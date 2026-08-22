@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.42.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.43.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1678,6 +1678,46 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   additions: _upstream_verdict_enabled, _upstream_verdict_pages,
 #   _upstream_verdict_max_age_min, _uv_page_state, _uv_parse_value,
 #   _uv_compose, _write_upstream_verdict.
+# v6.43.0 (2026-08-23, W1A-6e — foreign-writer attribution + identity refetch):
+#   CENSUS VERDICT (adjudicated, this build's premise): every Sheets write in
+#   this repository was enumerated and classified — 12 .execute() sites in
+#   this file (1 guarded data write via write_table @ the W1A-6 seam; 1
+#   headers-only repair; _Run_Log/_Status/verdict telemetry for the rest);
+#   scripts/intraday_quote_refresh.py writes ONLY Current Price + Last
+#   Updated (2 cells, symbol-keyed — it re-STAMPS rows it never repaired);
+#   scripts/repair_stores.py BLANKS cells (dry-gated) and cannot populate;
+#   scripts/run_inline_page_recovery.py delegates page writes to THIS script
+#   (guarded). CONCLUSION: no in-repo leg can populate Open/Name — the
+#   same-day lake divergence (GM: guard flagged=5/blank_open=511 outgoing vs
+#   440 violations/blank_open=116 on-sheet, 433 fresh-stamped; ML: 255/255
+#   Opens blank outgoing vs fully populated on-sheet) is deposited by an
+#   OUT-OF-REPO writer: the GAS cockpit and/or the eodhd-screener cron
+#   (22:00–00:50Z, overlapping the 00:00Z leg). Two additive mechanisms:
+#   (1) [OHLC-LAKE] pre-write lake probe — reads the live page BEFORE this
+#       leg writes, runs the REAL _apply_ohlc_prewrite_guard on the SHEET
+#       grid in forced-observe (the proven v6.41.0 readback reuse pattern),
+#       then joins lake vs the outgoing matrix by Symbol to count
+#       foreign_open_fill (matrix Open blank, lake populated) and
+#       foreign_name_diff (both non-blank, normalized different) with
+#       examples. One _Run_Log line per page per leg via the FW-3 channel.
+#       Read-only by construction; rides the W1A-6 gate
+#       (TFB_SYNC_OHLC_PREWRITE); kill-switch TFB_SYNC_OHLC_LAKE=0. This
+#       turns tonight's manual TSV adjudication into a per-leg measured
+#       number and catches the out-of-repo writer red-handed at 00:00Z.
+#   (2) [IDENTITY-REFETCH] heal-first extension — HF-1/HF-2 front blank and
+#       fabricated Names, but a row carrying another symbol's REAL Name
+#       passes as healthy, is never re-fetched, and KLG preserves the wrong
+#       identity forever (the 364-row BLOCKED class). Under
+#       TFB_SYNC_IDENTITY_REFETCH=1 (DEFAULT OFF — unset keeps v6.42.0
+#       ordering byte-identical), symbols whose non-blank Name is shared by
+#       >= TFB_SYNC_NAME_DEDUP_MIN (default 3) distinct symbols on the live
+#       page are fronted AFTER stubs, BEFORE healthy rows — a real
+#       single-symbol refetch lets the ID-FIREWALL adjudicate fresh identity
+#       so BLOCKED heals instead of persisting. Fetch-order-only when armed;
+#       never drops, never blanks, cap semantics unchanged.
+#   ENV: TFB_SYNC_IDENTITY_REFETCH (NEW, default OFF).
+#   Kill-switch (never set unless disabling): TFB_SYNC_OHLC_LAKE=0.
+#   data_engine_v2.py's gate untouched (standing constraint).
 # v6.42.0 (2026-08-21, W1A-6d — six-gate audit adjudicated on the 16:30 TSVs):
 #   WHY: the day's audit re-ran this file's own predicate (verbatim: aliases,
 #   _ohlc_prewrite_num, 0.01 tol, P1/P2/P3) over the exported sheets and got
@@ -1703,7 +1743,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   enforce behaviour, KLG, trim, readback logic, any write. With every ENV
 #   unset the write path is byte-identical to v6.41.0.
 
-SCRIPT_VERSION = "6.42.0"
+SCRIPT_VERSION = "6.43.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3346,7 +3386,30 @@ def _read_existing_page_symbols(
                 "of %d — repaired stubs jump the refresh queue.",
                 sheet_name, len(blanks), len(blanks) + len(named),
             )
-        out = blanks + named
+        # v6.43.0 (W1A-6e) IDENTITY-REFETCH: HF-1/HF-2 front blank and
+        # fabricated Names, but a row wearing another symbol's REAL Name
+        # passes as healthy, never re-fetches, and KLG preserves the wrong
+        # identity forever. When armed, hoist over-assigned-Name carriers
+        # (same non-blank Name on >= _name_dedup_min() distinct symbols —
+        # the ID-FIREWALL / repair_stores B3 signal) to the front AFTER
+        # true stubs, so a real single-symbol refetch lets the firewall
+        # adjudicate fresh identity and BLOCKED heals instead of
+        # persisting. DEFAULT OFF => `suspects` stays empty and the line
+        # below is byte-equivalent to v6.42.0's `blanks + named`.
+        suspects: List[str] = []
+        if _identity_refetch_enabled():
+            _susp, _gN = _identity_suspect_symbols(grid, hdr_r, sym_i, name_i)
+            if _susp:
+                suspects = [t for t in named if t in _susp]
+                named = [t for t in named if t not in _susp]
+                logger.info(
+                    "%s %s: fronted %d identity-suspect symbol(s) across "
+                    "%d duplicate-name group(s) (same non-blank Name on "
+                    ">= %d symbols) — refetch lets the ID-FIREWALL "
+                    "adjudicate fresh identity.",
+                    _IDENTITY_REFETCH_TAG, sheet_name, len(suspects), _gN,
+                    _name_dedup_min())
+        out = blanks + suspects + named
         if max_symbols > 0 and len(out) > max_symbols:
             # v6.39.5 (F-10): same pinned literal as _read_symbols so one
             # grep covers both truncation sites; "readback" marks the path.
@@ -5165,6 +5228,222 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
         print("::warning::%s stamp FAILED for %s — %s: %s"
               % (_STATUS_STAMP_TAG, page, type(_e).__name__, _e))
         logger.warning("%s stamp skipped for %s: %s", _STATUS_STAMP_TAG, page, _e)
+
+
+# =============================================================================
+# v6.43.0 (W1A-6e) — LAKE PROBE + IDENTITY-REFETCH (see header changelog)
+# =============================================================================
+_OHLC_LAKE_TAG = f"[OHLC-LAKE v{SCRIPT_VERSION}]"
+_IDENTITY_REFETCH_TAG = f"[IDENTITY-REFETCH v{SCRIPT_VERSION}]"
+
+
+def _identity_refetch_enabled() -> bool:
+    """v6.43.0 W1A-6e master gate for the identity-suspect fronting.
+    DEFAULT OFF — unset/0/false/off keeps v6.42.0 refresh ordering
+    byte-identical. Fetch-ORDER-only when armed; it can never drop a
+    symbol, blank a cell, or change what is written."""
+    return (os.getenv("TFB_SYNC_IDENTITY_REFETCH") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _ohlc_lake_enabled() -> bool:
+    """v6.43.0 W1A-6e: the lake probe rides the W1A-6 gate — armed iff
+    TFB_SYNC_OHLC_PREWRITE is armed. TFB_SYNC_OHLC_LAKE=0 is the probe's
+    own kill-switch (default ON under the gate). With the W1A-6 gate off
+    the probe performs NO read and NO write — v6.42.0 byte-identical."""
+    if not _ohlc_prewrite_enabled():
+        return False
+    return (os.getenv("TFB_SYNC_OHLC_LAKE") or "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _identity_suspect_symbols(grid: List[Any], hdr_r: int, sym_i: int,
+                              name_i: int) -> Tuple[set, int]:
+    """v6.43.0 W1A-6e: pure classifier over the SAME grid block the
+    heal-first read already holds. Returns (suspect_symbol_set, n_groups):
+    a symbol is suspect when its non-blank, non-fabricated Name is shared
+    by >= _name_dedup_min() DISTINCT symbols on the page — the exact
+    over-assignment signal the ID-FIREWALL and repair_stores B3 use.
+    First occurrence per symbol wins (mirrors the caller's seen-set).
+    Fail-safe: ({}, 0) on any problem — the caller's ordering is then
+    v6.42.0-identical."""
+    try:
+        if name_i < 0 or sym_i < 0 or hdr_r < 0:
+            return set(), 0
+        by_name: Dict[str, set] = {}
+        seen: set = set()
+        for row in grid[hdr_r + 1:]:
+            if not isinstance(row, list) or sym_i >= len(row):
+                continue
+            raw = row[sym_i]
+            if _guard_is_blank(raw):
+                continue
+            t = str(raw).strip().upper()
+            if not t or t in {"SYMBOL", "TICKER"} or t in seen:
+                continue
+            seen.add(t)
+            nm = row[name_i] if name_i < len(row) else ""
+            if _guard_is_blank(nm):
+                continue
+            if _placeholder_guard_enabled() and _name_is_fabricated(nm):
+                continue
+            key = _guard_norm(nm)
+            if not key:
+                continue
+            by_name.setdefault(key, set()).add(t)
+        _min = _name_dedup_min()
+        suspects: set = set()
+        n_groups = 0
+        for _k, syms in by_name.items():
+            if len(syms) >= _min:
+                n_groups += 1
+                suspects |= syms
+        return suspects, n_groups
+    except Exception:
+        return set(), 0
+
+
+def _ohlc_lake_probe(sheets: Any, spreadsheet_id: str, page: str,
+                     headers: List[Any], rows_matrix: List[List[Any]]) -> dict:
+    """v6.43.0 W1A-6e: read the live page BEFORE this leg writes and
+    attribute the foreign writer's residue. READ-ONLY by construction:
+    exactly one read_values call, zero writes, `rows_matrix` never
+    touched. Runs the REAL _apply_ohlc_prewrite_guard on the SHEET grid
+    under forced-observe (save/force/restore MODE — the proven v6.41.0
+    readback reuse), then joins lake vs the OUTGOING matrix by Symbol:
+      foreign_open_fill — matrix Open blank, lake Open populated
+      foreign_name_diff — both Names non-blank, normalized different
+    Fail-open: any error returns {"error": ...} and the write path is
+    untouched. Gate checks live in the caller AND here (belt/braces)."""
+    stats: dict = {}
+    try:
+        if not _ohlc_lake_enabled() or sheets is None:
+            return {}
+        blk = (f"A1:ZZ{_page_read_row_bound()}"
+               if _universe_cap_v2_enabled() else "A1:ZZ6000")
+        grid = sheets.read_values(spreadsheet_id, page, blk)
+        if not grid or not isinstance(grid, list):
+            return {"error": "lake read unavailable"}
+        hdr_r, l_sym = -1, -1
+        for r in range(min(len(grid), 25)):
+            row = grid[r] if isinstance(grid[r], list) else []
+            idx = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+            if idx >= 0:
+                hdr_r, l_sym = r, idx
+                break
+        if l_sym < 0:
+            return {"error": "lake Symbol column not found"}
+        lake_hdr = grid[hdr_r] if isinstance(grid[hdr_r], list) else []
+        lake_rows = grid[hdr_r + 1:]
+        _prev = os.environ.get("TFB_SYNC_OHLC_PREWRITE_MODE")
+        os.environ["TFB_SYNC_OHLC_PREWRITE_MODE"] = "observe"
+        try:
+            _, _lg = _apply_ohlc_prewrite_guard(lake_hdr, lake_rows, page)
+        finally:
+            if _prev is None:
+                os.environ.pop("TFB_SYNC_OHLC_PREWRITE_MODE", None)
+            else:
+                os.environ["TFB_SYNC_OHLC_PREWRITE_MODE"] = _prev
+        stats["lake_checked"] = int(_lg.get("checked") or 0)
+        stats["lake_flagged"] = int(_lg.get("flagged") or 0)
+        stats["lake_blank_open"] = int(_lg.get("blank_open") or 0)
+        l_open = _guard_find_col(lake_hdr, _GUARD_OPEN_ALIASES)
+        l_name = _guard_find_col(lake_hdr, _GUARD_NAME_ALIASES)
+        m_sym = _guard_find_col(headers or [], _GUARD_SYMBOL_ALIASES)
+        m_open = _guard_find_col(headers or [], _GUARD_OPEN_ALIASES)
+        m_name = _guard_find_col(headers or [], _GUARD_NAME_ALIASES)
+        lake_map: Dict[str, Tuple[Any, Any]] = {}
+        for row in lake_rows:
+            if not isinstance(row, list) or l_sym >= len(row):
+                continue
+            if _guard_is_blank(row[l_sym]):
+                continue
+            t = str(row[l_sym]).strip().upper()
+            if t in lake_map:
+                continue
+            lake_map[t] = (
+                row[l_open] if 0 <= l_open < len(row) else "",
+                row[l_name] if 0 <= l_name < len(row) else "",
+            )
+        fills, ndiffs = [], []
+        if m_sym >= 0:
+            for row in (rows_matrix or []):
+                if not isinstance(row, list) or m_sym >= len(row):
+                    continue
+                if _guard_is_blank(row[m_sym]):
+                    continue
+                t = str(row[m_sym]).strip().upper()
+                lk = lake_map.get(t)
+                if lk is None:
+                    continue
+                if (m_open >= 0 and m_open < len(row)
+                        and _guard_is_blank(row[m_open])
+                        and not _guard_is_blank(lk[0])):
+                    fills.append(t)
+                if (m_name >= 0 and m_name < len(row)
+                        and not _guard_is_blank(row[m_name])
+                        and not _guard_is_blank(lk[1])
+                        and _guard_norm(row[m_name]) != _guard_norm(lk[1])):
+                    ndiffs.append(t)
+        stats["foreign_open_fill"] = len(fills)
+        stats["foreign_name_diff"] = len(ndiffs)
+        stats["examples"] = ([f"{t}(open)" for t in fills[:8]]
+                             + [f"{t}(name)" for t in ndiffs[:8]])[:12]
+        stats["version"] = SCRIPT_VERSION
+        return stats
+    except Exception as _e:
+        return {"error": f"{type(_e).__name__}: {_e}"}
+
+
+def _append_runlog_ohlc_lake(sheets: Any, spreadsheet_id: str, page: str,
+                             stats: dict) -> None:
+    """v6.43.0 W1A-6e: one [OHLC-LAKE] line per page per leg through the
+    proven FW-3 _Run_Log channel — same 10-column shape, same retry x2,
+    same fail-loud-but-fail-open discipline as the W1A-6b appender."""
+    if not stats or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        _ff = int(stats.get("foreign_open_fill") or 0)
+        _fn = int(stats.get("foreign_name_diff") or 0)
+        _lf = int(stats.get("lake_flagged") or 0)
+        level = "WARNING" if (_ff or _fn or _lf) else "INFO"
+        status = "SUSPECT" if (_ff or _fn or _lf) else "OK"
+        msg = (
+            f"{_OHLC_LAKE_TAG} {page} | lake_checked="
+            f"{int(stats.get('lake_checked') or 0)} lake_flagged={_lf} "
+            f"lake_blank_open={int(stats.get('lake_blank_open') or 0)} | "
+            f"foreign_open_fill={_ff} foreign_name_diff={_fn}"
+            + ((" | ex: " + ", ".join(stats.get("examples") or []))
+               if (stats.get("examples") and (_ff or _fn)) else "")
+        )
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            msg, "", "", "",
+                            json.dumps(dict(stats, version=SCRIPT_VERSION))]]}
+        _last = None
+        for _ in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last = None
+                break
+            except Exception as _ae:
+                _last = _ae
+                time.sleep(1.0)
+        if _last is not None:
+            raise _last
+    except Exception as _e:
+        print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
+              % (_OHLC_LAKE_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s run-log line skipped: %s", _OHLC_LAKE_TAG, _e)
 
 
 # =============================================================================
@@ -8420,6 +8699,48 @@ async def _run_one_task(
                     logger.info("%s harvested %d priced rows from %s", _XPAGE_TAG, _xn, task.sheet_name)
             except Exception as _xe:
                 logger.warning("%s harvest skipped for %s (error: %s)", _XPAGE_TAG, task.sheet_name, _xe)
+
+        # --- v6.43.0 (W1A-6e) LAKE PROBE — foreign-writer attribution --------
+        # In-repo census: the guarded seam below is this repository's ONLY
+        # row-writer for these pages, yet the lake diverges from what each
+        # leg writes — the filler is out-of-repo (GAS cockpit /
+        # eodhd-screener). Read the lake BEFORE overwriting it; join by
+        # Symbol; log the residue. Read-only; rides the W1A-6 gate;
+        # fail-open twice (helper + this guard). NEVER touches rows_matrix
+        # or res.status.
+        try:
+            if _ohlc_lake_enabled():
+                _lk = _ohlc_lake_probe(sheets, spreadsheet_id,
+                                       task.sheet_name, headers, rows_matrix)
+                if _lk and not _lk.get("error"):
+                    _ff = int(_lk.get("foreign_open_fill") or 0)
+                    _fn = int(_lk.get("foreign_name_diff") or 0)
+                    _lkl = (f"{_OHLC_LAKE_TAG} {task.sheet_name} | "
+                            f"lake_checked={_lk.get('lake_checked')} "
+                            f"lake_flagged={_lk.get('lake_flagged')} "
+                            f"lake_blank_open={_lk.get('lake_blank_open')} | "
+                            f"foreign_open_fill={_ff} "
+                            f"foreign_name_diff={_fn}"
+                            + ((" | ex: " + ", ".join(_lk.get("examples") or []))
+                               if (_ff or _fn) else ""))
+                    if _ff or _fn:
+                        res.warnings.append(_lkl)
+                        logger.warning(_lkl)
+                    else:
+                        logger.info(_lkl)
+                    try:
+                        _append_runlog_ohlc_lake(
+                            sheets, spreadsheet_id, task.sheet_name, _lk)
+                    except Exception:
+                        pass
+                elif _lk.get("error"):
+                    logger.warning("%s unavailable on %s (%s)",
+                                   _OHLC_LAKE_TAG, task.sheet_name,
+                                   _lk["error"])
+        except Exception as _lke:
+            logger.warning("%s probe skipped on %s (%s)",
+                           _OHLC_LAKE_TAG, task.sheet_name, _lke)
+        # ---------------------------------------------------------------------
 
         # --- v6.38.0 (W1A-6) PRE-WRITE OHLC COHERENCE ------------------------
         # LAST checkpoint before the sheet: the engine-side Fix BC guard runs
