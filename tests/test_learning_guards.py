@@ -588,7 +588,15 @@ _RDS_FW = _extract_funcs(
      "_guard_find_col", "_guard_is_blank", "_guard_norm",
      "_read_existing_page_symbols", "_heal_first_enabled",
      "_universe_cap_v2_enabled", "_page_read_row_bound",
-     "_manual_hold_gate_enabled", "_mh_parse_hold_until", "_mh_read_hold"},
+     "_manual_hold_gate_enabled", "_mh_parse_hold_until", "_mh_read_hold",
+     # v6.43.0 (W1A-6e): _read_existing_page_symbols now calls
+     # _identity_refetch_enabled() unconditionally (tri-partition
+     # blanks + suspects + named). Lift the full closure —
+     # _identity_suspect_symbols and _name_dedup_min included — or the
+     # HF-2 guards NameError inside <lift> instead of exercising the
+     # DEFAULT-OFF path they exist to pin.
+     "_identity_refetch_enabled", "_identity_suspect_symbols",
+     "_name_dedup_min"},
     extra_globals={"re": _g5_re, "Sequence": _g5_typing.Sequence,
                    "datetime": _g5_dt, "timezone": _g5_tz,
                    "logger": types.SimpleNamespace(
