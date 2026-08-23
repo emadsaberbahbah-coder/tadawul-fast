@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.1)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.2)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
@@ -292,6 +292,17 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
+# v8.13.2 (2026-08-23, IR-096 FIX — adjudicated from the LIVE 12:17 boot):
+# v8.13.1's payload expression called getattr(engine_obj, ...) — but
+# app.state.engine is an ENGINE INSTANCE, while surface_gate_states() is a
+# MODULE-level function; the backward-safe default fired in production and
+# every payload carried "engine_gates": {}. The full-module import
+# reproduction returned the complete nine-key dict, isolating the defect to
+# this seam. Fix: _engine_gates_snapshot() resolves through a chain —
+# (1) the canonical module in sys.modules (single source of truth,
+# engine >= 5.132.1), (2) the instance attr (future engines), (3) legacy
+# health()["surface_invariants"] (engines 5.128.4+), (4) {}. Same
+# fail-open contract; nothing armed; engine file untouched.
 # v8.13.1 (2026-08-23, IR-096): additive observability only — one new
 # status-payload key "engine_gates" mirroring the engine's [GUARDS+] boot
 # line via core.data_engine_v2.surface_gate_states() (engine >= 5.132.1).
@@ -300,7 +311,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.13.1"
+APP_ENTRY_VERSION = "8.13.2"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1851,6 +1862,32 @@ def _mount_routes_once(app: FastAPI, *, phase: str) -> Dict[str, Any]:
 # =============================================================================
 # Runtime metadata
 # =============================================================================
+def _engine_gates_snapshot(engine_obj: Any) -> Dict[str, Any]:
+    """v8.13.2 (IR-096 fix): see the header WHY. Resolution order:
+    module fn -> instance fn -> legacy health()['surface_invariants'] -> {}.
+    Read-only; observability never takes the app down."""
+    try:
+        mod = sys.modules.get("core.data_engine_v2")
+        fn = getattr(mod, "surface_gate_states", None)
+        if callable(fn):
+            g = fn()
+            if isinstance(g, dict) and g:
+                return g
+        fn = getattr(engine_obj, "surface_gate_states", None)
+        if callable(fn):
+            g = fn()
+            if isinstance(g, dict) and g:
+                return g
+        h = getattr(engine_obj, "health", None)
+        if callable(h):
+            si = (h() or {}).get("surface_invariants")
+            if isinstance(si, dict) and si:
+                return si
+    except Exception:
+        pass
+    return {}
+
+
 def _resolve_engine_version(engine_obj: Any, engine_source: str) -> str:
     """v8.11.3: best-effort engine build version for the status payloads.
 
@@ -1982,11 +2019,9 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "engine_source": engine_source,
         "engine_version": _resolve_engine_version(engine_obj, engine_source),
         "engine_init_error": engine_init_error,
-        # v8.13.1 (IR-096): gate states — fail-open {} on any shape.
-        "engine_gates": (
-            getattr(engine_obj, "surface_gate_states", lambda: {})()
-            if engine_obj is not None else {}
-        ),
+        # v8.13.2 (IR-096): resolved via the module-first chain — see
+        # _engine_gates_snapshot. Fail-open {} on any shape.
+        "engine_gates": _engine_gates_snapshot(engine_obj),
         "startup_warnings": startup_warnings,
     }
 
