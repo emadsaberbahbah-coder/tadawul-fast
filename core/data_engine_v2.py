@@ -3236,6 +3236,19 @@ if str(ROOT_DIR) not in sys.path:
 #   _BD_SCAN_ERROR_COUNT/_LOGGED. Harness v2 ships subprocess-isolated
 #   OLD/NEW comparison with CLI paths (audit P1-A/F7) + expanded matrix.
 # =============================================================================
+# v5.132.1 (2026-08-23, IR-096 — GATE STATES IN THE HEALTH PAYLOAD):
+#   WHY: five consecutive Render deploys could not confirm whether
+#   TFB_SURFACE_BLOCKED_INVARIANT registered — the [GUARDS+] boot line lives
+#   only in deploy logs, and the operator's natural verification artifact is
+#   the health JSON, which never carried gate state. Every arming was blind
+#   to the artifact actually being pasted.
+#   WHAT: surface_gate_states() — a module-level, read-only, fail-open
+#   mirror of the [GUARDS+] line (the four surface gates via the SAME
+#   _surface_gate_on alias pairs, mp_blocked_nulls, env_combo, sai_version)
+#   PLUS the two next-arming gates (yf_target_fallback v5.132.0,
+#   engine_target_klg W1A-0b). main.py v8.13.1 attaches it to every status
+#   payload as "engine_gates", so the health paste the operator already
+#   sends IS the arming acceptance test. No behavior change; nothing armed.
 # v5.132.0 (2026-08-23, W1B-3 / IR-076 — TARGET-FALLBACK REACHABILITY):
 #   ROOT CAUSE (confidence-attractor chain, adjudicated): EODHD's analyst-
 #   target leg throttles independently of prices (W1A-0). When it does, a row
@@ -3295,7 +3308,7 @@ if str(ROOT_DIR) not in sys.path:
 #   Top_10 dry-run per standing policy.
 #   NOT CHANGED: synthesize math, reliability formula, gate thresholds,
 #   projection schema (115), SAI contract (1.4.1), any provider call.
-__version__ = "5.132.0"
+__version__ = "5.132.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4859,6 +4872,32 @@ def _t10_post_invariant_keep(row: Dict[str, Any]) -> bool:
         return True
     except Exception:
         return True
+
+
+def surface_gate_states() -> Dict[str, Any]:
+    """v5.132.1 (IR-096): machine-readable mirror of the [GUARDS+] boot line
+    plus the two next-arming gates. Consumed by main.py's status payload as
+    "engine_gates" so every health-JSON paste is a gate acceptance test.
+    Read-only; fail-open to {} — observability must never take the app down.
+    Uses the EXACT same helpers as the boot line (single source of truth)."""
+    try:
+        return {
+            "surface_blocked": _surface_gate_on(
+                "TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT"),
+            "surface_fetchfail": _surface_gate_on(
+                "TFB_T10_FETCHFAIL_BLOCKED", "TFB_SURFACE_FETCHFAIL_BLOCKED"),
+            "surface_warn_invest": _surface_gate_on(
+                "TFB_WARN_INVEST_INVARIANT", "TFB_SURFACE_WARN_INVEST"),
+            "surface_row_sanity": _surface_gate_on(
+                "TFB_ROW_SANITY_QUARANTINE", "TFB_SURFACE_ROW_SANITY"),
+            "mp_blocked_nulls": _mp_blocked_nulls_enabled(),
+            "env_combo": _sai_env_combo_state(),
+            "sai_version": _SAI_STATE.get("version"),
+            "yf_target_fallback": _yf_target_fallback_enabled(),
+            "engine_target_klg": _tgt_lkg_enabled(),
+        }
+    except Exception:
+        return {}
 
 
 def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
