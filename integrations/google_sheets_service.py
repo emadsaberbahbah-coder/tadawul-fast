@@ -227,7 +227,23 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-SERVICE_VERSION = "6.1.0"
+# =============================================================================
+# v6.2.0 (2026-08-23, IR-078b — write-seam capacity telemetry, read-only):
+#   The evidence engine got its guard in track_performance v6.34.0; this
+#   module is the OTHER write stack (routes / validator / brief writers) and
+#   had zero capacity awareness while the workbook sat 23 cells from the
+#   10,000,000 hard limit. v6.2.0 adds ONE read-only metadata probe per
+#   process per spreadsheet at the write seams (write_range,
+#   write_grid_chunked) emitting a single '[CAPACITY-SVC v6.2.0]' line with
+#   allocated / % / NEAR-LIMIT marker at >= 85%. NO enforcement here — this
+#   module never appends, and refusal authority stays with the evidence
+#   engine. Fail-open on any error (telemetry must never take a writer
+#   down). Kill: TFB_SVC_CAPACITY_GUARD=0. Double-log worst case under
+#   thread races is accepted (telemetry; no lock on the cache by design —
+#   the executor pool may hit two sids concurrently and a Lock here would
+#   serialize real writes for a log line).
+# =============================================================================
+SERVICE_VERSION = "6.2.0"
 MIN_CORE_VERSION = "5.0.0"
 
 # =============================================================================
@@ -236,6 +252,62 @@ MIN_CORE_VERSION = "5.0.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+# --- v6.2.0 (IR-078b) capacity telemetry -------------------------------------
+_SVC_CAP_LIMIT = 10_000_000
+_SVC_CAP_WARN_PCT = 85.0
+_SVC_CAP_SEEN: Dict[str, bool] = {}
+
+
+def _svc_capacity_guard_enabled() -> bool:
+    return (os.getenv("TFB_SVC_CAPACITY_GUARD") or "1").strip().lower() not in _FALSY
+
+
+def _svc_allocated_from_meta(meta: Any) -> Optional[int]:
+    """PURE: sum rowCount*columnCount over sheets[].properties.gridProperties
+    (allocation is what Google's 10M limit counts). None on malformed."""
+    try:
+        sheets = meta.get("sheets") if isinstance(meta, dict) else None
+        if not isinstance(sheets, list) or not sheets:
+            return None
+        total, seen = 0, False
+        for sh in sheets:
+            try:
+                gp = sh["properties"]["gridProperties"]
+                total += int(gp["rowCount"]) * int(gp["columnCount"])
+                seen = True
+            except Exception:
+                continue
+        return total if seen else None
+    except Exception:
+        return None
+
+
+def _svc_capacity_probe(spreadsheet_id: str) -> None:
+    """One '[CAPACITY-SVC]' line per process per spreadsheet, from the write
+    seams. Read-only; every failure path is silent-open by design."""
+    sid = str(spreadsheet_id or "")
+    if not sid or _SVC_CAP_SEEN.get(sid) or not _svc_capacity_guard_enabled():
+        return
+    _SVC_CAP_SEEN[sid] = True
+    try:
+        service = get_sheets_service()
+        meta = (service.spreadsheets()
+                .get(spreadsheetId=sid,
+                     fields="sheets(properties(gridProperties("
+                            "rowCount,columnCount)))")
+                .execute())
+        alloc = _svc_allocated_from_meta(meta)
+        if alloc is None:
+            return
+        pct = 100.0 * alloc / _SVC_CAP_LIMIT
+        logger.info(
+            "[CAPACITY-SVC v%s] %s: allocated=%s cells (%.2f%% of %s)%s",
+            SERVICE_VERSION, sid[-8:], f"{alloc:,}", pct,
+            f"{_SVC_CAP_LIMIT:,}",
+            "  NEAR-LIMIT (>=85%)" if pct >= _SVC_CAP_WARN_PCT else "")
+    except Exception:
+        pass
 
 # =============================================================================
 # Enums
@@ -1754,6 +1826,7 @@ def write_range(
     value_input: str = "RAW",
 ) -> int:
     """Write values to a range."""
+    _svc_capacity_probe(spreadsheet_id)   # v6.2.0 (IR-078b): telemetry only
     service = get_sheets_service()
     body = {"values": values or [[]]}
 
@@ -1794,6 +1867,7 @@ def write_grid_chunked(
     value_input: str = "RAW",
 ) -> int:
     """Write grid in chunks."""
+    _svc_capacity_probe(spreadsheet_id)   # v6.2.0 (IR-078b): telemetry only
     if not grid:
         return 0
 
