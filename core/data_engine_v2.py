@@ -3236,6 +3236,45 @@ if str(ROOT_DIR) not in sys.path:
 #   _BD_SCAN_ERROR_COUNT/_LOGGED. Harness v2 ships subprocess-isolated
 #   OLD/NEW comparison with CLI paths (audit P1-A/F7) + expanded matrix.
 # =============================================================================
+# v5.132.0 (2026-08-23, W1B-3 / IR-076 — TARGET-FALLBACK REACHABILITY):
+#   ROOT CAUSE (confidence-attractor chain, adjudicated): EODHD's analyst-
+#   target leg throttles independently of prices (W1A-0). When it does, a row
+#   with fully healthy core fundamentals arrives target-blank — and
+#   _row_needs_yahoo_enrichment() correctly does NOT fire, because v5.77.10
+#   deliberately removed the persistently-missing target fields from the
+#   24-field needs-check after they caused a Yahoo call on EVERY row (the
+#   any() incident). Downstream everything already works: the FILTER accept
+#   list carries target_*_price/analyst_count AND the forecast_price_*
+#   canonical aliases (v5.77.8), yahoo_fundamentals maps targetMeanPrice /
+#   numberOfAnalystOpinions, and the plausibility gate + drop-audit exist
+#   (v5.77.19). The provider was therefore registered, enabled, and
+#   STRUCTURALLY UNREACHABLE exactly when it was needed — targets fall to
+#   synthetic sources, reliability collapses toward the ~31 attractor, and
+#   the surface splits (R-6 shape).
+#   FIX — a SEPARATE trigger, never membership in the 24-field set (which,
+#   with its _FUND_LKG_FIELDS twin, is byte-untouched):
+#     _row_needs_target_fallback(row): fires only when ALL hold — master
+#       gate ON; target_mean_price missing; row is real (name present,
+#       positive current_price/price, so the v5.77.19 gate can judge any
+#       returned target); resolved asset class is Equity (row asset_class,
+#       else _infer_asset_class_from_symbol) with belt-and-braces symbol
+#       exclusions (-USD / =F / =X / ^ prefixes) — the audit's equity-only
+#       contract: no synthetic fund/FX/crypto targets.
+#     _apply_target_fallback(row, needs_fund): the one call-site seam. If
+#       needs_fund is already True, targets ride along free (v5.131.0
+#       behavior). Otherwise it consumes ONE unit of a per-process budget
+#       (TFB_YF_TARGET_FALLBACK_MAX, default 200, clamp 1..5000) — the
+#       v5.77.10 failure mode (mass outage => thousands of Yahoo calls)
+#       is structurally capped — flips needs_fund, and stamps the audit
+#       tag 'yf_target_fallback_triggered' into warnings so every
+#       fallback-sourced target is traceable on the sheet.
+#   ENV (Render): TFB_YF_TARGET_FALLBACK — DEFAULT OFF => v5.131.0
+#   byte-identical. Arm as its own evidence day; the committed
+#   provider_target_coverage workflow (W1B-1) is the before/after
+#   instrument. Kill = unset/0. Budget counter is per-process (asyncio
+#   single-threaded per worker; two gunicorn workers = two budgets).
+#   NOT CHANGED: the 24-field needs-check, _FUND_LKG_FIELDS, accept list,
+#   provider code, plausibility gate, LKG, SAI contract (1.4.1).
 # v5.131.0 (2026-08-21, W1A-0b — TARGET-BLOCK LKG, six-gate audit adjudicated):
 #   WHY: the 16:30 TSVs show the surface split at full scale — 4,455 rows
 #   (GM 2,118 / CFX 158 / MF 2,179) pinned at forecast_reliability_score
@@ -3256,7 +3295,7 @@ if str(ROOT_DIR) not in sys.path:
 #   Top_10 dry-run per standing policy.
 #   NOT CHANGED: synthesize math, reliability formula, gate thresholds,
 #   projection schema (115), SAI contract (1.4.1), any provider call.
-__version__ = "5.131.0"
+__version__ = "5.132.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3738,6 +3777,92 @@ def _row_needs_yahoo_enrichment(row: Dict[str, Any]) -> Tuple[bool, bool]:
         )
 
     return needs_fund, needs_chart
+
+
+# =============================================================================
+# v5.132.0 (W1B-3 / IR-076) — gated, budgeted, equity-only TARGET-FALLBACK
+# =============================================================================
+def _yf_target_fallback_enabled() -> bool:
+    """Master gate. DEFAULT OFF => v5.131.0 byte-identical (no extra Yahoo
+    call can occur). Render env; armed as its own evidence day."""
+    return (os.getenv("TFB_YF_TARGET_FALLBACK") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _yf_target_fallback_max() -> int:
+    """Per-process budget — the structural cap on the v5.77.10 failure mode
+    (a mass EODHD target outage must not become thousands of Yahoo calls).
+    Default 200, clamped 1..5000."""
+    try:
+        v = int((os.getenv("TFB_YF_TARGET_FALLBACK_MAX") or "200").strip())
+    except Exception:
+        v = 200
+    return min(5000, max(1, v))
+
+
+_YF_TARGET_BUDGET: Dict[str, Any] = {"used": 0, "warned": False}
+
+
+def _yf_target_budget_take() -> bool:
+    """Consume one budget unit. Per-process plain dict is safe: enrichment
+    runs on the worker's single asyncio loop (no cross-thread mutation)."""
+    if _YF_TARGET_BUDGET["used"] < _yf_target_fallback_max():
+        _YF_TARGET_BUDGET["used"] += 1
+        return True
+    if not _YF_TARGET_BUDGET["warned"]:
+        _YF_TARGET_BUDGET["warned"] = True
+        logger.warning(
+            "[YF-TARGET v%s] per-process fallback budget exhausted (max=%d) "
+            "— further target-fallback triggers suppressed this process.",
+            __version__, _yf_target_fallback_max())
+    return False
+
+
+def _yf_asset_class_ok(row: Dict[str, Any]) -> bool:
+    """Equity-only contract (external audit §8): resolved class must be
+    Equity. Belt-and-braces symbol exclusions catch crypto/futures/FX rows
+    that the coarse inferrer defaults to Equity (e.g. DOT-USD)."""
+    sym = _safe_str(row.get("symbol") or row.get("requested_symbol")).strip()
+    su = sym.upper()
+    if (su.endswith("-USD") or su.endswith("=F") or su.endswith("=X")
+            or su.startswith("^")):
+        return False
+    cls = _safe_str(row.get("asset_class")).strip()
+    if _is_missing_or_unknown_field(cls):
+        cls = _infer_asset_class_from_symbol(sym)
+    return cls.strip().lower().startswith("equit")
+
+
+def _row_needs_target_fallback(row: Dict[str, Any]) -> bool:
+    """PURE predicate — no budget, no mutation. True only when the row is a
+    real, priced, Equity instrument whose analyst target is missing."""
+    if not isinstance(row, dict) or not _yf_target_fallback_enabled():
+        return False
+    if not _is_missing_or_unknown_field(row.get("target_mean_price")):
+        return False
+    if _is_missing_or_unknown_field(row.get("name")):
+        return False
+    px = _as_float(row.get("current_price"))
+    if px is None:
+        px = _as_float(row.get("price"))
+    if px is None or px <= 0:
+        return False
+    return _yf_asset_class_ok(row)
+
+
+def _apply_target_fallback(row: Dict[str, Any], needs_fund: bool) -> bool:
+    """The single call-site seam. Already-True needs_fund passes through
+    untouched (targets ride along free, v5.131.0 behavior). A flip consumes
+    one budget unit and stamps the audit tag so every fallback-sourced
+    target is traceable on the sheet."""
+    if needs_fund:
+        return True
+    if not _row_needs_target_fallback(row):
+        return False
+    if not _yf_target_budget_take():
+        return False
+    _append_yahoo_warning_tag(row, "yf_target_fallback_triggered")
+    return True
 
 
 def _filter_patch_to_missing_fields(
@@ -14730,6 +14855,10 @@ class DataEngineV5:
             return row
 
         needs_fund, needs_chart = _row_needs_yahoo_enrichment(row)
+        # v5.132.0 (W1B-3/IR-076): gated+budgeted target-fallback — may flip
+        # needs_fund for a real, priced Equity row whose analyst target is
+        # missing. Gate OFF (default) => this line is a no-op passthrough.
+        needs_fund = _apply_target_fallback(row, needs_fund)
         if not (needs_fund or needs_chart):
             return row
 
