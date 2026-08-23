@@ -27,6 +27,16 @@ jobs:
     env:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_COMPLIANCE_GATE_ENABLED: "1"
+      # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
+      # v1.3.0 EODHD rescue reads exactly these two names and was
+      # structurally unreachable because neither was mapped. This mapping is
+      # INERT WIRING: with the repo Variable TFB_SHADOW_EODHD unset/0 the
+      # rescue stays byte-off, and the secret may not even exist yet.
+      # ARMING (=1) is an S-1 EVIDENCE-WINDOW decision — record the arming
+      # date as a window boundary in S1_Gate BEFORE setting the Variable,
+      # and create the EODHD_API_KEY secret in the same sitting.
+      TFB_SHADOW_EODHD: ${{ vars.TFB_SHADOW_EODHD }}
+      TFB_EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
     steps:
       - uses: actions/checkout@v5
 
