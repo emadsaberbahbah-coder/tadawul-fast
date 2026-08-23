@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI — every production-critical file, every push
 # ============================================================================
+# VERSION 1.0.2 (2026-08-23) — IR-095: integrations/** JOINS THE PATH FILTER
+#
+# v1.0.2:
+# - FIX: both trigger path filters omitted 'integrations/**'. Consequence,
+#   observed live on PR #248 (integrations/google_sheets_service.py v6.2.0):
+#   this workflow never fires, so the REQUIRED '📋 CI verdict' status sits
+#   "Expected — waiting" forever and the merge button is permanently dead.
+#   Any integrations-only change was structurally unmergeable via PR — the
+#   exact orphaned-path class the WHY section below documents, still living
+#   in this file's own trigger block. Two additive lines; nothing else moves.
+#
 # VERSION 1.0.1 (2026-07-29) — CONTRACT ENVIRONMENT PIN
 #
 # v1.0.1:
@@ -82,6 +93,7 @@ on:
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
+      - 'integrations/**'
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/**'
@@ -91,6 +103,7 @@ on:
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
+      - 'integrations/**'
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/**'
