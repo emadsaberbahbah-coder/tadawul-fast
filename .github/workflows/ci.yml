@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI — every production-critical file, every push
 # ============================================================================
+# VERSION 1.0.3 (2026-08-23) — IR-092: FALSE-GREEN FIXTURES JOIN THE LEAN SUITE
+#
+# v1.0.3:
+# - ADD tests/test_sai_falsegreen_fixtures.py to the lean decision-layer
+#   suite: the four rows the 2026-08-23 review caught publishing as INVEST
+#   while carrying fetch_failed (UNI.MI, KE=F, ALI=F, the Copper zombie)
+#   are permanent regression cases against the REAL
+#   apply_surface_action_invariants — armed => all four die with audit
+#   tags; unarmed => strict no-op, same object back. One list entry;
+#   nothing else moves.
+#
 # VERSION 1.0.2 (2026-08-23) — IR-095: integrations/** JOINS THE PATH FILTER
 #
 # v1.0.2:
@@ -206,6 +217,7 @@ jobs:
             tests/test_scoring_engine_contract.py \
             tests/test_top10_selector.py \
             tests/test_learning_guards.py
+            tests/test_sai_falsegreen_fixtures.py
           echo "::endgroup::"
 
       - name: ✅ Coverage note
