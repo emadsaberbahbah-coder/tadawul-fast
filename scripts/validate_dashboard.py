@@ -2,12 +2,61 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.2.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.0)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.0 (2026-08-23) — W1A-1: ROUTE-AWARE SCOPE, OPEN VALIDATION, HONEST SAMPLING
+--------------------------------------------------------------------------------
+WHY (external audits 2026-08-22/23, adjudicated): (a) P1-1 — this validator
+sampled the first 1,500 rows of 6,617-row pages and reported page-level
+verdicts with no sampling label, and never validated Open although 465 GM /
+118 CFX / 82 MF rows carried Open outside [Day Low, Day High] on the 08-23
+export; (b) Top_10_Investments had ZERO default-scope coverage since v1.1.0
+(correctly — the registry contract can't read a decision cockpit), so the
+P0-5 class (funded ticket while the feed is NOT ACTIONABLE) had no
+backend-side tripwire.
+
+WHAT v1.3.0 ADDS (all additive; every v1.2.0 check byte-identical):
+  1  sanity.open_present — blank-Open census per page. PASS when none blank,
+     SKIP when the whole column is blank (structural source gap, e.g.
+     Market_Leaders 255/255 — not a per-row anomaly), WARN on partial blanks.
+  2  sanity.open_in_day_range — Open outside [day_low, day_high], WARN class
+     (Class-B statistical per project taxonomy; report, never page-kill).
+     Canonical key: open_price (registry: Price/"Open").
+  3  scope.coverage — every market page now carries FULL(rows=N) as PASS or
+     SAMPLE_ONLY(first N; more exist) as WARN. WARN exits 1, which
+     daily_sync explicitly tolerates (it reds only on exit >= 2) — the page
+     is labeled, production is not broken. --full / VALIDATE_FULL=1 lifts
+     the cap to VALIDATE_FULL_MAX (default 20,000) for a certified run.
+     Sampling detection is mechanical: the reader asks for one row beyond
+     the cap (read_range already over-fetches +25; get_sheet_rows now asks
+     limit=max_rows+1) and flags when it arrives.
+  4  ROUTE-AWARE DECISION SURFACE — Top_10_Investments RETURNS to default
+     scope, but through its own path, never the 118-col registry contract
+     (the v1.1.0 rationale stands and is honored): a dedicated reader scans
+     up to VALIDATE_T10_HEADER_SCAN (60) rows for the cockpit data-grid
+     header (Rank|Symbol...), locates the FEED banner, and runs
+     check_top10_surface:
+       decision.header_found            FAIL if the cockpit grid is absent
+       decision.feed_banner_present     FAIL if no FEED verdict line renders
+       decision.sizing_withheld_when_blocked
+                                        FAIL if the banner says NOT
+                                        ACTIONABLE yet any selected row
+                                        carries a numeric Ticket SAR or
+                                        Shares — the P0-5 regression
+                                        tripwire, now backend-side with
+                                        exit-2 authority (daily_sync reds).
+       decision.price_present           WARN on missing/non-positive Price
+                                        when the feed is executable.
+     check_top10 (v1.0.0 legacy) is retained verbatim and still reachable
+     via the old orchestrator tail for any non-decision alias.
+REVERSIBILITY: VALIDATE_DECISION_SURFACE=0 removes Top_10 from default scope
+again (v1.2.0 scope, byte-equivalent); the sampling label and Open checks are
+pure additions with no behavior flag — they only ever ADD result lines.
+
 v1.2.0 (2026-07-01) — gate.buy_has_no_block_reason MADE GOVERNANCE-AWARE
 --------------------------------------------------------------------------------
 WHY: A live audit of the production workbook (2026-07-01) found 461 of the
@@ -221,7 +270,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -345,6 +394,7 @@ _K_DAY_HI = "day_high"
 _K_DAY_LO = "day_low"
 _K_W52_HI = "week_52_high"
 _K_W52_LO = "week_52_low"
+_K_OPEN = "open_price"          # v1.3.0: registry Price/"Open"
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +568,7 @@ class _PageData:
     header_cells: List[str]  # literal header row (empty on get_sheet_rows path)
     rows: List[Dict[str, Any]]
     error: str = ""
+    sampled: bool = False   # v1.3.0: more rows existed beyond max_rows
 
 
 async def _read_page(
@@ -545,18 +596,23 @@ async def _read_page(
             hr = _detect_header_row(grid, expected_tokens)
             if hr >= 0:
                 header_cells = [_safe_str(c) for c in grid[hr]]
+                avail = max(0, len(grid) - (hr + 1))
                 rows = _grid_to_rows(header_cells, grid[hr + 1 : hr + 1 + max_rows])
-                return _PageData(page, "read_range", header_cells, rows)
+                # v1.3.0: the range already over-fetches (+25), so any grid
+                # rows beyond the cap prove the page continues -> SAMPLE_ONLY.
+                return _PageData(page, "read_range", header_cells, rows,
+                                 sampled=(avail > max_rows))
             logger.warning("read_range: header row not detected for %s", page)
 
     # FALLBACK: logical rows via engine get_sheet_rows (no literal header row)
     if rows_reader is not None:
         fn, is_async, modpath = rows_reader
+        probe = max_rows + 1  # v1.3.0: one past the cap => sampling proof
         attempts: Tuple[Tuple[Tuple, Dict[str, Any]], ...] = (
-            ((), {"sheet": page, "limit": max_rows}),
-            ((), {"sheet_name": page, "limit": max_rows}),
-            ((), {"page": page, "limit": max_rows}),
-            ((page,), {"limit": max_rows}),
+            ((), {"sheet": page, "limit": probe}),
+            ((), {"sheet_name": page, "limit": probe}),
+            ((), {"page": page, "limit": probe}),
+            ((page,), {"limit": probe}),
             ((page,), {}),
         )
         for args, kwargs in attempts:
@@ -564,7 +620,9 @@ async def _read_page(
                 res = fn(*args, **kwargs) if is_async else fn(*args, **kwargs)
                 res = await res if is_async else await _maybe_await(res)
                 rows = _extract_rows(res)
-                return _PageData(page, "get_sheet_rows", [], rows)
+                sampled = len(rows) > max_rows
+                return _PageData(page, "get_sheet_rows", [], rows[:max_rows],
+                                 sampled=sampled)
             except TypeError:
                 continue
             except Exception as e:
@@ -801,6 +859,38 @@ def check_sanity(page: str, k2h: Dict[str, str], actual_set: set, rows: List[Dic
                                "WARN" if bad else "PASS", count=len(bad), examples=bad,
                                detail="current price outside [day_low, day_high]" if bad else ""))
 
+    # v1.3.0 (W1A-1 / audit P1-1): Open census + Open-vs-day-range.
+    if _has_column(actual_set, k2h, _K_OPEN):
+        blanks = [sym(r) for r in rows
+                  if _safe_float(_resolve(r, k2h, _K_OPEN)) is None]
+        if rows and len(blanks) == len(rows):
+            out.append(CheckResult(page, "sanity.open_present", "SKIP",
+                                   count=len(blanks),
+                                   detail="Open column entirely blank "
+                                          "(structural source gap, not "
+                                          "per-row anomalies)"))
+        else:
+            out.append(CheckResult(page, "sanity.open_present",
+                                   "WARN" if blanks else "PASS",
+                                   count=len(blanks), examples=blanks,
+                                   detail="rows with blank Open"
+                                   if blanks else ""))
+        if _has_column(actual_set, k2h, _K_DAY_HI) and _has_column(
+                actual_set, k2h, _K_DAY_LO):
+            bad = []
+            for r in rows:
+                o = _safe_float(_resolve(r, k2h, _K_OPEN))
+                hi = _safe_float(_resolve(r, k2h, _K_DAY_HI))
+                lo = _safe_float(_resolve(r, k2h, _K_DAY_LO))
+                if o is None or hi is None or lo is None or hi <= 0 or lo <= 0:
+                    continue
+                if o < lo or o > hi:
+                    bad.append(f"{sym(r)}={o}")
+            out.append(CheckResult(
+                page, "sanity.open_in_day_range",
+                "WARN" if bad else "PASS", count=len(bad), examples=bad,
+                detail="Open outside [day_low, day_high]" if bad else ""))
+
     # price outside 52w range
     if _has_column(actual_set, k2h, _K_W52_HI) and _has_column(actual_set, k2h, _K_W52_LO):
         bad = []
@@ -866,6 +956,139 @@ def check_top10(page: str, k2h: Dict[str, str], actual_set: set, rows: List[Dict
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v1.3.0 (W1A-1) — ROUTE-AWARE DECISION SURFACE (Top_10 cockpit)
+# ---------------------------------------------------------------------------
+_DECISION_PAGES = ("Top_10_Investments",)
+_T10_BANNER_TOKENS = ("FEED", "ACTIONABLE")
+
+
+def _decision_surface_enabled() -> bool:
+    """VALIDATE_DECISION_SURFACE=0 restores the exact v1.2.0 default scope."""
+    return _env_bool("VALIDATE_DECISION_SURFACE", True)
+
+
+def _is_decision_page(page: str) -> bool:
+    p = _safe_str(page).strip().lower()
+    return any(p == d.lower() for d in _DECISION_PAGES)
+
+
+def _find_decision_header(grid: List[List[Any]]) -> int:
+    """Cockpit data-grid header: first cell 'Rank' with 'Symbol' among the
+    first four cells. Registry-token detection can't find it (v1.1.0 WHY),
+    so this looks for the cockpit's own signature."""
+    for i, row in enumerate(grid):
+        if not isinstance(row, list) or not row:
+            continue
+        c0 = _safe_str(row[0]).strip()
+        first4 = {_safe_str(c).strip() for c in row[:4]}
+        if c0 == "Rank" and "Symbol" in first4:
+            return i
+    return -1
+
+
+def _find_feed_banner(grid: List[List[Any]], upto: int) -> str:
+    """First row above the data grid whose joined text carries the FEED
+    verdict tokens. Returns the joined text ('' = banner absent)."""
+    for row in grid[: max(0, upto)]:
+        if not isinstance(row, list):
+            continue
+        txt = " ".join(_safe_str(c) for c in row if _safe_str(c)).strip()
+        up = txt.upper()
+        if all(tok in up for tok in _T10_BANNER_TOKENS):
+            return txt
+    return ""
+
+
+def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
+    """Decision-surface checks for the Top_10 cockpit — the backend-side
+    P0-5 tripwire. FAIL here exits 2 and daily_sync goes RED by design."""
+    out: List[CheckResult] = []
+    hr = _find_decision_header(grid)
+    if hr < 0:
+        out.append(CheckResult(page, "decision.header_found", "FAIL",
+                               detail=f"cockpit data-grid header (Rank|Symbol) "
+                                      f"not found in first {len(grid)} rows"))
+        return out
+    out.append(CheckResult(page, "decision.header_found", "PASS"))
+
+    banner = _find_feed_banner(grid, hr)
+    out.append(CheckResult(page, "decision.feed_banner_present",
+                           "PASS" if banner else "FAIL",
+                           detail=banner[:120] if banner
+                           else "no FEED verdict line above the data grid"))
+    blocked = "NOT ACTIONABLE" in banner.upper()
+
+    header = [_safe_str(c).strip() for c in grid[hr]]
+
+    def col(name: str) -> int:
+        try:
+            return header.index(name)
+        except ValueError:
+            return -1
+
+    i_sym, i_tkt = col("Symbol"), col("Ticket SAR")
+    i_shr, i_prc = col("Shares"), col("Price")
+
+    def cell(row: List[Any], i: int) -> str:
+        return _safe_str(row[i]).strip() if 0 <= i < len(row) else ""
+
+    data: List[List[Any]] = []
+    for row in grid[hr + 1:]:
+        if not isinstance(row, list) or not cell(row, i_sym):
+            break  # first symbol-blank row ends the SELECTED grid
+        data.append(row)
+
+    if blocked:
+        sized = []
+        for row in data:
+            t = _safe_float(cell(row, i_tkt))
+            sh = _safe_float(cell(row, i_shr))
+            if (t is not None and t > 0) or (sh is not None and sh > 0):
+                sized.append(f"{cell(row, i_sym)}"
+                             f"(ticket={cell(row, i_tkt) or '-'},"
+                             f"shares={cell(row, i_shr) or '-'})")
+        out.append(CheckResult(
+            page, "decision.sizing_withheld_when_blocked",
+            "FAIL" if sized else "PASS", count=len(sized) or len(data),
+            examples=sized,
+            detail="feed NOT ACTIONABLE yet row carries numeric sizing "
+                   "(P0-5 regression)" if sized else
+                   f"feed blocked; all {len(data)} selected row(s) unsized"))
+    else:
+        out.append(CheckResult(page, "decision.sizing_withheld_when_blocked",
+                               "SKIP", detail="feed not blocked"))
+        missing = [cell(r, i_sym) for r in data
+                   if (_safe_float(cell(r, i_prc)) or 0) <= 0]
+        out.append(CheckResult(page, "decision.price_present",
+                               "WARN" if missing else "PASS",
+                               count=len(missing), examples=missing,
+                               detail="selected row without positive Price"
+                               if missing else ""))
+    return out
+
+
+async def _run_decision_surface(page: str, sid: str,
+                                read_range: Optional[Callable]
+                                ) -> List[CheckResult]:
+    if read_range is None or not sid:
+        return [CheckResult(page, "decision.read", "SKIP",
+                            detail="decision surface requires the "
+                                   "read_range reader")]
+    depth = _env_int("VALIDATE_T10_HEADER_SCAN", 60, lo=20) + 60
+    rng = f"{page}!A1:AZ{depth}"
+    try:
+        loop = asyncio.get_running_loop()
+        grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
+        grid = await _maybe_await(grid)
+    except Exception as e:
+        return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
+    if not isinstance(grid, list) or not grid:
+        return [CheckResult(page, "decision.read", "FAIL",
+                            detail="read_range returned no grid")]
+    return check_top10_surface(page, grid)
+
+
 _DEFAULT_PAGES = [
     "Market_Leaders",
     "Global_Markets",
@@ -881,8 +1104,10 @@ _DEFAULT_PAGES = [
     # DATA GAPS / CANDIDATES) and has no hand-entered columns to protect.
     # check_top10() and the orchestrator's Top-10 branch are intentionally kept,
     # so an explicit `--pages Top_10_Investments` still runs the Top-10 checks.
-    # REVERSIBLE: uncomment the next line to restore the prior behavior exactly.
-    # "Top_10_Investments",
+    # v1.3.0 (W1A-1): Top_10 RETURNS to default scope through the
+    # DECISION-SURFACE path above (never the registry contract — the v1.1.0
+    # rationale stands). VALIDATE_DECISION_SURFACE=0 removes it again.
+    "Top_10_Investments",
 ]
 
 
@@ -908,6 +1133,13 @@ async def validate(
     results: List[CheckResult] = []
     for raw_page in pages:
         page = reg.normalize(raw_page) or raw_page
+        # v1.3.0: decision cockpit pages take their own surface path and
+        # never touch the 118-col registry contract.
+        if _is_decision_page(raw_page) or _is_decision_page(page):
+            if _decision_surface_enabled():
+                results.extend(
+                    await _run_decision_surface(raw_page, sid, read_range))
+            continue
         try:
             expected_headers = reg.headers(page)
             expected_keys = reg.keys(page)
@@ -922,6 +1154,18 @@ async def validate(
         if pdata.error and not pdata.rows:
             results.append(CheckResult(page, "read", "FAIL", detail=pdata.error))
             continue
+
+        # v1.3.0 (audit P1-1): every page verdict now carries its scope.
+        # WARN exits 1; daily_sync tolerates exit 1 by explicit design and
+        # reds only on >= 2 — the page is labeled, production is not broken.
+        results.append(CheckResult(
+            page, "scope.coverage",
+            "WARN" if pdata.sampled else "PASS",
+            count=len(pdata.rows),
+            detail=(f"SAMPLE_ONLY: first {len(pdata.rows)} rows validated; "
+                    "page has more — NOT a full-page certificate "
+                    "(--full / VALIDATE_FULL=1 to certify)")
+            if pdata.sampled else f"FULL ({len(pdata.rows)} rows)"))
 
         # CONTRACT
         if pdata.source == "read_range":
@@ -1053,6 +1297,10 @@ def create_parser() -> argparse.ArgumentParser:
                    help="Pages to validate (also VALIDATE_PAGES env as CSV).")
     p.add_argument("--max-rows", type=int, default=_env_int("VALIDATE_MAX_ROWS", 1500, lo=1),
                    help="Max data rows per page (also VALIDATE_MAX_ROWS env).")
+    p.add_argument("--full", action="store_true",
+                   default=_env_bool("VALIDATE_FULL", False),
+                   help="Lift --max-rows to VALIDATE_FULL_MAX (default 20000) "
+                        "for a certified full-page run (also VALIDATE_FULL).")
     p.add_argument("--json-out", default=os.getenv("VALIDATE_JSON_OUT") or "",
                    help="Write JSON report to this path (also VALIDATE_JSON_OUT env).")
     p.add_argument("--write-sheet", type=int, default=(1 if _env_bool("VALIDATE_WRITE_SHEET", False) else 0),
@@ -1078,7 +1326,12 @@ async def async_main() -> int:
         logger.error("No spreadsheet ID. Use --sheet-id or set VALIDATE_SHEET_ID / DEFAULT_SPREADSHEET_ID.")
         return 3
 
-    results, meta = await validate(pages=list(args.pages or _DEFAULT_PAGES), sid=sid, max_rows=int(args.max_rows))
+    max_rows = int(args.max_rows)
+    if getattr(args, "full", False):
+        max_rows = max(max_rows, _env_int("VALIDATE_FULL_MAX", 20000, lo=1))
+        logger.info("v1.3.0 --full: max_rows lifted to %d", max_rows)
+
+    results, meta = await validate(pages=list(args.pages or _DEFAULT_PAGES), sid=sid, max_rows=max_rows)
 
     if meta.get("fatal"):
         logger.error("Cannot validate: %s", meta["fatal"])
@@ -1123,6 +1376,7 @@ __all__ = [
     "check_gate",
     "check_sanity",
     "check_top10",
+    "check_top10_surface",
     "validate",
     "create_parser",
     "main",
