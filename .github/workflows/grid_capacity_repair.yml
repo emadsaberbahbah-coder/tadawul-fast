@@ -1,0 +1,88 @@
+# =============================================================================
+# 🧰 Grid Capacity Repair (P0-1) — .github/workflows/grid_capacity_repair.yml
+# =============================================================================
+# WHY: the workbook is at 9,999,977 / 10,000,000 allocated cells (23 free);
+# _Run_Log / Performance_Log / Signal_History appends fail HTTP 400 and the
+# S-1 evidence clock is frozen. scripts/repair_grid_capacity.py v1.0.0 frees
+# ~3.78M cells by grid-ROW reduction on six tabs, archiving _Run_Log to an
+# artifact before pruning. See the tool header for the full safety contract.
+#
+# MANUAL DISPATCH ONLY. Two-step operation:
+#   1) Run with apply=false  -> read the plan in the log + report artifact.
+#   2) Take a workbook backup, then run with apply=true, have_backup=yes,
+#      confirm=RESIZE.
+# The tool refuses apply unless every gate is present (exit 2), and exits 1
+# unless after-total < 7,000,000 AND a _Run_Log test append lands.
+#
+# Concurrency joins the PRODUCTION-WRITE group used by daily_sync so this can
+# never run while a sync leg is writing.
+# =============================================================================
+name: 🧰 Grid Capacity Repair (P0-1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Execute the resize (false = dry-run report only)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      have_backup:
+        description: "A full workbook backup exists (required for apply)"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+      confirm:
+        description: "Type RESIZE to arm apply"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tadawul-production-write-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  grid-repair:
+    name: 🧯 Report / repair allocated grid
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth
+
+      - name: Run repair tool
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          TFB_GRID_REPAIR_APPLY: ${{ inputs.apply == 'true' && '1' || '0' }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ "${{ inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "${{ inputs.have_backup }}" = "yes" ]; then ARGS="$ARGS --i-have-backup"; fi
+          python scripts/repair_grid_capacity.py $ARGS \
+            --confirm "${{ inputs.confirm }}" \
+            --artifacts-dir artifacts | tee artifacts_console.txt
+
+      - name: Upload artifacts (report + _Run_Log archive)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: grid-repair-${{ github.run_id }}
+          path: |
+            artifacts/
+            artifacts_console.txt
+          if-no-files-found: warn
+          retention-days: 90
