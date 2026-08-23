@@ -291,6 +291,7 @@ ENV KILL-SWITCHES (read per call; explicit controls > env > defaults)
   TFB_PF_TRIM_ROI_PCT     "-5"   valuation TRIM threshold (ROI ≤ this)
   TFB_PF_EXIT_ROI_PCT     "-15"  valuation EXIT threshold (ROI ≤ this)
   TFB_PF_VALUATION_TRIM_FRAC "0.5"  fraction trimmed on valuation TRIM
+  TFB_PF_MIN_TICKET_SAR   "0"    v1.8.1: TRIM below this SAR ⇒ HOLD (0=off)
   TFB_PF_REVIEW_DAYS      "30"   review-by horizon
   TFB_PF_LOT_SIZE         "1"    share lot rounding for ADD sizing
   TFB_PF_MAX_HOLDINGS     "0"    0 = unlimited; CPU safety clamp
@@ -620,6 +621,22 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   fixture. Fail-open: rows without a usable weight fall back to the
 #   legacy action-basis so the alert can never go silent on sparse data.
 #   Additive only — no key removed, no consumer broken.
+# v1.8.1 (2026-08-23, IR-090 — DE-MINIMIS TRIM FLOOR, default OFF):
+#   WHY: the 2026-08-23 corrected-cash PD rerun maths put YUM at a 66-SAR
+#   TRIM — below one USD-venue leg cost (~$30 ≈ 113 SAR), an economically
+#   irrational ticket that still rendered as an action. Both external
+#   audits flagged the class.
+#   WHAT: _apply_deminimis(action, reason, proceeds) — a post-decision
+#   demotion at the SAME caller seam as _apply_add_confirmation. Applies to
+#   TRIM ONLY: 0 < proceeds < TFB_PF_MIN_TICKET_SAR ⇒ HOLD with an explicit
+#   "De-minimis" reason and proceeds zeroed (so the proceeds/deployable
+#   aggregates never count a suppressed ticket). NEVER touches EXIT (rule
+#   and valuation exits are verdicts, not sizings — the v1.4.0 1a lesson),
+#   never ADD (sized later in the funding pass), never BLOCK/HOLD.
+#   decide_action itself is byte-identical.
+#   ENV: TFB_PF_MIN_TICKET_SAR, DEFAULT "0" ⇒ floor disabled, v1.8.0
+#   byte-identical. Recommended arming value 500 (≈4× USD leg cost);
+#   Render-side, its own arming day. KILL: unset/0.
 # v1.8.0 (2026-08-18 evening, external portfolio-layer audit — every P0/P1
 # reproduced against source; per-site F-tags): F1 rule-EXIT passes the SAME
 # step-1 primitives first (cost-basis rule, shared trust assessment,
@@ -634,7 +651,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # pass-2. F9 fresh_basis_gate_enabled boolean-typed. F10 range clamps +
 # configuration_invalid alert. F11 taxonomy split. F12 logging imported.
 # F13 OB floor (1,9,1).
-PORTFOLIO_ACTIONS_VERSION = "1.8.0"
+PORTFOLIO_ACTIONS_VERSION = "1.8.1"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -651,6 +668,29 @@ except Exception as _e1:  # pragma: no cover - environment dependent
         except Exception as _e3:
             _ob = None
             _OB_IMPORT_ERROR = "%s | %s | %s" % (_e1, _e2, _e3)
+
+def _apply_deminimis(action, reason, proceeds):
+    """v1.8.1 (IR-090). PURE post-decision demotion: a TRIM whose proceeds
+    sit strictly between 0 and TFB_PF_MIN_TICKET_SAR becomes HOLD with an
+    explicit reason, proceeds zeroed. Floor <= 0 (the DEFAULT) is a
+    passthrough — v1.8.0 byte-identical. EXIT is deliberately exempt
+    (verdict, not sizing); ADD is sized later in the funding pass and is
+    out of scope here."""
+    try:
+        floor = float((os.getenv("TFB_PF_MIN_TICKET_SAR") or "0").strip())
+    except Exception:
+        floor = 0.0
+    if floor <= 0 or action != ACTION_TRIM:
+        return action, reason, proceeds
+    p = float(proceeds or 0.0)
+    if 0.0 < p < floor:
+        return (ACTION_HOLD,
+                "De-minimis: TRIM %d SAR below floor %d SAR — "
+                "cost-inefficient ticket suppressed (IR-090); %s"
+                % (round(p), round(floor), reason),
+                0.0)
+    return action, reason, proceeds
+
 
 ACTION_ADD = "ADD"
 ACTION_HOLD = "HOLD"
@@ -2414,6 +2454,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             excess_share = sector_excess[sec] * (mv / sec_val)
         action, reason, proceeds, capped_from = decide_action(
             c, ctl, (None if _pv_incomplete else weight), (None if _pv_incomplete else sec_weight), (None if _pv_incomplete else excess_share))
+        # v1.8.1 (IR-090): de-minimis demotion — same seam pattern as the
+        # add-confirmation pass below; decide_action stays byte-identical.
+        action, reason, proceeds = _apply_deminimis(action, reason, proceeds)
         # v1.1.0 (Fix #3): a first-day ADD renders HOLD "pending
         # confirmation"; a non-ADD verdict resets the symbol's clock.
         action, reason, capped_from = _apply_add_confirmation(
