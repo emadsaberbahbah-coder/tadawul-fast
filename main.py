@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.0)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.1)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
@@ -292,7 +292,15 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
-APP_ENTRY_VERSION = "8.13.0"
+# v8.13.1 (2026-08-23, IR-096): additive observability only — one new
+# status-payload key "engine_gates" mirroring the engine's [GUARDS+] boot
+# line via core.data_engine_v2.surface_gate_states() (engine >= 5.132.1).
+# WHY: five deploys of arming attempts were unverifiable from the health
+# JSON the operator naturally pastes; now the paste IS the acceptance test.
+# Fail-open: engine absent or older engine (no attr) => {} — same
+# backward-safe-default rule as every prior additive key (engine_version,
+# global_auth_enforcement). No route, auth, or behavior change.
+APP_ENTRY_VERSION = "8.13.1"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1974,6 +1982,11 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "engine_source": engine_source,
         "engine_version": _resolve_engine_version(engine_obj, engine_source),
         "engine_init_error": engine_init_error,
+        # v8.13.1 (IR-096): gate states — fail-open {} on any shape.
+        "engine_gates": (
+            getattr(engine_obj, "surface_gate_states", lambda: {})()
+            if engine_obj is not None else {}
+        ),
         "startup_warnings": startup_warnings,
     }
 
