@@ -608,7 +608,26 @@ logger.addHandler(logging.NullHandler())
 # Zero functions removed; additions:
 # _t10_hard_exclude_over_grace_enabled, _t10_row_hard_excluded.
 # -----------------------------------------------------------------------------
-TOP10_SELECTOR_VERSION = "4.26.0"
+# =============================================================================
+# v4.27.0 (2026-08-24) — BC-3: HARD VETOES ARE CHECKED AT ADMISSION
+# =============================================================================
+# EVIDENCE: 2026-08-24 00:08 — Require Investable flipped to No; the pool
+#   reached the selector unfiltered and FAST-TRACK seated four rows whose own
+#   source state was BLOCKED / DO_NOT_INVEST (T82U.SI, ANDINA-B.SN, NTPC.NS,
+#   3816.KL), producing a same-export contradiction with Global_Markets.
+#   BC-2 (TFB_T10_HARD_EXCLUDE_OVER_GRACE) only polices GRACE continuation of
+#   incumbents; no admission path checked the predicate at all.
+# FIX: _admit_hard_vetoed() runs UNCONDITIONALLY on every seat-originating
+#   path — confirmed entry, displacement, fast-track fill — reusing the BC-2
+#   predicate (_t10_row_hard_excluded: final_action in {DO_NOT_INVEST,
+#   BLOCKED} or investability BLOCKED; deliberately NOT widened — SELL-class
+#   is already encoded in final_action by the engine). Vetoed symbols land in
+#   audit.hard_vetoed_admission (additive key). Panel settings can widen the
+#   POOL; they can never widen the BOARD past a hard veto.
+# KILL SWITCH: TFB_T10_ADMIT_LEGACY=1 => v4.26.0 membership byte-identical.
+# Zero removals; all prior WHYs preserved verbatim.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.27.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1140,6 +1159,22 @@ def _t10_hard_exclude_over_grace_enabled() -> bool:
     Default OFF; TFB_T10_HARD_EXCLUDE_OVER_GRACE=1 arms it. Unset/0
     keeps v4.25.0 membership behaviour byte-identically."""
     return (os.getenv("TFB_T10_HARD_EXCLUDE_OVER_GRACE") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _t10_admission_hard_veto_enabled() -> bool:
+    """v4.27.0 [BC-3]: hard safety verdicts are checked at ADMISSION —
+    unconditionally, on every path that can seat a symbol (confirmed entry,
+    displacement, fast-track fill). BC-2 (env-gated) only protects GRACE
+    continuation of incumbents; the 2026-08-24 00:08 regression proved a
+    panel toggle (Require Investable=No) could hand the selector a pool
+    containing BLOCKED / DO_NOT_INVEST rows and FAST-TRACK would seat them
+    (T82U.SI, ANDINA-B.SN, NTPC.NS, 3816.KL — live board, same-export
+    contradiction with Global_Markets). Stability may smooth soft-gate
+    movement; it must NEVER originate a seat for a hard-vetoed row,
+    regardless of panel settings. KILL SWITCH: TFB_T10_ADMIT_LEGACY=1
+    restores v4.26.0 membership byte-identically."""
+    return str(os.getenv("TFB_T10_ADMIT_LEGACY") or "0").strip().lower() \
+        not in ("1", "true", "yes", "on")
 
 
 _T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
@@ -4234,6 +4269,21 @@ def _apply_selection_stability(
             raw_by_sym[sym] = row
     raw_set = frozenset(raw_syms)
 
+    # v4.27.0 [BC-3]: admission-time hard veto (see helper docstring). Row
+    # lookup prefers today's raw row, falls back to the all-pool map; a row
+    # the predicate cannot read is fail-safe False (v4.26.0 behaviour).
+    _admit_veto_on = _t10_admission_hard_veto_enabled()
+    hard_vetoed_admission: List[str] = []
+
+    def _admit_hard_vetoed(sym: str) -> bool:
+        if not _admit_veto_on:
+            return False
+        if _t10_row_hard_excluded(raw_by_sym.get(sym) or sym2row.get(sym)):
+            if sym not in hard_vetoed_admission:
+                hard_vetoed_admission.append(sym)
+            return True
+        return False
+
     # v4.25.0 [PY-10]: resolved once per call; every hist point written
     # below is denominated in THIS scale and stamped with it.
     hist_scale = _stability_score_basis()
@@ -4359,6 +4409,8 @@ def _apply_selection_stability(
     for sym in raw_syms:  # confirmed challengers, today's quality order
         if sym in final:
             continue
+        if _admit_hard_vetoed(sym):  # v4.27.0 [BC-3]
+            continue
         if _safe_int(symbols[sym].get("ci"), 0) < confirm_days:
             continue
         if len(final) < limit:
@@ -4385,6 +4437,8 @@ def _apply_selection_stability(
         if len(final) >= limit:
             break
         if sym in final:
+            continue
+        if _admit_hard_vetoed(sym):  # v4.27.0 [BC-3]: never seat a hard veto
             continue
         fast_tracked.append(sym)
         final.append(sym)
@@ -4500,6 +4554,7 @@ def _apply_selection_stability(
             "exited_soft": exited_soft,
             "exited_capacity": exited_capacity,
             "exited_displaced": exited_displaced,
+            "hard_vetoed_admission": hard_vetoed_admission,
             "held_by_grace": held_by_grace,
             "pending": pending,
             "state_pruned": pruned,
