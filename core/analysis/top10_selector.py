@@ -627,7 +627,20 @@ logger.addHandler(logging.NullHandler())
 # KILL SWITCH: TFB_T10_ADMIT_LEGACY=1 => v4.26.0 membership byte-identical.
 # Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.27.0"
+# =============================================================================
+# v4.28.0 (2026-08-24) — BC-4: SIZING WITHHELD MEANS DISCLOSURE WITHHELD
+# =============================================================================
+# EVIDENCE: 2026-08-24 board — Ticket/Shares rendered "\u2014" on withheld
+#   seats while Advisor Note, Funds From and the GAS _Selection_Log echo of
+#   the same row dicts disclosed the full sizing plan. The renderer and the
+#   log consume THESE rows; redacting here closes note + funds + log in one
+#   seam. Out of scope by placement facts: the KPI strip (builder kpis
+#   payload) and any verdict-conditional blanking (GAS consumer of the
+#   unarmed TFB_SYNC_UPSTREAM_VERDICT producer) — both registered separately.
+# KILL SWITCH: TFB_T10_DISCLOSE_LEGACY=1 => v4.27.0 payload byte-identical.
+# Zero removals; all prior WHYs preserved verbatim.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.28.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1175,6 +1188,51 @@ def _t10_admission_hard_veto_enabled() -> bool:
     restores v4.26.0 membership byte-identically."""
     return str(os.getenv("TFB_T10_ADMIT_LEGACY") or "0").strip().lower() \
         not in ("1", "true", "yes", "on")
+
+
+def _t10_disclosure_redaction_enabled() -> bool:
+    """v4.28.0 [BC-4] kill switch — TFB_T10_DISCLOSE_LEGACY=1 restores
+    v4.27.0 payload bytes (full plans on withheld rows)."""
+    return str(os.getenv("TFB_T10_DISCLOSE_LEGACY") or "0").strip().lower() \
+        not in ("1", "true", "yes", "on")
+
+
+_T10_WITHHELD_STATUS_PREFIXES = ("FAST-TRACK", "GRACE")
+_T10_RESEARCH_NOTE = ("RESEARCH_ONLY \u2014 sizing withheld until stability "
+                      "confirms; no executable plan.")
+_T10_REDACT_NONE_KEYS = ("suggested_sar", "suggested_shares",
+                         "exp_gain_12m_sar")
+
+
+def _t10_redact_withheld(row, status):
+    """v4.28.0 [BC-4]: column-hiding is not decision-withholding. The live
+    2026-08-24 board withheld Ticket/Shares with \u2014 while the SAME rows
+    leaked the full plan through Advisor Note (1150.SR: 18,234 SAR / 723 sh /
+    entry / stop / TP1 / TP2), Funds From (ENELCHILE.SN: "Cash 18,243 SAR")
+    and the GAS _Selection_Log echo of these very row dicts. When a seat is
+    sizing-withheld (stability_status FAST-TRACK* / GRACE*), every sizing
+    disclosure on the row is redacted at the source: advisor_note ->
+    RESEARCH_ONLY sentence (no numbers), funds_from -> \u2014,
+    suggested_sar / suggested_shares / exp_gain_12m_sar -> None. Per-share
+    levels (entry zone, stop_sar, tp1/tp2_sar) are NOT sizing and stay.
+    ACTIVE / NEW(confirmed) rows are untouched. Pure, in-place, total —
+    unreadable rows pass through unchanged. Returns row for harness use."""
+    try:
+        if not _t10_disclosure_redaction_enabled():
+            return row
+        s = str(status or "").upper()
+        if not s.startswith(_T10_WITHHELD_STATUS_PREFIXES):
+            return row
+        if "advisor_note" in row:
+            row["advisor_note"] = _T10_RESEARCH_NOTE
+        if "funds_from" in row:
+            row["funds_from"] = "\u2014"
+        for k in _T10_REDACT_NONE_KEYS:
+            if k in row:
+                row[k] = None
+    except Exception:
+        pass
+    return row
 
 
 _T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
@@ -4506,6 +4564,7 @@ def _apply_selection_stability(
         row["entry_date"] = since
         row["score_smoothed"] = smoothed
         row["stability_trend"] = trend
+        _t10_redact_withheld(row, status)  # v4.28.0 [BC-4]
         out_rows.append(row)
 
     # ---- state hygiene: prune stale non-members, cap total size --------------
