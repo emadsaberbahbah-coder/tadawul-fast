@@ -1020,7 +1020,25 @@ from datetime import datetime, timedelta, timezone
 # GATE DEFAULT: **OFF**. ZERO functions removed. Additions:
 # _env_cap_band_gate, _env_cap_band, _cap_band_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.13.0"
+# =============================================================================
+# v1.14.0 (2026-08-24) — ROI-TRUTH: ONE MEANING PER KEY ON THE AUDIT TAIL
+# =============================================================================
+# EVIDENCE (Morning Review + adjudication 2026-08-24): the same symbol carried
+#   three ROI stories — board plan-TP1 10.7% (ENELCHILE.SN), audit tail 21.5%
+#   in the SAME rendered column, engine 21.5% — because audit records emit
+#   VALUATION upside in the primary roi_pct key while the board renders
+#   plan-TP1 under the "ROI % (TP1)" header. MECHANISM ADJUDICATION: the 12%
+#   ROI gate tests VALUATION upside and was never fed engine values (external
+#   "gate bypass by substitution" claim REFUTED at this file); the defect is
+#   emission ambiguity, not gating. FIX: under the live default basis "plan",
+#   _audit_align_plan_roi() rewrites the audit record's primary roi/ann to
+#   plan-TP1 AFTER gates/verdict/score (selection byte-identical); valuation
+#   preserved in valuation_roi_pct/_ann; missing ladder => None + D-25 tag
+#   roi_basis_note=TP1_UNAVAILABLE(DATA_GAP). New pure helper _tp1_plan_roi()
+#   is the single plan-TP1 definition. KILL SWITCH TFB_OPP_AUDIT_ROI_LEGACY=1
+#   restores v1.13.0 bytes. Zero removals; all prior WHYs preserved verbatim.
+# =============================================================================
+OPPORTUNITY_BUILDER_VERSION = "1.14.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1614,6 +1632,55 @@ def _ref_conservative_enabled():
     normalize_candidate byte-identical to v1.2.0."""
     return str(_env_str("TFB_OPP_REF_CONSERVATIVE", "0")).strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def _tp1_plan_roi(cand):
+    """v1.14.0 [ROI-TRUTH-1]: the plan-TP1 ROI for ANY candidate dict —
+    (tp1 - price) / price * 100 — or None when the ladder/price is absent.
+    Pure and total: bad inputs return None, never raise. This is the ONE
+    definition of \"plan TP1 ROI\" for audit alignment; the ticket path keeps
+    its own _plan_roi (identical formula at the selected seam)."""
+    try:
+        tp1 = cand.get("tp1")
+        price = cand.get("price")
+        tp1 = float(tp1) if tp1 is not None else None
+        price = float(price) if price is not None else None
+        if tp1 is None or price is None or price <= 0:
+            return None
+        return round((tp1 - price) / price * 100.0, 1)
+    except Exception:
+        return None
+
+
+def _audit_align_plan_roi(rec, crit):
+    """v1.14.0 [ROI-TRUTH-2 / D-25]: under the LIVE default basis (\"plan\")
+    the audit record's PRIMARY roi/ann now speak the same language as the
+    rendered board: plan-TP1. Before this fix the audit carried VALUATION
+    upside in the same key the board renders as plan-TP1 — one key, three
+    meanings ("three ROI stories", Morning Review 2026-08-24 §4). Gates,
+    verdict, score and selection were computed BEFORE this call and are
+    byte-untouched; valuation stays in valuation_roi_pct / _ann. When no
+    TP1 ladder exists the primary field becomes None (renders blank) and
+    roi_basis_note = TP1_UNAVAILABLE(DATA_GAP) — an evidence gap stated
+    honestly, never a silently borrowed number (D-25 default: DATA_GAP).
+    KILL SWITCH: TFB_OPP_AUDIT_ROI_LEGACY=1 restores v1.13.0 emission
+    byte-identically. Returns rec (mutated in place) for harness use."""
+    try:
+        if str(_env_str("TFB_OPP_AUDIT_ROI_LEGACY", "0")).strip().lower() \
+                in ("1", "true", "yes", "on"):
+            return rec
+        if str((crit or {}).get("primary_roi_basis") or "").strip().lower() \
+                != "plan":
+            return rec
+        _p = _tp1_plan_roi(rec.get("_cand") or {})
+        rec["roi_pct"] = _p
+        rec["ann_roi_pct"] = _p
+        rec["primary_roi_basis"] = "plan"
+        if _p is None:
+            rec["roi_basis_note"] = "TP1_UNAVAILABLE(DATA_GAP)"
+    except Exception:
+        pass
+    return rec
 
 
 def _env_primary_roi_basis():
@@ -4156,6 +4223,10 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 _rec["primary_roi_basis"] = "engine"
             else:
                 _rec["primary_roi_basis"] = "valuation"
+        # v1.14.0 [ROI-TRUTH-2]: plan-basis alignment (the live default) —
+        # see _audit_align_plan_roi. Runs AFTER gates/verdict/score; display
+        # truthfulness only, selection byte-identical.
+        _audit_align_plan_roi(audit[-1], crit)
 
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
     invest = [a for a in audit
