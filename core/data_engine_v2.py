@@ -3308,7 +3308,23 @@ if str(ROOT_DIR) not in sys.path:
 #   Top_10 dry-run per standing policy.
 #   NOT CHANGED: synthesize math, reliability formula, gate thresholds,
 #   projection schema (115), SAI contract (1.4.1), any provider call.
-__version__ = "5.132.1"
+# =============================================================================
+# v5.133.0 (2026-08-24) — DQ-COHERENCE-CAP: COMPLETENESS IS NOT COHERENCE
+# =============================================================================
+# EVIDENCE (Morning Review + adjudication 2026-08-24): data_quality_score is a
+#   completeness metric, so fully-populated-with-garbage rows scored 100 and
+#   gated INVESTABLE ('Copper Futures' fetch_failed + inverted range @82.4;
+#   O39.SI Open 187.30 vs 30.80-31.02 @100). FIX: _dq_coherence_cap() caps DQ
+#   at 55 (between the v5.78.0 floors 40/70) when engine-visible incoherence is
+#   present, applied INSIDE _apply_investability_gate before rel blend, trust
+#   banding and the verdict ladder — INVESTABLE becomes impossible for the
+#   capped class; the cap never manufactures a BLOCKED. xprovider_verified 0.0%%
+#   stays exonerating. SCOPE HONESTY: contamination injected AFTER the engine
+#   at the GAS write seam is out of this cap's sight — that remains the writer-
+#   guard work item. KILL SWITCH: TFB_DQ_COHERENCE_LEGACY=1 => v5.132.1
+#   byte-identical. Zero removals; all prior WHYs preserved verbatim.
+# =============================================================================
+__version__ = "5.133.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5936,6 +5952,71 @@ def _dd_infer_dtype_fmt(key: str, header: str) -> Tuple[str, str]:
     return "string", ""
 
 
+_DQ_COHERENCE_CAP: float = 55.0
+# v5.133.0: sits BETWEEN the v5.78.0 floors — below _GATE_DQ_INVESTABLE_MIN
+# (70 => a capped row can never gate INVESTABLE) and above _GATE_DQ_HARD_FLOOR
+# (40 => the cap itself never manufactures a BLOCKED; hard blocks stay owned
+# by their own evidence classes: missing price, bar age, provider failure).
+
+
+def _dq_coherence_cap_enabled() -> bool:
+    """v5.133.0 kill switch — TFB_DQ_COHERENCE_LEGACY=1 restores v5.132.1
+    byte-identical DQ semantics (completeness only)."""
+    return str(os.getenv("TFB_DQ_COHERENCE_LEGACY") or "0").strip().lower() \
+        not in ("1", "true", "yes", "on")
+
+
+def _dq_coherence_cap(row, dq, warns):
+    """v5.133.0 [DQ-COHERENCE-CAP]: data_quality_score was pure COMPLETENESS
+    (field 108) — a row whose every field is populated with garbage scored 100
+    (live exhibits 2026-08-24: 'Copper Futures' INVEST with fetch_failed:HTTP
+    422 + inverted day range at DQ 82.4; O39.SI-class INVEST with Open far
+    outside the day range at DQ 100). Completeness is not coherence: any
+    decision-critical incoherence the ENGINE can see caps DQ at
+    _DQ_COHERENCE_CAP *before* the verdict ladder, the 0.7/0.3 reliability
+    blend and the trust banding consume it — the cap is DECISIONAL, not
+    cosmetic. Conditions (any):
+      * 'fetch_failed' in warnings (provider-emitted, visible at gate scope)
+      * 'xprovider_price_conflict' in warnings — NOTE: xprovider_verified:*:0.0%%
+        is EXONERATION (exact cross-provider agreement) and must NEVER cap
+      * 'identity_mismatch' / 'identity_echo_mismatch' in warnings
+      * geometry, only on PRESENT values (blank Open pages e.g. Market_Leaders
+        are untouched): day_high < day_low; Open outside [low,high] at 1%%
+        tolerance (the engine coherence family tolerance); current_price
+        outside [low,high] at 1%%.
+    Returns (capped_dq, reason_tag_or_None); pure and total — bad inputs
+    return (dq, None), never raise."""
+    try:
+        if not _dq_coherence_cap_enabled():
+            return dq, None
+        w = warns or ""
+        reason = None
+        if "fetch_failed" in w:
+            reason = "fetch_failed"
+        elif "xprovider_price_conflict" in w:
+            reason = "xprovider_conflict"
+        elif "identity_echo_mismatch" in w or "identity_mismatch" in w:
+            reason = "identity"
+        else:
+            o = _as_float(row.get("open"))
+            lo = _as_float(row.get("day_low"))
+            hi = _as_float(row.get("day_high"))
+            cp = _as_float(row.get("current_price"))
+            if lo is not None and hi is not None and hi < lo:
+                reason = "high_lt_low"
+            elif (o is not None and lo is not None and hi is not None
+                  and (o < lo * 0.99 or o > hi * 1.01)):
+                reason = "open_outside_range"
+            elif (cp is not None and lo is not None and hi is not None
+                  and (cp < lo * 0.99 or cp > hi * 1.01)):
+                reason = "price_outside_range"
+        if reason is None or dq is None or dq <= _DQ_COHERENCE_CAP:
+            return dq, None
+        return _DQ_COHERENCE_CAP, "dq_capped:coherence:" + reason
+    except Exception:
+        return dq, None
+
+
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """v5.78.0: compute the decision-readiness layer (8 canonical columns).
 
@@ -6052,6 +6133,12 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     total_w = sum(w for w, _ok in components)
     got_w = sum(w for w, ok in components if ok)
     dq = round(100.0 * got_w / total_w, 1) if total_w else 0.0
+    # v5.133.0 [DQ-COHERENCE-CAP]: cap BEFORE rel blend, trust banding and the
+    # verdict ladder so an incoherent row can never gate INVESTABLE off a
+    # completeness-only 100. See _dq_coherence_cap.
+    dq, _dq_cap_tag = _dq_coherence_cap(row, dq, warns)
+    if _dq_cap_tag:
+        _v573_append_warning(row, _dq_cap_tag)
 
     # -- forecast_reliability_score: confidence penalised for weak provenance --
     # v5.83.3 (Fix S2): two env-gated refinements, both behind
