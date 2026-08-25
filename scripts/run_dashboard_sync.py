@@ -1796,7 +1796,46 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   enforce behaviour, KLG, trim, readback logic, any write. With every ENV
 #   unset the write path is byte-identical to v6.41.0.
 
-SCRIPT_VERSION = "6.44.1"
+# =============================================================================
+# v6.45.0 (ONE-PASS R1-R6, operator-approved scope freeze 2026-08-25)
+# -----------------------------------------------------------------------------
+# Evidence base: 2026-08-25 six-gate audit + adjudicated external audit.
+# prewrite flags 0-9 vs readback 300-440 (GM) every run; zero Global_Markets
+# "Batch refresh completed" since 2026-08-02 19:13:44 => a second writer is
+# always mid-flight; _Status is not a freshness contract; ML .SR price_band
+# flags fire only at TASI-open runs (stale band vs live price = data artifact,
+# not corruption).
+#   R1 [SYNC-HOLD]   backend publishes "backend sync hold until <utc>" into
+#      _Sync_Control before write_table and clears it after, reusing the
+#      v6.32.0 channel in the REVERSE direction (backend already yields to
+#      GAS; now GAS can yield to the backend — GAS half ships separately).
+#      ENV TFB_SYNC_WRITE_SENTINEL default OFF => zero reads/writes, byte-
+#      identical. TTL (TFB_SYNC_HOLD_TTL_SEC, default 180s) self-heals a
+#      crash mid-write. Distinct key norm "backendsyncholduntil" is invisible
+#      to _mh_read_hold by construction (proven in harness).
+#   R2 [OHLC-REPAIR] on a DIVERGENT readback, restore ONLY the Open/High/Low
+#      columns from the in-memory payload (the matrix that just passed the
+#      prewrite guard), then re-verify once and log before->after. ENV
+#      TFB_SYNC_READBACK_REPAIR default off; token "repair" arms; anything
+#      else off. Bounded: one pass per page per run; <=3 column updates.
+#   R3/R6 [ENFORCE-CLASSES] TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES (default
+#      "open,price_band,range" = today's enforce semantics byte-identical)
+#      lets enforce act per offense class. Rationale: ML .SR rows flag
+#      price_band only during the TASI session because the band is the prior
+#      fetch's — blanking H/L there would degrade a live page for a data-
+#      freshness artifact. "open,range" enforces the corruption classes while
+#      price_band stays measured-only. Counters/logs unchanged in ALL modes.
+#   R4 [STATUS-STAMP+] the A..J stamp message now carries data_status
+#      (COMPLETE/PARTIAL), guard counts (pw/rb/repair), and payload sha8 —
+#      the mini cohort manifest the W2 certificate consumes. Bounded A..J
+#      exactly as before; gate TFB_SYNC_STATUS_STAMP unchanged, still OFF.
+#   R5 [RUN-META] every _Run_Log Details JSON this file writes gains
+#      run_id + ts_utc via _runlog_meta_json (fail-open). Column-A format
+#      deliberately UNCHANGED (both-writer ISO migration = Register item).
+# Zero functions removed; additive only; every new behavior ENV-gated with
+# defaults preserving v6.44.1 byte-identically.
+# =============================================================================
+SCRIPT_VERSION = "6.45.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4289,15 +4328,20 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
         if len(stats["examples"]) < 12 and 0 <= sym_i < n and not _guard_is_blank(row[sym_i]):
             stats["examples"].append(str(row[sym_i]).strip())
         if enforce:
-            if "open" in offenses and 0 <= open_i < n:
+            # v6.45.0 R3/R6: mutate only the operator-selected classes;
+            # default = all three = v6.44.1 byte-identical. Counters and the
+            # per-page log line above are class-blind in every setting.
+            _ecl = _ohlc_prewrite_enforce_classes()
+            _acted = [k for k in offenses if k in _ecl]
+            if "open" in _acted and 0 <= open_i < n:
                 row[open_i] = ""
-            if ("range" in offenses or "price_band" in offenses):
+            if ("range" in _acted or "price_band" in _acted):
                 if 0 <= hi_i < n:
                     row[hi_i] = ""
                 if 0 <= lo_i < n:
                     row[lo_i] = ""
-            if 0 <= warn_i < n:
-                tag = "ohlc_incoherent_dropped:" + "+".join(offenses) + ":prewrite"
+            if _acted and 0 <= warn_i < n:
+                tag = "ohlc_incoherent_dropped:" + "+".join(_acted) + ":prewrite"
                 prev = "" if _guard_is_blank(row[warn_i]) else str(row[warn_i]).strip()
                 if tag not in prev:
                     row[warn_i] = (prev + ("; " if prev else "") + tag)
@@ -4857,6 +4901,7 @@ def _append_runlog_ohlc_prewrite(
             "tol": tol,
             "version": SCRIPT_VERSION,
         })
+        details = _runlog_meta_json(details)
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status,
                             msg, "", "", "", details]]}
@@ -5039,8 +5084,8 @@ def _append_runlog_ohlc_readback(
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status,
                             msg, "", "", "",
-                            json.dumps(dict(delta,
-                                            version=SCRIPT_VERSION))]]}
+                            _runlog_meta_json(json.dumps(dict(delta,
+                                            version=SCRIPT_VERSION)))]]}
         _last = None
         for _ in (1, 2):
             try:
@@ -5062,6 +5107,302 @@ def _append_runlog_ohlc_readback(
         print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
               % (_OHLC_READBACK_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log line skipped: %s", _OHLC_READBACK_TAG, _e)
+
+
+# =============================================================================
+# v6.45.0 (R1/R2/R5) — SYNC-HOLD, READBACK-REPAIR, RUN-META
+# =============================================================================
+import hashlib as _sh_hashlib
+import uuid as _sh_uuid
+
+_RUN_ID = _sh_uuid.uuid4().hex[:12]
+_SYNC_HOLD_TAG = f"[SYNC-HOLD v{SCRIPT_VERSION}]"
+_OHLC_REPAIR_TAG = f"[OHLC-REPAIR v{SCRIPT_VERSION}]"
+_SH_KEY = "backend sync hold until"
+_SH_KEY_NORM = "backendsyncholduntil"
+_SH_STATE = {"active": False, "row": None}
+
+
+def _runlog_meta_json(details: str) -> str:
+    """v6.45.0 R5: inject run_id + ts_utc into a Details-JSON string.
+    FAIL-OPEN: any parse error returns the input unchanged."""
+    try:
+        d = json.loads(details or "{}")
+        if isinstance(d, dict):
+            d.setdefault("run_id", (os.getenv("GITHUB_RUN_ID") or "").strip()
+                         or _RUN_ID)
+            d.setdefault("ts_utc", datetime.now(timezone.utc).isoformat())
+            return json.dumps(d)
+    except Exception:
+        pass
+    return details
+
+
+def _payload_sha8(headers: list, rows_matrix: list) -> str:
+    """v6.45.0 R4: stable 8-hex fingerprint of the written payload."""
+    try:
+        h = _sh_hashlib.sha256()
+        h.update(("|".join(str(x) for x in (headers or []))).encode(
+            "utf-8", "replace"))
+        for r in (rows_matrix or []):
+            h.update(("|".join("" if c is None else str(c)
+                               for c in (r if isinstance(r, list) else [r]))
+                      ).encode("utf-8", "replace"))
+        return h.hexdigest()[:8]
+    except Exception:
+        return ""
+
+
+def _sync_hold_enabled() -> bool:
+    """v6.45.0 R1 master gate. DEFAULT OFF — unset/0/false/off keeps the
+    v6.44.1 write path byte-identical (no _Sync_Control writes at all)."""
+    return (os.getenv("TFB_SYNC_WRITE_SENTINEL") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _sync_hold_ttl_sec() -> int:
+    try:
+        v = int(float((os.getenv("TFB_SYNC_HOLD_TTL_SEC") or "180").strip()))
+    except Exception:
+        v = 180
+    return min(900, max(30, v))
+
+
+def _sync_hold_find_row(grid) -> int:
+    """1-based row index of the backend hold key in _Sync_Control, or -1."""
+    try:
+        for i, row in enumerate(grid or [], start=1):
+            if not isinstance(row, list) or not row:
+                continue
+            key = re.sub(r"[^a-z0-9]+", "", str(row[0] or "").lower())
+            if key == _SH_KEY_NORM:
+                return i
+    except Exception:
+        pass
+    return -1
+
+
+def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
+    """v6.45.0 R1: publish the backend write-window hold. FAIL-OPEN — a
+    publish failure must never block the write it protects."""
+    if not _sync_hold_enabled() or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        row_i = _SH_STATE.get("row")
+        if not row_i:
+            grid = []
+            try:
+                _resp = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{_MH_SHEET}'!A1:C12").execute()
+                grid = _resp.get("values", []) or []
+            except Exception:
+                grid = []
+            row_i = _sync_hold_find_row(grid)
+            if row_i < 1:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{_MH_SHEET}'!A1:C1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [[_SH_KEY, "", ""]]}).execute()
+                row_i = max(1, len(grid) + 1)
+            _SH_STATE["row"] = row_i
+        _td = __import__("datetime").timedelta
+        until = (datetime.now(timezone.utc)
+                 + _td(seconds=_sync_hold_ttl_sec())).isoformat()
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{_MH_SHEET}'!A{row_i}:C{row_i}",
+            valueInputOption="RAW",
+            body={"values": [[_SH_KEY, until,
+                              f"{_SYNC_HOLD_TAG} {page}"]]}).execute()
+        _SH_STATE["active"] = True
+        logger.info("%s published for %s until %s (row %s)",
+                    _SYNC_HOLD_TAG, page, until, row_i)
+    except Exception as _e:
+        print("::warning::%s publish failed for %s — %s: %s"
+              % (_SYNC_HOLD_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s publish skipped: %s", _SYNC_HOLD_TAG, _e)
+
+
+def _sync_hold_clear(sheets: Any, spreadsheet_id: str) -> None:
+    """v6.45.0 R1: clear the hold (blank the expiry cell). No-op unless a
+    publish succeeded this run. FAIL-OPEN; TTL is the crash backstop."""
+    if not _SH_STATE.get("active") or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        row_i = _SH_STATE.get("row")
+        if svc and row_i:
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{_MH_SHEET}'!B{row_i}:C{row_i}",
+                valueInputOption="RAW",
+                body={"values": [["", f"{_SYNC_HOLD_TAG} cleared"]]}).execute()
+        _SH_STATE["active"] = False
+        logger.info("%s cleared (row %s)", _SYNC_HOLD_TAG, row_i)
+    except Exception as _e:
+        _SH_STATE["active"] = False
+        print("::warning::%s clear failed — %s: %s (TTL will expire it)"
+              % (_SYNC_HOLD_TAG, type(_e).__name__, _e))
+
+
+def _ohlc_prewrite_enforce_classes() -> frozenset:
+    """v6.45.0 R3/R6: offense classes enforce may MUTATE. Default = all
+    three = v6.44.1 enforce semantics byte-identical. CSV restricted to
+    {open, price_band, range}; empty/invalid input fails SAFE to default.
+    Observe-mode counters and log lines are unaffected in every setting."""
+    default = frozenset({"open", "price_band", "range"})
+    raw = (os.getenv("TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES") or "").strip()
+    if not raw:
+        return default
+    out = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    out &= default
+    return frozenset(out) if out else default
+
+
+def _readback_repair_mode() -> str:
+    """v6.45.0 R2: 'repair' only on the exact token; anything else = off."""
+    raw = (os.getenv("TFB_SYNC_READBACK_REPAIR") or "").strip().lower()
+    return "repair" if raw == "repair" else "off"
+
+
+def _append_runlog_ohlc_repair(sheets: Any, spreadsheet_id: str, page: str,
+                               info: dict) -> None:
+    """v6.45.0 R2: durable line for the repair pass, same channel/discipline
+    as the readback appender."""
+    if not info or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        level = "WARNING" if info.get("warn") else "INFO"
+        status = "REPAIRED" if not info.get("warn") else "REPAIR_PARTIAL"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            str(info.get("line") or ""), "", "", "",
+                            _runlog_meta_json(json.dumps(dict(
+                                info, version=SCRIPT_VERSION)))]]}
+        for _ in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body).execute()
+                return
+            except Exception:
+                time.sleep(1.0)
+    except Exception as _e:
+        logger.warning("%s run-log line skipped: %s", _OHLC_REPAIR_TAG, _e)
+
+
+def _ohlc_readback_repair(sheets: Any, spreadsheet_id: str, page: str,
+                          headers: list, rows_matrix: list,
+                          start_cell: str, delta: dict) -> Optional[dict]:
+    """v6.45.0 R2 — restore the OHLC trio from the payload after a DIVERGENT
+    readback, then re-verify ONCE.
+
+    Contract:
+      * Acts only when TFB_SYNC_READBACK_REPAIR=repair AND the readback
+        verdict is DIVERGENT with a real baseline (prewrite armed).
+      * Touches ONLY the Open / Day High / Day Low columns, over exactly the
+        row span this run wrote (start_row+1 .. +len(rows_matrix)). Every
+        other column and any row outside the span is untouched by
+        construction. Payload None -> "" (explicit clear, FG semantics).
+      * Bounded: <=3 values.update calls (1 when the trio is contiguous),
+        one re-verify, one _Run_Log line. One pass per page per run.
+      * FAIL-OPEN end to end: any error returns {'error': ...} and the
+        write's verdict stands.
+    """
+    try:
+        if _readback_repair_mode() != "repair":
+            return None
+        if not delta or delta.get("error") or not _ohlc_prewrite_enabled():
+            return None
+        _lvl, _st = _ohlc_readback_status(delta)
+        if _st != "DIVERGENT":
+            return None
+        if not headers or not rows_matrix or sheets is None:
+            return None
+        svc = sheets._get_service()
+        if not svc:
+            return None
+        hdr = list(headers)
+        open_i = _guard_find_col(hdr, _GUARD_OPEN_ALIASES)
+        hi_i = _guard_find_col(hdr, _GUARD_DAYHIGH_ALIASES)
+        lo_i = _guard_find_col(hdr, _GUARD_DAYLOW_ALIASES)
+        cols = sorted(i for i in (open_i, hi_i, lo_i) if i >= 0)
+        if not cols:
+            return None
+        _m = re.match(r"^\$?([A-Za-z]+)\$?(\d+)$",
+                      str(start_cell or "").strip())
+        _scol = (_m.group(1).upper() if _m else "A")
+        _srow = (int(_m.group(2)) if _m else 1)
+        _sidx = 0
+        for _ch in _scol:
+            _sidx = _sidx * 26 + (ord(_ch) - ord("A") + 1)
+        r0 = _srow + 1                      # first data row (headers at _srow)
+        r1 = _srow + len(rows_matrix)
+        def _cell(row, ci):
+            v = row[ci] if (isinstance(row, list) and ci < len(row)) else None
+            return "" if v is None else v
+        updates = 0
+        contiguous = (len(cols) >= 2 and cols == list(
+            range(cols[0], cols[0] + len(cols))))
+        if contiguous:
+            a = _idx_to_a1_col(_sidx + cols[0])
+            b = _idx_to_a1_col(_sidx + cols[-1])
+            vals = [[_cell(r, ci) for ci in cols] for r in rows_matrix]
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{page}'!{a}{r0}:{b}{r1}",
+                valueInputOption="RAW",
+                body={"majorDimension": "ROWS", "values": vals}).execute()
+            updates = 1
+        else:
+            for ci in cols:
+                a = _idx_to_a1_col(_sidx + ci)
+                vals = [[_cell(r, ci)] for r in rows_matrix]
+                svc.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{page}'!{a}{r0}:{a}{r1}",
+                    valueInputOption="RAW",
+                    body={"majorDimension": "ROWS", "values": vals}).execute()
+                updates += 1
+        pw = {"checked": int(delta.get("prewrite_checked") or 0),
+              "flagged": int(delta.get("prewrite_flagged") or 0),
+              "blank_open": int(delta.get("prewrite_blank_open") or 0)}
+        rb2 = _ohlc_readback_verify(sheets, spreadsheet_id, page, headers,
+                                    rows_matrix, start_cell, pw) or {}
+        after = (int(rb2.get("readback_flagged"))
+                 if rb2.get("readback_flagged") is not None
+                 and not rb2.get("error") else None)
+        before = int(delta.get("readback_flagged") or 0)
+        warn = (after is None) or (after > pw["flagged"])
+        line = (f"{_OHLC_REPAIR_TAG} {page} | restored ohlc cols={len(cols)} "
+                f"rows={len(rows_matrix)} updates={updates} | "
+                f"flagged rb:{before}->"
+                f"{after if after is not None else '?'} (pw={pw['flagged']})")
+        info = {"page": page, "cols": len(cols), "rows": len(rows_matrix),
+                "updates": updates, "before_flagged": before,
+                "after_flagged": after, "pw_flagged": pw["flagged"],
+                "warn": bool(warn), "line": line}
+        try:
+            _append_runlog_ohlc_repair(sheets, spreadsheet_id, page, info)
+        except Exception:
+            pass
+        return info
+    except Exception as _e:
+        logger.warning("%s failed on %s — %s: %s", _OHLC_REPAIR_TAG, page,
+                       type(_e).__name__, _e)
+        return {"error": f"{type(_e).__name__}: {_e}"}
 
 
 # =============================================================================
@@ -5158,7 +5499,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
             ).total_seconds() * 1000.0))
     except Exception:
         dur_ms = ""
-    run_id = (os.getenv("GITHUB_RUN_ID") or "").strip()
+    run_id = (os.getenv("GITHUB_RUN_ID") or "").strip() or _RUN_ID
     # v6.39.1 (external audit P0-3, ACCEPTED): write completeness is NOT
     # refresh completeness. A FLOOR-MERGE leg can write a full page of which
     # only a fraction is fresh — publish fresh/preserved/coverage explicitly
@@ -5185,6 +5526,21 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     status_cell = status.upper() if status else "UNKNOWN"
     if (status_cell == "SUCCESS" and cov is not None and cov < fresh_min):
         status_cell = "PARTIAL_FRESH"
+    # v6.45.0 R4: data_status = the cohort verdict a consumer can trust.
+    # COMPLETE only when the leg succeeded, nothing failed, refresh coverage
+    # met the floor, and the readback either matched or was repaired back to
+    # the prewrite baseline. Anything else is PARTIAL — never false-green.
+    rbst = str(meta.get("rb_status") or "").strip().upper()
+    rep_after = meta.get("repair_after")
+    pw_fl = int(meta.get("pw_flagged") or 0)
+    data_status = "COMPLETE"
+    if status.lower() != "success" or failed > 0:
+        data_status = "PARTIAL"
+    if cov is not None and cov < fresh_min:
+        data_status = "PARTIAL"
+    if rbst == "DIVERGENT" and not (
+            isinstance(rep_after, int) and 0 <= rep_after <= pw_fl):
+        data_status = "PARTIAL"
     msg = (f"{_STATUS_STAMP_TAG} leg={status} written={written} failed={failed}"
            + (f" requested={requested}" if requested else "")
            + (f" fresh={fresh}" if fresh is not None else "")
@@ -5193,6 +5549,15 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" fresh_cov={cov}%" if cov is not None else "")
            + (f" warnings={len(warns)}" if warns else "")
            + (f" error={err[:120]}" if err else "")
+           + f" | data={data_status}"
+           + (f" guard=pw:{pw_fl}/{int(meta.get('pw_checked') or 0)}"
+              + (f",rb:{int(meta.get('rb_flagged') or 0)}"
+                 f"/{int(meta.get('rb_checked') or 0)}"
+                 if meta.get("rb_checked") is not None else "")
+              + (f",rep:{rep_after}" if rep_after is not None else "")
+              if meta.get("pw_checked") is not None else "")
+           + (f" sha={meta.get('payload_sha8')}"
+              if meta.get("payload_sha8") else "")
            + (f" run={run_id}" if run_id else ""))
     return [
         page,                                       # A Page
@@ -5490,7 +5855,8 @@ def _append_runlog_ohlc_lake(sheets: Any, spreadsheet_id: str, page: str,
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status,
                             msg, "", "", "",
-                            json.dumps(dict(stats, version=SCRIPT_VERSION))]]}
+                            _runlog_meta_json(json.dumps(
+                                dict(stats, version=SCRIPT_VERSION)))]]}
         _last = None
         for _ in (1, 2):
             try:
@@ -5689,7 +6055,8 @@ def _append_runlog_ohlc_fillguard(sheets: Any, spreadsheet_id: str, page: str,
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status,
                             msg, "", "", "",
-                            json.dumps(dict(stats, version=SCRIPT_VERSION))]]}
+                            _runlog_meta_json(json.dumps(
+                                dict(stats, version=SCRIPT_VERSION)))]]}
         _last = None
         for _ in (1, 2):
             try:
@@ -6904,7 +7271,7 @@ def _append_runlog_manual_hold(sheets: Any, spreadsheet_id: str, msg: str) -> No
                 datetime.now(timezone.utc).isoformat(),
                 "WARNING", "manual_hold", "ALL", "DEFERRED",
                 f"{_MANUAL_HOLD_TAG} {msg}", "", "", "",
-                json.dumps({"version": SCRIPT_VERSION}),
+                _runlog_meta_json(json.dumps({"version": SCRIPT_VERSION})),
             ]]},
         ).execute()
     except Exception:
@@ -9123,9 +9490,23 @@ async def _run_one_task(
             except Exception as e:
                 res.warnings.append(f"Clear failed: {e}")
 
+        # v6.45.0 R1: hold the write window (no-op unless armed; fail-open).
+        _sync_hold_publish(sheets, spreadsheet_id, task.sheet_name)
         try:
             written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix)
             res.rows_written = int(written)
+            # v6.45.0 R4: seed the stamp manifest with payload identity +
+            # prewrite verdict (additive; _stamp_meta declared since 6.39.3).
+            try:
+                _sm = dict(getattr(res, "_stamp_meta", None) or {})
+                _sm["payload_sha8"] = _payload_sha8(headers, rows_matrix)
+                _sm["pw_flagged"] = int(
+                    (_oc_stats_for_readback or {}).get("flagged") or 0)
+                _sm["pw_checked"] = int(
+                    (_oc_stats_for_readback or {}).get("checked") or 0)
+                res._stamp_meta = _sm
+            except Exception:
+                pass
             if _trim_mode:
                 for _w in _trim_after_write(
                     sheets, spreadsheet_id, task.sheet_name, start_cell,
@@ -9195,6 +9576,37 @@ async def _run_one_task(
                                 task.sheet_name, _rb)
                         except Exception:
                             pass
+                        # v6.45.0 R4: readback verdict into the manifest.
+                        try:
+                            _sm = dict(getattr(res, "_stamp_meta", None) or {})
+                            _sm["rb_flagged"] = int(
+                                _rb.get("readback_flagged") or 0)
+                            _sm["rb_checked"] = int(
+                                _rb.get("readback_checked") or 0)
+                            _sm["rb_status"] = ("UNKNOWN" if _rb.get("error")
+                                                else _ohlc_readback_status(_rb)[1])
+                            res._stamp_meta = _sm
+                        except Exception:
+                            pass
+                        # v6.45.0 R2: one bounded repair pass (off by default).
+                        try:
+                            _rp = _ohlc_readback_repair(
+                                sheets, spreadsheet_id, task.sheet_name,
+                                headers, rows_matrix, start_cell, _rb)
+                            if _rp and not _rp.get("error"):
+                                _sm = dict(getattr(res, "_stamp_meta",
+                                                   None) or {})
+                                _sm["repair_after"] = _rp.get("after_flagged")
+                                res._stamp_meta = _sm
+                                if _rp.get("warn"):
+                                    res.warnings.append(str(_rp.get("line")))
+                                    logger.warning(str(_rp.get("line")))
+                                else:
+                                    logger.info(str(_rp.get("line")))
+                        except Exception as _rpe:
+                            logger.warning("%s skipped on %s (%s)",
+                                           _OHLC_REPAIR_TAG,
+                                           task.sheet_name, _rpe)
             except Exception as _rbe:
                 logger.warning("%s skipped on %s (%s)",
                                _OHLC_READBACK_TAG, task.sheet_name, _rbe)
@@ -9211,6 +9623,9 @@ async def _run_one_task(
         return res
 
     finally:
+        # v6.45.0 R1: release the write-window hold on EVERY exit path
+        # (no-op unless this run published; TTL backstops a hard crash).
+        _sync_hold_clear(sheets, spreadsheet_id)
         res.end_utc = _utc_now().isoformat()
         # --- v6.39.1 (W1A-4b) BACKEND _Status STAMP (moved to finally) -------
         # External audit P0-3, ACCEPTED: the terminus-only stamp missed every
