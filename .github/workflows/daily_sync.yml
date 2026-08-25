@@ -320,6 +320,11 @@ jobs:
       TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
       TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      # W1A-6f (2026-08-25): map the v6.44 FILL-GUARD gates (DS-01). Unset
+      # Variables resolve to safe defaults — the guard stays OFF until armed.
+      TFB_SYNC_OHLC_FILL_GUARD: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD || '0' }}
+      TFB_SYNC_OHLC_FILL_GUARD_MODE: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_MODE || 'observe' }}
+      TFB_SYNC_OHLC_FILL_GUARD_COLS: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_COLS || '' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
@@ -1338,6 +1343,11 @@ jobs:
       TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
       TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      # W1A-6f (2026-08-25): map the v6.44 FILL-GUARD gates (DS-01). Unset
+      # Variables resolve to safe defaults — the guard stays OFF until armed.
+      TFB_SYNC_OHLC_FILL_GUARD: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD || '0' }}
+      TFB_SYNC_OHLC_FILL_GUARD_MODE: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_MODE || 'observe' }}
+      TFB_SYNC_OHLC_FILL_GUARD_COLS: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_COLS || '' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
