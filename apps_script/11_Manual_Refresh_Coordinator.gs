@@ -18,7 +18,24 @@
 // This file is inert until the existing bound Apps Script entrypoints call the
 // wrapper functions documented in docs/MANUAL_REFRESH_PRIORITY_V1.md.
 
-var TFB_REFRESH_COORDINATOR_VERSION = '1.0.2';
+// -----------------------------------------------------------------------------
+// v1.1.0 (2026-08-25, One-Pass Script #2 — operator-approved scope)
+// WHY: run_dashboard_sync v6.45.0 R1 publishes "backend sync hold until <utc>"
+// into _Sync_Control before write_table and clears it after. Evidence base:
+// prewrite 0-9 vs readback 300-440 flags per Global run and ZERO completed
+// Global cycles since 2026-08-02 — this loop is always mid-flight when the
+// backend writes, and it is the prime suspect for the post-write OHLC
+// contamination. This version makes the automatic side honor that hold at the
+// two existing choke points (Allowed_/YieldPoint_), so the two writers can
+// never overlap once BOTH sides are armed.
+// GATE: Script Property TFB_GAS_BACKEND_HOLD, DEFAULT OFF — absent/0/false
+// keeps v1.0.2 behavior byte-identical (no sheet read, no new events).
+// FAIL-OPEN everywhere: any read/parse error => no hold. Far-future ceiling
+// (now + 16 min) mirrors the backend's own rejection so a stuck cell can
+// never freeze automation; the backend TTL (default 180s) self-clears.
+// Manual operator priority is checked FIRST and always outranks the hold.
+// -----------------------------------------------------------------------------
+var TFB_REFRESH_COORDINATOR_VERSION = '1.1.0';
 
 var TFB_REFRESH_COORDINATOR_ = Object.freeze({
   PROP_MANUAL_UNTIL_MS: 'TFB_MANUAL_REFRESH_UNTIL_MS',
@@ -305,10 +322,119 @@ function tfbClearManualPause_(reason, expectedRequestId, force) {
   return outcome.cleared;
 }
 
+// ---------------------------------------------------------------------------
+// v1.1.0 BACKEND WRITE-WINDOW HOLD (counterpart of sync v6.45.0 [SYNC-HOLD])
+// ---------------------------------------------------------------------------
+var TFB_BACKEND_HOLD_ = Object.freeze({
+  SHEET: '_Sync_Control',
+  KEY_NORM: 'backendsyncholduntil',
+  SCAN_ROWS: 12,
+  PROP_GATE: 'TFB_GAS_BACKEND_HOLD',
+  CEILING_MS: 16 * 60 * 1000,   // backend TTL max 900s + skew
+  SKEW_MS: 60 * 1000,
+  MEMO_TTL_MS: 10 * 1000,
+  RIYADH_OFFSET_MS: 3 * 60 * 60 * 1000,
+  SHEETS_EPOCH_MS: Date.UTC(1899, 11, 30)
+});
+
+var TFB_BACKEND_HOLD_MEMO_ = {atMs: 0, raw: null};
+
+function tfbBackendHoldEnabled_() {
+  try {
+    var v = String(
+      tfbScriptProperties_().getProperty(TFB_BACKEND_HOLD_.PROP_GATE) || ''
+    ).trim().toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * PURE parse of the hold cell -> {active, untilMs, remainingMs}.
+ * Accepts the backend's ISO-8601 (with offset, 'Z', or space separator),
+ * and Google Sheets DATE SERIALS in the 20000..80000 band (naive = Riyadh
+ * UTC+3), mirroring the backend's _mh_parse_hold_until semantics. Anything
+ * unparsable, expired, or beyond now + CEILING is INACTIVE (fail-open).
+ */
+function tfbBackendHoldParse_(cellRaw, nowMs) {
+  var out = {active: false, untilMs: 0, remainingMs: 0};
+  try {
+    var s = String(cellRaw === null || cellRaw === undefined ? '' : cellRaw).trim();
+    if (!s) { return out; }
+    var untilMs = NaN;
+    var asNum = Number(s);
+    if (isFinite(asNum) && asNum > 20000 && asNum < 80000) {
+      untilMs = TFB_BACKEND_HOLD_.SHEETS_EPOCH_MS +
+        asNum * 86400000 - TFB_BACKEND_HOLD_.RIYADH_OFFSET_MS;
+    } else {
+      var iso = s.replace(' ', 'T');
+      if (/[zZ]$/.test(iso)) { iso = iso.slice(0, -1) + '+00:00'; }
+      var hasTz = /[+-]\d\d:?\d\d$/.test(iso);
+      var parsed = Date.parse(hasTz ? iso : iso + '+03:00'); // naive = Riyadh
+      if (isFinite(parsed)) { untilMs = parsed; }
+    }
+    if (!isFinite(untilMs)) { return out; }
+    var ceiling = nowMs + TFB_BACKEND_HOLD_.CEILING_MS + TFB_BACKEND_HOLD_.SKEW_MS;
+    if (untilMs > ceiling) { return out; }             // reject far-future
+    if (untilMs <= nowMs) { return out; }              // expired
+    out.active = true;
+    out.untilMs = untilMs;
+    out.remainingMs = untilMs - nowMs;
+    return out;
+  } catch (err) {
+    return out;
+  }
+}
+
+/** I/O: raw B-cell of the backend key row in _Sync_Control ('' on any error). */
+function tfbBackendHoldCellRaw_() {
+  try {
+    var sh = SpreadsheetApp.getActive().getSheetByName(TFB_BACKEND_HOLD_.SHEET);
+    if (!sh) { return ''; }
+    var grid = sh.getRange(1, 1, TFB_BACKEND_HOLD_.SCAN_ROWS, 2).getValues();
+    for (var i = 0; i < grid.length; i++) {
+      var key = String(grid[i][0] === null || grid[i][0] === undefined
+        ? '' : grid[i][0]).toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (key === TFB_BACKEND_HOLD_.KEY_NORM) {
+        var v = grid[i][1];
+        if (v instanceof Date) { return v.toISOString(); }
+        return String(v === null || v === undefined ? '' : v);
+      }
+    }
+    return '';
+  } catch (err) {
+    return '';
+  }
+}
+
+/** Gate + 10s memo + parse. Gate OFF short-circuits before any sheet read. */
+function tfbBackendHoldState_() {
+  if (!tfbBackendHoldEnabled_()) {
+    return {active: false, untilMs: 0, remainingMs: 0};
+  }
+  var nowMs = tfbNowMs_();
+  if (TFB_BACKEND_HOLD_MEMO_.raw === null ||
+      (nowMs - TFB_BACKEND_HOLD_MEMO_.atMs) > TFB_BACKEND_HOLD_.MEMO_TTL_MS) {
+    TFB_BACKEND_HOLD_MEMO_.raw = tfbBackendHoldCellRaw_();
+    TFB_BACKEND_HOLD_MEMO_.atMs = nowMs;
+  }
+  return tfbBackendHoldParse_(TFB_BACKEND_HOLD_MEMO_.raw, nowMs);
+}
+
 /** Automatic entrypoints call this before doing any work. */
 function tfbAutomaticRefreshAllowed_(label) {
   var pause = tfbReadManualPause_();
   if (!pause.active) {
+    // v1.1.0: manual priority checked first; then the backend write window.
+    var hold = tfbBackendHoldState_();
+    if (hold.active) {
+      tfbRecordRefreshEvent_(
+        'automatic-skipped-for-backend-hold',
+        String(label || '') + ' remainingMs=' + hold.remainingMs
+      );
+      return false;
+    }
     return true;
   }
   tfbRecordRefreshEvent_(
@@ -323,6 +449,15 @@ function tfbAutomaticRefreshAllowed_(label) {
 function tfbAutomaticYieldPoint_(label) {
   var pause = tfbReadManualPause_();
   if (!pause.active) {
+    // v1.1.0: yield at the next safe boundary while the backend is writing.
+    var hold = tfbBackendHoldState_();
+    if (hold.active) {
+      tfbRecordRefreshEvent_(
+        'automatic-yielded-for-backend-hold',
+        String(label || '') + ' remainingMs=' + hold.remainingMs
+      );
+      return true;
+    }
     return false;
   }
   tfbRecordRefreshEvent_(
