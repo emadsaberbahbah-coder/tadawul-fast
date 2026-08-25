@@ -89,7 +89,15 @@ class ManualRefreshPriorityContractTests(unittest.TestCase):
             self.assertIn(token, self.source)
 
     def test_version_includes_race_hardening(self) -> None:
-        self.assertIn("TFB_REFRESH_COORDINATOR_VERSION = '1.0.2'", self.source)
+        # v1.1.0 (2026-08-25): backend write-window hold honored at the
+        # Allowed_/YieldPoint_ choke points (counterpart of sync v6.45.0
+        # [SYNC-HOLD]); gate TFB_GAS_BACKEND_HOLD default OFF. The pin
+        # tracks the reviewed version deliberately - bump it only with a
+        # reviewed coordinator change.
+        self.assertIn("TFB_REFRESH_COORDINATOR_VERSION = '1.1.0'", self.source)
+        self.assertIn("TFB_GAS_BACKEND_HOLD", self.source)
+        self.assertIn("automatic-skipped-for-backend-hold", self.source)
+        self.assertIn("automatic-yielded-for-backend-hold", self.source)
         self.assertIn("TFB_MANUAL_REFRESH_REQUEST_ID", self.source)
 
     def test_coordinator_uses_a_separate_document_lock(self) -> None:
