@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.43.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.44.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1678,6 +1678,59 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   additions: _upstream_verdict_enabled, _upstream_verdict_pages,
 #   _upstream_verdict_max_age_min, _uv_page_state, _uv_parse_value,
 #   _uv_compose, _write_upstream_verdict.
+# v6.44.1 (2026-08-25, W1A-6f2 — FILL-GUARD hardening, external-review adjudication):
+#   Independent review of v6.44.0 (Revised-Scripts Audit, 24 Aug) raised six
+#   findings against the new guard; five adjudicated VALID on the primary
+#   artifact and fixed here, one deferred to the Register:
+#   DS-02 FAIL-CLOSED ENFORCE: a core exception under an armed ENFORCE now
+#         RAISES before values.update (write aborted, page keeps last-good,
+#         task fails loud). observe/off remain fail-open — telemetry never
+#         blocks a run.
+#   DS-03 CERTIFICATION: enforce requires selftest state EXACTLY True; a None
+#         state lazily runs FG-3 once; anything but True forces observe.
+#   DS-04 -O-SAFE SELFTEST: bare asserts replaced with explicit checks that
+#         survive python -O; a 4th fixture certifies case-folded headers.
+#   DS-05 HEADER NORMALIZATION: guarded-column match is case-insensitive and
+#         the runlog line reports cols=found/configured, so a silently-inert
+#         guard is visible instead of green.
+#   DS-06 COLS ALLOWLIST: TFB_SYNC_OHLC_FILL_GUARD_COLS can only SELECT WITHIN
+#         {Open, Day High, Day Low}; foreign tokens are rejected and reported
+#         (cols_rejected) — the override can never clear non-OHLC fields.
+#   DS-10 TELEMETRY GATE: the FILLGUARD appender honors TFB_SYNC_OHLC_RUNLOG
+#         and skips pages with zero guarded columns.
+#   DS-07 (symbol-keyed preservation for ALL nullable fields) is REAL but a
+#         persistence-layer redesign — Improvement Register, not this hotfix.
+# v6.44.0 (2026-08-25, W1A-6f — OHLC blank-cell FILL GUARD at the write seam):
+#   WHY (READBACK v6.41.0 + LAKE v6.43.0 forensics, runs of 2026-08-24/25):
+#   PREWRITE flagged 0 while READBACK flagged 59 (Mutual_Funds, delta +59) and
+#   3 -> 104 (Commodities_FX, delta +101) — on exactly the rows LAKE counted as
+#   foreign_open_fill (63 / 107): matrix Open blank, lake populated. MECHANISM
+#   (code-confirmed this session): _coerce_jsonable(None) -> None serializes as
+#   JSON null, and the Sheets values.update contract SKIPS null cells, leaving
+#   the PRIOR cell content standing under the NEW row. With write-then-trim (no
+#   pre-clear) any row re-ordering between runs grafts ANOTHER SYMBOL's
+#   Open/High/Low onto this row — the cross-symbol Open contamination class
+#   (HUF-313.61 family). The injection happens AFTER the PREWRITE check, which
+#   is why arming PREWRITE enforce alone can never stop it.
+#   FIX (env-gated, DEFAULT OFF => byte-identical v6.43.0 write path):
+#     FG-1 _ohlc_fill_guard_core()/_apply(): pure, header-name-scoped pass over
+#          the final matrix inside write_table (the single choke point both row
+#          paths funnel through). Guarded columns default "Open,Day High,Day
+#          Low" (override: TFB_SYNC_OHLC_FILL_GUARD_COLS). observe -> count
+#          only, zero mutation; enforce -> substitute "" (an explicit clear)
+#          for None in guarded columns ONLY, so an honest blank is written
+#          instead of inheriting a foreign value. Every other column keeps the
+#          null-skip semantics untouched (deliberate keep-last-good paths,
+#          e.g. provider targets, are NOT affected).
+#     FG-2 [OHLC-FILLGUARD] one _Run_Log line per page per write (armed runs
+#          only) through the proven FW-3 channel — fail-loud-but-fail-open.
+#     FG-3 startup selftest: 3 canned fixtures through the REAL core function
+#          before any page write; a selftest failure FORCES observe and logs
+#          loudly — enforcement never runs on an unproven guard (FW-4 lesson).
+#   GATES: TFB_SYNC_OHLC_FILL_GUARD (unset/0 = OFF, guard fully inert);
+#          =1/true arms OBSERVE. TFB_SYNC_OHLC_FILL_GUARD_MODE=enforce arms
+#          substitution. Both are GitHub-Actions repo Variables (sync
+#          namespace). ZERO functions removed; unarmed behaviour byte-identical.
 # v6.43.0 (2026-08-23, W1A-6e — foreign-writer attribution + identity refetch):
 #   CENSUS VERDICT (adjudicated, this build's premise): every Sheets write in
 #   this repository was enumerated and classified — 12 .execute() sites in
@@ -1743,7 +1796,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   enforce behaviour, KLG, trim, readback logic, any write. With every ENV
 #   unset the write path is byte-identical to v6.41.0.
 
-SCRIPT_VERSION = "6.43.0"
+SCRIPT_VERSION = "6.44.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2290,6 +2343,13 @@ class SheetsWriter:
                     rr = rr[:width]
             matrix.append([_coerce_jsonable(x) for x in rr])
 
+        # v6.44.1 (W1A-6f2) OHLC-FILLGUARD at the single write choke point.
+        # Unarmed/observe NEVER raises (same object untouched when off).
+        # ENFORCE fails CLOSED: an exception here aborts this write, the page
+        # keeps its last-good content, and the task fails loud (DS-02).
+        _fg_stats = None
+        matrix, _fg_stats = _ohlc_fill_guard_apply(hdr, matrix)
+
         values: List[List[Any]] = []
         if hdr:
             values.append(hdr)
@@ -2322,6 +2382,14 @@ class SheetsWriter:
                     f"{_backoffs[min(_try, len(_backoffs) - 1)]:.0f}s: {_we}"
                 )
                 time.sleep(_backoffs[min(_try, len(_backoffs) - 1)])
+
+        # v6.44.0 (W1A-6f) FG-2: one FILLGUARD line per page per write.
+        try:
+            if _fg_stats:
+                _append_runlog_ohlc_fillguard(self, spreadsheet_id,
+                                              sheet_name, _fg_stats)
+        except Exception:
+            pass
 
         return max(0, len(values) - (1 if hdr else 0))
 
@@ -5447,6 +5515,244 @@ def _append_runlog_ohlc_lake(sheets: Any, spreadsheet_id: str, page: str,
 
 
 # =============================================================================
+# =============================================================================
+# v6.44.0 (W1A-6f) — OHLC BLANK-CELL FILL GUARD (write seam; header changelog)
+# =============================================================================
+_OHLC_FILLGUARD_TAG = f"[OHLC-FILLGUARD v{SCRIPT_VERSION}]"
+_OHLC_FILLGUARD_DEFAULT_COLS: Tuple[str, ...] = ("Open", "Day High", "Day Low")
+_OHLC_FILLGUARD_SELFTEST_OK: Optional[bool] = None
+
+
+def _ohlc_fillguard_enabled() -> bool:
+    """v6.44.0 FG-1 master gate. DEFAULT OFF — unset/0/false/off keeps the
+    v6.43.0 write path byte-identical (no scan, no mutation, no log line)."""
+    return (os.getenv("TFB_SYNC_OHLC_FILL_GUARD") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _ohlc_fillguard_mode() -> str:
+    """v6.44.0: 'enforce' only on the exact token; anything else = observe."""
+    raw = (os.getenv("TFB_SYNC_OHLC_FILL_GUARD_MODE") or "").strip().lower()
+    return "enforce" if raw == "enforce" else "observe"
+
+
+def _ohlc_fillguard_env_tokens() -> Tuple[str, ...]:
+    """v6.44.1 DS-06: raw CSV tokens from TFB_SYNC_OHLC_FILL_GUARD_COLS."""
+    raw = (os.getenv("TFB_SYNC_OHLC_FILL_GUARD_COLS") or "").strip()
+    out: List[str] = []
+    for tok in raw.split(","):
+        t = tok.strip()
+        if t and t not in out:
+            out.append(t)
+    return tuple(out)
+
+
+def _ohlc_fillguard_cols() -> Tuple[str, ...]:
+    """v6.44.1 DS-06: guarded header names, ALLOWLIST-RESTRICTED. The env can
+    only SELECT WITHIN the default triple (case-insensitive); it can never
+    add a column outside it, so enforce can never clear a non-OHLC field."""
+    toks = _ohlc_fillguard_env_tokens()
+    if not toks:
+        return _OHLC_FILLGUARD_DEFAULT_COLS
+    allow = {c.casefold(): c for c in _OHLC_FILLGUARD_DEFAULT_COLS}
+    out: List[str] = []
+    for t in toks:
+        c = allow.get(t.casefold())
+        if c and c not in out:
+            out.append(c)
+    return tuple(out) if out else _OHLC_FILLGUARD_DEFAULT_COLS
+
+
+def _ohlc_fillguard_cols_rejected() -> Tuple[str, ...]:
+    """v6.44.1 DS-06: env tokens outside the allowlist (reported, unused)."""
+    allow = {c.casefold() for c in _OHLC_FILLGUARD_DEFAULT_COLS}
+    return tuple(t for t in _ohlc_fillguard_env_tokens()
+                 if t.casefold() not in allow)
+
+
+def _ohlc_fill_guard_core(hdr: List[Any], matrix: List[List[Any]],
+                          mode: str, cols: Sequence[str]) -> Tuple[List[List[Any]], dict]:
+    """v6.44.0 FG-1 PURE CORE (env-free; selftest + harness target).
+    Scans the FINAL write matrix for None cells in the guarded columns.
+    observe -> zero mutation. enforce -> rr[i] = "" for exactly those cells
+    (an explicit Sheets clear, defeating the values.update null-skip that
+    lets a foreign prior value survive). Returns (matrix, stats)."""
+    names = [str(h).strip().casefold() for h in (hdr or [])]
+    guard_idx: Dict[int, str] = {}
+    for want in cols:
+        wf = str(want).strip().casefold()
+        for i, nm in enumerate(names):
+            if nm == wf:
+                guard_idx[i] = want  # v6.44.1 DS-05: case-insensitive, all hits
+    stats: dict = {
+        "rows": len(matrix or []),
+        "cols": sorted(set(guard_idx.values())),
+        "configured": list(cols),
+        "nulls": {c: 0 for c in cols},
+        "total": 0,
+        "mode": mode,
+        "action": "observed",
+        "examples": [],
+    }
+    if not guard_idx or not matrix:
+        return matrix, stats
+    sym_i = 0 if (names and names[0] == "symbol") else None
+    for rn, rr in enumerate(matrix):
+        for ci, cname in guard_idx.items():
+            if ci < len(rr) and rr[ci] is None:
+                stats["nulls"][cname] = stats["nulls"].get(cname, 0) + 1
+                stats["total"] += 1
+                if len(stats["examples"]) < 3:
+                    who = str(rr[sym_i]) if (sym_i is not None and sym_i < len(rr) and rr[sym_i] not in (None, "")) else f"r{rn}"
+                    stats["examples"].append(f"{who}({cname.split()[-1].lower()})")
+                if mode == "enforce":
+                    rr[ci] = ""
+    if mode == "enforce" and stats["total"]:
+        stats["action"] = "cleared"
+    return matrix, stats
+
+
+def _ohlc_fill_guard_apply(hdr: List[Any], matrix: List[List[Any]]):
+    """v6.44.1 FG-1 env wrapper. OFF -> (matrix, None): the SAME object,
+    untouched — byte-identical v6.43.0. Armed: observe NEVER raises
+    (fail-open telemetry); ENFORCE fails CLOSED — certification must be
+    exactly True (lazy FG-3 run when None), and a core exception RAISES so
+    the caller aborts the write and the page keeps its last-good content
+    (DS-02 / DS-03)."""
+    if not _ohlc_fillguard_enabled():
+        return matrix, None
+    mode = _ohlc_fillguard_mode()
+    cols = _ohlc_fillguard_cols()
+    rejected = _ohlc_fillguard_cols_rejected()
+    forced = None
+    if mode == "enforce":
+        if _OHLC_FILLGUARD_SELFTEST_OK is None:
+            _ohlc_fillguard_selftest_()
+        if _OHLC_FILLGUARD_SELFTEST_OK is not True:
+            mode, forced = "observe", "FAIL->observe"
+    try:
+        matrix, stats = _ohlc_fill_guard_core(hdr, matrix, mode, cols)
+    except Exception as _ce:
+        if mode == "enforce":
+            logger.error("%s core FAILED under ENFORCE — failing CLOSED, "
+                         "write aborted: %s", _OHLC_FILLGUARD_TAG, _ce)
+            raise RuntimeError(
+                f"{_OHLC_FILLGUARD_TAG} enforce fail-closed: {_ce}") from _ce
+        logger.warning("%s core failed under observe (fail-open): %s",
+                       _OHLC_FILLGUARD_TAG, _ce)
+        return matrix, {"armed": True, "mode": mode,
+                        "rows": len(matrix or []), "cols": [],
+                        "configured": list(cols), "nulls": {}, "total": 0,
+                        "action": "observed", "examples": [],
+                        "error": type(_ce).__name__}
+    stats["armed"] = True
+    if forced:
+        stats["selftest"] = forced
+    if rejected:
+        stats["cols_rejected"] = list(rejected)
+    return matrix, stats
+
+
+def _append_runlog_ohlc_fillguard(sheets: Any, spreadsheet_id: str, page: str,
+                                  stats: dict) -> None:
+    """v6.44.0 FG-2: one [OHLC-FILLGUARD] line per page per write through the
+    proven FW-3 _Run_Log channel — same 10-column shape, same retry x2, same
+    fail-loud-but-fail-open discipline as the LAKE/PREWRITE appenders."""
+    if not stats or sheets is None:
+        return
+    if not _ohlc_prewrite_runlog_enabled():
+        return  # v6.44.1 DS-10: honor the existing OHLC run-log kill switch
+    if not stats.get("cols") and not stats.get("error"):
+        return  # v6.44.1 DS-10: no guarded columns on this page — skip noise
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        _t = int(stats.get("total") or 0)
+        _n = stats.get("nulls") or {}
+        level = "WARNING" if _t else "INFO"
+        status = "SUSPECT" if (_t and stats.get("action") != "cleared") else "OK"
+        msg = (
+            f"{_OHLC_FILLGUARD_TAG} {page} | rows={int(stats.get('rows') or 0)} "
+            f"nulls(open/high/low)={int(_n.get('Open') or 0)}/"
+            f"{int(_n.get('Day High') or 0)}/{int(_n.get('Day Low') or 0)} "
+            f"total={_t} | cols={len(stats.get('cols') or [])}/"
+            f"{len(stats.get('configured') or [])} | "
+            f"action={stats.get('action')} | mode={stats.get('mode')}"
+            + (f" | rejected={','.join(stats['cols_rejected'])}"
+               if stats.get("cols_rejected") else "")
+            + (f" | error={stats['error']}" if stats.get("error") else "")
+            + (f" | selftest={stats['selftest']}" if stats.get("selftest") else "")
+            + ((" | ex: " + ", ".join(stats.get("examples") or []))
+               if (stats.get("examples") and _t) else "")
+        )
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            msg, "", "", "",
+                            json.dumps(dict(stats, version=SCRIPT_VERSION))]]}
+        _last = None
+        for _ in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last = None
+                break
+            except Exception as _ae:
+                _last = _ae
+                time.sleep(1.0)
+        if _last is not None:
+            raise _last
+    except Exception as _e:
+        print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
+              % (_OHLC_FILLGUARD_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s run-log line skipped: %s", _OHLC_FILLGUARD_TAG, _e)
+
+
+def _ohlc_fillguard_selftest_() -> bool:
+    """v6.44.1 FG-3: prove the REAL core on 4 canned fixtures BEFORE any page
+    write. Explicit checks (NOT assert) so python -O cannot hollow the proof
+    (DS-04). Failure -> loud log + module flag; _apply then forces observe so
+    an unproven guard can never mutate a write (FW-4 lesson)."""
+    global _OHLC_FILLGUARD_SELFTEST_OK
+
+    def _ck(cond: bool, msg: str) -> None:
+        if not cond:
+            raise AssertionError(msg)
+
+    try:
+        hdr = ["Symbol", "Open", "Day High", "Day Low", "Target Price"]
+        cols = _OHLC_FILLGUARD_DEFAULT_COLS
+        m1 = [["AAA", None, 10.0, None, None], ["BBB", 5.0, None, 4.0, 7.0]]
+        m1, s1 = _ohlc_fill_guard_core(hdr, m1, "enforce", cols)
+        _ck(m1[0][1] == "" and m1[0][3] == "" and m1[1][2] == "", "F1 clear")
+        _ck(m1[0][4] is None and m1[1][0] == "BBB" and m1[1][1] == 5.0,
+            "F1 untouched")
+        _ck(s1["total"] == 3 and s1["action"] == "cleared", "F1 stats")
+        m2 = [["CCC", None, 1.0, 2.0, None]]
+        m2, s2 = _ohlc_fill_guard_core(hdr, m2, "observe", cols)
+        _ck(m2[0][1] is None and s2["total"] == 1
+            and s2["action"] == "observed", "F2 observe")
+        m3 = [[None, None]]
+        m3, s3 = _ohlc_fill_guard_core(["A", "B"], m3, "enforce", cols)
+        _ck(m3[0][0] is None and s3["total"] == 0, "F3 inert")
+        m4 = [["DDD", None, 2.0, 1.0]]
+        m4, s4 = _ohlc_fill_guard_core(["symbol", "open", "DAY HIGH",
+                                        "day low"], m4, "enforce", cols)
+        _ck(m4[0][1] == "" and s4["total"] == 1, "F4 casefold")
+        _OHLC_FILLGUARD_SELFTEST_OK = True
+        return True
+    except Exception as _e:
+        _OHLC_FILLGUARD_SELFTEST_OK = False
+        logger.error("%s SELFTEST FAILED — enforce disabled, observe forced: "
+                     "%s", _OHLC_FILLGUARD_TAG, _e)
+        return False
+
+
 # v6.40.0 (W1A-4a) — UPSTREAM DECISION-FEED VERDICT (producer)
 # =============================================================================
 _UPSTREAM_VERDICT_TAG = f"[UPSTREAM-VERDICT v{SCRIPT_VERSION}]"
@@ -8988,6 +9294,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     backend = BackendClient(backend_url, timeout_sec=timeout_sec, token=token)
     sheets = SheetsWriter()
     _idfw_selftest_()  # v6.24.1 ST-1: verify guards on fixtures before any page
+    _ohlc_fillguard_selftest_()  # v6.44.0 FG-3: prove the fill guard pre-write
 
     # --- v6.32.0 MANUAL-HOLD startup gate --------------------------------
     if _manual_hold_gate_enabled() and not bool(args.dry_run):
