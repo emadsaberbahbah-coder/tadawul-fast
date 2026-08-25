@@ -210,7 +210,16 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # criterion 5b groups per basket — a fourth basket with one row per day is
 # structurally invisible to both (selftested). The gate call, day-exclusion
 # rule, scored-day counting and net-alpha inputs are untouched lines.
-SCRIPT_VERSION = "1.5.0"
+# v1.6.0 (2026-08-25) DRY-RUN AUTHORITATIVE OVER THE DRILL MARKER:
+# WHY (Revised-Scripts Audit, 24 Aug — adjudicated VALID on this file): the
+# --rollback-drill-passed branch appended its [ROLLBACK-DRILL] line and
+# returned BEFORE ever consulting --dry-run, so a combined
+# "--dry-run --rollback-drill-passed" invocation still mutated _Run_Log.
+# The workflow-side flag COMPOSITION fix (shadow_scorer.yml, same delivery)
+# makes both flags arrive; this change makes dry-run mean ZERO writes on
+# every path: the drill branch now previews and exits without touching
+# Sheets. Everything else is byte-identical to v1.5.0.
+SCRIPT_VERSION = "1.6.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -927,6 +936,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     sh = sb._open_sheet(args.sheet_id)
 
     if args.rollback_drill_passed:
+        if args.dry_run:
+            # v1.6.0: dry-run is authoritative — ZERO writes on any path.
+            print(f"[S1-GATE v{SCRIPT_VERSION}] DRY-RUN — would append "
+                  f"[ROLLBACK-DRILL] marker for {today}; no write performed")
+            return 0
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
              "shadow_scorer", TAB_GATE, "OK",
