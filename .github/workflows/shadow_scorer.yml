@@ -67,6 +67,11 @@ jobs:
         run: |
           set -euo pipefail
           EXTRA=""
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
-          if [[ "${{ github.event.inputs.rollback_drill_passed }}" == "true" ]]; then EXTRA="--rollback-drill-passed"; fi
+          # 2026-08-25 fix: COMPOSE flags — the second assignment used to
+          # OVERWRITE the first, so dry_run+rollback_drill_passed silently
+          # dropped --dry-run. NOTE: composition alone does NOT guarantee a
+          # zero-write dry run; run_shadow_scorer.py v1.6.0 (same delivery)
+          # makes --dry-run authoritative inside the drill branch itself.
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="$EXTRA --dry-run"; fi
+          if [[ "${{ github.event.inputs.rollback_drill_passed }}" == "true" ]]; then EXTRA="$EXTRA --rollback-drill-passed"; fi
           python scripts/run_shadow_scorer.py $EXTRA
