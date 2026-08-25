@@ -159,6 +159,11 @@ jobs:
       TFB_SYNC_PAGE_ORDER: ${{ matrix.page }}
       TFB_SYNC_EMPTY_RETRY: '0'
       TFB_SYNC_NAME_DEDUP_MODE: observe
+      # W1A-6f (2026-08-25): v6.44 FILL-GUARD gates (DS-01) — same contract
+      # as daily_sync; unset Variables keep the guard OFF.
+      TFB_SYNC_OHLC_FILL_GUARD: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD || '0' }}
+      TFB_SYNC_OHLC_FILL_GUARD_MODE: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_MODE || 'observe' }}
+      TFB_SYNC_OHLC_FILL_GUARD_COLS: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_COLS || '' }}
       TFB_PORTFOLIO_REBUILD: '1'
       TFB_SYNC_DECISION_GUARD: '1'
       TFB_SYNC_SYMBOL_BATCH_SIZE: '25'
