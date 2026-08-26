@@ -651,7 +651,28 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # pass-2. F9 fresh_basis_gate_enabled boolean-typed. F10 range clamps +
 # configuration_invalid alert. F11 taxonomy split. F12 logging imported.
 # F13 OB floor (1,9,1).
-PORTFOLIO_ACTIONS_VERSION = "1.8.1"
+# =============================================================================
+# v1.9.0 (2026-08-26, One-Pass Batch #6a) — SHARE-RESOLVED SELL SIDE + EXPLICIT
+# REDUCE POLICY
+# WHY (U-06, 2026-08-26 audit + external review): Portfolio_Decision showed
+# OTIS EXIT (−14,759 SAR) and SHG TRIM (−2,373 SAR) with Delta Shares BLANK —
+# the field is only ever computed for ADD rows in the funding pass, so the
+# operator had to derive −55 / −9 by hand. And engine REDUCE maps to a full
+# EXIT implicitly (REDUCE sits in _SELL_TIER), a policy the operator never
+# explicitly chose.
+#   D1 — after funding, every EXIT/TRIM entry gains a SIGNED INTEGER
+#        suggested_delta_shares (EXIT: −quantity; TRIM: the smallest whole-
+#        share count whose sale brings post-trade weight to/below the
+#        position cap) plus additive post_trade_weight_pct. suggested_delta_
+#        _sar and proceeds_sar are untouched.
+#   D2 — TFB_PA_REDUCE_ACTION = exit (DEFAULT, today verbatim) | hold.
+#        "hold" demotes an engine-REDUCE full-exit to HOLD with zero
+#        proceeds and an explicit reason note; any other value fails safe
+#        to "exit". The escalation is now a visible operator policy.
+# Additive only; no gate needed for D1 (it fills a column that exists and
+# renders blank today with its correct value).
+# =============================================================================
+PORTFOLIO_ACTIONS_VERSION = "1.9.0"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -2261,6 +2282,75 @@ def _advisor_sentence(entry, controls, review_date):
     return "; ".join(bits) + "."
 
 
+def _reduce_policy() -> str:
+    """v1.9.0 D2: TFB_PA_REDUCE_ACTION — 'exit' (default, v1.8.1 verbatim)
+    or 'hold'. Anything else fails safe to 'exit'."""
+    v = str(os.getenv("TFB_PA_REDUCE_ACTION") or "exit").strip().lower()
+    return v if v in ("exit", "hold") else "exit"
+
+
+def _apply_reduce_policy(cand, action, reason, proceeds):
+    """v1.9.0 D2: applied at the same seam as _apply_deminimis. Only an
+    engine-REDUCE row that decide_action escalated to EXIT is in scope."""
+    try:
+        if (action == ACTION_EXIT
+                and str(cand.get("recommendation") or "").strip().upper()
+                == "REDUCE" and _reduce_policy() == "hold"):
+            return (ACTION_HOLD,
+                    (reason + " — engine REDUCE held per TFB_PA_REDUCE_ACTION"
+                     "=hold (no exit executed)"),
+                    0.0)
+    except Exception:
+        pass
+    return action, reason, proceeds
+
+
+def _sell_side_deltas(entries, ctl, total_value):
+    """v1.9.0 D1: signed integer share deltas for EXIT/TRIM + post-trade
+    weight. Pure arithmetic on fields already present; rows without a usable
+    quantity/price are left blank exactly as before. Idempotent."""
+    cap = None
+    for k in ("max_position_pct", "max_weight_pct", "max_pos_pct"):
+        if isinstance(ctl, dict) and ctl.get(k) is not None:
+            cap = float(ctl[k]); break
+    for e in entries:
+        try:
+            act = e.get("action")
+            if act not in (ACTION_EXIT, ACTION_TRIM):
+                continue
+            if e.get("suggested_delta_shares") is not None:
+                continue
+            cand = e.get("cand") or {}
+            qraw = cand.get("quantity")
+            q = int(round(float(qraw))) if qraw not in (None, "") else 0
+            if q <= 0:
+                continue
+            mv = float(cand.get("market_value_sar") or 0.0)
+            px = (mv / q) if mv > 0 else float(
+                (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0))
+            if act == ACTION_EXIT:
+                n = q
+            else:
+                if px <= 0:
+                    continue
+                proceeds = float(e.get("proceeds_sar") or 0.0)
+                n = int(math.ceil(proceeds / px)) if proceeds > 0 else 0
+                n = max(1 if proceeds > 0 else 0, min(n, q))
+                if cap is not None and total_value:
+                    while n < q and (mv - n * px) / float(total_value) \
+                            * 100.0 > cap + 1e-9:
+                        n += 1
+                if n <= 0:
+                    continue
+            e["suggested_delta_shares"] = -n
+            if total_value:
+                post = max(0.0, (mv - n * px)) / float(total_value) * 100.0
+                e["post_trade_weight_pct"] = round(post, 1)
+        except Exception:
+            continue
+    return entries
+
+
 def _action_row(entry, review_date, controls):
     cand = entry["cand"]
     fx = cand.get("fx_to_sar")
@@ -2303,6 +2393,7 @@ def _action_row(entry, review_date, controls):
         "suggested_delta_sar": _round(entry.get("suggested_delta_sar"), 0),
         "suggested_delta_shares": entry.get("suggested_delta_shares"),
         "proceeds_sar": _round(entry.get("proceeds_sar"), 0),
+        "post_trade_weight_pct": entry.get("post_trade_weight_pct"),
         "funds_from": entry.get("funds_from"),
         "stop_sar": _level_sar(cand.get("stop"), fx),
         "tp1_sar": _level_sar(cand.get("tp1"), fx),
@@ -2461,6 +2552,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         # confirmation"; a non-ADD verdict resets the symbol's clock.
         action, reason, capped_from = _apply_add_confirmation(
             c.get("symbol"), action, reason, capped_from, ctl)
+        # v1.9.0 D2: explicit REDUCE policy (default 'exit' = verbatim).
+        action, reason, proceeds = _apply_reduce_policy(
+            c, action, reason, proceeds)
         sec_room = None
         if total_value:
             sec_room = max(0.0, (ctl["max_sector_pct"] / 100.0) *
@@ -2512,6 +2606,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         else:
             deployable, proceeds_inc, adds_funded, cash_floor = fund_adds(
                 entries, ctl, cash, total_value)
+
+    # v1.9.0 D1: share-resolve the sell side once funding is settled.
+    _sell_side_deltas(entries, ctl, total_value)
 
     review_date = (datetime.now(timezone.utc) +
                    timedelta(days=ctl["review_days"])).date().isoformat()
