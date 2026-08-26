@@ -109,7 +109,32 @@ from typing import Any, Dict, List, Optional, Tuple
 # mirror otherwise. Applied to BOTH buy branches (INVEST primary and the
 # raw-BUY fallback). The SELL side is deliberately untouched: exiting a
 # blocked holding is exactly what the rulebook wants.
-__version__ = "1.2.1"
+# =============================================================================
+# v2.0.0 (2026-08-26, One-Pass Batch #4) — THE MANIFEST GATE
+# -----------------------------------------------------------------------------
+# EVIDENCE: Digest run #174 (2026-08-26 05:55 UTC) sent "BUY 4344.SR | SELL
+# OTIS" AFTER Coverage #806 FAILED and Freshness #794 returned
+# executable=false. This script consumed neither verdict: it is schedule-
+# triggered and v1.1.0's _is_stale treats an UNSTAMPED row as never-stale.
+# The operator disabled digest.yml the same morning. This version is the
+# condition for re-enabling it.
+#   GATE — before any pick is computed, the digest reads '_Status' and
+#   requires, for EVERY page in DIGEST_MANIFEST_PAGES, a backend write-seam
+#   stamp (run_dashboard_sync v6.45.0 R4) whose data=COMPLETE, whose
+#   timestamp parses, and whose age is within DIGEST_MANIFEST_TTL_H and not
+#   in the future. ANY missing/PARTIAL/stale/unparseable/errored evidence
+#   ⇒ the digest sends a RESEARCH-ONLY incident notice containing ZERO
+#   action language and exits DIGEST_FAIL_EXIT (default 3 ⇒ red run).
+#   FAIL-CLOSED FLIP — _is_stale now returns True for unstamped rows while
+#   the gate is required (the exact inversion of the v1.1.0 D3 choice).
+#   ESCAPE — DIGEST_REQUIRE_MANIFEST=0 restores v1.2.1 behavior verbatim.
+#   DEFAULT IS ON deliberately: the workflow is disabled today, so the flip
+#   cannot change tonight's behavior; re-enabling digest.yml is the
+#   operator's explicit adoption of the gate. Stamps exist only once
+#   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
+#   the correct fail-closed answer.
+# =============================================================================
+__version__ = "2.0.0"
 
 # v1.2.0 — PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): _load_page fetched each tab via a hardcoded
@@ -394,6 +419,147 @@ def _issuer_key(name: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
 
 
+# --------------------------------------------------------------------------- #
+# v2.0.0 manifest gate
+# --------------------------------------------------------------------------- #
+def _manifest_required() -> bool:
+    """v2.0.0: DIGEST_REQUIRE_MANIFEST, default ON. 0/false/off/no restores
+    v1.2.1 behavior (no gate, unstamped-is-fresh)."""
+    return (os.getenv("DIGEST_REQUIRE_MANIFEST") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _manifest_ttl_h() -> float:
+    try:
+        return max(0.5, float(_env("DIGEST_MANIFEST_TTL_H", "6") or "6"))
+    except Exception:
+        return 6.0
+
+
+def _fail_exit() -> int:
+    try:
+        return int(_env("DIGEST_FAIL_EXIT", "3") or "3")
+    except Exception:
+        return 3
+
+
+def _manifest_pages() -> List[str]:
+    raw = _env("DIGEST_MANIFEST_PAGES",
+               "Market_Leaders,Global_Markets,Commodities_FX,Mutual_Funds")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _parse_any_ts(raw: Any) -> Optional[datetime]:
+    """v2.0.0: parse a _Status timestamp cell. Accepts the digest's own
+    'YYYY-MM-DD HH:MM[:SS]' forms and ISO-8601 with 'T' (offset ignored;
+    naive values are treated as Riyadh wall clock, matching the sheet)."""
+    t = str(raw or "").strip()
+    if not t:
+        return None
+    t = t.replace("T", " ")
+    if "+" in t[10:]:
+        t = t[: t.index("+", 10)]
+    if t.endswith("Z"):
+        t = t[:-1]
+    return _parse_ts(t[:19])
+
+
+def _read_status_rows(read_range, sheet_id: str) -> List[List[Any]]:
+    return read_range(sheet_id, "'_Status'!A1:J400") or []
+
+
+def _scan_backend_stamp(rows: List[List[Any]], page: str) -> Dict[str, Any]:
+    """v2.0.0: newest row that names `page` and carries a v6.45.0 write-seam
+    manifest (' data=' marker in some cell). Returns parsed fields; every
+    absence stays None so the gate can fail closed on it."""
+    out = {"found": False, "data": None, "age_h": None, "run": "", "raw": ""}
+    for row in reversed(rows or []):
+        cells = [str(c) for c in (row or [])]
+        if not any(str(c).strip() == page for c in cells[:4]):
+            continue
+        msg = next((c for c in cells if " data=" in c), "")
+        if not msg:
+            continue
+        out["found"] = True
+        out["raw"] = msg[:200]
+        m = re.search(r"\bdata=(COMPLETE|PARTIAL)\b", msg)
+        out["data"] = m.group(1) if m else None
+        m = re.search(r"\brun=(\S+)", msg)
+        out["run"] = m.group(1) if m else ""
+        ts = None
+        for c in cells:
+            ts = _parse_any_ts(c)
+            if ts is not None:
+                break
+        if ts is not None:
+            now_r = datetime.now(RIYADH_TZ).replace(tzinfo=None)
+            out["age_h"] = (now_r - ts).total_seconds() / 3600.0
+        return out
+    return out
+
+
+def _manifest_gate(read_range, sheet_id: str):
+    """v2.0.0: (ok, summary, fails). FAIL-CLOSED: any exception, missing
+    page stamp, PARTIAL, unparseable/absent timestamp, stale beyond TTL, or
+    a timestamp more than 15 minutes in the future fails the gate."""
+    fails: List[str] = []
+    parts: List[str] = []
+    try:
+        rows = _read_status_rows(read_range, sheet_id)
+    except Exception as exc:  # noqa: BLE001
+        return False, "manifest unreadable", [f"_Status read failed: {exc}"]
+    ttl = _manifest_ttl_h()
+    run_ids = set()
+    for page in _manifest_pages():
+        st = _scan_backend_stamp(rows, page)
+        if not st["found"]:
+            fails.append(f"{page}: no backend write-seam stamp")
+            continue
+        if st["data"] != "COMPLETE":
+            fails.append(f"{page}: data={st['data'] or 'UNKNOWN'}")
+        if st["age_h"] is None:
+            fails.append(f"{page}: stamp timestamp unparseable")
+        elif st["age_h"] > ttl:
+            fails.append(f"{page}: stamp stale {st['age_h']:.1f}h > {ttl:.1f}h")
+        elif st["age_h"] < -0.25:
+            fails.append(f"{page}: stamp {abs(st['age_h']):.1f}h in the future (clock skew)")
+        if st["run"]:
+            run_ids.add(st["run"])
+        parts.append(f"{page}={st['data'] or '?'}"
+                     + (f"/{st['age_h']:.1f}h" if st["age_h"] is not None else "/?"))
+    summary = ("pages " + ", ".join(parts)
+               + (f" | runs={len(run_ids)}" if run_ids else ""))
+    return (len(fails) == 0), summary, fails
+
+
+_MANIFEST_NOTE = {"line": ""}
+
+
+def _compose_incident(session: str, fails: List[str], summary: str):
+    """v2.0.0: research-only notice. Deliberately contains no action verbs,
+    no picks, and no symbols — only which evidence failed."""
+    now = datetime.now(RIYADH_TZ).strftime("%Y-%m-%d %H:%M")
+    subject = f"TFB Digest — {session} — RESEARCH ONLY (manifest FAIL)"
+    lines = [
+        f"TFB Decision Digest — {session}",
+        f"Generated {now} Riyadh.",
+        "",
+        "The decision-surface manifest did NOT pass, so this message contains",
+        "no trade guidance. A complete, fresh, verified source cohort is",
+        "required before the digest may carry action language.",
+        "",
+        "Failed checks:",
+        *[f"  - {f}" for f in (fails or ["(none listed)"])],
+        "",
+        f"Manifest summary: {summary}",
+        "",
+        "This is an automated fail-closed notice (send_digest v2.0.0).",
+    ]
+    text = "\n".join(lines)
+    html = "<pre>" + text.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+    return subject, text, html
+
+
 def _stale_hours() -> float:
     """v1.1.0 (D3): DIGEST_STALE_HOURS, default 24, floor 1."""
     try:
@@ -422,7 +588,10 @@ def _is_stale(r: Optional[Dict[str, Any]]) -> bool:
         return False
     ts = _parse_ts(r.get("updated"))
     if ts is None:
-        return False
+        # v2.0.0: under the manifest gate an UNSTAMPED row is STALE — an
+        # unverifiable vintage must never render as fresh. Exact inversion
+        # of the v1.1.0 D3 fail-open; DIGEST_REQUIRE_MANIFEST=0 restores it.
+        return _manifest_required()
     now_r = datetime.now(RIYADH_TZ).replace(tzinfo=None)
     return (now_r - ts).total_seconds() / 3600.0 >= _stale_hours()
 
@@ -697,6 +866,7 @@ def _compose(
         [
             f"TFB Decision Digest — {session}",
             f"Generated {now} Riyadh (from the latest synced dashboard).",
+            *([_MANIFEST_NOTE["line"]] if _MANIFEST_NOTE.get("line") else []),
             *([stale_note] if stale_note else []),
             "",
             _line("Best BUY ", best_buy),
@@ -828,6 +998,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     session = args.session or datetime.now(RIYADH_TZ).strftime("%H:%M Riyadh")
     read_range = _get_read_range()
+
+    # v2.0.0: the manifest gate runs before any pick exists. FAIL ⇒ send a
+    # research-only incident notice and exit red (DIGEST_FAIL_EXIT).
+    if _manifest_required():
+        m_ok, m_summary, m_fails = _manifest_gate(read_range, sheet_id)
+        if not m_ok:
+            _log("MANIFEST FAIL: " + "; ".join(m_fails)[:400])
+            subj_i, text_i, html_i = _compose_incident(session, m_fails, m_summary)
+            rc = _send_email(subj_i, text_i, html_i, args.dry_run)
+            return rc if rc != 0 else _fail_exit()
+        _MANIFEST_NOTE["line"] = f"Manifest: PASS — {m_summary}"
+        _log("MANIFEST PASS: " + m_summary[:300])
 
     candidate_pages = [
         p.strip() for p in _env("DIGEST_CANDIDATE_PAGES", "Market_Leaders").split(",") if p.strip()
