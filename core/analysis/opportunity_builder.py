@@ -1038,7 +1038,30 @@ from datetime import datetime, timedelta, timezone
 #   is the single plan-TP1 definition. KILL SWITCH TFB_OPP_AUDIT_ROI_LEGACY=1
 #   restores v1.13.0 bytes. Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-OPPORTUNITY_BUILDER_VERSION = "1.14.0"
+# =============================================================================
+# v1.15.0 (2026-08-26, One-Pass Batch #5b) — CAPITAL HONESTY SWITCHES
+# WHY (2026-08-26 audit): Portfolio_Decision displayed Deployable 22,923 SAR
+# on broker cash of 14,700 — 74.7% of it UNEXECUTED OTIS/SHG sale proceeds,
+# because the L7 doctrine defines Deployable = cash + pending TRIM/EXIT
+# proceeds, and sizing divides by CURRENT price while the advisor advertises
+# entry up to price*1.01. Two opt-in gates, both DEFAULT OFF = v1.14.0
+# byte-identical; the operator arms each against evidence:
+#   TFB_OPP_FUNDING_SETTLED_ONLY=1  -> proceeds contribute ZERO to funding
+#       (deployable = settled cash only; _funds_from proceeds leg starts 0).
+#   TFB_OPP_SIZE_AT_ENTRY_HIGH=1    -> share sizing divides by the WORST
+#       advertised entry (price_sar * 1.01), so a fill at entry-high cannot
+#       breach the allocation the ticket promised.
+# Additive, ungated: kpis expose deployable_current_sar (cash-only view) and
+# deployable_proforma_sar (doctrine view) so every surface can label which
+# number it is showing. No recommendation logic touched.
+# =============================================================================
+# v1.15.1 (2026-08-26, A4 self-audit catch): under SIZE_AT_ENTRY_HIGH the
+# v1.15.0 draft sized shares at price*1.01 but still RESERVED shares*price —
+# a ~1% under-reservation, the exact failure the switch exists to prevent.
+# Fixed: in that mode `suggested` (the reserved/booked ticket) is
+# shares * worst-entry too, so Σ suggested can never be breached by a fill
+# at the advertised entry-high. OFF remains v1.14.0 byte-identical.
+OPPORTUNITY_BUILDER_VERSION = "1.15.1"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -3427,14 +3450,41 @@ def _size_one(cand, criteria, budget_base, remaining):
     # the unarmed path is byte-identical to v1.10.3.
     lot = max(1, int(criteria["lot_size"]), _venue_lot_for_symbol(cand))
     shares = 0
-    if price_sar > 0 and alloc >= price_sar * lot:
-        shares = int(alloc // (price_sar * lot)) * lot
-    suggested = shares * price_sar
+    # v1.15.0: optional worst-entry sizing — divide by the advertised
+    # entry-high (price*1.01) so the ticket stays affordable at its own
+    # worst fill. OFF (default) = v1.14.0 byte-identical.
+    _sz_px = price_sar * 1.01 if _size_at_entry_high() else price_sar
+    if _sz_px > 0 and alloc >= _sz_px * lot:
+        shares = int(alloc // (_sz_px * lot)) * lot
+    # v1.15.1: the reserved ticket must survive the worst advertised fill —
+    # book at the same price the sizing assumed. OFF: shares*price verbatim.
+    suggested = shares * _sz_px
     return suggested, shares
 
 
+_LAST_DEPLOYABLE_SPLIT = {"current": 0, "proforma": 0}
+
+
+def _funding_settled_only() -> bool:
+    """v1.15.0: TFB_OPP_FUNDING_SETTLED_ONLY — default OFF (doctrine L7,
+    cash + pending proceeds). ON: only settled cash funds ADDs."""
+    return str(os.getenv("TFB_OPP_FUNDING_SETTLED_ONLY") or "0").strip() \
+        .lower() in ("1", "true", "yes", "on")
+
+
+def _size_at_entry_high() -> bool:
+    """v1.15.0: TFB_OPP_SIZE_AT_ENTRY_HIGH — default OFF (size at current
+    price, v1.14.0 verbatim). ON: size at price*1.01 (worst advertised
+    entry) so the promised allocation survives an entry-high fill."""
+    return str(os.getenv("TFB_OPP_SIZE_AT_ENTRY_HIGH") or "0").strip() \
+        .lower() in ("1", "true", "yes", "on")
+
+
 def _funds_from(suggested, cash_left, proceeds_left):
-    """L7: every ADD names its funding source; split cash-first."""
+    """L7: every ADD names its funding source; split cash-first.
+    v1.15.0: settled-only mode zeroes the proceeds leg at the source."""
+    if _funding_settled_only():
+        proceeds_left = 0.0
     from_cash = min(suggested, cash_left)
     from_proceeds = min(max(0.0, suggested - from_cash), proceeds_left)
     parts = []
@@ -3508,7 +3558,11 @@ def _issuer_key(cand):
 def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     """L2 cap + §4.2 diversification (selection-time, defer) + §4.4 sizing.
     Returns (tickets_raw, deferrals{symbol: reason})."""
-    deployable = pf["cash"] + pf["proceeds"]
+    # v1.15.0: settled-only mode removes pending proceeds from funding.
+    _LAST_DEPLOYABLE_SPLIT["current"] = round(pf["cash"], 0)
+    _LAST_DEPLOYABLE_SPLIT["proforma"] = round(pf["cash"] + pf["proceeds"], 0)
+    deployable = pf["cash"] + (0.0 if _funding_settled_only()
+                               else pf["proceeds"])
     budget_base = pf["portfolio_value"] + deployable
     remaining = deployable
     cash_left, proceeds_left = pf["cash"], pf["proceeds"]
@@ -4297,6 +4351,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
+        # v1.15.0 additive: label-able views — settled cash only vs doctrine.
+        "deployable_current_sar": _LAST_DEPLOYABLE_SPLIT["current"],
+        "deployable_proforma_sar": _LAST_DEPLOYABLE_SPLIT["proforma"],
         "expected_gain_12m_sar": round(
             sum(t["exp_gain_12m_sar"] for t in tickets), 0),
         "selected_count": len(tickets),
@@ -4463,7 +4520,8 @@ def _skeleton(status, message, criteria):
         "version": OPPORTUNITY_BUILDER_VERSION,
         "status": status,
         "message": message,
-        "kpis": {"deployable_sar": 0, "expected_gain_12m_sar": 0,
+        "kpis": {"deployable_sar": 0, "deployable_current_sar": 0,
+                 "deployable_proforma_sar": 0, "expected_gain_12m_sar": 0,
                  "selected_count": 0,
                  "max_selected": criteria.get("max_selected", 10),
                  "blended_reliability": None, "blended_rr": None,
