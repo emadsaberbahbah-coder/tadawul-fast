@@ -640,7 +640,22 @@ logger.addHandler(logging.NullHandler())
 # KILL SWITCH: TFB_T10_DISCLOSE_LEGACY=1 => v4.27.0 payload byte-identical.
 # Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.28.0"
+# =============================================================================
+# v4.29.0 (2026-08-26, One-Pass Batch #5a) — BC-4 REACHES THE NESTED TICKET
+# WHY: the live 2026-08-26 10:04 board withheld every top-level sizing field
+# ("—") yet the rendered panel still showed 1015.KL "Funds From: Cash 6,286
+# SAR". Root cause: opportunity_builder emits the funding/sizing AGAIN inside
+# the nested row["ticket"] dict, and v4.28.0's _t10_redact_withheld only
+# redacted top-level keys — column-hiding is not decision-withholding, and
+# neither is top-level-only redaction. This version walks the nested ticket
+# (and the engine/valuation gain parallels) under the SAME gate
+# (TFB_T10_DISCLOSE_LEGACY=1 restores v4.28.0 verbatim). Per-share levels
+# (entry zone / stop / TP1 / TP2) remain visible by BC-4 design.
+# NOTE (Register): a withheld seat still RESERVED builder capital this run
+# (cash_left consumed before stability was known) — releasing that
+# reservation is the cohort/capital wave, not this redaction fix.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.29.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1228,6 +1243,22 @@ def _t10_redact_withheld(row, status):
         if "funds_from" in row:
             row["funds_from"] = "\u2014"
         for k in _T10_REDACT_NONE_KEYS:
+            if k in row:
+                row[k] = None
+        # v4.29.0: the builder repeats funding/sizing inside the nested
+        # ticket dict (and gain parallels) — redact those too, same gate.
+        tk = row.get("ticket")
+        if isinstance(tk, dict):
+            if "funds_from" in tk:
+                tk["funds_from"] = "\u2014"
+            if "advisor_note" in tk:
+                tk["advisor_note"] = _T10_RESEARCH_NOTE
+            for k in ("suggested_sar", "suggested_shares",
+                      "exp_gain_12m_sar", "engine_exp_gain_12m_sar",
+                      "valuation_exp_gain_12m_sar"):
+                if k in tk:
+                    tk[k] = None
+        for k in ("engine_exp_gain_12m_sar", "valuation_exp_gain_12m_sar"):
             if k in row:
                 row[k] = None
     except Exception:
