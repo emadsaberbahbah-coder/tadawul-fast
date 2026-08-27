@@ -110,7 +110,7 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -538,7 +538,7 @@ jobs:
 
     steps:
       - name: 📥 Secure Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -1407,7 +1407,7 @@ jobs:
 
     steps:
       - name: 📥 Secure Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           persist-credentials: false
