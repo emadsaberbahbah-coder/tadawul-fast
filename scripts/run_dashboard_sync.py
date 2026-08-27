@@ -1835,7 +1835,52 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.45.0"
+SCRIPT_VERSION = "6.46.0"
+# -----------------------------------------------------------------------------
+# v6.46.0 (2026-08-27) — _STATUS TIMESTAMPS CARRY AN EXPLICIT UTC OFFSET
+# -----------------------------------------------------------------------------
+# FORENSIC WHY (confirmed to the minute, 2026-08-27 morning session): the
+# _Status page stamps (col B) and the L/M feed-verdict keys were written as
+# NAIVE runner-local wall-clock ("2026-08-27 03:11:19", TZ=Asia/Riyadh in the
+# workflow). The GAS consumer dt10UvParse_ v1.10.2 resolves a naive stamp
+# under BOTH clocks and keeps the smallest plausible age — which picks the
+# UTC misreading for any verdict older than 180 minutes, understating feed
+# age by exactly the Riyadh offset forever after (measured: banner 173m vs
+# true 353m; effective staleness window 660m against a declared 480m). Root
+# cause is the PRODUCER emitting an ambiguous timestamp; a consumer cannot
+# disambiguate what the producer never stated.
+# FIX (this file only, two write sites + one parser):
+#   (1) _status_ts_str(): local wall-clock + explicit offset computed from
+#       the runner ("2026-08-27 03:11:19+03:00"). Human-readable, and the
+#       offset is derived, not hardcoded, so a workflow TZ change cannot
+#       reintroduce the lie.
+#   (2) _status_stamp_row col B and the upstream-verdict `ts` now use it.
+#   (3) _uv_parse_value tolerates both formats (offset stripped via [:19]),
+#       so this job keeps reading rows written by v6.45.0 and by itself.
+# CONSUMER IMPACT, verified against live sources before this edit:
+#   - dt10UvParse_ v1.10.2 regex is UNANCHORED (/(\d{4})-.../): it ignores
+#     the suffix, so board behavior is BYTE-IDENTICAL until the GAS Batch-2
+#     parser lands and starts honoring the offset. Fix-enabling, not
+#     behavior-changing.
+#   - Coordinator tfbBackendHoldParse_ has explicit hasTz handling: suffix OK.
+#   - send_digest._parse_ts and this file's _mh reader slice [:19]: suffix OK.
+# Functions added: 1 (_status_ts_str). Functions removed: 0.
+# -----------------------------------------------------------------------------
+
+
+def _status_ts_str() -> str:
+    """Local wall-clock with an explicit UTC offset, e.g.
+    '2026-08-27 03:11:19+03:00'. The offset is computed from the runner's
+    actual zone so the string is self-describing wherever the job runs."""
+    try:
+        off = -(time.altzone if time.daylight and time.localtime().tm_isdst
+                else time.timezone)
+        sign = "+" if off >= 0 else "-"
+        off = abs(int(off))
+        suffix = "%s%02d:%02d" % (sign, off // 3600, (off % 3600) // 60)
+    except Exception:
+        suffix = ""
+    return time.strftime("%Y-%m-%d %H:%M:%S") + suffix
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -5561,7 +5606,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" run={run_id}" if run_id else ""))
     return [
         page,                                       # A Page
-        time.strftime("%Y-%m-%d %H:%M:%S"),         # B Last Updated
+        _status_ts_str(),                           # B Last Updated (v6.46.0: +offset)
         status_cell,                                # C Status (PARTIAL_FRESH when refresh coverage < min)
         msg,                                        # D Message
         _STATUS_STAMP_ENDPOINT,                     # E Endpoint
@@ -6203,6 +6248,15 @@ def _uv_parse_value(val: str) -> tuple:
                 ts = time.mktime(time.strptime(p, "%Y-%m-%d %H:%M:%S"))
                 break
             except Exception:
+                pass
+            try:
+                # v6.46.0: tolerate an explicit UTC-offset suffix
+                # ("2026-08-27 03:11:19+03:00") by parsing the naive prefix;
+                # producer and runner share the same zone, so [:19] is exact.
+                if len(p) >= 19:
+                    ts = time.mktime(time.strptime(p[:19], "%Y-%m-%d %H:%M:%S"))
+                    break
+            except Exception:
                 continue
         return state, ts
     except Exception:
@@ -6303,7 +6357,7 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                 raise _err
             keys[key.casefold()] = (slot, value)
 
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ts = _status_ts_str()  # v6.46.0: explicit offset
         run_id = (os.getenv("GITHUB_RUN_ID") or "").strip() or "local"
         required = set(_upstream_verdict_pages())
         for r in (results or []):
