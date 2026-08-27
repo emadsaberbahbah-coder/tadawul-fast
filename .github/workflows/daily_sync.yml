@@ -337,6 +337,17 @@ jobs:
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
       TFB_SYNC_VERDICT_MAX_AGE_MIN: ${{ vars.TFB_SYNC_VERDICT_MAX_AGE_MIN || '240' }}
+      # -- v6.45.0 R1/R3/R6 hold+repair chain: ARMING PLUMBING (added 2026-08-28).
+      # FORENSIC WHY: the four Script-#1 gates read os.getenv, but repo
+      # Variables never reach the process unless mapped here. On run
+      # 33121085275 the sentinel Variable was set to 1 yet [SYNC-HOLD]
+      # published zero times and the coordinator (correctly) yielded zero
+      # times - the producer was mute by missing plumbing, not broken code.
+      # Defaults mirror code defaults: byte-identical when Variables absent.
+      TFB_SYNC_WRITE_SENTINEL: ${{ vars.TFB_SYNC_WRITE_SENTINEL || '0' }}
+      TFB_SYNC_HOLD_TTL_SEC: ${{ vars.TFB_SYNC_HOLD_TTL_SEC || '180' }}
+      TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
+      TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
       # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
@@ -1360,6 +1371,17 @@ jobs:
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
       TFB_SYNC_VERDICT_MAX_AGE_MIN: ${{ vars.TFB_SYNC_VERDICT_MAX_AGE_MIN || '240' }}
+      # -- v6.45.0 R1/R3/R6 hold+repair chain: ARMING PLUMBING (added 2026-08-28).
+      # FORENSIC WHY: the four Script-#1 gates read os.getenv, but repo
+      # Variables never reach the process unless mapped here. On run
+      # 33121085275 the sentinel Variable was set to 1 yet [SYNC-HOLD]
+      # published zero times and the coordinator (correctly) yielded zero
+      # times - the producer was mute by missing plumbing, not broken code.
+      # Defaults mirror code defaults: byte-identical when Variables absent.
+      TFB_SYNC_WRITE_SENTINEL: ${{ vars.TFB_SYNC_WRITE_SENTINEL || '0' }}
+      TFB_SYNC_HOLD_TTL_SEC: ${{ vars.TFB_SYNC_HOLD_TTL_SEC || '180' }}
+      TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
+      TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
       # ─────────────────────────────────────────────────────────────────────
 
       # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
