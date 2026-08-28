@@ -1061,7 +1061,35 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.15.1"
+OPPORTUNITY_BUILDER_VERSION = "1.16.0"
+# -----------------------------------------------------------------------------
+# v1.16.0 (2026-08-28) - CONSTRAINTS PACK, ALL THREE ENV-GATED / DEFAULT-OFF
+# -----------------------------------------------------------------------------
+# FORENSIC WHY (2026-08-27 board, live): the 1015.KL ticket (6,293 SAR MYR,
+# 957 shares) cleared every gate while breaching, on PD arithmetic, the 30%
+# sector cap (Financials 30.41%) and the operator cash floor (left 8,407 vs
+# 8,915), and while ignoring the Bursa 100-share board lot - because:
+#   (a) the 'budget' sector basis divides by pv+deployable, diluting the cap
+#       (26.1% pass vs 30.41% on the PD base);
+#   (b) no cash-floor concept existed builder-side at all;
+#   (c) TFB_T10_VENUE_LOTS carried the typo "defult", which the parser
+#       silently collapsed to {} = feature OFF - a gate asleep for weeks with
+#       zero telemetry; and _VENUE_COSTS had no .KL row, so even an armed
+#       floor gate returned None for Bursa.
+# CHANGES (each byte-identical until its ENV is set):
+#   (1) TFB_OPP_SECTOR_CAP_BASIS gains 'pd': denominators use
+#       portfolio_value ONLY, matching Portfolio_Decision arithmetic, in BOTH
+#       _sector_context and the S4.2 application. 'budget' stays the default.
+#   (2) NEW TFB_OPP_CASH_FLOOR_SAR (default '' = off): an absolute SAR
+#       reserve subtracted from cash_left AND deployable before any pick is
+#       funded. Semantics-free by design (no pv-inclusion guessing).
+#   (3) _env_venue_lots(): an unparsable NON-EMPTY value now emits ONE loud
+#       _LOG.warning naming the raw value and stays OFF (observability only;
+#       no behavior flip on a live misconfig). _VENUE_COSTS gains a .KL
+#       row so the ALREADY-GATED floor feature covers Bursa when armed
+#       (.SI pre-existed at 16,700 further down the map - left untouched).
+# Functions added: 1 (_cash_floor_sar). Removed: 0.
+# -----------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1553,6 +1581,13 @@ def _env_venue_lots():
             continue
         if suf and lot > 1:
             out[suf] = lot
+    if not out:  # v1.16.0: non-empty value parsed to nothing (e.g. "defult")
+        try:
+            _LOG.warning("[VENUE-LOTS] CONFIG INVALID: %r yields no entries - "
+                         "feature stays OFF; set TFB_T10_VENUE_LOTS=default "
+                         "or a csv like T:100,KL:100", raw)
+        except Exception:
+            pass
     return out
 
 
@@ -1978,6 +2013,7 @@ _VENUE_COSTS = {
     ".US": (0.0,   0.0,  0.10,  5000),
     ".SR": (0.155, 0.0,  0.05,  4000),   # conservative ceiling until zero-tier confirmed
     ".T":  (0.199, 46.0, 0.10, 13200),
+    ".KL": (0.199, 51.0, 0.15, 45000),   # v1.16.0: Bursa - measured non-USD floor
     ".HK": (0.199, 95.0, 0.15, 27200),
     ".L":  (0.199, 97.2, 0.15, 27700),
     ".PA": (0.199, 85.5, 0.12, 24500), ".AS": (0.199, 85.5, 0.12, 24500),
@@ -3408,12 +3444,29 @@ def _normalize_portfolio(portfolio):
             "portfolio_value": max(0.0, pv), "holdings": holdings}
 
 
+def _cash_floor_sar() -> float:
+    """v1.16.0: absolute cash reserve in SAR (TFB_OPP_CASH_FLOOR_SAR,
+    default '' = 0.0 = off). Unparsable values are loudly ignored."""
+    raw = (os.getenv("TFB_OPP_CASH_FLOOR_SAR") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw.replace(",", "")))
+    except (TypeError, ValueError):
+        try:
+            _LOG.warning("[CASH-FLOOR] CONFIG INVALID: %r is not a number - "
+                         "floor INACTIVE; fix TFB_OPP_CASH_FLOOR_SAR", raw)
+        except Exception:
+            pass
+        return 0.0
+
+
 def _sector_cap_basis() -> str:
     """v1.0.24: 'budget' (default) -> sector-weight checks divide by
     budget_base = portfolio_value + deployable; 'legacy' -> v1.0.23
     portfolio-value-only denominators, byte-identical."""
     v = (os.getenv("TFB_OPP_SECTOR_CAP_BASIS") or "budget").strip().lower()
-    return v if v in {"budget", "legacy"} else "budget"
+    return v if v in {"budget", "legacy", "pd"} else "budget"
 
 
 def _sector_context(pf, criteria, deployable=0.0):
@@ -3423,7 +3476,8 @@ def _sector_context(pf, criteria, deployable=0.0):
     cap_hit = set()
     # v1.0.24: cash-aware base under the default 'budget' basis; 'legacy'
     # keeps the v1.0.23 pv-only formula exactly.
-    if _sector_cap_basis() == "budget":
+    _scb = _sector_cap_basis()
+    if _scb == "budget":
         _base = pf["portfolio_value"] + max(0.0, float(deployable or 0.0))
         if _base > 0:
             cap = criteria["pf_max_sector_pct"]
@@ -3431,6 +3485,7 @@ def _sector_context(pf, criteria, deployable=0.0):
                 if v / _base * 100.0 >= cap:
                     cap_hit.add(s)
     elif pf["portfolio_value"] > 0:
+        # 'legacy' and v1.16.0 'pd' share the pv-only denominator here.
         cap = criteria["pf_max_sector_pct"]
         for s, v in sectors.items():
             if v / pf["portfolio_value"] * 100.0 >= cap:
@@ -3561,11 +3616,16 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     # v1.15.0: settled-only mode removes pending proceeds from funding.
     _LAST_DEPLOYABLE_SPLIT["current"] = round(pf["cash"], 0)
     _LAST_DEPLOYABLE_SPLIT["proforma"] = round(pf["cash"] + pf["proceeds"], 0)
+    _floor = _cash_floor_sar()
     deployable = pf["cash"] + (0.0 if _funding_settled_only()
                                else pf["proceeds"])
     budget_base = pf["portfolio_value"] + deployable
     remaining = deployable
     cash_left, proceeds_left = pf["cash"], pf["proceeds"]
+    if _floor > 0:  # v1.16.0: absolute reserve, never funded from
+        _res = min(cash_left, _floor)
+        cash_left -= _res
+        deployable = max(0.0, deployable - _res)
 
     sector_counts, market_counts = {}, {}
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
@@ -3646,11 +3706,16 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         # §4.2 combined post-action portfolio sector cap (only if sized & ctx)
         # v1.0.24: 'budget' basis divides by budget_base (pv + deployable) —
         # the true post-round portfolio; 'legacy' keeps pv + suggested.
-        _scb_budget = _sector_cap_basis() == "budget"
+        _scb = _sector_cap_basis()
+        _scb_budget = _scb == "budget"
         _cap_base_ok = (budget_base > 0) if _scb_budget else (pf["portfolio_value"] > 0)
         if (suggested > 0 and _cap_base_ok and
                 sector_ctx["available"]):
-            post_total = budget_base if _scb_budget else (pf["portfolio_value"] + suggested)
+            # v1.16.0 'pd': PD-consistent pv-only denominator (post_sector
+            # includes the ticket; the total does not double-count cash).
+            post_total = (budget_base if _scb_budget else
+                          (pf["portfolio_value"] if _scb == "pd"
+                           else pf["portfolio_value"] + suggested))
             post_sector = pf_sector_sar.get(sec, 0.0) + suggested
             if post_sector / post_total * 100.0 > criteria[
                     "pf_max_sector_pct"]:
