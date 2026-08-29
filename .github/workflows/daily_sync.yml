@@ -346,6 +346,7 @@ jobs:
       # Defaults mirror code defaults: byte-identical when Variables absent.
       TFB_SYNC_WRITE_SENTINEL: ${{ vars.TFB_SYNC_WRITE_SENTINEL || '0' }}
       TFB_SYNC_HOLD_TTL_SEC: ${{ vars.TFB_SYNC_HOLD_TTL_SEC || '180' }}
+      TFB_SYNC_HOLD_POST_GRACE_SEC: ${{ vars.TFB_SYNC_HOLD_POST_GRACE_SEC || '45' }}
       TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
       TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
       # ─────────────────────────────────────────────────────────────────────
@@ -1380,6 +1381,7 @@ jobs:
       # Defaults mirror code defaults: byte-identical when Variables absent.
       TFB_SYNC_WRITE_SENTINEL: ${{ vars.TFB_SYNC_WRITE_SENTINEL || '0' }}
       TFB_SYNC_HOLD_TTL_SEC: ${{ vars.TFB_SYNC_HOLD_TTL_SEC || '180' }}
+      TFB_SYNC_HOLD_POST_GRACE_SEC: ${{ vars.TFB_SYNC_HOLD_POST_GRACE_SEC || '45' }}
       TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
       TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
       # ─────────────────────────────────────────────────────────────────────
