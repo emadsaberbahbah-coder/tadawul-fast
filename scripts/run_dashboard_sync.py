@@ -1835,7 +1835,28 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.46.0"
+SCRIPT_VERSION = "6.47.0"
+# -----------------------------------------------------------------------------
+# v6.47.0 (2026-08-29) - SYNC-HOLD BECOMES SELF-EVIDENCING
+# -----------------------------------------------------------------------------
+# FORENSIC WHY: three consecutive nights produced zero coordinator yields
+# while write-seam divergence persisted (GM rb 392/403/404/440). The producer
+# is PROVEN to have published at least once (the undated "cleared" note in
+# _Sync_Control) - but nothing records WHEN a publish happened, whether last
+# night's publish succeeded, or what the cell held during the 03:05-03:07
+# GAS/backend overlap. That evidence lives only in the GitHub Actions console
+# - invisible in every workbook export - the same artifact-blindness class
+# that already cost four acceptance gates this week.
+# CHANGES (pure observability; hold semantics byte-identical):
+#   (1) NEW _append_runlog_sync_hold(): one _Run_Log row per publish, clear,
+#       and FAILURE (cloned from _append_runlog_manual_hold; fail-open).
+#   (2) _sync_hold_publish(): after the update, READS THE CELL BACK and logs
+#       "verified=<cell contents>" - a publish that did not land can never
+#       again masquerade as one that did.
+#   (3) Cell notes now carry ISO timestamps (held/cleared <iso>), so
+#       _Sync_Control itself becomes a dated witness.
+# Functions added: 1 (_append_runlog_sync_hold). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.46.0 (2026-08-27) — _STATUS TIMESTAMPS CARRY AN EXPLICIT UTC OFFSET
 # -----------------------------------------------------------------------------
@@ -5227,6 +5248,30 @@ def _sync_hold_find_row(grid) -> int:
     return -1
 
 
+def _append_runlog_sync_hold(sheets: Any, spreadsheet_id: str, level: str,
+                             status: str, msg: str) -> None:
+    """v6.47.0: best-effort, fail-open _Run_Log line so the hold lifecycle
+    is auditable from workbook exports alone."""
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        svc.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="'_Run_Log'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                datetime.now(timezone.utc).isoformat(),
+                level, "sync_hold", "ALL", status,
+                f"{_SYNC_HOLD_TAG} {msg}", "", "", "",
+                _runlog_meta_json(json.dumps({"version": SCRIPT_VERSION})),
+            ]]},
+        ).execute()
+    except Exception:
+        pass
+
+
 def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
     """v6.45.0 R1: publish the backend write-window hold. FAIL-OPEN — a
     publish failure must never block the write it protects."""
@@ -5264,14 +5309,32 @@ def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
             range=f"'{_MH_SHEET}'!A{row_i}:C{row_i}",
             valueInputOption="RAW",
             body={"values": [[_SH_KEY, until,
-                              f"{_SYNC_HOLD_TAG} {page}"]]}).execute()
+                              f"{_SYNC_HOLD_TAG} held {page} " +
+                              datetime.now(timezone.utc).isoformat()
+                              ]]}).execute()
         _SH_STATE["active"] = True
-        logger.info("%s published for %s until %s (row %s)",
-                    _SYNC_HOLD_TAG, page, until, row_i)
+        verified = ""
+        try:  # v6.47.0: read the cell back - the publish proves itself.
+            _vr = svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range="'" + _MH_SHEET + "'!B" + str(row_i)).execute()
+            _vv = (_vr.get("values") or [[""]])
+            verified = str((_vv[0] or [""])[0]) if _vv else ""
+        except Exception as _ve:
+            verified = "<read-back failed: " + type(_ve).__name__ + ">"
+        logger.info("%s published for %s until %s (row %s) verified=%s",
+                    _SYNC_HOLD_TAG, page, until, row_i, verified)
+        _append_runlog_sync_hold(
+            sheets, spreadsheet_id, "INFO", "HELD",
+            "published page=" + page + " until=" + until +
+            " row=" + str(row_i) + " verified=" + repr(verified))
     except Exception as _e:
         print("::warning::%s publish failed for %s — %s: %s"
               % (_SYNC_HOLD_TAG, page, type(_e).__name__, _e))
         logger.warning("%s publish skipped: %s", _SYNC_HOLD_TAG, _e)
+        _append_runlog_sync_hold(
+            sheets, spreadsheet_id, "WARNING", "PUBLISH_FAILED",
+            "page=" + page + " " + type(_e).__name__ + ": " + str(_e))
 
 
 def _sync_hold_clear(sheets: Any, spreadsheet_id: str) -> None:
@@ -5287,13 +5350,21 @@ def _sync_hold_clear(sheets: Any, spreadsheet_id: str) -> None:
                 spreadsheetId=spreadsheet_id,
                 range=f"'{_MH_SHEET}'!B{row_i}:C{row_i}",
                 valueInputOption="RAW",
-                body={"values": [["", f"{_SYNC_HOLD_TAG} cleared"]]}).execute()
+                body={"values": [["",
+                    f"{_SYNC_HOLD_TAG} cleared " +
+                    datetime.now(timezone.utc).isoformat()]]}).execute()
         _SH_STATE["active"] = False
         logger.info("%s cleared (row %s)", _SYNC_HOLD_TAG, row_i)
+        _append_runlog_sync_hold(sheets, spreadsheet_id, "INFO",
+                                 "CLEARED", "row=" + str(row_i))
     except Exception as _e:
         _SH_STATE["active"] = False
         print("::warning::%s clear failed — %s: %s (TTL will expire it)"
               % (_SYNC_HOLD_TAG, type(_e).__name__, _e))
+        _append_runlog_sync_hold(sheets, spreadsheet_id, "WARNING",
+                                 "CLEAR_FAILED",
+                                 type(_e).__name__ + ": " + str(_e) +
+                                 " (TTL expires it)")
 
 
 def _ohlc_prewrite_enforce_classes() -> frozenset:
