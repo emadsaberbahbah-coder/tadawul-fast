@@ -1835,7 +1835,39 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.48.0"
+SCRIPT_VERSION = "6.49.0"
+# -----------------------------------------------------------------------------
+# v6.49.0 (2026-08-29) - OWNER-SET LEASE: A FINISHING LEG CAN ONLY REMOVE
+#                        ITSELF (external audit F-03; AT-02 monotonicity)
+# -----------------------------------------------------------------------------
+# GROUND TRUTH (pinned-source review at e5c8ffa + run 33255802873 lifecycle):
+# v6.48 publish ADOPTED a live foreign owner token and stored it locally;
+# clear then compared the cell owner against that adopted token, matched, and
+# shortened the shared hold to now+grace while the real owner was still
+# writing. The v6.48 harness passed adopt (C4) and foreign-skip (C3) as
+# separate states; the composed cross-leg sequence adopt->clear was the
+# untested hole. Today's five hold windows were sequential, so the branch
+# never fired in production - latent, not triggered - and it is removed
+# outright rather than patched:
+#   (1) Column C now carries an owners= ledger: one 'token@expiry' entry per
+#       live writer, ';'-separated. Tokens are sanitized to [A-Za-z0-9_.:-]
+#       and capped at 64 chars (leg ids arrive as comma-separated
+#       TFB_SYNC_PAGE_ORDER). Publish drops expired entries, upserts ONLY
+#       its own entry, and never adopts: _SH_STATE['owner'] is always our
+#       own token.
+#   (2) Column B stays a PURE ISO timestamp (the only cell the deployed GAS
+#       parser reads) and always equals max(live expiries). Clear removes
+#       its own entry and rewrites B to max(remaining); grace applies only
+#       when the ledger empties; grace=0 blanks (v6.47 behaviour).
+#       Invariant: at every instant the effective hold >= every live lease.
+#   (3) Legacy v6.48 'owner=' cells parse as one live entry expiring at B,
+#       so a mixed-version overlap still counts the old writer.
+#   (4) Publish verifies its own token in the C read-back and retries the
+#       merge once on a lost read-modify-write race. Every path stays
+#       FAIL-OPEN: hold bookkeeping must never block the write it protects.
+# Functions added: 2 (_sync_hold_parse_owners, _sync_hold_fmt_owners).
+# Removed: 0. CLEAR_SKIPPED retires (ledger self-removal replaces it).
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.48.0 (2026-08-29) - OWNERSHIP + POST-WRITE GRACE: THE HOLD BECOMES A
 #                        MECHANISM INSTEAD OF A LOTTERY
@@ -5276,11 +5308,15 @@ def _sync_hold_find_row(grid) -> int:
 
 
 def _sync_hold_owner_token() -> str:
-    """v6.48.0: stable identity for this writer process."""
+    """v6.48.0: stable identity for this writer process.
+    v6.49.0: sanitized to [A-Za-z0-9_.:-] and capped at 64 chars - the leg
+    component may arrive as comma-separated TFB_SYNC_PAGE_ORDER, and the
+    owners= ledger reserves ';' between entries and '@' before expiries."""
     rid = (os.getenv("GITHUB_RUN_ID") or "local").strip() or "local"
     leg = (os.getenv("TFB_SYNC_LEG") or os.getenv("TFB_SYNC_PAGE_ORDER")
            or "leg").strip() or "leg"
-    return f"{rid}:{leg}:{os.getpid()}"
+    tok = f"{rid}:{leg}:{os.getpid()}"
+    return re.sub(r"[^A-Za-z0-9_.:-]", "-", tok)[:64]
 
 
 def _sync_hold_post_grace_sec() -> int:
@@ -5302,6 +5338,62 @@ def _sync_hold_note_owner(note: str) -> str:
         if _tok.startswith("owner="):
             return _tok[6:]
     return ""
+
+
+def _sync_hold_parse_owners(note: str, b_iso: str) -> dict:
+    """v6.49.0: parse the owners= ledger in note column C into
+    {token: aware-UTC expiry}. Entries are 'tok@ISO' joined by ';'.
+    Legacy v6.48 cells carry a bare 'owner=tok' with the expiry living
+    only in column B - synthesized here as one live entry at B so a
+    mixed-version overlap still counts the old writer. Unparseable
+    entries are dropped; every path is FAIL-OPEN."""
+    out: dict = {}
+    txt = str(note or "")
+    ledger = ""
+    for _tok in txt.split():
+        if _tok.startswith("owners="):
+            ledger = _tok[7:]
+            break
+    if ledger:
+        for _ent in ledger.split(";"):
+            if "@" not in _ent:
+                continue
+            _t, _, _iso = _ent.partition("@")
+            _t = _t.strip()
+            if not _t:
+                continue
+            try:
+                _exp = datetime.fromisoformat(_iso.strip())
+            except Exception:
+                continue
+            if _exp.tzinfo is None:
+                _exp = _exp.replace(tzinfo=timezone.utc)
+            out[_t] = _exp
+        return out
+    _legacy = _sync_hold_note_owner(txt)
+    if _legacy:
+        try:
+            _exp = datetime.fromisoformat(str(b_iso or "").strip())
+        except Exception:
+            _exp = None
+        if _exp is not None:
+            if _exp.tzinfo is None:
+                _exp = _exp.replace(tzinfo=timezone.utc)
+            out[re.sub(r"[^A-Za-z0-9_.:-]", "-", _legacy)[:64]] = _exp
+    return out
+
+
+def _sync_hold_fmt_owners(owners: dict) -> str:
+    """v6.49.0: serialize {token: expiry} to 'owners=tok@ISO;...' sorted
+    by (expiry, token) for deterministic cells; '' when empty. Tokens are
+    pre-sanitized to [A-Za-z0-9_.:-] so ';' and '@' stay structural and
+    the whole ledger is one whitespace-free word."""
+    if not owners:
+        return ""
+    _items = sorted(owners.items(),
+                    key=lambda kv: (kv[1].isoformat(), kv[0]))
+    return "owners=" + ";".join(
+        t + "@" + e.isoformat() for t, e in _items)
 
 
 def _append_runlog_sync_hold(sheets: Any, spreadsheet_id: str, level: str,
@@ -5329,8 +5421,18 @@ def _append_runlog_sync_hold(sheets: Any, spreadsheet_id: str, level: str,
 
 
 def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
-    """v6.45.0 R1: publish the backend write-window hold. FAIL-OPEN — a
-    publish failure must never block the write it protects."""
+    """v6.45.0 R1: publish the backend write-window hold. FAIL-OPEN - a
+    publish failure must never block the write it protects.
+    v6.49.0: OWNER-SET LEASE. Column C carries an owners= ledger (one
+    'token@expiry' entry per live writer); column B stays a PURE ISO
+    timestamp equal to max(live expiries) - the only cell the deployed
+    GAS parser reads. Publish drops expired entries, upserts ONLY this
+    process' entry, and NEVER adopts a foreign identity:
+    _SH_STATE['owner'] is always our own token. Closes the v6.48 defect
+    (external audit F-03) where an adopted token let the first-finishing
+    leg pass the clear-time ownership check and shorten a lease it did
+    not own. A lost read-modify-write race is detected by re-reading C
+    for our own token and the merge is retried once."""
     if not _sync_hold_enabled() or sheets is None:
         return
     try:
@@ -5358,40 +5460,46 @@ def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
                 row_i = max(1, len(grid) + 1)
             _SH_STATE["row"] = row_i
         _td = __import__("datetime").timedelta
-        _now = datetime.now(timezone.utc)
-        until = (_now + _td(seconds=_sync_hold_ttl_sec())).isoformat()
         owner = _sync_hold_owner_token()
-        # v6.48.0: a live foreign hold is EXTENDED, never usurped - read the
-        # current B (pure ISO) and C (note carrying owner=).
-        try:
-            _cur = svc.spreadsheets().values().get(
+        _SH_STATE["owner"] = owner  # v6.49.0: always our OWN token
+        until = ""
+        owners_live = 0
+        for _attempt in (0, 1):
+            _now = datetime.now(timezone.utc)
+            _biso, _cnote = "", ""
+            try:
+                _cur = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range="'" + _MH_SHEET + "'!B" + str(row_i) + ":C"
+                          + str(row_i)).execute()
+                _row = ((_cur.get("values") or [["", ""]])[0] or ["", ""])
+                _biso = str((_row[0] if len(_row) > 0 else "") or "").strip()
+                _cnote = str((_row[1] if len(_row) > 1 else "") or "")
+            except Exception:
+                pass
+            owners = _sync_hold_parse_owners(_cnote, _biso)
+            owners = {t: e for t, e in owners.items() if e > _now}
+            owners[owner] = _now + _td(seconds=_sync_hold_ttl_sec())
+            until = max(owners.values()).isoformat()
+            owners_live = len(owners)
+            note = (f"{_SYNC_HOLD_TAG} held {page} " + _now.isoformat()
+                    + " " + _sync_hold_fmt_owners(owners))
+            svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range="'" + _MH_SHEET + "'!B" + str(row_i) + ":C"
-                      + str(row_i)).execute()
-            _row = ((_cur.get("values") or [["", ""]])[0] or ["", ""])
-            _biso = str((_row[0] if len(_row) > 0 else "") or "").strip()
-            _cnote = str((_row[1] if len(_row) > 1 else "") or "")
-            _own = _sync_hold_note_owner(_cnote)
-            if _biso and _own and _own != owner:
-                _exp = None
-                try:
-                    _exp = datetime.fromisoformat(_biso)
-                except Exception:
-                    _exp = None
-                if _exp is not None and _exp > _now:
-                    owner = _own  # extend under the live owner's name
-        except Exception:
-            pass
-        _SH_STATE["owner"] = owner
-        svc.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{_MH_SHEET}'!A{row_i}:C{row_i}",
-            valueInputOption="RAW",
-            body={"values": [[_SH_KEY, until,
-                              f"{_SYNC_HOLD_TAG} held {page} " +
-                              datetime.now(timezone.utc).isoformat() +
-                              " owner=" + owner
-                              ]]}).execute()
+                range=f"'{_MH_SHEET}'!A{row_i}:C{row_i}",
+                valueInputOption="RAW",
+                body={"values": [[_SH_KEY, until, note]]}).execute()
+            _vc = ""
+            try:
+                _vr = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range="'" + _MH_SHEET + "'!C" + str(row_i)).execute()
+                _vv = (_vr.get("values") or [[""]])
+                _vc = str((_vv[0] or [""])[0]) if _vv else ""
+            except Exception:
+                _vc = ""
+            if (owner + "@") in _vc or _attempt == 1:
+                break
         _SH_STATE["active"] = True
         verified = ""
         try:  # v6.47.0: read the cell back - the publish proves itself.
@@ -5402,12 +5510,16 @@ def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
             verified = str((_vv[0] or [""])[0]) if _vv else ""
         except Exception as _ve:
             verified = "<read-back failed: " + type(_ve).__name__ + ">"
-        logger.info("%s published for %s until %s (row %s) verified=%s",
-                    _SYNC_HOLD_TAG, page, until, row_i, verified)
+        logger.info("%s published for %s until %s (row %s) owner=%s "
+                    "owners_live=%s verified=%s",
+                    _SYNC_HOLD_TAG, page, until, row_i, owner,
+                    owners_live, verified)
         _append_runlog_sync_hold(
             sheets, spreadsheet_id, "INFO", "HELD",
             "published page=" + page + " until=" + until +
-            " row=" + str(row_i) + " verified=" + repr(verified))
+            " row=" + str(row_i) + " owner=" + owner +
+            " owners_live=" + str(owners_live) +
+            " verified=" + repr(verified))
     except Exception as _e:
         print("::warning::%s publish failed for %s — %s: %s"
               % (_SYNC_HOLD_TAG, page, type(_e).__name__, _e))
@@ -5418,54 +5530,66 @@ def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
 
 
 def _sync_hold_clear(sheets: Any, spreadsheet_id: str) -> None:
-    """v6.45.0 R1: clear the hold (blank the expiry cell). No-op unless a
-    publish succeeded this run. FAIL-OPEN; TTL is the crash backstop."""
+    """v6.45.0 R1: clear the hold. No-op unless a publish succeeded this
+    run. FAIL-OPEN; TTL is the crash backstop.
+    v6.49.0: removes ONLY this process' entry from the owners= ledger.
+    While other live entries remain, column B is rewritten to
+    max(remaining expiries) - a finishing leg can never shorten another
+    leg's lease (AT-02 monotonicity). Grace applies only when the ledger
+    empties; grace=0 blanks the cell (v6.47 behaviour). CLEAR_SKIPPED is
+    retired: ledger self-removal replaces the v6.48 foreign-skip path."""
     if not _SH_STATE.get("active") or sheets is None:
         return
+    _remaining = -1
+    row_i = _SH_STATE.get("row")
+    my_owner = str(_SH_STATE.get("owner") or "")
     try:
         svc = sheets._get_service()
-        row_i = _SH_STATE.get("row")
         if svc and row_i:
-            my_owner = str(_SH_STATE.get("owner") or "")
+            _biso, _cnote = "", ""
             try:
                 _cur = svc.spreadsheets().values().get(
                     spreadsheetId=spreadsheet_id,
                     range="'" + _MH_SHEET + "'!B" + str(row_i) + ":C"
                           + str(row_i)).execute()
                 _row = ((_cur.get("values") or [["", ""]])[0] or ["", ""])
+                _biso = str((_row[0] if len(_row) > 0 else "") or "").strip()
                 _cnote = str((_row[1] if len(_row) > 1 else "") or "")
             except Exception:
-                _cnote = ""
-            _own = _sync_hold_note_owner(_cnote)
-            if _own and my_owner and _own != my_owner:
-                _SH_STATE["active"] = False
-                logger.info("%s clear skipped - owned by %s",
-                            _SYNC_HOLD_TAG, _own)
-                _append_runlog_sync_hold(
-                    sheets, spreadsheet_id, "INFO", "CLEAR_SKIPPED",
-                    "cell owned by " + _own + "; TTL/owner settles it")
-                return
-            grace = _sync_hold_post_grace_sec()
+                pass
+            _now = datetime.now(timezone.utc)
+            owners = _sync_hold_parse_owners(_cnote, _biso)
+            owners = {t: e for t, e in owners.items()
+                      if e > _now and t != my_owner}
+            _remaining = len(owners)
             _td = __import__("datetime").timedelta
-            if grace > 0:
-                new_b = (datetime.now(timezone.utc)
-                         + _td(seconds=grace)).isoformat()
-                note = (f"{_SYNC_HOLD_TAG} write done; grace {grace}s " +
-                        datetime.now(timezone.utc).isoformat() +
-                        (" owner=" + my_owner if my_owner else ""))
+            if owners:
+                new_b = max(owners.values()).isoformat()
+                note = (f"{_SYNC_HOLD_TAG} write done; live="
+                        + str(_remaining) + " " + _now.isoformat()
+                        + " " + _sync_hold_fmt_owners(owners))
             else:
-                new_b = ""
-                note = (f"{_SYNC_HOLD_TAG} cleared " +
-                        datetime.now(timezone.utc).isoformat())
+                grace = _sync_hold_post_grace_sec()
+                if grace > 0:
+                    new_b = (_now + _td(seconds=grace)).isoformat()
+                    note = (f"{_SYNC_HOLD_TAG} write done; grace "
+                            + str(grace) + "s " + _now.isoformat())
+                else:
+                    new_b = ""
+                    note = (f"{_SYNC_HOLD_TAG} cleared "
+                            + _now.isoformat())
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{_MH_SHEET}'!B{row_i}:C{row_i}",
                 valueInputOption="RAW",
                 body={"values": [[new_b, note]]}).execute()
         _SH_STATE["active"] = False
-        logger.info("%s cleared (row %s)", _SYNC_HOLD_TAG, row_i)
-        _append_runlog_sync_hold(sheets, spreadsheet_id, "INFO",
-                                 "CLEARED", "row=" + str(row_i))
+        logger.info("%s cleared (row %s) owner=%s remaining=%s",
+                    _SYNC_HOLD_TAG, row_i, my_owner, _remaining)
+        _append_runlog_sync_hold(
+            sheets, spreadsheet_id, "INFO", "CLEARED",
+            "row=" + str(row_i) + " owner=" + my_owner +
+            " remaining=" + str(_remaining))
     except Exception as _e:
         _SH_STATE["active"] = False
         print("::warning::%s clear failed — %s: %s (TTL will expire it)"
