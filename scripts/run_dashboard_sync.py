@@ -1835,7 +1835,34 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.47.0"
+SCRIPT_VERSION = "6.48.0"
+# -----------------------------------------------------------------------------
+# v6.48.0 (2026-08-29) - OWNERSHIP + POST-WRITE GRACE: THE HOLD BECOMES A
+#                        MECHANISM INSTEAD OF A LOTTERY
+# -----------------------------------------------------------------------------
+# GROUND TRUTH (artifacts of run 33215277102, all four processes): the
+# producer worked PERFECTLY - six publishes, six clears, all logged, no
+# cross-leg overlap that night. The defect is arithmetic: publish->clear
+# spans were 2s/5s/6s/10s/26s/23s while GAS probes chunk boundaries every
+# ~5-20s. A 2-26s window against boundary probes is a coin flip per page -
+# three nights of zero yields are CONSISTENT with correct code on both
+# sides. Fix the geometry, keep the correctness:
+#   (1) POST-WRITE GRACE (TFB_SYNC_HOLD_POST_GRACE_SEC, default 45): on
+#       success the clear SHORTENS the hold to now+grace instead of
+#       blanking it, so a chunk ending seconds after our write still
+#       yields before touching the page. 0 = v6.47 immediate blank.
+#   (2) OWNERSHIP, suffix-free: column B stays a PURE ISO timestamp (the
+#       deployed GAS parser replaces the first space and end-anchors its
+#       offset regex - any suffix in B would make it reject the hold, a
+#       breakage caught in pre-ship compatibility testing). The owner token
+#       "<runid>:<leg>:<pid>" therefore lives in the NOTE column C.
+#       _sync_hold_clear refuses to touch a hold whose C-owner is another
+#       live process; _sync_hold_publish over a live foreign hold EXTENDS B
+#       and PRESERVES the foreign owner in C instead of usurping it. TTL
+#       remains the crash backstop for every path.
+# Functions added: 3 (_sync_hold_owner_token, _sync_hold_post_grace_sec, _sync_hold_note_owner).
+# Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.47.0 (2026-08-29) - SYNC-HOLD BECOMES SELF-EVIDENCING
 # -----------------------------------------------------------------------------
@@ -5248,6 +5275,35 @@ def _sync_hold_find_row(grid) -> int:
     return -1
 
 
+def _sync_hold_owner_token() -> str:
+    """v6.48.0: stable identity for this writer process."""
+    rid = (os.getenv("GITHUB_RUN_ID") or "local").strip() or "local"
+    leg = (os.getenv("TFB_SYNC_LEG") or os.getenv("TFB_SYNC_PAGE_ORDER")
+           or "leg").strip() or "leg"
+    return f"{rid}:{leg}:{os.getpid()}"
+
+
+def _sync_hold_post_grace_sec() -> int:
+    """v6.48.0: seconds the hold outlives a successful write (default 45).
+    0 = v6.47 behaviour (immediate blank). Invalid input -> default."""
+    raw = (os.getenv("TFB_SYNC_HOLD_POST_GRACE_SEC") or "").strip()
+    if not raw:
+        return 45
+    try:
+        v = int(float(raw))
+        return v if v >= 0 else 45
+    except (TypeError, ValueError):
+        return 45
+
+
+def _sync_hold_note_owner(note: str) -> str:
+    """v6.48.0: extract owner=<tok> from a note cell ('' if absent)."""
+    for _tok in str(note or "").split():
+        if _tok.startswith("owner="):
+            return _tok[6:]
+    return ""
+
+
 def _append_runlog_sync_hold(sheets: Any, spreadsheet_id: str, level: str,
                              status: str, msg: str) -> None:
     """v6.47.0: best-effort, fail-open _Run_Log line so the hold lifecycle
@@ -5302,15 +5358,39 @@ def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
                 row_i = max(1, len(grid) + 1)
             _SH_STATE["row"] = row_i
         _td = __import__("datetime").timedelta
-        until = (datetime.now(timezone.utc)
-                 + _td(seconds=_sync_hold_ttl_sec())).isoformat()
+        _now = datetime.now(timezone.utc)
+        until = (_now + _td(seconds=_sync_hold_ttl_sec())).isoformat()
+        owner = _sync_hold_owner_token()
+        # v6.48.0: a live foreign hold is EXTENDED, never usurped - read the
+        # current B (pure ISO) and C (note carrying owner=).
+        try:
+            _cur = svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range="'" + _MH_SHEET + "'!B" + str(row_i) + ":C"
+                      + str(row_i)).execute()
+            _row = ((_cur.get("values") or [["", ""]])[0] or ["", ""])
+            _biso = str((_row[0] if len(_row) > 0 else "") or "").strip()
+            _cnote = str((_row[1] if len(_row) > 1 else "") or "")
+            _own = _sync_hold_note_owner(_cnote)
+            if _biso and _own and _own != owner:
+                _exp = None
+                try:
+                    _exp = datetime.fromisoformat(_biso)
+                except Exception:
+                    _exp = None
+                if _exp is not None and _exp > _now:
+                    owner = _own  # extend under the live owner's name
+        except Exception:
+            pass
+        _SH_STATE["owner"] = owner
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"'{_MH_SHEET}'!A{row_i}:C{row_i}",
             valueInputOption="RAW",
             body={"values": [[_SH_KEY, until,
                               f"{_SYNC_HOLD_TAG} held {page} " +
-                              datetime.now(timezone.utc).isoformat()
+                              datetime.now(timezone.utc).isoformat() +
+                              " owner=" + owner
                               ]]}).execute()
         _SH_STATE["active"] = True
         verified = ""
@@ -5346,13 +5426,42 @@ def _sync_hold_clear(sheets: Any, spreadsheet_id: str) -> None:
         svc = sheets._get_service()
         row_i = _SH_STATE.get("row")
         if svc and row_i:
+            my_owner = str(_SH_STATE.get("owner") or "")
+            try:
+                _cur = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range="'" + _MH_SHEET + "'!B" + str(row_i) + ":C"
+                          + str(row_i)).execute()
+                _row = ((_cur.get("values") or [["", ""]])[0] or ["", ""])
+                _cnote = str((_row[1] if len(_row) > 1 else "") or "")
+            except Exception:
+                _cnote = ""
+            _own = _sync_hold_note_owner(_cnote)
+            if _own and my_owner and _own != my_owner:
+                _SH_STATE["active"] = False
+                logger.info("%s clear skipped - owned by %s",
+                            _SYNC_HOLD_TAG, _own)
+                _append_runlog_sync_hold(
+                    sheets, spreadsheet_id, "INFO", "CLEAR_SKIPPED",
+                    "cell owned by " + _own + "; TTL/owner settles it")
+                return
+            grace = _sync_hold_post_grace_sec()
+            _td = __import__("datetime").timedelta
+            if grace > 0:
+                new_b = (datetime.now(timezone.utc)
+                         + _td(seconds=grace)).isoformat()
+                note = (f"{_SYNC_HOLD_TAG} write done; grace {grace}s " +
+                        datetime.now(timezone.utc).isoformat() +
+                        (" owner=" + my_owner if my_owner else ""))
+            else:
+                new_b = ""
+                note = (f"{_SYNC_HOLD_TAG} cleared " +
+                        datetime.now(timezone.utc).isoformat())
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{_MH_SHEET}'!B{row_i}:C{row_i}",
                 valueInputOption="RAW",
-                body={"values": [["",
-                    f"{_SYNC_HOLD_TAG} cleared " +
-                    datetime.now(timezone.utc).isoformat()]]}).execute()
+                body={"values": [[new_b, note]]}).execute()
         _SH_STATE["active"] = False
         logger.info("%s cleared (row %s)", _SYNC_HOLD_TAG, row_i)
         _append_runlog_sync_hold(sheets, spreadsheet_id, "INFO",
