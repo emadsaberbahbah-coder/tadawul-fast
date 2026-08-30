@@ -1835,7 +1835,37 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.50.0"
+SCRIPT_VERSION = "6.51.0"
+# -----------------------------------------------------------------------------
+# v6.51.0 (2026-08-30) - STATUS TRUTH: THE COHORT VERDICT REACHES THE CELL AND
+#                        THE FEED (audit F-05/E-03, P0-3 first half, AT-07)
+# -----------------------------------------------------------------------------
+# EVIDENCE (runs 33255802873 and 33293471258, both re-verified on the live
+# _Status exports): Global_Markets Status cell = SUCCESS and the TFB Decision
+# Feed flipped "EXECUTABLE ... GM:OK" while the SAME row's stamp message said
+# data=PARTIAL guard=rb:415/6609 (then rb:348). The v6.45.0 R4 arithmetic was
+# already honest - it computed data_status correctly on every run - but the
+# verdict lived only inside the message string: _status_stamp_row chose the
+# Status cell from the leg status alone, and _uv_page_state fed OK to the
+# EXECUTABLE composite from the leg status alone. Truth existed; nothing
+# consumed it.
+# CHANGE (all behind TFB_SYNC_STATUS_TRUTH, DEFAULT OFF = v6.50.0 identical):
+#   (1) _status_data_verdict(): the R4 arithmetic factored into ONE helper so
+#       the stamp message, the C cell and the feed token can never disagree.
+#   (2) Status cell: SUCCESS is demoted to PARTIAL when the cohort verdict is
+#       PARTIAL. PARTIAL_FRESH (already non-green) is left as the more
+#       specific label.
+#   (3) _uv_page_state: a success leg whose cohort verdict is PARTIAL feeds
+#       PARTIAL, not OK - _uv_compose then yields NOT_ACTIONABLE(partial:<pg>)
+#       with zero changes to the composite itself. STALE_COV keeps precedence
+#       as the more specific label.
+# ARMING NOTE, stated up front: with today's live rb divergence (GM 348+) the
+# armed feed will read NOT_ACTIONABLE(partial:GM) on most runs UNTIL the
+# w52/quarantine work closes the seam - that is the intended conservative
+# behaviour (AT-07: PARTIAL may never surface as EXECUTABLE), and the reason
+# the gate ships OFF: observe v6.50's counters first, arm this second.
+# Functions added: 2. Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.50.0 (2026-08-30) - w52_band: THE 52-WEEK INVARIANT ENTERS THE WRITE PATH
 # -----------------------------------------------------------------------------
@@ -5888,6 +5918,39 @@ _STATUS_SHEET_NAME = "_Status"
 _STATUS_STAMP_ENDPOINT = "backend:run_dashboard_sync"
 
 
+def _status_truth_enabled() -> bool:
+    """v6.51.0 gate: TFB_SYNC_STATUS_TRUTH=1 arms AT-07 semantics - the
+    Status cell and the Decision-Feed per-page token consume the cohort
+    verdict. DEFAULT OFF: unset/0 keeps v6.50.0 behaviour byte-identical."""
+    return (os.getenv("TFB_SYNC_STATUS_TRUTH") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
+                         meta: dict) -> str:
+    """v6.51.0: THE cohort verdict, factored verbatim from _status_stamp_row
+    (v6.45.0 R4) so the stamp message, the Status cell and the feed token can
+    never disagree again. COMPLETE only when the leg succeeded, nothing
+    failed, refresh coverage met the floor, and the readback matched or was
+    repaired back to the prewrite baseline. Any internal error -> PARTIAL
+    (never false-green)."""
+    try:
+        rbst = str((meta or {}).get("rb_status") or "").strip().upper()
+        rep_after = (meta or {}).get("repair_after")
+        pw_fl = int((meta or {}).get("pw_flagged") or 0)
+        out = "COMPLETE"
+        if str(status_lower or "") != "success" or int(failed or 0) > 0:
+            out = "PARTIAL"
+        if cov is not None and float(cov) < float(fresh_min):
+            out = "PARTIAL"
+        if rbst == "DIVERGENT" and not (
+                isinstance(rep_after, int) and 0 <= rep_after <= pw_fl):
+            out = "PARTIAL"
+        return out
+    except Exception:  # noqa: BLE001
+        return "PARTIAL"
+
+
 def _status_stamp_enabled() -> bool:
     """v6.39.0 W1A-4b: master gate. DEFAULT OFF — unset/0/false/off keeps
     v6.38.0 behaviour byte-identical (no read, no write, no API call)."""
@@ -5971,14 +6034,14 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     rbst = str(meta.get("rb_status") or "").strip().upper()
     rep_after = meta.get("repair_after")
     pw_fl = int(meta.get("pw_flagged") or 0)
-    data_status = "COMPLETE"
-    if status.lower() != "success" or failed > 0:
-        data_status = "PARTIAL"
-    if cov is not None and cov < fresh_min:
-        data_status = "PARTIAL"
-    if rbst == "DIVERGENT" and not (
-            isinstance(rep_after, int) and 0 <= rep_after <= pw_fl):
-        data_status = "PARTIAL"
+    # v6.51.0: single source of truth - the same arithmetic now also decides
+    # the Status cell (below, gated) and the per-page feed token (AT-07).
+    data_status = _status_data_verdict(status.lower(), failed, cov,
+                                       fresh_min, meta)
+    if (_status_truth_enabled() and data_status == "PARTIAL"
+            and status_cell == "SUCCESS"):
+        # v6.51.0 AT-07: SUCCESS may never sit over data=PARTIAL.
+        status_cell = "PARTIAL"
     msg = (f"{_STATUS_STAMP_TAG} leg={status} written={written} failed={failed}"
            + (f" requested={requested}" if requested else "")
            + (f" fresh={fresh}" if fresh is not None else "")
@@ -6621,6 +6684,14 @@ def _uv_page_state(res: Any) -> tuple:
             pass
         if cov is not None and cov < fmin:
             return "STALE_COV", cov
+        if _status_truth_enabled():
+            # v6.51.0 AT-07: a success leg whose cohort verdict is PARTIAL
+            # (failed rows, coverage floor, or unrepaired DIVERGENT readback)
+            # may not feed OK into the EXECUTABLE composite.
+            _failed = int(getattr(res, "rows_failed", 0) or 0)
+            if _status_data_verdict("success", _failed, cov, fmin,
+                                    meta) == "PARTIAL":
+                return "PARTIAL", cov
         return "OK", cov
     if status == "partial":
         return "PARTIAL", cov
