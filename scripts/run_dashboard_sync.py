@@ -1835,7 +1835,45 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.49.0"
+SCRIPT_VERSION = "6.50.0"
+# -----------------------------------------------------------------------------
+# v6.50.0 (2026-08-30) - w52_band: THE 52-WEEK INVARIANT ENTERS THE WRITE PATH
+# -----------------------------------------------------------------------------
+# EVIDENCE (2026-08-30 export, run 33293471258): 73 Global_Markets rows carry a
+# Current Price outside their OWN 52W band (TOD.MI 257.52 vs 45.18-56.70;
+# VUK.AX 0.1888 vs 51.78-97.14), plus 3 in Commodities_FX and 2 in
+# Mutual_Funds - while the same run's guard reported pw:2/6609. Both facts are
+# true because the write path never tested the 52W band:
+#   * _apply_ohlc_prewrite_guard runs on EVERY row of the FINAL matrix, but its
+#     P2 'price_band' test uses the DAY high/low aliases only.
+#   * _apply_price_sanity_screen (v6.36.0 PV-3) DOES test
+#     px outside [52wLo*0.99, 52wHi*1.01] - but it takes a `restored` set and
+#     returns immediately when empty, so it screens only PV-2 second-chance
+#     re-injections. Normally-arriving rows are never tested.
+# A cross-row index-shift hypothesis was RAISED AND REJECTED before this build:
+# a uniform +2 shift explains 49/299 sampled clean rows (chance level),
+# neighbour offsets are scattered (+1,-5,-1,+3,-2), and 26 of the 73 fit NO
+# neighbour band. The defect is therefore screened on the INVARIANT, not on a
+# hypothesised mechanism - which also covers those 26 unattributable rows.
+# CHANGE: a fourth offense class 'w52_band' joins the existing P1/P2/P3 chain
+# in _apply_ohlc_prewrite_guard, reusing the _PSAN_52WH/52WL aliases already
+# defined for PV-3 and the same _ohlc_prewrite_tol() widening. It is:
+#   (1) ADDITIVE to `flagged` and reported in the [OHLC-PREWRITE] line and the
+#       Details JSON, with its own counters (w52_band, w52_zero_band,
+#       w52_tol_excused, w52_absent) so an arming decision reads measurements,
+#       not guesses;
+#   (2) NOT in the default enforce set. _ohlc_prewrite_enforce_classes keeps
+#       returning {open, price_band, range} unless the operator names
+#       w52_band explicitly, so enforce-mode mutation is byte-identical to
+#       v6.49 until armed - observe first, arm on evidence (§ standing rule);
+#   (3) INDEPENDENT of the P1/P2 short-circuit: a row that already failed
+#       price_band is still tested against its 52W band, because the two bands
+#       answer different questions (session coherence vs annual coherence).
+# When armed via TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES, w52_band blanks the
+# 52W High/Low cells (never Symbol, never price, never Warnings) and appends
+# 'ohlc_incoherent_dropped:w52_band:prewrite' - the FW-2-consistent shape.
+# Functions added: 0. Functions removed: 0. Counters added: 4.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.49.0 (2026-08-29) - OWNER-SET LEASE: A FINISHING LEG CAN ONLY REMOVE
 #                        ITSELF (external audit F-03; AT-02 monotonicity)
@@ -4378,6 +4416,12 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
              #               Open ALSO violates — the short-circuit
              #               hid the open attribution (6 rows)
              "zero_band": 0, "tol_excused": 0, "open_masked": 0,
+             # v6.50.0: the 52-week invariant, measured on every row of the
+             # final matrix for the first time. w52_absent counts rows the
+             # page cannot test (no 52W columns) so coverage is never
+             # confused with cleanliness.
+             "w52_band": 0, "w52_zero_band": 0, "w52_tol_excused": 0,
+             "w52_absent": 0, "w52_examples": [],
              "examples": []}
     if not headers or not rows_matrix:
         return rows_matrix, stats
@@ -4387,6 +4431,9 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
     price_i = _guard_find_col(hdr, _GUARD_PRICE_ALIASES)
     hi_i = _guard_find_col(hdr, _GUARD_DAYHIGH_ALIASES)
     lo_i = _guard_find_col(hdr, _GUARD_DAYLOW_ALIASES)
+    # v6.50.0: 52-week band columns, reusing the PV-3 alias sets.
+    h52_i = _guard_find_col(hdr, _PSAN_52WH_ALIASES)
+    l52_i = _guard_find_col(hdr, _PSAN_52WL_ALIASES)
     if hi_i < 0 or lo_i < 0 or (open_i < 0 and price_i < 0):
         return rows_matrix, stats  # page has no testable OHLC contract
     warn_i = -1
@@ -4439,6 +4486,30 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
         if range_ok and op is not None and op > 0 and not (
                 lo * (1.0 - tol) <= op <= hi * (1.0 + tol)):
             offenses.append("open")
+        # v6.50.0 P4: the anchor must also sit inside its own 52-WEEK band.
+        # Deliberately NOT gated on range_ok - P1/P2 describe the session
+        # band, and a row with an incoherent session band can still have a
+        # perfectly testable annual band (and vice versa). Same tol widening
+        # as P2/P3 so the classes stay comparable.
+        if h52_i < 0 or l52_i < 0:
+            stats["w52_absent"] += 1
+        else:
+            _h52 = _ohlc_prewrite_num(row[h52_i]) if h52_i < n else None
+            _l52 = _ohlc_prewrite_num(row[l52_i]) if l52_i < n else None
+            if _h52 is not None and _l52 is not None:
+                if not (_h52 > 0 and _l52 > 0):
+                    stats["w52_zero_band"] += 1
+                elif cp is not None and cp > 0:
+                    _lb = _l52 * (1.0 - tol)
+                    _ub = _h52 * (1.0 + tol)
+                    if _h52 >= _l52 and not (_lb <= cp <= _ub):
+                        offenses.append("w52_band")
+                        if len(stats["w52_examples"]) < 12 and 0 <= sym_i < n:
+                            stats["w52_examples"].append(
+                                str(row[sym_i]).strip() + "(" + str(cp) + " vs "
+                                + str(_l52) + "-" + str(_h52) + ")")
+                    elif (_h52 >= _l52 and not (_l52 <= cp <= _h52)):
+                        stats["w52_tol_excused"] += 1
         # v6.42.0 (W1A-6d): P2 fired with a valid band and the Open is
         # ALSO outside the tol band — the P1/P2 short-circuit hides the
         # open attribution from the counters an arming decision reads.
@@ -4465,6 +4536,13 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
                     row[hi_i] = ""
                 if 0 <= lo_i < n:
                     row[lo_i] = ""
+            # v6.50.0: blank ONLY the 52W band cells - never Symbol, never
+            # price, never Warnings (FW-2 shape). Off unless armed.
+            if "w52_band" in _acted:
+                if 0 <= h52_i < n:
+                    row[h52_i] = ""
+                if 0 <= l52_i < n:
+                    row[l52_i] = ""
             if _acted and 0 <= warn_i < n:
                 tag = "ohlc_incoherent_dropped:" + "+".join(_acted) + ":prewrite"
                 prev = "" if _guard_is_blank(row[warn_i]) else str(row[warn_i]).strip()
@@ -5004,7 +5082,14 @@ def _append_runlog_ohlc_prewrite(
         msg = (
             f"{_OHLC_PREWRITE_TAG} {page} | checked={checked} "
             f"flagged={flagged} (open={n_open} price_band={n_band} "
-            f"range={n_range}) | blank(o/h/l)="
+            f"range={n_range} w52_band={int(stats.get('w52_band') or 0)}) "
+            f"| w52(zero/tol/absent)="
+            f"{int(stats.get('w52_zero_band') or 0)}/"
+            f"{int(stats.get('w52_tol_excused') or 0)}/"
+            f"{int(stats.get('w52_absent') or 0)}"
+            + (f" | w52ex: {', '.join(stats.get('w52_examples') or [])}"
+               if stats.get('w52_examples') else "")
+            + f" | blank(o/h/l)="
             f"{int(stats.get('blank_open') or 0)}/"
             f"{int(stats.get('blank_hi') or 0)}/"
             f"{int(stats.get('blank_lo') or 0)}"
@@ -5606,11 +5691,15 @@ def _ohlc_prewrite_enforce_classes() -> frozenset:
     {open, price_band, range}; empty/invalid input fails SAFE to default.
     Observe-mode counters and log lines are unaffected in every setting."""
     default = frozenset({"open", "price_band", "range"})
+    # v6.50.0: w52_band is SELECTABLE but NOT default - an unset/blank env
+    # keeps v6.49 enforce semantics byte-identical. Observe first, arm on
+    # measured evidence.
+    allowed = frozenset({"open", "price_band", "range", "w52_band"})
     raw = (os.getenv("TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES") or "").strip()
     if not raw:
         return default
     out = {t.strip().lower() for t in raw.split(",") if t.strip()}
-    out &= default
+    out &= allowed
     return frozenset(out) if out else default
 
 
