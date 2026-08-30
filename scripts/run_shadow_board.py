@@ -99,7 +99,26 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # of default-OFF guards is that they stay off). =0 restores v1.1.3 exactly.
 # Zero functions removed. Two helpers added.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
+# -----------------------------------------------------------------------------
+# v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
+# -----------------------------------------------------------------------------
+# EVIDENCE (2026-08-30 weekly brief): 1015.KL carried Edge Verdict=TRADE with
+# RT 0.55% / net edge 8.23% while its own row said BROKER_UNTRADABLE and
+# Gen2 Eligible=NO - the F-06 class on the Gen-2 surface. run_weekly_brief
+# v1.0.3 now terminalizes at render; this closes it AT SOURCE so no consumer
+# of Shadow_Board rows can ever see edge economics on a hard-blocked name:
+#   * When compliance says not eligible, the verdict is
+#     "BLOCKED - <status>" and rt/net-edge/hurdle are never computed
+#     (cells empty). Debt/MCap stays - it IS the block evidence.
+#   * Eligible names: byte-identical to v1.2.0 (TRADE / EDGE_BELOW_COST /
+#     NO_COST_MODEL / NO_ROI unchanged).
+#   * FLOOR_LOCKED counter semantics unchanged; the blocked counter and
+#     the "FLIP" diffing keep working (a name flipping TRADE->BLOCKED is a
+#     legitimate, visible flip).
+# KILL SWITCH: TFB_SB_COST_LEGACY=1 restores v1.2.0 exactly.
+# Functions added: 1 (_sb_cost_legacy). Removed: 0.
+# -----------------------------------------------------------------------------
 TAB_OUT = "Shadow_Board"
 
 # v1.2.0 - regime history
@@ -319,6 +338,13 @@ def _fnd_valid(rec: Dict[str, Any]) -> bool:
                 or rec.get("sector"))
 
 
+def _sb_cost_legacy() -> bool:
+    """v1.3.0 kill switch: TFB_SB_COST_LEGACY=1 -> v1.2.0 behaviour
+    (cost model computed for blocked names)."""
+    return str(os.getenv("TFB_SB_COST_LEGACY") or "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
 def evaluate_board(cands: List[Dict[str, Any]],
                    auth_index: Dict[str, Dict[str, Any]],
                    monitor: Dict[str, str],
@@ -339,17 +365,22 @@ def evaluate_board(cands: List[Dict[str, Any]],
                     "interest_debt": fnd.get("interest_debt")}
         v = cg.evaluate(c["symbol"], gate_row, auth_index,
                         monitor=monitor, equity_sar=equity)
-        ticket = c.get("market_value_sar") or (ob._venue_floor(c["symbol"]) or 10000.0)
-        rt = ob.rt_cost_pct(c["symbol"], ticket)
-        p = {"High": 0.65, "Medium": 0.55, "Low": 0.45}.get(
-            c.get("confidence_band") or "", 0.50)
         roi = c.get("roi_pct")
-        ne = hurdle = None
-        verdict = "NO_COST_MODEL" if rt is None else "NO_ROI"
-        if rt is not None and roi is not None:
-            hurdle = max(3.0 * rt, 1.5)
-            ne = p * roi - rt
-            verdict = "TRADE" if ne >= hurdle else "EDGE_BELOW_COST"
+        rt = ne = hurdle = None
+        if v.invest_eligible or _sb_cost_legacy():
+            ticket = c.get("market_value_sar") or (
+                ob._venue_floor(c["symbol"]) or 10000.0)
+            rt = ob.rt_cost_pct(c["symbol"], ticket)
+            p = {"High": 0.65, "Medium": 0.55, "Low": 0.45}.get(
+                c.get("confidence_band") or "", 0.50)
+            verdict = "NO_COST_MODEL" if rt is None else "NO_ROI"
+            if rt is not None and roi is not None:
+                hurdle = max(3.0 * rt, 1.5)
+                ne = p * roi - rt
+                verdict = "TRADE" if ne >= hurdle else "EDGE_BELOW_COST"
+        else:
+            # v1.3.0: hard block terminates BEFORE the cost model exists.
+            verdict = "BLOCKED — " + str(v.shariah_status or "INELIGIBLE")
         gen2 = bool(v.invest_eligible and verdict == "TRADE")
         if v.invest_eligible:
             eligible += 1
