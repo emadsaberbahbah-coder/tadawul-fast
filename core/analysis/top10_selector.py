@@ -655,7 +655,28 @@ logger.addHandler(logging.NullHandler())
 # (cash_left consumed before stability was known) — releasing that
 # reservation is the cohort/capital wave, not this redaction fix.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.29.0"
+# =============================================================================
+# v4.30.0 (2026-08-30) - [BC-5] SHADOW HARD BLOCKS JOIN THE EXCLUSION PREDICATE
+# =============================================================================
+# EVIDENCE: external audit F-06 (2026-08-29) + live boards 08-29/08-30 -
+#   1015.KL rode GRACE while Shadow_Board said BROKER_UNTRADABLE, and 5110.SR
+#   ranked QUALIFIED while it said MODEL_SCREEN_FAIL. Both rows ALREADY carry
+#   shadow_invest_eligible=False, stamped by _apply_shadow_compliance onto the
+#   very dicts this selector ranks - but _t10_row_hard_excluded (the single
+#   predicate behind BC-2 grace policing and BC-3 admission vetoes) read only
+#   final_action / investability_status, so the machinery built to stop hard-
+#   blocked names was blind to the one class the audit names P0-4/AT-09.
+# FIX: the predicate also returns True when row["shadow_invest_eligible"] is
+#   the literal boolean False (the only writer sets bool(...); missing / None /
+#   strings stay fail-safe NOT-excluded, exactly the v4.26.0 doctrine). The
+#   widen flows through BOTH consumers: BC-3 admission (unconditional) blocks
+#   seating immediately; BC-2 grace exits incumbents once its gate is armed.
+# KILL SWITCH: TFB_T10_SHADOW_HARD_LEGACY=1 => predicate byte-identical to
+#   v4.29.0. Zero functions removed; one added (_t10_shadow_hard_legacy_enabled).
+# ACCEPTANCE FIXTURES: 1015.KL and 5110.SR shapes must exclude regardless of
+#   score, feed or cash - never grace-held, never QUALIFIED.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.30.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1270,12 +1291,22 @@ _T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
 _T10_HARD_INVESTABILITY = frozenset({"BLOCKED"})
 
 
+def _t10_shadow_hard_legacy_enabled() -> bool:
+    """v4.30.0 [BC-5] kill switch: TFB_T10_SHADOW_HARD_LEGACY=1 restores the
+    v4.29.0 predicate byte-identically (shadow fields ignored)."""
+    return str(os.getenv("TFB_T10_SHADOW_HARD_LEGACY") or "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
 def _t10_row_hard_excluded(row: Any) -> bool:
     """v4.26.0 [BC-2]: True when the candidate row carries a hard safety
     verdict — final_action in {DO_NOT_INVEST, BLOCKED} or
     investability_status = BLOCKED — read tolerantly across canonical
     and display keys. Missing/unreadable fields -> False (fail-safe:
-    the row is treated exactly as v4.25.0 treated it)."""
+    the row is treated exactly as v4.25.0 treated it).
+    v4.30.0 [BC-5]: ALSO True when shadow_invest_eligible is the literal
+    boolean False (BROKER_UNTRADABLE / MODEL_SCREEN_FAIL class), unless
+    TFB_T10_SHADOW_HARD_LEGACY=1."""
     if not isinstance(row, dict):
         return False
     try:
@@ -1292,6 +1323,12 @@ def _t10_row_hard_excluded(row: Any) -> bool:
             or ""
         ).strip().upper()
         if inv in _T10_HARD_INVESTABILITY:
+            return True
+        # v4.30.0 [BC-5]: the shadow board's verdict lives on this same row
+        # (stamped by _apply_shadow_compliance). Strictly `is False` - the
+        # writer emits bool(); anything else keeps the fail-safe default.
+        if (not _t10_shadow_hard_legacy_enabled()
+                and row.get("shadow_invest_eligible") is False):
             return True
     except Exception:
         return False
