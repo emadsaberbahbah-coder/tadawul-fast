@@ -47,7 +47,33 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # from risk_limits v1.0.0 (via shadow_board v1.1.3's build_risk_block) now
 # appears in both the text and HTML memo, so a structural concentration is
 # read on Sunday morning rather than discovered after capital moves.
-SCRIPT_VERSION = "1.0.2"
+# -----------------------------------------------------------------------------
+# v1.0.3 (2026-08-30) - HARD-GATE TERMINAL AT THE RENDER SEAM (audit D-1/D-2)
+# -----------------------------------------------------------------------------
+# EVIDENCE (2026-08-30 12:54 live brief): 1015.KL rendered Edge Verdict=TRADE
+# with a full cost model (RT 0.55%, net edge 8.23%) while its own row said
+# Gen2 Eligible=NO / BROKER_UNTRADABLE and the header counted it blocked -
+# the F-06 defect class reproduced on the Gen-2 surface: hard blocks arriving
+# AFTER scoring instead of terminating it. The verdict is computed upstream in
+# shadow_board; this brief owns the last seam both text and HTML flow through
+# (key_cols), so v1.0.3 terminalizes there:
+#   (1) _hard_gate_rows(): any row whose Gen2 Eligible cell is not YES gets
+#       Edge Verdict overwritten to "BLOCKED - <status>" and its edge economics
+#       (ROI %, RT Cost %, Net Edge %) suppressed to em-dash. Debt/MCap stays -
+#       it IS the block evidence (5110.SR 323.6%). Pure + fail-open: any parse
+#       problem returns the row untouched. Upstream shadow_board fix (compute
+#       no cost model for blocked names at all) is registered separately.
+#   (2) Column label "Shariah Status" renders as "Status": the screening
+#       policy was retired 2026-08-13 and the field factually carries
+#       tradability/model codes (BROKER_UNTRADABLE, MODEL_SCREEN_*) - a
+#       compliance-labeled column holding non-compliance codes is D-2.
+#       Authority plumbing untouched this pass (removal rides the
+#       shadow_board revision).
+# SELFTEST extended with the 1015.KL-shape fixture: blocked row must render
+# BLOCKED, never TRADE, with economics suppressed; eligible rows byte-same.
+# Functions added: 1 (_hard_gate_rows). Removed: 0.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.0.3"
 TAB_STATE = "_Brief_State"
 
 
@@ -110,6 +136,28 @@ def save_state(sh, state: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # memo rendering (pure)                                                        #
 # --------------------------------------------------------------------------- #
+def _hard_gate_rows(rows: List[List[Any]]) -> List[List[Any]]:
+    """v1.0.3: terminalize hard blocks at the render seam. A row whose
+    Gen2 Eligible cell (index 16) is not YES gets Edge Verdict (14)
+    overwritten to 'BLOCKED - <status(6)>' and ROI/RT/Net Edge (4/11/12)
+    suppressed. Pure (copies), FAIL-OPEN (any error -> row untouched)."""
+    out: List[List[Any]] = []
+    for r in rows or []:
+        try:
+            if (isinstance(r, list) and len(r) >= 17
+                    and str(r[16] or "").strip().upper() != "YES"):
+                c = list(r)
+                status = str(c[6] or "").strip() or "INELIGIBLE"
+                c[14] = "BLOCKED — " + status
+                c[4] = c[11] = c[12] = "—"
+                out.append(c)
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        out.append(r)
+    return out
+
+
 def _verdict_headline(scan: Dict[str, Any]) -> Tuple[str, str]:
     if scan["verdict"] == "NO_ACTION":
         return ("لا فعل هذا الأسبوع — الإبقاء على كل المراكز هو التوصية",
@@ -126,11 +174,14 @@ def _verdict_headline(scan: Dict[str, Any]) -> Tuple[str, str]:
 def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
                 diff, equity, risk=None) -> Tuple[str, str, str]:
     """-> (subject, text, html)."""
+    rows = _hard_gate_rows(rows)  # v1.0.3: blocks terminate before display
     ar, en = _verdict_headline(scan)
     subject = (f"TFB Weekly Decision Brief — {_now_riyadh()[:10]} — "
                f"{scan['verdict']} — SHADOW MODE")
     key_cols = [0, 3, 4, 5, 6, 11, 12, 14, 15, 16]
     key_hdr = [sb.OUT_HEADER[i] for i in key_cols]
+    # v1.0.3 D-2: retired-policy label; the field carries tradability codes.
+    key_hdr = ["Status" if h == "Shariah Status" else h for h in key_hdr]
 
     L: List[str] = []
     L.append("TFB GEN-2 WEEKLY DECISION BRIEF (SHADOW MODE)")
@@ -385,6 +436,27 @@ def _selftest() -> int:
     checks.append(("html escapes + contains board table",
                    "&lt;" not in h2.split("<table")[0]
                    and "MODEL_SCREEN_PASS_NOT_FATWA" in h2))
+    # v1.0.3: the 1015.KL-shape fixture - blocked must terminalize.
+    r3 = ["1015.KL", "AMMB", "", "Financial Services", 13.5, "High",
+          "BROKER_UNTRADABLE", "SHADOW", "BROKER_UNTRADABLE", "KLSE", "NO",
+          0.55, 8.23, 1.2, "TRADE", 109.2, "NO"]
+    _, t3, h3 = render_memo(rows + [r3],
+                            {"compliance_eligible": 2,
+                             "blocked": {"BROKER_UNTRADABLE": 1}},
+                            scan_na, regime, {"rows": 0, "as_of": None},
+                            2, 3, d0, 130000)
+    line1015 = next(l for l in t3.splitlines() if l.startswith("1015.KL"))
+    checks.append(("blocked row terminalized: BLOCKED verdict, no TRADE",
+                   "BLOCKED — BROKER_UNTRADABLE" in line1015
+                   and "TRADE" not in line1015.replace("BROKER_UNTRADABLE", "")))
+    checks.append(("blocked row economics suppressed, Debt/MCap kept",
+                   line1015.count("—") >= 3 and "109.2" in line1015))
+    checks.append(("eligible rows untouched by the gate",
+                   any(l.startswith("7010.SR") and "TRADE" in l
+                       for l in t3.splitlines())))
+    checks.append(("retired label renders as Status (text+html)",
+                   "Shariah Status" not in t3 and "Shariah Status" not in h3
+                   and "Status" in t3 and "BLOCKED — BROKER_UNTRADABLE" in h3))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)
