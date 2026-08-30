@@ -1835,7 +1835,31 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.51.0"
+SCRIPT_VERSION = "6.52.0"
+# -----------------------------------------------------------------------------
+# v6.52.0 (2026-08-30) - RB ATTRIBUTION: NAME THE ROWS, NOT JUST THE COUNT
+# -----------------------------------------------------------------------------
+# CONTEXT: four runs of paired counters (foreign_open_fill vs rb-open:
+# 436/431, 281/413, 376/358, 93/346) prove the lake fill is a real but NOT
+# dominant channel of the write-seam divergence - the correlation collapsed
+# on 08-30. Closing the seam needs to know WHICH symbols diverge, per run,
+# so the lake / GAS / assembly-point decomposition becomes measurable
+# instead of argued. The planned lake QUARANTINE is deliberately NOT in this
+# version: _ohlc_lake_probe is read-only telemetry and the actual fill
+# writer has not been located at source - quarantining a mechanism before
+# finding its writer is the exact guess-class this week banned; the item
+# stays registered pending that trace.
+# CHANGE (pure telemetry, zero cell writes, no gate needed):
+#   (1) _ohlc_readback_verify captures the SYMBOL SET where the sheet's Open
+#       differs from the matrix Open this leg just wrote (direct matrix-vs-
+#       sheet diff on the written column; cap 60). Delta gains
+#       open_diff_syms / open_diff_n.
+#   (2) The readback console/warning line gains " | attr: SYM1, SYM2, ..."
+#       so every run names its offenders - directly comparable with the same
+#       run's [OHLC-LAKE] examples to measure overlap off-log.
+# This version also CARRIES v6.51.0 (status truth) below, still gated OFF.
+# Functions added: 0. Removed: 0. Delta keys added: 2.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.51.0 (2026-08-30) - STATUS TRUTH: THE COHORT VERDICT REACHES THE CELL AND
 #                        THE FEED (audit F-05/E-03, P0-3 first half, AT-07)
@@ -5228,6 +5252,32 @@ def _ohlc_readback_verify(
             return {"error": "read_failed"}
         if not grid:
             return {"error": "empty_readback"}
+        # v6.52.0: per-symbol Open attribution - direct matrix-vs-sheet diff
+        # on the column this leg just wrote. Read-only; capped 60; fail-open.
+        _ods = []
+        try:
+            _si = _guard_find_col(headers, _GUARD_SYMBOL_ALIASES)
+            _oi = _guard_find_col(headers, _GUARD_OPEN_ALIASES)
+            if _si >= 0 and _oi >= 0:
+                _sheet_open = {}
+                for _gr in grid:
+                    if (isinstance(_gr, list) and _si < len(_gr)
+                            and not _guard_is_blank(_gr[_si])):
+                        _sheet_open[str(_gr[_si]).strip().upper()] = (
+                            str(_gr[_oi]).strip() if _oi < len(_gr) else "")
+                for _mr in (rows_matrix or []):
+                    if (not isinstance(_mr, list) or _si >= len(_mr)
+                            or _guard_is_blank(_mr[_si])):
+                        continue
+                    _t = str(_mr[_si]).strip().upper()
+                    _mo = str(_mr[_oi]).strip() if _oi < len(_mr) else ""
+                    _so = _sheet_open.get(_t)
+                    if _so is not None and _so != _mo:
+                        _ods.append(_t)
+                        if len(_ods) >= 60:
+                            break
+        except Exception:
+            _ods = []
         live_hdr = [str(c or "").strip() for c in (grid[0] or [])]
         live_rows = [list(r) for r in grid[1:] if any(
             str(c or "").strip() for c in r)]
@@ -5249,6 +5299,8 @@ def _ohlc_readback_verify(
             "prewrite_flagged": int(pw.get("flagged") or 0),
             "readback_checked": int(rb.get("checked") or 0),
             "readback_flagged": int(rb.get("flagged") or 0),
+            "open_diff_n": len(_ods),           # v6.52.0
+            "open_diff_syms": list(_ods),        # v6.52.0
             "delta_flagged": int(rb.get("flagged") or 0)
             - int(pw.get("flagged") or 0),
             "delta_checked": int(rb.get("checked") or 0)
@@ -10083,6 +10135,11 @@ async def _run_one_task(
                                 f"rows_delta={_rb['delta_checked']:+d}")
                             _lvl, _st = _ohlc_readback_status(_rb)
                             _rl += f" status={_st}"
+                            # v6.52.0: name the offenders on the same line.
+                            _oda = list(_rb.get("open_diff_syms") or [])
+                            if _oda:
+                                _rl += (f" | attr({len(_oda)}): "
+                                        + ", ".join(_oda[:60]))
                             if _lvl == "WARNING":
                                 res.warnings.append(_rl)
                                 logger.warning(_rl)
