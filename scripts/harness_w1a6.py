@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.1.0  (2026-08-18)
+W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.2.0  (2026-08-18)
 ================================================================================
 v2.0.0 (external W1A-6 Deployment Audit adjudicated):
   F-07 enforce-mode mutation contract (deterministic synthetic fixtures);
@@ -641,9 +641,26 @@ res_gm._stamp_meta = {"requested": 6626, "pre_persist_rows": 6626,
 rec, sw = rec_writer(grid=UVGRID)
 M._write_upstream_verdict(sw, "SID", [res_gm])
 ups = [kw for k, kw in rec.calls if k == "update"]
+# v2.2.0 (sync v6.53.0): the writer now upserts a THIRD bounded key,
+# "TFB Grid Capacity", through the same L:M closure - still ZERO appends.
+_cap_on = getattr(M, "_capacity_status_enabled", lambda: False)()
+_exp_updates = 3 if _cap_on else 2
 check("S12.11 writer: bounded L{r}:M{r} updates ONLY, ZERO appends",
-      len(ups) == 2 and not [1 for k, _ in rec.calls if k == "append"],
-      f"updates={len(ups)}")
+      len(ups) == _exp_updates
+      and not [1 for k, _ in rec.calls if k == "append"]
+      and all(str(u["range"]).startswith("'_Status'!L")
+              and ":M" in str(u["range"]) for u in ups),
+      f"updates={len(ups)} (expected {_exp_updates})")
+check("S12.11b capacity key: third bounded L6:M6 RAW update, UNKNOWN when "
+      "metadata is unreadable, never an append",
+      (not _cap_on) or (
+          ups[2]["range"] == "'_Status'!L6:M6"
+          and ups[2]["valueInputOption"] == "RAW"
+          and ups[2]["body"]["values"][0][0] == "TFB Grid Capacity"
+          and str(ups[2]["body"]["values"][0][1]).startswith(
+              ("UNKNOWN | allocated=n/a", "OK | allocated=",
+               "NEAR-LIMIT | allocated=", "AT-LIMIT | allocated="))),
+      (ups[2]["range"] if len(ups) > 2 else "no third update"))
 check("S12.12 new page key took first blank slot L4:M4, RAW",
       ups[0]["range"] == "'_Status'!L4:M4"
       and ups[0]["valueInputOption"] == "RAW", ups[0]["range"])
@@ -694,7 +711,7 @@ env(TFB_SYNC_UPSTREAM_VERDICT="0")
 print()
 print("=" * 78)
 npass = sum(1 for _, ok, _ in RESULTS if ok)
-print(f"HARNESS v2.1.0 RESULT: {npass}/{len(RESULTS)} PASS"
+print(f"HARNESS v2.2.0 RESULT: {npass}/{len(RESULTS)} PASS"
       + (f"  ({len(SKIPPED)} suite(s) skipped)" if SKIPPED else ""))
 for n, ok, d in RESULTS:
     if not ok:
