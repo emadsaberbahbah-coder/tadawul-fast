@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI — every production-critical file, every push
 # ============================================================================
+# VERSION 1.0.5 (2026-08-31) — THE ORPHANED-PATH CLASS CLOSED FOR GOOD
+#
+# v1.0.5:
+# - FIX: the pull_request trigger no longer carries a paths filter. Root cause
+#   re-observed on PR #322/#324/#325 (docs/evidence/*.json): a path outside the
+#   list cannot generate the REQUIRED '📋 CI verdict' status, so the ruleset
+#   waits forever. v1.0.2 patched one instance (integrations/**); this closes
+#   the class. push: keeps its filter; workflow_dispatch unchanged; every job,
+#   step and pin below is byte-identical to v1.0.4.
+#
 # VERSION 1.0.4 (2026-08-23) — FIX v1.0.3'S OWN DEFECT + LANDING-ORDER PROOFING
 #
 # v1.0.4:
@@ -122,16 +132,13 @@ on:
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/**'
+  # v1.0.5 (2026-08-31): pull_request is UNFILTERED on purpose. The required
+  # '📋 CI verdict' status can only exist when this workflow runs; a paths
+  # filter here made every PR outside the list (docs/evidence JSON, PR #322/
+  # #324/#325 today; integrations/** on PR #248 before v1.0.2) permanently
+  # "Expected — waiting" and unmergeable. push: stays filtered so the expensive
+  # jobs still skip unrelated pushes. A docs-only PR now costs one clean run.
   pull_request:
-    paths:
-      - 'main.py'
-      - 'core/**'
-      - 'routes/**'
-      - 'scripts/**'
-      - 'integrations/**'
-      - 'tests/**'
-      - 'requirements*.txt'
-      - '.github/workflows/**'
   workflow_dispatch:
 
 # Own group, deliberately NOT shared with the sync workflow's workbook lease.
