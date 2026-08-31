@@ -1061,7 +1061,35 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.16.0"
+OPPORTUNITY_BUILDER_VERSION = "1.17.0"
+# -----------------------------------------------------------------------------
+# v1.17.0 (2026-08-31, 10-day program Day 2) - TWO SEAMS THE 08-31 BOARD DIED ON
+# -----------------------------------------------------------------------------
+# EVIDENCE (Top_10 tab 08:47:17 + page census): Scanned 9,786, Passed 0. Of the
+# 16 names that clear BUY/INVESTABLE/DQ>=80/Rel>=70, ELEVEN sit in the 30-35%
+# band because the engine soft-caps genuine analyst targets to the phase-II
+# ceiling (151 GM rows tagged provider_target_12m_capped_to_phase_ii_ceiling)
+# and the armed B4c cap-band gate then excludes the wall as a minted
+# fingerprint - NOS.LS blocked at exactly x1.3500 on a provider_target row.
+# B4c's own WHY block states the cost: pre-provenance, a real 35% and a
+# manufactured 35% were indistinguishable. Engine v5.134.0 (Fix AI) now
+# publishes the RAW analyst target into the Target Price column, which gives
+# the value-level provenance B4c was waiting for:
+#   (1) CAP-BAND RAW-TARGET EXEMPTION: a candidate whose engine ratio sits in
+#       the band BUT whose RAW target/price ratio is strictly ABOVE it
+#       (> hi + 0.01) is a genuine target the engine compressed, not a
+#       price x 1.35 mint (a mint lands IN the band on both readings). Such a
+#       row passes the gate with "(raw xR)" shown; a row with no raw target,
+#       or a raw ratio inside/below the band, is treated exactly as v1.16.0.
+#       Kill-switch TFB_T10_CAP_BAND_RAW_EXEMPT (default ON; 0 = v1.16.0).
+#   (2) _to_float ACCEPTS THE SHEET'S DISPLAY GLYPHS: 255/255 ML and 38% of GM
+#       cells arrive as "(up-arrow) 31.90%" / "(down-arrow) -3.82%"; the old
+#       parser returned None, so the Forecast gate read "Unknown passes" on
+#       those rows and the reliability/DQ floors could not see them. The
+#       glyphs are stripped before the numeric regex; every value that parsed
+#       before parses identically (pure widening, no unit conversion here).
+# Functions added: 1 (_env_cap_band_raw_exempt). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.16.0 (2026-08-28) - CONSTRAINTS PACK, ALL THREE ENV-GATED / DEFAULT-OFF
 # -----------------------------------------------------------------------------
@@ -1638,19 +1666,41 @@ def _env_cap_band():
     return _DEFAULT_CAP_BAND
 
 
+def _env_cap_band_raw_exempt():
+    """v1.17.0: value-level provenance exemption for the cap-band gate.
+    Default ON; TFB_T10_CAP_BAND_RAW_EXEMPT=0/false/off/no restores the
+    v1.16.0 assessment byte-identically."""
+    return str(_env_str("TFB_T10_CAP_BAND_RAW_EXEMPT", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
 def _cap_band_assessment(cand):
     """v1.12.0 [B4c]: (ok, current_text) for the Forecast Cap Band gate.
     ok=True when the implied 12M ratio sits OUTSIDE the manufactured band;
-    blank/unparseable forecasts PASS (the Forecast gate owns those)."""
+    blank/unparseable forecasts PASS (the Forecast gate owns those).
+    v1.17.0: a RAW analyst target/price ratio strictly ABOVE the band proves
+    the in-band engine ratio is a soft-capped genuine target, not a mint."""
     try:
         pct = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
     except Exception:
         pct = None
     if pct is None:
-        return True, "—"
+        return True, "\u2014"
     ratio = round(1.0 + (pct / 100.0), 4)
     lo, hi = _env_cap_band()
-    return (not (lo <= ratio <= hi)), ("\u00d7%.4f" % ratio)
+    if not (lo <= ratio <= hi):
+        return True, ("\u00d7%.4f" % ratio)
+    if _env_cap_band_raw_exempt():
+        try:
+            tp = _to_float(cand.get("target_price"))
+            px = _to_float(cand.get("price"))
+            if tp is not None and px is not None and tp > 0 and px > 0:
+                raw_ratio = round(tp / px, 4)
+                if raw_ratio > hi + 0.01:
+                    return True, ("\u00d7%.4f (raw \u00d7%.4f)" % (ratio, raw_ratio))
+        except Exception:
+            pass
+    return False, ("\u00d7%.4f" % ratio)
 
 
 def _env_forecast_gate():
@@ -2165,6 +2215,10 @@ def _to_float(v):
     if s.lower() in _MISSING_TOKENS:
         return None
     s = s.replace(",", "").replace("%", "").replace("SAR", "").strip()
+    # v1.17.0: the sheet renders ROI/change cells with direction glyphs
+    # (U+25B2 / U+25BC) in front of the number; strip them before the numeric
+    # test. Nothing that parsed before parses differently.
+    s = s.replace("\u25b2", "").replace("\u25bc", "").strip()
     if not _NUM_RE.match(s):
         return None
     try:
