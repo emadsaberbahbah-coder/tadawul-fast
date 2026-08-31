@@ -134,7 +134,37 @@ from typing import Any, Dict, List, Optional, Tuple
 #   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
 #   the correct fail-closed answer.
 # =============================================================================
-__version__ = "2.0.0"
+__version__ = "2.1.0"
+# -----------------------------------------------------------------------------
+# v2.1.0 (2026-08-31, 10-day program Day 5) — THE DAILY STATE BRIEF
+# -----------------------------------------------------------------------------
+# WHY: v2.0.0's manifest gate is correct and strict (every page data=COMPLETE,
+# fresh, one run). With the write seam still open the sync stamps GM/MF/CFX
+# data=PARTIAL on most days, so re-enabling the workflow would have produced
+# a red run and a bare "manifest FAIL" notice every morning: truthful, but not
+# a brief, and the operator switched the digest off on 2026-08-26 for exactly
+# the opposite fault (picks after failed checks). This version makes the
+# digest useful on EVERY day while keeping v2.0.0's core promise: no action
+# language unless the surface is executable.
+# CHANGE (kill-switch DIGEST_STATE_BRIEF, default ON; =0 => v2.0.0 verbatim):
+#   (1) The sync's composite '_Status' key "TFB Decision Feed" (upstream
+#       verdict, status-truth) is consumed as the ACTIONABILITY AUTHORITY:
+#       NOT_ACTIONABLE(...) blocks picks even when the page manifest passes
+#       (AT-07: PARTIAL never surfaces as EXECUTABLE); an absent key falls
+#       back to the v2.0.0 manifest-only decision.
+#   (2) When not actionable, a STATE BRIEF is sent instead of the bare
+#       incident: feed state + reason, per-page manifest, "TFB Grid Capacity",
+#       "TFB Calibration", Top_10 last run + KPI strip (Scanned/Passed/
+#       Selected/Deployable/Unallocated) and alert TYPES with counts
+#       (rotation_proposal / capital_call / unfunded_candidates...). Research
+#       only: no picks, no symbols, no action verbs. Exit DIGEST_STATE_EXIT
+#       (default 0) — a truthful non-actionable state is not a job failure.
+#   (3) When actionable, the same state block is prepended to the v2.0.0
+#       pick email so the reader sees WHY it is actionable.
+# Functions added: 5 (_state_brief_enabled, _read_status_globals,
+# _decision_feed_state, _read_top10_summary, _compose_state_brief).
+# Removed: 0.
+# -----------------------------------------------------------------------------
 
 # v1.2.0 — PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): _load_page fetched each tab via a hardcoded
@@ -533,6 +563,130 @@ def _manifest_gate(read_range, sheet_id: str):
 
 
 _MANIFEST_NOTE = {"line": ""}
+
+
+# ---------------------------------------------------------------------------
+# v2.1.0 state brief
+# ---------------------------------------------------------------------------
+def _state_brief_enabled() -> bool:
+    """v2.1.0 kill-switch. Default ON; DIGEST_STATE_BRIEF=0/false/off/no
+    restores the v2.0.0 flow verbatim."""
+    return (os.getenv("DIGEST_STATE_BRIEF") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _read_status_globals(read_range, sheet_id: str) -> Dict[str, str]:
+    """v2.1.0: the '_Status' L:M global key-value block -> {key.casefold(): value}.
+    Fail-open: any problem -> {} (the caller then falls back to v2.0.0)."""
+    try:
+        rows = read_range(sheet_id, "'_Status'!L1:M60") or []
+    except Exception:  # noqa: BLE001
+        return {}
+    out: Dict[str, str] = {}
+    for row in rows:
+        if not row:
+            continue
+        k = str(row[0]).strip() if len(row) > 0 else ""
+        v = str(row[1]).strip() if len(row) > 1 else ""
+        if k:
+            out[k.casefold()] = v
+    return out
+
+
+def _decision_feed_state(globals_kv: Dict[str, str]) -> Tuple[str, str, str]:
+    """v2.1.0 PURE: (state, reason, raw) from the 'TFB Decision Feed' key.
+    state in EXECUTABLE / NOT_ACTIONABLE / UNKNOWN (key absent or unparseable)."""
+    raw = str((globals_kv or {}).get("tfb decision feed", "") or "").strip()
+    if not raw:
+        return "UNKNOWN", "no TFB Decision Feed key in _Status", ""
+    head = raw.split("|", 1)[0].strip()
+    if head.upper().startswith("EXECUTABLE"):
+        return "EXECUTABLE", "", raw
+    if head.upper().startswith("NOT_ACTIONABLE"):
+        m = re.search(r"NOT_ACTIONABLE\(([^)]*)\)", head, re.I)
+        return "NOT_ACTIONABLE", (m.group(1) if m else head), raw
+    return "UNKNOWN", f"unrecognised feed value: {head[:60]}", raw
+
+
+def _read_top10_summary(read_range, sheet_id: str) -> Dict[str, Any]:
+    """v2.1.0: last-run line, KPI strip and alert types from the Top_10 tab.
+    Layout-tolerant (finds rows by label); fail-open -> {}."""
+    out: Dict[str, Any] = {}
+    try:
+        rows = read_range(sheet_id, "'Top_10_Investments'!A1:L60") or []
+    except Exception:  # noqa: BLE001
+        return out
+    cells = [[str(c).strip() for c in (r or [])] for r in rows]
+    for i, r in enumerate(cells):
+        if not r:
+            continue
+        if r[0].startswith("Status:") and len(r) > 1 and not out.get("last_run"):
+            out["last_run"] = r[1][:160]
+        if "Deployable (SAR)" in r and i + 1 < len(cells):
+            hdr, val = r, cells[i + 1]
+            for h, v in zip(hdr, val):
+                if h:
+                    out.setdefault("kpis", {})[h] = v
+        if r[0].upper().startswith("ALERTS"):
+            kinds: List[str] = []
+            for rr in cells[i + 2:]:
+                if not rr or not rr[0]:
+                    break
+                kinds.append(rr[0] + (f"={rr[1]}" if len(rr) > 1 and rr[1] else ""))
+            out["alerts"] = kinds
+        if r[0].startswith(("⛔", "FEED")) or r[0].upper().startswith("FEED"):
+            out["banner"] = r[0][:140]
+    return out
+
+
+def _compose_state_brief(session: str, feed_state: str, feed_reason: str,
+                         m_ok: bool, m_summary: str, m_fails: List[str],
+                         globals_kv: Dict[str, str], top10: Dict[str, Any],
+                         ) -> Tuple[str, str, str]:
+    """v2.1.0 PURE: the research-only daily state brief (no picks, no symbols,
+    no action verbs). Used alone when not actionable; prepended otherwise."""
+    now = datetime.now(RIYADH_TZ).strftime("%Y-%m-%d %H:%M")
+    actionable = (feed_state == "EXECUTABLE" or feed_state == "UNKNOWN") and m_ok
+    if feed_state == "NOT_ACTIONABLE":
+        why = feed_reason or "feed"
+    elif not m_ok:
+        why = "manifest"
+    else:
+        why = feed_reason or "feed"
+    tag = "EXECUTABLE" if actionable else f"NOT ACTIONABLE ({why})"
+    subject = f"TFB Brief — {session} — {tag}"
+    cap = globals_kv.get("tfb grid capacity", "") or "(no TFB Grid Capacity key)"
+    cal = globals_kv.get("tfb calibration", "") or "(no TFB Calibration key)"
+    feed = globals_kv.get("tfb decision feed", "") or "(no TFB Decision Feed key)"
+    lines = [
+        f"TFB Decision Brief — {session}",
+        f"Generated {now} Riyadh.",
+        "",
+        f"DECISION SURFACE: {tag}",
+        f"  feed: {feed[:180]}",
+        f"  manifest: {'PASS' if m_ok else 'FAIL'} — {m_summary}",
+        *[f"    - {f}" for f in (m_fails or [])],
+        f"  capacity: {cap[:160]}",
+        f"  calibration: {cal[:160]}",
+        "",
+        "TOP-10 BOARD:",
+        f"  last run: {top10.get('last_run', '(tab unreadable)')}",
+    ]
+    if top10.get("banner"):
+        lines.append(f"  banner: {top10['banner']}")
+    k = top10.get("kpis") or {}
+    if k:
+        lines.append("  kpis: " + " | ".join(f"{h}={v}" for h, v in k.items()))
+    if top10.get("alerts"):
+        lines.append("  alerts: " + ", ".join(top10["alerts"][:8]))
+    lines += ["", ("Picks follow below." if actionable else
+                   "Research only: qualified names are on the Top_10 tab with "
+                   "their funding states; no action guidance is carried while "
+                   "the surface is not actionable."),
+              "", f"send_digest v{__version__} state brief."]
+    text = "\n".join(lines)
+    html = "<pre>" + text.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+    return subject, text, html
 
 
 def _compose_incident(session: str, fails: List[str], summary: str):
@@ -1001,15 +1155,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # v2.0.0: the manifest gate runs before any pick exists. FAIL ⇒ send a
     # research-only incident notice and exit red (DIGEST_FAIL_EXIT).
+    _state_block = ""
     if _manifest_required():
         m_ok, m_summary, m_fails = _manifest_gate(read_range, sheet_id)
-        if not m_ok:
+        if _state_brief_enabled():
+            # v2.1.0: the composite feed is the actionability authority.
+            g_kv = _read_status_globals(read_range, sheet_id)
+            f_state, f_reason, _ = _decision_feed_state(g_kv)
+            top10 = _read_top10_summary(read_range, sheet_id)
+            actionable = m_ok and f_state != "NOT_ACTIONABLE"
+            subj_s, text_s, html_s = _compose_state_brief(
+                session, f_state, f_reason, m_ok, m_summary, m_fails, g_kv, top10)
+            if not actionable:
+                _log("NOT ACTIONABLE: feed=%s reason=%s manifest=%s"
+                     % (f_state, f_reason or "-", "PASS" if m_ok else "FAIL"))
+                rc = _send_email(subj_s, text_s, html_s, args.dry_run)
+                if rc != 0:
+                    return rc
+                try:
+                    return int(_env("DIGEST_STATE_EXIT", "0") or "0")
+                except Exception:
+                    return 0
+            _state_block = text_s
+            _MANIFEST_NOTE["line"] = f"Manifest: PASS — {m_summary} | feed: {f_state}"
+            _log("ACTIONABLE: manifest PASS, feed=%s" % f_state)
+        elif not m_ok:
             _log("MANIFEST FAIL: " + "; ".join(m_fails)[:400])
             subj_i, text_i, html_i = _compose_incident(session, m_fails, m_summary)
             rc = _send_email(subj_i, text_i, html_i, args.dry_run)
             return rc if rc != 0 else _fail_exit()
-        _MANIFEST_NOTE["line"] = f"Manifest: PASS — {m_summary}"
-        _log("MANIFEST PASS: " + m_summary[:300])
+        else:
+            _MANIFEST_NOTE["line"] = f"Manifest: PASS — {m_summary}"
+            _log("MANIFEST PASS: " + m_summary[:300])
 
     candidate_pages = [
         p.strip() for p in _env("DIGEST_CANDIDATE_PAGES", "Market_Leaders").split(",") if p.strip()
@@ -1045,6 +1222,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     subject, text, html = _compose(session, best_buy, best_sell, swap)
+    if _state_block:  # v2.1.0: the reader sees WHY the surface is actionable
+        text = _state_block + "\n\n" + "=" * 60 + "\n\n" + text
+        html = ("<pre>" + _state_block.replace("&", "&amp;").replace("<", "&lt;")
+                + "</pre><hr/>" + html)
     return _send_email(subject, text, html, args.dry_run)
 
 
