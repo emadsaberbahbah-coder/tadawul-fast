@@ -1061,7 +1061,45 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.17.0"
+OPPORTUNITY_BUILDER_VERSION = "1.18.0"
+# -----------------------------------------------------------------------------
+# v1.18.0 (2026-08-31, 10-day program Day 3) - FUNDING-STATE LAYER: DISCOVERY IS
+#          INDEPENDENT OF CASH (operator principle ratified 2026-08-31)
+# -----------------------------------------------------------------------------
+# WHY: the board's job is to name the best opportunities in the universe
+# regardless of the wallet; funding is a SEPARATE layer. Until now the two
+# capital mechanisms (v1.0.9 unfunded_watch, v1.0.14 ticket floor) only HID a
+# qualified name ("Unfunded ...") - they never said how it could be taken.
+# CHANGE (additive; response contract preserved; kill-switch below):
+#   Every rank-ordered name that qualified but could not be funded gets ONE
+#   funding state, appended to its existing Funding near-miss reason text and
+#   counted in kpis/alerts:
+#     FUNDABLE_NOW          - already a sized ticket (unchanged path; the
+#                             Selected count is FUNDABLE_NOW only, as before).
+#     FUNDABLE_BY_ROTATION  - a held equity is worse by >= edge_pp of engine
+#                             12M forecast after round-trip cost: propose
+#                             TRIM/EXIT <holding> with the SAR proceeds and the
+#                             edge. Max ONE rotation proposal per run; sukuk
+#                             excluded (TFB_OPP_ROTATION_EXCLUDE, default
+#                             5023.SR). Holdings' forecasts are read from the
+#                             same scanned pool (exact symbol, then .US alias).
+#     CAPITAL_CALL          - deposit >= shortfall to take the ticket at the
+#                             venue floor / sized amount (top-N only in the
+#                             alert, TFB_OPP_CAPITAL_CALL_TOPN default 3).
+#   kpis: fundable_now, fundable_by_rotation, capital_call,
+#         capital_call_topn_sar. alerts: rotation_proposal, capital_call.
+#   NOT implementable from today's payload (holdings carry symbol/sector/
+#   market/value_sar only): "not within 3% of TP1" and "held >= 5 trading
+#   days" - both need tp1_sar/buy_date in the GAS holdings payload
+#   (16_Decision_Top10.gs); registered, applied when the payload carries them.
+#   A rotation proposal is a TICKET, never an order: written GO with a live
+#   quote still governs execution.
+# GATE: TFB_OPP_FUNDING_PLAN default ON; =0/false/off/no => v1.17.0
+#   byte-identical (no text, no kpis, no alerts). Knobs:
+#   TFB_OPP_ROTATION_EDGE_PP (8.0), TFB_OPP_ROTATION_COST_PCT (1.1),
+#   TFB_OPP_ROTATION_EXCLUDE ("5023.SR"), TFB_OPP_CAPITAL_CALL_TOPN (3).
+# Functions added: 9. Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.17.0 (2026-08-31, 10-day program Day 2) - TWO SEAMS THE 08-31 BOARD DIED ON
 # -----------------------------------------------------------------------------
@@ -3572,6 +3610,145 @@ def _size_one(cand, criteria, budget_base, remaining):
 
 
 _LAST_DEPLOYABLE_SPLIT = {"current": 0, "proforma": 0}
+# v1.18.0: symbol -> {"need_sar", "sized_sar", "remaining_sar"} recorded at the
+# funding-deferral sites of _select_and_size (reset per call).
+_LAST_FUNDING_NEEDS: dict = {}
+
+
+def _env_funding_plan():
+    """v1.18.0 kill-switch. Default ON; 0/false/off/no = v1.17.0 byte-identical."""
+    return str(_env_str("TFB_OPP_FUNDING_PLAN", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _env_rotation_edge_pp():
+    try:
+        v = float(_env_str("TFB_OPP_ROTATION_EDGE_PP", "8") or 8.0)
+        return v if v >= 0 else 8.0
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _env_rotation_cost_pct():
+    try:
+        v = float(_env_str("TFB_OPP_ROTATION_COST_PCT", "1.1") or 1.1)
+        return v if v >= 0 else 1.1
+    except (TypeError, ValueError):
+        return 1.1
+
+
+def _env_rotation_exclude():
+    raw = str(_env_str("TFB_OPP_ROTATION_EXCLUDE", "5023.SR") or "").upper()
+    return {t.strip() for t in raw.replace(";", ",").split(",") if t.strip()}
+
+
+def _env_capital_call_topn():
+    try:
+        v = int(float(_env_str("TFB_OPP_CAPITAL_CALL_TOPN", "3") or 3))
+        return v if v > 0 else 3
+    except (TypeError, ValueError):
+        return 3
+
+
+def _holding_roi_map(audit_rows, holdings):
+    """v1.18.0 PURE: held symbol -> engine 12M forecast (pct) read from the
+    scanned pool: exact symbol first, then the .US alias either way."""
+    pool = {}
+    for a in (audit_rows or []):
+        c = a.get("_cand") if isinstance(a, dict) else None
+        if not isinstance(c, dict):
+            continue
+        s = str(a.get("symbol") or "").strip().upper()
+        if s:
+            pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
+    out = {}
+    for h in (holdings or []):
+        s = str(h.get("symbol") or "").strip().upper()
+        if not s:
+            continue
+        for k in (s, s + ".US", s[:-3] if s.endswith(".US") else s):
+            if k in pool and pool[k] is not None:
+                out[s] = pool[k]
+                break
+    return out
+
+
+def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
+    """v1.18.0 PURE: the held equity with the LOWEST engine forecast that is
+    worse than the opportunity by >= edge_pp after round-trip cost; None when
+    nothing qualifies. Excluded symbols (sukuk) and holdings without a
+    forecast in the pool never rotate."""
+    if opp_roi_pct is None:
+        return None
+    best = None
+    for h in (holdings or []):
+        s = str(h.get("symbol") or "").strip().upper()
+        if not s or s in exclude or (h.get("value_sar") or 0) <= 0:
+            continue
+        r = hold_roi.get(s)
+        if r is None:
+            continue
+        edge = float(opp_roi_pct) - float(r) - float(cost_pct)
+        if edge < float(edge_pp):
+            continue
+        if best is None or r < best["roi_pct"]:
+            best = {"symbol": s, "value_sar": float(h.get("value_sar") or 0.0),
+                    "roi_pct": float(r), "edge_pp": round(edge, 1)}
+    return best
+
+
+def _funding_plans(ordered_needs, remaining, holdings, hold_roi, exclude,
+                   edge_pp, cost_pct):
+    """v1.18.0 PURE: sequential funding plans for rank-ordered unfunded names.
+    ordered_needs: [(symbol, need_sar, opp_roi_pct)]. Cash covers plans in rank
+    order; ONE rotation proposal per run; the rest are capital calls."""
+    plans, avail, rotation_used = [], max(0.0, float(remaining or 0.0)), False
+    for sym, need, opp_roi in ordered_needs:
+        need = float(need or 0.0)
+        if need <= 0:
+            continue
+        short = max(0.0, need - avail)
+        avail = max(0.0, avail - need)
+        plan = {"symbol": sym, "need_sar": round(need, 0),
+                "shortfall_sar": round(short, 0), "state": "FUNDABLE_NOW",
+                "rotation": None}
+        if short > 0:
+            rot = None
+            if not rotation_used:
+                rot = _rotation_pick(opp_roi, holdings, hold_roi, exclude,
+                                     edge_pp, cost_pct)
+            if rot is not None:
+                rotation_used = True
+                proceeds = min(rot["value_sar"], short)
+                rot = dict(rot, proceeds_sar=round(proceeds, 0),
+                           action=("EXIT" if proceeds >= rot["value_sar"] - 0.5
+                                   else "TRIM"))
+                plan["rotation"] = rot
+                plan["shortfall_sar"] = round(max(0.0, short - proceeds), 0)
+                plan["state"] = "FUNDABLE_BY_ROTATION"
+            else:
+                plan["state"] = "CAPITAL_CALL"
+        plans.append(plan)
+    return plans
+
+
+def _funding_plan_text(plan, remaining):
+    """v1.18.0 PURE: the clause appended to the Funding near-miss reason."""
+    st = plan.get("state")
+    if st == "FUNDABLE_BY_ROTATION":
+        r = plan["rotation"]
+        txt = (" | FUNDABLE_BY_ROTATION: " + r["action"].lower() + " " +
+               r["symbol"] + " " + _fmt_sar(r["proceeds_sar"]) +
+               " (engine 12M edge +" + _fmt_num(r["edge_pp"]) + "pp after cost)"
+               " \u2192 ticket " + _fmt_sar(plan["need_sar"]))
+        if (plan.get("shortfall_sar") or 0) > 0:
+            txt += "; residual CAPITAL_CALL " + _fmt_sar(plan["shortfall_sar"])
+        return txt
+    if st == "CAPITAL_CALL":
+        return (" | CAPITAL_CALL: deposit \u2265 " + _fmt_sar(plan["shortfall_sar"]) +
+                " for a " + _fmt_sar(plan["need_sar"]) + " ticket (cash " +
+                _fmt_sar(max(0.0, float(remaining or 0.0))) + ")")
+    return ""
 
 
 def _funding_settled_only() -> bool:
@@ -3668,6 +3845,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     """L2 cap + §4.2 diversification (selection-time, defer) + §4.4 sizing.
     Returns (tickets_raw, deferrals{symbol: reason})."""
     # v1.15.0: settled-only mode removes pending proceeds from funding.
+    _LAST_FUNDING_NEEDS.clear()  # v1.18.0
     _LAST_DEPLOYABLE_SPLIT["current"] = round(pf["cash"], 0)
     _LAST_DEPLOYABLE_SPLIT["proforma"] = round(pf["cash"] + pf["proceeds"], 0)
     _floor = _cash_floor_sar()
@@ -3756,6 +3934,9 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             deferrals[cand["symbol"]] = (
                 "Unfunded \u2014 sized ticket " + _fmt_sar(suggested) +
                 " below minimum ticket floor " + _fmt_sar(_min_ticket))
+            _LAST_FUNDING_NEEDS[cand["symbol"]] = {   # v1.18.0
+                "need_sar": float(_min_ticket), "sized_sar": float(suggested),
+                "remaining_sar": float(remaining)}
             continue
         # §4.2 combined post-action portfolio sector cap (only if sized & ctx)
         # v1.0.24: 'budget' basis divides by budget_base (pv + deployable) —
@@ -4428,7 +4609,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # it could be funded) is NOT an executable ticket — it is removed from
     # `selected`, excluded from the count, and reclassed as a WATCH near-miss.
     # OFF => funded_picks == picks and unfunded_picks == [] (byte-identical).
-    if crit.get("unfunded_watch_enabled"):
+    # v1.18.0: under the funding layer, Selected = FUNDABLE_NOW only - a
+    # 0-SAR pick is never an executable ticket, whatever unfunded_watch says.
+    if crit.get("unfunded_watch_enabled") or _env_funding_plan():
         funded_picks = [p for p in picks if (p["suggested_sar"] or 0) > 0]
         unfunded_picks = [p for p in picks if (p["suggested_sar"] or 0) <= 0]
     else:
@@ -4467,6 +4650,49 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         })
 
     # 3) kpis (L7 funding identity: unallocated = deployable − Σ suggested)
+    # --- v1.18.0 FUNDING-STATE LAYER (additive; kill-switch) -----------------
+    _fp_plans = []
+    if _env_funding_plan():
+        try:
+            _needs = dict(_LAST_FUNDING_NEEDS)
+            _min_floor = float(crit.get("min_ticket_sar", 0.0) or 0.0)
+            for _p in unfunded_picks:  # 0-SAR picks (capital exhausted)
+                _s = _p["cand"]["symbol"]
+                _nf = _min_floor
+                if _env_venue_floors():
+                    _vf = _venue_floor(_s)
+                    if _vf and float(_vf) > _nf:
+                        _nf = float(_vf)
+                if _s not in _needs and _nf > 0:
+                    _needs[_s] = {"need_sar": _nf, "sized_sar": 0.0,
+                                  "remaining_sar": float(remaining)}
+            _ordered = []
+            for _a in invest:  # rank order
+                _s = _a["symbol"]
+                if _s in _needs:
+                    _ordered.append((
+                        _s, _needs[_s]["need_sar"],
+                        _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))))
+            if _ordered:
+                _hold_roi = _holding_roi_map(audit, pf["holdings"])
+                _fp_plans = _funding_plans(
+                    _ordered, remaining, pf["holdings"], _hold_roi,
+                    _env_rotation_exclude(), _env_rotation_edge_pp(),
+                    _env_rotation_cost_pct())
+                _by_sym_plan = {pl["symbol"]: pl for pl in _fp_plans}
+                for _s, _pl in _by_sym_plan.items():
+                    _txt = _funding_plan_text(_pl, remaining)
+                    if not _txt:
+                        continue
+                    if _s in deferrals:
+                        deferrals[_s] = deferrals[_s] + _txt
+                        if _s in by_symbol:
+                            by_symbol[_s]["deferral"] = deferrals[_s]
+                    for _nm in unfunded_nm:
+                        if _nm.get("symbol") == _s:
+                            _nm["current"] = str(_nm.get("current") or "") + _txt
+        except Exception:  # noqa: BLE001 - the layer is additive, never fatal
+            _fp_plans = []
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
@@ -4491,6 +4717,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "scan_coverage_pct": (round(100.0 * len(audit) / _pool_received, 1)
                               if _pool_received else 100.0),
     }
+    if _env_funding_plan():  # v1.18.0 additive keys
+        _topn = _env_capital_call_topn()
+        kpis["fundable_now"] = len(tickets)
+        kpis["fundable_by_rotation"] = sum(
+            1 for pl in _fp_plans if pl["state"] == "FUNDABLE_BY_ROTATION")
+        kpis["capital_call"] = sum(
+            1 for pl in _fp_plans if pl["state"] == "CAPITAL_CALL")
+        kpis["capital_call_topn_sar"] = round(sum(
+            (pl.get("shortfall_sar") or 0.0) for pl in _fp_plans[:_topn]), 0)
     if _scan_clamped:
         kpis["scan_clamped"] = True
         kpis["scan_clamp"] = int(crit["max_candidates"])
@@ -4535,6 +4770,31 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 "executable tickets."),
         })
 
+    if _env_funding_plan() and _fp_plans:  # v1.18.0 additive alerts
+        _rot = [pl for pl in _fp_plans if pl["state"] == "FUNDABLE_BY_ROTATION"]
+        if _rot:
+            _r = _rot[0]["rotation"]
+            alerts.append({
+                "type": "rotation_proposal", "count": len(_rot),
+                "required_action": (
+                    _rot[0]["symbol"] + " is fundable by " + _r["action"].lower() +
+                    " of " + _r["symbol"] + " " + _fmt_sar(_r["proceeds_sar"]) +
+                    " (engine 12M edge +" + _fmt_num(_r["edge_pp"]) +
+                    "pp after cost). A rotation is a ticket, not an order: "
+                    "written GO with a live quote required."),
+            })
+        _topn = _env_capital_call_topn()
+        _cc = [pl for pl in _fp_plans[:_topn] if (pl.get("shortfall_sar") or 0) > 0]
+        if _cc:
+            alerts.append({
+                "type": "capital_call", "count": len(_cc),
+                "required_action": (
+                    "Deposit \u2265 " + _fmt_sar(sum(pl["shortfall_sar"] for pl in _cc)) +
+                    " to take the top-" + str(len(_cc)) + " qualified ticket(s): " +
+                    ", ".join(pl["symbol"] for pl in _cc) +
+                    ". Qualified names are shown regardless of cash; funding is "
+                    "the operator's decision."),
+            })
     # 4) audit grid sorted by score; strip internals
     audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
     for a in audit:
