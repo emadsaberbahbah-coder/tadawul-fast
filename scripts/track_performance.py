@@ -1306,7 +1306,38 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.34.0"
+SCRIPT_VERSION = "6.35.0"
+# -----------------------------------------------------------------------------
+# v6.35.0 (2026-08-31, 10-day program Day 4) - THE TRACKER SEES ITS WHOLE LOG
+# -----------------------------------------------------------------------------
+# EVIDENCE (Performance_Log inside the 2026-08-31 workbook, 38,040 records):
+# rows 1-~10,000 carry every maturation (5,471) and every 08-31 update; rows
+# 10,001-38,040 (28,040 records, everything appended since ~08-16) were never
+# touched after their recording day - 4,478 of them are ACTIVE past their
+# Target Date (1W/2W cohorts dated 08-22..08-30). Cause, at source:
+#   load_records(max_records=10000) reads rows DATA_ROW0..DATA_ROW0+9999 and
+#   save_records clears/rewrites only to row 10,000, so once the log crossed
+#   10k records the tracker went blind to every newer cohort; append_records
+#   dedups against a cache that never held those keys, so the same
+#   symbol|horizon|day was appended again by later runs (4,303 of the frozen
+#   rows share their Key with a sibling). The "matured 0" verdict lines were
+#   honest about the 10k window and silent about the 28k outside it.
+# CHANGE:
+#   (1) TRACK_MAX_RECORDS default 10,000 -> 200,000 (also load_snapshots
+#       20,000 -> 200,000), the read range CLAMPED to the worksheet grid
+#       (row_count) so a wide window can never throw "exceeds grid limits".
+#   (2) save_records clears to the LOADED EXTENT (never less than the old
+#       10,000 window) and rewrites in 5,000-row chunks (a single 38k x 33
+#       update risks the API payload limit).
+#   (3) DUPLICATE-KEY COHORTS: on load, the first record per Key stays; later
+#       duplicates become EXPIRED / outcome DUPLICATE_KEY / realized None
+#       (excluded from every statistic like UNPRICED), tagged in Notes.
+#       TRACK_DEDUP_KEYS=0/false/off/no keeps them (v6.34.0 behaviour).
+#   (4) The [PERF-VERDICT] line gains "loaded N/extent R | dup_expired K" so
+#       the window is measurable from _Run_Log alone.
+# Functions added: 2 (_track_max_records_default, _dedup_keys_enabled).
+# Removed: 0.
+# -----------------------------------------------------------------------------
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2686,6 +2717,24 @@ def _ca_decide_v2(print_roi: float, adj_roi: Optional[float],
 # v6.17.0 — maturity price-integrity switches
 # =============================================================================
 _MATURE_FRESH_TAG = "[v6.17.0 MATURE-FRESH-ONLY]"
+
+
+_LAST_LOAD_STATS: Dict[str, int] = {"loaded": 0, "extent": 0, "dup_expired": 0}
+
+
+def _track_max_records_default() -> int:
+    """v6.35.0: window default 200,000 (was 10,000); TRACK_MAX_RECORDS wins;
+    unparseable -> 200,000."""
+    try:
+        return max(1, int(float(os.getenv("TRACK_MAX_RECORDS") or "200000")))
+    except Exception:
+        return 200000
+
+
+def _dedup_keys_enabled() -> bool:
+    """v6.35.0 (3): expire later duplicates of a symbol|horizon|day Key on
+    load. Default ON; TRACK_DEDUP_KEYS=0/false/off/no keeps v6.34.0."""
+    return (os.getenv("TRACK_DEDUP_KEYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _mature_fresh_only_enabled() -> bool:
@@ -4126,10 +4175,18 @@ class PerformanceStore:
     def is_available(self) -> bool:
         return bool(self.ws)
 
-    def load_records(self, max_records: int = 10000) -> List[PerformanceRecord]:
+    def load_records(self, max_records: int = 200000) -> List[PerformanceRecord]:
         if not self.ws:
             return []
         end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
+        # v6.35.0 (1): clamp to the worksheet grid so a wide window never
+        # exceeds it ("exceeds grid limits" would otherwise fail the load).
+        try:
+            _rc = int(getattr(self.ws, "row_count", 0) or 0)
+        except Exception:
+            _rc = 0
+        if _rc >= self.DATA_ROW0:
+            end_row = min(end_row, _rc)
         end_col = len(self.HEADERS)
         rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
 
@@ -4138,7 +4195,10 @@ class PerformanceStore:
 
         try:
             rows = self.backoff.execute_sync(_load)
+            self._loaded_extent = self.DATA_ROW0 + len(rows or []) - 1  # v6.35.0
             records: List[PerformanceRecord] = []
+            _dup_expired = 0
+            _dedup = _dedup_keys_enabled()
             with self.cache_lock:
                 self.cache.clear()
                 for r in rows or []:
@@ -4147,8 +4207,28 @@ class PerformanceStore:
                     padded = list(r) + [""] * max(0, len(self.HEADERS) - len(r))
                     rec = PerformanceRecord.from_sheet_row(padded, self.HEADERS)
                     if rec.symbol:
+                        if _dedup and rec.key in self.cache:
+                            # v6.35.0 (3): the same symbol|horizon|day recorded
+                            # twice (append dedup was blind beyond the 10k
+                            # window) - the later copy can never count.
+                            if rec.status == PerformanceStatus.ACTIVE:
+                                rec.status = PerformanceStatus.EXPIRED
+                                rec.maturity_date = RiyadhTime.now()
+                                rec.realized_roi = None
+                                rec.outcome = "DUPLICATE_KEY"
+                                _note = ("[v6.35.0 DEDUP] duplicate of " + rec.key +
+                                         " - excluded, never a double-counted outcome")
+                                rec.notes = f"{rec.notes} | {_note}" if rec.notes else _note
+                                rec.last_updated = _utc_now()
+                                _dup_expired += 1
+                            records.append(rec)
+                            continue
                         records.append(rec)
                         self.cache[rec.key] = rec
+            self._dup_expired = _dup_expired  # v6.35.0
+            _LAST_LOAD_STATS.update({"loaded": len(records),
+                                     "extent": int(self._loaded_extent),
+                                     "dup_expired": int(_dup_expired)})
             return records
         except Exception as e:
             logger.error("Failed to load records: %s", e)
@@ -4201,13 +4281,26 @@ class PerformanceStore:
         data: List[List[Any]] = [self._record_to_row(r) for r in records]
 
         def _save() -> None:
-            clear_rng = _a1_range(1, self.DATA_ROW0, end_col, 10000)
+            # v6.35.0 (2): clear to the loaded extent (never less than the old
+            # 10,000 window), clamped to the grid; rewrite in 5,000-row chunks.
+            _ext = max(10000, int(getattr(self, "_loaded_extent", 0) or 0),
+                       self.DATA_ROW0 + len(data) - 1)
+            try:
+                _rc = int(getattr(self.ws, "row_count", 0) or 0)
+            except Exception:
+                _rc = 0
+            if _rc >= self.DATA_ROW0:
+                _ext = min(_ext, _rc)
+            clear_rng = _a1_range(1, self.DATA_ROW0, end_col, _ext)
             self.ws.batch_clear([clear_rng])  # type: ignore
-            if data:
+            _chunk = 5000
+            for _off in range(0, len(data), _chunk):
+                _part = data[_off:_off + _chunk]
                 write_rng = _a1_range(
-                    1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1
+                    1, self.DATA_ROW0 + _off, end_col,
+                    self.DATA_ROW0 + _off + len(_part) - 1
                 )
-                self.ws.update(values=data, range_name=write_rng)  # type: ignore
+                self.ws.update(values=_part, range_name=write_rng)  # type: ignore
 
         try:
             self.backoff.execute_sync(_save)
@@ -4424,10 +4517,16 @@ class SignalHistoryStore:
     def is_available(self) -> bool:
         return bool(self.ws)
 
-    def load_snapshots(self, max_records: int = 20000) -> List[SignalSnapshot]:
+    def load_snapshots(self, max_records: int = 200000) -> List[SignalSnapshot]:
         if not self.ws:
             return []
         end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
+        try:  # v6.35.0 (1): clamp to the grid (same class as load_records)
+            _rc = int(getattr(self.ws, "row_count", 0) or 0)
+        except Exception:
+            _rc = 0
+        if _rc >= self.DATA_ROW0:
+            end_row = min(end_row, _rc)
         end_col = len(self.HEADERS)
         rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
 
@@ -7067,7 +7166,7 @@ class PerformanceTrackerApp:
             snaps = await loop.run_in_executor(
                 _get_executor(),
                 self.signal_store.load_snapshots,
-                int(self.args.max_records or 20000),
+                int(self.args.max_records or _track_max_records_default()),
             )
         except Exception as e:
             logger.error("load_snapshots failed: %s", e)
@@ -7307,6 +7406,7 @@ class PerformanceTrackerApp:
                 "[PERF-VERDICT v%s] priced %d/%d | roi_nonzero %d | "
                 "fallback_filled %d | junk_rejected %d | matured %d | "
                 "pending %d | expired %d | feed=%s | fb=%s | selftest=%s"
+                " | loaded %d/extent %d | dup_expired %d"
                 % (
                     SCRIPT_VERSION,
                     int(st.get("priced") or 0),
@@ -7320,6 +7420,9 @@ class PerformanceTrackerApp:
                     _LAST_FEED_DIAGNOSIS,
                     _fb_s,
                     _TRACK_SELFTEST_MSG,
+                    int(_LAST_LOAD_STATS.get("loaded") or 0),   # v6.35.0
+                    int(_LAST_LOAD_STATS.get("extent") or 0),
+                    int(_LAST_LOAD_STATS.get("dup_expired") or 0),
                 )
             )
             level = (
@@ -7510,7 +7613,7 @@ class PerformanceTrackerApp:
             records = await loop.run_in_executor(
                 _get_executor(),
                 self.store.load_records,
-                int(self.args.max_records or 10000),
+                int(self.args.max_records or _track_max_records_default()),
             )
         else:
             records = []
@@ -8102,7 +8205,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-records",
         type=int,
-        default=_env_int("TRACK_MAX_RECORDS", 10000, lo=1),
+        default=_env_int("TRACK_MAX_RECORDS", 200000, lo=1),
         help="Max records to load from sheet (also TRACK_MAX_RECORDS env).",
     )
     p.add_argument(
