@@ -47,11 +47,13 @@ import csv
 import datetime as _dt
 import json
 import os
+import hashlib
 import re
+import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -102,6 +104,24 @@ def _parse_dt(v: Any) -> Optional[_dt.datetime]:
         return None
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _mtime_iso(path: str) -> str:
+    try:
+        return _dt.datetime.fromtimestamp(os.path.getmtime(path), tz=_dt.timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
 def _table(rows: List[List[str]]) -> List[Dict[str, str]]:
     """header row + data rows -> list of dicts (header-keyed, blank-safe)."""
     if not rows:
@@ -132,7 +152,11 @@ class Check:
 # data sources                                                                #
 # --------------------------------------------------------------------------- #
 class Source:
-    """Uniform access: tab(name) -> list of rows (list of str). Missing -> []."""
+    """Uniform access: tab(name) -> list of rows (list of str). Missing -> [].
+    v1.0.2: every read problem is RECORDED in .errors (fail-closed: a check on
+    an unreadable tab reports NA with the reason; --strict fails on errors)."""
+    errors: List[str] = []
+    inputs: List[Dict[str, Any]] = []
 
     def tab(self, name: str) -> List[List[str]]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -148,18 +172,35 @@ class ExportSource(Source):
         self.xlsx = xlsx
         self._cache: Dict[str, List[List[str]]] = {}
         self._files: Dict[str, str] = {}
-        for fn in os.listdir(export_dir):
+        self.errors = []
+        self.inputs = []
+        cands: Dict[str, List[str]] = {}
+        for fn in sorted(os.listdir(export_dir)):
             if fn.lower().endswith(".tsv") and "_-_" in fn:
                 tab = fn.rsplit("_-_", 1)[1][:-4]
                 # v1.0.1: browser download counters never identify a file
                 # (project rule): "Global_Markets(6)" / "Global_Markets__6_" -> tab.
                 tab = re.sub(r"(\s*\(\d+\)|__\d+_)\s*$", "", tab).strip()
-                self._files.setdefault(tab, os.path.join(export_dir, fn))
+                cands.setdefault(tab, []).append(os.path.join(export_dir, fn))
+        # v1.0.2: deterministic choice — the NEWEST file by mtime (ties: name);
+        # every candidate is recorded so the choice is auditable.
+        for tab, paths in cands.items():
+            chosen = sorted(paths, key=lambda q: (os.path.getmtime(q), q))[-1]
+            self._files[tab] = chosen
+            self.inputs.append({"tab": tab, "file": os.path.basename(chosen),
+                                "sha256": _sha256_file(chosen), "mtime_utc": _mtime_iso(chosen),
+                                "candidates": [os.path.basename(q) for q in paths]})
         if not xlsx:
-            for fn in os.listdir(export_dir):
-                if fn.lower().endswith(".xlsx"):
-                    self.xlsx = os.path.join(export_dir, fn)
-                    break
+            xl = sorted((fn for fn in os.listdir(export_dir) if fn.lower().endswith(".xlsx")),
+                        key=lambda fn: (os.path.getmtime(os.path.join(export_dir, fn)), fn))
+            if xl:
+                self.xlsx = os.path.join(export_dir, xl[-1])
+        if self.xlsx:
+            if os.path.exists(self.xlsx):
+                self.inputs.append({"tab": "*xlsx*", "file": os.path.basename(self.xlsx),
+                                    "sha256": _sha256_file(self.xlsx), "mtime_utc": _mtime_iso(self.xlsx)})
+            else:
+                self.errors.append(f"xlsx not found: {self.xlsx}")
 
     def tab(self, name: str) -> List[List[str]]:
         if name in self._cache:
@@ -168,15 +209,25 @@ class ExportSource(Source):
         if name in self._files:
             with open(self._files[name], encoding="utf-8", newline="") as fh:
                 rows = [list(r) for r in csv.reader(fh, delimiter="\t", quoting=csv.QUOTE_NONE)]
-        elif self.xlsx:
+        elif self.xlsx and os.path.exists(self.xlsx):
             try:
                 from openpyxl import load_workbook  # optional dependency
+            except Exception as exc:  # v1.0.2: never silent
+                self.errors.append(f"openpyxl unavailable — xlsx tab {name} unread: {exc}")
+                self._cache[name] = []
+                return []
+            try:
                 wb = load_workbook(self.xlsx, read_only=True, data_only=True)
                 if name in wb.sheetnames:
                     ws = wb[name]
                     rows = [[_s(c) for c in r] for r in ws.iter_rows(values_only=True)]
-            except Exception:
+                else:
+                    self.errors.append(f"tab {name} absent from xlsx and no TSV")
+            except Exception as exc:
+                self.errors.append(f"xlsx read failed for tab {name}: {exc}")
                 rows = []
+        else:
+            self.errors.append(f"tab {name}: no TSV and no xlsx")
         self._cache[name] = rows
         return rows
 
@@ -185,6 +236,8 @@ class LiveSource(Source):
     def __init__(self, sheet_id: str):
         self.sheet_id = sheet_id
         self._cache: Dict[str, List[List[str]]] = {}
+        self.errors = []
+        self.inputs = [{"tab": "*live*", "workbook_id": sheet_id}]
         self.gc = self._client()
         self.book = self.gc.open_by_key(sheet_id)
 
@@ -276,7 +329,8 @@ class LiveSource(Source):
                 rows = self._page_columns(ws)
             else:
                 rows = ws.get_all_values() or []
-        except Exception as exc:  # fail-open: the check reports NA
+        except Exception as exc:  # recorded, never silent: the check reports NA
+            self.errors.append(f"live tab {name} unreadable: {exc}")
             print(f"[acceptance] tab {name} unreadable: {exc}", file=sys.stderr)
             rows = []
         self._cache[name] = [[_s(c) for c in r] for r in rows]
@@ -388,7 +442,16 @@ def check_learning(src: Source) -> List[Check]:
 def check_feed_truth(src: Source) -> List[Check]:
     kv = _status_globals(src)
     feed = kv.get("tfb decision feed", "")
-    out = [Check("D10-4a", "decision feed key present", "PASS" if feed else "FAIL", feed.split("|", 1)[0].strip() if feed else None, feed[:120])]
+    head = feed.split("|", 1)[0].strip() if feed else ""
+    out = [Check("D10-4a", "decision feed key present", "PASS" if feed else "FAIL", head or None, feed[:120])]
+    # v1.0.2: presence is not permission — the STATE is its own criterion.
+    if head.upper().startswith("EXECUTABLE"):
+        out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "PASS", "EXECUTABLE", feed[:120]))
+    elif head.upper().startswith("NOT_ACTIONABLE"):
+        out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "WARN", head[:40],
+                         "truthful non-actionable state — no investment/deployment permission"))
+    else:
+        out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "FAIL", head[:40] or None, "absent or unrecognised"))
     lies = []
     for st in _status_stamps(src):
         page, status, msg = _s(st.get("Page")), _s(st.get("Status")).upper(), _s(st.get("Message"))
@@ -417,8 +480,9 @@ def check_pages(src: Source) -> List[Check]:
             if d and (now - d.astimezone(RIYADH)).total_seconds() <= 24 * 3600:
                 fresh += 1
         glyph = sum(1 for r in rows if _is_glyph(r.get("Expected ROI 12M")))
-        pt = sum(1 for r in rows if _s(r.get("Forecast Source")) == "provider_target")
-        tp = sum(1 for r in rows if _s(r.get("Target Price")))
+        pt_rows = [r for r in rows if _s(r.get("Forecast Source")) == "provider_target"]
+        pt = len(pt_rows)
+        tp = sum(1 for r in pt_rows if _s(r.get("Target Price")))  # v1.0.2: within the cohort
         oor = 0
         for r in rows:
             o, h, l = _to_float(r.get("Open")), _to_float(r.get("Day High")), _to_float(r.get("Day Low"))
@@ -429,13 +493,15 @@ def check_pages(src: Source) -> List[Check]:
             if _s(r.get("Final Action")).upper() == "INVEST" or _s(r.get("Investability Status")).upper() == "INVESTABLE":
                 if not _TICKER_RE.match(_s(r.get("Symbol")).upper()) or "fetch_failed" in _s(r.get("Warnings")).lower():
                     fg += 1
-        out.append(Check(f"G1-{p}", f"{p} integrity (rows/dup/blank)", "PASS" if (dup == 0 and blank == 0) else "FAIL",
-                         n, f"dup_symbols={dup} blank_symbols={blank} fresh24h={fresh}/{n}"))
+        fresh_share = fresh / n * 100.0
+        g1_ok = dup == 0 and blank == 0 and fresh_share >= 95.0  # v1.0.2: stale is a FAIL
+        out.append(Check(f"G1-{p}", f"{p} integrity (rows/dup/blank/fresh>=95%)", "PASS" if g1_ok else "FAIL",
+                         n, f"dup_symbols={dup} blank_symbols={blank} fresh24h={fresh}/{n} ({fresh_share:.1f}%)"))
         gs = glyph / n * 100.0
         out.append(Check(f"D10-5-{p}", f"{p} single writer (display-glyph share %)", "PASS" if glyph == 0 else ("WARN" if gs <= 5 else "FAIL"),
                          round(gs, 1), f"glyph_cells={glyph} open_outside_range={oor}"))
-        out.append(Check(f"G2-{p}", f"{p} targets (Target Price nonblank / provider_target)", "PASS" if (pt == 0 or tp >= 0.8 * pt) else "FAIL",
-                         tp, f"provider_target={pt} target_price_nonblank={tp}"))
+        out.append(Check(f"G2-{p}", f"{p} targets (Target Price nonblank within provider_target rows)", "PASS" if (pt == 0 or tp >= 0.8 * pt) else "FAIL",
+                         tp, f"provider_target={pt} target_price_nonblank_in_cohort={tp}"))
         out.append(Check(f"G3-{p}", f"{p} false greens (INVEST with fetch_failed / non-ticker)", "PASS" if fg == 0 else "FAIL", fg, ""))
     return out
 
@@ -530,8 +596,45 @@ def _selftest() -> int:
     assert cb["G3-Global_Markets"].verdict == "FAIL" and cb["G3-Global_Markets"].measured == 1
     assert cb["D10-5-Global_Markets"].verdict == "FAIL" and cb["G2-Global_Markets"].verdict == "FAIL"
     assert cb["G1-Global_Markets"].verdict == "PASS"  # two distinct symbols, none blank
+    # v1.0.2 fixtures (review P1/P2): stale page -> G1 FAIL even with unique symbols
+    stale = [hdr, ["AAPL", "Apple", "10", "11", "9", "0.2", "provider_target", "12", "INVESTABLE", "INVEST", "", "2026-01-01T00:00:00+00:00"]]
+    C = _MemSource({"Market_Leaders": stale, "Global_Markets": good, "Commodities_FX": good, "Mutual_Funds": good,
+                    "_Status": status_ok, "Top_10_Investments": top10, "Performance_Log": perf, "_Run_Log": runlog, "S1_Gate": s1})
+    cc = {c.cid: c for c in run_all(C)}
+    assert cc["G1-Market_Leaders"].verdict == "FAIL" and cc["G1-Global_Markets"].verdict == "PASS"
+    # mixed cohort: provider_target rows blank, unrelated rows carry targets -> G2 FAIL
+    mixed = [hdr, ["AAPL", "Apple", "10", "11", "9", "0.2", "provider_target", "", "INVESTABLE", "INVEST", "", now],
+             ["MSFT", "Microsoft", "10", "11", "9", "0.1", "phase_ii_synthetic", "50", "WATCHLIST", "WATCH", "", now]]
+    D = _MemSource({"Market_Leaders": mixed, "Global_Markets": good, "Commodities_FX": good, "Mutual_Funds": good, "_Status": status_ok,
+                    "Top_10_Investments": top10, "Performance_Log": perf, "_Run_Log": runlog, "S1_Gate": s1})
+    cd = {c.cid: c for c in run_all(D)}
+    assert cd["G2-Market_Leaders"].verdict == "FAIL" and cd["G2-Market_Leaders"].measured == 0
+    # feed state criterion: NOT_ACTIONABLE is WARN (truthful), EXECUTABLE is PASS
+    assert ca["D10-4c"].verdict == "WARN"
+    E = _MemSource({"_Status": [["Page", "Last Updated", "Status", "Message", "", "", "", "", "", "", "", "Global Key", "Value"],
+                                ["", "", "", "", "", "", "", "", "", "", "", "TFB Decision Feed", "EXECUTABLE | run=1"]]})
+    assert {c.cid: c for c in check_feed_truth(E)}["D10-4c"].verdict == "PASS"
+    # duplicate downloads: the NEWEST normalized export wins, deterministically, and inputs are hashed
+    import tempfile, time
+    with tempfile.TemporaryDirectory() as td:
+        older = os.path.join(td, "_X_-_Market_Leaders(6).tsv")
+        newer = os.path.join(td, "_X_-_Market_Leaders(7).tsv")
+        with open(older, "w", encoding="utf-8") as fh:
+            fh.write("Symbol\tName\nOLD\tx\n")
+        with open(newer, "w", encoding="utf-8") as fh:
+            fh.write("Symbol\tName\nNEW\tx\n")
+        os.utime(older, (time.time() - 100, time.time() - 100))
+        src = ExportSource(td)
+        assert src.tab("Market_Leaders")[1][0] == "NEW", src.tab("Market_Leaders")
+        rec = next(i for i in src.inputs if i["tab"] == "Market_Leaders")
+        assert rec["file"].endswith("(7).tsv") and len(rec["sha256"]) == 64 and len(rec["candidates"]) == 2
+        # missing xlsx / unreadable tab is RECORDED, never silent
+        src2 = ExportSource(td, xlsx=os.path.join(td, "missing.xlsx"))
+        assert any("xlsx not found" in e for e in src2.errors)
+        src2.tab("Performance_Log")
+        assert any("Performance_Log" in e for e in src2.errors), src2.errors
     print(render(list(ca.values()), "selftest A (all good)"))
-    print("selftest: PASS 2/2 fixtures")
+    print("selftest: PASS 6/6 fixtures (all-good, all-bad, stale page, mixed target cohort, duplicate downloads, unreadable xlsx)")
     return 0
 
 
@@ -572,14 +675,37 @@ def main(argv: Optional[List[str]] = None) -> int:
                 fh.write("```\n" + text + "\n```\n")
         except Exception:
             pass
+    errs = list(getattr(src, "errors", []) or [])
+    if errs:
+        print("READ ERRORS (fail-closed): " + " | ".join(errs)[:600])
+    tally = {v: sum(1 for c in checks if c.verdict == v) for v in ("PASS", "WARN", "FAIL", "NA")}
+    overall = "FAIL" if (tally["FAIL"] or errs) else ("WARN" if tally["WARN"] else "PASS")
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump({"version": VERSION, "title": title, "generated_riyadh": _now_riyadh().isoformat(),
-                       "checks": [c.row() for c in checks]}, fh, indent=2, ensure_ascii=False)
-    if a.strict and any(c.verdict == "FAIL" for c in checks):
+                       "provenance": _provenance(a, src),
+                       "overall_verdict": overall, "fail_count": tally["FAIL"], "tally": tally,
+                       "read_errors": errs, "checks": [c.row() for c in checks]}, fh, indent=2, ensure_ascii=False)
+    if a.strict and (tally["FAIL"] or errs):
         return 1
     return 0
+
+
+def _provenance(a, src: Source) -> Dict[str, Any]:
+    """v1.0.2: who measured what, from which commit, on which inputs."""
+    here = os.path.abspath(__file__)
+    sha = _s(os.getenv("GITHUB_SHA"))
+    if not sha:
+        try:
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5,
+                                 cwd=os.path.dirname(here)).stdout.strip()
+        except Exception:
+            sha = ""
+    return {"generator_version": VERSION, "generator_sha256": _sha256_file(here),
+            "generator_commit_sha": sha or None, "workflow_run_id": _s(os.getenv("GITHUB_RUN_ID")) or None,
+            "source_mode": "live" if a.live else "export", "snapshot_riyadh": _now_riyadh().isoformat(),
+            "inputs": list(getattr(src, "inputs", []) or [])}
 
 
 if __name__ == "__main__":
