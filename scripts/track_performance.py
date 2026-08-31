@@ -1306,7 +1306,39 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.35.0"
+SCRIPT_VERSION = "6.36.0"
+# -----------------------------------------------------------------------------
+# v6.36.0 (2026-08-31, 10-day program Day 4 #2) - CALIBRATION WRITE-BACK
+# -----------------------------------------------------------------------------
+# WHY: ReliabilityCalibrator (v6.8.0) computes per-investability calibration
+# factors with Wilson intervals and sample shrinkage, but the result only ever
+# reached stdout and a run artifact. The engine's consumer (data_engine_v2
+# v5.91.0, TFB_CALIBRATION_ADJUST + TFB_CALIBRATION_FACTORS
+# "INVESTABLE:0.85,WATCHLIST:0.95", downward-only) therefore never had a
+# published, auditable source - the loop's last mile was a copy-paste that
+# never happened. Now that v6.35.0 lets the tracker see its whole log, the
+# factors are worth publishing.
+# CHANGE (all in-place cell updates - works AT the workbook cell cap; the
+# _Run_Log line is the only append and fails open):
+#   (1) _publish_reliability_calibration(report): builds the ENV-READY string
+#       from SUFFICIENT buckets only (decided >= min_sample), e.g.
+#       "INVESTABLE:0.812,WATCHLIST:0.947"; insufficient buckets are listed as
+#       n/a with their decided count, never published as factors.
+#   (2) Publishes to _Status key "TFB Calibration" = "<env-string> | n=<decided
+#       per bucket> | brier=<b> | as_of=<ts>" via a bounded L{r}:M{r} upsert
+#       (same contract as the sync's TFB Feed keys, never an append), and to
+#       _S1_Calibration rows 12-18 as a "RELIABILITY FACTORS" block.
+#   (3) EVERY CHANGE of the published env-string versus the previous _Status
+#       value is logged to _Run_Log as "[CALIBRATION v6.36.0] old -> new" with
+#       the per-bucket sample sizes - the human-review trail the Strategy
+#       requires for any self-learning weight.
+#   (4) The engine still applies factors ONLY from its own ENV (operator's
+#       hands, deployment policy): the published string is the value to set.
+# GATE: TRACK_PUBLISH_CALIBRATION default ON; =0/false/off/no => v6.35.0
+# byte-identical (no cell written).
+# Functions added: 3 (_publish_calibration_enabled, _calibration_env_string,
+# _publish_reliability_calibration). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.35.0 (2026-08-31, 10-day program Day 4) - THE TRACKER SEES ITS WHOLE LOG
 # -----------------------------------------------------------------------------
@@ -2735,6 +2767,32 @@ def _dedup_keys_enabled() -> bool:
     """v6.35.0 (3): expire later duplicates of a symbol|horizon|day Key on
     load. Default ON; TRACK_DEDUP_KEYS=0/false/off/no keeps v6.34.0."""
     return (os.getenv("TRACK_DEDUP_KEYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _publish_calibration_enabled() -> bool:
+    """v6.36.0 kill-switch. Default ON; TRACK_PUBLISH_CALIBRATION=0/false/off/
+    no => nothing is written (v6.35.0 byte-identical)."""
+    return (os.getenv("TRACK_PUBLISH_CALIBRATION") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _calibration_env_string(report: Any) -> Tuple[str, str]:
+    """v6.36.0 PURE: (env_string, sample_note) from report.by_investability.
+    env_string names ONLY sufficient buckets (decided >= min_sample), in the
+    engine's TFB_CALIBRATION_FACTORS grammar "BUCKET:factor,..."; the note
+    carries every bucket's decided count so an absent bucket is explained."""
+    parts, notes = [], []
+    for b in (getattr(report, "by_investability", None) or []):
+        name = str(getattr(b, "name", "") or "").strip().upper()
+        if not name or name in ("NONE", "UNKNOWN", "N/A", "?"):
+            continue  # a non-verdict bucket (blank/None investability) is never a factor
+        decided = int(getattr(b, "decided", 0) or 0)
+        f = getattr(b, "calibration_factor_shrunk", None)
+        if bool(getattr(b, "sufficient", False)) and f is not None:
+            parts.append(f"{name}:{float(f):.3f}")
+            notes.append(f"{name}={decided}")
+        else:
+            notes.append(f"{name}=n/a({decided})")
+    return ",".join(parts), " ".join(notes)
 
 
 def _mature_fresh_only_enabled() -> bool:
@@ -7455,6 +7513,83 @@ class PerformanceTrackerApp:
         except Exception as e:
             logger.warning("[v6.20.0 VT-1] run-log verdict skipped: %s", e)
 
+    def _publish_reliability_calibration(self, report: Any) -> Dict[str, Any]:
+        """v6.36.0: publish the calibration factors where a human and the
+        deploy checklist can read them (in-place cell updates only; the
+        _Run_Log change line is append-only and fails open)."""
+        out: Dict[str, Any] = {"published": False, "env": "", "changed": False}
+        if not _publish_calibration_enabled() or report is None:
+            return out
+        try:
+            sheet = getattr(self.store, "sheet", None)
+            if sheet is None:
+                return out
+            env_s, note = _calibration_env_string(report)
+            ts = RiyadhTime.format()
+            brier = getattr(report, "brier_score", None)
+            value = (f"{env_s if env_s else 'NONE'} | n={note} | "
+                     f"brier={'' if brier is None else brier} | as_of={ts}")
+            out["env"] = env_s
+            # (2a) _Status bounded L:M upsert - never an append.
+            ws_status = sheet.worksheet("_Status")
+            grid = ws_status.get("L1:M60") or []
+            slot, prev, blank = None, "", None
+            for i in range(60):
+                row = grid[i] if i < len(grid) else []
+                k = str(row[0]).strip() if row and len(row) > 0 else ""
+                if k.casefold() == "tfb calibration":
+                    slot = i + 1
+                    prev = str(row[1]).strip() if len(row) > 1 else ""
+                    break
+                if not k and blank is None:
+                    blank = i + 1
+            if slot is None:
+                slot = blank
+            if slot is not None:
+                ws_status.update(values=[["TFB Calibration", value]],
+                                 range_name=f"L{slot}:M{slot}",
+                                 value_input_option="RAW")
+                out["published"] = True
+            # (2b) _S1_Calibration rows 12-18 in place (tab created by the
+            # S-1 publisher; skipped, never created, when absent).
+            try:
+                ws_cal = sheet.worksheet(S1_CAL_TAB)
+                rows = [["RELIABILITY FACTORS v6.36.0", "env: " + (env_s or "NONE"),
+                         "as_of " + ts, "min_sample " + str(getattr(report, "min_sample", ""))],
+                        ["bucket", "factor(shrunk)", "decided", "sufficient"]]
+                for b in (getattr(report, "by_investability", None) or [])[:4]:
+                    rows.append([str(getattr(b, "name", "")),
+                                 getattr(b, "calibration_factor_shrunk", ""),
+                                 int(getattr(b, "decided", 0) or 0),
+                                 "YES" if getattr(b, "sufficient", False) else "NO"])
+                while len(rows) < 7:
+                    rows.append(["", "", "", ""])
+                ws_cal.update(values=rows, range_name="A12:D18",
+                              value_input_option="RAW")
+            except Exception as _ce:
+                logger.warning("[CALIBRATION v6.36.0] _S1_Calibration block skipped: %s", _ce)
+            # (3) change trail: previous env-string is the first token of prev.
+            prev_env = prev.split(" | ", 1)[0].strip() if prev else ""
+            if prev_env != (env_s or "NONE"):
+                out["changed"] = True
+                line = (f"[CALIBRATION v6.36.0] factors changed: "
+                        f"{prev_env or '(none)'} -> {env_s or 'NONE'} | n={note}")
+                try:
+                    ws_log = sheet.worksheet("_Run_Log")
+                    ws_log.append_row(
+                        [ts, "INFO", "track_performance", "Performance_Log",
+                         "CALIBRATION", line, "", "", "",
+                         json_dumps({"env": env_s, "prev": prev_env,
+                                     "samples": note, "version": SCRIPT_VERSION})],
+                        value_input_option="USER_ENTERED")
+                except Exception as _le:
+                    logger.warning("[CALIBRATION v6.36.0] _Run_Log line skipped: %s", _le)
+                logger.info(line)
+            return out
+        except Exception as e:
+            logger.warning("[CALIBRATION v6.36.0] publish skipped: %s", e)
+            return out
+
     def _publish_s1_calibration(self, records: Any) -> bool:
         """v6.29.0 [WAVE B]: compute criterion-4 calibration and overwrite
         the _S1_Calibration block. Returns True on a successful write.
@@ -7811,6 +7946,15 @@ class PerformanceTrackerApp:
         if calibration is not None and (self.args.analyze or self.args.calibrate):
             _out("")
             render_calibration_report(calibration, verbose=bool(self.args.verbose))
+            # v6.36.0: write-back (in-place cells + change trail), kill-switched.
+            if self.store.is_available():
+                _pub = await loop.run_in_executor(
+                    _get_executor(), self._publish_reliability_calibration,
+                    calibration)
+                if _pub.get("published"):
+                    _out(f"Calibration published: TFB_CALIBRATION_FACTORS="
+                         f"{_pub.get('env') or 'NONE'}"
+                         f"{' (CHANGED - see _Run_Log)' if _pub.get('changed') else ''}")
 
         if self.args.simulate:
             matured = [
