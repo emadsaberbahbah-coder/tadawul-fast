@@ -219,7 +219,26 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # makes both flags arrive; this change makes dry-run mean ZERO writes on
 # every path: the drill branch now previews and exits without touching
 # Sheets. Everything else is byte-identical to v1.5.0.
-SCRIPT_VERSION = "1.6.0"
+SCRIPT_VERSION = "1.7.0"
+# -----------------------------------------------------------------------------
+# v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
+#          ACTUALLY RAN (the registration gap)
+# -----------------------------------------------------------------------------
+# EVIDENCE: the 2026-08-17 restore drill (backup_workbook.py --restore-test,
+# RTO 8 min, 6/6 checks) is the rollback drill the gate asks for, and the
+# drill script writes "[RESTORE-TEST vX] PASS ..." to _Run_Log. find_drill_marker
+# looked ONLY for the manual "[ROLLBACK-DRILL]" marker AND only in the last 400
+# rows of a ~35k-row log (about one day of GAS lines) - so criterion 6 stayed
+# "not yet run (operator, monthly)" for two weeks after a passed drill, and no
+# nightly evidence could ever register it.
+# CHANGE: find_drill_marker (a) accepts BOTH markers - "[ROLLBACK-DRILL]" and a
+# "[RESTORE-TEST ...] PASS" line (FAIL lines never count); (b) scans the WHOLE
+# window by timestamp (backend "YYYY-MM-DD ..." and GAS "M/D/YYYY ..." stamps),
+# not a row-count tail; (c) returns "YYYY-MM-DD (MARKER)" so the S1_Gate detail
+# names its provenance. The manual --rollback-drill-passed path is unchanged.
+# Kill-switch TFB_S1_DRILL_LEGACY=1 restores the v1.6.0 scan byte-for-byte.
+# Functions added: 1 (_drill_row_date). Removed: 0.
+# -----------------------------------------------------------------------------
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -881,24 +900,58 @@ def write_gate(sh, gate: Dict[str, Any], meta: List[List[Any]]) -> None:
     ws.update(values=body, range_name="A1")
 
 
+def _drill_row_date(stamp: str) -> Optional[date]:
+    """v1.7.0 PURE: the date of a _Run_Log stamp in either house format."""
+    t = str(stamp or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(t.split(" ")[0].split("T")[0][:10], fmt).date()
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def find_drill_marker(sh, since: date) -> Optional[str]:
-    """Criterion 6: newest [ROLLBACK-DRILL] line in _Run_Log within window."""
+    """Criterion 6: newest drill evidence in _Run_Log within the window.
+    v1.7.0: "[ROLLBACK-DRILL]" (manual) OR "[RESTORE-TEST ...] PASS" (the drill
+    script's own line), whole window by timestamp; returns "YYYY-MM-DD (MARKER)".
+    TFB_S1_DRILL_LEGACY=1 restores the v1.6.0 scan (last 400 rows, one marker)."""
     try:
         ws = sh.worksheet("_Run_Log")
         vals = ws.get_all_values()
     except Exception:  # noqa: BLE001
         return None
-    newest: Optional[str] = None
-    for row in vals[-400:]:
+    legacy = (os.getenv("TFB_S1_DRILL_LEGACY") or "0").strip().lower() in ("1", "true", "yes", "on")
+    if legacy:
+        newest_l: Optional[str] = None
+        for row in vals[-400:]:
+            line = " ".join(str(c) for c in row)
+            if "[ROLLBACK-DRILL]" in line:
+                stamp = str(row[0]).strip()[:10] if row else ""
+                try:
+                    if datetime.strptime(stamp, "%Y-%m-%d").date() >= since:
+                        newest_l = stamp
+                except Exception:  # noqa: BLE001
+                    continue
+        return newest_l
+    newest: Optional[date] = None
+    marker = ""
+    for row in vals:
+        if not row:
+            continue
         line = " ".join(str(c) for c in row)
         if "[ROLLBACK-DRILL]" in line:
-            stamp = str(row[0]).strip()[:10] if row else ""
-            try:
-                if datetime.strptime(stamp, "%Y-%m-%d").date() >= since:
-                    newest = stamp
-            except Exception:  # noqa: BLE001
-                continue
-    return newest
+            m = "ROLLBACK-DRILL"
+        elif "[RESTORE-TEST" in line and "] PASS " in line:
+            m = "RESTORE-TEST"
+        else:
+            continue
+        d = _drill_row_date(str(row[0]))
+        if d is None or d < since:
+            continue
+        if newest is None or d >= newest:
+            newest, marker = d, m
+    return f"{newest.isoformat()} ({marker})" if newest else None
 
 
 def ca_is_clean(sh) -> bool:
