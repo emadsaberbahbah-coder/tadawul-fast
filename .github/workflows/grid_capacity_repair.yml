@@ -36,6 +36,10 @@ on:
         description: "Type RESIZE to arm apply"
         type: string
         default: ""
+      targets_json:
+        description: "Optional target map override (JSON {tab: rows}); empty = the tool's default map"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -72,9 +76,22 @@ jobs:
           ARGS=""
           if [ "${{ inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ "${{ inputs.have_backup }}" = "yes" ]; then ARGS="$ARGS --i-have-backup"; fi
-          python scripts/repair_grid_capacity.py $ARGS \
-            --confirm "${{ inputs.confirm }}" \
-            --artifacts-dir artifacts | tee artifacts_console.txt
+          # v1.1.0 (2026-08-31): optional target-map override (the tool's own
+          # --targets-json). Dry-run 2026-08-31 measured 9,999,995/10,000,000
+          # allocated; the default map projects 7,261,044 (> the 7,000,000
+          # closure bar), so the operator can pass a wider map without a code
+          # change. Same safety contract: data-extent guard, reductions only.
+          TJ='${{ inputs.targets_json }}'
+          if [ -n "$TJ" ]; then
+            python scripts/repair_grid_capacity.py $ARGS \
+              --confirm "${{ inputs.confirm }}" \
+              --targets-json "$TJ" \
+              --artifacts-dir artifacts | tee artifacts_console.txt
+          else
+            python scripts/repair_grid_capacity.py $ARGS \
+              --confirm "${{ inputs.confirm }}" \
+              --artifacts-dir artifacts | tee artifacts_console.txt
+          fi
 
       - name: Upload artifacts (report + _Run_Log archive)
         if: always()
