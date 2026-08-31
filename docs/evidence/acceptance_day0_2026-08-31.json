@@ -1,0 +1,182 @@
+{
+  "version": "1.0.0",
+  "title": "export uploads",
+  "generated_riyadh": "2026-08-31T14:20:37.102976+03:00",
+  "checks": [
+    {
+      "id": "D10-1",
+      "criterion": "board fills (Top_10 Passed >= 5)",
+      "verdict": "FAIL",
+      "measured": 0.0,
+      "evidence": "Passed=0 Selected=0 / 10 | funding alerts:  | Last run 2026-08-31 08:47:17 | status: ok | sheets pool 9786 rows [Market_Leader"
+    },
+    {
+      "id": "D10-2a",
+      "criterion": "capacity key present (TFB Grid Capacity)",
+      "verdict": "FAIL",
+      "measured": null,
+      "evidence": "key absent from _Status L:M"
+    },
+    {
+      "id": "D10-2b",
+      "criterion": "evidence clock (newest backend _Run_Log row age h)",
+      "verdict": "FAIL",
+      "measured": 29.2,
+      "evidence": "2026-08-30T09:07:32+03:00"
+    },
+    {
+      "id": "D10-3a",
+      "criterion": "calibration key present (TFB Calibration)",
+      "verdict": "FAIL",
+      "measured": null,
+      "evidence": ""
+    },
+    {
+      "id": "D10-3b",
+      "criterion": "learning loop (overdue active cohorts)",
+      "verdict": "FAIL",
+      "measured": 4478,
+      "evidence": "records=38040 active=32543 matured=5471 duplicate_key=0 overdue_share=13.8%"
+    },
+    {
+      "id": "D10-4a",
+      "criterion": "decision feed key present",
+      "verdict": "PASS",
+      "measured": "NOT_ACTIONABLE(aged:GM)",
+      "evidence": "NOT_ACTIONABLE(aged:GM) | run=33358823331 | 2026-08-31 08:28:00+03:00 | ML:OK GM:AGED CFX:OK MF:OK"
+    },
+    {
+      "id": "D10-4b",
+      "criterion": "no SUCCESS-over-PARTIAL page stamp (status-truth armed)",
+      "verdict": "FAIL",
+      "measured": 3,
+      "evidence": "Global_Markets, Mutual_Funds, Commodities_FX"
+    },
+    {
+      "id": "G1-Market_Leaders",
+      "criterion": "Market_Leaders integrity (rows/dup/blank)",
+      "verdict": "PASS",
+      "measured": 255,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=255/255"
+    },
+    {
+      "id": "D10-5-Market_Leaders",
+      "criterion": "Market_Leaders single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 100.0,
+      "evidence": "glyph_cells=255 open_outside_range=0"
+    },
+    {
+      "id": "G2-Market_Leaders",
+      "criterion": "Market_Leaders targets (Target Price nonblank / provider_target)",
+      "verdict": "FAIL",
+      "measured": 0,
+      "evidence": "provider_target=109 target_price_nonblank=0"
+    },
+    {
+      "id": "G3-Market_Leaders",
+      "criterion": "Market_Leaders false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Global_Markets",
+      "criterion": "Global_Markets integrity (rows/dup/blank)",
+      "verdict": "PASS",
+      "measured": 6609,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=6496/6609"
+    },
+    {
+      "id": "D10-5-Global_Markets",
+      "criterion": "Global_Markets single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 38.1,
+      "evidence": "glyph_cells=2516 open_outside_range=443"
+    },
+    {
+      "id": "G2-Global_Markets",
+      "criterion": "Global_Markets targets (Target Price nonblank / provider_target)",
+      "verdict": "FAIL",
+      "measured": 0,
+      "evidence": "provider_target=764 target_price_nonblank=0"
+    },
+    {
+      "id": "G3-Global_Markets",
+      "criterion": "Global_Markets false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Commodities_FX",
+      "criterion": "Commodities_FX integrity (rows/dup/blank)",
+      "verdict": "PASS",
+      "measured": 453,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=451/453"
+    },
+    {
+      "id": "D10-5-Commodities_FX",
+      "criterion": "Commodities_FX single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 86.5,
+      "evidence": "glyph_cells=392 open_outside_range=113"
+    },
+    {
+      "id": "G2-Commodities_FX",
+      "criterion": "Commodities_FX targets (Target Price nonblank / provider_target)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": "provider_target=0 target_price_nonblank=0"
+    },
+    {
+      "id": "G3-Commodities_FX",
+      "criterion": "Commodities_FX false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "FAIL",
+      "measured": 1,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Mutual_Funds",
+      "criterion": "Mutual_Funds integrity (rows/dup/blank)",
+      "verdict": "PASS",
+      "measured": 2474,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=2470/2474"
+    },
+    {
+      "id": "D10-5-Mutual_Funds",
+      "criterion": "Mutual_Funds single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 54.3,
+      "evidence": "glyph_cells=1343 open_outside_range=72"
+    },
+    {
+      "id": "G2-Mutual_Funds",
+      "criterion": "Mutual_Funds targets (Target Price nonblank / provider_target)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": "provider_target=0 target_price_nonblank=0"
+    },
+    {
+      "id": "G3-Mutual_Funds",
+      "criterion": "Mutual_Funds false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "D10-7",
+      "criterion": "S-1 evidence clock (scored days /28)",
+      "verdict": "WARN",
+      "measured": 3,
+      "evidence": "verdict=NOT_DECIDABLE"
+    },
+    {
+      "id": "D10-6",
+      "criterion": "daily brief automated (digest.yml enabled)",
+      "verdict": "NA",
+      "measured": null,
+      "evidence": "workflow state is not in the workbook — verify in Actions"
+    }
+  ]
+}
