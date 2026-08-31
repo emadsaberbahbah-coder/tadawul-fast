@@ -1835,7 +1835,39 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.53.0"
+SCRIPT_VERSION = "6.54.0"
+# -----------------------------------------------------------------------------
+# v6.54.0 (2026-08-31) - IDENTITY DOMAIN: A NON-TICKER CAN NEVER BE LAST-GOOD
+#                        OR LEAVE THE SYNC AS INVEST (audit P0 #3, CFX row 454)
+# -----------------------------------------------------------------------------
+# EVIDENCE (2026-08-31 export, Commodities_FX last row): Symbol="Copper
+# Futures", Name="Commodity", Exchange="USD", Day High 6.4955 < Day Low 6.728,
+# Warnings "fetch_failed:HTTP 422", Last Updated 2026-08-13 - and STILL
+# INVESTABLE / INVEST (the page's only INVEST row). Mechanism, traced at
+# source: the shifted 08-13 write left a Name-like string in the Symbol cell;
+# every run since, the backend cannot fetch it (422 stub) and KEEP-LAST-GOOD
+# certifies the OLD row as GOOD because the keep-gate tests price, provider,
+# a non-blank Name and P/E coherence - none of which asks "is this even a
+# ticker?". The engine-side fetch-fail block (armed 08-23) never sees the row
+# because the poison is re-installed at the sync seam, not fetched.
+# CHANGE (two seams, DOWNGRADE-ONLY, no new cell allocation):
+#   (1) KLG Leg 0 (inside the existing TFB_SYNC_KLG_IDENTITY_GATE, default
+#       ON): an old row whose Symbol is outside the ticker domain
+#       (_klg_symbol_domain_ok: A-Z 0-9 . - = ^ & / only, no whitespace) is a
+#       suspect, never last-GOOD. Counted in the existing klg_suspect_dropped
+#       telemetry and NAMED on the [ID-FIREWALL] line - zero new plumbing.
+#   (2) FALSE-GREEN SCREEN on the FINAL matrix, immediately before the
+#       pre-write OHLC guard: a row that is INVEST / INVESTABLE while its
+#       Symbol fails the domain OR its Warnings carry fetch_failed is set to
+#       DO_NOT_INVEST / BLOCKED, Block Reason gains
+#       "sync_false_green:<reasons>", Warnings gains
+#       "false_green_blocked:v6.54.0". It NEVER upgrades and touches no
+#       other cell. One [FALSE-GREEN] line per page when anything is blocked.
+# GATE: TFB_SYNC_FALSE_GREEN_SCREEN, DEFAULT ON (protective, downgrade-only,
+# FW-3 precedent); =0/false/off/no restores v6.53.0 byte-identically for (2).
+# Functions added: 3 (_klg_symbol_domain_ok, _false_green_screen_enabled,
+# _apply_false_green_screen). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.53.0 (2026-08-31) - GRID CAPACITY REACHES THE WORKBOOK (P0-1 recurrence)
 # -----------------------------------------------------------------------------
@@ -3968,6 +4000,92 @@ def _klg_identity_gate_enabled() -> bool:
     21:07-21:23 stamps) violates it. TFB_SYNC_KLG_IDENTITY_GATE=0/false/
     off/no restores the v6.22.3 keep-test byte-identically."""
     return (os.getenv("TFB_SYNC_KLG_IDENTITY_GATE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+_KLG_SYMBOL_DOMAIN_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
+
+
+def _klg_symbol_domain_ok(t: Any) -> bool:
+    """v6.54.0 Leg 0 (PURE): a KEEP-LAST-GOOD candidate / a green row must be
+    a TICKER: upper-case letters, digits and the venue punctuation used by
+    the universe (. - = ^ & /), 1-24 chars, no whitespace. "COPPER FUTURES"
+    (a Name that landed in the Symbol cell on 2026-08-13) fails; every
+    symbol in the live 9,791-row universe passes (proved in the harness)."""
+    s = str(t or "").strip().upper()
+    if not s or any(ch.isspace() for ch in s):
+        return False
+    return bool(_KLG_SYMBOL_DOMAIN_RE.match(s))
+
+
+_FG_TAG = "[FALSE-GREEN v6.54.0]"
+_FG_INVEST_ALIASES = frozenset({
+    "investabilitystatus", "investability", "investable", "investstatus",
+})
+_FG_WARN_ALIASES = frozenset({"warnings", "warning", "flags", "rowwarnings"})
+_FG_FETCHFAIL_RE = re.compile(r"fetch_failed", re.IGNORECASE)
+
+
+def _false_green_screen_enabled() -> bool:
+    """v6.54.0 kill-switch. DEFAULT ON; TFB_SYNC_FALSE_GREEN_SCREEN=0/false/
+    off/no restores v6.53.0 byte-identically (matrix untouched)."""
+    return (os.getenv("TFB_SYNC_FALSE_GREEN_SCREEN") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _apply_false_green_screen(headers: list, rows_matrix: list,
+                              page: str) -> tuple:
+    """v6.54.0 DOWNGRADE-ONLY final-matrix screen. A row that is INVEST or
+    INVESTABLE while (a) its Symbol is outside the ticker domain or (b) its
+    Warnings carry fetch_failed becomes DO_NOT_INVEST / BLOCKED with a named
+    Block Reason and Warnings token. Never upgrades; no other cell touched.
+    Returns (rows_matrix, stats)."""
+    stats = {"checked": 0, "blocked": 0, "domain": 0, "fetchfail": 0,
+             "examples": []}
+    hdr = [str(h or "") for h in (headers or [])]
+    si = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    ai = _guard_find_col(hdr, _ACTION_COL_ALIASES)
+    ii = _guard_find_col(hdr, _FG_INVEST_ALIASES)
+    bi = _guard_find_col(hdr, _BLOCK_COL_ALIASES)
+    wi = _guard_find_col(hdr, _FG_WARN_ALIASES)
+    if si < 0 or (ai < 0 and ii < 0):
+        return rows_matrix, stats
+    for r in (rows_matrix or []):
+        if not isinstance(r, list) or si >= len(r) or _guard_is_blank(r[si]):
+            continue
+        stats["checked"] += 1
+        act = str(r[ai]).strip().upper() if 0 <= ai < len(r) else ""
+        inv = str(r[ii]).strip().upper() if 0 <= ii < len(r) else ""
+        if act != "INVEST" and inv != "INVESTABLE":
+            continue
+        reasons = []
+        if not _klg_symbol_domain_ok(r[si]):
+            reasons.append("identity_domain")
+        warn = str(r[wi]) if 0 <= wi < len(r) else ""
+        if _FG_FETCHFAIL_RE.search(warn):
+            reasons.append("fetch_failed")
+        if not reasons:
+            continue
+        need = max(ai, ii, bi, wi)
+        if need >= len(r):
+            r.extend([""] * (need + 1 - len(r)))
+        if ai >= 0:
+            r[ai] = "DO_NOT_INVEST"
+        if ii >= 0:
+            r[ii] = "BLOCKED"
+        if bi >= 0:
+            _prev = str(r[bi] or "").strip()
+            _tag = "sync_false_green:" + "+".join(reasons)
+            r[bi] = _tag if not _prev else f"{_prev}; {_tag}"
+        if wi >= 0:
+            _prev = str(r[wi] or "").strip()
+            _tok = "false_green_blocked:v6.54.0"
+            r[wi] = _tok if not _prev else f"{_prev}; {_tok}"
+        stats["blocked"] += 1
+        stats["domain"] += int("identity_domain" in reasons)
+        stats["fetchfail"] += int("fetch_failed" in reasons)
+        if len(stats["examples"]) < 20:
+            stats["examples"].append(str(r[si]).strip())
+    return rows_matrix, stats
 
 
 def _klg_old_row_identity_ok(
@@ -7155,6 +7273,9 @@ def _keep_last_good_rows(
         if t in _forced:                         # v6.29.0 B-4
             _LAST_KLG_FORCED.append(t)
             continue  # forced symbol: the old row may NEVER ride back in
+        if _klg_identity_gate_enabled() and not _klg_symbol_domain_ok(t):
+            _LAST_KLG_ID_SUSPECTS.append(t)      # v6.54.0 Leg 0
+            continue  # non-ticker identity ("COPPER FUTURES") is poison, never last-GOOD
         if not _klg_price_ok(row[old_px_i] if old_px_i < len(row) else ""):
             continue  # old row not good -> keep the fresh stub
         if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
@@ -10087,6 +10208,22 @@ async def _run_one_task(
                            _OHLC_LAKE_TAG, task.sheet_name, _lke)
         # ---------------------------------------------------------------------
 
+        # --- v6.54.0 FALSE-GREEN SCREEN (identity domain / fetch_failed) -----
+        # DOWNGRADE-ONLY: a non-ticker or fetch_failed row may never leave the
+        # sync as INVEST / INVESTABLE (CFX "Copper Futures", 08-13 -> 08-31).
+        if _false_green_screen_enabled():
+            try:
+                rows_matrix, _fg = _apply_false_green_screen(
+                    headers, rows_matrix, task.sheet_name)
+                if _fg.get("blocked"):
+                    _fgl = (f"{_FG_TAG} {task.sheet_name} | "
+                            f"checked={_fg['checked']} blocked={_fg['blocked']} "
+                            f"(domain={_fg['domain']} fetchfail={_fg['fetchfail']})"
+                            f" | ex: {', '.join(_fg['examples'][:8])}")
+                    logger.warning(_fgl)
+                    print("::warning::%s" % _fgl)
+            except Exception as _fge:
+                logger.warning("%s skipped: %s", _FG_TAG, _fge)
         # --- v6.38.0 (W1A-6) PRE-WRITE OHLC COHERENCE ------------------------
         # LAST checkpoint before the sheet: the engine-side Fix BC guard runs
         # at fetch and cannot see the assembly-layer Open leak (589 foreign
