@@ -1,0 +1,331 @@
+{
+  "version": "1.0.2",
+  "title": "export uploads",
+  "generated_riyadh": "2026-08-31T15:26:43.008367+03:00",
+  "provenance": {
+    "generator_version": "1.0.2",
+    "generator_sha256": "b76a0eec8978eb22f694180e54f164808591104a0214af1a72aebf0c02802f44",
+    "generator_commit_sha": null,
+    "workflow_run_id": null,
+    "source_mode": "export",
+    "snapshot_riyadh": "2026-08-31T15:26:43.024226+03:00",
+    "inputs": [
+      {
+        "tab": "Commodities_FX",
+        "file": "_Market_Share_Deepseek-V3_-_Commodities_FX.tsv",
+        "sha256": "a0d707892038f7610379f0c0a4e9d879fe407ad464768e490b15868872db6735",
+        "mtime_utc": "2026-08-31T05:54:17.490772+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_Commodities_FX.tsv"
+        ]
+      },
+      {
+        "tab": "Global_Markets",
+        "file": "_Market_Share_Deepseek-V3_-_Global_Markets.tsv",
+        "sha256": "02a7ecc0b87268c4d26621e0b00c5035386a8744186c154378648204b9484304",
+        "mtime_utc": "2026-08-31T05:54:43.560384+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_Global_Markets.tsv"
+        ]
+      },
+      {
+        "tab": "Market_Leaders",
+        "file": "_Market_Share_Deepseek-V3_-_Market_Leaders.tsv",
+        "sha256": "ae812ddcc0acacc2314b556152a5d286ede4b68ad549032ee2608131d3f3ca2e",
+        "mtime_utc": "2026-08-31T05:54:16.288448+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_Market_Leaders.tsv"
+        ]
+      },
+      {
+        "tab": "Mutual_Funds",
+        "file": "_Market_Share_Deepseek-V3_-_Mutual_Funds.tsv",
+        "sha256": "8a6f5047c8fe8ddec70fcff8566efdb2617fc6bcde06f6132ddf0946c6089121",
+        "mtime_utc": "2026-08-31T05:54:27.653394+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_Mutual_Funds.tsv"
+        ]
+      },
+      {
+        "tab": "My_Portfolio",
+        "file": "_Market_Share_Deepseek-V3_-_My_Portfolio.tsv",
+        "sha256": "6a6cfe96afbb66233bd5f102df331a7f8942465b57b2383c1f5801e4b9c28a37",
+        "mtime_utc": "2026-08-31T05:54:14.335499+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_My_Portfolio.tsv"
+        ]
+      },
+      {
+        "tab": "Portfolio_Decision",
+        "file": "_Market_Share_Deepseek-V3_-_Portfolio_Decision.tsv",
+        "sha256": "b5be8e169221e007665dda64916d8040eb92eb29a7dcca92e6260907f87379ea",
+        "mtime_utc": "2026-08-31T05:54:14.464193+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_Portfolio_Decision.tsv"
+        ]
+      },
+      {
+        "tab": "S1_Gate",
+        "file": "_Market_Share_Deepseek-V3_-_S1_Gate.tsv",
+        "sha256": "ce3f0839bd5b68551bb014522663d247ce079d02090b04abbe032425fa981a6f",
+        "mtime_utc": "2026-08-31T05:54:14.344176+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-_S1_Gate.tsv"
+        ]
+      },
+      {
+        "tab": "_Decision_Diagnostics",
+        "file": "_Market_Share_Deepseek-V3_-__Decision_Diagnostics.tsv",
+        "sha256": "ae4f378ce588143b1adc041932d39859d50ae0d8f8083aa4d05edd4eec7c92cf",
+        "mtime_utc": "2026-08-31T05:54:14.174048+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Decision_Diagnostics.tsv"
+        ]
+      },
+      {
+        "tab": "_Portfolio_CostBasis",
+        "file": "_Market_Share_Deepseek-V3_-__Portfolio_CostBasis.tsv",
+        "sha256": "12c2d8c0227af0a3ae5c0e9a9bb5d5dda5aa207b5a569f9371da01d980a3240f",
+        "mtime_utc": "2026-08-31T05:54:14.257979+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Portfolio_CostBasis.tsv"
+        ]
+      },
+      {
+        "tab": "_Run_Log",
+        "file": "_Market_Share_Deepseek-V3_-__Run_Log.tsv",
+        "sha256": "89a09cde3467cf8c0cceb8e81e70f37d2253e11cc4bbad091fe9fe251b4b3763",
+        "mtime_utc": "2026-08-31T05:54:51.461776+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Run_Log.tsv"
+        ]
+      },
+      {
+        "tab": "_Selection_Log",
+        "file": "_Market_Share_Deepseek-V3_-__Selection_Log.tsv",
+        "sha256": "6625bc6dd6b3539bbd251ab2a535bf71a139f9a51b227a7b72b250334addc2af",
+        "mtime_utc": "2026-08-31T05:54:20.763730+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Selection_Log.tsv"
+        ]
+      },
+      {
+        "tab": "_Status",
+        "file": "_Market_Share_Deepseek-V3_-__Status.tsv",
+        "sha256": "a01fbd23e3334f4e98e31834b76a029e58a3bb43a34df335a9cbd2aa4202f912",
+        "mtime_utc": "2026-08-31T05:54:14.417057+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Status.tsv"
+        ]
+      },
+      {
+        "tab": "_Sync_Control",
+        "file": "_Market_Share_Deepseek-V3_-__Sync_Control.tsv",
+        "sha256": "c34778dfeffff924558a2ded7c43bd543ef27c741e5b4b94f7713f2abe080d81",
+        "mtime_utc": "2026-08-31T05:54:14.458890+00:00",
+        "candidates": [
+          "_Market_Share_Deepseek-V3_-__Sync_Control.tsv"
+        ]
+      },
+      {
+        "tab": "*xlsx*",
+        "file": "_Market_Share_Deepseek-V3.xlsx",
+        "sha256": "b64716441362c63009888b338e8571dc0e23ebb58f3999cdf50452375b992814",
+        "mtime_utc": "2026-08-31T05:55:04.245371+00:00"
+      }
+    ]
+  },
+  "overall_verdict": "FAIL",
+  "fail_count": 13,
+  "tally": {
+    "PASS": 10,
+    "WARN": 2,
+    "FAIL": 13,
+    "NA": 1
+  },
+  "read_errors": [],
+  "checks": [
+    {
+      "id": "D10-1",
+      "criterion": "board fills (Top_10 Passed >= 5)",
+      "verdict": "FAIL",
+      "measured": 0.0,
+      "evidence": "Passed=0 Selected=0 / 10 | funding alerts:  | Last run 2026-08-31 08:47:17 | status: ok | sheets pool 9786 rows [Market_Leader"
+    },
+    {
+      "id": "D10-2a",
+      "criterion": "capacity key present (TFB Grid Capacity)",
+      "verdict": "FAIL",
+      "measured": null,
+      "evidence": "key absent from _Status L:M"
+    },
+    {
+      "id": "D10-2b",
+      "criterion": "evidence clock (newest backend _Run_Log row age h)",
+      "verdict": "FAIL",
+      "measured": 30.3,
+      "evidence": "2026-08-30T09:07:32+03:00"
+    },
+    {
+      "id": "D10-3a",
+      "criterion": "calibration key present (TFB Calibration)",
+      "verdict": "FAIL",
+      "measured": null,
+      "evidence": ""
+    },
+    {
+      "id": "D10-3b",
+      "criterion": "learning loop (overdue active cohorts)",
+      "verdict": "FAIL",
+      "measured": 4478,
+      "evidence": "records=38040 active=32543 matured=5471 duplicate_key=0 overdue_share=13.8%"
+    },
+    {
+      "id": "D10-4a",
+      "criterion": "decision feed key present",
+      "verdict": "PASS",
+      "measured": "NOT_ACTIONABLE(aged:GM)",
+      "evidence": "NOT_ACTIONABLE(aged:GM) | run=33358823331 | 2026-08-31 08:28:00+03:00 | ML:OK GM:AGED CFX:OK MF:OK"
+    },
+    {
+      "id": "D10-4c",
+      "criterion": "decision feed state (EXECUTABLE = actionable)",
+      "verdict": "WARN",
+      "measured": "NOT_ACTIONABLE(aged:GM)",
+      "evidence": "truthful non-actionable state — no investment/deployment permission"
+    },
+    {
+      "id": "D10-4b",
+      "criterion": "no SUCCESS-over-PARTIAL page stamp (status-truth armed)",
+      "verdict": "FAIL",
+      "measured": 3,
+      "evidence": "Global_Markets, Mutual_Funds, Commodities_FX"
+    },
+    {
+      "id": "G1-Market_Leaders",
+      "criterion": "Market_Leaders integrity (rows/dup/blank/fresh>=95%)",
+      "verdict": "PASS",
+      "measured": 255,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=255/255 (100.0%)"
+    },
+    {
+      "id": "D10-5-Market_Leaders",
+      "criterion": "Market_Leaders single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 100.0,
+      "evidence": "glyph_cells=255 open_outside_range=0"
+    },
+    {
+      "id": "G2-Market_Leaders",
+      "criterion": "Market_Leaders targets (Target Price nonblank within provider_target rows)",
+      "verdict": "FAIL",
+      "measured": 0,
+      "evidence": "provider_target=109 target_price_nonblank_in_cohort=0"
+    },
+    {
+      "id": "G3-Market_Leaders",
+      "criterion": "Market_Leaders false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Global_Markets",
+      "criterion": "Global_Markets integrity (rows/dup/blank/fresh>=95%)",
+      "verdict": "PASS",
+      "measured": 6609,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=6496/6609 (98.3%)"
+    },
+    {
+      "id": "D10-5-Global_Markets",
+      "criterion": "Global_Markets single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 38.1,
+      "evidence": "glyph_cells=2516 open_outside_range=443"
+    },
+    {
+      "id": "G2-Global_Markets",
+      "criterion": "Global_Markets targets (Target Price nonblank within provider_target rows)",
+      "verdict": "FAIL",
+      "measured": 0,
+      "evidence": "provider_target=764 target_price_nonblank_in_cohort=0"
+    },
+    {
+      "id": "G3-Global_Markets",
+      "criterion": "Global_Markets false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Commodities_FX",
+      "criterion": "Commodities_FX integrity (rows/dup/blank/fresh>=95%)",
+      "verdict": "PASS",
+      "measured": 453,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=451/453 (99.6%)"
+    },
+    {
+      "id": "D10-5-Commodities_FX",
+      "criterion": "Commodities_FX single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 86.5,
+      "evidence": "glyph_cells=392 open_outside_range=113"
+    },
+    {
+      "id": "G2-Commodities_FX",
+      "criterion": "Commodities_FX targets (Target Price nonblank within provider_target rows)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": "provider_target=0 target_price_nonblank_in_cohort=0"
+    },
+    {
+      "id": "G3-Commodities_FX",
+      "criterion": "Commodities_FX false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "FAIL",
+      "measured": 1,
+      "evidence": ""
+    },
+    {
+      "id": "G1-Mutual_Funds",
+      "criterion": "Mutual_Funds integrity (rows/dup/blank/fresh>=95%)",
+      "verdict": "PASS",
+      "measured": 2474,
+      "evidence": "dup_symbols=0 blank_symbols=0 fresh24h=2470/2474 (99.8%)"
+    },
+    {
+      "id": "D10-5-Mutual_Funds",
+      "criterion": "Mutual_Funds single writer (display-glyph share %)",
+      "verdict": "FAIL",
+      "measured": 54.3,
+      "evidence": "glyph_cells=1343 open_outside_range=72"
+    },
+    {
+      "id": "G2-Mutual_Funds",
+      "criterion": "Mutual_Funds targets (Target Price nonblank within provider_target rows)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": "provider_target=0 target_price_nonblank_in_cohort=0"
+    },
+    {
+      "id": "G3-Mutual_Funds",
+      "criterion": "Mutual_Funds false greens (INVEST with fetch_failed / non-ticker)",
+      "verdict": "PASS",
+      "measured": 0,
+      "evidence": ""
+    },
+    {
+      "id": "D10-7",
+      "criterion": "S-1 evidence clock (scored days /28)",
+      "verdict": "WARN",
+      "measured": 3,
+      "evidence": "verdict=NOT_DECIDABLE"
+    },
+    {
+      "id": "D10-6",
+      "criterion": "daily brief automated (digest.yml enabled)",
+      "verdict": "NA",
+      "measured": null,
+      "evidence": "workflow state is not in the workbook — verify in Actions"
+    }
+  ]
+}
