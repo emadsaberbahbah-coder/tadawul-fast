@@ -3324,7 +3324,7 @@ if str(ROOT_DIR) not in sys.path:
 #   guard work item. KILL SWITCH: TFB_DQ_COHERENCE_LEGACY=1 => v5.132.1
 #   byte-identical. Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-__version__ = "5.133.0"
+__version__ = "5.134.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -12418,6 +12418,24 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
         if plausible_target_survives:
             out["forecast_source"] = "provider_target"
+            # v5.134.0 (Fix AI, TARGET-PRICE COLUMN LIVE): this is the ONLY site
+            # that knows a plausible 12M analyst target survived the gate, yet it
+            # recorded only the tag. _apply_analyst_trend_block derives the
+            # published Target Price / Upside-Downside columns from
+            # target_mean_price, which the EODHD-primary path never carries
+            # (EODHD emits no target key; the Yahoo fallback's snake-case key is
+            # consumed by the alias mapping) - live 2026-08-31 export: 873
+            # provider_target rows, Target Price blank on 100.0% of 6,864 rows,
+            # so the Top_10 builder fell back to intrinsic value for EVERY
+            # candidate (penny-stock garbage ranked first, sane names failed
+            # ROI). Publish the RAW, plausibility-gated 12M target here, BEFORE
+            # the soft cap runs on forecast_price_12m, fill-only. Kill-switch
+            # TFB_TARGET_MEAN_PUBLISH=0/false/off restores v5.133.0 exactly.
+            if has_12m_target and _target_mean_publish_enabled() \
+                    and _as_float(out.get("target_mean_price")) is None:
+                _tgt12_raw = _as_float(out.get("forecast_price_12m"))
+                if _tgt12_raw is not None and _tgt12_raw > 0:
+                    out["target_mean_price"] = round(float(_tgt12_raw), 6)
 
     inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
     inferred_name = _infer_display_name_from_symbol(inferred_symbol)
@@ -12801,6 +12819,13 @@ def _apply_forecast_pair_coherence(row: Dict[str, Any]) -> None:
         touched = True
     if touched:
         _v573_append_warning(row, _FORECAST_PAIR_TAG)
+
+
+def _target_mean_publish_enabled() -> bool:
+    """v5.134.0 (Fix AI) kill-switch. Default ON; TFB_TARGET_MEAN_PUBLISH in
+    {0,false,off,no} restores the v5.133.0 tagging site byte-identically."""
+    return (os.getenv("TFB_TARGET_MEAN_PUBLISH") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
 
 
 def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
