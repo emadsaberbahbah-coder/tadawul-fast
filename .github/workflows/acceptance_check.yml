@@ -1,0 +1,67 @@
+# =============================================================================
+# 📏 TFB Acceptance (Day-10 definition of done, measured) — acceptance_check.yml
+# =============================================================================
+# WHY: "done" is a printed table of measurements, not an opinion. This runs
+# scripts/tfb_acceptance.py v1.0.0 READ-ONLY against the live workbook every
+# morning after the sync legs (and on demand), publishes the table to the job
+# summary and an artifact, and never writes a cell. Non-strict by design: an
+# instrument, not a blocker (add strict=true on dispatch to make FAIL red).
+# =============================================================================
+name: 📏 TFB Acceptance (measured)
+on:
+  schedule:
+    - cron: "45 6 * * *"   # 09:45 Riyadh — after the morning legs + Top_10
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: "Exit non-zero when any criterion FAILs"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      board_min:
+        description: "Board criterion: minimum qualified names"
+        type: string
+        default: "5"
+permissions:
+  contents: read
+concurrency:
+  group: tfb-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  acceptance:
+    name: 📏 Measure the definition of done
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet gspread google-auth openpyxl
+      - name: Offline selftest (no credentials)
+        run: python scripts/tfb_acceptance.py --selftest
+      - name: Measure the live workbook (read-only)
+        env:
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -o pipefail
+          ARGS=(--live --json artifacts/acceptance.json --board-min "${{ inputs.board_min || '5' }}")
+          if [ "${{ inputs.strict }}" = "true" ]; then ARGS+=(--strict); fi
+          python scripts/tfb_acceptance.py "${ARGS[@]}" | tee artifacts_console.txt
+      - name: Upload acceptance artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfb-acceptance-${{ github.run_id }}
+          path: |
+            artifacts/
+            artifacts_console.txt
+          if-no-files-found: warn
+          retention-days: 90
