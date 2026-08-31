@@ -1835,7 +1835,35 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.52.0"
+SCRIPT_VERSION = "6.53.0"
+# -----------------------------------------------------------------------------
+# v6.53.0 (2026-08-31) - GRID CAPACITY REACHES THE WORKBOOK (P0-1 recurrence)
+# -----------------------------------------------------------------------------
+# EVIDENCE (2026-08-31 morning export): both v6.52.0 runs (33339574567,
+# 33358823331) wrote every page and _Status stamp yet left ZERO _Run_Log rows;
+# the GAS auto-refresh logged nothing for 266 trigger fires (8/30 10:44 ->
+# 8/31 08:44) and shadow_board's 05:10Z PERF-VERDICT is absent - the exact
+# 2026-08-22 signature of the 10,000,000-cell allocation cap (INSERT_ROWS
+# appends fail HTTP 400 while in-place updates succeed and jobs stay green).
+# The only capacity instrument (google_sheets_service v6.2.0 [CAPACITY-SVC])
+# is a job-log INFO line nobody reads from the workbook, so the recurrence was
+# invisible for ~22 hours.
+# CHANGE (telemetry only; ONE bounded in-place L:M update, never append):
+#   (1) _capacity_allocated(): reads sheets[].gridProperties rowCount x
+#       columnCount (what Google's limit counts). Fail-open -> None.
+#   (2) _capacity_state()/_capacity_value(): PURE. OK < 85% <= NEAR-LIMIT
+#       < 99.5% <= AT-LIMIT; UNKNOWN when metadata is unreadable.
+#   (3) _write_upstream_verdict() upserts key "TFB Grid Capacity" =
+#       "<STATE> | allocated=N (p%) | free=F | run=<id> | <ts>" through the
+#       SAME self-checked _upsert closure as the TFB Feed keys - so the value
+#       lands even when the workbook is AT the cap (updates do not allocate).
+#       Non-OK states also print a ::warning:: annotation on the run page.
+# GATE: TFB_SYNC_CAPACITY_STATUS, DEFAULT ON (protective telemetry ships
+# armed, FW-3 precedent); =0/false/off/no restores v6.52.0 byte-identically.
+# Rides inside TFB_SYNC_UPSTREAM_VERDICT (already live - the TFB Feed keys
+# exist in _Status); when that master gate is OFF nothing here runs.
+# Functions added: 4. Removed: 0. Cell writes: 1 (L:M in-place).
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.52.0 (2026-08-30) - RB ATTRIBUTION: NAME THE ROWS, NOT JUST THE COUNT
 # -----------------------------------------------------------------------------
@@ -6801,6 +6829,63 @@ def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
     return verdict, " ".join(frags)
 
 
+_CAP_STATUS_KEY = "TFB Grid Capacity"          # v6.53.0
+_CAP_LIMIT = 10_000_000                        # Google Sheets allocation cap
+_CAP_NEAR_PCT = 85.0
+_CAP_AT_PCT = 99.5
+_CAP_TAG = "[CAPACITY-STATUS v6.53.0]"
+
+
+def _capacity_status_enabled() -> bool:
+    """v6.53.0 kill-switch. DEFAULT ON; TFB_SYNC_CAPACITY_STATUS=0/false/off/no
+    restores v6.52.0 byte-identically (no metadata read, no key write)."""
+    return (os.getenv("TFB_SYNC_CAPACITY_STATUS") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _capacity_allocated(svc: Any, spreadsheet_id: str) -> Optional[int]:
+    """v6.53.0: allocated cells = sum(rowCount * columnCount) over all sheets
+    (allocation, not content, is what the 10M limit counts). Fail-open."""
+    try:
+        meta = (svc.spreadsheets()
+                .get(spreadsheetId=spreadsheet_id,
+                     fields="sheets(properties(gridProperties("
+                            "rowCount,columnCount)))")
+                .execute())
+        total, seen = 0, False
+        for sh in (meta.get("sheets") if isinstance(meta, dict) else []) or []:
+            try:
+                gp = sh["properties"]["gridProperties"]
+                total += int(gp["rowCount"]) * int(gp["columnCount"])
+                seen = True
+            except Exception:
+                continue
+        return total if seen else None
+    except Exception:
+        return None
+
+
+def _capacity_state(alloc: Optional[int]) -> tuple:
+    """v6.53.0 PURE: (state, pct). UNKNOWN when alloc is None."""
+    if alloc is None:
+        return "UNKNOWN", None
+    pct = 100.0 * float(alloc) / float(_CAP_LIMIT)
+    if pct >= _CAP_AT_PCT:
+        return "AT-LIMIT", pct
+    if pct >= _CAP_NEAR_PCT:
+        return "NEAR-LIMIT", pct
+    return "OK", pct
+
+
+def _capacity_value(alloc: Optional[int], run_id: str, ts: str) -> str:
+    """v6.53.0 PURE: the _Status M-cell text for the TFB Grid Capacity key."""
+    state, pct = _capacity_state(alloc)
+    if pct is None:
+        return f"UNKNOWN | allocated=n/a | run={run_id} | {ts}"
+    return (f"{state} | allocated={int(alloc):,} ({pct:.2f}%) | "
+            f"free={max(0, _CAP_LIMIT - int(alloc)):,} | run={run_id} | {ts}")
+
+
 def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                             results: list) -> None:
     """v6.40.0 W1A-4a producer. Upsert this job's per-page keys, then the
@@ -6895,6 +6980,23 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                 f"{verdict} | run={run_id} | {ts} | {summary}")
         line = f"{_UPSTREAM_VERDICT_TAG} {verdict} | {summary}"
         (logger.info if verdict == "EXECUTABLE" else logger.warning)(line)
+        # v6.53.0: grid-capacity key - the same bounded in-place _upsert, so
+        # it lands even when the workbook is AT the allocation cap.
+        if _capacity_status_enabled():
+            try:
+                _alloc = _capacity_allocated(svc, spreadsheet_id)
+                _cap_val = _capacity_value(_alloc, run_id, ts)
+                _upsert(_CAP_STATUS_KEY, _cap_val)
+                _cst, _ = _capacity_state(_alloc)
+                _cline = f"{_CAP_TAG} {_cap_val}"
+                if _cst == "OK":
+                    logger.info(_cline)
+                else:
+                    logger.warning(_cline)
+                    print("::warning::%s" % _cline)
+            except Exception as _ce:
+                print("::warning::%s skipped — %s: %s"
+                      % (_CAP_TAG, type(_ce).__name__, _ce))
     except Exception as _e:
         print("::warning::%s write FAILED — %s: %s"
               % (_UPSTREAM_VERDICT_TAG, type(_e).__name__, _e))
