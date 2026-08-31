@@ -51,7 +51,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -151,7 +151,10 @@ class ExportSource(Source):
         for fn in os.listdir(export_dir):
             if fn.lower().endswith(".tsv") and "_-_" in fn:
                 tab = fn.rsplit("_-_", 1)[1][:-4]
-                self._files[tab] = os.path.join(export_dir, fn)
+                # v1.0.1: browser download counters never identify a file
+                # (project rule): "Global_Markets(6)" / "Global_Markets__6_" -> tab.
+                tab = re.sub(r"(\s*\(\d+\)|__\d+_)\s*$", "", tab).strip()
+                self._files.setdefault(tab, os.path.join(export_dir, fn))
         if not xlsx:
             for fn in os.listdir(export_dir):
                 if fn.lower().endswith(".xlsx"):
@@ -209,24 +212,68 @@ class LiveSource(Source):
             creds = service_account.Credentials.from_service_account_info(json.loads(s), scopes=scopes)
         return gspread.authorize(creds)
 
+    _PAGE_COLS = ("Symbol", "Open", "Day High", "Day Low", "Expected ROI 12M", "Forecast Source",
+                  "Target Price", "Investability Status", "Final Action", "Warnings", "Last Updated (UTC)")
+
+    @staticmethod
+    def _col_letter(n: int) -> str:
+        out = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            out = chr(65 + r) + out
+        return out
+
+    def _rng(self, ws, r0: int, r1: int, cols: int) -> str:
+        """v1.0.1: a range CLAMPED to the worksheet grid (values.get rejects a
+        range beyond the grid with 'exceeds grid limits')."""
+        rc = int(getattr(ws, "row_count", 0) or 0) or r1
+        cc = int(getattr(ws, "col_count", 0) or 0) or cols
+        r1 = max(r0, min(r1, rc))
+        return f"A{r0}:{self._col_letter(max(1, min(cols, cc)))}{r1}"
+
+    def _page_columns(self, ws) -> List[List[str]]:
+        """v1.0.1: read only the columns the checks need (header-driven), via
+        one batch_get — a 6,609 x 115 page is ~8 MB as a single values.get."""
+        hdr = (ws.get(self._rng(ws, 1, 1, 200)) or [[]])[0]
+        idx = {}
+        for i, h in enumerate(hdr):
+            if _s(h) in self._PAGE_COLS and _s(h) not in idx:
+                idx[_s(h)] = i + 1
+        if "Symbol" not in idx:
+            return []
+        rc = int(getattr(ws, "row_count", 0) or 0) or 2
+        names = [n for n in self._PAGE_COLS if n in idx]
+        ranges = [f"{self._col_letter(idx[n])}2:{self._col_letter(idx[n])}{rc}" for n in names]
+        blocks = ws.batch_get(ranges) or []
+        n_rows = max((len(b) for b in blocks), default=0)
+        rows: List[List[str]] = [list(names)]
+        for r in range(n_rows):
+            row = []
+            for b in blocks:
+                cell = b[r][0] if r < len(b) and b[r] else ""
+                row.append(_s(cell))
+            if any(row):
+                rows.append(row)
+        return rows
+
     def tab(self, name: str) -> List[List[str]]:
         if name in self._cache:
             return self._cache[name]
         try:
             ws = self.book.worksheet(name)
+            rc = int(getattr(ws, "row_count", 0) or 0)
             if name == "_Run_Log":
-                rc = int(getattr(ws, "row_count", 0) or 0)
-                lo = max(1, rc - 400)
-                rows = ws.get(f"A{lo}:J{rc}") or []
-            elif name in ("_Status",):
-                rows = ws.get("A1:M60") or []
+                rows = ws.get(self._rng(ws, max(1, rc - 400), rc, 10)) or []
+            elif name == "_Status":
+                rows = ws.get(self._rng(ws, 1, 60, 13)) or []
             elif name == "Top_10_Investments":
-                rows = ws.get("A1:L60") or []
+                rows = ws.get(self._rng(ws, 1, 60, 12)) or []
             elif name == "S1_Gate":
-                rows = ws.get("A1:D20") or []
+                rows = ws.get(self._rng(ws, 1, 20, 4)) or []
             elif name == "Performance_Log":
-                rc = int(getattr(ws, "row_count", 0) or 0)
-                rows = ws.get(f"A4:AF{max(4, rc)}") or []
+                rows = ws.get(self._rng(ws, 1, rc, 32)) or []
+            elif name in PAGES:
+                rows = self._page_columns(ws)
             else:
                 rows = ws.get_all_values() or []
         except Exception as exc:  # fail-open: the check reports NA
