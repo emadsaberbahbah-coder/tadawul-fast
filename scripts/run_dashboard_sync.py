@@ -1835,7 +1835,24 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.54.0"
+SCRIPT_VERSION = "6.55.0"
+# -----------------------------------------------------------------------------
+# v6.55.0 (2026-09-01) - F-11: A FAILED EVIDENCE APPEND FAILS THE JOB
+# -----------------------------------------------------------------------------
+# WHY: every _Run_Log append channel (ID-FIREWALL, OHLC pre-write/readback/
+# repair, SYNC-HOLD lifecycle) swallows a final failure as a ::warning:: and
+# the job stays green. That is exactly how the 10,000,000-cell freeze of
+# 2026-08-30 hid for 22 hours: pages written, stamps written, zero evidence,
+# job green. The capacity key (v6.53.0) now REPORTS the state; this makes the
+# run itself unable to report success when its evidence clock did not advance.
+# CHANGE: every append channel records its final failure (site tag) in
+# _RUNLOG_APPEND_FAILS; main() returns 3 with a named ::error:: AFTER the run
+# completed normally (return 0) - page writes are never affected, only the job
+# status, which the workflow already maps to "Sync script failed" (no recover
+# job fires: that job keys on missing pages, not on the exit code).
+# GATE: TFB_SYNC_APPEND_FAIL_IS_ERROR default ON; =0/false/off/no restores the
+# v6.54.0 exit code (warnings only). Functions added: 2. Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.54.0 (2026-08-31) - IDENTITY DOMAIN: A NON-TICKER CAN NEVER BE LAST-GOOD
 #                        OR LEAVE THE SYNC AS INVEST (audit P0 #3, CFX row 454)
@@ -5152,6 +5169,24 @@ def _idfw_selftest_() -> bool:
     return _IDFW_SELFTEST_OK
 
 
+_RUNLOG_APPEND_FAILS: List[str] = []   # v6.55.0: site tags of final append failures
+
+
+def _note_runlog_append_failure(site: str) -> None:
+    """v6.55.0: remember a FINAL _Run_Log append failure (after retries)."""
+    try:
+        _RUNLOG_APPEND_FAILS.append(str(site or "?"))
+    except Exception:
+        pass
+
+
+def _append_fail_is_error() -> bool:
+    """v6.55.0 kill-switch. DEFAULT ON; TFB_SYNC_APPEND_FAIL_IS_ERROR=0/false/
+    off/no restores the v6.54.0 exit code (warnings only)."""
+    return (os.getenv("TFB_SYNC_APPEND_FAIL_IS_ERROR") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
 def _idfw_runlog_enabled() -> bool:
     """v6.24.0 FW-3: append one [ID-FIREWALL] verdict line per market page
     to the workbook's _Run_Log. Default ON; TFB_SYNC_IDFW_RUNLOG=0 off."""
@@ -5228,6 +5263,7 @@ def _append_runlog_idfirewall(
     except Exception as _e:
         # v6.24.1 FW-3b: a tripwire's own failure must be LOUD — annotate
         # the run page so it can never fail invisibly again.
+        _note_runlog_append_failure("verdict")   # v6.55.0
         print("::warning::%s _Run_Log verdict append FAILED for %s — %s: %s"
               % (_IDFW_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
@@ -5334,6 +5370,7 @@ def _append_runlog_ohlc_prewrite(
             raise _last_err
     except Exception as _e:
         # Same FW-3b discipline: the tripwire's own failure must be LOUD.
+        _note_runlog_append_failure("verdict")   # v6.55.0
         print("::warning::%s _Run_Log verdict append FAILED for %s — %s: %s"
               % (_OHLC_PREWRITE_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log verdict skipped: %s",
@@ -5542,6 +5579,7 @@ def _append_runlog_ohlc_readback(
         if _last is not None:
             raise _last
     except Exception as _e:
+        _note_runlog_append_failure("line")   # v6.55.0
         print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
               % (_OHLC_READBACK_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log line skipped: %s", _OHLC_READBACK_TAG, _e)
@@ -5729,8 +5767,12 @@ def _append_runlog_sync_hold(sheets: Any, spreadsheet_id: str, level: str,
                 _runlog_meta_json(json.dumps({"version": SCRIPT_VERSION})),
             ]]},
         ).execute()
-    except Exception:
-        pass
+    except Exception as _e:
+        # v6.55.0: was fully silent — the hold lifecycle lines were part of the
+        # evidence that vanished on 2026-08-30. Still fail-open, now counted.
+        _note_runlog_append_failure("sync_hold")
+        print("::warning::%s _Run_Log append FAILED (sync_hold) — %s: %s"
+              % (_SYNC_HOLD_TAG, type(_e).__name__, _e))
 
 
 def _sync_hold_publish(sheets: Any, spreadsheet_id: str, page: str) -> None:
@@ -5967,6 +6009,9 @@ def _append_runlog_ohlc_repair(sheets: Any, spreadsheet_id: str, page: str,
                 time.sleep(1.0)
     except Exception as _e:
         logger.warning("%s run-log line skipped: %s", _OHLC_REPAIR_TAG, _e)
+        _note_runlog_append_failure("ohlc_repair")   # v6.55.0
+        print("::warning::%s _Run_Log append FAILED (ohlc_repair) — %s: %s"
+              % (_OHLC_REPAIR_TAG, type(_e).__name__, _e))
 
 
 def _ohlc_readback_repair(sheets: Any, spreadsheet_id: str, page: str,
@@ -6574,6 +6619,7 @@ def _append_runlog_ohlc_lake(sheets: Any, spreadsheet_id: str, page: str,
         if _last is not None:
             raise _last
     except Exception as _e:
+        _note_runlog_append_failure("line")   # v6.55.0
         print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
               % (_OHLC_LAKE_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log line skipped: %s", _OHLC_LAKE_TAG, _e)
@@ -6774,6 +6820,7 @@ def _append_runlog_ohlc_fillguard(sheets: Any, spreadsheet_id: str, page: str,
         if _last is not None:
             raise _last
     except Exception as _e:
+        _note_runlog_append_failure("line")   # v6.55.0
         print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
               % (_OHLC_FILLGUARD_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log line skipped: %s", _OHLC_FILLGUARD_TAG, _e)
@@ -8067,8 +8114,10 @@ def _append_runlog_manual_hold(sheets: Any, spreadsheet_id: str, msg: str) -> No
                 _runlog_meta_json(json.dumps({"version": SCRIPT_VERSION})),
             ]]},
         ).execute()
-    except Exception:
-        pass
+    except Exception as _e:
+        _note_runlog_append_failure("manual_hold")   # v6.55.0: was silent
+        print("::warning::[MANUAL-HOLD] _Run_Log append FAILED — %s: %s"
+              % (type(_e).__name__, _e))
 
 
 def _default_tasks() -> List[TaskSpec]:
@@ -10711,7 +10760,18 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
 def main() -> int:
     try:
-        return asyncio.run(main_async())
+        rc = asyncio.run(main_async())
+        # v6.55.0 (F-11): a normally-completed run whose evidence appends failed
+        # must not report success. Writes are done; only the exit code changes.
+        if rc == 0 and _RUNLOG_APPEND_FAILS and _append_fail_is_error():
+            _sites = ", ".join(sorted(set(_RUNLOG_APPEND_FAILS)))
+            print("::error::[EVIDENCE-CLOCK v%s] %d _Run_Log append(s) FAILED this run "
+                  "(sites: %s) — pages were written, but the evidence clock did not "
+                  "advance. Check TFB Grid Capacity in _Status. "
+                  "Kill-switch: TFB_SYNC_APPEND_FAIL_IS_ERROR=0"
+                  % (SCRIPT_VERSION, len(_RUNLOG_APPEND_FAILS), _sites))
+            return 3
+        return rc
     except KeyboardInterrupt:
         logger.warning("Interrupted.")
         return 130
