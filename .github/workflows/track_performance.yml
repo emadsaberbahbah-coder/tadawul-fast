@@ -78,7 +78,7 @@ jobs:
     name: 📈 Record · Audit · Calibrate
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: 📥 Checkout
