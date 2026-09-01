@@ -1,0 +1,308 @@
+{
+  "version": "1.0.0",
+  "title": "_Market_Share_Deepseek-V3.xlsx",
+  "n": 5401,
+  "results": [
+    {
+      "signal": "Entry Forecast Reliability",
+      "type": "numeric",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "50-70",
+          "n": 1969,
+          "win_pct": 61.6,
+          "mean_roi_pct": 1.34,
+          "median_roi_pct": 0.75
+        },
+        {
+          "group": "70-85",
+          "n": 1441,
+          "win_pct": 62.7,
+          "mean_roi_pct": 2.26,
+          "median_roi_pct": 1.58
+        },
+        {
+          "group": "<50",
+          "n": 1900,
+          "win_pct": 61.2,
+          "mean_roi_pct": 1.45,
+          "median_roi_pct": 0.85
+        },
+        {
+          "group": ">=85",
+          "n": 91,
+          "win_pct": 51.6,
+          "mean_roi_pct": 0.43,
+          "median_roi_pct": 0.18
+        }
+      ],
+      "raw_brier_as_probability": 0.2679,
+      "spearman_vs_roi": 0.038,
+      "cv_brier_group_calibrated": 0.237,
+      "win_spread_pp": 1.5,
+      "spread_z": 0.88,
+      "cv_gain_vs_base": -0.0005,
+      "verdict": "NONE"
+    },
+    {
+      "signal": "Entry Score",
+      "type": "numeric",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "Q1",
+          "n": 1077,
+          "win_pct": 58.5,
+          "mean_roi_pct": 1.25,
+          "median_roi_pct": 0.68
+        },
+        {
+          "group": "Q2",
+          "n": 1080,
+          "win_pct": 57.6,
+          "mean_roi_pct": 1.3,
+          "median_roi_pct": 0.38
+        },
+        {
+          "group": "Q3",
+          "n": 1079,
+          "win_pct": 64.3,
+          "mean_roi_pct": 1.81,
+          "median_roi_pct": 1.01
+        },
+        {
+          "group": "Q4",
+          "n": 1084,
+          "win_pct": 65.0,
+          "mean_roi_pct": 2.18,
+          "median_roi_pct": 1.41
+        },
+        {
+          "group": "Q5",
+          "n": 1081,
+          "win_pct": 62.5,
+          "mean_roi_pct": 1.5,
+          "median_roi_pct": 1.44
+        }
+      ],
+      "raw_brier_as_probability": 0.2417,
+      "spearman_vs_roi": 0.058,
+      "cv_brier_group_calibrated": 0.2361,
+      "win_spread_pp": 7.4,
+      "spread_z": 3.54,
+      "cv_gain_vs_base": 0.0004,
+      "verdict": "WEAK"
+    },
+    {
+      "signal": "Confidence",
+      "type": "categorical",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "MEDIUM",
+          "n": 4560,
+          "win_pct": 62.7,
+          "mean_roi_pct": 1.66,
+          "median_roi_pct": 0.95
+        },
+        {
+          "group": "HIGH",
+          "n": 452,
+          "win_pct": 53.3,
+          "mean_roi_pct": 1.02,
+          "median_roi_pct": 0.31
+        },
+        {
+          "group": "LOW",
+          "n": 389,
+          "win_pct": 58.6,
+          "mean_roi_pct": 1.67,
+          "median_roi_pct": 0.99
+        }
+      ],
+      "cv_brier_group_calibrated": 0.2361,
+      "win_spread_pp": 9.4,
+      "spread_z": 3.92,
+      "cv_gain_vs_base": 0.0004,
+      "verdict": "WEAK"
+    },
+    {
+      "signal": "Entry Investability",
+      "type": "categorical",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "WATCHLIST",
+          "n": 4948,
+          "win_pct": 61.8,
+          "mean_roi_pct": 1.62,
+          "median_roi_pct": 0.9
+        },
+        {
+          "group": "INVESTABLE",
+          "n": 421,
+          "win_pct": 59.1,
+          "mean_roi_pct": 1.14,
+          "median_roi_pct": 0.85
+        },
+        {
+          "group": "None",
+          "n": 28,
+          "win_pct": 67.9,
+          "mean_roi_pct": 6.82,
+          "median_roi_pct": 3.21
+        },
+        {
+          "group": "BLOCKED",
+          "n": 4,
+          "win_pct": 50.0,
+          "mean_roi_pct": 0.02,
+          "median_roi_pct": 0.06
+        }
+      ],
+      "cv_brier_group_calibrated": 0.237,
+      "win_spread_pp": 2.7,
+      "spread_z": 1.09,
+      "cv_gain_vs_base": -0.0005,
+      "verdict": "NONE"
+    },
+    {
+      "signal": "Entry Recommendation",
+      "type": "categorical",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "HOLD",
+          "n": 3828,
+          "win_pct": 60.5,
+          "mean_roi_pct": 1.31,
+          "median_roi_pct": 0.69
+        },
+        {
+          "group": "ACCUMULATE",
+          "n": 898,
+          "win_pct": 67.8,
+          "mean_roi_pct": 3.15,
+          "median_roi_pct": 2.32
+        },
+        {
+          "group": "BUY",
+          "n": 353,
+          "win_pct": 55.5,
+          "mean_roi_pct": 0.83,
+          "median_roi_pct": 0.62
+        },
+        {
+          "group": "SELL",
+          "n": 212,
+          "win_pct": 66.5,
+          "mean_roi_pct": 1.89,
+          "median_roi_pct": 1.47
+        },
+        {
+          "group": "REDUCE",
+          "n": 107,
+          "win_pct": 60.7,
+          "mean_roi_pct": 1.41,
+          "median_roi_pct": 1.79
+        },
+        {
+          "group": "AVOID",
+          "n": 2,
+          "win_pct": 50.0,
+          "mean_roi_pct": 0.38,
+          "median_roi_pct": 0.38
+        },
+        {
+          "group": "STRONG BUY",
+          "n": 1,
+          "win_pct": 0.0,
+          "mean_roi_pct": -6.72,
+          "median_roi_pct": -6.72
+        }
+      ],
+      "cv_brier_group_calibrated": 0.2364,
+      "win_spread_pp": 12.3,
+      "spread_z": 4.03,
+      "cv_gain_vs_base": 0.0001,
+      "verdict": "WEAK"
+    },
+    {
+      "signal": "Horizon",
+      "type": "categorical",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "1M",
+          "n": 2497,
+          "win_pct": 63.6,
+          "mean_roi_pct": 2.3,
+          "median_roi_pct": 1.67
+        },
+        {
+          "group": "2W",
+          "n": 1454,
+          "win_pct": 58.7,
+          "mean_roi_pct": 1.26,
+          "median_roi_pct": 0.67
+        },
+        {
+          "group": "1W",
+          "n": 1450,
+          "win_pct": 61.1,
+          "mean_roi_pct": 0.77,
+          "median_roi_pct": 0.52
+        }
+      ],
+      "cv_brier_group_calibrated": 0.2365,
+      "win_spread_pp": 4.9,
+      "spread_z": 3.05,
+      "cv_gain_vs_base": 0.0,
+      "verdict": "NONE"
+    },
+    {
+      "signal": "Origin Tab",
+      "type": "categorical",
+      "n": 5401,
+      "base_win_pct": 61.6,
+      "base_brier": 0.2365,
+      "groups": [
+        {
+          "group": "Top_10_Investments",
+          "n": 4413,
+          "win_pct": 61.6,
+          "mean_roi_pct": 1.67,
+          "median_roi_pct": 0.88
+        },
+        {
+          "group": "Decision_Coverage",
+          "n": 988,
+          "win_pct": 61.6,
+          "mean_roi_pct": 1.36,
+          "median_roi_pct": 1.07
+        }
+      ],
+      "cv_brier_group_calibrated": 0.2368,
+      "win_spread_pp": 0.0,
+      "spread_z": 0.0,
+      "cv_gain_vs_base": -0.0003,
+      "verdict": "NONE"
+    }
+  ],
+  "missing": [
+    "Entry Risk Bucket"
+  ]
+}
