@@ -1063,7 +1063,13 @@ jobs:
       # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
       # wall — empty secret keeps today's anonymous behavior exactly.
       - name: 📈 Track Performance (record + audit)
-        if: success()
+        # 2026-09-01 (duplicate-cohort ROOT CAUSE): this step ran in EVERY matrix
+        # leg, so each sync recorded the day's cohorts three times (plus the
+        # 14:00Z workflow and manual runs); overlapping trackers append and
+        # rewrite Performance_Log from different in-memory copies (23,799
+        # duplicate cohorts by 08-31; 3,981 new ones within hours of the drop).
+        # Exactly ONE leg records now: the last to finish (global-markets).
+        if: ${{ success() && matrix.group == 'global-markets' }}
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
