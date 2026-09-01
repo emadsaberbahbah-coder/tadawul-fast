@@ -157,6 +157,8 @@ jobs:
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           DEFAULT_SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          # 2026-09-01: one-shot opt-in (v6.38.0) — set the repo Variable to 1 for ONE run, then remove it
+          TRACK_DROP_DUPLICATE_ROWS: ${{ vars.TRACK_DROP_DUPLICATE_ROWS || '0' }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,
@@ -220,6 +222,7 @@ jobs:
             *_performance*.json
             *_signal_trends.json
             *_calibration.json
+            dropped_duplicates_*.csv
           retention-days: 14
           if-no-files-found: warn
 
