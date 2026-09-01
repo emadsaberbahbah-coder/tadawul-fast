@@ -1306,7 +1306,34 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.36.0"
+SCRIPT_VERSION = "6.37.0"
+# -----------------------------------------------------------------------------
+# v6.37.0 (2026-08-31 evening) - THE MATURATION BACKLOG MUST NOT STALL THE RUN
+# -----------------------------------------------------------------------------
+# EVIDENCE (run 33399867640, first v6.36.0 run after the capacity repair): log
+# reached "[SELFTEST] PASS 12/12" at 17:05:16 Riyadh, then printed nothing for
+# 18 minutes until the workflow's 25-minute kill. v6.35.0 handed the maturation
+# loop 4,478 overdue cohorts at once; every maturing record whose print ROI is
+# >= TRACK_CA_VERIFY_PCT (15) or carries a ledger action calls
+# _ca_adjusted_roi -> _yf_deep_history (a yfinance 1y pull) PER RECORD, with
+# no per-symbol cache and no budget - fine at 40-200 maturations/day, a stall
+# at 4,478. And an unverifiable record is EXPIRED as CORP_ACTION_SUSPECT, so a
+# budget must DEFER (keep ACTIVE, retry next run), never return None.
+# CHANGE:
+#   (1) per-run cache of adjusted bars per symbol (_CA_BARS_CACHE): one pull
+#       per symbol, not per record.
+#   (2) CA-verify budget: TRACK_CA_VERIFY_BUDGET (default 60 symbol pulls/run)
+#       and TRACK_CA_VERIFY_TIME_SEC (default 240 s). Once exhausted, a record
+#       that needs verification is left ACTIVE and counted ca_deferred - it
+#       matures on a later run (fresh-only maturation retries by design).
+#   (3) progress line every 1,000 records in the loop, so a slow phase is
+#       visible in the artifact log instead of an 18-minute silence.
+#   (4) [PERF-VERDICT] gains "ca_deferred N".
+# Kill-switch TRACK_CA_VERIFY_BUDGET=0 and TRACK_CA_VERIFY_TIME_SEC=0 =>
+# unlimited (v6.36.0 behaviour).
+# Functions added: 3 (_ca_verify_budget, _ca_verify_time_sec,
+# _ca_budget_state). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.36.0 (2026-08-31, 10-day program Day 4 #2) - CALIBRATION WRITE-BACK
 # -----------------------------------------------------------------------------
@@ -2596,17 +2623,62 @@ def _ca_decide(print_roi: float, adj_roi: Optional[float],
     return "ok", print_roi
 
 
+_CA_BARS_CACHE: Dict[str, Any] = {}          # v6.37.0: per-run symbol -> bars
+_CA_BUDGET: Dict[str, Any] = {"pulls": 0, "t0": 0.0, "deferred": 0}
+
+
+def _ca_verify_budget() -> int:
+    """v6.37.0: max distinct symbol pulls per run (0 = unlimited)."""
+    try:
+        return max(0, int(float(os.getenv("TRACK_CA_VERIFY_BUDGET") or "60")))
+    except Exception:
+        return 60
+
+
+def _ca_verify_time_sec() -> float:
+    """v6.37.0: wall-clock budget for CA verification pulls (0 = unlimited)."""
+    try:
+        return max(0.0, float(os.getenv("TRACK_CA_VERIFY_TIME_SEC") or "240"))
+    except Exception:
+        return 240.0
+
+
+def _ca_budget_state(symbol: str) -> str:
+    """v6.37.0: 'cached' (no pull needed), 'ok' (a pull is allowed) or
+    'exhausted' (defer this record; never expire it)."""
+    sym = _safe_str(symbol).upper()
+    if sym.endswith(".US"):
+        sym = sym[:-3]
+    if sym in _CA_BARS_CACHE:
+        return "cached"
+    b = _ca_verify_budget()
+    t = _ca_verify_time_sec()
+    if _CA_BUDGET["t0"] == 0.0:
+        _CA_BUDGET["t0"] = time.time()
+    if b and _CA_BUDGET["pulls"] >= b:
+        return "exhausted"
+    if t and (time.time() - _CA_BUDGET["t0"]) > t:
+        return "exhausted"
+    return "ok"
+
+
 def _ca_adjusted_roi(symbol: str, entry_date: Any) -> Optional[float]:
     """ROI% from the ADJUSTED close series between entry_date and the latest
     bar (deep-history pull, adjusted via v6.18.0 D). Start bar = nearest bar
-    within 7 days of entry_date. Fail-soft None on any doubt."""
+    within 7 days of entry_date. Fail-soft None on any doubt.
+    v6.37.0: bars are cached per symbol for the run (one pull per symbol)."""
     try:
         sym = _safe_str(symbol).upper()
         if not sym:
             return None
         if sym.endswith(".US"):
             sym = sym[:-3]  # yfinance wants bare US tickers
-        bars = _yf_deep_history(sym, period="1y")
+        if sym in _CA_BARS_CACHE:
+            bars = _CA_BARS_CACHE[sym]
+        else:
+            bars = _yf_deep_history(sym, period="1y")
+            _CA_BARS_CACHE[sym] = bars or []
+            _CA_BUDGET["pulls"] += 1
         if not bars:
             return None
         want = _safe_str(entry_date)[:10]
@@ -7302,8 +7374,16 @@ class PerformanceTrackerApp:
         _n_matured = 0
         _pending_syms: List[str] = []
         _expired_syms: List[str] = []
+        _CA_BARS_CACHE.clear()   # v6.37.0: per-run cache + budget reset
+        _CA_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
+        _loop_i = 0
 
         for r in active:
+            _loop_i += 1
+            if _loop_i % 1000 == 0:
+                logger.info("[MATURE v%s] progress %d/%d | matured=%d pending=%d ca_pulls=%d ca_deferred=%d",
+                            SCRIPT_VERSION, _loop_i, len(active), _n_matured,
+                            len(_pending_syms), _CA_BUDGET["pulls"], _CA_BUDGET["deferred"])
             px = float(price_map.get(r.symbol, 0.0))
             _fresh = px > 0.0
             if _fresh:
@@ -7345,6 +7425,14 @@ class PerformanceTrackerApp:
                         # v6.22.0: a CONFIRMED ledger action forces
                         # verification even below the 15pp heuristic (the
                         # sub-threshold hole: a 21:20 bonus prints -4.8%).
+                        # v6.37.0: budgeted verification - an exhausted budget
+                        # DEFERS the record (stays ACTIVE, retried next run);
+                        # it never manufactures a None that would expire it.
+                        if _ledger_roi is None and _ca_budget_state(r.symbol) == "exhausted":
+                            _CA_BUDGET["deferred"] += 1
+                            _pending_syms.append(r.symbol)
+                            r.last_updated = _utc_now()
+                            continue
                         _adj = (None if _ledger_roi is not None
                                 else _ca_adjusted_roi(r.symbol,
                                                       r.date_recorded))
@@ -7435,6 +7523,8 @@ class PerformanceTrackerApp:
                 "roi_nonzero": _roi_nz,
                 "fallback_filled": int(_LAST_FALLBACK_FILLED),
                 "matured": int(_n_matured),
+                "ca_deferred": int(_CA_BUDGET.get("deferred") or 0),   # v6.37.0
+                "ca_pulls": int(_CA_BUDGET.get("pulls") or 0),
                 "pending": len(_pending_syms),
                 "expired": len(_expired_syms),
             }
@@ -7464,7 +7554,7 @@ class PerformanceTrackerApp:
                 "[PERF-VERDICT v%s] priced %d/%d | roi_nonzero %d | "
                 "fallback_filled %d | junk_rejected %d | matured %d | "
                 "pending %d | expired %d | feed=%s | fb=%s | selftest=%s"
-                " | loaded %d/extent %d | dup_expired %d"
+                " | loaded %d/extent %d | dup_expired %d | ca_deferred %d"
                 % (
                     SCRIPT_VERSION,
                     int(st.get("priced") or 0),
@@ -7481,6 +7571,7 @@ class PerformanceTrackerApp:
                     int(_LAST_LOAD_STATS.get("loaded") or 0),   # v6.35.0
                     int(_LAST_LOAD_STATS.get("extent") or 0),
                     int(_LAST_LOAD_STATS.get("dup_expired") or 0),
+                    int(st.get("ca_deferred") or 0),   # v6.37.0
                 )
             )
             level = (
