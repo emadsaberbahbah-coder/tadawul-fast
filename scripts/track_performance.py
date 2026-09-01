@@ -1306,7 +1306,27 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.37.0"
+SCRIPT_VERSION = "6.38.0"
+# -----------------------------------------------------------------------------
+# v6.38.0 (2026-09-01) - DUPLICATE COHORTS LEAVE THE SHEET (capacity regrowth)
+# -----------------------------------------------------------------------------
+# EVIDENCE: acceptance 2026-09-01 09:34 — records=38,570, active=8,251,
+# duplicate_key=23,799. The duplicates are EXPIRED/DUPLICATE_KEY (v6.35.0),
+# excluded from every statistic, yet they still occupy ~23.8k rows x 32 cols
+# (~760k cells) of a workbook that re-hit the 10,000,000-cell cap twice in nine
+# days. Clearing values does NOT shrink allocation; only deleting rows does.
+# CHANGE (OPT-IN, default OFF — a physical row delete is a data operation):
+#   TRACK_DROP_DUPLICATE_ROWS=1: save_records (a) archives every EXPIRED /
+#   DUPLICATE_KEY record to dropped_duplicates_<ts>.csv (uploaded by the
+#   workflow artifact glob), (b) writes only the kept records, (c) deletes the
+#   now-empty rows between the new last data row and the loaded extent with
+#   Worksheet.delete_rows, so the grid allocation actually shrinks. Logged as
+#   "[DEDUP-DROP v6.38.0] dropped=N archived=<file> rows_deleted=a..b".
+#   Off (default): v6.37.0 byte-identical. One-shot in effect: once dropped,
+#   later runs find nothing to drop.
+# Functions added: 2 (_drop_duplicate_rows_enabled, _archive_dropped_records).
+# Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.37.0 (2026-08-31 evening) - THE MATURATION BACKLOG MUST NOT STALL THE RUN
 # -----------------------------------------------------------------------------
@@ -2833,6 +2853,29 @@ def _track_max_records_default() -> int:
         return max(1, int(float(os.getenv("TRACK_MAX_RECORDS") or "200000")))
     except Exception:
         return 200000
+
+
+def _drop_duplicate_rows_enabled() -> bool:
+    """v6.38.0 OPT-IN: TRACK_DROP_DUPLICATE_ROWS=1 physically removes
+    EXPIRED/DUPLICATE_KEY rows (archived first). Default OFF."""
+    return (os.getenv("TRACK_DROP_DUPLICATE_ROWS") or "0").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _archive_dropped_records(headers: List[str], rows: List[List[Any]]) -> str:
+    """v6.38.0: write the dropped rows to dropped_duplicates_<ts>.csv in the
+    working directory (the workflow uploads it). Returns the path or ''."""
+    try:
+        import csv as _csv
+        name = f"dropped_duplicates_{RiyadhTime.format(fmt='%Y%m%d_%H%M%S')}.csv"
+        with open(name, "w", encoding="utf-8", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(list(headers))
+            for r in rows:
+                w.writerow(["" if v is None else v for v in r])
+        return name
+    except Exception as exc:
+        logger.error("[DEDUP-DROP v6.38.0] archive write failed: %s", exc)
+        return ""
 
 
 def _dedup_keys_enabled() -> bool:
@@ -4408,6 +4451,26 @@ class PerformanceStore:
             return False
         end_col = len(self.HEADERS)
 
+        # v6.38.0: opt-in physical drop of duplicate cohorts (archived first).
+        _dropped: List[PerformanceRecord] = []
+        if _drop_duplicate_rows_enabled():
+            _kept: List[PerformanceRecord] = []
+            for r in records:
+                if (r.status == PerformanceStatus.EXPIRED
+                        and _safe_str(getattr(r, "outcome", "")) == "DUPLICATE_KEY"):
+                    _dropped.append(r)
+                else:
+                    _kept.append(r)
+            if _dropped:
+                _arch = _archive_dropped_records(self.HEADERS,
+                                                 [self._record_to_row(r) for r in _dropped])
+                if not _arch:
+                    logger.error("[DEDUP-DROP v6.38.0] archive FAILED — nothing dropped this run")
+                    _dropped = []
+                else:
+                    records = _kept
+                    self._dedup_drop_archive = _arch
+
         data: List[List[Any]] = [self._record_to_row(r) for r in records]
 
         def _save() -> None:
@@ -4431,6 +4494,15 @@ class PerformanceStore:
                     self.DATA_ROW0 + _off + len(_part) - 1
                 )
                 self.ws.update(values=_part, range_name=write_rng)  # type: ignore
+            # v6.38.0: shrink the allocation — delete the emptied tail rows.
+            if _dropped:
+                _first_free = self.DATA_ROW0 + len(data)
+                if _ext >= _first_free:
+                    self.ws.delete_rows(_first_free, _ext)  # type: ignore
+                    logger.info("[DEDUP-DROP v6.38.0] dropped=%d archived=%s rows_deleted=%d..%d",
+                                len(_dropped), getattr(self, "_dedup_drop_archive", ""),
+                                _first_free, _ext)
+                    self._loaded_extent = _first_free - 1
 
         try:
             self.backoff.execute_sync(_save)
