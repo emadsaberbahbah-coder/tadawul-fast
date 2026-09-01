@@ -1061,7 +1061,28 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.18.1"
+OPPORTUNITY_BUILDER_VERSION = "1.19.0"
+# -----------------------------------------------------------------------------
+# v1.19.0 (2026-09-01) - RELIABILITY FLOOR MODE (H-28 consequence, unarmed)
+# -----------------------------------------------------------------------------
+# EVIDENCE (H-28 backtest, 5,401 deduplicated decided cohorts, 2026-09-01):
+# stated Forecast Reliability carries no outcome information - win rate 61-63%
+# in every band below 85 (51.6% at 85-100, n=91), raw value as probability
+# Brier 0.268 (worse than a coin flip), every calibration scheme equals the
+# base rate out of sample, Spearman vs realized ROI 0.033. The Top-10 floor
+# "Min Reliability >= 70" therefore removes candidates (6 of 16 sane names on
+# 08-31) without changing their odds.
+# CHANGE (env-gated, DEFAULT = v1.18.1 behaviour; the operator decides):
+#   TFB_T10_REL_FLOOR_MODE = gate    (default) reliability floor excludes as before
+#                          = display reliability is shown, never excludes: the
+#                                    Reliability gate passes with the note
+#                                    "display-only (H-28)"; the first-pass
+#                                    eligibility filter ignores the floor too.
+#   In 'display' the L8 low-confidence cap (same score) is lifted as well.
+#   The DQ floor, the reliability-cluster gate (B4a/b) and every other gate are
+#   untouched: this only stops a non-separating score from gating.
+# Functions added: 1 (_env_rel_floor_mode). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.18.1 (2026-09-01) - ROTATION RULE READS THE HOLDINGS FIELDS THE GAS NOW SENDS
 # -----------------------------------------------------------------------------
@@ -2615,6 +2636,13 @@ def normalize_candidate(row, fx_rates, criteria):
 # §4.2 hard gates → verdict (truth table)
 # ---------------------------------------------------------------------------
 
+def _env_rel_floor_mode():
+    """v1.19.0: 'gate' (default, v1.18.1) or 'display' (H-28: the floor never
+    excludes). Anything else -> 'gate'."""
+    v = str(_env_str("TFB_T10_REL_FLOOR_MODE", "gate") or "gate").strip().lower()
+    return "display" if v == "display" else "gate"
+
+
 def _gate(name, passed, fail_class, current, required, note=None):
     return {"gate": name, "passed": bool(passed),
             "fail_class": None if passed else fail_class,
@@ -3187,7 +3215,11 @@ def evaluate_gates(cand, criteria, held_symbols=None):
 
     rel = cand["reliability"]
     min_rel = criteria["min_reliability"]
-    if rel is not None and rel >= min_rel:
+    if _env_rel_floor_mode() == "display":   # v1.19.0
+        g.append(_gate("Reliability", True, None, _round1(rel),
+                       ">= " + _fmt_num(min_rel),
+                       "display-only (H-28: floor does not separate outcomes)"))
+    elif rel is not None and rel >= min_rel:
         g.append(_gate("Reliability", True, None, _round1(rel),
                        ">= " + _fmt_num(min_rel)))
     elif rel is not None and rel >= min_rel - 15.0:
@@ -3436,7 +3468,11 @@ def derive_verdict(gates, reliability):
     has_non_critical = any(
         g["fail_class"] == FAIL_NON_CRITICAL for g in gates)
     verdict = VERDICT_WATCH if has_non_critical else VERDICT_INVEST
-    if verdict == VERDICT_INVEST and confidence_band(reliability) == CONF_LOW:
+    # v1.19.0: in display mode the confidence band (derived from the same
+    # non-separating score; H-28: HIGH-confidence cohorts win LESS than MEDIUM)
+    # no longer caps INVEST at WATCH either.
+    if (verdict == VERDICT_INVEST and confidence_band(reliability) == CONF_LOW
+            and _env_rel_floor_mode() != "display"):
         return VERDICT_WATCH
     return verdict
 
@@ -4410,6 +4446,8 @@ def _pregate_quality_order(rows, crit):
     f_floor = (crit.get("min_engine_roi_pct", 0.0)
                if crit.get("forecast_gate_enabled") else None)
     rel_floor = crit.get("min_reliability")
+    if _env_rel_floor_mode() == "display":   # v1.19.0: never pre-filters either
+        rel_floor = None
     keyed = []
     for i, raw in enumerate(rows):
         view = _row_lookup(raw if isinstance(raw, dict) else {})
