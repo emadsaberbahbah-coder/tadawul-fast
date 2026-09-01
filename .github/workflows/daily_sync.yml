@@ -349,6 +349,13 @@ jobs:
       TFB_SYNC_HOLD_POST_GRACE_SEC: ${{ vars.TFB_SYNC_HOLD_POST_GRACE_SEC || '45' }}
       TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
       TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
+      # 2026-09-01: flags the sync reads but this workflow never mapped — a repo
+      # Variable for any of them was silently inert (acceptance D10-4b stayed red
+      # after TFB_SYNC_STATUS_TRUTH=1 was set). Defaults mirror the code exactly.
+      TFB_SYNC_STATUS_TRUTH: ${{ vars.TFB_SYNC_STATUS_TRUTH || '0' }}
+      TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
+      TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
+      TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
       # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
@@ -1384,6 +1391,13 @@ jobs:
       TFB_SYNC_HOLD_POST_GRACE_SEC: ${{ vars.TFB_SYNC_HOLD_POST_GRACE_SEC || '45' }}
       TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
       TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
+      # 2026-09-01: flags the sync reads but this workflow never mapped — a repo
+      # Variable for any of them was silently inert (acceptance D10-4b stayed red
+      # after TFB_SYNC_STATUS_TRUTH=1 was set). Defaults mirror the code exactly.
+      TFB_SYNC_STATUS_TRUTH: ${{ vars.TFB_SYNC_STATUS_TRUTH || '0' }}
+      TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
+      TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
+      TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
       # ─────────────────────────────────────────────────────────────────────
 
       # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
