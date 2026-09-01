@@ -1061,7 +1061,19 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.18.0"
+OPPORTUNITY_BUILDER_VERSION = "1.18.1"
+# -----------------------------------------------------------------------------
+# v1.18.1 (2026-09-01) - ROTATION RULE READS THE HOLDINGS FIELDS THE GAS NOW SENDS
+# -----------------------------------------------------------------------------
+# 16_Decision_Top10.gs v1.11.0 adds market / buy_date / tp1_sar (and, when it
+# carries it, price_sar) to each holding in the request. Two ratified rotation
+# criteria that v1.18.0 could not evaluate become live, fail-open per field:
+#   - held >= TFB_OPP_ROTATION_MIN_HELD_DAYS calendar days (default 7 ~ 5
+#     trading days); a holding without buy_date is NOT excluded (unknown age).
+#   - not within TFB_OPP_ROTATION_TP1_PROXIMITY_PCT (default 3) below its TP1:
+#     needs BOTH tp1_sar and price_sar on the holding; otherwise not applied.
+# Functions added: 1 (_holding_rotation_eligible). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.18.0 (2026-08-31, 10-day program Day 3) - FUNDING-STATE LAYER: DISCOVERY IS
 #          INDEPENDENT OF CASH (operator principle ratified 2026-08-31)
@@ -3673,6 +3685,45 @@ def _holding_roi_map(audit_rows, holdings):
     return out
 
 
+def _env_rotation_min_held_days():
+    try:
+        v = float(_env_str("TFB_OPP_ROTATION_MIN_HELD_DAYS", "7") or 7)
+        return v if v >= 0 else 7.0
+    except (TypeError, ValueError):
+        return 7.0
+
+
+def _env_rotation_tp1_proximity_pct():
+    try:
+        v = float(_env_str("TFB_OPP_ROTATION_TP1_PROXIMITY_PCT", "3") or 3)
+        return v if v >= 0 else 3.0
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _holding_rotation_eligible(h, today=None):
+    """v1.18.1 PURE: (eligible, reason). Fail-open per field: a holding that
+    lacks buy_date / tp1_sar / price_sar is not excluded on that criterion."""
+    import datetime as _dt
+    today = today or _dt.date.today()
+    bd = h.get("buy_date")
+    if bd:
+        try:
+            d = _dt.date.fromisoformat(str(bd)[:10])
+            held = (today - d).days
+            if held < _env_rotation_min_held_days():
+                return False, f"held {held}d < {_env_rotation_min_held_days():g}d"
+        except Exception:
+            pass
+    tp1 = _to_float(h.get("tp1_sar"))
+    px = _to_float(h.get("price_sar"))
+    if tp1 and px and tp1 > 0 and px > 0:
+        gap_pct = (tp1 - px) / tp1 * 100.0
+        if 0 <= gap_pct <= _env_rotation_tp1_proximity_pct():
+            return False, f"within {gap_pct:.1f}% of TP1"
+    return True, ""
+
+
 def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
     """v1.18.0 PURE: the held equity with the LOWEST engine forecast that is
     worse than the opportunity by >= edge_pp after round-trip cost; None when
@@ -3684,6 +3735,8 @@ def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
     for h in (holdings or []):
         s = str(h.get("symbol") or "").strip().upper()
         if not s or s in exclude or (h.get("value_sar") or 0) <= 0:
+            continue
+        if not _holding_rotation_eligible(h)[0]:   # v1.18.1
             continue
         r = hold_roi.get(s)
         if r is None:
