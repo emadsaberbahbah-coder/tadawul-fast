@@ -53,7 +53,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -369,6 +369,13 @@ def _top10(src: Source) -> Dict[str, Any]:
                     break
                 kinds.append((rr[0], rr[1] if len(rr) > 1 else ""))
             out["alerts"] = kinds
+        if r[0].upper().startswith("DATA GAPS"):   # v1.0.3: first-fail distribution
+            gates = []
+            for rr in rows[i + 2:]:
+                if not rr or not rr[0]:
+                    break
+                gates.append(f"{rr[0]}={rr[1] if len(rr) > 1 else ''}")
+            out["gates"] = gates
     return out
 
 
@@ -381,8 +388,10 @@ def check_board(src: Source, board_min: int) -> List[Check]:
     if not k:
         return [Check("D10-1", "board fills (Top_10 Passed >= %d)" % board_min, "NA", None, "Top_10 tab unreadable")]
     v = "PASS" if (passed or 0) >= board_min else ("WARN" if (passed or 0) > 0 else "FAIL")
-    ev = f"Passed={passed:g} Selected={sel} | funding alerts: " + ", ".join(
-        f"{a}={c}" for a, c in alerts.items() if a in ("rotation_proposal", "capital_call", "unfunded_candidates")) or "none"
+    ev = f"Passed={passed:g} Selected={sel} | funding alerts: " + (", ".join(
+        f"{a}={c}" for a, c in alerts.items() if a in ("rotation_proposal", "capital_call", "unfunded_candidates")) or "none")
+    if t.get("gates"):
+        ev += " | first-fail: " + ", ".join(t["gates"][:4])
     return [Check("D10-1", "board fills (Top_10 Passed >= %d)" % board_min, v, passed, ev + f" | {t.get('last_run', '')[:80]}")]
 
 
@@ -462,9 +471,22 @@ def check_feed_truth(src: Source) -> List[Check]:
     return out
 
 
+def _stamp_guard(src: Source) -> Dict[str, Dict[str, Any]]:
+    """v1.0.3: per page, the sync stamp's guard counters 'guard=pw:x/n,rb:y/n'."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for st in _status_stamps(src):
+        page = _s(st.get("Page"))
+        m = re.search(r"guard=pw:(\d+)/(\d+),rb:(\d+)/(\d+)", _s(st.get("Message")))
+        if page in PAGES and m:
+            out[page] = {"pw": int(m.group(1)), "pw_n": int(m.group(2)), "rb": int(m.group(3)), "rb_n": int(m.group(4)),
+                         "stamp": _s(st.get("Last Updated"))}
+    return out
+
+
 def check_pages(src: Source) -> List[Check]:
     out = []
     now = _now_riyadh()
+    guard = _stamp_guard(src)
     for p in PAGES:
         rows = _table(src.tab(p))
         n = len(rows)
@@ -498,8 +520,19 @@ def check_pages(src: Source) -> List[Check]:
         out.append(Check(f"G1-{p}", f"{p} integrity (rows/dup/blank/fresh>=95%)", "PASS" if g1_ok else "FAIL",
                          n, f"dup_symbols={dup} blank_symbols={blank} fresh24h={fresh}/{n} ({fresh_share:.1f}%)"))
         gs = glyph / n * 100.0
-        out.append(Check(f"D10-5-{p}", f"{p} single writer (display-glyph share %)", "PASS" if glyph == 0 else ("WARN" if gs <= 5 else "FAIL"),
-                         round(gs, 1), f"glyph_cells={glyph} open_outside_range={oor}"))
+        g = guard.get(p)
+        if g and g["rb_n"] > 0:
+            rb_share = g["rb"] / g["rb_n"] * 100.0
+            out.append(Check(f"D10-5-{p}", f"{p} single writer (sync readback divergence rows)",
+                             "PASS" if g["rb"] == 0 else ("WARN" if rb_share <= 1.0 else "FAIL"), g["rb"],
+                             f"rb={g['rb']}/{g['rb_n']} ({rb_share:.1f}%) pw={g['pw']}/{g['pw_n']} stamp={g['stamp'][:19]}"))
+        else:
+            out.append(Check(f"D10-5-{p}", f"{p} single writer (sync readback divergence rows)", "NA", None,
+                             "no guard counters on the page stamp"))
+        # v1.0.3: display glyphs are a GAS number FORMAT (exports render display text; the pool is
+        # read UNFORMATTED) — informational, never a writer verdict.
+        out.append(Check(f"G4-{p}", f"{p} display number-format share % (info)", "WARN" if glyph else "PASS",
+                         round(gs, 1), f"glyph_cells={glyph} open_outside_range={oor} (layout format, not a writer)"))
         out.append(Check(f"G2-{p}", f"{p} targets (Target Price nonblank within provider_target rows)", "PASS" if (pt == 0 or tp >= 0.8 * pt) else "FAIL",
                          tp, f"provider_target={pt} target_price_nonblank_in_cohort={tp}"))
         out.append(Check(f"G3-{p}", f"{p} false greens (INVEST with fetch_failed / non-ticker)", "PASS" if fg == 0 else "FAIL", fg, ""))
@@ -567,11 +600,12 @@ def _selftest() -> int:
     bad = [hdr, ["Copper Futures", "Commodity", "6.49", "6.4955", "6.728", "\u25b2 31.90%", "provider_target", "", "INVESTABLE", "INVEST", "fetch_failed:HTTP 422", now],
            ["AAPL", "Apple", "10", "11", "9", "0.2", "provider_target", "", "WATCHLIST", "WATCH", "", now]]
     status_ok = [["Page", "Last Updated", "Status", "Message", "", "", "", "", "", "", "", "Global Key", "Value"],
-                 ["Global_Markets", now, "PARTIAL", "data=PARTIAL", "", "", "", "", "", "", "", "TFB Decision Feed", "NOT_ACTIONABLE(partial:GM) | run=1"],
+                 ["Global_Markets", now, "PARTIAL", "data=PARTIAL guard=pw:0/2,rb:0/2", "", "", "", "", "", "", "", "TFB Decision Feed", "NOT_ACTIONABLE(partial:GM) | run=1"],
+                 ["Market_Leaders", now, "SUCCESS", "data=COMPLETE guard=pw:0/2,rb:1/2", "", "", "", "", "", "", "", "", ""],
                  ["", "", "", "", "", "", "", "", "", "", "", "TFB Grid Capacity", "OK | allocated=5,000,000 (50.00%) | free=5,000,000"],
                  ["", "", "", "", "", "", "", "", "", "", "", "TFB Calibration", "INVESTABLE:0.814 | n=INVESTABLE=421"]]
     status_bad = [["Page", "Last Updated", "Status", "Message", "", "", "", "", "", "", "", "Global Key", "Value"],
-                  ["Global_Markets", now, "SUCCESS", "data=PARTIAL", "", "", "", "", "", "", "", "Backend URL", "x"]]
+                  ["Global_Markets", now, "SUCCESS", "data=PARTIAL guard=pw:0/2,rb:2/2", "", "", "", "", "", "", "", "Backend URL", "x"]]
     top10 = [["Status:", "Last run x | status: ok"], ["Deployable (SAR)", "Exp", "Selected", "Rel", "RR", "Scanned", "Passed", "Unalloc"],
              ["3218", "0", "2 / 10", "", "", "9786", "6", "0"], [], ["ALERTS (1)"], ["Type", "Count", "Action"], ["capital_call", "2", "x"], []]
     perf = [["x"], ["x"], ["x"], ["Record ID", "Key", "Symbol", "Horizon", "Date Recorded (Riyadh)", "Target Date (Riyadh)", "Status", "Outcome"],
@@ -586,7 +620,9 @@ def _selftest() -> int:
     assert ca["D10-2a"].verdict == "PASS" and ca["D10-2b"].verdict == "PASS"
     assert ca["D10-3a"].verdict == "PASS" and ca["D10-3b"].verdict == "PASS" and ca["D10-3b"].measured == 0
     assert ca["D10-4a"].verdict == "PASS" and ca["D10-4b"].verdict == "PASS"
-    assert all(ca[f"G3-{p}"].verdict == "PASS" for p in PAGES) and all(ca[f"D10-5-{p}"].verdict == "PASS" for p in PAGES)
+    assert all(ca[f"G3-{p}"].verdict == "PASS" for p in PAGES)
+    assert ca["D10-5-Global_Markets"].verdict == "PASS" and ca["D10-5-Market_Leaders"].verdict == "FAIL" and ca["D10-5-Market_Leaders"].measured == 1
+    assert ca["D10-5-Commodities_FX"].verdict == "NA" and ca["G4-Global_Markets"].verdict == "PASS"
     assert ca["D10-7"].verdict == "WARN" and ca["D10-7"].measured == 3
     B = _MemSource({"Market_Leaders": bad, "Global_Markets": bad, "Commodities_FX": bad, "Mutual_Funds": bad,
                     "_Status": status_bad, "Top_10_Investments": [], "Performance_Log": [], "_Run_Log": [], "S1_Gate": []})
@@ -594,7 +630,7 @@ def _selftest() -> int:
     assert cb["D10-1"].verdict == "NA" and cb["D10-2a"].verdict == "FAIL" and cb["D10-2b"].verdict == "FAIL"
     assert cb["D10-3a"].verdict == "FAIL" and cb["D10-4a"].verdict == "FAIL" and cb["D10-4b"].verdict == "FAIL" and cb["D10-4b"].measured == 1
     assert cb["G3-Global_Markets"].verdict == "FAIL" and cb["G3-Global_Markets"].measured == 1
-    assert cb["D10-5-Global_Markets"].verdict == "FAIL" and cb["G2-Global_Markets"].verdict == "FAIL"
+    assert cb["D10-5-Global_Markets"].verdict == "FAIL" and cb["D10-5-Global_Markets"].measured == 2 and cb["G4-Global_Markets"].verdict == "WARN" and cb["G2-Global_Markets"].verdict == "FAIL"
     assert cb["G1-Global_Markets"].verdict == "PASS"  # two distinct symbols, none blank
     # v1.0.2 fixtures (review P1/P2): stale page -> G1 FAIL even with unique symbols
     stale = [hdr, ["AAPL", "Apple", "10", "11", "9", "0.2", "provider_target", "12", "INVESTABLE", "INVEST", "", "2026-01-01T00:00:00+00:00"]]
