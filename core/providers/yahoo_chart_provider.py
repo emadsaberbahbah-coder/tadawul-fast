@@ -664,7 +664,25 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.13.0"
+PROVIDER_VERSION = "8.14.0"
+# -----------------------------------------------------------------------------
+# v8.14.0 (2026-09-01) - OPEN HEALED FROM THE SESSION CANDLE, COHERENCE-GUARDED
+# -----------------------------------------------------------------------------
+# EVIDENCE (Market_Leaders, every sync since at least 2026-08-26): Open blank on
+# 255/255 rows (yahoo_chart 250, history 5) while High/Low/Price are 100%
+# populated. v8.12.0 healed day_high/day_low from the latest candle when the
+# .SR `info` omits the day range - Open was never given the same heal, so the
+# candlestick layer is impossible on KSA names and the sync's fill guard has
+# nothing to protect there (null Open -> null-skip inheritance on write).
+# CHANGE: _apply_open_fallback(): when info yields no open, take the latest
+# candle's open ONLY IF it is coherent with the day range (day_low <= open <=
+# day_high when both known) - a yesterday's-bar open that falls outside today's
+# range is rejected, never written (that is the stale-Open contamination the
+# 2026-09-01 readback forensics named). Provenance "open_source" =
+# "history_last_candle". A provider-supplied open is never overridden.
+# Kill-switch TFB_YC_OPEN_FALLBACK=0/false/off/no => v8.13.0 byte-identical.
+# Functions added: 2 (_yc_open_fallback_enabled, _apply_open_fallback).
+# -----------------------------------------------------------------------------
 # =============================================================================
 # v8.13.0 (2026-08-03) — P1-6 CANDLE-TRUE 52W RANGE + PROVENANCE (audit)
 # v8.12.0 derived 52w from CLOSES, understating highs / overstating lows when
@@ -1478,6 +1496,42 @@ def _first_number(*values: Any) -> Optional[float]:
         if f is not None:
             return f
     return None
+
+def _yc_open_fallback_enabled() -> bool:
+    """v8.14.0: default ON. TFB_YC_OPEN_FALLBACK=0/false/off/no restores
+    v8.13.0 (Open only from provider info)."""
+    return (os.getenv("TFB_YC_OPEN_FALLBACK") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _apply_open_fallback(
+    open_price: Optional[float],
+    day_high: Optional[float],
+    day_low: Optional[float],
+    history: Any,
+    provenance: Optional[dict] = None,
+) -> Optional[float]:
+    """v8.14.0: heal a MISSING open from the latest candle, coherence-guarded.
+    Never overrides a provider open; never returns an open outside the known
+    day range; fail-safe returns the input unchanged."""
+    try:
+        if open_price is not None:
+            return open_price
+        if not _yc_open_fallback_enabled() or not history:
+            return open_price
+        last = history[-1] if isinstance(history[-1], dict) else {}
+        cand = _first_number(last.get("open"))
+        if cand is None or cand <= 0:
+            return open_price
+        if day_high is not None and day_high > 0 and cand > day_high * 1.000001:
+            return open_price
+        if day_low is not None and day_low > 0 and cand < day_low * 0.999999:
+            return open_price
+        if provenance is not None:
+            provenance["open_source"] = "history_last_candle"
+        return cand
+    except Exception:
+        return open_price
+
 
 def _yc_range_fallbacks_enabled() -> bool:
     """v8.12.0: default ON. TFB_YC_RANGE_FALLBACKS=0/false/off/no restores
@@ -2512,6 +2566,10 @@ def _enrich_data(
     # v8.12.0: .SR meta omits day range — heal from the latest candle.
     day_high, day_low, _, _ = _apply_range_fallbacks(
         day_high, day_low, 1.0, 1.0, history, provenance=_range_prov)
+    # v8.14.0: .SR info omits open too — heal it, coherence-guarded by the
+    # (possibly healed) day range so a stale open can never be published.
+    open_price = _apply_open_fallback(open_price, day_high, day_low, history,
+                                      provenance=_range_prov)
 
     # Data quality
     if price and history:
