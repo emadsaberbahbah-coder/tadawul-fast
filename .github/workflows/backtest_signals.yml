@@ -1,0 +1,69 @@
+# =============================================================================
+# 🔬 TFB Signal Backtest (hypothesis registry) — backtest_signals.yml
+# =============================================================================
+# WHY: the Strategy requires "register → backtest → then change a gate". This
+# runs scripts/tfb_backtest.py READ-ONLY against the live Performance_Log every
+# Friday morning (and on demand) so the Friday idea cadence starts from numbers:
+# all default signals, plus board-origin cohorts, plus a since-window for
+# out-of-sample reads. Never writes a cell.
+# =============================================================================
+name: 🔬 TFB Signal Backtest
+on:
+  schedule:
+    - cron: "0 5 * * 5"   # Fridays 08:00 Riyadh
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Date Recorded >= YYYY-MM-DD (blank = all)"
+        type: string
+        default: ""
+      filter:
+        description: "COL=VALUE exact match (blank = none), e.g. Origin Tab=Top_10_Investments"
+        type: string
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: tfb-backtest-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  backtest:
+    name: 🔬 Backtest signals on the live log
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet gspread google-auth openpyxl
+      - name: Offline selftest
+        run: python scripts/tfb_backtest.py --selftest
+      - name: Backtest (all signals, all cohorts)
+        env:
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          python scripts/tfb_backtest.py --live --all-signals --edges 50,70,85 --json artifacts/backtest_all.json | tee -a artifacts/console.txt
+          python scripts/tfb_backtest.py --live --all-signals --edges 50,70,85 --filter "Origin Tab=Top_10_Investments" --json artifacts/backtest_board.json | tee -a artifacts/console.txt
+          ARGS=(--live --all-signals --edges 50,70,85 --json artifacts/backtest_window.json)
+          if [ -n "${{ inputs.since }}" ]; then ARGS+=(--since "${{ inputs.since }}"); fi
+          if [ -n "${{ inputs.filter }}" ]; then ARGS+=(--filter "${{ inputs.filter }}"); fi
+          python scripts/tfb_backtest.py "${ARGS[@]}" | tee -a artifacts/console.txt
+          { echo '```'; cat artifacts/console.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload backtest artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfb-backtest-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 90
