@@ -28,6 +28,8 @@ USAGE
   python scripts/tfb_backtest.py --export-dir DIR --all-signals      # every Entry*/Horizon/Origin column
   python scripts/tfb_backtest.py --selftest
 Options: --edges "50,70,85" (numeric bands) --min-n 100 --json out.json --horizon 1W,2W,1M
+         --filter "Origin Tab=Top_10_Investments" (repeatable, exact match)   [v1.1.0]
+         --since 2026-08-01 / --until 2026-08-31  (Date Recorded window)       [v1.1.0]
 READ-ONLY. No writes, ever.
 """
 from __future__ import annotations
@@ -43,7 +45,7 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
                    "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
 
@@ -110,18 +112,29 @@ def load_records(rows: List[List[str]]) -> Tuple[List[str], List[Dict[str, str]]
     return hdr, out
 
 
-def decided_cohorts(records: List[Dict[str, str]], horizons: Optional[List[str]] = None) -> List[Dict[str, str]]:
-    """Matured WIN/LOSS, one record per Key (first occurrence), optional horizon filter."""
+def decided_cohorts(records: List[Dict[str, str]], horizons: Optional[List[str]] = None,
+                    filters: Optional[Dict[str, str]] = None, since: str = "", until: str = "") -> List[Dict[str, str]]:
+    """Matured WIN/LOSS, one record per Key (first occurrence); optional horizon,
+    exact-match column filters and a Date Recorded window (v1.1.0)."""
     seen, out = set(), []
     for r in records:
         if _s(r.get("Status")).lower() != "matured" or _s(r.get("Outcome")) not in ("WIN", "LOSS"):
             continue
-        if horizons and _s(r.get("Horizon")) not in horizons:
-            continue
+        # dedup FIRST: the canonical cohort for a Key is its first occurrence,
+        # whatever window or filter is applied afterwards (v1.1.0 fix).
         k = _s(r.get("Key"))
         if k in seen:
             continue
         seen.add(k)
+        if horizons and _s(r.get("Horizon")) not in horizons:
+            continue
+        if filters and any(_s(r.get(k2)) != v for k2, v in filters.items()):
+            continue
+        d = _s(r.get("Date Recorded (Riyadh)"))[:10]
+        if since and d and d < since:
+            continue
+        if until and d and d > until:
+            continue
         if _f(r.get("Realized ROI %")) is None:
             continue
         out.append(r)
@@ -272,6 +285,12 @@ def _selftest() -> int:
     recs.append(dict(recs[0], Key="K0"))        # duplicate key must be dropped
     coh = decided_cohorts(recs)
     assert len(coh) == 3000, len(coh)
+    assert len(decided_cohorts(recs, filters={"Cat": "A"})) == sum(1 for r in recs[:3000] if r["Cat"] == "A")
+    for r in recs[:1500]:
+        r["Date Recorded (Riyadh)"] = "2026-07-15 09:00:00"
+    for r in recs[1500:]:
+        r["Date Recorded (Riyadh)"] = "2026-08-20 09:00:00"
+    assert len(decided_cohorts(recs, since="2026-08-01")) == 1500 and len(decided_cohorts(recs, until="2026-07-31")) == 1500
     good = evaluate_signal(coh, "Good", edges=[50, 70, 85]); noise = evaluate_signal(coh, "Noise")
     cat = evaluate_signal(coh, "Cat")
     assert good["verdict"] == "SEPARATES" and good["win_spread_pp"] >= 20, good
@@ -279,7 +298,7 @@ def _selftest() -> int:
     assert cat["verdict"] == "SEPARATES" and cat["type"] == "categorical", cat
     assert good["raw_brier_as_probability"] < noise["raw_brier_as_probability"]
     print(render([good, noise, cat], "selftest"))
-    print("selftest: PASS 3/3 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped)")
+    print("selftest: PASS 4/4 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; filter/since/until)")
     return 0
 
 
@@ -293,6 +312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--all-signals", action="store_true")
     ap.add_argument("--edges", default="")
     ap.add_argument("--horizon", default="")
+    ap.add_argument("--filter", action="append", default=[], help='COL=VALUE exact match, repeatable (v1.1.0)')
+    ap.add_argument("--since", default="", help="Date Recorded >= YYYY-MM-DD (v1.1.0)")
+    ap.add_argument("--until", default="", help="Date Recorded <= YYYY-MM-DD (v1.1.0)")
     ap.add_argument("--min-n", type=int, default=100)
     ap.add_argument("--json", default="")
     ap.add_argument("--selftest", action="store_true")
@@ -319,12 +341,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("FATAL: Performance_Log header row not found / no records", file=sys.stderr)
         return 2
     hz = [h.strip() for h in a.horizon.split(",") if h.strip()] or None
-    coh = decided_cohorts(recs, hz)
+    flt = {}
+    for item in a.filter:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            flt[k.strip()] = v.strip()
+    coh = decided_cohorts(recs, hz, flt or None, a.since.strip(), a.until.strip())
     signals = a.signal or (DEFAULT_SIGNALS if a.all_signals else ["Entry Forecast Reliability"])
     edges = [float(x) for x in a.edges.split(",") if x.strip()] or None
     results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n) for sg in signals if sg in hdr]
     missing = [sg for sg in signals if sg not in hdr]
-    print(render(results, f"{title} | decided cohorts n={len(coh)}" + (f" | horizons {','.join(hz)}" if hz else "")))
+    scope = (f" | horizons {','.join(hz)}" if hz else "") + (f" | filter {flt}" if flt else "") + \
+            (f" | since {a.since}" if a.since else "") + (f" | until {a.until}" if a.until else "")
+    print(render(results, f"{title} | decided cohorts n={len(coh)}{scope}"))
     if missing:
         print("signals not in header:", ", ".join(missing))
     if a.json:
