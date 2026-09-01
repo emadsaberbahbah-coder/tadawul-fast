@@ -356,6 +356,7 @@ jobs:
       TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
       TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
       TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
+      TFB_SYNC_APPEND_FAIL_IS_ERROR: ${{ vars.TFB_SYNC_APPEND_FAIL_IS_ERROR || '1' }}
       # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
@@ -984,9 +985,23 @@ jobs:
           # why a standing read-only-service-account 403 could slip past this net.
           # Added the real gspread signatures, kept auth-specific (403/401 only) so
           # a 429/500 APIError can't false-trip this and fail the job.
-          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden|does not have permission|PERMISSION_DENIED|\[401\]|\[403\]" "$LOG_FILE"; then
+          # 2026-09-01 (run 33494812694): the backend's own transient 401s (httpx
+          # lines during a Render redeploy, recovered by BATCH-RETRY, SYNC DONE
+          # failed=0) tripped this Google-auth net and failed a healthy leg.
+          # Backend lines are excluded from the Google scan and reported on
+          # their own: a warning when the sync recovered, an error otherwise.
+          if grep -viE "httpx|tadawul-fast-bridge|/v1/" "$LOG_FILE" | grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden|does not have permission|PERMISSION_DENIED|\[401\]|\[403\]"; then
             echo "::error::Google Sheets authentication/permission issue detected."
             EXIT_CODE=1
+          fi
+          BK401=$(grep -ciE "httpx.*(401 Unauthorized|403 Forbidden)" "$LOG_FILE" || true)
+          if [ "${BK401:-0}" -gt 0 ]; then
+            if grep -qE "SYNC DONE \| .*failed=0" "$LOG_FILE"; then
+              echo "::warning::Backend returned ${BK401} 401/403 response(s) during this leg (transient; batches recovered, SYNC DONE failed=0). If this repeats outside a Render deploy, check TFB_TOKEN on both sides."
+            else
+              echo "::error::Backend auth failure: ${BK401} 401/403 response(s) and the sync did not complete cleanly. Check TFB_TOKEN (GitHub secret vs Render env)."
+              EXIT_CODE=1
+            fi
           fi
 
           cp "$LOG_FILE" sync_execution.log
@@ -1398,6 +1413,7 @@ jobs:
       TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
       TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
       TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
+      TFB_SYNC_APPEND_FAIL_IS_ERROR: ${{ vars.TFB_SYNC_APPEND_FAIL_IS_ERROR || '1' }}
       # ─────────────────────────────────────────────────────────────────────
 
       # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
