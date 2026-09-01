@@ -1,0 +1,115 @@
+{
+  "version": "1.1.0",
+  "title": "_Market_Share_Deepseek-V3.xlsx",
+  "n": 1594,
+  "results": [
+    {
+      "signal": "Entry Score",
+      "type": "numeric",
+      "n": 1594,
+      "base_win_pct": 58.6,
+      "base_brier": 0.2426,
+      "groups": [
+        {
+          "group": "Q1",
+          "n": 318,
+          "win_pct": 49.4,
+          "mean_roi_pct": 0.49,
+          "median_roi_pct": -0.06
+        },
+        {
+          "group": "Q2",
+          "n": 319,
+          "win_pct": 49.5,
+          "mean_roi_pct": 0.48,
+          "median_roi_pct": -0.0
+        },
+        {
+          "group": "Q3",
+          "n": 316,
+          "win_pct": 61.4,
+          "mean_roi_pct": 0.74,
+          "median_roi_pct": 0.26
+        },
+        {
+          "group": "Q4",
+          "n": 321,
+          "win_pct": 66.0,
+          "mean_roi_pct": 1.0,
+          "median_roi_pct": 0.75
+        },
+        {
+          "group": "Q5",
+          "n": 320,
+          "win_pct": 66.6,
+          "mean_roi_pct": 1.55,
+          "median_roi_pct": 1.78
+        }
+      ],
+      "raw_brier_as_probability": 0.237,
+      "spearman_vs_roi": 0.176,
+      "cv_brier_group_calibrated": 0.238,
+      "win_spread_pp": 17.2,
+      "spread_z": 4.41,
+      "cv_gain_vs_base": 0.0046,
+      "verdict": "SEPARATES"
+    },
+    {
+      "signal": "Entry Recommendation",
+      "type": "categorical",
+      "n": 1594,
+      "base_win_pct": 58.6,
+      "base_brier": 0.2426,
+      "groups": [
+        {
+          "group": "HOLD",
+          "n": 1259,
+          "win_pct": 58.1,
+          "mean_roi_pct": 0.72,
+          "median_roi_pct": 0.31
+        },
+        {
+          "group": "ACCUMULATE",
+          "n": 126,
+          "win_pct": 74.6,
+          "mean_roi_pct": 2.42,
+          "median_roi_pct": 2.55
+        },
+        {
+          "group": "SELL",
+          "n": 99,
+          "win_pct": 51.5,
+          "mean_roi_pct": 0.19,
+          "median_roi_pct": 0.25
+        },
+        {
+          "group": "BUY",
+          "n": 77,
+          "win_pct": 51.9,
+          "mean_roi_pct": 1.42,
+          "median_roi_pct": 0.46
+        },
+        {
+          "group": "REDUCE",
+          "n": 31,
+          "win_pct": 51.6,
+          "mean_roi_pct": 0.81,
+          "median_roi_pct": 0.81
+        },
+        {
+          "group": "AVOID",
+          "n": 2,
+          "win_pct": 50.0,
+          "mean_roi_pct": 0.38,
+          "median_roi_pct": 0.38
+        }
+      ],
+      "cv_brier_group_calibrated": 0.2411,
+      "win_spread_pp": 16.5,
+      "spread_z": 3.59,
+      "cv_gain_vs_base": 0.0015,
+      "verdict": "WEAK"
+    }
+  ],
+  "missing": []
+}
