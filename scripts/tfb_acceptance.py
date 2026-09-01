@@ -53,7 +53,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -523,12 +523,16 @@ def check_pages(src: Source) -> List[Check]:
         g = guard.get(p)
         if g and g["rb_n"] > 0:
             rb_share = g["rb"] / g["rb_n"] * 100.0
-            out.append(Check(f"D10-5-{p}", f"{p} single writer (sync readback divergence rows)",
+            # v1.0.4: honest label. The readback count is the sync's OWN post-write
+            # OHLC guard on the live rows; its known driver is null-skip inheritance
+            # (a blank Open in the matrix leaves the prior cell standing) — cured by
+            # the v6.44.0 fill guard when armed — not proof of a second writer.
+            out.append(Check(f"D10-5-{p}", f"{p} OHLC coherence after write (readback-flagged rows)",
                              "PASS" if g["rb"] == 0 else ("WARN" if rb_share <= 1.0 else "FAIL"), g["rb"],
-                             f"rb={g['rb']}/{g['rb_n']} ({rb_share:.1f}%) pw={g['pw']}/{g['pw_n']} stamp={g['stamp'][:19]}"))
+                             f"rb={g['rb']}/{g['rb_n']} ({rb_share:.1f}%) pw={g['pw']}/{g['pw_n']} open_outside_range={oor} stamp={g['stamp'][:19]}"))
         else:
-            out.append(Check(f"D10-5-{p}", f"{p} single writer (sync readback divergence rows)", "NA", None,
-                             "no guard counters on the page stamp"))
+            out.append(Check(f"D10-5-{p}", f"{p} OHLC coherence after write (readback-flagged rows)", "NA", None,
+                             f"no guard counters on the page stamp; open_outside_range={oor}"))
         # v1.0.3: display glyphs are a GAS number FORMAT (exports render display text; the pool is
         # read UNFORMATTED) — informational, never a writer verdict.
         out.append(Check(f"G4-{p}", f"{p} display number-format share % (info)", "WARN" if glyph else "PASS",
