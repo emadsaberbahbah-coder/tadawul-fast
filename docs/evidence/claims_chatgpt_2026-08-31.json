@@ -1,0 +1,14 @@
+{"source": "ChatGPT Morning Review 2026-08-31 + PR #325 review (numeric claims re-expressed in the tfb_claims schema)",
+ "claims": [
+  {"id":"R1","check":"D10-1","op":"==","expected":0,"note":"Top-10 Passed 0"},
+  {"id":"R2","check":"D10-3b","op":"==","expected":4478,"note":"overdue active cohorts"},
+  {"id":"R3","check":"D10-5-Global_Markets","op":"~","expected":38.1,"tol":0.2,"note":"GM display-glyph share (2516/6609)"},
+  {"id":"R4","check":"D10-5-Commodities_FX","op":"~","expected":86.5,"tol":0.2,"note":"CFX glyph share"},
+  {"id":"R5","check":"D10-5-Mutual_Funds","op":"~","expected":54.3,"tol":0.2,"note":"MF glyph share"},
+  {"id":"R6","check":"G3-Commodities_FX","op":"==","expected":1,"note":"one false INVEST (Copper Futures)"},
+  {"id":"R7","check":"G2-Global_Markets","op":"==","expected":0,"note":"zero displayed targets in the provider-target cohort"},
+  {"id":"R8","check":"D10-2b","op":">=","expected":24,"note":"backend evidence clock older than a day (29.2h)"},
+  {"id":"R9","check":"D10-4b","op":"==","expected":3,"note":"SUCCESS-over-PARTIAL on 3 pages"},
+  {"id":"R10","check":"D10-7","op":"==","expected":3,"note":"S-1 scored days 3/28"},
+  {"id":"R11","check":"D10-4a","field":"verdict","op":"==","expected":"PASS","note":"feed key present (state NOT_ACTIONABLE — see D10-4c)"}
+ ]}
