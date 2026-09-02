@@ -1835,7 +1835,20 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.56.0"
+SCRIPT_VERSION = "6.56.1"
+# -----------------------------------------------------------------------------
+# v6.56.1 (2026-09-02) - ENV-ECHO: the log proves the arming state every run
+# -----------------------------------------------------------------------------
+# EVIDENCE: run 33609124633 (11:41) and 33620619118 (14:03) both ran with
+# the v6.44 fill guard OFF (no [OHLC-FILLGUARD] line) and v6.56.0 with a
+# zero tolerance (MF rb-pw=+1 stamped PARTIAL), while the scheduled 07:00
+# run of the same day logged mode=enforce. The operator had "set" the
+# Variables; nothing in the log could say whether they reached the job
+# (the v6.39.4 failure mode: a Variable that is not in env never reaches
+# os.getenv). CHANGE: one INFO line at guard self-test time listing the
+# EFFECTIVE value of every armed gate as the script sees it. Log-only.
+# Functions added: 1 (_env_echo_line). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.56.0 (2026-09-02) - RB-TOLERANCE: a BOUNDED readback residual is COMPLETE
 # -----------------------------------------------------------------------------
@@ -5190,6 +5203,10 @@ def _idfw_selftest_() -> bool:
     _IDFW_SELFTEST_MSG = "PASS %d/%d" % (passed, total) if _IDFW_SELFTEST_OK else "FAIL %d/%d" % (passed, total)
     if _IDFW_SELFTEST_OK:
         logger.info("[SELFTEST v6.25.2] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
+    try:
+        logger.info(_env_echo_line())  # v6.56.1 ENV-ECHO
+    except Exception:  # noqa: BLE001
+        pass
     else:
         print("::error::[SELFTEST v6.25.2] %s — a guard fixture failed; "
               "FW-4 quarantine disabled for this run (FW-1/FW-2 remain on)." % _IDFW_SELFTEST_MSG)
@@ -6194,6 +6211,27 @@ def _status_truth_enabled() -> bool:
     verdict. DEFAULT OFF: unset/0 keeps v6.50.0 behaviour byte-identical."""
     return (os.getenv("TFB_SYNC_STATUS_TRUTH") or "0").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def _env_echo_line() -> str:
+    """v6.56.1 [ENV-ECHO]: effective arming state as the script sees it. The
+    values are the parsed results of the same readers the guards use, so a
+    Variable that never reached env shows up here as its default."""
+    def _raw(k):
+        v = os.getenv(k)
+        return "unset" if v is None else repr(v.strip())[:24]
+    try:
+        return (f"[ENV-ECHO v{SCRIPT_VERSION}] "
+                f"status_truth={_status_truth_enabled()} "
+                f"status_stamp={_status_stamp_enabled()} "
+                f"ohlc_prewrite={_ohlc_prewrite_enabled()} "
+                f"ohlc_readback={_ohlc_readback_enabled()} "
+                f"fill_guard={_ohlc_fillguard_enabled()}({_raw('TFB_SYNC_OHLC_FILL_GUARD')}) "
+                f"fill_mode={_ohlc_fillguard_mode()}({_raw('TFB_SYNC_OHLC_FILL_GUARD_MODE')}) "
+                f"rb_tol_rows={_raw('TFB_SYNC_RB_TOL_ROWS')} rb_tol_pct={_raw('TFB_SYNC_RB_TOL_PCT')} "
+                f"rb_tol@6609={_rb_tolerance_env(6609)}")
+    except Exception as exc:  # noqa: BLE001
+        return f"[ENV-ECHO v{SCRIPT_VERSION}] unavailable: {exc}"
 
 
 def _rb_tolerance_env(rb_checked: int) -> int:
