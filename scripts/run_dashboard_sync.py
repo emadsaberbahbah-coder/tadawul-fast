@@ -1835,7 +1835,34 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.55.0"
+SCRIPT_VERSION = "6.56.0"
+# -----------------------------------------------------------------------------
+# v6.56.0 (2026-09-02) - RB-TOLERANCE: a BOUNDED readback residual is COMPLETE
+# -----------------------------------------------------------------------------
+# EVIDENCE (runs 33556504158 / 33609124633 and the scheduled 07:00 run of
+# 2026-09-02): with the v6.44 fill guard armed in ENFORCE (110 nulls
+# cleared on GM), the post-write readback still reported GM rb=72 vs pw=66
+# (+6); unarmed, rb=78 vs pw=63 (+15). The residual is a handful of
+# illiquid foreign names whose Open the OHLC lake cannot fill (9984.T,
+# Z74.SI, 7084.KL ...). _status_data_verdict() stamps DIVERGENT as PARTIAL
+# unless the readback REPAIR brought the count back to the prewrite
+# baseline - and the repair is forced-observe for the S-1 window. Result:
+# 0.1-0.2% of 6,609 rows keep the page PARTIAL, the composite feed
+# NOT_ACTIONABLE(partial:GM), the board banner red and every ticket
+# "SIZING WITHHELD" - indefinitely, while the board's own per-row gates
+# (Quote Freshness, Data Trust) already fence those rows off one by one.
+# CHANGE: a DIVERGENT readback whose write-survival delta (rb_flagged -
+# pw_flagged) is within a bounded tolerance counts as COMPLETE. The
+# tolerance is max(TFB_SYNC_RB_TOL_ROWS, ceil(rb_checked *
+# TFB_SYNC_RB_TOL_PCT / 100)). The stamp message carries
+# "rb_tol=<tol>(+<delta>)" whenever the tolerance decided the verdict, so
+# the residual is never hidden. The readback line, the _Run_Log evidence
+# and the acceptance counters are unchanged; only the cohort verdict is.
+# GATES: both knobs DEFAULT 0 -> tolerance 0 -> v6.55.0 byte-identical.
+# Recommended arming: TFB_SYNC_RB_TOL_PCT=0.25, TFB_SYNC_RB_TOL_ROWS=2
+# (GM 17 rows, MF 7, CFX 2, ML 2). Functions added: 3 (_rb_tolerance_env,
+# _rb_divergence_tolerated, _rb_tolerance_note). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.55.0 (2026-09-01) - F-11: A FAILED EVIDENCE APPEND FAILS THE JOB
 # -----------------------------------------------------------------------------
@@ -6169,6 +6196,55 @@ def _status_truth_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+def _rb_tolerance_env(rb_checked: int) -> int:
+    """v6.56.0 [RB-TOLERANCE]: bounded write-survival residual that still
+    counts as COMPLETE. max(TFB_SYNC_RB_TOL_ROWS, ceil(rb_checked *
+    TFB_SYNC_RB_TOL_PCT / 100)). Both DEFAULT 0 -> 0 (byte-identical)."""
+    try:
+        rows_abs = int(float((os.getenv("TFB_SYNC_RB_TOL_ROWS") or "0").strip()))
+    except Exception:  # noqa: BLE001
+        rows_abs = 0
+    try:
+        pct = float((os.getenv("TFB_SYNC_RB_TOL_PCT") or "0").strip())
+    except Exception:  # noqa: BLE001
+        pct = 0.0
+    rows_abs = max(0, rows_abs)
+    pct_rows = 0
+    if pct > 0 and rb_checked > 0:
+        pct_rows = int(-(-(rb_checked * pct) // 100.0))  # ceil without math
+    return max(rows_abs, pct_rows)
+
+
+def _rb_divergence_tolerated(meta: dict, pw_fl: int):
+    """v6.56.0: (tolerated: bool, tol: int, delta: int). Tolerated iff the
+    readback counters exist, tol > 0 and 0 <= rb_flagged - pw_flagged <= tol.
+    Any missing counter -> not tolerated (never false-green)."""
+    try:
+        m = meta or {}
+        if m.get("rb_checked") is None or m.get("rb_flagged") is None:
+            return False, 0, 0
+        rb_fl = int(m.get("rb_flagged") or 0)
+        checked = int(m.get("rb_checked") or 0)
+        tol = _rb_tolerance_env(checked)
+        delta = rb_fl - int(pw_fl or 0)
+        return (tol > 0 and checked > 0 and 0 <= delta <= tol), tol, delta
+    except Exception:  # noqa: BLE001
+        return False, 0, 0
+
+
+def _rb_tolerance_note(meta: dict, pw_fl: int) -> str:
+    """v6.56.0: " rb_tol=<tol>(+<delta>)" when the tolerance decided a
+    DIVERGENT readback; "" otherwise. Stamp-message only."""
+    try:
+        rbst = str((meta or {}).get("rb_status") or "").strip().upper()
+        if rbst != "DIVERGENT":
+            return ""
+        ok, tol, delta = _rb_divergence_tolerated(meta, pw_fl)
+        return f" rb_tol={tol}(+{delta})" if ok else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
                          meta: dict) -> str:
     """v6.51.0: THE cohort verdict, factored verbatim from _status_stamp_row
@@ -6188,7 +6264,10 @@ def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
             out = "PARTIAL"
         if rbst == "DIVERGENT" and not (
                 isinstance(rep_after, int) and 0 <= rep_after <= pw_fl):
-            out = "PARTIAL"
+            # v6.56.0 [RB-TOLERANCE]: a bounded write-survival residual is
+            # COMPLETE; the stamp message records rb_tol=<tol>(+<delta>).
+            if not _rb_divergence_tolerated(meta, pw_fl)[0]:
+                out = "PARTIAL"
         return out
     except Exception:  # noqa: BLE001
         return "PARTIAL"
@@ -6294,6 +6373,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" warnings={len(warns)}" if warns else "")
            + (f" error={err[:120]}" if err else "")
            + f" | data={data_status}"
+           + _rb_tolerance_note(meta, pw_fl)
            + (f" guard=pw:{pw_fl}/{int(meta.get('pw_checked') or 0)}"
               + (f",rb:{int(meta.get('rb_flagged') or 0)}"
                  f"/{int(meta.get('rb_checked') or 0)}"
