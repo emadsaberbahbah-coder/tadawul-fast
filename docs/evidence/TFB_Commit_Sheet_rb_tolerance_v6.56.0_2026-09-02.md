@@ -29,3 +29,10 @@ With the fill guard armed in enforce, today's counters all stamp COMPLETE (GM +6
 
 ## Evidence run
 Commit → set the two Variables → confirm `TFB_SYNC_OHLC_FILL_GUARD=1` / `_MODE=enforce` are exactly those strings → dispatch `daily_sync` (full_sync) → expect all four `[STATUS-STAMP]` lines `status=SUCCESS` with `rb_tol=…` on the divergent pages, `[UPSTREAM-VERDICT] EXECUTABLE`, then Top_10 refresh → banner gone, sizing shown → acceptance `D10-4c PASS`, `D10-5-Global_Markets PASS`.
+
+## Addendum — v6.56.1 [ENV-ECHO] (same day, supersedes the v6.56.0 script file)
+**Delivered:** `scripts/run_dashboard_sync.py` v6.56.1 · SHA256 `c15460525436cb63…` · 10,902 lines.
+**Evidence:** run 33620619118 (14:03) ran v6.56.0 with a ZERO tolerance (MF rb−pw=+1 stamped PARTIAL; tolerance would have been 7) and the fill guard OFF (no `[OHLC-FILLGUARD]` line) — while the yml on `main` maps all four Variables and the scheduled 07:00 run logged `mode=enforce`. Nothing in the log could say whether a Variable reached the job.
+**Change (log-only):** one INFO line at self-test time, e.g. `[ENV-ECHO v6.56.1] status_truth=True … fill_guard=True('1') fill_mode=enforce('enforce') rb_tol_rows='2' rb_tol_pct='0.25' rb_tol@6609=17`. A Variable that never reached env shows as `unset`; a value the reader rejects shows as e.g. `fill_guard=False('enforce')`.
+**Protocol:** anchored edits 4 (count==1), py_compile, AST zero-removal (added `_env_echo_line`), smoke on the real module (unset / armed / operator-slip), repo deterministic gate 84/84 PASS.
+**Register item (not changed today):** CFX readback `UNAVAILABLE (read_failed)` stamped SUCCESS — the v6.51.0 rule only turns DIVERGENT into PARTIAL; an UNKNOWN readback passes. Latent false-green on transient read failures.
