@@ -53,7 +53,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -478,8 +478,12 @@ def _stamp_guard(src: Source) -> Dict[str, Dict[str, Any]]:
         page = _s(st.get("Page"))
         m = re.search(r"guard=pw:(\d+)/(\d+),rb:(\d+)/(\d+)", _s(st.get("Message")))
         if page in PAGES and m:
+            # v1.0.5: the sync v6.56.0 stamp carries "rb_tol=<tol>(+<delta>)" when its bounded
+            # write-survival tolerance decided a DIVERGENT readback as COMPLETE.
+            t = re.search(r"rb_tol=(\d+)\(\+(-?\d+)\)", _s(st.get("Message")))
             out[page] = {"pw": int(m.group(1)), "pw_n": int(m.group(2)), "rb": int(m.group(3)), "rb_n": int(m.group(4)),
-                         "stamp": _s(st.get("Last Updated"))}
+                         "stamp": _s(st.get("Last Updated")),
+                         "rb_tol": int(t.group(1)) if t else None}
     return out
 
 
@@ -523,13 +527,20 @@ def check_pages(src: Source) -> List[Check]:
         g = guard.get(p)
         if g and g["rb_n"] > 0:
             rb_share = g["rb"] / g["rb_n"] * 100.0
-            # v1.0.4: honest label. The readback count is the sync's OWN post-write
-            # OHLC guard on the live rows; its known driver is null-skip inheritance
-            # (a blank Open in the matrix leaves the prior cell standing) — cured by
-            # the v6.44.0 fill guard when armed — not proof of a second writer.
-            out.append(Check(f"D10-5-{p}", f"{p} OHLC coherence after write (readback-flagged rows)",
-                             "PASS" if g["rb"] == 0 else ("WARN" if rb_share <= 1.0 else "FAIL"), g["rb"],
-                             f"rb={g['rb']}/{g['rb_n']} ({rb_share:.1f}%) pw={g['pw']}/{g['pw_n']} open_outside_range={oor} stamp={g['stamp'][:19]}"))
+            # v1.0.5: measure WRITE SURVIVAL (rb - pw), not the raw readback count. The
+            # prewrite-flagged rows are provider OHLC incoherence already present in the
+            # payload (tol_excused etc.), not something the write did. PASS when nothing
+            # survived the write or the sync's own bounded tolerance (v6.56.0 rb_tol)
+            # decided the cohort COMPLETE; WARN when the residual is <= 1% of rows; FAIL above.
+            delta = max(0, g["rb"] - g["pw"])
+            d_share = delta / g["rb_n"] * 100.0
+            tol = g.get("rb_tol")
+            verdict = "PASS" if (delta == 0 or tol is not None) else ("WARN" if d_share <= 1.0 else "FAIL")
+            out.append(Check(f"D10-5-{p}", f"{p} OHLC coherence after write (write-survival rows rb-pw)",
+                             verdict, delta,
+                             f"survived={delta} ({d_share:.2f}%) rb={g['rb']}/{g['rb_n']} ({rb_share:.1f}%) pw={g['pw']}/{g['pw_n']}"
+                             + (f" rb_tol={tol}" if tol is not None else "")
+                             + f" open_outside_range={oor} stamp={g['stamp'][:19]}"))
         else:
             out.append(Check(f"D10-5-{p}", f"{p} OHLC coherence after write (readback-flagged rows)", "NA", None,
                              f"no guard counters on the page stamp; open_outside_range={oor}"))
@@ -627,6 +638,16 @@ def _selftest() -> int:
     assert all(ca[f"G3-{p}"].verdict == "PASS" for p in PAGES)
     assert ca["D10-5-Global_Markets"].verdict == "PASS" and ca["D10-5-Market_Leaders"].verdict == "FAIL" and ca["D10-5-Market_Leaders"].measured == 1
     assert ca["D10-5-Commodities_FX"].verdict == "NA" and ca["G4-Global_Markets"].verdict == "PASS"
+    # v1.0.5: a v6.56.0 tolerated stamp -> PASS with measured = survived rows; an untolerated
+    # residual above 1% -> FAIL; prewrite-flagged rows never count against the write.
+    status_tol = [status_ok[0],
+                  ["Global_Markets", now, "SUCCESS", "data=COMPLETE rb_tol=17(+15) guard=pw:63/6609,rb:78/6609", "", "", "", "", "", "", "", "TFB Decision Feed", "EXECUTABLE | run=1"],
+                  ["Market_Leaders", now, "SUCCESS", "data=COMPLETE guard=pw:30/255,rb:30/255", "", "", "", "", "", "", "", "", ""]]
+    T = _MemSource({"Market_Leaders": good, "Global_Markets": good, "Commodities_FX": good, "Mutual_Funds": good,
+                    "_Status": status_tol, "Top_10_Investments": top10, "Performance_Log": perf, "_Run_Log": runlog, "S1_Gate": s1})
+    ct = {c.cid: c for c in run_all(T)}
+    assert ct["D10-5-Global_Markets"].verdict == "PASS" and ct["D10-5-Global_Markets"].measured == 15
+    assert ct["D10-5-Market_Leaders"].verdict == "PASS" and ct["D10-5-Market_Leaders"].measured == 0
     assert ca["D10-7"].verdict == "WARN" and ca["D10-7"].measured == 3
     B = _MemSource({"Market_Leaders": bad, "Global_Markets": bad, "Commodities_FX": bad, "Mutual_Funds": bad,
                     "_Status": status_bad, "Top_10_Investments": [], "Performance_Log": [], "_Run_Log": [], "S1_Gate": []})
