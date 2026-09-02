@@ -1061,7 +1061,29 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.1"
+OPPORTUNITY_BUILDER_VERSION = "1.19.2"
+# -----------------------------------------------------------------------------
+# v1.19.2 (2026-09-02) - ELIGIBILITY (VENUE): the operator's tradable venues
+# -----------------------------------------------------------------------------
+# EVIDENCE (Top_10 11:10 Riyadh, first populated board: 112 qualified): the
+# single Selected ticket was HDFCBANK.NS (NSE India) and the qualified set
+# carried 2317.TW, TRAN.BA, BMRI.JK - venues a foreign retail account at
+# IBKR/Derayah generally cannot trade. Eligibility (KSA) fences Tadawul
+# (Nomu, foreign-restricted) but nothing fenced the VENUE for the other
+# 9,500 rows, so "Passed" - the KPI for board-originated trades - counted
+# names that can never become a ticket.
+# CHANGE: a new "Eligibility (Venue)" gate (FAIL_MAJOR, right after
+# Eligibility (KSA) in GATE_ORDER) passes a candidate iff its market name
+# OR its symbol suffix is in TFB_T10_VENUE_ALLOWLIST (CSV, case-insensitive;
+# a bare ticker counts as suffix US). Examples of tokens: US, NYSE, NASDAQ,
+# SR, TADAWUL, L, PA, DE, SW, T, HK, TO, AX. Fail-open: an unknown market
+# AND an absent suffix pass ("venue unknown") so a mapping gap can never
+# empty the board.
+# GATE: TFB_T10_VENUE_ALLOWLIST unset/empty = gate NOT appended -> v1.19.1
+# gate list, verdicts and payload byte-identical. Arming is the operator's
+# explicit decision (declared version break; alters candidate eligibility).
+# Functions added: 2 (_env_venue_allowlist, _venue_eligibility). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.19.1 (2026-09-02) - AUDIT-DEPTH-ORDER: the written audit and the near-miss
 #          surface are ordered by HOW FAR a row got through the gate chain,
@@ -1497,7 +1519,8 @@ GATE_ORDER = (
     # added here, so first_failed_gate sorted them to 99 and could
     # mis-attribute the near-miss surface. True append positions:
     "Quote Freshness", "Shariah (KSA)", "Eligibility (KSA)",
-    "Shariah (Model)",       # v1.9.0 B-6 (appends after Eligibility (KSA))
+    "Eligibility (Venue)",   # v1.19.2 (appends after Eligibility (KSA))
+    "Shariah (Model)",       # v1.9.0 B-6 (appends after Eligibility (Venue))
     "Activity Screen",
     "Investability",
     # v1.10.2 [G-1]: appended immediately after Investability in evaluate_gates.
@@ -2891,6 +2914,31 @@ def _env_compliance_gate():
         not in ("0", "false", "off", "no")
 
 
+def _env_venue_allowlist():
+    """v1.19.2: frozenset of upper-cased venue tokens from
+    TFB_T10_VENUE_ALLOWLIST (CSV). Empty -> the venue gate is not appended."""
+    raw = (os.getenv("TFB_T10_VENUE_ALLOWLIST") or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(t.strip().upper().lstrip(".") for t in raw.split(",")
+                     if t.strip())
+
+
+def _venue_eligibility(cand, allow):
+    """v1.19.2: (ok, current). Market name OR symbol suffix in the allow-list
+    passes; a bare ticker counts as suffix US; unknown market with no
+    suffix passes fail-open as "venue unknown"."""
+    sym = str(cand.get("symbol") or "").strip().upper()
+    mkt = str(cand.get("market") or "").strip().upper()
+    suffix = sym.rsplit(".", 1)[1] if "." in sym else ("US" if sym else "")
+    if not mkt or mkt == "UNKNOWN":
+        mkt = ""
+    if not mkt and not suffix:
+        return True, "venue unknown"
+    ok = (mkt in allow) or (suffix in allow)
+    return ok, f"{mkt or '?'}/.{suffix or '?'}"
+
+
 def _env_eligibility_gate():
     return (os.getenv("TFB_ELIGIBILITY_GATE") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
@@ -3339,6 +3387,16 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             ("NOMU_BLOCKED" if _nomu else
              ("FOREIGN_RESTRICTED" if _sym_u in _restr2 else "eligible")),
             "Main Market only; foreign-resident tradable set"))
+
+    # v1.19.2 [ELIGIBILITY (VENUE)]: the operator's tradable venues. Gate
+    # is appended only when TFB_T10_VENUE_ALLOWLIST is set (byte-identical
+    # otherwise). FAIL_MAJOR: an untradable venue is never a ticket.
+    _venue_allow = _env_venue_allowlist()
+    if _venue_allow:
+        _ok_v, _v_cur = _venue_eligibility(cand, _venue_allow)
+        g.append(_gate(
+            "Eligibility (Venue)", _ok_v, FAIL_MAJOR, _v_cur,
+            "market name or symbol suffix in TFB_T10_VENUE_ALLOWLIST"))
 
     # v1.9.0 [B-6 SHARIAH MODEL GATE — GLOBAL]: the resolver fail set,
     # finally consulted for NON-.SR candidates too. Same one-resolver
