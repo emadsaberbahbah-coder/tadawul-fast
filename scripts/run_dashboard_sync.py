@@ -1835,7 +1835,19 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.56.1"
+SCRIPT_VERSION = "6.56.2"
+# -----------------------------------------------------------------------------
+# v6.56.2 (2026-09-02) - HOTFIX: v6.56.1 placed the ENV-ECHO try/except between
+# the self-test "if" and its "else", so the else bound to the try and the
+# "::error:: a guard fixture failed; FW-4 quarantine disabled" annotation
+# printed on EVERY run after a successful echo (run 33640922781: 3 false
+# errors; FW-4 itself stayed ON - it quarantined ZL=F - the print is log-only).
+# The echo now runs before the if/else, which is restored verbatim. Harness
+# H-SELFTEST captures stdout of the real self-test and asserts no "::error::".
+# ALSO corrected in the v6.56.1 note below: the [OHLC-FILLGUARD] line is a
+# _Run_Log (sheet) append only - it never reaches the local log file - so its
+# absence from a job log is NOT evidence that the guard was off. ENV-ECHO is
+# the only valid arming evidence. Functions added: 0. Removed: 0.
 # -----------------------------------------------------------------------------
 # v6.56.1 (2026-09-02) - ENV-ECHO: the log proves the arming state every run
 # -----------------------------------------------------------------------------
@@ -5201,12 +5213,12 @@ def _idfw_selftest_() -> bool:
         return False
     _IDFW_SELFTEST_OK = (passed == total)
     _IDFW_SELFTEST_MSG = "PASS %d/%d" % (passed, total) if _IDFW_SELFTEST_OK else "FAIL %d/%d" % (passed, total)
-    if _IDFW_SELFTEST_OK:
-        logger.info("[SELFTEST v6.25.2] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
     try:
-        logger.info(_env_echo_line())  # v6.56.1 ENV-ECHO
+        logger.info(_env_echo_line())  # v6.56.1 ENV-ECHO (v6.56.2: moved ABOVE the if/else)
     except Exception:  # noqa: BLE001
         pass
+    if _IDFW_SELFTEST_OK:
+        logger.info("[SELFTEST v6.25.2] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
     else:
         print("::error::[SELFTEST v6.25.2] %s — a guard fixture failed; "
               "FW-4 quarantine disabled for this run (FW-1/FW-2 remain on)." % _IDFW_SELFTEST_MSG)
