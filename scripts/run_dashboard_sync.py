@@ -1835,7 +1835,44 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.56.2"
+SCRIPT_VERSION = "6.57.0"
+# -----------------------------------------------------------------------------
+# v6.57.0 (2026-09-03) - NULL-CLEAR SCOPE: the fill guard can clear EVERY column
+# -----------------------------------------------------------------------------
+# EVIDENCE (Global_Markets export 2026-09-03 00:40 vs engine v5.135.0):
+#   - MCHPP.US: the engine's own Upside/Downside % = -0.001 (target ~= price
+#     at the boundary) while the sheet's Target Price cell reads 218.364;
+#     NBRG.US engine upside 0.001 (target ~10.08) vs cell 1,642.86; 14 rows
+#     carry the v5.135.0 "*_rejected_outlier" tag in Warnings (the engine
+#     emitted target_price=null) and STILL show a value in the cell.
+#   - The values differ from the previous day (MCHPP 129,500 -> 218.364),
+#     so they are not this symbol's stale cell either.
+#   MECHANISM (the v6.44.0 note below, now measured on non-OHLC columns):
+#   values.update SKIPS JSON-null cells; the page is written then trimmed with
+#   no pre-clear; rows re-sort between runs; so a null Target Price inherits
+#   WHATEVER SYMBOL sat in that row position on the previous write. Over
+#   weeks of daily re-sorts nearly every position accumulates SOME stale
+#   value: 6,080/6,609 GM rows show a Target Price, 89.9% disagree with the
+#   row's own Upside %, 40% are outside [0.25x, 3.0x] of price. The same
+#   grafting explains P/E != Price/EPS (47.6%), wrong sectors (KLAC.US =
+#   "Basic Materials") and the Top_10 Valuation Sanity carnage. The engine
+#   firewall (v5.135.0) cannot fix a cell the writer never touches.
+# FIX (env-gated, DEFAULT byte-identical v6.56.2):
+#   TFB_SYNC_NULL_CLEAR_SCOPE = ohlc (default) -> guard scope unchanged
+#                            = all  -> when the guard is armed, EVERY header
+#                                      except Symbol (and TFB_SYNC_NULL_KEEP_COLS,
+#                                      CSV, default empty) is guarded: observe
+#                                      counts the nulls, enforce writes "" so
+#                                      an honest blank replaces the graft.
+#   Sheet-side null-skip persistence is no longer a feature: the engine
+#   carries its own keep-last-good for targets (engine_target_klg) and the
+#   row-level persistence paths (SYMBOL-PERSISTENCE, FW-KEEP) are untouched.
+#   EXPECTED ON FIRST ENFORCE: a large one-time blanking of grafted cells
+#   (Target Price on most synthetic rows, stale P/E/EPS/sector cells);
+#   missing_valuation on the board rises; that is the true state.
+#   The FILLGUARD _Run_Log line carries scope=all and the total cleared.
+# Functions added: 2 (_null_clear_scope, _null_clear_keep_cols). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.56.2 (2026-09-02) - HOTFIX: v6.56.1 placed the ENV-ECHO try/except between
 # the self-test "if" and its "else", so the else bound to the try and the
@@ -6804,6 +6841,35 @@ def _ohlc_fillguard_cols() -> Tuple[str, ...]:
     return tuple(out) if out else _OHLC_FILLGUARD_DEFAULT_COLS
 
 
+def _null_clear_scope() -> str:
+    """v6.57.0: TFB_SYNC_NULL_CLEAR_SCOPE = ohlc (default) | all."""
+    raw = (os.getenv("TFB_SYNC_NULL_CLEAR_SCOPE") or "ohlc").strip().lower()
+    return "all" if raw == "all" else "ohlc"
+
+
+def _null_clear_keep_cols() -> Tuple[str, ...]:
+    """v6.57.0: TFB_SYNC_NULL_KEEP_COLS (CSV, case-insensitive) - headers
+    excluded from the all-columns scope. Symbol is always excluded."""
+    raw = (os.getenv("TFB_SYNC_NULL_KEEP_COLS") or "").strip()
+    out: List[str] = []
+    for tok in raw.split(","):
+        t = tok.strip()
+        if t and t not in out:
+            out.append(t)
+    return tuple(out)
+
+
+def _null_clear_all_cols(hdr: Sequence[Any]) -> Tuple[str, ...]:
+    """v6.57.0: every header except Symbol and the keep list."""
+    keep = {c.casefold() for c in _null_clear_keep_cols()} | {"symbol"}
+    out: List[str] = []
+    for h in (hdr or []):
+        hs = str(h).strip()
+        if hs and hs.casefold() not in keep and hs not in out:
+            out.append(hs)
+    return tuple(out)
+
+
 def _ohlc_fillguard_cols_rejected() -> Tuple[str, ...]:
     """v6.44.1 DS-06: env tokens outside the allowlist (reported, unused)."""
     allow = {c.casefold() for c in _OHLC_FILLGUARD_DEFAULT_COLS}
@@ -6865,6 +6931,10 @@ def _ohlc_fill_guard_apply(hdr: List[Any], matrix: List[List[Any]]):
     mode = _ohlc_fillguard_mode()
     cols = _ohlc_fillguard_cols()
     rejected = _ohlc_fillguard_cols_rejected()
+    _scope = _null_clear_scope()  # v6.57.0
+    if _scope == "all":
+        cols = _null_clear_all_cols(hdr)
+        rejected = ()
     forced = None
     if mode == "enforce":
         if _OHLC_FILLGUARD_SELFTEST_OK is None:
@@ -6887,6 +6957,7 @@ def _ohlc_fill_guard_apply(hdr: List[Any], matrix: List[List[Any]]):
                         "action": "observed", "examples": [],
                         "error": type(_ce).__name__}
     stats["armed"] = True
+    stats["scope"] = _scope  # v6.57.0
     if forced:
         stats["selftest"] = forced
     if rejected:
@@ -6920,6 +6991,7 @@ def _append_runlog_ohlc_fillguard(sheets: Any, spreadsheet_id: str, page: str,
             f"total={_t} | cols={len(stats.get('cols') or [])}/"
             f"{len(stats.get('configured') or [])} | "
             f"action={stats.get('action')} | mode={stats.get('mode')}"
+            + (f" | scope={stats['scope']}" if stats.get("scope") == "all" else "")
             + (f" | rejected={','.join(stats['cols_rejected'])}"
                if stats.get("cols_rejected") else "")
             + (f" | error={stats['error']}" if stats.get("error") else "")
