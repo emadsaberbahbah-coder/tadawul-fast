@@ -1,0 +1,149 @@
+{
+  "version": "1.0.0",
+  "checks": [
+    {
+      "cid": "C1",
+      "page": "Global_Markets",
+      "criterion": "SELL-tier share of recommendations",
+      "verdict": "FAIL",
+      "measured": 80.25,
+      "evidence": "sell_tier=5304/6609"
+    },
+    {
+      "cid": "C2",
+      "page": "Global_Markets",
+      "criterion": "BUY-tier share of recommendations",
+      "verdict": "FAIL",
+      "measured": 0.45,
+      "evidence": "buy_tier=30/6609"
+    },
+    {
+      "cid": "C3",
+      "page": "Global_Markets",
+      "criterion": "SELL-tier reco vs engine forecast > +10%",
+      "verdict": "FAIL",
+      "measured": 14.86,
+      "evidence": "sell_reco_with_forecast_gt_10pct=982/6609"
+    },
+    {
+      "cid": "C4",
+      "page": "Global_Markets",
+      "criterion": "analyst vs recommendation polar clash",
+      "verdict": "FAIL",
+      "measured": 34.5,
+      "evidence": "polar=2250/6521 rated rows"
+    },
+    {
+      "cid": "C5",
+      "page": "Global_Markets",
+      "criterion": "p50 Overall Score (Raw) vs BUY cutoff",
+      "verdict": "FAIL",
+      "measured": 52.06,
+      "evidence": "p50_raw=52.06 n=6609 BUY_cutoff=70 ACCUMULATE=60"
+    },
+    {
+      "cid": "B1",
+      "page": "Global_Markets",
+      "criterion": "Upside% vs Target/Price disagreement",
+      "verdict": "FAIL",
+      "measured": 89.88,
+      "evidence": "disagree=5465/6080 priced+targeted rows"
+    },
+    {
+      "cid": "B2",
+      "page": "Global_Markets",
+      "criterion": "Target/Price outliers",
+      "verdict": "FAIL",
+      "measured": 34.61,
+      "evidence": "outliers=2104/6080 (band 0.25x-3.0x)"
+    },
+    {
+      "cid": "B3",
+      "page": "Global_Markets",
+      "criterion": "P/E != Price/EPS",
+      "verdict": "FAIL",
+      "measured": 47.59,
+      "evidence": "mismatch=2982/6266 rows with P/E and EPS"
+    },
+    {
+      "cid": "B4",
+      "page": "Global_Markets",
+      "criterion": "reliability cluster share (provider_target)",
+      "verdict": "FAIL",
+      "measured": 73.13,
+      "evidence": "cluster=754/1031 provider_target rows"
+    },
+    {
+      "cid": "C1",
+      "page": "Market_Leaders",
+      "criterion": "SELL-tier share of recommendations",
+      "verdict": "FAIL",
+      "measured": 74.51,
+      "evidence": "sell_tier=190/255"
+    },
+    {
+      "cid": "C2",
+      "page": "Market_Leaders",
+      "criterion": "BUY-tier share of recommendations",
+      "verdict": "WARN",
+      "measured": 3.14,
+      "evidence": "buy_tier=8/255"
+    },
+    {
+      "cid": "C3",
+      "page": "Market_Leaders",
+      "criterion": "SELL-tier reco vs engine forecast > +10%",
+      "verdict": "FAIL",
+      "measured": 13.73,
+      "evidence": "sell_reco_with_forecast_gt_10pct=35/255"
+    },
+    {
+      "cid": "C4",
+      "page": "Market_Leaders",
+      "criterion": "analyst vs recommendation polar clash",
+      "verdict": "PASS",
+      "measured": 6.67,
+      "evidence": "polar=17/255 rated rows"
+    },
+    {
+      "cid": "C5",
+      "page": "Market_Leaders",
+      "criterion": "p50 Overall Score (Raw) vs BUY cutoff",
+      "verdict": "FAIL",
+      "measured": 49.2,
+      "evidence": "p50_raw=49.2 n=255 BUY_cutoff=70 ACCUMULATE=60"
+    },
+    {
+      "cid": "B1",
+      "page": "Market_Leaders",
+      "criterion": "Upside% vs Target/Price disagreement",
+      "verdict": "FAIL",
+      "measured": 90.22,
+      "evidence": "disagree=166/184 priced+targeted rows"
+    },
+    {
+      "cid": "B2",
+      "page": "Market_Leaders",
+      "criterion": "Target/Price outliers",
+      "verdict": "FAIL",
+      "measured": 15.22,
+      "evidence": "outliers=28/184 (band 0.25x-3.0x)"
+    },
+    {
+      "cid": "B3",
+      "page": "Market_Leaders",
+      "criterion": "P/E != Price/EPS",
+      "verdict": "WARN",
+      "measured": 33.07,
+      "evidence": "mismatch=84/254 rows with P/E and EPS"
+    },
+    {
+      "cid": "B4",
+      "page": "Market_Leaders",
+      "criterion": "reliability cluster share (provider_target)",
+      "verdict": "PASS",
+      "measured": 2.54,
+      "evidence": "cluster=3/118 provider_target rows"
+    }
+  ]
+}
