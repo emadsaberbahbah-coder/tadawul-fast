@@ -1061,7 +1061,33 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.0"
+OPPORTUNITY_BUILDER_VERSION = "1.19.1"
+# -----------------------------------------------------------------------------
+# v1.19.1 (2026-09-02) - AUDIT-DEPTH-ORDER: the written audit and the near-miss
+#          surface are ordered by HOW FAR a row got through the gate chain,
+#          not by opportunity score.
+# -----------------------------------------------------------------------------
+# EVIDENCE (Top_10 exports 09-01 00:51 and 09-02 09:10/09:40, pool 9,786):
+# the written audit is capped (TFB_OPP_AUDIT_ROWS_MAX=300 on the instance) and
+# the remaining slots were filled by the HIGHEST-SCORING failures. Junk
+# micro-caps with absurd fair-value gaps score 76.9-82.0, so all 300 slots and
+# all 10 near-miss slots were Valuation Sanity failures every day (294/300,
+# 297/300, 290/300), while the 14 sane candidates that pass Rel/DQ/Sanity/ROI
+# by hand were NOT WRITTEN AT ALL - their first-fail gate was unknowable from
+# the sheet. A controlled probe (panel Min R/R 2.0 -> 1.0) took Passed 0 -> 3
+# and the 11 others were still invisible. The operator could not see the
+# system's own best candidates or why they failed.
+# CHANGE (display-only; selection, tickets, kpis, alerts byte-identical):
+#   TFB_OPP_AUDIT_ORDER = depth (default) rows ordered by (INVEST first,
+#                                 deepest first-fail gate in GATE_ORDER, then
+#                                 reliability desc, score desc, symbol). Rows
+#                                 that died at gate 5 (Valuation Sanity) sort
+#                                 behind rows that reached gate 24
+#                                 (Risk/Reward). Applied to the pre-sort, the
+#                                 cap fill and the near-miss pool.
+#                       = score   kill-switch: v1.19.0 ordering byte-for-byte.
+# Functions added: 2 (_env_audit_order, _audit_depth_key). Removed: 0.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v1.19.0 (2026-09-01) - RELIABILITY FLOOR MODE (H-28 consequence, unarmed)
 # -----------------------------------------------------------------------------
@@ -2024,6 +2050,13 @@ def _normalize_sector(s):
     _env_sector_normalize()."""
     t = (s or "").strip()
     return _YAHOO_TO_GICS_SECTOR.get(t, t)
+
+
+def _env_audit_order():
+    """v1.19.1 [AUDIT-DEPTH-ORDER]: TFB_OPP_AUDIT_ORDER = depth (default) |
+    score (kill-switch, v1.19.0 ordering byte-for-byte). Display-only."""
+    raw = str(_env_str("TFB_OPP_AUDIT_ORDER", "depth") or "depth").strip().lower()
+    return "score" if raw == "score" else "depth"
 
 
 def _env_rank_by_engine_roi():
@@ -3484,6 +3517,27 @@ def first_failed_gate(gates):
     return failed[0] if failed else None
 
 
+_GATE_DEPTH_INDEX = {name: i for i, name in enumerate(GATE_ORDER)}  # v1.19.1
+
+
+def _audit_depth_key(a):
+    """v1.19.1 [AUDIT-DEPTH-ORDER] sort key for the written audit / near-miss
+    pool: INVEST first, then the row whose FIRST failing gate sits deepest in
+    GATE_ORDER (it survived more gates), then reliability desc, score desc,
+    symbol. A row with no first_fail that is not INVEST (structural) sorts
+    as deepest-possible so it is never hidden behind a gate-5 failure."""
+    ff = a.get("first_fail") or None
+    if ff:
+        depth = _GATE_DEPTH_INDEX.get(ff.get("gate"), -1)
+    else:
+        depth = len(GATE_ORDER)
+    return (0 if a.get("verdict") == VERDICT_INVEST else 1,
+            -depth,
+            -float(a.get("reliability") or 0.0),
+            -float(a.get("opportunity_score") or 0.0),
+            str(a.get("symbol") or ""))
+
+
 # ---------------------------------------------------------------------------
 # §4.3 opportunity score
 # ---------------------------------------------------------------------------
@@ -4320,7 +4374,12 @@ def _round4(v):
 
 def _near_miss_rows(audit, selected_syms, deferrals, criteria):
     pool = [a for a in audit if a["symbol"] not in selected_syms]
-    pool.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
+    # v1.19.1 [AUDIT-DEPTH-ORDER]: near-miss = the rows that got FURTHEST, not
+    # the highest-scoring failures. Kill-switch TFB_OPP_AUDIT_ORDER=score.
+    if _env_audit_order() == "depth":
+        pool.sort(key=_audit_depth_key)
+    else:
+        pool.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
     rows = []
     for a in pool[:criteria["near_miss_n"]]:
         if a["symbol"] in deferrals:
@@ -4887,7 +4946,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     "the operator's decision."),
             })
     # 4) audit grid sorted by score; strip internals
-    audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
+    # v1.19.1 [AUDIT-DEPTH-ORDER]: depth order by default (display-only).
+    if _env_audit_order() == "depth":
+        audit.sort(key=_audit_depth_key)
+    else:
+        audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
     for a in audit:
         a.pop("_cand", None)
 
@@ -4910,8 +4973,16 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             else:
                 _rest.append(a)
         _room = _audit_cap - len(_must)
+        # v1.19.1 [AUDIT-DEPTH-ORDER]: the free slots go to the rows that got
+        # furthest through the gate chain, so a Risk/Reward failure is written
+        # before a Valuation Sanity failure. Kill-switch: score order.
+        if _env_audit_order() == "depth":
+            _rest.sort(key=_audit_depth_key)
         audit = _must + (_rest[:_room] if _room > 0 else [])
-        audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
+        if _env_audit_order() == "depth":
+            audit.sort(key=_audit_depth_key)
+        else:
+            audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
 
     meta_in = upstream_meta or {}
     meta = {
