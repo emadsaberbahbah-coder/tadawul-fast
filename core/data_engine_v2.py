@@ -3324,7 +3324,7 @@ if str(ROOT_DIR) not in sys.path:
 #   guard work item. KILL SWITCH: TFB_DQ_COHERENCE_LEGACY=1 => v5.132.1
 #   byte-identical. Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-__version__ = "5.134.0"
+__version__ = "5.135.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -12828,6 +12828,90 @@ def _target_mean_publish_enabled() -> bool:
         not in ("0", "false", "off", "no")
 
 
+# =============================================================================
+# v5.135.0 (Fix AJ) - VALUATION SANITY FIREWALL at the publish boundary
+# =============================================================================
+# EVIDENCE (workbook exports 2026-09-02 07:00-09:10 Riyadh, all rows rebuilt
+# that morning on v5.134.0): the published Target Price disagrees with the
+# row's own Upside % on 5,465 of 6,080 Global_Markets rows (89.9%); 2,104
+# targets and 1,017 intrinsic values sit outside [0.25x, 3.0x] of price
+# (KLAC.US 170.89 -> target 3,812.30; MCHPP.US 61.87 -> 129,500;
+# KIDZ.US 4.05 -> 69,730). Every one of those rows is phase_ii_synthetic;
+# ZERO provider_target rows fall outside the band (measured on the same
+# export), so the band is a data-integrity bound, not a valuation opinion.
+# Downstream, the Top_10 builder read those numbers as real and 290-297 of
+# every 300 audited candidates failed Valuation Sanity on garbage.
+# FIX: at the SAME final boundary as _apply_analyst_trend_block (all four
+# call sites inherit it), a published target_price / intrinsic_value whose
+# ratio to the current price is outside [TFB_TARGET_SANITY_MIN_RATIO,
+# TFB_TARGET_SANITY_MAX_RATIO] (defaults 0.25 / 3.0) is BLANKED together
+# with the upside field derived from it, and the row is tagged
+# "target_rejected_outlier(xN.N)" / "intrinsic_rejected_outlier(xN.N)"
+# so the source hunt (Register, Phase 1.3) keeps the provenance. Fail-open:
+# no price, non-positive value or unparseable input => untouched. Scoring
+# upstream of the boundary is NOT changed by this build (display/publish
+# layer only); the source-level fundamentals firewall is a separate item.
+# Kill-switch TFB_TARGET_SANITY_GUARD=0/false/off => v5.134.0 byte-for-byte.
+# Functions added: 3 (_valuation_sanity_guard_enabled, _valuation_sanity_bounds,
+# _apply_valuation_sanity_firewall). Removed: 0.
+# =============================================================================
+def _valuation_sanity_guard_enabled() -> bool:
+    """v5.135.0 (Fix AJ) kill-switch. Default ON."""
+    return (os.getenv("TFB_TARGET_SANITY_GUARD") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _valuation_sanity_bounds() -> Tuple[float, float]:
+    """v5.135.0: [min, max] ratio of published valuation ref to current
+    price. Env-tunable; unparseable or inverted values fall back to
+    (0.25, 3.0)."""
+    lo = _as_float(os.getenv("TFB_TARGET_SANITY_MIN_RATIO"))
+    hi = _as_float(os.getenv("TFB_TARGET_SANITY_MAX_RATIO"))
+    if lo is None or lo <= 0:
+        lo = 0.25
+    if hi is None or hi <= lo:
+        hi = 3.0
+    return float(lo), float(hi)
+
+
+def _apply_valuation_sanity_firewall(row: Dict[str, Any]) -> None:
+    """v5.135.0 (Fix AJ): blank a published target_price / intrinsic_value
+    (and the upside derived from it) whose ratio to price is outside the
+    sanity band; tag the row with the ratio. Mutates in place; never
+    raises; fail-open on any missing input."""
+    try:
+        if not _valuation_sanity_guard_enabled() or not isinstance(row, dict):
+            return
+        px = _as_float(row.get("current_price"))
+        if px is None or px <= 0:
+            px = _as_float(row.get("price"))
+        if px is None or px <= 0:
+            return
+        lo, hi = _valuation_sanity_bounds()
+        checks = (
+            ("target_price", ("analyst_target_price",),
+             ("upside_downside_pct", "upside_downside"), "target_rejected_outlier"),
+            ("intrinsic_value", (), ("upside_pct",), "intrinsic_rejected_outlier"),
+        )
+        for key, aliases, upside_keys, tag in checks:
+            v = _as_float(row.get(key))
+            if v is None or v <= 0:
+                continue
+            ratio = v / px
+            if lo <= ratio <= hi:
+                continue
+            row[key] = None
+            for a in aliases:
+                if a in row:
+                    row[a] = None
+            for u in upside_keys:
+                if u in row:
+                    row[u] = None
+            _append_yahoo_warning_tag(row, "%s(x%.1f)" % (tag, ratio))
+    except Exception:
+        return
+
+
 def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     """v5.85.0 (Fix AD): populate the eight schema-defined presentation columns
     the engine never emitted (Analyst Rating, Target Price, Upside/Downside %,
@@ -12964,6 +13048,9 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
 
     if touched:
         _v573_append_warning(row, "analyst_trend_block_applied")
+    # v5.135.0 (Fix AJ): publish-boundary valuation sanity firewall - runs at
+    # every call site of this block (all four final boundaries).
+    _apply_valuation_sanity_firewall(row)
 
 
 
