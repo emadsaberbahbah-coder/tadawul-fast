@@ -38,7 +38,7 @@ jobs:
       TFB_SHADOW_EODHD: ${{ vars.TFB_SHADOW_EODHD }}
       TFB_EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
