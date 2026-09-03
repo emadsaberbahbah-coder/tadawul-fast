@@ -336,6 +336,16 @@ jobs:
       # Unset -> 'ohlc' -> byte-identical.
       TFB_SYNC_NULL_CLEAR_SCOPE: ${{ vars.TFB_SYNC_NULL_CLEAR_SCOPE || 'ohlc' }}
       TFB_SYNC_NULL_KEEP_COLS: ${{ vars.TFB_SYNC_NULL_KEEP_COLS || '' }}
+      # W1A-6g (2026-09-03): map two overrides that existed in code but were
+      # never reachable from repo Variables (kill-switch-without-mapping class).
+      #  - v6.29.0 FORCE-REFETCH: comma list of symbols whose OLD sheet row may
+      #    NEVER be KLG-substituted this run (fresh fetch/stub always wins).
+      #    Operator contract: set for ONE run, verify [FORCE-REFETCH], unset.
+      #    Unset/empty -> byte-exact no-op.
+      #  - v6.43.0 IDENTITY-REFETCH: fronts name-dup (>= NAME_DEDUP_MIN) rows
+      #    for a real single-symbol refetch. Unset -> '0' -> byte-identical.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}
+      TFB_SYNC_IDENTITY_REFETCH: ${{ vars.TFB_SYNC_IDENTITY_REFETCH || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
@@ -1410,6 +1420,16 @@ jobs:
       # Unset -> 'ohlc' -> byte-identical.
       TFB_SYNC_NULL_CLEAR_SCOPE: ${{ vars.TFB_SYNC_NULL_CLEAR_SCOPE || 'ohlc' }}
       TFB_SYNC_NULL_KEEP_COLS: ${{ vars.TFB_SYNC_NULL_KEEP_COLS || '' }}
+      # W1A-6g (2026-09-03): map two overrides that existed in code but were
+      # never reachable from repo Variables (kill-switch-without-mapping class).
+      #  - v6.29.0 FORCE-REFETCH: comma list of symbols whose OLD sheet row may
+      #    NEVER be KLG-substituted this run (fresh fetch/stub always wins).
+      #    Operator contract: set for ONE run, verify [FORCE-REFETCH], unset.
+      #    Unset/empty -> byte-exact no-op.
+      #  - v6.43.0 IDENTITY-REFETCH: fronts name-dup (>= NAME_DEDUP_MIN) rows
+      #    for a real single-symbol refetch. Unset -> '0' -> byte-identical.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}
+      TFB_SYNC_IDENTITY_REFETCH: ${{ vars.TFB_SYNC_IDENTITY_REFETCH || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
