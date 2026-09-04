@@ -25,6 +25,16 @@ WHAT IT MEASURES (each row = criterion, measured value, verdict, evidence)
     G1..G4 gates               rows, dup/blank symbols, freshness, provider_target
                                share, Target Price share, false greens (INVEST with
                                fetch_failed or a non-ticker symbol)
+    A1..A4 decision integrity  (v1.0.6, 2026-09-04 six-gate audit classes)
+                               A1 board seats on Derayah-tradable venues (symbol
+                                  suffix in core.compliance_gate.DERAYAH_MARKETS)
+                               A2 USD FX peg: Top_10 audit + Portfolio_Decision
+                                  Price SAR / Price within [3.74, 3.77]
+                               A3 equity identity collisions: futures / crypto /
+                                  contract-month names on Global_Markets /
+                                  Market_Leaders equity rows (KE.US -> wheat,
+                                  LINK.US -> Chainlink, NG.US -> natural gas)
+                               A4 Portfolio_Decision TRIM/EXIT rows carry Δ Shares
 
 VERDICT VOCABULARY   PASS / WARN / FAIL / NA. Exit code 0 unless --strict and
 any FAIL (the CI workflow runs non-strict: an instrument, not a blocker).
@@ -53,11 +63,28 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
+
+# v1.0.6 — decision-integrity constants. The venue set mirrors
+# core.compliance_gate.DERAYAH_MARKETS (loaded live when importable; the frozen
+# copy below is the offline fallback and is reported as such in evidence).
+_DERAYAH_SUFFIXES_FROZEN = frozenset((
+    "US", "SR", "T", "HK", "L", "PA", "AS", "BR", "DE", "MI", "MC", "LS", "VI",
+    "SW", "TO", "AX", "OL", "SI", "MX"))
+_FX_PEG_BAND = (3.74, 3.77)          # SAR/USD official 3.75; spot 3.7500..3.7550
+_FX_PEG_MIN_ROWS = 5
+# names that can never belong to an equity row: futures, contract months, crypto pairs
+_IDENTITY_COLLISION_RE = re.compile(
+    r"\bfutures\b"          # plural only: "Future FinTech Group" is a company
+    r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s-]?\d{2}(?:\d{2})?\s*$"
+    r"|,\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-\d{4}\b"
+    r"|\susd\s*$",
+    re.I)
+_NON_EQUITY_SYMBOL_RE = re.compile(r"(=F|=X|-USD|-USDT|\^)", re.I)
 
 
 # --------------------------------------------------------------------------- #
@@ -570,10 +597,183 @@ def check_s1(src: Source) -> List[Check]:
     return [Check("D10-7", "S-1 evidence clock (scored days /28)", "PASS" if scored >= 28 else "WARN", scored, f"verdict={verdict or '?'}")]
 
 
+def _derayah_suffixes() -> Tuple[frozenset, str]:
+    """v1.0.6: (suffix set, source). Live from core.compliance_gate when the
+    repo is importable (CI runs from the repo root); frozen copy otherwise."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.dirname(here)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from core.compliance_gate import DERAYAH_MARKETS  # type: ignore
+        live = frozenset(_s(k).lstrip(".").upper() for k in DERAYAH_MARKETS.keys() if _s(k))
+        if live:
+            return live, "compliance_gate"
+    except Exception:
+        pass
+    return _DERAYAH_SUFFIXES_FROZEN, "frozen"
+
+
+def _symbol_suffix(sym: str) -> str:
+    s = _s(sym).upper()
+    if not s:
+        return ""
+    return s.rsplit(".", 1)[1] if "." in s else "US"
+
+
+def _top10_sections(src: Source) -> Dict[str, Tuple[List[str], List[List[str]]]]:
+    """v1.0.6: named sections of the Top_10 export -> (header, body rows).
+    board    = the header row that carries both Symbol and Stability
+    qualified= header after a row starting with ALL QUALIFIED
+    audit    = header after a row starting with CANDIDATES"""
+    rows = [[_s(c) for c in r] for r in src.tab("Top_10_Investments")]
+    out: Dict[str, Tuple[List[str], List[List[str]]]] = {}
+
+    def body(i: int) -> List[List[str]]:
+        b: List[List[str]] = []
+        for rr in rows[i + 1:]:
+            if not rr or not any(rr) or not (rr[0] or (len(rr) > 1 and rr[1])):
+                break
+            b.append(rr)
+        return b
+    for i, r in enumerate(rows):
+        if "Symbol" not in r:
+            continue
+        prev = _s(rows[i - 1][0]).upper() if i > 0 and rows[i - 1] else ""
+        if "Stability" in r and "board" not in out:
+            out["board"] = (r, body(i))
+        elif prev.startswith("ALL QUALIFIED") and "qualified" not in out:
+            out["qualified"] = (r, body(i))
+        elif prev.startswith("CANDIDATES") and "audit" not in out:
+            out["audit"] = (r, body(i))
+    return out
+
+
+def _implied_fx(header: List[str], body: List[List[str]], ccy_col: str, px_col: str,
+                pxsar_col: str) -> List[Tuple[str, float]]:
+    ix = {h: i for i, h in enumerate(header)}
+    if ccy_col not in ix or px_col not in ix or pxsar_col not in ix:
+        return []
+    out: List[Tuple[str, float]] = []
+    for r in body:
+        if len(r) <= max(ix[ccy_col], ix[px_col], ix[pxsar_col]):
+            continue
+        if _s(r[ix[ccy_col]]).upper() != "USD":
+            continue
+        px, ps = _to_float(r[ix[px_col]]), _to_float(r[ix[pxsar_col]])
+        if px and ps and px > 0 and ps > 0:
+            out.append((_s(r[ix.get("Symbol", 0)]), ps / px))
+    return out
+
+
+def check_decision_integrity(src: Source) -> List[Check]:
+    """v1.0.6: A1..A4 — the four 2026-09-04 audit classes, measured daily."""
+    out: List[Check] = []
+    sec = _top10_sections(src)
+    suffixes, sfx_src = _derayah_suffixes()
+    lo, hi = _FX_PEG_BAND
+    # A1 — board seats on tradable venues
+    if "board" in sec:
+        hdr, body = sec["board"]
+        si = hdr.index("Symbol")
+        seats = [_s(r[si]) for r in body if len(r) > si and _s(r[si])]
+        bad = [f"{s}(.{_symbol_suffix(s)})" for s in seats if _symbol_suffix(s) not in suffixes]
+        out.append(Check("A1", "board seats on Derayah-tradable venues (suffix in DERAYAH_MARKETS)",
+                         "PASS" if (seats and not bad) else ("FAIL" if bad else "NA"), len(bad),
+                         f"seats={len(seats)} untradable={' '.join(bad) or 'none'} | venue set: {sfx_src} ({len(suffixes)})"))
+    else:
+        out.append(Check("A1", "board seats on Derayah-tradable venues (suffix in DERAYAH_MARKETS)", "NA", None,
+                         "Top_10 board section not found"))
+    # A2 — USD FX peg (Top_10 audit, then Portfolio_Decision)
+    if "audit" in sec:
+        hdr, body = sec["audit"]
+        vals = _implied_fx(hdr, body, "Ccy", "Price", "Price SAR")
+        if len(vals) >= _FX_PEG_MIN_ROWS:
+            xs = sorted(v for _, v in vals)
+            med = xs[len(xs) // 2]
+            outside = [(s, v) for s, v in vals if not (lo <= v <= hi)]
+            share = len(outside) / float(len(vals))
+            v = "FAIL" if not (lo <= med <= hi) else ("WARN" if share > 0.01 else "PASS")
+            out.append(Check("A2a", f"USD FX peg — Top_10 audit Price SAR/Price within [{lo}, {hi}]", v, round(med, 4),
+                             f"n={len(vals)} median={med:.4f} min={xs[0]:.4f} max={xs[-1]:.4f} outside={len(outside)} "
+                             f"({share * 100:.1f}%) e.g. {' '.join(f'{s}={x:.4f}' for s, x in outside[:3]) or '-'}"))
+        else:
+            out.append(Check("A2a", f"USD FX peg — Top_10 audit Price SAR/Price within [{lo}, {hi}]", "NA", None,
+                             f"USD rows with both prices: {len(vals)} (< {_FX_PEG_MIN_ROWS})"))
+    else:
+        out.append(Check("A2a", f"USD FX peg — Top_10 audit Price SAR/Price within [{lo}, {hi}]", "NA", None,
+                         "Top_10 audit section not found"))
+    pd_rows = [[_s(c) for c in r] for r in src.tab("Portfolio_Decision")]
+    pd_hdr_i = next((i for i, r in enumerate(pd_rows) if "Action" in r and "Symbol" in r), None)
+    if pd_hdr_i is None:
+        out.append(Check("A2b", f"USD FX peg — Portfolio_Decision Price SAR/Price within [{lo}, {hi}]", "NA", None,
+                         "Portfolio_Decision header not found"))
+        out.append(Check("A4", "Portfolio_Decision sell-side rows (TRIM/EXIT) carry Δ Shares", "NA", None,
+                         "Portfolio_Decision header not found"))
+    else:
+        hdr = pd_rows[pd_hdr_i]
+        body = []
+        for rr in pd_rows[pd_hdr_i + 1:]:
+            if not rr or not _s(rr[0]):
+                break
+            body.append(rr)
+        vals = _implied_fx(hdr, body, "Ccy", "Price", "Price SAR")
+        if vals:
+            outside = [(s, v) for s, v in vals if not (lo <= v <= hi)]
+            out.append(Check("A2b", f"USD FX peg — Portfolio_Decision Price SAR/Price within [{lo}, {hi}]",
+                             "PASS" if not outside else "FAIL", len(outside),
+                             f"usd_rows={len(vals)} outside={len(outside)} "
+                             f"e.g. {' '.join(f'{s}={x:.4f}' for s, x in outside[:3]) or '-'}"))
+        else:
+            out.append(Check("A2b", f"USD FX peg — Portfolio_Decision Price SAR/Price within [{lo}, {hi}]", "NA", None,
+                             "no USD rows with both prices"))
+        ix = {h: i for i, h in enumerate(hdr)}
+        dcol = next((k for k in ("\u0394 Shares", "Delta Shares", "Δ Shares") if k in ix), None)
+        if dcol is None or "Action" not in ix:
+            out.append(Check("A4", "Portfolio_Decision sell-side rows (TRIM/EXIT) carry Δ Shares", "NA", None,
+                             "Δ Shares / Action column not found"))
+        else:
+            sells = [r for r in body if len(r) > ix["Action"] and _s(r[ix["Action"]]).upper() in ("TRIM", "EXIT")]
+            blank = [_s(r[ix["Symbol"]]) for r in sells
+                     if len(r) <= ix[dcol] or _to_float(r[ix[dcol]]) is None]
+            out.append(Check("A4", "Portfolio_Decision sell-side rows (TRIM/EXIT) carry Δ Shares",
+                             "FAIL" if blank else "PASS", len(blank),
+                             f"sell_rows={len(sells)} blank_delta_shares={' '.join(blank) or 'none'}"))
+    # A3 — equity identity collisions on the equity pages
+    for p in ("Global_Markets", "Market_Leaders"):
+        rows = src.tab(p)
+        if not rows:
+            out.append(Check(f"A3-{p}", f"{p} equity identity collisions (futures / crypto / contract-month names)",
+                             "NA", None, "tab unreadable"))
+            continue
+        hdr = [_s(c) for c in rows[0]]
+        ix = {h: i for i, h in enumerate(hdr)}
+        if "Symbol" not in ix or "Name" not in ix:
+            out.append(Check(f"A3-{p}", f"{p} equity identity collisions (futures / crypto / contract-month names)",
+                             "NA", None, "Symbol/Name columns not found"))
+            continue
+        hits: List[str] = []
+        n_eq = 0
+        for r in rows[1:]:
+            if len(r) <= max(ix["Symbol"], ix["Name"]):
+                continue
+            sym, name = _s(r[ix["Symbol"]]), _s(r[ix["Name"]])
+            if not sym or _NON_EQUITY_SYMBOL_RE.search(sym) or _symbol_suffix(sym) not in suffixes:
+                continue
+            n_eq += 1
+            if name and _IDENTITY_COLLISION_RE.search(name):
+                hits.append(f"{sym}\u2192{name[:28]}")
+        out.append(Check(f"A3-{p}", f"{p} equity identity collisions (futures / crypto / contract-month names)",
+                         "FAIL" if hits else "PASS", len(hits),
+                         f"equity_rows={n_eq} hits={' | '.join(hits[:6]) or 'none'}"))
+    return out
+
+
 def run_all(src: Source, board_min: int = 5) -> List[Check]:
     checks: List[Check] = []
     for fn in (lambda: check_board(src, board_min), lambda: check_evidence_clock(src), lambda: check_learning(src),
-               lambda: check_feed_truth(src), lambda: check_pages(src), lambda: check_s1(src)):
+               lambda: check_feed_truth(src), lambda: check_pages(src), lambda: check_s1(src),
+               lambda: check_decision_integrity(src)):   # v1.0.6
         try:
             checks.extend(fn())
         except Exception as exc:  # a broken check is reported, never hides the rest
@@ -694,8 +894,62 @@ def _selftest() -> int:
         assert any("xlsx not found" in e for e in src2.errors)
         src2.tab("Performance_Log")
         assert any("Performance_Log" in e for e in src2.errors), src2.errors
+    # v1.0.6 fixtures: decision integrity A1..A4 (good and bad Top_10 board/audit, PD, GM names)
+    t10_hdr_board = ["Rank", "Symbol", "Name", "Market", "Sector", "Ccy", "FX\u2192SAR", "Price", "Price SAR",
+                     "Stability"]
+    t10_hdr_audit = ["Symbol", "Name", "Market", "Sector", "Ccy", "Price", "Price SAR", "Verdict"]
+    t10_good = [["Status:", "Last run x"], [], ["banner"], t10_hdr_board,
+                ["1", "DDI.US", "DoubleDown", "NASDAQ", "Tech", "USD", "3.7528", "10.00", "37.53", "ACTIVE (2/3)"],
+                ["2", "2222.SR", "Aramco", "Tadawul", "Energy", "SAR", "1.0", "25.96", "25.96", "ACTIVE (3/3)"], [],
+                ["CANDIDATES \u2014 FULL AUDIT"], t10_hdr_audit] + [
+                [f"S{i}.US", f"Co {i}", "NYSE", "Tech", "USD", "10.00", "37.53", "INVEST"] for i in range(6)]
+    t10_bad = [["Status:", "Last run x"], [], ["banner"], t10_hdr_board,
+               ["1", "HDFCBANK.NS", "HDFC Bank", "NSE India", "Financials", "INR", "0.0395", "710.30", "28.03", "GRACE"],
+               ["\u2014", "BYMA.BA", "Bolsas", "BCBA", "Financials", "ARS", "", "264.50", "", "GRACE"],
+               ["3", "DDI.US", "DoubleDown", "NASDAQ", "Tech", "USD", "3.8088", "10.00", "38.09", "ACTIVE"], [],
+               ["CANDIDATES \u2014 FULL AUDIT"], t10_hdr_audit] + [
+               [f"S{i}.US", f"Co {i}", "NYSE", "Tech", "USD", "10.00", "38.09", "INVEST"] for i in range(6)]
+    pd_hdr = ["Action", "Symbol", "Name", "Sector", "Ccy", "Qty", "Avg Cost", "Price", "Price SAR", "\u0394 SAR",
+              "\u0394 Shares"]
+    pd_good = [["x"], pd_hdr, ["TRIM", "HCI.US", "HCI", "Fin", "USD", "30", "191.41", "189.83", "712.36", "-3,338 SAR", "-5"],
+               ["HOLD", "YUM", "Yum", "CC", "USD", "24", "144.71", "152.54", "572.45", "", ""]]
+    pd_bad = [["x"], pd_hdr, ["TRIM", "HCI.US", "HCI", "Fin", "USD", "30", "191.41", "189.83", "723.06", "-3,338 SAR", ""],
+              ["EXIT", "OTIS", "Otis", "Ind", "USD", "55", "72.79", "71.48", "272.27", "-14,759 SAR", ""]]
+    gm_hdr = ["Symbol", "Name", "Open", "Day High", "Day Low", "Expected ROI 12M", "Forecast Source", "Target Price",
+              "Investability Status", "Final Action", "Warnings", "Last Updated (UTC)"]
+    gm_bad = [gm_hdr, ["KE.US", "KC HRW Wheat Futures,Dec-2026", "10", "11", "9", "0.1", "provider_target", "12",
+                       "WATCHLIST", "WATCH", "", now],
+              ["LINK.US", "Chainlink USD", "10", "11", "9", "0.1", "provider_target", "12", "WATCHLIST", "WATCH", "", now],
+              ["NG.US", "Natural Gas Oct 26", "10", "11", "9", "0.1", "provider_target", "12", "WATCHLIST", "WATCH", "", now],
+              ["CC.US", "The Chemours Company", "10", "11", "9", "0.1", "provider_target", "12", "WATCHLIST", "WATCH", "", now],
+              ["FTFT.US", "Future FinTech Group Inc.", "10", "11", "9", "0.1", "provider_target", "12", "WATCHLIST", "WATCH", "", now],
+              ["NG=F", "Natural Gas Oct 26", "3", "3", "3", "", "", "", "", "", "", now],
+              ["BTC-USD", "Bitcoin USD", "3", "3", "3", "", "", "", "", "", "", now],
+              ["1120.SR", "Al Rajhi Bank", "10", "11", "9", "0.1", "provider_target", "12", "INVESTABLE", "INVEST", "", now]]
+    G = _MemSource({"Top_10_Investments": t10_good, "Portfolio_Decision": pd_good, "Global_Markets": good,
+                    "Market_Leaders": good})
+    cg = {c.cid: c for c in check_decision_integrity(G)}
+    assert cg["A1"].verdict == "PASS" and cg["A1"].measured == 0, cg["A1"].evidence
+    assert cg["A2a"].verdict == "PASS" and abs(cg["A2a"].measured - 3.753) < 0.001, cg["A2a"].evidence
+    assert cg["A2b"].verdict == "PASS" and cg["A2b"].measured == 0, cg["A2b"].evidence
+    assert cg["A4"].verdict == "PASS" and cg["A4"].measured == 0, cg["A4"].evidence
+    assert cg["A3-Global_Markets"].verdict == "PASS" and cg["A3-Market_Leaders"].verdict == "PASS"
+    H = _MemSource({"Top_10_Investments": t10_bad, "Portfolio_Decision": pd_bad, "Global_Markets": gm_bad,
+                    "Market_Leaders": good})
+    ch = {c.cid: c for c in check_decision_integrity(H)}
+    assert ch["A1"].verdict == "FAIL" and ch["A1"].measured == 2 and "HDFCBANK.NS(.NS)" in ch["A1"].evidence, ch["A1"].evidence
+    assert ch["A2a"].verdict == "FAIL" and abs(ch["A2a"].measured - 3.809) < 0.001, ch["A2a"].evidence
+    assert ch["A2b"].verdict == "FAIL" and ch["A2b"].measured == 2, ch["A2b"].evidence
+    assert ch["A4"].verdict == "FAIL" and ch["A4"].measured == 2 and "HCI.US" in ch["A4"].evidence, ch["A4"].evidence
+    assert ch["A3-Global_Markets"].verdict == "FAIL" and ch["A3-Global_Markets"].measured == 3, ch["A3-Global_Markets"].evidence
+    assert "CC.US" not in ch["A3-Global_Markets"].evidence and "NG=F" not in ch["A3-Global_Markets"].evidence
+    assert "FTFT.US" not in ch["A3-Global_Markets"].evidence, ch["A3-Global_Markets"].evidence   # "Future" ≠ futures
+    N = _MemSource({})
+    cn = {c.cid: c for c in check_decision_integrity(N)}
+    assert all(cn[k].verdict == "NA" for k in ("A1", "A2a", "A2b", "A4", "A3-Global_Markets")), [c.row() for c in cn.values()]
+    assert {c.cid for c in run_all(A)} >= {"A1", "A2a", "A2b", "A4", "A3-Global_Markets", "A3-Market_Leaders"}
     print(render(list(ca.values()), "selftest A (all good)"))
-    print("selftest: PASS 6/6 fixtures (all-good, all-bad, stale page, mixed target cohort, duplicate downloads, unreadable xlsx)")
+    print("selftest: PASS 7/7 fixtures (all-good, all-bad, stale page, mixed target cohort, duplicate downloads, unreadable xlsx, decision integrity A1..A4)")
     return 0
 
 
