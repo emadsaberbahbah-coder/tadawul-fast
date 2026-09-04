@@ -3360,7 +3360,37 @@ if str(ROOT_DIR) not in sys.path:
 #   reliability formula, entry schema, TTL default, fund LKG, providers,
 #   SAI contract. Zero functions removed.
 # =============================================================================
-__version__ = "5.136.0"
+# =============================================================================
+# v5.137.0 (2026-09-04) — CHART-META CLASS GUARD (belt for the bare-root
+# collision; env-gated, DEFAULT OFF)
+# =============================================================================
+# EVIDENCE (2026-09-04 six-gate audit + tfb_acceptance v1.0.6 A3 on the real
+#   export): six Global_Markets .US equity rows wore commodity / crypto
+#   identities with blank sectors — KE.US "KC HRW Wheat Futures,Dec-2026",
+#   NG.US "Natural Gas Oct 26", SI.US "Silver Dec 26", PL.US "Platinum Oct
+#   26", HG.US "Copper Dec 26", LINK.US "Chainlink USD". ROOT CAUSE is in
+#   core/symbols/normalize.py (v5.5.0: a bare root re-normalized by the chart
+#   provider became KE=F / LINK-USD). This engine change is the BELT: the
+#   BA-1 identity rescue accepted the contract's longName because the YC-4 /
+#   BB-1 identity checks compare SYMBOL token sets (KE vs KE=F intersect),
+#   while Yahoo's own meta declared instrumentType=FUTURE / CRYPTOCURRENCY —
+#   a class contradiction that no check consulted.
+# FIX (additions only, inside _apply_identity_rescue BA-1, before the echo
+#   gate): when TFB_ENGINE_CHART_META_CLASS_GUARD=1 and the row resolves to
+#   Equity (_yf_asset_class_ok — the v5.132 equity-only contract), a meta
+#   whose instrumentType / quoteType is one of FUTURE, CRYPTOCURRENCY,
+#   CURRENCY, INDEX, OPTION, COMMODITY is REFUSED for name / exchange /
+#   currency fill: tag identity_class_refused:<TYPE>, leave the name blank
+#   for BA-2 (static map) — a stranger's class never dresses an equity row.
+#   EQUITY / ETF / MUTUALFUND / an absent type keep v5.136.0 behaviour.
+# ENV (Render): TFB_ENGINE_CHART_META_CLASS_GUARD — DEFAULT OFF => v5.136.0
+#   byte-identical. Read-back: rows carry identity_class_refused:* only while
+#   normalize v5.5.0's TFB_SYM_BARE_ROOT_EQUITY is still OFF (with it ON the
+#   provider no longer fetches the contract, so the guard is silent).
+# NOT CHANGED: BB-1 echo gate, YC-4, BA-2 static map, enrichment passes,
+#   target LKG, providers. Zero functions removed.
+# =============================================================================
+__version__ = "5.137.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5489,6 +5519,43 @@ _NAME_UNRESOLVED_TAG = "name_unresolved"
 # v5.118.0 (Fix BA) -- identity rescue: chart-meta name + static-map belt
 # =============================================================================
 _ENGINE_STATIC_MAP_CACHE: Optional[Dict[str, str]] = None
+
+
+_CHART_META_NON_EQUITY_TYPES: Tuple[str, ...] = (
+    "FUTURE", "CRYPTOCURRENCY", "CURRENCY", "INDEX", "OPTION", "COMMODITY")
+
+
+def _chart_meta_class_guard_enabled() -> bool:
+    """v5.137.0: DEFAULT OFF — unset/0/false/off keeps _apply_identity_rescue
+    byte-identical to v5.136.0."""
+    return os.getenv("TFB_ENGINE_CHART_META_CLASS_GUARD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _chart_meta_declared_type(meta: Mapping[str, Any]) -> str:
+    """Upper-cased Yahoo instrumentType / quoteType from a chart meta, or ""."""
+    try:
+        return _safe_str(meta.get("instrumentType") or meta.get("quoteType")).strip().upper()
+    except Exception:
+        return ""
+
+
+def _chart_meta_class_refused(row: Mapping[str, Any], meta: Mapping[str, Any]) -> str:
+    """v5.137.0: the declared non-equity type when the guard is ON, the row is
+    an Equity (v5.132 contract) and the meta declares FUTURE / CRYPTO /
+    CURRENCY / INDEX / OPTION / COMMODITY; "" otherwise. Never raises."""
+    try:
+        if not _chart_meta_class_guard_enabled():
+            return ""
+        if not isinstance(row, Mapping) or not isinstance(meta, Mapping):
+            return ""
+        t = _chart_meta_declared_type(meta)
+        if t not in _CHART_META_NON_EQUITY_TYPES:
+            return ""
+        if not _yf_asset_class_ok(dict(row)):
+            return ""
+        return t
+    except Exception:
+        return ""
 
 
 def _identity_rescue_enabled() -> bool:
@@ -15445,6 +15512,13 @@ class DataEngineV5:
                             or meta.get("requested_symbol")
                             or meta.get("symbol_normalized")
                         ).strip().upper()
+                        # v5.137.0: class guard — a FUTURE / CRYPTO / FX / INDEX
+                        # meta never dresses an Equity row (no-op when OFF).
+                        _cls_refused = _chart_meta_class_refused(row, meta)
+                        if _cls_refused:
+                            _append_yahoo_warning_tag(row, "identity_class_refused:" + _cls_refused)
+                            meta = {}
+                    if isinstance(meta, dict) and meta:
                         if echo and not _bb1_echo_matches(sym, echo):
                             _append_yahoo_warning_tag(row, "identity_echo_refused")
                             return row
