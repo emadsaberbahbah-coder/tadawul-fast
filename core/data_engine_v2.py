@@ -3324,7 +3324,43 @@ if str(ROOT_DIR) not in sys.path:
 #   guard work item. KILL SWITCH: TFB_DQ_COHERENCE_LEGACY=1 => v5.132.1
 #   byte-identical. Zero removals; all prior WHYs preserved verbatim.
 # =============================================================================
-__version__ = "5.135.0"
+# =============================================================================
+# v5.136.0 (2026-09-04) — R-6b: TARGET-LKG PERSISTENCE (Redis L2, default OFF)
+# =============================================================================
+# EVIDENCE (Morning session 2026-09-04, six-gate audit): the v5.131.0 target
+#   LKG (W1A-0b) is byte-correct but has run as dead code since 2026-08-21
+#   (TFB_ENGINE_TARGET_KLG default OFF). Same-day rows flipped provider_target
+#   -> phase_ii_synthetic inside ONE sync (HDFCBANK.NS 34.3% -> -4.36%,
+#   ITRN.US, GRNT.US, HDB.US) and flipped back within hours (HCI.US, SBAC.US,
+#   OTIS.US 12:54Z). Arming the v5.131.0 store as-is would under-deliver:
+#   _TGT_LKG_STORE is a per-worker in-memory dict (two gunicorn workers =
+#   two disjoint stores) and every Render deploy - i.e. every ENV arming -
+#   empties it, so the carry is cold precisely on evidence mornings.
+# FIX: an L2 layer for the SAME store, additions only:
+#   _tgt_lkg_capture  -> after the in-memory write, write-through SETEX
+#                        tfb:tgt_lkg:v1:<SYMBOL> (ttl = _tgt_lkg_ttl_h) with
+#                        the unchanged entry schema {ts,name,fp12[,tmp]}.
+#   _tgt_lkg_restore  -> on an in-memory MISS only, GET the L2 entry, hydrate
+#                        memory, then fall through to the UNCHANGED TTL /
+#                        taint / identity guards (age is still entry.ts-based,
+#                        so semantics are identical to v5.131.0).
+#   Lazy client (redis==5.3.1 already pinned), 250 ms connect/socket
+#   timeouts, circuit breaker (3 consecutive errors -> memory-only for 300 s,
+#   then retry), counters hits/misses/writes/errors/breaker_trips surfaced in
+#   the boot banner (engine_target_klg_redis / tgt_lkg_redis_state /
+#   tgt_lkg_redis_stats) as the arming read-back proof. Any failure path
+#   degrades to v5.131.0 memory-only behaviour; nothing raises into the seam.
+# ENV (Render Web): TFB_ENGINE_TARGET_KLG_REDIS - DEFAULT OFF => v5.135.0
+#   byte-identical (no client is ever constructed). Reads REDIS_URL (the
+#   existing env.py name); absent URL => state "nourl", memory-only.
+#   Inert while the master gate TFB_ENGINE_TARGET_KLG is OFF. Kill = unset/0.
+#   Spec R-6 max age (5 trading days) is configuration:
+#   TFB_ENGINE_TARGET_KLG_TTL_H=168.
+# NOT CHANGED: seam logic in _phase_ii_quality_forecast, restore guards,
+#   reliability formula, entry schema, TTL default, fund LKG, providers,
+#   SAI contract. Zero functions removed.
+# =============================================================================
+__version__ = "5.136.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4911,6 +4947,9 @@ def surface_gate_states() -> Dict[str, Any]:
             "sai_version": _SAI_STATE.get("version"),
             "yf_target_fallback": _yf_target_fallback_enabled(),
             "engine_target_klg": _tgt_lkg_enabled(),
+            "engine_target_klg_redis": _tgt_lkg_redis_enabled(),
+            "tgt_lkg_redis_state": _tgt_lkg_redis_state_label(),
+            "tgt_lkg_redis_stats": _tgt_lkg_redis_stats(),
         }
     except Exception:
         return {}
@@ -10673,6 +10712,176 @@ def _tgt_lkg_max_symbols() -> int:
     return v if v >= 100 else 20000
 
 
+# ---------------------------------------------------------------------------
+# v5.136.0 (R-6b): Redis L2 for the target LKG. Default OFF. Never raises.
+# ---------------------------------------------------------------------------
+_TGT_LKG_REDIS_KEY_PREFIX: str = "tfb:tgt_lkg:v1:"
+_TGT_LKG_REDIS_BREAKER_ERRORS: int = 3
+_TGT_LKG_REDIS_BREAKER_SECONDS: float = 300.0
+_TGT_LKG_REDIS_TIMEOUT_S: float = 0.25
+_TGT_LKG_REDIS_STATE: Dict[str, Any] = {
+    "client": None,
+    "client_failed": False,
+    "consecutive_errors": 0,
+    "breaker_until": 0.0,
+    "hits": 0,
+    "misses": 0,
+    "writes": 0,
+    "errors": 0,
+    "breaker_trips": 0,
+}
+
+
+def _tgt_lkg_redis_enabled() -> bool:
+    """v5.136.0 master gate for the L2 layer. DEFAULT OFF — unset/0/false/off
+    keeps _tgt_lkg_capture/_tgt_lkg_restore byte-identical to v5.135.0 (no
+    client is ever constructed)."""
+    return os.getenv("TFB_ENGINE_TARGET_KLG_REDIS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tgt_lkg_redis_url() -> str:
+    return (os.getenv("REDIS_URL") or "").strip()
+
+
+def _tgt_lkg_redis_key(sym: str) -> str:
+    return _TGT_LKG_REDIS_KEY_PREFIX + _safe_str(sym).strip().upper()
+
+
+def _tgt_lkg_redis_state_label() -> str:
+    """off | nourl | breaker | idle | degraded | ok — banner/read-back only.
+    "ok" requires a built client AND zero consecutive errors."""
+    try:
+        if not _tgt_lkg_redis_enabled():
+            return "off"
+        if not _tgt_lkg_redis_url():
+            return "nourl"
+        st = _TGT_LKG_REDIS_STATE
+        if float(st.get("breaker_until") or 0.0) > time.time():
+            return "breaker"
+        if st.get("client") is None:
+            return "idle"
+        if int(st.get("consecutive_errors") or 0) > 0:
+            return "degraded"
+        return "ok"
+    except Exception:
+        return "unknown"
+
+
+def _tgt_lkg_redis_stats() -> Dict[str, int]:
+    st = _TGT_LKG_REDIS_STATE
+    try:
+        return {k: int(st.get(k) or 0) for k in
+                ("hits", "misses", "writes", "errors", "breaker_trips")}
+    except Exception:
+        return {}
+
+
+def _tgt_lkg_redis_note_error() -> None:
+    st = _TGT_LKG_REDIS_STATE
+    st["errors"] = int(st.get("errors") or 0) + 1
+    st["consecutive_errors"] = int(st.get("consecutive_errors") or 0) + 1
+    if st["consecutive_errors"] >= _TGT_LKG_REDIS_BREAKER_ERRORS:
+        st["breaker_until"] = time.time() + _TGT_LKG_REDIS_BREAKER_SECONDS
+        st["consecutive_errors"] = 0
+        st["breaker_trips"] = int(st.get("breaker_trips") or 0) + 1
+        st["client"] = None
+
+
+def _tgt_lkg_redis_note_ok() -> None:
+    _TGT_LKG_REDIS_STATE["consecutive_errors"] = 0
+
+
+def _tgt_lkg_redis_client() -> Any:
+    """Lazy, cached client. Returns None when the layer is OFF, REDIS_URL is
+    absent, the breaker is open, or the redis package/client cannot be
+    built. Construction does NOT ping (the first command is the probe)."""
+    try:
+        if not _tgt_lkg_redis_enabled():
+            return None
+        url = _tgt_lkg_redis_url()
+        if not url:
+            return None
+        st = _TGT_LKG_REDIS_STATE
+        if float(st.get("breaker_until") or 0.0) > time.time():
+            return None
+        client = st.get("client")
+        if client is not None:
+            return client
+        try:
+            import redis as _redis_mod  # type: ignore
+        except Exception:
+            st["client_failed"] = True
+            _tgt_lkg_redis_note_error()
+            return None
+        client = _redis_mod.Redis.from_url(
+            url,
+            socket_connect_timeout=_TGT_LKG_REDIS_TIMEOUT_S,
+            socket_timeout=_TGT_LKG_REDIS_TIMEOUT_S,
+            decode_responses=True,
+        )
+        st["client"] = client
+        return client
+    except Exception:
+        _tgt_lkg_redis_note_error()
+        return None
+
+
+def _tgt_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
+    """Write-through SETEX of a captured entry. ttl = _tgt_lkg_ttl_h().
+    Never raises; False on any refusal/failure."""
+    try:
+        client = _tgt_lkg_redis_client()
+        if client is None:
+            return False
+        import json  # local import — module convention (see v5.7x helpers)
+        ttl_s = int(max(1.0, _tgt_lkg_ttl_h() * 3600.0))
+        payload = json.dumps({
+            "ts": float(entry.get("ts") or 0.0),
+            "name": _safe_str(entry.get("name")),
+            "fp12": float(entry.get("fp12") or 0.0),
+            "tmp": (float(entry["tmp"]) if entry.get("tmp") is not None else None),
+        })
+        client.setex(_tgt_lkg_redis_key(sym), ttl_s, payload)
+        _tgt_lkg_redis_note_ok()
+        _TGT_LKG_REDIS_STATE["writes"] = int(_TGT_LKG_REDIS_STATE.get("writes") or 0) + 1
+        return True
+    except Exception:
+        _tgt_lkg_redis_note_error()
+        return False
+
+
+def _tgt_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
+    """L2 read on an in-memory miss. Returns a schema-valid entry dict or
+    None. Never raises. The caller re-applies the v5.131.0 TTL/taint/identity
+    guards — this function does NOT decide admissibility."""
+    try:
+        client = _tgt_lkg_redis_client()
+        if client is None:
+            return None
+        import json  # local import — module convention (see v5.7x helpers)
+        raw = client.get(_tgt_lkg_redis_key(sym))
+        _tgt_lkg_redis_note_ok()
+        if not raw:
+            _TGT_LKG_REDIS_STATE["misses"] = int(_TGT_LKG_REDIS_STATE.get("misses") or 0) + 1
+            return None
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            return None
+        ts = _as_float(d.get("ts"))
+        fp12 = _as_float(d.get("fp12"))
+        if ts is None or ts <= 0 or fp12 is None or fp12 <= 0:
+            return None
+        entry: Dict[str, Any] = {"ts": ts, "name": _safe_str(d.get("name")), "fp12": fp12}
+        tmp = _as_float(d.get("tmp"))
+        if tmp is not None and tmp > 0:
+            entry["tmp"] = tmp
+        _TGT_LKG_REDIS_STATE["hits"] = int(_TGT_LKG_REDIS_STATE.get("hits") or 0) + 1
+        return entry
+    except Exception:
+        _tgt_lkg_redis_note_error()
+        return None
+
+
 def _tgt_lkg_names_compatible(stored: Any, live: Any) -> bool:
     """Strict-but-not-brittle: blank on either side passes (fill-only
     philosophy); both present must match after normalization, or one must be
@@ -10715,6 +10924,8 @@ def _tgt_lkg_capture(row: Mapping[str, Any]) -> bool:
         if tmp is not None and tmp > 0:
             entry["tmp"] = tmp
         _TGT_LKG_STORE[s] = entry
+        # v5.136.0 (R-6b): write-through to the L2 layer (no-op when OFF).
+        _tgt_lkg_redis_set(s, entry)
         cap = _tgt_lkg_max_symbols()
         if len(_TGT_LKG_STORE) > cap:
             now = time.time()
@@ -10746,6 +10957,12 @@ def _tgt_lkg_restore(row: Dict[str, Any]) -> bool:
         if not s:
             return False
         entry = _TGT_LKG_STORE.get(s)
+        if not entry:
+            # v5.136.0 (R-6b): L2 read on an in-memory miss; the unchanged
+            # TTL/taint/identity guards below still decide admissibility.
+            entry = _tgt_lkg_redis_get(s)
+            if entry:
+                _TGT_LKG_STORE[s] = entry
         if not entry:
             return False
         now = time.time()
