@@ -1061,8 +1061,39 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.2"
+OPPORTUNITY_BUILDER_VERSION = "1.19.3"
 # -----------------------------------------------------------------------------
+# v1.19.3 (2026-09-04) - FX PEG GUARD + HELD-TARGET NO-NEW-MONEY (both
+# env-gated, DEFAULT OFF => v1.19.2 byte-identical)
+# EVIDENCE (2026-09-04 six-gate audit, session adjudication):
+#   (a) 433 USD audit rows carried Price SAR / Price = 3.8071..3.8102 while
+#       Commodities_FX SAR=X read 3.7549 and the broker converts at 3.7528;
+#       every non-USD cross (EUR/CAD/AUD/MXN) implied ~3.755, so the provided
+#       TFB_FX_LOOKUP map carries a wrong USD row (3.8088 -> 3.8090 within the
+#       day: a live feed, not a typo). _resolve_fx lets provided rates win
+#       unconditionally, so ledger, PD and T10 all inherited +1.44..1.49% on
+#       every USD MV / cost / stop / TP in SAR (W1B-1b evidence).
+#   (b) data_engine_v2 v5.136.0 armed the R-6 target-LKG carry; a restored
+#       target is relabelled forecast_source=provider_target and tagged
+#       analyst_lkg:<age>h. W1B-1 spec: a held target may PRESERVE an existing
+#       seat, never fund a NEW one (DATA_HOLD / NO_NEW_MONEY). Nothing in the
+#       funding layer distinguished a held target from a fresh one.
+# CHANGE:
+#   TFB_OPP_FX_SANITY=1 -> _resolve_fx routes every "provided" rate through
+#       _fx_peg_guard: USD outside [3.74, 3.77] => static 3.75 with source
+#       "static(peg-guard)"; SAR != 1.0 => 1.0 ("static(peg-guard)"); every
+#       other currency untouched. Rejections are counted per code in
+#       _FX_PEG_REJECTS (last rejected value kept) for diagnostics.
+#       Read-back: Price SAR / Price == 3.75 on every USD audit row.
+#   TFB_OPP_HELD_TARGET_NO_NEW_MONEY=1 -> normalize_candidate now carries the
+#       row's warnings text; in _select_and_size a candidate whose warnings
+#       contain "analyst_lkg:" is deferred BEFORE sizing with
+#       "Held target (analyst_lkg:<age>) - no new money until the provider
+#       leg returns" and never consumes capital. Verdict, gates, audit and
+#       near-miss are byte-identical, so the GAS stability layer can still
+#       keep an existing seat on grace/hold.
+# NOT CHANGED: gate list, GATE_ORDER, verdict derivation, sizing math, venue
+#   floors/lots, the v1.19.2 venue gate, static FX table. Zero removals.
 # v1.19.2 (2026-09-02) - ELIGIBILITY (VENUE): the operator's tradable venues
 # -----------------------------------------------------------------------------
 # EVIDENCE (Top_10 11:10 Riyadh, first populated board: 112 qualified): the
@@ -2230,6 +2261,61 @@ def _venue_cost_row(symbol):
     return _VENUE_COSTS.get(suf if suf else "")
 
 
+def _env_fx_sanity():
+    """v1.19.3: DEFAULT OFF. When on, provided USD/SAR rates outside the peg
+    band are replaced by the static peg (see _fx_peg_guard)."""
+    return _env_flag01("TFB_OPP_FX_SANITY", "0")
+
+
+def _env_held_target_no_new_money():
+    """v1.19.3: DEFAULT OFF. When on, a candidate carrying an analyst_lkg:
+    warning (R-6 held target) is never funded for a NEW ticket."""
+    return _env_flag01("TFB_OPP_HELD_TARGET_NO_NEW_MONEY", "0")
+
+
+# v1.19.3: peg band for the SAR/USD fix (3.75 official; 3.7500..3.7550 spot
+# for years) - anything outside is a broken feed, never a market.
+_FX_PEG_BAND = {"USD": (3.74, 3.77), "SAR": (1.0, 1.0)}
+_FX_PEG_STATIC = {"USD": 3.75, "SAR": 1.0}
+_FX_PEG_REJECTS = {}   # code -> {"count": int, "last": float}
+_HELD_TARGET_TAG = "analyst_lkg:"
+
+
+def _fx_peg_guard(code, rate, source):
+    """v1.19.3: (rate, source) pass-through unless TFB_OPP_FX_SANITY is on
+    AND code is a pegged code AND the provided rate is outside its band, in
+    which case the static peg is returned with source "static(peg-guard)".
+    Never raises; on any doubt the provided rate is returned unchanged."""
+    try:
+        if not _env_fx_sanity():
+            return rate, source
+        band = _FX_PEG_BAND.get(code)
+        if band is None or rate is None:
+            return rate, source
+        lo, hi = band
+        if lo <= float(rate) <= hi:
+            return rate, source
+        rec = _FX_PEG_REJECTS.setdefault(code, {"count": 0, "last": None})
+        rec["count"] = int(rec.get("count") or 0) + 1
+        rec["last"] = float(rate)
+        return _FX_PEG_STATIC[code], "static(peg-guard)"
+    except Exception:
+        return rate, source
+
+
+def _held_target_age(warnings_text):
+    """v1.19.3: the analyst_lkg:<age>h token from a warnings string, or ""."""
+    try:
+        t = str(warnings_text or "")
+        i = t.find(_HELD_TARGET_TAG)
+        if i < 0:
+            return ""
+        tok = t[i:].split(";")[0].split(",")[0].split(" ")[0].strip()
+        return tok
+    except Exception:
+        return ""
+
+
 def _venue_floor(symbol):
     row = _venue_cost_row(symbol)
     return row[3] if row else None
@@ -2524,10 +2610,11 @@ def _resolve_fx(currency_raw, fx_rates):
     # raw key only (never case-fold: "GBp".upper() collides with parent GBP)
     r = _to_float(provided.get(raw))
     if r is not None and r > 0:
-        return r, "provided"
+        return _fx_peg_guard(code, r, "provided")  # v1.19.3
     r = _to_float(provided.get(code))
     if r is not None and r > 0:
-        return r / divisor, "provided" if divisor == 1.0 else "provided/100"
+        return _fx_peg_guard(  # v1.19.3
+            code, r / divisor, "provided" if divisor == 1.0 else "provided/100")
     if code in FX_STATIC_TO_SAR:
         return FX_STATIC_TO_SAR[code] / divisor, (
             "static" if divisor == 1.0 else "static/100")
@@ -2652,6 +2739,7 @@ def normalize_candidate(row, fx_rates, criteria):
         # v1.9.1: basis passthrough for portfolio_actions' synthetic-basis
         # deferral (TFB_PF_REQUIRE_FRESH_BASIS). Always a string; "" absent.
         "forecast_source": _to_text(_field(view, "forecast_source")) or "",
+        "warnings": _to_text(_field(view, "warnings")) or "",   # v1.19.3
         "reliability": reliability,
         "dq": dq,
         "risk_level": _norm_risk(_field(view, "risk_level")),
@@ -4071,6 +4159,17 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     for cand in invest_cands:
         if len(picked) >= criteria["max_selected"]:
             break
+        # v1.19.3 [HELD-TARGET NO-NEW-MONEY]: an R-6 carried target (engine
+        # tag analyst_lkg:<age>h) may preserve an existing seat but never
+        # funds a NEW ticket. Deferred before sizing; verdict/gates/audit are
+        # untouched. Inert while TFB_OPP_HELD_TARGET_NO_NEW_MONEY is unset.
+        if _env_held_target_no_new_money():
+            _ht = _held_target_age(cand.get("warnings"))
+            if _ht:
+                deferrals[cand["symbol"]] = (
+                    "Held target (" + _ht + ") \u2014 no new money until the "
+                    "provider leg returns")
+                continue
         # v1.0.16: issuer-level cross-listing dedup (default OFF). Once an issuer
         # is FUNDED, a later listing of the SAME issuer (e.g. Takeda 4502.T then
         # TAK.US, or BMW.DE then BMW.XETRA) is deferred rather than taking a
