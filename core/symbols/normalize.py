@@ -2,10 +2,43 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.4.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.5.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.5.0 (over v5.4.0) — BARE ROOT IS AN EQUITY (identity-collision fix,
+2026-09-04 six-gate audit + acceptance A3 re-execution):
+- EVIDENCE: six Global_Markets .US equity rows carried commodity / crypto
+  identities with blank sectors: KE.US -> "KC HRW Wheat Futures,Dec-2026",
+  NG.US -> "Natural Gas Oct 26", SI.US -> "Silver Dec 26", PL.US ->
+  "Platinum Oct 26", HG.US -> "Copper Dec 26", LINK.US -> "Chainlink USD".
+  MECHANISM (re-executed on the real modules): the engine maps KE.US ->
+  "KE" (correct); the Yahoo chart provider re-normalizes that bare ticker
+  through to_yahoo_symbol("KE"), where is_commodity_future() / is_crypto()
+  treat a BARE ROOT found in COMMODITY_CODES / CRYPTO_COMMON as a future /
+  coin, so the fetch goes to KE=F / LINK-USD and the chart meta name is
+  grafted onto the equity row. Every bare root that is also a real US
+  ticker is exposed (KE, NG, SI, PL, HG, CC, KC, CT, SB, OJ, LB, RB, HO;
+  LINK, SOL, UNI, DOT, FIL, VET, ADA, ATOM, TRX, BCH ...). The workbook
+  never spells a commodity or coin as a bare root (Commodities_FX: 453/453
+  rows carry =F / =X; crypto is always XXX-USD), so the heuristic only ever
+  fires on equities.
+- FIX, env-gated DEFAULT OFF (TFB_SYM_BARE_ROOT_EQUITY=1): when ON,
+  is_commodity_future() is True only for EXPLICIT futures notation
+  (XX=F, XX.COMM/.COM/.FUT) and is_crypto() only for EXPLICIT crypto
+  notation (XXX-YYY dash pair with a known base, XXX.CRYPTO/.CC/.C); a bare
+  root falls through to equity handling, so to_yahoo_symbol("KE") -> "KE"
+  and ("LINK") -> "LINK" (Yahoo's own convention: KE is Kimball
+  Electronics, KE=F is the wheat contract). Explicit forms are byte-
+  identical either way. With the flag unset every function returns exactly
+  the v5.4.0 value (verified across a symbol-class battery on the real
+  module, engine and provider). NOTE: the three functions are lru_cached, so
+  the flag is read at import into _BARE_ROOT_EQUITY — Render restarts on
+  ENV change, the same semantics as CUSTOM_*_MAP.
+- Belt for vNEXT (Register): the engine's chart-meta name acceptance should
+  additionally refuse a patch whose instrumentType is not EQUITY/ETF for an
+  equity-page row.
 
 v5.4.0 (over v5.3.2) — EODHD FOREX mapping for Yahoo =X pairs (owner
 greenlight 2026-07-05; Forward-Looking/CFX reliability item):
@@ -78,7 +111,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.4.0"
+__version__ = "5.5.0"
 
 __all__ = [
     "MarketType",
@@ -561,6 +594,10 @@ CUSTOM_EXCHANGE_MAP = _env_dict("SYMBOL_EXCHANGE_MAP_JSON")
 CUSTOM_INDEX_MAP = _env_dict("SYMBOL_INDEX_MAP_JSON")
 CUSTOM_FX_MAP = _env_dict("SYMBOL_FX_MAP_JSON")
 CUSTOM_COMMODITY_MAP = _env_dict("SYMBOL_COMMODITY_MAP_JSON")
+# v5.5.0: bare alphanumeric roots are equities unless spelled with explicit
+# futures / crypto notation. DEFAULT OFF => v5.4.0 byte-identical. Read once at
+# import (the classifiers below are lru_cached; Render restarts on ENV change).
+_BARE_ROOT_EQUITY: bool = _env_bool("TFB_SYM_BARE_ROOT_EQUITY", False)
 CUSTOM_CRYPTO_MAP = _env_dict("SYMBOL_CRYPTO_MAP_JSON")
 CUSTOM_CURRENCY_MAP = _env_dict("SYMBOL_CURRENCY_MAP_JSON")
 CUSTOM_EXCHANGE_DISPLAY_MAP = _env_dict("SYMBOL_EXCHANGE_DISPLAY_MAP_JSON")
@@ -724,6 +761,8 @@ def is_commodity_future(symbol: str) -> bool:
         return False
     if FUTURE_EQUAL_RE.match(s) or FUTURE_SUFFIX_RE.match(s):
         return True
+    if _BARE_ROOT_EQUITY:   # v5.5.0: a bare root is an equity, never a future
+        return False
     base = s.replace("=F", "").replace(".COMM", "").replace(".COM", "").replace(".FUT", "")
     return base in COMMODITY_CODES
 
@@ -740,6 +779,8 @@ def is_crypto(symbol: str) -> bool:
     m = CRYPTO_DASH_RE.match(s)
     if m:
         return m.group(1).upper() in CRYPTO_COMMON
+    if _BARE_ROOT_EQUITY:   # v5.5.0: a bare root is an equity, never a coin
+        return False
     base = s.split("-")[0] if "-" in s else s
     return base in CRYPTO_COMMON
 
