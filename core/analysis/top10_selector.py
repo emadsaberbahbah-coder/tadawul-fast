@@ -676,7 +676,40 @@ logger.addHandler(logging.NullHandler())
 # ACCEPTANCE FIXTURES: 1015.KL and 5110.SR shapes must exclude regardless of
 #   score, feed or cash - never grace-held, never QUALIFIED.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.30.0"
+# =============================================================================
+# v4.31.0 (2026-09-05, 10-Day Program build #2) - [BC-6] FAST-TRACK PERSISTS
+# =============================================================================
+# EVIDENCE (live 2026-09-05 _Selection_Log + this file): AEFES.IS 03:40
+#   "FAST-TRACK (day 1) - sizing suspended under strict until confirmed"
+#   (output HELD) -> 07:46 "ACTIVE (day 1)" (WITHHELD only because the GM feed
+#   was aged) -> 08:08 EXECUTABLE, 3,824 SAR / 2,693 sh, Confirm Days = 3,
+#   ci = 1. ROOT CAUSE: the fast-track fill seats a symbol as a FULL member
+#   (member=True, since=today) with no memory that it was fast-tracked; the
+#   "FAST-TRACK (day 1)" label is derived only from THIS call's fast_tracked
+#   list. Every later run (same day or next) finds member=True, seats it as a
+#   survivor and labels it "ACTIVE (day n)" although ci < confirm_days - and
+#   BOTH sizing guards (BC-4 redaction here, 16_Decision_Top10.gs v1.11.1
+#   output-label truth) key on the FAST-TRACK*/GRACE* prefix, so the sizing is
+#   released on an unconfirmed seat. The v4.21.0 contract said "sizing
+#   suspended until confirmed"; the state never carried "confirmed".
+# FIX (additive): per-symbol state gains `ft` (bool). Set at seating time to
+#   (symbol was fast-track filled this call); cleared the first run on which
+#   ci >= confirm_days (the seat GRADUATES). Labels: an unconfirmed persisted
+#   fast-track seat reads "FAST-TRACK (day n, ci/confirm confirmed)" - same
+#   prefix, so BC-4 and the GAS guard withhold sizing exactly as on day 1;
+#   GRACE keeps precedence; ACTIVE only after graduation. Membership (`final`),
+#   entries, exits, displacement, clocks, hist: BYTE-UNTOUCHED - the S-1
+#   champion basket is the same symbols in the same order. Audit gains
+#   `fast_track_unconfirmed` (read-back instrument); meta gains
+#   `fast_track_legacy`. Blobs without `ft` parse as False (pre-existing
+#   members keep their labels).
+# KILL SWITCH: TFB_T10_FASTTRACK_LEGACY=1 => v4.30.0 labels/rows byte-identical
+#   (the state blob still carries the additive `ft` key so memory survives an
+#   off/on cycle). Zero functions removed; one added
+#   (_t10_fasttrack_legacy_enabled); default ON because the only direction it
+#   moves a board is sizing-withheld -> never a new executable ticket.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.31.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1231,6 +1264,13 @@ def _t10_disclosure_redaction_enabled() -> bool:
     v4.27.0 payload bytes (full plans on withheld rows)."""
     return str(os.getenv("TFB_T10_DISCLOSE_LEGACY") or "0").strip().lower() \
         not in ("1", "true", "yes", "on")
+
+
+def _t10_fasttrack_legacy_enabled() -> bool:
+    """v4.31.0 [BC-6] kill switch — TFB_T10_FASTTRACK_LEGACY=1 restores the
+    v4.30.0 labels (a fast-track seat reads ACTIVE on its very next run)."""
+    return str(os.getenv("TFB_T10_FASTTRACK_LEGACY") or "0").strip().lower() \
+        in ("1", "true", "yes", "on")
 
 
 _T10_WITHHELD_STATUS_PREFIXES = ("FAST-TRACK", "GRACE")
@@ -4339,6 +4379,9 @@ def _stability_parse_state(raw: Any) -> Dict[str, Any]:
                 "member": _coerce_bool(v.get("member"), False),
                 "since": _s(v.get("since")).strip(),
                 "ls": _s(v.get("ls")).strip(),
+                # v4.31.0 [BC-6]: fast-track memory; absent (v<=4.30 blob)
+                # => False, so pre-existing members keep their labels.
+                "ft": _coerce_bool(v.get("ft"), False),
                 "hist": hist[-30:],
                 # v4.25.0 [PY-10]: which scale `hist` is denominated in.
                 # Absent (v1 blob) => engine scale, which is what it holds.
@@ -4438,7 +4481,7 @@ def _apply_selection_stability(
         st = symbols.get(sym)
         if st is None:
             st = {"ci": 0, "co": 0, "member": False, "since": "", "ls": "",
-                  "hist": [], "hs": hist_scale}
+                  "hist": [], "hs": hist_scale, "ft": False}
             symbols[sym] = st
         # v4.25.0 [PY-10] scale-migration self-heal: never average two
         # scales inside one smoothing window. Membership/clocks untouched.
@@ -4586,8 +4629,11 @@ def _apply_selection_stability(
             st["member"] = True
             st["since"] = today
             st["co"] = 0
+            st["ft"] = sym in fast_tracked            # v4.31.0 [BC-6]
         elif not st.get("since"):
             st["since"] = today
+        if st.get("ft") and _safe_int(st.get("ci"), 0) >= confirm_days:
+            st["ft"] = False                          # v4.31.0 [BC-6] graduated
         if sym not in raw_set or _safe_int(st.get("co"), 0) > 0:
             held_by_grace.append({
                 "symbol": sym,
@@ -4598,6 +4644,7 @@ def _apply_selection_stability(
 
     # ---- output rows (stability columns stamped; projection carries them) ---
     exit_days = _safe_int(knobs.get("exit_days"), STABILITY_DEFAULT_EXIT_DAYS)
+    _ft_legacy = _t10_fasttrack_legacy_enabled()      # v4.31.0 [BC-6]
     out_rows: List[Dict[str, Any]] = []
     for sym in final:
         src = raw_by_sym.get(sym) or sym2row.get(sym)
@@ -4625,6 +4672,9 @@ def _apply_selection_stability(
             status = "NEW (confirmed %d/%d)" % (confirm_days, confirm_days)
         elif sym not in raw_set or _safe_int(st.get("co"), 0) > 0:
             status = "GRACE (%d/%d missed)" % (_safe_int(st.get("co"), 0), exit_days)
+        elif st.get("ft") and not _ft_legacy:         # v4.31.0 [BC-6]
+            status = "FAST-TRACK (day %d, %d/%d confirmed)" % (
+                days_in, _safe_int(st.get("ci"), 0), confirm_days)
         else:
             status = "ACTIVE (day %d)" % days_in
         row["stability_status"] = status
@@ -4669,6 +4719,7 @@ def _apply_selection_stability(
         "engine_version": TOP10_SELECTOR_VERSION,
         "date": today,
         "day_advanced": day_advance,
+        "fast_track_legacy": _ft_legacy,              # v4.31.0 [BC-6]
         "knobs": dict(knobs),
         "state": _json_safe(state),
         "audit": {
@@ -4676,6 +4727,10 @@ def _apply_selection_stability(
             "final_order": list(final),
             "entered": entered,
             "fast_tracked": fast_tracked,
+            # v4.31.0 [BC-6]: persisted fast-track seats not yet confirmed
+            # (includes today's fills) — the read-back instrument.
+            "fast_track_unconfirmed": [s for s in final
+                                       if symbols[s].get("ft")],
             "exited_hard": exited_hard,
             "exited_verdict": exited_verdict,
             "exited_soft": exited_soft,
