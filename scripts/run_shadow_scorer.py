@@ -1,6 +1,31 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.7.2  (2026-09-05)  — SHAPE GUARD + EXCLUSION REASON (P-71 / P-79)
+WHY v1.7.2: the very first v1.7.1 read-back (run #52, dry-run) said
+`gate=on token=yes yahoo_miss=30 eodhd_rescued=0/30 eodhd_fail=8` and listed
+the "symbols" that failed: `null`, `OK`, `NO_ACTION`, `6`, `8.06`,
+`SHADOW BOARD v1.3.0` and JSON fragments of the regime stamp. None is a
+symbol. They are the Shadow_Board META rows (title, authority, regime …)
+admitted as board data rows, swept into the W-7 EQW basket ("n=13" = 6
+names + 7 meta strings), written into Shadow_History and carried back into
+`need` every day — 19 junk tokens x (Yahoo + EODHD) = the 38 "price errors"
+that looked like a throttling problem for weeks. The dormant
+tests/test_shadow_scorer_shape_guard.py describes exactly this guard; it
+never reached the script. Second finding in the same run: CHALLENGER
+symbols were '' — the shadow board has published 0 eligible names most
+days (BROKER_UNTRADABLE / MODEL_SCREEN_FAIL), so fresh coverage is 0/0 and
+the day is excluded; the note called that EXCLUDED_INFRA.
+FIX: (1) symbol_like() + shape_guard_rows() — a board row counts only when
+its first cell is shaped like a symbol; `need` and the previous-row
+symbols/prices are filtered the same way (S-1 baskets contain only real
+symbols, so they are unmoved; EQW is informational). Kill switch
+TFB_SHADOW_SHAPE_GUARD=0 => v1.7.1 lists byte-for-byte. (2) the exclusion
+keeps its DAY_EXCLUDED_INFRA prefix (counters untouched) and gains
+` reason=no-challenger | fresh-floor | benchmark-leg`, echoed in the verdict
+line, the S1_Gate meta and the _Run_Log JSON. (3) summarize_price_errs
+classifies on the LAST colon (fragments with colons had garbled the
+histogram). Counting, basket math, classification of days: UNTOUCHED.
 VERSION 1.7.1  (2026-09-05)  — PRICE-ERRS READ-BACK (log-only)
 WHY v1.7.1: S1_Gate 2026-09-04 reads "price errors: 38 | day: EXCLUDED_INFRA"
 (32nd excluded-infra day) ONE day after TFB_SHADOW_EODHD=1 was armed, and
@@ -69,6 +94,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -235,7 +261,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # makes both flags arrive; this change makes dry-run mean ZERO writes on
 # every path: the drill branch now previews and exits without touching
 # Sheets. Everything else is byte-identical to v1.5.0.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.7.2"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -781,6 +807,43 @@ def _shadow_eodhd_enabled() -> bool:
             in ("1", "true", "yes", "on"))
 
 
+_SYMBOL_SHAPE_RE = re.compile(r"^\^?[A-Z0-9][A-Z0-9.\-=]{0,19}$")
+
+
+def _shape_guard_enabled() -> bool:
+    """v1.7.2 kill switch: TFB_SHADOW_SHAPE_GUARD=0 => v1.7.1 lists verbatim."""
+    return (os.getenv("TFB_SHADOW_SHAPE_GUARD") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def symbol_like(token: Any) -> bool:
+    """v1.7.2 PURE: True iff `token` is shaped like a market symbol —
+    upper-case letters/digits with optional . - = separators and a leading
+    ^ for indices (2222.SR, 0083.HK, ^TASI.SR, BRK-B, HG=F, T82U.SI), at
+    least one letter (rejects bare numbers), no spaces / quotes / braces /
+    colons / commas / underscores (rejects meta text and JSON fragments)."""
+    s = str(token or "").strip()
+    if not s or len(s) > 20 or not _SYMBOL_SHAPE_RE.match(s):
+        return False
+    return any(ch.isalpha() for ch in s)
+
+
+def shape_guard_rows(rows: Sequence[Sequence[Any]]
+                     ) -> Tuple[List[Sequence[Any]], List[str]]:
+    """v1.7.2 PURE: (kept_rows, dropped_first_cells). A board row is data
+    only when its first cell is symbol_like; everything else (title,
+    authority, regime stamp, advisory line) is meta and is reported."""
+    kept: List[Sequence[Any]] = []
+    dropped: List[str] = []
+    for r in rows or []:
+        first = str(r[0]).strip() if r else ""
+        if symbol_like(first):
+            kept.append(r)
+        else:
+            dropped.append(first[:40])
+    return kept, dropped
+
+
 def summarize_price_errs(errs: Sequence[str], gate_on: bool,
                          token_present: bool, first_n: int = 8
                          ) -> Tuple[str, Dict[str, Any]]:
@@ -811,7 +874,9 @@ def summarize_price_errs(errs: Sequence[str], gate_on: bool,
             except (ValueError, IndexError):
                 pass
             continue
-        sym, _, cls = e.partition(":")
+        sym, _sep, cls = e.rpartition(":")   # v1.7.2: class = LAST segment
+        if not _sep:
+            sym, cls = e, ""
         cls = cls or "unclassified"
         classes[cls] = classes.get(cls, 0) + 1
         if cls.startswith("eodhd_"):
@@ -1095,6 +1160,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     data_rows = [r for r in board
                  if r and r[0] and r[0] not in ("Symbol",)
                  and len(r) >= len(sb.OUT_HEADER) - 2]
+    _sg_on = _shape_guard_enabled()
+    _sg_dropped: List[str] = []
+    if _sg_on:                                     # v1.7.2 shape guard
+        data_rows, _sg_dropped = shape_guard_rows(data_rows)
     chal_syms = [r[0] for r in data_rows if str(r[-1]).strip().upper() == "YES"]
     violations = count_compliance_violations(data_rows)
 
@@ -1122,6 +1191,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             for b in (CHAMPION, CHALLENGER, BENCHMARK)}
     if eqw_on:                                     # v1.3.0 W-7
         prev[BENCHMARK_EQW] = last_row_for(history, BENCHMARK_EQW)
+    if _sg_on:  # v1.7.2: junk carried in old history rows never re-enters
+        for _pb in list(prev):
+            _pr = prev[_pb]
+            if _pr:
+                prev[_pb] = dict(
+                    _pr,
+                    symbols=[s for s in _pr.get("symbols") or [] if symbol_like(s)],
+                    prices={k: v for k, v in (_pr.get("prices") or {}).items()
+                            if symbol_like(k)})
     existing_forks = read_regret_ledger(sh)
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
     new_forks = dedupe_new_forks(
@@ -1140,6 +1218,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for p in prev.values():
         if p:
             need |= set(p["symbols"])
+    if _sg_on:                                     # v1.7.2: never fetch a non-symbol
+        need = {s for s in need if symbol_like(s)}
     spot, spot_asof, price_errs = fetch_spot(sorted(need))
 
     for f in new_forks:                      # price at the moment of refusal
@@ -1196,6 +1276,14 @@ def main(argv: Optional[List[str]] = None) -> int:
              or (measured[BENCHMARK]["p"] is not None
                  and measured[BENCHMARK]["ret"] is None)))
     total_stale = sum(m["n_stale"] for m in measured.values())
+    _excl_reason = ""                              # v1.7.2 label truth
+    if day_excluded:
+        if not chal_syms:
+            _excl_reason = "no-challenger"
+        elif _chal_frac < _min_fresh_frac():
+            _excl_reason = "fresh-floor"
+        else:
+            _excl_reason = "benchmark-leg"
 
     new_rows: List[List[Any]] = []
     results: Dict[str, Dict[str, Any]] = {}
@@ -1235,6 +1323,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 note += (f" stale={m['n_stale']}"
                          f"[{','.join(m['stale_syms'][:4])}"
                          f"{',…' if m['n_stale'] > 4 else ''}]")
+        if day_excluded and p and _excl_reason:    # v1.7.2 (prefix unchanged)
+            note += f" reason={_excl_reason}"
         if basket == BENCHMARK_EQW:                # v1.3.0 W-7
             note = "W7-INFORMATIONAL naive-eqw(all-board); " + note
         if price_errs:
@@ -1285,10 +1375,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"stale={total_stale} | "
                f"violations={len(violations)} | forks {len(all_forks)} "
                f"(+{len(new_forks)} new)")
+    if day_excluded and _excl_reason:              # v1.7.2 label truth
+        verdict += f" | excluded_reason={_excl_reason}"
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
         _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
         verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
     print(verdict)
+    _sg_line = (f"[S1-SHAPE-GUARD v{SCRIPT_VERSION}] {'on' if _sg_on else 'OFF'} "
+                f"dropped={len(_sg_dropped)} board_rows={len(data_rows)} "
+                f"need={len(need)} first={_sg_dropped[:6] if _sg_dropped else '-'}")
+    print(_sg_line)                                # v1.7.2 read-back
     # v1.7.1: PRICE-ERRS read-back — printed on EVERY path (incl. --dry-run);
     # token PRESENCE only, never its value.
     _pe_line, _pe_details = summarize_price_errs(
@@ -1318,7 +1414,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          "returns are cost-adjusted, daily-rebalanced equal-weight",
          f"price errors: {len(price_errs)} | stale: {total_stale} | "
          f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}",
-         _pe_line],                                 # v1.7.1 read-back cell
+         _pe_line,                                  # v1.7.1 read-back cell
+         _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")],
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1350,7 +1447,10 @@ def main(argv: Optional[List[str]] = None) -> int:
              "shadow_scorer", TAB_GATE,
              "OK" if gate["verdict"] != "FAIL" else "GATE_FAIL", verdict,
              "", "", "", json.dumps({"version": SCRIPT_VERSION,
-                                     "price_errs": _pe_details})],
+                                     "price_errs": _pe_details,
+                                     "shape_guard": {"on": _sg_on,
+                                                     "dropped": _sg_dropped[:12]},
+                                     "excluded_reason": _excl_reason})],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -1685,6 +1785,63 @@ def _selftest() -> int:
     if _dc_saved is not None:
         os.environ["TFB_SHADOW_DAY_CLASS"] = _dc_saved
 
+    # ---- v1.7.2 SG: shape guard (the markers tests/test_shadow_scorer_
+    # shape_guard.py has waited for) --------------------------------------- #
+    _w = max(7, len(sb.OUT_HEADER) - 2)
+    def _srow(sym, elig="YES", status="PASS"):
+        r = [sym, "n", "m", "s", "c", 1.0, status] + [""] * (_w - 7)
+        r[-1] = elig
+        return r
+    _sg_syms = ["AEGN.AT", "AEFES.IS", "SAWAD.BK", "HDFCBANK.NS", "BYMA.BA",
+                "BMA.BA", "2222.SR", "^TASI.SR", "BRK-B", "HG=F"]
+    _sg_meta = ["SHADOW BOARD v1.3.0", "authority rows=408 as_of=2026-03-31",
+                "switch scan: NO_ACTION", "risk: OK",
+                'regime: {"Global": {"state": "RISK_ON"}}',
+                "advisory stamp — drives nothing until gated"]
+    _sg_board = ([_srow(s, "YES" if i < 6 else "NO") for i, s in enumerate(_sg_syms)]
+                 + [[m] + [""] * (_w - 1) for m in _sg_meta])
+    _sg_kept, _sg_drop = shape_guard_rows(_sg_board)
+    checks.append(("SG: guard ON keeps exactly the 10 symbol rows",
+                   len(_sg_kept) == 10 and [r[0] for r in _sg_kept] == _sg_syms))
+    checks.append(("SG: guard ON drops exactly the 6 live meta strings",
+                   len(_sg_drop) == 6 and _sg_drop[0] == "SHADOW BOARD v1.3.0"))
+    checks.append(("SG: anti-Defect-A — special-char real symbols are KEPT, "
+                   "bare numbers / JSON / snake_case / lowercase are not",
+                   all(symbol_like(s) for s in ("^TASI.SR", "BRK-B", "HG=F",
+                                                "0083.HK", "T82U.SI", "SPUS"))
+                   and not any(symbol_like(s) for s in
+                               ("6", "8.06", "25.49}", "null", "NO_ACTION",
+                                '"Saudi": {"state": "UNKNOWN"', ""))))
+    checks.append(("SG: every live meta first-cell rejected",
+                   not any(symbol_like(m) for m in _sg_meta)))
+    _eqw_raw = [r[0] for r in _sg_board]
+    _eqw_grd = [r[0] for r in _sg_kept]
+    checks.append(("SG: EQW over guarded rows = 10 real names (was 16)",
+                   len(_eqw_raw) == 16 and len(_eqw_grd) == 10))
+    _chal_raw = [r[0] for r in _sg_board if str(r[-1]).strip().upper() == "YES"]
+    _chal_grd = [r[0] for r in _sg_kept if str(r[-1]).strip().upper() == "YES"]
+    checks.append(("SG: S-1 unmoved — challenger set identical on/off",
+                   _chal_raw == _chal_grd and len(_chal_grd) == 6))
+    checks.append(("SG: S-1 unmoved — criterion-2 violations identical",
+                   count_compliance_violations(_sg_board)
+                   == count_compliance_violations(_sg_kept)))
+    _sg_saved = os.environ.get("TFB_SHADOW_SHAPE_GUARD")
+    os.environ["TFB_SHADOW_SHAPE_GUARD"] = "0"
+    _sg_off = _shape_guard_enabled()
+    os.environ["TFB_SHADOW_SHAPE_GUARD"] = "1"
+    _sg_on1 = _shape_guard_enabled()
+    del os.environ["TFB_SHADOW_SHAPE_GUARD"]
+    _sg_unset = _shape_guard_enabled()
+    if _sg_saved is not None:
+        os.environ["TFB_SHADOW_SHAPE_GUARD"] = _sg_saved
+    checks.append(("SG: kill-switch OFF -> v1.5.0 list byte-for-byte "
+                   "(guard not applied; '1' and unset are ON)",
+                   _sg_off is False and _sg_on1 is True and _sg_unset is True))
+    checks.append(("PE: class parsed on the LAST colon (JSON fragment safe)",
+                   summarize_price_errs(['"Saudi": {"state": "UNKNOWN":HTTPStatusError',
+                                         '"Saudi": {"state": "UNKNOWN":eodhd_HTTPStatusError'],
+                                        True, True)[1]["classes"]
+                   == {"HTTPStatusError": 1, "eodhd_HTTPStatusError": 1}))
     # ---- v1.7.1: PRICE-ERRS read-back is pure and never leaks a secret --- #
     _pe_errs = ["AAA.US:HTTPStatusError", "BBB.US:no_close",
                 "CCC.US:no_bar_date", "DDD.US:HTTPStatusError",
