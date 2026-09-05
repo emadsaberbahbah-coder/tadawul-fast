@@ -1,0 +1,175 @@
+{
+ "source": "Morning_Review_2026-09-05.pdf (ChatGPT blind cross-check, evidence cutoff 11:45 Riyadh)",
+ "adjudicated_by": "Claude — primary artifacts: 09-05 export (15 TSVs), IBKR live read, repo main (compliance_gate 46b13527, top10_selector 28f12de5, run_shadow_scorer e41e0e00)",
+ "date": "2026-09-05",
+ "summary": {
+  "accepted": 15,
+  "rejected_or_modified": 5,
+  "partial": 2,
+  "hypothesis": 1,
+  "not_adopted": 1
+ },
+ "claims": [
+  {
+   "id": "C01",
+   "claim": "AEFES.IS is HOLD/WATCHLIST/WATCH in Global_Markets but INVEST/EXECUTABLE in Top_10",
+   "verdict": "ACCEPTED",
+   "evidence": "GM row: HOLD/WATCHLIST/WATCH; Top_10 control 'T10: Require Investable = No'. Precedence inconsistency: Portfolio_Decision applies §4.7 (engine WATCHLIST vetoes ADD), Top_10 does not.",
+   "register": "P-66/P-53"
+  },
+  {
+   "id": "C02",
+   "claim": "Three-day confirmation bypassed on day 1; authorization change not immutably logged",
+   "verdict": "ACCEPTED (mechanism proven)",
+   "evidence": "_Selection_Log 03:40 'FAST-TRACK (day 1) … not an executable ticket today' (HELD) → 07:46 'ACTIVE (day 1)' (WITHHELD aged:GM) → 08:08 EXECUTABLE; 'SelLog: unchanged'. Root cause in top10_selector v4.30.0 fast-track fill (no persisted ft). Fixed v4.31.0.",
+   "register": "P-61, P-62"
+  },
+  {
+   "id": "C03",
+   "claim": "Cash invariant: PD floor 9,001 → deployable 0 while Top_10 allocates 3,824",
+   "verdict": "ACCEPTED",
+   "evidence": "PD cash_floor=9001, Deployable 0 SAR; Top_10 Deployable 3,825, ticket 3,824. Two boards, two floors.",
+   "register": "P-41/P-64"
+  },
+  {
+   "id": "C04",
+   "claim": "Ticket math: 2,693 sh cost 3,825.81 at exact FX, 3,850.99 at the 1.43 ceiling",
+   "verdict": "ACCEPTED",
+   "evidence": "Recomputed: 18.45×0.0770=1.42065; ×2,693=3,825.81 > 3,825 cash; board divides by the 2-dp price 1.42.",
+   "register": "P-65"
+  },
+  {
+   "id": "C05",
+   "claim": "92 displayed qualified vs KPI Passed 89 = HCI/EPRT/PFS",
+   "verdict": "ACCEPTED",
+   "evidence": "ALL QUALIFIED list parsed: 92 rows incl. HCI.US, EPRT.US, PFS.US.",
+   "register": "P-66"
+  },
+  {
+   "id": "C06",
+   "claim": "Ten qualified rows below the 10% annualized minimum",
+   "verdict": "ACCEPTED (+)",
+   "evidence": "10 rows Ann ROI <10%; additionally 32 INVEST rows below Required ROI 12% (TP1).",
+   "register": "P-66/P-48"
+  },
+  {
+   "id": "C07",
+   "claim": "Ranks 3–5 and 9 labelled 'ranked below the Max Selected cut'",
+   "verdict": "ACCEPTED",
+   "evidence": "FDR.MC 3, MRL.MC 4, TLKM.JK 5, ASII.JK 9 carry the label.",
+   "register": "P-66"
+  },
+  {
+   "id": "C08",
+   "claim": "News Unknown 440/500; Sector Trend Unknown 500/500",
+   "verdict": "ACCEPTED as fact; REJECTED as fail-closed remediation",
+   "evidence": "Counts exact. Fail-closed on an unvalidated factor contradicts the Strategy's hypothesis gating; sector-trend feed is unpopulated (coverage item).",
+   "register": "W"
+  },
+  {
+   "id": "C09",
+   "claim": "58 INVESTABLE rows: 27 synthetic (46.6%), 14 GM with reliability <50, min 37.9",
+   "verdict": "ACCEPTED as fact; REJECTED as reliability-floor gate",
+   "evidence": "Counts exact (EOD.US 37.9). H-28 rejected reliability as a predictor (Brier 0.268, Spearman 0.033); Top_10 Rel≥70 already excludes them.",
+   "register": "P-54"
+  },
+  {
+   "id": "C10",
+   "claim": "Copper row is field-shifted",
+   "verdict": "ACCEPTED",
+   "evidence": "Symbol='Copper Futures', Name='Commodity', Exchange='USD', Currency='Global', High 6.4955 < Low 6.728; stale since 08-13 (HTTP 422); BLOCKED.",
+   "register": "P-70"
+  },
+  {
+   "id": "C11",
+   "claim": "Taxonomy: crypto/index rows and all funds classified Equity",
+   "verdict": "ACCEPTED",
+   "evidence": "CFX Asset Class: Equity 294 (49 -USD crypto, 12 ^ index), FX 125, Commodity 33; MF 2,474 Equity.",
+   "register": "P-70"
+  },
+  {
+   "id": "C12",
+   "claim": "118 rows with price_bar_stale; 2210.SR bar 04-29 with DQ 100; COMI.CA 2024",
+   "verdict": "ACCEPTED",
+   "evidence": "Exact count 118; 2210.SR warnings price_bar_stale:2026-04-29, DQ 100, BLOCKED; no Price-As-Of column exists.",
+   "register": "P-74"
+  },
+  {
+   "id": "C13",
+   "claim": "08:08 Top_10 run absent from _Run_Log",
+   "verdict": "ACCEPTED",
+   "evidence": "Morning cockpit trigger (tfbMorningCockpitRefresh) writes no _Run_Log row; only the 4-hourly wrapper does.",
+   "register": "P-67"
+  },
+  {
+   "id": "C14",
+   "claim": "Run-log timestamps mix three formats; Status 'Last Global Update 6/6/2026' stale",
+   "verdict": "ACCEPTED (cosmetic)",
+   "evidence": "Slash-naive GAS, space-naive backend, tz-aware sync_hold lines coexist.",
+   "register": "housekeeping"
+  },
+  {
+   "id": "C15",
+   "claim": "YUM and YUM.US both in Global_Markets with different forecasts",
+   "verdict": "ACCEPTED (refines P-45)",
+   "evidence": "YUM 4.20% synthetic rel 53.7 vs YUM.US 15.01% provider_target rel 74.9; also OTIS/OTIS.US, FCX/FCX.US. Explains 3 of 4 MP↔GM splits.",
+   "register": "P-63/P-52"
+  },
+  {
+   "id": "C16",
+   "claim": "Large unexplained cash movements (+17,225, −19,563, −11,483, +608)",
+   "verdict": "REJECTED",
+   "evidence": "All tie to ledger trades: T82U 17,217 · SHG buy −19,545 · EPRT −11,487 · SHG sell − HCI buy +606 (FX/commission residuals 1–19 SAR).",
+   "register": "—"
+  },
+  {
+   "id": "C17",
+   "claim": "Buy fees populated 0/33; sell fees 0/26 → results may be overstated",
+   "verdict": "PARTIAL",
+   "evidence": "Buy prices are commission-loaded (proven from IBKR fills: SHG 74.37+1.99/70=74.40; EPRT 30.59+1.99/100=30.61). Sell side: commission ($2.29 on SHG) not deducted — accepted for sells.",
+   "register": "P-69"
+  },
+  {
+   "id": "C18",
+   "claim": "Mixed percentage units create a 100× downstream risk",
+   "verdict": "REJECTED as data risk; ACCEPTED as display defect",
+   "evidence": "GAS number format on fixed row ranges (2,435 formatted / 4,174 raw); builder read PFS '▲17.69%' as 17.7% correctly; TMDX '300.00%' and YCBD are 2 isolated cells.",
+   "register": "cosmetic"
+  },
+  {
+   "id": "C19",
+   "claim": "900/967 Selection Log outcomes blank → no outcome feedback",
+   "verdict": "REJECTED as system finding",
+   "evidence": "Realized outcomes live in Performance_Log (PERF-VERDICT 1427/1428, Brier 0.2662); tab-level note only.",
+   "register": "—"
+  },
+  {
+   "id": "C20",
+   "claim": "Mutual Funds fallback clustering 96.2% / 98.7% / 88.9%",
+   "verdict": "PARTIAL",
+   "evidence": "Quality Score mode share 96.2% ✓; DQ 53.6% (not 98.7%); Reliability 48.4% (not 88.9%).",
+   "register": "P-44"
+  },
+  {
+   "id": "C21",
+   "claim": "AEFES previous close 17.99 vs public 18.21 (change +2.56% vs +1.32%)",
+   "verdict": "HYPOTHESIS (supported)",
+   "evidence": "Row has quote_current_price_missing + xprovider_verified:yahoo_chart; price from Yahoo, prev close from a stale EODHD quote → mixed-provider change fields.",
+   "register": "P-68"
+  },
+  {
+   "id": "C22",
+   "claim": "5023.SR identity: buy date 2025-01-10 vs 2026-01-01, blank name, class conflict",
+   "verdict": "ACCEPTED (low)",
+   "evidence": "MP name blank, Buy Date 2025-01-10, Industry 'Listed Equities'; ledger 2026-01-01 = inception placeholder shared by 7 legacy rows.",
+   "register": "P-39"
+  },
+  {
+   "id": "C23",
+   "claim": "Audit readiness 4.7/10",
+   "verdict": "NOT ADOPTED",
+   "evidence": "Reviewer rubric; the program metric is tfb_acceptance (last 24 PASS / 0 FAIL / 5 WARN).",
+   "register": "—"
+  }
+ ]
+}
