@@ -1835,7 +1835,36 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.57.0"
+SCRIPT_VERSION = "6.58.0"
+# -----------------------------------------------------------------------------
+# v6.58.0 (2026-09-05) - KLG STUB-SWAP COVERS PRICELESS 'history' ROWS (P-83a)
+# -----------------------------------------------------------------------------
+# EVIDENCE (Market_Leaders export, evening run 14:59-15:48Z, vs the 04:xxZ
+#   morning export): 25 .SR rows (2310, 2330, 2340, 2360, 2370, 2381, 3002,
+#   3003, 3005, 3007, 3008, 3020, 4080, 4191, 4321, 6004, 4144, 1835, 2010,
+#   2020, 2070, 4200, 1323, 1324, 1810) came back with Data Provider =
+#   "history", Last Updated 2026-09-03T07:00, NO Current Price, and the
+#   engine's recommendation_forced_hold_missing_price -> BLOCKED. The same
+#   symbols were yahoo_chart-priced at 08:19Z that morning (2310.SR = 13.19).
+#   INVESTABLE on the page fell 9 -> 4 with no market move behind it.
+# MECHANISM: the v6.22.3 KLG stub-swap (_keep_last_good_rows) recognises a
+#   stub ONLY as (a) provider in _KLG_ERROR_PROVIDERS or (b) blank Name. A
+#   "history" row has a Name and a non-error provider, so it is not a stub;
+#   the swap never runs; the priceless row overwrites the symbol's last-good
+#   sheet row, and NULL-CLEAR scope=all then blanks every derived cell. The
+#   engine's own fundamentals LKG could not help either: its store is
+#   in-process and the service restarted four times that day (P-75).
+# FIX (default ON, kill-switchable): a fresh row with NO positive price whose
+#   provider token is in TFB_SYNC_KLG_STUB_PROVIDERS (CSV, default "history")
+#   is stub-eligible, so the existing swap machinery restores the symbol's
+#   last-good row under the SAME certification as every other stub (old row
+#   priced, provider not error, FW-1 identity gate, forced-refetch veto).
+#   Rows that DO carry a fresh price are untouched (the price check runs
+#   first, exactly as before). TFB_SYNC_KLG_STUB_PROVIDERS="" => v6.57.0
+#   behaviour byte-identical.
+# Functions added: 2 (_klg_stub_providers, _klg_provider_is_stub_eligible).
+# Removed: 0. Changed: _keep_last_good_rows (one stub predicate widened).
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.57.0 (2026-09-03) - NULL-CLEAR SCOPE: the fill guard can clear EVERY column
 # -----------------------------------------------------------------------------
@@ -7417,6 +7446,30 @@ def _klg_provider_is_error(v: Any) -> bool:
     return _guard_norm(v) in _KLG_ERROR_PROVIDERS
 
 
+_KLG_STUB_PROVIDERS_DEFAULT = "history"
+
+
+def _klg_stub_providers() -> frozenset:
+    """v6.58.0 [P-83a]: provider tokens that make a PRICELESS fresh row
+    stub-eligible although they are not error markers.
+    TFB_SYNC_KLG_STUB_PROVIDERS (CSV, case-insensitive; default "history");
+    an explicitly EMPTY value disables the widening (v6.57.0 behaviour)."""
+    raw = os.getenv("TFB_SYNC_KLG_STUB_PROVIDERS")
+    if raw is None:
+        raw = _KLG_STUB_PROVIDERS_DEFAULT
+    return frozenset(t.strip().casefold() for t in raw.split(",") if t.strip())
+
+
+def _klg_provider_is_stub_eligible(v: Any) -> bool:
+    """v6.58.0 [P-83a]: True iff the Data Provider cell normalizes into the
+    stub-provider set (blank never qualifies). Price is checked by the caller
+    first: a row with a fresh positive price is NEVER a stub."""
+    try:
+        return _guard_norm(v) in _klg_stub_providers()
+    except Exception:
+        return False
+
+
 def _keep_last_good_rows(
     sheets: "SheetsWriter",
     spreadsheet_id: str,
@@ -7428,9 +7481,10 @@ def _keep_last_good_rows(
     with the symbol's existing last-good sheet row, re-aligned to the NEW
     header order by header NAME (exactly like _persist_missing_symbol_rows).
 
-    STUB (conservative; both forms require NO positive price):
+    STUB (conservative; all forms require NO positive price):
       (a) Data Provider in _KLG_ERROR_PROVIDERS, or
-      (b) the Name cell is blank.
+      (b) the Name cell is blank, or
+      (c) v6.58.0: Data Provider in _klg_stub_providers() (default "history").
     GOOD old row: positive price AND provider not in the error set. A stub
     whose old row is missing or not good keeps the fresh stub — the guard
     substitutes strictly better data or nothing.
@@ -7466,7 +7520,8 @@ def _keep_last_good_rows(
             continue  # carries a fresh price -> never a stub
         is_err = prov_i >= 0 and _klg_provider_is_error(_cell(row, prov_i))
         is_bare = name_i >= 0 and _guard_is_blank(_cell(row, name_i))
-        if not (is_err or is_bare):
+        is_hist = prov_i >= 0 and _klg_provider_is_stub_eligible(_cell(row, prov_i))  # v6.58.0
+        if not (is_err or is_bare or is_hist):
             continue
         t = str(row[sym_i]).strip().upper()
         stub_rows.setdefault(t, []).append(r_i)
