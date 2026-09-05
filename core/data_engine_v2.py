@@ -3390,7 +3390,47 @@ if str(ROOT_DIR) not in sys.path:
 # NOT CHANGED: BB-1 echo gate, YC-4, BA-2 static map, enrichment passes,
 #   target LKG, providers. Zero functions removed.
 # =============================================================================
-__version__ = "5.137.0"
+# =============================================================================
+# v5.138.0 (2026-09-05) — REDIS L2 FOR THE FUNDAMENTALS LKG (R-6c / P-83;
+# env-gated, DEFAULT OFF)
+# =============================================================================
+# EVIDENCE (2026-09-05 evening Global_Markets export, run 14:59-15:48Z, vs
+#   the 04:xxZ morning export): the Yahoo enrichment leg succeeded for ~3%
+#   of rows during the 15:00-15:30Z US-open throttle window (2/16, 3/122,
+#   5/169), recovering to ~65% after 15:30Z. The Fix AZ fundamentals LKG
+#   should have carried the morning block for exactly that gap — but the
+#   "fundamentals_lkg:<age>h" tag count went 320 (morning) -> 0 (evening):
+#   _FUND_LKG_STORE is a per-worker in-memory dict and the web service was
+#   redeployed four times that day (13:04, 14:28, 15:09, 16:03 Riyadh — ENV
+#   armings and docs commits alike restart Render). Cold store + null-clear
+#   scope=all on the sheet writer = Market Cap blanked on 1,925 symbols,
+#   Target Price on 1,028, provider_target 1,319 -> 711, INVESTABLE 49 -> 20
+#   — a coverage collapse with no market move behind it.
+# FIX: the v5.136.0 R-6b pattern applied to the SAME fundamentals store,
+#   additions only:
+#   _fund_lkg_capture  -> after the in-memory write, write-through SETEX
+#                         tfb:fund_lkg:v1:<SYMBOL> (ttl = _fund_lkg_ttl_h)
+#                         with the unchanged entry schema {ts,name,fields}.
+#   _fund_lkg_restore  -> on an in-memory MISS only, GET the L2 entry
+#                         (schema-checked: ts>0, whitelisted fields only,
+#                         at least one anchor), hydrate memory, then fall
+#                         through to the UNCHANGED TTL / min-fields /
+#                         fill-only guards (age stays entry.ts-based).
+#   Lazy client (redis already pinned), 250 ms timeouts, circuit breaker
+#   (3 consecutive errors -> memory-only for 300 s), counters surfaced in
+#   the boot banner / health engine_gates (engine_fund_lkg_redis /
+#   fund_lkg_redis_state / fund_lkg_redis_stats) as the arming read-back.
+#   Any failure path degrades to v5.117.0 memory-only behaviour.
+# ENV (Render Web): TFB_ENGINE_FUND_LKG_REDIS — DEFAULT OFF => v5.137.0
+#   byte-identical (no client is ever constructed). Reads REDIS_URL. Effective
+#   immediately when armed because the fund LKG master (TFB_ENGINE_FUND_LKG)
+#   is ON by default. Spec max age is configuration:
+#   TFB_ENGINE_FUND_LKG_TTL_H=120 (5 trading days). Kill = unset/0.
+# NOT CHANGED: capture-only-clean taint rules, min-fields threshold, the
+#   24-field whitelist, anchor rule, fill-only restore, the tag text, target
+#   LKG, providers, SAI contract. Zero functions removed.
+# =============================================================================
+__version__ = "5.138.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4980,6 +5020,9 @@ def surface_gate_states() -> Dict[str, Any]:
             "engine_target_klg_redis": _tgt_lkg_redis_enabled(),
             "tgt_lkg_redis_state": _tgt_lkg_redis_state_label(),
             "tgt_lkg_redis_stats": _tgt_lkg_redis_stats(),
+            "engine_fund_lkg_redis": _fund_lkg_redis_enabled(),        # v5.138.0
+            "fund_lkg_redis_state": _fund_lkg_redis_state_label(),
+            "fund_lkg_redis_stats": _fund_lkg_redis_stats(),
         }
     except Exception:
         return {}
@@ -10670,6 +10713,8 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
             "name": _safe_str(row.get("name")),
             "fields": fields,
         }
+        # v5.138.0 (R-6c): write-through to the L2 layer (no-op when OFF).
+        _fund_lkg_redis_set(s, _FUND_LKG_STORE[s])
         # Hygiene: prune expired, then enforce the size cap oldest-first.
         cap = _fund_lkg_max_symbols()
         if len(_FUND_LKG_STORE) > cap:
@@ -10704,6 +10749,12 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
             return None
         entry = _FUND_LKG_STORE.get(s)
         if not entry:
+            # v5.138.0 (R-6c): L2 read on an in-memory miss; the unchanged
+            # TTL / fill-only guards below still decide admissibility.
+            entry = _fund_lkg_redis_get(s)
+            if entry:
+                _FUND_LKG_STORE[s] = entry
+        if not entry:
             return None
         now = time.time()
         age_s = now - float(entry.get("ts") or 0.0)
@@ -10723,6 +10774,184 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# v5.138.0 (R-6c): Redis L2 for the FUNDAMENTALS LKG. Default OFF. Never
+# raises. A mirror of the v5.136.0 target-LKG layer with the {ts,name,fields}
+# schema; admissibility (TTL / min-fields / fill-only) stays in the callers.
+# ---------------------------------------------------------------------------
+_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v1:"
+_FUND_LKG_REDIS_BREAKER_ERRORS: int = 3
+_FUND_LKG_REDIS_BREAKER_SECONDS: float = 300.0
+_FUND_LKG_REDIS_TIMEOUT_S: float = 0.25
+_FUND_LKG_REDIS_STATE: Dict[str, Any] = {
+    "client": None,
+    "client_failed": False,
+    "consecutive_errors": 0,
+    "breaker_until": 0.0,
+    "hits": 0,
+    "misses": 0,
+    "writes": 0,
+    "errors": 0,
+    "breaker_trips": 0,
+}
+
+
+def _fund_lkg_redis_enabled() -> bool:
+    """v5.138.0 master gate for the fund-LKG L2 layer. DEFAULT OFF —
+    unset/0/false/off keeps _fund_lkg_capture/_fund_lkg_restore byte-identical
+    to v5.137.0 (no client is ever constructed)."""
+    return os.getenv("TFB_ENGINE_FUND_LKG_REDIS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fund_lkg_redis_url() -> str:
+    return (os.getenv("REDIS_URL") or "").strip()
+
+
+def _fund_lkg_redis_key(sym: str) -> str:
+    return _FUND_LKG_REDIS_KEY_PREFIX + _safe_str(sym).strip().upper()
+
+
+def _fund_lkg_redis_state_label() -> str:
+    """off | nourl | breaker | idle | degraded | ok — banner/read-back only."""
+    try:
+        if not _fund_lkg_redis_enabled():
+            return "off"
+        if not _fund_lkg_redis_url():
+            return "nourl"
+        st = _FUND_LKG_REDIS_STATE
+        if float(st.get("breaker_until") or 0.0) > time.time():
+            return "breaker"
+        if st.get("client") is None:
+            return "idle"
+        if int(st.get("consecutive_errors") or 0) > 0:
+            return "degraded"
+        return "ok"
+    except Exception:
+        return "unknown"
+
+
+def _fund_lkg_redis_stats() -> Dict[str, int]:
+    st = _FUND_LKG_REDIS_STATE
+    try:
+        return {k: int(st.get(k) or 0) for k in
+                ("hits", "misses", "writes", "errors", "breaker_trips")}
+    except Exception:
+        return {}
+
+
+def _fund_lkg_redis_note_error() -> None:
+    st = _FUND_LKG_REDIS_STATE
+    st["errors"] = int(st.get("errors") or 0) + 1
+    st["consecutive_errors"] = int(st.get("consecutive_errors") or 0) + 1
+    if st["consecutive_errors"] >= _FUND_LKG_REDIS_BREAKER_ERRORS:
+        st["breaker_until"] = time.time() + _FUND_LKG_REDIS_BREAKER_SECONDS
+        st["consecutive_errors"] = 0
+        st["breaker_trips"] = int(st.get("breaker_trips") or 0) + 1
+        st["client"] = None
+
+
+def _fund_lkg_redis_note_ok() -> None:
+    _FUND_LKG_REDIS_STATE["consecutive_errors"] = 0
+
+
+def _fund_lkg_redis_client() -> Any:
+    """Lazy, cached client. None when the layer is OFF, REDIS_URL is absent,
+    the breaker is open, or the redis package/client cannot be built.
+    Construction does NOT ping (the first command is the probe)."""
+    try:
+        if not _fund_lkg_redis_enabled():
+            return None
+        url = _fund_lkg_redis_url()
+        if not url:
+            return None
+        st = _FUND_LKG_REDIS_STATE
+        if float(st.get("breaker_until") or 0.0) > time.time():
+            return None
+        client = st.get("client")
+        if client is not None:
+            return client
+        try:
+            import redis as _redis_mod  # type: ignore
+        except Exception:
+            st["client_failed"] = True
+            _fund_lkg_redis_note_error()
+            return None
+        client = _redis_mod.Redis.from_url(
+            url,
+            socket_connect_timeout=_FUND_LKG_REDIS_TIMEOUT_S,
+            socket_timeout=_FUND_LKG_REDIS_TIMEOUT_S,
+            decode_responses=True,
+        )
+        st["client"] = client
+        return client
+    except Exception:
+        _fund_lkg_redis_note_error()
+        return None
+
+
+def _fund_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
+    """Write-through SETEX of a captured entry. ttl = _fund_lkg_ttl_h().
+    Never raises; False on any refusal/failure."""
+    try:
+        client = _fund_lkg_redis_client()
+        if client is None:
+            return False
+        import json  # local import — module convention (see v5.7x helpers)
+        fields = entry.get("fields")
+        if not isinstance(fields, Mapping) or not fields:
+            return False
+        ttl_s = int(max(1.0, _fund_lkg_ttl_h() * 3600.0))
+        payload = json.dumps({
+            "ts": float(entry.get("ts") or 0.0),
+            "name": _safe_str(entry.get("name")),
+            "fields": {k: v for k, v in fields.items() if k in _FUND_LKG_FIELDS},
+        }, default=str)
+        client.setex(_fund_lkg_redis_key(sym), ttl_s, payload)
+        _fund_lkg_redis_note_ok()
+        _FUND_LKG_REDIS_STATE["writes"] = int(_FUND_LKG_REDIS_STATE.get("writes") or 0) + 1
+        return True
+    except Exception:
+        _fund_lkg_redis_note_error()
+        return False
+
+
+def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
+    """L2 read on an in-memory miss. Returns a schema-valid entry dict
+    ({ts,name,fields}: ts>0, whitelisted non-missing fields only, at least
+    one anchor field) or None. Never raises. The caller re-applies the
+    v5.117.0 TTL / min-fields / fill-only guards."""
+    try:
+        client = _fund_lkg_redis_client()
+        if client is None:
+            return None
+        import json  # local import — module convention (see v5.7x helpers)
+        raw = client.get(_fund_lkg_redis_key(sym))
+        _fund_lkg_redis_note_ok()
+        if not raw:
+            _FUND_LKG_REDIS_STATE["misses"] = int(_FUND_LKG_REDIS_STATE.get("misses") or 0) + 1
+            return None
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            return None
+        ts = _as_float(d.get("ts"))
+        fields_in = d.get("fields")
+        if ts is None or ts <= 0 or not isinstance(fields_in, dict):
+            return None
+        fields: Dict[str, Any] = {}
+        for k in _FUND_LKG_FIELDS:
+            v = fields_in.get(k)
+            if not _is_missing_or_unknown_field(v):
+                fields[k] = v
+        if not fields or all(_is_missing_or_unknown_field(fields.get(k))
+                             for k in _FUND_LKG_ANCHOR_FIELDS):
+            return None
+        _FUND_LKG_REDIS_STATE["hits"] = int(_FUND_LKG_REDIS_STATE.get("hits") or 0) + 1
+        return {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
+    except Exception:
+        _fund_lkg_redis_note_error()
         return None
 
 
