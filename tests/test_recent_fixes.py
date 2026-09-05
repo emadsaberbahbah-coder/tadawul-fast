@@ -345,3 +345,94 @@ def test_rds_wrong_critical_issuer_cannot_report_success():
     result = type("Result", (), {"status": "success", "rows_failed": 0, "error": None})()
     rds.fail_result_on_identity(result, failures)
     assert result.status == "failed"
+
+
+# --------------------------------------------------------------------------- #
+# v5.138.0 (R-6c / P-83): Redis L2 for the fundamentals LKG                    #
+# --------------------------------------------------------------------------- #
+def _de_fund_fixture(monkeypatch, armed: bool):
+    from core import data_engine_v2 as de
+    if armed:
+        monkeypatch.setenv("TFB_ENGINE_FUND_LKG_REDIS", "1")
+        monkeypatch.setenv("REDIS_URL", "redis://fake:6379/0")
+    else:
+        monkeypatch.delenv("TFB_ENGINE_FUND_LKG_REDIS", raising=False)
+    monkeypatch.delenv("TFB_ENGINE_FUND_LKG", raising=False)
+    de._FUND_LKG_STORE.clear()
+    st = de._FUND_LKG_REDIS_STATE
+    for k in ("hits", "misses", "writes", "errors", "breaker_trips", "consecutive_errors"):
+        st[k] = 0
+    st["client"] = None
+    st["breaker_until"] = 0.0
+    return de
+
+
+class _FakeRedis:
+    def __init__(self):
+        self.kv = {}
+        self.fail = False
+
+    def setex(self, k, ttl, v):
+        if self.fail:
+            raise ConnectionError("down")
+        self.kv[k] = (ttl, v)
+
+    def get(self, k):
+        if self.fail:
+            raise ConnectionError("down")
+        return self.kv.get(k, (None, None))[1]
+
+
+def _full_fund_row(de, sym="HCI.US"):
+    r = {"symbol": sym, "name": "HCI Group, Inc.", "warnings": ""}
+    for i, k in enumerate(list(de._FUND_LKG_FIELDS)[:12]):
+        r[k] = 100.0 + i
+    r["eps_ttm"] = 23.7
+    r["market_cap"] = 2.33e9
+    return r
+
+
+def test_de_fund_lkg_redis_default_off_is_memory_only(monkeypatch):
+    de = _de_fund_fixture(monkeypatch, armed=False)
+    assert de._fund_lkg_redis_enabled() is False
+    assert de._fund_lkg_redis_state_label() == "off"
+    assert de._fund_lkg_capture("HCI.US", _full_fund_row(de)) is True
+    assert de._FUND_LKG_REDIS_STATE["client"] is None          # never constructed
+    assert de._fund_lkg_redis_stats()["writes"] == 0
+
+
+def test_de_fund_lkg_redis_cold_worker_restores_from_l2(monkeypatch):
+    de = _de_fund_fixture(monkeypatch, armed=True)
+    fr = _FakeRedis()
+    de._FUND_LKG_REDIS_STATE["client"] = fr
+    assert de._fund_lkg_capture("HCI.US", _full_fund_row(de)) is True
+    key = de._fund_lkg_redis_key("HCI.US")
+    assert key.startswith("tfb:fund_lkg:v1:") and key in fr.kv
+    de._FUND_LKG_STORE.clear()                                  # Render restart
+    degraded = {"symbol": "HCI.US", "name": "HCI Group, Inc.", "warnings": ""}
+    tag = de._fund_lkg_restore("HCI.US", degraded)
+    assert tag is not None and tag.startswith("fundamentals_lkg:")
+    assert degraded["market_cap"] == 2.33e9
+    assert "HCI.US" in de._FUND_LKG_STORE                       # memory rehydrated
+    assert de._fund_lkg_redis_stats()["hits"] == 1
+    assert de._fund_lkg_redis_stats()["writes"] == 1
+
+
+def test_de_fund_lkg_redis_breaker_degrades_to_memory_only(monkeypatch):
+    de = _de_fund_fixture(monkeypatch, armed=True)
+    fr = _FakeRedis()
+    fr.fail = True
+    de._FUND_LKG_REDIS_STATE["client"] = fr
+    for _ in range(3):
+        assert de._fund_lkg_redis_get("HCI.US") is None
+    assert de._fund_lkg_redis_state_label() == "breaker"
+    assert de._fund_lkg_redis_stats()["breaker_trips"] == 1
+    assert de._fund_lkg_capture("HCI.US", _full_fund_row(de)) is True   # memory path intact
+    assert "HCI.US" in de._FUND_LKG_STORE
+    # anchor-less L2 payloads are refused even when the client is healthy
+    fr2 = _FakeRedis()
+    de._FUND_LKG_REDIS_STATE["client"] = fr2
+    de._FUND_LKG_REDIS_STATE["breaker_until"] = 0.0
+    import json, time
+    fr2.kv[de._fund_lkg_redis_key("X.US")] = (1, json.dumps({"ts": time.time(), "name": "X", "fields": {"sector": "Tech"}}))
+    assert de._fund_lkg_redis_get("X.US") is None
