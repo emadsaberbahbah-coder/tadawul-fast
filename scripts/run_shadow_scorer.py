@@ -1,6 +1,22 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.7.1  (2026-09-05)  — PRICE-ERRS READ-BACK (log-only)
+WHY v1.7.1: S1_Gate 2026-09-04 reads "price errors: 38 | day: EXCLUDED_INFRA"
+(32nd excluded-infra day) ONE day after TFB_SHADOW_EODHD=1 was armed, and
+nothing in any artifact can say whether the v1.3.0 rescue fired: fetch_spot's
+errs list — where the `eodhd_rescued:N/M` tag and every `sym:eodhd_*`
+failure land — was only ever COUNTED (`price errors: N`), never shown. An
+arming without a read-back proof is not an arming (10-Day Program arming
+discipline). FIX: one PURE helper, summarize_price_errs(), folds the
+EXISTING errs list into an error-class histogram — gate on/off, token
+present yes/no (never the token itself), Yahoo misses, rescued N/M, EODHD
+failures, first 8 symbols — and the line is (a) printed right after the
+verdict on EVERY path incl. --dry-run, (b) written as the 4th cell of the
+S1_Gate "price errors" meta row, (c) embedded in the _Run_Log Details JSON
+as "price_errs". fetch_spot, the errs contents, every count, every basket
+number and every day classification: BYTE-UNTOUCHED — this release reads,
+it does not decide.
 VERSION 1.3.0  (2026-08-22)  — EODHD RESCUE FALLBACK FOR fetch_spot
 WHY v1.3.0: S1_Gate 2026-08-22 reads 3/28 scored days with 21 EXCLUDED_INFRA;
 the day-state classifier is honest, but the INPUT dies upstream: fetch_spot
@@ -219,7 +235,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # makes both flags arrive; this change makes dry-run mean ZERO writes on
 # every path: the drill branch now previews and exits without touching
 # Sheets. Everything else is byte-identical to v1.5.0.
-SCRIPT_VERSION = "1.7.0"
+SCRIPT_VERSION = "1.7.1"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -756,6 +772,73 @@ def fetch_spot(symbols: Sequence[str]
 
 
 # --------------------------------------------------------------------------- #
+# v1.7.1 PRICE-ERRS read-back — PURE: folds fetch_spot's errs, changes nothing  #
+# --------------------------------------------------------------------------- #
+def _shadow_eodhd_enabled() -> bool:
+    """v1.7.1: the SAME truthiness fetch_spot's rescue branch tests (an
+    unparseable value such as "defult" is OFF there too — IR-020 family)."""
+    return (os.getenv("TFB_SHADOW_EODHD", "0").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+def summarize_price_errs(errs: Sequence[str], gate_on: bool,
+                         token_present: bool, first_n: int = 8
+                         ) -> Tuple[str, Dict[str, Any]]:
+    """v1.7.1 PURE: (log line, JSON-safe details) from fetch_spot's errs.
+
+    errs entries are `sym:Class` (Yahoo miss/exception), `sym:no_bar_date`
+    (price PRESENT, bar date unreadable — not a miss), `sym:eodhd_<Exc>`
+    (rescue failed for that symbol) or the single `eodhd_rescued:N/M` tag.
+    yahoo_miss = entries that left the symbol unpriced after the Yahoo pass,
+    i.e. exactly fetch_spot's `missing` list; rescued / rescue_pool come from
+    the tag when present (else 0 over the derived miss pool). Nothing here
+    re-fetches, re-counts `price errors: N`, or re-classifies a day.
+    """
+    classes: Dict[str, int] = {}
+    yahoo_miss = 0
+    eodhd_fail = 0
+    rescued = 0
+    rescue_pool: Optional[int] = None
+    tag_seen = False
+    first: List[str] = []
+    for raw in errs:
+        e = str(raw)
+        if e.startswith("eodhd_rescued:"):
+            tag_seen = True
+            try:
+                n_s, m_s = e.split(":", 1)[1].split("/", 1)
+                rescued, rescue_pool = int(n_s), int(m_s)
+            except (ValueError, IndexError):
+                pass
+            continue
+        sym, _, cls = e.partition(":")
+        cls = cls or "unclassified"
+        classes[cls] = classes.get(cls, 0) + 1
+        if cls.startswith("eodhd_"):
+            eodhd_fail += 1
+        elif cls != "no_bar_date":
+            yahoo_miss += 1
+        if len(first) < first_n:
+            first.append(f"{sym}:{cls}")
+    pool = rescue_pool if rescue_pool is not None else yahoo_miss
+    hist = ",".join(f"{k}:{v}" for k, v in
+                    sorted(classes.items(), key=lambda kv: (-kv[1], kv[0])))
+    details: Dict[str, Any] = {
+        "n": len(errs), "gate_on": bool(gate_on),
+        "token_present": bool(token_present), "yahoo_miss": yahoo_miss,
+        "rescued": rescued, "rescue_pool": pool,
+        "rescue_tag_seen": tag_seen, "eodhd_fail": eodhd_fail,
+        "classes": classes, "first": first}
+    line = (f"[S1-PRICE-ERRS v{SCRIPT_VERSION}] n={len(errs)} "
+            f"gate={'on' if gate_on else 'off'} "
+            f"token={'yes' if token_present else 'no'} "
+            f"yahoo_miss={yahoo_miss} eodhd_rescued={rescued}/{pool} "
+            f"eodhd_fail={eodhd_fail} classes={hist or '-'} "
+            f"first={','.join(first) or '-'}")
+    return line, details
+
+
+# --------------------------------------------------------------------------- #
 # sheets I/O                                                                   #
 # --------------------------------------------------------------------------- #
 def read_history(sh) -> List[Dict[str, Any]]:
@@ -1206,6 +1289,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
         verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
     print(verdict)
+    # v1.7.1: PRICE-ERRS read-back — printed on EVERY path (incl. --dry-run);
+    # token PRESENCE only, never its value.
+    _pe_line, _pe_details = summarize_price_errs(
+        price_errs, _shadow_eodhd_enabled(),
+        bool((os.getenv("TFB_EODHD_API_KEY") or "").strip()))
+    print(_pe_line)
     if args.dry_run:
         for r in new_rows:
             print("  ", r[:3], "ret=", r[4], "idx=", r[5], "drag=", r[7])
@@ -1228,7 +1317,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         [f"benchmark = {json.dumps(BENCH_WEIGHTS)} (§1 locked)",
          "returns are cost-adjusted, daily-rebalanced equal-weight",
          f"price errors: {len(price_errs)} | stale: {total_stale} | "
-         f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}"],
+         f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}",
+         _pe_line],                                 # v1.7.1 read-back cell
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1259,7 +1349,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
              "shadow_scorer", TAB_GATE,
              "OK" if gate["verdict"] != "FAIL" else "GATE_FAIL", verdict,
-             "", "", "", json.dumps({"version": SCRIPT_VERSION})],
+             "", "", "", json.dumps({"version": SCRIPT_VERSION,
+                                     "price_errs": _pe_details})],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -1594,6 +1685,39 @@ def _selftest() -> int:
     if _dc_saved is not None:
         os.environ["TFB_SHADOW_DAY_CLASS"] = _dc_saved
 
+    # ---- v1.7.1: PRICE-ERRS read-back is pure and never leaks a secret --- #
+    _pe_errs = ["AAA.US:HTTPStatusError", "BBB.US:no_close",
+                "CCC.US:no_bar_date", "DDD.US:HTTPStatusError",
+                "BBB.US:eodhd_HTTPStatusError", "eodhd_rescued:2/3"]
+    _pl, _pd = summarize_price_errs(_pe_errs, True, True)
+    checks.append(("PE: yahoo_miss counts misses only (no_bar_date excluded)",
+                   _pd["yahoo_miss"] == 3 and _pd["n"] == 6))
+    checks.append(("PE: rescued N/M parsed from the tag, eodhd_fail counted",
+                   _pd["rescued"] == 2 and _pd["rescue_pool"] == 3
+                   and _pd["eodhd_fail"] == 1 and _pd["rescue_tag_seen"]))
+    checks.append(("PE: line carries gate/token/histogram, never a token",
+                   "gate=on token=yes" in _pl and "eodhd_rescued=2/3" in _pl
+                   and "HTTPStatusError:2" in _pl
+                   and "api_token" not in _pl and "first=AAA.US" in _pl))
+    _pl0, _pd0 = summarize_price_errs([], False, False)
+    checks.append(("PE: empty errs -> n=0, pool 0, gate off, token no, JSON-safe",
+                   _pd0["n"] == 0 and _pd0["rescue_pool"] == 0
+                   and "gate=off token=no" in _pl0
+                   and json.loads(json.dumps(_pd0)) == _pd0))
+    checks.append(("PE: no tag -> rescued 0 over the derived miss pool",
+                   summarize_price_errs(["X.US:no_close", "Y.US:no_close"],
+                                        True, False)[1]["rescue_pool"] == 2))
+    _pe_saved = os.environ.get("TFB_SHADOW_EODHD")
+    os.environ["TFB_SHADOW_EODHD"] = "1"
+    _pe_on = _shadow_eodhd_enabled()
+    os.environ["TFB_SHADOW_EODHD"] = "defult"
+    _pe_typo = _shadow_eodhd_enabled()
+    if _pe_saved is None:
+        del os.environ["TFB_SHADOW_EODHD"]
+    else:
+        os.environ["TFB_SHADOW_EODHD"] = _pe_saved
+    checks.append(("PE: gate truthiness mirrors fetch_spot ('1' on, typo off)",
+                   _pe_on is True and _pe_typo is False))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
