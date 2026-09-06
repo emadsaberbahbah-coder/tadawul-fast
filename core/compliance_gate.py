@@ -1,6 +1,32 @@
 """
 core/compliance_gate.py — TFB Generation-2 Layer-0 Compliance & Eligibility Gate
 ================================================================================
+VERSION 1.1.0  (2026-09-06)  — SCREEN RETIRED (P-79 root cause; completes the
+                                2026-08-13 retirement on the shadow path)
+WHY v1.1.0 (evidence: _Run_Log 2026-09-02..05 SHADOW-BOARD lines, S1_Gate
+  3/28 scored days frozen since <=2026-08-25, source read 2026-09-06):
+  * The shadow board's challenger basket is built from evaluate(): a name is
+    eligible only when shariah_status is AUTHORITY_PASS or MODEL_SCREEN_PASS.
+    Non-Saudi names are never in the authority index, so they fall to
+    model_screen(): activity screen (insurance/banks/... -> MODEL_SCREEN_FAIL),
+    then totalDebt/marketCap from yfinance get_info() (> 0.30 -> FAIL; fetch
+    miss -> UNKNOWN). Either way not eligible. Run 1 (venue allowlist) removed
+    the BROKER_UNTRADABLE half; this half kept the challenger empty
+    (eligible=0), the CHALLENGER basket blank, and every trading day excluded
+    with reason=no-challenger. The operator retired Shariah screening on
+    2026-08-13; the shadow path never got the memo.
+FIX v1.1.0 (env-gated, DEFAULT OFF = v1.0.1 byte-identical for every consumer):
+  * TFB_COMPLIANCE_SCREEN_RETIRED=1 -> evaluate() skips authority lookup and
+    model screen for every asset class and stamps SCREEN_RETIRED (a new status,
+    member of INVEST_OK_STATUSES, source "retired_2026-08-13"). Tradability,
+    Nomu venue block, instrument permissions and floor-vs-cap block exactly as
+    before; a blocked name still carries its blocked status.
+  * Arming scope: the shadow-board workflow (GitHub Variable). Render never
+    sets it, so the selector's use of this module is unchanged.
+  * Read-back: [SHADOW-BOARD] eligible>0 with blocked={} on a board of
+    allow-listed names; the 14:10Z scorer scores the day instead of
+    reason=no-challenger.
+--------------------------------------------------------------------------------
 VERSION 1.0.0  (2026-07-18)  — NEW MODULE (first deliverable of Wave A0)
 
 WHY (root-cause evidence, per TFB_GenII_Master_Plan_v2.1 §4, §19 and Decision_Log):
@@ -23,6 +49,7 @@ DESIGN RULES:
 
 ENV (all optional):
   TFB_COMPLIANCE_GATE_ENABLED          "0" (default) | "1"
+  TFB_COMPLIANCE_SCREEN_RETIRED        "0" (default) | "1"  (v1.1.0; see above)
   TFB_COMPLIANCE_MODEL_SCREEN_ENABLED  "1" (default; D-2 general acceptance) | "0"
   TFB_COMPLIANCE_AUTHORITY_MAX_AGE_DAYS "120"
   TFB_COMPLIANCE_DEBT_RATIO_MAX        "0.30"   (Rajhi-family threshold)
@@ -38,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 COMPLIANCE_GATE_VERSION = __version__
 
 # --------------------------------------------------------------------------- #
@@ -57,8 +84,9 @@ BROKER_TRADABLE = "BROKER_TRADABLE"
 BROKER_UNTRADABLE = "BROKER_UNTRADABLE"
 FLOOR_LOCKED = "FLOOR_LOCKED"
 GATE_DISABLED = "GATE_DISABLED"
+SCREEN_RETIRED = "SCREEN_RETIRED"   # v1.1.0: screening retired 2026-08-13
 
-INVEST_OK_STATUSES = {AUTHORITY_PASS, MODEL_SCREEN_PASS}
+INVEST_OK_STATUSES = {AUTHORITY_PASS, MODEL_SCREEN_PASS, SCREEN_RETIRED}
 
 # Asset classes (§5)
 EQUITY = "EQUITY"
@@ -86,6 +114,11 @@ def gate_enabled() -> bool:
 
 def model_screen_enabled() -> bool:
     return _env_flag("TFB_COMPLIANCE_MODEL_SCREEN_ENABLED", "1")
+
+def screen_retired() -> bool:
+    """v1.1.0: TFB_COMPLIANCE_SCREEN_RETIRED=1 -> no authority lookup, no
+    model screen; eligibility = tradability + venue + permissions + floor."""
+    return _env_flag("TFB_COMPLIANCE_SCREEN_RETIRED", "0")
 
 def authority_max_age_days() -> int:
     return int(_env_float("TFB_COMPLIANCE_AUTHORITY_MAX_AGE_DAYS", "120"))
@@ -370,7 +403,9 @@ def evaluate(symbol: str,
              permissions: Optional[Dict[str, bool]] = None,
              today: Optional[date] = None) -> ComplianceVerdict:
     """Gate order (§4/§19): AssetClass -> Tradability -> Venue -> Permissions
-    -> Shariah (authority first, model screen per D-2) -> Floor-vs-cap."""
+    -> Shariah (authority first, model screen per D-2) -> Floor-vs-cap.
+    v1.1.0: with TFB_COMPLIANCE_SCREEN_RETIRED=1 the Shariah step is replaced
+    by the SCREEN_RETIRED stamp; every other step is unchanged."""
     row = row or {}
     reasons: List[str] = []
     ac = classify_asset(symbol, row.get("name", ""), row.get("quote_type", ""))
@@ -392,7 +427,11 @@ def evaluate(symbol: str,
         blocked_status = INSTRUMENT_BLOCK; reasons.append(f"instrument_block:{ac}")
 
     src = "none"
-    if ac == SUKUK:
+    if screen_retired():   # v1.1.0
+        st = SCREEN_RETIRED if blocked_status is None else blocked_status
+        reasons.append("screen_retired_2026-08-13")
+        src = "retired_2026-08-13"
+    elif ac == SUKUK:
         st = AUTHORITY_PASS if blocked_status is None else blocked_status
         reasons.append("sukuk_pass_by_construction")
         src = "asset_class"
@@ -484,6 +523,39 @@ def _selftest() -> None:
     checks.append(("gate disabled -> passthrough eligible",
                    v.shariah_status == GATE_DISABLED and v.invest_eligible))
     os.environ["TFB_COMPLIANCE_GATE_ENABLED"] = "1"
+
+    # v1.1.0 — SCREEN_RETIRED
+    us_row = {"name": "Transportadora de Gas del Sur", "sector": "Utilities"}
+    v_off = evaluate("TGS.US", us_row, auth, today=today)
+    checks.append(("retired OFF: US name without debt inputs is UNKNOWN, not eligible",
+                   v_off.shariah_status == UNKNOWN and not v_off.invest_eligible))
+    os.environ["TFB_COMPLIANCE_SCREEN_RETIRED"] = "1"
+    v = evaluate("TGS.US", us_row, auth, today=today)
+    checks.append(("retired ON: US name eligible, stamped SCREEN_RETIRED",
+                   v.shariah_status == SCREEN_RETIRED and v.shariah_source == "retired_2026-08-13"
+                   and v.invest_eligible and "screen_retired_2026-08-13" in v.reasons))
+    v = evaluate("HCI.US", {"name": "HCI Group", "sector": "Financial Services",
+                            "industry": "Insurance - Property & Casualty"}, auth, today=today)
+    checks.append(("retired ON: activity-blocked sector no longer blocks",
+                   v.shariah_status == SCREEN_RETIRED and v.invest_eligible))
+    v = evaluate("RELIANCE.NS", {"name": "Reliance Industries"}, auth, today=today)
+    checks.append(("retired ON: untradable .NS still blocked",
+                   v.shariah_status == BROKER_UNTRADABLE and not v.invest_eligible))
+    v = evaluate("9628.SR", {}, auth, today=today)
+    checks.append(("retired ON: Nomu still venue-blocked",
+                   v.shariah_status == VENUE_BLOCK and not v.invest_eligible))
+    v = evaluate("0005.HK", {"name": "HSBC Holdings"}, auth, equity_sar=50000, today=today)
+    checks.append(("retired ON: floor-vs-cap still locks (HK floor 27,200 > 15% of 50K)",
+                   v.shariah_status == SCREEN_RETIRED and not v.invest_eligible
+                   and any(r.startswith(FLOOR_LOCKED) for r in v.reasons)))
+    v = evaluate("5023.SR", {"name": "Arabian Centres Sukuk 5023"}, auth, today=today)
+    checks.append(("retired ON: sukuk eligible under the retired stamp",
+                   v.asset_class == SUKUK and v.shariah_status == SCREEN_RETIRED and v.invest_eligible))
+    os.environ["TFB_COMPLIANCE_SCREEN_RETIRED"] = "0"
+    v_back = evaluate("TGS.US", us_row, auth, today=today)
+    checks.append(("retired OFF again: verdict identical to the pre-arming verdict",
+                   v_back == v_off))
+    os.environ.pop("TFB_COMPLIANCE_SCREEN_RETIRED", None)
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
