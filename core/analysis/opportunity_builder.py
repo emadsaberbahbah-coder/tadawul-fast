@@ -1061,7 +1061,54 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.3"
+OPPORTUNITY_BUILDER_VERSION = "1.19.4"
+# -----------------------------------------------------------------------------
+# v1.19.4 (2026-09-06) - ROTATION FUNDING FLOOR + EXIT-LEG PROVENANCE (P-45
+# rule applied to the exit side; kill-switch, DEFAULT ON)
+# EVIDENCE (2026-09-06 morning six-gate audit, gate (b), run 34010489746):
+#   The 08:08 cockpit carried "DEC.US ... FUNDABLE_BY_ROTATION: exit PFS
+#   445 SAR (engine 12M edge +34.9pp after cost) -> ticket 5,000 SAR; residual
+#   CAPITAL_CALL 4,504 SAR". Two defects in one proposal:
+#   (1) arithmetic - a 445 SAR exit cannot fund a 5,000 SAR ticket; the
+#       residual call (4,504) IS the ticket. The label promised a funding path
+#       that does not exist and proposed an exit that funds nothing.
+#   (2) provenance - the exit-leg baseline was the PFS.US pool row
+#       (-1.47%, rank_skipped_low_trust, Rel 31.3, DQ 73.7) while My_Portfolio
+#       carried +5.1% HOLD for the same holding. Register rule P-45: degraded
+#       pool rows (phase_ii_synthetic / momentum_only_fallback /
+#       rank_skipped_low_trust) must not serve as rotation baselines. v1.18.0
+#       applied that rule to the entry side only.
+# CHANGE (additive; response contract preserved; kill-switch below):
+#   [R1] FUNDABLE_BY_ROTATION requires FULL cover: _rotation_pick now takes
+#        min_value_sar (default 0.0 = v1.19.3) and _funding_plans passes the
+#        shortfall, so only a holding whose value covers the shortfall can be
+#        picked. No cover => state CAPITAL_CALL (counted as such), no exit
+#        proposed; the best candidate that could not cover is named in the
+#        near-miss text as "ROTATION_INSUFFICIENT: exit <sym> covers X of Y"
+#        (once per run, on the first uncovered plan).
+#        The one-rotation-per-run budget is NOT consumed by an insufficient
+#        candidate, so a smaller shortfall further down rank can still rotate.
+#   [R2] a TRIM that would leave a remnant below the operator's min-ticket
+#        floor becomes a full EXIT with the surplus stated ("surplus X to
+#        cash") - a sub-floor remnant is not an executable position (v1.0.14
+#        doctrine, applied to the exit side). floor_sar=0 (floor OFF) => no
+#        conversion.
+#   [R3] _holding_roi_map skips pool rows that _holding_forecast_degraded
+#        flags: synthesized forecast_source (the v1.10.0 token set, default
+#        phase_ii_synthetic) or a warnings token in _ROTATION_DEGRADED_TOKENS
+#        (rank_skipped_low_trust, momentum_only_fallback). Such a holding has no
+#        forecast in the map and therefore never rotates (v1.18.0 rule).
+#   kpis: rotation_insufficient (additive key; absent-key-safe consumers).
+#   Read-back on today's cockpit: DEC.US carries "CAPITAL_CALL: deposit >=
+#   4,949 SAR ... ROTATION_INSUFFICIENT: exit YUM covers 3,617 SAR of
+#   4,949 SAR"; PFS is never named; fundable_by_rotation = 0.
+# GATE: TFB_OPP_ROTATION_FLOOR_GUARD default ON; =0/false/off/no =>
+#   v1.19.3 byte-identical (same picks, same text, same kpis, same alerts).
+# NOT CHANGED: gate list, GATE_ORDER, verdicts, sizing, venue floors/lots,
+#   the v1.18.0 edge/cost rule, one-rotation-per-run, exclusions, FX.
+# Functions added: 2 (_env_rotation_floor_guard, _holding_forecast_degraded).
+#   Signatures extended (defaulted, backward-compatible): _rotation_pick,
+#   _funding_plans. Removed: 0.
 # -----------------------------------------------------------------------------
 # v1.19.3 (2026-09-04) - FX PEG GUARD + HELD-TARGET NO-NEW-MONEY (both
 # env-gated, DEFAULT OFF => v1.19.2 byte-identical)
@@ -3898,17 +3945,49 @@ def _env_capital_call_topn():
         return 3
 
 
+# v1.19.4: warnings tokens that mark a pool row as a degraded forecast row
+# (register rule P-45). The synthesized forecast_source set is the v1.10.0
+# token set (TFB_T10_SYNTHETIC_SOURCES, default phase_ii_synthetic).
+_ROTATION_DEGRADED_TOKENS = ("rank_skipped_low_trust", "momentum_only_fallback")
+
+
+def _env_rotation_floor_guard():
+    """v1.19.4 kill-switch. Default ON; 0/false/off/no = v1.19.3 byte-identical."""
+    return str(_env_str("TFB_OPP_ROTATION_FLOOR_GUARD", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _holding_forecast_degraded(cand):
+    """v1.19.4 PURE: True when a pool row must NOT serve as a rotation
+    baseline (P-45): its forecast_source normalizes to a synthesized token,
+    or its warnings carry a _ROTATION_DEGRADED_TOKENS token. Blank provenance
+    passes (fail-open, exactly as the v1.10.0 provenance gate)."""
+    if not isinstance(cand, dict):
+        return False
+    if not _forecast_provenance_assessment(cand)[0]:
+        return True
+    w = (_to_text(cand.get("warnings")) or "").lower()
+    return any(t in w for t in _ROTATION_DEGRADED_TOKENS)
+
+
 def _holding_roi_map(audit_rows, holdings):
     """v1.18.0 PURE: held symbol -> engine 12M forecast (pct) read from the
-    scanned pool: exact symbol first, then the .US alias either way."""
+    scanned pool: exact symbol first, then the .US alias either way.
+    v1.19.4: when the floor guard is ON, degraded pool rows (see
+    _holding_forecast_degraded) are skipped, so such a holding has no
+    forecast in the map and never rotates."""
     pool = {}
+    _guard = _env_rotation_floor_guard()   # v1.19.4
     for a in (audit_rows or []):
         c = a.get("_cand") if isinstance(a, dict) else None
         if not isinstance(c, dict):
             continue
         s = str(a.get("symbol") or "").strip().upper()
-        if s:
-            pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
+        if not s:
+            continue
+        if _guard and _holding_forecast_degraded(c):   # v1.19.4 [R3]
+            continue
+        pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
     out = {}
     for h in (holdings or []):
         s = str(h.get("symbol") or "").strip().upper()
@@ -3960,11 +4039,14 @@ def _holding_rotation_eligible(h, today=None):
     return True, ""
 
 
-def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
+def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct,
+                   min_value_sar=0.0):
     """v1.18.0 PURE: the held equity with the LOWEST engine forecast that is
     worse than the opportunity by >= edge_pp after round-trip cost; None when
     nothing qualifies. Excluded symbols (sukuk) and holdings without a
-    forecast in the pool never rotate."""
+    forecast in the pool never rotate.
+    v1.19.4 [R1]: min_value_sar > 0 restricts the pick to holdings whose
+    value covers that amount (the shortfall); default 0.0 = v1.19.3."""
     if opp_roi_pct is None:
         return None
     best = None
@@ -3974,6 +4056,9 @@ def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
             continue
         if not _holding_rotation_eligible(h)[0]:   # v1.18.1
             continue
+        if float(min_value_sar or 0.0) > 0 and \
+                float(h.get("value_sar") or 0.0) < float(min_value_sar) - 0.5:
+            continue   # v1.19.4 [R1]: cannot cover the shortfall
         r = hold_roi.get(s)
         if r is None:
             continue
@@ -3987,11 +4072,17 @@ def _rotation_pick(opp_roi_pct, holdings, hold_roi, exclude, edge_pp, cost_pct):
 
 
 def _funding_plans(ordered_needs, remaining, holdings, hold_roi, exclude,
-                   edge_pp, cost_pct):
+                   edge_pp, cost_pct, floor_sar=0.0):
     """v1.18.0 PURE: sequential funding plans for rank-ordered unfunded names.
     ordered_needs: [(symbol, need_sar, opp_roi_pct)]. Cash covers plans in rank
-    order; ONE rotation proposal per run; the rest are capital calls."""
+    order; ONE rotation proposal per run; the rest are capital calls.
+    v1.19.4 (floor guard ON): [R1] a rotation must cover the shortfall in
+    full, else the plan is a CAPITAL_CALL carrying rotation_insufficient
+    (the best candidate that could not cover; the rotation budget is not
+    consumed); [R2] a TRIM leaving a remnant below floor_sar becomes a full
+    EXIT with surplus_sar. floor_sar default 0.0 = no remnant rule."""
     plans, avail, rotation_used = [], max(0.0, float(remaining or 0.0)), False
+    _guard, _ins_noted = _env_rotation_floor_guard(), False   # v1.19.4
     for sym, need, opp_roi in ordered_needs:
         need = float(need or 0.0)
         if need <= 0:
@@ -4005,18 +4096,38 @@ def _funding_plans(ordered_needs, remaining, holdings, hold_roi, exclude,
             rot = None
             if not rotation_used:
                 rot = _rotation_pick(opp_roi, holdings, hold_roi, exclude,
-                                     edge_pp, cost_pct)
+                                     edge_pp, cost_pct,
+                                     min_value_sar=(short if _guard else 0.0))
             if rot is not None:
                 rotation_used = True
                 proceeds = min(rot["value_sar"], short)
                 rot = dict(rot, proceeds_sar=round(proceeds, 0),
                            action=("EXIT" if proceeds >= rot["value_sar"] - 0.5
                                    else "TRIM"))
+                if _guard and rot["action"] == "TRIM" \
+                        and float(floor_sar or 0.0) > 0 \
+                        and (rot["value_sar"] - proceeds) < float(floor_sar) - 0.5:
+                    # v1.19.4 [R2]: sub-floor remnant => full exit, surplus stated
+                    rot["action"] = "EXIT"
+                    rot["proceeds_sar"] = round(rot["value_sar"], 0)
+                    rot["surplus_sar"] = round(max(0.0, rot["value_sar"] - short), 0)
+                    rot["remnant_exit"] = True
                 plan["rotation"] = rot
                 plan["shortfall_sar"] = round(max(0.0, short - proceeds), 0)
                 plan["state"] = "FUNDABLE_BY_ROTATION"
             else:
                 plan["state"] = "CAPITAL_CALL"
+                if _guard and not rotation_used and not _ins_noted:
+                    # v1.19.4 [R1]: name the best candidate that could not
+                    # cover the shortfall (text only, once per run; no exit
+                    # proposed; the rotation budget stays available).
+                    _ins = _rotation_pick(opp_roi, holdings, hold_roi, exclude,
+                                          edge_pp, cost_pct)
+                    if _ins is not None:
+                        plan["rotation_insufficient"] = dict(
+                            _ins, short_sar=round(short, 0),
+                            covers_sar=round(min(_ins["value_sar"], short), 0))
+                        _ins_noted = True
         plans.append(plan)
     return plans
 
@@ -4032,11 +4143,21 @@ def _funding_plan_text(plan, remaining):
                " \u2192 ticket " + _fmt_sar(plan["need_sar"]))
         if (plan.get("shortfall_sar") or 0) > 0:
             txt += "; residual CAPITAL_CALL " + _fmt_sar(plan["shortfall_sar"])
+        if r.get("remnant_exit"):   # v1.19.4 [R2]
+            txt += (" (trim would leave a sub-floor remnant; surplus " +
+                    _fmt_sar(r.get("surplus_sar") or 0.0) + " to cash)")
         return txt
     if st == "CAPITAL_CALL":
-        return (" | CAPITAL_CALL: deposit \u2265 " + _fmt_sar(plan["shortfall_sar"]) +
-                " for a " + _fmt_sar(plan["need_sar"]) + " ticket (cash " +
-                _fmt_sar(max(0.0, float(remaining or 0.0))) + ")")
+        txt = (" | CAPITAL_CALL: deposit \u2265 " + _fmt_sar(plan["shortfall_sar"]) +
+               " for a " + _fmt_sar(plan["need_sar"]) + " ticket (cash " +
+               _fmt_sar(max(0.0, float(remaining or 0.0))) + ")")
+        _ins = plan.get("rotation_insufficient")   # v1.19.4 [R1]
+        if _ins:
+            txt += (" \u2014 ROTATION_INSUFFICIENT: exit " + _ins["symbol"] +
+                    " covers " + _fmt_sar(_ins["covers_sar"]) + " of " +
+                    _fmt_sar(_ins["short_sar"]) + " (engine 12M edge +" +
+                    _fmt_num(_ins["edge_pp"]) + "pp after cost); no exit proposed")
+        return txt
     return ""
 
 
@@ -4985,7 +5106,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 _fp_plans = _funding_plans(
                     _ordered, remaining, pf["holdings"], _hold_roi,
                     _env_rotation_exclude(), _env_rotation_edge_pp(),
-                    _env_rotation_cost_pct())
+                    _env_rotation_cost_pct(), floor_sar=_min_floor)   # v1.19.4
                 _by_sym_plan = {pl["symbol"]: pl for pl in _fp_plans}
                 for _s, _pl in _by_sym_plan.items():
                     _txt = _funding_plan_text(_pl, remaining)
@@ -5033,6 +5154,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             1 for pl in _fp_plans if pl["state"] == "CAPITAL_CALL")
         kpis["capital_call_topn_sar"] = round(sum(
             (pl.get("shortfall_sar") or 0.0) for pl in _fp_plans[:_topn]), 0)
+        if _env_rotation_floor_guard():   # v1.19.4 additive key
+            kpis["rotation_insufficient"] = sum(
+                1 for pl in _fp_plans if pl.get("rotation_insufficient"))
     if _scan_clamped:
         kpis["scan_clamped"] = True
         kpis["scan_clamp"] = int(crit["max_candidates"])
