@@ -1061,7 +1061,32 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.4"
+OPPORTUNITY_BUILDER_VERSION = "1.19.5"
+# -----------------------------------------------------------------------------
+# v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
+# (v1.18.1 wiring gap closed; no new env)
+# EVIDENCE (found while proving v1.19.4 end-to-end, 2026-09-06):
+#   _normalize_portfolio rebuilt every holding as {symbol, sector, market,
+#   value_sar} only. The v1.18.1 criteria ("held >= TFB_OPP_ROTATION_MIN_HELD_DAYS
+#   calendar days", "not within TFB_OPP_ROTATION_TP1_PROXIMITY_PCT below TP1")
+#   read buy_date / tp1_sar / price_sar from the holding and are fail-open per
+#   field - so in the real request flow they never fired: every holding was
+#   age-eligible. Under v1.19.3 HCI.US (bought 2026-09-03, 3 days) was a live
+#   rotation candidate and was not picked only because PFS had a lower
+#   forecast. The pinned-module harness for v1.19.4 passed holdings directly
+#   and therefore could not see this.
+# CHANGE (additive):
+#   _normalize_portfolio carries, when the request has them, buy_date (text,
+#   first 10 chars = ISO date), tp1_sar and price_sar (floats; unparseable =>
+#   omitted). Absent fields stay absent, so a holding without them is
+#   normalized byte-identically to v1.19.4 and the rule stays fail-open.
+#   meta.rotation_fields = {holdings, buy_date, tp1_sar, price_sar} counts =
+#   the arming read-back (must show buy_date == holdings once the GAS payload
+#   carries it; 0 means the payload does not, not that the rule is off).
+# GATE: none new. The existing knobs govern: TFB_OPP_ROTATION_MIN_HELD_DAYS=0
+#   disables the age rule, TFB_OPP_ROTATION_TP1_PROXIMITY_PCT=0 the TP1 rule.
+# NOT CHANGED: _holding_rotation_eligible, sector context, held-symbol
+#   exclusion, funding layer, gates, sizing. Functions added: 0. Removed: 0.
 # -----------------------------------------------------------------------------
 # v1.19.4 (2026-09-06) - ROTATION FUNDING FLOOR + EXIT-LEG PROVENANCE (P-45
 # rule applied to the exit side; kill-switch, DEFAULT ON)
@@ -3817,14 +3842,24 @@ def _normalize_portfolio(portfolio):
     for h in (p.get("holdings") or []):
         if not isinstance(h, dict):
             continue
-        holdings.append({
+        hd = {
             "symbol": _to_text(h.get("symbol")) or "?",
             "sector": (_normalize_sector(_to_text(h.get("sector")))
                        if _env_sector_normalize()
                        else _to_text(h.get("sector"))) or "Unknown",
             "market": _to_text(h.get("market")) or "Unknown",
             "value_sar": _to_float(h.get("value_sar")) or 0.0,
-        })
+        }
+        # v1.19.5: carry the v1.18.1 rotation fields when the request has
+        # them (fail-open: absent stays absent, unparseable is omitted).
+        _bd = _to_text(h.get("buy_date"))
+        if _bd:
+            hd["buy_date"] = _bd
+        for _k in ("tp1_sar", "price_sar"):
+            _fv = _to_float(h.get(_k))
+            if _fv is not None and _fv > 0:
+                hd[_k] = float(_fv)
+        holdings.append(hd)
     if pv <= 0 and holdings:
         pv = sum(h["value_sar"] for h in holdings)
     return {"cash": max(0.0, cash), "proceeds": max(0.0, proceeds),
@@ -5297,6 +5332,13 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             else meta_in.get("engine_version"),
         },
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        # v1.19.5 read-back: do the rotation fields reach the rule?
+        "rotation_fields": {
+            "holdings": len(pf["holdings"]),
+            "buy_date": sum(1 for h in pf["holdings"] if h.get("buy_date")),
+            "tp1_sar": sum(1 for h in pf["holdings"] if h.get("tp1_sar")),
+            "price_sar": sum(1 for h in pf["holdings"] if h.get("price_sar")),
+        },
     }
 
     status = "ok" if audit else "no_candidates"
