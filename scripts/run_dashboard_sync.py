@@ -1325,6 +1325,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     from scripts.critical_symbol_identity import (
+        CRITICAL_FETCH_SYMBOLS,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -1334,6 +1335,7 @@ try:
     )
 except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
     from critical_symbol_identity import (
+        CRITICAL_FETCH_SYMBOLS,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -1835,7 +1837,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.58.0"
+SCRIPT_VERSION = "6.59.0"
 # -----------------------------------------------------------------------------
 # v6.58.0 (2026-09-05) - KLG STUB-SWAP COVERS PRICELESS 'history' ROWS (P-83a)
 # -----------------------------------------------------------------------------
@@ -9206,6 +9208,7 @@ _OLDEST_FIRST_TAG = "[OLDEST-FIRST v6.27.0]"
 
 
 _DECISION_FIRST_TAG = "[DECISION-FIRST v6.35.0]"
+_CRIT_FRONT_TAG = "[CRIT-FRONT v6.59.0]"
 _DECISION_SOURCE_PAGES = ("My_Portfolio", "Top_10_Investments")
 _PRIORITY_SET_CACHE = {}
 
@@ -9215,6 +9218,14 @@ def _priority_fetch_enabled() -> bool:
     TFB_SYNC_PRIORITY_FETCH=1 promotes decision symbols to the front of
     every ranked market page's worklist (see header WHY block)."""
     raw = (os.getenv("TFB_SYNC_PRIORITY_FETCH", "0") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _crit_front_enabled() -> bool:
+    """v6.59.0 kill-switch — DEFAULT ON (fixes the 2026-09-07 live
+    feed-down defect; TFB_SYNC_CRIT_FRONT=0 restores v6.58.0
+    byte-identical ordering). See the CRIT-FRONT WHY at the call site."""
+    raw = (os.getenv("TFB_SYNC_CRIT_FRONT", "1") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -9617,6 +9628,40 @@ async def _run_one_task(
                                     "symbol(s) of %d",
                                     _DECISION_FIRST_TAG, task.sheet_name,
                                     _n_moved, len(symbols))
+                            except Exception:
+                                pass
+                # v6.59.0 [CRIT-FRONT] (P-104 close). WHY: registry criticals
+                # demand CURRENT-RUN identity proof (critical_symbol_identity.
+                # validate_fresh_critical_rows — a valid predecessor is
+                # deliberately inadmissible), yet [OLDEST-FIRST v6.27.0] sorts
+                # a critical refreshed last leg to the TAIL, where the
+                # [v6.22.4 TIME-BUDGET] cut leaves it unfetched and fails the
+                # whole leg + Decision Feed ("missing fresh response row":
+                # FISV.US, run 34081609919, 2026-09-07 08:04:44 +03 — leg 46%
+                # coverage, 124/268 batches). Deterministic ping-pong: each
+                # leg refreshes a critical, the NEXT leg tails it. FIX: front
+                # every critical present on the page as the OUTERMOST
+                # promotion (ahead of DECISION-FIRST — a missed decision
+                # symbol degrades one ticket; a missed critical kills the
+                # feed). Stable partition via _apply_decision_first keeps
+                # stalest-first order among the criticals themselves. Cost:
+                # a handful of head batches (criticals are single-symbol
+                # batches upstream). DEFAULT ON; kill TFB_SYNC_CRIT_FRONT=0.
+                if (_crit_front_enabled()
+                        and task.sheet_name in _RANKED_MARKET_PAGES):
+                    _crit_set = {
+                        str(_s or "").strip().upper() for _s in symbols
+                        if canonicalize_symbol(_s) in CRITICAL_FETCH_SYMBOLS}
+                    if _crit_set:
+                        symbols, _n_crit = _apply_decision_first(
+                            symbols, _crit_set)
+                        if _n_crit:
+                            try:
+                                logger.info(
+                                    "%s %s: fronted %d registry "
+                                    "critical(s) of %d",
+                                    _CRIT_FRONT_TAG, task.sheet_name,
+                                    _n_crit, len(symbols))
                             except Exception:
                                 pass
             elif _readback_empty_guard_enabled() and task.expects_rows:
