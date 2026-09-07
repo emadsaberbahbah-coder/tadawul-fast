@@ -2,7 +2,36 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.131.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.139.0
+================================================================================
+
+WHY v5.139.0 - SECTOR PASS-THROUGH ON VERIFIED IDENTITY (Fix AX; env-armed)
+- EVIDENCE (2026-09-08 Global_Markets census): Sector/Industry blank on
+  3,416 live rows (51.7%); 692 of them carry eodhd_fundamentals_fallback_
+  applied + fund_identity[_quarantined] - the fallback fetched sector and
+  AW-2 (v5.112.0) stripped it even when AW-1 had just verified the payload
+  DECLARED the matching identity. The remaining ~2,584 never fired the
+  fallback at all: its gate tests only the D/E-or-FCF gap, never sector.
+  Consequence: the sector-diversification cap cannot bind on half the page.
+- AX-1: _aw2_identity_declared_match (positive complement of AU-1's lenient
+  mismatch check, same token primitives) + _aw2_sector_passthrough_enabled
+  (TFB_AW2_SECTOR_PASSTHROUGH, DEFAULT OFF - loosening an incident-born
+  guard arms via Render env, one arming per evidence run). Armed + declared
+  match: sector/industry survive the AW-2 strip (fill-only, tag
+  sector_from_eodhd_verified). Name/exchange/currency/asset_class stay
+  quarantined UNCONDITIONALLY; undeclared or disjoint payloads behave
+  byte-identically to v5.112.0.
+- AX-2: the fallback gate also fires on a blank sector/industry - but only
+  while AX-1 is armed (unarmed, AW-2 would strip the fetched fields: a
+  paid no-op). Unarmed, both edits are byte-inert.
+- HEADER REPAIR: this file self-identified three ways (docstring title
+  v5.131.0; the operative __version__ = "5.138.0" at the constants block,
+  which /health reports; WHY content through v5.138.0). Title and the
+  operative assignment now read 5.139.0; every historical WHY block,
+  including its own "Version:" line, is preserved verbatim. The
+  14_Portfolio_PnL v2.5.1 lockstep rule applies backend-side from here on.
+
+Version: __version__ = "5.139.0". All prior WHYs preserved verbatim.
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3430,7 +3459,7 @@ if str(ROOT_DIR) not in sys.path:
 #   24-field whitelist, anchor rule, fill-only restore, the tag text, target
 #   LKG, providers, SAI contract. Zero functions removed.
 # =============================================================================
-__version__ = "5.138.0"
+__version__ = "5.139.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -10190,6 +10219,38 @@ def _fund_identity_guard_enabled() -> bool:
     return os.getenv("TFB_FUND_IDENTITY_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _aw2_sector_passthrough_enabled() -> bool:
+    """v5.139.0 (Fix AX-1): allow sector/industry through the AW-2 quarantine
+    ONLY for a fundamentals patch whose declared identity AFFIRMATIVELY
+    matches the requested symbol (_aw2_identity_declared_match). Default OFF:
+    this deliberately loosens a contamination guard born of a real incident
+    (Apple-as-Arbor), so it arms via Render env like every guard change.
+    TFB_AW2_SECTOR_PASSTHROUGH in {1,true,yes,on} arms it. Name / exchange /
+    currency / asset_class remain quarantined UNCONDITIONALLY."""
+    return os.getenv("TFB_AW2_SECTOR_PASSTHROUGH", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _aw2_identity_declared_match(requested: str, patch: Dict[str, Any]) -> bool:
+    """v5.139.0 (Fix AX-1 helper): True ONLY when the raw patch DECLARES an
+    identity (same four keys AU-1 reads) AND at least one declared token set
+    intersects the requested one — the positive complement of AU-1's lenient
+    _engine_patch_identity_mismatch. An UNDECLARED payload returns False: it
+    passes AU-1 by lenient design, but a quarantine pass-through must demand
+    an affirmative match, never the absence of a verdict. Pure; same
+    primitives as AU-1 so the two verdicts can never diverge on tokens."""
+    if not isinstance(patch, dict) or not patch:
+        return False
+    want = _au1_identity_token_set(requested)
+    if not want:
+        return False
+    for key in ("symbol_normalized", "symbol", "code", "requested_symbol"):
+        raw = patch.get(key)
+        s = ("" if raw is None else str(raw)).strip()
+        if s and (_au1_identity_token_set(s) & want):
+            return True
+    return False
+
+
 # v5.112.0 (Fix AW-2): display-identity keys that may NEVER enter a row via
 # the fundamentals side-channel. The fallback's stated purpose (v5.79.0) is
 # numeric fundamentals (debt_to_equity / free_cash_flow_ttm / margins);
@@ -15836,8 +15897,18 @@ class DataEngineV5:
         if not isinstance(row, dict):
             return row
         # Gate on the exact gap this fallback exists to close.
+        # v5.139.0 (Fix AX-2): a blank sector/industry is ALSO a gap worth
+        # one call — but only while AX-1 is armed; unarmed, AW-2 would strip
+        # the very fields the call was made for (a paid no-op). With AX-1
+        # off this condition is False and the gate is byte-identical.
+        _ax2_sector_gap = (
+            _aw2_sector_passthrough_enabled()
+            and (not _safe_str(row.get("sector"))
+                 or not _safe_str(row.get("industry")))
+        )
         if _as_float(row.get("debt_to_equity")) is not None \
-                and _as_float(row.get("free_cash_flow_ttm")) is not None:
+                and _as_float(row.get("free_cash_flow_ttm")) is not None \
+                and not _ax2_sector_gap:
             return row
         patch = await self._fetch_eodhd_fundamentals_patch(symbol, page)
         if not patch:
@@ -15875,11 +15946,25 @@ class DataEngineV5:
         # name_unresolved (v5.93.0 philosophy) beats a confidently wrong one.
         # Numeric fundamentals (the fallback's v5.79.0 purpose) still fill.
         if _fund_identity_guard_enabled() and filtered:
-            _aw_removed = [k for k in _AW_IDENTITY_QUARANTINE_KEYS if k in filtered]
+            _aw_keep: Tuple[str, ...] = ()
+            if _aw2_sector_passthrough_enabled() and \
+                    _aw2_identity_declared_match(symbol, patch):
+                # v5.139.0 (Fix AX-1): sector/industry may travel this channel
+                # ONLY on an affirmative declared-identity match — the
+                # Apple-as-Arbor vector was a DIFFERENT (or absent)
+                # declaration; a same-declared payload is the requested
+                # instrument's own record. Fill-only semantics inherited from
+                # _filter_patch_to_missing_fields; every other identity key
+                # stays quarantined.
+                _aw_keep = ("sector", "industry")
+            _aw_removed = [k for k in _AW_IDENTITY_QUARANTINE_KEYS
+                           if k in filtered and k not in _aw_keep]
             for _aw_k in _aw_removed:
                 filtered.pop(_aw_k, None)
             if _aw_removed:
                 _v573_append_warning(row, "fund_identity_quarantined")
+            if _aw_keep and any(k in filtered for k in _aw_keep):
+                _v573_append_warning(row, "sector_from_eodhd_verified")
         if filtered:
             row = self._merge(row, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
