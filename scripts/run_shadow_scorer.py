@@ -1,6 +1,22 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.7.3  (2026-09-08)  — FRESHNESS READ-BACK: NAME THE STARVERS (P-109)
+WHY v1.7.3: S-1 sits at 3/28 scored days with 33 excluded-infra; every
+trading day since 2026-09-02 ended `excluded_reason=fresh-floor` while the
+verdict printed only `stale=N`. Two starvation channels were invisible:
+(a) STALE names were collected by basket_return_fresh since v1.2.0 but never
+shown; (b) MISSING pairs — a basket symbol absent/zero in prev or absent in
+spot — lower fresh coverage without appearing anywhere (with 9 seats and the
+60% floor, 1 stale alone cannot exclude a day; unpaired seats can). An
+exclusion without names is not evidence (evidence discipline). FIX: one PURE
+helper _freshness_detail() — mirroring basket_return_fresh's exact pairing
+precondition — emits `[S1-FRESH v1.7.3] chal fresh=a/b floor=P% stale=[..]
+nopair=[..] new=[..]` (names capped), (a) appended to the verdict line before
+the informational eqw tail, (b) appended to the S1_Gate meta cell after the
+shape-guard segment, (c) added JSON-safe to the _Run_Log details. Counting,
+basket math, exclusion decisions, note formats, criteria: BYTE-UNTOUCHED.
+Log-only; no ENV; kill nothing.
 VERSION 1.7.2  (2026-09-05)  — SHAPE GUARD + EXCLUSION REASON (P-71 / P-79)
 WHY v1.7.2: the very first v1.7.1 read-back (run #52, dry-run) said
 `gate=on token=yes yahoo_miss=30 eodhd_rescued=0/30 eodhd_fail=8` and listed
@@ -261,7 +277,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # makes both flags arrive; this change makes dry-run mean ZERO writes on
 # every path: the drill branch now previews and exits without touching
 # Sheets. Everything else is byte-identical to v1.5.0.
-SCRIPT_VERSION = "1.7.2"
+SCRIPT_VERSION = "1.7.3"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -543,6 +559,43 @@ def blended_benchmark_return_fresh(prices_prev: Dict[str, float],
     if total_w <= 0:
         return None, n_fresh, n_stale
     return acc / total_w, n_fresh, n_stale
+
+
+def _freshness_detail(basket_syms: List[str],
+                      prev_prices: Optional[Dict[str, float]],
+                      cur_prices: Optional[Dict[str, float]],
+                      n_fresh: int, n_stale: int,
+                      stale_syms: List[str],
+                      floor_frac: float,
+                      ) -> Tuple[str, Dict[str, Any]]:
+    """v1.7.3 PURE: (log line, JSON-safe details) naming WHY challenger fresh
+    coverage sits where it does. `nopair` mirrors basket_return_fresh's exact
+    skip precondition (cur missing/None or prev price falsy); `new` are
+    today's seats with no prev entry (pairable only tomorrow). Reads nothing,
+    writes nothing, decides nothing."""
+    prev = prev_prices or {}
+    cur = cur_prices or {}
+    nopair = sorted(s for s, p0 in prev.items()
+                    if (cur.get(s) is None or not p0))
+    new_syms = sorted(s for s in (basket_syms or []) if s not in prev)
+    denom = len(basket_syms or [])
+    pct = floor_frac * 100.0
+    floor_txt = f"{pct:.0f}" if abs(pct - round(pct)) < 1e-9 else f"{pct:.1f}"
+
+    def _fmt(names: List[str]) -> str:
+        if not names:
+            return "-"
+        head = ",".join(names[:6])
+        more = len(names) - 6
+        return f"[{head}{f',+{more}' if more > 0 else ''}]"
+
+    line = (f"[S1-FRESH v{SCRIPT_VERSION}] chal fresh={n_fresh}/{denom} "
+            f"floor={floor_txt}% stale={_fmt(stale_syms)} "
+            f"nopair={_fmt(nopair)} new={_fmt(new_syms)}")
+    details = {"fresh": n_fresh, "basket": denom,
+               "floor_pct": round(pct, 1), "stale": stale_syms[:12],
+               "nopair": nopair[:12], "new": new_syms[:12]}
+    return line, details
 
 
 def count_scored_days(history: List[Dict[str, Any]], basket: str) -> Tuple[int, int]:
@@ -1377,6 +1430,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"(+{len(new_forks)} new)")
     if day_excluded and _excl_reason:              # v1.7.2 label truth
         verdict += f" | excluded_reason={_excl_reason}"
+    _fresh_line, _fresh_details = _freshness_detail(   # v1.7.3 read-back
+        chal_syms,
+        (_chal_m["p"] or {}).get("prices") if _chal_m["p"] else None,
+        spot, _chal_m["n_fresh"], _chal_m["n_stale"],
+        _chal_m["stale_syms"], _min_fresh_frac())
+    verdict += f" | {_fresh_line}"
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
         _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
         verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
@@ -1415,7 +1474,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"price errors: {len(price_errs)} | stale: {total_stale} | "
          f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}",
          _pe_line,                                  # v1.7.1 read-back cell
-         _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")],
+         _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")
+         + f" | {_fresh_line}"],                    # v1.7.3 read-back cell
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1450,7 +1510,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                      "price_errs": _pe_details,
                                      "shape_guard": {"on": _sg_on,
                                                      "dropped": _sg_dropped[:12]},
-                                     "excluded_reason": _excl_reason})],
+                                     "excluded_reason": _excl_reason,
+                                     "freshness": _fresh_details})],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -1875,6 +1936,17 @@ def _selftest() -> int:
         os.environ["TFB_SHADOW_EODHD"] = _pe_saved
     checks.append(("PE: gate truthiness mirrors fetch_spot ('1' on, typo off)",
                    _pe_on is True and _pe_typo is False))
+
+    _fl, _fd = _freshness_detail(
+        ["A", "B", "C", "D"], {"A": 1.0, "B": 2.0, "C": 0.0}, {"A": 1.1},
+        1, 0, [], 0.60)
+    checks.append(("FRESH: nopair mirrors pairing skip (B unpriced, C zero-prev); D new",
+                   _fd["nopair"] == ["B", "C"] and _fd["new"] == ["D"]
+                   and "fresh=1/4" in _fl and "floor=60%" in _fl
+                   and "nopair=[B,C]" in _fl))
+    checks.append(("FRESH: seed day (no prev) -> all seats new, nothing paired",
+                   _freshness_detail(["A"], None, {"A": 1.0},
+                                     0, 0, [], 0.6)[1]["new"] == ["A"]))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
