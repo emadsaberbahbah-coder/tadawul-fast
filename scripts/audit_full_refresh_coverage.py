@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Read-only, full-row audit for the GitHub automatic refresh pipeline."""
+"""Read-only, full-row audit for the GitHub automatic refresh pipeline.
+
+VERSION 1.1.0 (2026-09-08) — TIMEZONE TRUTH IN parse_dt (P-104)
+WHY v1.1.0: parse_dt emitted THREE inconsistent bases: naive strings/serials
+passed through as Riyadh wall time; "+HH:MM" ISO stamps were converted to
+naive UTC (every downstream naive-Riyadh subtraction inflated their age by
+exactly +3h — reproduced against the live _Status stamp); and "Z"-suffixed
+stamps had the suffix blanket-stripped, so a UTC instant was silently read
+as Riyadh (-3h). audit_grid additionally switched its `now0` basis on the
+STAMP column header, which only ever accidentally matched. FIX: (1) new PURE
+parse_dt_precision(v) -> (naive-Riyadh datetime | None, precision in
+{"datetime","date","none"}) — aware inputs convert via astimezone(RIYADH);
+"Z" is normalized to "+00:00", never stripped; naive inputs remain Riyadh
+wall time; integer sheet serials and date-only formats report precision
+"date" instead of fabricating midnight-as-instant. (2) parse_dt(v) is now a
+thin wrapper returning only the datetime — same signature, uniform basis.
+(3) audit_grid's now0 is unconditionally Riyadh-naive to match. Rules,
+floors, coverage math, exit codes: UNTOUCHED.
+"""
 from __future__ import annotations
 import argparse, asyncio, importlib, inspect, json, math, os, sys
 from collections import Counter
@@ -8,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -83,17 +101,38 @@ def idx(headers, names):
     return next((m[n.casefold()] for n in names if n.casefold() in m), -1)
 def has(row): return any(s(x) for x in row)
 
-def parse_dt(v):
-    if isinstance(v, datetime): return v.replace(tzinfo=None)
+RIYADH_TZ = timezone(timedelta(hours=3))          # v1.1.0 (P-104)
+_DATE_ONLY_FMTS = {"%Y-%m-%d", "%m/%d/%Y"}
+
+def parse_dt_precision(v):
+    """v1.1.0 PURE (P-104): (naive-RIYADH datetime | None, precision).
+
+    precision: "datetime" | "date" | "none". One output basis for every
+    input basis: aware -> astimezone(RIYADH) then strip tzinfo; "Z" is
+    normalized to "+00:00" (never stripped); naive strings and sheet
+    serials are Riyadh wall time as stored. An integer serial or a
+    date-only format is a DATE, reported as such — midnight is never
+    invented as an instant."""
+    if isinstance(v, datetime):
+        d = v.astimezone(RIYADH_TZ).replace(tzinfo=None) if v.tzinfo else v
+        return d, "datetime"
     if isinstance(v,(int,float)) and not isinstance(v,bool) and 20000 < float(v) < 80000:
-        return datetime(1899,12,30)+timedelta(days=float(v))
-    t=s(v).replace("T"," ").replace("Z","")
+        x=float(v)
+        return datetime(1899,12,30)+timedelta(days=x), ("date" if x==int(x) else "datetime")
+    t=s(v).replace("T"," ")
+    if not t: return None, "none"
+    if t.endswith("Z"): t=t[:-1]+"+00:00"
     for fmt in ("%Y-%m-%d %H:%M:%S.%f","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%Y-%m-%d","%m/%d/%Y %H:%M:%S","%m/%d/%Y"):
-        try: return datetime.strptime(t,fmt)
+        try: return datetime.strptime(t,fmt), ("date" if fmt in _DATE_ONLY_FMTS else "datetime")
         except Exception: pass
     try:
-        d=datetime.fromisoformat(t); return d.astimezone(timezone.utc).replace(tzinfo=None) if d.tzinfo else d
-    except Exception: return None
+        d=datetime.fromisoformat(t)
+        if d.tzinfo: d=d.astimezone(RIYADH_TZ).replace(tzinfo=None)
+        return d, ("datetime" if ":" in t else "date")
+    except Exception: return None, "none"
+
+def parse_dt(v):
+    return parse_dt_precision(v)[0]
 
 def resolve_reader():
     for mod in ("integrations.google_sheets_service","core.integrations.google_sheets_service","google_sheets_service","core.google_sheets_service"):
@@ -155,7 +194,7 @@ def audit_grid(grid, rule, expected, now, active=()):
     if not rule.symbols: return r.finish()
     si,ni,pi,ti,qi,ci=idx(headers,SYMBOL),idx(headers,NAME),idx(headers,PRICE),idx(headers,STAMP),idx(headers,QTY),idx(headers,COST)
     if si<0: r.failures.append("Symbol column missing"); return r.finish()
-    symbols=[]; names=prices=fresh=stale=bad=0; ages=[]; qmap={}; cmap={}; riyadh=ti>=0 and "riyadh" in headers[ti].casefold(); now0=now.astimezone(timezone.utc).replace(tzinfo=None)+(timedelta(hours=3) if riyadh else timedelta())
+    symbols=[]; names=prices=fresh=stale=bad=0; ages=[]; qmap={}; cmap={}; riyadh=ti>=0 and "riyadh" in headers[ti].casefold(); now0=now.astimezone(timezone.utc).replace(tzinfo=None)+timedelta(hours=3)  # v1.1.0 P-104: parse_dt is uniformly Riyadh-naive; now0 must match regardless of stamp-column basis (riyadh flag kept for payload truth)
     for row in rows:
         sym=s(row[si] if si<len(row) else "").upper()
         if not sym: r.blank_symbols+=1; continue
