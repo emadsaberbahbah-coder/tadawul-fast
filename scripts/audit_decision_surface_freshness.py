@@ -7,6 +7,22 @@ built from partial/stale source universes from looking executable merely
 because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
+
+VERSION 1.1.0 (2026-09-08) — CLOCK TRUTH: NO INVENTED AGES (P-104)
+WHY v1.1.0: the 2026-09-08 run (34189823244) failed PF_SOURCE_STALE on a
+date-only "9/8/2026" stamp read as midnight (fabricated 8.24h age), while
+every "+03:00" _Status stamp aged +3h exactly (shared parse_dt returned
+naive UTC; _age_hours subtracted it from naive Riyadh — reproduced against
+the live 07:07:28+03:00 stamp: true 1.11h, computed 4.11h). FIX: (1)
+parse_dt is now uniformly Riyadh-naive at its source (coverage script
+v1.1.0); ages and run-vs-source orderings become same-basis. (2) precision
+truth — a date-only stamp yields *_TIME_PRECISION (still FAIL, fail-closed)
+instead of a fabricated midnight age, and is excluded from run-vs-source
+ordering checks. (3) _age_hours returns SIGNED age; stamps more than
+FUTURE_SKEW_H in the future yield explicit *_FUTURE findings instead of
+silently clamping to fresh. (4) --selftest pins the golden cases (T05
+equivalence of Z/+00:00/+03:00/naive forms; T06 date-only; future). Floors,
+universe contract, exit-code semantics: UNTOUCHED.
 """
 from __future__ import annotations
 
@@ -27,9 +43,10 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from scripts.audit_full_refresh_coverage import parse_dt, resolve_reader, s  # noqa: E402
+from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
     r"Last\s+run\s+(?P<stamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -43,6 +60,7 @@ POOL_RE = re.compile(r"(?P<page>[A-Za-z][A-Za-z0-9_]+)\s+(?P<used>\d+)\/(?P<tota
 class StatusRow:
     page: str
     updated: Optional[datetime]
+    updated_precision: str                            # v1.1.0 P-104: "datetime" | "date" | "none"
     status: str
     message: str
     rows: Optional[int]
@@ -167,9 +185,12 @@ def parse_status_grid(grid: Sequence[Sequence[Any]]) -> dict[str, StatusRow]:
         page = s(raw[index["page"]] if index["page"] < len(raw) else "")
         if not page:
             continue
+        _upd, _prec = parse_dt_precision(              # v1.1.0 P-104
+            raw[index["last updated"]] if index["last updated"] < len(raw) else None)
         rows[page] = StatusRow(
             page=page,
-            updated=parse_dt(raw[index["last updated"]] if index["last updated"] < len(raw) else None),
+            updated=_upd,
+            updated_precision=_prec,
             status=s(raw[index["status"]] if index["status"] < len(raw) else "").upper(),
             message=s(raw[index["message"]] if index["message"] < len(raw) else ""),
             rows=_number(raw[index["rows"]] if index["rows"] < len(raw) else None),
@@ -179,10 +200,13 @@ def parse_status_grid(grid: Sequence[Sequence[Any]]) -> dict[str, StatusRow]:
 
 
 def _age_hours(stamp: Optional[datetime], now_riyadh: datetime) -> Optional[float]:
+    """v1.1.0 P-104: SIGNED age in hours (negative = stamp in the future).
+    The old max(0.0, ...) clamp silently certified future timestamps as
+    perfectly fresh; callers now detect them explicitly."""
     if stamp is None:
         return None
     local = stamp.replace(tzinfo=None)
-    return max(0.0, (now_riyadh.replace(tzinfo=None) - local).total_seconds() / 3600.0)
+    return (now_riyadh.replace(tzinfo=None) - local).total_seconds() / 3600.0
 
 
 def _iso(stamp: Optional[datetime]) -> Optional[str]:
@@ -223,8 +247,12 @@ def audit_surfaces(
     report.portfolio_run_riyadh = _iso(portfolio_run)
     if portfolio_run is None:
         report.findings.append(Finding("FAIL", "PF_RUN_MISSING", "Portfolio_Decision", "Last-run timestamp is missing or unparseable."))
-    elif _age_hours(portfolio_run, now_riyadh) > decision_max_age_h:
-        report.findings.append(Finding("FAIL", "PF_RUN_STALE", "Portfolio_Decision", f"Decision surface age exceeds {decision_max_age_h:g} hours."))
+    else:                                              # v1.1.0 P-104 signed age
+        _pf_age = _age_hours(portfolio_run, now_riyadh)
+        if _pf_age < -FUTURE_SKEW_H:
+            report.findings.append(Finding("FAIL", "PF_RUN_FUTURE", "Portfolio_Decision", f"Last-run timestamp is {-_pf_age:.2f} hours in the future."))
+        elif _pf_age > decision_max_age_h:
+            report.findings.append(Finding("FAIL", "PF_RUN_STALE", "Portfolio_Decision", f"Decision surface age exceeds {decision_max_age_h:g} hours."))
     if portfolio_state != "OK":
         report.findings.append(Finding("FAIL", "PF_STATUS_NOT_OK", "Portfolio_Decision", f"Embedded status is {portfolio_state or 'unknown'}, not OK."))
 
@@ -237,9 +265,17 @@ def audit_surfaces(
         if my_portfolio.status not in GOOD_FULL_PAGE_STATUSES:
             report.findings.append(Finding("FAIL", "PF_SOURCE_NOT_VALID", "Portfolio_Decision", f"My_Portfolio status is {my_portfolio.status or 'unknown'}."))
         source_age = _age_hours(my_portfolio.updated, now_riyadh)
-        if source_age is None or source_age > decision_max_age_h:
+        if my_portfolio.updated is not None and my_portfolio.updated_precision == "date":
+            # v1.1.0 P-104 precision truth: a date-only stamp cannot certify
+            # intraday freshness and must not fabricate a midnight age.
+            report.findings.append(Finding("FAIL", "PF_SOURCE_TIME_PRECISION", "Portfolio_Decision", "My_Portfolio Last Updated is date-only; intraday freshness cannot be certified from it."))
+        elif source_age is not None and source_age < -FUTURE_SKEW_H:
+            report.findings.append(Finding("FAIL", "PF_SOURCE_FUTURE", "Portfolio_Decision", f"My_Portfolio timestamp is {-source_age:.2f} hours in the future."))
+        elif source_age is None or source_age > decision_max_age_h:
             report.findings.append(Finding("FAIL", "PF_SOURCE_STALE", "Portfolio_Decision", f"My_Portfolio source age exceeds {decision_max_age_h:g} hours or is unknown."))
-        if portfolio_run and my_portfolio.updated and portfolio_run < my_portfolio.updated:
+        if (portfolio_run and my_portfolio.updated
+                and my_portfolio.updated_precision == "datetime"    # v1.1.0 P-104
+                and portfolio_run < my_portfolio.updated):
             report.findings.append(Finding("FAIL", "PF_OLDER_THAN_SOURCE", "Portfolio_Decision", "Portfolio_Decision predates the latest My_Portfolio refresh."))
 
     top10_text = _cell(top10_grid, 1, 1)
@@ -248,8 +284,12 @@ def audit_surfaces(
     report.top10_pool_counts = parse_pool_counts(top10_text)
     if top10_run is None:
         report.findings.append(Finding("FAIL", "T10_RUN_MISSING", "Top_10_Investments", "Last-run timestamp is missing or unparseable."))
-    elif _age_hours(top10_run, now_riyadh) > decision_max_age_h:
-        report.findings.append(Finding("FAIL", "T10_RUN_STALE", "Top_10_Investments", f"Top-10 surface age exceeds {decision_max_age_h:g} hours."))
+    else:                                              # v1.1.0 P-104 signed age
+        _t10_age = _age_hours(top10_run, now_riyadh)
+        if _t10_age < -FUTURE_SKEW_H:
+            report.findings.append(Finding("FAIL", "T10_RUN_FUTURE", "Top_10_Investments", f"Top-10 last-run timestamp is {-_t10_age:.2f} hours in the future."))
+        elif _t10_age > decision_max_age_h:
+            report.findings.append(Finding("FAIL", "T10_RUN_STALE", "Top_10_Investments", f"Top-10 surface age exceeds {decision_max_age_h:g} hours."))
     if top10_state != "OK":
         report.findings.append(Finding("FAIL", "T10_STATUS_NOT_OK", "Top_10_Investments", f"Embedded status is {top10_state or 'unknown'}, not OK."))
 
@@ -265,13 +305,21 @@ def audit_surfaces(
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "SOURCE_NOT_COMPLETE", "Top_10_Investments", f"{page} status is {item.status or 'unknown'}: {item.message or 'no message'}."))
         age = _age_hours(item.updated, now_riyadh)
-        if age is None or age > market_max_age_h:
+        if item.updated is not None and item.updated_precision == "date":
+            incomplete_sources.append(page)            # v1.1.0 P-104 precision truth
+            report.findings.append(Finding("FAIL", "SOURCE_TIME_PRECISION", "Top_10_Investments", f"{page} Last Updated is date-only; intraday freshness cannot be certified from it."))
+        elif age is not None and age < -FUTURE_SKEW_H:
+            incomplete_sources.append(page)
+            report.findings.append(Finding("FAIL", "SOURCE_FUTURE", "Top_10_Investments", f"{page} timestamp is {-age:.2f} hours in the future."))
+        elif age is None or age > market_max_age_h:
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "SOURCE_STALE", "Top_10_Investments", f"{page} exceeds {market_max_age_h:g} hours or has no valid timestamp."))
         if item.rows is None or item.rows < floor:
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "SOURCE_ROW_FLOOR", "Top_10_Investments", f"{page} rows {item.rows if item.rows is not None else 'unknown'} are below approved minimum {floor}."))
-        if top10_run and item.updated and top10_run < item.updated:
+        if (top10_run and item.updated
+                and item.updated_precision == "datetime"            # v1.1.0 P-104
+                and top10_run < item.updated):
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "T10_OLDER_THAN_SOURCE", "Top_10_Investments", f"Top-10 predates the latest {page} status timestamp."))
 
@@ -332,15 +380,89 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
     )
 
 
+def _selftest() -> int:
+    """v1.1.0 P-104 golden fixtures — offline, no network, no sheets.
+    Pins acceptance tests T05 (equivalent instants), T06 (missing time
+    precision) and the future-timestamp rule against the REAL functions."""
+    checks: list[tuple[str, bool]] = []
+    riyadh_naive = datetime(2026, 9, 8, 7, 7, 28)
+
+    forms = ["2026-09-08 07:07:28+03:00", "2026-09-08T04:07:28Z",
+             "2026-09-08T04:07:28+00:00", "2026-09-08 07:07:28"]
+    parsed = [parse_dt(x) for x in forms]
+    checks.append(("T05: Z / +00:00 / +03:00 / naive forms -> one Riyadh instant",
+                   all(p == riyadh_naive for p in parsed)))
+
+    now_utc = datetime(2026, 9, 8, 5, 14, 20, tzinfo=timezone.utc)
+    now_riyadh = now_utc.astimezone(timezone(timedelta(hours=3))).replace(tzinfo=None)
+    age = _age_hours(parse_dt("2026-09-08 07:07:28+03:00"), now_riyadh)
+    checks.append(("T05: reproduced 3h-inflation case now reads true 1.1144h",
+                   age is not None and abs(age - 1.114444) < 1e-3))
+
+    checks.append(("T06: date-only forms report precision 'date'",
+                   parse_dt_precision("9/8/2026")[1] == "date"
+                   and parse_dt_precision("2026-09-08")[1] == "date"
+                   and parse_dt_precision(46252)[1] == "date"
+                   and parse_dt_precision(46252.5)[1] == "datetime"))
+
+    def _grids(mp_updated: str, gm_updated: str):
+        status = [["Page", "Last Updated", "Status", "Message", "Rows", "Columns"],
+                  ["My_Portfolio", mp_updated, "VALID", "ok", "7", "122"],
+                  ["Market_Leaders", gm_updated, "SUCCESS", "ok", "255", "115"],
+                  ["Global_Markets", gm_updated, "SUCCESS", "ok", "6609", "115"],
+                  ["Commodities_FX", gm_updated, "SUCCESS", "ok", "453", "115"],
+                  ["Mutual_Funds", gm_updated, "SUCCESS", "ok", "2474", "115"]]
+        surface = [["x"], ["Status:", "Last run 2026-09-08 08:08:08 | status: ok | "
+                   "Market_Leaders 255/255, Global_Markets 6609/6609, "
+                   "Commodities_FX 453/453, Mutual_Funds 2469/2474"]]
+        return status, surface, surface
+
+    floors1 = {"Market_Leaders": 1, "Global_Markets": 1,
+               "Commodities_FX": 1, "Mutual_Funds": 1}
+    rep = audit_surfaces(*_grids("2026-09-08T05:05:24+00:00",
+                                 "2026-09-08 07:07:28+03:00"),
+                         now_utc=now_utc, min_rows=floors1)
+    codes = {x.code for x in rep.findings}
+    checks.append(("T05: fresh +03:00 / +00:00 stamps raise no STALE finding",
+                   not ({"SOURCE_STALE", "PF_SOURCE_STALE"} & codes)))
+
+    rep2 = audit_surfaces(*_grids("9/8/2026", "2026-09-08 07:07:28+03:00"),
+                          now_utc=now_utc, min_rows=floors1)
+    codes2 = {x.code for x in rep2.findings}
+    checks.append(("T06: date-only My_Portfolio -> PRECISION finding, never a "
+                   "fabricated-midnight STALE",
+                   "PF_SOURCE_TIME_PRECISION" in codes2
+                   and "PF_SOURCE_STALE" not in codes2))
+
+    rep3 = audit_surfaces(*_grids("2026-09-08T09:30:00+03:00",
+                                  "2026-09-08 07:07:28+03:00"),
+                          now_utc=now_utc, min_rows=floors1)
+    codes3 = {x.code for x in rep3.findings}
+    checks.append(("FUTURE: stamp beyond skew -> explicit *_FUTURE, not "
+                   "silent freshness",
+                   "PF_SOURCE_FUTURE" in codes3
+                   and "PF_SOURCE_STALE" not in codes3))
+
+    passed = sum(1 for _, ok in checks if ok)
+    for name, ok in checks:
+        print(("PASS " if ok else "FAIL ") + name)
+    print(f"[decision_surface_freshness v{VERSION}] SELFTEST {passed}/{len(checks)}")
+    return 0 if passed == len(checks) else 1
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sheet-id", default=os.getenv("DEFAULT_SPREADSHEET_ID", ""))
     parser.add_argument("--json-out", default="decision_surface_freshness.json")
+    parser.add_argument("--selftest", action="store_true",
+                        help="offline P-104 golden fixtures, no network")  # v1.1.0
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = create_parser().parse_args(argv)
+    if args.selftest:                                  # v1.1.0 P-104
+        return _selftest()
     report = asyncio.run(run_live(args.sheet_id))
     rendered = json.dumps(report.payload(), ensure_ascii=False, indent=2, default=str)
     print(rendered)
