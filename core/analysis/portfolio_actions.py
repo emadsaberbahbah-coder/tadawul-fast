@@ -343,6 +343,7 @@ from __future__ import annotations
 import math
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 import logging
 logger = logging.getLogger("core.analysis.portfolio_actions")
@@ -672,7 +673,27 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Additive only; no gate needed for D1 (it fills a column that exists and
 # renders blank today with its correct value).
 # =============================================================================
-PORTFOLIO_ACTIONS_VERSION = "1.9.0"
+# -----------------------------------------------------------------------------
+# v1.10.0 (2026-09-09) — F14: LIVE SWITCH SCAN ON THE PF PAGE (P-112 prototype)
+# WHY: the SS18.3/SS18.4 machinery (switch_test + advisor_switch_scan, v1.2.0)
+# only ever had OFFLINE consumers (weekly memo, shadow board). The live
+# Portfolio_Decision page kept judging holdings in isolation — the operator
+# finding of 2026-09-09 (OTIS/YUM: profits eroding while the board carried
+# fundable alternatives, and nothing compared the two). This build wires the
+# PURE scan into _build itself: env-gated OFF (TFB_PF_SWITCH_SCAN, house
+# default => byte-identical when unset), advisory-only (SS4.7: it annotates
+# and reports, it never changes an action), candidates fed by top10_selector
+# via set_switch_candidates() after every successful board build, freshness-
+# capped (TFB_PF_SWITCH_MAXAGE_H, default 6h => stale boards refuse to
+# advise), executable-only candidate filter (INVEST tier; fast-track/
+# sizing-suspended/grace seats excluded — the shadow-board v1.1.2
+# eligibility lesson), and 2-consecutive-scan persistence through the
+# existing confirm-redis store (namespace swc:) before a proposal is
+# promoted from SWITCH-WATCH to SWITCH-CANDIDATE. Row-note surfacing on the
+# sheet is F15 (after payload-shape observation); v1.10.0 surfaces via
+# meta.switch_scan + one [PF SWITCH] log line per proposal.
+# -----------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.10.0"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -1237,6 +1258,109 @@ def _annotate_hold_edge(row):
             row["hold_edge_pct"] = round(p * roi, 2)
     except Exception as exc:
         row["hold_edge_err"] = type(exc).__name__
+
+
+# --------------------------------------------------------------------------
+# F14 (v1.10.0): live switch-scan plumbing — cache, gates, filter, runner.
+# --------------------------------------------------------------------------
+_SWITCH_CANDS = {"rows": None, "ts": None}
+
+
+def set_switch_candidates(rows, ts=None):
+    """F14: called by top10_selector after each successful board build.
+    Fail-soft by contract; never raises into the caller."""
+    try:
+        if isinstance(rows, list) and rows:
+            _SWITCH_CANDS["rows"] = list(rows)
+            _SWITCH_CANDS["ts"] = float(ts) if ts else time.time()
+    except Exception:
+        pass
+
+
+def _env_switch_scan():
+    v = os.environ.get("TFB_PF_SWITCH_SCAN", "0")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_switch_buffer_pct():
+    return _env_float("TFB_PF_SWITCH_BUFFER_PCT", 1.0)
+
+
+def _env_switch_maxage_h():
+    return _env_float("TFB_PF_SWITCH_MAXAGE_H", 6.0)
+
+
+def _switch_candidate_eligible(c):
+    """F14: executable-only, the shadow-board v1.1.2 lesson — a name the
+    board itself will not fund today can never be the BUY leg. INVEST tier,
+    no fast-track/sizing-suspended/grace seats, priceable roi."""
+    try:
+        inv = str((c or {}).get("investability_status") or "").upper()
+        if "INVEST" not in inv or "DO_NOT" in inv or "NOT_INVEST" in inv:
+            return False  # F14 fix: "DO_NOT_INVEST" contains "INVEST"
+        low = (str((c or {}).get("stability_state") or "") + " " +
+               str((c or {}).get("recommendation_detail") or "")).lower()
+        if ("fast-track" in low or "sizing suspended" in low
+                or "grace" in low):
+            return False
+        return _to_float((c or {}).get("roi_pct")) is not None
+    except Exception:
+        return False
+
+
+def _run_switch_scan(cands, ctl):
+    """F14 orchestrator. Returns the meta block and stamps `switch_note`
+    onto matching holding dicts in place. Advisory-only; never raises."""
+    out = {"enabled": True, "status": "no_candidates", "asof_age_h": None,
+           "candidates_total": 0, "candidates_eligible": 0,
+           "pairs_checked": 0, "proposals": [], "persist_pending": []}
+    try:
+        rows, ts = _SWITCH_CANDS.get("rows"), _SWITCH_CANDS.get("ts")
+        if not rows or not ts:
+            return out
+        age_h = (time.time() - float(ts)) / 3600.0
+        out["asof_age_h"] = round(age_h, 2)
+        out["candidates_total"] = len(rows)
+        if age_h > _env_switch_maxage_h():
+            out["status"] = "stale_candidates"
+            return out
+        elig = [c for c in rows if _switch_candidate_eligible(c)]
+        out["candidates_eligible"] = len(elig)
+        if not elig:
+            return out
+        scan = advisor_switch_scan(
+            cands, elig, buffer_pct=_env_switch_buffer_pct())
+        out["pairs_checked"] = scan.get("pairs_checked")
+        held = {str((c or {}).get("symbol")): c for c in cands}
+        for prop in scan.get("proposals") or []:
+            key = "swc:%s>%s" % (prop.get("sell"), prop.get("buy"))
+            st = _confirm_redis_get(key) or {}
+            try:
+                seen = int(st.get("n") or 0) + 1
+            except Exception:
+                seen = 1
+            _confirm_redis_put(key, {"n": seen, "ts": int(time.time())})
+            prop["persist_day"] = seen
+            tag = ("SWITCH-CANDIDATE" if seen >= 2
+                   else "SWITCH-WATCH (day 1/2)")
+            note = ("%s -> buy %s (edge +%.2f%% vs hurdle %.2f%%); "
+                    "advisory only (SS4.7)"
+                    % (tag, prop.get("buy"), prop.get("delta_pct") or 0.0,
+                       prop.get("hurdle_pct") or 0.0))
+            hrow = held.get(str(prop.get("sell")))
+            if isinstance(hrow, dict):
+                hrow["switch_note"] = note
+            logger.warning("[PF v%s SWITCH] %s: sell %s persist_day=%d",
+                           PORTFOLIO_ACTIONS_VERSION, tag,
+                           prop.get("sell"), seen)
+            (out["proposals"] if seen >= 2
+             else out["persist_pending"]).append(prop)
+        out["status"] = ("proposals" if out["proposals"] else
+                         ("pending_persistence" if out["persist_pending"]
+                          else str(scan.get("verdict", "no_action")).lower()))
+    except Exception as exc:
+        out["status"] = "error:%s" % type(exc).__name__
+    return out
 
 
 SUKUK_BUCKET = "Sukuk (fixed income)"
@@ -2782,6 +2906,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                         if c.get("pnl_sar") is not None
                         and c.get("cost_sar") is not None)
 
+    _sw_meta = _run_switch_scan(cands, ctl) if _env_switch_scan() else None
+
     payload = {
         "version": PORTFOLIO_ACTIONS_VERSION,
         "status": "ok",
@@ -2814,6 +2940,7 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         "alerts": alerts,
         "alerts_units_version": 1,
         "meta": {
+            **({"switch_scan": _sw_meta} if _sw_meta else {}),
             "controls_snapshot": ctl,
             "cash_floor_sar": _round(cash_floor, 0),
             "fx": {"provided": sorted(fx_rates.keys()),
