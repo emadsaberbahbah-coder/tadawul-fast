@@ -4864,6 +4864,20 @@ def _apply_tradability_gate(rows: List[Dict[str, Any]]
     return kept, excluded
 
 
+def _feed_switch_cache(rows):
+    """P-112 wiring (2026-09-09): hand every finished board's rows to
+    portfolio_actions' switch-scan cache (F14). Lazy import (no cycle:
+    portfolio_actions never imports this module); absolutely fail-soft;
+    returns rows unchanged so payload assembly is untouched."""
+    try:
+        if isinstance(rows, list) and rows:
+            from core.analysis import portfolio_actions as _pa
+            _pa.set_switch_candidates(rows)
+    except Exception:
+        pass
+    return rows
+
+
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
     include_headers = _coerce_bool(meta.get("include_headers", True), True)
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
@@ -4881,7 +4895,7 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
         "keys": keys,
         "columns": keys,
         "fields": keys,
-        "rows": rows,
+        "rows": _feed_switch_cache(rows),
         "data": rows,
         "items": rows,
         "quotes": rows,
