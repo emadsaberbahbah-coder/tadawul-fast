@@ -594,6 +594,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1100,7 +1101,27 @@ def _build_error_patch_with_geo(
 #      restores v4.15.0), TFB_EODHD_PLAN_RESTRICTED_TOKENS (comma-separated
 #      additions), TFB_EODHD_PLAN_RESTRICTED_TTL_SEC (default 86400).
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "4.17.0"
+# =============================================================================
+# v4.18.0 LOOPGUARD (P-110) — WHY
+# Production emitted "RuntimeError: ... is bound to a different event loop"
+# + "Future exception was never retrieved" (Render record
+# f000f42a-4dfc-4c95-8b11-b3ebdf3a495d, 2026-09-09 05:13:13 UTC). Root cause:
+# module-global singletons held asyncio primitives (Semaphore, Locks,
+# single-flight Futures, httpx.AsyncClient) created on the FIRST event loop,
+# while sync entry points (top10_selector.build_top10_rows) call
+# asyncio.run(), creating a NEW loop per call. Fix, three parts, this build:
+#   (1) get_client() is loop-aware: same loop -> same client; new loop ->
+#       fresh client, old one retired on ITS OWN loop (aclose scheduled).
+#   (2) _ProviderHealth + both module singleton guards swap asyncio.Lock ->
+#       threading.Lock (loop-agnostic). Audited: zero awaits under any of
+#       these locks; all critical sections are sync state mutation. Health
+#       counters stay process-cumulative across loops by design.
+#   (3) _SingleFlight futures get a done-callback that observes the
+#       exception, so an owner-only failure can no longer leave an
+#       unretrieved Future (red-team T02).
+# All v4.17.0 and earlier WHY blocks below are preserved verbatim.
+# =============================================================================
+PROVIDER_VERSION = "4.18.0"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -1345,7 +1366,13 @@ class _ProviderHealth:
     """v4.8.0 AA: async-safe provider health + circuit breaker. (Preserved v4.9.0)"""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        # v4.18.0 LOOPGUARD (P-110): threading.Lock (was asyncio.Lock). This
+        # singleton's counters are process-cumulative by design ("reset only
+        # on process restart") and must survive across event loops; an
+        # asyncio.Lock binds to the first loop and raises on the next. Every
+        # critical section in this class is pure synchronous state mutation
+        # (audited: zero awaits under lock), so a thread lock is safe.
+        self._lock = threading.Lock()
         # Consecutive-failure tracking (reset on first success)
         self._consecutive_auth = 0
         self._consecutive_ip = 0
@@ -1368,7 +1395,7 @@ class _ProviderHealth:
         """
         v4.8.0 AB: called before each HTTP request. Returns (allow, state).
         """
-        async with self._lock:
+        with self._lock:
             self._total_requests += 1
 
             if not _circuit_breaker_enabled():
@@ -1389,7 +1416,7 @@ class _ProviderHealth:
 
     async def record_success(self) -> None:
         """v4.8.0 AB: called after a successful HTTP fetch."""
-        async with self._lock:
+        with self._lock:
             now = time.monotonic()
             self._success_count += 1
             self._consecutive_auth = 0
@@ -1407,7 +1434,7 @@ class _ProviderHealth:
         the corresponding consecutive counter; opens the circuit if
         the threshold is crossed.
         """
-        async with self._lock:
+        with self._lock:
             now = time.monotonic()
             self._last_failure = now
             self._last_failure_class = error_class
@@ -1453,7 +1480,7 @@ class _ProviderHealth:
 
     async def is_open(self) -> bool:
         """v4.8.0 AB: lightweight check used by patch builders."""
-        async with self._lock:
+        with self._lock:
             return self._state == "open"
 
     async def snapshot(self) -> Dict[str, Any]:
@@ -1461,7 +1488,7 @@ class _ProviderHealth:
         v4.8.0 AD/AE: structured snapshot for diagnose_health() and
         get_provider_stats().
         """
-        async with self._lock:
+        with self._lock:
             now = time.monotonic()
             last_success_age_sec = (
                 (now - self._last_success) if self._last_success is not None else None
@@ -1500,14 +1527,16 @@ class _ProviderHealth:
 
 # Module-level singleton instance, created lazily.
 _HEALTH: Optional[_ProviderHealth] = None
-_HEALTH_LOCK = asyncio.Lock()
+# v4.18.0 LOOPGUARD (P-110): threading.Lock (was asyncio.Lock, loop-bound).
+# _ProviderHealth() construction is fully synchronous -> never held across an await.
+_HEALTH_TLOCK = threading.Lock()
 
 
 async def _get_health() -> _ProviderHealth:
-    """v4.8.0 AA: lazy module-level singleton accessor."""
+    """v4.8.0 AA: lazy module-level singleton accessor. (v4.18.0: thread-lock guard.)"""
     global _HEALTH
     if _HEALTH is None:
-        async with _HEALTH_LOCK:
+        with _HEALTH_TLOCK:
             if _HEALTH is None:
                 _HEALTH = _ProviderHealth()
     return _HEALTH
@@ -1944,6 +1973,22 @@ def _infer_asset_class(general: Dict[str, Any], etf_data: Dict[str, Any]) -> Opt
 # Async primitives: SingleFlight + TTL Cache + TokenBucket
 # (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
+def _sf_observe_exception(fut: "asyncio.Future") -> None:
+    """
+    v4.18.0 (P-110, red-team T02): mark a shared single-flight Future's
+    exception as retrieved. When the OWNER's fetch fails and no waiter ever
+    awaits the shared Future, its exception was previously unobserved ->
+    "Future exception was never retrieved" on GC. Reading .exception() in a
+    done-callback marks it observed; waiters still receive the raise via
+    `await fut`.
+    """
+    try:
+        if not fut.cancelled():
+            fut.exception()
+    except Exception:
+        pass
+
+
 class _SingleFlight:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -1954,6 +1999,7 @@ class _SingleFlight:
             fut = self._calls.get(key)
             if fut is None:
                 fut = asyncio.get_running_loop().create_future()
+                fut.add_done_callback(_sf_observe_exception)  # v4.18.0 (P-110)
                 self._calls[key] = fut
                 owner = True
             else:
@@ -3333,15 +3379,75 @@ class EODHDClient:
 #  unchanged from v4.8.0)
 # =============================================================================
 _INSTANCE: Optional[EODHDClient] = None
-_INSTANCE_LOCK = asyncio.Lock()
+_INSTANCE_LOOP: Optional["asyncio.AbstractEventLoop"] = None
+_INSTANCE_TLOCK = threading.Lock()
+_LOOPGUARD_REBUILDS = 0
+_GRAVEYARD: List[EODHDClient] = []
+_GRAVEYARD_MAX = 4
+
+
+def _retire_client(old: "EODHDClient", old_loop: Optional["asyncio.AbstractEventLoop"]) -> None:
+    """
+    v4.18.0 LOOPGUARD (P-110): best-effort shutdown of a superseded client.
+    An httpx.AsyncClient can only be closed on the loop it lives on. If that
+    loop is still alive (another thread), aclose() is scheduled there;
+    otherwise a bounded reference is kept so the pool is not collected
+    mid-flight. Rebuilds happen once per new event loop entering the module,
+    so the graveyard stays tiny.
+    """
+    try:
+        if old_loop is not None and not old_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(old.aclose(), old_loop)
+            return
+    except Exception:
+        pass
+    try:
+        _GRAVEYARD.append(old)
+        del _GRAVEYARD[:-_GRAVEYARD_MAX]
+    except Exception:
+        pass
 
 
 async def get_client() -> EODHDClient:
-    global _INSTANCE
-    if _INSTANCE is None:
-        async with _INSTANCE_LOCK:
-            if _INSTANCE is None:
-                _INSTANCE = EODHDClient()
+    """
+    v4.18.0 LOOPGUARD (P-110): loop-aware singleton accessor.
+
+    WHY: the previous module singleton (v4.8.0..v4.17.0) held asyncio
+    primitives created on the FIRST event loop that touched the module. Sync
+    entry points call asyncio.run(), which creates a NEW loop per call - the
+    second loop then awaited primitives bound to the first, raising
+    "RuntimeError: ... is bound to a different event loop" in production.
+
+    FIX: the singleton is keyed to the running loop. Same loop -> same client
+    (connection pool, caches, budget preserved). New loop -> fresh client;
+    the old one is retired on ITS loop. The old module asyncio.Lock guard was
+    itself loop-bound and is replaced by a threading.Lock; EODHDClient()
+    construction is fully synchronous, so the lock is never held across an
+    await. Provider health/circuit state is intentionally NOT rebuilt here -
+    it is process-cumulative (see _ProviderHealth thread-lock swap).
+    """
+    global _INSTANCE, _INSTANCE_LOOP, _LOOPGUARD_REBUILDS
+    loop = asyncio.get_running_loop()
+    inst = _INSTANCE
+    if inst is not None and _INSTANCE_LOOP is loop:
+        return inst
+    with _INSTANCE_TLOCK:
+        inst = _INSTANCE
+        if inst is not None and _INSTANCE_LOOP is loop:
+            return inst
+        old, old_loop = inst, _INSTANCE_LOOP
+        _INSTANCE = EODHDClient()
+        _INSTANCE_LOOP = loop
+        if old is not None:
+            _LOOPGUARD_REBUILDS += 1
+            logger.warning(
+                "[EODHD-LOOPGUARD v4.18.0] client rebuilt for a new event loop | "
+                "rebuild_no=%d | old_loop_closed=%s | graveyard=%d",
+                _LOOPGUARD_REBUILDS,
+                (old_loop.is_closed() if old_loop is not None else None),
+                len(_GRAVEYARD),
+            )
+            _retire_client(old, old_loop)
     return _INSTANCE
 
 
