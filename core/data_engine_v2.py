@@ -31,7 +31,42 @@ WHY v5.139.0 - SECTOR PASS-THROUGH ON VERIFIED IDENTITY (Fix AX; env-armed)
   including its own "Version:" line, is preserved verbatim. The
   14_Portfolio_PnL v2.5.1 lockstep rule applies backend-side from here on.
 
-Version: __version__ = "5.139.0". All prior WHYs preserved verbatim.
+Version: __version__ = "5.140.0". All prior WHYs preserved verbatim.
+
+WHY v5.140.0 (P-115 FUND-SENTRY -- fundamentals unit contracts + margin
+coherence; env TFB_FUND_UNIT_SENTRY off|observe|enforce, default OFF ->
+byte-identical rows): production evidence 2026-09-10 (DDI.US, two live
+My_Portfolio snapshots 13 minutes apart at an unchanged price 12.72):
+  * 08:45 row (EODHD fundamentals fallback path): profit_margin arrived as
+    the raw FRACTION 0.33 under the engine's percent contract (truth
+    32.91; provider computes _safe_div(net_income,revenue) -- a fraction
+    by construction).
+  * 08:58 row (Yahoo enrichment path): debt_to_equity arrived as Yahoo's
+    PERCENT figure 3.70 under the engine's RATIO contract (truth ~0.037;
+    same 100x class as the SBGI.US 1,151 note above). The two paths race
+    per run (fill-only + transient fetch outcomes), so the same symbol
+    flips units minute-to-minute and Quality/Valuation scoring ingests a
+    different economy each pass.
+FIX (deterministic CONTRACT conversion, not value-sniffing, applied to the
+canonicalized patch inside the two proven paths only):
+  * yahoo_fundamentals patch: debt_to_equity / 100 (percent -> ratio).
+  * eodhd_fundamentals patch: margin-family keys x 100 when |v| <= 1.5
+    (fraction -> percent; the bound exists because eodhd gross/operating
+    margins may already ship as percent points, while its computed
+    profit_margin is a fraction by construction).
+Plus ONE row-level tripwire before the LKG block: the margin/PE identity
+(implied = 100*(market_cap/pe_ttm)/revenue_ttm; >= 8x divergence with
+|implied| >= 2pp) quarantines profit_margin in enforce, tags-only in
+observe. Every touch is disclosed via substring-safe warning tags
+(fund_unit_contract:*, fund_coherence_quarantined:*; no cap/forecast/
+target/roi/drop/reject). The D/E leg of the tripwire was DELIBERATELY CUT:
+without a second source an absolute D/E plausibility rule misfires on
+legitimately leveraged REIT/utility names -- the Yahoo contract fix above
+closes the observed 100x class deterministically instead. Known
+interaction: contract conversion runs BEFORE Fix-AZ LKG capture (clean
+values are what LKG snapshots); the coherence tripwire also runs before
+the LKG block so a quarantined margin is never captured. Rollback: env off
+(no deploy) or git revert.
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3459,7 +3494,7 @@ if str(ROOT_DIR) not in sys.path:
 #   24-field whitelist, anchor rule, fill-only restore, the tag text, target
 #   LKG, providers, SAI contract. Zero functions removed.
 # =============================================================================
-__version__ = "5.139.0"
+__version__ = "5.140.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3873,6 +3908,113 @@ _YAHOO_ENRICHMENT_LAST_PASS: Dict[str, Any] = {
     "fundamentals_filled_fields": [],
     "chart_filled_fields": [],
 }
+
+
+# =============================================================================
+# v5.140.0 P-115 FUND-SENTRY (fundamentals unit contracts + margin coherence)
+# -----------------------------------------------------------------------------
+# See the WHY v5.140.0 block at the top of the file. Everything here is inert
+# while TFB_FUND_UNIT_SENTRY is unset/off (default): helpers return []/None,
+# no field changes, no warning tags -- rows byte-identical to v5.139.0.
+# =============================================================================
+_FUND_SENTRY_TAG_PREFIX = "fund_unit_contract"          # substring-safe
+_FUND_SENTRY_QUARANTINE_TAG = "fund_coherence_quarantined"  # substring-safe
+_FUND_SENTRY_MARGIN_KEYS: Tuple[str, ...] = (
+    "profit_margin", "gross_margin", "operating_margin",
+)
+_FUND_SENTRY_FRACTION_BOUND: float = 1.5
+_FUND_SENTRY_MARGIN_RATIO_MIN: float = 8.0
+_FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT: float = 2.0
+
+
+def _fund_unit_sentry_mode() -> str:
+    """v5.140.0 (P-115): master mode for the fundamentals unit sentry.
+    Returns 'off' (default), 'observe' (tag-only, no value changes) or
+    'enforce' (convert/quarantine + tag)."""
+    raw = (os.getenv("TFB_FUND_UNIT_SENTRY") or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on", "enforce", "enabled", "enable"}:
+        return "enforce"
+    if raw in {"observe", "log", "tag"}:
+        return "observe"
+    return "off"
+
+
+def _fund_unit_contract_apply(patch: Dict[str, Any], provider: str,
+                              mode: str) -> List[str]:
+    """v5.140.0 (P-115): deterministic per-provider UNIT-CONTRACT conversion
+    on a canonicalized fundamentals patch, BEFORE the missing-field filter.
+
+      * yahoo_fundamentals: debt_to_equity is delivered in PERCENT by the
+        provider (raw passthrough of Yahoo's debtToEquity); the engine
+        contract is a RATIO -> divide by 100. (Live: DDI.US 3.70 -> 0.037;
+        SBGI.US 1,151 -> 11.51.)
+      * eodhd_fundamentals: margin-family keys whose |value| <= 1.5 are
+        FRACTIONS under the engine's percent contract -> multiply by 100.
+        (Live: DDI.US profit_margin 0.3291 -> 32.91. The provider computes
+        profit_margin = net_income/revenue -- a fraction by construction --
+        while its highlights-sourced margins already ship as percent points,
+        hence the bound instead of an unconditional conversion.)
+
+    Returns the list of touched keys. In 'observe' mode values are NOT
+    changed (the caller tags with an :observe suffix); in 'off' mode this is
+    a no-op returning []. Fill-only semantics downstream are unchanged: the
+    caller still runs _filter_patch_to_missing_fields, so a value already on
+    the row is never overwritten by a converted one."""
+    if mode == "off" or not isinstance(patch, dict):
+        return []
+    touched: List[str] = []
+    prov = (provider or "").strip().lower()
+    if prov == "yahoo_fundamentals":
+        de = _as_float(patch.get("debt_to_equity"))
+        if de is not None:
+            if mode == "enforce":
+                patch["debt_to_equity"] = round(de / 100.0, 6)
+            touched.append("debt_to_equity")
+    elif prov == "eodhd_fundamentals":
+        for k in _FUND_SENTRY_MARGIN_KEYS:
+            v = _as_float(patch.get(k))
+            if v is not None and abs(v) <= _FUND_SENTRY_FRACTION_BOUND:
+                if mode == "enforce":
+                    patch[k] = round(v * 100.0, 4)
+                touched.append(k)
+    return touched
+
+
+def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
+    """v5.140.0 (P-115): margin/PE identity tripwire on the fully-merged row.
+    implied_margin_pct = 100 * (market_cap / pe_ttm) / revenue_ttm must agree
+    with the stored profit_margin within a factor of
+    _FUND_SENTRY_MARGIN_RATIO_MIN when |implied| >=
+    _FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT. A >=8x divergence is a unit-scale
+    corruption (live: DDI.US stored 0.33 vs implied 33.0 -> 100x), never an
+    economic disagreement (vintage drift is tens of percent, not 8x).
+    enforce -> profit_margin quarantined to None + tag; observe -> tag only;
+    off/incomplete inputs -> None. Never raises. The D/E leg was deliberately
+    cut -- see the WHY block."""
+    if mode == "off" or not isinstance(row, dict):
+        return None
+    try:
+        pe = _as_float(row.get("pe_ttm"))
+        mc = _as_float(row.get("market_cap"))
+        rev = _as_float(row.get("revenue_ttm"))
+        pm = _as_float(row.get("profit_margin"))
+        if pe is None or mc is None or rev is None or pm is None:
+            return None
+        if pe <= 0.0 or mc <= 0.0 or rev <= 0.0 or pm == 0.0:
+            return None
+        implied = 100.0 * (mc / pe) / rev
+        if abs(implied) < _FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT:
+            return None
+        hi = max(abs(pm), abs(implied))
+        lo = min(abs(pm), abs(implied))
+        if lo <= 0.0 or (hi / lo) < _FUND_SENTRY_MARGIN_RATIO_MIN:
+            return None
+        if mode == "enforce":
+            row["profit_margin"] = None
+            return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin"
+        return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin:observe"
+    except Exception:
+        return None
 
 
 def _yahoo_enrichment_enabled() -> bool:
@@ -15705,6 +15847,12 @@ class DataEngineV5:
                     normalized_symbol=sym_for_canon,
                     provider="yahoo_fundamentals",
                 )
+                # v5.140.0 (P-115): unit-contract conversion on the canonical
+                # patch BEFORE the missing-field filter (off => no-op).
+                _fus_mode = _fund_unit_sentry_mode()
+                _fus_keys = _fund_unit_contract_apply(
+                    canon_patch, "yahoo_fundamentals", _fus_mode,
+                )
                 filtered, filled = _filter_patch_to_missing_fields(
                     row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
                 )
@@ -15716,6 +15864,16 @@ class DataEngineV5:
                 if filtered:
                     row = self._merge(row, filtered)
                     _append_yahoo_warning_tag(row, "yahoo_enrichment_applied")
+                    # v5.140.0 (P-115): disclose each contract-converted key
+                    # that actually landed on the row (survived the filter).
+                    for _fus_k in _fus_keys:
+                        if _fus_k in filtered:
+                            _append_yahoo_warning_tag(
+                                row,
+                                _FUND_SENTRY_TAG_PREFIX + ":yahoo:" + _fus_k
+                                + ("" if _fus_mode == "enforce"
+                                   else ":observe"),
+                            )
 
         # Re-check chart needs against the (possibly fundamentals-enriched) row.
         _, needs_chart = _row_needs_yahoo_enrichment(row)
@@ -15936,6 +16094,12 @@ class DataEngineV5:
             patch, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
             provider="eodhd_fundamentals",
         )
+        # v5.140.0 (P-115): unit-contract conversion on the canonical patch
+        # BEFORE the missing-field filter (off => no-op).
+        _fus_mode = _fund_unit_sentry_mode()
+        _fus_keys = _fund_unit_contract_apply(
+            canon_patch, "eodhd_fundamentals", _fus_mode,
+        )
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
@@ -15968,6 +16132,15 @@ class DataEngineV5:
         if filtered:
             row = self._merge(row, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
+            # v5.140.0 (P-115): disclose each contract-converted key that
+            # actually landed on the row (survived the filter).
+            for _fus_k in _fus_keys:
+                if _fus_k in filtered:
+                    _v573_append_warning(
+                        row,
+                        _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
+                        + ("" if _fus_mode == "enforce" else ":observe"),
+                    )
         return row
 
     # =========================================================================
@@ -16194,6 +16367,13 @@ class DataEngineV5:
             # scoring and the investability gate. Fetches only when a gap
             # remains. Env-toggleable (TFB_EODHD_FUNDAMENTALS_FALLBACK).
             merged = await self._apply_eodhd_fundamentals_fallback(merged, sym, page_ctx)
+
+            # --- v5.140.0 (P-115) FUND-SENTRY margin/PE coherence ------------
+            # Runs BEFORE the LKG block so a quarantined margin is never
+            # captured as a "clean" snapshot. off => no-op, rows byte-identical.
+            _fus_tag = _fund_coherence_sentry(merged, _fund_unit_sentry_mode())
+            if _fus_tag:
+                _aq_append_warning(merged, _fus_tag)
 
             # --- v5.117.0 (Fix AZ) FUNDAMENTALS LKG CONTINUITY ---------------
             # Every live fundamentals source (provider loop, Yahoo enrichment,
