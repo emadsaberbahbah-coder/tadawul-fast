@@ -72,7 +72,12 @@ jobs:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_COMPLIANCE_GATE_ENABLED: "1"
       # v1.1.0 (2026-09-06): P-79 arming — empty/unset variable = OFF (v1.0.1 behaviour)
-      TFB_COMPLIANCE_SCREEN_RETIRED: ${{ vars.TFB_COMPLIANCE_SCREEN_RETIRED }}
+      # P-79/S-1 unblock (2026-09-10): the repo Variable was never set, so the
+      # line above resolved EMPTY and the retirement decision never reached
+      # this lane either. Hardcoded now, matching shadow_scorer.yml — the
+      # standing operator decision (Shariah screening RETIRED 2026-08-13) is
+      # policy, not a toggle. Rollback: restore the vars.* form.
+      TFB_COMPLIANCE_SCREEN_RETIRED: "1"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
