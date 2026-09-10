@@ -27,6 +27,16 @@ jobs:
     env:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_COMPLIANCE_GATE_ENABLED: "1"
+      # P-79/S-1 unblock (root cause 2026-09-09, armed 2026-09-10): the
+      # retired-Shariah operator decision was never armed in THIS lane — the
+      # flag was absent here entirely, so compliance_gate v1.1.0 fell back to
+      # the stale authority list (as_of 2026-03-31, 120-day max age breached
+      # 2026-07-29), failed every symbol, emptied the challenger basket and
+      # froze the S-1 clock at 3/28 with excluded_reason=no-challenger.
+      # HARDCODED like GATE_ENABLED above (a repo Variable can be silently
+      # unset; git history cannot). Read-back: first nightly run with
+      # "chal fresh" > 0. Rollback: delete this line.
+      TFB_COMPLIANCE_SCREEN_RETIRED: "1"
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is
