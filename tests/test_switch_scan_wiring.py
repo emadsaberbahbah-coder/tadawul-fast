@@ -1,9 +1,21 @@
-"""P-112 / F14 closure tests: live switch scan on the PF page.
+"""P-112 / F14 closure tests: live switch scan on the PF page. v2 (P-117).
+
+v2 REWRITE (P-117, red-team MR-07 accepted 2026-09-10): v1 placed the
+promotion assertions inside `if status == "pending_persistence"`, so any
+unexpected status passed silently, and the feature-off test accepted an
+"unavailable" module as a pass. v2 makes every positive-path assertion
+UNCONDITIONAL, pins the working-dependency precondition explicitly, and
+moves fail-soft behaviour into its own dedicated test.
+
+Confirmation unit (explicit per MR-07): the persistence counter counts
+SCANS via the confirm-redis store, not calendar days -- `persist_day` is
+the Nth scan that produced the same sell->buy proposal.
+
 Run from repo root: pytest tests/test_switch_scan_wiring.py -q
-Covers: OFF => no switch_scan key; ON honest refusals (empty/stale cache);
-executable-only eligibility (DO_NOT_INVEST + fast-track excluded);
-2-scan persistence promotion via the confirm-redis store (monkeypatched)."""
-import copy, time
+"""
+import copy
+import time
+
 import core.analysis.portfolio_actions as pa
 
 HOLD = [{"Symbol": "AAA", "Name": "A", "Sector": "Industrials", "Currency": "USD",
@@ -24,11 +36,25 @@ def _build():
                                       fx_rates=dict(FX))
 
 
-def test_off_no_switch_key(monkeypatch):
+def _wire(monkeypatch):
+    """Working-module preconditions, asserted -- never skipped (P-117)."""
+    assert callable(getattr(pa, "advisor_switch_scan", None)), \
+        "advisor_switch_scan dependency missing -- strict test must FAIL"
+    store = {}
+    monkeypatch.setattr(pa, "_confirm_redis_get", store.get)
+    monkeypatch.setattr(pa, "_confirm_redis_put",
+                        lambda k, v: store.__setitem__(k, v))
+    monkeypatch.setattr(pa, "_rt_cost_pct_safe", lambda s, t: 0.40)
+    return store
+
+
+def test_off_no_switch_key_strict(monkeypatch):
     monkeypatch.delenv("TFB_PF_SWITCH_SCAN", raising=False)
     monkeypatch.setenv("TFB_PF_ENABLED", "1")
     out = _build()
-    assert out.get("status") in ("ok", "unavailable")
+    # P-117: "unavailable" is NOT an acceptable pass here -- a broken module
+    # must fail this test, not slip through as fail-soft.
+    assert out.get("status") == "ok"
     assert "switch_scan" not in (out.get("meta") or {})
 
 
@@ -43,21 +69,44 @@ def test_on_empty_and_stale(monkeypatch):
     assert m.get("status") == "stale_candidates"
 
 
-def test_eligibility_and_persistence(monkeypatch):
+def test_eligibility_and_persistence_unconditional(monkeypatch):
     monkeypatch.setenv("TFB_PF_SWITCH_SCAN", "1")
     monkeypatch.setenv("TFB_PF_ENABLED", "1")
-    store = {}
-    monkeypatch.setattr(pa, "_confirm_redis_get", store.get)
-    monkeypatch.setattr(pa, "_confirm_redis_put",
-                        lambda k, v: store.__setitem__(k, v))
-    monkeypatch.setattr(pa, "_rt_cost_pct_safe", lambda s, t: 0.40)
+    _wire(monkeypatch)
     pa.set_switch_candidates([dict(OK), dict(FT), dict(NO)])
+
     m1 = (_build().get("meta") or {}).get("switch_scan") or {}
     assert m1.get("candidates_total") == 3
-    assert m1.get("candidates_eligible") == 1        # FT + DO_NOT excluded
-    if m1.get("status") == "pending_persistence":     # ob present => real math
-        p = (m1.get("persist_pending") or [{}])[0]
-        assert p.get("buy") == "ALT1.US" and p.get("persist_day") == 1
-        m2 = (_build().get("meta") or {}).get("switch_scan") or {}
-        assert m2.get("status") == "proposals"
-        assert (m2.get("proposals") or [{}])[0].get("persist_day") == 2
+    assert m1.get("candidates_eligible") == 1            # FT + DO_NOT excluded
+    # P-117: promotion path asserted FLAT -- no conditional bypass.
+    assert m1.get("status") == "pending_persistence", \
+        "scan 1 must be pending_persistence, got %r" % m1.get("status")
+    p = (m1.get("persist_pending") or [{}])[0]
+    assert p.get("buy") == "ALT1.US" and p.get("persist_day") == 1
+    assert not m1.get("proposals")
+
+    m2 = (_build().get("meta") or {}).get("switch_scan") or {}
+    assert m2.get("status") == "proposals", \
+        "scan 2 must promote, got %r" % m2.get("status")
+    p2 = (m2.get("proposals") or [{}])[0]
+    assert p2.get("buy") == "ALT1.US" and p2.get("persist_day") == 2
+    assert not m2.get("persist_pending")
+
+
+def test_dependency_failure_is_failsoft_and_disclosed(monkeypatch):
+    """Fail-soft contract, tested EXPLICITLY (P-117): a raising dependency
+    must never break the PF build, and must be visible in the scan meta --
+    not silently reported as a clean scan."""
+    monkeypatch.setenv("TFB_PF_SWITCH_SCAN", "1")
+    monkeypatch.setenv("TFB_PF_ENABLED", "1")
+    _wire(monkeypatch)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("dependency down")
+    monkeypatch.setattr(pa, "advisor_switch_scan", _boom)
+    pa.set_switch_candidates([dict(OK)])
+    out = _build()                                      # must not raise
+    assert out.get("status") == "ok"
+    m = (out.get("meta") or {}).get("switch_scan") or {}
+    assert str(m.get("status", "")).startswith("error:"), \
+        "dependency failure must be disclosed, got %r" % m.get("status")
