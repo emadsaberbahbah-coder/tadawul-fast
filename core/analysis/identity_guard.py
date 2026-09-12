@@ -261,7 +261,35 @@ from core.analysis.symbol_dedup import (
     resolve_identity,
 )
 
-IDENTITY_GUARD_VERSION = "1.2.0"
+# -----------------------------------------------------------------------------
+# v1.3.0 (2026-09-12) — SIGNATURE 0: COLUMN-SHIFT / SCHEMA COHERENCE (gated OFF)
+# WHY: the live Commodities_FX export carries a preserved row whose every cell
+# is displaced one column left — Symbol="Copper Futures", Name="Commodity",
+# Asset Class="Futures", Exchange="USD", Currency="Global",
+# Country="Commodities", confidence 6567%. Signatures 1-4 are structurally
+# blind to it: the symbol has no venue suffix, so expected_currency_for()
+# returns None, currency_is_consistent() returns None (unverifiable), the
+# price cell holds text (price None) and the quote-failed markers are absent
+# — every check answers "cannot verify" and the corpse survives run after
+# run as a preserved row (external review 2026-09-11, adjudicated; the
+# session's own six-gate audit also passed it, because a single-column
+# check whitelisted "Global"). The correct test is CROSS-FIELD.
+# DESIGN: schema_shift_signals() reads four independent signals off the raw
+# row — whitespace inside the symbol cell, a currency cell that is not a
+# 3-letter code, an exchange cell holding a KNOWN currency token, a country
+# cell holding an asset-class token — and schema_shift_suspect() fires only
+# on (symbol-whitespace AND >=1 more) OR >=3 signals, so a legitimate FX
+# row carrying Currency="Global" (one signal) can never be condemned.
+# Gate TFB_IDG_SCHEMA_SHIFT = off|observe|enforce, DEFAULT OFF:
+#   observe -> case-tolerant warnings tag only (values untouched);
+#   enforce -> the row joins the existing QUARANTINE_FIELDS machinery
+#   (field clearing still governed by TFB_IDENTITY_QUARANTINE_KEYS exactly
+#   like signatures 1-4; BLOCKED status / block reason / refetch queue /
+#   mass-destruction guard all inherited unchanged). Repair is deliberately
+#   NOT attempted: shifted values need a trustworthy re-fetch, not a guess.
+# Functions added: 3 (+2 constants, +1 Reason). Removed: 0.
+# -----------------------------------------------------------------------------
+IDENTITY_GUARD_VERSION = "1.3.0"
 __version__ = IDENTITY_GUARD_VERSION
 
 __all__ = [
@@ -343,6 +371,62 @@ def row_asset_class(row: Mapping[str, Any]) -> str:
     return ""
 
 
+# --- v1.3.0 signature 0: column-shift / schema coherence --------------------
+_SS_CCY_RE = re.compile(r"^[A-Z]{3}$")
+_SS_KNOWN_CCY = frozenset(set(SUFFIX_CURRENCY.values())
+                          | set(SUBUNIT_OF) | set(SUBUNIT_OF.values())
+                          | {"USD", "EUR", "GBP", "JPY", "CNY", "OMR", "BHD",
+                             "JOD", "AED", "KWD", "QAR"})
+_SS_ASSET_CLASS_TOKENS = frozenset({
+    "commodity", "commodities", "future", "futures", "equity", "equities",
+    "fund", "funds", "mutual fund", "mutual funds", "etf", "fx", "forex",
+    "currency", "currencies", "index", "indices", "bond", "bonds"})
+_SS_SYMBOL_KEYS = ("Symbol", "symbol")
+_SS_CCY_KEYS = ("Currency", "currency")
+_SS_EXCH_KEYS = ("Exchange", "exchange")
+_SS_COUNTRY_KEYS = ("Country", "country")
+
+
+def _idg_schema_shift_mode() -> str:
+    """v1.3.0: off | observe | enforce (read at call time). DEFAULT OFF."""
+    v = (os.getenv("TFB_IDG_SCHEMA_SHIFT") or "").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _ss_first(row: Mapping[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        if key in row and row[key] is not None:
+            text = str(row[key]).strip()
+            if text:
+                return text
+    return ""
+
+
+def schema_shift_signals(row: Mapping[str, Any]) -> List[str]:
+    """v1.3.0 PURE: independent cross-field displacement signals, in a fixed
+    order so the warnings tag is deterministic."""
+    sigs: List[str] = []
+    sym = _ss_first(row, _SS_SYMBOL_KEYS)
+    if sym and re.search(r"\s", sym):
+        sigs.append("symbol_whitespace")
+    ccy = _ss_first(row, _SS_CCY_KEYS)
+    if ccy and not _SS_CCY_RE.match(ccy.upper()):
+        sigs.append("currency_not_code")
+    exch = _ss_first(row, _SS_EXCH_KEYS)
+    if exch and exch.upper() in _SS_KNOWN_CCY:
+        sigs.append("exchange_is_currency")
+    country = _ss_first(row, _SS_COUNTRY_KEYS)
+    if country and country.lower() in _SS_ASSET_CLASS_TOKENS:
+        sigs.append("country_is_asset_class")
+    return sigs
+
+
+def schema_shift_suspect(signals: Sequence[str]) -> bool:
+    """v1.3.0 PURE: conservative conjunction — a lone signal never fires."""
+    n = len(signals or [])
+    return ("symbol_whitespace" in (signals or []) and n >= 2) or n >= 3
+
+
 _QUOTE_FAILED_MARKERS = ("quote_current_price_missing",)
 _NAME_BORROWED_MARKERS = ("name_from_chart_meta",)
 
@@ -359,6 +443,7 @@ class Reason:
     PRICE_IMPLAUSIBLE = "price_magnitude_wrong_for_currency"
     QUOTE_FAILED_UNVERIFIABLE = "quote_failed_identity_unverifiable"
     DUPLICATE = "duplicate_of_fresher_row"
+    SCHEMA_SHIFT = "row_fields_column_shifted"        # v1.3.0 signature 0
 
 
 # Fields cleared by QUARANTINE_FIELDS. Symbol, Warnings and Block Reason are
@@ -747,6 +832,32 @@ def guard_sheet_rows(
     for index, identity in enumerate(identities):
         if not identity.symbol or identity.is_shell:
             continue
+
+        # --- signature 0 (v1.3.0): row fields column-shifted -----------------
+        # Runs FIRST: a shifted row's cells are displaced, so the venue-keyed
+        # signatures below all answer "unverifiable" on it. Gated, DEFAULT OFF.
+        _ss_mode = _idg_schema_shift_mode()
+        if _ss_mode != "off":
+            _ss = schema_shift_signals(working[index])
+            if schema_shift_suspect(_ss):
+                _append_guard_warning(
+                    working[index],
+                    "identity_guard_v%s:schema_shift_%s:%s"
+                    % (IDENTITY_GUARD_VERSION, "+".join(_ss), _ss_mode))
+                if _ss_mode == "enforce":
+                    contaminated.add(index)
+                    plan.findings.append(
+                        IdentityFinding(
+                            action=Action.QUARANTINE_FIELDS,
+                            symbol=identity.symbol,
+                            sheet=sheet,
+                            reason=Reason.SCHEMA_SHIFT,
+                            detail="fields displaced one column: "
+                            + ", ".join(_ss),
+                            row_index=index,
+                        )
+                    )
+                    continue
 
         ccy_ok = currency_is_consistent(identity.symbol, identity.currency)
         failed = _quote_failed(identity)
