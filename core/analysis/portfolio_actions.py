@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.8.0   (header synced to runtime; history below)
+Version: 1.11.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -693,7 +693,36 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # sheet is F15 (after payload-shape observation); v1.10.0 surfaces via
 # meta.switch_scan + one [PF SWITCH] log line per proposal.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.10.0"
+# ---------------------------------------------------------------------------
+# v1.11.0 (2026-09-12) — POST-MORTEM BUILD #1 (session register 2026-09-11/12)
+#   [F-2 DRAWDOWN/TIME GUARD]  env TFB_PF_DD_EXIT = off|observe|enforce
+#     (default off => byte-identical). The action ladder previously had NO
+#     loss-responsive exit: EXIT/TRIM fired only on valuation-rich ROI
+#     (price ABOVE reference) or engine SELL-class, so a falling holding
+#     produced a STRONGER hold/add signal (post-mortem 21.8x loser-size
+#     finding; OTIS/EPRT/HCI cluster). New seam _apply_drawdown_guard()
+#     runs after _apply_reduce_policy in the per-entry pipeline (same seam
+#     pattern as v1.8.1/_apply_deminimis): observe appends a visible
+#     "[dd-observe]" tag to action_reason, changing nothing else; enforce
+#     converts ADD/HOLD/TRIM to EXIT (full market value as proceeds) when
+#     unrealized return <= -TFB_PF_DD_EXIT_PCT (default 8.0) OR the
+#     position is negative past TFB_PF_DD_TIME_D days (default 45).
+#     Never overrides an existing EXIT/BLOCK. Fail-soft: no cost basis or
+#     unparseable buy_date => no flag, never a crash.
+#   [P-122 FEE-AWARE FUNDING]  env TFB_PF_FEE_FUNDING = 1 (default off)
+#     The funding pass debited the cash ledger with round(shares*price,0)
+#     and modelled zero brokerage fees; on 2026-09-11 that sized a DDI ADD
+#     leaving 1.15 SAR of reserve headroom that a ~8.6 SAR commission
+#     breached (external review F02, adjudicated + escalated). When armed:
+#     per-ticket fee TFB_PF_FEE_SAR (default 9.0 SAR) is subtracted from
+#     the fundable budget before sizing, and the ledger (cash_left /
+#     proceeds_left / remaining / sector room) is debited with the EXACT
+#     gross cost + fee. Display KPI (Adds Funded / suggested) stays the
+#     rounded figure. Off-path arithmetic is verbatim v1.10.0.
+#   Zero removals; all prior WHY blocks carried verbatim. Off/off deploy is
+#   behavior-identical (harness G1).
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.11.0"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -1615,6 +1644,25 @@ def _position_fields(row):
     return qty, cost, cost_raw
 
 
+_BUY_DATE_TOKENS = ("buydate", "buy_date", "purchasedate", "entrydate",
+                    "dateacquired", "datebought")
+
+
+def _buy_date_from_row(row):
+    """v1.11.0 [F-2]: pull the holding's buy date off the RAW sheet row
+    (display headers tolerated via the same token normalizer used for
+    qty/cost). normalize_candidate does not carry a date field, so without
+    this the time leg of the drawdown guard would never see one. Returns
+    the first non-empty match as text, else None (fail-soft)."""
+    for key, val in (row or {}).items():
+        tok = _ob._norm_token(key) if _ob is not None else str(key).lower()
+        if tok in _BUY_DATE_TOKENS:
+            s = str(val or "").strip()
+            if s:
+                return s
+    return None
+
+
 def normalize_holding(row, fx_rates, controls):
     """opportunity_builder.normalize_candidate + position economics."""
     crit = _ob.make_criteria({"period_months": controls["period_months"]})
@@ -1622,6 +1670,9 @@ def normalize_holding(row, fx_rates, controls):
     qty, avg_cost, avg_cost_raw = _position_fields(row)
     cand["quantity"] = qty
     cand["avg_cost"] = avg_cost
+    # v1.11.0 [F-2]: buy date for the guard's time leg (internal key; not
+    # emitted by _action_row -- G1 proves the off-path output is unchanged).
+    cand["dd_buy_date"] = _buy_date_from_row(row)
     # v1.0.2: internal-only; never emitted in a row (kept for the gate's
     # blank-vs-unparseable distinction). Not surfaced by _action_row.
     cand["avg_cost_raw"] = avg_cost_raw
@@ -2291,17 +2342,29 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
         budget = min(cap_room, sector_room, remaining)
         shares = 0
         suggested = 0.0
+        # v1.11.0 [P-122 FEE-AWARE FUNDING]: default OFF path is verbatim
+        # v1.10.0 arithmetic (_charge == suggested). Armed: fee comes off the
+        # fundable budget BEFORE sizing and the ledger is debited with the
+        # EXACT gross cost + fee, closing the rounded-debit / zero-fee gap
+        # that sized the 2026-09-11 DDI ADD into a reserve breach.
+        _fee_on = str(os.environ.get(
+            "TFB_PF_FEE_FUNDING", "")).strip().lower() in (
+            "1", "true", "on", "yes")
+        _fee_sar = abs(_env_float("TFB_PF_FEE_SAR", 9.0)) if _fee_on else 0.0
+        _charge = 0.0
         if price_sar > 0 and budget > 0:
-            shares = int(budget // price_sar)
+            _budget_eff = (budget - _fee_sar) if _fee_on else budget
+            shares = int(_budget_eff // price_sar) if _budget_eff > 0 else 0
             shares = (shares // lot) * lot
             suggested = round(shares * price_sar, 0)
+            _charge = ((shares * price_sar) + _fee_sar) if _fee_on else suggested
         if shares > 0 and suggested > 0:
-            take_cash = min(suggested, cash_left)
-            take_proc = min(suggested - take_cash, proceeds_left)
+            take_cash = min(_charge, cash_left)
+            take_proc = min(_charge - take_cash, proceeds_left)
             cash_left -= take_cash
             proceeds_left -= take_proc
-            remaining -= suggested
-            _sec_ledger[_fb] = max(0.0, _sec_ledger[_fb] - suggested)  # F4
+            remaining -= _charge
+            _sec_ledger[_fb] = max(0.0, _sec_ledger[_fb] - _charge)  # F4
             funded_total += suggested
             if take_proc > 0 and take_cash > 0:
                 ff = ("cash %d + proceeds %d SAR"
@@ -2473,6 +2536,64 @@ def _sell_side_deltas(entries, ctl, total_value):
         except Exception:
             continue
     return entries
+
+
+def _env_dd_guard_mode():
+    """v1.11.0 [F-2]: off | observe | enforce (read at call time, like the
+    engine fund-unit sentry, so an env change needs no redeploy proof at
+    boot — read-back is the [dd-observe]/guard tags in the next export)."""
+    v = str(os.environ.get("TFB_PF_DD_EXIT", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _apply_drawdown_guard(cand, action, reason, proceeds):
+    """v1.11.0 [F-2 DRAWDOWN/TIME GUARD] — the loss-responsive exit the
+    ladder never had. Seam-pattern (decide_action stays byte-identical).
+
+    observe : append a visible tag to action_reason; action/proceeds
+              untouched (log-only, house observe convention).
+    enforce : ADD/HOLD/TRIM -> EXIT with full market value as proceeds when
+              (a) unrealized return <= -TFB_PF_DD_EXIT_PCT   (default 8.0), or
+              (b) return < 0 after  > TFB_PF_DD_TIME_D days  (default 45).
+    Never overrides EXIT/BLOCK (a stronger verdict stands). Fail-soft on
+    missing basis or unparseable buy_date: returns inputs unchanged.
+    Return basis is pnl_sar/cost_sar (both SAR => currency-safe)."""
+    mode = _env_dd_guard_mode()
+    if mode == "off":
+        return action, reason, proceeds
+    if action in (ACTION_EXIT, ACTION_BLOCK):
+        return action, reason, proceeds
+    pnl = _to_float(cand.get("pnl_sar"))
+    cost = _to_float(cand.get("cost_sar"))
+    if pnl is None or cost is None or cost <= 0:
+        return action, reason, proceeds
+    ret_pct = pnl / cost * 100.0
+    dd_thr = abs(_env_float("TFB_PF_DD_EXIT_PCT", 8.0))
+    time_d = _env_int("TFB_PF_DD_TIME_D", 45)
+    days = None
+    bd = str(cand.get("dd_buy_date") or cand.get("buy_date") or "").strip()[:10]
+    if bd:
+        try:
+            days = (datetime.now(timezone.utc).date()
+                    - datetime.strptime(bd, "%Y-%m-%d").date()).days
+        except Exception:
+            days = None
+    dd_hit = ret_pct <= -dd_thr
+    time_hit = (days is not None and days > time_d and ret_pct < 0.0)
+    if not (dd_hit or time_hit):
+        return action, reason, proceeds
+    if dd_hit:
+        trig = "drawdown %.1f%% breaches -%.1f%% budget" % (ret_pct, dd_thr)
+    else:
+        trig = "still negative (%.1f%%) after %d d > %d d time budget" % (
+            ret_pct, days, time_d)
+    if mode == "observe":
+        tag = " | [dd-observe] %s - would EXIT under enforce" % trig
+        return action, (reason or "") + tag, proceeds
+    mv = _to_float(cand.get("market_value_sar")) or 0.0
+    return (ACTION_EXIT,
+            "Drawdown/time guard: %s - full exit (was %s)" % (trig, action),
+            mv)
 
 
 def _action_row(entry, review_date, controls):
@@ -2678,6 +2799,10 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             c.get("symbol"), action, reason, capped_from, ctl)
         # v1.9.0 D2: explicit REDUCE policy (default 'exit' = verbatim).
         action, reason, proceeds = _apply_reduce_policy(
+            c, action, reason, proceeds)
+        # v1.11.0 [F-2]: loss-responsive guard — same seam pattern; OFF is a
+        # pure pass-through (harness G1 byte-identical proof).
+        action, reason, proceeds = _apply_drawdown_guard(
             c, action, reason, proceeds)
         sec_room = None
         if total_value:
