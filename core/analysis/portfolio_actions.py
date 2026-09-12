@@ -722,7 +722,25 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   Zero removals; all prior WHY blocks carried verbatim. Off/off deploy is
 #   behavior-identical (harness G1).
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.11.0"
+# ---------------------------------------------------------------------------
+# v1.11.1 (2026-09-12) — P-125: "Position Qty" QUANTITY ALIAS (external
+# review, adjudicated 09-11; verified still open at HEAD today)
+# WHY: _position_fields resolves quantity via normalized tokens against
+# _QTY_KEYS, which lacked "positionqty" — yet "Position Qty" is the
+# engine's OWN My_Portfolio schema header (data_engine v5.85.4: "the
+# sheet's manual Position Qty + Avg Cost"). Any caller handing this
+# module rows under that header parsed qty=None and the holding vanished
+# from the action ladder. Latent today (the live GAS payload keys match),
+# a silent hole at the input boundary tomorrow.
+# FIX: append "positionqty" to _QTY_KEYS. PROVABLY ADDITIVE: the scan
+# takes the FIRST row key (row-iteration order) whose token is in the
+# set, so every row that parses today parses identically; divergence
+# requires a row carrying TWO quantity columns with the position-qty one
+# first — a shape no schema produces (harness Q4 documents it anyway).
+# Ungated by the alias-addition precedent (CONTAMINATED_FIELD_ALIASES
+# class). Functions added: 0. Removed: 0.
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.11.1"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -1612,7 +1630,8 @@ def _ob_version_ok():
 # Holding normalization (delegates row science to opportunity_builder)
 # ---------------------------------------------------------------------------
 
-_QTY_KEYS = ("quantity", "qty", "shares", "units", "holdingqty")
+_QTY_KEYS = ("quantity", "qty", "shares", "units", "holdingqty",
+             "positionqty")  # v1.11.1 [P-125]
 _COST_KEYS = ("buyprice", "avgcost", "averagecost", "costbasis",
               "purchaseprice", "avgbuyprice", "costpershare")
 
