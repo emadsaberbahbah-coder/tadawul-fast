@@ -1061,7 +1061,28 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.5"
+# -----------------------------------------------------------------------------
+# v1.19.6 (2026-09-12) — P-127: THE AUDIT GRID'S ANN ROI IS NOW ANNUALIZED
+# WHY (live 2026-09-12 board + external review F07, adjudicated 09-11): the
+# ALL QUALIFIED grid rendered Ann ROI % == ROI %(TP1) on every row (11.0/
+# 11.0, 16.2/16.2, 13.8/13.8...) while the SELECTED/FEED path annualized
+# properly (KRP 13.8% over the 3-month plan -> 67.7% = (1.138)^(365/91.25)
+# -1). Root: _audit_align_plan_roi (v1.14.0 ROI-TRUTH-2, the LIVE default
+# "plan" basis) set rec["ann_roi_pct"] = _p — a raw COPY of the TP1 plan
+# ROI with no annualization — while build_opportunity's ticket path uses
+# the compound formula on period_months. One grid, two formulas; the
+# operator read a 3-month figure in an "Ann" column.
+# FIX: the align step now annualizes _p over the SAME horizon the ticket
+# path uses (period_months x DAYS_PER_MONTH from the same criteria dict,
+# identical compound formula, fail-soft to the copy on any error).
+# roi_pct, gates, verdict, score, selection: byte-untouched — display
+# truth only, the ROI-TRUTH doctrine this block already carries.
+# DEFAULT ON with kill switch (file precedent: ROI-TRUTH-1/2 shipped as
+# the live default with TFB_OPP_AUDIT_ROI_LEGACY): TFB_OPP_ANN_LEGACY_COPY
+# =1 restores the v1.19.5 copy byte-for-byte. Functions added: 1
+# (_ann_from_plan_roi). Removed: 0.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.19.6"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1983,6 +2004,24 @@ def _tp1_plan_roi(cand):
         return None
 
 
+def _ann_from_plan_roi(plan_roi_pct, crit):
+    """v1.19.6 [P-127] PURE: annualize a plan-horizon ROI over the SAME
+    basis the ticket path uses — period_months * DAYS_PER_MONTH, compound.
+    None in, None out; any fault returns the input unchanged (fail-soft:
+    a wrong-but-labelled number never replaces a blank)."""
+    if plan_roi_pct is None:
+        return None
+    try:
+        months = max(1, int((crit or {}).get("period_months") or 3))
+        days = months * DAYS_PER_MONTH
+        if plan_roi_pct <= -100.0:
+            return plan_roi_pct
+        return round((math.pow(1.0 + plan_roi_pct / 100.0, 365.0 / days)
+                      - 1.0) * 100.0, 1)
+    except Exception:
+        return plan_roi_pct
+
+
 def _audit_align_plan_roi(rec, crit):
     """v1.14.0 [ROI-TRUTH-2 / D-25]: under the LIVE default basis (\"plan\")
     the audit record's PRIMARY roi/ann now speak the same language as the
@@ -2005,7 +2044,14 @@ def _audit_align_plan_roi(rec, crit):
             return rec
         _p = _tp1_plan_roi(rec.get("_cand") or {})
         rec["roi_pct"] = _p
-        rec["ann_roi_pct"] = _p
+        # v1.19.6 [P-127]: annualize over the plan horizon (ticket-path
+        # formula) instead of copying the 3-month figure into an "Ann"
+        # column. Kill: TFB_OPP_ANN_LEGACY_COPY=1 -> the v1.19.5 copy.
+        if str(_env_str("TFB_OPP_ANN_LEGACY_COPY", "0")).strip().lower() \
+                in ("1", "true", "yes", "on"):
+            rec["ann_roi_pct"] = _p
+        else:
+            rec["ann_roi_pct"] = _ann_from_plan_roi(_p, crit)
         rec["primary_roi_basis"] = "plan"
         if _p is None:
             rec["roi_basis_note"] = "TP1_UNAVAILABLE(DATA_GAP)"
