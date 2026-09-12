@@ -7,7 +7,14 @@ name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
 on:
   schedule:
-    - cron: "40 14 * * *"     # ~17:40 Riyadh, after the 17:10 shadow board
+    # v1.8.0 (2026-09-12) SCHEDULE-RACE FIX: was "40 14" (~17:40 Riyadh),
+    # only 30 min after the board's 14:10 UTC slot — GitHub cron jitter
+    # routinely exceeds that (observed 2026-09-11: board COMPLETED 17:44:11,
+    # after this job's scheduled start), so the scorer could read yesterday's
+    # or a mid-write board and record "no-challenger". 15:20 UTC = ~18:20
+    # Riyadh gives ~70 min of headroom; run_shadow_scorer.py v1.8.0 adds the
+    # board-fresh guard below as the belt to this suspender.
+    - cron: "20 15 * * *"     # ~18:20 Riyadh, after the 17:10 shadow board
   workflow_dispatch:
     inputs:
       dry_run:
@@ -37,6 +44,15 @@ jobs:
       # unset; git history cannot). Read-back: first nightly run with
       # "chal fresh" > 0. Rollback: delete this line.
       TFB_COMPLIANCE_SCREEN_RETIRED: "1"
+      # v1.8.0 BOARD-FRESH GUARD — ARMING IS A SEPARATE EVIDENCE-RUN STEP.
+      # Step 1 (this commit): cron moved + guard code deployed, gate OFF =>
+      # scorer behavior byte-identical. Step 2 (next sitting): uncomment the
+      # observe line, one nightly read-back = "[S1-BOARD-FRESH ...]" in the
+      # verdict. Step 3 (separate sitting): switch observe -> enforce; a
+      # stale read then re-polls up to TFB_S1_BOARD_WAIT_MIN (default 8) and
+      # an unrecovered day records the honest reason `stale-board` instead
+      # of `no-challenger`. Rollback: re-comment the line.
+      # TFB_S1_BOARD_FRESH_GUARD: "observe"
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is
