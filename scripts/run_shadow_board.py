@@ -99,7 +99,27 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # of default-OFF guards is that they stay off). =0 restores v1.1.3 exactly.
 # Zero functions removed. Two helpers added.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.0"
+# -----------------------------------------------------------------------------
+# v1.3.1 (2026-09-12) — D-2 ATOMIC BOARD WRITE (kill-switch, default ON)
+# WHY: write_board() was clear() THEN update() — two API calls with a gap in
+# which the tab is EMPTY. The S-1 scorer reads this exact tab and was
+# observed racing the board on 2026-09-11 (board completed 17:44:11, after
+# the scorer's scheduled start); a reader in the gap sees nothing and the
+# day records no-challenger. FIX: pad the body to a fixed 17-wide x >=60-row
+# blank rectangle and write it in ONE update() with no clear() — residue
+# from any previous, longer body is overwritten by the pad, and a
+# concurrent reader sees either the old full board or the new full board,
+# never an empty one. End-state cell content is identical to v1.3.0
+# (trailing blanks instead of cleared cells; every consumer — the scorer's
+# _board_extract/shape guard, eligible_symbols, GAS — filters on the symbol
+# cell, so blanks are inert). DEFAULT ON, deliberately: the OFF state IS
+# the defect (a race window), the end-state content is unchanged, and this
+# file's own convention ships mechanics fixes ON with a kill switch
+# (TFB_SB_COST_LEGACY precedent). Kill: TFB_SB_ATOMIC_WRITE=0 restores the
+# v1.3.0 clear()+update() order byte-for-byte. Functions added: 1
+# (_sb_atomic_write). Removed: 0.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.3.1"
 # -----------------------------------------------------------------------------
 # v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
 # -----------------------------------------------------------------------------
@@ -469,14 +489,31 @@ def _open_sheet(cli: Optional[str]):
     return gspread.authorize(creds).open_by_key(sid)
 
 
+def _sb_atomic_write() -> bool:
+    """v1.3.1 kill switch: TFB_SB_ATOMIC_WRITE=0 -> v1.3.0 clear()+update()."""
+    return str(os.getenv("TFB_SB_ATOMIC_WRITE") or "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+_SB_PAD_ROWS = 60      # >= any real body (meta ~7 + blank + header + <=20 data)
+
+
 def write_board(sh, data_rows: List[List[Any]], meta_lines: List[List[Any]]):
+    """v1.3.1 [D-2]: one-shot rectangle write; see the version WHY block."""
     try:
         ws = sh.worksheet(TAB_OUT)
     except Exception:  # noqa: BLE001
         ws = sh.add_worksheet(title=TAB_OUT, rows=200, cols=len(OUT_HEADER))
-    ws.clear()
     body = meta_lines + [[]] + [OUT_HEADER] + data_rows
-    ws.update(values=body, range_name="A1")
+    if not _sb_atomic_write():
+        ws.clear()
+        ws.update(values=body, range_name="A1")
+        return
+    width = max([len(OUT_HEADER)] + [len(r) for r in body if r])
+    rect = [list(r) + [""] * (width - len(r)) for r in body]
+    while len(rect) < _SB_PAD_ROWS:
+        rect.append([""] * width)
+    ws.update(values=rect, range_name="A1")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
