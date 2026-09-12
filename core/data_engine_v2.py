@@ -3494,7 +3494,30 @@ if str(ROOT_DIR) not in sys.path:
 #   24-field whitelist, anchor rule, fill-only restore, the tag text, target
 #   LKG, providers, SAI contract. Zero functions removed.
 # =============================================================================
-__version__ = "5.140.0"
+# -----------------------------------------------------------------------------
+# v5.141.0 (2026-09-12) — F-6 HORIZON COHERENCE (gated, default OFF)
+# WHY: three backfill sites paired `invest_period_label -> "1Y"` with
+# `horizon_days -> 365` as independent constants. When scoring has already
+# stamped the label (invest_period_label(MONTH, None) = "3M" with
+# horizon_days_effective=None), only the 365 half fires — manufacturing the
+# live "3M + 365 + horizon=month" three-way contradiction (review F-6).
+# The constant also creates the inverse case (days present, label blank ->
+# label "1Y" beside days=30). DESIGN: the three sites now route through
+# _horizon_coherence_fill(); TFB_HORIZON_COHERENT = off|observe|enforce
+# (default OFF => the exact legacy constant fills, byte-identical).
+# observe = legacy fills + a countable horizon_incoherent:<label>!=<days>
+# warnings tag wherever the post-fill pair disagrees (read-back population).
+# enforce = the blank side is derived from the present side — days from the
+# label via {1D:1, 1W:6, 1M:30, 3M:90, 1Y:365} (every value round-trips
+# scoring.invest_period_label's own bucket edges exactly), label from days
+# via those same edges; both-blank keeps 1Y/365; BOTH-PRESENT values are
+# NEVER rewritten (legacy stamped rows are tagged for counting only and
+# self-correct on their next fresh build). Display/metadata coherence only —
+# which horizon gets SCORED is untouched (that is a model decision, F-1/F-5
+# family, explicitly out of scope). Tags avoid the reliability-scan
+# substrings. Zero removals; three sites replaced by the shared helper.
+# -----------------------------------------------------------------------------
+__version__ = "5.141.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -12842,10 +12865,7 @@ def _apply_symbol_context_defaults(row: Dict[str, Any], symbol: str = "", page: 
             out.setdefault("market_cap", None)
             out.setdefault("float_shares", None)
 
-        if out.get("invest_period_label") in (None, ""):
-            out["invest_period_label"] = "1Y"
-        if out.get("horizon_days") in (None, ""):
-            out["horizon_days"] = 365
+        _horizon_coherence_fill(out)
 
     return out
 
@@ -13281,15 +13301,99 @@ def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: 
     return out
 
 
+_HZC_LABEL_TO_DAYS: Dict[str, int] = {
+    "1D": 1, "1W": 6, "1M": 30, "3M": 90, "1Y": 365,
+}
+
+
+def _horizon_coherence_mode() -> str:
+    """v5.141.0 [F-6]: off | observe | enforce, read at call time (sentry
+    doctrine — read-back is the horizon_* tags in the next export)."""
+    v = str(os.environ.get("TFB_HORIZON_COHERENT", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _hzc_label_for_days(days: Any) -> str:
+    """scoring.invest_period_label's exact bucket edges."""
+    try:
+        d = float(days)
+    except (TypeError, ValueError):
+        return "1Y"
+    if d <= 1:
+        return "1D"
+    if d <= 6:
+        return "1W"
+    if d <= 30:
+        return "1M"
+    if d <= 90:
+        return "3M"
+    return "1Y"
+
+
+def _horizon_coherence_fill(out: Dict[str, Any]) -> None:
+    """v5.141.0 [F-6]: coherent invest_period_label / horizon_days backfill.
+
+    off      -> the exact legacy constant fills ("1Y" / 365), byte-identical.
+    observe  -> legacy fills, plus horizon_incoherent:<label>!=<days>:observe
+                tag wherever the post-fill pair disagrees (countable).
+    enforce  -> blank side derived from the present side (round-trip-stable
+                mapping); both blank -> 1Y/365; both present -> values kept,
+                disagreement tagged :enforce only. Fail-soft throughout."""
+    if not isinstance(out, dict):
+        return
+    mode = _horizon_coherence_mode()
+    label = out.get("invest_period_label")
+    days = out.get("horizon_days")
+    label_blank = label in (None, "")
+    days_blank = days in (None, "")
+    if mode == "enforce":
+        try:
+            if label_blank and days_blank:
+                out["invest_period_label"] = "1Y"
+                out["horizon_days"] = 365
+            elif days_blank:
+                key = _safe_str(label).strip().upper()
+                mapped = _HZC_LABEL_TO_DAYS.get(key)
+                if mapped is None:
+                    out["horizon_days"] = 365
+                    _v573_append_warning(
+                        out, "horizon_label_unmapped:%s:enforce" % (key or "?"))
+                else:
+                    out["horizon_days"] = mapped
+                    if mapped != 365:
+                        _v573_append_warning(
+                            out, "horizon_coherent_fill:days_from_%s:enforce"
+                            % key)
+            elif label_blank:
+                derived = _hzc_label_for_days(days)
+                out["invest_period_label"] = derived
+                if derived != "1Y":
+                    _v573_append_warning(
+                        out, "horizon_coherent_fill:label_from_days:enforce")
+        except Exception:
+            pass
+    else:
+        if label_blank:
+            out["invest_period_label"] = "1Y"
+        if days_blank:
+            out["horizon_days"] = 365
+    if mode in ("observe", "enforce"):
+        try:
+            lbl = _safe_str(out.get("invest_period_label")).strip().upper()
+            dys = out.get("horizon_days")
+            if lbl and dys not in (None, "") and _hzc_label_for_days(dys) != lbl:
+                _v573_append_warning(
+                    out, "horizon_incoherent:%s!=%s:%s" % (lbl, dys, mode))
+        except Exception:
+            pass
+
+
 def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     target = _canonicalize_sheet_name(sheet)
     out = _apply_symbol_context_defaults(dict(row or {}), page=target)
     sym = normalize_symbol(_safe_str(out.get("symbol") or out.get("requested_symbol")))
 
-    if out.get("invest_period_label") in (None, ""):
-        out["invest_period_label"] = "1Y"
-    if out.get("horizon_days") in (None, ""):
-        out["horizon_days"] = 365
+    _horizon_coherence_fill(out)
 
     if out.get("data_provider") in (None, ""):
         sources = out.get("data_sources")
@@ -13346,10 +13450,7 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["exchange"] = _infer_exchange_from_symbol(sym)
         if out.get("currency") in (None, ""):
             out["currency"] = _infer_currency_from_symbol(sym)
-        if out.get("invest_period_label") in (None, ""):
-            out["invest_period_label"] = "1Y"
-        if out.get("horizon_days") in (None, ""):
-            out["horizon_days"] = 365
+        _horizon_coherence_fill(out)
 
     if target in {"Global_Markets", "Market_Leaders", "My_Portfolio", "Top_10_Investments"}:
         asset_class = _safe_str(out.get("asset_class"))
