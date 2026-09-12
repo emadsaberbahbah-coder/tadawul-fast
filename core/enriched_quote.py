@@ -368,7 +368,29 @@ logger.addHandler(logging.NullHandler())
 # double-gated (TFB_ENRICH_COMPLIANCE env + lazy gate import). Champion
 # behavior is byte-identical. Absence of core.compliance_gate never raises.
 # -----------------------------------------------------------------------------
-MODULE_VERSION = "4.10.0"
+# -----------------------------------------------------------------------------
+# v4.11.0 (2026-09-12) — P-101 ROOT FIX: ROI POINTS OUTPUT SENTRY (gated)
+# WHY: The sheet's Expected ROI columns carry a PERCENT-POINTS contract, but
+# this module's internal contract is FRACTION: step 4 (_normalize_percent_units)
+# actively converts points->fraction for expected_roi_*, step 5 backfills
+# fractions from fp/cp-1, and NO x100 exists anywhere before schema_projection.
+# Rows served through this path therefore land on the sheet as bare fractions
+# while engine-path rows land as points — the adjudicated P-101 defect, whose
+# residual grew 138 -> 167 -> 256 cells across the 09-09/09-11/09-12 exports
+# because the writer (this path) was never fixed, only the cells reformatted.
+# DESIGN: _roi_points_output_sentry() runs as pipeline step 8c, gated by
+# TFB_EQ_ROI_UNIT_SENTRY = off|observe|enforce (default OFF => byte-identical).
+# It is GROUND-TRUTH-CONFIRMED: a value is scaled x100 ONLY when forecast
+# price / current price prove it is fraction-scale (err-as-fraction beats
+# err-as-points — the same discriminator _normalize_percent_units already
+# uses). Without ground truth it NEVER scales (fail-safe): magnitude-suspect
+# values get a countable roi_unit_ambiguous tag instead. This structurally
+# prevents the inverse defect (inflating a genuine 0.55-point value x100,
+# external review F01 class). Idempotent: once in points, the discriminator
+# skips. Scope: expected_roi_1m/3m/12m only; upside_pct / percent_change are
+# a vNEXT decision after their own residual count.
+# -----------------------------------------------------------------------------
+MODULE_VERSION = "4.11.0"
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -1580,6 +1602,68 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
 
 
 # =============================================================================
+# v4.11.0: ROI Points Output Sentry (P-101 root fix, gated)
+# =============================================================================
+
+_ROI_POINTS_SENTRY_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("expected_roi_1m", "forecast_price_1m"),
+    ("expected_roi_3m", "forecast_price_3m"),
+    ("expected_roi_12m", "forecast_price_12m"),
+)
+
+
+def _eq_roi_sentry_mode() -> str:
+    """off | observe | enforce — read at call time (no boot line; read-back is
+    the roi_unit_* tags in the next export, sentry doctrine)."""
+    v = str(os.environ.get("TFB_EQ_ROI_UNIT_SENTRY", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _roi_points_output_sentry(row: Dict[str, Any]) -> None:
+    """v4.11.0 [P-101]: emit expected_roi_* in PERCENT POINTS at the module
+    boundary, ground-truth-confirmed, gated default OFF.
+
+    enforce: value proven fraction-scale by fp/cp  -> value*100 + tag
+             roi_unit_points:eq:<field>:enforce
+    observe: same detection, value untouched       -> ...:observe tag
+    no ground truth: NEVER scales; |v|<=1.5 nonzero gets a countable
+             roi_unit_ambiguous:eq:<field>:<mode> tag (fail-safe — this is
+             what makes the F01 inverse defect impossible here).
+    Idempotent: once in points the discriminator prefers points and skips."""
+    mode = _eq_roi_sentry_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return
+    cp = _to_number(row.get("current_price"))
+    for roi_key, fp_key in _ROI_POINTS_SENTRY_FIELDS:
+        try:
+            stored = _to_number(row.get(roi_key))
+            if stored is None:
+                continue
+            fp = _to_number(row.get(fp_key))
+            if fp is not None and cp is not None and cp > 0:
+                true_frac = (fp / cp) - 1.0
+                if (math.isnan(true_frac) or math.isinf(true_frac)
+                        or abs(true_frac) < 1e-9):
+                    continue
+                err_as_fraction = abs(stored - true_frac)
+                err_as_points = abs(stored - true_frac * 100.0)
+                if err_as_fraction < err_as_points:
+                    if mode == "enforce":
+                        row[roi_key] = stored * 100.0
+                        _append_warning(
+                            row, "roi_unit_points:eq:%s:enforce" % roi_key)
+                    else:
+                        _append_warning(
+                            row, "roi_unit_points:eq:%s:observe" % roi_key)
+                continue
+            if stored != 0 and abs(stored) <= 1.5:
+                _append_warning(
+                    row, "roi_unit_ambiguous:eq:%s:%s" % (roi_key, mode))
+        except Exception:
+            pass
+
+
+# =============================================================================
 # v4.5.0: Outlier-Clamp Sanity Gate
 # =============================================================================
 
@@ -2581,6 +2665,7 @@ def normalize_rows(
         7.  _sanitize_price_consistency         (v4.5.0)
         8.  _check_revenue_currency_units       (v4.5.0)
         8b. _check_market_cap_currency_units    (v4.6.0)
+        8c. _roi_points_output_sentry           (v4.11.0 NEW, gated OFF)
         9.  _normalize_warnings_field           (v4.3.0)
         9b. _normalize_scoring_errors_field     (v4.7.0 NEW)
         10. _ensure_provenance_fields           (v4.4.0)
@@ -2607,6 +2692,7 @@ def normalize_rows(
             _sanitize_price_consistency(rd)
             _check_revenue_currency_units(rd)
             _check_market_cap_currency_units(rd)
+            _roi_points_output_sentry(rd)
         _normalize_warnings_field(rd)
         if instrument_shaped:
             _normalize_scoring_errors_field(rd)
