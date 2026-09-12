@@ -112,6 +112,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -277,7 +278,34 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # makes both flags arrive; this change makes dry-run mean ZERO writes on
 # every path: the drill branch now previews and exits without touching
 # Sheets. Everything else is byte-identical to v1.5.0.
-SCRIPT_VERSION = "1.7.3"
+# -----------------------------------------------------------------------------
+# v1.8.0 (2026-09-12) — S-1 BOARD-FRESH GUARD (gated, default OFF)
+# WHY: the scorer read the Shadow_Board tab with ZERO assertion about WHICH
+# day's board it held. Schedules: board 05:10/14:10 UTC, scorer 14:40 UTC —
+# 30 min of headroom that GitHub cron jitter routinely eats (observed
+# 2026-09-11: board COMPLETED 17:44:11 Riyadh, four minutes after the
+# scorer's scheduled start; scorer logged 17:53:00 with chal fresh=0/0).
+# Compounding it, write_board() is clear()-then-update(): a reader in the
+# gap sees an empty/partial tab. Either way the scorer can silently score
+# yesterday's (or a half-written) board and record the day as
+# "no-challenger" — the exact post-fix failure signature, AFTER the
+# compliance unblock verifiably worked (blocked={} in the board log).
+# DESIGN: TFB_S1_BOARD_FRESH_GUARD = off|observe|enforce (default OFF =>
+# byte-identical). The board's own meta stamp ("as of YYYY-MM-DD HH:MM
+# Riyadh", meta row 1) is parsed by board_asof_date(); observe logs
+# [S1-BOARD-FRESH] into the verdict line only; enforce on a stale read
+# re-reads the tab for up to TFB_S1_BOARD_WAIT_MIN minutes (default 8,
+# poll 60s — recovers the race day), and if STILL stale classifies the day
+# EXCLUDED-INFRA with the honest new reason `stale-board` (precedence:
+# after non-trading, before no-challenger — a challenger list read off a
+# stale board is meaningless, so labeling it no-challenger was label
+# untruth). Missing/unparseable stamp FAILS OPEN as fresh (the guard can
+# never manufacture an exclusion on a formatting change). Functions added:
+# _board_fresh_mode, board_asof_date, _board_extract (verbatim-moved main
+# logic, shared with the retry), _board_fresh_retry, stale_board_override.
+# Removed: 0. Kill: unset the env var.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.8.0"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -897,6 +925,84 @@ def shape_guard_rows(rows: Sequence[Sequence[Any]]
     return kept, dropped
 
 
+_BOARD_ASOF_RE = re.compile(r"\bas of (\d{4}-\d{2}-\d{2})")
+
+
+def _board_fresh_mode() -> str:
+    """v1.8.0: off | observe | enforce (read at call time)."""
+    v = (os.getenv("TFB_S1_BOARD_FRESH_GUARD") or "").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def board_asof_date(values: Sequence[Sequence[Any]]) -> Optional[str]:
+    """v1.8.0 PURE: the board's own 'as of YYYY-MM-DD' meta stamp, scanned
+    from the first rows. None when absent/unparseable (guard fails OPEN)."""
+    for row in (values or [])[:8]:
+        for cell in row or []:
+            m = _BOARD_ASOF_RE.search(str(cell))
+            if m:
+                return m.group(1)
+    return None
+
+
+def _board_extract(board: Sequence[Sequence[Any]], sg_on: bool
+                   ) -> Tuple[List[Sequence[Any]], List[str], List[str], int]:
+    """v1.8.0: the exact v1.7.3 main-path board extraction, verbatim-moved so
+    the fresh-retry path reuses ONE implementation.
+    -> (data_rows, sg_dropped, chal_syms, violations)."""
+    data_rows = [r for r in board
+                 if r and r[0] and r[0] not in ("Symbol",)
+                 and len(r) >= len(sb.OUT_HEADER) - 2]
+    sg_dropped: List[str] = []
+    if sg_on:                                      # v1.7.2 shape guard
+        data_rows, sg_dropped = shape_guard_rows(data_rows)
+    chal_syms = [r[0] for r in data_rows
+                 if str(r[-1]).strip().upper() == "YES"]
+    violations = count_compliance_violations(data_rows)
+    return data_rows, sg_dropped, chal_syms, violations
+
+
+def stale_board_override(day_non_trading: bool, mode: str,
+                         stale: bool) -> bool:
+    """v1.8.0 PURE: True iff the day must be EXCLUDED as stale-board —
+    enforce mode, a stale read, and NOT a venue-closed day (non-trading
+    keeps precedence: a closed venue is not an infra failure)."""
+    return bool((not day_non_trading) and mode == "enforce" and stale)
+
+
+def _board_fresh_retry(sh, today, sg_on: bool,
+                       board: Sequence[Sequence[Any]], *,
+                       sleep_fn=time.sleep, wait_min: Optional[int] = None,
+                       poll_s: int = 60):
+    """v1.8.0: bounded re-read of the board tab until its stamp == today or
+    the window closes. Recovers the schedule-race day instead of excluding
+    it. -> (board, data_rows, sg_dropped, chal_syms, violations, asof,
+    stale). Injectable sleep/read for tests; any read error keeps the last
+    good values (never raises)."""
+    try:
+        wait = int(wait_min if wait_min is not None
+                   else (os.getenv("TFB_S1_BOARD_WAIT_MIN") or "8"))
+    except (TypeError, ValueError):
+        wait = 8
+    asof = board_asof_date(board)
+    tries = 0
+    for _ in range(max(0, wait)):
+        if asof == str(today):
+            break
+        sleep_fn(poll_s)
+        tries += 1
+        try:
+            board = sh.worksheet(sb.TAB_OUT).get_all_values()
+        except Exception:  # noqa: BLE001
+            continue
+        asof = board_asof_date(board)
+    stale = bool(asof is not None and asof != str(today))
+    data_rows, sg_dropped, chal_syms, violations = _board_extract(board, sg_on)
+    print(f"[S1-BOARD-FRESH v{SCRIPT_VERSION}] retry n={tries} "
+          f"asof={asof or '?'} final={'STALE' if stale else 'fresh'}")
+    return board, data_rows, sg_dropped, chal_syms, violations, asof, stale
+
+
 def summarize_price_errs(errs: Sequence[str], gate_on: bool,
                          token_present: bool, first_n: int = 8
                          ) -> Tuple[str, Dict[str, Any]]:
@@ -1210,15 +1316,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         board = sh.worksheet(sb.TAB_OUT).get_all_values()
     except Exception:  # noqa: BLE001
         board = []
-    data_rows = [r for r in board
-                 if r and r[0] and r[0] not in ("Symbol",)
-                 and len(r) >= len(sb.OUT_HEADER) - 2]
     _sg_on = _shape_guard_enabled()
-    _sg_dropped: List[str] = []
-    if _sg_on:                                     # v1.7.2 shape guard
-        data_rows, _sg_dropped = shape_guard_rows(data_rows)
-    chal_syms = [r[0] for r in data_rows if str(r[-1]).strip().upper() == "YES"]
-    violations = count_compliance_violations(data_rows)
+    data_rows, _sg_dropped, chal_syms, violations = _board_extract(
+        board, _sg_on)                             # v1.8.0 shared extraction
+    # v1.8.0 [S1 BOARD-FRESH GUARD]: assert WHICH day's board this is.
+    _bf_mode = _board_fresh_mode()
+    _bf_asof = board_asof_date(board)
+    _bf_stale = bool(_bf_asof is not None and _bf_asof != str(today))
+    if _bf_mode == "enforce" and _bf_stale:
+        (board, data_rows, _sg_dropped, chal_syms, violations,
+         _bf_asof, _bf_stale) = _board_fresh_retry(sh, today, _sg_on, board)
 
     # v1.3.0 W-7: naive pool = the FULL published board (pre-eligibility),
     # order-preserving unique. Board empty -> no EQW row (never invented).
@@ -1330,7 +1437,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                  and measured[BENCHMARK]["ret"] is None)))
     total_stale = sum(m["n_stale"] for m in measured.values())
     _excl_reason = ""                              # v1.7.2 label truth
-    if day_excluded:
+    if stale_board_override(day_non_trading, _bf_mode, _bf_stale):
+        day_excluded = True                        # v1.8.0: guard precedence
+        _excl_reason = "stale-board"
+    elif day_excluded:
         if not chal_syms:
             _excl_reason = "no-challenger"
         elif _chal_frac < _min_fresh_frac():
@@ -1436,6 +1546,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         spot, _chal_m["n_fresh"], _chal_m["n_stale"],
         _chal_m["stale_syms"], _min_fresh_frac())
     verdict += f" | {_fresh_line}"
+    if _bf_mode != "off":                          # v1.8.0 read-back
+        verdict += (f" | [S1-BOARD-FRESH v{SCRIPT_VERSION}] "
+                    f"asof={_bf_asof or '?'} mode={_bf_mode}"
+                    + (" STALE" if _bf_stale else ""))
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
         _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
         verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
