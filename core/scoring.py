@@ -268,7 +268,27 @@ logger.addHandler(logging.NullHandler())
 # a frozen literal tag ("[v5.7.4 SCORE]" while the module ran 5.11.0) turns
 # the audit chain's version evidence into a claim. Four sites converted;
 # zero behavioral change; SCORING_*_VERSION follow __version__ as before.
-__version__ = "5.11.1"
+# -----------------------------------------------------------------------------
+# v5.11.2 (2026-09-12) — P-129: EXPLICIT-PERCENT ROI DOUBLE-DIVISION CLOSED
+# WHY (external review F-class, adjudicated 09-11; re-proven on HEAD today):
+# _safe_float already strips a trailing "%" and divides once
+# (float(s[:-1])/100). _as_roi_fraction then applied the bare-number
+# points heuristic (abs>1 -> /100) to that ALREADY-DIVIDED value, so any
+# explicit percent string beyond 100% divided twice: "200%" -> 2.0 ->
+# 0.02, "▲ 150%" -> 0.015. These reads feed expected_roi_1m/3m/12m at the
+# forecast-derivation and gate sites — threshold comparisons on such rows
+# were distorted 100x. Bare numeric inputs (the engine path's floats:
+# 250.0 -> 2.5, 34.0 -> 0.34, 0.105 -> 0.105) were and remain CORRECT —
+# the heuristic is untouched for them.
+# FIX: when the ORIGINAL input is an explicit "%" string, trust the single
+# division _safe_float performed; never re-divide. DEFAULT ON with kill
+# switch TFB_SCORING_ROI_PARSE_LEGACY=1 (v5.11.1 byte-identical) — the
+# narrow-correctness precedent (v5.96.1 class): the affected population is
+# exactly explicit-% strings with |value| > 100%, provably parsed wrong.
+# The known <=1.0 bare-number ambiguity (0.9 = 90% or 0.9 points?) is OUT
+# of scope and unchanged. Functions added: 0 (in-place). Removed: 0.
+# -----------------------------------------------------------------------------
+__version__ = "5.11.2"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -857,6 +877,17 @@ def _as_roi_fraction(value: Any) -> Optional[float]:
     f = _safe_float(value)
     if f is None:
         return None
+    # v5.11.2 [P-129]: an explicit "%" string was ALREADY divided once by
+    # _safe_float — re-applying the points heuristic double-divided any
+    # magnitude beyond 100% ("200%" -> 0.02). Explicit percent trusts the
+    # single division. Kill: TFB_SCORING_ROI_PARSE_LEGACY=1.
+    if str(os.getenv("TFB_SCORING_ROI_PARSE_LEGACY") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        try:
+            if isinstance(value, str) and value.strip().endswith("%"):
+                return f
+        except Exception:
+            pass
     # ROI can be displayed as 10.5 or 10.5% or 0.105. Treat absolute >1 as percent points.
     if abs(f) > 1.0:
         return f / 100.0
@@ -867,6 +898,19 @@ def _as_upside_fraction(value: Any) -> Optional[float]:
     f = _safe_float(value)
     if f is None:
         return None
+    # v5.11.2 [P-129]: same explicit-percent guard as _as_roi_fraction —
+    # "300%" was double-divided to 0.03. Same kill switch. The two other
+    # /100 heuristics in this family (_as_pct_position_fraction, the
+    # confidence read) were REVIEWED and left unchanged: both clamp into
+    # [0,1] and only misread inputs that are already nonsense (>150%/
+    # >200% position/confidence), so a change there buys nothing.
+    if str(os.getenv("TFB_SCORING_ROI_PARSE_LEGACY") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        try:
+            if isinstance(value, str) and value.strip().endswith("%"):
+                return f
+        except Exception:
+            pass
     # Engine canonical is fraction; legacy Sheets can carry percent points.
     if abs(f) <= 2.5:
         return f
