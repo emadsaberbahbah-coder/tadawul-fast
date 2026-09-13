@@ -119,7 +119,33 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # v1.3.0 clear()+update() order byte-for-byte. Functions added: 1
 # (_sb_atomic_write). Removed: 0.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.1"
+# ---------------------------------------------------------------------------
+# VERSION 1.4.0 (2026-09-13) — ENGINE-ROI SOURCING FOR CANDIDATES (P-139/S-1)
+# FORENSIC WHY (operator Shadow_Board paste, 2026-09-13 20:24 board): all 9
+# candidate rows carried ROI %% = blank -> Edge Verdict NO_ROI -> Gen2
+# Eligible NO -> chal fresh 0/0 every non-anomalous day. Root: this script
+# sources ROI from the Top_10 sheet's FIRST data table, and the cockpit
+# DELIBERATELY blanks ROI on carried/grace rows (a stale printed ROI would
+# mislead the operator). Reading a display surface as a data source starved
+# the challenger pipeline; the 0->4->0 eligibility flap tracked whichever
+# rows happened to have printed ROI at read time. Adjudicated with operator
+# 2026-09-13: Option A — the board sources Engine ROI itself.
+# FIX: TFB_BOARD_ENGINE_ROI = off (default) | observe | enforce.
+#   observe: fetch Expected ROI 12M from Global_Markets/Market_Leaders for
+#     blank-ROI candidates; annotate the new "ROI Src" column (obs:<v>);
+#     ELIGIBILITY MATH BYTE-UNCHANGED. enforce: blank roi_pct is filled from
+#     the engine map (row tagged engine[/frac]); verdict math proceeds
+#     normally. Unit guard on parse: a bare 0<|v|<1 cell is the known
+#     fraction-scale residual class -> x100, tagged fraction_fixed; |v|>300
+#     is dropped (ROI cap doctrine); '%%'-formatted strings parse as points.
+# SCHEMA: "ROI Src" is inserted BEFORE "Gen2 Eligible" because BOTH this
+# script (eligible_symbols) and run_shadow_scorer v1.8.0 L1996 read Gen2
+# POSITIONALLY as r[-1] — Gen2 must stay the last column. Column is present
+# in all modes (stable schema); off-mode rows carry it empty.
+# Meta gains one line: engine_roi: mode/applied/fraction_fixed/unresolved.
+# Rollback: env off (or git revert). Functions added: 4. Removed: 0.
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "1.4.0"
 # -----------------------------------------------------------------------------
 # v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
 # -----------------------------------------------------------------------------
@@ -180,11 +206,14 @@ def build_regime_history_rows(regime_block, captured_utc, date_riyadh):
     return out
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
+TAB_ENGINE_ROI = ("Global_Markets", "Market_Leaders")   # v1.4.0 ROI source
+ENV_ENGINE_ROI = "TFB_BOARD_ENGINE_ROI"                 # off|observe|enforce
+ENGINE_ROI_CAP_PCT = 300.0
 
 OUT_HEADER = ["Symbol", "Name", "Champion Action", "Sector", "ROI %",
               "Confidence", "Shariah Status", "Shariah Source", "Tradability",
               "Venue", "Floor OK", "RT Cost %", "Net Edge %", "Hurdle %",
-              "Edge Verdict", "Debt/MCap %", "Gen2 Eligible"]
+              "Edge Verdict", "Debt/MCap %", "ROI Src", "Gen2 Eligible"]
 
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1mo"
 REGIME_SLEEVES = {"Global": "SPUS", "Saudi": "^TASI.SR"}
@@ -282,6 +311,103 @@ def rows_to_records(values: Sequence[Sequence[Any]],
                 })
             return out
     return []
+
+
+# --------------------------------------------------------------------------- #
+# v1.4.0 engine-ROI sourcing (pure parse/apply selftested; fetch is IO)        #
+# --------------------------------------------------------------------------- #
+def _engine_roi_mode() -> str:
+    m = str(os.getenv(ENV_ENGINE_ROI) or "off").strip().lower()
+    return m if m in ("off", "observe", "enforce") else "off"
+
+
+def _parse_engine_roi_cell(raw: Any) -> Tuple[Optional[float], str]:
+    """Display-string -> (roi_pct, tag). Pure. Tags: pct | fraction_fixed |
+    capped | unparsed | '' (empty cell). A bare 0<|v|<1 with no %% sign is
+    the known fraction-scale residual class -> x100."""
+    s = str(raw if raw is not None else "").strip()
+    if not s or s in ("\u2014", "-"):
+        return None, ""
+    has_pct = "%" in s
+    cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
+    if cleaned in ("", "-", ".", "-."):
+        return None, "unparsed"
+    try:
+        v = float(cleaned)
+    except Exception:  # noqa: BLE001
+        return None, "unparsed"
+    tag = "pct"
+    if not has_pct and 0.0 < abs(v) < 1.0:
+        v *= 100.0
+        tag = "fraction_fixed"
+    if abs(v) > ENGINE_ROI_CAP_PCT:
+        return None, "capped"
+    return round(v, 2), tag
+
+
+def apply_engine_roi(cands: List[Dict[str, Any]],
+                     roi_map: Dict[str, Dict[str, Any]],
+                     mode: str) -> Dict[str, int]:
+    """Pure. observe: annotate roi_src_cell only (eligibility byte-unchanged).
+    enforce: fill blank roi_pct from the map and tag the row."""
+    n = {"blank": 0, "applied": 0, "fraction_fixed": 0, "unresolved": 0}
+    if mode not in ("observe", "enforce"):
+        for c in cands:
+            c.setdefault("roi_src_cell", "")
+        return n
+    for c in cands:
+        c.setdefault("roi_src_cell", "")
+        if c.get("roi_pct") is not None:
+            continue
+        n["blank"] += 1
+        hit = roi_map.get(str(c.get("symbol") or "").upper())
+        if not hit or hit.get("roi") is None:
+            n["unresolved"] += 1
+            continue
+        frac = hit.get("tag") == "fraction_fixed"
+        if frac:
+            n["fraction_fixed"] += 1
+        if mode == "enforce":
+            c["roi_pct"] = hit["roi"]
+            c["roi_src_cell"] = "engine/frac" if frac else "engine"
+            n["applied"] += 1
+        elif mode == "observe":
+            c["roi_src_cell"] = ("obs:%g" % hit["roi"]) + ("\u2020" if frac else "")
+            n["applied"] += 1
+    return n
+
+
+def fetch_engine_roi_map(sh, symbols: Sequence[str]
+                         ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Read Expected ROI 12M for `symbols` from the engine pages. Tolerant:
+    per-tab errors are reported, never raised; first tab hit wins."""
+    need = {str(s).upper() for s in symbols if s}
+    out: Dict[str, Dict[str, Any]] = {}
+    errs: List[str] = []
+    for tab in TAB_ENGINE_ROI:
+        if not (need - set(out)):
+            break
+        try:
+            ws = sh.worksheet(tab)
+            toks = [_norm(h) for h in ws.row_values(1)]
+            si = next((i for i, t in enumerate(toks)
+                       if t in ("symbol", "ticker")), None)
+            ri = next((i for i, t in enumerate(toks)
+                       if "expectedroi12m" in t), None)
+            if si is None or ri is None:
+                errs.append(tab + ":cols")
+                continue
+            syms = ws.col_values(si + 1)
+            rois = ws.col_values(ri + 1)
+            for s_raw, r_raw in zip(syms[1:], rois[1:]):
+                u = str(s_raw).strip().upper()
+                if u in need and u not in out:
+                    val, tag = _parse_engine_roi_cell(r_raw)
+                    if val is not None:
+                        out[u] = {"roi": val, "tag": tag}
+        except Exception as exc:  # noqa: BLE001
+            errs.append(tab + ":" + type(exc).__name__)
+    return out, errs
 
 
 def build_risk_block(cands: List[Dict[str, Any]], eligible: set,
@@ -419,7 +545,9 @@ def evaluate_board(cands: List[Dict[str, Any]],
             round(rt, 2) if rt is not None else "",
             round(ne, 2) if ne is not None else "",
             round(hurdle, 2) if hurdle is not None else "",
-            verdict, ratio, "YES" if gen2 else "NO",
+            verdict, ratio,
+            c.get("roi_src_cell") or "",                 # v1.4.0 ROI Src
+            "YES" if gen2 else "NO",
         ])
     return rows, {"evaluated": len(cands), "compliance_eligible": eligible,
                   "blocked": blocked}
@@ -539,6 +667,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     monitor = sa.get_monitor_map()
     ameta = sa.get_meta()
 
+    roi_mode = _engine_roi_mode()                        # v1.4.0
+    roi_counters = {"blank": 0, "applied": 0, "fraction_fixed": 0,
+                    "unresolved": 0}
+    roi_errs: List[str] = []
+    if roi_mode != "off":
+        blanks = [c["symbol"] for c in cands if c.get("roi_pct") is None]
+        roi_map, roi_errs = fetch_engine_roi_map(sh, blanks) if blanks \
+            else ({}, [])
+        roi_counters = apply_engine_roi(cands, roi_map, roi_mode)
+
     fnd, fnd_errs = fetch_board_fundamentals([c["symbol"] for c in cands])
     data_rows, summary = evaluate_board(cands, auth, monitor, equity, fnd)
     ok = eligible_symbols(data_rows)
@@ -570,6 +708,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         ["regime: " + json.dumps(regime_block.get("sleeves", {}), default=str),
          "weights=" + json.dumps(regime_block.get("suggested_weights") or {}),
          ";".join(regime_block.get("errors", []) or [])],
+        ["engine_roi: mode=" + roi_mode +
+         " applied=%d/%d" % (roi_counters["applied"], roi_counters["blank"]) +
+         " fraction_fixed=%d" % roi_counters["fraction_fixed"] +
+         " unresolved=%d" % roi_counters["unresolved"],
+         ";".join(roi_errs[:3]) or "-"],
         [regime_block.get("governance", "")],
     ]
 
@@ -690,14 +833,43 @@ def _selftest() -> int:
     checks.append(("board: STC authority-pass + TRADE + Gen2 YES",
                    by["7010.SR"][6] == "AUTHORITY_PASS"
                    and by["7010.SR"][14] == "TRADE"
-                   and by["7010.SR"][16] == "YES"))
+                   and by["7010.SR"][17] == "YES"))
     checks.append(("board: Nomu venue-blocked, Gen2 NO",
-                   by["9628.SR"][6] == "VENUE_BLOCK" and by["9628.SR"][16] == "NO"))
+                   by["9628.SR"][6] == "VENUE_BLOCK" and by["9628.SR"][17] == "NO"))
     checks.append(("summary counts", summary["evaluated"] == 2
                    and summary["compliance_eligible"] == 1
                    and summary["blocked"] == {"VENUE_BLOCK": 1}))
     checks.append(("header width matches rows",
                    all(len(r) == len(OUT_HEADER) for r in rows)))
+    # v1.4.0 engine-ROI battery (pure paths)
+    checks.append(("roi parse: arrow-percent points",
+                   _parse_engine_roi_cell("\u25b2 35.00%") == (35.0, "pct")))
+    checks.append(("roi parse: bare fraction fixed x100",
+                   _parse_engine_roi_cell("0.325") == (32.5, "fraction_fixed")))
+    checks.append(("roi parse: cap drops implausible",
+                   _parse_engine_roi_cell("999") == (None, "capped")))
+    checks.append(("roi parse: dash empty",
+                   _parse_engine_roi_cell("\u2014") == (None, "")))
+    _c1 = [{"symbol": "AAA.US", "name": "a", "action": "", "roi_pct": None,
+            "confidence_band": "High", "market_value_sar": 10000,
+            "sector": ""},
+           {"symbol": "BBB.US", "name": "b", "action": "", "roi_pct": 9.0,
+            "confidence_band": "High", "market_value_sar": 10000,
+            "sector": ""}]
+    _m = {"AAA.US": {"roi": 21.5, "tag": "pct"}}
+    _n_obs = apply_engine_roi([dict(x) for x in _c1], _m, "observe")
+    _c_enf = [dict(x) for x in _c1]
+    _n_enf = apply_engine_roi(_c_enf, _m, "enforce")
+    checks.append(("apply observe: annotate only, roi stays None",
+                   _n_obs["applied"] == 1 and _n_obs["blank"] == 1))
+    checks.append(("apply enforce: blank filled + tagged, cockpit untouched",
+                   _c_enf[0]["roi_pct"] == 21.5
+                   and _c_enf[0]["roi_src_cell"] == "engine"
+                   and _c_enf[1]["roi_pct"] == 9.0
+                   and _n_enf["applied"] == 1))
+    checks.append(("schema: Gen2 Eligible is STILL the last column",
+                   OUT_HEADER[-1] == "Gen2 Eligible"
+                   and OUT_HEADER[-2] == "ROI Src"))
     # cockpit header variant: `Conf` + `Ticket SAR` + `Sector` must bind
     v_hdr = ["Rank", "Symbol", "Name", "Sector", "Ticket SAR", "ROI %",
              "Engine ROI %", "Conf"]
