@@ -46,6 +46,31 @@ change to bridge selection, timeout, or fail-soft logic. ENV-GATED, DEFAULT ON
 (purely additive -- extra meta fields only, nothing removed/renamed): set
 TFB_ADV_LIFT_TRUST_WARNINGS=0 to revert to v2.16.1 (silent) behavior exactly.
 
+WHY v2.18.0 — P-130: TypeError retry discrimination (twin sites)
+-------------------------------------------------------------------------------
+Register item P-130 (adjudicated 2026-09-12, external-patch audit): the two
+except-TypeError retry sites in this file treated EVERY TypeError as a
+signature mismatch and advanced to the next kwargs variant.
+
+- 🔑 FIX [HIGH]: _call_candidate — a TypeError raised INSIDE the bridge
+     function's body (a real data-shape bug, e.g. "'NoneType' object is not
+     subscriptable") was re-executed up to 9 times with progressively FEWER
+     kwargs. Variant 9 is {}, so a degraded call could "succeed" while
+     silently dropping page/limit/offset/schema_only — and on exhaustion the
+     outcome lied ("all_signatures_typed_mismatch" for a body bug). Now only
+     signature-mismatch TypeErrors (new _signature_typeerror_is_retryable,
+     marker union of core.investment_advisor_engine and routes.advisor
+     helpers) walk the variants; real body TypeErrors ride the EXISTING
+     "raised" path (same handling as the except-Exception branch — caller's
+     catch at _execute_via_bridge already recovers _last_call_summary).
+     Per-attempt records gain an additive "signature_retryable" key.
+- 🔑 FIX [MEDIUM]: _auth_passed — same discrimination; a real TypeError
+     inside auth_ok now returns False immediately (same terminal as the
+     except-Exception arm) instead of silently walking all 7 variants.
+- Kill switch TFB_ADV_TYPEERROR_LEGACY=1 (read at call time, no restart)
+     restores the legacy retry-all behavior at BOTH sites. Default = fixed.
+- Happy path (signature walk → success) is behavior-identical to v2.17.0.
+
 WHY v2.16.1 — Insights fallback content fix + version-constant correction
 -------------------------------------------------------------------------------
 Two fixes on top of v2.16.0:
@@ -240,7 +265,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.17.0"
+INVESTMENT_ADVISOR_VERSION = "2.18.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -1142,6 +1167,46 @@ def _is_open_mode_enabled() -> bool:
     return False
 
 
+def _p130_typeerror_retry_legacy() -> bool:
+    """P-130 kill switch — read at call time (no restart needed).
+
+    TFB_ADV_TYPEERROR_LEGACY=1 restores the pre-v2.18.0 behavior where
+    EVERY TypeError (including one raised inside the called function's
+    body) advanced to the next kwargs variant. Default (unset/0) = fixed:
+    only signature-mismatch TypeErrors walk the variants.
+    """
+    try:
+        return str(os.getenv("TFB_ADV_TYPEERROR_LEGACY", "0")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _signature_typeerror_is_retryable(exc: TypeError) -> bool:
+    """P-130: True only when the TypeError is a call-SIGNATURE mismatch.
+
+    Marker union of core.investment_advisor_engine._signature_typeerror_is_retryable
+    and routes.advisor._looks_like_signature_type_error (dedup'd — e.g.
+    "positional argument" already covers the required/too-many variants).
+    A False here means the TypeError came from inside the function body:
+    a real bug that must not be retried against degraded kwargs.
+    """
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        return False
+    signature_markers = (
+        "unexpected keyword",
+        "unexpected positional",
+        "positional argument",
+        "takes ",
+        "multiple values for argument",
+        "missing required",
+        "missing 1 required",
+        "keyword-only argument",
+    )
+    return any(marker in msg for marker in signature_markers)
+
+
 def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> bool:
     if _is_open_mode_enabled():
         return True
@@ -1186,8 +1251,13 @@ def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: O
     for kwargs in attempts:
         try:
             return bool(auth_ok(**kwargs))
-        except TypeError:
-            continue
+        except TypeError as exc:
+            # P-130 (v2.18.0): walk variants only on a signature mismatch.
+            # A real TypeError inside auth_ok is a bug, not a variant miss
+            # — terminal False, same as the except-Exception arm.
+            if _signature_typeerror_is_retryable(exc) or _p130_typeerror_retry_legacy():
+                continue
+            return False
         except Exception:
             return False
 
@@ -1354,9 +1424,12 @@ async def _call_candidate(
 
     outcome_label is one of:
       - "success"                       — result returned (may still be None)
-      - "all_signatures_typed_mismatch" — every variant raised TypeError
-      - "raised"                        — non-TypeError raised; raise propagated
-                                          to caller
+      - "all_signatures_typed_mismatch" — every variant raised a
+                                          SIGNATURE-mismatch TypeError
+      - "raised"                        — non-TypeError raised, or (v2.18.0,
+                                          P-130) a non-signature TypeError
+                                          from the function body; raise
+                                          propagated to caller
       - "no_attempts_executed"          — fn was None
       - "fn_not_callable"               — fn provided but not callable
 
@@ -1403,13 +1476,30 @@ async def _call_candidate(
             })
             return result, call_summary, "success"
         except TypeError as exc:
+            # P-130 (v2.18.0): only a SIGNATURE-mismatch TypeError may walk
+            # to the next kwargs variant. A TypeError raised inside the
+            # bridge function's body is a real bug — re-running it against
+            # progressively fewer kwargs silently drops the operator's
+            # parameters, and exhaustion mislabels the failure as
+            # typed_mismatch. Real body TypeErrors now ride the EXISTING
+            # "raised" path (identical handling to the except-Exception
+            # branch below; the caller's catch already recovers
+            # _last_call_summary).
+            _sig_retryable = _signature_typeerror_is_retryable(exc)
             call_summary.append({
                 "attempt_idx": attempt_idx,
                 "kwargs_keys": kwargs_keys,
                 "outcome": "typeerror",
                 "error_class": "TypeError",
                 "error_message": str(exc)[:200],
+                "signature_retryable": bool(_sig_retryable),
             })
+            if not _sig_retryable and not _p130_typeerror_retry_legacy():
+                try:
+                    _call_candidate._last_call_summary = call_summary  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                raise
             last_type_error = exc
             continue
         except Exception as exc:
