@@ -740,7 +740,43 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Ungated by the alias-addition precedent (CONTAMINATED_FIELD_ALIASES
 # class). Functions added: 0. Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.11.1"
+# v1.12.0 (2026-09-14) — [F-1a SINGLE FORECAST BASIS — operator decision B
+# "plan3m", translated threshold] (F-1 decision memo, session 2026-09-14)
+# WHY: four ROI bases feed one decision surface (memo, measured on the
+# 09-14 export): verdict prose 3M, Horizon Days 365, this module's ADD
+# gate on valuation-target upside (roi_pct — CWBC blocked at 3.4% while
+# its 12M forecast read 13.1%), cockpit qualification de-facto 12M.
+# Operator decision B: the plan horizon (TP1 over the plan period)
+# becomes the single decision basis, translated threshold.
+# F-1a scope = THIS module's ADD-qualification ROI leg only. EXIT/TRIM
+# valuation thresholds, the VF-conflict guard and the dd guard are
+# deliberately untouched (loss-control legs; re-basing them is a
+# separate operator decision). Cockpit qualification is F-1b
+# (opportunity_builder); the engine-roi3m fallback is F-1b feeder work —
+# expected_roi_3m is not plumbed into this module today, so a TP1-less
+# holding fails CLOSED on the plan leg with a disclosed DATA_GAP instead
+# of a stand-in number.
+# GATE: env TFB_FORECAST_BASIS = legacy(default) | observe | plan3m,
+# read at call time (fund-unit-sentry seam — no boot proof needed;
+# read-back = [f1-*] tags in the next Portfolio_Decision run).
+#   legacy  = v1.11.1 byte-identical decisions AND notes (harness F1
+#             deep-equal proof).
+#   observe = decisions unchanged; every holding's Advisor Note gains one
+#             countable "[f1-observe] plan 3M ROI ..." tag (" - FLIP"
+#             marks ADD-ROI-leg basis disagreement) via the post-decision
+#             seam, so day-one read-back is positive even on a zero-flip
+#             book (today's 7 real holdings: 7 tags, 0 FLIPs — harness F2
+#             golden).
+#   plan3m  = the ADD ROI leg runs plan-3M (TP1/price − 1) vs
+#             controls["add_roi_3m_pct"] (default 3.0 = the 12%-annual
+#             translation (1.12**0.25 − 1)·100; env
+#             TFB_PF_ADD_ROI_3M_PCT). rel/DQ/conflict legs, §4.7
+#             precedence, caps, confidence caps, confirmation gate:
+#             byte-untouched.
+# Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
+# _apply_f1_observe_tag). Removed: 0.
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.12.0"
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -821,6 +857,10 @@ DEFAULT_CONTROLS = {
     "rebalance_mode": REBALANCE_ADVISORY,
     # v1.0.0 pinned thresholds (env-overridable; see policy block)
     "add_roi_pct": 12.0,
+    # v1.12.0 [F-1a]: plan-basis ADD threshold, percent per plan period
+    # (3M). 3.0 ~= the 12%-annual translation (1.12**0.25 - 1) * 100.
+    # Consulted ONLY when TFB_FORECAST_BASIS is observe/plan3m.
+    "add_roi_3m_pct": 3.0,
     "trim_roi_pct": -5.0,
     "exit_roi_pct": -15.0,
     "valuation_trim_frac": 0.5,
@@ -863,7 +903,8 @@ DEFAULT_CONTROLS = {
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
-                   "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
+                   "add_roi_pct", "add_roi_3m_pct",
+                   "trim_roi_pct", "exit_roi_pct",
                    "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio",
                    "max_data_age_hours", "identity_min_reliability",
                    "vf_conflict_min_engine_roi_pct")
@@ -1211,6 +1252,9 @@ def _env_overrides():
     return {
         "add_roi_pct": _env_float("TFB_PF_ADD_ROI_PCT",
                                   DEFAULT_CONTROLS["add_roi_pct"]),
+        # v1.12.0 [F-1a]
+        "add_roi_3m_pct": _env_float("TFB_PF_ADD_ROI_3M_PCT",
+                                     DEFAULT_CONTROLS["add_roi_3m_pct"]),
         "trim_roi_pct": _env_float("TFB_PF_TRIM_ROI_PCT",
                                    DEFAULT_CONTROLS["trim_roi_pct"]),
         "exit_roi_pct": _env_float("TFB_PF_EXIT_ROI_PCT",
@@ -2235,9 +2279,22 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
 
     # 5. ADD qualification (sizing deferred to the funding pass)
     dq = cand.get("dq")
+    # v1.12.0 [F-1a]: the ROI leg of the ADD test is basis-switchable.
+    # legacy/observe keep the v1.11.1 valuation-upside test verbatim
+    # (observe evidence rides the post-decision seam, not here); plan3m
+    # swaps ONLY this leg to plan-3M ROI vs add_roi_3m_pct — a TP1-less
+    # holding fails CLOSED (DATA_GAP named in step 6). All other legs of
+    # add_ok are byte-untouched.
+    _f1 = _env_forecast_basis()
+    _f1_plan = _f1_plan_roi_pct(cand) if _f1 == "plan3m" else None
+    if _f1 == "plan3m":
+        _f1_roi_ok = (_f1_plan is not None and
+                      _f1_plan >= controls["add_roi_3m_pct"])
+    else:
+        _f1_roi_ok = (roi is not None and roi >= controls["add_roi_pct"])
     add_ok = (rel is not None and rel >= controls["min_reliability_add"] and
               dq is not None and dq >= controls["min_dq_add"] and
-              roi is not None and roi >= controls["add_roi_pct"] and
+              _f1_roi_ok and
               cand.get("conflict") is not True)
     if add_ok:
         # 5a. PRECEDENCE (v1.7.0) — the engine's verdict outranks the
@@ -2261,6 +2318,14 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                 return (ACTION_HOLD,
                         "Low confidence (reliability %s) capped ADD -> HOLD"
                         % _fmt(rel), 0.0, ACTION_ADD)
+            if _f1 == "plan3m":
+                # v1.12.0 [F-1a]: _f1_plan is not None here by _f1_roi_ok.
+                return (ACTION_ADD,
+                        "Plan 3M ROI %.1f%% >= %.1f%% [f1:plan3m], "
+                        "reliability %s, DQ %s, headroom available"
+                        % (_f1_plan, controls["add_roi_3m_pct"],
+                           _fmt(rel), _fmt(dq)),
+                        0.0, None)
             return (ACTION_ADD,
                     "Upside %.1f%% >= %.1f%%, reliability %s, DQ %s, "
                     "headroom available"
@@ -2284,7 +2349,17 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     # sole signal was the withheld valuation action reaches this line.
     if basis_note is not None:
         return (ACTION_HOLD, basis_note, 0.0, basis_suppressed)
-    if roi is None:
+    if _f1 == "plan3m" and not _f1_roi_ok:
+        # v1.12.0 [F-1a]: under the plan basis the binding fact IS the
+        # plan leg — named ahead of the legacy valuation wording.
+        if _f1_plan is None:
+            why = ("Plan 3M ROI unavailable (no TP1) [f1:DATA_GAP] — "
+                   "fails closed on the plan basis")
+        else:
+            why = ("Plan 3M ROI %.1f%% below add threshold %.1f%% "
+                   "[f1:plan3m]; within all caps"
+                   % (_f1_plan, controls["add_roi_3m_pct"]))
+    elif roi is None:
         why = "No valuation reference (target/intrinsic) — upside unknown"
     elif roi < controls["add_roi_pct"]:
         why = ("Upside %.1f%% below add threshold %.1f%%; within all caps"
@@ -2565,6 +2640,53 @@ def _env_dd_guard_mode():
     return v if v in ("observe", "enforce") else "off"
 
 
+def _env_forecast_basis():
+    """v1.12.0 [F-1a]: legacy | observe | plan3m (read at call time, same
+    seam as _env_dd_guard_mode, so an env change needs no redeploy proof
+    at boot — read-back is the [f1-*] tags in the next run). legacy is
+    the default and keeps v1.11.1 byte-identical."""
+    v = str(os.environ.get("TFB_FORECAST_BASIS", "")).strip().lower()
+    return v if v in ("observe", "plan3m") else "legacy"
+
+
+def _f1_plan_roi_pct(cand):
+    """v1.12.0 [F-1a]: plan-3M ROI percent = (TP1/price − 1)·100 on the
+    candidate's native-currency fields (an FX-invariant ratio; tp1 and
+    price are both pre-FX). Returns None when either side is missing or
+    non-positive — callers treat None as DATA_GAP and fail CLOSED on the
+    plan basis (no stand-in number; the engine-roi3m fallback is F-1b
+    feeder work)."""
+    tp1 = _to_float((cand or {}).get("tp1"))
+    px = _to_float((cand or {}).get("price"))
+    if tp1 is None or px is None or tp1 <= 0 or px <= 0:
+        return None
+    return (tp1 / px - 1.0) * 100.0
+
+
+def _apply_f1_observe_tag(cand, reason, controls):
+    """v1.12.0 [F-1a]: observe-mode basis evidence — appended POST-decision
+    at the same caller seam as the dd guard, so legacy decisions stay
+    byte-identical while the basis pair becomes countable on every row
+    (" - FLIP" strictly marks ADD-ROI-leg disagreement: plan-3M vs
+    add_roi_3m_pct against valuation roi_pct vs add_roi_pct). legacy and
+    plan3m are pure pass-throughs here."""
+    if _env_forecast_basis() != "observe":
+        return reason
+    roi = _to_float((cand or {}).get("roi_pct"))
+    plan = _f1_plan_roi_pct(cand)
+    thr = controls["add_roi_3m_pct"]
+    legacy_ok = (roi is not None and roi >= controls["add_roi_pct"])
+    if plan is None:
+        tag = ("[f1-observe] plan 3M ROI DATA_GAP (no TP1); legacy basis "
+               "kept")
+    else:
+        plan_ok = plan >= thr
+        tag = ("[f1-observe] plan 3M ROI %.1f%% vs %.1f%%%s; legacy basis "
+               "kept" % (plan, thr,
+                         " - FLIP" if plan_ok != legacy_ok else ""))
+    return ("%s; %s" % (reason, tag)) if reason else tag
+
+
 def _apply_drawdown_guard(cand, action, reason, proceeds):
     """v1.11.0 [F-2 DRAWDOWN/TIME GUARD] — the loss-responsive exit the
     ladder never had. Seam-pattern (decide_action stays byte-identical).
@@ -2823,6 +2945,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         # pure pass-through (harness G1 byte-identical proof).
         action, reason, proceeds = _apply_drawdown_guard(
             c, action, reason, proceeds)
+        # v1.12.0 [F-1a]: observe-mode basis evidence — same seam pattern;
+        # legacy/plan3m are pure pass-throughs (harness F1 proof).
+        reason = _apply_f1_observe_tag(c, reason, ctl)
         sec_room = None
         if total_value:
             sec_room = max(0.0, (ctl["max_sector_pct"] / 100.0) *
