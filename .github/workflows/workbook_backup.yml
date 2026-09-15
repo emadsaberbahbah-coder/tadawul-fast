@@ -46,7 +46,7 @@ jobs:
       TFB_BACKUP_OAUTH_REFRESH_TOKEN: ${{ secrets.TFB_BACKUP_OAUTH_REFRESH_TOKEN }}
       TFB_BACKUP_DRIVE_FOLDER_NAME: ${{ vars.TFB_BACKUP_DRIVE_FOLDER_NAME }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
