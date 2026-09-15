@@ -90,7 +90,7 @@ jobs:
       # NO_ROI rows become real TRADE/EDGE_BELOW_COST verdicts — record
       # the S-1 window boundary annotation on the flip date.
       # Rollback: set off (or delete the line).
-      TFB_BOARD_ENGINE_ROI: "observe"
+      TFB_BOARD_ENGINE_ROI: "enforce"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
