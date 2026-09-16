@@ -1,0 +1,46 @@
+name: Workflow Repair Regression
+
+on:
+  push:
+    branches: ['fix/actions-health-20260917']
+  pull_request:
+    paths:
+      - '.github/workflows/workflow_repair_tests.yml'
+      - 'scripts/audit_provider_target_coverage.py'
+      - 'scripts/workflow_*.py'
+      - 'tests/test_workflow_*.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-repair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Run existing audit contracts without live credentials
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python scripts/audit_provider_target_coverage.py --selftest
+          python -m unittest tests/test_full_refresh_coverage.py tests/test_decision_surface_freshness.py -v
+          python -m unittest discover -s tests -p 'test_workflow_*.py' -v
+      - name: Capture tracked source for independent local review
+        run: git archive --format=tar.gz --output=workflow-review-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workflow-review-source
+          path: workflow-review-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
