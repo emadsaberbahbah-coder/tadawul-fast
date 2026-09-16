@@ -86,7 +86,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -199,6 +199,7 @@ class CoverageReport:
     findings: list[Finding] = field(default_factory=list)
     baseline_at_utc: Optional[str] = None
     baseline_age_h: Optional[float] = None
+    baseline_verified_at_utc: Optional[str] = None
     baseline_updated: bool = False
     baseline_update_detail: str = ""
     persist_status: str = "pending"
@@ -424,8 +425,21 @@ def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
                                 f"baseline belongs to sheet {state.get('sheet')} not "
                                 f"{sheet_masked} — refusing to compare"))
         return {}, findings, None
+    pages = state.get("pages")
+    if not isinstance(pages, dict) or not pages:
+        if bootstrap and isinstance(pages, dict):
+            return {}, findings, None
+        findings.append(Finding("CONTROL", "CH_BASELINE_EMPTY", "*",
+                                "baseline contains no accepted page measurements; "
+                                "an empty file is not a last-good reference"))
+        return {}, findings, None
+    if state.get("config_hash") and state["config_hash"] != cfg.hash():
+        findings.append(Finding("CONTROL", "CH_BASELINE_POLICY_MISMATCH", "*",
+                                "baseline policy differs from current configuration; "
+                                "restore the matching policy before comparison"))
+        return {}, findings, None
     age_h = None
-    ts = state.get("generated_at_utc")
+    ts = state.get("last_verified_at_utc") or state.get("generated_at_utc")
     try:
         prev = datetime.fromisoformat(str(ts))
         if prev.tzinfo is None:
@@ -435,14 +449,18 @@ def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
         findings.append(Finding("CONTROL", "CH_BASELINE_MISMATCH", "*",
                                 f"baseline timestamp unreadable: {ts!r}"))
         return {}, findings, age_h
+    if age_h is not None and age_h < -0.25:
+        findings.append(Finding("CONTROL", "CH_BASELINE_FUTURE", "*",
+                                "baseline verification timestamp is in the future"))
+        return pages, findings, age_h
     if age_h is not None and age_h > cfg.baseline_max_age_h and not bootstrap:
         findings.append(Finding("CONTROL", "CH_BASELINE_STALE", "*",
                                 f"baseline is {age_h:.1f}h old > max {cfg.baseline_max_age_h:.0f}h — "
                                 f"the reference is not the prior healthy run; re-bootstrap or "
                                 f"investigate the gap"))
-        return {}, findings, age_h
-    pages = state.get("pages")
-    return (pages if isinstance(pages, dict) else {}), findings, age_h
+        # Preserve the reference for diagnosis; stale does not mean missing.
+        return pages, findings, age_h
+    return pages, findings, age_h
 
 
 def next_last_good(report: CoverageReport, prior_pages: dict, accept: bool) -> tuple[dict, str]:
@@ -508,6 +526,7 @@ def audit_pages(grids: dict[str, Any], baseline_state: Optional[dict],
     rep.findings.extend(base_findings)
     rep.baseline_at_utc = (baseline_state or {}).get("generated_at_utc")
     rep.baseline_age_h = age_h
+    rep.baseline_verified_at_utc = (baseline_state or {}).get("last_verified_at_utc")
     read_errors = read_errors or {}
     for page, grid in grids.items():
         cov = measure_page(page, grid, read_error=read_errors.get(page, ""))
@@ -583,16 +602,40 @@ def save_last_good(path: str, rep: CoverageReport, sheet_masked: str) -> str:
         return "disabled"
     if rep.fatal:
         return "kept: fatal"
+    if rep.exit_code == 2:
+        return "kept: control-health failure"
+    if rep.exit_code == 1 and rep.mode != "accept":
+        return "kept: coverage failure"
     if _flag("TFB_PTC_FREEZE"):
         return "kept: frozen by TFB_PTC_FREEZE"
     pages = getattr(rep, "_next_pages", None)
-    if not isinstance(pages, dict):
+    if not isinstance(pages, dict) or not pages:
         return "kept: no eligible update"
-    if not rep.baseline_updated and Path(path).is_file():
+    # Equal healthy observations must refresh the verification clock without
+    # lowering the reference. A decline, WARN, failure or missing page cannot.
+    renewable = bool(rep.pages) and set(pages) == set(rep.pages) and not rep.findings
+    for page, cov in rep.pages.items():
+        ref = pages.get(page) or {}
+        share = cov.get("share_pct")
+        renewable = renewable and (
+            cov.get("verdict") in ("OK", "STRUCTURAL_ZERO", "BOOTSTRAP")
+            and cov.get("rows", 0) >= rep.config.get("min_rows", 50)
+            and share is not None and ref.get("share_pct") is not None
+            and float(share) >= float(ref["share_pct"])
+        )
+    if not rep.baseline_updated and not renewable:
         return "unchanged"
-    blob = {"schema": STATE_SCHEMA, "generated_at_utc": rep.generated_at_utc,
+    old, error = load_state(path)
+    if error:
+        return "kept: corrupt baseline"
+    generated = rep.generated_at_utc if rep.baseline_updated else (old or {}).get("generated_at_utc", rep.generated_at_utc)
+    blob = {"schema": STATE_SCHEMA, "generated_at_utc": generated,
             "version": VERSION, "sheet": sheet_masked,
             "config_hash": rep.config.get("config_hash"), "pages": pages}
+    if renewable:
+        blob["last_verified_at_utc"] = rep.generated_at_utc
+    elif (old or {}).get("last_verified_at_utc"):
+        blob["last_verified_at_utc"] = old["last_verified_at_utc"]
     tmp = Path(path + ".tmp")
     try:
         tmp.write_text(json.dumps(blob, ensure_ascii=False, indent=2) + "\n",

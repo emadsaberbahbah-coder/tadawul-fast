@@ -5,12 +5,18 @@ on:
     paths:
       - '.github/workflows/decision_surface_freshness.yml'
       - 'scripts/audit_decision_surface_freshness.py'
+      - 'scripts/audit_full_refresh_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_decision_surface_freshness.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/decision_surface_freshness.yml'
       - 'scripts/audit_decision_surface_freshness.py'
+      - 'scripts/audit_full_refresh_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_decision_surface_freshness.py'
   workflow_run:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]

@@ -135,12 +135,11 @@ def parse_dt(v):
     return parse_dt_precision(v)[0]
 
 def resolve_reader():
-    for mod in ("integrations.google_sheets_service","core.integrations.google_sheets_service","google_sheets_service","core.google_sheets_service"):
-        try:
-            fn=getattr(importlib.import_module(mod),"read_range",None)
-            if callable(fn): return fn
-        except Exception: pass
-    return None
+    # Presentation formatting may hide a real intraday timestamp in _Status.
+    # Only audit readers change; the normal production Sheets reader is untouched.
+    from scripts.workflow_audit_support import resolve_audit_reader
+    return resolve_audit_reader()
+
 
 def resolve_registry():
     for mod in ("core.sheets.schema_registry","schema_registry","core.schema_registry","sheets.schema_registry"):

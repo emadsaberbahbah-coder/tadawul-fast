@@ -12,6 +12,19 @@ name: Provider Target Coverage Alert
 # Exit codes: 0 healthy/bootstrap · 1 coverage failure · 2 control-health.
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/provider_target_coverage.yml'
+      - 'scripts/audit_provider_target_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/provider_target_coverage.yml'
+      - 'scripts/audit_provider_target_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
   schedule:
     - cron: "20 6 * * *"   # after the morning sync legs write the pages
   workflow_dispatch:
@@ -37,7 +50,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  regression-tests:
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: |
+          python scripts/audit_provider_target_coverage.py --selftest
+          python -m unittest tests/test_workflow_audit_repairs.py -v
+
   audit:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -59,7 +86,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: provider_target_last_good.json
-          key: ptc-lastgood-${{ github.run_id }}
+          key: ptc-lastgood-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ptc-lastgood-
 
@@ -83,12 +110,32 @@ jobs:
             --observation-out provider_target_observation.json \
             --json-out provider_target_coverage.json
 
-      - name: Save last-good baseline
+      - name: Validate baseline before caching
+        id: baseline
         if: always()
+        run: |
+          python - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          report = Path("provider_target_coverage.json")
+          state = Path("provider_target_last_good.json")
+          eligible = False
+          if report.is_file() and state.is_file():
+              r = json.loads(report.read_text())
+              b = json.loads(state.read_text())
+              eligible = bool(b.get("pages")) and r.get("persist_status") == "written" and (
+                  r.get("exit_code") == 0 or (r.get("mode") == "accept" and r.get("exit_code") == 1)
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"save={'true' if eligible else 'false'}\n")
+          PYCODE
+
+      - name: Save last-good baseline
+        if: ${{ always() && steps.baseline.outputs.save == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: provider_target_last_good.json
-          key: ptc-lastgood-${{ github.run_id }}
+          key: ptc-lastgood-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload evidence
         if: always()
