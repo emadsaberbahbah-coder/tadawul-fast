@@ -3517,7 +3517,37 @@ if str(ROOT_DIR) not in sys.path:
 # family, explicitly out of scope). Tags avoid the reliability-scan
 # substrings. Zero removals; three sites replaced by the shared helper.
 # -----------------------------------------------------------------------------
-__version__ = "5.141.0"
+# WHY v5.142.0 (P-143 EQ-ROI BACKFILL WRITE-SITE SENTRY -- observe
+# instrumentation only):
+# The 2026-09-15 session pinned why the armed Render env
+# TFB_EQ_ROI_UNIT_SENTRY=observe produced ZERO tags: the v4.11.0 sentry
+# lives in core.enriched_quote.normalize_rows, which is OFF the daily
+# sync write path (sync -> /v1/analysis/sheet-rows -> routes/
+# analysis_sheet_rows -> this engine directly). The engine's own
+# backfills are the writers of the bare fraction-scale ROI cells the
+# sheet shows. This version ports the sentry to the ACTUAL write sites
+# as call-time-gated, countable attribution tags -- FOUR clusters, not
+# the one the 2026-09-15 pin named (correction owned on the commit
+# sheet): _phase_ii_quality_forecast's provider-12M branch, its
+# provider-3M branch, its full-synthesis block, and
+# _compute_scores_local_fallback's fallback block.
+# CONTRACT ADJUDICATION (2026-09-16, on the same-day export): the sheet
+# ROI columns store FRACTIONS under a percent NUMBER FORMAT; formatted
+# cells rendering "25.00%" prove the stored value is 0.25 (a stored
+# 25.0 would render "2,500.00%"); zero bare cells with |v|>1.5 exist
+# across all 9,791 market rows; the independent price/forecast/ROI
+# identity test passes value-wise on 9,399/9,653 rows reading
+# bare-as-fraction. Therefore the values these backfills write are
+# CORRECT and a x100 enforce at any sheet-bound path would corrupt
+# every percent-formatted destination (the same x100 hazard the
+# 2026-09-12 vNEXT premise check averted for Upside%/Percent Change).
+# P-101's residual is a DISPLAY FORMAT gap, owned GAS-side (Reformat
+# percent-format extension). Enforce mode here is DELIBERATELY tag-only
+# (observe + a per-row enforce_deferred marker) until that adjudication
+# is ever overturned in writing. Zero removals; one helper added;
+# default OFF is behavior-identical to v5.141.0.
+# -----------------------------------------------------------------------------
+__version__ = "5.142.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8252,14 +8282,17 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
             if row.get("expected_roi_12m") is None:
                 row["expected_roi_12m"] = round(return_12m, 6)
+                _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t12")
             if row.get("expected_roi_3m") is None:
                 fp3 = _as_float(row.get("forecast_price_3m"))
                 if fp3 is not None:
                     row["expected_roi_3m"] = round((fp3 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t12")
             if row.get("expected_roi_1m") is None:
                 fp1 = _as_float(row.get("forecast_price_1m"))
                 if fp1 is not None:
                     row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "t12")
         return
 
     # -------------------------------------------------------------------------
@@ -8300,14 +8333,17 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 row["forecast_price_12m"] = round(cp * (1.0 + derived_12m_return), 4)
             if row.get("expected_roi_3m") is None:
                 row["expected_roi_3m"] = round(return_3m, 6)
+                _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t3")
             if row.get("expected_roi_1m") is None:
                 fp1 = _as_float(row.get("forecast_price_1m"))
                 if fp1 is not None:
                     row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "t3")
             if row.get("expected_roi_12m") is None:
                 fp12 = _as_float(row.get("forecast_price_12m"))
                 if fp12 is not None:
                     row["expected_roi_12m"] = round((fp12 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t3")
         return
 
     intrinsic = _as_float(row.get("intrinsic_value"))
@@ -8413,8 +8449,11 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     row["forecast_price_3m"] = round(forecast_3m, 4)
     row["forecast_price_12m"] = round(forecast_12m, 4)
     row["expected_roi_1m"] = round(expected_1m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "synth")
     row["expected_roi_3m"] = round(expected_3m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "synth")
     row["expected_roi_12m"] = round(expected_12m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "synth")
     row["forecast_source"] = "phase_ii_synthetic"
 
     conf = 0.50
@@ -9672,6 +9711,29 @@ def _v573_append_warning(row: Dict[str, Any], tag: str) -> None:
         return
     parts.append(tag)
     row["warnings"] = "; ".join(parts)
+
+
+def _eq_roi_backfill_sentry_tag(row: Dict[str, Any], field: str, source: str) -> None:
+    """P-143 (v5.142.0): write-site attribution for engine-backfilled
+    expected_roi_* cells. Same gate env as core.enriched_quote's step-8c
+    sentry per the 2026-09-15 decision (the already-armed Render var
+    activates when this lands); read at CALL TIME, no boot line (the
+    FUND-SENTRY precedent). unset/off/other -> no-op, v5.141.0-identical.
+    observe -> one countable tag per field actually written:
+    eq_roi_backfill:<field>:<source>:observe. enforce -> deliberately
+    tag-only at this boundary (observe tags + one enforce_deferred marker
+    per row); see the WHY v5.142.0 block for the fraction-plus-number-
+    format contract proof that rules out a x100 rewrite here. Values are
+    never modified in any mode."""
+    try:
+        mode = str(os.getenv("TFB_EQ_ROI_UNIT_SENTRY", "") or "").strip().lower()
+    except Exception:
+        return
+    if mode not in ("observe", "enforce"):
+        return
+    _v573_append_warning(row, "eq_roi_backfill:%s:%s:observe" % (field, source))
+    if mode == "enforce":
+        _v573_append_warning(row, "eq_roi_backfill:enforce_deferred")
 
 
 # =============================================================================
@@ -14308,14 +14370,17 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
         fp1 = _as_float(row.get("forecast_price_1m"))
         if fp1 is not None and price:
             row["expected_roi_1m"] = round((fp1 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "fallback")
     if price is not None and row.get("expected_roi_3m") is None:
         fp3 = _as_float(row.get("forecast_price_3m"))
         if fp3 is not None and price:
             row["expected_roi_3m"] = round((fp3 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "fallback")
     if price is not None and row.get("expected_roi_12m") is None:
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "fallback")
 
     final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
     final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
