@@ -85,8 +85,11 @@ def test_observe_tags_without_mutation():
 def test_coherence_fires_on_0845_shape():
     r = copy.deepcopy(ROW_0845)
     tag = de._fund_coherence_sentry(r, "enforce")
-    assert tag == "fund_coherence_quarantined:profit_margin"
-    assert r["profit_margin"] is None
+    # v5.143.0 (P-146): the 100x signature is REPAIRED in enforce (0.33 ->
+    # 33.0 against implied ~33.0), no longer quarantined. The observe leg
+    # below is byte-identical to v5.140.0.
+    assert tag == "fund_coherence_repaired:profit_margin:x100"
+    assert abs(r["profit_margin"] - 33.0) < 1e-9
     r2 = copy.deepcopy(ROW_0845)
     tag2 = de._fund_coherence_sentry(r2, "observe")
     assert tag2 == "fund_coherence_quarantined:profit_margin:observe"
