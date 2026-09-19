@@ -3547,7 +3547,49 @@ if str(ROOT_DIR) not in sys.path:
 # is ever overturned in writing. Zero removals; one helper added;
 # default OFF is behavior-identical to v5.141.0.
 # -----------------------------------------------------------------------------
-__version__ = "5.142.0"
+# WHY v5.143.0 (P-146 FUND-SENTRY REPAIR LEG + MODE DISCLOSURE; same env
+# TFB_FUND_UNIT_SENTRY, off/observe byte-identical, enforce-only change):
+# The 2026-09-19 red-team adjudication pinned, against this file at HEAD
+# (sha 8e53a8f8) and the same-day export, that the Render env holds
+# "enforce" (operator paste) while the 09-10 arming record said "observe":
+# every fund_* tag on the export is the suffix-less enforce form, and the
+# tripwire's enforce branch had quarantined profit_margin to None on
+# 3,213 Global_Markets rows (48.6% of the page), 150 Market_Leaders rows
+# and all five US holdings. Implied margins recomputed from the export's
+# own market_cap / pe_ttm / revenue_ttm are PLAUSIBLE (2-100pp) on 3,075
+# of the 3,197 computable quarantined rows -- so the stored margin was
+# the off-scale side, in the 100x fraction class the DDI.US 08:45 golden
+# already documents. Root of the fraction: core/providers/
+# yahoo_fundamentals_provider.py L2179 emits profit_margin through
+# _as_fraction on the PRIMARY provider path, which v5.140.0's two
+# side-channel contracts (yahoo enrichment patch / eodhd fallback patch)
+# never see; the tripwire therefore met a correct-but-fraction value and
+# destroyed it instead of repairing it. The remaining 119 computable rows
+# have |implied| > 100pp -- unit-inconsistent inputs (e.g. IDR market
+# caps against thousands-scale revenue) where the benchmark itself is
+# garbage and a quarantine punishes a possibly-correct value.
+# FIX (enforce branch only; three-way verdict, disclosed by tag):
+#   * |implied| > _FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT (100): fail OPEN --
+#     value untouched, tag fund_coherence_skipped:profit_margin:implied_oob.
+#   * divergence ratio inside [_FUND_SENTRY_REPAIR_RATIO_LO, _HI] =
+#     [90, 110] (the 100x signature; vintage drift is tens of percent,
+#     never ~100x): REPAIR by x100 (stored is the fraction) or /100
+#     (stored is the 100x-inflated percent), accepted only if the repaired
+#     value then coheres (< 8x) -- tag
+#     fund_coherence_repaired:profit_margin:x100|d100.
+#   * anything else >= 8x: quarantine exactly as v5.140.0.
+#   observe keeps the v5.140.0 tag-only behaviour verbatim (byte-identical
+#   output); off is inert.
+# DISCLOSURE: the resolved sentry mode now prints in the [GUARDS] boot line
+# (fund_unit_sentry=off|observe|enforce) and in surface_gate_states() ->
+# health engine_gates["fund_unit_sentry"], so an arming is provable at
+# boot and in every health paste instead of only by tag-suffix forensics.
+# vNEXT (registered, not built here): convert the PRIMARY yahoo margin
+# fractions at canonicalization so the tripwire has nothing to repair.
+# Zero removals; five constants and two tags added; every existing tag
+# string unchanged. Rollback: git revert (env unchanged).
+# -----------------------------------------------------------------------------
+__version__ = "5.143.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3978,6 +4020,12 @@ _FUND_SENTRY_MARGIN_KEYS: Tuple[str, ...] = (
 _FUND_SENTRY_FRACTION_BOUND: float = 1.5
 _FUND_SENTRY_MARGIN_RATIO_MIN: float = 8.0
 _FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT: float = 2.0
+# v5.143.0 (P-146): repair leg + fail-open bound for the coherence tripwire.
+_FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT: float = 100.0
+_FUND_SENTRY_REPAIR_RATIO_LO: float = 90.0
+_FUND_SENTRY_REPAIR_RATIO_HI: float = 110.0
+_FUND_SENTRY_REPAIRED_TAG = "fund_coherence_repaired"  # substring-safe
+_FUND_SENTRY_SKIPPED_TAG = "fund_coherence_skipped"    # substring-safe
 
 
 def _fund_unit_sentry_mode() -> str:
@@ -4043,7 +4091,11 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
     economic disagreement (vintage drift is tens of percent, not 8x).
     enforce -> profit_margin quarantined to None + tag; observe -> tag only;
     off/incomplete inputs -> None. Never raises. The D/E leg was deliberately
-    cut -- see the WHY block."""
+    cut -- see the WHY block. v5.143.0 (P-146): in enforce the >= 8x branch
+    is a three-way verdict -- |implied| > 100pp fails OPEN (skipped tag),
+    a divergence inside the 100x band [90, 110] is REPAIRED (x100 / d100,
+    accepted only if the result coheres), anything else is quarantined as
+    before; observe output is byte-identical to v5.140.0."""
     if mode == "off" or not isinstance(row, dict):
         return None
     try:
@@ -4063,6 +4115,23 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
         if lo <= 0.0 or (hi / lo) < _FUND_SENTRY_MARGIN_RATIO_MIN:
             return None
         if mode == "enforce":
+            # v5.143.0 (P-146): three-way verdict -- see the WHY block.
+            if abs(implied) > _FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT:
+                return _FUND_SENTRY_SKIPPED_TAG + ":profit_margin:implied_oob"
+            _ratio = hi / lo
+            if (_FUND_SENTRY_REPAIR_RATIO_LO <= _ratio
+                    <= _FUND_SENTRY_REPAIR_RATIO_HI):
+                if abs(pm) < abs(implied):
+                    _repaired, _kind = round(pm * 100.0, 4), "x100"
+                else:
+                    _repaired, _kind = round(pm / 100.0, 4), "d100"
+                _r_hi = max(abs(_repaired), abs(implied))
+                _r_lo = min(abs(_repaired), abs(implied))
+                if _r_lo > 0.0 and (_r_hi / _r_lo) < \
+                        _FUND_SENTRY_MARGIN_RATIO_MIN:
+                    row["profit_margin"] = _repaired
+                    return (_FUND_SENTRY_REPAIRED_TAG + ":profit_margin:"
+                            + _kind)
             row["profit_margin"] = None
             return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin"
         return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin:observe"
@@ -5247,6 +5316,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "engine_fund_lkg_redis": _fund_lkg_redis_enabled(),        # v5.138.0
             "fund_lkg_redis_state": _fund_lkg_redis_state_label(),
             "fund_lkg_redis_stats": _fund_lkg_redis_stats(),
+            "fund_unit_sentry": _fund_unit_sentry_mode(),              # v5.143.0
         }
     except Exception:
         return {}
@@ -15206,7 +15276,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s",
+                "fund_lkg=%s fund_unit_sentry=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15220,6 +15290,7 @@ class DataEngineV5:
                 _g(_snapshot_poison_refusal_enabled),
                 _g(_final_action_invariant_enabled),
                 _g(_fund_lkg_enabled),
+                _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
             )
         except Exception:
             pass
