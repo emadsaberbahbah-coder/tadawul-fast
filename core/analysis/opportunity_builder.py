@@ -1082,7 +1082,46 @@ from datetime import datetime, timedelta, timezone
 # =1 restores the v1.19.5 copy byte-for-byte. Functions added: 1
 # (_ann_from_plan_roi). Removed: 0.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.19.6"
+# v1.20.0 (2026-09-19) — F-1b: COCKPIT QUALIFICATION ON THE PLAN-3M BASIS
+# (gate TFB_FORECAST_BASIS legacy|observe|plan3m — the SAME env F-1a armed
+# for portfolio_actions v1.12.0; default legacy = v1.19.6 byte-identical)
+# WHY (F-1 decision memo 2026-09-14, Emad: Option B "3M plan everywhere,
+# translated"; second specimen on the 2026-09-19 board): the two ROI gates
+# in evaluate_gates judge the 12M VALUATION upside (roi_pct = ref/price-1,
+# ann = that upside compounded as if it were a 3-month return) while the
+# board RENDERS the TP1 execution plan (_audit_align_plan_roi, the live
+# "plan" basis). On 2026-09-19: 18 of the 27 INVEST-verdict rows carried a
+# plan ROI below the panel's 12% while their valuation upside cleared it;
+# the KPI "Exp. Gain 12M" 19,474 SAR on two sizing-suspended seats equalled
+# ticket x the compounded-annualized plan (82.2%) rather than the TP1
+# payoff (P-141: 13,976 x 82.2% = 11,488 vs payoff 2,263).
+# FIX (three modes, read per call, no restart):
+#   legacy  — unset/anything else: every gate, note and gain byte-identical.
+#   observe — gates untouched; ONE countable "[f1b-observe]" tag per audit
+#             row (appended to failure_reason, blank for INVEST rows before)
+#             stating plan3m ROI vs the translated floor, "- FLIP" when the
+#             ROI+Ann gate outcome would change under plan3m, "- FLIP(strict)"
+#             under the strict 12%/period reading; tickets disclose
+#             "gain ann-basis X vs plan payoff Y" on the advisor note.
+#   plan3m  — the ROI gate judges the TP1 plan ROI against
+#             _f1b_required_roi_3m (default = required_roi_pct translated to
+#             the period, 12%/yr x 3/12 = 3.0%/3M, the F-1a translation;
+#             TFB_T10_REQ_ROI_3M_PCT overrides, e.g. 12 for strict), the
+#             Annualized ROI gate judges the plan ROI compounded over the
+#             period (_ann_from_plan_roi) against required_ann_roi_pct, and
+#             the ticket gain = suggested x plan ROI (TP1 payoff; the v1.0.23
+#             "exp_gain == suggested x ann" identity is DELIBERATELY broken
+#             in this mode — the payoff is the number the plan can deliver).
+#             No TP1 ladder -> the legacy gates evaluate (no ref -> the
+#             Valuation MAJOR gate already fails; never invents a plan).
+# Deliberate cuts: engine roi_3m fallback (the F-1b feeder) NOT plumbed — TP1
+# is the ladder midpoint to the reference, so a plan exists for every row
+# that has a valuation reference; rows without one fail closed upstream.
+# Selection/scoring order, sector caps, funding, rotation: byte-untouched in
+# every mode. Functions added: 3 (_f1b_basis, _f1b_required_roi_3m,
+# _f1b_plan_eval). Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.20.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -2058,6 +2097,57 @@ def _audit_align_plan_roi(rec, crit):
     except Exception:
         pass
     return rec
+
+
+def _f1b_basis():
+    """v1.20.0 [F-1b]: TFB_FORECAST_BASIS legacy(default)|observe|plan3m, read
+    per call — the F-1a gate of portfolio_actions v1.12.0 (same env, same
+    vocabulary, so one arming moves both legs in lockstep). Any other value
+    -> legacy (byte-identical). Never raises."""
+    try:
+        raw = str(_env_str("TFB_FORECAST_BASIS", "legacy")).strip().lower()
+        return raw if raw in ("observe", "plan3m") else "legacy"
+    except Exception:
+        return "legacy"
+
+
+def _f1b_required_roi_3m(crit):
+    """v1.20.0 [F-1b]: the plan-horizon ROI floor. Default = the panel's
+    required_roi_pct translated to the period (12%/yr x 3/12 = 3.0%/3M —
+    the translation F-1a adopted for the PF ADD gate); TFB_T10_REQ_ROI_3M_PCT
+    overrides (set 12 for the strict reading). Never raises."""
+    try:
+        ov = str(_env_str("TFB_T10_REQ_ROI_3M_PCT", "")).strip()
+        if ov:
+            return float(ov)
+        months = max(1, int((crit or {}).get("period_months") or 3))
+        base = float((crit or {}).get("required_roi_pct") or 12.0)
+        return round(base * months / 12.0, 2)
+    except Exception:
+        return 3.0
+
+
+def _f1b_plan_eval(cand, crit):
+    """v1.20.0 [F-1b] PURE: the plan-horizon view of the ROI / Annualized ROI
+    gates for one candidate — plan3m = the TP1 plan ROI (the ONE definition,
+    _tp1_plan_roi), ann = _ann_from_plan_roi over the panel period, floors =
+    _f1b_required_roi_3m (translated), required_roi_pct (strict) and
+    required_ann_roi_pct. Returns None when no plan exists (no TP1 ladder)
+    — never invents a number. Never raises."""
+    try:
+        p = _tp1_plan_roi(cand or {})
+        if p is None:
+            return None
+        req3 = _f1b_required_roi_3m(crit)
+        strict = float((crit or {}).get("required_roi_pct") or 12.0)
+        req_ann = float((crit or {}).get("required_ann_roi_pct") or 0.0)
+        ann = _ann_from_plan_roi(p, crit)
+        return {"plan3m": p, "ann": ann, "req3m": req3, "strict": strict,
+                "roi_ok": bool(p >= req3),
+                "strict_ok": bool(p >= strict),
+                "ann_ok": bool(ann is not None and ann >= req_ann)}
+    except Exception:
+        return None
 
 
 def _env_primary_roi_basis():
@@ -3411,17 +3501,33 @@ def evaluate_gates(cand, criteria, held_symbols=None):
                    cand["valuation_basis"] or "none",
                    "target_price or intrinsic_value present"))
 
-    roi_ok = (cand["roi_pct"] is not None and
-              cand["roi_pct"] >= criteria["required_roi_pct"])
-    g.append(_gate("ROI", roi_ok, FAIL_NON_CRITICAL,
-                   _round1(cand["roi_pct"]),
-                   ">= " + _fmt_num(criteria["required_roi_pct"]) + "%"))
+    # v1.20.0 [F-1b]: under TFB_FORECAST_BASIS=plan3m the two ROI gates
+    # judge the TP1 execution plan over the panel period (the basis the
+    # board already RENDERS); legacy and observe keep the v1.19.6 gates
+    # byte-identically (observe measures at the audit seam instead).
+    _f1b = (_f1b_plan_eval(cand, criteria) if _f1b_basis() == "plan3m"
+            else None)
+    if _f1b is not None:
+        g.append(_gate("ROI", _f1b["roi_ok"], FAIL_NON_CRITICAL,
+                       _round1(_f1b["plan3m"]),
+                       ">= " + _fmt_num(_f1b["req3m"]) + "% (plan3m)"))
+        g.append(_gate("Annualized ROI", _f1b["ann_ok"], FAIL_NON_CRITICAL,
+                       _round1(_f1b["ann"]),
+                       ">= " + _fmt_num(criteria["required_ann_roi_pct"])
+                       + "% (plan3m)"))
+    else:
+        roi_ok = (cand["roi_pct"] is not None and
+                  cand["roi_pct"] >= criteria["required_roi_pct"])
+        g.append(_gate("ROI", roi_ok, FAIL_NON_CRITICAL,
+                       _round1(cand["roi_pct"]),
+                       ">= " + _fmt_num(criteria["required_roi_pct"]) + "%"))
 
-    ann_ok = (cand["ann_roi_pct"] is not None and
-              cand["ann_roi_pct"] >= criteria["required_ann_roi_pct"])
-    g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
-                   _round1(cand["ann_roi_pct"]),
-                   ">= " + _fmt_num(criteria["required_ann_roi_pct"]) + "%"))
+        ann_ok = (cand["ann_roi_pct"] is not None and
+                  cand["ann_roi_pct"] >= criteria["required_ann_roi_pct"])
+        g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
+                       _round1(cand["ann_roi_pct"]),
+                       ">= " + _fmt_num(criteria["required_ann_roi_pct"])
+                       + "%"))
 
     # v1.0.4 [VALUATION-SANITY-GATE]: the ticket roi_pct is pure valuation
     # upside (ref/price); upstream the engine's intrinsic-value model permits
@@ -4590,6 +4696,19 @@ def _build_ticket(rank, pick, criteria, review_date):
                         - 1.0) * 100.0)
                if _plan_roi > -100.0 else 0.0) or 0.0
         exp_gain = round(suggested * ann / 100.0, 0)
+        # v1.20.0 [F-1b / P-141]: plan3m -> the ticket gain is the TP1 payoff
+        # over the plan horizon (suggested x plan ROI), not the compounded-
+        # annualized figure; observe discloses both on the advisor note;
+        # legacy byte-identical.
+        _f1b_mode = _f1b_basis()
+        if _f1b_mode == "plan3m":
+            exp_gain = round(suggested * _plan_roi / 100.0, 0)
+        elif _f1b_mode == "observe":
+            note = note + (" [f1b-observe] gain ann-basis "
+                           + _fmt_sar(round(suggested * ann / 100.0, 0))
+                           + " vs plan payoff "
+                           + _fmt_sar(round(suggested * _plan_roi / 100.0,
+                                            0)) + ".")
     if _ticket_engine_primary:
         ann = _round1(engine_pct) or 0.0
         exp_gain = round(suggested * ann / 100.0, 0)
@@ -5202,6 +5321,37 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                             _nm["current"] = str(_nm.get("current") or "") + _txt
         except Exception:  # noqa: BLE001 - the layer is additive, never fatal
             _fp_plans = []
+    # v1.20.0 [F-1b] observe: ONE countable tag per audit row — the plan-3M
+    # view of the two ROI gates beside the legacy verdict; "- FLIP" marks a
+    # row whose ROI+Ann gate outcome would change under plan3m (translated
+    # floor), "- FLIP(strict)" under the strict 12%/period reading. Runs
+    # AFTER selection/deferrals: gates, verdicts, picks and deferral text are
+    # byte-untouched; legacy/plan3m -> this block is inert.
+    if _f1b_basis() == "observe":
+        for _rec in audit:
+            try:
+                _ev = _f1b_plan_eval(_rec.get("_cand") or {}, crit)
+                _lg = {str(_g.get("gate")): bool(_g.get("passed"))
+                       for _g in (_rec.get("gates") or [])}
+                _legacy_ok = bool(_lg.get("ROI")) and \
+                    bool(_lg.get("Annualized ROI"))
+                if _ev is None:
+                    _tag = "[f1b-observe] plan3m DATA_GAP"
+                else:
+                    _plan_ok = bool(_ev["roi_ok"] and _ev["ann_ok"])
+                    _strict_ok = bool(_ev["strict_ok"] and _ev["ann_ok"])
+                    _tag = ("[f1b-observe] plan3m " + _fmt_num(_ev["plan3m"])
+                            + "% vs " + _fmt_num(_ev["req3m"]) + "%/"
+                            + str(max(1, int(crit.get("period_months") or 3)))
+                            + "M"
+                            + (" - FLIP" if _plan_ok != _legacy_ok else "")
+                            + (" - FLIP(strict)"
+                               if _strict_ok != _legacy_ok else ""))
+                _fr = _rec.get("failure_reason")
+                _rec["failure_reason"] = ((str(_fr) + " | ") if _fr else "") \
+                    + _tag
+            except Exception:  # noqa: BLE001 — observe is additive, never fatal
+                pass
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
