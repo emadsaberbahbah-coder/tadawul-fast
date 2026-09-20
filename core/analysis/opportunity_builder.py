@@ -1182,7 +1182,42 @@ from datetime import datetime, timedelta, timezone
 # Removed: 0.
 # Rollback: env unset (no deploy) or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.21.0"
+# -----------------------------------------------------------------------------
+# v1.22.0 [CASH-FLOOR-PCT] — the board honours the portfolio's cash floor
+# (register P-148, adjudicated 2026-09-19/20; Build #2 of 2026-09-20).
+# WHY: Portfolio_Decision reserves 10% of NAV (cash_floor=9,372 on
+# 2026-09-20: 10% x (holdings 68,957 + cash 24,764)) and exposes
+# deployable 15,392 SAR, while this builder sized the same wallet at the
+# full 24,764 — one wallet, two capital policies; on an executable day the
+# rank-1 ticket is sized up to 9,372 SAR over the floor the operator set.
+# The v1.16.0 absolute reserve (TFB_OPP_CASH_FLOOR_SAR, unset in
+# production) also only shrank cash_left and the reported deployable —
+# the sizing budget `remaining` was still the pre-reserve figure.
+# FIX (gate TFB_OPP_CASH_FLOOR_PCT, read per call, no restart):
+#   unset   — byte-identical v1.21.0: no reserve, no alert, no meta key.
+#   set     — floor_sar = max(absolute reserve, pct% x NAV), NAV = holdings
+#             value + cash (the PF page's basis; pending proceeds excluded).
+#     TFB_OPP_CASH_FLOOR_MODE=observe (default): selection, sizing, funding
+#             and KPIs untouched; ONE countable "cash_floor" alert states
+#             the floor, the deployable before/after, and how many of the
+#             sized seats (and how many SAR) would lose funding under it;
+#             meta.cash_floor carries the same numbers.
+#     TFB_OPP_CASH_FLOOR_MODE=enforce: the reserve is taken from cash
+#             BEFORE sizing — cash_left, the reported deployable AND the
+#             sizing budget `remaining` all honour it; tail seats read the
+#             existing "Unfunded ... capital exhausted" / min-ticket-floor
+#             semantics; funds_from can never name the reserve.
+# Deliberate cuts: budget_base (NAV incl. proceeds, the per-position cap
+# denominator) is unchanged — a reserve does not shrink NAV; the
+# absolute-only path (pct unset) stays byte-identical, its own remaining
+# gap is closed only when the pct gate is enforced (disclosed here); the
+# PF page's Target Cash % is not plumbed into the request — the pct is an
+# ENV mirror of that panel (10) until the cockpit sends it. Functions
+# added: 5 (_env_cash_floor_pct, _env_cash_floor_mode,
+# _cash_floor_pct_ctx, _cash_floor_finalize, _cash_floor_alert_text).
+# Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.22.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -4358,6 +4393,108 @@ def _cash_floor_sar() -> float:
         return 0.0
 
 
+# -----------------------------------------------------------------------------
+# v1.22.0 [CASH-FLOOR-PCT] helpers — see the header WHY block. Pure.
+# -----------------------------------------------------------------------------
+_LAST_CASH_FLOOR = {"mode": "off", "pct": None, "nav_sar": 0.0,
+                    "pct_floor_sar": 0.0, "abs_floor_sar": 0.0,
+                    "floor_sar": 0.0, "deployable_pre_sar": 0.0,
+                    "deployable_post_sar": 0.0, "seats_sized": 0,
+                    "would_unfund_seats": 0, "would_unfund_sar": 0.0}
+
+
+def _env_cash_floor_pct():
+    """TFB_OPP_CASH_FLOOR_PCT: percent of NAV to reserve (e.g. 10). Unset
+    or blank => None (gate off). Invalid / out of (0, 100) => None, logged."""
+    raw = (os.getenv("TFB_OPP_CASH_FLOOR_PCT") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw.replace(",", "").rstrip("%"))
+        if 0.0 < v < 100.0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    try:
+        _LOG.warning("[CASH-FLOOR-PCT] CONFIG INVALID: %r is not a percent "
+                     "in (0, 100) - floor INACTIVE; fix "
+                     "TFB_OPP_CASH_FLOOR_PCT", raw)
+    except Exception:
+        pass
+    return None
+
+
+def _env_cash_floor_mode():
+    v = (os.getenv("TFB_OPP_CASH_FLOOR_MODE") or "observe").strip().lower()
+    return "enforce" if v == "enforce" else "observe"
+
+
+def _cash_floor_pct_ctx(pf, deployable, abs_floor):
+    """Per-build floor context. NAV = holdings value + cash (the PF page's
+    basis). floor_sar = the stricter of the absolute reserve and pct x NAV.
+    Resets and fills _LAST_CASH_FLOOR. Pure; never raises."""
+    pct = _env_cash_floor_pct()
+    cash = float(pf.get("cash") or 0.0)
+    nav = float(pf.get("portfolio_value") or 0.0) + cash
+    ctx = {"mode": "off", "pct": pct, "nav_sar": round(nav, 0),
+           "pct_floor_sar": 0.0, "abs_floor_sar": round(float(abs_floor or 0.0), 2),
+           "floor_sar": round(float(abs_floor or 0.0), 2),
+           "deployable_pre_sar": round(float(deployable), 0),
+           "deployable_post_sar": round(float(deployable), 0),
+           "seats_sized": 0, "would_unfund_seats": 0, "would_unfund_sar": 0.0}
+    if pct is not None:
+        ctx["mode"] = _env_cash_floor_mode()
+        ctx["pct_floor_sar"] = round(nav * pct / 100.0, 2)
+        ctx["floor_sar"] = max(ctx["abs_floor_sar"], ctx["pct_floor_sar"])
+        ctx["deployable_post_sar"] = round(
+            max(0.0, float(deployable) - min(cash, ctx["floor_sar"])), 0)
+    _LAST_CASH_FLOOR.clear()
+    _LAST_CASH_FLOOR.update(ctx)
+    return ctx
+
+
+def _cash_floor_finalize(ctx, picked):
+    """observe read-back: walk the sized seats in selection order and count
+    those whose cumulative suggested SAR would exceed the post-floor
+    deployable (the seats that would lose funding under enforce). Pure."""
+    ctx["seats_sized"] = len(picked)
+    if ctx.get("mode") != "observe":
+        _LAST_CASH_FLOOR.update(ctx)
+        return ctx
+    post = float(ctx.get("deployable_post_sar") or 0.0)
+    cum, seats, short = 0.0, 0, 0.0
+    for p in picked:
+        # reproducibility contract (as exp_gain): the DISPLAYED rounded
+        # ticket size is the basis, so the sheet can re-verify the count.
+        s = round(float(p.get("suggested_sar") or 0.0), 0)
+        cum += s
+        if s > 0 and cum > post + 0.5:
+            seats += 1
+            short += min(s, cum - post)
+    ctx["would_unfund_seats"] = seats
+    ctx["would_unfund_sar"] = round(short, 0)
+    _LAST_CASH_FLOOR.update(ctx)
+    return ctx
+
+
+def _cash_floor_alert_text(ctx):
+    head = ("Cash floor %s%% of NAV %s = %s" % (
+        _fmt_num(ctx.get("pct")), _fmt_sar(ctx.get("nav_sar")),
+        _fmt_sar(ctx.get("floor_sar"))))
+    if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
+        head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
+    if ctx.get("mode") == "enforce":
+        return (head + " ENFORCED: deployable %s (reserve kept out of sizing "
+                "and funding)." % _fmt_sar(ctx.get("deployable_post_sar")))
+    return (head + " (observe): deployable would fall %s -> %s; %d of %d "
+            "sized seat(s) would lose funding (%s). No ticket changed."
+            % (_fmt_sar(ctx.get("deployable_pre_sar")),
+               _fmt_sar(ctx.get("deployable_post_sar")),
+               int(ctx.get("would_unfund_seats") or 0),
+               int(ctx.get("seats_sized") or 0),
+               _fmt_sar(ctx.get("would_unfund_sar"))))
+
+
 def _sector_cap_basis() -> str:
     """v1.0.24: 'budget' (default) -> sector-weight checks divide by
     budget_base = portfolio_value + deployable; 'legacy' -> v1.0.23
@@ -4774,10 +4911,18 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     budget_base = pf["portfolio_value"] + deployable
     remaining = deployable
     cash_left, proceeds_left = pf["cash"], pf["proceeds"]
+    # v1.22.0 [CASH-FLOOR-PCT]: NAV-percent reserve (the PF page's 10%
+    # basis). Unset => byte-identical v1.21.0. Under enforce the stricter
+    # of absolute / percent is the reserve AND the sizing budget honours it.
+    _cf = _cash_floor_pct_ctx(pf, deployable, _floor)
+    if _cf["mode"] == "enforce" and _cf["floor_sar"] > 0:
+        _floor = _cf["floor_sar"]
     if _floor > 0:  # v1.16.0: absolute reserve, never funded from
         _res = min(cash_left, _floor)
         cash_left -= _res
         deployable = max(0.0, deployable - _res)
+        if _cf["mode"] == "enforce":
+            remaining = max(0.0, remaining - _res)
 
     sector_counts, market_counts = {}, {}
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
@@ -4924,6 +5069,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                        "funds_from": funds_label})
         if issuer_dedup:
             funded_issuers[_ikey] = cand["symbol"]
+    _cash_floor_finalize(_cf, picked)  # v1.22.0 observe read-back
     return picked, deferrals, deployable, remaining
 
 
@@ -5828,6 +5974,14 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     ". Qualified names are shown regardless of cash; funding is "
                     "the operator's decision."),
             })
+    # v1.22.0 [CASH-FLOOR-PCT]: ONE countable alert per build when armed.
+    if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
+        alerts.append({
+            "type": "cash_floor",
+            "count": int(_LAST_CASH_FLOOR.get("would_unfund_seats") or 0)
+            if _LAST_CASH_FLOOR.get("mode") == "observe" else 1,
+            "required_action": _cash_floor_alert_text(_LAST_CASH_FLOOR),
+        })
     # v1.21.0 [PRICE-XCHECK]: ONE countable alert per build (observe/enforce).
     if _XCHECK_STATE.get("mode") in ("observe", "enforce") and \
             (_XCHECK_STATE.get("fetched") or _XCHECK_STATE.get("budget")):
@@ -5919,6 +6073,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # armed — off keeps the payload byte-identical to v1.20.0.
     if _XCHECK_STATE.get("mode") in ("observe", "enforce"):
         meta["price_xcheck"] = dict(_XCHECK_STATE)
+    if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
+        meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,
