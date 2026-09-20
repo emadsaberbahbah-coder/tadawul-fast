@@ -592,6 +592,7 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 # =============================================================================
@@ -1121,7 +1122,67 @@ from datetime import datetime, timedelta, timezone
 # every mode. Functions added: 3 (_f1b_basis, _f1b_required_roi_3m,
 # _f1b_plan_eval). Removed: 0. Rollback: env unset (no deploy) or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.20.0"
+# -----------------------------------------------------------------------------
+# v1.21.0 [PRICE-XCHECK] — second-source price verification for the seats
+# (register: accuracy gap 1, 2026-09-20; owner Claude; GO by Emad same day).
+# WHY: every ticket's entry zone, stop, TP1/TP2, shares and R/R are derived
+# from ONE price — the sheet's "Current Price", a single provider (yahoo_chart)
+# possibly preserved from an earlier run. The W-2 freshness gate proves the
+# quote's AGE, not its VALUE; nothing in the pipeline compares the seat price
+# against an independent source. Emad's standing trade rule ("entry price
+# verified by more than one independent method before ordering") was applied
+# by hand in every GO verdict (HCI/1321.SR class). The 2026-09-20 red-team
+# review rated every market page "prices not independently verified".
+# FIX (gate TFB_T10_PRICE_XCHECK, read per call, no restart):
+#   off     — default/unset/anything else: byte-identical v1.20.0 behaviour;
+#             not one network call, not one note, not one alert.
+#   observe — for each candidate that reaches SIZING in _select_and_size
+#             (i.e. only the <= max_selected seats plus xcheck-deferred
+#             re-tries — never the audit grid), fetch ONE independent quote
+#             (EODHD /real-time, direct httpx call, provider's key/base
+#             env resolution — nothing new to arm on Render) and compare
+#             it with cand.price: |delta| <= TFB_T10_PRICE_XCHECK_TOL_PCT
+#             (1.0) => verified; else diverge; no/failed/late quote =>
+#             single_source; past TFB_T10_PRICE_XCHECK_MAX_FETCH (15) or
+#             TFB_T10_PRICE_XCHECK_BUDGET_S (20s) => budget. Selection,
+#             sizing, funding, verdicts, gates, KPIs: byte-identical to off.
+#             Read-back: "[price-xcheck observe] ..." on every ticket's
+#             advisor note, detail.price_xcheck on every ticket, ONE countable
+#             "price_xcheck" alert and meta.price_xcheck per build.
+#   enforce — as observe, PLUS a divergent seat is DEFERRED before sizing
+#             with the countable reason "PRICE_XCHECK DIVERGE ..." (near-miss
+#             gate "Price Verification"), and the seat passes to the next
+#             candidate; TFB_T10_PRICE_XCHECK_STRICT=1 also defers
+#             single_source/budget seats (fail-closed). Default STRICT=0:
+#             a provider outage never blanks the board (fail-open, tagged).
+# Symbol mapping: core.symbols.normalize.to_eodhd_symbol when importable,
+# then eodhd_provider's own alias table mirrored verbatim (.L->.LSE ...).
+# Network hygiene: per-call timeout TFB_T10_PRICE_XCHECK_TIMEOUT_S (4s),
+# per-build cache by symbol, sequential calls (no event-loop entry — the
+# async provider client is deliberately NOT used from this sync path,
+# P-110 loop class), every exception swallowed into single_source.
+# Harness seam: _XCHECK_FETCH_OVERRIDE (callable(symbol, timeout_s)) lets
+# the REAL builder run end-to-end on recorded quote payloads.
+# Read-back visibility: an enforce deferral ALWAYS shows in the audit grid
+# Deferral column; it reaches the NEAR MISS table under the existing
+# depth-order/near_miss_n rule (same as sector-cap deferrals). STRICT=1
+# during a total second-source outage defers EVERY reachable INVEST row
+# (one countable reason each, budget verdicts after MAX_FETCH) — a 0-seat
+# board by design; the alert states the counts.
+# Deliberate cuts: holdings (Portfolio_Decision) are portfolio_actions'
+# surface, not this file's; the freshness gate is untouched (age and value
+# are different questions); no second-source PRICE is written back — the
+# sheet price stays the single rendered price, the check is disclosure +
+# (enforce) a deferral. Functions added: 12 (_env_xcheck_mode,
+# _env_xcheck_tol_pct, _env_xcheck_strict, _env_xcheck_max_fetch,
+# _env_xcheck_timeout_s, _env_xcheck_budget_s, _xcheck_eodhd_symbol,
+# _xcheck_parse_quote, _xcheck_fetch_eodhd, _xcheck_reset, _price_xcheck,
+# _xcheck_should_defer, _xcheck_fmt_px, _xcheck_summary_text) = 14 named
+# (+2 nested: _f in the parser, _canon in the mapper) = 16 AST defs.
+# Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.21.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -3128,6 +3189,268 @@ def _env_freshness_fallback_h():
         return 78.0
 
 
+# -----------------------------------------------------------------------------
+# v1.21.0 [PRICE-XCHECK] helpers — see the header WHY block. Pure except the
+# network leg (_xcheck_fetch_eodhd), which is budgeted and never raises.
+# -----------------------------------------------------------------------------
+_XCHECK_MODES = ("off", "observe", "enforce")
+_XCHECK_FETCH_OVERRIDE = None  # harness seam: callable(symbol, timeout_s)
+_XCHECK_STATE = {"mode": "off", "fetched": 0, "verified": 0, "diverge": 0,
+                 "single_source": 0, "budget": 0, "deferred": 0,
+                 "tol_pct": 1.0, "source": "eodhd", "elapsed_s": 0.0}
+_XCHECK_CACHE = {}
+# Mirrors eodhd_provider._EODHD_SUFFIX_CANONICAL (v4.7.0 ISSUE-D) verbatim so
+# the check hits the SAME EODHD code the fundamentals leg uses; nothing else
+# is invented here (an unsupported venue simply reads single_source).
+_XCHECK_SUFFIX_CANONICAL = {".L": ".LSE", ".XETR": ".XETRA", ".ETR": ".XETRA",
+                            ".TASE": ".TA"}
+
+
+def _env_xcheck_mode():
+    v = (os.getenv("TFB_T10_PRICE_XCHECK") or "off").strip().lower()
+    return v if v in _XCHECK_MODES else "off"
+
+
+def _env_xcheck_tol_pct():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_TOL_PCT") or 1.0)
+        return v if v > 0 else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _env_xcheck_strict():
+    return (os.getenv("TFB_T10_PRICE_XCHECK_STRICT") or "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_xcheck_max_fetch():
+    try:
+        v = int(float(os.getenv("TFB_T10_PRICE_XCHECK_MAX_FETCH") or 15))
+        return v if v > 0 else 15
+    except (TypeError, ValueError):
+        return 15
+
+
+def _env_xcheck_timeout_s():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_TIMEOUT_S") or 4.0)
+        return v if v > 0 else 4.0
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def _env_xcheck_budget_s():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_BUDGET_S") or 20.0)
+        return v if v > 0 else 20.0
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _xcheck_eodhd_symbol(symbol):
+    """Sheet (Yahoo-style) symbol -> EODHD code, provider-consistent: the
+    repo's canonical mapper (core.symbols.normalize.to_eodhd_symbol) when
+    importable, then the provider's own alias table (.L -> .LSE ...);
+    identity for FX/futures/crypto shapes. Pure; never raises."""
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+
+    def _canon(x):
+        if "." not in x:
+            return x
+        base, sfx = x.rsplit(".", 1)
+        return base + _XCHECK_SUFFIX_CANONICAL.get("." + sfx, "." + sfx)
+    try:
+        from core.symbols.normalize import to_eodhd_symbol  # type: ignore
+        m = to_eodhd_symbol(s)
+        if isinstance(m, str) and m.strip():
+            return _canon(m.strip().upper())
+    except Exception:
+        pass
+    if "=" in s or "-" in s or "^" in s or "/" in s:
+        return s
+    if "." in s:
+        return _canon(s)
+    return s + ".US"
+
+
+def _xcheck_parse_quote(payload):
+    """EODHD /real-time JSON -> (price, ts_iso, prev_close) or None. "NA"
+    strings, non-numeric or non-positive prices => None. Pure."""
+    if not isinstance(payload, dict):
+        return None
+
+    def _f(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, str) and v.strip().upper() in ("", "NA", "N/A"):
+                return None
+            f = float(v)
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+    px = _f(payload.get("close"))
+    if px is None or px <= 0:
+        return None
+    ts = None
+    t = _f(payload.get("timestamp"))
+    if t is not None and t > 0:
+        try:
+            ts = datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            ts = None
+    return px, ts, _f(payload.get("previousClose"))
+
+
+def _xcheck_fetch_eodhd(symbol, timeout_s):
+    """Network leg: ONE EODHD real-time quote. Returns the parsed tuple or
+    None; never raises. Direct synchronous HTTP on purpose: the async
+    provider client must not be entered from this sync builder path (P-110
+    loop class). Key/base mirror the repo provider's env resolution."""
+    # Same key/base resolution as core/providers/eodhd_provider (v4.18.0):
+    # EODHD_API_KEY | EODHD_API_TOKEN | EODHD_KEY; EODHD_BASE_URL override.
+    key = (os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN")
+           or os.getenv("EODHD_KEY") or "").strip()
+    code = _xcheck_eodhd_symbol(symbol)
+    if not key or not code:
+        return None
+    base = (os.getenv("EODHD_BASE_URL")
+            or "https://eodhistoricaldata.com/api").strip().rstrip("/")
+    url = base + "/real-time/" + code
+    params = {"api_token": key, "fmt": "json"}
+    try:
+        import httpx  # type: ignore
+    except Exception:
+        httpx = None
+    try:
+        if httpx is not None:
+            with httpx.Client(timeout=timeout_s) as _c:
+                r = _c.get(url, params=params)
+                if r.status_code != 200:
+                    return None
+                return _xcheck_parse_quote(r.json())
+        import urllib.parse
+        import urllib.request
+        req = urllib.request.Request(
+            url + "?" + urllib.parse.urlencode(params),
+            headers={"User-Agent": "tfb-price-xcheck/1.21.0"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            return _xcheck_parse_quote(
+                json.loads(resp.read().decode("utf-8", "replace")))
+    except Exception:
+        return None
+
+
+def _xcheck_reset(mode):
+    """Per-build reset of the xcheck counters and quote cache."""
+    _XCHECK_STATE.update({"mode": mode, "fetched": 0, "verified": 0,
+                          "diverge": 0, "single_source": 0, "budget": 0,
+                          "deferred": 0, "tol_pct": _env_xcheck_tol_pct(),
+                          "source": "eodhd", "elapsed_s": 0.0})
+    _XCHECK_CACHE.clear()
+
+
+def _price_xcheck(cand, ctx):
+    """Second-source comparison for ONE seat candidate. Returns the xcheck
+    dict (also stashed on cand["_price_xcheck"] for the ticket/audit).
+    Fail-open by construction: a missing, failed or late second source is
+    single_source (or budget), never a divergence. Never raises."""
+    sym = str(cand.get("symbol") or "").strip()
+    primary = cand.get("price")
+    try:
+        primary = float(primary) if primary is not None else None
+    except (TypeError, ValueError):
+        primary = None
+    xc = {"mode": ctx["mode"], "source": "eodhd", "symbol": sym,
+          "primary": primary, "secondary": None, "secondary_ts": None,
+          "delta_pct": None, "tol_pct": ctx["tol_pct"], "verdict": "skipped",
+          "text": "skipped (no primary price)"}
+    if primary is None or primary <= 0:
+        cand["_price_xcheck"] = xc
+        return xc
+    st = _XCHECK_STATE
+    q = _XCHECK_CACHE.get(sym, "MISS")
+    if q == "MISS":
+        if st["fetched"] >= ctx["max_fetch"] or \
+                st["elapsed_s"] >= ctx["budget_s"]:
+            xc["verdict"] = "budget"
+            st["budget"] += 1
+            xc["text"] = ("budget: %d fetches / %.1fs used \u2014 unverified"
+                          % (st["fetched"], st["elapsed_s"]))
+            cand["_price_xcheck"] = xc
+            return xc
+        t0 = time.monotonic()
+        try:
+            q = ctx["fetch_fn"](sym, ctx["timeout_s"])
+        except Exception:
+            q = None
+        st["fetched"] += 1
+        st["elapsed_s"] = round(st["elapsed_s"] +
+                                max(0.0, time.monotonic() - t0), 3)
+        _XCHECK_CACHE[sym] = q
+    if not q or q[0] is None or q[0] <= 0:
+        xc["verdict"] = "single_source"
+        st["single_source"] += 1
+        xc["text"] = "single-source: eodhd quote unavailable"
+        cand["_price_xcheck"] = xc
+        return xc
+    sec, ts, _pc = q
+    delta = (float(sec) / primary - 1.0) * 100.0
+    xc.update({"secondary": _round4(sec), "secondary_ts": ts,
+               "delta_pct": round(delta, 2)})
+    if abs(delta) <= ctx["tol_pct"]:
+        xc["verdict"] = "verified"
+        st["verified"] += 1
+        xc["text"] = ("verified: eodhd %s vs sheet %s, \u0394%+.2f%% (tol %.1f%%)"
+                      % (_xcheck_fmt_px(sec), _xcheck_fmt_px(primary),
+                         delta, ctx["tol_pct"]))
+    else:
+        xc["verdict"] = "diverge"
+        st["diverge"] += 1
+        xc["text"] = ("DIVERGE \u0394%+.2f%%: eodhd %s vs sheet %s (tol %.1f%%)"
+                      % (delta, _xcheck_fmt_px(sec), _xcheck_fmt_px(primary),
+                         ctx["tol_pct"]))
+    cand["_price_xcheck"] = xc
+    return xc
+
+
+def _xcheck_should_defer(xc, strict):
+    """enforce semantics: diverge always defers; single_source/budget defer
+    only under STRICT. verified/skipped never defer. Pure."""
+    v = (xc or {}).get("verdict")
+    if v == "diverge":
+        return True
+    return bool(strict) and v in ("single_source", "budget")
+
+
+def _xcheck_fmt_px(v):
+    """Price text for the xcheck note: 2 dp (4 dp below 1.0) so a 0.03
+    difference is visible (never the 1-dp _fmt_num rendering)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    return ("%.4f" % f) if abs(f) < 1.0 else ("%.2f" % f)
+
+
+def _xcheck_summary_text():
+    st = _XCHECK_STATE
+    tail = (" Enforce: %d seat(s) deferred." % st["deferred"]
+            if st["mode"] == "enforce" else
+            " Observe: no ticket changed.")
+    return ("Second-source price check (eodhd, mode %s, tol %.1f%%): "
+            "verified %d, diverge %d, single-source %d, budget %d of %d "
+            "fetched in %.1fs.%s"
+            % (st["mode"], st["tol_pct"], st["verified"], st["diverge"],
+               st["single_source"], st["budget"], st["fetched"],
+               st["elapsed_s"], tail))
+
+
 # v1.5.0: official authority FAIL list — compiled default (Al-Rajhi Q1-2026,
 # as_of 2026-03-31; quarterly refresh via env or the next authority upload).
 _KSA_AUTHORITY_FAIL_DEFAULT = (
@@ -4460,6 +4783,15 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
+    # v1.21.0 [PRICE-XCHECK]: per-build context, env read per call.
+    _xc_mode = _env_xcheck_mode()
+    _xcheck_reset(_xc_mode)
+    _xc_ctx = {"mode": _xc_mode, "tol_pct": _env_xcheck_tol_pct(),
+               "strict": _env_xcheck_strict(),
+               "max_fetch": _env_xcheck_max_fetch(),
+               "timeout_s": _env_xcheck_timeout_s(),
+               "budget_s": _env_xcheck_budget_s(),
+               "fetch_fn": _XCHECK_FETCH_OVERRIDE or _xcheck_fetch_eodhd}
     # v1.0.16: issuer-level cross-listing dedup (default OFF).
     issuer_dedup = bool(criteria.get("issuer_dedup_enabled", False))
     funded_issuers = {}
@@ -4507,6 +4839,20 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             deferrals[cand["symbol"]] = (
                 "Diversification: market cap reached (" + mkt + ")")
             continue
+        # v1.21.0 [PRICE-XCHECK]: the seat's sheet price is compared with an
+        # independent second source BEFORE sizing. off => skipped
+        # (byte-identical v1.20.0); observe => tag only; enforce => a
+        # divergent seat (or, under STRICT, an unverifiable one) is DEFERRED
+        # with a countable reason and the seat passes to the next candidate.
+        # Gates, verdicts and the audit grid are untouched in every mode.
+        if _xc_mode != "off":
+            _xc = _price_xcheck(cand, _xc_ctx)
+            if _xc_mode == "enforce" and \
+                    _xcheck_should_defer(_xc, _xc_ctx["strict"]):
+                _XCHECK_STATE["deferred"] += 1
+                deferrals[cand["symbol"]] = (
+                    "PRICE_XCHECK " + _xc["text"] + " \u2014 sizing deferred")
+                continue
         suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
         # name out (allocation buys >= 1 share but < 1 lot), say so honestly
@@ -4739,6 +5085,14 @@ def _build_ticket(rank, pick, criteria, review_date):
                            + _fmt_num(_round1(engine_pct))
                            + "% \u2014 the upside shown is a valuation target, "
                            "not a forecast.")
+    # v1.21.0 [PRICE-XCHECK]: disclose the second-source result on the
+    # ticket note (observe + enforce). off => no text (byte-identical).
+    _xc_t = cand.get("_price_xcheck")
+    if isinstance(_xc_t, dict) and _xc_t.get("mode") in ("observe", "enforce"):
+        note = note + (" [price-xcheck " + str(_xc_t.get("mode")) + "] " +
+                       str(_xc_t.get("text") or ""))
+    else:
+        _xc_t = None
     ticket = {
         "rank": rank,
         "symbol": cand["symbol"],
@@ -4819,6 +5173,11 @@ def _build_ticket(rank, pick, criteria, review_date):
         ticket["primary_roi_basis"] = ("plan" if _ticket_plan_primary
                                        else "valuation")
     _annotate_cost_edge(ticket, suggested)  # v1.1.0 net-edge stamp (env-gated)
+    if _xc_t:
+        ticket["detail"]["price_xcheck"] = {
+            k: _xc_t.get(k) for k in ("mode", "verdict", "primary",
+                                      "secondary", "secondary_ts",
+                                      "delta_pct", "tol_pct", "source")}
     return ticket
 
 
@@ -4883,6 +5242,18 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
                 note = ("Qualified (INVEST) \u2014 a higher-ranked listing of "
                         "this issuer is already funded; this is a cross-listing "
                         "of the same company, not a separate position.")
+            elif "PRICE_XCHECK" in _reason:
+                # v1.21.0: an enforce-mode xcheck deferral is a PRICE
+                # VERIFICATION near-miss — classify it distinctly (same bug
+                # class as the v1.0.15 floor / v1.0.17 duplicate fixes).
+                gate, cur, req = "Price Verification", _reason, (
+                    "second-source quote within " +
+                    _fmt_num(_XCHECK_STATE.get("tol_pct") or 1.0) +
+                    "% of the sheet price")
+                note = ("Qualified (INVEST) \u2014 deferred: the sheet price "
+                        "could not be verified against an independent quote; "
+                        "re-check on the next board or verify on the broker "
+                        "screen before any manual order.")
             else:
                 gate, cur, req = "Diversification", _reason, (
                     "within sector/market caps")
@@ -5457,6 +5828,13 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     ". Qualified names are shown regardless of cash; funding is "
                     "the operator's decision."),
             })
+    # v1.21.0 [PRICE-XCHECK]: ONE countable alert per build (observe/enforce).
+    if _XCHECK_STATE.get("mode") in ("observe", "enforce") and \
+            (_XCHECK_STATE.get("fetched") or _XCHECK_STATE.get("budget")):
+        alerts.append({
+            "type": "price_xcheck", "count": int(_XCHECK_STATE["fetched"]),
+            "required_action": _xcheck_summary_text(),
+        })
     # 4) audit grid sorted by score; strip internals
     # v1.19.1 [AUDIT-DEPTH-ORDER]: depth order by default (display-only).
     if _env_audit_order() == "depth":
@@ -5537,6 +5915,10 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         },
     }
 
+    # v1.21.0 [PRICE-XCHECK]: read-back block on meta ONLY when the gate is
+    # armed — off keeps the payload byte-identical to v1.20.0.
+    if _XCHECK_STATE.get("mode") in ("observe", "enforce"):
+        meta["price_xcheck"] = dict(_XCHECK_STATE)
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,
