@@ -3547,6 +3547,36 @@ if str(ROOT_DIR) not in sys.path:
 # is ever overturned in writing. Zero removals; one helper added;
 # default OFF is behavior-identical to v5.141.0.
 # -----------------------------------------------------------------------------
+# WHY v5.144.0 (P-115b REL-PATH-TAG — reliability decomposition disclosure;
+# new env TFB_REL_PATH_TAG off|observe, default off = byte-identical
+# v5.143.0, values never touched in any mode):
+# The same symbol reads a different forecast_reliability_score on different
+# surfaces of the same morning: 2026-09-20 export, DDI.US 70.4 on My_Portfolio
+# (advisor path, 08:25) vs 63.1 on Global_Markets (sync path, 02:56) with an
+# INVEST vs DO_NOT_INVEST verdict split; YUM 76.5 vs 58.1; CWBC 76.5 vs 59.3.
+# The PF ADD qualification (DDI day 1/2) rides the advisor-path number at the
+# 70 floor, so the path artifact gates real money. The score is a sum of
+# independent legs — base (0.7*fc + 0.3*dq under recalibration, else fc),
+# -60 no price, -40 no forecast, -5/-20 soft cap, -15 provider-target
+# drop/reject, -30 bar stale, -25 cross-provider conflict, -15 opp-source
+# fallback/momentum, -15 forecast-source synthetic/fallback/momentum — then
+# the DISPLAY calibration factor by bucket (v5.91.0, decision-neutral). None
+# of it is disclosed per row, so cross-surface divergence cannot be
+# attributed from the export.
+# FIX: observe mode appends ONE substring-safe tag per row to warnings,
+#   rel_path:b=B|F:fc=..:dq=..:pen=<codes|none>:os=<src>:fs=<src>:raw=..:cf=<factor|none>:fin=..
+# (penalty codes NP NF SC PD BS XC OS FS; source tokens rewritten so the tag
+# can never contain cap/forecast/target/roi/drop/reject/provider_target/
+# price_bar_stale/xprovider_price_conflict — the substrings the gate itself
+# tests on warnings, incl. rows preserved and re-read on the next run).
+# Read-back: the tag on every scored row of the next export; per holding,
+# the two surfaces' tags name the leg that differs (base dq, a penalty, or
+# the bucket factor) — the F-item semantics decision (which legs are path
+# artifacts) follows on that evidence. The mode prints in /health
+# engine_gates.rel_path_tag. Functions added: 4 (_rel_path_tag_mode,
+# _rel_path_src_code, _rel_path_tag, _rel_path_tag_enabled). Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
 # WHY v5.143.0 (P-146 FUND-SENTRY REPAIR LEG + MODE DISCLOSURE; same env
 # TFB_FUND_UNIT_SENTRY, off/observe byte-identical, enforce-only change):
 # The 2026-09-19 red-team adjudication pinned, against this file at HEAD
@@ -3589,7 +3619,7 @@ if str(ROOT_DIR) not in sys.path:
 # Zero removals; five constants and two tags added; every existing tag
 # string unchanged. Rollback: git revert (env unchanged).
 # -----------------------------------------------------------------------------
-__version__ = "5.143.0"
+__version__ = "5.144.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5317,6 +5347,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "fund_lkg_redis_state": _fund_lkg_redis_state_label(),
             "fund_lkg_redis_stats": _fund_lkg_redis_stats(),
             "fund_unit_sentry": _fund_unit_sentry_mode(),              # v5.143.0
+            "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
         }
     except Exception:
         return {}
@@ -5682,6 +5713,62 @@ def _reliability_recalibration_enabled() -> bool:
     gate refinements: audit the base distribution first, then enable."""
     raw = (os.getenv("TFB_RELIABILITY_RECALIBRATION") or "").strip().lower()
     return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+# -----------------------------------------------------------------------------
+# v5.144.0 [REL-PATH-TAG] (P-115b) — see the WHY block. Pure helpers.
+# -----------------------------------------------------------------------------
+_REL_PATH_SRC_REWRITES = (
+    ("provider_target", "pt"), ("fallback", "fb"), ("momentum", "mo"),
+    ("synthetic", "sy"), ("forecast", "fc"), ("target", "tg"),
+    ("conflict", "cf"), ("reject", "rj"), ("stale", "st"), ("drop", "dp"),
+    ("cap", "cp"), ("roi", "ri"),
+)
+_REL_PATH_FORBIDDEN = ("cap", "forecast", "target", "roi", "drop", "reject",
+                       "provider_target", "price_bar_stale",
+                       "xprovider_price_conflict")
+
+
+def _rel_path_tag_mode() -> str:
+    """TFB_REL_PATH_TAG: off (default) | observe. Read at call time."""
+    raw = (os.getenv("TFB_REL_PATH_TAG") or "").strip().lower()
+    return "observe" if raw in {"observe", "1", "true", "on", "yes"} else "off"
+
+
+def _rel_path_tag_enabled() -> bool:
+    return _rel_path_tag_mode() == "observe"
+
+
+def _rel_path_src_code(value: Any) -> str:
+    """Rewrite a source token so it stays readable but can never re-trigger
+    the gate's own substring tests on warnings (longest rewrites first)."""
+    s = _safe_str(value).strip().lower()
+    if not s:
+        return "na"
+    for old, new in _REL_PATH_SRC_REWRITES:
+        s = s.replace(old, new)
+    s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+    return s[:24] or "na"
+
+
+def _rel_path_tag(base_blend: bool, fc_pts: float, dq: float, pens, raw_rel: float,
+                  cal_factor: Optional[float], final_rel: float, opp_src: Any,
+                  fc_src: Any) -> str:
+    """ONE substring-safe tag; defensive on every input; never raises."""
+    try:
+        codes = ",".join(str(p) for p in (pens or [])) or "none"
+        cf = ("%.3f" % float(cal_factor)) if cal_factor is not None else "none"
+        tag = ("rel_path:b=%s:fc=%.1f:dq=%.1f:pen=%s:os=%s:fs=%s:raw=%.1f:cf=%s:fin=%.1f"
+               % ("B" if base_blend else "F", float(fc_pts), float(dq), codes,
+                  _rel_path_src_code(opp_src), _rel_path_src_code(fc_src),
+                  float(raw_rel), cf, float(final_rel)))
+        low = tag.lower()
+        for bad in _REL_PATH_FORBIDDEN:
+            if bad in low:
+                return "rel_path:unsafe_token_suppressed"
+        return tag
+    except Exception:
+        return "rel_path:tag_error"
 
 
 # =============================================================================
@@ -6608,33 +6695,43 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     else:
         fc_pts = 50.0
     rel = (0.7 * fc_pts + 0.3 * dq) if _recal else fc_pts
+    _rp = []  # v5.144.0 [REL-PATH-TAG]: applied-penalty codes (disclosure only)
     if not has_price:
         rel -= 60.0
+        _rp.append("NP")
     if not has_forecast:
         rel -= 40.0
+        _rp.append("NF")
     _soft_cap_penalty = 5.0 if _recal else 20.0
     if "cap" in warns and ("forecast" in warns or "target" in warns or "roi" in warns):
         rel -= _soft_cap_penalty
+        _rp.append("SC%g" % _soft_cap_penalty)
     if "provider_target" in warns and ("drop" in warns or "reject" in warns):
         rel -= 15.0
+        _rp.append("PD")
     # v5.104.0 (Fix AR): a "live" price whose own bar is older than the
     # exchange's last completed session (beyond tolerance) is NOT verified
     # provenance - penalize reliability harder than a soft-capped target.
     # Gated: flag OFF -> no penalty (v5.103.0 byte-identical).
     if _bar_age_gate_enabled() and "price_bar_stale" in warns:
         rel -= 30.0
+        _rp.append("BS")
     # v5.108.0 (Fix AR-5): two live providers materially disagreeing on the
     # same symbol's price is weaker provenance than one stale bar - one of
     # them is wrong and the engine does not yet know which.
     if _xprovider_verify_enabled() and "xprovider_price_conflict" in warns:
         rel -= 25.0
+        _rp.append("XC")
     opp_src = _safe_str(row.get("opportunity_source")).lower()
     fc_src = _safe_str(row.get("forecast_source")).lower()
     if "momentum" in opp_src or "fallback" in opp_src:
         rel -= 15.0
+        _rp.append("OS")
     if "synthetic" in fc_src or "fallback" in fc_src or "momentum" in fc_src:
         rel -= 15.0
+        _rp.append("FS")
     rel = round(max(0.0, min(100.0, rel)), 1)
+    _rp_raw, _rp_cal = rel, None  # v5.144.0: raw score before display calibration
 
     # -- provider vs engine conflict (a FLAG, not a block) --------------------
     # v5.79.1: compare canonical DIRECTION. provider_rating is stored as TEXT in
@@ -6876,8 +6973,14 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         _rel_cal, _cal_factor = _apply_reliability_calibration(rel, status)
         if _cal_factor is not None:
             rel = _rel_cal
+            _rp_cal = _cal_factor  # v5.144.0
             _v573_append_warning(row, _CALIBRATION_TAG)
 
+    # v5.144.0 [REL-PATH-TAG] (P-115b): observe-only disclosure of how this
+    # row's reliability was composed; off => nothing appended (byte-identical).
+    if _rel_path_tag_enabled():
+        _v573_append_warning(row, _rel_path_tag(
+            _recal, fc_pts, dq, _rp, _rp_raw, _rp_cal, rel, opp_src, fc_src))
     row["data_quality_score"] = dq
     row["forecast_reliability_score"] = rel
     row["provider_engine_conflict"] = conflict
