@@ -264,7 +264,10 @@ def test_t8_wiring():
     assert src.count('" [price-xcheck "') == 1
     assert src.count('"type": "price_xcheck"') == 1
     assert src.count('gate, cur, req = "Price Verification"') == 1
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.21.0"
+    # v1.22.0 note: the xcheck seam ships from 1.21.0 onward; assert a floor,
+    # not an exact pin, so later same-file builds keep this battery green.
+    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")) \
+        >= (1, 21, 0)
 
 
 if __name__ == "__main__":
