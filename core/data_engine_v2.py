@@ -3547,6 +3547,37 @@ if str(ROOT_DIR) not in sys.path:
 # is ever overturned in writing. Zero removals; one helper added;
 # default OFF is behavior-identical to v5.141.0.
 # -----------------------------------------------------------------------------
+# WHY v5.145.0 (P-151 CRYPTO-PAIR SHAPE — asset-class / exchange identity for
+# Yahoo crypto pairs; new env TFB_SYM_CRYPTO_PAIR_CLASS off|observe|enforce,
+# default off = byte-identical v5.144.0):
+# The 2026-09-20 export carries 49 Commodities_FX rows shaped <ROOT>-USD
+# (FLOW-USD, ETC-USD, SHIB-USD, DOT-USD ...) with Asset Class "Equity" and,
+# on FLOW-USD, Exchange "NASDAQ/NYSE" (red-team P2-11, re-executed 49/49).
+# Root: both symbol-shape inferrers treat a dot-less symbol as a US equity
+# (_infer_asset_class_from_symbol -> "Equity", _infer_exchange_from_symbol
+# -> "NASDAQ/NYSE"); the provider's quoteType/instrumentType only overrides
+# them when Yahoo's meta is present on that fetch. _yf_asset_class_ok already
+# excludes "-USD" from the equity contract, so the decision surface never
+# consumed them as equities (0 of 49 in the 09-20 audit strip) — the defect
+# is identity/display and every consumer that keys on Asset Class or venue.
+# FIX: _crypto_pair_shape(symbol) recognises <ROOT>-<QUOTE> with QUOTE in
+# USD/USDT/USDC/EUR/GBP/JPY/BTC/ETH (no exchange suffix, no "=", no "^");
+#   observe — inferrers unchanged; a shaped row whose class is missing or
+#             equity-like gets ONE countable tag crypto_pair_shape:observe
+#             (values untouched);
+#   enforce — the three inferrers answer Crypto / Crypto / <QUOTE> for the
+#             shape, and _crypto_pair_shape_apply repairs a shaped row whose
+#             class is missing or equity-like: asset_class="Crypto",
+#             exchange "NASDAQ/NYSE"/blank -> "Crypto", currency blank ->
+#             <QUOTE>, tagged crypto_pair_shape:enforce; a provider-declared
+#             non-equity class (CRYPTOCURRENCY ...) is never rewritten.
+# Applied at the Commodities_FX / =F / =X identity block (where the 49 live);
+# equities with a share-class dash (BRK-B, AKO-B.US, GRT-UN.TO) do not match
+# the shape by construction. Mode disclosed in /health engine_gates.
+# Functions added: 4 (_crypto_pair_class_mode, _crypto_pair_shape,
+# _crypto_pair_class_like_equity, _crypto_pair_shape_apply). Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
 # WHY v5.144.0 (P-115b REL-PATH-TAG — reliability decomposition disclosure;
 # new env TFB_REL_PATH_TAG off|observe, default off = byte-identical
 # v5.143.0, values never touched in any mode):
@@ -3619,7 +3650,7 @@ if str(ROOT_DIR) not in sys.path:
 # Zero removals; five constants and two tags added; every existing tag
 # string unchanged. Rollback: git revert (env unchanged).
 # -----------------------------------------------------------------------------
-__version__ = "5.144.0"
+__version__ = "5.145.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5348,6 +5379,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "fund_lkg_redis_stats": _fund_lkg_redis_stats(),
             "fund_unit_sentry": _fund_unit_sentry_mode(),              # v5.143.0
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
+            "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
         }
     except Exception:
         return {}
@@ -12801,10 +12833,74 @@ def _lookup_alias_value(src: Mapping[str, Any], flat: Mapping[str, Any], alias: 
     return None
 
 
+# -----------------------------------------------------------------------------
+# v5.145.0 [CRYPTO-PAIR SHAPE] (P-151) — see the WHY block. Pure helpers.
+# -----------------------------------------------------------------------------
+_CRYPTO_PAIR_RE = re.compile(r"^([A-Z0-9]{2,12})-(USD|USDT|USDC|EUR|GBP|JPY|BTC|ETH)$")
+_CRYPTO_PAIR_TAG_OBSERVE = "crypto_pair_shape:observe"
+_CRYPTO_PAIR_TAG_ENFORCE = "crypto_pair_shape:enforce"
+
+
+def _crypto_pair_class_mode() -> str:
+    """TFB_SYM_CRYPTO_PAIR_CLASS: off (default) | observe | enforce."""
+    raw = (os.getenv("TFB_SYM_CRYPTO_PAIR_CLASS") or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _crypto_pair_shape(symbol: Any) -> str:
+    """The quote currency when the symbol has the Yahoo crypto-pair shape
+    (<ROOT>-<QUOTE>, no exchange suffix), else "". Pure; never raises."""
+    try:
+        s = _safe_str(symbol).strip().upper()
+        if not s or "." in s or "=" in s or s.startswith("^"):
+            return ""
+        m = _CRYPTO_PAIR_RE.match(s)
+        return m.group(2) if m else ""
+    except Exception:
+        return ""
+
+
+def _crypto_pair_class_like_equity(value: Any) -> bool:
+    """True when the class is missing/unknown or reads as an equity (the two
+    states the shape may repair); a declared CRYPTO / FX / FUTURE stays."""
+    cls = _safe_str(value).strip()
+    if _is_missing_or_unknown_field(cls):
+        return True
+    return cls.lower().startswith("equit")
+
+
+def _crypto_pair_shape_apply(out: Dict[str, Any], sym: Any) -> str:
+    """observe: tag only; enforce: repair class/exchange/currency for a
+    shaped row whose class is missing or equity-like. Returns the mode that
+    acted ("" when nothing applied). Never raises."""
+    try:
+        mode = _crypto_pair_class_mode()
+        if mode == "off" or not isinstance(out, dict):
+            return ""
+        quote = _crypto_pair_shape(sym)
+        if not quote or not _crypto_pair_class_like_equity(out.get("asset_class")):
+            return ""
+        if mode == "observe":
+            _v573_append_warning(out, _CRYPTO_PAIR_TAG_OBSERVE)
+            return "observe"
+        out["asset_class"] = "Crypto"
+        exch = _safe_str(out.get("exchange")).strip()
+        if not exch or exch.upper() in ("NASDAQ/NYSE", "NYSE/NASDAQ"):
+            out["exchange"] = "Crypto"
+        if not _safe_str(out.get("currency")).strip():
+            out["currency"] = quote
+        _v573_append_warning(out, _CRYPTO_PAIR_TAG_ENFORCE)
+        return "enforce"
+    except Exception:
+        return ""
+
+
 def _infer_asset_class_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    if _crypto_pair_class_mode() == "enforce" and _crypto_pair_shape(s):
+        return "Crypto"  # v5.145.0
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Equity"
     if s.endswith("=X"):
@@ -12820,6 +12916,8 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    if _crypto_pair_class_mode() == "enforce" and _crypto_pair_shape(s):
+        return "Crypto"  # v5.145.0
     locale = _suffix_locale_for(s)
     if locale is not None:
         return locale[0]
@@ -12836,6 +12934,9 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    _cq = _crypto_pair_shape(s) if _crypto_pair_class_mode() == "enforce" else ""
+    if _cq:
+        return _cq  # v5.145.0
     locale = _suffix_locale_for(s)
     if locale is not None:
         return locale[1]
@@ -13084,6 +13185,7 @@ def _apply_symbol_context_defaults(row: Dict[str, Any], symbol: str = "", page: 
         out.setdefault("exchange", _infer_exchange_from_symbol(sym))
         out.setdefault("currency", _infer_currency_from_symbol(sym))
         out.setdefault("country", _infer_country_from_symbol(sym))
+        _crypto_pair_shape_apply(out, sym)  # v5.145.0 (P-151): off => no-op
         out.setdefault("sector", _infer_sector_from_symbol(sym))
         out.setdefault("industry", _infer_industry_from_symbol(sym))
 
