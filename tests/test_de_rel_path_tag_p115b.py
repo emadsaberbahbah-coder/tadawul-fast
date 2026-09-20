@@ -242,7 +242,9 @@ def test_t8_wiring():
     os.environ["TFB_REL_PATH_TAG"] = "observe"
     assert de.surface_gate_states().get("rel_path_tag") == "observe"
     _env(None, recal=None)
-    assert de.__version__ == "5.144.0"
+    # v5.145.0 note: the tag ships from 5.144.0 onward; assert a floor, not
+    # an exact pin, so later same-file builds keep this battery green.
+    assert tuple(int(x) for x in de.__version__.split(".")) >= (5, 144, 0)
 
 
 if __name__ == "__main__":
