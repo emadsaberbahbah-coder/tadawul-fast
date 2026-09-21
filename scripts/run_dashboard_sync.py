@@ -1837,7 +1837,56 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.59.0"
+SCRIPT_VERSION = "6.60.0"
+# -----------------------------------------------------------------------------
+# v6.60.0 (2026-09-21) - P-154 EODHD QUOTA SENTINEL (observe-only telemetry)
+# -----------------------------------------------------------------------------
+# EVIDENCE (workbook export 2026-09-21, run 35560901900): 845 Global_Markets
+#   rows (+1 Mutual_Funds) carried "fetch_failed:HTTP 402", every one stamped
+#   22:26-23:22 UTC on 2026-09-20 - the last hours of the provider's UTC day.
+#   EODHD documents 402 as "daily API call limit exhausted, no extra calls
+#   left" (the limit resets at midnight GMT). The engine's false-green screen
+#   then did its job - fetch_failed -> DQ cap 55 -> BLOCKED - so a provider
+#   QUOTA outage rewrote 845 rows as blocked, a board seat (GLNG.US) fell
+#   76.5 -> 65.1, the rows were preserved through the next morning leg, GM
+#   coverage read 87.0% and the decision feed went NOT_ACTIONABLE. NOTHING in
+#   _Run_Log said why: the sync never logs a provider HTTP class, and the
+#   quota counter was not visible anywhere in the evidence trail.
+# WHAT. One gate, TFB_SYNC_EODHD_QUOTA = off | observe (explicit word only;
+#   anything else = off). DEFAULT OFF = no call, no line: byte-identical to
+#   v6.59.0 apart from the version string in the existing tags.
+#   observe: after each ranked market page is written, ONE best-effort
+#   "[EODHD-QUOTA]" _Run_Log line (the FW-3 channel shape):
+#     used / limit (pct), counter date, extra-call balance  - one GET of the
+#       provider's usage endpoint /api/user, which costs 0 API calls;
+#     delta since this process' previous sample (account-wide: the matrix
+#       legs, the backend and any other consumer share one counter - read
+#       it as a burn CURVE over the day, not as a per-page invoice);
+#     rows402 new / carried in the OUTGOING matrix ("new" = stamped since
+#       this process started), plus the 429 / 404 / all-fetch_failed counts;
+#     state OK | WARN (>= TFB_SYNC_EODHD_QUOTA_WARN_PCT, 80) | CRIT (>=
+#       TFB_SYNC_EODHD_QUOTA_CRIT_PCT, 90) | ON_EXTRA | EXHAUSTED | UNKNOWN.
+#   WARN and worse are WARNING-level and also raise a ::warning:: annotation
+#   on the run page, so exhaustion is visible the same hour, not next morning.
+# WHY TELEMETRY FIRST. The burn SOURCE is still a hypothesis (the EODHD
+#   fundamentals fallback costs 10 calls per request and tags ~3,800 GM rows
+#   per leg; GM legs rose from 5-7 to 9-10 a day). A budget guard belongs in
+#   the backend, where the calls are made - and it should be aimed by a
+#   measured burn curve, not by a guess. This release measures.
+# SAFETY. The token is NEVER logged: the poll swallows its own exceptions
+#   and reports only the exception TYPE (+ an HTTP status code), because the
+#   request URL carries the key. No key in the job env -> state UNKNOWN
+#   (no_key) and the row counts are still published. The sentinel cannot
+#   fail, slow (<= TFB_SYNC_EODHD_QUOTA_TIMEOUT_S, 5 s, one attempt) or
+#   change a write, and its own append failure is annotated but deliberately
+#   NOT counted into _RUNLOG_APPEND_FAILS (telemetry must not be able to
+#   flip the sync's exit code).
+# ENV LANE: GitHub Actions (daily_sync.yml). The job env must also expose the
+#   key for the counter to be live:  EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+# Kill: unset / off. ZERO functions removed; additions: _eodhd_quota_mode,
+# _eodhd_quota_pct, _eodhd_quota_timeout, _eodhd_quota_key,
+# _eodhd_quota_parse, _eodhd_quota_poll, _eodhd_quota_count_rows,
+# _eodhd_quota_state, _eodhd_quota_selftest, _append_runlog_eodhd_quota.
 # -----------------------------------------------------------------------------
 # v6.58.0 (2026-09-05) - KLG STUB-SWAP COVERS PRICELESS 'history' ROWS (P-83a)
 # -----------------------------------------------------------------------------
@@ -5391,6 +5440,312 @@ def _append_runlog_idfirewall(
         print("::warning::%s _Run_Log verdict append FAILED for %s — %s: %s"
               % (_IDFW_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
+
+
+# =============================================================================
+# v6.60.0 (P-154) EODHD QUOTA SENTINEL - see the WHY block at SCRIPT_VERSION.
+# =============================================================================
+_EODHD_QUOTA_TAG = f"[EODHD-QUOTA v{SCRIPT_VERSION}]"
+_EQ_STATE: Dict[str, Any] = {"t0": time.time(), "prev_used": None,
+                             "prev_date": None, "prev_ts": None,
+                             "prev_page": None}
+_EQ_SELFTEST_MSG: str = "not-run"
+
+
+def _eodhd_quota_mode() -> str:
+    """off | observe. Explicit word only - a stray "1" arms nothing."""
+    v = (os.getenv("TFB_SYNC_EODHD_QUOTA") or "").strip().lower()
+    return "observe" if v == "observe" else "off"
+
+
+def _eodhd_quota_pct(name: str, default: float) -> float:
+    try:
+        return min(100.0, max(1.0, float((os.getenv(name) or "").strip()
+                                         or default)))
+    except Exception:
+        return float(default)
+
+
+def _eodhd_quota_timeout() -> float:
+    try:
+        return min(15.0, max(1.0, float(
+            (os.getenv("TFB_SYNC_EODHD_QUOTA_TIMEOUT_S") or "5").strip())))
+    except Exception:
+        return 5.0
+
+
+def _eodhd_quota_key() -> str:
+    for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_KEY"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _eodhd_quota_parse(payload: Any, today_utc: str) -> Dict[str, Any]:
+    """PURE. EODHD /api/user JSON -> usage snapshot. The provider resets the
+    counter LAZILY (on the first request after midnight GMT), so a counter
+    dated before today means nothing has been spent today."""
+    out: Dict[str, Any] = {"ok": False, "used": None, "limit": None,
+                           "extra": None, "date": "", "stale_date": False,
+                           "pct": None, "why": ""}
+
+    def _i(x: Any) -> Optional[int]:
+        try:
+            return int(float(str(x).strip()))
+        except Exception:
+            return None
+
+    try:
+        if not isinstance(payload, dict):
+            return out
+        used = _i(payload.get("apiRequests"))
+        limit = _i(payload.get("dailyRateLimit"))
+        extra = _i(payload.get("extraLimit"))
+        d = str(payload.get("apiRequestsDate") or "").strip()[:10]
+        if used is None or limit is None or limit <= 0:
+            return out
+        stale = bool(d and today_utc and d != today_utc)
+        if stale:
+            used = 0
+        out.update({"ok": True, "used": used, "limit": limit, "extra": extra,
+                    "date": d, "stale_date": stale,
+                    "pct": round(100.0 * used / float(limit), 1)})
+        return out
+    except Exception:
+        return out
+
+
+def _eodhd_quota_poll() -> Dict[str, Any]:
+    """One GET of the provider usage endpoint (0 API calls). NEVER raises and
+    NEVER logs the token: the URL carries the key, so a failure reports only
+    the exception TYPE and, when present, the HTTP status code."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = _eodhd_quota_key()
+    if not key:
+        r = _eodhd_quota_parse(None, today)
+        r["why"] = "no_key"
+        return r
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        base = (os.getenv("TFB_SYNC_EODHD_QUOTA_URL")
+                or "https://eodhd.com/api/user").strip()
+        url = (base + ("&" if "?" in base else "?")
+               + _up.urlencode({"api_token": key, "fmt": "json"}))
+        req = _ur.Request(url, headers={
+            "User-Agent": "tfb-sync-quota/" + SCRIPT_VERSION})
+        with _ur.urlopen(req, timeout=_eodhd_quota_timeout()) as resp:
+            body = resp.read(65536)
+        r = _eodhd_quota_parse(
+            json.loads(body.decode("utf-8", "replace")), today)
+        if not r.get("ok"):
+            r["why"] = "unparseable"
+        return r
+    except Exception as e:
+        r = _eodhd_quota_parse(None, today)
+        code = getattr(e, "code", None)
+        r["why"] = ("poll_failed:" + type(e).__name__
+                    + ((":" + str(int(code))) if isinstance(code, int) else ""))
+        return r
+
+
+def _eodhd_quota_count_rows(headers: Any, rows_matrix: Any,
+                            t0_epoch: float) -> Dict[str, int]:
+    """PURE. Provider-refusal rows in the OUTGOING matrix. q402_new = a 402
+    row stamped since this process started (120 s skew allowance, an
+    unreadable stamp counts as new - fail loud); q402_carried = an older
+    stamp, i.e. a preserved row still carrying the tag."""
+    out = {"q402_new": 0, "q402_carried": 0, "f429": 0, "f404": 0,
+           "fetch_failed": 0}
+    try:
+        hdr = [str(h or "").strip().lower() for h in (headers or [])]
+        if "warnings" not in hdr:
+            return out
+        wi = hdr.index("warnings")
+        ui = hdr.index("last updated (utc)") if "last updated (utc)" in hdr else -1
+        for row in (rows_matrix or []):
+            try:
+                w = str(row[wi]) if len(row) > wi and row[wi] is not None else ""
+            except Exception:
+                continue
+            if "fetch_failed" not in w:
+                continue
+            out["fetch_failed"] += 1
+            if "fetch_failed:HTTP 402" in w:
+                is_new = True
+                try:
+                    raw = str(row[ui]).strip() if (ui >= 0 and len(row) > ui) else ""
+                    if raw:
+                        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        is_new = dt.timestamp() >= (float(t0_epoch) - 120.0)
+                except Exception:
+                    is_new = True
+                out["q402_new" if is_new else "q402_carried"] += 1
+            elif "fetch_failed:HTTP 429" in w:
+                out["f429"] += 1
+            elif "fetch_failed:HTTP 404" in w:
+                out["f404"] += 1
+        return out
+    except Exception:
+        return out
+
+
+def _eodhd_quota_state(q: Dict[str, Any], rows: Dict[str, int],
+                       warn_pct: float, crit_pct: float) -> Tuple[str, str]:
+    """PURE -> (status, level). Fresh 402 rows ARE exhaustion, whatever the
+    counter says (it can be unreadable, or another consumer can have spent
+    the budget between the fetch and the poll)."""
+    try:
+        if int(rows.get("q402_new", 0) or 0) > 0:
+            return "EXHAUSTED", "WARNING"
+        if not q.get("ok"):
+            return "UNKNOWN", "INFO"
+        pct = float(q.get("pct") or 0.0)
+        if pct >= 100.0:
+            return (("ON_EXTRA" if int(q.get("extra") or 0) > 0
+                     else "EXHAUSTED"), "WARNING")
+        if pct >= float(crit_pct):
+            return "CRIT", "WARNING"
+        if pct >= float(warn_pct):
+            return "WARN", "WARNING"
+        return "OK", "INFO"
+    except Exception:
+        return "UNKNOWN", "INFO"
+
+
+def _eodhd_quota_selftest() -> str:
+    """Pure fixtures, run once per process; the verdict rides in the line."""
+    global _EQ_SELFTEST_MSG
+    if _EQ_SELFTEST_MSG != "not-run":
+        return _EQ_SELFTEST_MSG
+    passed, total = 0, 5
+    try:
+        p = _eodhd_quota_parse({"apiRequests": "321500", "dailyRateLimit": 400000,
+                                "extraLimit": "0",
+                                "apiRequestsDate": "2026-09-20"}, "2026-09-20")
+        if p["ok"] and p["used"] == 321500 and p["pct"] == 80.4 and not p["stale_date"]:
+            passed += 1
+        s2 = _eodhd_quota_parse({"apiRequests": 399999, "dailyRateLimit": 400000,
+                                 "apiRequestsDate": "2026-09-20"}, "2026-09-21")
+        if s2["ok"] and s2["stale_date"] and s2["used"] == 0 and s2["pct"] == 0.0:
+            passed += 1
+        if (not _eodhd_quota_parse(None, "x")["ok"]
+                and not _eodhd_quota_parse({"apiRequests": "n/a"}, "x")["ok"]):
+            passed += 1
+        hdr = ["Symbol", "Warnings", "Last Updated (UTC)"]
+        t0 = datetime(2026, 9, 21, 4, 25, tzinfo=timezone.utc).timestamp()
+        mat = [["A.US", "fetch_failed:HTTP 402; x", "2026-09-20T23:17:30+00:00"],
+               ["B.US", "fetch_failed:HTTP 402", "2026-09-21T05:01:00+00:00"],
+               ["C.MI", "fetch_failed:HTTP 404 not_found", "2026-09-21T05:01:00+00:00"],
+               ["D.US", "yahoo_enrichment_applied", "2026-09-21T05:01:00+00:00"],
+               ["E.US", "fetch_failed:HTTP 402", ""]]
+        c = _eodhd_quota_count_rows(hdr, mat, t0)
+        if c == {"q402_new": 2, "q402_carried": 1, "f429": 0, "f404": 1,
+                 "fetch_failed": 4}:
+            passed += 1
+        ok_q = {"ok": True, "pct": 50.0, "extra": 0}
+        if (_eodhd_quota_state(ok_q, {"q402_new": 0}, 80, 90) == ("OK", "INFO")
+                and _eodhd_quota_state({"ok": True, "pct": 85.0}, {}, 80, 90)[0] == "WARN"
+                and _eodhd_quota_state({"ok": True, "pct": 93.0}, {}, 80, 90)[0] == "CRIT"
+                and _eodhd_quota_state({"ok": True, "pct": 100.0, "extra": 0}, {}, 80, 90)[0] == "EXHAUSTED"
+                and _eodhd_quota_state({"ok": True, "pct": 100.0, "extra": 5000}, {}, 80, 90)[0] == "ON_EXTRA"
+                and _eodhd_quota_state(ok_q, {"q402_new": 3}, 80, 90) == ("EXHAUSTED", "WARNING")
+                and _eodhd_quota_state({"ok": False}, {}, 80, 90) == ("UNKNOWN", "INFO")):
+            passed += 1
+    except Exception as e:
+        _EQ_SELFTEST_MSG = "EXC %s" % type(e).__name__
+        return _EQ_SELFTEST_MSG
+    _EQ_SELFTEST_MSG = ("PASS %d/%d" if passed == total else "FAIL %d/%d") % (passed, total)
+    return _EQ_SELFTEST_MSG
+
+
+def _append_runlog_eodhd_quota(sheets: Any, spreadsheet_id: str, page: str,
+                               headers: Any, rows_matrix: Any) -> None:
+    """v6.60.0 P-154: one best-effort, fail-open [EODHD-QUOTA] line per ranked
+    market page per leg (the FW-3 channel shape). Gate off -> returns before
+    any work. Can never break, slow (one <= 5 s GET) or alter the write."""
+    if _eodhd_quota_mode() == "off" or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        rows = _eodhd_quota_count_rows(headers, rows_matrix, _EQ_STATE["t0"])
+        q = _eodhd_quota_poll()
+        now = time.time()
+        delta_txt = "delta=n/a"
+        delta_val: Optional[int] = None
+        if q.get("ok"):
+            pu, pd_, pt = (_EQ_STATE.get("prev_used"), _EQ_STATE.get("prev_date"),
+                           _EQ_STATE.get("prev_ts"))
+            if pu is None:
+                delta_txt = "delta=first-sample"
+            elif pd_ != q.get("date") or q.get("stale_date"):
+                delta_txt = "delta=rollover"
+            else:
+                delta_val = int(q["used"]) - int(pu)
+                delta_txt = "delta=%+d in %ds since %s" % (
+                    delta_val, int(max(0.0, now - float(pt or now))),
+                    _EQ_STATE.get("prev_page") or "?")
+            _EQ_STATE.update({"prev_used": q["used"], "prev_date": q.get("date"),
+                              "prev_ts": now, "prev_page": page})
+        warn_pct = _eodhd_quota_pct("TFB_SYNC_EODHD_QUOTA_WARN_PCT", 80.0)
+        crit_pct = _eodhd_quota_pct("TFB_SYNC_EODHD_QUOTA_CRIT_PCT", 90.0)
+        status, level = _eodhd_quota_state(q, rows, warn_pct, crit_pct)
+        if q.get("ok"):
+            used_txt = "used=%d/%d (%.1f%%) date=%s%s extra=%s" % (
+                int(q["used"]), int(q["limit"]), float(q["pct"]),
+                q.get("date") or "?",
+                "(not yet reset)" if q.get("stale_date") else "",
+                "n/a" if q.get("extra") is None else int(q["extra"]))
+        else:
+            used_txt = "used=unknown (%s)" % (q.get("why") or "?")
+        msg = ("%s %s | %s | %s | rows402 new=%d carried=%d | f429=%d f404=%d "
+               "fetch_failed=%d | state=%s | selftest=%s" % (
+                   _EODHD_QUOTA_TAG, page, used_txt, delta_txt,
+                   rows["q402_new"], rows["q402_carried"], rows["f429"],
+                   rows["f404"], rows["fetch_failed"], status,
+                   _eodhd_quota_selftest()))
+        details = _runlog_meta_json(json.dumps({
+            "mode": "observe", "state": status,
+            "used": q.get("used"), "limit": q.get("limit"), "pct": q.get("pct"),
+            "extra": q.get("extra"), "counter_date": q.get("date"),
+            "stale_date": bool(q.get("stale_date")), "why": q.get("why") or "",
+            "delta": delta_val, "rows": rows, "warn_pct": warn_pct,
+            "crit_pct": crit_pct, "selftest": _EQ_SELFTEST_MSG,
+            "version": SCRIPT_VERSION}))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status, msg,
+                            "", "", "", details]]}
+        _last_err = None
+        for _attempt in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last_err = None
+                break
+            except Exception as _ae:
+                _last_err = _ae
+                time.sleep(1.0)
+        if level == "WARNING":
+            print("::warning::" + msg)
+            logger.warning(msg)
+        else:
+            logger.info(msg)
+        if _last_err is not None:
+            raise _last_err
+    except Exception as _e:
+        # Telemetry only: annotated, never counted into _RUNLOG_APPEND_FAILS.
+        print("::warning::%s _Run_Log append FAILED for %s - %s"
+              % (_EODHD_QUOTA_TAG, page, type(_e).__name__))
 
 
 def _ohlc_prewrite_runlog_enabled() -> bool:
@@ -10385,6 +10740,18 @@ async def _run_one_task(
                     sheets, spreadsheet_id, task.sheet_name,
                     len(_klg_syms or []), _idfw_klg_suspects, _idfw_stripped,
                     _idfw_dup_groups, _idfw_dup_quar,
+                )
+            except Exception:
+                pass
+        # ----------------------------------------------------------------------
+
+        # --- v6.60.0 P-154: EODHD quota sentinel (observe-only) -----------
+        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
+                and sheets is not None and _eodhd_quota_mode() != "off"):
+            try:
+                _append_runlog_eodhd_quota(
+                    sheets, spreadsheet_id, task.sheet_name,
+                    headers, rows_matrix,
                 )
             except Exception:
                 pass
