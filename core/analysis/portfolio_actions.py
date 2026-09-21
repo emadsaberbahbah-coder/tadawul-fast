@@ -776,7 +776,28 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
 # _apply_f1_observe_tag). Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.12.0"
+PORTFOLIO_ACTIONS_VERSION = "1.12.1"
+# v1.12.1 (2026-09-21) - [F-2 HONOURS D-9] THE LOSS BUDGET IS AN EQUITY RULE
+# WHY: v1.11.0's _apply_drawdown_guard has no asset-class test. Its basis is
+# pnl_sar / cost_sar - PRICE ONLY - and its time rule exits anything "still
+# negative after TFB_PF_DD_TIME_D (45) days". 5023.SR (Arabian Centres sukuk,
+# bought at par, 8.5% coupon, held ~300 days, recorded income 637.50 SAR) is
+# above water on any honest basis, yet one print below par (52W low 100.05)
+# makes its price-only return negative with days >> 45: under the planned
+# TFB_PF_DD_EXIT=enforce the guard would force a FULL EXIT of the income
+# anchor, and under today's observe arming it would print "would EXIT".
+# Every other rule in this file already stands down for a sukuk: D-9 (never
+# a switch-scan SELL leg, v1.2.1) and RULE 1b (never position-cap trimmed,
+# v1.7.3). F-2 was written five weeks later and missed it - same class of
+# defect v1.7.3 closed, found before enforce instead of after.
+# FIX: when the guard's trigger fires on a SUKUK-class holding
+# (_is_sukuk_holding -> compliance_gate.classify_asset), action and proceeds
+# stand and a countable "[dd-exempt]" tag discloses what was seen. The test
+# is evaluated ONLY after a trigger fires, so every non-triggering row - and
+# every equity - is byte-identical to v1.12.0 in all three modes.
+# GATE: rides on the EXISTING TFB_PA_PROTECT_SUKUK (default ON), the v1.7.3
+# precedent - no new environment variable. TFB_PA_PROTECT_SUKUK=0 restores
+# v1.12.0 exactly. ZERO functions added or removed.
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -2728,6 +2749,14 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
     else:
         trig = "still negative (%.1f%%) after %d d > %d d time budget" % (
             ret_pct, days, time_d)
+    # v1.12.1 [F-2 HONOURS D-9]: a sukuk is held for income; this basis is
+    # price-only. Evaluated only after a trigger fired (see version WHY).
+    if _protect_sukuk_enabled() and _is_sukuk_holding(cand):
+        return (action,
+                (reason or "") + (" | [dd-exempt] sukuk / fixed income (D-9):"
+                                  " %s on a price-only basis - equity loss"
+                                  " budget not applied" % trig),
+                proceeds)
     if mode == "observe":
         tag = " | [dd-observe] %s - would EXIT under enforce" % trig
         return action, (reason or "") + tag, proceeds
