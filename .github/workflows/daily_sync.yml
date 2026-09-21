@@ -286,6 +286,15 @@ jobs:
       # band): far narrower than FW-4 quarantine, which stays "observe" per
       # the documented S-1-window decision below.
       TFB_SYNC_PERSIST_SANITY: "1"
+      # v6.60.0 P-154 EODHD QUOTA SENTINEL (scripts/run_dashboard_sync.py).
+      # ARMED "observe" 2026-09-21 - TELEMETRY ONLY: one [EODHD-QUOTA] _Run_Log
+      # line per ranked market page per leg (usage counter from the provider's
+      # 0-cost /api/user endpoint + 402/429/404 row counts in the outgoing
+      # matrix). Changes no write, cannot fail the leg. WHY: on 2026-09-20 the
+      # daily API-call limit ran out at 22:26-23:22 UTC (845 Global_Markets rows
+      # fetch_failed:HTTP 402 -> BLOCKED) and nothing in _Run_Log said so.
+      # KILL-SWITCH: delete this line -> v6.59.0 behaviour exactly.
+      TFB_SYNC_EODHD_QUOTA: "observe"
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -914,6 +923,11 @@ jobs:
           # behavior exactly (safe before AND after arming, provided the
           # secret is set before Render is).
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+          # v6.60.0 P-154: read ONLY by the quota sentinel's /api/user poll and
+          # never logged (the sentinel reports exception TYPES only). Step-scoped
+          # on purpose. Unset secret -> state UNKNOWN (no_key); row counts still
+          # publish.
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
         run: |
           set -euo pipefail
           echo "::group::📊 Sync Execution"
@@ -1486,6 +1500,13 @@ jobs:
       TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       TFB_SYNC_MARKET_GATEWAY: "analysis"
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+      # v6.60.0 P-154 EODHD quota sentinel - same observe arming as the
+      # sync-dashboard job. Recovery retries launch fresh run_dashboard_sync.py
+      # processes (up to TFB_INLINE_RECOVERY_MAX_CYCLES) and are a suspected
+      # burn amplifier, so they are sampled too (each process logs
+      # delta=first-sample; the absolute counter + timestamp give the curve).
+      TFB_SYNC_EODHD_QUOTA: "observe"
+      EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
 
     steps:
       - name: 📥 Secure Checkout
