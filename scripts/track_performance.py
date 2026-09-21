@@ -1306,7 +1306,66 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.38.0"
+SCRIPT_VERSION = "6.39.0"
+# -----------------------------------------------------------------------------
+# v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
+# the forecast again)
+# -----------------------------------------------------------------------------
+# WHY. Every ROI this file COMPUTES is percent points ((c1/c0 - 1) * 100),
+# and s1_checkpoint_calibration() states "both fields are already
+# percentages". But the TARGET is not computed here: _derive_target and
+# _derive_checkpoint_target copy the engine's expected_roi_* RAW, and the
+# engine contract is a FRACTION (0.023388 for +2.34%; adjudicated on the
+# sheet 2026-09-16). Nothing in this file multiplies it by 100. Live
+# specimen (Performance_Log, 2026-09-21): ETO.US entry 30.16, target price
+# 30.8654 (the engine's forecast price) beside Target ROI 0.023388 - the
+# price implies +2.3389 pp. A 1W checkpoint sliced from that thesis stores
+# 0.005457 where 0.5457 pp was meant, and its target price is derived as
+# entry * (1 + 0.005457 / 100) ~= entry. Criterion 4 then computes
+# realized_pp - target_fraction: the forecast enters at ~1/100 of its size,
+# so the published "mean |err|" is essentially mean |realized return|
+# (1W 2.60 / 2W 3.72 on 2026-09-21: ratio 1.43 ~= sqrt(2), the realized-
+# volatility scaling) and the "signed" number is the mean realized return,
+# not forecast bias. WIN/LOSS is unaffected (sign of realized only).
+# WHAT. One gate, TFB_PERF_TARGET_UNIT_SENTRY = off | observe | enforce
+# (explicit words only; anything else = off). DEFAULT OFF = records, sheet
+# rows and the criterion-4 row byte-identical to v6.38.0.
+#   observe : nothing changes value. The criterion-4 row is the legacy
+#             row; a separate "TARGET UNIT SENTRY" block (A4:D9 of
+#             _S1_Calibration, rows the S-1 consumer never reads) and one
+#             [PERF-UNIT] _Run_Log line publish legacy vs unit-corrected
+#             error side by side with fraction / percent / unresolved
+#             counts, plus what record creation WOULD have scaled.
+#   enforce : (a) new records store percent-point targets (and therefore a
+#             correct checkpoint target price); (b) criterion 4 is computed
+#             on the unit-corrected basis and its Detail says so. Stored
+#             legacy rows are NEVER rewritten - the correction is applied
+#             at measurement time, so rollback is one env line.
+# GROUND TRUTH, NEVER MAGNITUDE. A value like -0.25 is "-25%" as a fraction
+# and "-0.25%" as percent; size cannot tell them apart and this file does
+# not guess. The unit is decided only against a price-implied return:
+#   - at creation: the engine's own forecast price vs the entry price;
+#   - for a stored checkpoint: the SAME-DAY 1M sibling record of the same
+#     symbol (key SYMBOL|1M|YYYYMMDD), whose target price is the engine's
+#     1M forecast price. implied_1m_pp * days / 30 is the checkpoint truth.
+# The closer reading wins only if it lands within max(0.05pp, 10% of the
+# truth); otherwise the row is UNRESOLVED, excluded from the corrected
+# sample and counted - never scaled. The two readings differ by a factor
+# of 100, so the tolerance cannot confuse them. Known blind spot, surfaced
+# not hidden: a sibling whose target price was itself derived from the ROI
+# is self-consistent in the percent reading; such rows land in 'percent'
+# and the block discloses 'percent_tiny' (|target| < 0.05pp) as the tell.
+# S-1 NOTE. enforce changes what criterion 4 MEASURES (gate criteria, band,
+# min-sample, benchmark and counter are untouched). It is an evidence-lane
+# boundary: record the flip date in the evidence register.
+# ENV LANE: GitHub Actions (daily_sync.yml, the track_performance step),
+# NOT Render. Kill: unset / off -> v6.38.0 exactly. ZERO functions removed;
+# s1_checkpoint_calibration keeps its name and signature (the v6.29.0 body
+# is preserved verbatim as _s1_checkpoint_calibration_legacy). Additions:
+# _perf_unit_mode, _perf_unit_pick, _perf_unit_creation,
+# _perf_unit_day_key, _perf_unit_sibling_index, _s1_unit_sentry_measure,
+# _s1_unit_sentry_apply, _perf_unit_block_rows, _perf_unit_log_line.
+# Embedded self-test 12 -> 14 cases (the verdict reads selftest=PASS 14/14).
 # -----------------------------------------------------------------------------
 # v6.38.0 (2026-09-01) - DUPLICATE COHORTS LEAVE THE SHEET (capacity regrowth)
 # -----------------------------------------------------------------------------
@@ -3020,7 +3079,299 @@ def _s1_cal_min_sample() -> int:
         return 20
 
 
-def s1_checkpoint_calibration(records: Any) -> Dict[str, Any]:
+# =============================================================================
+# v6.39.0 (P-158) TARGET-UNIT SENTRY - see the WHY block at SCRIPT_VERSION.
+# =============================================================================
+_PERF_UNIT_TOL_ABS_PP = 0.05
+_PERF_UNIT_TOL_REL = 0.10
+_PERF_UNIT_TINY_PP = 0.05
+_PERF_UNIT_BASE_DAYS = 30.0   # mirrors PerformanceTrackerApp._CHECKPOINT_BASE_DAYS
+_PERF_UNIT_CREATION: Dict[str, int] = {
+    "fraction": 0, "percent": 0, "unverified": 0, "scaled": 0}
+
+
+def _perf_unit_mode() -> str:
+    """off | observe | enforce. Explicit words only - no boolean alias, so a
+    stray "1" can never arm a value change."""
+    v = (os.getenv("TFB_PERF_TARGET_UNIT_SENTRY") or "").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _perf_unit_pick(stored: Any, truth_pp: Any) -> Tuple[str, Optional[float]]:
+    """Decide the unit of a stored ROI against a price-implied truth in
+    percent points -> ("fraction", stored*100) | ("percent", stored) |
+    ("unresolved", None). Pure; never raises; never decides on magnitude."""
+    try:
+        sv = float(stored)
+        tv = float(truth_pp)
+        if (math.isnan(sv) or math.isnan(tv)
+                or math.isinf(sv) or math.isinf(tv)):
+            return "unresolved", None
+        tol = max(_PERF_UNIT_TOL_ABS_PP, _PERF_UNIT_TOL_REL * abs(tv))
+        d_frac = abs(sv * 100.0 - tv)
+        d_pct = abs(sv - tv)
+        if min(d_frac, d_pct) > tol:
+            return "unresolved", None
+        if d_frac < d_pct:
+            return "fraction", sv * 100.0
+        return "percent", sv
+    except Exception:
+        return "unresolved", None
+
+
+def _perf_unit_creation(roi: float, price: float, entry: float) -> float:
+    """Record-creation seam. off -> the input, untouched and uncounted.
+    observe -> the input, with the verdict counted. enforce -> a
+    ground-truth-confirmed fraction is returned as percent points. Without
+    a forecast price there is no truth: the value is left exactly as it
+    came. Never raises."""
+    mode = _perf_unit_mode()
+    if mode == "off":
+        return roi
+    try:
+        if roi == 0.0:
+            return roi
+        if price <= 0.0 or entry <= 0.0:
+            _PERF_UNIT_CREATION["unverified"] += 1
+            return roi
+        label, fixed = _perf_unit_pick(roi, (price / entry - 1.0) * 100.0)
+        if label == "unresolved" or fixed is None:
+            _PERF_UNIT_CREATION["unverified"] += 1
+            return roi
+        _PERF_UNIT_CREATION[label] += 1
+        if label == "fraction" and mode == "enforce":
+            _PERF_UNIT_CREATION["scaled"] += 1
+            return float(fixed)
+        return roi
+    except Exception:
+        return roi
+
+
+def _perf_unit_day_key(r: Any) -> str:
+    """SYMBOL|YYYYMMDD (Riyadh) - the day stamp PerformanceRecord.key uses,
+    so a checkpoint finds the 1M sibling recorded the same day."""
+    try:
+        parts = str(getattr(r, "key", "") or "").split("|")
+        if len(parts) == 3 and parts[0] and parts[2]:
+            return parts[0].upper() + "|" + parts[2]
+    except Exception:
+        pass
+    try:
+        d = getattr(r, "date_recorded", None)
+        return (str(getattr(r, "symbol", "")).upper() + "|"
+                + d.astimezone(_RIYADH_TZ).strftime("%Y%m%d"))
+    except Exception:
+        return ""
+
+
+def _perf_unit_sibling_index(records: Any) -> Dict[str, float]:
+    """day-key -> price-implied 1M thesis (percent points), taken from 1M
+    records carrying a positive entry price AND target price."""
+    idx: Dict[str, float] = {}
+    for r in (records or []):
+        try:
+            if getattr(getattr(r, "horizon", None), "value", None) != "1M":
+                continue
+            ep = _safe_float(getattr(r, "entry_price", 0.0), default=0.0)
+            tp = _safe_float(getattr(r, "target_price", 0.0), default=0.0)
+            if ep <= 0.0 or tp <= 0.0:
+                continue
+            k = _perf_unit_day_key(r)
+            if k and k not in idx:
+                idx[k] = (tp / ep - 1.0) * 100.0
+        except Exception:
+            continue
+    return idx
+
+
+def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
+    """Criterion-4 error on the unit-corrected basis. Same qualifying set as
+    the v6.29.0 measurement (1W/2W, MATURED, realized present, target != 0);
+    each target's unit is decided against its same-day 1M sibling. PURE."""
+    idx = _perf_unit_sibling_index(records)
+    counts = {"fraction": 0, "percent": 0, "unresolved": 0}
+    allc = {"fraction": 0, "percent": 0, "unresolved": 0}
+    why = {"no_sibling": 0, "mismatch": 0}
+    tiny = 0
+    errs: List[float] = []
+    per_hz: Dict[str, List[float]] = {}
+    for r in (records or []):
+        hz = getattr(getattr(r, "horizon", None), "value", None)
+        if hz not in ("1W", "2W"):
+            continue
+        target = _safe_float(getattr(r, "target_roi", 0.0), default=0.0)
+        if target == 0.0:
+            continue
+        days = 7.0 if hz == "1W" else 14.0
+        truth_1m = idx.get(_perf_unit_day_key(r))
+        if truth_1m is None:
+            label, fixed, reason = "unresolved", None, "no_sibling"
+        else:
+            label, fixed = _perf_unit_pick(
+                target, truth_1m * days / _PERF_UNIT_BASE_DAYS)
+            reason = "mismatch"
+        allc[label] += 1
+        if getattr(r, "status", None) != PerformanceStatus.MATURED:
+            continue
+        realized = getattr(r, "realized_roi", None)
+        if realized is None:
+            continue
+        counts[label] += 1
+        if label == "unresolved" or fixed is None:
+            why[reason] += 1
+            continue
+        if label == "percent" and abs(fixed) < _PERF_UNIT_TINY_PP:
+            tiny += 1
+        err = float(realized) - float(fixed)
+        errs.append(err)
+        per_hz.setdefault(hz, []).append(err)
+    n = len(errs)
+    rep: Dict[str, Any] = {
+        "n": n, "mean_abs_error_pp": None, "mean_signed_error_pp": None,
+        "by_horizon": {
+            k: {"n": len(v),
+                "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2)}
+            for k, v in sorted(per_hz.items()) if v
+        },
+        "counts": counts, "all_checkpoints": allc,
+        "unresolved_why": why, "percent_tiny": tiny,
+    }
+    if n:
+        rep["mean_abs_error_pp"] = round(sum(abs(x) for x in errs) / float(n), 2)
+        rep["mean_signed_error_pp"] = round(sum(errs) / float(n), 2)
+    return rep
+
+
+def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
+                          mode: str) -> Dict[str, Any]:
+    """observe: the legacy result plus a 'unit_sentry' report. enforce: the
+    headline moves to the unit-corrected basis and Detail discloses it; with
+    nothing resolvable, or on any error, the legacy basis is kept and the
+    reason is published. Never raises."""
+    new = dict(out)
+    try:
+        rep = _s1_unit_sentry_measure(records)
+    except Exception as exc:
+        rep = {"n": 0, "error": "unit_sentry_error:" + type(exc).__name__}
+    rep["mode"] = mode
+    rep["legacy"] = {k: out.get(k) for k in (
+        "state", "n", "mean_abs_error_pp", "mean_signed_error_pp",
+        "by_horizon", "detail")}
+    rep["creation"] = dict(_PERF_UNIT_CREATION)
+    new["unit_sentry"] = rep
+    if mode != "enforce" or rep.get("error"):
+        return new
+    n = int(rep.get("n") or 0)
+    if n == 0:
+        rep["enforce_note"] = "no resolvable checkpoint - legacy basis kept"
+        return new
+    try:
+        band = float(out.get("band_pp"))
+        min_sample = int(out.get("min_sample"))
+        mean_abs = float(rep["mean_abs_error_pp"])
+        mean_signed = float(rep["mean_signed_error_pp"])
+        c = rep.get("counts") or {}
+        _leg = rep["legacy"].get("mean_abs_error_pp")
+        tail = (" [unit-sentry enforce: targets in pp; %d fraction-scale "
+                "rescaled, %d already pp, %d unresolved excluded; legacy "
+                "mean |err| %spp]" % (
+                    int(c.get("fraction", 0)), int(c.get("percent", 0)),
+                    int(c.get("unresolved", 0)),
+                    ("%.2f" % _leg) if _leg is not None else "n/a"))
+        new["n"] = n
+        new["mean_abs_error_pp"] = rep["mean_abs_error_pp"]
+        new["mean_signed_error_pp"] = rep["mean_signed_error_pp"]
+        new["by_horizon"] = rep["by_horizon"]
+        if n < min_sample:
+            new["state"] = "PENDING"
+            new["detail"] = (f"{n}/{min_sample} checkpoints \u2014 sample too small "
+                             f"to decide (mean |err| {mean_abs:.2f}pp so far)"
+                             + tail)
+            return new
+        new["state"] = "PASS" if mean_abs <= band else "FAIL"
+        _bias = ("optimistic" if mean_signed < 0 else "conservative")
+        _bias_note = (f" ({_bias} bias)" if abs(mean_signed) >= band / 2.0
+                      else " (no strong directional bias)")
+        new["detail"] = (
+            f"mean |err| {mean_abs:.2f}pp vs band {band:.2f}pp over n={n}; "
+            f"signed {mean_signed:+.2f}pp" + _bias_note + tail)
+        return new
+    except Exception as exc:
+        rep["enforce_note"] = ("enforce_error:" + type(exc).__name__
+                               + " - legacy basis kept")
+        fallback = dict(out)
+        fallback["unit_sentry"] = rep
+        return fallback
+
+
+def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
+    """Six rows x four columns for _S1_Calibration!A4:D9."""
+    leg = rep.get("legacy") or {}
+    c = rep.get("counts") or {}
+    a = rep.get("all_checkpoints") or {}
+    w = rep.get("unresolved_why") or {}
+    cr = rep.get("creation") or {}
+    mode = str(rep.get("mode") or "")
+    n = int(rep.get("n") or 0)
+    basis = rep.get("error") or rep.get("enforce_note") or (
+        "criterion-4 basis: "
+        + ("unit-corrected" if (mode == "enforce" and n > 0) else "legacy"))
+
+    def _v(x: Any) -> Any:
+        return "" if x is None else x
+
+    return [
+        ["TARGET UNIT SENTRY v6.39.0 (P-158)", "mode " + mode,
+         "as_of " + ts, basis],
+        ["basis", "n", "mean |err| pp", "signed pp"],
+        ["legacy (target as stored)", _v(leg.get("n")),
+         _v(leg.get("mean_abs_error_pp")), _v(leg.get("mean_signed_error_pp"))],
+        ["unit-corrected (pp)", n, _v(rep.get("mean_abs_error_pp")),
+         _v(rep.get("mean_signed_error_pp"))],
+        ["matured checkpoint targets",
+         "fraction %d" % int(c.get("fraction", 0)),
+         "percent %d (tiny %d)" % (int(c.get("percent", 0)),
+                                   int(rep.get("percent_tiny") or 0)),
+         "unresolved %d (no_sibling %d, mismatch %d)" % (
+             int(c.get("unresolved", 0)), int(w.get("no_sibling", 0)),
+             int(w.get("mismatch", 0)))],
+        ["all checkpoint rows / creation this run",
+         "fraction %d / percent %d / unresolved %d" % (
+             int(a.get("fraction", 0)), int(a.get("percent", 0)),
+             int(a.get("unresolved", 0))),
+         "creation: fraction %d / percent %d / unverified %d" % (
+             int(cr.get("fraction", 0)), int(cr.get("percent", 0)),
+             int(cr.get("unverified", 0))),
+         "scaled %d" % int(cr.get("scaled", 0))],
+    ]
+
+
+def _perf_unit_log_line(rep: Dict[str, Any]) -> str:
+    leg = rep.get("legacy") or {}
+    c = rep.get("counts") or {}
+    cr = rep.get("creation") or {}
+
+    def _f(x: Any) -> str:
+        return "n/a" if x is None else ("%.2f" % float(x))
+
+    return ("[PERF-UNIT v6.39.0] mode=%s | legacy n=%s mean|err|=%spp "
+            "signed=%spp | corrected n=%s mean|err|=%spp signed=%spp | "
+            "targets fraction=%d percent=%d unresolved=%d | creation "
+            "fraction=%d percent=%d unverified=%d scaled=%d%s" % (
+                rep.get("mode"), leg.get("n"),
+                _f(leg.get("mean_abs_error_pp")),
+                _f(leg.get("mean_signed_error_pp")), rep.get("n"),
+                _f(rep.get("mean_abs_error_pp")),
+                _f(rep.get("mean_signed_error_pp")),
+                int(c.get("fraction", 0)), int(c.get("percent", 0)),
+                int(c.get("unresolved", 0)), int(cr.get("fraction", 0)),
+                int(cr.get("percent", 0)), int(cr.get("unverified", 0)),
+                int(cr.get("scaled", 0)),
+                (" | " + str(rep.get("error") or rep.get("enforce_note")))
+                if (rep.get("error") or rep.get("enforce_note")) else ""))
+
+
+def _s1_checkpoint_calibration_legacy(records: Any) -> Dict[str, Any]:
     """v6.29.0 [WAVE B] — the criterion-4 measurement. PURE: no I/O, no
     clock, no env beyond the two published thresholds. Never raises.
 
@@ -3084,6 +3435,16 @@ def s1_checkpoint_calibration(records: Any) -> Dict[str, Any]:
         f"mean |err| {mean_abs:.2f}pp vs band {band:.2f}pp over n={n}; "
         f"signed {mean_signed:+.2f}pp" + _bias_note)
     return out
+
+
+def s1_checkpoint_calibration(records: Any) -> Dict[str, Any]:
+    """v6.39.0 (P-158): the v6.29.0 measurement, verbatim, behind the
+    target-unit sentry. Gate off -> the legacy dict itself, untouched."""
+    out = _s1_checkpoint_calibration_legacy(records)
+    mode = _perf_unit_mode()
+    if mode == "off":
+        return out
+    return _s1_unit_sentry_apply(out, records, mode)
 
 
 class PerformanceStatus(str, Enum):
@@ -6824,6 +7185,8 @@ class PerformanceTrackerApp:
             base_roi = (base_price / entry_price - 1.0) * 100.0
         if base_roi == 0.0:
             return 0.0, 0.0
+        # v6.39.0 (P-158): gate off -> identity.
+        base_roi = _perf_unit_creation(base_roi, base_price, entry_price)
         frac = float(horizon.days) / self._CHECKPOINT_BASE_DAYS
         tgt_roi = base_roi * frac
         tgt_price = (entry_price * (1.0 + tgt_roi / 100.0)
@@ -6849,6 +7212,8 @@ class PerformanceTrackerApp:
 
         tgt_price = _safe_float(row.get(fkey), default=0.0) if fkey else 0.0
         tgt_roi = _safe_float(row.get(rkey), default=0.0) if rkey else 0.0
+        # v6.39.0 (P-158): gate off -> identity.
+        tgt_roi = _perf_unit_creation(tgt_roi, tgt_price, entry_price)
 
         if tgt_price <= 0.0 and tgt_roi != 0.0 and entry_price > 0.0:
             tgt_price = entry_price * (1.0 + (tgt_roi / 100.0))
@@ -7797,6 +8162,36 @@ class PerformanceTrackerApp:
             self.store.backoff.execute_sync(
                 ws.update, "A1", [S1_CAL_HEADER, row]
             )
+            # v6.39.0 (P-158): the sentry report exists only when the gate
+            # is armed; rows 4-9 are outside everything the S-1 consumer
+            # reads (rows 1-2) and the factors block (rows 12-18).
+            _us = rep_.get("unit_sentry") if isinstance(rep_, dict) else None
+            if _us:
+                try:
+                    _uts = _riyadh_now().strftime("%Y-%m-%d %H:%M:%S")
+                    _uline = _perf_unit_log_line(_us)
+                    _out(_uline)
+                    ws.update(values=_perf_unit_block_rows(_us, _uts),
+                              range_name="A4:D9",
+                              value_input_option="RAW")
+                    sheet.worksheet("_Run_Log").append_row(
+                        [_uts, "INFO", "track_performance",
+                         "Performance_Log", "UNIT_SENTRY", _uline, "", "",
+                         "", json_dumps({
+                             "mode": _us.get("mode"),
+                             "legacy": _us.get("legacy"),
+                             "n": _us.get("n"),
+                             "mean_abs_error_pp": _us.get("mean_abs_error_pp"),
+                             "mean_signed_error_pp": _us.get("mean_signed_error_pp"),
+                             "counts": _us.get("counts"),
+                             "all_checkpoints": _us.get("all_checkpoints"),
+                             "unresolved_why": _us.get("unresolved_why"),
+                             "percent_tiny": _us.get("percent_tiny"),
+                             "creation": _us.get("creation"),
+                             "version": SCRIPT_VERSION})],
+                        value_input_option="USER_ENTERED")
+                except Exception as _ue:
+                    logger.warning("[PERF-UNIT v6.39.0] block/log skipped: %s", _ue)
             return True
         except Exception as exc:
             logger.warning("[v6.29.0 WAVE-B] calibration publish failed: %s",
@@ -7810,7 +8205,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 12
+        total = 14
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -7890,6 +8285,51 @@ class PerformanceTrackerApp:
                     else:
                         os.environ[_k] = _v
             if _c12:
+                passed += 1
+            # ---- v6.39.0 (P-158) TARGET-UNIT SENTRY fixtures --------- #
+            # case 13: the unit is decided against a price-implied truth,
+            # never on magnitude (live specimen: ETO.US 30.16 -> 30.8654).
+            _t13 = (30.8654 / 30.16 - 1.0) * 100.0
+            _l1, _f1 = _perf_unit_pick(0.023388, _t13)
+            _l2, _f2 = _perf_unit_pick(2.3388, _t13)
+            _l3, _f3 = _perf_unit_pick(0.5, _t13)
+            _l4, _f4 = _perf_unit_pick(-0.0025, -0.25)
+            _l5, _f5 = _perf_unit_pick(-0.25, -0.25)
+            if (_l1 == "fraction" and _f1 is not None
+                    and abs(_f1 - 2.3388) < 1e-9
+                    and _l2 == "percent" and _f2 == 2.3388
+                    and _l3 == "unresolved" and _f3 is None
+                    and _l4 == "fraction" and _f4 is not None
+                    and abs(_f4 + 0.25) < 1e-12
+                    and _l5 == "percent" and _f5 == -0.25):
+                passed += 1
+            # case 14: gate parsing (explicit words only) and the OFF
+            # identity at the creation seam; env + counters restored.
+            _sv14 = os.environ.get("TFB_PERF_TARGET_UNIT_SENTRY")
+            _cv14 = dict(_PERF_UNIT_CREATION)
+            try:
+                os.environ.pop("TFB_PERF_TARGET_UNIT_SENTRY", None)
+                _c14 = _perf_unit_mode() == "off"
+                _c14 = _c14 and _perf_unit_creation(0.023388, 30.8654, 30.16) == 0.023388
+                _c14 = _c14 and dict(_PERF_UNIT_CREATION) == _cv14
+                for _w14, _e14 in (("observe", "observe"), (" ENFORCE ", "enforce"),
+                                   ("1", "off"), ("true", "off"), ("on", "off")):
+                    os.environ["TFB_PERF_TARGET_UNIT_SENTRY"] = _w14
+                    _c14 = _c14 and _perf_unit_mode() == _e14
+                os.environ["TFB_PERF_TARGET_UNIT_SENTRY"] = "observe"
+                _c14 = _c14 and _perf_unit_creation(0.023388, 30.8654, 30.16) == 0.023388
+                os.environ["TFB_PERF_TARGET_UNIT_SENTRY"] = "enforce"
+                _c14 = _c14 and abs(_perf_unit_creation(0.023388, 30.8654, 30.16) - 2.3388) < 1e-9
+                _c14 = _c14 and _perf_unit_creation(2.3388, 30.8654, 30.16) == 2.3388
+                _c14 = _c14 and _perf_unit_creation(0.023388, 0.0, 30.16) == 0.023388
+            finally:
+                if _sv14 is None:
+                    os.environ.pop("TFB_PERF_TARGET_UNIT_SENTRY", None)
+                else:
+                    os.environ["TFB_PERF_TARGET_UNIT_SENTRY"] = _sv14
+                _PERF_UNIT_CREATION.clear()
+                _PERF_UNIT_CREATION.update(_cv14)
+            if _c14:
                 passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
