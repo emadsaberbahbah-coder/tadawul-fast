@@ -1121,6 +1121,18 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
+          # (2026-09-22) P-158 TARGET-UNIT SENTRY — scripts/track_performance.py
+          # v6.39.0 (deployed 2026-09-21: [PERF-VERDICT v6.39.0] selftest=PASS 14/14).
+          # observe: criterion-4 row untouched, stored rows never rewritten; adds
+          # the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9 and
+          # ONE [PERF-UNIT v6.39.0] _Run_Log line per run (fraction/percent/
+          # unresolved counts). Explicit words only: off|observe|enforce.
+          # KILL-SWITCH: delete this line -> off (v6.39.0 default = legacy).
+          # Hardcoded here, not a repo Variable (S-1 lesson 2026-09-10: a Variable
+          # can be silently unset). This step runs in GitHub Actions, so a Render
+          # env var would never be seen. Enforce = separate sitting with the S-1
+          # criterion-4 boundary note.
+          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
