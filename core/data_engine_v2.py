@@ -3547,6 +3547,59 @@ if str(ROOT_DIR) not in sys.path:
 # is ever overturned in writing. Zero removals; one helper added;
 # default OFF is behavior-identical to v5.141.0.
 # -----------------------------------------------------------------------------
+# WHY v5.147.0 (F-7 SCORING SETTLE PASS -- pass-dependent scoring; new env
+# TFB_SCORING_SETTLE off|observe|enforce, default off = byte-identical
+# v5.145.0; TFB_SCORING_SETTLE_MAX_PASSES default 4, clamped 2..5):
+# The orchestrator scores a row BEFORE Phase-II enriches it:
+#   _compute_scores_canonical_first(merged)  ->  _apply_phase_dd_enhancements(merged)
+# so pass 1 is scored without intrinsic_value/upside_pct (valuation reads
+# them) and -- when the forecast is synthetic or the analyst target arrives via
+# the R-6 keep-last-good restore inside _phase_ii_quality_forecast -- without
+# ANY forecast at scoring time. core.scoring then labels the row
+# both_present_fallback (0.65*valuation + 0.35*momentum) even though the
+# published row carries a forecast, and the investability gate's -15 "fallback"
+# reliability leg fires on a label that describes pass ORDER, not data.
+# Measured 2026-09-21/22 (sheet, mapping-free): 3,705 -> 3,970 GM rows read
+# both_present_fallback while publishing ROI12; the -15 leg fired on 3,214 rows
+# (rel 54.3 vs 71.5 for the same stock scored warm); of 152 INVESTABLE GM rows
+# only the 48 roi_based ones clear the 70 add-floor; every non-KRP board seat
+# (ADAM, CRC, ITRN, GLNG, TSM) sat at 54.3 -> WATCHLIST -> seat churn, and a
+# real-engine replay showed pass-2 overall moving >=5 pts on 173/300 late-target
+# rows with 104/300 recommendation changes (pass 3 == pass 2), synthetic rows
+# converging by pass 3 (the synthesis reads scores, so it needs one more pass),
+# and a specimen overall 76.78 cold vs 65.71 warm across the 68 gate.
+# FIX (Option A, the operator's choice over a pipeline reorder): one seam right
+# after the pair -- _f7_settle_pass(merged) -- re-runs the SAME pair on a deep
+# copy until the decision fields (overall/opportunity/valuation scores,
+# forecast_confidence, expected_roi_12m (0.01pp), recommendation,
+# opportunity_source, forecast_source) stop moving, capped at MAX_PASSES.
+#   off      -> function returns the row untouched (default; byte-identical).
+#   observe  -> values untouched; ONE countable substring-safe tag on rows whose
+#               pass-2 output would differ:
+#               f7_settle:observe:st<k|x>:p<n>:<code>=<before>><after>...
+#               (st = pass at which it stopped changing, x = still moving at the
+#               cap; codes ov op va fcf r12 rc os fs; source tokens rewritten
+#               bpf/mof/rb/ins/pt/sy so the tag never carries cap/forecast/
+#               target/roi/drop/reject/provider_target/price_bar_stale/
+#               xprovider_price_conflict -- the gate's own substring tests).
+#   enforce  -> the settled row (last pass) replaces the pass-1 row and carries
+#               the same tag; rows already stable after pass 2 are returned
+#               untouched (byte-identical, no tag). Blast radius = tagged rows.
+# Re-run safety proven on source: every tag writer dedupes (_aq_append_warning,
+# _v573_append_warning), _tgt_lkg_capture refuses carry-tagged rows (a restore
+# cannot launder itself), _compute_intrinsic_and_upside is fill-only (no
+# intrinsic<->synthetic-forecast feedback loop), the classifier is idempotent
+# (v5.77.16/17). Fail-open: any exception returns the original row. WHICH
+# horizon is scored is untouched (F-1); the reliability arithmetic is untouched
+# (P-115b) -- the label that feeds it becomes truthful. Enforce changes published
+# scores/recommendations on many rows: observe first, enforce only with the S-1
+# boundary note. Mode disclosed in the [GUARDS] boot line and /health
+# engine_gates.scoring_settle. Functions added: 6 (_f7_settle_mode,
+# _f7_settle_max_passes, _f7_settle_token, _f7_settle_fmt, _f7_settle_diff,
+# _f7_settle_tag) + _f7_settle_pass = 7. Removed: 0. v5.146.0 is a burned
+# number (an uncommitted P-102 build); P-102 re-issues as v5.148.0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
 # WHY v5.145.0 (P-151 CRYPTO-PAIR SHAPE — asset-class / exchange identity for
 # Yahoo crypto pairs; new env TFB_SYM_CRYPTO_PAIR_CLASS off|observe|enforce,
 # default off = byte-identical v5.144.0):
@@ -3650,7 +3703,7 @@ if str(ROOT_DIR) not in sys.path:
 # Zero removals; five constants and two tags added; every existing tag
 # string unchanged. Rollback: git revert (env unchanged).
 # -----------------------------------------------------------------------------
-__version__ = "5.145.0"
+__version__ = "5.147.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5380,6 +5433,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "fund_unit_sentry": _fund_unit_sentry_mode(),              # v5.143.0
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
+            "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
         }
     except Exception:
         return {}
@@ -8265,6 +8319,172 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
         _build_top_factors_and_risks(row)
 
     return row
+
+
+# =============================================================================
+# v5.147.0 (F-7) -- SCORING SETTLE PASS (see WHY v5.147.0)
+# =============================================================================
+_F7_SETTLE_ENV: str = "TFB_SCORING_SETTLE"
+_F7_SETTLE_MAX_ENV: str = "TFB_SCORING_SETTLE_MAX_PASSES"
+_F7_SETTLE_MAX_DEFAULT: int = 4
+_F7_SETTLE_MAX_CAP: int = 5
+_F7_SETTLE_TAG: str = "f7_settle"
+# (row key, tag code, kind, tolerance) -- the decision fields compared between
+# consecutive passes. Codes are chosen so the finished tag can never contain a
+# substring the investability gate tests on warnings (_REL_PATH_FORBIDDEN).
+_F7_SETTLE_FIELDS: Tuple[Tuple[str, str, str, float], ...] = (
+    ("overall_score", "ov", "num", 0.05),
+    ("opportunity_score", "op", "num", 0.05),
+    ("valuation_score", "va", "num", 0.05),
+    ("forecast_confidence", "fcf", "num", 0.001),
+    ("expected_roi_12m", "r12", "num", 0.0001),
+    ("recommendation", "rc", "str", 0.0),
+    ("opportunity_source", "os", "str", 0.0),
+    ("forecast_source", "fs", "str", 0.0),
+)
+_F7_SETTLE_SRC_REWRITES: Tuple[Tuple[str, str], ...] = (
+    ("both_present_fallback", "bpf"), ("momentum_only_fallback", "mof"),
+    ("roi_based", "rb"), ("insufficient", "ins"),
+    ("provider_target", "pt"), ("phase_ii_synthetic", "sy"),
+)
+
+
+def _f7_settle_mode() -> str:
+    """TFB_SCORING_SETTLE: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off, so an accidental boolean can never arm
+    a value-changing mode. Read at call time (no restart needed)."""
+    raw = (os.getenv(_F7_SETTLE_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _f7_settle_max_passes() -> int:
+    """TFB_SCORING_SETTLE_MAX_PASSES: total passes incl. the orchestrator's
+    pass 1; default 4, clamped to [2, 5] so a config typo can never loop."""
+    n = _get_env_int(_F7_SETTLE_MAX_ENV, _F7_SETTLE_MAX_DEFAULT)
+    try:
+        n = int(n)
+    except Exception:
+        n = _F7_SETTLE_MAX_DEFAULT
+    return max(2, min(_F7_SETTLE_MAX_CAP, n))
+
+
+def _f7_settle_token(value: Any) -> str:
+    """Rewrite a source/label token so it stays readable but can never carry
+    one of the gate's forbidden substrings (longest rewrites first, then the
+    rel_path table as defense in depth)."""
+    s = _safe_str(value).strip().lower()
+    if not s:
+        return "na"
+    for old, new in _F7_SETTLE_SRC_REWRITES:
+        s = s.replace(old, new)
+    for old, new in _REL_PATH_SRC_REWRITES:
+        s = s.replace(old, new)
+    s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+    return s[:16] or "na"
+
+
+def _f7_settle_fmt(kind: str, value: Any) -> str:
+    """Compact disclosure of a compared value (scores 2dp, fractions 4dp)."""
+    if kind == "num":
+        f = _as_float(value)
+        if f is None:
+            return "na"
+        s = ("%.4f" % f) if abs(f) < 1.0 else ("%.2f" % f)
+        s = s.rstrip("0").rstrip(".") if "." in s else s
+        return s or "0"
+    return _f7_settle_token(value)
+
+
+def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any]) -> List[Tuple[str, str, str]]:
+    """Decision fields whose value differs between two passes, as
+    (code, before, after) tokens. Missing-on-both is equal; never raises."""
+    out: List[Tuple[str, str, str]] = []
+    try:
+        for key, code, kind, tol in _F7_SETTLE_FIELDS:
+            a = prev.get(key)
+            b = cand.get(key)
+            if kind == "num":
+                fa = _as_float(a)
+                fb = _as_float(b)
+                if fa is None and fb is None:
+                    continue
+                if fa is None or fb is None or abs(fa - fb) > tol:
+                    out.append((code, _f7_settle_fmt(kind, a), _f7_settle_fmt(kind, b)))
+            else:
+                sa = _safe_str(a).strip().upper()
+                sb = _safe_str(b).strip().upper()
+                if sa != sb:
+                    out.append((code, _f7_settle_token(a), _f7_settle_token(b)))
+    except Exception:
+        pass
+    return out
+
+
+def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
+                   first_diff: List[Tuple[str, str, str]]) -> str:
+    """ONE substring-safe tag: f7_settle:<mode>:st<k|x>:p<n>:code=before>after
+    (at most 6 field disclosures; st = pass at which the row stopped changing,
+    x = still moving at the cap; p = re-passes executed). If a disclosure ever
+    contained a forbidden substring the tag degrades to a count-only form."""
+    parts = [_F7_SETTLE_TAG, mode, "st%s" % (settled_at if settled_at else "x"), "p%d" % int(passes_run)]
+    for code, a, b in list(first_diff)[:6]:
+        parts.append("%s=%s>%s" % (code, a, b))
+    tag = ":".join(parts)
+    low = tag.lower()
+    if any(f in low for f in _REL_PATH_FORBIDDEN):
+        tag = ":".join(parts[:4]) + ":chg%d" % len(first_diff)
+    return tag
+
+
+def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
+    """v5.147.0 (F-7): re-run the scoring + enhancement pair on a deep copy of
+    the pass-1 row until the decision fields stop moving (cap
+    TFB_SCORING_SETTLE_MAX_PASSES). off -> row untouched. observe -> values
+    untouched, ONE countable tag on rows whose pass-2 output would differ.
+    enforce -> the settled row (last pass) replaces the pass-1 row and carries
+    the tag; rows already stable after pass 2 are returned untouched.
+    Fail-open: any exception returns the original row unchanged."""
+    mode = _f7_settle_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return row
+    try:
+        import copy as _copy
+        max_passes = _f7_settle_max_passes()
+        prev: Dict[str, Any] = row
+        last: Dict[str, Any] = row
+        first_diff: Optional[List[Tuple[str, str, str]]] = None
+        settled_at: Optional[int] = None
+        passes_run = 0
+        for k in range(2, max_passes + 1):
+            cand = _copy.deepcopy(prev)
+            _compute_scores_canonical_first(cand)
+            _apply_phase_dd_enhancements(cand)
+            passes_run += 1
+            diff = _f7_settle_diff(prev, cand)
+            if first_diff is None:
+                first_diff = diff
+            if not diff:
+                settled_at = k
+                if k > 2:
+                    last = cand
+                break
+            last = cand
+            prev = cand
+        if not first_diff:
+            return row
+        tag = _f7_settle_tag(mode, settled_at, passes_run, first_diff)
+        if mode == "observe":
+            _v573_append_warning(row, tag)
+            return row
+        _v573_append_warning(last, tag)
+        return last
+    except Exception as _sx:  # pragma: no cover - defensive
+        logger.debug(
+            "[engine_v2 v%s F-7] settle pass failed open for %s (page=%s): %s: %s",
+            __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+            _sx.__class__.__name__, _sx,
+        )
+        return row
 
 
 # =============================================================================
@@ -15481,7 +15701,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s",
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15496,6 +15716,7 @@ class DataEngineV5:
                 _g(_final_action_invariant_enabled),
                 _g(_fund_lkg_enabled),
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
+                _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
             )
         except Exception:
             pass
@@ -16859,6 +17080,10 @@ class DataEngineV5:
                     merged["_decision_symbol"] = True
                 _compute_scores_canonical_first(merged)
                 _apply_phase_dd_enhancements(merged)
+                # v5.147.0 (F-7): settle the pass-dependent scores. off ->
+                # returns merged untouched (byte-identical); observe -> tag
+                # only; enforce -> the settled row replaces the pass-1 row.
+                merged = _f7_settle_pass(merged, sym, page_ctx)
             else:
                 _mark_row_as_empty(merged)
 
