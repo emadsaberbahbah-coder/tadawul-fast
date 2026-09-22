@@ -3547,6 +3547,40 @@ if str(ROOT_DIR) not in sys.path:
 # is ever overturned in writing. Zero removals; one helper added;
 # default OFF is behavior-identical to v5.141.0.
 # -----------------------------------------------------------------------------
+# WHY v5.148.0 (P-102 FC-TUPLE COHERENCE -- re-issue of the never-committed
+# v5.146.0 build on the v5.147.0 base; new env TFB_FC_TUPLE_COHERENT
+# off|observe|enforce, default off = byte-identical v5.147.0):
+# The sheet publishes rows whose Expected ROI contradicts their own
+# (forecast price, current price) pair: 2026-09-20 export 173 rows
+# (Market_Leaders 46 = 18% of the Saudi page, Global_Markets 127; 172 at 12M
+# + 1 at 3M; 37 off by >2pp; sign flip 4090.SR stored +1.46% vs implied
+# -0.91%; board seat 2222.SR 22.28% vs 22.85%), 2026-09-21 157, 2026-09-22
+# 180 (ML 34 / GM 146) under the same tolerance. Root pinned on source:
+# expected_roi_* is derived ONCE (Phase-II honor branch / synthesis / the
+# eq_roi backfill), then the R-6 keep-last-good restore re-plants
+# forecast_price_12m and every price refresh replaces current_price -- nothing
+# re-derives the ROI, so the published triple is a vintage mix.
+# FIX: _fc_tuple_coherence(row) runs immediately BEFORE _apply_investability_gate
+# at all three publish boundaries (_strict_project_row, get_page_rows, the
+# direct Top_10 path) so the gate and every consumer read a coherent triple.
+# Per leg (12m/3m/1m) with cp>0, fp>0 and a stored ROI in the FRACTION domain
+# (|roi| <= 1.5): implied = (fp-cp)/cp; tol = max(0.0005, 2*0.005/cp + 0.0002)
+# (two 2-dp price roundings relative to cp, plus slack).
+#   off     -> function is inert (default; byte-identical rows).
+#   observe -> ONE countable tag per incoherent leg, fctuple_vintage:<h>:observe;
+#              values untouched.
+#   enforce -> expected_roi_<h> = round(implied, 6) + fctuple_vintage:<h>:enforce;
+#              prices are never touched, a percent-domain ROI is never scaled
+#              (units belong to the P-101/P-143 sentries), a missing ROI is left
+#              to the backfill. Idempotent: a second pass finds 0 residual.
+# Tag is substring-safe against the gate's own warnings tests (no cap/
+# forecast/target/roi/drop/reject/provider_target/price_bar_stale/
+# xprovider_price_conflict). Mode in the [GUARDS] boot line (fc_tuple=) and
+# /health engine_gates.fc_tuple_coherent. Enforce is a VALUE change on ~180
+# rows incl. board seats -> observe first, enforce as a separate sitting.
+# Functions added: 3 (_fc_tuple_mode, _fc_tuple_tol, _fc_tuple_coherence).
+# Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
 # WHY v5.147.0 (F-7 SCORING SETTLE PASS -- pass-dependent scoring; new env
 # TFB_SCORING_SETTLE off|observe|enforce, default off = byte-identical
 # v5.145.0; TFB_SCORING_SETTLE_MAX_PASSES default 4, clamped 2..5):
@@ -3703,7 +3737,7 @@ if str(ROOT_DIR) not in sys.path:
 # Zero removals; five constants and two tags added; every existing tag
 # string unchanged. Rollback: git revert (env unchanged).
 # -----------------------------------------------------------------------------
-__version__ = "5.147.0"
+__version__ = "5.148.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5434,6 +5468,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
+            "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
         }
     except Exception:
         return {}
@@ -6631,6 +6666,72 @@ def _dq_coherence_cap(row, dq, warns):
         return _DQ_COHERENCE_CAP, "dq_capped:coherence:" + reason
     except Exception:
         return dq, None
+
+
+# =============================================================================
+# v5.148.0 (P-102) -- FC-TUPLE COHERENCE (see WHY v5.148.0)
+# =============================================================================
+_FCT_ENV: str = "TFB_FC_TUPLE_COHERENT"
+_FCT_TAG: str = "fctuple_vintage"
+_FCT_LEGS: Tuple[Tuple[str, str, str], ...] = (
+    ("12m", "forecast_price_12m", "expected_roi_12m"),
+    ("3m", "forecast_price_3m", "expected_roi_3m"),
+    ("1m", "forecast_price_1m", "expected_roi_1m"),
+)
+_FCT_FRACTION_DOMAIN_MAX: float = 1.5   # |roi| above this is percent points: never scaled here
+
+
+def _fc_tuple_mode() -> str:
+    """TFB_FC_TUPLE_COHERENT: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_FCT_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _fc_tuple_tol(cp: float) -> float:
+    """Tolerance for |implied - stored|: two 2-dp price roundings relative to
+    the current price plus 0.02pp slack, floored at 0.05pp."""
+    try:
+        return max(0.0005, 2.0 * 0.005 / float(cp) + 0.0002)
+    except Exception:
+        return 0.0005
+
+
+def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
+    """v5.148.0 (P-102): make expected_roi_<h> agree with the row's own
+    (forecast_price_<h>, current_price) pair at the publish boundary. Returns
+    the number of legs tagged (observe) or repaired (enforce). Never raises;
+    off -> 0 and the row is untouched."""
+    mode = _fc_tuple_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    n = 0
+    try:
+        cp = _as_float(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return 0
+        tol = _fc_tuple_tol(cp)
+        for h, fp_key, roi_key in _FCT_LEGS:
+            fp = _as_float(row.get(fp_key))
+            if fp is None or fp <= 0:
+                continue
+            stored = _as_float(row.get(roi_key))
+            if stored is None:
+                continue  # left to the backfill
+            if abs(stored) > _FCT_FRACTION_DOMAIN_MAX:
+                continue  # percent domain: units are the sentries' job, never scaled here
+            implied = (fp - cp) / cp
+            if abs(implied - stored) <= tol:
+                continue
+            if mode == "enforce":
+                row[roi_key] = round(implied, 6)
+                _v573_append_warning(row, "%s:%s:enforce" % (_FCT_TAG, h))
+            else:
+                _v573_append_warning(row, "%s:%s:observe" % (_FCT_TAG, h))
+            n += 1
+    except Exception:
+        return n
+    return n
 
 
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
@@ -14434,6 +14535,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # before rows leave the API, so recommendation can never disagree with
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
+    _fc_tuple_coherence(row)  # v5.148.0 (P-102): coherent (fp, cp, roi) triple BEFORE the gate reads it
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
@@ -15701,7 +15803,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s",
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15717,6 +15819,7 @@ class DataEngineV5:
                 _g(_fund_lkg_enabled),
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
+                _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
             )
         except Exception:
             pass
@@ -17519,6 +17622,7 @@ class DataEngineV5:
         # path that returns rows then has recommendation == recommendation_detailed.
         for _r in rows:
             _reconcile_recommendation_family(_r)
+            _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
@@ -17625,6 +17729,7 @@ class DataEngineV5:
                 # requirement is actually applied on both Top_10 paths.
                 for _r in rows:
                     _reconcile_recommendation_family(_r)
+                    _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
                     _apply_investability_gate(_r)
                     _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
                 # v5.77.23 (Fix J): same Top 10 eligibility filter as the
