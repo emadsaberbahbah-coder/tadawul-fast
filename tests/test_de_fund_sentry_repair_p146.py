@@ -1,23 +1,20 @@
-"""P-146 (data_engine_v2 v5.143.0) — FUND-SENTRY repair leg + mode disclosure.
+"""P-151 (data_engine_v2 v5.145.0) — CRYPTO-PAIR SHAPE: asset-class /
+exchange / currency identity for Yahoo crypto pairs (<ROOT>-<QUOTE>).
+Repo-runnable battery T1-T7 over the REAL module (no stand-ins), driving
+_apply_symbol_context_defaults (the Commodities_FX identity block where the
+49 mislabelled rows of the 2026-09-20 export live) and the three inferrers.
 
-Repo-runnable battery T1-T9 over the REAL module (no stand-ins). Goldens:
-  * ROW_0845 / ROW_0858 — the v5.140.0 DDI.US production snapshots
-    (2026-09-10; the 100x fraction signature and its coherent twin).
-  * Inputs lifted VERBATIM from the 2026-09-19 Global_Markets / My_Portfolio
-    exports (market_cap / pe_ttm / revenue_ttm as exported): BRK-B.US and
-    BNY.US (quarantined on that export with PLAUSIBLE implied margins
-    21.68 / 14.31), ESSA.JK / HQH.US / GDHG.US (unit-inconsistent inputs,
-    implied 265,434 / 4,613 / 39,679 pp), DDI.US holding row (implied 33.25).
 Properties asserted at HEAD:
-  off inert; observe byte-identical to v5.140.0 (tag-only, never repairs or
-  skips); enforce = three-way verdict (fail-open above 100pp, repair inside
-  the 100x band [90,110] in both directions, quarantine otherwise); repaired
-  values always land inside the plausible window; band edges; tags
-  substring-safe; mode disclosed in surface_gate_states() and wired into
-  the [GUARDS] boot line.
-
-Run:  python tests/test_de_fund_sentry_repair_p146.py
-      (or pytest -q tests/test_de_fund_sentry_repair_p146.py)
+  off (unset) => rows and inferrers byte-identical to v5.144.0; observe =>
+  values untouched + ONE countable crypto_pair_shape:observe tag on a shaped
+  row whose class is missing or equity-like; enforce => asset_class "Crypto",
+  a NASDAQ/NYSE or blank exchange -> "Crypto", blank currency -> <QUOTE>,
+  tagged crypto_pair_shape:enforce; a provider-declared non-equity class is
+  never rewritten; share-class dashes (BRK-B, AKO-B.US, GRT-UN.TO), FX (=X),
+  futures (=F) and indices (^) never match; idempotent; mode disclosed in
+  surface_gate_states(); tags substring-safe.
+Run:  python tests/test_de_crypto_pair_shape_p151.py
+      (or pytest -q tests/test_de_crypto_pair_shape_p151.py)
 """
 import copy
 import hashlib
@@ -30,179 +27,166 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 de = importlib.import_module("core.data_engine_v2")
 
-# ---- goldens -----------------------------------------------------------------
-ROW_0845 = {"symbol": "DDI.US", "pe_ttm": 5.04, "market_cap": 631806336.0,
-            "revenue_ttm": 380037581.0, "profit_margin": 0.33}
-ROW_0858 = {"symbol": "DDI.US", "pe_ttm": 5.05, "market_cap": 630319770.0,
-            "revenue_ttm": 380043008.0, "profit_margin": 32.91}
-# 2026-09-19 export inputs (implied margin recomputed from these exact numbers)
-BRKB = {"symbol": "BRK-B.US", "pe_ttm": 13.07, "market_cap": 1090049409024.0,
-        "revenue_ttm": 384687000000.0}                     # implied 21.68
-BNY = {"symbol": "BNY.US", "pe_ttm": 17.92, "market_cap": 103824703488.0,
-       "revenue_ttm": 40481000000.0}                       # implied 14.31
-DDI_0919 = {"symbol": "DDI.US", "pe_ttm": 5.00, "market_cap": 631806360.0,
-            "revenue_ttm": 380043008.0}                    # implied 33.25
-ESSA = {"symbol": "ESSA.JK", "pe_ttm": 11.5723, "market_cap": 10422320103424.0,
-        "revenue_ttm": 339303576.0}                        # implied 265,434
-HQH = {"symbol": "HQH.US", "pe_ttm": 4.796421, "market_cap": 1226201570.0,
-       "revenue_ttm": 5541667.0}                           # implied 4,613
-GDHG = {"symbol": "GDHG.US", "pe_ttm": 0.0061, "market_cap": 67819624.0,
-        "revenue_ttm": 28020070.0}                         # implied 39,679
+ENV = "TFB_SYM_CRYPTO_PAIR_CLASS"
+FORBIDDEN = ("cap", "forecast", "target", "roi", "drop", "reject",
+             "provider_target", "price_bar_stale", "xprovider_price_conflict")
 
-REPAIRED = "fund_coherence_repaired:profit_margin"
-SKIPPED = "fund_coherence_skipped:profit_margin:implied_oob"
-QUAR = "fund_coherence_quarantined:profit_margin"
+# 2026-09-20 Commodities_FX specimens (shape + the exported labels)
+FLOW = {"symbol": "FLOW-USD", "asset_class": "Equity", "exchange": "NASDAQ/NYSE",
+        "currency": "USD", "current_price": 0.03}
+SHIB = {"symbol": "SHIB-USD", "asset_class": "Equity", "exchange": "", "currency": ""}
+DOT_DECLARED = {"symbol": "DOT-USD", "asset_class": "CRYPTOCURRENCY", "exchange": "CCC",
+                "currency": "USD"}
+BARE = {"symbol": "ETC-USD"}                                  # nothing declared
+BRKB = {"symbol": "BRK-B", "asset_class": "Equity", "exchange": "NASDAQ/NYSE"}
+AKO = {"symbol": "AKO-B.US", "asset_class": "Equity"}
+GRT = {"symbol": "GRT-UN.TO", "asset_class": "Equity"}
+FX = {"symbol": "IDRUSD=X"}
+FUT = {"symbol": "HG=F", "asset_class": "Commodity", "currency": "USD"}
+CRC = {"symbol": "CRC.US", "asset_class": "Equity", "exchange": "NYSE/NASDAQ"}
 
 
-def _implied(r):
-    return 100.0 * (r["market_cap"] / r["pe_ttm"]) / r["revenue_ttm"]
+def _env(mode=None):
+    os.environ.pop(ENV, None)
+    if mode is not None:
+        os.environ[ENV] = mode
 
 
-def _row(base, pm):
-    r = copy.deepcopy(base)
-    r["profit_margin"] = pm
-    return r
-
-
-def _run(base, pm, mode):
-    r = _row(base, pm)
-    tag = de._fund_coherence_sentry(r, mode)
-    return tag, r["profit_margin"]
-
-
-# ---- T1 off is inert ----------------------------------------------------------
-def test_t1_off_inert():
-    for base, pm in ((ROW_0845, 0.33), (BRKB, 0.2168), (ESSA, 12.5)):
-        r = _row(base, pm)
-        assert de._fund_coherence_sentry(r, "off") is None
-        assert r == _row(base, pm)
-
-
-# ---- T2 observe byte-identical to v5.140.0 -----------------------------------
-def test_t2_observe_tag_only_never_repairs_or_skips():
-    # 100x signature, plausible-implied 100x, and OOB shapes: observe ALWAYS
-    # returns the v5.140.0 observe tag and NEVER mutates the row.
-    for base, pm in ((ROW_0845, 0.33), (BRKB, 0.2168), (BNY, 0.1431),
-                     (ESSA, 12.5), (HQH, 40.0), (BRKB, 2168.0)):
-        tag, val = _run(base, pm, "observe")
-        assert tag == QUAR + ":observe", (base["symbol"], tag)
-        assert val == pm
-    # coherent twin stays quiet in observe as before
-    assert de._fund_coherence_sentry(copy.deepcopy(ROW_0858), "observe") is None
-
-
-# ---- T3 enforce repairs the 100x fraction (x100) -------------------------------
-def test_t3_enforce_repair_x100():
-    tag, val = _run(ROW_0845, 0.33, "enforce")
-    assert tag == REPAIRED + ":x100" and abs(val - 33.0) < 1e-9
-    for base, frac in ((BRKB, 0.2168), (BNY, 0.1431), (DDI_0919, 0.3325)):
-        tag, val = _run(base, frac, "enforce")
-        assert tag == REPAIRED + ":x100", (base["symbol"], tag)
-        assert abs(val - frac * 100.0) < 1e-6
-        # repaired value coheres with the implied benchmark (< 8x, ~1x here)
-        assert abs(val / _implied(base) - 1.0) < 0.02
-
-
-# ---- T4 enforce repairs the 100x-inflated percent (d100) -----------------------
-def test_t4_enforce_repair_d100():
-    for base, pct in ((BRKB, 2168.0), (BNY, 1431.0)):
-        tag, val = _run(base, pct, "enforce")
-        assert tag == REPAIRED + ":d100", (base["symbol"], tag)
-        assert abs(val - pct / 100.0) < 1e-6
-
-
-# ---- T5 enforce fails OPEN above 100pp implied ---------------------------------
-def test_t5_enforce_oob_fail_open():
-    for base, pm in ((ESSA, 12.5), (HQH, 40.0), (GDHG, 3.2), (ESSA, 0.125)):
-        tag, val = _run(base, pm, "enforce")
-        assert tag == SKIPPED, (base["symbol"], tag)
-        assert val == pm                                   # value untouched
-
-
-# ---- T6 enforce quarantines non-signature divergence exactly as v5.140.0 -------
-def test_t6_enforce_quarantine_unchanged_outside_band():
-    imp = _implied(BRKB)                                   # 21.68
-    for pm in (imp / 20.0, imp * 20.0, imp / 50.0, imp * 12.0):
-        tag, val = _run(BRKB, pm, "enforce")
-        assert tag == QUAR and val is None, (pm, tag)
-    # coherent rows stay quiet; tiny implied never judged (v5.140.0 guards)
-    assert de._fund_coherence_sentry(copy.deepcopy(ROW_0858), "enforce") is None
-    tiny = {"pe_ttm": 100.0, "market_cap": 1e8, "revenue_ttm": 1e9,
-            "profit_margin": 90.0}
-    assert de._fund_coherence_sentry(tiny, "enforce") is None
-
-
-# ---- T7 band edges + plausible-window invariant --------------------------------
-def test_t7_band_edges_and_window():
-    imp = _implied(BRKB)
-    lo, hi = de._FUND_SENTRY_REPAIR_RATIO_LO, de._FUND_SENTRY_REPAIR_RATIO_HI
-    assert (lo, hi) == (90.0, 110.0)
-    assert _run(BRKB, imp / lo, "enforce")[0] == REPAIRED + ":x100"
-    assert _run(BRKB, imp / hi, "enforce")[0] == REPAIRED + ":x100"
-    assert _run(BRKB, imp / (lo - 0.5), "enforce")[0] == QUAR
-    assert _run(BRKB, imp / (hi + 0.5), "enforce")[0] == QUAR
-    assert _run(BRKB, imp * lo, "enforce")[0] == REPAIRED + ":d100"
-    assert _run(BRKB, imp * (hi + 0.5), "enforce")[0] == QUAR
-    # a repair can only ever land inside [MIN, MAX] pp (the guards bound it)
-    for base in (BRKB, BNY, DDI_0919):
-        for pm in (_implied(base) / 100.0, _implied(base) * 100.0):
-            tag, val = _run(base, pm, "enforce")
-            assert tag.startswith(REPAIRED)
-            assert (de._FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT <= abs(val)
-                    <= de._FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT)
-
-
-# ---- T8 tags substring-safe (reliability-scan bans) ----------------------------
-def test_t8_tags_substring_safe():
-    banned = ("cap", "forecast", "target", "roi", "drop", "reject")
-    for t in (de._FUND_SENTRY_REPAIRED_TAG, de._FUND_SENTRY_SKIPPED_TAG,
-              de._FUND_SENTRY_QUARANTINE_TAG, de._FUND_SENTRY_TAG_PREFIX):
-        assert not any(b in t.lower() for b in banned), t
-    assert de._FUND_SENTRY_QUARANTINE_TAG == "fund_coherence_quarantined"
-
-
-# ---- T9 mode disclosure: health engine_gates + boot-line wiring ----------------
-def test_t9_mode_disclosure():
-    saved = os.environ.get("TFB_FUND_UNIT_SENTRY")
+def _apply(row, page="Commodities_FX", mode=None):
+    _env(mode)
     try:
-        for raw, want in ((None, "off"), ("observe", "observe"),
-                          ("enforce", "enforce"), ("1", "enforce"),
-                          ("garbage", "off")):
-            if raw is None:
-                os.environ.pop("TFB_FUND_UNIT_SENTRY", None)
-            else:
-                os.environ["TFB_FUND_UNIT_SENTRY"] = raw
-            assert de._fund_unit_sentry_mode() == want
-            assert de.surface_gate_states().get("fund_unit_sentry") == want
+        return de._apply_symbol_context_defaults(copy.deepcopy(row), row["symbol"], page)
     finally:
-        if saved is None:
-            os.environ.pop("TFB_FUND_UNIT_SENTRY", None)
-        else:
-            os.environ["TFB_FUND_UNIT_SENTRY"] = saved
+        _env(None)
+
+
+def _digest(r):
+    return hashlib.sha256(json.dumps(r, sort_keys=True, default=str).encode()).hexdigest()
+
+
+ALL = (FLOW, SHIB, DOT_DECLARED, BARE, BRKB, AKO, GRT, FX, FUT, CRC)
+
+
+# ---- T1 helpers ------------------------------------------------------------------
+def test_t1_helpers():
+    _env(None)
+    assert de._crypto_pair_class_mode() == "off"
+    for v in ("observe", "ENFORCE"):
+        os.environ[ENV] = v
+        assert de._crypto_pair_class_mode() == v.lower()
+    os.environ[ENV] = "1"
+    assert de._crypto_pair_class_mode() == "off"       # no boolean alias: explicit words only
+    _env(None)
+    assert de._crypto_pair_shape("FLOW-USD") == "USD"
+    assert de._crypto_pair_shape("eth-usdt") == "USDT"
+    assert de._crypto_pair_shape("BTC-EUR") == "EUR"
+    for s in ("BRK-B", "AKO-B.US", "GRT-UN.TO", "IDRUSD=X", "HG=F", "^GSPC", "X-USD",
+              "VERYLONGROOTNAME-USD", "", None, "BTC-USD.X", "BTC_USD"):
+        assert de._crypto_pair_shape(s) == "", s
+    assert de._crypto_pair_class_like_equity("") and de._crypto_pair_class_like_equity(None)
+    assert de._crypto_pair_class_like_equity("Equity") and de._crypto_pair_class_like_equity("EQUITY")
+    assert not de._crypto_pair_class_like_equity("CRYPTOCURRENCY")
+    assert not de._crypto_pair_class_like_equity("FX") and not de._crypto_pair_class_like_equity("Commodity")
+
+
+# ---- T2 off identity ---------------------------------------------------------------
+def test_t2_off_identity():
+    for row in ALL:
+        a, b = _apply(row), _apply(row, mode="off")
+        assert a == b
+        assert "crypto_pair_shape" not in str(a.get("warnings") or "")
+    _env(None)
+    assert de._infer_asset_class_from_symbol("FLOW-USD") == "Equity"        # v5.144.0 behaviour kept
+    assert de._infer_exchange_from_symbol("FLOW-USD") == "NASDAQ/NYSE"
+    assert de._infer_currency_from_symbol("ETH-USDT") == "USD"
+
+
+# ---- T3 observe ------------------------------------------------------------------
+def test_t3_observe():
+    for row in (FLOW, SHIB, BARE):
+        off, obs = _apply(row), _apply(row, mode="observe")
+        for k in ("asset_class", "exchange", "currency", "country"):
+            assert off.get(k) == obs.get(k), (row["symbol"], k)
+        w = str(obs.get("warnings") or "")
+        assert w.count("crypto_pair_shape:observe") == 1, (row["symbol"], w)
+    for row in (DOT_DECLARED, BRKB, AKO, GRT, FX, FUT, CRC):
+        off, obs = _apply(row), _apply(row, mode="observe")
+        assert off == obs, row["symbol"]                     # nothing to observe on these
+
+
+# ---- T4 enforce ------------------------------------------------------------------
+def test_t4_enforce():
+    r = _apply(FLOW, mode="enforce")
+    assert r["asset_class"] == "Crypto" and r["exchange"] == "Crypto" and r["currency"] == "USD"
+    assert str(r["warnings"]).count("crypto_pair_shape:enforce") == 1
+    r = _apply(SHIB, mode="enforce")
+    assert r["asset_class"] == "Crypto" and r["exchange"] == "Crypto" and r["currency"] == "USD"
+    r = _apply(BARE, mode="enforce")                          # inferrers answer the shape first
+    assert r["asset_class"] == "Crypto" and r["exchange"] == "Crypto" and r["currency"] == "USD"
+    assert "crypto_pair_shape:enforce" not in str(r.get("warnings") or "")  # nothing to repair: no equity label was written
+    r = _apply(DOT_DECLARED, mode="enforce")                  # declared non-equity class stays
+    assert r["asset_class"] == "CRYPTOCURRENCY" and r["exchange"] == "CCC"
+    assert "crypto_pair_shape" not in str(r.get("warnings") or "")
+    for row in (BRKB, AKO, GRT, FX, FUT, CRC):
+        assert _apply(row, mode="enforce") == _apply(row), row["symbol"]
+    _env("enforce")
+    try:
+        assert de._infer_asset_class_from_symbol("SHIB-USD") == "Crypto"
+        assert de._infer_exchange_from_symbol("SHIB-USD") == "Crypto"
+        assert de._infer_currency_from_symbol("ETH-USDT") == "USDT"
+        assert de._infer_asset_class_from_symbol("BRK-B") == "Equity"
+        assert de._infer_exchange_from_symbol("GRT-UN.TO") == "TSX"
+    finally:
+        _env(None)
+
+
+# ---- T5 equity page never touched, idempotence ------------------------------------
+def test_t5_page_scope_and_idempotence():
+    # the apply site is the Commodities_FX / =F / =X block: an equity page row
+    # shaped like a pair (never seen in production) is left alone there
+    r = _apply(FLOW, page="Global_Markets", mode="enforce")
+    assert r["asset_class"] == "Equity" and "crypto_pair_shape" not in str(r.get("warnings") or "")
+    for mode in (None, "observe", "enforce"):
+        for row in ALL:
+            once = _apply(row, mode=mode)
+            twice = de._apply_symbol_context_defaults(copy.deepcopy(once), row["symbol"], "Commodities_FX") \
+                if mode is None else _apply(once, mode=mode)
+            assert once == twice, (row["symbol"], mode)
+            assert _digest(_apply(row, mode=mode)) == _digest(_apply(row, mode=mode))
+
+
+# ---- T6 substring safety ---------------------------------------------------------
+def test_t6_substring_safety():
+    for tag in (de._CRYPTO_PAIR_TAG_OBSERVE, de._CRYPTO_PAIR_TAG_ENFORCE):
+        assert not any(b in tag.lower() for b in FORBIDDEN), tag
+
+
+# ---- T7 wiring + disclosure --------------------------------------------------------
+def test_t7_wiring():
     src = inspect.getsource(de)
-    assert src.count('"fund_lkg=%s fund_unit_sentry=%s",') == 1
-    assert src.count("_fund_unit_sentry_mode(),   # v5.143.0") == 1
-    assert de.__version__ == "5.143.0"
+    assert src.count("_crypto_pair_shape_apply(out, sym)") == 1
+    assert src.count('return "Crypto"  # v5.145.0') == 2
+    assert src.count("return _cq  # v5.145.0") == 1
+    _env(None)
+    assert de.surface_gate_states().get("crypto_pair_class") == "off"
+    os.environ[ENV] = "observe"
+    assert de.surface_gate_states().get("crypto_pair_class") == "observe"
+    _env(None)
+    # v5.147.0: exact pin loosened to a floor (the file is a battery, not a version lock)
+    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 145, 0)
 
-
-TESTS = [test_t1_off_inert, test_t2_observe_tag_only_never_repairs_or_skips,
-         test_t3_enforce_repair_x100, test_t4_enforce_repair_d100,
-         test_t5_enforce_oob_fail_open,
-         test_t6_enforce_quarantine_unchanged_outside_band,
-         test_t7_band_edges_and_window, test_t8_tags_substring_safe,
-         test_t9_mode_disclosure]
 
 if __name__ == "__main__":
-    trail = []
-    for fn in TESTS:
-        fn()
-        trail.append(fn.__name__)
-        print("PASS", fn.__name__)
-    # deterministic digest of the enforce verdicts on every golden
-    verdicts = []
-    for base, pm in ((ROW_0845, 0.33), (BRKB, 0.2168), (BNY, 0.1431),
-                     (DDI_0919, 0.3325), (BRKB, 2168.0), (ESSA, 12.5),
-                     (HQH, 40.0), (GDHG, 3.2), (BRKB, 1.0)):
-        verdicts.append([base["symbol"], pm, list(_run(base, pm, "enforce"))])
-    digest = hashlib.sha256(json.dumps(verdicts, sort_keys=True).encode()).hexdigest()[:16]
-    print("ALL PASS", len(trail), "digest", digest)
+    import traceback
+    fails = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print("PASS", name)
+            except Exception:
+                fails += 1
+                print("FAIL", name)
+                traceback.print_exc()
+    print("RESULT", "FAIL %d" % fails if fails else "ALL PASS")
+    sys.exit(1 if fails else 0)
