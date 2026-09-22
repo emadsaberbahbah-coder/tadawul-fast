@@ -554,7 +554,8 @@ def test_t8_wiring_and_version():
     src = inspect.getsource(de)
     assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx)") == 1
     assert src.count('"scoring_settle": _f7_settle_mode(),') == 1
-    assert src.count('"fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s",') == 1
+    # v5.148.0: the boot-line literal grows a leg per gate; check the leg, not the line
+    assert src.count("scoring_settle=%s") == 1
     assert src.count("_f7_settle_mode(),          # v5.147.0") == 1
     assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 147, 0)
 
