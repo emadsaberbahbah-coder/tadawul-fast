@@ -1507,7 +1507,16 @@ jobs:
       # single-pass "process-success" behavior byte-identically.
       TFB_AUDIT_REQUIRE_FULL_FETCH: "1"
       TFB_AUDIT_MIN_FRESH_PCT: "95"
-      TFB_INLINE_RECOVERY_MAX_CYCLES: "3"
+      # P-163 (2026-09-23) REPLAY CAP 3 -> 1. Measured on _Status/_Run_Log
+      # 09-15..09-23: the Global_Markets pass takes ~61 min against
+      # TFB_SYNC_TIME_BUDGET_SEC=3600, so the audit marks it incomplete on
+      # every pass and the recovery job replayed the WHOLE page up to 3x
+      # (each replay ~62 min, 9-24k EODHD calls, mostly the same rows).
+      # Run 35817773571 lasted 4h35m (GM x4); the 23:00 legs of 09-20 and
+      # 09-22 exhausted the daily quota inside the replays. One replay keeps
+      # the run under ~2h30m (< the 4h cron interval) and caps the burn.
+      # Rollback: set back to "3".
+      TFB_INLINE_RECOVERY_MAX_CYCLES: "1"
       TFB_SYNC_TIME_BUDGET_SEC: "3600"
       TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       TFB_SYNC_MARKET_GATEWAY: "analysis"
@@ -1519,6 +1528,17 @@ jobs:
       # delta=first-sample; the absolute counter + timestamp give the curve).
       TFB_SYNC_EODHD_QUOTA: "observe"
       EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+      # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
+      # page replay run_inline_page_recovery.py parses the page's last
+      # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
+      # (source-sync-artifacts, then the previous cycle's own log). observe =
+      # annotations "[RECOVERY-QUOTA v1.2.0 observe] <page> (cycle n): would
+      # SKIP/allow ..." + summary.quota_guard[] in inline-recovery-summary.json;
+      # NO replay is skipped. enforce (separate sitting) skips the replay as
+      # skipped:quota on EXHAUSTED/ON_EXTRA, any NEW 402 row, or used% >=
+      # TFB_INLINE_RECOVERY_QUOTA_SKIP_PCT (default 90). Explicit words only;
+      # delete the line (or "off") to restore v1.1.0 behaviour byte-identically.
+      TFB_INLINE_RECOVERY_QUOTA_GUARD: "observe"
 
     steps:
       - name: 📥 Secure Checkout
