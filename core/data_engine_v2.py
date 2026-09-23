@@ -3737,7 +3737,40 @@ if str(ROOT_DIR) not in sys.path:
 # Zero removals; five constants and two tags added; every existing tag
 # string unchanged. Rollback: git revert (env unchanged).
 # -----------------------------------------------------------------------------
-__version__ = "5.148.0"
+# WHY v5.149.0 (P-164 52W PROVIDER-CEILING SCRUB AT THE ENGINE SEAM; new env
+# TFB_ENGINE_52W_CEILING_SCRUB, DEFAULT ON = the v4.13.0 AS-1 precedent;
+# =0 restores v5.148.0 byte-identically):
+# EVIDENCE (2026-09-23 Global_Markets export): three rows publish
+# week_52_high = 999999.9999 (rendered 1,000,000.00) - 012450.KS (price
+# 1,021,000 KRW, INVESTABLE, 52W Position 100.00%), 009150.KS (1,507,000,
+# position 100.00%) and YPFD.BA (8,530 ARS, position 0.09%) - and the
+# sync's OHLC-PREWRITE flags every one of them as a w52_band anomaly on every
+# leg (observe mode, written anyway). 999999.9999 is the EODHD field
+# ceiling documented by eodhd_provider v4.13.0 AS-1 ("not a price any
+# instrument prints"), which the provider scrubs on its QUOTE patch and
+# merged quote only. Two writers bypass that scrub and land at this
+# engine: (1) _compute_history_patch_from_rows() takes max(highs) over the
+# 252-bar window - capped EOD bars for any KRW instrument that traded above
+# 1,000,000 yield exactly the ceiling; (2) the eodhd fundamentals payload's
+# Technicals.52WeekHigh/52WeekLow (provider L2672) carry the same ceiling
+# and are merged as fundamentals, not as a quote. The phase-BB sanity then
+# derives week_52_position_pct = 100% from the fabricated bound, so the
+# timing/momentum read is wrong on exactly the names where it matters.
+# FIX: _sanitize_corrupt_52w_bounds() - already the single 52W sanitizer,
+# hoisted into scoring's sanitization since v5.114.0 so it runs AFTER every
+# 52W writer and BEFORE any score reads the bound - drops a bound inside
+# [999999.0, 1000000.0) to None with sanitized:week_52_high|low_provider_
+# ceiling, and clears an already-derived week_52_position_pct with
+# sanitized:week_52_position_pct_unbounded (the position sanitizer only
+# writes when BOTH bounds exist; it never clears). Genuine 7-digit values
+# (000660.KS 52W high 2,987,000; an exact 1,000,000.00) are outside the
+# band and untouched. Drop, never fabricate: no repair from day_high or
+# price (the AS-1 rule). Tags are substring-safe for the investability
+# gate. Mode disclosed in the [GUARDS] boot line (w52_ceiling=) and in
+# /health engine_gates.w52_ceiling_scrub. Zero removals; one helper and
+# two constants added. Rollback: git revert, or the env kill-switch.
+# -----------------------------------------------------------------------------
+__version__ = "5.149.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5469,6 +5502,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
             "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
+            "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
         }
     except Exception:
         return {}
@@ -10429,12 +10463,57 @@ def _sanitize_extreme_outliers(row: Dict[str, Any]) -> int:
     return nulled
 
 
+# v5.149.0 (P-164): the EODHD field ceiling, mirrored from eodhd_provider
+# v4.13.0 AS-1 (_EODHD_SENTINEL_LOW/HIGH) - any float in [999999.0,
+# 1000000.0), live form 999999.9999. Kept as engine-local constants so this
+# seam never imports provider internals.
+_W52_CEILING_LOW = 999999.0
+_W52_CEILING_HIGH = 1000000.0
+_W52_CEILING_ENV = "TFB_ENGINE_52W_CEILING_SCRUB"
+
+
+def _w52_ceiling_scrub_mode() -> str:
+    """v5.149.0 (P-164): "on" (default) | "off". TFB_ENGINE_52W_CEILING_SCRUB
+    =0/false/off/no restores v5.148.0 byte-identically. Read at call time so
+    the kill-switch needs no restart. Never raises."""
+    try:
+        raw = (os.getenv(_W52_CEILING_ENV) or "1").strip().lower()
+        return "off" if raw in ("0", "false", "off", "no") else "on"
+    except Exception:
+        return "on"
+
+
+def _w52_is_ceiling(v: Optional[float]) -> bool:
+    return v is not None and _W52_CEILING_LOW <= v < _W52_CEILING_HIGH
+
+
 def _sanitize_corrupt_52w_bounds(row: Dict[str, Any]) -> int:
     if not isinstance(row, dict):
         return 0
     nulled = 0
     hi = _as_float(row.get("week_52_high"))
     lo = _as_float(row.get("week_52_low"))
+    # v5.149.0 (P-164): provider field-ceiling scrub FIRST - a 999999.9999
+    # bound is a fabrication, not a range; drop it (never repair it) and
+    # clear the position already derived from it by the phase-BB pass.
+    if _w52_ceiling_scrub_mode() == "on":
+        _ceiling_hit = False
+        if _w52_is_ceiling(hi):
+            row["week_52_high"] = None
+            _v573_append_warning(row, "sanitized:week_52_high_provider_ceiling")
+            nulled += 1
+            hi = None
+            _ceiling_hit = True
+        if _w52_is_ceiling(lo):
+            row["week_52_low"] = None
+            _v573_append_warning(row, "sanitized:week_52_low_provider_ceiling")
+            nulled += 1
+            lo = None
+            _ceiling_hit = True
+        if _ceiling_hit and row.get("week_52_position_pct") not in (None, ""):
+            row["week_52_position_pct"] = None
+            _v573_append_warning(row, "sanitized:week_52_position_pct_unbounded")
+            nulled += 1
     if hi is not None and hi <= 0:
         row["week_52_high"] = None
         _v573_append_warning(row, "sanitized:week_52_high_nonpositive")
@@ -15803,7 +15882,8 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s",
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
+                "w52_ceiling=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15820,6 +15900,7 @@ class DataEngineV5:
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
+                _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
             )
         except Exception:
             pass
