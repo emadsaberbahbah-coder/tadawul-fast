@@ -776,7 +776,41 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
 # _apply_f1_observe_tag). Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.12.1"
+PORTFOLIO_ACTIONS_VERSION = "1.12.2"
+# v1.12.2 (2026-09-23) - [P-165 ADD-CONFIRM FAIL-CLOSED] THE FUNDING GATE
+# MAY NEVER FAIL OPEN
+# WHY: _apply_add_confirmation ends in `except Exception: return action,
+# reason, capped_from`. Its `action` argument is the RAW verdict, so any
+# exception raised inside the gate hands an UNCONFIRMED ADD through as ADD,
+# and the funding pass sizes it. External review (2026-09-23) read this at
+# source; Claude confirmed it at HEAD. The gate is the one rule that turns
+# a verdict into money, and it is the one rule whose error path upgrades.
+# Exposure today: nil (DDI rendered "ADD confirmed (day 2/2)", so the gate
+# ran clean; the try block holds dict/date/Redis calls whose helpers never
+# raise) - a latent contract defect, closed before it fires, same class as
+# v1.12.1 (found before enforce instead of after).
+# FIX (behind ONE kill-switch, default ON):
+#   (a) an exception on an ADD verdict returns ACTION_HOLD with the reason
+#       "ADD held fail-closed [confirm-failclosed:<ExcType>] ..." and
+#       capped_from=ACTION_ADD (the suppressed-action contract the funding
+#       pass already honours); the symbol's clock is NOT touched (a transient
+#       error neither advances nor resets the chain); one WARNING log line.
+#       A non-ADD verdict that hits the same except still returns unchanged -
+#       fail-closed never suppresses TRIM/EXIT/BLOCK.
+#   (b) an unparsable `add_confirm_days` control falls back to
+#       DEFAULT_CONTROLS["add_confirm_days"] (confirmation required) instead
+#       of 0 (gate off). make_controls already validates the panel value, so
+#       this seam is unreachable in production - closed for the contract.
+#   (c) one countable alert `add_confirmation_gate_error` (count of
+#       fail-closed rows); the row is excluded from low_confidence_capped so
+#       it is counted exactly once, like every other capped class.
+# NOT changed: the memory-only "+1 after any gap" branch. It runs ONLY under
+# TFB_PF_CONFIRM_PERSIST=0, the documented v1.5.1-restore kill-switch;
+# with persistence armed (default) the strict-consecutiveness branch is
+# taken even when Redis is dead (_persist reads the env, not the client).
+# GATE: TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN=1 restores v1.12.1 byte-identically
+# (the P-127 / P-130 precedent: the OFF state IS the defect; operator veto).
+# Functions added: 1 (_add_confirm_failclosed_enabled). Removed: 0.
 # v1.12.1 (2026-09-21) - [F-2 HONOURS D-9] THE LOSS BUDGET IS AN EQUITY RULE
 # WHY: v1.11.0's _apply_drawdown_guard has no asset-class test. Its basis is
 # pnl_sar / cost_sar - PRICE ONLY - and its time rule exits anything "still
@@ -1018,6 +1052,18 @@ def _confirm_persist_enabled():
     the v1.5.1 memory-only confirmation store byte-identically."""
     return (os.getenv("TFB_PF_CONFIRM_PERSIST") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+def _add_confirm_failclosed_enabled():
+    """v1.12.2 [P-165] kill-switch reader - DEFAULT ON (fail-closed).
+    TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN=1/true/on/yes restores the v1.12.1
+    error path (an exception inside the confirmation gate returns the raw
+    verdict) byte-identically. Never raises."""
+    try:
+        return (os.getenv("TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN") or "0") \
+            .strip().lower() not in ("1", "true", "on", "yes")
+    except Exception:
+        return True
 
 
 def _confirm_redis():
@@ -2008,11 +2054,17 @@ def _add_confirm_store_size():
 
 def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
     """Returns (action, reason, capped_from) with the confirmation gate
-    applied. Non-ADD outcomes reset the symbol's clock. Never raises."""
+    applied. Non-ADD outcomes reset the symbol's clock. Never raises.
+    v1.12.2 [P-165]: an exception on an ADD verdict fails CLOSED (HOLD,
+    capped_from=ADD, clock untouched) unless the legacy kill-switch is set."""
+    _fc = _add_confirm_failclosed_enabled()   # v1.12.2 [P-165]
     try:
         days = int(controls.get("add_confirm_days") or 0)
     except (TypeError, ValueError):
-        days = 0
+        # v1.12.2 [P-165] (b): an unparsable depth means "confirmation
+        # required", not "gate off" - unreachable via make_controls, closed
+        # for the contract. Legacy: 0 (v1.12.1 verbatim).
+        days = int(DEFAULT_CONTROLS["add_confirm_days"]) if _fc else 0
     try:
         sym = str(symbol or "").strip().upper()
         if not sym:
@@ -2073,8 +2125,26 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
                 "%d consecutive days before funding; qualifying: %s"
                 % (count, days, days, reason),
                 ACTION_ADD)
-    except Exception:
-        return action, reason, capped_from
+    except Exception as exc:
+        # v1.12.2 [P-165] (a): the raw verdict must never upgrade through
+        # the error path. ADD -> HOLD fail-closed (clock untouched); any
+        # non-ADD verdict returns unchanged (never suppress TRIM/EXIT/BLOCK).
+        if not _fc or action != ACTION_ADD:
+            return action, reason, capped_from
+        _exc = exc.__class__.__name__
+        try:
+            logger.warning("[CONFIRM-FAILCLOSED v%s] %s: %s: %s - ADD held "
+                           "HOLD fail-closed this run (clock untouched)",
+                           PORTFOLIO_ACTIONS_VERSION,
+                           str(symbol or "").strip().upper(), _exc, exc)
+        except Exception:
+            pass
+        return (ACTION_HOLD,
+                "ADD held fail-closed [confirm-failclosed:%s] — the "
+                "confirmation gate raised; no funding this run, the "
+                "confirmation clock is untouched; qualifying: %s"
+                % (_exc, reason),
+                ACTION_ADD)
 
 
 def decide_action(cand, controls, weight_pct, sector_weight_pct,
@@ -3161,6 +3231,13 @@ def _build(rows, ctl, fx_rates, upstream_meta):
            sum(1 for e in entries if e.get("capped_from")
                and "pending confirmation" in _rl(e)),
            "No action needed — ADD confirms after the configured window")
+    # v1.12.2 [P-165] (c): fail-closed rows are counted ONCE, here; the
+    # helper appends nothing at count 0 (legacy / clean runs byte-identical).
+    _alert("add_confirmation_gate_error",
+           sum(1 for e in entries if e.get("capped_from")
+               and "confirm-failclosed" in _rl(e)),
+           "Confirmation gate raised — ADD held fail-closed; read the "
+           "[CONFIRM-FAILCLOSED] Render log line, then re-run")
     _alert("engine_precedence_veto",
            sum(1 for e in entries if e.get("capped_from")
                and ("precedence" in _rl(e) or "engine state" in _rl(e))),
@@ -3175,6 +3252,7 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                if e.get("capped_from") and
                not _is_vf_conflict_hold(e["action"], e["action_reason"])
                and "pending confirmation" not in _rl(e)
+               and "confirm-failclosed" not in _rl(e)   # v1.12.2 [P-165]
                and "precedence" not in _rl(e)
                and "engine state" not in _rl(e)
                and "synthetic" not in _rl(e)),
