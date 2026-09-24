@@ -1837,7 +1837,59 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.60.0"
+SCRIPT_VERSION = "6.61.0"
+# -----------------------------------------------------------------------------
+# v6.61.0 (2026-09-24) - P-154d EODHD QUOTA GUARD (leg-level containment)
+# -----------------------------------------------------------------------------
+# EVIDENCE (_Run_Log [EODHD-QUOTA v6.60.0] curve + exports, 2026-09-23/24):
+#   the counter hit 400,000/400,000 EXHAUSTED at 00:54 Riyadh (third time in
+#   four days); the 20Z run then fetched every page BLIND - 5,789 Global_
+#   Markets + 2,393 Mutual_Funds + 336 Commodities_FX rows came back
+#   "fetch_failed:HTTP 402", were written, and the engine's false-green screen
+#   turned them BLOCKED. The 02:01 cockpit consumed that epoch and hard-exited
+#   four seats (ITRN/CRC/PINFRA/ADAM); two came back at 06:06 as day-1 seats
+#   (register P-168). The sentinel SAW the exhaustion at 23:38 (96.5% CRIT) and
+#   the sync still spent the fetch and overwrote three good pages with a
+#   poisoned epoch. The v1.2.0 recovery guard protects only the REPLAY; the
+#   scheduled leg itself had no brake.
+# WHAT. One gate, TFB_SYNC_EODHD_QUOTA_GUARD = off | observe | enforce
+#   (explicit words; anything else = off). DEFAULT OFF = no poll, no line,
+#   byte-identical to v6.60.0 apart from the version string in the tags.
+#   Two seams inside _run_one_task, ranked market pages only:
+#   PRE-FETCH (after the decision-owned guard, before the symbol read): one
+#     0-cost poll of /api/user (the v6.60.0 poll, same key, same timeout).
+#     state EXHAUSTED, ON_EXTRA (unless TFB_SYNC_EODHD_QUOTA_GUARD_ALLOW_EXTRA=1)
+#     or used% >= TFB_SYNC_EODHD_QUOTA_GUARD_PCT (default 97) => enforce:
+#     the leg is SKIPPED before any provider call - nothing fetched, cleared
+#     or written; status="skipped" (exit code unchanged, the v6.6.0 decision-
+#     guard convention); the page keeps its last-good rows and the stamp
+#     records leg=skipped (the F-09 early-exit stamp) so the decision feed
+#     withholds TRUTHFULLY instead of consuming 402-blocked rows. UNKNOWN
+#     (no key / poll failed / unparseable) always ALLOWS - fail-open.
+#   POST-FETCH (at the v6.60.0 sentinel site, before the write): if the
+#     OUTGOING matrix carries fresh 402 rows (stamped since this process
+#     started) on >= TFB_SYNC_EODHD_QUOTA_GUARD_POISON_PCT (default 25) of its
+#     rows, the provider ran dry MID-LEG => enforce: the write is refused
+#     exactly like the persistence-hard / OHLC-enforce guards (skip clear+
+#     write, preserve last-good rows, status="skipped"). The calls are spent
+#     by then; the page is not poisoned.
+#   observe: the SAME decisions are computed and disclosed - one
+#     "[EODHD-QUOTA-GUARD]" _Run_Log line (WARNING + ::warning:: annotation)
+#     per page per leg whenever a skip WOULD fire; the fetch and the write
+#     proceed exactly as v6.60.0. Nothing changes but the log.
+#   The recovery job (run_inline_page_recovery v1.2.0) reads the same
+#   [EODHD-QUOTA] line and does not replay a page the audit never flagged, so
+#   a quota-skipped page waits for the next scheduled leg after the GMT reset.
+# SAFETY. Same poll helper as v6.60.0: the token is never logged, one <= 5 s
+#   attempt, any exception => UNKNOWN => allow. The guard's own _Run_Log
+#   append failure is annotated, never counted into _RUNLOG_APPEND_FAILS.
+# ENV LANE: GitHub Actions (daily_sync.yml): sync-dashboard job env AND the
+#   recovery job env (the replay subprocess inherits it), beside the existing
+#   TFB_SYNC_EODHD_QUOTA / EODHD_API_KEY lines.
+# Kill: unset / off. ZERO functions removed; additions: _eodhd_quota_guard_mode,
+# _eodhd_quota_guard_pct, _eodhd_quota_guard_poison_pct,
+# _eodhd_quota_guard_allow_extra, _eodhd_quota_guard_decide,
+# _append_runlog_eodhd_quota_guard, _eodhd_quota_guard_selftest.
 # -----------------------------------------------------------------------------
 # v6.60.0 (2026-09-21) - P-154 EODHD QUOTA SENTINEL (observe-only telemetry)
 # -----------------------------------------------------------------------------
@@ -5746,6 +5798,201 @@ def _append_runlog_eodhd_quota(sheets: Any, spreadsheet_id: str, page: str,
         # Telemetry only: annotated, never counted into _RUNLOG_APPEND_FAILS.
         print("::warning::%s _Run_Log append FAILED for %s - %s"
               % (_EODHD_QUOTA_TAG, page, type(_e).__name__))
+
+
+# =============================================================================
+# v6.61.0 (P-154d) - EODHD QUOTA GUARD: pre-fetch skip + post-fetch poison refusal
+# =============================================================================
+_EODHD_QUOTA_GUARD_TAG = f"[EODHD-QUOTA-GUARD v{SCRIPT_VERSION}]"
+_EQG_SELFTEST_MSG: str = ""
+
+
+def _eodhd_quota_guard_mode() -> str:
+    """TFB_SYNC_EODHD_QUOTA_GUARD: off (default) | observe | enforce. Explicit
+    words only -- "1"/"true"/"on" read as off. Read at call time."""
+    v = (os.getenv("TFB_SYNC_EODHD_QUOTA_GUARD") or "").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _eodhd_quota_guard_pct() -> float:
+    """used% at/above which a leg is skipped (default 97; clamped 50..100)."""
+    try:
+        v = float((os.getenv("TFB_SYNC_EODHD_QUOTA_GUARD_PCT") or "97").strip())
+    except Exception:
+        v = 97.0
+    return min(100.0, max(50.0, v))
+
+
+def _eodhd_quota_guard_poison_pct() -> float:
+    """share of the OUTGOING rows carrying a FRESH 402 at/above which the
+    write is refused (default 25; clamped 1..100)."""
+    try:
+        v = float((os.getenv("TFB_SYNC_EODHD_QUOTA_GUARD_POISON_PCT") or "25").strip())
+    except Exception:
+        v = 25.0
+    return min(100.0, max(1.0, v))
+
+
+def _eodhd_quota_guard_allow_extra() -> bool:
+    """TFB_SYNC_EODHD_QUOTA_GUARD_ALLOW_EXTRA=1 lets a leg run on the provider's
+    extra-call balance (ON_EXTRA). Default: ON_EXTRA is treated as exhausted."""
+    return (os.getenv("TFB_SYNC_EODHD_QUOTA_GUARD_ALLOW_EXTRA") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _eodhd_quota_guard_decide(page: str, phase: str, q: Optional[Dict[str, Any]],
+                              rows: Optional[Dict[str, int]], mode: str,
+                              skip_pct: float, poison_pct: float,
+                              allow_extra: bool) -> Dict[str, Any]:
+    """PURE -> the guard verdict for one page at one seam.
+    phase "pre":  q = the /api/user poll result (v6.60.0 shape); rows ignored.
+    phase "post": rows = the sentinel's row counts (+ "n" = outgoing rows).
+    verdict: "off" | "allow" | "skip" (enforce) | "would_skip" (observe).
+    Never raises: any failure -> allow (fail-open)."""
+    out: Dict[str, Any] = {"page": page, "phase": phase, "verdict": "allow", "reason": "",
+                           "state": "UNKNOWN", "pct": None, "used": None, "limit": None,
+                           "mode": mode, "note": ""}
+    try:
+        if mode not in ("observe", "enforce"):
+            out["verdict"] = "off"
+            return out
+        fire = False
+        if phase == "pre":
+            qq = q or {}
+            state, _lvl = _eodhd_quota_state(qq, {}, 80.0, 90.0)
+            out["state"] = state
+            if qq.get("ok"):
+                out["pct"] = float(qq.get("pct") or 0.0)
+                out["used"] = qq.get("used")
+                out["limit"] = qq.get("limit")
+            if not qq.get("ok"):
+                out["reason"] = "unknown:" + str(qq.get("why") or "?")
+            elif state == "EXHAUSTED":
+                fire, out["reason"] = True, "exhausted"
+            elif state == "ON_EXTRA":
+                if allow_extra:
+                    out["reason"] = "on_extra:allowed"
+                else:
+                    fire, out["reason"] = True, "on_extra"
+            elif float(out["pct"] or 0.0) >= float(skip_pct):
+                fire, out["reason"] = True, "used>=%g%%" % skip_pct
+            else:
+                out["reason"] = "under_threshold"
+        elif phase == "post":
+            rr = rows or {}
+            new402 = int(rr.get("q402_new", 0) or 0)
+            n = int(rr.get("n", 0) or 0)
+            share = (100.0 * new402 / n) if n > 0 else 0.0
+            out["state"] = "EXHAUSTED" if new402 > 0 else "OK"
+            out["pct"] = round(share, 1)
+            if new402 > 0 and share >= float(poison_pct):
+                fire, out["reason"] = True, "poison:%d/%d(%.1f%%)" % (new402, n, share)
+            elif new402 > 0:
+                out["reason"] = "fresh402:%d/%d(%.1f%%)<%g%%" % (new402, n, share, poison_pct)
+            else:
+                out["reason"] = "no_fresh_402"
+        else:
+            out["reason"] = "bad_phase"
+        if fire:
+            out["verdict"] = "skip" if mode == "enforce" else "would_skip"
+            what = ("leg SKIPPED before any provider call" if phase == "pre"
+                    else "write REFUSED (last-good rows preserved)")
+            if mode != "enforce":
+                what = "would " + what[0].lower() + what[1:]
+            used_txt = ("used=%s/%s (%.1f%%)" % (out["used"], out["limit"], float(out["pct"]))
+                        if phase == "pre" and out["used"] is not None
+                        else ("fresh402=%s" % out["pct"] if phase == "post" else "used=unknown"))
+            out["note"] = ("%s %s | phase=%s verdict=%s reason=%s | %s state=%s | mode=%s: %s"
+                           % (_EODHD_QUOTA_GUARD_TAG, page, phase, out["verdict"], out["reason"],
+                              used_txt, out["state"], mode, what))
+        return out
+    except Exception as _e:
+        out["verdict"] = "allow"
+        out["reason"] = "error:" + type(_e).__name__
+        return out
+
+
+def _eodhd_quota_guard_selftest() -> str:
+    """Offline proof over the pure decision (the FW-3 selftest convention)."""
+    global _EQG_SELFTEST_MSG
+    if _EQG_SELFTEST_MSG:
+        return _EQG_SELFTEST_MSG
+    passed, total = 0, 8
+    try:
+        ok = lambda pct, extra=0: {"ok": True, "pct": pct, "used": int(4000 * pct), "limit": 400000, "extra": extra}
+        d = _eodhd_quota_guard_decide
+        if d("GM", "pre", ok(50.0), None, "off", 97, 25, False)["verdict"] == "off":
+            passed += 1
+        if d("GM", "pre", ok(50.0), None, "enforce", 97, 25, False)["verdict"] == "allow":
+            passed += 1
+        if d("GM", "pre", ok(97.0), None, "enforce", 97, 25, False)["verdict"] == "skip":
+            passed += 1
+        if d("GM", "pre", ok(97.0), None, "observe", 97, 25, False)["verdict"] == "would_skip":
+            passed += 1
+        if d("GM", "pre", ok(100.0), None, "enforce", 97, 25, False)["reason"] == "exhausted":
+            passed += 1
+        x = d("GM", "pre", ok(100.0, 5000), None, "enforce", 97, 25, False)
+        y = d("GM", "pre", ok(100.0, 5000), None, "enforce", 97, 25, True)
+        if x["verdict"] == "skip" and x["reason"] == "on_extra" and y["verdict"] == "allow":
+            passed += 1
+        if d("GM", "pre", {"ok": False, "why": "no_key"}, None, "enforce", 97, 25, False)["verdict"] == "allow":
+            passed += 1
+        p1 = d("GM", "post", None, {"q402_new": 6071, "n": 6609}, "enforce", 97, 25, False)
+        p2 = d("GM", "post", None, {"q402_new": 47, "n": 6609}, "enforce", 97, 25, False)
+        p3 = d("GM", "post", None, {"q402_new": 0, "n": 6609}, "enforce", 97, 25, False)
+        if p1["verdict"] == "skip" and p2["verdict"] == "allow" and p3["verdict"] == "allow":
+            passed += 1
+    except Exception as e:
+        _EQG_SELFTEST_MSG = "EXC %s" % type(e).__name__
+        return _EQG_SELFTEST_MSG
+    _EQG_SELFTEST_MSG = ("PASS %d/%d" if passed == total else "FAIL %d/%d") % (passed, total)
+    return _EQG_SELFTEST_MSG
+
+
+def _append_runlog_eodhd_quota_guard(sheets: Any, spreadsheet_id: str,
+                                     verdict: Dict[str, Any]) -> None:
+    """One best-effort, fail-open [EODHD-QUOTA-GUARD] _Run_Log line (the FW-3
+    channel shape) when a skip fired or would fire. Telemetry only: its own
+    failure is annotated, never counted into _RUNLOG_APPEND_FAILS."""
+    if sheets is None or not verdict or verdict.get("verdict") not in ("skip", "would_skip"):
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        msg = str(verdict.get("note") or "") + " | selftest=" + _eodhd_quota_guard_selftest()
+        details = _runlog_meta_json(json.dumps({
+            "mode": verdict.get("mode"), "phase": verdict.get("phase"),
+            "verdict": verdict.get("verdict"), "reason": verdict.get("reason"),
+            "state": verdict.get("state"), "pct": verdict.get("pct"),
+            "used": verdict.get("used"), "limit": verdict.get("limit"),
+            "skip_pct": _eodhd_quota_guard_pct(),
+            "poison_pct": _eodhd_quota_guard_poison_pct(),
+            "selftest": _EQG_SELFTEST_MSG, "version": SCRIPT_VERSION}))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        status = "SKIPPED" if verdict.get("verdict") == "skip" else "WOULD_SKIP"
+        body = {"values": [[ts, "WARNING", "run_dashboard_sync", str(verdict.get("page") or ""),
+                            status, msg, "", "", "", details]]}
+        _last_err = None
+        for _attempt in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last_err = None
+                break
+            except Exception as _ae:
+                _last_err = _ae
+                time.sleep(1.0)
+        if _last_err is not None:
+            raise _last_err
+    except Exception as _e:
+        print("::warning::%s _Run_Log append FAILED for %s - %s"
+              % (_EODHD_QUOTA_GUARD_TAG, str(verdict.get("page") or "?"), type(_e).__name__))
 
 
 def _ohlc_prewrite_runlog_enabled() -> bool:
@@ -9859,6 +10106,41 @@ async def _run_one_task(
             logger.info(note)
             return res
 
+        # --- v6.61.0 P-154d: EODHD quota guard, PRE-FETCH seam --------------
+        # Taken HERE, before the symbol read / backend fetch / write, so an
+        # exhausted counter costs nothing and poisons nothing. off => no poll.
+        # observe => decision disclosed, leg proceeds. enforce => skipped leg,
+        # status="skipped" (exit code unchanged), last-good rows preserved.
+        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
+                and _eodhd_quota_guard_mode() != "off"):
+            try:
+                _qg_mode = _eodhd_quota_guard_mode()
+                _qg = _eodhd_quota_guard_decide(
+                    task.sheet_name, "pre", _eodhd_quota_poll(), None, _qg_mode,
+                    _eodhd_quota_guard_pct(), _eodhd_quota_guard_poison_pct(),
+                    _eodhd_quota_guard_allow_extra(),
+                )
+            except Exception as _qge:
+                _qg = {"verdict": "allow", "reason": "error:" + type(_qge).__name__, "note": ""}
+            if _qg.get("verdict") in ("skip", "would_skip"):
+                res.warnings.append(str(_qg.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                logger.warning(str(_qg.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                print("::warning::" + str(_qg.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                try:
+                    _append_runlog_eodhd_quota_guard(sheets, spreadsheet_id, _qg)
+                except Exception:
+                    pass
+                if _qg.get("verdict") == "skip":
+                    res.status = "skipped"
+                    res.rows_written = 0
+                    res.rows_failed = 0
+                    return res
+            else:
+                logger.info("%s %s | phase=pre verdict=%s reason=%s state=%s pct=%s",
+                            _EODHD_QUOTA_GUARD_TAG, task.sheet_name, _qg.get("verdict"),
+                            _qg.get("reason"), _qg.get("state"), _qg.get("pct"))
+        # ----------------------------------------------------------------------
+
         max_syms = max_symbols_override if max_symbols_override >= 0 else task.max_symbols
 
         symbols: List[str] = []
@@ -10755,6 +11037,38 @@ async def _run_one_task(
                 )
             except Exception:
                 pass
+        # ----------------------------------------------------------------------
+
+        # --- v6.61.0 P-154d: EODHD quota guard, POST-FETCH seam -------------
+        # The provider ran dry mid-leg: fresh 402 rows on >= poison_pct of the
+        # outgoing matrix. enforce => refuse the write exactly like the
+        # persistence-hard / OHLC-enforce guards (preserve last-good rows).
+        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
+                and _eodhd_quota_guard_mode() != "off"):
+            try:
+                _qg_rows = dict(_eodhd_quota_count_rows(headers, rows_matrix, _EQ_STATE["t0"]))
+                _qg_rows["n"] = len(rows_matrix or [])
+                _qg2 = _eodhd_quota_guard_decide(
+                    task.sheet_name, "post", None, _qg_rows, _eodhd_quota_guard_mode(),
+                    _eodhd_quota_guard_pct(), _eodhd_quota_guard_poison_pct(),
+                    _eodhd_quota_guard_allow_extra(),
+                )
+            except Exception as _qge2:
+                _qg2 = {"verdict": "allow", "reason": "error:" + type(_qge2).__name__, "note": ""}
+            if _qg2.get("verdict") in ("skip", "would_skip"):
+                res.warnings.append(str(_qg2.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                logger.warning(str(_qg2.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                print("::warning::" + str(_qg2.get("note") or _EODHD_QUOTA_GUARD_TAG))
+                try:
+                    _append_runlog_eodhd_quota_guard(sheets, spreadsheet_id, _qg2)
+                except Exception:
+                    pass
+                if _qg2.get("verdict") == "skip":
+                    res.status = "skipped"
+                    res.rows_written = 0
+                    res.rows_failed = 0
+                    fail_result_on_identity(res, _critical_identity_failures)
+                    return res
         # ----------------------------------------------------------------------
 
         # --- Persistence outcome verification (v6.22.2 L4b) ------------------
