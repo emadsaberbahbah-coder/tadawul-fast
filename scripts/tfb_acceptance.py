@@ -35,6 +35,16 @@ WHAT IT MEASURES (each row = criterion, measured value, verdict, evidence)
                                   Market_Leaders equity rows (KE.US -> wheat,
                                   LINK.US -> Chainlink, NG.US -> natural gas)
                                A4 Portfolio_Decision TRIM/EXIT rows carry Δ Shares
+    D10-1b/1c executable   (v1.0.7, P-166) executable tickets read from the cockpit
+                               SEAT-CHECK / banner (never the qualified KPI) and the
+                               funded-KPI parity (Fundable Now == board exec)
+    G1b-<page> stamp cov     (v1.0.7, P-166) the sync's OWN fresh_cov on the page
+                               stamp >= 95% (the decision-feed threshold; the 24h
+                               window of G1 is a floor, not that number)
+    NA hardening             (v1.0.7, P-166) an NA caused by a parse/section failure
+                               or a crashed check is HARD: the overall verdict is
+                               FAIL while any exists; NA by design (D10-6) stays
+                               neutral. Kill: TFB_ACCEPTANCE_LEGACY_NA=1 (v1.0.6).
 
 VERDICT VOCABULARY   PASS / WARN / FAIL / NA. Exit code 0 unless --strict and
 any FAIL (the CI workflow runs non-strict: an instrument, not a blocker).
@@ -63,7 +73,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -170,9 +180,22 @@ class Check:
     def __init__(self, cid: str, name: str, verdict: str, measured: Any, evidence: str = ""):
         self.cid, self.name, self.verdict, self.measured, self.evidence = cid, name, verdict, measured, evidence
 
+    @property
+    def na_kind(self) -> Optional[str]:
+        """v1.0.7 (P-166): why a check is NA. design = the workbook cannot hold the
+        answer (D10-6); crash = the check raised; parse = a tab/section/field the
+        check needs was not found. Only parse and crash are HARD."""
+        if self.verdict != "NA":
+            return None
+        if self.cid == "D10-6":
+            return "design"
+        if self.cid == "ERR":
+            return "crash"
+        return "parse"
+
     def row(self) -> Dict[str, Any]:
         return {"id": self.cid, "criterion": self.name, "verdict": self.verdict,
-                "measured": self.measured, "evidence": self.evidence}
+                "measured": self.measured, "evidence": self.evidence, "na_kind": self.na_kind}
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +410,9 @@ def _top10(src: Source) -> Dict[str, Any]:
             continue
         if r[0].startswith("Status:") and len(r) > 1:
             out.setdefault("last_run", r[1][:160])
+            out.setdefault("last_run_full", r[1])   # v1.0.7 (P-166): SEAT-CHECK lives past col 160
+        if r[0].upper().startswith(("\u2705", "\u26d4", "\u23f8", "FEED ")) or "EXECUTABLE TICKET" in r[0].upper():
+            out.setdefault("banner", r[0][:240])     # v1.0.7 (P-166): the output banner
         if "Deployable (SAR)" in r and i + 1 < len(rows):
             out["kpis"] = {h: v for h, v in zip(r, rows[i + 1]) if h}
         if r[0].upper().startswith("ALERTS"):
@@ -406,6 +432,43 @@ def _top10(src: Source) -> Dict[str, Any]:
     return out
 
 
+_SEAT_CHECK_RE = re.compile(
+    r"SEAT-CHECK\s+kpi\s+(\d+)\s+funded\s+vs\s+board\s+(\d+)\s+exec(?:\s*\+(\d+)\s+suspended)?(?:\s*\+(\d+)\s+grace)?", re.I)
+_OUTPUT_STATE_RE = re.compile(r"\boutput:\s*([A-Z_]+)", re.I)
+_BANNER_EXEC_RE = re.compile(r"(\d+)\s+EXECUTABLE\s+TICKETS?", re.I)
+
+
+def _top10_execution(t: Dict[str, Any]) -> Dict[str, Any]:
+    """v1.0.7 (P-166): what the cockpit can actually EXECUTE, read from its own
+    disclosure lines. exec/suspended/grace and the funded KPI come from the
+    status-line SEAT-CHECK (cockpit v1.11.6+); the banner is the fallback for
+    exec; the output state (EXECUTABLE/HELD/WITHHELD) from the status line.
+    Missing pieces are None, never guessed."""
+    full = _s(t.get("last_run_full") or t.get("last_run"))
+    out: Dict[str, Any] = {"exec": None, "suspended": None, "grace": None, "kpi_funded": None,
+                           "output": None, "source": ""}
+    m = _OUTPUT_STATE_RE.search(full)
+    if m:
+        out["output"] = m.group(1).upper()
+    m = _SEAT_CHECK_RE.search(full)
+    if m:
+        out["kpi_funded"] = int(m.group(1))
+        out["exec"] = int(m.group(2))
+        out["suspended"] = int(m.group(3)) if m.group(3) else 0
+        out["grace"] = int(m.group(4)) if m.group(4) else 0
+        out["source"] = "seat-check"
+    else:
+        b = _BANNER_EXEC_RE.search(_s(t.get("banner")))
+        if b:
+            out["exec"] = int(b.group(1))
+            out["source"] = "banner"
+    if out["kpi_funded"] is None:
+        f = _to_float((t.get("kpis") or {}).get("Fundable Now"))
+        if f is not None:
+            out["kpi_funded"] = int(f)
+    return out
+
+
 def check_board(src: Source, board_min: int) -> List[Check]:
     t = _top10(src)
     k = t.get("kpis") or {}
@@ -413,13 +476,41 @@ def check_board(src: Source, board_min: int) -> List[Check]:
     sel = _s(k.get("Selected"))
     alerts = dict(t.get("alerts") or [])
     if not k:
-        return [Check("D10-1", "board fills (Top_10 Passed >= %d)" % board_min, "NA", None, "Top_10 tab unreadable")]
+        return [Check("D10-1", "board qualified (Top_10 Passed >= %d)" % board_min, "NA", None, "Top_10 tab unreadable")]
     v = "PASS" if (passed or 0) >= board_min else ("WARN" if (passed or 0) > 0 else "FAIL")
     ev = f"Passed={passed:g} Selected={sel} | funding alerts: " + (", ".join(
         f"{a}={c}" for a, c in alerts.items() if a in ("rotation_proposal", "capital_call", "unfunded_candidates")) or "none")
     if t.get("gates"):
         ev += " | first-fail: " + ", ".join(t["gates"][:4])
-    return [Check("D10-1", "board fills (Top_10 Passed >= %d)" % board_min, v, passed, ev + f" | {t.get('last_run', '')[:80]}")]
+    # v1.0.7 (P-166): the qualified count is research capacity, not a filled board.
+    # The renamed D10-1 keeps its measure; D10-1b measures what can be executed and
+    # D10-1c whether the funded KPI agrees with it (the P-108 disagreement).
+    out = [Check("D10-1", "board qualified (Top_10 Passed >= %d)" % board_min, v, passed, ev + f" | {t.get('last_run', '')[:80]}")]
+    x = _top10_execution(t)
+    state = x["output"] or "?"
+    if x["exec"] is None:
+        out.append(Check("D10-1b", "board executable tickets (SEAT-CHECK/banner) >= 1", "NA", None,
+                         f"no SEAT-CHECK or banner on the Top_10 status line (output={state})"))
+    else:
+        detail = f"exec={x['exec']} suspended={x['suspended']} grace={x['grace']} output={state} source={x['source']}"
+        if x["exec"] >= 1:
+            vb = "PASS"
+        elif state == "WITHHELD":
+            vb, detail = "WARN", detail + " | feed-blocked: the criterion is not testable today"
+        else:
+            vb, detail = "FAIL", detail + " | actionable feed, no executable ticket"
+        out.append(Check("D10-1b", "board executable tickets (SEAT-CHECK/banner) >= 1", vb, x["exec"], detail))
+    if x["exec"] is None or x["kpi_funded"] is None:
+        out.append(Check("D10-1c", "funded-KPI parity (Fundable Now == board exec)", "NA", None,
+                         f"exec={x['exec']} kpi_funded={x['kpi_funded']}"))
+    else:
+        gap = x["kpi_funded"] - x["exec"]
+        gain = _s(k.get("Exp. Gain 12M (SAR)"))
+        vc = "PASS" if gap == 0 else ("FAIL" if gap > 0 else "WARN")
+        out.append(Check("D10-1c", "funded-KPI parity (Fundable Now == board exec)", vc, gap,
+                         f"kpi_funded={x['kpi_funded']} exec={x['exec']} gain_kpi={gain or '-'}"
+                         + (" | funded KPI on non-executable seats (P-108)" if gap > 0 else "")))
+    return out
 
 
 def check_evidence_clock(src: Source) -> List[Check]:
@@ -514,10 +605,23 @@ def _stamp_guard(src: Source) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _stamp_fresh_cov(src: Source) -> Dict[str, Tuple[float, str]]:
+    """v1.0.7 (P-166): per page, the sync's own 'fresh_cov=NN.N%' on the
+    STATUS-STAMP message (run_dashboard_sync v6.4x+), with the stamp time."""
+    out: Dict[str, Tuple[float, str]] = {}
+    for st in _status_stamps(src):
+        page = _s(st.get("Page"))
+        m = re.search(r"fresh_cov=(\d+(?:\.\d+)?)%", _s(st.get("Message")))
+        if page in PAGES and m:
+            out[page] = (float(m.group(1)), _s(st.get("Last Updated")))
+    return out
+
+
 def check_pages(src: Source) -> List[Check]:
     out = []
     now = _now_riyadh()
     guard = _stamp_guard(src)
+    stamp_cov = _stamp_fresh_cov(src)   # v1.0.7 (P-166)
     for p in PAGES:
         rows = _table(src.tab(p))
         n = len(rows)
@@ -550,6 +654,16 @@ def check_pages(src: Source) -> List[Check]:
         g1_ok = dup == 0 and blank == 0 and fresh_share >= 95.0  # v1.0.2: stale is a FAIL
         out.append(Check(f"G1-{p}", f"{p} integrity (rows/dup/blank/fresh>=95%)", "PASS" if g1_ok else "FAIL",
                          n, f"dup_symbols={dup} blank_symbols={blank} fresh24h={fresh}/{n} ({fresh_share:.1f}%)"))
+        # v1.0.7 (P-166): the 24h window above is a floor; the sync's OWN fresh
+        # coverage on the page stamp is what the decision feed gates on
+        # (stale_cov below 95% withholds the feed). Report that number too.
+        sc = stamp_cov.get(p)
+        if sc is None:
+            out.append(Check(f"G1b-{p}", f"{p} stamp fresh_cov >= 95% (sync's own coverage)", "NA", None,
+                             "no fresh_cov on the page stamp"))
+        else:
+            out.append(Check(f"G1b-{p}", f"{p} stamp fresh_cov >= 95% (sync's own coverage)",
+                             "PASS" if sc[0] >= 95.0 else "FAIL", sc[0], f"fresh_cov={sc[0]:g}% stamp={sc[1][:19]}"))
         gs = glyph / n * 100.0
         g = guard.get(p)
         if g and g["rb_n"] > 0:
@@ -783,6 +897,30 @@ def run_all(src: Source, board_min: int = 5) -> List[Check]:
     return checks
 
 
+def _legacy_na() -> bool:
+    """v1.0.7 (P-166) kill-switch: TFB_ACCEPTANCE_LEGACY_NA=1 restores the v1.0.6
+    overall-verdict arithmetic (NA never degrades the verdict)."""
+    return _s(os.getenv("TFB_ACCEPTANCE_LEGACY_NA")).lower() in ("1", "true", "yes", "on")
+
+
+def _na_split(checks: List[Check]) -> Tuple[int, int]:
+    """(hard, design) NA counts. hard = parse + crash."""
+    hard = sum(1 for c in checks if c.na_kind in ("parse", "crash"))
+    design = sum(1 for c in checks if c.na_kind == "design")
+    return hard, design
+
+
+def _overall_verdict(checks: List[Check], errs: List[str]) -> str:
+    """v1.0.7 (P-166): FAIL on any FAIL, any read error, or (unless the legacy
+    kill-switch is set) any HARD NA; WARN on any WARN; else PASS. An NA the
+    workbook cannot answer by design (D10-6) never moves the verdict."""
+    tally = {v: sum(1 for c in checks if c.verdict == v) for v in ("PASS", "WARN", "FAIL", "NA")}
+    hard, _design = _na_split(checks)
+    if tally["FAIL"] or errs or (hard and not _legacy_na()):
+        return "FAIL"
+    return "WARN" if tally["WARN"] else "PASS"
+
+
 def render(checks: List[Check], title: str) -> str:
     w = max(len(c.name) for c in checks) + 2
     iw = max(len(c.cid) for c in checks) + 2
@@ -792,7 +930,9 @@ def render(checks: List[Check], title: str) -> str:
         m = "" if c.measured is None else (f"{c.measured:g}" if isinstance(c.measured, (int, float)) else str(c.measured)[:10])
         lines.append(f"{c.cid:{iw}s}{c.name:{w}s}{c.verdict:8s}{m:>10s}  {c.evidence[:110]}")
     tally = {v: sum(1 for c in checks if c.verdict == v) for v in ("PASS", "WARN", "FAIL", "NA")}
-    lines.append("TALLY " + " ".join(f"{k}={v}" for k, v in tally.items()))
+    hard, design = _na_split(checks)   # v1.0.7 (P-166)
+    lines.append("TALLY " + " ".join(f"{k}={v}" for k, v in tally.items())
+                 + f" NA_hard={hard} NA_design={design}" + (" legacy_na=1" if _legacy_na() else ""))
     return "\n".join(lines)
 
 
@@ -948,8 +1088,70 @@ def _selftest() -> int:
     cn = {c.cid: c for c in check_decision_integrity(N)}
     assert all(cn[k].verdict == "NA" for k in ("A1", "A2a", "A2b", "A4", "A3-Global_Markets")), [c.row() for c in cn.values()]
     assert {c.cid for c in run_all(A)} >= {"A1", "A2a", "A2b", "A4", "A3-Global_Markets", "A3-Market_Leaders"}
+    # v1.0.7 (P-166) fixtures: the REAL 2026-09-24 08:08:29 cockpit status line + KPI strip
+    # (Passed=20 qualified, Fundable Now=2, 0 executable, 2 suspended, 1 grace, output HELD).
+    status_line = ("Last run 2026-09-24 08:08:29 | status: ok | output: HELD | sheets pool 9786 rows "
+                   "[Market_Leaders 255/255, Global_Markets 6609/6609, Commodities_FX 453/453, Mutual_Funds 2469/2469] "
+                   "(5 duplicate symbols removed) (full universe) | held=6 sent | route v4.16.0 | builder v1.22.0 | "
+                   "pool=body_rows/9786 | 24240ms | req f3f5df4ca283 | stab[strict]: 1 grace, 2 ft-carried | "
+                   "SEAT-CHECK kpi 2 funded vs board 0 exec +2 suspended +1 grace; gain kpi 22076 SAR vs board 0 exec | 71.1s")
+    kpi_hdr = ["Deployable (SAR)", "Exp. Gain 12M (SAR)", "Selected", "Blended Reliability", "Blended R/R (TP2)", "Scanned",
+               "Passed", "Unallocated (SAR)", "Fundable Now", "By Rotation", "Capital Call (SAR)"]
+    kpi_val = ["24,764 SAR", "22,076 SAR", "2 / 10", "71.5", "3.71", "9,786", "20", "15 SAR", "2", "1", "10000"]
+    banner = "\u2705 FEED ACTIONABLE \u2014 EXECUTABLE (verdict age 17m) \u2014 SELECTED \u2014 0 EXECUTABLE TICKETS + 2 FAST-TRACK (SIZING SUSPENDED) + 1 GRACE-HELD (NO PLAN TODAY)"
+    real_top10 = [["TOP 10 INVESTMENTS \u2014 DECISION"], ["Status:", status_line], [], ["KPIs"], kpi_hdr, kpi_val, [], [banner],
+                  ["ALERTS (2)"], ["Type", "Count", "Required Action"], ["unfunded_candidates", "8", "x"], ["capital_call", "2", "x"], []]
+    R = _MemSource({"Top_10_Investments": real_top10})
+    cr = {c.cid: c for c in check_board(R, 5)}
+    assert cr["D10-1"].verdict == "PASS" and cr["D10-1"].measured == 20, cr["D10-1"].row()
+    assert cr["D10-1b"].verdict == "FAIL" and cr["D10-1b"].measured == 0 and "suspended=2" in cr["D10-1b"].evidence, cr["D10-1b"].row()
+    assert cr["D10-1c"].verdict == "FAIL" and cr["D10-1c"].measured == 2 and "P-108" in cr["D10-1c"].evidence, cr["D10-1c"].row()
+    # the same day WITHHELD -> D10-1b is WARN (feed-blocked, not testable); executable -> PASS and parity PASS
+    wh = [r if r[:1] != ["Status:"] else ["Status:", status_line.replace("output: HELD", "output: WITHHELD")] for r in real_top10]
+    cw = {c.cid: c for c in check_board(_MemSource({"Top_10_Investments": wh}), 5)}
+    assert cw["D10-1b"].verdict == "WARN" and cw["D10-1b"].measured == 0, cw["D10-1b"].row()
+    ex = [r if r[:1] != ["Status:"] else ["Status:", status_line.replace("output: HELD", "output: EXECUTABLE").replace(
+        "kpi 2 funded vs board 0 exec +2 suspended +1 grace", "kpi 2 funded vs board 2 exec +0 suspended +1 grace")] for r in real_top10]
+    ce = {c.cid: c for c in check_board(_MemSource({"Top_10_Investments": ex}), 5)}
+    assert ce["D10-1b"].verdict == "PASS" and ce["D10-1b"].measured == 2 and ce["D10-1c"].verdict == "PASS" and ce["D10-1c"].measured == 0
+    # banner fallback when the status line carries no SEAT-CHECK (pre-v1.11.6 cockpit)
+    nb = [r if r[:1] != ["Status:"] else ["Status:", status_line.split(" | stab[strict]")[0]] for r in real_top10]
+    cn2 = {c.cid: c for c in check_board(_MemSource({"Top_10_Investments": nb}), 5)}
+    assert cn2["D10-1b"].measured == 0 and "source=banner" in cn2["D10-1b"].evidence and cn2["D10-1c"].verdict == "FAIL", cn2["D10-1b"].row()
+    # the legacy fixture (no SEAT-CHECK, no banner) -> D10-1b / D10-1c are NA(parse) = HARD
+    assert ca["D10-1b"].verdict == "NA" and ca["D10-1b"].na_kind == "parse" and ca["D10-1c"].na_kind == "parse"
+    assert ca["D10-6"].na_kind == "design" and ca["D10-1"].na_kind is None
+    # G1b: the sync's own fresh_cov on the page stamp (real 2026-09-24 GM 88.8% / ML 100%)
+    status_cov = [status_ok[0],
+                  ["Global_Markets", now, "PARTIAL_FRESH", "[STATUS-STAMP v6.60.0] leg=success written=6609 failed=0 requested=6609 fresh=5869 preserved=740 fresh_cov=88.8% warnings=13 | data=PARTIAL guard=pw:6/6609,rb:6/6609", "", "", "", "", "", "", "", "TFB Decision Feed", "NOT_ACTIONABLE(stale_cov:GM) | run=1"],
+                  ["Market_Leaders", now, "SUCCESS", "[STATUS-STAMP v6.60.0] leg=success written=255 failed=0 requested=255 fresh=255 fresh_cov=100.0% warnings=4 | data=COMPLETE guard=pw:0/255,rb:0/255", "", "", "", "", "", "", "", "", ""]]
+    G = _MemSource({"Market_Leaders": good, "Global_Markets": good, "Commodities_FX": good, "Mutual_Funds": good, "_Status": status_cov})
+    cg = {c.cid: c for c in check_pages(G)}
+    assert cg["G1b-Global_Markets"].verdict == "FAIL" and abs(cg["G1b-Global_Markets"].measured - 88.8) < 1e-9, cg["G1b-Global_Markets"].row()
+    assert cg["G1b-Market_Leaders"].verdict == "PASS" and cg["G1b-Market_Leaders"].measured == 100.0
+    assert cg["G1b-Commodities_FX"].verdict == "NA" and cg["G1b-Commodities_FX"].na_kind == "parse"
+    assert cg["G1-Global_Markets"].verdict == "PASS"   # the 24h window still passes: G1 and G1b measure different things
+    # overall arithmetic: a hard NA is FAIL unless the legacy switch is set; a design NA never moves it
+    only_design = [Check("D10-6", "x", "NA", None, ""), Check("G3-x", "x", "PASS", 0, "")]
+    hard_na = only_design + [Check("A1", "x", "NA", None, "section not found")]
+    assert _overall_verdict(only_design, []) == "PASS" and _na_split(only_design) == (0, 1)
+    assert _overall_verdict(hard_na, []) == "FAIL" and _na_split(hard_na) == (1, 1)
+    assert _overall_verdict([Check("ERR", "x", "NA", None, "crashed")], []) == "FAIL"
+    assert _overall_verdict([Check("G3-x", "x", "WARN", 0, "")], []) == "WARN"
+    assert _overall_verdict([Check("G3-x", "x", "PASS", 0, "")], ["read error"]) == "FAIL"
+    _prev = os.environ.get("TFB_ACCEPTANCE_LEGACY_NA")
+    os.environ["TFB_ACCEPTANCE_LEGACY_NA"] = "1"
+    try:
+        assert _overall_verdict(hard_na, []) == "PASS"          # v1.0.6 arithmetic restored
+        assert _overall_verdict([Check("ERR", "x", "NA", None, "crashed")], []) == "PASS"
+    finally:
+        if _prev is None:
+            os.environ.pop("TFB_ACCEPTANCE_LEGACY_NA", None)
+        else:
+            os.environ["TFB_ACCEPTANCE_LEGACY_NA"] = _prev
+    assert "na_kind" in ca["D10-1"].row()
     print(render(list(ca.values()), "selftest A (all good)"))
-    print("selftest: PASS 7/7 fixtures (all-good, all-bad, stale page, mixed target cohort, duplicate downloads, unreadable xlsx, decision integrity A1..A4)")
+    print("selftest: PASS 8/8 fixtures (all-good, all-bad, stale page, mixed target cohort, duplicate downloads, unreadable xlsx, decision integrity A1..A4, P-166 execution/parity/stamp-cov/NA-hardening)")
     return 0
 
 
@@ -994,15 +1196,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if errs:
         print("READ ERRORS (fail-closed): " + " | ".join(errs)[:600])
     tally = {v: sum(1 for c in checks if c.verdict == v) for v in ("PASS", "WARN", "FAIL", "NA")}
-    overall = "FAIL" if (tally["FAIL"] or errs) else ("WARN" if tally["WARN"] else "PASS")
+    overall = _overall_verdict(checks, errs)   # v1.0.7 (P-166): hard NA counts
+    na_hard, na_design = _na_split(checks)
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump({"version": VERSION, "title": title, "generated_riyadh": _now_riyadh().isoformat(),
                        "provenance": _provenance(a, src),
                        "overall_verdict": overall, "fail_count": tally["FAIL"], "tally": tally,
+                       "na_hard": na_hard, "na_design": na_design, "legacy_na": _legacy_na(),   # v1.0.7
                        "read_errors": errs, "checks": [c.row() for c in checks]}, fh, indent=2, ensure_ascii=False)
-    if a.strict and (tally["FAIL"] or errs):
+    if a.strict and (tally["FAIL"] or errs or (na_hard and not _legacy_na())):
         return 1
     return 0
 
