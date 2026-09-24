@@ -21,7 +21,7 @@ on:
   # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
   # or the 25-min job cap being too short for a full sweep); check the Actions tab.
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 4,12,20 * * *"   # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
 
   # ✅ Manual run
   workflow_dispatch:
@@ -295,6 +295,16 @@ jobs:
       # fetch_failed:HTTP 402 -> BLOCKED) and nothing in _Run_Log said so.
       # KILL-SWITCH: delete this line -> v6.59.0 behaviour exactly.
       TFB_SYNC_EODHD_QUOTA: "observe"
+      # v6.61.0 P-154d EODHD QUOTA GUARD - OBSERVE (2026-09-24). Pre-fetch: one
+      # 0-cost /api/user poll per ranked page; post-fetch: fresh-402 share of the
+      # outgoing matrix. observe = one [EODHD-QUOTA-GUARD] _Run_Log line (+ a
+      # ::warning:: annotation) whenever a skip WOULD fire (EXHAUSTED / ON_EXTRA /
+      # used% >= TFB_SYNC_EODHD_QUOTA_GUARD_PCT 97 / fresh 402 on >= 25% of rows);
+      # fetch and write proceed exactly as v6.60.0. enforce (separate sitting) skips
+      # the leg before any provider call, or refuses a poisoned write, preserving
+      # last-good rows (status=skipped, exit code unchanged). Explicit words only;
+      # delete the line (or "off") to restore v6.60.0 behaviour byte-identically.
+      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -1528,6 +1538,10 @@ jobs:
       # delta=first-sample; the absolute counter + timestamp give the curve).
       TFB_SYNC_EODHD_QUOTA: "observe"
       EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+      # v6.61.0 P-154d quota guard - same observe arming as the sync-dashboard
+      # job: the replay subprocesses inherit this env, so a replay under
+      # exhaustion is disclosed (observe) / skipped (enforce) the same way.
+      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
       # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
       # page replay run_inline_page_recovery.py parses the page's last
       # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
