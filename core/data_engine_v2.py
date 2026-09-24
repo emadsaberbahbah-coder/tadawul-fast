@@ -3770,7 +3770,55 @@ if str(ROOT_DIR) not in sys.path:
 # /health engine_gates.w52_ceiling_scrub. Zero removals; one helper and
 # two constants added. Rollback: git revert, or the env kill-switch.
 # -----------------------------------------------------------------------------
-__version__ = "5.149.0"
+# WHY v5.150.0 (P-154c EODHD FUNDAMENTALS CACHE-FIRST + NEGATIVE CACHE + PAGE
+# SKIP; new env TFB_EODHD_FUND_CACHE off|observe|enforce, DEFAULT OFF =
+# v5.149.0 byte-identical; explicit words only):
+# EVIDENCE (2026-09-24 export + _Run_Log [EODHD-QUOTA v6.60.0] curve): EODHD
+# reached 400,000/400,000 EXHAUSTED at 00:54 Riyadh for the third time in
+# four days; the 20Z sync ran blind (402 on 5,789 GM + 2,393 MF + 336 CFX
+# rows) and the 02:01 cockpit hard-exited four seats on that epoch. The 04Z
+# run alone cost 83k calls (37.6k -> 120.7k). On the same export the
+# fundamentals fallback fired on 3,774 GM + 2,373 MF + 223 CFX rows in ONE
+# pass: _apply_eodhd_fundamentals_fallback tests only the debt_to_equity /
+# free_cash_flow_ttm gap and then spends a fundamentals request (10 calls)
+# with NO cache and NO memory of an empty answer (611 rows re-fetched every
+# pass for nothing). The fund-LKG (v5.117.0/v5.138.0) already holds the
+# provider-completed 24-field block per symbol for _fund_lkg_ttl_h (120h
+# in production, Redis L2 survives restarts) - but it is consulted only
+# AFTER a fetch, on a DEGRADED block, so every pass and every cold worker
+# pays the provider again. Mutual_Funds and Commodities_FX have never seated
+# a candidate (0 of 1,772 _Selection_Log rows) yet burn ~29k calls per run.
+# FIX (three legs, one gate, all inside the fallback's gap branch so a row
+# with no gap is untouched):
+#   (1) cache-first: a fund-LKG snapshot (memory, then L2) younger than
+#       TFB_EODHD_FUND_CACHE_TTL_H (default 24, floor 1, ceiling = the LKG
+#       TTL) that fills >= 1 still-missing whitelisted field REPLACES the
+#       provider request; the fill goes through the SAME
+#       _filter_patch_to_missing_fields whitelist as the provider patch
+#       (fill-only, values already in engine units because they were
+#       captured after the FUND-SENTRY ran). Tag fund_cache:hit:<age>h:<n>
+#       (+ ":nt" when the row also lacks target_mean_price, i.e. a same-pass
+#       analyst-target fill is forgone; the v5.131.0 target LKG covers it).
+#   (2) negative cache: a request that lands NOTHING (empty payload, AW-1
+#       refusal, or no whitelisted field filled) marks the symbol in memory
+#       + L2 key tfb:fund_neg:v1:<SYM> for TFB_EODHD_FUND_NEG_TTL_H (default
+#       168); while the mark lives the request is skipped (fund_cache:neg:
+#       <age>h). Marks are written ONLY under enforce.
+#   (3) page skip: TFB_EODHD_FUND_FALLBACK_SKIP_PAGES (csv, default empty)
+#       names pages whose rows never spend a request (fund_cache:skip_page).
+# observe => the SAME decisions are computed and disclosed as one countable
+# fund_cache:would_hit / would_neg / would_skip_page tag per row; the
+# provider is still called exactly as v5.149.0 and every value is byte-
+# identical. off => no read, no tag, no write. A row served from the cache
+# is never re-captured by _fund_lkg_capture (tag check, the fundamentals_lkg
+# precedent), so a hit can never refresh its own TTL: the provider is asked
+# again once per cache TTL per symbol. Tags are substring-safe for the
+# investability gate. Mode disclosed in the [GUARDS] boot line (fund_cache=)
+# and in /health engine_gates.eodhd_fund_cache (+ fund_cache_stats
+# counters per worker). Zero removals; twelve helpers, nine constants added.
+# Rollback: git revert, or unset the env (= off).
+# -----------------------------------------------------------------------------
+__version__ = "5.150.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5503,6 +5551,8 @@ def surface_gate_states() -> Dict[str, Any]:
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
             "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
             "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
+            "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
+            "fund_cache_stats": _fund_cache_stats(),                   # v5.150.0 (P-154c)
         }
     except Exception:
         return {}
@@ -11589,6 +11639,10 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
             return False
         if _fund_lkg_row_tainted(row):
             return False
+        # v5.150.0 (P-154c): a row served from the cache must never re-seed
+        # the store, or a hit would refresh its own TTL forever.
+        if _fund_cache_row_is_hit(row):
+            return False
         if _fund_lkg_present_count(row) < _fund_lkg_min_fields():
             return False
         if all(_is_missing_or_unknown_field(row.get(k)) for k in _FUND_LKG_ANCHOR_FIELDS):
@@ -11846,6 +11900,257 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
     except Exception:
         _fund_lkg_redis_note_error()
         return None
+
+
+# =============================================================================
+# v5.150.0 (P-154c) - EODHD FUNDAMENTALS CACHE-FIRST / NEGATIVE CACHE / PAGE SKIP
+# =============================================================================
+# See the WHY v5.150.0 header block. The cache IS the fund-LKG snapshot
+# (memory first, Redis L2 on a miss, same client/breaker/key as v5.138.0);
+# this section adds the read-before-fetch decision, a negative cache for
+# empty answers and a page skip list. Every helper is pure/fail-open: any
+# exception yields "miss" and the provider path runs exactly as before.
+_FUND_CACHE_ENV: str = "TFB_EODHD_FUND_CACHE"                    # off|observe|enforce
+_FUND_CACHE_TTL_ENV: str = "TFB_EODHD_FUND_CACHE_TTL_H"          # default 24h
+_FUND_NEG_TTL_ENV: str = "TFB_EODHD_FUND_NEG_TTL_H"              # default 168h
+_FUND_FB_SKIP_PAGES_ENV: str = "TFB_EODHD_FUND_FALLBACK_SKIP_PAGES"  # csv of page names
+_FUND_CACHE_TAG: str = "fund_cache"                              # substring-safe namespace
+_FUND_NEG_REDIS_KEY_PREFIX: str = "tfb:fund_neg:v1:"
+_FUND_CACHE_SHORT_CIRCUIT_KINDS: Tuple[str, ...] = ("hit", "neg", "skip_page")
+_FUND_NEG_STORE: Dict[str, float] = {}      # per-worker mirror: SYM -> ts of the last empty answer
+_FUND_CACHE_STATS: Dict[str, int] = {
+    "hit": 0, "would_hit": 0, "neg": 0, "would_neg": 0,
+    "skip_page": 0, "would_skip_page": 0, "miss": 0, "neg_writes": 0,
+}
+
+
+def _fund_cache_mode() -> str:
+    """TFB_EODHD_FUND_CACHE: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_FUND_CACHE_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _fund_cache_ttl_h() -> float:
+    """Cache window in hours: default 24, floor 1, ceiling = the fund-LKG TTL
+    (an entry older than the LKG TTL is popped by the restore path anyway)."""
+    try:
+        v = float((os.getenv(_FUND_CACHE_TTL_ENV) or "24").strip())
+    except Exception:
+        v = 24.0
+    if v < 1.0:
+        v = 1.0
+    try:
+        lkg = float(_fund_lkg_ttl_h())
+        if v > lkg:
+            v = lkg
+    except Exception:
+        pass
+    return v
+
+
+def _fund_neg_ttl_h() -> float:
+    """Negative-cache window in hours: default 168 (7 days), floor 1."""
+    try:
+        v = float((os.getenv(_FUND_NEG_TTL_ENV) or "168").strip())
+    except Exception:
+        v = 168.0
+    return v if v >= 1.0 else 1.0
+
+
+def _fund_fb_skip_pages() -> Set[str]:
+    """Upper-cased page names whose rows never spend a fundamentals request
+    (enforce) / would not (observe). Empty by default."""
+    raw = (os.getenv(_FUND_FB_SKIP_PAGES_ENV) or "").strip()
+    if not raw:
+        return set()
+    return {p.strip().upper() for p in raw.split(",") if p.strip()}
+
+
+def _fund_cache_bump(key: str) -> None:
+    try:
+        _FUND_CACHE_STATS[key] = int(_FUND_CACHE_STATS.get(key) or 0) + 1
+    except Exception:
+        pass
+
+
+def _fund_cache_stats() -> Dict[str, int]:
+    try:
+        return {k: int(v or 0) for k, v in _FUND_CACHE_STATS.items()}
+    except Exception:
+        return {}
+
+
+def _fund_cache_row_is_hit(row: Mapping[str, Any]) -> bool:
+    """True when the row carries an ENFORCE cache-hit tag (fund_cache:hit:).
+    observe tags (fund_cache:would_hit:) do not match: those rows were still
+    served by the provider and may seed the store as before."""
+    try:
+        raw = row.get("warnings") if isinstance(row, Mapping) else None
+        if isinstance(raw, str):
+            return (_FUND_CACHE_TAG + ":hit:") in raw
+        if isinstance(raw, (list, tuple, set)):
+            return any((_FUND_CACHE_TAG + ":hit:") in _safe_str(p) for p in raw)
+        return False
+    except Exception:
+        return False
+
+
+def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
+    """(fields, age_s) of the fund-LKG snapshot for SYM when younger than the
+    cache TTL: memory first, then the L2 layer (populating memory like the
+    v5.138.0 restore path). None on miss / expired / any failure."""
+    try:
+        if not _fund_lkg_enabled():
+            return None
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return None
+        entry = _FUND_LKG_STORE.get(s)
+        if not entry:
+            entry = _fund_lkg_redis_get(s)
+            if entry:
+                _FUND_LKG_STORE[s] = entry
+        if not entry:
+            return None
+        age_s = time.time() - float(entry.get("ts") or 0.0)
+        if age_s < 0:
+            age_s = 0.0
+        if age_s > _fund_cache_ttl_h() * 3600.0:
+            return None
+        fields = entry.get("fields")
+        if not isinstance(fields, dict) or not fields:
+            return None
+        return fields, age_s
+    except Exception:
+        return None
+
+
+def _fund_neg_lookup(sym: str) -> Optional[float]:
+    """Age in seconds of a live negative mark for SYM (memory, then L2), or
+    None. Expired marks are dropped from memory. Never raises."""
+    try:
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return None
+        ts = _FUND_NEG_STORE.get(s)
+        if ts is None:
+            client = _fund_lkg_redis_client()
+            if client is not None:
+                raw = client.get(_FUND_NEG_REDIS_KEY_PREFIX + s)
+                _fund_lkg_redis_note_ok()
+                if raw:
+                    ts = _as_float(raw)
+                    if ts is not None and ts > 0:
+                        _FUND_NEG_STORE[s] = float(ts)
+        if ts is None:
+            return None
+        age_s = time.time() - float(ts)
+        if age_s < 0:
+            age_s = 0.0
+        if age_s > _fund_neg_ttl_h() * 3600.0:
+            _FUND_NEG_STORE.pop(s, None)
+            return None
+        return age_s
+    except Exception:
+        try:
+            _fund_lkg_redis_note_error()
+        except Exception:
+            pass
+        return None
+
+
+def _fund_neg_mark(sym: str) -> bool:
+    """Record an empty provider answer for SYM in memory + L2 (SETEX, ttl =
+    the negative TTL). Prunes memory oldest-first past the LKG size cap.
+    Never raises; True when the memory mark was written."""
+    try:
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return False
+        now = time.time()
+        _FUND_NEG_STORE[s] = now
+        cap = _fund_lkg_max_symbols()
+        if len(_FUND_NEG_STORE) > cap:
+            ttl_s = _fund_neg_ttl_h() * 3600.0
+            for k in [k for k, t in _FUND_NEG_STORE.items() if (now - float(t or 0.0)) > ttl_s]:
+                _FUND_NEG_STORE.pop(k, None)
+            if len(_FUND_NEG_STORE) > cap:
+                for k, _t in sorted(_FUND_NEG_STORE.items(), key=lambda kv: float(kv[1] or 0.0))[: len(_FUND_NEG_STORE) - cap]:
+                    _FUND_NEG_STORE.pop(k, None)
+        try:
+            client = _fund_lkg_redis_client()
+            if client is not None:
+                client.setex(_FUND_NEG_REDIS_KEY_PREFIX + s,
+                             int(max(1.0, _fund_neg_ttl_h() * 3600.0)),
+                             "%.3f" % now)
+                _fund_lkg_redis_note_ok()
+                _FUND_LKG_REDIS_STATE["writes"] = int(_FUND_LKG_REDIS_STATE.get("writes") or 0) + 1
+        except Exception:
+            _fund_lkg_redis_note_error()
+        return True
+    except Exception:
+        return False
+
+
+def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
+                       mode: str) -> Tuple[str, str, Dict[str, Any]]:
+    """The read-before-fetch decision for a row whose D/E-or-FCF gap is real.
+    Returns (kind, tag, fill): kind in hit|neg|skip_page|miss under enforce
+    and would_hit|would_neg|would_skip_page|miss under observe; tag is the
+    countable warnings tag ("" on miss); fill is the fill-only patch (only
+    under enforce on a hit). Never raises -> ("miss", "", {})."""
+    try:
+        if mode not in ("observe", "enforce"):
+            return "miss", "", {}
+        pfx = "" if mode == "enforce" else "would_"
+        s = _safe_str(symbol).strip().upper()
+        pg = _safe_str(page).strip().upper()
+        if pg and pg in _fund_fb_skip_pages():
+            kind = pfx + "skip_page"
+            _fund_cache_bump(kind)
+            return kind, "%s:%s" % (_FUND_CACHE_TAG, kind), {}
+        neg_age = _fund_neg_lookup(s)
+        if neg_age is not None:
+            kind = pfx + "neg"
+            _fund_cache_bump(kind)
+            return kind, "%s:%s:%dh" % (_FUND_CACHE_TAG, kind, int(neg_age // 3600)), {}
+        found = _fund_cache_lookup(s)
+        if found:
+            fields, age_s = found
+            filtered, _filled = _filter_patch_to_missing_fields(
+                dict(row) if not isinstance(row, dict) else row, fields, _YAHOO_FUNDAMENTAL_FIELDS,
+            )
+            if filtered:
+                kind = pfx + "hit"
+                _fund_cache_bump(kind)
+                tag = "%s:%s:%dh:%d" % (_FUND_CACHE_TAG, kind, int(age_s // 3600), len(filtered))
+                if _is_missing_or_unknown_field(row.get("target_mean_price")):
+                    tag += ":nt"
+                return kind, tag, (filtered if mode == "enforce" else {})
+        _fund_cache_bump("miss")
+        return "miss", "", {}
+    except Exception:
+        return "miss", "", {}
+
+
+def _fund_cache_note_empty(row: Dict[str, Any], symbol: str, mode: str, reason: str) -> None:
+    """A provider request that landed nothing: under enforce write the
+    negative mark (memory + L2) and tag fund_cache:neg_mark:<reason>; under
+    observe only count + tag fund_cache:would_neg:<reason>. off => no-op."""
+    try:
+        if mode not in ("observe", "enforce") or not isinstance(row, dict):
+            return
+        r = (reason or "empty").strip().lower() or "empty"
+        if mode == "enforce":
+            _fund_neg_mark(symbol)
+            _fund_cache_bump("neg_writes")
+            _v573_append_warning(row, "%s:neg_mark:%s" % (_FUND_CACHE_TAG, r))
+        else:
+            _fund_cache_bump("would_neg")
+            _v573_append_warning(row, "%s:would_neg:%s" % (_FUND_CACHE_TAG, r))
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -15883,7 +16188,7 @@ class DataEngineV5:
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
-                "w52_ceiling=%s",
+                "w52_ceiling=%s fund_cache=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15901,6 +16206,7 @@ class DataEngineV5:
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
+                _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
             )
         except Exception:
             pass
@@ -16915,8 +17221,29 @@ class DataEngineV5:
                 and _as_float(row.get("free_cash_flow_ttm")) is not None \
                 and not _ax2_sector_gap:
             return row
+        # --- v5.150.0 (P-154c) EODHD FUNDAMENTALS CACHE-FIRST ------------
+        # The gap is real. Before spending a 10-call fundamentals request,
+        # consult (1) the page skip list, (2) the negative cache, (3) the
+        # fund-LKG snapshot (memory, then Redis L2) when younger than the
+        # cache TTL. off => byte-identical to v5.149.0 (no read, no tag).
+        # observe => one countable would_* tag per row, values untouched,
+        # the provider still called exactly as before. enforce => the
+        # request is skipped and the row is filled FILL-ONLY from the
+        # snapshot (hit) or left as Yahoo delivered it (neg / skip_page).
+        _fc_mode = _fund_cache_mode()
+        if _fc_mode != "off":
+            _fc_kind, _fc_tag, _fc_fill = _fund_cache_decide(row, symbol, page, _fc_mode)
+            if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
+                if _fc_fill:
+                    row = self._merge(row, _fc_fill)
+                if _fc_tag:
+                    _v573_append_warning(row, _fc_tag)
+                return row
+            if _fc_tag:
+                _v573_append_warning(row, _fc_tag)
         patch = await self._fetch_eodhd_fundamentals_patch(symbol, page)
         if not patch:
+            _fund_cache_note_empty(row, symbol, _fc_mode, "empty")
             return row
         # v5.112.0 (Fix AW-1): run the AU-1 declared-identity check on the RAW
         # patch BEFORE _canonicalize_provider_row force-stamps the requested
@@ -16933,6 +17260,7 @@ class DataEngineV5:
                     __version__, symbol, _aw_got,
                 )
                 _v573_append_warning(row, "identity_patch_refused:eodhd_fundamentals")
+                _fund_cache_note_empty(row, symbol, _fc_mode, "refused")
                 return row
         sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
             _safe_str(row.get("symbol") or row.get("requested_symbol"))
@@ -16976,6 +17304,9 @@ class DataEngineV5:
                 _v573_append_warning(row, "fund_identity_quarantined")
             if _aw_keep and any(k in filtered for k in _aw_keep):
                 _v573_append_warning(row, "sector_from_eodhd_verified")
+        if not filtered:
+            # v5.150.0 (P-154c): the paid request landed nothing usable.
+            _fund_cache_note_empty(row, symbol, _fc_mode, "nofill")
         if filtered:
             row = self._merge(row, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
