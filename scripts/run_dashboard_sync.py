@@ -1837,7 +1837,56 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.62.0"
+SCRIPT_VERSION = "6.63.0"
+# -----------------------------------------------------------------------------
+# v6.63.0 (2026-09-26) - P-162b KEEP-LAST-GOOD FOR FETCH-FAILED ROWS
+# -----------------------------------------------------------------------------
+# EVIDENCE (runs 36199188352 / 36231358321, 2026-09-26): the v6.22.3
+#   keep-last-good guard substitutes only DATA-FREE stubs ("all forms require
+#   NO positive price"). A row the engine tagged fetch_failed:HTTP 402 carries
+#   a last-known price, so it is never a stub: on the 09-26 legs the guard
+#   swapped 7 priceless crypto stubs on Commodities_FX and let 6,302 GM,
+#   411 CFX and 2,472 MF price-carrying 402 rows overwrite clean rows. The
+#   v6.61.0 post-fetch refusal (armed enforce 2026-09-26) catches storms
+#   >= 25% of a page; a partial storm (2026-09-20: 845 GM rows = 12.8%,
+#   GLNG's seat fell 76.5 -> 65.1) still overwrites clean rows row by row.
+# WHAT. One gate, TFB_SYNC_KLG_FETCHFAIL = off | observe | enforce (explicit
+#   words; anything else = off). DEFAULT OFF = _keep_last_good_rows
+#   byte-identical to v6.62.0 (no extra read, no extra line).
+#   Stub form (d), inside the existing stub scan: an OUTGOING row whose
+#     Warnings cell carries the engine's fetch_failed tag (_FG_FETCHFAIL_RE)
+#     is a substitution CANDIDATE whatever its price cell says - the price
+#     is the engine's last-known value, not a fresh quote. Candidates ride
+#     the SAME certification as forms (a)-(c): forced-refetch skip, symbol
+#     domain, positive old price, non-error old provider, the FW-1 identity
+#     gate - PLUS one extra test: the old row must not itself carry
+#     fetch_failed (a poisoned predecessor is not last-GOOD).
+#   enforce: a certified prior replaces the fetch-failed row (header-aligned
+#     exactly like a stub); the symbol counts in `swapped` -> klg_kept ->
+#     the stamp's fresh/fresh_cov and the feed token are honest by the
+#     existing arithmetic; a candidate with no certified prior keeps the
+#     fresh row (the guard substitutes strictly better data or nothing).
+#   observe: candidates are certified but NOT substituted; the counts are
+#     disclosed. Both modes publish ONE "[KLG-FETCHFAIL]" line per page
+#     (res.warnings + logger + ::warning::) when candidates exist:
+#     candidates / good_prior / prior_fetchfailed / substituted, and
+#     _stamp_meta gains klg_ff_cand / klg_ff_good / klg_ff_swapped.
+#   Ordering fact (pinned on this file): the v6.61.0 post-fetch refusal
+#     runs AFTER this guard, on the outgoing matrix; under enforce the
+#     substituted rows no longer carry the tag, so a page with certified
+#     priors is WRITTEN (old good rows + the fresh clean ones) instead of
+#     refused whole - strictly more data, same honesty (klg_kept drives
+#     fresh_cov). Rows without a prior still count toward the 25% refusal.
+#   Cost: one old-grid read per leg only when candidates exist (the
+#     zero-stub fast path is untouched); a storm leg substitutes in memory.
+# SCOPE CUT (stated): the (a)-(c) forms and their certification are
+#   untouched; no cap on substitutions is added (the identity firewall's
+#   per-row gates stand; a whole-page substitution is the intended outcome
+#   of a whole-page provider failure).
+# ENV LANE: GitHub Actions (daily_sync.yml): sync-dashboard job env AND the
+#   recovery job env (the replay subprocess inherits it).
+# Kill: unset / off. ZERO functions removed; additions: _klg_fetchfail_mode,
+# _klg_fetchfail_selftest; one dict _LAST_KLG_FF.
 # -----------------------------------------------------------------------------
 # v6.62.0 (2026-09-26) - P-162 FETCH-FAILED STAMP TRUTH (fresh_cov + feed token)
 # -----------------------------------------------------------------------------
@@ -8290,6 +8339,83 @@ def _klg_provider_is_stub_eligible(v: Any) -> bool:
         return False
 
 
+# v6.63.0 [P-162b]: keep-last-good for fetch-failed rows ---------------------
+_KLG_FF_TAG = f"[KLG-FETCHFAIL v{SCRIPT_VERSION}]"
+_LAST_KLG_FF: Dict[str, Any] = {"mode": "off", "cand": 0, "good_prior": 0,
+                                "prior_ff": 0, "swapped": 0, "syms": []}
+
+
+def _klg_fetchfail_mode() -> str:
+    """v6.63.0 [P-162b] gate TFB_SYNC_KLG_FETCHFAIL = off | observe | enforce
+    (explicit words; anything else = off). Never throws."""
+    try:
+        raw = (os.getenv("TFB_SYNC_KLG_FETCHFAIL") or "off").strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def _klg_ff_reset(mode: str) -> None:
+    """Per-invocation counters read by the caller (the FW-1 suspects pattern)."""
+    _LAST_KLG_FF["mode"] = mode
+    _LAST_KLG_FF["cand"] = 0
+    _LAST_KLG_FF["good_prior"] = 0
+    _LAST_KLG_FF["prior_ff"] = 0
+    _LAST_KLG_FF["swapped"] = 0
+    del _LAST_KLG_FF["syms"][:]
+
+
+def _klg_fetchfail_selftest() -> str:
+    """v6.63.0 [P-162b]: pure fixtures through the REAL _keep_last_good_rows
+    with a canned sheet grid (no network). PASS / FAIL n/m; never throws."""
+    hdr = ["Symbol", "Name", "Current Price", "EPS (TTM)", "P/E (TTM)",
+           "Data Provider", "Warnings", "Last Updated (UTC)"]
+    old = [list(hdr),
+           ["A.US", "Alpha Corp", 10.0, 1.0, 10.0, "eodhd", "yahoo_enrichment_applied", "2026-09-25T13:00:00+00:00"],
+           ["B.US", "Beta Corp", 20.0, 2.0, 10.0, "eodhd", "fetch_failed:HTTP 402", "2026-09-25T23:20:00+00:00"],
+           ["C.US", "Gamma Corp", 30.0, 3.0, 10.0, "eodhd", "", "2026-09-25T13:00:00+00:00"]]
+    fresh = [["A.US", "Alpha Corp", 9.9, 1.0, 9.9, "eodhd", "fetch_failed:HTTP 402; dq_capped:coherence:fetch_failed", "2026-09-26T00:40:00+00:00"],
+             ["B.US", "Beta Corp", 19.8, 2.0, 9.9, "eodhd", "fetch_failed:HTTP 402", "2026-09-26T00:40:00+00:00"],
+             ["C.US", "Gamma Corp", 30.3, 3.0, 10.1, "eodhd", "ok", "2026-09-26T00:41:00+00:00"],
+             ["D.US", "Delta Corp", 5.0, 0.5, 10.0, "eodhd", "fetch_failed:HTTP 404 not_found", "2026-09-26T00:41:00+00:00"]]
+
+    class _G(object):
+        def read_values(self, *_a, **_k):
+            return [list(r) for r in old]
+
+    def _run(mode):
+        saved = os.environ.get("TFB_SYNC_KLG_FETCHFAIL")
+        try:
+            os.environ["TFB_SYNC_KLG_FETCHFAIL"] = mode
+            m = [list(r) for r in fresh]
+            out, sw = _keep_last_good_rows(_G(), "sid", "P", list(hdr), m)
+            return out, sw, dict(_LAST_KLG_FF)
+        finally:
+            if saved is None:
+                os.environ.pop("TFB_SYNC_KLG_FETCHFAIL", None)
+            else:
+                os.environ["TFB_SYNC_KLG_FETCHFAIL"] = saved
+    passed, total = 0, 4
+    try:
+        o_off, s_off, f_off = _run("off")
+        if s_off == [] and o_off[0][2] == 9.9 and f_off["cand"] == 0:
+            passed += 1
+        o_obs, s_obs, f_obs = _run("observe")
+        if (s_obs == [] and o_obs[0][2] == 9.9 and f_obs["cand"] == 3
+                and f_obs["good_prior"] == 1 and f_obs["prior_ff"] == 1 and f_obs["swapped"] == 0):
+            passed += 1
+        o_enf, s_enf, f_enf = _run("enforce")
+        if (s_enf == ["A.US"] and o_enf[0][2] == 10.0 and o_enf[0][6] == "yahoo_enrichment_applied"
+                and o_enf[1][2] == 19.8 and o_enf[3][2] == 5.0 and o_enf[2][2] == 30.3
+                and f_enf["swapped"] == 1 and f_enf["prior_ff"] == 1):
+            passed += 1
+        if _klg_fetchfail_mode() in ("off", "observe", "enforce"):
+            passed += 1
+    except Exception as e:  # noqa: BLE001
+        return "FAIL(%s)" % type(e).__name__
+    return "PASS" if passed == total else "FAIL %d/%d" % (passed, total)
+
+
 def _keep_last_good_rows(
     sheets: "SheetsWriter",
     spreadsheet_id: str,
@@ -8328,6 +8454,12 @@ def _keep_last_good_rows(
         return rows_matrix, swapped
     prov_i = _guard_find_col(list(headers), _KLG_PROVIDER_ALIASES)
     name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+    # v6.63.0 [P-162b]: form (d) - fetch-failed rows are substitution
+    # candidates whatever their (last-known) price cell says.
+    ff_mode = _klg_fetchfail_mode()
+    _klg_ff_reset(ff_mode)
+    warn_i = _guard_find_col(list(headers), _FG_WARN_ALIASES) if ff_mode != "off" else -1
+    ff_rows: Dict[str, List[int]] = {}
 
     def _cell(row: List[Any], i: int) -> Any:
         return row[i] if (0 <= i < len(row)) else ""
@@ -8336,6 +8468,11 @@ def _keep_last_good_rows(
     for r_i, row in enumerate(rows_matrix):
         if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
             continue
+        if warn_i >= 0 and _FG_FETCHFAIL_RE.search(str(_cell(row, warn_i) or "")):
+            tff = str(row[sym_i]).strip().upper()
+            ff_rows.setdefault(tff, []).append(r_i)
+            _LAST_KLG_FF["cand"] += 1
+            continue  # v6.63.0 [P-162b]: certified below against its prior
         if _klg_price_ok(_cell(row, px_i)):
             continue  # carries a fresh price -> never a stub
         is_err = prov_i >= 0 and _klg_provider_is_error(_cell(row, prov_i))
@@ -8345,7 +8482,7 @@ def _keep_last_good_rows(
             continue
         t = str(row[sym_i]).strip().upper()
         stub_rows.setdefault(t, []).append(r_i)
-    if not stub_rows:
+    if not stub_rows and not ff_rows:
         return rows_matrix, swapped
 
     # v6.24.3: last-good rows past the read bound were invisible to the swap.
@@ -8383,8 +8520,10 @@ def _keep_last_good_rows(
     old_pe_i = _guard_find_col(list(old_headers_raw), _COH_PE_ALIASES)
     if old_px_i < 0:
         return rows_matrix, swapped  # cannot certify an old row as GOOD without a price
+    # v6.63.0 [P-162b]: a fetch-failed predecessor is never last-GOOD.
+    old_warn_i = _guard_find_col(list(old_headers_raw), _FG_WARN_ALIASES) if ff_rows else -1
 
-    pending = set(stub_rows.keys())
+    pending = set(stub_rows.keys()) | set(ff_rows.keys())
     for row in grid[hdr_r + 1:]:
         if not pending:
             break
@@ -8413,12 +8552,30 @@ def _keep_last_good_rows(
         ):
             _LAST_KLG_ID_SUSPECTS.append(t)
             continue  # identity-suspect predecessor -> write the fresh stub
+        # v6.63.0 [P-162b]: form (d) needs one more certificate - the
+        # predecessor must not itself carry fetch_failed. observe counts,
+        # enforce substitutes; a symbol that is also a (a)-(c) stub keeps
+        # its v6.62.0 path for those rows regardless.
+        ff_ok = False
+        if t in ff_rows:
+            if 0 <= old_warn_i < len(row) and _FG_FETCHFAIL_RE.search(str(row[old_warn_i] or "")):
+                _LAST_KLG_FF["prior_ff"] += 1
+            else:
+                _LAST_KLG_FF["good_prior"] += 1
+                ff_ok = ff_mode == "enforce"
+            if t not in stub_rows and not ff_ok:
+                continue  # observe, or a poisoned prior: keep the fresh row
         aligned: List[Any] = []
         for h in headers:
             j = old_idx.get(_hnorm(h), -1)
             aligned.append(row[j] if 0 <= j < len(row) else "")
-        for r_i in stub_rows[t]:
+        for r_i in stub_rows.get(t, []):
             rows_matrix[r_i] = list(aligned)
+        if ff_ok:
+            for r_i in ff_rows[t]:
+                rows_matrix[r_i] = list(aligned)
+            _LAST_KLG_FF["swapped"] += 1
+            _LAST_KLG_FF["syms"].append(t)
         swapped.append(t)
     return rows_matrix, swapped
 
@@ -11037,6 +11194,23 @@ async def _run_one_task(
                     )
                     res.warnings.append(_kw)
                     logger.warning(_kw)
+                # v6.63.0 [P-162b]: fetch-failed candidates, one line per page.
+                if int(_LAST_KLG_FF.get("cand") or 0) > 0:
+                    _ffk = (
+                        f"{_KLG_FF_TAG} {task.sheet_name} | mode={_LAST_KLG_FF.get('mode')} "
+                        f"| candidates={_LAST_KLG_FF.get('cand')} "
+                        f"good_prior={_LAST_KLG_FF.get('good_prior')} "
+                        f"prior_fetchfailed={_LAST_KLG_FF.get('prior_ff')} "
+                        f"substituted={_LAST_KLG_FF.get('swapped')}"
+                        + (" (observe: nothing substituted)"
+                           if _LAST_KLG_FF.get("mode") == "observe" else "")
+                    )
+                    res.warnings.append(_ffk)
+                    logger.warning(_ffk)
+                    print("::warning::" + _ffk)
+                    res._stamp_meta["klg_ff_cand"] = int(_LAST_KLG_FF.get("cand") or 0)
+                    res._stamp_meta["klg_ff_good"] = int(_LAST_KLG_FF.get("good_prior") or 0)
+                    res._stamp_meta["klg_ff_swapped"] = int(_LAST_KLG_FF.get("swapped") or 0)
                 _idfw_klg_suspects = list(_LAST_KLG_ID_SUSPECTS)
                 if _idfw_klg_suspects:
                     _sw = (
@@ -11787,6 +11961,11 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     try:  # v6.62.0 P-162: certify the stamp-truth arithmetic pre-write
         logger.info("%s selftest=%s mode=%s", _FFT_TAG,
                     _fetchfail_truth_selftest(), _fetchfail_truth_mode())
+    except Exception:
+        pass
+    try:  # v6.63.0 P-162b: prove the fetch-failed keep-last-good leg pre-write
+        logger.info("%s selftest=%s mode=%s", _KLG_FF_TAG,
+                    _klg_fetchfail_selftest(), _klg_fetchfail_mode())
     except Exception:
         pass
 
