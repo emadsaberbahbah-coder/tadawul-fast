@@ -5,12 +5,16 @@ on:
     paths:
       - '.github/workflows/full_refresh_coverage.yml'
       - 'scripts/audit_full_refresh_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_full_refresh_coverage.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/full_refresh_coverage.yml'
       - 'scripts/audit_full_refresh_coverage.py'
+      - 'scripts/workflow_audit_support.py'
+      - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_full_refresh_coverage.py'
   workflow_run:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]

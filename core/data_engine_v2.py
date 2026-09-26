@@ -3517,7 +3517,308 @@ if str(ROOT_DIR) not in sys.path:
 # family, explicitly out of scope). Tags avoid the reliability-scan
 # substrings. Zero removals; three sites replaced by the shared helper.
 # -----------------------------------------------------------------------------
-__version__ = "5.141.0"
+# WHY v5.142.0 (P-143 EQ-ROI BACKFILL WRITE-SITE SENTRY -- observe
+# instrumentation only):
+# The 2026-09-15 session pinned why the armed Render env
+# TFB_EQ_ROI_UNIT_SENTRY=observe produced ZERO tags: the v4.11.0 sentry
+# lives in core.enriched_quote.normalize_rows, which is OFF the daily
+# sync write path (sync -> /v1/analysis/sheet-rows -> routes/
+# analysis_sheet_rows -> this engine directly). The engine's own
+# backfills are the writers of the bare fraction-scale ROI cells the
+# sheet shows. This version ports the sentry to the ACTUAL write sites
+# as call-time-gated, countable attribution tags -- FOUR clusters, not
+# the one the 2026-09-15 pin named (correction owned on the commit
+# sheet): _phase_ii_quality_forecast's provider-12M branch, its
+# provider-3M branch, its full-synthesis block, and
+# _compute_scores_local_fallback's fallback block.
+# CONTRACT ADJUDICATION (2026-09-16, on the same-day export): the sheet
+# ROI columns store FRACTIONS under a percent NUMBER FORMAT; formatted
+# cells rendering "25.00%" prove the stored value is 0.25 (a stored
+# 25.0 would render "2,500.00%"); zero bare cells with |v|>1.5 exist
+# across all 9,791 market rows; the independent price/forecast/ROI
+# identity test passes value-wise on 9,399/9,653 rows reading
+# bare-as-fraction. Therefore the values these backfills write are
+# CORRECT and a x100 enforce at any sheet-bound path would corrupt
+# every percent-formatted destination (the same x100 hazard the
+# 2026-09-12 vNEXT premise check averted for Upside%/Percent Change).
+# P-101's residual is a DISPLAY FORMAT gap, owned GAS-side (Reformat
+# percent-format extension). Enforce mode here is DELIBERATELY tag-only
+# (observe + a per-row enforce_deferred marker) until that adjudication
+# is ever overturned in writing. Zero removals; one helper added;
+# default OFF is behavior-identical to v5.141.0.
+# -----------------------------------------------------------------------------
+# WHY v5.148.0 (P-102 FC-TUPLE COHERENCE -- re-issue of the never-committed
+# v5.146.0 build on the v5.147.0 base; new env TFB_FC_TUPLE_COHERENT
+# off|observe|enforce, default off = byte-identical v5.147.0):
+# The sheet publishes rows whose Expected ROI contradicts their own
+# (forecast price, current price) pair: 2026-09-20 export 173 rows
+# (Market_Leaders 46 = 18% of the Saudi page, Global_Markets 127; 172 at 12M
+# + 1 at 3M; 37 off by >2pp; sign flip 4090.SR stored +1.46% vs implied
+# -0.91%; board seat 2222.SR 22.28% vs 22.85%), 2026-09-21 157, 2026-09-22
+# 180 (ML 34 / GM 146) under the same tolerance. Root pinned on source:
+# expected_roi_* is derived ONCE (Phase-II honor branch / synthesis / the
+# eq_roi backfill), then the R-6 keep-last-good restore re-plants
+# forecast_price_12m and every price refresh replaces current_price -- nothing
+# re-derives the ROI, so the published triple is a vintage mix.
+# FIX: _fc_tuple_coherence(row) runs immediately BEFORE _apply_investability_gate
+# at all three publish boundaries (_strict_project_row, get_page_rows, the
+# direct Top_10 path) so the gate and every consumer read a coherent triple.
+# Per leg (12m/3m/1m) with cp>0, fp>0 and a stored ROI in the FRACTION domain
+# (|roi| <= 1.5): implied = (fp-cp)/cp; tol = max(0.0005, 2*0.005/cp + 0.0002)
+# (two 2-dp price roundings relative to cp, plus slack).
+#   off     -> function is inert (default; byte-identical rows).
+#   observe -> ONE countable tag per incoherent leg, fctuple_vintage:<h>:observe;
+#              values untouched.
+#   enforce -> expected_roi_<h> = round(implied, 6) + fctuple_vintage:<h>:enforce;
+#              prices are never touched, a percent-domain ROI is never scaled
+#              (units belong to the P-101/P-143 sentries), a missing ROI is left
+#              to the backfill. Idempotent: a second pass finds 0 residual.
+# Tag is substring-safe against the gate's own warnings tests (no cap/
+# forecast/target/roi/drop/reject/provider_target/price_bar_stale/
+# xprovider_price_conflict). Mode in the [GUARDS] boot line (fc_tuple=) and
+# /health engine_gates.fc_tuple_coherent. Enforce is a VALUE change on ~180
+# rows incl. board seats -> observe first, enforce as a separate sitting.
+# Functions added: 3 (_fc_tuple_mode, _fc_tuple_tol, _fc_tuple_coherence).
+# Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# WHY v5.147.0 (F-7 SCORING SETTLE PASS -- pass-dependent scoring; new env
+# TFB_SCORING_SETTLE off|observe|enforce, default off = byte-identical
+# v5.145.0; TFB_SCORING_SETTLE_MAX_PASSES default 4, clamped 2..5):
+# The orchestrator scores a row BEFORE Phase-II enriches it:
+#   _compute_scores_canonical_first(merged)  ->  _apply_phase_dd_enhancements(merged)
+# so pass 1 is scored without intrinsic_value/upside_pct (valuation reads
+# them) and -- when the forecast is synthetic or the analyst target arrives via
+# the R-6 keep-last-good restore inside _phase_ii_quality_forecast -- without
+# ANY forecast at scoring time. core.scoring then labels the row
+# both_present_fallback (0.65*valuation + 0.35*momentum) even though the
+# published row carries a forecast, and the investability gate's -15 "fallback"
+# reliability leg fires on a label that describes pass ORDER, not data.
+# Measured 2026-09-21/22 (sheet, mapping-free): 3,705 -> 3,970 GM rows read
+# both_present_fallback while publishing ROI12; the -15 leg fired on 3,214 rows
+# (rel 54.3 vs 71.5 for the same stock scored warm); of 152 INVESTABLE GM rows
+# only the 48 roi_based ones clear the 70 add-floor; every non-KRP board seat
+# (ADAM, CRC, ITRN, GLNG, TSM) sat at 54.3 -> WATCHLIST -> seat churn, and a
+# real-engine replay showed pass-2 overall moving >=5 pts on 173/300 late-target
+# rows with 104/300 recommendation changes (pass 3 == pass 2), synthetic rows
+# converging by pass 3 (the synthesis reads scores, so it needs one more pass),
+# and a specimen overall 76.78 cold vs 65.71 warm across the 68 gate.
+# FIX (Option A, the operator's choice over a pipeline reorder): one seam right
+# after the pair -- _f7_settle_pass(merged) -- re-runs the SAME pair on a deep
+# copy until the decision fields (overall/opportunity/valuation scores,
+# forecast_confidence, expected_roi_12m (0.01pp), recommendation,
+# opportunity_source, forecast_source) stop moving, capped at MAX_PASSES.
+#   off      -> function returns the row untouched (default; byte-identical).
+#   observe  -> values untouched; ONE countable substring-safe tag on rows whose
+#               pass-2 output would differ:
+#               f7_settle:observe:st<k|x>:p<n>:<code>=<before>><after>...
+#               (st = pass at which it stopped changing, x = still moving at the
+#               cap; codes ov op va fcf r12 rc os fs; source tokens rewritten
+#               bpf/mof/rb/ins/pt/sy so the tag never carries cap/forecast/
+#               target/roi/drop/reject/provider_target/price_bar_stale/
+#               xprovider_price_conflict -- the gate's own substring tests).
+#   enforce  -> the settled row (last pass) replaces the pass-1 row and carries
+#               the same tag; rows already stable after pass 2 are returned
+#               untouched (byte-identical, no tag). Blast radius = tagged rows.
+# Re-run safety proven on source: every tag writer dedupes (_aq_append_warning,
+# _v573_append_warning), _tgt_lkg_capture refuses carry-tagged rows (a restore
+# cannot launder itself), _compute_intrinsic_and_upside is fill-only (no
+# intrinsic<->synthetic-forecast feedback loop), the classifier is idempotent
+# (v5.77.16/17). Fail-open: any exception returns the original row. WHICH
+# horizon is scored is untouched (F-1); the reliability arithmetic is untouched
+# (P-115b) -- the label that feeds it becomes truthful. Enforce changes published
+# scores/recommendations on many rows: observe first, enforce only with the S-1
+# boundary note. Mode disclosed in the [GUARDS] boot line and /health
+# engine_gates.scoring_settle. Functions added: 6 (_f7_settle_mode,
+# _f7_settle_max_passes, _f7_settle_token, _f7_settle_fmt, _f7_settle_diff,
+# _f7_settle_tag) + _f7_settle_pass = 7. Removed: 0. v5.146.0 is a burned
+# number (an uncommitted P-102 build); P-102 re-issues as v5.148.0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# WHY v5.145.0 (P-151 CRYPTO-PAIR SHAPE — asset-class / exchange identity for
+# Yahoo crypto pairs; new env TFB_SYM_CRYPTO_PAIR_CLASS off|observe|enforce,
+# default off = byte-identical v5.144.0):
+# The 2026-09-20 export carries 49 Commodities_FX rows shaped <ROOT>-USD
+# (FLOW-USD, ETC-USD, SHIB-USD, DOT-USD ...) with Asset Class "Equity" and,
+# on FLOW-USD, Exchange "NASDAQ/NYSE" (red-team P2-11, re-executed 49/49).
+# Root: both symbol-shape inferrers treat a dot-less symbol as a US equity
+# (_infer_asset_class_from_symbol -> "Equity", _infer_exchange_from_symbol
+# -> "NASDAQ/NYSE"); the provider's quoteType/instrumentType only overrides
+# them when Yahoo's meta is present on that fetch. _yf_asset_class_ok already
+# excludes "-USD" from the equity contract, so the decision surface never
+# consumed them as equities (0 of 49 in the 09-20 audit strip) — the defect
+# is identity/display and every consumer that keys on Asset Class or venue.
+# FIX: _crypto_pair_shape(symbol) recognises <ROOT>-<QUOTE> with QUOTE in
+# USD/USDT/USDC/EUR/GBP/JPY/BTC/ETH (no exchange suffix, no "=", no "^");
+#   observe — inferrers unchanged; a shaped row whose class is missing or
+#             equity-like gets ONE countable tag crypto_pair_shape:observe
+#             (values untouched);
+#   enforce — the three inferrers answer Crypto / Crypto / <QUOTE> for the
+#             shape, and _crypto_pair_shape_apply repairs a shaped row whose
+#             class is missing or equity-like: asset_class="Crypto",
+#             exchange "NASDAQ/NYSE"/blank -> "Crypto", currency blank ->
+#             <QUOTE>, tagged crypto_pair_shape:enforce; a provider-declared
+#             non-equity class (CRYPTOCURRENCY ...) is never rewritten.
+# Applied at the Commodities_FX / =F / =X identity block (where the 49 live);
+# equities with a share-class dash (BRK-B, AKO-B.US, GRT-UN.TO) do not match
+# the shape by construction. Mode disclosed in /health engine_gates.
+# Functions added: 4 (_crypto_pair_class_mode, _crypto_pair_shape,
+# _crypto_pair_class_like_equity, _crypto_pair_shape_apply). Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# WHY v5.144.0 (P-115b REL-PATH-TAG — reliability decomposition disclosure;
+# new env TFB_REL_PATH_TAG off|observe, default off = byte-identical
+# v5.143.0, values never touched in any mode):
+# The same symbol reads a different forecast_reliability_score on different
+# surfaces of the same morning: 2026-09-20 export, DDI.US 70.4 on My_Portfolio
+# (advisor path, 08:25) vs 63.1 on Global_Markets (sync path, 02:56) with an
+# INVEST vs DO_NOT_INVEST verdict split; YUM 76.5 vs 58.1; CWBC 76.5 vs 59.3.
+# The PF ADD qualification (DDI day 1/2) rides the advisor-path number at the
+# 70 floor, so the path artifact gates real money. The score is a sum of
+# independent legs — base (0.7*fc + 0.3*dq under recalibration, else fc),
+# -60 no price, -40 no forecast, -5/-20 soft cap, -15 provider-target
+# drop/reject, -30 bar stale, -25 cross-provider conflict, -15 opp-source
+# fallback/momentum, -15 forecast-source synthetic/fallback/momentum — then
+# the DISPLAY calibration factor by bucket (v5.91.0, decision-neutral). None
+# of it is disclosed per row, so cross-surface divergence cannot be
+# attributed from the export.
+# FIX: observe mode appends ONE substring-safe tag per row to warnings,
+#   rel_path:b=B|F:fc=..:dq=..:pen=<codes|none>:os=<src>:fs=<src>:raw=..:cf=<factor|none>:fin=..
+# (penalty codes NP NF SC PD BS XC OS FS; source tokens rewritten so the tag
+# can never contain cap/forecast/target/roi/drop/reject/provider_target/
+# price_bar_stale/xprovider_price_conflict — the substrings the gate itself
+# tests on warnings, incl. rows preserved and re-read on the next run).
+# Read-back: the tag on every scored row of the next export; per holding,
+# the two surfaces' tags name the leg that differs (base dq, a penalty, or
+# the bucket factor) — the F-item semantics decision (which legs are path
+# artifacts) follows on that evidence. The mode prints in /health
+# engine_gates.rel_path_tag. Functions added: 4 (_rel_path_tag_mode,
+# _rel_path_src_code, _rel_path_tag, _rel_path_tag_enabled). Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# WHY v5.143.0 (P-146 FUND-SENTRY REPAIR LEG + MODE DISCLOSURE; same env
+# TFB_FUND_UNIT_SENTRY, off/observe byte-identical, enforce-only change):
+# The 2026-09-19 red-team adjudication pinned, against this file at HEAD
+# (sha 8e53a8f8) and the same-day export, that the Render env holds
+# "enforce" (operator paste) while the 09-10 arming record said "observe":
+# every fund_* tag on the export is the suffix-less enforce form, and the
+# tripwire's enforce branch had quarantined profit_margin to None on
+# 3,213 Global_Markets rows (48.6% of the page), 150 Market_Leaders rows
+# and all five US holdings. Implied margins recomputed from the export's
+# own market_cap / pe_ttm / revenue_ttm are PLAUSIBLE (2-100pp) on 3,075
+# of the 3,197 computable quarantined rows -- so the stored margin was
+# the off-scale side, in the 100x fraction class the DDI.US 08:45 golden
+# already documents. Root of the fraction: core/providers/
+# yahoo_fundamentals_provider.py L2179 emits profit_margin through
+# _as_fraction on the PRIMARY provider path, which v5.140.0's two
+# side-channel contracts (yahoo enrichment patch / eodhd fallback patch)
+# never see; the tripwire therefore met a correct-but-fraction value and
+# destroyed it instead of repairing it. The remaining 119 computable rows
+# have |implied| > 100pp -- unit-inconsistent inputs (e.g. IDR market
+# caps against thousands-scale revenue) where the benchmark itself is
+# garbage and a quarantine punishes a possibly-correct value.
+# FIX (enforce branch only; three-way verdict, disclosed by tag):
+#   * |implied| > _FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT (100): fail OPEN --
+#     value untouched, tag fund_coherence_skipped:profit_margin:implied_oob.
+#   * divergence ratio inside [_FUND_SENTRY_REPAIR_RATIO_LO, _HI] =
+#     [90, 110] (the 100x signature; vintage drift is tens of percent,
+#     never ~100x): REPAIR by x100 (stored is the fraction) or /100
+#     (stored is the 100x-inflated percent), accepted only if the repaired
+#     value then coheres (< 8x) -- tag
+#     fund_coherence_repaired:profit_margin:x100|d100.
+#   * anything else >= 8x: quarantine exactly as v5.140.0.
+#   observe keeps the v5.140.0 tag-only behaviour verbatim (byte-identical
+#   output); off is inert.
+# DISCLOSURE: the resolved sentry mode now prints in the [GUARDS] boot line
+# (fund_unit_sentry=off|observe|enforce) and in surface_gate_states() ->
+# health engine_gates["fund_unit_sentry"], so an arming is provable at
+# boot and in every health paste instead of only by tag-suffix forensics.
+# vNEXT (registered, not built here): convert the PRIMARY yahoo margin
+# fractions at canonicalization so the tripwire has nothing to repair.
+# Zero removals; five constants and two tags added; every existing tag
+# string unchanged. Rollback: git revert (env unchanged).
+# -----------------------------------------------------------------------------
+# WHY v5.149.0 (P-164 52W PROVIDER-CEILING SCRUB AT THE ENGINE SEAM; new env
+# TFB_ENGINE_52W_CEILING_SCRUB, DEFAULT ON = the v4.13.0 AS-1 precedent;
+# =0 restores v5.148.0 byte-identically):
+# EVIDENCE (2026-09-23 Global_Markets export): three rows publish
+# week_52_high = 999999.9999 (rendered 1,000,000.00) - 012450.KS (price
+# 1,021,000 KRW, INVESTABLE, 52W Position 100.00%), 009150.KS (1,507,000,
+# position 100.00%) and YPFD.BA (8,530 ARS, position 0.09%) - and the
+# sync's OHLC-PREWRITE flags every one of them as a w52_band anomaly on every
+# leg (observe mode, written anyway). 999999.9999 is the EODHD field
+# ceiling documented by eodhd_provider v4.13.0 AS-1 ("not a price any
+# instrument prints"), which the provider scrubs on its QUOTE patch and
+# merged quote only. Two writers bypass that scrub and land at this
+# engine: (1) _compute_history_patch_from_rows() takes max(highs) over the
+# 252-bar window - capped EOD bars for any KRW instrument that traded above
+# 1,000,000 yield exactly the ceiling; (2) the eodhd fundamentals payload's
+# Technicals.52WeekHigh/52WeekLow (provider L2672) carry the same ceiling
+# and are merged as fundamentals, not as a quote. The phase-BB sanity then
+# derives week_52_position_pct = 100% from the fabricated bound, so the
+# timing/momentum read is wrong on exactly the names where it matters.
+# FIX: _sanitize_corrupt_52w_bounds() - already the single 52W sanitizer,
+# hoisted into scoring's sanitization since v5.114.0 so it runs AFTER every
+# 52W writer and BEFORE any score reads the bound - drops a bound inside
+# [999999.0, 1000000.0) to None with sanitized:week_52_high|low_provider_
+# ceiling, and clears an already-derived week_52_position_pct with
+# sanitized:week_52_position_pct_unbounded (the position sanitizer only
+# writes when BOTH bounds exist; it never clears). Genuine 7-digit values
+# (000660.KS 52W high 2,987,000; an exact 1,000,000.00) are outside the
+# band and untouched. Drop, never fabricate: no repair from day_high or
+# price (the AS-1 rule). Tags are substring-safe for the investability
+# gate. Mode disclosed in the [GUARDS] boot line (w52_ceiling=) and in
+# /health engine_gates.w52_ceiling_scrub. Zero removals; one helper and
+# two constants added. Rollback: git revert, or the env kill-switch.
+# -----------------------------------------------------------------------------
+# WHY v5.150.0 (P-154c EODHD FUNDAMENTALS CACHE-FIRST + NEGATIVE CACHE + PAGE
+# SKIP; new env TFB_EODHD_FUND_CACHE off|observe|enforce, DEFAULT OFF =
+# v5.149.0 byte-identical; explicit words only):
+# EVIDENCE (2026-09-24 export + _Run_Log [EODHD-QUOTA v6.60.0] curve): EODHD
+# reached 400,000/400,000 EXHAUSTED at 00:54 Riyadh for the third time in
+# four days; the 20Z sync ran blind (402 on 5,789 GM + 2,393 MF + 336 CFX
+# rows) and the 02:01 cockpit hard-exited four seats on that epoch. The 04Z
+# run alone cost 83k calls (37.6k -> 120.7k). On the same export the
+# fundamentals fallback fired on 3,774 GM + 2,373 MF + 223 CFX rows in ONE
+# pass: _apply_eodhd_fundamentals_fallback tests only the debt_to_equity /
+# free_cash_flow_ttm gap and then spends a fundamentals request (10 calls)
+# with NO cache and NO memory of an empty answer (611 rows re-fetched every
+# pass for nothing). The fund-LKG (v5.117.0/v5.138.0) already holds the
+# provider-completed 24-field block per symbol for _fund_lkg_ttl_h (120h
+# in production, Redis L2 survives restarts) - but it is consulted only
+# AFTER a fetch, on a DEGRADED block, so every pass and every cold worker
+# pays the provider again. Mutual_Funds and Commodities_FX have never seated
+# a candidate (0 of 1,772 _Selection_Log rows) yet burn ~29k calls per run.
+# FIX (three legs, one gate, all inside the fallback's gap branch so a row
+# with no gap is untouched):
+#   (1) cache-first: a fund-LKG snapshot (memory, then L2) younger than
+#       TFB_EODHD_FUND_CACHE_TTL_H (default 24, floor 1, ceiling = the LKG
+#       TTL) that fills >= 1 still-missing whitelisted field REPLACES the
+#       provider request; the fill goes through the SAME
+#       _filter_patch_to_missing_fields whitelist as the provider patch
+#       (fill-only, values already in engine units because they were
+#       captured after the FUND-SENTRY ran). Tag fund_cache:hit:<age>h:<n>
+#       (+ ":nt" when the row also lacks target_mean_price, i.e. a same-pass
+#       analyst-target fill is forgone; the v5.131.0 target LKG covers it).
+#   (2) negative cache: a request that lands NOTHING (empty payload, AW-1
+#       refusal, or no whitelisted field filled) marks the symbol in memory
+#       + L2 key tfb:fund_neg:v1:<SYM> for TFB_EODHD_FUND_NEG_TTL_H (default
+#       168); while the mark lives the request is skipped (fund_cache:neg:
+#       <age>h). Marks are written ONLY under enforce.
+#   (3) page skip: TFB_EODHD_FUND_FALLBACK_SKIP_PAGES (csv, default empty)
+#       names pages whose rows never spend a request (fund_cache:skip_page).
+# observe => the SAME decisions are computed and disclosed as one countable
+# fund_cache:would_hit / would_neg / would_skip_page tag per row; the
+# provider is still called exactly as v5.149.0 and every value is byte-
+# identical. off => no read, no tag, no write. A row served from the cache
+# is never re-captured by _fund_lkg_capture (tag check, the fundamentals_lkg
+# precedent), so a hit can never refresh its own TTL: the provider is asked
+# again once per cache TTL per symbol. Tags are substring-safe for the
+# investability gate. Mode disclosed in the [GUARDS] boot line (fund_cache=)
+# and in /health engine_gates.eodhd_fund_cache (+ fund_cache_stats
+# counters per worker). Zero removals; twelve helpers, nine constants added.
+# Rollback: git revert, or unset the env (= off).
+# -----------------------------------------------------------------------------
+__version__ = "5.150.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3948,6 +4249,12 @@ _FUND_SENTRY_MARGIN_KEYS: Tuple[str, ...] = (
 _FUND_SENTRY_FRACTION_BOUND: float = 1.5
 _FUND_SENTRY_MARGIN_RATIO_MIN: float = 8.0
 _FUND_SENTRY_IMPLIED_MARGIN_MIN_PCT: float = 2.0
+# v5.143.0 (P-146): repair leg + fail-open bound for the coherence tripwire.
+_FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT: float = 100.0
+_FUND_SENTRY_REPAIR_RATIO_LO: float = 90.0
+_FUND_SENTRY_REPAIR_RATIO_HI: float = 110.0
+_FUND_SENTRY_REPAIRED_TAG = "fund_coherence_repaired"  # substring-safe
+_FUND_SENTRY_SKIPPED_TAG = "fund_coherence_skipped"    # substring-safe
 
 
 def _fund_unit_sentry_mode() -> str:
@@ -4013,7 +4320,11 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
     economic disagreement (vintage drift is tens of percent, not 8x).
     enforce -> profit_margin quarantined to None + tag; observe -> tag only;
     off/incomplete inputs -> None. Never raises. The D/E leg was deliberately
-    cut -- see the WHY block."""
+    cut -- see the WHY block. v5.143.0 (P-146): in enforce the >= 8x branch
+    is a three-way verdict -- |implied| > 100pp fails OPEN (skipped tag),
+    a divergence inside the 100x band [90, 110] is REPAIRED (x100 / d100,
+    accepted only if the result coheres), anything else is quarantined as
+    before; observe output is byte-identical to v5.140.0."""
     if mode == "off" or not isinstance(row, dict):
         return None
     try:
@@ -4033,6 +4344,23 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
         if lo <= 0.0 or (hi / lo) < _FUND_SENTRY_MARGIN_RATIO_MIN:
             return None
         if mode == "enforce":
+            # v5.143.0 (P-146): three-way verdict -- see the WHY block.
+            if abs(implied) > _FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT:
+                return _FUND_SENTRY_SKIPPED_TAG + ":profit_margin:implied_oob"
+            _ratio = hi / lo
+            if (_FUND_SENTRY_REPAIR_RATIO_LO <= _ratio
+                    <= _FUND_SENTRY_REPAIR_RATIO_HI):
+                if abs(pm) < abs(implied):
+                    _repaired, _kind = round(pm * 100.0, 4), "x100"
+                else:
+                    _repaired, _kind = round(pm / 100.0, 4), "d100"
+                _r_hi = max(abs(_repaired), abs(implied))
+                _r_lo = min(abs(_repaired), abs(implied))
+                if _r_lo > 0.0 and (_r_hi / _r_lo) < \
+                        _FUND_SENTRY_MARGIN_RATIO_MIN:
+                    row["profit_margin"] = _repaired
+                    return (_FUND_SENTRY_REPAIRED_TAG + ":profit_margin:"
+                            + _kind)
             row["profit_margin"] = None
             return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin"
         return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin:observe"
@@ -5217,6 +5545,14 @@ def surface_gate_states() -> Dict[str, Any]:
             "engine_fund_lkg_redis": _fund_lkg_redis_enabled(),        # v5.138.0
             "fund_lkg_redis_state": _fund_lkg_redis_state_label(),
             "fund_lkg_redis_stats": _fund_lkg_redis_stats(),
+            "fund_unit_sentry": _fund_unit_sentry_mode(),              # v5.143.0
+            "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
+            "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
+            "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
+            "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
+            "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
+            "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
+            "fund_cache_stats": _fund_cache_stats(),                   # v5.150.0 (P-154c)
         }
     except Exception:
         return {}
@@ -5582,6 +5918,62 @@ def _reliability_recalibration_enabled() -> bool:
     gate refinements: audit the base distribution first, then enable."""
     raw = (os.getenv("TFB_RELIABILITY_RECALIBRATION") or "").strip().lower()
     return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+# -----------------------------------------------------------------------------
+# v5.144.0 [REL-PATH-TAG] (P-115b) — see the WHY block. Pure helpers.
+# -----------------------------------------------------------------------------
+_REL_PATH_SRC_REWRITES = (
+    ("provider_target", "pt"), ("fallback", "fb"), ("momentum", "mo"),
+    ("synthetic", "sy"), ("forecast", "fc"), ("target", "tg"),
+    ("conflict", "cf"), ("reject", "rj"), ("stale", "st"), ("drop", "dp"),
+    ("cap", "cp"), ("roi", "ri"),
+)
+_REL_PATH_FORBIDDEN = ("cap", "forecast", "target", "roi", "drop", "reject",
+                       "provider_target", "price_bar_stale",
+                       "xprovider_price_conflict")
+
+
+def _rel_path_tag_mode() -> str:
+    """TFB_REL_PATH_TAG: off (default) | observe. Read at call time."""
+    raw = (os.getenv("TFB_REL_PATH_TAG") or "").strip().lower()
+    return "observe" if raw in {"observe", "1", "true", "on", "yes"} else "off"
+
+
+def _rel_path_tag_enabled() -> bool:
+    return _rel_path_tag_mode() == "observe"
+
+
+def _rel_path_src_code(value: Any) -> str:
+    """Rewrite a source token so it stays readable but can never re-trigger
+    the gate's own substring tests on warnings (longest rewrites first)."""
+    s = _safe_str(value).strip().lower()
+    if not s:
+        return "na"
+    for old, new in _REL_PATH_SRC_REWRITES:
+        s = s.replace(old, new)
+    s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+    return s[:24] or "na"
+
+
+def _rel_path_tag(base_blend: bool, fc_pts: float, dq: float, pens, raw_rel: float,
+                  cal_factor: Optional[float], final_rel: float, opp_src: Any,
+                  fc_src: Any) -> str:
+    """ONE substring-safe tag; defensive on every input; never raises."""
+    try:
+        codes = ",".join(str(p) for p in (pens or [])) or "none"
+        cf = ("%.3f" % float(cal_factor)) if cal_factor is not None else "none"
+        tag = ("rel_path:b=%s:fc=%.1f:dq=%.1f:pen=%s:os=%s:fs=%s:raw=%.1f:cf=%s:fin=%.1f"
+               % ("B" if base_blend else "F", float(fc_pts), float(dq), codes,
+                  _rel_path_src_code(opp_src), _rel_path_src_code(fc_src),
+                  float(raw_rel), cf, float(final_rel)))
+        low = tag.lower()
+        for bad in _REL_PATH_FORBIDDEN:
+            if bad in low:
+                return "rel_path:unsafe_token_suppressed"
+        return tag
+    except Exception:
+        return "rel_path:tag_error"
 
 
 # =============================================================================
@@ -6360,6 +6752,72 @@ def _dq_coherence_cap(row, dq, warns):
         return dq, None
 
 
+# =============================================================================
+# v5.148.0 (P-102) -- FC-TUPLE COHERENCE (see WHY v5.148.0)
+# =============================================================================
+_FCT_ENV: str = "TFB_FC_TUPLE_COHERENT"
+_FCT_TAG: str = "fctuple_vintage"
+_FCT_LEGS: Tuple[Tuple[str, str, str], ...] = (
+    ("12m", "forecast_price_12m", "expected_roi_12m"),
+    ("3m", "forecast_price_3m", "expected_roi_3m"),
+    ("1m", "forecast_price_1m", "expected_roi_1m"),
+)
+_FCT_FRACTION_DOMAIN_MAX: float = 1.5   # |roi| above this is percent points: never scaled here
+
+
+def _fc_tuple_mode() -> str:
+    """TFB_FC_TUPLE_COHERENT: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_FCT_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _fc_tuple_tol(cp: float) -> float:
+    """Tolerance for |implied - stored|: two 2-dp price roundings relative to
+    the current price plus 0.02pp slack, floored at 0.05pp."""
+    try:
+        return max(0.0005, 2.0 * 0.005 / float(cp) + 0.0002)
+    except Exception:
+        return 0.0005
+
+
+def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
+    """v5.148.0 (P-102): make expected_roi_<h> agree with the row's own
+    (forecast_price_<h>, current_price) pair at the publish boundary. Returns
+    the number of legs tagged (observe) or repaired (enforce). Never raises;
+    off -> 0 and the row is untouched."""
+    mode = _fc_tuple_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    n = 0
+    try:
+        cp = _as_float(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return 0
+        tol = _fc_tuple_tol(cp)
+        for h, fp_key, roi_key in _FCT_LEGS:
+            fp = _as_float(row.get(fp_key))
+            if fp is None or fp <= 0:
+                continue
+            stored = _as_float(row.get(roi_key))
+            if stored is None:
+                continue  # left to the backfill
+            if abs(stored) > _FCT_FRACTION_DOMAIN_MAX:
+                continue  # percent domain: units are the sentries' job, never scaled here
+            implied = (fp - cp) / cp
+            if abs(implied - stored) <= tol:
+                continue
+            if mode == "enforce":
+                row[roi_key] = round(implied, 6)
+                _v573_append_warning(row, "%s:%s:enforce" % (_FCT_TAG, h))
+            else:
+                _v573_append_warning(row, "%s:%s:observe" % (_FCT_TAG, h))
+            n += 1
+    except Exception:
+        return n
+    return n
+
+
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """v5.78.0: compute the decision-readiness layer (8 canonical columns).
 
@@ -6508,33 +6966,43 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     else:
         fc_pts = 50.0
     rel = (0.7 * fc_pts + 0.3 * dq) if _recal else fc_pts
+    _rp = []  # v5.144.0 [REL-PATH-TAG]: applied-penalty codes (disclosure only)
     if not has_price:
         rel -= 60.0
+        _rp.append("NP")
     if not has_forecast:
         rel -= 40.0
+        _rp.append("NF")
     _soft_cap_penalty = 5.0 if _recal else 20.0
     if "cap" in warns and ("forecast" in warns or "target" in warns or "roi" in warns):
         rel -= _soft_cap_penalty
+        _rp.append("SC%g" % _soft_cap_penalty)
     if "provider_target" in warns and ("drop" in warns or "reject" in warns):
         rel -= 15.0
+        _rp.append("PD")
     # v5.104.0 (Fix AR): a "live" price whose own bar is older than the
     # exchange's last completed session (beyond tolerance) is NOT verified
     # provenance - penalize reliability harder than a soft-capped target.
     # Gated: flag OFF -> no penalty (v5.103.0 byte-identical).
     if _bar_age_gate_enabled() and "price_bar_stale" in warns:
         rel -= 30.0
+        _rp.append("BS")
     # v5.108.0 (Fix AR-5): two live providers materially disagreeing on the
     # same symbol's price is weaker provenance than one stale bar - one of
     # them is wrong and the engine does not yet know which.
     if _xprovider_verify_enabled() and "xprovider_price_conflict" in warns:
         rel -= 25.0
+        _rp.append("XC")
     opp_src = _safe_str(row.get("opportunity_source")).lower()
     fc_src = _safe_str(row.get("forecast_source")).lower()
     if "momentum" in opp_src or "fallback" in opp_src:
         rel -= 15.0
+        _rp.append("OS")
     if "synthetic" in fc_src or "fallback" in fc_src or "momentum" in fc_src:
         rel -= 15.0
+        _rp.append("FS")
     rel = round(max(0.0, min(100.0, rel)), 1)
+    _rp_raw, _rp_cal = rel, None  # v5.144.0: raw score before display calibration
 
     # -- provider vs engine conflict (a FLAG, not a block) --------------------
     # v5.79.1: compare canonical DIRECTION. provider_rating is stored as TEXT in
@@ -6776,8 +7244,14 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         _rel_cal, _cal_factor = _apply_reliability_calibration(rel, status)
         if _cal_factor is not None:
             rel = _rel_cal
+            _rp_cal = _cal_factor  # v5.144.0
             _v573_append_warning(row, _CALIBRATION_TAG)
 
+    # v5.144.0 [REL-PATH-TAG] (P-115b): observe-only disclosure of how this
+    # row's reliability was composed; off => nothing appended (byte-identical).
+    if _rel_path_tag_enabled():
+        _v573_append_warning(row, _rel_path_tag(
+            _recal, fc_pts, dq, _rp, _rp_raw, _rp_cal, rel, opp_src, fc_src))
     row["data_quality_score"] = dq
     row["forecast_reliability_score"] = rel
     row["provider_engine_conflict"] = conflict
@@ -8033,6 +8507,172 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# v5.147.0 (F-7) -- SCORING SETTLE PASS (see WHY v5.147.0)
+# =============================================================================
+_F7_SETTLE_ENV: str = "TFB_SCORING_SETTLE"
+_F7_SETTLE_MAX_ENV: str = "TFB_SCORING_SETTLE_MAX_PASSES"
+_F7_SETTLE_MAX_DEFAULT: int = 4
+_F7_SETTLE_MAX_CAP: int = 5
+_F7_SETTLE_TAG: str = "f7_settle"
+# (row key, tag code, kind, tolerance) -- the decision fields compared between
+# consecutive passes. Codes are chosen so the finished tag can never contain a
+# substring the investability gate tests on warnings (_REL_PATH_FORBIDDEN).
+_F7_SETTLE_FIELDS: Tuple[Tuple[str, str, str, float], ...] = (
+    ("overall_score", "ov", "num", 0.05),
+    ("opportunity_score", "op", "num", 0.05),
+    ("valuation_score", "va", "num", 0.05),
+    ("forecast_confidence", "fcf", "num", 0.001),
+    ("expected_roi_12m", "r12", "num", 0.0001),
+    ("recommendation", "rc", "str", 0.0),
+    ("opportunity_source", "os", "str", 0.0),
+    ("forecast_source", "fs", "str", 0.0),
+)
+_F7_SETTLE_SRC_REWRITES: Tuple[Tuple[str, str], ...] = (
+    ("both_present_fallback", "bpf"), ("momentum_only_fallback", "mof"),
+    ("roi_based", "rb"), ("insufficient", "ins"),
+    ("provider_target", "pt"), ("phase_ii_synthetic", "sy"),
+)
+
+
+def _f7_settle_mode() -> str:
+    """TFB_SCORING_SETTLE: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off, so an accidental boolean can never arm
+    a value-changing mode. Read at call time (no restart needed)."""
+    raw = (os.getenv(_F7_SETTLE_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _f7_settle_max_passes() -> int:
+    """TFB_SCORING_SETTLE_MAX_PASSES: total passes incl. the orchestrator's
+    pass 1; default 4, clamped to [2, 5] so a config typo can never loop."""
+    n = _get_env_int(_F7_SETTLE_MAX_ENV, _F7_SETTLE_MAX_DEFAULT)
+    try:
+        n = int(n)
+    except Exception:
+        n = _F7_SETTLE_MAX_DEFAULT
+    return max(2, min(_F7_SETTLE_MAX_CAP, n))
+
+
+def _f7_settle_token(value: Any) -> str:
+    """Rewrite a source/label token so it stays readable but can never carry
+    one of the gate's forbidden substrings (longest rewrites first, then the
+    rel_path table as defense in depth)."""
+    s = _safe_str(value).strip().lower()
+    if not s:
+        return "na"
+    for old, new in _F7_SETTLE_SRC_REWRITES:
+        s = s.replace(old, new)
+    for old, new in _REL_PATH_SRC_REWRITES:
+        s = s.replace(old, new)
+    s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+    return s[:16] or "na"
+
+
+def _f7_settle_fmt(kind: str, value: Any) -> str:
+    """Compact disclosure of a compared value (scores 2dp, fractions 4dp)."""
+    if kind == "num":
+        f = _as_float(value)
+        if f is None:
+            return "na"
+        s = ("%.4f" % f) if abs(f) < 1.0 else ("%.2f" % f)
+        s = s.rstrip("0").rstrip(".") if "." in s else s
+        return s or "0"
+    return _f7_settle_token(value)
+
+
+def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any]) -> List[Tuple[str, str, str]]:
+    """Decision fields whose value differs between two passes, as
+    (code, before, after) tokens. Missing-on-both is equal; never raises."""
+    out: List[Tuple[str, str, str]] = []
+    try:
+        for key, code, kind, tol in _F7_SETTLE_FIELDS:
+            a = prev.get(key)
+            b = cand.get(key)
+            if kind == "num":
+                fa = _as_float(a)
+                fb = _as_float(b)
+                if fa is None and fb is None:
+                    continue
+                if fa is None or fb is None or abs(fa - fb) > tol:
+                    out.append((code, _f7_settle_fmt(kind, a), _f7_settle_fmt(kind, b)))
+            else:
+                sa = _safe_str(a).strip().upper()
+                sb = _safe_str(b).strip().upper()
+                if sa != sb:
+                    out.append((code, _f7_settle_token(a), _f7_settle_token(b)))
+    except Exception:
+        pass
+    return out
+
+
+def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
+                   first_diff: List[Tuple[str, str, str]]) -> str:
+    """ONE substring-safe tag: f7_settle:<mode>:st<k|x>:p<n>:code=before>after
+    (at most 6 field disclosures; st = pass at which the row stopped changing,
+    x = still moving at the cap; p = re-passes executed). If a disclosure ever
+    contained a forbidden substring the tag degrades to a count-only form."""
+    parts = [_F7_SETTLE_TAG, mode, "st%s" % (settled_at if settled_at else "x"), "p%d" % int(passes_run)]
+    for code, a, b in list(first_diff)[:6]:
+        parts.append("%s=%s>%s" % (code, a, b))
+    tag = ":".join(parts)
+    low = tag.lower()
+    if any(f in low for f in _REL_PATH_FORBIDDEN):
+        tag = ":".join(parts[:4]) + ":chg%d" % len(first_diff)
+    return tag
+
+
+def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
+    """v5.147.0 (F-7): re-run the scoring + enhancement pair on a deep copy of
+    the pass-1 row until the decision fields stop moving (cap
+    TFB_SCORING_SETTLE_MAX_PASSES). off -> row untouched. observe -> values
+    untouched, ONE countable tag on rows whose pass-2 output would differ.
+    enforce -> the settled row (last pass) replaces the pass-1 row and carries
+    the tag; rows already stable after pass 2 are returned untouched.
+    Fail-open: any exception returns the original row unchanged."""
+    mode = _f7_settle_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return row
+    try:
+        import copy as _copy
+        max_passes = _f7_settle_max_passes()
+        prev: Dict[str, Any] = row
+        last: Dict[str, Any] = row
+        first_diff: Optional[List[Tuple[str, str, str]]] = None
+        settled_at: Optional[int] = None
+        passes_run = 0
+        for k in range(2, max_passes + 1):
+            cand = _copy.deepcopy(prev)
+            _compute_scores_canonical_first(cand)
+            _apply_phase_dd_enhancements(cand)
+            passes_run += 1
+            diff = _f7_settle_diff(prev, cand)
+            if first_diff is None:
+                first_diff = diff
+            if not diff:
+                settled_at = k
+                if k > 2:
+                    last = cand
+                break
+            last = cand
+            prev = cand
+        if not first_diff:
+            return row
+        tag = _f7_settle_tag(mode, settled_at, passes_run, first_diff)
+        if mode == "observe":
+            _v573_append_warning(row, tag)
+            return row
+        _v573_append_warning(last, tag)
+        return last
+    except Exception as _sx:  # pragma: no cover - defensive
+        logger.debug(
+            "[engine_v2 v%s F-7] settle pass failed open for %s (page=%s): %s: %s",
+            __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+            _sx.__class__.__name__, _sx,
+        )
+        return row
+
+
+# =============================================================================
 # v5.65.0 PHASE-II — Quality forecast generator
 # =============================================================================
 
@@ -8252,14 +8892,17 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
             if row.get("expected_roi_12m") is None:
                 row["expected_roi_12m"] = round(return_12m, 6)
+                _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t12")
             if row.get("expected_roi_3m") is None:
                 fp3 = _as_float(row.get("forecast_price_3m"))
                 if fp3 is not None:
                     row["expected_roi_3m"] = round((fp3 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t12")
             if row.get("expected_roi_1m") is None:
                 fp1 = _as_float(row.get("forecast_price_1m"))
                 if fp1 is not None:
                     row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "t12")
         return
 
     # -------------------------------------------------------------------------
@@ -8300,14 +8943,17 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 row["forecast_price_12m"] = round(cp * (1.0 + derived_12m_return), 4)
             if row.get("expected_roi_3m") is None:
                 row["expected_roi_3m"] = round(return_3m, 6)
+                _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t3")
             if row.get("expected_roi_1m") is None:
                 fp1 = _as_float(row.get("forecast_price_1m"))
                 if fp1 is not None:
                     row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "t3")
             if row.get("expected_roi_12m") is None:
                 fp12 = _as_float(row.get("forecast_price_12m"))
                 if fp12 is not None:
                     row["expected_roi_12m"] = round((fp12 - cp) / cp, 6)
+                    _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t3")
         return
 
     intrinsic = _as_float(row.get("intrinsic_value"))
@@ -8413,8 +9059,11 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     row["forecast_price_3m"] = round(forecast_3m, 4)
     row["forecast_price_12m"] = round(forecast_12m, 4)
     row["expected_roi_1m"] = round(expected_1m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "synth")
     row["expected_roi_3m"] = round(expected_3m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "synth")
     row["expected_roi_12m"] = round(expected_12m_return, 6)
+    _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "synth")
     row["forecast_source"] = "phase_ii_synthetic"
 
     conf = 0.50
@@ -9674,6 +10323,29 @@ def _v573_append_warning(row: Dict[str, Any], tag: str) -> None:
     row["warnings"] = "; ".join(parts)
 
 
+def _eq_roi_backfill_sentry_tag(row: Dict[str, Any], field: str, source: str) -> None:
+    """P-143 (v5.142.0): write-site attribution for engine-backfilled
+    expected_roi_* cells. Same gate env as core.enriched_quote's step-8c
+    sentry per the 2026-09-15 decision (the already-armed Render var
+    activates when this lands); read at CALL TIME, no boot line (the
+    FUND-SENTRY precedent). unset/off/other -> no-op, v5.141.0-identical.
+    observe -> one countable tag per field actually written:
+    eq_roi_backfill:<field>:<source>:observe. enforce -> deliberately
+    tag-only at this boundary (observe tags + one enforce_deferred marker
+    per row); see the WHY v5.142.0 block for the fraction-plus-number-
+    format contract proof that rules out a x100 rewrite here. Values are
+    never modified in any mode."""
+    try:
+        mode = str(os.getenv("TFB_EQ_ROI_UNIT_SENTRY", "") or "").strip().lower()
+    except Exception:
+        return
+    if mode not in ("observe", "enforce"):
+        return
+    _v573_append_warning(row, "eq_roi_backfill:%s:%s:observe" % (field, source))
+    if mode == "enforce":
+        _v573_append_warning(row, "eq_roi_backfill:enforce_deferred")
+
+
 # =============================================================================
 # v5.114.0 - SANITIZATION: SIGN-AWARE BANDS + THE NET ACTUALLY IN THE WATER
 # =============================================================================
@@ -9841,12 +10513,57 @@ def _sanitize_extreme_outliers(row: Dict[str, Any]) -> int:
     return nulled
 
 
+# v5.149.0 (P-164): the EODHD field ceiling, mirrored from eodhd_provider
+# v4.13.0 AS-1 (_EODHD_SENTINEL_LOW/HIGH) - any float in [999999.0,
+# 1000000.0), live form 999999.9999. Kept as engine-local constants so this
+# seam never imports provider internals.
+_W52_CEILING_LOW = 999999.0
+_W52_CEILING_HIGH = 1000000.0
+_W52_CEILING_ENV = "TFB_ENGINE_52W_CEILING_SCRUB"
+
+
+def _w52_ceiling_scrub_mode() -> str:
+    """v5.149.0 (P-164): "on" (default) | "off". TFB_ENGINE_52W_CEILING_SCRUB
+    =0/false/off/no restores v5.148.0 byte-identically. Read at call time so
+    the kill-switch needs no restart. Never raises."""
+    try:
+        raw = (os.getenv(_W52_CEILING_ENV) or "1").strip().lower()
+        return "off" if raw in ("0", "false", "off", "no") else "on"
+    except Exception:
+        return "on"
+
+
+def _w52_is_ceiling(v: Optional[float]) -> bool:
+    return v is not None and _W52_CEILING_LOW <= v < _W52_CEILING_HIGH
+
+
 def _sanitize_corrupt_52w_bounds(row: Dict[str, Any]) -> int:
     if not isinstance(row, dict):
         return 0
     nulled = 0
     hi = _as_float(row.get("week_52_high"))
     lo = _as_float(row.get("week_52_low"))
+    # v5.149.0 (P-164): provider field-ceiling scrub FIRST - a 999999.9999
+    # bound is a fabrication, not a range; drop it (never repair it) and
+    # clear the position already derived from it by the phase-BB pass.
+    if _w52_ceiling_scrub_mode() == "on":
+        _ceiling_hit = False
+        if _w52_is_ceiling(hi):
+            row["week_52_high"] = None
+            _v573_append_warning(row, "sanitized:week_52_high_provider_ceiling")
+            nulled += 1
+            hi = None
+            _ceiling_hit = True
+        if _w52_is_ceiling(lo):
+            row["week_52_low"] = None
+            _v573_append_warning(row, "sanitized:week_52_low_provider_ceiling")
+            nulled += 1
+            lo = None
+            _ceiling_hit = True
+        if _ceiling_hit and row.get("week_52_position_pct") not in (None, ""):
+            row["week_52_position_pct"] = None
+            _v573_append_warning(row, "sanitized:week_52_position_pct_unbounded")
+            nulled += 1
     if hi is not None and hi <= 0:
         row["week_52_high"] = None
         _v573_append_warning(row, "sanitized:week_52_high_nonpositive")
@@ -10922,6 +11639,10 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
             return False
         if _fund_lkg_row_tainted(row):
             return False
+        # v5.150.0 (P-154c): a row served from the cache must never re-seed
+        # the store, or a hit would refresh its own TTL forever.
+        if _fund_cache_row_is_hit(row):
+            return False
         if _fund_lkg_present_count(row) < _fund_lkg_min_fields():
             return False
         if all(_is_missing_or_unknown_field(row.get(k)) for k in _FUND_LKG_ANCHOR_FIELDS):
@@ -11179,6 +11900,257 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
     except Exception:
         _fund_lkg_redis_note_error()
         return None
+
+
+# =============================================================================
+# v5.150.0 (P-154c) - EODHD FUNDAMENTALS CACHE-FIRST / NEGATIVE CACHE / PAGE SKIP
+# =============================================================================
+# See the WHY v5.150.0 header block. The cache IS the fund-LKG snapshot
+# (memory first, Redis L2 on a miss, same client/breaker/key as v5.138.0);
+# this section adds the read-before-fetch decision, a negative cache for
+# empty answers and a page skip list. Every helper is pure/fail-open: any
+# exception yields "miss" and the provider path runs exactly as before.
+_FUND_CACHE_ENV: str = "TFB_EODHD_FUND_CACHE"                    # off|observe|enforce
+_FUND_CACHE_TTL_ENV: str = "TFB_EODHD_FUND_CACHE_TTL_H"          # default 24h
+_FUND_NEG_TTL_ENV: str = "TFB_EODHD_FUND_NEG_TTL_H"              # default 168h
+_FUND_FB_SKIP_PAGES_ENV: str = "TFB_EODHD_FUND_FALLBACK_SKIP_PAGES"  # csv of page names
+_FUND_CACHE_TAG: str = "fund_cache"                              # substring-safe namespace
+_FUND_NEG_REDIS_KEY_PREFIX: str = "tfb:fund_neg:v1:"
+_FUND_CACHE_SHORT_CIRCUIT_KINDS: Tuple[str, ...] = ("hit", "neg", "skip_page")
+_FUND_NEG_STORE: Dict[str, float] = {}      # per-worker mirror: SYM -> ts of the last empty answer
+_FUND_CACHE_STATS: Dict[str, int] = {
+    "hit": 0, "would_hit": 0, "neg": 0, "would_neg": 0,
+    "skip_page": 0, "would_skip_page": 0, "miss": 0, "neg_writes": 0,
+}
+
+
+def _fund_cache_mode() -> str:
+    """TFB_EODHD_FUND_CACHE: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_FUND_CACHE_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _fund_cache_ttl_h() -> float:
+    """Cache window in hours: default 24, floor 1, ceiling = the fund-LKG TTL
+    (an entry older than the LKG TTL is popped by the restore path anyway)."""
+    try:
+        v = float((os.getenv(_FUND_CACHE_TTL_ENV) or "24").strip())
+    except Exception:
+        v = 24.0
+    if v < 1.0:
+        v = 1.0
+    try:
+        lkg = float(_fund_lkg_ttl_h())
+        if v > lkg:
+            v = lkg
+    except Exception:
+        pass
+    return v
+
+
+def _fund_neg_ttl_h() -> float:
+    """Negative-cache window in hours: default 168 (7 days), floor 1."""
+    try:
+        v = float((os.getenv(_FUND_NEG_TTL_ENV) or "168").strip())
+    except Exception:
+        v = 168.0
+    return v if v >= 1.0 else 1.0
+
+
+def _fund_fb_skip_pages() -> Set[str]:
+    """Upper-cased page names whose rows never spend a fundamentals request
+    (enforce) / would not (observe). Empty by default."""
+    raw = (os.getenv(_FUND_FB_SKIP_PAGES_ENV) or "").strip()
+    if not raw:
+        return set()
+    return {p.strip().upper() for p in raw.split(",") if p.strip()}
+
+
+def _fund_cache_bump(key: str) -> None:
+    try:
+        _FUND_CACHE_STATS[key] = int(_FUND_CACHE_STATS.get(key) or 0) + 1
+    except Exception:
+        pass
+
+
+def _fund_cache_stats() -> Dict[str, int]:
+    try:
+        return {k: int(v or 0) for k, v in _FUND_CACHE_STATS.items()}
+    except Exception:
+        return {}
+
+
+def _fund_cache_row_is_hit(row: Mapping[str, Any]) -> bool:
+    """True when the row carries an ENFORCE cache-hit tag (fund_cache:hit:).
+    observe tags (fund_cache:would_hit:) do not match: those rows were still
+    served by the provider and may seed the store as before."""
+    try:
+        raw = row.get("warnings") if isinstance(row, Mapping) else None
+        if isinstance(raw, str):
+            return (_FUND_CACHE_TAG + ":hit:") in raw
+        if isinstance(raw, (list, tuple, set)):
+            return any((_FUND_CACHE_TAG + ":hit:") in _safe_str(p) for p in raw)
+        return False
+    except Exception:
+        return False
+
+
+def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
+    """(fields, age_s) of the fund-LKG snapshot for SYM when younger than the
+    cache TTL: memory first, then the L2 layer (populating memory like the
+    v5.138.0 restore path). None on miss / expired / any failure."""
+    try:
+        if not _fund_lkg_enabled():
+            return None
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return None
+        entry = _FUND_LKG_STORE.get(s)
+        if not entry:
+            entry = _fund_lkg_redis_get(s)
+            if entry:
+                _FUND_LKG_STORE[s] = entry
+        if not entry:
+            return None
+        age_s = time.time() - float(entry.get("ts") or 0.0)
+        if age_s < 0:
+            age_s = 0.0
+        if age_s > _fund_cache_ttl_h() * 3600.0:
+            return None
+        fields = entry.get("fields")
+        if not isinstance(fields, dict) or not fields:
+            return None
+        return fields, age_s
+    except Exception:
+        return None
+
+
+def _fund_neg_lookup(sym: str) -> Optional[float]:
+    """Age in seconds of a live negative mark for SYM (memory, then L2), or
+    None. Expired marks are dropped from memory. Never raises."""
+    try:
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return None
+        ts = _FUND_NEG_STORE.get(s)
+        if ts is None:
+            client = _fund_lkg_redis_client()
+            if client is not None:
+                raw = client.get(_FUND_NEG_REDIS_KEY_PREFIX + s)
+                _fund_lkg_redis_note_ok()
+                if raw:
+                    ts = _as_float(raw)
+                    if ts is not None and ts > 0:
+                        _FUND_NEG_STORE[s] = float(ts)
+        if ts is None:
+            return None
+        age_s = time.time() - float(ts)
+        if age_s < 0:
+            age_s = 0.0
+        if age_s > _fund_neg_ttl_h() * 3600.0:
+            _FUND_NEG_STORE.pop(s, None)
+            return None
+        return age_s
+    except Exception:
+        try:
+            _fund_lkg_redis_note_error()
+        except Exception:
+            pass
+        return None
+
+
+def _fund_neg_mark(sym: str) -> bool:
+    """Record an empty provider answer for SYM in memory + L2 (SETEX, ttl =
+    the negative TTL). Prunes memory oldest-first past the LKG size cap.
+    Never raises; True when the memory mark was written."""
+    try:
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return False
+        now = time.time()
+        _FUND_NEG_STORE[s] = now
+        cap = _fund_lkg_max_symbols()
+        if len(_FUND_NEG_STORE) > cap:
+            ttl_s = _fund_neg_ttl_h() * 3600.0
+            for k in [k for k, t in _FUND_NEG_STORE.items() if (now - float(t or 0.0)) > ttl_s]:
+                _FUND_NEG_STORE.pop(k, None)
+            if len(_FUND_NEG_STORE) > cap:
+                for k, _t in sorted(_FUND_NEG_STORE.items(), key=lambda kv: float(kv[1] or 0.0))[: len(_FUND_NEG_STORE) - cap]:
+                    _FUND_NEG_STORE.pop(k, None)
+        try:
+            client = _fund_lkg_redis_client()
+            if client is not None:
+                client.setex(_FUND_NEG_REDIS_KEY_PREFIX + s,
+                             int(max(1.0, _fund_neg_ttl_h() * 3600.0)),
+                             "%.3f" % now)
+                _fund_lkg_redis_note_ok()
+                _FUND_LKG_REDIS_STATE["writes"] = int(_FUND_LKG_REDIS_STATE.get("writes") or 0) + 1
+        except Exception:
+            _fund_lkg_redis_note_error()
+        return True
+    except Exception:
+        return False
+
+
+def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
+                       mode: str) -> Tuple[str, str, Dict[str, Any]]:
+    """The read-before-fetch decision for a row whose D/E-or-FCF gap is real.
+    Returns (kind, tag, fill): kind in hit|neg|skip_page|miss under enforce
+    and would_hit|would_neg|would_skip_page|miss under observe; tag is the
+    countable warnings tag ("" on miss); fill is the fill-only patch (only
+    under enforce on a hit). Never raises -> ("miss", "", {})."""
+    try:
+        if mode not in ("observe", "enforce"):
+            return "miss", "", {}
+        pfx = "" if mode == "enforce" else "would_"
+        s = _safe_str(symbol).strip().upper()
+        pg = _safe_str(page).strip().upper()
+        if pg and pg in _fund_fb_skip_pages():
+            kind = pfx + "skip_page"
+            _fund_cache_bump(kind)
+            return kind, "%s:%s" % (_FUND_CACHE_TAG, kind), {}
+        neg_age = _fund_neg_lookup(s)
+        if neg_age is not None:
+            kind = pfx + "neg"
+            _fund_cache_bump(kind)
+            return kind, "%s:%s:%dh" % (_FUND_CACHE_TAG, kind, int(neg_age // 3600)), {}
+        found = _fund_cache_lookup(s)
+        if found:
+            fields, age_s = found
+            filtered, _filled = _filter_patch_to_missing_fields(
+                dict(row) if not isinstance(row, dict) else row, fields, _YAHOO_FUNDAMENTAL_FIELDS,
+            )
+            if filtered:
+                kind = pfx + "hit"
+                _fund_cache_bump(kind)
+                tag = "%s:%s:%dh:%d" % (_FUND_CACHE_TAG, kind, int(age_s // 3600), len(filtered))
+                if _is_missing_or_unknown_field(row.get("target_mean_price")):
+                    tag += ":nt"
+                return kind, tag, (filtered if mode == "enforce" else {})
+        _fund_cache_bump("miss")
+        return "miss", "", {}
+    except Exception:
+        return "miss", "", {}
+
+
+def _fund_cache_note_empty(row: Dict[str, Any], symbol: str, mode: str, reason: str) -> None:
+    """A provider request that landed nothing: under enforce write the
+    negative mark (memory + L2) and tag fund_cache:neg_mark:<reason>; under
+    observe only count + tag fund_cache:would_neg:<reason>. off => no-op."""
+    try:
+        if mode not in ("observe", "enforce") or not isinstance(row, dict):
+            return
+        r = (reason or "empty").strip().lower() or "empty"
+        if mode == "enforce":
+            _fund_neg_mark(symbol)
+            _fund_cache_bump("neg_writes")
+            _v573_append_warning(row, "%s:neg_mark:%s" % (_FUND_CACHE_TAG, r))
+        else:
+            _fund_cache_bump("would_neg")
+            _v573_append_warning(row, "%s:would_neg:%s" % (_FUND_CACHE_TAG, r))
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -12566,10 +13538,74 @@ def _lookup_alias_value(src: Mapping[str, Any], flat: Mapping[str, Any], alias: 
     return None
 
 
+# -----------------------------------------------------------------------------
+# v5.145.0 [CRYPTO-PAIR SHAPE] (P-151) — see the WHY block. Pure helpers.
+# -----------------------------------------------------------------------------
+_CRYPTO_PAIR_RE = re.compile(r"^([A-Z0-9]{2,12})-(USD|USDT|USDC|EUR|GBP|JPY|BTC|ETH)$")
+_CRYPTO_PAIR_TAG_OBSERVE = "crypto_pair_shape:observe"
+_CRYPTO_PAIR_TAG_ENFORCE = "crypto_pair_shape:enforce"
+
+
+def _crypto_pair_class_mode() -> str:
+    """TFB_SYM_CRYPTO_PAIR_CLASS: off (default) | observe | enforce."""
+    raw = (os.getenv("TFB_SYM_CRYPTO_PAIR_CLASS") or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _crypto_pair_shape(symbol: Any) -> str:
+    """The quote currency when the symbol has the Yahoo crypto-pair shape
+    (<ROOT>-<QUOTE>, no exchange suffix), else "". Pure; never raises."""
+    try:
+        s = _safe_str(symbol).strip().upper()
+        if not s or "." in s or "=" in s or s.startswith("^"):
+            return ""
+        m = _CRYPTO_PAIR_RE.match(s)
+        return m.group(2) if m else ""
+    except Exception:
+        return ""
+
+
+def _crypto_pair_class_like_equity(value: Any) -> bool:
+    """True when the class is missing/unknown or reads as an equity (the two
+    states the shape may repair); a declared CRYPTO / FX / FUTURE stays."""
+    cls = _safe_str(value).strip()
+    if _is_missing_or_unknown_field(cls):
+        return True
+    return cls.lower().startswith("equit")
+
+
+def _crypto_pair_shape_apply(out: Dict[str, Any], sym: Any) -> str:
+    """observe: tag only; enforce: repair class/exchange/currency for a
+    shaped row whose class is missing or equity-like. Returns the mode that
+    acted ("" when nothing applied). Never raises."""
+    try:
+        mode = _crypto_pair_class_mode()
+        if mode == "off" or not isinstance(out, dict):
+            return ""
+        quote = _crypto_pair_shape(sym)
+        if not quote or not _crypto_pair_class_like_equity(out.get("asset_class")):
+            return ""
+        if mode == "observe":
+            _v573_append_warning(out, _CRYPTO_PAIR_TAG_OBSERVE)
+            return "observe"
+        out["asset_class"] = "Crypto"
+        exch = _safe_str(out.get("exchange")).strip()
+        if not exch or exch.upper() in ("NASDAQ/NYSE", "NYSE/NASDAQ"):
+            out["exchange"] = "Crypto"
+        if not _safe_str(out.get("currency")).strip():
+            out["currency"] = quote
+        _v573_append_warning(out, _CRYPTO_PAIR_TAG_ENFORCE)
+        return "enforce"
+    except Exception:
+        return ""
+
+
 def _infer_asset_class_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    if _crypto_pair_class_mode() == "enforce" and _crypto_pair_shape(s):
+        return "Crypto"  # v5.145.0
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Equity"
     if s.endswith("=X"):
@@ -12585,6 +13621,8 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    if _crypto_pair_class_mode() == "enforce" and _crypto_pair_shape(s):
+        return "Crypto"  # v5.145.0
     locale = _suffix_locale_for(s)
     if locale is not None:
         return locale[0]
@@ -12601,6 +13639,9 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+    _cq = _crypto_pair_shape(s) if _crypto_pair_class_mode() == "enforce" else ""
+    if _cq:
+        return _cq  # v5.145.0
     locale = _suffix_locale_for(s)
     if locale is not None:
         return locale[1]
@@ -12849,6 +13890,7 @@ def _apply_symbol_context_defaults(row: Dict[str, Any], symbol: str = "", page: 
         out.setdefault("exchange", _infer_exchange_from_symbol(sym))
         out.setdefault("currency", _infer_currency_from_symbol(sym))
         out.setdefault("country", _infer_country_from_symbol(sym))
+        _crypto_pair_shape_apply(out, sym)  # v5.145.0 (P-151): off => no-op
         out.setdefault("sector", _infer_sector_from_symbol(sym))
         out.setdefault("industry", _infer_industry_from_symbol(sym))
 
@@ -13877,6 +14919,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # before rows leave the API, so recommendation can never disagree with
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
+    _fc_tuple_coherence(row)  # v5.148.0 (P-102): coherent (fp, cp, roi) triple BEFORE the gate reads it
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
@@ -14308,14 +15351,17 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
         fp1 = _as_float(row.get("forecast_price_1m"))
         if fp1 is not None and price:
             row["expected_roi_1m"] = round((fp1 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "fallback")
     if price is not None and row.get("expected_roi_3m") is None:
         fp3 = _as_float(row.get("forecast_price_3m"))
         if fp3 is not None and price:
             row["expected_roi_3m"] = round((fp3 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "fallback")
     if price is not None and row.get("expected_roi_12m") is None:
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
+            _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "fallback")
 
     final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
     final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
@@ -15141,7 +16187,8 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s",
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
+                "w52_ceiling=%s fund_cache=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -15155,6 +16202,11 @@ class DataEngineV5:
                 _g(_snapshot_poison_refusal_enabled),
                 _g(_final_action_invariant_enabled),
                 _g(_fund_lkg_enabled),
+                _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
+                _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
+                _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
+                _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
+                _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
             )
         except Exception:
             pass
@@ -16169,8 +17221,29 @@ class DataEngineV5:
                 and _as_float(row.get("free_cash_flow_ttm")) is not None \
                 and not _ax2_sector_gap:
             return row
+        # --- v5.150.0 (P-154c) EODHD FUNDAMENTALS CACHE-FIRST ------------
+        # The gap is real. Before spending a 10-call fundamentals request,
+        # consult (1) the page skip list, (2) the negative cache, (3) the
+        # fund-LKG snapshot (memory, then Redis L2) when younger than the
+        # cache TTL. off => byte-identical to v5.149.0 (no read, no tag).
+        # observe => one countable would_* tag per row, values untouched,
+        # the provider still called exactly as before. enforce => the
+        # request is skipped and the row is filled FILL-ONLY from the
+        # snapshot (hit) or left as Yahoo delivered it (neg / skip_page).
+        _fc_mode = _fund_cache_mode()
+        if _fc_mode != "off":
+            _fc_kind, _fc_tag, _fc_fill = _fund_cache_decide(row, symbol, page, _fc_mode)
+            if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
+                if _fc_fill:
+                    row = self._merge(row, _fc_fill)
+                if _fc_tag:
+                    _v573_append_warning(row, _fc_tag)
+                return row
+            if _fc_tag:
+                _v573_append_warning(row, _fc_tag)
         patch = await self._fetch_eodhd_fundamentals_patch(symbol, page)
         if not patch:
+            _fund_cache_note_empty(row, symbol, _fc_mode, "empty")
             return row
         # v5.112.0 (Fix AW-1): run the AU-1 declared-identity check on the RAW
         # patch BEFORE _canonicalize_provider_row force-stamps the requested
@@ -16187,6 +17260,7 @@ class DataEngineV5:
                     __version__, symbol, _aw_got,
                 )
                 _v573_append_warning(row, "identity_patch_refused:eodhd_fundamentals")
+                _fund_cache_note_empty(row, symbol, _fc_mode, "refused")
                 return row
         sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
             _safe_str(row.get("symbol") or row.get("requested_symbol"))
@@ -16230,6 +17304,9 @@ class DataEngineV5:
                 _v573_append_warning(row, "fund_identity_quarantined")
             if _aw_keep and any(k in filtered for k in _aw_keep):
                 _v573_append_warning(row, "sector_from_eodhd_verified")
+        if not filtered:
+            # v5.150.0 (P-154c): the paid request landed nothing usable.
+            _fund_cache_note_empty(row, symbol, _fc_mode, "nofill")
         if filtered:
             row = self._merge(row, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
@@ -16518,6 +17595,10 @@ class DataEngineV5:
                     merged["_decision_symbol"] = True
                 _compute_scores_canonical_first(merged)
                 _apply_phase_dd_enhancements(merged)
+                # v5.147.0 (F-7): settle the pass-dependent scores. off ->
+                # returns merged untouched (byte-identical); observe -> tag
+                # only; enforce -> the settled row replaces the pass-1 row.
+                merged = _f7_settle_pass(merged, sym, page_ctx)
             else:
                 _mark_row_as_empty(merged)
 
@@ -16953,6 +18034,7 @@ class DataEngineV5:
         # path that returns rows then has recommendation == recommendation_detailed.
         for _r in rows:
             _reconcile_recommendation_family(_r)
+            _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
@@ -17059,6 +18141,7 @@ class DataEngineV5:
                 # requirement is actually applied on both Top_10 paths.
                 for _r in rows:
                     _reconcile_recommendation_family(_r)
+                    _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
                     _apply_investability_gate(_r)
                     _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
                 # v5.77.23 (Fix J): same Top 10 eligibility filter as the

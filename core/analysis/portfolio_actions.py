@@ -722,7 +722,116 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   Zero removals; all prior WHY blocks carried verbatim. Off/off deploy is
 #   behavior-identical (harness G1).
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.11.0"
+# ---------------------------------------------------------------------------
+# v1.11.1 (2026-09-12) — P-125: "Position Qty" QUANTITY ALIAS (external
+# review, adjudicated 09-11; verified still open at HEAD today)
+# WHY: _position_fields resolves quantity via normalized tokens against
+# _QTY_KEYS, which lacked "positionqty" — yet "Position Qty" is the
+# engine's OWN My_Portfolio schema header (data_engine v5.85.4: "the
+# sheet's manual Position Qty + Avg Cost"). Any caller handing this
+# module rows under that header parsed qty=None and the holding vanished
+# from the action ladder. Latent today (the live GAS payload keys match),
+# a silent hole at the input boundary tomorrow.
+# FIX: append "positionqty" to _QTY_KEYS. PROVABLY ADDITIVE: the scan
+# takes the FIRST row key (row-iteration order) whose token is in the
+# set, so every row that parses today parses identically; divergence
+# requires a row carrying TWO quantity columns with the position-qty one
+# first — a shape no schema produces (harness Q4 documents it anyway).
+# Ungated by the alias-addition precedent (CONTAMINATED_FIELD_ALIASES
+# class). Functions added: 0. Removed: 0.
+# ---------------------------------------------------------------------------
+# v1.12.0 (2026-09-14) — [F-1a SINGLE FORECAST BASIS — operator decision B
+# "plan3m", translated threshold] (F-1 decision memo, session 2026-09-14)
+# WHY: four ROI bases feed one decision surface (memo, measured on the
+# 09-14 export): verdict prose 3M, Horizon Days 365, this module's ADD
+# gate on valuation-target upside (roi_pct — CWBC blocked at 3.4% while
+# its 12M forecast read 13.1%), cockpit qualification de-facto 12M.
+# Operator decision B: the plan horizon (TP1 over the plan period)
+# becomes the single decision basis, translated threshold.
+# F-1a scope = THIS module's ADD-qualification ROI leg only. EXIT/TRIM
+# valuation thresholds, the VF-conflict guard and the dd guard are
+# deliberately untouched (loss-control legs; re-basing them is a
+# separate operator decision). Cockpit qualification is F-1b
+# (opportunity_builder); the engine-roi3m fallback is F-1b feeder work —
+# expected_roi_3m is not plumbed into this module today, so a TP1-less
+# holding fails CLOSED on the plan leg with a disclosed DATA_GAP instead
+# of a stand-in number.
+# GATE: env TFB_FORECAST_BASIS = legacy(default) | observe | plan3m,
+# read at call time (fund-unit-sentry seam — no boot proof needed;
+# read-back = [f1-*] tags in the next Portfolio_Decision run).
+#   legacy  = v1.11.1 byte-identical decisions AND notes (harness F1
+#             deep-equal proof).
+#   observe = decisions unchanged; every holding's Advisor Note gains one
+#             countable "[f1-observe] plan 3M ROI ..." tag (" - FLIP"
+#             marks ADD-ROI-leg basis disagreement) via the post-decision
+#             seam, so day-one read-back is positive even on a zero-flip
+#             book (today's 7 real holdings: 7 tags, 0 FLIPs — harness F2
+#             golden).
+#   plan3m  = the ADD ROI leg runs plan-3M (TP1/price − 1) vs
+#             controls["add_roi_3m_pct"] (default 3.0 = the 12%-annual
+#             translation (1.12**0.25 − 1)·100; env
+#             TFB_PF_ADD_ROI_3M_PCT). rel/DQ/conflict legs, §4.7
+#             precedence, caps, confidence caps, confirmation gate:
+#             byte-untouched.
+# Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
+# _apply_f1_observe_tag). Removed: 0.
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.12.2"
+# v1.12.2 (2026-09-23) - [P-165 ADD-CONFIRM FAIL-CLOSED] THE FUNDING GATE
+# MAY NEVER FAIL OPEN
+# WHY: _apply_add_confirmation ends in `except Exception: return action,
+# reason, capped_from`. Its `action` argument is the RAW verdict, so any
+# exception raised inside the gate hands an UNCONFIRMED ADD through as ADD,
+# and the funding pass sizes it. External review (2026-09-23) read this at
+# source; Claude confirmed it at HEAD. The gate is the one rule that turns
+# a verdict into money, and it is the one rule whose error path upgrades.
+# Exposure today: nil (DDI rendered "ADD confirmed (day 2/2)", so the gate
+# ran clean; the try block holds dict/date/Redis calls whose helpers never
+# raise) - a latent contract defect, closed before it fires, same class as
+# v1.12.1 (found before enforce instead of after).
+# FIX (behind ONE kill-switch, default ON):
+#   (a) an exception on an ADD verdict returns ACTION_HOLD with the reason
+#       "ADD held fail-closed [confirm-failclosed:<ExcType>] ..." and
+#       capped_from=ACTION_ADD (the suppressed-action contract the funding
+#       pass already honours); the symbol's clock is NOT touched (a transient
+#       error neither advances nor resets the chain); one WARNING log line.
+#       A non-ADD verdict that hits the same except still returns unchanged -
+#       fail-closed never suppresses TRIM/EXIT/BLOCK.
+#   (b) an unparsable `add_confirm_days` control falls back to
+#       DEFAULT_CONTROLS["add_confirm_days"] (confirmation required) instead
+#       of 0 (gate off). make_controls already validates the panel value, so
+#       this seam is unreachable in production - closed for the contract.
+#   (c) one countable alert `add_confirmation_gate_error` (count of
+#       fail-closed rows); the row is excluded from low_confidence_capped so
+#       it is counted exactly once, like every other capped class.
+# NOT changed: the memory-only "+1 after any gap" branch. It runs ONLY under
+# TFB_PF_CONFIRM_PERSIST=0, the documented v1.5.1-restore kill-switch;
+# with persistence armed (default) the strict-consecutiveness branch is
+# taken even when Redis is dead (_persist reads the env, not the client).
+# GATE: TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN=1 restores v1.12.1 byte-identically
+# (the P-127 / P-130 precedent: the OFF state IS the defect; operator veto).
+# Functions added: 1 (_add_confirm_failclosed_enabled). Removed: 0.
+# v1.12.1 (2026-09-21) - [F-2 HONOURS D-9] THE LOSS BUDGET IS AN EQUITY RULE
+# WHY: v1.11.0's _apply_drawdown_guard has no asset-class test. Its basis is
+# pnl_sar / cost_sar - PRICE ONLY - and its time rule exits anything "still
+# negative after TFB_PF_DD_TIME_D (45) days". 5023.SR (Arabian Centres sukuk,
+# bought at par, 8.5% coupon, held ~300 days, recorded income 637.50 SAR) is
+# above water on any honest basis, yet one print below par (52W low 100.05)
+# makes its price-only return negative with days >> 45: under the planned
+# TFB_PF_DD_EXIT=enforce the guard would force a FULL EXIT of the income
+# anchor, and under today's observe arming it would print "would EXIT".
+# Every other rule in this file already stands down for a sukuk: D-9 (never
+# a switch-scan SELL leg, v1.2.1) and RULE 1b (never position-cap trimmed,
+# v1.7.3). F-2 was written five weeks later and missed it - same class of
+# defect v1.7.3 closed, found before enforce instead of after.
+# FIX: when the guard's trigger fires on a SUKUK-class holding
+# (_is_sukuk_holding -> compliance_gate.classify_asset), action and proceeds
+# stand and a countable "[dd-exempt]" tag discloses what was seen. The test
+# is evaluated ONLY after a trigger fires, so every non-triggering row - and
+# every equity - is byte-identical to v1.12.0 in all three modes.
+# GATE: rides on the EXISTING TFB_PA_PROTECT_SUKUK (default ON), the v1.7.3
+# precedent - no new environment variable. TFB_PA_PROTECT_SUKUK=0 restores
+# v1.12.0 exactly. ZERO functions added or removed.
 _OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -803,6 +912,10 @@ DEFAULT_CONTROLS = {
     "rebalance_mode": REBALANCE_ADVISORY,
     # v1.0.0 pinned thresholds (env-overridable; see policy block)
     "add_roi_pct": 12.0,
+    # v1.12.0 [F-1a]: plan-basis ADD threshold, percent per plan period
+    # (3M). 3.0 ~= the 12%-annual translation (1.12**0.25 - 1) * 100.
+    # Consulted ONLY when TFB_FORECAST_BASIS is observe/plan3m.
+    "add_roi_3m_pct": 3.0,
     "trim_roi_pct": -5.0,
     "exit_roi_pct": -15.0,
     "valuation_trim_frac": 0.5,
@@ -845,7 +958,8 @@ DEFAULT_CONTROLS = {
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
-                   "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
+                   "add_roi_pct", "add_roi_3m_pct",
+                   "trim_roi_pct", "exit_roi_pct",
                    "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio",
                    "max_data_age_hours", "identity_min_reliability",
                    "vf_conflict_min_engine_roi_pct")
@@ -938,6 +1052,18 @@ def _confirm_persist_enabled():
     the v1.5.1 memory-only confirmation store byte-identically."""
     return (os.getenv("TFB_PF_CONFIRM_PERSIST") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+def _add_confirm_failclosed_enabled():
+    """v1.12.2 [P-165] kill-switch reader - DEFAULT ON (fail-closed).
+    TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN=1/true/on/yes restores the v1.12.1
+    error path (an exception inside the confirmation gate returns the raw
+    verdict) byte-identically. Never raises."""
+    try:
+        return (os.getenv("TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN") or "0") \
+            .strip().lower() not in ("1", "true", "on", "yes")
+    except Exception:
+        return True
 
 
 def _confirm_redis():
@@ -1193,6 +1319,9 @@ def _env_overrides():
     return {
         "add_roi_pct": _env_float("TFB_PF_ADD_ROI_PCT",
                                   DEFAULT_CONTROLS["add_roi_pct"]),
+        # v1.12.0 [F-1a]
+        "add_roi_3m_pct": _env_float("TFB_PF_ADD_ROI_3M_PCT",
+                                     DEFAULT_CONTROLS["add_roi_3m_pct"]),
         "trim_roi_pct": _env_float("TFB_PF_TRIM_ROI_PCT",
                                    DEFAULT_CONTROLS["trim_roi_pct"]),
         "exit_roi_pct": _env_float("TFB_PF_EXIT_ROI_PCT",
@@ -1612,7 +1741,8 @@ def _ob_version_ok():
 # Holding normalization (delegates row science to opportunity_builder)
 # ---------------------------------------------------------------------------
 
-_QTY_KEYS = ("quantity", "qty", "shares", "units", "holdingqty")
+_QTY_KEYS = ("quantity", "qty", "shares", "units", "holdingqty",
+             "positionqty")  # v1.11.1 [P-125]
 _COST_KEYS = ("buyprice", "avgcost", "averagecost", "costbasis",
               "purchaseprice", "avgbuyprice", "costpershare")
 
@@ -1924,11 +2054,17 @@ def _add_confirm_store_size():
 
 def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
     """Returns (action, reason, capped_from) with the confirmation gate
-    applied. Non-ADD outcomes reset the symbol's clock. Never raises."""
+    applied. Non-ADD outcomes reset the symbol's clock. Never raises.
+    v1.12.2 [P-165]: an exception on an ADD verdict fails CLOSED (HOLD,
+    capped_from=ADD, clock untouched) unless the legacy kill-switch is set."""
+    _fc = _add_confirm_failclosed_enabled()   # v1.12.2 [P-165]
     try:
         days = int(controls.get("add_confirm_days") or 0)
     except (TypeError, ValueError):
-        days = 0
+        # v1.12.2 [P-165] (b): an unparsable depth means "confirmation
+        # required", not "gate off" - unreachable via make_controls, closed
+        # for the contract. Legacy: 0 (v1.12.1 verbatim).
+        days = int(DEFAULT_CONTROLS["add_confirm_days"]) if _fc else 0
     try:
         sym = str(symbol or "").strip().upper()
         if not sym:
@@ -1989,8 +2125,26 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
                 "%d consecutive days before funding; qualifying: %s"
                 % (count, days, days, reason),
                 ACTION_ADD)
-    except Exception:
-        return action, reason, capped_from
+    except Exception as exc:
+        # v1.12.2 [P-165] (a): the raw verdict must never upgrade through
+        # the error path. ADD -> HOLD fail-closed (clock untouched); any
+        # non-ADD verdict returns unchanged (never suppress TRIM/EXIT/BLOCK).
+        if not _fc or action != ACTION_ADD:
+            return action, reason, capped_from
+        _exc = exc.__class__.__name__
+        try:
+            logger.warning("[CONFIRM-FAILCLOSED v%s] %s: %s: %s - ADD held "
+                           "HOLD fail-closed this run (clock untouched)",
+                           PORTFOLIO_ACTIONS_VERSION,
+                           str(symbol or "").strip().upper(), _exc, exc)
+        except Exception:
+            pass
+        return (ACTION_HOLD,
+                "ADD held fail-closed [confirm-failclosed:%s] — the "
+                "confirmation gate raised; no funding this run, the "
+                "confirmation clock is untouched; qualifying: %s"
+                % (_exc, reason),
+                ACTION_ADD)
 
 
 def decide_action(cand, controls, weight_pct, sector_weight_pct,
@@ -2216,9 +2370,22 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
 
     # 5. ADD qualification (sizing deferred to the funding pass)
     dq = cand.get("dq")
+    # v1.12.0 [F-1a]: the ROI leg of the ADD test is basis-switchable.
+    # legacy/observe keep the v1.11.1 valuation-upside test verbatim
+    # (observe evidence rides the post-decision seam, not here); plan3m
+    # swaps ONLY this leg to plan-3M ROI vs add_roi_3m_pct — a TP1-less
+    # holding fails CLOSED (DATA_GAP named in step 6). All other legs of
+    # add_ok are byte-untouched.
+    _f1 = _env_forecast_basis()
+    _f1_plan = _f1_plan_roi_pct(cand) if _f1 == "plan3m" else None
+    if _f1 == "plan3m":
+        _f1_roi_ok = (_f1_plan is not None and
+                      _f1_plan >= controls["add_roi_3m_pct"])
+    else:
+        _f1_roi_ok = (roi is not None and roi >= controls["add_roi_pct"])
     add_ok = (rel is not None and rel >= controls["min_reliability_add"] and
               dq is not None and dq >= controls["min_dq_add"] and
-              roi is not None and roi >= controls["add_roi_pct"] and
+              _f1_roi_ok and
               cand.get("conflict") is not True)
     if add_ok:
         # 5a. PRECEDENCE (v1.7.0) — the engine's verdict outranks the
@@ -2242,6 +2409,14 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                 return (ACTION_HOLD,
                         "Low confidence (reliability %s) capped ADD -> HOLD"
                         % _fmt(rel), 0.0, ACTION_ADD)
+            if _f1 == "plan3m":
+                # v1.12.0 [F-1a]: _f1_plan is not None here by _f1_roi_ok.
+                return (ACTION_ADD,
+                        "Plan 3M ROI %.1f%% >= %.1f%% [f1:plan3m], "
+                        "reliability %s, DQ %s, headroom available"
+                        % (_f1_plan, controls["add_roi_3m_pct"],
+                           _fmt(rel), _fmt(dq)),
+                        0.0, None)
             return (ACTION_ADD,
                     "Upside %.1f%% >= %.1f%%, reliability %s, DQ %s, "
                     "headroom available"
@@ -2265,7 +2440,17 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     # sole signal was the withheld valuation action reaches this line.
     if basis_note is not None:
         return (ACTION_HOLD, basis_note, 0.0, basis_suppressed)
-    if roi is None:
+    if _f1 == "plan3m" and not _f1_roi_ok:
+        # v1.12.0 [F-1a]: under the plan basis the binding fact IS the
+        # plan leg — named ahead of the legacy valuation wording.
+        if _f1_plan is None:
+            why = ("Plan 3M ROI unavailable (no TP1) [f1:DATA_GAP] — "
+                   "fails closed on the plan basis")
+        else:
+            why = ("Plan 3M ROI %.1f%% below add threshold %.1f%% "
+                   "[f1:plan3m]; within all caps"
+                   % (_f1_plan, controls["add_roi_3m_pct"]))
+    elif roi is None:
         why = "No valuation reference (target/intrinsic) — upside unknown"
     elif roi < controls["add_roi_pct"]:
         why = ("Upside %.1f%% below add threshold %.1f%%; within all caps"
@@ -2546,6 +2731,53 @@ def _env_dd_guard_mode():
     return v if v in ("observe", "enforce") else "off"
 
 
+def _env_forecast_basis():
+    """v1.12.0 [F-1a]: legacy | observe | plan3m (read at call time, same
+    seam as _env_dd_guard_mode, so an env change needs no redeploy proof
+    at boot — read-back is the [f1-*] tags in the next run). legacy is
+    the default and keeps v1.11.1 byte-identical."""
+    v = str(os.environ.get("TFB_FORECAST_BASIS", "")).strip().lower()
+    return v if v in ("observe", "plan3m") else "legacy"
+
+
+def _f1_plan_roi_pct(cand):
+    """v1.12.0 [F-1a]: plan-3M ROI percent = (TP1/price − 1)·100 on the
+    candidate's native-currency fields (an FX-invariant ratio; tp1 and
+    price are both pre-FX). Returns None when either side is missing or
+    non-positive — callers treat None as DATA_GAP and fail CLOSED on the
+    plan basis (no stand-in number; the engine-roi3m fallback is F-1b
+    feeder work)."""
+    tp1 = _to_float((cand or {}).get("tp1"))
+    px = _to_float((cand or {}).get("price"))
+    if tp1 is None or px is None or tp1 <= 0 or px <= 0:
+        return None
+    return (tp1 / px - 1.0) * 100.0
+
+
+def _apply_f1_observe_tag(cand, reason, controls):
+    """v1.12.0 [F-1a]: observe-mode basis evidence — appended POST-decision
+    at the same caller seam as the dd guard, so legacy decisions stay
+    byte-identical while the basis pair becomes countable on every row
+    (" - FLIP" strictly marks ADD-ROI-leg disagreement: plan-3M vs
+    add_roi_3m_pct against valuation roi_pct vs add_roi_pct). legacy and
+    plan3m are pure pass-throughs here."""
+    if _env_forecast_basis() != "observe":
+        return reason
+    roi = _to_float((cand or {}).get("roi_pct"))
+    plan = _f1_plan_roi_pct(cand)
+    thr = controls["add_roi_3m_pct"]
+    legacy_ok = (roi is not None and roi >= controls["add_roi_pct"])
+    if plan is None:
+        tag = ("[f1-observe] plan 3M ROI DATA_GAP (no TP1); legacy basis "
+               "kept")
+    else:
+        plan_ok = plan >= thr
+        tag = ("[f1-observe] plan 3M ROI %.1f%% vs %.1f%%%s; legacy basis "
+               "kept" % (plan, thr,
+                         " - FLIP" if plan_ok != legacy_ok else ""))
+    return ("%s; %s" % (reason, tag)) if reason else tag
+
+
 def _apply_drawdown_guard(cand, action, reason, proceeds):
     """v1.11.0 [F-2 DRAWDOWN/TIME GUARD] — the loss-responsive exit the
     ladder never had. Seam-pattern (decide_action stays byte-identical).
@@ -2587,6 +2819,14 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
     else:
         trig = "still negative (%.1f%%) after %d d > %d d time budget" % (
             ret_pct, days, time_d)
+    # v1.12.1 [F-2 HONOURS D-9]: a sukuk is held for income; this basis is
+    # price-only. Evaluated only after a trigger fired (see version WHY).
+    if _protect_sukuk_enabled() and _is_sukuk_holding(cand):
+        return (action,
+                (reason or "") + (" | [dd-exempt] sukuk / fixed income (D-9):"
+                                  " %s on a price-only basis - equity loss"
+                                  " budget not applied" % trig),
+                proceeds)
     if mode == "observe":
         tag = " | [dd-observe] %s - would EXIT under enforce" % trig
         return action, (reason or "") + tag, proceeds
@@ -2804,6 +3044,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         # pure pass-through (harness G1 byte-identical proof).
         action, reason, proceeds = _apply_drawdown_guard(
             c, action, reason, proceeds)
+        # v1.12.0 [F-1a]: observe-mode basis evidence — same seam pattern;
+        # legacy/plan3m are pure pass-throughs (harness F1 proof).
+        reason = _apply_f1_observe_tag(c, reason, ctl)
         sec_room = None
         if total_value:
             sec_room = max(0.0, (ctl["max_sector_pct"] / 100.0) *
@@ -2988,6 +3231,13 @@ def _build(rows, ctl, fx_rates, upstream_meta):
            sum(1 for e in entries if e.get("capped_from")
                and "pending confirmation" in _rl(e)),
            "No action needed — ADD confirms after the configured window")
+    # v1.12.2 [P-165] (c): fail-closed rows are counted ONCE, here; the
+    # helper appends nothing at count 0 (legacy / clean runs byte-identical).
+    _alert("add_confirmation_gate_error",
+           sum(1 for e in entries if e.get("capped_from")
+               and "confirm-failclosed" in _rl(e)),
+           "Confirmation gate raised — ADD held fail-closed; read the "
+           "[CONFIRM-FAILCLOSED] Render log line, then re-run")
     _alert("engine_precedence_veto",
            sum(1 for e in entries if e.get("capped_from")
                and ("precedence" in _rl(e) or "engine state" in _rl(e))),
@@ -3002,6 +3252,7 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                if e.get("capped_from") and
                not _is_vf_conflict_hold(e["action"], e["action_reason"])
                and "pending confirmation" not in _rl(e)
+               and "confirm-failclosed" not in _rl(e)   # v1.12.2 [P-165]
                and "precedence" not in _rl(e)
                and "engine state" not in _rl(e)
                and "synthetic" not in _rl(e)),

@@ -78,6 +78,19 @@ jobs:
       # standing operator decision (Shariah screening RETIRED 2026-08-13) is
       # policy, not a toggle. Rollback: restore the vars.* form.
       TFB_COMPLIANCE_SCREEN_RETIRED: "1"
+      # v1.4.0 ENGINE-ROI SOURCING (P-139 / S-1 unfreeze) — 3-step arming.
+      # Step 1 (2026-09-13, THIS commit): observe ARMED below. The board
+      # fetches Expected ROI 12M from Global_Markets/Market_Leaders for
+      # blank-ROI candidates and annotates the new "ROI Src" column
+      # (obs:<v>); ELIGIBILITY MATH IS BYTE-UNCHANGED. Read-back = the
+      # meta line "engine_roi: mode=observe applied=a/b ..." plus obs:
+      # annotations on the next scheduled board (05:10/14:10 UTC).
+      # Step 2 (separate sitting, after a clean observe read-back):
+      # observe -> enforce; blank roi_pct fills from the engine map and
+      # NO_ROI rows become real TRADE/EDGE_BELOW_COST verdicts — record
+      # the S-1 window boundary annotation on the flip date.
+      # Rollback: set off (or delete the line).
+      TFB_BOARD_ENGINE_ROI: "enforce"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:

@@ -592,6 +592,7 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 # =============================================================================
@@ -1061,7 +1062,162 @@ from datetime import datetime, timedelta, timezone
 # Fixed: in that mode `suggested` (the reserved/booked ticket) is
 # shares * worst-entry too, so Σ suggested can never be breached by a fill
 # at the advertised entry-high. OFF remains v1.14.0 byte-identical.
-OPPORTUNITY_BUILDER_VERSION = "1.19.5"
+# -----------------------------------------------------------------------------
+# v1.19.6 (2026-09-12) — P-127: THE AUDIT GRID'S ANN ROI IS NOW ANNUALIZED
+# WHY (live 2026-09-12 board + external review F07, adjudicated 09-11): the
+# ALL QUALIFIED grid rendered Ann ROI % == ROI %(TP1) on every row (11.0/
+# 11.0, 16.2/16.2, 13.8/13.8...) while the SELECTED/FEED path annualized
+# properly (KRP 13.8% over the 3-month plan -> 67.7% = (1.138)^(365/91.25)
+# -1). Root: _audit_align_plan_roi (v1.14.0 ROI-TRUTH-2, the LIVE default
+# "plan" basis) set rec["ann_roi_pct"] = _p — a raw COPY of the TP1 plan
+# ROI with no annualization — while build_opportunity's ticket path uses
+# the compound formula on period_months. One grid, two formulas; the
+# operator read a 3-month figure in an "Ann" column.
+# FIX: the align step now annualizes _p over the SAME horizon the ticket
+# path uses (period_months x DAYS_PER_MONTH from the same criteria dict,
+# identical compound formula, fail-soft to the copy on any error).
+# roi_pct, gates, verdict, score, selection: byte-untouched — display
+# truth only, the ROI-TRUTH doctrine this block already carries.
+# DEFAULT ON with kill switch (file precedent: ROI-TRUTH-1/2 shipped as
+# the live default with TFB_OPP_AUDIT_ROI_LEGACY): TFB_OPP_ANN_LEGACY_COPY
+# =1 restores the v1.19.5 copy byte-for-byte. Functions added: 1
+# (_ann_from_plan_roi). Removed: 0.
+# -----------------------------------------------------------------------------
+# v1.20.0 (2026-09-19) — F-1b: COCKPIT QUALIFICATION ON THE PLAN-3M BASIS
+# (gate TFB_FORECAST_BASIS legacy|observe|plan3m — the SAME env F-1a armed
+# for portfolio_actions v1.12.0; default legacy = v1.19.6 byte-identical)
+# WHY (F-1 decision memo 2026-09-14, Emad: Option B "3M plan everywhere,
+# translated"; second specimen on the 2026-09-19 board): the two ROI gates
+# in evaluate_gates judge the 12M VALUATION upside (roi_pct = ref/price-1,
+# ann = that upside compounded as if it were a 3-month return) while the
+# board RENDERS the TP1 execution plan (_audit_align_plan_roi, the live
+# "plan" basis). On 2026-09-19: 18 of the 27 INVEST-verdict rows carried a
+# plan ROI below the panel's 12% while their valuation upside cleared it;
+# the KPI "Exp. Gain 12M" 19,474 SAR on two sizing-suspended seats equalled
+# ticket x the compounded-annualized plan (82.2%) rather than the TP1
+# payoff (P-141: 13,976 x 82.2% = 11,488 vs payoff 2,263).
+# FIX (three modes, read per call, no restart):
+#   legacy  — unset/anything else: every gate, note and gain byte-identical.
+#   observe — gates untouched; ONE countable "[f1b-observe]" tag per audit
+#             row (appended to failure_reason, blank for INVEST rows before)
+#             stating plan3m ROI vs the translated floor, "- FLIP" when the
+#             ROI+Ann gate outcome would change under plan3m, "- FLIP(strict)"
+#             under the strict 12%/period reading; tickets disclose
+#             "gain ann-basis X vs plan payoff Y" on the advisor note.
+#   plan3m  — the ROI gate judges the TP1 plan ROI against
+#             _f1b_required_roi_3m (default = required_roi_pct translated to
+#             the period, 12%/yr x 3/12 = 3.0%/3M, the F-1a translation;
+#             TFB_T10_REQ_ROI_3M_PCT overrides, e.g. 12 for strict), the
+#             Annualized ROI gate judges the plan ROI compounded over the
+#             period (_ann_from_plan_roi) against required_ann_roi_pct, and
+#             the ticket gain = suggested x plan ROI (TP1 payoff; the v1.0.23
+#             "exp_gain == suggested x ann" identity is DELIBERATELY broken
+#             in this mode — the payoff is the number the plan can deliver).
+#             No TP1 ladder -> the legacy gates evaluate (no ref -> the
+#             Valuation MAJOR gate already fails; never invents a plan).
+# Deliberate cuts: engine roi_3m fallback (the F-1b feeder) NOT plumbed — TP1
+# is the ladder midpoint to the reference, so a plan exists for every row
+# that has a valuation reference; rows without one fail closed upstream.
+# Selection/scoring order, sector caps, funding, rotation: byte-untouched in
+# every mode. Functions added: 3 (_f1b_basis, _f1b_required_roi_3m,
+# _f1b_plan_eval). Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.21.0 [PRICE-XCHECK] — second-source price verification for the seats
+# (register: accuracy gap 1, 2026-09-20; owner Claude; GO by Emad same day).
+# WHY: every ticket's entry zone, stop, TP1/TP2, shares and R/R are derived
+# from ONE price — the sheet's "Current Price", a single provider (yahoo_chart)
+# possibly preserved from an earlier run. The W-2 freshness gate proves the
+# quote's AGE, not its VALUE; nothing in the pipeline compares the seat price
+# against an independent source. Emad's standing trade rule ("entry price
+# verified by more than one independent method before ordering") was applied
+# by hand in every GO verdict (HCI/1321.SR class). The 2026-09-20 red-team
+# review rated every market page "prices not independently verified".
+# FIX (gate TFB_T10_PRICE_XCHECK, read per call, no restart):
+#   off     — default/unset/anything else: byte-identical v1.20.0 behaviour;
+#             not one network call, not one note, not one alert.
+#   observe — for each candidate that reaches SIZING in _select_and_size
+#             (i.e. only the <= max_selected seats plus xcheck-deferred
+#             re-tries — never the audit grid), fetch ONE independent quote
+#             (EODHD /real-time, direct httpx call, provider's key/base
+#             env resolution — nothing new to arm on Render) and compare
+#             it with cand.price: |delta| <= TFB_T10_PRICE_XCHECK_TOL_PCT
+#             (1.0) => verified; else diverge; no/failed/late quote =>
+#             single_source; past TFB_T10_PRICE_XCHECK_MAX_FETCH (15) or
+#             TFB_T10_PRICE_XCHECK_BUDGET_S (20s) => budget. Selection,
+#             sizing, funding, verdicts, gates, KPIs: byte-identical to off.
+#             Read-back: "[price-xcheck observe] ..." on every ticket's
+#             advisor note, detail.price_xcheck on every ticket, ONE countable
+#             "price_xcheck" alert and meta.price_xcheck per build.
+#   enforce — as observe, PLUS a divergent seat is DEFERRED before sizing
+#             with the countable reason "PRICE_XCHECK DIVERGE ..." (near-miss
+#             gate "Price Verification"), and the seat passes to the next
+#             candidate; TFB_T10_PRICE_XCHECK_STRICT=1 also defers
+#             single_source/budget seats (fail-closed). Default STRICT=0:
+#             a provider outage never blanks the board (fail-open, tagged).
+# Symbol mapping: core.symbols.normalize.to_eodhd_symbol when importable,
+# then eodhd_provider's own alias table mirrored verbatim (.L->.LSE ...).
+# Network hygiene: per-call timeout TFB_T10_PRICE_XCHECK_TIMEOUT_S (4s),
+# per-build cache by symbol, sequential calls (no event-loop entry — the
+# async provider client is deliberately NOT used from this sync path,
+# P-110 loop class), every exception swallowed into single_source.
+# Harness seam: _XCHECK_FETCH_OVERRIDE (callable(symbol, timeout_s)) lets
+# the REAL builder run end-to-end on recorded quote payloads.
+# Read-back visibility: an enforce deferral ALWAYS shows in the audit grid
+# Deferral column; it reaches the NEAR MISS table under the existing
+# depth-order/near_miss_n rule (same as sector-cap deferrals). STRICT=1
+# during a total second-source outage defers EVERY reachable INVEST row
+# (one countable reason each, budget verdicts after MAX_FETCH) — a 0-seat
+# board by design; the alert states the counts.
+# Deliberate cuts: holdings (Portfolio_Decision) are portfolio_actions'
+# surface, not this file's; the freshness gate is untouched (age and value
+# are different questions); no second-source PRICE is written back — the
+# sheet price stays the single rendered price, the check is disclosure +
+# (enforce) a deferral. Functions added: 12 (_env_xcheck_mode,
+# _env_xcheck_tol_pct, _env_xcheck_strict, _env_xcheck_max_fetch,
+# _env_xcheck_timeout_s, _env_xcheck_budget_s, _xcheck_eodhd_symbol,
+# _xcheck_parse_quote, _xcheck_fetch_eodhd, _xcheck_reset, _price_xcheck,
+# _xcheck_should_defer, _xcheck_fmt_px, _xcheck_summary_text) = 14 named
+# (+2 nested: _f in the parser, _canon in the mapper) = 16 AST defs.
+# Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.22.0 [CASH-FLOOR-PCT] — the board honours the portfolio's cash floor
+# (register P-148, adjudicated 2026-09-19/20; Build #2 of 2026-09-20).
+# WHY: Portfolio_Decision reserves 10% of NAV (cash_floor=9,372 on
+# 2026-09-20: 10% x (holdings 68,957 + cash 24,764)) and exposes
+# deployable 15,392 SAR, while this builder sized the same wallet at the
+# full 24,764 — one wallet, two capital policies; on an executable day the
+# rank-1 ticket is sized up to 9,372 SAR over the floor the operator set.
+# The v1.16.0 absolute reserve (TFB_OPP_CASH_FLOOR_SAR, unset in
+# production) also only shrank cash_left and the reported deployable —
+# the sizing budget `remaining` was still the pre-reserve figure.
+# FIX (gate TFB_OPP_CASH_FLOOR_PCT, read per call, no restart):
+#   unset   — byte-identical v1.21.0: no reserve, no alert, no meta key.
+#   set     — floor_sar = max(absolute reserve, pct% x NAV), NAV = holdings
+#             value + cash (the PF page's basis; pending proceeds excluded).
+#     TFB_OPP_CASH_FLOOR_MODE=observe (default): selection, sizing, funding
+#             and KPIs untouched; ONE countable "cash_floor" alert states
+#             the floor, the deployable before/after, and how many of the
+#             sized seats (and how many SAR) would lose funding under it;
+#             meta.cash_floor carries the same numbers.
+#     TFB_OPP_CASH_FLOOR_MODE=enforce: the reserve is taken from cash
+#             BEFORE sizing — cash_left, the reported deployable AND the
+#             sizing budget `remaining` all honour it; tail seats read the
+#             existing "Unfunded ... capital exhausted" / min-ticket-floor
+#             semantics; funds_from can never name the reserve.
+# Deliberate cuts: budget_base (NAV incl. proceeds, the per-position cap
+# denominator) is unchanged — a reserve does not shrink NAV; the
+# absolute-only path (pct unset) stays byte-identical, its own remaining
+# gap is closed only when the pct gate is enforced (disclosed here); the
+# PF page's Target Cash % is not plumbed into the request — the pct is an
+# ENV mirror of that panel (10) until the cockpit sends it. Functions
+# added: 5 (_env_cash_floor_pct, _env_cash_floor_mode,
+# _cash_floor_pct_ctx, _cash_floor_finalize, _cash_floor_alert_text).
+# Removed: 0. Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.22.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1983,6 +2139,24 @@ def _tp1_plan_roi(cand):
         return None
 
 
+def _ann_from_plan_roi(plan_roi_pct, crit):
+    """v1.19.6 [P-127] PURE: annualize a plan-horizon ROI over the SAME
+    basis the ticket path uses — period_months * DAYS_PER_MONTH, compound.
+    None in, None out; any fault returns the input unchanged (fail-soft:
+    a wrong-but-labelled number never replaces a blank)."""
+    if plan_roi_pct is None:
+        return None
+    try:
+        months = max(1, int((crit or {}).get("period_months") or 3))
+        days = months * DAYS_PER_MONTH
+        if plan_roi_pct <= -100.0:
+            return plan_roi_pct
+        return round((math.pow(1.0 + plan_roi_pct / 100.0, 365.0 / days)
+                      - 1.0) * 100.0, 1)
+    except Exception:
+        return plan_roi_pct
+
+
 def _audit_align_plan_roi(rec, crit):
     """v1.14.0 [ROI-TRUTH-2 / D-25]: under the LIVE default basis (\"plan\")
     the audit record's PRIMARY roi/ann now speak the same language as the
@@ -2005,13 +2179,71 @@ def _audit_align_plan_roi(rec, crit):
             return rec
         _p = _tp1_plan_roi(rec.get("_cand") or {})
         rec["roi_pct"] = _p
-        rec["ann_roi_pct"] = _p
+        # v1.19.6 [P-127]: annualize over the plan horizon (ticket-path
+        # formula) instead of copying the 3-month figure into an "Ann"
+        # column. Kill: TFB_OPP_ANN_LEGACY_COPY=1 -> the v1.19.5 copy.
+        if str(_env_str("TFB_OPP_ANN_LEGACY_COPY", "0")).strip().lower() \
+                in ("1", "true", "yes", "on"):
+            rec["ann_roi_pct"] = _p
+        else:
+            rec["ann_roi_pct"] = _ann_from_plan_roi(_p, crit)
         rec["primary_roi_basis"] = "plan"
         if _p is None:
             rec["roi_basis_note"] = "TP1_UNAVAILABLE(DATA_GAP)"
     except Exception:
         pass
     return rec
+
+
+def _f1b_basis():
+    """v1.20.0 [F-1b]: TFB_FORECAST_BASIS legacy(default)|observe|plan3m, read
+    per call — the F-1a gate of portfolio_actions v1.12.0 (same env, same
+    vocabulary, so one arming moves both legs in lockstep). Any other value
+    -> legacy (byte-identical). Never raises."""
+    try:
+        raw = str(_env_str("TFB_FORECAST_BASIS", "legacy")).strip().lower()
+        return raw if raw in ("observe", "plan3m") else "legacy"
+    except Exception:
+        return "legacy"
+
+
+def _f1b_required_roi_3m(crit):
+    """v1.20.0 [F-1b]: the plan-horizon ROI floor. Default = the panel's
+    required_roi_pct translated to the period (12%/yr x 3/12 = 3.0%/3M —
+    the translation F-1a adopted for the PF ADD gate); TFB_T10_REQ_ROI_3M_PCT
+    overrides (set 12 for the strict reading). Never raises."""
+    try:
+        ov = str(_env_str("TFB_T10_REQ_ROI_3M_PCT", "")).strip()
+        if ov:
+            return float(ov)
+        months = max(1, int((crit or {}).get("period_months") or 3))
+        base = float((crit or {}).get("required_roi_pct") or 12.0)
+        return round(base * months / 12.0, 2)
+    except Exception:
+        return 3.0
+
+
+def _f1b_plan_eval(cand, crit):
+    """v1.20.0 [F-1b] PURE: the plan-horizon view of the ROI / Annualized ROI
+    gates for one candidate — plan3m = the TP1 plan ROI (the ONE definition,
+    _tp1_plan_roi), ann = _ann_from_plan_roi over the panel period, floors =
+    _f1b_required_roi_3m (translated), required_roi_pct (strict) and
+    required_ann_roi_pct. Returns None when no plan exists (no TP1 ladder)
+    — never invents a number. Never raises."""
+    try:
+        p = _tp1_plan_roi(cand or {})
+        if p is None:
+            return None
+        req3 = _f1b_required_roi_3m(crit)
+        strict = float((crit or {}).get("required_roi_pct") or 12.0)
+        req_ann = float((crit or {}).get("required_ann_roi_pct") or 0.0)
+        ann = _ann_from_plan_roi(p, crit)
+        return {"plan3m": p, "ann": ann, "req3m": req3, "strict": strict,
+                "roi_ok": bool(p >= req3),
+                "strict_ok": bool(p >= strict),
+                "ann_ok": bool(ann is not None and ann >= req_ann)}
+    except Exception:
+        return None
 
 
 def _env_primary_roi_basis():
@@ -2992,6 +3224,268 @@ def _env_freshness_fallback_h():
         return 78.0
 
 
+# -----------------------------------------------------------------------------
+# v1.21.0 [PRICE-XCHECK] helpers — see the header WHY block. Pure except the
+# network leg (_xcheck_fetch_eodhd), which is budgeted and never raises.
+# -----------------------------------------------------------------------------
+_XCHECK_MODES = ("off", "observe", "enforce")
+_XCHECK_FETCH_OVERRIDE = None  # harness seam: callable(symbol, timeout_s)
+_XCHECK_STATE = {"mode": "off", "fetched": 0, "verified": 0, "diverge": 0,
+                 "single_source": 0, "budget": 0, "deferred": 0,
+                 "tol_pct": 1.0, "source": "eodhd", "elapsed_s": 0.0}
+_XCHECK_CACHE = {}
+# Mirrors eodhd_provider._EODHD_SUFFIX_CANONICAL (v4.7.0 ISSUE-D) verbatim so
+# the check hits the SAME EODHD code the fundamentals leg uses; nothing else
+# is invented here (an unsupported venue simply reads single_source).
+_XCHECK_SUFFIX_CANONICAL = {".L": ".LSE", ".XETR": ".XETRA", ".ETR": ".XETRA",
+                            ".TASE": ".TA"}
+
+
+def _env_xcheck_mode():
+    v = (os.getenv("TFB_T10_PRICE_XCHECK") or "off").strip().lower()
+    return v if v in _XCHECK_MODES else "off"
+
+
+def _env_xcheck_tol_pct():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_TOL_PCT") or 1.0)
+        return v if v > 0 else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _env_xcheck_strict():
+    return (os.getenv("TFB_T10_PRICE_XCHECK_STRICT") or "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_xcheck_max_fetch():
+    try:
+        v = int(float(os.getenv("TFB_T10_PRICE_XCHECK_MAX_FETCH") or 15))
+        return v if v > 0 else 15
+    except (TypeError, ValueError):
+        return 15
+
+
+def _env_xcheck_timeout_s():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_TIMEOUT_S") or 4.0)
+        return v if v > 0 else 4.0
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def _env_xcheck_budget_s():
+    try:
+        v = float(os.getenv("TFB_T10_PRICE_XCHECK_BUDGET_S") or 20.0)
+        return v if v > 0 else 20.0
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _xcheck_eodhd_symbol(symbol):
+    """Sheet (Yahoo-style) symbol -> EODHD code, provider-consistent: the
+    repo's canonical mapper (core.symbols.normalize.to_eodhd_symbol) when
+    importable, then the provider's own alias table (.L -> .LSE ...);
+    identity for FX/futures/crypto shapes. Pure; never raises."""
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+
+    def _canon(x):
+        if "." not in x:
+            return x
+        base, sfx = x.rsplit(".", 1)
+        return base + _XCHECK_SUFFIX_CANONICAL.get("." + sfx, "." + sfx)
+    try:
+        from core.symbols.normalize import to_eodhd_symbol  # type: ignore
+        m = to_eodhd_symbol(s)
+        if isinstance(m, str) and m.strip():
+            return _canon(m.strip().upper())
+    except Exception:
+        pass
+    if "=" in s or "-" in s or "^" in s or "/" in s:
+        return s
+    if "." in s:
+        return _canon(s)
+    return s + ".US"
+
+
+def _xcheck_parse_quote(payload):
+    """EODHD /real-time JSON -> (price, ts_iso, prev_close) or None. "NA"
+    strings, non-numeric or non-positive prices => None. Pure."""
+    if not isinstance(payload, dict):
+        return None
+
+    def _f(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, str) and v.strip().upper() in ("", "NA", "N/A"):
+                return None
+            f = float(v)
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+    px = _f(payload.get("close"))
+    if px is None or px <= 0:
+        return None
+    ts = None
+    t = _f(payload.get("timestamp"))
+    if t is not None and t > 0:
+        try:
+            ts = datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            ts = None
+    return px, ts, _f(payload.get("previousClose"))
+
+
+def _xcheck_fetch_eodhd(symbol, timeout_s):
+    """Network leg: ONE EODHD real-time quote. Returns the parsed tuple or
+    None; never raises. Direct synchronous HTTP on purpose: the async
+    provider client must not be entered from this sync builder path (P-110
+    loop class). Key/base mirror the repo provider's env resolution."""
+    # Same key/base resolution as core/providers/eodhd_provider (v4.18.0):
+    # EODHD_API_KEY | EODHD_API_TOKEN | EODHD_KEY; EODHD_BASE_URL override.
+    key = (os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN")
+           or os.getenv("EODHD_KEY") or "").strip()
+    code = _xcheck_eodhd_symbol(symbol)
+    if not key or not code:
+        return None
+    base = (os.getenv("EODHD_BASE_URL")
+            or "https://eodhistoricaldata.com/api").strip().rstrip("/")
+    url = base + "/real-time/" + code
+    params = {"api_token": key, "fmt": "json"}
+    try:
+        import httpx  # type: ignore
+    except Exception:
+        httpx = None
+    try:
+        if httpx is not None:
+            with httpx.Client(timeout=timeout_s) as _c:
+                r = _c.get(url, params=params)
+                if r.status_code != 200:
+                    return None
+                return _xcheck_parse_quote(r.json())
+        import urllib.parse
+        import urllib.request
+        req = urllib.request.Request(
+            url + "?" + urllib.parse.urlencode(params),
+            headers={"User-Agent": "tfb-price-xcheck/1.21.0"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            return _xcheck_parse_quote(
+                json.loads(resp.read().decode("utf-8", "replace")))
+    except Exception:
+        return None
+
+
+def _xcheck_reset(mode):
+    """Per-build reset of the xcheck counters and quote cache."""
+    _XCHECK_STATE.update({"mode": mode, "fetched": 0, "verified": 0,
+                          "diverge": 0, "single_source": 0, "budget": 0,
+                          "deferred": 0, "tol_pct": _env_xcheck_tol_pct(),
+                          "source": "eodhd", "elapsed_s": 0.0})
+    _XCHECK_CACHE.clear()
+
+
+def _price_xcheck(cand, ctx):
+    """Second-source comparison for ONE seat candidate. Returns the xcheck
+    dict (also stashed on cand["_price_xcheck"] for the ticket/audit).
+    Fail-open by construction: a missing, failed or late second source is
+    single_source (or budget), never a divergence. Never raises."""
+    sym = str(cand.get("symbol") or "").strip()
+    primary = cand.get("price")
+    try:
+        primary = float(primary) if primary is not None else None
+    except (TypeError, ValueError):
+        primary = None
+    xc = {"mode": ctx["mode"], "source": "eodhd", "symbol": sym,
+          "primary": primary, "secondary": None, "secondary_ts": None,
+          "delta_pct": None, "tol_pct": ctx["tol_pct"], "verdict": "skipped",
+          "text": "skipped (no primary price)"}
+    if primary is None or primary <= 0:
+        cand["_price_xcheck"] = xc
+        return xc
+    st = _XCHECK_STATE
+    q = _XCHECK_CACHE.get(sym, "MISS")
+    if q == "MISS":
+        if st["fetched"] >= ctx["max_fetch"] or \
+                st["elapsed_s"] >= ctx["budget_s"]:
+            xc["verdict"] = "budget"
+            st["budget"] += 1
+            xc["text"] = ("budget: %d fetches / %.1fs used \u2014 unverified"
+                          % (st["fetched"], st["elapsed_s"]))
+            cand["_price_xcheck"] = xc
+            return xc
+        t0 = time.monotonic()
+        try:
+            q = ctx["fetch_fn"](sym, ctx["timeout_s"])
+        except Exception:
+            q = None
+        st["fetched"] += 1
+        st["elapsed_s"] = round(st["elapsed_s"] +
+                                max(0.0, time.monotonic() - t0), 3)
+        _XCHECK_CACHE[sym] = q
+    if not q or q[0] is None or q[0] <= 0:
+        xc["verdict"] = "single_source"
+        st["single_source"] += 1
+        xc["text"] = "single-source: eodhd quote unavailable"
+        cand["_price_xcheck"] = xc
+        return xc
+    sec, ts, _pc = q
+    delta = (float(sec) / primary - 1.0) * 100.0
+    xc.update({"secondary": _round4(sec), "secondary_ts": ts,
+               "delta_pct": round(delta, 2)})
+    if abs(delta) <= ctx["tol_pct"]:
+        xc["verdict"] = "verified"
+        st["verified"] += 1
+        xc["text"] = ("verified: eodhd %s vs sheet %s, \u0394%+.2f%% (tol %.1f%%)"
+                      % (_xcheck_fmt_px(sec), _xcheck_fmt_px(primary),
+                         delta, ctx["tol_pct"]))
+    else:
+        xc["verdict"] = "diverge"
+        st["diverge"] += 1
+        xc["text"] = ("DIVERGE \u0394%+.2f%%: eodhd %s vs sheet %s (tol %.1f%%)"
+                      % (delta, _xcheck_fmt_px(sec), _xcheck_fmt_px(primary),
+                         ctx["tol_pct"]))
+    cand["_price_xcheck"] = xc
+    return xc
+
+
+def _xcheck_should_defer(xc, strict):
+    """enforce semantics: diverge always defers; single_source/budget defer
+    only under STRICT. verified/skipped never defer. Pure."""
+    v = (xc or {}).get("verdict")
+    if v == "diverge":
+        return True
+    return bool(strict) and v in ("single_source", "budget")
+
+
+def _xcheck_fmt_px(v):
+    """Price text for the xcheck note: 2 dp (4 dp below 1.0) so a 0.03
+    difference is visible (never the 1-dp _fmt_num rendering)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    return ("%.4f" % f) if abs(f) < 1.0 else ("%.2f" % f)
+
+
+def _xcheck_summary_text():
+    st = _XCHECK_STATE
+    tail = (" Enforce: %d seat(s) deferred." % st["deferred"]
+            if st["mode"] == "enforce" else
+            " Observe: no ticket changed.")
+    return ("Second-source price check (eodhd, mode %s, tol %.1f%%): "
+            "verified %d, diverge %d, single-source %d, budget %d of %d "
+            "fetched in %.1fs.%s"
+            % (st["mode"], st["tol_pct"], st["verified"], st["diverge"],
+               st["single_source"], st["budget"], st["fetched"],
+               st["elapsed_s"], tail))
+
+
 # v1.5.0: official authority FAIL list — compiled default (Al-Rajhi Q1-2026,
 # as_of 2026-03-31; quarterly refresh via env or the next authority upload).
 _KSA_AUTHORITY_FAIL_DEFAULT = (
@@ -3365,17 +3859,33 @@ def evaluate_gates(cand, criteria, held_symbols=None):
                    cand["valuation_basis"] or "none",
                    "target_price or intrinsic_value present"))
 
-    roi_ok = (cand["roi_pct"] is not None and
-              cand["roi_pct"] >= criteria["required_roi_pct"])
-    g.append(_gate("ROI", roi_ok, FAIL_NON_CRITICAL,
-                   _round1(cand["roi_pct"]),
-                   ">= " + _fmt_num(criteria["required_roi_pct"]) + "%"))
+    # v1.20.0 [F-1b]: under TFB_FORECAST_BASIS=plan3m the two ROI gates
+    # judge the TP1 execution plan over the panel period (the basis the
+    # board already RENDERS); legacy and observe keep the v1.19.6 gates
+    # byte-identically (observe measures at the audit seam instead).
+    _f1b = (_f1b_plan_eval(cand, criteria) if _f1b_basis() == "plan3m"
+            else None)
+    if _f1b is not None:
+        g.append(_gate("ROI", _f1b["roi_ok"], FAIL_NON_CRITICAL,
+                       _round1(_f1b["plan3m"]),
+                       ">= " + _fmt_num(_f1b["req3m"]) + "% (plan3m)"))
+        g.append(_gate("Annualized ROI", _f1b["ann_ok"], FAIL_NON_CRITICAL,
+                       _round1(_f1b["ann"]),
+                       ">= " + _fmt_num(criteria["required_ann_roi_pct"])
+                       + "% (plan3m)"))
+    else:
+        roi_ok = (cand["roi_pct"] is not None and
+                  cand["roi_pct"] >= criteria["required_roi_pct"])
+        g.append(_gate("ROI", roi_ok, FAIL_NON_CRITICAL,
+                       _round1(cand["roi_pct"]),
+                       ">= " + _fmt_num(criteria["required_roi_pct"]) + "%"))
 
-    ann_ok = (cand["ann_roi_pct"] is not None and
-              cand["ann_roi_pct"] >= criteria["required_ann_roi_pct"])
-    g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
-                   _round1(cand["ann_roi_pct"]),
-                   ">= " + _fmt_num(criteria["required_ann_roi_pct"]) + "%"))
+        ann_ok = (cand["ann_roi_pct"] is not None and
+                  cand["ann_roi_pct"] >= criteria["required_ann_roi_pct"])
+        g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
+                       _round1(cand["ann_roi_pct"]),
+                       ">= " + _fmt_num(criteria["required_ann_roi_pct"])
+                       + "%"))
 
     # v1.0.4 [VALUATION-SANITY-GATE]: the ticket roi_pct is pure valuation
     # upside (ref/price); upstream the engine's intrinsic-value model permits
@@ -3883,6 +4393,108 @@ def _cash_floor_sar() -> float:
         return 0.0
 
 
+# -----------------------------------------------------------------------------
+# v1.22.0 [CASH-FLOOR-PCT] helpers — see the header WHY block. Pure.
+# -----------------------------------------------------------------------------
+_LAST_CASH_FLOOR = {"mode": "off", "pct": None, "nav_sar": 0.0,
+                    "pct_floor_sar": 0.0, "abs_floor_sar": 0.0,
+                    "floor_sar": 0.0, "deployable_pre_sar": 0.0,
+                    "deployable_post_sar": 0.0, "seats_sized": 0,
+                    "would_unfund_seats": 0, "would_unfund_sar": 0.0}
+
+
+def _env_cash_floor_pct():
+    """TFB_OPP_CASH_FLOOR_PCT: percent of NAV to reserve (e.g. 10). Unset
+    or blank => None (gate off). Invalid / out of (0, 100) => None, logged."""
+    raw = (os.getenv("TFB_OPP_CASH_FLOOR_PCT") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw.replace(",", "").rstrip("%"))
+        if 0.0 < v < 100.0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    try:
+        _LOG.warning("[CASH-FLOOR-PCT] CONFIG INVALID: %r is not a percent "
+                     "in (0, 100) - floor INACTIVE; fix "
+                     "TFB_OPP_CASH_FLOOR_PCT", raw)
+    except Exception:
+        pass
+    return None
+
+
+def _env_cash_floor_mode():
+    v = (os.getenv("TFB_OPP_CASH_FLOOR_MODE") or "observe").strip().lower()
+    return "enforce" if v == "enforce" else "observe"
+
+
+def _cash_floor_pct_ctx(pf, deployable, abs_floor):
+    """Per-build floor context. NAV = holdings value + cash (the PF page's
+    basis). floor_sar = the stricter of the absolute reserve and pct x NAV.
+    Resets and fills _LAST_CASH_FLOOR. Pure; never raises."""
+    pct = _env_cash_floor_pct()
+    cash = float(pf.get("cash") or 0.0)
+    nav = float(pf.get("portfolio_value") or 0.0) + cash
+    ctx = {"mode": "off", "pct": pct, "nav_sar": round(nav, 0),
+           "pct_floor_sar": 0.0, "abs_floor_sar": round(float(abs_floor or 0.0), 2),
+           "floor_sar": round(float(abs_floor or 0.0), 2),
+           "deployable_pre_sar": round(float(deployable), 0),
+           "deployable_post_sar": round(float(deployable), 0),
+           "seats_sized": 0, "would_unfund_seats": 0, "would_unfund_sar": 0.0}
+    if pct is not None:
+        ctx["mode"] = _env_cash_floor_mode()
+        ctx["pct_floor_sar"] = round(nav * pct / 100.0, 2)
+        ctx["floor_sar"] = max(ctx["abs_floor_sar"], ctx["pct_floor_sar"])
+        ctx["deployable_post_sar"] = round(
+            max(0.0, float(deployable) - min(cash, ctx["floor_sar"])), 0)
+    _LAST_CASH_FLOOR.clear()
+    _LAST_CASH_FLOOR.update(ctx)
+    return ctx
+
+
+def _cash_floor_finalize(ctx, picked):
+    """observe read-back: walk the sized seats in selection order and count
+    those whose cumulative suggested SAR would exceed the post-floor
+    deployable (the seats that would lose funding under enforce). Pure."""
+    ctx["seats_sized"] = len(picked)
+    if ctx.get("mode") != "observe":
+        _LAST_CASH_FLOOR.update(ctx)
+        return ctx
+    post = float(ctx.get("deployable_post_sar") or 0.0)
+    cum, seats, short = 0.0, 0, 0.0
+    for p in picked:
+        # reproducibility contract (as exp_gain): the DISPLAYED rounded
+        # ticket size is the basis, so the sheet can re-verify the count.
+        s = round(float(p.get("suggested_sar") or 0.0), 0)
+        cum += s
+        if s > 0 and cum > post + 0.5:
+            seats += 1
+            short += min(s, cum - post)
+    ctx["would_unfund_seats"] = seats
+    ctx["would_unfund_sar"] = round(short, 0)
+    _LAST_CASH_FLOOR.update(ctx)
+    return ctx
+
+
+def _cash_floor_alert_text(ctx):
+    head = ("Cash floor %s%% of NAV %s = %s" % (
+        _fmt_num(ctx.get("pct")), _fmt_sar(ctx.get("nav_sar")),
+        _fmt_sar(ctx.get("floor_sar"))))
+    if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
+        head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
+    if ctx.get("mode") == "enforce":
+        return (head + " ENFORCED: deployable %s (reserve kept out of sizing "
+                "and funding)." % _fmt_sar(ctx.get("deployable_post_sar")))
+    return (head + " (observe): deployable would fall %s -> %s; %d of %d "
+            "sized seat(s) would lose funding (%s). No ticket changed."
+            % (_fmt_sar(ctx.get("deployable_pre_sar")),
+               _fmt_sar(ctx.get("deployable_post_sar")),
+               int(ctx.get("would_unfund_seats") or 0),
+               int(ctx.get("seats_sized") or 0),
+               _fmt_sar(ctx.get("would_unfund_sar"))))
+
+
 def _sector_cap_basis() -> str:
     """v1.0.24: 'budget' (default) -> sector-weight checks divide by
     budget_base = portfolio_value + deployable; 'legacy' -> v1.0.23
@@ -4299,15 +4911,32 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     budget_base = pf["portfolio_value"] + deployable
     remaining = deployable
     cash_left, proceeds_left = pf["cash"], pf["proceeds"]
+    # v1.22.0 [CASH-FLOOR-PCT]: NAV-percent reserve (the PF page's 10%
+    # basis). Unset => byte-identical v1.21.0. Under enforce the stricter
+    # of absolute / percent is the reserve AND the sizing budget honours it.
+    _cf = _cash_floor_pct_ctx(pf, deployable, _floor)
+    if _cf["mode"] == "enforce" and _cf["floor_sar"] > 0:
+        _floor = _cf["floor_sar"]
     if _floor > 0:  # v1.16.0: absolute reserve, never funded from
         _res = min(cash_left, _floor)
         cash_left -= _res
         deployable = max(0.0, deployable - _res)
+        if _cf["mode"] == "enforce":
+            remaining = max(0.0, remaining - _res)
 
     sector_counts, market_counts = {}, {}
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
+    # v1.21.0 [PRICE-XCHECK]: per-build context, env read per call.
+    _xc_mode = _env_xcheck_mode()
+    _xcheck_reset(_xc_mode)
+    _xc_ctx = {"mode": _xc_mode, "tol_pct": _env_xcheck_tol_pct(),
+               "strict": _env_xcheck_strict(),
+               "max_fetch": _env_xcheck_max_fetch(),
+               "timeout_s": _env_xcheck_timeout_s(),
+               "budget_s": _env_xcheck_budget_s(),
+               "fetch_fn": _XCHECK_FETCH_OVERRIDE or _xcheck_fetch_eodhd}
     # v1.0.16: issuer-level cross-listing dedup (default OFF).
     issuer_dedup = bool(criteria.get("issuer_dedup_enabled", False))
     funded_issuers = {}
@@ -4355,6 +4984,20 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             deferrals[cand["symbol"]] = (
                 "Diversification: market cap reached (" + mkt + ")")
             continue
+        # v1.21.0 [PRICE-XCHECK]: the seat's sheet price is compared with an
+        # independent second source BEFORE sizing. off => skipped
+        # (byte-identical v1.20.0); observe => tag only; enforce => a
+        # divergent seat (or, under STRICT, an unverifiable one) is DEFERRED
+        # with a countable reason and the seat passes to the next candidate.
+        # Gates, verdicts and the audit grid are untouched in every mode.
+        if _xc_mode != "off":
+            _xc = _price_xcheck(cand, _xc_ctx)
+            if _xc_mode == "enforce" and \
+                    _xcheck_should_defer(_xc, _xc_ctx["strict"]):
+                _XCHECK_STATE["deferred"] += 1
+                deferrals[cand["symbol"]] = (
+                    "PRICE_XCHECK " + _xc["text"] + " \u2014 sizing deferred")
+                continue
         suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
         # name out (allocation buys >= 1 share but < 1 lot), say so honestly
@@ -4426,6 +5069,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                        "funds_from": funds_label})
         if issuer_dedup:
             funded_issuers[_ikey] = cand["symbol"]
+    _cash_floor_finalize(_cf, picked)  # v1.22.0 observe read-back
     return picked, deferrals, deployable, remaining
 
 
@@ -4544,6 +5188,19 @@ def _build_ticket(rank, pick, criteria, review_date):
                         - 1.0) * 100.0)
                if _plan_roi > -100.0 else 0.0) or 0.0
         exp_gain = round(suggested * ann / 100.0, 0)
+        # v1.20.0 [F-1b / P-141]: plan3m -> the ticket gain is the TP1 payoff
+        # over the plan horizon (suggested x plan ROI), not the compounded-
+        # annualized figure; observe discloses both on the advisor note;
+        # legacy byte-identical.
+        _f1b_mode = _f1b_basis()
+        if _f1b_mode == "plan3m":
+            exp_gain = round(suggested * _plan_roi / 100.0, 0)
+        elif _f1b_mode == "observe":
+            note = note + (" [f1b-observe] gain ann-basis "
+                           + _fmt_sar(round(suggested * ann / 100.0, 0))
+                           + " vs plan payoff "
+                           + _fmt_sar(round(suggested * _plan_roi / 100.0,
+                                            0)) + ".")
     if _ticket_engine_primary:
         ann = _round1(engine_pct) or 0.0
         exp_gain = round(suggested * ann / 100.0, 0)
@@ -4574,6 +5231,14 @@ def _build_ticket(rank, pick, criteria, review_date):
                            + _fmt_num(_round1(engine_pct))
                            + "% \u2014 the upside shown is a valuation target, "
                            "not a forecast.")
+    # v1.21.0 [PRICE-XCHECK]: disclose the second-source result on the
+    # ticket note (observe + enforce). off => no text (byte-identical).
+    _xc_t = cand.get("_price_xcheck")
+    if isinstance(_xc_t, dict) and _xc_t.get("mode") in ("observe", "enforce"):
+        note = note + (" [price-xcheck " + str(_xc_t.get("mode")) + "] " +
+                       str(_xc_t.get("text") or ""))
+    else:
+        _xc_t = None
     ticket = {
         "rank": rank,
         "symbol": cand["symbol"],
@@ -4654,6 +5319,11 @@ def _build_ticket(rank, pick, criteria, review_date):
         ticket["primary_roi_basis"] = ("plan" if _ticket_plan_primary
                                        else "valuation")
     _annotate_cost_edge(ticket, suggested)  # v1.1.0 net-edge stamp (env-gated)
+    if _xc_t:
+        ticket["detail"]["price_xcheck"] = {
+            k: _xc_t.get(k) for k in ("mode", "verdict", "primary",
+                                      "secondary", "secondary_ts",
+                                      "delta_pct", "tol_pct", "source")}
     return ticket
 
 
@@ -4718,6 +5388,18 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
                 note = ("Qualified (INVEST) \u2014 a higher-ranked listing of "
                         "this issuer is already funded; this is a cross-listing "
                         "of the same company, not a separate position.")
+            elif "PRICE_XCHECK" in _reason:
+                # v1.21.0: an enforce-mode xcheck deferral is a PRICE
+                # VERIFICATION near-miss — classify it distinctly (same bug
+                # class as the v1.0.15 floor / v1.0.17 duplicate fixes).
+                gate, cur, req = "Price Verification", _reason, (
+                    "second-source quote within " +
+                    _fmt_num(_XCHECK_STATE.get("tol_pct") or 1.0) +
+                    "% of the sheet price")
+                note = ("Qualified (INVEST) \u2014 deferred: the sheet price "
+                        "could not be verified against an independent quote; "
+                        "re-check on the next board or verify on the broker "
+                        "screen before any manual order.")
             else:
                 gate, cur, req = "Diversification", _reason, (
                     "within sector/market caps")
@@ -5156,6 +5838,37 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                             _nm["current"] = str(_nm.get("current") or "") + _txt
         except Exception:  # noqa: BLE001 - the layer is additive, never fatal
             _fp_plans = []
+    # v1.20.0 [F-1b] observe: ONE countable tag per audit row — the plan-3M
+    # view of the two ROI gates beside the legacy verdict; "- FLIP" marks a
+    # row whose ROI+Ann gate outcome would change under plan3m (translated
+    # floor), "- FLIP(strict)" under the strict 12%/period reading. Runs
+    # AFTER selection/deferrals: gates, verdicts, picks and deferral text are
+    # byte-untouched; legacy/plan3m -> this block is inert.
+    if _f1b_basis() == "observe":
+        for _rec in audit:
+            try:
+                _ev = _f1b_plan_eval(_rec.get("_cand") or {}, crit)
+                _lg = {str(_g.get("gate")): bool(_g.get("passed"))
+                       for _g in (_rec.get("gates") or [])}
+                _legacy_ok = bool(_lg.get("ROI")) and \
+                    bool(_lg.get("Annualized ROI"))
+                if _ev is None:
+                    _tag = "[f1b-observe] plan3m DATA_GAP"
+                else:
+                    _plan_ok = bool(_ev["roi_ok"] and _ev["ann_ok"])
+                    _strict_ok = bool(_ev["strict_ok"] and _ev["ann_ok"])
+                    _tag = ("[f1b-observe] plan3m " + _fmt_num(_ev["plan3m"])
+                            + "% vs " + _fmt_num(_ev["req3m"]) + "%/"
+                            + str(max(1, int(crit.get("period_months") or 3)))
+                            + "M"
+                            + (" - FLIP" if _plan_ok != _legacy_ok else "")
+                            + (" - FLIP(strict)"
+                               if _strict_ok != _legacy_ok else ""))
+                _fr = _rec.get("failure_reason")
+                _rec["failure_reason"] = ((str(_fr) + " | ") if _fr else "") \
+                    + _tag
+            except Exception:  # noqa: BLE001 — observe is additive, never fatal
+                pass
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
@@ -5261,6 +5974,21 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     ". Qualified names are shown regardless of cash; funding is "
                     "the operator's decision."),
             })
+    # v1.22.0 [CASH-FLOOR-PCT]: ONE countable alert per build when armed.
+    if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
+        alerts.append({
+            "type": "cash_floor",
+            "count": int(_LAST_CASH_FLOOR.get("would_unfund_seats") or 0)
+            if _LAST_CASH_FLOOR.get("mode") == "observe" else 1,
+            "required_action": _cash_floor_alert_text(_LAST_CASH_FLOOR),
+        })
+    # v1.21.0 [PRICE-XCHECK]: ONE countable alert per build (observe/enforce).
+    if _XCHECK_STATE.get("mode") in ("observe", "enforce") and \
+            (_XCHECK_STATE.get("fetched") or _XCHECK_STATE.get("budget")):
+        alerts.append({
+            "type": "price_xcheck", "count": int(_XCHECK_STATE["fetched"]),
+            "required_action": _xcheck_summary_text(),
+        })
     # 4) audit grid sorted by score; strip internals
     # v1.19.1 [AUDIT-DEPTH-ORDER]: depth order by default (display-only).
     if _env_audit_order() == "depth":
@@ -5341,6 +6069,12 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         },
     }
 
+    # v1.21.0 [PRICE-XCHECK]: read-back block on meta ONLY when the gate is
+    # armed — off keeps the payload byte-identical to v1.20.0.
+    if _XCHECK_STATE.get("mode") in ("observe", "enforce"):
+        meta["price_xcheck"] = dict(_XCHECK_STATE)
+    if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
+        meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,

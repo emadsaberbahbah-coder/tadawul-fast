@@ -1,0 +1,154 @@
+name: Workflow Repair Regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'fix/actions-health-20260917']
+    paths:
+      - '.github/workflows/workflow_repair_tests.yml'
+      - 'scripts/audit_*coverage.py'
+      - 'scripts/audit_decision_surface_freshness.py'
+      - 'scripts/workflow_*.py'
+      - 'tests/test_workflow_*.py'
+      - 'tests/test_full_refresh_coverage.py'
+      - 'tests/test_decision_surface_freshness.py'
+  pull_request:
+    paths:
+      - '.github/workflows/workflow_repair_tests.yml'
+      - 'scripts/audit_*coverage.py'
+      - 'scripts/audit_decision_surface_freshness.py'
+      - 'scripts/workflow_*.py'
+      - 'tests/test_workflow_*.py'
+      - 'tests/test_full_refresh_coverage.py'
+      - 'tests/test_decision_surface_freshness.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-repair-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Run audit contracts without live credentials
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python scripts/audit_provider_target_coverage.py --selftest
+          python scripts/audit_decision_surface_freshness.py --selftest
+          python -m unittest tests/test_full_refresh_coverage.py tests/test_decision_surface_freshness.py tests/test_workflow_audit_repairs.py -v
+          python -m unittest tests/test_repository_workflow_audit.py -v
+          python scripts/audit_repository_workflows.py
+
+  verify-live:
+    name: Read-only post-merge audit verification
+    needs: regression
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      PYTHONUNBUFFERED: '1'
+      TZ: Asia/Riyadh
+      DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
+      TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+      TFB_DECISION_SURFACE_MAX_AGE_H: '8'
+      TFB_DECISION_SOURCE_MAX_AGE_H: '30'
+      TFB_PTC_DROP_PCT: ${{ vars.TFB_PTC_DROP_PCT || '20' }}
+      TFB_PTC_ROW_DROP_PCT: ${{ vars.TFB_PTC_ROW_DROP_PCT || '30' }}
+      TFB_PTC_MIN_ROWS: ${{ vars.TFB_PTC_MIN_ROWS || '50' }}
+      TFB_PTC_FLOOR_PCT: ${{ vars.TFB_PTC_FLOOR_PCT || '0' }}
+      TFB_PTC_BASELINE_MAX_AGE_H: ${{ vars.TFB_PTC_BASELINE_MAX_AGE_H || '72' }}
+      TFB_PTC_ZERO_PAGES: ${{ vars.TFB_PTC_ZERO_PAGES || 'Commodities_FX,Mutual_Funds' }}
+      TFB_PTC_PAGES: ${{ vars.TFB_PTC_PAGES || '' }}
+      TFB_PTC_FREEZE: '1'
+      TFB_PTC_BOOTSTRAP: '0'
+      TFB_PTC_ACCEPT_BASELINE: '0'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install audit dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore reference without promoting or accepting it
+        uses: actions/cache/restore@v4
+        with:
+          path: provider_target_last_good.json
+          key: ptc-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ptc-lastgood-
+      - name: Verify live controls and retain genuine failures
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          out = Path('audit-evidence')
+          out.mkdir(exist_ok=True)
+          sid = os.getenv('DEFAULT_SPREADSHEET_ID', '').strip()
+          if not sid:
+              raise SystemExit('DEFAULT_SPREADSHEET_ID is missing')
+          commands = [
+              ('full_refresh', 'scripts/audit_full_refresh_coverage.py', ['--max-rows', '20000'], {0, 1}),
+              ('decision_surface', 'scripts/audit_decision_surface_freshness.py', [], {0, 1}),
+              ('provider_target', 'scripts/audit_provider_target_coverage.py', [
+                  '--state', 'provider_target_last_good.json',
+                  '--observation-out', str(out / 'provider_target_observation.json')], {0}),
+          ]
+          results = []
+          for name, script, extra, allowed in commands:
+              report = out / (name + '.json')
+              cmd = [sys.executable, script, '--sheet-id', sid, '--json-out', str(report), *extra]
+              with (out / (name + '.log')).open('w') as stream:
+                  try:
+                      code = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT, timeout=360).returncode
+                  except subprocess.TimeoutExpired:
+                      code = 124
+                      stream.write('\nAudit timed out; not a successful measurement.\n')
+              result = {'audit': name, 'exit_code': code, 'report_present': report.is_file(),
+                        'passed': code in allowed and report.is_file()}
+              results.append(result)
+              print(json.dumps(result))
+          payload = {'checked_at_utc': datetime.now(timezone.utc).isoformat(),
+                     'commit': os.environ['GITHUB_SHA'], 'read_only': True, 'results': results}
+          (out / 'verification.json').write_text(json.dumps(payload, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('# Post-merge live control verification\n\n')
+              stream.write('Workbook read-only; provider baseline frozen. No thresholds changed.\n\n')
+              stream.write('| Audit | Exit | Result |\n|---|---:|---|\n')
+              for r in results:
+                  stream.write(f"| {r['audit']} | {r['exit_code']} | {'PASS' if r['passed'] else 'FAIL — see evidence'} |\n")
+          raise SystemExit(0 if all(r['passed'] for r in results) else 1)
+          PY
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workflow-live-verification-${{ github.run_id }}
+          path: audit-evidence/
+          retention-days: 7
+          if-no-files-found: warn

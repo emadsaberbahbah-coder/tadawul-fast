@@ -21,7 +21,7 @@ on:
   # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
   # or the 25-min job cap being too short for a full sweep); check the Actions tab.
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 4,12,20 * * *"   # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
 
   # ✅ Manual run
   workflow_dispatch:
@@ -286,6 +286,25 @@ jobs:
       # band): far narrower than FW-4 quarantine, which stays "observe" per
       # the documented S-1-window decision below.
       TFB_SYNC_PERSIST_SANITY: "1"
+      # v6.60.0 P-154 EODHD QUOTA SENTINEL (scripts/run_dashboard_sync.py).
+      # ARMED "observe" 2026-09-21 - TELEMETRY ONLY: one [EODHD-QUOTA] _Run_Log
+      # line per ranked market page per leg (usage counter from the provider's
+      # 0-cost /api/user endpoint + 402/429/404 row counts in the outgoing
+      # matrix). Changes no write, cannot fail the leg. WHY: on 2026-09-20 the
+      # daily API-call limit ran out at 22:26-23:22 UTC (845 Global_Markets rows
+      # fetch_failed:HTTP 402 -> BLOCKED) and nothing in _Run_Log said so.
+      # KILL-SWITCH: delete this line -> v6.59.0 behaviour exactly.
+      TFB_SYNC_EODHD_QUOTA: "observe"
+      # v6.61.0 P-154d EODHD QUOTA GUARD - OBSERVE (2026-09-24). Pre-fetch: one
+      # 0-cost /api/user poll per ranked page; post-fetch: fresh-402 share of the
+      # outgoing matrix. observe = one [EODHD-QUOTA-GUARD] _Run_Log line (+ a
+      # ::warning:: annotation) whenever a skip WOULD fire (EXHAUSTED / ON_EXTRA /
+      # used% >= TFB_SYNC_EODHD_QUOTA_GUARD_PCT 97 / fresh 402 on >= 25% of rows);
+      # fetch and write proceed exactly as v6.60.0. enforce (separate sitting) skips
+      # the leg before any provider call, or refuses a poisoned write, preserving
+      # last-good rows (status=skipped, exit code unchanged). Explicit words only;
+      # delete the line (or "off") to restore v6.60.0 behaviour byte-identically.
+      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -914,6 +933,11 @@ jobs:
           # behavior exactly (safe before AND after arming, provided the
           # secret is set before Render is).
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+          # v6.60.0 P-154: read ONLY by the quota sentinel's /api/user poll and
+          # never logged (the sentinel reports exception TYPES only). Step-scoped
+          # on purpose. Unset secret -> state UNKNOWN (no_key); row counts still
+          # publish.
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
         run: |
           set -euo pipefail
           echo "::group::📊 Sync Execution"
@@ -1107,6 +1131,18 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
+          # (2026-09-22) P-158 TARGET-UNIT SENTRY — scripts/track_performance.py
+          # v6.39.0 (deployed 2026-09-21: [PERF-VERDICT v6.39.0] selftest=PASS 14/14).
+          # observe: criterion-4 row untouched, stored rows never rewritten; adds
+          # the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9 and
+          # ONE [PERF-UNIT v6.39.0] _Run_Log line per run (fraction/percent/
+          # unresolved counts). Explicit words only: off|observe|enforce.
+          # KILL-SWITCH: delete this line -> off (v6.39.0 default = legacy).
+          # Hardcoded here, not a repo Variable (S-1 lesson 2026-09-10: a Variable
+          # can be silently unset). This step runs in GitHub Actions, so a Render
+          # env var would never be seen. Enforce = separate sitting with the S-1
+          # criterion-4 boundary note.
+          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
@@ -1481,11 +1517,42 @@ jobs:
       # single-pass "process-success" behavior byte-identically.
       TFB_AUDIT_REQUIRE_FULL_FETCH: "1"
       TFB_AUDIT_MIN_FRESH_PCT: "95"
-      TFB_INLINE_RECOVERY_MAX_CYCLES: "3"
+      # P-163 (2026-09-23) REPLAY CAP 3 -> 1. Measured on _Status/_Run_Log
+      # 09-15..09-23: the Global_Markets pass takes ~61 min against
+      # TFB_SYNC_TIME_BUDGET_SEC=3600, so the audit marks it incomplete on
+      # every pass and the recovery job replayed the WHOLE page up to 3x
+      # (each replay ~62 min, 9-24k EODHD calls, mostly the same rows).
+      # Run 35817773571 lasted 4h35m (GM x4); the 23:00 legs of 09-20 and
+      # 09-22 exhausted the daily quota inside the replays. One replay keeps
+      # the run under ~2h30m (< the 4h cron interval) and caps the burn.
+      # Rollback: set back to "3".
+      TFB_INLINE_RECOVERY_MAX_CYCLES: "1"
       TFB_SYNC_TIME_BUDGET_SEC: "3600"
       TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       TFB_SYNC_MARKET_GATEWAY: "analysis"
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+      # v6.60.0 P-154 EODHD quota sentinel - same observe arming as the
+      # sync-dashboard job. Recovery retries launch fresh run_dashboard_sync.py
+      # processes (up to TFB_INLINE_RECOVERY_MAX_CYCLES) and are a suspected
+      # burn amplifier, so they are sampled too (each process logs
+      # delta=first-sample; the absolute counter + timestamp give the curve).
+      TFB_SYNC_EODHD_QUOTA: "observe"
+      EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+      # v6.61.0 P-154d quota guard - same observe arming as the sync-dashboard
+      # job: the replay subprocesses inherit this env, so a replay under
+      # exhaustion is disclosed (observe) / skipped (enforce) the same way.
+      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
+      # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
+      # page replay run_inline_page_recovery.py parses the page's last
+      # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
+      # (source-sync-artifacts, then the previous cycle's own log). observe =
+      # annotations "[RECOVERY-QUOTA v1.2.0 observe] <page> (cycle n): would
+      # SKIP/allow ..." + summary.quota_guard[] in inline-recovery-summary.json;
+      # NO replay is skipped. enforce (separate sitting) skips the replay as
+      # skipped:quota on EXHAUSTED/ON_EXTRA, any NEW 402 row, or used% >=
+      # TFB_INLINE_RECOVERY_QUOTA_SKIP_PCT (default 90). Explicit words only;
+      # delete the line (or "off") to restore v1.1.0 behaviour byte-identically.
+      TFB_INLINE_RECOVERY_QUOTA_GUARD: "observe"
 
     steps:
       - name: 📥 Secure Checkout

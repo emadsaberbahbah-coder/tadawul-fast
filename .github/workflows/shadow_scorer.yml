@@ -45,14 +45,17 @@ jobs:
       # "chal fresh" > 0. Rollback: delete this line.
       TFB_COMPLIANCE_SCREEN_RETIRED: "1"
       # v1.8.0 BOARD-FRESH GUARD — ARMING IS A SEPARATE EVIDENCE-RUN STEP.
-      # Step 1 (this commit): cron moved + guard code deployed, gate OFF =>
-      # scorer behavior byte-identical. Step 2 (next sitting): uncomment the
-      # observe line, one nightly read-back = "[S1-BOARD-FRESH ...]" in the
-      # verdict. Step 3 (separate sitting): switch observe -> enforce; a
+      # Step 1 (2026-09-12): cron moved + guard code deployed, gate OFF =>
+      # scorer behavior byte-identical. Step 2 (2026-09-13, THIS commit —
+      # A1 of the arming runbook): observe ARMED below. Observe only LOGS —
+      # scoring behavior stays byte-identical; read-back = "[S1-BOARD-FRESH"
+      # marker in the next run's verdict/log (first eligible run: the next
+      # 15:20 UTC schedule after this commit). Step 3 (separate sitting,
+      # only after a clean observe read-back): switch observe -> enforce; a
       # stale read then re-polls up to TFB_S1_BOARD_WAIT_MIN (default 8) and
       # an unrecovered day records the honest reason `stale-board` instead
-      # of `no-challenger`. Rollback: re-comment the line.
-      # TFB_S1_BOARD_FRESH_GUARD: "observe"
+      # of `no-challenger`. Rollback: re-comment the line below.
+      TFB_S1_BOARD_FRESH_GUARD: "observe"
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is
