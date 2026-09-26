@@ -1837,7 +1837,62 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.61.0"
+SCRIPT_VERSION = "6.62.0"
+# -----------------------------------------------------------------------------
+# v6.62.0 (2026-09-26) - P-162 FETCH-FAILED STAMP TRUTH (fresh_cov + feed token)
+# -----------------------------------------------------------------------------
+# EVIDENCE (run 36199188352, export 2026-09-26 10:14 Riyadh; six-gate audit
+#   + external audit adjudicated the same morning): the 20Z run started
+#   22:59Z (3 h late), its GM leg beat the 3,600 s budget by ~40 s, the
+#   recovery replay ran the WHOLE page from 00:17Z into an EXHAUSTED quota
+#   and wrote 6,302 Global_Markets rows "fetch_failed:HTTP 402" (DQ 55,
+#   BLOCKED) over the clean 23:02-00:03Z rows; 411 Commodities_FX rows the
+#   same. The stamp then read "leg=success written=6609 failed=0 fresh=6444
+#   preserved=165 fresh_cov=97.5% | data=COMPLETE", the per-page feed key
+#   read OK and "TFB Decision Feed" read EXECUTABLE (GM:OK). Mechanism: the
+#   stamp's fresh = pre_persist_rows - klg_kept counts every row the fetch
+#   RETURNED as fresh; a row the engine tagged fetch_failed (it carries a
+#   last-known price, so it is not a data-free stub either) is refresh
+#   FAILURE wearing a fresh stamp. _uv_page_state mirrors the same
+#   arithmetic, so the feed inherited the lie. (Register P-162, 2026-09-22;
+#   561 backend-served stale rows under "100% fresh" was the first specimen.)
+# WHAT. One gate, TFB_SYNC_FETCHFAIL_TRUTH = off | observe | enforce
+#   (explicit words; anything else = off). DEFAULT OFF = byte-identical
+#   stamps, cells and feed tokens apart from the version string.
+#   CENSUS (inside _run_one_task, after the v6.61.0 post-fetch seam, before
+#     the persistence verification, ranked market pages only): one PURE pass
+#     over the OUTGOING matrix, _fetchfail_count_rows, splits rows whose
+#     Warnings carry the engine's fetch_failed tag (any HTTP class /
+#     timeout) into ff_new (stamped since this process started, the
+#     v6.60.0 120 s skew rule; unreadable stamp = new) and ff_carried;
+#     both ride res._stamp_meta.
+#   STAMP + FEED (_status_stamp_row and _uv_page_state, via ONE pure
+#     _fetchfail_truth_apply so the two can never disagree):
+#     observe: values untouched; the stamp message discloses
+#       " fetchfail=<new>/<carried> would_cov=<x>%".
+#     enforce: fresh = max(0, fresh - ff_new); fresh_cov, PARTIAL_FRESH,
+#       the v6.51.0 data verdict, the Status cell and the per-page feed
+#       token (STALE_COV / PARTIAL) all follow from that one number;
+#       the message discloses " fetchfail=<new>/<carried>". On the
+#       2026-09-26 GM leg: fresh 6444 -> 142, fresh_cov 97.5% -> 2.1%,
+#       data=PARTIAL, feed GM:STALE_COV -> NOT_ACTIONABLE(stale_cov:GM).
+#     Nothing is disclosed when both counts are zero (healthy legs keep
+#     their exact v6.61.0 stamp text).
+#   CERTIFICATION: _fetchfail_truth_selftest (pure fixtures incl. the real
+#     GM leg numbers) runs once per process at startup beside the FW/FG
+#     self-tests; a FAIL degrades enforce to observe (FG-3 / DS-03 rule),
+#     never the reverse.
+# SCOPE CUT (stated): keeping a poisoned row from OVERWRITING a clean one
+#   below the v6.61.0 25% refusal threshold is a keep-last-good widening
+#   (a price-carrying fetch_failed row is not a stub under the v6.22.3
+#   doctrine) -> register candidate P-162b after this build's read-back
+#   shows the residual ff_new per leg. data_status stays binary
+#   (COMPLETE/PARTIAL): PARTIAL already means "never false-green" to every
+#   consumer (acceptance G1b, the W2 certificate, the feed).
+# ENV LANE: GitHub Actions (daily_sync.yml): sync-dashboard job env AND the
+#   recovery job env (the replay subprocess inherits it).
+# Kill: unset / off. ZERO functions removed; additions: _fetchfail_truth_mode,
+# _fetchfail_count_rows, _fetchfail_truth_apply, _fetchfail_truth_selftest.
 # -----------------------------------------------------------------------------
 # v6.61.0 (2026-09-24) - P-154d EODHD QUOTA GUARD (leg-level containment)
 # -----------------------------------------------------------------------------
@@ -6965,6 +7020,158 @@ def _rb_tolerance_note(meta: dict, pw_fl: int) -> str:
         return ""
 
 
+# -----------------------------------------------------------------------------
+# v6.62.0 (P-162) - FETCH-FAILED STAMP TRUTH: gate, census, apply, self-test
+# -----------------------------------------------------------------------------
+_FFT_TAG = f"[FETCHFAIL-TRUTH v{SCRIPT_VERSION}]"
+_FFT_SELFTEST_MSG: str = "not-run"
+
+
+def _fetchfail_truth_mode() -> str:
+    """v6.62.0 [P-162] gate TFB_SYNC_FETCHFAIL_TRUTH = off | observe | enforce
+    (explicit words; anything else = off). enforce is certified by the pure
+    self-test: a FAIL degrades enforce to observe (the FG-3 / DS-03
+    convention), never the other way round. Never throws."""
+    try:
+        raw = (os.getenv("TFB_SYNC_FETCHFAIL_TRUTH") or "off").strip().lower()
+        if raw not in ("observe", "enforce"):
+            return "off"
+        if raw == "enforce" and _fetchfail_truth_selftest() != "PASS":
+            return "observe"
+        return raw
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def _fetchfail_count_rows(headers: Any, rows_matrix: Any,
+                          t0_epoch: float) -> Dict[str, int]:
+    """PURE. Rows of the OUTGOING matrix whose Warnings carry the engine's
+    fetch_failed tag (any HTTP class / timeout; _FG_FETCHFAIL_RE), split by
+    stamp age exactly like _eodhd_quota_count_rows: ff_new = stamped since
+    this process started (120 s skew allowance; an unreadable stamp counts
+    as new - fail loud), ff_carried = an older stamp (a preserved row still
+    carrying the tag). Never throws; no Warnings column -> zeros."""
+    out = {"ff_new": 0, "ff_carried": 0}
+    try:
+        hdr = [str(h or "").strip().lower() for h in (headers or [])]
+        if "warnings" not in hdr:
+            return out
+        wi = hdr.index("warnings")
+        ui = hdr.index("last updated (utc)") if "last updated (utc)" in hdr else -1
+        for row in (rows_matrix or []):
+            try:
+                w = str(row[wi]) if len(row) > wi and row[wi] is not None else ""
+            except Exception:
+                continue
+            if not _FG_FETCHFAIL_RE.search(w):
+                continue
+            is_new = True
+            try:
+                rawts = str(row[ui]).strip() if (ui >= 0 and len(row) > ui) else ""
+                if rawts:
+                    dt = datetime.fromisoformat(rawts.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    is_new = dt.timestamp() >= (float(t0_epoch) - 120.0)
+            except Exception:
+                is_new = True
+            out["ff_new" if is_new else "ff_carried"] += 1
+        return out
+    except Exception:
+        return out
+
+
+def _fetchfail_truth_apply(fresh, requested: int, meta: dict,
+                           mode: Optional[str] = None) -> Tuple[Any, Any, str]:
+    """PURE -> (fresh_out, cov_out, note). The ONE arithmetic the stamp
+    message, the Status cell, the data verdict and the per-page feed token
+    all consume (v6.51.0 single-source rule extended).
+      off      -> unchanged values, empty note.
+      observe  -> unchanged values; note " fetchfail=<new>/<carried>
+                  would_cov=<x>%" (what enforce would publish).
+      enforce  -> fresh = max(0, fresh - ff_new); cov recomputed; note
+                  " fetchfail=<new>/<carried>".
+    Both counts zero -> unchanged values and an empty note in every mode
+    (a healthy leg keeps its exact v6.61.0 stamp text). Never throws."""
+    try:
+        m = str(mode or _fetchfail_truth_mode())
+        ff_new = int((meta or {}).get("ff_new") or 0)
+        ff_car = int((meta or {}).get("ff_carried") or 0)
+        req = int(requested or 0)
+        cov_in = (round(100.0 * fresh / req, 1)
+                  if (fresh is not None and req > 0) else None)
+        if m == "off" or (ff_new == 0 and ff_car == 0):
+            return fresh, cov_in, ""
+        note = f" fetchfail={ff_new}/{ff_car}"
+        if fresh is None:
+            return fresh, cov_in, note
+        fresh_adj = max(0, int(fresh) - ff_new)
+        cov_adj = round(100.0 * fresh_adj / req, 1) if req > 0 else None
+        if m == "enforce":
+            return fresh_adj, cov_adj, note
+        return fresh, cov_in, note + (f" would_cov={cov_adj}%"
+                                      if cov_adj is not None else "")
+    except Exception:  # noqa: BLE001
+        try:
+            cov_in = (round(100.0 * fresh / int(requested), 1)
+                      if (fresh is not None and int(requested or 0) > 0) else None)
+        except Exception:  # noqa: BLE001
+            cov_in = None
+        return fresh, cov_in, ""
+
+
+def _fetchfail_truth_selftest() -> str:
+    """v6.62.0 [P-162]: pure fixtures, once per process (the FW-3 shape); the
+    verdict certifies enforce (see _fetchfail_truth_mode). Fixture 3 is the
+    real 2026-09-26 Global_Markets leg (6,609 requested, 6,444 fresh, 6,302
+    fresh 402 rows)."""
+    global _FFT_SELFTEST_MSG
+    if _FFT_SELFTEST_MSG != "not-run":
+        return _FFT_SELFTEST_MSG
+    passed, total = 0, 5
+    try:
+        hdr = ["Symbol", "Warnings", "Last Updated (UTC)"]
+        t0 = datetime(2026, 9, 26, 0, 17, tzinfo=timezone.utc).timestamp()
+        mat = [["A.US", "fetch_failed:HTTP 402; dq_capped:coherence:fetch_failed",
+                "2026-09-26T00:40:00+00:00"],
+               ["B.MI", "fetch_failed:HTTP 404 not_found; empty_row_no_provider_data",
+                "2026-09-26T01:10:00+00:00"],
+               ["C.US", "FETCH_FAILED:timeout", ""],
+               ["D.US", "yahoo_enrichment_applied; fetchfail_blocked_applied:v1.4.1",
+                "2026-09-26T00:50:00+00:00"],
+               ["E.US", "fetch_failed:HTTP 402", "2026-09-25T13:05:00+00:00"],
+               ["F.US"]]
+        if _fetchfail_count_rows(hdr, mat, t0) == {"ff_new": 3, "ff_carried": 1}:
+            passed += 1
+        if (_fetchfail_count_rows(["Symbol"], mat, t0) == {"ff_new": 0, "ff_carried": 0}
+                and _fetchfail_count_rows(None, None, t0) == {"ff_new": 0, "ff_carried": 0}):
+            passed += 1
+        meta = {"ff_new": 6302, "ff_carried": 0}
+        r_off = _fetchfail_truth_apply(6444, 6609, meta, "off")
+        r_obs = _fetchfail_truth_apply(6444, 6609, meta, "observe")
+        r_enf = _fetchfail_truth_apply(6444, 6609, meta, "enforce")
+        if (r_off == (6444, 97.5, "")
+                and r_obs == (6444, 97.5, " fetchfail=6302/0 would_cov=2.1%")
+                and r_enf == (142, 2.1, " fetchfail=6302/0")):
+            passed += 1
+        z = {"ff_new": 0, "ff_carried": 0}
+        if (_fetchfail_truth_apply(255, 255, z, "enforce") == (255, 100.0, "")
+                and _fetchfail_truth_apply(255, 255, z, "observe") == (255, 100.0, "")
+                and _fetchfail_truth_apply(None, 453, meta, "enforce") == (None, None, " fetchfail=6302/0")):
+            passed += 1
+        # carried-only rows never move the number (they were never fresh)
+        if (_fetchfail_truth_apply(100, 100, {"ff_new": 0, "ff_carried": 7}, "enforce")
+                == (100, 100.0, " fetchfail=0/7")
+                and _fetchfail_truth_apply(10, 100, {"ff_new": 25, "ff_carried": 0}, "enforce")
+                == (0, 0.0, " fetchfail=25/0")):
+            passed += 1
+    except Exception as e:  # noqa: BLE001
+        _FFT_SELFTEST_MSG = "FAIL(%s)" % type(e).__name__
+        return _FFT_SELFTEST_MSG
+    _FFT_SELFTEST_MSG = "PASS" if passed == total else "FAIL %d/%d" % (passed, total)
+    return _FFT_SELFTEST_MSG
+
+
 def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
                          meta: dict) -> str:
     """v6.51.0: THE cohort verdict, factored verbatim from _status_stamp_row
@@ -7061,6 +7268,10 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     fresh = max(0, int(pre_rows) - klg) if isinstance(pre_rows, int) else None
     cov = (round(100.0 * fresh / requested, 1)
            if (fresh is not None and requested > 0) else None)
+    # v6.62.0 [P-162]: fetch-failed rows the engine returned are refresh
+    # FAILURE, not fresh data. One pure step decides the number every
+    # downstream consumer reads (off = the two lines above, byte-identical).
+    fresh, cov, ff_note = _fetchfail_truth_apply(fresh, requested, meta)
     fresh_min = 95.0
     try:
         fresh_min = float((os.getenv("TFB_SYNC_STATUS_FRESH_MIN") or "95").strip())
@@ -7089,6 +7300,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" fresh={fresh}" if fresh is not None else "")
            + (f" preserved={preserved}" if preserved else "")
            + (f" stubbed={stubbed}" if stubbed else "")
+           + ff_note                                   # v6.62.0 [P-162]
            + (f" fresh_cov={cov}%" if cov is not None else "")
            + (f" warnings={len(warns)}" if warns else "")
            + (f" error={err[:120]}" if err else "")
@@ -7755,6 +7967,10 @@ def _uv_page_state(res: Any) -> tuple:
     cov = None
     if isinstance(pre, int) and requested > 0:
         cov = round(100.0 * max(0, pre - klg) / requested, 1)
+        # v6.62.0 [P-162]: the feed token consumes the SAME fetch-failed
+        # correction as the stamp (enforce only; observe/off = unchanged).
+        if _fetchfail_truth_mode() == "enforce":
+            cov = _fetchfail_truth_apply(max(0, pre - klg), requested, meta)[1]
     if status == "success":
         fmin = 95.0
         try:
@@ -11071,6 +11287,18 @@ async def _run_one_task(
                     return res
         # ----------------------------------------------------------------------
 
+        # --- v6.62.0 P-162: fetch-failed census of the OUTGOING matrix --------
+        # PURE count only; the stamp / feed token apply the gate's arithmetic.
+        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
+                and _fetchfail_truth_mode() != "off"):
+            try:
+                _ffc = _fetchfail_count_rows(headers, rows_matrix, _EQ_STATE["t0"])
+                res._stamp_meta["ff_new"] = int(_ffc.get("ff_new") or 0)
+                res._stamp_meta["ff_carried"] = int(_ffc.get("ff_carried") or 0)
+            except Exception:
+                pass
+        # ----------------------------------------------------------------------
+
         # --- Persistence outcome verification (v6.22.2 L4b) ------------------
         # _persist_missing_symbol_rows is FAIL-SAFE: its own read_values
         # failure (or an unlocatable header) returns the SHRUNKEN matrix
@@ -11556,6 +11784,11 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     sheets = SheetsWriter()
     _idfw_selftest_()  # v6.24.1 ST-1: verify guards on fixtures before any page
     _ohlc_fillguard_selftest_()  # v6.44.0 FG-3: prove the fill guard pre-write
+    try:  # v6.62.0 P-162: certify the stamp-truth arithmetic pre-write
+        logger.info("%s selftest=%s mode=%s", _FFT_TAG,
+                    _fetchfail_truth_selftest(), _fetchfail_truth_mode())
+    except Exception:
+        pass
 
     # --- v6.32.0 MANUAL-HOLD startup gate --------------------------------
     if _manual_hold_gate_enabled() and not bool(args.dry_run):
