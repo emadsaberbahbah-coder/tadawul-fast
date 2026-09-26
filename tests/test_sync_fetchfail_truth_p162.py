@@ -109,7 +109,8 @@ def test_t1_vocabulary():
     finally:
         mod._FFT_SELFTEST_MSG = saved
         _setmode(mod, None)
-    assert mod.SCRIPT_VERSION == "6.62.0"
+    # v6.63.0: version pin loosened to a floor (the 09-22 practice) so later builds carry this battery.
+    assert tuple(int(x) for x in mod.SCRIPT_VERSION.split(".")) >= (6, 62, 0), mod.SCRIPT_VERSION
 
 
 # T2 - census on the REAL export ----------------------------------------------------
