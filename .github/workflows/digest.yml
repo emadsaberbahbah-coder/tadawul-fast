@@ -109,7 +109,7 @@ jobs:
       # deliberately left as-is: bumping them mid-window is churn with breakage
       # risk and no safety gain. Registered for post-window alignment.
       - name: 📥 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
