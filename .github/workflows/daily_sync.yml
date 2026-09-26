@@ -21,7 +21,9 @@ on:
   # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
   # or the 25-min job cap being too short for a full sweep); check the Actions tab.
   schedule:
-    - cron: "0 4,12,20 * * *"   # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
+    - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
+                                 # P-170 (2026-09-26): minute 00 is GitHub's most-delayed schedule minute -
+                                 # the 20Z slot fired 22:59Z and the 04Z slot 09:00Z; :17 keeps the slots off the hour.
 
   # ✅ Manual run
   workflow_dispatch:
@@ -304,7 +306,19 @@ jobs:
       # the leg before any provider call, or refuses a poisoned write, preserving
       # last-good rows (status=skipped, exit code unchanged). Explicit words only;
       # delete the line (or "off") to restore v6.60.0 behaviour byte-identically.
-      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
+      # ENFORCE 2026-09-26 (P-154d): run 36199188352 - the 00:17Z recovery replay
+      # ran into the EXHAUSTED counter under observe and wrote 6,302 Global_Markets
+      # + 411 Commodities_FX rows fetch_failed:HTTP 402 over clean rows; run
+      # 36231358321 then poisoned Mutual_Funds (2,472 rows) the same way while the
+      # observe line said "would write REFUSED". Rollback: "observe".
+      TFB_SYNC_EODHD_QUOTA_GUARD: "enforce"
+      # v6.62.0 P-162 FETCH-FAILED STAMP TRUTH - OBSERVE (2026-09-26): every
+      # ranked-page [STATUS-STAMP] discloses " fetchfail=<new>/<carried>
+      # would_cov=x%" (values untouched). enforce (separate sitting) makes
+      # fresh_cov, the Status cell and the per-page feed token exclude the
+      # fetch-failed rows. Explicit words only; delete the line (or "off") for
+      # v6.61.0 stamp text verbatim.
+      TFB_SYNC_FETCHFAIL_TRUTH: "observe"
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -540,7 +554,12 @@ jobs:
       # GM leg (~3,652 symbols = 147 batches) either finishes whole inside the
       # ceiling or lands ~79% fresh + the rest preserved at minute 60.
       # KILL-SWITCH: remove this line (or "0") for v6.22.3 behavior verbatim.
-      TFB_SYNC_TIME_BUDGET_SEC: "3600"
+      # 3600 -> 5400 (P-163, 2026-09-26): the Global_Markets leg is 6,609 symbols
+      # and measures 60.6-61.1 min; at 3600 every pass lands 89-97% fresh at
+      # minute 60 and the audit replays the WHOLE page (53-60k EODHD calls; the
+      # 2026-09-26 replay is what wrote the poisoned page). 5400 covers the
+      # measured leg with margin under timeout-minutes 115. Rollback: "3600".
+      TFB_SYNC_TIME_BUDGET_SEC: "5400"
       # Per-page symbol cap for the four MARKET pages (scripts/
       # run_dashboard_sync.py _market_symbol_cap).
       # WHY (2026-07-07 forensics): the script default is 2500. A cap SMALLER
@@ -1527,7 +1546,9 @@ jobs:
       # the run under ~2h30m (< the 4h cron interval) and caps the burn.
       # Rollback: set back to "3".
       TFB_INLINE_RECOVERY_MAX_CYCLES: "1"
-      TFB_SYNC_TIME_BUDGET_SEC: "3600"
+      # 3600 -> 5400 (P-163, 2026-09-26): same ceiling as the sync-dashboard job so
+      # a replay subprocess is never cut shorter than the leg it repairs.
+      TFB_SYNC_TIME_BUDGET_SEC: "5400"
       TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       TFB_SYNC_MARKET_GATEWAY: "analysis"
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
@@ -1541,7 +1562,12 @@ jobs:
       # v6.61.0 P-154d quota guard - same observe arming as the sync-dashboard
       # job: the replay subprocesses inherit this env, so a replay under
       # exhaustion is disclosed (observe) / skipped (enforce) the same way.
-      TFB_SYNC_EODHD_QUOTA_GUARD: "observe"
+      # ENFORCE 2026-09-26 (P-154d) - same flip as the sync-dashboard job; the
+      # 00:17Z replay of run 36199188352 is the specimen. Rollback: "observe".
+      TFB_SYNC_EODHD_QUOTA_GUARD: "enforce"
+      # v6.62.0 P-162 stamp truth - same observe arming as the sync-dashboard job
+      # (the replay subprocess stamps pages too).
+      TFB_SYNC_FETCHFAIL_TRUTH: "observe"
       # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
       # page replay run_inline_page_recovery.py parses the page's last
       # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
