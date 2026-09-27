@@ -1217,7 +1217,39 @@ from datetime import datetime, timedelta, timezone
 # _cash_floor_pct_ctx, _cash_floor_finalize, _cash_floor_alert_text).
 # Removed: 0. Rollback: env unset (no deploy) or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.22.0"
+# -----------------------------------------------------------------------------
+# v1.22.1 [B4d REL-CLUSTER TAG BASIS] — the fingerprint moved; the gate did
+# not (audit of the 2026-09-27 evening export, cockpit req 244024d0722e;
+# owner Claude; arming = Emad's separate ENV act — S-1 window law unchanged).
+# WHY: the v1.10.3 Reliability Cluster gate recognises the default-confidence
+# fingerprint by VALUE (70.4 / 71.5 / 75.4 / 76.5 = 0.7 x {64.82, 66.41} +
+# 0.3 x 100, with / without the -5 soft-cap penalty). On 2026-09-27 the
+# dominant default is 63.23 (2,297 Global_Markets rows to the digit; 3,504
+# rows tagged confidence_default_suspected) => reliability 74.3 / 69.3 /
+# 54.3 — outside the shipped set. In the top-500 audit six values cover 495
+# of 501 rows; all three seats (ITRN 71.5, ADAM 71.5, GOOGL 76.5) carry the
+# tag. A value list chases arithmetic; the source row already states the
+# provenance in its Warnings column (the TRUST-001 lineage precedent).
+# WHAT: TFB_T10_REL_CLUSTER_BASIS (read at gate time, no restart):
+#   values  — unset/default: v1.22.0 byte-identical (value set, env csv).
+#   tag     — the gate fails when the row's Warnings carry a default-
+#             confidence token (TFB_T10_CONF_DEFAULT_TOKENS, default
+#             confidence_default_suspected; matched on ';'-split tag HEADS,
+#             never as a substring of the blob); the value is not consulted.
+#   both    — either witness fails the gate (the recommended arming).
+#   The gate itself stays behind TFB_T10_EXCLUDE_REL_CLUSTER (DEFAULT OFF):
+#   unarmed, gate list / verdicts / tickets are byte-identical in every basis.
+# Current text discloses the witness ("71.5 [confidence_default_suspected]");
+# the required text names the basis so NEAR MISS / DATA GAPS read truthfully.
+# Deliberate cuts: no new gate name (GATE_ORDER untouched); the default value
+# tuple is NOT extended (values basis stays the operator-confirmed set; 74.3 /
+# 69.3 can be added via TFB_T10_REL_CLUSTER_VALUES without code); the
+# portfolio_actions ADD path (DDI 70.4 pending) is that file's own build.
+# Functions added: 4 (_env_rel_cluster_basis, _env_conf_default_tokens,
+# _conf_default_tag_hit, _rel_cluster_required_text). Removed: 0.
+# Rollback: env unset (no deploy) or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.22.1"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1946,20 +1978,99 @@ def _rel_cluster_values_text():
     return "{" + ", ".join(sorted(_env_rel_cluster_values())) + "}"
 
 
+_DEFAULT_CONF_DEFAULT_TOKENS = ("confidence_default_suspected",)
+
+
+def _env_rel_cluster_basis():
+    """v1.22.1 [B4d]: how the Reliability Cluster gate recognises the
+    default-confidence fingerprint — read at gate time, no restart.
+      values  (default) rounded reliability equals a cluster member
+                        (v1.10.3 behaviour, byte-identical);
+      tag               the source row's Warnings carry a default-
+                        confidence provenance token;
+      both              either witness fails the gate.
+    Anything else => values."""
+    v = str(_env_str("TFB_T10_REL_CLUSTER_BASIS", "values") or "values")
+    v = v.strip().lower()
+    return v if v in ("values", "tag", "both") else "values"
+
+
+def _env_conf_default_tokens():
+    """v1.22.1: the Warnings tag heads that witness a defaulted forecast
+    confidence, as a normalized frozenset. Operator-tunable via
+    TFB_T10_CONF_DEFAULT_TOKENS (csv; ';' accepted as ','); empty / blank /
+    fully-unparseable env => the default set."""
+    raw = str(_env_str("TFB_T10_CONF_DEFAULT_TOKENS", "") or "")
+    raw = raw.replace(";", ",")
+    toks = [_norm_token(t) for t in raw.split(",") if str(t).strip()]
+    toks = [t for t in toks if t]
+    if not toks:
+        toks = [_norm_token(t) for t in _DEFAULT_CONF_DEFAULT_TOKENS]
+    return frozenset(toks)
+
+
+def _conf_default_tag_hit(cand):
+    """v1.22.1: the matched default-confidence tag head (raw text) when the
+    candidate's Warnings carry one, else None. Matching is on the
+    ';'-split tag HEADS (text before the first ':'), normalized — never a
+    bare substring of the whole Warnings blob (substring-safety rule)."""
+    w = _to_text((cand or {}).get("warnings")) or ""
+    if not w:
+        return None
+    toks = _env_conf_default_tokens()
+    for part in str(w).split(";"):
+        head_raw = part.split(":", 1)[0].strip()
+        head = _norm_token(head_raw)
+        if head and head in toks:
+            return head_raw
+    return None
+
+
+def _rel_cluster_required_text():
+    """v1.22.1: the Reliability Cluster gate's required-text per basis.
+    basis=values returns the v1.10.3 string byte-for-byte."""
+    basis = _env_rel_cluster_basis()
+    base = ("reliability off the default-confidence cluster "
+            + _rel_cluster_values_text() + " (blank/Unknown passes)")
+    if basis == "tag":
+        return ("no default-confidence source tag in Warnings "
+                "(tag basis; blank passes)")
+    if basis == "both":
+        return (base + " AND no default-confidence source tag in Warnings"
+                " (both basis)")
+    return base
+
+
 def _rel_cluster_assessment(cand):
     """v1.10.3: (ok, current_text) for the Reliability Cluster gate.
     ok=False only when the candidate's reliability, rounded to one
     decimal, equals a member of the cluster set. None / unparseable
     reliability PASSES this gate — fail-open by design (header WHY): the
     tiered Reliability gate below owns the missing-value verdict; this
-    gate exists solely to catch the default-confidence fingerprint."""
+    gate exists solely to catch the default-confidence fingerprint.
+    v1.22.1 [B4d]: under TFB_T10_REL_CLUSTER_BASIS=tag|both the source
+    row's own provenance witness (a default-confidence Warnings tag) also
+    fails the gate — arithmetic-independent, so a new default value
+    (63.23 => 74.3 / 69.3) needs no cluster update. basis=values (the
+    default) is byte-identical to v1.10.3, including the None path."""
+    basis = _env_rel_cluster_basis()
     rel = (cand or {}).get("reliability")
     try:
         rel_f = float(rel)
+        cur = "%.1f" % rel_f
     except (TypeError, ValueError):
-        return True, "Unknown"
-    cur = "%.1f" % rel_f
-    return (cur not in _env_rel_cluster_values()), cur
+        rel_f = None
+        cur = "Unknown"
+    if basis == "values":
+        if rel_f is None:
+            return True, "Unknown"
+        return (cur not in _env_rel_cluster_values()), cur
+    value_hit = (basis == "both" and rel_f is not None
+                 and cur in _env_rel_cluster_values())
+    tag_head = _conf_default_tag_hit(cand)
+    if tag_head:
+        cur = cur + " [" + tag_head + "]"
+    return (not (value_hit or tag_head)), cur
 
 
 _DEFAULT_VENUE_LOTS = {"T": 100, "SI": 100, "KL": 100}
@@ -3946,8 +4057,7 @@ def evaluate_gates(cand, criteria, held_symbols=None):
         _rc_ok, _rc_cur = _rel_cluster_assessment(cand)
         g.append(_gate(
             "Reliability Cluster", _rc_ok, FAIL_MAJOR, _rc_cur,
-            "reliability off the default-confidence cluster "
-            + _rel_cluster_values_text() + " (blank/Unknown passes)"))
+            _rel_cluster_required_text()))   # v1.22.1: per-basis text
 
     # v1.12.0 [B4c FORECAST CAP-BAND GATE]: the manufactured-target
     # fingerprint (12M target ≈ price × ~1.35, minted by degraded
