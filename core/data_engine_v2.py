@@ -3818,7 +3818,57 @@ if str(ROOT_DIR) not in sys.path:
 # counters per worker). Zero removals; twelve helpers, nine constants added.
 # Rollback: git revert, or unset the env (= off).
 # -----------------------------------------------------------------------------
-__version__ = "5.150.0"
+# WHY v5.151.0 (P-152 / P-146b MARGIN PUBLISH CONTRACT at the publish boundary;
+# new env TFB_MARGIN_PUBLISH off|observe|enforce, DEFAULT OFF = v5.150.0
+# byte-identical on every row; explicit words only):
+# EVIDENCE (2026-09-27/28 exports, both audits): the three margin columns
+# leave the engine in THREE units at once. Gross Margin on Global_Markets
+# 2026-09-28: 2,401 rows stored as FRACTIONS (yahoo path, e.g. DDI 0.7336),
+# 3,760 as PERCENT POINTS (EODHD path after the v5.140.0 sentry, FISV
+# 47.2156), 4 above 150 (financial-sector artefacts); Profit Margin carries
+# the v5.143.0 REPAIR output in points (DDI 32.908) beside yahoo fractions on
+# the same page, and Market_Leaders holds gross/operating as fractions
+# (254/254) next to profit in points (152/240). The sheet renders every
+# margin cell under a percent NUMBER FORMAT (the operator's 09:25 Reformat
+# extended it to all 6,165 GM cells), so a points value displays x100:
+# 3,579 GM gross cells > 100 % and 156/255 ML profit cells (Al Rajhi
+# 6,795 %, DDI 3,290.80 %, YUM 2,540.70 %). Scoring is NOT the victim
+# (compute_quality_score reads margins through scoring._as_fraction and the
+# engine's _as_pct_points, both unit-agnostic below 1.5) - the defect is the
+# PUBLISHED value contract: one column, three units, one format.
+# ADJUDICATED CONTRACT (the 2026-09-16 rule for expected_roi_*, extended):
+# every percent-formatted sheet column stores a FRACTION. The engine keeps
+# its internal percent-points contract for margins; the publish boundary
+# emits the fraction.
+# FIX: _margin_publish_contract(row) runs at all three publish boundaries
+# (_strict_project_row, get_page_rows, the direct Top_10 path) immediately
+# AFTER _apply_investability_gate (the gate reads presence, never magnitude,
+# so the pass is decision-neutral by construction). Per field
+# (gross_margin, operating_margin, profit_margin):
+#   * a POINTS WITNESS on the row settles the unit: a suffix-less
+#     fund_unit_contract:eodhd:<field> tag (the sentry converted it) or a
+#     fund_coherence_repaired:<field>:* tag (the repair wrote points)
+#     -> kind pts (or pts_thin when |v| <= 1.5) -> v / 100;
+#   * else |v| <= 1.5 -> kind frac (kept as-is; frac_amb when the row's only
+#     fundamentals provenance is the EODHD fallback - the residual
+#     ambiguity class, disclosed, never scaled);
+#   * else |v| <= 150 -> kind pts -> v / 100;
+#   * else kind oob -> v / 100 as points, tagged (NEVER / 10,000: no ground
+#     truth exists for a x100-points reading; the AS-1 / F01-inverse rule).
+# observe => one countable tag per field, margin_publish:<field>:<kind>:
+# observe, values byte-identical. enforce => the conversion above plus the
+# suffix-less tag, which is also the idempotence marker (a second boundary
+# pass skips the field; an observe-tagged row is still converted once when
+# the gate flips to enforce). Never raises; off => no read, no tag.
+# NOT changed: scoring, the sentry, the repair, the fund LKG / cache, every
+# other column, the API percent-points contract inside the engine. The
+# engine-side yahoo margin leg (make the ENGINE row single-unit at the
+# sentry seam) is P-146b vNEXT - this build fixes what the sheet shows.
+# Mode disclosed in the [GUARDS] boot line (margin_publish=) and in /health
+# engine_gates.margin_publish. Zero removals; four helpers, six constants
+# added. Rollback: git revert, or unset the env (= off).
+# -----------------------------------------------------------------------------
+__version__ = "5.151.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5553,6 +5603,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
             "fund_cache_stats": _fund_cache_stats(),                   # v5.150.0 (P-154c)
+            "margin_publish": _margin_publish_mode(),                  # v5.151.0 (P-152)
         }
     except Exception:
         return {}
@@ -6763,6 +6814,92 @@ _FCT_LEGS: Tuple[Tuple[str, str, str], ...] = (
     ("1m", "forecast_price_1m", "expected_roi_1m"),
 )
 _FCT_FRACTION_DOMAIN_MAX: float = 1.5   # |roi| above this is percent points: never scaled here
+
+
+# =============================================================================
+# v5.151.0 (P-152 / P-146b) -- MARGIN PUBLISH CONTRACT (see the WHY block)
+# =============================================================================
+_MPC_ENV: str = "TFB_MARGIN_PUBLISH"
+_MPC_TAG: str = "margin_publish"            # substring-safe for the investability gate
+_MPC_FIELDS: Tuple[str, ...] = ("gross_margin", "operating_margin", "profit_margin")
+_MPC_FRACTION_BOUND: float = 1.5            # |v| <= bound with no points witness -> fraction, kept
+_MPC_OOB_BOUND: float = 150.0               # points above this are tagged oob (still / 100, never / 10,000)
+_MPC_POINTS_WITNESS_PREFIXES: Tuple[str, ...] = (
+    "fund_unit_contract:eodhd:",            # v5.140.0 sentry converted this key to points (enforce, no :observe)
+    "fund_coherence_repaired:",             # v5.143.0 repair wrote points (x100 / d100)
+)
+_MPC_EODHD_PROVENANCE_TAG: str = "eodhd_fundamentals_fallback_applied"
+_MPC_YAHOO_PROVENANCE_TAG: str = "yahoo_enrichment_applied"
+
+
+def _margin_publish_mode() -> str:
+    """TFB_MARGIN_PUBLISH: off (default) | observe | enforce. Explicit words
+    only -- "1"/"true"/"on" read as off. Read at call time (no restart; the
+    read-back is the margin_publish:* tags in the next export)."""
+    raw = (os.getenv(_MPC_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _mpc_warning_parts(row: Dict[str, Any]) -> List[str]:
+    raw = row.get("warnings")
+    if isinstance(raw, str):
+        return [p.strip() for p in raw.split(";") if p.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [_safe_str(p).strip() for p in raw if _safe_str(p).strip()]
+    return []
+
+
+def _mpc_points_witness(parts: List[str], field: str) -> bool:
+    """True when the row itself proves <field> is in PERCENT POINTS: the
+    v5.140.0 sentry converted it (suffix-less enforce tag) or the v5.143.0
+    repair wrote it. An :observe-suffixed sentry tag is NOT a witness (the
+    value was not changed)."""
+    for p in parts:
+        for pref in _MPC_POINTS_WITNESS_PREFIXES:
+            if p.startswith(pref + field) and not p.endswith(":observe"):
+                return True
+    return False
+
+
+def _margin_publish_contract(row: Dict[str, Any]) -> int:
+    """v5.151.0 (P-152): publish the three margin fields under ONE sheet
+    contract (FRACTION under the percent number format) at the publish
+    boundary. Returns the number of fields tagged (observe) or converted
+    (enforce). Never raises; off -> 0 and the row is untouched."""
+    mode = _margin_publish_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    n = 0
+    try:
+        parts = _mpc_warning_parts(row)
+        eodhd_only = (any(p.startswith(_MPC_EODHD_PROVENANCE_TAG) for p in parts)
+                      and not any(p.startswith(_MPC_YAHOO_PROVENANCE_TAG) for p in parts))
+        for field in _MPC_FIELDS:
+            marker = "%s:%s:" % (_MPC_TAG, field)
+            if any(p.startswith(marker) and not p.endswith(":observe") for p in parts):
+                continue                      # already published under the contract (idempotent)
+            v = _as_float(row.get(field))
+            if v is None:
+                continue
+            av = abs(v)
+            if _mpc_points_witness(parts, field):
+                kind = "pts_thin" if av <= _MPC_FRACTION_BOUND else "pts"
+            elif av <= _MPC_FRACTION_BOUND:
+                kind = "frac_amb" if eodhd_only else "frac"
+            elif av <= _MPC_OOB_BOUND:
+                kind = "pts"
+            else:
+                kind = "oob"
+            if mode == "enforce":
+                if kind in ("pts", "pts_thin", "oob"):
+                    row[field] = round(v / 100.0, 6)
+                _v573_append_warning(row, "%s%s" % (marker, kind))
+            else:
+                _v573_append_warning(row, "%s%s:observe" % (marker, kind))
+            n += 1
+    except Exception:
+        return n
+    return n
 
 
 def _fc_tuple_mode() -> str:
@@ -14921,6 +15058,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _reconcile_recommendation_family(row)
     _fc_tuple_coherence(row)  # v5.148.0 (P-102): coherent (fp, cp, roi) triple BEFORE the gate reads it
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
+    _margin_publish_contract(row)  # v5.151.0 (P-152): one sheet unit for the three margins, AFTER the gate
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     return {k: _json_safe(row.get(k)) for k in keys}
@@ -16188,7 +16326,7 @@ class DataEngineV5:
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
-                "w52_ceiling=%s fund_cache=%s",
+                "w52_ceiling=%s fund_cache=%s margin_publish=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -16207,6 +16345,7 @@ class DataEngineV5:
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
+                _margin_publish_mode(),     # v5.151.0 (P-152): publish contract provable at boot
             )
         except Exception:
             pass
@@ -18036,6 +18175,7 @@ class DataEngineV5:
             _reconcile_recommendation_family(_r)
             _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
+            _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
         # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
@@ -18143,6 +18283,7 @@ class DataEngineV5:
                     _reconcile_recommendation_family(_r)
                     _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
                     _apply_investability_gate(_r)
+                    _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
                     _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
                 # v5.77.23 (Fix J): same Top 10 eligibility filter as the
                 # fallback path (missing price / sell-family excluded).
