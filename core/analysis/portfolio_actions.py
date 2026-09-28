@@ -776,7 +776,59 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
 # _apply_f1_observe_tag). Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.12.2"
+PORTFOLIO_ACTIONS_VERSION = "1.13.0"
+# v1.13.0 (2026-09-28) - [P-168b SESSION-KEYED ADD CONFIRMATION] A
+# CONFIRMATION DAY IS A COMPLETED TRADING SESSION, NOT A CALENDAR DATE
+# WHY: _apply_add_confirmation keys its "distinct consecutive days" on the
+# UTC calendar date (_add_confirm_today). The portfolio page refreshes
+# every 4 h, seven days a week, so a signal that qualifies on Friday's
+# close is counted once on Sunday and again on Monday BEFORE the US open -
+# "ADD confirmed (day 2/2)" earned on zero new sessions. Live specimen
+# 2026-09-27/28: DDI.US day 1/2 (Sun 09-27) -> confirmed 2/2 (Mon 09-28
+# 03:40Z) with the price 13.00 unchanged since the 09-23 close; the
+# external morning audit of 2026-09-28 read the same rows. The v1.6.0
+# strict-consecutiveness fix (persistence) made the calendar clock durable
+# but did not change what a "day" is. Same class as P-144/P-168 on the
+# cockpit side (day-key vs epoch), now the ADD-counter half.
+# FIX (behind ONE gate, default OFF = v1.12.2 byte-identical):
+#   TFB_PF_CONFIRM_SESSION = off | observe | enforce (read at call time,
+#   no restart; same seam pattern as TFB_FORECAST_BASIS / TFB_PF_DD_EXIT).
+#   * The clock becomes (last COMPLETED session of the holding's venue,
+#     the session before it): US/AMER/EU/ASIA Mon-Fri, KSA/GULF Sun-Thu,
+#     each with a conservative UTC close and a fixed-date holiday set
+#     (NYSE 2026, Tadawul fixed dates); TFB_PF_SESSION_HOLIDAYS (csv
+#     YYYY-MM-DD, all venues) adds Eid / ad-hoc closures. A missing
+#     holiday fails OPEN to counting that date (the legacy direction).
+#   * observe : the legacy verdict stands; a SHADOW chain keyed on
+#     sessions (memory + the same Redis prefix under the "~S~" namespace,
+#     same TTL) is advanced in parallel and ONE countable tag per raw-ADD
+#     row is appended at the caller seam:
+#     "[confirm-session-observe] venue=US session=2026-09-25 legacy 2/2 vs
+#      session 1/2 - FLIP; legacy clock kept" (" - FLIP" strictly marks a
+#     confirmed/pending disagreement). Non-ADD raw verdicts clear the
+#     shadow chain and print nothing.
+#   * enforce : _apply_add_confirmation uses the session pair in place of
+#     (today, yesterday) in the SAME store / Redis keys (a later flip back
+#     to off finds a session date <= today and restarts conservatively);
+#     the rendered reason gains "; session YYYY-MM-DD" inside the day
+#     counter so the basis is visible on the page. Same-session reruns
+#     stay frozen; a skipped session restarts the chain (the contract).
+#   * A calendar fault under enforce falls back to the legacy UTC pair for
+#     that call (one WARNING); the P-165 fail-closed contract on the
+#     store/Redis path is untouched (T1/T2 of its battery still hold).
+#   * meta.confirm_session {mode, shadow_symbols, venues} is emitted ONLY
+#     when the gate is armed, so the off payload is byte-identical.
+# NOT changed: decide_action, the funding pass, D-9/RULE-1b sukuk rules,
+# F-1a/F-2 seams, the legacy "+1 after any gap" branch under
+# TFB_PF_CONFIRM_PERSIST=0. P-153 (sukuk equity-ladder display) and the
+# P-169 thesis-exit rule are deliberate scope cuts (next v1.13.x, the
+# latter after the backtest dispatch).
+# GATE: TFB_PF_CONFIRM_SESSION (default off). Rollback = unset (no code).
+# Functions added: 10 (_env_confirm_session_mode, _confirm_venue,
+# _confirm_session_holidays, _confirm_is_session_day,
+# _confirm_session_key, _confirm_prev_session, _confirm_clock,
+# _confirm_session_shadow_count, _apply_confirm_session_observe,
+# _confirm_session_meta). Removed: 0.
 # v1.12.2 (2026-09-23) - [P-165 ADD-CONFIRM FAIL-CLOSED] THE FUNDING GATE
 # MAY NEVER FAIL OPEN
 # WHY: _apply_add_confirmation ends in `except Exception: return action,
@@ -2052,6 +2104,223 @@ def _add_confirm_store_size():
     return len(_ADD_CONFIRM_STORE)
 
 
+# ---------------------------------------------------------------------------
+# v1.13.0 [P-168b] - session-keyed confirmation clock (venue calendars)
+# ---------------------------------------------------------------------------
+# venue -> (trading weekdays Mon=0..Sun=6, close hour UTC, close minute).
+# Closes are deliberately LATE (conservative): a run between the real close
+# and the table close still keys to the previous session - a confirmation
+# is delayed by at most a few hours, never granted early.
+_CONFIRM_SESSION_VENUES = {
+    "US":   ((0, 1, 2, 3, 4), 21, 0),   # NYSE/Nasdaq: 20:00Z (DST) / 21:00Z
+    "AMER": ((0, 1, 2, 3, 4), 22, 0),   # Toronto / Mexico / Sao Paulo / Santiago
+    "EU":   ((0, 1, 2, 3, 4), 17, 0),   # London 16:30Z, continental <= 16:30Z
+    "ASIA": ((0, 1, 2, 3, 4), 11, 0),   # Tokyo 06:00Z ... Mumbai 10:00Z
+    "KSA":  ((6, 0, 1, 2, 3), 12, 0),   # Tadawul Sun-Thu, close 15:00 Riyadh
+    "GULF": ((6, 0, 1, 2, 3), 12, 0),   # Doha/Kuwait/Manama/Muscat/Cairo/Amman/TASE
+}
+_CONFIRM_SESSION_SUFFIX = {
+    "SR": "KSA",
+    "QA": "GULF", "KW": "GULF", "BH": "GULF", "OM": "GULF", "CA": "GULF",
+    "EG": "GULF", "JO": "GULF", "TA": "GULF",
+    "L": "EU", "LSE": "EU", "PA": "EU", "AS": "EU", "BR": "EU", "DE": "EU",
+    "XETRA": "EU", "ETR": "EU", "MI": "EU", "MC": "EU", "SW": "EU", "CO": "EU",
+    "ST": "EU", "OL": "EU", "HE": "EU", "WA": "EU", "LS": "EU", "VI": "EU",
+    "IR": "EU", "AT": "EU", "PR": "EU", "BD": "EU", "IS": "EU",
+    "T": "ASIA", "HK": "ASIA", "KS": "ASIA", "KQ": "ASIA", "KO": "ASIA",
+    "SI": "ASIA", "AX": "ASIA", "AU": "ASIA", "NZ": "ASIA", "NS": "ASIA",
+    "NSE": "ASIA", "BO": "ASIA", "BSE": "ASIA", "TW": "ASIA", "TWO": "ASIA",
+    "KL": "ASIA", "JK": "ASIA", "BK": "ASIA", "SS": "ASIA", "SZ": "ASIA",
+    "SHG": "ASIA", "SHE": "ASIA", "PS": "ASIA", "VN": "ASIA", "AE": "ASIA",
+    "DU": "ASIA",
+    "TO": "AMER", "V": "AMER", "CN": "AMER", "MX": "AMER", "SA": "AMER",
+    "SN": "AMER", "BA": "AMER",
+}
+# Fixed-date closures. NYSE 2026 (+ 2027-01-01); Tadawul fixed dates. Eid and
+# ad-hoc closures are announced yearly -> TFB_PF_SESSION_HOLIDAYS (csv of
+# YYYY-MM-DD, applied to every venue). A date missing here fails OPEN (it is
+# counted as a session - the legacy direction), never CLOSED.
+_CONFIRM_SESSION_HOLIDAYS = {
+    "US": frozenset(("2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+                     "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+                     "2026-11-26", "2026-12-25", "2027-01-01")),
+    "KSA": frozenset(("2026-02-22", "2026-09-23")),
+}
+_ADD_CONFIRM_SESSION_STORE = {}          # observe-mode shadow chain (memory)
+_CONFIRM_SESSION_SHADOW_NS = "~S~"       # Redis namespace inside the same prefix
+
+
+def _env_confirm_session_mode():
+    """v1.13.0 [P-168b]: off | observe | enforce, read at call time (no
+    restart; read-back = the [confirm-session-observe] tags / the
+    "; session YYYY-MM-DD" counter suffix in the next run). Default off keeps
+    v1.12.2 byte-identical."""
+    v = str(os.environ.get("TFB_PF_CONFIRM_SESSION", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _confirm_venue(sym):
+    """Venue code from the symbol suffix; bare symbols and unknown suffixes
+    are US (the broker's default venue for this book)."""
+    s = str(sym or "").strip().upper()
+    if "." in s:
+        return _CONFIRM_SESSION_SUFFIX.get(s.rsplit(".", 1)[1], "US")
+    return "US"
+
+
+def _confirm_session_holidays(venue):
+    hol = set(_CONFIRM_SESSION_HOLIDAYS.get(venue, ()))
+    extra = str(os.environ.get("TFB_PF_SESSION_HOLIDAYS", "") or "")
+    for tok in extra.replace(";", ",").split(","):
+        tok = tok.strip()
+        if len(tok) == 10 and tok[4] == "-" and tok[7] == "-":
+            hol.add(tok)
+    return hol
+
+
+def _confirm_is_session_day(venue, d, holidays=None):
+    wd, _h, _m = _CONFIRM_SESSION_VENUES.get(venue, _CONFIRM_SESSION_VENUES["US"])
+    if d.weekday() not in wd:
+        return False
+    hol = holidays if holidays is not None else _confirm_session_holidays(venue)
+    return d.isoformat() not in hol
+
+
+def _confirm_session_key(venue, now_utc=None):
+    """ISO date of the venue's most recent COMPLETED session at now_utc."""
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    _wd, ch, cm = _CONFIRM_SESSION_VENUES.get(venue, _CONFIRM_SESSION_VENUES["US"])
+    hol = _confirm_session_holidays(venue)
+    d = now.date()
+    if not ((now.hour, now.minute) >= (ch, cm) and _confirm_is_session_day(venue, d, hol)):
+        d = d - timedelta(days=1)
+        for _ in range(14):
+            if _confirm_is_session_day(venue, d, hol):
+                break
+            d = d - timedelta(days=1)
+    return d.isoformat()
+
+
+def _confirm_prev_session(venue, key):
+    """ISO date of the venue session immediately before `key`."""
+    d = datetime.strptime(str(key)[:10], "%Y-%m-%d").date() - timedelta(days=1)
+    hol = _confirm_session_holidays(venue)
+    for _ in range(14):
+        if _confirm_is_session_day(venue, d, hol):
+            return d.isoformat()
+        d = d - timedelta(days=1)
+    return d.isoformat()
+
+
+def _confirm_clock(sym, now_utc=None):
+    """v1.13.0 [P-168b]: (today_key, yesterday_key, basis). off/observe ->
+    the legacy UTC-date pair (v1.12.2 verbatim; the legacy helper's own
+    exceptions propagate exactly as before). enforce -> the venue's last
+    completed session and the session before it; a calendar fault falls
+    back to the legacy pair for that call (one WARNING)."""
+    if _env_confirm_session_mode() != "enforce":
+        return (_add_confirm_today(),
+                (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
+                "utc")
+    try:
+        venue = _confirm_venue(sym)
+        key = _confirm_session_key(venue, now_utc)
+        return key, _confirm_prev_session(venue, key), "session"
+    except Exception as exc:
+        try:
+            logger.warning("[CONFIRM-SESSION v%s] %s: calendar fault %s: %s "
+                           "- legacy UTC day key used this call",
+                           PORTFOLIO_ACTIONS_VERSION,
+                           str(sym or "").strip().upper(),
+                           exc.__class__.__name__, exc)
+        except Exception:
+            pass
+        return (_add_confirm_today(),
+                (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
+                "utc")
+
+
+def _confirm_session_shadow_count(sym, venue, now_utc=None):
+    """observe-mode SHADOW chain: same advance / freeze / restart rules as
+    the live gate, keyed on sessions, in its own memory dict and under the
+    "~S~" namespace of the same Redis prefix (same TTL). Returns
+    (session_key, count)."""
+    key = _confirm_session_key(venue, now_utc)
+    prev = _confirm_prev_session(venue, key)
+    st = _ADD_CONFIRM_SESSION_STORE.get(sym)
+    persist = _confirm_persist_enabled()
+    if persist and st is None:
+        st = _confirm_redis_get(_CONFIRM_SESSION_SHADOW_NS + sym)
+    if st is None:
+        count = 1
+    elif str(st.get("date") or "") == key:
+        count = int(st.get("count") or 1)          # same-session rerun: frozen
+    elif str(st.get("date") or "") == prev:
+        count = int(st.get("count") or 0) + 1      # consecutive session: advance
+    else:
+        count = 1                                  # skipped session: restart
+    _ADD_CONFIRM_SESSION_STORE[sym] = {"count": count, "date": key}
+    if persist:
+        _confirm_redis_put(_CONFIRM_SESSION_SHADOW_NS + sym,
+                           {"count": count, "date": key})
+    if len(_ADD_CONFIRM_SESSION_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
+        while len(_ADD_CONFIRM_SESSION_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
+            oldest = min(_ADD_CONFIRM_SESSION_STORE.items(),
+                         key=lambda kv: str(kv[1].get("date") or ""))
+            _ADD_CONFIRM_SESSION_STORE.pop(oldest[0], None)
+    return key, count
+
+
+def _apply_confirm_session_observe(cand, raw_action, action, reason,
+                                   capped_from, controls, now_utc=None):
+    """v1.13.0 [P-168b]: observe-mode evidence appended POST-gate at the
+    caller seam (same pattern as _apply_f1_observe_tag). The legacy verdict
+    is untouched; off and enforce are pure pass-throughs. Never raises."""
+    try:
+        if _env_confirm_session_mode() != "observe":
+            return reason
+        sym = str((cand or {}).get("symbol") or "").strip().upper()
+        if not sym:
+            return reason
+        try:
+            days = int(controls.get("add_confirm_days") or 0)
+        except (TypeError, ValueError):
+            days = int(DEFAULT_CONTROLS["add_confirm_days"])
+        if raw_action != ACTION_ADD:
+            _ADD_CONFIRM_SESSION_STORE.pop(sym, None)
+            if _confirm_persist_enabled():
+                _confirm_redis_del(_CONFIRM_SESSION_SHADOW_NS + sym)
+            return reason
+        if days <= 1:
+            return reason
+        venue = _confirm_venue(sym)
+        key, s_count = _confirm_session_shadow_count(sym, venue, now_utc)
+        l_count = int((_ADD_CONFIRM_STORE.get(sym) or {}).get("count") or 0)
+        flip = (l_count >= days) != (s_count >= days)
+        tag = ("[confirm-session-observe] venue=%s session=%s legacy %d/%d "
+               "vs session %d/%d%s; legacy clock kept"
+               % (venue, key, l_count, days, s_count, days,
+                  " - FLIP" if flip else ""))
+        return ("%s; %s" % (reason, tag)) if reason else tag
+    except Exception as exc:
+        try:
+            logger.warning("[CONFIRM-SESSION v%s] observe tag skipped: %s: %s",
+                           PORTFOLIO_ACTIONS_VERSION, exc.__class__.__name__, exc)
+        except Exception:
+            pass
+        return reason
+
+
+def _confirm_session_meta():
+    """Payload echo (emitted only when the gate is armed)."""
+    return {"mode": _env_confirm_session_mode(),
+            "shadow_symbols": len(_ADD_CONFIRM_SESSION_STORE),
+            "venues": sorted(_CONFIRM_SESSION_VENUES)}
+
+
 def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
     """Returns (action, reason, capped_from) with the confirmation gate
     applied. Non-ADD outcomes reset the symbol's clock. Never raises.
@@ -2078,7 +2347,8 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
             return action, reason, capped_from
         if days <= 1:
             return action, reason, capped_from  # gate off: v1.0.5 verbatim
-        today = _add_confirm_today()
+        today, _yday_key, _clock_basis = _confirm_clock(sym)  # v1.13.0 [P-168b]
+        _sk_note = ("; session %s" % today) if _clock_basis == "session" else ""
         st = _ADD_CONFIRM_STORE.get(sym)
         _persist = _confirm_persist_enabled()
         if _persist and st is None:
@@ -2093,8 +2363,7 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
             # v1.6.0 STRICT CONSECUTIVENESS: persistence makes multi-day
             # gaps real; the contract says CONSECUTIVE days, so only a
             # yesterday-dated chain advances — anything older restarts.
-            _yday = (datetime.now(timezone.utc).date()
-                     - timedelta(days=1)).isoformat()
+            _yday = _yday_key   # v1.13.0 [P-168b]: session-keyed under enforce
             if str(st.get("date") or "") == _yday:
                 count = int(st.get("count") or 0) + 1
             else:
@@ -2118,12 +2387,12 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
                 _ADD_CONFIRM_STORE.pop(oldest[0], None)
         if count >= days:
             return (ACTION_ADD,
-                    reason + " — ADD confirmed (day %d/%d)" % (count, days),
+                    reason + " — ADD confirmed (day %d/%d%s)" % (count, days, _sk_note),
                     capped_from)
         return (ACTION_HOLD,
-                "ADD pending confirmation (day %d/%d) — signal must persist "
+                "ADD pending confirmation (day %d/%d%s) — signal must persist "
                 "%d consecutive days before funding; qualifying: %s"
-                % (count, days, days, reason),
+                % (count, days, _sk_note, days, reason),
                 ACTION_ADD)
     except Exception as exc:
         # v1.12.2 [P-165] (a): the raw verdict must never upgrade through
@@ -3035,8 +3304,13 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         action, reason, proceeds = _apply_deminimis(action, reason, proceeds)
         # v1.1.0 (Fix #3): a first-day ADD renders HOLD "pending
         # confirmation"; a non-ADD verdict resets the symbol's clock.
+        _raw_action = action              # v1.13.0 [P-168b] observe witness
         action, reason, capped_from = _apply_add_confirmation(
             c.get("symbol"), action, reason, capped_from, ctl)
+        # v1.13.0 [P-168b]: observe-mode session evidence - same seam
+        # pattern; off/enforce are pure pass-throughs here.
+        reason = _apply_confirm_session_observe(
+            c, _raw_action, action, reason, capped_from, ctl)
         # v1.9.0 D2: explicit REDUCE policy (default 'exit' = verbatim).
         action, reason, proceeds = _apply_reduce_policy(
             c, action, reason, proceeds)
@@ -3317,6 +3591,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         "alerts_units_version": 1,
         "meta": {
             **({"switch_scan": _sw_meta} if _sw_meta else {}),
+            **({"confirm_session": _confirm_session_meta()}
+               if _env_confirm_session_mode() != "off" else {}),   # v1.13.0
             "controls_snapshot": ctl,
             "cash_floor_sar": _round(cash_floor, 0),
             "fx": {"provided": sorted(fx_rates.keys()),
