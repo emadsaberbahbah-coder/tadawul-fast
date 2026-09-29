@@ -145,7 +145,34 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # Meta gains one line: engine_roi: mode/applied/fraction_fixed/unresolved.
 # Rollback: env off (or git revert). Functions added: 4. Removed: 0.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.4.0"
+# ---------------------------------------------------------------------------
+# VERSION 1.5.0 (2026-09-29) - NON-TRADING-DAY FREEZE (P-175 / S-1 fresh-floor)
+# EVIDENCE (_Run_Log S1-GATE lines, 2026-09-16 .. 09-28): every EXCLUDED_INFRA
+#   day since the engine-ROI fix came from CHALLENGER TURNOVER across
+#   non-trading days, not from stale prices. 09-27 (Sun) scorer: new=[ADAM,
+#   GOOGL, ITRN] stale=[PINFRA, NVDA]; 09-28 (Mon): excluded_reason=fresh-floor,
+#   chal fresh 1/5, new=[GOOGL, ITRN, PINE, PINFRA] - four of five seats had
+#   no prior scored-day pair because this script REBUILT the board twice on
+#   Saturday and twice on Sunday from a cockpit that drifts on weekends. The
+#   scorer pairs a seat only with the last SCORED day (Friday), so anything
+#   seated after Friday 15:20Z is NEW on Monday. Same mechanism on 09-20.
+#   Counter 11/28 with 41 excluded days; each weekend leak moves the earliest
+#   decidable date out by a day.
+# FIX: TFB_BOARD_FREEZE_NONTRADING = off (default) | observe | enforce.
+#   enforce: on a non-trading day (Sat/Sun by the UTC run date, plus any date
+#     in TFB_BOARD_FREEZE_HOLIDAYS) the script writes NOTHING - no Top_10 read,
+#     no yfinance, no board, no Regime_History - except one _Run_Log evidence
+#     row "[SHADOW-BOARD-FREEZE v1.5.0] frozen: <reason>"; the tab keeps
+#     Friday's board, so Monday's rebuild is the only turnover the scorer
+#     sees. observe: the run proceeds byte-identical to v1.4.0 and prints /
+#     logs "would freeze" (countable read-back). off: byte-identical.
+#   TFB_BOARD_FREEZE_TODAY=YYYY-MM-DD overrides the clock (harness hook).
+# S-1 BOUNDARY: this is a board-INPUT cadence change of the same class as
+#   v1.4.0 (P-139): gate criteria, benchmark, fresh floor and counter are
+#   byte-untouched; prior excluded days stand; the counter continues.
+# Rollback: env off (or git revert). Functions added: 5. Removed: 0.
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "1.5.0"
 # -----------------------------------------------------------------------------
 # v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
 # -----------------------------------------------------------------------------
@@ -209,6 +236,10 @@ TAB_HOLDINGS = "Portfolio_Decision"
 TAB_ENGINE_ROI = ("Global_Markets", "Market_Leaders")   # v1.4.0 ROI source
 ENV_ENGINE_ROI = "TFB_BOARD_ENGINE_ROI"                 # off|observe|enforce
 ENGINE_ROI_CAP_PCT = 300.0
+ENV_FREEZE = "TFB_BOARD_FREEZE_NONTRADING"              # v1.5.0 off|observe|enforce
+ENV_FREEZE_HOLIDAYS = "TFB_BOARD_FREEZE_HOLIDAYS"      # v1.5.0 comma ISO dates
+ENV_FREEZE_TODAY = "TFB_BOARD_FREEZE_TODAY"            # v1.5.0 harness clock hook
+FREEZE_TAG = f"[SHADOW-BOARD-FREEZE v{SCRIPT_VERSION}]"
 
 OUT_HEADER = ["Symbol", "Name", "Champion Action", "Sector", "ROI %",
               "Confidence", "Shariah Status", "Shariah Source", "Tradability",
@@ -222,6 +253,76 @@ REGIME_SLEEVES = {"Global": "SPUS", "Saudi": "^TASI.SR"}
 def _now_riyadh() -> str:
     from datetime import timedelta
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+
+
+# v1.5.0 [P-175] non-trading-day freeze - pure helpers (selftested offline)
+def _freeze_mode() -> str:
+    """TFB_BOARD_FREEZE_NONTRADING = off | observe | enforce (explicit words;
+    anything else = off). Never throws."""
+    try:
+        raw = (os.getenv(ENV_FREEZE) or "off").strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def _freeze_holidays(raw: Optional[str] = None) -> set:
+    """Comma/space separated ISO dates -> set of date; junk tokens dropped."""
+    out: set = set()
+    try:
+        src = raw if raw is not None else (os.getenv(ENV_FREEZE_HOLIDAYS) or "")
+        for tok in str(src).replace(";", ",").replace(" ", ",").split(","):
+            t = tok.strip()
+            if not t:
+                continue
+            try:
+                out.add(date.fromisoformat(t))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _freeze_today() -> date:
+    """UTC run date (the scorer's session date); TFB_BOARD_FREEZE_TODAY
+    overrides for harnesses. Never throws."""
+    try:
+        raw = (os.getenv(ENV_FREEZE_TODAY) or "").strip()
+        if raw:
+            return date.fromisoformat(raw)
+    except Exception:  # noqa: BLE001
+        pass
+    return datetime.now(timezone.utc).date()
+
+
+def _is_nontrading_day(d: date, holidays: Optional[set] = None) -> Tuple[bool, str]:
+    """Weekend (Sat/Sun, US venue calendar the scorer also uses) or a listed
+    holiday -> (True, reason); else (False, '')."""
+    try:
+        if d.weekday() >= 5:
+            return True, "weekend:" + d.strftime("%a")
+        if holidays and d in holidays:
+            return True, "holiday:" + d.isoformat()
+    except Exception:  # noqa: BLE001
+        return False, ""
+    return False, ""
+
+
+def freeze_verdict(mode: str, today: date, holidays: Optional[set] = None
+                   ) -> Dict[str, Any]:
+    """Pure: {mode, date, nontrading, reason, skip, note}. skip is True only
+    under enforce on a non-trading day; note is the printable line (empty in
+    off mode or on trading days)."""
+    nt, why = _is_nontrading_day(today, holidays)
+    skip = bool(mode == "enforce" and nt)
+    note = ""
+    if mode == "enforce" and nt:
+        note = f"{FREEZE_TAG} frozen: {why} - board kept, nothing written"
+    elif mode == "observe" and nt:
+        note = f"{FREEZE_TAG} would freeze (observe): {why} - run proceeds"
+    return {"mode": mode, "date": today.isoformat(), "nontrading": nt,
+            "reason": why, "skip": skip, "note": note}
 
 
 # --------------------------------------------------------------------------- #
@@ -653,6 +754,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.selftest:
         return _selftest()
 
+    fz = freeze_verdict(_freeze_mode(), _freeze_today(), _freeze_holidays())  # v1.5.0
+    if fz["note"]:
+        print(fz["note"])
+    if fz["skip"]:
+        # v1.5.0 [P-175] enforce on a non-trading day: zero writes except the
+        # evidence row. No Top_10 read, no yfinance, no board, no history.
+        if not args.dry_run:
+            try:
+                _fsh = _open_sheet(args.sheet_id)
+                _fsh.worksheet("_Run_Log").append_row(
+                    [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                     "INFO", "shadow_board", TAB_OUT, "FROZEN", fz["note"],
+                     "", "", "", json.dumps({"version": SCRIPT_VERSION,
+                                             "freeze": fz["reason"],
+                                             "date": fz["date"]})],
+                    value_input_option="RAW")
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
+
     os.environ.setdefault("TFB_COMPLIANCE_GATE_ENABLED", "1")
     equity = float(os.getenv("TFB_SHADOW_EQUITY_SAR") or "130000")
 
@@ -759,11 +880,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("[REGIME-HISTORY v1.2.0] WARN append failed "
                   "(board unaffected): " + str(_e))
 
+    _rl_details: Dict[str, Any] = {"version": SCRIPT_VERSION}
+    if fz["mode"] == "observe" and fz["nontrading"]:      # v1.5.0 read-back
+        _rl_details["freeze_observe"] = fz["reason"]
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
              "shadow_board", TAB_OUT, "OK", verdict, "", "", "",
-             json.dumps({"version": SCRIPT_VERSION})],
+             json.dumps(_rl_details)],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -932,6 +1056,30 @@ def _selftest() -> int:
     mo = rg.monthly_from_daily([(date(2026, m, 1), 100.0 + m) for m in range(1, 13)])
     checks.append(("regime helpers importable end-to-end",
                    rg.current_regime(mo)["state"] in ("RISK_ON", "RISK_OFF")))
+    # v1.5.0 freeze battery (pure paths; 2026-09-26 Sat / 09-27 Sun / 09-28 Mon)
+    _hol = _freeze_holidays("2026-11-26, junk;2026-12-25")
+    checks.append(("freeze: holiday env parses, junk dropped",
+                   _hol == {date(2026, 11, 26), date(2026, 12, 25)}))
+    checks.append(("freeze: weekend + holiday detection",
+                   _is_nontrading_day(date(2026, 9, 26)) == (True, "weekend:Sat")
+                   and _is_nontrading_day(date(2026, 9, 27))[0]
+                   and _is_nontrading_day(date(2026, 9, 28)) == (False, "")
+                   and _is_nontrading_day(date(2026, 11, 26), _hol)
+                   == (True, "holiday:2026-11-26")))
+    _f_off = freeze_verdict("off", date(2026, 9, 27))
+    _f_obs = freeze_verdict("observe", date(2026, 9, 27))
+    _f_enf = freeze_verdict("enforce", date(2026, 9, 27))
+    _f_mon = freeze_verdict("enforce", date(2026, 9, 28))
+    checks.append(("freeze: off never skips and prints nothing",
+                   _f_off["skip"] is False and _f_off["note"] == ""))
+    checks.append(("freeze: observe never skips, notes 'would freeze'",
+                   _f_obs["skip"] is False and "would freeze" in _f_obs["note"]))
+    checks.append(("freeze: enforce skips on Sunday with the frozen note",
+                   _f_enf["skip"] is True and "frozen: weekend:Sun" in _f_enf["note"]))
+    checks.append(("freeze: enforce on Monday runs normally",
+                   _f_mon["skip"] is False and _f_mon["note"] == ""))
+    checks.append(("freeze: mode parser explicit words only",
+                   _freeze_mode() in ("off", "observe", "enforce")))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)
