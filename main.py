@@ -2,12 +2,39 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.2)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+Why this revision (v8.14.0 vs v8.13.2)
+--------------------------------------
+- ADD OBSERVABILITY (2026-09-29, /health truth): two ADDITIVE status-payload
+    keys, same backward-safe-default rule as engine_version / engine_gates:
+      "pf_gates" -- call-time read of the portfolio_actions and
+        opportunity_builder gate ENVs (TFB_PF_CONFIRM_SESSION,
+        TFB_FORECAST_BASIS, TFB_PF_DD_EXIT, TFB_PF_SWITCH_SCAN, ...) plus the
+        two module versions, resolved from sys.modules without importing.
+        Those modules read their gates per call, print no boot line and are
+        invisible in engine_gates, so a Render arming of e.g.
+        TFB_PF_CONFIRM_SESSION=observe was UNVERIFIABLE from the health JSON
+        the operator pastes (evidence: the 2026-09-29 13:14 deploy). An
+        unset variable reports the literal string "unset" so "off" (explicit)
+        and "absent" stay distinguishable.
+      "deploy" -- provenance: RENDER_GIT_COMMIT / RENDER_GIT_BRANCH /
+        RENDER_GIT_REPO_SLUG / RENDER_SERVICE_ID / RENDER_SERVICE_NAME /
+        RENDER_INSTANCE_ID (Render injects them; "unset" elsewhere), the
+        worker pid and the worker's boot time (module import, UTC). The
+        health JSON now pins WHICH commit is live and shows a worker
+        restart -- which wipes the per-worker fund cache -- as a new
+        boot_utc, without a Render Shell session.
+- Fail-open: both helpers return {} on any exception; nothing armed; no
+    route, auth, mount-plan, middleware or engine-lifecycle change. The
+    reduced anonymous view (_PUBLIC_STATUS_META_KEYS) is unchanged, so the
+    new keys are visible only where the full payload already is.
+- ADD: APP_ENTRY_VERSION bumped to 8.14.0.
 
 Why this revision (v8.13.0 vs v8.12.1)
 --------------------------------------
@@ -292,6 +319,9 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
+# v8.14.0 (2026-09-29, /health truth): additive "pf_gates" + "deploy" status
+# keys -- see the header WHY. Fail-open {}; no behaviour change; the gate
+# ENV list lives in _PF_GATE_ENVS / _OB_GATE_ENVS below (auditable).
 # v8.13.2 (2026-08-23, IR-096 FIX — adjudicated from the LIVE 12:17 boot):
 # v8.13.1's payload expression called getattr(engine_obj, ...) — but
 # app.state.engine is an ENGINE INSTANCE, while surface_gate_states() is a
@@ -311,7 +341,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.13.2"
+APP_ENTRY_VERSION = "8.14.0"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -365,6 +395,11 @@ APP_ENTRY_VERSION = "8.13.2"
 # v8.11.1: Cross-module canonical alias (matches worker.py v4.3.0,
 # config.py v7.3.0, env.py v7.8.1, track_performance v6.4.0, etc.)
 SERVICE_VERSION = APP_ENTRY_VERSION
+
+# v8.14.0: per-worker boot stamp (module import time). A new value on /health
+# means the worker restarted (Render deploy / ENV change / crash) -- the event
+# that wipes the engine's per-worker in-memory fund cache.
+_PROCESS_BOOT_UTC: str = datetime.now(timezone.utc).isoformat()
 
 # Project-canonical 8-value boolean vocabulary.
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
@@ -1914,6 +1949,83 @@ def _resolve_engine_version(engine_obj: Any, engine_source: str) -> str:
         return ""
 
 
+# v8.14.0: gate ENVs the two decision modules read PER CALL (no boot line).
+_PF_GATE_ENVS: Tuple[str, ...] = (
+    "TFB_PF_ENABLED", "TFB_FORECAST_BASIS", "TFB_PF_ADD_ROI_3M_PCT",
+    "TFB_PF_CONFIRM_SESSION", "TFB_PF_SESSION_HOLIDAYS",
+    "TFB_PF_CONFIRM_PERSIST", "TFB_PF_ADD_CONFIRM_DAYS",
+    "TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN", "TFB_PF_DD_EXIT",
+    "TFB_PF_DD_EXIT_PCT", "TFB_PF_DD_TIME_D", "TFB_PF_SWITCH_SCAN",
+    "TFB_PF_REQUIRE_FRESH_BASIS", "TFB_PF_VF_CONFLICT_GUARD",
+    "TFB_PF_ENGINE_ROI_DISPLAY", "TFB_PF_TRUST_GATE", "TFB_PF_IDENTITY_GATE",
+    "TFB_PF_COST_BASIS_GATE", "TFB_PF_BLOCK_THIN_COVERAGE",
+    "TFB_PF_BLOCK_MISSING_COST_BASIS", "TFB_PF_NULL_LEVELS",
+)
+_OB_GATE_ENVS: Tuple[str, ...] = (
+    "TFB_FORECAST_BASIS", "TFB_T10_REQ_ROI_3M_PCT", "TFB_OPP_CASH_FLOOR_MODE",
+    "TFB_OPP_CASH_FLOOR_PCT", "TFB_OPP_CASH_FLOOR_SAR",
+)
+_DEPLOY_ENVS: Tuple[str, ...] = (
+    "RENDER_GIT_COMMIT", "RENDER_GIT_BRANCH", "RENDER_GIT_REPO_SLUG",
+    "RENDER_SERVICE_ID", "RENDER_SERVICE_NAME", "RENDER_INSTANCE_ID",
+)
+
+
+def _env_or_unset(name: str) -> str:
+    """v8.14.0: raw ENV value (stripped) or the literal "unset" -- "off" set
+    explicitly and a variable that was never set must stay distinguishable
+    on the payload."""
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return "unset"
+        v = str(v).strip()
+        return v if v != "" else "unset"
+    except Exception:
+        return "unset"
+
+
+def _module_version_no_import(mod_name: str, attr: str) -> str:
+    """v8.14.0: read a version constant from an ALREADY-IMPORTED module via
+    sys.modules; never imports; "" when absent (same contract as
+    _resolve_engine_version)."""
+    try:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            return ""
+        return str(getattr(mod, attr, "") or "")
+    except Exception:
+        return ""
+
+
+def _pf_gates_snapshot() -> Dict[str, Any]:
+    """v8.14.0: call-time view of the portfolio_actions / opportunity_builder
+    gate ENVs + module versions. Read-only, fail-open {}."""
+    try:
+        return {
+            "portfolio_actions_version": _module_version_no_import(
+                "core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION"),
+            "opportunity_builder_version": _module_version_no_import(
+                "core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION"),
+            "portfolio_actions": {k: _env_or_unset(k) for k in _PF_GATE_ENVS},
+            "opportunity_builder": {k: _env_or_unset(k) for k in _OB_GATE_ENVS},
+        }
+    except Exception:
+        return {}
+
+
+def _deploy_provenance() -> Dict[str, Any]:
+    """v8.14.0: which commit / service / worker answered. Render injects the
+    RENDER_* variables; elsewhere they read "unset". Fail-open {}."""
+    try:
+        out: Dict[str, Any] = {k.lower(): _env_or_unset(k) for k in _DEPLOY_ENVS}
+        out["worker_pid"] = int(os.getpid())
+        out["worker_boot_utc"] = _PROCESS_BOOT_UTC
+        return out
+    except Exception:
+        return {}
+
+
 def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     snap: Dict[str, Any] = {}
     routes_mounted = False
@@ -2022,6 +2134,10 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         # v8.13.2 (IR-096): resolved via the module-first chain — see
         # _engine_gates_snapshot. Fail-open {} on any shape.
         "engine_gates": _engine_gates_snapshot(engine_obj),
+        # v8.14.0: call-time decision-module gates + deploy provenance.
+        # Additive, fail-open {} -- see the header WHY.
+        "pf_gates": _pf_gates_snapshot(),
+        "deploy": _deploy_provenance(),
         "startup_warnings": startup_warnings,
     }
 
