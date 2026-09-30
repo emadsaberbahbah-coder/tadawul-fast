@@ -73,7 +73,7 @@ jobs:
     steps:
       # v1.1.0: pinned to main — a dispatch from any other branch would
       # otherwise append unreviewed output into the permanent evidence archive.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
