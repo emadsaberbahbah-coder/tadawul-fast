@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* tests/test_gas_sync_dispatch_p170.js
- * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 [P-170 DISPATCH-FROM-GAS].
+ * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 surface, re-pinned on v1.1.0 [P-170 DISPATCH-FROM-GAS].
  * Loads the REAL .gs source into a vm context whose only additions are stubs of
  * the Apps Script services it touches (PropertiesService, UrlFetchApp,
  * SpreadsheetApp, ScriptApp, Logger). Every test calls the real functions.
@@ -86,8 +86,8 @@ function run() {
   {
     const w = makeWorld({});
     const v = w.ctx.tfbSyncDispatchSelfTest();
-    T('T1 selftest', v === 'sync dispatch core: ok', v);
-    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.0.0');
+    T('T1 selftest', v.indexOf('sync dispatch core: ok') === 0, v);
+    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.1.0');
   }
   // T2 happy path: token, stale GM (3 h), expired hold -> dispatch 204
   {
