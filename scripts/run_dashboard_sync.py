@@ -1837,7 +1837,63 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.63.0"
+SCRIPT_VERSION = "6.64.0"
+# -----------------------------------------------------------------------------
+# v6.64.0 (2026-09-30) - P-174 OPERATOR RETIREMENT LIST (_Retired_Symbols)
+# -----------------------------------------------------------------------------
+# EVIDENCE (workbook audits 2026-09-27 / 09-29, export 09-30): Global_Markets
+#   carries 141 rows (131 at the 09-27 audit) whose Name has stayed blank leg
+#   after leg - `quote_current_price_missing`, BLOCKED "Missing current
+#   price" - classed as mostly delisted / renamed tickers from the 07-28
+#   expansion plus a smaller set of live names whose quote came back empty;
+#   the operator's CSV review decides the list. Each one costs a fetch every
+#   leg (3 legs/day) and, blank-Named, sits in the HEAL-FIRST front slot
+#   forever. The sheet IS the symbol source (v6.16.0
+#   read-back): a row can only leave a page by a manual delete, and v6.19.0
+#   PERSISTENCE + the L4b HARD-GUARD (correctly) resurrect anything a fetch
+#   misses. The v6.19.0 deny filter (TFB_SYNC_UNIVERSE_DENY) is a REGEX for
+#   placeholder families, not a list of named instruments, and a 40-name
+#   regex in a workflow Variable is not an operator surface.
+# WHAT. One gate, TFB_SYNC_RETIRE_TAB = off | observe | enforce (explicit
+#   words; anything else = off; enforce degrades to observe when the pure
+#   self-test fails). DEFAULT OFF = byte-identical to v6.63.0 (no read, no
+#   line). The list lives in the workbook tab `_Retired_Symbols`
+#   (TFB_SYNC_RETIRE_TAB_NAME): a header row with Symbol (+ optional Retired
+#   On / Reason / Replacement / Page); a blank Page retires the symbol on
+#   every ranked market page, a named Page scopes it to that page. Read ONCE
+#   per run (cached per spreadsheet), fail-open: absent tab / read error /
+#   no header row => nothing retired, the reason is logged.
+#   Seam: the FINAL request list of a ranked market page - after read-back /
+#     deny filter / sanitize / OLDEST-FIRST / DECISION-FIRST / CRIT-FRONT,
+#     before the fetch - the single point every downstream consumer diffs
+#     against (persistence, second-chance pass, L4b hard guard, coverage
+#     floor, strict membership). A retired symbol is neither requested nor
+#     persisted, so its row leaves the page on this write and, because the
+#     sheet is the symbol source, stays out; the tab is the durable record
+#     and the guard against re-introduction.
+#   enforce: the listed symbols leave the request list (order of the rest
+#     untouched). REFUSED - list unchanged, loud - when the match exceeds
+#     TFB_SYNC_RETIRE_MAX_PCT (default 20 % of the page) or would empty the
+#     list, so a mis-paste can never amputate a page (the ML 1,278 -> 897
+#     class) or fall through to a page-driven request.
+#   observe: request list unchanged; the same verdict is disclosed.
+#   Both: one info line per ranked page per leg (arming provable from the
+#     log even at zero matches); when >= 1 symbol matched, one
+#     "[UNIVERSE-RETIRE]" warning (res.warnings + logger + ::warning::) and
+#     one _Run_Log row on the FW-3 channel (Status RETIRED / WOULD_RETIRE /
+#     REFUSED; Details JSON: names, counts, tab stats, selftest, R5 run
+#     meta); the _Status stamp gains " retired=N" under enforce.
+# SCOPE CUT (stated): the Replacement column is read but NOT applied - a
+#   symbol identity change belongs to the registry lane; My_Portfolio and
+#   the non-ranked pages are out of scope; the tab is operator-written only
+#   (this script never writes it).
+# ENV LANE: GitHub Actions (daily_sync.yml): sync-dashboard job env AND the
+#   recovery job env (the replay subprocess inherits it).
+# Kill: unset / off. ZERO functions removed; additions: _retired_tab_name,
+# _retire_mode_raw, _retire_mode, _retire_max_pct, _retired_index_empty,
+# _retired_index_from_matrix, _retired_for_page, _apply_retire_filter,
+# _retire_decide, _load_retired_index, _retire_selftest,
+# _append_runlog_retire; one dict _RETIRED_CACHE.
 # -----------------------------------------------------------------------------
 # v6.63.0 (2026-09-26) - P-162b KEEP-LAST-GOOD FOR FETCH-FAILED ROWS
 # -----------------------------------------------------------------------------
@@ -7313,6 +7369,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     preserved = klg + int(meta.get("persist_restored") or 0) + int(
         meta.get("pv2_restored") or 0)
     stubbed = int(meta.get("stubbed") or 0)
+    retired = int(meta.get("retired") or 0)      # v6.64.0 [P-174]
     pre_rows = meta.get("pre_persist_rows")
     fresh = max(0, int(pre_rows) - klg) if isinstance(pre_rows, int) else None
     cov = (round(100.0 * fresh / requested, 1)
@@ -7349,6 +7406,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" fresh={fresh}" if fresh is not None else "")
            + (f" preserved={preserved}" if preserved else "")
            + (f" stubbed={stubbed}" if stubbed else "")
+           + (f" retired={retired}" if retired else "")  # v6.64.0 [P-174]
            + ff_note                                   # v6.62.0 [P-162]
            + (f" fresh_cov={cov}%" if cov is not None else "")
            + (f" warnings={len(warns)}" if warns else "")
@@ -9001,6 +9059,309 @@ def _universe_junk(symbol: str, pats: Optional[List["re.Pattern[str]"]] = None) 
         if pat.match(t):
             return True
     return False
+
+
+# =============================================================================
+# v6.64.0 (P-174) OPERATOR RETIREMENT LIST - see the WHY block at SCRIPT_VERSION.
+# =============================================================================
+_RETIRE_TAG = "[UNIVERSE-RETIRE v6.64.0]"
+_RETIRED_TAB_DEFAULT = "_Retired_Symbols"
+_RETIRED_TAB_RANGE = "A1:F5000"
+_RETIRED_PAGE_ALIASES = frozenset({"page", "sheet", "tab", "sheetname", "pagename"})
+_RETIRED_CACHE: Dict[str, Any] = {}          # spreadsheet_id -> (monotonic ts, index)
+_RETIRED_CACHE_TTL_S = 3600.0
+_RETIRE_SELFTEST_MSG = ""
+
+
+def _retired_tab_name() -> str:
+    """Tab holding the operator retirement list (TFB_SYNC_RETIRE_TAB_NAME,
+    default _Retired_Symbols)."""
+    return (os.getenv("TFB_SYNC_RETIRE_TAB_NAME") or "").strip() or _RETIRED_TAB_DEFAULT
+
+
+def _retire_mode_raw() -> str:
+    """PURE parse of TFB_SYNC_RETIRE_TAB: off (default) | observe | enforce.
+    Explicit words only - "1"/"true"/"on" read as off."""
+    raw = (os.getenv("TFB_SYNC_RETIRE_TAB") or "off").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _retire_mode() -> str:
+    """v6.64.0 [P-174] gate. enforce is certified by the pure self-test: a
+    FAIL degrades enforce to observe (the FG-3 / DS-03 convention), never
+    the other way round. Never throws."""
+    try:
+        raw = _retire_mode_raw()
+        if raw == "enforce" and _retire_selftest() != "PASS":
+            return "observe"
+        return raw
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def _retire_max_pct() -> float:
+    """Largest share of a page's request list the list may retire in one
+    leg (TFB_SYNC_RETIRE_MAX_PCT, default 20; clamped 1..100). Above it the
+    leg REFUSES (list unchanged) - a mis-paste is bounded by construction."""
+    try:
+        v = float((os.getenv("TFB_SYNC_RETIRE_MAX_PCT") or "20").strip())
+    except Exception:
+        v = 20.0
+    return min(100.0, max(1.0, v))
+
+
+def _retired_index_empty(reason: str) -> Dict[str, Any]:
+    """An index that retires nothing, with the reason named."""
+    return {"global": set(), "by_page": {}, "rows": 0, "junk": 0, "hdr": -1,
+            "reason": reason, "tab": _retired_tab_name()}
+
+
+def _retired_index_from_matrix(values: Any) -> Dict[str, Any]:
+    """PURE. Parse the retirement tab into {global: set, by_page: {norm_page:
+    set}, rows, junk, hdr, reason}. Header row = the first of the top 10
+    rows holding a Symbol-alias cell (title rows above it are fine); an
+    optional Page / Sheet / Tab column scopes a row to one page (blank =
+    every ranked page). Symbols are normalized exactly like the read-back
+    (strip().upper()) and must pass the ticker-domain test; anything else
+    counts as junk and is ignored. No header row => empty index, reason
+    header_not_found (nothing is ever retired by accident)."""
+    idx = _retired_index_empty("ok")
+    if values is None:
+        idx["reason"] = "unreadable"
+        return idx
+    if not isinstance(values, list) or not values:
+        idx["reason"] = "empty"
+        return idx
+    hdr_r, sym_i, page_i = -1, -1, -1
+    for r in range(min(len(values), 10)):
+        row = values[r] if isinstance(values[r], list) else []
+        si = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+        if si >= 0:
+            hdr_r, sym_i = r, si
+            page_i = _guard_find_col(row, _RETIRED_PAGE_ALIASES)
+            break
+    idx["hdr"] = hdr_r
+    if sym_i < 0:
+        idx["reason"] = "header_not_found"
+        return idx
+    for row in values[hdr_r + 1:]:
+        if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
+            continue
+        t = str(row[sym_i]).strip().upper()
+        if not t or t in {"SYMBOL", "TICKER"}:
+            continue
+        if not _klg_symbol_domain_ok(t):
+            idx["junk"] += 1
+            continue
+        page = ""
+        if 0 <= page_i < len(row) and not _guard_is_blank(row[page_i]):
+            page = _guard_norm(row[page_i])
+        if page:
+            idx["by_page"].setdefault(page, set()).add(t)
+        else:
+            idx["global"].add(t)
+        idx["rows"] += 1
+    if idx["rows"] == 0 and idx["junk"] == 0:
+        idx["reason"] = "empty"
+    return idx
+
+
+def _retired_for_page(idx: Dict[str, Any], page: str) -> set:
+    """PURE. The retired set that applies to one page: the global rows plus
+    the rows scoped to that page (normalized name match)."""
+    if not idx:
+        return set()
+    out = set(idx.get("global") or set())
+    out |= set((idx.get("by_page") or {}).get(_guard_norm(page), set()))
+    return out
+
+
+def _apply_retire_filter(symbols: List[str], retired: set) -> Tuple[List[str], List[str]]:
+    """PURE, order-preserving. (kept, dropped): a symbol whose normalized
+    form is in `retired` leaves the request list; every other symbol keeps
+    its position (OLDEST-FIRST / DECISION-FIRST / CRIT-FRONT order is
+    untouched). `dropped` is de-duplicated, in first-seen order."""
+    if not symbols or not retired:
+        return list(symbols or []), []
+    kept: List[str] = []
+    dropped: List[str] = []
+    seen_drop: set = set()
+    for s in symbols:
+        t = str(s or "").strip().upper()
+        if t and t in retired:
+            if t not in seen_drop:
+                seen_drop.add(t)
+                dropped.append(t)
+            continue
+        kept.append(s)
+    return kept, dropped
+
+
+def _retire_decide(n_drop: int, n_before: int, mode: str, max_pct: float) -> str:
+    """PURE verdict: none | retired | would_retire | refused. enforce applies
+    the list only when >= 1 symbol matched, the page keeps >= 1 symbol and
+    the match is within max_pct of the request list; observe reports the
+    same test as would_retire (its note says whether enforce would refuse).
+    """
+    try:
+        n_drop = int(n_drop or 0)
+        n_before = int(n_before or 0)
+    except Exception:
+        return "none"
+    if n_drop <= 0 or n_before <= 0:
+        return "none"
+    over = (n_drop >= n_before) or (100.0 * n_drop > float(max_pct) * n_before)
+    if mode == "enforce":
+        return "refused" if over else "retired"
+    return "would_retire"
+
+
+def _load_retired_index(sheets: Any, spreadsheet_id: str) -> Dict[str, Any]:
+    """ONE read of the retirement tab per run (cached per spreadsheet for
+    _RETIRED_CACHE_TTL_S). FAIL-OPEN: no writer / unreadable tab (an absent
+    tab answers API 400 => read_values None) => an empty index with the
+    reason named, so a missing or broken tab can never retire anything."""
+    key = str(spreadsheet_id or "")
+    try:
+        hit = _RETIRED_CACHE.get(key)
+        if hit and (time.monotonic() - float(hit[0])) < _RETIRED_CACHE_TTL_S:
+            return hit[1]
+    except Exception:
+        pass
+    idx = _retired_index_empty("no_sheets")
+    if sheets is not None:
+        try:
+            values = sheets.read_values(spreadsheet_id, _retired_tab_name(), _RETIRED_TAB_RANGE)
+            idx = _retired_index_from_matrix(values)
+        except Exception as e:  # noqa: BLE001
+            idx = _retired_index_empty("error:" + type(e).__name__)
+    try:
+        _RETIRED_CACHE[key] = (time.monotonic(), idx)
+    except Exception:
+        pass
+    return idx
+
+
+def _retire_selftest() -> str:
+    """v6.64.0 [P-174]: pure fixtures through the parser, the page scoping,
+    the filter and the verdict (no network). PASS / FAIL n/m; memoized;
+    never throws."""
+    global _RETIRE_SELFTEST_MSG
+    if _RETIRE_SELFTEST_MSG:
+        return _RETIRE_SELFTEST_MSG
+    tab = [["Retired symbols (operator list)", "", "", "", ""],
+           ["Symbol", "Retired On", "Reason", "Replacement", "Page"],
+           ["abcd.us ", "2026-09-30", "delisted", "", ""],
+           ["1234.SR", "", "merged", "5678.SR", "Market_Leaders"],
+           ["bad symbol", "", "junk", "", ""],
+           ["", "", "", "", ""],
+           ["ABCD.US", "", "duplicate", "", ""],
+           ["ZZ=F", "", "expired contract", "", "commodities_fx"]]
+    passed, total = 0, 7
+    try:
+        idx = _retired_index_from_matrix(tab)
+        if (idx["reason"] == "ok" and idx["hdr"] == 1 and idx["rows"] == 4 and idx["junk"] == 1
+                and idx["global"] == {"ABCD.US"}
+                and idx["by_page"] == {"marketleaders": {"1234.SR"}, "commoditiesfx": {"ZZ=F"}}):
+            passed += 1
+        if (_retired_for_page(idx, "Global_Markets") == {"ABCD.US"}
+                and _retired_for_page(idx, "Market_Leaders") == {"ABCD.US", "1234.SR"}
+                and _retired_for_page(idx, "Commodities_FX") == {"ABCD.US", "ZZ=F"}
+                and _retired_for_page({}, "Global_Markets") == set()):
+            passed += 1
+        kept, dropped = _apply_retire_filter(["X.US", "abcd.us", "1234.SR", "Y.US", "ABCD.US"],
+                                             _retired_for_page(idx, "Global_Markets"))
+        if kept == ["X.US", "1234.SR", "Y.US"] and dropped == ["ABCD.US"]:
+            passed += 1
+        k2, d2 = _apply_retire_filter(["X.US", "Y.US"], set())
+        k3, d3 = _apply_retire_filter([], {"X.US"})
+        if k2 == ["X.US", "Y.US"] and d2 == [] and k3 == [] and d3 == []:
+            passed += 1
+        e1 = _retired_index_from_matrix(None)
+        e2 = _retired_index_from_matrix([])
+        e3 = _retired_index_from_matrix([["Retired list"], ["ABCD.US", "no header row"]])
+        if (e1["reason"] == "unreadable" and e2["reason"] == "empty"
+                and e3["reason"] == "header_not_found"
+                and not (e1["global"] or e2["global"] or e3["global"])):
+            passed += 1
+        if (_retire_decide(40, 6512, "enforce", 20.0) == "retired"
+                and _retire_decide(2000, 6512, "enforce", 20.0) == "refused"
+                and _retire_decide(5, 5, "enforce", 100.0) == "refused"
+                and _retire_decide(40, 6512, "observe", 20.0) == "would_retire"
+                and _retire_decide(0, 6512, "enforce", 20.0) == "none"
+                and _retire_decide(3, 0, "enforce", 20.0) == "none"):
+            passed += 1
+        saved = os.environ.get("TFB_SYNC_RETIRE_TAB")
+        try:
+            words = []
+            for w in ("", "off", "observe", "enforce", "1", "true", " ENFORCE "):
+                os.environ["TFB_SYNC_RETIRE_TAB"] = w
+                words.append(_retire_mode_raw())
+            if words == ["off", "off", "observe", "enforce", "off", "off", "enforce"]:
+                passed += 1
+        finally:
+            if saved is None:
+                os.environ.pop("TFB_SYNC_RETIRE_TAB", None)
+            else:
+                os.environ["TFB_SYNC_RETIRE_TAB"] = saved
+    except Exception as e:  # noqa: BLE001
+        _RETIRE_SELFTEST_MSG = "FAIL(%s)" % type(e).__name__
+        return _RETIRE_SELFTEST_MSG
+    _RETIRE_SELFTEST_MSG = "PASS" if passed == total else "FAIL %d/%d" % (passed, total)
+    return _RETIRE_SELFTEST_MSG
+
+
+def _append_runlog_retire(sheets: Any, spreadsheet_id: str, page: str, verdict: str,
+                          mode: str, dropped: List[str], n_before: int,
+                          idx: Dict[str, Any]) -> None:
+    """One best-effort, fail-open [UNIVERSE-RETIRE] _Run_Log line (the FW-3
+    channel shape) per page per leg when the list retired, would retire or
+    was refused. Telemetry only: its own failure is annotated, never counted
+    into _RUNLOG_APPEND_FAILS."""
+    if sheets is None or not dropped or verdict not in ("retired", "would_retire", "refused"):
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        status = {"retired": "RETIRED", "would_retire": "WOULD_RETIRE"}.get(verdict, "REFUSED")
+        msg = ("%s %s | mode=%s verdict=%s matched=%d of %d requested (%s%s) | tab=%s rows=%s junk=%s "
+               "reason=%s max_pct=%s | selftest=%s"
+               % (_RETIRE_TAG, page, mode, verdict, len(dropped), int(n_before or 0),
+                  ", ".join(dropped[:15]), "..." if len(dropped) > 15 else "",
+                  idx.get("tab"), idx.get("rows"), idx.get("junk"), idx.get("reason"),
+                  _retire_max_pct(), _retire_selftest()))
+        details = _runlog_meta_json(json.dumps({
+            "mode": mode, "verdict": verdict, "page": page, "retired": len(dropped),
+            "requested_before": int(n_before or 0),
+            "requested_after": int(n_before or 0) - (len(dropped) if verdict == "retired" else 0),
+            "names": list(dropped[:60]), "tab": idx.get("tab"), "tab_rows": idx.get("rows"),
+            "tab_junk": idx.get("junk"), "tab_reason": idx.get("reason"),
+            "max_pct": _retire_max_pct(), "selftest": _RETIRE_SELFTEST_MSG,
+            "version": SCRIPT_VERSION}))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, "WARNING", "run_dashboard_sync", str(page or ""),
+                            status, msg, "", "", "", details]]}
+        _last_err = None
+        for _attempt in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last_err = None
+                break
+            except Exception as _ae:
+                _last_err = _ae
+                time.sleep(1.0)
+        if _last_err is not None:
+            raise _last_err
+    except Exception as _e:
+        print("::warning::%s _Run_Log append FAILED for %s - %s"
+              % (_RETIRE_TAG, str(page or "?"), type(_e).__name__))
 
 
 def _persist_missing_symbol_rows(
@@ -10703,6 +11064,71 @@ async def _run_one_task(
                 res.warnings.append(_rb_msg)
                 logger.error(_rb_msg)
                 return res
+
+        # --- v6.64.0 [P-174] OPERATOR RETIREMENT LIST (_Retired_Symbols) ----
+        # Taken HERE, on the FINAL request list of a ranked market page (after
+        # read-back / deny filter / sanitize / ordering, before the fetch), so
+        # every downstream consumer that diffs against `symbols` (persistence,
+        # second-chance pass, the L4b hard guard, coverage floor, strict
+        # membership) sees one universe. A retired symbol is neither requested
+        # nor persisted, so its row leaves the page on this write and, because
+        # the sheet is the symbol source, stays out. off => this block is
+        # inert (no read, no line). observe => verdict disclosed, list kept.
+        # enforce => applied within TFB_SYNC_RETIRE_MAX_PCT, else REFUSED.
+        if (task.expects_rows and symbols and sheets is not None
+                and task.sheet_name in _RANKED_MARKET_PAGES
+                and _retire_mode() != "off"):
+            try:
+                _rt_mode = _retire_mode()
+                _rt_idx = _load_retired_index(sheets, spreadsheet_id)
+                _rt_set = _retired_for_page(_rt_idx, task.sheet_name)
+                _rt_keep, _rt_drop = _apply_retire_filter(symbols, _rt_set)
+                _rt_before = len(symbols)
+                _rt_verdict = _retire_decide(len(_rt_drop), _rt_before, _rt_mode, _retire_max_pct())
+                logger.info("%s %s | mode=%s verdict=%s tab=%s reason=%s tab_rows=%s junk=%s "
+                            "applicable=%d matched=%d requested=%d max_pct=%s",
+                            _RETIRE_TAG, task.sheet_name, _rt_mode, _rt_verdict,
+                            _rt_idx.get("tab"), _rt_idx.get("reason"), _rt_idx.get("rows"),
+                            _rt_idx.get("junk"), len(_rt_set), len(_rt_drop), _rt_before,
+                            _retire_max_pct())
+                if _rt_verdict != "none":
+                    if _rt_verdict == "retired":
+                        symbols = _rt_keep
+                        res._stamp_meta["retired"] = len(_rt_drop)
+                        _rt_tail = (" - not requested, not persisted; the rows leave the "
+                                    "page on this write.")
+                    elif _rt_verdict == "refused":
+                        _rt_tail = (" - REFUSED: the match exceeds TFB_SYNC_RETIRE_MAX_PCT="
+                                    "%s%% of the request list (or would empty it); list "
+                                    "unchanged. Fix the tab or raise the cap deliberately."
+                                    % _retire_max_pct())
+                    else:
+                        _rt_tail = (" - observe: request list unchanged (TFB_SYNC_RETIRE_TAB="
+                                    "enforce applies it%s)."
+                                    % ("; NOTE enforce would REFUSE this match - above "
+                                       "TFB_SYNC_RETIRE_MAX_PCT=%s%%" % _retire_max_pct()
+                                       if _retire_decide(len(_rt_drop), _rt_before, "enforce",
+                                                         _retire_max_pct()) == "refused"
+                                       else ""))
+                    _rt_w = ("%s %s: %s %d of %d requested symbol(s) listed in %s: %s%s%s"
+                             % (_RETIRE_TAG, task.sheet_name,
+                                {"retired": "retired", "refused": "matched"}.get(_rt_verdict, "would retire"),
+                                len(_rt_drop), _rt_before, _rt_idx.get("tab"),
+                                ", ".join(_rt_drop[:15]), "..." if len(_rt_drop) > 15 else "",
+                                _rt_tail))
+                    res.warnings.append(_rt_w)
+                    logger.warning(_rt_w)
+                    print("::warning::" + _rt_w)
+                    if not dry_run:          # "Dry run: no sheet write" holds for this channel too
+                        try:
+                            _append_runlog_retire(sheets, spreadsheet_id, task.sheet_name, _rt_verdict,
+                                                  _rt_mode, _rt_drop, _rt_before, _rt_idx)
+                        except Exception:
+                            pass
+            except Exception as _rte:  # never let the list break the leg
+                logger.warning("%s %s: skipped (%s: %s)", _RETIRE_TAG, task.sheet_name,
+                               type(_rte).__name__, _rte)
+        # ----------------------------------------------------------------------
 
         res.symbols_requested = len(symbols)
 
