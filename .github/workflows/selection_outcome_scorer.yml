@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Selection_Log ticket-vs-reality scorer (v0.1.0, 2026-08-22)
+# READ-ONLY / ARTIFACT-ONLY: exports _Selection_Log via the Sheets CSV
+# export URL, scores every sized ticket against EODHD closes, uploads
+# selection_outcomes.csv as a run artifact. Writes NOTHING to the workbook.
+# NOT an S-1 instrument (criterion 1 is run_shadow_scorer.py's job).
+# workflow_dispatch ONLY — no cron until the first run is observed.
+# ---------------------------------------------------------------------------
+name: Selection Outcome Scorer
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TFB_EODHD_API_KEY: ${{ secrets.TFB_EODHD_API_KEY }}
+      TFB_SHEET_ID: ${{ secrets.TFB_SHEET_ID }}
+      GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Selftest (offline fixtures, no network)
+        run: python3 scripts/score_selection_log.py --selftest
+      - name: Export _Selection_Log
+        run: |
+          pip install --quiet google-api-python-client google-auth
+          python3 - <<'PY'
+          import csv, io, json, os
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          creds = service_account.Credentials.from_service_account_info(
+              json.loads(os.environ["GOOGLE_CREDS_JSON"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+          svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+          vals = svc.spreadsheets().values().get(
+              spreadsheetId=os.environ["TFB_SHEET_ID"],
+              range="_Selection_Log").execute().get("values", [])
+          with open("_Selection_Log.tsv", "w", newline="", encoding="utf-8") as fh:
+              csv.writer(fh, delimiter="\t").writerows(vals)
+          print(f"exported {len(vals)-1} rows")
+          PY
+      - name: Score
+        run: |
+          python3 scripts/score_selection_log.py \
+            --tsv _Selection_Log.tsv --fetch --out selection_outcomes.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selection-outcomes-${{ github.run_number }}
+          path: selection_outcomes.csv
+          retention-days: 90
