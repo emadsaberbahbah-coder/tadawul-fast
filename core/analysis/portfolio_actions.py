@@ -776,7 +776,44 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
 # _apply_f1_observe_tag). Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.13.0"
+PORTFOLIO_ACTIONS_VERSION = "1.13.1"
+# v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
+# HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
+# WHY: every RULE in this file already stands down for a SUKUK-class
+# holding - D-9 (v1.2.1) never a SELL leg, RULE-1b (v1.7.3) never a
+# position-cap TRIM, v1.3.0 its own "Sukuk (fixed income)" bucket, F-2
+# (v1.12.1) drawdown/time guard exempt - yet the ROW still prints the
+# equity ladder: 5023.SR (Arabian Centres sukuk, par 100) shows
+# "Stop SAR 92.23 / TP1 102.70 / TP2 105.16", the advisor note repeats
+# "stop 92.2 / TP1 102.7 / TP2 105.2 SAR", and the F-1a observe tag prints
+# "[f1-observe] plan 3M ROI 2.4% vs 3.0%" - an equity valuation test
+# (TP1/price - 1) on a paper that is held for its coupon and exits by
+# maturity, issuer event or operator decision. Live specimen: every
+# Portfolio_Decision run since v1.12.0 (09-28 register note; 09-30 08:15
+# export). A printed stop on a sukuk invites the one action the rules
+# refuse to take. Display class only (register P-153; scope cut from
+# v1.13.0 to keep one mechanism per build).
+# FIX (DEFAULT ON - the OFF state IS the defect, the v1.22.2 near-miss
+# text precedent; kill-switch TFB_PA_SUKUK_LADDER_LEGACY=1 restores the
+# v1.13.0 row byte-for-byte; also inert when TFB_PA_PROTECT_SUKUK=0, the
+# sukuk master switch):
+#   * _action_row: stop_sar / tp1_sar / tp2_sar are None (rendered blank,
+#     the v1.7.2 B-7 contract) on a SUKUK-class row; detail gains
+#     ladder_display = "sukuk_na" on that row only.
+#   * _advisor_sentence: the "stop x / TP1 y / TP2 z SAR" bit is replaced
+#     by SUKUK_LADDER_NOTE on a SUKUK-class ADD/HOLD row.
+#   * _apply_f1_observe_tag: under TFB_FORECAST_BASIS=observe a SUKUK-class
+#     row carries "[f1-observe] n/a - sukuk / fixed income (D-9) ..." so
+#     the per-row observe count stays complete while no equity basis is
+#     printed; legacy/plan3m modes are untouched pass-throughs.
+# NOT changed: decide_action (the ADD ladder's "Upside x% below add
+# threshold" wording and the plan3m leg are decision logic, not display),
+# roi_pct / engine ROI cells, the sector bucket, D-9 / RULE-1b / F-2
+# rules, the confirmation gate, funding, KPIs, alerts. Equity rows are
+# byte-identical in every mode (harness S2/S5).
+# Functions added: 2 (_env_sukuk_ladder_legacy, _sukuk_display_active);
+# one constant SUKUK_LADDER_NOTE. Removed: 0.
+# ---------------------------------------------------------------------------
 # v1.13.0 (2026-09-28) - [P-168b SESSION-KEYED ADD CONFIRMATION] A
 # CONFIRMATION DAY IS A COMPLETED TRADING SESSION, NOT A CALENDAR DATE
 # WHY: _apply_add_confirmation keys its "distinct consecutive days" on the
@@ -2861,6 +2898,34 @@ def _null_levels_enabled():
         not in ("0", "false", "off", "no")
 
 
+SUKUK_LADDER_NOTE = ("sukuk / fixed income (D-9): held for income - no equity "
+                     "stop/TP ladder (exit by maturity, issuer event or operator "
+                     "decision)")
+
+
+def _env_sukuk_ladder_legacy():
+    """v1.13.1 [P-153] kill-switch. TFB_PA_SUKUK_LADDER_LEGACY=1/true/on/yes
+    restores the v1.13.0 display (equity ladder cells, the ladder bit of the
+    advisor note and the plan-3M observe tag on a sukuk row) byte-for-byte.
+    Default OFF = the fix is live. Read at call time (no restart)."""
+    return (os.getenv("TFB_PA_SUKUK_LADDER_LEGACY") or "0").strip().lower() \
+        in ("1", "true", "on", "yes")
+
+
+def _sukuk_display_active(cand):
+    """v1.13.1 [P-153]: True when the sukuk display contract applies to this
+    holding - the D-9 master switch is on (TFB_PA_PROTECT_SUKUK, default 1),
+    the kill-switch is off, and the compliance gate classes the holding
+    SUKUK (_is_sukuk_holding, the D-9 classifier). Fail-open False = the
+    equity display, exactly v1.13.0."""
+    try:
+        return bool(_protect_sukuk_enabled()
+                    and not _env_sukuk_ladder_legacy()
+                    and _is_sukuk_holding(cand))
+    except Exception:
+        return False
+
+
 def _level_sar(level, fx, nd=2):
     """v1.7.2 B-7: a price LEVEL (stop / TP1 / TP2) converted to SAR.
     Returns None — rendered blank — when the level is absent or not
@@ -2907,7 +2972,11 @@ def _advisor_sentence(entry, controls, review_date):
     else:
         bits.append("HOLD")
     bits.append(entry["action_reason"])
-    if act in (ACTION_ADD, ACTION_HOLD) and cand.get("stop") is not None:
+    if act in (ACTION_ADD, ACTION_HOLD) and _sukuk_display_active(cand):
+        # v1.13.1 [P-153]: a sukuk states its own exit contract; the equity
+        # ladder bit below is never printed for it.
+        bits.append(SUKUK_LADDER_NOTE)
+    elif act in (ACTION_ADD, ACTION_HOLD) and cand.get("stop") is not None:
         # v1.7.2 B-7: name an absent ladder instead of printing 0/0.
         _s = _level_sar(cand.get("stop"), fx)
         _t1 = _level_sar(cand.get("tp1"), fx)
@@ -3032,6 +3101,13 @@ def _apply_f1_observe_tag(cand, reason, controls):
     plan3m are pure pass-throughs here."""
     if _env_forecast_basis() != "observe":
         return reason
+    if _sukuk_display_active(cand):
+        # v1.13.1 [P-153]: plan-3M (TP1/price - 1) is an equity valuation
+        # test; a sukuk row keeps the observe token (complete per-row
+        # count) and prints no basis pair.
+        tag = ("[f1-observe] n/a - sukuk / fixed income (D-9): equity "
+               "valuation basis not applied")
+        return ("%s; %s" % (reason, tag)) if reason else tag
     roi = _to_float((cand or {}).get("roi_pct"))
     plan = _f1_plan_roi_pct(cand)
     thr = controls["add_roi_3m_pct"]
@@ -3108,6 +3184,8 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
 def _action_row(entry, review_date, controls):
     cand = entry["cand"]
     fx = cand.get("fx_to_sar")
+    # v1.13.1 [P-153]: a SUKUK-class row carries no equity ladder cells.
+    _sk_disp = _sukuk_display_active(cand)
     # v1.0.1: surface the engine 12M forecast alongside (never substituted into)
     # the valuation roi_pct. OFF => engine_pct stays None and every assignment
     # below is byte-identical v1.0.0.
@@ -3149,9 +3227,9 @@ def _action_row(entry, review_date, controls):
         "proceeds_sar": _round(entry.get("proceeds_sar"), 0),
         "post_trade_weight_pct": entry.get("post_trade_weight_pct"),
         "funds_from": entry.get("funds_from"),
-        "stop_sar": _level_sar(cand.get("stop"), fx),
-        "tp1_sar": _level_sar(cand.get("tp1"), fx),
-        "tp2_sar": _level_sar(cand.get("tp2"), fx),
+        "stop_sar": None if _sk_disp else _level_sar(cand.get("stop"), fx),
+        "tp1_sar": None if _sk_disp else _level_sar(cand.get("tp1"), fx),
+        "tp2_sar": None if _sk_disp else _level_sar(cand.get("tp2"), fx),
         "roi_pct": _round(cand.get("roi_pct"), 1),
         "ann_roi_pct": _round(cand.get("ann_roi_pct"), 1),
         "reliability": _round(cand.get("reliability"), 1),
@@ -3177,6 +3255,9 @@ def _action_row(entry, review_date, controls):
         },
     }
     _annotate_hold_edge(row)  # v1.2.0 hold-edge stamp (env-gated)
+    if _sk_disp:
+        # v1.13.1 [P-153]: machine-readable witness on the sukuk row only.
+        row["detail"]["ladder_display"] = "sukuk_na"
     if _eng_display:
         row["engine_roi_pct"] = _round(engine_pct, 1)
         row["valuation_roi_pct"] = _round(cand.get("roi_pct"), 1)
