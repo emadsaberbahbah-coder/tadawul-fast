@@ -305,7 +305,45 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # logic, shared with the retry), _board_fresh_retry, stale_board_override.
 # Removed: 0. Kill: unset the env var.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.8.0"
+# v1.9.0 (2026-09-30) — P-176 EVIDENCE-DAY KEY + VISIBLE DUPLICATE REFUSAL
+# WHY (measured 2026-09-30 on the live tab + Actions history): the history
+# date key was `_today_riyadh()` = the Riyadh WALL-CLOCK date at run time.
+# The 15:20 UTC schedule slips routinely (the last six shadow-board crons
+# fired 4.2-6.5 h late); a slip of >= 2 h 40 m crosses midnight Riyadh.
+# Run #76 (the 2026-09-28 slot) fired after 21:00 UTC, computed today =
+# 2026-09-29, and appended the 09-28 board's evaluation under 2026-09-29.
+# Run #77 (the real 2026-09-29 slot, 20:00 UTC) then hit the append-only
+# guard `already recorded — refusing duplicate` — printed to stdout only —
+# and exited 0 without a sheet row. One jitter event consumed TWO calendar
+# days, the second one unrecoverably (S1_Gate stayed byte-identical; nothing
+# in _Run_Log said why). The board-fresh guard compounded it: the stale test
+# compares the board's as-of with the same wrong `today`.
+# DESIGN (one pure function, one call site):
+#   * evidence_day(now_utc, slot) = the date of the most recent scheduled
+#     slot boundary <= now: (now_utc - slot_offset).date(). At the slot
+#     itself (15:20 UTC = 18:20 Riyadh) this equals the Riyadh date, so an
+#     on-time run is BYTE-IDENTICAL to v1.8.0; only a late run differs, and
+#     there the wall-clock date is provably the wrong key (#76). A manual
+#     dispatch before the slot keys to the previous evidence day — that is
+#     the recovery path for a failed slot (dispatch next morning records
+#     yesterday), and a genuine duplicate is now refused VISIBLY.
+#   * TFB_S1_DAY_KEY = slot (DEFAULT ON — protective, v1.5.0 B-2 precedent:
+#     the OFF state IS the defect) | observe (wall-clock key kept, drift
+#     only logged) | wallclock (kill switch = v1.8.0 byte-for-byte).
+#     TFB_S1_SLOT_UTC = "HH:MM" (default 15:20 = the yml cron; keep in step).
+#   * The duplicate refusal appends one _Run_Log row (status
+#     DUPLICATE_REFUSED, wall-clock vs key dates in the JSON) so the evidence
+#     lane can never no-op silently again. --dry-run stays zero-write.
+#   * `[S1-DAY-KEY v1.9.0] mode=.. key=.. wallclock=.. slot=..` prints on
+#     every path; the token is appended to the verdict line / S1_Gate meta /
+#     _Run_Log JSON ONLY when key != wall-clock (drift), so on-time output
+#     stays byte-identical.
+# UNTOUCHED: count_scored_days, evaluate_s1, basket math, day classes,
+# HISTORY_HEADER, constants (S-1 integrity contract). Functions added: 4
+# (_day_key_mode, _slot_utc_hm, evidence_day, resolve_evidence_day).
+# Removed: 0. Rollback: TFB_S1_DAY_KEY=wallclock in shadow_scorer.yml.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.9.0"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -359,6 +397,65 @@ _BLOCKING = {"AUTHORITY_FAIL", "MODEL_SCREEN_FAIL", "UNKNOWN", "DATA_STALE",
 
 def _today_riyadh() -> date:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+
+
+def _day_key_mode() -> str:
+    """v1.9.0 P-176: slot (default) | observe | wallclock. Read at call time;
+    any other value falls to the DEFAULT (slot) — the protective state."""
+    v = (os.getenv("TFB_S1_DAY_KEY") or "").strip().lower()
+    if v in ("wallclock", "legacy", "0", "off"):
+        return "wallclock"
+    if v == "observe":
+        return "observe"
+    return "slot"
+
+
+def _slot_utc_hm(raw: Optional[str] = None) -> Tuple[int, int]:
+    """v1.9.0 PURE: the scheduled slot as (hour, minute) UTC. Default 15:20
+    (shadow_scorer.yml cron "20 15 * * *"). Unparseable -> default; never
+    raises."""
+    s = (raw if raw is not None else os.getenv("TFB_S1_SLOT_UTC") or "15:20")
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(s))
+    if not m:
+        return (15, 20)
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return (15, 20)
+    return (h, mi)
+
+
+def evidence_day(now_utc: Optional[datetime] = None,
+                 slot_hm: Optional[Tuple[int, int]] = None) -> date:
+    """v1.9.0 PURE: the evidence day = the date of the most recent scheduled
+    slot boundary at or before `now_utc`, i.e. (now - slot_offset).date().
+    At the slot (15:20 UTC = 18:20 Riyadh) this equals the Riyadh date, so
+    on-time runs key exactly as v1.8.0; a run delayed past midnight Riyadh
+    keeps its own slot's date instead of stealing the next day's."""
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    h, mi = slot_hm if slot_hm is not None else _slot_utc_hm()
+    return (now - timedelta(hours=h, minutes=mi)).date()
+
+
+def resolve_evidence_day(now_utc: Optional[datetime] = None
+                         ) -> Tuple[date, Dict[str, Any]]:
+    """v1.9.0: (date to key today's evidence, JSON-safe details). Mode slot
+    -> the slot key; observe/wallclock -> the wall-clock Riyadh date (observe
+    only reports the drift). Never raises."""
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    mode = _day_key_mode()
+    slot_hm = _slot_utc_hm()
+    wall = (now + timedelta(hours=3)).date()
+    slot_day = evidence_day(now, slot_hm)
+    chosen = slot_day if mode == "slot" else wall
+    details = {"mode": mode, "key": str(chosen), "wallclock": str(wall),
+               "slot": str(slot_day), "slot_utc": f"{slot_hm[0]:02d}:{slot_hm[1]:02d}",
+               "drift": bool(slot_day != wall),
+               "now_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    return chosen, details
 
 
 def _num(x: Any) -> Optional[float]:
@@ -1292,7 +1389,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _selftest()
 
     os.environ.setdefault("TFB_COMPLIANCE_GATE_ENABLED", "1")
-    today = _today_riyadh()
+    today, _dk = resolve_evidence_day()          # v1.9.0 P-176 evidence-day key
+    _dk_line = (f"[S1-DAY-KEY v{SCRIPT_VERSION}] mode={_dk['mode']} "
+                f"key={_dk['key']} wallclock={_dk['wallclock']} "
+                f"slot={_dk['slot']}@{_dk['slot_utc']}Z"
+                + (" DRIFT" if _dk["drift"] else ""))
+    print(_dk_line)
     sh = sb._open_sheet(args.sheet_id)
 
     if args.rollback_drill_passed:
@@ -1342,9 +1444,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     history = read_history(sh)
     if any(h["date"] == str(today) for h in history):
-        print(f"[S1-GATE v{SCRIPT_VERSION}] {today} already recorded — "
-              f"append-only, refusing duplicate (point-in-time integrity)")
+        _dup_msg = (f"[S1-GATE v{SCRIPT_VERSION}] {today} already recorded — "
+                    f"append-only, refusing duplicate (point-in-time integrity)")
+        print(_dup_msg)
         if not args.dry_run:
+            # v1.9.0 P-176: the refusal is evidence — write it where the
+            # evidence lane is read (stdout-only refusal hid the 09-29 loss).
+            try:
+                sh.worksheet("_Run_Log").append_row(
+                    [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                     "WARNING", "shadow_scorer", TAB_GATE, "DUPLICATE_REFUSED",
+                     _dup_msg + f" | {_dk_line}", "", "", "",
+                     json.dumps({"version": SCRIPT_VERSION,
+                                 "duplicate_of": str(today),
+                                 "day_key": _dk})],
+                    value_input_option="RAW")
+            except Exception:  # noqa: BLE001
+                pass
             return 0
 
     prev = {b: last_row_for(history, b)
@@ -1550,6 +1666,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         verdict += (f" | [S1-BOARD-FRESH v{SCRIPT_VERSION}] "
                     f"asof={_bf_asof or '?'} mode={_bf_mode}"
                     + (" STALE" if _bf_stale else ""))
+    if _dk["drift"]:                               # v1.9.0 P-176 read-back
+        verdict += f" | {_dk_line}"
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
         _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
         verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
@@ -1589,7 +1707,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}",
          _pe_line,                                  # v1.7.1 read-back cell
          _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")
-         + f" | {_fresh_line}"],                    # v1.7.3 read-back cell
+         + f" | {_fresh_line}"
+         + (f" | {_dk_line}" if _dk["drift"] else "")],  # v1.7.3 / v1.9.0 cells
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1625,7 +1744,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                      "shape_guard": {"on": _sg_on,
                                                      "dropped": _sg_dropped[:12]},
                                      "excluded_reason": _excl_reason,
-                                     "freshness": _fresh_details})],
+                                     "freshness": _fresh_details,
+                                     "day_key": _dk})],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -2061,6 +2181,56 @@ def _selftest() -> int:
     checks.append(("FRESH: seed day (no prev) -> all seats new, nothing paired",
                    _freshness_detail(["A"], None, {"A": 1.0},
                                      0, 0, [], 0.6)[1]["new"] == ["A"]))
+
+    # v1.9.0 P-176 evidence-day key (pure; replays the live #76/#77 case)
+    _t = lambda s: datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
+    checks.append(("DAYKEY: on-time slot run keys the Riyadh date (v1.8.0 parity)",
+                   evidence_day(_t("2026-09-29T15:20:00Z"), (15, 20))
+                   == date(2026, 9, 29)
+                   == (_t("2026-09-29T15:20:00Z") + timedelta(hours=3)).date()))
+    checks.append(("DAYKEY: run #76 replay 2026-09-28 21:40Z -> 09-28 (wall-clock said 09-29)",
+                   evidence_day(_t("2026-09-28T21:40:00Z"), (15, 20))
+                   == date(2026, 9, 28)))
+    checks.append(("DAYKEY: run #77 replay 2026-09-29 20:00Z -> 09-29 (no longer a duplicate)",
+                   evidence_day(_t("2026-09-29T20:00:00Z"), (15, 20))
+                   == date(2026, 9, 29)))
+    checks.append(("DAYKEY: 9h40m-late run 2026-09-30 01:00Z still keys 09-29",
+                   evidence_day(_t("2026-09-30T01:00:00Z"), (15, 20))
+                   == date(2026, 9, 29)))
+    checks.append(("DAYKEY: one second before the next slot keys the prior day; at the slot the new day",
+                   evidence_day(_t("2026-09-30T15:19:59Z"), (15, 20)) == date(2026, 9, 29)
+                   and evidence_day(_t("2026-09-30T15:20:00Z"), (15, 20)) == date(2026, 9, 30)))
+    checks.append(("DAYKEY: slot parser default 15:20, custom 05:10, junk -> default",
+                   _slot_utc_hm(None) in ((15, 20), _slot_utc_hm(os.getenv("TFB_S1_SLOT_UTC")))
+                   and _slot_utc_hm("05:10") == (5, 10)
+                   and _slot_utc_hm("junk") == (15, 20)
+                   and _slot_utc_hm("25:99") == (15, 20)))
+    _dk_saved = os.environ.get("TFB_S1_DAY_KEY")
+    os.environ["TFB_S1_DAY_KEY"] = "wallclock"
+    _dk_wall = resolve_evidence_day(_t("2026-09-28T21:40:00Z"))
+    os.environ["TFB_S1_DAY_KEY"] = "observe"
+    _dk_obs = resolve_evidence_day(_t("2026-09-28T21:40:00Z"))
+    os.environ.pop("TFB_S1_DAY_KEY", None)
+    _dk_def = resolve_evidence_day(_t("2026-09-28T21:40:00Z"))
+    os.environ["TFB_S1_DAY_KEY"] = "junk-value"
+    _dk_junk = resolve_evidence_day(_t("2026-09-28T21:40:00Z"))
+    if _dk_saved is None:
+        os.environ.pop("TFB_S1_DAY_KEY", None)
+    else:
+        os.environ["TFB_S1_DAY_KEY"] = _dk_saved
+    checks.append(("DAYKEY: kill switch wallclock keeps the v1.8.0 date and reports drift",
+                   _dk_wall[0] == date(2026, 9, 29) and _dk_wall[1]["mode"] == "wallclock"
+                   and _dk_wall[1]["drift"] is True))
+    checks.append(("DAYKEY: observe keeps the wall-clock date, logs drift only",
+                   _dk_obs[0] == date(2026, 9, 29) and _dk_obs[1]["mode"] == "observe"
+                   and _dk_obs[1]["slot"] == "2026-09-28"))
+    checks.append(("DAYKEY: default (unset) and junk env = slot mode -> 09-28",
+                   _dk_def[0] == date(2026, 9, 28) and _dk_def[1]["mode"] == "slot"
+                   and _dk_junk[0] == date(2026, 9, 28) and _dk_junk[1]["mode"] == "slot"))
+    checks.append(("DAYKEY: tz-aware input handled; details JSON-safe",
+                   evidence_day(datetime(2026, 9, 28, 21, 40, tzinfo=timezone.utc), (15, 20))
+                   == date(2026, 9, 28)
+                   and json.dumps(_dk_def[1]) is not None))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
