@@ -74,7 +74,7 @@ websockets==13.1
 # ----------------------------------------------------------------------------
 yfinance==0.2.66
 pandas==2.3.3
-numpy==1.26.4
+numpy==2.4.6
 pandas-market-calendars==4.6.1
 exchange-calendars==4.13.2
 
