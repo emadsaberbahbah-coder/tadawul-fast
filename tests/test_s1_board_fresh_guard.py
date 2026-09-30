@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_shadow_scorer v1.8.0 K-harness — REAL module (full selftest battery +
+"""run_shadow_scorer v1.9.0 K-harness (v1.8.0 guard surface re-run on v1.9.0) — REAL module (full selftest battery +
 the new guard's pure surface). K1 selftest parity | K2 asof parsing incl. the
 LIVE meta shape | K3 mode reader | K4 override truth table incl. non-trading
 precedence | K5 retry recovers a race and stops on the window; injectable
@@ -7,14 +7,14 @@ sleep, zero real waiting. Run x3, identical digest."""
 import importlib.util, os, sys, json, hashlib, subprocess
 spec = importlib.util.spec_from_file_location("s1", "scripts/run_shadow_scorer.py")
 s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)
-assert s1.SCRIPT_VERSION == "1.8.0"
+assert s1.SCRIPT_VERSION == "1.9.0"
 
 # K1: the full existing battery still passes on the revised module
 r = subprocess.run([sys.executable, "scripts/run_shadow_scorer.py", "--selftest"],
                    capture_output=True, text=True)
 line = [l for l in r.stdout.splitlines() if "SELFTEST" in l][-1]
-assert r.returncode == 0 and "89/89" in line, line
-print("K1 PASS  full existing selftest battery 89/89 on v1.8.0:", line.strip())
+assert r.returncode == 0 and "99/99" in line, line
+print("K1 PASS  full existing selftest battery 99/99 on v1.9.0:", line.strip())
 
 # K2: asof parsing — the EXACT live meta shape + failure modes
 live_meta = [["SHADOW BOARD v1.3.0", "as of 2026-09-11 17:44 Riyadh",
