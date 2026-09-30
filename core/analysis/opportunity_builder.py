@@ -1249,7 +1249,44 @@ from datetime import datetime, timedelta, timezone
 # _conf_default_tag_hit, _rel_cluster_required_text). Removed: 0.
 # Rollback: env unset (no deploy) or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.22.1"
+# -----------------------------------------------------------------------------
+# v1.22.2 [P-171 / P-149 NEAR-MISS TEXT TRUTH] (2026-09-30, One-Pass; owner
+# Claude; display semantics only — selection, gates, sizing, deferral
+# decisions, KPIs and alerts byte-untouched).
+# WHY (09-30 cockpit 08:55:20, req d9bf9ef769fb, board r27/r50/r52 vs r83):
+#   (1) BBOX.L: deferral says "sized ticket 6,737 SAR below minimum ticket
+#       floor 27,700 SAR" while the NEAR MISS 'Required' cell says "fundable
+#       amount >= minimum ticket floor (1,000 SAR)". Both numbers are real:
+#       27,700 is the .L VENUE floor (TFB_OPP_VENUE_FLOORS=1 raises the
+#       operator floor per _VENUE_COSTS: LSE min fee 97.2 SAR/side), 1,000
+#       is the operator floor — but the Required text printed
+#       criteria["min_ticket_sar"] regardless of the raise. Two floors on one
+#       row read as a contradiction (P-171, second specimen).
+#   (2) DDI.US: verdict INVEST with the STRUCTURAL Portfolio gate failed
+#       (held; Include Portfolio Holdings = No). _near_miss_rows has no
+#       branch for "INVEST but structurally blocked", so it fell into the
+#       INVEST branch and printed "Capacity / rank beyond Max Selected /
+#       Max Selected = 10" for a rank-3 name — a false capacity story
+#       (P-149, builder half; the cockpit's own 'Why Not Selected' text is
+#       the GAS half).
+# WHAT (DEFAULT ON — the OFF state IS the defect, P-127/P-142/P-145
+#   precedent; kill TFB_OPP_NEARMISS_TEXT_LEGACY=1 => v1.22.1 strings
+#   byte-for-byte):
+#   * _effective_min_ticket(symbol, criteria) -> (floor_sar, source) with
+#     source "operator" or "venue:.L" — one pure helper used by BOTH the
+#     sizing deferral text and the near-miss Required text, so they can no
+#     longer disagree. The deferral keeps its "minimum ticket floor" token
+#     (substring contract with _near_miss_rows and the cockpit) and gains
+#     " (.L venue floor; operator floor 1,000 SAR)" only when the venue
+#     raised it.
+#   * _near_miss_rows: a structurally blocked INVEST row is classified by
+#     its own first failing gate (Portfolio: held / exclude holdings …) with
+#     a note that says "held position — add or trim via the Portfolio page,
+#     not the board", instead of Capacity.
+# Functions added: 2 (_env_nearmiss_text_legacy, _effective_min_ticket).
+# Removed: 0. No new ENV besides the kill switch. Rollback: env or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.22.2"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -2734,6 +2771,34 @@ def _held_target_age(warnings_text):
 def _venue_floor(symbol):
     row = _venue_cost_row(symbol)
     return row[3] if row else None
+
+
+def _env_nearmiss_text_legacy():
+    """v1.22.2 [P-171/P-149] kill switch: 1 => v1.22.1 near-miss / floor
+    strings byte-for-byte. Default OFF => truthful text."""
+    return _env_flag01("TFB_OPP_NEARMISS_TEXT_LEGACY", "0")
+
+
+def _effective_min_ticket(symbol, criteria):
+    """v1.22.2 PURE: (floor_sar, source) — the floor that actually applies to
+    this symbol: the operator floor (criteria["min_ticket_sar"]) unless
+    TFB_OPP_VENUE_FLOORS is on and the venue floor is higher, in which case
+    the venue floor with source "venue:<suffix>". Never raises."""
+    try:
+        floor = float((criteria or {}).get("min_ticket_sar", 0.0) or 0.0)
+    except Exception:
+        floor = 0.0
+    source = "operator"
+    try:
+        if _env_venue_floors():
+            vf = _venue_floor(symbol)
+            if vf and float(vf) > floor:
+                s = _to_text(symbol).strip().upper()
+                suf = ("." + s.rsplit(".", 1)[1]) if "." in s else ".US"
+                floor, source = float(vf), "venue:" + suf
+    except Exception:
+        pass
+    return floor, source
 
 
 def rt_cost_pct(symbol, ticket_sar):
@@ -5140,9 +5205,16 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             if _vf and float(_vf) > _min_ticket:
                 _min_ticket = float(_vf)
         if _min_ticket > 0.0 and 0.0 < suggested < _min_ticket:
+            _floor_note = ""
+            if not _env_nearmiss_text_legacy():   # v1.22.2 P-171: name the floor
+                _ef, _esrc = _effective_min_ticket(cand["symbol"], criteria)
+                if _esrc != "operator" and abs(_ef - _min_ticket) < 0.5:
+                    _floor_note = (" (" + _esrc.split(":", 1)[1] +
+                                   " venue floor; operator floor " +
+                                   _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
             deferrals[cand["symbol"]] = (
                 "Unfunded \u2014 sized ticket " + _fmt_sar(suggested) +
-                " below minimum ticket floor " + _fmt_sar(_min_ticket))
+                " below minimum ticket floor " + _fmt_sar(_min_ticket) + _floor_note)
             _LAST_FUNDING_NEEDS[cand["symbol"]] = {   # v1.18.0
                 "need_sar": float(_min_ticket), "sized_sar": float(suggested),
                 "remaining_sar": float(remaining)}
@@ -5482,13 +5554,34 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
             # the gate / required / how-to columns are accurate. Real
             # diversification deferrals keep their byte-identical labeling.
             if "minimum ticket floor" in _reason:
-                gate, cur, req = "Funding", _reason, (
-                    "fundable amount \u2265 minimum ticket floor (" +
-                    _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
-                note = ("Qualified (INVEST) \u2014 ranked, but the fundable "
-                        "amount was below the minimum ticket floor; add Cash "
-                        "Available, lower Max Selected, or lower the floor to "
-                        "fund it.")
+                if _env_nearmiss_text_legacy():
+                    gate, cur, req = "Funding", _reason, (
+                        "fundable amount \u2265 minimum ticket floor (" +
+                        _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
+                    note = ("Qualified (INVEST) \u2014 ranked, but the fundable "
+                            "amount was below the minimum ticket floor; add Cash "
+                            "Available, lower Max Selected, or lower the floor to "
+                            "fund it.")
+                else:                                  # v1.22.2 P-171
+                    _ef, _esrc = _effective_min_ticket(a["symbol"], criteria)
+                    gate, cur = "Funding", _reason
+                    if _esrc == "operator":
+                        req = ("fundable amount \u2265 minimum ticket floor (" +
+                               _fmt_sar(_ef) + ")")
+                        note = ("Qualified (INVEST) \u2014 ranked, but the fundable "
+                                "amount was below the minimum ticket floor; add Cash "
+                                "Available, lower Max Selected, or lower the floor to "
+                                "fund it.")
+                    else:
+                        req = ("fundable amount \u2265 " + _esrc.split(":", 1)[1] +
+                               " venue floor (" + _fmt_sar(_ef) + "; operator floor " +
+                               _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
+                        note = ("Qualified (INVEST) \u2014 ranked, but the fundable "
+                                "amount was below the " + _esrc.split(":", 1)[1] +
+                                " venue floor (Derayah minimum fee makes a smaller "
+                                "ticket uneconomic); add Cash Available or accept the "
+                                "venue floor \u2014 lowering the operator floor "
+                                "does not unblock it.")
             elif "Duplicate issuer" in _reason:
                 # v1.0.17: the v1.0.16 issuer-dedup adds a "Duplicate issuer"
                 # deferral to the same dict — classify it distinctly so it is
@@ -5515,6 +5608,19 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
                     "within sector/market caps")
                 note = (
                     "Qualified (INVEST) \u2014 deferred by diversification cap")
+        elif (a["verdict"] == VERDICT_INVEST and a.get("structural_block")
+              and a.get("first_fail") and not _env_nearmiss_text_legacy()):
+            # v1.22.2 P-149: an INVEST row kept out by a STRUCTURAL gate is
+            # not a capacity miss — name the gate that actually holds it.
+            _ff = a["first_fail"]
+            gate, cur, req = _ff.get("gate") or "?", _ff.get("current"), _ff.get("required")
+            if (_ff.get("gate") or "") == "Portfolio":
+                note = ("Qualified (INVEST) \u2014 held position; excluded from new "
+                        "board tickets by Include Portfolio Holdings = No. Add or "
+                        "trim via the Portfolio page, not the board.")
+            else:
+                note = ("Qualified (INVEST) \u2014 structurally excluded by the " +
+                        (_ff.get("gate") or "?") + " gate; not a capacity or funding miss.")
         elif a["verdict"] == VERDICT_INVEST:
             gate, cur, req = "Capacity", "rank beyond Max Selected", (
                 "Max Selected = " + str(criteria["max_selected"]))
