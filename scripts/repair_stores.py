@@ -68,7 +68,32 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-TOOL_VERSION = "1.0.0"
+# =============================================================================
+# v1.1.0 (2026-08-01, CG-7) — PHASE B4: REGISTERED-ISSUER SWEEP + KNOWN-DEFECT
+# SEED REPORT. The engine LKG is process-memory only (_FUND_LKG_STORE) and the
+# KLG keep-gate restores from the SHEET GRID itself — so the "last-good store"
+# to sweep IS the market pages, exactly this tool's Phase-B domain. B1-B3
+# catch structurally broken rows; the 2026-08-01 live poisonings (BF-A
+# carrying Biofrontera, DENN.US carrying Amer Sports) are NAMED and COHERENT,
+# invisible to all three. B4 consults critical_symbol_identity v1.1.0
+# (identity_contradiction: the SAME registry run_dashboard_sync v6.31.0 now
+# enforces at its FW seams — one registry, one truth): registered-issuer
+# mismatch, venue contradiction, malformed .SR. Rows that are ALREADY clean
+# stubs (blank name AND blank price) are skipped — a stub is the repair
+# outcome, not a contradiction. APPLY first copies each offending row to
+# _Identity_Quarantine (Timestamp/Page/Row/Symbol/Reason/Name/Price/RowJSON;
+# tab auto-created) and only then blanks-to-stub with
+# identity_repaired:issuer:v1.1.0 — reversible by construction, never a
+# delete. Plus a report-only status of the six known-defect symbols (BK.US,
+# BRK-B.US, FISV.US, 8270.SR, 4328.SR, 3001.SR) with the exact one-dispatch
+# TFB_SYNC_FORCE_REFETCH_SYMBOLS re-seed instructions printed when needed.
+# Kill-switch REPAIR_ISSUER_SWEEP (default ON; 0/false/off/no -> B4 reports
+# skipped and v1.0.0 output is byte-identical). csi unavailable -> B4
+# SKIPPED with reason, v1.0.0 phases untouched (fail-open). DRY remains the
+# default for everything. Zero functions removed.
+# =============================================================================
+TOOL_VERSION = "1.1.0"
+__version__ = TOOL_VERSION  # verify_deployment fallback attribute
 TAG = f"[REPAIR-VERDICT v{TOOL_VERSION}]"
 
 # ---- constants mirrored from run_dashboard_sync v6.24.0 (attribution) ------
@@ -83,6 +108,93 @@ _PRICE_ALIASES = {"price", "currentprice", "lastprice", "last", "close"}
 _EPS_ALIASES = {"epsttm", "eps", "epsttmusd", "earningspershare"}
 _PE_ALIASES = {"pettm", "pe", "peratio", "pricetoearnings"}
 _WARN_ALIASES = {"warnings", "warning"}
+# v1.1.0 B4: issuer/venue columns + registry import (fail-open).
+_EXCH_ALIASES = {"exchange", "market"}
+_CCY_ALIASES = {"currency"}
+_CTRY_ALIASES = {"country"}
+try:
+    from scripts.critical_symbol_identity import identity_contradiction as _csi_identity
+except Exception:
+    try:
+        from critical_symbol_identity import identity_contradiction as _csi_identity
+    except Exception:
+        _csi_identity = None  # B4 reports SKIPPED; v1.0.0 phases unaffected
+
+_KNOWN_DEFECT_SYMBOLS: Tuple[str, ...] = (
+    "BK.US", "BRK-B.US", "FISV.US", "8270.SR", "4328.SR", "3001.SR")
+
+
+def _issuer_sweep_enabled() -> bool:
+    """v1.1.0 kill-switch (default ON). 0/false/off/no -> B4 skipped and
+    v1.0.0 output byte-identical."""
+    return (os.getenv("REPAIR_ISSUER_SWEEP") or "1").strip().lower() \
+        not in {"0", "false", "off", "no"}
+
+
+def _issuer_violations(H: List[Any], grid: List[List[Any]]
+                       ) -> List[Tuple[int, str, str, str, str]]:
+    """v1.1.0 B4 core (pure, testable): (1-based row, sym, reason, name,
+    price) for every row whose registered identity contradicts the csi
+    registry. Already-stubbed rows (blank name AND blank price) are
+    skipped. Empty list when csi is unavailable."""
+    out: List[Tuple[int, str, str, str, str]] = []
+    if _csi_identity is None:
+        return out
+    si = _find_col(H, _SYMBOL_ALIASES)
+    ni = _find_col(H, _NAME_ALIASES)
+    pi = _find_col(H, _PRICE_ALIASES)
+    xi = _find_col(H, _EXCH_ALIASES)
+    ci = _find_col(H, _CCY_ALIASES)
+    yi = _find_col(H, _CTRY_ALIASES)
+    if si < 0:
+        return out
+    for r in range(1, len(grid)):
+        row = grid[r]
+        sym = (row[si] if si < len(row) else "").strip().upper()
+        if not sym:
+            continue
+        nm = (row[ni] if 0 <= ni < len(row) else "").strip()
+        px = row[pi] if 0 <= pi < len(row) else ""
+        if not nm and _blank(px):
+            continue  # clean stub: the repair OUTCOME, not a contradiction
+        try:
+            reason = _csi_identity(
+                sym, nm, px,
+                row[xi] if 0 <= xi < len(row) else "",
+                row[ci] if 0 <= ci < len(row) else "",
+                row[yi] if 0 <= yi < len(row) else "")
+        except Exception:
+            reason = ""
+        if reason:
+            out.append((r + 1, sym, reason, nm, str(px)))
+    return out
+
+
+def _known_defect_status(H: List[Any], grid: List[List[Any]]) -> List[Dict[str, Any]]:
+    """v1.1.0 B4 report (pure): presence/stub state of the six known-defect
+    symbols on one page. needs_seed = absent OR blank stub."""
+    si = _find_col(H, _SYMBOL_ALIASES)
+    ni = _find_col(H, _NAME_ALIASES)
+    pi = _find_col(H, _PRICE_ALIASES)
+    found: Dict[str, Dict[str, Any]] = {}
+    if si >= 0:
+        for r in range(1, len(grid)):
+            row = grid[r]
+            sym = (row[si] if si < len(row) else "").strip().upper()
+            if sym in _KNOWN_DEFECT_SYMBOLS and sym not in found:
+                nm = (row[ni] if 0 <= ni < len(row) else "").strip()
+                px = (str(row[pi]) if 0 <= pi < len(row) else "").strip()
+                found[sym] = {"symbol": sym, "row": r + 1, "name": nm,
+                              "price": px,
+                              "blank_stub": (not nm and not px)}
+    out: List[Dict[str, Any]] = []
+    for sym in _KNOWN_DEFECT_SYMBOLS:
+        e = found.get(sym, {"symbol": sym, "row": None, "name": "",
+                            "price": "", "blank_stub": False})
+        e["present"] = e["row"] is not None
+        e["needs_seed"] = (not e["present"]) or bool(e["blank_stub"])
+        out.append(e)
+    return out
 
 
 def _norm(h: Any) -> str:
@@ -403,6 +515,102 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
     return out
 
 
+def phase_b4_issuer(sheet, apply: bool) -> Dict[str, Any]:
+    """v1.1.0 B4: registered-issuer sweep + known-defect seed report.
+    Mirrors phase_b_identity write discipline exactly; APPLY additionally
+    copies every offending row to _Identity_Quarantine BEFORE the stub
+    write (reversible, never a delete)."""
+    out: Dict[str, Any] = {"pages": {}}
+    if not _issuer_sweep_enabled():
+        out["skipped"] = "REPAIR_ISSUER_SWEEP=0"
+        return out
+    if _csi_identity is None:
+        out["skipped"] = "critical_symbol_identity unavailable"
+        return out
+    pages = [p.strip() for p in
+             (os.getenv("REPAIR_PAGES") or "Market_Leaders,Global_Markets").split(",")
+             if p.strip()]
+    seed_needed: List[str] = []
+    for page in pages:
+        ws = _ws(sheet, page)
+        rep: Dict[str, Any] = {"present": ws is not None}
+        out["pages"][page] = rep
+        if ws is None:
+            continue
+        try:
+            grid = ws.get_all_values()
+            if not grid:
+                rep["error"] = "empty page"
+                continue
+            H = grid[0]
+            si = _find_col(H, _SYMBOL_ALIASES)
+            wi = _find_col(H, _WARN_ALIASES)
+            if si < 0:
+                rep["error"] = "Symbol column not found"
+                continue
+            width = len(H)
+            viols = _issuer_violations(H, grid)
+            rep["issuer_corrupt"] = len(viols)
+            rep["by_reason"] = {}
+            for _, _, why, _, _ in viols:
+                k = why.split(" ")[0].split("(")[0][:24]
+                rep["by_reason"][k] = rep["by_reason"].get(k, 0) + 1
+            rep["samples"] = [f"{sym}[{why[:40]}]" for _, sym, why, _, _ in viols[:15]]
+            kd = _known_defect_status(H, grid)
+            rep["known_defects"] = kd
+            seed_needed.extend(f"{page}:{e['symbol']}" for e in kd if e["needs_seed"])
+            if apply and viols:
+                # (1) quarantine copies FIRST — reversible record
+                try:
+                    try:
+                        qws = sheet.worksheet("_Identity_Quarantine")
+                    except Exception:
+                        qws = sheet.add_worksheet(title="_Identity_Quarantine",
+                                                  rows=2000, cols=10)
+                        qws.append_row(["Timestamp", "Page", "Row", "Symbol",
+                                        "Reason", "Name", "Price", "RowJSON"],
+                                       value_input_option="RAW")
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    qrows = []
+                    for r1, sym, why, nm, px in viols:
+                        src = grid[r1 - 1] if 0 <= r1 - 1 < len(grid) else []
+                        qrows.append([stamp, page, r1, sym, why, nm, px,
+                                      json.dumps(src)[:9000]])
+                    CH = 100
+                    for i in range(0, len(qrows), CH):
+                        qws.append_rows(qrows[i:i + CH],
+                                        value_input_option="RAW")
+                    rep["quarantined"] = len(qrows)
+                except Exception as qe:
+                    rep["quarantine_error"] = str(qe)[:120]
+                # (2) blank-to-stub, identical discipline to phase B
+                updates = []
+                last_col = _col_letter(width)
+                for r1, sym, _why, _nm, _px in viols:
+                    row = ["" for _ in range(width)]
+                    row[si] = sym
+                    if 0 <= wi < width:
+                        row[wi] = f"identity_repaired:issuer:v{TOOL_VERSION}"
+                    updates.append({"range": f"A{r1}:{last_col}{r1}",
+                                    "values": [row]})
+                CH = 200
+                for i in range(0, len(updates), CH):
+                    ws.batch_update(updates[i:i + CH],
+                                    value_input_option="USER_ENTERED")
+                rep["repaired"] = len(viols)
+        except Exception as e:
+            rep["error"] = str(e)
+    out["seed_needed"] = seed_needed
+    if seed_needed:
+        out["seed_instructions"] = (
+            "ONE-DISPATCH RE-SEED: add TFB_SYNC_FORCE_REFETCH_SYMBOLS="
+            + ",".join(sorted({t.split(":", 1)[1] for t in seed_needed}))
+            + " to daily_sync.yml env, run ONE workflow dispatch, verify the "
+              "[FORCE-REFETCH] lines in _Run_Log, then REMOVE the flag block. "
+              "Never let the flag survive a second run.")
+    return out
+
+
 def phase_c_ghost_panel(sheet, apply: bool) -> Dict[str, Any]:
     rep: Dict[str, Any] = {}
     ws = _ws(sheet, "Performance_Log")
@@ -430,18 +638,22 @@ def main() -> int:
 
     a = phase_a_junk(sheet, apply, max_del)
     b = phase_b_identity(sheet, apply)
+    b4 = phase_b4_issuer(sheet, apply)          # v1.1.0 CG-7
     c = phase_c_ghost_panel(sheet, apply)
 
-    summary = {"mode": mode, "phase_a": a, "phase_b": b, "phase_c": c,
-               "version": TOOL_VERSION}
+    summary = {"mode": mode, "phase_a": a, "phase_b": b, "phase_b4": b4,
+               "phase_c": c, "version": TOOL_VERSION}
     print(json.dumps(summary, indent=2)[:20000], flush=True)
 
     a_n = sum(int(v.get("deleted", v.get("would_delete", 0)) or 0)
               for v in a.get("stores", {}).values() if isinstance(v, dict))
     b_n = sum(int(v.get("corrupt", 0) or 0)
               for v in b.get("pages", {}).values() if isinstance(v, dict))
+    b4_n = sum(int(v.get("issuer_corrupt", 0) or 0)
+               for v in b4.get("pages", {}).values() if isinstance(v, dict))
+    seed_n = len(b4.get("seed_needed", []) or [])
     errs = []
-    for grp in (a.get("stores", {}), b.get("pages", {})):
+    for grp in (a.get("stores", {}), b.get("pages", {}), b4.get("pages", {})):
         for k, v in grp.items():
             if isinstance(v, dict) and v.get("error"):
                 errs.append(f"{k}:{str(v['error'])[:60]}")
@@ -450,9 +662,12 @@ def main() -> int:
 
     verb = "repaired/deleted" if apply else "WOULD repair/delete"
     msg = (f"{TAG} mode={mode} | junk_rows {verb}: {a_n} | "
-           f"identity_corrupt rows: {b_n} | ghost_panel: "
+           f"identity_corrupt rows: {b_n} | issuer_corrupt rows: {b4_n} | "
+           f"known_defects_needing_seed: {seed_n} | ghost_panel: "
            f"{c.get('cleared', c.get('ghost_present', False))}"
            f"{' | ERRORS: ' + '; '.join(errs[:4]) if errs else ''}")
+    if b4.get("seed_instructions"):
+        print(TAG + " " + b4["seed_instructions"], flush=True)
     print(msg, flush=True)
     _append_runlog(sheet, "WARNING" if errs else "INFO",
                    "OK" if not errs else "PARTIAL", msg, summary)
