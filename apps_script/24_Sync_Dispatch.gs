@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.0.0  [P-170 DISPATCH-FROM-GAS]
+// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
 //
 // Purpose
 // -------
@@ -6,6 +6,54 @@
 // sync) from a time-driven Apps Script trigger, so the morning sync starts ON
 // THE MINUTE instead of whenever GitHub gets round to a schedule event.
 //
+// -----------------------------------------------------------------------------
+// v1.1.0 (2026-09-30, One-Pass Script - P-170b S-1 LANE DISPATCH)
+// WHY (measured 2026-09-30 from _Run_Log, the Actions run pages and the
+//   scorer source): the S-1 evidence lane runs on the SAME GitHub schedule
+//   mechanism as the sync and slips the same way - the last six shadow-board
+//   crons (05:10Z / 14:10Z) fired 4.2-6.5 h late; the scorer cron (15:20Z)
+//   fired at 20:00Z on 09-29. A scorer that slips past 21:00Z crosses midnight
+//   Riyadh: run #76 (the 09-28 slot) keyed the 09-28 board as 2026-09-29 and
+//   the real 09-29 run was refused as a duplicate - one calendar day of S-1
+//   evidence lost outright (register P-176; the scorer's own date-key fix is
+//   run_shadow_scorer v1.9.0, same day). The dispatcher already owns the cure
+//   for the sync lane; this release extends it to the two S-1 workflows so
+//   the whole evidence lane leaves GitHub `schedule`.
+// WHAT (additive; every v1.0.0 function is carried verbatim):
+//   tfbDispatchShadowBoard()   trigger handler -> shadow_board.yml at 08:10 and
+//                              17:10 Riyadh (TFB_SB_DISPATCH_HOURS / _MINUTE);
+//                              guards: kill switch, per-lane kill, token,
+//                              min gap (60), board tab "as of" younger than
+//                              TFB_SB_DISPATCH_FRESH_SKIP_MIN (60) -> SKIPPED
+//   tfbDispatchShadowScorer()  trigger handler -> shadow_scorer.yml at 18:40
+//                              Riyadh (TFB_S1_DISPATCH_HOURS / _MINUTE);
+//                              guards: kill switches, token, min gap (1,200 =
+//                              once per evidence day), and BEFORE-SLOT: never
+//                              dispatch before the scorer's slot boundary
+//                              (TFB_S1_DISPATCH_SLOT_UTC, default 15:20) - a
+//                              run keyed before the boundary belongs to the
+//                              previous evidence day and would be refused.
+//                              18:40 Riyadh (trigger window 18:25-18:55 =
+//                              15:25Z-15:55Z) is always after 15:20Z.
+//   tfbDispatchShadowBoardNow() / tfbDispatchShadowScorerNow()  manual (bypass
+//                              gap/fresh, NOT kill/token/before-slot)
+//   tfbS1DispatchProbe()       GET both S-1 workflow records (dispatches nothing)
+//   tfbInstallS1DispatchTriggers() / tfbRemoveS1DispatchTriggers()
+//   tfbS1DispatchStatus()      one-line status for the two lanes
+//   tfbSyncDispatchSelfTest()  gains the 's1 lane core' battery
+//   INPUTS: shadow_board.yml's dry_run input DEFAULTS TO "true" - every board
+//   dispatch sends dry_run="false" explicitly (the 09-14 #118 lesson: a
+//   default-true dispatch writes nothing); the scorer gets dry_run="false" too.
+//   daily_sync's request builder/payload/guards are byte-untouched.
+//   LOG: tfbSdLog_ gains an OPTIONAL trailing `page` argument so lane rows
+//   carry their own workflow file in the Page column (v1.0.0 calls unchanged).
+// COEXISTENCE with the yml crons (keep them as fallback this week): a board
+//   dispatched and a board scheduled both write the same atomic rectangle
+//   (harmless); a scorer that runs second is DUPLICATE_REFUSED visibly under
+//   run_shadow_scorer v1.9.0. Remove the crons at the Saturday 10-03 sitting
+//   after one clean week of dispatch rows.
+// KILL: TFB_SYNC_DISPATCH_DISABLED=1 (all lanes), TFB_SB_DISPATCH_DISABLED=1,
+//   TFB_S1_DISPATCH_DISABLED=1 (per lane); rollback = tfbRemoveS1DispatchTriggers.
 // -----------------------------------------------------------------------------
 // v1.0.0 (2026-09-29, One-Pass Script - P-170 SCHEDULE DRIFT)
 // WHY (measured from _Run_Log / _Status / the GitHub jobs API):
@@ -61,7 +109,7 @@
 //   and drop the schedule block entirely.
 // ES5 only (file is loaded by the classic runtime path); no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_SYNC_DISPATCH_VERSION = '1.0.0';
+var TFB_SYNC_DISPATCH_VERSION = '1.1.0';
 
 var TFB_SYNC_DISPATCH_ = Object.freeze({
   PROP_TOKEN: 'TFB_GH_DISPATCH_TOKEN',
@@ -331,16 +379,17 @@ function tfbSdReadGmStampMs_() {
 
 // One _Run_Log row: Timestamp | Level | Action | Page | Status | Message |
 // Endpoint | HTTP Code | Duration ms | Details JSON   (fail-open)
-function tfbSdLog_(level, action, status, message, endpoint, httpCode, durationMs, details, token) {
+function tfbSdLog_(level, action, status, message, endpoint, httpCode, durationMs, details, token, page) {
   var C = TFB_SYNC_DISPATCH_;
   var msg = tfbSdRedact_(message, token);
   var det = details || {};
   det.version = TFB_SYNC_DISPATCH_VERSION;
   var detJson = tfbSdRedact_(JSON.stringify(det), token);
+  var pageCell = tfbSdTrim_(page) === '' ? C.DEFAULT_WORKFLOW : tfbSdTrim_(page);   // v1.1.0 lane rows
   try {
     var sh = tfbSdSheet_(C.TAB_RUN_LOG);
     if (sh) {
-      sh.appendRow([new Date(), level, action, C.DEFAULT_WORKFLOW, status, msg,
+      sh.appendRow([new Date(), level, action, pageCell, status, msg,
         tfbSdRedact_(endpoint || '', token), httpCode === undefined || httpCode === null ? '' : httpCode,
         durationMs === undefined || durationMs === null ? '' : durationMs, detJson]);
     }
@@ -588,6 +637,428 @@ function tfbSyncDispatchSelfTest() {
   ok(tfbSdRedact_('x', '') === 'x' && tfbSdRedact_(null, 'tok_ABCDEFG') === '', 'redact edge');
   ok(tfbSdClip_('abcdefghij', 4) === 'abcd...', 'clip');
   var verdict = fails.length === 0 ? 'sync dispatch core: ok' : 'sync dispatch core: FAIL ' + fails.length + ' [' + fails.join('; ') + ']';
+  verdict += ' | ' + tfbS1DispatchSelfTest_();          // v1.1.0 lane battery
   try { Logger.log('[SYNC-DISPATCH v' + TFB_SYNC_DISPATCH_VERSION + '] selftest -> ' + verdict); } catch (err) { /* noop */ }
   return verdict;
+}
+
+// ===========================================================================
+// v1.1.0 [P-170b] S-1 LANE DISPATCH - shadow_board.yml + shadow_scorer.yml
+// (additive section; nothing above this line changed except the three edits
+//  named in the v1.1.0 WHY block)
+// ===========================================================================
+
+var TFB_S1_DISPATCH_ = Object.freeze({
+  LANES: {
+    shadow_board: {
+      lane: 'shadow_board',
+      workflow: 'shadow_board.yml',
+      handler: 'tfbDispatchShadowBoard',
+      manual: 'tfbDispatchShadowBoardNow',
+      propHours: 'TFB_SB_DISPATCH_HOURS',
+      propMinute: 'TFB_SB_DISPATCH_MINUTE',
+      propDisabled: 'TFB_SB_DISPATCH_DISABLED',
+      propMinGapMin: 'TFB_SB_DISPATCH_MIN_GAP_MIN',
+      propFreshSkipMin: 'TFB_SB_DISPATCH_FRESH_SKIP_MIN',
+      propLastOkMs: 'TFB_SB_DISPATCH_LAST_OK_MS',
+      defaultHours: '8,17',
+      defaultMinute: 10,
+      defaultMinGapMin: 60,
+      defaultFreshSkipMin: 60,
+      inputs: { dry_run: 'false' },
+      slotGuard: false
+    },
+    shadow_scorer: {
+      lane: 'shadow_scorer',
+      workflow: 'shadow_scorer.yml',
+      handler: 'tfbDispatchShadowScorer',
+      manual: 'tfbDispatchShadowScorerNow',
+      propHours: 'TFB_S1_DISPATCH_HOURS',
+      propMinute: 'TFB_S1_DISPATCH_MINUTE',
+      propDisabled: 'TFB_S1_DISPATCH_DISABLED',
+      propMinGapMin: 'TFB_S1_DISPATCH_MIN_GAP_MIN',
+      propFreshSkipMin: '',
+      propLastOkMs: 'TFB_S1_DISPATCH_LAST_OK_MS',
+      defaultHours: '18',
+      defaultMinute: 40,
+      defaultMinGapMin: 1200,
+      defaultFreshSkipMin: 0,
+      inputs: { dry_run: 'false' },
+      slotGuard: true
+    }
+  },
+  PROP_SLOT_UTC: 'TFB_S1_DISPATCH_SLOT_UTC',
+  DEFAULT_SLOT_UTC: '15:20',
+  TAB_BOARD: 'Shadow_Board',
+  BOARD_ASOF_RE: /as of (\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})/,
+  RIYADH_OFFSET_MS: 3 * 60 * 60 * 1000
+});
+
+// ---------------------------------------------------------------------------
+// Pure helpers (self-tested; no GAS services touched)
+// ---------------------------------------------------------------------------
+
+// "15:20" -> {h:15, m:20}; anything unparseable -> the default slot.
+function tfbS1ParseSlot_(raw) {
+  var s = tfbSdTrim_(raw);
+  var m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) { return { h: 15, m: 20 }; }
+  var h = parseInt(m[1], 10);
+  var mi = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || mi < 0 || mi > 59) { return { h: 15, m: 20 }; }
+  return { h: h, m: mi };
+}
+
+// True when the UTC time-of-day of nowMs is before the slot boundary
+// (a scorer dispatched then would key to the PREVIOUS evidence day).
+function tfbS1BeforeSlot_(nowMs, slot) {
+  var d = new Date(Number(nowMs) || 0);
+  var minutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+  var boundary = (slot ? slot.h : 15) * 60 + (slot ? slot.m : 20);
+  return minutes < boundary;
+}
+
+// Shadow_Board meta "as of 2026-09-29 22:23 Riyadh" -> epoch ms (Riyadh =
+// UTC+3, fixed); 0 when absent/unparseable.
+function tfbS1ParseBoardAsOfMs_(raw) {
+  var s = tfbSdTrim_(raw);
+  if (s === '') { return 0; }
+  var m = s.match(TFB_S1_DISPATCH_.BOARD_ASOF_RE);
+  if (!m) { return 0; }
+  var t = Date.parse(m[1] + 'T' + m[2] + ':' + m[3] + ':00+03:00');
+  return isNaN(t) ? 0 : t;
+}
+
+// Lane decision table. inp = {disabled, laneDisabled, tokenPresent, force,
+// nowMs, lastOkMs, minGapMs, freshMs, freshSkipMs, slotGuard, slot}
+function tfbS1DecideLane_(inp) {
+  var i = inp || {};
+  if (i.disabled) { return { dispatch: false, reason: 'disabled' }; }
+  if (i.laneDisabled) { return { dispatch: false, reason: 'lane_disabled' }; }
+  if (!i.tokenPresent) { return { dispatch: false, reason: 'no_token' }; }
+  var now = Number(i.nowMs) || 0;
+  if (i.slotGuard && tfbS1BeforeSlot_(now, i.slot)) {
+    return { dispatch: false, reason: 'before_slot' };
+  }
+  if (!i.force) {
+    var lastOk = Number(i.lastOkMs) || 0;
+    var gap = Number(i.minGapMs) || 0;
+    if (lastOk > 0 && gap > 0 && now - lastOk < gap) {
+      return { dispatch: false, reason: 'min_gap' };
+    }
+    var fresh = Number(i.freshMs) || 0;
+    var skip = Number(i.freshSkipMs) || 0;
+    if (fresh > 0 && skip > 0 && now - fresh < skip) {
+      return { dispatch: false, reason: 'board_fresh' };
+    }
+  }
+  return { dispatch: true, reason: i.force ? 'forced' : 'ok' };
+}
+
+// Lane request: same headers/shape as the v1.0.0 builder, lane-specific inputs.
+function tfbS1BuildDispatchRequest_(repo, workflow, ref, token, inputs) {
+  var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
+    '/actions/workflows/' + encodeURIComponent(workflow) + '/dispatches';
+  var inp = {};
+  var src = inputs || {};
+  for (var k in src) { if (src.hasOwnProperty(k)) { inp[k] = String(src[k]); } }
+  var payload = { ref: ref, inputs: inp };
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': TFB_SYNC_DISPATCH_.API_VERSION
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  return { url: url, options: options };
+}
+
+// ---------------------------------------------------------------------------
+// GAS-facing helpers (fail open / soft)
+// ---------------------------------------------------------------------------
+
+function tfbS1LaneConfig_(laneKey) {
+  var L = TFB_S1_DISPATCH_.LANES[laneKey];
+  var C = TFB_SYNC_DISPATCH_;
+  return {
+    lane: L.lane,
+    workflow: L.workflow,
+    handler: L.handler,
+    token: tfbSdTrim_(tfbSdProp_(C.PROP_TOKEN, '')),
+    repo: tfbSdTrim_(tfbSdProp_(C.PROP_REPO, C.DEFAULT_REPO)),
+    ref: tfbSdTrim_(tfbSdProp_(C.PROP_REF, C.DEFAULT_REF)),
+    hours: tfbSdParseHours_(tfbSdProp_(L.propHours, L.defaultHours)),
+    minute: tfbSdParseIntProp_(tfbSdProp_(L.propMinute, String(L.defaultMinute)), L.defaultMinute, 0, 59),
+    disabled: tfbSdIsOn_(tfbSdProp_(C.PROP_DISABLED, '')),
+    laneDisabled: tfbSdIsOn_(tfbSdProp_(L.propDisabled, '')),
+    minGapMs: tfbSdParseIntProp_(tfbSdProp_(L.propMinGapMin, String(L.defaultMinGapMin)), L.defaultMinGapMin, 0, 2880) * 60 * 1000,
+    freshSkipMs: L.propFreshSkipMin === '' ? 0 :
+      tfbSdParseIntProp_(tfbSdProp_(L.propFreshSkipMin, String(L.defaultFreshSkipMin)), L.defaultFreshSkipMin, 0, 1440) * 60 * 1000,
+    lastOkMs: tfbSdParseIntProp_(tfbSdProp_(L.propLastOkMs, '0'), 0, 0, 9007199254740991),
+    inputs: L.inputs,
+    slotGuard: !!L.slotGuard,
+    slot: tfbS1ParseSlot_(tfbSdProp_(TFB_S1_DISPATCH_.PROP_SLOT_UTC, TFB_S1_DISPATCH_.DEFAULT_SLOT_UTC))
+  };
+}
+
+// Shadow_Board row 1 -> newest "as of" ms (0 when the tab/stamp is absent).
+function tfbS1ReadBoardAsOfMs_() {
+  try {
+    var sh = tfbSdSheet_(TFB_S1_DISPATCH_.TAB_BOARD);
+    if (!sh) { return 0; }
+    var vals = sh.getRange(1, 1, 1, Math.max(1, Math.min(6, sh.getLastColumn()))).getValues();
+    var best = 0;
+    for (var c = 0; c < vals[0].length; c++) {
+      var t = tfbS1ParseBoardAsOfMs_(vals[0][c]);
+      if (t > best) { best = t; }
+    }
+    return best;
+  } catch (err) {
+    return 0;
+  }
+}
+
+function tfbS1Dispatch_(laneKey, force) {
+  var t0 = tfbSdNowMs_();
+  var cfg = tfbS1LaneConfig_(laneKey);
+  var L = TFB_S1_DISPATCH_.LANES[laneKey];
+  var action = force ? L.manual : L.handler;
+  var freshMs = laneKey === 'shadow_board' ? tfbS1ReadBoardAsOfMs_() : 0;
+  var now = tfbSdNowMs_();
+  var verdict = tfbS1DecideLane_({
+    disabled: cfg.disabled, laneDisabled: cfg.laneDisabled, tokenPresent: cfg.token !== '',
+    force: !!force, nowMs: now, lastOkMs: cfg.lastOkMs, minGapMs: cfg.minGapMs,
+    freshMs: freshMs, freshSkipMs: cfg.freshSkipMs, slotGuard: cfg.slotGuard, slot: cfg.slot
+  });
+  var ctx = {
+    lane: cfg.lane, reason: verdict.reason, repo: cfg.repo, workflow: cfg.workflow, ref: cfg.ref,
+    board_asof_age_min: freshMs > 0 ? Math.round((now - freshMs) / 60000) : null,
+    last_ok_age_min: cfg.lastOkMs > 0 ? Math.round((now - cfg.lastOkMs) / 60000) : null,
+    slot_utc: cfg.slot.h + ':' + (cfg.slot.m < 10 ? '0' : '') + cfg.slot.m,
+    force: !!force
+  };
+  if (!verdict.dispatch) {
+    var status = verdict.reason === 'no_token' ? 'FAILED' : 'SKIPPED';
+    var level = verdict.reason === 'no_token' ? 'ERROR' : 'INFO';
+    tfbSdLog_(level, action, status, 'dispatch ' + status.toLowerCase() + ': ' + verdict.reason, '', '', tfbSdNowMs_() - t0, ctx, cfg.token, cfg.workflow);
+    return status + ':' + verdict.reason;
+  }
+  var req = tfbS1BuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, cfg.inputs);
+  var code = 0;
+  var body = '';
+  try {
+    var resp = UrlFetchApp.fetch(req.url, req.options);
+    code = resp.getResponseCode();
+    body = tfbSdClip_(resp.getContentText() || '');
+  } catch (err) {
+    code = -1;
+    body = tfbSdClip_(String(err && err.message ? err.message : err));
+  }
+  var dur = tfbSdNowMs_() - t0;
+  if (code === 204) {
+    try { tfbSdProps_().setProperty(L.propLastOkMs, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
+    ctx.http = 204;
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(cfg.inputs), req.url, 204, dur, ctx, cfg.token, cfg.workflow);
+    return 'OK:204';
+  }
+  ctx.http = code;
+  ctx.body = body;
+  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body, req.url, code, dur, ctx, cfg.token, cfg.workflow);
+  return 'FAILED:' + code;
+}
+
+// Trigger handlers (installed by tfbInstallS1DispatchTriggers)
+function tfbDispatchShadowBoard() {
+  return tfbS1Dispatch_('shadow_board', false);
+}
+
+function tfbDispatchShadowScorer() {
+  return tfbS1Dispatch_('shadow_scorer', false);
+}
+
+// Manual variants: bypass min-gap and board-fresh (NOT kill switches, token
+// or the scorer's before-slot guard).
+function tfbDispatchShadowBoardNow() {
+  return tfbS1Dispatch_('shadow_board', true);
+}
+
+function tfbDispatchShadowScorerNow() {
+  return tfbS1Dispatch_('shadow_scorer', true);
+}
+
+// GET both workflow records: proves token + permission, dispatches nothing.
+function tfbS1DispatchProbe() {
+  var out = [];
+  var keys = ['shadow_board', 'shadow_scorer'];
+  for (var i = 0; i < keys.length; i++) {
+    var t0 = tfbSdNowMs_();
+    var cfg = tfbS1LaneConfig_(keys[i]);
+    if (cfg.token === '') {
+      tfbSdLog_('ERROR', 'tfbS1DispatchProbe', 'FAILED', 'no token in Script Property ' + TFB_SYNC_DISPATCH_.PROP_TOKEN, '', '', 0, { lane: cfg.lane }, '', cfg.workflow);
+      out.push(cfg.lane + '=FAILED:no_token');
+      continue;
+    }
+    var req = tfbSdBuildProbeRequest_(cfg.repo, cfg.workflow, cfg.token);
+    var code = 0;
+    var body = '';
+    try {
+      var resp = UrlFetchApp.fetch(req.url, req.options);
+      code = resp.getResponseCode();
+      body = resp.getContentText() || '';
+    } catch (err) {
+      code = -1;
+      body = String(err && err.message ? err.message : err);
+    }
+    var dur = tfbSdNowMs_() - t0;
+    if (code === 200) {
+      var state = '';
+      var wfId = '';
+      try { var j = JSON.parse(body); state = j.state || ''; wfId = j.id || ''; } catch (e1) { /* noop */ }
+      tfbSdLog_('INFO', 'tfbS1DispatchProbe', 'OK', 'workflow reachable: id=' + wfId + ' state=' + state + ' hours=' + cfg.hours.join(',') + ' minute=' + cfg.minute, req.url, 200, dur,
+        { lane: cfg.lane, repo: cfg.repo, workflow: cfg.workflow, hours: cfg.hours, minute: cfg.minute, state: state, slot_utc: cfg.slot.h + ':' + cfg.slot.m }, cfg.token, cfg.workflow);
+      out.push(cfg.lane + '=OK:200:' + state);
+    } else {
+      var hint = code === 401 ? 'bad/expired token' : code === 403 ? 'token lacks Actions permission' :
+        code === 404 ? 'repo/workflow not visible to this token' : 'network or API error';
+      tfbSdLog_('ERROR', 'tfbS1DispatchProbe', 'FAILED', 'HTTP ' + code + ' (' + hint + ') ' + tfbSdClip_(body), req.url, code, dur,
+        { lane: cfg.lane, repo: cfg.repo, workflow: cfg.workflow, hint: hint }, cfg.token, cfg.workflow);
+      out.push(cfg.lane + '=FAILED:' + code + ':' + hint);
+    }
+  }
+  return out.join(' | ');
+}
+
+// ---------------------------------------------------------------------------
+// Triggers (per handler; the v1.0.0 daily_sync installer is untouched)
+// ---------------------------------------------------------------------------
+
+function tfbS1TriggersFor_(handler) {
+  var out = [];
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === handler) { out.push(all[i]); }
+    }
+  } catch (err) { /* noop */ }
+  return out;
+}
+
+function tfbRemoveS1DispatchTriggers() {
+  var keys = ['shadow_board', 'shadow_scorer'];
+  var n = 0;
+  for (var k = 0; k < keys.length; k++) {
+    var own = tfbS1TriggersFor_(TFB_S1_DISPATCH_.LANES[keys[k]].handler);
+    for (var i = 0; i < own.length; i++) {
+      try { ScriptApp.deleteTrigger(own[i]); n++; } catch (err) { /* noop */ }
+    }
+  }
+  tfbSdLog_('INFO', 'tfbRemoveS1DispatchTriggers', 'OK', 'removed ' + n + ' S-1 lane trigger(s)', '', '', 0, { removed: n }, '', 'shadow_board.yml');
+  return 'OK:removed=' + n;
+}
+
+// Idempotent: for each S-1 lane, remove that handler's triggers, then create
+// one daily trigger per configured hour (Asia/Riyadh) near the configured minute.
+function tfbInstallS1DispatchTriggers() {
+  var C = TFB_SYNC_DISPATCH_;
+  var keys = ['shadow_board', 'shadow_scorer'];
+  var summary = [];
+  var allOk = true;
+  for (var k = 0; k < keys.length; k++) {
+    var L = TFB_S1_DISPATCH_.LANES[keys[k]];
+    var cfg = tfbS1LaneConfig_(keys[k]);
+    var own = tfbS1TriggersFor_(L.handler);
+    var removed = 0;
+    for (var i = 0; i < own.length; i++) {
+      try { ScriptApp.deleteTrigger(own[i]); removed++; } catch (err) { /* noop */ }
+    }
+    var created = [];
+    for (var h = 0; h < cfg.hours.length; h++) {
+      try {
+        ScriptApp.newTrigger(L.handler)
+          .timeBased()
+          .everyDays(1)
+          .atHour(cfg.hours[h])
+          .nearMinute(cfg.minute)
+          .inTimezone(C.TIMEZONE)
+          .create();
+        created.push(cfg.hours[h]);
+      } catch (err2) {
+        allOk = false;
+        tfbSdLog_('ERROR', 'tfbInstallS1DispatchTriggers', 'FAILED', 'create failed for ' + L.handler + ' hour ' + cfg.hours[h] + ': ' + String(err2 && err2.message ? err2.message : err2), '', '', 0, { lane: L.lane, hour: cfg.hours[h] }, '', L.workflow);
+      }
+    }
+    if (created.length !== cfg.hours.length) { allOk = false; }
+    summary.push(L.lane + ':hours=' + created.join(',') + ':minute=' + cfg.minute + ':removed=' + removed);
+    tfbSdLog_('INFO', 'tfbInstallS1DispatchTriggers', created.length === cfg.hours.length ? 'OK' : 'PARTIAL',
+      'installed ' + created.length + '/' + cfg.hours.length + ' daily trigger(s) for ' + L.handler + ' at hours [' + created.join(',') + '] near minute ' + cfg.minute + ' ' + C.TIMEZONE + ' (removed ' + removed + ' old)',
+      '', '', 0, { lane: L.lane, hours: created, minute: cfg.minute, removed: removed }, '', L.workflow);
+  }
+  return (allOk ? 'OK' : 'PARTIAL') + ':' + summary.join(' | ');
+}
+
+function tfbS1DispatchStatus() {
+  var keys = ['shadow_board', 'shadow_scorer'];
+  var parts = ['S1-DISPATCH v' + TFB_SYNC_DISPATCH_VERSION];
+  for (var k = 0; k < keys.length; k++) {
+    var cfg = tfbS1LaneConfig_(keys[k]);
+    parts.push(cfg.lane + ': workflow=' + cfg.workflow + ' hours=' + cfg.hours.join(',') + ' minute=' + cfg.minute +
+      ' disabled=' + (cfg.disabled || cfg.laneDisabled ? 'YES' : 'no') + ' min_gap_min=' + Math.round(cfg.minGapMs / 60000) +
+      (cfg.slotGuard ? ' slot_utc=' + cfg.slot.h + ':' + (cfg.slot.m < 10 ? '0' : '') + cfg.slot.m : ' fresh_skip_min=' + Math.round(cfg.freshSkipMs / 60000)) +
+      ' triggers=' + tfbS1TriggersFor_(cfg.handler).length +
+      ' last_ok=' + (cfg.lastOkMs > 0 ? new Date(cfg.lastOkMs).toISOString() : 'never'));
+  }
+  var s = parts.join(' | ') + ' | token=' + (tfbSdTrim_(tfbSdProp_(TFB_SYNC_DISPATCH_.PROP_TOKEN, '')) === '' ? 'MISSING' : 'present');
+  try { Logger.log(s); } catch (err) { /* noop */ }
+  return s;
+}
+
+// Pure-logic self-test for the S-1 lanes (called by tfbSyncDispatchSelfTest;
+// no network, no sheet write, no trigger change).
+function tfbS1DispatchSelfTest_() {
+  var fails = [];
+  function ok(cond, name) { if (!cond) { fails.push(name); } }
+  // slot parsing
+  var sl = tfbS1ParseSlot_('15:20');
+  ok(sl.h === 15 && sl.m === 20, 's1 slot parse');
+  ok(tfbS1ParseSlot_('junk').h === 15 && tfbS1ParseSlot_('25:99').m === 20 && tfbS1ParseSlot_('5:10').h === 5, 's1 slot default/junk');
+  // before-slot guard (UTC time-of-day)
+  ok(tfbS1BeforeSlot_(Date.parse('2026-09-30T15:19:59Z'), sl) === true, 's1 before slot true');
+  ok(tfbS1BeforeSlot_(Date.parse('2026-09-30T15:20:00Z'), sl) === false, 's1 at slot false');
+  ok(tfbS1BeforeSlot_(Date.parse('2026-09-30T15:40:00Z'), sl) === false, 's1 18:40 Riyadh dispatch after slot');
+  ok(tfbS1BeforeSlot_(Date.parse('2026-09-30T15:05:00Z'), sl) === true, 's1 early trigger window blocked');
+  // board as-of parsing (Riyadh fixed +03:00)
+  ok(tfbS1ParseBoardAsOfMs_('as of 2026-09-29 22:23 Riyadh') === Date.parse('2026-09-29T22:23:00+03:00'), 's1 board asof');
+  ok(tfbS1ParseBoardAsOfMs_('SHADOW BOARD v1.5.0') === 0 && tfbS1ParseBoardAsOfMs_('') === 0, 's1 board asof absent');
+  // lane decision table
+  var now = Date.parse('2026-09-30T15:40:00Z');
+  var base = { disabled: false, laneDisabled: false, tokenPresent: true, force: false, nowMs: now, lastOkMs: 0, minGapMs: 3600000, freshMs: 0, freshSkipMs: 3600000, slotGuard: false, slot: sl };
+  function d(over) { var x = {}; for (var k in base) { if (base.hasOwnProperty(k)) { x[k] = base[k]; } } for (var k2 in over) { if (over.hasOwnProperty(k2)) { x[k2] = over[k2]; } } return tfbS1DecideLane_(x); }
+  ok(d({}).dispatch === true && d({}).reason === 'ok', 's1 decide ok');
+  ok(d({ disabled: true }).reason === 'disabled', 's1 decide global kill');
+  ok(d({ laneDisabled: true }).reason === 'lane_disabled', 's1 decide lane kill');
+  ok(d({ tokenPresent: false }).reason === 'no_token', 's1 decide no token');
+  ok(d({ lastOkMs: now - 600000 }).reason === 'min_gap', 's1 decide min gap');
+  ok(d({ freshMs: now - 1800000 }).reason === 'board_fresh', 's1 decide board fresh');
+  ok(d({ freshMs: now - 3600001 }).dispatch === true, 's1 decide board stale ok');
+  ok(d({ slotGuard: true, nowMs: Date.parse('2026-09-30T15:05:00Z') }).reason === 'before_slot', 's1 decide before slot');
+  ok(d({ slotGuard: true }).dispatch === true, 's1 decide after slot ok');
+  ok(d({ force: true, lastOkMs: now - 600000, freshMs: now - 60000 }).reason === 'forced', 's1 force bypasses gap/fresh');
+  ok(d({ force: true, slotGuard: true, nowMs: Date.parse('2026-09-30T15:05:00Z') }).reason === 'before_slot', 's1 force keeps before-slot');
+  ok(d({ force: true, disabled: true }).reason === 'disabled', 's1 force keeps kill');
+  // request: lane inputs, board dry_run=false explicit
+  var rq = tfbS1BuildDispatchRequest_('o/r', 'shadow_board.yml', 'main', 'tok_ABCDEFG', TFB_S1_DISPATCH_.LANES.shadow_board.inputs);
+  var pl = JSON.parse(rq.options.payload);
+  ok(rq.url === 'https://api.github.com/repos/o/r/actions/workflows/shadow_board.yml/dispatches', 's1 board url');
+  ok(pl.ref === 'main' && pl.inputs.dry_run === 'false' && pl.inputs.run_mode === undefined, 's1 board payload dry_run=false, no run_mode');
+  var rq2 = tfbS1BuildDispatchRequest_('o/r', 'shadow_scorer.yml', 'main', 'tok_ABCDEFG', TFB_S1_DISPATCH_.LANES.shadow_scorer.inputs);
+  ok(JSON.parse(rq2.options.payload).inputs.dry_run === 'false' && rq2.options.headers.Authorization === 'Bearer tok_ABCDEFG', 's1 scorer payload/headers');
+  // lane defaults
+  var LB = TFB_S1_DISPATCH_.LANES.shadow_board, LS = TFB_S1_DISPATCH_.LANES.shadow_scorer;
+  ok(tfbSdParseHours_(LB.defaultHours).join(',') === '8,17' && LB.defaultMinute === 10, 's1 board schedule 08:10/17:10');
+  ok(tfbSdParseHours_(LS.defaultHours).join(',') === '18' && LS.defaultMinute === 40 && LS.defaultMinGapMin === 1200, 's1 scorer schedule 18:40, once per day');
+  return fails.length === 0 ? 's1 lane core: ok' : 's1 lane core: FAIL ' + fails.length + ' [' + fails.join('; ') + ']';
 }
