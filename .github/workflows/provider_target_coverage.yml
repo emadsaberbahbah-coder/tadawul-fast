@@ -83,7 +83,7 @@ jobs:
         run: python scripts/audit_provider_target_coverage.py --selftest
 
       - name: Restore last-good baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: provider_target_last_good.json
           key: ptc-lastgood-${{ github.run_id }}-${{ github.run_attempt }}
@@ -132,7 +132,7 @@ jobs:
 
       - name: Save last-good baseline
         if: ${{ always() && steps.baseline.outputs.save == 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: provider_target_last_good.json
           key: ptc-lastgood-${{ github.run_id }}-${{ github.run_attempt }}
