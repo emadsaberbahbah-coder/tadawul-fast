@@ -1306,7 +1306,41 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.39.0"
+# -----------------------------------------------------------------------------
+# v6.40.0 (2026-09-30) - P-180 FORCED COVERAGE: ACTIVE LOTS FIRST, CLOSED
+# LOTS SCOPED (the register candidate opened 2026-09-28)
+# -----------------------------------------------------------------------------
+# EVIDENCE (ledger export 2026-09-30, 39 lots / 36 unique symbols; 6 Active,
+# 30 closed-only): _load_costbasis_symbols reads column A of the WHOLE
+# ledger, so every closed lot's symbol joins the v6.16.0 priority set for
+# life. Today missing=36 < TFB_TRACK_FORCE_MAX 40 (four names of headroom);
+# each new closed name adds one; at 41 the cut is `sorted(missing)[:40]` - ALPHABETICAL - so YUM (the
+# last letter in the book) is the first ACTIVE holding to drop out of the
+# daily Signal_History snapshot, and P-169's thesis-exit evidence goes blind
+# on exactly the position it is watching. Meanwhile 30 dead symbols are
+# fetched from the backend three times a day for nothing.
+# FIX (two knobs, both fail-open):
+#   1. ORDER (always on, byte-identical below the cap): the cut keeps every
+#      ACTIVE lot symbol and every pinned extra (TFB_TRACK_PRIORITY_SYMBOLS)
+#      and applies the cap to the CLOSED-lot remainder only. Below the cap
+#      the fetch list is the same sorted list as v6.39.0.
+#   2. SCOPE: TFB_TRACK_FORCE_SCOPE = all (DEFAULT, v6.39.0 semantics) |
+#      active (closed lots are not forced at all; they still appear when
+#      the cockpit itself lists them). Arming `active` is the operator's
+#      cost/hygiene decision (~30 fewer forced fetches per run today).
+#   The ledger is read ONCE (get_all_values instead of col_values(1)) by the
+#   new _load_costbasis_symbols_by_status; if that read fails for any reason
+#   the v6.16.0/v6.20.0 loader runs exactly as before (legacy cut included).
+# LOG: "[v6.40.0 COVERAGE] scope=.. active=.. closed=.. extras=.. cut=[..]
+# skipped_closed=.." precedes the unchanged v6.16.0 COVERAGE line.
+# ENV LANE: GitHub Actions (daily_sync.yml track step), NOT Render.
+# Kill: TFB_TRACK_FORCE_SCOPE=all is the default; the ordering rule has no
+# switch because the OFF state IS the defect (an active holding cut for a
+# dead one). ZERO functions removed. Additions: _force_scope, _force_plan,
+# _extract_costbasis_by_status, _load_costbasis_symbols_by_status.
+# Embedded self-test 14 -> 16 cases (the verdict reads selftest=PASS 16/16).
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.40.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -1809,6 +1843,43 @@ def _force_rows_page() -> str:
             or "Market_Leaders").strip() or "Market_Leaders"
 
 
+def _force_scope() -> str:
+    """v6.40.0 (P-180): which ledger lots join the forced-coverage set.
+    'all' (DEFAULT, v6.39.0 semantics) | 'active' (Active-status lots +
+    pinned extras only). Anything else -> 'all'."""
+    v = (os.getenv("TFB_TRACK_FORCE_SCOPE") or "all").strip().lower()
+    return "active" if v == "active" else "all"
+
+
+def _force_plan(active: List[str], closed: List[str], extras: List[str],
+                covered: set, cap: int, scope: str) -> Dict[str, Any]:
+    """v6.40.0 (P-180) PURE: decide the forced fetch list.
+    missing = (extras | active | closed-if-scope-all) - covered, SORTED like
+    v6.39.0. Below the cap the list is returned unchanged (byte-identical).
+    Over the cap: every active/extra symbol is kept, the cap applies to the
+    closed remainder in sorted order; `cut` names what was dropped.
+    -> {forced, cut, skipped_closed, scope, active, closed, extras}"""
+    cov = {_safe_str(s).strip().upper() for s in (covered or set())}
+    act = [s for s in dict.fromkeys(_safe_str(x).strip().upper() for x in (active or [])) if s]
+    ext = [s for s in dict.fromkeys(_safe_str(x).strip().upper() for x in (extras or [])) if s]
+    cls = [s for s in dict.fromkeys(_safe_str(x).strip().upper() for x in (closed or []))
+           if s and s not in act and s not in ext]
+    keep = sorted({s for s in act + ext if s not in cov})
+    pool_closed = sorted({s for s in cls if s not in cov}) if scope != "active" else []
+    skipped = sorted({s for s in cls if s not in cov}) if scope == "active" else []
+    missing = sorted(set(keep) | set(pool_closed))
+    cap_i = max(1, int(cap or 1))
+    if len(missing) <= cap_i:
+        return {"forced": missing, "cut": [], "skipped_closed": skipped, "scope": scope,
+                "active": len(act), "closed": len(cls), "extras": len(ext)}
+    room = max(0, cap_i - len(keep))
+    kept_closed = pool_closed[:room]
+    cut = pool_closed[room:]
+    forced = sorted(set(keep) | set(kept_closed))
+    return {"forced": forced, "cut": cut, "skipped_closed": skipped, "scope": scope,
+            "active": len(act), "closed": len(cls), "extras": len(ext)}
+
+
 def _costbasis_tab() -> str:
     return (os.getenv("TFB_TRACK_COSTBASIS_TAB")
             or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
@@ -1930,6 +2001,79 @@ def _load_costbasis_symbols(spreadsheet_id: str) -> List[str]:
     except Exception as e:
         logger.debug("cost-basis symbol read skipped: %s", e)
         return []
+
+
+def _extract_costbasis_by_status(values: List[List[Any]]) -> Tuple[List[str], List[str]]:
+    """v6.40.0 (P-180) PURE: from the ledger's full value matrix return
+    (active_symbols, closed_symbols) - header-anchored on the row that holds
+    both 'Symbol' and 'Status', shape-validated (SG-1 rule), deduped in
+    first-seen order. A symbol Active in ANY lot is active. Without a
+    Symbol+Status header row -> ([], []) so the caller falls back."""
+    hdr_i = -1
+    ci_s = ci_st = -1
+    for i, row in enumerate(values or []):
+        cells = [_safe_str(c).strip().upper() for c in (row or [])]
+        if "SYMBOL" in cells and "STATUS" in cells:
+            hdr_i, ci_s, ci_st = i, cells.index("SYMBOL"), cells.index("STATUS")
+            break
+    if hdr_i < 0:
+        return [], []
+    active: List[str] = []
+    closed: List[str] = []
+    seen_a: set = set()
+    seen_c: set = set()
+    for row in values[hdr_i + 1:]:
+        row = row or []
+        sym = _safe_str(row[ci_s]).strip().upper() if ci_s < len(row) else ""
+        if not sym or sym == "SYMBOL" or not _valid_symbol_shape(sym):
+            continue
+        st = _safe_str(row[ci_st]).strip().lower() if ci_st < len(row) else ""
+        if st == "active":
+            if sym not in seen_a:
+                seen_a.add(sym)
+                active.append(sym)
+        else:
+            if sym not in seen_c:
+                seen_c.add(sym)
+                closed.append(sym)
+    closed = [s for s in closed if s not in seen_a]
+    return active, closed
+
+
+def _load_costbasis_symbols_by_status(spreadsheet_id: str) -> Optional[Tuple[List[str], List[str]]]:
+    """v6.40.0 (P-180): ONE read of _Portfolio_CostBasis (get_all_values)
+    -> (active, closed) via _extract_costbasis_by_status. Returns None on
+    ANY problem (no creds, no gspread, API error, no Symbol+Status header)
+    so the caller runs the v6.16.0/v6.20.0 path exactly as before."""
+    if not spreadsheet_id or not GSPREAD_AVAILABLE or gspread is None:
+        return None
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return None
+    s = raw
+    if not s.startswith("{"):
+        try:
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return None
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(spreadsheet_id).worksheet(_costbasis_tab())
+        active, closed = _extract_costbasis_by_status(ws.get_all_values() or [])
+        if not active and not closed:
+            return None
+        return active, closed
+    except Exception as e:
+        logger.debug("cost-basis by-status read skipped: %s", e)
+        return None
 
 
 def _ensure_project_root_on_path() -> None:
@@ -7629,15 +7773,29 @@ class PerformanceTrackerApp:
             for r in rows if _safe_str(r.get("symbol")).strip()
         }
         priority: set = set(_force_extra_symbols())
+        _by_status: Optional[Tuple[List[str], List[str]]] = None   # v6.40.0
         if self.spreadsheet_id:
             loop = asyncio.get_running_loop()
             try:
-                held = await loop.run_in_executor(
-                    _get_executor(), _load_costbasis_symbols, self.spreadsheet_id
+                _by_status = await loop.run_in_executor(
+                    _get_executor(), _load_costbasis_symbols_by_status, self.spreadsheet_id
                 )
-                priority |= set(held or [])
             except Exception as e:
-                logger.warning("cost-basis holdings read failed: %s", e)
+                logger.warning("cost-basis by-status read failed: %s", e)
+                _by_status = None
+            if _by_status is not None:
+                _act, _cls = _by_status
+                priority |= set(_act)
+                if _force_scope() != "active":
+                    priority |= set(_cls)
+            else:
+                try:
+                    held = await loop.run_in_executor(
+                        _get_executor(), _load_costbasis_symbols, self.spreadsheet_id
+                    )
+                    priority |= set(held or [])
+                except Exception as e:
+                    logger.warning("cost-basis holdings read failed: %s", e)
         # v6.20.0 (SG-1): the merged priority set (cost-basis + forced
         # extras from TFB_TRACK_FORCE_SYMBOLS) passes the same shape gate,
         # so junk can never reach the backend fetch regardless of source.
@@ -7651,7 +7809,27 @@ class PerformanceTrackerApp:
                 )
                 priority = {x for x in priority if _valid_symbol_shape(x)}
         missing = sorted(s for s in priority if s and s not in covered)
-        if len(missing) > _force_max():
+        if _by_status is not None:                        # v6.40.0 P-180
+            _plan = _force_plan(_by_status[0], _by_status[1],
+                                sorted(_force_extra_symbols()), covered,
+                                _force_max(), _force_scope())
+            logger.info(
+                "[v6.40.0 COVERAGE] scope=%s active=%d closed=%d extras=%d "
+                "forced=%d cut=%s skipped_closed=%d",
+                _plan["scope"], _plan["active"], _plan["closed"], _plan["extras"],
+                len(_plan["forced"]),
+                ",".join(_plan["cut"][:8]) + ("..." if len(_plan["cut"]) > 8 else "")
+                if _plan["cut"] else "-",
+                len(_plan["skipped_closed"]),
+            )
+            if _plan["cut"]:
+                logger.warning(
+                    "[v6.40.0 COVERAGE] cap %d binds: kept every active/pinned "
+                    "symbol, dropped %d closed-lot symbol(s)",
+                    _force_max(), len(_plan["cut"]),
+                )
+            missing = list(_plan["forced"])
+        elif len(missing) > _force_max():
             logger.warning(
                 "[v6.16.0 COVERAGE] %d missing decision symbols exceed cap %d; "
                 "forcing the first %d (raise TFB_TRACK_FORCE_MAX if intended)",
@@ -8205,7 +8383,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 14
+        total = 16
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -8330,6 +8508,51 @@ class PerformanceTrackerApp:
                 _PERF_UNIT_CREATION.clear()
                 _PERF_UNIT_CREATION.update(_cv14)
             if _c14:
+                passed += 1
+            # ---- v6.40.0 (P-180) FORCED-COVERAGE fixtures -------------- #
+            # case 15: the ledger matrix (title / Status: / legend rows
+            # above the header) -> active vs closed; Active in ANY lot wins;
+            # junk cells rejected; plan below the cap == v6.39.0 sorted cut.
+            _led = [["_Portfolio_CostBasis \u2014 LEDGER"], ["Status:", "Last refresh"],
+                    ["BLUE = operator"], ["Symbol", "Name", "Ccy", "Status", "Buy Date"],
+                    ["FER.US", "Ferrovial", "USD", "Inactive", ""],
+                    ["1050.SR", "BSF", "SAR", "Inactive", ""],
+                    ["YUM", "Yum", "USD", "Active", ""],
+                    ["1050.SR", "BSF", "SAR", "Active", ""],
+                    ["DDI.US", "DoubleDown", "USD", "Active", ""],
+                    ["TRUTH:", "", "", "Inactive", ""],
+                    ["", "", "", "", ""]]
+            _a15, _c15 = _extract_costbasis_by_status(_led)
+            _p15 = _force_plan(_a15, _c15, [], set(), 40, "all")
+            _c15ok = (_a15 == ["YUM", "1050.SR", "DDI.US"] and _c15 == ["FER.US"]
+                      and _p15["forced"] == ["1050.SR", "DDI.US", "FER.US", "YUM"]
+                      and _p15["cut"] == [] and _p15["active"] == 3 and _p15["closed"] == 1
+                      and _extract_costbasis_by_status([["Symbol", "Name"], ["YUM", "x"]]) == ([], []))
+            if _c15ok:
+                passed += 1
+            # case 16: at the cap active/extras are never cut (YUM survives
+            # 40 alphabetically-earlier closed names); scope=active skips
+            # closed lots; covered symbols leave the plan; parser words.
+            _closed16 = ["C%02d.US" % i for i in range(40)]
+            _p16 = _force_plan(["YUM", "DDI.US"], _closed16, ["ZZZ.US"], {"DDI.US"}, 40, "all")
+            _p16b = _force_plan(["YUM", "DDI.US"], _closed16, [], set(), 40, "active")
+            _sv16 = os.environ.get("TFB_TRACK_FORCE_SCOPE")
+            try:
+                os.environ.pop("TFB_TRACK_FORCE_SCOPE", None)
+                _c16 = _force_scope() == "all"
+                os.environ["TFB_TRACK_FORCE_SCOPE"] = " Active "
+                _c16 = _c16 and _force_scope() == "active"
+                os.environ["TFB_TRACK_FORCE_SCOPE"] = "junk"
+                _c16 = _c16 and _force_scope() == "all"
+            finally:
+                if _sv16 is None:
+                    os.environ.pop("TFB_TRACK_FORCE_SCOPE", None)
+                else:
+                    os.environ["TFB_TRACK_FORCE_SCOPE"] = _sv16
+            if (_c16 and "YUM" in _p16["forced"] and "ZZZ.US" in _p16["forced"]
+                    and "DDI.US" not in _p16["forced"] and len(_p16["forced"]) == 40
+                    and _p16["cut"] == ["C38.US", "C39.US"]
+                    and _p16b["forced"] == ["DDI.US", "YUM"] and len(_p16b["skipped_closed"]) == 40):
                 passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
