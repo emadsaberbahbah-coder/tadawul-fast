@@ -1,0 +1,130 @@
+name: "📋 TFB Board Scorecard"
+
+# ============================================================================
+# v1.0.0 (2026-10-01) — [P-182 BOARD SCORECARD] NEW workflow.
+# Scores every Top-10 board seat recorded in _Selection_Log against the
+# venue's later daily closes (+1 / +5 / +10 / +20 sessions, to exit, to now)
+# and against SPUS — scripts/score_selection_log.py v1.0.0 --scorecard.
+#
+# OBSERVE BY DEFAULT: computes, prints the summary into the job log and the
+# job summary, uploads CSV/MD artifacts — ZERO sheet writes (not even
+# _Run_Log). The sheet write (the NEW tab _Board_Scorecard, rewritten whole,
+# + one _Run_Log row "[BOARD-SCORECARD v1.0.0] ...") happens only when
+# TFB_BOARD_SCORECARD is "write": Emad's hand edit of the job env below, or a
+# manual dispatch with mode=write (that run only).
+#
+# _Selection_Log is READ ONLY. Prices come from the Yahoo chart API (no key,
+# NO EODHD quota spent — the EODHD day budget belongs to daily_sync).
+#
+# SCHEDULE: 22:23 UTC Mon-Fri (01:23 Riyadh Tue-Sat) — after the US close in
+# both DST regimes, so every venue's session for the day is final; the
+# Saturday sitting reads Friday's close. A live/partial bar is dropped by the
+# script anyway (manual dispatch during a session is safe).
+# ROLLBACK: delete this file (or set TFB_BOARD_SCORECARD: "off"). The v0.1.0
+# ticket path of the script does not depend on any of this.
+# ============================================================================
+
+on:
+  schedule:
+    - cron: "23 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "observe = artifacts only (no sheet writes); write = also rewrite _Board_Scorecard (this run only)"
+        required: true
+        default: "observe"
+        type: choice
+        options: ["observe", "write"]
+      since:
+        description: "Start date of the 'since' summary window (YYYY-MM-DD)"
+        required: false
+        default: "2026-09-01"
+
+concurrency:
+  group: tfb-board-scorecard
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scorecard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      # Scheduled runs use this value. "observe" = no sheet writes at all.
+      # ARMING (Emad's hand edit, after two green observe runs whose job
+      # summary reads sensibly): change to "write".
+      TFB_BOARD_SCORECARD: "observe"
+    steps:
+      # Pinned to main; the job token is not persisted into .git.
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # Pinned — keep in step with requirements.txt on main.
+      - name: Install deps
+        run: pip install --quiet "gspread==6.2.1" "google-auth==2.49.2"
+
+      - name: Materialize Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          if [[ -n "${SECRET_CREDS:-}" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present."; exit 1
+          fi
+          chmod 600 "$CREDS_PATH"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Self-test
+        run: python scripts/score_selection_log.py --selftest
+
+      - name: Run board scorecard
+        env:
+          # Dispatch inputs reach the shell through env, never through ${{ }}
+          # inside run:. A SCHEDULED run carries no inputs -> the job-level
+          # TFB_BOARD_SCORECARD above stands.
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_SINCE: ${{ github.event.inputs.since }}
+        run: |
+          set -euo pipefail
+          if [[ "${INPUT_MODE:-}" == "observe" || "${INPUT_MODE:-}" == "write" ]]; then
+            TFB_BOARD_SCORECARD="$INPUT_MODE"
+          fi
+          export TFB_BOARD_SCORECARD
+          SINCE="${INPUT_SINCE:-2026-09-01}"
+          if [[ ! "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::since must be YYYY-MM-DD"; exit 1
+          fi
+          echo "mode='${TFB_BOARD_SCORECARD}' (input='${INPUT_MODE:-<scheduled: none>}') since='${SINCE}'"
+          python scripts/score_selection_log.py --scorecard --live --fetch-yahoo \
+            --since "$SINCE" --out-dir artifacts/board_scorecard
+
+      - name: Upload scorecard artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfb-board-scorecard-${{ github.run_id }}
+          path: artifacts/board_scorecard/
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The key file never outlives the job, whatever failed above.
+      - name: Remove Google credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gcreds.json"
