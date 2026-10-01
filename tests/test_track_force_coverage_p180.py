@@ -39,7 +39,7 @@ def load(name, path):
 
 
 tp = load("tp_new_p180", NEW_PATH)
-assert tp.SCRIPT_VERSION == "6.40.0", tp.SCRIPT_VERSION
+assert tp.SCRIPT_VERSION == "6.41.0", tp.SCRIPT_VERSION
 tb = load("tp_base_p180", BASE_PATH) if BASE_PATH and os.path.exists(BASE_PATH) else None
 if tb is not None:
     assert tb.SCRIPT_VERSION == "6.39.0", tb.SCRIPT_VERSION
@@ -95,7 +95,7 @@ def fetched(backend):
 
 # ---------------------------------------------------------------- V1 ------ #
 a_new = tp.PerformanceTrackerApp(tp.create_parser().parse_args([]))
-T("V1 delivered selftest 16/16", a_new._track_selftest_() and tp._TRACK_SELFTEST_MSG == "PASS 16/16", tp._TRACK_SELFTEST_MSG)
+T("V1 delivered selftest 18/18", a_new._track_selftest_() and tp._TRACK_SELFTEST_MSG == "PASS 18/18", tp._TRACK_SELFTEST_MSG)
 if tb is not None:
     a_base = tb.PerformanceTrackerApp(tb.create_parser().parse_args([]))
     T("V1 base selftest 14/14", a_base._track_selftest_() and tb._TRACK_SELFTEST_MSG == "PASS 14/14", tb._TRACK_SELFTEST_MSG)
