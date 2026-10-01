@@ -343,7 +343,58 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # (_day_key_mode, _slot_utc_hm, evidence_day, resolve_evidence_day).
 # Removed: 0. Rollback: TFB_S1_DAY_KEY=wallclock in shadow_scorer.yml.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.0"
+# -----------------------------------------------------------------------------
+# v1.9.1 (2026-10-01) - P-186 BASE POLICY: pair every basket against the last
+# SCORED row, not the last row (env-gated, DEFAULT legacy = v1.9.0 byte-identical)
+# WHY (measured 2026-10-01 on Shadow_History + the 10-01 export): the day-D
+# return of each basket pairs today's bars against the PREVIOUS ROW's stored
+# prices. On an excluded day (DAY_EXCLUDED_INFRA / DAY_NON_TRADING) the stored
+# row keeps fresh bars where they existed and CARRIES the older price where
+# they did not ("so the next fresh bar captures the full move"). The two
+# baskets therefore enter the next scored day with bases of DIFFERENT
+# vintages: on 2026-09-30 the challenger's PINE leg paired 17.415 against a
+# 16.89 base carried from the 09-28 close (the 09-29 row was the mis-dated
+# #76 evaluation, fresh=1/5) while the benchmark's two legs paired against
+# TRUE 09-29 closes (SPUS 59.72, ^TASI 10,579) - a 2-session challenger
+# interval scored against a 1-session benchmark interval, and the day
+# counted as scored evidence (+0.45 % vs -0.54 %). GOOGL carried 342.75 (the
+# 09-28 close) in the same row. Red-team 10-01 section 12 found the same mechanism
+# independently. Also: the S1-FRESH read-back prints `fresh=a/b` with `a` =
+# paired legs of the PREVIOUS basket (daily-rebalanced convention: the
+# basket held through the session is yesterday's) but `b` = today's basket
+# size - `fresh=5/3` on 09-30. The floor test used the same denominator.
+# DESIGN (one policy, read once per run):
+#   * last_scored_row_for(history, basket): the most recent row of the basket
+#     that carries a numeric Daily Return, or its seed row (blank return,
+#     'seeded' note) when nothing has been scored yet; None when the basket
+#     has no rows (first-ever run keeps the legacy seed path).
+#   * TFB_S1_BASE_POLICY = legacy (DEFAULT: prev = last row, v1.9.0
+#     byte-identical) | observe (prev = last row; the last-scored pairing is
+#     ALSO measured for CHALLENGER and BENCHMARK and printed) | lastscored
+#     (prev = last SCORED row for every basket: pairing, turnover, cost
+#     drag, carried prices and the non-trading test all key off it, so a
+#     scored day after an excluded day spans the SAME interval for every
+#     basket - index chains are unchanged because excluded rows carry the
+#     index).
+#   * Freshness denominator: under lastscored the floor fraction and the
+#     S1-FRESH line divide by the PAIRABLE legs of the base row (prev prices
+#     present), never by today's seat count; legacy/observe keep v1.9.0's
+#     arithmetic and the observe line reports both.
+#   * `[S1-BASE v1.9.1] mode=.. chal legacy=.. lastscored=.. base=<date>
+#     legs=n | bench legacy=.. lastscored=.. | alpha_delta=..pp` is appended
+#     to the verdict line / S1_Gate meta / _Run_Log ONLY when the policy is
+#     not legacy, so the default output stays byte-identical.
+# S-1 BOUNDARY NOTE (P-139/P-175 class): this is a MEASUREMENT repair of the
+#   evidence lane; gate criteria, benchmark mix, fresh floor, counters and
+#   HISTORY_HEADER are byte-untouched; prior scored days stand as recorded.
+#   The flip to lastscored is an evidence-lane decision (Saturday sitting)
+#   after one observe read-back.
+# UNTOUCHED: count_scored_days, evaluate_s1, basket math, day classes,
+# HISTORY_HEADER, constants. Functions added: 4 (_base_policy,
+# last_scored_row_for, _sg_filter_prev, _measure_one). Removed: 0.
+# Rollback: unset TFB_S1_BASE_POLICY (or legacy) in shadow_scorer.yml.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.9.1"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -692,6 +743,7 @@ def _freshness_detail(basket_syms: List[str],
                       n_fresh: int, n_stale: int,
                       stale_syms: List[str],
                       floor_frac: float,
+                      denom_override: Optional[int] = None,
                       ) -> Tuple[str, Dict[str, Any]]:
     """v1.7.3 PURE: (log line, JSON-safe details) naming WHY challenger fresh
     coverage sits where it does. `nopair` mirrors basket_return_fresh's exact
@@ -704,6 +756,8 @@ def _freshness_detail(basket_syms: List[str],
                     if (cur.get(s) is None or not p0))
     new_syms = sorted(s for s in (basket_syms or []) if s not in prev)
     denom = len(basket_syms or [])
+    if denom_override is not None and denom_override > 0:   # v1.9.1 [P-186]
+        denom = int(denom_override)
     pct = floor_frac * 100.0
     floor_txt = f"{pct:.0f}" if abs(pct - round(pct)) < 1e-9 else f"{pct:.1f}"
 
@@ -1194,6 +1248,74 @@ def last_row_for(history: List[Dict[str, Any]], basket: str
     return rows[-1] if rows else None
 
 
+def _base_policy() -> str:
+    """v1.9.1 [P-186]: TFB_S1_BASE_POLICY legacy(default)|observe|lastscored.
+    Anything else -> legacy (byte-identical). Never raises."""
+    try:
+        raw = (os.getenv("TFB_S1_BASE_POLICY") or "legacy").strip().lower()
+        return raw if raw in ("observe", "lastscored") else "legacy"
+    except Exception:  # noqa: BLE001
+        return "legacy"
+
+
+def last_scored_row_for(history: List[Dict[str, Any]], basket: str
+                        ) -> Optional[Dict[str, Any]]:
+    """v1.9.1 [P-186] PURE: the most recent row of `basket` that carries a
+    numeric Daily Return (a SCORED day), else its most recent seed row
+    (blank return, 'seeded' note), else None. Excluded / non-trading rows
+    are never a pairing base under the lastscored policy."""
+    rows = [h for h in history if h.get("basket") == basket]
+    for h in reversed(rows):
+        if h.get("daily_return") is not None:
+            return h
+    for h in reversed(rows):
+        if "seeded" in str(h.get("note") or ""):
+            return h
+    return None
+
+
+def _sg_filter_prev(prev_map: Dict[str, Optional[Dict[str, Any]]]
+                    ) -> Dict[str, Optional[Dict[str, Any]]]:
+    """v1.9.1 [P-186] PURE: the v1.7.2 shape-guard filter applied to a base
+    map (junk carried in old rows never re-enters). Mirrors main()'s inline
+    block verbatim; used for the alternative base map only."""
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for _pb, _pr in prev_map.items():
+        if _pr:
+            out[_pb] = dict(
+                _pr,
+                symbols=[s for s in _pr.get("symbols") or [] if symbol_like(s)],
+                prices={k: v for k, v in (_pr.get("prices") or {}).items()
+                        if symbol_like(k)})
+        else:
+            out[_pb] = _pr
+    return out
+
+
+def _measure_one(basket: str, p: Optional[Dict[str, Any]],
+                 spot: Dict[str, float], spot_asof: Dict[str, date]
+                 ) -> Dict[str, Any]:
+    """v1.9.1 [P-186] PURE: one basket's honest pass-1 measurement against a
+    given base row - mirrors main()'s inline pass 1 (benchmark blended,
+    others equal-weight). Returns {ret, n_fresh, n_stale, stale_syms,
+    pairable, base_date}."""
+    p_date = _parse_iso_date(p["date"]) if p else None
+    if basket == BENCHMARK:
+        ret, n_fresh, n_stale = (
+            blended_benchmark_return_fresh(p["prices"], spot, spot_asof, p_date)
+            if p else (None, 0, 0))
+        stale_syms: List[str] = []
+    else:
+        ret, n_fresh, n_stale, stale_syms = (
+            basket_return_fresh(p["prices"], spot, spot_asof, p_date)
+            if p else (None, 0, 0, []))
+    pairable = len([1 for _s, _p0 in ((p or {}).get("prices") or {}).items()
+                    if _p0]) if p else 0
+    return {"ret": ret, "n_fresh": n_fresh, "n_stale": n_stale,
+            "stale_syms": stale_syms, "pairable": pairable,
+            "base_date": (str(p.get("date")) if p else None)}
+
+
 def append_history(sh, rows: List[List[Any]]) -> None:
     try:
         ws = sh.worksheet(TAB_HISTORY)
@@ -1476,6 +1598,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     symbols=[s for s in _pr.get("symbols") or [] if symbol_like(s)],
                     prices={k: v for k, v in (_pr.get("prices") or {}).items()
                             if symbol_like(k)})
+    # v1.9.1 [P-186 BASE POLICY]: legacy keeps `prev` as built above; the
+    # alternative map pairs against the last SCORED row of each basket.
+    _bp_mode = _base_policy()
+    _prev_legacy = prev
+    _prev_ls: Dict[str, Optional[Dict[str, Any]]] = {}
+    if _bp_mode != "legacy":
+        _prev_ls = {b: last_scored_row_for(history, b) for b in prev}
+        if _sg_on:
+            _prev_ls = _sg_filter_prev(_prev_ls)
+        if _bp_mode == "lastscored":
+            prev = _prev_ls
     existing_forks = read_regret_ledger(sh)
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
     new_forks = dedupe_new_forks(
@@ -1494,6 +1627,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     for p in prev.values():
         if p:
             need |= set(p["symbols"])
+    if _bp_mode != "legacy":                       # v1.9.1: both base maps priced
+        for p in list(_prev_legacy.values()) + list(_prev_ls.values()):
+            if p:
+                need |= set(p["symbols"])
     if _sg_on:                                     # v1.7.2: never fetch a non-symbol
         need = {s for s in need if symbol_like(s)}
     spot, spot_asof, price_errs = fetch_spot(sorted(need))
@@ -1537,6 +1674,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the three series never diverge on which days they consider real.
     _chal_m = measured[CHALLENGER]
     _chal_frac = (_chal_m["n_fresh"] / len(chal_syms)) if chal_syms else 0.0
+    # v1.9.1 [P-186]: the basket held through the session is the BASE row's
+    # basket (daily-rebalanced convention), so under lastscored the floor
+    # fraction divides by its pairable legs; observe only reports it.
+    _bp_pairable = len([1 for _s, _p0 in ((_chal_m["p"] or {}).get("prices") or {}).items()
+                        if _p0]) if _chal_m["p"] else 0
+    _chal_frac_legacy = _chal_frac
+    if _bp_mode == "lastscored" and _bp_pairable > 0:
+        _chal_frac = _chal_m["n_fresh"] / _bp_pairable
+    _base_line = ""
+    if _bp_mode != "legacy":
+        try:
+            _alt_prev = _prev_ls if _bp_mode == "observe" else _prev_legacy
+            _m_cur_c, _m_cur_b = measured[CHALLENGER], measured[BENCHMARK]
+            _m_alt_c = _measure_one(CHALLENGER, _alt_prev.get(CHALLENGER), spot, spot_asof)
+            _m_alt_b = _measure_one(BENCHMARK, _alt_prev.get(BENCHMARK), spot, spot_asof)
+            _leg_c = _m_cur_c if _bp_mode == "observe" else _m_alt_c    # legacy pairing
+            _ls_c = _m_alt_c if _bp_mode == "observe" else _m_cur_c     # lastscored pairing
+            _leg_b = _m_cur_b if _bp_mode == "observe" else _m_alt_b
+            _ls_b = _m_alt_b if _bp_mode == "observe" else _m_cur_b
+            def _f(v: Optional[float]) -> str:
+                return "n/a" if v is None else f"{v:+.4f}%"
+            _a_leg = (None if (_leg_c["ret"] is None or _leg_b["ret"] is None)
+                      else _leg_c["ret"] - _leg_b["ret"])
+            _a_ls = (None if (_ls_c["ret"] is None or _ls_b["ret"] is None)
+                     else _ls_c["ret"] - _ls_b["ret"])
+            _a_delta = (None if (_a_leg is None or _a_ls is None) else _a_ls - _a_leg)
+            _ls_base = (_prev_ls.get(CHALLENGER) or {}).get("date") if _bp_mode == "observe" \
+                else (prev.get(CHALLENGER) or {}).get("date")
+            _leg_base = (_prev_legacy.get(CHALLENGER) or {}).get("date")
+            _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
+                          f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
+                          f"lastscored={_f(_ls_c['ret'])}@{_ls_base or '-'} "
+                          f"legs={_ls_c['n_fresh']}/{_ls_c['pairable']} | "
+                          f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "
+                          f"alpha legacy={_f(_a_leg)} lastscored={_f(_a_ls)} "
+                          f"delta={'n/a' if _a_delta is None else f'{_a_delta:+.4f}pp'} | "
+                          f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}")
+        except Exception as _bp_exc:  # noqa: BLE001 - read-back is additive, never fatal
+            _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
+                          f"readback_error={type(_bp_exc).__name__}")
     # v1.5.0 B-2: venue-closed days are NON-TRADING, not infra failures.
     _chal_p_date = (_parse_iso_date(_chal_m["p"]["date"])
                     if _chal_m["p"] else None)
@@ -1660,8 +1837,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         chal_syms,
         (_chal_m["p"] or {}).get("prices") if _chal_m["p"] else None,
         spot, _chal_m["n_fresh"], _chal_m["n_stale"],
-        _chal_m["stale_syms"], _min_fresh_frac())
+        _chal_m["stale_syms"], _min_fresh_frac(),
+        denom_override=(_bp_pairable if (_bp_mode == "lastscored" and _bp_pairable > 0)
+                        else None))                 # v1.9.1 [P-186]
     verdict += f" | {_fresh_line}"
+    if _base_line:                                 # v1.9.1 [P-186] read-back
+        verdict += f" | {_base_line}"
     if _bf_mode != "off":                          # v1.8.0 read-back
         verdict += (f" | [S1-BOARD-FRESH v{SCRIPT_VERSION}] "
                     f"asof={_bf_asof or '?'} mode={_bf_mode}"
@@ -1708,7 +1889,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          _pe_line,                                  # v1.7.1 read-back cell
          _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")
          + f" | {_fresh_line}"
-         + (f" | {_dk_line}" if _dk["drift"] else "")],  # v1.7.3 / v1.9.0 cells
+         + (f" | {_dk_line}" if _dk["drift"] else "")
+         + (f" | {_base_line}" if _base_line else "")],  # v1.7.3 / v1.9.0 / v1.9.1 cells
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1734,18 +1916,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[S1-GATE v{SCRIPT_VERSION}] WRITE FAILED {_label}: {_exc}")
     if _write_errors:
         verdict += " | write_errors=" + ",".join(_write_errors)
+    _rl_details: Dict[str, Any] = {"version": SCRIPT_VERSION,
+                                   "price_errs": _pe_details,
+                                   "shape_guard": {"on": _sg_on,
+                                                   "dropped": _sg_dropped[:12]},
+                                   "excluded_reason": _excl_reason,
+                                   "freshness": _fresh_details,
+                                   "day_key": _dk}
+    if _base_line:                                 # v1.9.1 [P-186] armed only
+        _rl_details["base_policy"] = {"mode": _bp_mode, "line": _base_line,
+                                      "pairable": _bp_pairable,
+                                      "fresh_frac_legacy": round(_chal_frac_legacy, 4),
+                                      "fresh_frac_used": round(_chal_frac, 4)}
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
              "shadow_scorer", TAB_GATE,
              "OK" if gate["verdict"] != "FAIL" else "GATE_FAIL", verdict,
-             "", "", "", json.dumps({"version": SCRIPT_VERSION,
-                                     "price_errs": _pe_details,
-                                     "shape_guard": {"on": _sg_on,
-                                                     "dropped": _sg_dropped[:12]},
-                                     "excluded_reason": _excl_reason,
-                                     "freshness": _fresh_details,
-                                     "day_key": _dk})],
+             "", "", "", json.dumps(_rl_details)],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -2231,6 +2419,51 @@ def _selftest() -> int:
                    evidence_day(datetime(2026, 9, 28, 21, 40, tzinfo=timezone.utc), (15, 20))
                    == date(2026, 9, 28)
                    and json.dumps(_dk_def[1]) is not None))
+
+    # v1.9.1 P-186 base policy (pure)
+    _bh = [
+        {"date": "2026-09-26", "basket": "CHALLENGER", "symbols": ["A"], "prices": {"A": 10.0},
+         "daily_return": None, "cum_index": 100.0, "note": "n=1 seeded"},
+        {"date": "2026-09-27", "basket": "CHALLENGER", "symbols": ["A"], "prices": {"A": 11.0},
+         "daily_return": 10.0, "cum_index": 110.0, "note": "n=1"},
+        {"date": "2026-09-28", "basket": "CHALLENGER", "symbols": ["A", "B"], "prices": {"A": 11.0, "B": 5.0},
+         "daily_return": None, "cum_index": 110.0, "note": "DAY_EXCLUDED_INFRA fresh=0/2 stale=1 reason=fresh-floor"},
+        {"date": "2026-09-29", "basket": "CHALLENGER", "symbols": ["A", "B"], "prices": {"A": 11.0, "B": 5.0},
+         "daily_return": None, "cum_index": 110.0, "note": "DAY_NON_TRADING no-venue-session fresh=0/2"},
+        {"date": "2026-09-29", "basket": "BENCHMARK", "symbols": ["SPUS"], "prices": {"SPUS": 1.0},
+         "daily_return": None, "cum_index": 100.0, "note": "n=1 seeded"},
+    ]
+    checks.append(("BASE: last_scored_row_for skips excluded/non-trading rows -> 09-27 scored row",
+                   (last_scored_row_for(_bh, "CHALLENGER") or {}).get("date") == "2026-09-27"
+                   and (last_row_for(_bh, "CHALLENGER") or {}).get("date") == "2026-09-29"))
+    checks.append(("BASE: seed row is the base when nothing is scored; unknown basket -> None",
+                   (last_scored_row_for(_bh, "BENCHMARK") or {}).get("date") == "2026-09-29"
+                   and last_scored_row_for(_bh, "CHAMPION") is None))
+    _bp_saved = os.environ.get("TFB_S1_BASE_POLICY")
+    os.environ["TFB_S1_BASE_POLICY"] = "LastScored"
+    _bp_a = _base_policy()
+    os.environ["TFB_S1_BASE_POLICY"] = "junk"
+    _bp_b = _base_policy()
+    os.environ.pop("TFB_S1_BASE_POLICY", None)
+    _bp_c = _base_policy()
+    if _bp_saved is not None:
+        os.environ["TFB_S1_BASE_POLICY"] = _bp_saved
+    checks.append(("BASE: policy reader lastscored / junk->legacy / unset->legacy",
+                   (_bp_a, _bp_b, _bp_c) == ("lastscored", "legacy", "legacy")))
+    checks.append(("BASE: S1-FRESH denominator override (5 pairable legs, 3 seats)",
+                   "chal fresh=5/5" in _freshness_detail(["X", "Y", "Z"], {"A": 1.0, "B": 1.0, "C": 1.0,
+                                                                            "D": 1.0, "E": 1.0},
+                                                         {"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0, "E": 1.0},
+                                                         5, 0, [], 0.6, denom_override=5)[0]
+                   and "chal fresh=5/3" in _freshness_detail(["X", "Y", "Z"], {"A": 1.0, "B": 1.0, "C": 1.0,
+                                                                                "D": 1.0, "E": 1.0},
+                                                             {"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0, "E": 1.0},
+                                                             5, 0, [], 0.6)[0]))
+    checks.append(("BASE: _measure_one mirrors pass 1 (equal-weight, honest pairing)",
+                   abs((_measure_one("CHALLENGER", {"date": "2026-09-27", "prices": {"A": 10.0, "B": 20.0}},
+                                     {"A": 11.0, "B": 22.0}, {"A": date(2026, 9, 28), "B": date(2026, 9, 28)})["ret"] or 0.0)
+                       - 10.0) < 1e-9
+                   and _measure_one("CHALLENGER", None, {}, {})["ret"] is None))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
