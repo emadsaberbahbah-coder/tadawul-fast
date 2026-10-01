@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""tests/test_tp_dedup_matured_p189b.py — track_performance v6.41.0
+[P-189b MATURED DUPLICATE KEYS + P-188 RISK PLACEHOLDERS].
+
+REAL classes (PerformanceStore.load_records / _record_to_row,
+PerformanceAnalyzer.analyze, PerformanceTrackerApp._track_selftest_) — the
+store is constructed without its network init and handed an in-memory
+worksheet whose get() returns the Performance_Log rows; nothing else is
+stubbed. Set TFB_TEST_PERF_TSV=<Performance_Log.tsv> (2026-10-01 export:
+18,287 records, 27 matured/matured duplicate keys) for the real-data legs and
+TP_BASE=<v6.40.0 file> for the dual-tree. TP_FILE=<path> tests a file outside
+the repo tree.
+
+P1 embedded guard self-test 18/18 (16 v6.40.0 cases + 2 new)
+P2 synthetic: off == base; observe counts the decided duplicate only (an
+   ACTIVE-first / MATURED-later pair and a MATURED-first / ACTIVE-later pair
+   are never touched by the new pass); enforce expires it with the note (matured 5 -> 4); the
+   v6.35.0 ACTIVE-duplicate rule is byte-unchanged
+P3 real export, OFF: load + analyze + rows == base (dual-tree); 27 decided
+   duplicates present; matured 9,808 / W 4,776 / L 4,839
+P4 real export, observe: records, analyze and rows identical to OFF;
+   read-back count 27 (W 20 / L 7 / BE 0); verdict token text
+P5 real export, enforce: exactly 27 records change (MATURED -> EXPIRED /
+   DUPLICATE_KEY, realized None, note names the original outcome); analyze
+   matured 9,781 / W 4,756 / L 4,832; every first copy untouched
+P6 TRACK_RISK_BLANK=1: rows differ from OFF ONLY in the three risk cells
+   ("" for the 0.0 placeholders, 3 x 18,287 cells); read-back of a blanked
+   row maps to 0.0 (round trip stable)
+P7 idempotence x2
+"""
+import copy, csv, hashlib, importlib.util, json, os, sys
+from types import SimpleNamespace
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+sys.path.insert(0, ROOT)
+TP_FILE = os.environ.get("TP_FILE") or os.path.join(ROOT, "scripts", "track_performance.py")
+TSV = os.environ.get("TFB_TEST_PERF_TSV", "")
+BASE = os.environ.get("TP_BASE", "")
+ENVS = ("TRACK_DEDUP_MATURED", "TRACK_RISK_BLANK", "TRACK_DEDUP_KEYS")
+
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+tp = _load(TP_FILE, "tp_under_test")
+assert tp.SCRIPT_VERSION == "6.41.0", tp.SCRIPT_VERSION
+out = []
+
+
+def T(name, cond, detail=""):
+    out.append(("PASS " if cond else "FAIL ") + name + (" | " + str(detail)[:260] if detail else ""))
+    if not cond:
+        raise AssertionError(name + " " + str(detail))
+
+
+def _env(dm=None, blank=None):
+    for k in ENVS:
+        os.environ.pop(k, None)
+    if dm is not None:
+        os.environ["TRACK_DEDUP_MATURED"] = dm
+    if blank is not None:
+        os.environ["TRACK_RISK_BLANK"] = blank
+
+
+class WS:
+    """In-memory worksheet: get(range) returns the data rows (row 6 on)."""
+    def __init__(self, rows):
+        self._rows = rows
+        self.row_count = 6 + len(rows) + 10
+    def get(self, rng):
+        return [list(r) for r in self._rows]
+
+
+def _store(mod, rows):
+    st = object.__new__(mod.PerformanceStore)
+    st.spreadsheet_id = "TEST"
+    st.sheet_name = "Performance_Log"
+    st.backoff = mod.FullJitterBackoff(max_retries=1)
+    st.cache = {}
+    st.cache_lock = mod.Lock()
+    st.gc = st.sheet = None
+    st.ws = WS(rows)
+    return st
+
+
+def _run(mod, rows, dm=None, blank=None):
+    _env(dm, blank)
+    try:
+        st = _store(mod, copy.deepcopy(rows))
+        recs = st.load_records()
+        summ = mod.PerformanceAnalyzer().analyze(recs)
+        out_rows = [st._record_to_row(r) for r in recs]
+        rb = dict(getattr(mod, "_LAST_DEDUP_MATURED", {}) or {})
+    finally:
+        _env(None)
+    return recs, summ, out_rows, rb
+
+
+def _rows_digest(rows):
+    # last_updated / maturity stamps of mutated rows carry wall-clock time:
+    # mask columns 25-26 (Last Updated, Maturity Date) for cross-run digests
+    norm = [[c for i, c in enumerate(r) if i not in (24, 25)] for r in rows]
+    return hashlib.sha256(json.dumps(norm, default=str).encode()).hexdigest()[:16]
+
+
+H = tp.PerformanceStore.HEADERS
+
+
+def _row(key_sym, horizon, date, status, outcome, roi, rid):
+    r = [""] * len(H)
+    m = {h: i for i, h in enumerate(H)}
+    r[m["Record ID"]] = rid
+    r[m["Key"]] = "%s|%s|%s" % (key_sym, horizon, date.replace("-", ""))
+    r[m["Symbol"]] = key_sym
+    r[m["Horizon"]] = horizon
+    r[m["Date Recorded (Riyadh)"]] = date + " 10:00:00"
+    r[m["Entry Price"]] = "10.0"
+    r[m["Entry Recommendation"]] = "BUY"
+    r[m["Entry Score"]] = "70"
+    r[m["Target Price"]] = "11.0"
+    r[m["Target ROI %"]] = "0.1"
+    r[m["Target Date (Riyadh)"]] = "2026-08-01 10:00:00"
+    r[m["Status"]] = status
+    r[m["Current Price"]] = "10.5"
+    r[m["Realized ROI %"]] = "" if roi is None else str(roi)
+    r[m["Outcome"]] = outcome
+    r[m["Volatility"]] = "0.0"
+    r[m["Max Drawdown %"]] = "0.0"
+    r[m["Sharpe Ratio"]] = "0.0"
+    r[m["Last Updated (Riyadh)"]] = "2026-08-01 10:00:00"
+    return r
+
+
+# ---------------------------------------------------------------- P1 ---- #
+app = object.__new__(tp.PerformanceTrackerApp)
+ok = tp.PerformanceTrackerApp._track_selftest_(app)
+T("P1 embedded guard self-test 18/18", ok is not False and tp._TRACK_SELFTEST_MSG == "PASS 18/18", tp._TRACK_SELFTEST_MSG)
+
+# ---------------------------------------------------------------- P2 ---- #
+SYN = [_row("AAA.US", "1M", "2026-07-01", "matured", "WIN", 2.5, "a1"),
+       _row("AAA.US", "1M", "2026-07-01", "matured", "WIN", 2.5, "a2"),      # decided dup -> counted
+       _row("BBB.US", "1M", "2026-07-01", "active", "", None, "b1"),
+       _row("BBB.US", "1M", "2026-07-01", "matured", "LOSS", -1.0, "b2"),    # active-first: untouched
+       _row("CCC.US", "1M", "2026-07-01", "matured", "LOSS", -3.0, "c1"),
+       _row("CCC.US", "1M", "2026-07-01", "active", "", None, "c2"),          # v6.35.0 rule: expired
+       _row("DDD.US", "1M", "2026-07-01", "matured", "WIN", 1.0, "d1")]
+r_off, s_off, rows_off, rb_off = _run(tp, SYN, None)
+r_obs, s_obs, rows_obs, rb_obs = _run(tp, SYN, "observe")
+r_enf, s_enf, rows_enf, rb_enf = _run(tp, SYN, "enforce")
+st = lambda recs: [(r.record_id, r.status.value, r.outcome, r.realized_roi) for r in recs]  # noqa: E731
+T("P2 off: v6.35.0 rule expires the ACTIVE dup only (c2)", [x for x in st(r_off) if x[0] == "c2"][0][1:3] == ("expired", "DUPLICATE_KEY")
+  and [x for x in st(r_off) if x[0] == "a2"][0][1] == "matured", st(r_off))
+T("P2 observe: records identical to off; count 1 (W1)", st(r_obs) == st(r_off) and rb_obs["count"] == 1 and rb_obs["wins"] == 1
+  and rb_obs["keys"] == ["AAA.US|1M|20260701"], rb_obs)
+a2 = [r for r in r_enf if r.record_id == "a2"][0]
+T("P2 enforce: a2 -> EXPIRED/DUPLICATE_KEY, realized None, note names WIN 2.5", a2.status.value == "expired" and a2.outcome == "DUPLICATE_KEY"
+  and a2.realized_roi is None and "[v6.41.0 DEDUP-MATURED] duplicate of AAA.US|1M|20260701 (was matured WIN 2.5000)" in a2.notes, (a2.status, a2.notes))
+T("P2 enforce: active-first / matured-later pair untouched (b2 stays matured)", [x for x in st(r_enf) if x[0] == "b2"][0][1] == "matured")
+T("P2 enforce: first copies a1/c1 untouched", [x for x in st(r_enf) if x[0] in ("a1", "c1")] == [x for x in st(r_off) if x[0] in ("a1", "c1")])
+T("P2 analyze: matured off 5 -> enforce 4", s_off.matured_records == 5 and s_enf.matured_records == 4, (s_off.matured_records, s_enf.matured_records))
+if BASE:
+    tpb = _load(BASE, "tp_base_v6400")
+    assert tpb.SCRIPT_VERSION == "6.40.0", tpb.SCRIPT_VERSION
+    rb_recs, rb_s, rb_rows, _ = _run(tpb, SYN, None)
+    T("P2 dual-tree: off rows == base rows (synthetic)", _rows_digest(rows_off) == _rows_digest(rb_rows))
+    rb2_recs, _, rb2_rows, _ = _run(tpb, SYN, "enforce", "1")
+    T("P2 dual-tree: new envs inert on base", _rows_digest(rb2_rows) == _rows_digest(rb_rows))
+else:
+    out.append("SKIP P2 dual-tree (set TP_BASE=<v6.40.0 file>)")
+
+# ---------------------------------------------------------------- P3-P7 - #
+real_digest = None
+if TSV and os.path.exists(TSV):
+    with open(TSV, encoding="utf-8") as fh:
+        allrows = list(csv.reader(fh, delimiter="\t"))
+    data = [r[:len(H)] for r in allrows[5:] if r and r[0].strip()]
+    T("P3 real export loaded", len(data) == 18287, len(data))
+    R_off, S_off, W_off, RB_off = _run(tp, data, None)
+    keys = {}
+    for r in R_off:
+        keys.setdefault(r.key, []).append(r)
+    dups = {k: v for k, v in keys.items() if len(v) > 1}
+    T("P3 off: 27 duplicate keys, all decided pairs", len(dups) == 27 and all(
+        all(x.status == tp.PerformanceStatus.MATURED and x.realized_roi is not None for x in v) for v in dups.values()), len(dups))
+    T("P3 off: analyze matured 9,808 / W 4,776 / L 4,839", (S_off.matured_records, S_off.wins, S_off.losses) == (9808, 4776, 4839),
+      (S_off.matured_records, S_off.wins, S_off.losses))
+    if BASE:
+        R_b, S_b, W_b, _ = _run(tpb, data, None)
+        T("P3 dual-tree: off rows == base rows (18,287)", _rows_digest(W_off) == _rows_digest(W_b), (_rows_digest(W_off), _rows_digest(W_b)))
+        T("P3 dual-tree: off analyze == base analyze", (S_off.matured_records, S_off.wins, S_off.losses, round(S_off.avg_roi, 9)) ==
+          (S_b.matured_records, S_b.wins, S_b.losses, round(S_b.avg_roi, 9)))
+    R_o, S_o, W_o, RB_o = _run(tp, data, "observe")
+    T("P4 observe: rows identical to off", _rows_digest(W_o) == _rows_digest(W_off))
+    T("P4 observe: analyze identical to off", (S_o.matured_records, S_o.wins, S_o.losses) == (S_off.matured_records, S_off.wins, S_off.losses))
+    T("P4 observe: read-back 27 (W 20 / L 7 / BE 0)", (RB_o["count"], RB_o["wins"], RB_o["losses"], RB_o["breakeven"]) == (27, 20, 7, 0), RB_o)
+    R_e, S_e, W_e, RB_e = _run(tp, data, "enforce")
+    changed = [(a, b) for a, b in zip(R_off, R_e) if (a.status, a.outcome, a.realized_roi) != (b.status, b.outcome, b.realized_roi)]
+    T("P5 enforce: exactly 27 records change, each MATURED -> EXPIRED/DUPLICATE_KEY", len(changed) == 27 and all(
+        b.status == tp.PerformanceStatus.EXPIRED and b.outcome == "DUPLICATE_KEY" and b.realized_roi is None
+        and "[v6.41.0 DEDUP-MATURED]" in b.notes for _, b in changed), len(changed))
+    firsts = {k: v[0].record_id for k, v in dups.items()}
+    T("P5 enforce: no first copy changed", not any(a.record_id in firsts.values() for a, _ in changed))
+    T("P5 enforce: analyze matured 9,781 / W 4,756 / L 4,832", (S_e.matured_records, S_e.wins, S_e.losses) == (9781, 4756, 4832),
+      (S_e.matured_records, S_e.wins, S_e.losses))
+    out.append("INFO win rate off %.2f%% -> enforce %.2f%%" % (S_off.win_rate, S_e.win_rate))
+    R_k, S_k, W_k, _ = _run(tp, data, None, "1")
+    idx = [H.index("Volatility"), H.index("Max Drawdown %"), H.index("Sharpe Ratio")]
+    diff_cells = [(i, j) for i, (a, b) in enumerate(zip(W_off, W_k)) for j in range(len(a)) if a[j] != b[j]]
+    T("P6 risk blank: only the three risk columns differ", all(j in idx for _, j in diff_cells), set(j for _, j in diff_cells))
+    T("P6 risk blank: all 3 x 18,287 placeholder cells blanked", len(diff_cells) == 3 * 18287 and all(W_k[i][j] == "" for i, j in diff_cells), len(diff_cells))
+    rt = tp.PerformanceRecord.from_sheet_row([str(c) for c in W_k[0]], H)
+    T("P6 round trip: a blanked row reads back as 0.0", (rt.volatility, rt.max_drawdown, rt.sharpe_ratio) == (0.0, 0.0, 0.0))
+    T("P7 idempotence observe/enforce", _rows_digest(_run(tp, data, "observe")[2]) == _rows_digest(W_o)
+      and _rows_digest(_run(tp, data, "enforce")[2]) == _rows_digest(W_e))
+    real_digest = [_rows_digest(W_off), _rows_digest(W_o), _rows_digest(W_e), _rows_digest(W_k)]
+else:
+    out.append("SKIP P3-P7 real export (set TFB_TEST_PERF_TSV=<Performance_Log.tsv>)")
+
+digest = hashlib.sha256(("\n".join(out) + json.dumps(real_digest)).encode()).hexdigest()[:16]
+print("\n".join(out))
+print("RESULT %d PASS / %d FAIL, digest %s" % (sum(1 for l in out if l.startswith("PASS")),
+                                              sum(1 for l in out if l.startswith("FAIL")), digest))
+
+
+def test_all():
+    assert not any(l.startswith("FAIL") for l in out)
