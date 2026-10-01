@@ -776,7 +776,47 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # Functions added: 3 (_env_forecast_basis, _f1_plan_roi_pct,
 # _apply_f1_observe_tag). Removed: 0.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.13.1"
+# ---------------------------------------------------------------------------
+# v1.14.0 (2026-10-01) - [P-183 ADD-ON-LOSER VETO] no averaging down, no
+# adding into a stop (env-gated, DEFAULT OFF = v1.13.1 byte-identical)
+# EVIDENCE (Monitoring Sheet #5 / _Portfolio_Action_Log, 2026-10-01): the PF
+#   layer recommended "ADD 58 sh CARE.US @ 30.07" on 09-25, four days before
+#   CARE stopped out at 29.55 (-723 SAR); today it recommends "ADD 20 sh
+#   AER.US ~10,800 SAR, confirmed 2/2" on a 3-day-old divergence buy sitting
+#   -3.3% below cost. The 09-12 post-mortem named the five-step loss pattern
+#   (entry -> adverse move -> engine HOLD/ADD strengthens as the price falls
+#   -> behavioural exit on a larger ticket); the ladder still qualifies an
+#   ADD on upside/reliability/DQ/headroom alone and never asks whether the
+#   position is already losing or sitting on its stop.
+# WHAT: a post-decision seam (the F-2 / F-1a pattern; decide_action stays
+#   byte-identical) that NARROWS an ADD to HOLD when
+#     (a) unrealized return (pnl_sar / cost_sar) <= -TFB_PF_ADD_LOSER_PCT
+#         (default 2.0 %), or
+#     (b) the native price sits within TFB_PF_ADD_STOP_PROX_PCT (default
+#         2.0 %) above the holding's stop, or at/below it.
+#   Never upgrades anything; never touches HOLD/TRIM/EXIT/BLOCK; a sukuk is
+#   exempt (D-9: no equity stop, income basis); fail-soft on a missing basis
+#   (returns inputs unchanged). The confirmation clock runs BEFORE this seam,
+#   so a vetoed ADD keeps its confirmed state and re-emerges the day the
+#   trigger clears (no reset, no re-confirmation churn).
+# GATE TFB_PF_ADD_LOSER_VETO = off (default) | observe | enforce, read at
+#   call time (no restart; read-back = the tags in the next run):
+#   observe -> action untouched; one countable "[addveto-observe] <trigger>
+#              - would HOLD under enforce" tag on the ADD row's reason
+#              (renders at BOTH sites: action_reason + advisor_note)
+#   enforce -> ADD -> HOLD, reason "ADD vetoed [P-183]: <trigger> (was ADD:
+#              <original reason>)", proceeds 0, capped_from=ADD (the
+#              suppressed-action contract the funding pass understands);
+#              alert add_loser_veto (count) + meta.add_loser_veto read-back
+# SCOPE CUTS (register): a 1-day-sigma loser threshold (vol-scaled) is a
+#   later refinement - the fixed 2.0 % floor is explainable on the sheet;
+#   stop proximity reads the ladder's own stop (TP1-anchored), not the
+#   broker order; timing of NEW seats = opportunity_builder v1.23.0 (P-181).
+# Functions added: 5 (_env_add_loser_veto_mode, _env_add_loser_pct,
+#   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
+#   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.14.0"
 # v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
 # HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
 # WHY: every RULE in this file already stands down for a SUKUK-class
@@ -3181,6 +3221,88 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
             mv)
 
 
+def _env_add_loser_veto_mode():
+    """v1.14.0 [P-183]: off | observe | enforce (read at call time, the
+    F-2 / F-1a seam convention; read-back = the [addveto-*] tags in the next
+    Portfolio_Decision run). Any other value -> off (byte-identical)."""
+    v = str(os.environ.get("TFB_PF_ADD_LOSER_VETO", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _env_add_loser_pct():
+    """v1.14.0 [P-183]: loser floor in percent of cost (default 2.0; the
+    sign is ignored - a position <= -floor is a loser)."""
+    return abs(_env_float("TFB_PF_ADD_LOSER_PCT", 2.0))
+
+
+def _env_add_stop_prox_pct():
+    """v1.14.0 [P-183]: stop-proximity band in percent above the stop
+    (default 2.0); a non-positive value disables the proximity leg."""
+    return _env_float("TFB_PF_ADD_STOP_PROX_PCT", 2.0)
+
+
+def _add_loser_eval(cand, loser_pct, prox_pct):
+    """v1.14.0 [P-183] PURE: {ret_pct, prox_pct, loser, near_stop,
+    below_stop, trig} for one holding. Return basis = pnl_sar / cost_sar
+    (both SAR, currency-safe - the F-2 basis); stop proximity on the
+    native price vs the ladder stop (both pre-FX). Missing inputs never
+    fire a leg. Never raises."""
+    out = {"ret_pct": None, "prox_pct": None, "loser": False,
+           "near_stop": False, "below_stop": False, "trig": ""}
+    try:
+        pnl = _to_float((cand or {}).get("pnl_sar"))
+        cost = _to_float((cand or {}).get("cost_sar"))
+        if pnl is not None and cost is not None and cost > 0:
+            out["ret_pct"] = pnl / cost * 100.0
+            out["loser"] = out["ret_pct"] <= -abs(float(loser_pct))
+        px = _to_float((cand or {}).get("price"))
+        stop = _to_float((cand or {}).get("stop"))
+        if px is not None and stop is not None and px > 0 and stop > 0:
+            out["prox_pct"] = (px / stop - 1.0) * 100.0
+            if px <= stop:
+                out["below_stop"] = True
+            elif float(prox_pct) > 0.0 and out["prox_pct"] <= float(prox_pct):
+                out["near_stop"] = True
+        bits = []
+        if out["loser"]:
+            bits.append("position %.1f%% vs cost breaches the -%.1f%% loser floor"
+                        % (out["ret_pct"], abs(float(loser_pct))))
+        if out["below_stop"]:
+            bits.append("price at/below the stop (%.2f <= %.2f)" % (px, stop))
+        elif out["near_stop"]:
+            bits.append("price %.1f%% above the stop (band %.1f%%)"
+                        % (out["prox_pct"], float(prox_pct)))
+        out["trig"] = "; ".join(bits)
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        pass
+    return out
+
+
+def _apply_add_loser_veto(cand, action, reason, proceeds, capped_from):
+    """v1.14.0 [P-183 ADD-ON-LOSER VETO] - seam-pattern (decide_action stays
+    byte-identical). off -> pass-through. Only an ADD is examined; a sukuk is
+    exempt (D-9). observe -> tag only; enforce -> ADD narrows to HOLD with
+    capped_from=ADD and zero proceeds. Returns (action, reason, proceeds,
+    capped_from)."""
+    mode = _env_add_loser_veto_mode()
+    if mode == "off" or action != ACTION_ADD:
+        return action, reason, proceeds, capped_from
+    if _protect_sukuk_enabled() and _is_sukuk_holding(cand):
+        return action, reason, proceeds, capped_from
+    ev = _add_loser_eval(cand, _env_add_loser_pct(), _env_add_stop_prox_pct())
+    if not (ev["loser"] or ev["near_stop"] or ev["below_stop"]):
+        if mode == "observe":
+            tag = " | [addveto-observe] ok"
+            return action, (reason or "") + tag, proceeds, capped_from
+        return action, reason, proceeds, capped_from
+    if mode == "observe":
+        tag = " | [addveto-observe] %s - would HOLD under enforce" % ev["trig"]
+        return action, (reason or "") + tag, proceeds, capped_from
+    new_reason = ("ADD vetoed [P-183]: %s - no averaging down / adding into a "
+                  "stop (was ADD: %s)" % (ev["trig"], reason or ""))
+    return ACTION_HOLD, new_reason, 0.0, ACTION_ADD
+
+
 def _action_row(entry, review_date, controls):
     cand = entry["cand"]
     fx = cand.get("fx_to_sar")
@@ -3399,6 +3521,10 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         # pure pass-through (harness G1 byte-identical proof).
         action, reason, proceeds = _apply_drawdown_guard(
             c, action, reason, proceeds)
+        # v1.14.0 [P-183]: ADD-on-loser veto - same seam pattern; off is a
+        # pure pass-through (harness L2 byte-identical proof).
+        action, reason, proceeds, capped_from = _apply_add_loser_veto(
+            c, action, reason, proceeds, capped_from)
         # v1.12.0 [F-1a]: observe-mode basis evidence — same seam pattern;
         # legacy/plan3m are pure pass-throughs (harness F1 proof).
         reason = _apply_f1_observe_tag(c, reason, ctl)
@@ -3602,6 +3728,18 @@ def _build(rows, ctl, fx_rates, upstream_meta):
            sum(1 for e in entries if e.get("capped_from")
                and "synthetic" in _rl(e)),
            "Deferred until a real cost basis replaces the synthetic")
+    # v1.14.0 [P-183]: vetoed ADDs carry capped_from=ADD; counted ONCE here
+    # and excluded from low_confidence_capped (the v1.0.5 marker-split
+    # pattern). Off -> zero rows -> both counts byte-identical to v1.13.1.
+    _alert("add_loser_veto",
+           sum(1 for e in entries if e.get("capped_from")
+               and "add vetoed [p-183]" in _rl(e)),
+           "ADD narrowed to HOLD - the position is below its loser floor or "
+           "sitting on its stop; no averaging down (Program v2)")
+    _alert("add_loser_observe",
+           sum(1 for e in entries if "[addveto-observe]" in _rl(e)
+               and "would hold" in _rl(e)),
+           "Observe only - this ADD would be vetoed under enforce")
     _alert("low_confidence_capped",
            sum(1 for e in entries
                if e.get("capped_from") and
@@ -3610,7 +3748,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                and "confirm-failclosed" not in _rl(e)   # v1.12.2 [P-165]
                and "precedence" not in _rl(e)
                and "engine state" not in _rl(e)
-               and "synthetic" not in _rl(e)),
+               and "synthetic" not in _rl(e)
+               and "add vetoed [p-183]" not in _rl(e)),  # v1.14.0 [P-183]
            "Improve data reliability; actions were capped to HOLD")
     _alert("portfolio_value_incomplete", 1 if _pv_incomplete else 0,  # F3
            "A held position has no resolvable market value — weights, "
@@ -3674,6 +3813,19 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             **({"switch_scan": _sw_meta} if _sw_meta else {}),
             **({"confirm_session": _confirm_session_meta()}
                if _env_confirm_session_mode() != "off" else {}),   # v1.13.0
+            **({"add_loser_veto": {                                # v1.14.0
+                "mode": _env_add_loser_veto_mode(),
+                "loser_pct": _env_add_loser_pct(),
+                "stop_prox_pct": _env_add_stop_prox_pct(),
+                "vetoed": sum(1 for e in entries if e.get("capped_from")
+                              and "add vetoed [p-183]" in
+                              str(e.get("action_reason") or "").lower()),
+                "would_veto": sum(1 for e in entries
+                                  if "[addveto-observe]" in
+                                  str(e.get("action_reason") or "").lower()
+                                  and "would hold" in
+                                  str(e.get("action_reason") or "").lower()),
+               }} if _env_add_loser_veto_mode() != "off" else {}),
             "controls_snapshot": ctl,
             "cash_floor_sar": _round(cash_floor, 0),
             "fx": {"provided": sorted(fx_rates.keys()),
