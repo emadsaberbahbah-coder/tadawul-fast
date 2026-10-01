@@ -1340,7 +1340,46 @@ from urllib.error import HTTPError, URLError
 # _extract_costbasis_by_status, _load_costbasis_symbols_by_status.
 # Embedded self-test 14 -> 16 cases (the verdict reads selftest=PASS 16/16).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.40.0"
+# -----------------------------------------------------------------------------
+# v6.41.0 (2026-10-01) - P-189b MATURED DUPLICATE KEYS + P-188 RISK
+# PLACEHOLDERS (both env-gated, DEFAULT OFF = v6.40.0 byte-identical)
+# -----------------------------------------------------------------------------
+# EVIDENCE (Performance_Log, workbook export 2026-10-01 03:52 sync; red-team
+# 10-01 H07 re-executed): 18,287 records / 18,260 unique Keys - 27 Keys carry
+# TWO rows, and all 27 pairs are MATURED/MATURED (20 WIN/WIN, 7 LOSS/LOSS; e.g.
+# 7010.SR|1M|20260719, XAIX.US|1W|20260807, IUSG.US|1W|20260807). v6.35.0's
+# load-time dedupe expires a later copy only when it is ACTIVE, so these
+# pairs - matured before v6.35.0 shipped - are counted TWICE by
+# PerformanceAnalyzer.analyze (matured 9,808 incl. 27 duplicates; win rate
+# 49.67 % vs 49.60 % deduped) and feed the calibration corpus twice.
+# Separately, Volatility / Max Drawdown % / Sharpe Ratio are 0.0 on all 9,808
+# matured rows: no code path ever computes them per record (the dataclass
+# defaults are written back on every save), so the sheet presents "zero risk"
+# where nothing was measured.
+# FIX 1 [P-189b] TRACK_DEDUP_MATURED = off (DEFAULT) | observe | enforce, read
+#   per load: a LATER copy of a Key whose FIRST copy is MATURED with a realized
+#   ROI, itself MATURED with a realized ROI, is the duplicate.
+#     observe -> counted and logged only ("[v6.41.0 DEDUP-MATURED] mode=observe
+#                would_expire=N (W a / L b / BE c) first=[keys]"), and the
+#                [PERF-VERDICT] line gains " | dedup_matured observe N";
+#                records untouched.
+#     enforce -> that copy becomes EXPIRED / outcome DUPLICATE_KEY /
+#                realized None with a note naming the original outcome and
+#                ROI (the v6.35.0 rule extended); the existing v6.38.0
+#                TRACK_DROP_DUPLICATE_ROWS opt-in then archives + drops it.
+#   The FIRST copy always stands; an ACTIVE-first / MATURED-later pair is left
+#   alone (never discard the only decided outcome).
+# FIX 2 [P-188] TRACK_RISK_BLANK = 0 (DEFAULT) | 1: _record_to_row writes ""
+#   instead of the 0.0 placeholder in the three per-record risk cells (they are
+#   never computed per record). Read-back maps "" -> 0.0 as before, so nothing
+#   downstream changes; the portfolio-level Sharpe/Sortino in the summary
+#   block are computed from realized ROIs and are untouched.
+# ENV LANE: GitHub Actions (.github/workflows/track_performance.yml, the
+#   Performance Clock run step). Embedded self-test 16 -> 18 cases.
+# ZERO functions removed. Additions: _dedup_matured_mode, _risk_blank_enabled,
+#   _matured_dup_decision, _risk_cells. Rollback: unset the envs or revert.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.41.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3085,6 +3124,57 @@ def _dedup_keys_enabled() -> bool:
     """v6.35.0 (3): expire later duplicates of a symbol|horizon|day Key on
     load. Default ON; TRACK_DEDUP_KEYS=0/false/off/no keeps v6.34.0."""
     return (os.getenv("TRACK_DEDUP_KEYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# v6.41.0 [P-189b]: per-load read-back of the matured-duplicate pass.
+_LAST_DEDUP_MATURED: Dict[str, Any] = {"mode": "off", "count": 0, "wins": 0,
+                                       "losses": 0, "breakeven": 0, "keys": []}
+
+
+def _dedup_matured_mode() -> str:
+    """v6.41.0 [P-189b]: TRACK_DEDUP_MATURED off (DEFAULT) | observe |
+    enforce. Anything else -> off (v6.40.0 byte-identical). Never raises."""
+    try:
+        v = (os.getenv("TRACK_DEDUP_MATURED") or "off").strip().lower()
+        return v if v in ("observe", "enforce") else "off"
+    except Exception:
+        return "off"
+
+
+def _risk_blank_enabled() -> bool:
+    """v6.41.0 [P-188]: TRACK_RISK_BLANK=1/true/on/yes writes "" instead of
+    the never-computed 0.0 in the three per-record risk cells. Default OFF."""
+    return (os.getenv("TRACK_RISK_BLANK") or "0").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _matured_dup_decision(first: Any, later: Any) -> bool:
+    """v6.41.0 [P-189b] PURE: True when `later` is a decided duplicate of a
+    decided `first` (both MATURED with a realized ROI). Never raises."""
+    try:
+        return bool(
+            first is not None and later is not None
+            and first.status == PerformanceStatus.MATURED
+            and first.realized_roi is not None
+            and later.status == PerformanceStatus.MATURED
+            and later.realized_roi is not None)
+    except Exception:
+        return False
+
+
+def _risk_cells(r: Any) -> List[Any]:
+    """v6.41.0 [P-188] PURE: the three per-record risk cells. Off -> the
+    record's values verbatim (v6.40.0); on -> "" where the value is the 0.0
+    placeholder (never computed per record), the value otherwise."""
+    vals = [r.volatility, r.max_drawdown, r.sharpe_ratio]
+    if not _risk_blank_enabled():
+        return vals
+    out: List[Any] = []
+    for v in vals:
+        try:
+            out.append("" if float(v) == 0.0 else v)
+        except Exception:
+            out.append(v)
+    return out
 
 
 def _publish_calibration_enabled() -> bool:
@@ -4877,6 +4967,10 @@ class PerformanceStore:
             records: List[PerformanceRecord] = []
             _dup_expired = 0
             _dedup = _dedup_keys_enabled()
+            # v6.41.0 [P-189b]: per-load matured-duplicate pass (off -> inert)
+            _dm_mode = _dedup_matured_mode()
+            _dm = {"mode": _dm_mode, "count": 0, "wins": 0, "losses": 0,
+                   "breakeven": 0, "keys": []}
             with self.cache_lock:
                 self.cache.clear()
                 for r in rows or []:
@@ -4899,6 +4993,30 @@ class PerformanceStore:
                                 rec.notes = f"{rec.notes} | {_note}" if rec.notes else _note
                                 rec.last_updated = _utc_now()
                                 _dup_expired += 1
+                            elif (_dm_mode != "off"
+                                  and _matured_dup_decision(self.cache.get(rec.key), rec)):
+                                # v6.41.0 [P-189b]: a decided duplicate of a
+                                # decided first copy - counted (observe) or
+                                # excluded (enforce); the first copy stands.
+                                _roi = float(rec.realized_roi or 0.0)
+                                _dm["count"] += 1
+                                if _roi > 0:
+                                    _dm["wins"] += 1
+                                elif _roi < 0:
+                                    _dm["losses"] += 1
+                                else:
+                                    _dm["breakeven"] += 1
+                                if len(_dm["keys"]) < 12:
+                                    _dm["keys"].append(rec.key)
+                                if _dm_mode == "enforce":
+                                    _was = "%s %.4f" % (rec.outcome or "?", _roi)
+                                    rec.status = PerformanceStatus.EXPIRED
+                                    rec.realized_roi = None
+                                    rec.outcome = "DUPLICATE_KEY"
+                                    _note = ("[v6.41.0 DEDUP-MATURED] duplicate of " + rec.key +
+                                             " (was matured " + _was + ") - excluded, the first copy stands")
+                                    rec.notes = f"{rec.notes} | {_note}" if rec.notes else _note
+                                    rec.last_updated = _utc_now()
                             records.append(rec)
                             continue
                         records.append(rec)
@@ -4907,6 +5025,13 @@ class PerformanceStore:
             _LAST_LOAD_STATS.update({"loaded": len(records),
                                      "extent": int(self._loaded_extent),
                                      "dup_expired": int(_dup_expired)})
+            _LAST_DEDUP_MATURED.update(_dm)              # v6.41.0 [P-189b]
+            if _dm_mode != "off":
+                logger.warning(
+                    "[v6.41.0 DEDUP-MATURED] mode=%s %s=%d (W %d / L %d / BE %d) first=%s",
+                    _dm_mode, "would_expire" if _dm_mode == "observe" else "expired",
+                    _dm["count"], _dm["wins"], _dm["losses"], _dm["breakeven"],
+                    _dm["keys"][:6])
             return records
         except Exception as e:
             logger.error("Failed to load records: %s", e)
@@ -4933,9 +5058,7 @@ class PerformanceStore:
             r.unrealized_roi,
             "" if r.realized_roi is None else r.realized_roi,
             r.outcome or "",
-            r.volatility,
-            r.max_drawdown,
-            r.sharpe_ratio,
+            *_risk_cells(r),   # v6.41.0 [P-188]: off -> the three values verbatim
             r.sector or "",
             json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
             RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
@@ -8189,6 +8312,10 @@ class PerformanceTrackerApp:
                     int(st.get("ca_deferred") or 0),   # v6.37.0
                 )
             )
+            if _LAST_DEDUP_MATURED.get("mode") in ("observe", "enforce"):   # v6.41.0
+                msg += " | dedup_matured %s %d" % (
+                    _LAST_DEDUP_MATURED.get("mode"),
+                    int(_LAST_DEDUP_MATURED.get("count") or 0))
             level = (
                 "INFO"
                 if int(st.get("priced") or 0) > 0
@@ -8383,7 +8510,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 16
+        total = 18   # v6.41.0: +2 (P-189b decision, P-188 cells)
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -8553,6 +8680,45 @@ class PerformanceTrackerApp:
                     and "DDI.US" not in _p16["forced"] and len(_p16["forced"]) == 40
                     and _p16["cut"] == ["C38.US", "C39.US"]
                     and _p16b["forced"] == ["DDI.US", "YUM"] and len(_p16b["skipped_closed"]) == 40):
+                passed += 1
+            # case 17 (v6.41.0 P-189b): decided-duplicate decision is
+            # matured+realized on BOTH copies only; mode reader vocabulary.
+            from types import SimpleNamespace as _NS
+            _m17 = _NS(status=PerformanceStatus.MATURED, realized_roi=1.5)
+            _a17 = _NS(status=PerformanceStatus.ACTIVE, realized_roi=None)
+            _sv17 = os.environ.get("TRACK_DEDUP_MATURED")
+            try:
+                os.environ.pop("TRACK_DEDUP_MATURED", None)
+                _c17 = _dedup_matured_mode() == "off"
+                os.environ["TRACK_DEDUP_MATURED"] = " Enforce "
+                _c17 = _c17 and _dedup_matured_mode() == "enforce"
+                os.environ["TRACK_DEDUP_MATURED"] = "junk"
+                _c17 = _c17 and _dedup_matured_mode() == "off"
+            finally:
+                if _sv17 is None:
+                    os.environ.pop("TRACK_DEDUP_MATURED", None)
+                else:
+                    os.environ["TRACK_DEDUP_MATURED"] = _sv17
+            if (_c17 and _matured_dup_decision(_m17, _m17)
+                    and not _matured_dup_decision(_a17, _m17)
+                    and not _matured_dup_decision(_m17, _a17)
+                    and not _matured_dup_decision(None, _m17)):
+                passed += 1
+            # case 18 (v6.41.0 P-188): risk cells verbatim when off, blank
+            # placeholders when on, real values kept.
+            _r18 = _NS(volatility=0.0, max_drawdown=0.0, sharpe_ratio=1.25)
+            _sv18 = os.environ.get("TRACK_RISK_BLANK")
+            try:
+                os.environ.pop("TRACK_RISK_BLANK", None)
+                _off18 = _risk_cells(_r18)
+                os.environ["TRACK_RISK_BLANK"] = "1"
+                _on18 = _risk_cells(_r18)
+            finally:
+                if _sv18 is None:
+                    os.environ.pop("TRACK_RISK_BLANK", None)
+                else:
+                    os.environ["TRACK_RISK_BLANK"] = _sv18
+            if _off18 == [0.0, 0.0, 1.25] and _on18 == ["", "", 1.25]:
                 passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
