@@ -1286,7 +1286,48 @@ from datetime import datetime, timedelta, timezone
 # Functions added: 2 (_env_nearmiss_text_legacy, _effective_min_ticket).
 # Removed: 0. No new ENV besides the kill switch. Rollback: env or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.22.2"
+# -----------------------------------------------------------------------------
+# v1.23.0 (2026-10-01) - [P-181 TIMING GATE] two-sided 52W window + one-session
+# shock veto on candidates (env-gated, DEFAULT OFF = v1.22.2 byte-identical)
+# EVIDENCE (Monitoring Sheet #5, 2026-10-01): the rank-1 FAST-TRACK seat
+#   RDN.US fell -6.53% on 09-30 to 0.14% of its 52W range and kept rank 1;
+#   MRP.US was seated the same morning at 0.62% of its range (-2.04% day);
+#   44 names seated since 09-01 average -4.32% from first seat (8 positive;
+#   SPUS +2.15% over the same window). No gate in evaluate_gates reads the
+#   52W position or the last session's move; the 09-12 post-mortem rule
+#   ("two-sided 52W timing gate 15th/85th pct + no reactive entries") was
+#   never built. This is that rule, at the one seam every seat passes.
+# WHAT: gate "Timing (52W)" appended in evaluate_gates immediately BEFORE
+#   "Portfolio" (registered in GATE_ORDER at that true position - the v1.0.7
+#   lesson). Inputs come from the row itself: 52W position recomputed as
+#   (price - low) / (high - low) * 100 when price, 52W High and 52W Low are
+#   all present and high > low, else the sheet's "52W Position %" (percent
+#   points - the engine contract, verified on the 10-01 export: RDN 0.14,
+#   NVDA 88.71, DDI 97.92 reproduce from price/high/low); the last-session
+#   move from "Percent Change" (FRACTION contract, v5.85.0 adjudication ->
+#   x100). Unknown passes (the News/Sector Trend precedent). Fail when
+#   pos < TFB_T10_W52_LOW_PCT (15) or pos > TFB_T10_W52_HIGH_PCT (85) or
+#   move <= TFB_T10_SHOCK_PCT (-5.0). Fail class NON_CRITICAL (=> WATCH, the
+#   ROI gates' class): a timing veto means "not now", never DO_NOT_INVEST,
+#   and a WATCH row is never seated or sized.
+# GATE TFB_T10_W52_TIMING = off (default) | observe | enforce, read per call:
+#   off      -> no gate appended; cand dict, gates, verdicts, payload
+#               byte-identical to v1.22.2
+#   observe  -> gate appended as PASSED with a note; ONE countable
+#               "[w52-observe] ..." tag per audit row in failure_reason (the
+#               F-1b seam, after selection/deferrals) and meta["timing_gate"]
+#               counters; verdicts, seats, KPIs, alerts untouched
+#   enforce  -> the gate fails NON_CRITICAL; the near-miss "How To Qualify"
+#               names the window and the shock floor
+# SCOPE CUTS (register): an upside shock (>= +X% day) is not vetoed; timing of
+#   ADDs on held positions belongs to portfolio_actions (P-183); the 52W
+#   fields attach to cand ONLY when the mode is armed (the v1.13.0 lineage
+#   precedent keeps the OFF cand dict byte-identical).
+# Functions added: 6 (_env_w52_timing_mode, _env_w52_low_pct,
+#   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
+# Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.23.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1857,7 +1898,9 @@ GATE_ORDER = (
     # a gate missing from this tuple sorts to 99 and can mis-attribute
     # first_failed_gate on the near-miss surface).
     "Sell-Class",
-    "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend", "Portfolio",
+    "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend",
+    "Timing (52W)",          # v1.23.0 [P-181] (appends before Portfolio)
+    "Portfolio",
 )
 
 # v1.7.0: explicit sell-tier tokens (normalized). Everything else — including
@@ -2779,6 +2822,146 @@ def _env_nearmiss_text_legacy():
     return _env_flag01("TFB_OPP_NEARMISS_TEXT_LEGACY", "0")
 
 
+# v1.23.0 [P-181 TIMING GATE] ------------------------------------------------
+_TIMING_GATE_NAME = "Timing (52W)"
+# Per-build read-back state (the _XCHECK_STATE precedent): reset at the top of
+# every _build, surfaced on meta["timing_gate"] ONLY when the mode is armed.
+_TIMING_STATE = {"mode": "off", "evaluated": 0, "unknown": 0, "fail_low": 0,
+                 "fail_high": 0, "fail_shock": 0, "would_fail": 0,
+                 "low_pct": 15.0, "high_pct": 85.0, "shock_pct": -5.0}
+
+
+def _env_w52_timing_mode():
+    """v1.23.0 [P-181]: TFB_T10_W52_TIMING off(default)|observe|enforce, read
+    per call (no restart). Any other value -> off (byte-identical). Never
+    raises."""
+    try:
+        raw = str(_env_str("TFB_T10_W52_TIMING", "off")).strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:
+        return "off"
+
+
+def _env_w52_low_pct():
+    """v1.23.0 [P-181]: lower edge of the 52W window (percent points, 15)."""
+    try:
+        v = _env_float("TFB_T10_W52_LOW_PCT", 15.0)
+    except Exception:
+        v = 15.0
+    return v if 0.0 <= v <= 100.0 else 15.0
+
+
+def _env_w52_high_pct():
+    """v1.23.0 [P-181]: upper edge of the 52W window (percent points, 85)."""
+    try:
+        v = _env_float("TFB_T10_W52_HIGH_PCT", 85.0)
+    except Exception:
+        v = 85.0
+    return v if 0.0 <= v <= 100.0 else 85.0
+
+
+def _env_shock_pct():
+    """v1.23.0 [P-181]: one-session move at or below which a candidate is
+    vetoed (percent, -5.0). A non-negative value disables the shock leg."""
+    try:
+        v = _env_float("TFB_T10_SHOCK_PCT", -5.0)
+    except Exception:
+        v = -5.0
+    return v
+
+
+def _w52_eval(cand, low_pct, high_pct, shock_pct):
+    """v1.23.0 [P-181] PURE. Returns {"pos": pct|None, "chg": pct|None,
+    "fail_low", "fail_high", "fail_shock", "unknown": bool, "current": str}.
+    pos is recomputed from price / 52W High / 52W Low when all three are
+    present and high > low (the sheet field is the fallback); chg is the
+    Percent Change FRACTION x100 (|v| < 1.5 => fraction; else already a
+    percent). Unknown inputs never fail. Never raises."""
+    out = {"pos": None, "chg": None, "fail_low": False, "fail_high": False,
+           "fail_shock": False, "unknown": False, "current": "n/a"}
+    try:
+        price = _to_float(cand.get("price"))
+        hi = _to_float(cand.get("w52_high"))
+        lo = _to_float(cand.get("w52_low"))
+        pos = None
+        if (price is not None and hi is not None and lo is not None
+                and hi > lo and price > 0):
+            pos = (price - lo) / (hi - lo) * 100.0
+            pos = max(0.0, min(100.0, pos))
+        if pos is None:
+            raw = _to_float(cand.get("w52_position_pct"))
+            if raw is not None and 0.0 <= raw <= 100.0:
+                pos = raw
+        chg_raw = _to_float(cand.get("pct_change_1d"))
+        chg = None
+        if chg_raw is not None:
+            chg = chg_raw * 100.0 if abs(chg_raw) < 1.5 else chg_raw
+        out["pos"], out["chg"] = pos, chg
+        if pos is None and chg is None:
+            out["unknown"] = True
+            return out
+        if pos is not None:
+            out["fail_low"] = pos < float(low_pct)
+            out["fail_high"] = pos > float(high_pct)
+        if chg is not None and float(shock_pct) < 0.0:
+            out["fail_shock"] = chg <= float(shock_pct)
+        bits = []
+        bits.append("pos " + (_fmt_num(round(pos, 1)) + "%" if pos is not None
+                              else "n/a"))
+        bits.append("1d " + (("%+.1f%%" % chg) if chg is not None else "n/a"))
+        out["current"] = " | ".join(bits)
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        out["unknown"] = True
+    return out
+
+
+def _timing_gate(cand, mode):
+    """v1.23.0 [P-181]: the gate dict for evaluate_gates. observe => always
+    PASSED (note carries the would-be verdict); enforce => NON_CRITICAL fail
+    on low/high/shock. Updates _TIMING_STATE counters. Never raises."""
+    low, high, shock = _env_w52_low_pct(), _env_w52_high_pct(), _env_shock_pct()
+    ev = _w52_eval(cand, low, high, shock)
+    required = ("%s%% <= 52W pos <= %s%% and 1d move > %s%%"
+                % (_fmt_num(low), _fmt_num(high), _fmt_num(shock)))
+    bad = ev["fail_low"] or ev["fail_high"] or ev["fail_shock"]
+    try:
+        _TIMING_STATE["evaluated"] += 1
+        if ev["unknown"]:
+            _TIMING_STATE["unknown"] += 1
+        if ev["fail_low"]:
+            _TIMING_STATE["fail_low"] += 1
+        if ev["fail_high"]:
+            _TIMING_STATE["fail_high"] += 1
+        if ev["fail_shock"]:
+            _TIMING_STATE["fail_shock"] += 1
+        if bad:
+            _TIMING_STATE["would_fail"] += 1
+    except Exception:
+        pass
+    why = []
+    if ev["fail_low"]:
+        why.append("below the 52W window (near the 52W low)")
+    if ev["fail_high"]:
+        why.append("above the 52W window (near the 52W high)")
+    if ev["fail_shock"]:
+        why.append("one-session shock")
+    note = ("[w52-" + mode + "] " + ("ok" if not bad else
+            "WOULD_FAIL " + "; ".join(why) if mode == "observe"
+            else "FAIL " + "; ".join(why)))
+    if ev["unknown"]:
+        note = "[w52-" + mode + "] n/a (no 52W / change fields)"
+    passed = True if mode == "observe" else (not bad)
+    g = _gate(_TIMING_GATE_NAME, passed, FAIL_NON_CRITICAL, ev["current"],
+              required, note=note)
+    g["timing_detail"] = {"pos_pct": (None if ev["pos"] is None
+                                      else round(ev["pos"], 2)),
+                          "chg_pct": (None if ev["chg"] is None
+                                      else round(ev["chg"], 2)),
+                          "fail_low": ev["fail_low"], "fail_high": ev["fail_high"],
+                          "fail_shock": ev["fail_shock"], "unknown": ev["unknown"]}
+    return g
+
+
 def _effective_min_ticket(symbol, criteria):
     """v1.22.2 PURE: (floor_sar, source) — the floor that actually applies to
     this symbol: the operator floor (criteria["min_ticket_sar"]) unless
@@ -2984,6 +3167,18 @@ _FIELD_ALIASES = {
     # own trust verdict and is the lineage witness this build consumes.
     "warnings": ("warnings", "warning", "rowwarnings"),
     "data_provider": ("dataprovider", "provider", "primaryprovider"),
+    # v1.23.0 [P-181]: 52W bounds / position and the last-session move.
+    # Display headers ("52W High", "52W Position %", "Percent Change") and
+    # engine keys (week_52_high, week_52_position_pct, percent_change) both
+    # compact to these tokens.
+    "w52_high": ("52whigh", "week52high", "high52w", "52weekhigh",
+                 "week52highprice"),
+    "w52_low": ("52wlow", "week52low", "low52w", "52weeklow",
+                "week52lowprice"),
+    "w52_position_pct": ("52wposition", "week52positionpct", "52wpositionpct",
+                         "w52positionpct", "week52position", "52wpos"),
+    "pct_change_1d": ("percentchange", "pctchange", "changepct",
+                      "daychangepct", "percentchange1d", "pctchange1d"),
 }
 
 _TREND_MAP = {
@@ -3253,6 +3448,14 @@ def normalize_candidate(row, fx_rates, criteria):
                                     or "rank_skipped_low_trust" in _w_txt)
         cand["dq_alias_key"] = _alias_key_used(view, "dq")
         cand["rel_alias_key"] = _alias_key_used(view, "reliability")
+    # v1.23.0 [P-181]: the timing inputs attach ONLY when the gate is armed so
+    # the OFF cand dict (and every downstream row/payload) stays byte-identical
+    # to v1.22.2.
+    if _env_w52_timing_mode() != "off":
+        cand["w52_high"] = _to_float(_field(view, "w52_high"))
+        cand["w52_low"] = _to_float(_field(view, "w52_low"))
+        cand["w52_position_pct"] = _to_float(_field(view, "w52_position_pct"))
+        cand["pct_change_1d"] = _to_float(_field(view, "pct_change_1d"))
     return cand
 
 
@@ -4370,6 +4573,12 @@ def evaluate_gates(cand, criteria, held_symbols=None):
                cand["sector_trend"] != "Negative")
     g.append(_gate("Sector Trend", sect_ok, FAIL_MAJOR, cand["sector_trend"],
                    "not Negative (Unknown passes)"))
+
+    # v1.23.0 [P-181]: Timing (52W) sits immediately BEFORE Portfolio (the
+    # structural gate stays last). Off => nothing appended.
+    _w52_mode = _env_w52_timing_mode()
+    if _w52_mode != "off":
+        g.append(_timing_gate(cand, _w52_mode))
 
     held_hit = (not criteria["include_portfolio_holdings"] and
                 (str(cand["symbol"] or "").strip().upper() in held
@@ -5641,6 +5850,12 @@ def _improve_note(ff):
     if not ff:
         return "No failing gate recorded"
     cur, req = ff.get("current"), ff.get("required")
+    # v1.23.0 [P-181]: a timing veto is "not now" - say what must change.
+    if ff.get("gate") == _TIMING_GATE_NAME:
+        return ("Timing: wait until the price sits inside the 52W window and "
+                "the last session was not a shock day (now: " + str(cur) +
+                "; needs: " + str(req) + "). Re-qualifies automatically; no "
+                "operator input.")
     if isinstance(cur, (int, float)) and req:
         return ("Lift " + ff["gate"] + " from " + _fmt_num(cur) + " to " +
                 str(req))
@@ -5851,6 +6066,14 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         for _hs in held:
             _hv |= _symbol_variants(_hs)
         held = _hv
+
+    # v1.23.0 [P-181]: per-build read-back reset (the _XCHECK_STATE precedent).
+    _TIMING_STATE.update({"mode": _env_w52_timing_mode(), "evaluated": 0,
+                          "unknown": 0, "fail_low": 0, "fail_high": 0,
+                          "fail_shock": 0, "would_fail": 0,
+                          "low_pct": _env_w52_low_pct(),
+                          "high_pct": _env_w52_high_pct(),
+                          "shock_pct": _env_shock_pct()})
 
     # 1) normalize → gates → verdict → score (audit grid, 1:1 trace)
     audit = []
@@ -6085,6 +6308,26 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     + _tag
             except Exception:  # noqa: BLE001 — observe is additive, never fatal
                 pass
+    # v1.23.0 [P-181] observe: ONE countable "[w52-observe] ..." tag per audit
+    # row beside the legacy verdict - runs AFTER selection/deferrals so gates,
+    # verdicts, picks and deferral text are byte-untouched; off/enforce ->
+    # this block is inert (enforce speaks through the gate itself).
+    if _TIMING_STATE.get("mode") == "observe":
+        for _rec in audit:
+            try:
+                _tg = None
+                for _g in (_rec.get("gates") or []):
+                    if _g.get("gate") == _TIMING_GATE_NAME:
+                        _tg = _g
+                        break
+                if _tg is None:
+                    continue
+                _tag = str(_tg.get("note") or "[w52-observe] n/a")
+                _fr = _rec.get("failure_reason")
+                _rec["failure_reason"] = ((str(_fr) + " | ") if _fr else "") \
+                    + _tag
+            except Exception:  # noqa: BLE001 - observe is additive, never fatal
+                pass
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
@@ -6291,6 +6534,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["price_xcheck"] = dict(_XCHECK_STATE)
     if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
+    if _TIMING_STATE.get("mode") in ("observe", "enforce"):
+        meta["timing_gate"] = dict(_TIMING_STATE)    # v1.23.0 [P-181] read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,
