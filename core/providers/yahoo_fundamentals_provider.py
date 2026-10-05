@@ -2,7 +2,52 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.8.0
+Yahoo Finance Fundamentals Provider -- v6.9.0
+================================================================================
+v6.9.0 -- LOOPGUARD (P-203): ASYNC STATE SURVIVES asyncio.run() PER CALL
+--------------------------------------------------------------------------------
+WHY (Render 2026-10-04 17:53:09 UTC, four "unhandled future / semaphore is
+bound to a different event loop" events; source reproduced without the
+network in the 2026-10-05 independent audit, adjudicated in
+TFB_Audit_Reconciliation_2026-10-05 N2): this module keeps a PROCESS-GLOBAL
+singleton (get_provider) whose asyncio.Semaphore (max_concurrency), the
+asyncio.Lock of every helper (AdvancedCache x2, TokenBucket,
+AdvancedCircuitBreaker, SingleFlight) and the SingleFlight Futures are
+created lazily on the FIRST event loop that contends them. Sync entry points
+(core/analysis/top10_selector.build_top10_rows -> asyncio.run(...)) create a
+NEW loop per cockpit build, so the second build finds a Semaphore bound to a
+dead loop ("is bound to a different event loop"), a non-owner awaiting a
+Future from another loop, and an owner-only failure leaving an unretrieved
+Future ("Future exception was never retrieved"). eodhd_provider got exactly
+this fix in v4.18.0 LOOPGUARD (P-110, 2026-09-09); this provider -- and
+argaam_provider / yahoo_chart_provider (B6) -- did not.
+
+FIX (three parts, the v4.18.0 pattern):
+  (1) Every helper lock becomes threading.Lock (loop-agnostic). Audited:
+      ZERO awaits inside any of these critical sections -- AdvancedCache
+      get/set/size, TokenBucket.wait_and_acquire (the sleep is outside the
+      lock), AdvancedCircuitBreaker allow/on_success/on_failure (metrics +
+      logger are sync), SingleFlight.run bookkeeping. Health counters stay
+      process-cumulative across loops by design.
+  (2) The provider semaphore is LOOP-KEYED: _get_semaphore() returns the
+      Semaphore of the RUNNING loop; a new loop gets a fresh Semaphore and
+      the previous loop's one is dropped (one entry kept). The module
+      singleton guard (_PROVIDER_LOCK) becomes threading.Lock; get_provider()
+      keeps its async signature.
+  (3) SingleFlight never awaits a FOREIGN Future: an in-flight entry whose
+      Future belongs to another loop (left behind by a dead asyncio.run()
+      loop) is replaced by the caller's own flight; same-loop callers still
+      share one call. Every Future gets a done-callback that OBSERVES its
+      exception, so an owner-only failure can no longer leave an unretrieved
+      Future.
+Behaviour on a single loop is unchanged (same concurrency cap, same
+dedup, same breaker/limiter semantics). No ENV, no kill switch: the OFF
+state IS the defect (v4.18.0 / P-139 precedent; the operator can veto by
+re-pasting v6.8.0). Zero functions removed. Additions:
+SingleFlight._observe_future(), SingleFlight.inflight(); field
+YahooFundamentalsProvider._sem_loop.
+
+Version: PROVIDER_VERSION = "6.9.0". All prior WHYs preserved verbatim.
 ================================================================================
 v6.8.0 -- CIRCUIT BREAKER ACTUALLY TRIPS ON THE CRUMB-BLOCK CLASS
           (Fixes YF-CB-1 / YF-CB-2 / YF-CB-3 / YF-CB-4)
@@ -219,6 +264,7 @@ import os
 import pickle
 import random
 import re
+import threading
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -238,7 +284,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.8.0"
+PROVIDER_VERSION = "6.9.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1562,7 +1608,7 @@ class AdvancedCache:
         self.redis_url = redis_url
         self._mem: Dict[str, Tuple[Any, float]] = {}
         self._touch: Dict[str, float] = {}
-        self._lock: Optional[asyncio.Lock] = None
+        self._lock: Optional[threading.Lock] = None   # v6.9.0 LOOPGUARD: loop-agnostic
         self.stats = CacheStats()
         self._redis: Any = None
         if self.use_redis:
@@ -1573,9 +1619,11 @@ class AdvancedCache:
                 self._redis = None
                 self.use_redis = False
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.9.0 LOOPGUARD (P-203): threading.Lock (was asyncio.Lock, loop-bound).
+        # Every section under it is sync state mutation -- no awaits inside.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
 
     def _key(self, prefix: str) -> str:
@@ -1593,7 +1641,7 @@ class AdvancedCache:
     async def get(self, prefix: str) -> Optional[Any]:
         k = self._key(prefix)
         now = time.monotonic()
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             if k in self._mem:
                 v, exp = self._mem[k]
                 if now < exp:
@@ -1608,7 +1656,7 @@ class AdvancedCache:
                 blob = await self._redis.get(k)
                 if blob is not None:
                     val = pickle.loads(zlib.decompress(blob)) if blob else {}
-                    async with self._get_lock():
+                    with self._get_lock():           # v6.9.0 LOOPGUARD
                         if len(self._mem) >= self.maxsize:
                             self._evict_lru()
                         self._mem[k] = (val, now + self.ttl)
@@ -1626,7 +1674,7 @@ class AdvancedCache:
         k = self._key(prefix)
         exp = time.monotonic() + float(ttl or self.ttl)
         now = time.monotonic()
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             if len(self._mem) >= self.maxsize and k not in self._mem:
                 self._evict_lru()
             self._mem[k] = (value, exp)
@@ -1650,7 +1698,7 @@ class AdvancedCache:
         self._redis = None
 
     async def size(self) -> int:
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             return len(self._mem)
 
 
@@ -1660,11 +1708,13 @@ class TokenBucket:
         self.capacity = max(1.0, self.rate * 2.0) if self.rate > 0 else 1.0
         self.tokens = self.capacity
         self.last = time.monotonic()
-        self._lock: Optional[asyncio.Lock] = None
+        self._lock: Optional[threading.Lock] = None   # v6.9.0 LOOPGUARD
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.9.0 LOOPGUARD (P-203): threading.Lock; the sleep below sits
+        # OUTSIDE the critical section, so the lock never spans an await.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
 
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
@@ -1672,7 +1722,7 @@ class TokenBucket:
             return
         need = float(tokens)
         while True:
-            async with self._get_lock():
+            with self._get_lock():                   # v6.9.0 LOOPGUARD
                 now = time.monotonic()
                 self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
                 self.last = now
@@ -1706,18 +1756,20 @@ class AdvancedCircuitBreaker:
     def __init__(self, fail_threshold: int, cooldown_sec: float):
         self.fail_threshold = max(1, int(fail_threshold))
         self.stats = CircuitBreakerStats(cooldown_sec=float(cooldown_sec))
-        self._lock: Optional[asyncio.Lock] = None
+        self._lock: Optional[threading.Lock] = None   # v6.9.0 LOOPGUARD
         self._half_open_probe_used = False
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.9.0 LOOPGUARD (P-203): threading.Lock; allow/on_success/on_failure
+        # mutate counters, set a gauge and log -- all sync, no awaits inside.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
 
     async def allow_request(self) -> bool:
         if not _cb_enabled():
             return True
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             now = time.monotonic()
             if self.stats.state == CircuitState.CLOSED:
                 yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
@@ -1740,7 +1792,7 @@ class AdvancedCircuitBreaker:
     async def on_success(self) -> None:
         if not _cb_enabled():
             return
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             _was = self.stats.state  # v6.8.0 (YF-CB-4)
             self.stats.successes += 1
             self.stats.state = CircuitState.CLOSED
@@ -1761,7 +1813,7 @@ class AdvancedCircuitBreaker:
         # site passes status_code only and is unaffected.
         if not _cb_enabled():
             return
-        async with self._get_lock():
+        with self._get_lock():                       # v6.9.0 LOOPGUARD
             now = time.monotonic()
             _was = self.stats.state  # v6.8.0 (YF-CB-4)
             self.stats.failures += 1
@@ -1806,21 +1858,44 @@ class AdvancedCircuitBreaker:
 
 class SingleFlight:
     def __init__(self) -> None:
-        self._lock: Optional[asyncio.Lock] = None
+        self._lock: Optional[threading.Lock] = None   # v6.9.0 LOOPGUARD
         self._futs: Dict[str, asyncio.Future] = {}
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.9.0 LOOPGUARD (P-203): threading.Lock; both sections are dict ops.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
+
+    @staticmethod
+    def _observe_future(fut: "asyncio.Future") -> None:
+        """v6.9.0 LOOPGUARD: retrieve the exception of a finished Future so an
+        owner-only failure never logs 'Future exception was never retrieved'."""
+        try:
+            if not fut.cancelled():
+                fut.exception()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def inflight(self) -> int:
+        """v6.9.0: number of in-flight keys -- diagnostics only."""
+        with self._get_lock():
+            return len(self._futs)
 
     async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
         owner = False
         lock = self._get_lock()
-        async with lock:
+        loop = asyncio.get_running_loop()
+        with lock:
             fut = self._futs.get(key)
+            # v6.9.0 LOOPGUARD: a Future that belongs to ANOTHER loop (a flight
+            # left behind by a dead asyncio.run() loop) is never awaited here --
+            # it is replaced by our own flight. Same-loop callers still share.
+            if fut is not None and fut.get_loop() is not loop:
+                fut = None
             if fut is None:
-                fut = asyncio.get_running_loop().create_future()
+                fut = loop.create_future()
+                fut.add_done_callback(self._observe_future)   # v6.9.0
                 self._futs[key] = fut
                 owner = True
         if not owner:
@@ -1835,8 +1910,9 @@ class SingleFlight:
                 fut.set_exception(exc)
             raise
         finally:
-            async with lock:
-                self._futs.pop(key, None)
+            with lock:
+                if self._futs.get(key) is fut:
+                    self._futs.pop(key, None)
 
 
 # =============================================================================
@@ -1849,6 +1925,7 @@ class YahooFundamentalsProvider:
 
     timeout_sec: float = field(init=False)
     semaphore: Optional[asyncio.Semaphore] = field(init=False, default=None)
+    _sem_loop: Any = field(init=False, default=None)   # v6.9.0 LOOPGUARD: the loop that owns `semaphore`
     max_concurrency: int = field(init=False)
     rate_limiter: TokenBucket = field(init=False)
     circuit_breaker: AdvancedCircuitBreaker = field(init=False)
@@ -1865,6 +1942,7 @@ class YahooFundamentalsProvider:
         self.timeout_sec = _timeout_sec()
         self.max_concurrency = _max_concurrency()
         self.semaphore = None
+        self._sem_loop = None                         # v6.9.0 LOOPGUARD
         self.rate_limiter = TokenBucket(_rate_limit())
         self.circuit_breaker = AdvancedCircuitBreaker(
             fail_threshold=_cb_fail_threshold(),
@@ -1912,8 +1990,16 @@ class YahooFundamentalsProvider:
         return _configured()
 
     def _get_semaphore(self) -> asyncio.Semaphore:
-        if self.semaphore is None:
+        # v6.9.0 LOOPGUARD (P-203): the Semaphore of the RUNNING loop. A new
+        # loop (asyncio.run per cockpit build) gets a fresh Semaphore; the
+        # previous loop's one is dropped. Same cap, same semantics per loop.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if self.semaphore is None or self._sem_loop is not loop:
             self.semaphore = asyncio.Semaphore(self.max_concurrency)
+            self._sem_loop = loop
         return self.semaphore
 
     # -- History helpers --------------------------------------------------
@@ -2596,13 +2682,15 @@ class YahooFundamentalsProvider:
 # =============================================================================
 
 _PROVIDER_INSTANCE: Optional[YahooFundamentalsProvider] = None
-_PROVIDER_LOCK: Optional[asyncio.Lock] = None
+_PROVIDER_LOCK: Optional[threading.Lock] = None   # v6.9.0 LOOPGUARD: loop-agnostic
 
 
-def _get_provider_lock() -> asyncio.Lock:
+def _get_provider_lock() -> threading.Lock:
+    # v6.9.0 LOOPGUARD (P-203): threading.Lock (was asyncio.Lock, loop-bound);
+    # the critical section only instantiates the provider -- no awaits.
     global _PROVIDER_LOCK
     if _PROVIDER_LOCK is None:
-        _PROVIDER_LOCK = asyncio.Lock()
+        _PROVIDER_LOCK = threading.Lock()
     return _PROVIDER_LOCK
 
 
@@ -2610,7 +2698,7 @@ async def get_provider() -> YahooFundamentalsProvider:
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         return _PROVIDER_INSTANCE
-    async with _get_provider_lock():
+    with _get_provider_lock():                       # v6.9.0 LOOPGUARD
         if _PROVIDER_INSTANCE is None:
             _PROVIDER_INSTANCE = YahooFundamentalsProvider()
     return _PROVIDER_INSTANCE
