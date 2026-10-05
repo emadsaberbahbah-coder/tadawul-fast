@@ -1,10 +1,56 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.11.12 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.11.13 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
+ * ============================================================================
+ *
+ * ============================================================================
+ * v1.11.13 (2026-10-05) [P-202] -- HOTFIX: ONE PROPERTY READ PER EXECUTION
+ * ----------------------------------------------------------
+ * WHY (Monitoring Sheet #8, export 2026-10-05 09:10):
+ *   Four consecutive refreshDecisionTop10 runs left no completion (00:30
+ *   manual, 01:31, 05:35, 08:07 morning trigger); each was judged
+ *   ABORTED_PREV by the next (the v1.11.12 P-195 marker working as built).
+ *   Alive at +5 min (05:40 'document lock busy'), dead by +9 min (01:40
+ *   lock free) = the 6-minute Apps Script execution ceiling. ROOT CAUSE on
+ *   this file: v1.11.12 E5 made dt10PoolRowFromSheetRow_ (called once per
+ *   sheet row) call dt10PoolFieldsActive_(), which calls
+ *   dt10W52FieldsLegacy_(), which calls PropertiesService.getScriptProperties()
+ *   .getProperty('DT10_P181B_W52_LEGACY') -- ONE SERVICE CALL PER POOL ROW:
+ *   255 + 6,609 + 453 + 2,474 = 9,791 rows -> ~9,800 service calls per run
+ *   (+4 in dt10MapHeaderCols_), i.e. +100..+300 s on a run whose GAS side
+ *   already took 55-185 s (7-day median 84 s). The only v1.11.12 run that
+ *   completed took 301.9 s (21:30 on 10-04, backend 25.3 s); the next four
+ *   crossed 360 s. Side effect: ~59k property reads/day against the 50k/day
+ *   quota (the read is inside try/catch, so quota errors degrade to
+ *   legacy=false -- slowly). The 10-04 harness stubbed PropertiesService, so
+ *   the per-row service cost was invisible to a functional dual-tree.
+ *   DT10_P181B_W52_LEGACY='1' does NOT help: it changes the value returned,
+ *   not the number of reads.
+ * WHAT:
+ *   (a) DT10_PROP_MEMO_ (per-execution object) + dt10PropMemoGet_(key,
+ *       reader) / dt10PropMemoReset_(). Apps Script gives every execution a
+ *       fresh global scope, so the memo lives exactly one run.
+ *   (b) dt10W52FieldsLegacy_ reads its property ONCE per execution;
+ *       dt10PoolFieldsActive_() (no-arg form) returns ONE cached list per
+ *       execution; dt10SeatTruthOn_ reads its property once per execution
+ *       (it ran once per qualified row). Explicit-argument calls
+ *       dt10PoolFieldsActive_(true|false) stay pure and unmemoized.
+ *   (c) refreshDecisionTop10 resets the memo at entry (fresh reads per run,
+ *       no cross-run state even if the runtime ever reused a scope).
+ *   (d) dt10SelfTest gains 'property memo core: ok (...)'.
+ *   Zero behavioural change for any property value: the same flags produce
+ *   the byte-identical pool, body, board and KPIs; only the service-call
+ *   count changes (harness: base reads == rows + 4, delivered reads == 1).
+ *   No ENV, no YAML, no arming. Rollback = re-paste v1.11.12 (f30bddd3...)
+ *   or v1.11.11 (0112efbd...).
+ * EXPECT after paste: dt10SelfTest prints the new line; one manual cockpit
+ *   refresh completes with a 'decision-cockpit refresh completed' row whose
+ *   durationMs is back in the 60-200 s band; no ABORTED_PREV row at the
+ *   next auto run.
  * ============================================================================
  *
  * ============================================================================
@@ -1506,7 +1552,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.11.12';
+var DT10_VERSION = '1.11.13';
 /* v1.11.1 (2026-09-03) — MORNING TRIGGER TARGET RESTORED + OUTPUT TRUTH
  *  (1) tfbMorningCockpitRefresh(): the 08:07 time-driven trigger pointed at
  *      a function this file no longer defined ("Script function not found",
@@ -1566,11 +1612,13 @@ var DT10_V188_SEAT_TRUTH = true;   // v1.11.12 [P-149]: ON (was false since v1.8
  * Never throws. */
 function dt10SeatTruthOn_() {
   if (!DT10_V188_SEAT_TRUTH) return false;
-  try {
-    return String(PropertiesService.getScriptProperties()
-        .getProperty('DT10_SEAT_TRUTH_LEGACY') || '') !== '1';
-  } catch (eSt) {}
-  return true;
+  return dt10PropMemoGet_('DT10_SEAT_TRUTH_LEGACY', function () {   // v1.11.13 [P-202]
+    try {
+      return String(PropertiesService.getScriptProperties()
+          .getProperty('DT10_SEAT_TRUTH_LEGACY') || '') !== '1';
+    } catch (eSt) {}
+    return true;
+  });
 }
 // v1.8.10 [IR-094 FAST-TRACK SIZING SUSPENSION] — **true** by default
 // (protective class: ships ON, unlike display toggles). true => a
@@ -1836,20 +1884,43 @@ var DT10_POOL_FIELDS = [
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
                          '52W Position %': true, 'Percent Change': true };
+/** v1.11.13 [P-202]: per-execution memo for Script Property reads that sit
+ * on per-row paths. Apps Script gives each execution a fresh global scope,
+ * so this object lives exactly one run; refreshDecisionTop10 also resets it
+ * at entry. reader() runs once per key per execution. Never throws beyond
+ * what reader() throws. */
+var DT10_PROP_MEMO_ = {};
+function dt10PropMemoGet_(key, reader) {
+  if (!Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, key)) {
+    DT10_PROP_MEMO_[key] = reader();
+  }
+  return DT10_PROP_MEMO_[key];
+}
+function dt10PropMemoReset_() {
+  DT10_PROP_MEMO_ = {};
+}
 /** v1.11.12 [P-181b]: Script Property DT10_P181B_W52_LEGACY = '1' restores
  * the v1.11.11 projection. Absent/junk/no service (node) => fields ON.
- * Never throws. */
+ * Never throws. v1.11.13 [P-202]: read ONCE per execution (was once per
+ * pool row -- ~9,800 service calls per run, the 6-minute kill). */
 function dt10W52FieldsLegacy_() {
-  try {
-    return String(PropertiesService.getScriptProperties()
-        .getProperty('DT10_P181B_W52_LEGACY') || '') === '1';
-  } catch (eW52) {}
-  return false;
+  return dt10PropMemoGet_('DT10_P181B_W52_LEGACY', function () {
+    try {
+      return String(PropertiesService.getScriptProperties()
+          .getProperty('DT10_P181B_W52_LEGACY') || '') === '1';
+    } catch (eW52) {}
+    return false;
+  });
 }
 /** v1.11.12 [P-181b]: the projection in force this run (PURE given the
  * legacy flag; the flag read is the only service touch). */
 function dt10PoolFieldsActive_(legacy) {
-  var leg = (legacy === undefined) ? dt10W52FieldsLegacy_() : !!legacy;
+  if (legacy === undefined) {   // v1.11.13 [P-202]: ONE list per execution
+    return dt10PropMemoGet_('pool_fields_active', function () {
+      return dt10PoolFieldsActive_(dt10W52FieldsLegacy_());
+    });
+  }
+  var leg = !!legacy;
   if (!leg) return DT10_POOL_FIELDS;
   var out = [];
   for (var i = 0; i < DT10_POOL_FIELDS.length; i++) {
@@ -4962,6 +5033,7 @@ function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
 // ---------------------------------------------------------------------------
 function refreshDecisionTop10() {
   var t0 = new Date().getTime();
+  dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
   // v1.3.0 layout guard: the panel grew a row (KPI head moved 13 -> 14), so a
@@ -6084,6 +6156,23 @@ function dt10SelfTest() {
         dt10PoolFieldsActive_(false).length === DT10_POOL_FIELDS.length)
        ? 'ok (4 fields; legacy filter drops 4)' : 'FAIL') +
       ' | DT10_P181B_W52_LEGACY=' + (dt10W52FieldsLegacy_() ? '1 (OFF)' : 'unset (ON)'));
+  /* v1.11.13 [P-202]: property memo -- the no-arg projection is ONE list
+     per execution and the legacy flag ONE read (v1.11.12 read it per pool
+     row: ~9,800 service calls, the 6-minute kill). */
+  dt10PropMemoReset_();
+  var pmA = dt10PoolFieldsActive_();
+  var pmB = dt10PoolFieldsActive_();
+  var pmC = dt10PoolFieldsActive_();
+  var pmKeys = 0;
+  for (var pmK in DT10_PROP_MEMO_) {
+    if (Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, pmK)) pmKeys++;
+  }
+  report.push('property memo core: ' +
+      ((pmA === pmB && pmB === pmC && pmKeys >= 2 &&
+        pmA.length === (dt10W52FieldsLegacy_() ? DT10_POOL_FIELDS.length - 4
+                                               : DT10_POOL_FIELDS.length))
+       ? 'ok (pool fields memoized; keys=' + pmKeys + '; reads=1/execution)'
+       : 'FAIL'));
   /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race
      (ML run 37114669145 at 12:59, GM still run 37079471147 at 03:43) and
      the clean 10-04 case (both legs run 37160795404). */
