@@ -107,6 +107,8 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -394,7 +396,58 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # last_scored_row_for, _sg_filter_prev, _measure_one). Removed: 0.
 # Rollback: unset TFB_S1_BASE_POLICY (or legacy) in shadow_scorer.yml.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.1"
+# -----------------------------------------------------------------------------
+# v1.9.2 (2026-10-05) — S-1 CRITERIA V2 (P-204 / P-201 / C5 / P-186), ENV-GATED
+# WHY (Audit Reconciliation 2026-10-05, re-executed on the 10-05 export):
+#   (a) P-204 — criterion 3 ("net alpha >= 0") is evaluated on the cumulative
+#       index since the 2026-07-19 seed. Rebased at the last index before the
+#       2026-09-16 engine-ROI repair (P-139 enforce boundary note of 09-15):
+#       challenger 107.164026 -> 106.892669 = -0.2532 %, champion -0.2519 %,
+#       benchmark 99.04464 -> 101.554736 = +2.5343 % => challenger excess
+#       -2.79 pp over the 11 scored dates since 09-16, while the cumulative
+#       line reads +5.34 %. The PASS is carried by the pre-repair history
+#       (07-21: +3.25 % on n=2 with 3 stale names). A gate that cannot say
+#       which window authorises Tranche 1 is not evidence.
+#   (b) P-201 — criterion 4 ("calibration in band 10 pp") passes trivially:
+#       on the same matured 1W+2W cohort MAE(model) 3.23 pp > MAE(zero
+#       forecast) 3.07 pp (1W 2.65 vs 2.55, 2W 3.89 vs 3.65). A band of 10 pp
+#       accepts forecasts that lose to predicting zero.
+#   (c) Criterion 5 reads PASS on an EMPTY _Corporate_Actions register (0
+#       rows since the tab was created) — a vacuous pass.
+#   (d) P-186 — the scored challenger set is not named on the verdict; a
+#       re-run of the same day cannot be compared to the first.
+# WHAT (env TFB_S1_CRITERIA_V2 = off | observe | enforce, read at call time;
+#       DEFAULT off = v1.9.1 BYTE-IDENTICAL output on every surface):
+#   * PURE window_cum(history, basket, start, idx_today): return since the
+#     LAST index dated before `start` (TFB_S1_WINDOW_START, default
+#     2026-09-16); window_alpha = challenger - benchmark on that window.
+#   * PURE parse_zero_mae(header, row) / parse_model_mae(detail): reads an
+#     optional "Zero MAE (pp)" column or a `zero_mae=<x>pp` token in the
+#     _S1_Calibration Detail (published by track_performance >= 6.42.0);
+#     absent => None (never guessed).
+#   * ca_register_rows(sh): data rows in _Corporate_Actions (None on error).
+#   * PURE evaluate_s1_v2(gate, mode, ...): observe => every criterion
+#     keeps its status; criteria 3/4/5 gain ` | v2: ...` detail naming what
+#     enforce WOULD do. enforce => criterion 3 PASS needs BOTH windows >= 0
+#     (window unknown => PENDING); criterion 4 PASS needs in-band AND
+#     MAE(model) < MAE(zero) (zero MAE unpublished => PENDING, fail-safe);
+#     criterion 5 => NOT_EVALUABLE on an empty register (counts as pending).
+#     Verdict re-derived with the same §15 rule (any FAIL -> FAIL; all PASS
+#     -> PASS; else NOT_DECIDABLE). gate["v2"] carries the measurements.
+#   * `[S1-CRITERIA-V2 v1.9.2] mode=.. window_start=.. chal=.. bench=..
+#     alpha=.. zero_mae=.. model_mae=.. ca_rows=.. set=<8-hex>` on the
+#     verdict line, the S1_Gate meta cell and the _Run_Log details JSON —
+#     only when the mode is not off. The set digest (sorted challenger
+#     symbols) is the P-186 reproducibility key.
+#   * Shadow_History rows, basket math, counters, fresh floor: untouched.
+#   * Boundary note (Register §5): enabling enforce is an S-1 evidence-lane
+#     methodology change and needs its own written boundary note; observe
+#     first, enforce at a Saturday sitting.
+# Functions added: 7 (_criteria_v2_mode, _window_start, window_cum,
+# parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
+# evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.9.2"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -891,6 +944,226 @@ def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
         if dates != sorted(dates):
             return False, f"non-monotonic dates in {basket}"
     return True, "append-only integrity intact"
+
+
+# --------------------------------------------------------------------------- #
+# v1.9.2 S-1 CRITERIA V2 (P-204 / P-201 / C5 / P-186) — pure helpers + reader   #
+# --------------------------------------------------------------------------- #
+S1_WINDOW_START_DEFAULT = "2026-09-16"   # P-139 engine-ROI enforce boundary (note of 2026-09-15)
+
+
+def _criteria_v2_mode() -> str:
+    """v1.9.2: TFB_S1_CRITERIA_V2 off (DEFAULT, byte-identical) | observe |
+    enforce. Anything else -> off. Read at call time; never raises."""
+    try:
+        raw = (os.getenv("TFB_S1_CRITERIA_V2") or "off").strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def _window_start(raw: Optional[str] = None) -> date:
+    """v1.9.2 PURE given raw: TFB_S1_WINDOW_START (YYYY-MM-DD); unparseable or
+    unset -> the P-139 boundary 2026-09-16. Never raises."""
+    txt = raw if raw is not None else (os.getenv("TFB_S1_WINDOW_START") or "")
+    try:
+        return datetime.strptime(str(txt).strip()[:10], "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return datetime.strptime(S1_WINDOW_START_DEFAULT, "%Y-%m-%d").date()
+
+
+def window_cum(history: Sequence[Dict[str, Any]], basket: str, start: date,
+               idx_today: Optional[float]) -> Optional[float]:
+    """v1.9.2 PURE [P-204]: cumulative return (%) of `basket` from the LAST
+    history index dated strictly before `start` to `idx_today`. None when
+    there is no such row, no usable base index or no today's index (never a
+    silent zero)."""
+    if idx_today is None:
+        return None
+    base: Optional[float] = None
+    for h in history:
+        if h.get("basket") != basket:
+            continue
+        d = str(h.get("date") or "")[:10]
+        try:
+            hd = datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:  # noqa: BLE001
+            continue
+        if hd < start and h.get("cum_index") is not None:
+            base = h["cum_index"]            # rows are chronological; keep the last
+    if base is None or base <= 0:
+        return None
+    return (float(idx_today) / float(base) - 1.0) * 100.0
+
+
+_ZERO_MAE_RE = re.compile(r"zero[_\s-]*(?:baseline)?[_\s-]*mae\s*[=:]?\s*([0-9]+(?:\.[0-9]+)?)\s*pp",
+                          re.IGNORECASE)
+_MODEL_MAE_RE = re.compile(r"mean\s*\|err\|\s*([0-9]+(?:\.[0-9]+)?)\s*pp", re.IGNORECASE)
+
+
+def parse_zero_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float]:
+    """v1.9.2 PURE [P-201]: the zero-forecast baseline MAE (pp) from a
+    `Zero MAE (pp)` column or a `zero_mae=<x>pp` token in Detail. None when
+    unpublished (track_performance < 6.42.0) — never guessed."""
+    hdr = [str(h).strip().lower() for h in header]
+    try:
+        if "zero mae (pp)" in hdr:
+            v = str(row[hdr.index("zero mae (pp)")]).strip()
+            if v:
+                return float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        detail = str(row[hdr.index("detail")]) if "detail" in hdr else ""
+    except Exception:  # noqa: BLE001
+        detail = ""
+    m = _ZERO_MAE_RE.search(detail or "")
+    return float(m.group(1)) if m else None
+
+
+def parse_model_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float]:
+    """v1.9.2 PURE: the published model MAE (pp) from `Mean Abs Error (pp)`
+    or the `mean |err| x.xxpp` token in Detail. None if unreadable."""
+    hdr = [str(h).strip().lower() for h in header]
+    try:
+        if "mean abs error (pp)" in hdr:
+            v = str(row[hdr.index("mean abs error (pp)")]).strip()
+            if v:
+                return float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        detail = str(row[hdr.index("detail")]) if "detail" in hdr else ""
+    except Exception:  # noqa: BLE001
+        detail = ""
+    m = _MODEL_MAE_RE.search(detail or "")
+    return float(m.group(1)) if m else None
+
+
+def read_s1_calibration_mae(sh) -> Tuple[Optional[float], Optional[float]]:
+    """v1.9.2: (zero_mae_pp, model_mae_pp) from _S1_Calibration row 2.
+    Any read problem -> (None, None); never raises."""
+    try:
+        vals = sh.worksheet(TAB_S1_CAL).get_all_values()
+        if not vals or len(vals) < 2:
+            return None, None
+        return parse_zero_mae(vals[0], vals[1]), parse_model_mae(vals[0], vals[1])
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def ca_register_rows(sh) -> Optional[int]:
+    """v1.9.2 [C5]: number of non-blank data rows in _Corporate_Actions;
+    None when the tab cannot be read (never a silent zero)."""
+    try:
+        try:
+            from core import corporate_actions as _ca
+            tab = _ca.TAB_ACTIONS
+        except Exception:  # noqa: BLE001
+            tab = "_Corporate_Actions"
+        vals = sh.worksheet(tab).get_all_values()
+        return sum(1 for r in vals[1:] if any(str(c).strip() for c in r))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
+                   window_alpha_pct: Optional[float], window_start: date,
+                   zero_mae_pp: Optional[float], model_mae_pp: Optional[float],
+                   ca_rows: Optional[int],
+                   window_cums: Optional[Dict[str, Optional[float]]] = None,
+                   set_digest: str = "") -> Dict[str, Any]:
+    """v1.9.2 PURE: returns a NEW gate dict. mode off -> deep copy, untouched.
+    observe -> statuses untouched, criteria 3/4/5 details gain ` | v2: ...`
+    naming what enforce would do. enforce -> criterion 3 PASS needs both
+    windows >= 0 (window unknown -> PENDING); criterion 4 PASS needs the
+    legacy PASS AND model MAE < zero MAE (zero unpublished -> PENDING);
+    criterion 5 -> NOT_EVALUABLE on an empty register. §15 verdict rule
+    re-applied (NOT_EVALUABLE counts as pending). Never auto-promotes."""
+    g = copy.deepcopy(gate)
+    g["v2"] = {"mode": mode, "window_start": str(window_start),
+               "window_alpha_pct": (None if window_alpha_pct is None
+                                    else round(window_alpha_pct, 4)),
+               "window_cums": {k: (None if v is None else round(v, 4))
+                               for k, v in (window_cums or {}).items()},
+               "zero_mae_pp": zero_mae_pp, "model_mae_pp": model_mae_pp,
+               "ca_rows": ca_rows, "set_digest": set_digest}
+    if mode not in ("observe", "enforce"):
+        return g
+    by_id = {c["id"]: c for c in g["criteria"]}
+    # ---- criterion 3: dual window (P-204) ----
+    c3 = by_id.get(3)
+    if c3 is not None:
+        if window_alpha_pct is None:
+            w_status, w_txt = "PENDING", f"since {window_start}: insufficient history"
+        else:
+            w_pass = window_alpha_pct >= 0
+            w_status = "PASS" if (w_pass and c3["status"] == "PASS") else (
+                "FAIL" if (c3["status"] == "FAIL" or not w_pass) else c3["status"])
+            w_txt = (f"since {window_start}: {window_alpha_pct:+.2f}% "
+                     f"({'PASS' if w_pass else 'FAIL'} on the window)")
+        if mode == "observe":
+            c3["detail"] += f" | v2: {w_txt} -> would {w_status}"
+        else:
+            c3["detail"] += f" | v2: {w_txt}"
+            c3["status"] = w_status
+    # ---- criterion 4: baseline-relative (P-201) ----
+    c4 = by_id.get(4)
+    if c4 is not None:
+        if zero_mae_pp is None or model_mae_pp is None:
+            z_status, z_txt = "PENDING", "zero-baseline MAE not published (needs track_performance >= 6.42.0)"
+        else:
+            beats = model_mae_pp < zero_mae_pp
+            z_status = "PASS" if (beats and c4["status"] == "PASS") else (
+                "FAIL" if (c4["status"] == "FAIL" or (not beats and c4["status"] == "PASS")) else c4["status"])
+            z_txt = (f"model {model_mae_pp:.2f}pp vs zero-forecast {zero_mae_pp:.2f}pp "
+                     f"({'beats' if beats else 'does NOT beat'} the baseline)")
+        if mode == "observe":
+            c4["detail"] += f" | v2: {z_txt} -> would {z_status}"
+        else:
+            c4["detail"] += f" | v2: {z_txt}"
+            c4["status"] = z_status
+    # ---- criterion 5: vacuous pass on an empty register ----
+    c5 = by_id.get(5)
+    if c5 is not None:
+        if ca_rows is None:
+            e_txt, e_status = "_Corporate_Actions unreadable", "PENDING"
+        elif ca_rows == 0:
+            e_txt, e_status = "_Corporate_Actions has 0 rows (vacuous)", "NOT_EVALUABLE"
+        else:
+            e_txt, e_status = f"_Corporate_Actions rows={ca_rows}", c5["status"]
+        if mode == "observe":
+            c5["detail"] += f" | v2: {e_txt} -> would {e_status}"
+        else:
+            c5["detail"] += f" | v2: {e_txt}"
+            c5["status"] = e_status
+    if mode == "enforce":
+        c = g["criteria"]
+        if any(x["status"] == "FAIL" for x in c):
+            g["verdict"], g["why"] = "FAIL", "a criterion is breached — promotion frozen (§15)"
+        elif all(x["status"] == "PASS" for x in c):
+            g["verdict"], g["why"] = "PASS", "all six criteria met — Tranche 1 may be authorized"
+        else:
+            pend = [str(x["id"]) for x in c if x["status"] != "PASS"]
+            g["verdict"], g["why"] = "NOT_DECIDABLE", f"criteria {','.join(pend)} still pending"
+        g["why"] += " [criteria v2 enforce]"
+    return g
+
+
+def criteria_v2_line(gate: Dict[str, Any]) -> str:
+    """v1.9.2 PURE: the read-back token line for the verdict / meta / _Run_Log."""
+    v = gate.get("v2") or {}
+    wc = v.get("window_cums") or {}
+    def _f(x: Any, fmt: str = "{:+.2f}%") -> str:
+        return "n/a" if x is None else fmt.format(x)
+    return (f"[S1-CRITERIA-V2 v{SCRIPT_VERSION}] mode={v.get('mode')} "
+            f"window_start={v.get('window_start')} chal={_f(wc.get(CHALLENGER))} "
+            f"champ={_f(wc.get(CHAMPION))} bench={_f(wc.get(BENCHMARK))} "
+            f"alpha={_f(v.get('window_alpha_pct'))} "
+            f"zero_mae={_f(v.get('zero_mae_pp'), '{:.2f}pp')} "
+            f"model_mae={_f(v.get('model_mae_pp'), '{:.2f}pp')} "
+            f"ca_rows={'n/a' if v.get('ca_rows') is None else v.get('ca_rows')} "
+            f"set={v.get('set_digest') or '-'}")
 
 
 def evaluate_s1(days: int, violations: List[str],
@@ -1820,6 +2093,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                        find_drill_marker(sh, today - timedelta(days=45)),
                        excluded_days=excluded_days,
                        calibration_detail=cal_detail)
+    _v2_mode = _criteria_v2_mode()                 # v1.9.2 [P-204/P-201/C5]
+    _v2_line = ""
+    if _v2_mode != "off":
+        _v2_start = _window_start()
+        _v2_cums = {b: window_cum(history, b, _v2_start,
+                                  (results.get(b) or {}).get("index"))
+                    for b in (CHALLENGER, CHAMPION, BENCHMARK)}
+        _v2_alpha = (None if (_v2_cums[CHALLENGER] is None
+                              or _v2_cums[BENCHMARK] is None)
+                     else _v2_cums[CHALLENGER] - _v2_cums[BENCHMARK])
+        _v2_zero, _v2_model = read_s1_calibration_mae(sh)
+        _v2_ca_rows = ca_register_rows(sh)
+        _v2_set = hashlib.sha256(",".join(sorted(chal_syms)).encode("utf-8")).hexdigest()[:8]
+        gate = evaluate_s1_v2(gate, _v2_mode, _v2_alpha, _v2_start, _v2_zero,
+                              _v2_model, _v2_ca_rows, _v2_cums, _v2_set)
+        _v2_line = criteria_v2_line(gate)
+        print(_v2_line)
 
     verdict = (f"[S1-GATE v{SCRIPT_VERSION}] {gate['verdict']} day {days}/"
                f"{S1_WINDOW_DAYS}"
@@ -1843,6 +2133,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     verdict += f" | {_fresh_line}"
     if _base_line:                                 # v1.9.1 [P-186] read-back
         verdict += f" | {_base_line}"
+    if _v2_line:                                   # v1.9.2 armed only
+        verdict += f" | {_v2_line}"
     if _bf_mode != "off":                          # v1.8.0 read-back
         verdict += (f" | [S1-BOARD-FRESH v{SCRIPT_VERSION}] "
                     f"asof={_bf_asof or '?'} mode={_bf_mode}"
@@ -1890,7 +2182,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          _sg_line + (f" | excluded_reason={_excl_reason}" if _excl_reason else "")
          + f" | {_fresh_line}"
          + (f" | {_dk_line}" if _dk["drift"] else "")
-         + (f" | {_base_line}" if _base_line else "")],  # v1.7.3 / v1.9.0 / v1.9.1 cells
+         + (f" | {_base_line}" if _base_line else "")
+         + (f" | {_v2_line}" if _v2_line else "")],  # v1.7.3 / v1.9.0 / v1.9.1 / v1.9.2 cells
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1928,6 +2221,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                       "pairable": _bp_pairable,
                                       "fresh_frac_legacy": round(_chal_frac_legacy, 4),
                                       "fresh_frac_used": round(_chal_frac, 4)}
+    if _v2_line:                                   # v1.9.2 armed only
+        _rl_details["criteria_v2"] = gate.get("v2")
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
@@ -2464,6 +2759,89 @@ def _selftest() -> int:
                                      {"A": 11.0, "B": 22.0}, {"A": date(2026, 9, 28), "B": date(2026, 9, 28)})["ret"] or 0.0)
                        - 10.0) < 1e-9
                    and _measure_one("CHALLENGER", None, {}, {})["ret"] is None))
+
+    # ---- v1.9.2 S-1 criteria v2 (pure cores on the REAL 10-05 Shadow_History
+    # indexes: challenger 107.164026 -> 106.892669, champion 101.391146 ->
+    # 101.135775, benchmark 99.04464 -> 101.554736, boundary 2026-09-16) ---- #
+    _v2h = [{"date": "2026-09-15", "basket": "CHALLENGER", "cum_index": 107.164026},
+            {"date": "2026-09-15", "basket": "CHAMPION", "cum_index": 101.391146},
+            {"date": "2026-09-15", "basket": "BENCHMARK", "cum_index": 99.04464},
+            {"date": "2026-09-16", "basket": "CHALLENGER", "cum_index": 107.565994},
+            {"date": "2026-09-16", "basket": "BENCHMARK", "cum_index": 98.981859},
+            {"date": "junk", "basket": "CHALLENGER", "cum_index": 1.0}]
+    _v2s = _window_start("2026-09-16")
+    _v2c = window_cum(_v2h, "CHALLENGER", _v2s, 106.892669)
+    _v2b = window_cum(_v2h, "BENCHMARK", _v2s, 101.554736)
+    _v2p = window_cum(_v2h, "CHAMPION", _v2s, 101.135775)
+    checks.append(("V2: window_cum reproduces the 10-05 audit (chal -0.2532 / champ -0.2519 / bench +2.5343)",
+                   abs(_v2c - (-0.2532)) < 5e-4 and abs(_v2p - (-0.2519)) < 5e-4
+                   and abs(_v2b - 2.5343) < 5e-4
+                   and abs((_v2c - _v2b) - (-2.7875)) < 1e-3))
+    checks.append(("V2: window_cum -> None without a pre-boundary row / today index / base <= 0",
+                   window_cum(_v2h, "BENCHMARK_EQW", _v2s, 101.0) is None
+                   and window_cum(_v2h, "CHALLENGER", _v2s, None) is None
+                   and window_cum([{"date": "2026-09-15", "basket": "CHALLENGER", "cum_index": 0.0}],
+                                  "CHALLENGER", _v2s, 100.0) is None
+                   and window_cum(_v2h, "CHALLENGER", _window_start("2026-07-01"), 100.0) is None))
+    checks.append(("V2: window start default / parse / junk",
+                   str(_window_start("junk")) == "2026-09-16"
+                   and str(_window_start("2026-09-30 10:00")) == "2026-09-30"
+                   and str(_window_start("")) == "2026-09-16"))
+    _cal_hdr = ["As Of (Riyadh)", "State", "N Checkpoints", "Mean Abs Error (pp)", "Mean Signed Error (pp)",
+                "Band (pp)", "Min Sample", "By Horizon", "Detail", "Writer Version"]
+    _cal_row = ["2026-10-05 03:28:01", "PASS", "6275", "3.13", "-0.45", "10.0", "20", "1W n=3324",
+                "mean |err| 3.13pp vs band 10.00pp over n=6275; signed -0.45pp", "6.41.0"]
+    _cal_row2 = list(_cal_row); _cal_row2[8] += " | zero_mae=3.07pp (v6.42.0)"
+    _cal_hdr3 = _cal_hdr + ["Zero MAE (pp)"]; _cal_row3 = _cal_row + ["3.0662"]
+    checks.append(("V2: zero MAE parse — unpublished None / detail token 3.07 / column 3.0662; model 3.13",
+                   parse_zero_mae(_cal_hdr, _cal_row) is None
+                   and parse_zero_mae(_cal_hdr, _cal_row2) == 3.07
+                   and parse_zero_mae(_cal_hdr3, _cal_row3) == 3.0662
+                   and parse_model_mae(_cal_hdr, _cal_row) == 3.13
+                   and parse_model_mae(["x", "detail"], ["", "mean |err| 2.65pp"]) == 2.65))
+    _g0 = evaluate_s1(14, [], 5.34, "PASS", True, True, "append-only integrity intact",
+                      "2026-09-19 (RESTORE-TEST)", excluded_days=41,
+                      calibration_detail="mean |err| 3.13pp vs band 10.00pp over n=6189")
+    _gx = evaluate_s1_v2(_g0, "off", -2.7875, _v2s, None, 3.13, 0)
+    _gx.pop("v2", None)
+    checks.append(("V2: mode off leaves the legacy gate untouched (deep copy, equal)",
+                   _gx == _g0 and _gx is not _g0))
+    _go = evaluate_s1_v2(_g0, "observe", -2.7875, _v2s, None, 3.13, 0, {"CHALLENGER": -0.2532, "BENCHMARK": 2.5343}, "ab12cd34")
+    checks.append(("V2: observe keeps statuses + verdict, annotates 3/4/5 with would-outcomes",
+                   [c["status"] for c in _go["criteria"]] == [c["status"] for c in _g0["criteria"]]
+                   and _go["verdict"] == _g0["verdict"]
+                   and "would FAIL" in _go["criteria"][2]["detail"]
+                   and "would PENDING" in _go["criteria"][3]["detail"]
+                   and "would NOT_EVALUABLE" in _go["criteria"][4]["detail"]
+                   and _go["criteria"][0]["detail"] == _g0["criteria"][0]["detail"]))
+    _ge = evaluate_s1_v2(_g0, "enforce", -2.7875, _v2s, None, 3.13, 0)
+    checks.append(("V2: enforce — window FAIL flips criterion 3, zero-MAE unpublished -> 4 PENDING, empty CA -> 5 NOT_EVALUABLE, verdict FAIL",
+                   _ge["criteria"][2]["status"] == "FAIL" and _ge["criteria"][3]["status"] == "PENDING"
+                   and _ge["criteria"][4]["status"] == "NOT_EVALUABLE" and _ge["verdict"] == "FAIL"))
+    _ge2 = evaluate_s1_v2(_g0, "enforce", 1.0, _v2s, 3.07, 2.90, 3)
+    checks.append(("V2: enforce — window PASS + model beats zero + CA rows -> 3/4/5 PASS; verdict stays NOT_DECIDABLE on criterion 1",
+                   [c["status"] for c in _ge2["criteria"]] == ["PENDING", "PASS", "PASS", "PASS", "PASS", "PASS"]
+                   and _ge2["verdict"] == "NOT_DECIDABLE" and "criteria 1 still pending" in _ge2["why"]))
+    _ge3 = evaluate_s1_v2(_g0, "enforce", 1.0, _v2s, 3.07, 3.23, 3)
+    checks.append(("V2: enforce — model loses to zero -> criterion 4 FAIL -> verdict FAIL",
+                   _ge3["criteria"][3]["status"] == "FAIL" and _ge3["verdict"] == "FAIL"))
+    _ge4 = evaluate_s1_v2(_g0, "enforce", None, _v2s, 3.07, 2.90, None)
+    checks.append(("V2: enforce — unknown window -> 3 PENDING; unreadable CA -> 5 PENDING; never auto-promotes",
+                   _ge4["criteria"][2]["status"] == "PENDING" and _ge4["criteria"][4]["status"] == "PENDING"
+                   and _ge4["verdict"] == "NOT_DECIDABLE"))
+    _v2l = criteria_v2_line(_go)
+    checks.append(("V2: read-back line carries mode / window / alpha / zero / ca_rows / set digest",
+                   _v2l.startswith(f"[S1-CRITERIA-V2 v{SCRIPT_VERSION}] mode=observe window_start=2026-09-16")
+                   and "chal=-0.25%" in _v2l and "bench=+2.53%" in _v2l and "alpha=-2.79%" in _v2l
+                   and "zero_mae=n/a" in _v2l and "model_mae=3.13pp" in _v2l and "ca_rows=0" in _v2l
+                   and "set=ab12cd34" in _v2l))
+    _v2_saved = os.environ.get("TFB_S1_CRITERIA_V2")
+    os.environ["TFB_S1_CRITERIA_V2"] = "Enforce"; _m1 = _criteria_v2_mode()
+    os.environ["TFB_S1_CRITERIA_V2"] = "junk"; _m2 = _criteria_v2_mode()
+    os.environ.pop("TFB_S1_CRITERIA_V2", None); _m3 = _criteria_v2_mode()
+    if _v2_saved is not None:
+        os.environ["TFB_S1_CRITERIA_V2"] = _v2_saved
+    checks.append(("V2: mode reader enforce / junk->off / unset->off", (_m1, _m2, _m3) == ("enforce", "off", "off")))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
