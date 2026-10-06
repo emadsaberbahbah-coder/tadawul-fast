@@ -9,6 +9,35 @@ REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
 
+Why this revision (v8.14.1 vs v8.14.0)
+--------------------------------------
+- FIX OBSERVABILITY (2026-10-06, Improvement Register item 7, raised by the
+    2026-10-03 Deploy Read-back: "Not reported by /health: TFB_T10_W52_TIMING,
+    TFB_PF_ADD_LOSER_VETO (A1/A2) -- the key list in main.py is fixed"):
+    v8.14.0 added the pf_gates block but its two key tuples never named the
+    two gates the operator was actually arming. _pf_gates_snapshot() reports
+    only the keys IN the tuple, so a key that is absent does not even read
+    "unset" -- it is simply not on the payload, and an arming of
+    TFB_T10_W52_TIMING=observe (the two-sided 52W timing gate that decides
+    whether a candidate is entered near its 52-week extremes) or of
+    TFB_PF_ADD_LOSER_VETO=observe (the veto that stops an ADD into a losing
+    position) could not be verified from the health JSON at all. Both modules
+    read these per call and print no boot line, which is precisely the
+    v8.14.0 rationale -- the list was just incomplete.
+    _OB_GATE_ENVS gains TFB_T10_W52_TIMING, TFB_T10_W52_LOW_PCT,
+    TFB_T10_W52_HIGH_PCT, TFB_T10_SHOCK_PCT (opportunity_builder v1.23.0,
+    lines 2839/2848/2857/2867); _PF_GATE_ENVS gains TFB_PF_ADD_LOSER_VETO,
+    TFB_PF_ADD_LOSER_PCT, TFB_PF_ADD_STOP_PROX_PCT (portfolio_actions
+    v1.14.0, lines 3228/3235/3241).
+- SAFE SCOPE: seven ADDITIVE keys inside two existing payload blocks. No new
+    block, no route, mount-plan, middleware, auth or engine-lifecycle change;
+    the reduced anonymous view (_PUBLIC_STATUS_META_KEYS) is untouched, so the
+    keys are visible only where the full payload already is. An unset gate
+    still reports the literal "unset", so "off" (explicit) and "absent" stay
+    distinguishable. Both helpers still return {} on any exception.
+- ADD: APP_ENTRY_VERSION bumped to 8.14.1.
+- Rollback: restore the two tuples and the version constant to v8.14.0.
+
 Why this revision (v8.14.0 vs v8.13.2)
 --------------------------------------
 - ADD OBSERVABILITY (2026-09-29, /health truth): two ADDITIVE status-payload
@@ -341,7 +370,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.0"
+APP_ENTRY_VERSION = "8.14.1"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1960,10 +1989,21 @@ _PF_GATE_ENVS: Tuple[str, ...] = (
     "TFB_PF_ENGINE_ROI_DISPLAY", "TFB_PF_TRUST_GATE", "TFB_PF_IDENTITY_GATE",
     "TFB_PF_COST_BASIS_GATE", "TFB_PF_BLOCK_THIN_COVERAGE",
     "TFB_PF_BLOCK_MISSING_COST_BASIS", "TFB_PF_NULL_LEVELS",
+    # v8.14.1 (2026-10-06): P-183 add-loser veto. portfolio_actions v1.14.0
+    # reads these per call (_add_loser_veto_mode at line 3228,
+    # _add_loser_pct 3235, _add_stop_prox_pct 3241) and prints no boot line,
+    # so an arming of TFB_PF_ADD_LOSER_VETO=observe was invisible on /health.
+    "TFB_PF_ADD_LOSER_VETO", "TFB_PF_ADD_LOSER_PCT",
+    "TFB_PF_ADD_STOP_PROX_PCT",
 )
 _OB_GATE_ENVS: Tuple[str, ...] = (
     "TFB_FORECAST_BASIS", "TFB_T10_REQ_ROI_3M_PCT", "TFB_OPP_CASH_FLOOR_MODE",
     "TFB_OPP_CASH_FLOOR_PCT", "TFB_OPP_CASH_FLOOR_SAR",
+    # v8.14.1 (2026-10-06): P-181/P-181b two-sided 52W timing gate.
+    # opportunity_builder v1.23.0 reads these per call (_env_w52_timing_mode
+    # at line 2839 plus the three thresholds at 2848 / 2857 / 2867).
+    "TFB_T10_W52_TIMING", "TFB_T10_W52_LOW_PCT", "TFB_T10_W52_HIGH_PCT",
+    "TFB_T10_SHOCK_PCT",
 )
 _DEPLOY_ENVS: Tuple[str, ...] = (
     "RENDER_GIT_COMMIT", "RENDER_GIT_BRANCH", "RENDER_GIT_REPO_SLUG",

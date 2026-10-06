@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""main.py v8.14.0 [/health truth] dual-tree harness.
+"""main.py v8.14.1 [/health truth] dual-tree harness.
 
 Loads the REAL delivered main.py (app created, 6 route modules mounted, no
 server) and — when MAIN_BASE points at the v8.13.2 file — the REAL base in a
@@ -78,7 +78,7 @@ def main():
     fix = importlib.util.module_from_spec(sp)
     sys.modules["main_fix"] = fix
     sp.loader.exec_module(fix)
-    T("H1 entry version", fix.APP_ENTRY_VERSION == "8.14.0" and fix.SERVICE_VERSION == "8.14.0")
+    T("H1 entry version", fix.APP_ENTRY_VERSION == "8.14.1" and fix.SERVICE_VERSION == "8.14.1")
 
     # H2 dual-tree payload comparison
     fx = run_payload(DELIVERED)
@@ -92,19 +92,32 @@ def main():
         T("H2 shared keys equal (timestamp/version masked)", not diff, json.dumps(diff)[:300])
         extra = sorted(set(fx) - set(bs))
         T("H2 exactly two additive keys", extra == ["deploy", "pf_gates"], extra)
-        T("H2 app_version follows entry (config default)", fx.get("app_version") in ("8.14.0", bs.get("app_version")), fx.get("app_version"))
+        T("H2 app_version follows entry (config default)", fx.get("app_version") in ("8.14.1", bs.get("app_version")), fx.get("app_version"))
     else:
         out.append("SKIP H2 base legs (MAIN_BASE not found)")
 
     # H3 pf_gates shape
     pg = fx["pf_gates"]
     T("H3 pf_gates keys", set(pg) == {"portfolio_actions_version", "opportunity_builder_version", "portfolio_actions", "opportunity_builder"}, sorted(pg))
-    T("H3 module versions from sys.modules", pg["portfolio_actions_version"] == "1.13.0" and pg["opportunity_builder_version"] == "1.22.1", (pg["portfolio_actions_version"], pg["opportunity_builder_version"]))
+    # (2026-10-06) READ THE EXPECTED VERSIONS FROM THE MODULES THEMSELVES.
+    # This assertion used to hardcode "1.13.0" / "1.22.1" and had been RED
+    # on HEAD since portfolio_actions reached 1.14.0 and opportunity_builder
+    # 1.23.0 -- the same stale-pin class as the P-158 harness. What the case
+    # actually proves is that _module_version_no_import() reports what
+    # sys.modules holds, so compare against the live constants.
+    import core.analysis.portfolio_actions as _pa_mod
+    import core.analysis.opportunity_builder as _ob_mod
+    _pa_v = getattr(_pa_mod, "PORTFOLIO_ACTIONS_VERSION", "")
+    _ob_v = getattr(_ob_mod, "OPPORTUNITY_BUILDER_VERSION", "")
+    T("H3 module versions from sys.modules", bool(_pa_v) and bool(_ob_v) and pg["portfolio_actions_version"] == _pa_v and pg["opportunity_builder_version"] == _ob_v, (pg["portfolio_actions_version"], pg["opportunity_builder_version"], _pa_v, _ob_v))
     pa = pg["portfolio_actions"]
     T("H3 explicit values", pa["TFB_PF_CONFIRM_SESSION"] == "observe" and pa["TFB_FORECAST_BASIS"] == "observe" and pa["TFB_PF_DD_EXIT"] == "off")
     T("H3 unset literal", pa["TFB_PF_SWITCH_SCAN"] == "unset" and pg["opportunity_builder"]["TFB_OPP_CASH_FLOOR_SAR"] == "unset")
     T("H3 shared basis in both blocks", pg["opportunity_builder"]["TFB_FORECAST_BASIS"] == "observe")
-    T("H3 env list complete", len(pa) == len(fix._PF_GATE_ENVS) == 21 and len(pg["opportunity_builder"]) == len(fix._OB_GATE_ENVS) == 5)
+    # v8.14.1 (2026-10-06): +3 PF keys (P-183 add-loser veto) and +4 OB keys
+    # (P-181 52W timing) closed Improvement Register item 7.
+    T("H3 env list complete", len(pa) == len(fix._PF_GATE_ENVS) == 24 and len(pg["opportunity_builder"]) == len(fix._OB_GATE_ENVS) == 9)
+    T("H3 register item 7 keys present", "TFB_T10_W52_TIMING" in pg["opportunity_builder"] and "TFB_PF_ADD_LOSER_VETO" in pa)
     os.environ["TFB_PF_SWITCH_SCAN"] = "  1  "
     T("H3 call-time read + strip", fix._pf_gates_snapshot()["portfolio_actions"]["TFB_PF_SWITCH_SCAN"] == "1")
     os.environ["TFB_PF_SWITCH_SCAN"] = "   "

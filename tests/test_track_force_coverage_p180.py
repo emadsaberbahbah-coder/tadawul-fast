@@ -22,6 +22,7 @@ V7 _extract_costbasis_by_status on the REAL 2026-09-30 ledger export
    (TP_LEDGER_TSV) -> 6 active / 30 closed
 Run x3, identical digest.
 """
+import re
 import asyncio, csv, hashlib, importlib.util, json, logging, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 logging.disable(logging.CRITICAL)
@@ -39,7 +40,17 @@ def load(name, path):
 
 
 tp = load("tp_new_p180", NEW_PATH)
-assert tp.SCRIPT_VERSION == "6.41.0", tp.SCRIPT_VERSION
+# (2026-10-06) FLOOR, NOT AN EXACT PIN. This line read
+# `== "6.41.0"` and broke the moment track_performance reached 6.42.0
+# -- the same stale-pin class as tests/test_tp_target_unit_sentry_p158.py's
+# "PASS 14/14". What the harness needs is "at least the version that
+# introduced the behaviour under test", so compare version TUPLES and keep a
+# floor. A tuple compare also avoids the string trap where "6.9.0" > "6.42.0".
+def _ver_tuple(v):
+    return tuple(int(x) for x in str(v).strip().split(".")[:3])
+
+
+assert _ver_tuple(tp.SCRIPT_VERSION) >= (6, 41, 0), tp.SCRIPT_VERSION
 tb = load("tp_base_p180", BASE_PATH) if BASE_PATH and os.path.exists(BASE_PATH) else None
 if tb is not None:
     assert tb.SCRIPT_VERSION == "6.39.0", tb.SCRIPT_VERSION
@@ -52,6 +63,19 @@ def T(name, cond, detail=""):
     out.append(("PASS " if cond else "FAIL ") + name + (" | " + str(detail) if detail else ""))
     if not cond:
         raise AssertionError(name + " " + str(detail))
+
+# (2026-10-06) ALL-OF-THEM, NOT A FIXED COUNT. These assertions pinned the
+# embedded self-test's exact case count ("PASS 18/18"), so every release that
+# ADDS a self-test case broke this harness: v6.40.0 took it 14 -> 16, v6.41.0
+# 16 -> 18 and v6.42.0 18 -> 20, and each time a harness that was never in CI
+# went quietly red. What the case actually proves is "the embedded self-test
+# ran and every case passed", so assert k == k with k > 0.
+def _selftest_all_passed(msg, floor=0):
+    m = re.match(r"^PASS (\d+)/(\d+)$", str(msg).strip())
+    if not m:
+        return False
+    done, total = int(m.group(1)), int(m.group(2))
+    return done == total and total >= max(1, floor)
 
 
 class FakeBackend:
@@ -95,10 +119,10 @@ def fetched(backend):
 
 # ---------------------------------------------------------------- V1 ------ #
 a_new = tp.PerformanceTrackerApp(tp.create_parser().parse_args([]))
-T("V1 delivered selftest 18/18", a_new._track_selftest_() and tp._TRACK_SELFTEST_MSG == "PASS 18/18", tp._TRACK_SELFTEST_MSG)
+T("V1 delivered selftest all cases", a_new._track_selftest_() and _selftest_all_passed(tp._TRACK_SELFTEST_MSG, 18), tp._TRACK_SELFTEST_MSG)
 if tb is not None:
     a_base = tb.PerformanceTrackerApp(tb.create_parser().parse_args([]))
-    T("V1 base selftest 14/14", a_base._track_selftest_() and tb._TRACK_SELFTEST_MSG == "PASS 14/14", tb._TRACK_SELFTEST_MSG)
+    T("V1 base selftest all cases", a_base._track_selftest_() and _selftest_all_passed(tb._TRACK_SELFTEST_MSG), tb._TRACK_SELFTEST_MSG)
 digest_parts.append(tp._TRACK_SELFTEST_MSG)
 
 # ---------------------------------------------------------------- V2 ------ #

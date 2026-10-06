@@ -1,8 +1,36 @@
 # .github/workflows/ci.yml
 # ============================================================================
-# TFB UNIVERSAL CI — every production-critical file, every push
+# TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.0.5 (2026-08-31) — THE ORPHANED-PATH CLASS CLOSED FOR GOOD
+# VERSION 1.0.6 (2026-10-06) -- SIX ORPHANED SUITES JOIN THE LEAN GATE
+#
+# v1.0.6:
+# - ADD six suites to the blocking lean-unit job. The 2026-10-06 review found
+#   67 of 91 test files run by NO workflow, which is the same orphaned-suite
+#   class this file was created to close (see WHY below) - only one layer
+#   down, in the harnesses rather than the unit suites. Four of the six guard
+#   scripts/track_performance.py, the module that owns the OUTCOME evidence
+#   (Performance_Log, maturation, the S-1 calibration block):
+#     tests/test_tp_target_unit_sentry_p158.py  (P-158 target-unit sentry)
+#     tests/test_track_force_coverage_p180.py   (P-180 forced coverage)
+#     tests/test_tp_dedup_matured_p189b.py      (P-189b matured duplicates)
+#     tests/test_tp_zero_baseline_p201.py       (P-201 zero-forecast baseline)
+#     tests/test_sync_outcome_audit.py          (did the pages refresh?)
+#     tests/test_verify_manifest_pins.py        (deployment-manifest drift)
+# - WHY THEY COULD NOT BE ADDED BEFORE, and what changed: the four
+#   track_performance harnesses each load the module with importlib, and the
+#   module registered three Prometheus metrics UNGUARDED at import, so the
+#   SECOND load in one pytest process died at collection with "Duplicated
+#   timeseries in CollectorRegistry". track_performance v6.42.0 adds a
+#   double-import guard (_metric()), and the four now collect together in one
+#   run - measured 8 passed in 0.77s. Two of them also pinned exact version
+#   strings and exact self-test counts ("PASS 18/18"), which went red on every
+#   release that added a case; those are now version-tuple floors and k==k
+#   assertions, so a passing suite stays passing without hand re-pinning.
+# - Every suite added here is zero-network (in-memory sheet stubs) and runs in
+#   the same lean numpy+pytest image as the rest of the job.
+# - Nothing is removed and no existing entry moves.
+#
 #
 # v1.0.5:
 # - FIX: the pull_request trigger no longer carries a paths filter. Root cause
@@ -243,7 +271,13 @@ jobs:
             tests/test_portfolio_actions.py \
             tests/test_scoring_engine_contract.py \
             tests/test_top10_selector.py \
-            tests/test_learning_guards.py $EXTRA
+            tests/test_learning_guards.py \
+            tests/test_sync_outcome_audit.py \
+            tests/test_verify_manifest_pins.py \
+            tests/test_tp_target_unit_sentry_p158.py \
+            tests/test_track_force_coverage_p180.py \
+            tests/test_tp_dedup_matured_p189b.py \
+            tests/test_tp_zero_baseline_p201.py $EXTRA
           echo "::endgroup::"
 
       - name: ✅ Coverage note

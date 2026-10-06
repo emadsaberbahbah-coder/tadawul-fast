@@ -1718,3 +1718,103 @@ jobs:
           if [[ -f "$CREDS_PATH" ]]; then
             shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
           fi
+
+  # =============================================================================
+  # 🔔 RUN VERDICT (2026-10-06) -- A CANCELLED LEG MUST NOT BE SILENT
+  # -----------------------------------------------------------------------------
+  # WHY: the only failure notifier in this workflow lives INSIDE the matrix leg
+  # (the "🔔 Notify on Failure" step, line 1345, `if: failure()`), so it can
+  # only fire on a leg that actually started. On run 37370684206 (2026-10-05
+  # 20:17 slot) the global-markets leg was CANCELLED BEFORE IT EVER GOT A
+  # RUNNER -- job 111970695957: runner_id 0, runner_name "", zero steps,
+  # cancelled after 15m01s -- so no step of any kind executed for it, the step
+  # reported `skipped` in the two legs that succeeded, and the run concluded
+  # `failure` with NOBODY TOLD. The operator discovered the problem days later
+  # from the decision surface, by which time the in-sync Track Performance step
+  # (gated on the global-markets leg) had also silently not run.
+  #
+  # This job runs on its own fresh runner and depends on the two production
+  # jobs, so it executes even when a matrix leg never started. It emits a
+  # ::error:: annotation unconditionally (visible in the Actions summary with
+  # NO secret configured) and additionally posts to Slack when the webhook
+  # secret exists -- same gate and same non-fatal curl handling as the in-leg
+  # notifier it complements.
+  #
+  # It never changes a write, cannot fail the sync (the sync jobs have already
+  # finished), and adds one ubuntu-latest runner-minute per failed scheduled
+  # run. Rollback: delete this job.
+  # =============================================================================
+  notify-run-verdict:
+    name: 🔔 Run verdict
+    needs: [sync-dashboard, recover-missing-market-pages]
+    if: >-
+      ${{
+        always() &&
+        (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+        (
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 🔔 Announce the run verdict
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SYNC_RESULT: ${{ needs.sync-dashboard.result }}
+          RECOVERY_RESULT: ${{ needs.recover-missing-market-pages.result }}
+        run: |
+          set -euo pipefail
+
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          # Always visible in the Actions summary, with or without a webhook.
+          echo "::error::Daily Sync did not complete cleanly - sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT} (${RIYADH_TIME}). A matrix leg that is 'cancelled' with no steps was starved of a hosted runner; the in-sync Track Performance step is gated on the global-markets leg and will NOT have run."
+          {
+            echo "## 🔔 Run verdict"
+            echo ""
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| sync-dashboard | \`${SYNC_RESULT}\` |"
+            echo "| recover-missing-market-pages | \`${RECOVERY_RESULT}\` |"
+            echo ""
+            echo "Time (Riyadh): ${RIYADH_TIME}"
+            echo ""
+            echo "If a leg shows \`cancelled\` with no steps it never received a runner."
+            echo "Check that the Performance Clock recorded this Riyadh day."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "ℹ️  No Slack webhook configured; annotation only."
+            exit 0
+          fi
+
+          PAYLOAD="$(jq -n \
+            --arg trigger  "${{ github.event_name }}" \
+            --arg time     "$RIYADH_TIME" \
+            --arg sync     "${SYNC_RESULT:-unknown}" \
+            --arg recovery "${RECOVERY_RESULT:-unknown}" \
+            --arg url      "$RUN_URL" \
+            '{
+              text: "❌ Tadawul Daily Sync run did not complete cleanly",
+              attachments: [{
+                color: "danger",
+                fields: [
+                  {title: "Trigger",        value: $trigger,  short: true},
+                  {title: "Time (Riyadh)",  value: $time,     short: true},
+                  {title: "sync-dashboard", value: $sync,     short: true},
+                  {title: "recovery",       value: $recovery, short: true},
+                  {title: "Details",        value: ("<" + $url + "|View Logs>"), short: false}
+                ]
+              }]
+            }')"
+
+          if curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+               -H "Content-Type: application/json" \
+               --data-raw "$PAYLOAD" >/dev/null; then
+            echo "✅ Slack notification sent"
+          else
+            echo "::warning::Slack notification failed to send (non-fatal)"
+          fi

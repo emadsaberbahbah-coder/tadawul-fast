@@ -2,7 +2,85 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.5.0
+Yahoo Chart Provider (Global + KSA History) -- v8.15.0
+================================================================================
+v8.15.0 -- LOOPGUARD (B6-b): ASYNC STATE SURVIVES asyncio.run() PER CALL
+--------------------------------------------------------------------------------
+WHY (zero-network reproduction, 2026-10-06 review of branch
+claude/tfb-review-2026-10-06; same class as eodhd_provider v4.18.0 (P-110,
+2026-09-09) and yahoo_fundamentals_provider v6.9.0 (P-203, 2026-10-05), which
+named yahoo_chart_provider as the remaining B6 debt):
+
+(1) THE SERIOUS ONE -- SingleFlight bound its asyncio.Lock to the FIRST loop
+    that contended it, and the NON-OWNER awaited the shared Future WHILE
+    HOLDING THAT LOCK. Sync entry points (cockpit builds) call asyncio.run()
+    once per build, so the process-global provider singleton carries the dead
+    loop's Lock and its Futures into the next loop. The created Future got no
+    get_loop() check and no done-callback, so the second loop both contended
+    a Lock bound to a closed loop and awaited a Future owned by it. Repro with
+    4 concurrent callers via asyncio.gather on ONE provider instance across
+    two asyncio.run() loops measured loop1 ['v','v','v','v'] and loop2
+    ['RuntimeError','v','RuntimeError','RuntimeError'] with
+    sf._lock._loop.is_closed() True. Because get_enriched_quotes_batch gathers
+    with return_exceptions=True and then drops every Exception result
+    ('if isinstance(result, Exception): continue'), the production symptom is
+    SILENT SYMBOL LOSS -- rows vanish from the batch with no error surfaced.
+(2) PARITY -- TokenBucket.lock, CircuitBreaker.lock, AdvancedCache._lock and
+    the module _PROVIDER_LOCK were all eager/lazy asyncio.Locks on the same
+    process-global singleton. The review measured these as never actually
+    contended across loops today (lock._loop is None), so they are parity
+    ports against the same latent failure, not live defects.
+
+WHAT CHANGED (per edit site):
+  - Header banner: "v8.5.0" -> "v8.15.0" (the banner had been stale since
+    v8.6.0; corrected in this build so banner and PROVIDER_VERSION agree).
+  - import threading (stdlib, alphabetical, beside import time).
+  - TokenBucket.lock: field(default_factory=asyncio.Lock) -> threading.Lock,
+    typed Any for the slots dataclass; 'async with self.lock' -> 'with
+    self.lock' in acquire(). Audited: no await inside; the
+    asyncio.sleep(min(5.0, ...)) stays OUTSIDE the section, unchanged.
+  - CircuitBreaker.lock: same conversion; 'with self.lock' in allow(),
+    record_success(), record_failure(). Audited: _get_metrics() and the
+    metrics .set()/.labels() calls are sync, time.monotonic() is sync, no
+    await inside any of the three sections.
+  - SingleFlight: lazy threading.Lock via _get_lock(); the lock is taken ONLY
+    for dict bookkeeping. A stored Future whose fut.get_loop() is not the
+    RUNNING loop is treated as ABSENT -- a flight left by a dead loop is never
+    awaited, the caller runs its own. Every Future gets
+    add_done_callback(self._observe_future) so an owner-only failure can no
+    longer log 'Future exception was never retrieved'.
+    'if not owner: return await fut' sits OUTSIDE the critical section: a
+    threading.Lock held across an await would deadlock the loop. The finally
+    clause re-takes the lock and pops only if self._futures.get(key) is fut,
+    so a newer loop's flight is never evicted by an older one.
+    ADDED (additive, +3 defs, 0 removed): SingleFlight._get_lock() (the
+    lazy-lock helper), SingleFlight._observe_future(),
+    SingleFlight.inflight().
+  - AdvancedCache._lock: same conversion; 'with self._lock' in get(), set(),
+    clear(), size(). Audited: dict operations and time.monotonic() only.
+  - _PROVIDER_LOCK / _get_provider_lock(): asyncio.Lock -> threading.Lock;
+    get_provider() uses a plain 'with' and KEEPS its async signature -- the
+    critical section only instantiates YahooChartProvider (no awaits).
+
+LEFT ALONE (verified by reading the code in this build, classified safe):
+  - the asyncio.Semaphore in get_enriched_quotes_batch: constructed per call
+    inside the coroutine, so it is loop-local and never outlives its loop.
+  - the shared concurrent.futures.ThreadPoolExecutor built in __init__ and
+    used via loop.run_in_executor(self._executor, ...) in fetch_history_raw:
+    concurrent.futures is loop-agnostic and the loop is re-read per call.
+  - _raw_http_get_json: opens a FRESH httpx.AsyncClient per call under
+    'async with', so no transport outlives its loop.
+
+No ENV gate, no kill switch: the OFF state IS the defect (v4.18.0 / v6.9.0
+precedent). Single-loop behaviour is unchanged -- same dedup, same
+concurrency cap, same breaker/limiter/cache semantics; health counters stay
+process-cumulative across loops by design.
+
+ROLLBACK: re-paste v8.14.0 of this file (snapshot of the pre-change module
+kept by the delivery harness). Nothing else in the repo depends on the new
+names, so reverting this one file is a complete rollback.
+
+Version: PROVIDER_VERSION = "8.15.0". All prior WHY blocks preserved verbatim.
 ================================================================================
 
 v8.11.0 — CHART-META IDENTITY GUARD (Fix YC-4)
@@ -495,6 +573,7 @@ import os
 import random
 import re
 import statistics
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -664,7 +743,7 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.14.0"
+PROVIDER_VERSION = "8.15.0"
 # -----------------------------------------------------------------------------
 # v8.14.0 (2026-09-01) - OPEN HEALED FROM THE SESSION CANDLE, COHERENCE-GUARDED
 # -----------------------------------------------------------------------------
@@ -1703,14 +1782,16 @@ class TokenBucket:
     burst: float
     tokens: float = 0.0
     last: float = 0.0
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, loop-bound);
+    # the asyncio.sleep below stays OUTSIDE the critical section.
+    lock: Any = field(default_factory=threading.Lock)
 
     async def acquire(self, n: float = 1.0) -> None:
         """Acquire `n` tokens (blocking until available)."""
         if self.rate_per_sec <= 0:
             return
 
-        async with self.lock:
+        with self.lock:                              # v8.15.0 LOOPGUARD
             now = time.monotonic()
             if self.last <= 0:
                 self.last = now
@@ -1742,12 +1823,14 @@ class CircuitBreaker:
     successes: int = 0
     opened_at: float = 0.0
     state: str = "closed"
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, loop-bound);
+    # allow/record_success/record_failure hold no await (metrics are sync).
+    lock: Any = field(default_factory=threading.Lock)
 
     async def allow(self) -> bool:
         """Return True if a request is allowed through."""
         metrics = _get_metrics()
-        async with self.lock:
+        with self.lock:                              # v8.15.0 LOOPGUARD
             if self.state == "closed":
                 metrics.circuit_state.labels(state="closed").set(0.0)
                 return True
@@ -1766,7 +1849,7 @@ class CircuitBreaker:
 
     async def record_success(self) -> None:
         """Record a successful request."""
-        async with self.lock:
+        with self.lock:                              # v8.15.0 LOOPGUARD
             if self.state == "half_open":
                 self.successes += 1
                 if self.successes >= self.success_threshold:
@@ -1778,7 +1861,7 @@ class CircuitBreaker:
 
     async def record_failure(self) -> None:
         """Record a failed request (may open the breaker)."""
-        async with self.lock:
+        with self.lock:                              # v8.15.0 LOOPGUARD
             self.failures += 1
             if self.state == "half_open":
                 self.state = "open"
@@ -1793,19 +1876,53 @@ class SingleFlight:
     """Deduplicate concurrent requests for the same key."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock: Optional[Any] = None             # v8.15.0 LOOPGUARD: lazy threading.Lock
         self._futures: Dict[str, asyncio.Future] = {}
+
+    def _get_lock(self) -> Any:
+        # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, bound to
+        # the first loop that contended it); both sections are dict ops only.
+        if self._lock is None:
+            self._lock = threading.Lock()
+        return self._lock
+
+    @staticmethod
+    def _observe_future(fut: "asyncio.Future") -> None:
+        """v8.15.0 LOOPGUARD: retrieve the exception of a finished Future so an
+        owner-only failure never logs 'Future exception was never retrieved'."""
+        try:
+            if not fut.cancelled():
+                fut.exception()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def inflight(self) -> int:
+        """v8.15.0: number of in-flight keys -- diagnostics only."""
+        with self._get_lock():
+            return len(self._futures)
 
     async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
         """Execute coroutine; concurrent callers for the same key share the result."""
-        async with self._lock:
+        owner = False
+        lock = self._get_lock()
+        loop = asyncio.get_running_loop()
+        with lock:                                   # v8.15.0 LOOPGUARD
             future = self._futures.get(key)
-            if future is not None:
-                return await future
+            # v8.15.0 LOOPGUARD: a Future that belongs to ANOTHER loop (a flight
+            # left behind by a dead asyncio.run() loop) is never awaited here --
+            # it is replaced by our own flight. Same-loop callers still share.
+            if future is not None and future.get_loop() is not loop:
+                future = None
+            if future is None:
+                future = loop.create_future()
+                future.add_done_callback(self._observe_future)   # v8.15.0
+                self._futures[key] = future
+                owner = True
 
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._futures[key] = future
+        # v8.15.0 LOOPGUARD: OUTSIDE the critical section -- a threading.Lock
+        # held across an await would deadlock the loop.
+        if not owner:
+            return await future
 
         try:
             result = await coro_fn()
@@ -1817,8 +1934,9 @@ class SingleFlight:
                 future.set_exception(exc)
             raise
         finally:
-            async with self._lock:
-                self._futures.pop(key, None)
+            with lock:                               # v8.15.0 LOOPGUARD
+                if self._futures.get(key) is future:
+                    self._futures.pop(key, None)
 
 
 @dataclass(slots=True)
@@ -1829,7 +1947,9 @@ class AdvancedCache:
     ttl_sec: float
     max_size: int = 5000
     _data: Dict[str, Tuple[Any, float]] = field(default_factory=dict)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, loop-bound);
+    # get/set/clear/size hold dict ops and time.monotonic() only -- no await.
+    _lock: Any = field(default_factory=threading.Lock)
 
     def _make_key(self, symbol: str, kind: str) -> str:
         return f"{self.name}:{kind}:{symbol}"
@@ -1839,7 +1959,7 @@ class AdvancedCache:
         key = self._make_key(symbol, kind)
         now = time.monotonic()
 
-        async with self._lock:
+        with self._lock:                             # v8.15.0 LOOPGUARD
             item = self._data.get(key)
             if not item:
                 return None
@@ -1861,7 +1981,7 @@ class AdvancedCache:
         ttl = ttl_sec if ttl_sec is not None else self.ttl_sec
         expires_at = time.monotonic() + max(0.5, ttl)
 
-        async with self._lock:
+        with self._lock:                             # v8.15.0 LOOPGUARD
             if len(self._data) >= self.max_size and key not in self._data:
                 n = max(1, self.max_size // 10)
                 for k in list(self._data.keys())[:n]:
@@ -1870,12 +1990,12 @@ class AdvancedCache:
 
     async def clear(self) -> None:
         """Clear cache."""
-        async with self._lock:
+        with self._lock:                             # v8.15.0 LOOPGUARD
             self._data.clear()
 
     async def size(self) -> int:
         """Get current cache size."""
-        async with self._lock:
+        with self._lock:                             # v8.15.0 LOOPGUARD
             return len(self._data)
 
 
@@ -3009,13 +3129,15 @@ class YahooChartProvider:
 # =============================================================================
 
 _PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
-_PROVIDER_LOCK: Optional[asyncio.Lock] = None
+_PROVIDER_LOCK: Optional[Any] = None             # v8.15.0 LOOPGUARD: loop-agnostic
 
 
-def _get_provider_lock() -> asyncio.Lock:
+def _get_provider_lock() -> Any:
+    # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, loop-bound);
+    # the critical section only instantiates the provider -- no awaits.
     global _PROVIDER_LOCK
     if _PROVIDER_LOCK is None:
-        _PROVIDER_LOCK = asyncio.Lock()
+        _PROVIDER_LOCK = threading.Lock()
     return _PROVIDER_LOCK
 
 
@@ -3024,7 +3146,7 @@ async def get_provider() -> YahooChartProvider:
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         return _PROVIDER_INSTANCE
-    async with _get_provider_lock():
+    with _get_provider_lock():                       # v8.15.0 LOOPGUARD
         if _PROVIDER_INSTANCE is None:
             _PROVIDER_INSTANCE = YahooChartProvider()
     return _PROVIDER_INSTANCE

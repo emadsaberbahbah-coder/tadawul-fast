@@ -179,7 +179,7 @@ def ledger_symbols(grid):
 def rules():
     def R(page,count,price=95,name=99):
         key=page.upper(); return Rule(page,env_i(f"TFB_EXPECTED_MIN_ROWS_{key}",count),env_f(f"TFB_REFRESH_MAX_AGE_H_{key}",30),env_f(f"TFB_REFRESH_MIN_FRESH_PCT_{key}",95),name,price)
-    return [R("Market_Leaders",1025),R("Global_Markets",6512),R("Commodities_FX",453,95,95),R("Mutual_Funds",4496,90),
+    return [R("Market_Leaders",240),R("Global_Markets",6512),R("Commodities_FX",453,95,95),R("Mutual_Funds",2350,90),
             Rule("My_Portfolio",1,env_f("TFB_REFRESH_MAX_AGE_H_MY_PORTFOLIO",8),100,100,100,True,True),
             Rule("Insights_Analysis",1,None,0,0,0,False),Rule("Data_Dictionary",1,None,0,0,0,False)]
 

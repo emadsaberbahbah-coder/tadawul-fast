@@ -1,0 +1,20 @@
+{
+ "as_of": "2026-10-06",
+ "note": "HEAD-verified re-sync: every value below was read from the source constant by AST on branch claude/tfb-review-2026-10-06. Supersedes versions_2026-10-03.json.",
+ "data_engine_v2": "5.151.0",
+ "opportunity_builder": "1.23.0",
+ "portfolio_actions": "1.14.0",
+ "top10_selector": "4.31.0",
+ "run_dashboard_sync": "6.64.0",
+ "run_shadow_scorer": "1.9.2",
+ "track_performance": "6.42.0",
+ "run_shadow_board": "1.5.0",
+ "verify_deployment": "1.0.29",
+ "main_entry": "8.14.1",
+ "route_advanced_analysis": "4.16.0",
+ "argaam_provider": "6.2.0",
+ "yahoo_chart_provider": "8.15.0",
+ "yahoo_fundamentals_provider": "6.9.0",
+ "eodhd_provider": "4.18.0",
+ "decision_top10_gas": "1.11.13"
+}

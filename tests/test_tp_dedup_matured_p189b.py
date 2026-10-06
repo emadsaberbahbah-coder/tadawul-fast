@@ -28,6 +28,7 @@ P6 TRACK_RISK_BLANK=1: rows differ from OFF ONLY in the three risk cells
    row maps to 0.0 (round trip stable)
 P7 idempotence x2
 """
+import re
 import copy, csv, hashlib, importlib.util, json, os, sys
 from types import SimpleNamespace
 
@@ -49,7 +50,17 @@ def _load(path, name):
 
 
 tp = _load(TP_FILE, "tp_under_test")
-assert tp.SCRIPT_VERSION == "6.41.0", tp.SCRIPT_VERSION
+# (2026-10-06) FLOOR, NOT AN EXACT PIN. This line read
+# `== "6.41.0"` and broke the moment track_performance reached 6.42.0
+# -- the same stale-pin class as tests/test_tp_target_unit_sentry_p158.py's
+# "PASS 14/14". What the harness needs is "at least the version that
+# introduced the behaviour under test", so compare version TUPLES and keep a
+# floor. A tuple compare also avoids the string trap where "6.9.0" > "6.42.0".
+def _ver_tuple(v):
+    return tuple(int(x) for x in str(v).strip().split(".")[:3])
+
+
+assert _ver_tuple(tp.SCRIPT_VERSION) >= (6, 41, 0), tp.SCRIPT_VERSION
 out = []
 
 
@@ -57,6 +68,19 @@ def T(name, cond, detail=""):
     out.append(("PASS " if cond else "FAIL ") + name + (" | " + str(detail)[:260] if detail else ""))
     if not cond:
         raise AssertionError(name + " " + str(detail))
+
+# (2026-10-06) ALL-OF-THEM, NOT A FIXED COUNT. These assertions pinned the
+# embedded self-test's exact case count ("PASS 18/18"), so every release that
+# ADDS a self-test case broke this harness: v6.40.0 took it 14 -> 16, v6.41.0
+# 16 -> 18 and v6.42.0 18 -> 20, and each time a harness that was never in CI
+# went quietly red. What the case actually proves is "the embedded self-test
+# ran and every case passed", so assert k == k with k > 0.
+def _selftest_all_passed(msg, floor=0):
+    m = re.match(r"^PASS (\d+)/(\d+)$", str(msg).strip())
+    if not m:
+        return False
+    done, total = int(m.group(1)), int(m.group(2))
+    return done == total and total >= max(1, floor)
 
 
 def _env(dm=None, blank=None):
@@ -140,7 +164,7 @@ def _row(key_sym, horizon, date, status, outcome, roi, rid):
 # ---------------------------------------------------------------- P1 ---- #
 app = object.__new__(tp.PerformanceTrackerApp)
 ok = tp.PerformanceTrackerApp._track_selftest_(app)
-T("P1 embedded guard self-test 18/18", ok is not False and tp._TRACK_SELFTEST_MSG == "PASS 18/18", tp._TRACK_SELFTEST_MSG)
+T("P1 embedded guard self-test all cases", ok is not False and _selftest_all_passed(tp._TRACK_SELFTEST_MSG, 18), tp._TRACK_SELFTEST_MSG)
 
 # ---------------------------------------------------------------- P2 ---- #
 SYN = [_row("AAA.US", "1M", "2026-07-01", "matured", "WIN", 2.5, "a1"),

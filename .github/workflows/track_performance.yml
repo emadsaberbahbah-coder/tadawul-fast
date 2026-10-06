@@ -28,9 +28,34 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # =============================================================================
 
 on:
-  # Production scheduler — once daily after the Riyadh close.
+  # Production scheduler - twice daily after the Riyadh close.
+  #
+  # (2026-10-06) TWO SLOTS, OFF THE HOUR. Evidence: the last 12 scheduled runs
+  # of this workflow NEVER started within 3 h of the nominal 14:00 UTC - the
+  # measured run_started_at values were 17:44, 17:57, 18:02, 18:48, 18:57,
+  # 19:05, 19:15, 20:22 and, on 2026-10-05, 21:20:52Z. GitHub's scheduler is
+  # delivering every cron in this repository 3-7 h late (daily_sync's
+  # "17 4,12,20" slots fired 09:55-11:36 / 16:28-19:42 / 23:07-00:24 and the
+  # 12:17 slot did not fire at all on 10-05), and minute 0 is the worst
+  # contended minute of the hour.
+  #
+  # WHY IT MATTERS FOR THE OUTCOME EVIDENCE: the record key is the WALL-CLOCK
+  # Riyadh date (track_performance.py: key = symbol|horizon|YYYYMMDD built from
+  # date_recorded = RiyadhTime.now()), so a run that lands after 21:00 UTC is
+  # keyed to the NEXT Riyadh day - the 21:20:52Z run on 10-05 recorded under
+  # 20261006. A day whose global-markets sync leg also failed then carries NO
+  # --record at all for that Riyadh date, and days that were never sampled
+  # cannot be recovered later.
+  #
+  # Both slots are safe to fire: the tracker is idempotent per day
+  # (PerformanceRecord.key is symbol|horizon|YYYYMMDD, SignalSnapshot.key is
+  # symbol|YYYYMMDD), so the second run writes nothing new once the first
+  # succeeded. Two earlier slots raise the probability that at least one lands
+  # inside the intended Riyadh day under the observed drift.
+  # Rollback: restore the single `- cron: "0 14 * * *"` line.
   schedule:
-    - cron: "0 14 * * *"
+    - cron: "47 11 * * *"   # 14:47 Riyadh - after the Tadawul close
+    - cron: "47 15 * * *"   # 18:47 Riyadh - backstop before Riyadh midnight
 
   # Manual trigger — use this to START THE CLOCK immediately and to verify the
   # wiring without waiting for 14:00 UTC.
@@ -56,8 +81,27 @@ on:
         type: boolean
 
 # Never overlap two clock runs (a cold Top_10 build can take ~90s).
+#
+# (2026-10-06) THE GROUP IS NOW THE PRODUCTION WRITE LEASE, NOT A PRIVATE ONE.
+# Evidence: daily_sync.yml serialises its scheduled writes on
+# 'tadawul-production-write-<ref>' (daily_sync.yml line 75), while this clock
+# held its own group 'tfb-performance-clock'. The two never saw each other, yet
+# BOTH run scripts/track_performance.py --record --audit against the same
+# Performance_Log: the sync's tracker step runs at the END of the ~60-min
+# global-markets leg (so ~21:20-21:35Z for the 20:17 slot) and this clock's
+# measured starts land in exactly that window (21:20:52Z on 2026-10-05).
+# daily_sync.yml's own comment at lines 1131-1135 records what that costs:
+# "overlapping trackers append and rewrite Performance_Log from different
+# in-memory copies (23,799 duplicate cohorts by 08-31)", and v6.41.0 still
+# finds 27 matured/matured duplicate Keys counted twice by analyze.
+# Sharing the lease makes the two writers queue instead of interleave.
+# DELIBERATE COST, recorded: GitHub keeps only ONE pending run per group, so a
+# clock run queued behind a running sync and another pending one is dropped.
+# That is acceptable here - the sync leg records the same keys, the tracker is
+# idempotent per Riyadh day, and this workflow now has two daily slots.
+# Rollback: restore `group: tfb-performance-clock`.
 concurrency:
-  group: tfb-performance-clock
+  group: tadawul-production-write-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -82,13 +126,18 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v4
+        # (2026-10-06) v4 -> v6: scripts/audit_repository_workflows.py reports
+        # OUTDATED_ACTION_MAJOR on this pin, and every other production
+        # workflow in this repository already runs checkout@v6. Same inputs.
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        # (2026-10-06) v5 -> v6: same OUTDATED_ACTION_MAJOR finding; the
+        # `cache: pip` input is unchanged in v6.
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -167,6 +216,41 @@ jobs:
           # (the correct cadence -- the 15-min sync would rewrite identical
           # daily values 96x/day). Revert by removing this line or setting "0".
           TFB_SIGNAL_TRENDS_TAB: "1"
+          # ── (2026-10-06) ENV PARITY WITH THE IN-SYNC TRACKER ────────────────
+          # WHY: this clock and daily_sync.yml's "📈 Track Performance" step run
+          # the SAME script against the SAME Performance_Log, but the sync step
+          # carried three settings this block did not, so whichever lane
+          # happened to record a given Riyadh day decided the COHORT SHAPE of
+          # that day's evidence. The three lines below are mirrored verbatim
+          # from daily_sync.yml (lines 1152, 328 and 1164) and the two blocks
+          # MUST stay identical - if you change one, change the other.
+          #
+          # track_performance v6.23.0+ records "1W"/"2W" as CHECKPOINTS, not
+          # maturities: a time-scaled slice of the 1M thesis used to measure
+          # whether a position is TRACKING its forecast. Gate S-1 criterion 4
+          # ("calibration error within band on 7D/14D checkpoints") has no
+          # other input, and checkpoints need ELAPSED time - days not sampled
+          # cannot be recovered later. Default is "1M,3M".
+          # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
+          TRACK_HORIZONS: "1W,2W,1M,3M"
+          # v6.33.0 SHADOW/REGRET. ARMED ("1") - operator Option B, 2026-08-09:
+          # every Performance_Log record stamps 'Entry Selected' (col 32)
+          # YES/NO from the live board's executable tickets, and the calibrate
+          # report gains the BOARD_EXEC vs ALT_TOPK split plus the regret
+          # headline. Without it this lane writes an EMPTY stamp, which lands
+          # in NEITHER the champion nor the alternates bucket and is therefore
+          # invisible to the regret split.
+          TFB_TRACK_SHADOW_COHORTS: "1"
+          # (2026-09-22) P-158 TARGET-UNIT SENTRY - v6.39.0+.
+          # observe: criterion-4 row untouched, stored rows never rewritten;
+          # adds the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9
+          # and ONE [PERF-UNIT] _Run_Log line per run (fraction/percent/
+          # unresolved counts). Explicit words only: off|observe|enforce.
+          # KILL-SWITCH: delete this line -> off (default = legacy).
+          # Hardcoded, not a repo Variable (S-1 lesson 2026-09-10: a Variable
+          # can be silently unset). Enforce = separate sitting with the S-1
+          # criterion-4 boundary note.
+          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
           # plain secret, fall back to the _B64 variant if that is the one set.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}

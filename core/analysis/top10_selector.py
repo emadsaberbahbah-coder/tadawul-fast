@@ -3,7 +3,9 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.21.0
+Top 10 Selector — v4.31.0 (banner corrected 2026-10-06; TOP10_SELECTOR_VERSION
+has been the single source of truth and read 4.31.0 while this line still said
+4.21.0, ten releases behind - the per-release WHY blocks below are complete)
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
