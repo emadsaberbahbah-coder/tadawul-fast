@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 ob = importlib.import_module("core.analysis.opportunity_builder")
-assert ob.OPPORTUNITY_BUILDER_VERSION == "1.23.0", ob.OPPORTUNITY_BUILDER_VERSION
+assert ob.OPPORTUNITY_BUILDER_VERSION == "1.23.2", ob.OPPORTUNITY_BUILDER_VERSION
 
 NOW = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 FX = {"USD": 3.7555, "SAR": 1.0, "GBX": 0.0498}
@@ -161,6 +161,12 @@ if base_path and os.path.exists(base_path):
         _p.pop("version", None)                       # top-level builder version
         for k in list(_p.get("meta") or {}):
             if "version" in k: _p["meta"].pop(k, None)
+    # v1.23.1: BLOCKED enforcement is unconditionally active, so the effective
+    # criteria snapshot intentionally reads true even though this older base
+    # reported the retired switch as false. Normalize that one policy delta;
+    # the rest of the legacy payload remains a byte-for-byte comparison.
+    pb["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"] = \
+        pl2["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"]
     T("N6 legacy payload == base payload (version fields masked)", pb == pl2,
       "" if pb == pl2 else json.dumps([k for k in pb if pb[k] != pl2.get(k)]))
     pd = _build(ob, "1", None)

@@ -43,7 +43,7 @@ def _load(path, name):
 OB_FILE = os.environ.get("OB_FILE")
 ob = _load(OB_FILE, "ob_under_test") if OB_FILE else importlib.import_module(
     "core.analysis.opportunity_builder")
-assert ob.OPPORTUNITY_BUILDER_VERSION == "1.23.0", ob.OPPORTUNITY_BUILDER_VERSION
+assert ob.OPPORTUNITY_BUILDER_VERSION == "1.23.2", ob.OPPORTUNITY_BUILDER_VERSION
 
 NOW = "2026-10-01T03:40:00+00:00"
 from datetime import datetime as _dt, timezone as _tz
@@ -216,11 +216,17 @@ if base_path:
     p_base = _build(obb, None)
     p_base["version"] = p_off["version"]
     p_base["meta"]["versions"]["opportunity_builder"] = p_off["meta"]["versions"]["opportunity_builder"]
+    # v1.23.1 intentionally forces this effective policy read-back true. It is
+    # orthogonal to the v1.23.0 timing OFF-tree identity proven here.
+    p_base["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"] = \
+        p_off["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"]
     T("W2 dual-tree: OFF payload == base payload (version string aside)", _digest(p_base) == _digest(p_off),
       (_digest(p_base), _digest(p_off)))
     # observe/enforce on the base must be inert (base has no such env)
     p_base_obs = _build(obb, "observe"); p_base_obs["version"] = p_off["version"]
     p_base_obs["meta"]["versions"]["opportunity_builder"] = p_off["meta"]["versions"]["opportunity_builder"]
+    p_base_obs["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"] = \
+        p_off["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"]
     T("W2 dual-tree: base ignores the new env", _digest(p_base_obs) == _digest(p_off))
 else:
     out.append("SKIP W2 dual-tree (set OB_BASE=<v1.22.2 file>)")
@@ -321,9 +327,24 @@ if gm_tsv and os.path.exists(gm_tsv):
     out.append("INFO real page OFF seats=%s | enforce seats=%s | counters=%s" % (
         [t["symbol"] for t in p_r_off["selected"]], [t["symbol"] for t in p_r_enf["selected"]], tgr))
     if base_path:
-        p_rb = _build(obb, None, rows=real)
-        p_rb["version"] = p_r_off["version"]; p_rb["meta"]["versions"]["opportunity_builder"] = p_r_off["meta"]["versions"]["opportunity_builder"]
-        T("R4 real page dual-tree: OFF == base", _digest(p_rb) == _digest(p_r_off), (_digest(p_rb), _digest(p_r_off)))
+        # v1.23.1 deliberately changed BLOCKED rows even with the timing gate
+        # off. Keep this timing dual-tree proof on rows outside that intentional
+        # policy delta, including conflicting raw aliases where any BLOCKED wins.
+        inv_aliases = frozenset(ob._FIELD_ALIASES["investability"])
+        def _has_explicit_blocked(row):
+            return any(
+                ob._norm_token(key) in inv_aliases
+                and ob._norm_token(ob._to_text(value) or "") == "blocked"
+                for key, value in row.items())
+        parity_rows = [row for row in real if not _has_explicit_blocked(row)]
+        p_r_parity = _build(ob, None, rows=parity_rows)
+        p_rb = _build(obb, None, rows=parity_rows)
+        p_rb["version"] = p_r_parity["version"]; p_rb["meta"]["versions"]["opportunity_builder"] = p_r_parity["meta"]["versions"]["opportunity_builder"]
+        p_rb["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"] = \
+            p_r_parity["meta"]["criteria_snapshot"]["blocked_identity_gate_enabled"]
+        T("R4 real page dual-tree: OFF == base outside BLOCKED policy delta",
+          _digest(p_rb) == _digest(p_r_parity),
+          (_digest(p_rb), _digest(p_r_parity), len(real) - len(parity_rows)))
 else:
     out.append("SKIP R1-R4 real page (set TFB_TEST_GM_TSV=<Global_Markets.tsv>)")
 

@@ -60,6 +60,13 @@ jobs:
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The standalone audit must enforce the same data-complete contract as
+    # Daily Sync recovery. A positive PAGE-VERDICT can contain mostly
+    # last-good rows after a time-budget exit; process success alone is not a
+    # fresh refresh.
+    env:
+      TFB_AUDIT_REQUIRE_FULL_FETCH: "1"
+      TFB_AUDIT_MIN_FRESH_PCT: "95"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -140,11 +147,9 @@ jobs:
       # the LAST verdict per page, so 'zz-recovery/...' sorts after
       # 'tadawul-sync-logs-...' and the recovered verdict wins.
       # continue-on-error: a clean run produces no recovery artifacts at all.
-      # Known conservative quirk, left as is: a multi-cycle recovery writes
-      # cycle 1 at <group>/sync_execution.log and cycle 2 at
-      # <group>/cycle2/sync_execution.log, and 'cycle2' sorts BEFORE
-      # 'sync_execution.log', so the EARLIER cycle wins. That biases the audit
-      # toward FAIL, never toward a false PASS.
+      # Multi-cycle recovery attempts are ordered numerically by the auditor:
+      # <group>/sync_execution.log (cycle 1), then cycle2, cycle3, and so on,
+      # so the final attempt's verdict and completeness evidence both win.
       - name: Download recovery evidence (best-effort)
         continue-on-error: true
         uses: actions/download-artifact@v8

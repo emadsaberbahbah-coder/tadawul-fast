@@ -9,8 +9,9 @@ from data-refresh success.
 
 Exit codes
 ----------
-0  every required market page was observed and wrote rows
-2  a required page was missing, skipped, failed, or wrote zero rows
+0  every required market page was observed and passed the armed criteria
+2  a required page was missing, skipped, failed, wrote zero rows, or could
+   not certify the configured fresh-coverage minimum while the criterion was armed
 3  artifacts could not be read
 """
 from __future__ import annotations
@@ -24,7 +25,13 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.2"
+# v1.1.2 (2026-10-06): full-fetch mode now rejects partial verdicts and
+# explicit unknown exact coverage, while legacy no-coverage logs remain
+# compatible. Canonical-log preference is local to each artifact directory.
+# v1.1.1 (2026-10-06): parse exact PAGE-VERDICT coverage, compare the integer
+# ratio without display rounding, and make recovery verdict/evidence ordering
+# attempt-aware with later clean attempts clearing stale failure evidence.
 CRITICAL_MARKET_PAGES = (
     "Market_Leaders",
     "Global_Markets",
@@ -37,6 +44,12 @@ _PAGE_VERDICT_RE = re.compile(
     r"page=(?P<page>\S+)\s+"
     r"status=(?P<status>\S+)\s+"
     r"rows_written=(?P<rows>\d+)"
+)
+_PAGE_FRESH_RE = re.compile(
+    r"\bfresh_rows=(?P<fresh>\d+|NA)\s+"
+    r"requested_rows=(?P<requested>\d+|NA)\s+"
+    r"fresh_pct=(?P<pct>\d+(?:\.\d+)?|NA)\b",
+    re.IGNORECASE,
 )
 _FORCE_REFETCH_RE = re.compile(r"\[FORCE-REFETCH[^\]]*\]", re.IGNORECASE)
 
@@ -92,6 +105,18 @@ class PageVerdict:
         return self.status.lower() in {"success", "partial"} and self.rows_written > 0
 
 
+def _verdict_passed(verdict: PageVerdict, full_fetch_gate: bool) -> bool:
+    """Apply the gate-specific status contract to one parsed verdict.
+
+    Legacy/unarmed audits retain the original soft-pass treatment for a
+    positive-row ``partial`` result.  Once the full-fetch criterion is armed,
+    only ``success`` can certify a data-complete refresh.
+    """
+    return verdict.passed and (
+        not full_fetch_gate or verdict.status.lower() == "success"
+    )
+
+
 @dataclass(frozen=True)
 class AuditResult:
     status: str
@@ -127,54 +152,126 @@ class AuditResult:
             "full_fetch_gate": self.full_fetch_gate,
             "min_fresh_pct": self.min_fresh_pct,
             "log_files": list(self.log_files),
-            "verdicts": [asdict(item) | {"passed": item.passed} for item in self.verdicts],
+            "verdicts": [
+                asdict(item)
+                | {"passed": _verdict_passed(item, self.full_fetch_gate)}
+                for item in self.verdicts
+            ],
         }
 
 
 def _candidate_logs(root: Path) -> list[Path]:
-    """Prefer one canonical execution log per artifact to avoid duplicates."""
-    canonical = sorted(path for path in root.rglob("sync_execution.log") if path.is_file())
-    if canonical:
-        return canonical
-    return sorted(path for path in root.rglob("sync_*.log") if path.is_file())
+    """Prefer the canonical execution log within each artifact directory.
+
+    Recovery cycle directories represent ordered attempts. Strip ``cycleN``
+    from the logical path for ordering, then sort the base attempt before
+    cycle 2, cycle 3, and so on. Plain lexical sorting puts ``cycle2`` before
+    ``sync_execution.log`` and can let an older verdict overwrite recovery.
+
+    Canonical preference is deliberately local to a directory.  A different
+    artifact may have been interrupted before creating ``sync_execution.log``
+    while still carrying its usable timestamped ``sync_*.log``.
+    """
+
+    def order_key(
+        path: Path,
+    ) -> tuple[tuple[str, ...], int, str, tuple[str, ...]]:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            parts = path.parts
+        logical_parent: list[str] = []
+        cycle = 1
+        for part in parts[:-1]:
+            match = re.fullmatch(r"cycle(\d+)", part, re.IGNORECASE)
+            if match:
+                cycle = max(cycle, int(match.group(1)))
+            else:
+                logical_parent.append(part)
+        filename = parts[-1] if parts else ""
+        return tuple(logical_parent), cycle, filename, tuple(parts)
+
+    by_parent: dict[Path, list[Path]] = {}
+    for path in root.rglob("sync_*.log"):
+        if path.is_file():
+            by_parent.setdefault(path.parent, []).append(path)
+
+    selected: list[Path] = []
+    for paths in by_parent.values():
+        canonical = [p for p in paths if p.name == "sync_execution.log"]
+        selected.extend(canonical or paths)
+    return sorted(selected, key=order_key)
 
 
 def _read_logs(paths: Iterable[Path]) -> tuple[list[PageVerdict], int, dict]:
     verdicts: list[PageVerdict] = []
     force_lines = 0
+    # v1.1.1: completeness evidence follows the same last-attempt-wins
+    # contract as PAGE-VERDICT. Recovery artifacts sort after primary logs;
+    # a clean recovery verdict must therefore clear an earlier attempt's
+    # TIME-BUDGET/FLOOR-MERGE evidence instead of inheriting it.
     fetch_evidence: dict[str, dict] = {}
     for path in paths:
+        pending_evidence: dict[str, dict] = {}
         text = path.read_text(encoding="utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
             if _FORCE_REFETCH_RE.search(line):
                 force_lines += 1
             tb = _TIME_BUDGET_RE.search(line)
             if tb:
-                ev = fetch_evidence.setdefault(tb.group("page"), {"page": tb.group("page")})
+                ev = pending_evidence.setdefault(tb.group("page"), {"page": tb.group("page")})
                 ev["batches_done"] = int(tb.group("done"))
                 ev["batches_total"] = int(tb.group("total"))
             fm = _FLOOR_MERGE_RE.search(line)
             if fm:
-                ev = fetch_evidence.setdefault(fm.group("page"), {"page": fm.group("page")})
+                ev = pending_evidence.setdefault(fm.group("page"), {"page": fm.group("page")})
                 ev["fresh_rows"] = int(fm.group("fresh"))
                 ev["requested"] = int(fm.group("req"))
                 ev["fresh_pct"] = int(fm.group("pct"))
             ur = _UNRECOVERED_RE.search(line)
             if ur:
-                ev = fetch_evidence.setdefault(ur.group("page"), {"page": ur.group("page")})
+                ev = pending_evidence.setdefault(ur.group("page"), {"page": ur.group("page")})
                 ev["unrecovered_batches"] = int(ur.group("n"))
             match = _PAGE_VERDICT_RE.search(line)
             if not match:
                 continue
+            page = match.group("page")
+            exact = _PAGE_FRESH_RE.search(line)
+            if exact:
+                values = exact.groupdict()
+                ev = pending_evidence.setdefault(page, {"page": page})
+                ev["coverage_source"] = "page_verdict"
+                ev["coverage_unknown"] = any(
+                    values[key].upper() == "NA"
+                    for key in ("fresh", "requested", "pct")
+                )
+                if values["fresh"].upper() != "NA":
+                    ev["fresh_rows"] = int(values["fresh"])
+                if values["requested"].upper() != "NA":
+                    ev["requested"] = int(values["requested"])
+                if values["pct"].upper() != "NA":
+                    ev["fresh_pct"] = float(values["pct"])
             verdicts.append(
                 PageVerdict(
-                    page=match.group("page"),
+                    page=page,
                     status=match.group("status").lower(),
                     rows_written=int(match.group("rows")),
                     source=str(path),
                     line=line_number,
                 )
             )
+            evidence = pending_evidence.pop(page, None)
+            if evidence:
+                fetch_evidence[page] = {
+                    **evidence,
+                    "source": str(path),
+                    "verdict_line": line_number,
+                }
+            else:
+                # A later clean attempt supersedes incomplete evidence from
+                # the original leg. Absence of these warnings means only
+                # "not demonstrably incomplete", matching the gate's scope.
+                fetch_evidence.pop(page, None)
     return verdicts, force_lines, fetch_evidence
 
 
@@ -199,12 +296,13 @@ def audit_artifacts(
 
     observed = tuple(page for page in required if page in latest_by_page)
     missing = tuple(page for page in required if page not in latest_by_page)
+    gate = _require_full_fetch()
     failed = tuple(
         page for page in required
-        if page in latest_by_page and not latest_by_page[page].passed
+        if page in latest_by_page
+        and not _verdict_passed(latest_by_page[page], gate)
     )
     # v1.1.0: pages whose fetch demonstrably did not complete this run.
-    gate = _require_full_fetch()
     min_pct = _min_fresh_pct()
     incomplete: list[str] = []
     for page in required:
@@ -214,9 +312,28 @@ def audit_artifacts(
         short_budget = (
             "batches_total" in ev and ev.get("batches_done", 0) < ev["batches_total"]
         )
-        low_fresh = ("fresh_pct" in ev and ev["fresh_pct"] < min_pct)
+        if ev.get("requested", 0) > 0 and "fresh_rows" in ev:
+            # Compare the exact ratio. PAGE-VERDICT carries four-decimal
+            # display telemetry, while the integer numerator/denominator keep
+            # the threshold decision free of rounding artifacts.
+            low_fresh = (
+                int(ev["fresh_rows"]) * 100
+                < min_pct * int(ev["requested"])
+            )
+        else:
+            low_fresh = (
+                "fresh_pct" in ev and float(ev["fresh_pct"]) < min_pct
+            )
         unrecovered = ev.get("unrecovered_batches", 0) > 0
-        if short_budget or low_fresh or unrecovered:
+        # Legacy PAGE-VERDICT lines carried no exact coverage fields and remain
+        # backward-compatible.  A modern line that explicitly reports any
+        # exact field as NA has supplied evidence that completeness is unknown;
+        # the armed full-fetch contract cannot certify it as complete.
+        unknown_exact = (
+            ev.get("coverage_source") == "page_verdict"
+            and bool(ev.get("coverage_unknown"))
+        )
+        if short_budget or low_fresh or unrecovered or unknown_exact:
             incomplete.append(page)
     if gate:
         failed = tuple(dict.fromkeys(tuple(failed) + tuple(incomplete)))
@@ -270,7 +387,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         Path(args.json_out).write_text(rendered + "\n", encoding="utf-8")
 
     for verdict in result.verdicts:
-        annotation = "notice" if verdict.passed else "error"
+        annotation = (
+            "notice"
+            if _verdict_passed(verdict, result.full_fetch_gate)
+            else "error"
+        )
         print(
             f"::{annotation} file={verdict.source},line={verdict.line}::"
             f"{verdict.page}: status={verdict.status}, rows_written={verdict.rows_written}"

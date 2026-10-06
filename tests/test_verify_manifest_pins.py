@@ -15,7 +15,7 @@ one apologising for the same omission ("MY OMISSION, AND THE THIRD TIME: I
 bumped three scripts in this session and pinned none of them").  On 2026-10-06
 a full sweep found the manifest stale on 14 of its 27 entries, among them
 opportunity_builder 1.15.1 vs 1.23.0, portfolio_actions 1.9.0 vs 1.14.0,
-data_engine_v2 5.133.0 vs 5.151.0 and track_performance 6.34.0 vs 6.41.0 - so
+data_engine_v2 5.133.0 vs 5.151.0 and track_performance 6.34.0 vs 6.42.0 - so
 the verifier had been reporting fiction on the decision layer for weeks.
 
 Re-pinning by hand is what keeps failing. This test closes the loop

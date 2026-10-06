@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.19  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.23.2  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
@@ -1287,6 +1287,39 @@ from datetime import datetime, timedelta, timezone
 # Removed: 0. No new ENV besides the kill switch. Rollback: env or revert.
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
+# v1.23.2 (2026-10-06) - [BLOCKED ALIAS DOMINANCE + TRACE COMPATIBILITY]
+# The v1.23.1 invariant consumed the single investability value chosen by the
+# generic alias resolver. A row carrying both investability=INVESTABLE and the
+# canonical investability_status=BLOCKED could therefore hide the hard state
+# and receive a funded ticket. Candidate normalization now scans every raw key
+# recognized as an investability alias before the lossy normalized-key view is
+# built; any exact normalized BLOCKED value wins, including duplicate header
+# spellings that normalize to the same token. Enforcement remains unconditional.
+# Builds also retain the old opt-in PASS trace when the retired env/request
+# switch was explicitly enabled, without letting either switch disable a fail.
+# Functions added: 2; removed: 0; no new environment switch.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.23.1 (2026-10-06) - [BLOCKED IDENTITY INVARIANT]
+# An explicit engine investability state of BLOCKED is now always a MAJOR
+# failure. The live cockpit posts sheet rows directly to the opportunity route,
+# so those rows do not necessarily pass through the selector's INVESTABLE
+# prefilter. With both legacy investability switches off, a BLOCKED row could
+# therefore receive an INVEST verdict and a funded ticket; an offline mounted-
+# route reproduction returned a 7,500 SAR ticket while the same response still
+# disclosed engine_gate.investability=BLOCKED.
+#
+# BLOCKED is an identity/tradability hard state, unlike WATCHLIST's conservative
+# opinion. The narrow Blocked Identity gate is consequently unconditional and
+# still matches only the normalized token "blocked"; WATCHLIST continues to
+# follow investability_gate_enabled exactly as before. The historical
+# blocked_identity_gate_enabled criterion remains in criteria_snapshot for
+# response compatibility, but is fixed true. Neither an environment value nor
+# request criteria can disarm it. _env_blocked_identity_gate is retained as a
+# compatibility helper and now reports the invariant truth. Functions removed:
+# 0; no new environment switch.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # v1.23.0 (2026-10-01) - [P-181 TIMING GATE] two-sided 52W window + one-session
 # shock veto on candidates (env-gated, DEFAULT OFF = v1.22.2 byte-identical)
 # EVIDENCE (Monitoring Sheet #5, 2026-10-01): the rank-1 FAST-TRACK seat
@@ -1327,7 +1360,7 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.23.0"
+OPPORTUNITY_BUILDER_VERSION = "1.23.2"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1782,8 +1815,9 @@ DEFAULT_CRITERIA = {
     # v1.0.8: DEFAULT OFF (opt-in) — the selector backfills Tier-2 rows, so
     # default-ON would diverge the opportunity surface from the Top_10 page.
     "investability_gate_enabled": False,
-    # v1.10.2 [G-1]: BLOCKED-identity hard gate (env TFB_OPP_BLOCKED_IDENTITY_GATE).
-    "blocked_identity_gate_enabled": False,
+    # v1.23.1: immutable safety invariant. Retained in the criteria snapshot
+    # for compatibility, but environment/request overrides cannot disable it.
+    "blocked_identity_gate_enabled": True,
     # v1.0.9: DEFAULT OFF (opt-in). When ON, a sized ticket whose suggested
     # SAR is 0 (capital exhausted before it could be funded) is NOT counted as
     # a selected/executable ticket: it is removed from `selected`, excluded
@@ -2492,12 +2526,34 @@ def _env_trust_gate():
 
 
 def _env_blocked_identity_gate():
-    """v1.10.2 [G-1]: TFB_OPP_BLOCKED_IDENTITY_GATE — default OFF (house
-    law: ship byte-identical, arm deliberately). When on, an engine
-    investability of exactly BLOCKED MAJOR-fails regardless of the retired
-    Require-Investable setting. Reader mirrors _env_investability_gate."""
+    """v1.23.1: compatibility reader for the always-on BLOCKED invariant.
+
+    TFB_OPP_BLOCKED_IDENTITY_GATE used to be an opt-in switch. Exact BLOCKED
+    is now a non-configurable identity/tradability failure, so even an old
+    deployment value of ``0`` cannot reopen the funded-ticket path.
+    """
+    return True
+
+
+def _legacy_blocked_identity_trace_enabled(overrides=None):
+    """Return the v1.23.0 opt-in state for response-trace compatibility.
+
+    Enforcement no longer consults this value. It records whether the retired
+    environment/request switch would previously have appended a PASS gate for
+    a non-BLOCKED row. Request precedence mirrors ``make_criteria`` exactly.
+    """
     raw = (os.getenv("TFB_OPP_BLOCKED_IDENTITY_GATE") or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    enabled = raw in ("1", "true", "yes", "on")
+    try:
+        items = (overrides or {}).items()
+    except AttributeError:
+        return enabled
+    for key, val in items:
+        if (str(key).strip().lower() != "blocked_identity_gate_enabled"
+                or val in (None, "")):
+            continue
+        enabled = _coerce_bool(val)
+    return enabled
 
 
 def _env_investability_gate():
@@ -3034,6 +3090,10 @@ def make_criteria(overrides=None):
         k = str(key).strip().lower()
         if k not in crit or val in (None, ""):
             continue
+        # v1.23.1: server-owned identity invariant. Keep accepting the legacy
+        # key without letting HTTP/request criteria turn the protection off.
+        if k == "blocked_identity_gate_enabled":
+            continue
         if k in _CRITERIA_BOOL_KEYS:
             crit[k] = _coerce_bool(val)
         elif k in _CRITERIA_FLOAT_KEYS:
@@ -3060,6 +3120,8 @@ def make_criteria(overrides=None):
                                                   "valuation") else "plan")
     if crit.get("min_ticket_sar", 0.0) < 0:
         crit["min_ticket_sar"] = 0.0
+    # Defense in depth for callers that supply an altered defaults/env map.
+    crit["blocked_identity_gate_enabled"] = True
     return crit
 
 
@@ -3219,6 +3281,29 @@ def _field(view, field):
             if v not in (None, ""):
                 return v
     return None
+
+
+def _resolve_investability(row, view):
+    """Resolve investability conservatively across every supported raw alias.
+
+    ``_row_lookup`` intentionally collapses equivalent header spellings and
+    ``_field`` intentionally chooses the first populated alias. Those generic
+    rules are unsuitable for the BLOCKED identity invariant: a conflicting
+    safe value must never hide an explicit hard state. Preserve the old alias
+    result unless any recognized raw alias says exact normalized BLOCKED.
+    """
+    fallback = _field(view, "investability")
+    items = getattr(row, "items", None)
+    if not callable(items):
+        return fallback
+    aliases = frozenset(_FIELD_ALIASES.get("investability", ()))
+    for key, value in items():
+        if _norm_token(key) not in aliases:
+            continue
+        text = _to_text(value)
+        if text is not None and _norm_token(text) == "blocked":
+            return text
+    return fallback
 
 
 def _norm_trend(v):
@@ -3433,7 +3518,7 @@ def normalize_candidate(row, fx_rates, criteria):
         "recommendation_reason": _to_text(
             _field(view, "recommendation_reason")),
         "engine_gate": {
-            "investability": _to_text(_field(view, "investability")),
+            "investability": _to_text(_resolve_investability(row, view)),
             "reasons": _to_text(_field(view, "investability_reasons")),
             "provider": _to_text(_field(view, "data_provider")),
             "last_updated": _to_text(_field(view, "last_updated")),
@@ -4220,7 +4305,8 @@ def _data_trust_assessment(cand, criteria):
     return passed, cur, detail
 
 
-def evaluate_gates(cand, criteria, held_symbols=None):
+def evaluate_gates(cand, criteria, held_symbols=None,
+                   blocked_identity_trace_enabled=None):
     """Per-row §4.2 gates in plan order. Diversification is selection-time
     (handled in the pick loop) and intentionally absent here."""
     held = held_symbols or set()
@@ -4515,11 +4601,17 @@ def evaluate_gates(cand, criteria, held_symbols=None):
     # This gate fails MAJOR on exactly the token "blocked" — nothing
     # else — regardless of the retired gate's setting. Blank/Unknown/
     # WATCHLIST all PASS here untouched (fail-open + traced, the house
-    # convention). Appended ONLY when blocked_identity_gate_enabled =>
-    # byte-identical v1.10.1 when TFB_OPP_BLOCKED_IDENTITY_GATE=0.
-    if criteria.get("blocked_identity_gate_enabled"):
-        _bi_raw = (cand.get("engine_gate") or {}).get("investability")
-        _bi_norm = _norm_token(_to_text(_bi_raw) or "")
+    # convention). v1.23.1: exact BLOCKED unconditionally appends the failing
+    # gate. v1.23.2: a non-BLOCKED row also retains the old PASS trace when the
+    # retired env/request switch was explicitly enabled. This is a server-owned
+    # invariant, not a panel policy: neither env nor request criteria can remove
+    # a failure.
+    _bi_raw = (cand.get("engine_gate") or {}).get("investability")
+    _bi_norm = _norm_token(_to_text(_bi_raw) or "")
+    if blocked_identity_trace_enabled is None:
+        blocked_identity_trace_enabled = \
+            _legacy_blocked_identity_trace_enabled(criteria)
+    if _bi_norm == "blocked" or blocked_identity_trace_enabled:
         _bi_ok = _bi_norm != "blocked"
         g.append(_gate(
             "Blocked Identity", _bi_ok, FAIL_MAJOR,
@@ -6005,6 +6097,10 @@ def build_opportunity_payload(rows, criteria=None, portfolio=None,
 
 
 def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
+    # v1.23.2: preserve whether the retired switch used to request PASS rows
+    # before make_criteria replaces its public snapshot value with invariant
+    # truth. This flag affects trace shape only; BLOCKED enforcement is always on.
+    _blocked_identity_trace = _legacy_blocked_identity_trace_enabled(criteria)
     crit = make_criteria(criteria)
     if not _env_enabled():
         return _json_safe(_skeleton("disabled",
@@ -6083,7 +6179,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                    "lineage_low": 0, "lineage_contradiction": 0}
     for raw in rows:
         cand = normalize_candidate(raw, fx_rates, crit)
-        gates = evaluate_gates(cand, crit, held)
+        gates = evaluate_gates(
+            cand, crit, held,
+            blocked_identity_trace_enabled=_blocked_identity_trace)
         # v1.13.0 [TRUST-001] run telemetry — counts in tag AND gate mode;
         # zeros when off (keys always present, the v1.0.6 meta precedent).
         if cand.get("trust_low_source"):
