@@ -197,7 +197,7 @@ class TestRelClusterTagBasis(unittest.TestCase):
         self.assertIn("Reliability Cluster", ob.GATE_ORDER)
         self.assertEqual(ob.GATE_ORDER.count("Reliability Cluster"), 1)
         self.assertEqual(ob._DEFAULT_REL_CLUSTER_VALUES, (70.4, 71.5, 75.4, 76.5))
-        self.assertEqual(ob.OPPORTUNITY_BUILDER_VERSION, "1.24.0")
+        self.assertEqual(ob.OPPORTUNITY_BUILDER_VERSION, "1.24.1")
 
 
 if __name__ == "__main__":

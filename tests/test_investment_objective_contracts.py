@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -53,6 +54,140 @@ def mounted(client, candidate, fx=None):
     })
     assert response.status_code == 200
     return response.json()
+
+
+@pytest.fixture
+def quote_clock(monkeypatch):
+    instant = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(ob, "datetime", Clock)
+    monkeypatch.setattr(ob, "_venue_state", lambda *args: (
+        False, instant - timedelta(hours=1)))
+    return instant
+
+
+@pytest.mark.parametrize("stamp", [
+    "2026-10-06T12:05:01+00:00", "2026-10-06T15:05:01+03:00",
+    "2026-10-07T12:00:00Z", "2026-10-06", "2026/10/06", "2026-10-07",
+])
+def test_invalid_quote_time_never_funds_at_mounted_boundary(client, quote_clock, stamp):
+    result = mounted(client, row(last_updated=stamp))
+    assert result["selected"] == []
+    failures = [gate for gate in result["candidates_rows"][0]["gates"]
+                if gate["gate"] == "Quote Freshness"]
+    assert failures and failures[0]["passed"] is False
+
+
+@pytest.mark.parametrize("offset", [0, 300])
+def test_known_clock_skew_and_offsets_still_fund(client, quote_clock, offset):
+    stamp = (quote_clock + timedelta(seconds=offset)).astimezone(
+        timezone(timedelta(hours=3))).isoformat()
+    assert mounted(client, row(last_updated=stamp))["selected"]
+
+
+@pytest.mark.parametrize("stamp", ["20261006T1500+0300", "20261006T150000+0300"])
+def test_basic_iso_datetime_preserves_precise_quote_evidence(client, quote_clock, stamp):
+    assert mounted(client, row(last_updated=stamp))["selected"]
+
+
+def test_quote_age_retains_future_sign(quote_clock):
+    assert ob._parse_age_hours("2026-10-06T13:00:00Z") == -1
+
+
+def test_date_only_does_not_certify_a_fresh_midnight_quote(quote_clock, monkeypatch):
+    class Midnight(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return quote_clock.replace(hour=0).astimezone(tz)
+
+    monkeypatch.setattr(ob, "datetime", Midnight)
+    passed, _, detail = ob._quote_freshness_assessment({
+        "engine_gate": {"last_updated": "2026-10-06"}})
+    assert passed is False
+    assert detail["timestamp_reason"] == "timestamp_precision_unknown"
+
+
+def test_data_trust_rejects_future_even_with_quote_gate_disabled(quote_clock, monkeypatch):
+    monkeypatch.setenv("TFB_TICKET_FRESHNESS_GATE", "0")
+    result = ob.build_opportunity_payload([
+        row(last_updated="2026-10-07T12:00:00Z")], criteria={
+        "trust_gate_enabled": True, "min_trust_fields": 0,
+    }, fx_rates={"USD": 3.75}, portfolio={"cash_available_sar": 50_000})
+    assert result["selected"] == []
+    assert result["candidates_rows"][0]["first_fail"]["gate"] == "Data Trust"
+    assert result["meta"]["trust_gate"]["blocked_invalid_timestamp"] == 1
+
+
+@pytest.mark.parametrize("planner", ["opportunity", "portfolio"])
+def test_nonfinite_trust_age_cannot_disable_stale_block(quote_clock, monkeypatch, planner):
+    monkeypatch.setenv("TFB_TICKET_FRESHNESS_GATE", "0")
+    monkeypatch.setenv("TFB_OPP_MAX_DATA_AGE_HOURS", "inf")
+    monkeypatch.setenv("TFB_PF_MAX_DATA_AGE_HOURS", "inf")
+    stale = row(currency="SAR", quantity=1, buy_price=100, stop=80,
+                last_updated=(quote_clock - timedelta(hours=200)).isoformat())
+    if planner == "opportunity":
+        result = ob.build_opportunity_payload([stale], criteria={
+            "trust_gate_enabled": True, "min_trust_fields": 0,
+        }, fx_rates={"SAR": 1}, portfolio={"cash_available_sar": 50_000})
+        assert result["selected"] == []
+        assert result["candidates_rows"][0]["first_fail"]["gate"] == "Data Trust"
+    else:
+        result = pa.build_portfolio_actions([stale], controls={
+            "trust_gate_enabled": True, "max_data_age_hours": float("inf"),
+            "cash_available_sar": 50_000, "add_confirm_days": 1,
+        }, fx_rates={"SAR": 1})
+        assert result["actions"][0]["action"] == pa.ACTION_BLOCK
+        assert result["meta"]["trust_gate"]["stale_blocked"] == 1
+
+
+@pytest.mark.parametrize("calendar,age_hours,setting", [
+    ("open", 2, "TFB_TICKET_MAX_QUOTE_AGE_MIN"),
+    ("missing", 96, "TFB_TICKET_FALLBACK_MAX_AGE_H"),
+])
+def test_nonfinite_age_policy_cannot_certify_stale_quote(
+        client, quote_clock, monkeypatch, calendar, age_hours, setting):
+    monkeypatch.setenv(setting, "inf")
+    monkeypatch.setattr(ob, "_venue_state", lambda *args: (
+        True, quote_clock - timedelta(days=1)) if calendar == "open" else None)
+    stamp = (quote_clock - timedelta(hours=age_hours)).isoformat()
+    result = mounted(client, row(last_updated=stamp))
+    assert result["selected"] == []
+    assert result["candidates_rows"][0]["first_fail"]["gate"] == "Quote Freshness"
+
+
+def test_future_quote_cannot_consume_only_candidate_slot(quote_clock):
+    future = row(symbol="FUTURE.US", forecast_reliability_score=99,
+                 last_updated="2026-10-07T12:00:00Z")
+    current = row(last_updated=quote_clock.isoformat())
+    result = ob.build_opportunity_payload([future, current], criteria={
+        "max_candidates": 1,
+    }, fx_rates={"USD": 3.75}, portfolio={"cash_available_sar": 50_000})
+    assert [ticket["symbol"] for ticket in result["selected"]] == ["SAFE.US"]
+
+
+@pytest.mark.parametrize("stamp", ["2026-10-07T12:00:00Z", "2026-10-06"])
+def test_portfolio_consumes_shared_timestamp_failure(quote_clock, monkeypatch, stamp):
+    monkeypatch.setenv("TFB_EXIT_BY_RULE_EXTRA", "SAFE.US")
+    holding = row(currency="SAR", quantity=1, buy_price=100, stop=80,
+                  last_updated=stamp)
+    controls = pa.make_controls({"trust_gate_enabled": True,
+                                 "cash_available_sar": 50_000, "add_confirm_days": 1})
+    cand = pa.normalize_holding(holding, {"SAR": 1}, controls)
+    assert cand["_trust"]["invalid_timestamp"] is True
+    assert pa._rule_exit_data_ok(cand, controls) is False
+    result = pa.build_portfolio_actions([holding], controls=controls, fx_rates={"SAR": 1})
+    action = result["actions"][0]
+    assert action["action"] == pa.ACTION_BLOCK
+    assert not action["suggested_delta_shares"]
+    trust = result["meta"]["trust_gate"]
+    assert trust["invalid_timestamp_blocked"] == 1
+    assert trust["thin_blocked"] == trust["stale_blocked"] == 0
+    assert any(alert["type"] == "invalid_quote_timestamp" for alert in result["alerts"])
 
 
 def test_final_fx_mounted_override_cannot_multiply_quantity(client, monkeypatch):

@@ -6,12 +6,12 @@
     "compile": [
       "echo \"::group::compileall\"\npython -m compileall -q main.py core routes scripts\necho \"::endgroup::\"\necho \"\u2705 every production file parses\"\n",
       "python -m compileall -q tests\necho \"\u2705 every test file parses\"\n",
-      "node tests/test_dt10_hard_safety_projection.js"
+      "node tests/test_dt10_hard_safety_projection.js\nnode tests/test_dt10_withheld_containment.js\n"
     ],
     "lean-unit": [
       "python -m pip install -U pip\npython -m pip install \"numpy>=1.26.4,<2.0.0\" \"pytest==9.0.3\"\n",
       "python -m py_compile \\\n  core/stats.py \\\n  core/quality_gates.py \\\n  core/scoring.py \\\n  core/analysis/opportunity_builder.py \\\n  core/analysis/portfolio_actions.py \\\n  core/analysis/top10_selector.py\n",
-      "echo \"::group::pytest (lean)\"\n# v1.0.4: existence-gated \u2014 see header. Unquoted $EXTRA vanishes\n# when empty; single-token path, no word-splitting risk.\nEXTRA=\"\"\nif [ -f tests/test_sai_falsegreen_fixtures.py ]; then\n  EXTRA=\"tests/test_sai_falsegreen_fixtures.py\"\nfi\npython -m pytest -q \\\n  tests/test_stats.py \\\n  tests/test_quality_gates.py \\\n  tests/test_data_validity.py \\\n  tests/test_research_evidence_validity.py \\\n  tests/test_opportunity_builder.py \\\n  tests/test_recent_fixes.py \\\n  tests/test_portfolio_actions.py \\\n  tests/test_scoring_engine_contract.py \\\n  tests/test_top10_selector.py \\\n  tests/test_learning_guards.py \\\n  tests/test_sync_outcome_audit.py \\\n  tests/test_verify_manifest_pins.py \\\n  tests/test_tp_target_unit_sentry_p158.py \\\n  tests/test_track_force_coverage_p180.py \\\n  tests/test_tp_dedup_matured_p189b.py \\\n  tests/test_tp_zero_baseline_p201.py \\\n  tests/test_track_evidence_day_p205.py \\\n  tests/test_backend_readiness.py \\\n  tests/test_argaam_loopguard_b6.py \\\n  tests/test_ycp_loopguard_b6.py $EXTRA\necho \"::endgroup::\"\n",
+      "echo \"::group::pytest (lean)\"\n# v1.0.4: existence-gated \u2014 see header. Unquoted $EXTRA vanishes\n# when empty; single-token path, no word-splitting risk.\nEXTRA=\"\"\nif [ -f tests/test_sai_falsegreen_fixtures.py ]; then\n  EXTRA=\"tests/test_sai_falsegreen_fixtures.py\"\nfi\npython -m pytest -q \\\n  tests/test_stats.py \\\n  tests/test_quality_gates.py \\\n  tests/test_data_validity.py \\\n  tests/test_research_evidence_validity.py \\\n  tests/test_backtest_walk_forward.py \\\n  tests/test_opportunity_builder.py \\\n  tests/test_recent_fixes.py \\\n  tests/test_portfolio_actions.py \\\n  tests/test_scoring_engine_contract.py \\\n  tests/test_top10_selector.py \\\n  tests/test_learning_guards.py \\\n  tests/test_sync_outcome_audit.py \\\n  tests/test_verify_manifest_pins.py \\\n  tests/test_tp_target_unit_sentry_p158.py \\\n  tests/test_track_force_coverage_p180.py \\\n  tests/test_tp_dedup_matured_p189b.py \\\n  tests/test_tp_zero_baseline_p201.py \\\n  tests/test_track_evidence_day_p205.py \\\n  tests/test_backend_readiness.py \\\n  tests/test_argaam_loopguard_b6.py \\\n  tests/test_ycp_loopguard_b6.py $EXTRA\necho \"::endgroup::\"\n",
       "echo \"portfolio_actions suite executed \u2014 the gap this workflow exists to close.\"\n"
     ],
     "contract": [
@@ -25,23 +25,62 @@
   },
   "results": {
     "lean": {
-      "passed": 462,
+      "passed": 521,
       "skipped": 2,
       "subtests_passed": 28
     },
     "contract": {
-      "passed": 137,
+      "passed": 157,
       "skipped": 3
     },
     "engine": {
       "passed": 39
     },
     "yahoo_fundamentals_assertions": 13,
-    "gas_assertions": 10,
+    "gas_assertions": 39,
     "workflow_audit": {
       "errors": 0,
       "warnings": 27
+    },
+    "total_passed": 717,
+    "gas_hard_safety_projection_assertions": 10,
+    "gas_withheld_render_refresh_log_cases": 29,
+    "research_tests": 105,
+    "backtest_selftest": {
+      "passed": 4,
+      "total": 4
+    },
+    "daily_ci": {
+      "passed": 75,
+      "skipped": 2,
+      "standalone_harness_passed": 85,
+      "standalone_harness_total": 85
     }
   },
-  "production_validation": false
+  "production_validation": false,
+  "previous_review_commit": "88f0a13b38499ec577982312f02ac3d860c27a9c",
+  "versions": {
+    "entry": "8.14.2",
+    "engine": "5.151.0",
+    "opportunity_builder": "1.24.1",
+    "portfolio_actions": "1.15.1",
+    "gas_top10": "1.12.1",
+    "backtest": "1.2.0"
+  },
+  "local_runtime": {
+    "ready": true,
+    "engine_ready": true,
+    "routes_failed_count": 0,
+    "openapi_paths": 50,
+    "dictionary_rows": 716,
+    "dictionary_headers": 9,
+    "live_quote_or_sheet_writes_tested": false
+  },
+  "limitations": [
+    "No production or native GAS deployment/readback",
+    "No atomic immutable source/decision publication bundle",
+    "Approved universe and durable account/risk/cash authority remain unverified",
+    "Ledger timestamps do not establish immutable historical revisions or complete CA/PIT evidence; statistical gain remains descriptive",
+    "Branch-protection API returned HTTP 403; repository and PR access succeeded"
+  ]
 }

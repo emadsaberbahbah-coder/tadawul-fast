@@ -43,7 +43,7 @@ def _load(path, name):
 OB_FILE = os.environ.get("OB_FILE")
 ob = _load(OB_FILE, "ob_under_test") if OB_FILE else importlib.import_module(
     "core.analysis.opportunity_builder")
-assert ob.OPPORTUNITY_BUILDER_VERSION == "1.24.0", ob.OPPORTUNITY_BUILDER_VERSION
+assert ob.OPPORTUNITY_BUILDER_VERSION == "1.24.1", ob.OPPORTUNITY_BUILDER_VERSION
 
 NOW = "2026-10-01T03:40:00+00:00"
 from datetime import datetime as _dt, timezone as _tz

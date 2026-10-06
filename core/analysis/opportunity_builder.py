@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.24.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.1  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
@@ -579,6 +579,12 @@ upstream_meta=…)`. `collect_candidates_via_selector()` is a best-effort
 convenience hook only — the authoritative wiring lands in P3 after the live
 selector exports are confirmed on Render (never trust /mnt/project copies).
 
+v1.24.1 (2026-10-06): quote/trust evidence retains signed timestamp age;
+date-only or more than 300 seconds future evidence cannot receive a ticket.
+Candidate caps apply the same evidence rule. Nonfinite age-policy values
+fall back to the existing safe defaults. Unknown legacy timestamps remain
+explicitly unknown; this does not certify an immutable source snapshot.
+
 Volatility note: `vol_30d` is consumed as the 30-day realized volatility in
 percent (≈ monthly), matching the engine's "Volatility 30D" column; it is NOT
 de-annualized here. If the live engine emits annualized vol, recalibrate
@@ -594,6 +600,7 @@ import os
 import re
 import time
 from core.analysis.hard_eligibility import resolve_hard_eligibility
+from core.data_validity import timestamp_freshness
 from core.symbols.normalize import FIAT_CODES
 from datetime import datetime, timedelta, timezone
 
@@ -1374,7 +1381,7 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.0"
+OPPORTUNITY_BUILDER_VERSION = "1.24.1"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -3155,6 +3162,8 @@ def make_criteria(overrides=None):
                                                   "valuation") else "plan")
     if crit.get("min_ticket_sar", 0.0) < 0:
         crit["min_ticket_sar"] = 0.0
+    if _to_float(crit.get("max_data_age_hours")) is None:
+        crit["max_data_age_hours"] = DEFAULT_CRITERIA["max_data_age_hours"]
     # Defense in depth for callers that supply an altered defaults/env map.
     crit["blocked_identity_gate_enabled"] = True
     return crit
@@ -3704,33 +3713,10 @@ def _trust_signal_count(cand):
 
 
 def _parse_age_hours(last_updated_text):
-    """Age in hours (float) of an ISO-ish timestamp vs now(UTC), or None when
-    unparseable/absent so the freshness sub-check is SKIPPED (never a false
-    stale block). Naive timestamps are assumed UTC; a future timestamp (clock
-    skew) is treated as age 0, not stale. stdlib-only."""
-    if not last_updated_text:
-        return None
-    s = str(last_updated_text).strip()
-    if not s:
-        return None
-    iso = s.replace("Z", "+00:00").replace("z", "+00:00")
-    dt = None
-    try:
-        dt = datetime.fromisoformat(iso)
-    except (ValueError, TypeError):
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                break
-            except (ValueError, TypeError):
-                continue
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-    return 0.0 if age < 0 else age
+    """Signed UTC age; unknown timestamps stay unknown, never age zero."""
+    dt = _parse_ts_utc(last_updated_text)
+    return None if dt is None else (
+        datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
 
 
 # --------------------------------------------------------------------------- #
@@ -3738,7 +3724,7 @@ def _parse_age_hours(last_updated_text):
 # --------------------------------------------------------------------------- #
 def _parse_ts_utc(last_updated_text):
     """The timestamp behind _parse_age_hours, as an aware UTC datetime (or
-    None). Same parsing ladder, same naive⇒UTC assumption; extracted so the
+    None). Legacy naive⇒UTC assumption; extracted so the
     freshness gate can compare against a venue close, not just an age."""
     if not last_updated_text:
         return None
@@ -3764,6 +3750,26 @@ def _parse_ts_utc(last_updated_text):
     return dt
 
 
+def _quote_timestamp_facts(last_updated_text, now=None):
+    """Reject known invalid timestamp evidence before any venue-age fallback.
+
+    Missing/unparseable legacy evidence retains its explicit unknown state.
+    The existing naive-as-UTC convention remains; an authoritative timestamp
+    basis for all source rows still requires the source-bundle contract.
+    """
+    stamp = _parse_ts_utc(last_updated_text)
+    if stamp is None:
+        return None, None, "timestamp_unknown"
+    precision = "datetime" if re.search(
+        r"[Tt ]\d{2}:\d{2}|[Tt]\d{4}(?:\d{2})?", str(last_updated_text)) else "date"
+    _, age, reason = timestamp_freshness(
+        stamp, now or datetime.now(timezone.utc), precision=precision,
+        # Only evidence integrity is checked here. The caller applies its
+        # own age policy, including the existing last-venue-close allowance.
+        max_age_seconds=1e15)
+    return stamp, None if age is None else age / 3600.0, reason
+
+
 def _env_freshness_gate():
     """W-2 kill-switch — DEFAULT ON (protective guards ship armed)."""
     return (os.getenv("TFB_TICKET_FRESHNESS_GATE") or "1").strip().lower() \
@@ -3773,7 +3779,7 @@ def _env_freshness_gate():
 def _env_quote_max_age_min():
     try:
         v = float(os.getenv("TFB_TICKET_MAX_QUOTE_AGE_MIN") or 15.0)
-        return v if v > 0 else 15.0
+        return v if math.isfinite(v) and v > 0 else 15.0
     except (TypeError, ValueError):
         return 15.0
 
@@ -3781,7 +3787,7 @@ def _env_quote_max_age_min():
 def _env_freshness_fallback_h():
     try:
         v = float(os.getenv("TFB_TICKET_FALLBACK_MAX_AGE_H") or 78.0)
-        return v if v > 0 else 78.0
+        return v if math.isfinite(v) and v > 0 else 78.0
     except (TypeError, ValueError):
         return 78.0
 
@@ -4316,21 +4322,25 @@ def _venue_state(symbol, now_utc):
 
 
 def _quote_freshness_assessment(cand):
-    """v1.4.0 (W-2). Returns (passed, current_str, detail). Pure-defensive:
-    the only FAIL paths are PROVEN staleness; absent/unparseable timestamps
-    and calendar outages never block a candidate on their own."""
+    """W-2: venue freshness with precise, signed timestamp evidence."""
     eng = cand.get("engine_gate") or {}
-    qdt = _parse_ts_utc(eng.get("last_updated"))
+    now = datetime.now(timezone.utc)
+    qdt, age_h, reason = _quote_timestamp_facts(eng.get("last_updated"), now)
     detail = {"quote_ts": (None if qdt is None else qdt.isoformat()),
-              "mode": None, "age_min": None}
+              "mode": None, "age_min": None, "timestamp_reason": reason}
     if qdt is None:
         detail["mode"] = "skipped_no_timestamp"
         return True, "no timestamp (skipped)", detail
-    now = datetime.now(timezone.utc)
-    age_min = max(0.0, (now - qdt).total_seconds() / 60.0)
-    detail["age_min"] = round(age_min, 1)
+    age_min = None if age_h is None else age_h * 60.0
+    detail["age_min"] = None if age_min is None else round(age_min, 1)
+    if reason:
+        detail["mode"] = "invalid_timestamp"
+        return False, "INVALID_QUOTE_TIME " + reason, detail
     max_min = _env_quote_max_age_min()
     if age_min <= max_min:
+        if age_min < 0:
+            detail["mode"] = "clock_skew"
+            return True, "clock skew %.0fm ahead (within 5m)" % -age_min, detail
         detail["mode"] = "live"
         return True, "live %.0fm old" % age_min, detail
     vs = _venue_state(cand.get("symbol") or "", now)
@@ -4374,30 +4384,38 @@ def _data_trust_assessment(cand, criteria):
     """v1.0.6 Phase-0 trust signal for a Top_10 candidate. Returns
     (passed, current_str, detail). passed=False => the caller emits a MAJOR
     'Data Trust' gate (=> DO_NOT_INVEST; audit/near-miss only, never selected).
-    Pure; never raises. Fails when the row is STALE (last_updated older than
+    Pure; never raises. Invalid precision/future timestamps fail alongside STALE
+    rows (last_updated older than
     max_data_age_hours; unparseable/absent is NOT stale) OR THINLY COVERED
     (fewer than min_trust_fields of the six secondary signals present)."""
     max_age = criteria.get("max_data_age_hours")
+    if max_age is not None and _to_float(max_age) is None:
+        max_age = DEFAULT_CRITERIA["max_data_age_hours"]
     min_fields = int(criteria.get("min_trust_fields") or 0)
     eng = cand.get("engine_gate") or {}
-    age_h = _parse_age_hours(eng.get("last_updated"))
+    _, age_h, time_reason = _quote_timestamp_facts(eng.get("last_updated"))
+    invalid_time = time_reason not in ("", "timestamp_unknown")
     stale = (max_age is not None and max_age > 0 and
              age_h is not None and age_h > max_age)
     present = _trust_signal_count(cand)
     thin = present < min_fields
-    passed = not (stale or thin)
+    passed = not (stale or thin or invalid_time)
     if passed:
         cur = ("ok (%d/6 signals%s)"
                % (present, "" if age_h is None
                   else ", %.1fd old" % (age_h / 24.0)))
     else:
         bits = []
+        if invalid_time:
+            bits.append(time_reason)
         if stale:
             bits.append("stale %.1fd" % (age_h / 24.0))
         if thin:
             bits.append("thin %d/6 signals" % present)
         cur = "; ".join(bits)
     detail = {"stale": bool(stale), "thin": bool(thin),
+              "invalid_timestamp": bool(invalid_time),
+              "timestamp_reason": time_reason,
               "age_hours": (None if age_h is None else round(age_h, 1)),
               "signals_present": present}
     return passed, cur, detail
@@ -6157,11 +6175,14 @@ def _pregate_quality_order(rows, crit):
         if price and ref:
             roi_pct = (ref - price) / price * 100.0
         rel = _to_float(_field(view, "reliability"))
-        age_h = _parse_age_hours(_to_text(_field(view, "last_updated")))
+        _, age_h, time_reason = _quote_timestamp_facts(
+            _to_text(_field(view, "last_updated")))
         blocked_identity = resolve_hard_eligibility(raw).blocked
         ok_pr = price is not None and ref is not None
         ok_fresh = not (max_age is not None and max_age > 0
                         and age_h is not None and age_h > max_age)
+        if (_env_freshness_gate() or crit.get("trust_gate_enabled")):
+            ok_fresh = ok_fresh and time_reason in ("", "timestamp_unknown")
         ok_sane = (vmax is None or roi_pct is None or roi_pct <= vmax)
         ok_fcst = (f_floor is None or eng_pct is None
                    or eng_pct >= f_floor)
@@ -6287,6 +6308,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     gate_fail_counts = {}
     trust_stats = {"evaluated": 0, "blocked": 0,
                    "blocked_stale": 0, "blocked_thin": 0,
+                   "blocked_invalid_timestamp": 0,
                    "lineage_low": 0, "lineage_contradiction": 0}
     for raw in rows:
         cand = normalize_candidate(raw, fx_rates, crit)
@@ -6321,6 +6343,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                         trust_stats["blocked_stale"] += 1
                     if td.get("thin"):
                         trust_stats["blocked_thin"] += 1
+                    if td.get("invalid_timestamp"):
+                        trust_stats["blocked_invalid_timestamp"] += 1
         structural_block = any(g["fail_class"] == FAIL_STRUCTURAL
                                for g in gates)
         audit.append({
@@ -6708,6 +6732,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "blocked": trust_stats["blocked"],
             "blocked_stale": trust_stats["blocked_stale"],
             "blocked_thin": trust_stats["blocked_thin"],
+            "blocked_invalid_timestamp": trust_stats["blocked_invalid_timestamp"],
         },
         "trust_lineage": {
             "mode": _env_trust_lineage_mode() or "off",
@@ -6805,7 +6830,8 @@ def _skeleton(status, message, criteria):
                      "max_data_age_hours": criteria.get("max_data_age_hours"),
                      "min_trust_fields": criteria.get("min_trust_fields"),
                      "evaluated": 0, "blocked": 0,
-                     "blocked_stale": 0, "blocked_thin": 0},
+                     "blocked_stale": 0, "blocked_thin": 0,
+                     "blocked_invalid_timestamp": 0},
                  "coverage": None, "budget": None, "timeouts": None,
                  "freshness": None,
                  "versions": {"opportunity_builder":

@@ -146,7 +146,7 @@ jobs:
             exit 1
           fi
 
-          python -m pip install -q pytest
+          python -m pip install -q "pytest==9.0.3"
 
       - name: 🧪 Run Tests (hard fail on missing gates)
         env:

@@ -1,11 +1,20 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.12.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.12.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.12.1 (2026-10-06) — WITHHELD SNAPSHOT CONTAINMENT
+ * Capture the authoritative verdict before projecting or writing output.
+ * Known WITHHELD snapshots suppress sizing and funding solicitations across
+ * the board, KPIs, research tables and selection log. A later valid feed
+ * cannot release the quantities belonging to a rendered WITHHELD snapshot.
+ * The initial KPI write is withheld; no corrective second write is needed.
+ * Refresh status and selection-log Run Info also suppress funded-seat/gain
+ * diagnostics according to the captured verdict.
  *
  * ============================================================================
  * v1.11.13 (2026-10-05) [P-202] -- HOTFIX: ONE PROPERTY READ PER EXECUTION
@@ -1552,7 +1561,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.12.0';
+var DT10_VERSION = '1.12.1';
 /* v1.11.1 (2026-09-03) — MORNING TRIGGER TARGET RESTORED + OUTPUT TRUTH
  *  (1) tfbMorningCockpitRefresh(): the 08:07 time-driven trigger pointed at
  *      a function this file no longer defined ("Script function not found",
@@ -3200,7 +3209,19 @@ function dt10RunLogRow_(level, status, message, details) {
  */
 function dt10IsFundingAlert_(a) {
   var t = String((a && a.type) || '').toLowerCase();
-  return t === 'capital_call' || t === 'unfunded_candidates';
+  if (t === 'funding_withheld') return false;
+  return t === 'capital_call' || t === 'unfunded_candidates' ||
+         t === 'rotation_proposal' || t === 'no_deployable_capital' ||
+         t === 'cash_floor' || t.indexOf('funding') !== -1 ||
+         dt10IsFundingText_((a && a.required_action) || '');
+}
+
+/** Funding advice cannot accompany a known non-actionable decision snapshot. */
+function dt10IsFundingText_(text) {
+  // Includes the builder's funding deferrals even with funding-plan mode off:
+  // sized ticket / board lot below floor, exhausted capital and cash controls.
+  return /capital_call|deposit|fundable|fund(?:s|ed) from|already funded|\bunfunded\b|\bsized (?:ticket|allocation|seat)|\btickets? (?:are )?sized\b|\bminimum ticket floor\b|\bdeployable capital\b|\bcash available\b|(?:add|increase|raise|set)\s+cash/i
+      .test(String(text || ''));
 }
 
 /**
@@ -3214,8 +3235,7 @@ function dt10IsFundingNearMiss_(n) {
   var txt = (String((n && n.required) || '') + ' ' +
              String((n && n.improve_note) || '') + ' ' +
              String((n && n.current) || '')).toLowerCase();
-  return txt.indexOf('capital_call') !== -1 ||
-         txt.indexOf('deposit') !== -1;
+  return dt10IsFundingText_(txt);
 }
 
 /**
@@ -3271,10 +3291,32 @@ function dt10ContainFundingCore_(nearMiss, alerts, state, legacy) {
   return { nearMiss: nmOut, alerts: alOut, suppressed: suppressed };
 }
 
-/** v1.11.8 [P-142]: property-reading wrapper around the pure core. */
+/** Known WITHHELD decisions always contain funding; other states stay unchanged. */
 function dt10ContainFunding_(nearMiss, alerts, state) {
   return dt10ContainFundingCore_(nearMiss, alerts, state,
-                                 dt10FundingWithholdLegacy_());
+      state === 'WITHHELD' ? false : dt10FundingWithholdLegacy_());
+}
+
+/** Preserve raw research evidence; render copies suppress actionable funding. */
+function dt10ContainFundingCandidates_(cands, state) {
+  if (state !== 'WITHHELD') return cands || [];
+  var out = [];
+  var fields = ['deferral', 'failure_reason', 'advisor_note', 'recommendation_detail'];
+  for (var i = 0; i < (cands || []).length; i++) {
+    var original = cands[i];
+    if (!original) { out.push(original); continue; }
+    var copy = {};
+    for (var key in original) {
+      if (original.hasOwnProperty(key)) copy[key] = original[key];
+    }
+    for (var j = 0; j < fields.length; j++) {
+      if (dt10IsFundingText_(copy[fields[j]])) {
+        copy[fields[j]] = 'WITHHELD — funding not evaluated (feed not actionable)';
+      }
+    }
+    out.push(copy);
+  }
+  return out;
 }
 var DT10_CAND_HEADERS = ['Symbol', 'Name', 'Market', 'Sector', 'Ccy', 'Price',
   'Price SAR', 'ROI % (TP1)', 'Engine ROI % (12M)', 'Ann ROI %', 'R/R (TP2)', 'Rel', 'DQ',
@@ -4819,18 +4861,20 @@ function dt10AppendSelectionLog_(ss, tickets, runInfo, panel, outputState) {
     }
     /* v1.10.0 (R3): fail-closed verdict read (mirrors dt10RenderPayload_);
      * read trouble withholds. */
-    if (dt10UvOn_()) {
-      var slUv;
+    var slUv = outputState === 'WITHHELD' ?
+        { state: 'NOT_ACTIONABLE', reason: 'rendered decision snapshot WITHHELD' } :
+        { state: 'EXECUTABLE', reason: '' };
+    if (slUv.state === 'EXECUTABLE' && dt10UvOn_()) {
       try {
         slUv = dt10UvParse_(dt10UvRead_(ss), Date.now());
       } catch (eUv) {
         slUv = { state: 'NOT_ACTIONABLE', reason: 'verdict read failed' };
       }
-      if (slUv.state !== 'EXECUTABLE') {
-        for (var wI = 0; wI < rows.length; wI++) {
-          dt10UvWithholdRow_(rows[wI], DT10_UV_LOG_WITHHOLD_IDX,
-                             DT10_UV_LOG_NOTE_IDX, slUv.reason);
-        }
+    }
+    if (slUv.state !== 'EXECUTABLE') {
+      for (var wI = 0; wI < rows.length; wI++) {
+        dt10UvWithholdRow_(rows[wI], DT10_UV_LOG_WITHHOLD_IDX,
+                           DT10_UV_LOG_NOTE_IDX, slUv.reason);
       }
     }
     var sh = dt10SelLogSheet_(ss);
@@ -5205,9 +5249,11 @@ function refreshDecisionTop10() {
   var earn = dt10EarningsAnnotate_(payload, ss);
   // v1.6.6 (S-5): board-vs-backend KPI verification — token only.
   var kpiNote = dt10KpiCheckNote_(payload);
-  // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
-  var seatNote = dt10SeatCheckNote_(payload);
   dt10RenderPayload_(sheet, payload, tokens);
+  // Funded-seat/gain diagnostics are execution claims. Use the verdict
+  // captured by the render before sharing them in status or log Run Info.
+  var seatNote = payload._dt10_uv && payload._dt10_uv.state === 'EXECUTABLE' ?
+      dt10SeatCheckNote_(payload) : '';
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(String(payload.status || '?'),
       poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
@@ -5429,6 +5475,19 @@ function dt10UvParse_(raw, nowMs) {
 }
 
 function dt10RenderPayload_(sheet, payload, tokens) {
+  // Capture one authoritative verdict before any output write or projector.
+  // A later status change cannot retroactively approve this rendered snapshot.
+  var dt10UvEnabled = dt10UvOn_();
+  var dt10Uv = { state: 'EXECUTABLE', reason: '', ageMin: null };
+  if (dt10UvEnabled) {
+    try {
+      dt10Uv = dt10UvParse_(dt10UvRead_(sheet.getParent()), Date.now());
+    } catch (eUvRead) {
+      dt10Uv = { state: 'NOT_ACTIONABLE', reason: 'verdict read failed', ageMin: null };
+    }
+  }
+  payload._dt10_uv = dt10Uv;
+  var dt10Withheld = dt10Uv.state !== 'EXECUTABLE';
   // Clear dynamic zones (breakApart first: section headers and empty-state
   // lines are merged ranges; writing over stale merges throws in GAS).
   var lastRow = sheet.getMaxRows();
@@ -5442,10 +5501,11 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // KPI strip
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
                                 DT10_KPI_LABELS.length);
-  kpiRange.setValues([dt10KpiValues_(payload.kpis)]);
+  kpiRange.setValues([dt10Withheld ? dt10KpiWithheldValues_(payload.kpis) :
+                                    dt10KpiValues_(payload.kpis)]);
   // v1.8.8 (G-a): seat-truth Selected cell — toggle-gated, fail-open
   // ('' => the v1.8.7 cell stands).
-  if (dt10SeatTruthOn_()) {   // v1.11.12 [P-149]
+  if (!dt10Withheld && dt10SeatTruthOn_()) {   // v1.11.12 [P-149]
     var _stKpi = dt10SeatTruthKpi_(payload);
     if (_stKpi) sheet.getRange(DT10_ROW_KPI_VALUES, 3).setValue(_stKpi);
   }
@@ -5462,12 +5522,13 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // renders NO funding solicitation (capital_call / unfunded_candidates
   // alerts dropped; NEAR MISS funding text replaced; one countable
   // 'funding_withheld' disclosure row appended). Pure copies — payload
-  // untouched. Kill: Script Property DT10_FUNDING_WITHHOLD_LEGACY='1'.
+  // untouched. A legacy display property cannot release a WITHHELD snapshot.
   var _p142 = dt10ContainFunding_(nearMiss, alerts,
-                                  dt10OutputStatus_(payload));
+      dt10Withheld ? 'WITHHELD' : dt10OutputStatus_(payload));
   nearMiss = _p142.nearMiss;
   alerts = _p142.alerts;
-  var cands = payload.candidates_rows || [];
+  var cands = dt10ContainFundingCandidates_(payload.candidates_rows || [],
+      dt10Withheld ? 'WITHHELD' : dt10OutputStatus_(payload));
   // SELECTED
   // v1.6.7 (D-1): separate the two classes in the TITLE. A grace-held ghost
   // has no entry/ticket/stop/TP - calling it an executable ticket is what
@@ -5491,14 +5552,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   }
   /* v1.9.0 W1A-4a: consume the upstream verdict BEFORE any sizing is
    * shown. Fail-closed: read/parse trouble withholds sizing. */
-  var dt10Uv = { state: 'EXECUTABLE', reason: '', ageMin: null };
-  if (dt10UvOn_()) {
-    try {
-      dt10Uv = dt10UvParse_(dt10UvRead_(sheet.getParent()), Date.now());
-    } catch (e) {
-      dt10Uv = { state: 'NOT_ACTIONABLE',
-                 reason: 'verdict read failed', ageMin: null };
-    }
+  if (dt10UvEnabled) {
     if (dt10Uv.state !== 'EXECUTABLE') {
       /* v1.9.1 (IR-089): under a blocked feed nothing is executable —
        * recount the embedded title as qualified PLANS (review Q1).
@@ -5524,16 +5578,6 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       Logger.log('[DT10 v' + DT10_VERSION +
           '] \u2705 upstream verdict: EXECUTABLE');
     }
-  }
-  payload._dt10_uv = dt10Uv;   /* v1.11.1: the verdict the render acted on */
-  /* v1.11.6 [K-1b]: the withheld-truth KPI pass runs HERE, where the
-   * verdict is authoritative -- the v1.11.5 site ran before dt10Uv was
-   * read, so _dt10_uv was absent and the classifier fell through to HELD
-   * (caught live, 2026-09-08 00:28 board). One corrective setValues on
-   * the same kpiRange; EXECUTABLE feeds skip it entirely. */
-  if (dt10Uv.state !== 'EXECUTABLE' && dt10KpiTruthEnabled_() &&
-      dt10OutputStatus_(payload) === 'WITHHELD') {
-    kpiRange.setValues([dt10KpiWithheldValues_(payload.kpis)]);
   }
   row = dt10WriteSection_(sheet, row, dt10SelTitle, tokens);
   var selRows = [];
@@ -5594,8 +5638,13 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   }
   var qRows = [];
   for (var q2 = 0; q2 < qualified.length; q2++) {
-    qRows.push(dt10QualToRow_(qualified[q2], q2 + 1, qPending,
-                              qualified.length, qSeats, qTicketRoi));
+    var qualifiedRow = dt10QualToRow_(qualified[q2], q2 + 1, qPending,
+                                     qualified.length, qSeats, qTicketRoi);
+    if (dt10Withheld) {
+      qualifiedRow[13] = 'WITHHELD';
+      qualifiedRow[14] = 'WITHHELD — no executable plan while the feed is not actionable';
+    }
+    qRows.push(qualifiedRow);
   }
   var qT = dt10WriteTable_(sheet, row, DT10_QUAL_HEADERS, qRows,
       'None — no candidate passed every gate (INVEST) under the current ' +
@@ -5609,7 +5658,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
         .setWrap(true).setFontSize(9);
   }
   // v1.2.1: color the Selected column by status (green/amber/grey).
-  dt10ColorQualified_(sheet, qT.firstDataRow, qT.count, 14, qualified, tokens);
+  // A WITHHELD cell retains the neutral table styling, without approval ink.
+  if (!dt10Withheld) {
+    dt10ColorQualified_(sheet, qT.firstDataRow, qT.count, 14, qualified, tokens);
+  }
   row = qT.next + 1;
   // NEAR MISS
   row = dt10WriteSection_(sheet, row,
@@ -5671,7 +5723,9 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       tokens);
   var cRows = [];
   for (var c = 0; c < cands.length; c++) {
-    cRows.push(dt10CandToRow_(cands[c]));
+    var candidateRow = dt10CandToRow_(cands[c]);
+    if (dt10Withheld && cands[c].selected === true) candidateRow[23] = 'WITHHELD';
+    cRows.push(candidateRow);
   }
   var cT = dt10WriteTable_(sheet, row, DT10_CAND_HEADERS, cRows,
       'No candidates — pool was empty (see Status line and Alerts).');

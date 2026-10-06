@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.15.0  (header synced to runtime; history below)
+Version: 1.15.1  (header synced to runtime; history below)
+v1.15.1 (2026-10-06): consume shared invalid timestamp evidence before any
+portfolio action or rule-exit override; report precise timestamp blocks apart
+from stale/thin evidence. Existing trust-gate activation is preserved.
+
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -817,7 +821,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.15.0"
+PORTFOLIO_ACTIONS_VERSION = "1.15.1"
 # v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
 # HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
 # WHY: every RULE in this file already stands down for a SUKUK-class
@@ -1362,7 +1366,7 @@ def _rule_exit_data_ok(cand, controls):
         if not okb:
             return False
         det = _trust_assess(cand, controls)
-        if det is not None and (det.get("stale")
+        if det is not None and (det.get("invalid_timestamp") or det.get("stale")
                                 or (det.get("thin") and controls.get(
                                     "block_thin_coverage"))):
             return False
@@ -1858,7 +1862,7 @@ def make_controls(overrides=None):
         ctl["cost_min_ratio"] = DEFAULT_CONTROLS["cost_min_ratio"]
         ctl["cost_max_ratio"] = DEFAULT_CONTROLS["cost_max_ratio"]
     # v1.0.3 data-trust threshold sanity
-    if ctl["max_data_age_hours"] <= 0:
+    if not math.isfinite(ctl["max_data_age_hours"]) or ctl["max_data_age_hours"] <= 0:
         ctl["max_data_age_hours"] = DEFAULT_CONTROLS["max_data_age_hours"]
     if ctl["min_trust_fields"] < 0:
         ctl["min_trust_fields"] = 0
@@ -2075,11 +2079,16 @@ def _is_stale_block(action, reason):
 
 def _is_trust_block(action, reason):
     """v1.0.3: True iff this BLOCK was raised by the data-trust gate (stale or
-    thin). Used to exclude trust blocks from the presence (blocked_positions)
+    thin or invalid timestamp). Used to exclude trust blocks from the presence (blocked_positions)
     count."""
     r = (reason or "").lower()
     return action == ACTION_BLOCK and (
-        _STALE_BLOCK_MARKER in r or _THIN_BLOCK_MARKER in r)
+        _STALE_BLOCK_MARKER in r or _THIN_BLOCK_MARKER in r
+        or "invalid quote timestamp" in r)
+
+
+def _is_timestamp_block(action, reason):
+    return action == ACTION_BLOCK and "invalid quote timestamp" in (reason or "").lower()
 
 
 _VF_CONFLICT_MARKER = "valuation/forecast conflict"
@@ -2656,6 +2665,11 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     #     position). Detail is computed once in normalize_holding.
     det = cand.get("_trust")
     if det:
+        if det.get("invalid_timestamp"):
+            return (ACTION_BLOCK,
+                    "BLOCKED — invalid quote timestamp (%s); action withheld "
+                    "pending timestamp verification" % det.get("timestamp_reason"),
+                    0.0, None)
         if det.get("stale"):
             age_h = det.get("age_hours")
             age_txt = "" if age_h is None else " (%dd old)" % int(age_h / 24.0)
@@ -3771,6 +3785,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                         if _is_trust_block(e["action"], e["action_reason"]))
     stale_blocked = sum(1 for e in entries
                         if _is_stale_block(e["action"], e["action_reason"]))
+    timestamp_blocked = sum(1 for e in entries
+                            if _is_timestamp_block(e["action"], e["action_reason"]))
     thin_flagged = sum(1 for e in entries
                        if (e["cand"].get("_trust") or {}).get("thin"))
     # v1.0.4: identity (ghost-ticker) blocks are excluded from blocked_positions
@@ -3788,6 +3804,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     _alert("identity_blocked", identity_blocked,
            "Verify the instrument identity on flagged holdings (name/symbol, "
            "fundamentals) — action withheld as a ghost-ticker until resolved")
+    _alert("invalid_quote_timestamp", timestamp_blocked,
+           "Verify quote timestamp precision, timezone and clock before acting")
     _alert("stale_quote_blocked", stale_blocked,
            "Refresh the quote on stale holdings — action withheld until the "
            "price updates")
@@ -3978,8 +3996,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                 "assessed": sum(1 for c in cands
                                 if c.get("_trust") is not None),
                 "stale_blocked": stale_blocked,
+                "invalid_timestamp_blocked": timestamp_blocked,
                 "thin_flagged": thin_flagged,
-                "thin_blocked": trust_blocked - stale_blocked,
+                "thin_blocked": trust_blocked - stale_blocked - timestamp_blocked,
                 "max_data_age_hours": ctl.get("max_data_age_hours"),
                 "min_trust_fields": ctl.get("min_trust_fields"),
                 "block_thin_coverage": bool(ctl.get("block_thin_coverage")),
