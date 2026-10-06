@@ -46,3 +46,10 @@ a reusable suite.
 The live, runnable batteries are in `tests/`. A new build's harness belongs
 there, as a file that works both as `python tests/<name>.py` and under
 `python -m pytest -q tests/<name>.py`, with no absolute paths and no network.
+
+## Later additions
+
+- 2026-10-07: `harness_ob1181.py` from open PR #340 (`scripts/Harness
+  ob1181<U+00B7>py`, commit `ed85c15`), the same upload pattern, never merged. It
+  hard-codes `/home/claude/repo/tadawul-fast-main` like the others. Landed
+  here so the PR can be closed without losing the evidence.
