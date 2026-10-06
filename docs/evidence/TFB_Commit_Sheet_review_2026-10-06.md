@@ -2,6 +2,8 @@
 
 Date: 2026-10-06 (Tuesday) · Lanes: GitHub Actions / Render (Python) / repo hygiene · Protocol: One-Pass, lane-by-lane review of the whole repository · Base HEAD `39977ad` (`main`, 2026-10-05 14:30Z)
 
+> **CORRECTION, recorded rather than quietly edited.** One lane of this delivery (Lane 4, the row floors) shipped a WRONG finding to PR #718 and was reverted before merge after an automated reviewer challenged it. The finding inverted on inspection: what looked like two stale thresholds is a real ~75 % universe loss on Market_Leaders, and it is now the leading explanation for the operator's complaint. The reasoning, the evidence that misled it and the correction are in Lane 4. Nothing else in this delivery depended on it.
+
 **Operator complaint this delivery answers:** "I face an issue related to the outcome and the top investment recommendation."
 
 ---
@@ -17,7 +19,7 @@ The two complaints are one failure chain, and its first link is **not in this co
 | 3 | **So the outcome evidence for that Riyadh day was never recorded.** | `daily_sync.yml:1137` gates the tracker step on `success() && matrix.group == 'global-markets'`, and the recovery job carries no tracker step. The backstop clock then ran at **21:20:52Z = 00:20 Riyadh 10-06**, and the record key is the wall-clock Riyadh date (`key = symbol|horizon|YYYYMMDD` from `date_recorded = RiyadhTime.now()`), so it recorded under **20261006**. Riyadh day 10-05 has no `--record` from either lane. |
 | 4 | **And the one audit that answers "did the pages refresh?" refused to look.** | `sync_outcome_audit` run `37381563177` died in its Resolve step: `Source Daily Sync run concluded 'failure'` - although core-pages and mutual-funds had both succeeded and uploaded logs, and the recovery job had re-written Global_Markets (6,609 rows, 21:28-22:17Z). `decision_surface_freshness` and `full_refresh_coverage` refused on the same rule. |
 | 5 | **Two recommendation-path providers silently drop symbols on every cockpit build after the first.** | Reproduced zero-network on untouched copies of HEAD. `yahoo_chart` SingleFlight awaited its future **while holding** an `asyncio.Lock`: loop 1 `['v','v','v','v']`, loop 2 `['RuntimeError','v','RuntimeError','RuntimeError']`, and the batch path served `['CCC']` of `['CCC','DDD']` **with no exception raised**. `argaam`'s semaphore: loop 1 6/6, loop 2 **1/6** with 5 rows carrying `fetch_failed`. Same class as `yahoo_fundamentals` P-203, fixed 10-05; `top10_selector` calls `asyncio.run()` per build at lines 5391/5448. |
-| 6 | **Three audits have been red on EVERY scheduled run since 10-01 for a reason that is not a defect.** | Row floors of 1025 Market_Leaders and 4496 Mutual_Funds against a measured universe of **255** and **2,474** - 4.0x and 1.8x. The real findings in those same reports (Global_Markets name coverage 97.93 %, My_Portfolio 80.00 %) were buried under the permanent red. |
+| 6 | **~~Three audits red for a non-defect~~ -> WITHDRAWN, and it inverts into a far more serious finding: Market_Leaders is carrying ~25 % of its approved universe.** | See **Lane 4**. The floors (ML 1,025 / MF 4,496) are the OWNER-APPROVED universe, the pages carry 255 and 2,474, and those audits are **correctly red**. |
 | 7 | **Register item 7 still open: the two armed decision gates were invisible on `/health`.** | `main.py:1953-1967`: neither tuple named `TFB_T10_W52_TIMING` (the two-sided 52W entry-timing gate) nor `TFB_PF_ADD_LOSER_VETO`. A key absent from the tuple is not even reported as `unset`. |
 | 8 | **67 of 91 test files are run by no workflow**, and four of the `track_performance` harnesses could not be added to CI even in principle. | The module registered three Prometheus metrics unguarded at import, so the second `importlib` load in one pytest process died at collection with `Duplicated timeseries in CollectorRegistry`. Two of those harnesses also pinned exact strings (`== "6.41.0"`, `"PASS 18/18"`) that go red on every release that adds a case. |
 
@@ -85,11 +87,25 @@ Why it matters: on the matured 1W+2W cohort MAE(model) 3.23 pp is **worse** than
 
 Also in this build: `_metric()` wraps the three Prometheus registrations so a **second import in one process** reuses the registered collector instead of raising. That is what unblocks CI (finding 8).
 
-### Lane 4 — chronically-red audits (finding 6)
+### Lane 4 — WITHDRAWN, and what it actually means (finding 6)
 
-Row floors re-based to ~95 % of the measured universe: Market_Leaders `1025 -> 240`, Mutual_Funds `4496 -> 2350`, in both workflows and both Python fallbacks. Global_Markets (6512 vs 6609) and Commodities_FX (453 vs 453) were already correct and are untouched. 255 and 2,474 are the **complete** pages - the 10-05 export counts 255 + 6,609 + 453 + 2,474 = 9,791 rows and the cockpit status reads `ML 255/255`; the universe was re-scoped by P-163b and the floors were never re-based with it. Repo Variables `EXPECTED_MIN_ROWS_*` still override.
+**This lane originally lowered the Market_Leaders row floor from 1,025 to 240 and Mutual_Funds from 4,496 to 2,350, on the reasoning that the live pages measure 255 and 2,474 so the floors "were never re-based after P-163b re-scoped the universe". That reasoning was wrong. The change is fully reverted; the floors stay at 1,025 / 4,496.**
 
-> **OPERATOR DECISION REQUESTED.** This is the only change in this delivery that moves a **safety threshold**. The reasoning is that a floor which can never be met is the "gate that cries wolf" this repo's own `ci.yml` header warns about, and it was burying the real findings. Confirm the two numbers, or set the repo Variables to values you prefer; rollback is `1025` / `4496`.
+It was caught on PR #718 by an automated reviewer, and the repository's own documents settle it:
+
+- `docs/AUTOMATIC_REFRESH_COMPLETENESS_V1.md` sets the July 2026 defaults (ML 1,025 / GM 6,512 / CFX 453 / MF 4,496) and says, in terms: *"The row-count defaults can be raised through repository variables after an approved universe expansion. **A lower count cannot silently pass merely because the workflow wrote some rows.**"* That sentence describes precisely what the change did.
+- `daily_sync.yml:574-576` records the universe as **owner-approved**: *"owner-approved additions take Global_Markets to 6,512 symbols (ML 1,025 / CFX 453 / MF 4,496; 12,486 total)"*.
+- P-163b reduced the number of cron **slots**. It did not re-scope the universe.
+
+**Where the original reasoning went wrong, and why it matters.** The evidence used was the cockpit's `ML 255/255` status and the 9,791-row export total. Both are true and neither says what was claimed: they say the sync wrote every symbol **present on the sheet's Symbol column**. `daily_sync.yml:570-573` documents exactly this trap - the **macro symbol-loss ratchet**: *"this lets the sync REQUEST past the cap; the request list still comes from the sheet's Symbol column, so previously-lost symbols return only once pasted back to the page."* A page that has lost rows therefore reports 100 % of its own shrunken self for ever after, and `255/255` is the ratchet's signature, not proof of completeness.
+
+**So the finding inverts.** Market_Leaders is carrying **255 of 1,025** approved symbols (~25 %) and Mutual_Funds **2,474 of 4,496** (~55 %). Those two audits have been red since 10-01 because they are **right**, and lowering the floor would have converted a permanent universe loss into a green tick - defeating the one gate built to catch it.
+
+**This is now the leading candidate explanation for the operator's "top investment recommendation" complaint**, and a stronger one than anything else in this delivery: the Top-10 is selected from a candidate pool that is missing roughly three-quarters of its Market_Leaders names. No ranking, timing or provider fix can surface a name that was never a candidate.
+
+**Not fixed here, deliberately.** Restoring a universe is an operator action on the workbook (paste the missing symbols back into each page's Symbol column, or re-run `scripts/build_universes.py` and repopulate), and it is a ~12,486-symbol EODHD re-fetch that needs a quota plan. It must not be done blind from a review session. What this delivery does instead is leave the gate that detects it **armed and loud**, and record the diagnosis.
+
+**Register this as the top open item**, ahead of everything else listed in S4.
 
 ### Lane 5 — hygiene (finding 8 and the rest)
 
@@ -123,7 +139,7 @@ Row floors re-based to ~95 % of the measured universe: Market_Leaders `1025 -> 2
 ## S4 — Operator steps
 
 1. **Review the PR.** All 34 changed paths are in one branch; CI must show `📋 CI verdict: CLEAN`.
-2. **Confirm or override the two row floors** (Lane 4). This is the one safety-threshold change.
+2. **Act on the universe truncation** (S2a / Lane 4) - the top open item. Decide how to restore Market_Leaders to its approved 1,025 and Mutual_Funds to 4,496, with an EODHD quota plan for the re-fetch. No threshold was moved in the end: the floors are untouched at their approved values.
 3. **After merge, read back Render** (`main` auto-deploys): `/health` -> `entry_version 8.14.1`, `startup_warnings []`, and `pf_gates.opportunity_builder.TFB_T10_W52_TIMING` + `pf_gates.portfolio_actions.TFB_PF_ADD_LOSER_VETO` now PRESENT (register item 7 closed). On the next cockpit build (two `asyncio.run` loops in one worker life): **zero** `bound to a different event loop` and `Future exception was never retrieved` lines from `argaam` or `yahoo_chart`.
 4. **Arm P-201 when you want it** (not armed by this commit): add `TFB_S1_ZERO_BASELINE: "publish"` to the tracker env in BOTH lanes. Read-back: `_S1_Calibration!K2` populated and the scorer's `zero_mae=` token no longer `n/a`. **Sequencing matters** - flip `TFB_PERF_TARGET_UNIT_SENTRY` to `enforce` BEFORE `TFB_S1_CRITERIA_V2`, or row 2 and its new zero column are compared on the legacy fraction-scale basis.
 5. **One-off, no code**: dispatch `provider_target_coverage` once with `bootstrap=true` after a clean sync - its last-good baseline was never bootstrapped, so it has been exiting 2 on every scheduled run (`CH_BASELINE_EMPTY`).

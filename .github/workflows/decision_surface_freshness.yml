@@ -82,36 +82,35 @@ jobs:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_DECISION_SURFACE_MAX_AGE_H: '8'
       TFB_DECISION_SOURCE_MAX_AGE_H: '30'
-      # ── (2026-10-06) ROW FLOORS RE-BASED ON THE MEASURED UNIVERSE ──────────
-      # WHY: these two floors were 4.0x and 1.8x the universe the sync actually
-      # requests, so BOTH audits that read them have failed on EVERY scheduled
-      # run since 2026-10-01. Measured evidence, run 37381563218 (10-05 22:18Z,
-      # the Variable is unset so the YAML default below was in force):
-      #   [SOURCE_ROW_FLOOR] Market_Leaders rows 255 are below approved
-      #                      minimum 1025
-      #   [SOURCE_ROW_FLOOR] Mutual_Funds   rows 2474 are below approved
-      #                      minimum 4496
-      #   -> plus [T10_POOL_BELOW_FLOOR] and [FALSE_FULL_UNIVERSE_CLAIM],
-      #      verdict "Decision surfaces are not executable (exit 2)".
-      # 255 and 2,474 are the COMPLETE pages, not a shortfall: the 10-05
-      # cockpit export counts 255 + 6,609 + 453 + 2,474 = 9,791 rows and the
-      # GAS status line reads "ML 255/255". The universe was re-scoped (P-163b
-      # cut the EODHD day from six sync slots to three); these floors were
-      # never re-based with it.
-      # A floor that can never be met is worse than no floor - it is the
-      # "gate that cries wolf" this repository's own ci.yml header warns
-      # about, and it has been burying the REAL findings in the same reports
-      # (Global_Markets name coverage 97.93% and My_Portfolio 80.00%, both
-      # below their rules, which are the P-192 crypto-name gap).
-      # New values are ~95% of measured, so a genuine page collapse still
-      # trips them. Global_Markets (6512 vs 6609) and Commodities_FX (453 vs
-      # 453) were already correct and are untouched.
-      # OPERATOR OVERRIDE unchanged: repo Variables EXPECTED_MIN_ROWS_* still
-      # win over these defaults. Rollback: restore 1025 / 4496.
-      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '240' }}
+      # ── (2026-10-06) FLOORS KEPT. A 10-06 review proposed lowering these to
+      # 240 / 2350 "because the live pages measure 255 / 2,474". That was
+      # WRONG and is recorded here so nobody repeats it:
+      #   * docs/AUTOMATIC_REFRESH_COMPLETENESS_V1.md states the July 2026
+      #     defaults (ML 1,025 / GM 6,512 / CFX 453 / MF 4,496) and says in
+      #     terms: "A lower count cannot silently pass merely because the
+      #     workflow wrote some rows."
+      #   * daily_sync.yml:574-576 records the universe as OWNER-APPROVED:
+      #     "owner-approved additions take Global_Markets to 6,512 symbols
+      #     (ML 1,025 / CFX 453 / MF 4,496; 12,486 total)".
+      #   * P-163b reduced the number of cron SLOTS. It did not re-scope the
+      #     universe.
+      # So Market_Leaders carrying 255 rows is ~25% of its approved universe
+      # and Mutual_Funds 2,474 is ~55% - a REAL truncation, and these audits
+      # are correctly red. The "255/255" the cockpit reports means the sync
+      # wrote every symbol PRESENT ON THE SHEET, which is a different claim:
+      # daily_sync.yml:570-573 documents the macro symbol-loss ratchet - "the
+      # request list still comes from the sheet's Symbol column, so
+      # previously-lost symbols return only once pasted back to the page" -
+      # so a page that has lost rows reports 100% of its shrunken self for
+      # ever after. Lowering the floor would have converted that permanent
+      # loss into a green audit.
+      # The floors stay. Restoring the universe is an operator action (paste
+      # the missing symbols back into the Symbol column, or re-run
+      # scripts/build_universes.py), tracked as its own item.
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
       TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
       TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
-      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '2350' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
 
     steps:
       - name: Checkout main

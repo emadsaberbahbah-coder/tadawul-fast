@@ -82,30 +82,27 @@ on:
 
 # Never overlap two clock runs (a cold Top_10 build can take ~90s).
 #
-# (2026-10-06) THE GROUP IS NOW THE PRODUCTION WRITE LEASE, NOT A PRIVATE ONE.
-# Evidence: daily_sync.yml serialises its scheduled writes on
-# 'tadawul-production-write-<ref>' (daily_sync.yml line 75), while this clock
-# held its own group 'tfb-performance-clock'. The two never saw each other, yet
-# BOTH run scripts/track_performance.py --record --audit against the same
-# Performance_Log: the sync's tracker step runs at the END of the ~60-min
-# global-markets leg (so ~21:20-21:35Z for the 20:17 slot) and this clock's
-# measured starts land in exactly that window (21:20:52Z on 2026-10-05).
-# daily_sync.yml's own comment at lines 1131-1135 records what that costs:
-# "overlapping trackers append and rewrite Performance_Log from different
-# in-memory copies (23,799 duplicate cohorts by 08-31)", and v6.41.0 still
-# finds 27 matured/matured duplicate Keys counted twice by analyze.
-# Sharing the lease makes the two writers queue instead of interleave.
-# DELIBERATE COST, recorded: GitHub keeps only ONE pending run per group, so a
-# clock run queued behind a running sync and another pending one is dropped.
-# That is acceptable here - the sync leg records the same keys, the tracker is
-# idempotent per Riyadh day, and this workflow now has two daily slots.
-# Rollback: restore `group: tfb-performance-clock`.
+# (2026-10-06) THIS GROUP STAYS PRIVATE. A first attempt moved it to the
+# production write lease ('tadawul-production-write-<ref>') to stop this clock
+# interleaving with daily_sync's own tracker step. Review caught that this is
+# ACTIVELY DANGEROUS: with the default single queue GitHub keeps at most ONE
+# pending run per concurrency group, and a newly queued run CANCELS the
+# existing pending one. `cancel-in-progress: false` protects only the RUNNING
+# item. So with a sync running and the next sync already queued, either clock
+# slot would have evicted that pending sync - recreating the very
+# missing-sync, missing-outcome failure this file is trying to mitigate.
+# The overlap is instead prevented by the preflight step below, which SKIPS
+# the clock run when a production write is in flight. A skip costs nothing
+# (the tracker is idempotent per Riyadh day and this workflow now has two
+# slots) and, unlike a shared lease, it can never cancel anything.
 concurrency:
-  group: tadawul-production-write-${{ github.ref }}
+  group: tfb-performance-clock
   cancel-in-progress: false
 
 permissions:
   contents: read
+  # (2026-10-06) the preflight overlap check reads the Actions API.
+  actions: read
 
 defaults:
   run:
@@ -159,8 +156,52 @@ jobs:
             exit 1
           fi
 
+      - name: 🚦 Skip if a production write is in flight
+        id: overlap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # (2026-10-06) WHY THIS EXISTS. This clock and daily_sync's own
+          # "📈 Track Performance" step run the SAME script against the SAME
+          # Performance_Log. daily_sync.yml:1131-1135 records what an overlap
+          # already cost once: "overlapping trackers append and rewrite
+          # Performance_Log from different in-memory copies (23,799 duplicate
+          # cohorts by 08-31)", and track_performance v6.41.0 still finds 27
+          # matured/matured duplicate Keys counted twice by analyze. The two
+          # workflows hold different concurrency groups by design (sharing one
+          # would let a queued clock run cancel a PENDING sync), so the
+          # overlap is prevented here instead: if a Daily Sync is queued or
+          # running, this run exits 0 WITHOUT recording.
+          # Safe to skip: the tracker is idempotent per Riyadh day
+          # (PerformanceRecord.key is symbol|horizon|YYYYMMDD), the sync's own
+          # leg records the same keys, and this workflow has a second slot.
+          # Fail-OPEN: any API problem proceeds with the run and warns. A
+          # missing day is worse than a rare overlap, and the overlap is the
+          # condition this step merely makes less likely, not a correctness
+          # guarantee.
+          RUNNING="$(curl -sS --max-time 25 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?per_page=20" \
+            | jq -r '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length' 2>/dev/null || echo "ERR")"
+
+          if [[ "$RUNNING" == "ERR" || -z "${RUNNING:-}" || ! "$RUNNING" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Could not read Daily Sync state; proceeding (fail-open)."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$RUNNING" -gt 0 ]]; then
+            echo "::notice::${RUNNING} Daily Sync run(s) queued or in progress - skipping this Performance Clock run to avoid two writers on Performance_Log. The sync's own tracker step records the same keys; the next clock slot will cover it if it does not."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "✅ No Daily Sync in flight."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: 🔎 Resolve configuration
         id: cfg
+        if: steps.overlap.outputs.skip != 'true'
         env:
           INPUT_URL: ${{ github.event.inputs.backend_url }}
           INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
@@ -185,6 +226,7 @@ jobs:
           echo "✅ Sheet:   $SHEET"
 
       - name: 💓 Backend readiness (best-effort)
+        if: steps.overlap.outputs.skip != 'true'
         run: |
           set -euo pipefail
           for ep in /readyz /health /livez; do
@@ -195,6 +237,7 @@ jobs:
 
       - name: 📈 Run performance clock
         id: run_clock
+        if: steps.overlap.outputs.skip != 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
