@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.11.0  (header synced to runtime; history below)
+Version: 1.15.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -344,6 +344,7 @@ import math
 import json
 import os
 import time
+from core.analysis.hard_eligibility import resolve_hard_eligibility
 from datetime import datetime, timedelta, timezone
 import logging
 logger = logging.getLogger("core.analysis.portfolio_actions")
@@ -816,7 +817,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.14.0"
+PORTFOLIO_ACTIONS_VERSION = "1.15.0"
 # v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
 # HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
 # WHY: every RULE in this file already stands down for a SUKUK-class
@@ -1225,8 +1226,16 @@ def _confirm_redis():
         return None
 
 
+class _ConfirmationStateError(ValueError):
+    """A corrupt modern clock cannot be interpreted as a missing record."""
+
+
 def _confirm_redis_get(sym):
-    """-> {"count": int, "date": "YYYY-MM-DD"} | None. Never raises."""
+    """Read persisted state; corrupt session records reach the fail-closed gate.
+
+    Legacy UTC records retain their old decode/migration contract. Session
+    counts must be validated in JSON form before integer coercion loses type.
+    """
     global _CONFIRM_REDIS_DEAD
     cli = _confirm_redis()
     if cli is None:
@@ -1236,11 +1245,25 @@ def _confirm_redis_get(sym):
         if not raw:
             return None
         obj = json.loads(raw)
+        if obj.get("clock_basis") == "session":
+            if (type(obj.get("count")) is not int or obj["count"] < 1
+                    or type(obj.get("schema_version")) is not int
+                    or obj["schema_version"] != 1):
+                raise _ConfirmationStateError(
+                    "invalid persisted completed-session confirmation count/schema")
         cnt = int(obj.get("count") or 0)
         dte = str(obj.get("date") or "")
         if cnt > 0 and len(dte) == 10:
-            return {"count": cnt, "date": dte}
+            state = {"count": cnt, "date": dte}
+            for field in ("schema_version", "clock_basis", "exchange"):
+                if field in obj:
+                    state[field] = obj[field]
+            return state
         return None
+    except _ConfirmationStateError:
+        # Retain both stored evidence and the in-memory clock. Do not latch
+        # Redis as unavailable: other symbols' valid records remain usable.
+        raise
     except Exception as exc:
         _CONFIRM_REDIS_DEAD = True
         try:
@@ -1621,12 +1644,13 @@ def _run_switch_scan(cands, ctl):
         held = {str((c or {}).get("symbol")): c for c in cands}
         for prop in scan.get("proposals") or []:
             key = "swc:%s>%s" % (prop.get("sell"), prop.get("buy"))
-            st = _confirm_redis_get(key) or {}
+            st = _switch_redis_get(key) or {}
             try:
-                seen = int(st.get("n") or 0) + 1
+                seen = int(st.get("count") or 0) + 1
             except Exception:
                 seen = 1
-            _confirm_redis_put(key, {"n": seen, "ts": int(time.time())})
+            _switch_redis_put(key, {"schema_version": 1, "count_unit": "scans",
+                                    "count": seen, "ts": int(time.time())})
             prop["persist_day"] = seen
             tag = ("SWITCH-CANDIDATE" if seen >= 2
                    else "SWITCH-WATCH (day 1/2)")
@@ -1648,6 +1672,35 @@ def _run_switch_scan(cands, ctl):
     except Exception as exc:
         out["status"] = "error:%s" % type(exc).__name__
     return out
+
+
+_SWITCH_REDIS_PREFIX = "tfb:pf:switch_scan:v1:"
+
+
+def _switch_redis_get(key):
+    """Switch scan counts round-trip their own versioned durable schema."""
+    client = _confirm_redis()
+    if client is None:
+        raise RuntimeError("switch persistence unavailable")
+    raw = client.get(_SWITCH_REDIS_PREFIX + key)
+    if not raw:
+        return None
+    state = json.loads(raw)
+    if (type(state.get("schema_version")) is not int
+            or state["schema_version"] != 1 or state.get("count_unit") != "scans"
+            or isinstance(state.get("count"), bool)
+            or not isinstance(state.get("count"), int) or state["count"] < 1
+            or not isinstance(state.get("ts"), (int, float))):
+        raise ValueError("invalid switch persistence schema")
+    return state
+
+
+def _switch_redis_put(key, state):
+    client = _confirm_redis()
+    if client is None:
+        raise RuntimeError("switch persistence unavailable")
+    client.set(_SWITCH_REDIS_PREFIX + key, json.dumps(state),
+               ex=(_ADD_CONFIRM_PRUNE_DAYS + 1) * 86400)
 
 
 SUKUK_BUCKET = "Sukuk (fixed income)"
@@ -1926,6 +1979,36 @@ def normalize_holding(row, fx_rates, controls):
     """opportunity_builder.normalize_candidate + position economics."""
     crit = _ob.make_criteria({"period_months": controls["period_months"]})
     cand = _ob.normalize_candidate(row, fx_rates, crit)
+    # Existing units carry their own risk state. Today's generated entry
+    # ladder remains separate and cannot relax a stop when the quote falls.
+    cand["entry_stop"] = cand.get("stop")
+    cand["entry_stop_pct"] = cand.get("stop_pct")
+    cand["entry_rr"] = cand.get("rr")
+    held_stops = []
+    for key, value in (row or {}).items():
+        token = _ob._norm_token(key)
+        if token in {"stop", "activestop", "trailingstop", "stoploss", "stopprice"}:
+            held_stops.append(_pos_float(value))
+        elif token in {"stopsar", "activestopsar", "trailingstopsar"}:
+            number, rate = _pos_float(value), _pos_float(cand.get("fx_to_sar"))
+            held_stops.append(number / rate if number and rate else None)
+    valid_stops = [value for value in held_stops if value is not None]
+    coherent = (valid_stops and len(valid_stops) == len(held_stops)
+                and max(valid_stops) - min(valid_stops) <= 1e-8)
+    cand["stop"] = valid_stops[0] if coherent else None
+    cand["held_risk_state"] = "recorded" if coherent else (
+        "invalid_or_conflicting" if held_stops else "missing")
+    held_price, held_stop = _pos_float(cand.get("price")), cand["stop"]
+    cand["stop_pct"] = ((held_price - held_stop) / held_price * 100.0
+                        if held_price and held_stop else None)
+    distance = cand["stop_pct"]
+    reward = cand.get("roi_pct")
+    cand["rr"] = (reward / distance
+                  if reward is not None and distance is not None and distance > 0
+                  else None)
+    if _is_sukuk_holding(cand):
+        cand["held_risk_state"] = "not_applicable"
+        cand["stop_pct"] = cand["rr"] = None
     qty, avg_cost, avg_cost_raw = _position_fields(row)
     cand["quantity"] = qty
     cand["avg_cost"] = avg_cost
@@ -2296,8 +2379,8 @@ def _confirm_clock(sym, now_utc=None):
     """v1.13.0 [P-168b]: (today_key, yesterday_key, basis). off/observe ->
     the legacy UTC-date pair (v1.12.2 verbatim; the legacy helper's own
     exceptions propagate exactly as before). enforce -> the venue's last
-    completed session and the session before it; a calendar fault falls
-    back to the legacy pair for that call (one WARNING)."""
+    completed session and the session before it; a calendar fault propagates
+    to the outer fail-closed confirmation guard."""
     if _env_confirm_session_mode() != "enforce":
         return (_add_confirm_today(),
                 (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
@@ -2309,15 +2392,13 @@ def _confirm_clock(sym, now_utc=None):
     except Exception as exc:
         try:
             logger.warning("[CONFIRM-SESSION v%s] %s: calendar fault %s: %s "
-                           "- legacy UTC day key used this call",
+                           "- completed-session identity unavailable",
                            PORTFOLIO_ACTIONS_VERSION,
                            str(sym or "").strip().upper(),
                            exc.__class__.__name__, exc)
         except Exception:
             pass
-        return (_add_confirm_today(),
-                (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
-                "utc")
+        raise
 
 
 def _confirm_session_shadow_count(sym, venue, now_utc=None):
@@ -2403,7 +2484,8 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
     applied. Non-ADD outcomes reset the symbol's clock. Never raises.
     v1.12.2 [P-165]: an exception on an ADD verdict fails CLOSED (HOLD,
     capped_from=ADD, clock untouched) unless the legacy kill-switch is set."""
-    _fc = _add_confirm_failclosed_enabled()   # v1.12.2 [P-165]
+    _fc = (_add_confirm_failclosed_enabled()
+           or _env_confirm_session_mode() == "enforce")
     try:
         days = int(controls.get("add_confirm_days") or 0)
     except (TypeError, ValueError):
@@ -2432,11 +2514,27 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
             # v1.6.0 read-through: a deploy wiped process memory — the
             # durable copy carries yesterday's chain across the restart.
             st = _confirm_redis_get(sym)
+        if (_clock_basis == "session" and st is not None
+                and st.get("clock_basis") == "session"
+                and (type(st.get("schema_version")) is not int
+                     or st["schema_version"] != 1)):
+            raise _ConfirmationStateError("invalid completed-session confirmation schema")
+        if _clock_basis == "session" and st is not None and (
+                type(st.get("schema_version")) is not int
+                or st["schema_version"] != 1 or st.get("clock_basis") != "session"
+                or st.get("exchange") != _confirm_venue(sym)):
+            # Legacy UTC records are evidence of a different clock, not a
+            # completed-session count. Migration restarts at one session.
+            st = None
+        if _clock_basis == "session" and st is not None and (
+                isinstance(st.get("count"), bool)
+                or not isinstance(st.get("count"), int) or st["count"] < 1):
+            raise ValueError("invalid completed-session confirmation count")
         if st is None:
             count = 1
         elif st.get("date") == today:
             count = int(st.get("count") or 1)      # same-day rerun: frozen
-        elif _persist:
+        elif _persist or _clock_basis == "session":
             # v1.6.0 STRICT CONSECUTIVENESS: persistence makes multi-day
             # gaps real; the contract says CONSECUTIVE days, so only a
             # yesterday-dated chain advances — anything older restarts.
@@ -2447,9 +2545,12 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
                 count = 1
         else:
             count = int(st.get("count") or 0) + 1  # new day: advance
-        _ADD_CONFIRM_STORE[sym] = {"count": count, "date": today}
+        state = {"count": count, "date": today}
+        if _clock_basis == "session":
+            state.update(schema_version=1, clock_basis="session", exchange=_confirm_venue(sym))
+        _ADD_CONFIRM_STORE[sym] = state
         if _persist:
-            _confirm_redis_put(sym, {"count": count, "date": today})
+            _confirm_redis_put(sym, state)
         # Hygiene: prune stale entries, then cap oldest-first.
         if len(_ADD_CONFIRM_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
             cutoff = (datetime.now(timezone.utc)
@@ -2734,6 +2835,18 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
               _f1_roi_ok and
               cand.get("conflict") is not True)
     if add_ok:
+        hard = cand.get("hard_eligibility") or ()
+        if hard:
+            return (ACTION_HOLD, "Hard eligibility blocks ADD: " + "; ".join(hard),
+                    0.0, ACTION_ADD)
+        if not _is_sukuk_holding(cand):
+            stop = _pos_float(cand.get("stop"))
+            if stop is None:
+                return (ACTION_HOLD, "Held risk state unavailable or conflicting — ADD withheld",
+                        0.0, ACTION_ADD)
+            if cand["price"] <= stop:
+                return (ACTION_HOLD, "Held risk stop breached (%.2f <= %.2f) — ADD withheld"
+                        % (cand["price"], stop), 0.0, ACTION_ADD)
         # 5a. PRECEDENCE (v1.7.0) — the engine's verdict outranks the
         #     allocator's arithmetic. Placed before headroom/confidence so
         #     the reason names the binding fact (1321.SR lesson).
@@ -2838,7 +2951,9 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
     for e in entries:
         if e["action"] in (ACTION_TRIM, ACTION_EXIT):
             proceeds += e["proceeds_sar"] or 0.0
-    include_proceeds = controls["rebalance_mode"] != REBALANCE_NEW_CASH
+    # TRIM/EXIT rows are proposed advice, never verified executed/settled
+    # cash. Conditional rotation plans must not fund an immediate ADD.
+    include_proceeds = False
     cash_floor = (controls["target_cash_pct"] / 100.0) * (
         total_value_sar or 0.0)
     # v1.8.0 F5 (policy change, documented): proceeds first restore the
@@ -3358,6 +3473,13 @@ def _action_row(entry, review_date, controls):
         "dq": _round(cand.get("dq"), 1),
         "advisor_note": note,
         "detail": {
+            "held_risk_state": cand.get("held_risk_state"),
+            "entry_stop_sar": (None if _is_sukuk_holding(cand) else
+                               _level_sar(cand.get("entry_stop"), fx)),
+            "entry_stop_pct": (None if _is_sukuk_holding(cand) else
+                               _round(cand.get("entry_stop_pct"), 1)),
+            "entry_rr": (None if _is_sukuk_holding(cand) else
+                         _round(cand.get("entry_rr"))),
             "valuation_basis": cand.get("valuation_basis"),
             "target_price": _round(cand.get("target_price")),
             "intrinsic_value": _round(cand.get("intrinsic_value")),
@@ -3748,9 +3870,17 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                and "confirm-failclosed" not in _rl(e)   # v1.12.2 [P-165]
                and "precedence" not in _rl(e)
                and "engine state" not in _rl(e)
+               and "held risk" not in _rl(e)
+               and "hard eligibility" not in _rl(e)
                and "synthetic" not in _rl(e)
                and "add vetoed [p-183]" not in _rl(e)),  # v1.14.0 [P-183]
            "Improve data reliability; actions were capped to HOLD")
+    _alert("held_risk_state_withheld",
+           sum(1 for e in entries if "held risk" in _rl(e)),
+           "Verify the holding's recorded active stop and risk state before adding exposure")
+    _alert("hard_eligibility_withheld",
+           sum(1 for e in entries if "hard eligibility" in _rl(e)),
+           "Resolve current-row hard safety restrictions before adding exposure")
     _alert("portfolio_value_incomplete", 1 if _pv_incomplete else 0,  # F3
            "A held position has no resolvable market value — weights, "
            "cap trims and ADD funding suppressed this run")
@@ -3799,6 +3929,9 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                     and pnl_total is not None) else None, 1),
             "deployable_sar": _round(deployable, 0),
             "proceeds_pending_sar": _round(proceeds_inc, 0),
+            "proposed_sale_proceeds_sar": _round(sum(
+                e.get("proceeds_sar") or 0.0 for e in entries
+                if e["action"] in (ACTION_TRIM, ACTION_EXIT)), 0),
             "adds_funded_sar": _round(adds_funded, 0),
             "capital_unallocated_sar": _round(unalloc, 0),
             "positions": len(cands),

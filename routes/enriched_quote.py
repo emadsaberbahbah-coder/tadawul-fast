@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/enriched_quote.py
 """
+v8.5.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.4.0
+TFB Enriched Quote Routes Wrapper — v8.5.1
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
@@ -112,6 +115,8 @@ WHY v8.3.0 (preserved below)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import importlib
 import inspect
@@ -130,7 +135,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.5.0"
+ROUTER_VERSION = "8.5.1"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -998,7 +1003,7 @@ class _Service:
             auth_token = _strip(token_query)
 
         headers = dict(request.headers)
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        path = request_path(request)
         attempts = [
             {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request, "settings": settings},
             {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request},

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""main.py v8.14.1 [/health truth] dual-tree harness.
+"""main.py v8.14.2 [/health truth] dual-tree harness.
 
 Loads the REAL delivered main.py (app created, 6 route modules mounted, no
 server) and — when MAIN_BASE points at the v8.13.2 file — the REAL base in a
@@ -78,7 +78,7 @@ def main():
     fix = importlib.util.module_from_spec(sp)
     sys.modules["main_fix"] = fix
     sp.loader.exec_module(fix)
-    T("H1 entry version", fix.APP_ENTRY_VERSION == "8.14.1" and fix.SERVICE_VERSION == "8.14.1")
+    T("H1 entry version", fix.APP_ENTRY_VERSION == "8.14.2" and fix.SERVICE_VERSION == "8.14.2")
 
     # H2 dual-tree payload comparison
     fx = run_payload(DELIVERED)
@@ -92,7 +92,7 @@ def main():
         T("H2 shared keys equal (timestamp/version masked)", not diff, json.dumps(diff)[:300])
         extra = sorted(set(fx) - set(bs))
         T("H2 exactly two additive keys", extra == ["deploy", "pf_gates"], extra)
-        T("H2 app_version follows entry (config default)", fx.get("app_version") in ("8.14.1", bs.get("app_version")), fx.get("app_version"))
+        T("H2 app_version follows entry (config default)", fx.get("app_version") in ("8.14.2", bs.get("app_version")), fx.get("app_version"))
     else:
         out.append("SKIP H2 base legs (MAIN_BASE not found)")
 
@@ -165,7 +165,7 @@ def main():
             t = ast.parse(open(path, encoding="utf-8").read())
             return sorted(n.name for n in ast.walk(t) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
         fb, ff = fns(BASE), fns(DELIVERED)
-        T("H8 AST zero removal", not (set(fb) - set(ff)) and sorted(set(ff) - set(fb)) == ["_deploy_provenance", "_env_or_unset", "_module_version_no_import", "_pf_gates_snapshot"], (len(fb), len(ff), sorted(set(ff) - set(fb))))
+        T("H8 AST zero removal", not (set(fb) - set(ff)) and sorted(set(ff) - set(fb)) == ["RequestAuthorityValidationMiddleware", "_deploy_provenance", "_env_or_unset", "_module_version_no_import", "_pf_gates_snapshot"], (len(fb), len(ff), sorted(set(ff) - set(fb))))
 
     digest = hashlib.sha256("\n".join(out).encode()).hexdigest()[:12]
     print("\n".join(out))

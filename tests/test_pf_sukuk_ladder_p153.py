@@ -156,13 +156,13 @@ def _row(symbol, name, qty, avg, price, ccy="USD", stop=None, tp1=None, tp2=None
 
 HAND = [
     _row("YUM", "Yum! Brands, Inc.", 24, 144.71, 137.73, stop=119.85, tp1=155.4, tp2=173.1, sector="Consumer Discretionary"),
-    _row("NOLAD.US", "No Ladder Corp", 10, 20.0, 21.0, roi=-3.0),          # target below price -> stop, no TP: B-7 line
+    _row("NOLAD.US", "No Ladder Corp", 10, 20.0, 21.0, roi=-3.0, stop=18.0),  # recorded held stop; no new TP
     _row("5023.SR", "", 100, 100.0, 100.25, ccy="SAR", stop=92.23, tp1=102.7, tp2=105.16, rel=26.2, dq=70.6, roi=4.9, sector="Unknown"),
 ]
 
 
 def run_all():
-    T("S0 delivered version", pa.PORTFOLIO_ACTIONS_VERSION == "1.14.0", pa.PORTFOLIO_ACTIONS_VERSION)
+    T("S0 delivered version", pa.PORTFOLIO_ACTIONS_VERSION == "1.15.0", pa.PORTFOLIO_ACTIONS_VERSION)
     base = None
     if BASE and os.path.exists(BASE):
         spec = importlib.util.spec_from_file_location("pa_base_v1130", BASE)

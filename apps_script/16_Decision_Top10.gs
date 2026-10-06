@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.11.13 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.12.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
@@ -1552,7 +1552,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.11.13';
+var DT10_VERSION = '1.12.0';
 /* v1.11.1 (2026-09-03) — MORNING TRIGGER TARGET RESTORED + OUTPUT TRUTH
  *  (1) tfbMorningCockpitRefresh(): the 08:07 time-driven trigger pointed at
  *      a function this file no longer defined ("Script function not found",
@@ -1771,7 +1771,7 @@ var DT10_PANEL = [
   { label: 'T10: Allow Conflict', def: 'No', kind: 'yesno' },
   { label: 'T10: Allow Negative News', def: 'No', kind: 'yesno' },
   { label: 'T10: Allow Negative Sector', def: 'No', kind: 'yesno' },
-  { label: 'T10: Max Per Sector', def: 3, kind: 'int' },   // v1.11.12: 2 -> 3 (2026-09-10 decision)
+  { label: 'T10: Max Per Sector', def: 2, kind: 'int' },   // matches current approved/live policy
   { label: 'T10: Max Per Market', def: 10, kind: 'int' },  // v1.2.6: 4 -> 10
   { label: 'T10: Include Portfolio Holdings', def: 'No', kind: 'yesno' },
   { label: 'T10: Base Currency', def: 'SAR', kind: 'text' },
@@ -1841,6 +1841,8 @@ var DT10_POOL_FIELDS = [
     match: ['recommendationdetail', 'recommendationdetailed'] },
   { send: 'Investability Status',
     match: ['investabilitystatus', 'investability'] },
+  { send: 'Final Action', match: ['finalaction'] },
+  { send: 'Source Snapshot ID', match: ['sourcesnapshotid', 'snapshotid'] },
   { send: 'Block Reason', match: ['blockreason', 'blockreasons'] },
   // v1.8.10 [TRUST-001 witness]: the source engine's own trust verdict
   // (low_data_trust / rank_skipped_low_trust) lives in Warnings; without
@@ -1960,6 +1962,16 @@ function dt10MapHeaderCols_(headerRow) {
     if (t && byToken[t] === undefined) byToken[t] = c;
   }
   var map = {};
+  // Safety columns must survive duplicate aliases before generic first-value
+  // projection discards them. This is current-row evidence, not prior opinion.
+  map._hardSafetyCols = [];
+  for (var sc = 0; sc < headerRow.length; sc++) {
+    var st = dt10NormToken_(headerRow[sc]);
+    if (st === 'finalaction' || st === 'investabilitystatus' ||
+        st === 'investability' || st === 'investabilitygate' || st === 'gatestatus') {
+      map._hardSafetyCols.push({col: sc, action: st === 'finalaction'});
+    }
+  }
   var fields = dt10PoolFieldsActive_();   // v1.11.12 [P-181b]
   for (var i = 0; i < fields.length; i++) {
     var spec = fields[i];
@@ -2007,6 +2019,16 @@ function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
     if (col === null || col === undefined) continue;
     var v = row[col];
     if (dt10HasValue_(v)) out[send] = v;
+  }
+  var safety = colMap._hardSafetyCols || [];
+  for (var si = 0; si < safety.length; si++) {
+    var evidence = safety[si];
+    var token = dt10NormToken_(row[evidence.col]);
+    if (evidence.action && (token === 'blocked' || token === 'donotinvest')) {
+      out['Final Action'] = token === 'blocked' ? 'BLOCKED' : 'DO_NOT_INVEST';
+    } else if (!evidence.action && token === 'blocked') {
+      out['Investability Status'] = 'BLOCKED';
+    }
   }
   if (!dt10HasValue_(out['Exchange'])) out['Exchange'] = pageName;
   return out;

@@ -1,7 +1,19 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.3)
+# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.4)
 # ============================================================================
-# WHY this revision (2026-06-11):
+# WHY this revision (2026-10-06):
+# - Apply audited security fixes as one compatible set: FastAPI / Starlette,
+#   AnyIO, multipart, settings, HTTP/2, aiohttp, crypto, protobuf, dotenv,
+#   JWT and XML. FastAPI 0.135.0 supports patched Starlette 1.3.1
+#   without requiring an upgrade of the OpenTelemetry 1.28 family.
+# - Retain numpy 1.26.4, pandas 2.3.3, yfinance 0.2.66 and httpx 0.27.2.
+# - protobuf 5.29.6 fixes the 5.x advisories while preserving grpcio-status
+#   1.64.3 and OpenTelemetry compatibility. Crypto / pyOpenSSL move together.
+# - Remove unused NLTK: the app only reports its optional availability;
+#   regex sentiment and optional Transformers analysis do not depend on it.
+#   This also removes the unfixed GHSA-8mgp-746c-j5xp from runtime installs.
+#
+# Carried from v1.1.3 (2026-06-11):
 # - FIX: Render builds failed with "No matching distribution found for
 #   httpcore==1.0.9" -- pypi.org/simple/httpcore/ (the INDEX page only)
 #   timed out on 10 consecutive retries from Render's CDN edge, while
@@ -11,11 +23,6 @@
 #   Same version (1.0.9), same artifact, deterministic.
 #   REVERT PATH: once the CDN edge recovers, this line may be restored to
 #   "httpcore==1.0.9" -- both forms are stable; the URL pin is safe to keep.
-# - No other version changes: every pin below is carried forward verbatim
-#   from v1.1.2 (zero-regression rule).
-#
-# Carried from v1.1.2:
-# - protobuf 5.26.1 kept for grpcio-status 1.64.3 compatibility
 # - OpenTelemetry family at 1.28.0 / 0.49b0 (protobuf 5.x support)
 #
 # Conventions:
@@ -26,19 +33,19 @@
 # ----------------------------------------------------------------------------
 # Web framework (FastAPI core)
 # ----------------------------------------------------------------------------
-fastapi==0.115.14
-starlette==0.41.3
+fastapi==0.135.0
+starlette==1.3.1
 uvicorn[standard]==0.32.1
 gunicorn==23.0.0
-anyio==4.13.0
-python-multipart==0.0.12
+anyio==4.14.2
+python-multipart==0.0.31
 
 # ----------------------------------------------------------------------------
 # Pydantic (models + settings)
 # ----------------------------------------------------------------------------
 pydantic==2.13.2
 pydantic-core==2.46.2
-pydantic-settings==2.13.1
+pydantic-settings==2.14.2
 typing-extensions==4.15.0
 
 # ----------------------------------------------------------------------------
@@ -54,8 +61,8 @@ rapidfuzz==3.14.5
 # ----------------------------------------------------------------------------
 # Security / crypto
 # ----------------------------------------------------------------------------
-cryptography==43.0.3
-pyOpenSSL==24.3.0
+cryptography==50.0.0
+pyOpenSSL==26.4.0
 
 # ----------------------------------------------------------------------------
 # HTTP clients
@@ -64,9 +71,9 @@ httpx==0.27.2
 # v1.1.3: direct wheel URL == httpcore 1.0.9 (see header). Satisfies
 # httpx 0.27.2's requirement httpcore>=1.0.0,<2.0.0.
 httpcore @ https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
-h2==4.3.0
+h2==4.4.1
 requests==2.33.1
-aiohttp==3.13.5
+aiohttp==3.14.3
 websockets==13.1
 
 # ----------------------------------------------------------------------------
@@ -86,7 +93,7 @@ py-googletrans==4.0.0
 # ----------------------------------------------------------------------------
 # gRPC / protobuf
 # ----------------------------------------------------------------------------
-protobuf==5.26.1
+protobuf==5.29.6
 grpcio==1.64.3
 grpcio-status==1.64.3
 googleapis-common-protos==1.64.0
@@ -124,7 +131,7 @@ opentelemetry-exporter-otlp==1.28.0
 # ----------------------------------------------------------------------------
 # Config / env file loading
 # ----------------------------------------------------------------------------
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 pyyaml==6.0.3
 
 # ============================================================================
@@ -137,7 +144,7 @@ slowapi==0.1.9
 limits==3.14.1
 
 # --- Auth / passwords --------------------------------------------------------
-PyJWT==2.12.1
+PyJWT==2.15.0
 passlib==1.7.4
 bcrypt==4.3.0
 
@@ -158,9 +165,8 @@ sentry-sdk==2.58.0
 
 # --- Scraping / feeds / NLP (news intelligence) ------------------------------
 beautifulsoup4==4.14.3
-lxml==5.4.0
+lxml==6.1.0
 feedparser==6.0.12
-nltk==3.9.4
 
 # --- Async file / cache IO ---------------------------------------------------
 aiofiles==24.1.0

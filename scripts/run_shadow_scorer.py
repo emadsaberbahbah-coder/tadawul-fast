@@ -1,6 +1,11 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.3 (2026-10-06): absent/unreadable CA or PIT evidence is unknown,
+so criterion 5 remains PENDING. Known breaches remain FAIL in every v2 mode.
+This checks recorded actions and append-only integrity; it does not certify
+external ledger coverage, data-source freshness or complete PIT archives.
+
 VERSION 1.7.3  (2026-09-08)  — FRESHNESS READ-BACK: NAME THE STARVERS (P-109)
 WHY v1.7.3: S-1 sits at 3/28 scored days with 33 excluded-infra; every
 trading day since 2026-09-02 ended `excluded_reason=fresh-floor` while the
@@ -447,7 +452,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.2"
+SCRIPT_VERSION = "1.9.3"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -933,16 +938,29 @@ def count_compliance_violations(board_rows: Sequence[Sequence[Any]]) -> List[str
     return out
 
 
-def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
+def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[Optional[bool], str]:
     """Criterion 5b: dates strictly increasing per basket, no duplicates."""
+    if not history:
+        return None, "append-only history unavailable (UNKNOWN)"
     seen: Dict[str, List[str]] = {}
+    unknown_note = ""
     for h in history or []:
-        seen.setdefault(h.get("basket", ""), []).append(str(h.get("date", "")))
+        if not h.get("basket") or not h.get("date"):
+            unknown_note = "append-only history identity/date unavailable (UNKNOWN)"
+            continue
+        try:
+            parsed_day = date.fromisoformat(str(h["date"]))
+        except (ValueError, TypeError):
+            unknown_note = "append-only history date unavailable (UNKNOWN)"
+            continue
+        seen.setdefault(h.get("basket", ""), []).append(parsed_day.isoformat())
     for basket, dates in seen.items():
         if len(dates) != len(set(dates)):
             return False, f"duplicate dates in {basket}"
         if dates != sorted(dates):
             return False, f"non-monotonic dates in {basket}"
+    if unknown_note:
+        return None, unknown_note
     return True, "append-only integrity intact"
 
 
@@ -1132,6 +1150,9 @@ def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
             e_txt, e_status = "_Corporate_Actions has 0 rows (vacuous)", "NOT_EVALUABLE"
         else:
             e_txt, e_status = f"_Corporate_Actions rows={ca_rows}", c5["status"]
+        # Missing evidence cannot erase a known CA or date-integrity breach.
+        if c5["status"] == "FAIL":
+            e_status = "FAIL"
         if mode == "observe":
             c5["detail"] += f" | v2: {e_txt} -> would {e_status}"
         else:
@@ -1168,7 +1189,7 @@ def criteria_v2_line(gate: Dict[str, Any]) -> str:
 
 def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
-                calibration_state: str, ca_clean: bool, pit_ok: bool,
+                calibration_state: str, ca_clean: Optional[bool], pit_ok: Optional[bool],
                 pit_note: str, drill_date: Optional[str],
                 excluded_days: int = 0,
                 calibration_detail: str = "") -> Dict[str, Any]:
@@ -1201,9 +1222,16 @@ def evaluate_s1(days: int, violations: List[str],
               "detail": calibration_detail or (
                   "7D/14D horizons land in Wave B (track_performance)"
                   if calibration_state == "PENDING" else "in band")})
+    evidence_status = (
+        "FAIL" if ca_clean is False or pit_ok is False
+        else "PASS" if ca_clean is True and pit_ok is True
+        else "PENDING"
+    )
+    ca_detail = "clean" if ca_clean is True else (
+        "UNREPAIRED" if ca_clean is False else "UNKNOWN (evidence unavailable)")
     c.append({"id": 5, "name": "corporate-actions + point-in-time",
-              "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
-              "detail": f"CA {'clean' if ca_clean else 'UNREPAIRED'}; {pit_note}"})
+              "status": evidence_status,
+              "detail": f"CA {ca_detail}; {pit_note}"})
     c.append({"id": 6, "name": "rollback drill passed",
               "status": "PASS" if drill_date else "PENDING",
               "detail": drill_date or "not yet run (operator, monthly)"})
@@ -1753,21 +1781,53 @@ def find_drill_marker(sh, since: date) -> Optional[str]:
     return f"{newest.isoformat()} ({marker})" if newest else None
 
 
-def ca_is_clean(sh) -> bool:
-    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log."""
+def ca_is_clean(sh) -> Optional[bool]:
+    """No recorded confirmed action needs repair; None means unproven.
+
+    Empty, unreadable or malformed evidence cannot certify this check. A
+    populated, parsed register and readable records only establish repair
+    status for the recorded actions, not completeness of external coverage.
+    """
     try:
         from core import corporate_actions as ca
         rp_path = os.path.join(_ROOT, "scripts", "repair_corporate_actions.py")
         spec = importlib.util.spec_from_file_location("tfb_ca_repair", rp_path)
         rp = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rp)  # type: ignore[union-attr]
-        acts = ca.parse_actions(sh.worksheet(ca.TAB_ACTIONS).get_all_values())
+        values = sh.worksheet(ca.TAB_ACTIONS).get_all_values()
+        if not values or [str(cell).strip() for cell in values[0][:7]] != ca.ACTIONS_HEADER[:7]:
+            return None
+        data = [row for row in values[1:] if any(str(cell).strip() for cell in row)]
+        acts = ca.parse_actions([values[0], *data])
+        if not acts or len(acts) != len(data):
+            return None
         idx = ca.build_adjustment_index(acts, confirmed_only=True)
-        plan, _hdr, _cols = rp.plan_repairs(
-            sh.worksheet("Performance_Log").get_all_values(), idx)
+        records = sh.worksheet("Performance_Log").get_all_values()
+        plan, header, columns = rp.plan_repairs(records, idx)
+        required = ("Record ID", "Symbol", "Date Recorded (Riyadh)", "Entry Price", "Target Price", "Notes")
+        if header is None or any(columns.get(name) is None for name in required):
+            return None
+        # A known outstanding repair takes precedence over unrelated unknown
+        # records. Missing evidence can prevent PASS, never erase a breach.
+        if plan:
+            return False
+        data_records = [row for row in records[header + 1:] if any(str(cell).strip() for cell in row)]
+        if not data_records:
+            return None
+        for row in data_records:
+            def value(name):
+                index = columns[name]
+                return row[index] if index < len(row) else None
+            if (not str(value("Record ID") or "").strip()
+                    or not str(value("Symbol") or "").strip()
+                    or ca._as_date(value("Date Recorded (Riyadh)")) is None
+                    or (ca._as_float(value("Entry Price")) or 0) <= 0):
+                return None
+        if any(not action.confirmed for action in acts):
+            return None
         return len(plan) == 0
     except Exception:  # noqa: BLE001
-        return True          # absence of ledger is not a violation
+        return None          # absence or read failure is not clean evidence
 
 
 # --------------------------------------------------------------------------- #

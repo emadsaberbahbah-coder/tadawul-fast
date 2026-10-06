@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.23.2  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
@@ -593,6 +593,8 @@ import math
 import os
 import re
 import time
+from core.analysis.hard_eligibility import resolve_hard_eligibility
+from core.symbols.normalize import FIAT_CODES
 from datetime import datetime, timedelta, timezone
 
 # =============================================================================
@@ -1287,6 +1289,18 @@ from datetime import datetime, timedelta, timezone
 # Removed: 0. No new ENV besides the kill switch. Rollback: env or revert.
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
+# v1.23.3 (2026-10-06) - [NORMALIZED CRITERIA TRACE PROVENANCE]
+# make_criteria() keeps the retired BLOCKED-gate switch's explicit env/request
+# trace intent as private mapping metadata. Direct evaluate_gates() calls and
+# builds given already-normalized criteria therefore retain the v1.23.2 PASS-
+# trace contract without mistaking the public, always-true invariant snapshot
+# for an opt-in. The pre-clamp quality order now also demotes exact BLOCKED
+# rows, using the same conflict-safe raw-alias resolver as normalization, so a
+# hard-state row cannot consume a capped scan slot ahead of a safe row. Full
+# uncapped audits and WATCHLIST policy are unchanged. Class added: 1; functions
+# removed: 0; no new environment switch.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # v1.23.2 (2026-10-06) - [BLOCKED ALIAS DOMINANCE + TRACE COMPATIBILITY]
 # The v1.23.1 invariant consumed the single investability value chosen by the
 # generic alias resolver. A row carrying both investability=INVESTABLE and the
@@ -1360,7 +1374,7 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.23.2"
+OPPORTUNITY_BUILDER_VERSION = "1.24.0"
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -1927,7 +1941,7 @@ GATE_ORDER = (
     "Activity Screen",
     "Investability",
     # v1.10.2 [G-1]: appended immediately after Investability in evaluate_gates.
-    "Blocked Identity",
+    "Blocked Identity", "Hard Eligibility",
     # v1.7.0: appended at its true position (the v1.0.7 GATE_ORDER lesson —
     # a gate missing from this tuple sorts to 99 and can mis-attribute
     # first_failed_gate on the near-miss surface).
@@ -2542,6 +2556,14 @@ def _legacy_blocked_identity_trace_enabled(overrides=None):
     environment/request switch would previously have appended a PASS gate for
     a non-BLOCKED row. Request precedence mirrors ``make_criteria`` exactly.
     """
+    # make_criteria() must expose invariant truth in its public snapshot, so
+    # preserve the retired switch's trace-only intent outside the mapping
+    # keys. This takes precedence when callers pass prepared criteria back to
+    # evaluate_gates() or build_opportunity_payload().
+    prepared = getattr(overrides, "_blocked_identity_trace_enabled", None)
+    if prepared is not None:
+        return bool(prepared)
+
     raw = (os.getenv("TFB_OPP_BLOCKED_IDENTITY_GATE") or "").strip().lower()
     enabled = raw in ("1", "true", "yes", "on")
     try:
@@ -2554,6 +2576,17 @@ def _legacy_blocked_identity_trace_enabled(overrides=None):
             continue
         enabled = _coerce_bool(val)
     return enabled
+
+
+class _CriteriaDict(dict):
+    """Criteria mapping with private compatibility-trace provenance."""
+
+    def copy(self):
+        copied = type(self)(self)
+        marker = getattr(self, "_blocked_identity_trace_enabled", None)
+        if marker is not None:
+            copied._blocked_identity_trace_enabled = bool(marker)
+        return copied
 
 
 def _env_investability_gate():
@@ -3084,7 +3117,9 @@ def _annotate_cost_edge(ticket, suggested):
 
 def make_criteria(overrides=None):
     """DEFAULTS < env policy block < explicit overrides; coerced types."""
-    crit = dict(DEFAULT_CRITERIA)
+    blocked_identity_trace = _legacy_blocked_identity_trace_enabled(overrides)
+    crit = _CriteriaDict(DEFAULT_CRITERIA)
+    crit._blocked_identity_trace_enabled = blocked_identity_trace
     crit.update(_env_overrides())
     for key, val in (overrides or {}).items():
         k = str(key).strip().lower()
@@ -3381,6 +3416,62 @@ def _resolve_fx(currency_raw, fx_rates):
     return None, "missing"
 
 
+def _final_fx_error(currency_raw, fx_rates, row, effective):
+    """Validate units and every supplied rate without silently repairing it.
+
+    Map keys name the rate's quote unit: GBP is per pound; GBp/GBX is per
+    pence. Row fx_to_sar is always per unit of the row's currency/price.
+    """
+    raw = str(currency_raw or "").strip()
+    parent = _RAW_SUBUNIT_TOKENS.get(raw)
+    if parent is None and raw.upper() in ("GBX", "ZAC", "ILA"):
+        parent = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}[raw.upper()]
+    code = (parent or raw).upper()
+    if code not in (FIAT_CODES | FX_STATIC_TO_SAR.keys()):
+        return "unknown_currency"
+    rates = []
+    supplied = fx_rates or {}
+    for key in supplied:
+        pair = _norm_token(key)
+        if len(pair) > 3 and code.lower() in pair and "sar" in pair:
+            return "unsupported_currency_pair"
+    for key in dict.fromkeys((raw, code)):
+        if key not in supplied:
+            continue
+        rate = _to_float(supplied[key])
+        if rate is None or rate <= 0:
+            return "invalid_map_rate"
+        divisor = 100.0 if parent and key == code else 1.0
+        rate /= divisor
+        rates.append(rate)
+        if code in _FX_PEG_BAND:
+            lo, hi = _FX_PEG_BAND[code]
+            if not lo <= rate <= hi:
+                return "invalid_currency_peg"
+    # Inspect all raw aliases so a benign duplicate cannot conceal an invalid
+    # override before the generic view chooses a single value.
+    for key, value in (row.items() if isinstance(row, dict) else ()):
+        if _norm_token(key) not in _FIELD_ALIASES["fx_to_sar"] or value in (None, ""):
+            continue
+        rate = _to_float(value)
+        if rate is None or rate <= 0:
+            return "invalid_row_rate"
+        rates.append(rate)
+    if effective is None or not math.isfinite(effective) or effective <= 0:
+        return "missing_rate"
+    if code in _FX_PEG_BAND:
+        lo, hi = _FX_PEG_BAND[code]
+        if not lo <= effective <= hi:
+            return "invalid_currency_peg"
+    elif code in FX_STATIC_TO_SAR and not (
+            0.1 <= effective / (FX_STATIC_TO_SAR[code] /
+                               (100.0 if parent else 1.0)) <= 10.0):
+        return "implausible_currency_rate"
+    if any(abs(rate / effective - 1.0) > 0.01 for rate in rates):
+        return "conflicting_rates"
+    return None
+
+
 def normalize_candidate(row, fx_rates, criteria):
     """Raw engine/selector row → internal candidate dict. Never raises on a
     malformed row; missing facts surface as None and fail their gates."""
@@ -3398,6 +3489,12 @@ def normalize_candidate(row, fx_rates, criteria):
     row_fx = _to_float(_field(view, "fx_to_sar"))
     if row_fx is not None and row_fx > 0:
         fx, fx_source = row_fx, "row"
+    # Validate the effective value AFTER every override. Neither a legacy
+    # peg substitution nor a malformed override can turn bad evidence into
+    # an executable amount. Row/map differences beyond 1% are contradictory.
+    fx_error = _final_fx_error(currency_raw, fx_rates, row, fx)
+    if fx_error:
+        fx, fx_source = None, "invalid:" + fx_error
 
     target = _to_float(_field(view, "target_price"))
     iv = _to_float(_field(view, "intrinsic_value"))
@@ -3523,6 +3620,7 @@ def normalize_candidate(row, fx_rates, criteria):
             "provider": _to_text(_field(view, "data_provider")),
             "last_updated": _to_text(_field(view, "last_updated")),
         },
+        "hard_eligibility": resolve_hard_eligibility(row).reason_codes,
     }
     # v1.13.0 [TRUST-001]: lineage fields attach ONLY when the mode is
     # armed, so the OFF candidate dict (and therefore every downstream
@@ -4318,7 +4416,8 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     g.append(_gate("FX", cand["fx_to_sar"] is not None and
                    cand["fx_to_sar"] > 0, FAIL_MAJOR,
                    cand["fx_to_sar"],
-                   "fx_to_sar > 0 (ccy=" + str(cand["currency"]) + ")"))
+                   "validated fx_to_sar > 0 (ccy=" + str(cand["currency"]) + ")",
+                   note=cand.get("fx_source")))
 
     g.append(_gate("Valuation", cand["valuation_ref"] is not None, FAIL_MAJOR,
                    cand["valuation_basis"] or "none",
@@ -4617,6 +4716,12 @@ def evaluate_gates(cand, criteria, held_symbols=None,
             "Blocked Identity", _bi_ok, FAIL_MAJOR,
             (_to_text(_bi_raw) or "Unknown"),
             "engine identity/tradability not BLOCKED (blank/Unknown/WATCHLIST pass)"))
+
+    hard_reasons = cand.get("hard_eligibility") or ()
+    if hard_reasons:
+        g.append(_gate("Hard Eligibility", False, FAIL_MAJOR,
+                       "; ".join(hard_reasons),
+                       "no current-row hard restriction or conflicting safety alias"))
 
     # v1.7.0 [SELL-CLASS GATE]: the narrow guard — MAJOR-fail only an
     # EXPLICIT engine sell-tier verdict, instead of the Investability gate's
@@ -6016,7 +6121,7 @@ def _pregate_quality_order(rows, crit):
     under a second); no FX resolve, no ticket math, no venue calendar."""
     stats = {"pool": len(rows), "eligible": 0, "fail_price_or_ref": 0,
              "fail_fresh": 0, "fail_sanity": 0, "fail_forecast": 0,
-             "fail_reliability": 0}
+             "fail_reliability": 0, "fail_blocked_identity": 0}
     max_age = crit.get("max_data_age_hours")
     vmax = (crit.get("max_valuation_roi_pct", 80.0)
             if crit.get("valuation_sanity_gate_enabled") else None)
@@ -6053,6 +6158,7 @@ def _pregate_quality_order(rows, crit):
             roi_pct = (ref - price) / price * 100.0
         rel = _to_float(_field(view, "reliability"))
         age_h = _parse_age_hours(_to_text(_field(view, "last_updated")))
+        blocked_identity = resolve_hard_eligibility(raw).blocked
         ok_pr = price is not None and ref is not None
         ok_fresh = not (max_age is not None and max_age > 0
                         and age_h is not None and age_h > max_age)
@@ -6061,7 +6167,8 @@ def _pregate_quality_order(rows, crit):
                    or eng_pct >= f_floor)
         ok_rel = (rel_floor is None
                   or (rel is not None and rel >= float(rel_floor)))
-        eligible = (ok_pr and ok_fresh and ok_sane and ok_fcst and ok_rel)
+        eligible = (ok_pr and ok_fresh and ok_sane and ok_fcst and ok_rel
+                    and not blocked_identity)
         if eligible:
             stats["eligible"] += 1
         else:
@@ -6075,6 +6182,8 @@ def _pregate_quality_order(rows, crit):
                 stats["fail_forecast"] += 1
             if not ok_rel:
                 stats["fail_reliability"] += 1
+            if blocked_identity:
+                stats["fail_blocked_identity"] += 1
         rel_k = rel if rel is not None else -1.0e18
         eng_k = eng_pct if eng_pct is not None else -1.0e18
         keyed.append(((0 if eligible else 1, -rel_k, -eng_k, symbol, i),
@@ -6139,14 +6248,16 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             try:
                 _LOG.info(
                     "[PREGATE v%s] pool=%d eligible=%d kept=%d fail("
-                    "fresh=%d sanity=%d forecast=%d rel=%d price_ref=%d)",
+                    "fresh=%d sanity=%d forecast=%d rel=%d price_ref=%d "
+                    "blocked_identity=%d)",
                     OPPORTUNITY_BUILDER_VERSION, pregate_stats["pool"],
                     pregate_stats["eligible"], pregate_stats["kept"],
                     pregate_stats["fail_fresh"],
                     pregate_stats["fail_sanity"],
                     pregate_stats["fail_forecast"],
                     pregate_stats["fail_reliability"],
-                    pregate_stats["fail_price_or_ref"])
+                    pregate_stats["fail_price_or_ref"],
+                    pregate_stats["fail_blocked_identity"])
             except Exception:
                 pass
         rows = rows[:crit["max_candidates"]]

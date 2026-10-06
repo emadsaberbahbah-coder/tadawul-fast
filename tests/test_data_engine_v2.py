@@ -35,23 +35,47 @@ Tests cover:
      plus three structural assertions (fundamentals-empty guard,
      priority_band emission, _make_cache_key call site)
 
-Runs against a stub `core.scoring` in this workspace's `core/scoring.py`.
-The production deployment uses the real v5.3.0 scoring module.
+Runs against the repository's actual engine and scoring functions. Provider
+calls are unnecessary for these classification, schema, unit, and sanitization
+contracts; pytest rejects network connections even when providers are installed.
 
-Invocation:
-    cd /home/claude/work_v5731
-    python3 test_v5731.py
+Invocation: python -m pytest -q tests/test_data_engine_v2.py
 """
 from __future__ import annotations
 import os
+import socket
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
-sys.path.insert(0, "/home/claude/work_v5731")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Import the engine under test
 from core import data_engine_v2 as de  # noqa: E402
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _offline_engine_contract(monkeypatch):
+    attempts = []
+
+    def reject(_socket, address):
+        attempts.append(address)
+        raise AssertionError(f"Engine contract attempted network access: {address!r}")
+
+    monkeypatch.setattr(socket.socket, "connect", reject)
+    monkeypatch.setattr(socket.socket, "connect_ex", reject)
+    # Historical standalone tests modify these directly; monkeypatch records
+    # the original environment and restores it even when an assertion fails.
+    for name in (
+        "TFB_TRUST_PROVIDER_RECO", "TFB_SANITIZATION_ENABLED",
+        "TFB_DISABLE_V572_SANITIZATION", "TFB_CRITERIA_SNAPSHOT_MAX_CHARS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    yield
+    assert not attempts, f"Engine contract attempted network access: {attempts!r}"
 
 
 # ----------------------------------------------------------------------------

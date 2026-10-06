@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -37,6 +37,7 @@ COST = ("Avg Cost", "Average Cost", "Buy Price")
 
 for p in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
     if str(p) not in sys.path: sys.path.insert(0, str(p))
+from core.data_validity import coverage_validity, timestamp_freshness
 
 @dataclass(frozen=True)
 class Rule:
@@ -201,10 +202,12 @@ def audit_grid(grid, rule, expected, now, active=()):
         if qi>=0: qmap[sym]=f(row[qi] if qi<len(row) else None)
         if ci>=0: cmap[sym]=f(row[ci] if ci<len(row) else None)
         if rule.max_age_h is not None:
-            d=parse_dt(row[ti] if ti>=0 and ti<len(row) else None)
-            if d is None: bad+=1; stale+=1
-            else:
-                age=max(0,(now0-d).total_seconds()/3600); ages.append(age); fresh+=int(age<=rule.max_age_h); stale+=int(age>rule.max_age_h)
+            d, precision = parse_dt_precision(row[ti] if ti>=0 and ti<len(row) else None)
+            accepted, age_seconds, reason = timestamp_freshness(
+                d, now0, precision=precision, max_age_seconds=rule.max_age_h * 3600)
+            fresh += int(accepted); stale += int(not accepted)
+            if age_seconds is not None: ages.append(age_seconds / 3600)
+            if reason in {"timestamp_precision_unknown", "timestamp_future"}: bad += 1
     c=Counter(symbols); r.unique=len(c); r.duplicates=sorted(k for k,v in c.items() if v>1)
     if r.blank_symbols: r.failures.append(f"{r.blank_symbols} blank-symbol row(s)")
     if r.duplicates: r.failures.append("duplicate symbols: "+", ".join(r.duplicates[:20]))
@@ -216,8 +219,8 @@ def audit_grid(grid, rule, expected, now, active=()):
     if rule.max_age_h is not None:
         r.fresh,r.stale,r.bad_stamps=fresh,stale,bad; r.fresh_pct=pct(fresh,len(symbols)); r.newest_age_h=min(ages) if ages else None; r.oldest_age_h=max(ages) if ages else None
         if ti<0: r.failures.append("Last Updated column missing")
-        elif r.fresh_pct is None or r.fresh_pct<rule.min_fresh: r.failures.append(f"fresh coverage {r.fresh_pct} below {rule.min_fresh}% within {rule.max_age_h}h")
-        if bad: r.warnings.append(f"{bad} blank/unparseable timestamp(s)")
+        elif not coverage_validity(len(symbols), fresh, rule.min_fresh).valid: r.failures.append(f"fresh coverage {r.fresh_pct} below {rule.min_fresh}% within {rule.max_age_h}h")
+        if bad: r.warnings.append(f"{bad} missing, date-only, invalid or future timestamp(s)")
     if rule.portfolio:
         a,p=set(active),set(symbols); r.missing_portfolio=sorted(a-p); r.extra_portfolio=sorted(p-a); r.min_rows=len(a) or 1
         if r.missing_portfolio: r.failures.append("active ledger symbols missing: "+", ".join(r.missing_portfolio))

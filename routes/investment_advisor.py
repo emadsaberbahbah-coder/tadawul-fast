@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
+v2.18.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.17.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.18.1
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
@@ -245,6 +248,8 @@ Co-deployment matrix (Wave 2A)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import inspect
 import json
@@ -265,7 +270,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.18.0"
+INVESTMENT_ADVISOR_VERSION = "2.18.1"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -1212,7 +1217,7 @@ def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: O
         return True
 
     try:
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        path = request_path(request)
     except Exception:
         path = ""
 

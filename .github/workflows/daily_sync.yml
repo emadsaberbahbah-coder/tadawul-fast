@@ -21,7 +21,10 @@ on:
   # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
   # or the 25-min job cap being too short for a full sweep); check the Actions tab.
   schedule:
-    - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
+    # Separate entries preserve cadence and identify the scheduled cohort slot.
+    - cron: "17 4 * * *"
+    - cron: "17 12 * * *"
+    - cron: "17 20 * * *"
                                  # P-170 (2026-09-26): minute 00 is GitHub's most-delayed schedule minute -
                                  # the 20Z slot fired 22:59Z and the 04Z slot 09:00Z; :17 keeps the slots off the hour.
 
@@ -872,41 +875,16 @@ jobs:
 
       - name: 💓 Backend Health Check
         id: health_check
+        env:
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           set -euo pipefail
-          echo "::group::🏥 Backend Health Check"
-
-          HEALTH_ENDPOINTS=("/readyz" "/health" "/livez")
-          MAX_RETRIES=4
-
-          for endpoint in "${HEALTH_ENDPOINTS[@]}"; do
-            echo "▶️ Probing $TARGET_URL$endpoint..."
-            for attempt in $(seq 1 "$MAX_RETRIES"); do
-              BACKOFF=$(( 2 ** attempt ))
-
-              RESPONSE="$(curl -s -w "\n%{http_code}" --max-time 10 "$TARGET_URL$endpoint" 2>&1 || echo -e "\n000")"
-              HTTP_CODE="$(echo "$RESPONSE" | tail -n1)"
-              BODY="$(echo "$RESPONSE" | sed '$d')"
-
-              if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
-                echo "✅ Healthy via $endpoint (HTTP $HTTP_CODE)"
-                # entry_version/service_version are the deployed code stamp;
-                # app_version may be a stale platform environment label.
-                VERSION="$(echo "$BODY" | jq -r '.entry_version // .service_version // .version // .app_version // .build // "unknown"' 2>/dev/null || echo "unknown")"
-                echo "health_status=healthy" >> "$GITHUB_OUTPUT"
-                echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
-                echo "::endgroup::"
-                exit 0
-              fi
-
-              echo "⏳ Attempt $attempt/$MAX_RETRIES: HTTP $HTTP_CODE, retrying in ${BACKOFF}s..."
-              sleep "$BACKOFF"
-            done
-          done
-
-          echo "::warning::All health check endpoints failed. Backend may be degraded."
-          echo "health_status=degraded" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
+          # HTTP 200 can still report ready=false in nonstrict mode. Require
+          # authenticated route/engine diagnostics, canonical owners, and the
+          # checked-out entry/engine version contract before publishing rows.
+          python scripts/check_backend_readiness.py \
+            --backend "$TARGET_URL" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: 🎯 Scope Keys To Matrix Leg
         run: |
@@ -1142,6 +1120,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          TRACK_DAY_KEY_MODE: ${{ github.event_name == 'schedule' && 'slot' || 'wallclock' }}
+          TRACK_SLOT_UTC: ${{ github.event.schedule == '17 4 * * *' && '04:17' || github.event.schedule == '17 12 * * *' && '12:17' || github.event.schedule == '17 20 * * *' && '20:17' || '' }}
+          GH_TOKEN: ${{ github.token }}
           # (2026-07-19) S-1 CRITERION 4 — 7D/14D CHECKPOINT HORIZONS.
           # track_performance v6.23.0+ records "1W"/"2W" as CHECKPOINTS, not
           # maturities: a time-scaled slice of the 1M thesis used to measure
@@ -1166,6 +1147,14 @@ jobs:
           TFB_PERF_TARGET_UNIT_SENTRY: "observe"
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
+          if [[ "$TRACK_DAY_KEY_MODE" == "slot" ]]; then
+            if ! TRACK_RUN_CREATED_AT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)" \
+                || ! date -u -d "$TRACK_RUN_CREATED_AT" >/dev/null; then
+              echo "::error::Cannot resolve the original scheduled cohort reference; skipping the tracker."
+              exit 1
+            fi
+            export TRACK_RUN_CREATED_AT
+          fi
           if [ ! -f "scripts/track_performance.py" ]; then
             echo "::warning::scripts/track_performance.py not found — skipping"
             exit 0
@@ -1646,14 +1635,9 @@ jobs:
       - name: 💓 Check backend health
         run: |
           set -euo pipefail
-          for endpoint in /readyz /health /livez; do
-            if curl -fsS --max-time 15 "$TARGET_URL$endpoint" >/dev/null; then
-              echo "Backend healthy via $endpoint"
-              exit 0
-            fi
-          done
-          echo "::error::Backend health checks failed."
-          exit 1
+          # Recovery publishes through the same backend; use the identical
+          # readiness guard and never substitute liveness for readiness.
+          python scripts/check_backend_readiness.py --backend "$TARGET_URL"
 
       - name: 🧯 Recover only pages that did not refresh
         run: |

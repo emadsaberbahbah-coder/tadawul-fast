@@ -18,14 +18,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.data_validity import coverage_validity
 
-SCRIPT_VERSION = "1.1.2"
+
+SCRIPT_VERSION = "1.1.3"
 # v1.1.2 (2026-10-06): full-fetch mode now rejects partial verdicts and
 # explicit unknown exact coverage, while legacy no-coverage logs remain
 # compatible. Canonical-log preference is local to each artifact directory.
@@ -84,10 +89,11 @@ def _require_full_fetch() -> bool:
     return (_os.getenv("TFB_AUDIT_REQUIRE_FULL_FETCH") or "0").strip().lower() in {"1", "true", "on", "yes"}
 
 
-def _min_fresh_pct() -> int:
+def _min_fresh_pct() -> float:
     """v1.1.0: minimum acceptable fresh-fetch coverage percent (default 95)."""
     try:
-        return max(0, min(100, int((_os.getenv("TFB_AUDIT_MIN_FRESH_PCT") or "95").strip())))
+        value = float((_os.getenv("TFB_AUDIT_MIN_FRESH_PCT") or "95").strip())
+        return max(0, min(100, value)) if math.isfinite(value) else 95
     except ValueError:
         return 95
 
@@ -316,10 +322,8 @@ def audit_artifacts(
             # Compare the exact ratio. PAGE-VERDICT carries four-decimal
             # display telemetry, while the integer numerator/denominator keep
             # the threshold decision free of rounding artifacts.
-            low_fresh = (
-                int(ev["fresh_rows"]) * 100
-                < min_pct * int(ev["requested"])
-            )
+            low_fresh = not coverage_validity(
+                int(ev["requested"]), int(ev["fresh_rows"]), min_pct).valid
         else:
             low_fresh = (
                 "fresh_pct" in ev and float(ev["fresh_pct"]) < min_pct

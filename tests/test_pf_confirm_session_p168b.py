@@ -119,7 +119,10 @@ def test_t3_enforce_session_sequence(monkeypatch):
     assert mon_pre == sun and mon_late == sun            # frozen: no completed session yet
     assert tue[0] == ADD and "ADD confirmed (day 2/2; session 2026-09-28)" in tue[1]
     assert wed[0] == ADD and "(day 3/2; session 2026-09-29)" in wed[1]
-    assert pa._ADD_CONFIRM_STORE["DDI.US"] == {"count": 3, "date": "2026-09-29"}
+    assert pa._ADD_CONFIRM_STORE["DDI.US"] == {
+        "count": 3, "date": "2026-09-29", "schema_version": 1,
+        "clock_basis": "session", "exchange": "US",
+    }
 
 
 def test_t4_enforce_restart_and_clear(monkeypatch):
@@ -180,14 +183,14 @@ def test_t6_observe_tag(monkeypatch, caplog):
     assert pa._apply_confirm_session_observe({"symbol": "DDI.US"}, ADD, ADD, "q", None, CTL) == "q"
 
 
-def test_t7_enforce_calendar_fault_falls_back(monkeypatch, caplog):
+def test_t7_enforce_calendar_fault_fails_closed(monkeypatch, caplog):
     _reset(monkeypatch, "enforce")
     monkeypatch.setattr(pa, "_confirm_session_key", _raise)
     with caplog.at_level(logging.WARNING), _Clock(T(2026, 9, 28, 3, 40)):
         out = pa._apply_add_confirmation("DDI.US", ADD, "q", None, CTL)
-    assert out[0] == HOLD and "(day 1/2)" in out[1] and "session" not in out[1]
+    assert out[0] == HOLD and "fail-closed" in out[1]
     assert any("[CONFIRM-SESSION" in r.getMessage() for r in caplog.records)
-    assert pa._ADD_CONFIRM_STORE["DDI.US"]["date"] == "2026-09-28"     # legacy UTC key
+    assert "DDI.US" not in pa._ADD_CONFIRM_STORE  # no invented session or UTC advance
 
 
 def test_t8_p165_fail_closed_preserved(monkeypatch):

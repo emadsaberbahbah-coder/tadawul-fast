@@ -552,6 +552,7 @@ from collections import OrderedDict
 import re
 import sys
 import time
+from core.analysis.hard_eligibility import resolve_hard_eligibility
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, MutableMapping
 
@@ -735,7 +736,7 @@ logger.addHandler(logging.NullHandler())
 # Stability now ranks admission-safe pools while using the original pools only
 # to find incumbents, preserving BC-2's opt-in hard-exit/grace policy.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.31.2"
+TOP10_SELECTOR_VERSION = "4.32.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1353,16 +1354,6 @@ def _t10_redact_withheld(row, status):
     return row
 
 
-_T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
-_T10_HARD_INVESTABILITY = frozenset({"BLOCKED"})
-_T10_FINAL_ACTION_ALIASES = (
-    "final_action", "finalAction", "Final Action",
-)
-_T10_INVESTABILITY_ALIASES = (
-    "investability_status", "investabilityStatus", "Investability Status",
-)
-
-
 def _t10_shadow_hard_legacy_enabled() -> bool:
     """v4.30.0 [BC-5] kill switch: TFB_T10_SHADOW_HARD_LEGACY=1 restores the
     v4.29.0 predicate byte-identically (shadow fields ignored)."""
@@ -1380,32 +1371,9 @@ def _t10_row_hard_excluded(row: Any) -> bool:
     v4.30.0 [BC-5]: ALSO True when shadow_invest_eligible is the literal
     boolean False (BROKER_UNTRADABLE / MODEL_SCREEN_FAIL class), unless
     TFB_T10_SHADOW_HARD_LEGACY=1."""
-    if not isinstance(row, Mapping):
-        return False
-    try:
-        action_keys = frozenset(_compact_key(k) for k in _T10_FINAL_ACTION_ALIASES)
-        investability_keys = frozenset(
-            _compact_key(k) for k in _T10_INVESTABILITY_ALIASES
-        )
-        for raw_key, raw_value in row.items():
-            key = _compact_key(raw_key)
-            if key in action_keys:
-                action = str(raw_value or "").strip().upper().replace(" ", "_")
-                if action in _T10_HARD_ACTIONS:
-                    return True
-            elif key in investability_keys:
-                investability = str(raw_value or "").strip().upper()
-                if investability in _T10_HARD_INVESTABILITY:
-                    return True
-        # v4.30.0 [BC-5]: the shadow board's verdict lives on this same row
-        # (stamped by _apply_shadow_compliance). Strictly `is False` - the
-        # writer emits bool(); anything else keeps the fail-safe default.
-        if (not _t10_shadow_hard_legacy_enabled()
-                and row.get("shadow_invest_eligible") is False):
-            return True
-    except Exception:
-        return False
-    return False
+    return resolve_hard_eligibility(
+        row, include_shadow=not _t10_shadow_hard_legacy_enabled()
+    ).blocked
 
 
 # v4.25.0 (2026-07-26) [PY-10] STABILITY HISTORY SPEAKS THE RANKING SCORE

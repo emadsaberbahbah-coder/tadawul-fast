@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/analysis_sheet_rows.py
 """
+v4.8.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.0  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
@@ -263,6 +266,8 @@ Co-deployment matrix (Wave 2A + Wave 3)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import importlib
 import inspect
@@ -351,7 +356,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.1"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -978,7 +983,7 @@ def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorizat
             return True
     except Exception:
         pass
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    path = request_path(request)
     if _is_public_path(settings, path):
         return True
     headers_dict = dict(request.headers)
@@ -3045,7 +3050,7 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         "engine_source": eng_src,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "auth": auth_summary,
-        "path": str(getattr(getattr(request, "url", None), "path", "")),
+        "path": request_path(request),
         "proxy_targets": [
             "routes.advanced_analysis._run_advanced_sheet_rows_impl",
             "routes.advanced_sheet_rows._run_advanced_sheet_rows_impl",

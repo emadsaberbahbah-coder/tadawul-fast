@@ -7,14 +7,14 @@ sleep, zero real waiting. Run x3, identical digest."""
 import importlib.util, os, sys, json, hashlib, subprocess
 spec = importlib.util.spec_from_file_location("s1", "scripts/run_shadow_scorer.py")
 s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)
-assert s1.SCRIPT_VERSION == "1.9.2"
+assert s1.SCRIPT_VERSION == "1.9.3"
 
 # K1: the full existing battery still passes on the revised module
 r = subprocess.run([sys.executable, "scripts/run_shadow_scorer.py", "--selftest"],
                    capture_output=True, text=True)
 line = [l for l in r.stdout.splitlines() if "SELFTEST" in l][-1]
 assert r.returncode == 0 and "116/116" in line, line
-print("K1 PASS  full existing selftest battery 116/116 on v1.9.2:", line.strip())
+print("K1 PASS  full existing selftest battery 116/116 on v1.9.3:", line.strip())
 
 # K2: asof parsing — the EXACT live meta shape + failure modes
 live_meta = [["SHADOW BOARD v1.3.0", "as of 2026-09-11 17:44 Riyadh",

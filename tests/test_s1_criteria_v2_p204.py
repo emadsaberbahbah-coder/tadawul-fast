@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""run_shadow_scorer v1.9.2 [P-204 / P-201 / C5 / P-186] harness — REAL module,
+"""run_shadow_scorer v1.9.3 [P-204 / P-201 / C5 / P-186] harness — REAL module,
 REAL main() on an in-memory sheet stub (the P-176 harness shape); the network
 fetch and the clock are the only injected parts.
-  C1 full embedded selftest battery (116/116 on v1.9.2; base 104/104 if S1_BASE set)
+  C1 full embedded selftest battery (116/116 on v1.9.3; base 104/104 if S1_BASE set)
   C2 the REAL read_history + window_cum on the REAL 2026-10-05 Shadow_History
      rows (fixture): challenger -0.2532 / champion -0.2519 / benchmark +2.5343
      since 2026-09-16 => alpha -2.7875 pp (the audit numbers, exact)
-  C3 DUAL-TREE PARITY (if S1_BASE set): REAL main() under mode off produces
-     byte-identical Shadow_History rows, S1_Gate body and _Run_Log verdict on
-     base (v1.9.1) and delivered (v1.9.2)
+  C3 HISTORICAL PARITY (if S1_BASE set): REAL main() retains identical history
+     rows and unaffected criteria; empty CA evidence changes criterion 5 from
+     a vacuous PASS on v1.9.1 to PENDING on v1.9.3.
   C4 observe: statuses + verdict unchanged vs off; criteria 3/4/5 details carry
      ` | v2:` would-outcomes; token line on the verdict, the meta cell and the
      _Run_Log JSON; history rows identical to off
@@ -33,7 +33,7 @@ def load(path, name):
     return m
 
 s1 = load(DELIV, "s1_deliv")
-assert s1.SCRIPT_VERSION == "1.9.2", s1.SCRIPT_VERSION
+assert s1.SCRIPT_VERSION == "1.9.3", s1.SCRIPT_VERSION
 s1b = load(BASE, "s1_base") if BASE else None
 digest_parts = []
 
@@ -140,7 +140,7 @@ def fresh_sheet(cal=None, ca_rows=None):
     top10 = [["TOP 10 INVESTMENTS — DECISION"], ["Status:", "Last run"], [],
              ["Rank", "Symbol", "Name", "Price", "ROI %"]] + \
             [[str(i + 1), s, s + " Co", "1.0", "10%"] for i, s in enumerate(CHAMP)]
-    ca = [["Logged At", "Symbol", "Type", "Ex-Date", "Ratio", "Status", "Source", "Note", "Repair"]]
+    ca = [["Symbol", "Action Type", "Effective Date", "Ratio", "Old Symbol", "New Symbol", "Source", "Detected At", "Notes"]]
     if ca_rows:
         ca += ca_rows
     return Sheet({
@@ -149,6 +149,8 @@ def fresh_sheet(cal=None, ca_rows=None):
         s1.TAB_HISTORY: history_seed(),
         s1.TAB_S1_CAL: cal if cal is not None else cal_rows(),
         "_Corporate_Actions": ca,
+        "Performance_Log": [["Record ID", "Symbol", "Date Recorded (Riyadh)", "Entry Price", "Target Price", "Status", "Current Price", "Notes"],
+                            ["R1", "DDI.US", "2026-10-02", "30", "33", "active", "30", ""]],
         "_Run_Log": [["Timestamp", "Level", "Action", "Page", "Status", "Message",
                       "Endpoint", "HTTP Code", "Duration ms", "Details JSON"],
                      ["2026-09-19 05:00:00", "INFO", "workbook_backup", "_Backup", "OK",
@@ -199,15 +201,16 @@ WHEN, SPOT = "2026-10-05T15:40:00Z", "2026-10-05"
 sh_off = fresh_sheet(); rc, out_off = run_at(s1, WHEN, sh_off, SPOT, v2=None)
 assert rc == 0 and "[S1-CRITERIA-V2" not in out_off, out_off
 c_off = crit(sh_off)
-assert c_off[3][0] == "PASS" and "v2:" not in c_off[3][1] and c_off[5][0] == "PASS", c_off
+assert c_off[3][0] == "PASS" and "v2:" not in c_off[3][1] and c_off[5][0] == "PENDING" and "UNKNOWN" in c_off[5][1], c_off
 if s1b:
     sh_b = fresh_sheet(); rcb, out_b = run_at(s1b, WHEN, sh_b, SPOT, v2=None)
-    norm = lambda rows: [[str(c).replace("v1.9.1", "vX").replace("v1.9.2", "vX") for c in r] for r in rows]  # noqa: E731
+    norm = lambda rows: [[str(c).replace("v1.9.1", "vX").replace("v1.9.3", "vX") for c in r] for r in rows]  # noqa: E731
     assert rcb == 0 and norm(hist_rows(sh_b)) == norm(hist_rows(sh_off)), "history parity"
-    assert norm(gate_body(sh_b)) == norm(gate_body(sh_off)), "gate parity"
-    vb, vd = runlog(sh_b)[-1][5], runlog(sh_off)[-1][5]
-    assert vb.replace("v1.9.1", "vX") == vd.replace("v1.9.2", "vX"), (vb, vd)
-    print("C3 PASS  dual-tree parity under mode off: history rows, S1_Gate body and verdict byte-identical (version token aside)")
+    c_base = crit(sh_b)
+    assert {k: v for k, v in c_base.items() if k != 5} == {k: v for k, v in c_off.items() if k != 5}, "unaffected criteria parity"
+    assert c_base[5][0] == "PASS" and c_off[5][0] == "PENDING", "empty CA now blocks vacuous PASS"
+    assert gate_body(sh_b)[0][2] == gate_body(sh_off)[0][2], "other pending criteria still block final promotion"
+    print("C3 PASS  historical history/unaffected criteria parity; empty CA changes criterion 5 PASS to PENDING")
 else:
     print("C3 SKIP  dual-tree parity (set S1_BASE=<v1.9.1 file>)")
 digest_parts.append(c_off)
@@ -222,7 +225,7 @@ assert "zero-baseline MAE not published" in c_obs[4][1] and "would PENDING" in c
 assert "0 rows (vacuous)" in c_obs[5][1] and "would NOT_EVALUABLE" in c_obs[5][1], c_obs[5]
 assert gate_body(sh_obs)[0][2] == gate_body(sh_off)[0][2], "verdict changed under observe"
 assert hist_rows(sh_obs) == hist_rows(sh_off), "observe must not touch Shadow_History"
-tok = [l for l in out_obs.splitlines() if l.startswith("[S1-CRITERIA-V2 v1.9.2] mode=observe")]
+tok = [l for l in out_obs.splitlines() if l.startswith("[S1-CRITERIA-V2 v1.9.3] mode=observe")]
 # today's scored day moves every index by exactly +1.00 % (all spots x1.01, zero turnover), so the
 # window return = seed_index x 1.01 / pre-boundary index - 1 for each basket
 exp = {b: (i * 1.01 / p - 1) * 100 for b, i, p in (("chal", 106.892669, 107.164026), ("bench", 101.554736, 99.04464))}
@@ -233,9 +236,9 @@ assert tok and m_alpha and abs(float(m_alpha.group(1)) - exp_alpha) < 0.02 and e
     and "zero_mae=n/a" in tok[0] and "model_mae=3.13pp" in tok[0] \
     and "ca_rows=0" in tok[0] and "set=" in tok[0], (tok, exp_alpha)
 meta_cells = " ".join(str(c) for r in gate_body(sh_obs)[:6] for c in r)
-assert "[S1-CRITERIA-V2 v1.9.2] mode=observe" in meta_cells, "meta cell token missing"
+assert "[S1-CRITERIA-V2 v1.9.3] mode=observe" in meta_cells, "meta cell token missing"
 rl = runlog(sh_obs)[-1]
-assert "[S1-CRITERIA-V2 v1.9.2]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
+assert "[S1-CRITERIA-V2 v1.9.3]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
 print("C4 PASS  observe: statuses/verdict unchanged, 3/4/5 annotated, token on verdict + meta + _Run_Log JSON, history untouched")
 digest_parts.append(tok[0].split(" set=")[0])
 
@@ -254,7 +257,7 @@ digest_parts.append({k: v[0] for k, v in c_enf.items()})
 H6 = history_seed()
 for r in H6[1:]:
     if r[1] == "BENCHMARK" and r[0] == "2026-10-02": r[5] = 97.0        # benchmark below its 09-15 base => window alpha > 0
-sh6 = fresh_sheet(cal=cal_rows(zero_col=3.5), ca_rows=[["2026-10-01", "DDI.US", "DIVIDEND", "2026-10-15", "1.0", "CONFIRMED", "eodhd", "", "n/a"]])
+sh6 = fresh_sheet(cal=cal_rows(zero_col=3.5), ca_rows=[["DDI.US", "SPLIT", "2026-10-01", "2", "", "", "CONFIRMED", "", ""]])
 sh6.tabs[s1.TAB_HISTORY] = WS(H6)
 rc, out6 = run_at(s1, WHEN, sh6, SPOT, v2="enforce")
 assert rc == 0, out6
@@ -268,7 +271,7 @@ digest_parts.append({k: v[0] for k, v in c6.items()})
 # ---------------------------------------------------------------- C7 ------ #
 sh7 = fresh_sheet(); before = (copy.deepcopy(hist_rows(sh7)), copy.deepcopy(runlog(sh7)))
 rc, out7 = run_at(s1, WHEN, sh7, SPOT, v2="observe", argv=["--dry-run"])
-assert rc == 0 and "[S1-CRITERIA-V2 v1.9.2] mode=observe" in out7, out7
+assert rc == 0 and "[S1-CRITERIA-V2 v1.9.3] mode=observe" in out7, out7
 assert (hist_rows(sh7), runlog(sh7)) == before and s1.TAB_GATE not in sh7.tabs, "dry-run wrote"
 print("C7 PASS  --dry-run under observe: token printed, zero writes")
 digest_parts.append("dryrun-ok")

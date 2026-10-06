@@ -2,7 +2,7 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.8.0
+Core Configuration Module — v5.8.1
 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE / ROUTE-AUTH-CONTROLLED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
@@ -22,6 +22,9 @@ Primary goals:
 
 Safe-by-default philosophy:
 - Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
+
+v5.8.1: request-based public exemptions use the ASGI routing path, overriding
+caller-supplied path hints and avoiding Host-based URL reconstruction.
 
 ────────────────────────────────────────────────────────────────────────────────
 Why v5.8.0 (vs v5.7.0) — OPEN PRICE ROUTING (Phase 1.3 of upgrade plan)
@@ -129,6 +132,8 @@ After deploying v5.8.0:
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import base64
 import copy
 import json
@@ -148,7 +153,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.8.0"
+__version__ = "5.8.1"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -1999,9 +2004,11 @@ def auth_ok(
     req_headers = headers
 
     if request is not None:
+        # A request is authoritative. Failed scope extraction must not fall
+        # back to a caller-supplied public path.
+        req_path = ""
         try:
-            if not req_path:
-                req_path = getattr(getattr(request, "url", None), "path", None) or getattr(request, "scope", {}).get("path")
+            req_path = request_path(request)
         except Exception:
             pass
         try:

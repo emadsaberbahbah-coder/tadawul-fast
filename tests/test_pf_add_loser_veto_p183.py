@@ -52,7 +52,7 @@ if PA_FILE:
     pa = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(pa)
 else:
     import core.analysis.portfolio_actions as pa  # noqa: E402
-assert pa.PORTFOLIO_ACTIONS_VERSION == "1.14.0", pa.PORTFOLIO_ACTIONS_VERSION
+assert pa.PORTFOLIO_ACTIONS_VERSION == "1.15.0", pa.PORTFOLIO_ACTIONS_VERSION
 
 PANEL = {"cash_available_sar": 34166.25, "target_cash_pct": 10.0,
          "max_position_pct": 20.0, "max_sector_pct": 30.0,
@@ -149,6 +149,7 @@ def _fx_row(symbol, price, qty, avg_cost, tp1_mult=1.25, stop_mult=0.92, sukuk=F
          "Data Quality Score": 100.0, "Risk Bucket": "LOW", "Investability Status": "INVESTABLE",
          "Final Action": "INVEST", "Recommendation": "BUY", "Volatility 30D": 0.2,
          "Forecast Source": "provider_target", "Position Qty": qty, "Avg Cost": avg_cost,
+         "Active Stop": price * stop_mult,  # recorded separately from the generated entry ladder
          "Position Cost": round(qty * avg_cost, 2), "Position Value": round(qty * price, 2),
          "Unrealized P/L": round(qty * (price - avg_cost), 2),
          "Unrealized P/L %": round((price / avg_cost - 1) * 100, 4),

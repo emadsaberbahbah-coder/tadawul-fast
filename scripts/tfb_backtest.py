@@ -31,6 +31,11 @@ Options: --edges "50,70,85" (numeric bands) --min-n 100 --json out.json --horizo
          --filter "Origin Tab=Top_10_Investments" (repeatable, exact match)   [v1.1.0]
          --since 2026-08-01 / --until 2026-08-31  (Date Recorded window)       [v1.1.0]
 READ-ONLY. No writes, ever.
+
+v1.1.1 (2026-10-06): Spearman uses Pearson correlation of averaged ranks,
+including ties; constant/nonfinite/short inputs are explicitly undefined.
+Research limitation: shuffled CV, whole-cohort quantiles and the in-sample
+baseline remain exploratory and do not establish chronological model skill.
 """
 from __future__ import annotations
 
@@ -45,7 +50,7 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
                    "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
 
@@ -149,8 +154,20 @@ def brier(pairs: List[Tuple[float, float]]) -> float:
 
 
 def spearman(a: List[float], b: List[float]) -> float:
+    """Tie-correct rank correlation; undefined results propagate as NaN.
+
+    Require at least three paired finite observations. Do not silently drop
+    invalid observations, which would change the evaluated cohort.
+    """
     n = len(a)
-    if n < 3:
+    if n != len(b) or n < 3:
+        return float("nan")
+    try:
+        a = [float(value) for value in a]
+        b = [float(value) for value in b]
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
+    if not all(math.isfinite(value) for value in a + b):
         return float("nan")
     def ranks(x):
         order = sorted(range(n), key=lambda i: x[i])
@@ -166,8 +183,15 @@ def spearman(a: List[float], b: List[float]) -> float:
             i = j + 1
         return r
     ra, rb = ranks(a), ranks(b)
-    d2 = sum((ra[i] - rb[i]) ** 2 for i in range(n))
-    return 1 - 6 * d2 / (n * (n * n - 1))
+    mean_a, mean_b = statistics.mean(ra), statistics.mean(rb)
+    centered_a = [value - mean_a for value in ra]
+    centered_b = [value - mean_b for value in rb]
+    variance_a = math.fsum(value * value for value in centered_a)
+    variance_b = math.fsum(value * value for value in centered_b)
+    if variance_a == 0 or variance_b == 0:
+        return float("nan")
+    covariance = math.fsum(x * y for x, y in zip(centered_a, centered_b))
+    return max(-1.0, min(1.0, covariance / math.sqrt(variance_a * variance_b)))
 
 
 def cv_brier(groups: List[Any], ys: List[float], k: int = 5, shrink: float = 20.0, seed: int = 7) -> float:
@@ -237,7 +261,8 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
         xs = [nums[i] for i in keep]
         if xs and 0 <= min(xs) and max(xs) <= 100:
             res["raw_brier_as_probability"] = round(brier([(x / 100.0, yy) for x, yy in zip(xs, y)]), 4)
-        res["spearman_vs_roi"] = round(spearman(xs, roi), 3)
+        correlation = spearman(xs, roi)
+        res["spearman_vs_roi"] = round(correlation, 3) if math.isfinite(correlation) else None
     res["cv_brier_group_calibrated"] = round(cv_brier(groups, y), 4)
     big = [t for t in table if t["n"] >= min_n]
     spread, z = 0.0, 0.0
@@ -263,7 +288,9 @@ def render(results: List[Dict[str, Any]], title: str) -> str:
     for r in results:
         lines.append(f"\n[{r['verdict']:9s}] {r['signal']} ({r['type']}, n={r['n']}, base win {r['base_win_pct']}%, base Brier {r['base_brier']})")
         if "raw_brier_as_probability" in r:
-            lines.append(f"    raw value as probability: Brier {r['raw_brier_as_probability']} | Spearman vs ROI {r['spearman_vs_roi']}")
+            correlation = r["spearman_vs_roi"]
+            correlation_label = "undefined" if correlation is None else str(correlation)
+            lines.append(f"    raw value as probability: Brier {r['raw_brier_as_probability']} | Spearman vs ROI {correlation_label}")
         lines.append(f"    CV Brier group-calibrated {r['cv_brier_group_calibrated']} (gain vs base {r['cv_gain_vs_base']:+.4f}) | win spread {r['win_spread_pp']} pp (z={r['spread_z']})")
         lines.append(f"    {'group':14s}{'n':>6s}{'win%':>7s}{'meanROI%':>10s}{'medROI%':>9s}")
         for t in r["groups"][:12]:

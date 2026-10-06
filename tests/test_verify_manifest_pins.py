@@ -57,6 +57,9 @@ _MODULE_FILES = {
     "routes.advanced_analysis": "routes/advanced_analysis.py",
     "core.analysis.top10_selector": "core/analysis/top10_selector.py",
     "core.providers.yahoo_chart_provider": "core/providers/yahoo_chart_provider.py",
+    "core.providers.yahoo_fundamentals_provider": "core/providers/yahoo_fundamentals_provider.py",
+    "core.providers.finnhub_provider": "core/providers/finnhub_provider.py",
+    "core.providers.tadawul_provider": "core/providers/tadawul_provider.py",
     "core.data_engine_v2": "core/data_engine_v2.py",
 }
 

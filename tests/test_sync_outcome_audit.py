@@ -353,7 +353,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
             (1, 5, 20.0),
         )
 
-    def test_runner_missing_symbol_lineage_uses_legacy_klg_fallback(self):
+    def test_runner_missing_modern_symbol_lineage_stays_unknown(self):
         from scripts import run_dashboard_sync as sync
 
         fetched, known = sync._fresh_symbol_lineage(
@@ -378,7 +378,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
         )
         self.assertEqual(
             sync._page_fresh_fetch_metrics(result),
-            (8, 10, 80.0),
+            (None, 10, None),
         )
 
     def test_runner_klg_stub_candidate_is_noncurrent_without_prior(self):
@@ -569,6 +569,110 @@ class SyncOutcomeAuditTests(unittest.TestCase):
             )
         )
 
+    def test_runner_freshness_with_symbol_persistence_disabled(self):
+        from scripts import run_dashboard_sync as sync
+
+        headers = [
+            "Symbol", "Name", "Current Price", "EPS (TTM)", "P/E (TTM)",
+            "Data Provider", "Warnings", "Last Updated (UTC)",
+        ]
+        symbols = ["A.US", "B.US", "C.US", "D.US"]
+        healthy = [
+            [symbol, symbol + " Corp", 10, 1, 10, "eodhd", "", ""]
+            for symbol in symbols
+        ]
+        failed = [list(row) for row in healthy]
+        failed[0][6] = "fetch_failed:timeout"
+        stubbed = [list(row) for row in healthy]
+        stubbed[0] = ["A.US", "", "", "", "", "history", "no_data_stub", ""]
+
+        class Backend:
+            def __init__(self, rows):
+                self.rows = rows
+
+            async def post_json(self, _path, _payload):
+                return {
+                    "headers": list(headers),
+                    "rows_matrix": [list(row) for row in self.rows],
+                }, None, 200
+
+        class Writer:
+            def __init__(self):
+                self.written = []
+
+            def _get_service(self):
+                return object()
+
+            def read_values(self, *_args, **_kwargs):
+                return []
+
+            def write_table(self, _sheet_id, _page, _start, _headers, rows):
+                self.written = [list(row) for row in rows]
+                return len(rows)
+
+        task = sync.TaskSpec(
+            "GLOBAL_MARKETS", "Global_Markets", "analysis", max_symbols=4
+        )
+        env = {
+            "TFB_MARKET_SYMBOL_READBACK": "0",
+            "TFB_SYNC_SYMBOL_BATCH_SIZE": "0",
+            "TFB_SYNC_SYMBOL_PERSISTENCE": "0",
+            "TFB_SYNC_PERSISTENCE_HARD": "0",
+            "TFB_SYNC_KEEP_LAST_GOOD": "1",
+            "TFB_SYNC_KLG_FETCHFAIL": "off",
+            "TFB_SYNC_ROW_ID_FIREWALL": "0",
+            "TFB_SYNC_NAME_DEDUP_MODE": "off",
+            "TFB_SYNC_OHLC_LAKE": "0",
+            "TFB_SYNC_FALSE_GREEN_SCREEN": "0",
+            "TFB_SYNC_STATUS_STAMP": "0",
+            "TFB_SYNC_FETCHFAIL_TRUTH": "off",
+            "TFB_SYNC_IDENTITY_TRIPWIRE": "0",
+            "TFB_SYNC_COHERENCE_TRIPWIRE": "0",
+            "TFB_SYNC_EODHD_QUOTA_GUARD": "off",
+            "TFB_SYNC_STALE_SKIP_RED": "1",
+            "TFB_AUDIT_REQUIRE_FULL_FETCH": "1",
+            "TFB_AUDIT_MIN_FRESH_PCT": "95",
+        }
+        cases = (
+            ("healthy", healthy, 4, 0, "ok"),
+            ("missing", healthy[:3], 3, 0, "blocked"),
+            ("fetchfailed", failed, 3, 0, "blocked"),
+            ("unusable", stubbed, 3, 1, "blocked"),
+        )
+        for name, rows, fresh, noncurrent, audit_status in cases:
+            with self.subTest(name=name), mock.patch.dict("os.environ", env), \
+                    mock.patch.object(sync, "_read_symbols", return_value=symbols), \
+                    mock.patch.object(sync, "_persist_missing_symbol_rows") as persist:
+                writer = Writer()
+                result = asyncio.run(sync._run_one_task(
+                    task, "sheet", "A1", -1, False, False, Backend(rows), writer
+                ))
+                self.assertEqual(result.status, "success", result.error)
+                self.assertEqual(writer.written, rows)
+                persist.assert_not_called()
+                self.assertTrue(result._stamp_meta["fresh_lineage_known"])
+                self.assertEqual(result._stamp_meta["pre_persist_rows"], len(rows))
+                self.assertEqual(result._stamp_meta["noncurrent_fetched"], noncurrent)
+                self.assertEqual(
+                    sync._page_fresh_fetch_metrics(result),
+                    (fresh, 4, 100.0 * fresh / 4),
+                )
+                with mock.patch.object(sync.logger, "info") as info, \
+                        mock.patch.object(sync, "_page_newest_stamp_age_h", return_value=1):
+                    sync._apply_stale_skip_escalation([result], writer, "sheet")
+                verdict = next(
+                    call.args[0] % call.args[1:]
+                    for call in info.call_args_list
+                    if "fresh_rows=" in call.args[0]
+                )
+                other_pages = "".join(
+                    self._line(page, fresh=10, requested=10)
+                    for page in CRITICAL_MARKET_PAGES
+                    if page != "Global_Markets"
+                )
+                audit = self._audit(other_pages + verdict + "\n")
+                self.assertEqual(audit.status, audit_status)
+
     def test_runner_lineage_drives_page_status_and_upstream_coverage(self):
         from scripts import run_dashboard_sync as sync
 
@@ -712,17 +816,17 @@ class SyncOutcomeAuditTests(unittest.TestCase):
             )
             enforce_feed = sync._uv_page_state(result)
 
-        self.assertIn("fresh=2", off_status[3])
-        self.assertNotIn("fetchfail=", off_status[3])
-        self.assertIn("fresh=2", observe_status[3])
+        self.assertIn("fresh=1", off_status[3])
+        self.assertIn("fetchfail=1/0", off_status[3])
+        self.assertIn("fresh=1", observe_status[3])
         # The old-stamped A origin is exact-new by provenance, never also
         # reported as carried; appended prior failures do not affect coverage.
         self.assertIn("fetchfail=1/0", observe_status[3])
-        self.assertIn("would_cov=25.0%", observe_status[3])
+        self.assertNotIn("would_cov=", observe_status[3])
         self.assertIn("fresh=1", enforce_status[3])
         self.assertIn("fetchfail=1/0", enforce_status[3])
-        self.assertEqual(off_feed, ("STALE_COV", 50.0))
-        self.assertEqual(observe_feed, ("STALE_COV", 50.0))
+        self.assertEqual(off_feed, ("STALE_COV", 25.0))
+        self.assertEqual(observe_feed, ("STALE_COV", 25.0))
         self.assertEqual(enforce_feed, ("STALE_COV", 25.0))
 
     def test_runner_audit_coverage_counts_new_fetch_failures_as_not_fresh(self):

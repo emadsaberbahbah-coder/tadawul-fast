@@ -2,8 +2,17 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.9.0
+Yahoo Finance Fundamentals Provider -- v6.9.1
 ================================================================================
+v6.9.1 -- SINGLEFLIGHT CANCELLATION SAFETY
+--------------------------------------------------------------------------------
+Followers now await the shared Future through asyncio.shield(), so cancelling
+one caller cannot cancel the result awaited by the owner and other followers.
+If the owner is cancelled, it explicitly cancels that shared Future before the
+existing identity-checked cleanup, waking every follower instead of leaving
+them blocked forever. No lock is held across an await; routing, payloads,
+concurrency limits and cross-loop replacement semantics are unchanged.
+
 v6.9.0 -- LOOPGUARD (P-203): ASYNC STATE SURVIVES asyncio.run() PER CALL
 --------------------------------------------------------------------------------
 WHY (Render 2026-10-04 17:53:09 UTC, four "unhandled future / semaphore is
@@ -284,7 +293,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.9.0"
+PROVIDER_VERSION = "6.9.1"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1899,12 +1908,22 @@ class SingleFlight:
                 self._futs[key] = fut
                 owner = True
         if not owner:
-            return await fut  # type: ignore[return-value]
+            # v6.9.1: a cancelled follower must not cancel the shared Future
+            # (and therefore every other waiter).  The owner remains the sole
+            # task responsible for completing or cancelling it.
+            return await asyncio.shield(fut)  # type: ignore[return-value]
         try:
             res = await coro_fn()
             if not fut.done():
                 fut.set_result(res)
             return res
+        except asyncio.CancelledError:
+            # v6.9.1: CancelledError is a BaseException on supported Python
+            # versions, so the Exception branch below cannot wake followers.
+            # Completing the shared Future before cleanup prevents a hang.
+            if not fut.done():
+                fut.cancel()
+            raise
         except Exception as exc:
             if not fut.done():
                 fut.set_exception(exc)

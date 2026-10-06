@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.2)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.3)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1315,6 +1315,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1322,6 +1323,10 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.data_validity import coverage_validity, MAX_CLOCK_SKEW_SECONDS
 
 try:
     from scripts.critical_symbol_identity import (
@@ -1837,7 +1842,16 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.2"
+SCRIPT_VERSION = "6.64.4"
+# v6.64.4: source validity is factual in every rollout mode. Status/feed
+# compare exact coverage, and unknown modern lineage cannot certify a source.
+# -----------------------------------------------------------------------------
+# v6.64.3 (2026-10-06) - FRESHNESS INDEPENDENT OF PERSISTENCE ROLLBACK
+# -----------------------------------------------------------------------------
+# Capture requested rows and fetched-origin/fetch-failure lineage even when
+# TFB_SYNC_SYMBOL_PERSISTENCE=0. Only prior-row restoration depends on that
+# switch; a healthy rollback fetch must still emit auditable exact coverage.
+# Fetches, outgoing rows, writes and task exit codes are unchanged.
 # -----------------------------------------------------------------------------
 # v6.64.2 (2026-10-06) - PAGE-VERDICT OLD-ROW LINEAGE TRUTH
 # -----------------------------------------------------------------------------
@@ -7288,6 +7302,8 @@ def _fresh_fetch_base(res: Any) -> Tuple[Optional[int], int]:
             fetched_origin = int(meta.get("fetched_origin") or 0)
             noncurrent = int(meta.get("noncurrent_fetched") or 0)
             return max(0, fetched_origin - noncurrent), requested
+        if "fresh_lineage_known" in meta:
+            return None, requested
         pre_rows = meta.get("pre_persist_rows")
         klg = int(meta.get("klg_kept") or 0)
         fresh = (
@@ -7353,7 +7369,7 @@ def _fetchfail_truth_selftest() -> str:
 
 
 def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
-                         meta: dict) -> str:
+                         meta: dict, *, fresh=None, requested=None) -> str:
     """v6.51.0: THE cohort verdict, factored verbatim from _status_stamp_row
     (v6.45.0 R4) so the stamp message, the Status cell and the feed token can
     never disagree again. COMPLETE only when the leg succeeded, nothing
@@ -7367,7 +7383,14 @@ def _status_data_verdict(status_lower: str, failed: int, cov, fresh_min,
         out = "COMPLETE"
         if str(status_lower or "") != "success" or int(failed or 0) > 0:
             out = "PARTIAL"
-        if cov is not None and float(cov) < float(fresh_min):
+        if requested is None and cov is not None and float(cov) < float(fresh_min):
+            out = "PARTIAL"
+        if requested is not None and "fresh_lineage_known" in meta and (
+                meta.get("fresh_lineage_known") is not True
+                or meta.get("fetchfail_lineage_known") is not True):
+            out = "PARTIAL"
+        if requested is not None and not coverage_validity(
+                requested, fresh, fresh_min).valid:
             out = "PARTIAL"
         if rbst == "DIVERGENT" and not (
                 isinstance(rep_after, int) and 0 <= rep_after <= pw_fl):
@@ -7455,14 +7478,16 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # v6.62.0 [P-162]: fetch-failed rows the engine returned are refresh
     # FAILURE, not fresh data. One pure step decides the number every
     # downstream consumer reads (off = the two lines above, byte-identical).
-    fresh, cov, ff_note = _fetchfail_truth_apply(fresh, requested, meta)
+    fresh, cov, ff_note = _fetchfail_truth_apply(fresh, requested, meta, mode="enforce")
     fresh_min = 95.0
     try:
         fresh_min = float((os.getenv("TFB_SYNC_STATUS_FRESH_MIN") or "95").strip())
     except Exception:
         pass
     status_cell = status.upper() if status else "UNKNOWN"
-    if (status_cell == "SUCCESS" and cov is not None and cov < fresh_min):
+    coverage_required = page in _RANKED_MARKET_PAGES or requested > 0
+    if (coverage_required and status_cell == "SUCCESS" and not coverage_validity(
+            requested, fresh, fresh_min).valid):
         status_cell = "PARTIAL_FRESH"
     # v6.45.0 R4: data_status = the cohort verdict a consumer can trust.
     # COMPLETE only when the leg succeeded, nothing failed, refresh coverage
@@ -7474,8 +7499,9 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # v6.51.0: single source of truth - the same arithmetic now also decides
     # the Status cell (below, gated) and the per-page feed token (AT-07).
     data_status = _status_data_verdict(status.lower(), failed, cov,
-                                       fresh_min, meta)
-    if (_status_truth_enabled() and data_status == "PARTIAL"
+                                       fresh_min, meta, fresh=fresh,
+                                       requested=requested if coverage_required else None)
+    if (data_status == "PARTIAL"
             and status_cell == "SUCCESS"):
         # v6.51.0 AT-07: SUCCESS may never sit over data=PARTIAL.
         status_cell = "PARTIAL"
@@ -8147,12 +8173,7 @@ def _uv_page_state(res: Any) -> tuple:
     meta = dict(getattr(res, "_stamp_meta", None) or {})
     fresh, requested = _fresh_fetch_base(res)
     cov = None
-    if fresh is not None and requested > 0:
-        cov = round(100.0 * fresh / requested, 1)
-        # v6.62.0 [P-162]: the feed token consumes the SAME fetch-failed
-        # correction as the stamp (enforce only; observe/off = unchanged).
-        if _fetchfail_truth_mode() == "enforce":
-            cov = _fetchfail_truth_apply(fresh, requested, meta)[1]
+    fresh, cov, _note = _fetchfail_truth_apply(fresh, requested, meta, mode="enforce")
     if status == "success":
         fmin = 95.0
         try:
@@ -8160,16 +8181,12 @@ def _uv_page_state(res: Any) -> tuple:
                          .strip())
         except Exception:
             pass
-        if cov is not None and cov < fmin:
+        if not coverage_validity(requested, fresh, fmin).valid:
             return "STALE_COV", cov
-        if _status_truth_enabled():
-            # v6.51.0 AT-07: a success leg whose cohort verdict is PARTIAL
-            # (failed rows, coverage floor, or unrepaired DIVERGENT readback)
-            # may not feed OK into the EXECUTABLE composite.
-            _failed = int(getattr(res, "rows_failed", 0) or 0)
-            if _status_data_verdict("success", _failed, cov, fmin,
-                                    meta) == "PARTIAL":
-                return "PARTIAL", cov
+        _failed = int(getattr(res, "rows_failed", 0) or 0)
+        if _status_data_verdict("success", _failed, cov, fmin,
+                                meta, fresh=fresh, requested=requested) == "PARTIAL":
+            return "PARTIAL", cov
         return "OK", cov
     if status == "partial":
         return "PARTIAL", cov
@@ -8187,16 +8204,11 @@ def _uv_parse_value(val: str) -> tuple:
         ts = None
         for p in parts:
             try:
-                ts = time.mktime(time.strptime(p, "%Y-%m-%d %H:%M:%S"))
-                break
-            except Exception:
-                pass
-            try:
-                # v6.46.0: tolerate an explicit UTC-offset suffix
-                # ("2026-08-27 03:11:19+03:00") by parsing the naive prefix;
-                # producer and runner share the same zone, so [:19] is exact.
-                if len(p) >= 19:
-                    ts = time.mktime(time.strptime(p[:19], "%Y-%m-%d %H:%M:%S"))
+                if len(p) >= 19 and p[4:5] == "-" and p[7:8] == "-":
+                    parsed = datetime.fromisoformat(p.replace("Z", "+00:00"))
+                    # Legacy stamps without an offset use the producer's local
+                    # timezone. Modern offset-bearing stamps preserve the instant.
+                    ts = parsed.timestamp()
                     break
             except Exception:
                 continue
@@ -8218,7 +8230,11 @@ def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
     for page in _upstream_verdict_pages():
         state, ts = page_states.get(page, ("", None))
         label = state or "MISSING"
-        if ts is not None and (now_epoch - ts) > max_age:
+        if ts is None:
+            label = "TIMESTAMP_UNKNOWN"
+        elif now_epoch - ts < -MAX_CLOCK_SKEW_SECONDS:
+            label = "FUTURE"
+        elif now_epoch - ts > max_age:
             label = "AGED"
         frags.append(f"{abbr.get(page, page)}:{label}")
         if not reason and label != "OK":
@@ -10934,6 +10950,10 @@ def _page_fresh_fetch_metrics(res: Any) -> Tuple[Optional[int], int, Optional[fl
     try:
         meta = dict(getattr(res, "_stamp_meta", None) or {})
         fresh, requested = _fresh_fetch_base(res)
+        if "fresh_lineage_known" in meta and (
+                meta.get("fresh_lineage_known") is not True
+                or meta.get("fetchfail_lineage_known") is not True):
+            return None, requested, None
         # Audit telemetry always reports the factual numerator. The workflow
         # may keep workbook/feed fetchfail truth in observe mode; PAGE enforces
         # the disjoint exact-origin count (or the legacy final census).
@@ -11776,16 +11796,10 @@ async def _run_one_task(
             logger.warning(msg)
         # ---------------------------------------------------------------------
 
-        # --- Per-symbol persistence (v6.19.0, WHY 1) -------------------------
-        # The empty-guard blocks a ZERO-row write and the shrink guard blocks
-        # <70% coverage — but a 70-99% fetch still rewrote the page verbatim,
-        # silently deleting every requested symbol the backend missed (and,
-        # because the sheet is the symbol source, deleting it PERMANENTLY).
-        # Append the last-good row of each requested-but-missing symbol so a
-        # fetch miss can never remove an operator symbol; the next healthy
-        # fetch replaces the preserved row with fresh data in place.
-        if (_symbol_persistence_enabled() and task.expects_rows and symbols
-                and rows_matrix and headers and sheets is not None):
+        # v6.64.3: fetched evidence is independent of the persistence rollback.
+        # Capture it before any prior-row restoration so later KLG/firewall
+        # stages can exclude noncurrent identities in either switch state.
+        if task.expects_rows and symbols and rows_matrix and headers:
             try:
                 res._stamp_meta["requested"] = len(symbols or [])
                 res._stamp_meta["pre_persist_rows"] = len(rows_matrix or [])
@@ -11811,6 +11825,22 @@ async def _run_one_task(
                         res._stamp_meta["ff_new_fetched"] = len(
                             _fetchfail_origin_symbols
                         )
+            except Exception as _fe:
+                _fw = f"[FRESH-COVERAGE v6.64.3] capture skipped (error: {_fe})"
+                res.warnings.append(_fw)
+                logger.warning(_fw)
+
+        # --- Per-symbol persistence (v6.19.0, WHY 1) -------------------------
+        # The empty-guard blocks a ZERO-row write and the shrink guard blocks
+        # <70% coverage — but a 70-99% fetch still rewrote the page verbatim,
+        # silently deleting every requested symbol the backend missed (and,
+        # because the sheet is the symbol source, deleting it PERMANENTLY).
+        # Append the last-good row of each requested-but-missing symbol so a
+        # fetch miss can never remove an operator symbol; the next healthy
+        # fetch replaces the preserved row with fresh data in place.
+        if (_symbol_persistence_enabled() and task.expects_rows and symbols
+                and rows_matrix and headers and sheets is not None):
+            try:
                 rows_matrix, _kept_syms = _persist_missing_symbol_rows(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix, symbols
                 )
