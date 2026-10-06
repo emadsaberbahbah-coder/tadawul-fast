@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/advanced_sheet_rows.py
 """
+v4.4.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-ADVANCED Sheet-Rows Router — RETIRED ORPHAN (NOT MOUNTED) — v4.4.0
+ADVANCED Sheet-Rows Router — RETIRED ORPHAN (NOT MOUNTED) — v4.4.1
 ================================================================================
 THIS FILE IS NOT THE LIVE ANALYSIS ROUTER. DO NOT CONFUSE THE TWO.
 
@@ -16,9 +19,8 @@ plan, so NOTHING in this file is mounted at runtime. It is retained ONLY so that
 legacy string-based resolver fallbacks referencing
 "routes.advanced_sheet_rows._run_advanced_sheet_rows_impl" still import cleanly;
 those fallbacks sit AFTER `routes.advanced_analysis` in every resolver chain, so
-this code is effectively never reached. The body below is kept BYTE-FOR-BYTE at
-v4.4.0 — only the header identity (filename comment, this banner, and the version
-constant name) was corrected — so there is zero behavioural drift.
+this code is effectively never reached. The historical v4.4.0 body remains except for the v4.4.1 route-path auth
+hardening described above.
 
 >>> IF YOU ARE EDITING SHEET-ROWS CONTRACT LOGIC, you want
 >>> routes/analysis_sheet_rows.py (currently v4.5.1), NOT this file. <<<
@@ -144,6 +146,8 @@ Co-deployment matrix (Wave 2A + Wave 3 + Fix-K gate)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import importlib
 import inspect
@@ -233,7 +237,7 @@ except Exception:
 
 
 # Canonical, clearly-named identity for THIS module (routes/advanced_sheet_rows).
-ADVANCED_SHEET_ROWS_VERSION = "4.4.0"
+ADVANCED_SHEET_ROWS_VERSION = "4.4.1"
 # Backward-compat alias: this file began as a copy of the analysis router, so its
 # internal log lines and the response 'version' field reference
 # ANALYSIS_SHEET_ROWS_VERSION (14 references below). Keep it as an alias so none
@@ -820,7 +824,7 @@ def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorizat
             return True
     except Exception:
         pass
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    path = request_path(request)
     if _is_public_path(settings, path):
         return True
     headers_dict = dict(request.headers)
@@ -2448,7 +2452,7 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         "engine_source": eng_src,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "auth": auth_summary,
-        "path": str(getattr(getattr(request, "url", None), "path", "")),
+        "path": request_path(request),
         # v4.4.0: expose the registry-derived contract widths the router is
         # serving so operators can confirm at-a-glance whether Top_10 is at
         # the full canonical width or still tracking a stale 90/93 registry.

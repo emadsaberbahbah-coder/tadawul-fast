@@ -267,7 +267,7 @@ def T(name, cond, detail=""):
 
 
 mod = m()
-T("R0 delivered SCRIPT_VERSION 6.64.2", mod.SCRIPT_VERSION == "6.64.2", mod.SCRIPT_VERSION)
+T("R0 delivered SCRIPT_VERSION 6.64.4", mod.SCRIPT_VERSION == "6.64.4", mod.SCRIPT_VERSION)
 base = b()
 if base is not None:
     T("R0 base SCRIPT_VERSION 6.63.0 (dual-tree armed)", base.SCRIPT_VERSION == "6.63.0", base.SCRIPT_VERSION)
@@ -509,7 +509,7 @@ det = json.loads(row6[9])
 T("R6 Details JSON: names, counts, tab stats, selftest, version, R5 run meta (run_id, ts_utc)",
   det["names"] == ["DEAD1.US", "DEAD2.US", "OLD.US"] and det["retired"] == 3 and det["requested_before"] == 11
   and det["requested_after"] == 11 and det["verdict"] == "refused" and det["tab_rows"] == 4 and det["tab_junk"] == 1
-  and det["selftest"] == "PASS" and det["version"] == "6.64.2" and det["run_id"] == "36646905345" and "ts_utc" in det, det)
+  and det["selftest"] == "PASS" and det["version"] == "6.64.4" and det["run_id"] == "36646905345" and "ts_utc" in det, det)
 T("R6 message names the tag, verdict, counts, tab and selftest",
   row6[5].startswith("[UNIVERSE-RETIRE v6.64.0] Global_Markets | mode=enforce verdict=refused matched=3 of 11 requested")
   and "tab=_Retired_Symbols rows=4 junk=1" in row6[5] and "selftest=PASS" in row6[5], row6[5])
@@ -552,7 +552,7 @@ T("R7 stamp Status cell / data verdict unaffected by the token", row_0[2] == row
 if base is not None:
     row_b = _stamp_row(base, 0)
     T("R7 base parity: with no retirement the delivered Message == base Message (version tag masked; timestamp column excluded)",
-      row_b[3].replace("v6.63.0", "vX") == row_0[3].replace("v6.64.2", "vX") and row_b[2] == row_0[2]
+      row_b[3].replace("v6.63.0", "vX") == row_0[3].replace("v6.64.4", "vX") and row_b[2] == row_0[2]
       and row_b[6:] == row_0[6:], (row_b[3][:120], row_0[3][:120]))
 digest.append([row_3[3].split(" | ")[0]])
 

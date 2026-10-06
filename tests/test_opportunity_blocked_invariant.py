@@ -51,6 +51,18 @@ def _build_row(row: Dict[str, Any], criteria: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _direct_identity_gates(
+    investability: str, criteria: Dict[str, Any]
+) -> list[Dict[str, Any]]:
+    candidate = ob.normalize_candidate(
+        _row(investability), {"SAR": 1.0}, criteria
+    )
+    return [
+        gate for gate in ob.evaluate_gates(candidate, criteria)
+        if gate["gate"] == "Blocked Identity"
+    ]
+
+
 def test_builder_rejects_blocked_when_env_and_request_try_to_disarm(monkeypatch):
     monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
     payload = _build(
@@ -173,6 +185,122 @@ def test_explicit_legacy_enable_keeps_nonblocked_pass_trace(monkeypatch):
         if gate["gate"] == "Blocked Identity"
     ]
     assert len(identity) == 1 and identity[0]["passed"] is True
+
+
+def test_prepared_criteria_preserve_trace_intent_for_direct_evaluation(
+    monkeypatch,
+):
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
+    default_off = ob.make_criteria({"investability_gate_enabled": False})
+
+    # The public compatibility snapshot remains invariant truth; its private
+    # trace provenance must not become another response/snapshot key.
+    assert default_off["blocked_identity_gate_enabled"] is True
+    assert "_blocked_identity_trace_enabled" not in default_off
+    assert _direct_identity_gates("WATCHLIST", default_off) == []
+    assert _direct_identity_gates("WATCHLIST", default_off.copy()) == []
+
+    blocked = _direct_identity_gates("BLOCKED", default_off)
+    assert len(blocked) == 1 and blocked[0]["passed"] is False
+
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "1")
+    env_enabled = ob.make_criteria({"investability_gate_enabled": False})
+    identity = _direct_identity_gates("WATCHLIST", env_enabled)
+    assert len(identity) == 1 and identity[0]["passed"] is True
+
+    request_disabled = ob.make_criteria({
+        "investability_gate_enabled": False,
+        "blocked_identity_gate_enabled": False,
+    })
+    for criteria in (
+        request_disabled,
+        request_disabled.copy(),
+        ob.make_criteria(request_disabled),
+    ):
+        assert _direct_identity_gates("WATCHLIST", criteria) == []
+
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
+    request_enabled = ob.make_criteria({
+        "investability_gate_enabled": False,
+        "blocked_identity_gate_enabled": True,
+    })
+    for criteria in (
+        request_enabled,
+        request_enabled.copy(),
+        ob.make_criteria(request_enabled),
+    ):
+        identity = _direct_identity_gates("WATCHLIST", criteria)
+        assert len(identity) == 1 and identity[0]["passed"] is True
+
+
+def test_build_preserves_trace_intent_from_prepared_criteria(monkeypatch):
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
+    prepared_off = ob.make_criteria({"investability_gate_enabled": False})
+
+    # Changing the process env after normalization must not reinterpret the
+    # invariant public True value as an explicit PASS-trace request.
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "1")
+    payload = _build("WATCHLIST", prepared_off)
+    assert "Blocked Identity" not in {
+        gate["gate"] for gate in payload["candidates_rows"][0]["gates"]
+    }
+
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
+    prepared_on = ob.make_criteria({
+        "investability_gate_enabled": False,
+        "blocked_identity_gate_enabled": True,
+    })
+    payload = _build("WATCHLIST", prepared_on)
+    identity = [
+        gate for gate in payload["candidates_rows"][0]["gates"]
+        if gate["gate"] == "Blocked Identity"
+    ]
+    assert len(identity) == 1 and identity[0]["passed"] is True
+
+
+def test_pregate_cap_does_not_let_blocked_row_crowd_out_safe_row(monkeypatch):
+    monkeypatch.setenv("TFB_OPP_BLOCKED_IDENTITY_GATE", "0")
+    monkeypatch.setenv("TFB_OPP_PREGATE_ORDER", "1")
+    monkeypatch.setenv("TFB_OPP_SCAN_UNCAPPED", "0")
+
+    blocked = _row("INVESTABLE")
+    blocked.update({
+        "symbol": "BAD.SR",
+        "forecast_reliability_score": 99.0,
+        # Conflict-safe raw alias scanning must see this duplicate normalized
+        # header even though the canonical field above carries a safe value.
+        "Investability Status": "B-L-O-C-K-E-D",
+    })
+    safe = _row("WATCHLIST")
+    safe["symbol"] = "SAFE.SR"
+
+    capped = ob.build_opportunity_payload(
+        [blocked, safe],
+        criteria={
+            "max_candidates": 1,
+            "investability_gate_enabled": False,
+        },
+        portfolio={"cash_available_sar": 50_000},
+    )
+    assert capped["kpis"]["scanned"] == 1
+    assert [ticket["symbol"] for ticket in capped["selected"]] == ["SAFE.SR"]
+    assert capped["kpis"]["pregate"]["fail_blocked_identity"] == 1
+
+    uncapped = ob.build_opportunity_payload(
+        [blocked, safe],
+        criteria={
+            "max_candidates": 0,
+            "investability_gate_enabled": False,
+        },
+        portfolio={"cash_available_sar": 50_000},
+    )
+    assert uncapped["kpis"]["scanned"] == 2
+    blocked_audit = next(
+        row for row in uncapped["candidates_rows"]
+        if row["symbol"] == "BAD.SR"
+    )
+    assert blocked_audit["verdict"] == "DO_NOT_INVEST"
+    assert blocked_audit["first_fail"]["gate"] == "Blocked Identity"
 
 
 def test_mounted_route_cannot_disarm_blocked_invariant(monkeypatch):

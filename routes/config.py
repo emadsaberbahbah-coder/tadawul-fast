@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/config.py
 """
+v5.9.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-TFB Config Routes — v5.9.0
+TFB Config Routes — v5.9.1
 ================================================================================
 CONFIG-ONLY • SCHEMA-DECOUPLED • PROMETHEUS-SAFE • RENDER-SAFE • AUTH-COMPATIBLE
 FLEXIBLE-AUTH-OK • STATE-AWARE-REQUEST-ID • RESPONSE-HEADER-PROPAGATION
@@ -56,6 +59,8 @@ Those endpoints are owned by `routes.advanced_analysis`.
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import logging
 import os
 import uuid
@@ -72,7 +77,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.config")
 
-ROUTER_VERSION = "5.9.0"
+ROUTER_VERSION = "5.9.1"
 ROUTE_OWNER_NAME = "config"
 ROUTE_FAMILY_NAME = "config"
 
@@ -319,7 +324,7 @@ def _auth_ok(request: Request, *, query_token: Optional[str] = None) -> bool:
     token = info.get("token")
     authz = info.get("authorization")
 
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    path = request_path(request)
     headers_dict = dict(request.headers)
     settings = _get_settings_cached(force_reload=False)
 

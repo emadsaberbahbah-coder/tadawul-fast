@@ -2,7 +2,7 @@
 # tests/test_ycp_loopguard_b6.py
 """
 ================================================================================
-B6-b LOOPGUARD harness -- core/providers/yahoo_chart_provider.py v8.15.0
+B6-b LOOPGUARD harness -- core/providers/yahoo_chart_provider.py v8.15.2
 ================================================================================
 Zero network. The HTTP leg (_raw_chart_fetch_triple) is stubbed in-process, so
 the REAL SingleFlight / TokenBucket / CircuitBreaker / AdvancedCache path runs.
@@ -18,7 +18,7 @@ G2 DELIVERED: both loops return every symbol; the fetch stub runs exactly once
 G3 STATIC (ast): the three dataclass locks and _PROVIDER_LOCK are
    threading-based, no 'await' sits inside any 'with <threading lock>' block,
    zero defs removed (additions are the LOOPGUARD helpers only), and
-   PROVIDER_VERSION == "8.15.0" with the header banner in lockstep.
+   PROVIDER_VERSION == "8.15.2" with the header banner in lockstep.
 
 Runs both ways:
     /home/user/tfb-venv/bin/python tests/test_ycp_loopguard_b6.py
@@ -42,7 +42,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 TARGET = _REPO / "core" / "providers" / "yahoo_chart_provider.py"
-EXPECTED_VERSION = "8.15.0"
+EXPECTED_VERSION = "8.15.2"
 BASE_ENV = "YCP_BASE"
 
 
@@ -303,7 +303,7 @@ def _run_g1(record: Any) -> None:
 
 
 def _run_g2(record: Any) -> None:
-    """The delivered v8.15.0 module: no loss, dedup intact, no stale awaits."""
+    """The delivered v8.15.2 module: no loss, dedup intact, no stale awaits."""
     mod = _load_target()
     calls = _install_fetch_stub(mod)
     provider = mod.YahooChartProvider()
@@ -514,7 +514,7 @@ def test_g1_golden_negative_on_base() -> None:
 
 
 def test_g2_delivered_no_loss_and_dedup() -> None:
-    """v8.15.0: every symbol on both loops, one fetch per key per loop."""
+    """v8.15.2: every symbol on both loops, one fetch per key per loop."""
     _assert_group(_run_g2)
 
 

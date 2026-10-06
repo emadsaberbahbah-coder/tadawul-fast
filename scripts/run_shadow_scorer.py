@@ -1,6 +1,16 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.4 (2026-10-06): calibration consumes one publication snapshot,
+requires sufficient valid counts and finite nonnegative MAE, and interprets
+Riyadh timestamps on an aware UTC clock with the shared five-minute skew bound.
+Missing extra v2 evidence preserves an independently established FAIL.
+
+VERSION 1.9.3 (2026-10-06): absent/unreadable CA or PIT evidence is unknown,
+so criterion 5 remains PENDING. Known breaches remain FAIL in every v2 mode.
+This checks recorded actions and append-only integrity; it does not certify
+external ledger coverage, data-source freshness or complete PIT archives.
+
 VERSION 1.7.3  (2026-09-08)  — FRESHNESS READ-BACK: NAME THE STARVERS (P-109)
 WHY v1.7.3: S-1 sits at 3/28 scored days with 33 excluded-infra; every
 trading day since 2026-09-02 ended `excluded_reason=fresh-floor` while the
@@ -111,11 +121,13 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -123,6 +135,7 @@ sys.path.insert(0, _ROOT)
 
 from core.analysis import opportunity_builder as ob   # noqa: E402
 from core import regret as rg                        # noqa: E402
+from core.data_validity import MAX_CLOCK_SKEW_SECONDS, timestamp_freshness  # noqa: E402
 
 _SB_PATH = os.path.join(_ROOT, "scripts", "run_shadow_board.py")
 _spec = importlib.util.spec_from_file_location("tfb_shadow_board", _SB_PATH)
@@ -447,7 +460,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.2"
+SCRIPT_VERSION = "1.9.4"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -596,24 +609,56 @@ def _s1_cal_consume() -> bool:
 
 def _s1_cal_max_age_h() -> float:
     try:
-        return abs(float((os.getenv("TFB_S1_CAL_MAX_AGE_H") or "48").strip()))
+        return float((os.getenv("TFB_S1_CAL_MAX_AGE_H") or "48").strip())
     except Exception:
         return 48.0
 
 
-def read_s1_calibration(sh, now_local: Optional[datetime] = None
-                        ) -> Tuple[str, str]:
+def _s1_calibration_snapshot(sh) -> Tuple[List[List[Any]], Optional[str]]:
+    """Read one publication for both its state and baseline comparison."""
+    try:
+        return sh.worksheet(TAB_S1_CAL).get_all_values() or [], None
+    except Exception as exc:
+        return [], f"no {TAB_S1_CAL} tab ({type(exc).__name__})"
+
+
+def _finite_nonnegative(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0.0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _checkpoint_count(value: str) -> Optional[int]:
+    try:
+        number = Decimal(value)
+        if not number.is_finite() or number < 0 or number != number.to_integral_value():
+            return None
+        return int(number)
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+
+
+def read_s1_calibration(
+    sh, now_local: Optional[datetime] = None, *,
+    _snapshot: Optional[Tuple[List[List[Any]], Optional[str]]] = None,
+) -> Tuple[str, str]:
     """v1.4.0 Wave B -> (state, detail). state is always one of
     PASS / FAIL / PENDING. Every failure mode resolves to PENDING with the
     reason in `detail`; this function never raises and never guesses."""
     if not _s1_cal_consume():
         return "PENDING", "consumer disabled (TFB_S1_CAL_CONSUME=0)"
-    try:
-        vals = sh.worksheet(TAB_S1_CAL).get_all_values()
-    except Exception as exc:
-        return "PENDING", f"no {TAB_S1_CAL} tab ({type(exc).__name__})"
+    vals, problem = _snapshot if _snapshot is not None else _s1_calibration_snapshot(sh)
+    if problem:
+        return "PENDING", problem
     if not vals or len(vals) < 2:
         return "PENDING", f"{TAB_S1_CAL} empty — tracker has not published"
+    if (not isinstance(vals[0], (list, tuple))
+            or not isinstance(vals[1], (list, tuple))):
+        return "PENDING", "calibration publication rows unreadable"
     header = [str(h).strip().lower() for h in vals[0]]
     row = vals[1]
 
@@ -627,21 +672,46 @@ def read_s1_calibration(sh, now_local: Optional[datetime] = None
     if state not in ("PASS", "FAIL", "PENDING"):
         return "PENDING", f"unreadable state token {state!r}"
     as_of_raw = _cell("as of (riyadh)")
-    stamp = None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            stamp = datetime.strptime(as_of_raw[:19], fmt)
-            break
-        except Exception:
-            continue
-    if stamp is None:
+    try:
+        stamp = datetime.fromisoformat(as_of_raw.replace("Z", "+00:00"))
+        precision = ("datetime" if re.match(
+            r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", as_of_raw) else "date")
+        riyadh = timezone(timedelta(hours=3))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=riyadh)
+        ref = now_local if now_local is not None else datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=riyadh)
+        stamp = stamp.astimezone(timezone.utc)
+        ref = ref.astimezone(timezone.utc)
+    except (TypeError, AttributeError, ValueError, OverflowError):
         return "PENDING", f"unreadable as_of {as_of_raw!r}"
-    ref = now_local or datetime.now()
-    age_h = (ref - stamp).total_seconds() / 3600.0
     limit = _s1_cal_max_age_h()
-    if age_h > limit:
-        return "PENDING", (f"calibration row stale ({age_h:.0f}h > "
+    fresh, age, reason = timestamp_freshness(
+        stamp, ref, precision=precision, max_age_seconds=limit * 3600.0,
+        clock_skew_seconds=MAX_CLOCK_SKEW_SECONDS,
+    )
+    if not fresh:
+        if reason != "timestamp_stale":
+            return "PENDING", f"calibration evidence {reason}"
+        return "PENDING", (f"calibration row stale ({age / 3600.0:.0f}h > "
                            f"{limit:.0f}h) — tracker not publishing")
+    count = _checkpoint_count(_cell("n checkpoints"))
+    minimum = _checkpoint_count(_cell("min sample"))
+    if count is None or minimum is None or minimum < 1:
+        return "PENDING", "calibration checkpoint count or minimum sample invalid"
+    if state in ("PASS", "FAIL"):
+        if count < minimum:
+            return "PENDING", f"calibration sample insufficient ({count}/{minimum})"
+        model_mae = parse_model_mae(header, row)
+        if model_mae is None:
+            return "PENDING", "calibration model MAE unavailable or invalid"
+        band = _finite_nonnegative(_cell("band (pp)"))
+        if band is None:
+            return "PENDING", "calibration error band unavailable or invalid"
+        if state == "PASS" and model_mae > band:
+            return "FAIL", (f"published PASS contradicted by model MAE "
+                            f"{model_mae:.2f}pp > band {band:.2f}pp")
     detail = _cell("detail") or f"n={_cell('n checkpoints')}"
     return state, detail
 
@@ -933,16 +1003,29 @@ def count_compliance_violations(board_rows: Sequence[Sequence[Any]]) -> List[str
     return out
 
 
-def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
+def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[Optional[bool], str]:
     """Criterion 5b: dates strictly increasing per basket, no duplicates."""
+    if not history:
+        return None, "append-only history unavailable (UNKNOWN)"
     seen: Dict[str, List[str]] = {}
+    unknown_note = ""
     for h in history or []:
-        seen.setdefault(h.get("basket", ""), []).append(str(h.get("date", "")))
+        if not h.get("basket") or not h.get("date"):
+            unknown_note = "append-only history identity/date unavailable (UNKNOWN)"
+            continue
+        try:
+            parsed_day = date.fromisoformat(str(h["date"]))
+        except (ValueError, TypeError):
+            unknown_note = "append-only history date unavailable (UNKNOWN)"
+            continue
+        seen.setdefault(h.get("basket", ""), []).append(parsed_day.isoformat())
     for basket, dates in seen.items():
         if len(dates) != len(set(dates)):
             return False, f"duplicate dates in {basket}"
         if dates != sorted(dates):
             return False, f"non-monotonic dates in {basket}"
+    if unknown_note:
+        return None, unknown_note
     return True, "append-only integrity intact"
 
 
@@ -1010,7 +1093,7 @@ def parse_zero_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float]
         if "zero mae (pp)" in hdr:
             v = str(row[hdr.index("zero mae (pp)")]).strip()
             if v:
-                return float(v)
+                return _finite_nonnegative(v)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -1018,7 +1101,7 @@ def parse_zero_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float]
     except Exception:  # noqa: BLE001
         detail = ""
     m = _ZERO_MAE_RE.search(detail or "")
-    return float(m.group(1)) if m else None
+    return _finite_nonnegative(m.group(1)) if m else None
 
 
 def parse_model_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float]:
@@ -1029,7 +1112,7 @@ def parse_model_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float
         if "mean abs error (pp)" in hdr:
             v = str(row[hdr.index("mean abs error (pp)")]).strip()
             if v:
-                return float(v)
+                return _finite_nonnegative(v)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -1037,14 +1120,18 @@ def parse_model_mae(header: Sequence[str], row: Sequence[str]) -> Optional[float
     except Exception:  # noqa: BLE001
         detail = ""
     m = _MODEL_MAE_RE.search(detail or "")
-    return float(m.group(1)) if m else None
+    return _finite_nonnegative(m.group(1)) if m else None
 
 
-def read_s1_calibration_mae(sh) -> Tuple[Optional[float], Optional[float]]:
+def read_s1_calibration_mae(
+    sh, *, _snapshot: Optional[Tuple[List[List[Any]], Optional[str]]] = None,
+) -> Tuple[Optional[float], Optional[float]]:
     """v1.9.2: (zero_mae_pp, model_mae_pp) from _S1_Calibration row 2.
     Any read problem -> (None, None); never raises."""
     try:
-        vals = sh.worksheet(TAB_S1_CAL).get_all_values()
+        vals, problem = _snapshot if _snapshot is not None else _s1_calibration_snapshot(sh)
+        if problem:
+            return None, None
         if not vals or len(vals) < 2:
             return None, None
         return parse_zero_mae(vals[0], vals[1]), parse_model_mae(vals[0], vals[1])
@@ -1080,6 +1167,8 @@ def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
     legacy PASS AND model MAE < zero MAE (zero unpublished -> PENDING);
     criterion 5 -> NOT_EVALUABLE on an empty register. §15 verdict rule
     re-applied (NOT_EVALUABLE counts as pending). Never auto-promotes."""
+    zero_mae_pp = _finite_nonnegative(zero_mae_pp)
+    model_mae_pp = _finite_nonnegative(model_mae_pp)
     g = copy.deepcopy(gate)
     g["v2"] = {"mode": mode, "window_start": str(window_start),
                "window_alpha_pct": (None if window_alpha_pct is None
@@ -1095,7 +1184,8 @@ def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
     c3 = by_id.get(3)
     if c3 is not None:
         if window_alpha_pct is None:
-            w_status, w_txt = "PENDING", f"since {window_start}: insufficient history"
+            w_status = "FAIL" if c3["status"] == "FAIL" else "PENDING"
+            w_txt = f"since {window_start}: insufficient history"
         else:
             w_pass = window_alpha_pct >= 0
             w_status = "PASS" if (w_pass and c3["status"] == "PASS") else (
@@ -1111,7 +1201,8 @@ def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
     c4 = by_id.get(4)
     if c4 is not None:
         if zero_mae_pp is None or model_mae_pp is None:
-            z_status, z_txt = "PENDING", "zero-baseline MAE not published (needs track_performance >= 6.42.0)"
+            z_status = "FAIL" if c4["status"] == "FAIL" else "PENDING"
+            z_txt = "model or zero-baseline MAE unavailable or invalid (needs track_performance >= 6.42.0)"
         else:
             beats = model_mae_pp < zero_mae_pp
             z_status = "PASS" if (beats and c4["status"] == "PASS") else (
@@ -1132,6 +1223,9 @@ def evaluate_s1_v2(gate: Dict[str, Any], mode: str,
             e_txt, e_status = "_Corporate_Actions has 0 rows (vacuous)", "NOT_EVALUABLE"
         else:
             e_txt, e_status = f"_Corporate_Actions rows={ca_rows}", c5["status"]
+        # Missing evidence cannot erase a known CA or date-integrity breach.
+        if c5["status"] == "FAIL":
+            e_status = "FAIL"
         if mode == "observe":
             c5["detail"] += f" | v2: {e_txt} -> would {e_status}"
         else:
@@ -1168,7 +1262,7 @@ def criteria_v2_line(gate: Dict[str, Any]) -> str:
 
 def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
-                calibration_state: str, ca_clean: bool, pit_ok: bool,
+                calibration_state: str, ca_clean: Optional[bool], pit_ok: Optional[bool],
                 pit_note: str, drill_date: Optional[str],
                 excluded_days: int = 0,
                 calibration_detail: str = "") -> Dict[str, Any]:
@@ -1201,9 +1295,16 @@ def evaluate_s1(days: int, violations: List[str],
               "detail": calibration_detail or (
                   "7D/14D horizons land in Wave B (track_performance)"
                   if calibration_state == "PENDING" else "in band")})
+    evidence_status = (
+        "FAIL" if ca_clean is False or pit_ok is False
+        else "PASS" if ca_clean is True and pit_ok is True
+        else "PENDING"
+    )
+    ca_detail = "clean" if ca_clean is True else (
+        "UNREPAIRED" if ca_clean is False else "UNKNOWN (evidence unavailable)")
     c.append({"id": 5, "name": "corporate-actions + point-in-time",
-              "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
-              "detail": f"CA {'clean' if ca_clean else 'UNREPAIRED'}; {pit_note}"})
+              "status": evidence_status,
+              "detail": f"CA {ca_detail}; {pit_note}"})
     c.append({"id": 6, "name": "rollback drill passed",
               "status": "PASS" if drill_date else "PENDING",
               "detail": drill_date or "not yet run (operator, monthly)"})
@@ -1753,21 +1854,53 @@ def find_drill_marker(sh, since: date) -> Optional[str]:
     return f"{newest.isoformat()} ({marker})" if newest else None
 
 
-def ca_is_clean(sh) -> bool:
-    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log."""
+def ca_is_clean(sh) -> Optional[bool]:
+    """No recorded confirmed action needs repair; None means unproven.
+
+    Empty, unreadable or malformed evidence cannot certify this check. A
+    populated, parsed register and readable records only establish repair
+    status for the recorded actions, not completeness of external coverage.
+    """
     try:
         from core import corporate_actions as ca
         rp_path = os.path.join(_ROOT, "scripts", "repair_corporate_actions.py")
         spec = importlib.util.spec_from_file_location("tfb_ca_repair", rp_path)
         rp = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rp)  # type: ignore[union-attr]
-        acts = ca.parse_actions(sh.worksheet(ca.TAB_ACTIONS).get_all_values())
+        values = sh.worksheet(ca.TAB_ACTIONS).get_all_values()
+        if not values or [str(cell).strip() for cell in values[0][:7]] != ca.ACTIONS_HEADER[:7]:
+            return None
+        data = [row for row in values[1:] if any(str(cell).strip() for cell in row)]
+        acts = ca.parse_actions([values[0], *data])
+        if not acts or len(acts) != len(data):
+            return None
         idx = ca.build_adjustment_index(acts, confirmed_only=True)
-        plan, _hdr, _cols = rp.plan_repairs(
-            sh.worksheet("Performance_Log").get_all_values(), idx)
+        records = sh.worksheet("Performance_Log").get_all_values()
+        plan, header, columns = rp.plan_repairs(records, idx)
+        required = ("Record ID", "Symbol", "Date Recorded (Riyadh)", "Entry Price", "Target Price", "Notes")
+        if header is None or any(columns.get(name) is None for name in required):
+            return None
+        # A known outstanding repair takes precedence over unrelated unknown
+        # records. Missing evidence can prevent PASS, never erase a breach.
+        if plan:
+            return False
+        data_records = [row for row in records[header + 1:] if any(str(cell).strip() for cell in row)]
+        if not data_records:
+            return None
+        for row in data_records:
+            def value(name):
+                index = columns[name]
+                return row[index] if index < len(row) else None
+            if (not str(value("Record ID") or "").strip()
+                    or not str(value("Symbol") or "").strip()
+                    or ca._as_date(value("Date Recorded (Riyadh)")) is None
+                    or (ca._as_float(value("Entry Price")) or 0) <= 0):
+                return None
+        if any(not action.confirmed for action in acts):
+            return None
         return len(plan) == 0
     except Exception:  # noqa: BLE001
-        return True          # absence of ledger is not a violation
+        return None          # absence or read failure is not clean evidence
 
 
 # --------------------------------------------------------------------------- #
@@ -2087,13 +2220,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     pit_ok, pit_note = check_point_in_time(history)
     # v1.4.0 Wave B: criterion 4 reads the published measurement instead
     # of the hardcoded literal. Fail-safe to PENDING on any read problem.
-    cal_state, cal_detail = read_s1_calibration(sh)
+    _v2_mode = _criteria_v2_mode()                 # v1.9.2 [P-204/P-201/C5]
+    _cal_snapshot = (_s1_calibration_snapshot(sh)
+                     if _s1_cal_consume() or _v2_mode != "off" else ([], None))
+    cal_state, cal_detail = read_s1_calibration(sh, _snapshot=_cal_snapshot)
     gate = evaluate_s1(days, violations, net_alpha, cal_state,
                        ca_is_clean(sh), pit_ok, pit_note,
                        find_drill_marker(sh, today - timedelta(days=45)),
                        excluded_days=excluded_days,
                        calibration_detail=cal_detail)
-    _v2_mode = _criteria_v2_mode()                 # v1.9.2 [P-204/P-201/C5]
     _v2_line = ""
     if _v2_mode != "off":
         _v2_start = _window_start()
@@ -2103,7 +2238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _v2_alpha = (None if (_v2_cums[CHALLENGER] is None
                               or _v2_cums[BENCHMARK] is None)
                      else _v2_cums[CHALLENGER] - _v2_cums[BENCHMARK])
-        _v2_zero, _v2_model = read_s1_calibration_mae(sh)
+        _v2_zero, _v2_model = read_s1_calibration_mae(sh, _snapshot=_cal_snapshot)
         _v2_ca_rows = ca_register_rows(sh)
         _v2_set = hashlib.sha256(",".join(sorted(chal_syms)).encode("utf-8")).hexdigest()[:8]
         gate = evaluate_s1_v2(gate, _v2_mode, _v2_alpha, _v2_start, _v2_zero,

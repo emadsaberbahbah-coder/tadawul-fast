@@ -41,8 +41,8 @@ def _wire(monkeypatch):
     assert callable(getattr(pa, "advisor_switch_scan", None)), \
         "advisor_switch_scan dependency missing -- strict test must FAIL"
     store = {}
-    monkeypatch.setattr(pa, "_confirm_redis_get", store.get)
-    monkeypatch.setattr(pa, "_confirm_redis_put",
+    monkeypatch.setattr(pa, "_switch_redis_get", store.get)
+    monkeypatch.setattr(pa, "_switch_redis_put",
                         lambda k, v: store.__setitem__(k, v))
     monkeypatch.setattr(pa, "_rt_cost_pct_safe", lambda s, t: 0.40)
     return store

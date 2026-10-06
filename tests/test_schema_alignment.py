@@ -81,6 +81,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import os
+import socket
 from dataclasses import asdict, is_dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -550,19 +551,6 @@ def _dd_map_sheet_to_keys(dd_rows: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
 # =============================================================================
 # Local auth patching for deterministic tests
 # =============================================================================
-class _DummySettings:
-    allow_query_token = True
-    open_mode = True
-    require_auth = False
-    auth_header_name = "X-APP-TOKEN"
-    service_name = "TFB Test"
-    app_version = "test"
-    environment = "test"
-    timezone = "Asia/Riyadh"
-    backend_base_url = ""
-    engine_cache_ttl_sec = 1
-
-
 def _patch_auth_open(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPEN_MODE", "1")
     monkeypatch.setenv("REQUIRE_AUTH", "0")
@@ -574,14 +562,10 @@ def _patch_auth_open(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENABLE_REDOC", "0")
     monkeypatch.setenv("INIT_ENGINE_ON_BOOT", "0")
 
-    try:
-        cfg = importlib.import_module("core.config")
-        monkeypatch.setattr(cfg, "is_open_mode", lambda: True, raising=False)
-        monkeypatch.setattr(cfg, "auth_ok", lambda *args, **kwargs: True, raising=False)
-        monkeypatch.setattr(cfg, "get_settings_cached", lambda: _DummySettings(), raising=False)
-        monkeypatch.setattr(cfg, "get_settings", lambda: _DummySettings(), raising=False)
-    except Exception:
-        pass
+    # Keep actual auth exports intact: routes capture them at import, so a
+    # temporary always-true function can contaminate later security tests.
+    cfg = importlib.import_module("core.config")
+    cfg.get_settings_cached(force_reload=True)
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -606,6 +590,7 @@ class _StubEngine:
 
     def __init__(self, sr: Any):
         self._sr = sr
+        self.sheet_calls: List[str] = []
 
     async def get_sheet_rows(
         self,
@@ -620,14 +605,24 @@ class _StubEngine:
         sheet_name = sheet or kwargs.get("page") or kwargs.get("sheet_name") or ""
         headers = _schema_sheet_headers(self._sr, sheet_name) if sheet_name else []
         keys = _schema_sheet_keys(self._sr, sheet_name) if sheet_name else []
+        self.sheet_calls.append(sheet_name)
+        row = dict.fromkeys(keys)
+        for key, value in {
+            "symbol": "AAPL", "name": "Schema fixture", "current_price": 100.0,
+            "section": "System", "item": "Schema fixture", "metric": "contract",
+            "value": "OK", "notes": "In-memory schema contract fixture",
+        }.items():
+            if key in row:
+                row[key] = value
+        rows = [row] if keys and offset == 0 else []
         return {
             "status": "success",
             "sheet": sheet_name,
             "page": sheet_name,
             "headers": headers,
             "keys": keys,
-            "rows": [],
-            "rows_matrix": [],
+            "rows": rows,
+            "rows_matrix": [[row[key] for key in keys] for row in rows],
             "meta": {
                 "stub": True,
                 "limit": limit,
@@ -660,16 +655,66 @@ class _StubEngine:
     async def health(self):
         return {"status": "ok", "stub": True}
 
+    async def aclose(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _reject_external_connections(monkeypatch: pytest.MonkeyPatch):
+    """A swallowed provider exception must still fail this offline suite."""
+    attempts: List[Any] = []
+
+    def reject(_socket, address):
+        attempts.append(address)
+        raise AssertionError(f"Schema contract attempted network access: {address!r}")
+
+    monkeypatch.setattr(socket.socket, "connect", reject)
+    monkeypatch.setattr(socket.socket, "connect_ex", reject)
+    yield
+    cfg = importlib.import_module("core.config")
+    cfg._SETTINGS_CACHE.clear()
+    assert not attempts, f"Schema contract attempted network access: {attempts!r}"
+
+
+def _patch_engine_factories(monkeypatch: pytest.MonkeyPatch, engine: _StubEngine) -> None:
+    """Keep real route adapters; replace their engine acquisition boundary.
+
+    advanced_analysis captures its factory at import and its adapter does not
+    consult app.state.engine. Other routers also use the legacy facade, whose
+    get_sheet_rows calls its own factory. Setting only app.state therefore
+    permits live providers whenever the optional full dependencies are present.
+    """
+    async def get_engine(*args: Any, **kwargs: Any):
+        return engine
+
+    # Import before replacing exported factories so newly imported routers
+    # cannot retain a test factory after monkeypatch restores the module.
+    advanced = importlib.import_module("routes.advanced_analysis")
+    for name in ("core.data_engine_v2", "core.data_engine"):
+        module = importlib.import_module(name)
+        monkeypatch.setattr(module, "get_engine", get_engine)
+        if hasattr(module, "get_engine_if_ready"):
+            monkeypatch.setattr(module, "get_engine_if_ready", lambda: engine)
+        for alias in ("_ENGINE_INSTANCE", "ENGINE", "engine", "_ENGINE"):
+            if hasattr(module, alias):
+                monkeypatch.setattr(module, alias, engine)
+
+    monkeypatch.setattr(advanced, "_v2_get_engine", get_engine)
+    monkeypatch.setattr(advanced, "_V2_ENGINE_HEALTH_FACTORY", get_engine)
+    monkeypatch.setattr(advanced, "_V2_ENGINE_HEALTH_FACTORY_INITED", True)
+
 
 def _build_test_app(monkeypatch: pytest.MonkeyPatch, sr: Any) -> Any:
     _patch_auth_open(monkeypatch)
+    engine = _StubEngine(sr)
+    _patch_engine_factories(monkeypatch, engine)
 
     try:
         main_mod = _import_any("main")
         create_app = getattr(main_mod, "create_app", None)
         if callable(create_app):
             app = create_app()
-            app.state.engine = _StubEngine(sr)
+            app.state.engine = engine
             app.state.engine_ready = True
             return app
     except Exception:
@@ -698,7 +743,7 @@ def _build_test_app(monkeypatch: pytest.MonkeyPatch, sr: Any) -> Any:
     except TypeError:
         mount_fn(app)
 
-    app.state.engine = _StubEngine(sr)
+    app.state.engine = engine
     app.state.engine_ready = True
     return app
 

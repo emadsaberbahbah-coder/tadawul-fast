@@ -860,7 +860,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
@@ -1468,7 +1468,43 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _s1_zero_baseline_enabled,
 #   _s1_zero_mae, _zb_strip.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.42.0"
+# v6.43.0 (2026-10-06) - OUTCOME DAY-KEY INTEGRITY
+# -----------------------------------------------------------------------------
+# WHY. GitHub schedule runs in this repository routinely start hours after their
+# nominal slot. PerformanceRecord and SignalSnapshot each used a separate
+# RiyadhTime.now() call, so a delayed run after 21:00 UTC stole the following
+# Riyadh day's key; the genuine following-day cohort was then suppressed as an
+# apparent duplicate. A run crossing midnight between the Performance_Log and
+# Signal_History writes could also split one source snapshot across two dates.
+# The twice-daily backstop exposed a second defect: SignalHistoryStore's key
+# cache started empty in every fresh process and was never populated until the
+# later trend-analysis read, so same-day retries appended duplicate symbol/day
+# rows despite the documented idempotency contract.
+#
+# WHAT.
+#   * resolve_track_evidence_day resolves one Riyadh cohort day before run I/O.
+#     Provenance precedence is TRACK_EVIDENCE_DAY, then the most recent
+#     TRACK_SLOT_UTC before fixed TRACK_RUN_CREATED_AT, then the once-captured
+#     current-run wall clock. TRACK_DAY_KEY_MODE=observe reports slot drift
+#     without applying it; wallclock is the rollback mode.
+#   * run_once passes that one evidence_day to both key constructors, while one
+#     actual captured_at taken after the Top10 fetch continues to govern Date
+#     Recorded, target maturity, event offsets and Recorded At. Quotes are never
+#     presented as sampled at an earlier nominal slot. The existing Key column
+#     persists the cohort day, so no sheet schema changes are needed.
+#   * SignalHistoryStore refreshes the worksheet Key column before every append.
+#     An unreadable key column fails the append closed rather than writing a
+#     duplicate blindly. This closes sequential fresh-process duplication; a
+#     simultaneous read/append race still requires external writer serialization.
+#
+# Workflow contract: scheduled callers supply TRACK_DAY_KEY_MODE=slot,
+# TRACK_SLOT_UTC=HH:MM selected from github.event.schedule, and a fixed original
+# TRACK_RUN_CREATED_AT ISO-UTC value. Manual/local callers omit them and retain
+# one captured wall-clock day. TRACK_EVIDENCE_DAY=YYYY-MM-DD is the
+# authoritative replay/operator override. Delays beyond the next identical slot
+# cannot be inferred without that explicit day; operators must supply it.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.43.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2402,7 +2438,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _days_until(raw: Any) -> Optional[int]:
+def _days_until(raw: Any, *, reference_day: Optional[date] = None) -> Optional[int]:
     """v6.14.0 (F4): whole days from today (Riyadh) until a date-like value.
     Accepts date/datetime/ISO-ish strings; returns None on blank/unparseable
     input — never raises. Negative values are valid (event already passed)."""
@@ -2426,7 +2462,15 @@ def _days_until(raw: Any) -> Optional[int]:
     try:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_RIYADH_TZ)
-        today = RiyadhTime.now().astimezone(_RIYADH_TZ).date()
+        if isinstance(reference_day, datetime):
+            ref = reference_day
+            if ref.tzinfo is None:
+                ref = ref.replace(tzinfo=_RIYADH_TZ)
+            today = ref.astimezone(_RIYADH_TZ).date()
+        else:
+            today = reference_day
+        if today is None:
+            today = RiyadhTime.now().astimezone(_RIYADH_TZ).date()
         return (dt.astimezone(_RIYADH_TZ).date() - today).days
     except Exception:
         return None
@@ -2592,6 +2636,193 @@ class RiyadhTime:
         if d.tzinfo is None:
             d = d.replace(tzinfo=cls._tz)
         return d.astimezone(cls._tz).strftime(fmt)
+
+
+# =============================================================================
+# v6.43.0 — one provenance-backed outcome cohort day per run
+# =============================================================================
+def _track_slot_utc(raw: Any) -> Optional[Tuple[int, int]]:
+    """Parse an exact daily UTC slot (HH:MM). Invalid/missing -> None."""
+    if isinstance(raw, (tuple, list)) and len(raw) == 2:
+        try:
+            hour, minute = int(raw[0]), int(raw[1])
+            return (hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+        except Exception:
+            return None
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", _safe_str(raw))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return (hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
+def _track_run_created_at(raw: Any) -> Optional[datetime]:
+    """Parse the fixed original Actions run reference as an aware UTC instant."""
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        text = _safe_str(raw)
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    # A date-only or timezone-free string is not original Actions UTC
+    # provenance. Do not silently turn it into a midnight reference that can
+    # select the preceding day's slot.
+    try:
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return None
+        return dt.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _track_explicit_day(raw: Any) -> Optional[date]:
+    """Parse an authoritative Riyadh evidence day (YYYY-MM-DD)."""
+    if isinstance(raw, datetime):
+        try:
+            return raw.astimezone(_RIYADH_TZ).date() if raw.tzinfo else raw.date()
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(raw, date):
+        return raw
+    text = _safe_str(raw)
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) is None:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _track_capture_time(raw: Optional[datetime] = None) -> datetime:
+    """Normalize one real capture instant to an aware Riyadh datetime."""
+    captured = raw or RiyadhTime.now()
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=_RIYADH_TZ)
+    return captured.astimezone(_RIYADH_TZ)
+
+
+def resolve_track_evidence_day(
+    now_riyadh: Optional[datetime] = None,
+    *,
+    mode: Optional[str] = None,
+    slot_utc: Any = None,
+    run_created_at: Any = None,
+    evidence_day: Any = None,
+) -> Tuple[date, Dict[str, Any]]:
+    """Resolve the one cohort day used by both outcome evidence tables.
+
+    Scheduled callers provide an exact UTC slot selected from
+    ``github.event.schedule`` plus the original workflow-run ``created_at``.
+    The most recent occurrence of that slot at or before the fixed reference
+    supplies the candidate Riyadh day. ``TRACK_EVIDENCE_DAY`` is an explicit,
+    authoritative replay/operator override. Manual and local calls with no
+    schedule provenance use the once-captured current Riyadh day.
+
+    This resolver deliberately returns only a *day*. Physical quote/capture
+    timestamps and target maturity continue to use the actual capture instant.
+    A repeated daily slot delayed beyond its following occurrence is inherently
+    ambiguous; callers must provide ``TRACK_EVIDENCE_DAY`` in that case.
+    """
+    actual = now_riyadh or RiyadhTime.now()
+    if actual.tzinfo is None:
+        actual = actual.replace(tzinfo=_RIYADH_TZ)
+    actual = actual.astimezone(_RIYADH_TZ)
+    wall_day = actual.date()
+
+    raw_mode = _safe_str(
+        (mode if mode is not None else os.getenv("TRACK_DAY_KEY_MODE")) or ""
+    ).lower()
+    if raw_mode in {"wallclock", "legacy", "off", "0"}:
+        resolved_mode = "wallclock"
+    elif raw_mode == "observe":
+        resolved_mode = "observe"
+    elif raw_mode == "slot":
+        resolved_mode = "slot"
+    else:
+        resolved_mode = "wallclock"
+
+    raw_slot = slot_utc if slot_utc is not None else os.getenv("TRACK_SLOT_UTC")
+    parsed_slot = _track_slot_utc(raw_slot)
+    raw_reference = (
+        run_created_at
+        if run_created_at is not None
+        else os.getenv("TRACK_RUN_CREATED_AT")
+    )
+    reference = _track_run_created_at(raw_reference)
+    raw_override = (
+        evidence_day if evidence_day is not None else os.getenv("TRACK_EVIDENCE_DAY")
+    )
+    override = _track_explicit_day(raw_override)
+
+    warnings: List[str] = []
+    if raw_slot is not None and _safe_str(raw_slot) and parsed_slot is None:
+        warnings.append("invalid TRACK_SLOT_UTC")
+    if raw_reference is not None and _safe_str(raw_reference) and reference is None:
+        warnings.append("invalid TRACK_RUN_CREATED_AT")
+    if raw_override is not None and _safe_str(raw_override) and override is None:
+        warnings.append("invalid TRACK_EVIDENCE_DAY")
+    if raw_mode and raw_mode not in {
+        "slot", "observe", "wallclock", "legacy", "off", "0"
+    }:
+        warnings.append("invalid TRACK_DAY_KEY_MODE")
+    if reference is not None and reference > actual.astimezone(timezone.utc):
+        warnings.append("TRACK_RUN_CREATED_AT is after current run time")
+        reference = None
+
+    candidate: Optional[date] = None
+    slot_instant: Optional[datetime] = None
+    if parsed_slot is not None and reference is not None:
+        hour, minute = parsed_slot
+        try:
+            slot_instant = reference.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if slot_instant > reference:
+                slot_instant -= timedelta(days=1)
+            candidate = slot_instant.astimezone(_RIYADH_TZ).date()
+        except (ValueError, OverflowError):
+            warnings.append("scheduled slot outside supported calendar range")
+            slot_instant = None
+
+    if override is not None:
+        chosen = override
+        source = "explicit-day"
+    elif resolved_mode == "slot" and candidate is not None:
+        chosen = candidate
+        source = "scheduled-slot"
+    else:
+        chosen = wall_day
+        source = "current-run"
+        if resolved_mode == "slot":
+            warnings.append("slot mode missing valid slot/reference; used current run")
+
+    details: Dict[str, Any] = {
+        "mode": resolved_mode,
+        "source": source,
+        "day": chosen.isoformat(),
+        "wallclock_day": wall_day.isoformat(),
+        "candidate_day": candidate.isoformat() if candidate else None,
+        "slot_utc": (
+            f"{parsed_slot[0]:02d}:{parsed_slot[1]:02d}" if parsed_slot else None
+        ),
+        "slot_instant_utc": (
+            slot_instant.isoformat().replace("+00:00", "Z") if slot_instant else None
+        ),
+        "run_created_at_utc": (
+            reference.isoformat().replace("+00:00", "Z") if reference else None
+        ),
+        "resolved_at_riyadh": actual.isoformat(),
+        "drift": chosen != wall_day,
+        "candidate_drift": bool(candidate is not None and candidate != wall_day),
+        "warnings": tuple(warnings),
+    }
+    return chosen, details
 
 
 # =============================================================================
@@ -3993,6 +4224,17 @@ def _risk_bucket_from_score(risk_score: Optional[float]) -> str:
         return "MODERATE"
 
 
+def _evidence_day_from_key(raw: Any) -> Optional[date]:
+    """Recover a cohort day from the existing ``...|YYYYMMDD`` key suffix."""
+    suffix = _safe_str(raw).rsplit("|", 1)[-1]
+    if re.fullmatch(r"\d{8}", suffix) is None:
+        return None
+    try:
+        return datetime.strptime(suffix, "%Y%m%d").date()
+    except Exception:
+        return None
+
+
 def _confidence_bucket(conf: Optional[float]) -> str:
     if conf is None:
         return "MEDIUM"
@@ -4059,12 +4301,25 @@ class PerformanceRecord:
     # 'NO' (audited but unseated), '' (feature off / board unreadable).
     # END-APPENDED per the v6.6.0 law above.
     entry_selected: str = ""
+    # v6.43.0: logical cohort/day-key provenance. This is intentionally an
+    # in-memory field only: the existing Key column persists it, while
+    # date_recorded remains the real quote/capture instant.
+    evidence_day: Optional[date] = None
+
+    @property
+    def evidence_date(self) -> date:
+        if self.evidence_day is not None:
+            return self.evidence_day
+        dt = self.date_recorded
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_RIYADH_TZ)
+        return dt.astimezone(_RIYADH_TZ).date()
 
     @property
     def key(self) -> str:
         return (
             f"{self.symbol}|{self.horizon.value}|"
-            f"{self.date_recorded.astimezone(_RIYADH_TZ).strftime('%Y%m%d')}"
+            f"{self.evidence_date.strftime('%Y%m%d')}"
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -4188,6 +4443,7 @@ class PerformanceRecord:
             entry_investability_status=_safe_str(get("Entry Investability") or ""),
             entry_final_action=_safe_str(get("Entry Final Action") or ""),
             entry_selected=_safe_str(get("Entry Selected") or ""),
+            evidence_day=_evidence_day_from_key(get("Key")),
         )
 
 
@@ -4253,10 +4509,22 @@ class SignalSnapshot:
     target_price: float = 0.0
     days_to_earnings: Optional[int] = None
     days_to_exdiv: Optional[int] = None
+    # v6.43.0: logical cohort/day-key provenance, persisted in existing Key.
+    # Date/Recorded At remain the real capture timestamp and date.
+    evidence_day: Optional[date] = None
+
+    @property
+    def evidence_date(self) -> date:
+        if self.evidence_day is not None:
+            return self.evidence_day
+        dt = self.date_recorded
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_RIYADH_TZ)
+        return dt.astimezone(_RIYADH_TZ).date()
 
     @property
     def date_key(self) -> str:
-        return self.date_recorded.astimezone(_RIYADH_TZ).strftime("%Y%m%d")
+        return self.evidence_date.strftime("%Y%m%d")
 
     @property
     def key(self) -> str:
@@ -4324,6 +4592,7 @@ class SignalSnapshot:
                               if _safe_str(get("Days To Earnings")) else None),
             days_to_exdiv=(int(_safe_float(get("Days To ExDiv")))
                            if _safe_str(get("Days To ExDiv")) else None),
+            evidence_day=_evidence_day_from_key(get("Key")),
         )
 
 
@@ -5482,6 +5751,10 @@ class SignalHistoryStore:
         self.backoff = FullJitterBackoff()
         self.cache_keys: set = set()
         self.cache_lock = Lock()
+        # Serialize refresh/filter/append inside one process. Cross-process
+        # writers still require workflow-level serialization because Sheets
+        # has no atomic compare-and-append primitive.
+        self.append_lock = Lock()
 
         self.gc = None
         self.sheet = None
@@ -5625,45 +5898,94 @@ class SignalHistoryStore:
             s.days_to_exdiv if s.days_to_exdiv is not None else "",
         ]
 
+    def _refresh_key_cache(self) -> bool:
+        """Load every persisted Signal_History key before an append.
+
+        A fresh tracker process has an empty in-memory cache. Reading the
+        worksheet's full Key column closes the sequential retry/backstop hole
+        without downloading every 18-column snapshot. Failure is closed: a
+        blind append could create evidence that violates symbol/day identity.
+        """
+        if not self.ws:
+            return False
+        try:
+            values = self.backoff.execute_sync(
+                lambda: self.ws.col_values(2)  # type: ignore
+            )
+            if not isinstance(values, (list, tuple)) or not values or values[0] != "Key":
+                raise ValueError("Signal_History Key column missing canonical header")
+            keys = {
+                _safe_str(value)
+                for value in (values or [])[1:]
+                if _safe_str(value)
+            }
+            with self.cache_lock:
+                self.cache_keys = keys
+            return True
+        except Exception as e:
+            logger.error("Failed to preload signal snapshot keys: %s", e)
+            _note_evidence_append_failure(
+                "Signal_History", f"key preload failed: {e}"
+            )
+            return False
+
     def append_snapshots(self, snaps: List[SignalSnapshot]) -> int:
         """Append only snapshots whose key isn't already present (idempotent
         per symbol-per-day). Returns the count actually written."""
-        if not self.ws:
+        if not self.ws or not snaps:
             return 0
-        with self.cache_lock:
-            existing = set(self.cache_keys)
-        seen_now: set = set()
-        new: List[SignalSnapshot] = []
-        for s in snaps:
-            if s.key in existing or s.key in seen_now:
-                continue
-            seen_now.add(s.key)
-            new.append(s)
-        if not new:
-            return 0
-        rows = [self._snapshot_to_row(s) for s in new]
-        # v6.34.0 (IR-078a): capacity refusal before Google — see
-        # PerformanceStore.append_records.
-        _blk = _capacity_block_reason(
-            getattr(self, "_ws_book", None) or self.sheet,
-            getattr(self, "_ws_sid", None) or self.spreadsheet_id)
-        if _blk:
-            logger.error(
-                "[CAPACITY v6.34.0] Signal_History append REFUSED: %s", _blk)
-            _note_evidence_append_failure("Signal_History", _blk)
-            return 0
-        try:
-            self.backoff.execute_sync(
-                lambda: self.ws.append_rows(rows, value_input_option="RAW")  # type: ignore
-            )
+        with self.append_lock:
+            if not self._refresh_key_cache():
+                return 0
             with self.cache_lock:
-                for s in new:
-                    self.cache_keys.add(s.key)
-            return len(new)
-        except Exception as e:
-            logger.error("Failed to append signal snapshots: %s", e)
-            _note_evidence_append_failure("Signal_History", str(e))
-            return 0
+                existing = set(self.cache_keys)
+            seen_now: set = set()
+            new: List[SignalSnapshot] = []
+            for s in snaps:
+                if s.key in existing or s.key in seen_now:
+                    continue
+                seen_now.add(s.key)
+                new.append(s)
+            if not new:
+                return 0
+            # v6.34.0 (IR-078a): capacity refusal before Google — see
+            # PerformanceStore.append_records.
+            _blk = _capacity_block_reason(
+                getattr(self, "_ws_book", None) or self.sheet,
+                getattr(self, "_ws_sid", None) or self.spreadsheet_id)
+            if _blk:
+                logger.error(
+                    "[CAPACITY v6.34.0] Signal_History append REFUSED: %s", _blk)
+                _note_evidence_append_failure("Signal_History", _blk)
+                return 0
+            try:
+                def _append_missing() -> int:
+                    # A timed-out append may already have committed. Refresh
+                    # persisted keys on each backoff attempt before retrying
+                    # a non-idempotent Sheets append.
+                    if not self._refresh_key_cache():
+                        raise RuntimeError("Signal_History retry key preload failed")
+                    with self.cache_lock:
+                        present = set(self.cache_keys)
+                    missing = [s for s in new if s.key not in present]
+                    if missing:
+                        self.ws.append_rows(  # type: ignore
+                            [self._snapshot_to_row(s) for s in missing],
+                            value_input_option="RAW",
+                        )
+                    # Includes a successful commit whose first response was
+                    # lost and whose keys were confirmed on this attempt.
+                    return len(new)
+
+                written = self.backoff.execute_sync(_append_missing)
+                with self.cache_lock:
+                    for s in new:
+                        self.cache_keys.add(s.key)
+                return written
+            except Exception as e:
+                logger.error("Failed to append signal snapshots: %s", e)
+                _note_evidence_append_failure("Signal_History", str(e))
+                return 0
 
 
 def _trend_day_keyed_enabled() -> bool:
@@ -6130,7 +6452,18 @@ class SignalTrendAnalyzer:
         trends: List[SignalTrend] = []
         _day_keyed = _trend_day_keyed_enabled()
         for sym, snaps in by_sym.items():
-            snaps_sorted = sorted(snaps, key=lambda x: x.date_recorded)
+            # v6.43.0: scheduled backfills may be physically captured on the
+            # following date. Day-keyed analysis follows the logical cohort
+            # date, with the real capture time only ordering writes within a
+            # cohort. Legacy snapshot mode keeps physical-time ordering.
+            snaps_sorted = sorted(
+                snaps,
+                key=(
+                    (lambda x: (x.evidence_date, x.date_recorded))
+                    if _day_keyed
+                    else (lambda x: x.date_recorded)
+                ),
+            )
             n = len(snaps_sorted)
             latest = snaps_sorted[-1]
 
@@ -6145,16 +6478,13 @@ class SignalTrendAnalyzer:
                 by_day: Dict[str, SignalSnapshot] = {}
                 day_order: List[str] = []
                 for s in snaps_sorted:
-                    dk = RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
+                    dk = s.evidence_date.isoformat()
                     if dk not in by_day:
                         day_order.append(dk)
                     by_day[dk] = s  # last write wins = last snapshot of day
                 day_reps = [by_day[d] for d in day_order]
                 win = day_reps[-window:]
-                win_days = set(
-                    RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
-                    for s in win
-                )
+                win_days = {s.evidence_date.isoformat() for s in win}
                 recs = [s.recommendation.value for s in win]
                 scores = [float(s.overall_score) for s in win]
 
@@ -6173,8 +6503,7 @@ class SignalTrendAnalyzer:
                 # day collapse.
                 _win_snaps = [
                     s for s in snaps_sorted
-                    if RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
-                    in win_days
+                    if s.evidence_date.isoformat() in win_days
                 ]
                 sides = [self._side(s.recommendation.value)
                          for s in _win_snaps]
@@ -6255,7 +6584,13 @@ class SignalTrendAnalyzer:
                     current_action=latest.recommendation.value,
                     current_investability=latest.investability_status,
                     latest_score=float(latest.overall_score),
-                    latest_date=RiyadhTime.format(latest.date_recorded, fmt="%Y-%m-%d"),
+                    latest_date=(
+                        latest.evidence_date.isoformat()
+                        if _day_keyed
+                        else RiyadhTime.format(
+                            latest.date_recorded, fmt="%Y-%m-%d"
+                        )
+                    ),
                     days_in_current_action=days_in,
                     action_direction=direction,
                     score_slope=round(slope, 4),
@@ -7832,6 +8167,9 @@ class PerformanceTrackerApp:
         self,
         existing: List[PerformanceRecord],
         rows: Optional[List[Dict[str, Any]]] = None,
+        *,
+        evidence_day: Optional[date] = None,
+        captured_at: Optional[datetime] = None,
     ) -> List[PerformanceRecord]:
         # v6.7.0: accept pre-fetched rows so run_once can fetch the Top10
         # universe ONCE and feed both the pick recorder and the daily
@@ -7858,7 +8196,8 @@ class PerformanceTrackerApp:
             logger.info("record_from_top10: %d rows (pre-fetched)", len(rows))
 
         existing_keys = set(r.key for r in existing)
-        now = RiyadhTime.now()
+        now = _track_capture_time(captured_at)
+        cohort_day = _track_explicit_day(evidence_day) or now.date()
         horizons = self._horizons()
 
         new_records: List[PerformanceRecord] = []
@@ -7964,13 +8303,14 @@ class PerformanceTrackerApp:
                     status=PerformanceStatus.ACTIVE,
                     current_price=entry_price,
                     unrealized_roi=0.0,
-                    last_updated=_utc_now(),
+                    last_updated=now.astimezone(timezone.utc),
                     # v6.6.0: investability-gate snapshot at entry.
                     entry_data_quality=entry_dq,
                     entry_forecast_reliability=entry_frel,
                     entry_investability_status=entry_inv_status,
                     entry_final_action=entry_final_action,
                     entry_selected=entry_sel,
+                    evidence_day=cohort_day,
                 )
                 if r.key not in existing_keys:
                     existing_keys.add(r.key)
@@ -7996,9 +8336,12 @@ class PerformanceTrackerApp:
         return new_records
 
     def _build_signal_snapshots(
-        self, rows: List[Dict[str, Any]]
+        self, rows: List[Dict[str, Any]], *,
+        evidence_day: Optional[date] = None,
+        captured_at: Optional[datetime] = None,
     ) -> List[SignalSnapshot]:
-        now = RiyadhTime.now()
+        now = _track_capture_time(captured_at)
+        cohort_day = _track_explicit_day(evidence_day) or now.date()
         out: List[SignalSnapshot] = []
         seen: set = set()
         for row in rows or []:
@@ -8027,10 +8370,12 @@ class PerformanceTrackerApp:
                     row.get("target_price") or row.get("Target Price"), default=0.0
                 )
                 _dte = _days_until(
-                    row.get("next_earnings_date") or row.get("Next Earnings Date")
+                    row.get("next_earnings_date") or row.get("Next Earnings Date"),
+                    reference_day=now.date(),
                 )
                 _dtx = _days_until(
-                    row.get("next_ex_div_date") or row.get("Next Ex-Div Date")
+                    row.get("next_ex_div_date") or row.get("Next Ex-Div Date"),
+                    reference_day=now.date(),
                 )
             else:
                 _arating, _tprice, _dte, _dtx = "", 0.0, None, None
@@ -8049,10 +8394,12 @@ class PerformanceTrackerApp:
                 risk_score=_safe_float(row.get("risk_score"), default=0.0),
                 price=price,
                 origin_tab=origin,
+                recorded_at=now.astimezone(timezone.utc),
                 analyst_rating=_arating,
                 target_price=_tprice,
                 days_to_earnings=_dte,
                 days_to_exdiv=_dtx,
+                evidence_day=cohort_day,
             )
             if snap.key in seen:
                 continue
@@ -8213,7 +8560,11 @@ class PerformanceTrackerApp:
         )
         return rows
 
-    async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
+    async def record_signal_snapshots(
+        self, rows: List[Dict[str, Any]], *,
+        evidence_day: Optional[date] = None,
+        captured_at: Optional[datetime] = None,
+    ) -> int:
         # v6.7.0: log one daily verdict snapshot per decision symbol from the
         # ALREADY-FETCHED Top10 rows. Idempotent per symbol-per-day. Best
         # effort: a Sheets hiccup here must never break --record/--audit.
@@ -8229,7 +8580,9 @@ class PerformanceTrackerApp:
                 logger.info("calendar context merged onto %d row(s)", merged)
         except Exception as e:
             logger.debug("calendar context merge skipped: %s", e)
-        snaps = self._build_signal_snapshots(rows)
+        snaps = self._build_signal_snapshots(
+            rows, evidence_day=evidence_day, captured_at=captured_at
+        )
         if not snaps:
             return 0
         loop = asyncio.get_running_loop()
@@ -9067,6 +9420,12 @@ class PerformanceTrackerApp:
         return ok
 
     async def run_once(self) -> int:
+        # Resolve the logical cohort before any I/O. Its day is independent
+        # of when delayed source quotes are actually captured below.
+        evidence_day, day_details = resolve_track_evidence_day()
+        logger.info("[OUTCOME-DAY v6.43.0] %s", json_dumps(day_details))
+        for warning in day_details["warnings"]:
+            logger.warning("[OUTCOME-DAY v6.43.0] %s", warning)
         loop = asyncio.get_running_loop()
         records: List[PerformanceRecord] = []
 
@@ -9081,28 +9440,30 @@ class PerformanceTrackerApp:
 
         if self.args.record:
             # v6.7.0: fetch the Top10 universe once, feed both pipelines.
-            prefetched: Optional[List[Dict[str, Any]]] = None
-            if (
-                self.signal_history_enabled
-                and self.signal_store is not None
-                and self.backend.base_url
-            ):
+            prefetched: List[Dict[str, Any]] = []
+            if self.backend.base_url:
                 try:
                     prefetched, _pf_meta = await self.backend.get_top10_rows(
                         criteria_overrides=None
                     )
                 except Exception as e:
                     logger.warning("Top10 prefetch failed: %s", e)
-                    prefetched = None
+                    prefetched = []
 
             # v6.16.0 (Fix #5): guarantee decision-symbol coverage for BOTH
-            # consumers below. Fail-open; kill switch skips the call entirely
-            # (v6.15.0 None-on-failure semantics preserved byte-identically).
+            # consumers below. Fail-open; the kill switch skips this call.
+            # An empty/failed Top10 read stays explicit instead of causing an
+            # implicit second fetch in record_from_top10.
             if _force_decision_enabled():
                 try:
                     prefetched = await self._augment_with_decision_symbols(prefetched)
                 except Exception as e:
                     logger.warning("decision-symbol coverage failed: %s", e)
+
+            # One real capture instant for both writer families, taken after
+            # the Top10/decision-symbol reads. Slow Sheets writes and midnight
+            # crossings cannot change it or backdate the observed quotes.
+            captured_at = _track_capture_time()
 
             # v6.33.0 SHADOW/REGRET: read the champion set ONCE per run —
             # the board's executable tickets — before records are built.
@@ -9119,7 +9480,10 @@ class PerformanceTrackerApp:
                         "[v6.33.0 SHADOW] champion set: %d executable ticket(s)",
                         len(self._board_selected))
 
-            new = await self.record_from_top10(records, rows=prefetched)
+            new = await self.record_from_top10(
+                records, rows=prefetched,
+                evidence_day=evidence_day, captured_at=captured_at,
+            )
             if new and self.store.is_available():
                 ok = await loop.run_in_executor(
                     _get_executor(), self.store.append_records, new
@@ -9128,8 +9492,9 @@ class PerformanceTrackerApp:
                     records.extend(new)
 
             # v6.7.0: log today's verdict snapshot per decision symbol.
-            if prefetched is not None:
-                await self.record_signal_snapshots(prefetched)
+            await self.record_signal_snapshots(
+                prefetched, evidence_day=evidence_day, captured_at=captured_at
+            )
 
         self._track_selftest_()  # v6.21.0 ST-1
         if self.args.audit:
@@ -9821,6 +10186,7 @@ __all__ = [
     "PerformanceStatus",
     "HorizonType",
     "RecommendationType",
+    "resolve_track_evidence_day",
     "PerformanceRecord",
     "PerformanceSummary",
     "BackendClient",

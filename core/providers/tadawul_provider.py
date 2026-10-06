@@ -2,8 +2,18 @@
 # core/providers/tadawul_provider.py
 """
 ================================================================================
-Tadawul Provider (KSA Market Data) -- v6.1.0
+Tadawul Provider (KSA Market Data) -- v6.2.0
 ================================================================================
+
+v6.2.0 -- LOOP-OWNED HTTP RESOURCES AND CANCELLATION-SAFE SINGLE FLIGHT
+--------------------------------------------------------------------------------
+Each running event loop owns its HTTP transport and semaphore. Requests capture
+those resources locally, so a second live loop cannot replace or close them.
+Shared quota and caches use threading locks with no await in their critical
+sections. Single-flight futures are keyed by loop; follower cancellation is
+shielded and owner cancellation wakes followers before removing the entry.
+Closing a client releases only the calling loop's transport. Provider routing,
+configuration, presets, request/retry policy and returned patches are unchanged.
 
 Purpose
 -------
@@ -135,6 +145,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -193,7 +204,7 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "6.1.0"
+PROVIDER_VERSION = "6.2.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -876,11 +887,9 @@ class TokenBucket:
         self.capacity = capacity if capacity is not None else max(1.0, self.rate)
         self.tokens = self.capacity
         self.last = time.monotonic()
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> Any:
         return self._lock
 
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
@@ -889,7 +898,7 @@ class TokenBucket:
             return
 
         while True:
-            async with self._get_lock():
+            with self._get_lock():
                 now = time.monotonic()
                 elapsed = max(0.0, now - self.last)
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
@@ -912,16 +921,14 @@ class SmartCache:
         self._cache: Dict[str, Any] = {}
         self._expires: Dict[str, float] = {}
         self._access_times: Dict[str, float] = {}
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> Any:
         return self._lock
 
     async def get(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired; refreshes access time."""
-        async with self._get_lock():
+        with self._get_lock():
             now = time.monotonic()
             if key in self._cache:
                 if now < self._expires.get(key, 0):
@@ -934,7 +941,7 @@ class SmartCache:
 
     async def set(self, key: str, value: Any, ttl_sec: Optional[float] = None) -> None:
         """Set value in cache with TTL; LRU-evicts least-recently-accessed on overflow."""
-        async with self._get_lock():
+        with self._get_lock():
             if len(self._cache) >= self.max_size and key not in self._cache:
                 if self._access_times:
                     oldest = min(self._access_times.items(), key=lambda x: x[1])[0]
@@ -949,7 +956,7 @@ class SmartCache:
 
     async def size(self) -> int:
         """Get current cache size."""
-        async with self._get_lock():
+        with self._get_lock():
             return len(self._cache)
 
 
@@ -957,38 +964,48 @@ class SingleFlight:
     """Deduplicate concurrent requests for the same key."""
 
     def __init__(self) -> None:
-        self._lock: Optional[asyncio.Lock] = None  # lazy
-        self._futures: Dict[str, asyncio.Future] = {}
+        self._lock = threading.Lock()
+        self._futures: Dict[Tuple[asyncio.AbstractEventLoop, str], asyncio.Future] = {}
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> Any:
         return self._lock
 
     async def run(self, key: str, coro_fn: Callable[[], Any]) -> Any:
         """Execute coroutine; concurrent callers for the same key share the result."""
+        loop = asyncio.get_running_loop()
+        flight_key = (loop, key)
         lock = self._get_lock()
-        async with lock:
-            future = self._futures.get(key)
-            if future is not None:
-                return await future
+        with lock:
+            future = self._futures.get(flight_key)
+            owner = future is None
+            if owner:
+                future = loop.create_future()
+                # Observe owner-only exceptions as well as shared failures.
+                future.add_done_callback(
+                    lambda f: None if f.cancelled() else f.exception()
+                )
+                self._futures[flight_key] = future
 
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._futures[key] = future
+        if not owner:
+            return await asyncio.shield(future)
 
         try:
             result = await coro_fn()
             if not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             if not future.done():
                 future.set_exception(exc)
             raise
         finally:
-            async with lock:
-                self._futures.pop(key, None)
+            with lock:
+                if self._futures.get(flight_key) is future:
+                    self._futures.pop(flight_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,12 +1058,28 @@ else:
 # Tadawul HTTP Client
 # ---------------------------------------------------------------------------
 
+_HTTP_GRAVEYARD: List[Any] = []
+_HTTP_GRAVEYARD_LOCK = threading.Lock()
+
+
+def _retain_closed_loop_transport(client: Any) -> None:
+    """Detach a closed loop's transport without closing it on a foreign loop."""
+    with _HTTP_GRAVEYARD_LOCK:
+        _HTTP_GRAVEYARD.append(client)
+        del _HTTP_GRAVEYARD[:-4]
+
+
 class TadawulClient:
     """Async client for Tadawul API."""
 
     def __init__(self, config: Optional[TadawulConfig] = None):
         self.config = config or TadawulConfig.from_env()
         self._semaphore: Optional[asyncio.Semaphore] = None  # lazy
+        self._resource_lock = threading.Lock()
+        self._loop_resources: Dict[
+            asyncio.AbstractEventLoop, Tuple[asyncio.Semaphore, httpx.AsyncClient]
+        ] = {}
+        self._initial_client_claimed = False
         self._rate_limiter = TokenBucket(self.config.rate_limit)
         self._single_flight = SingleFlight()
 
@@ -1075,13 +1108,8 @@ class TadawulClient:
                 else:
                     headers[hk] = self.config.api_key
 
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_sec),
-            follow_redirects=True,
-            headers=headers,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-            http2=True,
-        )
+        self._headers = headers
+        self._client: Optional[httpx.AsyncClient] = self._new_http_client()
 
         logger.info(
             "TadawulClient v%s initialized | configured=%s | preset=%s | has_api_key=%s | has_profile=%s | has_history=%s",
@@ -1093,10 +1121,47 @@ class TadawulClient:
             bool(self.config.history_url),
         )
 
+    def _new_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.timeout_sec),
+            follow_redirects=True,
+            headers=self._headers,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            http2=True,
+        )
+
+    def _get_loop_resources(self) -> Tuple[asyncio.Semaphore, httpx.AsyncClient]:
+        loop = asyncio.get_running_loop()
+        with self._resource_lock:
+            # Another live loop can still be using its transport. Only detach
+            # resources whose owner has already closed.
+            for old_loop in list(self._loop_resources):
+                if old_loop is not loop and old_loop.is_closed():
+                    _, old_client = self._loop_resources.pop(old_loop)
+                    _retain_closed_loop_transport(old_client)
+            resources = self._loop_resources.get(loop)
+            if resources is None:
+                if not self._initial_client_claimed and self._client is not None:
+                    http_client = self._client
+                    self._initial_client_claimed = True
+                else:
+                    http_client = self._new_http_client()
+                resources = (
+                    asyncio.Semaphore(max(1, self.config.max_concurrency)),
+                    http_client,
+                )
+                self._loop_resources[loop] = resources
+            # Historical private aliases are diagnostics only. Request code
+            # uses the locally captured pair instead of these mutable slots.
+            self._semaphore, self._client = resources
+            return resources
+
     def _get_semaphore(self) -> asyncio.Semaphore:
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
-        return self._semaphore
+        return self._get_loop_resources()[0]
+
+    def _has_live_resources(self) -> bool:
+        with self._resource_lock:
+            return any(not loop.is_closed() for loop in self._loop_resources)
 
     # -- HTTP layer -----------------------------------------------------
 
@@ -1104,13 +1169,14 @@ class TadawulClient:
     async def _request(self, url: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
         """Make HTTP request to Tadawul API."""
         await self._rate_limiter.wait_and_acquire()
+        semaphore, http_client = self._get_loop_resources()
 
-        async with self._get_semaphore():
+        async with semaphore:
             last_error: Optional[str] = None
 
             for attempt in range(self.config.retry_attempts):
                 try:
-                    response = await self._client.get(url)
+                    response = await http_client.get(url)
                     status_code = response.status_code
 
                     if status_code == 429:
@@ -1745,9 +1811,29 @@ class TadawulClient:
         }
 
     async def close(self) -> None:
-        """Close the underlying httpx client."""
+        """Close the calling loop's transport, leaving other live loops intact."""
+        loop = asyncio.get_running_loop()
+        with self._resource_lock:
+            for old_loop in list(self._loop_resources):
+                if old_loop is not loop and old_loop.is_closed():
+                    _, old_client = self._loop_resources.pop(old_loop)
+                    _retain_closed_loop_transport(old_client)
+            resources = self._loop_resources.pop(loop, None)
+            if resources is not None:
+                _, http_client = resources
+                if self._client is http_client:
+                    self._client = None
+                    self._semaphore = None
+            elif not self._initial_client_claimed:
+                http_client = self._client
+                self._initial_client_claimed = True
+                self._client = None
+            else:
+                http_client = None
+        if http_client is None:
+            return
         try:
-            await self._client.aclose()
+            await http_client.aclose()
         except Exception as exc:
             logger.debug("tadawul client close failed: %s", exc)
 
@@ -1757,33 +1843,32 @@ class TadawulClient:
 # ---------------------------------------------------------------------------
 
 _CLIENT_INSTANCE: Optional[TadawulClient] = None
-_CLIENT_LOCK: Optional[asyncio.Lock] = None
+_CLIENT_LOCK = threading.Lock()
 
 
-def _get_client_lock() -> asyncio.Lock:
-    global _CLIENT_LOCK
-    if _CLIENT_LOCK is None:
-        _CLIENT_LOCK = asyncio.Lock()
+def _get_client_lock() -> Any:
     return _CLIENT_LOCK
 
 
 async def get_client() -> TadawulClient:
     """Get the singleton TadawulClient instance."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE is not None:
-        return _CLIENT_INSTANCE
-    async with _get_client_lock():
+    with _get_client_lock():
         if _CLIENT_INSTANCE is None:
             _CLIENT_INSTANCE = TadawulClient()
-    return _CLIENT_INSTANCE
+        return _CLIENT_INSTANCE
 
 
 async def close_client() -> None:
     """Close and reset the singleton client."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE is not None:
-        await _CLIENT_INSTANCE.close()
-        _CLIENT_INSTANCE = None
+    with _get_client_lock():
+        client = _CLIENT_INSTANCE
+    if client is not None:
+        await client.close()
+        with _get_client_lock():
+            if _CLIENT_INSTANCE is client and not client._has_live_resources():
+                _CLIENT_INSTANCE = None
 
 
 # ---------------------------------------------------------------------------

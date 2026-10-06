@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/data_dictionary.py
 """
+v2.7.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-Schema Router — v2.7.0 (UNIFIED / REGISTRY-FIRST / FORMAT-COMPATIBLE)
+Schema Router — v2.7.1 (UNIFIED / REGISTRY-FIRST / FORMAT-COMPATIBLE)
 ================================================================================
 
 Endpoints
@@ -68,6 +71,8 @@ Why this revision (vs v2.6.0)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import importlib
 import os
 import uuid
@@ -84,7 +89,7 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.7.0"
+SCHEMA_ROUTE_VERSION = "2.7.1"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
@@ -512,7 +517,7 @@ def _auth_passed(
     except Exception:
         pass
 
-    if _is_public_path(str(getattr(getattr(request, "url", None), "path", "") or "")):
+    if _is_public_path(request_path(request)):
         return True
 
     if auth_ok is None:
@@ -527,7 +532,7 @@ def _auth_passed(
         auth_token = token.strip()
 
     headers_dict = dict(request.headers)
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    path = request_path(request)
 
     settings = None
     try:

@@ -44,9 +44,10 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
         sys.path.insert(0, str(_path))
 
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
+from core.data_validity import MAX_CLOCK_SKEW_SECONDS  # noqa: E402
 
-VERSION = "1.1.0"
-FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
+VERSION = "1.1.1"
+FUTURE_SKEW_H = MAX_CLOCK_SKEW_SECONDS / 3600
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
     r"Last\s+run\s+(?P<stamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"

@@ -81,6 +81,7 @@ def H(symbol, qty=100, cost=30.0, price=34.5, iv=41.4, rel=83, dq=92,
         "Provider/Engine Conflict": conflict, "Volatility 30D": 4.0,
         "Avg Volume 30D": 1000000, "Recommendation Detail": reco,
         "Investability Status": "INVESTABLE", "Block Reason": "",
+        "Active Stop": 25.0,  # independently recorded held risk, not today's ladder
     }
     row.update(kw)
     return row
@@ -215,7 +216,7 @@ def _run_legacy_suite():
         ok("t10-deployable", p["kpis"]["deployable_sar"] ==
            round(max(0, 5000 - floor10)), p["kpis"]["deployable_sar"])
 
-        # --- 11. Advisory mode includes proceeds; funding split names both ---
+        # --- 11. Advisory cannot spend proposed unexecuted sale proceeds ---
         ctl11 = dict(ctl10)
         ctl11["rebalance_mode"] = "Advisory Only"
         ctl11["target_cash_pct"] = 0
@@ -225,10 +226,9 @@ def _run_legacy_suite():
                   H("AD2.SR", qty=10, sector="Tech")]
         p = pa.build_portfolio_actions(rows11, controls=ctl11, fx_rates=FX)
         a = find(p, "AD2.SR")
-        ok("t11-add-sized", a["action"] == "ADD" and a["suggested_delta_sar"] > 5000,
+        ok("t11-add-sized", a["action"] == "ADD" and 0 < a["suggested_delta_sar"] <= 5000,
            (a["action"], a["suggested_delta_sar"]))
-        ok("t11-funds-split", a["funds_from"] is not None and
-           "proceeds" in a["funds_from"], a["funds_from"])
+        ok("t11-funds-cash-only", a["funds_from"] == "cash", a["funds_from"])
         ok("t11-identity", p["kpis"]["adds_funded_sar"] <=
            p["kpis"]["deployable_sar"])
 

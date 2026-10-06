@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/routes_argaam.py
 """
+v2.1.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-Argaam Routes — v2.1.0 (FLEXIBLE-AUTH / ASYNC-PROVIDER-SAFE / CORE-CONFIG-ALIGNED)
+Argaam Routes — v2.1.1 (FLEXIBLE-AUTH / ASYNC-PROVIDER-SAFE / CORE-CONFIG-ALIGNED)
 ================================================================================
 
 Canonical-plan note (read first)
@@ -80,6 +83,8 @@ Why this revision (v2.1.0 vs v2.0.0)
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import importlib
 import inspect
@@ -97,7 +102,7 @@ from fastapi.responses import JSONResponse
 logger = logging.getLogger("routes.routes_argaam")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "2.1.0"
+ROUTER_VERSION = "2.1.1"
 ROUTE_OWNER_NAME = "routes_argaam"
 ROUTE_FAMILY_NAME = "argaam"
 
@@ -333,7 +338,7 @@ def _auth_ok_flexible(
         headers_dict.setdefault("Authorization", authorization)
 
     try:
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        path = request_path(request)
     except Exception:
         path = ""
 

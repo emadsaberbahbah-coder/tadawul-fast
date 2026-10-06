@@ -2,7 +2,22 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.0.8 (2026-10-06) -- BLOCKED IDENTITY INVARIANT JOINS CONTRACT CI
+# VERSION 1.0.11 (2026-10-06) -- WORKBOOK FRESHNESS AND CALIBRATION REGRESSIONS
+# v1.0.11: block recent failed/quarantined row false passes, shared clock-skew
+# drift, invalid calibration evidence and canonical risk-header omissions.
+#
+# v1.0.10: run actual WITHHELD render/log containment and daily expanding
+# walk-forward regressions alongside the existing safety contracts.
+#
+# v1.0.9:
+# - Add blocking scheduled-evidence-day and backend readiness regressions.
+# - Run provider cancellation and loop guards with actual httpx in the
+#   contract image, plus the standalone Yahoo fundamentals harness.
+# - Add mounted authentication/readiness coverage and mirror the upgraded
+#   production framework pins. pytest is pinned to patched 9.0.3.
+# - Promote the verified offline engine contracts to blocking and include
+#   their result in the required CI verdict.
+# - Run the real Apps Script Top10 projection regression under Node.
 #
 # v1.0.8:
 # - ADD the builder + mounted-route regression proving an exact engine BLOCKED
@@ -150,9 +165,9 @@
 #       that expects a running backend. It is a tool, not a unit suite. It is
 #       the natural seed for a post-window authenticated smoke workflow and is
 #       intentionally excluded here.
-#     - tests/test_data_engine_v2.py imports the 738 KB engine and its provider
-#       stack. It runs in the `heavy` job below as REPORT-ONLY until proven
-#       green, then gets promoted to blocking post-window.
+#     - tests/test_data_engine_v2.py imports the full engine stack. It now runs
+#       as blocking in the `heavy` job: its 39 deterministic function contracts
+#       pass with the upgraded production dependencies and forbid network I/O.
 #   Adding a suite to the blocking jobs is a deliberate act with evidence, never
 #   a wildcard.
 #
@@ -174,6 +189,7 @@ on:
       - 'routes/**'
       - 'scripts/**'
       - 'integrations/**'
+      - 'apps_script/**'
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/**'
@@ -232,6 +248,16 @@ jobs:
           python -m compileall -q tests
           echo "✅ every test file parses"
 
+      - name: 🟢 Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: 🛡️ Apps Script hard safety and WITHHELD containment
+        run: |
+          node tests/test_dt10_hard_safety_projection.js
+          node tests/test_dt10_withheld_containment.js
+
   # ==========================================================================
   # JOB 2 — decision-layer unit suites (BLOCKING)
   # ==========================================================================
@@ -259,7 +285,7 @@ jobs:
       - name: 📦 Install minimal deps (numpy + pytest only)
         run: |
           python -m pip install -U pip
-          python -m pip install "numpy>=1.26.4,<2.0.0" pytest
+          python -m pip install "numpy>=1.26.4,<2.0.0" "pytest==9.0.3"
 
       - name: 🎯 py_compile the decision layer
         run: |
@@ -283,6 +309,12 @@ jobs:
           python -m pytest -q \
             tests/test_stats.py \
             tests/test_quality_gates.py \
+            tests/test_data_validity.py \
+            tests/test_full_refresh_coverage.py \
+            tests/test_decision_surface_freshness.py \
+            tests/test_research_evidence_validity.py \
+            tests/test_shadow_calibration_validity.py \
+            tests/test_backtest_walk_forward.py \
             tests/test_opportunity_builder.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
@@ -295,6 +327,8 @@ jobs:
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_zero_baseline_p201.py \
+            tests/test_track_evidence_day_p205.py \
+            tests/test_backend_readiness.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
@@ -327,13 +361,14 @@ jobs:
           python -m pip install -U pip
           python -m pip install \
             "numpy==1.26.4" \
-            pytest \
-            "fastapi==0.115.14" \
-            "starlette==0.41.3" \
+            "pytest==9.0.3" \
+            "fastapi==0.135.0" \
+            "starlette==1.3.1" \
             "httpx==0.27.2" \
             "pydantic==2.13.2" \
             "pydantic-core==2.46.2" \
-            "anyio==4.13.0"
+            "orjson==3.11.8" \
+            "anyio==4.14.2"
 
       - name: 📐 Run schema alignment
         run: |
@@ -346,28 +381,29 @@ jobs:
           python -m pytest -q \
             tests/test_schema_alignment.py \
             tests/test_current_schema_contract.py \
-            tests/test_opportunity_blocked_invariant.py
+            tests/test_enriched_margin_publish.py \
+            tests/test_opportunity_blocked_invariant.py \
+            tests/test_investment_objective_contracts.py \
+            tests/test_request_auth_readiness.py \
+            tests/test_finnhub_loopguard.py \
+            tests/test_tadawul_loopguard.py \
+            tests/test_yahoo_singleflight_cancellation.py \
+            tests/test_yahoo_token_bucket.py \
+            tests/test_ycp_loopguard_b6.py \
+            tests/test_argaam_loopguard_b6.py
+          python tests/test_yf_loopguard_p203.py
           echo "::endgroup::"
 
   # ==========================================================================
-  # JOB 4 — data engine (REPORT-ONLY, NON-BLOCKING)
+  # JOB 4 — offline data-engine contracts (BLOCKING)
   # ==========================================================================
-  # tests/test_data_engine_v2.py guards the largest and most consequential
-  # module in the repository (738 KB) and is currently run by nothing at all.
-  # It installs the full requirements.txt, so it is the most likely job to fail
-  # for reasons unrelated to code quality (provider I/O, absent credentials,
-  # heavy dependency resolution).
-  #
-  # continue-on-error: true is a DELIBERATE, TEMPORARY setting. It buys
-  # visibility today without the risk of a permanently red gate that trains the
-  # operator to ignore CI. The moment this job is observed green on main, it is
-  # promoted to blocking by deleting the continue-on-error line — a one-line
-  # change, logged, post-window.
+  # These contracts exercise the actual engine classification, schema,
+  # sanitization, and cache-key functions with installed production deps.
+  # They forbid network connections and need no provider credentials.
   heavy:
-    name: ⚙️ Data engine suite (report-only)
+    name: ⚙️ Data engine contracts
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v5
@@ -381,19 +417,13 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -r requirements.txt
-          python -m pip install pytest
+          python -m pip install "pytest==9.0.3"
 
       - name: ⚙️ Run data engine suite
         run: |
           echo "::group::pytest (heavy)"
           python -m pytest -q tests/test_data_engine_v2.py
           echo "::endgroup::"
-
-      - name: ℹ️ Status note
-        if: always()
-        run: |
-          echo "REPORT-ONLY. A failure here does not block the merge yet."
-          echo "Promote to blocking by deleting 'continue-on-error: true' once green."
 
   # ==========================================================================
   # JOB 5 — gate summary
@@ -404,7 +434,7 @@ jobs:
   summary:
     name: 📋 CI verdict
     runs-on: ubuntu-latest
-    needs: [compile, lean-unit, contract]
+    needs: [compile, lean-unit, contract, heavy]
     if: always()
     steps:
       - name: 📋 Print verdict
@@ -412,9 +442,11 @@ jobs:
           echo "compile   : ${{ needs.compile.result }}"
           echo "lean-unit : ${{ needs.lean-unit.result }}"
           echo "contract  : ${{ needs.contract.result }}"
+          echo "engine    : ${{ needs.heavy.result }}"
           if [ "${{ needs.compile.result }}" = "success" ] \
           && [ "${{ needs.lean-unit.result }}" = "success" ] \
-          && [ "${{ needs.contract.result }}" = "success" ]; then
+          && [ "${{ needs.contract.result }}" = "success" ] \
+          && [ "${{ needs.heavy.result }}" = "success" ]; then
             echo "VERDICT: CLEAN — decision layer verified on this commit."
           else
             echo "VERDICT: FAIL — do not deploy this commit."

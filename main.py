@@ -2,12 +2,20 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.0)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.2)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+Why this revision (v8.14.2 vs v8.14.1)
+--------------------------------------
+- Authorize the ASGI route path independently of Host-based URL reconstruction.
+  Reject malformed or duplicate Host authorities before routing/authentication.
+- Report structural readiness failures even when READY_REQUIRE_* flags retain
+  their legacy defaults. TFB_READYZ_STRICT and TFB_HEALTH_STRICT continue to
+  control response status/labels, so diagnostics do not alter default probes.
 
 Why this revision (v8.14.1 vs v8.14.0)
 --------------------------------------
@@ -201,6 +209,8 @@ Why this revision (v8.11.2 vs v8.11.1)
 """
 from __future__ import annotations
 
+from core.utils.request_security import request_path, invalid_host_authority
+
 import asyncio
 import importlib
 import inspect
@@ -370,7 +380,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.1"
+APP_ENTRY_VERSION = "8.14.2"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -801,9 +811,11 @@ class _SettingsView:
     CORS_ORIGINS: str = ""
     CORS_ALLOW_CREDENTIALS: bool = False
 
-    READY_REQUIRE_ENGINE: bool = False           # v8.12.1: report-only
-    READY_REQUIRE_ROUTES: bool = False           # v8.12.1: report-only
-    READY_REQUIRE_AUTH: bool = False             # v8.12.1: report-only
+    # Legacy configuration attributes remain accepted. Diagnostics are always
+    # evaluated; TFB_READYZ_STRICT / TFB_HEALTH_STRICT control probe responses.
+    READY_REQUIRE_ENGINE: bool = False
+    READY_REQUIRE_ROUTES: bool = False
+    READY_REQUIRE_AUTH: bool = False
 
     BACKEND_BASE_URL: str = ""
     ENGINE_CACHE_TTL_SEC: int = 20
@@ -1056,7 +1068,7 @@ def _call_auth_ok_flexible(
     authorization: str,
     api_key_value: str = "",
 ) -> bool:
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    path = request_path(request)
     headers_dict = dict(request.headers)
 
     settings = None
@@ -1272,7 +1284,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     "Downstream returned None response",
                     extra={
                         "request_id": request_id,
-                        "path": str(request.url.path),
+                        "path": request_path(request),
                         "status_code": 500,
                     },
                 )
@@ -1283,7 +1295,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     content={
                         "status": "error",
                         "error": "internal_server_error",
-                        "path": str(request.url.path),
+                        "path": request_path(request),
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
                     },
@@ -1295,7 +1307,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     "Caught downstream no-response runtime error",
                     extra={
                         "request_id": request_id,
-                        "path": str(request.url.path),
+                        "path": request_path(request),
                         "status_code": 500,
                     },
                 )
@@ -1306,13 +1318,25 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     content={
                         "status": "error",
                         "error": _public_error_text(exc),
-                        "path": str(request.url.path),
+                        "path": request_path(request),
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
                     },
                 )
             raise
 
+
+
+class RequestAuthorityValidationMiddleware(BaseHTTPMiddleware):
+    """Reject malformed Host authority before routing or authentication."""
+
+    async def dispatch(self, request: Request, call_next):
+        if invalid_host_authority(request.scope):
+            return _StrictJSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "invalid_host"},
+            )
+        return await call_next(request)
 
 
 class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
@@ -1335,7 +1359,7 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
             if str(request.method or "").upper() == "OPTIONS":
                 return await call_next(request)
-            if str(request.url.path or "") in _GLOBAL_AUTH_EXEMPT_PATHS:
+            if request_path(request) in _GLOBAL_AUTH_EXEMPT_PATHS:
                 return await call_next(request)
             if _auth_ok(request):
                 return await call_next(request)
@@ -1349,7 +1373,7 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
             content={
                 "status": "error",
                 "error": "unauthorized",
-                "path": str(request.url.path),
+                "path": request_path(request),
                 "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
             },
@@ -2220,25 +2244,22 @@ def _readiness_evaluation(app: FastAPI) -> Tuple[bool, List[str]]:
     meta = _runtime_meta(app)
     reasons: List[str] = []
 
-    if bool(getattr(_SETTINGS, "READY_REQUIRE_ROUTES", True)):
-        if not bool(meta.get("routes_mounted")):
-            reasons.append("routes_not_mounted")
-        if int(meta.get("routes_failed_count", 0) or 0) > 0:
-            reasons.append("route_module_failure")
-        if list(meta.get("missing_required_keys", []) or []):
-            reasons.append("required_route_family_missing")
-        if dict(meta.get("canonical_path_owner_mismatches", {}) or {}):
-            reasons.append("canonical_route_owner_mismatch")
+    if not bool(meta.get("routes_mounted")):
+        reasons.append("routes_not_mounted")
+    if int(meta.get("routes_failed_count", 0) or 0) > 0:
+        reasons.append("route_module_failure")
+    if list(meta.get("missing_required_keys", []) or []):
+        reasons.append("required_route_family_missing")
+    if dict(meta.get("canonical_path_owner_mismatches", {}) or {}):
+        reasons.append("canonical_route_owner_mismatch")
 
-    require_engine = bool(getattr(_SETTINGS, "READY_REQUIRE_ENGINE", True))
     engine_expected = bool(getattr(_SETTINGS, "INIT_ENGINE_ON_BOOT", True))
-    if require_engine and engine_expected:
+    if engine_expected:
         if not bool(meta.get("engine_ready")):
             reasons.append("engine_not_ready")
 
     if (
-        bool(getattr(_SETTINGS, "READY_REQUIRE_AUTH", True))
-        and _is_production_env(getattr(_SETTINGS, "APP_ENV", "production"))
+        _is_production_env(getattr(_SETTINGS, "APP_ENV", "production"))
         and not bool(getattr(_SETTINGS, "OPEN_MODE", False))
         and not bool(getattr(_SETTINGS, "REQUIRE_AUTH", True))
     ):
@@ -2592,13 +2613,15 @@ def create_app() -> FastAPI:
         _append_startup_warning(app, "query_token_transport_enabled")
 
     # Starlette middleware is LIFO (last added = outermost). Desired order:
-    # RequestID -> CORS -> GlobalAuth -> NoResponseGuard -> GZip -> route.
+    # RequestID -> CORS -> AuthorityValidation -> GlobalAuth ->
+    # NoResponseGuard -> GZip -> route.
     # This preserves request IDs on every response, lets CORS decorate the
     # 401s the wall synthesizes, and keeps the wall OUTSIDE the response
     # guard and compression so an anonymous caller costs no route work.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(NoResponseGuardMiddleware)
     app.add_middleware(GlobalAuthEnforcementMiddleware)   # v8.13.0 wall
+    app.add_middleware(RequestAuthorityValidationMiddleware)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
         if bool(_SETTINGS.CORS_ALLOW_CREDENTIALS):
@@ -2634,7 +2657,7 @@ def create_app() -> FastAPI:
             exc_info=True,
             extra={
                 "request_id": request_id,
-                "path": str(request.url.path),
+                "path": request_path(request),
                 "status_code": 500,
             },
         )
@@ -2645,7 +2668,7 @@ def create_app() -> FastAPI:
             content={
                 "status": "error",
                 "error": _public_error_text(exc),
-                "path": str(request.url.path),
+                "path": request_path(request),
                 "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
             },

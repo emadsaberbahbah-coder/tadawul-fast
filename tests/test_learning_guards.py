@@ -1025,7 +1025,9 @@ def test_v633_far_future_reject_is_logged_not_clamped():
 @pytest.mark.skipif(not _ROUTE_V16 or _AA is None,
                     reason="advanced_analysis v4.16.0 not present")
 def test_v416_runtime_version_matches_file():
-    assert 'ADVANCED_ANALYSIS_VERSION = "4.16.0"' in _AA_SRC
+    source_version = _src_ver(_AA_SRC, r'ADVANCED_ANALYSIS_VERSION = "([0-9.]+)"')
+    assert source_version >= (4, 16, 0)
+    assert tuple(int(part) for part in _AA.ADVANCED_ANALYSIS_VERSION.split(".")) == source_version
 
 
 @pytest.mark.skipif(not _ROUTE_V16 or _AA is None,

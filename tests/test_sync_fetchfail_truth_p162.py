@@ -158,10 +158,8 @@ def test_t3_stamp_row_modes():
     _setmode(mod, None)
     for row in (off, obs, enf):
         assert len(row) == 10 and row[0] == "Global_Markets" and row[6] == 6609
-    assert "fresh=6444" in off[3] and "fresh_cov=97.5%" in off[3] and "data=COMPLETE" in off[3] and "fetchfail" not in off[3]
-    assert off[2] == "SUCCESS"
-    assert "fresh=6444" in obs[3] and "fresh_cov=97.5%" in obs[3] and "data=COMPLETE" in obs[3]
-    assert " fetchfail=6302/0 would_cov=2.1%" in obs[3] and obs[2] == "SUCCESS"
+    # v6.64.4: presentation rollout cannot change factual data validity.
+    assert off[2:] == obs[2:] == enf[2:]
     assert "fresh=142" in enf[3] and "fresh_cov=2.1%" in enf[3] and "data=PARTIAL" in enf[3]
     assert " fetchfail=6302/0" in enf[3] and "would_cov" not in enf[3]
     assert enf[2] == "PARTIAL_FRESH"
@@ -175,9 +173,9 @@ def test_t4_feed_token():
     mod = m()
     meta = dict(GM_META, ff_new=6302, ff_carried=0)
     _setmode(mod, None)
-    assert mod._uv_page_state(_res(mod, **meta)) == ("OK", 97.5)
+    assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 2.1)
     _setmode(mod, "observe")
-    assert mod._uv_page_state(_res(mod, **meta)) == ("OK", 97.5)
+    assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 2.1)
     _setmode(mod, "enforce")
     assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 2.1)
     # partial storm below the 95% floor still flips; above it stays OK
@@ -224,8 +222,10 @@ def test_t6_base_parity():
     enf_row = mod._status_stamp_row("Global_Markets", _res(mod, **meta), 115)
     _setmode(mod, None)
     nb, no = _norm(base_row), _norm(off_row)
-    assert nb[0] == no[0] and nb[2] == no[2] and nb[3] == no[3] and nb[4:] == no[4:]   # B is a timestamp
-    assert bb._uv_page_state(_res(bb, **meta)) == ("OK", 97.5) == mod._uv_page_state(_res(mod, **meta))
+    assert nb[0] == no[0] and nb[4:] == no[4:]   # stable schema/counters
+    assert no[2:] == _norm(enf_row)[2:]
+    assert bb._uv_page_state(_res(bb, **meta)) == ("OK", 97.5)
+    assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 2.1)
     assert "data=COMPLETE" in base_row[3] and "data=PARTIAL" in enf_row[3]          # the lie vs the truth
     return "parity"
 

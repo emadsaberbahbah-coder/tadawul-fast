@@ -3,7 +3,7 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.9.0 (STATIC-NAME-FALLBACK / SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED)
+TFB Enriched Quote Core — v4.11.1 (WITNESSED-MARGIN-PUBLICATION / ENGINE-CONTRACT-ALIGNED)
 ==============================================================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
@@ -390,7 +390,12 @@ logger.addHandler(logging.NullHandler())
 # skips. Scope: expected_roi_1m/3m/12m only; upside_pct / percent_change are
 # a vNEXT decision after their own residual count.
 # -----------------------------------------------------------------------------
-MODULE_VERSION = "4.11.0"
+# v4.11.1 (2026-10-06): symbol-explicit engine_quotes bypasses the engine's
+# sheet projection. Honor TFB_MARGIN_PUBLISH at this publication boundary,
+# converting only margins with exact, field-specific points provenance.
+# Default off and internal engine/scoring values are unchanged. A genuine
+# fraction above 1.5 is never reinterpreted from its magnitude alone.
+MODULE_VERSION = "4.11.1"
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -1664,6 +1669,51 @@ def _roi_points_output_sentry(row: Dict[str, Any]) -> None:
 
 
 # =============================================================================
+# v4.11.1: Witnessed Margin Publication
+# =============================================================================
+
+def _publish_witnessed_margin_units(row: Dict[str, Any]) -> None:
+    """Publish proven margin points as fractions under the existing mode.
+
+    Exact enforce-mode unit/repair tags establish the field's unit; neither
+    provider names nor magnitude suffice. Existing margin_publish markers
+    make repeated engine/bridge/fallback projections idempotent.
+    """
+    mode = str(os.getenv("TFB_MARGIN_PUBLISH") or "").strip().lower()
+    if mode not in {"observe", "enforce"} or not isinstance(row, dict):
+        return
+    raw = row.get("warnings")
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [_strip(p) for p in raw if _strip(p)]
+    else:
+        return
+    for field in ("gross_margin", "operating_margin", "profit_margin"):
+        marker = "margin_publish:%s:" % field
+        published = {marker + kind for kind in ("pts", "pts_thin", "oob", "frac", "frac_amb")}
+        if published.intersection(parts):
+            continue
+        witnesses = {
+            "fund_unit_contract:eodhd:%s" % field,
+            "fund_coherence_repaired:%s:x100" % field,
+            "fund_coherence_repaired:%s:d100" % field,
+        }
+        if not witnesses.intersection(parts):
+            continue
+        value = _to_number(row.get(field))
+        if value is None:
+            continue
+        kind = "pts_thin" if abs(value) <= 1.5 else "pts"
+        tag = marker + kind + (":observe" if mode == "observe" else "")
+        if mode == "enforce":
+            row[field] = round(value / 100.0, 6)
+        if tag not in parts:
+            _append_warning(row, tag)
+            parts.append(tag)
+
+
+# =============================================================================
 # v4.5.0: Outlier-Clamp Sanity Gate
 # =============================================================================
 
@@ -2670,7 +2720,8 @@ def normalize_rows(
         9b. _normalize_scoring_errors_field     (v4.7.0 NEW)
         10. _ensure_provenance_fields           (v4.4.0)
         11. _detect_and_mark_empty_row          (v4.5.0, EXPANDED v4.7.0)
-        11b. _strip_stale_warnings              (v4.6.0 — runs LAST)
+        11b. _strip_stale_warnings              (v4.6.0)
+        11c. _publish_witnessed_margin_units    (v4.11.1, gated OFF)
         12. top10-specific normalization        (existing)
         13. schema_projection                   (existing)
     """
@@ -2699,6 +2750,7 @@ def normalize_rows(
             _ensure_provenance_fields(rd)
             _detect_and_mark_empty_row(rd)
             _strip_stale_warnings(rd)
+            _publish_witnessed_margin_units(rd)
         if page == "Top_10_Investments":
             if rd.get("top10_rank") is None and rd.get("rank_overall") is not None:
                 rd["top10_rank"] = rd.get("rank_overall")

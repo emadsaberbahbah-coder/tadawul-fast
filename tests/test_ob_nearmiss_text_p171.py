@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 ob = importlib.import_module("core.analysis.opportunity_builder")
-assert ob.OPPORTUNITY_BUILDER_VERSION == "1.23.2", ob.OPPORTUNITY_BUILDER_VERSION
+assert ob.OPPORTUNITY_BUILDER_VERSION == "1.24.1", ob.OPPORTUNITY_BUILDER_VERSION
 
 NOW = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 FX = {"USD": 3.7555, "SAR": 1.0, "GBX": 0.0498}

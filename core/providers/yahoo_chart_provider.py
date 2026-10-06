@@ -2,8 +2,26 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.15.0
+Yahoo Chart Provider (Global + KSA History) -- v8.15.2
 ================================================================================
+v8.15.2 -- ENFORCE TOKEN REFILLS UNDER CONCURRENT WAITERS
+--------------------------------------------------------------------------------
+TokenBucket now rechecks and consumes available tokens after each bounded sleep.
+Previously every waiting caller could resume after the same delay without
+consuming a refill, and the five-second sleep cap admitted low-rate calls early.
+Waiting cancellation leaves fractional tokens available to other callers.
+Requests larger than the configured burst fail immediately instead of waiting
+for an impossible refill. The v8.15.1 single-flight cancellation guards remain.
+
+v8.15.1 -- SINGLEFLIGHT CANCELLATION SAFETY
+--------------------------------------------------------------------------------
+Followers now await the shared Future through asyncio.shield(), so cancelling
+one caller cannot cancel the result awaited by the owner and other followers.
+If the owner is cancelled, it explicitly cancels that shared Future before the
+existing identity-checked cleanup, waking every follower instead of leaving
+them blocked forever. No lock is held across an await; routing, payloads,
+concurrency limits and cross-loop replacement semantics are unchanged.
+
 v8.15.0 -- LOOPGUARD (B6-b): ASYNC STATE SURVIVES asyncio.run() PER CALL
 --------------------------------------------------------------------------------
 WHY (zero-network reproduction, 2026-10-06 review of branch
@@ -743,7 +761,7 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.15.0"
+PROVIDER_VERSION = "8.15.2"
 # -----------------------------------------------------------------------------
 # v8.14.0 (2026-09-01) - OPEN HEALED FROM THE SESSION CANDLE, COHERENCE-GUARDED
 # -----------------------------------------------------------------------------
@@ -1790,26 +1808,33 @@ class TokenBucket:
         """Acquire `n` tokens (blocking until available)."""
         if self.rate_per_sec <= 0:
             return
+        if n <= 0:
+            return
+        if not math.isfinite(n) or n > self.burst:
+            raise ValueError("token request must be finite and no larger than burst")
 
-        with self.lock:                              # v8.15.0 LOOPGUARD
-            now = time.monotonic()
-            if self.last <= 0:
+        while True:
+            with self.lock:                          # v8.15.0 LOOPGUARD
+                now = time.monotonic()
+                if self.last <= 0:
+                    self.last = now
+                    self.tokens = float(self.burst)
+
+                elapsed = max(0.0, now - self.last)
+                self.tokens = min(float(self.burst), self.tokens + elapsed * float(self.rate_per_sec))
                 self.last = now
-                self.tokens = float(self.burst)
 
-            elapsed = max(0.0, now - self.last)
-            self.tokens = min(float(self.burst), self.tokens + elapsed * float(self.rate_per_sec))
-            self.last = now
+                if self.tokens >= n:
+                    self.tokens -= n
+                    return
 
-            if self.tokens >= n:
-                self.tokens -= n
-                return
+                wait = (n - self.tokens) / float(self.rate_per_sec)
 
-            need = n - self.tokens
-            wait = need / float(self.rate_per_sec)
-            self.tokens = 0.0
-
-        await asyncio.sleep(min(5.0, max(0.0, wait)))
+            # Recheck after waking: another caller may have consumed the
+            # refill, or the capped sleep may cover only part of the delay.
+            # No reservation is made until admission, so cancellation cannot
+            # waste the tokens already available to other waiting callers.
+            await asyncio.sleep(min(5.0, max(0.0, wait)))
 
 
 @dataclass(slots=True)
@@ -1922,13 +1947,23 @@ class SingleFlight:
         # v8.15.0 LOOPGUARD: OUTSIDE the critical section -- a threading.Lock
         # held across an await would deadlock the loop.
         if not owner:
-            return await future
+            # v8.15.1: a cancelled follower must not cancel the shared Future
+            # (and therefore every other waiter).  The owner remains the sole
+            # task responsible for completing or cancelling it.
+            return await asyncio.shield(future)
 
         try:
             result = await coro_fn()
             if not future.cancelled() and not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            # v8.15.1: CancelledError is a BaseException on supported Python
+            # versions, so the Exception branch below cannot wake followers.
+            # Completing the shared Future before cleanup prevents a hang.
+            if not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             if not future.cancelled() and not future.done():
                 future.set_exception(exc)

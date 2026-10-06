@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # routes/advanced_analysis.py
 """
+v4.16.1 (2026-10-06): authorize the ASGI route path independently of Host-based
+URL reconstruction.
+
 ================================================================================
-Advanced Analysis Root Owner — v4.16.0
+Advanced Analysis Root Owner — v4.16.1
 NO-FABRICATION CLOSEOUT  (external audit P0-1 a/b/c/d — 2026-08-03)
 ================================================================================
 v4.16.0 (2026-08-03) — closes the four residual fabrication paths found by the
@@ -448,6 +451,8 @@ and their /v1/schema aliases.
 
 from __future__ import annotations
 
+from core.utils.request_security import request_path
+
 import asyncio
 import inspect
 import threading
@@ -528,7 +533,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.16.0"  # v4.16.0: runtime telemetry now matches file version (P0-1a)
+ADVANCED_ANALYSIS_VERSION = "4.16.1"
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -2236,7 +2241,7 @@ def _auth_passed(
 
     if callable(auth_ok):
         headers_dict = dict(request.headers)
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        path = request_path(request)
         attempts = [
             {
                 "token": auth_token,
@@ -3585,7 +3590,7 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         },
         "allowed_pages_count": len(_safe_allowed_pages()),
         "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
-        "path": str(getattr(getattr(request, "url", None), "path", "")),
+        "path": request_path(request),
     })
 
 
@@ -3620,8 +3625,7 @@ async def schema_provider_health(request: Request) -> Dict[str, Any]:
             "dispatch": "schema_provider_health",
             "source": "core.data_engine_v2.get_engine().health",
             "timeout_s": _provider_health_timeout_s(),
-            "path": str(
-                getattr(getattr(request, "url", None), "path", "")),
+            "path": request_path(request),
         },
     })
 

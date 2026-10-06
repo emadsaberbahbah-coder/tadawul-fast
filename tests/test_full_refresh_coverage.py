@@ -12,6 +12,63 @@ HEADERS = ["Symbol", "Name", "Current Price", "Last Updated (UTC)", "Position Qt
 
 
 class FullRefreshCoverageTests(unittest.TestCase):
+    def test_recent_failed_fetch_cannot_certify_refresh_coverage(self) -> None:
+        headers = HEADERS + ["Warnings"]
+        grid = [headers]
+        for i in range(100):
+            # Reproduce the exported page: failed provider calls stamped now.
+            warning = "fetch_failed:HTTP 429; dq_capped:coherence:fetch_failed" if i < 6 else ""
+            grid.append([f"S{i}", "Name", 10, "2026-07-30T07:30:00Z", "", "", warning])
+        result = audit_grid(grid, Rule("Commodities_FX", 100, 30, 95, 100, 100), headers, NOW)
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(result.timestamp_fresh, 100)
+        self.assertEqual(result.fresh, 94)
+        self.assertEqual(result.failed_fetch_rows, 6)
+        self.assertEqual(result.excluded_origin_rows, 6)
+
+    def test_failure_overlap_excluded_once_and_safe_warning_not_excluded(self) -> None:
+        headers = HEADERS + ["Warnings"]
+        grid = [headers,
+                ["A", "Name", 10, "2026-07-30T07:30:00Z", "", "", "fetch_failed:timeout; identity_quarantined:kept_last_good; price_bar_stale:48h"],
+                ["B", "Name", 10, "2026-07-30T07:30:00Z", "", "", "fund_identity_quarantined:name_conflict"],
+                ["C", "Name", 10, "2026-07-30T07:30:00Z", "", "", "fundamentals_lkg:used; fetch_failed_count:0"]]
+        result = audit_grid(grid, Rule("Global_Markets", 3, 30, 95, 100, 100), headers, NOW)
+        self.assertEqual(result.fresh, 1)
+        self.assertEqual(result.failed_fetch_rows, 1)
+        self.assertEqual(result.quarantined_rows, 2)
+        self.assertEqual(result.unusable_origin_rows, 1)
+        self.assertEqual(result.excluded_origin_rows, 2)
+
+    def test_unusable_origin_prefixes_cannot_certify_refresh_coverage(self) -> None:
+        headers = HEADERS + ["Warnings"]
+        unusable = (
+            "price_bar_stale:48h",
+            "bar_age_failover_exhausted:2",
+            "empty_row_no_provider_data",
+        )
+        grid = [headers]
+        for i in range(100):
+            warning = unusable[i % len(unusable)] if i < 6 else ""
+            grid.append([f"S{i}", "Name", 10, "2026-07-30T07:30:00Z", "", "", warning])
+        result = audit_grid(grid, Rule("Commodities_FX", 100, 30, 95, 100, 100), headers, NOW)
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(result.timestamp_fresh, 100)
+        self.assertEqual(result.fresh, 94)
+        self.assertEqual(result.unusable_origin_rows, 6)
+        self.assertEqual(result.excluded_origin_rows, 6)
+
+    def test_unusable_origin_matching_requires_delimited_exact_prefix(self) -> None:
+        headers = HEADERS + ["Warnings"]
+        grid = [headers,
+                ["A", "Name", 10, "2026-07-30T07:30:00Z", "", "", "price_bar_stale_count:0"],
+                ["B", "Name", 10, "2026-07-30T07:30:00Z", "", "", "xbar_age_failover_exhausted:2"],
+                ["C", "Name", 10, "2026-07-30T07:30:00Z", "", "", "empty_row_no_provider_data_count:0"]]
+        result = audit_grid(grid, Rule("Global_Markets", 3, 30, 100, 100, 100), headers, NOW)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.fresh, 3)
+        self.assertEqual(result.unusable_origin_rows, 0)
+        self.assertEqual(result.excluded_origin_rows, 0)
+
     def test_clean_market_page_passes(self) -> None:
         grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-30 07:30:00", "", ""], ["BBB", "Beta", 20, "2026-07-30 07:00:00", "", ""]]
         result = audit_grid(grid, Rule("Market_Leaders", 2, 30, 100, 100, 100), HEADERS, NOW)

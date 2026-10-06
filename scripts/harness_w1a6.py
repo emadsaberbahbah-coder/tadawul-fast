@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.2.0  (2026-08-18)
+W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.3.0  (2026-10-06)
 ================================================================================
+v2.3.0 (factual feed validity): success without coverage metadata must remain
+  STALE_COV, and an absent page has an unknown timestamp. Retain the distinct
+  missing-state test with an explicitly fresh timestamp so both rejection
+  paths are tested rather than treating absent evidence as executable.
 v2.0.0 (external W1A-6 Deployment Audit adjudicated):
   F-07 enforce-mode mutation contract (deterministic synthetic fixtures);
   F-08 decision-owned _Status suppression test (new v6.39.5 behaviour);
@@ -618,12 +622,16 @@ check("S12.6 OK but older than 240min -> AGED -> NOT_ACTIONABLE",
       v == "NOT_ACTIONABLE(aged:MF)", v)
 miss = dict(ALL_OK); miss.pop("Commodities_FX")
 v, _ = M._uv_compose(miss, _now)
-check("S12.7 missing page -> NOT_ACTIONABLE(missing:CFX)",
-      v == "NOT_ACTIONABLE(missing:CFX)", v)
+check("S12.7 absent page -> NOT_ACTIONABLE(timestamp_unknown:CFX)",
+      v == "NOT_ACTIONABLE(timestamp_unknown:CFX)", v)
+miss["Commodities_FX"] = ("", _now - 60)
+v, s = M._uv_compose(miss, _now)
+check("S12.7b fresh timestamp without page state -> NOT_ACTIONABLE(missing:CFX)",
+      v == "NOT_ACTIONABLE(missing:CFX)" and "CFX:MISSING" in s, v)
 st, cov = M._uv_page_state(fresh_res(
     status="success", symbols_requested=100))
-check("S12.8 success w/o meta -> OK, cov None (no fake numbers)",
-      st == "OK" and cov is None, f"{st}/{cov}")
+check("S12.8 success w/o metadata -> STALE_COV, cov None (no invented coverage)",
+      st == "STALE_COV" and cov is None, f"{st}/{cov}")
 r = fresh_res(status="success", symbols_requested=100)
 r._stamp_meta = {"requested": 100, "pre_persist_rows": 50, "klg_kept": 10}
 check("S12.9 success at 40% coverage -> STALE_COV",
@@ -668,9 +676,10 @@ check("S12.13 composite upserted at next blank L5:M5",
       ups[1]["range"] == "'_Status'!L5:M5", ups[1]["range"])
 comp = ups[1]["body"]["values"][0]
 check("S12.14 composite key/value: GM fresh-OK but ML/CFX/MF missing "
-      "-> NOT_ACTIONABLE(missing:ML)",
+      "-> NOT_ACTIONABLE(timestamp_unknown:ML)",
       comp[0] == "TFB Decision Feed"
-      and comp[1].startswith("NOT_ACTIONABLE(missing:ML)"), comp[1][:60])
+      and comp[1].startswith("NOT_ACTIONABLE(timestamp_unknown:ML)")
+      and "ML:TIMESTAMP_UNKNOWN" in comp[1], comp[1][:60])
 FULLGRID = [["Global Key", "Value"], ["Backend URL", "https://x"],
             ["TFB Feed Market_Leaders",
              f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
@@ -711,7 +720,7 @@ env(TFB_SYNC_UPSTREAM_VERDICT="0")
 print()
 print("=" * 78)
 npass = sum(1 for _, ok, _ in RESULTS if ok)
-print(f"HARNESS v2.2.0 RESULT: {npass}/{len(RESULTS)} PASS"
+print(f"HARNESS v2.3.0 RESULT: {npass}/{len(RESULTS)} PASS"
       + (f"  ({len(SKIPPED)} suite(s) skipped)" if SKIPPED else ""))
 for n, ok, d in RESULTS:
     if not ok:

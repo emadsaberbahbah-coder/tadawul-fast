@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""yahoo_fundamentals_provider v6.9.0 [P-203 LOOPGUARD] harness — REAL module,
-dual-tree (base v6.8.0 vs delivered v6.9.0), ZERO network: the blocking yfinance
+"""yahoo_fundamentals_provider v6.9.1 [P-203 LOOPGUARD] harness — REAL module,
+dual-tree (base v6.8.0 vs delivered v6.9.1), ZERO network: the blocking yfinance
 leg is replaced by a sync stub, `_configured` is forced True, Redis stays off.
   G1 GOLDEN-NEGATIVE on BASE: the REAL fetch_fundamentals_batch across two
      asyncio.run() loops with provider-level contention (cap 1, 4 callers) — the
@@ -83,7 +83,7 @@ else:
 
 # ---------------------------------------------------------------- G2 ------ #
 md = load(DELIV, "yf_deliv"); calls = arm(md)
-assert md.PROVIDER_VERSION == "6.9.0", md.PROVIDER_VERSION
+assert md.PROVIDER_VERSION == "6.9.1", md.PROVIDER_VERSION
 pd, d1, d2, derr = drive_two_loops(md)
 check("G2 delivered loop 1 returns all symbols", len(d1) == len(SYMS), len(d1))
 check("G2 delivered loop 2 returns all symbols, no error", len(d2) == len(SYMS) and derr is None, f"loop2={len(d2)} err={derr!r}")
@@ -184,7 +184,7 @@ dd = defs(src_d)
 if BASE:
     db = defs(open(BASE, encoding="utf-8").read())
     check("G6 +2 defs (_observe_future, inflight), 0 removed", sorted(dd - db) == ["_observe_future", "inflight"] and not (db - dd), sorted(dd - db))
-check("G6 no asyncio.Lock constructed in code; version 6.9.0", "asyncio.Lock()" not in src_d and md.VERSION == "6.9.0")
+check("G6 no asyncio.Lock constructed in code; version 6.9.1", "asyncio.Lock()" not in src_d and md.VERSION == "6.9.1")
 awaits_under_lock = []
 for n in ast.walk(ast.parse(src_d)):
     if isinstance(n, ast.With):

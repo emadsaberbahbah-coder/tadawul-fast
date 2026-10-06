@@ -1,0 +1,664 @@
+{
+  "review_as_of_utc": "2026-10-06T21:03:11+00:00",
+  "source": {
+    "file_name": "_Market Share Deepseek-V3 (1).xlsx",
+    "sha256": "9c8b34812eee7d5554a3586f1f86a232e79159f24e228a4eac070e2436441ef4",
+    "bytes": 21390797,
+    "sheet_count": 49,
+    "cached_values_only": true,
+    "formula_cells": 13578,
+    "formula_without_cached_element": 0
+  },
+  "production_validation": false,
+  "main_and_deployed_commit": "26fe4960e7e4f03ab3066ed3031e91eeb4c8a3b4",
+  "previous_review_commit": "6d34156e72adb53809deef5916916653e98c5a0e",
+  "runtime_observation": {
+    "observed_at_utc": "2026-10-06T21:16:32.502456+00:00",
+    "base_url": "https://tadawul-fast-bridge.onrender.com",
+    "endpoints": {
+      "/health": {
+        "http_status": 200,
+        "ready": true,
+        "status": "healthy",
+        "entry_version": "8.14.1",
+        "service_version": "8.14.1",
+        "engine_version": "5.151.0",
+        "engine_ready": true,
+        "routes_failed_count": 0,
+        "startup_warnings": [],
+        "deployed_commit": "26fe4960e7e4f03ab3066ed3031e91eeb4c8a3b4"
+      },
+      "/readyz": {
+        "http_status": 200,
+        "ready": true,
+        "status": "ready",
+        "entry_version": "8.14.1",
+        "service_version": "8.14.1",
+        "engine_version": "5.151.0",
+        "engine_ready": true,
+        "routes_failed_count": 0,
+        "startup_warnings": [],
+        "deployed_commit": "26fe4960e7e4f03ab3066ed3031e91eeb4c8a3b4"
+      }
+    }
+  },
+  "source_coverage": [
+    {
+      "page": "Market_Leaders",
+      "status": "FAIL",
+      "header_row": 1,
+      "expected_cols": 115,
+      "actual_cols": 115,
+      "rows": 255,
+      "unique": 255,
+      "min_rows": 1025,
+      "fresh": 251,
+      "stale": 4,
+      "bad_stamps": 0,
+      "timestamp_fresh": 255,
+      "failed_fetch_rows": 0,
+      "quarantined_rows": 2,
+      "unusable_origin_rows": 2,
+      "excluded_origin_rows": 4,
+      "fresh_pct": 98.4314,
+      "name_pct": 100.0,
+      "price_pct": 100.0,
+      "newest_age_h": 0.9887030530555555,
+      "oldest_age_h": 24.183184225833333,
+      "blank_symbols": 0,
+      "failures": [
+        "row count 255 below minimum 1025"
+      ],
+      "warnings": [
+        "4 failed-fetch, quarantined or unusable-origin row(s) excluded from fresh coverage"
+      ]
+    },
+    {
+      "page": "Global_Markets",
+      "status": "FAIL",
+      "header_row": 1,
+      "expected_cols": 115,
+      "actual_cols": 115,
+      "rows": 6609,
+      "unique": 6609,
+      "min_rows": 6512,
+      "fresh": 6337,
+      "stale": 272,
+      "bad_stamps": 1,
+      "timestamp_fresh": 6579,
+      "failed_fetch_rows": 46,
+      "quarantined_rows": 150,
+      "unusable_origin_rows": 80,
+      "excluded_origin_rows": 272,
+      "fresh_pct": 95.8844,
+      "name_pct": 97.9119,
+      "price_pct": 97.7758,
+      "newest_age_h": 1.3223982405555554,
+      "oldest_age_h": 116.25835871583332,
+      "blank_symbols": 0,
+      "failures": [
+        "name coverage 97.91% below 99.00%"
+      ],
+      "warnings": [
+        "1 missing, date-only, invalid or future timestamp(s)",
+        "272 failed-fetch, quarantined or unusable-origin row(s) excluded from fresh coverage"
+      ]
+    },
+    {
+      "page": "Commodities_FX",
+      "status": "FAIL",
+      "header_row": 1,
+      "expected_cols": 115,
+      "actual_cols": 115,
+      "rows": 453,
+      "unique": 453,
+      "min_rows": 453,
+      "fresh": 402,
+      "stale": 51,
+      "bad_stamps": 0,
+      "timestamp_fresh": 446,
+      "failed_fetch_rows": 35,
+      "quarantined_rows": 0,
+      "unusable_origin_rows": 11,
+      "excluded_origin_rows": 44,
+      "fresh_pct": 88.7417,
+      "name_pct": 100.0,
+      "price_pct": 97.7925,
+      "newest_age_h": 1.0197045736111112,
+      "oldest_age_h": 328.71847635055553,
+      "blank_symbols": 0,
+      "failures": [
+        "fresh coverage 88.7417 below 95.0% within 30.0h"
+      ],
+      "warnings": [
+        "44 failed-fetch, quarantined or unusable-origin row(s) excluded from fresh coverage"
+      ]
+    },
+    {
+      "page": "Mutual_Funds",
+      "status": "FAIL",
+      "header_row": 1,
+      "expected_cols": 115,
+      "actual_cols": 115,
+      "rows": 2474,
+      "unique": 2474,
+      "min_rows": 4496,
+      "fresh": 2417,
+      "stale": 57,
+      "bad_stamps": 0,
+      "timestamp_fresh": 2474,
+      "failed_fetch_rows": 0,
+      "quarantined_rows": 0,
+      "unusable_origin_rows": 57,
+      "excluded_origin_rows": 57,
+      "fresh_pct": 97.696,
+      "name_pct": 98.0194,
+      "price_pct": 97.5344,
+      "newest_age_h": 2.022305517777778,
+      "oldest_age_h": 9.243259981111112,
+      "blank_symbols": 0,
+      "failures": [
+        "row count 2474 below minimum 4496",
+        "name coverage 98.02% below 99.00%"
+      ],
+      "warnings": [
+        "57 failed-fetch, quarantined or unusable-origin row(s) excluded from fresh coverage"
+      ]
+    },
+    {
+      "page": "My_Portfolio",
+      "status": "FAIL",
+      "header_row": 1,
+      "expected_cols": 122,
+      "actual_cols": 122,
+      "rows": 5,
+      "unique": 5,
+      "min_rows": 5,
+      "fresh": 5,
+      "stale": 0,
+      "bad_stamps": 0,
+      "timestamp_fresh": 5,
+      "failed_fetch_rows": 0,
+      "quarantined_rows": 0,
+      "unusable_origin_rows": 0,
+      "excluded_origin_rows": 0,
+      "fresh_pct": 100.0,
+      "name_pct": 80.0,
+      "price_pct": 100.0,
+      "newest_age_h": 2.6279691841666666,
+      "oldest_age_h": 2.628160305,
+      "blank_symbols": 0,
+      "failures": [
+        "name coverage 80.00% below 100.00%"
+      ],
+      "warnings": []
+    },
+    {
+      "page": "Insights_Analysis",
+      "status": "PASS",
+      "header_row": 1,
+      "expected_cols": 7,
+      "actual_cols": 7,
+      "rows": 52,
+      "unique": 0,
+      "min_rows": 1,
+      "fresh": 0,
+      "stale": 0,
+      "bad_stamps": 0,
+      "timestamp_fresh": 0,
+      "failed_fetch_rows": 0,
+      "quarantined_rows": 0,
+      "unusable_origin_rows": 0,
+      "excluded_origin_rows": 0,
+      "fresh_pct": null,
+      "name_pct": null,
+      "price_pct": null,
+      "newest_age_h": null,
+      "oldest_age_h": null,
+      "blank_symbols": 0,
+      "failures": [],
+      "warnings": []
+    },
+    {
+      "page": "Data_Dictionary",
+      "status": "PASS",
+      "header_row": 1,
+      "expected_cols": 9,
+      "actual_cols": 9,
+      "rows": 831,
+      "unique": 0,
+      "min_rows": 1,
+      "fresh": 0,
+      "stale": 0,
+      "bad_stamps": 0,
+      "timestamp_fresh": 0,
+      "failed_fetch_rows": 0,
+      "quarantined_rows": 0,
+      "unusable_origin_rows": 0,
+      "excluded_origin_rows": 0,
+      "fresh_pct": null,
+      "name_pct": null,
+      "price_pct": null,
+      "newest_age_h": null,
+      "oldest_age_h": null,
+      "blank_symbols": 0,
+      "failures": [],
+      "warnings": []
+    }
+  ],
+  "decision_snapshot": {
+    "latest_top10_run_utc": "2026-10-06T20:36:26+00:00",
+    "portfolio_run_utc": "2026-10-06T19:20:17+00:00",
+    "top10_after_sources": true,
+    "top10_state": "HELD",
+    "grace_rows": 6,
+    "suspended_rows": 1,
+    "executable_top10_tickets": 0,
+    "cached_opportunity_builder_version": "1.23.2",
+    "cached_portfolio_actions_version": "1.14.0",
+    "hard_blocked_invest_contradictions": 0,
+    "source_invest_labels": 127,
+    "source_invest_meeting_cockpit_dq_reliability_floors": 14,
+    "active_lots_priced": 5,
+    "portfolio_display_arithmetic_reconciles_at_workbook_fx": true,
+    "latest_cash_snapshot_date": "2026-10-03"
+  },
+  "workflow_evidence": {
+    "sync_run": 37511489930,
+    "sync_outcome_audit": 37523655967,
+    "full_coverage_audit": 37523655956,
+    "decision_freshness_audit": 37523655982,
+    "conclusions": "failure",
+    "decision_audit_vintage": "earlier than latest cached Top10; do not transfer all eight old findings to newer export",
+    "cfx_fresh_fetched": 411,
+    "cfx_requested": 453,
+    "sampled_eodhd_quota_percent_range": [
+      13,
+      24
+    ],
+    "performance_price_fetch_run": 37503424288,
+    "performance_fallback_requested": 17,
+    "performance_fallback_fetched": 0,
+    "http_429": 16
+  },
+  "backtest": {
+    "version": "1.2.1",
+    "as_of_utc": "2026-10-06T21:03:11+00:00",
+    "unique_decided_cohorts": 10987,
+    "signals": [
+      {
+        "signal": "Entry Forecast Reliability",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.28225819261215085,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": -0.004016532524559913,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 0
+      },
+      {
+        "signal": "Entry Score",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.27853540771719537,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": -0.000293747629604435,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 0
+      },
+      {
+        "signal": "Confidence",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.27533637810953937,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.002905281978051566,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 0
+      },
+      {
+        "signal": "Entry Investability",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.2729408241921024,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.00530083589548852,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 49
+      },
+      {
+        "signal": "Entry Recommendation",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.2776089029006358,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.0006327571869551574,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 79
+      },
+      {
+        "signal": "Risk Bucket",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.2781403789693582,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.00010128111823271002,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 4
+      },
+      {
+        "signal": "Horizon",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.27523297333659047,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.0030086867510004667,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 296
+      },
+      {
+        "signal": "Origin Tab",
+        "status": "PENDING",
+        "pending_reasons": [
+          "duplicate_cohort"
+        ],
+        "heldout_rows": 6931,
+        "heldout_days": 53,
+        "excluded_rows": 27,
+        "model_brier": 0.2753321309035154,
+        "baseline_brier": 0.27824166008759094,
+        "paired_brier_gain": 0.0029095291840755544,
+        "heldout_feature_missing_rows": 0,
+        "heldout_baseline_fallback_rows": 0
+      }
+    ]
+  },
+  "limits": [
+    "Workbook cached values are a snapshot, not a live Google Sheets read or recalculated formulas.",
+    "No direct IBKR or site-project tools exposed; no broker fill/account reconciliation.",
+    "No live Sheet edits, native GAS deployment, production merge/deploy or broker mutations performed.",
+    "No approved replacement universe membership supplied; configured floors remain unchanged.",
+    "Paper cohort/basket metrics do not establish net account performance, immutable evidence or statistical significance."
+  ],
+  "outcome_evidence": {
+    "performance_log": {
+      "records": 19637,
+      "statuses": {
+        "matured": 11218,
+        "expired": 112,
+        "active": 8307
+      },
+      "outcomes": {
+        "WIN": 5150,
+        "LOSS": 5864,
+        "BREAKEVEN": 204,
+        "CORP_ACTION_SUSPECT": 47,
+        "": 8307,
+        "UNPRICED": 65
+      },
+      "unique_keys": 19610,
+      "duplicate_keys": 27,
+      "extra_duplicate_rows": 27,
+      "duplicate_record_dates": {
+        "2026-07-19": 1,
+        "2026-08-07": 26
+      },
+      "duplicate_differences": [
+        "Record ID",
+        "Date Recorded (Riyadh)",
+        "Target Date (Riyadh)"
+      ],
+      "duplicate_current_outcome_or_roi_disagreement": false,
+      "unique_decided_cohorts": 10987,
+      "entry_selection_stamps": {
+        "": 6259,
+        "NO": 4708,
+        "YES": 20
+      }
+    },
+    "signal_history": {
+      "snapshots": 28376,
+      "unique_keys": 7552,
+      "duplicated_keys": 5156,
+      "extra_key_rows": 20824,
+      "duplicate_snapshot_ids": 0,
+      "latest_day": "2026-10-06",
+      "latest_day_duplicate_keys": 55,
+      "interpretation": "Intraday history cannot be counted as independent daily evidence. Candidate tracker preloads persisted keys/rechecks retries; old workbook duplicates remain and need auditable lineage."
+    },
+    "shadow": {
+      "paper_not_execution": true,
+      "history_rows": 292,
+      "date_range": [
+        "2026-07-19",
+        "2026-10-06"
+      ],
+      "challenger_scored_days": 15,
+      "challenger_excluded_days_current_reader": 45,
+      "challenger_excluded_days_published_dashboard": 42,
+      "published_net_alpha_pp": 4.54,
+      "window_start": "2026-09-16",
+      "window_paper_returns_percent": {
+        "CHAMPION": -0.3252029521394362,
+        "CHALLENGER": -0.3265508147295648,
+        "BENCHMARK": 3.2589810008901043
+      },
+      "window_challenger_minus_benchmark_pp": -3.585531815619669,
+      "window_enforce_criterion3": "FAIL",
+      "published_gate_verdict": "NOT_DECIDABLE",
+      "interpretation": "Published all-time alpha and intended version-boundary alpha disagree in sign; rollback/model promotion cannot use them interchangeably. No rollout mode changed."
+    },
+    "corporate_actions_and_pit": {
+      "corporate_action_register_rows": 0,
+      "current_ca_clean": null,
+      "current_ca_status": "PENDING",
+      "published_ca_status": "PASS",
+      "pit_history_order_and_duplicate_check": true,
+      "pit_note": "append-only integrity intact",
+      "limitation": "A header-only CA register is missing verification evidence; append-order checks do not prove immutable historical fundamentals or complete point-in-time coverage."
+    },
+    "calibration": {
+      "current_reader_state": "PASS",
+      "published_checkpoint_counts": 6403,
+      "published_min_sample": 20,
+      "published_band_pp": 10,
+      "published_model_mae_pp": 3.13,
+      "published_zero_mae_pp": null,
+      "pure_aggregate_reproduction": [
+        {
+          "basis": "legacy_as_stored",
+          "n": 6403,
+          "model_mae_pp": 3.13,
+          "same_row_zero_mae_pp": 3.08,
+          "model_beats_zero": false
+        },
+        {
+          "basis": "unit_corrected",
+          "n": 6349,
+          "model_mae_pp": 3.25,
+          "same_row_zero_mae_pp": 3.07,
+          "model_beats_zero": false
+        }
+      ],
+      "unit_sentry_mode": "observe",
+      "fraction_corrected_rows": 6347,
+      "already_percent_rows": 2,
+      "unresolved_unit_mismatches_excluded": 54,
+      "missing_sibling_rows": 0,
+      "interpretation": "PASS means within10pp absolute band. Neither retrospective aggregate beats zero forecast. Same-row zero baseline is unpublished, so current v2 improvement check stays PENDING unless a valid known failure dominates. These aggregates are not heldout skill."
+    },
+    "execution_evidence_quality": {
+      "operator_ledger_rows": 39,
+      "active_rows": 5,
+      "inactive_rows": 34,
+      "internal_formula_reconciliation": "Ledger calculated costs/returns match its own inputs; this does not authenticate fills/cashflows. Account totals intentionally omitted.",
+      "inactive_rows_missing_buy_fees": 32,
+      "inactive_rows_missing_sell_fees": 25,
+      "inactive_rows_jan1_buy_dates_requiring_provenance": 6,
+      "trade_note_data_rows": 0,
+      "broker_order_or_fill_id_columns_present": false,
+      "cash_snapshot_latest_date": "2026-10-03",
+      "cash_snapshot_comment_reconciliation": "Repeated currency note differs from changed balance; comment alone cannot reconcile broker cash.",
+      "cashflow_or_nav_return_series_present": false,
+      "selection_log_paper_episodes": 283,
+      "selection_log_open_paper_episodes": 7,
+      "board_scorecard_tab_present": false
+    },
+    "remaining_improvements": [
+      "Auditable duplicate-key lineage/canonical revision policy; do not silently delete historical evidence.",
+      "Publish the same-row zero baseline with the unit basis, sample identity and timestamp; keep rollout changes separately reviewed.",
+      "Segment shadow evidence by registered model/method versions and reconcile dashboard evidence counts.",
+      "Treat pooled repeated horizons and Wilson/IC significance as dependent exploratory samples; use day/instrument grouping for inference.",
+      "Label mixed-horizon cohort Sharpe/Sortino exploratory or suppress them until a consistent NAV return series exists; RiskCalculator currently annualizes cohort ROI as daily returns and mixes percentage ROI with fraction-valued risk-free rate.",
+      "Separate board-selected paper cohorts from actual execution and broker-confirmed fills; add linked immutable fill/cashflow/fee/FX provenance before strategy/account attribution."
+    ],
+    "limitations": [
+      "Workbook formulas were not recalculated; this is a cached snapshot, not a live connector verification.",
+      "Local code health checks and internal arithmetic agreement do not establish source data truth or complete CA/PIT coverage.",
+      "All model gains here are descriptive; no account financial totals, trading instructions, allocation changes or profitability claims are supplied."
+    ],
+    "regret_evidence": {
+      "forks": 85,
+      "by_kind": {
+        "FLOOR_LOCK": 29,
+        "COMPLIANCE_BLOCK": 55,
+        "EDGE_BELOW_COST": 1
+      },
+      "ledger_rows_without_scored_on": 85,
+      "ledger_rows_without_forgone_return": 85,
+      "published_summary_pending": 0,
+      "interpretation": "Fork ledger is append-only reference evidence; current hypothetical scores are rewritten into Regret_Summary. They are variable-horizon mark-to-market comparisons, not executed returns or a fixed-horizon experiment. Replaying requires the dated current-price snapshots, which are not retained in the fork ledger."
+    },
+    "hypothesis_registry": {
+      "hypotheses": 6,
+      "statuses": {
+        "INSUFFICIENT_DATA": 6
+      },
+      "zero_samples": 6,
+      "latest_backtest_utc": "2026-10-04T17:14:14.279735+00:00",
+      "interpretation": "The registry honestly reports insufficient data; it does not certify any of these six hypotheses."
+    }
+  },
+  "coverage_audit": {
+    "version": "1.1.2",
+    "schema_version": "2.15.0",
+    "summary": {
+      "pages": 7,
+      "failures": 5,
+      "warnings": 4,
+      "exit_code": 2,
+      "fatal": ""
+    },
+    "ledger_membership_validated": true
+  },
+  "validation": {
+    "python": "3.11.9",
+    "ci_commands": {
+      "compile": [
+        "echo \"::group::compileall\"\npython -m compileall -q main.py core routes scripts\necho \"::endgroup::\"\necho \"✅ every production file parses\"\n",
+        "python -m compileall -q tests\necho \"✅ every test file parses\"\n",
+        "node tests/test_dt10_hard_safety_projection.js\nnode tests/test_dt10_withheld_containment.js\n"
+      ],
+      "lean-unit": [
+        "python -m pip install -U pip\npython -m pip install \"numpy>=1.26.4,<2.0.0\" \"pytest==9.0.3\"\n",
+        "python -m py_compile \\\n  core/stats.py \\\n  core/quality_gates.py \\\n  core/scoring.py \\\n  core/analysis/opportunity_builder.py \\\n  core/analysis/portfolio_actions.py \\\n  core/analysis/top10_selector.py\n",
+        "echo \"::group::pytest (lean)\"\n# v1.0.4: existence-gated — see header. Unquoted $EXTRA vanishes\n# when empty; single-token path, no word-splitting risk.\nEXTRA=\"\"\nif [ -f tests/test_sai_falsegreen_fixtures.py ]; then\n  EXTRA=\"tests/test_sai_falsegreen_fixtures.py\"\nfi\npython -m pytest -q \\\n  tests/test_stats.py \\\n  tests/test_quality_gates.py \\\n  tests/test_data_validity.py \\\n  tests/test_full_refresh_coverage.py \\\n  tests/test_decision_surface_freshness.py \\\n  tests/test_research_evidence_validity.py \\\n  tests/test_shadow_calibration_validity.py \\\n  tests/test_backtest_walk_forward.py \\\n  tests/test_opportunity_builder.py \\\n  tests/test_recent_fixes.py \\\n  tests/test_portfolio_actions.py \\\n  tests/test_scoring_engine_contract.py \\\n  tests/test_top10_selector.py \\\n  tests/test_learning_guards.py \\\n  tests/test_sync_outcome_audit.py \\\n  tests/test_verify_manifest_pins.py \\\n  tests/test_tp_target_unit_sentry_p158.py \\\n  tests/test_track_force_coverage_p180.py \\\n  tests/test_tp_dedup_matured_p189b.py \\\n  tests/test_tp_zero_baseline_p201.py \\\n  tests/test_track_evidence_day_p205.py \\\n  tests/test_backend_readiness.py \\\n  tests/test_argaam_loopguard_b6.py \\\n  tests/test_ycp_loopguard_b6.py $EXTRA\necho \"::endgroup::\"\n",
+        "echo \"portfolio_actions suite executed — the gap this workflow exists to close.\"\n"
+      ],
+      "contract": [
+        "python -m pip install -U pip\npython -m pip install \\\n  \"numpy==1.26.4\" \\\n  \"pytest==9.0.3\" \\\n  \"fastapi==0.135.0\" \\\n  \"starlette==1.3.1\" \\\n  \"httpx==0.27.2\" \\\n  \"pydantic==2.13.2\" \\\n  \"pydantic-core==2.46.2\" \\\n  \"orjson==3.11.8\" \\\n  \"anyio==4.14.2\"\n",
+        "echo \"::group::pytest (contract)\"\n# PY-4 (2026-07-26): the exact current-schema contract is now an\n# UNCONDITIONAL gate — previously only the legacy alignment test\n# ran here, and tests.yml guards the exact test behind a path\n# filter that omits schema_registry.py, so a registry change\n# could dodge the strongest check entirely.\npython -m pytest -q \\\n  tests/test_schema_alignment.py \\\n  tests/test_current_schema_contract.py \\\n  tests/test_enriched_margin_publish.py \\\n  tests/test_opportunity_blocked_invariant.py \\\n  tests/test_investment_objective_contracts.py \\\n  tests/test_request_auth_readiness.py \\\n  tests/test_finnhub_loopguard.py \\\n  tests/test_tadawul_loopguard.py \\\n  tests/test_yahoo_singleflight_cancellation.py \\\n  tests/test_yahoo_token_bucket.py \\\n  tests/test_ycp_loopguard_b6.py \\\n  tests/test_argaam_loopguard_b6.py\npython tests/test_yf_loopguard_p203.py\necho \"::endgroup::\"\n"
+      ],
+      "heavy": [
+        "python -m pip install -U pip\npython -m pip install -r requirements.txt\npython -m pip install \"pytest==9.0.3\"\n",
+        "echo \"::group::pytest (heavy)\"\npython -m pytest -q tests/test_data_engine_v2.py\necho \"::endgroup::\"\n"
+      ]
+    },
+    "results": {
+      "lean": {
+        "passed": 649,
+        "skipped": 2,
+        "subtests_passed": 38
+      },
+      "contract": {
+        "passed": 190,
+        "skipped": 3
+      },
+      "engine": {
+        "passed": 39
+      },
+      "total_passed": 878,
+      "total_skipped": 5,
+      "gas_assertions": 39,
+      "gas_hard_safety_assertions": 10,
+      "gas_withheld_render_refresh_log_cases": 29,
+      "yahoo_fundamentals_assertions": 13,
+      "focused_research": 216,
+      "backtest_selftest": {
+        "passed": 4,
+        "total": 4
+      },
+      "scorer_selftest": {
+        "passed": 116,
+        "total": 116
+      },
+      "workflow_audit": {
+        "errors": 0,
+        "warnings": 27
+      },
+      "manifest_and_compilation": "PASS",
+      "legacy_scorer_harnesses": "Four standalone scripts pass; each embeds116/116; optional historical dual-tree comparisons skipped because S1_BASE absent",
+      "pf_legacy_harnesses": "Loser veto20/20; sukuk ladder standalonePASS"
+    },
+    "source_versions": {
+      "entry": "8.14.2",
+      "engine": "5.151.0",
+      "opportunity_builder": "1.24.1",
+      "portfolio_actions": "1.15.2",
+      "core_enriched_quote": "4.11.1",
+      "route_enriched_quote": "8.5.2",
+      "shadow_scorer": "1.9.4",
+      "backtest": "1.2.1",
+      "full_refresh_audit": "1.1.2",
+      "decision_freshness_audit": "1.1.1",
+      "deployment_verifier": "1.0.35",
+      "ci_workflow": "1.0.11"
+    },
+    "scope": "Offline source validation; production/GAS deployment, live quotes, live workbook mutation and broker reconciliation not validated"
+  }
+}

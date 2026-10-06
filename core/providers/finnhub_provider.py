@@ -2,7 +2,7 @@
 """
 core/providers/finnhub_provider.py
 ================================================================================
-Finnhub Provider -- v6.1.0 (SCHEMA-ALIGNED / BATCH-CAPABLE / FULLY TYPED)
+Finnhub Provider -- v6.2.0 (LOOP-SAFE / ENGINE-CALLABLE / FULLY TYPED)
 ================================================================================
 
 Purpose
@@ -12,6 +12,23 @@ Provides financial market data from Finnhub API:
   - Company profiles and fundamentals
   - Historical OHLCV data with technical indicators
   - Financial metrics and ratios
+
+v6.2.0 Changes (from v6.1.0)
+----------------------------
+Loop and cancellation safety for the process-global provider:
+  - Pure bookkeeping locks now use threading.Lock; their critical sections
+    contain no awaits and can safely survive repeated asyncio.run() calls.
+  - HTTP clients and concurrency semaphores are retained per running event
+    loop, so simultaneous loops never replace or close one another's active
+    transport and every loop keeps the configured concurrency cap.
+  - SingleFlight keys flights by loop, shields shared follower waits, and
+    cancels the shared Future when its owner is cancelled. A cancelled waiter
+    can no longer cancel its peers, and owner cancellation cannot strand them.
+  - The module client factory is loop-keyed and guarded by threading.Lock.
+    Closed-loop entries are pruned without touching clients on live loops.
+  - Added engine-compatible `get_quote` and `fetch_quote` module aliases to
+    the existing enriched-patch path. The default KSA block, patch schema,
+    error behavior and provider-chain policy remain unchanged.
 
 v6.1.0 Changes (from v6.0.0)
 ----------------------------
@@ -84,11 +101,12 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 
@@ -104,12 +122,12 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "finnhub"
-PROVIDER_VERSION = "6.1.0"
+PROVIDER_VERSION = "6.2.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
-DEFAULT_USER_AGENT = "TFB-Finnhub/6.1.0"
+DEFAULT_USER_AGENT = "TFB-Finnhub/6.2.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -529,11 +547,9 @@ class TokenBucket:
         self.capacity = max(1.0, burst)
         self.tokens = self.capacity
         self.last = time.monotonic()
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> threading.Lock:
         return self._lock
 
     async def wait(self, amount: float = 1.0) -> None:
@@ -542,7 +558,8 @@ class TokenBucket:
             return
         amount = max(0.0001, amount)
         while True:
-            async with self._get_lock():
+            # v6.2.0 LOOPGUARD: synchronous state only; never await while held.
+            with self._get_lock():
                 now = time.monotonic()
                 elapsed = max(0.0, now - self.last)
                 self.last = now
@@ -569,17 +586,15 @@ class TTLCache:
         self.max_size = max(128, max_size)
         self.ttl_sec = max(1.0, ttl_sec)
         self._cache: "OrderedDict[str, _CacheItem]" = OrderedDict()
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> threading.Lock:
         return self._lock
 
     async def get(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
         now = time.monotonic()
-        async with self._get_lock():
+        with self._get_lock():
             item = self._cache.get(key)
             if not item:
                 return None
@@ -592,7 +607,7 @@ class TTLCache:
         """Set value in cache with TTL; FIFO-evicts on overflow."""
         now = time.monotonic()
         ttl = self.ttl_sec if ttl_sec is None else max(1.0, ttl_sec)
-        async with self._get_lock():
+        with self._get_lock():
             if key not in self._cache and len(self._cache) >= self.max_size:
                 self._cache.popitem(last=False)
             self._cache[key] = _CacheItem(expires_at=now + ttl, value=value)
@@ -602,41 +617,69 @@ class SingleFlight:
     """Deduplicate concurrent requests for the same key."""
 
     def __init__(self) -> None:
-        self._lock: Optional[asyncio.Lock] = None  # lazy
-        self._calls: Dict[str, asyncio.Future] = {}
+        self._lock = threading.Lock()
+        self._calls: Dict[Tuple[asyncio.AbstractEventLoop, str], asyncio.Future] = {}
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> threading.Lock:
         return self._lock
 
-    async def do(self, key: str, coro_factory: Callable[[], Any]) -> Any:
+    @staticmethod
+    def _observe_future(future: "asyncio.Future[Any]") -> None:
+        """Consume owner-only exceptions so asyncio emits no false warning."""
+        try:
+            if not future.cancelled():
+                future.exception()
+        except Exception:
+            pass
+
+    def inflight(self) -> int:
+        """Return the number of flights across live loops (diagnostics only)."""
+        with self._get_lock():
+            return len(self._calls)
+
+    async def do(
+        self,
+        key: str,
+        coro_factory: Callable[[], Awaitable[Any]],
+    ) -> Any:
         """Execute coroutine; concurrent callers for the same key share the result."""
         lock = self._get_lock()
-        async with lock:
-            future = self._calls.get(key)
+        loop = asyncio.get_running_loop()
+        flight_key = (loop, key)
+        with lock:
+            future = self._calls.get(flight_key)
             if future is None:
-                future = asyncio.get_running_loop().create_future()
-                self._calls[key] = future
+                future = loop.create_future()
+                future.add_done_callback(self._observe_future)
+                self._calls[flight_key] = future
                 owner = True
             else:
                 owner = False
 
         if not owner:
-            return await future
+            # A caller owns only its wait, not the shared result. Without
+            # shield(), cancelling one follower cancels every peer's Future.
+            return await asyncio.shield(future)
 
         try:
             result = await coro_factory()
             if not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            # CancelledError bypasses `except Exception`; explicitly finish
+            # the shared Future so shielded followers wake rather than hang.
+            if not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             if not future.done():
                 future.set_exception(exc)
             raise
         finally:
-            async with lock:
-                self._calls.pop(key, None)
+            with lock:
+                if self._calls.get(flight_key) is future:
+                    self._calls.pop(flight_key, None)
 
 
 class CircuitBreaker:
@@ -647,27 +690,25 @@ class CircuitBreaker:
         self.cooldown_sec = max(1.0, cooldown_sec)
         self.failures = 0
         self.open_until = 0.0
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def _get_lock(self) -> threading.Lock:
         return self._lock
 
     async def allow(self) -> bool:
         """Return True if requests are allowed (breaker closed or cooled down)."""
-        async with self._get_lock():
+        with self._get_lock():
             return time.monotonic() >= self.open_until
 
     async def on_success(self) -> None:
         """Record a success; resets failure count."""
-        async with self._get_lock():
+        with self._get_lock():
             self.failures = 0
             self.open_until = 0.0
 
     async def on_failure(self) -> None:
         """Record a failure; may open the circuit."""
-        async with self._get_lock():
+        with self._get_lock():
             self.failures += 1
             if self.failures >= self.threshold:
                 self.open_until = time.monotonic() + self.cooldown_sec
@@ -748,12 +789,40 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
 # Finnhub HTTP Client
 # ---------------------------------------------------------------------------
 
+_HTTP_GRAVEYARD: List[Any] = []
+_HTTP_GRAVEYARD_LOCK = threading.Lock()
+_HTTP_GRAVEYARD_MAX = 4
+
+
+def _retain_closed_loop_transport(client: Any) -> None:
+    """Keep a bounded reference to a transport whose owner loop is closed.
+
+    Closing an async transport on a different loop is unsafe. A closed owner
+    loop cannot still have an in-flight request, so the resource is detached
+    from routing and retained only in this small graveyard instead of being
+    closed from a competing live loop.
+    """
+    if client is None:
+        return
+    with _HTTP_GRAVEYARD_LOCK:
+        _HTTP_GRAVEYARD.append(client)
+        del _HTTP_GRAVEYARD[:-_HTTP_GRAVEYARD_MAX]
+
+
 class FinnhubClient:
     """Async client for Finnhub API."""
 
     def __init__(self, config: Optional[FinnhubConfig] = None):
         self.config = config or FinnhubConfig.from_env()
         self._semaphore: Optional[asyncio.Semaphore] = None  # lazy
+        self._sem_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._resource_lock = threading.Lock()
+        self._loop_resources: Dict[
+            asyncio.AbstractEventLoop,
+            Tuple[asyncio.Semaphore, Any],
+        ] = {}
+        self._initial_client_claimed = False
         self._bucket = TokenBucket(
             rate_per_sec=self.config.rate_limit_rps,
             burst=self.config.rate_limit_burst,
@@ -769,7 +838,13 @@ class FinnhubClient:
         self._metric_cache = TTLCache(max_size=4000, ttl_sec=self.config.metric_ttl_sec)
         self._history_cache = TTLCache(max_size=2500, ttl_sec=self.config.history_ttl_sec)
 
-        self._client = httpx.AsyncClient(
+        # Keep the historical eager allocation, but let the first running loop
+        # claim it. Every additional live loop receives its own transport.
+        self._client: Optional[Any] = self._new_http_client()
+
+    def _new_http_client(self) -> httpx.AsyncClient:
+        """Build a transport with the exact historical timeout/pool defaults."""
+        return httpx.AsyncClient(
             timeout=httpx.Timeout(self.config.timeout_sec),
             headers={"User-Agent": self.config.user_agent},
             limits=httpx.Limits(max_keepalive_connections=30, max_connections=60),
@@ -777,10 +852,60 @@ class FinnhubClient:
             http2=True,
         )
 
+    def _retire_loop_resources(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Detach resources for a loop already known to be closed."""
+        with self._resource_lock:
+            resources = self._loop_resources.pop(loop, None)
+            if resources is not None:
+                _retain_closed_loop_transport(resources[1])
+            elif not self._initial_client_claimed and self._client is not None:
+                # A factory caller can request a client without issuing HTTP.
+                # Its eager legacy transport still belongs to that factory
+                # loop and must not be handed to a later one.
+                _retain_closed_loop_transport(self._client)
+                self._initial_client_claimed = True
+                self._client = None
+            if self._sem_loop is loop:
+                self._semaphore = None
+                self._sem_loop = None
+            if self._client_loop is loop:
+                self._client = None
+                self._client_loop = None
+
+    def _get_loop_resources(self) -> Tuple[asyncio.Semaphore, Any]:
+        """Return the semaphore and HTTP transport owned by the running loop."""
+        loop = asyncio.get_running_loop()
+        with self._resource_lock:
+            # Sequential asyncio.run() callers leave closed loops behind. Drop
+            # only those; a client owned by another live loop may be in flight.
+            for old_loop in list(self._loop_resources):
+                if old_loop is not loop and old_loop.is_closed():
+                    _, old_client = self._loop_resources.pop(old_loop)
+                    _retain_closed_loop_transport(old_client)
+
+            resources = self._loop_resources.get(loop)
+            if resources is None:
+                if not self._initial_client_claimed and self._client is not None:
+                    http_client = self._client
+                    self._initial_client_claimed = True
+                else:
+                    http_client = self._new_http_client()
+                resources = (
+                    asyncio.Semaphore(max(1, self.config.max_concurrency)),
+                    http_client,
+                )
+                self._loop_resources[loop] = resources
+
+            # Backward-compatible diagnostic aliases only. Request code below
+            # captures the returned resources locally and never rereads these
+            # mutable slots, which is what makes simultaneous loops safe.
+            self._semaphore, self._client = resources
+            self._sem_loop = loop
+            self._client_loop = loop
+            return resources
+
     def _get_semaphore(self) -> asyncio.Semaphore:
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
-        return self._semaphore
+        return self._get_loop_resources()[0]
 
     @staticmethod
     def _parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -816,13 +941,14 @@ class FinnhubClient:
         query_params = dict(params or {})
         query_params["token"] = self.config.api_key
         last_error: Optional[str] = None
+        semaphore, http_client = self._get_loop_resources()
 
-        async with self._get_semaphore():
+        async with semaphore:
             for attempt in range(max(1, self.config.retry_attempts + 1)):
                 await self._bucket.wait(1.0)
 
                 try:
-                    response = await self._client.get(url, params=query_params)
+                    response = await http_client.get(url, params=query_params)
                     status_code = response.status_code
 
                     if status_code == 429:
@@ -1266,45 +1392,86 @@ class FinnhubClient:
         return output
 
     async def close(self) -> None:
-        """Close the underlying httpx client."""
+        """Close only the transport owned by the running loop.
+
+        A direct FinnhubClient may be shared by multiple live loops. Closing a
+        competing loop's transport here would race its in-flight request.
+        """
+        loop = asyncio.get_running_loop()
+        http_client: Optional[Any] = None
+        with self._resource_lock:
+            resources = self._loop_resources.pop(loop, None)
+            if resources is not None:
+                http_client = resources[1]
+            elif not self._initial_client_claimed and self._client is not None:
+                # The eager historical transport was never used.
+                http_client = self._client
+                self._initial_client_claimed = True
+
+            if self._sem_loop is loop:
+                self._semaphore = None
+                self._sem_loop = None
+            if self._client_loop is loop or self._client is http_client:
+                self._client = None
+                self._client_loop = None
+
+        if http_client is None:
+            return
         try:
-            await self._client.aclose()
+            await http_client.aclose()
         except Exception as exc:
             logger.debug("finnhub client close failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Singleton Client (lazy lock)
+# Loop-keyed Client Factory
 # ---------------------------------------------------------------------------
 
 _CLIENT_INSTANCE: Optional[FinnhubClient] = None
-_CLIENT_LOCK: Optional[asyncio.Lock] = None
+_CLIENTS: Dict[asyncio.AbstractEventLoop, FinnhubClient] = {}
+_CLIENT_LOCK = threading.Lock()
 
 
-def _get_client_lock() -> asyncio.Lock:
-    global _CLIENT_LOCK
-    if _CLIENT_LOCK is None:
-        _CLIENT_LOCK = asyncio.Lock()
+def _get_client_lock() -> threading.Lock:
     return _CLIENT_LOCK
 
 
 async def get_client() -> FinnhubClient:
-    """Get the singleton FinnhubClient instance."""
+    """Get the FinnhubClient owned by the running event loop."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE is not None:
-        return _CLIENT_INSTANCE
-    async with _get_client_lock():
-        if _CLIENT_INSTANCE is None:
-            _CLIENT_INSTANCE = FinnhubClient()
-    return _CLIENT_INSTANCE
+    loop = asyncio.get_running_loop()
+    with _get_client_lock():
+        # Never retire a live loop: it may be serving a request in another
+        # thread. Closed-loop clients are unreachable and safe to detach.
+        for old_loop in list(_CLIENTS):
+            if old_loop is not loop and old_loop.is_closed():
+                old_client = _CLIENTS.pop(old_loop)
+                old_client._retire_loop_resources(old_loop)
+
+        client = _CLIENTS.get(loop)
+        if client is None:
+            client = FinnhubClient()
+            _CLIENTS[loop] = client
+        # Preserved as a best-effort compatibility/diagnostic alias. Routing
+        # always uses the loop-keyed map, never this mutable slot.
+        _CLIENT_INSTANCE = client
+        return client
 
 
 async def close_client() -> None:
-    """Close and reset the singleton client."""
+    """Close and reset the client owned by the running event loop."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE is not None:
-        await _CLIENT_INSTANCE.close()
-        _CLIENT_INSTANCE = None
+    loop = asyncio.get_running_loop()
+    with _get_client_lock():
+        for old_loop in list(_CLIENTS):
+            if old_loop is not loop and old_loop.is_closed():
+                old_client = _CLIENTS.pop(old_loop)
+                old_client._retire_loop_resources(old_loop)
+        client = _CLIENTS.pop(loop, None)
+        if _CLIENT_INSTANCE is client:
+            _CLIENT_INSTANCE = None
+    if client is not None:
+        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1332,6 +1499,16 @@ async def fetch_enriched_quotes_batch(
         logger.debug("fetch_enriched_quotes_batch: ignoring kwargs=%r", kwargs)
     client = await get_client()
     return await client.get_enriched_quotes_batch(symbols, mode=mode)
+
+
+async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Engine-compatible alias for the existing enriched quote patch path."""
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
+
+
+async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Engine-compatible alias for the existing enriched quote patch path."""
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -1376,6 +1553,8 @@ __all__ = [
     # Engine-facing
     "fetch_enriched_quote_patch",
     "fetch_enriched_quotes_batch",
+    "get_quote",
+    "fetch_quote",
     "fetch_quote_patch",
     "fetch_patch",
     # Symbol helpers
