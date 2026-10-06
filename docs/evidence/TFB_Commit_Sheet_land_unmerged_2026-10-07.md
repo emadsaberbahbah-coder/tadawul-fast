@@ -1,7 +1,7 @@
 # TFB Commit Sheet - LAND UNMERGED CONTENT 2026-10-07 [GitHub review: open-PR triage]
 
 Date basis: Asia/Riyadh (2026-10-07). Base: `main` at `26fe496` (PR #719).
-Lane: repository hygiene. No runtime code path changes. This commit lands
+Lane: repository hygiene. No Render (Python) runtime change. The first commit lands
 eight evidence or register documents, one Apps Script file that is mirrored
 here (the live source is the Apps Script editor), one passing test, and one
 archived harness.
@@ -56,6 +56,34 @@ sheets, the later sheet wins.
   the archive README).
 - None of the landed paths existed on `main` before this commit, so no file
   was overwritten.
+
+## Second commit: 25_Trade_Notes.gs v1.0.0 -> v1.0.1 (review fixes)
+
+The Codex review of this PR posted three P2 findings on the landed v1.0.0
+file. Each one was confirmed against the code, then fixed:
+
+| Finding | Confirmed path | Fix |
+| --- | --- | --- |
+| Reason Class not checked against its enum | The form dropdown is built with `setAllowInvalid(true)`, so `JUDGEMENT` logged OK. | `tbValidate_` checks `REASON_CLASSES` case-insensitively; the row stores the canonical spelling. |
+| Existing tab accepted on a non-empty A1 alone | A reordered or truncated header (or a wrong `TFB_TRADE_NOTES_TAB`) took rows in the fixed 28-column layout, and scoring wrote into the computed Outcome column. | Row 1 must start with `TFB_TN_HEADER`; extra trailing columns are allowed. Otherwise setup, log and score return `FAILED:schema mismatch ...`, write nothing and stamp `_Run_Log`. A non-empty header is still never overwritten. |
+| Note ID allocation not serialized | Two writers on one trade date read the same IDs and appended the same Note ID. | `tbLogTradeNote` holds `LockService.getScriptLock()` across the ID scan, allocation and append. A 30 s timeout returns `FAILED:lock timeout` and appends nothing; the lock is released in `finally`. |
+
+Evidence:
+
+- `node tests/test_gas_trade_notes_v101.js` on v1.0.1 gives
+  `SUMMARY 16/16 PASS`.
+- Golden negative: `TFB_TN_SRC=<v1.0.0 from 75f5edb>` gives
+  `SUMMARY 2/16 PASS`. Every regression case fails on v1.0.0. Only the two
+  compatibility cases pass on both: an extra trailing column, and an empty
+  existing tab.
+- `tests/test_gas_trade_notes_v100.js` still gives `25/25 PASS` with the same
+  digest `e28934d7aed2`. Its two exact `'1.0.0'` pins were changed to a
+  version floor and to the live constant, per the house rule.
+- `node --check` passes; the added lines are ASCII and ES5.
+
+Operator step: the live copy is in the Apps Script editor. Paste v1.0.1 over
+the editor's `25_Trade_Notes.gs`, if v1.0.0 was ever deployed there, so the
+mirror and the editor match.
 
 ## Triage of all 136 other open PRs (recorded here, nothing closed)
 

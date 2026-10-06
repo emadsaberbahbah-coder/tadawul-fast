@@ -8,6 +8,28 @@
 // from a small input tab so the operator never types into the log directly.
 //
 // -----------------------------------------------------------------------------
+// v1.0.1 (2026-10-07, review fixes on landing the mirror, PR #721)
+// WHY: an automated review of the landed v1.0.0 found three ways a row can be
+//   wrong without any error, each reproduced in
+//   tests/test_gas_trade_notes_v101.js against the v1.0.0 source:
+//   (a) Reason Class was only checked for being non-empty. The form dropdown
+//       is built with setAllowInvalid(true), so a typo such as JUDGEMENT was
+//       logged outside the four declared classes and broke grouping. It is
+//       now validated case-insensitively against REASON_CLASSES and written
+//       in the canonical spelling.
+//   (b) An existing log tab was accepted whenever A1 was non-empty. A tab with
+//       a reordered, truncated or unrelated header (for example a wrong
+//       TFB_TRADE_NOTES_TAB property) then received rows in the fixed
+//       28-column layout, and scoring wrote into a computed Outcome column.
+//       Row 1 must now start with TFB_TN_HEADER (extra columns after it are
+//       allowed); otherwise setup, log and score return FAILED and write
+//       nothing. A non-empty header is still never overwritten.
+//   (c) The Note ID scan, allocation and append were not serialized, so two
+//       writers on the same trade date could both get the same ID, and
+//       scoring then updated only the first match. tbLogTradeNote now holds
+//       the script lock across all three; a 30 s lock timeout returns
+//       FAILED:lock timeout and appends nothing.
+// -----------------------------------------------------------------------------
 // v1.0.0 (2026-09-29, One-Pass Script - NEW FILE, no base)
 // WHY: Program v2 says "every fill gets a 5-line trade note (thesis, factor
 //   evidence, benchmark, exit rule, size rationale) - in the ledger Notes
@@ -38,7 +60,7 @@
 //   TFB_TRADE_NOTES_INPUT_TAB rename the tabs (defaults below).
 // ES5 only; no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_TRADE_NOTES_VERSION = '1.0.0';
+var TFB_TRADE_NOTES_VERSION = '1.0.1';
 
 var TFB_TRADE_NOTES_ = Object.freeze({
   PROP_TAB: 'TFB_TRADE_NOTES_TAB',
@@ -143,6 +165,28 @@ function tbIsYes_(v) {
   return s === 'YES' || s === 'Y' || s === 'TRUE' || s === '1';
 }
 
+// v1.0.1: the canonical REASON_CLASSES member matching v (case-insensitive), or ''
+function tbReasonClass_(v) {
+  var s = tbTrim_(v).toUpperCase();
+  if (s === '') { return ''; }
+  for (var i = 0; i < TFB_TRADE_NOTES_.REASON_CLASSES.length; i++) {
+    if (TFB_TRADE_NOTES_.REASON_CLASSES[i].toUpperCase() === s) { return TFB_TRADE_NOTES_.REASON_CLASSES[i]; }
+  }
+  return '';
+}
+
+// v1.0.1: '' when headerRow starts with TFB_TN_HEADER (extra columns after it
+// are allowed), else a description of the first mismatching column
+function tbHeaderProblem_(headerRow) {
+  var h = headerRow || [];
+  for (var i = 0; i < TFB_TN_HEADER.length; i++) {
+    if (tbTrim_(h[i]) !== TFB_TN_HEADER[i]) {
+      return 'column ' + (i + 1) + ' is "' + tbTrim_(h[i]) + '", expected "' + TFB_TN_HEADER[i] + '"';
+    }
+  }
+  return '';
+}
+
 // Validation: returns [] when ok, else the list of problems
 function tbValidate_(rec) {
   var r = rec || {};
@@ -153,6 +197,7 @@ function tbValidate_(rec) {
   if (tbTrim_(r.type) !== '' && TFB_TRADE_NOTES_.TYPES.indexOf(tbTrim_(r.type).toUpperCase()) === -1) { errs.push('type not in ' + TFB_TRADE_NOTES_.TYPES.join('/')); }
   if (tbTrim_(r.side) !== '' && TFB_TRADE_NOTES_.SIDES.indexOf(tbTrim_(r.side).toUpperCase()) === -1) { errs.push('side not in ' + TFB_TRADE_NOTES_.SIDES.join('/')); }
   if (tbTrim_(r.origin) !== '' && TFB_TRADE_NOTES_.ORIGINS.indexOf(tbTrim_(r.origin).toUpperCase()) === -1) { errs.push('origin not in ' + TFB_TRADE_NOTES_.ORIGINS.join('/')); }
+  if (tbTrim_(r.reason_class) !== '' && tbReasonClass_(r.reason_class) === '') { errs.push('reason_class not in ' + TFB_TRADE_NOTES_.REASON_CLASSES.join('/')); }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tbTrim_(r.trade_date))) { errs.push('trade_date must be YYYY-MM-DD'); }
   var t = tbTrim_(r.type).toUpperCase();
   if (t.indexOf('FILL') !== -1) {
@@ -175,7 +220,7 @@ function tbBuildRow_(rec, noteId, nowRiyadh) {
     tbTrim_(r.side).toUpperCase(), r.qty === '' || r.qty === undefined || r.qty === null ? '' : Number(r.qty),
     r.price === '' || r.price === undefined || r.price === null ? '' : Number(r.price),
     tbTrim_(r.ccy).toUpperCase(), tbTrim_(r.venue), tbTrim_(r.board_ref) || 'none',
-    tbTrim_(r.origin).toUpperCase(), div, tbTrim_(r.reason_class), tbTrim_(r.reason_ref),
+    tbTrim_(r.origin).toUpperCase(), div, tbReasonClass_(r.reason_class), tbTrim_(r.reason_ref),
     tbTrim_(r.system_verdict), tbTrim_(r.thesis), tbTrim_(r.evidence), tbTrim_(r.benchmark),
     tbTrim_(r.exit_rule), tbTrim_(r.size_rationale),
     r.size_pct_nav === '' || r.size_pct_nav === undefined || r.size_pct_nav === null ? '' : Number(r.size_pct_nav),
@@ -228,7 +273,26 @@ function tbEnsureTab_() {
     sh.getRange(1, 1, 1, TFB_TN_HEADER.length).setValues([TFB_TN_HEADER]);
     try { sh.setFrozenRows(1); } catch (err2) { /* noop */ }
   }
+  // v1.0.1: refuse a header that does not start with TFB_TN_HEADER; the
+  // caller turns the error into FAILED:<reason> and writes nothing
+  var problem = tbHeaderProblem_(sh.getRange(1, 1, 1, TFB_TN_HEADER.length).getValues()[0]);
+  if (problem !== '') { throw new Error('schema mismatch on ' + name + ': ' + problem); }
   return sh;
+}
+
+// v1.0.1: run fn under the script lock and return its value, or
+// 'FAILED:lock timeout' when another writer holds the lock for 30 s.
+// LockService always exists in Apps Script; the unlocked path is only for an
+// environment without it (the offline node harness).
+function tbWithLock_(fn) {
+  var lock = null;
+  try { lock = LockService.getScriptLock(); } catch (err) { lock = null; }
+  if (lock && !lock.tryLock(30000)) { return 'FAILED:lock timeout'; }
+  try {
+    return fn();
+  } finally {
+    if (lock) { try { lock.releaseLock(); } catch (err2) { /* noop */ } }
+  }
 }
 
 function tbListFor_(kind) {
@@ -300,7 +364,12 @@ function tbWriteForm_(sh, rec) {
 // Public entry points
 // ---------------------------------------------------------------------------
 function tbTradeNotesSetup() {
-  tbEnsureTab_();
+  try {
+    tbEnsureTab_();
+  } catch (err) {
+    tbLog_('tbTradeNotesSetup', 'FAILED', err.message, { tab: tbTabName_() });
+    return 'FAILED:' + err.message;
+  }
   tbEnsureInputTab_();
   return 'OK:' + tbTabName_() + ',' + tbInputTabName_();
 }
@@ -315,16 +384,24 @@ function tbLogTradeNote(rec) {
     tbLog_('tbLogTradeNote', 'FAILED', 'validation: ' + errs.join('; '), { symbol: tbTrim_(rec && rec.symbol) });
     return 'FAILED:' + errs.join('; ');
   }
-  var sh = tbEnsureTab_();
-  var now = tbNowRiyadh_();
-  var last = sh.getLastRow();
-  var ids = last >= 2 ? sh.getRange(2, 1, last - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
-  var id = tbNextNoteId_(ids, tbIdDatePart_(rec.trade_date, now));
-  var row = tbBuildRow_(rec, id, now);
-  sh.appendRow(row);
-  tbLog_('tbLogTradeNote', 'OK', id + ' ' + row[4] + ' ' + row[5] + ' ' + row[6] + ' @ ' + row[7] + ' type=' + row[2] + ' divergence=' + row[12] + ' origin=' + row[11],
-    { note_id: id, symbol: row[4], type: row[2], divergence: row[12], origin: row[11], reason_class: row[13] });
-  return 'OK:' + id;
+  // v1.0.1: ID scan, allocation and append happen under one lock
+  var res = tbWithLock_(function () {
+    var sh;
+    try { sh = tbEnsureTab_(); } catch (err) { return 'FAILED:' + err.message; }
+    var now = tbNowRiyadh_();
+    var last = sh.getLastRow();
+    var ids = last >= 2 ? sh.getRange(2, 1, last - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
+    var id = tbNextNoteId_(ids, tbIdDatePart_(rec.trade_date, now));
+    var row = tbBuildRow_(rec, id, now);
+    sh.appendRow(row);
+    tbLog_('tbLogTradeNote', 'OK', id + ' ' + row[4] + ' ' + row[5] + ' ' + row[6] + ' @ ' + row[7] + ' type=' + row[2] + ' divergence=' + row[12] + ' origin=' + row[11],
+      { note_id: id, symbol: row[4], type: row[2], divergence: row[12], origin: row[11], reason_class: row[13] });
+    return 'OK:' + id;
+  });
+  if (res.indexOf('FAILED:') === 0) {
+    tbLog_('tbLogTradeNote', 'FAILED', res.slice('FAILED:'.length), { symbol: tbTrim_(rec && rec.symbol) });
+  }
+  return res;
 }
 
 function tbLogTradeNoteFromInput() {
@@ -343,7 +420,13 @@ function tbScoreTradeNote(noteId, outcome, pnlSar, scoredBy) {
   var oc = tbTrim_(outcome).toUpperCase();
   if (id === '') { return 'FAILED:missing note id'; }
   if (TFB_TRADE_NOTES_.OUTCOMES.indexOf(oc) === -1 || oc === '') { return 'FAILED:outcome not in ' + TFB_TRADE_NOTES_.OUTCOMES.slice(1).join('/'); }
-  var sh = tbEnsureTab_();
+  var sh;
+  try {
+    sh = tbEnsureTab_();
+  } catch (err) {
+    tbLog_('tbScoreTradeNote', 'FAILED', err.message, { note_id: id });
+    return 'FAILED:' + err.message;
+  }
   var last = sh.getLastRow();
   if (last < 2) { return 'FAILED:no rows'; }
   var ids = sh.getRange(2, 1, last - 1, 1).getValues();
@@ -436,6 +519,9 @@ function tbTradeNotesSelfTest() {
   ok(row.length === 28 && row[0] === 'TN-20260928-001' && row[4] === 'AER.US' && row[6] === 14 && row[7] === 148.18 && row[12] === 'YES' && row[11] === 'OVERRIDE' && row[22] === '' && row[27] === TFB_TRADE_NOTES_VERSION, 'row shape');
   ok(tbBuildRow_({ type: 'FILL', divergence: 'no' }, 'x', 'y')[12] === 'NO' && tbBuildRow_({ type: 'FILL', divergence: 'yes' }, 'x', 'y')[12] === 'YES', 'divergence flag');
   ok(tbIsYes_('Yes') && tbIsYes_('1') && !tbIsYes_('no') && !tbIsYes_(''), 'yes parser');
+  ok(tbReasonClass_(' judgment ') === 'JUDGMENT' && tbReasonClass_('JUDGEMENT') === '' && tbReasonClass_('') === '', 'reason class canon');
+  ok(tbValidate_({ type: 'DIVERGENCE', trade_date: '2026-09-28', symbol: 'X', origin: 'NO-TRADE', reason_class: 'JUDGEMENT', system_verdict: 'v', thesis: 't', evidence: 'e', benchmark: 'b', exit_rule: 'x', size_rationale: 's' }).join(';').indexOf('reason_class not in') !== -1, 'reason class enum');
+  ok(tbHeaderProblem_(TFB_TN_HEADER.concat(['Extra'])) === '' && tbHeaderProblem_(['Note ID']).indexOf('column 2') === 0 && tbHeaderProblem_(['Type', 'Note ID']).indexOf('column 1') === 0, 'header check');
   ok(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(tbNowRiyadh_(new Date(Date.UTC(2026, 8, 29, 10, 0, 0)))) && tbNowRiyadh_(new Date(Date.UTC(2026, 8, 29, 10, 0, 0))) === '2026-09-29 13:00:00', 'riyadh clock');
   var verdict = fails.length === 0 ? 'trade notes core: ok' : 'trade notes core: FAIL ' + fails.length + ' [' + fails.join('; ') + ']';
   try { Logger.log('[TRADE-NOTES v' + TFB_TRADE_NOTES_VERSION + '] selftest -> ' + verdict); } catch (err) { /* noop */ }
