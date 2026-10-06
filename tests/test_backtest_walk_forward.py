@@ -1,9 +1,11 @@
 """Adverse timeline/cohort fixtures for purged, training-only research metrics."""
 from copy import deepcopy
+import ast
 import csv
 from datetime import datetime, timedelta, timezone
 import json
 import random
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -388,3 +390,39 @@ def test_same_day_coarse_target_preserves_later_real_label_events(ledger, maturi
     result = walk(rows)
     assert result["status"] == "COMPLETE"
     assert result["excluded_rows"] == 0
+
+
+@pytest.mark.parametrize("missing_risk", [False, True])
+def test_all_signals_cli_uses_actual_tracker_risk_header(ledger, tmp_path, missing_risk):
+    # The producer schema is the fixture contract, independent of the
+    # consumer's default list. Reading its literal avoids tracker startup.
+    producer = Path(backtest.__file__).with_name("track_performance.py")
+    cls = next(node for node in ast.parse(producer.read_text()).body
+               if isinstance(node, ast.ClassDef) and node.name == "PerformanceStore")
+    header_assignment = next(node for node in cls.body if isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Name) and target.id == "HEADERS"
+                                     for target in node.targets))
+    headers = ast.literal_eval(header_assignment.value)
+    rows = deepcopy(ledger)
+    for row in rows:
+        row.update({"Entry Forecast Reliability": row["Entry Score"], "Confidence": "High",
+                    "Entry Investability": "INVESTABLE", "Entry Recommendation": "BUY",
+                    "Risk Bucket": "" if missing_risk else "LOW", "Horizon": "1W",
+                    "Origin Tab": "Top_10_Investments"})
+    source = tmp_path / "Performance_Log.tsv"
+    with source.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh, delimiter="\t", quoting=csv.QUOTE_NONE)
+        writer.writerow(headers)
+        writer.writerows([[row.get(header, "") for header in headers] for row in rows])
+    output = tmp_path / "all_signals.json"
+    assert backtest.main(["--export-dir", str(tmp_path), "--all-signals", "--min-n", "1",
+                          "--min-train", "2", "--as-of-utc", AS_OF.isoformat(),
+                          "--json", str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result["missing"] == []
+    assert len(result["results"]) == 8
+    risk = next(item for item in result["results"] if item["signal"] == "Risk Bucket")
+    assert risk["verdict"] == ("PENDING" if missing_risk else "NO_GAIN")
+    if missing_risk:
+        assert risk["walk_forward"]["heldout_feature_observed_rows"] == 0
+        assert "insufficient_training_feature_history" in risk["walk_forward"]["pending_reasons"]

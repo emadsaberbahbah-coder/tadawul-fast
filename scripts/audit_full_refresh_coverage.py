@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.1.2 (2026-10-06) — ORIGIN-AWARE FRESHNESS
+Recent timestamps no longer certify rows explicitly marked failed-fetch,
+identity-quarantined, stale-price or empty-provider. Report timestamp freshness
+and excluded origins separately; overlapping markers exclude each row once.
+The following 1.1.0 entry describes that historical timezone-only change.
+
 VERSION 1.1.0 (2026-09-08) — TIMEZONE TRUTH IN parse_dt (P-104)
 WHY v1.1.0: parse_dt emitted THREE inconsistent bases: naive strings/serials
 passed through as Riyadh wall time; "+HH:MM" ISO stamps were converted to
@@ -19,14 +25,14 @@ thin wrapper returning only the datetime — same signature, uniform basis.
 floors, coverage math, exit codes: UNTOUCHED.
 """
 from __future__ import annotations
-import argparse, asyncio, importlib, inspect, json, math, os, sys
+import argparse, asyncio, importlib, inspect, json, math, os, re, sys
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -34,6 +40,16 @@ PRICE = ("Current Price", "Price", "Last Price")
 STAMP = ("Last Updated (Riyadh)", "Last Updated (UTC)", "Last Updated")
 QTY = ("Position Qty", "Quantity", "Shares")
 COST = ("Avg Cost", "Average Cost", "Buy Price")
+WARNINGS = ("Warnings",)
+# These are producer failure facts, independent of timestamp presentation or
+# rollout modes. A recent failure stamp does not prove a successful refresh.
+_FAILED_FETCH = re.compile(r"(?:^|[;|,\s])fetch_failed(?=[:;|,\s]|$)", re.I)
+_QUARANTINED = re.compile(r"(?:^|[;|,\s])(?:fund_)?identity_quarantined(?=[:;|,\s]|$)", re.I)
+_UNUSABLE_ORIGIN = re.compile(
+    r"(?:^|[;|,\s])(?:price_bar_stale|bar_age_failover_exhausted|empty_row_no_provider_data)"
+    r"(?=[:;|,\s]|$)",
+    re.I,
+)
 
 for p in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
     if str(p) not in sys.path: sys.path.insert(0, str(p))
@@ -49,6 +65,9 @@ class Result:
     page: str; status: str = "PENDING"; header_row: int = 0
     expected_cols: int = 0; actual_cols: int = 0; rows: int = 0; unique: int = 0
     min_rows: int = 0; fresh: int = 0; stale: int = 0; bad_stamps: int = 0
+    timestamp_fresh: int = 0; failed_fetch_rows: int = 0; quarantined_rows: int = 0
+    unusable_origin_rows: int = 0
+    excluded_origin_rows: int = 0
     fresh_pct: Optional[float] = None; name_pct: Optional[float] = None
     price_pct: Optional[float] = None; newest_age_h: Optional[float] = None
     oldest_age_h: Optional[float] = None; duplicates: list[str] = field(default_factory=list)
@@ -193,6 +212,7 @@ def audit_grid(grid, rule, expected, now, active=()):
     if r.rows<rule.min_rows: r.failures.append(f"row count {r.rows} below minimum {rule.min_rows}")
     if not rule.symbols: return r.finish()
     si,ni,pi,ti,qi,ci=idx(headers,SYMBOL),idx(headers,NAME),idx(headers,PRICE),idx(headers,STAMP),idx(headers,QTY),idx(headers,COST)
+    wi=idx(headers,WARNINGS)
     if si<0: r.failures.append("Symbol column missing"); return r.finish()
     symbols=[]; names=prices=fresh=stale=bad=0; ages=[]; qmap={}; cmap={}; riyadh=ti>=0 and "riyadh" in headers[ti].casefold(); now0=now.astimezone(timezone.utc).replace(tzinfo=None)+timedelta(hours=3)  # v1.1.0 P-104: parse_dt is uniformly Riyadh-naive; now0 must match regardless of stamp-column basis (riyadh flag kept for payload truth)
     for row in rows:
@@ -205,6 +225,17 @@ def audit_grid(grid, rule, expected, now, active=()):
             d, precision = parse_dt_precision(row[ti] if ti>=0 and ti<len(row) else None)
             accepted, age_seconds, reason = timestamp_freshness(
                 d, now0, precision=precision, max_age_seconds=rule.max_age_h * 3600)
+            r.timestamp_fresh += int(accepted)
+            warning_text = s(row[wi]) if 0 <= wi < len(row) else ""
+            failed_fetch = bool(_FAILED_FETCH.search(warning_text))
+            quarantined = bool(_QUARANTINED.search(warning_text))
+            unusable_origin = bool(_UNUSABLE_ORIGIN.search(warning_text))
+            r.failed_fetch_rows += int(failed_fetch)
+            r.quarantined_rows += int(quarantined)
+            r.unusable_origin_rows += int(unusable_origin)
+            origin_excluded = failed_fetch or quarantined or unusable_origin
+            r.excluded_origin_rows += int(origin_excluded)
+            accepted = accepted and not origin_excluded
             fresh += int(accepted); stale += int(not accepted)
             if age_seconds is not None: ages.append(age_seconds / 3600)
             if reason in {"timestamp_precision_unknown", "timestamp_future"}: bad += 1
@@ -221,6 +252,8 @@ def audit_grid(grid, rule, expected, now, active=()):
         if ti<0: r.failures.append("Last Updated column missing")
         elif not coverage_validity(len(symbols), fresh, rule.min_fresh).valid: r.failures.append(f"fresh coverage {r.fresh_pct} below {rule.min_fresh}% within {rule.max_age_h}h")
         if bad: r.warnings.append(f"{bad} missing, date-only, invalid or future timestamp(s)")
+        if r.excluded_origin_rows:
+            r.warnings.append(f"{r.excluded_origin_rows} failed-fetch, quarantined or unusable-origin row(s) excluded from fresh coverage")
     if rule.portfolio:
         a,p=set(active),set(symbols); r.missing_portfolio=sorted(a-p); r.extra_portfolio=sorted(p-a); r.min_rows=len(a) or 1
         if r.missing_portfolio: r.failures.append("active ledger symbols missing: "+", ".join(r.missing_portfolio))

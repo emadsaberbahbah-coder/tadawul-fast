@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # routes/enriched_quote.py
 """
+v8.5.2 (2026-10-06): publish only explicitly witnessed margin points as
+fractions on the engine-direct fallback, honoring the existing mode.
 v8.5.1 (2026-10-06): authorize the ASGI route path independently of Host-based
 URL reconstruction.
 
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.5.1
+TFB Enriched Quote Routes Wrapper — v8.5.2
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
@@ -135,7 +137,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.5.1"
+ROUTER_VERSION = "8.5.2"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -642,6 +644,12 @@ def _normalize_row(keys: Sequence[str], headers: Sequence[str], raw: Mapping[str
             out["symbol"] = symbol_fallback
         if "ticker" in out and not out.get("ticker"):
             out["ticker"] = symbol_fallback
+    if (os.getenv("TFB_MARGIN_PUBLISH") or "").strip().lower() in {"observe", "enforce"}:
+        try:
+            from core.enriched_quote import _publish_witnessed_margin_units
+            _publish_witnessed_margin_units(out)
+        except ImportError:
+            pass  # Preserve the engine-direct fallback when the bridge is absent.
     return out
 
 

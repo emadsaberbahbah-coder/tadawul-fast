@@ -12,6 +12,12 @@ or a same-cohort investment evaluation.
 Production deployment readback and complete-cycle evidence remain outstanding. Changes described as repaired refer to source and
 offline verification unless a separate runtime observation is stated.
 
+The later [49-tab workbook review](TFB_Workbook_Health_Audit_2026-10-06.md)
+adds source-origin coverage, calibration validity, risk-header, margin-boundary
+and held-stop rounding repairs. Its adjacent JSON records the newer validation
+and snapshot evidence. Earlier test totals below remain attributed to the
+previous implementation; neither report establishes production deployment.
+
 ## Evidence and authorization
 
 The supplied `Tadawul_Fast_Full_Audit_Codex_Plan_2026-10-06.pdf` contains the

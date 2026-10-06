@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts.audit_decision_surface_freshness import audit_surfaces
 
@@ -64,6 +64,19 @@ def top10_grid(stamp="2026-07-31 20:10:00", state="ok", full=True):
 
 
 class DecisionSurfaceFreshnessTests(unittest.TestCase):
+    def test_all_surface_clocks_use_shared_five_minute_skew(self):
+        for seconds, rejected in ((300, False), (301, True), (600, True)):
+            stamp = (NOW + timedelta(hours=3, seconds=seconds)).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+            grid = status_grid({
+                "My_Portfolio": [stamp, "VALID", "complete", 10, 122],
+                "Global_Markets": [stamp, "SUCCESS", "complete", 6512, 115],
+            })
+            result = audit_surfaces(grid, portfolio_grid(stamp), top10_grid(stamp), now_utc=NOW, min_rows=FLOORS)
+            codes = {item.code for item in result.findings}
+            expected = {"PF_RUN_FUTURE", "T10_RUN_FUTURE", "PF_SOURCE_FUTURE", "SOURCE_FUTURE"}
+            with self.subTest(seconds=seconds):
+                self.assertEqual(expected & codes, expected if rejected else set())
+
     def test_clean_synchronized_surfaces_pass(self):
         result = audit_surfaces(
             status_grid(),

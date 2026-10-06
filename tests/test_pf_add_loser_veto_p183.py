@@ -52,7 +52,7 @@ if PA_FILE:
     pa = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(pa)
 else:
     import core.analysis.portfolio_actions as pa  # noqa: E402
-assert pa.PORTFOLIO_ACTIONS_VERSION == "1.15.1", pa.PORTFOLIO_ACTIONS_VERSION
+assert tuple(map(int, pa.PORTFOLIO_ACTIONS_VERSION.split("."))) >= (1, 15, 2), pa.PORTFOLIO_ACTIONS_VERSION
 
 PANEL = {"cash_available_sar": 34166.25, "target_cash_pct": 10.0,
          "max_position_pct": 20.0, "max_sector_pct": 30.0,

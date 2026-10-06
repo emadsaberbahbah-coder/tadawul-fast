@@ -55,6 +55,7 @@ _MODULE_FILES = {
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",
     "core.analysis.portfolio_actions": "core/analysis/portfolio_actions.py",
     "routes.advanced_analysis": "routes/advanced_analysis.py",
+    "routes.enriched_quote": "routes/enriched_quote.py",
     "core.analysis.top10_selector": "core/analysis/top10_selector.py",
     "core.providers.yahoo_chart_provider": "core/providers/yahoo_chart_provider.py",
     "core.providers.yahoo_fundamentals_provider": "core/providers/yahoo_fundamentals_provider.py",

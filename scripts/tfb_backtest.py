@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tfb_backtest.py — v1.2.0 (2026-10-06)
+tfb_backtest.py — v1.2.1 (2026-10-06)
 ================================================================================
 WHY: the Strategy's rule is "register a hypothesis, backtest it, then change a
 weight or gate". H-28 (stated reliability predicts outcomes) was rejected by an
@@ -35,6 +35,8 @@ Options: --edges "50,70,85" (numeric bands) --min-n 100 --json out.json --horizo
          --since 2026-08-01 / --until 2026-08-31  (Date Recorded window)       [v1.1.0]
 Read-only source access; optional local JSON export, no sheet mutations.
 
+v1.2.1: the default risk signal uses Performance_Log's canonical Risk Bucket
+header; absent values retain PENDING rather than synthesizing a risk field.
 v1.2.0 (2026-10-06): daily expanding validation purges unavailable training
 labels, fits transformations/calibration on training rows and compares a
 training-only baseline on identical heldout rows. Unknown ledger provenance
@@ -65,12 +67,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.data_validity import MAX_CLOCK_SKEW_SECONDS
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
-                   "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
+                   "Entry Recommendation", "Risk Bucket", "Horizon", "Origin Tab"]
 _ENTRY_FIELDS = set(DEFAULT_SIGNALS) | {
-    "Risk Bucket", "Entry Price", "Entry Data Quality", "Entry Final Action",
+    "Entry Risk Bucket", "Entry Price", "Entry Data Quality", "Entry Final Action",
     "Entry Selected", "Target Price", "Target ROI %", "Symbol",
 }
 _NUMERIC_ENTRY_FIELDS = {

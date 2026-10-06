@@ -276,6 +276,69 @@ def test_held_stop_not_regenerated_into_add_permission(monkeypatch):
     assert result["actions"][0]["stop_sar"] == 95
 
 
+@pytest.mark.parametrize(("fx", "stop_sar"), [
+    pytest.param(3.75, 462.94, id="sar-rounds-up"),
+    pytest.param(3.74, 461.70, id="sar-rounds-down"),
+])
+@pytest.mark.parametrize(
+    "sar_first", [False, True], ids=["native-first", "sar-first"])
+def test_native_and_sar_held_stop_aliases_allow_display_rounding(
+        fx, stop_sar, sar_first):
+    holding = row(currency="USD", current_price=130, intrinsic_value=170,
+                  quantity=1, buy_price=120, stop=123.45)
+    if sar_first:
+        holding = {"Stop SAR": stop_sar, **holding}
+    else:
+        holding["Stop SAR"] = stop_sar
+    controls = {"cash_available_sar": 50_000, "add_confirm_days": 1}
+
+    normalized = pa.normalize_holding(
+        holding, {"USD": fx}, pa.make_controls(controls))
+    assert normalized["held_risk_state"] == "recorded"
+    assert normalized["stop"] == 123.45
+
+    result = pa.build_portfolio_actions(
+        [holding], controls=controls, fx_rates={"USD": fx})
+    action = result["actions"][0]
+    assert action["action"] == pa.ACTION_ADD
+    assert action["stop_sar"] == stop_sar
+
+
+@pytest.mark.parametrize("extra_alias", [
+    {"Stop SAR": 462.92},
+    {"Stop SAR": 462.96},
+    {"Stop SAR": 463.04},
+    {"Active Stop": 123.46},
+    {"Stop SAR": 462.94, "Trailing Stop": "TBD"},
+])
+def test_held_stop_rounding_tolerance_preserves_fail_closed_conflicts(extra_alias):
+    holding = row(currency="USD", current_price=130, intrinsic_value=170,
+                  quantity=1, buy_price=120, stop=123.45, **extra_alias)
+    controls = {"cash_available_sar": 50_000, "add_confirm_days": 1}
+
+    normalized = pa.normalize_holding(
+        holding, {"USD": 3.75}, pa.make_controls(controls))
+    assert normalized["held_risk_state"] == "invalid_or_conflicting"
+    assert normalized["stop"] is None
+
+    result = pa.build_portfolio_actions(
+        [holding], controls=controls, fx_rates={"USD": 3.75})
+    action = result["actions"][0]
+    assert action["action"] != pa.ACTION_ADD
+    assert "risk state" in action["action_reason"].lower()
+
+
+def test_sar_held_stop_alias_still_fails_closed_without_valid_fx():
+    holding = row(symbol="SAFE.XX", currency="UNKNOWN", current_price=130,
+                  quantity=1, buy_price=120, stop=123.45,
+                  **{"Stop SAR": 462.94})
+    normalized = pa.normalize_holding(
+        holding, {}, pa.make_controls({"add_confirm_days": 1}))
+    assert normalized["fx_to_sar"] is None
+    assert normalized["held_risk_state"] == "invalid_or_conflicting"
+    assert normalized["stop"] is None
+
+
 def test_unknown_held_stop_withholds_additional_equity_exposure(monkeypatch):
     monkeypatch.setenv("TFB_PF_ADD_LOSER_VETO", "off")
     holding = row(currency="SAR", symbol="SAFE.SR", quantity=1, buy_price=100)

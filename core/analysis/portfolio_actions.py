@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.15.1  (header synced to runtime; history below)
+Version: 1.15.2  (header synced to runtime; history below)
+v1.15.2 (2026-10-06): reconcile native and SAR held-stop aliases within
+the SAR value's two-decimal display interval while retaining the native stop
+as authoritative; malformed and genuinely conflicting aliases fail closed.
 v1.15.1 (2026-10-06): consume shared invalid timestamp evidence before any
 portfolio action or rule-exit override; report precise timestamp blocks apart
 from stale/thin evidence. Existing trust-gate activation is preserved.
@@ -821,7 +824,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.15.1"
+PORTFOLIO_ACTIONS_VERSION = "1.15.2"
 # v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
 # HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
 # WHY: every RULE in this file already stands down for a SUKUK-class
@@ -1979,6 +1982,36 @@ def _buy_date_from_row(row):
     return None
 
 
+_SAR_STOP_DISPLAY_HALF_UNIT = 0.005
+_STOP_ALIAS_EXACT_TOLERANCE = 1e-8
+
+
+def _held_stop_aliases_coherent(evidence):
+    """Whether all supplied held-stop aliases can denote the same stop.
+
+    Stop SAR is rendered to two currency decimals, while the native value is
+    read from the sheet as the stored numeric value.  A cross-unit comparison
+    therefore allows only half a SAR minor unit transformed through FX; the
+    native stop stays exact and authoritative.  Same-unit aliases retain the
+    legacy near-exact comparison so this fix cannot conceal two genuinely
+    different stops.
+    """
+    if not evidence or any(item is None for item in evidence):
+        return False
+    for index, (left, left_unit, left_half_unit) in enumerate(evidence):
+        for right, right_unit, right_half_unit in evidence[index + 1:]:
+            tolerance = (_STOP_ALIAS_EXACT_TOLERANCE
+                         if left_unit == right_unit
+                         else left_half_unit + right_half_unit)
+            # Currency intervals are the policy tolerance.  This extra slack
+            # is only enough to absorb float arithmetic at their boundary.
+            scale = max(abs(left), abs(right), tolerance, 1.0)
+            float_slack = 4.0 * math.ulp(scale)
+            if abs(left - right) > tolerance + float_slack:
+                return False
+    return True
+
+
 def normalize_holding(row, fx_rates, controls):
     """opportunity_builder.normalize_candidate + position economics."""
     crit = _ob.make_criteria({"period_months": controls["period_months"]})
@@ -1992,14 +2025,29 @@ def normalize_holding(row, fx_rates, controls):
     for key, value in (row or {}).items():
         token = _ob._norm_token(key)
         if token in {"stop", "activestop", "trailingstop", "stoploss", "stopprice"}:
-            held_stops.append(_pos_float(value))
+            number = _pos_float(value)
+            held_stops.append((number, "native", 0.0)
+                              if number is not None else None)
         elif token in {"stopsar", "activestopsar", "trailingstopsar"}:
             number, rate = _pos_float(value), _pos_float(cand.get("fx_to_sar"))
-            held_stops.append(number / rate if number and rate else None)
-    valid_stops = [value for value in held_stops if value is not None]
-    coherent = (valid_stops and len(valid_stops) == len(held_stops)
-                and max(valid_stops) - min(valid_stops) <= 1e-8)
-    cand["stop"] = valid_stops[0] if coherent else None
+            if number is not None and rate is not None:
+                native_value = number / rate
+                native_half_unit = _SAR_STOP_DISPLAY_HALF_UNIT / rate
+                held_stops.append(
+                    (native_value, "sar", native_half_unit)
+                    if (math.isfinite(native_value)
+                        and math.isfinite(native_half_unit)) else None)
+            else:
+                held_stops.append(None)
+    valid_stops = [item for item in held_stops if item is not None]
+    coherent = _held_stop_aliases_coherent(held_stops)
+    # Native evidence is authoritative even when a sheet puts Stop SAR first;
+    # inverse-FX rounding must not perturb stop_pct / RR / breach thresholds.
+    native_stops = [item[0] for item in valid_stops if item[1] == "native"]
+    if coherent:
+        cand["stop"] = native_stops[0] if native_stops else valid_stops[0][0]
+    else:
+        cand["stop"] = None
     cand["held_risk_state"] = "recorded" if coherent else (
         "invalid_or_conflicting" if held_stops else "missing")
     held_price, held_stop = _pos_float(cand.get("price")), cand["stop"]
