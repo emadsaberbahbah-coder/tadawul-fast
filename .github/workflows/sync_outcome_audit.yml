@@ -80,10 +80,32 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             RUN_ID="$WORKFLOW_RUN_ID"
-            if [[ "$WORKFLOW_CONCLUSION" != "success" ]]; then
-              echo "::error::Source Daily Sync run concluded '$WORKFLOW_CONCLUSION'."
-              exit 1
-            fi
+            # (2026-10-06) A FAILED SYNC IS EXACTLY WHEN THIS AUDIT IS NEEDED.
+            # Evidence: run 37370684206 (2026-10-05 20:17 slot) concluded
+            # 'failure' because the global-markets MATRIX LEG was cancelled
+            # before it ever got a runner (job 111970695957: runner_id 0, no
+            # steps, cancelled after 15m01s) - while core-pages and
+            # mutual-funds both SUCCEEDED and uploaded their logs, and the
+            # recovery job then re-wrote Global_Markets (6,609 rows,
+            # 21:28-22:17Z). The old guard refused the whole day on the run
+            # conclusion alone, so this audit (37381563177) died in this step
+            # with "Source Daily Sync run concluded 'failure'" and the one
+            # question the operator needed answered - DID THE PAGES ACTUALLY
+            # REFRESH? - went unanswered precisely on the day it mattered.
+            # 'failure' is now audited; the auditor reads the per-page
+            # [PAGE-VERDICT] lines and reports missing/failed pages itself,
+            # which is a strictly better signal than refusing to look.
+            # 'cancelled' / 'skipped' / 'timed_out' still exit 1: those runs
+            # upload no usable evidence.
+            case "$WORKFLOW_CONCLUSION" in
+              success|failure)
+                echo "Upstream Daily Sync concluded '$WORKFLOW_CONCLUSION' - auditing."
+                ;;
+              *)
+                echo "::error::Source Daily Sync run concluded '$WORKFLOW_CONCLUSION'."
+                exit 1
+                ;;
+            esac
           else
             RUN_ID="$INPUT_RUN_ID"
           fi
@@ -99,6 +121,36 @@ jobs:
         with:
           pattern: tadawul-sync-logs-${{ steps.source.outputs.run_id }}-*
           path: downloaded-sync-artifacts
+          merge-multiple: false
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # (2026-10-06) THE RECOVERY JOB'S EVIDENCE COUNTS TOO.
+      # daily_sync.yml's 'recover-missing-market-pages' job (if: always()) runs
+      # scripts/run_inline_page_recovery.py, which re-runs the real
+      # run_dashboard_sync.py for each page that did not refresh and writes a
+      # full sync_execution.log - carrying the same [PAGE-VERDICT v6.26.0]
+      # lines - into inline-recovery-evidence/<group>/, uploaded as
+      # page-refresh-<run_id>-<group>. This audit never downloaded those, so a
+      # page that FAILED in its leg and was then SUCCESSFULLY recovered was
+      # still reported as failed/missing (run 37370684206: Global_Markets
+      # recovered 6,609 rows at 22:17Z, invisible here).
+      # The 'zz-recovery/' prefix is load-bearing: audit_sync_outcome.py's
+      # _candidate_logs() sorts log paths and _read_logs/latest_by_page keeps
+      # the LAST verdict per page, so 'zz-recovery/...' sorts after
+      # 'tadawul-sync-logs-...' and the recovered verdict wins.
+      # continue-on-error: a clean run produces no recovery artifacts at all.
+      # Known conservative quirk, left as is: a multi-cycle recovery writes
+      # cycle 1 at <group>/sync_execution.log and cycle 2 at
+      # <group>/cycle2/sync_execution.log, and 'cycle2' sorts BEFORE
+      # 'sync_execution.log', so the EARLIER cycle wins. That biases the audit
+      # toward FAIL, never toward a false PASS.
+      - name: Download recovery evidence (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: page-refresh-${{ steps.source.outputs.run_id }}-*
+          path: downloaded-sync-artifacts/zz-recovery
           merge-multiple: false
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}

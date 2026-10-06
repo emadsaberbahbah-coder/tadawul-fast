@@ -2,7 +2,7 @@
 """
 core/providers/argaam_provider.py
 ================================================================================
-Argaam Provider (KSA Market Data) -- v6.1.0
+Argaam Provider (KSA Market Data) -- v6.2.0
 ================================================================================
 PROFILE + CLASSIFICATION + HISTORY FALLBACK + ROUTER/ENGINE COMPAT
 
@@ -14,6 +14,79 @@ Provides KSA market data from Argaam-compatible APIs:
   - Historical OHLCV data
   - Derived technical indicators (RSI, ATR, volume ratio)
   - KSA-specific symbol normalization
+
+v6.2.0 -- LOOPGUARD (B6-a): ASYNC STATE SURVIVES asyncio.run() PER CALL
+-----------------------------------------------------------------------
+WHY (2026-10-06 review of branch claude/tfb-review-2026-10-06, reproduced
+without the network; same defect class as yahoo_fundamentals_provider
+v6.9.0 LOOPGUARD (P-203) and eodhd_provider v4.18.0 LOOPGUARD (P-110),
+which both already carry this fix):
+
+(a) EVIDENCE / ROOT CAUSE. ArgaamClient kept ONE lazily created
+    asyncio.Semaphore in self._semaphore (v6.1.0 line 915, created in
+    _get_semaphore(), acquired as 'async with self._get_semaphore():'
+    around 'await self._client.get(url)' in _fetch_json). On Python
+    >= 3.10 an asyncio.Semaphore binds to the first event loop that
+    CONTENDS it (asyncio.mixins._LoopBoundMixin._get_loop, reached only
+    when the counter is already 0 -- so an uncontended acquire looks
+    healthy). This provider is a process-global singleton (get_provider /
+    _get_provider_sync) while the sync entry points create a NEW loop per
+    call: core/analysis/top10_selector.py line 5391 ('return
+    asyncio.run(coro)' in build_top10_rows) and line 5448. The SECOND
+    cockpit build therefore raised "<Semaphore ...> is bound to a
+    different event loop" on acquire. Because get_enriched_quotes_batch
+    gathers with return_exceptions=True and turns every exception into
+    _build_error_patch(sym, FETCH_FAILED, ...), the production symptom was
+    not a crash but SILENT PER-SYMBOL DATA LOSS. Measured on the v6.1.0
+    file with a stub transport (max_concurrency=1, 6 symbols, two
+    asyncio.run loops): loop 1 = 6/6 OK, loop 2 = 1/6 OK with 5
+    fetch_failed, and client._semaphore._loop.is_closed() was True.
+
+(b) WHAT CHANGED (per edit site; additive only, nothing removed):
+    1. imports: added 'threading'.
+    2. _TTLCache._lock / _get_lock(): asyncio.Lock -> threading.Lock,
+       taken with a plain 'with' in get()/set(). Audited: ZERO awaits
+       inside either critical section (pure OrderedDict bookkeeping), so
+       the lock is never held across an await.
+    3. ArgaamClient.__init__: added self._sem_loop (the loop that owns
+       self._semaphore), self._client_loop (the loop that owns the httpx
+       connection pool) and self._http_headers (the exact header set
+       __init__ built, so a rebuilt pool is identically configured).
+    4. ArgaamClient._get_semaphore(): now LOOP-KEYED -- it returns the
+       Semaphore of the RUNNING loop; a new loop gets a fresh
+       asyncio.Semaphore(max(1, self.config.max_concurrency)), the SAME
+       cap, and the previous loop's one is dropped (one entry kept).
+    5. ArgaamClient._new_http_client() and _ensure_http_client() (both
+       NEW), plus one _ensure_http_client() call on the transport leg of
+       _fetch_json: an httpx.AsyncClient's pool belongs to the loop that
+       used it, so when the running loop changed the pool is rebuilt with
+       the same timeout/limits/headers and the old one is retired by
+       _retire_http_client() (NEW, module level) -- aclose() scheduled on
+       its own loop while that loop is alive, otherwise a bounded
+       graveyard keeps it from being collected mid-flight (the eodhd
+       v4.18.0 _retire_client pattern). A client object this module did
+       not build (an injected stub) is left untouched.
+    6. ArgaamProvider._lock / _get_lock(): asyncio.Lock -> threading.Lock
+       ('with' in _get_client). Audited: the section only constructs
+       ArgaamClient -- no awaits.
+    7. Module singleton guard _PROVIDER_LOCK / _get_provider_lock():
+       asyncio.Lock -> threading.Lock ('with' in get_provider()).
+       Audited: the section only constructs ArgaamProvider -- no awaits.
+       get_provider() keeps its async signature.
+    Behaviour on a single loop is UNCHANGED: same concurrency cap, same
+    URL-candidate dedup, same cache/TTL semantics, same patch shapes, same
+    env vars. No ENV gate and no kill switch -- the OFF state IS the
+    defect (the v6.9.0 / v4.18.0 precedent).
+
+(c) ROLLBACK: re-paste v6.1.0 of this file (its WHY block is preserved
+    verbatim below; the review kept a byte-identical copy as
+    argaam_provider_base_v610.py). Nothing else in the repo changes with
+    it.
+
+Zero functions or classes removed. Additions: module-level
+_retire_http_client(); methods ArgaamClient._new_http_client() and
+ArgaamClient._ensure_http_client(); attributes _sem_loop, _client_loop,
+_http_headers. Covered by tests/test_argaam_loopguard_b6.py.
 
 v6.1.0 Changes (from v6.0.0)
 ----------------------------
@@ -129,6 +202,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -169,7 +243,7 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "6.1.0"
+PROVIDER_VERSION = "6.2.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -869,17 +943,20 @@ class _TTLCache:
     def __init__(self, max_size: int = DEFAULT_CACHE_MAX_SIZE):
         self._max_size = max(1, max_size)
         self._cache: "OrderedDict[str, _CacheItem]" = OrderedDict()
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[threading.Lock] = None  # lazy (v6.2.0 LOOPGUARD: loop-agnostic)
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.2.0 LOOPGUARD (B6-a): threading.Lock (was asyncio.Lock, which
+        # binds to the loop that contends it). Both sections below are pure
+        # OrderedDict bookkeeping -- audited, zero awaits inside.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
 
     async def get(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
         now = time.monotonic()
-        async with self._get_lock():
+        with self._get_lock():  # v6.2.0 LOOPGUARD
             item = self._cache.get(key)
             if not item:
                 return None
@@ -891,7 +968,7 @@ class _TTLCache:
     async def set(self, key: str, value: Any, ttl_sec: float) -> None:
         """Set value in cache with TTL; FIFO-evicts on overflow."""
         now = time.monotonic()
-        async with self._get_lock():
+        with self._get_lock():  # v6.2.0 LOOPGUARD
             # Evict oldest entries until we're back under the cap
             # (bounded excess, not the flat 200 from v5.0.0)
             while len(self._cache) >= self._max_size:
@@ -900,6 +977,39 @@ class _TTLCache:
                 expires_at=now + max(1.0, ttl_sec),
                 value=value,
             )
+
+
+# ---------------------------------------------------------------------------
+# Transport retirement (v6.2.0 LOOPGUARD)
+# ---------------------------------------------------------------------------
+
+_HTTP_GRAVEYARD: List[Any] = []
+_HTTP_GRAVEYARD_MAX = 4
+
+
+def _retire_http_client(old: Any, old_loop: Any) -> None:
+    """
+    v6.2.0 LOOPGUARD (B6-a): best-effort shutdown of a superseded pool.
+
+    An httpx.AsyncClient can only be closed on the loop it lives on. If that
+    loop is still alive, aclose() is scheduled there; otherwise a bounded
+    reference is kept so the pool is not collected mid-flight. Rebuilds
+    happen once per new event loop entering the client, so the graveyard
+    stays tiny. (Mirrors eodhd_provider v4.18.0 _retire_client.)
+    """
+    if old is None:
+        return
+    try:
+        if old_loop is not None and not old_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(old.aclose(), old_loop)
+            return
+    except Exception:
+        pass
+    try:
+        _HTTP_GRAVEYARD.append(old)
+        del _HTTP_GRAVEYARD[:-_HTTP_GRAVEYARD_MAX]
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -913,8 +1023,11 @@ class ArgaamClient:
         self.config = config or ArgaamConfig.from_env()
         self.client_id = str(uuid.uuid4())[:8]
         self._semaphore: Optional[asyncio.Semaphore] = None  # lazy
+        self._sem_loop: Any = None  # v6.2.0 LOOPGUARD: loop that owns _semaphore
         self._cache = _TTLCache(max_size=self.config.cache_max_size)
         self._client: Optional["httpx.AsyncClient"] = None
+        self._client_loop: Any = None  # v6.2.0 LOOPGUARD: loop that owns the httpx pool
+        self._http_headers: Dict[str, str] = {}  # v6.2.0 LOOPGUARD: headers for a pool rebuild
 
         if _HTTPX_AVAILABLE:
             headers = {
@@ -938,6 +1051,10 @@ class ArgaamClient:
                 else:
                     headers[hk] = api_key
 
+            # v6.2.0 LOOPGUARD: remember the exact header set so a pool
+            # rebuilt for a new event loop is configured identically.
+            self._http_headers = dict(headers)
+
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.config.timeout_sec),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
@@ -958,9 +1075,69 @@ class ArgaamClient:
                 pass
 
     def _get_semaphore(self) -> asyncio.Semaphore:
-        if self._semaphore is None:
+        # v6.2.0 LOOPGUARD (B6-a): the Semaphore of the RUNNING loop. A new
+        # loop (one asyncio.run per cockpit build) gets a fresh Semaphore
+        # with the SAME cap; the previous loop's one is dropped. Without
+        # this, the second loop raised "is bound to a different event loop"
+        # on acquire and every symbol came back as fetch_failed.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if self._semaphore is None or self._sem_loop is not loop:
             self._semaphore = asyncio.Semaphore(max(1, self.config.max_concurrency))
+            self._sem_loop = loop
         return self._semaphore
+
+    # -- Transport lifecycle (v6.2.0 LOOPGUARD) --------------------------
+
+    def _new_http_client(self) -> Optional["httpx.AsyncClient"]:
+        """
+        v6.2.0 LOOPGUARD (B6-a): build an httpx.AsyncClient with exactly the
+        timeout/limits/headers __init__ used. Returns None when httpx is
+        unavailable (the no-transport path is unchanged).
+        """
+        if not _HTTPX_AVAILABLE or httpx is None:
+            return None
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.timeout_sec),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
+            headers=dict(self._http_headers),
+        )
+
+    def _ensure_http_client(self) -> None:
+        """
+        v6.2.0 LOOPGUARD (B6-a): keep the connection pool on the running loop.
+
+        An httpx.AsyncClient's pool belongs to the loop that drove it, so a
+        process-global client reused from a second asyncio.run() loop can
+        fail on a kept-alive connection. The first loop to use the pool
+        claims it; a later, different loop gets a freshly built pool and the
+        superseded one is retired on its own loop. A client object this
+        module did not build (an injected stub/fake) is left untouched.
+        """
+        if self._client is None:
+            return
+        if not _HTTPX_AVAILABLE or httpx is None:
+            return
+        if not isinstance(self._client, httpx.AsyncClient):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._client_loop is None:
+            self._client_loop = loop
+            return
+        if self._client_loop is loop:
+            return
+        old, old_loop = self._client, self._client_loop
+        fresh = self._new_http_client()
+        if fresh is None:
+            return
+        self._client = fresh
+        self._client_loop = loop
+        _retire_http_client(old, old_loop)
 
     # -- URL helpers -----------------------------------------------------
 
@@ -1008,6 +1185,8 @@ class ArgaamClient:
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached, None
+
+        self._ensure_http_client()  # v6.2.0 LOOPGUARD: pool on the running loop
 
         if not self._client:
             return None, "httpx_not_available"
@@ -1352,6 +1531,7 @@ class ArgaamClient:
             except Exception as exc:
                 logger.debug("argaam client close failed: %s", exc)
             self._client = None
+            self._client_loop = None  # v6.2.0 LOOPGUARD: next pool claims its own loop
 
 
 # ---------------------------------------------------------------------------
@@ -1367,16 +1547,19 @@ class ArgaamProvider:
     def __init__(self, config: Optional[ArgaamConfig] = None):
         self._config = config or ArgaamConfig.from_env()
         self._client: Optional[ArgaamClient] = None
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[threading.Lock] = None  # lazy (v6.2.0 LOOPGUARD: loop-agnostic)
 
-    def _get_lock(self) -> asyncio.Lock:
+    def _get_lock(self) -> threading.Lock:
+        # v6.2.0 LOOPGUARD (B6-a): threading.Lock (was asyncio.Lock, which is
+        # bound to one loop). The only section below constructs ArgaamClient
+        # -- audited, zero awaits inside.
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            self._lock = threading.Lock()
         return self._lock
 
     async def _get_client(self) -> ArgaamClient:
         """Get or create the underlying client instance."""
-        async with self._get_lock():
+        with self._get_lock():  # v6.2.0 LOOPGUARD
             if self._client is None:
                 self._client = ArgaamClient(self._config)
             return self._client
@@ -1432,13 +1615,15 @@ class ArgaamProvider:
 # ---------------------------------------------------------------------------
 
 _PROVIDER_INSTANCE: Optional[ArgaamProvider] = None
-_PROVIDER_LOCK: Optional[asyncio.Lock] = None
+_PROVIDER_LOCK: Optional[threading.Lock] = None  # v6.2.0 LOOPGUARD: loop-agnostic
 
 
-def _get_provider_lock() -> asyncio.Lock:
+def _get_provider_lock() -> threading.Lock:
+    # v6.2.0 LOOPGUARD (B6-a): threading.Lock (was asyncio.Lock, loop-bound);
+    # the guarded section only constructs ArgaamProvider -- no awaits.
     global _PROVIDER_LOCK
     if _PROVIDER_LOCK is None:
-        _PROVIDER_LOCK = asyncio.Lock()
+        _PROVIDER_LOCK = threading.Lock()
     return _PROVIDER_LOCK
 
 
@@ -1455,7 +1640,7 @@ async def get_provider() -> ArgaamProvider:
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         return _PROVIDER_INSTANCE
-    async with _get_provider_lock():
+    with _get_provider_lock():  # v6.2.0 LOOPGUARD
         if _PROVIDER_INSTANCE is None:
             _PROVIDER_INSTANCE = ArgaamProvider()
         return _PROVIDER_INSTANCE

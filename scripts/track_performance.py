@@ -1379,7 +1379,96 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _dedup_matured_mode, _risk_blank_enabled,
 #   _matured_dup_decision, _risk_cells. Rollback: unset the envs or revert.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.41.0"
+# -----------------------------------------------------------------------------
+# v6.42.0 (2026-10-06) - P-201 ZERO-FORECAST BASELINE MAE (S-1 criterion 4
+# stops passing trivially)
+# -----------------------------------------------------------------------------
+# EVIDENCE (matured 1W+2W checkpoint cohort, workbook export 2026-10-06).
+# Criterion 4 asks one question - "is the published mean |err| inside the
+# 10 pp band?" - and on that cohort the answer is yes: MAE(model) 3.23 pp.
+# But on the SAME rows MAE(zero forecast), i.e. mean |realized| when the
+# forecast is replaced by a flat 0.00 pp, is 3.07 pp (1W 2.65 model vs 2.55
+# zero; 2W 3.89 model vs 3.65 zero). The band therefore certifies a
+# forecast that LOSES to predicting nothing: a wide-enough band plus small
+# realized moves passes forever, and the gate measures the market's
+# quietness rather than the model's skill. Nothing in this file ever
+# published the comparison, so the scorer could not make it either.
+# CONSUMER ALREADY SHIPPED: scripts/run_shadow_scorer.py v1.9.2 reads the
+# baseline with parse_zero_mae (a 'Zero MAE (pp)' column matched
+# case-insensitively on the header, or a `zero_mae=<x.xx>pp` token in the
+# Detail cell of _S1_Calibration row 2) and read_s1_calibration_mae reads
+# row 2 BY HEADER NAME - so APPENDING a column is safe. Until this build
+# lands the scorer prints zero_mae=n/a and criterion 4 reads PENDING under
+# enforce.
+# WHAT CHANGED (gate TFB_S1_ZERO_BASELINE = off (DEFAULT, every surface
+# byte-identical to v6.41.0) | publish; the COMPUTATION is pure and
+# UNGATED, only the PUBLICATION is gated):
+#   1. _s1_zero_baseline_enabled() + _s1_zero_mae() beside _s1_cal_enabled
+#      (the 1/true/on/yes vocabulary of its default-off neighbours).
+#   2. _s1_checkpoint_calibration_legacy accumulates, inside the SAME
+#      qualifying iteration that appends err, abs(float(realized)) into a
+#      parallel zero_errs (+ per horizon), and always carries
+#      out["zero_mae_pp"] (None when n == 0) plus a "zero_mae_pp" key in
+#      every by_horizon entry. No env is read here.
+#   3. _s1_unit_sentry_measure does the same over the unit-corrected
+#      cohort (only rows that reach errs.append) -> rep["zero_mae_pp"] and
+#      per-horizon; _s1_unit_sentry_apply carries zero_mae_pp in
+#      rep["legacy"] and, in the enforce branch, copies
+#      new["zero_mae_pp"] = rep["zero_mae_pp"] beside the existing
+#      n/mean_abs/mean_signed/by_horizon copy, so row 2's zero baseline is
+#      ALWAYS on the same basis as row 2's model MAE.
+#   4. _publish_s1_calibration, gate ON only: hdr = S1_CAL_HEADER +
+#      ["Zero MAE (pp)"] (S1_CAL_HEADER itself is UNCHANGED, so the OFF
+#      path is byte-identical), the value appended to row 2 ("" when
+#      None), " | zero_mae=<x.xx>pp" appended to the Detail cell (its index
+#      computed from S1_CAL_HEADER, never hardcoded) and to the stdout
+#      line. The tab is created with cols=len(S1_CAL_HEADER)+2 = 12, so an
+#      11th column fits existing tabs.
+#   5. _perf_unit_block_rows gains, gate ON only, a 7th row
+#      ["zero-forecast baseline (|realized|)", n, legacy_zero,
+#      corrected_zero]; the publisher's write range is derived from the row
+#      count (A4:D9 OFF, A4:D10 ON). Rows 10-11 are free - the reliability
+#      factors block starts at A12.
+#   6. Embedded self-test 18 -> 20 cases (zero MAE == mean |realized| on a
+#      fixture whose model MAE differs AND is lower, i.e. the model-wins
+#      direction asserted explicitly; Detail-token round trip through a
+#      local copy of the scorer's own regex).
+#   7. _zb_strip(): with the gate OFF, zero_mae_pp is removed from the
+#      _Run_Log UNIT_SENTRY JSON payload (which serialises rep["legacy"]
+#      and its by_horizon entries verbatim). Without it, an unarmed run
+#      under TFB_PERF_TARGET_UNIT_SENTRY=observe - the LIVE setting in both
+#      recording lanes - would have published keys nobody armed, breaking
+#      the default-OFF-is-byte-identical rule on a surface the WHY block
+#      claimed was untouched. Found by the delivery audit, not in testing.
+# ENV LANE: GitHub Actions (.github/workflows/track_performance.yml, the
+#   Performance Clock run step, and the in-sync step in daily_sync.yml),
+#   NOT Render.
+# WHAT THIS BUILD DOES NOT CLAIM: publishing the baseline does not by
+#   itself change any verdict. criterion 4 only starts REFUSING a
+#   skill-less forecast once the scorer's TFB_S1_CRITERIA_V2 reaches
+#   enforce, which is its own operator sitting with its own boundary note.
+#   Sequencing matters: under the current P-158 observe arming row 2's
+#   model MAE is still on the legacy fraction-scale basis, so flip
+#   TFB_PERF_TARGET_UNIT_SENTRY to enforce BEFORE TFB_S1_CRITERIA_V2, or
+#   row 2 and its new zero column will be compared on one basis while the
+#   stored targets sit on another.
+# ROLLBACK: unset TFB_S1_ZERO_BASELINE (or set it to 0/off) -> the header,
+#   row 2, the Detail cell, the stdout line, the _Run_Log payload and the
+#   A4:D9 sentry WRITE are byte-identical to v6.41.0; the dict field stays
+#   and is simply unread.
+#   ONE MANUAL STEP ON ROLLBACK, because a narrower write does not clear
+#   what a wider one left: arming wrote the sentry block to A4:D10, and
+#   disarming writes only A4:D9, so the stale 'zero-forecast baseline
+#   (|realized|)' row is left behind in _S1_Calibration row 10. Clear
+#   A10:D10 by hand after disarming. Nothing reads rows 10-11 (the
+#   reliability-factors block starts at A12), so this is cosmetic - but it
+#   is a sheet that an operator reads, so it is stated rather than implied.
+#   Full revert: restore v6.41.0 of this file (the scorer tolerates the
+#   missing column by design).
+# ZERO functions removed. Additions: _s1_zero_baseline_enabled,
+#   _s1_zero_mae, _zb_strip.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.42.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -1830,6 +1919,11 @@ except Exception:
 # Monitoring & Tracing (safe dummy)
 try:
     from prometheus_client import Counter, Gauge  # type: ignore
+    # v6.42.0: REGISTRY / CollectorRegistry back the double-import guard in
+    # _metric() below. Imported here, inside the same guarded try, so a
+    # prometheus_client too old to expose them degrades exactly as a missing
+    # prometheus_client already does.
+    from prometheus_client import REGISTRY, CollectorRegistry  # type: ignore
 
     PROMETHEUS_AVAILABLE = True
 except Exception:
@@ -2207,12 +2301,58 @@ def _shutdown_executor() -> None:
         _CPU_EXECUTOR = None
 
 
+def _metric(factory: Any, name: str, doc: str) -> Any:
+    """v6.42.0 (2026-10-06): register a Prometheus metric that TOLERATES a
+    SECOND IMPORT OF THIS FILE IN ONE PROCESS.
+
+    WHY: these three registrations ran unguarded at module scope against the
+    prometheus_client default REGISTRY, so loading this file twice in one
+    interpreter raised
+
+        ValueError: Duplicated timeseries in CollectorRegistry:
+        {'perf_records_processed', 'perf_records_processed_total',
+         'perf_records_processed_created'}
+
+    and every dual-tree harness for this module - the ones that load a base
+    copy and the delivered copy side by side to prove an OFF path is
+    byte-identical, which is how this project proves a gated build at all -
+    could only ever load ONE of them. It is also why `pytest tests/` cannot
+    collect tests/test_tp_target_unit_sentry_p158.py and
+    tests/test_track_force_coverage_p180.py in the same run: the second
+    import dies at collection, so neither harness could be added to the CI
+    suite list. The metrics themselves are process-cumulative counters that
+    nothing reads back per-import, so reusing the already-registered
+    collector is correct, not merely convenient.
+
+    Returns the existing collector when the name is already registered, and
+    degrades to a fresh unregistered instance if anything unexpected happens
+    (a metric must never be the reason this script cannot start).
+    """
+    try:
+        return factory(name, doc)
+    except ValueError:
+        try:
+            existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+            if existing is not None:
+                return existing
+        except Exception:
+            pass
+        try:
+            return factory(name, doc, registry=CollectorRegistry())
+        except Exception:
+            return factory()
+    except Exception:
+        return factory()
+
+
 if PROMETHEUS_AVAILABLE:
-    perf_records_processed = Counter(
-        "perf_records_processed_total", "Total performance records processed"
-    )
-    perf_daemon_cycles = Counter("perf_daemon_cycles_total", "Total daemon cycles")
-    perf_win_rate = Gauge("perf_overall_win_rate", "Overall win rate percentage")
+    perf_records_processed = _metric(
+        Counter, "perf_records_processed_total",
+        "Total performance records processed")
+    perf_daemon_cycles = _metric(
+        Counter, "perf_daemon_cycles_total", "Total daemon cycles")
+    perf_win_rate = _metric(
+        Gauge, "perf_overall_win_rate", "Overall win rate percentage")
 else:
     perf_records_processed = Counter()  # type: ignore
     perf_daemon_cycles = Counter()  # type: ignore
@@ -3298,6 +3438,58 @@ def _s1_cal_enabled() -> bool:
         not in ("0", "false", "off", "no")
 
 
+def _s1_zero_baseline_enabled() -> bool:
+    """v6.42.0 [P-201]: TFB_S1_ZERO_BASELINE=1/true/on/yes/publish PUBLISHES
+    the zero-forecast baseline MAE (an appended 'Zero MAE (pp)' column, a
+    `zero_mae=<x.xx>pp` token in Detail and one extra sentry row). Default
+    OFF -> every published surface is byte-identical to v6.41.0. The
+    COMPUTATION itself is pure and never gated."""
+    return (os.getenv("TFB_S1_ZERO_BASELINE") or "0").strip().lower() \
+        in {"1", "true", "on", "yes", "publish"}
+
+
+def _zb_strip(obj: Any) -> Any:
+    """v6.42.0 [P-201]: `obj` without any zero_mae_pp key when the publish
+    gate is OFF, so an unarmed run's _Run_Log payload is byte-identical to
+    v6.42.0's predecessor. Armed -> returned unchanged. Recurses one level
+    into a by_horizon mapping. Never raises: on any surprise the input is
+    returned as-is (fail-open telemetry, the v6.18.0 doctrine)."""
+    if _s1_zero_baseline_enabled():
+        return obj
+    try:
+        if not isinstance(obj, dict):
+            return obj
+        out = {k: v for k, v in obj.items() if k != "zero_mae_pp"}
+        bh = out.get("by_horizon")
+        if isinstance(bh, dict):
+            out["by_horizon"] = {
+                hz: ({k: v for k, v in row.items() if k != "zero_mae_pp"}
+                     if isinstance(row, dict) else row)
+                for hz, row in bh.items()
+            }
+        elif isinstance(bh, list):
+            out["by_horizon"] = [
+                ({k: v for k, v in row.items() if k != "zero_mae_pp"}
+                 if isinstance(row, dict) else row)
+                for row in bh
+            ]
+        return out
+    except Exception:
+        return obj
+
+
+def _s1_zero_mae(vals: Any) -> Optional[float]:
+    """v6.42.0 [P-201] PURE: mean of the already-absolute zero-forecast
+    errors, rounded to 2 dp; None on an empty sample. Never raises."""
+    try:
+        xs = [float(v) for v in (vals or [])]
+    except Exception:
+        return None
+    if not xs:
+        return None
+    return round(sum(xs) / float(len(xs)), 2)
+
+
 def _s1_cal_band_pp() -> float:
     try:
         return abs(float((os.getenv("TFB_S1_CAL_BAND_PP") or "10").strip()))
@@ -3429,6 +3621,8 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
     tiny = 0
     errs: List[float] = []
     per_hz: Dict[str, List[float]] = {}
+    zero_errs: List[float] = []
+    zero_per_hz: Dict[str, List[float]] = {}
     for r in (records or []):
         hz = getattr(getattr(r, "horizon", None), "value", None)
         if hz not in ("1W", "2W"):
@@ -3459,16 +3653,22 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
         err = float(realized) - float(fixed)
         errs.append(err)
         per_hz.setdefault(hz, []).append(err)
+        # v6.42.0 (P-201): zero-forecast baseline over the SAME unit-
+        # corrected cohort, so row 2 compares like with like.
+        zero_errs.append(abs(float(realized)))
+        zero_per_hz.setdefault(hz, []).append(abs(float(realized)))
     n = len(errs)
     rep: Dict[str, Any] = {
         "n": n, "mean_abs_error_pp": None, "mean_signed_error_pp": None,
         "by_horizon": {
             k: {"n": len(v),
-                "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2)}
+                "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2),
+                "zero_mae_pp": _s1_zero_mae(zero_per_hz.get(k))}
             for k, v in sorted(per_hz.items()) if v
         },
         "counts": counts, "all_checkpoints": allc,
         "unresolved_why": why, "percent_tiny": tiny,
+        "zero_mae_pp": _s1_zero_mae(zero_errs),
     }
     if n:
         rep["mean_abs_error_pp"] = round(sum(abs(x) for x in errs) / float(n), 2)
@@ -3490,7 +3690,7 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
     rep["mode"] = mode
     rep["legacy"] = {k: out.get(k) for k in (
         "state", "n", "mean_abs_error_pp", "mean_signed_error_pp",
-        "by_horizon", "detail")}
+        "by_horizon", "detail", "zero_mae_pp")}   # v6.42.0 (P-201)
     rep["creation"] = dict(_PERF_UNIT_CREATION)
     new["unit_sentry"] = rep
     if mode != "enforce" or rep.get("error"):
@@ -3516,6 +3716,8 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
         new["mean_abs_error_pp"] = rep["mean_abs_error_pp"]
         new["mean_signed_error_pp"] = rep["mean_signed_error_pp"]
         new["by_horizon"] = rep["by_horizon"]
+        # v6.42.0 (P-201): the zero baseline MUST follow the headline basis.
+        new["zero_mae_pp"] = rep["zero_mae_pp"]
         if n < min_sample:
             new["state"] = "PENDING"
             new["detail"] = (f"{n}/{min_sample} checkpoints \u2014 sample too small "
@@ -3539,7 +3741,9 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
 
 
 def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
-    """Six rows x four columns for _S1_Calibration!A4:D9."""
+    """Six rows x four columns for _S1_Calibration!A4:D9; a seventh
+    zero-forecast-baseline row (A4:D10) when TFB_S1_ZERO_BASELINE is armed
+    (v6.42.0 P-201). The caller derives the range from len(rows)."""
     leg = rep.get("legacy") or {}
     c = rep.get("counts") or {}
     a = rep.get("all_checkpoints") or {}
@@ -3554,7 +3758,7 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
     def _v(x: Any) -> Any:
         return "" if x is None else x
 
-    return [
+    _rows: List[List[Any]] = [
         ["TARGET UNIT SENTRY v6.39.0 (P-158)", "mode " + mode,
          "as_of " + ts, basis],
         ["basis", "n", "mean |err| pp", "signed pp"],
@@ -3578,6 +3782,13 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
              int(cr.get("unverified", 0))),
          "scaled %d" % int(cr.get("scaled", 0))],
     ]
+    # v6.42.0 (P-201): one extra row ONLY when the publication gate is
+    # armed, so the OFF block stays exactly six rows (A4:D9).
+    if _s1_zero_baseline_enabled():
+        _rows.append(["zero-forecast baseline (|realized|)", n,
+                      _v(leg.get("zero_mae_pp")),
+                      _v(rep.get("zero_mae_pp"))])
+    return _rows
 
 
 def _perf_unit_log_line(rep: Dict[str, Any]) -> str:
@@ -3620,9 +3831,14 @@ def _s1_checkpoint_calibration_legacy(records: Any) -> Dict[str, Any]:
         "mean_signed_error_pp": None, "band_pp": band,
         "min_sample": min_sample, "by_horizon": {},
         "detail": "no qualifying checkpoints yet",
+        # v6.42.0 (P-201): the zero-forecast baseline travels with every
+        # result, gate or no gate - only its PUBLICATION is switched.
+        "zero_mae_pp": None,
     }
     errs: List[float] = []
     per_hz: Dict[str, List[float]] = {}
+    zero_errs: List[float] = []
+    zero_per_hz: Dict[str, List[float]] = {}
     try:
         for r in (records or []):
             hz = getattr(getattr(r, "horizon", None), "value", None)
@@ -3639,6 +3855,10 @@ def _s1_checkpoint_calibration_legacy(records: Any) -> Dict[str, Any]:
             err = float(realized) - float(target)
             errs.append(err)
             per_hz.setdefault(hz, []).append(err)
+            # v6.42.0 (P-201): the same qualifying row scored against a flat
+            # 0.00 pp forecast - |realized - 0| = |realized|.
+            zero_errs.append(abs(float(realized)))
+            zero_per_hz.setdefault(hz, []).append(abs(float(realized)))
     except Exception as exc:                  # measurement never breaks a run
         out["detail"] = f"calibration_error:{type(exc).__name__}"
         return out
@@ -3646,9 +3866,11 @@ def _s1_checkpoint_calibration_legacy(records: Any) -> Dict[str, Any]:
     n = len(errs)
     out["n"] = n
     out["by_horizon"] = {
-        k: {"n": len(v), "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2)}
+        k: {"n": len(v), "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2),
+            "zero_mae_pp": _s1_zero_mae(zero_per_hz.get(k))}
         for k, v in sorted(per_hz.items()) if v
     }
+    out["zero_mae_pp"] = _s1_zero_mae(zero_errs)
     if n == 0:
         return out
     mean_abs = sum(abs(x) for x in errs) / float(n)
@@ -8431,9 +8653,21 @@ class PerformanceTrackerApp:
             return False
         try:
             rep_ = s1_checkpoint_calibration(records)
+            # v6.42.0 (P-201): the zero-forecast baseline token. Gate OFF or
+            # no sample -> "" -> every line/cell below is byte-identical to
+            # v6.41.0.
+            _zb_on = _s1_zero_baseline_enabled()
+            _zb_val = rep_.get("zero_mae_pp") if isinstance(rep_, dict) else None
+            _zb_tok = ""
+            if _zb_on and _zb_val is not None:
+                try:
+                    _zb_tok = " | zero_mae=%.2fpp" % float(_zb_val)
+                except Exception:
+                    _zb_tok = ""
             _out(
                 f"S-1 CRITERION 4 (checkpoint calibration): {rep_['state']} "
                 f"— {rep_['detail']}"
+                + _zb_tok
             )
             if not (self.store and self.store.is_available()
                     and getattr(self.store, "sheet", None)):
@@ -8464,8 +8698,24 @@ class PerformanceTrackerApp:
                 rep_["detail"],
                 SCRIPT_VERSION,
             ]
+            # v6.42.0 (P-201): S1_CAL_HEADER itself is NEVER mutated - the
+            # column is appended to a copy, so the OFF path writes exactly
+            # the v6.41.0 header and row. The Detail index is computed, not
+            # hardcoded; the scorer reads row 2 by header name, so an
+            # appended column cannot move anything it depends on.
+            hdr = list(S1_CAL_HEADER)
+            if _zb_on:
+                hdr = hdr + ["Zero MAE (pp)"]
+                if _zb_tok:
+                    try:
+                        _di = S1_CAL_HEADER.index("Detail")
+                        row[_di] = str(row[_di]) + _zb_tok
+                    except Exception as _de:
+                        logger.warning("[P-201 v6.42.0] Detail token "
+                                       "skipped: %s", _de)
+                row = row + ["" if _zb_val is None else _zb_val]
             self.store.backoff.execute_sync(
-                ws.update, "A1", [S1_CAL_HEADER, row]
+                ws.update, "A1", [hdr, row]
             )
             # v6.39.0 (P-158): the sentry report exists only when the gate
             # is armed; rows 4-9 are outside everything the S-1 consumer
@@ -8476,15 +8726,33 @@ class PerformanceTrackerApp:
                     _uts = _riyadh_now().strftime("%Y-%m-%d %H:%M:%S")
                     _uline = _perf_unit_log_line(_us)
                     _out(_uline)
-                    ws.update(values=_perf_unit_block_rows(_us, _uts),
-                              range_name="A4:D9",
+                    # v6.42.0 (P-201): the range follows the row count -
+                    # A4:D9 with the gate off, A4:D10 with the extra
+                    # zero-baseline row. Rows 10-11 are free (the
+                    # reliability factors block starts at A12).
+                    _ublk = _perf_unit_block_rows(_us, _uts)
+                    ws.update(values=_ublk,
+                              range_name="A4:D%d" % (3 + len(_ublk)),
                               value_input_option="RAW")
                     sheet.worksheet("_Run_Log").append_row(
                         [_uts, "INFO", "track_performance",
                          "Performance_Log", "UNIT_SENTRY", _uline, "", "",
                          "", json_dumps({
                              "mode": _us.get("mode"),
-                             "legacy": _us.get("legacy"),
+                             # v6.42.0 [P-201] OFF-PATH PURITY: the zero
+                             # baseline is COMPUTED unconditionally (the pure
+                             # functions always carry zero_mae_pp), but every
+                             # PUBLISHED surface stays byte-identical to
+                             # v6.41.0 until the gate is armed. rep["legacy"]
+                             # and each of its by_horizon entries now carry
+                             # zero_mae_pp, and this _Run_Log payload
+                             # serialises that mapping verbatim -- so with
+                             # TFB_S1_ZERO_BASELINE unset and
+                             # TFB_PERF_TARGET_UNIT_SENTRY=observe (the LIVE
+                             # setting in both lanes) the JSON would have
+                             # gained keys nobody armed. Strip them when the
+                             # gate is off.
+                             "legacy": _zb_strip(_us.get("legacy")),
                              "n": _us.get("n"),
                              "mean_abs_error_pp": _us.get("mean_abs_error_pp"),
                              "mean_signed_error_pp": _us.get("mean_signed_error_pp"),
@@ -8510,7 +8778,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 18   # v6.41.0: +2 (P-189b decision, P-188 cells)
+        total = 20   # v6.42.0: +2 (P-201 zero baseline, Detail token)
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -8719,6 +8987,72 @@ class PerformanceTrackerApp:
                 else:
                     os.environ["TRACK_RISK_BLANK"] = _sv18
             if _off18 == [0.0, 0.0, 1.25] and _on18 == ["", "", 1.25]:
+                passed += 1
+            # ---- v6.42.0 (P-201) ZERO-FORECAST BASELINE fixtures ------- #
+            # case 19: the zero baseline IS mean |realized| over the
+            # qualifying cohort, per horizon too, and it differs from the
+            # model MAE on the same rows. PURE: no env is read.
+            _z19 = [
+                _NS(horizon=HorizonType.WEEK_1, status=PerformanceStatus.MATURED,
+                    realized_roi=2.0, target_roi=1.0),
+                _NS(horizon=HorizonType.WEEK_1, status=PerformanceStatus.MATURED,
+                    realized_roi=-4.0, target_roi=-1.0),
+                _NS(horizon=HorizonType.WEEK_2, status=PerformanceStatus.MATURED,
+                    realized_roi=6.0, target_roi=0.0),      # no forecast: out
+                _NS(horizon=HorizonType.WEEK_1, status=PerformanceStatus.ACTIVE,
+                    realized_roi=None, target_roi=1.0),     # not matured: out
+                _NS(horizon=HorizonType.MONTH_1, status=PerformanceStatus.MATURED,
+                    realized_roi=9.0, target_roi=1.0),      # wrong horizon
+            ]
+            _r19 = _s1_checkpoint_calibration_legacy(_z19)
+            _e19 = _s1_checkpoint_calibration_legacy([])
+            if (_r19["n"] == 2 and _r19["zero_mae_pp"] == 3.0
+                    and _r19["mean_abs_error_pp"] == 2.0
+                    # v6.42.0 (hardened 2026-10-06): this read `!=`, which
+                    # is satisfied whichever way round the two MAEs are and
+                    # so proved nothing about the comparison the consumer
+                    # actually makes. Assert the DIRECTION for this cohort
+                    # (model 2.00 pp beats zero 3.00 pp) and, below, drive
+                    # the opposite direction too -- a forecast INSIDE the
+                    # band that is still worse than predicting zero, which
+                    # is the whole P-201 defect.
+                    and _r19["mean_abs_error_pp"] < _r19["zero_mae_pp"]
+                    and _s1_zero_mae([4.0, 5.0, 6.0, 5.0]) == 5.0
+                    and _s1_zero_mae([1.0, 1.0, 2.0, 2.0]) == 1.5
+                    and _s1_zero_mae([4.0, 5.0, 6.0, 5.0])
+                    > _s1_zero_mae([1.0, 1.0, 2.0, 2.0])
+                    and _r19["by_horizon"]["1W"]["zero_mae_pp"] == 3.0
+                    and _s1_zero_mae([]) is None and _s1_zero_mae(None) is None
+                    and _s1_zero_mae([1.0, 2.0]) == 1.5
+                    and _e19["n"] == 0 and _e19["zero_mae_pp"] is None):
+                passed += 1
+            # case 20: the published Detail token round-trips through a
+            # LOCAL copy of run_shadow_scorer v1.9.2's own parse_zero_mae
+            # regex (copied, never imported), and the gate reader's words.
+            _re20 = re.compile(
+                r"zero[_\s-]*(?:baseline)?[_\s-]*mae\s*[=:]?\s*"
+                r"([0-9]+(?:\.[0-9]+)?)\s*pp", re.IGNORECASE)
+            _d20 = ("mean |err| 2.00pp vs band 10.00pp over n=2"
+                    + (" | zero_mae=%.2fpp" % float(_r19["zero_mae_pp"])))
+            _m20 = _re20.search(_d20)
+            _sv20 = os.environ.get("TFB_S1_ZERO_BASELINE")
+            try:
+                os.environ.pop("TFB_S1_ZERO_BASELINE", None)
+                _c20 = _s1_zero_baseline_enabled() is False
+                for _w20 in ("1", "true", " ON ", "yes", "publish"):
+                    os.environ["TFB_S1_ZERO_BASELINE"] = _w20
+                    _c20 = _c20 and _s1_zero_baseline_enabled() is True
+                for _w20 in ("0", "off", "false", "no", "junk"):
+                    os.environ["TFB_S1_ZERO_BASELINE"] = _w20
+                    _c20 = _c20 and _s1_zero_baseline_enabled() is False
+            finally:
+                if _sv20 is None:
+                    os.environ.pop("TFB_S1_ZERO_BASELINE", None)
+                else:
+                    os.environ["TFB_S1_ZERO_BASELINE"] = _sv20
+            if (_c20 and _m20 is not None
+                    and abs(float(_m20.group(1)) - 3.0) < 1e-12
+                    and _re20.search("mean |err| 2.00pp vs band 10.00pp") is None):
                 passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__

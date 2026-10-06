@@ -28,9 +28,34 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # =============================================================================
 
 on:
-  # Production scheduler — once daily after the Riyadh close.
+  # Production scheduler - twice daily after the Riyadh close.
+  #
+  # (2026-10-06) TWO SLOTS, OFF THE HOUR. Evidence: the last 12 scheduled runs
+  # of this workflow NEVER started within 3 h of the nominal 14:00 UTC - the
+  # measured run_started_at values were 17:44, 17:57, 18:02, 18:48, 18:57,
+  # 19:05, 19:15, 20:22 and, on 2026-10-05, 21:20:52Z. GitHub's scheduler is
+  # delivering every cron in this repository 3-7 h late (daily_sync's
+  # "17 4,12,20" slots fired 09:55-11:36 / 16:28-19:42 / 23:07-00:24 and the
+  # 12:17 slot did not fire at all on 10-05), and minute 0 is the worst
+  # contended minute of the hour.
+  #
+  # WHY IT MATTERS FOR THE OUTCOME EVIDENCE: the record key is the WALL-CLOCK
+  # Riyadh date (track_performance.py: key = symbol|horizon|YYYYMMDD built from
+  # date_recorded = RiyadhTime.now()), so a run that lands after 21:00 UTC is
+  # keyed to the NEXT Riyadh day - the 21:20:52Z run on 10-05 recorded under
+  # 20261006. A day whose global-markets sync leg also failed then carries NO
+  # --record at all for that Riyadh date, and days that were never sampled
+  # cannot be recovered later.
+  #
+  # Both slots are safe to fire: the tracker is idempotent per day
+  # (PerformanceRecord.key is symbol|horizon|YYYYMMDD, SignalSnapshot.key is
+  # symbol|YYYYMMDD), so the second run writes nothing new once the first
+  # succeeded. Two earlier slots raise the probability that at least one lands
+  # inside the intended Riyadh day under the observed drift.
+  # Rollback: restore the single `- cron: "0 14 * * *"` line.
   schedule:
-    - cron: "0 14 * * *"
+    - cron: "47 11 * * *"   # 14:47 Riyadh - after the Tadawul close
+    - cron: "47 15 * * *"   # 18:47 Riyadh - backstop before Riyadh midnight
 
   # Manual trigger — use this to START THE CLOCK immediately and to verify the
   # wiring without waiting for 14:00 UTC.
@@ -56,12 +81,28 @@ on:
         type: boolean
 
 # Never overlap two clock runs (a cold Top_10 build can take ~90s).
+#
+# (2026-10-06) THIS GROUP STAYS PRIVATE. A first attempt moved it to the
+# production write lease ('tadawul-production-write-<ref>') to stop this clock
+# interleaving with daily_sync's own tracker step. Review caught that this is
+# ACTIVELY DANGEROUS: with the default single queue GitHub keeps at most ONE
+# pending run per concurrency group, and a newly queued run CANCELS the
+# existing pending one. `cancel-in-progress: false` protects only the RUNNING
+# item. So with a sync running and the next sync already queued, either clock
+# slot would have evicted that pending sync - recreating the very
+# missing-sync, missing-outcome failure this file is trying to mitigate.
+# The overlap is instead prevented by the preflight step below, which SKIPS
+# the clock run when a production write is in flight. A skip costs nothing
+# (the tracker is idempotent per Riyadh day and this workflow now has two
+# slots) and, unlike a shared lease, it can never cancel anything.
 concurrency:
   group: tfb-performance-clock
   cancel-in-progress: false
 
 permissions:
   contents: read
+  # (2026-10-06) the preflight overlap check reads the Actions API.
+  actions: read
 
 defaults:
   run:
@@ -82,13 +123,18 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v4
+        # (2026-10-06) v4 -> v6: scripts/audit_repository_workflows.py reports
+        # OUTDATED_ACTION_MAJOR on this pin, and every other production
+        # workflow in this repository already runs checkout@v6. Same inputs.
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        # (2026-10-06) v5 -> v6: same OUTDATED_ACTION_MAJOR finding; the
+        # `cache: pip` input is unchanged in v6.
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -110,8 +156,52 @@ jobs:
             exit 1
           fi
 
+      - name: 🚦 Skip if a production write is in flight
+        id: overlap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # (2026-10-06) WHY THIS EXISTS. This clock and daily_sync's own
+          # "📈 Track Performance" step run the SAME script against the SAME
+          # Performance_Log. daily_sync.yml:1131-1135 records what an overlap
+          # already cost once: "overlapping trackers append and rewrite
+          # Performance_Log from different in-memory copies (23,799 duplicate
+          # cohorts by 08-31)", and track_performance v6.41.0 still finds 27
+          # matured/matured duplicate Keys counted twice by analyze. The two
+          # workflows hold different concurrency groups by design (sharing one
+          # would let a queued clock run cancel a PENDING sync), so the
+          # overlap is prevented here instead: if a Daily Sync is queued or
+          # running, this run exits 0 WITHOUT recording.
+          # Safe to skip: the tracker is idempotent per Riyadh day
+          # (PerformanceRecord.key is symbol|horizon|YYYYMMDD), the sync's own
+          # leg records the same keys, and this workflow has a second slot.
+          # Fail-OPEN: any API problem proceeds with the run and warns. A
+          # missing day is worse than a rare overlap, and the overlap is the
+          # condition this step merely makes less likely, not a correctness
+          # guarantee.
+          RUNNING="$(curl -sS --max-time 25 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?per_page=20" \
+            | jq -r '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length' 2>/dev/null || echo "ERR")"
+
+          if [[ "$RUNNING" == "ERR" || -z "${RUNNING:-}" || ! "$RUNNING" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Could not read Daily Sync state; proceeding (fail-open)."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$RUNNING" -gt 0 ]]; then
+            echo "::notice::${RUNNING} Daily Sync run(s) queued or in progress - skipping this Performance Clock run to avoid two writers on Performance_Log. The sync's own tracker step records the same keys; the next clock slot will cover it if it does not."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "✅ No Daily Sync in flight."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: 🔎 Resolve configuration
         id: cfg
+        if: steps.overlap.outputs.skip != 'true'
         env:
           INPUT_URL: ${{ github.event.inputs.backend_url }}
           INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
@@ -136,6 +226,7 @@ jobs:
           echo "✅ Sheet:   $SHEET"
 
       - name: 💓 Backend readiness (best-effort)
+        if: steps.overlap.outputs.skip != 'true'
         run: |
           set -euo pipefail
           for ep in /readyz /health /livez; do
@@ -146,6 +237,7 @@ jobs:
 
       - name: 📈 Run performance clock
         id: run_clock
+        if: steps.overlap.outputs.skip != 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
@@ -167,6 +259,41 @@ jobs:
           # (the correct cadence -- the 15-min sync would rewrite identical
           # daily values 96x/day). Revert by removing this line or setting "0".
           TFB_SIGNAL_TRENDS_TAB: "1"
+          # ── (2026-10-06) ENV PARITY WITH THE IN-SYNC TRACKER ────────────────
+          # WHY: this clock and daily_sync.yml's "📈 Track Performance" step run
+          # the SAME script against the SAME Performance_Log, but the sync step
+          # carried three settings this block did not, so whichever lane
+          # happened to record a given Riyadh day decided the COHORT SHAPE of
+          # that day's evidence. The three lines below are mirrored verbatim
+          # from daily_sync.yml (lines 1152, 328 and 1164) and the two blocks
+          # MUST stay identical - if you change one, change the other.
+          #
+          # track_performance v6.23.0+ records "1W"/"2W" as CHECKPOINTS, not
+          # maturities: a time-scaled slice of the 1M thesis used to measure
+          # whether a position is TRACKING its forecast. Gate S-1 criterion 4
+          # ("calibration error within band on 7D/14D checkpoints") has no
+          # other input, and checkpoints need ELAPSED time - days not sampled
+          # cannot be recovered later. Default is "1M,3M".
+          # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
+          TRACK_HORIZONS: "1W,2W,1M,3M"
+          # v6.33.0 SHADOW/REGRET. ARMED ("1") - operator Option B, 2026-08-09:
+          # every Performance_Log record stamps 'Entry Selected' (col 32)
+          # YES/NO from the live board's executable tickets, and the calibrate
+          # report gains the BOARD_EXEC vs ALT_TOPK split plus the regret
+          # headline. Without it this lane writes an EMPTY stamp, which lands
+          # in NEITHER the champion nor the alternates bucket and is therefore
+          # invisible to the regret split.
+          TFB_TRACK_SHADOW_COHORTS: "1"
+          # (2026-09-22) P-158 TARGET-UNIT SENTRY - v6.39.0+.
+          # observe: criterion-4 row untouched, stored rows never rewritten;
+          # adds the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9
+          # and ONE [PERF-UNIT] _Run_Log line per run (fraction/percent/
+          # unresolved counts). Explicit words only: off|observe|enforce.
+          # KILL-SWITCH: delete this line -> off (default = legacy).
+          # Hardcoded, not a repo Variable (S-1 lesson 2026-09-10: a Variable
+          # can be silently unset). Enforce = separate sitting with the S-1
+          # criterion-4 boundary note.
+          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
           # plain secret, fall back to the _B64 variant if that is the one set.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
