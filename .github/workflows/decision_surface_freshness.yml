@@ -82,31 +82,13 @@ jobs:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_DECISION_SURFACE_MAX_AGE_H: '8'
       TFB_DECISION_SOURCE_MAX_AGE_H: '30'
-      # ── (2026-10-06) FLOORS KEPT. A 10-06 review proposed lowering these to
-      # 240 / 2350 "because the live pages measure 255 / 2,474". That was
-      # WRONG and is recorded here so nobody repeats it:
-      #   * docs/AUTOMATIC_REFRESH_COMPLETENESS_V1.md states the July 2026
-      #     defaults (ML 1,025 / GM 6,512 / CFX 453 / MF 4,496) and says in
-      #     terms: "A lower count cannot silently pass merely because the
-      #     workflow wrote some rows."
-      #   * daily_sync.yml:574-576 records the universe as OWNER-APPROVED:
-      #     "owner-approved additions take Global_Markets to 6,512 symbols
-      #     (ML 1,025 / CFX 453 / MF 4,496; 12,486 total)".
-      #   * P-163b reduced the number of cron SLOTS. It did not re-scope the
-      #     universe.
-      # So Market_Leaders carrying 255 rows is ~25% of its approved universe
-      # and Mutual_Funds 2,474 is ~55% - a REAL truncation, and these audits
-      # are correctly red. The "255/255" the cockpit reports means the sync
-      # wrote every symbol PRESENT ON THE SHEET, which is a different claim:
-      # daily_sync.yml:570-573 documents the macro symbol-loss ratchet - "the
-      # request list still comes from the sheet's Symbol column, so
-      # previously-lost symbols return only once pasted back to the page" -
-      # so a page that has lost rows reports 100% of its shrunken self for
-      # ever after. Lowering the floor would have converted that permanent
-      # loss into a green audit.
-      # The floors stay. Restoring the universe is an operator action (paste
-      # the missing symbols back into the Symbol column, or re-run
-      # scripts/build_universes.py), tracked as its own item.
+      # Keep the configured row-count contracts. The observed 255 ML and
+      # 2,474 MF rows prove a deficit against these floors, but the repository
+      # has no canonical approved-symbol manifest from which to identify the
+      # missing members or prove recommendation impact. Do not use
+      # scripts/build_universes.py to restore these Saudi pages: that script
+      # explicitly cannot regenerate them. Restore only from an owner-approved
+      # versioned list or verified Saudi-native source, after backup and diff.
       TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
       TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
       TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}

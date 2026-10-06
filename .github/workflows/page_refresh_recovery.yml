@@ -75,6 +75,12 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # A successful write can still contain last-good rows retained after an
+    # incomplete fetch. Keep the planner on the same 95% fresh-data contract as
+    # Daily Sync's inline recovery and the scheduled outcome audit.
+    env:
+      TFB_AUDIT_REQUIRE_FULL_FETCH: '1'
+      TFB_AUDIT_MIN_FRESH_PCT: '95'
     outputs:
       needs_recovery: ${{ steps.plan.outputs.needs_recovery }}
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -153,6 +159,10 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       TZ: Asia/Riyadh
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      # The post-refresh auditor below must reject a positive write whose
+      # current-run fresh coverage remains below the recovery contract.
+      TFB_AUDIT_REQUIRE_FULL_FETCH: '1'
+      TFB_AUDIT_MIN_FRESH_PCT: '95'
       TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_XPAGE_PRICE_CHECK: '1'

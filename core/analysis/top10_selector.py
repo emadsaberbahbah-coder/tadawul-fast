@@ -3,9 +3,8 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.31.0 (banner corrected 2026-10-06; TOP10_SELECTOR_VERSION
-has been the single source of truth and read 4.31.0 while this line still said
-4.21.0, ten releases behind - the per-release WHY blocks below are complete)
+Top 10 Selector — v4.31.2 (2026-10-06; hard-veto aliases are conflict-safe
+and stability ranks only admission-safe candidates)
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -49,8 +48,8 @@ rank_buffer=15, smooth_days=5):
   - EXIT GRACE: an incumbent leaves only after missing the raw result on
     `exit_days` consecutive days ("GRACE n/m missed" while holding).
   - RANK-JITTER IMMUNITY: a day an incumbent misses the raw top-N but still
-    ranks <= rank_buffer across ALL pools does NOT count against it (the grace
-    counter pauses; it does not reset).
+    ranks <= rank_buffer across all admission-safe pools does NOT count against
+    it (the grace counter pauses; it does not reset).
   - DISPLACEMENT: with seats full, a CONFIRMED challenger replaces the weakest
     incumbent only when its SMOOTHED score is higher — persistent superiority
     displaces; noise never does. Fast-track fills never displace.
@@ -678,7 +677,6 @@ logger.addHandler(logging.NullHandler())
 # ACCEPTANCE FIXTURES: 1015.KL and 5110.SR shapes must exclude regardless of
 #   score, feed or cash - never grace-held, never QUALIFIED.
 # =============================================================================
-# =============================================================================
 # v4.31.0 (2026-09-05, 10-Day Program build #2) - [BC-6] FAST-TRACK PERSISTS
 # =============================================================================
 # EVIDENCE (live 2026-09-05 _Selection_Log + this file): AEFES.IS 03:40
@@ -711,7 +709,33 @@ logger.addHandler(logging.NullHandler())
 #   (_t10_fasttrack_legacy_enabled); default ON because the only direction it
 #   moves a board is sizing-withheld -> never a new executable ticket.
 # =============================================================================
-TOP10_SELECTOR_VERSION = "4.31.0"
+# =============================================================================
+# v4.31.1 (2026-10-06) - [BC-3 SCOPE] HARD VETO COVERS MEMORYLESS ADMISSION
+# =============================================================================
+# WHY: _t10_row_hard_excluded already defined the safety contract and BC-3
+# enforced it inside _apply_selection_stability, but that function is opt-in.
+# A default build (no stability_state/config) therefore let a BUY/HOLD row with
+# investability_status=BLOCKED or final_action=DO_NOT_INVEST enter the four-pool
+# fill and take a Top-10 seat. The fresh candidate-wide engine gate could stamp
+# that contradiction immediately before selection.
+# FIX: derive admission pools by removing hard-vetoed rows under the existing
+# TFB_T10_ADMIT_LEGACY kill switch before the memoryless fill. Preserve the
+# original pools for stability so BC-2 still exclusively controls whether an
+# existing incumbent may ride grace. Top-level meta audits the vetoed symbols.
+# =============================================================================
+# =============================================================================
+# v4.31.2 (2026-10-06) - [BC-3 FOLLOW-UP] CONFLICT-SAFE VETO + SAFE RANKS
+# =============================================================================
+# WHY: the admission predicate read only the first canonical/display value,
+# so camelCase verdicts were invisible and a benign canonical value could mask
+# a conflicting BLOCKED / DO_NOT_INVEST alias. The v4.31.1 stability call also
+# ranked the unfiltered pools, allowing a vetoed challenger to consume a rank-
+# buffer position and advance a safe incumbent's exit clock.
+# FIX: scan every supported raw spelling and let any hard verdict dominate.
+# Stability now ranks admission-safe pools while using the original pools only
+# to find incumbents, preserving BC-2's opt-in hard-exit/grace policy.
+# =============================================================================
+TOP10_SELECTOR_VERSION = "4.31.2"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1224,8 +1248,8 @@ def _ensure_gate_output_keys(headers: List[str], keys: List[str]) -> Tuple[List[
 # =============================================================================
 # v4.21.0 — SELECTION STABILITY LAYER (membership hysteresis) — constants.
 # OPT-IN: engaged only when the request body carries `stability_state` and/or
-# a `stability` config mapping; with neither present, every code path below
-# is unreachable and the build is byte-identical to v4.20.0. No ENV vars.
+# a `stability` config mapping. The BC-3 admission predicate and its existing
+# kill switch are also shared by the memoryless fill as of v4.31.1.
 # =============================================================================
 STABILITY_OUTPUT_KEY_HEADERS: "OrderedDict[str, str]" = OrderedDict(
     (
@@ -1331,6 +1355,12 @@ def _t10_redact_withheld(row, status):
 
 _T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
 _T10_HARD_INVESTABILITY = frozenset({"BLOCKED"})
+_T10_FINAL_ACTION_ALIASES = (
+    "final_action", "finalAction", "Final Action",
+)
+_T10_INVESTABILITY_ALIASES = (
+    "investability_status", "investabilityStatus", "Investability Status",
+)
 
 
 def _t10_shadow_hard_legacy_enabled() -> bool:
@@ -1343,29 +1373,30 @@ def _t10_shadow_hard_legacy_enabled() -> bool:
 def _t10_row_hard_excluded(row: Any) -> bool:
     """v4.26.0 [BC-2]: True when the candidate row carries a hard safety
     verdict — final_action in {DO_NOT_INVEST, BLOCKED} or
-    investability_status = BLOCKED — read tolerantly across canonical
-    and display keys. Missing/unreadable fields -> False (fail-safe:
-    the row is treated exactly as v4.25.0 treated it).
+    investability_status = BLOCKED — read tolerantly across canonical,
+    camelCase, and display keys. Every matching raw key is inspected so a
+    benign duplicate cannot mask a hard verdict. Missing/unreadable fields
+    remain fail-safe False, exactly as v4.25.0 treated them.
     v4.30.0 [BC-5]: ALSO True when shadow_invest_eligible is the literal
     boolean False (BROKER_UNTRADABLE / MODEL_SCREEN_FAIL class), unless
     TFB_T10_SHADOW_HARD_LEGACY=1."""
-    if not isinstance(row, dict):
+    if not isinstance(row, Mapping):
         return False
     try:
-        fa = str(
-            row.get("final_action")
-            or row.get("Final Action")
-            or ""
-        ).strip().upper().replace(" ", "_")
-        if fa in _T10_HARD_ACTIONS:
-            return True
-        inv = str(
-            row.get("investability_status")
-            or row.get("Investability Status")
-            or ""
-        ).strip().upper()
-        if inv in _T10_HARD_INVESTABILITY:
-            return True
+        action_keys = frozenset(_compact_key(k) for k in _T10_FINAL_ACTION_ALIASES)
+        investability_keys = frozenset(
+            _compact_key(k) for k in _T10_INVESTABILITY_ALIASES
+        )
+        for raw_key, raw_value in row.items():
+            key = _compact_key(raw_key)
+            if key in action_keys:
+                action = str(raw_value or "").strip().upper().replace(" ", "_")
+                if action in _T10_HARD_ACTIONS:
+                    return True
+            elif key in investability_keys:
+                investability = str(raw_value or "").strip().upper()
+                if investability in _T10_HARD_INVESTABILITY:
+                    return True
         # v4.30.0 [BC-5]: the shadow board's verdict lives on this same row
         # (stamped by _apply_shadow_compliance). Strictly `is False` - the
         # writer emits bool(); anything else keeps the fail-safe default.
@@ -4402,12 +4433,17 @@ def _apply_selection_stability(
     criteria: Mapping[str, Any],
     knobs: Mapping[str, int],
     limit: int,
+    incumbent_lookup_pools: Optional[
+        Sequence[Sequence[Tuple[float, Dict[str, Any]]]]
+    ] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Apply membership hysteresis to today's raw fill result.
 
     `raw_selected` = _fill_top10_selection output (today's memoryless answer);
-    `pools` = the four pre-sorted pools (defines the all-pool global rank used
-    by the rank buffer, and supplies row objects for grace-held incumbents).
+    `pools` = admission-safe pre-sorted pools defining the global rank used by
+    the rank buffer. `incumbent_lookup_pools` may carry the original unfiltered
+    pools solely to supply row objects for grace-held incumbents; omitted means
+    `pools` supplies both roles for backward compatibility.
     Returns (stable_rows, stability_meta); stability_meta["state"] is the
     updated blob the caller must persist and post back next run.
     """
@@ -4418,17 +4454,29 @@ def _apply_selection_stability(
     symbols: Dict[str, Dict[str, Any]] = state["symbols"]
     limit = max(1, int(limit))
 
-    # ---- all-pool row map + global rank (fill order = quality order) --------
+    # ---- incumbent row map + admission-safe rank (fill order = quality) -----
     sym2row: Dict[str, Dict[str, Any]] = {}
+    lookup_pools = (
+        incumbent_lookup_pools
+        if incumbent_lookup_pools is not None
+        else pools
+    )
+    for pool in lookup_pools:
+        for _score, row in pool:
+            sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+            if sym and sym not in sym2row:
+                sym2row[sym] = row
+
     global_rank: Dict[str, int] = {}
+    ranked: set = set()
     rank = 0
     for pool in pools:
         for _score, row in pool:
             sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
-            if not sym or sym in sym2row:
+            if not sym or sym in ranked:
                 continue
+            ranked.add(sym)
             rank += 1
-            sym2row[sym] = row
             global_rank[sym] = rank
 
     raw_syms: List[str] = []
@@ -4441,7 +4489,7 @@ def _apply_selection_stability(
     raw_set = frozenset(raw_syms)
 
     # v4.27.0 [BC-3]: admission-time hard veto (see helper docstring). Row
-    # lookup prefers today's raw row, falls back to the all-pool map; a row
+    # lookup prefers today's raw row, falls back to the incumbent row map; a row
     # the predicate cannot read is fail-safe False (v4.26.0 behaviour).
     _admit_veto_on = _t10_admission_hard_veto_enabled()
     hard_vetoed_admission: List[str] = []
@@ -5156,7 +5204,33 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         filtered_count = len(t1_pass) + len(t2_pass)
         filter_relaxed = bool(selectable) and filtered_count == 0
 
-        top_rows, fill_meta = _fill_top10_selection((t1_pass, t2_pass, t1_fail, t2_fail), limit)
+        # BC-3 admission vetoes apply to the memoryless selector even when the
+        # optional stability layer is disengaged. Keep the unfiltered pools as
+        # an incumbent row lookup: an existing incumbent's hard-verdict grace/
+        # exit policy remains governed by BC-2. Stability ranks the filtered
+        # admission pools so vetoed challengers cannot consume buffer ranks.
+        stability_pools = (t1_pass, t2_pass, t1_fail, t2_fail)
+        admission_hard_veto_enabled = _t10_admission_hard_veto_enabled()
+        hard_vetoed_admission: List[str] = []
+        hard_vetoed_seen: set = set()
+        if admission_hard_veto_enabled:
+            admission_pools: Tuple[List[Tuple[float, Dict[str, Any]]], ...] = tuple(
+                [] for _ in stability_pools
+            )
+            for source_pool, target_pool in zip(stability_pools, admission_pools):
+                for entry in source_pool:
+                    row = entry[1]
+                    if _t10_row_hard_excluded(row):
+                        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+                        if sym and sym not in hard_vetoed_seen:
+                            hard_vetoed_seen.add(sym)
+                            hard_vetoed_admission.append(sym)
+                        continue
+                    target_pool.append(entry)
+        else:
+            admission_pools = stability_pools
+
+        top_rows, fill_meta = _fill_top10_selection(admission_pools, limit)
 
         # v4.21.0: membership hysteresis over today's memoryless fill result.
         # Grace-held incumbents re-enter from the pool row map (they still
@@ -5166,10 +5240,11 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         if stability_knobs is not None:
             top_rows, stability_meta = _apply_selection_stability(
                 raw_selected=top_rows,
-                pools=(t1_pass, t2_pass, t1_fail, t2_fail),
+                pools=admission_pools,
                 criteria=criteria,
                 knobs=stability_knobs,
                 limit=limit,
+                incumbent_lookup_pools=stability_pools,
             )
 
         # v4.18.0 [FIX W-6] — assemble tier / backfill labels. Internal keys
@@ -5262,6 +5337,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "projection_keys_count": len(keys),
             "admission_excluded_count": len(admission_excluded),
             "admission_excluded": [dict(x) for x in admission_excluded[:25]],
+            # BC-3 hard-verdict admission audit. This is independent of the
+            # optional stability layer; its nested audit keeps the same symbol
+            # list for stability-specific entry attempts.
+            "admission_hard_veto_enabled": admission_hard_veto_enabled,
+            "hard_vetoed_admission_count": len(hard_vetoed_admission),
+            "hard_vetoed_admission": list(hard_vetoed_admission[:25]),
             # v4.18.0 [FIX W] audit surface.
             "golden_composite_enabled": TOP10_GOLDEN_COMPOSITE_ENABLED,
             "composite_weights": dict(GOLDEN_COMPOSITE_WEIGHTS) if TOP10_GOLDEN_COMPOSITE_ENABLED else "legacy",

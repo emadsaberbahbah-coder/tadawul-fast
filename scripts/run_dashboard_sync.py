@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.44.1)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1837,7 +1837,36 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.0"
+SCRIPT_VERSION = "6.64.2"
+# -----------------------------------------------------------------------------
+# v6.64.2 (2026-10-06) - PAGE-VERDICT OLD-ROW LINEAGE TRUTH
+# -----------------------------------------------------------------------------
+# v6.64.1's exact coverage still counted a fetched row as fresh when a later
+# KLG/FW-KEEP/PV-2 stage replaced it with prior-sheet data, or a firewall left
+# only a quarantine stub. Track the unique symbols present before persistence
+# and the de-duplicated intersection later made non-current/unusable. The same
+# exact base now feeds Status, upstream verdict and PAGE-VERDICT. Fetch-failed
+# identities are captured at that origin seam, independent of their carried
+# timestamp, and retain each surface's off/observe/enforce semantics without
+# double-counting a substituted symbol.
+# An initially missing symbol restored by persistence/PV-2 was never in the
+# fetched set and is therefore never subtracted twice.
+# Completeness-accounting only: fetches, outgoing rows, writes and task exit
+# codes are unchanged; Status/feed may now report partial instead of falsely
+# complete. Functions added: 4.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v6.64.1 (2026-10-06) - PAGE-VERDICT EXACT FRESH-COVERAGE TELEMETRY
+# -----------------------------------------------------------------------------
+# The standalone outcome audit can require 95% fresh coverage, but v6.64.0
+# exposed incompleteness only through warning text. Ordinary partial fetches
+# between the runner's 70% persistence floor and the audit's 95% threshold
+# could therefore retain last-good rows and still look complete. PAGE-VERDICT
+# now always carries fresh_rows, requested_rows and fresh_pct. v6.64.1 used the
+# then-current Status/upstream arithmetic; v6.64.2 centralises and strengthens
+# that base for all three surfaces. This is logging only: fetches, writes,
+# recovery, and exit codes are unchanged. Functions added: 1.
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.64.0 (2026-09-30) - P-174 OPERATOR RETIREMENT LIST (_Retired_Symbols)
 # -----------------------------------------------------------------------------
@@ -4377,6 +4406,10 @@ _FORCE_REFETCH_TAG = "[FORCE-REFETCH v6.29.0]"
 # certification by the identity gate this pass (read by the call site for
 # the warnings line + FW-3 verdict; single-threaded sync loop).
 _LAST_KLG_ID_SUSPECTS: list = []
+# v6.64.2: every current data-free (a)-(c) KLG candidate, including one with
+# no certifiable predecessor. The single-threaded call site uses this only for
+# exact freshness lineage; substitution/output behavior remains unchanged.
+_LAST_KLG_STUB_CANDIDATES: list = []
 # v6.29.0 B-4: per-page list of forced symbols whose old-row substitution
 # was blocked this pass (read by the call site for the report line).
 _LAST_KLG_FORCED: list = []
@@ -7200,8 +7233,20 @@ def _fetchfail_truth_apply(fresh, requested: int, meta: dict,
     (a healthy leg keeps its exact v6.61.0 stamp text). Never throws."""
     try:
         m = str(mode or _fetchfail_truth_mode())
-        ff_new = int((meta or {}).get("ff_new") or 0)
-        ff_car = int((meta or {}).get("ff_carried") or 0)
+        if (
+            (meta or {}).get("fresh_lineage_known") is True
+            and (meta or {}).get("fetchfail_lineage_known") is True
+        ):
+            # v6.64.2: exact identities captured before persistence exclude
+            # appended prior rows and already-noncurrent overlaps. Do not pair
+            # them with the timestamp census's carried count: an old-stamped
+            # origin failure can appear in both buckets. Exact carried
+            # provenance is conservatively zero unless recorded explicitly.
+            ff_new = int((meta or {}).get("ff_new_fetched") or 0)
+            ff_car = int((meta or {}).get("ff_carried_fetched") or 0)
+        else:
+            ff_new = int((meta or {}).get("ff_new") or 0)
+            ff_car = int((meta or {}).get("ff_carried") or 0)
         req = int(requested or 0)
         cov_in = (round(100.0 * fresh / req, 1)
                   if (fresh is not None and req > 0) else None)
@@ -7223,6 +7268,36 @@ def _fetchfail_truth_apply(fresh, requested: int, meta: dict,
         except Exception:  # noqa: BLE001
             cov_in = None
         return fresh, cov_in, ""
+
+
+def _fresh_fetch_base(res: Any) -> Tuple[Optional[int], int]:
+    """Return the shared pre-fetchfail numerator and request denominator.
+
+    v6.64.2 exact lineage counts unique symbols returned by this fetch and
+    removes the de-duplicated subset later replaced or quarantined. Synthetic
+    and older TaskResults fall back to the established pre-row/KLG arithmetic.
+    """
+    try:
+        meta = dict(getattr(res, "_stamp_meta", None) or {})
+        requested = int(
+            meta.get("requested")
+            or getattr(res, "symbols_requested", 0)
+            or 0
+        )
+        if meta.get("fresh_lineage_known") is True:
+            fetched_origin = int(meta.get("fetched_origin") or 0)
+            noncurrent = int(meta.get("noncurrent_fetched") or 0)
+            return max(0, fetched_origin - noncurrent), requested
+        pre_rows = meta.get("pre_persist_rows")
+        klg = int(meta.get("klg_kept") or 0)
+        fresh = (
+            max(0, int(pre_rows) - klg)
+            if isinstance(pre_rows, int)
+            else None
+        )
+        return fresh, requested
+    except Exception:
+        return None, 0
 
 
 def _fetchfail_truth_selftest() -> str:
@@ -7363,15 +7438,18 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # v6.39.5 (F-09): early exits (identity fail, floor veto, guard skips)
     # stamp before the persistence stage populates _stamp_meta — fall back to
     # the leg's own symbols_requested so diagnostics keep the denominator.
-    requested = int(meta.get("requested")
-                    or getattr(res, "symbols_requested", 0) or 0)
+    fresh, requested = _fresh_fetch_base(res)
     klg = int(meta.get("klg_kept") or 0)
+    lineage_known = meta.get("fresh_lineage_known") is True
+    noncurrent = int(meta.get("noncurrent_fetched") or 0)
+    # ``preserved`` is the legacy sum of restoration counters retained for
+    # compatibility. ``noncurrent`` is the exact de-duplicated fetched-origin
+    # complement used by the fresh base. Fetchfail adjustment stays separate
+    # so its established off/observe/enforce rollout semantics remain intact.
     preserved = klg + int(meta.get("persist_restored") or 0) + int(
         meta.get("pv2_restored") or 0)
     stubbed = int(meta.get("stubbed") or 0)
     retired = int(meta.get("retired") or 0)      # v6.64.0 [P-174]
-    pre_rows = meta.get("pre_persist_rows")
-    fresh = max(0, int(pre_rows) - klg) if isinstance(pre_rows, int) else None
     cov = (round(100.0 * fresh / requested, 1)
            if (fresh is not None and requested > 0) else None)
     # v6.62.0 [P-162]: fetch-failed rows the engine returned are refresh
@@ -7405,6 +7483,7 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
            + (f" requested={requested}" if requested else "")
            + (f" fresh={fresh}" if fresh is not None else "")
            + (f" preserved={preserved}" if preserved else "")
+           + (f" noncurrent={noncurrent}" if lineage_known else "")
            + (f" stubbed={stubbed}" if stubbed else "")
            + (f" retired={retired}" if retired else "")  # v6.64.0 [P-174]
            + ff_note                                   # v6.62.0 [P-162]
@@ -8063,21 +8142,17 @@ def _upstream_verdict_max_age_min() -> int:
 
 def _uv_page_state(res: Any) -> tuple:
     """(STATE, cov_or_None) for one leg result. Mirrors the stamp's coverage
-    arithmetic (v6.39.1 P0-3) without touching the verified stamp code:
-    fresh = pre_persist_rows - klg_kept; cov = fresh/requested."""
+    arithmetic (v6.39.1 P0-3; exact lineage since v6.64.2)."""
     status = str(getattr(res, "status", "") or "").strip().lower()
     meta = dict(getattr(res, "_stamp_meta", None) or {})
-    requested = int(meta.get("requested")
-                    or getattr(res, "symbols_requested", 0) or 0)
-    pre = meta.get("pre_persist_rows")
-    klg = int(meta.get("klg_kept") or 0)
+    fresh, requested = _fresh_fetch_base(res)
     cov = None
-    if isinstance(pre, int) and requested > 0:
-        cov = round(100.0 * max(0, pre - klg) / requested, 1)
+    if fresh is not None and requested > 0:
+        cov = round(100.0 * fresh / requested, 1)
         # v6.62.0 [P-162]: the feed token consumes the SAME fetch-failed
         # correction as the stamp (enforce only; observe/off = unchanged).
         if _fetchfail_truth_mode() == "enforce":
-            cov = _fetchfail_truth_apply(max(0, pre - klg), requested, meta)[1]
+            cov = _fetchfail_truth_apply(fresh, requested, meta)[1]
     if status == "success":
         fmin = 95.0
         try:
@@ -8490,7 +8565,7 @@ def _keep_last_good_rows(
       (b) the Name cell is blank, or
       (c) v6.58.0: Data Provider in _klg_stub_providers() (default "history").
     GOOD old row: positive price AND provider not in the error set. A stub
-    whose old row is missing or not good keeps the fresh stub — the guard
+    whose old row is missing or not good keeps the incoming stub — the guard
     substitutes strictly better data or nothing.
 
     ZERO-COST FAST PATH: the matrix is pre-scanned against the NEW headers;
@@ -8502,6 +8577,7 @@ def _keep_last_good_rows(
     swapped: List[str] = []
     # v6.24.0 FW-1: fresh suspects list per invocation (read by the caller).
     del _LAST_KLG_ID_SUSPECTS[:]
+    del _LAST_KLG_STUB_CANDIDATES[:]
     del _LAST_KLG_FORCED[:]                     # v6.29.0 B-4
     _forced = _force_refetch_symbols()
     if not headers or not rows_matrix:
@@ -8540,6 +8616,7 @@ def _keep_last_good_rows(
             continue
         t = str(row[sym_i]).strip().upper()
         stub_rows.setdefault(t, []).append(r_i)
+    _LAST_KLG_STUB_CANDIDATES.extend(stub_rows.keys())
     if not stub_rows and not ff_rows:
         return rows_matrix, swapped
 
@@ -10743,6 +10820,131 @@ def _order_symbols_oldest_first(symbols: List[str],
                   key=lambda s: stamps.get(str(s).strip().upper()) or _min)
 
 
+def _fresh_symbol_lineage(
+    headers: Any, rows_matrix: Any, requested_symbols: Any = None
+) -> Tuple[set, bool]:
+    """Return unique requested pre-persistence symbols and capture certainty."""
+    try:
+        sym_i = _guard_find_col(list(headers or []), _GUARD_SYMBOL_ALIASES)
+        if sym_i < 0:
+            return set(), False
+        symbols = {
+            canonicalize_symbol(row[sym_i])
+            for row in (rows_matrix or [])
+            if isinstance(row, list)
+            and sym_i < len(row)
+            and not _guard_is_blank(row[sym_i])
+        }
+        symbols.discard("")
+        if requested_symbols is not None:
+            requested = {
+                canonicalize_symbol(symbol)
+                for symbol in (requested_symbols or [])
+            }
+            requested.discard("")
+            symbols &= requested
+        return symbols, True
+    except Exception:
+        return set(), False
+
+
+def _fetchfail_symbol_lineage(
+    headers: Any, rows_matrix: Any, fetched_origin: Any = None
+) -> Tuple[set, bool]:
+    """Return fetched-origin symbols carrying any fetch-failure marker.
+
+    Every row in this matrix came from the current provider response.  Its
+    timestamp may legitimately predate process start when the provider emits
+    a stale failure stub, so timestamp age cannot make that row fresh. When an
+    origin set is supplied, unsolicited response identities are excluded.
+    """
+    try:
+        sym_i = _guard_find_col(list(headers or []), _GUARD_SYMBOL_ALIASES)
+        if sym_i < 0:
+            return set(), False
+        warn_i = _guard_find_col(list(headers or []), _FG_WARN_ALIASES)
+        if warn_i < 0:
+            return set(), True
+        symbols: set = set()
+        for row in (rows_matrix or []):
+            if (
+                not isinstance(row, list)
+                or sym_i >= len(row)
+                or _guard_is_blank(row[sym_i])
+            ):
+                continue
+            warning = (
+                str(row[warn_i])
+                if warn_i < len(row) and row[warn_i] is not None
+                else ""
+            )
+            if not _FG_FETCHFAIL_RE.search(warning):
+                continue
+            symbol = canonicalize_symbol(row[sym_i])
+            if symbol:
+                symbols.add(symbol)
+        if fetched_origin is not None:
+            origin = {
+                canonicalize_symbol(symbol)
+                for symbol in (fetched_origin or set())
+            }
+            origin.discard("")
+            symbols &= origin
+        return symbols, True
+    except Exception:
+        return set(), False
+
+
+def _merge_noncurrent_fetched_lineage(
+    fetched_origin: Any, current: Any, noncurrent_symbols: Any
+) -> set:
+    """Union unusable/replaced identities that originated in this fetch."""
+    try:
+        origin = {
+            canonicalize_symbol(symbol)
+            for symbol in (fetched_origin or set())
+            if str(symbol or "").strip()
+        }
+        merged = {
+            canonicalize_symbol(symbol)
+            for symbol in (current or set())
+            if str(symbol or "").strip()
+        }
+        noncurrent = {
+            canonicalize_symbol(symbol)
+            for symbol in (noncurrent_symbols or [])
+            if str(symbol or "").strip()
+        }
+        origin.discard("")
+        merged.discard("")
+        noncurrent.discard("")
+        return merged | (origin & noncurrent)
+    except Exception:
+        return set(current or set())
+
+
+def _page_fresh_fetch_metrics(res: Any) -> Tuple[Optional[int], int, Optional[float]]:
+    """Return the exact fresh-row numerator, request denominator and percent.
+
+    All surfaces share _fresh_fetch_base. PAGE telemetry then enforces the
+    factual fetch-failure adjustment even while workbook/feed rollout remains
+    observe. Exact lineage uses origin identities; legacy/unknown lineage uses
+    the final census. Unknown coverage stays explicit as ``None``.
+    """
+    try:
+        meta = dict(getattr(res, "_stamp_meta", None) or {})
+        fresh, requested = _fresh_fetch_base(res)
+        # Audit telemetry always reports the factual numerator. The workflow
+        # may keep workbook/feed fetchfail truth in observe mode; PAGE enforces
+        # the disjoint exact-origin count (or the legacy final census).
+        fresh, coverage, _note = _fetchfail_truth_apply(
+            fresh, requested, meta, mode="enforce"
+        )
+        return fresh, requested, coverage
+    except Exception:
+        return None, 0, None
+
+
 def _apply_stale_skip_escalation(results: List["TaskResult"], sheets: Any,
                                  spreadsheet_id: str) -> None:
     """v6.26.0 post-run pass (see header WHY block). Mutates TaskResult
@@ -10775,10 +10977,15 @@ def _apply_stale_skip_escalation(results: List["TaskResult"], sheets: Any,
                 logger.error(r.error)
         try:
             reason = (r.warnings[0] if r.warnings else (r.error or "clean"))
+            fresh, requested, fresh_pct = _page_fresh_fetch_metrics(r)
             logger.info(
                 "%s page=%s status=%s rows_written=%d "
+                "fresh_rows=%s requested_rows=%s fresh_pct=%s "
                 "newest_stamp_age_h=%s reason=%s",
                 _PAGE_VERDICT_TAG, r.sheet_name, r.status, r.rows_written,
+                str(fresh) if fresh is not None else "NA",
+                str(requested) if requested > 0 else "NA",
+                ("%.4f" % fresh_pct) if fresh_pct is not None else "NA",
                 ("%.1f" % age) if age is not None else "NA",
                 str(reason)[:120])
         except Exception:
@@ -10802,7 +11009,14 @@ async def _run_one_task(
     res.dry_run = bool(dry_run)
     headers = None  # v6.39.3: finally-stamp reads this; must exist on every exit
     res._stamp_meta = {"requested": 0, "pre_persist_rows": None, "klg_kept": 0,
-                       "persist_restored": 0, "pv2_restored": 0, "stubbed": 0}
+                       "persist_restored": 0, "pv2_restored": 0, "stubbed": 0,
+                       "fresh_lineage_known": False, "fetched_origin": 0,
+                       "noncurrent_fetched": 0,
+                       "fetchfail_lineage_known": False,
+                       "ff_new_fetched": 0, "ff_carried_fetched": 0}
+    _fetched_origin_symbols: set = set()
+    _noncurrent_fetched_symbols: set = set()
+    _fetchfail_origin_symbols: set = set()
 
     try:
         canon_task_key = _canon_key(task.key)
@@ -11575,6 +11789,28 @@ async def _run_one_task(
             try:
                 res._stamp_meta["requested"] = len(symbols or [])
                 res._stamp_meta["pre_persist_rows"] = len(rows_matrix or [])
+                (
+                    _fetched_origin_symbols,
+                    _fresh_lineage_known,
+                ) = _fresh_symbol_lineage(headers, rows_matrix, symbols)
+                res._stamp_meta["fresh_lineage_known"] = _fresh_lineage_known
+                if _fresh_lineage_known:
+                    res._stamp_meta["fetched_origin"] = len(
+                        _fetched_origin_symbols
+                    )
+                    (
+                        _fetchfail_origin_symbols,
+                        _fetchfail_lineage_known,
+                    ) = _fetchfail_symbol_lineage(
+                        headers, rows_matrix, _fetched_origin_symbols
+                    )
+                    res._stamp_meta["fetchfail_lineage_known"] = (
+                        _fetchfail_lineage_known
+                    )
+                    if _fetchfail_lineage_known:
+                        res._stamp_meta["ff_new_fetched"] = len(
+                            _fetchfail_origin_symbols
+                        )
                 rows_matrix, _kept_syms = _persist_missing_symbol_rows(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix, symbols
                 )
@@ -11599,8 +11835,9 @@ async def _run_one_task(
         # with a DATA-FREE ERROR STUB is "present", passes every membership
         # guard, and overwrites the last good row (the Global_Markets
         # fallback_error erosion, 2026-07-10). Swap each stub for the symbol's
-        # existing GOOD row; a stub with no good predecessor stays fresh. Zero
-        # stubs (the normal healthy sync) costs zero extra reads.
+        # existing GOOD row; a stub with no good predecessor stays in the
+        # output but exact telemetry counts it noncurrent. Zero stubs (the
+        # normal healthy sync) costs zero extra reads.
         # TFB_SYNC_KEEP_LAST_GOOD=0 restores v6.22.2 exactly.
         if (_keep_last_good_enabled() and task.expects_rows
                 and rows_matrix and headers and sheets is not None
@@ -11611,6 +11848,20 @@ async def _run_one_task(
                 )
                 if _klg_syms:
                     res._stamp_meta["klg_kept"] = len(_klg_syms)
+                    _noncurrent_fetched_symbols = (
+                        _merge_noncurrent_fetched_lineage(
+                            _fetched_origin_symbols,
+                            _noncurrent_fetched_symbols,
+                            _klg_syms,
+                        )
+                    )
+                    res._stamp_meta["noncurrent_fetched"] = len(
+                        _noncurrent_fetched_symbols
+                    )
+                    res._stamp_meta["ff_new_fetched"] = len(
+                        _fetchfail_origin_symbols
+                        - _noncurrent_fetched_symbols
+                    )
                     _kw = (
                         f"{_KEEP_LAST_GOOD_TAG} substituted {len(_klg_syms)} "
                         f"error-stub row(s) with last-good data on "
@@ -11654,6 +11905,26 @@ async def _run_one_task(
                 res.warnings.append(_kw)
                 logger.warning(_kw)
                 _idfw_klg_suspects = []
+            finally:
+                # v6.64.2: candidate capture happens before the prior-sheet
+                # read. Consume it even when that read raises; the outgoing
+                # data-free stub is still unusable/noncurrent.
+                _klg_candidates = list(_LAST_KLG_STUB_CANDIDATES)
+                if _klg_candidates:
+                    _noncurrent_fetched_symbols = (
+                        _merge_noncurrent_fetched_lineage(
+                            _fetched_origin_symbols,
+                            _noncurrent_fetched_symbols,
+                            _klg_candidates,
+                        )
+                    )
+                    res._stamp_meta["noncurrent_fetched"] = len(
+                        _noncurrent_fetched_symbols
+                    )
+                    res._stamp_meta["ff_new_fetched"] = len(
+                        _fetchfail_origin_symbols
+                        - _noncurrent_fetched_symbols
+                    )
             # v6.29.0 B-4: forced-refetch visibility — report the INCOMING
             # identity for every forced symbol so a provider re-sending the
             # wrong instrument is caught on the very next run.
@@ -11723,6 +11994,20 @@ async def _run_one_task(
                             s for s in _fab_stripped if s not in _seen_strip
                         ]
                 if _idfw_stripped:
+                    _noncurrent_fetched_symbols = (
+                        _merge_noncurrent_fetched_lineage(
+                            _fetched_origin_symbols,
+                            _noncurrent_fetched_symbols,
+                            _idfw_stripped,
+                        )
+                    )
+                    res._stamp_meta["noncurrent_fetched"] = len(
+                        _noncurrent_fetched_symbols
+                    )
+                    res._stamp_meta["ff_new_fetched"] = len(
+                        _fetchfail_origin_symbols
+                        - _noncurrent_fetched_symbols
+                    )
                     _fw = (
                         f"{_IDFW_TAG} quarantined {len(_idfw_stripped)} "
                         f"identity-broken outgoing row(s) on "
@@ -11740,6 +12025,7 @@ async def _run_one_task(
                     # re-tag Warnings so the quarantine stays visible. New
                     # symbols with no last-good remain stubs (correct).
                     if _fw_keep_last_good_enabled() and sheets is not None:
+                        _fwk_restored: List[str] = []
                         try:
                             rows_matrix, _fwk_restored = _keep_last_good_rows(
                                 sheets, spreadsheet_id, task.sheet_name,
@@ -11775,6 +12061,27 @@ async def _run_one_task(
                                 "[v6.25.1 FW-KEEP] restore skipped on '%s': %s",
                                 task.sheet_name, _ke,
                             )
+                        finally:
+                            # Candidate capture precedes KLG's prior-sheet
+                            # read. Consume it even if that read or the later
+                            # FW retagging raises.
+                            _fwk_candidates = list(
+                                _LAST_KLG_STUB_CANDIDATES
+                            )
+                            _noncurrent_fetched_symbols = (
+                                _merge_noncurrent_fetched_lineage(
+                                    _fetched_origin_symbols,
+                                    _noncurrent_fetched_symbols,
+                                    list(_fwk_restored) + _fwk_candidates,
+                                )
+                            )
+                            res._stamp_meta["noncurrent_fetched"] = len(
+                                _noncurrent_fetched_symbols
+                            )
+                            res._stamp_meta["ff_new_fetched"] = len(
+                                _fetchfail_origin_symbols
+                                - _noncurrent_fetched_symbols
+                            )
             except Exception as _fe:
                 logger.warning("%s outgoing firewall skipped: %s", _IDFW_TAG, _fe)
 
@@ -11786,6 +12093,21 @@ async def _run_one_task(
             rows_matrix, _idfw_dup_groups, _idfw_dup_quar = _name_dedup_apply(
                 headers, rows_matrix
             )
+            if _idfw_dup_quar:
+                _noncurrent_fetched_symbols = (
+                    _merge_noncurrent_fetched_lineage(
+                        _fetched_origin_symbols,
+                        _noncurrent_fetched_symbols,
+                        _idfw_dup_quar,
+                    )
+                )
+                res._stamp_meta["noncurrent_fetched"] = len(
+                    _noncurrent_fetched_symbols
+                )
+                res._stamp_meta["ff_new_fetched"] = len(
+                    _fetchfail_origin_symbols
+                    - _noncurrent_fetched_symbols
+                )
             if _idfw_dup_groups:
                 _dw = (
                     f"{_IDFW_TAG} name_dup: {len(_idfw_dup_groups)} Name(s) on "
@@ -11817,6 +12139,20 @@ async def _run_one_task(
                 if (failure.symbol, failure.reason) not in _known_critical_failures
             )
             if _critical_identity_failures:
+                _noncurrent_fetched_symbols = (
+                    _merge_noncurrent_fetched_lineage(
+                        _fetched_origin_symbols,
+                        _noncurrent_fetched_symbols,
+                        [f.symbol for f in _critical_identity_failures],
+                    )
+                )
+                res._stamp_meta["noncurrent_fetched"] = len(
+                    _noncurrent_fetched_symbols
+                )
+                res._stamp_meta["ff_new_fetched"] = len(
+                    _fetchfail_origin_symbols
+                    - _noncurrent_fetched_symbols
+                )
                 _cf = (
                     "[CRITICAL-IDENTITY v1.0.0] quarantined "
                     f"{len(_critical_identity_failures)} exact identity mismatch(es) "
@@ -11930,6 +12266,20 @@ async def _run_one_task(
                         sheets, spreadsheet_id, task.sheet_name, headers,
                         rows_matrix, symbols)
                     res._stamp_meta["pv2_restored"] = len(_kept2 or [])
+                    _noncurrent_fetched_symbols = (
+                        _merge_noncurrent_fetched_lineage(
+                            _fetched_origin_symbols,
+                            _noncurrent_fetched_symbols,
+                            _kept2,
+                        )
+                    )
+                    res._stamp_meta["noncurrent_fetched"] = len(
+                        _noncurrent_fetched_symbols
+                    )
+                    res._stamp_meta["ff_new_fetched"] = len(
+                        _fetchfail_origin_symbols
+                        - _noncurrent_fetched_symbols
+                    )
                     if _kept2:
                         _p2 = (f"[PERSIST v6.34.0] second-chance pass restored "
                                f"{len(_kept2)} row(s) dropped by later stages on "
@@ -11963,6 +12313,20 @@ async def _run_one_task(
                 rows_matrix, _plq = _apply_operator_quarantine(headers, rows_matrix)
                 if _plq:
                     res._stamp_meta["stubbed"] += len(_plq)
+                    _noncurrent_fetched_symbols = (
+                        _merge_noncurrent_fetched_lineage(
+                            _fetched_origin_symbols,
+                            _noncurrent_fetched_symbols,
+                            _plq,
+                        )
+                    )
+                    res._stamp_meta["noncurrent_fetched"] = len(
+                        _noncurrent_fetched_symbols
+                    )
+                    res._stamp_meta["ff_new_fetched"] = len(
+                        _fetchfail_origin_symbols
+                        - _noncurrent_fetched_symbols
+                    )
                     _pl = (f"[PL-1 v6.37.0] operator quarantine stubbed "
                            f"{len(_plq)} row(s) on '{task.sheet_name}': "
                            f"{', '.join(_plq[:12])}"

@@ -22,8 +22,10 @@ composite's weights (those belong to the golden-composite suite):
   6. a v1 state blob (no `hs` key) is read as the engine scale.
 """
 
+import asyncio
 import importlib
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -309,6 +311,291 @@ def test_confirmed_entry_is_never_flagged_fast_track(monkeypatch):
     assert meta["audit"]["fast_tracked"] == []
     assert meta["state"]["symbols"]["CHA.SR"]["ft"] is False
     assert meta["audit"]["fast_track_unconfirmed"] == []
+
+
+# --------------------------------------------------------------------------- #
+# 8. v4.31.1/v4.31.2 [BC-3 scope] — hard veto applies without stability state
+# --------------------------------------------------------------------------- #
+def _hard_veto_candidate(symbol, score, *, investability, final_action):
+    return {
+        "symbol": symbol,
+        "ticker": symbol,
+        "current_price": 10.0,
+        "forecast_confidence": 80.0,
+        "forecast_reliability_score": 80.0,
+        "expected_roi_3m": 0.10,
+        "recommendation": "HOLD",
+        "investability_status": investability,
+        "final_action": final_action,
+        "overall_score": score,
+        "opportunity_score": score,
+        "conviction_score": score,
+    }
+
+
+def _run_hard_veto_build(mod, monkeypatch, rows, criteria, *,
+                         stability_spy=None, legacy=False):
+    monkeypatch.setenv("TFB_T10_ADMIT_LEGACY", "1" if legacy else "")
+    monkeypatch.setattr(
+        mod, "_resolve_engine",
+        AsyncMock(return_value=(object(), "hard-veto-test")),
+    )
+    monkeypatch.setattr(
+        mod, "_collect_candidate_rows",
+        AsyncMock(return_value=([dict(row) for row in rows], {})),
+    )
+    # Start with authoritative gate verdicts rather than coupling this
+    # selector-scope regression to the engine gate's input contract.
+    monkeypatch.setattr(
+        mod, "_apply_final_gate", lambda candidates: (len(candidates), 0, True),
+    )
+    if stability_spy is not None:
+        monkeypatch.setattr(mod, "_apply_selection_stability", stability_spy)
+    return asyncio.run(mod._build_top10_rows_async(criteria=criteria))
+
+
+@pytest.mark.parametrize(("raw_key", "hard_value"), [
+    ("final_action", "DO_NOT_INVEST"),
+    ("finalAction", "DO_NOT_INVEST"),
+    ("Final Action", "BLOCKED"),
+    ("investability_status", "BLOCKED"),
+    ("investabilityStatus", "BLOCKED"),
+    ("Investability Status", "BLOCKED"),
+])
+def test_hard_veto_reads_every_supported_raw_alias(
+        monkeypatch, raw_key, hard_value):
+    mod = _fresh(monkeypatch)
+    assert mod._t10_row_hard_excluded({raw_key: hard_value}) is True
+
+
+@pytest.mark.parametrize("row", [
+    {"final_action": "INVEST", "finalAction": "DO_NOT_INVEST"},
+    {"finalAction": "INVEST", "Final Action": "BLOCKED"},
+    {"investability_status": "INVESTABLE", "investabilityStatus": "BLOCKED"},
+    {"investabilityStatus": "WATCHLIST", "Investability Status": "BLOCKED"},
+])
+def test_any_hard_alias_dominates_conflicting_benign_value(monkeypatch, row):
+    mod = _fresh(monkeypatch)
+    assert mod._t10_row_hard_excluded(row) is True
+
+
+def test_memoryless_fill_excludes_hard_veto_and_uses_next_candidate(monkeypatch):
+    mod = _fresh(monkeypatch)
+    blocked = _hard_veto_candidate(
+        "BLOCKED.SR", 99.0,
+        investability="BLOCKED", final_action="DO_NOT_INVEST",
+    )
+    safe = _hard_veto_candidate(
+        "SAFE.SR", 50.0,
+        investability="WATCHLIST", final_action="WATCH",
+    )
+
+    payload = _run_hard_veto_build(
+        mod, monkeypatch, [blocked, safe],
+        {"limit": 1, "include_headers": False, "include_matrix": False},
+    )
+
+    assert [row["symbol"] for row in payload["rows"]] == ["SAFE.SR"]
+    assert "stability" not in payload["meta"]
+    assert payload["meta"]["admission_hard_veto_enabled"] is True
+    assert payload["meta"]["hard_vetoed_admission_count"] == 1
+    assert payload["meta"]["hard_vetoed_admission"] == ["BLOCKED.SR"]
+
+
+@pytest.mark.parametrize(("raw_key", "hard_value"), [
+    ("finalAction", "DO_NOT_INVEST"),
+    ("Final Action", "BLOCKED"),
+    ("investabilityStatus", "BLOCKED"),
+    ("Investability Status", "BLOCKED"),
+])
+def test_memoryless_fill_excludes_hard_alias_despite_benign_canonical_value(
+        monkeypatch, raw_key, hard_value):
+    mod = _fresh(monkeypatch)
+    blocked = _hard_veto_candidate(
+        "ALIAS-BLOCKED.SR", 99.0,
+        investability="INVESTABLE", final_action="INVEST",
+    )
+    blocked[raw_key] = hard_value
+    safe = _hard_veto_candidate(
+        "SAFE.SR", 50.0,
+        investability="WATCHLIST", final_action="WATCH",
+    )
+
+    payload = _run_hard_veto_build(
+        mod, monkeypatch, [blocked, safe],
+        {"limit": 1, "include_headers": False, "include_matrix": False},
+    )
+
+    assert [row["symbol"] for row in payload["rows"]] == ["SAFE.SR"]
+    assert payload["meta"]["hard_vetoed_admission"] == ["ALIAS-BLOCKED.SR"]
+
+
+def test_memoryless_hard_veto_kill_switch_restores_legacy_fill(monkeypatch):
+    mod = _fresh(monkeypatch)
+    blocked = _hard_veto_candidate(
+        "BLOCKED.SR", 99.0,
+        investability="BLOCKED", final_action="DO_NOT_INVEST",
+    )
+    safe = _hard_veto_candidate(
+        "SAFE.SR", 50.0,
+        investability="WATCHLIST", final_action="WATCH",
+    )
+
+    payload = _run_hard_veto_build(
+        mod, monkeypatch, [blocked, safe],
+        {"limit": 1, "include_headers": False, "include_matrix": False},
+        legacy=True,
+    )
+
+    assert [row["symbol"] for row in payload["rows"]] == ["BLOCKED.SR"]
+    assert payload["meta"]["admission_hard_veto_enabled"] is False
+    assert payload["meta"]["hard_vetoed_admission_count"] == 0
+    assert payload["meta"]["hard_vetoed_admission"] == []
+
+
+def test_memoryless_veto_splits_safe_ranks_from_incumbent_lookup(monkeypatch):
+    mod = _fresh(monkeypatch)
+    blocked = _hard_veto_candidate(
+        "BLOCKED.SR", 99.0,
+        investability="BLOCKED", final_action="DO_NOT_INVEST",
+    )
+    safe = _hard_veto_candidate(
+        "SAFE.SR", 50.0,
+        investability="WATCHLIST", final_action="WATCH",
+    )
+    observed = {}
+
+    def stability_spy(*, raw_selected, pools, criteria, knobs, limit,
+                      incumbent_lookup_pools=None):
+        observed["raw"] = [row["symbol"] for row in raw_selected]
+        observed["rank_pool"] = [
+            row["symbol"] for pool in pools for _score, row in pool
+        ]
+        observed["lookup_pool"] = [
+            row["symbol"]
+            for pool in (incumbent_lookup_pools or ())
+            for _score, row in pool
+        ]
+        return list(raw_selected), {"state": {}, "audit": {}}
+
+    _run_hard_veto_build(
+        mod, monkeypatch, [blocked, safe],
+        {
+            "limit": 1,
+            "include_headers": False,
+            "include_matrix": False,
+            "stability_state": {},
+        },
+        stability_spy=stability_spy,
+    )
+
+    assert observed["raw"] == ["SAFE.SR"]
+    assert observed["rank_pool"] == ["SAFE.SR"]
+    assert set(observed["lookup_pool"]) == {"BLOCKED.SR", "SAFE.SR"}
+
+
+def _incumbent_state(symbol, score):
+    return {
+        "v": 2,
+        "date": "2026-10-05",
+        "symbols": {
+            symbol: {
+                "ci": 3,
+                "co": 0,
+                "member": True,
+                "since": "2026-10-01",
+                "ls": "2026-10-05",
+                "hist": [score],
+                "hs": "engine",
+                "ft": False,
+            },
+        },
+    }
+
+
+def test_vetoed_challenger_does_not_consume_rank_buffer(monkeypatch):
+    mod = _fresh(monkeypatch)
+    monkeypatch.setattr(mod, "_stability_today_key", lambda: "2026-10-06")
+    blocked = _hard_veto_candidate(
+        "BLOCKED.SR", 100.0,
+        investability="BLOCKED", final_action="DO_NOT_INVEST",
+    )
+    challenger = _hard_veto_candidate(
+        "CHALLENGER.SR", 90.0,
+        investability="INVESTABLE", final_action="INVEST",
+    )
+    incumbent = _hard_veto_candidate(
+        "INCUMBENT.SR", 80.0,
+        investability="INVESTABLE", final_action="INVEST",
+    )
+
+    payload = _run_hard_veto_build(
+        mod, monkeypatch, [blocked, challenger, incumbent],
+        {
+            "limit": 1,
+            "include_headers": False,
+            "include_matrix": False,
+            "stability_state": _incumbent_state("INCUMBENT.SR", 80.0),
+            "stability": {
+                "confirm_days": 3,
+                "exit_days": 3,
+                "rank_buffer": 2,
+                "smooth_days": 5,
+            },
+        },
+    )
+
+    stability = payload["meta"]["stability"]
+    incumbent_state = stability["state"]["symbols"]["INCUMBENT.SR"]
+    assert incumbent_state["co"] == 0
+    assert stability["audit"]["held_by_grace"] == [{
+        "symbol": "INCUMBENT.SR",
+        "missed_days": 0,
+        "exit_days": 3,
+        "all_pool_rank": 2,
+    }]
+
+
+def test_blocked_incumbent_remains_available_for_bc2_grace(monkeypatch):
+    mod = _fresh(monkeypatch)
+    monkeypatch.delenv("TFB_T10_HARD_EXCLUDE_OVER_GRACE", raising=False)
+    monkeypatch.setattr(mod, "_stability_today_key", lambda: "2026-10-06")
+    incumbent = _hard_veto_candidate(
+        "BLOCKED-INC.SR", 100.0,
+        investability="BLOCKED", final_action="DO_NOT_INVEST",
+    )
+    challenger = _hard_veto_candidate(
+        "CHALLENGER.SR", 90.0,
+        investability="INVESTABLE", final_action="INVEST",
+    )
+
+    payload = _run_hard_veto_build(
+        mod, monkeypatch, [incumbent, challenger],
+        {
+            "limit": 1,
+            "include_headers": False,
+            "include_matrix": False,
+            "stability_state": _incumbent_state("BLOCKED-INC.SR", 100.0),
+            "stability": {
+                "confirm_days": 3,
+                "exit_days": 3,
+                "rank_buffer": 2,
+                "smooth_days": 5,
+            },
+        },
+    )
+
+    assert [row["symbol"] for row in payload["rows"]] == ["BLOCKED-INC.SR"]
+    stability = payload["meta"]["stability"]
+    assert stability["audit"]["exited_hard"] == []
+    assert stability["audit"]["exited_verdict"] == []
+    assert stability["state"]["symbols"]["BLOCKED-INC.SR"]["co"] == 1
+    assert stability["audit"]["held_by_grace"] == [{
+        "symbol": "BLOCKED-INC.SR",
+        "missed_days": 1,
+        "exit_days": 3,
+        "all_pool_rank": None,
+    }]
 
 
 def teardown_module(_module):
