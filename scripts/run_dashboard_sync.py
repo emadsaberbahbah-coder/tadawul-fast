@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.6)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.7)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1843,7 +1843,9 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.6"
+SCRIPT_VERSION = "6.64.7"
+# v6.64.7: fill only a blank final portfolio display Name from an unambiguous
+# guarded active-ledger label, with explicit provenance after identity guards.
 # v6.64.6: portfolio rebuild uses one validated active-ledger snapshot for
 # the explicit fetch cohort, native-currency holdings and final membership.
 # Unknown/ambiguous inputs never fall back to backend default instruments.
@@ -3827,6 +3829,29 @@ def _find_pnl_pct_col(headers: List[Any]) -> int:
     return -1
 
 
+def _portfolio_ledger_name(value: Any, symbol: str) -> Optional[str]:
+    """An operator display label is optional; it is never issuer identity proof."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or name.casefold() in {
+            "n/a", "na", "none", "null", "unknown", "unavailable", "undefined",
+            "nan", "inf", "-", "--", "name", "symbol", "ticker"}:
+        return None
+    if name.upper() in {symbol, symbol.rsplit(".", 1)[0]}:
+        return None
+    try:
+        float(name.replace(",", ""))
+        return None  # Numeric text cannot prove a display label either.
+    except ValueError:
+        pass
+    if _name_is_fabricated(name) or any(
+            name.casefold().startswith(page.casefold() + " ")
+            for page in _FABRICATED_NAME_PAGES):
+        return None
+    return name
+
+
 def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
     """Read one complete, unambiguous active-ledger snapshot.
 
@@ -3855,6 +3880,8 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
             return {}
         columns.append(found[0])
     s_i, status_i, q_i, c_i, ccy_i = columns
+    name_columns = [i for i, name in enumerate(names) if name in _GUARD_NAME_ALIASES]
+    name_i = name_columns[0] if len(name_columns) == 1 else -1
     out: Dict[str, Dict[str, Any]] = {}
     for row in grid[header_row + 1:]:
         if not isinstance(row, list):
@@ -3886,6 +3913,9 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
                 or not re.fullmatch(r"[A-Z]{3}", currency) or sym in out):
             return {}
         out[sym] = {"qty": qty, "cost": cost, "currency": currency}
+        name = _portfolio_ledger_name(row[name_i], sym) if 0 <= name_i < len(row) else None
+        if name is not None:
+            out[sym]["name"] = name
     return out
 
 
@@ -3941,15 +3971,17 @@ def _read_portfolio_acquisition_symbols(
 def _inject_portfolio_holdings(
     headers: List[Any],
     rows_matrix: List[List[Any]],
-    cost_basis: Dict[str, Dict[str, Any]],
+    cost_basis: Dict[str, Dict[str, Any]], *, include_ledger_name: bool = False,
 ) -> Tuple[List[List[Any]], int]:
     """Apply ledger inputs and reproduce the engine's native position math.
 
     Canonical Position Cost/Value/P&L use the quote's native currency; percent
     is in percentage points. Explicit SAR columns are separate and require
     positive native and SAR prices to establish their conversion. This helper
-    changes neither quote provenance nor manual decisions/notes. The caller
-    validates currency and membership before publication.
+    changes neither quote provenance nor manual decisions/notes. Optional
+    display-label fallback runs only after existing identity/eligibility guards
+    in the final injection pass, with its own provenance. The caller validates
+    currency and membership before publication.
     """
     if not headers or not rows_matrix or not cost_basis:
         return rows_matrix, 0
@@ -3969,6 +4001,10 @@ def _inject_portfolio_holdings(
     pnl_sar_i = _guard_find_col(headers, _PM_PNLSAR_ALIASES)
     pct_i = _find_pnl_pct_col(headers)
     cls_i = _guard_find_col(headers, _PM_ASSETCLASS_ALIASES)
+    name_columns = [i for i, h in enumerate(headers) if _guard_norm(h) in _GUARD_NAME_ALIASES]
+    warning_columns = [i for i, h in enumerate(headers) if _guard_norm(h) in _FG_WARN_ALIASES]
+    name_i = name_columns[0] if len(name_columns) == 1 else -1
+    warning_i = warning_columns[0] if len(warning_columns) == 1 else -1
     fi_syms = _fixed_income_symbols()
 
     width = len(headers)
@@ -3981,6 +4017,15 @@ def _inject_portfolio_holdings(
         sym = str(rr[sym_i]).strip().upper() if sym_i < len(rr) and rr[sym_i] is not None else ""
         hold = cost_basis.get(sym)
         if hold:
+            ledger_name = _portfolio_ledger_name(hold.get("name"), sym)
+            if (include_ledger_name and name_i >= 0 and warning_i >= 0
+                    and (rr[warning_i] is None or isinstance(rr[warning_i], str))
+                    and _guard_is_blank(rr[name_i]) and ledger_name is not None):
+                rr[name_i] = ledger_name
+                provenance = "name_source:portfolio_ledger"
+                warning = str(rr[warning_i]) if rr[warning_i] is not None else ""
+                if provenance not in {token.strip() for token in warning.split(";")}:
+                    rr[warning_i] = (warning + "; " + provenance) if warning else provenance
             qty = hold["qty"]
             buy = hold["cost"]
             rr[qty_i] = qty
@@ -12789,7 +12834,7 @@ async def _run_one_task(
         # and a brand-new omitted holding cannot silently disappear.
         if _pf_cost_basis:
             rows_matrix, _pf_injected = _inject_portfolio_holdings(
-                headers, rows_matrix, _pf_cost_basis)
+                headers, rows_matrix, _pf_cost_basis, include_ledger_name=True)
             _pf_safe, _pf_reason = _portfolio_holdings_contract(
                 headers, rows_matrix, _pf_cost_basis, require_complete=True)
             if not _pf_safe or _pf_injected != len(_pf_cost_basis):
