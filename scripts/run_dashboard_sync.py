@@ -1843,7 +1843,21 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.7"
+SCRIPT_VERSION = "6.64.8"
+# v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
+# WHY: v6.64.6 compares the quote Currency with the ledger currency after
+#   .upper() on both sides. The engine quotes .L in pence as 'GBp'
+#   (data_engine_v2 suffix table; pence must be matched case-sensitively),
+#   while the ledger reader only admits a 3-letter major code. 'GBp' upper-
+#   cases to 'GBP', so a pence quote passes against a pounds ledger and
+#   Position Value / Unrealized P/L publish 100x (synthetic VOD.L: 100 sh at
+#   25.00 GBP, quote 2600 GBp -> value 260,000, P/L 257,500, P/L% 10,300).
+# WHAT (one site, _portfolio_holdings_contract): with
+#   TFB_PF_MINOR_UNIT_CCY_GUARD=1 a holding whose RAW quote currency is a
+#   minor unit (GBp, GBX, ZAc, ZAC, ILA) is rejected as a currency mismatch,
+#   so the existing fail-closed path keeps the prior portfolio page.
+# OFF (unset/0): byte-identical v6.64.7. Functions added: 1
+#   (_pf_minor_unit_ccy_guard). Removed: 0. Rollback: unset the env.
 # v6.64.7: fill only a blank final portfolio display Name from an unambiguous
 # guarded active-ledger label, with explicit provenance after identity guards.
 # v6.64.6: portfolio rebuild uses one validated active-ledger snapshot for
@@ -4059,6 +4073,16 @@ def _inject_portfolio_holdings(
     return out, injected
 
 
+_PF_MINOR_UNIT_CCY = frozenset({"GBp", "GBX", "GBx", "ZAc", "ZAC", "ILA", "ILa"})
+
+
+def _pf_minor_unit_ccy_guard() -> bool:
+    """v6.64.8: reject minor-unit (pence/cents/agorot) holding quotes. Default
+    OFF; =1/true/on/yes arms. OFF => v6.64.7 byte-identical."""
+    return (os.getenv("TFB_PF_MINOR_UNIT_CCY_GUARD") or "").strip().lower() in {
+        "1", "true", "on", "yes"}
+
+
 def _portfolio_holdings_contract(
     headers: List[Any], rows_matrix: List[List[Any]],
     cost_basis: Dict[str, Dict[str, Any]], *, require_complete: bool,
@@ -4098,6 +4122,9 @@ def _portfolio_holdings_contract(
         currency = str(row[currency_i] or "").strip().upper() if currency_i < len(row) else ""
         if currency != cost_basis[symbol]["currency"]:
             return False, "holding quote currency does not match native ledger currency"
+        if _pf_minor_unit_ccy_guard() and currency_i < len(row) and \
+                str(row[currency_i] or "").strip() in _PF_MINOR_UNIT_CCY:
+            return False, "holding quote currency is a minor unit; native ledger is major"
         if require_complete:
             qty = _pm_to_float(row[qty_i]) if qty_i < len(row) else None
             cost = _pm_to_float(row[avg_i]) if avg_i < len(row) else None

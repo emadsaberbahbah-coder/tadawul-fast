@@ -80,7 +80,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", "5.11.2", "scoring"),
     ("core.enriched_quote", "MODULE_VERSION", "4.11.0", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.24.1", "opportunity builder"),
+     "1.24.2", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
      "1.14.0", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.17.0",
@@ -104,7 +104,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.64.7", "dashboard sync"),
+    ("run_dashboard_sync", "6.64.8", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.4.0", "workbook backup"),
     ("pit_snapshot", "1.1.0", "pit snapshot"),

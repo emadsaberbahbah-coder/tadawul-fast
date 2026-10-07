@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.24.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.2  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
@@ -1367,7 +1367,34 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.1"
+# -----------------------------------------------------------------------------
+# v1.24.2 (2026-10-07) [RESEARCH-PASS DIVERSIFICATION] - gated, default OFF.
+# WHY: the v1.24.x two-pass contract adds every qualified candidate to the
+#   research pass BEFORE the per-sector / per-market counters (and the issuer
+#   dedup ledger) are advanced, so the research list that the cockpit's
+#   stability core turns into the final board is undiversified. The allocate
+#   replay then re-applies max_per_sector and defers the over-cap seats, which
+#   still occupy board slots. Synthetic repro (4 Energy + 2 Materials,
+#   max_selected=4, max_per_sector=2, 100,000 SAR): the v1.23 single pass
+#   funded E0,E1,M0,M1 = 100,000 SAR; v1.24.1 research->board E0..E3, replay
+#   funded E0,E1 = 50,000 SAR and left 50,000 SAR unallocated.
+# WHAT (one site, _select_and_size research branch): when
+#   TFB_OPP_RESEARCH_DIVERSIFY=1 the research pick advances sector_counts,
+#   market_counts and (if issuer dedup is on) funded_issuers exactly as a
+#   funded pick does, so the existing cap/dedup checks above it defer later
+#   over-cap research candidates. Cash, sizing and every other ledger stay
+#   untouched in research. The env name is in the TFB_OPP_ policy prefix, so
+#   it is bound into the signed replay fingerprint.
+#   Review (PR #730, Codex P1): before consuming a slot, a research seat that
+#   is structurally unfundable - a venue board lot above the per-seat cap, or
+#   a ticket below the minimum-ticket floor even at the per-seat cap - is
+#   deferred, mirroring the single pass's pre-counter deferrals. Sized at the
+#   cap, not live cash, so cash-limited seats keep their capital-call path.
+# OFF (unset/0): byte-identical v1.24.1. Functions added: 1
+#   (_env_research_diversify). Removed: 0.
+# Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.24.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2740,6 +2767,14 @@ def _env_trust_lineage_mode():
     if v in ("tag", "observe", "1"):
         return "tag"
     return ""
+
+
+def _env_research_diversify():
+    """v1.24.2: research-pass diversification. Default OFF; =1/true/on/yes
+    makes a research pick consume the sector/market/issuer counters the way a
+    funded pick does. OFF => v1.24.1 byte-identical."""
+    return (os.getenv("TFB_OPP_RESEARCH_DIVERSIFY") or "").strip().lower() in (
+        "1", "true", "on", "yes")
 
 
 def _env_sector_normalize():
@@ -5605,6 +5640,40 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                     "PRICE_XCHECK " + _xc["text"] + " \u2014 sizing deferred")
                 continue
         if research:
+            if _env_research_diversify():
+                # v1.24.2 (review): a seat that can never be funded must not
+                # take a diversification slot. Mirror the single pass's two
+                # pre-counter deferrals (venue board lot, minimum-ticket
+                # floor), sized at the per-seat cap rather than live cash so
+                # cash-limited seats keep their capital-call path.
+                _r_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
+                if _r_cap > 0:
+                    _r_sugg, _r_sh = _size_one(cand, criteria, budget_base, _r_cap)
+                    _r_lot = _venue_lot_for_symbol(cand)
+                    _r_px = cand["price_sar"] or 0.0
+                    if _r_lot > 1 and _r_sh == 0 and 0 < _r_px <= _r_cap:
+                        deferrals[cand["symbol"]] = (
+                            "Unfunded \u2014 one board lot (" + "{:,}".format(_r_lot) +
+                            " sh) exceeds the per-seat cap " + _fmt_sar(_r_cap) +
+                            " (research)")
+                        continue
+                    _r_min = criteria.get("min_ticket_sar", 0.0) or 0.0
+                    if _env_venue_floors():
+                        _r_vf = _venue_floor(cand["symbol"])
+                        if _r_vf and float(_r_vf) > _r_min:
+                            _r_min = float(_r_vf)
+                    if _r_min > 0.0 and 0.0 < _r_sugg < _r_min:
+                        deferrals[cand["symbol"]] = (
+                            "Unfunded \u2014 ticket at the per-seat cap " +
+                            _fmt_sar(_r_sugg) + " below minimum ticket floor " +
+                            _fmt_sar(_r_min) + " (research)")
+                        continue
+                # v1.24.2: a research seat consumes the cash-independent
+                # diversification slots so the board it feeds is diversified.
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                market_counts[mkt_key] = market_counts.get(mkt_key, 0) + 1
+                if issuer_dedup:
+                    funded_issuers[_issuer_key(cand)] = cand["symbol"]
             picked.append({"cand": cand, "suggested_sar": 0,
                            "suggested_shares": 0, "funds_from": "Research — no allocation"})
             continue
