@@ -3879,7 +3879,9 @@ if str(ROOT_DIR) not in sys.path:
 # Acquisition checks distinguish the profit-margin quarantine from a price
 # failure without changing fundamentals or eligibility controls. If every
 # quote is unpriced, later empty shells cannot erase an earlier fetch failure.
-__version__ = "5.151.2"
+# v5.151.3 (2026-10-07): Yahoo chart-provider symbol-local misses no longer
+# consume the global outage breaker. Engine routing/proof/policy is unchanged.
+__version__ = "5.151.3"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
