@@ -126,7 +126,7 @@ record is completed afterward; exact-head GitHub CI verifies the published SHA.
 
 | Combined Python 3.11 check | Result |
 | --- | --- |
-| Blocking lean command | 1,279 passed, 13 subtests passed, six explicit optional skips |
+| Blocking lean command after live-acceptance follow-up | 1,354 passed, 13 subtests passed, six explicit optional skips |
 | Production-pinned schema/route/transport command | 146 passed, two existing schema skips |
 | Full-source Apps Script funding | 64 passed |
 | Fail-closed policy | 18 passed; deterministic artifact generated |
@@ -145,3 +145,43 @@ legacy unresolved units; neither correction weakens production safeguards.
 Protected merge, exact Render revision and targeted live readbacks are recorded
 in the release receipt. Code completion, deployment, scheduled execution and
 native installation are distinct acceptance states.
+
+## Live acceptance and bounded follow-up
+
+[Repair #733](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/733)
+protected-merged as `e4af2732d569347cea650652aba59a6af828aa80`. Its deployed
+tree equals the reviewed head tree. Render deploy `dep-db3c7dfavr4c7395jntg`
+went live at 01:13:42 Riyadh on 8 Oct (22:13:42 UTC on 7 Oct). Both health
+endpoints report ready, engine 5.151.4, entry 8.14.2 and the exact revision.
+Authenticated [readback 37694883495](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/37694883495)
+passed signed research, zero blocked allocation and rejection of changed cash/FX.
+
+The first portfolio-only [run 37694886900](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/37694886900)
+exposed a blank native Buy Fees cell not represented in the initial fixtures.
+The guard failed before fetch/clear/write and retained all five prior rows.
+A unique same-snapshot native Cost Basis equals that row's Shares × Buy Price
+exactly. Sync 6.64.10 resolves only this witnessed zero ledger fee component,
+retaining the raw blank and proof; it does not assert a broker commission.
+Missing, ambiguous, approximate, SAR-only and nonblank invalid fee evidence
+remain fail-closed. Fifty-nine new regressions join blocking CI.
+
+The run also exposed post-sync writes from an empty GM matrix leg. Ownership
+receipts now suppress no-key and health-only dashboard writes; performance
+tracking remains exactly one owning GM leg after a full sync. A single-page
+refresh cannot launch unrelated performance recording. The matrix and tracking
+policy, arguments and observation settings are unchanged. Sixteen added
+workflow cases cover these boundaries. Independent combined review passed
+281 affected tests, and all 14 required local steps were rerun successfully.
+
+That existing performance writer separately created 232 new records, including
+116 one-/two-week checkpoints at 01:17:36 Riyadh. All 116 have unique same-day
+same-entry 1M witnesses and correct percentage-point ROI and four-decimal target
+price. Historical target tuples were not rewritten. Portfolio write acceptance
+is distinct and requires a successful 6.64.10 writer/readback.
+
+The bounded Drive search found the earliest relevant accessible backup on
+26 July: Market Leaders has 1,025 unique symbols, Mutual Funds 2,475. No
+16–25 July backup or joint 1,025/4,496 witness was found. This file is evidence,
+not an approved roster; no workbook membership changed. The latest native board
+still withholds all ticket money but has an inconsistent cash-floor observation,
+and bound 1.12.2 installation remains unverified.
