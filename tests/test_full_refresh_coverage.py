@@ -8,26 +8,26 @@ from scripts.audit_full_refresh_coverage import (
 )
 
 NOW = datetime(2026, 7, 30, 8, 0, 0, tzinfo=timezone.utc)
-HEADERS = ["Symbol", "Name", "Current Price", "Last Updated (UTC)", "Position Qty", "Avg Cost"]
+HEADERS = ["Symbol", "Name", "Current Price", "Last Updated (UTC)", "Position Qty", "Avg Cost", "Data Provider"]
 
 
 class FullRefreshCoverageTests(unittest.TestCase):
     def test_clean_market_page_passes(self) -> None:
-        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-30 07:30:00", "", ""], ["BBB", "Beta", 20, "2026-07-30 07:00:00", "", ""]]
+        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-30 07:30:00", "", "", "eodhd"], ["BBB", "Beta", 20, "2026-07-30 07:00:00", "", "", "eodhd"]]
         result = audit_grid(grid, Rule("Market_Leaders", 2, 30, 100, 100, 100), HEADERS, NOW)
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.rows, 2)
         self.assertEqual(result.fresh_pct, 100.0)
 
     def test_duplicate_and_stale_page_fails(self) -> None:
-        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-20 07:30:00", "", ""], ["AAA", "Alpha", 10, "2026-07-30 07:00:00", "", ""]]
+        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-20 07:30:00", "", "", "eodhd"], ["AAA", "Alpha", 10, "2026-07-30 07:00:00", "", "", "eodhd"]]
         result = audit_grid(grid, Rule("Global_Markets", 2, 30, 95, 100, 100), HEADERS, NOW)
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.duplicates, ["AAA"])
         self.assertLess(result.fresh_pct or 0, 95)
 
     def test_portfolio_requires_all_active_ledger_symbols(self) -> None:
-        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-30 07:30:00", 5, 8]]
+        grid = [HEADERS, ["AAA", "Alpha", 10, "2026-07-30 07:30:00", 5, 8, "eodhd"]]
         result = audit_grid(grid, Rule("My_Portfolio", 1, 8, 100, 100, 100, portfolio=True), HEADERS, NOW, active=["AAA", "BBB"])
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.missing_portfolio, ["BBB"])
@@ -63,8 +63,8 @@ class FullRefreshCoverageTests(unittest.TestCase):
 
     def test_utc_freshness_age_is_not_shifted_three_hours(self) -> None:
         for header in ("Last Updated (UTC)", "Last Updated (Riyadh)"):
-            headers = ["Symbol", "Name", "Current Price", header]
-            grid = [headers, ["AAA", "Alpha", 10, "2026-07-30T07:30:00Z"]]
+            headers = ["Symbol", "Name", "Current Price", header, "Data Provider"]
+            grid = [headers, ["AAA", "Alpha", 10, "2026-07-30T07:30:00Z", "eodhd"]]
             with self.subTest(header=header):
                 result = audit_grid(grid, Rule("Global_Markets", 1, 1, 100, 100, 100), headers, NOW)
                 self.assertEqual(result.status, "PASS")

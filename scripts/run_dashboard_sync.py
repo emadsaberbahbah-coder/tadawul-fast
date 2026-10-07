@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.2)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.3)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1315,6 +1315,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1322,6 +1323,10 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.data_validity import acquisition_census, coverage_validity, symbol_domain_ok
 
 try:
     from scripts.critical_symbol_identity import (
@@ -1837,7 +1842,12 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.2"
+SCRIPT_VERSION = "6.64.3"
+# v6.64.3: successful-acquisition facts are captured before restoration,
+# independently of persistence and rollout flags. Status/PAGE disclose the
+# factual numerator, timestamp diagnostic and policy numerator separately.
+# Off/observe retain configured feed behavior; enforce consumes the proved
+# acquisition cohort. Failed enforce certification is an explicit error.
 # -----------------------------------------------------------------------------
 # v6.64.2 (2026-10-06) - PAGE-VERDICT OLD-ROW LINEAGE TRUTH
 # -----------------------------------------------------------------------------
@@ -4442,10 +4452,7 @@ def _klg_symbol_domain_ok(t: Any) -> bool:
     the universe (. - = ^ & /), 1-24 chars, no whitespace. "COPPER FUTURES"
     (a Name that landed in the Symbol cell on 2026-08-13) fails; every
     symbol in the live 9,791-row universe passes (proved in the harness)."""
-    s = str(t or "").strip().upper()
-    if not s or any(ch.isspace() for ch in s):
-        return False
-    return bool(_KLG_SYMBOL_DOMAIN_RE.match(s))
+    return symbol_domain_ok(t)
 
 
 _FG_TAG = "[FALSE-GREEN v6.54.0]"
@@ -7165,20 +7172,24 @@ _FFT_TAG = f"[FETCHFAIL-TRUTH v{SCRIPT_VERSION}]"
 _FFT_SELFTEST_MSG: str = "not-run"
 
 
+def _fetchfail_truth_requested_mode() -> str:
+    raw = (os.getenv("TFB_SYNC_FETCHFAIL_TRUTH") or "off").strip().lower()
+    return raw if raw in ("off", "observe", "enforce") else "off"
+
+
 def _fetchfail_truth_mode() -> str:
     """v6.62.0 [P-162] gate TFB_SYNC_FETCHFAIL_TRUTH = off | observe | enforce
     (explicit words; anything else = off). enforce is certified by the pure
-    self-test: a FAIL degrades enforce to observe (the FG-3 / DS-03
-    convention), never the other way round. Never throws."""
+    self-test. Failed enforce certification is explicit error, never a
+    silent permissive observe policy. Never throws."""
+    raw = "off"
     try:
-        raw = (os.getenv("TFB_SYNC_FETCHFAIL_TRUTH") or "off").strip().lower()
-        if raw not in ("observe", "enforce"):
-            return "off"
+        raw = _fetchfail_truth_requested_mode()
         if raw == "enforce" and _fetchfail_truth_selftest() != "PASS":
-            return "observe"
+            return "error"
         return raw
     except Exception:  # noqa: BLE001
-        return "off"
+        return "error" if raw == "enforce" else "off"
 
 
 def _fetchfail_count_rows(headers: Any, rows_matrix: Any,
@@ -7233,6 +7244,8 @@ def _fetchfail_truth_apply(fresh, requested: int, meta: dict,
     (a healthy leg keeps its exact v6.61.0 stamp text). Never throws."""
     try:
         m = str(mode or _fetchfail_truth_mode())
+        if m == "error":
+            return None, None, " fetchfail_policy_error=certification_failed"
         if (
             (meta or {}).get("fresh_lineage_known") is True
             and (meta or {}).get("fetchfail_lineage_known") is True
@@ -7250,6 +7263,10 @@ def _fetchfail_truth_apply(fresh, requested: int, meta: dict,
         req = int(requested or 0)
         cov_in = (round(100.0 * fresh / req, 1)
                   if (fresh is not None and req > 0) else None)
+        if m == "enforce" and "acquisition_known" in (meta or {}):
+            acquired = (meta or {}).get("acquired_fresh") if (meta or {}).get("acquisition_known") is True else None
+            validity = coverage_validity(req,acquired,0)
+            return acquired if validity.valid else None,validity.percent,(f" fetchfail={ff_new}/{ff_car}" if ff_new or ff_car else "")
         if m == "off" or (ff_new == 0 and ff_car == 0):
             return fresh, cov_in, ""
         note = f" fetchfail={ff_new}/{ff_car}"
@@ -7455,14 +7472,15 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # v6.62.0 [P-162]: fetch-failed rows the engine returned are refresh
     # FAILURE, not fresh data. One pure step decides the number every
     # downstream consumer reads (off = the two lines above, byte-identical).
-    fresh, cov, ff_note = _fetchfail_truth_apply(fresh, requested, meta)
+    policy_fresh, policy_cov, ff_note = _fetchfail_truth_apply(fresh, requested, meta)
+    fresh, requested, cov = _page_fresh_fetch_metrics(res)
     fresh_min = 95.0
     try:
         fresh_min = float((os.getenv("TFB_SYNC_STATUS_FRESH_MIN") or "95").strip())
     except Exception:
         pass
     status_cell = status.upper() if status else "UNKNOWN"
-    if (status_cell == "SUCCESS" and cov is not None and cov < fresh_min):
+    if (status_cell == "SUCCESS" and policy_cov is not None and policy_cov < fresh_min):
         status_cell = "PARTIAL_FRESH"
     # v6.45.0 R4: data_status = the cohort verdict a consumer can trust.
     # COMPLETE only when the leg succeeded, nothing failed, refresh coverage
@@ -7475,22 +7493,51 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # the Status cell (below, gated) and the per-page feed token (AT-07).
     data_status = _status_data_verdict(status.lower(), failed, cov,
                                        fresh_min, meta)
-    if (_status_truth_enabled() and data_status == "PARTIAL"
+    acquisition = coverage_validity(requested, fresh, fresh_min)
+    if not acquisition.valid or _fetchfail_truth_mode() == "error":
+        data_status = "PARTIAL"
+    acquisition_state = ("UNKNOWN" if fresh is None else
+                         "COMPLETE" if acquisition.valid else "PARTIAL")
+    policy_data_status = _status_data_verdict(status.lower(),failed,policy_cov,fresh_min,meta)
+    if _fetchfail_truth_mode()=="error":
+        policy_data_status="PARTIAL"
+        if status_cell=="SUCCESS":
+            status_cell="POLICY_ERROR"
+    if (_fetchfail_truth_mode()=="enforce" and "acquisition_known" in meta
+            and not coverage_validity(requested,policy_fresh,fresh_min).valid):
+        policy_data_status="PARTIAL"
+        if status_cell=="SUCCESS":
+            status_cell="PARTIAL_FRESH"
+    if (_status_truth_enabled() and policy_data_status == "PARTIAL"
             and status_cell == "SUCCESS"):
-        # v6.51.0 AT-07: SUCCESS may never sit over data=PARTIAL.
+        # The status cell follows configured eligibility policy. The factual
+        # data/acquisition verdict is disclosed separately in every mode.
         status_cell = "PARTIAL"
     msg = (f"{_STATUS_STAMP_TAG} leg={status} written={written} failed={failed}"
            + (f" requested={requested}" if requested else "")
            + (f" fresh={fresh}" if fresh is not None else "")
+           + (f" policy_fresh={policy_fresh}" if policy_fresh is not None else "")
+           + (f" policy_cov={policy_cov}%" if policy_cov is not None else "")
            + (f" preserved={preserved}" if preserved else "")
            + (f" noncurrent={noncurrent}" if lineage_known else "")
            + (f" stubbed={stubbed}" if stubbed else "")
            + (f" retired={retired}" if retired else "")  # v6.64.0 [P-174]
            + ff_note                                   # v6.62.0 [P-162]
            + (f" fresh_cov={cov}%" if cov is not None else "")
+           + f" acquired={fresh if fresh is not None else 'unknown'}/{requested}"
+           + f" acquisition={acquisition_state}"
+           + f" timestamp_fresh={meta.get('timestamp_fresh', 'unknown')}"
+           + f" acquisition_unknown={meta.get('acquisition_unknown', 'unknown')}"
+           + f" acquisition_invalid={meta.get('acquisition_invalid', 'unknown')}"
+           + f" quote_asof_known={meta.get('quote_asof_known', 'unknown')}"
+           + f" fetchfail_requested={_fetchfail_truth_requested_mode()}"
+           + f" fetchfail_effective={_fetchfail_truth_mode()}"
+           + (" acquisition_reasons=" + ",".join(f"{k}:{v}" for k,v in sorted(meta.get('acquisition_reasons',{}).items()))
+              if meta.get("acquisition_reasons") else "")
            + (f" warnings={len(warns)}" if warns else "")
            + (f" error={err[:120]}" if err else "")
            + f" | data={data_status}"
+           + f" policy_data={policy_data_status}"
            + _rb_tolerance_note(meta, pw_fl)
            + (f" guard=pw:{pw_fl}/{int(meta.get('pw_checked') or 0)}"
               + (f",rb:{int(meta.get('rb_flagged') or 0)}"
@@ -8146,13 +8193,7 @@ def _uv_page_state(res: Any) -> tuple:
     status = str(getattr(res, "status", "") or "").strip().lower()
     meta = dict(getattr(res, "_stamp_meta", None) or {})
     fresh, requested = _fresh_fetch_base(res)
-    cov = None
-    if fresh is not None and requested > 0:
-        cov = round(100.0 * fresh / requested, 1)
-        # v6.62.0 [P-162]: the feed token consumes the SAME fetch-failed
-        # correction as the stamp (enforce only; observe/off = unchanged).
-        if _fetchfail_truth_mode() == "enforce":
-            cov = _fetchfail_truth_apply(fresh, requested, meta)[1]
+    fresh, cov, _note = _fetchfail_truth_apply(fresh,requested,meta)
     if status == "success":
         fmin = 95.0
         try:
@@ -8160,15 +8201,16 @@ def _uv_page_state(res: Any) -> tuple:
                          .strip())
         except Exception:
             pass
+        if _fetchfail_truth_mode() == "error":
+            return "POLICY_ERROR", cov
+        if (_fetchfail_truth_mode()=="enforce" and "acquisition_known" in meta
+                and not coverage_validity(requested,fresh,fmin).valid):
+            return "STALE_COV",cov
         if cov is not None and cov < fmin:
             return "STALE_COV", cov
         if _status_truth_enabled():
-            # v6.51.0 AT-07: a success leg whose cohort verdict is PARTIAL
-            # (failed rows, coverage floor, or unrepaired DIVERGENT readback)
-            # may not feed OK into the EXECUTABLE composite.
             _failed = int(getattr(res, "rows_failed", 0) or 0)
-            if _status_data_verdict("success", _failed, cov, fmin,
-                                    meta) == "PARTIAL":
+            if _status_data_verdict("success", _failed, cov, fmin, meta) == "PARTIAL":
                 return "PARTIAL", cov
         return "OK", cov
     if status == "partial":
@@ -10924,25 +10966,83 @@ def _merge_noncurrent_fetched_lineage(
 
 
 def _page_fresh_fetch_metrics(res: Any) -> Tuple[Optional[int], int, Optional[float]]:
-    """Return the exact fresh-row numerator, request denominator and percent.
-
-    All surfaces share _fresh_fetch_base. PAGE telemetry then enforces the
-    factual fetch-failure adjustment even while workbook/feed rollout remains
-    observe. Exact lineage uses origin identities; legacy/unknown lineage uses
-    the final census. Unknown coverage stays explicit as ``None``.
-    """
+    """Factual successful acquisitions, independent of eligibility rollout."""
     try:
         meta = dict(getattr(res, "_stamp_meta", None) or {})
-        fresh, requested = _fresh_fetch_base(res)
-        # Audit telemetry always reports the factual numerator. The workflow
-        # may keep workbook/feed fetchfail truth in observe mode; PAGE enforces
-        # the disjoint exact-origin count (or the legacy final census).
-        fresh, coverage, _note = _fetchfail_truth_apply(
-            fresh, requested, meta, mode="enforce"
-        )
-        return fresh, requested, coverage
+        requested = int(meta.get("requested") or getattr(res,"symbols_requested",0) or 0)
+        fresh = meta.get("acquired_fresh") if meta.get("acquisition_known") is True else None
+        validity = coverage_validity(requested, fresh, 0)
+        return fresh, requested, validity.percent
     except Exception:
         return None, 0, None
+
+
+def _acquisition_max_age_seconds(page: str) -> float:
+    default = 8.0 if page == "My_Portfolio" else 30.0
+    try:
+        return float(os.getenv("TFB_REFRESH_MAX_AGE_H_" + page.upper()) or default) * 3600
+    except (ValueError, TypeError):
+        return default * 3600
+
+
+def _record_acquisition_census(res: Any, headers: Any, rows: Any,
+                               requested_symbols: Any, *, origins=None,
+                               noncurrent=(), now=None) -> set:
+    """Capture before restoration; final evidence cannot promote replacements.
+
+    Acquisition success is bounded retrieval evidence, not a claim about quote
+    age. The first census records originating successful symbols. The final
+    census intersects that set and subtracts the union of replaced/quarantined
+    origins once, even when the replacement has a recent valid-looking stamp.
+    """
+    now = now or _utc_now()
+    census = acquisition_census(headers or [], rows or [], now=now,
+        max_age_seconds=_acquisition_max_age_seconds(res.sheet_name),
+        requested=requested_symbols, symbol_key=canonicalize_symbol)
+    success = census.successful
+    if origins is not None:
+        success = (success & set(origins)) - set(noncurrent)
+    meta = res._stamp_meta
+    meta["requested"] = len(census.requested)
+    meta["acquisition_known"] = _guard_find_col(list(headers or []), _GUARD_SYMBOL_ALIASES) >= 0
+    meta["acquired_fresh"] = len(success)
+    meta["timestamp_fresh"] = len(census.timestamp_fresh)
+    meta["quote_asof_known"] = len(census.quote_asof_known)
+    meta["acquisition_unknown"] = len(census.unknown)
+    meta["acquisition_invalid"] = len(census.requested - success - census.unknown)
+    reasons = dict(census.reason_counts)
+    replaced = len((census.successful - success) & census.requested)
+    if replaced:
+        reasons["preserved_or_replaced_origin"] = replaced
+    meta["acquisition_reasons"] = reasons
+    return set(success)
+
+
+def _mark_preserved_acquisitions(headers: Any, rows: Any, restored_symbols: Any) -> int:
+    """Keep restoration provenance in the published canonical warning cell.
+
+    Only actual PV/KLG/FW restorations are marked. Original prices/times and
+    nonacquisition warnings survive; a prior success status is superseded by
+    preserved without creating a fetch_failed or trading-policy warning.
+    """
+    sym_i=_guard_find_col(list(headers or []),_GUARD_SYMBOL_ALIASES)
+    warn_i=_guard_find_col(list(headers or []),_FG_WARN_ALIASES)
+    if sym_i<0 or warn_i<0:
+        return 0
+    restored={canonicalize_symbol(symbol) for symbol in restored_symbols or ()}
+    marked=0
+    for row in rows or []:
+        if sym_i>=len(row) or canonicalize_symbol(row[sym_i]) not in restored:
+            continue
+        while len(row)<=warn_i:
+            row.append("")
+        original=row[warn_i]
+        warnings=original if isinstance(original,(list,tuple)) else str(original or "").split(";")
+        retained=[str(token).strip() for token in warnings if str(token).strip()
+                  and not str(token).strip().lower().startswith("acquisition_status:")]
+        row[warn_i]="; ".join(retained+["acquisition_status:preserved"])
+        marked+=1
+    return marked
 
 
 def _apply_stale_skip_escalation(results: List["TaskResult"], sheets: Any,
@@ -11013,10 +11113,15 @@ async def _run_one_task(
                        "fresh_lineage_known": False, "fetched_origin": 0,
                        "noncurrent_fetched": 0,
                        "fetchfail_lineage_known": False,
-                       "ff_new_fetched": 0, "ff_carried_fetched": 0}
+                       "ff_new_fetched": 0, "ff_carried_fetched": 0,
+                       "acquisition_known": False, "acquired_fresh": None}
     _fetched_origin_symbols: set = set()
     _noncurrent_fetched_symbols: set = set()
     _fetchfail_origin_symbols: set = set()
+    _acquired_origin_symbols: Optional[set] = None
+    _preserved_acquisition_symbols: set = set()
+    symbols: List[str] = []
+    rows_matrix: List[List[Any]] = []
 
     try:
         canon_task_key = _canon_key(task.key)
@@ -11530,6 +11635,18 @@ async def _run_one_task(
         # ---------------------------------------------------------------------
 
         if task.expects_rows and symbols and headers:
+            # Acquisition origins must be captured before identity quarantine
+            # or any restoration, even when symbol persistence is disabled.
+            _fetched_origin_symbols, _fresh_lineage_known = _fresh_symbol_lineage(headers, rows_matrix, symbols)
+            _fetchfail_origin_symbols, _fetchfail_lineage_known = _fetchfail_symbol_lineage(headers, rows_matrix, _fetched_origin_symbols)
+            res._stamp_meta.update({
+                "fresh_lineage_known": _fresh_lineage_known,
+                "fetched_origin": len(_fetched_origin_symbols),
+                "fetchfail_lineage_known": _fetchfail_lineage_known,
+                "ff_new_fetched": len(_fetchfail_origin_symbols),
+                "pre_persist_rows": len(rows_matrix),
+            })
+            _acquired_origin_symbols = _record_acquisition_census(res, headers, rows_matrix, symbols)
             rows_matrix, _critical_identity_failures = validate_fresh_critical_rows(
                 headers, rows_matrix, symbols
             )
@@ -11787,34 +11904,11 @@ async def _run_one_task(
         if (_symbol_persistence_enabled() and task.expects_rows and symbols
                 and rows_matrix and headers and sheets is not None):
             try:
-                res._stamp_meta["requested"] = len(symbols or [])
-                res._stamp_meta["pre_persist_rows"] = len(rows_matrix or [])
-                (
-                    _fetched_origin_symbols,
-                    _fresh_lineage_known,
-                ) = _fresh_symbol_lineage(headers, rows_matrix, symbols)
-                res._stamp_meta["fresh_lineage_known"] = _fresh_lineage_known
-                if _fresh_lineage_known:
-                    res._stamp_meta["fetched_origin"] = len(
-                        _fetched_origin_symbols
-                    )
-                    (
-                        _fetchfail_origin_symbols,
-                        _fetchfail_lineage_known,
-                    ) = _fetchfail_symbol_lineage(
-                        headers, rows_matrix, _fetched_origin_symbols
-                    )
-                    res._stamp_meta["fetchfail_lineage_known"] = (
-                        _fetchfail_lineage_known
-                    )
-                    if _fetchfail_lineage_known:
-                        res._stamp_meta["ff_new_fetched"] = len(
-                            _fetchfail_origin_symbols
-                        )
                 rows_matrix, _kept_syms = _persist_missing_symbol_rows(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix, symbols
                 )
                 if _kept_syms:
+                    _preserved_acquisition_symbols.update(_kept_syms)
                     res._stamp_meta["persist_restored"] = len(_kept_syms)
                     _pw = (
                         f"{_SYMBOL_PERSISTENCE_TAG} preserved {len(_kept_syms)} "
@@ -11847,6 +11941,7 @@ async def _run_one_task(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix
                 )
                 if _klg_syms:
+                    _preserved_acquisition_symbols.update(_klg_syms)
                     res._stamp_meta["klg_kept"] = len(_klg_syms)
                     _noncurrent_fetched_symbols = (
                         _merge_noncurrent_fetched_lineage(
@@ -12031,6 +12126,7 @@ async def _run_one_task(
                                 sheets, spreadsheet_id, task.sheet_name,
                                 headers, rows_matrix,
                             )
+                            _preserved_acquisition_symbols.update(_fwk_restored)
                             _fwk_set = {s for s in _fwk_restored
                                         if s in set(_idfw_stripped)}
                             if _fwk_set:
@@ -12225,8 +12321,7 @@ async def _run_one_task(
 
         # --- v6.62.0 P-162: fetch-failed census of the OUTGOING matrix --------
         # PURE count only; the stamp / feed token apply the gate's arithmetic.
-        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
-                and _fetchfail_truth_mode() != "off"):
+        if task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES:
             try:
                 _ffc = _fetchfail_count_rows(headers, rows_matrix, _EQ_STATE["t0"])
                 res._stamp_meta["ff_new"] = int(_ffc.get("ff_new") or 0)
@@ -12265,6 +12360,7 @@ async def _run_one_task(
                     rows_matrix, _kept2 = _persist_missing_symbol_rows(
                         sheets, spreadsheet_id, task.sheet_name, headers,
                         rows_matrix, symbols)
+                    _preserved_acquisition_symbols.update(_kept2)
                     res._stamp_meta["pv2_restored"] = len(_kept2 or [])
                     _noncurrent_fetched_symbols = (
                         _merge_noncurrent_fetched_lineage(
@@ -12516,6 +12612,9 @@ async def _run_one_task(
         # WRITE-then-TRIM: the atomic values.update overwrites in place first,
         # then _trim_after_write clears only the stale tail below/right.
         # TFB_SYNC_WRITE_THEN_TRIM=0 restores the exact v6.17.0 order.
+        # Preserve factual provenance after the final PV2/guard passes, before
+        # every publication path. Only tracked actual restorations are tagged.
+        _mark_preserved_acquisitions(headers,rows_matrix,_preserved_acquisition_symbols)
         _trim_mode = clear_before_write and _write_then_trim_enabled()
         if clear_before_write and not _trim_mode:
             try:
@@ -12665,6 +12764,14 @@ async def _run_one_task(
         # (no-op unless this run published; TTL backstops a hard crash).
         _sync_hold_clear(sheets, spreadsheet_id)
         res.end_utc = _utc_now().isoformat()
+        if _acquired_origin_symbols is not None:
+            try:
+                _record_acquisition_census(res, headers, rows_matrix, symbols,
+                    origins=_acquired_origin_symbols, noncurrent=_noncurrent_fetched_symbols)
+            except Exception as exc:
+                res._stamp_meta["acquisition_known"] = False
+                res._stamp_meta["acquired_fresh"] = None
+                res.warnings.append(f"Acquisition evidence unavailable: {type(exc).__name__}")
         # --- v6.39.1 (W1A-4b) BACKEND _Status STAMP (moved to finally) -------
         # External audit P0-3, ACCEPTED: the terminus-only stamp missed every
         # early return (skips, identity fails, floor vetoes) and ran before

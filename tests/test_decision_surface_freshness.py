@@ -36,6 +36,7 @@ def status_grid(overrides=None):
         data[key] = value
     rows = [HEADER]
     for page, (stamp, state, message, count, columns) in data.items():
+        message += f" acquired={count}/{count} acquisition=COMPLETE data=COMPLETE fetchfail_requested=observe fetchfail_effective=observe"
         rows.append([page, stamp, state, message, "/read-only", 200, count, columns])
     return rows
 

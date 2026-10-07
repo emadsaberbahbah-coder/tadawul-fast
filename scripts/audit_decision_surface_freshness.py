@@ -8,6 +8,10 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.2.0 — acquisition truth is required independently of the rollout
+status cell. Missing/partial acquisition evidence and policy certification
+errors cannot certify decision readiness. Duplicate proofs remain unknown.
+
 VERSION 1.1.0 (2026-09-08) — CLOCK TRUTH: NO INVENTED AGES (P-104)
 WHY v1.1.0: the 2026-09-08 run (34189823244) failed PF_SOURCE_STALE on a
 date-only "9/8/2026" stamp read as midnight (fabricated 8.24h age), while
@@ -34,7 +38,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -44,8 +48,9 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
         sys.path.insert(0, str(_path))
 
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
+from core.data_validity import coverage_validity  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -65,6 +70,12 @@ class StatusRow:
     message: str
     rows: Optional[int]
     columns: Optional[int]
+    acquired_fresh: Optional[int] = None
+    acquired_requested: Optional[int] = None
+    acquisition: str = "UNKNOWN"
+    data: str = "UNKNOWN"
+    fetchfail_requested: str = "unknown"
+    fetchfail_effective: str = "unknown"
 
 
 @dataclass
@@ -187,14 +198,30 @@ def parse_status_grid(grid: Sequence[Sequence[Any]]) -> dict[str, StatusRow]:
             continue
         _upd, _prec = parse_dt_precision(              # v1.1.0 P-104
             raw[index["last updated"]] if index["last updated"] < len(raw) else None)
+        message = s(raw[index["message"]] if index["message"] < len(raw) else "")
+        acquired_values = re.findall(r"(?:^|\s)acquired=([^\s]+)",message,re.I)
+        acquired = re.fullmatch(r"(\d+|unknown)/(\d+)",acquired_values[0],re.I) if len(acquired_values)==1 else None
+        def token(name, default):
+            values = re.findall(r"(?:^|\s)" + re.escape(name) + r"=([A-Za-z_]+)(?:\s|$)",message,re.I)
+            return values[0] if len(values)==1 else default
+        if page in rows:
+            rows[page] = replace(rows[page],acquired_fresh=None,acquired_requested=None,
+                                 acquisition="UNKNOWN",data="UNKNOWN")
+            continue
         rows[page] = StatusRow(
             page=page,
             updated=_upd,
             updated_precision=_prec,
             status=s(raw[index["status"]] if index["status"] < len(raw) else "").upper(),
-            message=s(raw[index["message"]] if index["message"] < len(raw) else ""),
+            message=message,
             rows=_number(raw[index["rows"]] if index["rows"] < len(raw) else None),
             columns=_number(raw[index["columns"]] if index["columns"] < len(raw) else None),
+            acquired_fresh=_number(acquired.group(1)) if acquired else None,
+            acquired_requested=_number(acquired.group(2)) if acquired else None,
+            acquisition=token("acquisition","UNKNOWN").upper(),
+            data=token("data","UNKNOWN").upper(),
+            fetchfail_requested=token("fetchfail_requested","unknown").lower(),
+            fetchfail_effective=token("fetchfail_effective","unknown").lower(),
         )
     return rows
 
@@ -211,6 +238,29 @@ def _age_hours(stamp: Optional[datetime], now_riyadh: datetime) -> Optional[floa
 
 def _iso(stamp: Optional[datetime]) -> Optional[str]:
     return stamp.isoformat(sep=" ", timespec="seconds") if stamp else None
+
+
+def _acquisition_findings(item: StatusRow, surface: str, prefix: str,
+                          floor: int, minimum: float) -> list[Finding]:
+    """Read acquisition truth even when the status cell reflects observe policy."""
+    findings: list[Finding] = []
+    validity = coverage_validity(item.acquired_requested, item.acquired_fresh, minimum)
+    if item.acquired_fresh is None or item.acquired_requested is None:
+        findings.append(Finding("FAIL",prefix+"_ACQUISITION_UNKNOWN",surface,
+            f"{item.page} successful-acquisition evidence is missing; a recent publication stamp cannot certify acquisition."))
+    elif not validity.valid or item.acquisition != "COMPLETE":
+        findings.append(Finding("FAIL",prefix+"_ACQUISITION_INCOMPLETE",surface,
+            f"{item.page} acquired {item.acquired_fresh}/{item.acquired_requested} ({validity.percent}%), acquisition={item.acquisition}; minimum {minimum:g}%."))
+    if item.acquired_requested is not None and item.acquired_requested < floor:
+        findings.append(Finding("FAIL",prefix+"_ACQUISITION_UNIVERSE",surface,
+            f"{item.page} acquisition denominator {item.acquired_requested} is below approved minimum {floor}."))
+    if item.data != "COMPLETE":
+        findings.append(Finding("FAIL",prefix+"_DATA_NOT_COMPLETE",surface,
+            f"{item.page} factual data verdict is {item.data} despite status {item.status}."))
+    if item.fetchfail_effective == "error":
+        findings.append(Finding("FAIL",prefix+"_POLICY_ERROR",surface,
+            f"{item.page} requested {item.fetchfail_requested} but effective policy is error; readiness is blocked."))
+    return findings
 
 
 def audit_surfaces(
@@ -262,6 +312,7 @@ def audit_surfaces(
     else:
         report.my_portfolio_updated_riyadh = _iso(my_portfolio.updated)
         report.source_status["My_Portfolio"] = asdict(my_portfolio)
+        report.findings.extend(_acquisition_findings(my_portfolio,"Portfolio_Decision","PF_SOURCE",1,100))
         if my_portfolio.status not in GOOD_FULL_PAGE_STATUSES:
             report.findings.append(Finding("FAIL", "PF_SOURCE_NOT_VALID", "Portfolio_Decision", f"My_Portfolio status is {my_portfolio.status or 'unknown'}."))
         source_age = _age_hours(my_portfolio.updated, now_riyadh)
@@ -301,6 +352,11 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "SOURCE_STATUS_MISSING", "Top_10_Investments", f"{page} is absent from _Status."))
             continue
         report.source_status[page] = asdict(item)
+        acquisition_findings = _acquisition_findings(item,"Top_10_Investments","SOURCE",floor,
+            _env_float("TFB_REFRESH_MIN_FRESH_PCT_"+page.upper(),95.0))
+        if acquisition_findings:
+            incomplete_sources.append(page)
+            report.findings.extend(acquisition_findings)
         if item.status not in GOOD_FULL_PAGE_STATUSES:
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "SOURCE_NOT_COMPLETE", "Top_10_Investments", f"{page} status is {item.status or 'unknown'}: {item.message or 'no message'}."))

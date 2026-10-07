@@ -9,6 +9,16 @@ from unittest import mock
 from scripts.audit_sync_outcome import CRITICAL_MARKET_PAGES, audit_artifacts
 
 
+
+def _record_frozen_provider_rows(result, successful):
+    from scripts import run_dashboard_sync as sync
+    from datetime import datetime, timezone
+    now=datetime(2026,10,6,0,1,tzinfo=timezone.utc)
+    requested=[f"ACQ{i}.US" for i in range(result.symbols_requested)]
+    rows=[[symbol,100,"eodhd","" if i<successful else "fetch_failed:timeout",now.isoformat()]
+          for i,symbol in enumerate(requested)]
+    sync._record_acquisition_census(result,["Symbol","Current Price","Data Provider","Warnings","Last Updated (UTC)"],rows,requested,now=now)
+
 class SyncOutcomeAuditTests(unittest.TestCase):
     def _audit(self, text: str):
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,6 +293,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
                 "klg_kept": 0,
             },
         )
+        _record_frozen_provider_rows(result, 90)
         with mock.patch.object(
             sync, "_page_newest_stamp_age_h", return_value=1.0
         ), mock.patch.object(
@@ -350,10 +361,10 @@ class SyncOutcomeAuditTests(unittest.TestCase):
         )
         self.assertEqual(
             sync._page_fresh_fetch_metrics(result),
-            (1, 5, 20.0),
+            (None, 5, None),
         )
 
-    def test_runner_missing_symbol_lineage_uses_legacy_klg_fallback(self):
+    def test_runner_missing_acquisition_evidence_remains_unknown(self):
         from scripts import run_dashboard_sync as sync
 
         fetched, known = sync._fresh_symbol_lineage(
@@ -378,7 +389,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
         )
         self.assertEqual(
             sync._page_fresh_fetch_metrics(result),
-            (8, 10, 80.0),
+            (None, 10, None),
         )
 
     def test_runner_klg_stub_candidate_is_noncurrent_without_prior(self):
@@ -439,7 +450,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
                 "ff_new_fetched": 0,
             },
         )
-        self.assertEqual(sync._page_fresh_fetch_metrics(result), (0, 1, 0.0))
+        self.assertEqual(sync._page_fresh_fetch_metrics(result), (None, 1, None))
 
         class RaisingSheets:
             def read_values(self, *_args, **_kwargs):
@@ -594,6 +605,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
                 "ff_carried": 0,
             },
         )
+        _record_frozen_provider_rows(result, 94)
         with mock.patch.dict(
             "os.environ", {"TFB_SYNC_FETCHFAIL_TRUTH": "off"}
         ), mock.patch.object(
@@ -690,6 +702,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
                 **final_census,
             },
         )
+        _record_frozen_provider_rows(result, 1)
         self.assertEqual(sync._page_fresh_fetch_metrics(result), (1, 4, 25.0))
 
         with mock.patch.dict(
@@ -712,9 +725,9 @@ class SyncOutcomeAuditTests(unittest.TestCase):
             )
             enforce_feed = sync._uv_page_state(result)
 
-        self.assertIn("fresh=2", off_status[3])
+        self.assertIn("fresh=1", off_status[3])
         self.assertNotIn("fetchfail=", off_status[3])
-        self.assertIn("fresh=2", observe_status[3])
+        self.assertIn("fresh=1", observe_status[3])
         # The old-stamped A origin is exact-new by provenance, never also
         # reported as carried; appended prior failures do not affect coverage.
         self.assertIn("fetchfail=1/0", observe_status[3])
@@ -743,6 +756,7 @@ class SyncOutcomeAuditTests(unittest.TestCase):
                 "ff_carried": 0,
             },
         )
+        _record_frozen_provider_rows(result, 90)
         # Production currently observes fetch-fail truth. Audit telemetry is
         # factual regardless of that display rollout mode.
         with mock.patch.dict(

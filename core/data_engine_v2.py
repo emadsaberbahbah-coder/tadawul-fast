@@ -3868,7 +3868,19 @@ if str(ROOT_DIR) not in sys.path:
 # engine_gates.margin_publish. Zero removals; four helpers, six constants
 # added. Rollback: git revert, or unset the env (= off).
 # -----------------------------------------------------------------------------
-__version__ = "5.151.0"
+# v5.151.1 (2026-10-07): one instrument capability route for quote, history,
+# price verification and optional EODHD enrichment. Yahoo-native futures and
+# indices, and Milan/NZX suffixes without a verified EODHD translation, use
+# the configured Yahoo path only. Price acquisition provenance survives sheet
+# projection in warning tokens; cache reads retain the original acquisition
+# time and history/snapshot prices never claim a new quote acquisition.
+__version__ = "5.151.1"
+
+from core.provider_capabilities import (
+    provider_supports_instrument,
+    providers_for_instrument,
+    yahoo_primary_reason,
+)
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -12911,6 +12923,54 @@ def _parse_bar_ts(v: Any) -> Optional[Tuple[str, Any]]:
         return None
 
 
+def _quote_acquisition_asof(value: Any) -> str:
+    """Publish only a precise source quote instant; never infer it from a mint."""
+    parsed = _parse_bar_ts(value)
+    if parsed is None or parsed[0] != "dt":
+        return ""
+    if not isinstance(value, (int, float)):
+        text = _safe_str(value).strip()
+        if not text.isdigit():
+            try:
+                if datetime.fromisoformat(text.replace("Z", "+00:00")).tzinfo is None:
+                    return ""
+            except (ValueError, TypeError):
+                return ""
+    return parsed[1].astimezone(timezone.utc).isoformat()
+
+
+def _publish_price_acquisition(
+    row: Dict[str, Any], *, live_priced: bool, fallback_source: str,
+    acquired_at: str, provider: str, quote_asof: str,
+) -> None:
+    """Retain retrieval facts in the existing Warnings column.
+
+    SUCCESS records positive provider-returned acquisition evidence, not an executable
+    recommendation or proof of fresh HTTP transport. Source quote time is a
+    separate optional fact. Terminal errors/coherence guards remain intact
+    and the shared acquisition audit can reject SUCCESS evidence containing
+    them. Reused history/snapshot rows cannot inherit an earlier SUCCESS.
+    """
+    raw = row.get("warnings")
+    parts = (list(raw) if isinstance(raw, list) else
+             [part.strip() for part in _safe_str(raw).split(";") if part.strip()])
+    parts = [part for part in parts
+             if not _safe_str(part).strip().lower().startswith("acquisition_")]
+    row["warnings"] = parts if isinstance(raw, list) else "; ".join(parts)
+    price = _as_float(row.get("current_price"))
+    if live_priced and "fetch_failed" in _safe_str(row.get("warnings")).lower():
+        _aq_append_warning(row, "acquisition_status:failed")
+    elif live_priced and price is not None and price > 0 and provider and acquired_at:
+        _aq_append_warning(row, "acquisition_status:success")
+        _aq_append_warning(row, "acquisition_acquired_at:" + acquired_at)
+        _aq_append_warning(row, "acquisition_provider:" + provider)
+        if quote_asof:
+            _aq_append_warning(row, "acquisition_quote_asof:" + quote_asof)
+    else:
+        status = "preserved" if fallback_source and price is not None and price > 0 else "unavailable"
+        _aq_append_warning(row, "acquisition_status:" + status)
+
+
 def _bar_age_sessions(symbol: str, parsed: Tuple[str, Any], now_utc: Optional[datetime] = None) -> Optional[int]:
     """v5.104.0 (Fix AR): completed trading sessions strictly AFTER the bar's
     exchange-local date, up to (and including) the last completed session as
@@ -16394,7 +16454,8 @@ class DataEngineV5:
                 p = "Market_Leaders"
             else:
                 p = "Global_Markets"
-        return p, self._page_primary_provider_for(p)
+        routed = self._providers_for_instrument(p, symbol)
+        return p, (routed[0] if routed else "")
 
     def _providers_for(self, page: str) -> List[str]:
         p = _canonicalize_sheet_name(page)
@@ -16412,6 +16473,9 @@ class DataEngineV5:
         if p in {"Market_Leaders", "My_Portfolio", "My_Investments", "Top_10_Investments"}:
             return _dedupe_keep_order(DEFAULT_PROVIDERS)
         return _dedupe_keep_order(DEFAULT_PROVIDERS)
+
+    def _providers_for_instrument(self, page: str, symbol: str) -> List[str]:
+        return providers_for_instrument(symbol, self._providers_for(page))
 
     # =========================================================================
     # Snapshot management
@@ -16669,6 +16733,8 @@ class DataEngineV5:
     # Provider fetch
     # =========================================================================
     async def _fetch_patch(self, provider_name: str, symbol: str, page: str = "") -> Dict[str, Any]:
+        if not provider_supports_instrument(provider_name, symbol):
+            return {}
         mod = self._provider_registry.get(provider_name)
         if mod is None:
             return {}
@@ -16935,6 +17001,8 @@ class DataEngineV5:
         return patch
 
     async def _fetch_history_patch(self, provider_name: str, symbol: str) -> Dict[str, Any]:
+        if not provider_supports_instrument(provider_name, symbol):
+            return {}
         mod = self._provider_registry.get(provider_name)
         if mod is None:
             return {}
@@ -16961,7 +17029,7 @@ class DataEngineV5:
         return self._compute_history_patch_from_rows(rows)
 
     async def _get_history_patch_best_effort(self, symbol: str, page: str = "") -> Dict[str, Any]:
-        for provider_name in self._providers_for(page):
+        for provider_name in self._providers_for_instrument(page, symbol):
             patch = await self._fetch_history_patch(provider_name, symbol)
             if patch:
                 return patch
@@ -17304,6 +17372,8 @@ class DataEngineV5:
         client.fetch_fundamentals -- the FUNDAMENTALS endpoint only (one call).
         The client normalizes the symbol internally (mirrors the working quote
         path) and returns (patch, err); the tuple is unwrapped here."""
+        if not provider_supports_instrument("eodhd", symbol):
+            return {}
         mod = self._provider_registry.get("eodhd")
         if mod is None:
             return {}
@@ -17345,6 +17415,8 @@ class DataEngineV5:
         if not _eodhd_fundamentals_fallback_enabled():
             return row
         if not isinstance(row, dict):
+            return row
+        if not provider_supports_instrument("eodhd", symbol):
             return row
         # Gate on the exact gap this fallback exists to close.
         # v5.139.0 (Fix AX-2): a blank sector/industry is ALSO a gap worth
@@ -17490,13 +17562,32 @@ class DataEngineV5:
 
         async def factory() -> Dict[str, Any]:
             merged: Dict[str, Any] = {}
-            for provider_name in self._providers_for(page_ctx):
+            price_providers = self._providers_for_instrument(page_ctx, sym)
+            unpriced_attempts: List[str] = []
+            terminal_quote_patch: Dict[str, Any] = {}
+            for provider_name in price_providers:
                 patch = await self._fetch_patch(provider_name, sym, page_ctx)
                 if not patch:
+                    unpriced_attempts.append(provider_name)
                     continue
                 canon_patch = _canonicalize_provider_row(
                     patch, requested_symbol=sym, normalized_symbol=sym, provider=provider_name,
                 )
+                # Canonical projection does not keep the adapter's Error
+                # field. A terminal failed-fetch fact must survive even
+                # when that adapter also returns a carried price.
+                if "fetch_failed" in _safe_str(patch.get("error")).lower():
+                    _aq_append_warning(canon_patch, "fetch_failed:quote_provider_error")
+                quote_price = _as_float(canon_patch.get("current_price"))
+                if quote_price is None or quote_price <= 0:
+                    # A failed/empty quote is an attempted source, not the
+                    # identity, timestamp or terminal failure of a later
+                    # successful quote. Keep its shell only if every quote
+                    # fails. Priced rows carrying fetch_failed remain intact
+                    # so the existing fail-closed guard still rejects them.
+                    terminal_quote_patch = canon_patch
+                    unpriced_attempts.append(provider_name)
+                    continue
                 merged = self._merge(merged, canon_patch)
                 # v5.107.0 (Fix AT): the provenance label belongs to the
                 # provider that DELIVERED the price. A priceless error shell
@@ -17513,6 +17604,10 @@ class DataEngineV5:
                     merged.setdefault("data_provider", provider_name)
                 if _as_float(merged.get("current_price")) is not None:
                     break
+            if not merged and terminal_quote_patch:
+                merged = terminal_quote_patch
+            for attempted_provider in unpriced_attempts:
+                _aq_append_warning(merged, "quote_attempt:" + attempted_provider + ":unpriced")
 
             # --- v5.105.0 (Fix AR-2) BAR-AGE PROVIDER FAILOVER ---------------
             # The loop above stops at the first provider with a price; when
@@ -17529,7 +17624,7 @@ class DataEngineV5:
                 and _as_float(merged.get("current_price")) is not None
             ):
                 _ar2_tag = await _bar_age_failover_attempt(
-                    sym, page_ctx, merged, self._providers_for(page_ctx), self._fetch_patch,
+                    sym, page_ctx, merged, price_providers, self._fetch_patch,
                 )
                 if _ar2_tag:
                     _aq_append_warning(merged, _ar2_tag)
@@ -17547,7 +17642,7 @@ class DataEngineV5:
                 and "price_bar_stale" not in _safe_str(merged.get("warnings")).lower()
             ):
                 _ar5_tag = await _xprovider_verify_attempt(
-                    sym, page_ctx, merged, self._providers_for(page_ctx), self._fetch_patch,
+                    sym, page_ctx, merged, price_providers, self._fetch_patch,
                 )
                 if _ar5_tag:
                     _aq_append_warning(merged, _ar5_tag)
@@ -17591,7 +17686,13 @@ class DataEngineV5:
             # present HERE came from a real provider quote; anything filled by
             # the history/snapshot fallbacks below is NOT a live verification
             # and must not be stamped as one.
-            _live_priced = _as_float(merged.get("current_price")) is not None
+            _live_price = _as_float(merged.get("current_price"))
+            _live_priced = _live_price is not None and _live_price > 0
+            _acquired_at = _now_utc_iso() if _live_priced else ""
+            _acquired_provider = _safe_str(merged.get("data_provider")) if _live_priced else ""
+            # Capture this before history/enrichment may fill another bar's
+            # timestamp. It is a source quote time, never Last Updated.
+            _quote_asof = _quote_acquisition_asof(merged.get("price_bar_ts")) if _live_priced else ""
             _fallback_price_src = ""
             _snap_lu_utc = ""
             _snap_lu_riy = ""
@@ -17826,6 +17927,15 @@ class DataEngineV5:
                 merged["last_updated_utc"] = _now_utc_iso()
             if not merged.get("last_updated_riyadh") and not _aq_honest:
                 merged["last_updated_riyadh"] = _now_riyadh_iso()
+
+            _publish_price_acquisition(
+                merged, live_priced=_live_priced, fallback_source=_fallback_price_src,
+                acquired_at=_acquired_at, provider=_acquired_provider,
+                quote_asof=_quote_asof,
+            )
+            route_reason = yahoo_primary_reason(sym)
+            if route_reason:
+                _aq_append_warning(merged, "provider_route:" + route_reason)
 
             await self._cache.set(cache_key, merged)
             await self._store_sheet_snapshot(page_ctx, [merged])

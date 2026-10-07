@@ -366,8 +366,8 @@ p = ups[0]["body"]["values"][0]
 check("S7.4 payload: A=page, E=backend endpoint, G=rows WRITTEN, J=warn count",
       p[0] == "Global_Markets" and p[4] == "backend:run_dashboard_sync"
       and p[6] == 6626 and p[9] == 2, f"G={p[6]} J={p[9]}")
-check("S7.5 fresh coverage healthy -> Status=SUCCESS",
-      p[2] == "SUCCESS", p[2])
+check("S7.5 healthy policy coverage -> SUCCESS, absent acquisition proof stays UNKNOWN",
+      p[2] == "SUCCESS" and "acquisition=UNKNOWN" in p[3], p[2])
 
 res = fresh_res(rows_written=6626, symbols_requested=6626)
 res._stamp_meta = {"requested": 6626, "pre_persist_rows": 3000,
@@ -377,8 +377,9 @@ M._stamp_page_status(sw, "SID", "Global_Markets", res, 115)
 p = [kw for k, kw in rec.calls if k == "update"][0]["body"]["values"][0]
 check("S7.6 fresh 2900/6626 (43.8%) < min 95 -> Status=PARTIAL_FRESH",
       p[2] == "PARTIAL_FRESH", p[2])
-check("S7.7 message publishes fresh_cov explicitly",
-      "fresh_cov=43.8%" in p[3], p[3][:120])
+check("S7.7 message publishes policy coverage and honest unknown acquisition",
+      "policy_cov=43.8%" in p[3] and "acquired=unknown/6626" in p[3]
+      and "acquisition=UNKNOWN" in p[3] and "data=PARTIAL" in p[3], p[3][:120])
 
 res = fresh_res(sheet_name="Mutual_Funds", rows_written=2474)
 rec, sw = rec_writer(grid=STATGRID)
