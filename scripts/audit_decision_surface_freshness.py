@@ -8,6 +8,10 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.2.1 — consumes the corrected price-acquisition facts: a margin-only
+fundamentals quarantine remains a fundamentals flag, not a price failure.
+Configured feed policy and decision-readiness checks remain unchanged.
+
 VERSION 1.2.0 — acquisition truth is required independently of the rollout
 status cell. Missing/partial acquisition evidence and policy certification
 errors cannot certify decision readiness. Duplicate proofs remain unknown.
@@ -50,7 +54,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
 from core.data_validity import coverage_validity  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(

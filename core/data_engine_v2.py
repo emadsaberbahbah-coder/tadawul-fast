@@ -3874,7 +3874,12 @@ if str(ROOT_DIR) not in sys.path:
 # the configured Yahoo path only. Price acquisition provenance survives sheet
 # projection in warning tokens; cache reads retain the original acquisition
 # time and history/snapshot prices never claim a new quote acquisition.
-__version__ = "5.151.1"
+# v5.151.2 (2026-10-07): narrow the Yahoo-only index exception to ^TASI.SR;
+# other caret indices retain the configured EODHD quote/history alternative.
+# Acquisition checks distinguish the profit-margin quarantine from a price
+# failure without changing fundamentals or eligibility controls. If every
+# quote is unpriced, later empty shells cannot erase an earlier fetch failure.
+__version__ = "5.151.2"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -17565,6 +17570,7 @@ class DataEngineV5:
             price_providers = self._providers_for_instrument(page_ctx, sym)
             unpriced_attempts: List[str] = []
             terminal_quote_patch: Dict[str, Any] = {}
+            terminal_quote_failures: List[str] = []
             for provider_name in price_providers:
                 patch = await self._fetch_patch(provider_name, sym, page_ctx)
                 if not patch:
@@ -17586,6 +17592,10 @@ class DataEngineV5:
                     # fails. Priced rows carrying fetch_failed remain intact
                     # so the existing fail-closed guard still rejects them.
                     terminal_quote_patch = canon_patch
+                    terminal_quote_failures.extend(
+                        warning for warning in _mpc_warning_parts(canon_patch)
+                        if "fetch_failed" in warning.lower()
+                    )
                     unpriced_attempts.append(provider_name)
                     continue
                 merged = self._merge(merged, canon_patch)
@@ -17606,6 +17616,12 @@ class DataEngineV5:
                     break
             if not merged and terminal_quote_patch:
                 merged = terminal_quote_patch
+                # All quote attempts failed. Preserve every explicit failed-
+                # fetch fact even if the last unpriced shell omitted it.
+                # A genuine later positive quote remains scoped to its own
+                # result and keeps preceding failures as attempt diagnostics.
+                for terminal_failure in terminal_quote_failures:
+                    _aq_append_warning(merged, terminal_failure)
             for attempted_provider in unpriced_attempts:
                 _aq_append_warning(merged, "quote_attempt:" + attempted_provider + ":unpriced")
 

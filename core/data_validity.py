@@ -16,11 +16,13 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from core.provider_capabilities import provider_supports_instrument
 
 MAX_CLOCK_SKEW_SECONDS = 900  # Match the decision audit's existing 15 min allowance.
+# Fundamentals-only margin quarantine is retained for its own controls; it
+# does not invalidate a successfully acquired price or its provider evidence.
 _INVALID_WARNINGS = re.compile(
     r"fetch_failed|empty_row_no_provider_data|identity_quarantined|"
     r"kept_last_good|no_data_stub|placeholder_stub|price_unverified_live|"
     r"price_bar_stale|operator_quarantine|pl1_quarantined|"
-    r"persist_sanity_quarantined|fund_coherence_quarantined|xprovider_price_conflict", re.I,
+    r"persist_sanity_quarantined|xprovider_price_conflict", re.I,
 )
 _NONLIVE_PROVIDER = re.compile(
     r"fallback_error|placeholder|unavailable|history|snapshot|cache|last_good", re.I,

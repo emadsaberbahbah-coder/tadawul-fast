@@ -1,9 +1,10 @@
 """Bounded instrument routing for the provider symbols currently supported.
 
-Yahoo-native futures/indices and Yahoo Milan/NZX suffixes have no verified
-EODHD translation in this release. Do not guess another exchange or strip a
-suffix. Explicit provider configuration remains authoritative: an omitted
-Yahoo provider is not enabled by this resolver.
+Yahoo-native futures, ^TASI.SR, and Yahoo Milan/NZX suffixes use the bounded
+Yahoo path in this release. Other caret indices retain their configured
+provider chain. Do not guess another exchange or strip a suffix. Explicit
+provider configuration remains authoritative: an omitted Yahoo provider is
+not enabled by this resolver.
 """
 from __future__ import annotations
 
@@ -16,8 +17,8 @@ def yahoo_primary_reason(symbol: str) -> str:
     value = str(symbol or "").strip().upper()
     if value.endswith("=F"):
         return "yahoo_native_future"
-    if value.startswith("^"):
-        return "yahoo_native_index"
+    if value == "^TASI.SR":
+        return "yahoo_tasi_index"
     if value.endswith((".MI", ".NZ")):
         return "unverified_eodhd_exchange_mapping"
     return ""

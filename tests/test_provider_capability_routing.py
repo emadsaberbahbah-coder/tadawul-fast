@@ -2,19 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from core import data_engine_v2 as de
 from core.provider_capabilities import providers_for_instrument
+from core.data_validity import row_acquisition
 
 ACQUIRED = "2026-10-07T08:10:00+00:00"
 QUOTE_ASOF = "2026-10-07T08:09:00+00:00"
 
 
 def quote(symbol, **changes):
-    currency = "EUR" if symbol.endswith(".MI") else "NZD" if symbol.endswith(".NZ") else "SAR" if symbol == "^TASI.SR" else "USD"
+    index_currency = {"^GSPC": "USD", "^GDAXI": "EUR", "^BSESN": "INR", "^TASI.SR": "SAR"}
+    currency = index_currency.get(symbol) or ("EUR" if symbol.endswith(".MI") else "NZD" if symbol.endswith(".NZ") else "USD")
     result = {
         "symbol": symbol, "name": "Test instrument", "current_price": 100.0,
         "previous_close": 99.0, "currency": currency, "exchange": "Test venue",
@@ -56,7 +59,7 @@ def engine(monkeypatch, *, providers=None, quote_result=quote, history_result=()
     return instance, calls
 
 
-@pytest.mark.parametrize("symbol", ["GC=F", "CL=F", "^TASI.SR", "^GSPC", "ENI.MI", "AIR.NZ"])
+@pytest.mark.parametrize("symbol", ["GC=F", "CL=F", "^TASI.SR", "ENI.MI", "AIR.NZ"])
 @pytest.mark.parametrize("page", ["", "Commodities_FX", "Global_Markets", "My_Portfolio"])
 def test_quote_history_and_enrichment_share_capability_route(monkeypatch, symbol, page):
     instance, calls = engine(monkeypatch)
@@ -78,13 +81,96 @@ def test_quote_history_and_enrichment_share_capability_route(monkeypatch, symbol
     assert instance._resolve_quote_page_context(symbol, page)[1] == "yahoo_chart"
 
 
-@pytest.mark.parametrize("symbol", ["AAPL.US", "2222.SR", "SPUS.US", "ALV.DE", "USDSAR=X"])
+@pytest.mark.parametrize("symbol", ["AAPL.US", "2222.SR", "SPUS.US", "ALV.DE", "USDSAR=X", "^GSPC", "^GDAXI", "^BSESN"])
 def test_other_instruments_keep_existing_default_and_explicit_order(monkeypatch, symbol):
     instance, _ = engine(monkeypatch)
     assert instance._providers_for_instrument("Global_Markets", symbol) == instance._providers_for("Global_Markets")
     configured = ["custom", "yahoo_chart", "eodhd", "finnhub"]
     instance, _ = engine(monkeypatch, providers=configured)
     assert instance._providers_for_instrument("My_Portfolio", symbol) == configured
+
+
+def history_bars():
+    return [{"timestamp": "2026-10-07", "close": 90.0 + index}
+            for index in range(30)]
+
+
+@pytest.mark.parametrize("symbol", ["^GSPC", "^GDAXI", "^BSESN"])
+@pytest.mark.parametrize("page", ["", "Commodities_FX", "Global_Markets", "My_Portfolio"])
+def test_other_indices_keep_eodhd_quote_and_history_when_yahoo_is_unavailable(monkeypatch, symbol, page):
+    instance, calls = engine(monkeypatch, history_result=history_bars())
+
+    async def yahoo_outage(requested):
+        calls.append(("quote", "yahoo_chart", requested))
+        return {"symbol": requested, "error": "fetch_failed:HTTP429", "warnings": "fetch_failed:HTTP429"}
+
+    instance._provider_registry._modules["yahoo_chart"].get_quote = yahoo_outage
+
+    async def run():
+        row = await instance._get_enriched_quote_impl(symbol, page)
+        history = await instance._get_history_patch_best_effort(symbol, page)
+        return row, history
+
+    row, history = asyncio.run(run())
+    assert row["current_price"] == 100.0 and row["data_provider"] == "eodhd"
+    assert row["symbol"] == symbol and row["currency"] == quote(symbol)["currency"]
+    assert instance._resolve_quote_page_context(symbol, page)[1] == "eodhd"
+    price_history_calls = [(kind, provider, requested) for kind, provider, requested in calls
+                           if kind in {"quote", "history"}]
+    assert price_history_calls and all(provider == "eodhd" and requested == symbol
+                                       for _, provider, requested in price_history_calls)
+    assert history["volatility_30d"] is not None
+    assert row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
+
+
+@pytest.mark.parametrize("symbol", ["^GSPC", "^GDAXI", "^BSESN"])
+def test_other_indices_fall_back_to_yahoo_for_both_quote_and_history(monkeypatch, symbol):
+    instance, calls = engine(monkeypatch, providers=["eodhd", "yahoo_chart"], history_result=history_bars())
+
+    async def failed_quote(requested):
+        calls.append(("quote", "eodhd", requested))
+        return {"symbol": requested, "error": "fetch_failed:HTTP422",
+                "warnings": "fetch_failed:HTTP422", "currency": "WRONG"}
+
+    async def failed_history(requested):
+        calls.append(("history", "eodhd", requested))
+        return []
+
+    instance._provider_registry._modules["eodhd"].get_quote = failed_quote
+    instance._provider_registry._modules["eodhd"].get_history = failed_history
+
+    async def run():
+        row = await instance._get_enriched_quote_impl(symbol, "Commodities_FX")
+        history = await instance._get_history_patch_best_effort(symbol, "Commodities_FX")
+        return row, history
+
+    row, history = asyncio.run(run())
+    assert [provider for kind, provider, _ in calls if kind == "quote"] == ["eodhd", "yahoo_chart"]
+    assert {provider for kind, provider, _ in calls if kind == "history"} == {"eodhd", "yahoo_chart"}
+    assert row["current_price"] == 100.0 and row["data_provider"] == "yahoo_chart"
+    assert row["symbol"] == symbol and row["currency"] == quote(symbol)["currency"]
+    assert "quote_attempt:eodhd:unpriced" in row["warnings"] and "fetch_failed" not in row["warnings"]
+    assert history["volatility_30d"] is not None
+    assert row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
+
+
+@pytest.mark.parametrize("symbol", ["^GSPC", "^GDAXI", "^BSESN"])
+def test_other_indices_remain_unavailable_when_both_quote_sources_fail(monkeypatch, symbol):
+    instance, calls = engine(monkeypatch, providers=["eodhd", "yahoo_chart"],
+                             quote_result={"error": "fetch_failed:timeout", "warnings": "fetch_failed:timeout"})
+    row = asyncio.run(instance._get_enriched_quote_impl(symbol, "Commodities_FX"))
+    assert [provider for kind, provider, _ in calls if kind == "quote"] == ["eodhd", "yahoo_chart"]
+    assert row.get("current_price") is None and "acquisition_status:unavailable" in row["warnings"]
+    assert not row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
+
+
+def test_configured_eodhd_only_is_retained_for_other_caret_indices(monkeypatch):
+    instance, calls = engine(monkeypatch, providers=["eodhd"])
+    row = asyncio.run(instance._get_enriched_quote_impl("^GDAXI", "Commodities_FX"))
+    assert instance._providers_for_instrument("Commodities_FX", "^GDAXI") == ["eodhd"]
+    assert row["data_provider"] == "eodhd" and row["currency"] == "EUR"
+    assert [provider for kind, provider, _ in calls if kind == "quote"] == ["eodhd"]
+    assert row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
 
 
 @pytest.mark.parametrize("symbol", ["GC=F", "^TASI.SR", "ENI.MI", "AIR.NZ"])
@@ -167,6 +253,50 @@ def test_all_failed_sources_keep_terminal_failure_and_unavailable_acquisition(mo
     assert "acquisition_status:unavailable" in row["warnings"]
     assert "quote_attempt:eodhd:unpriced" in row["warnings"]
     assert "quote_attempt:yahoo_chart:unpriced" in row["warnings"]
+
+
+@pytest.mark.parametrize("failure", [
+    {"warnings": "fetch_failed:HTTP402"},
+    {"warnings": ["fetch_failed:HTTP402"]},
+    {"error": "fetch_failed:HTTP402"},
+])
+def test_later_unpriced_shell_cannot_erase_earlier_terminal_fetch_failure(monkeypatch, failure):
+    instance, calls = engine(monkeypatch, providers=["eodhd", "yahoo_chart"],
+                             quote_result=lambda symbol: {"symbol": symbol, "name": "Empty quote shell"})
+
+    async def failed_primary(symbol):
+        calls.append(("quote", "eodhd", symbol))
+        return {"symbol": symbol, **failure}
+
+    instance._provider_registry._modules["eodhd"].get_quote = failed_primary
+    row = asyncio.run(instance._get_enriched_quote_impl("AAPL.US", "Global_Markets"))
+    assert [provider for kind, provider, _ in calls if kind == "quote"] == ["eodhd", "yahoo_chart"]
+    assert row.get("current_price") is None
+    assert "fetch_failed" in row["warnings"]
+    assert "acquisition_status:unavailable" in row["warnings"]
+    assert not row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
+
+
+def test_actual_success_after_multiple_unpriced_attempts_keeps_failure_scoped(monkeypatch):
+    instance, calls = engine(monkeypatch, providers=["eodhd", "custom", "yahoo_chart"])
+
+    async def failed_primary(symbol):
+        calls.append(("quote", "eodhd", symbol))
+        return {"symbol": symbol, "warnings": "fetch_failed:HTTP402"}
+
+    async def unpriced_secondary(symbol):
+        calls.append(("quote", "custom", symbol))
+        return {"symbol": symbol, "name": "Empty quote shell"}
+
+    instance._provider_registry._modules["eodhd"].get_quote = failed_primary
+    instance._provider_registry._modules["custom"].get_quote = unpriced_secondary
+    row = asyncio.run(instance._get_enriched_quote_impl("AAPL.US", "Global_Markets"))
+    assert [provider for kind, provider, _ in calls if kind == "quote"] == ["eodhd", "custom", "yahoo_chart"]
+    assert row["current_price"] == 100.0 and row["data_provider"] == "yahoo_chart"
+    assert "quote_attempt:eodhd:unpriced" in row["warnings"]
+    assert "quote_attempt:custom:unpriced" in row["warnings"]
+    assert "fetch_failed" not in row["warnings"]
+    assert row_acquisition(row, datetime.fromisoformat(ACQUIRED), 3600).successful
 
 
 def test_priced_provider_failure_is_not_sanitized_into_success(monkeypatch):

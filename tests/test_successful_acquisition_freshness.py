@@ -2,11 +2,13 @@
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 import asyncio
+import copy
 
 import pytest
 
+from core import data_engine_v2 as engine
 from core.data_validity import acquisition_census, coverage_validity, row_acquisition
-from core.sheets.schema_registry import get_sheet_headers
+from core.sheets.schema_registry import get_sheet_headers, get_sheet_keys
 from scripts import run_dashboard_sync as sync
 from scripts.audit_full_refresh_coverage import Rule, audit_grid
 from scripts.audit_decision_surface_freshness import audit_surfaces, parse_status_grid
@@ -31,7 +33,6 @@ def matrix(rows):
     ({"Warnings":"fetch_failed:HTTP 402"},"INVALID"),
     ({"Warnings":"empty_row_no_provider_data"},"INVALID"),
     ({"Warnings":"identity_quarantined:kept_last_good"},"INVALID"),
-    ({"Warnings":"fund_coherence_quarantined"},"INVALID"),
     ({"Warnings":"persist_sanity_quarantined"},"INVALID"),
     ({"Warnings":"xprovider_price_conflict"},"INVALID"),
     ({"Warnings":"price_unverified_live:snapshot"},"INVALID"),
@@ -53,6 +54,117 @@ def matrix(rows):
 ])
 def test_recent_publication_never_hides_failure(changes,status):
     assert row_acquisition(quote(**changes),NOW,30*3600).status==status
+
+
+
+def projected_fund_quarantine(mode, *, typed=True, failure=""):
+    """Exercise the real margin sentry, acquisition producer and 115-key boundary.
+
+    A 10x margin disagreement falls outside the 100x repair band. The quote
+    inputs are frozen provider-shaped evidence, not a new live acquisition.
+    """
+    row = {"symbol":"BHF.US", "name":"Brighthouse Financial", "current_price":50.02,
+           "data_provider":"eodhd", "last_updated_utc":"2026-10-07T08:59:00Z",
+           "last_updated_riyadh":"2026-10-07T11:59:00+03:00", "pe_ttm":10.0,
+           "market_cap":1e9, "revenue_ttm":1e9, "profit_margin":1.0,
+           "warnings":"", "recommendation":"HOLD",
+           "recommendation_reason":"Await decision inputs"}
+    before = copy.deepcopy(row)
+    tag = engine._fund_coherence_sentry(row, mode)
+    after_sentry = copy.deepcopy(row)
+    engine._aq_append_warning(row, tag)
+    if failure == "price_missing":
+        row["current_price"] = None
+    elif failure == "provider_unavailable":
+        row["data_provider"] = "fallback_error"
+    elif failure == "stale_acquisition":
+        row["last_updated_utc"] = "2026-10-01T08:59:00Z"
+        row["last_updated_riyadh"] = "2026-10-01T11:59:00+03:00"
+    elif failure == "future_acquisition":
+        row["last_updated_utc"] = "2036-10-07T08:59:00Z"
+        row["last_updated_riyadh"] = "2036-10-07T11:59:00+03:00"
+    elif failure and failure != "preserved":
+        engine._aq_append_warning(row, failure)
+    if typed:
+        engine._publish_price_acquisition(row, live_priced=failure != "preserved",
+            fallback_source="snapshot" if failure == "preserved" else "",
+            acquired_at=row["last_updated_utc"], provider=row["data_provider"],
+            quote_asof="2026-10-07T08:58:00Z")
+    headers = get_sheet_headers("Global_Markets")
+    keys = get_sheet_keys("Global_Markets")
+    projected = engine._strict_project_row(keys, row)
+    display = engine._strict_project_row_display(headers, keys, projected)
+    values = [display[header] for header in headers]
+    return before, after_sentry, tag, headers, display, values
+
+
+@pytest.mark.parametrize("fund_mode", ["observe", "enforce"])
+@pytest.mark.parametrize("policy_mode", ["off", "observe", "enforce"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_margin_sentry_keeps_price_acquisition_and_fundamentals_controls(
+        fund_mode, policy_mode, typed, monkeypatch):
+    monkeypatch.setenv("TFB_SYNC_FETCHFAIL_TRUTH", policy_mode)
+    monkeypatch.setenv("TFB_SYNC_STATUS_TRUTH", "0")
+    before, after, tag, headers, display, values = projected_fund_quarantine(fund_mode, typed=typed)
+    assert tag == "fund_coherence_quarantined:profit_margin" + (":observe" if fund_mode == "observe" else "")
+    expected = dict(before, profit_margin=None) if fund_mode == "enforce" else before
+    assert after == expected  # Actual sentry changes only the margin in enforce.
+    assert len(headers) == len(values) == 115
+    assert tag in display["Warnings"]
+    assert display["Profit Margin"] == (None if fund_mode == "enforce" else 1.0)
+    for key, header in (("current_price", "Current Price"), ("data_provider", "Data Provider"),
+                        ("last_updated_utc", "Last Updated (UTC)"),
+                        ("last_updated_riyadh", "Last Updated (Riyadh)")):
+        assert display[header] == before[key]
+    # Acquired price is independent of the existing recommendation/gate verdict.
+    assert display["Investability Status"] == "BLOCKED"
+    assert display["Final Action"] == "DO_NOT_INVEST"
+    assert display["Block Reason"]
+    snapshot = copy.deepcopy(display)
+    verdict = row_acquisition(display, NOW, 30*3600)
+    assert verdict.successful and display == snapshot
+    assert (verdict.quote_asof is not None) == typed
+    census = acquisition_census(headers, [values], now=NOW, max_age_seconds=30*3600, requested=["BHF.US"])
+    assert census.successful == {"BHF.US"} and not census.invalid and not census.unknown
+    result = sync.TaskResult(key="GLOBAL", sheet_name="Global_Markets", status="success",
+        start_utc=NOW.isoformat(), symbols_requested=1, rows_written=1)
+    result._stamp_meta.update(requested=1, pre_persist_rows=1, fresh_lineage_known=True,
+        fetched_origin=1, noncurrent_fetched=0, ff_new=0)
+    assert sync._record_acquisition_census(result, headers, [values], ["BHF.US"], now=NOW) == {"BHF.US"}
+    assert sync._page_fresh_fetch_metrics(result) == (1, 1, 100.0)
+    assert sync._uv_page_state(result) == ("OK", 100.0)
+    stamp = sync._status_stamp_row("Global_Markets", result, len(headers))
+    assert "acquired=1/1" in stamp[3] and "acquisition=COMPLETE" in stamp[3] and "data=COMPLETE" in stamp[3]
+    parsed = parse_status_grid([["Page", "Last Updated", "Status", "Message", "Rows", "Columns"], stamp])
+    assert parsed["Global_Markets"].acquired_fresh == 1
+    assert parsed["Global_Markets"].acquisition == "COMPLETE"
+    audit = audit_grid([headers, values], Rule("Global_Markets", 1, 30, 95, 0, 0), headers, NOW)
+    assert audit.status == "PASS" and audit.fresh == audit.timestamp_fresh == 1
+    assert display == snapshot  # Classification never promotes eligibility or erases the flag.
+
+
+@pytest.mark.parametrize("fund_mode", ["observe", "enforce"])
+@pytest.mark.parametrize("failure", ["fetch_failed:timeout", "identity_quarantined:bad_symbol",
+    "persist_sanity_quarantined:v6.36.0", "price_unverified_live:snapshot", "xprovider_price_conflict",
+    "preserved", "price_missing", "provider_unavailable", "stale_acquisition", "future_acquisition"])
+def test_margin_quarantine_cannot_rescue_actual_price_or_provenance_failure(fund_mode, failure, monkeypatch):
+    monkeypatch.setenv("TFB_SYNC_FETCHFAIL_TRUTH", "enforce")
+    monkeypatch.setenv("TFB_SYNC_STATUS_TRUTH", "0")
+    _before, _after, tag, headers, display, values = projected_fund_quarantine(fund_mode, failure=failure)
+    assert tag in display["Warnings"]
+    assert row_acquisition(display, NOW, 30*3600).status == "INVALID"
+    census = acquisition_census(headers, [values], now=NOW, max_age_seconds=30*3600, requested=["BHF.US"])
+    assert census.invalid == {"BHF.US"} and not census.successful
+    result = sync.TaskResult(key="GLOBAL", sheet_name="Global_Markets", status="success",
+        start_utc=NOW.isoformat(), symbols_requested=1, rows_written=1)
+    result._stamp_meta.update(requested=1, pre_persist_rows=1, fresh_lineage_known=True,
+        fetched_origin=1, noncurrent_fetched=0, ff_new=0)
+    assert not sync._record_acquisition_census(result, headers, [values], ["BHF.US"], now=NOW)
+    assert sync._page_fresh_fetch_metrics(result) == (0, 1, 0.0)
+    stamp = sync._status_stamp_row("Global_Markets", result, len(headers))
+    assert "acquired=0/1" in stamp[3] and "acquisition=PARTIAL" in stamp[3] and "data=PARTIAL" in stamp[3]
+    audit = audit_grid([headers, values], Rule("Global_Markets", 1, 30, 95, 0, 0), headers, NOW)
+    assert audit.status == "FAIL" and audit.fresh == 0
 
 
 def test_trusted_fallback_and_optional_attempt_failure_count_as_acquired():

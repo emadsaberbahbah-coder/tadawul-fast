@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.2.1 — fundamentals-only margin quarantine does not invalidate a
+successful price acquisition. Its flag and fundamentals controls remain intact.
+
 VERSION 1.2.0 — successful acquisitions and timestamp freshness are separate.
 Valid price/provider, bounded retrieval time and unusable provenance are
 checked per unique identity. Generated timestamps cannot green failed rows.
@@ -32,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")

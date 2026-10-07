@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.3)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.4)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1842,7 +1842,11 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.3"
+SCRIPT_VERSION = "6.64.4"
+# v6.64.4: shared acquisition classification excludes the fundamentals-only
+# profit-margin quarantine. Its flag, fundamentals controls and configured
+# feed policy remain intact; genuine price/provenance failures still invalidate
+# acquisition.
 # v6.64.3: successful-acquisition facts are captured before restoration,
 # independently of persistence and rollout flags. Status/PAGE disclose the
 # factual numerator, timestamp diagnostic and policy numerator separately.
