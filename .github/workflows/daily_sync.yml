@@ -6,20 +6,12 @@ on:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler (UTC; Riyadh UTC+3) — every 4 hours, every day.
-  # CHANGED 2026-06-30 from ~2-hourly to 4-hourly: each run now has more budget to
-  # finish ALL pages (Global_Markets is ~3,000 symbols) and leaves headroom for
-  # adding new symbols, while a single daily rule replaces the prior Mon–Fri +
-  # Sunday split. Riyadh fire times: 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 — the
-  # 07:00 run precedes the 08:00 cockpit refresh and the 09:00 brief on EVERY
-  # trading day INCLUDING Sunday (previously Sunday's first sync was 10:00 Riyadh,
-  # AFTER the brief). FX/commodities trade ~24h, so the extra Saturday/holiday
-  # fires are harmless (equity rows unchanged, FX still moves).
-  # NOTE: cron cannot see HOLIDAYS/DST; a holiday run fires harmlessly. A
-  # market-calendar guard step remains the clean follow-up if exact per-market
-  # session handling is ever needed. NOTE: 4-hourly addresses cadence/headroom —
-  # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
-  # or the 25-min job cap being too short for a full sweep); check the Actions tab.
+  # ✅ Production scheduler (UTC; Riyadh UTC+3): three slots every day.
+  # Configured Riyadh times are 07:17, 15:17 and 23:17. GitHub can delay them;
+  # the actual run timestamp is the execution witness. This includes Sunday.
+  # Three slots retain the existing provider-quota budget. Cron does not know
+  # venue holidays or DST, and a scheduled start does not prove a completed
+  # refresh. Check the source run, recovery and coverage-audit results.
   schedule:
     - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
                                  # P-170 (2026-09-26): minute 00 is GitHub's most-delayed schedule minute -

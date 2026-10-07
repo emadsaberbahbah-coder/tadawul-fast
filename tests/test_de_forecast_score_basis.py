@@ -294,10 +294,15 @@ def test_late_basis_holdback_preserves_exit_through_actual_page_surface_invarian
     assert returned["overall_score"] is None
 
 
-def test_cached_published_margin_is_never_rescored_or_rescaled(monkeypatch):
+@pytest.mark.parametrize("unit_proof", [True, False], ids=["value_bound_published", "legacy_unitless_unresolved"])
+def test_cached_published_margin_is_never_rescored_or_rescaled(monkeypatch, unit_proof):
     monkeypatch.setenv("TFB_MARGIN_PUBLISH", "enforce")
     engine, calls = _engine(monkeypatch)
     row = _old_scored_row(profit_margin=0.009, warnings=ACQUISITION + "; margin_publish:profit_margin:pts")
+    if unit_proof:
+        row["_margin_unit_basis"] = {
+            "profit_margin": {"unit": "fraction", "value": 0.009, "published": True},
+        }
 
     async def run():
         page, _ = engine._resolve_quote_page_context(SYMBOL, "Global_Markets")
@@ -307,7 +312,9 @@ def test_cached_published_margin_is_never_rescored_or_rescaled(monkeypatch):
 
     output = asyncio.run(run())
     _assert_held(output)
-    assert output["profit_margin"] == 0.009
+    assert output["profit_margin"] == (0.009 if unit_proof else None)
+    if not unit_proof:
+        assert "margin_publish:profit_margin:unresolved" in de._mpc_warning_parts(output)
     assert calls == []
 
 

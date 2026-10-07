@@ -54,6 +54,12 @@ an explicit repository value `0` remains an opt-out. Direct CLI helper defaults
 are unchanged. A merge or configuration expression alone does not prove the
 resolved value in a production run.
 
+Production scoring settlement, tuple coherence, margin publication and
+historical target-unit measurement retain their observation settings. The
+strict-mode repairs do not silently arm a new model or calibration policy.
+New checkpoint creation and fee-inclusive portfolio arithmetic are corrected
+independently of those settings. Fundamentals unit enforcement remains enabled.
+
 ## Coverage and decision evidence
 
 The linked full audit [37680095784](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/37680095784)
@@ -71,10 +77,14 @@ The audit exits unsuccessfully for these coverage failures. A successful outcome
 audit or sync process cannot supersede this verdict. Acquisition success also
 does not prove current market quote age or executable eligibility.
 
-No approved membership source has been located. Older backups mix different
-markets/scopes; they cannot establish the intended current universe. The owner
-has been asked for a repository manifest, provider list or Drive source. Do not
-lower coverage floors or manufacture members to turn an audit green.
+The user confirmed that no repository, provider or Drive roster is approved
+today. The live page Symbol column defines current membership, but it cannot
+recover members already lost. The July 16 staged-expansion member list was
+never committed. Older inspected backups mix different markets/scopes; they
+cannot establish the intended current universe. A search for an early matching
+backup is read-only. Any restoration requires an approved roster, versioned
+files, backup and reviewed membership diff before workbook changes. Do not lower
+coverage floors or manufacture members to turn an audit green.
 
 The latest inspected board was WITHHELD with zero executable seats, zero
 research/grace ticket amounts and masked financial KPIs. This supports the prior
@@ -110,7 +120,28 @@ the production-pinned contract stack. Existing tests and all four required
 checks remain. Independent reviewers check frozen source bytes and actual
 producer/consumer paths rather than only helper-level mocks.
 
-Final combined local results, independent review receipts, protected merge,
-exact Render revision and targeted live readbacks are recorded below after
-validation. Code completion, deployment, scheduled execution and native
-installation are distinct acceptance states.
+All 14 checked-in non-publishing required workflow steps passed on the final
+combined runtime, tests and workflow contents. The local documentation/commit
+record is completed afterward; exact-head GitHub CI verifies the published SHA.
+
+| Combined Python 3.11 check | Result |
+| --- | --- |
+| Blocking lean command | 1,279 passed, 13 subtests passed, six explicit optional skips |
+| Production-pinned schema/route/transport command | 146 passed, two existing schema skips |
+| Full-source Apps Script funding | 64 passed |
+| Fail-closed policy | 18 passed; deterministic artifact generated |
+| Workflow audit | Seven tests passed; scanner zero errors, 27 existing warnings |
+| Daily full-requirements command and sync harness | Passed; exact result recorded in the release receipt |
+| Compilation and diff checks | Passed |
+
+Independent reviews cleared frozen news/calendar/rank/schedule candidates,
+the complete diagnostic-output repair, and fee/checkpoint/margin contracts.
+The parent separately reviewed forecast-basis changes and ran 181 affected
+tests before integrating units. The combined command then found and corrected
+two test-boundary issues: inherited global logging disable, and an old untyped
+margin fixture. The latter now proves both preserved value-bound units and
+legacy unresolved units; neither correction weakens production safeguards.
+
+Protected merge, exact Render revision and targeted live readbacks are recorded
+in the release receipt. Code completion, deployment, scheduled execution and
+native installation are distinct acceptance states.
