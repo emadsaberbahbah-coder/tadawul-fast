@@ -48,6 +48,23 @@ The two actual-library cases skip only in the lean environment. Focused proof:
 67 passed, 2 skipped in Python 3.11 lean; 69 passed in the pinned full image.
 The inherited loopguard and manifest regressions also pass independently.
 
+A separate local lifecycle repair shields subscribers from cancelling the
+shared acquisition. Cancelling its owner cancels the shared result, wakes all
+subscribers and propagates cancellation. Ordinary owner errors still reach
+every subscriber and flight cleanup retains its existing identity guard.
+The real batch method explicitly propagates a gathered cancellation rather
+than unpacking it as a quote or publishing a successful partial/empty batch.
+Six direct concurrency and real-provider/batch regressions verify these
+paths without inventing a price, cache entry or circuit failure.
+
+Final combined required validation used the checked-in workflow commands and
+Python 3.11 lean, production-pinned contract and full-requirements images:
+all 14 steps passed. Lean: 657 passed, 5 optional skips and 13 subtests;
+contract: 45 passed, 2 optional skips; full-source Apps Script: 18 passed;
+daily-sync full image: 150 passed plus the deterministic 84/84 harness;
+policy: 18 passed; workflow audit: 7 passed and zero scanner errors. Existing
+test-return warnings and 27 action-major audit warnings remain unchanged.
+
 This is local acquisition-path evidence. A deployed exact-SHA refresh and the
 shared acquisition census must verify the resulting live coverage. Retrieval
 freshness remains distinct from source quote age, liquidity and tradability.

@@ -8,6 +8,8 @@ v8.15.1 -- isolate symbol-local quote misses from provider outages. A 404
 or an empty instrument cannot open the shared quote breaker. Mixed host
 failures and failed fallback transport retain outage protection. Local
 misses use bounded symbol-only backoff; no price/provenance is invented.
+Cancelled single-flight owners release their waiters; cancelled waiters do
+not cancel shared acquisition. Batch cancellation remains cancellation.
 ================================================================================
 v8.15.0 -- LOOPGUARD (B6-b): ASYNC STATE SURVIVES asyncio.run() PER CALL
 --------------------------------------------------------------------------------
@@ -1986,13 +1988,21 @@ class SingleFlight:
         # v8.15.0 LOOPGUARD: OUTSIDE the critical section -- a threading.Lock
         # held across an await would deadlock the loop.
         if not owner:
-            return await future
+            # One subscriber cannot cancel the shared acquisition or its
+            # result still awaited by other subscribers.
+            return await asyncio.shield(future)
 
         try:
             result = await coro_fn()
             if not future.cancelled() and not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            # Wake every subscriber. Cancellation is never a priced or
+            # empty successful result and must not leave a pending waiter.
+            if not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             if not future.cancelled() and not future.done():
                 future.set_exception(exc)
@@ -3120,6 +3130,8 @@ class YahooChartProvider:
 
         output: Dict[str, Dict[str, Any]] = {}
         for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if isinstance(result, Exception):
                 continue
             sym, data = result

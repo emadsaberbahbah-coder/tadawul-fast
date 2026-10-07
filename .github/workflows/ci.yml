@@ -305,6 +305,7 @@ jobs:
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
+            tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
 
