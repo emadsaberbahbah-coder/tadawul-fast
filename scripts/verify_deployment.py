@@ -106,7 +106,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.2", "shadow scorer"),
-    ("track_performance", "6.42.0", "track performance"),
+    ("track_performance", "6.42.1", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.

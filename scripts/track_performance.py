@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.34.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.42.1)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1468,7 +1468,14 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _s1_zero_baseline_enabled,
 #   _s1_zero_mae, _zb_strip.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.42.0"
+# v6.42.1 (2026-10-08): new 1W/2W target tuples always come from the
+# explicit entry/1M forecast price pair, in percentage points. Sentry modes
+# still control historical measurement, not this creation contract. Stored
+# rows are never rewritten. Enforce cannot publish a legacy PASS when its
+# corrected cohort is unavailable; sibling evidence must be unique and use
+# the checkpoint's entry price. Existing 1M/3M creation and thresholds stay
+# unchanged.
+SCRIPT_VERSION = "6.42.1"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3590,21 +3597,30 @@ def _perf_unit_day_key(r: Any) -> str:
         return ""
 
 
-def _perf_unit_sibling_index(records: Any) -> Dict[str, float]:
-    """day-key -> price-implied 1M thesis (percent points), taken from 1M
-    records carrying a positive entry price AND target price."""
-    idx: Dict[str, float] = {}
+def _perf_unit_sibling_index(
+    records: Any,
+) -> Dict[str, Optional[Tuple[float, float]]]:
+    """day-key -> (entry, price-implied 1M thesis in pp). A witness must
+    be a unique same-day 1M row with finite positive prices. Duplicate or
+    invalid witnesses remain unresolved; iteration order never picks one."""
+    idx: Dict[str, Optional[Tuple[float, float]]] = {}
     for r in (records or []):
         try:
             if getattr(getattr(r, "horizon", None), "value", None) != "1M":
                 continue
+            k = _perf_unit_day_key(r)
+            if not k:
+                continue
+            if k in idx:
+                idx[k] = None
+                continue
+            idx[k] = None
             ep = _safe_float(getattr(r, "entry_price", 0.0), default=0.0)
             tp = _safe_float(getattr(r, "target_price", 0.0), default=0.0)
-            if ep <= 0.0 or tp <= 0.0:
-                continue
-            k = _perf_unit_day_key(r)
-            if k and k not in idx:
-                idx[k] = (tp / ep - 1.0) * 100.0
+            if ep > 0.0 and tp > 0.0:
+                thesis = (tp / ep - 1.0) * 100.0
+                if math.isfinite(thesis):
+                    idx[k] = (ep, thesis)
         except Exception:
             continue
     return idx
@@ -3631,12 +3647,16 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
         if target == 0.0:
             continue
         days = 7.0 if hz == "1W" else 14.0
-        truth_1m = idx.get(_perf_unit_day_key(r))
-        if truth_1m is None:
+        key = _perf_unit_day_key(r)
+        witness = idx.get(key)
+        entry = _safe_float(getattr(r, "entry_price", 0.0), default=0.0)
+        if key not in idx:
             label, fixed, reason = "unresolved", None, "no_sibling"
+        elif witness is None or entry <= 0.0 or entry != witness[0]:
+            label, fixed, reason = "unresolved", None, "mismatch"
         else:
             label, fixed = _perf_unit_pick(
-                target, truth_1m * days / _PERF_UNIT_BASE_DAYS)
+                target, witness[1] * days / _PERF_UNIT_BASE_DAYS)
             reason = "mismatch"
         allc[label] += 1
         if getattr(r, "status", None) != PerformanceStatus.MATURED:
@@ -3650,13 +3670,16 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
             continue
         if label == "percent" and abs(fixed) < _PERF_UNIT_TINY_PP:
             tiny += 1
-        err = float(realized) - float(fixed)
+        realized = float(realized)
+        err = realized - float(fixed)
+        if not math.isfinite(realized) or not math.isfinite(err):
+            raise ValueError("nonfinite corrected checkpoint error")
         errs.append(err)
         per_hz.setdefault(hz, []).append(err)
         # v6.42.0 (P-201): zero-forecast baseline over the SAME unit-
         # corrected cohort, so row 2 compares like with like.
-        zero_errs.append(abs(float(realized)))
-        zero_per_hz.setdefault(hz, []).append(abs(float(realized)))
+        zero_errs.append(abs(realized))
+        zero_per_hz.setdefault(hz, []).append(abs(realized))
     n = len(errs)
     rep: Dict[str, Any] = {
         "n": n, "mean_abs_error_pp": None, "mean_signed_error_pp": None,
@@ -3679,9 +3702,9 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
 def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
                           mode: str) -> Dict[str, Any]:
     """observe: the legacy result plus a 'unit_sentry' report. enforce: the
-    headline moves to the unit-corrected basis and Detail discloses it; with
-    nothing resolvable, or on any error, the legacy basis is kept and the
-    reason is published. Never raises."""
+    headline moves to the unit-corrected basis and Detail discloses it.
+    Without a corrected cohort, enforce publishes PENDING with unknown
+    metrics; legacy results remain diagnostic only. Never raises."""
     new = dict(out)
     try:
         rep = _s1_unit_sentry_measure(records)
@@ -3693,17 +3716,32 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
         "by_horizon", "detail", "zero_mae_pp")}   # v6.42.0 (P-201)
     rep["creation"] = dict(_PERF_UNIT_CREATION)
     new["unit_sentry"] = rep
-    if mode != "enforce" or rep.get("error"):
+    if mode != "enforce":
         return new
-    n = int(rep.get("n") or 0)
-    if n == 0:
-        rep["enforce_note"] = "no resolvable checkpoint - legacy basis kept"
+
+    def _pending(reason: str) -> Dict[str, Any]:
+        rep["enforce_note"] = reason
+        for k, v in (("n", 0), ("mean_abs_error_pp", None),
+                     ("mean_signed_error_pp", None), ("by_horizon", {}),
+                     ("zero_mae_pp", None)):
+            new[k] = v
+            rep[k] = v
+        new["state"] = "PENDING"
+        new["detail"] = "unit-sentry enforce: " + reason
         return new
+
+    if rep.get("error"):
+        return _pending(str(rep["error"]) + " - corrected calibration unavailable")
     try:
+        n = int(rep.get("n") or 0)
+        if n <= 0:
+            return _pending("no resolvable checkpoint - corrected calibration unavailable")
         band = float(out.get("band_pp"))
         min_sample = int(out.get("min_sample"))
         mean_abs = float(rep["mean_abs_error_pp"])
         mean_signed = float(rep["mean_signed_error_pp"])
+        if not all(math.isfinite(v) for v in (band, mean_abs, mean_signed)):
+            raise ValueError("nonfinite corrected calibration")
         c = rep.get("counts") or {}
         _leg = rep["legacy"].get("mean_abs_error_pp")
         tail = (" [unit-sentry enforce: targets in pp; %d fraction-scale "
@@ -3733,11 +3771,8 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
             f"signed {mean_signed:+.2f}pp" + _bias_note + tail)
         return new
     except Exception as exc:
-        rep["enforce_note"] = ("enforce_error:" + type(exc).__name__
-                               + " - legacy basis kept")
-        fallback = dict(out)
-        fallback["unit_sentry"] = rep
-        return fallback
+        return _pending("enforce_error:" + type(exc).__name__
+                        + " - corrected calibration unavailable")
 
 
 def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
@@ -7665,21 +7700,21 @@ class PerformanceTrackerApp:
     def _derive_checkpoint_target(
         self, row: Dict[str, Any], horizon: HorizonType, entry_price: float
     ) -> Tuple[float, float]:
-        """v6.23.0: time-scaled slice of the 1M thesis (see module WHY).
-        Returns (0.0, 0.0) when no 1M forecast exists — a checkpoint is never
-        invented from nothing."""
-        base_roi = _safe_float(row.get("expected_roi_1m"), default=0.0)
+        """Time-scaled 1M price thesis, expressed in percentage points.
+        Only the explicit positive finite entry/forecast price pair is a
+        witness: raw expected_roi_1m units never determine either value.
+        Missing or unrepresentable evidence returns (0.0, 0.0)."""
+        entry_price = _safe_float(entry_price, default=0.0)
         base_price = _safe_float(row.get("forecast_price_1m"), default=0.0)
-        if base_roi == 0.0 and base_price > 0.0 and entry_price > 0.0:
-            base_roi = (base_price / entry_price - 1.0) * 100.0
-        if base_roi == 0.0:
+        if entry_price <= 0.0 or base_price <= 0.0:
             return 0.0, 0.0
-        # v6.39.0 (P-158): gate off -> identity.
-        base_roi = _perf_unit_creation(base_roi, base_price, entry_price)
         frac = float(horizon.days) / self._CHECKPOINT_BASE_DAYS
-        tgt_roi = base_roi * frac
-        tgt_price = (entry_price * (1.0 + tgt_roi / 100.0)
-                     if entry_price > 0.0 else 0.0)
+        tgt_roi = (base_price / entry_price - 1.0) * (100.0 * frac)
+        # A convex price slice avoids an overflowing intermediate ROI
+        # multiplication when both explicit prices are otherwise finite.
+        tgt_price = entry_price * (1.0 - frac) + base_price * frac
+        if not math.isfinite(tgt_roi) or not math.isfinite(tgt_price) or tgt_price <= 0.0:
+            return 0.0, 0.0
         return tgt_price, tgt_roi
 
     def _derive_target(

@@ -3803,6 +3803,7 @@ _CB_QTY_ALIASES = frozenset({"quantity", "qty", "shares", "units", "positionqty"
 _CB_COST_ALIASES = frozenset({"buyprice", "avgcost", "averagecost", "avgbuyprice",
                               "averagebuyprice", "avgcostprice"})
 _CB_CURRENCY_ALIASES = frozenset({"ccy", "currency"})
+_CB_BUY_FEES = "buyfees"
 
 # Position-math columns recomputed after injection (alias-matched, normalized).
 _PM_QTY_ALIASES = frozenset({"qty", "quantity", "shares", "units", "positionqty", "positionquantity"})
@@ -3884,8 +3885,12 @@ def _portfolio_ledger_name(value: Any, symbol: str) -> Optional[str]:
 def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
     """Read one complete, unambiguous active-ledger snapshot.
 
-    Buy Price / Avg Cost is a native-currency unit cost. Aggregate Cost Basis,
-    fees and SAR totals cannot establish that value. Duplicate active lots
+    Buy Price is a native-currency trade price. An explicit Buy Fees column
+    establishes native acquisition fees: effective unit cost is
+    (Shares * Buy Price + Buy Fees) / Shares, matching the native ledger.
+    Preserve those two inputs separately in the frozen snapshot. An Avg Cost
+    alias with nonzero fees is ambiguous and cannot establish this contract.
+    Aggregate Cost Basis and SAR totals cannot establish the input. Duplicate active lots
     require an explicit aggregation contract, so they remain unproven here.
     {} means no safe refresh cohort; the caller must preserve the old page.
     """
@@ -3909,6 +3914,10 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
             return {}
         columns.append(found[0])
     s_i, status_i, q_i, c_i, ccy_i = columns
+    fee_columns = [i for i, name in enumerate(names) if name.startswith(_CB_BUY_FEES)]
+    if len(fee_columns) > 1 or any(names[i] != _CB_BUY_FEES for i in fee_columns):
+        return {}  # Do not silently treat a fee in another currency as native.
+    fee_i = fee_columns[0] if fee_columns else -1
     name_columns = [i for i, name in enumerate(names) if name in _GUARD_NAME_ALIASES]
     name_i = name_columns[0] if len(name_columns) == 1 else -1
     out: Dict[str, Dict[str, Any]] = {}
@@ -3942,6 +3951,17 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
                 or not re.fullmatch(r"[A-Z]{3}", currency) or sym in out):
             return {}
         out[sym] = {"qty": qty, "cost": cost, "currency": currency}
+        if fee_i >= 0:
+            fees = _pm_to_float(row[fee_i]) if fee_i < len(row) else None
+            if fees is None or fees < 0 or (fees != 0 and names[c_i] != "buyprice"):
+                return {}
+            native_cost = qty * cost + fees
+            effective_cost = native_cost / qty
+            if (not math.isfinite(native_cost) or native_cost <= 0
+                    or not math.isfinite(effective_cost) or effective_cost <= 0):
+                return {}
+            out[sym].update({"buy_price": cost, "buy_fees": fees,
+                            "native_cost": native_cost, "cost": effective_cost})
         name = _portfolio_ledger_name(row[name_i], sym) if 0 <= name_i < len(row) else None
         if name is not None:
             out[sym]["name"] = name
@@ -4061,7 +4081,9 @@ def _inject_portfolio_holdings(
             rr[avg_i] = buy
             price = _pm_to_float(rr[price_i]) if price_i >= 0 else None
             psar = _pm_to_float(rr[psar_i]) if psar_i >= 0 else None
-            native_cost = qty * buy
+            # Keep the total from the same frozen raw-price/fee snapshot.
+            # Multiplying the effective unit cost back can add rounding drift.
+            native_cost = hold.get("native_cost", qty * buy)
             if cost_i >= 0:
                 rr[cost_i] = round(native_cost, 6)
             for i in (mv_i, pnl_i, pct_i, mv_sar_i, cost_sar_i, pnl_sar_i):
@@ -4147,6 +4169,9 @@ def _portfolio_holdings_contract(
                 return False, "holding quantity or unit cost differs from ledger snapshot"
             if cost_i >= len(row) or _pm_to_float(row[cost_i]) is None:
                 return False, "nonfinite native position cost"
+            native_cost = cost_basis[symbol].get("native_cost", qty * cost)
+            if _pm_to_float(row[cost_i]) != round(native_cost, 6):
+                return False, "native position cost differs from ledger snapshot"
             price = _pm_to_float(row[price_i]) if price_i < len(row) else None
             if price is not None and price > 0 and any(
                     i >= len(row) or _pm_to_float(row[i]) is None
