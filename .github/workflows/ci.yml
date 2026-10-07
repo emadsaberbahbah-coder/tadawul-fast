@@ -301,6 +301,9 @@ jobs:
             tests/test_news_intelligence_contracts.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_tfb_backtest_rank_evidence.py \
+            tests/test_secret_redaction.py \
+            tests/test_task_error_redaction.py \
+            tests/test_de_forecast_score_basis.py \
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
             tests/test_sync_fetchfail_truth_p162.py \
@@ -377,7 +380,10 @@ jobs:
             tests/test_schema_alignment.py \
             tests/test_current_schema_contract.py \
             tests/test_opportunity_blocked_invariant.py \
-            tests/test_board_funding_route.py
+            tests/test_board_funding_route.py \
+            tests/test_redaction_boundaries.py \
+            tests/test_route_error_redaction.py \
+            tests/test_eodhd_error_redaction.py
           echo "::endgroup::"
 
   # ==========================================================================
