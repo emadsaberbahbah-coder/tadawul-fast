@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.23.2  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.1  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.24.1 (2026-10-07): signed replay covers all execution policy families and
+the Render release identity; signing resolves the endpoint's complete active
+authentication token set so primary/backup/list rotation invalidates snapshots.
+Ordinary single-pass requests and their authentication semantics are unchanged.
 
 v1.9.0 [B-6 SHARIAH MODEL GATE — the resolver's own "until the Gen-2
 wiring" note, closed]: compliance_rule_sets() has merged the operator's
@@ -588,6 +593,8 @@ TFB_OPP_STOP_VOL_MULT rather than editing formulas.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
 import math
 import os
@@ -1360,7 +1367,106 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.23.2"
+OPPORTUNITY_BUILDER_VERSION = "1.24.1"
+
+# Final board allocation is an explicit, two-pass contract. A frozen snapshot
+# prevents the stability pass from reserving cash for research/grace seats and
+# prevents the allocation replay from acquiring a different price/policy basis.
+_BOARD_FUNDING_VERSION = 1
+_BOARD_FUNDING_MAX_ROWS = 500
+_BOARD_FUNDING_MAX_BYTES = 1_000_000
+_BOARD_FUNDING_MAX_AGE_S = 180
+_BOARD_FUNDING_POLICY_PREFIXES = (
+    "TFB_OPP_", "TFB_T10_", "TFB_TICKET_", "TFB_COMPLIANCE_", "TFB_TREND_",
+)
+_BOARD_FUNDING_POLICY_NAMES = frozenset((
+    "TFB_FORECAST_BASIS", "TFB_ELIGIBILITY_GATE", "TFB_GLOBAL_ACTIVITY_SCREEN",
+    "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA", "TFB_KSA_FOREIGN_RESTRICTED",
+))
+
+
+def _board_funding_json(value):
+    # GAS JSON.parse/stringify turns 100.0 into 100, -0.0 into 0 and may
+    # change decimal/exponent spelling. Sign the JSON number's IEEE-754 value,
+    # with explicit type tags, rather than Python's serializer spelling.
+    # The same canonicalization protects the signature, basis and row check.
+    def canonical(obj):
+        if obj is None:
+            return ["null"]
+        if isinstance(obj, bool):
+            return ["bool", obj]
+        if isinstance(obj, (int, float)):
+            number = float(obj)
+            return ["number", (0.0 if number == 0 else number).hex()]
+        if isinstance(obj, str):
+            return ["string", obj]
+        if isinstance(obj, list):
+            return ["array", [canonical(item) for item in obj]]
+        return ["object", [[key, canonical(obj[key])] for key in sorted(obj)]]
+    return json.dumps(canonical(_json_safe(value)), separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
+
+
+def _board_funding_basis(criteria, portfolio, fx_rates):
+    # Include admission, freshness, forecast horizon, compliance rules and
+    # acquisition-stage trend policy as well as sizing/price-check settings.
+    # Gate controls outside TFB_OPP_/TFB_T10_ must never change silently
+    # between qualification and allocation. Only the digest leaves the server.
+    policy = {k: v for k, v in os.environ.items()
+              if k.startswith(_BOARD_FUNDING_POLICY_PREFIXES)
+              or k in _BOARD_FUNDING_POLICY_NAMES}
+    clean = {k: v for k, v in criteria.items()
+             if not k.startswith("board_funding_")}
+    if _env_scan_uncapped() and (clean.get("max_candidates") or 0) > 0:
+        clean["max_candidates"] = 0
+    # Render shares this release identity across workers/instances. A deploy
+    # that changes an imported gate module must also invalidate replay, even
+    # if that release leaves the builder's own version constant unchanged.
+    release = {"render_git_commit": os.getenv("RENDER_GIT_COMMIT") or None}
+    return hashlib.sha256(_board_funding_json(
+        [clean, portfolio or {}, fx_rates or {}, policy, release])).hexdigest()
+
+
+def _board_funding_sign(snapshot):
+    # This is the same resolver used by the opportunity route's normal auth.
+    # Preserve its list-over-single-token precedence and aliases; do not add
+    # an independent auth vocabulary or revive ignored/retired credentials.
+    # The complete active set binds snapshots to primary/backup/list rotation.
+    try:
+        from core.config import allowed_tokens
+        tokens = sorted(set(allowed_tokens()))
+    except Exception:
+        tokens = []
+    if not tokens:
+        return ""
+    key = hashlib.sha256(b"tfb-board-funding-auth-v1\0" +
+                         _board_funding_json(tokens)).digest()
+    unsigned = {k: v for k, v in snapshot.items() if k != "snapshot_id"}
+    return hmac.new(key, _board_funding_json(unsigned), hashlib.sha256).hexdigest()
+
+
+def _board_funding_validate(snapshot, rows, criteria, portfolio, fx_rates):
+    if not isinstance(snapshot, dict):
+        return "missing frozen snapshot"
+    if snapshot.get("contract_version") != _BOARD_FUNDING_VERSION or \
+            snapshot.get("builder_version") != OPPORTUNITY_BUILDER_VERSION:
+        return "unsupported snapshot version"
+    sid = str(snapshot.get("snapshot_id") or "")
+    if not sid or not hmac.compare_digest(sid, _board_funding_sign(snapshot)):
+        return "snapshot signature mismatch"
+    age = time.time() - float(snapshot.get("issued_at") or 0)
+    if age < -5 or age > _BOARD_FUNDING_MAX_AGE_S:
+        return "snapshot expired"
+    if snapshot.get("basis_fingerprint") != _board_funding_basis(
+            criteria, portfolio, fx_rates):
+        return "release, policy, holdings, cash or FX basis changed"
+    frozen = snapshot.get("rows")
+    if not isinstance(frozen, list) or len(frozen) > _BOARD_FUNDING_MAX_ROWS or \
+            _board_funding_json(rows) != _board_funding_json(frozen):
+        return "frozen rows mismatch"
+    if len(_board_funding_json(snapshot)) > _BOARD_FUNDING_MAX_BYTES:
+        return "snapshot exceeds transport bound"
+    return ""
 # -----------------------------------------------------------------------------
 # v1.19.5 (2026-09-06) - ROTATION FIELDS ACTUALLY REACH THE ROTATION RULE
 # (v1.18.1 wiring gap closed; no new env)
@@ -3088,6 +3194,15 @@ def make_criteria(overrides=None):
     crit.update(_env_overrides())
     for key, val in (overrides or {}).items():
         k = str(key).strip().lower()
+        if k == "board_funding_stage":
+            crit[k] = str(val or "").strip().lower()
+            continue
+        if k == "board_funding_symbols":
+            crit[k] = [str(s).strip().upper() for s in val] if isinstance(val, list) else []
+            continue
+        if k == "board_funding_snapshot":
+            crit[k] = val if isinstance(val, dict) else None
+            continue
         if k not in crit or val in (None, ""):
             continue
         # v1.23.1: server-owned identity invariant. Keep accepting the legacy
@@ -5416,9 +5531,17 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     # v1.0.16: issuer-level cross-listing dedup (default OFF).
     issuer_dedup = bool(criteria.get("issuer_dedup_enabled", False))
     funded_issuers = {}
+    research = criteria.get("board_funding_stage") == "research"
+    replay = criteria.get("board_funding_stage") == "allocate"
+    eligible = set(criteria.get("board_funding_symbols") or [])
+    frozen_xchecks = (criteria.get("board_funding_snapshot") or {}).get("xchecks", {})
 
     for cand in invest_cands:
-        if len(picked) >= criteria["max_selected"]:
+        if replay and cand["symbol"].upper() not in eligible:
+            # Research seats never reserve cash, a diversification slot, or a
+            # capital-call plan. Eligibility precedes every funding ledger.
+            continue
+        if not research and len(picked) >= criteria["max_selected"]:
             break
         # v1.19.3 [HELD-TARGET NO-NEW-MONEY]: an R-6 carried target (engine
         # tag analyst_lkg:<age>h) may preserve an existing seat but never
@@ -5467,13 +5590,24 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         # with a countable reason and the seat passes to the next candidate.
         # Gates, verdicts and the audit grid are untouched in every mode.
         if _xc_mode != "off":
-            _xc = _price_xcheck(cand, _xc_ctx)
+            if replay:
+                _xc = frozen_xchecks.get(cand["symbol"])
+                if not isinstance(_xc, dict) or _xc.get("mode") != _xc_mode:
+                    deferrals[cand["symbol"]] = "Frozen PRICE_XCHECK unavailable — sizing withheld"
+                    continue
+                cand["_price_xcheck"] = dict(_xc)
+            else:
+                _xc = _price_xcheck(cand, _xc_ctx)
             if _xc_mode == "enforce" and \
                     _xcheck_should_defer(_xc, _xc_ctx["strict"]):
                 _XCHECK_STATE["deferred"] += 1
                 deferrals[cand["symbol"]] = (
                     "PRICE_XCHECK " + _xc["text"] + " \u2014 sizing deferred")
                 continue
+        if research:
+            picked.append({"cand": cand, "suggested_sar": 0,
+                           "suggested_shares": 0, "funds_from": "Research — no allocation"})
+            continue
         suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
         # name out (allocation buys >= 1 share but < 1 lot), say so honestly
@@ -5505,6 +5639,20 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             _vf = _venue_floor(cand["symbol"])
             if _vf and float(_vf) > _min_ticket:
                 _min_ticket = float(_vf)
+        if replay and _min_ticket > suggested and sector_ctx["available"]:
+            # A capital call must describe an admissible final-board action.
+            # Extra cash cannot repair a sector policy exclusion, so prove
+            # the minimum actionable ticket fits before recording a need.
+            _scb_floor = _sector_cap_basis()
+            _floor_total = (budget_base if _scb_floor == "budget" else
+                            (pf["portfolio_value"] if _scb_floor == "pd" else
+                             pf["portfolio_value"] + _min_ticket))
+            if _floor_total > 0 and (pf_sector_sar.get(sec, 0.0) + _min_ticket) / \
+                    _floor_total * 100.0 > criteria["pf_max_sector_pct"]:
+                deferrals[cand["symbol"]] = (
+                    "Diversification: minimum ticket would exceed post-action sector weight "
+                    + _fmt_num(criteria["pf_max_sector_pct"]) + "% (" + sec + ")")
+                continue
         if _min_ticket > 0.0 and 0.0 < suggested < _min_ticket:
             _floor_note = ""
             if not _env_nearmiss_text_legacy():   # v1.22.2 P-171: name the floor
@@ -6102,10 +6250,20 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # truth. This flag affects trace shape only; BLOCKED enforcement is always on.
     _blocked_identity_trace = _legacy_blocked_identity_trace_enabled(criteria)
     crit = make_criteria(criteria)
+    _board_stage = crit.get("board_funding_stage")
+    _board_research = _board_stage == "research"
+    _board_replay = _board_stage == "allocate"
+    if _board_stage and _board_stage not in ("research", "allocate"):
+        return _json_safe(_skeleton("board_funding_mismatch", "unsupported funding stage", crit))
+    rows = list(rows or [])
+    if _board_replay:
+        _why = _board_funding_validate(crit.get("board_funding_snapshot"), rows,
+                                      crit, portfolio, fx_rates)
+        if _why:
+            return _json_safe(_skeleton("board_funding_mismatch", _why, crit))
     if not _env_enabled():
         return _json_safe(_skeleton("disabled",
                                     "TFB_OPP_ENABLED=0", crit))
-    rows = list(rows or [])
     pregate_stats = None
     # v1.9.2 [SC-2]: remember the pool size BEFORE any clamp so coverage can
     # be stated honestly (kpis["scanned"] counts the post-clamp audit).
@@ -6179,6 +6337,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                    "lineage_low": 0, "lineage_contradiction": 0}
     for raw in rows:
         cand = normalize_candidate(raw, fx_rates, crit)
+        if _board_research:
+            cand["_board_source_row"] = raw
         gates = evaluate_gates(
             cand, crit, held,
             blocked_identity_trace_enabled=_blocked_identity_trace)
@@ -6293,7 +6453,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # OFF => funded_picks == picks and unfunded_picks == [] (byte-identical).
     # v1.18.0: under the funding layer, Selected = FUNDABLE_NOW only - a
     # 0-SAR pick is never an executable ticket, whatever unfunded_watch says.
-    if crit.get("unfunded_watch_enabled") or _env_funding_plan():
+    if not _board_research and (crit.get("unfunded_watch_enabled") or _env_funding_plan()):
         funded_picks = [p for p in picks if (p["suggested_sar"] or 0) > 0]
         unfunded_picks = [p for p in picks if (p["suggested_sar"] or 0) <= 0]
     else:
@@ -6301,6 +6461,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         unfunded_picks = []
     tickets = [_build_ticket(i + 1, p, crit, review_date)
                for i, p in enumerate(funded_picks)]
+    if _board_research:
+        for ticket in tickets:
+            ticket["_board_research"] = True
     selected_syms = {t["symbol"] for t in tickets}
     by_symbol = {a["symbol"]: a for a in audit}
     for sym in selected_syms:
@@ -6334,7 +6497,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # 3) kpis (L7 funding identity: unallocated = deployable − Σ suggested)
     # --- v1.18.0 FUNDING-STATE LAYER (additive; kill-switch) -----------------
     _fp_plans = []
-    if _env_funding_plan():
+    if _env_funding_plan() and not _board_research:
         try:
             _needs = dict(_LAST_FUNDING_NEEDS)
             _min_floor = float(crit.get("min_ticket_sar", 0.0) or 0.0)
@@ -6349,7 +6512,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     _needs[_s] = {"need_sar": _nf, "sized_sar": 0.0,
                                   "remaining_sar": float(remaining)}
             _ordered = []
-            for _a in invest:  # rank order
+            for _a in invest:  # rank order, only final eligible seats have needs
                 _s = _a["symbol"]
                 if _s in _needs:
                     _ordered.append((
@@ -6434,7 +6597,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "deployable_proforma_sar": _LAST_DEPLOYABLE_SPLIT["proforma"],
         "expected_gain_12m_sar": round(
             sum(t["exp_gain_12m_sar"] for t in tickets), 0),
-        "selected_count": len(tickets),
+        "selected_count": 0 if _board_research else len(tickets),
         "max_selected": crit["max_selected"],
         "blended_reliability": _blend(tickets, "reliability"),
         # v1.8.0 [PY-1]: blend the TP2 R/R the tickets actually display.
@@ -6452,7 +6615,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     }
     if _env_funding_plan():  # v1.18.0 additive keys
         _topn = _env_capital_call_topn()
-        kpis["fundable_now"] = len(tickets)
+        kpis["fundable_now"] = 0 if _board_research else len(tickets)
         kpis["fundable_by_rotation"] = sum(
             1 for pl in _fp_plans if pl["state"] == "FUNDABLE_BY_ROTATION")
         kpis["capital_call"] = sum(
@@ -6587,7 +6750,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
 
     meta_in = upstream_meta or {}
     meta = {
-        "criteria_snapshot": crit,
+        "criteria_snapshot": {k: v for k, v in crit.items() if k != "board_funding_snapshot"},
         "gate_trace_counts": gate_fail_counts,
         "trust_gate": {
             "enabled": bool(crit.get("trust_gate_enabled")),
@@ -6625,6 +6788,36 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "price_sar": sum(1 for h in pf["holdings"] if h.get("price_sar")),
         },
     }
+
+    if _board_stage:
+        board = {"contract_version": _BOARD_FUNDING_VERSION,
+                 "stage": _board_stage, "snapshot_available": False}
+        if _board_research:
+            snapshot = {
+                "contract_version": _BOARD_FUNDING_VERSION,
+                "builder_version": OPPORTUNITY_BUILDER_VERSION,
+                "issued_at": time.time(),
+                "basis_fingerprint": _board_funding_basis(crit, portfolio, fx_rates),
+                "upstream_meta": upstream_meta or {},
+                "rows": [p["cand"]["_board_source_row"] for p in picks],
+                "xchecks": {p["cand"]["symbol"]: p["cand"]["_price_xcheck"]
+                            for p in picks if p["cand"].get("_price_xcheck")},
+            }
+            snapshot["snapshot_id"] = _board_funding_sign(snapshot)
+            if not snapshot["snapshot_id"]:
+                board["reason"] = "shared application authentication key unavailable"
+            elif len(snapshot["rows"]) <= _BOARD_FUNDING_MAX_ROWS and \
+                    len(_board_funding_json(snapshot)) <= _BOARD_FUNDING_MAX_BYTES:
+                board.update(snapshot_available=True, snapshot=snapshot,
+                             snapshot_id=snapshot["snapshot_id"])
+            else:
+                board["reason"] = "qualified snapshot exceeds transport bound"
+        else:
+            board.update(snapshot_available=True,
+                         snapshot_id=crit["board_funding_snapshot"]["snapshot_id"],
+                         eligible_symbols=list(crit.get("board_funding_symbols") or []))
+        meta["board_funding"] = board
+        meta["board_execution_basis"] = {"blended_rr": _env_blended_rr_basis()}
 
     # v1.21.0 [PRICE-XCHECK]: read-back block on meta ONLY when the gate is
     # armed — off keeps the payload byte-identical to v1.20.0.
@@ -6673,6 +6866,7 @@ def _blend_detail(tickets, key):
 
 def _skeleton(status, message, criteria):
     """Zone-degradable empty payload (§5) — every zone present and typed."""
+    criteria = {k: v for k, v in criteria.items() if k != "board_funding_snapshot"}
     return {
         "version": OPPORTUNITY_BUILDER_VERSION,
         "status": status,
