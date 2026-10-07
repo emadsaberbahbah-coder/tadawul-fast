@@ -490,9 +490,10 @@ jobs:
       TFB_SYNC_NAME_DEDUP_MODE: "observe"
       TFB_PORTFOLIO_REBUILD: "1"
       # v6.64.8 (2026-10-07) portfolio minor-unit currency guard (GBp vs GBP
-      # 100x Position Value / P/L). Repo Variable; unset/0 = OFF, behaviour
-      # unchanged. Set the Variable to 1 to arm (rollback: delete it).
-      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '0' }}
+      # 100x Position Value / P/L). Guard the three production PF write lanes.
+      # Default ON: reject explicit minor-unit quotes instead of publishing
+      # major-currency cost/value math. An explicit Variable value 0 opts out.
+      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '1' }}
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
       # clear-and-rewrite Top_10_Investments as a flat engine page, on the premise
@@ -730,9 +731,11 @@ jobs:
             # - newline separated
             # - JSON array: ["A","B","C"]
             local raw="$1"
-            raw="$(echo "${raw:-}" | tr -d '\r' | xargs || true)"
+            # Preserve JSON quotes until jq has parsed a documented array.
+            # xargs strips them and turns ["A","B"] into invalid raw keys.
+            raw="$(printf '%s' "${raw:-}" | tr -d '\r')"
 
-            if [[ -z "${raw:-}" ]]; then
+            if [[ -z "${raw//[[:space:]]/}" ]]; then
               echo ""
               return 0
             fi
@@ -830,6 +833,13 @@ jobs:
           fi
 
           validate_keys_allowed "$KEYS"
+
+          # Scheduled full refreshes must include the active portfolio even
+          # when a legacy DEFAULT_SYNC_KEYS override omits it. Preserve manual
+          # subset requests, health-only mode, validated keys and key order.
+          if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "$MODE" == "full_sync" ]]; then
+            KEYS="$(sanitize_keys "$KEYS MY_PORTFOLIO")"
+          fi
 
           echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
           echo "📋 Mode: $MODE | Keys: $KEYS"
@@ -1454,9 +1464,10 @@ jobs:
       TFB_SYNC_PERSIST_SANITY: "1"
       TFB_PORTFOLIO_REBUILD: "1"
       # v6.64.8 (2026-10-07) portfolio minor-unit currency guard (GBp vs GBP
-      # 100x Position Value / P/L). Repo Variable; unset/0 = OFF, behaviour
-      # unchanged. Set the Variable to 1 to arm (rollback: delete it).
-      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '0' }}
+      # 100x Position Value / P/L). Guard the three production PF write lanes.
+      # Default ON: reject explicit minor-unit quotes instead of publishing
+      # major-currency cost/value math. An explicit Variable value 0 opts out.
+      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '1' }}
       TFB_SYNC_DECISION_GUARD: "1"
 
       # ── W1A-6a (2026-08-18) OPERATOR-ARMABLE GATES ───────────────────────

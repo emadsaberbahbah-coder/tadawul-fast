@@ -176,9 +176,10 @@ jobs:
       TFB_SYNC_OHLC_FILL_GUARD_COLS: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_COLS || '' }}
       TFB_PORTFOLIO_REBUILD: '1'
       # v6.64.8 (2026-10-07) portfolio minor-unit currency guard (GBp vs GBP
-      # 100x Position Value / P/L). Repo Variable; unset/0 = OFF, behaviour
-      # unchanged. Set the Variable to 1 to arm (rollback: delete it).
-      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '0' }}
+      # 100x Position Value / P/L). Guard the three production PF write lanes.
+      # Default ON: reject explicit minor-unit quotes instead of publishing
+      # major-currency cost/value math. An explicit Variable value 0 opts out.
+      TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '1' }}
       TFB_SYNC_DECISION_GUARD: '1'
       TFB_SYNC_SYMBOL_BATCH_SIZE: '25'
       TFB_SYNC_TIME_BUDGET_SEC: '3600'

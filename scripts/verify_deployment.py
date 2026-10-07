@@ -110,7 +110,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pit_snapshot", "1.1.0", "pit snapshot"),
     ("run_daily_brief", "1.17.1", "daily brief"),
     ("send_digest", "2.1.0", "digest"),
-    ("run_calendar_sync", "1.1.1", "calendar sync"),
+    ("run_calendar_sync", "1.1.2", "calendar sync"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)

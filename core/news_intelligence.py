@@ -2,9 +2,17 @@
 """
 core/news_intelligence.py
 ================================================================================
-Advanced News Intelligence Engine -- v5.2.0
+Advanced News Intelligence Engine -- v5.2.1
 ================================================================================
 RENDER-SAFE • IMPORT-SAFE • LAZY-ML • RSS/GOOGLE SAFE • CACHE-BACKED • ASYNC-SAFE
+
+v5.2.1 — repairs to the existing RSS-to-brief contract
+---------------------------------------------------
+- The summary helper forwards the documented symbol/company-name payload.
+- Display reads published_utc and source_domain, retaining legacy aliases.
+- Credibility matches parsed hostnames at domain boundaries, including userinfo.
+- Aggregator RSS retains asserted publisher URL/domain separately from transport.
+No source is enabled, no event model is added, and public signatures are preserved.
 
 v5.2.0 changes (over v5.1.0) — FACTUAL DISPLAY SUMMARY (Fix N1)
 ---------------------------------------------------------------
@@ -154,7 +162,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.0"
+__version__ = "5.2.1"
 NEWS_VERSION = __version__
 
 # =============================================================================
@@ -356,6 +364,10 @@ SOURCE_CREDIBILITY: Dict[str, float] = {
     "default": 0.60,
 }
 
+# These RSS transports may assert an original publisher in <source url="...">.
+# Keep that assertion in the article; it is not independent primary verification.
+_AGGREGATOR_DOMAINS = frozenset({"news.google.com", "bing.com", "msn.com", "news.yahoo.com"})
+
 # Topic keywords
 TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "earnings": ["earnings", "profit", "loss", "revenue", "quarter", "guidance"],
@@ -459,6 +471,8 @@ class NewsArticle:
     credibility_weight: float = 1.0
     is_headline: bool = False
     duplicate_of: Optional[str] = None
+    transport_domain: str = ""
+    publisher_url: str = ""     # asserted RSS publisher, separate from the article URL
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -651,11 +665,12 @@ def _canonical_url(url: str) -> str:
 
 
 def _extract_domain(url: str) -> str:
-    """Extract domain from URL."""
+    """Parse a URL or bare hostname without treating userinfo as the host."""
     try:
-        parsed = urlparse(url)
-        domain = parsed.netloc or parsed.path.split("/")[0]
-        return domain.replace("www.", "").split(":")[0].lower()
+        value = str(url or "").strip()
+        parsed = urlparse(value if "://" in value or value.startswith("//") else "//" + value)
+        domain = (parsed.hostname or "").lower().removesuffix(".")
+        return domain.removeprefix("www.")
     except Exception:
         return ""
 
@@ -664,9 +679,9 @@ def _get_credibility_weight(domain: str) -> float:
     """Get credibility weight for domain."""
     if not _CONFIG.enable_source_credibility:
         return 1.0
-    domain = (domain or "").lower()
+    domain = _extract_domain(domain)
     for key, weight in SOURCE_CREDIBILITY.items():
-        if key != "default" and key in domain:
+        if key != "default" and (domain == key or domain.endswith("." + key)):
             return weight
     return SOURCE_CREDIBILITY.get("default", 0.6)
 
@@ -1306,14 +1321,29 @@ def _parse_rss(xml_text: str, source_hint: str) -> List[NewsArticle]:
         description = _strip_html(item.findtext("description") or "")
         pub_raw = _strip_html(item.findtext("pubDate") or item.findtext("published") or "")
         pub_dt = _parse_datetime(pub_raw)
+        source_el = item.find("source")
         source = _strip_html(item.findtext("source") or source_hint or "") or source_hint
-        domain = _extract_domain(link) or _extract_domain(source_hint)
+        transport = _extract_domain(source_hint) or _extract_domain(link)
+        domain = _extract_domain(link) or transport
+        publisher_url = ""
+        if (source_el is not None and transport in _AGGREGATOR_DOMAINS
+                and domain in _AGGREGATOR_DOMAINS):
+            asserted_url = _strip_html(source_el.get("url") or "")
+            publisher_domain = _extract_domain(asserted_url)
+            if publisher_domain:
+                publisher_url, domain = asserted_url, publisher_domain
+                publisher_name = _strip_html(item.findtext("source") or "")
+                suffix = " - " + publisher_name if publisher_name else ""
+                if suffix and title.endswith(suffix):
+                    title = title[:-len(suffix)].strip()
 
         article = NewsArticle(
             title=title,
             url=link,
             source=source or domain,
             source_domain=domain,
+            transport_domain=transport,
+            publisher_url=publisher_url,
             published_utc=_utc_iso(pub_dt) if pub_dt else None,
             published_riyadh=_to_riyadh_iso(pub_dt),
             snippet=description,
@@ -1850,7 +1880,7 @@ def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
     latest_line = ""
     for a in (d.get("articles") or []):
         aa = a if isinstance(a, dict) else {}
-        ts = _parse_datetime(aa.get("published_at") or aa.get("published"))
+        ts = _parse_datetime(aa.get("published_utc") or aa.get("published_at") or aa.get("published"))
         if ts is None:
             continue
         if ts >= cutoff:
@@ -1858,7 +1888,7 @@ def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
         if latest_ts is None or ts > latest_ts:
             latest_ts = ts
             title = str(aa.get("title") or "").strip()
-            src_d = str(aa.get("source") or aa.get("domain") or "").strip()
+            src_d = str(aa.get("source_domain") or aa.get("domain") or aa.get("source") or "").strip()
             latest_line = (title[:70] + (" — " + src_d if src_d else "") +
                            (" (" + ts.strftime("%m-%d") + ")"))
 
@@ -1895,7 +1925,7 @@ async def summarize_symbol_news(symbol: str, company_name: str = "",
     get_news_intelligence) then summarize_for_display. Fail-open: any fault
     returns the honest empty summary for the symbol."""
     try:
-        res = await get_news_intelligence(symbol, company_name=company_name)
+        res = await get_news_intelligence({"symbol": symbol, "company_name": company_name})
         return summarize_for_display(res, days=days)
     except Exception as e:
         logger.warning("summarize_symbol_news(%s) failed: %s", symbol, e)
