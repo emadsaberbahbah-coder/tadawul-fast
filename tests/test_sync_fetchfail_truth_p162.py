@@ -79,6 +79,14 @@ def _res(mod, page="Global_Markets", **meta):
                        symbols_requested=int(meta.get("requested") or 0),
                        rows_written=int(meta.get("pre_persist_rows") or 0), rows_failed=0)
     r._stamp_meta.update(meta)
+    # Validate frozen provider-shaped source rows rather than treating generated
+    # timestamps or the old counters themselves as proof of success.
+    requested=[f"FIX{i}.US" for i in range(r.symbols_requested)]
+    available=max(0,int(meta.get("pre_persist_rows") or 0)-int(meta.get("klg_kept") or 0))
+    source=[[symbol,100,"eodhd","fetch_failed:HTTP402" if i<int(meta.get("ff_new") or 0) else "",r.end_utc]
+            for i,symbol in enumerate(requested[:available])]
+    mod._record_acquisition_census(r,["Symbol","Current Price","Data Provider","Warnings","Last Updated (UTC)"],source,requested,
+                                   now=datetime.fromisoformat(r.end_utc))
     return r
 
 
@@ -103,7 +111,7 @@ def test_t1_vocabulary():
     try:
         mod._FFT_SELFTEST_MSG = "FAIL 4/5"
         _setmode(mod, "enforce")
-        assert mod._fetchfail_truth_mode() == "observe"          # FG-3 / DS-03: FAIL degrades enforce
+        assert mod._fetchfail_truth_mode() == "error"          # Failed enforce certification stays explicit
         _setmode(mod, "observe")
         assert mod._fetchfail_truth_mode() == "observe"
     finally:
@@ -158,11 +166,11 @@ def test_t3_stamp_row_modes():
     _setmode(mod, None)
     for row in (off, obs, enf):
         assert len(row) == 10 and row[0] == "Global_Markets" and row[6] == 6609
-    assert "fresh=6444" in off[3] and "fresh_cov=97.5%" in off[3] and "data=COMPLETE" in off[3] and "fetchfail" not in off[3]
+    assert "fresh=142" in off[3] and "policy_fresh=6444" in off[3] and "fresh_cov=2.148" in off[3] and "data=PARTIAL" in off[3] and "fetchfail=" not in off[3]
     assert off[2] == "SUCCESS"
-    assert "fresh=6444" in obs[3] and "fresh_cov=97.5%" in obs[3] and "data=COMPLETE" in obs[3]
+    assert "fresh=142" in obs[3] and "policy_fresh=6444" in obs[3] and "fresh_cov=2.148" in obs[3] and "data=PARTIAL" in obs[3]
     assert " fetchfail=6302/0 would_cov=2.1%" in obs[3] and obs[2] == "SUCCESS"
-    assert "fresh=142" in enf[3] and "fresh_cov=2.1%" in enf[3] and "data=PARTIAL" in enf[3]
+    assert "fresh=142" in enf[3] and "fresh_cov=2.148" in enf[3] and "data=PARTIAL" in enf[3]
     assert " fetchfail=6302/0" in enf[3] and "would_cov" not in enf[3]
     assert enf[2] == "PARTIAL_FRESH"
     # message order: fetchfail sits between preserved and fresh_cov
@@ -179,12 +187,12 @@ def test_t4_feed_token():
     _setmode(mod, "observe")
     assert mod._uv_page_state(_res(mod, **meta)) == ("OK", 97.5)
     _setmode(mod, "enforce")
-    assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 2.1)
+    assert mod._uv_page_state(_res(mod, **meta)) == ("STALE_COV", 100*142/6609)
     # partial storm below the 95% floor still flips; above it stays OK
     small = dict(GM_META, ff_new=200, ff_carried=4)          # 6444-200 = 6244 -> 94.5%
-    assert mod._uv_page_state(_res(mod, **small)) == ("STALE_COV", 94.5)
+    assert mod._uv_page_state(_res(mod, **small)) == ("STALE_COV", 100*6244/6609)
     tiny = dict(GM_META, ff_new=100, ff_carried=4)           # 6344 -> 96.0%
-    assert mod._uv_page_state(_res(mod, **tiny)) == ("OK", 96.0)
+    assert mod._uv_page_state(_res(mod, **tiny)) == ("OK", 100*6344/6609)
     _setmode(mod, None)
 
 
@@ -199,7 +207,7 @@ def test_t5_healthy_leg_identical():
         _setmode(mod, v)
         rows.append(mod._status_stamp_row("Market_Leaders", _res(mod, "Market_Leaders", **ml), 115))
     _setmode(mod, None)
-    assert rows[0][3] == rows[1][3] == rows[2][3] and "fetchfail" not in rows[0][3]
+    assert all("fresh=255" in row[3] and "acquisition=COMPLETE" in row[3] for row in rows)
     assert "fresh_cov=100.0%" in rows[0][3] and "data=COMPLETE" in rows[0][3] and rows[0][2] == "SUCCESS"
     # carried-only rows: values unchanged, disclosure only
     car = dict(ml, ff_new=0, ff_carried=3)
@@ -258,7 +266,7 @@ def test_t7_seam_replay():
             ["C.US", "fetch_failed:HTTP 404 not_found", "2026-09-25T13:05:00+00:00"]]
     mod._EQ_STATE["t0"] = datetime(2026, 9, 26, 0, 17, 4, tzinfo=timezone.utc).timestamp()
     ns = dict(vars(mod))
-    for v, exp in ((None, None), ("observe", (1, 1)), ("enforce", (1, 1))):
+    for v, exp in ((None, (1, 1)), ("observe", (1, 1)), ("enforce", (1, 1))):
         _setmode(mod, v)
         task = mod.TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="analysis")
         res = mod.TaskResult(key="GLOBAL_MARKETS", sheet_name="Global_Markets", status="success",

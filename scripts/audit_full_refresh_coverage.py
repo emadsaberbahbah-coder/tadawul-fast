@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.2.1 — fundamentals-only margin quarantine does not invalidate a
+successful price acquisition. Its flag and fundamentals controls remain intact.
+
+VERSION 1.2.0 — successful acquisitions and timestamp freshness are separate.
+Valid price/provider, bounded retrieval time and unusable provenance are
+checked per unique identity. Generated timestamps cannot green failed rows.
+Physical row floors remain unchanged. Quote-asof is never inferred from the
+retrieval stamp; legacy valid rows retain the established acquisition basis.
+
 VERSION 1.1.0 (2026-09-08) — TIMEZONE TRUTH IN parse_dt (P-104)
 WHY v1.1.0: parse_dt emitted THREE inconsistent bases: naive strings/serials
 passed through as Riyadh wall time; "+HH:MM" ISO stamps were converted to
@@ -26,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -37,6 +46,12 @@ COST = ("Avg Cost", "Average Cost", "Buy Price")
 
 for p in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
     if str(p) not in sys.path: sys.path.insert(0, str(p))
+
+from core.data_validity import (  # noqa: E402
+    acquisition_census, coverage_validity, retrieval_timestamp, row_acquisition,
+    timestamp_freshness,
+)
+from scripts.critical_symbol_identity import canonicalize_symbol  # noqa: E402
 
 @dataclass(frozen=True)
 class Rule:
@@ -49,6 +64,10 @@ class Result:
     expected_cols: int = 0; actual_cols: int = 0; rows: int = 0; unique: int = 0
     min_rows: int = 0; fresh: int = 0; stale: int = 0; bad_stamps: int = 0
     fresh_pct: Optional[float] = None; name_pct: Optional[float] = None
+    timestamp_fresh: int = 0; timestamp_fresh_pct: Optional[float] = None
+    unknown_acquisitions: int = 0; invalid_acquisitions: int = 0
+    acquisition_reasons: dict[str, int] = field(default_factory=dict)
+    quote_asof_known: int = 0
     price_pct: Optional[float] = None; newest_age_h: Optional[float] = None
     oldest_age_h: Optional[float] = None; duplicates: list[str] = field(default_factory=list)
     blank_symbols: int = 0; missing_portfolio: list[str] = field(default_factory=list)
@@ -193,18 +212,22 @@ def audit_grid(grid, rule, expected, now, active=()):
     if not rule.symbols: return r.finish()
     si,ni,pi,ti,qi,ci=idx(headers,SYMBOL),idx(headers,NAME),idx(headers,PRICE),idx(headers,STAMP),idx(headers,QTY),idx(headers,COST)
     if si<0: r.failures.append("Symbol column missing"); return r.finish()
-    symbols=[]; names=prices=fresh=stale=bad=0; ages=[]; qmap={}; cmap={}; riyadh=ti>=0 and "riyadh" in headers[ti].casefold(); now0=now.astimezone(timezone.utc).replace(tzinfo=None)+timedelta(hours=3)  # v1.1.0 P-104: parse_dt is uniformly Riyadh-naive; now0 must match regardless of stamp-column basis (riyadh flag kept for payload truth)
+    symbols=[]; names=prices=0; ages=[]; qmap={}; cmap={}
+    timestamp_symbols=set(); bad_symbols=set(); quote_symbols=set()
     for row in rows:
-        sym=s(row[si] if si<len(row) else "").upper()
+        sym=canonicalize_symbol(s(row[si] if si<len(row) else "").upper())
         if not sym: r.blank_symbols+=1; continue
         symbols.append(sym); names+=int(ni>=0 and ni<len(row) and bool(s(row[ni]))); prices+=int(pi>=0 and pi<len(row) and (f(row[pi]) or 0)>0)
         if qi>=0: qmap[sym]=f(row[qi] if qi<len(row) else None)
         if ci>=0: cmap[sym]=f(row[ci] if ci<len(row) else None)
         if rule.max_age_h is not None:
-            d=parse_dt(row[ti] if ti>=0 and ti<len(row) else None)
-            if d is None: bad+=1; stale+=1
-            else:
-                age=max(0,(now0-d).total_seconds()/3600); ages.append(age); fresh+=int(age<=rule.max_age_h); stale+=int(age>rule.max_age_h)
+            mapped={name: row[i] if i<len(row) else None for i,name in enumerate(headers)}
+            stamp,precision=retrieval_timestamp(mapped)
+            timely,age,_reason=timestamp_freshness(stamp,now,max_age_seconds=rule.max_age_h*3600,precision=precision)
+            if timely: timestamp_symbols.add(sym)
+            if stamp is None or precision!="datetime": bad_symbols.add(sym)
+            if age is not None: ages.append(age/3600)
+            if row_acquisition(mapped,now,rule.max_age_h*3600).quote_asof is not None: quote_symbols.add(sym)
     c=Counter(symbols); r.unique=len(c); r.duplicates=sorted(k for k,v in c.items() if v>1)
     if r.blank_symbols: r.failures.append(f"{r.blank_symbols} blank-symbol row(s)")
     if r.duplicates: r.failures.append("duplicate symbols: "+", ".join(r.duplicates[:20]))
@@ -214,10 +237,15 @@ def audit_grid(grid, rule, expected, now, active=()):
     if pi<0 and rule.min_price: r.failures.append("Current Price column missing")
     elif r.price_pct is not None and r.price_pct<rule.min_price: r.failures.append(f"price coverage {r.price_pct:.2f}% below {rule.min_price:.2f}%")
     if rule.max_age_h is not None:
-        r.fresh,r.stale,r.bad_stamps=fresh,stale,bad; r.fresh_pct=pct(fresh,len(symbols)); r.newest_age_h=min(ages) if ages else None; r.oldest_age_h=max(ages) if ages else None
+        census=acquisition_census(headers,rows,now=now,max_age_seconds=rule.max_age_h*3600,symbol_key=canonicalize_symbol)
+        r.fresh=len(census.successful); r.stale=r.unique-r.fresh; r.bad_stamps=len(bad_symbols)
+        r.fresh_pct=pct(r.fresh,r.unique); r.timestamp_fresh=len(census.timestamp_fresh); r.timestamp_fresh_pct=pct(r.timestamp_fresh,r.unique)
+        r.unknown_acquisitions=len(census.unknown); r.invalid_acquisitions=len(census.invalid); r.acquisition_reasons=census.reason_counts
+        r.quote_asof_known=len(census.quote_asof_known)
+        r.newest_age_h=min(ages) if ages else None; r.oldest_age_h=max(ages) if ages else None
         if ti<0: r.failures.append("Last Updated column missing")
-        elif r.fresh_pct is None or r.fresh_pct<rule.min_fresh: r.failures.append(f"fresh coverage {r.fresh_pct} below {rule.min_fresh}% within {rule.max_age_h}h")
-        if bad: r.warnings.append(f"{bad} blank/unparseable timestamp(s)")
+        if not coverage_validity(r.unique,r.fresh,rule.min_fresh).valid: r.failures.append(f"successful acquisition coverage {r.fresh_pct} below {rule.min_fresh}% within {rule.max_age_h}h")
+        if r.bad_stamps: r.warnings.append(f"{r.bad_stamps} blank/unparseable/date-only timestamp(s)")
     if rule.portfolio:
         a,p=set(active),set(symbols); r.missing_portfolio=sorted(a-p); r.extra_portfolio=sorted(p-a); r.min_rows=len(a) or 1
         if r.missing_portfolio: r.failures.append("active ledger symbols missing: "+", ".join(r.missing_portfolio))
