@@ -287,6 +287,9 @@ jobs:
             tests/test_provider_capability_routing.py \
             tests/test_successful_acquisition_freshness.py \
             tests/test_data_validity_token_anchor.py \
+            tests/test_portfolio_acquisition_census.py \
+            tests/test_portfolio_active_targets.py \
+            tests/test_portfolio_ledger_labels.py \
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
             tests/test_sync_fetchfail_truth_p162.py \
@@ -307,6 +310,8 @@ jobs:
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
+            tests/test_ycp_quote_breaker_isolation.py \
+            tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
 

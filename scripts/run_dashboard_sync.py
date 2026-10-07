@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.4)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.7)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1312,6 +1312,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -1842,7 +1843,15 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.4"
+SCRIPT_VERSION = "6.64.7"
+# v6.64.7: fill only a blank final portfolio display Name from an unambiguous
+# guarded active-ledger label, with explicit provenance after identity guards.
+# v6.64.6: portfolio rebuild uses one validated active-ledger snapshot for
+# the explicit fetch cohort, native-currency holdings and final membership.
+# Unknown/ambiguous inputs never fall back to backend default instruments.
+# v6.64.5: page-driven portfolio acquisition telemetry uses the independently
+# proven active ledger cohort, including missing responses. Fetch, holdings
+# injection, membership, preservation and configured policy remain unchanged.
 # v6.64.4: shared acquisition classification excludes the fundamentals-only
 # profit-margin quarantine. Its flag, fundamentals controls and configured
 # feed policy remain intact; genuine price/provenance failures still invalidate
@@ -3740,31 +3749,22 @@ def _portfolio_write_guard(
 # Symbols reading (uses repo module if present)
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
-# My_Portfolio rebuild from _Portfolio_CostBasis (v6.14.0)
+# My_Portfolio rebuild from _Portfolio_CostBasis (v6.64.6)
 #
-# WHY: My_Portfolio's authoritative content is the user's manually-maintained
-# holdings — symbol, quantity, average (buy) cost — which live ONLY in the
-# _Portfolio_CostBasis tab. The page-driven enriched request (empty symbol
-# list) returns the backend's own default/page rows WITHOUT the user's
-# quantities, so the v6.5.0 guard correctly refuses every write (it would blank
-# Qty/Avg Cost). Net effect: My_Portfolio never refreshes.
-# FIX (gated OFF by TFB_PORTFOLIO_REBUILD): when enabled AND the task is
-# My_Portfolio, (1) source the symbol list from _Portfolio_CostBasis so the
-# backend returns enriched rows for the user's ACTUAL holdings with live
-# prices/recommendation; (2) inject the user's Qty + Avg Cost back into those
-# rows and recompute the position-math columns (MV / Cost / P&L) consistently
-# with a per-row FX derived from the payload's own Price vs Price-SAR — so the
-# guard passes and no internally-inconsistent half-row (fresh price against a
-# blank value) is ever written; (3) classify known sukuk / fixed-income
-# instruments so they are not framed by equity valuation columns.
-# SAFETY: applies to My_Portfolio only. On ANY uncertainty (cost basis
-# unreadable/empty, or the payload lacks a symbol / Qty / Avg-Cost column) the
-# rebuild NO-OPS and the existing page-driven flow + guard run unchanged — so a
-# failed rebuild can only fall back to the current (safe) blocked state, never
-# to corrupted data. The FX/position math reproduces the engine's own
-# Portfolio_Decision figures (unit-tested in tests/test_portfolio_rebuild.py).
-# Full fixed-income analytics (yield/duration/credit) are NOT claimed here;
-# sukuk are LABELED and held, not valued as equities.
+# A native row-four ledger was unreadable by the historical row-one parser;
+# symbols=[] then selected unrelated backend defaults. One bounded snapshot
+# now proves exact active identities, positive Shares, native unit Buy Price
+# and Ccy before any fetch. Historical inactive lots and aggregate Cost Basis
+# are not holdings inputs. Ambiguous/empty inputs preserve the prior page.
+# TFB_PORTFOLIO_REBUILD retains its default OFF. OFF requires explicit caller
+# holdings; ON supplies the verified ledger cohort. A page-driven portfolio
+# fallback is never a valid holding source.
+# Apply the same snapshot again after restoration. Canonical Position Cost,
+# Value and P&L are native currency, matching engine _compute_position_math;
+# explicit SAR columns require verified per-row price conversion separately.
+# Final membership/currency/input validation is independent of market rollout
+# gates. Existing quote, decision, manual-write and acquisition guards remain.
+# Fixed-income labeling is retained; yield/duration/credit are not computed.
 # -----------------------------------------------------------------------------
 _PORTFOLIO_REBUILD_TAG = "[v6.14.0 PORTFOLIO-REBUILD]"
 _COST_BASIS_SHEET = "_Portfolio_CostBasis"
@@ -3772,7 +3772,8 @@ _COST_BASIS_SHEET = "_Portfolio_CostBasis"
 _CB_SYMBOL_ALIASES = frozenset({"symbol", "ticker", "code", "instrument"})
 _CB_QTY_ALIASES = frozenset({"quantity", "qty", "shares", "units", "positionqty", "positionquantity"})
 _CB_COST_ALIASES = frozenset({"buyprice", "avgcost", "averagecost", "avgbuyprice",
-                              "averagebuyprice", "costbasis", "avgcostprice", "cost", "price"})
+                              "averagebuyprice", "avgcostprice"})
+_CB_CURRENCY_ALIASES = frozenset({"ccy", "currency"})
 
 # Position-math columns recomputed after injection (alias-matched, normalized).
 _PM_QTY_ALIASES = frozenset({"qty", "quantity", "shares", "units", "positionqty", "positionquantity"})
@@ -3780,7 +3781,10 @@ _PM_AVGCOST_ALIASES = frozenset({"avgcost", "averagecost", "avgcostprice", "posi
                                  "avgprice", "averageprice", "costbasis", "avgbuyprice", "averagebuyprice"})
 _PM_PRICE_ALIASES = frozenset({"price", "lastprice", "currentprice"})
 _PM_PRICESAR_ALIASES = frozenset({"pricesar"})
-_PM_MVSAR_ALIASES = frozenset({"mvsar", "marketvaluesar", "positionvaluesar", "positionvalue", "marketvalue"})
+_PM_MV_ALIASES = frozenset({"positionvalue", "marketvalue"})
+_PM_COST_ALIASES = frozenset({"positioncost"})
+_PM_PNL_ALIASES = frozenset({"unrealizedpl", "unrealizedpnl"})
+_PM_MVSAR_ALIASES = frozenset({"mvsar", "marketvaluesar", "positionvaluesar"})
 _PM_COSTSAR_ALIASES = frozenset({"costsar"})
 _PM_PNLSAR_ALIASES = frozenset({"plsar", "pnlsar", "unrealizedplsar", "unrealizedpnlsar"})
 _PM_PNLPCT_ALIASES = frozenset({"plpct", "pnlpct"})
@@ -3803,9 +3807,10 @@ def _fixed_income_symbols() -> set:
 
 def _pm_to_float(v: Any) -> Optional[float]:
     try:
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+        if v is None or isinstance(v, bool) or (isinstance(v, str) and v.strip() == ""):
             return None
-        return float(str(v).replace(",", "").strip())
+        number = float(str(v).replace(",", "").strip())
+        return number if math.isfinite(number) else None
     except Exception:
         return None
 
@@ -3819,53 +3824,165 @@ def _find_pnl_pct_col(headers: List[Any]) -> int:
         n = _guard_norm(h)
         if n in {"plpct", "pnlpct", "plpercent", "pnlpercent"}:
             return i
-        if n in {"pl", "pnl"} and "%" in str(h if h is not None else ""):
+        if n in {"pl", "pnl", "unrealizedpl", "unrealizedpnl"} and "%" in str(h if h is not None else ""):
             return i
     return -1
 
 
-def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, float]]:
-    """Read _Portfolio_CostBasis -> {SYMBOL: {'qty': float, 'cost': float}}.
-    Returns {} on ANY failure so the caller no-ops the rebuild (fail-safe)."""
+def _portfolio_ledger_name(value: Any, symbol: str) -> Optional[str]:
+    """An operator display label is optional; it is never issuer identity proof."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or name.casefold() in {
+            "n/a", "na", "none", "null", "unknown", "unavailable", "undefined",
+            "nan", "inf", "-", "--", "name", "symbol", "ticker"}:
+        return None
+    if name.upper() in {symbol, symbol.rsplit(".", 1)[0]}:
+        return None
     try:
-        grid = sheets.read_values(spreadsheet_id, _COST_BASIS_SHEET, "A1:Z200")
+        float(name.replace(",", ""))
+        return None  # Numeric text cannot prove a display label either.
+    except ValueError:
+        pass
+    if _name_is_fabricated(name) or any(
+            name.casefold().startswith(page.casefold() + " ")
+            for page in _FABRICATED_NAME_PAGES):
+        return None
+    return name
+
+
+def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
+    """Read one complete, unambiguous active-ledger snapshot.
+
+    Buy Price / Avg Cost is a native-currency unit cost. Aggregate Cost Basis,
+    fees and SAR totals cannot establish that value. Duplicate active lots
+    require an explicit aggregation contract, so they remain unproven here.
+    {} means no safe refresh cohort; the caller must preserve the old page.
+    """
+    try:
+        grid = sheets.read_values(spreadsheet_id, _COST_BASIS_SHEET, "A1:EZ20050")
     except Exception:
         return {}
-    if not grid or not isinstance(grid, list) or len(grid) < 2:
+    if not isinstance(grid, list) or not grid or len(grid) >= 20050:
         return {}
-    header = grid[0] if isinstance(grid[0], list) else []
-    s_i = _guard_find_col(header, _CB_SYMBOL_ALIASES)
-    q_i = _guard_find_col(header, _CB_QTY_ALIASES)
-    c_i = _guard_find_col(header, _CB_COST_ALIASES)
-    if s_i < 0 or q_i < 0 or c_i < 0:
+    header_row = next((i for i, row in enumerate(grid[:45])
+        if isinstance(row, list) and "status" in [_guard_norm(h) for h in row]
+        and any(_guard_norm(h) in _CB_SYMBOL_ALIASES for h in row)), None)
+    if header_row is None:
         return {}
-    out: Dict[str, Dict[str, float]] = {}
-    for row in grid[1:]:
+    names = [_guard_norm(h) for h in grid[header_row]]
+    columns = []
+    for aliases in (_CB_SYMBOL_ALIASES, frozenset({"status"}), _CB_QTY_ALIASES,
+                    _CB_COST_ALIASES, _CB_CURRENCY_ALIASES):
+        found = [i for i, name in enumerate(names) if name in aliases]
+        if len(found) != 1:
+            return {}
+        columns.append(found[0])
+    s_i, status_i, q_i, c_i, ccy_i = columns
+    name_columns = [i for i, name in enumerate(names) if name in _GUARD_NAME_ALIASES]
+    name_i = name_columns[0] if len(name_columns) == 1 else -1
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in grid[header_row + 1:]:
         if not isinstance(row, list):
-            continue
+            return {}
         sym = str(row[s_i]).strip().upper() if s_i < len(row) and row[s_i] is not None else ""
-        if not sym or sym in {"SYMBOL", "TICKER"}:
+        if not sym:
+            if any(i < len(row) and not _guard_is_blank(row[i])
+                   for i in (status_i, q_i, c_i, ccy_i)):
+                return {}
+            continue
+        status = str(row[status_i] or "").strip().casefold() if status_i < len(row) else ""
+        if status not in {"active", "inactive", "closed", "sold"}:
+            return {}
+        if status != "active":
             continue
         qty = _pm_to_float(row[q_i]) if q_i < len(row) else None
         cost = _pm_to_float(row[c_i]) if c_i < len(row) else None
-        if qty is None or cost is None:
+        if qty is None or qty < 0:
+            return {}
+        if qty == 0:
             continue
-        out[sym] = {"qty": qty, "cost": cost}
+        if canonicalize_symbol(sym) != sym or not symbol_domain_ok(sym):
+            # Existing market filters rewrite approved registry aliases.
+            # The ledger and full-refresh audit need one exact active identity;
+            # require its already established canonical spelling before fetch.
+            return {}
+        currency = str(row[ccy_i] or "").strip().upper() if ccy_i < len(row) else ""
+        if (cost is None or cost <= 0 or not math.isfinite(qty * cost) or qty * cost <= 0
+                or not re.fullmatch(r"[A-Z]{3}", currency) or sym in out):
+            return {}
+        out[sym] = {"qty": qty, "cost": cost, "currency": currency}
+        name = _portfolio_ledger_name(row[name_i], sym) if 0 <= name_i < len(row) else None
+        if name is not None:
+            out[sym]["name"] = name
     return out
+
+
+def _read_portfolio_acquisition_symbols(
+    sheets: "SheetsWriter", spreadsheet_id: str,
+) -> Optional[List[str]]:
+    """Prove the active acquisition cohort without changing holdings inputs.
+
+    Retained as a pure telemetry reader for callers that do not need financial
+    inputs. The production rebuild uses its stricter _read_cost_basis snapshot
+    for both fetch and census; returned rows cannot establish its denominator.
+    Reuse the coverage audit's active-ledger parser, including header-offset and
+    closed/zero-quantity handling. Unproven/bounded-out ledgers remain UNKNOWN.
+    """
+    try:
+        from scripts.audit_full_refresh_coverage import ledger_symbols
+
+        grid = sheets.read_values(spreadsheet_id, _COST_BASIS_SHEET, "A1:EZ20050")
+        if not isinstance(grid, list) or len(grid) >= 20050:
+            return None
+        # A known active/inactive status is required to prove a cohort of
+        # holdings rather than accidentally count historical closed lots.
+        ledger_header = next((i for i, row in enumerate(grid[:45])
+            if isinstance(row, list) and "symbol" in [_guard_norm(h) for h in row]
+            and "status" in [_guard_norm(h) for h in row]), None)
+        if ledger_header is None:
+            return None
+        names = [_guard_norm(h) for h in grid[ledger_header]]
+        if names.count("symbol") != 1 or names.count("status") != 1:
+            return None
+        quantity_columns = [i for i, name in enumerate(names) if name in _CB_QTY_ALIASES]
+        if len(quantity_columns) > 1:
+            return None
+        if quantity_columns and str(grid[ledger_header][quantity_columns[0]]).strip().casefold() not in {
+                "shares", "quantity", "position qty"}:
+            # Do not claim quantity-based membership the shared parser cannot
+            # interpret, or select one of contradictory quantity aliases.
+            return None
+        symbol_i, status_i = names.index("symbol"), names.index("status")
+        for row in grid[ledger_header + 1:]:
+            if not isinstance(row, list):
+                return None
+            if symbol_i < len(row) and str(row[symbol_i] or "").strip():
+                status = str(row[status_i] or "").strip().casefold() if status_i < len(row) else ""
+                if status not in {"active", "inactive", "closed", "sold"}:
+                    return None
+        active, warnings = ledger_symbols(grid[ledger_header:])
+        return None if warnings else active
+    except Exception:
+        return None
 
 
 def _inject_portfolio_holdings(
     headers: List[Any],
     rows_matrix: List[List[Any]],
-    cost_basis: Dict[str, Dict[str, float]],
+    cost_basis: Dict[str, Dict[str, Any]], *, include_ledger_name: bool = False,
 ) -> Tuple[List[List[Any]], int]:
-    """Inject the user's Qty + Avg Cost into the payload rows and recompute the
-    position-math columns (MV / Cost / P&L) consistently, using a per-row FX
-    derived from the payload's own Price vs Price-SAR. Pure function (no I/O) so
-    it is unit-testable. Returns (rows, injected_count). NO-OPS (returns input
-    unchanged) when the symbol / Qty / Avg-Cost columns are absent — the guard
-    then blocks the still-blank write, so the failure mode is the current safe
-    blocked state, never corrupted data."""
+    """Apply ledger inputs and reproduce the engine's native position math.
+
+    Canonical Position Cost/Value/P&L use the quote's native currency; percent
+    is in percentage points. Explicit SAR columns are separate and require
+    positive native and SAR prices to establish their conversion. This helper
+    changes neither quote provenance nor manual decisions/notes. Optional
+    display-label fallback runs only after existing identity/eligibility guards
+    in the final injection pass, with its own provenance. The caller validates
+    currency and membership before publication.
+    """
     if not headers or not rows_matrix or not cost_basis:
         return rows_matrix, 0
     sym_i = _guard_find_col(headers, _GUARD_SYMBOL_ALIASES)
@@ -3875,11 +3992,19 @@ def _inject_portfolio_holdings(
         return rows_matrix, 0  # cannot inject safely -> no-op
     price_i = _guard_find_col(headers, _PM_PRICE_ALIASES)
     psar_i = _guard_find_col(headers, _PM_PRICESAR_ALIASES)
-    mv_i = _guard_find_col(headers, _PM_MVSAR_ALIASES)
-    cost_i = _guard_find_col(headers, _PM_COSTSAR_ALIASES)
-    pnl_i = _guard_find_col(headers, _PM_PNLSAR_ALIASES)
+    mv_i = _guard_find_col(headers, _PM_MV_ALIASES)
+    cost_i = _guard_find_col(headers, _PM_COST_ALIASES)
+    pnl_i = next((i for i, h in enumerate(headers)
+        if _guard_norm(h) in _PM_PNL_ALIASES and "%" not in str(h)), -1)
+    mv_sar_i = _guard_find_col(headers, _PM_MVSAR_ALIASES)
+    cost_sar_i = _guard_find_col(headers, _PM_COSTSAR_ALIASES)
+    pnl_sar_i = _guard_find_col(headers, _PM_PNLSAR_ALIASES)
     pct_i = _find_pnl_pct_col(headers)
     cls_i = _guard_find_col(headers, _PM_ASSETCLASS_ALIASES)
+    name_columns = [i for i, h in enumerate(headers) if _guard_norm(h) in _GUARD_NAME_ALIASES]
+    warning_columns = [i for i, h in enumerate(headers) if _guard_norm(h) in _FG_WARN_ALIASES]
+    name_i = name_columns[0] if len(name_columns) == 1 else -1
+    warning_i = warning_columns[0] if len(warning_columns) == 1 else -1
     fi_syms = _fixed_income_symbols()
 
     width = len(headers)
@@ -3892,32 +4017,102 @@ def _inject_portfolio_holdings(
         sym = str(rr[sym_i]).strip().upper() if sym_i < len(rr) and rr[sym_i] is not None else ""
         hold = cost_basis.get(sym)
         if hold:
+            ledger_name = _portfolio_ledger_name(hold.get("name"), sym)
+            if (include_ledger_name and name_i >= 0 and warning_i >= 0
+                    and (rr[warning_i] is None or isinstance(rr[warning_i], str))
+                    and _guard_is_blank(rr[name_i]) and ledger_name is not None):
+                rr[name_i] = ledger_name
+                provenance = "name_source:portfolio_ledger"
+                warning = str(rr[warning_i]) if rr[warning_i] is not None else ""
+                if provenance not in {token.strip() for token in warning.split(";")}:
+                    rr[warning_i] = (warning + "; " + provenance) if warning else provenance
             qty = hold["qty"]
             buy = hold["cost"]
             rr[qty_i] = qty
             rr[avg_i] = buy
             price = _pm_to_float(rr[price_i]) if price_i >= 0 else None
             psar = _pm_to_float(rr[psar_i]) if psar_i >= 0 else None
-            # Per-row FX from the payload's own native vs SAR price; SAR rows -> 1.0
-            fx = (psar / price) if (price not in (None, 0) and psar not in (None, 0)) else 1.0
-            unit_sar = psar if psar not in (None, 0) else (price if price not in (None, 0) else None)
-            if unit_sar is not None:
-                mv_sar = qty * unit_sar
-                cost_sar = qty * buy * fx
-                pnl_sar = mv_sar - cost_sar
-                if mv_i >= 0:
-                    rr[mv_i] = round(mv_sar, 2)
-                if cost_i >= 0:
-                    rr[cost_i] = round(cost_sar, 2)
-                if pnl_i >= 0:
-                    rr[pnl_i] = round(pnl_sar, 2)
-                if pct_i >= 0 and cost_sar not in (None, 0):
-                    rr[pct_i] = round(pnl_sar / cost_sar * 100.0, 2)
+            native_cost = qty * buy
+            if cost_i >= 0:
+                rr[cost_i] = round(native_cost, 6)
+            for i in (mv_i, pnl_i, pct_i, mv_sar_i, cost_sar_i, pnl_sar_i):
+                if i >= 0:
+                    rr[i] = ""  # An old price-dependent value is not proof.
+            if price is not None and price > 0:
+                native_value = qty * price
+                native_pnl = native_value - native_cost
+                for i, value in ((mv_i, native_value), (pnl_i, native_pnl),
+                                 (pct_i, native_pnl / native_cost * 100.0)):
+                    if i >= 0:
+                        rr[i] = round(value, 6)
+                if psar is not None and psar > 0:
+                    fx = psar / price
+                    for i, value in ((mv_sar_i, native_value * fx),
+                                     (cost_sar_i, native_cost * fx),
+                                     (pnl_sar_i, native_pnl * fx)):
+                        if i >= 0:
+                            rr[i] = round(value, 6)
             if sym in fi_syms and cls_i >= 0:
                 rr[cls_i] = "Fixed Income / Sukuk"
             injected += 1
         out.append(rr)
     return out, injected
+
+
+def _portfolio_holdings_contract(
+    headers: List[Any], rows_matrix: List[List[Any]],
+    cost_basis: Dict[str, Dict[str, Any]], *, require_complete: bool,
+) -> Tuple[bool, str]:
+    """Validate exact active membership and native-currency input semantics.
+
+    The contract is independent of configurable market membership/gate modes.
+    An omitted holding may be restored by existing persistence, but a foreign,
+    duplicate or currency-ambiguous row cannot establish a portfolio refresh.
+    """
+    column_groups = (_GUARD_SYMBOL_ALIASES, _PM_QTY_ALIASES,
+        _PM_AVGCOST_ALIASES, _PM_PRICE_ALIASES, _CB_CURRENCY_ALIASES,
+        _PM_COST_ALIASES, _PM_MV_ALIASES)
+    columns = []
+    names = [_guard_norm(h) for h in headers or []]
+    for aliases in column_groups:
+        found = [i for i, name in enumerate(names) if name in aliases]
+        if len(found) != 1:
+            return False, "missing or ambiguous native holdings columns"
+        columns.append(found[0])
+    pnl_columns = [i for i, h in enumerate(headers)
+        if _guard_norm(h) in _PM_PNL_ALIASES and "%" not in str(h)]
+    pct_columns = [i for i, h in enumerate(headers)
+        if (_guard_norm(h) in _PM_PNL_ALIASES and "%" in str(h))
+        or _guard_norm(h) in {"plpct", "pnlpct", "plpercent", "pnlpercent"}]
+    if len(pnl_columns) != 1 or len(pct_columns) != 1:
+        return False, "missing or ambiguous native P&L columns"
+    symbol_i, qty_i, avg_i, price_i, currency_i, cost_i, value_i = columns
+    seen = set()
+    for row in rows_matrix or []:
+        if not isinstance(row, list):
+            return False, "malformed holdings row"
+        symbol = str(row[symbol_i] or "").strip().upper() if symbol_i < len(row) else ""
+        if symbol not in cost_basis or symbol in seen:
+            return False, "foreign, blank or duplicate holding identity"
+        seen.add(symbol)
+        currency = str(row[currency_i] or "").strip().upper() if currency_i < len(row) else ""
+        if currency != cost_basis[symbol]["currency"]:
+            return False, "holding quote currency does not match native ledger currency"
+        if require_complete:
+            qty = _pm_to_float(row[qty_i]) if qty_i < len(row) else None
+            cost = _pm_to_float(row[avg_i]) if avg_i < len(row) else None
+            if qty != cost_basis[symbol]["qty"] or cost != cost_basis[symbol]["cost"]:
+                return False, "holding quantity or unit cost differs from ledger snapshot"
+            if cost_i >= len(row) or _pm_to_float(row[cost_i]) is None:
+                return False, "nonfinite native position cost"
+            price = _pm_to_float(row[price_i]) if price_i < len(row) else None
+            if price is not None and price > 0 and any(
+                    i >= len(row) or _pm_to_float(row[i]) is None
+                    for i in (value_i, pnl_columns[0], pct_columns[0])):
+                return False, "nonfinite price-dependent position math"
+    if require_complete and seen != set(cost_basis):
+        return False, "active holding missing from final portfolio matrix"
+    return True, ""
 
 
 # =============================================================================
@@ -11123,6 +11318,7 @@ async def _run_one_task(
     _noncurrent_fetched_symbols: set = set()
     _fetchfail_origin_symbols: set = set()
     _acquired_origin_symbols: Optional[set] = None
+    _acquisition_requested_symbols: Optional[List[str]] = None
     _preserved_acquisition_symbols: set = set()
     symbols: List[str] = []
     rows_matrix: List[List[Any]] = []
@@ -11204,22 +11400,26 @@ async def _run_one_task(
         if max_syms != 0:
             symbols = _read_symbols(canon_task_key, spreadsheet_id, max_syms)
 
-        # v6.14.0: My_Portfolio rebuild — source symbols from the user's
-        # _Portfolio_CostBasis (the authoritative holdings) so the backend
-        # returns enriched rows for the ACTUAL holdings. Fail-safe: empty cost
-        # basis (unreadable/no creds) leaves the page-driven flow untouched.
-        _pf_cost_basis: Dict[str, Dict[str, float]] = {}
-        if (
-            _portfolio_rebuild_enabled()
-            and sheets is not None
-            and _guard_norm(task.sheet_name) == _guard_norm("My_Portfolio")
-        ):
-            _pf_cost_basis = _read_cost_basis(sheets, spreadsheet_id)
-            if _pf_cost_basis:
-                symbols = sorted(_pf_cost_basis.keys())
-                res.warnings.append(
-                    f"{_PORTFOLIO_REBUILD_TAG} sourced {len(symbols)} holding(s) from {_COST_BASIS_SHEET}"
-                )
+        # One validated snapshot establishes both the request and holdings
+        # inputs. An unreadable row-four ledger must never select defaults.
+        _pf_cost_basis: Dict[str, Dict[str, Any]] = {}
+        _is_portfolio = _guard_norm(task.sheet_name) == _guard_norm("My_Portfolio")
+        if _is_portfolio and _portfolio_rebuild_enabled():
+            _pf_cost_basis = _read_cost_basis(sheets, spreadsheet_id) if sheets is not None else {}
+            if not _pf_cost_basis or len(_pf_cost_basis) > _request_limit_ceiling():
+                res.status = "failed"
+                res.error = "Active portfolio ledger is empty, unreadable, ambiguous, requires canonical symbol spelling or exceeds the request bound; preserving prior portfolio."
+                res.warnings.append(f"{_PORTFOLIO_REBUILD_TAG} {res.error}")
+                return res
+            symbols = sorted(_pf_cost_basis)
+            res._stamp_meta["requested"] = len(symbols)
+            res.warnings.append(
+                f"{_PORTFOLIO_REBUILD_TAG} sourced {len(symbols)} active holding(s) from {_COST_BASIS_SHEET}"
+            )
+        elif _is_portfolio and not symbols:
+            res.status = "failed"
+            res.error = "Portfolio has no explicit requested holdings and rebuild is disabled; preserving prior portfolio."
+            return res
 
         # v6.16.0: Market-page symbol read-back — refresh the symbols the user
         # has on the page instead of overwriting them with placeholder defaults.
@@ -11229,6 +11429,7 @@ async def _run_one_task(
         # the page-driven flow untouched; the read-back can only ADD symbols.
         if (
             _market_symbol_readback_enabled()
+            and not _pf_cost_basis
             and sheets is not None
             and _guard_norm(task.sheet_name) in _market_readback_pages()
         ):
@@ -11454,6 +11655,7 @@ async def _run_one_task(
         # ----------------------------------------------------------------------
 
         res.symbols_requested = len(symbols)
+        _acquisition_requested_symbols = symbols
 
         # Dry run: still success-ish but no backend call and no write
         if dry_run:
@@ -11563,10 +11765,16 @@ async def _run_one_task(
                 continue
 
             rows_matrix = _rectify_matrix(headers, rows_matrix)
-            # v6.14.0: inject the user's Qty/Avg Cost from _Portfolio_CostBasis
-            # and recompute MV/Cost/P&L so the guard passes and no half-row is
-            # written. No-ops if columns absent (guard then blocks the still-
-            # blank write -> safe fall-back to the current blocked state).
+            if _pf_cost_basis:
+                _pf_safe, _pf_reason = _portfolio_holdings_contract(
+                    headers, rows_matrix, _pf_cost_basis, require_complete=False)
+                if not _pf_safe:
+                    res.status = "failed"
+                    res.error = f"Portfolio response contract failed: {_pf_reason}; preserving prior portfolio."
+                    res.warnings.append(f"{_PORTFOLIO_REBUILD_TAG} {res.error}")
+                    return res
+            # Apply the verified native holdings inputs before existing manual
+            # guards. A final pass also updates any restored predecessor.
             if _pf_cost_basis and rows_matrix:
                 rows_matrix, _inj = _inject_portfolio_holdings(headers, rows_matrix, _pf_cost_basis)
                 if _inj:
@@ -11650,7 +11858,9 @@ async def _run_one_task(
                 "ff_new_fetched": len(_fetchfail_origin_symbols),
                 "pre_persist_rows": len(rows_matrix),
             })
-            _acquired_origin_symbols = _record_acquisition_census(res, headers, rows_matrix, symbols)
+            if _acquisition_requested_symbols is not None:
+                _acquired_origin_symbols = _record_acquisition_census(
+                    res, headers, rows_matrix, _acquisition_requested_symbols)
             rows_matrix, _critical_identity_failures = validate_fresh_critical_rows(
                 headers, rows_matrix, symbols
             )
@@ -11665,6 +11875,15 @@ async def _run_one_task(
                 )
                 res.warnings.append(_fresh_msg)
                 logger.error(_fresh_msg)
+
+        if (task.sheet_name == "My_Portfolio" and headers
+                and _acquisition_requested_symbols is not None
+                and _acquired_origin_symbols is None):
+            # Page-driven portfolio requests have no explicit symbol payload.
+            # Capture their actual originating rows against the proven roster
+            # before manual-cell guards or any last-good restoration.
+            _acquired_origin_symbols = _record_acquisition_census(
+                res, headers, rows_matrix, _acquisition_requested_symbols)
 
         # No creds => partial (data fetched but not written). Critical identity
         # validation has already run, so this path cannot report green when
@@ -12610,6 +12829,22 @@ async def _run_one_task(
                                _OHLC_PREWRITE_TAG, task.sheet_name, _oce)
         # ---------------------------------------------------------------------
 
+        # Reapply the same frozen active-ledger snapshot after all restoration
+        # and quarantine stages. A restored row cannot revert edited holdings,
+        # and a brand-new omitted holding cannot silently disappear.
+        if _pf_cost_basis:
+            rows_matrix, _pf_injected = _inject_portfolio_holdings(
+                headers, rows_matrix, _pf_cost_basis, include_ledger_name=True)
+            _pf_safe, _pf_reason = _portfolio_holdings_contract(
+                headers, rows_matrix, _pf_cost_basis, require_complete=True)
+            if not _pf_safe or _pf_injected != len(_pf_cost_basis):
+                res.status = "failed"
+                res.rows_written = 0
+                res.rows_failed = len(_pf_cost_basis)
+                res.error = f"Final portfolio contract failed: {_pf_reason or 'incomplete holdings injection'}; preserving prior portfolio."
+                res.warnings.append(f"{_PORTFOLIO_REBUILD_TAG} {res.error}")
+                return res
+
         # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
         # leaves an EMPTY page when the job dies between the two calls (the
         # 2026-07-02 Mutual_Funds / Commodities_FX wipe). Default is now
@@ -12770,7 +13005,7 @@ async def _run_one_task(
         res.end_utc = _utc_now().isoformat()
         if _acquired_origin_symbols is not None:
             try:
-                _record_acquisition_census(res, headers, rows_matrix, symbols,
+                _record_acquisition_census(res, headers, rows_matrix, _acquisition_requested_symbols,
                     origins=_acquired_origin_symbols, noncurrent=_noncurrent_fetched_symbols)
             except Exception as exc:
                 res._stamp_meta["acquisition_known"] = False

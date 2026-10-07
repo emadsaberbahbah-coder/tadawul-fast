@@ -2,7 +2,14 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.15.0
+Yahoo Chart Provider (Global + KSA History) -- v8.15.1
+
+v8.15.1 -- isolate symbol-local quote misses from provider outages. A 404
+or an empty instrument cannot open the shared quote breaker. Mixed host
+failures and failed fallback transport retain outage protection. Local
+misses use bounded symbol-only backoff; no price/provenance is invented.
+Cancelled single-flight owners release their waiters; cancelled waiters do
+not cancel shared acquisition. Batch cancellation remains cancellation.
 ================================================================================
 v8.15.0 -- LOOPGUARD (B6-b): ASYNC STATE SURVIVES asyncio.run() PER CALL
 --------------------------------------------------------------------------------
@@ -743,7 +750,7 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.15.0"
+PROVIDER_VERSION = "8.15.1"
 # -----------------------------------------------------------------------------
 # v8.14.0 (2026-09-01) - OPEN HEALED FROM THE SESSION CANDLE, COHERENCE-GUARDED
 # -----------------------------------------------------------------------------
@@ -1145,10 +1152,15 @@ def _raw_chart_parse_triple(
     err = chart.get("error")
     if err:
         code = err.get("code") if isinstance(err, dict) else str(err)
-        raise YahooFetchError(f"chart_error:{code}")
-    results = chart.get("result") or []
-    if not results or not isinstance(results[0], dict):
-        raise YahooFetchError("empty_result")
+        raise YahooFetchError(f"chart_error:{code}",
+                              provider_outage=str(code).strip().lower() != "not found")
+    if "result" not in chart:
+        raise YahooFetchError("malformed_payload")
+    results = chart.get("result")
+    if results is None or results == []:
+        raise YahooFetchError("empty_result", provider_outage=False)
+    if not isinstance(results, list) or not isinstance(results[0], dict):
+        raise YahooFetchError("malformed_payload")
     r0 = results[0]
     meta_raw = r0.get("meta") or {}
     if not isinstance(meta_raw, dict):
@@ -1306,14 +1318,17 @@ async def _raw_chart_fetch_triple(
     Raises YahooFetchError (with the LAST host's reason) on total failure."""
     params = {"range": range_ or "1y", "interval": interval or "1d"}
     last_exc: Optional[Exception] = None
+    provider_outage = False
     for host in _RAW_CHART_HOSTS:
         try:
             data = await _raw_http_get_json(f"{host}/v8/finance/chart/{ysym}", params, timeout)
             return _raw_chart_parse_triple(ysym, data, range_)
         except Exception as exc:  # noqa: BLE001 — ladder tries next host
             last_exc = exc
+            provider_outage = provider_outage or _quote_failure_provider_wide(exc)
             continue
-    raise YahooFetchError(f"raw_chart_failed:{last_exc}")
+    # A later 404 must not hide an earlier 429/auth/network/5xx outage.
+    raise YahooFetchError(f"raw_chart_failed:{last_exc}", provider_outage=provider_outage)
 
 
 # =============================================================================
@@ -1412,6 +1427,52 @@ class YahooProviderError(Exception):
 
 class YahooFetchError(YahooProviderError):
     """Raised when a data fetch fails."""
+
+    def __init__(self, message: str, *, provider_outage: Optional[bool] = None):
+        super().__init__(message)
+        self.provider_outage = provider_outage
+
+
+def _quote_failure_provider_wide(exc: Exception) -> bool:
+    """Known per-instrument misses are local; uncertain transport stays protected."""
+    classified = getattr(exc, "provider_outage", None)
+    if classified:
+        return True
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    text = str(exc).lower()
+    statuses = [int(code) for code in re.findall(
+        r"(?:http(?: error)?[_ -]?|status(?:[_ ]code)?[=: ]+)(\d{3})\b", text,
+    )]
+    if isinstance(status, int):
+        statuses.append(status)
+    if any(code in (401, 403, 429) or code >= 500 for code in statuses):
+        return True
+    if any(term in text for term in (
+        "too many requests", "rate limit", "invalid crumb", "unauthorized",
+        "forbidden", "authentication", "timed out", "timeout", "connection", "network",
+        "internal server error", "service unavailable", "bad gateway",
+        "unable to access this feature", "access denied", "unauthenticated",
+    )):
+        return True
+    if classified is False:
+        return False
+    if 404 in statuses:
+        return False
+    wrapped = re.search(r"yahoo error\s*=\s*[\"']([^\"']*)", text)
+    if wrapped:
+        # yfinance wraps even a server/auth failure in PricesMissingError.
+        # Its explicit Yahoo description outranks the generic class label.
+        return not any(term in wrapped.group(1) for term in (
+            "not found", "no price data found", "no data found", "possibly delisted",
+        ))
+    if exc.__class__.__name__ in {"YFPricesMissingError", "YFTzMissingError"}:
+        return False
+    if any(term in text for term in ("possibly delisted", "no price data found", "no data found")):
+        return False
+    return True
 
 
 # =============================================================================
@@ -1826,25 +1887,30 @@ class CircuitBreaker:
     # v8.15.0 LOOPGUARD (B6-b): threading.Lock (was asyncio.Lock, loop-bound);
     # allow/record_success/record_failure hold no await (metrics are sync).
     lock: Any = field(default_factory=threading.Lock)
+    report_metrics: bool = True
 
     async def allow(self) -> bool:
         """Return True if a request is allowed through."""
         metrics = _get_metrics()
         with self.lock:                              # v8.15.0 LOOPGUARD
             if self.state == "closed":
-                metrics.circuit_state.labels(state="closed").set(0.0)
+                if self.report_metrics:
+                    metrics.circuit_state.labels(state="closed").set(0.0)
                 return True
 
             if self.state == "open":
                 if time.monotonic() - self.opened_at >= self.cooldown_sec:
                     self.state = "half_open"
                     self.successes = 0
-                    metrics.circuit_state.labels(state="half_open").set(1.0)
+                    if self.report_metrics:
+                        metrics.circuit_state.labels(state="half_open").set(1.0)
                     return True
-                metrics.circuit_state.labels(state="open").set(2.0)
+                if self.report_metrics:
+                    metrics.circuit_state.labels(state="open").set(2.0)
                 return False
 
-            metrics.circuit_state.labels(state="half_open").set(1.0)
+            if self.report_metrics:
+                metrics.circuit_state.labels(state="half_open").set(1.0)
             return True
 
     async def record_success(self) -> None:
@@ -1922,13 +1988,21 @@ class SingleFlight:
         # v8.15.0 LOOPGUARD: OUTSIDE the critical section -- a threading.Lock
         # held across an await would deadlock the loop.
         if not owner:
-            return await future
+            # One subscriber cannot cancel the shared acquisition or its
+            # result still awaited by other subscribers.
+            return await asyncio.shield(future)
 
         try:
             result = await coro_fn()
             if not future.cancelled() and not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            # Wake every subscriber. Cancellation is never a priced or
+            # empty successful result and must not leave a pending waiter.
+            if not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             if not future.cancelled() and not future.done():
                 future.set_exception(exc)
@@ -2378,7 +2452,7 @@ def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Optional[str]]:
 # Yahoo Finance Sync Fetcher (runs in ThreadPool)
 # =============================================================================
 
-def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
+def _safe_history_metadata(ticker: Any, failures: Optional[List[Exception]] = None) -> Dict[str, Any]:
     """
     Safely extract history metadata from a yfinance Ticker.
 
@@ -2394,8 +2468,9 @@ def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
         meta = getattr(ticker, "history_metadata", None)
         if isinstance(meta, dict) and meta:
             return meta
-    except Exception:
-        pass
+    except Exception as exc:
+        if failures is not None:
+            failures.append(exc)
 
     try:
         fn = getattr(ticker, "get_history_metadata", None)
@@ -2403,8 +2478,9 @@ def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
             meta = fn()
             if isinstance(meta, dict) and meta:
                 return meta
-    except Exception:
-        pass
+    except Exception as exc:
+        if failures is not None:
+            failures.append(exc)
 
     return {}
 
@@ -2487,6 +2563,7 @@ def _fetch_ticker_sync(
     if not _HAS_YFINANCE or yf is None:
         return {}, {}, []
 
+    provider_outage = False
     try:
         ticker = yf.Ticker(_yc_yahoo_symbol(symbol))  # v8.4.0 SSOT map
 
@@ -2496,15 +2573,15 @@ def _fetch_ticker_sync(
             fast_info = getattr(ticker, "fast_info", None)
             if fast_info:
                 info_dict = dict(fast_info)
-        except Exception:
-            pass
+        except Exception as exc:
+            provider_outage = provider_outage or _quote_failure_provider_wide(exc)
 
         try:
             info = getattr(ticker, "info", None)
             if isinstance(info, dict):
                 info_dict.update(info)
-        except Exception:
-            pass
+        except Exception as exc:
+            provider_outage = provider_outage or _quote_failure_provider_wide(exc)
 
         # History (respects config-provided period/interval)
         history_list: List[Dict[str, Any]] = []
@@ -2512,7 +2589,7 @@ def _fetch_ticker_sync(
             # v8.8.0 (YC-ADJ-2): auto_adjust pinned explicitly — library
             # default today, but the raw transport now adjusts too and the two
             # must never diverge again on a yfinance default-flip.
-            hist_df = ticker.history(period=period, interval=interval, auto_adjust=True)
+            hist_df = ticker.history(period=period, interval=interval, auto_adjust=True, raise_errors=True)
             if (_HAS_PANDAS and pd is not None
                     and isinstance(hist_df, pd.DataFrame) and not hist_df.empty):
                 hist_df = hist_df.reset_index()
@@ -2530,18 +2607,26 @@ def _fetch_ticker_sync(
                         "close": _safe_float(row_dict.get("Close")),
                         "volume": _safe_float(row_dict.get("Volume")),
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            provider_outage = provider_outage or _quote_failure_provider_wide(exc)
 
         # v8.0.0: capture history_metadata *after* calling .history() (it's
         # populated lazily by yfinance). v7.0.0 passed None to the helper
         # and got {} back every time.
-        meta = _safe_history_metadata(ticker)
+        metadata_failures: List[Exception] = []
+        meta = _safe_history_metadata(ticker, metadata_failures)
+        provider_outage = provider_outage or any(_quote_failure_provider_wide(exc) for exc in metadata_failures)
+
+        # Keep suppressed transport facts internal. Optional info failures
+        # cannot poison a usable quote, but an empty fallback must not erase
+        # actual authentication/rate/network failure from breaker accounting.
+        if provider_outage:
+            info_dict["_yc_provider_outage"] = True
 
         return info_dict, meta, history_list
     except Exception as exc:
         logger.warning("Sync fetch failed for %s: %s", symbol, exc)
-        return {}, {}, []
+        return ({"_yc_provider_outage": True} if _quote_failure_provider_wide(exc) else {}), {}, []
 
 
 def _enrich_data(
@@ -2782,6 +2867,15 @@ class YahooChartProvider:
             cooldown_sec=self.config.cb_cooldown_sec,
             success_threshold=self.config.cb_success_threshold,
         )
+        # Authenticated yfinance fallback health is separate from the public
+        # chart transport. A missing symbol followed by Invalid Crumb must
+        # protect that fallback without denying other valid raw-chart quotes.
+        self._fallback_circuit_breaker = CircuitBreaker(
+            fail_threshold=self.config.cb_fail_threshold,
+            cooldown_sec=self.config.cb_cooldown_sec,
+            success_threshold=self.config.cb_success_threshold,
+            report_metrics=False,
+        )
         self._single_flight = SingleFlight()
         self._cache = AdvancedCache(
             name="yahoo",
@@ -2794,6 +2888,20 @@ class YahooChartProvider:
         )
         # v8.7.0: throttle marker so a CB-open storm logs once per cooldown.
         self._cb_deny_log_ts: float = 0.0
+        self._fallback_deny_log_ts: float = 0.0
+
+    async def _quote_transport_allowed(self, breaker: CircuitBreaker, transport: str, symbol: str) -> bool:
+        if await breaker.allow():
+            return True
+        marker = "_cb_deny_log_ts" if transport == "raw_chart" else "_fallback_deny_log_ts"
+        now = time.monotonic()
+        if now - getattr(self, marker) >= self.config.cb_cooldown_sec:
+            setattr(self, marker, now)
+            logger.warning(
+                "[yahoo_chart v%s] %s circuit OPEN — requests denied (incl. %s); retry after %.0fs cooldown",
+                PROVIDER_VERSION, transport, symbol, self.config.cb_cooldown_sec,
+            )
+        return False
 
     async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get an enriched quote for a single symbol."""
@@ -2815,26 +2923,23 @@ class YahooChartProvider:
             metrics.cache_hits_total.labels(symbol=sym).inc()
             return cached
 
-        metrics.cache_misses_total.labels(symbol=sym).inc()
+        local_miss = await self._cache.get(sym, kind="quote_miss")
+        if local_miss:
+            metrics.cache_hits_total.labels(symbol=sym).inc()
+            return local_miss.get("row")
 
-        if not await self._circuit_breaker.allow():
-            # v8.7.0: a CB-open denial was a SILENT None (the exact probe
-            # symptom: RESULT None with zero log lines). Throttled to one
-            # line per cooldown window so a storm cannot flood the log.
-            _now_mono = time.monotonic()
-            if _now_mono - getattr(self, "_cb_deny_log_ts", 0.0) >= self.config.cb_cooldown_sec:
-                self._cb_deny_log_ts = _now_mono
-                logger.warning(
-                    "[yahoo_chart v%s] circuit OPEN — requests denied (incl. %s); retry after %.0fs cooldown",
-                    PROVIDER_VERSION, sym, self.config.cb_cooldown_sec,
-                )
-            return None
+        metrics.cache_misses_total.labels(symbol=sym).inc()
 
         await self._token_bucket.acquire()
 
         async def _do_fetch() -> Optional[Dict[str, Any]]:
             loop = asyncio.get_running_loop()
             start_time = time.monotonic()
+            provider_outage = False
+            raw_attempted = False
+            fallback_attempted = False
+            fallback_outage = False
+            failure_stage = "processing"
 
             try:
                 # v8.7.0 (YC-RAW): crumb-free raw chart transport FIRST.
@@ -2846,7 +2951,9 @@ class YahooChartProvider:
                 meta: Dict[str, Any] = {}
                 history: List[Dict[str, Any]] = []
                 _raw_ok = False
-                if _raw_chart_enabled() and _HAS_HTTPX:
+                if (_raw_chart_enabled() and _HAS_HTTPX
+                        and await self._quote_transport_allowed(self._circuit_breaker, "raw_chart", sym)):
+                    raw_attempted = True
                     try:
                         info, meta, history = await _raw_chart_fetch_triple(
                             _yc_yahoo_symbol(sym),
@@ -2856,22 +2963,37 @@ class YahooChartProvider:
                         )
                         _raw_ok = bool(info or history)
                     except Exception as _raw_exc:
+                        provider_outage = _quote_failure_provider_wide(_raw_exc)
+                        if provider_outage:
+                            await self._circuit_breaker.record_failure()
                         logger.warning(
                             "[yahoo_chart v%s YC-RAW] raw chart quote failed for %s: %s — falling back to yfinance",
                             PROVIDER_VERSION, sym, _raw_exc,
                         )
                 if not _raw_ok:
                     # v8.0.0: pass config-provided period/interval to the worker.
-                    info, meta, history = await loop.run_in_executor(
-                        self._executor,
-                        _fetch_ticker_sync,
-                        sym,
-                        self.config.history_period,
-                        self.config.history_interval,
-                    )
+                    if await self._quote_transport_allowed(self._fallback_circuit_breaker, "yfinance", sym):
+                        fallback_attempted = True
+                        failure_stage = "fallback"
+                        info, meta, history = await loop.run_in_executor(
+                            self._executor,
+                            _fetch_ticker_sync,
+                            sym,
+                            self.config.history_period,
+                            self.config.history_interval,
+                        )
+                        failure_stage = "processing"
 
+                if isinstance(info, dict):
+                    info = dict(info)
+                    fallback_outage = bool(info.pop("_yc_provider_outage", False))
                 if not info and not history:
-                    await self._circuit_breaker.record_failure()
+                    if fallback_attempted and fallback_outage:
+                        await self._fallback_circuit_breaker.record_failure()
+                    if ((raw_attempted or fallback_attempted) and not provider_outage
+                            and (raw_attempted or not fallback_outage)):
+                        await self._cache.set(sym, {"row": None}, kind="quote_miss",
+                                              ttl_sec=min(self.config.quote_ttl_sec, self.config.cb_cooldown_sec))
                     metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
                     # v8.7.0: the empty-set outcome was the other silent
                     # None. One observable line, transport-attributed.
@@ -2940,18 +3062,45 @@ class YahooChartProvider:
                     else:
                         result["warnings"] = ["chart_price_incoherent_dropped"]
 
-                await self._circuit_breaker.record_success()
-                metrics.requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
+                price = _safe_float(result.get("current_price"))
+                priced = price is not None and math.isfinite(price) and price > 0
+                if fallback_attempted:
+                    if priced:
+                        await self._fallback_circuit_breaker.record_success()
+                    elif fallback_outage:
+                        await self._fallback_circuit_breaker.record_failure()
+                if priced and _raw_ok:
+                    await self._circuit_breaker.record_success()
+                elif (not priced and (raw_attempted or fallback_attempted) and not provider_outage
+                      and (raw_attempted or not fallback_outage)):
+                    await self._cache.set(sym, {"row": result}, kind="quote_miss",
+                                          ttl_sec=min(self.config.quote_ttl_sec, self.config.cb_cooldown_sec))
+                metrics.requests_total.labels(symbol=sym, op="enriched", status="ok" if priced else "unpriced").inc()
                 metrics.request_duration.labels(symbol=sym, op="enriched").observe(
                     time.monotonic() - start_time
                 )
 
-                if result.get("current_price"):
+                if priced:
                     await self._cache.set(sym, result, kind="enriched")
 
                 return result
             except Exception as exc:
-                await self._circuit_breaker.record_failure()
+                if failure_stage == "fallback":
+                    fallback_outage = fallback_outage or _quote_failure_provider_wide(exc)
+                    if fallback_attempted and fallback_outage:
+                        await self._fallback_circuit_breaker.record_failure()
+                else:
+                    if _quote_failure_provider_wide(exc):
+                        breaker = self._fallback_circuit_breaker if fallback_attempted else self._circuit_breaker
+                        await breaker.record_failure()
+                        if fallback_attempted:
+                            fallback_outage = True
+                        else:
+                            provider_outage = True
+                if ((raw_attempted or fallback_attempted) and not provider_outage
+                        and (raw_attempted or not fallback_outage)):
+                    await self._cache.set(sym, {"row": None}, kind="quote_miss",
+                                          ttl_sec=min(self.config.quote_ttl_sec, self.config.cb_cooldown_sec))
                 metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
                 logger.error("Error fetching %s: %s", sym, exc)
                 return None
@@ -2981,6 +3130,8 @@ class YahooChartProvider:
 
         output: Dict[str, Dict[str, Any]] = {}
         for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if isinstance(result, Exception):
                 continue
             sym, data = result
