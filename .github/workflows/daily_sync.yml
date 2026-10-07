@@ -915,6 +915,7 @@ jobs:
           echo "::endgroup::"
 
       - name: 🎯 Scope Keys To Matrix Leg
+        id: scope_keys
         run: |
           set -euo pipefail
           # (2026-07-08) Two-leg split: filter the FULLY-VALIDATED key set from
@@ -938,6 +939,11 @@ jobs:
               ;;
           esac
           echo "SYNC_KEYS=$SCOPED" >> "$GITHUB_ENV"
+          if [[ -n "$SCOPED" ]]; then
+            echo "has_keys=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_keys=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "🎯 Leg ${{ matrix.group }} keys: ${SCOPED:-<none>}"
           if [[ -z "$SCOPED" ]]; then
             echo "::notice::Leg '${{ matrix.group }}' has no keys after scoping — the sync step will no-op (exit 0)."
@@ -1099,7 +1105,7 @@ jobs:
       # "succeeded" but produced a structurally broken sheet).
       - name: ✅ Validate Dashboard (contract + gate integrity)
         id: validate_dashboard
-        if: success()
+        if: ${{ success() && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE != 'health_only' }}
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -1141,8 +1147,10 @@ jobs:
         # 14:00Z workflow and manual runs); overlapping trackers append and
         # rewrite Performance_Log from different in-memory copies (23,799
         # duplicate cohorts by 08-31; 3,981 new ones within hours of the drop).
-        # Exactly ONE leg records now: the last to finish (global-markets).
-        if: ${{ success() && matrix.group == 'global-markets' }}
+        # Exactly ONE leg records after a full sync that includes GM.
+        # A no-key GM leg, single-page refresh or health probe must not record
+        # unrelated page cohorts or rewrite Performance_Log.
+        if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' }}
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}

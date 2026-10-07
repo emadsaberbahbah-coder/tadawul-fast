@@ -3,9 +3,14 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.9)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.10)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.10: resolve a blank native Buy Fees input only when the same ledger
+snapshot's unique native Cost Basis exactly equals Shares * Buy Price.
+Preserve the raw blank and its ledger witness; unproven fees still stop
+the rebuild before fetching or writing the prior portfolio.
 
 v6.64.9: redact HTTP body and exception diagnostics before truncation, and
 protect existing log formatters. HTTP auth, retries and success payloads remain
@@ -1852,7 +1857,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.9"
+SCRIPT_VERSION = "6.64.10"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -3784,7 +3789,8 @@ def _portfolio_write_guard(
 # symbols=[] then selected unrelated backend defaults. One bounded snapshot
 # now proves exact active identities, positive Shares, native unit Buy Price
 # and Ccy before any fetch. Historical inactive lots and aggregate Cost Basis
-# are not holdings inputs. Ambiguous/empty inputs preserve the prior page.
+# cannot replace native unit cost. Cost Basis may only corroborate a blank
+# fee's exact zero delta. Ambiguous/empty inputs preserve the prior page.
 # TFB_PORTFOLIO_REBUILD retains its default OFF. OFF requires explicit caller
 # holdings; ON supplies the verified ledger cohort. A page-driven portfolio
 # fallback is never a valid holding source.
@@ -3890,7 +3896,12 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
     (Shares * Buy Price + Buy Fees) / Shares, matching the native ledger.
     Preserve those two inputs separately in the frozen snapshot. An Avg Cost
     alias with nonzero fees is ambiguous and cannot establish this contract.
-    Aggregate Cost Basis and SAR totals cannot establish the input. Duplicate active lots
+    A blank fee is not inherently zero: only exact Buy Price and Shares
+    headers plus a unique native Cost Basis equal to their product establish
+    a zero ledger fee component. Retain the raw blank and witness separately;
+    this says nothing about commissions outside this ledger snapshot.
+    Aggregate Cost Basis and SAR totals cannot replace the unit-price input.
+    Duplicate active lots
     require an explicit aggregation contract, so they remain unproven here.
     {} means no safe refresh cohort; the caller must preserve the old page.
     """
@@ -3918,6 +3929,7 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
     if len(fee_columns) > 1 or any(names[i] != _CB_BUY_FEES for i in fee_columns):
         return {}  # Do not silently treat a fee in another currency as native.
     fee_i = fee_columns[0] if fee_columns else -1
+    native_cost_columns = [i for i, name in enumerate(names) if name == "costbasis"]
     name_columns = [i for i, name in enumerate(names) if name in _GUARD_NAME_ALIASES]
     name_i = name_columns[0] if len(name_columns) == 1 else -1
     out: Dict[str, Dict[str, Any]] = {}
@@ -3952,7 +3964,23 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
             return {}
         out[sym] = {"qty": qty, "cost": cost, "currency": currency}
         if fee_i >= 0:
-            fees = _pm_to_float(row[fee_i]) if fee_i < len(row) else None
+            fee_raw = row[fee_i] if fee_i < len(row) else None
+            fees = _pm_to_float(fee_raw)
+            if fees is None and (fee_raw is None or
+                    (isinstance(fee_raw, str) and fee_raw.strip() == "")):
+                # A same-snapshot, value-bound native total corroborates this
+                # blank. Aggregate/SAR aliases and approximate equality cannot
+                # establish a zero fee, and the original input is not erased.
+                if (names[c_i] != "buyprice" or names[q_i] != "shares"
+                        or len(native_cost_columns) != 1):
+                    return {}
+                native_i = native_cost_columns[0]
+                witness = _pm_to_float(row[native_i]) if native_i < len(row) else None
+                if witness is None or witness <= 0 or witness != qty * cost:
+                    return {}
+                fees = 0.0
+                out[sym].update({"buy_fees_raw": fee_raw,
+                    "buy_fees_basis": "native_cost_basis_zero_delta"})
             if fees is None or fees < 0 or (fees != 0 and names[c_i] != "buyprice"):
                 return {}
             native_cost = qty * cost + fees
