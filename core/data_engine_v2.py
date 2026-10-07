@@ -3881,7 +3881,9 @@ if str(ROOT_DIR) not in sys.path:
 # quote is unpriced, later empty shells cannot erase an earlier fetch failure.
 # v5.151.3 (2026-10-07): Yahoo chart-provider symbol-local misses no longer
 # consume the global outage breaker. Engine routing/proof/policy is unchanged.
-__version__ = "5.151.3"
+# v5.151.4: enforce forecast tuple coherence before scoring; disclose and
+# withhold an unproven late decision basis without replacing acquisition facts.
+__version__ = "5.151.4"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -4359,10 +4361,25 @@ def _fund_unit_contract_apply(patch: Dict[str, Any], provider: str,
     a no-op returning []. Fill-only semantics downstream are unchanged: the
     caller still runs _filter_patch_to_missing_fields, so a value already on
     the row is never overwritten by a converted one."""
-    if mode == "off" or not isinstance(patch, dict):
+    if not isinstance(patch, dict):
         return []
     touched: List[str] = []
     prov = (provider or "").strip().lower()
+    # Canonical Yahoo margins and unit-aware EODHD margins are fractions.
+    # Bind this producer contract to each value before a fill-only merge.
+    if _margin_unit_tracking_enabled():
+        unit = "fraction" if prov == "yahoo_fundamentals" else "unknown"
+        if prov == "eodhd_fundamentals" and (os.getenv("TFB_EODHD_UNIT_AWARE") or "1").strip().lower() \
+                not in {"0", "false", "off", "no"}:
+            unit = "fraction"
+        if prov in {"yahoo_fundamentals", "eodhd_fundamentals"}:
+            for field in _FUND_SENTRY_MARGIN_KEYS:
+                if _margin_unit_valid(patch, field) is None:
+                    basis = patch.get(_MPC_UNIT_KEY)
+                    stale = isinstance(basis, Mapping) and field in basis
+                    _margin_unit_set(patch, field, "unknown" if stale else unit)
+    if mode == "off":
+        return []
     if prov == "yahoo_fundamentals":
         de = _as_float(patch.get("debt_to_equity"))
         if de is not None:
@@ -4371,10 +4388,15 @@ def _fund_unit_contract_apply(patch: Dict[str, Any], provider: str,
             touched.append("debt_to_equity")
     elif prov == "eodhd_fundamentals":
         for k in _FUND_SENTRY_MARGIN_KEYS:
+            if _margin_unit_valid(patch, k) == "percent_points":
+                continue  # This exact value has already crossed the unit seam.
             v = _as_float(patch.get(k))
             if v is not None and abs(v) <= _FUND_SENTRY_FRACTION_BOUND:
                 if mode == "enforce":
+                    previous_unit = _margin_unit_valid(patch, k)
                     patch[k] = round(v * 100.0, 4)
+                    _margin_unit_set(patch, k, "percent_points"
+                        if previous_unit == "fraction" else "unknown")
                 touched.append(k)
     return touched
 
@@ -4428,9 +4450,11 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
                 if _r_lo > 0.0 and (_r_hi / _r_lo) < \
                         _FUND_SENTRY_MARGIN_RATIO_MIN:
                     row["profit_margin"] = _repaired
+                    _margin_unit_set(row, "profit_margin", "percent_points")
                     return (_FUND_SENTRY_REPAIRED_TAG + ":profit_margin:"
                             + _kind)
             row["profit_margin"] = None
+            _margin_unit_clear(row, "profit_margin")
             return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin"
         return _FUND_SENTRY_QUARANTINE_TAG + ":profit_margin:observe"
     except Exception:
@@ -6833,6 +6857,13 @@ _FCT_LEGS: Tuple[Tuple[str, str, str], ...] = (
     ("1m", "forecast_price_1m", "expected_roi_1m"),
 )
 _FCT_FRACTION_DOMAIN_MAX: float = 1.5   # |roi| above this is percent points: never scaled here
+_FCT_BASIS_TAG: str = "fctuple_basis_unproven"
+_FCT_BASIS_REASON: str = "Forecast inputs changed after scoring; clean rebuild required"
+_FCT_ROI_SCORE_FIELDS: Tuple[str, ...] = (
+    "valuation_score", "value_score", "opportunity_score", "overall_score",
+    "overall_score_raw", "conviction_score", "rank_overall", "top10_rank",
+    "value_view", "top_factors",
+)
 
 
 # =============================================================================
@@ -6849,6 +6880,7 @@ _MPC_POINTS_WITNESS_PREFIXES: Tuple[str, ...] = (
 )
 _MPC_EODHD_PROVENANCE_TAG: str = "eodhd_fundamentals_fallback_applied"
 _MPC_YAHOO_PROVENANCE_TAG: str = "yahoo_enrichment_applied"
+_MPC_UNIT_KEY: str = "_margin_unit_basis"
 
 
 def _margin_publish_mode() -> str:
@@ -6857,6 +6889,75 @@ def _margin_publish_mode() -> str:
     read-back is the margin_publish:* tags in the next export)."""
     raw = (os.getenv(_MPC_ENV) or "").strip().lower()
     return raw if raw in ("observe", "enforce") else "off"
+
+
+def _margin_unit_tracking_enabled() -> bool:
+    return _margin_publish_mode() != "off"
+
+
+def _margin_unit_valid(row: Mapping[str, Any], field: str) -> Optional[str]:
+    """Validate a per-field unit against its exact current finite value.
+
+    Warning strings and magnitudes are diagnostics, never unit proof. A
+    replaced value cannot inherit an older conversion or publication marker.
+    """
+    basis = row.get(_MPC_UNIT_KEY) if isinstance(row, Mapping) else None
+    record = basis.get(field) if isinstance(basis, Mapping) else None
+    if not isinstance(record, Mapping) or record.get("unit") not in {"fraction", "percent_points"}:
+        return None
+    value, witnessed = row.get(field), record.get("value")
+    if isinstance(value, bool) or isinstance(witnessed, bool):
+        return None
+    v, w = _as_float(value), _as_float(witnessed)
+    if v is None or w is None or not math.isfinite(v) or not math.isfinite(w) or v != w:
+        return None
+    return str(record["unit"])
+
+
+def _margin_unit_set(row: Dict[str, Any], field: str, unit: str, *, published: bool = False) -> None:
+    if not _margin_unit_tracking_enabled() or field not in _MPC_FIELDS:
+        return
+    basis = dict(row.get(_MPC_UNIT_KEY) or {}) if isinstance(row.get(_MPC_UNIT_KEY), Mapping) else {}
+    value = _as_float(row.get(field))
+    if value is None or not math.isfinite(value) or isinstance(row.get(field), bool):
+        basis.pop(field, None)
+    else:
+        basis[field] = {"unit": unit, "value": value, "published": bool(published)}
+    if basis:
+        row[_MPC_UNIT_KEY] = basis
+    else:
+        row.pop(_MPC_UNIT_KEY, None)
+
+
+def _margin_unit_clear(row: Dict[str, Any], field: str) -> None:
+    basis = row.get(_MPC_UNIT_KEY)
+    if isinstance(basis, Mapping):
+        clean = dict(basis)
+        clean.pop(field, None)
+        if clean:
+            row[_MPC_UNIT_KEY] = clean
+        else:
+            row.pop(_MPC_UNIT_KEY, None)
+
+
+def _margin_unit_copy(dest: Dict[str, Any], source: Mapping[str, Any], fields: Iterable[str]) -> None:
+    if not _margin_unit_tracking_enabled():
+        return
+    for field in fields:
+        if field not in _MPC_FIELDS or _as_float(dest.get(field)) != _as_float(source.get(field)):
+            continue
+        _margin_unit_set(dest, field, _margin_unit_valid(source, field) or "unknown")
+
+
+def _margin_unit_snapshot(row: Mapping[str, Any], fields: Mapping[str, Any]) -> Dict[str, Any]:
+    """Only value-bound, whitelisted margin metadata can cross cache storage."""
+    out: Dict[str, Any] = {}
+    for field in _MPC_FIELDS:
+        if field in fields:
+            unit = _margin_unit_valid(row, field)
+            if unit is not None:
+                out[field] = {"unit": unit, "value": _as_float(fields[field])}
+    return out
 
 
 def _mpc_warning_parts(row: Dict[str, Any]) -> List[str]:
@@ -6881,10 +6982,10 @@ def _mpc_points_witness(parts: List[str], field: str) -> bool:
 
 
 def _margin_publish_contract(row: Dict[str, Any]) -> int:
-    """v5.151.0 (P-152): publish the three margin fields under ONE sheet
-    contract (FRACTION under the percent number format) at the publish
-    boundary. Returns the number of fields tagged (observe) or converted
-    (enforce). Never raises; off -> 0 and the row is untouched."""
+    """Publish fractions under the sheet's percent format. Enforce requires
+    a current per-field value-bound unit witness; old warnings/magnitudes
+    cannot establish it. Observe retains legacy diagnostics and values.
+    Returns tagged/converted fields; off -> 0 and the row is untouched."""
     mode = _margin_publish_mode()
     if mode == "off" or not isinstance(row, dict):
         return 0
@@ -6895,11 +6996,20 @@ def _margin_publish_contract(row: Dict[str, Any]) -> int:
                       and not any(p.startswith(_MPC_YAHOO_PROVENANCE_TAG) for p in parts))
         for field in _MPC_FIELDS:
             marker = "%s:%s:" % (_MPC_TAG, field)
-            if any(p.startswith(marker) and not p.endswith(":observe") for p in parts):
-                continue                      # already published under the contract (idempotent)
             v = _as_float(row.get(field))
             if v is None:
+                if mode == "enforce" and field in row and row.get(field) not in (None, ""):
+                    row[field] = None
+                    _margin_unit_clear(row, field)
+                    _v573_append_warning(row, marker + "unresolved")
+                    n += 1
                 continue
+            unit = _margin_unit_valid(row, field)
+            basis = row.get(_MPC_UNIT_KEY)
+            record = basis.get(field, {}) if isinstance(basis, Mapping) else {}
+            record = record if isinstance(record, Mapping) else {}
+            if mode == "enforce" and unit == "fraction" and record.get("published") is True:
+                continue  # Exact value and unit prove this pass is idempotent.
             av = abs(v)
             if _mpc_points_witness(parts, field):
                 kind = "pts_thin" if av <= _MPC_FRACTION_BOUND else "pts"
@@ -6910,8 +7020,16 @@ def _margin_publish_contract(row: Dict[str, Any]) -> int:
             else:
                 kind = "oob"
             if mode == "enforce":
-                if kind in ("pts", "pts_thin", "oob"):
+                if unit == "percent_points":
+                    kind = "pts_thin" if av <= _MPC_FRACTION_BOUND else "pts"
                     row[field] = round(v / 100.0, 6)
+                elif unit == "fraction":
+                    kind = "frac"
+                else:
+                    # Legacy snapshots and stale warnings cannot prove a unit.
+                    row[field] = None
+                    kind = "unresolved"
+                _margin_unit_set(row, field, "fraction", published=True)
                 _v573_append_warning(row, "%s%s" % (marker, kind))
             else:
                 _v573_append_warning(row, "%s%s:observe" % (marker, kind))
@@ -6937,6 +7055,16 @@ def _fc_tuple_tol(cp: float) -> float:
         return 0.0005
 
 
+def _fc_tuple_canonical_price(row: Dict[str, Any]) -> None:
+    """Apply the readiness gate's existing positive price-alias fill early."""
+    if _fc_tuple_mode() != "enforce" or not isinstance(row, dict):
+        return
+    if _as_float(row.get("current_price")) is None:
+        price = _as_float(row.get("price"))
+        if price is not None and price > 0.0:
+            row["current_price"] = price
+
+
 def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
     """v5.148.0 (P-102): make expected_roi_<h> agree with the row's own
     (forecast_price_<h>, current_price) pair at the publish boundary. Returns
@@ -6945,6 +7073,7 @@ def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
     mode = _fc_tuple_mode()
     if mode == "off" or not isinstance(row, dict):
         return 0
+    _fc_tuple_canonical_price(row)
     n = 0
     try:
         cp = _as_float(row.get("current_price"))
@@ -6974,6 +7103,79 @@ def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
     return n
 
 
+def _fc_tuple_holdback(row: Dict[str, Any], before: Optional[Tuple[Any, ...]] = None) -> None:
+    """Withhold an enforced late tuple's unproved decision basis, without I/O.
+
+    Canonical scoring resolves tuples first. A publication-time repair therefore
+    has no proven score basis (old cache, external row, or late target). Preserve
+    facts/exits/vetoes, clear invalid score claims, and prevent new investment.
+    The marker is sticky across projection and direct scoring calls; only a new
+    successful raw factory acquisition may release it.
+    """
+    if _fc_tuple_mode() != "enforce" or not isinstance(row, dict):
+        return
+    parts = _mpc_warning_parts(row)
+    held = _FCT_BASIS_TAG in parts
+    changed = before is not None and before != tuple(row.get(k) for _h, _fp, k in _FCT_LEGS)
+    if not (held or changed):
+        return
+    _aq_append_warning(row, _FCT_BASIS_TAG)
+    for key in _FCT_ROI_SCORE_FIELDS:
+        for alias in _CANONICAL_FIELD_ALIASES.get(key, (key,)):
+            if alias in row:
+                row[alias] = None
+    row["opportunity_source"] = "unproven_tuple_basis"
+    for h, _fp, _roi in _FCT_LEGS:
+        for key in ("trend_" + h, "expected_return_" + h):
+            if key in row:
+                row[key] = None
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) or _canonical_recommendation(row.get("recommendation"))
+    exit_action = _safe_str(row.get("final_action")).strip().upper() in {"EXIT", "SELL", "REDUCE", "TRIM"}
+    # A new hard BLOCKED verdict would make the shared surface invariant erase
+    # an explicit EXIT. Keep exits/sell-family under a soft WATCHLIST holdback,
+    # while preserving any hard block already owned by another guard.
+    prior_hard_block = _safe_str(row.get("investability_status")).strip().upper() == "BLOCKED"
+    row["investability_status"] = "WATCHLIST" if (exit_action or rec in _TOP10_EXCLUDED_RECO_FAMILIES) and not prior_hard_block else "BLOCKED"
+    if not exit_action:
+        row["final_action"] = "DO_NOT_INVEST"
+    row["block_reason"] = _safe_str(row.get("block_reason")).strip() or _FCT_BASIS_REASON
+    if rec in _RECO_COHERENCE_BUY_FAMILY:
+        row["recommendation"] = row["recommendation_detailed"] = "HOLD"
+        row["recommendation_reason"] = "HOLD: " + row["block_reason"]
+        for key in ("recommendation_detail", "signal", "overall_signal"):
+            if key in row:
+                row[key] = None
+        _reconcile_recommendation_family(row)
+
+
+def _fc_tuple_finalize(row: Dict[str, Any]) -> None:
+    """Enforce a coherent final tuple and apply the same holdback on every exit."""
+    if _fc_tuple_mode() != "enforce" or not isinstance(row, dict):
+        return
+    _fc_tuple_canonical_price(row)
+    _apply_forecast_pair_coherence(row)
+    before = tuple(row.get(k) for _h, _fp, k in _FCT_LEGS)
+    _fc_tuple_coherence(row)
+    _fc_tuple_holdback(row, before)
+
+
+def _fc_tuple_release_factory_basis(row: Dict[str, Any], *, live_priced: bool, scored: bool) -> None:
+    """Release only a newly acquired/scored raw factory basis, never a cache hit.
+
+    An inherited enforced margin-publish receipt proves the row already crossed
+    a display unit boundary; this repair does not speculate about rescoring it.
+    """
+    if _fc_tuple_mode() != "enforce" or not live_priced or not scored:
+        return
+    parts = _mpc_warning_parts(row)
+    if _FCT_BASIS_TAG not in parts or "acquisition_status:success" not in parts:
+        return
+    if any(p.startswith("margin_publish:") and not p.endswith(":observe") for p in parts):
+        return
+    kept = [p for p in parts if p != _FCT_BASIS_TAG]
+    row["warnings"] = kept if isinstance(row.get("warnings"), list) else "; ".join(kept)
+
+
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """v5.78.0: compute the decision-readiness layer (8 canonical columns).
 
@@ -6991,6 +7193,9 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """
     if not isinstance(row, dict) or not _investability_gate_enabled():
         return
+    _fct_held = _fc_tuple_mode() == "enforce" and _FCT_BASIS_TAG in _mpc_warning_parts(row)
+    _fct_prior_action = _safe_str(row.get("final_action")).strip().upper() if _fct_held else ""
+    _fct_prior_reason = _safe_str(row.get("block_reason")).strip() if _fct_held else ""
 
     # v5.84.0 (Fix AA-3): clear a junk forecast_source literal ("1", "true",
     # "nan", ...) BEFORE fc_src is consumed below, so both gate passes see the
@@ -7416,6 +7621,13 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     row["investability_status"] = status
     row["final_action"] = action
     row["block_reason"] = reason
+    if _fct_prior_action in {"EXIT", "SELL", "REDUCE", "TRIM"}:
+        row["final_action"] = _fct_prior_action
+    if _fct_prior_reason:
+        row["block_reason"] = _fct_prior_reason
+    # An explicit tuple ENFORCE holdback survives readiness/coherence kill
+    # switches and every gate rerun. It never upgrades a prior sell/exit/veto.
+    _fc_tuple_holdback(row)
 
 
 # v5.77.16: recommendation_source values the ENGINE itself writes. When a row
@@ -10288,6 +10500,15 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict):
         return
 
+    # Tuple enforcement owns the forecast/ROI correction. Resolve the existing
+    # display-pair policy first, then give every authoritative scoring pass
+    # (including F7 iterations) the same tuple the publication gate will read.
+    # Off/observe retain their publication-only behavior; no extra pass runs.
+    if _fc_tuple_mode() == "enforce":
+        _fc_tuple_canonical_price(row)
+        _apply_forecast_pair_coherence(row)
+        _fc_tuple_coherence(row)
+
     # v5.114.0 [SANITIZE-PRIMARY]: the ONLY call to _apply_v572_sanitization used to
     # live inside _compute_scores_local_fallback - and the canonical branch below
     # `return`s the moment scoring succeeds, which in production is always. The net
@@ -11816,6 +12037,9 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
             "name": _safe_str(row.get("name")),
             "fields": fields,
         }
+        units = _margin_unit_snapshot(row, fields)
+        if units:
+            _FUND_LKG_STORE[s]["margin_units"] = units
         # v5.138.0 (R-6c): write-through to the L2 layer (no-op when OFF).
         _fund_lkg_redis_set(s, _FUND_LKG_STORE[s])
         # Hygiene: prune expired, then enforce the size cap oldest-first.
@@ -11874,6 +12098,9 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
             return None
         for k, v in filtered.items():
             row[k] = v
+        witnessed_fields = dict(fields)
+        witnessed_fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
+        _margin_unit_copy(row, witnessed_fields, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
@@ -12007,11 +12234,17 @@ def _fund_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
         if not isinstance(fields, Mapping) or not fields:
             return False
         ttl_s = int(max(1.0, _fund_lkg_ttl_h() * 3600.0))
-        payload = json.dumps({
+        cached = {
             "ts": float(entry.get("ts") or 0.0),
             "name": _safe_str(entry.get("name")),
             "fields": {k: v for k, v in fields.items() if k in _FUND_LKG_FIELDS},
-        }, default=str)
+        }
+        witnessed_fields = dict(cached["fields"])
+        witnessed_fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
+        units = _margin_unit_snapshot(witnessed_fields, cached["fields"])
+        if units:
+            cached["margin_units"] = units
+        payload = json.dumps(cached, default=str)
         client.setex(_fund_lkg_redis_key(sym), ttl_s, payload)
         _fund_lkg_redis_note_ok()
         _FUND_LKG_REDIS_STATE["writes"] = int(_FUND_LKG_REDIS_STATE.get("writes") or 0) + 1
@@ -12052,7 +12285,13 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
                              for k in _FUND_LKG_ANCHOR_FIELDS):
             return None
         _FUND_LKG_REDIS_STATE["hits"] = int(_FUND_LKG_REDIS_STATE.get("hits") or 0) + 1
-        return {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
+        entry = {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
+        witnessed_fields = dict(fields)
+        witnessed_fields[_MPC_UNIT_KEY] = d.get("margin_units", {})
+        units = _margin_unit_snapshot(witnessed_fields, fields)
+        if units:
+            entry["margin_units"] = units
+        return entry
     except Exception:
         _fund_lkg_redis_note_error()
         return None
@@ -12177,6 +12416,9 @@ def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
         fields = entry.get("fields")
         if not isinstance(fields, dict) or not fields:
             return None
+        fields = dict(fields)
+        if _margin_unit_tracking_enabled():
+            fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
         return fields, age_s
     except Exception:
         return None
@@ -12283,6 +12525,8 @@ def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
                 tag = "%s:%s:%dh:%d" % (_FUND_CACHE_TAG, kind, int(age_s // 3600), len(filtered))
                 if _is_missing_or_unknown_field(row.get("target_mean_price")):
                     tag += ":nt"
+                if mode == "enforce":
+                    _margin_unit_copy(filtered, fields, list(filtered))
                 return kind, tag, (filtered if mode == "enforce" else {})
         _fund_cache_bump("miss")
         return "miss", "", {}
@@ -15123,7 +15367,9 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # before rows leave the API, so recommendation can never disagree with
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
+    _fct_before = tuple(row.get(k) for _h, _fp, k in _FCT_LEGS)
     _fc_tuple_coherence(row)  # v5.148.0 (P-102): coherent (fp, cp, roi) triple BEFORE the gate reads it
+    _fc_tuple_holdback(row, _fct_before)
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
     _margin_publish_contract(row)  # v5.151.0 (P-152): one sheet unit for the three margins, AFTER the gate
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
@@ -15196,9 +15442,15 @@ def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[
     out = dict(base_row or {})
     if not isinstance(template_row, dict):
         return out
+    filled_margin_fields: List[str] = []
     for k, v in template_row.items():
+        if k == _MPC_UNIT_KEY:
+            continue  # Only the per-field landed-value copy can carry proof.
         if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
             out[k] = _json_safe(v)
+            if k in _MPC_FIELDS:
+                filled_margin_fields.append(k)
+    _margin_unit_copy(out, template_row, filled_margin_fields)
     return out
 
 
@@ -15397,6 +15649,7 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     # stale is False -> the inner branch never fires and this loop is byte-
     # identical to v5.99.1 (every blank live value is skipped).
     clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
+    replaced_margin_fields: List[str] = []
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
@@ -15405,6 +15658,9 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
                 out[k] = _json_safe(v)
             continue
         out[k] = _json_safe(v)
+        if k in _MPC_FIELDS:
+            replaced_margin_fields.append(k)
+    _margin_unit_copy(out, live_row, replaced_margin_fields)
     return out
 
 
@@ -17230,6 +17486,7 @@ class DataEngineV5:
                 _merge_gate_drop_warnings(row, canon_patch)
                 if filtered:
                     row = self._merge(row, filtered)
+                    _margin_unit_copy(row, canon_patch, filtered)
                     _append_yahoo_warning_tag(row, "yahoo_enrichment_applied")
                     # v5.140.0 (P-115): disclose each contract-converted key
                     # that actually landed on the row (survived the filter).
@@ -17454,6 +17711,7 @@ class DataEngineV5:
             if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
                 if _fc_fill:
                     row = self._merge(row, _fc_fill)
+                    _margin_unit_copy(row, _fc_fill, _fc_fill)
                 if _fc_tag:
                     _v573_append_warning(row, _fc_tag)
                 return row
@@ -17527,6 +17785,7 @@ class DataEngineV5:
             _fund_cache_note_empty(row, symbol, _fc_mode, "nofill")
         if filtered:
             row = self._merge(row, filtered)
+            _margin_unit_copy(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
@@ -17550,6 +17809,7 @@ class DataEngineV5:
         cache_key = _make_cache_key(sym, page_ctx, self._provider_profile_key())
         cached = await self._cache.get(cache_key)
         if isinstance(cached, dict) and cached:
+            _fc_tuple_finalize(cached)
             # v5.85.1 (Fix AD-2): rows cached before the analyst/trend block
             # existed (or cached by a worker mid-deploy) lack the eight Fix AD
             # fields. The block is fill-only + idempotent, so applying it on
@@ -17840,6 +18100,7 @@ class DataEngineV5:
             # no upstream provider rating — captured the engine's own recommendation
             # as provider_rating on the second pass. Removed; classification happens
             # exactly once now.
+            _fct_scored = False
             if not _is_empty_data_row(merged):
                 # v5.97.0 (Phase 3): tag decision-symbol rows so scoring.py's
                 # compute_momentum_score blends in the structural read. Gated +
@@ -17857,6 +18118,7 @@ class DataEngineV5:
                 # returns merged untouched (byte-identical); observe -> tag
                 # only; enforce -> the settled row replaces the pass-1 row.
                 merged = _f7_settle_pass(merged, sym, page_ctx)
+                _fct_scored = _as_float(merged.get("overall_score")) is not None
             else:
                 _mark_row_as_empty(merged)
 
@@ -17951,6 +18213,10 @@ class DataEngineV5:
                 acquired_at=_acquired_at, provider=_acquired_provider,
                 quote_asof=_quote_asof,
             )
+            _fc_tuple_release_factory_basis(merged, live_priced=_live_priced, scored=_fct_scored)
+            _fc_tuple_finalize(merged)
+            if _fc_tuple_mode() == "enforce":
+                _apply_analyst_trend_block(merged)
             route_reason = yahoo_primary_reason(sym)
             if route_reason:
                 _aq_append_warning(merged, "provider_route:" + route_reason)
@@ -18301,7 +18567,9 @@ class DataEngineV5:
         # path that returns rows then has recommendation == recommendation_detailed.
         for _r in rows:
             _reconcile_recommendation_family(_r)
+            _fct_before = tuple(_r.get(k) for _h, _fp, k in _FCT_LEGS)
             _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
+            _fc_tuple_holdback(_r, _fct_before)
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
             _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
@@ -18409,7 +18677,9 @@ class DataEngineV5:
                 # requirement is actually applied on both Top_10 paths.
                 for _r in rows:
                     _reconcile_recommendation_family(_r)
+                    _fct_before = tuple(_r.get(k) for _h, _fp, k in _FCT_LEGS)
                     _fc_tuple_coherence(_r)  # v5.148.0 (P-102): same boundary as _strict_project_row
+                    _fc_tuple_holdback(_r, _fct_before)
                     _apply_investability_gate(_r)
                     _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
                     _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row

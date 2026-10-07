@@ -57,6 +57,8 @@ _MODULE_FILES = {
     "routes.advanced_analysis": "routes/advanced_analysis.py",
     "core.analysis.top10_selector": "core/analysis/top10_selector.py",
     "core.providers.yahoo_chart_provider": "core/providers/yahoo_chart_provider.py",
+    "core.providers.eodhd_provider": "core/providers/eodhd_provider.py",
+    "core.providers.calendar_provider": "core/providers/calendar_provider.py",
     "core.data_engine_v2": "core/data_engine_v2.py",
 }
 

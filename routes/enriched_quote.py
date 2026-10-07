@@ -2,11 +2,13 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.4.0
+TFB Enriched Quote Routes Wrapper — v8.5.1
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • CONSERVATIVE-PLACEHOLDERS
+
+v8.5.1: redact credentials from caught route and engine diagnostics.
 
 WHY v8.4.0 — diagnostic visibility + hardening
 ----------------------------------------------
@@ -127,10 +129,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
+from core.secret_redaction import redact_text, safe_error_text
+
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.5.0"
+ROUTER_VERSION = "8.5.1"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -1273,7 +1277,7 @@ async def _call_with_tolerant_signatures(
                 "kwargs_keys": kwargs_keys,
                 "outcome": "typeerror",
                 "error_class": "TypeError",
-                "error_message": str(exc)[:200],
+                "error_message": redact_text(exc, limit=200),
             })
             last_error = exc
             continue
@@ -1292,7 +1296,7 @@ async def _call_with_tolerant_signatures(
                 "kwargs_keys": kwargs_keys,
                 "outcome": "error",
                 "error_class": exc.__class__.__name__,
-                "error_message": str(exc)[:200],
+                "error_message": redact_text(exc, limit=200),
             })
             last_error = exc
             # Non-TypeError: the function matched a signature but its body
@@ -1395,7 +1399,7 @@ async def _delegate_sheet_rows_via_bridge(
         # v8.4.0 [FIX-8]: capture the error instead of letting it propagate.
         # Bridge failures should NOT 500 the request — caller falls through
         # to the engine-direct path or local fail-soft.
-        bridge_error = "{}: {}".format(exc.__class__.__name__, str(exc)[:200])
+        bridge_error = safe_error_text(exc, limit=200)
         bridge_call_outcome = "raised"
         out = None
         try:
@@ -1553,7 +1557,7 @@ async def _fetch_analysis_rows(
         except Exception as exc:
             method_outcome = "raised"
             method_error_class = exc.__class__.__name__
-            method_error_msg = str(exc)[:200]
+            method_error_msg = redact_text(exc, limit=200)
             try:
                 logger.warning(
                     "[enriched_quote v%s] engine.%s raised: %s: %s",
@@ -1608,7 +1612,7 @@ async def _fetch_analysis_rows(
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
                 per_failures += 1
         except Exception as e:
-            out[s] = {"symbol": s, "error": "{}: {}".format(e.__class__.__name__, str(e)[:200])}
+            out[s] = {"symbol": s, "error": safe_error_text(e, limit=200)}
             per_failures += 1
 
     if per_method_used and out:
@@ -1858,7 +1862,7 @@ async def _sheet_rows_handler(
         # v8.4.0 [FIX-4]: top-level catch. Return structured error envelope
         # so the bridging caller (investment_advisor, analysis_sheet_rows)
         # always gets a parseable dict back.
-        error_repr = "{}: {}".format(handler_err.__class__.__name__, str(handler_err)[:500])
+        error_repr = safe_error_text(handler_err, limit=500)
         try:
             logger.error(
                 "[enriched_quote v%s] _sheet_rows_handler top-level exception: %s",
@@ -2033,7 +2037,7 @@ async def _single_quote_handler(
         raise
     except Exception as handler_err:
         # v8.4.0 [FIX-4]: top-level catch
-        error_repr = "{}: {}".format(handler_err.__class__.__name__, str(handler_err)[:500])
+        error_repr = safe_error_text(handler_err, limit=500)
         try:
             logger.error(
                 "[enriched_quote v%s] _single_quote_handler top-level exception: %s",

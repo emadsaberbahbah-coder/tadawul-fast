@@ -3,9 +3,13 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.7)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.9)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.9: redact HTTP body and exception diagnostics before truncation, and
+protect existing log formatters. HTTP auth, retries and success payloads remain
+unchanged.
 
 v6.34.0 — PERSISTENCE TRUTH & SECOND-CHANCE PASS (run 30782099065 forensics)
 ================================================================================
@@ -1328,6 +1332,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.data_validity import acquisition_census, coverage_validity, symbol_domain_ok
+from core.secret_redaction import (
+    install_redaction_on_handlers,
+    redact_text,
+    safe_error_text,
+)
 
 try:
     from scripts.critical_symbol_identity import (
@@ -1843,7 +1852,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.8"
+SCRIPT_VERSION = "6.64.9"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -2588,6 +2597,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("DashboardSync")
+install_redaction_on_handlers()
+install_redaction_on_handlers(logger)
 
 # -----------------------------------------------------------------------------
 # Helpers (safe)
@@ -2833,8 +2844,9 @@ class TaskResult:
             "rows_written": self.rows_written,
             "rows_failed": self.rows_failed,
             "gateway_used": self.gateway_used,
-            "warnings": self.warnings,
-            "error": self.error,
+            "warnings": [redact_text(warning) if isinstance(warning, str) else warning
+                         for warning in self.warnings],
+            "error": redact_text(self.error) if isinstance(self.error, str) else self.error,
             "request_id": self.request_id,
             "version": SCRIPT_VERSION,
         }
@@ -2912,13 +2924,14 @@ class BackendClient:
             r = await client.get(url)
             code = int(r.status_code)
             if code != 200:
-                return None, f"HTTP {code}: {r.text[:200]}", code
+                hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                return None, f"HTTP {code}: {hint}", code
             try:
                 return r.json(), None, code
             except Exception as e:
-                return None, f"JSON parse error: {e}", code
+                return None, f"JSON parse error: {safe_error_text(e, secret_values=(self.token,))}", code
         except Exception as e:
-            return None, str(e), 0
+            return None, safe_error_text(e, secret_values=(self.token,)), 0
 
     async def post_json(self, path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
@@ -2931,21 +2944,23 @@ class BackendClient:
 
                 if code in (429,) or (500 <= code < 600):
                     if attempt == max_retries - 1:
-                        return None, f"HTTP {code}: {r.text[:200]}", code
+                        hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                        return None, f"HTTP {code}: {hint}", code
                     await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
                     continue
 
                 if code != 200:
-                    return None, f"HTTP {code}: {r.text[:200]}", code
+                    hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                    return None, f"HTTP {code}: {hint}", code
 
                 try:
                     return r.json(), None, code
                 except Exception as e:
-                    return None, f"JSON parse error: {e}", code
+                    return None, f"JSON parse error: {safe_error_text(e, secret_values=(self.token,))}", code
 
             except Exception as e:
                 if attempt == max_retries - 1:
-                    return None, str(e), 0
+                    return None, safe_error_text(e, secret_values=(self.token,)), 0
                 await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
 
         return None, "Unknown error", 0
@@ -3788,6 +3803,7 @@ _CB_QTY_ALIASES = frozenset({"quantity", "qty", "shares", "units", "positionqty"
 _CB_COST_ALIASES = frozenset({"buyprice", "avgcost", "averagecost", "avgbuyprice",
                               "averagebuyprice", "avgcostprice"})
 _CB_CURRENCY_ALIASES = frozenset({"ccy", "currency"})
+_CB_BUY_FEES = "buyfees"
 
 # Position-math columns recomputed after injection (alias-matched, normalized).
 _PM_QTY_ALIASES = frozenset({"qty", "quantity", "shares", "units", "positionqty", "positionquantity"})
@@ -3869,8 +3885,12 @@ def _portfolio_ledger_name(value: Any, symbol: str) -> Optional[str]:
 def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
     """Read one complete, unambiguous active-ledger snapshot.
 
-    Buy Price / Avg Cost is a native-currency unit cost. Aggregate Cost Basis,
-    fees and SAR totals cannot establish that value. Duplicate active lots
+    Buy Price is a native-currency trade price. An explicit Buy Fees column
+    establishes native acquisition fees: effective unit cost is
+    (Shares * Buy Price + Buy Fees) / Shares, matching the native ledger.
+    Preserve those two inputs separately in the frozen snapshot. An Avg Cost
+    alias with nonzero fees is ambiguous and cannot establish this contract.
+    Aggregate Cost Basis and SAR totals cannot establish the input. Duplicate active lots
     require an explicit aggregation contract, so they remain unproven here.
     {} means no safe refresh cohort; the caller must preserve the old page.
     """
@@ -3894,6 +3914,10 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
             return {}
         columns.append(found[0])
     s_i, status_i, q_i, c_i, ccy_i = columns
+    fee_columns = [i for i, name in enumerate(names) if name.startswith(_CB_BUY_FEES)]
+    if len(fee_columns) > 1 or any(names[i] != _CB_BUY_FEES for i in fee_columns):
+        return {}  # Do not silently treat a fee in another currency as native.
+    fee_i = fee_columns[0] if fee_columns else -1
     name_columns = [i for i, name in enumerate(names) if name in _GUARD_NAME_ALIASES]
     name_i = name_columns[0] if len(name_columns) == 1 else -1
     out: Dict[str, Dict[str, Any]] = {}
@@ -3927,6 +3951,17 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
                 or not re.fullmatch(r"[A-Z]{3}", currency) or sym in out):
             return {}
         out[sym] = {"qty": qty, "cost": cost, "currency": currency}
+        if fee_i >= 0:
+            fees = _pm_to_float(row[fee_i]) if fee_i < len(row) else None
+            if fees is None or fees < 0 or (fees != 0 and names[c_i] != "buyprice"):
+                return {}
+            native_cost = qty * cost + fees
+            effective_cost = native_cost / qty
+            if (not math.isfinite(native_cost) or native_cost <= 0
+                    or not math.isfinite(effective_cost) or effective_cost <= 0):
+                return {}
+            out[sym].update({"buy_price": cost, "buy_fees": fees,
+                            "native_cost": native_cost, "cost": effective_cost})
         name = _portfolio_ledger_name(row[name_i], sym) if 0 <= name_i < len(row) else None
         if name is not None:
             out[sym]["name"] = name
@@ -4046,7 +4081,9 @@ def _inject_portfolio_holdings(
             rr[avg_i] = buy
             price = _pm_to_float(rr[price_i]) if price_i >= 0 else None
             psar = _pm_to_float(rr[psar_i]) if psar_i >= 0 else None
-            native_cost = qty * buy
+            # Keep the total from the same frozen raw-price/fee snapshot.
+            # Multiplying the effective unit cost back can add rounding drift.
+            native_cost = hold.get("native_cost", qty * buy)
             if cost_i >= 0:
                 rr[cost_i] = round(native_cost, 6)
             for i in (mv_i, pnl_i, pct_i, mv_sar_i, cost_sar_i, pnl_sar_i):
@@ -4132,6 +4169,9 @@ def _portfolio_holdings_contract(
                 return False, "holding quantity or unit cost differs from ledger snapshot"
             if cost_i >= len(row) or _pm_to_float(row[cost_i]) is None:
                 return False, "nonfinite native position cost"
+            native_cost = cost_basis[symbol].get("native_cost", qty * cost)
+            if _pm_to_float(row[cost_i]) != round(native_cost, 6):
+                return False, "native position cost differs from ledger snapshot"
             price = _pm_to_float(row[price_i]) if price_i < len(row) else None
             if price is not None and price > 0 and any(
                     i >= len(row) or _pm_to_float(row[i]) is None
@@ -13016,13 +13056,13 @@ async def _run_one_task(
             # ---------------------------------------------------------------
         except Exception as e:
             res.status = "failed"
-            res.error = f"Write failed: {e}"
+            res.error = f"Write failed: {safe_error_text(e)}"
 
         return res
 
     except Exception as e:
         res.status = "failed"
-        res.error = str(e)
+        res.error = safe_error_text(e)
         return res
 
     finally:

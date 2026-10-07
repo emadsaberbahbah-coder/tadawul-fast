@@ -2,9 +2,12 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.0 (F2b: EARNINGS-DATES TIER + THROTTLE DISCLOSURE)
+Calendar Provider — v1.2.1 (CREDENTIAL-SAFE DIAGNOSTICS)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.2.1 — redact credentials from exception diagnostics before logging.
+Calendar requests, fallback behavior, and returned event maps are unchanged.
 
 v1.2.0 (over v1.1.0) — get_earnings_dates becomes the earnings tier (Fix F2b):
 - EVIDENCE (Render shell, 2026-07-14 ~10:40 UTC, verbatim): Ticker.calendar
@@ -133,12 +136,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from core.secret_redaction import safe_error_text
+
 try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
     import yfinance as _yf  # type: ignore
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -317,7 +322,8 @@ async def fetch_earnings_map(symbols: List[str],
                     })
                 except Exception as e:
                     logger.error("[calendar_provider v%s] earnings batch failed "
-                                 "(%d syms): %s", __version__, len(batch), e)
+                                 "(%d syms): %s", __version__, len(batch),
+                                 safe_error_text(e, secret_values=(_api_key(),)))
                     continue
                 items = payload.get("earnings") if isinstance(payload, dict) else payload
                 for it in items or []:
@@ -334,7 +340,7 @@ async def fetch_earnings_map(symbols: List[str],
         return out
     except Exception as e:  # blanket: a calendar hiccup must never propagate
         logger.error("[calendar_provider v%s] fetch_earnings_map failed: %s",
-                     __version__, e)
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return {}
 
 
@@ -369,7 +375,8 @@ async def fetch_next_exdiv_map(symbols: List[str],
                         "from": _iso(today), "to": horizon,
                     })
                 except Exception as e:
-                    logger.debug("[calendar_provider] div %s: %s", code, e)
+                    logger.debug("[calendar_provider] div %s: %s", code,
+                                 safe_error_text(e, secret_values=(_api_key(),)))
                     return
                 best: Optional[_dt.date] = None
                 for it in payload if isinstance(payload, list) else []:
@@ -386,7 +393,7 @@ async def fetch_next_exdiv_map(symbols: List[str],
         return out
     except Exception as e:
         logger.error("[calendar_provider v%s] fetch_next_exdiv_map failed: %s",
-                     __version__, e)
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return {}
 
 
@@ -422,7 +429,8 @@ async def fetch_ipos(days_ahead: int = 30) -> List[Dict[str, Any]]:
         out.sort(key=lambda x: x.get("start_date") or "9999-99-99")
         return out
     except Exception as e:
-        logger.error("[calendar_provider v%s] fetch_ipos failed: %s", __version__, e)
+        logger.error("[calendar_provider v%s] fetch_ipos failed: %s", __version__,
+                     safe_error_text(e, secret_values=(_api_key(),)))
         return []
 
 
@@ -525,7 +533,7 @@ async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
             if "ratelimit" in type(e).__name__.lower():
                 throttled[0] += 1
             logger.debug("[calendar_provider] yahoo earnings_dates %s: %s",
-                         orig, e)
+                         orig, safe_error_text(e))
         # Tier 2: Ticker.calendar — ex-div (its only source) + earnings
         # backup. Throttles here are classified too, never silently eaten.
         try:
@@ -536,7 +544,8 @@ async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
         except Exception as e:
             if "ratelimit" in type(e).__name__.lower():
                 throttled[0] += 1
-            logger.debug("[calendar_provider] yahoo calendar %s: %s", orig, e)
+            logger.debug("[calendar_provider] yahoo calendar %s: %s", orig,
+                         safe_error_text(e))
         if earn is not None and earn >= today:
             out_earn[orig] = _iso(earn)
         if exdiv is not None and exdiv >= today:
@@ -586,7 +595,7 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
         return n_e, n_d
     except Exception as e:
         logger.error("[calendar_provider v%s] yahoo fallback pass failed: %s",
-                     __version__, e)
+                     __version__, safe_error_text(e))
         return 0, 0
 
 
@@ -627,7 +636,7 @@ async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optiona
         return base
     except Exception as e:
         logger.error("[calendar_provider v%s] fetch_event_context failed: %s",
-                     __version__, e)
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return base
 
 

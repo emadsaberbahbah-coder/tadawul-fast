@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tfb_backtest.py — v1.0.0 (2026-09-01)
+tfb_backtest.py — v1.1.1 (2026-10-08)
 ================================================================================
 WHY: the Strategy's rule is "register a hypothesis, backtest it, then change a
 weight or gate". H-28 (stated reliability predicts outcomes) was rejected by an
@@ -17,7 +17,9 @@ WHAT IT DOES
   - predictive power: Brier of the raw value as a probability (numeric 0-100
     only) vs naive 0.5 vs constant base rate; 5-fold cross-validated Brier of a
     group-calibrated probability (shrinkage k=20) vs the base rate;
-    Spearman(signal, realized ROI) for numeric signals; win-rate spread
+    Spearman(signal, realized ROI) for numeric signals, using Pearson
+    correlation of average tie ranks; undefined rank IC is JSON null with an
+    explicit status (fewer than three pairs or a constant input); win-rate spread
     (max-min group win %, groups with n >= min_n);
   - verdict per signal: SEPARATES (CV Brier beats base rate by >= 0.002 AND
     spread >= 5 pp with n >= min_n in both extremes) / WEAK / NONE.
@@ -45,7 +47,7 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
                    "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
 
@@ -149,6 +151,21 @@ def brier(pairs: List[Tuple[float, float]]) -> float:
 
 
 def spearman(a: List[float], b: List[float]) -> float:
+    """Pearson correlation of average tie ranks for aligned finite pairs.
+
+    Return NaN for fewer than three pairs or zero rank variance, preserving the
+    float API's small-sample convention. Reject unequal lengths/nonfinite input
+    instead of manufacturing ranks for invalid observations. The no-ties
+    squared-rank-difference shortcut is not valid when either input has ties.
+    """
+    if len(a) != len(b):
+        raise ValueError("Spearman inputs must have equal lengths")
+    try:
+        finite = all(math.isfinite(x) for x in a) and all(math.isfinite(x) for x in b)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Spearman inputs must contain finite numbers") from exc
+    if not finite:
+        raise ValueError("Spearman inputs must contain finite numbers")
     n = len(a)
     if n < 3:
         return float("nan")
@@ -166,8 +183,14 @@ def spearman(a: List[float], b: List[float]) -> float:
             i = j + 1
         return r
     ra, rb = ranks(a), ranks(b)
-    d2 = sum((ra[i] - rb[i]) ** 2 for i in range(n))
-    return 1 - 6 * d2 / (n * (n * n - 1))
+    center = (n + 1) / 2.0
+    da, db = [r - center for r in ra], [r - center for r in rb]
+    va = math.fsum(d * d for d in da)
+    vb = math.fsum(d * d for d in db)
+    if va == 0.0 or vb == 0.0:
+        return float("nan")
+    correlation = math.fsum(x * y for x, y in zip(da, db)) / math.sqrt(va * vb)
+    return max(-1.0, min(1.0, correlation))
 
 
 def cv_brier(groups: List[Any], ys: List[float], k: int = 5, shrink: float = 20.0, seed: int = 7) -> float:
@@ -192,6 +215,14 @@ def cv_brier(groups: List[Any], ys: List[float], k: int = 5, shrink: float = 20.
 
 def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[List[float]] = None,
                     min_n: int = 100) -> Dict[str, Any]:
+    """Summarize one signal on the supplied decided, finite-return cohort.
+
+    Numeric rank IC is a descriptive pooled association, not an out-of-sample
+    estimate or a probability. ``spearman_vs_roi`` is a rounded float when
+    ``spearman_status`` is ``defined``; otherwise it is None (JSON null) with
+    status ``insufficient_samples``, ``constant_signal``, ``constant_roi``, or
+    ``constant_signal_and_roi``. Finite numeric scores retain their paired ROI.
+    """
     vals = [r.get(signal) for r in cohorts]
     nums = [_f(v) for v in vals]
     numeric = sum(1 for x in nums if x is not None) >= 0.9 * max(1, len(vals))
@@ -237,7 +268,18 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
         xs = [nums[i] for i in keep]
         if xs and 0 <= min(xs) and max(xs) <= 100:
             res["raw_brier_as_probability"] = round(brier([(x / 100.0, yy) for x, yy in zip(xs, y)]), 4)
-        res["spearman_vs_roi"] = round(spearman(xs, roi), 3)
+        ic = spearman(xs, roi)
+        res["spearman_vs_roi"] = round(ic, 3) if math.isfinite(ic) else None
+        if len(xs) < 3:
+            res["spearman_status"] = "insufficient_samples"
+        elif len(set(xs)) == 1 and len(set(roi)) == 1:
+            res["spearman_status"] = "constant_signal_and_roi"
+        elif len(set(xs)) == 1:
+            res["spearman_status"] = "constant_signal"
+        elif len(set(roi)) == 1:
+            res["spearman_status"] = "constant_roi"
+        else:
+            res["spearman_status"] = "defined"
     res["cv_brier_group_calibrated"] = round(cv_brier(groups, y), 4)
     big = [t for t in table if t["n"] >= min_n]
     spread, z = 0.0, 0.0
@@ -263,7 +305,10 @@ def render(results: List[Dict[str, Any]], title: str) -> str:
     for r in results:
         lines.append(f"\n[{r['verdict']:9s}] {r['signal']} ({r['type']}, n={r['n']}, base win {r['base_win_pct']}%, base Brier {r['base_brier']})")
         if "raw_brier_as_probability" in r:
-            lines.append(f"    raw value as probability: Brier {r['raw_brier_as_probability']} | Spearman vs ROI {r['spearman_vs_roi']}")
+            lines.append(f"    raw value as probability: Brier {r['raw_brier_as_probability']}")
+        if "spearman_vs_roi" in r:
+            ic_text = str(r["spearman_vs_roi"]) if r["spearman_vs_roi"] is not None else f"undefined ({r['spearman_status']})"
+            lines.append(f"    Spearman vs ROI {ic_text}")
         lines.append(f"    CV Brier group-calibrated {r['cv_brier_group_calibrated']} (gain vs base {r['cv_gain_vs_base']:+.4f}) | win spread {r['win_spread_pp']} pp (z={r['spread_z']})")
         lines.append(f"    {'group':14s}{'n':>6s}{'win%':>7s}{'meanROI%':>10s}{'medROI%':>9s}")
         for t in r["groups"][:12]:

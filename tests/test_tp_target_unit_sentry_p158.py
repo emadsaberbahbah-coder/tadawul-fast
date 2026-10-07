@@ -63,9 +63,11 @@ ETO = {"symbol": "ETO.US", "current_price": 30.16,
        "forecast_price_3m": 32.10, "expected_roi_3m": 0.064324}
 
 
-def build_corpus(mod, seed=158, days=24, nsym=30):
-    """Records are built by the module's OWN derive methods from engine-shaped
-    rows (expected_roi_* = FRACTION, the engine contract). Eras / defects:
+def build_corpus(mod, seed=158, days=24, nsym=30, historical=True):
+    """Synthetic stored history explicitly models the pre-6.42.1
+    checkpoint creation defect; it must not depend on current creation code.
+    1M/3M records still use the real derive methods. historical=False uses
+    current creation for every horizon. Eras / historical defects:
       era 'fraction' : engine fraction ROI + real forecast price (live shape)
       era 'percent'  : engine percent ROI + consistent forecast price
       'nosib'        : the 1M sibling is dropped      -> unresolved/no_sibling
@@ -118,7 +120,13 @@ def build_corpus(mod, seed=158, days=24, nsym=30):
             for h in hz:
                 if kind == "nosib" and h.value == "1M":
                     continue
-                tp, troi = app._derive_target(row, h, cp)
+                if historical and h.value in ("1W", "2W"):
+                    # Immutable historical fixture: the old producer copied
+                    # raw expected ROI and treated it as percentage points.
+                    troi = row["expected_roi_1m"] * h.days / 30.0
+                    tp = cp * (1.0 + troi / 100.0) if troi else 0.0
+                else:
+                    tp, troi = app._derive_target(row, h, cp)
                 if tp <= 0.0:
                     tp, troi = cp, 0.0
                 rid += 1
@@ -231,20 +239,24 @@ def run_all():
     assert new.SCRIPT_VERSION >= "6.39.0", new.SCRIPT_VERSION
     base = _load(BASE, "tp_p158_base") if BASE else None
 
-    # T1 - golden negative on the live specimen (defect reproduced through
-    # the real derive methods with the gate OFF; identical on the base tree).
+    # T1 - future checkpoint creation uses the explicit price witness even
+    # with the sentry OFF; the existing 1M behavior is unchanged.
     _gate(None)
     app = _app(new)
     tp1m, r1m = app._derive_target(dict(ETO), new.HorizonType.MONTH_1, 30.16)
     tp1w, r1w = app._derive_target(dict(ETO), new.HorizonType.WEEK_1, 30.16)
     assert (tp1m, r1m) == (30.8654, 0.023388), (tp1m, r1m)
-    assert abs(r1w - 0.023388 * 7 / 30) < 1e-12
-    assert abs(tp1w - 30.16) < 0.01, "checkpoint price ~= entry IS the defect"
-    res["T1_defect_off"] = [tp1m, r1m, round(tp1w, 6), round(r1w, 9)]
+    price_roi = (ETO["forecast_price_1m"] / 30.16 - 1.0) * 100.0 * 7 / 30
+    assert abs(r1w - price_roi) < 1e-12
+    assert abs(tp1w - 30.16 * (1 + r1w / 100.0)) < 1e-12
+    assert tp1w > 30.30
+    res["T1_checkpoint_price_witness"] = [tp1m, r1m, round(tp1w, 6), round(r1w, 9)]
     if base is not None:
         b = _app(base)
         assert b._derive_target(dict(ETO), base.HorizonType.MONTH_1, 30.16) == (tp1m, r1m)
-        assert b._derive_target(dict(ETO), base.HorizonType.WEEK_1, 30.16) == (tp1w, r1w)
+        old_w = b._derive_target(dict(ETO), base.HorizonType.WEEK_1, 30.16)
+        assert abs(old_w[1] - 0.023388 * 7 / 30) < 1e-12
+        assert old_w != (tp1w, r1w)
 
     # T2 - gate OFF: no report key, counters untouched, dual-tree identity.
     _reset_counters(new)
@@ -300,9 +312,9 @@ def run_all():
     e1m = _app(new)._derive_target(dict(ETO), new.HorizonType.MONTH_1, 30.16)
     e1w = _app(new)._derive_target(dict(ETO), new.HorizonType.WEEK_1, 30.16)
     assert e1m[0] == 30.8654 and abs(e1m[1] - 2.3388) < 1e-9
-    assert abs(e1w[1] - 2.3388 * 7 / 30) < 1e-9
+    assert abs(e1w[1] - price_roi) < 1e-12
     assert abs(e1w[0] - 30.16 * (1 + e1w[1] / 100.0)) < 1e-9 and e1w[0] > 30.30
-    erecs, etruth = build_corpus(new)
+    erecs, etruth = build_corpus(new, historical=False)
     again = new.s1_checkpoint_calibration(erecs)
     c2 = again["unit_sentry"]["counts"]
     assert c2["fraction"] == 0, "enforced rows must read as pp - never x100 twice"
@@ -313,8 +325,8 @@ def run_all():
     res["T5_enforce_creation"] = {"eto_1m": list(e1m), "eto_1w": [round(e1w[0], 6), round(e1w[1], 9)],
                                   "counts_after": c2}
 
-    # T6 - fail-open: nothing resolvable -> legacy basis kept + note; junk
-    # records never raise.
+    # T6 - enforce fails closed: no resolvable witness cannot inherit the
+    # legacy PASS. Legacy values remain separate diagnostics; junk never raises.
     _gate("enforce")
     nosib = [r for r in orecs if r.horizon.value != "1M"]
     keep = new.s1_checkpoint_calibration(nosib)
@@ -322,12 +334,15 @@ def run_all():
     _gate(None)
     leg = new.s1_checkpoint_calibration(nosib)
     _gate("enforce")
-    for k in leg:
-        assert keep[k] == leg[k], k
-    assert "legacy basis kept" in keep["unit_sentry"]["enforce_note"]
+    assert keep["state"] == "PENDING" and keep["n"] == 0
+    assert keep["mean_abs_error_pp"] is None and keep["mean_signed_error_pp"] is None
+    assert keep["zero_mae_pp"] is None and keep["by_horizon"] == {}
+    assert keep["unit_sentry"]["legacy"]["state"] == leg["state"]
+    assert keep["unit_sentry"]["legacy"]["n"] == leg["n"]
+    assert "corrected calibration unavailable" in keep["unit_sentry"]["enforce_note"]
     junk = new.s1_checkpoint_calibration([object(), None, 7, "x"] + orecs[:50])
     assert isinstance(junk, dict) and "state" in junk
-    res["T6_failopen"] = keep["unit_sentry"]["enforce_note"]
+    res["T6_failclosed"] = keep["unit_sentry"]["enforce_note"]
 
     # T7 - block + log line shapes.
     rows = new._perf_unit_block_rows(us, "2026-09-21 12:00:00")

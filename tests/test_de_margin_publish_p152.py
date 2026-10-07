@@ -9,8 +9,9 @@ _apply_investability_gate at all three publish boundaries.
 
   off (unset) -> inert, rows byte-identical
   observe     -> ONE tag per margin field (margin_publish:<field>:<kind>:observe), values untouched
-  enforce     -> pts / pts_thin / oob -> v / 100 (+ suffix-less tag = idempotence marker);
-                 frac / frac_amb kept; other fields never touched; never raises
+  enforce     -> value-bound explicit units determine conversion; legacy rows
+                 with only magnitude/warning hints remain unresolved/blank.
+                 Current producer/cache unit contracts have separate tests.
 
 Run: python -m pytest -q tests/test_de_margin_publish_p152.py   (or python tests/...)
 """
@@ -103,6 +104,8 @@ def test_t3_observe_tag_only():
 
 
 def test_t4_enforce_converts_and_is_idempotent():
+    # These immutable legacy specimens have diagnostic warning strings, not
+    # a unit witness bound to the current field value. Never guess their unit.
     _env("enforce")
     for r in ROWS:
         rr = copy.deepcopy(r)
@@ -113,27 +116,15 @@ def test_t4_enforce_converts_and_is_idempotent():
             if v is None:
                 assert f not in k and rr.get(f) is None
                 continue
-            if k[f] in ("frac", "frac_amb"):
-                assert rr[f] == v
-            else:
-                assert rr[f] == round(v / 100.0, 6), (r["symbol"], f, rr[f])
+            assert k[f] == "unresolved" and rr[f] is None
         assert all(not t.endswith(":observe") for t in _tags(rr))
         # idempotent: a second boundary pass changes nothing
         snap = copy.deepcopy(rr)
         assert de._margin_publish_contract(rr) == 0 and rr == snap
-    # named specimens
-    ddi = copy.deepcopy(ROWS[0]); de._margin_publish_contract(ddi)
-    assert (ddi["gross_margin"], ddi["operating_margin"], ddi["profit_margin"]) == (0.7336, 0.3872, 0.32908)
-    fisv = copy.deepcopy(ROWS[1]); de._margin_publish_contract(fisv)
-    assert (fisv["gross_margin"], fisv["operating_margin"], fisv["profit_margin"]) == (0.472156, 0.213745, 0.0)
-    top = copy.deepcopy(ROWS[3]); de._margin_publish_contract(top)
-    assert top["gross_margin"] == 1.003553 and top["profit_margin"] is None
-    oob = copy.deepcopy(ROWS[5]); de._margin_publish_contract(oob)
-    assert (oob["gross_margin"], oob["operating_margin"], oob["profit_margin"]) == (73.36, -2.5, 0.25)
-    # observe -> enforce transition: an observe-tagged row is converted exactly once
+    # Observe tags cannot become a numerical unit proof when enforcement arms.
     _env("observe"); tr = copy.deepcopy(ROWS[0]); de._margin_publish_contract(tr)
     _env("enforce"); de._margin_publish_contract(tr)
-    assert tr["profit_margin"] == 0.32908 and "margin_publish:profit_margin:pts" in _tags(tr)
+    assert tr["profit_margin"] is None and "margin_publish:profit_margin:unresolved" in _tags(tr)
     snap = copy.deepcopy(tr); de._margin_publish_contract(tr); assert tr == snap
 
 
@@ -141,38 +132,40 @@ def test_t5_points_witness_rules():
     _env("enforce")
     thin = {"operating_margin": 1.2, "warnings": "fund_unit_contract:eodhd:operating_margin"}
     de._margin_publish_contract(thin)
-    assert thin["operating_margin"] == 0.012 and _kinds(thin) == {"operating_margin": "pts_thin"}
+    assert thin["operating_margin"] is None and _kinds(thin) == {"operating_margin": "unresolved"}
     obs = {"operating_margin": 1.2, "warnings": "fund_unit_contract:eodhd:operating_margin:observe"}
     de._margin_publish_contract(obs)
-    assert obs["operating_margin"] == 1.2 and _kinds(obs) == {"operating_margin": "frac"}   # :observe is not a witness
+    assert obs["operating_margin"] is None and _kinds(obs) == {"operating_margin": "unresolved"}
     rep = {"profit_margin": 0.9, "warnings": "fund_coherence_repaired:profit_margin:d100"}
     de._margin_publish_contract(rep)
-    assert rep["profit_margin"] == 0.009 and _kinds(rep) == {"profit_margin": "pts_thin"}
+    assert rep["profit_margin"] is None and _kinds(rep) == {"profit_margin": "unresolved"}
     other = {"gross_margin": 0.9, "warnings": "fund_unit_contract:eodhd:profit_margin"}          # witness for ANOTHER field
     de._margin_publish_contract(other)
-    assert other["gross_margin"] == 0.9 and _kinds(other) == {"gross_margin": "frac"}
+    assert other["gross_margin"] is None and _kinds(other) == {"gross_margin": "unresolved"}
     lst = {"gross_margin": 45.0, "warnings": ["fund_unit_contract:eodhd:gross_margin", "x"]}      # list-typed warnings
     de._margin_publish_contract(lst)
-    assert lst["gross_margin"] == 0.45 and "margin_publish:gross_margin:pts" in str(lst["warnings"])
+    assert lst["gross_margin"] is None and "margin_publish:gross_margin:unresolved" in str(lst["warnings"])
 
 
 def test_t6_kinds_and_guards():
     _env("enforce")
     neg = {"gross_margin": -0.15, "profit_margin": -12.5, "warnings": "yahoo_enrichment_applied"}
     de._margin_publish_contract(neg)
-    assert (neg["gross_margin"], neg["profit_margin"]) == (-0.15, -0.125)
+    assert (neg["gross_margin"], neg["profit_margin"]) == (None, None)
     amb = {"gross_margin": 1.2, "warnings": "eodhd_fundamentals_fallback_applied"}
     de._margin_publish_contract(amb)
-    assert amb["gross_margin"] == 1.2 and _kinds(amb) == {"gross_margin": "frac_amb"}          # never scaled without a witness
+    assert amb["gross_margin"] is None and _kinds(amb) == {"gross_margin": "unresolved"}
     both = {"gross_margin": 1.2, "warnings": "eodhd_fundamentals_fallback_applied; yahoo_enrichment_applied"}
     de._margin_publish_contract(both)
-    assert _kinds(both) == {"gross_margin": "frac"}
+    assert _kinds(both) == {"gross_margin": "unresolved"}
     edge = {"gross_margin": 1.5, "operating_margin": 1.5000001, "profit_margin": 150.0, "warnings": ""}
     de._margin_publish_contract(edge)
-    assert _kinds(edge) == {"gross_margin": "frac", "operating_margin": "pts", "profit_margin": "pts"}
-    assert edge["profit_margin"] == 1.5
+    assert _kinds(edge) == {f: "unresolved" for f in MF}
+    assert edge["profit_margin"] is None
     junk = {"gross_margin": "junk", "operating_margin": True, "profit_margin": float("nan"), "warnings": None}
-    assert de._margin_publish_contract(junk) == 0 and _tags(junk) == []
+    assert de._margin_publish_contract(junk) == 3
+    assert all(junk[field] is None for field in MF)
+    assert _kinds(junk) == {field: "unresolved" for field in MF}
     assert de._margin_publish_contract("not-a-row") == 0
     assert de._margin_publish_contract({}) == 0
     # never raises even if a helper is broken

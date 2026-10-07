@@ -59,7 +59,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 # v1.1.0 (2026-07-22): STICKY DATES — replace-mode amnesia cured.
@@ -103,7 +103,9 @@ from zoneinfo import ZoneInfo
 # passes again). ZERO functions removed; additions: _ticker_guard_enabled,
 # _is_ticker_shaped. Selftest grows 5 -> 9 with the exact production leak
 # fixture.
-__version__ = "1.1.1"
+# v1.1.2: validate sticky dates per field, retain either future event, and
+# preserve a carried record's original source/as-of instead of stamping it now.
+__version__ = "1.1.2"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
@@ -145,6 +147,30 @@ def _days_until(iso: Optional[str]) -> Any:
         d = _dt.datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
         return (d - _today_riyadh()).days
     except Exception:
+        return ""
+
+
+def _future_date(value: Any) -> Optional[str]:
+    """Canonical future calendar day, or None for a malformed/expired field."""
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        day = _dt.date.fromisoformat(text)
+        return day.isoformat() if day >= _today_riyadh() else None
+    except ValueError:
+        return None
+
+
+def _prior_asof(value: Any) -> str:
+    """Retain a valid supplied timestamp; absent/invalid observation stays unknown."""
+    text = str(value or "").strip()
+    if "T" not in text and " " not in text:
+        return ""
+    try:
+        _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return text
+    except ValueError:
         return ""
 
 
@@ -221,9 +247,10 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
     """v1.1.0: {SYM: {"e": date, "x": date}} from the existing tab —
     FUTURE dates only (rule 3: the past is never carried)."""
     out: Dict[str, Dict[str, str]] = {}
+    parse_prior.junk_purged = 0
     if not values:
         return out
-    hdr_i, cs, ce, cx = -1, -1, -1, -1
+    hdr_i, cs, ce, cx, ca, cp = -1, -1, -1, -1, -1, -1
     for i, row in enumerate(values[:5]):
         low = [str(c or "").strip().lower() for c in row]
         if "symbol" in low:
@@ -233,10 +260,13 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
                     ce = j
                 elif "ex-div" in h or "ex div" in h:
                     cx = j
+                elif h == "updated at (riyadh)":
+                    ca = j
+                elif h == "source":
+                    cp = j
             break
     if hdr_i < 0 or cs < 0:
         return out
-    parse_prior.junk_purged = 0  # v1.1.1: telemetry, reset per call
     for row in values[hdr_i + 1:]:
         sym = str(row[cs] if cs < len(row) else "").strip().upper()
         if not sym or sym == "SYMBOL":
@@ -249,11 +279,12 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
             continue
         rec: Dict[str, str] = {}
         for key, cix in (("e", ce), ("x", cx)):
-            d = str(row[cix] if 0 <= cix < len(row) else "").strip()[:10]
-            du = _days_until(d)
-            if d and du is not None and du >= 0:
+            d = _future_date(row[cix] if 0 <= cix < len(row) else "")
+            if d is not None:
                 rec[key] = d
         if rec:
+            rec["asof"] = _prior_asof(row[ca] if 0 <= ca < len(row) else "")
+            rec["source"] = str(row[cp] if 0 <= cp < len(row) else "").strip()
             out[sym] = rec
     return out
 
@@ -268,6 +299,9 @@ def apply_sticky(symbols: List[str],
     resurrects vanished symbols (rule 2); only future dates exist in
     `prior` by construction (rule 3)."""
     ctx_out = {s: dict(ctx.get(s) or {}) for s in symbols}
+    for c in ctx_out.values():
+        for key in ("next_earnings_date", "next_ex_div_date"):
+            c[key] = _future_date(c.get(key))
     carried: set = set()
     n_fill = 0
     for s in symbols:
@@ -275,24 +309,29 @@ def apply_sticky(symbols: List[str],
         if not p:
             continue
         c = ctx_out[s]
-        touched = False
-        if not c.get("next_earnings_date") and p.get("e"):
-            c["next_earnings_date"] = p["e"]
-            touched = True
-        if not c.get("next_ex_div_date") and p.get("x"):
-            c["next_ex_div_date"] = p["x"]
-            touched = True
-        if touched:
+        fields = []
+        for prior_key, key in (("e", "next_earnings_date"), ("x", "next_ex_div_date")):
+            d = _future_date(p.get(prior_key))
+            if not c.get(key) and d:
+                c[key] = d
+                fields.append(prior_key)
+        if fields:
+            c["_carried_fields"] = ",".join(fields)
+            c["_carried_asof"] = _prior_asof(p.get("asof"))
+            c["_carried_source"] = str(p.get("source") or "").strip()
             carried.add(s)
             n_fill += 1
     symbols_out = list(symbols)
     n_res = 0
     for s, p in prior.items():
-        if s in ctx_out or not p.get("e"):
+        e, x = _future_date(p.get("e")), _future_date(p.get("x"))
+        if s in ctx_out or not (e or x):
             continue
         symbols_out.append(s)
-        ctx_out[s] = {"next_earnings_date": p.get("e"),
-                      "next_ex_div_date": p.get("x")}
+        ctx_out[s] = {"next_earnings_date": e, "next_ex_div_date": x,
+                      "_carried_fields": ",".join(k for k, d in (("e", e), ("x", x)) if d),
+                      "_carried_asof": _prior_asof(p.get("asof")),
+                      "_carried_source": str(p.get("source") or "").strip()}
         carried.add(s)
         n_res += 1
     return symbols_out, ctx_out, carried, n_fill, n_res
@@ -308,9 +347,21 @@ def build_rows(symbols: List[str],
     for s in symbols:
         c = ctx.get(s) or {}
         e, x = c.get("next_earnings_date"), c.get("next_ex_div_date")
-        row_src = (source + " +carried") if s in carried else source
+        row_src, row_stamp = source, stamp if (e or x) else ""
+        if s in carried:
+            row_stamp = _prior_asof(c.get("_carried_asof"))
+            prior_source = str(c.get("_carried_source") or "").strip().removesuffix(" +carried")
+            prior_source = prior_source or "prior source unknown"
+            fields = set(str(c.get("_carried_fields") or "").split(","))
+            fresh = [label for key, d, label in (("e", e, "earnings"), ("x", x, "ex-div"))
+                     if d and key not in fields]
+            if fresh:
+                old = "/".join(label for key, label in (("e", "earnings"), ("x", "ex-div")) if key in fields)
+                row_src = f"fresh {'/'.join(fresh)}: {source}; carried {old}: {prior_source} +carried"
+            else:
+                row_src = prior_source + " +carried"
         rows.append([s, e or "", _days_until(e), x or "", _days_until(x),
-                     stamp, row_src])
+                     row_stamp, row_src])
     return rows
 
 
