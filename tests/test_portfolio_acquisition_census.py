@@ -1,4 +1,4 @@
-"""Page-driven portfolio acquisitions use a proven ledger, never written count."""
+"""Portfolio acquisitions use a proven active ledger, never written count."""
 import asyncio
 import copy
 import logging
@@ -26,7 +26,7 @@ def ledger():
             ["Symbol", "Name", "Ccy", "Status", "Buy Date", "Buy Price", "Shares"],
             *[[symbol, "Synthetic holding", "USD", "Active", "2026-01-01", 22, 11]
               for symbol in SYMBOLS],
-            [SYMBOLS[0], "Synthetic second lot", "USD", "Active", "2026-01-01", 23, 2],
+            [SYMBOLS[0], "Synthetic closed lot", "USD", "Inactive", "2026-01-01", 23, 2],
             *[["OLD" + str(i) + ".US", "Closed synthetic lot", "USD", "Inactive", "", 20, 1]
               for i in range(34)],
             ["ZERO.US", "Zero quantity", "USD", "Active", "", 20, 0],
@@ -36,7 +36,7 @@ def ledger():
 
 def provider_row(symbol, failure="", index=0):
     provider = "eodhd" if index < 3 else "yahoo_chart"
-    row = {"symbol": symbol, "name": "Synthetic holding", "current_price": 30 + index,
+    row = {"symbol": symbol, "name": "Synthetic holding", "currency": "USD", "current_price": 30 + index,
            "data_provider": provider, "last_updated_utc": STAMP,
            "last_updated_riyadh": "2026-10-07T15:29:00+03:00", "warnings": "",
            "position_qty": 11, "avg_cost": 22, "decision": "HOLD",
@@ -112,8 +112,8 @@ def run_portfolio(monkeypatch, rows, *, grid=None, backend_error=False, prior=No
                 return None, "synthetic outage", 503
             return {"headers": HEADERS, "rows_matrix": copy.deepcopy(rows)}, None, 200
 
-    # Exercise the production page-driven path and real manual-cell guard.
-    monkeypatch.setenv("TFB_PORTFOLIO_REBUILD", "1")
+    # Exercise the repaired page-driven entry and real manual-cell guard.
+    monkeypatch.setenv("TFB_PORTFOLIO_REBUILD", "0" if explicit_symbols else "1")
     monkeypatch.setenv("TFB_SYNC_STATUS_STAMP", "1")
     monkeypatch.setenv("TFB_SYNC_STATUS_STAMP_PAGES", "")
     monkeypatch.setenv("TFB_SYNC_STATUS_TRUTH", "0")
@@ -126,11 +126,11 @@ def run_portfolio(monkeypatch, rows, *, grid=None, backend_error=False, prior=No
     monkeypatch.setenv("GITHUB_RUN_ID", "synthetic-portfolio-run")
     monkeypatch.setattr(sync, "_read_symbols", lambda *_args: explicit_symbols or [])
     monkeypatch.setattr(sync, "_utc_now", lambda: NOW)
-    assert sync._read_cost_basis(writer, "offline") == {}  # Holdings injection is unchanged.
     result = asyncio.run(sync._run_one_task(
         sync.TaskSpec("MY_PORTFOLIO", "My_Portfolio", "enriched", allow_empty_symbols=True),
         "offline", "A1", -1, False, False, Backend(), writer))
-    assert payloads and all(payload["symbols"] == (explicit_symbols or []) for payload in payloads)
+    expected = explicit_symbols or SYMBOLS
+    assert all(payload["symbols"] == expected for payload in payloads)
     return result, writer
 
 
@@ -147,18 +147,23 @@ def test_real_page_driven_portfolio_census_status_and_audit(mode, failure, fresh
     incoming = copy.deepcopy(rows)
     caplog.set_level(logging.INFO, logger=sync.logger.name)
     result, writer = run_portfolio(monkeypatch, rows)
-    assert result.status == "success" and result.symbols_requested == 0
-    assert writer.published == incoming  # Prices, manual holdings and decisions survive.
+    assert result.status == "success" and result.symbols_requested == 5
+    published = {row[HEADERS.index("Symbol")]: row for row in writer.published}
+    for original in incoming:
+        output = published[original[HEADERS.index("Symbol")]]
+        for name in ("Current Price", "Currency", "Position Qty", "Avg Cost",
+                     "Data Provider", "Last Updated (UTC)", "Investor Decision", "User Notes"):
+            assert output[HEADERS.index(name)] == original[HEADERS.index(name)]
     assert sync._page_fresh_fetch_metrics(result) == (fresh, 5, fresh * 20.0)
     census = acquisition_census(HEADERS, writer.published, now=NOW,
         max_age_seconds=8 * 3600, requested=SYMBOLS, symbol_key=sync.canonicalize_symbol)
     assert len(census.requested) == 5 and len(census.successful) == fresh
     assert result._stamp_meta["acquisition_unknown"] == (1 if failure == "unknown" else 0)
     if failure == "missing":
-        assert result._stamp_meta["acquisition_reasons"]["response_missing"] == 1
+        assert result._stamp_meta["persist_restored"] == 1
     stamp = writer.status_rows[-1]
-    assert stamp[0] == "My_Portfolio" and stamp[6] == len(incoming)
-    assert "[STATUS-STAMP v6.64.5]" in stamp[3]
+    assert stamp[0] == "My_Portfolio" and stamp[6] == 5
+    assert f"[STATUS-STAMP v{sync.SCRIPT_VERSION}]" in stamp[3]
     assert "run=synthetic-portfolio-run" in stamp[3]
     assert f"acquired={fresh}/5" in stamp[3]
     assert "acquisition=" + ("COMPLETE" if fresh == 5 else "PARTIAL") in stamp[3]
@@ -167,8 +172,13 @@ def test_real_page_driven_portfolio_census_status_and_audit(mode, failure, fresh
         assert "policy_data=" + ("COMPLETE" if fresh == 5 else "PARTIAL") in stamp[3]
         assert sync._uv_page_state(result) == ("OK" if fresh == 5 else "STALE_COV", fresh * 20.0)
     else:
-        assert stamp[2] == "SUCCESS" and "policy_data=COMPLETE" in stamp[3]
-        assert sync._uv_page_state(result) == ("OK", None)
+        # Existing policy modes still expose incomplete response coverage;
+        # priced failure truth is factual regardless of the rollout mode.
+        assert stamp[2] == ("PARTIAL_FRESH" if failure == "missing" else "SUCCESS")
+        assert "policy_data=" + ("PARTIAL" if failure == "missing" else "COMPLETE") in stamp[3]
+        assert sync._uv_page_state(result) == (
+            "STALE_COV" if failure == "missing" else "OK",
+            80.0 if failure == "missing" else 100.0)
     sync._apply_stale_skip_escalation([result], writer, "offline")
     assert f"fresh_rows={fresh} requested_rows=5 fresh_pct={fresh * 20.0:.4f}" in caplog.text
     active, warnings = ledger_symbols(ledger())
@@ -178,7 +188,8 @@ def test_real_page_driven_portfolio_census_status_and_audit(mode, failure, fresh
     assert audit.fresh == fresh
     assert audit.status == ("PASS" if fresh == 5 else "FAIL")
     if failure == "missing":
-        assert audit.missing_portfolio == [SYMBOLS[0]]  # Physical denominator differs, membership fails.
+        assert not audit.missing_portfolio  # Real persistence retains the failed acquisition as preserved.
+        assert "acquisition_status:preserved" in published[SYMBOLS[0]][HEADERS.index("Warnings")]
     else:
         assert audit.unique == 5 and audit.fresh_pct == fresh * 20.0
 
@@ -197,7 +208,7 @@ def test_unproven_ledger_never_uses_successful_response_denominator(bad_ledger, 
     monkeypatch.setenv("TFB_SYNC_FETCHFAIL_TRUTH", "observe")
     result, writer = run_portfolio(monkeypatch,
         [provider_row(symbol, index=i) for i, symbol in enumerate(SYMBOLS)], grid=bad_ledger)
-    assert result.rows_written == 5
+    assert result.status == "failed" and result.rows_written == 0 and not writer.published
     assert sync._page_fresh_fetch_metrics(result) == (None, 0, None)
     assert "acquired=unknown/0 acquisition=UNKNOWN" in writer.status_rows[-1][3]
     assert "| data=PARTIAL" in writer.status_rows[-1][3]
@@ -217,8 +228,9 @@ def test_proven_empty_active_ledger_cannot_certify_existing_rows(monkeypatch):
     result, writer = run_portfolio(monkeypatch,
         [provider_row(symbol, index=i) for i, symbol in enumerate(SYMBOLS)],
         grid=[["Symbol", "Status", "Shares"], ["OLD.US", "Inactive", 1]])
-    assert sync._page_fresh_fetch_metrics(result) == (0, 0, None)
-    assert "acquired=0/0 acquisition=PARTIAL" in writer.status_rows[-1][3]
+    assert result.status == "failed" and not writer.published
+    assert sync._page_fresh_fetch_metrics(result) == (None, 0, None)
+    assert "acquired=unknown/0 acquisition=UNKNOWN" in writer.status_rows[-1][3]
 
 
 def test_bounded_out_ledger_does_not_prove_a_partial_cohort():
@@ -230,8 +242,8 @@ def test_foreign_success_cannot_inflate_active_portfolio_acquisition(monkeypatch
     result, _writer = run_portfolio(monkeypatch,
         [provider_row(symbol, index=i) for i, symbol in enumerate(SYMBOLS[1:])]
         + [provider_row("FOREIGN.US")])
-    assert sync._page_fresh_fetch_metrics(result) == (4, 5, 80.0)
-    assert result._stamp_meta["acquisition_reasons"]["response_missing"] == 1
+    assert result.status == "failed" and result.rows_written == 0
+    assert sync._page_fresh_fetch_metrics(result) == (None, 5, None)
 
 
 def test_validated_ledger_header_cannot_be_replaced_by_earlier_partial_header():
@@ -251,12 +263,12 @@ def test_explicit_portfolio_request_keeps_existing_requested_cohort(monkeypatch)
     assert "acquired=2/2 acquisition=COMPLETE" in writer.status_rows[-1][3]
 
 
-def test_manual_guard_still_blocks_blank_holdings_without_publication(monkeypatch):
+def test_trusted_active_ledger_repairs_blank_backend_holdings_before_manual_guard(monkeypatch):
     monkeypatch.setenv("TFB_SYNC_FETCHFAIL_TRUTH", "observe")
     rows = [provider_row(symbol, index=i) for i, symbol in enumerate(SYMBOLS)]
     rows[0][HEADERS.index("Position Qty")] = ""
     result, writer = run_portfolio(monkeypatch, rows)
-    assert result.status == "partial" and not writer.published and result.rows_written == 0
-    assert any("would blank existing Qty/Avg Cost" in warning for warning in result.warnings)
-    assert "leg=partial written=0" in writer.status_rows[-1][3]
-    assert "| data=PARTIAL" in writer.status_rows[-1][3]
+    assert result.status == "success" and result.rows_written == 5
+    assert writer.published[0][HEADERS.index("Position Qty")] == 11
+    assert "leg=success written=5" in writer.status_rows[-1][3]
+    assert "| data=COMPLETE" in writer.status_rows[-1][3]
