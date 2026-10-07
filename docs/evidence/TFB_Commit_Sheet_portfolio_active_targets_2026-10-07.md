@@ -1,5 +1,7 @@
 # Active portfolio targets — synchronizer 6.64.6
 
+Later live readback verified the active-target and native-money contracts. The linked full-row audit still found one blank provider Name below its unchanged 100% name-coverage requirement; the separate 6.64.7 repair carries a guarded exact-active-row ledger display label for that case. See [the display-label evidence](TFB_Commit_Sheet_portfolio_ledger_labels_2026-10-07.md).
+
 An offset portfolio ledger header made the historical first-row reader return an empty holding basis. The synchronizer then sent `symbols=[]`, selecting unrelated backend defaults with no trustworthy quantity or unit-cost inputs. Version 6.64.5's independent census exposed the missing actual holdings; it did not repair that request source.
 
 The rebuild now reads one bounded, unformatted active-ledger snapshot. It detects the header below title rows and requires one unambiguous Symbol, Status, quantity, native unit Buy Price/Avg Cost and Ccy/Currency column. Inactive, Closed, Sold and zero-quantity positions are excluded. Aggregate Cost Basis, fees and SAR totals cannot stand in for unit cost. Unreadable, truncated, empty, conflicting, duplicate, noncanonical known registry or mathematically invalid active inputs fail before fetching. Duplicate active lots require an explicit aggregation contract; this change does not invent one.

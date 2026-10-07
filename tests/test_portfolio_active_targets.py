@@ -26,6 +26,8 @@ HOLDINGS = {
     "7010.SR": {"qty": 7.0, "cost": 20.0, "currency": "SAR"},
     "SYNB.US": {"qty": 3.0, "cost": 31.0, "currency": "USD"},
 }
+LABELED_HOLDINGS = {symbol: {**holding, "name": "Synthetic holding"}
+    for symbol, holding in HOLDINGS.items()}
 SYMBOLS = sorted(HOLDINGS)
 PRICES = {"SYNA.US": 10.875, "7010.SR": 25.2, "SYNB.US": 27.125}
 LEDGER_HEADERS = ["Symbol", "Name", "Ccy", "Status", "Buy Date", "Buy Price", "Shares"]
@@ -182,7 +184,7 @@ def assert_money(row, symbol, *, priced=True):
 
 def test_row_four_ledger_uses_only_unique_active_positive_positions():
     writer = Writer(ledger())
-    assert sync._read_cost_basis(writer, "offline") == HOLDINGS
+    assert sync._read_cost_basis(writer, "offline") == LABELED_HOLDINGS
     assert writer.ledger_reads == [("A1:EZ20050",)]
 
 
@@ -474,7 +476,7 @@ def test_ledger_reader_does_not_truncate_later_active_holding_to_old_200_row_cap
     grid.extend([[]] * (450 - len(grid)))
     grid.append(last)
     writer = Writer(grid)
-    assert sync._read_cost_basis(writer, "offline") == HOLDINGS
+    assert sync._read_cost_basis(writer, "offline") == LABELED_HOLDINGS
     assert writer.ledger_reads == [("A1:EZ20050",)]
 
 
@@ -532,7 +534,7 @@ def test_header_offset_native_unit_cost_ignores_aggregate_totals_and_inactive_du
     inactive_duplicate[5], inactive_duplicate[6] = 99999, 99999
     grid.append(inactive_duplicate)
     writer = Writer(grid)
-    assert sync._read_cost_basis(writer, "offline") == HOLDINGS
+    assert sync._read_cost_basis(writer, "offline") == LABELED_HOLDINGS
     assert writer.ledger_reads == [("A1:EZ20050",)]
 
 
