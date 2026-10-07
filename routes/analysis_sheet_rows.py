@@ -2,12 +2,14 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.0  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+v4.8.1: redact credentials from caught route, engine, and proxy diagnostics.
 
 WHY v4.8.0 — route-level P/E coherence [ROUTE-COHERENCE / Fix RC]
 --------------------------------------------------------------------------
@@ -280,6 +282,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
+from core.secret_redaction import redact_text, safe_error_text
+
 logger = logging.getLogger("routes.analysis_sheet_rows")
 logger.addHandler(logging.NullHandler())
 
@@ -351,7 +355,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.1"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -1201,7 +1205,7 @@ def _schema_from_registry(page: str) -> Tuple[List[str], List[str], Any, str]:
     try:
         spec = get_sheet_spec(page)  # type: ignore[misc]
     except Exception as e:
-        return [], [], None, f"registry_error:{e}"
+        return [], [], None, f"registry_error:{redact_text(e)}"
     headers, keys = _extract_headers_keys_from_spec(spec)
     return headers, keys, spec, "schema_registry.spec"
 
@@ -2672,7 +2676,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
         except Exception as exc:
             method_outcome = "raised"
             method_error_class = exc.__class__.__name__
-            method_error_msg = str(exc)[:200]
+            method_error_msg = redact_text(exc, limit=200)
             try:
                 logger.warning(
                     "[analysis_sheet_rows v%s] engine.%s raised: %s: %s",
@@ -2728,7 +2732,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
                 per_failures += 1
         except Exception as e:
-            out[s] = {"symbol": s, "error": "{}: {}".format(e.__class__.__name__, str(e)[:200])}
+            out[s] = {"symbol": s, "error": safe_error_text(e, limit=200)}
             per_failures += 1
 
     if per_method_used and out:
@@ -2819,7 +2823,7 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
                 "args_count": len(args),
                 "outcome": "typeerror",
                 "error_class": "TypeError",
-                "error_message": str(e)[:200],
+                "error_message": redact_text(e, limit=200),
             })
             last_err = e
             continue
@@ -2849,18 +2853,18 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
                 "args_count": len(args),
                 "outcome": "error",
                 "error_class": e.__class__.__name__,
-                "error_message": str(e)[:200],
+                "error_message": redact_text(e, limit=200),
             })
             last_err = e
             try:
                 logger.warning(
                     "[analysis_sheet_rows v%s] adapter raised on attempt %d: %s: %s",
-                    ANALYSIS_SHEET_ROWS_VERSION, attempt_idx, e.__class__.__name__, str(e)[:200],
+                    ANALYSIS_SHEET_ROWS_VERSION, attempt_idx, e.__class__.__name__, redact_text(e, limit=200),
                 )
             except Exception:
                 pass
             return (
-                {"status": "error", "error": "{}: {}".format(e.__class__.__name__, str(e)[:500]), "row_objects": []},
+                {"status": "error", "error": safe_error_text(e, limit=500), "row_objects": []},
                 "core:get_sheet_rows",
                 call_summary,
                 "raised",
@@ -2909,7 +2913,7 @@ async def _proxy_callable(*, module_names: Sequence[str], function_name: str, re
     if imported is None:
         meta["proxy_import_error"] = "{}: {}".format(
             (last_import_error.__class__.__name__ if last_import_error else "ImportError"),
-            (str(last_import_error)[:300] if last_import_error else "import failed"),
+            (redact_text(last_import_error, limit=300) if last_import_error else "import failed"),
         )
         meta["proxy_call_outcome"] = "import_failed"
         return None, meta
@@ -2981,8 +2985,8 @@ async def _proxy_callable(*, module_names: Sequence[str], function_name: str, re
         return None, meta
     except Exception as e:
         # v4.3.1 [FIX-3]: capture FULL error message + class, not just str(e)
-        meta["proxy_call_error"] = str(e)[:500]  # v4.3.0 backwards-compatible field
-        meta["proxy_error"] = "{}: {}".format(e.__class__.__name__, str(e)[:500])
+        meta["proxy_call_error"] = redact_text(e, limit=500)  # v4.3.0 backwards-compatible field
+        meta["proxy_error"] = safe_error_text(e, limit=500)
         meta["proxy_error_class"] = e.__class__.__name__
         meta["proxy_module"] = imported_name
         meta["proxy_call_outcome"] = "raised"
@@ -2990,7 +2994,7 @@ async def _proxy_callable(*, module_names: Sequence[str], function_name: str, re
             logger.warning(
                 "[analysis_sheet_rows v%s] proxy raised: %s.%s — %s: %s (page=%s)",
                 ANALYSIS_SHEET_ROWS_VERSION, imported_name, function_name,
-                e.__class__.__name__, str(e)[:200], page,
+                e.__class__.__name__, redact_text(e, limit=200), page,
             )
         except Exception:
             pass
@@ -3349,13 +3353,13 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
             started_at=start,
             mode=mode,
             status_out="partial",
-            error_out="analysis_sheet_rows runtime fallback: {}: {}".format(e.__class__.__name__, str(e)[:300]),
+            error_out="analysis_sheet_rows runtime fallback: " + safe_error_text(e, limit=300),
             meta={
                 "dispatch": "analysis_sheet_rows_emergency_fallback",
                 "schema_source": schema_source,
                 "exception_type": type(e).__name__,
                 "engine_source": CORE_ENGINE_SOURCE,
-                "_engine_error": "{}: {}".format(e.__class__.__name__, str(e)[:500]),
+                "_engine_error": safe_error_text(e, limit=500),
                 "_engine_error_class": e.__class__.__name__,
             },
         )

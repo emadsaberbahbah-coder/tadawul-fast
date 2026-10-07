@@ -89,6 +89,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "top10 selector"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", "4.18.1",
+     "eodhd provider"),
+    ("core.providers.calendar_provider", "__version__", "1.2.1",
+     "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
@@ -104,7 +108,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.64.8", "dashboard sync"),
+    ("run_dashboard_sync", "6.64.9", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.4.0", "workbook backup"),
     ("pit_snapshot", "1.1.0", "pit snapshot"),

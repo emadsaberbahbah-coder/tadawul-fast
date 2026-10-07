@@ -2,12 +2,15 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.0)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.2)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.2: redact credential-bearing diagnostic text and wrap existing logging
+formatters while retaining handler routing, error classes and request IDs.
 
 Why this revision (v8.14.1 vs v8.14.0)
 --------------------------------------
@@ -219,6 +222,12 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+from core.secret_redaction import (
+    install_redaction_on_handlers,
+    redact_text,
+    safe_error_text,
+)
+
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.openapi.utils import get_openapi
@@ -370,7 +379,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.1"
+APP_ENTRY_VERSION = "8.14.2"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -602,11 +611,7 @@ def _coerce_version(value: Any, default: str) -> str:
 
 
 def _err_to_str(e: BaseException, limit: int = 1600) -> str:
-    try:
-        s = f"{type(e).__name__}: {e}"
-    except Exception:
-        s = "UnknownError"
-    return s if len(s) <= limit else (s[:limit] + "...(truncated)")
+    return safe_error_text(e, limit=limit)
 
 
 def _pick_attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -696,9 +701,7 @@ def _append_startup_warning(app: FastAPI, message: str) -> None:
     pass` blocks scattered through v8.11.0's lifespan and create_app.
     """
     try:
-        msg = str(message or "")
-        if len(msg) > 2000:
-            msg = msg[:2000] + "...(truncated)"
+        msg = redact_text(message or "", limit=2000)
         warnings = list(getattr(app.state, "startup_warnings", []) or [])
         if msg not in warnings:
             warnings.append(msg)
@@ -716,13 +719,14 @@ class _JsonFormatter(logging.Formatter):
             "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "msg": redact_text(record.getMessage()),
         }
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = redact_text(self.formatException(record.exc_info))
         for key in ("request_id", "path", "status_code"):
             if hasattr(record, key):
-                payload[key] = getattr(record, key)
+                value = getattr(record, key)
+                payload[key] = redact_text(value) if isinstance(value, str) else value
         try:
             return json.dumps(payload, ensure_ascii=False)
         except Exception:
@@ -764,6 +768,7 @@ def _setup_logging() -> logging.Logger:
         logging.getLogger(name).setLevel(resolved_level)
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    install_redaction_on_handlers()
     main_logger = logging.getLogger("main")
     main_logger.setLevel(resolved_level)
     return main_logger

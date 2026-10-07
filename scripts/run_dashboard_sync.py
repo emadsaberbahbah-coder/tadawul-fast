@@ -3,9 +3,13 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.7)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.9)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.9: redact HTTP body and exception diagnostics before truncation, and
+protect existing log formatters. HTTP auth, retries and success payloads remain
+unchanged.
 
 v6.34.0 — PERSISTENCE TRUTH & SECOND-CHANCE PASS (run 30782099065 forensics)
 ================================================================================
@@ -1328,6 +1332,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.data_validity import acquisition_census, coverage_validity, symbol_domain_ok
+from core.secret_redaction import (
+    install_redaction_on_handlers,
+    redact_text,
+    safe_error_text,
+)
 
 try:
     from scripts.critical_symbol_identity import (
@@ -1843,7 +1852,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.8"
+SCRIPT_VERSION = "6.64.9"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -2588,6 +2597,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("DashboardSync")
+install_redaction_on_handlers()
+install_redaction_on_handlers(logger)
 
 # -----------------------------------------------------------------------------
 # Helpers (safe)
@@ -2833,8 +2844,9 @@ class TaskResult:
             "rows_written": self.rows_written,
             "rows_failed": self.rows_failed,
             "gateway_used": self.gateway_used,
-            "warnings": self.warnings,
-            "error": self.error,
+            "warnings": [redact_text(warning) if isinstance(warning, str) else warning
+                         for warning in self.warnings],
+            "error": redact_text(self.error) if isinstance(self.error, str) else self.error,
             "request_id": self.request_id,
             "version": SCRIPT_VERSION,
         }
@@ -2912,13 +2924,14 @@ class BackendClient:
             r = await client.get(url)
             code = int(r.status_code)
             if code != 200:
-                return None, f"HTTP {code}: {r.text[:200]}", code
+                hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                return None, f"HTTP {code}: {hint}", code
             try:
                 return r.json(), None, code
             except Exception as e:
-                return None, f"JSON parse error: {e}", code
+                return None, f"JSON parse error: {safe_error_text(e, secret_values=(self.token,))}", code
         except Exception as e:
-            return None, str(e), 0
+            return None, safe_error_text(e, secret_values=(self.token,)), 0
 
     async def post_json(self, path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
@@ -2931,21 +2944,23 @@ class BackendClient:
 
                 if code in (429,) or (500 <= code < 600):
                     if attempt == max_retries - 1:
-                        return None, f"HTTP {code}: {r.text[:200]}", code
+                        hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                        return None, f"HTTP {code}: {hint}", code
                     await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
                     continue
 
                 if code != 200:
-                    return None, f"HTTP {code}: {r.text[:200]}", code
+                    hint = redact_text(r.text, secret_values=(self.token,), limit=200)
+                    return None, f"HTTP {code}: {hint}", code
 
                 try:
                     return r.json(), None, code
                 except Exception as e:
-                    return None, f"JSON parse error: {e}", code
+                    return None, f"JSON parse error: {safe_error_text(e, secret_values=(self.token,))}", code
 
             except Exception as e:
                 if attempt == max_retries - 1:
-                    return None, str(e), 0
+                    return None, safe_error_text(e, secret_values=(self.token,)), 0
                 await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
 
         return None, "Unknown error", 0
@@ -13016,13 +13031,13 @@ async def _run_one_task(
             # ---------------------------------------------------------------
         except Exception as e:
             res.status = "failed"
-            res.error = f"Write failed: {e}"
+            res.error = f"Write failed: {safe_error_text(e)}"
 
         return res
 
     except Exception as e:
         res.status = "failed"
-        res.error = str(e)
+        res.error = safe_error_text(e)
         return res
 
     finally:

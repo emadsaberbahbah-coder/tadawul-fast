@@ -2,6 +2,10 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
+v4.18.1: redact 401/403 body hints exported into error rows. Classification
+keeps its original raw 200-character input; quota, auth and breaker behavior
+remain unchanged.
+
 EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
                           that silently inflated every sub-1.5% value by 100x
                           is retired)
@@ -600,6 +604,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+from core.secret_redaction import redact_text
+
 import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
@@ -1121,7 +1127,7 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
-PROVIDER_VERSION = "4.18.0"
+PROVIDER_VERSION = "4.18.1"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -2321,12 +2327,17 @@ class EODHDClient:
                         continue
 
                     if sc in (401, 403):
-                        body_hint = ""
+                        body_text = ""
                         try:
-                            body_hint = (r.text or "")[:200]
+                            body_text = r.text or ""
                         except Exception:
-                            body_hint = ""
-                        body_low = body_hint.lower()
+                            body_text = ""
+                        # Classification retains its original raw 200-character
+                        # input; only the diagnostic exported to rows is redacted.
+                        body_low = body_text[:200].lower()
+                        body_hint = redact_text(
+                            body_text, secret_values=(self.api_key,), limit=200,
+                        )
 
                         is_quota_or_rate = any(
                             k in body_low for k in (
