@@ -290,6 +290,7 @@ jobs:
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
+            tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
             tests/test_scoring_engine_contract.py \

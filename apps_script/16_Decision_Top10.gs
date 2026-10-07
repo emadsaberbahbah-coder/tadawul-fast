@@ -1552,7 +1552,18 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.12.0';
+var DT10_VERSION = '1.12.1';
+
+/** A reversible rollout brake with no fallback to the old funding bug.
+ * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
+ * Unset/enabled permits the signed replay. Unknown/read-failed is research. */
+function dt10BoardFundingMode_() {
+  try {
+    var mode = String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_BOARD_FUNDING_MODE') || '').trim().toLowerCase();
+    return !mode || mode === 'enabled' ? 'enabled' : 'research';
+  } catch (e) { return 'research'; }
+}
 
 /** Funding follows the final stability board, using one frozen backend replay. */
 function dt10BoardEligible_(t) {
@@ -1583,6 +1594,11 @@ function dt10BoardFundingFail_(payload, reason) {
 }
 function dt10ReallocateBoard_(payload, body) {
   var meta = payload.meta || {}, funding = meta.board_funding || {};
+  if (dt10BoardFundingMode_() !== 'enabled') {
+    dt10BoardFundingFail_(payload, 'research-only mode; allocation disabled');
+    payload.meta.board_funding.mode = 'research';
+    return;
+  }
   var snapshot = funding.snapshot;
   if (funding.contract_version !== 1 || funding.stage !== 'research' ||
       !funding.snapshot_available || !snapshot ||
@@ -1671,6 +1687,12 @@ function dt10ReallocateBoard_(payload, body) {
 function dt10FinalizeBoard_(payload) {
   payload.kpis = payload.kpis || {};
   payload.meta = payload.meta || {};
+  // Check again at render/finalization: the rollout brake may have changed
+  // during the HTTP call, and direct render callers must obey it too.
+  if (dt10BoardFundingMode_() !== 'enabled') {
+    dt10BoardFundingFail_(payload, 'research-only mode; allocation disabled');
+    payload.meta.board_funding.mode = 'research';
+  }
   var k = payload.kpis, funding = payload.meta.board_funding || {};
   delete funding.snapshot;
   var feedOk = !payload._dt10_uv || payload._dt10_uv.state === 'EXECUTABLE';

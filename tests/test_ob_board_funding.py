@@ -7,7 +7,9 @@ allocator, using the signed research snapshot rather than refreshed inputs.
 
 from __future__ import annotations
 
+import ast
 import copy
+import inspect
 import json
 import os
 from typing import Any
@@ -30,6 +32,23 @@ CRITERIA = {
 PORTFOLIO = {"cash_available_sar": 10_000.0}
 FX = {"SAR": 1.0}
 FUNDING_ALERTS = {"capital_call", "rotation_proposal", "unfunded_candidates"}
+AUTH_ENV_KEYS = (
+    "APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN",
+    "ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS",
+    "X_APP_TOKEN", "API_KEY", "TFB_TOKEN",
+)
+POLICY_ENV_CHANGES = (
+    ("TFB_FORECAST_BASIS", "legacy", "plan3m"),
+    ("TFB_TICKET_FRESHNESS_GATE", "1", "0"),
+    ("TFB_TICKET_MAX_QUOTE_AGE_MIN", "15", "30"),
+    ("TFB_TICKET_FALLBACK_MAX_AGE_H", "78", "1"),
+    ("TFB_COMPLIANCE_SURFACE_GATE", "1", "0"),
+    ("TFB_ELIGIBILITY_GATE", "1", "0"),
+    ("TFB_GLOBAL_ACTIVITY_SCREEN", "", "full"),
+    ("TFB_SHARIAH_FAIL_LIST", "UNRELATED.SR", "LATER.SR"),
+    ("TFB_EXIT_BY_RULE_EXTRA", "", "LATER.SR"),
+    ("TFB_KSA_FOREIGN_RESTRICTED", "UNRELATED.SR", "LATER.SR"),
+)
 
 
 def _row(symbol: str, roi: float = 24.0, **overrides: Any) -> dict[str, Any]:
@@ -63,6 +82,9 @@ def _isolated_builder_environment(monkeypatch):
     for key in list(os.environ):
         if key.startswith("TFB_OPP_") or key.startswith("TFB_T10_"):
             monkeypatch.delenv(key, raising=False)
+    for key in AUTH_ENV_KEYS + tuple(item[0] for item in POLICY_ENV_CHANGES):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
     monkeypatch.setenv("TFB_OPP_ENABLED", "1")
     monkeypatch.setenv("TFB_OPP_FUNDING_PLAN", "1")
     monkeypatch.setenv("APP_TOKEN", "synthetic-board-test")
@@ -280,6 +302,141 @@ def test_changed_environment_policy_invalidates_snapshot(monkeypatch):
     allocated = _allocate(research, ["LATER.SR"])
     assert allocated["status"] == "board_funding_mismatch"
     _assert_no_execution(allocated)
+
+
+@pytest.mark.parametrize("key,before,after", POLICY_ENV_CHANGES,
+    ids=[change[0] for change in POLICY_ENV_CHANGES])
+def test_non_opportunity_policy_change_rejects_replay_before_allocation(
+    monkeypatch, key, before, after,
+):
+    monkeypatch.setenv(key, before)
+    research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)])
+    assert research["meta"]["board_funding"]["snapshot_available"] is True
+    monkeypatch.setenv(key, after)
+
+    def forbidden_allocator(*_args, **_kwargs):
+        raise AssertionError("changed policy must be rejected before allocation")
+
+    monkeypatch.setattr(ob, "_select_and_size", forbidden_allocator)
+    rejected = _allocate(research, ["LATER.SR"])
+    assert rejected["status"] == "board_funding_mismatch"
+    assert "basis changed" in rejected.get("message", "")
+    _assert_no_execution(rejected)
+
+
+def test_all_direct_builder_policy_reads_are_bound_to_replay_fingerprint(monkeypatch):
+    # Behavioral parameter cases above cover the discovered omissions. This
+    # source guard catches a newly introduced execution setting before it can
+    # silently bypass snapshot validation. Acquisition credentials are outside
+    # this TFB policy family; their results are already frozen as signed rows.
+    policy_names = set()
+    for node in ast.walk(ast.parse(inspect.getsource(ob))):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = (node.func.attr if isinstance(node.func, ast.Attribute)
+                    else node.func.id if isinstance(node.func, ast.Name) else "")
+        if function != "getenv" and not function.startswith("_env_"):
+            continue
+        first = node.args[0]
+        if (isinstance(first, ast.Constant) and isinstance(first.value, str)
+                and first.value.startswith("TFB_")):
+            policy_names.add(first.value)
+    assert len(policy_names) >= 80  # Ensure the scan traversed the full builder.
+    baseline = ob._board_funding_basis(CRITERIA, PORTFOLIO, FX)
+    unbound = []
+    for name in sorted(policy_names):
+        with monkeypatch.context() as isolated:
+            isolated.setenv(name, "synthetic-distinct-policy-value")
+            if ob._board_funding_basis(CRITERIA, PORTFOLIO, FX) == baseline:
+                unbound.append(name)
+    assert not unbound, "Policy reads missing from replay fingerprint: " + ", ".join(unbound)
+
+
+@pytest.mark.parametrize("rotated_key,initial", [
+    ("APP_TOKEN", {"APP_TOKEN": "primary-v1", "BACKUP_APP_TOKEN": "backup-v1"}),
+    ("BACKUP_APP_TOKEN", {"APP_TOKEN": "primary-v1", "BACKUP_APP_TOKEN": "backup-v1"}),
+    ("ALLOWED_TOKENS", {"APP_TOKEN": "inactive-primary", "ALLOWED_TOKENS": "active-v1,active-backup"}),
+])
+def test_any_active_token_rotation_rejects_existing_snapshot_before_allocation(
+    monkeypatch, rotated_key, initial,
+):
+    for key, value in initial.items():
+        monkeypatch.setenv(key, value)
+    research = _research([_row("LATER.SR", 20.0)])
+    assert _allocate(research, ["LATER.SR"])["status"] == "ok"
+    monkeypatch.setenv(rotated_key, "rotated-active-token")
+
+    def forbidden_allocator(*_args, **_kwargs):
+        raise AssertionError("active token rotation must invalidate before allocation")
+
+    monkeypatch.setattr(ob, "_select_and_size", forbidden_allocator)
+    rejected = _allocate(research, ["LATER.SR"])
+    assert rejected["status"] == "board_funding_mismatch"
+    assert "signature mismatch" in rejected.get("message", "")
+    _assert_no_execution(rejected)
+    serialized = json.dumps([research, rejected])
+    assert all(token.strip() not in serialized
+               for value in initial.values() for token in value.split(","))
+    assert "rotated-active-token" not in serialized
+
+
+def test_inactive_app_token_rotation_does_not_change_active_allowed_token_set(monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "inactive-primary-v1")
+    monkeypatch.setenv("ALLOWED_TOKENS", "active-primary,active-backup")
+    research = _research([_row("LATER.SR", 20.0)])
+    first = _allocate(research, ["LATER.SR"])
+    monkeypatch.setenv("APP_TOKEN", "inactive-primary-v2")
+    second = _allocate(research, ["LATER.SR"])
+    assert first["status"] == second["status"] == "ok"
+    assert first["selected"] == second["selected"]
+    assert first["kpis"] == second["kpis"]
+
+
+def test_active_csv_token_order_whitespace_and_duplicates_preserve_signature(monkeypatch):
+    monkeypatch.delenv("APP_TOKEN")
+    monkeypatch.setenv("ALLOWED_TOKENS", "active-primary,active-backup")
+    research = _research([_row("LATER.SR", 20.0)])
+    first = _allocate(research, ["LATER.SR"])
+    monkeypatch.setenv("ALLOWED_TOKENS", " active-backup , active-primary , active-backup ")
+    second = _allocate(research, ["LATER.SR"])
+    assert first["status"] == second["status"] == "ok"
+    assert first["selected"] == second["selected"]
+    assert first["kpis"] == second["kpis"]
+    assert all(token not in json.dumps([research, first, second])
+               for token in ("active-primary", "active-backup"))
+
+
+@pytest.mark.parametrize("initial_release", (None, "synthetic-release-a"),
+    ids=("local-to-render", "render-release-change"))
+def test_changed_backend_release_identity_rejects_snapshot_before_allocation(
+    monkeypatch, initial_release,
+):
+    if initial_release is not None:
+        monkeypatch.setenv("RENDER_GIT_COMMIT", initial_release)
+    research = _research([_row("LATER.SR", 20.0)])
+    assert _allocate(research, ["LATER.SR"])["status"] == "ok"
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "synthetic-release-b")
+
+    def forbidden_allocator(*_args, **_kwargs):
+        raise AssertionError("release identity drift must reject before allocation")
+
+    monkeypatch.setattr(ob, "_select_and_size", forbidden_allocator)
+    rejected = _allocate(research, ["LATER.SR"])
+    assert rejected["status"] == "board_funding_mismatch"
+    assert "basis changed" in rejected.get("message", "")
+    _assert_no_execution(rejected)
+
+
+def test_same_release_snapshot_is_valid_across_worker_instance_contexts(monkeypatch):
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "synthetic-same-release")
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "synthetic-worker-a")
+    research = _research([_row("LATER.SR", 20.0)])
+    first = _allocate(research, ["LATER.SR"])
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "synthetic-worker-b")
+    second = _allocate(research, ["LATER.SR"])
+    assert first["status"] == second["status"] == "ok"
+    assert first["selected"] == second["selected"]
+    assert first["kpis"] == second["kpis"]
 
 
 def test_missing_shared_authentication_key_leaves_research_unsized(monkeypatch):

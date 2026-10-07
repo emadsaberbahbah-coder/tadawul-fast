@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.23.2  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.1  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.24.1 (2026-10-07): signed replay covers all execution policy families and
+the Render release identity; signing resolves the endpoint's complete active
+authentication token set so primary/backup/list rotation invalidates snapshots.
+Ordinary single-pass requests and their authentication semantics are unchanged.
 
 v1.9.0 [B-6 SHARIAH MODEL GATE — the resolver's own "until the Gen-2
 wiring" note, closed]: compliance_rule_sets() has merged the operator's
@@ -1362,7 +1367,7 @@ from datetime import datetime, timedelta, timezone
 #   _env_w52_high_pct, _env_shock_pct, _w52_eval, _timing_gate). Removed: 0.
 # Rollback: env unset (or absent) = v1.22.2 behaviour; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.0"
+OPPORTUNITY_BUILDER_VERSION = "1.24.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -1371,6 +1376,13 @@ _BOARD_FUNDING_VERSION = 1
 _BOARD_FUNDING_MAX_ROWS = 500
 _BOARD_FUNDING_MAX_BYTES = 1_000_000
 _BOARD_FUNDING_MAX_AGE_S = 180
+_BOARD_FUNDING_POLICY_PREFIXES = (
+    "TFB_OPP_", "TFB_T10_", "TFB_TICKET_", "TFB_COMPLIANCE_", "TFB_TREND_",
+)
+_BOARD_FUNDING_POLICY_NAMES = frozenset((
+    "TFB_FORECAST_BASIS", "TFB_ELIGIBILITY_GATE", "TFB_GLOBAL_ACTIVITY_SCREEN",
+    "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA", "TFB_KSA_FOREIGN_RESTRICTED",
+))
 
 
 def _board_funding_json(value):
@@ -1396,26 +1408,39 @@ def _board_funding_json(value):
 
 
 def _board_funding_basis(criteria, portfolio, fx_rates):
+    # Include admission, freshness, forecast horizon, compliance rules and
+    # acquisition-stage trend policy as well as sizing/price-check settings.
+    # Gate controls outside TFB_OPP_/TFB_T10_ must never change silently
+    # between qualification and allocation. Only the digest leaves the server.
     policy = {k: v for k, v in os.environ.items()
-              if k.startswith(("TFB_OPP_", "TFB_T10_"))}
+              if k.startswith(_BOARD_FUNDING_POLICY_PREFIXES)
+              or k in _BOARD_FUNDING_POLICY_NAMES}
     clean = {k: v for k, v in criteria.items()
              if not k.startswith("board_funding_")}
     if _env_scan_uncapped() and (clean.get("max_candidates") or 0) > 0:
         clean["max_candidates"] = 0
+    # Render shares this release identity across workers/instances. A deploy
+    # that changes an imported gate module must also invalidate replay, even
+    # if that release leaves the builder's own version constant unchanged.
+    release = {"render_git_commit": os.getenv("RENDER_GIT_COMMIT") or None}
     return hashlib.sha256(_board_funding_json(
-        [clean, portfolio or {}, fx_rates or {}, policy])).hexdigest()
+        [clean, portfolio or {}, fx_rates or {}, policy, release])).hexdigest()
 
 
 def _board_funding_sign(snapshot):
-    # Use the existing shared application auth configuration, never a
-    # per-worker random key or an unsigned fallback. Key rotation invalidates
-    # outstanding snapshots. No new deployment secret is required.
-    secret = next((os.getenv(k) for k in (
-        "APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN",
-        "ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS") if os.getenv(k)), None)
-    if not secret:
+    # This is the same resolver used by the opportunity route's normal auth.
+    # Preserve its list-over-single-token precedence and aliases; do not add
+    # an independent auth vocabulary or revive ignored/retired credentials.
+    # The complete active set binds snapshots to primary/backup/list rotation.
+    try:
+        from core.config import allowed_tokens
+        tokens = sorted(set(allowed_tokens()))
+    except Exception:
+        tokens = []
+    if not tokens:
         return ""
-    key = secret.encode("utf-8")
+    key = hashlib.sha256(b"tfb-board-funding-auth-v1\0" +
+                         _board_funding_json(tokens)).digest()
     unsigned = {k: v for k, v in snapshot.items() if k != "snapshot_id"}
     return hmac.new(key, _board_funding_json(unsigned), hashlib.sha256).hexdigest()
 
@@ -1434,7 +1459,7 @@ def _board_funding_validate(snapshot, rows, criteria, portfolio, fx_rates):
         return "snapshot expired"
     if snapshot.get("basis_fingerprint") != _board_funding_basis(
             criteria, portfolio, fx_rates):
-        return "policy, holdings, cash or FX basis changed"
+        return "release, policy, holdings, cash or FX basis changed"
     frozen = snapshot.get("rows")
     if not isinstance(frozen, list) or len(frozen) > _BOARD_FUNDING_MAX_ROWS or \
             _board_funding_json(rows) != _board_funding_json(frozen):

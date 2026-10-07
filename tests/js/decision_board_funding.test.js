@@ -28,9 +28,9 @@ function ticket(symbol, score = 90, overrides = {}) {
     advisor_note: 'Synthetic plan', detail: {rr: 2, rr_tp2: 3, funds_from: 'Cash'}}, overrides);
 }
 function payload(seats) {
-  const snapshot = {contract_version: 1, builder_version: '1.24.0', snapshot_id: 'synthetic-signed-id',
+  const snapshot = {contract_version: 1, builder_version: '1.24.1', snapshot_id: 'synthetic-signed-id',
     rows: seats.map(t => ({symbol: t.symbol})), xchecks: {}};
-  return {version: '1.24.0', status: 'ok', selected: seats,
+  return {version: '1.24.1', status: 'ok', selected: seats,
     candidates_rows: seats.map(t => ({symbol: t.symbol, opportunity_score: t.opportunity_score,
       verdict: 'INVEST', selected: true, structural_block: false})),
     kpis: {deployable_sar: 10000, expected_gain_12m_sar: 12345,
@@ -121,6 +121,32 @@ for (const failure of ['throw', 'http', 'version', 'snapshot', 'unsupported']) {
     assert(p.alerts.some(a => a.type === 'board_funding_unavailable'));
   });
 }
+for (const mode of ['research', 'unknown']) {
+check('rollout mode ' + mode + ' withholds replay and all monetary claims', () => {
+  const {ctx, properties} = context(); const p = payload([ticket('ACTIVE.SR')]);
+  properties.DT10_BOARD_FUNDING_MODE = mode;
+  ctx.dt10Post_ = () => {throw new Error('research-only mode must not request allocation');};
+  ctx.dt10ReallocateBoard_(p, request); ctx.dt10FinalizeBoard_(p); zeroMoney(ctx, p);
+  assert.equal(p.meta.board_funding.mode, 'research');
+  assert(ctx.dt10MetaLine_(p.meta).includes('funding=research/0exec'));
+  const once = JSON.stringify(p); ctx.dt10FinalizeBoard_(p); assert.equal(JSON.stringify(p), once);
+});
+}
+check('rollout brake changed after allocation still withholds at render finalization', () => {
+  const {ctx, properties} = context(); const p = payload([ticket('ACTIVE.SR')]);
+  ctx.dt10Post_ = () => allocated(p, [ticket('ACTIVE.SR')]);
+  ctx.dt10ReallocateBoard_(p, request);
+  properties.DT10_BOARD_FUNDING_MODE = 'research';
+  ctx.dt10FinalizeBoard_(p); zeroMoney(ctx, p);
+  assert.equal(p.meta.board_funding.finalized, false);
+});
+check('rollout control read failure withholds allocation and monetary claims', () => {
+  const {ctx} = context(); const p = payload([ticket('ACTIVE.SR')]);
+  ctx.PropertiesService.getScriptProperties = () => {throw new Error('synthetic property outage');};
+  ctx.dt10Post_ = () => {throw new Error('unknown rollout control must not allocate');};
+  ctx.dt10ReallocateBoard_(p, request); ctx.dt10FinalizeBoard_(p); zeroMoney(ctx, p);
+  assert.equal(p.meta.board_funding.mode, 'research');
+});
 check('feed withheld blocks replay and all funding even after successful allocation', () => {
   const {ctx} = context(); const p = payload([ticket('ACTIVE.SR')]);
   p._dt10_uv.state = 'NOT_ACTIONABLE';
