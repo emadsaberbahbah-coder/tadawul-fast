@@ -16,13 +16,26 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from core.provider_capabilities import provider_supports_instrument
 
 MAX_CLOCK_SKEW_SECONDS = 900  # Match the decision audit's existing 15 min allowance.
+DATA_VALIDITY_VERSION = "1.0.1"
+# v1.0.1 (2026-10-07): invalid-warning tokens must start a token. The
+#   unanchored v1.0.0 pattern matched 'identity_quarantined' inside the
+#   engine's fundamentals-only tag 'fund_identity_quarantined' (data_engine_v2
+#   AW-2: display identity stripped from the EODHD fundamentals side channel),
+#   so a row whose price was successfully acquired from Yahoo was classed
+#   INVALID, under-counting acquisition coverage on the sync stamp and in the
+#   full-refresh / decision-surface audits. Every real failure tag in the
+#   repo begins a token ('identity_quarantined:...', 'fetch_failed:...'), so
+#   the lookbehind only stops the fund_ collision. Not env-gated: the v1.0.0
+#   behaviour is a same-day defect with no safe use, and the change can only
+#   move a row from INVALID to its true state. Rollback: revert this block.
 # Fundamentals-only margin quarantine is retained for its own controls; it
 # does not invalidate a successfully acquired price or its provider evidence.
 _INVALID_WARNINGS = re.compile(
+    r"(?<![a-z0-9_])(?:"
     r"fetch_failed|empty_row_no_provider_data|identity_quarantined|"
     r"kept_last_good|no_data_stub|placeholder_stub|price_unverified_live|"
     r"price_bar_stale|operator_quarantine|pl1_quarantined|"
-    r"persist_sanity_quarantined|xprovider_price_conflict", re.I,
+    r"persist_sanity_quarantined|xprovider_price_conflict)", re.I,
 )
 _NONLIVE_PROVIDER = re.compile(
     r"fallback_error|placeholder|unavailable|history|snapshot|cache|last_good", re.I,

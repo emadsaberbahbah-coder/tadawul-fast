@@ -286,11 +286,13 @@ jobs:
             tests/test_quality_gates.py \
             tests/test_provider_capability_routing.py \
             tests/test_successful_acquisition_freshness.py \
+            tests/test_data_validity_token_anchor.py \
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
+            tests/test_ob_research_diversify.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
