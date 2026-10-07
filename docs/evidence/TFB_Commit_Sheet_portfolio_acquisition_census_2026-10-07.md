@@ -1,6 +1,8 @@
 # Portfolio acquisition census — synchronizer 6.64.5
 
-The deployed 6.64.4 page-driven portfolio path could write provider-priced rows while reporting `acquired=unknown/0`. The portfolio ledger header is below its title rows; the existing first-row holdings-injection reader safely no-ops, and the backend independently resolves the empty-symbol request. Acquisition capture previously required an explicit runner symbol list.
+The 6.64.6 active-target repair supersedes the fetch behavior described below. Subsequent live readback proved that an empty-symbol request selected unrelated default instruments, with no overlap with the trusted active ledger. Version 6.64.5 correctly exposed every holding as `response_missing`; its telemetry repair did not prove or fix the backend's holding selection. See [the active-target repair evidence](TFB_Commit_Sheet_portfolio_active_targets_2026-10-07.md).
+
+The deployed 6.64.4 page-driven portfolio path could write provider-priced rows while reporting `acquired=unknown/0`. The portfolio ledger header is below its title rows; the existing first-row holdings-injection reader no-ops, and the backend selects its own page rows for the empty-symbol request. Acquisition capture previously required an explicit runner symbol list.
 
 The repair independently proves the active ledger cohort before a page-driven portfolio fetch, using the coverage audit's active/inactive and quantity semantics. It validates the selected header, rejects ambiguous status/quantity evidence, and reuses that same frozen cohort for the originating and final shared acquisition censuses. Missing responses remain in the denominator; failed, preserved, stale and unknown price evidence cannot count as successful. Unreadable or unrecognized ledger evidence remains UNKNOWN. Successful response count and written count never determine the requested cohort.
 
