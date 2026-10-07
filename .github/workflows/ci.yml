@@ -287,6 +287,7 @@ jobs:
             tests/test_provider_capability_routing.py \
             tests/test_successful_acquisition_freshness.py \
             tests/test_data_validity_token_anchor.py \
+            tests/test_engine_unpriced_fill.py \
             tests/test_portfolio_acquisition_census.py \
             tests/test_portfolio_active_targets.py \
             tests/test_portfolio_ledger_labels.py \

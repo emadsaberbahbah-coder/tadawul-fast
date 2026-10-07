@@ -92,7 +92,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.151.3", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.151.4", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import

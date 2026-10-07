@@ -3881,7 +3881,26 @@ if str(ROOT_DIR) not in sys.path:
 # quote is unpriced, later empty shells cannot erase an earlier fetch failure.
 # v5.151.3 (2026-10-07): Yahoo chart-provider symbol-local misses no longer
 # consume the global outage breaker. Engine routing/proof/policy is unchanged.
-__version__ = "5.151.3"
+# v5.151.4 (2026-10-07) [UNPRICED-PATCH FILL] - gated, default OFF.
+# WHY: v5.151.2 (#722) stopped merging a provider patch that carries no
+#   positive price, so a failed realtime quote (e.g. EODHD HTTP 429) no longer
+#   leaks its identity/timestamp/error into a row priced by a later provider.
+#   It also discarded the patch's name, sector and fundamentals, which the
+#   v5.151.0 merge kept. Synthetic AAPL.US (EODHD unpriced, Yahoo priced):
+#   5.151.0 name/sector/market_cap/pe_ttm/eps_ttm present; 5.151.3 all None.
+#   The 2026-10-07 evening Full Refresh Coverage run reports name coverage
+#   97.93% (Global_Markets) and 98.02% (Mutual_Funds) against a 99% bar.
+# WHAT (one site, the quote factory): with TFB_ENGINE_UNPRICED_FILL=1, once a
+#   later provider has priced the row, the unpriced patches fill ONLY blank
+#   identity-display and fundamentals fields (_UNPRICED_FILL_FIELDS), after the
+#   priced merge so the priced provider wins every conflict. Price, OHLC,
+#   volume, currency, timestamps, provenance, analyst targets, 52-week levels,
+#   errors and warnings are never taken. A patch whose declared identity is
+#   disjoint from the requested symbol (AU-1) is skipped. Each provider that
+#   filled anything is tagged unpriced_fill:<provider>.
+# OFF (unset/0): byte-identical v5.151.3. Functions added: 1
+#   (_unpriced_fill_enabled). Removed: 0. Rollback: unset the env.
+__version__ = "5.151.4"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -11247,6 +11266,23 @@ def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Op
     return declared[0]
 
 
+_UNPRICED_FILL_FIELDS: Tuple[str, ...] = (
+    "name", "asset_class", "exchange", "country", "sector", "industry",
+    "market_cap", "float_shares", "beta_5y", "pe_ttm", "pe_forward", "eps_ttm",
+    "dividend_yield", "payout_ratio", "revenue_ttm", "revenue_growth_yoy",
+    "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
+    "free_cash_flow_ttm", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "avg_volume_10d", "avg_volume_30d",
+)
+
+
+def _unpriced_fill_enabled() -> bool:
+    """v5.151.4: fill blank identity/fundamentals from unpriced quote patches
+    after a later provider priced the row. Default OFF; =1/true/on/yes arms.
+    OFF => v5.151.3 byte-identical."""
+    return os.getenv("TFB_ENGINE_UNPRICED_FILL", "").strip().lower() in ("1", "true", "on", "yes")
+
+
 def _fund_identity_guard_enabled() -> bool:
     """v5.112.0 (Fix AW): identity guard on the EODHD fundamentals fallback
     channel — the ONLY patch channel that carried no AU-1 check while its
@@ -17573,6 +17609,7 @@ class DataEngineV5:
             unpriced_attempts: List[str] = []
             terminal_quote_patch: Dict[str, Any] = {}
             terminal_quote_failures: List[str] = []
+            unpriced_patches: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
             for provider_name in price_providers:
                 patch = await self._fetch_patch(provider_name, sym, page_ctx)
                 if not patch:
@@ -17599,6 +17636,7 @@ class DataEngineV5:
                         if "fetch_failed" in warning.lower()
                     )
                     unpriced_attempts.append(provider_name)
+                    unpriced_patches.append((provider_name, patch, canon_patch))
                     continue
                 merged = self._merge(merged, canon_patch)
                 # v5.107.0 (Fix AT): the provenance label belongs to the
@@ -17626,6 +17664,25 @@ class DataEngineV5:
                     _aq_append_warning(merged, terminal_failure)
             for attempted_provider in unpriced_attempts:
                 _aq_append_warning(merged, "quote_attempt:" + attempted_provider + ":unpriced")
+            # v5.151.4 [UNPRICED-PATCH FILL] (gated, default OFF): restore the
+            # identity/fundamentals an unpriced patch carried, fill-only and
+            # after the priced merge so the priced provider wins conflicts.
+            _uf_price = _as_float(merged.get("current_price"))
+            if unpriced_patches and _uf_price is not None and _uf_price > 0 \
+                    and _unpriced_fill_enabled():
+                for _uf_provider, _uf_raw, _uf_patch in unpriced_patches:
+                    if _engine_patch_identity_mismatch(sym, _uf_raw):
+                        continue
+                    _uf_filled = False
+                    for _uf_key in _UNPRICED_FILL_FIELDS:
+                        _uf_val = _uf_patch.get(_uf_key)
+                        if _uf_val is None or _uf_val == "":
+                            continue
+                        if merged.get(_uf_key) in (None, "", [], {}):
+                            merged[_uf_key] = _uf_val
+                            _uf_filled = True
+                    if _uf_filled:
+                        _aq_append_warning(merged, "unpriced_fill:" + _uf_provider)
 
             # --- v5.105.0 (Fix AR-2) BAR-AGE PROVIDER FAILOVER ---------------
             # The loop above stops at the first provider with a price; when
