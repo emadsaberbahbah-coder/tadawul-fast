@@ -104,7 +104,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.64.7", "dashboard sync"),
+    ("run_dashboard_sync", "6.64.8", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.4.0", "workbook backup"),
     ("pit_snapshot", "1.1.0", "pit snapshot"),

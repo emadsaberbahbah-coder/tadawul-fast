@@ -290,6 +290,7 @@ jobs:
             tests/test_portfolio_acquisition_census.py \
             tests/test_portfolio_active_targets.py \
             tests/test_portfolio_ledger_labels.py \
+            tests/test_pf_minor_unit_ccy_guard.py \
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
             tests/test_sync_fetchfail_truth_p162.py \
