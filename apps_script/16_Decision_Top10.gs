@@ -1,11 +1,21 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.11.13 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.12.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.12.1 (2026-10-07) -- FINAL BOARD FUNDING AND REPLAY HARDENING
+ * Qualify research without reserving cash, advance stability once, then fund
+ * only eligible final seats through the signed frozen backend replay. Grace,
+ * research and withheld seats carry zero money; KPIs and logs follow final
+ * actions. Builder 1.24.1 binds execution policy, active auth and Render SHA.
+ * DT10_BOARD_FUNDING_MODE=research is the reversible zero-allocation brake;
+ * unknown values or property-read failures also withhold allocation.
+ * Install this complete file, run dt10SelfTest(), then refreshDecisionTop10()
+ * and verify the live footer plus HELD zero-execution money fields.
  *
  * ============================================================================
  * v1.11.13 (2026-10-05) [P-202] -- HOTFIX: ONE PROPERTY READ PER EXECUTION
