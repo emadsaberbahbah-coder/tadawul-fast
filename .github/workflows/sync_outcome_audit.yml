@@ -6,12 +6,14 @@ on:
       - '.github/workflows/sync_outcome_audit.yml'
       - 'scripts/audit_sync_outcome.py'
       - 'tests/test_sync_outcome_audit.py'
+      - 'tests/test_sync_audit_cancelled_source.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/sync_outcome_audit.yml'
       - 'scripts/audit_sync_outcome.py'
       - 'tests/test_sync_outcome_audit.py'
+      - 'tests/test_sync_audit_cancelled_source.py'
   workflow_run:
     workflows: ['🏦 Tadawul Dashboard Advanced Sync']
     types: [completed]
@@ -46,10 +48,13 @@ jobs:
           python-version: '3.11'
 
       - name: Compile auditor
-        run: python -m py_compile scripts/audit_sync_outcome.py tests/test_sync_outcome_audit.py
+        run: python -m py_compile scripts/audit_sync_outcome.py tests/test_sync_outcome_audit.py tests/test_sync_audit_cancelled_source.py
 
       - name: Run regression tests
         run: python -m unittest tests/test_sync_outcome_audit.py
+
+      - name: Run cancelled-source gate harness
+        run: python tests/test_sync_audit_cancelled_source.py
 
   audit-scheduled-run:
     name: Verify required market pages actually refreshed
@@ -83,10 +88,30 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           INPUT_RUN_ID: ${{ inputs.run_id }}
+          TFB_SYNC_AUDIT_ACCEPT_CANCELLED: ${{ vars.TFB_SYNC_AUDIT_ACCEPT_CANCELLED || '0' }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             RUN_ID="$WORKFLOW_RUN_ID"
+            # (2026-10-07) A 'cancelled' RUN CAN CARRY A COMPLETE REFRESH.
+            # Evidence: scheduled Daily Sync 37612073997 (2026-10-07 11:08Z,
+            # sha 26fe496). All three matrix legs (core-pages, mutual-funds,
+            # global-markets) and recover-missing-market-pages concluded
+            # 'success' and uploaded their logs; the only non-success job was
+            # 'Run verdict' (job 112789049165), whose if: needed a failure or
+            # cancellation and which was marked 'cancelled' with no runner at
+            # 12:21:46Z - the same second the pending workflow_dispatch run
+            # 37619602053 took the shared production-write lease. The run
+            # therefore concluded 'cancelled' and this audit (37620447754)
+            # refused it in this step without reading the evidence.
+            # Auditing a cancelled run cannot manufacture a pass: the auditor
+            # exits 3 when no sync log exists and 2 when any required page
+            # verdict is missing, failed or (full-fetch gate) incomplete.
+            # Gate: repo variable TFB_SYNC_AUDIT_ACCEPT_CANCELLED=1 audits
+            # 'cancelled' like 'failure'. Default '0' keeps the previous
+            # refusal, message and exit code unchanged. 'skipped' and
+            # 'timed_out' are still refused either way.
+            # Rollback: unset the variable (or set it to 0).
             # (2026-10-06) A FAILED SYNC IS EXACTLY WHEN THIS AUDIT IS NEEDED.
             # Evidence: run 37370684206 (2026-10-05 20:17 slot) concluded
             # 'failure' because the global-markets MATRIX LEG was cancelled
@@ -107,6 +132,14 @@ jobs:
             case "$WORKFLOW_CONCLUSION" in
               success|failure)
                 echo "Upstream Daily Sync concluded '$WORKFLOW_CONCLUSION' - auditing."
+                ;;
+              cancelled)
+                if [[ "${TFB_SYNC_AUDIT_ACCEPT_CANCELLED:-0}" == "1" ]]; then
+                  echo "Upstream Daily Sync concluded 'cancelled' - auditing uploaded evidence (TFB_SYNC_AUDIT_ACCEPT_CANCELLED=1)."
+                else
+                  echo "::error::Source Daily Sync run concluded '$WORKFLOW_CONCLUSION'."
+                  exit 1
+                fi
                 ;;
               *)
                 echo "::error::Source Daily Sync run concluded '$WORKFLOW_CONCLUSION'."

@@ -33,6 +33,7 @@
 #     tests/test_tp_dedup_matured_p189b.py      (P-189b matured duplicates)
 #     tests/test_tp_zero_baseline_p201.py       (P-201 zero-forecast baseline)
 #     tests/test_sync_outcome_audit.py          (did the pages refresh?)
+#     tests/test_sync_audit_cancelled_source.py (cancelled-source audit gate)
 #     tests/test_verify_manifest_pins.py        (deployment-manifest drift)
 # - WHY THEY COULD NOT BE ADDED BEFORE, and what changed: the four
 #   track_performance harnesses each load the module with importlib, and the
@@ -297,6 +298,7 @@ jobs:
             tests/test_top10_selector.py \
             tests/test_learning_guards.py \
             tests/test_sync_outcome_audit.py \
+            tests/test_sync_audit_cancelled_source.py \
             tests/test_verify_manifest_pins.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
