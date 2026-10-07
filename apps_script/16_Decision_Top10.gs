@@ -1,11 +1,18 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.12.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.12.2 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.12.2 (2026-10-07) -- FINAL CASH-FLOOR OBSERVATION DENOMINATOR
+ * Cash-floor sizing/loss observations use only final executable displayed
+ * tickets, including a zero-eligible board or late render-time withholding.
+ * Existing cash policy context, reserve, budgets and allocation are unchanged.
+ * Observe alerts retain their backend policy head and pre/post budgets while
+ * their seat/loss tail follows the final board. No alert or floor is invented.
  *
  * v1.12.1 (2026-10-07) -- FINAL BOARD FUNDING AND REPLAY HARDENING
  * Qualify research without reserving cash, advance stability once, then fund
@@ -1562,7 +1569,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.12.1';
+var DT10_VERSION = '1.12.2';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -1693,6 +1700,53 @@ function dt10ReallocateBoard_(payload, body) {
     delete funding.snapshot;
   }
 }
+/** Python round(value, 0) parity for the displayed-ticket observation basis. */
+function dt10CashFloorRound_(value) {
+  var base = Math.floor(value);
+  if (value - base === 0.5) return base % 2 === 0 ? base : base + 1;
+  return Math.round(value);
+}
+/** Preserve the backend policy head and pre/post wording; refresh only its
+ * observation tail. Unsupported wording gets an explicit final-board tail. */
+function dt10CashFloorObserveText_(original, floor) {
+  var shortSar = Number(floor.would_unfund_sar || 0).toFixed(0)
+      .replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' SAR';
+  var tail = floor.would_unfund_seats + ' of ' + floor.seats_sized +
+      ' sized seat(s) would lose funding (' + shortSar + '). No ticket changed.';
+  var text = String(original || ''), marker = text.indexOf(' (observe):');
+  var separator = marker >= 0 ? text.indexOf(';', marker) : -1;
+  if (separator >= 0) return text.slice(0, separator) + '; ' + tail;
+  var head = marker >= 0 ? text.slice(0, marker) : 'Cash floor';
+  return head + ' (observe): final executable board; ' + tail;
+}
+/** Observation only: mirror backend _cash_floor_finalize on final tickets.
+ * No sizing, policy context, reserves or budget fields are changed. */
+function dt10FinalizeCashFloor_(payload, executable) {
+  var floor = payload.meta && payload.meta.cash_floor;
+  if (!floor || typeof floor !== 'object' || Array.isArray(floor)) return payload;
+  floor.seats_sized = executable.length;
+  if (floor.mode !== 'observe') return payload;
+  var post = Number(floor.deployable_post_sar || 0), cumulative = 0, seats = 0, short = 0;
+  executable.forEach(function (t) {
+    var size = dt10CashFloorRound_(Number(t.suggested_sar || 0));
+    cumulative += size;
+    if (size > 0 && cumulative > post + 0.5) {
+      seats += 1;
+      short += Math.min(size, cumulative - post);
+    }
+  });
+  floor.would_unfund_seats = seats;
+  floor.would_unfund_sar = dt10CashFloorRound_(short);
+  if (Array.isArray(payload.alerts)) payload.alerts = payload.alerts.map(function (alert) {
+    if (!alert || alert.type !== 'cash_floor') return alert;
+    var out = {};
+    Object.keys(alert).forEach(function (key) { out[key] = alert[key]; });
+    out.count = seats;
+    out.required_action = dt10CashFloorObserveText_(alert.required_action, floor);
+    return out;
+  });
+  return payload;
+}
 /** Idempotent: every monetary aggregate and narrative uses final actions. */
 function dt10FinalizeBoard_(payload) {
   payload.kpis = payload.kpis || {};
@@ -1773,6 +1827,7 @@ function dt10FinalizeBoard_(payload) {
   payload.meta.board_execution = {executable_count: executable.length,
       spend_sar: k.total_suggested_sar, gain_sar: k.expected_gain_12m_sar,
       allocation_finalized: funding.finalized === true};
+  dt10FinalizeCashFloor_(payload, executable);
   return payload;
 }
 /* v1.11.1 (2026-09-03) — MORNING TRIGGER TARGET RESTORED + OUTPUT TRUTH
