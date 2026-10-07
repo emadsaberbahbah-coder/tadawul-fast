@@ -305,6 +305,7 @@ jobs:
             tests/test_task_error_redaction.py \
             tests/test_de_forecast_score_basis.py \
             tests/test_portfolio_fee_basis.py \
+            tests/test_portfolio_blank_fee_witness.py \
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
