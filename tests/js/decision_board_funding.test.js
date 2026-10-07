@@ -233,4 +233,289 @@ check('weighted KPI verification uses executable seats and preserves unknown par
   assert.equal(p.kpis.engine_expected_gain_12m_sar, null);
   assert.equal(ctx.dt10KpiCheckNote_(p), '');
 });
+
+/* Final cash-floor observations use the final executable list. The oracle runs
+ * the unchanged real Python backend once; no HTTP, credentials, or saved data. */
+function cashContext(post = 1000, mode = 'observe', updates = {}) {
+  return Object.assign({mode, pct: 10, nav_sar: 50000, pct_floor_sar: 5000,
+    abs_floor_sar: 200, floor_sar: 5000, deployable_pre_sar: 9000,
+    deployable_post_sar: post, seats_sized: 9, would_unfund_seats: 8,
+    would_unfund_sar: 777, synthetic_preserve_marker: {keep: true}}, updates);
+}
+function cashCase(name, values, post = 1000, mode = 'observe', updates = {}) {
+  return {name, ctx: cashContext(post, mode, updates), picked: values.map((value, i) =>
+    ticket('ROUND' + i + '.SR', 90-i, {suggested_sar: value, suggested_shares: 1}))};
+}
+const cashCases = [
+  cashCase('zero executable', []),
+  cashCase('single under budget', [999]),
+  cashCase('single exact budget', [1000]),
+  cashCase('single over budget', [1001]),
+  cashCase('all integers fit', [200, 300, 500]),
+  cashCase('partial crossing then full seat', [600, 600, 400]),
+  cashCase('ordered crossing first permutation', [800, 300, 100]),
+  cashCase('ordered crossing second permutation', [100, 300, 800]),
+  cashCase('zero post budget', [1, 2, 3], 0),
+  cashCase('large post budget', [1, 2, 3], 100000),
+  cashCase('exact post plus half tolerance', [1000], 999.5),
+  cashCase('above post plus half tolerance', [1000], 999.499999999),
+  cashCase('below post plus half tolerance', [1000], 999.500000001),
+  cashCase('cumulative final tolerance seat', [400, 600], 999.5),
+  cashCase('ticket just below half', [1000.499999999]),
+  cashCase('ticket even half rounds down', [1000.5]),
+  cashCase('ticket odd half rounds up', [1001.5]),
+  cashCase('ticket just above half', [1000.500000001]),
+  cashCase('displayed shortfall half sum', [1000, 1], 999.5),
+  cashCase('shortfall even half', [1000], 997.5),
+  cashCase('shortfall odd half', [1000], 998.5),
+  cashCase('small half-even ticket sizes', [0.5, 1.5, 2.5, 3.5], 4),
+  cashCase('zero raw backend picked value', [0]),
+  cashCase('null raw backend picked value', [null]),
+  cashCase('integer and fractional combination', [101, 99.49, 200.5, 299.51], 500),
+  cashCase('absolute reserve stricter', [600, 600], 1000, 'observe',
+    {abs_floor_sar: 6000, floor_sar: 6000}),
+  cashCase('fractional policy formatting remains exact', [600, 600], 1000, 'observe',
+    {pct: 12.345, nav_sar: 54321.49, pct_floor_sar: 6789.01,
+      abs_floor_sar: 987.655, floor_sar: 6789.01, deployable_pre_sar: 9999.5}),
+  cashCase('missing post value is zero', [100], 1000, 'observe', {deployable_post_sar: null}),
+  cashCase('enforce selected', [600, 600], 1000, 'enforce'),
+  cashCase('enforce empty', [], 1000, 'enforce'),
+  cashCase('off selected', [600, 600], 1000, 'off'),
+  cashCase('off empty', [], 1000, 'off'),
+  cashCase('final mixed board executable subset', [600, 600]),
+  cashCase('later rendering withholds all executables', [])
+];
+const roundValues = [0, 0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5,
+  1000.499999999, 1000.5, 1001.5, 1000.500000001];
+function backendCashOracle(cases) {
+  const {spawnSync} = require('node:child_process');
+  const program = String.raw`
+import copy, json, sys
+from core.analysis import opportunity_builder as ob
+body = json.load(sys.stdin)
+rows = []
+for case in body['cases']:
+    initial = copy.deepcopy(case['ctx'])
+    initial_alert = ob._cash_floor_alert_text(initial)
+    final = ob._cash_floor_finalize(copy.deepcopy(initial), copy.deepcopy(case['picked']))
+    rows.append({'name': case['name'], 'ctx': final, 'initial_alert': initial_alert,
+                 'alert': ob._cash_floor_alert_text(final)})
+print(json.dumps({'cases': rows, 'rounds': [round(float(v), 0) for v in body['rounds']]}))
+`;
+  const response = spawnSync(process.env.PYTHON || 'python', ['-c', program], {
+    cwd: path.join(__dirname, '../..'),
+    input: JSON.stringify({cases, rounds: roundValues}), encoding: 'utf8', timeout: 30000
+  });
+  assert.equal(response.status, 0, 'real backend cash-floor oracle: ' + response.stderr);
+  return JSON.parse(response.stdout);
+}
+const cashOracle = backendCashOracle(cashCases);
+function addCashAlert(p, ctx, initialAction) {
+  p.meta.cash_floor = copy(ctx);
+  p.alerts.push({type: 'cash_floor', count: ctx.would_unfund_seats,
+    required_action: initialAction, synthetic_alert_marker: 'keep'});
+  return p;
+}
+function onlyCashAlert(p) {
+  const alerts = p.alerts.filter(a => a.type === 'cash_floor');
+  assert.equal(alerts.length, 1); return alerts[0];
+}
+function stableCashPolicy(before, after) {
+  const immutable = Object.keys(before).filter(key => ![
+    'seats_sized', 'would_unfund_seats', 'would_unfund_sar'].includes(key));
+  immutable.forEach(key => assert.deepEqual(copy(after[key]), copy(before[key]), key));
+}
+function zeroFinalCash(p) {
+  assert.equal(p.meta.cash_floor.seats_sized, 0);
+  assert.equal(p.meta.cash_floor.would_unfund_seats, 0);
+  assert.equal(p.meta.cash_floor.would_unfund_sar, 0);
+  const alert = onlyCashAlert(p);
+  assert.equal(alert.count, 0);
+  assert(alert.required_action.includes('0 of 0 sized seat(s) would lose funding (0 SAR).'));
+  assert(alert.required_action.endsWith('No ticket changed.'));
+}
+check('cash-floor banker rounding matches Python including negative and neighboring half values', () => {
+  const {ctx} = context();
+  // Signed zero has the same cash value and displayed amount.
+  assert.deepEqual(roundValues.map(v => ctx.dt10CashFloorRound_(v) || 0),
+    cashOracle.rounds.map(v => v || 0));
+});
+cashCases.forEach((test, i) => check('cash-floor real backend parity: ' + test.name, () => {
+  const {ctx} = context();
+  const p = addCashAlert(payload(copy(test.picked)), test.ctx, cashOracle.cases[i].initial_alert);
+  const immutable = copy(p), executables = copy(test.picked), beforeTickets = copy(executables);
+  ctx.dt10Post_ = () => {throw new Error('pure cash-floor observation must never allocate');};
+  ctx.dt10BoardEligible_ = () => {throw new Error('observation must not add an eligibility gate');};
+  ctx.dt10BoardFundingMode_ = () => {throw new Error('observation must not change rollout policy');};
+  ctx.dt10FinalizeCashFloor_(p, executables);
+  assert.deepEqual(copy(p.meta.cash_floor), cashOracle.cases[i].ctx);
+  assert.deepEqual(executables, beforeTickets);
+  assert.deepEqual(p.selected, immutable.selected); assert.deepEqual(p.kpis, immutable.kpis);
+  assert.deepEqual(p.near_miss, immutable.near_miss);
+  assert.deepEqual(p.meta.board_funding, immutable.meta.board_funding);
+  assert.deepEqual(p._dt10_uv, immutable._dt10_uv);
+  const withoutCashObservation = value => {
+    const out = copy(value); delete out.meta.cash_floor;
+    out.alerts = out.alerts.filter(a => a.type !== 'cash_floor'); return out;
+  };
+  assert.deepEqual(withoutCashObservation(p), withoutCashObservation(immutable));
+  stableCashPolicy(test.ctx, p.meta.cash_floor);
+  const alert = onlyCashAlert(p);
+  assert.equal(alert.synthetic_alert_marker, 'keep');
+  assert.equal(alert.required_action, test.ctx.mode === 'observe' ?
+    cashOracle.cases[i].alert : cashOracle.cases[i].initial_alert);
+  assert.equal(alert.count, test.ctx.mode === 'observe' ?
+    cashOracle.cases[i].ctx.would_unfund_seats : test.ctx.would_unfund_seats);
+  assert.deepEqual(p.alerts.filter(a => a.type !== 'cash_floor'),
+    immutable.alerts.filter(a => a.type !== 'cash_floor'));
+  const once = JSON.stringify(p);
+  ctx.dt10FinalizeCashFloor_(p, executables); assert.equal(JSON.stringify(p), once);
+}));
+check('research cash-floor sizing is cleared by final grace and suspended board without replay', () => {
+  const {ctx} = context();
+  const p = addCashAlert(payload([
+    ticket('GRACE_CASH.SR', 99, {_grace_hold: true, _stab_status: 'GRACE (1/3 missed)'}),
+    ticket('FAST_CASH.SR', 95, {_ft_suspended: true}),
+    ticket('RISK_CASH.SR', 90, {_p145_suspended: true})
+  ]), cashContext(1000, 'observe', {seats_sized: 1, would_unfund_seats: 1, would_unfund_sar: 9000}),
+  'Cash floor 10% of NAV 50,000 SAR = 5,000 SAR (observe): deployable would fall 9,000 SAR -> 1,000 SAR; 1 of 1 sized seat(s) would lose funding (9,000 SAR). No ticket changed.');
+  const policy = copy(p.meta.cash_floor), otherAlerts = p.alerts.filter(a => a.type === 'missing_fx');
+  ctx.dt10Post_ = () => {throw new Error('no final eligible seat: no allocation HTTP');};
+  ctx.dt10ReallocateBoard_(p, request); ctx.dt10FinalizeBoard_(p);
+  zeroMoney(ctx, p); zeroFinalCash(p); stableCashPolicy(policy, p.meta.cash_floor);
+  assert.deepEqual(p.alerts.filter(a => a.type === 'missing_fx'), otherAlerts);
+  const once = JSON.stringify(p); ctx.dt10FinalizeBoard_(p); assert.equal(JSON.stringify(p), once);
+});
+check('successful replay cash-floor uses only final seats in board order and rounded ticket sizes', () => {
+  const {ctx} = context();
+  const seats = [ticket('HOLD_CASH.SR', 99, {_ft_suspended: true}),
+    ticket('ONE_CASH.SR', 90), ticket('TWO_CASH.SR', 80), ticket('THREE_CASH.SR', 70),
+    ticket('ZERO_CASH.SR', 60)];
+  const p = payload(seats), cf = cashContext(4001.5);
+  const expected = [2000.5, 2001.5, 3000.5].map((amount, i) =>
+    ticket(['ONE_CASH.SR', 'TWO_CASH.SR', 'THREE_CASH.SR'][i], 90-i*10,
+      {suggested_sar: amount, suggested_shares: 1}));
+  let calls = 0;
+  ctx.dt10Post_ = body => {
+    calls++; assert.deepEqual(copy(body.criteria.board_funding_symbols),
+      ['ONE_CASH.SR', 'TWO_CASH.SR', 'THREE_CASH.SR', 'ZERO_CASH.SR']);
+    const reply = allocated(p, expected.concat(ticket('ZERO_CASH.SR', 60,
+      {suggested_sar: 20000, suggested_shares: 0})));
+    reply.json.meta.cash_floor = copy(cf);
+    reply.json.alerts.push({type: 'cash_floor', count: 8,
+      required_action: 'Cash floor 10% of NAV 50,000 SAR = 5,000 SAR (observe): deployable would fall 9,000 SAR -> 4,002 SAR; 8 of 9 sized seat(s) would lose funding (777 SAR). No ticket changed.'});
+    return reply;
+  };
+  ctx.dt10ReallocateBoard_(p, request); ctx.dt10FinalizeBoard_(p);
+  assert.equal(calls, 1); assert.equal(p.kpis.selected_count, 3);
+  assert.equal(p.meta.cash_floor.seats_sized, 3);
+  assert.equal(p.meta.cash_floor.would_unfund_seats, 1);
+  assert.equal(p.meta.cash_floor.would_unfund_sar, 3000);
+  stableCashPolicy(cf, p.meta.cash_floor);
+  assert.deepEqual(p.selected.filter(t => t.suggested_shares > 0).map(t => t.suggested_sar),
+    expected.map(t => t.suggested_sar));
+  assert.equal(p.selected[0].suggested_sar, 0); assert.equal(p.selected[4].suggested_sar, 0);
+  const alert = onlyCashAlert(p);
+  assert.equal(alert.count, 1);
+  assert(alert.required_action.includes('deployable would fall 9,000 SAR -> 4,002 SAR; 1 of 3'));
+  assert(alert.required_action.includes('would lose funding (3,000 SAR). No ticket changed.'));
+  const once = JSON.stringify(p); ctx.dt10FinalizeBoard_(p);
+  assert.equal(JSON.stringify(p), once); assert.equal(calls, 1);
+});
+for (const reason of ['feed before replay', 'feed after replay', 'mode before replay',
+  'mode after replay', 'control read failure', 'replay failure']) {
+  check('cash-floor final executable denominator cleared on ' + reason, () => {
+    const {ctx, properties} = context();
+    const p = addCashAlert(payload([ticket('ACTIVE_CASH.SR')]), cashContext(),
+      cashOracle.cases[0].initial_alert);
+    const policy = copy(p.meta.cash_floor);
+    let calls = 0;
+    ctx.dt10Post_ = () => {
+      calls++;
+      if (reason === 'replay failure') throw new Error('synthetic replay failure');
+      const reply = allocated(p, [ticket('ACTIVE_CASH.SR')]);
+      reply.json.meta.cash_floor = copy(policy);
+      reply.json.alerts.push(copy(onlyCashAlert(p)));
+      return reply;
+    };
+    if (reason === 'feed before replay') p._dt10_uv.state = 'NOT_ACTIONABLE';
+    if (reason === 'mode before replay') properties.DT10_BOARD_FUNDING_MODE = 'research';
+    if (reason === 'control read failure') ctx.PropertiesService.getScriptProperties = () => {
+      throw new Error('synthetic property outage');
+    };
+    ctx.dt10ReallocateBoard_(p, request);
+    if (reason === 'feed after replay') p._dt10_uv.state = 'NOT_ACTIONABLE';
+    if (reason === 'mode after replay') properties.DT10_BOARD_FUNDING_MODE = 'research';
+    ctx.dt10FinalizeBoard_(p); zeroMoney(ctx, p); zeroFinalCash(p);
+    stableCashPolicy(policy, p.meta.cash_floor);
+    assert.equal(calls, ['feed after replay', 'mode after replay', 'replay failure'].includes(reason) ? 1 : 0);
+    const once = JSON.stringify(p); ctx.dt10FinalizeBoard_(p);
+    assert.equal(JSON.stringify(p), once);
+  });
+}
+check('missing cash-floor metadata or alert never creates a reserve policy or a countable alert', () => {
+  const {ctx} = context();
+  const p = payload([ticket('NO_FLOOR.SR')]), before = copy(p);
+  ctx.dt10FinalizeCashFloor_(p, p.selected);
+  assert.deepEqual(p, before); assert(!p.meta.hasOwnProperty('cash_floor'));
+  p.meta.cash_floor = cashContext();
+  ctx.dt10FinalizeCashFloor_(p, []);
+  assert.equal(p.meta.cash_floor.seats_sized, 0);
+  assert(!p.alerts.some(a => a.type === 'cash_floor'));
+});
+check('unexpected observe wording emits final facts without invented policy arithmetic or stale counts', () => {
+  const {ctx} = context();
+  const p = addCashAlert(payload([]), cashContext(),
+    'Synthetic older message: 8 of 9 sized seat(s) would lose funding (777 SAR).');
+  ctx.dt10FinalizeCashFloor_(p, []);
+  const action = onlyCashAlert(p).required_action;
+  assert(action.includes('0 of 0 sized seat(s) would lose funding (0 SAR).'));
+  assert(!action.includes('8 of 9')); assert(!action.includes('777'));
+  assert(!action.includes('50,000') && !action.includes('5,000') && !action.includes('9,000'));
+  const once = JSON.stringify(p); ctx.dt10FinalizeCashFloor_(p, []);
+  assert.equal(JSON.stringify(p), once);
+});
+
+
+check('authoritative render feed withholding after successful replay clears displayed floor observations', () => {
+  const {ctx} = context();
+  const p = addCashAlert(payload([ticket('RENDER_CASH.SR')]), cashContext(),
+    cashOracle.cases[0].initial_alert);
+  const policy = copy(p.meta.cash_floor);
+  let calls = 0, verdictReads = 0;
+  ctx.dt10Post_ = () => {
+    calls++; assert.equal(calls, 1, 'renderer must not request a new allocation');
+    const reply = allocated(p, [ticket('RENDER_CASH.SR')]);
+    reply.json.meta.cash_floor = copy(policy);
+    reply.json.alerts.push(copy(onlyCashAlert(p)));
+    return reply;
+  };
+  ctx.dt10ReallocateBoard_(p, request);
+  assert.equal(calls, 1); assert.equal(p._dt10_uv.state, 'EXECUTABLE');
+  const writes = [], tables = [];
+  const range = new Proxy({}, {get(_target, method) {
+    if (method === 'setValues') return values => {writes.push(copy(values)); return range;};
+    return () => range;
+  }});
+  const sheet = {getMaxRows() {return 100;}, getMaxColumns() {return 60;},
+    getRange() {return range;}, getParent() {return {};}};
+  ctx.dt10BoardVerdict_ = () => {
+    verdictReads++; return {state: 'NOT_ACTIONABLE', reason: 'Synthetic final feed withholding'};
+  };
+  ctx.dt10WriteSection_ = (_sheet, row) => row + 1;
+  ctx.dt10WriteTable_ = (_sheet, row, headers, rows) => {
+    tables.push(copy({headers, rows})); return {firstDataRow: 0, count: 0, next: row + 1};
+  };
+  ctx.dt10RenderPayload_(sheet, p, {});
+  assert(verdictReads > 0); assert.equal(p._dt10_uv.state, 'NOT_ACTIONABLE');
+  assert.equal(calls, 1); zeroMoney(ctx, p); zeroFinalCash(p);
+  stableCashPolicy(policy, p.meta.cash_floor);
+  assert.equal(writes[0][0][1], 0); assert.equal(writes[0][0][7], 10000);
+  const displayed = JSON.stringify(tables);
+  assert(displayed.includes('0 of 0 sized seat(s) would lose funding (0 SAR).'));
+  assert(!displayed.includes('8 of 9') && !displayed.includes('777 SAR'));
+  const once = JSON.stringify(p); ctx.dt10RenderPayload_(sheet, p, {});
+  assert.equal(JSON.stringify(p), once); assert.equal(calls, 1);
+});
+
 console.log('Full-source final board funding: ' + passed + ' passed');
