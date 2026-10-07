@@ -298,7 +298,13 @@ def test_handler_wrapping_shared_idempotent_and_new_handlers():
     handler.setLevel(logging.WARNING)
     delegate = logging.Formatter("%(name)s %(levelname)s %(message)s")
     handler.setFormatter(delegate)
-    first, second = logging.Logger("first"), logging.Logger("second")
+    # Other suites may disable global logging. These emitters use an isolated
+    # manager so the formatter contract does not depend on process-wide state.
+    manager = logging.Manager(logging.RootLogger(logging.WARNING))
+    manager.setLoggerClass(logging.Logger)
+    first, second = manager.getLogger("first"), manager.getLogger("second")
+    first.setLevel(logging.WARNING)
+    second.setLevel(logging.WARNING)
     first.addHandler(handler)
     second.addHandler(handler)
     assert redaction.install_redaction_on_handlers(first, second, secret_values=(secret,)) == 1
