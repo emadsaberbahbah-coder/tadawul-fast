@@ -168,7 +168,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py tests/test_ycp_quote_breaker_isolation.py
           # W1A-6b (2026-08-18, external audit F-13 ACCEPTED): the OHLC
           # guard + _Run_Log + _Status contracts are merge-blocking. The
           # harness self-detects CI (no fixture exports) and runs its
