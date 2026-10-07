@@ -210,7 +210,8 @@ def test_actual_google_json_aliases(monkeypatch, name):
     assert json.loads(redaction.redact_text(raw))["project_id"] == "nonsecret-project"
 
 
-@pytest.mark.parametrize("name", ["GOOGLE_SHEETS_CREDENTIALS_B64", "GOOGLE_CREDENTIALS_B64"])
+@pytest.mark.parametrize("name", ["GOOGLE_SHEETS_CREDENTIALS_B64", "GOOGLE_CREDENTIALS_B64",
+                                  "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"])
 def test_actual_google_base64_aliases_resolve_private_leaf_without_file_reads(monkeypatch, name):
     secret = "synthetic-google-base64-private-78621"
     raw = base64.b64encode(json.dumps({"private_key": secret}).encode()).decode()
@@ -225,8 +226,9 @@ def test_actual_google_base64_aliases_resolve_private_leaf_without_file_reads(mo
 
 
 @pytest.mark.parametrize("raw", ["not-valid-base64!", "e30=", "/w=="])
-def test_malformed_or_empty_base64_credentials_never_break_diagnostics(monkeypatch, raw):
-    monkeypatch.setitem(redaction.os.environ, "GOOGLE_CREDENTIALS_B64", raw)
+@pytest.mark.parametrize("name", ["GOOGLE_CREDENTIALS_B64", "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"])
+def test_malformed_or_empty_base64_credentials_never_break_diagnostics(monkeypatch, raw, name):
+    monkeypatch.setitem(redaction.os.environ, name, raw)
     output = redaction.redact_text("raw echo " + raw + " HTTP 503")
     hidden(output, raw)
     assert output.endswith(" HTTP 503")

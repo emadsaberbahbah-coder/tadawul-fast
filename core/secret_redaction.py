@@ -132,7 +132,14 @@ def configured_secret_values() -> tuple[str, ...]:
             try:
                 values.extend(_json_secrets(json.loads(raw)))
             except (ValueError, TypeError, RecursionError):
-                pass
+                # The sync writer also accepts base64 JSON in these primary
+                # names, rather than requiring a *_B64 alias.
+                if name in {"GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"}:
+                    try:
+                        decoded = base64.b64decode("".join(raw.split()), validate=True).decode("utf-8")
+                        values.extend(_json_secrets(json.loads(decoded)))
+                    except (ValueError, UnicodeError, RecursionError):
+                        pass
     for name in _BASE64_JSON_ENV_NAMES:
         raw = os.environ.get(name, "")
         if raw:

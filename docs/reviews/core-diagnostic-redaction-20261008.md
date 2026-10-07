@@ -10,7 +10,8 @@ behavior; they do not claim that a production credential was exposed.
 The repair introduces a dependency-free diagnostic redactor and uses it only
 at those output boundaries. Caller-known credentials protect bare echoes;
 explicit runtime credential aliases protect configured values, including
-supported token lists and Google JSON/base64 forms. Context patterns cover
+supported token lists and Google JSON/base64 forms, including base64 accepted
+under the primary Google credential variable names. Context patterns cover
 unknown credential fields, authorization headers, URL userinfo, and private-key
 blocks. Redaction precedes truncation. Malformed and deeply nested diagnostic
 JSON cannot bypass redaction by breaking the formatter. Credential files are
@@ -45,7 +46,7 @@ source. There are no external HTTP calls.
 | EODHD request → quote/enriched diagnostics | 6 failed / 2 passed | 8 passed |
 | Caught route envelopes, engine error shells, single quotes | 13 failed / 6 passed | 19 passed |
 | Sync task read/write/guard failures and serialized reports | 3 failed | 3 passed |
-| Shared leaf redactor | New suite | 69 passed |
+| Shared leaf redactor | New suite | 77 passed |
 
 Baseline failures retain synthetic credentials; positive controls verify
 unchanged auth/status/retries, healthy rows, successful quote payloads,
@@ -58,9 +59,9 @@ serialization does not mutate the original warning or error state.
 Focused checks on the final source:
 
 - Exact Python 3.11 lean: redactor/task/manifest plus existing sync outcome and
-  successful-acquisition suites — **190 passed, 2 subtests passed**.
+  successful-acquisition suites — **198 passed, 2 subtests passed**.
 - Pinned Python 3.11 contract stack: all five security suites, manifest, existing
-  main health modes and board funding route — **142 passed**.
+  main health modes and board funding route — **150 passed**.
 - `git diff --check` — clean.
 
 The production blocking workflow must execute the actual httpx/FastAPI suites;
