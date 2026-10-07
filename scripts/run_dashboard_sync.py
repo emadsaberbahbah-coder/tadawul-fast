@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.4)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.5)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1842,7 +1842,10 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.4"
+SCRIPT_VERSION = "6.64.5"
+# v6.64.5: page-driven portfolio acquisition telemetry uses the independently
+# proven active ledger cohort, including missing responses. Fetch, holdings
+# injection, membership, preservation and configured policy remain unchanged.
 # v6.64.4: shared acquisition classification excludes the fundamentals-only
 # profit-margin quarantine. Its flag, fundamentals controls and configured
 # feed policy remain intact; genuine price/provenance failures still invalidate
@@ -3852,6 +3855,56 @@ def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, D
             continue
         out[sym] = {"qty": qty, "cost": cost}
     return out
+
+
+def _read_portfolio_acquisition_symbols(
+    sheets: "SheetsWriter", spreadsheet_id: str,
+) -> Optional[List[str]]:
+    """Prove the active acquisition cohort without changing holdings inputs.
+
+    The cost/quantity injection reader has its own narrower input contract.
+    A page-driven backend can still resolve holdings when that reader no-ops;
+    returned rows cannot prove how many holdings were requested. Reuse the
+    coverage audit's active-ledger parser, including its header-offset and
+    closed/zero-quantity handling. An unreadable/unrecognized or bounded-out
+    ledger leaves the cohort UNKNOWN, never inferred from successful rows.
+    """
+    try:
+        from scripts.audit_full_refresh_coverage import ledger_symbols
+
+        grid = sheets.read_values(spreadsheet_id, _COST_BASIS_SHEET, "A1:EZ20050")
+        if not isinstance(grid, list) or len(grid) >= 20050:
+            return None
+        # A known active/inactive status is required to prove a cohort of
+        # holdings rather than accidentally count historical closed lots.
+        ledger_header = next((i for i, row in enumerate(grid[:45])
+            if isinstance(row, list) and "symbol" in [_guard_norm(h) for h in row]
+            and "status" in [_guard_norm(h) for h in row]), None)
+        if ledger_header is None:
+            return None
+        names = [_guard_norm(h) for h in grid[ledger_header]]
+        if names.count("symbol") != 1 or names.count("status") != 1:
+            return None
+        quantity_columns = [i for i, name in enumerate(names) if name in _CB_QTY_ALIASES]
+        if len(quantity_columns) > 1:
+            return None
+        if quantity_columns and str(grid[ledger_header][quantity_columns[0]]).strip().casefold() not in {
+                "shares", "quantity", "position qty"}:
+            # Do not claim quantity-based membership the shared parser cannot
+            # interpret, or select one of contradictory quantity aliases.
+            return None
+        symbol_i, status_i = names.index("symbol"), names.index("status")
+        for row in grid[ledger_header + 1:]:
+            if not isinstance(row, list):
+                return None
+            if symbol_i < len(row) and str(row[symbol_i] or "").strip():
+                status = str(row[status_i] or "").strip().casefold() if status_i < len(row) else ""
+                if status not in {"active", "inactive", "closed", "sold"}:
+                    return None
+        active, warnings = ledger_symbols(grid[ledger_header:])
+        return None if warnings else active
+    except Exception:
+        return None
 
 
 def _inject_portfolio_holdings(
@@ -11123,6 +11176,7 @@ async def _run_one_task(
     _noncurrent_fetched_symbols: set = set()
     _fetchfail_origin_symbols: set = set()
     _acquired_origin_symbols: Optional[set] = None
+    _acquisition_requested_symbols: Optional[List[str]] = None
     _preserved_acquisition_symbols: set = set()
     symbols: List[str] = []
     rows_matrix: List[List[Any]] = []
@@ -11454,6 +11508,22 @@ async def _run_one_task(
         # ----------------------------------------------------------------------
 
         res.symbols_requested = len(symbols)
+        if task.sheet_name == "My_Portfolio" and not symbols:
+            # Keep the page-driven fetch and holdings injection contracts intact.
+            # This independently read roster exists only for factual telemetry.
+            _acquisition_requested_symbols = (
+                _read_portfolio_acquisition_symbols(sheets, spreadsheet_id)
+                if sheets is not None else None
+            )
+            if _acquisition_requested_symbols is not None:
+                res._stamp_meta["requested"] = len({
+                    canonicalize_symbol(symbol)
+                    for symbol in _acquisition_requested_symbols
+                })
+            else:
+                res.warnings.append("Portfolio active acquisition roster unavailable; acquisition evidence remains UNKNOWN.")
+        else:
+            _acquisition_requested_symbols = symbols
 
         # Dry run: still success-ish but no backend call and no write
         if dry_run:
@@ -11650,7 +11720,9 @@ async def _run_one_task(
                 "ff_new_fetched": len(_fetchfail_origin_symbols),
                 "pre_persist_rows": len(rows_matrix),
             })
-            _acquired_origin_symbols = _record_acquisition_census(res, headers, rows_matrix, symbols)
+            if _acquisition_requested_symbols is not None:
+                _acquired_origin_symbols = _record_acquisition_census(
+                    res, headers, rows_matrix, _acquisition_requested_symbols)
             rows_matrix, _critical_identity_failures = validate_fresh_critical_rows(
                 headers, rows_matrix, symbols
             )
@@ -11665,6 +11737,15 @@ async def _run_one_task(
                 )
                 res.warnings.append(_fresh_msg)
                 logger.error(_fresh_msg)
+
+        if (task.sheet_name == "My_Portfolio" and headers
+                and _acquisition_requested_symbols is not None
+                and _acquired_origin_symbols is None):
+            # Page-driven portfolio requests have no explicit symbol payload.
+            # Capture their actual originating rows against the proven roster
+            # before manual-cell guards or any last-good restoration.
+            _acquired_origin_symbols = _record_acquisition_census(
+                res, headers, rows_matrix, _acquisition_requested_symbols)
 
         # No creds => partial (data fetched but not written). Critical identity
         # validation has already run, so this path cannot report green when
@@ -12770,7 +12851,7 @@ async def _run_one_task(
         res.end_utc = _utc_now().isoformat()
         if _acquired_origin_symbols is not None:
             try:
-                _record_acquisition_census(res, headers, rows_matrix, symbols,
+                _record_acquisition_census(res, headers, rows_matrix, _acquisition_requested_symbols,
                     origins=_acquired_origin_symbols, noncurrent=_noncurrent_fetched_symbols)
             except Exception as exc:
                 res._stamp_meta["acquisition_known"] = False
