@@ -206,6 +206,49 @@ def test_on_research_respects_issuer_dedup_when_enabled():
     assert len(off) >= len(on), (off, on)
 
 
+def test_on_min_ticket_unfundable_seat_does_not_take_sector_slot():
+    # PR #730 review (Codex P1): E0 sizes to 15,000 SAR at the per-seat cap,
+    # below the 20,000 floor, so it can never be funded. It must not block E1.
+    ob = _load_builder()
+    rows = [_row("E0.SR", "Energy", 40), _row("E1.SR", "Energy", 35)]
+    rows[0]["current_price"], rows[0]["intrinsic_value"] = 15000.0, 21000.0
+    crit = {**CRIT, "max_per_sector": 1, "min_ticket_sar": 20000.0}
+    with _Env(**{GATE: "1"}):
+        single = _funded(_single(ob, rows, crit))
+        res, board, alloc = _board_then_allocate(ob, rows, crit)
+    assert single == [("E1.SR", 25000.0)], single
+    assert board == ["E1.SR"], board
+    assert _funded(alloc) == single, _funded(alloc)
+    assert "E0.SR" not in [t["symbol"] for t in res["selected"]]
+
+
+def test_on_venue_lot_unfundable_seat_does_not_take_sector_slot():
+    ob = _load_builder()
+    rows = [_row("E0.T", "Energy", 40), _row("E1.SR", "Energy", 35)]
+    rows[0]["current_price"], rows[0]["intrinsic_value"] = 300.0, 420.0
+    crit = {**CRIT, "max_per_sector": 1}
+    with _Env(**{GATE: "1", "TFB_T10_VENUE_LOTS": "T:100"}):
+        single = _funded(_single(ob, rows, crit))
+        _res, board, alloc = _board_then_allocate(ob, rows, crit)
+    assert single == [("E1.SR", 25000.0)], single
+    assert board == ["E1.SR"], board
+    assert _funded(alloc) == single, _funded(alloc)
+
+
+def test_on_cash_limited_seats_stay_on_research_board():
+    # A seat short of CASH (not structurally unfundable) keeps its research
+    # seat so the capital-call path still sees it.
+    ob = _load_builder()
+    crit = {**CRIT, "min_ticket_sar": 5000.0}
+    with _Env(**{GATE: "1"}):
+        res = ob.build_opportunity_payload(
+            copy.deepcopy(ROWS), criteria={**crit, "board_funding_stage": "research"},
+            portfolio={"cash_available_sar": 1000.0, "portfolio_value_sar": 200000.0},
+            fx_rates=dict(FX))
+    syms = [t["symbol"] for t in res["selected"]]
+    assert syms == ["E0.SR", "E1.SR", "M0.SR", "M1.SR"], syms
+
+
 def test_gate_is_bound_into_replay_fingerprint():
     ob = _load_builder()
     with _Env():

@@ -1385,6 +1385,11 @@ from datetime import datetime, timedelta, timezone
 #   over-cap research candidates. Cash, sizing and every other ledger stay
 #   untouched in research. The env name is in the TFB_OPP_ policy prefix, so
 #   it is bound into the signed replay fingerprint.
+#   Review (PR #730, Codex P1): before consuming a slot, a research seat that
+#   is structurally unfundable - a venue board lot above the per-seat cap, or
+#   a ticket below the minimum-ticket floor even at the per-seat cap - is
+#   deferred, mirroring the single pass's pre-counter deferrals. Sized at the
+#   cap, not live cash, so cash-limited seats keep their capital-call path.
 # OFF (unset/0): byte-identical v1.24.1. Functions added: 1
 #   (_env_research_diversify). Removed: 0.
 # Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
@@ -5636,6 +5641,33 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                 continue
         if research:
             if _env_research_diversify():
+                # v1.24.2 (review): a seat that can never be funded must not
+                # take a diversification slot. Mirror the single pass's two
+                # pre-counter deferrals (venue board lot, minimum-ticket
+                # floor), sized at the per-seat cap rather than live cash so
+                # cash-limited seats keep their capital-call path.
+                _r_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
+                if _r_cap > 0:
+                    _r_sugg, _r_sh = _size_one(cand, criteria, budget_base, _r_cap)
+                    _r_lot = _venue_lot_for_symbol(cand)
+                    _r_px = cand["price_sar"] or 0.0
+                    if _r_lot > 1 and _r_sh == 0 and 0 < _r_px <= _r_cap:
+                        deferrals[cand["symbol"]] = (
+                            "Unfunded \u2014 one board lot (" + "{:,}".format(_r_lot) +
+                            " sh) exceeds the per-seat cap " + _fmt_sar(_r_cap) +
+                            " (research)")
+                        continue
+                    _r_min = criteria.get("min_ticket_sar", 0.0) or 0.0
+                    if _env_venue_floors():
+                        _r_vf = _venue_floor(cand["symbol"])
+                        if _r_vf and float(_r_vf) > _r_min:
+                            _r_min = float(_r_vf)
+                    if _r_min > 0.0 and 0.0 < _r_sugg < _r_min:
+                        deferrals[cand["symbol"]] = (
+                            "Unfunded \u2014 ticket at the per-seat cap " +
+                            _fmt_sar(_r_sugg) + " below minimum ticket floor " +
+                            _fmt_sar(_r_min) + " (research)")
+                        continue
                 # v1.24.2: a research seat consumes the cash-independent
                 # diversification slots so the board it feeds is diversified.
                 sector_counts[sec] = sector_counts.get(sec, 0) + 1
