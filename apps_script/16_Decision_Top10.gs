@@ -1552,7 +1552,197 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.11.13';
+var DT10_VERSION = '1.12.0';
+
+/** Funding follows the final stability board, using one frozen backend replay. */
+function dt10BoardEligible_(t) {
+  return !!t && t._grace_hold !== true && t._ft_suspended !== true &&
+      t._p145_suspended !== true && !/^GRACE\b/.test(String(t._stab_status || ''));
+}
+function dt10BoardFundingAlert_(a) {
+  return dt10IsFundingAlert_(a) || String((a && a.type) || '') === 'rotation_proposal';
+}
+function dt10BoardVerdict_(ss) {
+  if (!dt10UvOn_()) return { state: 'EXECUTABLE', reason: '', ageMin: null };
+  try { return dt10UvParse_(dt10UvRead_(ss), Date.now()); }
+  catch (e) { return { state: 'NOT_ACTIONABLE', reason: 'verdict read failed', ageMin: null }; }
+}
+function dt10BoardFundingFail_(payload, reason) {
+  payload.meta = payload.meta || {};
+  payload.meta.board_funding = payload.meta.board_funding || {};
+  payload.meta.board_funding.finalized = false;
+  payload.meta.board_funding.reason = reason;
+  delete payload.meta.board_funding.snapshot;
+  (payload.selected || []).forEach(function (t) { t._board_unfunded = true; });
+  payload.alerts = (payload.alerts || []).filter(function (a) {
+    return a.type !== 'board_funding_unavailable';
+  });
+  payload.alerts.push({type: 'board_funding_unavailable', count: 1,
+      required_action: 'Final board allocation unavailable: ' + reason +
+          '. Research seats reserve no cash; retry after the backend and cockpit versions agree.'});
+}
+function dt10ReallocateBoard_(payload, body) {
+  var meta = payload.meta || {}, funding = meta.board_funding || {};
+  var snapshot = funding.snapshot;
+  if (funding.contract_version !== 1 || funding.stage !== 'research' ||
+      !funding.snapshot_available || !snapshot ||
+      snapshot.builder_version !== payload.version ||
+      snapshot.snapshot_id !== funding.snapshot_id || !Array.isArray(snapshot.rows)) {
+    dt10BoardFundingFail_(payload, funding.reason || 'frozen funding contract unsupported');
+    return;
+  }
+  var eligible = (payload.selected || []).filter(dt10BoardEligible_).map(function (t) {
+    return dt10NormSym_(t.symbol);
+  });
+  funding.eligible_symbols = eligible;
+  // No allocation request can promote a seat or advance stability clocks.
+  if (!eligible.length || (payload._dt10_uv && payload._dt10_uv.state !== 'EXECUTABLE')) {
+    funding.finalized = true;
+    funding.eligible_symbols = [];
+    delete funding.snapshot;
+    return;
+  }
+  try {
+    var replay = JSON.parse(JSON.stringify(body));
+    replay.rows = snapshot.rows;
+    replay.criteria.board_funding_stage = 'allocate';
+    replay.criteria.board_funding_symbols = eligible;
+    replay.criteria.board_funding_snapshot = snapshot;
+    var response = dt10Post_(replay), allocated = response.json;
+    var af = allocated && allocated.meta && allocated.meta.board_funding;
+    if (response.code !== 200 || !allocated || dt10PayloadDegraded_(allocated) ||
+        allocated.status !== 'ok' || allocated.version !== payload.version || !af ||
+        af.contract_version !== 1 || af.stage !== 'allocate' ||
+        af.snapshot_id !== snapshot.snapshot_id) {
+      throw new Error((allocated && allocated.message) || 'allocation response/version/snapshot mismatch');
+    }
+    var bySymbol = {};
+    (allocated.selected || []).forEach(function (t) {
+      var sym = dt10NormSym_(t.symbol);
+      if (eligible.indexOf(sym) < 0 || bySymbol[sym]) throw new Error('unexpected allocation symbol');
+      bySymbol[sym] = t;
+    });
+    payload.selected = (payload.selected || []).map(function (seat, index) {
+      var ticket = bySymbol[dt10NormSym_(seat.symbol)];
+      if (ticket && dt10BoardEligible_(seat)) {
+        var out = {};
+        Object.keys(seat).forEach(function (key) { out[key] = seat[key]; });
+        Object.keys(ticket).forEach(function (key) { out[key] = ticket[key]; });
+        delete out._board_research;
+        delete out._board_unfunded;
+        out.rank = index + 1;
+        return out;
+      }
+      seat._board_unfunded = true;
+      return seat;
+    });
+    if (payload._dt10_stability_disabled === true) payload.selected = allocated.selected || [];
+    var deferrals = {};
+    (allocated.candidates_rows || []).forEach(function (c) {
+      if (eligible.indexOf(dt10NormSym_(c.symbol)) >= 0) deferrals[dt10NormSym_(c.symbol)] = c.deferral || '';
+    });
+    (payload.candidates_rows || []).forEach(function (c) {
+      if (deferrals.hasOwnProperty(dt10NormSym_(c.symbol))) c.deferral = deferrals[dt10NormSym_(c.symbol)];
+    });
+    payload.near_miss = (payload.near_miss || []).filter(function (n) {
+      return !dt10IsFundingNearMiss_(n);
+    }).concat((allocated.near_miss || []).filter(function (n) {
+      return eligible.indexOf(dt10NormSym_(n.symbol)) >= 0;
+    }));
+    payload.alerts = (payload.alerts || []).filter(function (a) {
+      return !dt10BoardFundingAlert_(a) && a.type !== 'cash_floor';
+    }).concat((allocated.alerts || []).filter(function (a) {
+      return dt10BoardFundingAlert_(a) || a.type === 'cash_floor';
+    }));
+    if (allocated.meta.cash_floor) payload.meta.cash_floor = allocated.meta.cash_floor;
+    ['fundable_by_rotation', 'capital_call', 'capital_call_topn_sar', 'rotation_insufficient'].forEach(function (key) {
+      if (allocated.kpis.hasOwnProperty(key)) payload.kpis[key] = allocated.kpis[key];
+    });
+    funding.finalized = true;
+    funding.stage = 'allocate';
+    funding.allocation_version = allocated.version;
+    delete funding.snapshot; // never carry raw snapshot rows into logs/briefs
+  } catch (e) {
+    dt10BoardFundingFail_(payload, String(e).slice(0, 160));
+    delete funding.snapshot;
+  }
+}
+/** Idempotent: every monetary aggregate and narrative uses final actions. */
+function dt10FinalizeBoard_(payload) {
+  payload.kpis = payload.kpis || {};
+  payload.meta = payload.meta || {};
+  var k = payload.kpis, funding = payload.meta.board_funding || {};
+  delete funding.snapshot;
+  var feedOk = !payload._dt10_uv || payload._dt10_uv.state === 'EXECUTABLE';
+  var allocatedSafe = funding.finalized === true && funding.stage === 'allocate' &&
+      funding.contract_version === 1 && funding.allocation_version === payload.version;
+  var executable = [], selectedSymbols = {};
+  (payload.selected || []).forEach(function (t) {
+    var executableNow = feedOk && allocatedSafe &&
+        (funding.eligible_symbols || []).indexOf(dt10NormSym_(t.symbol)) >= 0 &&
+        dt10BoardEligible_(t) && t._board_research !== true &&
+        t._board_unfunded !== true && Number(t.suggested_shares) > 0 && Number(t.suggested_sar) > 0;
+    if (executableNow) {
+      executable.push(t); selectedSymbols[dt10NormSym_(t.symbol)] = true;
+    } else {
+      t.suggested_sar = 0; t.suggested_shares = 0; t.exp_gain_12m_sar = 0;
+      ['engine_exp_gain_12m_sar', 'valuation_exp_gain_12m_sar'].forEach(function (key) {
+        if (t.hasOwnProperty(key)) t[key] = 0;
+      });
+      // Research identity/forecast/stability stays visible; an order surface
+      // never accompanies an unfunded final seat, including replay failure.
+      t.entry_zone = '\u2014'; t.stop_sar = '\u2014'; t.tp1_sar = '\u2014'; t.tp2_sar = '\u2014';
+      t.detail = t.detail || {}; t.detail.funds_from = 'Research — no allocation';
+      if (!allocatedSafe || t._board_research === true || t._board_unfunded === true || !feedOk) {
+        t.advisor_note = 'Research seat — no executable allocation today. ' + String(t._stab_status || '');
+      }
+    }
+  });
+  function sum(key) {
+    return Math.round(executable.reduce(function (total, t) { return total + (Number(t[key]) || 0); }, 0));
+  }
+  function blend(getValue, digits) {
+    var weight = 0, total = 0;
+    executable.forEach(function (t) {
+      var v = getValue(t), w = Number(t.suggested_sar);
+      if (v !== null && v !== undefined && isFinite(Number(v))) { total += Number(v) * w; weight += w; }
+    });
+    return weight ? Math.round(total / weight * Math.pow(10, digits)) / Math.pow(10, digits) : null;
+  }
+  k.selected_count = executable.length; k.fundable_now = executable.length;
+  k.total_suggested_sar = sum('suggested_sar'); k.expected_gain_12m_sar = sum('exp_gain_12m_sar');
+  k.capital_unallocated_sar = Math.round((Number(k.deployable_sar) || 0) - k.total_suggested_sar);
+  ['engine_expected_gain_12m_sar', 'valuation_expected_gain_12m_sar'].forEach(function (key) {
+    if (k.hasOwnProperty(key)) {
+      var field = key.replace('expected', 'exp');
+      var known = executable.some(function (t) { return t[field] !== null && t[field] !== undefined; });
+      k[key] = executable.length && !known ? null : sum(field);
+    }
+  });
+  k.blended_reliability = blend(function (t) { return t.reliability; }, 1);
+  var rrBasis = (payload.meta.board_execution_basis || {}).blended_rr || 'tp2';
+  k.blended_rr = blend(function (t) { return (t.detail || {})[rrBasis === 'plan' ? 'rr' : 'rr_tp2']; }, 2);
+  var plansAllowed = feedOk && allocatedSafe &&
+      (funding.eligible_symbols || []).length > 0;
+  if (!plansAllowed) {
+    ['fundable_by_rotation', 'capital_call', 'capital_call_topn_sar', 'rotation_insufficient'].forEach(function (key) {
+      if (k.hasOwnProperty(key)) k[key] = 0;
+    });
+    payload.alerts = (payload.alerts || []).filter(function (a) { return !dt10BoardFundingAlert_(a); });
+    payload.near_miss = (payload.near_miss || []).map(function (n) {
+      if (!dt10IsFundingNearMiss_(n)) return n;
+      var out = {}; Object.keys(n).forEach(function (key) { out[key] = n[key]; });
+      out.required = 'Research — no executable funding action';
+      out.current = 'No cash reserved'; out.improve_note = 'Recheck qualification and confirmation before funding.';
+      return out;
+    });
+  }
+  (payload.candidates_rows || []).forEach(function (c) { c.selected = !!selectedSymbols[dt10NormSym_(c.symbol)]; });
+  payload.meta.board_execution = {executable_count: executable.length,
+      spend_sar: k.total_suggested_sar, gain_sar: k.expected_gain_12m_sar,
+      allocation_finalized: funding.finalized === true};
+  return payload;
+}
 /* v1.11.1 (2026-09-03) — MORNING TRIGGER TARGET RESTORED + OUTPUT TRUTH
  *  (1) tfbMorningCockpitRefresh(): the 08:07 time-driven trigger pointed at
  *      a function this file no longer defined ("Script function not found",
@@ -3525,6 +3715,10 @@ function dt10MetaLine_(meta) {
   parts.push('builder v' + dt10Cell_(versions.opportunity_builder ||
              route.opportunity_builder_version));
   parts.push('pool=' + dt10Cell_(pool.source) + '/' + dt10Cell_(pool.count));
+  if (meta.board_execution) {
+    parts.push('funding=' + (meta.board_execution.allocation_finalized ? 'final' : 'research') +
+        '/' + meta.board_execution.executable_count + 'exec');
+  }
   if (budget.exhausted === true) parts.push('budget_exhausted');
   if (budget.universe_starved === true) parts.push('universe_starved');
   if (route.duration_ms !== undefined && route.duration_ms !== null) {
@@ -3655,6 +3849,9 @@ function dt10OutputStatus_(payload) {
     }
     if (!feedOk && (cls.total > 0 || passed > 0)) return 'WITHHELD';
     if (cls.exec > 0) return 'EXECUTABLE';
+    var funding = p.meta && p.meta.board_funding;
+    if (funding && funding.finalized === true && funding.stage === 'allocate' &&
+        (funding.eligible_symbols || []).length > 0) return 'QUALIFIED_UNFUNDED';
     if (cls.total > 0) return 'HELD';
     if (passed > 0) return 'QUALIFIED_UNFUNDED';
     return 'EMPTY';
@@ -4365,7 +4562,10 @@ function dt10StabSave_(state) {
  */
 function dt10ApplyStability_(payload, panel, outage) {
   var knobs = dt10StabKnobs_(panel);
-  if (!knobs.enabled) return { note: 'stab: OFF (panel switch)' };
+  if (!knobs.enabled) {
+    payload._dt10_stability_disabled = true;
+    return { note: 'stab: OFF (panel switch)' };
+  }
   // v1.8.0 (BE-2): the service read lives HERE so dt10StabCore_ stays
   // pure/node-testable; the core consumes the choice as a plain knob.
   knobs.hard_strict = dt10HardVerdictStrict_();
@@ -4551,16 +4751,18 @@ function dt10KpiCheckNote_(payload) {
     var kpis = (payload && payload.kpis) || {};
     if (!sel.length) return '';
     var rrSum = 0, rrN = 0, relSum = 0, relN = 0;
+    var rrBasis = ((payload.meta || {}).board_execution_basis || {}).blended_rr || 'tp2';
     for (var i = 0; i < sel.length; i++) {
       var t = sel[i] || {};
-      var px = Number(t.price_sar), st = Number(t.stop_sar),
-          tp2 = Number(t.tp2_sar), rel = Number(t.reliability);
-      if (isFinite(px) && isFinite(st) && isFinite(tp2) &&
-          px > 0 && px > st && tp2 > px) {
-        rrSum += (tp2 - px) / (px - st);
-        rrN++;
+      var weight = Number(t.suggested_sar), rel = Number(t.reliability);
+      if (!dt10BoardEligible_(t) || !(weight > 0) || !(Number(t.suggested_shares) > 0)) continue;
+      var rrRaw = (t.detail || {})[rrBasis === 'plan' ? 'rr' : 'rr_tp2'];
+      var rr = Number(rrRaw);
+      if (rrRaw !== null && rrRaw !== undefined && isFinite(rr)) {
+        rrSum += rr * weight;
+        rrN += weight;
       }
-      if (isFinite(rel) && rel > 0) { relSum += rel; relN++; }
+      if (isFinite(rel) && rel > 0) { relSum += rel * weight; relN += weight; }
     }
     var bits = [];
     var brr = Number(kpis.blended_rr);
@@ -5139,6 +5341,7 @@ function refreshDecisionTop10() {
   }
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
+  body.criteria.board_funding_stage = 'research';
   var resp;
   try {
     resp = dt10Post_(body);
@@ -5179,13 +5382,18 @@ function refreshDecisionTop10() {
   // grid / qualified / near-miss zones keep the backend's RAW truth; only
   // the SELECTED board gains memory.
   var stab = dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]
+  payload._dt10_uv = dt10BoardVerdict_(ss);
+  dt10ReallocateBoard_(payload, body);
+  dt10FinalizeBoard_(payload);
   // v1.6.0 (W-3): earnings proximity tag — annotation-only, never gates.
   var earn = dt10EarningsAnnotate_(payload, ss);
   // v1.6.6 (S-5): board-vs-backend KPI verification — token only.
-  var kpiNote = dt10KpiCheckNote_(payload);
+  var kpiNote;
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
-  var seatNote = dt10SeatCheckNote_(payload);
+  var seatNote;
   dt10RenderPayload_(sheet, payload, tokens);
+  kpiNote = dt10KpiCheckNote_(payload);
+  seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(String(payload.status || '?'),
       poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
@@ -5407,6 +5615,10 @@ function dt10UvParse_(raw, nowMs) {
 }
 
 function dt10RenderPayload_(sheet, payload, tokens) {
+  // Read the authoritative gate before any KPI, alert, or ticket is written.
+  // The live caller reads once before replay; direct render callers fail closed.
+  payload._dt10_uv = dt10BoardVerdict_(sheet.getParent());
+  dt10FinalizeBoard_(payload);
   // Clear dynamic zones (breakApart first: section headers and empty-state
   // lines are merged ranges; writing over stale merges throws in GAS).
   var lastRow = sheet.getMaxRows();
@@ -5456,12 +5668,15 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   var dt10Cls = dt10TicketClasses_(selected);
   var dt10ExecN = dt10Cls.exec, dt10GraceN = dt10Cls.grace,
       dt10SuspN = dt10Cls.suspended;
+  var dt10FastN = selected.filter(function (t) { return t._ft_suspended === true && t._grace_hold !== true; }).length;
+  var dt10ResearchN = Math.max(0, dt10SuspN - dt10FastN);
   var dt10SelTitle;
   if (dt10GraceN > 0 || dt10SuspN > 0) {
     dt10SelTitle = 'SELECTED — ' + dt10ExecN + ' EXECUTABLE TICKET' +
         (dt10ExecN === 1 ? '' : 'S') +
-        (dt10SuspN > 0 ? ' + ' + dt10SuspN +
+        (dt10FastN > 0 ? ' + ' + dt10FastN +
             ' FAST-TRACK (SIZING SUSPENDED)' : '') +
+        (dt10ResearchN > 0 ? ' + ' + dt10ResearchN + ' RESEARCH (NO ALLOCATION)' : '') +
         (dt10GraceN > 0 ? ' + ' + dt10GraceN +
             ' GRACE-HELD (NO PLAN TODAY)' : '');
   } else {
@@ -5469,14 +5684,8 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   }
   /* v1.9.0 W1A-4a: consume the upstream verdict BEFORE any sizing is
    * shown. Fail-closed: read/parse trouble withholds sizing. */
-  var dt10Uv = { state: 'EXECUTABLE', reason: '', ageMin: null };
+  var dt10Uv = payload._dt10_uv;
   if (dt10UvOn_()) {
-    try {
-      dt10Uv = dt10UvParse_(dt10UvRead_(sheet.getParent()), Date.now());
-    } catch (e) {
-      dt10Uv = { state: 'NOT_ACTIONABLE',
-                 reason: 'verdict read failed', ageMin: null };
-    }
     if (dt10Uv.state !== 'EXECUTABLE') {
       /* v1.9.1 (IR-089): under a blocked feed nothing is executable —
        * recount the embedded title as qualified PLANS (review Q1).

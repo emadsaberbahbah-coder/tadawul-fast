@@ -2,6 +2,13 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.17.0
+FINAL BOARD FUNDING REPLAY (2026-10-07)
+================================================================================
+The existing opportunity endpoint accepts a signed frozen allocation replay.
+Replay requires explicit frozen rows and skips selector, trend, health, and
+news acquisition so the final stability board retains its original basis.
+================================================================================
 Advanced Analysis Root Owner — v4.16.0
 NO-FABRICATION CLOSEOUT  (external audit P0-1 a/b/c/d — 2026-08-03)
 ================================================================================
@@ -528,7 +535,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.16.0"  # v4.16.0: runtime telemetry now matches file version (P0-1a)
+ADVANCED_ANALYSIS_VERSION = "4.17.0"  # frozen final-board allocation replay
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -3942,6 +3949,7 @@ async def opportunity_candidates_post(
 
     merged_body = _merge_body_with_query(body, request)
     criteria = _opp_criteria_from_body(merged_body.get("criteria"))
+    board_replay = criteria.get("board_funding_stage") == "allocate"
     fx_rates = (
         merged_body.get("fx_rates")
         if isinstance(merged_body.get("fx_rates"), Mapping)
@@ -4030,8 +4038,7 @@ async def opportunity_candidates_post(
             explicit_rows = merged_body.get("rows")
             if (
                 isinstance(explicit_rows, list)
-                and explicit_rows
-                and isinstance(explicit_rows[0], Mapping)
+                and (board_replay or (explicit_rows and isinstance(explicit_rows[0], Mapping)))
             ):
                 cap = _opp_explicit_rows_max()
                 pool_rows = [
@@ -4045,6 +4052,11 @@ async def opportunity_candidates_post(
                     "explicit_rows_used": len(pool_rows),
                     "explicit_rows_truncated": len(explicit_rows) > cap,
                 }
+            elif board_replay:
+                payload = _opp_degraded_payload(
+                    "board_funding_mismatch", "allocation requires frozen explicit rows",
+                    [], criteria)
+                pool_source = "frozen_rows_missing"
             else:
                 pool_budget = min(
                     _opp_pool_timeout_s(),
@@ -4091,7 +4103,7 @@ async def opportunity_candidates_post(
 
             if payload is None:
                 trend_started = time.monotonic()
-                if _enrich_rows_with_trends is not None:
+                if not board_replay and _enrich_rows_with_trends is not None:
                     try:
                         pool_rows, trends_meta = _enrich_rows_with_trends(
                             pool_rows)
@@ -4119,7 +4131,7 @@ async def opportunity_candidates_post(
                     _provider_health_timeout_s(),
                     _remaining_budget(deadline, reserve=4.0),
                 )
-                if health_budget >= 0.25:
+                if not board_replay and health_budget >= 0.25:
                     provider_health = await _provider_health_with_budget(
                         health_budget)
                 else:
@@ -4174,6 +4186,9 @@ async def opportunity_candidates_post(
                         "engine": engine_version,
                     },
                 }
+                if board_replay:
+                    frozen = criteria.get("board_funding_snapshot") or {}
+                    upstream_meta = dict(frozen.get("upstream_meta") or {})
 
                 build_budget = min(
                     _opp_build_timeout_s(),
@@ -4280,7 +4295,7 @@ async def opportunity_candidates_post(
     meta["provider_health"] = _json_safe(provider_health)
 
     news_display_meta: Dict[str, Any] = {"enabled": False}
-    if _news_display_enabled():
+    if not board_replay and _news_display_enabled():
         news_budget = min(
             _news_display_timeout_s(),
             _remaining_budget(deadline, reserve=0.5),

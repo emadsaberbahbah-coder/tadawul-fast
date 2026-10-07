@@ -620,14 +620,25 @@ class _StubEngine:
         sheet_name = sheet or kwargs.get("page") or kwargs.get("sheet_name") or ""
         headers = _schema_sheet_headers(self._sr, sheet_name) if sheet_name else []
         keys = _schema_sheet_keys(self._sr, sheet_name) if sheet_name else []
+        # Empty data is intentionally rejected by the advisor resolver. Supply
+        # a schema-aligned fixture row so these contract tests exercise the
+        # mounted route's successful path rather than its live-data fallbacks.
+        fixture = {
+            "symbol": "AAPL.US", "name": "Schema fixture", "current_price": 100.0,
+            "currency": "USD", "exchange": "NASDAQ", "data_provider": "fixture",
+            "recommendation": "HOLD", "recommendation_reason": "Schema fixture",
+            "top10_rank": 1, "selection_reason": "Schema fixture",
+            "criteria_snapshot": "{}", "overall_score": 70.0,
+        }
+        row = {key: fixture.get(key) for key in keys}
         return {
             "status": "success",
             "sheet": sheet_name,
             "page": sheet_name,
             "headers": headers,
             "keys": keys,
-            "rows": [],
-            "rows_matrix": [],
+            "rows": [row] if keys else [],
+            "rows_matrix": [[row[key] for key in keys]] if keys else [],
             "meta": {
                 "stub": True,
                 "limit": limit,
@@ -663,13 +674,27 @@ class _StubEngine:
 
 def _build_test_app(monkeypatch: pytest.MonkeyPatch, sr: Any) -> Any:
     _patch_auth_open(monkeypatch)
+    engine = _StubEngine(sr)
+    # Bridges bind module-level adapters independently of app.state, including
+    # aliases captured before this fixture runs. Bind those data boundaries to
+    # the same stub while keeping the real mounted routes and schema logic.
+    for module_name in ("core.data_engine_v2", "core.data_engine"):
+        module = _import_any(module_name)
+        monkeypatch.setattr(module, "get_engine", lambda: engine)
+        monkeypatch.setattr(module, "get_engine_if_ready", lambda: engine, raising=False)
+        monkeypatch.setattr(module, "get_sheet_rows", engine.get_sheet_rows, raising=False)
+    for module_name in (
+        "routes.analysis_sheet_rows", "routes.advanced_analysis", "routes.advanced_sheet_rows",
+    ):
+        module = _import_any(module_name)
+        monkeypatch.setattr(module, "core_get_sheet_rows", engine.get_sheet_rows)
 
     try:
         main_mod = _import_any("main")
         create_app = getattr(main_mod, "create_app", None)
         if callable(create_app):
             app = create_app()
-            app.state.engine = _StubEngine(sr)
+            app.state.engine = engine
             app.state.engine_ready = True
             return app
     except Exception:
@@ -698,7 +723,7 @@ def _build_test_app(monkeypatch: pytest.MonkeyPatch, sr: Any) -> Any:
     except TypeError:
         mount_fn(app)
 
-    app.state.engine = _StubEngine(sr)
+    app.state.engine = engine
     app.state.engine_ready = True
     return app
 
