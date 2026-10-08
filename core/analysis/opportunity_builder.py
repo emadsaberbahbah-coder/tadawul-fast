@@ -2078,6 +2078,7 @@ GATE_ORDER = (
     "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend",
     "Timing (52W)",          # v1.23.0 [P-181] (appends before Portfolio)
     "Portfolio",
+    "FX Evidence",           # certified currency proof, appended after policy gates
 )
 
 # v1.7.0: explicit sell-tier tokens (normalized). Everything else — including
@@ -6669,6 +6670,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         withheld["kpis"]["scanned"] = len(audit)
         withheld["meta"].update(execution_ready=False, input_certification=input_certification,
                                   gate_trace_counts=gate_fail_counts)
+        if _board_replay:
+            # Signing authenticates the frozen research inputs; certification
+            # still independently controls whether any money can be allocated.
+            withheld["meta"]["board_funding"] = {
+                "contract_version": _BOARD_FUNDING_VERSION,
+                "stage": "allocate", "snapshot_available": True,
+                "snapshot_id": crit["board_funding_snapshot"]["snapshot_id"],
+                "eligible_symbols": list(crit.get("board_funding_symbols") or []),
+            }
         withheld["alerts"] = [{"type": "portfolio_inputs_unverified", "count": 1,
                                  "required_action": "Reconcile complete positions, settled cash, reservations, FX and holding prices before funding."}]
         return _json_safe(withheld)

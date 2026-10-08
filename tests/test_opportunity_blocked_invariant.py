@@ -18,7 +18,7 @@ from core.analysis import opportunity_builder as ob
 from routes import advanced_analysis as advanced
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from decision_evidence_fixtures import observed_price_fields
+from decision_evidence_fixtures import observed_price_fields, observed_portfolio
 
 
 def _row(investability: str) -> Dict[str, Any]:
@@ -53,7 +53,7 @@ def _build_row(row: Dict[str, Any], criteria: Dict[str, Any]) -> Dict[str, Any]:
     return ob.build_opportunity_payload(
         [row],
         criteria=criteria,
-        portfolio={"cash_available_sar": 50_000},
+        portfolio=observed_portfolio({"cash_available_sar": 50_000}),
     )
 
 

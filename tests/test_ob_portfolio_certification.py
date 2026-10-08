@@ -90,6 +90,23 @@ def test_empty_candidate_pool_cannot_publish_unverified_money():
         "capital_unallocated_sar", "expected_gain_12m_sar"))
 
 
+def test_empty_signed_replay_acknowledges_authentication_but_withholds_money():
+    pf = {"cash_available_sar": 50_000}
+    research = ob.build_opportunity_payload([], criteria={"board_funding_stage": "research"},
+                                            portfolio=pf, fx_rates=FX)
+    snapshot = research["meta"]["board_funding"]["snapshot"]
+    replay = ob.build_opportunity_payload([], criteria={"board_funding_stage": "allocate",
+        "board_funding_symbols": [], "board_funding_snapshot": snapshot}, portfolio=pf, fx_rates=FX)
+    board = replay["meta"]["board_funding"]
+    assert board["snapshot_id"] == snapshot["snapshot_id"]
+    assert board["snapshot_available"] is True and board["eligible_symbols"] == []
+    assert board["stage"] == "allocate"
+    assert not replay["meta"]["execution_ready"] and replay["selected"] == []
+    assert all(replay["kpis"][key] == 0 for key in (
+        "deployable_sar", "deployable_current_sar", "deployable_proforma_sar",
+        "capital_unallocated_sar", "expected_gain_12m_sar"))
+
+
 def test_holding_row_fx_cannot_override_verified_currency_basis():
     pf = portfolio()
     pf["holdings"][0]["fx_to_sar"] = 1
