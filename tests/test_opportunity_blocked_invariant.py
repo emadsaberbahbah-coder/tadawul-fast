@@ -7,6 +7,8 @@ WATCHLIST/INVESTABLE policy and independently of request criteria.
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 from typing import Any, Dict
 
 from fastapi import FastAPI
@@ -15,10 +17,14 @@ from fastapi.testclient import TestClient
 from core.analysis import opportunity_builder as ob
 from routes import advanced_analysis as advanced
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from decision_evidence_fixtures import observed_price_fields
+
 
 def _row(investability: str) -> Dict[str, Any]:
     is_blocked = investability.strip().lower() == "blocked"
     return {
+        **observed_price_fields(),
         "symbol": "BAD.SR" if is_blocked else "WATCH.SR",
         "name": "Identity Fixture",
         "sector": "Industrials",

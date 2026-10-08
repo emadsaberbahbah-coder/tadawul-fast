@@ -6,6 +6,10 @@ import copy
 import os
 import json
 import subprocess
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pytest
 from fastapi import FastAPI
@@ -122,6 +126,7 @@ def real_authenticated_board_route(mounted_board_route, monkeypatch):
 
 
 def _research_body():
+    from decision_evidence_fixtures import observed_portfolio
     return {
         "rows": [_row("HIGH.SR", 24.0), _row("LATER.SR", 20.0)],
         "criteria": {
@@ -132,7 +137,7 @@ def _research_body():
             "rank_by_engine_roi_enabled": True,
             "trust_gate_enabled": False,
         },
-        "portfolio": {"cash_available_sar": 10_000.0},
+        "portfolio": observed_portfolio({"cash_available_sar": 10_000.0}, {"SAR": 1.0}),
         "fx_rates": {"SAR": 1.0},
     }
 

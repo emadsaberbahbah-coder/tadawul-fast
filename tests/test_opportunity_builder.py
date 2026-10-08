@@ -80,6 +80,8 @@ except Exception as _e1:
         _IMPORT_ERR = (_e1, _e2)
 
 
+from decision_evidence_fixtures import build_with_observed_inputs, observed_portfolio
+
 # ---------------------------------------------------------------------------
 # Hygiene-safe output helper (no print())
 # ---------------------------------------------------------------------------
@@ -144,7 +146,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
     # -- §5 frozen payload --------------------------------------------------
 
     def test_empty_input_is_valid_no_candidates(self) -> None:
-        p = ob.build_opportunity_payload([])
+        p = build_with_observed_inputs(ob, [])
         for k in _SECTION5_KEYS:
             self.assertIn(k, p, "missing §5 zone key: {}".format(k))
         self.assertEqual(p["status"], "no_candidates")
@@ -155,7 +157,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
         prev = os.environ.get("TFB_OPP_ENABLED")
         os.environ["TFB_OPP_ENABLED"] = "0"
         try:
-            p = ob.build_opportunity_payload([_row()])
+            p = build_with_observed_inputs(ob, [_row()])
             self.assertEqual(p["status"], "disabled")
             for k in _SECTION5_KEYS:
                 self.assertIn(k, p)
@@ -168,7 +170,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
     # -- §4.2 gates / verdicts ---------------------------------------------
 
     def test_clean_row_is_invest_and_sized(self) -> None:
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             [_row()], portfolio={"cash_available_sar": 50000})
         a = _candidate(p)
         self.assertEqual(a.get("verdict"), "INVEST",
@@ -180,7 +182,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
 
     def test_l7_funding_identity(self) -> None:
         # unallocated == deployable - Σ suggested (L7)
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             [_row()], portfolio={"cash_available_sar": 50000})
         deployable = p["kpis"]["deployable_sar"]
         total = sum(t["suggested_sar"] for t in p["selected"])
@@ -190,30 +192,30 @@ class TestOpportunityBuilderContract(unittest.TestCase):
             self.assertIn("funds_from", t["detail"])
 
     def test_missing_fx_is_major_fail(self) -> None:
-        a = _candidate(ob.build_opportunity_payload([_row(symbol="Z.XX",
+        a = _candidate(build_with_observed_inputs(ob, [_row(symbol="Z.XX",
                                                           currency="ZZZ")]))
         self.assertEqual(a.get("verdict"), "DO_NOT_INVEST")
         self.assertEqual((a.get("first_fail") or {}).get("gate"), "FX")
 
     def test_gbp_subunit_resolves_div_100(self) -> None:
-        a = _candidate(ob.build_opportunity_payload(
+        a = _candidate(build_with_observed_inputs(ob,
             [_row(symbol="L.LON", currency="GBp", current_price=500.0)]))
         self.assertEqual(a.get("fx_source"), "static/100")
 
     def test_tiered_reliability_bands(self) -> None:
         # within (min_reliability - 15) band -> NON_CRITICAL -> WATCH
-        a = _candidate(ob.build_opportunity_payload(
+        a = _candidate(build_with_observed_inputs(ob,
             [_row(forecast_reliability_score=60.0)]))
         self.assertEqual(a.get("verdict"), "WATCH")
         # below the band -> MAJOR -> DO_NOT_INVEST
-        a = _candidate(ob.build_opportunity_payload(
+        a = _candidate(build_with_observed_inputs(ob,
             [_row(forecast_reliability_score=40.0)]))
         self.assertEqual(a.get("verdict"), "DO_NOT_INVEST")
 
     def test_max_selected_cap_and_capacity_near_miss(self) -> None:
         rows = [_row(symbol="S{}.SR".format(i), sector="Sec{}".format(i))
                 for i in range(6)]
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             rows, criteria={"max_selected": 3},
             portfolio={"cash_available_sar": 500000})
         self.assertEqual(len(p["selected"]), 3)
@@ -224,7 +226,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
     def test_verdict_matches_gate_trace_contract(self) -> None:
         rows = [_row(symbol="S{}.SR".format(i), sector="Sec{}".format(i))
                 for i in range(6)]
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             rows, portfolio={"cash_available_sar": 500000})
         for a in p["candidates_rows"]:
             self.assertEqual(
@@ -240,7 +242,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
         for val in ("No conflict", "no provider/engine conflict",
                     "No Conflict Detected", "conflict-free",
                     "without conflict"):
-            a = _candidate(ob.build_opportunity_payload(
+            a = _candidate(build_with_observed_inputs(ob,
                 [_row(provider_engine_conflict=val)],
                 portfolio={"cash_available_sar": 50000}))
             self.assertIs(a.get("conflict"), False,
@@ -252,7 +254,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
     def test_real_conflict_still_blocks(self) -> None:
         for val in ("Yes", "conflict", "provider conflict flagged",
                     "notable conflict in data"):
-            a = _candidate(ob.build_opportunity_payload(
+            a = _candidate(build_with_observed_inputs(ob,
                 [_row(provider_engine_conflict=val)],
                 portfolio={"cash_available_sar": 50000}))
             self.assertIs(a.get("conflict"), True,
@@ -270,7 +272,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
                      current_price=300.0, intrinsic_value=390.0),
                 _row(symbol="BBB.SR", sector="SecB",
                      current_price=50.0, intrinsic_value=65.0)]
-        return ob.build_opportunity_payload(
+        return build_with_observed_inputs(ob,
             rows,
             criteria={"max_weight_pct": 100.0, "max_selected": 5,
                       "min_ticket_sar": min_ticket},
@@ -321,11 +323,11 @@ class TestOpportunityBuilderContract(unittest.TestCase):
         rows = [_row(symbol="AAA.SR", sector="SecA", expected_roi_12m=12.0),
                 _row(symbol="ZZZ.SR", sector="SecZ", expected_roi_12m=30.0)]
         port = {"cash_available_sar": 500000}
-        off = ob.build_opportunity_payload(
+        off = build_with_observed_inputs(ob,
             rows, criteria={"max_selected": 5,
                             "rank_by_engine_roi_enabled": False},
             portfolio=port)
-        on = ob.build_opportunity_payload(
+        on = build_with_observed_inputs(ob,
             rows, criteria={"max_selected": 5,
                             "rank_by_engine_roi_enabled": True},
             portfolio=port)
@@ -348,7 +350,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
         # 0 SAR. ON -> a WATCH near-miss, not a 0-SAR "executable" ticket.
         rows = [_row(symbol="AAA.SR", sector="SecA", current_price=100.0),
                 _row(symbol="BBB.SR", sector="SecB", current_price=100.0)]
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             rows,
             criteria={"max_weight_pct": 100.0, "max_selected": 5,
                       "unfunded_watch_enabled": True},
@@ -385,7 +387,7 @@ class TestOpportunityBuilderContract(unittest.TestCase):
                      name="Takeda Pharmaceutical Company Limited"),
                 _row(symbol="TAK.US",
                      name="Takeda Pharmaceutical Company Limited")]
-        return ob.build_opportunity_payload(
+        return build_with_observed_inputs(ob,
             rows,
             criteria={"issuer_dedup_enabled": dedup, "max_selected": 10},
             portfolio={"cash_available_sar": 500000})
@@ -427,13 +429,13 @@ class TestOpportunityBuilderContract(unittest.TestCase):
 
     def test_nan_input_is_json_safe(self) -> None:
         import json
-        p = ob.build_opportunity_payload([_row(current_price=float("nan"))])
+        p = build_with_observed_inputs(ob, [_row(current_price=float("nan"))])
         # must not raise — _json_safe coerces NaN/inf to None
         json.dumps(p)
 
     def test_malformed_rows_never_raise(self) -> None:
         weird: List[Any] = [None, 42, "not-a-dict", {}, {"symbol": None}]
-        p = ob.build_opportunity_payload(weird,
+        p = build_with_observed_inputs(ob, weird,
                                          portfolio={"cash_available_sar": 1000})
         self.assertIn(p["status"], ("ok", "no_candidates"))
         for k in _SECTION5_KEYS:

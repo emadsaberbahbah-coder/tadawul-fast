@@ -19,6 +19,8 @@ import pytest
 from core.analysis import opportunity_builder as ob
 
 
+from decision_evidence_fixtures import build_with_observed_inputs, observed_portfolio
+
 CRITERIA = {
     "max_selected": 2,
     "max_per_sector": 1,
@@ -31,6 +33,7 @@ CRITERIA = {
 }
 PORTFOLIO = {"cash_available_sar": 10_000.0}
 FX = {"SAR": 1.0}
+PORTFOLIO = observed_portfolio(PORTFOLIO, FX)
 FUNDING_ALERTS = {"capital_call", "rotation_proposal", "unfunded_candidates"}
 AUTH_ENV_KEYS = (
     "APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN",
@@ -93,7 +96,7 @@ def _isolated_builder_environment(monkeypatch):
 
 
 def _build(rows, criteria=None, portfolio=None):
-    return ob.build_opportunity_payload(
+    return build_with_observed_inputs(ob,
         copy.deepcopy(rows),
         criteria={**CRITERIA, **(criteria or {})},
         portfolio=copy.deepcopy(PORTFOLIO if portfolio is None else portfolio),

@@ -5075,6 +5075,65 @@ def _normalize_portfolio(portfolio):
             "portfolio_value": max(0.0, pv), "holdings": holdings}
 
 
+def _portfolio_input_assessment(portfolio, fx_rates, criteria):
+    """Bind quantity, settled cash and valuation facts before allocating money.
+
+    Evidence is declared by the authenticated caller, not broker-authenticated.
+    The signed replay binds this complete packet and rechecks freshness.
+    """
+    from decimal import Decimal, InvalidOperation
+    from core.portfolio_reconciliation import certify_portfolio_inputs, certification_summary
+    raw = portfolio if isinstance(portfolio, dict) else {}
+    holdings = raw.get("holdings", [])
+    result = certify_portfolio_inputs(holdings, raw.get("reconciliation_evidence"), fx_rates)
+    summary = certification_summary(result)
+    reasons = dict(summary.get("reason_counts") or {})
+    if raw.get("holdings_input_incomplete") is not False:
+        reasons["holdings_input_completeness_unknown"] = 1
+    if result.get("funding_eligible"):
+        try:
+            requested = raw.get("cash_available_sar", 0)
+            if isinstance(requested, bool):
+                raise ValueError("cash")
+            requested = Decimal(str(requested))
+            available = Decimal(result["certified_cash_available_sar_exact"])
+            if not requested.is_finite() or requested < 0 or abs(requested - available) > Decimal("0.01"):
+                reasons["cash_basis_mismatch"] = 1
+            proceeds = raw.get("pending_proceeds_sar", 0)
+            if isinstance(proceeds, bool) or not Decimal(str(proceeds)).is_finite() or Decimal(str(proceeds)) != 0:
+                reasons["unsettled_proceeds_requested"] = 1
+            values = Decimal(0)
+            for holding in holdings:
+                candidate = normalize_candidate(holding, fx_rates, criteria)
+                quote_ok, _, _ = _quote_freshness_assessment(candidate)
+                if not quote_ok:
+                    reasons["holding_quote_unverified"] = reasons.get("holding_quote_unverified", 0) + 1
+                    continue
+                quantity = next((value for key, value in holding.items()
+                                 if _norm_token(key) in {"quantity", "qty", "shares", "units", "holdingqty", "positionqty"}), None)
+                value = holding.get("value_sar")
+                if isinstance(value, bool) or quantity is None or not candidate.get("price_sar"):
+                    reasons["holding_value_unverified"] = 1
+                    continue
+                value = Decimal(str(value))
+                implied = Decimal(str(candidate["price"])) * Decimal(str(candidate["fx_to_sar"])) * Decimal(str(quantity))
+                if not value.is_finite() or value < 0 or abs(value - implied) > Decimal("0.01"):
+                    reasons["holding_value_mismatch"] = reasons.get("holding_value_mismatch", 0) + 1
+                values += value
+            stated = raw.get("portfolio_value_sar", 0)
+            if isinstance(stated, bool):
+                raise ValueError("NAV")
+            stated = Decimal(str(stated))
+            if not stated.is_finite() or stated < 0 or (stated > 0 and abs(stated - values) > Decimal("0.01")):
+                reasons["portfolio_value_mismatch"] = 1
+        except (ValueError, TypeError, InvalidOperation, OverflowError):
+            reasons["portfolio_value_unverified"] = 1
+    summary["reason_counts"] = dict(sorted(reasons.items()))
+    summary["funding_eligible"] = result.get("funding_eligible") is True and not reasons
+    summary["status"] = "certified" if summary["funding_eligible"] else "withheld"
+    return summary, result.get("certified_cash_available_sar", 0.0)
+
+
 def _cash_floor_sar() -> float:
     """v1.16.0: absolute cash reserve in SAR (TFB_OPP_CASH_FLOOR_SAR,
     default '' = 0.0 = off). Unparsable values are loudly ignored."""
@@ -6454,6 +6513,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 pass
         rows = rows[:crit["max_candidates"]]
     pf = _normalize_portfolio(portfolio)
+    input_certification, certified_cash = _portfolio_input_assessment(portfolio, fx_rates, crit)
+    if input_certification["funding_eligible"]:
+        # Cents-rounding acceptance never increases the certified funding cap.
+        pf["cash"] = min(pf["cash"], certified_cash)
+        pf["proceeds"] = 0.0
     sector_ctx = _sector_context(pf, crit, pf["cash"] + pf["proceeds"])
     held = {h["symbol"] for h in pf["holdings"]}
     # v1.0.21 (Fix #4): expand to normalized bare/.US variants so the
@@ -6571,6 +6635,19 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         # see _audit_align_plan_roi. Runs AFTER gates/verdict/score; display
         # truthfulness only, selection byte-identical.
         _audit_align_plan_roi(audit[-1], crit)
+
+    if rows and not _board_research and not input_certification["funding_eligible"]:
+        # Publish a consumable empty allocation, rather than a failed response
+        # that a native client might treat as permission to preserve old money.
+        withheld = _skeleton("ok", "Portfolio inputs unverified; executable funding withheld", crit)
+        withheld["candidates_rows"] = [{k: v for k, v in item.items() if k != "_cand"}
+                                        for item in audit]
+        withheld["kpis"]["scanned"] = len(audit)
+        withheld["meta"].update(execution_ready=False, input_certification=input_certification,
+                                  gate_trace_counts=gate_fail_counts)
+        withheld["alerts"] = [{"type": "portfolio_inputs_unverified", "count": 1,
+                                 "required_action": "Reconcile complete positions, settled cash, reservations, FX and holding prices before funding."}]
+        return _json_safe(withheld)
 
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
     invest = [a for a in audit
@@ -6898,6 +6975,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
 
     meta_in = upstream_meta or {}
     meta = {
+        "execution_ready": input_certification["funding_eligible"] and not _board_research and bool(tickets),
+        "input_certification": input_certification,
         "criteria_snapshot": {k: v for k, v in crit.items() if k != "board_funding_snapshot"},
         "gate_trace_counts": gate_fail_counts,
         "trust_gate": {

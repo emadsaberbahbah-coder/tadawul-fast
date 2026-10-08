@@ -24,6 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from decision_evidence_fixtures import build_with_observed_inputs, observed_portfolio
+
 HARNESS_VERSION = (1, 0, 0)
 GATE = "TFB_OPP_RESEARCH_DIVERSIFY"
 _CLEAN_PREFIXES = ("TFB_OPP_", "TFB_T10_", "TFB_TICKET_")
@@ -78,15 +80,16 @@ CRIT = {"max_selected": 4, "max_per_sector": 2, "max_per_market": 10, "max_weigh
         "rank_by_engine_roi_enabled": True, "trust_gate_enabled": False}
 PF = {"cash_available_sar": 100000.0}
 FX = {"SAR": 1.0}
+PF = observed_portfolio(PF, FX)
 
 
 def _single(ob, rows=ROWS, crit=CRIT):
-    return ob.build_opportunity_payload(copy.deepcopy(rows), criteria=dict(crit),
+    return build_with_observed_inputs(ob, copy.deepcopy(rows), criteria=dict(crit),
                                         portfolio=dict(PF), fx_rates=dict(FX))
 
 
 def _research(ob, rows=ROWS, crit=CRIT):
-    return ob.build_opportunity_payload(copy.deepcopy(rows),
+    return build_with_observed_inputs(ob, copy.deepcopy(rows),
                                         criteria={**crit, "board_funding_stage": "research"},
                                         portfolio=dict(PF), fx_rates=dict(FX))
 
@@ -97,7 +100,7 @@ def _board_then_allocate(ob, rows=ROWS, crit=CRIT):
     res = _research(ob, rows, crit)
     board = [t["symbol"] for t in res["selected"]][:crit["max_selected"]]
     snap = res["meta"]["board_funding"]["snapshot"]
-    alloc = ob.build_opportunity_payload(
+    alloc = build_with_observed_inputs(ob,
         copy.deepcopy(snap["rows"]),
         criteria={**crit, "board_funding_stage": "allocate", "board_funding_symbols": board,
                   "board_funding_snapshot": copy.deepcopy(snap)},
@@ -242,7 +245,7 @@ def test_on_cash_limited_seats_stay_on_research_board():
     ob = _load_builder()
     crit = {**CRIT, "min_ticket_sar": 5000.0}
     with _Env(**{GATE: "1"}):
-        res = ob.build_opportunity_payload(
+        res = build_with_observed_inputs(ob,
             copy.deepcopy(ROWS), criteria={**crit, "board_funding_stage": "research"},
             portfolio={"cash_available_sar": 1000.0, "portfolio_value_sar": 200000.0},
             fx_rates=dict(FX))
