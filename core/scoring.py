@@ -243,6 +243,11 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+try:
+    from core.financial_units import margin_value as _margin_value
+except ImportError:  # local script-style import from the core directory
+    from financial_units import margin_value as _margin_value
+
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -288,7 +293,10 @@ logger.addHandler(logging.NullHandler())
 # The known <=1.0 bare-number ambiguity (0.9 = 90% or 0.9 points?) is OUT
 # of scope and unchanged. Functions added: 0 (in-place). Removed: 0.
 # -----------------------------------------------------------------------------
-__version__ = "5.11.2"
+# v5.11.3: value-bound margin receipts determine the economic unit for quality
+# scoring. Absent receipts keep the legacy parser; explicit invalid receipts
+# contribute no margin. Source values and all score thresholds stay unchanged.
+__version__ = "5.11.3"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -1651,8 +1659,14 @@ def _revenue_collapse_haircut(revenue_growth: Optional[float]) -> float:
 def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     roe = _as_fraction(_get(row, "roe", "return_on_equity", "returnOnEquity"))
     roa = _as_fraction(_get(row, "roa", "return_on_assets", "returnOnAssets"))
-    op_margin = _as_fraction(_get(row, "operating_margin", "operatingMarginTTM"))
-    net_margin = _as_fraction(_get(row, "profit_margin", "net_margin", "profitMargins"))
+    op_margin = _margin_value(
+        row, "operating_margin", _get(row, "operating_margin", "operatingMarginTTM"),
+        output_unit="fraction", legacy_parser=_as_fraction,
+    )
+    net_margin = _margin_value(
+        row, "profit_margin", _get(row, "profit_margin", "net_margin", "profitMargins"),
+        output_unit="fraction", legacy_parser=_as_fraction,
+    )
     de = _normalize_debt_to_equity(_get(row, "debt_to_equity", "debt_equity", "debtToEquity"))
 
     # v5.7.3: for banks and REITs the debt/equity term is not a meaningful

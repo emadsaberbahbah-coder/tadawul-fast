@@ -2,7 +2,17 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.9.0
+Yahoo Finance Fundamentals Provider -- v6.9.1
+================================================================================
+v6.9.1 -- PRODUCER-OWNED MARGIN UNIT RECEIPTS (TFB-05)
+Yahoo margin fields are fractions: preserve their quantities, including genuine
+values above 100% and negative values, instead of inferring units by magnitude.
+Attach value-bound supplier/raw-unit/source/transform receipts before caching.
+Unit basis distinguishes field contracts, explicit percent strings and computed
+ratios. Computed margin fallbacks retain fraction receipts. Version the
+fundamentals cache namespace so old Redis entries cannot masquerade as this
+producer output.
+The generic fraction parser and all non-margin numerical behavior are unchanged.
 ================================================================================
 v6.9.0 -- LOOPGUARD (P-203): ASYNC STATE SURVIVES asyncio.run() PER CALL
 --------------------------------------------------------------------------------
@@ -284,7 +294,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.9.0"
+PROVIDER_VERSION = "6.9.1"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -888,6 +898,35 @@ def _as_fraction(x: Any) -> Optional[float]:
     if v is None:
         return None
     return v / 100.0 if abs(v) > 1.5 else v
+
+
+_MARGIN_UNIT_KEY = "_margin_unit_basis"
+_MARGIN_FRACTION_VERSION = "yahoo_margin_fraction_v1"
+
+
+def _margin_fraction_receipt(
+    value: Any, source_field: str, *, unit_basis: str = "supplier_field_contract",
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+    """Yahoo margin scalars and computed ratios are already fractions.
+
+    An explicit percent string is normalized once by its declared unit;
+    magnitude alone never changes a margin's unit.
+    """
+    raw_value = safe_float(value)
+    if raw_value is None:
+        return None, None
+    raw_unit = "percent_points" if isinstance(value, str) and value.strip().endswith("%") else "fraction"
+    fraction = raw_value / 100.0 if raw_unit == "percent_points" else raw_value
+    return fraction, {
+        "unit": "fraction",
+        "value": fraction,
+        "provider": PROVIDER_NAME,
+        "raw_unit": raw_unit,
+        "raw_value": raw_value,
+        "unit_basis": "explicit_percent" if raw_unit == "percent_points" else unit_basis,
+        "source_field": source_field,
+        "transform_version": _MARGIN_FRACTION_VERSION,
+    }
 
 
 def _pct_from_ratio(numerator: Any, denominator: Any) -> Optional[float]:
@@ -2260,9 +2299,14 @@ class YahooFundamentalsProvider:
                 enterprise_value = safe_float(_pick(info, "enterpriseValue"))
 
                 # Margins
-                gross_margin = _as_fraction(_pick(info, "grossMargins"))
-                operating_margin = _as_fraction(_pick(info, "operatingMargins"))
-                profit_margin = _as_fraction(_pick(info, "profitMargins", "netMargins"))
+                gross_margin, gross_receipt = _margin_fraction_receipt(_pick(info, "grossMargins"), "grossMargins")
+                operating_margin, operating_receipt = _margin_fraction_receipt(
+                    _pick(info, "operatingMargins"), "operatingMargins",
+                )
+                profit_margin, profit_receipt = _margin_fraction_receipt(
+                    _pick(info, "profitMargins", "netMargins"),
+                    "profitMargins" if "profitMargins" in info else "netMargins",
+                )
                 roe = _as_fraction(_pick(info, "returnOnEquity"))
                 roa = _as_fraction(_pick(info, "returnOnAssets"))
 
@@ -2355,9 +2399,21 @@ class YahooFundamentalsProvider:
                 short_percent = _as_fraction(_pick(info, "shortPercentOfFloat"))
 
                 if gross_margin is None:
-                    gross_margin = _pct_from_ratio(_pick(info, "grossProfits"), revenue_ttm)
+                    gross_margin, gross_receipt = _margin_fraction_receipt(
+                        _pct_from_ratio(_pick(info, "grossProfits"), revenue_ttm), "grossProfits/revenue_ttm",
+                        unit_basis="computed_ratio",
+                    )
                 if operating_margin is None:
-                    operating_margin = _pct_from_ratio(_pick(info, "ebitda"), revenue_ttm)
+                    operating_margin, operating_receipt = _margin_fraction_receipt(
+                        _pct_from_ratio(_pick(info, "ebitda"), revenue_ttm), "ebitda/revenue_ttm",
+                        unit_basis="computed_ratio",
+                    )
+                margin_units = {
+                    field: receipt for field, receipt in (
+                        ("gross_margin", gross_receipt), ("operating_margin", operating_receipt),
+                        ("profit_margin", profit_receipt),
+                    ) if receipt is not None
+                }
 
                 # 52-week position (fraction in [0,1])
                 week_52_position_pct: Optional[float] = None
@@ -2449,6 +2505,7 @@ class YahooFundamentalsProvider:
                     "gross_margin": gross_margin,
                     "operating_margin": operating_margin,
                     "profit_margin": profit_margin,
+                    _MARGIN_UNIT_KEY: margin_units or None,
                     "debt_to_equity": debt_to_equity,
                     "free_cash_flow_ttm": free_cash_flow_ttm,
 
@@ -2564,7 +2621,8 @@ class YahooFundamentalsProvider:
         if not norm:
             return {}
 
-        cached = await self.fund_cache.get(norm)
+        cache_key = f"{_MARGIN_FRACTION_VERSION}:{norm}"
+        cached = await self.fund_cache.get(cache_key)
         if cached:
             return cached
 
@@ -2621,14 +2679,14 @@ class YahooFundamentalsProvider:
                         yf_fund_requests_total.labels(status="success").inc()
                         yf_fund_request_duration.observe(time.monotonic() - start_time)
                         if res.get("current_price") is not None:
-                            await self.fund_cache.set(norm, res)
+                            await self.fund_cache.set(cache_key, res)
                         return res
                     await self.circuit_breaker.on_success()
                     yf_fund_requests_total.labels(status="success").inc()
                     yf_fund_request_duration.observe(time.monotonic() - start_time)
 
                     if res.get("current_price") is not None:
-                        await self.fund_cache.set(norm, res)
+                        await self.fund_cache.set(cache_key, res)
                     return res
                 except Exception as exc:
                     await self.circuit_breaker.on_failure()
@@ -2636,7 +2694,7 @@ class YahooFundamentalsProvider:
                     logger.error("Error fetching fundamentals for %s: %s", norm, exc)
                     return {}
 
-        return await self.singleflight.run(norm, _do)
+        return await self.singleflight.run(cache_key, _do)
 
     async def fetch_fundamentals_batch(
         self,

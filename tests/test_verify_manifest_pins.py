@@ -51,6 +51,8 @@ _MODULE_FILES = {
     "core.validation": "core/validation.py",
     "core.regret": "core/regret.py",
     "core.scoring": "core/scoring.py",
+    "core.financial_units": "core/financial_units.py",
+    "core.execution_accounting": "core/execution_accounting.py",
     "core.enriched_quote": "core/enriched_quote.py",
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",
     "core.analysis.portfolio_actions": "core/analysis/portfolio_actions.py",
@@ -58,6 +60,7 @@ _MODULE_FILES = {
     "core.analysis.top10_selector": "core/analysis/top10_selector.py",
     "core.providers.yahoo_chart_provider": "core/providers/yahoo_chart_provider.py",
     "core.providers.eodhd_provider": "core/providers/eodhd_provider.py",
+    "core.providers.yahoo_fundamentals_provider": "core/providers/yahoo_fundamentals_provider.py",
     "core.providers.calendar_provider": "core/providers/calendar_provider.py",
     "core.data_engine_v2": "core/data_engine_v2.py",
 }

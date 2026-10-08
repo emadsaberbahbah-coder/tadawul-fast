@@ -2,6 +2,20 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
+v4.18.2: producer-owned margin unit receipts (TFB-05).
+Margins retain the supplier unit, raw scalar, source field and transform version
+before caching. Native ProfitMargin and OperatingMarginTTM carry fractions;
+explicit percent strings normalize once, and computed ratios retain fractions.
+Bare nonstandard GrossMargin/OperatingMargin aliases retain the prior configured
+transform for analysis with UNKNOWN units; their magnitude cannot prove a unit.
+Unit basis distinguishes field contracts, explicit percentages, computed ratios
+and configured transforms. Negative values and fractions above 100% remain
+intact. Legacy numeric behavior remains available with unknown-unit receipts.
+The retained v4.15.0 historical assumption that all Highlights margins are
+percent points is superseded for margins by this source-specific policy.
+Fundamentals cache/single-flight keys include the normalization version, so a mode switch or
+an old unversioned entry cannot rebrand cached legacy values as fractions.
+
 v4.18.1: redact 401/403 body hints exported into error rows. Classification
 keeps its original raw 200-character input; quota, auth and breaker behavior
 remain unchanged.
@@ -1127,7 +1141,7 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
-PROVIDER_VERSION = "4.18.1"
+PROVIDER_VERSION = "4.18.2"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -1702,6 +1716,60 @@ def _pct_merge(pct_source: Any, frac_fallback: Any = None) -> Optional[float]:
     if converted is not None:
         return converted
     return _already_frac(frac_fallback)
+
+
+_MARGIN_UNIT_KEY = "_margin_unit_basis"
+_MARGIN_FRACTION_VERSION = "eodhd_margin_fraction_v1"
+_MARGIN_LEGACY_VERSION = "eodhd_margin_legacy_v1"
+
+
+def _margin_from_sources(
+    source_value: Any, frac_fallback: Any, source_field: str, fallback_field: str,
+    *, unit_aware: bool, source_unit: str,
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+    """Normalize a margin at its owning boundary and retain value-bound proof.
+
+    Native fraction fields, explicit percent strings and computed ratios have
+    distinct source contracts. Nonstandard numeric aliases keep the prior
+    configured transform without certifying either the raw or output unit.
+    The legacy switch preserves its prior numbers but cannot certify units.
+    """
+    explicit_percent = isinstance(source_value, str) and source_value.strip().endswith("%")
+    raw_source = source_value.strip()[:-1].strip() if explicit_percent else source_value
+    scalar = safe_float(raw_source)
+    fraction = safe_float(frac_fallback)
+    if scalar is not None:
+        raw_value, field = scalar, source_field
+        if explicit_percent:
+            raw_unit, unit_basis, unit = "percent_points", "explicit_percent", "fraction"
+            value = scalar / 100.0
+        elif source_unit == "fraction":
+            raw_unit, unit_basis, unit = "fraction", "supplier_field_contract", "fraction"
+            value = scalar
+        else:
+            raw_unit, unit_basis, unit = "unknown", "configured_adapter_contract", "unknown"
+            value = scalar / 100.0
+    elif fraction is not None:
+        raw_value, raw_unit, field = fraction, "fraction", fallback_field
+        unit_basis, unit = "computed_ratio", "fraction"
+        value = fraction
+    else:
+        return None, None
+    if not unit_aware:
+        value = _frac_from_percentish(_first_present(source_value, frac_fallback))
+        unit = "unknown"
+    if value is None:
+        return None, None
+    return value, {
+        "unit": unit,
+        "value": value,
+        "provider": PROVIDER_NAME,
+        "raw_unit": raw_unit,
+        "raw_value": raw_value,
+        "unit_basis": unit_basis,
+        "source_field": field,
+        "transform_version": _MARGIN_FRACTION_VERSION if unit_aware else _MARGIN_LEGACY_VERSION,
+    }
 
 
 def _safe_div(a: Any, b: Any) -> Optional[float]:
@@ -2552,7 +2620,9 @@ class EODHDClient:
         if _KSA_RE.match(sym) and _ksa_blocked_by_default() and not _allow_ksa_override():
             return {}, "ksa_blocked"
 
-        ck = f"f:{sym}"
+        margin_unit_aware = _eodhd_unit_aware_enabled()
+        margin_version = _MARGIN_FRACTION_VERSION if margin_unit_aware else _MARGIN_LEGACY_VERSION
+        ck = f"f:{margin_version}:{sym}"
         cached = await self.fund_cache.get(ck)
         if cached:
             return cached, None
@@ -2647,6 +2717,24 @@ class EODHDClient:
             gross_margin = _safe_div(gross_profit_ttm, revenue_ttm)
             operating_margin = _safe_div(operating_income_ttm, revenue_ttm)
             profit_margin = _safe_div(net_income_ttm, revenue_ttm)
+            margin_values: Dict[str, Optional[float]] = {}
+            margin_units: Dict[str, Dict[str, Any]] = {}
+            operating_key = "OperatingMarginTTM" if margin_unit_aware \
+                and safe_float(highlights.get("OperatingMarginTTM")) is not None else "OperatingMargin"
+            for field, supplier_key, fraction, numerator, source_unit in (
+                ("gross_margin", "GrossMargin", gross_margin, "grossProfit", "unknown"),
+                ("operating_margin", operating_key, operating_margin, "operatingIncome",
+                 "fraction" if operating_key == "OperatingMarginTTM" else "unknown"),
+                ("profit_margin", "ProfitMargin", profit_margin, "netIncome", "fraction"),
+            ):
+                value, receipt = _margin_from_sources(
+                    highlights.get(supplier_key), fraction, f"Highlights.{supplier_key}",
+                    f"Financials.Income_Statement.quarterly:{numerator}_ttm/revenue_ttm",
+                    unit_aware=margin_unit_aware, source_unit=source_unit,
+                )
+                margin_values[field] = value
+                if receipt is not None:
+                    margin_units[field] = receipt
 
             latest_bs = balance_q[0] if balance_q else (balance_y[0] if balance_y else {})
             total_assets = _pick_numeric(latest_bs, "totalAssets", "TotalAssets")
@@ -2778,10 +2866,9 @@ class EODHDClient:
                     "payout_ratio": payout_ratio,
                     "roe": roe,
                     "roa": roa,
-                    # v4.15.0 UNIT-AWARE: highlights.* are PERCENT POINTS; profit_margin /
-                    # revenue_growth_yoy / earnings_growth are TRUE FRACTIONS this module
-                    # computed by division a few lines above. Each converted at its own unit.
-                    "net_margin": _pct_merge(highlights.get("ProfitMargin"), profit_margin),
+                    # Margins use the source-specific receipt policy above.
+                    # Generic non-margin conversion retains its v4.15.0 behavior.
+                    "net_margin": margin_values["profit_margin"],
                     "revenue_growth": _pct_merge(highlights.get("RevenueGrowth"), revenue_growth_yoy),
                     "revenue_growth_yoy": _pct_merge(highlights.get("RevenueGrowth"), revenue_growth_yoy),
                     "earnings_growth": _pct_merge(highlights.get("EarningsGrowth"), earnings_growth),
@@ -2791,11 +2878,13 @@ class EODHDClient:
                     "week_52_low": week_52_low,
                     "revenue_ttm": revenue_ttm,
                     "revenue": revenue_ttm,
-                    # v4.15.0 UNIT-AWARE (see above). profit_margin is the field whose 24
-                    # ~100x overstatements PROVED highlights.* is percent points.
-                    "gross_margin": _pct_merge(highlights.get("GrossMargin"), gross_margin),
-                    "operating_margin": _pct_merge(highlights.get("OperatingMargin"), operating_margin),
-                    "profit_margin": _pct_merge(highlights.get("ProfitMargin"), profit_margin),
+                    # Native margin fields are fractions. Explicit percent
+                    # strings and computed ratios retain their own unit basis;
+                    # bare nonstandard aliases remain unproven.
+                    "gross_margin": margin_values["gross_margin"],
+                    "operating_margin": margin_values["operating_margin"],
+                    "profit_margin": margin_values["profit_margin"],
+                    _MARGIN_UNIT_KEY: margin_units or None,
                     "free_cash_flow_ttm": fcf_ttm,
                     "fcf_ttm": fcf_ttm,
                     "debt_to_equity": debt_to_equity,
