@@ -187,8 +187,8 @@ def test_eodhd_wire_thin_points_reach_fraction_after_capture_restore(monkeypatch
         requests.append(path)
         return {
             "General": {"Code": "SYNTH", "Exchange": "US", "CurrencyCode": "USD"},
-            "Highlights": {"ProfitMargin": 0.9, "OperatingMargin": -0.4,
-                           "GrossMargin": 0.0},
+            "Highlights": {"ProfitMargin": "0.9%", "OperatingMargin": "-0.4%",
+                           "GrossMargin": "0%"},
         }, None
 
     monkeypatch.setattr(client, "_request_json", request_json)
@@ -313,7 +313,9 @@ def test_legacy_tampered_or_unknown_l2_units_never_infer_scale(monkeypatch, unit
     wire.values[de._fund_lkg_redis_key(SYMBOL)] = json.dumps(raw)
     entry = de._fund_lkg_redis_get(SYMBOL)
     assert entry is not None
-    assert not entry.get("margin_units")
+    # Pre-fix cache entries cannot certify the old producer conversion. Bare,
+    # unknown and malformed receipts all retain explicit uncertainty.
+    assert entry["margin_units"]["profit_margin"] == {"unit": "unknown", "value": 0.9}
     row = {"symbol": SYMBOL}
     assert de._fund_lkg_restore(SYMBOL, row)
     monkeypatch.setenv("TFB_MARGIN_PUBLISH", mode)

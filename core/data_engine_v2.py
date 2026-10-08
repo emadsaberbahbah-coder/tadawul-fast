@@ -2947,6 +2947,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from core.financial_units import (
+    margin_record_lineage as _margin_record_lineage,
+    margin_unit_valid as _margin_unit_valid_shared,
+    margin_value as _margin_value,
+)
+
 # =============================================================================
 # v5.120.0 - PORTFOLIO WEIGHTS WERE CURRENCY-BLIND
 # -----------------------------------------------------------------------------
@@ -3885,7 +3891,9 @@ if str(ROOT_DIR) not in sys.path:
 # withhold an unproven late decision basis without replacing acquisition facts.
 # v5.151.5: keep F7 settlement failures sticky across scoring and normalization;
 # withhold failed funding rows while retaining protective exits and source facts.
-__version__ = "5.151.5"
+# v5.151.6: score witnessed margin units consistently across supplier, cache
+# and publication paths without changing source values or policy thresholds.
+__version__ = "5.151.6"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -4396,9 +4404,14 @@ def _fund_unit_contract_apply(patch: Dict[str, Any], provider: str,
             if v is not None and abs(v) <= _FUND_SENTRY_FRACTION_BOUND:
                 if mode == "enforce":
                     previous_unit = _margin_unit_valid(patch, k)
+                    lineage = _margin_unit_lineage(patch, k)
+                    basis = patch.get(_MPC_UNIT_KEY)
+                    explicit = _MPC_UNIT_KEY in patch and (
+                        not isinstance(basis, Mapping) or k in basis)
                     patch[k] = round(v * 100.0, 4)
                     _margin_unit_set(patch, k, "percent_points"
-                        if previous_unit == "fraction" else "unknown")
+                        if previous_unit == "fraction" else "unknown", lineage=lineage,
+                        retain_when_off=explicit)
                 touched.append(k)
     return touched
 
@@ -4417,14 +4430,18 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
     is a three-way verdict -- |implied| > 100pp fails OPEN (skipped tag),
     a divergence inside the 100x band [90, 110] is REPAIRED (x100 / d100,
     accepted only if the result coheres), anything else is quarantined as
-    before; observe output is byte-identical to v5.140.0."""
+    before; unproved legacy observe output is byte-identical to v5.140.0.
+    Value-bound receipts are compared in points; a proven economic divergence
+    cannot be repaired by guessing another unit."""
     if mode == "off" or not isinstance(row, dict):
         return None
     try:
         pe = _as_float(row.get("pe_ttm"))
         mc = _as_float(row.get("market_cap"))
         rev = _as_float(row.get("revenue_ttm"))
-        pm = _as_float(row.get("profit_margin"))
+        pm_unit = _margin_unit_valid(row, "profit_margin")
+        pm = _margin_value(row, "profit_margin", row.get("profit_margin"),
+                           output_unit="percent_points", legacy_parser=_as_float)
         if pe is None or mc is None or rev is None or pm is None:
             return None
         if pe <= 0.0 or mc <= 0.0 or rev <= 0.0 or pm == 0.0:
@@ -4441,7 +4458,9 @@ def _fund_coherence_sentry(row: Dict[str, Any], mode: str) -> Optional[str]:
             if abs(implied) > _FUND_SENTRY_IMPLIED_MARGIN_MAX_PCT:
                 return _FUND_SENTRY_SKIPPED_TAG + ":profit_margin:implied_oob"
             _ratio = hi / lo
-            if (_FUND_SENTRY_REPAIR_RATIO_LO <= _ratio
+            # Scaling repair belongs only to the legacy unproved path. A
+            # supplier receipt already establishes the economic quantity.
+            if (pm_unit is None and _FUND_SENTRY_REPAIR_RATIO_LO <= _ratio
                     <= _FUND_SENTRY_REPAIR_RATIO_HI):
                 if abs(pm) < abs(implied):
                     _repaired, _kind = round(pm * 100.0, 4), "x100"
@@ -6885,6 +6904,7 @@ _MPC_POINTS_WITNESS_PREFIXES: Tuple[str, ...] = (
 _MPC_EODHD_PROVENANCE_TAG: str = "eodhd_fundamentals_fallback_applied"
 _MPC_YAHOO_PROVENANCE_TAG: str = "yahoo_enrichment_applied"
 _MPC_UNIT_KEY: str = "_margin_unit_basis"
+_MARGIN_CACHE_CONTRACT_VERSION: str = "source_margin_units_v1"
 
 
 def _margin_publish_mode() -> str:
@@ -6905,28 +6925,41 @@ def _margin_unit_valid(row: Mapping[str, Any], field: str) -> Optional[str]:
     Warning strings and magnitudes are diagnostics, never unit proof. A
     replaced value cannot inherit an older conversion or publication marker.
     """
-    basis = row.get(_MPC_UNIT_KEY) if isinstance(row, Mapping) else None
+    return _margin_unit_valid_shared(row, field)
+
+
+def _margin_unit_lineage(row: Mapping[str, Any], field: str) -> Dict[str, Any]:
+    basis = row.get(_MPC_UNIT_KEY)
     record = basis.get(field) if isinstance(basis, Mapping) else None
-    if not isinstance(record, Mapping) or record.get("unit") not in {"fraction", "percent_points"}:
-        return None
-    value, witnessed = row.get(field), record.get("value")
-    if isinstance(value, bool) or isinstance(witnessed, bool):
-        return None
-    v, w = _as_float(value), _as_float(witnessed)
-    if v is None or w is None or not math.isfinite(v) or not math.isfinite(w) or v != w:
-        return None
-    return str(record["unit"])
+    value = _as_float(row.get(field))
+    if not isinstance(record, Mapping) or value is None or not math.isfinite(value) \
+            or isinstance(row.get(field), bool) or isinstance(record.get("value"), bool) \
+            or value != _as_float(record.get("value")):
+        return {}
+    return _margin_record_lineage(record)
 
 
-def _margin_unit_set(row: Dict[str, Any], field: str, unit: str, *, published: bool = False) -> None:
-    if not _margin_unit_tracking_enabled() or field not in _MPC_FIELDS:
+def _margin_unit_set(row: Dict[str, Any], field: str, unit: str, *, published: bool = False,
+                     lineage: Optional[Mapping[str, Any]] = None,
+                     retain_when_off: bool = False) -> None:
+    if (not _margin_unit_tracking_enabled() and not retain_when_off) or field not in _MPC_FIELDS:
         return
-    basis = dict(row.get(_MPC_UNIT_KEY) or {}) if isinstance(row.get(_MPC_UNIT_KEY), Mapping) else {}
+    raw_basis = row.get(_MPC_UNIT_KEY)
+    basis = dict(raw_basis) if isinstance(raw_basis, Mapping) else {}
+    if _MPC_UNIT_KEY in row and not isinstance(raw_basis, Mapping):
+        # Malformed top-level metadata marks every margin as uncertain. A
+        # receipt landed for one field cannot erase that state for the rest.
+        for other in _MPC_FIELDS:
+            number = _as_float(row.get(other))
+            if number is not None and math.isfinite(number) and not isinstance(row.get(other), bool):
+                basis[other] = {"unit": "unknown", "value": number, "published": False}
     value = _as_float(row.get(field))
     if value is None or not math.isfinite(value) or isinstance(row.get(field), bool):
         basis.pop(field, None)
     else:
         basis[field] = {"unit": unit, "value": value, "published": bool(published)}
+        if lineage:
+            basis[field].update(_margin_record_lineage(lineage))
     if basis:
         row[_MPC_UNIT_KEY] = basis
     else:
@@ -6945,23 +6978,61 @@ def _margin_unit_clear(row: Dict[str, Any], field: str) -> None:
 
 
 def _margin_unit_copy(dest: Dict[str, Any], source: Mapping[str, Any], fields: Iterable[str]) -> None:
-    if not _margin_unit_tracking_enabled():
-        return
     for field in fields:
         if field not in _MPC_FIELDS or _as_float(dest.get(field)) != _as_float(source.get(field)):
             continue
-        _margin_unit_set(dest, field, _margin_unit_valid(source, field) or "unknown")
+        source_basis = source.get(_MPC_UNIT_KEY)
+        dest_basis = dest.get(_MPC_UNIT_KEY)
+        # A landed replacement cannot inherit a prior receipt, even when its
+        # numeric value happens to equal the stale receipt's observation.
+        explicit_source = _MPC_UNIT_KEY in source and (
+            not isinstance(source_basis, Mapping) or field in source_basis)
+        prior_receipt = _MPC_UNIT_KEY in dest and (
+            not isinstance(dest_basis, Mapping) or field in dest_basis)
+        unit = _margin_unit_valid(source, field)
+        lineage = _margin_unit_lineage(source, field)
+        _margin_unit_clear(dest, field)
+        _margin_unit_set(dest, field, unit or "unknown", lineage=lineage,
+                         retain_when_off=unit is not None or explicit_source or prior_receipt)
 
 
 def _margin_unit_snapshot(row: Mapping[str, Any], fields: Mapping[str, Any]) -> Dict[str, Any]:
-    """Only value-bound, whitelisted margin metadata can cross cache storage."""
+    """Keep current proof or explicit uncertainty; never cache stale proof."""
     out: Dict[str, Any] = {}
     for field in _MPC_FIELDS:
         if field in fields:
             unit = _margin_unit_valid(row, field)
-            if unit is not None:
-                out[field] = {"unit": unit, "value": _as_float(fields[field])}
+            basis = row.get(_MPC_UNIT_KEY)
+            explicit = _MPC_UNIT_KEY in row and (
+                not isinstance(basis, Mapping) or field in basis)
+            value = _as_float(fields[field])
+            if value != _as_float(row.get(field)):
+                unit = None
+            if (unit is not None or explicit) and value is not None and math.isfinite(value) \
+                    and not isinstance(fields[field], bool):
+                out[field] = {"unit": unit or "unknown", "value": value}
+                out[field].update(_margin_unit_lineage(row, field))
     return out
+
+
+def _margin_cache_units(entry: Mapping[str, Any], fields: Mapping[str, Any]) -> Dict[str, Any]:
+    """Retain other fundamentals while quarantining pre-fix cached margins.
+
+    Old receipts can bind a unit to a value produced by the former incorrect
+    native-field conversion. Reading or writing that snapshot cannot certify
+    it under the current source contract; only a fresh capture owns the marker.
+    """
+    witnessed = dict(fields)
+    witnessed[_MPC_UNIT_KEY] = entry.get("margin_units", {})
+    units = _margin_unit_snapshot(witnessed, fields)
+    if entry.get("margin_contract_version") == _MARGIN_CACHE_CONTRACT_VERSION:
+        return units
+    for field in _MPC_FIELDS:
+        value = _as_float(fields.get(field))
+        if value is not None and math.isfinite(value) and not isinstance(fields.get(field), bool):
+            lineage = _margin_record_lineage(units.get(field, {}))
+            units[field] = {"unit": "unknown", "value": value, **lineage}
+    return units
 
 
 def _mpc_warning_parts(row: Dict[str, Any]) -> List[str]:
@@ -7024,6 +7095,7 @@ def _margin_publish_contract(row: Dict[str, Any]) -> int:
             else:
                 kind = "oob"
             if mode == "enforce":
+                lineage = _margin_unit_lineage(row, field)
                 if unit == "percent_points":
                     kind = "pts_thin" if av <= _MPC_FRACTION_BOUND else "pts"
                     row[field] = round(v / 100.0, 6)
@@ -7033,7 +7105,7 @@ def _margin_publish_contract(row: Dict[str, Any]) -> int:
                     # Legacy snapshots and stale warnings cannot prove a unit.
                     row[field] = None
                     kind = "unresolved"
-                _margin_unit_set(row, field, "fraction", published=True)
+                _margin_unit_set(row, field, "fraction", published=True, lineage=lineage)
                 _v573_append_warning(row, "%s%s" % (marker, kind))
             else:
                 _v573_append_warning(row, "%s%s:observe" % (marker, kind))
@@ -12237,6 +12309,7 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
             "ts": now,
             "name": _safe_str(row.get("name")),
             "fields": fields,
+            "margin_contract_version": _MARGIN_CACHE_CONTRACT_VERSION,
         }
         units = _margin_unit_snapshot(row, fields)
         if units:
@@ -12300,7 +12373,7 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         for k, v in filtered.items():
             row[k] = v
         witnessed_fields = dict(fields)
-        witnessed_fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
+        witnessed_fields[_MPC_UNIT_KEY] = _margin_cache_units(entry, fields)
         _margin_unit_copy(row, witnessed_fields, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
@@ -12440,9 +12513,10 @@ def _fund_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
             "name": _safe_str(entry.get("name")),
             "fields": {k: v for k, v in fields.items() if k in _FUND_LKG_FIELDS},
         }
-        witnessed_fields = dict(cached["fields"])
-        witnessed_fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
-        units = _margin_unit_snapshot(witnessed_fields, cached["fields"])
+        version = entry.get("margin_contract_version")
+        if isinstance(version, str) and version:
+            cached["margin_contract_version"] = version
+        units = _margin_cache_units(entry, cached["fields"])
         if units:
             cached["margin_units"] = units
         payload = json.dumps(cached, default=str)
@@ -12487,9 +12561,10 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
             return None
         _FUND_LKG_REDIS_STATE["hits"] = int(_FUND_LKG_REDIS_STATE.get("hits") or 0) + 1
         entry = {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
-        witnessed_fields = dict(fields)
-        witnessed_fields[_MPC_UNIT_KEY] = d.get("margin_units", {})
-        units = _margin_unit_snapshot(witnessed_fields, fields)
+        version = d.get("margin_contract_version")
+        if isinstance(version, str) and version:
+            entry["margin_contract_version"] = version
+        units = _margin_cache_units(d, fields)
         if units:
             entry["margin_units"] = units
         return entry
@@ -12618,8 +12693,9 @@ def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
         if not isinstance(fields, dict) or not fields:
             return None
         fields = dict(fields)
-        if _margin_unit_tracking_enabled():
-            fields[_MPC_UNIT_KEY] = entry.get("margin_units", {})
+        units = _margin_cache_units(entry, fields)
+        if _margin_unit_tracking_enabled() or units:
+            fields[_MPC_UNIT_KEY] = units
         return fields, age_s
     except Exception:
         return None
@@ -14961,6 +15037,11 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    if _MPC_UNIT_KEY in src:
+        source_basis = src.get(_MPC_UNIT_KEY)
+        explicit_fields = [field for field in _MPC_FIELDS
+                           if not isinstance(source_basis, Mapping) or field in source_basis]
+        _margin_unit_copy(out, src, explicit_fields)
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
         out["warnings"] = "Recovered from history/chart fallback"
 
@@ -15908,9 +15989,12 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
     debt_to_equity = _as_float(row.get("debt_to_equity"))
 
     div_yield_pct = _as_pct_points(row.get("dividend_yield")) or 0.0
-    gross_margin_pct = _as_pct_points(row.get("gross_margin")) or 0.0
-    operating_margin_pct = _as_pct_points(row.get("operating_margin")) or 0.0
-    profit_margin_pct = _as_pct_points(row.get("profit_margin")) or 0.0
+    gross_margin_pct = _margin_value(row, "gross_margin", row.get("gross_margin"),
+        output_unit="percent_points", legacy_parser=_as_pct_points) or 0.0
+    operating_margin_pct = _margin_value(row, "operating_margin", row.get("operating_margin"),
+        output_unit="percent_points", legacy_parser=_as_pct_points) or 0.0
+    profit_margin_pct = _margin_value(row, "profit_margin", row.get("profit_margin"),
+        output_unit="percent_points", legacy_parser=_as_pct_points) or 0.0
     revenue_growth_pct = _as_pct_points(row.get("revenue_growth_yoy")) or 0.0
 
     seed_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
@@ -17518,11 +17602,17 @@ class DataEngineV5:
 
     def _merge(self, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base or {})
+        landed_margins: List[str] = []
         for k, v in (patch or {}).items():
+            if k == _MPC_UNIT_KEY:
+                continue
             if v is None or v == "":
                 continue
             if out.get(k) in (None, "", [], {}):
                 out[k] = v
+                if k in _MPC_FIELDS:
+                    landed_margins.append(k)
+        _margin_unit_copy(out, patch or {}, landed_margins)
         return out
 
     def _data_quality(self, row: Dict[str, Any]) -> QuoteQuality:
