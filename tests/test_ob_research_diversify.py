@@ -61,7 +61,8 @@ class _Env:
 
 
 def _row(sym, sector, roi, name=None):
-    return {"symbol": sym, "name": name or sym, "sector": sector, "market": "Tadawul",
+    from decision_evidence_fixtures import observed_price_fields
+    return {**observed_price_fields(), "symbol": sym, "name": name or sym, "sector": sector, "market": "Tadawul",
             "currency": "SAR", "current_price": 100.0, "intrinsic_value": 100 * (1 + roi / 100),
             "forecast_reliability_score": 82.0, "data_quality_score": 91.0,
             "risk_bucket": "Moderate", "provider_engine_conflict": "No", "volatility_30d": 4.0,

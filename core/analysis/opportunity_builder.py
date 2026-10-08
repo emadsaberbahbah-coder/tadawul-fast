@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.24.3  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.25.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.25.0 (2026-10-09): executable quote freshness consumes the original
+acquisition proof and actual market quote instant, never the retrieval stamp.
+Missing, conflicting, preserved or unverified evidence cannot authorize a
+ticket; an unavailable venue calendar cannot certify an old close.
 
 v1.24.3 (2026-10-08): known F7 settlement failures cannot rank or receive
 new allocation, including signed research replay and disabled policy gates.
@@ -1398,7 +1403,7 @@ from datetime import datetime, timedelta, timezone
 #   (_env_research_diversify). Removed: 0.
 # Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.3"
+OPPORTUNITY_BUILDER_VERSION = "1.25.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3700,6 +3705,18 @@ def normalize_candidate(row, fx_rates, criteria):
             "last_updated": _to_text(_field(view, "last_updated")),
         },
     }
+    # Retain the acquisition verdict before generic aliases discard typed
+    # warning tokens. This is a price witness, separate from engine retrieval.
+    from core.data_validity import row_acquisition
+    proof = row_acquisition(row if isinstance(row, dict) else {},
+                            datetime.now(timezone.utc),
+                            _env_freshness_fallback_h() * 3600.0)
+    cand["quote_evidence"] = {
+        "status": proof.status,
+        "reason": proof.reason,
+        "acquired_at": proof.acquired_at.isoformat() if proof.acquired_at else None,
+        "quote_asof": proof.quote_asof.isoformat() if proof.quote_asof else None,
+    }
     settlement_failure = _scoring_settlement_failure(row)
     if settlement_failure:
         cand["scoring_settlement_failure"] = settlement_failure
@@ -3854,7 +3871,7 @@ def _env_freshness_gate():
 def _env_quote_max_age_min():
     try:
         v = float(os.getenv("TFB_TICKET_MAX_QUOTE_AGE_MIN") or 15.0)
-        return v if v > 0 else 15.0
+        return v if math.isfinite(v) and v > 0 else 15.0
     except (TypeError, ValueError):
         return 15.0
 
@@ -3862,7 +3879,7 @@ def _env_quote_max_age_min():
 def _env_freshness_fallback_h():
     try:
         v = float(os.getenv("TFB_TICKET_FALLBACK_MAX_AGE_H") or 78.0)
-        return v if v > 0 else 78.0
+        return v if math.isfinite(v) and v > 0 else 78.0
     except (TypeError, ValueError):
         return 78.0
 
@@ -4357,11 +4374,16 @@ _FRESHNESS_FALLBACK_LOGGED = set()
 def _venue_state(symbol, now_utc):
     """(is_open, prev_close_utc_datetime) for the symbol's venue at now_utc,
     or None when the calendar layer cannot answer (unknown suffix, import
-    failure, any exception) — the caller then uses the permissive fallback.
+    failure, any exception) — an old quote then remains uncertified.
     Lazy exchange_calendars + pandas; NEVER raises."""
     try:
         s = (str(symbol or "").strip().upper())
         suffix = s.rsplit(".", 1)[1] if "." in s else "US"
+        if suffix not in _VENUE_CAL_MAP and "." in s:
+            from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+            if (s.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(s)
+                    and split_symbol_exchange(s)[1] is None):
+                suffix = "US"
         code = _VENUE_CAL_MAP.get(suffix)
         if not code:
             return None
@@ -4397,17 +4419,29 @@ def _venue_state(symbol, now_utc):
 
 
 def _quote_freshness_assessment(cand):
-    """v1.4.0 (W-2). Returns (passed, current_str, detail). Pure-defensive:
-    the only FAIL paths are PROVEN staleness; absent/unparseable timestamps
-    and calendar outages never block a candidate on their own."""
-    eng = cand.get("engine_gate") or {}
-    qdt = _parse_ts_utc(eng.get("last_updated"))
+    """Require successful acquisition and a witnessed market quote instant.
+
+    Retrieval time is not quote time. An unknown session cannot certify an
+    old close for executable allocation, although the row remains auditable.
+    """
+    from core.data_validity import precise_utc
+    proof = cand.get("quote_evidence") or {}
+    qdt = precise_utc(proof.get("quote_asof"))
     detail = {"quote_ts": (None if qdt is None else qdt.isoformat()),
+              "acquired_at": proof.get("acquired_at"),
+              "acquisition_status": proof.get("status", "UNKNOWN"),
               "mode": None, "age_min": None}
+    if proof.get("status") != "SUCCESS":
+        detail["mode"] = "acquisition_unverified"
+        detail["reason"] = proof.get("reason") or "acquisition_proof_missing"
+        return False, "UNVERIFIED_PRICE: " + detail["reason"], detail
     if qdt is None:
-        detail["mode"] = "skipped_no_timestamp"
-        return True, "no timestamp (skipped)", detail
+        detail["mode"] = "quote_asof_unknown"
+        return False, "UNVERIFIED_PRICE: quote as-of unknown", detail
     now = datetime.now(timezone.utc)
+    if qdt > now + timedelta(seconds=60):
+        detail["mode"] = "quote_asof_future"
+        return False, "UNVERIFIED_PRICE: quote as-of is in the future", detail
     age_min = max(0.0, (now - qdt).total_seconds() / 60.0)
     detail["age_min"] = round(age_min, 1)
     max_min = _env_quote_max_age_min()
@@ -4430,7 +4464,7 @@ def _quote_freshness_assessment(cand):
                        "venue close %s"
                        % (age_min / 60.0,
                           prev_close.strftime("%Y-%m-%d %H:%M UTC"))), detail
-    detail["mode"] = "fallback_no_calendar"
+    detail["mode"] = "calendar_unavailable"
     try:
         _sfx = (str(cand.get("symbol") or "").strip().upper()
                 .rsplit(".", 1)[-1]) or "?"
@@ -4438,17 +4472,13 @@ def _quote_freshness_assessment(cand):
             _FRESHNESS_FALLBACK_LOGGED.add(_sfx)
             _LOG.warning(
                 "[FRESHNESS v%s] venue calendar unavailable for '.%s' -> "
-                "78h fallback in effect (last err: %s)",
+                "old quote cannot be certified (last err: %s)",
                 OPPORTUNITY_BUILDER_VERSION, _sfx,
                 _VENUE_LAST_ERROR.get("msg") or "none captured")
     except Exception:
         pass
-    fb_h = _env_freshness_fallback_h()
-    if age_min <= fb_h * 60.0:
-        return True, ("fallback: %.1fh old, no venue calendar"
-                      % (age_min / 60.0)), detail
-    return False, ("STALE_PRICE %.1fh old (no venue calendar; cap %.0fh)"
-                   % (age_min / 60.0, fb_h)), detail
+    return False, ("UNVERIFIED_PRICE: %.1fh old and venue calendar unavailable"
+                   % (age_min / 60.0)), detail
 
 
 def _data_trust_assessment(cand, criteria):
@@ -4677,13 +4707,21 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     # DO_NOT_INVEST: candidate DEFERS with the STALE_PRICE tag in the audit
     # grid, never sized. DEFAULT ON; TFB_TICKET_FRESHNESS_GATE=0 restores the
     # v1.3.0 gate list byte-for-byte.
-    if _env_freshness_gate():
+    # A disabled age policy cannot authenticate absent or known failed price
+    # evidence. Preserve that factual invariant independently of rollout.
+    quote_proof = cand.get("quote_evidence") or {}
+    from core.data_validity import precise_utc
+    quote_stamp = precise_utc(quote_proof.get("quote_asof"))
+    unverified_quote = (quote_proof.get("status") != "SUCCESS"
+                        or quote_stamp is None
+                        or quote_stamp > datetime.now(timezone.utc) + timedelta(seconds=60))
+    if _env_freshness_gate() or unverified_quote:
         f_ok, f_cur, f_detail = _quote_freshness_assessment(cand)
         fg = _gate(
             "Quote Freshness", f_ok, FAIL_MAJOR, f_cur,
-            ("live <= %.0fm in-session; else >= venue last close; "
-             "fallback <= %.0fh"
-             % (_env_quote_max_age_min(), _env_freshness_fallback_h())))
+            ("successful price acquisition with actual quote as-of; live <= "
+             "%.0fm in-session or witnessed latest venue close; unknown defers"
+             % _env_quote_max_age_min()))
         fg["freshness_detail"] = f_detail
         g.append(fg)
 

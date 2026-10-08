@@ -34,7 +34,9 @@ OPPORTUNITY_PATH = "/sheet-rows/opportunity-candidates"
 
 
 def _row(symbol, roi):
+    from decision_evidence_fixtures import observed_price_fields
     return {
+        **observed_price_fields(),
         "symbol": symbol, "name": "Synthetic " + symbol,
         "sector": "Energy", "market": "Tadawul", "currency": "SAR",
         "current_price": 100.0, "intrinsic_value": 130.0,

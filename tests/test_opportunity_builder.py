@@ -103,6 +103,8 @@ def _row(**kw: Any) -> Dict[str, Any]:
         "recommendation_detailed": "STRONG BUY",
         "investability_status": "INVESTABLE", "block_reason": "",
     }
+    from decision_evidence_fixtures import observed_price_fields
+    base.update(observed_price_fields())
     base.update(kw)
     return base
 

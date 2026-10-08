@@ -71,6 +71,8 @@ def _row(symbol: str, roi: float = 24.0, **overrides: Any) -> dict[str, Any]:
         "investability_status": "INVESTABLE",
         "block_reason": "",
     }
+    from decision_evidence_fixtures import observed_price_fields
+    row.update(observed_price_fields())
     row.update(overrides)
     return row
 
