@@ -58,12 +58,14 @@ Usage
 
 Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = usage / load error.
 
-Cash certification contract (v1.1.0)
+Cash certification contract (v1.1.1)
 ----------------------------------
 The latest appended _Cash_Snapshot record must name Account (or Account ID),
 Currency (or Ccy), and Balance Type=settled_cash. Type=SNAPSHOT describes a
 record, not its balance type. Provide As Of/Timestamp with a time, or separate
-Date and Time cells. Naive Excel values use --tz-offset. Foreign cash needs
+Date and Time cells. Blank full-timestamp aliases defer to the next alias or
+Date/Time; a selected populated invalid timestamp always fails. Naive Excel
+values use --tz-offset. Foreign cash needs
 Balance (or Native Balance), FX to SAR, and FX As Of; SAR uses identity FX.
 Any recorded Balance SAR must agree with native balance x recorded FX within
 one halala. Cash and FX default to a maximum age of 24 hours, configurable with
@@ -86,7 +88,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 
 try:
     import openpyxl
@@ -685,12 +687,16 @@ def _cash_snapshot_record(index, row, tz_offset, date_only_headers=()):
     def cell(*names):
         return next((row[index[name]] for name in names if name in index), None)
 
-    timestamp_header = next((name for name in ("As Of", "Timestamp") if name in index), None)
-    as_of = (None if timestamp_header in date_only_headers
-             else _cash_timestamp(cell("As Of", "Timestamp"), tz_offset))
-    if "As Of" not in index and "Timestamp" not in index:
+    # Preserve populated-alias precedence. Only blanks may defer; parsing
+    # failure or a date-only format on a selected value must never fall through.
+    timestamp_header = next((name for name in ("As Of", "Timestamp")
+                             if name in index and _s(cell(name)) != ""), None)
+    if timestamp_header is None:
         as_of = (None if "Time" in date_only_headers
                  else _cash_date_time(cell("Date"), cell("Time"), tz_offset))
+    else:
+        as_of = (None if timestamp_header in date_only_headers
+                 else _cash_timestamp(cell(timestamp_header), tz_offset))
     currency = _s(cell("Currency", "Ccy")).upper()
     recorded_sar = _cash_decimal(cell("Balance SAR"))
     balance = _cash_decimal(cell("Balance", "Native Balance"))

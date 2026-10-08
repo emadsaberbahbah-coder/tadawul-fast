@@ -108,6 +108,40 @@ def test_date_only_asof_does_not_get_a_midnight_timestamp(tmp_path):
     _assert_uncertified(findings, metrics, "missing_or_invalid_timestamp")
 
 
+@pytest.mark.parametrize("blank", [None, "", " \t "])
+@pytest.mark.parametrize("source", ["timestamp", "date_time", "timestamp_only_date_time"])
+def test_blank_timestamp_aliases_defer_to_the_next_available_source(tmp_path, blank, source):
+    if source == "timestamp":
+        changes = {"As Of": blank, "Timestamp": "2026-10-08T11:30:00Z"}
+        extra_headers = ("As Of", "Timestamp")
+    elif source == "date_time":
+        changes = {"As Of": blank, "Timestamp": blank}
+        extra_headers = ("As Of", "Timestamp")
+    else:
+        changes = {"Timestamp": blank}
+        extra_headers = ("Timestamp",)
+    findings, metrics = _check(_write(tmp_path, _record(**changes), extra_headers=extra_headers))
+    assert findings["cash_snapshot_certification"]["status"] == "PASS"
+    assert metrics["cash_snapshot"]["as_of_utc"] == "2026-10-08T11:30:00+00:00"
+    assert metrics["cash_sar"] == pytest.approx(46_444.4642088, rel=0, abs=1e-9)
+
+
+@pytest.mark.parametrize("header", ["As Of", "Timestamp"])
+@pytest.mark.parametrize("invalid", ["invalid", "2026-10-08", 0, False, dt.date(2026, 10, 8)])
+def test_populated_invalid_timestamp_alias_cannot_fall_through_to_valid_sources(tmp_path, header, invalid):
+    changes = {"As Of": None, "Timestamp": "2026-10-08T11:30:00Z", header: invalid}
+    path = _write(tmp_path, _record(**changes), extra_headers=("As Of", "Timestamp"))
+    findings, metrics = _check(path)
+    _assert_uncertified(findings, metrics, "missing_or_invalid_timestamp")
+
+
+def test_blank_full_timestamp_alias_keeps_date_only_excel_time_fail_closed(tmp_path):
+    path = _write(tmp_path, _record(**{"As Of": None, "Time": dt.date(2026, 10, 8)}),
+                  extra_headers=("As Of",))
+    findings, metrics = _check(path)
+    _assert_uncertified(findings, metrics, "missing_or_invalid_timestamp")
+
+
 @pytest.mark.parametrize("header,reason", [
     ("As Of", "missing_or_invalid_timestamp"),
     ("Timestamp", "missing_or_invalid_timestamp"),
