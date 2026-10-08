@@ -145,12 +145,19 @@ def test_all_three_publication_paths_withhold_unknown_basis_even_with_guards_dis
     monkeypatch.setenv("TFB_FORECAST_PAIR_COHERENCE", display_pair)
     row = _old_scored_row()
 
-    def assert_basis(output):
+    def assert_basis(output, *, public=True):
         if tuple_mode == "enforce":
             _assert_held(output)
         else:
             assert output["overall_score"] == 90.0
-            assert output["expected_roi_12m"] == -0.2
+            # The display contract now withholds an inconsistent return,
+            # while off/observe scoring still consumes the original basis.
+            display_conflict = public and display_pair == "0"
+            assert output["expected_roi_12m"] == (None if display_conflict else -0.2)
+            if public:
+                if display_conflict:
+                    assert "sheet_tuple_conflict:expected_roi_12m" in output["warnings"]
+                assert row["expected_roi_12m"] == -0.2
             assert de._FCT_BASIS_TAG not in de._mpc_warning_parts(output)
 
     if seam == "projection":
@@ -187,7 +194,7 @@ def test_all_three_publication_paths_withhold_unknown_basis_even_with_guards_dis
         monkeypatch.setattr(de, "_extract_requested_symbols_from_body", lambda *_a, **_k: [SYMBOL])
         returned = asyncio.run(engine.get_sheet_rows("Top_10_Investments", body={"symbols": [SYMBOL]}))
         assert returned["rows"] == []  # the held candidate cannot take a board seat
-        assert_basis(row)
+        assert_basis(row, public=False)
     assert calls == []
 
 

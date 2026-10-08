@@ -2,8 +2,15 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.139.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.151.7
 ================================================================================
+
+WHY v5.151.7 - COPY-ONLY SHEET PRESENTATION CONTRACT
+- Value-bound margin receipts survive strict projection as display evidence;
+  percent-point margins serialize once as fractions for the native schema.
+- Unproven units and inconsistent derived returns are withheld in output
+  copies. Actual horizon days determine the displayed label. Source prices,
+  scoring, eligibility and all rollout modes retain their existing behavior.
 
 WHY v5.139.0 - SECTOR PASS-THROUGH ON VERIFIED IDENTITY (Fix AX; env-armed)
 - EVIDENCE (2026-09-08 Global_Markets census): Sector/Industry blank on
@@ -3893,7 +3900,9 @@ from core.financial_units import (
 # withhold failed funding rows while retaining protective exits and source facts.
 # v5.151.6: score witnessed margin units consistently across supplier, cache
 # and publication paths without changing source values or policy thresholds.
-__version__ = "5.151.6"
+__version__ = "5.151.7"
+
+from core.sheet_presentation import present_instrument_row
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -15666,14 +15675,16 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     _f7_settle_holdback(row)
-    return {k: _json_safe(row.get(k)) for k in keys}
+    displayed = present_instrument_row(row)
+    return {k: _json_safe(displayed.get(k)) for k in keys}
 
 
 def _strict_project_row_display(headers: Sequence[str], keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
+    displayed = present_instrument_row(row)
     for idx, key in enumerate(keys or []):
         header = headers[idx] if idx < len(headers or []) else key
-        out[header] = _json_safe(row.get(key))
+        out[header] = _json_safe(displayed.get(key))
     return out
 
 
@@ -15957,7 +15968,11 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
 
 
 def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
-    return [[_json_safe(row.get(k)) for k in keys] for row in rows or []]
+    result = []
+    for row in rows or []:
+        displayed = present_instrument_row(row)
+        result.append([_json_safe(displayed.get(k)) for k in keys])
+    return result
 
 
 def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
@@ -18896,7 +18911,7 @@ class DataEngineV5:
         # its own late veto with NO invariant — a vetoed row could leave
         # here as BUY + block_reason. Same shared wrapper as every surface.
         rows = _apply_surface_invariants_safe(rows, page)
-        return rows
+        return [present_instrument_row(row) for row in rows]
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
         canon = _canonicalize_sheet_name(sheet)
@@ -19027,6 +19042,7 @@ class DataEngineV5:
                 for _t10_i, _t10_r in enumerate(rows, start=1):
                     if "top10_rank" in _t10_r:
                         _t10_r["top10_rank"] = _t10_i
+            rows = [present_instrument_row(row) for row in rows]
             return {
                 "rows": rows,
                 "rows_display": _rows_display_objects_from_rows(rows, headers, keys),
@@ -19144,6 +19160,7 @@ class DataEngineV5:
         # wrapper — the v5.128.0 "single choke point" claim was wrong and is
         # retracted in the version WHY.
         rows = _apply_surface_invariants_safe(rows, target_sheet)
+        rows = [present_instrument_row(row) for row in rows]
         # ---------------------------------------------------------------------
 
         return {
