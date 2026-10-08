@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.2.0  (2026-08-18)
+W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.3.0  (2026-10-08)
 ================================================================================
+v2.3.0: retained page fixtures use the current writer's explicit-offset format;
+  an offsetless legacy clock is explicitly unverified rather than executable.
 v2.0.0 (external W1A-6 Deployment Audit adjudicated):
   F-07 enforce-mode mutation contract (deterministic synthetic fixtures);
   F-08 decision-owned _Status suppression test (new v6.39.5 behaviour);
@@ -601,6 +603,7 @@ check("S12.2 '0' (workflow default) -> disabled",
 env(TFB_SYNC_UPSTREAM_VERDICT="1", TFB_SYNC_VERDICT_PAGES=None,
     TFB_SYNC_VERDICT_MAX_AGE_MIN=None)
 import time as _t
+import datetime as _dt
 _now = _t.time()
 ALL_OK = {p: ("OK", _now - 60) for p in
           ["Market_Leaders", "Global_Markets", "Commodities_FX",
@@ -630,8 +633,13 @@ r._stamp_meta = {"requested": 100, "pre_persist_rows": 50, "klg_kept": 10}
 check("S12.9 success at 40% coverage -> STALE_COV",
       M._uv_page_state(r) == ("STALE_COV", 40.0))
 check("S12.10 parser round-trips writer format",
-      M._uv_parse_value("OK | cov=99.1 | run=7 | 2026-08-18 21:00:00")[0]
-      == "OK")
+      M._uv_parse_value("OK | cov=99.1 | run=7 | 2026-08-18 21:00:00+03:00")
+      == ("OK", _dt.datetime(2026, 8, 18, 18, tzinfo=_dt.timezone.utc).timestamp()))
+unverified = dict(ALL_OK)
+unverified["Global_Markets"] = M._uv_parse_value(
+    "OK | cov=99.1 | run=7 | 2026-08-18 21:00:00")
+check("S12.10b offsetless legacy time cannot certify publication freshness",
+      M._uv_compose(unverified, _now)[0] == "NOT_ACTIONABLE(unverified_ts:GM)")
 
 UVGRID = [["Global Key", "Value"], ["Last Global Update", "6/6/2026"],
           ["Backend URL", "https://x"], [], [], []]
@@ -674,13 +682,13 @@ check("S12.14 composite key/value: GM fresh-OK but ML/CFX/MF missing "
       and comp[1].startswith("NOT_ACTIONABLE(missing:ML)"), comp[1][:60])
 FULLGRID = [["Global Key", "Value"], ["Backend URL", "https://x"],
             ["TFB Feed Market_Leaders",
-             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+             f"OK | cov=100 | run=1 | {M._status_ts_str()}"],
             ["TFB Feed Commodities_FX",
-             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+             f"OK | cov=100 | run=1 | {M._status_ts_str()}"],
             ["TFB Feed Mutual_Funds",
-             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+             f"OK | cov=100 | run=1 | {M._status_ts_str()}"],
             ["TFB Feed Global_Markets", "FAILED | cov=n/a | run=1 | "
-             + _t.strftime('%Y-%m-%d %H:%M:%S')],
+             + M._status_ts_str()],
             ["TFB Decision Feed", "stale"], []]
 rec, sw = rec_writer(grid=FULLGRID)
 M._write_upstream_verdict(sw, "SID", [res_gm])
@@ -712,7 +720,7 @@ env(TFB_SYNC_UPSTREAM_VERDICT="0")
 print()
 print("=" * 78)
 npass = sum(1 for _, ok, _ in RESULTS if ok)
-print(f"HARNESS v2.2.0 RESULT: {npass}/{len(RESULTS)} PASS"
+print(f"HARNESS v2.3.0 RESULT: {npass}/{len(RESULTS)} PASS"
       + (f"  ({len(SKIPPED)} suite(s) skipped)" if SKIPPED else ""))
 for n, ok, d in RESULTS:
     if not ok:

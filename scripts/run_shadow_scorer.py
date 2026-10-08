@@ -1,6 +1,17 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
+Lookup/read failures previously became empty regret or shadow history. A failed
+regret read could append an existing fork again, replace its summary and publish
+a fresh S-1 PASS. Both required histories now validate before normal-run reads,
+prices, evaluation or writes. Missing/unreadable/malformed evidence exits 2 with
+fixed diagnostics and leaves the prior artifacts intact. Successful blank or
+canonical header-only tables remain valid empty evidence; optional unscored
+values stay optional. Retained cumulative bases are required and a genuine zero
+remains zero instead of reseeding capital at 100. This is a reader-integrity guard, not historical repair,
+net-return accounting, a distributed writer protocol or a promotion policy change.
+
 VERSION 1.7.3  (2026-09-08)  — FRESHNESS READ-BACK: NAME THE STARVERS (P-109)
 WHY v1.7.3: S-1 sits at 3/28 scored days with 33 excluded-infra; every
 trading day since 2026-09-02 ended `excluded_reason=fresh-floor` while the
@@ -102,6 +113,7 @@ USAGE:
   --dry-run       compute + print, write nothing
   (default)       append today's row, rewrite the S1_Gate dashboard
   --rollback-drill-passed   record today's drill marker (operator-run)
+  exit 2          required history unavailable/malformed; no writes or evaluation
 """
 
 from __future__ import annotations
@@ -111,6 +123,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -447,7 +460,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.2"
+SCRIPT_VERSION = "1.9.3"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -897,7 +910,7 @@ def cost_drag_pct(prev_symbols: Sequence[str], cur_symbols: Sequence[str],
 def chain_index(prev_index: Optional[float], daily_return_pct: Optional[float],
                 drag_pct: float = 0.0) -> float:
     """Geometric chaining, cost-adjusted. Missing return = flat day."""
-    base = float(prev_index) if prev_index else BASE_INDEX
+    base = float(prev_index) if prev_index is not None else BASE_INDEX
     r = (daily_return_pct or 0.0) - (drag_pct or 0.0)
     return round(base * (1.0 + r / 100.0), 6)
 
@@ -1489,27 +1502,101 @@ def summarize_price_errs(errs: Sequence[str], gate_on: bool,
 # --------------------------------------------------------------------------- #
 # sheets I/O                                                                   #
 # --------------------------------------------------------------------------- #
-def read_history(sh) -> List[Dict[str, Any]]:
+class EvidenceReadError(RuntimeError):
+    """Required history is unavailable; only fixed identifiers reach diagnostics."""
+
+    def __init__(self, tab: str, reason: str):
+        self.tab = tab
+        self.reason = reason
+        super().__init__(f"{tab}:{reason}")
+
+
+class _EvidenceRows(list):
+    """List-compatible parsed evidence with explicit successful-blank provenance."""
+
+    def __init__(self, rows=(), *, confirmed_blank: bool = False):
+        super().__init__(rows)
+        self.confirmed_blank = confirmed_blank
+
+
+def _evidence_row_blank(row: Sequence[Any]) -> bool:
+    """Zero and False are populated cells, never proof of an empty table."""
+    return all(cell is None or (isinstance(cell, str) and not cell.strip()) for cell in row)
+
+
+def _read_evidence_values(sh, tab: str, header: Sequence[str]) -> List[List[Any]]:
+    """Read a known table atomically, never infer bootstrap from an exception."""
     try:
-        ws = sh.worksheet(TAB_HISTORY)
-    except Exception:  # noqa: BLE001
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in ws.get_all_values()[1:]:
-        if not row or not str(row[0]).strip():
+        values = sh.worksheet(tab).get_all_values()
+    except Exception:  # noqa: BLE001 - backend details may contain credentials
+        raise EvidenceReadError(tab, "read_failed") from None
+    if not isinstance(values, (list, tuple)) or any(
+            not isinstance(row, (list, tuple))
+            or any(not isinstance(cell, (str, int, float, type(None))) for cell in row)
+            for row in values):
+        raise EvidenceReadError(tab, "malformed_table")
+    # A successful read of an existing, genuinely blank worksheet is distinct
+    # from missing/forbidden/unreadable history. Do not invent a header on failure.
+    if not values or all(_evidence_row_blank(row) for row in values):
+        return _EvidenceRows(confirmed_blank=True)
+    # Blank leading rows can remain when an empty worksheet received its first
+    # header by append; ignore only blank spacers, never a nonblank unknown row.
+    first = next(i for i, row in enumerate(values) if not _evidence_row_blank(row))
+    values = values[first:]
+    actual = [str(cell).strip().lower() for cell in values[0][:len(header)]]
+    if actual != [cell.lower() for cell in header]:
+        raise EvidenceReadError(tab, "malformed_header")
+    return _EvidenceRows(values[1:])
+
+
+def _evidence_number(tab: str, value: Any) -> Optional[float]:
+    """Preserve ordinary numeric/blank cells; reject supplied corrupt numbers."""
+    if value is None or not str(value).strip():
+        return None
+    if isinstance(value, bool):
+        raise EvidenceReadError(tab, "malformed_number")
+    number = _num(value)
+    if number is None or not math.isfinite(number):
+        raise EvidenceReadError(tab, "malformed_number")
+    return number
+
+
+def read_history(sh) -> List[Dict[str, Any]]:
+    """Read known shadow rows; unavailable evidence cannot bypass deduplication."""
+    rows = _read_evidence_values(sh, TAB_HISTORY, HISTORY_HEADER)
+    out = _EvidenceRows(confirmed_blank=rows.confirmed_blank)
+    for row in rows:
+        if _evidence_row_blank(row):
             continue
+        if len(row) < 6 or _parse_iso_date(row[0]) is None:
+            raise EvidenceReadError(TAB_HISTORY, "malformed_identity")
+        basket = str(row[1]).strip().upper()
+        if basket not in (CHAMPION, CHALLENGER, BENCHMARK, BENCHMARK_EQW):
+            raise EvidenceReadError(TAB_HISTORY, "malformed_identity")
         try:
-            prices = json.loads(row[3]) if len(row) > 3 and row[3] else {}
+            prices = {} if _evidence_row_blank([row[3]]) else json.loads(row[3])
         except Exception:  # noqa: BLE001
-            prices = {}
+            raise EvidenceReadError(TAB_HISTORY, "malformed_prices") from None
+        if not isinstance(prices, dict) or any(
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+                for value in prices.values()):
+            raise EvidenceReadError(TAB_HISTORY, "malformed_prices")
+        for value in prices.values():
+            _evidence_number(TAB_HISTORY, value)
+        # Every persisted row is a possible last-row base, including seeds and
+        # excluded/non-trading days. The writer always stores its carried index;
+        # absence must not invoke chain_index's first-run BASE_INDEX fallback.
+        cumulative_index = _evidence_number(TAB_HISTORY, row[5])
+        if cumulative_index is None:
+            raise EvidenceReadError(TAB_HISTORY, "malformed_number")
         out.append({
             "date": str(row[0]).strip()[:10],
-            "basket": str(row[1]).strip().upper() if len(row) > 1 else "",
+            "basket": basket,
             "symbols": [s for s in (str(row[2]).split(",") if len(row) > 2 else [])
                         if s.strip()],
             "prices": prices,
-            "daily_return": _num(row[4]) if len(row) > 4 else None,
-            "cum_index": _num(row[5]) if len(row) > 5 else None,
+            "daily_return": _evidence_number(TAB_HISTORY, row[4]) if len(row) > 4 else None,
+            "cum_index": cumulative_index,
             "note": str(row[8]).strip() if len(row) > 8 else "",
         })
     return out
@@ -1589,34 +1676,35 @@ def _measure_one(basket: str, p: Optional[Dict[str, Any]],
             "base_date": (str(p.get("date")) if p else None)}
 
 
-def append_history(sh, rows: List[List[Any]]) -> None:
-    try:
-        ws = sh.worksheet(TAB_HISTORY)
-    except Exception:  # noqa: BLE001
-        ws = sh.add_worksheet(title=TAB_HISTORY, rows=500,
-                              cols=len(HISTORY_HEADER))
-        ws.update(values=[HISTORY_HEADER], range_name="A1")
-    ws.append_rows(rows, value_input_option="RAW")
+def append_history(sh, rows: List[List[Any]], *, confirmed_blank: bool = False) -> None:
+    ws = sh.worksheet(TAB_HISTORY)
+    # Append a first header together with data only after a proven blank read.
+    # No clear/update and no exception-inferred worksheet creation.
+    body = [list(HISTORY_HEADER)] + rows if confirmed_blank else rows
+    ws.append_rows(body, value_input_option="RAW")
 
 
 def read_regret_ledger(sh) -> List[Dict[str, Any]]:
-    """Open forks as written (append-only). Scoring is always recomputed."""
-    try:
-        vals = sh.worksheet(TAB_REGRET).get_all_values()
-    except Exception:  # noqa: BLE001
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in vals[1:]:
-        if not row or not str(row[0]).strip():
+    """Open known forks as written; scoring is recomputed, never lost on read."""
+    # Only the seven original inputs are consumed; trailing outcome columns
+    # may be absent or blank because this runner recomputes them every day.
+    rows = _read_evidence_values(sh, TAB_REGRET, rg.LEDGER_HEADER[:7])
+    out = _EvidenceRows(confirmed_blank=rows.confirmed_blank)
+    for row in rows:
+        if _evidence_row_blank(row):
             continue
+        if (len(row) < 3 or _parse_iso_date(row[0]) is None
+                or str(row[1]).strip().upper() not in rg.FORK_KINDS
+                or not str(row[2] or "").strip()):
+            raise EvidenceReadError(TAB_REGRET, "malformed_identity")
         out.append({"date": str(row[0]).strip()[:10],
                     "fork": str(row[1]).strip().upper() if len(row) > 1 else "",
                     "symbol": str(row[2]).strip().upper() if len(row) > 2 else "",
                     "counterparty": (str(row[3]).strip().upper()
                                      if len(row) > 3 else ""),
                     "reason": str(row[4]) if len(row) > 4 else "",
-                    "ref_price": _num(row[5]) if len(row) > 5 else None,
-                    "alt_price": _num(row[6]) if len(row) > 6 else None})
+                    "ref_price": _evidence_number(TAB_REGRET, row[5]) if len(row) > 5 else None,
+                    "alt_price": _evidence_number(TAB_REGRET, row[6]) if len(row) > 6 else None})
     return out
 
 
@@ -1637,16 +1725,12 @@ def dedupe_new_forks(existing: Sequence[Dict[str, Any]],
     return fresh
 
 
-def append_regret(sh, rows: List[List[Any]]) -> None:
+def append_regret(sh, rows: List[List[Any]], *, confirmed_blank: bool = False) -> None:
     if not rows:
         return
-    try:
-        ws = sh.worksheet(TAB_REGRET)
-    except Exception:  # noqa: BLE001
-        ws = sh.add_worksheet(title=TAB_REGRET, rows=1000,
-                              cols=len(rg.LEDGER_HEADER))
-        ws.update(values=[rg.LEDGER_HEADER], range_name="A1")
-    ws.append_rows(rows, value_input_option="RAW")
+    ws = sh.worksheet(TAB_REGRET)
+    body = [list(rg.LEDGER_HEADER)] + rows if confirmed_blank else rows
+    ws.append_rows(body, value_input_option="RAW")
 
 
 def _now_riyadh() -> str:
@@ -1806,6 +1890,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[S1-GATE v{SCRIPT_VERSION}] rollback drill recorded {today}")
         return 0
 
+    # Required append-only evidence must be read before any normal-run writes,
+    # duplicate refusals, price acquisition or gate evaluation. A failure never
+    # manufactures an empty cohort or a fresh permission to promote.
+    try:
+        history = read_history(sh)
+        existing_forks = read_regret_ledger(sh)
+    except EvidenceReadError as exc:
+        print(f"[S1-GATE v{SCRIPT_VERSION}] NOT_DECIDABLE | "
+              f"evidence_unavailable:{exc.tab}:{exc.reason} | "
+              "promotion frozen; no writes or evaluation performed")
+        return 2
+
     # --- today's baskets -------------------------------------------------- #
     champ = sb.rows_to_records(sh.worksheet(sb.TAB_TOP10).get_all_values())
     champ_syms = [c["symbol"] for c in champ]
@@ -1837,7 +1933,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 eqw_syms.append(_s)
         eqw_on = bool(eqw_syms)
 
-    history = read_history(sh)
     if any(h["date"] == str(today) for h in history):
         _dup_msg = (f"[S1-GATE v{SCRIPT_VERSION}] {today} already recorded — "
                     f"append-only, refusing duplicate (point-in-time integrity)")
@@ -1882,7 +1977,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             _prev_ls = _sg_filter_prev(_prev_ls)
         if _bp_mode == "lastscored":
             prev = _prev_ls
-    existing_forks = read_regret_ledger(sh)
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
     new_forks = dedupe_new_forks(
         existing_forks,
@@ -2198,8 +2292,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     _write_errors: List[str] = []
     for _label, _fn in (
             ("S1_Gate", lambda: write_gate(sh, gate, meta)),
-            ("Shadow_History", lambda: append_history(sh, new_rows)),
-            ("Regret_Ledger", lambda: append_regret(sh, rg.to_rows(new_forks))),
+            ("Shadow_History", lambda: append_history(sh, new_rows,
+                confirmed_blank=history.confirmed_blank)),
+            ("Regret_Ledger", lambda: append_regret(sh, rg.to_rows(new_forks),
+                confirmed_blank=existing_forks.confirmed_blank)),
             ("Regret_Summary",
              lambda: write_regret_summary(sh, regret_summary, scored_forks))):
         try:

@@ -3,9 +3,19 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.11)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.13)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.13: upstream feed freshness requires a complete, numeric-offset
+publication timestamp. Missing, offsetless, malformed and future times cannot
+certify an OK page. Explicit offsets resolve to UTC independently of runner TZ;
+the existing per-page trailing window and cross-run composition remain intact.
+
+v6.64.12: validate current and explicit legacy Insights table contracts before
+rectification or publication. Malformed headers, matrix shapes, dictionary-key
+alignment and missing Section/Item labels retain the prior page and fail the run.
+Optional blank values, numeric zero and permitted empty boards stay valid.
 
 v6.64.11: failed HTTP-200 Insights envelopes and required empty analysis
 retain the prior page and fail the run with the upstream diagnostic. Usable
@@ -1861,7 +1871,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.11"
+SCRIPT_VERSION = "6.64.13"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -8448,7 +8458,7 @@ def _ohlc_fillguard_selftest_() -> bool:
 # =============================================================================
 _UPSTREAM_VERDICT_TAG = f"[UPSTREAM-VERDICT v{SCRIPT_VERSION}]"
 # Composite key the cockpit reads. Value contract (single cell, RAW):
-#   "EXECUTABLE | run=<id> | <YYYY-mm-dd HH:MM:SS> | ML:OK GM:OK CFX:OK MF:OK"
+#   "EXECUTABLE | run=<id> | <YYYY-mm-dd HH:MM:SS±HH:MM> | ML:OK GM:OK CFX:OK MF:OK"
 #   "NOT_ACTIONABLE(<reason>) | run=<id> | <ts> | ML:OK GM:STALE_COV ..."
 # Per-page key: "TFB Feed <Page>" ->
 #   "<STATE> | cov=<pct|n/a> | run=<id> | <ts>"   STATE in
@@ -8520,36 +8530,45 @@ def _uv_page_state(res: Any) -> tuple:
 
 def _uv_parse_value(val: str) -> tuple:
     """Parse a stored per-page value -> (STATE, epoch_seconds|None).
-    Tolerant: unknown shapes -> ("", None) and the page counts unhealthy."""
+    Only a complete SPACE/whole-seconds/numeric-offset timestamp proves its
+    instant. Offsetless legacy rows have unknown origin and cannot certify
+    freshness; the scheduled producer has emitted offsets since v6.46.0.
+    Unknown or ambiguous timestamp shapes retain the state with no proof."""
     try:
         parts = [p.strip() for p in str(val or "").split("|")]
         state = parts[0].split("(")[0].strip().upper() if parts else ""
-        ts = None
-        for p in parts:
-            try:
-                ts = time.mktime(time.strptime(p, "%Y-%m-%d %H:%M:%S"))
-                break
-            except Exception:
-                pass
-            try:
-                # v6.46.0: tolerate an explicit UTC-offset suffix
-                # ("2026-08-27 03:11:19+03:00") by parsing the naive prefix;
-                # producer and runner share the same zone, so [:19] is exact.
-                if len(p) >= 19:
-                    ts = time.mktime(time.strptime(p[:19], "%Y-%m-%d %H:%M:%S"))
-                    break
-            except Exception:
-                continue
-        return state, ts
+        stamps = [p for p in parts if re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}", p)]
+        if len(stamps) != 1 or not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}"
+                r"[+-][0-9]{2}:[0-9]{2}", stamps[0]):
+            return state, None
+        try:
+            instant = datetime.strptime(stamps[0], "%Y-%m-%d %H:%M:%S%z")
+            return state, instant.astimezone(timezone.utc).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return state, None
     except Exception:
         return "", None
 
 
+def _uv_finite_epoch(value: Any) -> bool:
+    """Only finite numeric instants qualify; bool is not a clock value."""
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
     """Pure composite over {page: (STATE, epoch|None)} -> (verdict, summary).
-    EXECUTABLE iff EVERY required page is OK and within the age window.
+    EXECUTABLE iff EVERY required page is OK with a proved nonfuture instant
+    within the inclusive trailing age window. Different run IDs are allowed;
+    this is publication freshness, not a single-run/cohort certificate.
     First failing page names the reason — deterministic, order = required
     list. Unit-tested in scripts/harness_w1a6.py S12."""
+    if not _uv_finite_epoch(now_epoch):
+        return "NOT_ACTIONABLE(clock_invalid)", "CLOCK_INVALID"
     max_age = _upstream_verdict_max_age_min() * 60.0
     abbr = {"Market_Leaders": "ML", "Global_Markets": "GM",
             "Commodities_FX": "CFX", "Mutual_Funds": "MF"}
@@ -8558,7 +8577,16 @@ def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
     for page in _upstream_verdict_pages():
         state, ts = page_states.get(page, ("", None))
         label = state or "MISSING"
-        if ts is not None and (now_epoch - ts) > max_age:
+        if ts is None:
+            if label == "OK":
+                label = "UNVERIFIED_TS"
+        elif not _uv_finite_epoch(ts):
+            if label == "OK":
+                label = "INVALID_TS"
+        elif ts > now_epoch:
+            if label == "OK":
+                label = "FUTURE_TS"
+        elif (now_epoch - ts) > max_age:
             label = "AGED"
         frags.append(f"{abbr.get(page, page)}:{label}")
         if not reason and label != "OK":
@@ -10725,6 +10753,66 @@ def _insights_payload_outcome(resp: Dict[str, Any]) -> Tuple[Optional[str], bool
     return None, partial
 
 
+def _validated_insights_table(
+    resp: Dict[str, Any],
+) -> Tuple[List[Any], List[List[Any]], Optional[str]]:
+    """Validate structure without repairing or inventing analytical content.
+
+    Current columns come from core.sheets.schema_registry / insights_builder;
+    the explicit predecessor remains the analysis_sheet_rows fallback. Both
+    contracts require string Section/Item labels. Other row values are optional.
+    Check raw rows and dictionary keys as well as the extracted table: extraction
+    filters malformed rows, and rectification can pad, truncate or stringify them.
+    """
+    envelope = resp
+    while isinstance(envelope.get("data"), dict):
+        envelope = envelope["data"]
+    raw_matrix = envelope.get("rows_matrix")
+    if raw_matrix is not None and not isinstance(raw_matrix, list):
+        return [], [], "Insights rows_matrix must be a list of rows"
+    rows = raw_matrix if isinstance(raw_matrix, list) else envelope.get("rows")
+    if rows is not None and not isinstance(rows, list):
+        return [], [], "Insights rows must be a list"
+    dict_rows = bool(rows) and not isinstance(raw_matrix, list) and all(isinstance(row, dict) for row in rows)
+    # Reject malformed entries before the generic extractor can discard them.
+    if rows and not dict_rows and not all(isinstance(row, list) for row in rows):
+        return [], [], "Insights raw rows have mixed or invalid row types"
+    keys = envelope.get("keys") if dict_rows else None
+    if keys is not None and not isinstance(keys, list):
+        return [], [], "Insights dictionary keys must be a list"
+    if keys and any(not isinstance(key, str) or not key.strip() for key in keys):
+        return [], [], "Insights dictionary keys must be nonblank strings"
+
+    headers, matrix = _extract_table_payload(envelope)
+    if not headers or any(not isinstance(header, str) or not header.strip() for header in headers):
+        return [], [], "Insights headers are missing or blank"
+    names = [_guard_norm(header) for header in headers]
+    if len(set(names)) != len(names):
+        return [], [], "Insights headers contain duplicate columns"
+    if not {"section", "item"}.issubset(names):
+        return [], [], "Insights headers lack required Section/Item columns"
+    current = {"section", "item", "metric", "value", "notes", "source", "sortorder"}
+    legacy = {"section", "item", "symbol", "metric", "value", "notes", "lastupdatedriyadh"}
+    if set(names) not in (current, legacy):
+        return [], [], "Insights headers do not match a supported current or legacy contract"
+    if keys and [_guard_norm(key) for key in keys] != names:
+        return [], [], "Insights dictionary keys do not align with their headers"
+
+    required = [names.index("section"), names.index("item")]
+    if dict_rows:
+        # Preserve raw identity types before dict conversion can stringify them.
+        lookup = keys or headers
+        if any(not isinstance(row.get(lookup[index]), str) or not row[lookup[index]].strip()
+               for row in rows for index in required):
+            return [], [], "Insights rows lack required string Section/Item labels"
+    for row in matrix:
+        if len(row) != len(headers):
+            return [], [], "Insights row column count does not match its headers"
+        if any(not isinstance(row[index], str) or not row[index].strip() for index in required):
+            return [], [], "Insights rows lack required string Section/Item labels"
+    return headers, matrix, None
+
+
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
@@ -11877,7 +11965,13 @@ async def _run_one_task(
                     last_err = f"{ep} -> Insights analysis failed: {_analysis_error}; preserving prior page."
                     continue
 
-            headers, rows_matrix = _extract_table_payload(data)
+            if _is_insights:
+                headers, rows_matrix, _table_problem = _validated_insights_table(data)
+                if _table_problem:
+                    last_err = f"{ep} -> {_table_problem}; preserving prior page."
+                    continue
+            else:
+                headers, rows_matrix = _extract_table_payload(data)
             # v6.15.0 TOP10-HEADER-REPAIR: the analysis route can return a blank
             # header row for Top_10 (118 empty-string cells), which the writer
             # would put on the sheet verbatim -> every column title blank ->
