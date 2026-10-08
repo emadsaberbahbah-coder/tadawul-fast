@@ -102,6 +102,7 @@ import random
 import re
 import threading
 import time
+import weakref
 import xml.etree.ElementTree as ET
 import zlib
 from collections import OrderedDict
@@ -1192,55 +1193,80 @@ _CACHE = AdvancedCache(_CONFIG.max_cache_items, _CONFIG.cache_ttl_seconds, _CONF
 # Single Flight Request Deduplication
 # =============================================================================
 
-class SingleFlight:
-    """Deduplicate concurrent requests.
+@dataclass
+class _SingleFlightState:
+    calls: Dict[str, "asyncio.Task[Any]"] = field(default_factory=dict)
+    closed: bool = False
 
-    v5.1.0: the existing future is retrieved under the dedup lock and then
-    awaited OUTSIDE the lock. v5.0.0 awaited inside the lock, which (a)
-    serialized all callers (even for unrelated keys) on that one lock and
-    (b) could deadlock nested SingleFlight.execute calls.
+
+class SingleFlight:
+    """Own one bounded task per key and event loop, shielding every caller.
+
+    Cancelling any caller, including the first, only cancels that caller's
+    wait. The shared work finishes or times out independently. Loop shutdown
+    or ``aclose`` cancels the owned tasks and wakes their remaining callers.
     """
 
-    def __init__(self) -> None:
-        self._calls: Dict[str, "asyncio.Future[Any]"] = {}
-        self._lock: Optional[asyncio.Lock] = None
+    def __init__(self, timeout_seconds: float = 60.0) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("SingleFlight timeout_seconds must be positive and finite")
+        self.timeout_seconds = timeout_seconds
+        self._states: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _SingleFlightState]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._states_lock = threading.Lock()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
+    def _get_state(self) -> _SingleFlightState:
+        loop = asyncio.get_running_loop()
+        # Only registry access crosses threads. Each state's calls belong to
+        # its loop; lookup/insertion never yields, so no async lock is needed.
+        with self._states_lock:
+            state = self._states.get(loop)
+            if state is None:
+                state = _SingleFlightState()
+                self._states[loop] = state
+            return state
+
+    async def _run(self, coro_func: Callable[[], Awaitable[Any]]) -> Any:
+        async with asyncio.timeout(self.timeout_seconds):
+            return await coro_func()
+
+    @staticmethod
+    def _finished(state: _SingleFlightState, key: str, task: "asyncio.Task[Any]") -> None:
+        # A completed task can be replaced before this callback is scheduled.
+        # Its cleanup must not remove the replacement flight.
+        if state.calls.get(key) is task:
+            state.calls.pop(key)
+        # Observe failures even when every subscriber has already cancelled.
+        # Awaiting the task still delivers that same exception to subscribers.
+        if not task.cancelled():
+            task.exception()
 
     async def execute(self, key: str, coro_func: Callable[[], Awaitable[Any]]) -> Any:
-        """Execute coroutine, deduplicating concurrent calls."""
-        lock = self._get_lock()
+        """Join or start shared work without transferring cancellation to it."""
+        state = self._get_state()
+        if state.closed:
+            raise RuntimeError("SingleFlight is closed for this event loop")
+        task = state.calls.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._run(coro_func))
+            state.calls[key] = task
+            task.add_done_callback(lambda done: self._finished(state, key, done))
+        return await asyncio.shield(task)
 
-        existing: Optional["asyncio.Future[Any]"] = None
-        future: Optional["asyncio.Future[Any]"] = None
+    def inflight(self) -> int:
+        """Return the number of running acquisitions on the current loop."""
+        return sum(not task.done() for task in self._get_state().calls.values())
 
-        async with lock:
-            if key in self._calls:
-                existing = self._calls[key]
-            else:
-                future = asyncio.get_running_loop().create_future()
-                self._calls[key] = future
-
-        # v5.1.0: await OUTSIDE the lock so we don't block unrelated keys.
-        if existing is not None:
-            return await existing
-
-        assert future is not None  # for type checkers
-        try:
-            result = await coro_func()
-            if not future.done():
-                future.set_result(result)
-            return result
-        except Exception as e:
-            if not future.done():
-                future.set_exception(e)
-            raise
-        finally:
-            async with lock:
-                self._calls.pop(key, None)
+    async def aclose(self) -> None:
+        """Reject new work and cancel/drain this loop's shared acquisitions."""
+        state = self._get_state()
+        state.closed = True
+        tasks = list(state.calls.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 _SINGLE_FLIGHT = SingleFlight()

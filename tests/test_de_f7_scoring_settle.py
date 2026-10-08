@@ -9,10 +9,15 @@ that re-runs the SAME pair on a deep copy until the decision fields stop
 moving (cap TFB_SCORING_SETTLE_MAX_PASSES, default 4, clamped 2..5).
 
   off (unset)  -> row untouched (byte-identical to v5.145.0)
-  observe      -> values untouched; ONE countable substring-safe tag on rows
-                  whose pass-2 output would differ
+  observe      -> stable values untouched; ONE countable substring-safe tag on
+                  rows whose pass-2 output would differ
   enforce      -> the settled row replaces the pass-1 row (tagged); rows stable
                   after pass 2 are returned untouched
+
+Detected errors and non-convergence in either active mode always withhold
+dependent scores, rank and new capital. Their canonical warnings/scoring_errors
+receipts survive projection and later switches to Off. Source observations stay
+fixed; generated forecasts retain the historical settlement behavior.
 
 Fixtures: six REAL Global_Markets input rows from the 2026-09-22 export
 (engine keys, derived fields stripped) — two early-target rows (provider
@@ -31,6 +36,7 @@ import os
 import re
 import sys
 import time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -519,21 +525,284 @@ def test_t5b_late_and_synthetic_rows_lose_the_fallback_label():
     _env(None)
 
 
-def test_t6_fail_open_on_exception():
-    _env("enforce")
-    row = _prep(FIXTURES[0])
-    before = copy.deepcopy(row)
-    saved = de._compute_scores_canonical_first
+def _failure_row():
+    return {
+        "symbol": "TEST.US", "current_price": 100.0, "overall_score": 80.0,
+        "opportunity_score": 85.0, "valuation_score": 75.0, "rank_overall": 1,
+        "recommendation": "BUY", "recommendation_detailed": "BUY",
+        "investability_status": "INVESTABLE", "final_action": "INVEST",
+        "forecast_price_12m": 120.0, "expected_roi_12m": 0.2,
+        "position_qty": 4, "stop_loss": 95.0,
+    }
 
-    def _boom(r):
+
+def _assert_withheld(out):
+    assert de._f7_settle_failed(out)
+    assert out["overall_score"] is None and out["opportunity_score"] is None
+    assert out["rank_overall"] is None
+    assert out["investability_status"] == "BLOCKED"
+    assert out["final_action"] == "DO_NOT_INVEST"
+    assert out["recommendation"] == out["recommendation_detailed"] == "HOLD"
+    assert "scoring_settlement:" in out["scoring_errors"]
+    assert out["current_price"] == 100.0 and out["forecast_price_12m"] == 120.0
+    assert out["position_qty"] == 4 and out["stop_loss"] == 95.0
+    # Policy switches cannot restore a known failure, nor may cached scores
+    # launder it back into an eligible row after canonical projection.
+    with patch.dict(os.environ, {ENV: "off", "TFB_TOP10_QUALITY_FILTER": "0", "TFB_INVESTABILITY_GATE": "0"}):
+        projected = de._strict_project_row(de.INSTRUMENT_CANONICAL_KEYS, copy.deepcopy(out))
+        projected.update(overall_score=99.0, rank_overall=1, recommendation="BUY",
+                         recommendation_detailed="BUY", investability_status="INVESTABLE", final_action="INVEST")
+        de._compute_scores_canonical_first(projected)
+        de._compute_scores_local_fallback(projected)
+        de._classify_recommendation_8tier(projected)
+        de._apply_rank_overall([projected])
+        assert projected["overall_score"] is None and projected["rank_overall"] is None
+        assert projected["final_action"] == "DO_NOT_INVEST"
+        assert not de._top10_row_is_eligible(projected)
+        assert de._f7_settle_pass(projected) is projected
+
+
+def test_t6_exception_is_typed_and_fail_closed_in_both_modes():
+    def boom(r):
+        r["current_price"] = 999
         raise RuntimeError("settle boom")
 
-    de._compute_scores_canonical_first = _boom
-    try:
-        out = de._f7_settle_pass(row, row["symbol"], "Global_Markets")
-    finally:
-        de._compute_scores_canonical_first = saved
-    assert out is row and row == before
+    for mode in ("observe", "enforce"):
+        _env(mode)
+        row = _failure_row()
+        before = copy.deepcopy(row)
+        with patch.object(de, "_compute_scores_canonical_first", boom):
+            result = de._f7_settle_result(row)
+            assert result.status == "error" and result.row is None
+            assert result.error_type == "RuntimeError" and result.passes_run == 1
+            assert row == before
+            out = de._f7_settle_pass(row)
+        _assert_withheld(out)
+        assert '"error_type":"RuntimeError"' in out["scoring_errors"]
+    _env(None)
+
+
+def test_t6b_oscillation_is_non_executable_in_both_modes():
+    def oscillate(r):
+        r["overall_score"] = 20.0 if r["overall_score"] == 80.0 else 80.0
+
+    for mode in ("observe", "enforce"):
+        _env(mode, 4)
+        row = _failure_row()
+        with patch.object(de, "_compute_scores_canonical_first", oscillate), \
+                patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
+            result = de._f7_settle_result(row)
+            assert result.status == "non_converged" and result.row is None
+            assert result.reason == "oscillation" and result.passes_run == 2
+            out = de._f7_settle_pass(row)
+        _assert_withheld(out)
+        assert '"reason":"oscillation"' in out["scoring_errors"]
+        assert '"overall_score":80.0' in out["scoring_errors"]
+    _env(None)
+
+
+def test_t6c_pass_limit_is_non_executable_in_both_modes():
+    def drift(r):
+        r["overall_score"] += 1.0
+
+    for mode in ("observe", "enforce"):
+        _env(mode, 2)
+        row = _failure_row()
+        with patch.object(de, "_compute_scores_canonical_first", drift), \
+                patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
+            result = de._f7_settle_result(row)
+            assert result.status == "non_converged" and result.row is None
+            assert result.reason == "pass_limit" and result.passes_run == 1
+            out = de._f7_settle_pass(row)
+        _assert_withheld(out)
+    _env(None)
+
+
+def test_t6d_protective_exits_survive_failure_projection_and_mode_switch():
+    def boom(r):
+        raise ValueError("settle boom")
+
+    for mode in ("observe", "enforce"):
+        _env(mode)
+        row = _failure_row()
+        row.update(recommendation="SELL", recommendation_detailed="SELL", final_action="EXIT")
+        with patch.object(de, "_compute_scores_canonical_first", boom):
+            out = de._f7_settle_pass(row)
+        _env("off")
+        projected = de._strict_project_row(de.INSTRUMENT_CANONICAL_KEYS, out)
+        assert projected["recommendation"] == "SELL" and projected["final_action"] == "EXIT"
+        assert projected["investability_status"] == "WATCHLIST"
+        assert projected["position_qty"] == 4
+        assert out["stop_loss"] == 95.0
+        assert not de._top10_row_is_eligible(projected)
+    _env(None)
+
+
+def test_t6e_canonical_exception_cannot_fall_back_to_valid_scores():
+    def boom(r):
+        raise RuntimeError("canonical scorer failure")
+
+    _env("enforce")
+    for scorer in (boom, lambda r: {}):
+        with patch.object(de, "_SCORING_COMPUTE_SCORES_AVAILABLE", True), \
+                patch.object(de, "_scoring_compute_scores", scorer), \
+                patch.object(de, "_compute_scores_local_fallback") as fallback:
+            result = de._f7_settle_result(_failure_row())
+        assert result.status == "error" and result.row is None
+        assert result.error_type == "RuntimeError"
+        fallback.assert_not_called()
+    _env(None)
+
+
+def test_t6f_source_observation_mutation_is_a_failure():
+    def mutate_price(r):
+        r["current_price"] = 200.0
+
+    _env("enforce")
+    row = _failure_row()
+    with patch.object(de, "_compute_scores_canonical_first", mutate_price), \
+            patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
+        result = de._f7_settle_result(row)
+        assert result.status == "error" and result.row is None
+        assert result.reason == "source_inputs_changed:current_price"
+        out = de._f7_settle_pass(row)
+    _assert_withheld(out)
+    _env(None)
+
+
+def test_t6g_known_failure_cannot_add_underweight_portfolio_capital():
+    row = _failure_row()
+    row["warnings"] = "f7_settle_failed:error"
+    row.update(position_value=400.0, target_weight=90.0, currency="USD")
+    other = {"symbol": "OTHER.US", "position_value": 3600.0, "currency": "USD"}
+    with patch.dict(os.environ, {"TFB_PF_WEIGHT_FX": "0"}):
+        de._compute_portfolio_fields([row, other])
+    assert row["weight_gap"] == 80.0
+    assert row["action_flag"] == row["decision"] == "HOLD"
+    row.update(recommendation="SELL", recommendation_detailed="SELL")
+    assert de._portfolio_decision(row, 80.0, 5.0, 60.0) == "SELL"
+
+
+def test_t6h_stable_results_preserve_independent_golden_scores():
+    _env("enforce", 4)
+    for fx in FIXTURES:
+        row = _prep(fx)
+        before = copy.deepcopy(row)
+        golden = _golden(copy.deepcopy(row), 4)
+        result = de._f7_settle_result(row)
+        assert result.status == "stable" and result.settled_at is not None
+        assert _norm(result.row) == _norm(golden)
+        assert row == before
+    _env(None)
+
+
+def test_t6i_real_fixture_recommendation_exception_cannot_certify_settlement():
+    def boom(*args, **kwargs):
+        raise ValueError("canonical recommendation failure")
+
+    for mode in ("observe", "enforce"):
+        _env(mode, 4)
+        row = _prep(FIXTURES[1])  # 3328.HK previously settled to ACCUMULATE.
+        before = copy.deepcopy(row)
+        with patch.object(de, "_scoring_apply_canonical", boom):
+            result = de._f7_settle_result(row)
+            assert result.status == "error" and result.row is None
+            assert result.error_type == "ValueError" and result.passes_run == 1
+            assert row == before
+            out = de._f7_settle_pass(row)
+        assert de._f7_settle_failed(out) and out["overall_score"] is None
+        assert out["final_action"] == "DO_NOT_INVEST"
+        assert not de._top10_row_is_eligible(out)
+    # Outside settlement the established degraded recommendation remains.
+    ordinary = _failure_row()
+    with patch.object(de, "_scoring_apply_canonical", boom):
+        de._classify_recommendation_8tier(ordinary)
+    assert ordinary["recommendation"] == "BUY"
+    assert ordinary["recommendation_source"] == "engine_local_score"
+    assert not de._f7_settle_failed(ordinary)
+    _env(None)
+
+
+def test_t6j_missing_or_invalid_recommendation_patch_cannot_use_local_fallback():
+    _env("enforce")
+    for recommendation_patch in (None, {}, {"recommendation": "unrecognized"},
+                                 {"recommendation": "BUY", "scoring_errors": ["conviction_failed:ValueError"]}):
+        row = _prep(FIXTURES[1])
+        with patch.object(de, "_scoring_apply_canonical", lambda *a, **k: recommendation_patch):
+            result = de._f7_settle_result(row)
+        assert result.status == "error" and result.row is None
+    _env(None)
+
+
+def test_t6k_sanitization_failure_only_propagates_during_settlement():
+    def boom(r):
+        raise ValueError("sanitization failure")
+
+    _env("enforce")
+    row = _prep(FIXTURES[1])
+    with patch.object(de, "_sanitize_primary_path_enabled", lambda: True), \
+            patch.object(de, "_apply_v572_sanitization", boom):
+        result = de._f7_settle_result(row)
+        assert result.status == "error" and result.error_type == "ValueError"
+        ordinary = _failure_row()
+        with patch.object(de, "_scoring_compute_scores", lambda r: {"overall_score": 81.0}):
+            de._compute_scores_canonical_first(ordinary)
+        assert ordinary["overall_score"] == 81.0 and not de._f7_settle_failed(ordinary)
+    _env(None)
+
+
+def test_t6l_returned_processing_failures_and_partial_scores_are_non_executable():
+    _env("enforce")
+    for score_patch in (
+        {"overall_score": 80.0, "scoring_errors": ["conviction_failed:ValueError"]},
+        {"overall_score": 80.0, "scoring_errors": "insights_failed:RuntimeError"},
+        {"overall_score": 80.0, "scoring_errors": ["scoring_exception:TypeError"]},
+        {"quality_score": 75.0},
+    ):
+        with patch.object(de, "_scoring_compute_scores", lambda r: score_patch), \
+                patch.object(de, "_compute_scores_local_fallback") as fallback:
+            result = de._f7_settle_result(_failure_row())
+        assert result.status == "error" and result.row is None
+        fallback.assert_not_called()
+    _env(None)
+
+
+def test_t6m_display_aliases_cannot_resurrect_withheld_scores_or_hide_failure():
+    row = _failure_row()
+    row.update({"Overall Score": 99.0, "Rank Overall": 1,
+                "Warnings": ["f7_settle_failed:error"], "warnings": "unrelated_warning"})
+    assert de._f7_settle_failed(row)
+    de._f7_settle_holdback(row)
+    assert row["Overall Score"] is None
+    assert row["overall_score"] is None and row["rank_overall"] is None
+    # Even input that has not passed holdback must preserve its alias receipt
+    # and clear restored values at the public normalization boundary.
+    raw = _failure_row()
+    raw.update({"overall_score": None, "Overall Score": 99.0,
+                "Warnings": "f7_settle_failed:error", "warnings": "unrelated_warning"})
+    keys = ["overall_score", "rank_overall", "warnings", "recommendation", "final_action"]
+    headers = ["Overall Score", "Rank Overall", "Warnings", "Recommendation", "Final Action"]
+    normalized = de._normalize_to_schema_keys(keys, headers, raw)
+    assert set(normalized) == set(keys)
+    assert normalized["overall_score"] is None and normalized["rank_overall"] is None
+    assert normalized["recommendation"] == "HOLD"
+    assert normalized["final_action"] == "DO_NOT_INVEST"
+    assert de._f7_settle_failed(normalized)
+
+
+def test_t6n_unavailable_canonical_modules_only_allow_fallback_outside_settlement():
+    _env("enforce")
+    with patch.object(de, "_SCORING_COMPUTE_SCORES_AVAILABLE", False), \
+            patch.object(de, "_compute_scores_local_fallback") as fallback:
+        result = de._f7_settle_result(_failure_row())
+        assert result.status == "error" and result.row is None
+        fallback.assert_not_called()
+        de._compute_scores_canonical_first(_failure_row())
+        fallback.assert_called_once()
+    row = _prep(FIXTURES[1])
+    with patch.object(de, "_SCORING_APPLY_CANONICAL_AVAILABLE", False):
+        result = de._f7_settle_result(row)
+        assert result.status == "error" and result.row is None
     _env(None)
 
 
@@ -562,7 +831,21 @@ def test_t8_wiring_and_version():
 
 TESTS = [test_t1_gate_explicit_words_only, test_t2_max_passes_clamped, test_t3_off_is_byte_identical,
          test_t4_observe_values_untouched_one_safe_tag, test_t5_enforce_equals_independent_golden,
-         test_t5b_late_and_synthetic_rows_lose_the_fallback_label, test_t6_fail_open_on_exception,
+         test_t5b_late_and_synthetic_rows_lose_the_fallback_label,
+         test_t6_exception_is_typed_and_fail_closed_in_both_modes,
+         test_t6b_oscillation_is_non_executable_in_both_modes,
+         test_t6c_pass_limit_is_non_executable_in_both_modes,
+         test_t6d_protective_exits_survive_failure_projection_and_mode_switch,
+         test_t6e_canonical_exception_cannot_fall_back_to_valid_scores,
+         test_t6f_source_observation_mutation_is_a_failure,
+         test_t6g_known_failure_cannot_add_underweight_portfolio_capital,
+         test_t6h_stable_results_preserve_independent_golden_scores,
+         test_t6i_real_fixture_recommendation_exception_cannot_certify_settlement,
+         test_t6j_missing_or_invalid_recommendation_patch_cannot_use_local_fallback,
+         test_t6k_sanitization_failure_only_propagates_during_settlement,
+         test_t6l_returned_processing_failures_and_partial_scores_are_non_executable,
+         test_t6m_display_aliases_cannot_resurrect_withheld_scores_or_hide_failure,
+         test_t6n_unavailable_canonical_modules_only_allow_fallback_outside_settlement,
          test_t7_tag_composer_degrades_on_forbidden_substring, test_t8_wiring_and_version]
 
 if __name__ == "__main__":

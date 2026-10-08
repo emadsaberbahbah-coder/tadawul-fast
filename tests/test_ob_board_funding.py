@@ -518,3 +518,55 @@ def test_zero_cash_minimum_ticket_policy_exclusion_does_not_solicit_capital():
     assert any(row["symbol"] == "LATER.SR" and row["failed_gate"] == "Diversification"
                for row in allocated["near_miss"])
     assert not any(row["failed_gate"] == "Funding" for row in allocated["near_miss"])
+
+
+@pytest.mark.parametrize("state", ["error", "non_converged"])
+@pytest.mark.parametrize("investability", ["INVESTABLE", "WATCHLIST", ""])
+def test_failed_scoring_settlement_cannot_rank_or_fund_with_policy_gates_off(
+    monkeypatch, state, investability,
+):
+    monkeypatch.setenv("TFB_SCORING_SETTLE", "off")
+    monkeypatch.setenv("TFB_OPP_INVESTABILITY_GATE", "0")
+    monkeypatch.setenv("TFB_T10_REL_FLOOR_MODE", "display")
+    row = _row("FAILED.SR", warnings="provider_ok;f7_settle_failed:" + state,
+               investability_status=investability)
+    criteria = {"investability_gate_enabled": False, "sell_class_gate_enabled": False}
+    ordinary = _build([row], criteria)
+    assert ordinary["status"] == "ok", ordinary.get("message")
+    assert ordinary["selected"] == []
+    _assert_no_execution(ordinary)
+    failed = ordinary["candidates_rows"][0]
+    assert failed["verdict"] == "DO_NOT_INVEST"
+    assert failed["opportunity_score"] is None
+    assert failed["first_fail"]["gate"] == "Scoring Settlement"
+    assert failed["first_fail"]["current"] == state
+    research = _research([row], criteria)
+    allocated = _allocate(research, ["FAILED.SR"], criteria=criteria)
+    assert allocated["selected"] == []
+    _assert_no_execution(allocated)
+
+
+@pytest.mark.parametrize("failure_field", ["Warnings", "warning", "scoring_errors"])
+def test_scoring_failure_cannot_be_hidden_by_an_earlier_clean_warning_alias(failure_field):
+    row = _row("FAILED.SR", warnings="provider_ok")
+    row[failure_field] = "f7_settle_failed:error"
+    payload = _build([row], {"investability_gate_enabled": False})
+    assert payload["selected"] == []
+    _assert_no_execution(payload)
+    assert payload["candidates_rows"][0]["first_fail"]["gate"] == "Scoring Settlement"
+
+
+def test_settlement_observation_is_not_a_failure_marker():
+    clean = _row("STABLE.SR")
+    observed = {**clean, "warnings": "f7_settle:observe:st2:p2:chg1"}
+    assert _build([observed])["selected"] == _build([clean])["selected"]
+
+
+def test_failed_settlement_does_not_consume_capped_scan_capacity(monkeypatch):
+    monkeypatch.setenv("TFB_OPP_PREGATE_ORDER", "1")
+    failed = _row("FAILED.SR", warnings="f7_settle_failed:error",
+                  forecast_reliability_score=99.0)
+    clean = _row("CLEAN.SR")
+    payload = _build([failed, clean], {"max_candidates": 1})
+    assert [ticket["symbol"] for ticket in payload["selected"]] == ["CLEAN.SR"]
+    assert payload["kpis"]["pregate"]["fail_scoring_settlement"] == 1

@@ -2923,7 +2923,7 @@ from decimal import Decimal
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -5696,10 +5696,12 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     negative even when the gate has NOT run yet (the direct Top_10 path filters
     before _strict_project_row). Closes the Fix S / Fix J seam where a
     negative-forecast WATCHLIST name could still rank into the Top 10."""
-    if not _top10_quality_filter_enabled():
-        return True
     if not isinstance(row, dict):
         return False
+    if _f7_settle_failed(row):
+        return False
+    if not _top10_quality_filter_enabled():
+        return True
     if _as_float(row.get("current_price")) is None and _as_float(row.get("price")) is None:
         return False
     rec = _canonical_recommendation(row.get("recommendation_detailed")) \
@@ -7099,6 +7101,8 @@ def _fc_tuple_coherence(row: Dict[str, Any]) -> int:
                 _v573_append_warning(row, "%s:%s:observe" % (_FCT_TAG, h))
             n += 1
     except Exception:
+        if row.get("_f7_settlement_active"):
+            raise
         return n
     return n
 
@@ -7191,6 +7195,9 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     a "provider bullish / engine cautious" disagreement is surfaced as a FLAG,
     not a block, and capped-ROI rows are not benched.
     """
+    if isinstance(row, dict) and _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return
     if not isinstance(row, dict) or not _investability_gate_enabled():
         return
     _fct_held = _fc_tuple_mode() == "enforce" and _FCT_BASIS_TAG in _mpc_warning_parts(row)
@@ -7656,6 +7663,9 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     """
     if not isinstance(row, dict):
         return
+    if _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return
 
     # -- Step 1: empty-row guard ------------------------------------
     if _is_empty_data_row(row):
@@ -7754,10 +7764,15 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
                 errs.append(err)
             else:
                 row["scoring_errors"] = [err]
+            if row.get("_f7_settlement_active"):
+                raise
 
         if patch and isinstance(patch, dict):
+            _f7_reject_scoring_patch_failures(row, patch)
             _preserve_scoring_provenance(row, patch)
             rec_raw = patch.get("recommendation")
+            if row.get("_f7_settlement_active") and _safe_str(rec_raw).strip().upper() not in _V573_RECOMMENDATION_ENUM:
+                raise RuntimeError("canonical recommendation returned invalid recommendation")
             rec_canon = _v573_collapse_to_canonical_enum(rec_raw)
             if rec_canon:
                 rec = rec_canon
@@ -7765,6 +7780,9 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
                 reason = _safe_str(patch.get("recommendation_reason")) or \
                     f"{rec}: Engine classification via core.scoring."
                 priority_band = _safe_str(patch.get("recommendation_priority_band"))
+
+        if not rec and row.get("_f7_settlement_active"):
+            raise RuntimeError("canonical recommendation returned no valid recommendation")
 
     # -- Step 3c: score-based local fallback, then conservative HOLD ----
     # v5.77.15: when the engine path (Step 3b) produced no recommendation —
@@ -7777,6 +7795,8 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     # in the Reco Source column for diagnostics. Only when there is no usable
     # overall_score do we fall through to the conservative HOLD below.
     if not rec:
+        if row.get("_f7_settlement_active"):
+            raise RuntimeError("canonical recommendation unavailable during settlement")
         _ov = _as_float(row.get("overall_score"))
         if _ov is not None:
             if _ov >= 85.0:
@@ -8846,6 +8866,9 @@ def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
 def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return row
+    if _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return row
 
     _synthesize_market_cap_if_zero(row)
     _compute_intrinsic_and_upside(row)
@@ -8882,6 +8905,128 @@ _F7_SETTLE_MAX_ENV: str = "TFB_SCORING_SETTLE_MAX_PASSES"
 _F7_SETTLE_MAX_DEFAULT: int = 4
 _F7_SETTLE_MAX_CAP: int = 5
 _F7_SETTLE_TAG: str = "f7_settle"
+_F7_SETTLE_FAILURE_TAG: str = "f7_settle_failed:"
+# Source observations remain fixed while generated forecasts and scores settle.
+# The broader TFB-05 canonical tuple / execution-policy split is independent.
+_F7_SETTLE_SOURCE_FIELDS: Tuple[str, ...] = (
+    "symbol", "name", "asset_class", "exchange", "currency", "country",
+    "sector", "industry", "current_price", "price", "previous_close",
+    "open_price", "day_high", "day_low", "week_52_high", "week_52_low",
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares",
+    "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield",
+    "payout_ratio", "revenue_ttm", "revenue_growth_yoy", "gross_margin",
+    "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "target_mean_price", "provider_rating",
+)
+_F7_SETTLE_DEPENDENT_FIELDS: Tuple[str, ...] = (
+    "overall_score", "overall_score_raw", "overall_penalty_factor",
+    "opportunity_score", "valuation_score", "value_score", "quality_score",
+    "momentum_score", "growth_score", "technical_score", "conviction_score",
+    "sector_relative_score", "rank_overall", "top10_rank", "top_factors",
+)
+
+
+@dataclass(frozen=True)
+class F7SettlementResult:
+    """Only stable results contain a publishable row; failures retain evidence."""
+    status: Literal["stable", "error", "non_converged"]
+    row: Optional[Dict[str, Any]] = None
+    settled_at: Optional[int] = None
+    passes_run: int = 0
+    first_diff: Tuple[Tuple[str, str, str], ...] = ()
+    last_diff: Tuple[Tuple[str, str, str], ...] = ()
+    reason: str = ""
+    error_type: str = ""
+
+
+def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
+    """Read all warning aliases before header normalization chooses one."""
+    if not isinstance(row, Mapping):
+        return []
+    aliases = {_norm_key(key) for key in ("warnings", *_CANONICAL_FIELD_ALIASES.get("warnings", ()))}
+    parts: List[str] = []
+    for key, value in row.items():
+        normalized_key = key.lower().strip("_") if isinstance(key, str) and key.isidentifier() else _norm_key(key)
+        if normalized_key in aliases:
+            parts.extend(part for part in _mpc_warning_parts({"warnings": value})
+                         if part.startswith(_F7_SETTLE_FAILURE_TAG))
+    return list(dict.fromkeys(parts))
+
+
+def _f7_settle_failed(row: Mapping[str, Any]) -> bool:
+    """A known failure survives projection, cache reuse and later mode changes."""
+    return bool(_f7_settle_failure_parts(row))
+
+
+def _f7_reject_scoring_patch_failures(row: Mapping[str, Any], patch: Mapping[str, Any]) -> None:
+    """Caught inner processing failures are not proof of stable scoring.
+
+    Data-quality notices (missing inputs, provider errors, sanitation flags)
+    retain their existing meaning. Explicit processing exceptions disclosed
+    by the canonical scorer prevent an active settlement from succeeding.
+    """
+    if not row.get("_f7_settlement_active"):
+        return
+    errors = _coerce_scoring_errors_for_sheet(patch.get("scoring_errors")) or ""
+    if re.search(r"(?:^|[;\s])(?:[a-z0-9_.]*_failed|scoring_exception):", errors, re.IGNORECASE):
+        raise RuntimeError("canonical scorer reported processing failure: " + errors)
+
+
+def _f7_settle_holdback(row: Dict[str, Any], result: Optional[F7SettlementResult] = None) -> None:
+    """Withhold dependent scores/new capital while retaining facts and exits."""
+    if not isinstance(row, dict):
+        return
+    if result is not None and result.status != "stable":
+        import json
+        _v573_append_warning(row, _F7_SETTLE_FAILURE_TAG + result.status)
+        details = {
+            "status": result.status, "reason": result.reason,
+            "passes_run": result.passes_run, "error_type": result.error_type,
+            "first_diff": result.first_diff, "last_diff": result.last_diff,
+            "pass1_scores": {k: _json_safe(row.get(k)) for k in _F7_SETTLE_DEPENDENT_FIELDS if k in row},
+        }
+        error = "scoring_settlement:" + json.dumps(details, sort_keys=True, separators=(",", ":"))
+        existing = _coerce_scoring_errors_for_sheet(row.get("scoring_errors"))
+        row["scoring_errors"] = (existing + "; " + error) if existing else error
+    if not _f7_settle_failed(row):
+        return
+    for part in _f7_settle_failure_parts(row):
+        _v573_append_warning(row, part)
+    dependent_aliases = {
+        _norm_key(alias) for key in _F7_SETTLE_DEPENDENT_FIELDS
+        for alias in (key, *_CANONICAL_FIELD_ALIASES.get(key, ()))
+    }
+    for key in tuple(row):
+        if _norm_key(key) in dependent_aliases:
+            row[key] = None
+    for key in _F7_SETTLE_DEPENDENT_FIELDS:
+        for alias in _CANONICAL_FIELD_ALIASES.get(key, (key,)):
+            if alias in row or alias == key:
+                row[alias] = None
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) or _canonical_recommendation(row.get("recommendation"))
+    exit_action = _safe_str(row.get("final_action")).strip().upper() in {"EXIT", "SELL", "REDUCE", "TRIM"}
+    prior_hard_block = _safe_str(row.get("investability_status")).strip().upper() == "BLOCKED"
+    row["investability_status"] = "WATCHLIST" if (exit_action or rec in _TOP10_EXCLUDED_RECO_FAMILIES) and not prior_hard_block else "BLOCKED"
+    if not exit_action:
+        row["final_action"] = "DO_NOT_INVEST"
+    reason = "Scoring settlement failed; clean rebuild required"
+    prior_reason = _safe_str(row.get("block_reason")).strip()
+    if reason not in prior_reason:
+        row["block_reason"] = (prior_reason + " | " + reason) if prior_reason else reason
+    if rec in _RECO_COHERENCE_BUY_FAMILY:
+        row["recommendation"] = row["recommendation_detailed"] = "HOLD"
+        row["recommendation_reason"] = "HOLD: " + row["block_reason"]
+        for key in ("recommendation_detail", "signal", "overall_signal"):
+            if key in row:
+                row[key] = None
+        _reconcile_recommendation_family(row)
+    for key in ("action_flag", "decision"):
+        if _safe_str(row.get(key)).strip().upper() in {"ADD", "BUY", "INVEST", "ACCUMULATE"}:
+            row[key] = "HOLD"
+    if not exit_action and rec not in _TOP10_EXCLUDED_RECO_FAMILIES:
+        row["position_size_hint"] = "Hold existing; no new capital (scoring settlement failed)"
 # (row key, tag code, kind, tolerance) -- the decision fields compared between
 # consecutive passes. Codes are chosen so the finished tag can never contain a
 # substring the investability gate tests on warnings (_REL_PATH_FORBIDDEN).
@@ -8948,9 +9093,10 @@ def _f7_settle_fmt(kind: str, value: Any) -> str:
     return _f7_settle_token(value)
 
 
-def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any]) -> List[Tuple[str, str, str]]:
+def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any], *, strict: bool = False) -> List[Tuple[str, str, str]]:
     """Decision fields whose value differs between two passes, as
-    (code, before, after) tokens. Missing-on-both is equal; never raises."""
+    (code, before, after) tokens. Missing-on-both is equal. Strict settlement
+    comparison errors propagate to the typed error result."""
     out: List[Tuple[str, str, str]] = []
     try:
         for key, code, kind, tol in _F7_SETTLE_FIELDS:
@@ -8969,7 +9115,8 @@ def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any]) -> List[Tu
                 if sa != sb:
                     out.append((code, _f7_settle_token(a), _f7_settle_token(b)))
     except Exception:
-        pass
+        if strict:
+            raise
     return out
 
 
@@ -8989,55 +9136,88 @@ def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
     return tag
 
 
-def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
-    """v5.147.0 (F-7): re-run the scoring + enhancement pair on a deep copy of
-    the pass-1 row until the decision fields stop moving (cap
-    TFB_SCORING_SETTLE_MAX_PASSES). off -> row untouched. observe -> values
-    untouched, ONE countable tag on rows whose pass-2 output would differ.
-    enforce -> the settled row (last pass) replaces the pass-1 row and carries
-    the tag; rows already stable after pass 2 are returned untouched.
-    Fail-open: any exception returns the original row unchanged."""
-    mode = _f7_settle_mode()
-    if mode == "off" or not isinstance(row, dict):
-        return row
+def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
+    """Evaluate isolated iterates against a fixed snapshot of source inputs.
+
+    Generated forecasts may evolve with scores (the existing synthetic path).
+    Source observations cannot change, and a failure never exposes an iterate
+    as a usable row. The full canonical forecast tuple is owned by TFB-05.
+    """
+    passes_run = 0
+    first_diff: Tuple[Tuple[str, str, str], ...] = ()
+    last_diff: Tuple[Tuple[str, str, str], ...] = ()
     try:
         import copy as _copy
         max_passes = _f7_settle_max_passes()
-        prev: Dict[str, Any] = row
-        last: Dict[str, Any] = row
-        first_diff: Optional[List[Tuple[str, str, str]]] = None
-        settled_at: Optional[int] = None
-        passes_run = 0
+        # Never pass the caller's row or its nested values to the scorer.
+        frozen_input = _copy.deepcopy(row)
+        prev = _copy.deepcopy(frozen_input)
+        source_input = {key: _copy.deepcopy(frozen_input.get(key)) for key in _F7_SETTLE_SOURCE_FIELDS}
+        history = [prev]
         for k in range(2, max_passes + 1):
             cand = _copy.deepcopy(prev)
+            cand["_f7_settlement_active"] = True
+            passes_run += 1
             _compute_scores_canonical_first(cand)
             _apply_phase_dd_enhancements(cand)
-            passes_run += 1
-            diff = _f7_settle_diff(prev, cand)
-            if first_diff is None:
-                first_diff = diff
-            if not diff:
-                settled_at = k
-                if k > 2:
-                    last = cand
-                break
-            last = cand
+            cand.pop("_f7_settlement_active", None)
+            changed_inputs = [key for key, value in source_input.items() if cand.get(key) != value]
+            if changed_inputs:
+                return F7SettlementResult(
+                    "error", passes_run=passes_run, first_diff=first_diff,
+                    reason="source_inputs_changed:" + ",".join(changed_inputs),
+                )
+            if _as_float(cand.get("overall_score")) is None:
+                return F7SettlementResult("error", passes_run=passes_run, first_diff=first_diff,
+                                          reason="missing_overall_score")
+            last_diff = tuple(_f7_settle_diff(prev, cand, strict=True))
+            if passes_run == 1:
+                first_diff = last_diff
+            if not last_diff:
+                stable_row = row if k == 2 else cand
+                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff)
+            if any(not _f7_settle_diff(prior, cand, strict=True) for prior in history):
+                return F7SettlementResult("non_converged", passes_run=passes_run,
+                                          first_diff=first_diff, last_diff=last_diff, reason="oscillation")
+            history.append(cand)
             prev = cand
-        if not first_diff:
-            return row
-        tag = _f7_settle_tag(mode, settled_at, passes_run, first_diff)
-        if mode == "observe":
-            _v573_append_warning(row, tag)
-            return row
-        _v573_append_warning(last, tag)
-        return last
-    except Exception as _sx:  # pragma: no cover - defensive
+        return F7SettlementResult("non_converged", passes_run=passes_run,
+                                  first_diff=first_diff, last_diff=last_diff, reason="pass_limit")
+    except Exception as exc:
+        return F7SettlementResult("error", passes_run=passes_run, first_diff=first_diff,
+                                  last_diff=last_diff, reason="scorer_exception", error_type=type(exc).__name__)
+
+
+def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
+    """Keep stable mode semantics; detected failures always withhold execution.
+
+    Off leaves unmarked rows unchanged. Observe keeps successful pass-1 values
+    and Enforce publishes a proved stable row. Neither mode nor a later switch
+    to Off can turn a known error/non-convergence into valid scores or funding.
+    """
+    if not isinstance(row, dict):
+        return row
+    if _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return row
+    mode = _f7_settle_mode()
+    if mode == "off":
+        return row
+    result = _f7_settle_result(row)
+    if result.status != "stable":
+        _f7_settle_holdback(row, result)
         logger.debug(
-            "[engine_v2 v%s F-7] settle pass failed open for %s (page=%s): %s: %s",
+            "[engine_v2 v%s F-7] settlement withheld for %s (page=%s): %s: %s",
             __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
-            _sx.__class__.__name__, _sx,
+            result.status, result.reason,
         )
         return row
+    if not result.first_diff:
+        return row
+    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
+    out = row if mode == "observe" else result.row
+    _v573_append_warning(out, tag)
+    return out
 
 
 # =============================================================================
@@ -9782,6 +9962,8 @@ def _portfolio_decision(row: Dict[str, Any], gap: Optional[float], band: float, 
         return "SELL"
     if (overweight and weak_signal) or (forecast_negative and at_or_above_target):
         return "REDUCE"
+    if _f7_settle_failed(row):
+        return "HOLD"
     if underweight and constructive and (not forecast_negative) and risk != "HIGH":
         return "ADD"
     return "HOLD"
@@ -10233,6 +10415,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     r["portfolio_fx_status"] = _msg
                     r["action_flag"] = _portfolio_rebalance_action(None, band)
                     r["decision"] = _portfolio_decision(r, None, band, weak)
+                    _f7_settle_holdback(r)
                 return
             for r in rows:
                 if isinstance(r, dict):
@@ -10264,6 +10447,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                 r["weight_gap"] = gap
             r["action_flag"] = _portfolio_rebalance_action(gap, band)
             r["decision"] = _portfolio_decision(r, gap, band, weak)
+            _f7_settle_holdback(r)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(
             "[engine_v2 v%s] _compute_portfolio_fields failed: %s: %s",
@@ -10499,6 +10683,9 @@ def _preserve_scoring_provenance(row: Dict[str, Any], patch: Mapping[str, Any]) 
 def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict):
         return
+    if _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return
 
     # Tuple enforcement owns the forecast/ROI correction. Resolve the existing
     # display-pair policy first, then give every authoritative scoring pass
@@ -10529,11 +10716,16 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 _sx.__class__.__name__,
                 _sx,
             )
+            if row.get("_f7_settlement_active"):
+                raise
 
     if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
         try:
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
+                _f7_reject_scoring_patch_failures(row, patch)
+                if row.get("_f7_settlement_active") and _as_float(patch.get("overall_score")) is None:
+                    raise RuntimeError("canonical scoring returned no valid overall score")
                 recommendation_owned_keys = {
                     "recommendation",
                     "recommendation_detailed",
@@ -10551,6 +10743,8 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 row.update(safe_patch)
                 _preserve_scoring_provenance(row, patch)
                 return
+            if row.get("_f7_settlement_active"):
+                raise RuntimeError("canonical scoring returned no score patch")
         except Exception as exc:
             logger.debug(
                 "[engine_v2 v%s] canonical scoring failed for %s: %s: %s",
@@ -10563,7 +10757,12 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
             msg = f"canonical_scoring_failed:{type(exc).__name__}"
             existing_text = _coerce_scoring_errors_for_sheet(existing)
             row["scoring_errors"] = (existing_text + "; " + msg) if existing_text else msg
+            # A settlement failure cannot be hidden by the legacy local fallback.
+            if row.get("_f7_settlement_active"):
+                raise
 
+    if row.get("_f7_settlement_active"):
+        raise RuntimeError("canonical scoring unavailable during settlement")
     _compute_scores_local_fallback(row)
 
 
@@ -14767,6 +14966,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
 
 def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    _f7_failure_parts = _f7_settle_failure_parts(row)
     src = _canonicalize_provider_row(
         dict(row or {}),
         requested_symbol=_safe_str((row or {}).get("requested_symbol")),
@@ -14788,6 +14988,14 @@ def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: 
                 found = True
                 break
         out[key] = _json_safe(_to_scalar(val)) if found else None
+    # Header/alias selection cannot restore score or execution claims that a
+    # known failed basis already invalidated. Preserve the requested schema.
+    if _f7_failure_parts:
+        held = dict(out)
+        for part in _f7_failure_parts:
+            _v573_append_warning(held, part)
+        _f7_settle_holdback(held)
+        out = {key: _json_safe(held.get(key)) for key in (keys or [])}
     return out
 
 
@@ -15374,6 +15582,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _margin_publish_contract(row)  # v5.151.0 (P-152): one sheet unit for the three margins, AFTER the gate
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
+    _f7_settle_holdback(row)
     return {k: _json_safe(row.get(k)) for k in keys}
 
 
@@ -15669,6 +15878,9 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 
 def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
+    if _f7_settle_failed(row):
+        _f7_settle_holdback(row)
+        return
     try:
         sanitized_counts = _apply_v572_sanitization(row)
     except Exception as exc:
@@ -15890,6 +16102,10 @@ def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
     dropped_low_trust = 0
     scored: List[Tuple[int, float]] = []
     for i, row in enumerate(rows):
+        if isinstance(row, dict) and _f7_settle_failed(row):
+            _f7_settle_holdback(row)
+            _v573_append_warning(row, "rank_skipped_settlement_failure")
+            continue
         # v5.88.0: a LOW-trust row is withheld from the ranking entirely -- a
         # sparse / blocked / low-completeness name must not occupy a market-page
         # Rank (Overall). Mirrors the rank_skipped_no_overall_score path. Only
