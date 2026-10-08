@@ -3883,7 +3883,9 @@ if str(ROOT_DIR) not in sys.path:
 # consume the global outage breaker. Engine routing/proof/policy is unchanged.
 # v5.151.4: enforce forecast tuple coherence before scoring; disclose and
 # withhold an unproven late decision basis without replacing acquisition facts.
-__version__ = "5.151.4"
+# v5.151.5: keep F7 settlement failures sticky across scoring and normalization;
+# withhold failed funding rows while retaining protective exits and source facts.
+__version__ = "5.151.5"
 
 from core.provider_capabilities import (
     provider_supports_instrument,
