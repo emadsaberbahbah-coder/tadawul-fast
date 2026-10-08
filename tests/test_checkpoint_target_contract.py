@@ -253,5 +253,5 @@ def test_publisher_writes_pending_and_blank_unknown_metrics(tracker, monkeypatch
     assert row["State"] == "PENDING" and row["N Checkpoints"] == 0
     for key in ("Mean Abs Error (pp)", "Mean Signed Error (pp)", "Zero MAE (pp)"):
         assert row[key] == ""
-    assert row["Writer Version"] == "6.42.1"
+    assert row["Writer Version"] == tracker.SCRIPT_VERSION
     assert "zero_mae=" not in row["Detail"]
