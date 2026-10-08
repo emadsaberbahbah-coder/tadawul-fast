@@ -2,7 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.0.12 (2026-10-08) -- INSIGHTS PUBLICATION AND CALENDAR CONFIRMATION
+# VERSION 1.0.13 (2026-10-08) -- HISTORY READ AND PUBLICATION CLOCK INTEGRITY
+#
+# v1.0.13:
+# - Require offline actual-main history-read failure regressions for the scorer.
+# - Require truthful publication clocks and malformed source-time regressions.
+# - Preserve the existing Insights publication suite and every required verdict.
 #
 # v1.0.12:
 # - Require actual-runner Insights failure/partial/empty publication regressions.
@@ -334,6 +339,8 @@ jobs:
             tests/test_decision_surface_freshness.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
+            tests/test_sync_publication_clock.py \
+            tests/test_shadow_scorer_regret_read_failure.py \
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \

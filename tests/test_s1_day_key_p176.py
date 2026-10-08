@@ -4,7 +4,7 @@ in-memory sheet stub; the network fetch and the clock are the only injected
 parts. Replays the live 2026-09-28/29 loss: run #76 (the 09-28 slot) fired
 after 21:00 UTC and keyed the 09-28 board as 2026-09-29; run #77 (the real
 09-29 slot) was refused as a duplicate, silently.
-  D1 full existing selftest battery (116/116 on v1.9.2)
+  D1 full existing selftest battery (116/116 on v1.9.3)
   D2 pure replay table (#76, #77, on-time, 9h40m-late, boundary second)
   D3 END-TO-END default (slot): #76 keys 09-28 with DRIFT read-back; #77 then
      records 09-29 — the day is no longer lost
@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta, date
 
 spec = importlib.util.spec_from_file_location("s1", "scripts/run_shadow_scorer.py")
 s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)
-assert s1.SCRIPT_VERSION == "1.9.2", s1.SCRIPT_VERSION
+assert s1.SCRIPT_VERSION == "1.9.3", s1.SCRIPT_VERSION
 digest_parts = []
 
 # ---------------------------------------------------------------- D1 ------ #
@@ -106,6 +106,7 @@ def fresh_sheet(board_asof, hist=None):
         s1.sb.TAB_TOP10: top10,
         s1.sb.TAB_OUT: board_rows(board_asof, CHAL),
         s1.TAB_HISTORY: copy.deepcopy(hist or history_seed()),
+        s1.TAB_REGRET: [list(s1.rg.LEDGER_HEADER)],
         "_Run_Log": [["Timestamp", "Level", "Action", "Page", "Status", "Message",
                       "Endpoint", "HTTP Code", "Duration ms", "Details JSON"],
                      ["2026-09-19 05:00:00", "INFO", "workbook_backup", "_Backup", "OK",
@@ -157,7 +158,7 @@ assert rc1 == 0
 assert hist_dates(sh) == ["2026-09-27", "2026-09-28"], hist_dates(sh)
 assert gate_asof(sh) == "as of 2026-09-28 Riyadh", gate_asof(sh)
 v1 = runlog(sh)[-1]
-assert v1[4] == "OK" and "[S1-DAY-KEY v1.9.2] mode=slot key=2026-09-28 wallclock=2026-09-29 slot=2026-09-28@15:20Z DRIFT" in v1[5], v1[5]
+assert v1[4] == "OK" and "[S1-DAY-KEY v1.9.3] mode=slot key=2026-09-28 wallclock=2026-09-29 slot=2026-09-28@15:20Z DRIFT" in v1[5], v1[5]
 dk1 = json.loads(v1[9])["day_key"]; assert dk1["drift"] is True and dk1["key"] == "2026-09-28"
 assert "day_scored" in v1[5], v1[5]
 # board written for 09-29, then run #77 at 20:00Z (= 23:00 Riyadh, same day)
@@ -168,7 +169,7 @@ assert hist_dates(sh) == ["2026-09-27", "2026-09-28", "2026-09-29"], hist_dates(
 v2 = runlog(sh)[-1]
 assert v2[4] == "OK" and "DRIFT" not in v2[5] and "refusing duplicate" not in v2[5], v2[5]
 assert gate_asof(sh) == "as of 2026-09-29 Riyadh"
-assert "[S1-DAY-KEY v1.9.2] mode=slot key=2026-09-29 wallclock=2026-09-29" in out2
+assert "[S1-DAY-KEY v1.9.3] mode=slot key=2026-09-29 wallclock=2026-09-29" in out2
 print("D3 PASS  default slot key: #76 -> 2026-09-28 (DRIFT read-back in verdict+JSON), #77 -> 2026-09-29 recorded; history", hist_dates(sh))
 digest_parts.append([hist_dates(sh), v1[5].split(" | ")[0], gate_asof(sh)])
 
@@ -205,7 +206,7 @@ def late_run(mode):
     return s, runlog(s)[-1][5]
 s_slot, msg_slot = late_run(None)
 s_wall, msg_wall = late_run("wallclock")
-assert "[S1-BOARD-FRESH v1.9.2] asof=2026-09-29 mode=observe" in msg_slot and "asof=2026-09-29 mode=observe STALE" not in msg_slot, msg_slot
+assert "[S1-BOARD-FRESH v1.9.3] asof=2026-09-29 mode=observe" in msg_slot and "asof=2026-09-29 mode=observe STALE" not in msg_slot, msg_slot
 assert "asof=2026-09-29 mode=observe STALE" in msg_wall, msg_wall
 assert hist_dates(s_slot)[-1] == "2026-09-29" and hist_dates(s_wall)[-1] == "2026-09-30"
 print("D6 PASS  past-midnight run: slot key reads the 09-29 board as fresh (keys 09-29); wall-clock flags STALE and keys 09-30")

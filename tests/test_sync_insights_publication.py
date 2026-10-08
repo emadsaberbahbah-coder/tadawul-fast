@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -11,19 +12,29 @@ from scripts import run_dashboard_sync as sync
 
 
 HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
+CURRENT_HEADERS = ["Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order"]
+CURRENT_KEYS = ["section", "item", "metric", "value", "notes", "source", "sort_order"]
+CURRENT_ROW = ["Overview", "Sources", "count", 0, "", "", 1]
 VALID_ROW = ["Overview", "Sources", "", "count", 3, "Source summary", "2026-10-08T08:00:00+03:00"]
 FALLBACK_ROW = ["Status", "Engine availability", "", "warning", "Engine returned no usable rows",
                 "Live engine and upstream proxies returned empty/error payloads", "2026-10-08T08:00:00+03:00"]
 
 
 def run_sync(payload, *, error=None, code=200, page="Insights_Analysis", expects_rows=True,
-             env=None):
+             env=None, responses=None):
     """Replace only external clients; execute real main_async and task logic."""
     class Backend:
+        def __init__(self):
+            self.calls = []
+
         async def get_json(self, _path):
             return {"status": "ready"}, None, 200
 
         async def post_json(self, _path, _payload):
+            self.calls.append(_path)
+            if responses:
+                data, response_error, response_code = responses[min(len(self.calls) - 1, len(responses) - 1)]
+                return deepcopy(data), response_error, response_code
             return deepcopy(payload), error, code
 
         async def close(self):
@@ -52,6 +63,8 @@ def run_sync(payload, *, error=None, code=200, page="Insights_Analysis", expects
             self.clears.append(_args)
 
     writer = Writer()
+    backend = Backend()
+    writer.backend_calls = backend.calls
     results = []
     real_run = sync._run_one_task
 
@@ -63,7 +76,7 @@ def run_sync(payload, *, error=None, code=200, page="Insights_Analysis", expects
     key = "INSIGHTS_ANALYSIS" if page == "Insights_Analysis" else "TOP_10_INVESTMENTS"
     task = sync.TaskSpec(key, page, "analysis", max_symbols=0, expects_rows=expects_rows)
     with patch.dict("os.environ", {"TFB_SYNC_DECISION_GUARD": "0", **(env or {})}, clear=True), \
-            patch.object(sync, "BackendClient", return_value=Backend()), \
+            patch.object(sync, "BackendClient", return_value=backend), \
             patch.object(sync, "SheetsWriter", return_value=writer), \
             patch.object(sync, "_default_tasks", return_value=[task]), \
             patch.object(sync, "_run_one_task", side_effect=capture):
@@ -173,3 +186,146 @@ def test_upstream_failure_diagnostic_is_sanitized_before_reporting():
     assert "analysis failed" in result.error
     assert secret not in result.error
     assert secret not in str(result.to_dict())
+
+
+@pytest.mark.parametrize("headers", [
+    [""] * 7,
+    [" "] * 7,
+    ["Section", "Section", *CURRENT_HEADERS[2:]],
+    ["Group", *CURRENT_HEADERS[1:]],
+    [*CURRENT_HEADERS[:5], "", "Sort Order"],
+    ["A", "B", "C", "D", "E", "F", "G"],
+    CURRENT_HEADERS[:-1],
+    [None, *CURRENT_HEADERS[1:]],
+])
+@pytest.mark.parametrize("trim", ["0", "1"])
+def test_malformed_insights_headers_fail_before_any_publication(headers, trim):
+    payload = {"status": "success", "headers": headers, "rows_matrix": [CURRENT_ROW]}
+    assert_retained_failure(*run_sync(payload, env={"TFB_SYNC_WRITE_THEN_TRIM": trim}))
+
+
+@pytest.mark.parametrize("rows", [
+    [CURRENT_ROW[:2]],
+    [[*CURRENT_ROW, "unrequested extra cell"]],
+    [CURRENT_ROW, "not a matrix row"],
+    [CURRENT_ROW, {"section": "not a matrix row"}],
+    [["", "", "", "", "", "provider", 1]],
+    [["", "Count", "count", 0, "", "", 1]],
+    [["Overview", "", "count", 0, "", "", 1]],
+    [[{"section": "Overview"}, "Count", "count", 0, "", "", 1]],
+])
+def test_raw_matrix_shape_and_required_row_labels_cannot_be_repaired_to_success(rows):
+    payload = {"status": "success", "headers": CURRENT_HEADERS, "rows_matrix": rows}
+    assert_retained_failure(*run_sync(payload))
+
+
+def test_legacy_timestamp_only_content_is_not_analysis():
+    payload = {"headers": HEADERS,
+               "rows_matrix": [["", "", "", "", "", "", "2026-10-08T08:00:00+03:00"]]}
+    assert_retained_failure(*run_sync(payload))
+
+
+@pytest.mark.parametrize("keys", [
+    ["section", "section", *CURRENT_KEYS[2:]],
+    ["item", "section", *CURRENT_KEYS[2:]],
+    CURRENT_KEYS[:-1],
+])
+def test_dictionary_keys_must_match_the_declared_headers_without_inventing_labels(keys):
+    payload = {"headers": CURRENT_HEADERS, "keys": keys,
+               "rows": [{"section": "Overview", "item": "Count", "value": 0}]}
+    assert_retained_failure(*run_sync(payload))
+
+
+@pytest.mark.parametrize("rows", [
+    [{"section": "Overview", "item": "Count", "value": 0}, "bad row"],
+    [{"section": "Overview", "item": "Count", "value": 0}, CURRENT_ROW],
+    [{"source": "provider", "sort_order": 1}],
+])
+def test_dictionary_payload_does_not_hide_invalid_or_provenance_only_rows(rows):
+    payload = {"headers": CURRENT_HEADERS, "keys": CURRENT_KEYS, "rows": rows}
+    assert_retained_failure(*run_sync(payload))
+
+
+@pytest.mark.parametrize("status,expected_exit", [(None, 0), ("success", 0), ("partial", 1)])
+@pytest.mark.parametrize("representation", ["matrix", "rows", "dict", "nested"])
+def test_current_producer_schema_keeps_zero_values_and_optional_blanks(status, expected_exit, representation):
+    from core.sheets.schema_registry import get_sheet_headers, get_sheet_keys
+
+    headers = get_sheet_headers("Insights_Analysis")
+    keys = get_sheet_keys("Insights_Analysis")
+    assert headers == CURRENT_HEADERS and keys == CURRENT_KEYS
+    payload = {"headers": headers, "keys": keys}
+    if status is not None:
+        payload["status"] = status
+    if representation == "dict":
+        payload["rows"] = [{"section": "Overview", "item": "Sources", "metric": "count", "value": 0,
+                            "sort_order": 1}]
+    else:
+        payload["rows" if representation == "rows" else "rows_matrix"] = [CURRENT_ROW]
+    if representation == "nested":
+        payload = {"status": "success", "data": payload}
+    exit_code, result, writer = run_sync(payload)
+    assert exit_code == expected_exit
+    assert result.status == ("partial" if expected_exit else "success")
+    assert result.rows_written == 1
+    assert writer.writes[0][0] == CURRENT_HEADERS
+    written = writer.writes[0][1][0]
+    assert written[0:4] == CURRENT_ROW[0:4]
+    assert written[5] in (None, "")
+
+
+def test_reordered_current_headers_and_aligned_keys_keep_their_original_order():
+    payload = {"headers": list(reversed(CURRENT_HEADERS)), "keys": list(reversed(CURRENT_KEYS)),
+               "rows": [dict(zip(CURRENT_KEYS, CURRENT_ROW))]}
+    exit_code, result, writer = run_sync(payload)
+    assert exit_code == 0 and result.status == "success"
+    assert writer.writes == [(list(reversed(CURRENT_HEADERS)), [list(reversed(CURRENT_ROW))])]
+
+
+@pytest.mark.parametrize("headers,row", [(CURRENT_HEADERS, CURRENT_ROW), (HEADERS, VALID_ROW)])
+def test_dictionary_rows_keyed_by_display_headers_need_no_new_key_metadata(headers, row):
+    payload = {"headers": headers, "rows": [dict(zip(headers, row))]}
+    exit_code, result, writer = run_sync(payload)
+    assert exit_code == 0 and result.status == "success"
+    assert writer.writes == [(headers, [row])]
+
+
+@pytest.mark.parametrize("label", [0, False, ["Overview"], {"label": "Overview"},
+                                   datetime(2026, 10, 8, tzinfo=timezone.utc)])
+@pytest.mark.parametrize("representation", ["matrix", "dict"])
+def test_required_identity_types_cannot_be_stringified_into_analysis(label, representation):
+    payload = {"headers": CURRENT_HEADERS, "keys": CURRENT_KEYS}
+    if representation == "dict":
+        payload["rows"] = [{"section": label, "item": "Count", "value": 0}]
+    else:
+        payload["rows_matrix"] = [[label, *CURRENT_ROW[1:]]]
+    assert_retained_failure(*run_sync(payload))
+
+
+def test_explicit_matrix_of_dictionaries_is_not_a_permitted_empty_schema():
+    payload = {"headers": CURRENT_HEADERS, "rows_matrix": [{"section": "Overview", "item": "Count"}]}
+    assert_retained_failure(*run_sync(payload, expects_rows=False))
+
+
+@pytest.mark.parametrize("bad_key", [{"token": "synthetic-secret"}, ["section"], None, 0, ""])
+def test_malformed_explicit_keys_cannot_skip_a_healthy_endpoint_fallback(bad_key):
+    malformed = {"headers": CURRENT_HEADERS, "keys": [bad_key, *CURRENT_KEYS[1:]],
+                 "rows": [{"section": "Overview", "item": "Count", "value": 0}]}
+    healthy = {"headers": CURRENT_HEADERS, "rows_matrix": [CURRENT_ROW]}
+    exit_code, result, writer = run_sync(None, env={"TFB_SYNC_SAFE_GATEWAYS": "0"},
+                                        responses=[(malformed, None, 200), (healthy, None, 200)])
+    assert exit_code == 0 and result.status == "success"
+    assert len(writer.backend_calls) == 2
+    assert writer.writes == [(CURRENT_HEADERS, [CURRENT_ROW])]
+    assert "synthetic-secret" not in str(result.to_dict())
+
+
+def test_all_malformed_key_candidates_retain_prior_page_without_raw_diagnostics():
+    malformed = {"headers": CURRENT_HEADERS, "keys": [{"token": "synthetic-secret"}, *CURRENT_KEYS[1:]],
+                 "rows": [{"section": "Overview", "item": "Count", "value": 0}]}
+    exit_code, result, writer = run_sync(malformed, env={"TFB_SYNC_SAFE_GATEWAYS": "0"})
+    assert_retained_failure(exit_code, result, writer)
+    assert len(writer.backend_calls) > 1
+    assert writer.backend_calls[-1] == "/enriched/sheet-rows"
+    assert "nonblank strings" in result.error
+    assert "synthetic-secret" not in str(result.to_dict())
