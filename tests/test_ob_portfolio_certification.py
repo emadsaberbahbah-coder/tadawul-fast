@@ -80,6 +80,44 @@ def test_cash_rounding_tolerance_cannot_increase_settled_funding_cap():
     assert sum(item["suggested_sar"] for item in payload["selected"]) <= 50_000
 
 
+def test_empty_candidate_pool_cannot_publish_unverified_money():
+    payload = ob.build_opportunity_payload([], portfolio={
+        "cash_available_sar": 50_000, "pending_proceeds_sar": 25_000}, fx_rates=FX)
+    assert payload["status"] == "no_candidates"
+    assert not payload["meta"]["execution_ready"]
+    assert all(payload["kpis"][key] == 0 for key in (
+        "deployable_sar", "deployable_current_sar", "deployable_proforma_sar",
+        "capital_unallocated_sar", "expected_gain_12m_sar"))
+
+
+def test_holding_row_fx_cannot_override_verified_currency_basis():
+    pf = portfolio()
+    pf["holdings"][0]["fx_to_sar"] = 1
+    pf["holdings"][0]["value_sar"] = 1000
+    payload = build(pf)
+    assert_withheld(payload)
+    assert payload["meta"]["input_certification"]["reason_counts"]["holding_fx_unverified"] == 1
+
+
+def test_new_candidate_row_fx_cannot_underprice_native_quantity():
+    source = stock()
+    source["fx_to_sar"] = .01
+    payload = ob.build_opportunity_payload([source],
+        criteria={"trust_gate_enabled": False, "max_weight_pct": 100, "pf_max_sector_pct": 100},
+        portfolio=portfolio(), fx_rates=FX)
+    assert payload["selected"] == [] and not payload["meta"]["execution_ready"]
+    assert any(g["gate"] == "FX Evidence" and not g["passed"]
+               for g in payload["candidates_rows"][0]["gates"])
+
+
+def test_static_fx_cannot_fund_currency_missing_from_fresh_proof():
+    pf = observed_portfolio({"cash_available_sar": 50_000}, {"SAR": 1})
+    payload = build(pf)
+    assert payload["selected"] == [] and not payload["meta"]["execution_ready"]
+    assert any(g["gate"] == "FX Evidence" and not g["passed"]
+               for g in payload["candidates_rows"][0]["gates"])
+
+
 @pytest.mark.parametrize("case", ["absent", "stale", "cash_mismatch", "reserved",
                                   "holding_quote", "holding_value", "nav", "proceeds",
                                   "incomplete", "completeness_unknown", "other_custody", "fx"])

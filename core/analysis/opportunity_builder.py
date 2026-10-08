@@ -5088,6 +5088,10 @@ def _portfolio_input_assessment(portfolio, fx_rates, criteria):
     result = certify_portfolio_inputs(holdings, raw.get("reconciliation_evidence"), fx_rates)
     summary = certification_summary(result)
     reasons = dict(summary.get("reason_counts") or {})
+    proven_rates = {"SAR": 1.0}
+    if result.get("funding_eligible"):
+        proven_rates.update({proof["currency"].strip().upper(): proof["rate_to_sar"]
+                             for proof in raw["reconciliation_evidence"].get("fx_rates", [])})
     if raw.get("holdings_input_incomplete") is not False:
         reasons["holdings_input_completeness_unknown"] = 1
     if result.get("funding_eligible"):
@@ -5105,6 +5109,9 @@ def _portfolio_input_assessment(portfolio, fx_rates, criteria):
             values = Decimal(0)
             for holding in holdings:
                 candidate = normalize_candidate(holding, fx_rates, criteria)
+                if not _certified_fx_assessment(candidate, proven_rates)[0]:
+                    reasons["holding_fx_unverified"] = reasons.get("holding_fx_unverified", 0) + 1
+                    continue
                 quote_ok, _, _ = _quote_freshness_assessment(candidate)
                 if not quote_ok:
                     reasons["holding_quote_unverified"] = reasons.get("holding_quote_unverified", 0) + 1
@@ -5131,7 +5138,18 @@ def _portfolio_input_assessment(portfolio, fx_rates, criteria):
     summary["reason_counts"] = dict(sorted(reasons.items()))
     summary["funding_eligible"] = result.get("funding_eligible") is True and not reasons
     summary["status"] = "certified" if summary["funding_eligible"] else "withheld"
-    return summary, result.get("certified_cash_available_sar", 0.0)
+    return summary, result.get("certified_cash_available_sar", 0.0), proven_rates
+
+
+def _certified_fx_assessment(candidate, proven_rates):
+    """A row override/static default cannot replace fresh declared FX proof."""
+    expected, source = _resolve_fx(candidate.get("currency"), proven_rates)
+    current = candidate.get("fx_to_sar")
+    if source not in {"provided", "provided/100"} or expected is None:
+        return False, "fresh native-currency FX proof missing"
+    if current is None or not math.isclose(current, expected, rel_tol=1e-12, abs_tol=0.0):
+        return False, "row FX conflicts with the certified currency basis"
+    return True, "matches fresh declared currency FX"
 
 
 def _cash_floor_sar() -> float:
@@ -6513,7 +6531,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 pass
         rows = rows[:crit["max_candidates"]]
     pf = _normalize_portfolio(portfolio)
-    input_certification, certified_cash = _portfolio_input_assessment(portfolio, fx_rates, crit)
+    input_certification, certified_cash, proven_rates = _portfolio_input_assessment(portfolio, fx_rates, crit)
     if input_certification["funding_eligible"]:
         # Cents-rounding acceptance never increases the certified funding cap.
         pf["cash"] = min(pf["cash"], certified_cash)
@@ -6551,6 +6569,10 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         gates = evaluate_gates(
             cand, crit, held,
             blocked_identity_trace_enabled=_blocked_identity_trace)
+        if input_certification["funding_eligible"] and not _board_research:
+            fx_ok, fx_reason = _certified_fx_assessment(cand, proven_rates)
+            gates.append(_gate("FX Evidence", fx_ok, FAIL_MAJOR, fx_reason,
+                               "conversion bound to fresh declared native-currency FX"))
         # v1.13.0 [TRUST-001] run telemetry — counts in tag AND gate mode;
         # zeros when off (keys always present, the v1.0.6 meta precedent).
         if cand.get("trust_low_source"):
@@ -6636,10 +6658,10 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         # truthfulness only, selection byte-identical.
         _audit_align_plan_roi(audit[-1], crit)
 
-    if rows and not _board_research and not input_certification["funding_eligible"]:
+    if not _board_research and not input_certification["funding_eligible"]:
         # Publish a consumable empty allocation, rather than a failed response
         # that a native client might treat as permission to preserve old money.
-        withheld = _skeleton("ok", "Portfolio inputs unverified; executable funding withheld", crit)
+        withheld = _skeleton("ok" if rows else "no_candidates", "Portfolio inputs unverified; executable funding withheld", crit)
         withheld["candidates_rows"] = [{k: v for k, v in item.items() if k != "_cand"}
                                         for item in audit]
         withheld["kpis"]["scanned"] = len(audit)
