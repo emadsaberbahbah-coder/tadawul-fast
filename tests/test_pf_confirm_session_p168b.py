@@ -17,8 +17,8 @@ T5  calendar: venue map, US/KSA keys and previous sessions, NYSE holiday,
     Tadawul National Day, TFB_PF_SESSION_HOLIDAYS csv
 T6  observe: verdict unchanged, ONE tag with venue/session/legacy/session
     counts, FLIP on disagreement; raw non-ADD clears the shadow chain and
-    prints nothing; an injected calendar fault is a pass-through
-T7  enforce: calendar fault -> legacy UTC pair for that call + WARNING
+    prints nothing; an injected calendar fault exposes unavailable evidence
+T7  enforce: calendar fault -> fail-closed HOLD, clock untouched + WARNING
 T8  enforce: the P-165 fail-closed contract on the store path still holds
 T9  integration (opt-in, TFB_TEST_MP_TSV = a My_Portfolio export): observe
     tags exactly the raw-ADD rows at BOTH payload sites with verdicts equal
@@ -28,6 +28,7 @@ T9  integration (opt-in, TFB_TEST_MP_TSV = a My_Portfolio export): observe
 from __future__ import annotations
 
 import csv
+import copy
 import logging
 import os
 import re
@@ -39,6 +40,31 @@ import core.analysis.portfolio_actions as pa
 
 ADD, HOLD = pa.ACTION_ADD, pa.ACTION_HOLD
 CTL = {"add_confirm_days": 2}
+_OFFLINE_CONFIRM_CACHE = {}
+
+
+@pytest.fixture(autouse=True)
+def _offline_confirm_cache(monkeypatch):
+    """Exercise persistence without ever loading a configured Redis client."""
+    _OFFLINE_CONFIRM_CACHE.clear()
+    traffic = []
+    def get(key):
+        traffic.append(("get", key))
+        return copy.deepcopy(_OFFLINE_CONFIRM_CACHE.get(key))
+    def put(key, value):
+        traffic.append(("put", key))
+        _OFFLINE_CONFIRM_CACHE[key] = copy.deepcopy(value)
+    def delete(key):
+        traffic.append(("delete", key))
+        _OFFLINE_CONFIRM_CACHE.pop(key, None)
+    def forbidden_client():
+        raise AssertionError("session tests must not load a real Redis client")
+    monkeypatch.setattr(pa, "_confirm_redis", forbidden_client)
+    monkeypatch.setattr(pa, "_confirm_redis_get", get)
+    monkeypatch.setattr(pa, "_confirm_redis_put", put)
+    monkeypatch.setattr(pa, "_confirm_redis_del", delete)
+    yield {"values": _OFFLINE_CONFIRM_CACHE, "traffic": traffic}
+    _OFFLINE_CONFIRM_CACHE.clear()
 
 
 def T(*a):
@@ -64,6 +90,7 @@ class _Clock:
 
 
 def _reset(monkeypatch, mode=None, persist="1"):
+    _OFFLINE_CONFIRM_CACHE.clear()
     monkeypatch.delenv("TFB_PF_CONFIRM_SESSION", raising=False)
     monkeypatch.delenv("TFB_PF_SESSION_HOLIDAYS", raising=False)
     monkeypatch.setenv("TFB_PF_CONFIRM_PERSIST", persist)
@@ -102,7 +129,7 @@ def test_t2_golden_negative_calendar_clock(monkeypatch):
     assert s[0] == HOLD and m[0] == ADD and "ADD confirmed (day 2/2)" in m[1]   # the defect
 
 
-def test_t3_enforce_session_sequence(monkeypatch):
+def test_t3_enforce_session_sequence(monkeypatch, _offline_confirm_cache):
     _reset(monkeypatch, "enforce")
     with _Clock(T(2026, 9, 27, 6, 0)):
         sun = pa._apply_add_confirmation("DDI.US", ADD, "q", None, CTL)
@@ -120,6 +147,7 @@ def test_t3_enforce_session_sequence(monkeypatch):
     assert tue[0] == ADD and "ADD confirmed (day 2/2; session 2026-09-28)" in tue[1]
     assert wed[0] == ADD and "(day 3/2; session 2026-09-29)" in wed[1]
     assert pa._ADD_CONFIRM_STORE["DDI.US"] == {"count": 3, "date": "2026-09-29"}
+    assert _offline_confirm_cache["values"]["DDI.US"] == pa._ADD_CONFIRM_STORE["DDI.US"]
 
 
 def test_t4_enforce_restart_and_clear(monkeypatch):
@@ -136,8 +164,10 @@ def test_t5_calendar(monkeypatch):
     _reset(monkeypatch)
     v = pa._confirm_venue
     assert (v("1050.SR"), v("YUM"), v("DDI.US"), v("BBOX.L"), v("7203.T"),
-            v("QNBK.QA"), v("ORBIA.MX"), v("ZZZ.UNKNOWN")) == \
-           ("KSA", "US", "US", "EU", "ASIA", "GULF", "AMER", "US")
+            v("QNBK.QA"), v("ORBIA.MX")) == \
+           ("KSA", "US", "US", "EU", "ASIA", "GULF", "AMER")
+    with pytest.raises(pa.ConfirmCalendarUnavailable, match="unknown venue suffix"):
+        v("ZZZ.UNKNOWN")
     k = pa._confirm_session_key
     assert k("US", T(2026, 9, 27, 6, 0)) == "2026-09-25"
     assert k("US", T(2026, 9, 28, 20, 59)) == "2026-09-25"
@@ -153,7 +183,7 @@ def test_t5_calendar(monkeypatch):
     assert k("US", T(2026, 9, 30, 0, 40)) == "2026-09-25"
 
 
-def test_t6_observe_tag(monkeypatch, caplog):
+def test_t6_observe_tag(monkeypatch, caplog, _offline_confirm_cache):
     _reset(monkeypatch, "observe")
     pa._ADD_CONFIRM_STORE["DDI.US"] = {"count": 1, "date": "2026-09-27"}   # Sunday's legacy count
     with _Clock(T(2026, 9, 28, 3, 40)):
@@ -166,28 +196,33 @@ def test_t6_observe_tag(monkeypatch, caplog):
     assert (m.group(3), m.group(5), m.group(7)) == ("2", "1", " - FLIP")
     assert reason.count("[confirm-session-observe]") == 1
     assert pa._ADD_CONFIRM_SESSION_STORE["DDI.US"] == {"count": 1, "date": "2026-09-25"}
+    shadow_key = pa._CONFIRM_SESSION_SHADOW_NS + "DDI.US"
+    assert _offline_confirm_cache["values"][shadow_key] == pa._ADD_CONFIRM_SESSION_STORE["DDI.US"]
     # raw non-ADD clears the shadow chain and prints nothing
     r = pa._apply_confirm_session_observe({"symbol": "DDI.US"}, HOLD, HOLD, "x", None, CTL)
     assert r == "x" and "DDI.US" not in pa._ADD_CONFIRM_SESSION_STORE
+    assert shadow_key not in _offline_confirm_cache["values"]
     # gate depth <= 1 -> nothing
     assert pa._apply_confirm_session_observe({"symbol": "DDI.US"}, ADD, ADD, "q", None,
                                              {"add_confirm_days": 1}) == "q"
-    # injected calendar fault -> pass-through, never raises
+    # injected calendar fault -> verdict kept, unavailable evidence exposed
     monkeypatch.setattr(pa, "_confirm_session_key", _raise)
-    assert pa._apply_confirm_session_observe({"symbol": "DDI.US"}, ADD, ADD, "q", None, CTL) == "q"
+    unavailable = pa._apply_confirm_session_observe({"symbol": "DDI.US"}, ADD, ADD, "q", None, CTL)
+    assert unavailable.startswith("q;") and "session evidence unavailable" in unavailable
+    assert "legacy clock kept" in unavailable
     # off / enforce are pass-throughs at this seam
     monkeypatch.setenv("TFB_PF_CONFIRM_SESSION", "enforce")
     assert pa._apply_confirm_session_observe({"symbol": "DDI.US"}, ADD, ADD, "q", None, CTL) == "q"
 
 
-def test_t7_enforce_calendar_fault_falls_back(monkeypatch, caplog):
+def test_t7_enforce_calendar_fault_holds_without_fallback(monkeypatch, caplog):
     _reset(monkeypatch, "enforce")
     monkeypatch.setattr(pa, "_confirm_session_key", _raise)
     with caplog.at_level(logging.WARNING), _Clock(T(2026, 9, 28, 3, 40)):
         out = pa._apply_add_confirmation("DDI.US", ADD, "q", None, CTL)
-    assert out[0] == HOLD and "(day 1/2)" in out[1] and "session" not in out[1]
-    assert any("[CONFIRM-SESSION" in r.getMessage() for r in caplog.records)
-    assert pa._ADD_CONFIRM_STORE["DDI.US"]["date"] == "2026-09-28"     # legacy UTC key
+    assert out[0] == HOLD and "calendar unavailable" in out[1] and out[2] == ADD
+    assert any("[CONFIRM-FAILCLOSED" in r.getMessage() for r in caplog.records)
+    assert "DDI.US" not in pa._ADD_CONFIRM_STORE
 
 
 def test_t8_p165_fail_closed_preserved(monkeypatch):
@@ -196,7 +231,7 @@ def test_t8_p165_fail_closed_preserved(monkeypatch):
     monkeypatch.setattr(pa, "_confirm_prev_session", _raise)               # calendar fault ...
     monkeypatch.setattr(pa, "_add_confirm_today", _raise)                  # ... and the legacy helper raises
     out = pa._apply_add_confirmation("DDI.US", ADD, "q", None, CTL)
-    assert out[0] == HOLD and "[confirm-failclosed:RuntimeError]" in out[1] and out[2] == ADD
+    assert out[0] == HOLD and "[confirm-failclosed:ConfirmCalendarUnavailable]" in out[1] and out[2] == ADD
     assert pa._ADD_CONFIRM_STORE["DDI.US"] == {"count": 1, "date": "2000-01-01"}
 
 

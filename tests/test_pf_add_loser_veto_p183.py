@@ -30,6 +30,9 @@ Run: python3 tests/test_pf_add_loser_veto_p183.py   (x3, digest)
 from __future__ import annotations
 
 import copy, csv, hashlib, importlib, importlib.util, json, os, sys
+from contextlib import ExitStack
+from datetime import datetime
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -52,7 +55,7 @@ if PA_FILE:
     pa = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(pa)
 else:
     import core.analysis.portfolio_actions as pa  # noqa: E402
-assert pa.PORTFOLIO_ACTIONS_VERSION == "1.14.0", pa.PORTFOLIO_ACTIONS_VERSION
+assert pa.PORTFOLIO_ACTIONS_VERSION == "1.14.1", pa.PORTFOLIO_ACTIONS_VERSION
 
 PANEL = {"cash_available_sar": 34166.25, "target_cash_pct": 10.0,
          "max_position_pct": 20.0, "max_sector_pct": 30.0,
@@ -85,8 +88,20 @@ def _rows(path):
 def _build(mod, rows, mode=None, loser=None, prox=None):
     _env(mode, loser, prox)
     try:
-        mod._ADD_CONFIRM_STORE.clear()
-        p = mod.build_portfolio_actions(copy.deepcopy(rows), dict(PANEL), dict(FX))
+        with ExitStack() as clocks:
+            if rows is globals().get("FIX"):
+                # Only the dated synthetic fixture runs at its witnessed time;
+                # optional real exports keep the actual freshness policy.
+                when = datetime.fromisoformat(rows[0]["Last Updated (UTC)"])
+                class FixtureClock(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return when.astimezone(tz) if tz else when.replace(tzinfo=None)
+                from core.analysis import opportunity_builder
+                clocks.enter_context(patch.object(mod, "datetime", FixtureClock))
+                clocks.enter_context(patch.object(opportunity_builder, "datetime", FixtureClock))
+            mod._ADD_CONFIRM_STORE.clear()
+            p = mod.build_portfolio_actions(copy.deepcopy(rows), dict(PANEL), dict(FX))
     finally:
         _env(None)
     p = json.loads(json.dumps(p, default=str, sort_keys=True))

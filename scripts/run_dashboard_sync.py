@@ -3,9 +3,13 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.10)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.11)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.11: failed HTTP-200 Insights envelopes and required empty analysis
+retain the prior page and fail the run with the upstream diagnostic. Usable
+partial Insights publish as partial. Permitted empty board schemas remain valid.
 
 v6.64.10: resolve a blank native Buy Fees input only when the same ledger
 snapshot's unique native Cost Basis exactly equals Shares * Buy Price.
@@ -1857,7 +1861,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.10"
+SCRIPT_VERSION = "6.64.11"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -10700,6 +10704,27 @@ async def _fetch_market_rows_batched(
     return headers, combined, used_endpoint, last_err
 
 
+def _insights_payload_outcome(resp: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    """Read declared failure/completeness at each supported table envelope.
+
+    The analysis route marks schema-shaped and nonempty diagnostic fallbacks
+    with an error. Genuine partial content without a declared error may still
+    publish, but cannot be certified complete. Statusless legacy tables remain
+    accepted; a successful outer wrapper cannot erase an inner failure.
+    """
+    partial = False
+    envelope = resp
+    while isinstance(envelope, dict):
+        status = str(envelope.get("status") or "").strip().lower()
+        error = envelope.get("error")
+        if error or status in {"error", "fail", "failed", "failure", "degraded", "unavailable"}:
+            reason = safe_error_text(error) if error else f"upstream status={status}"
+            return reason, partial
+        partial = partial or status in {"partial", "warn", "warning"}
+        envelope = envelope.get("data")
+    return None, partial
+
+
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
@@ -11813,6 +11838,8 @@ async def _run_one_task(
         rows_matrix: List[List[Any]] = []
         used_endpoint: Optional[str] = None
         eff_gw = _effective_gateway(task)  # v6.10.0: ranked market pages -> analysis when enabled
+        _is_insights = _guard_norm(task.sheet_name) == _guard_norm("Insights_Analysis")
+        _insights_partial = False
 
         # v6.17.0 [SYMBOL-BATCHING]: when enabled, a many-symbol market page is
         # fetched in small SEQUENTIAL batches (see _fetch_market_rows_batched /
@@ -11843,6 +11870,13 @@ async def _run_one_task(
                 last_err = f"{ep} -> Non-dict response"
                 continue
 
+            if _is_insights:
+                _analysis_error, _insights_partial = _insights_payload_outcome(data)
+                if _analysis_error:
+                    headers, rows_matrix = [], []
+                    last_err = f"{ep} -> Insights analysis failed: {_analysis_error}; preserving prior page."
+                    continue
+
             headers, rows_matrix = _extract_table_payload(data)
             # v6.15.0 TOP10-HEADER-REPAIR: the analysis route can return a blank
             # header row for Top_10 (118 empty-string cells), which the writer
@@ -11860,6 +11894,11 @@ async def _run_one_task(
                 continue
 
             rows_matrix = _rectify_matrix(headers, rows_matrix)
+            if (_is_insights and task.expects_rows
+                    and not any(not _guard_is_blank(cell) for row in rows_matrix for cell in row)):
+                headers, rows_matrix = [], []
+                last_err = f"{ep} -> Insights analysis returned no usable content; preserving prior page."
+                continue
             if _pf_cost_basis:
                 _pf_safe, _pf_reason = _portfolio_holdings_contract(
                     headers, rows_matrix, _pf_cost_basis, require_complete=False)
@@ -11900,6 +11939,8 @@ async def _run_one_task(
 
         res.gateway_used = f"{eff_gw}:{used_endpoint}" if used_endpoint else eff_gw
         res.symbols_processed = len(symbols)
+        if _is_insights and _insights_partial:
+            res.warnings.append("Insights upstream analysis is partial; published content cannot certify complete analysis.")
 
         # Capture current-run critical identity proof before persistence or
         # KEEP-LAST-GOOD can restore a valid predecessor.  Those mechanisms
@@ -12990,6 +13031,8 @@ async def _run_one_task(
             else:
                 res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
                 res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
+            if _is_insights and _insights_partial and res.status == "success":
+                res.status = "partial"
             if _critical_identity_failures:
                 fail_result_on_identity(res, _critical_identity_failures)
 
