@@ -42,7 +42,8 @@ Checks implemented (first delivery, 2026-10-03 reconciliation):
       slots, the cockpit-vs-sync race (Top 10 run time inside the sync run).
   Book: ledger active lots x My_Portfolio prices x FX vs Portfolio_Decision
       KPI (sold holdings still displayed, stale KPI cash), _Cash_Snapshot
-      duplicate dates and stale notes, fills vs _Trade_Notes.
+      explicit settled-cash records with account/currency/time and recorded
+      FX vintage, duplicate dates and stale notes, fills vs _Trade_Notes.
   (f) RAG per lane (DATA, BOOK, DECISION, PIPELINE, MODEL, GOVERNANCE) and
       an ordered fix list.
 
@@ -56,23 +57,40 @@ Usage
   python scripts/tfb_export_audit.py --selftest
 
 Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = usage / load error.
+
+Cash certification contract (v1.1.0)
+----------------------------------
+The latest appended _Cash_Snapshot record must name Account (or Account ID),
+Currency (or Ccy), and Balance Type=settled_cash. Type=SNAPSHOT describes a
+record, not its balance type. Provide As Of/Timestamp with a time, or separate
+Date and Time cells. Naive Excel values use --tz-offset. Foreign cash needs
+Balance (or Native Balance), FX to SAR, and FX As Of; SAR uses identity FX.
+Any recorded Balance SAR must agree with native balance x recorded FX within
+one halala. Cash and FX default to a maximum age of 24 hours, configurable with
+--cash-max-age-hours; future timestamps always fail. An invalid latest record
+retains its raw amount and reasons, but cannot supply certified cash or NAV.
+This offline check does not authenticate a broker read or approve funding.
 """
 from __future__ import annotations
 
 import argparse
 import collections
 import datetime as dt
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import math
 import os
 import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 try:
     import openpyxl
+    from openpyxl.styles.numbers import is_datetime as excel_datetime_kind
 except ImportError:  # pragma: no cover
     sys.stderr.write("openpyxl is required: pip install openpyxl\n")
     sys.exit(2)
@@ -233,9 +251,20 @@ class Book:
         self.path = path
         self.sheets = {}      # title -> list of row tuples
         self.state = {}       # title -> 'visible' | 'hidden'
+        self.cash_date_only_cells = set()  # 0-based cells; Excel dates load as midnight datetimes
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         for ws in wb.worksheets:
-            rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+            if ws.title == "_Cash_Snapshot":
+                rows = []
+                for ri, cells in enumerate(ws.iter_rows()):
+                    rows.append(tuple(cell.value for cell in cells))
+                    self.cash_date_only_cells.update(
+                        (ri, ci) for ci, cell in enumerate(cells)
+                        if isinstance(cell.value, dt.datetime)
+                        and excel_datetime_kind(cell.number_format or "") == "date"
+                    )
+            else:
+                rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
             while rows and all(v is None or v == "" for v in rows[-1]):
                 rows.pop()
             # read_only mode returns ragged tuples; pad every row to the sheet width so
@@ -511,6 +540,175 @@ def check_pit(book):
 # --------------------------------------------------------------------------- #
 # Book: ledger, cash, Portfolio_Decision
 # --------------------------------------------------------------------------- #
+def _cash_decimal(value):
+    """Money and rates must be finite; bools are not monetary values."""
+    if value is None or isinstance(value, bool) or _s(value) == "":
+        return None
+    try:
+        result = Decimal(_s(value).replace(",", ""))
+    except InvalidOperation:
+        return None
+    return result if result.is_finite() and math.isfinite(float(result)) else None
+
+
+def _cash_timestamp(value, tz_offset):
+    """Parse a complete timestamp, never turn a date-only value into midnight.
+
+    Naive Excel timestamps use the explicit workbook timezone policy. Strings
+    must contain a time; the permissive general audit parser is inappropriate
+    at this certification boundary.
+    """
+    if isinstance(value, dt.datetime):
+        stamp = value
+    else:
+        text = _s(value)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+                            r"(?:Z|[+-]\d{2}:\d{2})?", text):
+            return None
+        try:
+            stamp = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone(dt.timedelta(hours=tz_offset)))
+    return stamp.astimezone(dt.timezone.utc)
+
+
+def _cash_date_time(date_value, time_value, tz_offset):
+    """The legacy Date/Time layout requires an actual Time cell, including 00:00."""
+    date_text = _cash_date(date_value)
+    if date_text is None or time_value is None or _s(time_value) == "":
+        return None
+    try:
+        day = dt.date.fromisoformat(date_text)
+        if isinstance(time_value, dt.datetime):
+            clock = time_value.timetz()
+        elif isinstance(time_value, dt.time):
+            clock = time_value
+        elif isinstance(time_value, (int, float)) and not isinstance(time_value, bool):
+            if not math.isfinite(time_value) or not 0 <= time_value < 1:
+                return None
+            clock = (dt.datetime.min + dt.timedelta(days=time_value)).time()
+        else:
+            clock = dt.time.fromisoformat(_s(time_value).replace("Z", "+00:00"))
+        return _cash_timestamp(dt.datetime.combine(day, clock), tz_offset)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _cash_date(value):
+    """Keep annotation text and partial regex matches out of a cash timestamp."""
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.date().isoformat() if isinstance(value, dt.datetime) else value.isoformat()
+    text = _s(value)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        return dt.date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class CashSnapshot:
+    """An immutable audit record, not a broker authentication or funding approval.
+
+    Only explicitly named settled_cash can certify a cash balance. A native
+    foreign balance requires its recorded SAR rate and timestamp. SAR has an
+    identity conversion, so no market FX read is needed. The caller must keep
+    broker order reconciliation and execution policy separate.
+    """
+    account_id: str
+    currency: str
+    balance_type: str
+    as_of_utc: dt.datetime | None
+    balance: Decimal | None
+    fx_to_sar: Decimal | None
+    fx_as_of_utc: dt.datetime | None
+    recorded_balance_sar: Decimal | None = None
+    snapshot_date: str | None = None
+    invalid_recorded_balance_sar: bool = False
+
+    def certify(self, now_utc, max_age_hours=24.0, tz_offset=3):
+        """Return (certified SAR balance or None, immutable failure reasons)."""
+        errors = []
+        if not self.account_id:
+            errors.append("missing_account")
+        if not re.fullmatch(r"[A-Z]{3}", self.currency):
+            errors.append("missing_or_invalid_currency")
+        if self.balance_type != "settled_cash":
+            errors.append("balance_type_must_be_settled_cash")
+        valid_policy = math.isfinite(max_age_hours) and max_age_hours > 0
+        if not valid_policy:
+            errors.append("invalid_cash_max_age_policy")
+        if self.as_of_utc is None:
+            errors.append("missing_or_invalid_timestamp")
+            # A future date is also visible when a legacy Time cell is blank.
+            local_now = now_utc.astimezone(dt.timezone(dt.timedelta(hours=tz_offset)))
+            if self.snapshot_date and self.snapshot_date > local_now.date().isoformat():
+                errors.append("future_snapshot")
+        else:
+            age_hours = (now_utc - self.as_of_utc).total_seconds() / 3600
+            if age_hours < 0:
+                errors.append("future_snapshot")
+            elif valid_policy and age_hours > max_age_hours:
+                errors.append("stale_snapshot")
+        if self.balance is None or self.balance < 0:
+            errors.append("missing_or_invalid_native_balance")
+        if self.invalid_recorded_balance_sar:
+            errors.append("invalid_recorded_sar_balance")
+        if self.fx_to_sar is None or self.fx_to_sar <= 0:
+            errors.append("missing_or_invalid_fx_rate")
+        if self.fx_as_of_utc is None:
+            errors.append("missing_or_invalid_fx_timestamp")
+        else:
+            fx_age_hours = (now_utc - self.fx_as_of_utc).total_seconds() / 3600
+            if fx_age_hours < 0:
+                errors.append("future_fx_timestamp")
+            elif valid_policy and fx_age_hours > max_age_hours:
+                errors.append("stale_fx_timestamp")
+            if self.as_of_utc is not None and self.fx_as_of_utc > self.as_of_utc:
+                errors.append("fx_timestamp_after_cash_snapshot")
+        converted = None
+        if self.balance is not None and self.fx_to_sar is not None:
+            converted = self.balance * self.fx_to_sar
+            if not math.isfinite(float(converted)):
+                errors.append("invalid_converted_sar_balance")
+            if (self.recorded_balance_sar is not None
+                    and abs(converted - self.recorded_balance_sar) > Decimal("0.01")):
+                errors.append("recorded_sar_disagrees_with_native_balance_and_fx")
+        return (None if errors else converted), tuple(errors)
+
+
+def _cash_snapshot_record(index, row, tz_offset, date_only_headers=()):
+    """Adapt explicit headers; Type=SNAPSHOT is never a balance-type inference."""
+    def cell(*names):
+        return next((row[index[name]] for name in names if name in index), None)
+
+    timestamp_header = next((name for name in ("As Of", "Timestamp") if name in index), None)
+    as_of = (None if timestamp_header in date_only_headers
+             else _cash_timestamp(cell("As Of", "Timestamp"), tz_offset))
+    if "As Of" not in index and "Timestamp" not in index:
+        as_of = (None if "Time" in date_only_headers
+                 else _cash_date_time(cell("Date"), cell("Time"), tz_offset))
+    currency = _s(cell("Currency", "Ccy")).upper()
+    recorded_sar = _cash_decimal(cell("Balance SAR"))
+    balance = _cash_decimal(cell("Balance", "Native Balance"))
+    if "Balance" not in index and "Native Balance" not in index and currency == "SAR":
+        balance = recorded_sar
+    fx = Decimal("1") if currency == "SAR" else _cash_decimal(cell("FX to SAR"))
+    fx_as_of = (as_of if currency == "SAR" else
+                None if "FX As Of" in date_only_headers else
+                _cash_timestamp(cell("FX As Of"), tz_offset))
+    return CashSnapshot(
+        account_id=_s(cell("Account", "Account ID")), currency=currency,
+        balance_type=_s(cell("Balance Type")).lower().replace(" ", "_"),
+        as_of_utc=as_of, balance=balance, fx_to_sar=fx, fx_as_of_utc=fx_as_of,
+        recorded_balance_sar=recorded_sar, snapshot_date=_cash_date(cell("Date")),
+        invalid_recorded_balance_sar=(_s(cell("Balance SAR")) != "" and recorded_sar is None),
+    )
+
+
 def _status_line(rows, row=1, col=1):
     try:
         return _s(rows[row][col])
@@ -518,7 +716,7 @@ def _status_line(rows, row=1, col=1):
         return ""
 
 
-def check_portfolio(book, tz_offset, since_days, now_utc):
+def check_portfolio(book, tz_offset, since_days, now_utc, cash_max_age_hours=24.0):
     out, metrics = [], {}
     # Ledger
     lrows = book.rows("_Portfolio_CostBasis") or []
@@ -561,17 +759,47 @@ def check_portfolio(book, tz_offset, since_days, now_utc):
     cash = None
     dup_dates = 0
     stale_notes = 0
+    cash_errors = ("missing_cash_snapshot",)
+    metrics.update(cash_sar=None, cash_sar_raw=None, cash_certified=False)
     if cix and "Balance SAR" in cix:
-        bals = [(r[cix.get("Date", 0)], _num(r[cix["Balance SAR"]]), _s(r[cix.get("Note", 6)]))
+        bals = [(r[cix["Date"]] if "Date" in cix else None,
+                 _num(r[cix["Balance SAR"]]), _s(r[cix["Note"]]) if "Note" in cix else "")
                 for r in cbody if _num(r[cix["Balance SAR"]]) is not None]
-        if bals:
-            cash = bals[-1][1]
         dc = collections.Counter(_date_of(b[0]) for b in bals)
         dup_dates = sum(v - 1 for v in dc.values() if v > 1)
         for a, b in zip(bals, bals[1:]):
             if a[1] != b[1] and a[2] and a[2] == b[2]:
                 stale_notes += 1
-        metrics["cash_sar"] = cash
+    if cix and cbody:
+        # Latest means last appended record. Never silently reuse an older
+        # balance if the newest broker snapshot is malformed or future-dated.
+        latest_row_index = len(book.rows("_Cash_Snapshot")) - 1
+        date_only_headers = {name for name, ci in cix.items()
+                             if (latest_row_index, ci) in book.cash_date_only_cells}
+        record = _cash_snapshot_record(cix, cbody[-1], tz_offset, date_only_headers)
+        converted, cash_errors = record.certify(now_utc, cash_max_age_hours, tz_offset)
+        cash = float(converted) if converted is not None else None
+        metrics.update(
+            cash_sar=cash,
+            cash_sar_raw=(float(record.recorded_balance_sar)
+                          if record.recorded_balance_sar is not None else None),
+            cash_certified=not cash_errors,
+            cash_snapshot={
+                "account": record.account_id, "currency": record.currency,
+                "balance_type": record.balance_type,
+                "as_of_utc": record.as_of_utc.isoformat() if record.as_of_utc else None,
+                "native_balance": str(record.balance) if record.balance is not None else None,
+                "fx_to_sar": str(record.fx_to_sar) if record.fx_to_sar is not None else None,
+                "fx_as_of_utc": record.fx_as_of_utc.isoformat() if record.fx_as_of_utc else None,
+            },
+        )
+    metrics["cash_certification_errors"] = list(cash_errors)
+    out.append(F("book", "BOOK", "cash_snapshot_certification", "FAIL" if cash_errors else "PASS",
+                 len(cash_errors),
+                 "latest appended record; required account, currency, settled_cash, complete timestamp; "
+                 f"cash and FX maximum age {cash_max_age_hours:g}h; "
+                 "SAR conversion reconciled to native balance at recorded FX",
+                 cash_errors))
     # Portfolio_Decision
     prow = book.rows("Portfolio_Decision") or []
     pd_status = _status_line(prow)
@@ -973,7 +1201,7 @@ def verdicts(findings):
 
 def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(3, 40.0),
                    eodhd_target=90000, cron="17 4,12,20", tz_offset=3, since_days=7,
-                   manifest=None, now_utc=None):
+                   manifest=None, now_utc=None, cash_max_age_hours=24.0):
     """Run every gate on one export. Returns a JSON-serialisable result dict."""
     expect = dict(DEFAULT_EXPECT if expect is None else expect)
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
@@ -996,7 +1224,7 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
     findings += check_forecast_pairs(book)
     findings += check_horizon(book)
     findings += check_pit(book)
-    f, m = check_portfolio(book, tz_offset, since_days, now_utc)
+    f, m = check_portfolio(book, tz_offset, since_days, now_utc, cash_max_age_hours)
     findings += f
     metrics["book"] = m
     f, m = check_cockpit(book, tz_offset, sector_cap)
@@ -1020,7 +1248,8 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
             "findings": findings, "metrics": metrics, "fix_list": fixes,
             "params": {"expect": expect, "dq": dq, "rel": rel, "sector_cap": list(sector_cap),
                        "eodhd_target": eodhd_target, "cron": cron, "tz_offset": tz_offset,
-                       "since_days": since_days, "manifest": bool(manifest)}}
+                       "since_days": since_days, "manifest": bool(manifest),
+                       "cash_max_age_hours": cash_max_age_hours}}
 
 
 def _jsonable(o):
@@ -1075,6 +1304,8 @@ def render_md(res):
               f"- Active lots {b.get('active_lots')}; holdings {b.get('holdings_sar'):,} SAR; cash {b.get('cash_sar')} SAR; "
               f"NAV {b.get('nav_sar')} SAR; ledger totals {b.get('ledger_totals')}",
               f"- Portfolio_Decision KPI: {b.get('pd_kpi')}",
+              f"- Cash certified: {b.get('cash_certified')}; recorded cash {b.get('cash_sar_raw')} SAR; "
+              f"certification errors {b.get('cash_certification_errors')}",
               f"- Fills in window {b.get('fills_in_window')}; trade notes {b.get('trade_notes')}"]
     v = res["metrics"].get("versions", {})
     if v:
@@ -1166,9 +1397,13 @@ def _build_synthetic(path, clean, asof="2026-10-03", tz_offset=3):
                136.01, 2.29, 18, None, 3473.04])
     # Cash
     ws = wb.create_sheet("_Cash_Snapshot")
-    ws.append(["Date", "Time", "Type", "Amount SAR", "Balance SAR", "Delta vs Prev", "Note"])
-    ws.append([dt.datetime(2026, 10, 1), None, "SNAPSHOT", None, 34166.25, None, "USD 9130"])
-    ws.append([dt.datetime(2026, 10, 1 if not clean else 2), None, "SNAPSHOT", None, 46398.75, None, "USD 9130" if not clean else "USD 12373"])
+    ws.append(["Date", "Time", "Type", "Amount SAR", "Balance SAR", "Delta vs Prev", "Note",
+               "Account", "Currency", "Balance Type"])
+    snapshot_day = dt.date.fromisoformat(asof)
+    ws.append([dt.datetime(2026, 10, 1) if clean else snapshot_day, dt.time(13, 20),
+               "SNAPSHOT", None, 34166.25, None, "USD 9130", "synthetic-account", "SAR", "settled_cash"])
+    ws.append([snapshot_day, dt.time(13, 30), "SNAPSHOT", None, 46398.75, None,
+               "USD 9130" if not clean else "USD 12373", "synthetic-account", "SAR", "settled_cash"])
     cash = 46398.75
     holdings = 100 * 10.0 * 3.75 + 10 * 20.0 * 3.75   # 4,500
     # Portfolio_Decision
@@ -1382,6 +1617,8 @@ def parse_args(argv=None):
     ap.add_argument("--cron", default="17 4,12,20", help="daily_sync cron 'minute hours' in UTC")
     ap.add_argument("--tz-offset", type=int, default=3, help="workbook local offset (Riyadh = 3)")
     ap.add_argument("--since-days", type=int, default=7)
+    ap.add_argument("--cash-max-age-hours", type=float, default=24.0,
+                    help="maximum cash/FX snapshot age; complete timestamps are always required (default 24h)")
     ap.add_argument("--manifest", help="JSON {name: version} to compare stamps against")
     ap.add_argument("--now", help="override 'now' as ISO UTC (for replays)")
     ap.add_argument("--selftest", action="store_true")
@@ -1409,7 +1646,8 @@ def main(argv=None):
     now = _parse_dt(a.now, 0) if a.now else None
     res = audit_workbook(a.export, expect=expect, asof=a.asof, dq=a.dq, rel=a.rel,
                          sector_cap=(int(n), float(pct)), eodhd_target=a.eodhd_target, cron=a.cron,
-                         tz_offset=a.tz_offset, since_days=a.since_days, manifest=manifest, now_utc=now)
+                         tz_offset=a.tz_offset, since_days=a.since_days, manifest=manifest, now_utc=now,
+                         cash_max_age_hours=a.cash_max_age_hours)
     res["generated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     res["digest"] = digest(res)
     if a.json:

@@ -2,7 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.0.9 (2026-10-08) -- PROJECT REVIEW REGRESSIONS JOIN BLOCKING CI
+# VERSION 1.0.10 (2026-10-08) -- DETERMINISTIC ENGINE SUITE BLOCKS CI VERDICT
+#
+# v1.0.10:
+# - Promote the existing deterministic data-engine suite to blocking after
+#   verifying all 39 tests pass offline. Keep its production dependency install.
+# - Include heavy in the required verdict so failure, cancellation or a skipped
+#   engine run cannot publish CLEAN. Add a regression executing the actual
+#   verdict shell with injected job outcomes to the blocking lean suite.
+# - Run scoring-settle and news shared-task cancellation regressions in the
+#   same required job, where engine and provider dependencies already exist.
+# - Run exported-workbook cash certification in the same job with test-only
+#   openpyxl pinned to the version already used by workbook_backup.yml.
 #
 # v1.0.9:
 # - Run the new project-review regressions in the existing blocking jobs.
@@ -158,8 +169,8 @@
 #       the natural seed for a post-window authenticated smoke workflow and is
 #       intentionally excluded here.
 #     - tests/test_data_engine_v2.py imports the 738 KB engine and its provider
-#       stack. It runs in the `heavy` job below as REPORT-ONLY until proven
-#       green, then gets promoted to blocking post-window.
+#       stack. It runs separately in the blocking `heavy` job below using full
+#       production dependencies; its deterministic tests do not call providers.
 #   Adding a suite to the blocking jobs is a deliberate act with evidence, never
 #   a wildcard.
 #
@@ -301,6 +312,7 @@ jobs:
             tests/test_news_intelligence_contracts.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_tfb_backtest_rank_evidence.py \
+            tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
             tests/test_task_error_redaction.py \
             tests/test_de_forecast_score_basis.py \
@@ -392,24 +404,16 @@ jobs:
           echo "::endgroup::"
 
   # ==========================================================================
-  # JOB 4 — data engine (REPORT-ONLY, NON-BLOCKING)
+  # JOB 4 — deterministic data engine suite (BLOCKING)
   # ==========================================================================
-  # tests/test_data_engine_v2.py guards the largest and most consequential
-  # module in the repository (738 KB) and is currently run by nothing at all.
-  # It installs the full requirements.txt, so it is the most likely job to fail
-  # for reasons unrelated to code quality (provider I/O, absent credentials,
-  # heavy dependency resolution).
-  #
-  # continue-on-error: true is a DELIBERATE, TEMPORARY setting. It buys
-  # visibility today without the risk of a permanently red gate that trains the
-  # operator to ignore CI. The moment this job is observed green on main, it is
-  # promoted to blocking by deleting the continue-on-error line — a one-line
-  # change, logged, post-window.
+  # The engine tests classify synthetic rows and inspect engine contracts;
+  # they do not fetch provider data or require credentials. All 39 pass offline.
+  # Keep the full requirements.txt install so this gate exercises the production
+  # dependency stack. Dependency-install failures also block the final verdict.
   heavy:
-    name: ⚙️ Data engine suite (report-only)
+    name: ⚙️ Data engine suite (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v5
@@ -423,7 +427,7 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -r requirements.txt
-          python -m pip install pytest
+          python -m pip install pytest "openpyxl==3.1.5"
 
       - name: ⚙️ Run data engine suite
         run: |
@@ -431,22 +435,25 @@ jobs:
           python -m pytest -q tests/test_data_engine_v2.py
           echo "::endgroup::"
 
-      - name: ℹ️ Status note
-        if: always()
+      - name: ⚙️ Run scoring-settle and news cancellation regressions
         run: |
-          echo "REPORT-ONLY. A failure here does not block the merge yet."
-          echo "Promote to blocking by deleting 'continue-on-error: true' once green."
+          python -m pytest -q \
+            tests/test_de_f7_scoring_settle.py \
+            tests/test_news_singleflight_cancellation.py
+
+      - name: 💵 Run exported-workbook cash certification regressions
+        run: python -m pytest -q tests/test_cash_snapshot_certification.py
 
   # ==========================================================================
   # JOB 5 — gate summary
   # ==========================================================================
   # Single line in the Actions tab answering 'did the things that guard money
-  # actually run', so the answer never has to be reconstructed from three
-  # separate job logs.
+  # actually run', so the answer never has to be reconstructed from four
+  # separate job logs. Every required job, including the engine, must succeed.
   summary:
     name: 📋 CI verdict
     runs-on: ubuntu-latest
-    needs: [compile, lean-unit, contract]
+    needs: [compile, lean-unit, contract, heavy]
     if: always()
     steps:
       - name: 📋 Print verdict
@@ -454,9 +461,11 @@ jobs:
           echo "compile   : ${{ needs.compile.result }}"
           echo "lean-unit : ${{ needs.lean-unit.result }}"
           echo "contract  : ${{ needs.contract.result }}"
+          echo "heavy     : ${{ needs.heavy.result }}"
           if [ "${{ needs.compile.result }}" = "success" ] \
           && [ "${{ needs.lean-unit.result }}" = "success" ] \
-          && [ "${{ needs.contract.result }}" = "success" ]; then
+          && [ "${{ needs.contract.result }}" = "success" ] \
+          && [ "${{ needs.heavy.result }}" = "success" ]; then
             echo "VERDICT: CLEAN — decision layer verified on this commit."
           else
             echo "VERDICT: FAIL — do not deploy this commit."

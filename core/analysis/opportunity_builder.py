@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.24.2  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.24.3  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.24.3 (2026-10-08): known F7 settlement failures cannot rank or receive
+new allocation, including signed research replay and disabled policy gates.
+Clean rows and ordinary settlement observation tags retain their behavior.
 
 v1.24.1 (2026-10-07): signed replay covers all execution policy families and
 the Render release identity; signing resolves the endpoint's complete active
@@ -1394,7 +1398,7 @@ from datetime import datetime, timedelta, timezone
 #   (_env_research_diversify). Removed: 0.
 # Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.2"
+OPPORTUNITY_BUILDER_VERSION = "1.24.3"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2038,6 +2042,7 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
+    "Scoring Settlement",
     "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Valuation Sanity",
     "Forecast",
     # v1.10.0: appended immediately after "Forecast" in evaluate_gates —
@@ -3456,6 +3461,27 @@ def _resolve_investability(row, view):
     return fallback
 
 
+def _scoring_settlement_failure(row):
+    """Read a known engine failure across aliases before normalization collapses them.
+
+    An unset/changed scoring mode cannot make an already failed observation
+    executable. Keep ordinary observation tags and clean candidates unchanged.
+    """
+    if not isinstance(row, dict):
+        return None
+    aliases = frozenset((*_FIELD_ALIASES["warnings"], "scoringerrors"))
+    for key, value in row.items():
+        if _norm_token(key) not in aliases:
+            continue
+        items = value if isinstance(value, (list, tuple)) else (value,)
+        for item in items:
+            match = re.search(r"(?:^|[;\s|,])f7_settle_failed:([a-z_]+)(?=$|[;\s|,])",
+                              _to_text(item) or "", re.IGNORECASE)
+            if match:
+                return match.group(1).lower()
+    return None
+
+
 def _norm_trend(v):
     t = _to_text(v)
     if t is None:
@@ -3674,6 +3700,9 @@ def normalize_candidate(row, fx_rates, criteria):
             "last_updated": _to_text(_field(view, "last_updated")),
         },
     }
+    settlement_failure = _scoring_settlement_failure(row)
+    if settlement_failure:
+        cand["scoring_settlement_failure"] = settlement_failure
     # v1.13.0 [TRUST-001]: lineage fields attach ONLY when the mode is
     # armed, so the OFF candidate dict (and therefore every downstream
     # row/payload outside meta) is byte-identical to v1.12.0.
@@ -4461,6 +4490,12 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     (handled in the pick loop) and intentionally absent here."""
     held = held_symbols or set()
     g = []
+
+    if cand.get("scoring_settlement_failure"):
+        g.append(_gate(
+            "Scoring Settlement", False, FAIL_MAJOR,
+            cand["scoring_settlement_failure"], "stable scoring result",
+            "TFB-06: failed scoring cannot rank or receive new funding"))
 
     g.append(_gate("Price", cand["price"] is not None, FAIL_MAJOR,
                    cand["price"], "> 0"))
@@ -6245,6 +6280,7 @@ def _pregate_quality_order(rows, crit):
     keyed = []
     for i, raw in enumerate(rows):
         view = _row_lookup(raw if isinstance(raw, dict) else {})
+        ok_settlement = not _scoring_settlement_failure(raw if isinstance(raw, dict) else {})
         symbol = _to_text(_field(view, "symbol")) or "?"
         price = _to_float(_field(view, "price"))
         if price is not None and price <= 0:
@@ -6278,10 +6314,12 @@ def _pregate_quality_order(rows, crit):
                    or eng_pct >= f_floor)
         ok_rel = (rel_floor is None
                   or (rel is not None and rel >= float(rel_floor)))
-        eligible = (ok_pr and ok_fresh and ok_sane and ok_fcst and ok_rel)
+        eligible = (ok_settlement and ok_pr and ok_fresh and ok_sane and ok_fcst and ok_rel)
         if eligible:
             stats["eligible"] += 1
         else:
+            if not ok_settlement:
+                stats["fail_scoring_settlement"] = stats.get("fail_scoring_settlement", 0) + 1
             if not ok_pr:
                 stats["fail_price_or_ref"] += 1
             if not ok_fresh:
@@ -6419,8 +6457,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     and cand["dq"] >= (crit.get("min_dq") or 0)):
                 trust_stats["lineage_contradiction"] += 1
         verdict = derive_verdict(gates, cand["reliability"])
-        comps = score_components(cand, sector_ctx)
-        score = opportunity_score(comps)
+        if cand.get("scoring_settlement_failure"):
+            comps, score = {}, None
+        else:
+            comps = score_components(cand, sector_ctx)
+            score = opportunity_score(comps)
         cand["_components"] = comps
         cand["_score"] = score
         ff = first_failed_gate(gates)

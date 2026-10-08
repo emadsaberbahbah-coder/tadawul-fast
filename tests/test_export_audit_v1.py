@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_export_audit_v1.py - harness for scripts/tfb_export_audit.py v1.0.0.
+"""tests/test_export_audit_v1.py - harness for scripts/tfb_export_audit.py v1.1.0.
 
 v1.0.1 (2026-10-04) REBUILD: the 10-03 delivery (sha 15822e74...) never
 reached HEAD - the file committed under this name was a byte-copy of the
@@ -11,7 +11,7 @@ Contract:
   P2  CLI: no args -> rc 2; missing file -> rc 2; --help -> rc 0
   P3  determinism: two --selftest runs print identical digests
   P4  the script is not this file (D7 guard): different sha256, and the
-      script declares SCRIPT_VERSION = "1.0.0"
+      script declares SCRIPT_VERSION = "1.1.0"
 Runs under pytest or directly (python tests/test_export_audit_v1.py).
 """
 import hashlib
@@ -60,7 +60,7 @@ def test_p4_not_a_copy_of_the_script():
     with open(os.path.abspath(__file__), "rb") as f:
         me = f.read()
     assert hashlib.sha256(script).hexdigest() != hashlib.sha256(me).hexdigest()
-    assert b'SCRIPT_VERSION = "1.0.0"' in script
+    assert b'SCRIPT_VERSION = "1.1.0"' in script
     assert b"def test_" not in script
 
 
