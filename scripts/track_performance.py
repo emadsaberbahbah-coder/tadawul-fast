@@ -1475,7 +1475,11 @@ from urllib.error import HTTPError, URLError
 # corrected cohort is unavailable; sibling evidence must be unique and use
 # the checkpoint's entry price. Existing 1M/3M creation and thresholds stay
 # unchanged.
-SCRIPT_VERSION = "6.42.1"
+# v6.43.0 (2026-10-09): outcome labels require value-bound acquisition and
+# source quote timestamps for the intended exchange session. Positive scalars,
+# last-good/stale prices, and later-session quotes never become fake WIN/LOSS.
+# Evidence is versioned in Notes; the 32-column schema and historical rows stay.
+SCRIPT_VERSION = "6.43.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2814,6 +2818,284 @@ def _yahoo_symbol(sym: str) -> str:
     return s
 
 
+_OUTCOME_RECEIPT = "[OUTCOME-WITNESS v1] "
+_OUTCOME_ACQUISITION_MAX_AGE_SECONDS = 24 * 3600
+_OUTCOME_CALENDARS = {
+    "US": "XNYS", "SR": "XSAU", "L": "XLON", "LSE": "XLON",
+    "TO": "XTSE", "V": "XTSX", "AX": "XASX", "AU": "XASX",
+    "T": "XTKS", "HK": "XHKG", "DE": "XETR", "XETRA": "XETR",
+    "PA": "XPAR", "AS": "XAMS", "BR": "XBRU", "MI": "XMIL",
+    "SW": "XSWX", "CO": "XCSE", "ST": "XSTO", "OL": "XOSL",
+    "HE": "XHEL", "WA": "XWAR", "LS": "XLIS", "VI": "XWBO",
+    "IS": "XIST", "JSE": "XJSE", "TA": "XTAE", "SG": "XSES",
+    "SI": "XSES", "KS": "XKRX", "KO": "XKRX", "NZ": "XNZE",
+}
+
+
+@dataclass(frozen=True)
+class OutcomePrice:
+    """Immutable source evidence bound to exactly one symbol and price."""
+    symbol: str
+    price: float
+    provider: str
+    acquired_at: datetime
+    quote_asof: datetime
+    quote_kind: str = "source_quote"
+
+
+class OutcomePrices(dict):
+    """Numeric dict compatibility, with explicit value-bound outcome evidence.
+
+    Copying/casting to an ordinary dict loses the proof and cannot mature a
+    record. Consumers must check both the receipt and its exact numeric value.
+    """
+    def __init__(self):
+        super().__init__()
+        self.evidence: Dict[str, OutcomePrice] = {}
+        self.reasons: Dict[str, str] = {}
+
+    def accept(self, evidence: OutcomePrice) -> None:
+        self[evidence.symbol] = evidence.price
+        self.evidence[evidence.symbol] = evidence
+        self.reasons.pop(evidence.symbol, None)
+
+
+def _outcome_timestamp(value: Any) -> Optional[datetime]:
+    """An actual instant, never a date-only or invented retrieval timestamp."""
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            epoch = float(value)
+            if not math.isfinite(epoch) or epoch <= 0:
+                return None
+            if epoch > 1e12:
+                epoch /= 1000.0
+            return datetime.fromtimestamp(epoch, timezone.utc)
+        if isinstance(value, datetime):
+            stamp = value
+        else:
+            raw = _safe_str(value)
+            if ":" not in raw:
+                return None
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+@functools.lru_cache(maxsize=128)
+def _outcome_calendar_schedule(name: str, utc_day: str) -> Tuple[Tuple[str, datetime, datetime], ...]:
+    import exchange_calendars as calendars
+    cal = calendars.get_calendar(name)
+    day = datetime.fromisoformat(utc_day).date()
+    sessions = cal.sessions_in_range(
+        (day - timedelta(days=14)).isoformat(), (day + timedelta(days=14)).isoformat())
+    return tuple((str(s.date()), cal.session_open(s).to_pydatetime(),
+                  cal.session_close(s).to_pydatetime()) for s in sessions)
+
+
+def _outcome_sessions(symbol: str, around: datetime) -> Tuple[str, Tuple[Tuple[str, datetime, datetime], ...]]:
+    """Bounded offline exchange-calendar evidence; unavailable means unknown.
+
+    Existing declared exchange-calendars supplies DST, holidays and early
+    closes. No weekday guess is used for an unsupported instrument/calendar.
+    """
+    raw = _safe_str(symbol).upper()
+    if not raw or raw.startswith("^") or "=" in raw or raw.endswith("-USD"):
+        raise ValueError("outcome_calendar_unknown")
+    from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+    suffix = raw.rsplit(".", 1)[1] if "." in raw else "US"
+    if "." in raw and US_SHARE_CLASS_DOT_RE.fullmatch(raw) and split_symbol_exchange(raw)[1] is None:
+        suffix = "US"
+    name = _OUTCOME_CALENDARS.get(suffix)
+    if name is None or ("." not in raw and not raw[0].isalpha()):
+        raise ValueError("outcome_calendar_unknown")
+    return name, _outcome_calendar_schedule(name, around.astimezone(timezone.utc).date().isoformat())
+
+
+def _outcome_quote_session(evidence: OutcomePrice, now: datetime) -> Tuple[Optional[str], str]:
+    """Require a latest completed or current-session quote, with an actual time."""
+    try:
+        _name, sessions = _outcome_sessions(evidence.symbol, now)
+        completed = [s for s in sessions if s[2] <= now]
+        if not completed:
+            return None, "outcome_calendar_unknown"
+        # The shared future-clock allowance does not turn an after-hours
+        # price into a regular-session close. Only an explicit regular market
+        # timestamp can extend slightly beyond the calendar close.
+        skew = timedelta(minutes=15)
+        close_slack = skew if evidence.quote_kind == "regular_market" else timedelta(0)
+        matching = [s for s in sessions if s[1] <= evidence.quote_asof <= s[2] + close_slack]
+        if len(matching) != 1:
+            return None, "quote_timestamp_stale" if evidence.quote_asof < sessions[0][1] else "quote_session_unknown"
+        session = matching[0]
+        if evidence.quote_asof > now + skew:
+            return None, "quote_timestamp_future"
+        if session[0] < completed[-1][0]:
+            return None, "quote_session_stale"
+        if session[1] > now:
+            return None, "quote_timestamp_future"
+        return session[0], ""
+    except Exception:
+        return None, "outcome_calendar_unknown"
+
+
+def _outcome_price_from_row(row: Dict[str, Any], requested: str, now: datetime) -> Tuple[Optional[OutcomePrice], str]:
+    """Share acquisition truth, then require independently witnessed quote time."""
+    try:
+        from core.data_validity import row_acquisition, acquisition_tokens
+        sym = _safe_str(row.get("symbol") or row.get("ticker")).upper()
+        if sym != requested:
+            return None, "quote_identity_mismatch"
+        grouped: Dict[str, List[Any]] = defaultdict(list)
+        for key, value in row.items():
+            grouped[re.sub(r"[^a-z0-9]", "", str(key).lower())].append(value)
+        normalized = {key: values[-1] for key, values in grouped.items()}
+        raw_prices = [v for k, values in grouped.items()
+                      if k in {"currentprice", "price", "last", "lastprice"}
+                      for v in values if v not in (None, "")]
+        if any(isinstance(v, bool) for v in raw_prices):
+            return None, "quote_price_invalid_or_conflicting"
+        prices = [float(v) for v in raw_prices]
+        if not prices or any(not math.isfinite(p) or p <= 0 for p in prices) or len(set(prices)) != 1:
+            return None, "quote_price_invalid_or_conflicting"
+        checked = dict(row)
+        checked.setdefault("current_price", prices[0])
+        verdict = row_acquisition(checked, now, _OUTCOME_ACQUISITION_MAX_AGE_SECONDS)
+        if not verdict.successful:
+            return None, verdict.reason or "acquisition_unknown"
+        tokens: Dict[str, str] = {}
+        for key in ("warnings", "warning", "flags", "rowwarnings"):
+            for value in grouped.get(key, []):
+                tokens.update(acquisition_tokens(value))
+        for key in ("acquisition_status", "acquisition_provider", "acquisition_acquired_at", "acquisition_quote_asof"):
+            if normalized.get(re.sub(r"[^a-z0-9]", "", key)) not in (None, ""):
+                tokens[key] = _safe_str(normalized[re.sub(r"[^a-z0-9]", "", key)])
+        if tokens.get("acquisition_status", "").lower() != "success":
+            return None, "acquisition_receipt_missing"
+        if not tokens.get("acquisition_provider") or not tokens.get("acquisition_acquired_at"):
+            return None, "acquisition_receipt_missing"
+        if tokens.get("acquisition_quote_asof") and verdict.quote_asof is None:
+            return None, "quote_timestamp_unknown"
+        quote_values = [verdict.quote_asof] if verdict.quote_asof is not None else []
+        regular_market_witnessed = False
+        for key in ("pricebarts", "quotetimestamp", "regularmarkettime"):
+            for value in grouped.get(key, []):
+                if value in (None, ""):
+                    continue
+                quote = _outcome_timestamp(value)
+                if quote is None:
+                    return None, "quote_timestamp_unknown"
+                quote_values.append(quote)
+                if key == "regularmarkettime":
+                    regular_market_witnessed = True
+        if not quote_values:
+            return None, "quote_timestamp_unknown"
+        if len(set(quote_values)) != 1:
+            return None, "quote_timestamp_conflict"
+        provider = _safe_str(normalized.get("dataprovider") or normalized.get("provider")
+                             or normalized.get("datasource") or normalized.get("source"))
+        provider = provider or tokens.get("acquisition_provider", "")
+        kind = "regular_market" if regular_market_witnessed else "source_quote"
+        evidence = OutcomePrice(requested, prices[0], provider, verdict.acquired_at, quote_values[0], kind)
+        if evidence.quote_asof > evidence.acquired_at + timedelta(minutes=15):
+            return None, "quote_after_acquisition"
+        _session, reason = _outcome_quote_session(evidence, now)
+        return (None, reason) if reason else (evidence, "")
+    except Exception:
+        return None, "outcome_evidence_unavailable"
+
+
+def _outcome_map_evidence(prices: Any, symbol: str, now: datetime) -> Tuple[Optional[OutcomePrice], str]:
+    """Revalidate every receipt; numeric casts or changed values lose the proof."""
+    if not isinstance(prices, OutcomePrices):
+        return None, "outcome_price_evidence_missing"
+    evidence = prices.evidence.get(symbol)
+    if not isinstance(evidence, OutcomePrice):
+        return None, prices.reasons.get(symbol, "price_unavailable")
+    if isinstance(prices.get(symbol), bool) or evidence.symbol != symbol or prices.get(symbol) != evidence.price:
+        return None, "outcome_price_evidence_conflict"
+    row = {"symbol": symbol, "current_price": evidence.price, "data_provider": evidence.provider,
+           "acquisition_status": "success", "acquisition_provider": evidence.provider,
+           "acquisition_acquired_at": evidence.acquired_at.isoformat(),
+           "acquisition_quote_asof": evidence.quote_asof.isoformat()}
+    if evidence.quote_kind == "regular_market":
+        row["regularMarketTime"] = evidence.quote_asof.timestamp()
+    return _outcome_price_from_row(row, symbol, now)
+
+
+def _outcome_target_session(record: Any, evidence: OutcomePrice, now: datetime) -> Tuple[Dict[str, Any], str]:
+    """First exchange-session close at/after target; never use a later session."""
+    result: Dict[str, Any] = {}
+    try:
+        target = _outcome_timestamp(record.target_date)
+        entry = _outcome_timestamp(record.date_recorded)
+        if target is None or entry is None or target <= entry:
+            return result, "outcome_target_time_unknown"
+        name, sessions = _outcome_sessions(record.symbol, target)
+        candidates = [s for s in sessions if s[2] >= target]
+        if not candidates:
+            return result, "outcome_calendar_unknown"
+        session, _open, close = candidates[0]
+        quote_session, reason = _outcome_quote_session(evidence, now)
+        result.update(calendar=name, target_session=session, target_session_close=close.isoformat(),
+                      quote_session=quote_session, requested_horizon=record.horizon.value,
+                      intended_horizon_days=(target-entry).total_seconds()/86400.0,
+                      actual_horizon_days=(evidence.quote_asof-entry).total_seconds()/86400.0)
+        if reason:
+            return result, reason
+        if now < close:
+            return result, "target_session_not_complete"
+        if quote_session != session:
+            return result, "quote_outside_target_session"
+        if evidence.quote_asof < target:
+            return result, "quote_before_target_time"
+        if evidence.quote_asof < close:
+            return result, "quote_before_target_close"
+        return result, ""
+    except Exception:
+        return result, "outcome_calendar_unknown"
+
+
+def _outcome_receipt(record: Any, now: datetime, state: str, reason: str,
+                     evidence: Optional[OutcomePrice] = None, context: Optional[Dict[str, Any]] = None) -> None:
+    """Replace only this version's last receipt in Notes; preserve other history."""
+    receipt = {"schema": "tfb.outcome-price.v1", "tracker_version": SCRIPT_VERSION,
+               "state": state, "reason": reason, "evaluated_at": now.isoformat(),
+               "target_at": (_outcome_timestamp(record.target_date).isoformat()
+                             if _outcome_timestamp(record.target_date) else None)}
+    if evidence is not None:
+        receipt.update(provider=evidence.provider, acquired_at=evidence.acquired_at.isoformat(),
+                       quote_asof=evidence.quote_asof.isoformat(), quote_kind=evidence.quote_kind,
+                       price=evidence.price)
+    receipt.update(context or {})
+    parts = [p for p in str(record.notes or "").split(" | ") if not p.startswith(_OUTCOME_RECEIPT)]
+    parts.append(_OUTCOME_RECEIPT + json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    record.notes = " | ".join(p for p in parts if p)
+
+
+def _yahoo_parse_chart_outcome(payload: Any, symbol: str, now: datetime) -> Tuple[Optional[OutcomePrice], str]:
+    """Bind Yahoo's own identity, current price and market timestamp together."""
+    try:
+        results = (((payload or {}).get("chart") or {}).get("result") or [])
+        if len(results) != 1:
+            return None, "quote_payload_invalid"
+        meta = (results[0] or {}).get("meta") or {}
+        if _safe_str(meta.get("symbol")).upper() != _yahoo_symbol(symbol).upper():
+            return None, "quote_identity_mismatch"
+        quote = _outcome_timestamp(meta.get("regularMarketTime"))
+        if quote is None:
+            return None, "quote_timestamp_unknown"
+        row = {"symbol": symbol, "current_price": meta.get("regularMarketPrice"),
+               "data_provider": "yahoo_chart", "acquisition_status": "success",
+               "acquisition_provider": "yahoo_chart", "acquisition_acquired_at": now.isoformat(),
+               "acquisition_quote_asof": quote.isoformat(), "regularMarketTime": meta.get("regularMarketTime")}
+        return _outcome_price_from_row(row, symbol, now)
+    except Exception:
+        return None, "quote_payload_invalid"
+
+
 def _yahoo_parse_chart_price(payload: Any) -> float:
     """Extract meta.regularMarketPrice from a v8 chart envelope. 0.0 when
     absent/malformed. Pure + total: never raises."""
@@ -2845,35 +3127,52 @@ def _yahoo_fetch_one_price_sync(sym: str, timeout: float) -> float:
         return 0.0
 
 
-async def _yahoo_fetch_one_status(session: Any, sym: str, timeout: float) -> tuple:
-    """v6.21.0 PF-2: status-aware single fetch -> (price, status_class)
-    where status_class is one of ok/429/403/timeout/other. Never raises."""
+def _yahoo_fetch_one_outcome_sync(sym: str, timeout: float) -> Tuple[Optional[OutcomePrice], str]:
+    try:
+        req = UrlRequest(_YF_CHART_URL.format(sym=_yahoo_symbol(sym)), method="GET")
+        for k, v in _YF_HEADERS.items():
+            req.add_header(k, v)
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json_loads(resp.read())
+        return _yahoo_parse_chart_outcome(payload, sym, _utc_now())
+    except Exception:
+        return None, "quote_transport_failed"
+
+
+async def _yahoo_fetch_one_outcome_status(session: Any, sym: str, timeout: float) -> tuple:
+    """Status-aware source-evidence fetch; no quote timestamp means unknown."""
     if session is not None:
         try:
             url = _YF_CHART_URL.format(sym=_yahoo_symbol(sym))
             async with session.get(url) as resp:
                 code = int(resp.status)
                 if code in (429, 999):
-                    return 0.0, "429"
+                    return None, "429", "quote_http_429"
                 if code == 403:
-                    return 0.0, "403"
+                    return None, "403", "quote_http_403"
                 if code != 200:
-                    return 0.0, "other"
+                    return None, "other", "quote_http_error"
                 raw = await resp.read()
-            px = _yahoo_parse_chart_price(json_loads(raw))
-            return (px, "ok") if px > 0 else (0.0, "other")
+            evidence, reason = _yahoo_parse_chart_outcome(json_loads(raw), sym, _utc_now())
+            return (evidence, "ok", "") if evidence is not None else (None, "other", reason)
         except asyncio.TimeoutError:
-            return 0.0, "timeout"
+            return None, "timeout", "quote_transport_timeout"
         except Exception:
-            return 0.0, "other"
+            return None, "other", "quote_transport_failed"
     loop = asyncio.get_running_loop()
     try:
-        px = await loop.run_in_executor(
-            _get_executor(), _yahoo_fetch_one_price_sync, sym, timeout
+        evidence, reason = await loop.run_in_executor(
+            _get_executor(), _yahoo_fetch_one_outcome_sync, sym, timeout
         )
-        return (px, "ok") if px > 0 else (0.0, "other")
+        return (evidence, "ok", "") if evidence is not None else (None, "other", reason)
     except Exception:
-        return 0.0, "other"
+        return None, "other", "quote_transport_failed"
+
+
+async def _yahoo_fetch_one_status(session: Any, sym: str, timeout: float) -> tuple:
+    """Numeric compatibility wrapper; scalar output has no outcome proof."""
+    evidence, status, _reason = await _yahoo_fetch_one_outcome_status(session, sym, timeout)
+    return (evidence.price if evidence is not None else 0.0), status
 
 
 async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> float:
@@ -2885,7 +3184,9 @@ async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> floa
 async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
     """v6.20.0 (PF-1): price the given symbols directly from Yahoo's v8
     chart API under a concurrency cap and wall-clock budget. Returns only
-    positive prices, keyed by the ORIGINAL (TFB) symbol. Never raises."""
+    witnessed positive prices, keyed by the ORIGINAL (TFB) symbol. Never raises.
+    The numeric API is retained; OutcomePrices carries the required sidecar.
+    """
     syms = [
         _safe_str(x).strip().upper()
         for x in (symbols or [])
@@ -2902,7 +3203,7 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
     budget = _fallback_budget_sec()
     timeout = _fallback_timeout_sec()
     sem = asyncio.Semaphore(_fallback_conc())
-    out: Dict[str, float] = {}
+    out = OutcomePrices()
     session = None
     try:
         if ASYNC_HTTP_AVAILABLE and aiohttp is not None:
@@ -2924,6 +3225,7 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
 
         async def one(s: str) -> None:
             if (time.time() - t0) > budget:
+                out.reasons[s] = "quote_budget_exhausted"
                 return
             if _brk_on and _brk["consec"] >= _brk_at:
                 if not _brk["tripped"]:
@@ -2933,34 +3235,45 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
                         "skipping the remaining launches this leg.",
                         _PF_TAG, _brk["consec"])
                 stats["skipped"] = stats.get("skipped", 0) + 1
+                out.reasons[s] = "quote_rate_limit_breaker"
                 return
             async with sem:
                 if (time.time() - t0) > budget:
+                    out.reasons[s] = "quote_budget_exhausted"
                     return
                 if _brk_on and _brk["consec"] >= _brk_at:
                     stats["skipped"] = stats.get("skipped", 0) + 1
+                    out.reasons[s] = "quote_rate_limit_breaker"
                     return
                 # v6.21.0 PF-2: serialize launch spacing so the runner
                 # never bursts past Yahoo's limiter.
                 if spacing > 0:
                     async with launch_lock:
                         await asyncio.sleep(spacing)
-                px, st = await _yahoo_fetch_one_status(session, s, timeout)
+                evidence, st, reason = await _yahoo_fetch_one_outcome_status(session, s, timeout)
                 if st == "429" and retry_on and (time.time() - t0) < budget:
                     await asyncio.sleep(3.0 + random.random() * 3.0)
-                    px, st = await _yahoo_fetch_one_status(session, s, timeout)
+                    evidence, st, reason = await _yahoo_fetch_one_outcome_status(session, s, timeout)
                 stats[st] = stats.get(st, 0) + 1
                 if st == "429":
                     _brk["consec"] += 1
                 elif st == "ok":
                     _brk["consec"] = 0
-                if px > 0:
-                    out[s] = px
+                if evidence is not None:
+                    out.accept(evidence)
+                else:
+                    out.reasons[s] = reason or "outcome_evidence_unavailable"
 
         await asyncio.gather(*(one(s) for s in syms), return_exceptions=True)
+        for symbol in syms:
+            if symbol not in out:
+                out.reasons.setdefault(symbol, "outcome_evidence_unavailable")
         global _LAST_FALLBACK_STATS
         _LAST_FALLBACK_STATS = dict(stats)
     except Exception as e:
+        for symbol in syms:
+            if symbol not in out:
+                out.reasons.setdefault(symbol, "quote_transport_failed")
         logger.warning("%s pass error: %s", _PF_TAG, e)
     finally:
         if session is not None:
@@ -3071,11 +3384,34 @@ def _ca_budget_state(symbol: str) -> str:
     return "ok"
 
 
-def _ca_adjusted_roi(symbol: str, entry_date: Any) -> Optional[float]:
+def _ca_target_bar(bars: Any, target_session: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """One finite adjusted close at the witnessed target session, or unknown."""
+    try:
+        datetime.strptime(target_session, "%Y-%m-%d")
+        endings = [bar for bar in bars or [] if isinstance(bar, dict)
+                   and _safe_str(bar.get("date"))[:10] == target_session]
+        if not endings:
+            return None, "corporate_action_target_close_unavailable"
+        closes = {_bt_bar_close(bar) for bar in endings}
+        if len(closes) != 1:
+            return None, "corporate_action_target_close_conflict"
+        close = next(iter(closes))
+        if close is None or not math.isfinite(close) or close <= 0:
+            return None, "corporate_action_target_close_invalid"
+        return endings[0], ""
+    except Exception:
+        return None, "corporate_action_target_close_invalid"
+
+
+def _ca_adjusted_roi(symbol: str, entry_date: Any, target_session: Optional[str] = None) -> Optional[float]:
     """ROI% from the ADJUSTED close series between entry_date and the latest
     bar (deep-history pull, adjusted via v6.18.0 D). Start bar = nearest bar
     within 7 days of entry_date. Fail-soft None on any doubt.
-    v6.37.0: bars are cached per symbol for the run (one pull per symbol)."""
+    v6.37.0: bars are cached per symbol for the run (one pull per symbol).
+    Prospective outcomes pass the witnessed target session: only that exact
+    bar can end the comparison, never a later current-session bar. The old
+    two-argument helper API retains its legacy latest-bar behavior.
+    """
     try:
         sym = _safe_str(symbol).upper()
         if not sym:
@@ -3108,10 +3444,16 @@ def _ca_adjusted_roi(symbol: str, entry_date: Any) -> Optional[float]:
         if best is None or best_gap > 7:
             return None
         c0 = _bt_bar_close(best)
-        c1 = _bt_bar_close(bars[-1])
-        if not c0 or not c1 or c0 <= 0:
+        end = bars[-1]
+        if target_session is not None:
+            end, reason = _ca_target_bar(bars, target_session)
+            if reason:
+                return None
+        c1 = _bt_bar_close(end)
+        if not c0 or not c1 or c0 <= 0 or not math.isfinite(c0) or not math.isfinite(c1):
             return None
-        return (c1 / c0 - 1.0) * 100.0
+        roi = (c1 / c0 - 1.0) * 100.0
+        return roi if math.isfinite(roi) else None
     except Exception:
         return None
 
@@ -3182,7 +3524,7 @@ def _ca_ledger_index() -> Dict[str, Any]:
     return _CA_LEDGER_CACHE["index"]
 
 
-def _ca_ledger_factor(symbol: str, entry_date: Any) -> Optional[float]:
+def _ca_ledger_factor(symbol: str, entry_date: Any, target_session: Optional[str] = None) -> Optional[float]:
     """Cumulative confirmed price factor for prices dated entry_date; 1.0/None
     when no confirmed action applies."""
     if not _ca_ledger_enabled():
@@ -3192,6 +3534,10 @@ def _ca_ledger_factor(symbol: str, entry_date: Any) -> Optional[float]:
     if not cam or not idx:
         return None
     try:
+        if target_session is not None:
+            end = datetime.strptime(target_session, "%Y-%m-%d").date()
+            idx = {key: [(effective, factor) for effective, factor in actions if effective <= end]
+                   for key, actions in idx.items()}
         f = cam.cumulative_factor(_safe_str(symbol).upper(),
                                   cam._as_date(entry_date), idx)
         return f if abs(f - 1.0) > 1e-9 else None
@@ -3351,10 +3697,8 @@ def _calibration_env_string(report: Any) -> Tuple[str, str]:
 
 
 def _mature_fresh_only_enabled() -> bool:
-    """v6.17.0 (C) master switch. Default ON; set
-    TFB_TRACK_MATURE_FRESH_ONLY=0/false/off/no to restore the v6.16.0
-    maturation verbatim (past-due records mature on stale/default
-    unrealized_roi — the fake-breakeven behavior)."""
+    """Existing unpriced-grace expiry switch. Source evidence is mandatory
+    in every mode; disabling this flag cannot resurrect fabricated outcomes."""
     return (os.getenv("TFB_TRACK_MATURE_FRESH_ONLY") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
@@ -4693,9 +5037,9 @@ class BackendClient:
         # v6.28.0 FEED-R: each chunk call is now transient-retried with
         # backoff+jitter under a feed deadline, bisected once on final
         # failure, and the residue gets one last primary sweep. The legacy
-        # kill-switch routes every call through a single attempt, restoring
-        # v6.27.0 byte-identically (same payloads, same _first_fail strings).
-        out: Dict[str, float] = {}
+        # retry switch routes every call through a single attempt (same
+        # payloads and _first_fail strings). Outcome evidence stays mandatory.
+        out = OutcomePrices()
         chunk_n = _price_chunk_size()
         chunk_to = _price_chunk_timeout_sec()
         global _LAST_FEED_DIAGNOSIS, _LAST_FEED_RETRY_STATS
@@ -4705,34 +5049,44 @@ class BackendClient:
         _rstats = {"retries": 0, "bisects": 0, "sweep": 0}
 
         def _absorb_rows(rows: Any) -> None:
+            grouped: Dict[str, List[Tuple[Optional[OutcomePrice], str]]] = defaultdict(list)
             for r in rows or []:
                 if not isinstance(r, dict):
                     continue
                 sym = _safe_str(r.get("symbol")).upper()
-                price = _safe_float(
-                    r.get("current_price")
-                    or r.get("price")
-                    or r.get("last")
-                    or r.get("last_price"),
-                    default=0.0,
-                )
-                if sym and price > 0 and sym not in out:
-                    out[sym] = price
+                if sym not in syms:
+                    for requested in syms:
+                        if requested not in out:
+                            out.reasons.setdefault(requested, "quote_identity_mismatch")
+                    continue
+                grouped[sym].append(_outcome_price_from_row(r, sym, _utc_now()))
+            for sym, verdicts in grouped.items():
+                if sym in out:
+                    continue
+                # Contradictory identities/prices/provenance in one response
+                # cannot certify its first clean duplicate. A separate valid
+                # secondary response can still supply independent proof.
+                evidence, reason = verdicts[0]
+                if len(set(verdicts)) > 1:
+                    out.reasons[sym] = "quote_duplicate_conflict"
+                elif evidence is not None:
+                    out.accept(evidence)
+                else:
+                    out.reasons[sym] = reason
 
         def _absorb_map(blob: Any) -> None:
             if not isinstance(blob, dict):
                 return
+            rows = []
             for k, v in blob.items():
                 if isinstance(v, dict):
-                    fv = _safe_float(
-                        v.get("current_price")
-                        or v.get("price")
-                        or v.get("last")
-                        or v.get("last_price"),
-                        default=0.0,
-                    )
-                    if fv > 0 and str(k).upper() not in out:
-                        out[str(k).upper()] = fv
+                    sym = str(k).upper()
+                    if sym not in syms:
+                        continue
+                    row = dict(v)
+                    row.setdefault("symbol", sym)
+                    rows.append(row)
+            _absorb_rows(rows)
 
         async def _chunk_call(label: str, endpoint: str, mk_payload: Any,
                               chunk: List[str]) -> List[Dict[str, Any]]:
@@ -4749,6 +5103,9 @@ class BackendClient:
                 if not _first_fail:
                     _first_fail = "%s (HTTP %s: %s)" % (
                         label, code, _safe_str(err)[:90])
+                for symbol in chunk:
+                    if symbol not in out:
+                        out.reasons.setdefault(symbol, "quote_transport_failed")
                 return []
             attempt = 1
             while (attempt < _feed_retries()
@@ -4765,6 +5122,9 @@ class BackendClient:
             if not _first_fail:
                 _first_fail = "%s (HTTP %s: %s)" % (
                     label, code, _safe_str(err)[:90])
+            for symbol in chunk:
+                if symbol not in out:
+                    out.reasons.setdefault(symbol, "quote_transport_failed")
             if (_feed_bisect_enabled() and len(chunk) >= 10
                     and time.time() < _deadline):
                 _rstats["bisects"] += 1
@@ -4791,8 +5151,15 @@ class BackendClient:
 
         def _absorb_primary(envs: List[Dict[str, Any]]) -> None:
             for data in envs:
-                _absorb_rows(_extract_rows_from_envelope(data))
-                _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else None)
+                rows = list(_extract_rows_from_envelope(data))
+                blob = data.get("data")
+                if isinstance(blob, dict):
+                    for key, value in blob.items():
+                        if isinstance(value, dict) and str(key).upper() in syms:
+                            row = dict(value)
+                            row.setdefault("symbol", str(key).upper())
+                            rows.append(row)
+                _absorb_rows(rows)
 
         # --- pass 1: primary /v1/enriched/quotes, chunked -----------------
         for ci in range(0, len(syms), chunk_n):
@@ -4857,18 +5224,11 @@ class BackendClient:
         )
         if isinstance(data, dict) and code == 200 and not err:
             rows = _extract_rows_from_envelope(data)
-            out = {}
-            for r in rows:
-                sym = _safe_str(r.get("symbol")).upper()
-                price = _safe_float(
-                    r.get("current_price") or r.get("price"), default=0.0
-                )
-                if sym and price > 0:
-                    out[sym] = price
+            _absorb_rows(rows)
             if out:
                 return out
 
-        return {}
+        return out
 
 
 # =============================================================================
@@ -8328,7 +8688,8 @@ class PerformanceTrackerApp:
             # v6.18.0 (PRICE-FEED-LOUD): this exact silent {} froze all 2,264
             # records at entry price on 2026-07-12 — and would have expired the
             # whole first cohort UNPRICED. Never silent again.
-            price_map: Dict[str, float] = {}
+            price_map = OutcomePrices()
+            price_map.reasons.update({s: "backend_unavailable" for s in syms})
             global _LAST_FEED_DIAGNOSIS
             _LAST_FEED_DIAGNOSIS = "base_url_EMPTY"
             logger.error(
@@ -8338,7 +8699,10 @@ class PerformanceTrackerApp:
                 _PRICE_FEED_TAG, len(syms),
             )
         else:
-            price_map = await self.backend.fetch_prices(syms)
+            fetched = await self.backend.fetch_prices(syms)
+            price_map = fetched if isinstance(fetched, OutcomePrices) else OutcomePrices()
+            if not isinstance(fetched, OutcomePrices):
+                price_map.reasons.update({s: "outcome_price_evidence_missing" for s in syms})
             _dead = _price_feed_dead(syms, price_map)
             if _dead and not str(_LAST_FEED_DIAGNOSIS).startswith("backend_dead"):
                 _LAST_FEED_DIAGNOSIS = "backend_dead: " + str(_dead)[:160]
@@ -8353,14 +8717,17 @@ class PerformanceTrackerApp:
         global _LAST_FALLBACK_FILLED
         _LAST_FALLBACK_FILLED = 0
         if _price_fallback_enabled():
-            _missing = [s for s in syms
-                        if float(price_map.get(s, 0.0) or 0.0) <= 0.0]
+            _missing = [s for s in syms if _outcome_map_evidence(price_map, s, _utc_now())[0] is None]
             if _missing:
                 _fb = await _yahoo_chart_fallback_prices(_missing)
-                for _k, _v in _fb.items():
-                    if float(price_map.get(_k, 0.0) or 0.0) <= 0.0 and _v > 0:
-                        price_map[_k] = _v
-                _LAST_FALLBACK_FILLED = len(_fb)
+                for _k in _missing:
+                    _evidence, _reason = _outcome_map_evidence(_fb, _k, _utc_now())
+                    if _evidence is not None:
+                        price_map.accept(_evidence)
+                        _LAST_FALLBACK_FILLED += 1
+                    else:
+                        _prior = price_map.reasons.get(_k, "")
+                        price_map.reasons[_k] = ";".join(dict.fromkeys(x for x in (_prior, _reason) if x))
 
         now_r = RiyadhTime.now()
 
@@ -8369,6 +8736,7 @@ class PerformanceTrackerApp:
         _n_matured = 0
         _pending_syms: List[str] = []
         _expired_syms: List[str] = []
+        _skipped_outcome_reasons: Dict[str, int] = defaultdict(int)
         _CA_BARS_CACHE.clear()   # v6.37.0: per-run cache + budget reset
         _CA_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
         _loop_i = 0
@@ -8379,29 +8747,54 @@ class PerformanceTrackerApp:
                 logger.info("[MATURE v%s] progress %d/%d | matured=%d pending=%d ca_pulls=%d ca_deferred=%d",
                             SCRIPT_VERSION, _loop_i, len(active), _n_matured,
                             len(_pending_syms), _CA_BUDGET["pulls"], _CA_BUDGET["deferred"])
-            px = float(price_map.get(r.symbol, 0.0))
-            _fresh = px > 0.0
+            _evidence, _outcome_reason = _outcome_map_evidence(price_map, r.symbol, now_r)
+            px = _evidence.price if _evidence is not None else 0.0
+            _fresh = _evidence is not None
+            _roi_nonfinite = False
             if _fresh:
                 r.current_price = px
-                if r.entry_price > 0:
-                    r.unrealized_roi = (px / r.entry_price - 1.0) * 100.0
+                if math.isfinite(r.entry_price) and r.entry_price > 0:
+                    _roi = (px / r.entry_price - 1.0) * 100.0
+                    _roi_nonfinite = not math.isfinite(_roi)
+                    r.unrealized_roi = None if _roi_nonfinite else _roi
 
-            if r.target_date and now_r >= r.target_date:
-                if not _fresh_only:
-                    # v6.16.0 VERBATIM (kill-switch path): mature on whatever
-                    # unrealized_roi is stored — stale or default-0.0 included.
-                    r.status = PerformanceStatus.MATURED
-                    r.maturity_date = now_r
-                    r.realized_roi = float(r.unrealized_roi)
-                    if (r.realized_roi or 0.0) > 0:
-                        r.outcome = "WIN"
-                    elif (r.realized_roi or 0.0) < 0:
-                        r.outcome = "LOSS"
+            _target = _outcome_timestamp(r.target_date)
+            if _target is None:
+                r.realized_roi = None
+                r.outcome = None
+                _pending_syms.append(r.symbol)
+                _skipped_outcome_reasons["outcome_target_time_unknown"] += 1
+                _outcome_receipt(r, now_r, "PENDING", "outcome_target_time_unknown", _evidence)
+            elif now_r >= _target:
+                _context = {}
+                if _evidence is not None:
+                    _context, _outcome_reason = _outcome_target_session(r, _evidence, now_r)
+                if not math.isfinite(r.entry_price) or r.entry_price <= 0:
+                    _outcome_reason = "entry_price_invalid"
+                elif _roi_nonfinite:
+                    _outcome_reason = "outcome_roi_nonfinite"
+                if _outcome_reason:
+                    # Known price with an unknown/wrong target basis remains
+                    # ACTIVE even beyond grace. Never invent a target close.
+                    r.realized_roi = None
+                    r.outcome = None
+                    _skipped_outcome_reasons[_outcome_reason] += 1
+                    _state = "PENDING"
+                    if (_fresh_only and _outcome_reason == "price_unavailable"
+                            and (now_r-_target).days > _grace_d):
+                        r.status = PerformanceStatus.EXPIRED
+                        r.maturity_date = now_r
+                        r.outcome = "UNPRICED"
+                        _expired_syms.append(r.symbol)
+                        _state = "EXPIRED"
                     else:
-                        r.outcome = "BREAKEVEN"
-                elif _fresh and r.entry_price > 0:
-                    # v6.17.0 (A): fresh positive price THIS run -> honest
-                    # maturation on today's realized number.
+                        _pending_syms.append(r.symbol)
+                    _outcome_receipt(r, now_r, _state, _outcome_reason, _evidence, _context)
+                    r.last_updated = _utc_now()
+                    continue
+                if _fresh and r.entry_price > 0:
+                    # A witnessed intended-session close is mandatory even
+                    # when the legacy unpriced-grace expiry switch is off.
                     # v6.18.0 (CA-GUARD): a big print-ROI is verified against
                     # the ADJUSTED series before it becomes a WIN/LOSS — a
                     # bonus issue / split between entry and maturity fakes the
@@ -8411,7 +8804,7 @@ class PerformanceTrackerApp:
                     # (excluded like UNPRICED). TFB_TRACK_CA_GUARD=0 -> v6.17.0.
                     _roi_print = float(r.unrealized_roi or 0.0)
                     _verdict, _roi_use = "ok", _roi_print
-                    _lf = (_ca_ledger_factor(r.symbol, r.date_recorded)
+                    _lf = (_ca_ledger_factor(r.symbol, r.date_recorded, _context["target_session"])
                            if _ca_guard_enabled() else None)
                     _ledger_roi = _ca_ledger_roi(_roi_print, _lf)
                     if _ca_guard_enabled() and (
@@ -8426,13 +8819,34 @@ class PerformanceTrackerApp:
                         if _ledger_roi is None and _ca_budget_state(r.symbol) == "exhausted":
                             _CA_BUDGET["deferred"] += 1
                             _pending_syms.append(r.symbol)
+                            _outcome_receipt(r, now_r, "PENDING", "corporate_action_verification_pending", _evidence, _context)
+                            _skipped_outcome_reasons["corporate_action_verification_pending"] += 1
                             r.last_updated = _utc_now()
                             continue
                         _adj = (None if _ledger_roi is not None
                                 else _ca_adjusted_roi(r.symbol,
-                                                      r.date_recorded))
+                                                      r.date_recorded, _context["target_session"]))
+                        if _ledger_roi is None and _adj is None:
+                            _bar, _ca_reason = _ca_target_bar(
+                                _CA_BARS_CACHE.get(_yahoo_symbol(r.symbol)), _context["target_session"])
+                            if _ca_reason:
+                                r.realized_roi = None
+                                r.outcome = None
+                                _pending_syms.append(r.symbol)
+                                _skipped_outcome_reasons[_ca_reason] += 1
+                                _outcome_receipt(r, now_r, "PENDING", _ca_reason, _evidence, _context)
+                                r.last_updated = _utc_now()
+                                continue
                         _verdict, _roi_use = _ca_decide_v2(
                             _roi_print, _adj, _ledger_roi)
+                    if not math.isfinite(_roi_use):
+                        r.realized_roi = None
+                        r.outcome = None
+                        _pending_syms.append(r.symbol)
+                        _skipped_outcome_reasons["outcome_roi_nonfinite"] += 1
+                        _outcome_receipt(r, now_r, "PENDING", "outcome_roi_nonfinite", _evidence, _context)
+                        r.last_updated = _utc_now()
+                        continue
                     if _verdict == "suspect":
                         r.status = PerformanceStatus.EXPIRED
                         r.maturity_date = now_r
@@ -8443,6 +8857,7 @@ class PerformanceTrackerApp:
                                  f"unavailable — excluded, never a fake outcome")
                         r.notes = f"{r.notes} | {_note}" if r.notes else _note
                         _expired_syms.append(r.symbol)
+                        _outcome_receipt(r, now_r, "EXPIRED", "corp_action_suspect", _evidence, _context)
                         r.last_updated = _utc_now()
                         continue
                     if _verdict in ("adjust", "ledger"):
@@ -8469,26 +8884,8 @@ class PerformanceTrackerApp:
                     else:
                         r.outcome = "BREAKEVEN"
                     _n_matured += 1
-                else:
-                    # v6.17.0 (B): past due but no fresh price (or no usable
-                    # entry price) -> hold ACTIVE and retry, then expire
-                    # UNPRICED after the grace window. EXPIRED + realized None
-                    # is structurally excluded from every statistic.
-                    _overdue = (now_r - r.target_date).days
-                    if _overdue > _grace_d:
-                        r.status = PerformanceStatus.EXPIRED
-                        r.maturity_date = now_r
-                        r.realized_roi = None
-                        r.outcome = "UNPRICED"
-                        _note = (
-                            f"{_MATURE_FRESH_TAG} expired unpriced {_overdue}d "
-                            f"past target (no fresh price this run)"
-                        )
-                        r.notes = f"{r.notes} | {_note}" if r.notes else _note
-                        _expired_syms.append(r.symbol)
-                    else:
-                        _pending_syms.append(r.symbol)
-
+                    _context.update(roi_basis=_verdict, realized_roi_pp=r.realized_roi)
+                    _outcome_receipt(r, now_r, "MATURED", "", _evidence, _context)
             r.last_updated = _utc_now()
 
         if _fresh_only and (_n_matured or _pending_syms or _expired_syms):
@@ -8522,6 +8919,8 @@ class PerformanceTrackerApp:
                 "ca_pulls": int(_CA_BUDGET.get("pulls") or 0),
                 "pending": len(_pending_syms),
                 "expired": len(_expired_syms),
+                "outcome_evidence_version": "tfb.outcome-price.v1",
+                "outcome_skipped_reasons": dict(_skipped_outcome_reasons),
             }
         except Exception:
             self._last_audit_stats = {}
