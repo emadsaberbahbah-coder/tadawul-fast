@@ -3,9 +3,14 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.13)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.14)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.64.14: validate and copy canonical market presentation after all last-good
+restoration and at the direct Sheets writer. Unknown margin/return/label cells
+use explicit empty strings so RAW updates clear stale prior display values.
+Prices, scoring, quote proof, other pages and existing rollout modes stay raw.
 
 v6.64.13: upstream feed freshness requires a complete, numeric-offset
 publication timestamp. Missing, offsetless, malformed and future times cannot
@@ -1871,7 +1876,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.13"
+SCRIPT_VERSION = "6.64.14"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -3057,6 +3062,12 @@ class RedisLock:
 # -----------------------------------------------------------------------------
 # Google Sheets writer (optional, direct API)
 # -----------------------------------------------------------------------------
+def _present_market_sheet_rows(sheet_name, headers, rows):
+    """Copy only the four canonical market pages' final display publication."""
+    from core.sheet_presentation import present_market_sheet_rows
+    return present_market_sheet_rows(sheet_name, headers, rows)
+
+
 class SheetsWriter:
     def __init__(self):
         self._service = None  # lazy
@@ -3146,10 +3157,14 @@ class SheetsWriter:
         # Ensure rectangular rows matching header length (Sheets-friendly)
         hdr = [str(h) for h in (headers or [])]
         width = len(hdr)
+        # Validate before rectangularization can discard an extra/conflicting
+        # cell or pad missing proof. Other pages keep their existing contract.
+        from core.sheet_presentation import validate_market_sheet_rows
+        market_keys = validate_market_sheet_rows(sheet_name, hdr, rows)
 
         matrix: List[List[Any]] = []
         for r in rows or []:
-            rr = list(r) if isinstance(r, list) else [r]
+            rr = list(r) if isinstance(r, list) or (market_keys is not None and isinstance(r, tuple)) else [r]
             if width > 0:
                 if len(rr) < width:
                     rr = rr + [None] * (width - len(rr))
@@ -3163,6 +3178,7 @@ class SheetsWriter:
         # keeps its last-good content, and the task fails loud (DS-02).
         _fg_stats = None
         matrix, _fg_stats = _ohlc_fill_guard_apply(hdr, matrix)
+        matrix = _present_market_sheet_rows(sheet_name, hdr, matrix)
 
         values: List[List[Any]] = []
         if hdr:
@@ -13084,6 +13100,10 @@ async def _run_one_task(
         # Preserve factual provenance after the final PV2/guard passes, before
         # every publication path. Only tracked actual restorations are tagged.
         _mark_preserved_acquisitions(headers,rows_matrix,_preserved_acquisition_symbols)
+        # Last-good persistence can restore legacy display quantities after
+        # API serialization. Certify the final copy before any clear/hold/write;
+        # an error reaches the existing failed-task path and preserves the page.
+        rows_matrix = _present_market_sheet_rows(task.sheet_name, headers, rows_matrix)
         _trim_mode = clear_before_write and _write_then_trim_enabled()
         if clear_before_write and not _trim_mode:
             try:

@@ -243,7 +243,7 @@ logger.addHandler(logging.NullHandler())
 #   the executor pool may hit two sids concurrently and a Lock here would
 #   serialize real writes for a log line).
 # =============================================================================
-SERVICE_VERSION = "6.2.1"
+SERVICE_VERSION = "6.2.2"
 
 from core.sheet_presentation import present_instrument_row
 MIN_CORE_VERSION = "5.0.0"
@@ -1889,7 +1889,6 @@ def write_grid_chunked(
     value_input: str = "RAW",
 ) -> int:
     """Write grid in chunks."""
-    _svc_capacity_probe(spreadsheet_id)   # v6.2.0 (IR-078b): telemetry only
     if not grid:
         return 0
 
@@ -1898,6 +1897,8 @@ def write_grid_chunked(
 
     header = list(grid[0] if grid else [])
     data_rows = grid[1:] if len(grid) > 1 else []
+    from core.sheet_presentation import validate_market_sheet_rows, present_market_sheet_rows
+    validate_market_sheet_rows(sheet_name, header, data_rows)
 
     header_len = len(header)
     presentation_names = _presentation_column_names(header)
@@ -1911,6 +1912,8 @@ def write_grid_chunked(
         elif len(row_list) > header_len:
             row_list = row_list[:header_len]
         fixed_rows.append(_present_grid_row(presentation_names, row_list))
+    fixed_rows = present_market_sheet_rows(sheet_name, header, fixed_rows)
+    _svc_capacity_probe(spreadsheet_id)   # v6.2.0 (IR-078b): telemetry only
 
     chunks = [
         fixed_rows[i:i + _CONFIG.max_rows_per_write]

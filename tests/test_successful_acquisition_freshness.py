@@ -314,7 +314,7 @@ def test_real_runner_captures_acquisition_before_persistence_or_credentials(pers
 
 @pytest.mark.parametrize("mechanism",["klg","pv"])
 def test_real_runner_published_restoration_agrees_with_row_audit(mechanism,monkeypatch):
-    fresh=quote("GC=F")
+    fresh=quote("GC=F", **{"Horizon Days":365,"Invest Period Label":"1Y"})
     prior=quote("SI=F",Warnings="prior_nonacquisition_note; acquisition_status:success; acquisition_provider:yahoo_chart; acquisition_acquired_at:2026-10-07T08:58:00Z")
     failed=quote("SI=F",**{"Current Price":"","Data Provider":"fallback_error","Warnings":"fetch_failed:timeout"})
     class Backend:
