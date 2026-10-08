@@ -118,6 +118,21 @@ def test_static_fx_cannot_fund_currency_missing_from_fresh_proof():
                for g in payload["candidates_rows"][0]["gates"])
 
 
+def test_certified_ticker_alias_still_excludes_existing_exposure():
+    pf = portfolio()
+    holding = pf["holdings"][0]
+    holding["Ticker"] = holding.pop("symbol")
+    source = stock()
+    source["symbol"] = "HELD.US"
+    payload = ob.build_opportunity_payload([source],
+        criteria={"trust_gate_enabled": False, "include_portfolio_holdings": False},
+        portfolio=pf, fx_rates=FX)
+    assert payload["meta"]["input_certification"]["funding_eligible"]
+    assert not payload["selected"] and not payload["meta"]["execution_ready"]
+    assert any(g["gate"] == "Portfolio" and not g["passed"]
+               for g in payload["candidates_rows"][0]["gates"])
+
+
 @pytest.mark.parametrize("case", ["absent", "stale", "cash_mismatch", "reserved",
                                   "holding_quote", "holding_value", "nav", "proceeds",
                                   "incomplete", "completeness_unknown", "other_custody", "fx"])

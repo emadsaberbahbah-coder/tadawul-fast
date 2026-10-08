@@ -5052,7 +5052,9 @@ def _normalize_portfolio(portfolio):
         if not isinstance(h, dict):
             continue
         hd = {
-            "symbol": _to_text(h.get("symbol")) or "?",
+            # The certificate accepts Symbol/Ticker aliases; exclusion and
+            # sizing must consume that same identity rather than invent '?'.
+            "symbol": _to_text(_field(_row_lookup(h), "symbol")) or "?",
             "sector": (_normalize_sector(_to_text(h.get("sector")))
                        if _env_sector_normalize()
                        else _to_text(h.get("sector"))) or "Unknown",

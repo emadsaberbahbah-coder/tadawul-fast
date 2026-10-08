@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.17.0
+Advanced Analysis Root Owner — v4.18.0
 FINAL BOARD FUNDING REPLAY (2026-10-07)
 ================================================================================
 The existing opportunity endpoint accepts a signed frozen allocation replay.
@@ -535,7 +535,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.17.0"  # frozen final-board allocation replay
+ADVANCED_ANALYSIS_VERSION = "4.18.0"  # frozen final-board allocation replay
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
