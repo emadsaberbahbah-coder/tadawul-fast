@@ -390,7 +390,9 @@ logger.addHandler(logging.NullHandler())
 # skips. Scope: expected_roi_1m/3m/12m only; upside_pct / percent_change are
 # a vNEXT decision after their own residual count.
 # -----------------------------------------------------------------------------
-MODULE_VERSION = "4.11.0"
+MODULE_VERSION = "4.11.1"
+
+from core.sheet_presentation import present_instrument_row
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -2721,7 +2723,7 @@ def normalize_rows(
                     rd["selection_reason"] = " | ".join(parts)
             if rd.get("criteria_snapshot") in {None, ""}:
                 rd["criteria_snapshot"] = None
-        result.append(schema_projection(rd, keys))
+        result.append(schema_projection(present_instrument_row(rd) if instrument_shaped else rd, keys))
     return result
 
 

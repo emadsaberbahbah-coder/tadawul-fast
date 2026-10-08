@@ -111,7 +111,11 @@ def test_margin_sentry_keeps_price_acquisition_and_fundamentals_controls(
     assert after == expected  # Actual sentry changes only the margin in enforce.
     assert len(headers) == len(values) == 115
     assert tag in display["Warnings"]
-    assert display["Profit Margin"] == (None if fund_mode == "enforce" else 1.0)
+    # Source observe mode retains its quantity above; publication requires a
+    # value-bound unit receipt and withholds this fixture's unproven margin.
+    assert display["Profit Margin"] is None
+    if fund_mode == "observe":
+        assert "sheet_margin_unknown:profit_margin" in display["Warnings"]
     for key, header in (("current_price", "Current Price"), ("data_provider", "Data Provider"),
                         ("last_updated_utc", "Last Updated (UTC)"),
                         ("last_updated_riyadh", "Last Updated (Riyadh)")):

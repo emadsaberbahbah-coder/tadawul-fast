@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.17.0
+Advanced Analysis Root Owner — v4.18.0
 FINAL BOARD FUNDING REPLAY (2026-10-07)
 ================================================================================
 The existing opportunity endpoint accepts a signed frozen allocation replay.
@@ -535,7 +535,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.17.0"  # frozen final-board allocation replay
+ADVANCED_ANALYSIS_VERSION = "4.18.0"  # frozen final-board allocation replay
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -4458,8 +4458,8 @@ async def portfolio_actions_post(
     raw_rows = merged_body.get("rows")
     holdings: List[Dict[str, Any]] = []
     received_count = len(raw_rows) if isinstance(raw_rows, list) else 0
+    cap = min(500, _portfolio_holdings_max())
     if isinstance(raw_rows, list):
-        cap = _portfolio_holdings_max()
         holdings = [
             dict(row)
             for row in raw_rows[:cap]
@@ -4504,6 +4504,10 @@ async def portfolio_actions_post(
     upstream_meta: Dict[str, Any] = {
         "versions": {"engine": engine_version},
         "rows_supplied_by": "gas_sheets",
+        # Private declared capture: builder strips it before rendering/logging.
+        # Never substitute the sheet's cash/date fields for broker evidence.
+        "reconciliation_evidence": merged_body.get("reconciliation_evidence"),
+        "holdings_input_incomplete": (received_count != len(holdings)),
     }
 
     build_started = time.monotonic()
@@ -4591,7 +4595,7 @@ async def portfolio_actions_post(
             "received": received_count,
             "used": len(holdings),
             "truncated": received_count > len(holdings),
-            "cap": _portfolio_holdings_max(),
+            "cap": cap,
         },
         "builder_offloop": _portfolio_build_offloop_enabled(),
         "builder_timeout_s": _portfolio_build_timeout_s(),

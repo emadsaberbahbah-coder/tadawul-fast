@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.12.2 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
@@ -1569,7 +1569,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.12.2';
+var DT10_VERSION = '1.13.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2329,6 +2329,31 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
     }
   }
   var h = { symbol: sym, sector: sector || 'Unknown', value_sar: val };
+  // Reconciliation never invents quantity/currency or a fresh quote timestamp.
+  // Preserve minor-unit spelling so the backend can reject ambiguous units.
+  if (extra.iCcy >= 0 && dt10HasValue_(row[extra.iCcy])) {
+    h.currency = String(row[extra.iCcy]).trim();
+  }
+  if (extra.iQuantity >= 0 && dt10HasValue_(row[extra.iQuantity]) &&
+      typeof row[extra.iQuantity] !== 'boolean') {
+    var qty = Number(row[extra.iQuantity]);
+    if (isFinite(qty) && qty >= 0) h.quantity = qty;
+  }
+  if (extra.iPrice >= 0 && dt10HasValue_(row[extra.iPrice]) &&
+      typeof row[extra.iPrice] !== 'boolean') {
+    var price = Number(row[extra.iPrice]);
+    if (isFinite(price) && price > 0) h.current_price = price;
+  }
+  var proofFields = [['iProvider', 'data_provider'], ['iWarnings', 'warnings'],
+                     ['iUpdated', 'last_updated']];
+  for (var pf = 0; pf < proofFields.length; pf++) {
+    var col = extra[proofFields[pf][0]];
+    if (col >= 0 && dt10HasValue_(row[col])) {
+      var original = row[col];
+      h[proofFields[pf][1]] = original instanceof Date && !isNaN(original.getTime()) ?
+          original.toISOString() : String(original).trim();
+    }
+  }
   // v1.11.0 (3): optional fields for the rotation rule — omitted when absent.
   if (extra.iMarket >= 0) {
     var mk = String(row[extra.iMarket] === null || row[extra.iMarket] === undefined ?
@@ -2354,23 +2379,38 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
 /** v1.5.0 (Fix H1): read the operator's holdings from My_Portfolio for the
  * request body. Header auto-scan (dt10FindHeaderRow_); Symbol mandatory;
  * an explicitly-SAR-labelled value column is preferred over raw Position
- * Value; cap 500 rows; per-symbol dedupe. Fail-open: any fault logs and
- * returns [] — a broken portfolio page can never break the Top_10
- * refresh (the status line then discloses held=0). */
+ * Value; cap 500 rows; per-symbol dedupe. Missing, duplicate, oversized or
+ * unreadable inputs carry _input_incomplete so funding stays withheld. */
 function dt10CollectHoldings_(ss) {
+  var out = [];
+  function unavailable() { out._input_incomplete = true; return out; }
   try {
     var sheet = ss.getSheetByName('My_Portfolio');
-    if (!sheet) return [];
-    var values = sheet.getDataRange().getValues();
-    if (!values || !values.length) return [];
+    if (!sheet) return unavailable();
+    var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+    var readRows = Math.min(lastRow, DT10_HEADER_SCAN_ROWS + 501);
+    var readCols = Math.min(lastCol, 250);
+    if (!(readRows > 0) || !(readCols > 0)) return unavailable();
+    var values = sheet.getRange(1, 1, readRows, readCols).getValues();
+    if (lastRow > readRows || lastCol > readCols) out._input_incomplete = true;
+    if (!values || !values.length) return unavailable();
     var hIdx = dt10FindHeaderRow_(values, DT10_HEADER_SCAN_ROWS);
-    if (hIdx < 0) return [];
+    if (hIdx < 0) return unavailable();
     var hdr = values[hIdx];
     var iSym = -1, iSec = -1, iValSar = -1, iVal = -1;
     var extra = { iMarket: -1, iBuyDate: -1, iTp1: -1,
-                  iCcy: -1, fx: null };                  // v1.11.0 (3) / v1.11.4
+                  iCcy: -1, iQuantity: -1, iPrice: -1, iProvider: -1,
+                  iWarnings: -1, iUpdated: -1, fx: null };
+    var proofSeen = {};
     for (var c = 0; c < hdr.length; c++) {
       var t = dt10NormToken_(hdr[c]);
+      var proofKey = t === 'symbol' || t === 'ticker' ? 'symbol' :
+          t === 'currency' || t === 'ccy' ? 'currency' :
+          t === 'quantity' || t === 'positionqty' || t === 'shares' ? 'quantity' :
+          t === 'currentprice' || t === 'price' ? 'price' :
+          t === 'lastupdated' || t === 'sourcelastupdated' ? 'updated' : '';
+      if (proofKey && proofSeen[proofKey]) out._input_incomplete = true;
+      if (proofKey) proofSeen[proofKey] = true;
       if (iSym < 0 && (t === 'symbol' || t === 'ticker')) {
         iSym = c;
       } else if (iSec < 0 && t === 'sector') {
@@ -2383,6 +2423,16 @@ function dt10CollectHoldings_(ss) {
         iVal = c;
       } else if (extra.iCcy < 0 && (t === 'currency' || t === 'ccy')) {
         extra.iCcy = c;                                     // v1.11.4 [P-78]
+      } else if (extra.iQuantity < 0 && (t === 'quantity' || t === 'positionqty' || t === 'shares')) {
+        extra.iQuantity = c;
+      } else if (extra.iPrice < 0 && (t === 'currentprice' || t === 'price')) {
+        extra.iPrice = c;
+      } else if (extra.iProvider < 0 && t === 'dataprovider') {
+        extra.iProvider = c;
+      } else if (extra.iWarnings < 0 && (t === 'warnings' || t === 'datawarnings')) {
+        extra.iWarnings = c;
+      } else if (extra.iUpdated < 0 && (t === 'lastupdated' || t === 'sourcelastupdated')) {
+        extra.iUpdated = c;
       } else if (extra.iMarket < 0 && (t === 'market' || t === 'exchange')) {
         extra.iMarket = c;
       } else if (extra.iBuyDate < 0 && (t === 'buydate' || t === 'purchasedate' ||
@@ -2394,18 +2444,18 @@ function dt10CollectHoldings_(ss) {
         extra.iTp1 = c;
       }
     }
-    if (iSym < 0) return [];
+    if (iSym < 0) return unavailable();
     var useVal = iValSar >= 0 ? iValSar : iVal;
     // v1.11.4 [P-78]: only a NATIVE value column needs the FX map.
     if (DT10_V1114_HOLDINGS_FX && iValSar < 0 && iVal >= 0 && extra.iCcy >= 0) {
       extra.fx = dt10FxRates_(ss);
     }
-    var out = [];
     var seen = {};
-    for (var r = hIdx + 1; r < values.length && out.length < 500; r++) {
+    for (var r = hIdx + 1; r < values.length; r++) {
       var h = dt10HoldingFromRow_(values[r], iSym, iSec, useVal, extra);
       if (!h) continue;
-      if (seen[h.symbol]) continue;
+      if (seen[h.symbol]) { out._input_incomplete = true; continue; }
+      if (out.length >= 500) { out._input_incomplete = true; continue; }
       seen[h.symbol] = true;
       out.push(h);
     }
@@ -2419,10 +2469,44 @@ function dt10CollectHoldings_(ss) {
     return out;
   } catch (eCh) {
     try {
-      Logger.log('[DT10 v' + DT10_VERSION + '] holdings read failed: ' + eCh);
+      Logger.log('[DT10 v' + DT10_VERSION + '] holdings read unavailable');
     } catch (eLog) {}
-    return [];
+    return unavailable();
   }
+}
+
+/** Private declared evidence, populated separately by an authorized owner.
+ * No workbook cash/date or position row is promoted into broker evidence.
+ * Document scope prevents a capture from silently crossing workbooks; missing,
+ * unavailable, malformed or oversized properties produce no evidence. */
+function dt10ReconciliationEvidence_() {
+  try {
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) return null;
+    var raw = props.getProperty('TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1');
+    if (typeof raw !== 'string' || !raw || raw.length > 9000) return null;
+    var packet = JSON.parse(raw);
+    if (!packet || Object.prototype.toString.call(packet) !== '[object Object]' ||
+        packet.schema_version !== 1) return null;
+    return packet;
+  } catch (eEvidence) { return null; }
+}
+
+/** Actual request seam, also used by full-source offline transport tests. */
+function dt10PortfolioInputs_(ss, panel) {
+  var portfolio = {
+    cash_available_sar: Number(panel['Cash Available (SAR)']) || 0,
+    pending_proceeds_sar: Number(panel['Pending Proceeds (SAR)']) || 0,
+    holdings_input_incomplete: true
+  };
+  var packet = dt10ReconciliationEvidence_();
+  if (packet) portfolio.reconciliation_evidence = packet;
+  if (dt10SendHoldingsEnabled_()) {
+    var holdings = dt10CollectHoldings_(ss);
+    portfolio.holdings = holdings;
+    portfolio.holdings_input_incomplete = holdings._input_incomplete === true;
+  }
+  return portfolio;
 }
 // ---------------------------------------------------------------------------
 // v1.3.0 — SELECTION STABILITY LAYER (pure core; node-parity-tested against
@@ -3981,8 +4065,8 @@ function dt10PageStatusEnabled_() {
 }
 /** v1.5.0 (Fix H1): send My_Portfolio holdings with every refresh so the
  * builder's Portfolio gate can enforce "Include Portfolio Holdings = No".
- * Default ON; Script Property DT10_SEND_HOLDINGS = 0/false/off/no restores
- * the exact v1.4.0 request body. Fail-open ON. */
+ * Default ON. Disabling transport keeps holdings_input_incomplete=true;
+ * it cannot bypass the account-scoped funding contract. */
 function dt10SendHoldingsEnabled_() {
   try {
     var v = String(PropertiesService.getScriptProperties()
@@ -4135,48 +4219,70 @@ function dt10HardVerdictStrict_() {
     return true;
   }
 }
-/** v1.6.0 (W-3): PURE — {SYMBOL: daysToEarnings} from a raw Calendar_Events
- * matrix. Header row = the one whose cells contain 'symbol'; the days come
- * from the 'Days To Earnings' column; only finite values >= 0 are kept
- * (blank, junk, and past dates never tag). */
-function dt10EarningsMapFromValues_(values) {
+// Calendar_Events is a bounded facts table, not a cockpit-sized sample.
+var DT10_CALENDAR_MAX_ROWS = 5000; // body rows; overflow produces no annotation
+/** Calendar day as an integer UTC day. Dates represent spreadsheet instants
+ * in Riyadh (UTC+3); ISO date-only strings represent literal calendar dates.
+ * Reject rollover dates, timestamps in text cells, and numeric sheet serials.
+ * A missing observation is never interpreted as an event occurring today. */
+function dt10CalendarDay_(value) {
+  var text, shifted;
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (!isFinite(value.getTime())) return null;
+    shifted = new Date(value.getTime() + 3 * 60 * 60 * 1000);
+    text = shifted.toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    text = value.trim();
+  } else {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || text.slice(0, 4) === '0000') return null;
+  var parsed = new Date(text + 'T00:00:00.000Z');
+  if (!isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== text) {
+    return null;
+  }
+  return Math.floor(parsed.getTime() / 86400000);
+}
+/** PURE — {SYMBOL: daysToEarnings} from dated Calendar_Events facts. The
+ * consumer derives days for its current Riyadh date, so a yesterday counter
+ * cannot survive midnight. Blank/invalid dates never fall back to a counter. */
+function dt10EarningsMapFromValues_(values, asOfDate) {
   var map = {};
   if (!values || !values.length) return map;
-  var iSym = -1, iDays = -1, r, c, cells, tok;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, r, c, cells, tok, rowSym, rowDate;
   for (r = 0; r < values.length && iSym < 0; r++) {
     cells = values[r] || [];
+    rowSym = -1; rowDate = -1;
     for (c = 0; c < cells.length; c++) {
       tok = dt10NormToken_(cells[c]);
-      if (tok === 'symbol') iSym = c;
-      else if (tok === 'daystoearnings') iDays = c;
+      if (tok === 'symbol') rowSym = c;
+      else if (tok === 'nextearningsdate' || tok === 'earningsdate') rowDate = c;
     }
-    if (iSym >= 0 && iDays < 0) iSym = -1; // need both on the same row
+    if (rowSym >= 0 && rowDate >= 0) { iSym = rowSym; iDate = rowDate; }
   }
-  if (iSym < 0 || iDays < 0) return map;
+  if (iSym < 0 || iDate < 0) return map;
   for (; r < values.length; r++) {
     cells = values[r] || [];
     var sym = dt10NormSym_(cells[iSym]);
-    if (!sym || map.hasOwnProperty(sym)) continue;
-    // v1.8.3: a BLANK days cell must not coerce to 0 ("earnings today").
-    // Number('') === 0 passed the >=0 gate, so every Calendar_Events row
-    // with an empty Days-To-Earnings cell false-tagged its symbol with a
-    // same-day \u26a0 on the board — the exact case the v1.6.0 self-test
-    // fixture (JUNK.X) was written to catch, and did: 'earnings tag
-    // core: FAIL' on 2026-08-09 led straight here.
-    if (String(cells[iDays] === null || cells[iDays] === undefined ?
-               '' : cells[iDays]).trim() === '') continue;
-    var d = Number(cells[iDays]);
-    if (isFinite(d) && d >= 0) map[sym] = Math.floor(d);
+    if (!sym || sym === 'SYMBOL' || map.hasOwnProperty(sym)) continue;
+    var eventDay = dt10CalendarDay_(cells[iDate]);
+    if (eventDay !== null && eventDay >= today) map[sym] = eventDay - today;
   }
   return map;
 }
 /** v1.6.0 (W-3): live Calendar_Events read. ANY failure => empty map =>
  * zero tags — the annotation must never be able to break the render. */
-function dt10EarningsMap_(ss) {
+function dt10EarningsMap_(ss, asOfDate) {
   try {
     var sh = ss.getSheetByName('Calendar_Events');
     if (!sh) return {};
-    return dt10EarningsMapFromValues_(sh.getRange('A1:H200').getValues());
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 7);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10EarningsMapFromValues_(
+        sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
   } catch (eEm) {
     return {};
   }
@@ -5368,12 +5474,7 @@ function refreshDecisionTop10() {
   var body = {
     criteria: dt10CriteriaFromPanel_(panel),
     fx_rates: dt10FxRates_(ss),
-    portfolio: {
-      // v1.11.7 [P-134]: cash routed through dt10CashChoose_ below; the
-      // default 'panel' mode makes this line's value byte-identical.
-      cash_available_sar: Number(panel['Cash Available (SAR)']) || 0,
-      pending_proceeds_sar: Number(panel['Pending Proceeds (SAR)']) || 0
-    },
+    portfolio: dt10PortfolioInputs_(ss, panel),
     pool_limit: poolLimit
   };
   // v1.5.0 (Fix H1): give the builder's Portfolio gate the held symbols it
@@ -5381,12 +5482,14 @@ function refreshDecisionTop10() {
   // DT10_SEND_HOLDINGS=0 restores the exact v1.4.0 body (key absent).
   var heldNote = '';
   if (dt10SendHoldingsEnabled_()) {
-    var heldRows = dt10CollectHoldings_(ss);
+    var heldRows = body.portfolio.holdings || [];
     if (heldRows.length) {
       body.portfolio.holdings = heldRows;
       heldNote = ' | held=' + heldRows.length + ' sent';
     } else {
-      heldNote = ' | held=0 (My_Portfolio empty/unreadable \u2014 gate blind)';
+      heldNote = body.portfolio.holdings_input_incomplete ?
+          ' | held=unknown (My_Portfolio incomplete/unreadable; funding withheld)' :
+          ' | held=0 (empty source; reconciliation evidence required)';
     }
   }
   // v1.11.7 [P-134]: cash source-of-truth. Default mode 'panel' leaves the
@@ -6041,10 +6144,10 @@ function dt10SelfTest() {
                ['Symbol', 'Next Earnings Date', 'Days To Earnings'],
                ['EXE.US', '2026-07-28', 7],
                ['MRP.US', '2026-08-04', 14],
-               ['FAR.US', '2026-09-01', 15],
+               ['FAR.US', '2026-08-05', 15],
                ['JUNK.X', '', ''],
                ['OLD.US', '2026-07-01', -3]];
-  var eaMap = dt10EarningsMapFromValues_(eaFix);
+  var eaMap = dt10EarningsMapFromValues_(eaFix, '2026-07-21');
   var eaTk = [{ symbol: 'EXE.US', advisor_note: 'INVEST' },
               { symbol: 'MRP.US', advisor_note: 'grace' },
               { symbol: 'FAR.US', advisor_note: 'x' },

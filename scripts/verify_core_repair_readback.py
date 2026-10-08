@@ -13,6 +13,8 @@ import urllib.request
 
 BACKEND = "https://tadawul-fast-bridge.onrender.com"
 OPPORTUNITY_PATH = "/sheet-rows/opportunity-candidates"
+PORTFOLIO_ACTIONS_PATH = "/sheet-rows/portfolio-actions"
+PORTFOLIO_PROBE_SYMBOL = "SYNTH.SR"
 
 
 class ReadbackError(RuntimeError):
@@ -88,7 +90,67 @@ def require_zero_money(payload):
         raise ReadbackError("blocked probe produced a funding alert")
 
 
-def verify(request, expected_commit, expected_engine, expected_builder, expected_contract=1):
+def require_uncertified(payload, label):
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or meta.get("execution_ready") is not False:
+        raise ReadbackError(label + " did not explicitly withhold execution")
+    certification = meta.get("input_certification")
+    if not isinstance(certification, dict) or certification.get("funding_eligible") is not False:
+        raise ReadbackError(label + " did not explicitly withhold certified funding")
+
+
+def require_blocked_portfolio(payload, expected_version):
+    if payload.get("version") != expected_version or payload.get("status") != "ok":
+        raise ReadbackError("portfolio actions version or status differs from source")
+    require_uncertified(payload, "portfolio probe")
+    meta = payload["meta"]
+    versions, route = meta.get("versions"), meta.get("route")
+    if not isinstance(versions, dict) or not isinstance(route, dict) or \
+            versions.get("portfolio_actions") != expected_version or \
+            route.get("portfolio_actions_version") != expected_version:
+        raise ReadbackError("portfolio actions runtime version attestation missing")
+    kpis = payload.get("kpis")
+    if not isinstance(kpis, dict):
+        raise ReadbackError("portfolio KPI envelope missing")
+    for key in ("deployable_sar", "adds_funded_sar", "proceeds_pending_sar", "capital_unallocated_sar"):
+        value = kpis.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0:
+            raise ReadbackError("nonzero or invalid withheld portfolio KPI: " + key)
+    for key in ("portfolio_value_sar", "holdings_value_sar", "cash_sar", "cash_pct",
+                "cost_basis_sar", "pnl_sar", "pnl_pct"):
+        if key not in kpis or kpis[key] is not None:
+            raise ReadbackError("uncertified portfolio amount was published: " + key)
+    actions = payload.get("actions")
+    if not isinstance(actions, list) or len(actions) != 1 or not isinstance(actions[0], dict):
+        raise ReadbackError("portfolio probe did not return exactly one protective row")
+    action = actions[0]
+    if action.get("symbol") != PORTFOLIO_PROBE_SYMBOL or action.get("action") != "BLOCK":
+        raise ReadbackError("unreconciled synthetic holding was not blocked")
+    for key in ("suggested_delta_sar", "suggested_delta_shares", "proceeds_sar"):
+        value = action.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0:
+            raise ReadbackError("unreconciled holding produced execution money: " + key)
+    for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "weight_pct",
+                "post_trade_weight_pct", "stop_sar", "tp1_sar", "tp2_sar", "funds_from"):
+        if key not in action or action[key] is not None:
+            raise ReadbackError("unreconciled holding produced an execution level: " + key)
+    detail = action.get("detail")
+    if not isinstance(detail, dict) or detail.get("execution_ready") is not False or \
+            detail.get("position_evidence_matched") is not False or \
+            "sector_weight_pct" not in detail or detail["sector_weight_pct"] is not None:
+        raise ReadbackError("portfolio row execution or sector weight was not withheld")
+    if payload.get("sector_summary") != []:
+        raise ReadbackError("unreconciled portfolio published sector weights")
+    alerts = payload.get("alerts")
+    if not isinstance(alerts, list) or len(alerts) != 1 or not isinstance(alerts[0], dict) or \
+            alerts[0].get("type") != "portfolio_inputs_unverified":
+        raise ReadbackError("portfolio protective alert missing or replaced with funding advice")
+
+
+def verify(request, expected_commit, expected_engine, expected_builder, expected_contract=1,
+           expected_portfolio_actions=None):
+    if expected_portfolio_actions is None:
+        expected_portfolio_actions = source_version("core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION")
     health = request("/health")
     deployed = (health.get("deploy") or {}).get("render_git_commit")
     if deployed != expected_commit:
@@ -127,6 +189,7 @@ def verify(request, expected_commit, expected_engine, expected_builder, expected
                               "Board Funding Snapshot": snapshot})
     allocated = request(OPPORTUNITY_PATH, replay, True)
     require_zero_money(allocated)
+    require_uncertified(allocated, "allocation replay")
     allocated_board = (allocated.get("meta") or {}).get("board_funding") or {}
     if allocated.get("version") != expected_builder or \
             allocated.get("status") not in ("ok", "no_candidates") or \
@@ -144,15 +207,38 @@ def verify(request, expected_commit, expected_engine, expected_builder, expected
         require_zero_money(rejected)
         if rejected.get("status") != "board_funding_mismatch":
             raise ReadbackError("changed " + section + " basis was accepted")
+    stamp = datetime.now(timezone.utc).isoformat()
+    portfolio_probe = {
+        "rows": [{"Symbol": PORTFOLIO_PROBE_SYMBOL, "Name": "Unreconciled synthetic readback probe",
+                  "Currency": "SAR", "Position Qty": 10, "Buy Price": 90, "Current Price": 100,
+                  "Intrinsic Value": 130, "Sector": "Energy", "Market": "Tadawul",
+                  "Forecast Reliability Score": 90, "Data Quality Score": 90,
+                  "Recommendation": "BUY", "Investability Status": "INVESTABLE", "Risk Bucket": "Moderate",
+                  "Data Provider": "EODHD", "Last Updated": stamp,
+                  "Warnings": "acquisition_status:success; acquisition_provider:EODHD; acquisition_acquired_at:"
+                              + stamp + "; acquisition_quote_asof:" + stamp}],
+        "controls": {"Cash Available (SAR)": 10_000, "target_cash_pct": 10,
+                     "max_position_pct": 20, "max_sector_pct": 30, "trust_gate_enabled": False},
+        "fx_rates": {"SAR": 1},
+    }
+    # These are fabricated probe inputs, with no account/custody capture and
+    # no reconciliation packet. The real route must withhold all execution.
+    protective = request(PORTFOLIO_ACTIONS_PATH, portfolio_probe, True)
+    require_blocked_portfolio(protective, expected_portfolio_actions)
     final_health = request("/health")
     if (final_health.get("deploy") or {}).get("render_git_commit") != expected_commit:
         raise ReadbackError("deployment changed during readback")
+    margin_mode = (final_health.get("engine_gates") or {}).get("margin_publish")
+    margin_mode = margin_mode if isinstance(margin_mode, str) and margin_mode in {"off", "observe", "enforce"} else None
     return {"ok": True, "checked_at_utc": datetime.now(timezone.utc).isoformat(),
             "commit": deployed, "engine_version": expected_engine,
             "builder_version": expected_builder, "signed_research": True,
             "empty_allocation": True, "cash_and_fx_changes_rejected": True,
-            "margin_publish": (final_health.get("engine_gates") or {}).get("margin_publish"),
-            "scope": "blocked synthetic API probe; Apps Script and live coverage not attested"}
+            "uncertified_replay_withheld": True,
+            "portfolio_actions_version": expected_portfolio_actions,
+            "unreconciled_portfolio_blocked": True,
+            "margin_publish": margin_mode,
+            "scope": "blocked synthetic board and unreconciled holding API probes; Apps Script and live coverage not attested"}
 
 
 def main():
@@ -167,7 +253,8 @@ def main():
         result = verify(transport(token), args.expected_commit,
                         source_version("core/data_engine_v2.py", "__version__"),
                         source_version("core/analysis/opportunity_builder.py", "OPPORTUNITY_BUILDER_VERSION"),
-                        int(source_version("core/analysis/opportunity_builder.py", "_BOARD_FUNDING_VERSION")))
+                        int(source_version("core/analysis/opportunity_builder.py", "_BOARD_FUNDING_VERSION")),
+                        source_version("core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION"))
     except ReadbackError as exc:
         result = {"ok": False, "error": str(exc)}
     except Exception as exc:

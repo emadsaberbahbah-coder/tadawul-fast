@@ -14,6 +14,7 @@ import logging
 import pytest
 
 from core.analysis import portfolio_actions as pa
+from tests.portfolio_reconciliation_fixtures import build_certified_portfolio_actions, synthetic_quote_receipt
 
 
 ADD, HOLD = pa.ACTION_ADD, pa.ACTION_HOLD
@@ -132,7 +133,8 @@ def test_direct_calendar_helpers_refuse_unknown_venue(venue):
 
 
 def _holding(symbol, *, price=34.5, value=41.4, recommendation="BUY"):
-    return {"Symbol": symbol, "Name": "Synthetic calendar holding", "Sector": "Synthetic",
+    return {**synthetic_quote_receipt(),
+            "Symbol": symbol, "Name": "Synthetic calendar holding", "Sector": "Synthetic",
             "Exchange": "Synthetic", "Currency": "SAR", "Quantity": 100, "Buy Price": 30,
             "Current Price": price, "Intrinsic Value": value, "Expected ROI 12M": 15,
             "Forecast Reliability Score": 83, "Data Quality Score": 92, "Risk Bucket": "Low",
@@ -148,7 +150,7 @@ def test_actual_build_caller_cannot_fund_calendar_unavailable_add(monkeypatch, i
     original = {"count": 1, "date": "2026-09-27" if kind != "unknown" else "2026-09-28"}
     pa._ADD_CONFIRM_STORE[symbol] = copy.deepcopy(original)
     cache[symbol] = copy.deepcopy(original)
-    result = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    result = build_certified_portfolio_actions(pa, [_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
     row = result["actions"][0]
     assert result["status"] == "ok" and row["action"] == HOLD
     assert row["detail"]["capped_from"] == ADD and "calendar unavailable" in row["action_reason"]
@@ -179,7 +181,7 @@ def test_actual_build_preserves_protective_exit_and_hold_without_calendar(monkey
     monkeypatch.setattr(pa, "_confirm_clock", unavailable)
     rows = [_holding("SYNEXIT.UNKNOWN", price=50, value=40),
             _holding("SYNHOLD.UNKNOWN", value=34.5, recommendation="HOLD")]
-    result = pa.build_portfolio_actions(rows, controls=CTL, fx_rates={"SAR": 1})
+    result = build_certified_portfolio_actions(pa, rows, controls=CTL, fx_rates={"SAR": 1})
     actions = {row["symbol"]: row for row in result["actions"]}
     assert actions["SYNEXIT.UNKNOWN"]["action"] == pa.ACTION_EXIT
     assert actions["SYNEXIT.UNKNOWN"]["proceeds_sar"] == 5000
@@ -233,7 +235,7 @@ def test_actual_gate_observe_and_build_redact_calendar_fault_diagnostics(
     pa._ADD_CONFIRM_STORE["SYNTH.US"] = {"count": 1, "date": "2026-09-27"}
     gate = pa._apply_add_confirmation("SYNTH.US", ADD, "q", None, CTL)
     diagnostic = pa._apply_confirm_session_observe({"symbol": "SYNTH.US"}, ADD, *gate, CTL)
-    payload = pa.build_portfolio_actions([_holding("SYNTH.US")], controls=CTL, fx_rates={"SAR": 1})
+    payload = build_certified_portfolio_actions(pa, [_holding("SYNTH.US")], controls=CTL, fx_rates={"SAR": 1})
     published = json.dumps(payload) + diagnostic + gate[1]
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert caplog.records
@@ -340,15 +342,15 @@ def test_share_class_actual_build_waits_preclose_then_confirms_and_funds(isolate
     original = {"count": 1, "date": "2026-10-06"}
     pa._ADD_CONFIRM_STORE[symbol] = copy.deepcopy(original)
     clock["now"] = at(2026, 10, 7, 20, 59)
-    held = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    held = build_certified_portfolio_actions(pa, [_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
     assert held["actions"][0]["action"] == HOLD and held["kpis"]["adds_funded_sar"] == 0
     assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == original
     clock["now"] = at(2026, 10, 7, 21)
-    ready = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    ready = build_certified_portfolio_actions(pa, [_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
     assert ready["actions"][0]["action"] == ADD and ready["kpis"]["adds_funded_sar"] == 12040
     assert "day 2/2; session 2026-10-07" in ready["actions"][0]["action_reason"]
     assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": "2026-10-07"}
-    repeated = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    repeated = build_certified_portfolio_actions(pa, [_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
     assert repeated["actions"][0]["action"] == ADD and repeated["kpis"]["adds_funded_sar"] == 12040
     assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": "2026-10-07"}
 
@@ -372,8 +374,9 @@ def test_registered_unsupported_and_malformed_suffixes_remain_closed(isolated_po
     assert pa._ADD_CONFIRM_STORE[symbol] == original and not cache and not traffic
 
 
-@pytest.mark.parametrize("symbol", ["ABC.İ", "ABC.K", "KRK.B", "ABC.ı", "ABC.ſ"])
-def test_unicode_share_class_shape_is_refused_at_resolver_gate_and_actual_build(isolated_policy, symbol):
+@pytest.mark.parametrize("symbol,build_action", [("ABC.İ", pa.ACTION_BLOCK), ("ABC.K", pa.ACTION_BLOCK),
+                                                ("KRK.B", pa.ACTION_BLOCK), ("ABC.ı", HOLD), ("ABC.ſ", HOLD)])
+def test_unicode_share_class_shape_is_refused_at_resolver_gate_and_actual_build(isolated_policy, symbol, build_action):
     clock, cache, traffic = isolated_policy
     clock["now"] = at(2026, 10, 7, 21)
     with pytest.raises(pa.ConfirmCalendarUnavailable):
@@ -382,11 +385,18 @@ def test_unicode_share_class_shape_is_refused_at_resolver_gate_and_actual_build(
     pa._ADD_CONFIRM_STORE[symbol.upper()] = copy.deepcopy(original)
     result = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
     assert result[0] == HOLD and "calendar unavailable" in result[1]
-    built = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    built = build_certified_portfolio_actions(pa, [_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
     # This caller preserves the supplied candidate symbol; no claim is made
     # about arbitrary upstream normalizers that already changed its identity.
     assert built["actions"][0]["symbol"] == symbol
-    assert built["actions"][0]["action"] == HOLD and built["kpis"]["adds_funded_sar"] == 0
+    # The acquisition parser rejects non-ASCII canonical identities first.
+    # Other Unicode forms uppercase to ASCII there, but remain refused by
+    # the calendar resolver using the original supplied candidate symbol.
+    assert built["actions"][0]["action"] == build_action and built["kpis"]["adds_funded_sar"] == 0
+    if build_action == pa.ACTION_BLOCK:
+        assert built["meta"]["input_certification"]["reason_counts"]["holding_quote_unverified"] == 1
+    else:
+        assert "calendar unavailable" in built["actions"][0]["action_reason"]
     assert pa._ADD_CONFIRM_STORE[symbol.upper()] == original and not cache and not traffic
 
 

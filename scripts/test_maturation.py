@@ -1,7 +1,7 @@
 """
 scripts/test_maturation.py — Pre-Flight Test for the Maturation Write Path
 ==========================================================================
-VERSION 1.0.0  (2026-07-19)  — NEW SCRIPT (operations, deliverable #31)
+VERSION 1.1.0  (2026-10-09) — witnessed outcome pre-flight
 
 WHY: Performance_Log holds 3,496 records and every single one reads `active`.
 `Realized ROI %` and `Outcome` are empty across the board. That means the code
@@ -23,7 +23,7 @@ WHAT IT VERIFIES (each mapped to the guarantee it defends):
   B  past due, NO fresh price, in grace-> stays ACTIVE, retried next run
   B' past due, NO fresh price, past grace -> EXPIRED, realized_roi None,
                                           outcome UNPRICED
-  C  kill-switch off                   -> v6.16.0 behaviour restored
+  C  unpriced expiry switch off        -> stays ACTIVE; evidence mandatory
   D  a record that matured on a stale price is NOT produced (the exact
      2026-07-12 failure: 2,264 records frozen at entry price)
 
@@ -39,6 +39,7 @@ import datetime as dt
 import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
@@ -46,7 +47,20 @@ sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
 import track_performance as tp  # noqa: E402
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+_NOW = dt.datetime(2026, 10, 8, 21, tzinfo=dt.timezone.utc)
+_CLOSE = dt.datetime(2026, 10, 8, 20, tzinfo=dt.timezone.utc)
+
+
+def _synthetic_calendar(name: str, utc_day: str) -> Any:
+    """Explicit NYSE session for these fixed synthetic prices, no dependency.
+
+    Production calendar availability is checked by the outcome-evidence suite;
+    this pre-flight exercises maturation against an already known fixture.
+    """
+    assert name == "XNYS", name
+    opening = _CLOSE.replace(hour=13, minute=30)
+    return ((_CLOSE.date().isoformat(), opening, _CLOSE),)
 
 
 class _FakeBackend:
@@ -59,14 +73,18 @@ class _FakeBackend:
         self._prices = dict(prices)
 
     async def fetch_prices(self, syms: List[str]) -> Dict[str, float]:
-        return {s: self._prices[s] for s in syms if s in self._prices}
+        result = tp.OutcomePrices()
+        for symbol in syms:
+            if symbol in self._prices:
+                result.accept(tp.OutcomePrice(symbol, self._prices[symbol], "yahoo_chart", _NOW, _CLOSE))
+        return result
 
 
 def _mk(symbol: str, entry: float, target_days_ago: int,
         horizon: str = "1M") -> Any:
     """An ACTIVE record whose target date is `target_days_ago` days in the
     past (negative = still in the future)."""
-    now = dt.datetime.now(tp._RIYADH_TZ)   # tracker compares Riyadh-aware times
+    now = _CLOSE - dt.timedelta(hours=4)
     recorded = now - dt.timedelta(days=30 + target_days_ago)
     target = now - dt.timedelta(days=target_days_ago)
     rec = tp.PerformanceRecord(
@@ -98,7 +116,12 @@ def _tracker(prices: Dict[str, float]) -> Any:
 
 
 def _run(tracker: Any, records: List[Any]) -> List[Any]:
-    return asyncio.run(tracker.audit_active_records(records))
+    with patch.object(tp, "_utc_now", return_value=_NOW), \
+            patch.object(tp.RiyadhTime, "now", return_value=_NOW), \
+            patch.object(tp, "_outcome_calendar_schedule", side_effect=_synthetic_calendar), \
+            patch.object(tp, "_price_fallback_enabled", return_value=False), \
+            patch.object(tp, "_ca_guard_enabled", return_value=False):
+        return asyncio.run(tracker.audit_active_records(records))
 
 
 def main() -> int:
@@ -111,7 +134,7 @@ def main() -> int:
     os.environ["TFB_TRACK_MATURE_GRACE_DAYS"] = "5"
 
     # --- A: fresh price + past due -> MATURED with correct ROI -------------
-    r = _mk("AAA.US", 100.0, target_days_ago=1)
+    r = _mk("AAA.US", 100.0, target_days_ago=0)
     out = _run(_tracker({"AAA.US": 115.0}), [r])[0]
     check("A  past-due + fresh price -> MATURED",
           out.status == tp.PerformanceStatus.MATURED, f"status={out.status}")
@@ -163,19 +186,18 @@ def main() -> int:
           and out.realized_roi != 42.0,
           f"status={out.status} realized={out.realized_roi}")
 
-    # --- C: kill-switch restores prior behaviour ---------------------------
+    # --- C: expiry switch never disables source evidence -------------------
     os.environ["TFB_TRACK_MATURE_FRESH_ONLY"] = "0"
     r = _mk("GGG.US", 100.0, target_days_ago=1)
     r.unrealized_roi = 7.5
     out = _run(_tracker({}), [r])[0]
-    check("C  kill-switch off -> v6.16.0 behaviour reachable",
-          out.status in (tp.PerformanceStatus.MATURED,
-                         tp.PerformanceStatus.ACTIVE),
+    check("C  expiry switch off -> remains ACTIVE without evidence",
+          out.status == tp.PerformanceStatus.ACTIVE and out.realized_roi is None,
           f"status={out.status}")
     os.environ["TFB_TRACK_MATURE_FRESH_ONLY"] = "1"
 
     # --- mixed cohort: the realistic first-maturity shape ------------------
-    cohort = [_mk(f"S{i}.US", 100.0, target_days_ago=1) for i in range(5)]
+    cohort = [_mk(f"S{i}.US", 100.0, target_days_ago=0) for i in range(5)]
     priced = {"S0.US": 110.0, "S1.US": 95.0, "S2.US": 100.0}   # 2 unpriceable
     res = _run(_tracker(priced), cohort)
     matured = [x for x in res if x.status == tp.PerformanceStatus.MATURED]

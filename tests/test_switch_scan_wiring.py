@@ -17,6 +17,7 @@ import copy
 import time
 
 import core.analysis.portfolio_actions as pa
+from tests.portfolio_reconciliation_fixtures import build_certified_portfolio_actions, synthetic_quote_receipt
 
 HOLD = [{"Symbol": "AAA", "Name": "A", "Sector": "Industrials", "Currency": "USD",
          "Current Price": "68.66", "Quantity": "55", "Buy Price": "72.79",
@@ -32,7 +33,8 @@ NO = dict(OK, symbol="ALT3.US", investability_status="DO_NOT_INVEST", roi_pct=50
 
 
 def _build():
-    return pa.build_portfolio_actions(copy.deepcopy(HOLD), controls=None,
+    rows = [dict(row, **synthetic_quote_receipt()) for row in copy.deepcopy(HOLD)]
+    return build_certified_portfolio_actions(pa, rows, controls=None,
                                       fx_rates=dict(FX))
 
 

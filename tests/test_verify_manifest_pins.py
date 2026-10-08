@@ -53,6 +53,8 @@ _MODULE_FILES = {
     "core.scoring": "core/scoring.py",
     "core.financial_units": "core/financial_units.py",
     "core.execution_accounting": "core/execution_accounting.py",
+    "core.portfolio_reconciliation": "core/portfolio_reconciliation.py",
+    "core.sheet_presentation": "core/sheet_presentation.py",
     "core.enriched_quote": "core/enriched_quote.py",
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",
     "core.analysis.portfolio_actions": "core/analysis/portfolio_actions.py",

@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.24.3  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.25.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.25.0 (2026-10-09): executable quote freshness consumes the original
+acquisition proof and actual market quote instant, never the retrieval stamp.
+Missing, conflicting, preserved or unverified evidence cannot authorize a
+ticket; an unavailable venue calendar cannot certify an old close.
 
 v1.24.3 (2026-10-08): known F7 settlement failures cannot rank or receive
 new allocation, including signed research replay and disabled policy gates.
@@ -1398,7 +1403,7 @@ from datetime import datetime, timedelta, timezone
 #   (_env_research_diversify). Removed: 0.
 # Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.24.3"
+OPPORTUNITY_BUILDER_VERSION = "1.25.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2073,6 +2078,7 @@ GATE_ORDER = (
     "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend",
     "Timing (52W)",          # v1.23.0 [P-181] (appends before Portfolio)
     "Portfolio",
+    "FX Evidence",           # certified currency proof, appended after policy gates
 )
 
 # v1.7.0: explicit sell-tier tokens (normalized). Everything else — including
@@ -3700,6 +3706,18 @@ def normalize_candidate(row, fx_rates, criteria):
             "last_updated": _to_text(_field(view, "last_updated")),
         },
     }
+    # Retain the acquisition verdict before generic aliases discard typed
+    # warning tokens. This is a price witness, separate from engine retrieval.
+    from core.data_validity import row_acquisition
+    proof = row_acquisition(row if isinstance(row, dict) else {},
+                            datetime.now(timezone.utc),
+                            _env_freshness_fallback_h() * 3600.0)
+    cand["quote_evidence"] = {
+        "status": proof.status,
+        "reason": proof.reason,
+        "acquired_at": proof.acquired_at.isoformat() if proof.acquired_at else None,
+        "quote_asof": proof.quote_asof.isoformat() if proof.quote_asof else None,
+    }
     settlement_failure = _scoring_settlement_failure(row)
     if settlement_failure:
         cand["scoring_settlement_failure"] = settlement_failure
@@ -3854,7 +3872,7 @@ def _env_freshness_gate():
 def _env_quote_max_age_min():
     try:
         v = float(os.getenv("TFB_TICKET_MAX_QUOTE_AGE_MIN") or 15.0)
-        return v if v > 0 else 15.0
+        return v if math.isfinite(v) and v > 0 else 15.0
     except (TypeError, ValueError):
         return 15.0
 
@@ -3862,7 +3880,7 @@ def _env_quote_max_age_min():
 def _env_freshness_fallback_h():
     try:
         v = float(os.getenv("TFB_TICKET_FALLBACK_MAX_AGE_H") or 78.0)
-        return v if v > 0 else 78.0
+        return v if math.isfinite(v) and v > 0 else 78.0
     except (TypeError, ValueError):
         return 78.0
 
@@ -4357,11 +4375,16 @@ _FRESHNESS_FALLBACK_LOGGED = set()
 def _venue_state(symbol, now_utc):
     """(is_open, prev_close_utc_datetime) for the symbol's venue at now_utc,
     or None when the calendar layer cannot answer (unknown suffix, import
-    failure, any exception) — the caller then uses the permissive fallback.
+    failure, any exception) — an old quote then remains uncertified.
     Lazy exchange_calendars + pandas; NEVER raises."""
     try:
         s = (str(symbol or "").strip().upper())
         suffix = s.rsplit(".", 1)[1] if "." in s else "US"
+        if suffix not in _VENUE_CAL_MAP and "." in s:
+            from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+            if (s.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(s)
+                    and split_symbol_exchange(s)[1] is None):
+                suffix = "US"
         code = _VENUE_CAL_MAP.get(suffix)
         if not code:
             return None
@@ -4397,17 +4420,29 @@ def _venue_state(symbol, now_utc):
 
 
 def _quote_freshness_assessment(cand):
-    """v1.4.0 (W-2). Returns (passed, current_str, detail). Pure-defensive:
-    the only FAIL paths are PROVEN staleness; absent/unparseable timestamps
-    and calendar outages never block a candidate on their own."""
-    eng = cand.get("engine_gate") or {}
-    qdt = _parse_ts_utc(eng.get("last_updated"))
+    """Require successful acquisition and a witnessed market quote instant.
+
+    Retrieval time is not quote time. An unknown session cannot certify an
+    old close for executable allocation, although the row remains auditable.
+    """
+    from core.data_validity import precise_utc
+    proof = cand.get("quote_evidence") or {}
+    qdt = precise_utc(proof.get("quote_asof"))
     detail = {"quote_ts": (None if qdt is None else qdt.isoformat()),
+              "acquired_at": proof.get("acquired_at"),
+              "acquisition_status": proof.get("status", "UNKNOWN"),
               "mode": None, "age_min": None}
+    if proof.get("status") != "SUCCESS":
+        detail["mode"] = "acquisition_unverified"
+        detail["reason"] = proof.get("reason") or "acquisition_proof_missing"
+        return False, "UNVERIFIED_PRICE: " + detail["reason"], detail
     if qdt is None:
-        detail["mode"] = "skipped_no_timestamp"
-        return True, "no timestamp (skipped)", detail
+        detail["mode"] = "quote_asof_unknown"
+        return False, "UNVERIFIED_PRICE: quote as-of unknown", detail
     now = datetime.now(timezone.utc)
+    if qdt > now + timedelta(seconds=60):
+        detail["mode"] = "quote_asof_future"
+        return False, "UNVERIFIED_PRICE: quote as-of is in the future", detail
     age_min = max(0.0, (now - qdt).total_seconds() / 60.0)
     detail["age_min"] = round(age_min, 1)
     max_min = _env_quote_max_age_min()
@@ -4430,7 +4465,7 @@ def _quote_freshness_assessment(cand):
                        "venue close %s"
                        % (age_min / 60.0,
                           prev_close.strftime("%Y-%m-%d %H:%M UTC"))), detail
-    detail["mode"] = "fallback_no_calendar"
+    detail["mode"] = "calendar_unavailable"
     try:
         _sfx = (str(cand.get("symbol") or "").strip().upper()
                 .rsplit(".", 1)[-1]) or "?"
@@ -4438,17 +4473,13 @@ def _quote_freshness_assessment(cand):
             _FRESHNESS_FALLBACK_LOGGED.add(_sfx)
             _LOG.warning(
                 "[FRESHNESS v%s] venue calendar unavailable for '.%s' -> "
-                "78h fallback in effect (last err: %s)",
+                "old quote cannot be certified (last err: %s)",
                 OPPORTUNITY_BUILDER_VERSION, _sfx,
                 _VENUE_LAST_ERROR.get("msg") or "none captured")
     except Exception:
         pass
-    fb_h = _env_freshness_fallback_h()
-    if age_min <= fb_h * 60.0:
-        return True, ("fallback: %.1fh old, no venue calendar"
-                      % (age_min / 60.0)), detail
-    return False, ("STALE_PRICE %.1fh old (no venue calendar; cap %.0fh)"
-                   % (age_min / 60.0, fb_h)), detail
+    return False, ("UNVERIFIED_PRICE: %.1fh old and venue calendar unavailable"
+                   % (age_min / 60.0)), detail
 
 
 def _data_trust_assessment(cand, criteria):
@@ -4677,13 +4708,21 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     # DO_NOT_INVEST: candidate DEFERS with the STALE_PRICE tag in the audit
     # grid, never sized. DEFAULT ON; TFB_TICKET_FRESHNESS_GATE=0 restores the
     # v1.3.0 gate list byte-for-byte.
-    if _env_freshness_gate():
+    # A disabled age policy cannot authenticate absent or known failed price
+    # evidence. Preserve that factual invariant independently of rollout.
+    quote_proof = cand.get("quote_evidence") or {}
+    from core.data_validity import precise_utc
+    quote_stamp = precise_utc(quote_proof.get("quote_asof"))
+    unverified_quote = (quote_proof.get("status") != "SUCCESS"
+                        or quote_stamp is None
+                        or quote_stamp > datetime.now(timezone.utc) + timedelta(seconds=60))
+    if _env_freshness_gate() or unverified_quote:
         f_ok, f_cur, f_detail = _quote_freshness_assessment(cand)
         fg = _gate(
             "Quote Freshness", f_ok, FAIL_MAJOR, f_cur,
-            ("live <= %.0fm in-session; else >= venue last close; "
-             "fallback <= %.0fh"
-             % (_env_quote_max_age_min(), _env_freshness_fallback_h())))
+            ("successful price acquisition with actual quote as-of; live <= "
+             "%.0fm in-session or witnessed latest venue close; unknown defers"
+             % _env_quote_max_age_min()))
         fg["freshness_detail"] = f_detail
         g.append(fg)
 
@@ -5014,7 +5053,9 @@ def _normalize_portfolio(portfolio):
         if not isinstance(h, dict):
             continue
         hd = {
-            "symbol": _to_text(h.get("symbol")) or "?",
+            # The certificate accepts Symbol/Ticker aliases; exclusion and
+            # sizing must consume that same identity rather than invent '?'.
+            "symbol": _to_text(_field(_row_lookup(h), "symbol")) or "?",
             "sector": (_normalize_sector(_to_text(h.get("sector")))
                        if _env_sector_normalize()
                        else _to_text(h.get("sector"))) or "Unknown",
@@ -5035,6 +5076,83 @@ def _normalize_portfolio(portfolio):
         pv = sum(h["value_sar"] for h in holdings)
     return {"cash": max(0.0, cash), "proceeds": max(0.0, proceeds),
             "portfolio_value": max(0.0, pv), "holdings": holdings}
+
+
+def _portfolio_input_assessment(portfolio, fx_rates, criteria):
+    """Bind quantity, settled cash and valuation facts before allocating money.
+
+    Evidence is declared by the authenticated caller, not broker-authenticated.
+    The signed replay binds this complete packet and rechecks freshness.
+    """
+    from decimal import Decimal, InvalidOperation
+    from core.portfolio_reconciliation import certify_portfolio_inputs, certification_summary
+    raw = portfolio if isinstance(portfolio, dict) else {}
+    holdings = raw.get("holdings", [])
+    result = certify_portfolio_inputs(holdings, raw.get("reconciliation_evidence"), fx_rates)
+    summary = certification_summary(result)
+    reasons = dict(summary.get("reason_counts") or {})
+    proven_rates = {"SAR": 1.0}
+    if result.get("funding_eligible"):
+        proven_rates.update({proof["currency"].strip().upper(): proof["rate_to_sar"]
+                             for proof in raw["reconciliation_evidence"].get("fx_rates", [])})
+    if raw.get("holdings_input_incomplete") is not False:
+        reasons["holdings_input_completeness_unknown"] = 1
+    if result.get("funding_eligible"):
+        try:
+            requested = raw.get("cash_available_sar", 0)
+            if isinstance(requested, bool):
+                raise ValueError("cash")
+            requested = Decimal(str(requested))
+            available = Decimal(result["certified_cash_available_sar_exact"])
+            if not requested.is_finite() or requested < 0 or abs(requested - available) > Decimal("0.01"):
+                reasons["cash_basis_mismatch"] = 1
+            proceeds = raw.get("pending_proceeds_sar", 0)
+            if isinstance(proceeds, bool) or not Decimal(str(proceeds)).is_finite() or Decimal(str(proceeds)) != 0:
+                reasons["unsettled_proceeds_requested"] = 1
+            values = Decimal(0)
+            for holding in holdings:
+                candidate = normalize_candidate(holding, fx_rates, criteria)
+                if not _certified_fx_assessment(candidate, proven_rates)[0]:
+                    reasons["holding_fx_unverified"] = reasons.get("holding_fx_unverified", 0) + 1
+                    continue
+                quote_ok, _, _ = _quote_freshness_assessment(candidate)
+                if not quote_ok:
+                    reasons["holding_quote_unverified"] = reasons.get("holding_quote_unverified", 0) + 1
+                    continue
+                quantity = next((value for key, value in holding.items()
+                                 if _norm_token(key) in {"quantity", "qty", "shares", "units", "holdingqty", "positionqty"}), None)
+                value = holding.get("value_sar")
+                if isinstance(value, bool) or quantity is None or not candidate.get("price_sar"):
+                    reasons["holding_value_unverified"] = 1
+                    continue
+                value = Decimal(str(value))
+                implied = Decimal(str(candidate["price"])) * Decimal(str(candidate["fx_to_sar"])) * Decimal(str(quantity))
+                if not value.is_finite() or value < 0 or abs(value - implied) > Decimal("0.01"):
+                    reasons["holding_value_mismatch"] = reasons.get("holding_value_mismatch", 0) + 1
+                values += value
+            stated = raw.get("portfolio_value_sar", 0)
+            if isinstance(stated, bool):
+                raise ValueError("NAV")
+            stated = Decimal(str(stated))
+            if not stated.is_finite() or stated < 0 or (stated > 0 and abs(stated - values) > Decimal("0.01")):
+                reasons["portfolio_value_mismatch"] = 1
+        except (ValueError, TypeError, InvalidOperation, OverflowError):
+            reasons["portfolio_value_unverified"] = 1
+    summary["reason_counts"] = dict(sorted(reasons.items()))
+    summary["funding_eligible"] = result.get("funding_eligible") is True and not reasons
+    summary["status"] = "certified" if summary["funding_eligible"] else "withheld"
+    return summary, result.get("certified_cash_available_sar", 0.0), proven_rates
+
+
+def _certified_fx_assessment(candidate, proven_rates):
+    """A row override/static default cannot replace fresh declared FX proof."""
+    expected, source = _resolve_fx(candidate.get("currency"), proven_rates)
+    current = candidate.get("fx_to_sar")
+    if source not in {"provided", "provided/100"} or expected is None:
+        return False, "fresh native-currency FX proof missing"
+    if current is None or not math.isclose(current, expected, rel_tol=1e-12, abs_tol=0.0):
+        return False, "row FX conflicts with the certified currency basis"
+    return True, "matches fresh declared currency FX"
 
 
 def _cash_floor_sar() -> float:
@@ -6416,6 +6534,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 pass
         rows = rows[:crit["max_candidates"]]
     pf = _normalize_portfolio(portfolio)
+    input_certification, certified_cash, proven_rates = _portfolio_input_assessment(portfolio, fx_rates, crit)
+    if input_certification["funding_eligible"]:
+        # Cents-rounding acceptance never increases the certified funding cap.
+        pf["cash"] = min(pf["cash"], certified_cash)
+        pf["proceeds"] = 0.0
     sector_ctx = _sector_context(pf, crit, pf["cash"] + pf["proceeds"])
     held = {h["symbol"] for h in pf["holdings"]}
     # v1.0.21 (Fix #4): expand to normalized bare/.US variants so the
@@ -6449,6 +6572,10 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         gates = evaluate_gates(
             cand, crit, held,
             blocked_identity_trace_enabled=_blocked_identity_trace)
+        if input_certification["funding_eligible"] and not _board_research:
+            fx_ok, fx_reason = _certified_fx_assessment(cand, proven_rates)
+            gates.append(_gate("FX Evidence", fx_ok, FAIL_MAJOR, fx_reason,
+                               "conversion bound to fresh declared native-currency FX"))
         # v1.13.0 [TRUST-001] run telemetry — counts in tag AND gate mode;
         # zeros when off (keys always present, the v1.0.6 meta precedent).
         if cand.get("trust_low_source"):
@@ -6533,6 +6660,28 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         # see _audit_align_plan_roi. Runs AFTER gates/verdict/score; display
         # truthfulness only, selection byte-identical.
         _audit_align_plan_roi(audit[-1], crit)
+
+    if not _board_research and not input_certification["funding_eligible"]:
+        # Publish a consumable empty allocation, rather than a failed response
+        # that a native client might treat as permission to preserve old money.
+        withheld = _skeleton("ok" if rows else "no_candidates", "Portfolio inputs unverified; executable funding withheld", crit)
+        withheld["candidates_rows"] = [{k: v for k, v in item.items() if k != "_cand"}
+                                        for item in audit]
+        withheld["kpis"]["scanned"] = len(audit)
+        withheld["meta"].update(execution_ready=False, input_certification=input_certification,
+                                  gate_trace_counts=gate_fail_counts)
+        if _board_replay:
+            # Signing authenticates the frozen research inputs; certification
+            # still independently controls whether any money can be allocated.
+            withheld["meta"]["board_funding"] = {
+                "contract_version": _BOARD_FUNDING_VERSION,
+                "stage": "allocate", "snapshot_available": True,
+                "snapshot_id": crit["board_funding_snapshot"]["snapshot_id"],
+                "eligible_symbols": list(crit.get("board_funding_symbols") or []),
+            }
+        withheld["alerts"] = [{"type": "portfolio_inputs_unverified", "count": 1,
+                                 "required_action": "Reconcile complete positions, settled cash, reservations, FX and holding prices before funding."}]
+        return _json_safe(withheld)
 
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
     invest = [a for a in audit
@@ -6860,6 +7009,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
 
     meta_in = upstream_meta or {}
     meta = {
+        "execution_ready": input_certification["funding_eligible"] and not _board_research and bool(tickets),
+        "input_certification": input_certification,
         "criteria_snapshot": {k: v for k, v in crit.items() if k != "board_funding_snapshot"},
         "gate_trace_counts": gate_fail_counts,
         "trust_gate": {

@@ -21,7 +21,7 @@ module (which executed its 22 groups at IMPORT time) crashed at pytest
 collection. CI never noticed because tests.yml runs an explicit three-file
 list that never included this file. Two structural fixes:
 
-  (1) HERMETIC: the 22 legacy groups are preserved VERBATIM but now run
+  (1) HERMETIC: the 22 policy groups run with synthetic account evidence
       inside `_run_legacy_suite()` with TWO gates pinned for the duration
       — TFB_EXIT_BY_RULE_GATE=0 (the rulebook postdates these groups; the
       contract must stay testable regardless of what the live authority
@@ -56,6 +56,7 @@ import unittest
 
 sys.path.insert(0, '.')
 from core.analysis import portfolio_actions as pa
+from tests.portfolio_reconciliation_fixtures import build_certified_portfolio_actions, synthetic_quote_receipt
 
 FAILS = []
 
@@ -73,6 +74,7 @@ def ok(name, cond, extra=""):
 def H(symbol, qty=100, cost=30.0, price=34.5, iv=41.4, rel=83, dq=92,
       ccy="SAR", sector="Financials", reco="BUY", conflict="No", **kw):
     row = {
+        **synthetic_quote_receipt(),
         "Symbol": symbol, "Name": symbol + " Co", "Sector": sector,
         "Exchange": "Tadawul", "Currency": ccy, "Quantity": qty,
         "Buy Price": cost, "Current Price": price, "Intrinsic Value": iv,
@@ -101,8 +103,11 @@ def find(p, sym):
 
 
 def _run_legacy_suite():
-    """The original 22 groups, verbatim, under the pre-rulebook contract
-    (TFB_EXIT_BY_RULE_GATE=0 for the duration — see the header WHY)."""
+    """Policy groups with complete synthetic positions and settled cash.
+
+    Rulebook and confirmation are pinned as described above. Funding follows
+    the current settled-cash contract even when advisory mode was requested.
+    """
     del FAILS[:]
     _saved = {k: os.environ.get(k) for k in _RULE_ENV_KEYS}
     os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
@@ -111,7 +116,7 @@ def _run_legacy_suite():
     os.environ["TFB_PF_CONFIRM_PERSIST"] = "0"   # v1.6.0 cache stays cold
     try:
         # --- 1. clean ADD with sizing + funding ------------------------------
-        p = pa.build_portfolio_actions([H("1050.SR")], controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [H("1050.SR")], controls=CTL, fx_rates=FX)
         a = find(p, "1050.SR")
         ok("t1-status", p["status"] == "ok", p["status"])
         ok("t1-action", a["action"] == "ADD", a["action"])
@@ -132,19 +137,19 @@ def _run_legacy_suite():
         ok("t1-stop", a["stop_sar"] is not None and a["stop_sar"] < a["price_sar"])
 
         # --- 2. BLOCK on missing price ---------------------------------------
-        p = pa.build_portfolio_actions([H("X.SR", price="N/A")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("X.SR", price="N/A")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "X.SR")
         ok("t2-block", a["action"] == "BLOCK", a["action"])
-        ok("t2-reason", "price" in a["action_reason"])
-        ok("t2-alert", any(al["type"] == "blocked_positions" for al in p["alerts"]))
+        ok("t2-reason", p["meta"]["input_certification"]["reason_counts"].get("holding_quote_unverified") == 1)
+        ok("t2-alert", any(al["type"] == "portfolio_inputs_unverified" for al in p["alerts"]))
 
         # --- 3. BLOCK on missing quantity ------------------------------------
-        p = pa.build_portfolio_actions([H("Q.SR", qty="")], controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [H("Q.SR", qty="")], controls=CTL, fx_rates=FX)
         ok("t3-block", find(p, "Q.SR")["action"] == "BLOCK")
 
         # --- 4. EXIT on valuation ROI <= -15 ---------------------------------
-        p = pa.build_portfolio_actions([H("OV.SR", price=50.0, iv=40.0)],
+        p = build_certified_portfolio_actions(pa, [H("OV.SR", price=50.0, iv=40.0)],
                                        controls=CTL, fx_rates=FX)  # roi = -20%
         a = find(p, "OV.SR")
         ok("t4-exit", a["action"] == "EXIT", a["action"])
@@ -152,12 +157,12 @@ def _run_legacy_suite():
         ok("t4-reason", "exit threshold" in a["action_reason"])
 
         # --- 5. EXIT on sell-tier engine reco --------------------------------
-        p = pa.build_portfolio_actions([H("SL.SR", reco="STRONG_SELL")],
+        p = build_certified_portfolio_actions(pa, [H("SL.SR", reco="STRONG_SELL")],
                                        controls=CTL, fx_rates=FX)
         ok("t5-exit", find(p, "SL.SR")["action"] == "EXIT")
 
         # --- 6. low confidence caps EXIT -> HOLD -----------------------------
-        p = pa.build_portfolio_actions([H("LC.SR", price=50.0, iv=40.0, rel=45)],
+        p = build_certified_portfolio_actions(pa, [H("LC.SR", price=50.0, iv=40.0, rel=45)],
                                        controls=CTL, fx_rates=FX)
         a = find(p, "LC.SR")
         ok("t6-hold", a["action"] == "HOLD", a["action"])
@@ -169,7 +174,7 @@ def _run_legacy_suite():
         ctl7 = dict(CTL)
         ctl7["cash_available_sar"] = 10000
         # qty 1000 x 34.5 = 34500 mv; total = 44500; weight 77.5% > 15%
-        p = pa.build_portfolio_actions([H("BIG.SR", qty=1000, iv=36.0)],
+        p = build_certified_portfolio_actions(pa, [H("BIG.SR", qty=1000, iv=36.0)],
                                        controls=ctl7, fx_rates=FX)
         a = find(p, "BIG.SR")
         ok("t7-trim", a["action"] == "TRIM", a["action"])
@@ -184,7 +189,7 @@ def _run_legacy_suite():
         ctl8["max_position_pct"] = 60  # disable position cap for the test
         rows8 = [H("S1.SR", qty=500, iv=36.0), H("S2.SR", qty=500, iv=36.0)]
         # each mv 17250, sector total 34500 = 100% > 30%; excess = 24150
-        p = pa.build_portfolio_actions(rows8, controls=ctl8, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, rows8, controls=ctl8, fx_rates=FX)
         a1, a2 = find(p, "S1.SR"), find(p, "S2.SR")
         ok("t8-both-trim", a1["action"] == "TRIM" and a2["action"] == "TRIM",
            (a1["action"], a2["action"]))
@@ -194,7 +199,7 @@ def _run_legacy_suite():
         ok("t8-sector-flag", p["sector_summary"][0]["over_cap"] is True)
 
         # --- 9. valuation TRIM (between -15 and -5) trims 50% ----------------
-        p = pa.build_portfolio_actions([H("VT.SR", price=44.0, iv=40.0)],
+        p = build_certified_portfolio_actions(pa, [H("VT.SR", price=44.0, iv=40.0)],
                                        controls=CTL, fx_rates=FX)  # roi ~ -9.1%
         a = find(p, "VT.SR")
         ok("t9-trim", a["action"] == "TRIM", a["action"])
@@ -207,7 +212,7 @@ def _run_legacy_suite():
         ctl10 = dict(CTL)
         ctl10["cash_available_sar"] = 5000
         ctl10["rebalance_mode"] = "New Cash Only"
-        p = pa.build_portfolio_actions(rows10, controls=ctl10, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, rows10, controls=ctl10, fx_rates=FX)
         ok("t10-proceeds-excluded", p["kpis"]["proceeds_pending_sar"] == 0,
            p["kpis"]["proceeds_pending_sar"])
         total10 = 400 * 50.0 + 10 * 34.5 + 5000
@@ -215,7 +220,7 @@ def _run_legacy_suite():
         ok("t10-deployable", p["kpis"]["deployable_sar"] ==
            round(max(0, 5000 - floor10)), p["kpis"]["deployable_sar"])
 
-        # --- 11. Advisory mode includes proceeds; funding split names both ---
+        # --- 11. Advisory request cannot spend proposed sale proceeds --------
         ctl11 = dict(ctl10)
         ctl11["rebalance_mode"] = "Advisory Only"
         ctl11["target_cash_pct"] = 0
@@ -223,12 +228,13 @@ def _run_legacy_suite():
         ctl11["max_sector_pct"] = 95
         rows11 = [H("EX2.SR", qty=400, price=50.0, iv=40.0, sector="Energy"),
                   H("AD2.SR", qty=10, sector="Tech")]
-        p = pa.build_portfolio_actions(rows11, controls=ctl11, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, rows11, controls=ctl11, fx_rates=FX)
         a = find(p, "AD2.SR")
-        ok("t11-add-sized", a["action"] == "ADD" and a["suggested_delta_sar"] > 5000,
+        ok("t11-add-sized", a["action"] == "ADD" and 0 < a["suggested_delta_sar"] <= 5000,
            (a["action"], a["suggested_delta_sar"]))
-        ok("t11-funds-split", a["funds_from"] is not None and
-           "proceeds" in a["funds_from"], a["funds_from"])
+        ok("t11-funds-cash", a["funds_from"] == "cash", a["funds_from"])
+        ok("t11-proceeds-withheld", p["kpis"]["proceeds_pending_sar"] == 0)
+        ok("t11-settled-deployable", p["kpis"]["deployable_sar"] == 5000)
         ok("t11-identity", p["kpis"]["adds_funded_sar"] <=
            p["kpis"]["deployable_sar"])
 
@@ -238,7 +244,7 @@ def _run_legacy_suite():
         # while weight 3450/63450 = 5.4% stays under the 15% position cap.
         ctl12["cash_available_sar"] = 60000
         ctl12["target_cash_pct"] = 95
-        p = pa.build_portfolio_actions([H("ZD.SR")], controls=ctl12, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [H("ZD.SR")], controls=ctl12, fx_rates=FX)
         a = find(p, "ZD.SR")
         ok("t12-add", a["action"] == "ADD", a["action"])
         ok("t12-zero", a["suggested_delta_sar"] == 0)
@@ -247,7 +253,7 @@ def _run_legacy_suite():
                             for al in p["alerts"]))
 
         # --- 13. missing cost basis: action still computed, P&L None, alert --
-        p = pa.build_portfolio_actions([H("NC.SR", cost="")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("NC.SR", cost="")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "NC.SR")
         ok("t13-action", a["action"] == "ADD")
@@ -256,7 +262,7 @@ def _run_legacy_suite():
                             for al in p["alerts"]))
 
         # --- 14. USD holding: FX applied to mv/pnl/levels --------------------
-        p = pa.build_portfolio_actions(
+        p = build_certified_portfolio_actions(pa,
             [H("O.US", ccy="USD", price=56.1, cost=50.0, iv=70.0, qty=100)],
             controls=CTL, fx_rates=FX)
         a = find(p, "O.US")
@@ -265,39 +271,39 @@ def _run_legacy_suite():
         ok("t14-pnl", a["pnl_sar"] == round(100 * 6.1 * 3.75))
 
         # --- 15. missing FX currency -> BLOCK --------------------------------
-        p = pa.build_portfolio_actions([H("Z.ZZ", ccy="XXX")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("Z.ZZ", ccy="XXX")], controls=CTL,
                                        fx_rates=FX)
         ok("t15-block", find(p, "Z.ZZ")["action"] == "BLOCK")
 
         # --- 16. HOLD reason names binding fact ------------------------------
-        p = pa.build_portfolio_actions([H("HL.SR", iv=36.0)], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("HL.SR", iv=36.0)], controls=CTL,
                                        fx_rates=FX)  # roi 4.3% < 12
         a = find(p, "HL.SR")
         ok("t16-hold", a["action"] == "HOLD")
         ok("t16-why", "below add threshold" in a["action_reason"])
 
         # --- 17. conflict blocks ADD -> HOLD with reason ---------------------
-        p = pa.build_portfolio_actions([H("CF.SR", conflict="Yes")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("CF.SR", conflict="Yes")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "CF.SR")
         ok("t17-hold", a["action"] == "HOLD", a["action"])
         ok("t17-why", "conflict" in a["action_reason"].lower())
 
         # --- 18. empty holdings: honest empty payload ------------------------
-        p = pa.build_portfolio_actions([], controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [], controls=CTL, fx_rates=FX)
         ok("t18-empty", p["status"] == "empty")
         ok("t18-cash", p["kpis"]["cash_sar"] == 100000)
 
         # --- 19. disabled kill-switch ----------------------------------------
         os.environ["TFB_PF_ENABLED"] = "0"
-        p = pa.build_portfolio_actions([H("A.SR")], controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [H("A.SR")], controls=CTL, fx_rates=FX)
         ok("t19-disabled", p["status"] == "disabled")
         os.environ["TFB_PF_ENABLED"] = "1"
 
         # --- 20. KPI integrity + action ordering (EXIT first, HOLD last) -----
         rows20 = [H("AA.SR"), H("BB.SR", price=50.0, iv=40.0),
                   H("CC.SR", iv=36.0)]
-        p = pa.build_portfolio_actions(rows20, controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, rows20, controls=CTL, fx_rates=FX)
         acts = [a["action"] for a in p["actions"]]
         ok("t20-order", acts[0] == "EXIT" and acts[-1] == "HOLD", acts)
         k = p["kpis"]
@@ -316,7 +322,7 @@ def _run_legacy_suite():
 
         # --- 22. JSON serializable end-to-end --------------------------------
         import json
-        p = pa.build_portfolio_actions(rows20, controls=CTL, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, rows20, controls=CTL, fx_rates=FX)
         json.dumps(p)
         ok("t22-json", True)
     finally:
@@ -356,7 +362,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         the exact behavior that broke the old module-level t1."""
         os.environ.pop("TFB_PF_ADD_CONFIRM_DAYS", None)    # default 2
         os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
-        p = pa.build_portfolio_actions([H("CONF1.SR")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("CONF1.SR")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "CONF1.SR")
         self.assertEqual(a["action"], "HOLD")
@@ -366,7 +372,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
     def test_rule_1a_exit_by_rule_uncappable(self):
         os.environ.pop("TFB_EXIT_BY_RULE_GATE", None)      # default ON
         os.environ["TFB_EXIT_BY_RULE_EXTRA"] = "RULEX.SR"  # fictional symbol
-        p = pa.build_portfolio_actions([H("RULEX.SR", rel=20)],
+        p = build_certified_portfolio_actions(pa, [H("RULEX.SR", rel=20)],
                                        controls=CTL, fx_rates=FX)
         a = find(p, "RULEX.SR")
         self.assertEqual(a["action"], "EXIT")
@@ -384,7 +390,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         ctl["cash_available_sar"] = 10000
         # qty 1000 x 34.5 = 34500 mv; total 44500; weight 77.5% > 15%;
         # rel 45 => band Low — v1.4.0 capped this to HOLD (the 5023 lesson).
-        p = pa.build_portfolio_actions([H("BIGLO.SR", qty=1000, iv=36.0,
+        p = build_certified_portfolio_actions(pa, [H("BIGLO.SR", qty=1000, iv=36.0,
                                           rel=45)],
                                        controls=ctl, fx_rates=FX)
         a = find(p, "BIGLO.SR")
@@ -399,7 +405,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         os.environ["TFB_TRIM_BY_RULE_GATE"] = "0"
         ctl = dict(CTL)
         ctl["cash_available_sar"] = 10000
-        p = pa.build_portfolio_actions([H("BIGLO.SR", qty=1000, iv=36.0,
+        p = build_certified_portfolio_actions(pa, [H("BIGLO.SR", qty=1000, iv=36.0,
                                           rel=45)],
                                        controls=ctl, fx_rates=FX)
         a = find(p, "BIGLO.SR")
@@ -440,7 +446,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         fake.d["tfb:pf:add_confirm:CP1.SR"] = (
             '{"count": 1, "date": "%s"}' % yday)
         self._inject_redis(fake)
-        p = pa.build_portfolio_actions([H("CP1.SR")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("CP1.SR")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "CP1.SR")
         self.assertEqual(a["action"], "ADD")
@@ -457,7 +463,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         fake.d["tfb:pf:add_confirm:CP2.SR"] = (
             '{"count": 1, "date": "%s"}' % old)
         self._inject_redis(fake)
-        p = pa.build_portfolio_actions([H("CP2.SR")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("CP2.SR")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "CP2.SR")
         self.assertEqual(a["action"], "HOLD")
@@ -469,7 +475,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         pa._ADD_CONFIRM_STORE.clear()
         fake = self._FakeRedis()
         self._inject_redis(fake)
-        p = pa.build_portfolio_actions([H("CP3.SR")], controls=CTL,
+        p = build_certified_portfolio_actions(pa, [H("CP3.SR")], controls=CTL,
                                        fx_rates=FX)
         a = find(p, "CP3.SR")
         self.assertEqual(a["action"], "HOLD")
@@ -486,7 +492,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         ctl["cash_available_sar"] = 29183   # mv 6180 => weight ~17.5%
         h = H("RCIX.SR", qty=100, price=61.8, cost=67.0, iv=64.0,
               rel=39.2, reco="REDUCE")
-        p = pa.build_portfolio_actions([h], controls=ctl, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [h], controls=ctl, fx_rates=FX)
         a = find(p, "RCIX.SR")
         self.assertEqual(a["action"], "TRIM")
         self.assertIn("TRIM-BY-RULE", a["action_reason"])
@@ -504,7 +510,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         ctl["cash_available_sar"] = 29183
         h = H("RCIX.SR", qty=100, price=61.8, cost=67.0, iv=64.0,
               rel=39.2, reco="REDUCE")
-        p = pa.build_portfolio_actions([h], controls=ctl, fx_rates=FX)
+        p = build_certified_portfolio_actions(pa, [h], controls=ctl, fx_rates=FX)
         a = find(p, "RCIX.SR")
         self.assertEqual(a["action"], "HOLD")
         self.assertEqual(a["detail"]["capped_from"], "EXIT")
@@ -514,7 +520,7 @@ class TestPortfolioActionsContract(unittest.TestCase):
         os.environ.pop("TFB_TRIM_BY_RULE_GATE", None)      # gate ON
         # roi ~ -9.1% => VALUATION trim (signal-driven); rel 45 => Low.
         # Rule 1b must NOT rescue this — only cap-kind trims are rules.
-        p = pa.build_portfolio_actions([H("VTLOW.SR", price=44.0, iv=40.0,
+        p = build_certified_portfolio_actions(pa, [H("VTLOW.SR", price=44.0, iv=40.0,
                                           rel=45)],
                                        controls=CTL, fx_rates=FX)
         a = find(p, "VTLOW.SR")

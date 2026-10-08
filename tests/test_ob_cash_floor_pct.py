@@ -27,10 +27,16 @@ import hashlib
 import importlib
 import json
 import os
+from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from decision_evidence_fixtures import observed_price_fields
+
 ob = importlib.import_module("core.analysis.opportunity_builder")
+
+from decision_evidence_fixtures import build_with_observed_inputs, observed_portfolio
 
 FX = {"USD": 3.7576, "SAR": 1.0}
 CRIT = ob.make_criteria({"period_months": 3, "required_roi_pct": 12,
@@ -43,7 +49,8 @@ ENVS = ("TFB_OPP_CASH_FLOOR_PCT", "TFB_OPP_CASH_FLOOR_MODE",
 
 
 def _row(symbol, price, target, sector="Energy", rel=76.5, dq=100.0):
-    return {"Symbol": symbol, "Name": symbol + " Inc.", "Sector": sector,
+    evidence = observed_price_fields()
+    return {**evidence, "Symbol": symbol, "Name": symbol + " Inc.", "Sector": sector,
             "Market": "NYSE/NASDAQ", "Currency": "USD",
             "Current Price": price, "Target Price": target,
             "Expected ROI 12M": round((target / price - 1.0) * 100.0, 2),
@@ -51,7 +58,7 @@ def _row(symbol, price, target, sector="Energy", rel=76.5, dq=100.0):
             "Risk Bucket": "Low", "Investability Status": "INVESTABLE",
             "Final Action": "INVEST", "Recommendation": "BUY",
             "Volatility 30D": 2.0, "Forecast Source": "provider_target",
-            "Last Updated (UTC)": "2026-09-20T05:25:00+00:00"}
+            "Last Updated (UTC)": evidence["last_updated_utc"]}
 
 
 ROWS = [_row("CRC.US", 54.07, 72.72, "Energy"),
@@ -62,6 +69,7 @@ ROWS = [_row("CRC.US", 54.07, 72.72, "Energy"),
         _row("RDN.US", 35.01, 43.80, "Financials")]
 
 PF = {"cash_available_sar": 30000.0, "portfolio_value_sar": 60000.0}
+PF = observed_portfolio(PF, FX)
 
 
 def _env(pct=None, mode=None, abs_sar=None):
@@ -78,7 +86,7 @@ def _env(pct=None, mode=None, abs_sar=None):
 def _build(pct=None, mode=None, abs_sar=None, pf=None):
     _env(pct, mode, abs_sar)
     try:
-        p = ob.build_opportunity_payload(
+        p = build_with_observed_inputs(ob,
             [copy.deepcopy(r) for r in ROWS], criteria=dict(CRIT),
             portfolio=dict(pf if pf is not None else PF), fx_rates=dict(FX))
     finally:
@@ -222,7 +230,7 @@ def test_t8_wiring():
     assert src.count('"type": "cash_floor"') == 1
     assert src.count('meta["cash_floor"] = dict(_LAST_CASH_FLOOR)') == 1
     assert src.index("_cf = _cash_floor_pct_ctx(") < src.index("if _floor > 0:  # v1.16.0")
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.22.0"
+    assert tuple(map(int, ob.OPPORTUNITY_BUILDER_VERSION.split("."))) >= (1, 22, 0)
 
 
 if __name__ == "__main__":

@@ -122,14 +122,14 @@ def test_whole_carried_row_roundtrips_without_relabeling_source_or_time():
         prior = sync.parse_prior(previous)
         symbols, ctx, carried, _, _ = sync.apply_sticky([], {}, prior)
         row = sync.build_rows(symbols, ctx, "latest provider failed", carried)[0]
-        assert row[5] == ASOF and row[6] == PRIOR_SOURCE + " +carried"
+        assert row[5] == ASOF and row[6] == PRIOR_SOURCE + " [events unknown:ex-div] +carried"
         previous = table(row)
 
 
 def test_empty_failed_observation_does_not_claim_a_fresh_fact():
     row = sync.build_rows(["ACME.US"], {}, "provider error")[0]
     assert row[1] == row[3] == row[5] == ""
-    assert row[6] == "provider error"
+    assert row[6] == "provider error [events unknown:earnings/ex-div]"
 
 
 def test_prior_telemetry_resets_even_for_empty_or_no_header_input():

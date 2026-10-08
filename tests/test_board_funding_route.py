@@ -6,6 +6,10 @@ import copy
 import os
 import json
 import subprocess
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pytest
 from fastapi import FastAPI
@@ -34,7 +38,9 @@ OPPORTUNITY_PATH = "/sheet-rows/opportunity-candidates"
 
 
 def _row(symbol, roi):
+    from decision_evidence_fixtures import observed_price_fields
     return {
+        **observed_price_fields(),
         "symbol": symbol, "name": "Synthetic " + symbol,
         "sector": "Energy", "market": "Tadawul", "currency": "SAR",
         "current_price": 100.0, "intrinsic_value": 130.0,
@@ -64,7 +70,7 @@ def mounted_board_route(monkeypatch):
         calls["trends"] += 1
         return copy.deepcopy(rows), {"enabled": False, "bound": True}
 
-    async def _health(_timeout_s):
+    async def _health(_timeout_s=None):
         calls["health"] += 1
         return {"unavailable": True, "reason": "synthetic-test"}
 
@@ -120,6 +126,7 @@ def real_authenticated_board_route(mounted_board_route, monkeypatch):
 
 
 def _research_body():
+    from decision_evidence_fixtures import observed_portfolio
     return {
         "rows": [_row("HIGH.SR", 24.0), _row("LATER.SR", 20.0)],
         "criteria": {
@@ -130,7 +137,7 @@ def _research_body():
             "rank_by_engine_roi_enabled": True,
             "trust_gate_enabled": False,
         },
-        "portfolio": {"cash_available_sar": 10_000.0},
+        "portfolio": observed_portfolio({"cash_available_sar": 10_000.0}, {"SAR": 1.0}),
         "fx_rates": {"SAR": 1.0},
     }
 
@@ -359,9 +366,15 @@ def test_mounted_route_round_trip_replays_snapshot_without_provider_refresh(moun
 
 
 def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
-    mounted_board_route, monkeypatch,
+    real_authenticated_board_route, monkeypatch,
 ):
-    client, calls = mounted_board_route
+    from core.analysis import portfolio_actions as pa
+    client, calls = real_authenticated_board_route
+    monkeypatch.setenv("APP_TOKEN", "synthetic-board-test")
+    core_config._SETTINGS_CACHE.clear()
+    monkeypatch.setenv("TFB_PF_ENABLED", "1")
+    monkeypatch.setattr(advanced, "_portfolio_build_offloop_enabled", lambda: False)
+    monkeypatch.setattr(advanced, "_build_portfolio_actions", pa.build_portfolio_actions)
     commit = "synthetic-readback-release"
     monkeypatch.setenv("RENDER_GIT_COMMIT", commit)
     engine = probe.source_version("core/data_engine_v2.py", "__version__")
@@ -381,7 +394,7 @@ def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
         if path == "/health":
             assert body is None and authenticated is False
             return copy.deepcopy(health)
-        assert path == OPPORTUNITY_PATH and authenticated is True
+        assert path in (OPPORTUNITY_PATH, probe.PORTFOLIO_ACTIONS_PATH) and authenticated is True
         response = client.post(path, json=body,
             headers={"X-APP-TOKEN": "synthetic-board-test"})
         assert response.status_code == 200
@@ -394,7 +407,19 @@ def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
     assert result["signed_research"] is True
     assert result["empty_allocation"] is True
     assert result["cash_and_fx_changes_rejected"] is True
-    assert len(requests) == 6 and len(responses) == 4
+    assert len(requests) == 7 and len(responses) == 5
+    assert result["uncertified_replay_withheld"] is True
+    assert result["unreconciled_portfolio_blocked"] is True
+    assert result["portfolio_actions_version"] == "1.15.0"
+    protective = responses[-1]
+    assert requests[-2][0] == probe.PORTFOLIO_ACTIONS_PATH
+    assert "reconciliation_evidence" not in requests[-2][1]
+    assert protective["meta"]["execution_ready"] is False
+    assert protective["meta"]["input_certification"]["funding_eligible"] is False
+    assert protective["actions"][0]["action"] == "BLOCK"
+    assert protective["kpis"]["adds_funded_sar"] == 0
+    assert protective["kpis"]["portfolio_value_sar"] is None
+    assert client.post(probe.PORTFOLIO_ACTIONS_PATH, json=requests[-2][1]).status_code == 401
     body = requests[1][1]
     assert body["rows"][0]["symbol"] == "AAPL.US"
     assert body["rows"][0]["investability_status"] == "BLOCKED"
@@ -408,9 +433,9 @@ def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
     assert allocated_board["snapshot_available"] is True
     assert requests[2][1]["rows"] == []
     assert requests[2][1]["criteria"]["Board Funding Symbols"] == []
-    for rejected in responses[2:]:
+    for rejected in responses[2:4]:
         _assert_rejected_before_money(rejected)
-    assert calls == {"trends": 1, "health": 1, "news": 1, "selector": 0}
+    assert calls == {"trends": 1, "health": 2, "news": 1, "selector": 0}
     assert snapshot["snapshot_id"] not in json.dumps(result)
     assert "synthetic-board-test" not in json.dumps([result, responses])
 

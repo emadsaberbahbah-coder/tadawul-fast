@@ -243,7 +243,9 @@ logger.addHandler(logging.NullHandler())
 #   the executor pool may hit two sids concurrently and a Lock here would
 #   serialize real writes for a log line).
 # =============================================================================
-SERVICE_VERSION = "6.2.0"
+SERVICE_VERSION = "6.2.1"
+
+from core.sheet_presentation import present_instrument_row
 MIN_CORE_VERSION = "5.0.0"
 
 # =============================================================================
@@ -1119,6 +1121,24 @@ def append_missing_headers(headers: List[str], extra: Sequence[str]) -> List[str
 # Row Processing
 # =============================================================================
 
+def _presentation_column_names(headers: Sequence[str]) -> List[str]:
+    """Preserve conflicting exact duplicate headers until evidence is checked."""
+    names: List[str] = []
+    seen: Set[str] = set()
+    for header in headers:
+        name = header
+        while name in seen:
+            name += " "
+        names.append(name)
+        seen.add(name)
+    return names
+
+
+def _present_grid_row(names: Sequence[str], row: Sequence[Any]) -> List[Any]:
+    displayed = present_instrument_row(dict(zip(names, row)))
+    return [displayed.get(name) for name in names]
+
+
 def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[Any]]]:
     """Convert rows to grid format."""
     headers = [(_strip(h) or "") for h in (headers or []) if _strip(h)]
@@ -1134,6 +1154,7 @@ def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[An
         for row_dict in rows:
             if not isinstance(row_dict, dict):
                 continue
+            row_dict = present_instrument_row(row_dict)
             row_data: List[Any] = [None] * len(headers)
             for key, value in row_dict.items():
                 nk = _normalize_header_key(key)
@@ -1150,6 +1171,7 @@ def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[An
 
     # List rows
     if isinstance(rows, list):
+        names = _presentation_column_names(headers)
         for row in rows:
             if not isinstance(row, (list, tuple)):
                 row = [row]
@@ -1158,7 +1180,7 @@ def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[An
                 row_list += [None] * (len(headers) - len(row_list))
             elif len(row_list) > len(headers):
                 row_list = row_list[:len(headers)]
-            fixed_rows.append(row_list)
+            fixed_rows.append(_present_grid_row(names, row_list))
         return headers, fixed_rows
 
     fixed_rows.append([rows] + [None] * (len(headers) - 1))
@@ -1878,6 +1900,7 @@ def write_grid_chunked(
     data_rows = grid[1:] if len(grid) > 1 else []
 
     header_len = len(header)
+    presentation_names = _presentation_column_names(header)
     fixed_rows: List[List[Any]] = []
     for row in data_rows:
         if not isinstance(row, (list, tuple)):
@@ -1887,7 +1910,7 @@ def write_grid_chunked(
             row_list += [None] * (header_len - len(row_list))
         elif len(row_list) > header_len:
             row_list = row_list[:header_len]
-        fixed_rows.append(row_list)
+        fixed_rows.append(_present_grid_row(presentation_names, row_list))
 
     chunks = [
         fixed_rows[i:i + _CONFIG.max_rows_per_write]
@@ -2174,6 +2197,21 @@ def ensure_headers_and_formatting(
                 "fields": "pixelSize",
             }
         })
+
+        # Canonical fraction columns require native percent formatting. This
+        # changes display format only; value-bound conversion occurs in the
+        # shared serializer before values are sent to Sheets.
+        fraction_headers = {"grossmargin", "operatingmargin", "profitmargin", "upside", "upsidepct",
+                            "upsidedownside", "upsidedownsidepct", "expectedroi1m", "expectedroi3m", "expectedroi12m"}
+        for index, header in enumerate(canonical):
+            if _normalize_header_key(header) in fraction_headers:
+                column_index = col_to_index(start_col) - 1 + index
+                requests.append({"repeatCell": {
+                    "range": {"sheetId": sid, "startRowIndex": frozen_rows,
+                              "startColumnIndex": column_index, "endColumnIndex": column_index + 1},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }})
 
         _batch_update(spreadsheet_id, requests)
     except Exception as e:
@@ -3022,6 +3060,9 @@ def _refresh_logic(
             rows3 = _apply_preserve_map(
                 headers3, rows3, preserve_map, _CONFIG.preserve_columns
             )
+
+        # Preservation cannot resurrect an unproven percentage/return value.
+        headers3, rows3 = rows_to_grid(headers3, rows3)
 
         grid = [headers3] + rows3
 
