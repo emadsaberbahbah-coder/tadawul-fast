@@ -99,8 +99,14 @@ def present_instrument_row(row: Mapping[str, Any]) -> dict[str, Any]:
         if not values:
             return None
         first = values[0]
-        if any(value != first and (_number(value) is None or _number(value) != _number(first))
-               for value in values[1:]):
+        if field not in {"invest_period_label", "horizon_label", "warnings"}:
+            # Python considers True == 1 and False == 0. Validate every typed
+            # alias before equivalence, so an invalid alias cannot certify a
+            # numeric quantity or survive into the writer's last-key mapping.
+            numbers = [_number(value) for value in values]
+            if any(number is None for number in numbers) or len(set(numbers)) != 1:
+                return None
+        elif any(value != first for value in values[1:]):
             return None
         return first
 
@@ -110,6 +116,30 @@ def present_instrument_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
     def populated(field: str) -> bool:
         return any(row[name] not in (None, "") for name in columns.get(field, []))
+
+    price_columns = columns.get("current_price", [])
+    duplicate_price_conflict = len(price_columns) > 1 and (
+        read("current_price") is None
+        or len({"" if row[name] is None else str(row[name]).strip() for name in price_columns}) > 1
+    )
+    acquisition_prices = [value for name, value in row.items()
+                          if _key(name) in {"currentprice", "price", "lastprice"}
+                          and value is not None and str(value).strip()]
+    # Match the acquisition classifier's comma-tolerant numeric consensus
+    # across differently named price aliases; duplicate current-price names
+    # above retain its stricter exact-text consensus.
+    price_numbers = [_number(str(value).strip().replace(",", ""))
+                     if not isinstance(value, bool) else None for value in acquisition_prices]
+    cross_price_conflict = len(acquisition_prices) > 1 and (
+        any(number is None or number <= 0 for number in price_numbers)
+        or len(set(price_numbers)) != 1
+    )
+    if duplicate_price_conflict or cross_price_conflict:
+        # The acquisition classifier already rejects conflicting current-price
+        # aliases. Strict projection must not erase that failure and certify a
+        # canonical price just because its disagreeing alias was discarded.
+        # Retain the raw prices and models; carry only the failed proof.
+        added.extend(("sheet_quote_conflict:current_price", "acquisition_status:conflict"))
 
     witnessed = dict(row)
     for field in MARGIN_FIELDS:
@@ -168,9 +198,17 @@ def present_instrument_row(row: Mapping[str, Any]) -> dict[str, Any]:
         # one-cent price allowance would accept arbitrary returns on tiny
         # crypto/FX prices. This permits existing six-decimal ROI rounding.
         tolerance = max(0.000005, abs(implied) * 0.000001)
+        if not math.isfinite(implied) or not math.isfinite(tolerance):
+            write(return_field, None)
+            added.append("sheet_tuple_unknown:" + return_field)
+            continue
         if abs(actual - implied) > tolerance:
             write(return_field, None)
             added.append("sheet_tuple_conflict:" + return_field)
+        else:
+            # RAW Sheets writes preserve strings as text. Publish the witnessed
+            # existing numeric return after validation; never derive a new ROI.
+            write(return_field, actual)
 
     if added:
         # Keep display receipts last on every pass; otherwise replacing their

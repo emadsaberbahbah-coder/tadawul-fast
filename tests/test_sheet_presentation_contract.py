@@ -288,6 +288,143 @@ def test_duplicate_exact_grid_header_does_not_hide_unit_conflict():
     assert rows[0][1] is rows[0][2] is None
 
 
+@pytest.mark.parametrize("field,alias,valid,invalid", [
+    ("profit_margin", "Profit Margin", 1.0, True),
+    ("profit_margin", "Profit Margin", 0.0, False),
+    ("expected_roi_12m", "Expected ROI 12M", 1.0, True),
+    ("horizon_days", "Horizon Days", 1.0, True),
+    ("current_price", "Current Price", 1.0, True),
+    ("profit_margin", "Profit Margin", 1.0, float("inf")),
+    ("profit_margin", "Profit Margin", 1.0, "not-a-number"),
+])
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_invalid_typed_alias_never_certifies_or_wins_actual_writer(field, alias, valid, invalid, alias_first):
+    row = source_row(1.0)
+    row.update(current_price=1.0, forecast_price_12m=2.0, expected_roi_12m=1.0, horizon_days=1.0)
+    row[field] = valid
+    if field == "profit_margin":
+        row["_margin_unit_basis"][field]["value"] = valid
+    if alias_first:
+        row = {alias: invalid, **row}
+    else:
+        row[alias] = invalid
+    original = copy.deepcopy(row)
+    displayed = present_instrument_row(row)
+    if field == "horizon_days":
+        assert displayed["invest_period_label"] is None
+    elif field == "current_price":
+        assert displayed["expected_roi_12m"] is None
+    else:
+        assert displayed[field] is displayed[alias] is None
+    headers = ["Symbol", "Profit Margin", "Expected ROI 12M", "Horizon Days", "Invest Period Label", "Warnings"]
+    _, matrix = sheets.rows_to_grid(headers, [row])
+    if field == "profit_margin":
+        assert matrix[0][1] is None
+    elif field == "expected_roi_12m" or field == "current_price":
+        assert matrix[0][2] is None
+    else:
+        assert matrix[0][4] is None
+    assert row == original
+
+
+def test_legitimate_numeric_string_aliases_remain_equivalent():
+    row = source_row(1.0)
+    row["Profit Margin"] = "1.0"
+    displayed = present_instrument_row(row)
+    assert displayed["profit_margin"] == displayed["Profit Margin"] == 0.01
+
+
+@pytest.mark.parametrize("canonical,alias", [(1.0, True), (0.0, False), (1.0, 2.0), (1, "1.0")])
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_actual_strict_projection_preserves_failed_quote_proof_before_alias_is_lost(canonical, alias, alias_first):
+    row = source_row()
+    row["current_price"] = canonical
+    row = {"Current Price": alias, **row} if alias_first else {**row, "Current Price": alias}
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    assert row_acquisition(row, now, 86400).status == "INVALID"
+    _, keys = de.get_sheet_spec("Global_Markets")
+    projected = de._strict_project_row(keys, row)
+    assert projected["current_price"] == canonical
+    assert "Current Price" not in projected
+    assert "sheet_quote_conflict:current_price" in projected["warnings"]
+    assert "acquisition_status:conflict" in projected["warnings"]
+    assert row_acquisition(projected, now, 86400).status == "INVALID"
+    assert row["current_price"] == canonical and row["Current Price"] == alias
+
+
+@pytest.mark.parametrize("alias_name", ["price", "last_price"])
+@pytest.mark.parametrize("alias_value", [50.0, True, float("inf")])
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_actual_strict_projection_retains_cross_name_acquisition_price_failure(alias_name, alias_value, alias_first):
+    row = source_row()
+    row = {alias_name: alias_value, **row} if alias_first else {**row, alias_name: alias_value}
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    assert row_acquisition(row, now, 86400).status == "INVALID"
+    _, keys = de.get_sheet_spec("Global_Markets")
+    projected = de._strict_project_row(keys, row)
+    assert alias_name not in projected and projected["current_price"] == 100
+    assert "acquisition_status:conflict" in projected["warnings"]
+    assert row_acquisition(projected, now, 86400).status == "INVALID"
+    assert row[alias_name] == alias_value
+
+
+@pytest.mark.parametrize("alias_name", ["price", "last_price"])
+@pytest.mark.parametrize("price,alias_value", [(100, "100.0"), (1000, "1,000")])
+def test_equivalent_cross_name_price_proof_does_not_create_failure(alias_name, price, alias_value):
+    row = source_row()
+    row["current_price"] = price
+    row[alias_name] = alias_value
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    assert row_acquisition(row, now, 86400).status == "SUCCESS"
+    _, keys = de.get_sheet_spec("Global_Markets")
+    projected = de._strict_project_row(keys, row)
+    assert "acquisition_status:conflict" not in projected["warnings"]
+    assert row_acquisition(projected, now, 86400).status == "SUCCESS"
+
+
+@pytest.mark.parametrize("price_field,return_field,price_header,return_header", [
+    ("target_price", "upside_downside_pct", "Target Price", "Upside/Downside %"),
+    ("intrinsic_value", "upside_pct", "Intrinsic Value", "Upside %"),
+    ("forecast_price_1m", "expected_roi_1m", "Forecast Price 1M", "Expected ROI 1M"),
+    ("forecast_price_3m", "expected_roi_3m", "Forecast Price 3M", "Expected ROI 3M"),
+    ("forecast_price_12m", "expected_roi_12m", "Forecast Price 12M", "Expected ROI 12M"),
+])
+@pytest.mark.parametrize("numeric_string", ["0.2", "2e-1"])
+def test_coherent_numeric_string_returns_are_numeric_in_actual_raw_writer(
+        monkeypatch, price_field, return_field, price_header, return_header, numeric_string):
+    row = {"symbol": "SYNTH.US", "current_price": "100", price_field: "120",
+           return_field: numeric_string, return_header: numeric_string}
+    original = copy.deepcopy(row)
+    displayed = present_instrument_row(row)
+    assert displayed[return_field] == displayed[return_header] == 0.2
+    assert type(displayed[return_field]) is float
+    api = FakeSheetsAPI()
+    monkeypatch.setattr(sheets, "get_sheets_service", lambda: api)
+    monkeypatch.setattr(sheets._CONFIG, "use_batch_update", True)
+    headers = ["Symbol", "Current Price", price_header, return_header, "Warnings"]
+    _, matrix = sheets.rows_to_grid(headers, [row])
+    sheets.write_grid_chunked("SYNTHETIC_BOOK", "Global_Markets", "A5", [headers] + matrix)
+    body = api.requests[0]["body"]
+    assert body["valueInputOption"] == "RAW"
+    assert type(body["data"][0]["values"][1][3]) is float
+    assert body["data"][0]["values"][1][3] == 0.2
+    assert row == original
+    assert present_instrument_row(displayed) == displayed
+
+
+def test_finite_price_ratio_overflow_never_certifies_derived_return():
+    row = {"symbol": "SYNTH.US", "current_price": 1e-300, "forecast_price_12m": 1e300,
+           "expected_roi_12m": 0.2}
+    original = copy.deepcopy(row)
+    displayed = present_instrument_row(row)
+    assert displayed["expected_roi_12m"] is None
+    assert "sheet_tuple_unknown:expected_roi_12m" in displayed["warnings"]
+    headers = ["Symbol", "Current Price", "Forecast Price 12M", "Expected ROI 12M", "Warnings"]
+    _, matrix = sheets.rows_to_grid(headers, [row])
+    assert matrix[0][3] is None
+    assert row == original
+
+
 def test_actual_refresh_preservation_cannot_resurrect_unknown_margin(monkeypatch):
     api = FakeSheetsAPI()
     headers = ["Symbol", "Current Price", "Profit Margin", "Position Qty", "Warnings"]
