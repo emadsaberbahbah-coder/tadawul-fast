@@ -162,7 +162,7 @@ HAND = [
 
 
 def run_all():
-    T("S0 delivered version", pa.PORTFOLIO_ACTIONS_VERSION == "1.14.0", pa.PORTFOLIO_ACTIONS_VERSION)
+    T("S0 delivered version", pa.PORTFOLIO_ACTIONS_VERSION == "1.14.1", pa.PORTFOLIO_ACTIONS_VERSION)
     base = None
     if BASE and os.path.exists(BASE):
         spec = importlib.util.spec_from_file_location("pa_base_v1130", BASE)

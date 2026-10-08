@@ -346,6 +346,8 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 import logging
+
+from core.secret_redaction import safe_error_text
 logger = logging.getLogger("core.analysis.portfolio_actions")
 
 # -----------------------------------------------------------------------------
@@ -816,7 +818,13 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.14.0"
+PORTFOLIO_ACTIONS_VERSION = "1.14.1"
+
+# v1.14.1 (TFB-09): an unknown venue or failed completed-session lookup
+# cannot grant ADD confirmation under explicit enforce mode. The live count
+# and date stay untouched; protective non-ADD outcomes retain their behavior.
+# Off remains legacy policy. Observe keeps that verdict but marks unavailable
+# shadow evidence instead of substituting a US calendar or a UTC day.
 # v1.13.1 (2026-09-30) - [P-153 SUKUK ROW: NO EQUITY LADDER ON A FIXED-INCOME
 # HOLDING] DISPLAY TRUTH ON THE PORTFOLIO_DECISION ROW
 # WHY: every RULE in this file already stands down for a SUKUK-class
@@ -1186,8 +1194,8 @@ def _confirm_persist_enabled():
 def _add_confirm_failclosed_enabled():
     """v1.12.2 [P-165] kill-switch reader - DEFAULT ON (fail-closed).
     TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN=1/true/on/yes restores the v1.12.1
-    error path (an exception inside the confirmation gate returns the raw
-    verdict) byte-identically. Never raises."""
+    generic error path (a store/gate exception returns the raw verdict).
+    Explicitly enforced calendar unavailability stays closed. Never raises."""
     try:
         return (os.getenv("TFB_PF_ADD_CONFIRM_LEGACY_FAILOPEN") or "0") \
             .strip().lower() not in ("1", "true", "on", "yes")
@@ -2197,6 +2205,7 @@ _CONFIRM_SESSION_VENUES = {
     "GULF": ((6, 0, 1, 2, 3), 12, 0),   # Doha/Kuwait/Manama/Muscat/Cairo/Amman/TASE
 }
 _CONFIRM_SESSION_SUFFIX = {
+    "US": "US",
     "SR": "KSA",
     "QA": "GULF", "KW": "GULF", "BH": "GULF", "OM": "GULF", "CA": "GULF",
     "EG": "GULF", "JO": "GULF", "TA": "GULF",
@@ -2227,6 +2236,10 @@ _ADD_CONFIRM_SESSION_STORE = {}          # observe-mode shadow chain (memory)
 _CONFIRM_SESSION_SHADOW_NS = "~S~"       # Redis namespace inside the same prefix
 
 
+class ConfirmCalendarUnavailable(RuntimeError):
+    """A completed-session clock could not be established for confirmation."""
+
+
 def _env_confirm_session_mode():
     """v1.13.0 [P-168b]: off | observe | enforce, read at call time (no
     restart; read-back = the [confirm-session-observe] tags / the
@@ -2237,26 +2250,50 @@ def _env_confirm_session_mode():
 
 
 def _confirm_venue(sym):
-    """Venue code from the symbol suffix; bare symbols and unknown suffixes
-    are US (the broker's default venue for this book)."""
+    """Resolve known suffixes; bare symbols retain the book's US convention.
+
+    An unrecognized explicit suffix supplies no completed-session evidence.
+    This bounded mapping is not a canonical instrument/MIC registry.
+    """
     s = str(sym or "").strip().upper()
+    if not s:
+        raise ConfirmCalendarUnavailable("missing symbol venue")
     if "." in s:
-        return _CONFIRM_SESSION_SUFFIX.get(s.rsplit(".", 1)[1], "US")
+        suffix = s.rsplit(".", 1)[1]
+        venue = _CONFIRM_SESSION_SUFFIX.get(suffix)
+        if venue is None:
+            detail = safe_error_text("unknown venue suffix %s" % (suffix or "<blank>"), limit=400)
+            raise ConfirmCalendarUnavailable(detail)
+        return venue
     return "US"
 
 
+def _confirm_calendar_definition(venue):
+    try:
+        return _CONFIRM_SESSION_VENUES[venue]
+    except (KeyError, TypeError):
+        raise ConfirmCalendarUnavailable("unsupported session calendar") from None
+
+
 def _confirm_session_holidays(venue):
+    _confirm_calendar_definition(venue)
     hol = set(_CONFIRM_SESSION_HOLIDAYS.get(venue, ()))
     extra = str(os.environ.get("TFB_PF_SESSION_HOLIDAYS", "") or "")
     for tok in extra.replace(";", ",").split(","):
         tok = tok.strip()
-        if len(tok) == 10 and tok[4] == "-" and tok[7] == "-":
-            hol.add(tok)
+        if not tok:
+            continue
+        try:
+            if datetime.strptime(tok, "%Y-%m-%d").date().isoformat() != tok:
+                raise ValueError("noncanonical date")
+        except ValueError:
+            raise ConfirmCalendarUnavailable("invalid configured session holiday") from None
+        hol.add(tok)
     return hol
 
 
 def _confirm_is_session_day(venue, d, holidays=None):
-    wd, _h, _m = _CONFIRM_SESSION_VENUES.get(venue, _CONFIRM_SESSION_VENUES["US"])
+    wd, _h, _m = _confirm_calendar_definition(venue)
     if d.weekday() not in wd:
         return False
     hol = holidays if holidays is not None else _confirm_session_holidays(venue)
@@ -2265,20 +2302,21 @@ def _confirm_is_session_day(venue, d, holidays=None):
 
 def _confirm_session_key(venue, now_utc=None):
     """ISO date of the venue's most recent COMPLETED session at now_utc."""
-    now = now_utc or datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) if now_utc is None else now_utc
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
-    _wd, ch, cm = _CONFIRM_SESSION_VENUES.get(venue, _CONFIRM_SESSION_VENUES["US"])
+    _wd, ch, cm = _confirm_calendar_definition(venue)
     hol = _confirm_session_holidays(venue)
     d = now.date()
-    if not ((now.hour, now.minute) >= (ch, cm) and _confirm_is_session_day(venue, d, hol)):
+    if (now.hour, now.minute) >= (ch, cm) and _confirm_is_session_day(venue, d, hol):
+        return d.isoformat()
+    d = d - timedelta(days=1)
+    for _ in range(14):
+        if _confirm_is_session_day(venue, d, hol):
+            return d.isoformat()
         d = d - timedelta(days=1)
-        for _ in range(14):
-            if _confirm_is_session_day(venue, d, hol):
-                break
-            d = d - timedelta(days=1)
-    return d.isoformat()
+    raise ConfirmCalendarUnavailable("no completed session within lookup window")
 
 
 def _confirm_prev_session(venue, key):
@@ -2289,15 +2327,15 @@ def _confirm_prev_session(venue, key):
         if _confirm_is_session_day(venue, d, hol):
             return d.isoformat()
         d = d - timedelta(days=1)
-    return d.isoformat()
+    raise ConfirmCalendarUnavailable("no previous session within lookup window")
 
 
 def _confirm_clock(sym, now_utc=None):
     """v1.13.0 [P-168b]: (today_key, yesterday_key, basis). off/observe ->
     the legacy UTC-date pair (v1.12.2 verbatim; the legacy helper's own
     exceptions propagate exactly as before). enforce -> the venue's last
-    completed session and the session before it; a calendar fault falls
-    back to the legacy pair for that call (one WARNING)."""
+    completed session and the session before it. An unavailable enforced
+    calendar raises before any live confirmation state can advance."""
     if _env_confirm_session_mode() != "enforce":
         return (_add_confirm_today(),
                 (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
@@ -2306,18 +2344,11 @@ def _confirm_clock(sym, now_utc=None):
         venue = _confirm_venue(sym)
         key = _confirm_session_key(venue, now_utc)
         return key, _confirm_prev_session(venue, key), "session"
+    except ConfirmCalendarUnavailable:
+        raise
     except Exception as exc:
-        try:
-            logger.warning("[CONFIRM-SESSION v%s] %s: calendar fault %s: %s "
-                           "- legacy UTC day key used this call",
-                           PORTFOLIO_ACTIONS_VERSION,
-                           str(sym or "").strip().upper(),
-                           exc.__class__.__name__, exc)
-        except Exception:
-            pass
-        return (_add_confirm_today(),
-                (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
-                "utc")
+        raise ConfirmCalendarUnavailable("calendar computation failed: %s"
+                                         % safe_error_text(exc, limit=600)) from exc
 
 
 def _confirm_session_shadow_count(sym, venue, now_utc=None):
@@ -2383,12 +2414,14 @@ def _apply_confirm_session_observe(cand, raw_action, action, reason,
                   " - FLIP" if flip else ""))
         return ("%s; %s" % (reason, tag)) if reason else tag
     except Exception as exc:
+        detail = safe_error_text(exc, limit=600)
         try:
-            logger.warning("[CONFIRM-SESSION v%s] observe tag skipped: %s: %s",
-                           PORTFOLIO_ACTIONS_VERSION, exc.__class__.__name__, exc)
+            logger.warning("[CONFIRM-SESSION v%s] observe evidence unavailable: %s",
+                           PORTFOLIO_ACTIONS_VERSION, detail)
         except Exception:
             pass
-        return reason
+        tag = ("[confirm-session-observe] session evidence unavailable: %s; legacy clock kept" % detail)
+        return ("%s; %s" % (reason, tag)) if reason else tag
 
 
 def _confirm_session_meta():
@@ -2402,7 +2435,8 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
     """Returns (action, reason, capped_from) with the confirmation gate
     applied. Non-ADD outcomes reset the symbol's clock. Never raises.
     v1.12.2 [P-165]: an exception on an ADD verdict fails CLOSED (HOLD,
-    capped_from=ADD, clock untouched) unless the legacy kill-switch is set."""
+    capped_from=ADD, clock untouched) unless the legacy kill-switch is set.
+    v1.14.1: an unavailable enforced calendar remains closed with that switch."""
     _fc = _add_confirm_failclosed_enabled()   # v1.12.2 [P-165]
     try:
         days = int(controls.get("add_confirm_days") or 0)
@@ -2475,21 +2509,23 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
         # v1.12.2 [P-165] (a): the raw verdict must never upgrade through
         # the error path. ADD -> HOLD fail-closed (clock untouched); any
         # non-ADD verdict returns unchanged (never suppress TRIM/EXIT/BLOCK).
-        if not _fc or action != ACTION_ADD:
+        _calendar_unavailable = isinstance(exc, ConfirmCalendarUnavailable)
+        if action != ACTION_ADD or (not _fc and not _calendar_unavailable):
             return action, reason, capped_from
         _exc = exc.__class__.__name__
+        _detail = safe_error_text(exc, limit=600)
         try:
             logger.warning("[CONFIRM-FAILCLOSED v%s] %s: %s: %s - ADD held "
                            "HOLD fail-closed this run (clock untouched)",
                            PORTFOLIO_ACTIONS_VERSION,
-                           str(symbol or "").strip().upper(), _exc, exc)
+                           safe_error_text(str(symbol or "").strip(), limit=256), _exc, _detail)
         except Exception:
             pass
         return (ACTION_HOLD,
                 "ADD held fail-closed [confirm-failclosed:%s] — the "
                 "confirmation gate raised; no funding this run, the "
-                "confirmation clock is untouched; qualifying: %s"
-                % (_exc, reason),
+                "confirmation clock is untouched; %squalifying: %s"
+                % (_exc, ("calendar unavailable: %s; " % _detail) if _calendar_unavailable else "", reason),
                 ACTION_ADD)
 
 
