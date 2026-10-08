@@ -167,6 +167,8 @@ def certify_portfolio_inputs(holdings: list, evidence: Any, fx_rates: dict | Non
             for position in _list(account.get("positions"), MAX_POSITIONS):
                 if not isinstance(position, dict):
                     raise AccountingError("invalid_position")
+                if "account_id" in position and _text(position["account_id"], "position account_id") != aid:
+                    raise AccountingError("conflicting_position_account")
                 key = (aid, _text(position.get("instrument_id"), "instrument_id"))
                 if key in positions:
                     raise AccountingError("duplicate_positions")
@@ -275,6 +277,8 @@ def certify_portfolio_inputs(holdings: list, evidence: Any, fx_rates: dict | Non
                 for cash in cash_rows:
                     if not isinstance(cash, dict):
                         raise AccountingError("invalid_cash")
+                    if "account_id" in cash and _text(cash["account_id"], "cash account_id") != aid:
+                        raise AccountingError("conflicting_cash_account")
                     ccy = _native_currency(cash.get("currency"))
                     if ccy in seen:
                         raise AccountingError("duplicate_cash_currency")

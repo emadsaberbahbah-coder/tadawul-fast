@@ -260,38 +260,22 @@ def _tags(a):
 
 
 @pytest.mark.skipif(not os.getenv("TFB_TEST_MP_TSV"), reason="set TFB_TEST_MP_TSV to a My_Portfolio TSV export")
-def test_t9_integration_real_holdings(monkeypatch):
+def test_t9_integration_real_holdings_require_reconciliation_before_session_policy(monkeypatch):
     rows = _rows(os.environ["TFB_TEST_MP_TSV"])
-    when = T(2026, 9, 28, 3, 40)
-    # off
-    _reset(monkeypatch)
-    pa._ADD_CONFIRM_STORE["DDI.US"] = {"count": 1, "date": "2026-09-27"}
-    with _Clock(when):
-        off = pa.build_portfolio_actions(rows, LIVE_PANEL, FX)
-    assert "confirm_session" not in off["meta"]
-    # observe
-    _reset(monkeypatch, "observe")
-    pa._ADD_CONFIRM_STORE["DDI.US"] = {"count": 1, "date": "2026-09-27"}
-    with _Clock(when):
-        obs = pa.build_portfolio_actions(rows, LIVE_PANEL, FX)
-    assert _verdicts(obs) == _verdicts(off)
-    assert obs["kpis"]["adds_funded_sar"] == off["kpis"]["adds_funded_sar"]
-    raw_add = [a["symbol"] for a in obs["actions"] if _tags(a)]
-    assert raw_add == ["DDI.US"] and all(_tags(a) == 2 for a in obs["actions"] if a["symbol"] == "DDI.US")
-    assert " - FLIP" in [a for a in obs["actions"] if a["symbol"] == "DDI.US"][0]["action_reason"]
-    assert obs["meta"]["confirm_session"]["mode"] == "observe"
-    # enforce, Monday pre-open, Sunday's run already keyed on the Friday session
-    _reset(monkeypatch, "enforce")
-    pa._ADD_CONFIRM_STORE["DDI.US"] = {"count": 1, "date": "2026-09-25"}
-    with _Clock(when):
-        enf = pa.build_portfolio_actions(rows, LIVE_PANEL, FX)
-    ddi = [a for a in enf["actions"] if a["symbol"] == "DDI.US"][0]
-    assert ddi["action"] == HOLD and (ddi.get("detail") or {}).get("capped_from") == ADD
-    assert "session 2026-09-25" in ddi["action_reason"]
-    assert (enf["kpis"]["adds_funded_sar"] or 0) == 0
-    assert {al["type"]: al["count"] for al in enf["alerts"]}.get("add_confirmation_pending") == 1
-    with _Clock(T(2026, 9, 29, 0, 40)):
-        tue = pa.build_portfolio_actions(rows, LIVE_PANEL, FX)
-    ddi2 = [a for a in tue["actions"] if a["symbol"] == "DDI.US"][0]
-    assert ddi2["action"] == ADD and "session 2026-09-28" in ddi2["action_reason"]
-    assert (tue["kpis"]["adds_funded_sar"] or 0) > 0
+    # A historical sheet export supplies no current account positions or
+    # settled cash. Calendar policy cannot certify those missing inputs.
+    # Synthetic complete-evidence callers retain the policy regression in
+    # test_pf_confirm_calendar_failclosed.py.
+    for mode in (None, "observe", "enforce"):
+        _reset(monkeypatch, mode)
+        original = {"count": 1, "date": "2026-09-27"}
+        pa._ADD_CONFIRM_STORE["DDI.US"] = dict(original)
+        with _Clock(T(2026, 9, 28, 3, 40)):
+            payload = pa.build_portfolio_actions(rows, LIVE_PANEL, FX)
+        assert payload["status"] == "ok" and payload["meta"]["execution_ready"] is False
+        assert payload["meta"]["input_certification"]["funding_eligible"] is False
+        assert payload["meta"]["input_certification"]["reason_counts"]["missing_evidence"]
+        assert all(row["action"] == pa.ACTION_BLOCK for row in payload["actions"])
+        assert payload["kpis"]["adds_funded_sar"] == 0
+        assert payload["kpis"]["portfolio_value_sar"] is None
+        assert pa._ADD_CONFIRM_STORE["DDI.US"] == original

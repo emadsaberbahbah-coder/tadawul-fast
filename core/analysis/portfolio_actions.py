@@ -349,6 +349,9 @@ import logging
 
 from core.secret_redaction import safe_error_text
 from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+from core.portfolio_reconciliation import MAX_HOLDINGS, certify_portfolio_inputs, certification_summary
+from core.execution_accounting import AccountingError, _number
+from decimal import Decimal, localcontext
 logger = logging.getLogger("core.analysis.portfolio_actions")
 
 # -----------------------------------------------------------------------------
@@ -819,7 +822,13 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.14.2"
+PORTFOLIO_ACTIONS_VERSION = "1.15.0"
+
+# v1.15.0: current holding membership and available funding require a fresh,
+# explicitly account-scoped position/cash capture. Missing evidence produces
+# renderable BLOCK research rows, never trusted HOLD/ADD or stale preservation.
+# Only settled cash after complete reservations funds adds; proposed sales
+# remain estimates until a later declared cash capture proves settlement.
 
 # v1.14.2: preserve exact ASCII US share-class dots (BRK.B / BF.B / HEI.A).
 # Known calendar suffixes take precedence; registered exchange suffixes with
@@ -3492,7 +3501,108 @@ def build_portfolio_actions(rows, controls=None, fx_rates=None,
         return _json_sanitize(sk)
 
 
+def _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
+    """Renderable research rows without current NAV or execution instructions."""
+    result = _skeleton("ok", "portfolio inputs unverified; execution withheld", ctl)
+    row_states = {row["row_index"]: row for row in certification["row_results"]}
+    review_date = (datetime.now(timezone.utc) + timedelta(days=ctl["review_days"])).date().isoformat()
+    for index, raw in enumerate(rows[:MAX_HOLDINGS] if isinstance(rows, list) else []):
+        if not isinstance(raw, dict):
+            continue
+        cand = normalize_holding(raw, fx_rates, ctl)
+        state = row_states.get(index, {"trusted": False, "status": "invalid_evidence"})
+        # Retain the observed sheet identity/quantity; none is asserted to be a
+        # reconciled current portfolio amount. A mismatch cannot print a plan.
+        for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop", "tp1", "tp2"):
+            cand[key] = None
+        reason = "RECONCILIATION_REQUIRED: " + (state["status"] if not state["trusted"] else
+            ", ".join(sorted(certification["reason_counts"])) or "portfolio_inputs_unverified")
+        entry = {"cand": cand, "action": ACTION_BLOCK, "action_reason": reason,
+                 "proceeds_sar": 0.0, "capped_from": None, "weight_pct": None,
+                 "sector_weight_pct": None, "confidence_band": _ob.confidence_band(cand.get("reliability")),
+                 "suggested_delta_sar": 0.0, "suggested_delta_shares": 0, "funds_from": None}
+        rendered = _action_row(entry, review_date, ctl)
+        rendered["detail"]["position_evidence_matched"] = bool(state["trusted"])
+        rendered["detail"]["reconciliation_status"] = state["status"]
+        rendered["detail"]["execution_ready"] = False
+        result["actions"].append(rendered)
+    counts = {action: 0 for action in ACTIONS}
+    counts[ACTION_BLOCK] = len(result["actions"])
+    result["kpis"].update({"positions": len(result["actions"]), "action_counts": counts,
+                           "deployable_sar": 0.0, "proceeds_pending_sar": 0.0,
+                           "adds_funded_sar": 0.0, "capital_unallocated_sar": 0.0})
+    result["alerts"] = [{"type": "portfolio_inputs_unverified", "unit": "count", "count": max(1, len(result["actions"])),
+                         "required_action": "Reconcile account-scoped positions, fresh settled cash/reservations, FX and market quotes before acting; no ledger or order was changed"}]
+    result["meta"].update({"execution_ready": False, "input_certification": certification_summary(certification),
+                          "funding_basis": "settled_cash_after_reservations", "upstream": upstream_meta,
+                          "counts": {"rows_in": len(rows) if isinstance(rows, list) else 0, "normalized": len(result["actions"])}})
+    return result
+
+
 def _build(rows, ctl, fx_rates, upstream_meta):
+    upstream = dict(upstream_meta) if isinstance(upstream_meta, dict) else {}
+    evidence = upstream.pop("reconciliation_evidence", None)
+    certification = certify_portfolio_inputs(rows, evidence, fx_rates)
+    if upstream.get("holdings_input_incomplete") or (ctl["max_holdings"] and len(rows) > ctl["max_holdings"]):
+        certification["funding_eligible"] = False
+        certification["holdings_certified"] = False
+        certification["status"] = "withheld"
+        certification["reason_counts"]["holdings_input_incomplete"] = 1
+    if certification["funding_eligible"]:
+        with localcontext() as context:
+            context.prec = 512
+            requested = Decimal(str(ctl["cash_available_sar"] or 0)).quantize(Decimal(".01"))
+            available = Decimal(certification["certified_cash_available_sar_exact"]).quantize(Decimal(".01"))
+        if requested != available:
+            certification["funding_eligible"] = False
+            certification["cash_certified"] = False
+            certification["status"] = "withheld"
+            certification["reason_counts"]["cash_request_mismatch"] = 1
+    if certification["funding_eligible"]:
+        for raw in rows:
+            cand = normalize_holding(raw, fx_rates, ctl)
+            ccy = cand.get("currency")
+            try:
+                expected_fx = Decimal(1) if ccy == "SAR" else _number(fx_rates.get(ccy), "FX")
+                if _number(cand.get("fx_to_sar"), "holding FX") != expected_fx:
+                    raise AccountingError("holding FX mismatch")
+                for key, value in raw.items():
+                    if (_ob._norm_token(key) in {"fxtosar", "fxrate", "fxratetosar", "sarfx"}
+                            and value not in (None, "") and _number(value, "row FX") != expected_fx):
+                        raise AccountingError("row FX mismatch")
+            except AccountingError:
+                certification["funding_eligible"] = False
+                certification["reason_counts"]["holding_fx_mismatch"] = certification["reason_counts"].get("holding_fx_mismatch", 0) + 1
+            # The deployed OB guard requires successful acquisition AND an
+            # actual market quote instant. Old normalizers lack that receipt
+            # and cannot silently restore the legacy retrieval-time fallback.
+            proof = cand.get("quote_evidence") or {}
+            quote_ok = False
+            if proof.get("status") == "SUCCESS" and proof.get("quote_asof"):
+                try:
+                    quote_ok, _message, _detail = _ob._quote_freshness_assessment(cand)
+                except Exception:
+                    quote_ok = False
+            if not quote_ok:
+                certification["funding_eligible"] = False
+                certification["reason_counts"]["holding_quote_unverified"] = certification["reason_counts"].get("holding_quote_unverified", 0) + 1
+        if not certification["funding_eligible"]:
+            certification["status"] = "withheld"
+    if not certification["funding_eligible"]:
+        return _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
+    effective = dict(ctl)
+    effective["cash_available_sar"] = certification["certified_cash_available_sar"]
+    effective["rebalance_mode"] = REBALANCE_NEW_CASH
+    result = _build_verified(rows, effective, fx_rates, upstream)
+    result["meta"].update({"execution_ready": True, "input_certification": certification_summary(certification),
+                          "funding_basis": "settled_cash_after_reservations",
+                          "requested_rebalance_mode": ctl["rebalance_mode"]})
+    for row in result["actions"]:
+        row["detail"].update({"position_evidence_matched": True, "reconciliation_status": "matched", "execution_ready": True})
+    return result
+
+
+def _build_verified(rows, ctl, fx_rates, upstream_meta):
     if ctl["max_holdings"] and len(rows) > ctl["max_holdings"]:
         rows = rows[:ctl["max_holdings"]]
     cash = ctl["cash_available_sar"] or 0.0

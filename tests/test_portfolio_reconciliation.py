@@ -205,6 +205,15 @@ def test_minor_currency_token_never_becomes_major_currency_even_with_matching_ra
     packet["accounts"][0]["cash"][0]["currency"] = "GBp"
     packet["fx_rates"].append({"currency": "GBP", "rate_to_sar": 4, "asof": STAMP, "source_ref": "synthetic://FX"})
     assert not certify_portfolio_inputs(ROWS, packet, dict(FX, GBP=4), now=NOW)["funding_eligible"]
+
+
+@pytest.mark.parametrize("scope", ["positions", "cash"])
+def test_explicit_record_account_cannot_disagree_with_its_capture_scope(scope):
+    packet = evidence()
+    packet["accounts"][0][scope][0]["account_id"] = "synthetic-other-account"
+    result = certify(packet)
+    assert not result["funding_eligible"] and result["certified_cash_available_sar"] == 0
+    assert "synthetic-other-account" not in json.dumps(certification_summary(result))
     packet = evidence()
     packet["accounts"][0]["cash_complete"] = 1
     assert not certify(packet)["funding_eligible"]
