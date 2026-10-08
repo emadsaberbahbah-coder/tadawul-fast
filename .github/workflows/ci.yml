@@ -2,7 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.0 (2026-10-09) -- POSITION, CASH AND OUTCOME EVIDENCE
+# VERSION 1.1.1 (2026-10-09) -- FINAL WRITER PRESENTATION
+#
+# v1.1.1: guard restored market rows at both writers; explicit empty cells
+# clear withheld presentation facts under Google Sheets RAW semantics.
+# Intraday prices require actual quote evidence, preserve mixed-row distrust,
+# and recheck the full current row before each atomic cell batch.
 #
 # v1.1.0: require account-scoped reconciliation, executable quote-asof,
 # display-unit/coherence, complete calendar and outcome-price regressions.
@@ -343,6 +348,8 @@ jobs:
             tests/test_ob_quote_evidence.py \
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
+            tests/test_sync_sheet_presentation.py \
+            tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
             tests/test_outcome_price_evidence.py \
             tests/test_portfolio_blank_fee_witness.py \
