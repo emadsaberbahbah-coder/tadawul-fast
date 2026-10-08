@@ -105,8 +105,11 @@ from zoneinfo import ZoneInfo
 # fixture.
 # v1.1.2: validate sticky dates per field, retain either future event, and
 # preserve a carried record's original source/as-of instead of stamping it now.
-__version__ = "1.1.2"
+# v1.1.3: retain canonical hyphenated/class symbols, read the bounded full
+# prior event table, and label missing event facts without inventing an as-of.
+__version__ = "1.1.3"
 _RIYADH = ZoneInfo("Asia/Riyadh")
+_MAX_CALENDAR_BODY_ROWS = 5000
 
 HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
            "Next Ex-Div Date", "Days To ExDiv", "Updated At (Riyadh)", "Source"]
@@ -120,8 +123,11 @@ def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
-# v1.1.1: the pit_snapshot v1.0.1 ticker shape — one invariant, two scripts.
-_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}\.[A-Z]{1,4}$")
+# A venue suffix remains mandatory: cockpit headings/counts are not symbols.
+# Canonical class/unit roots include GRT-UN.TO and BRK.B.US, not just letters.
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}(?:[-.][A-Z0-9]{1,3})?\.[A-Z]{1,4}$")
+_UNKNOWN_EVENT_NOTE_RE = re.compile(
+    r"\s*\[events unknown:(?:earnings|ex-div)(?:/(?:earnings|ex-div))?\]")
 
 
 def _ticker_guard_enabled() -> bool:
@@ -346,11 +352,12 @@ def build_rows(symbols: List[str],
     rows: List[List[Any]] = []
     for s in symbols:
         c = ctx.get(s) or {}
-        e, x = c.get("next_earnings_date"), c.get("next_ex_div_date")
+        e, x = _future_date(c.get("next_earnings_date")), _future_date(c.get("next_ex_div_date"))
         row_src, row_stamp = source, stamp if (e or x) else ""
         if s in carried:
             row_stamp = _prior_asof(c.get("_carried_asof"))
-            prior_source = str(c.get("_carried_source") or "").strip().removesuffix(" +carried")
+            prior_source = _UNKNOWN_EVENT_NOTE_RE.sub(
+                "", str(c.get("_carried_source") or "")).strip().removesuffix(" +carried")
             prior_source = prior_source or "prior source unknown"
             fields = set(str(c.get("_carried_fields") or "").split(","))
             fresh = [label for key, d, label in (("e", e, "earnings"), ("x", x, "ex-div"))
@@ -360,6 +367,14 @@ def build_rows(symbols: List[str],
                 row_src = f"fresh {'/'.join(fresh)}: {source}; carried {old}: {prior_source} +carried"
             else:
                 row_src = prior_source + " +carried"
+        # Missing facts are not a neutral event result or a successful lookup.
+        # This is derived row status, not provider provenance; remove the prior
+        # annotation on roundtrip so newly known fields do not retain old status.
+        unknown = [label for d, label in ((e, "earnings"), (x, "ex-div")) if not d]
+        if unknown:
+            suffix = " +carried" if row_src.endswith(" +carried") else ""
+            row_src = row_src.removesuffix(suffix) if suffix else row_src
+            row_src += f" [events unknown:{'/'.join(unknown)}]" + suffix
         rows.append([s, e or "", _days_until(e), x or "", _days_until(x),
                      row_stamp, row_src])
     return rows
@@ -424,13 +439,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"WARN: provider failed ({e}) — writing blank dates")
         ctx, source = {}, f"provider error — blank dates"
 
-    # v1.1.0: sticky merge against the tab's prior state (read once, early).
+    # Read one sentinel row beyond the supported full table. Never replace a
+    # truncated prior table: that would erase unseen future sticky events.
     prior: Dict[str, Dict[str, str]] = {}
+    prior_extent = 0
     try:
-        prior = parse_prior(book.worksheet(tab).get("A1:H400"))
+        prior_sheet = book.worksheet(tab)
+        allocated_rows = getattr(prior_sheet, "row_count", None)
+        if isinstance(allocated_rows, int) and allocated_rows > _MAX_CALENDAR_BODY_ROWS + 1:
+            _out("ERROR: prior calendar grid exceeds bounded full-table capacity — preserving tab")
+            return 2
+        read_rows = allocated_rows if isinstance(allocated_rows, int) and allocated_rows > 0 \
+            else _MAX_CALENDAR_BODY_ROWS + 2
+        prior_values = prior_sheet.get(f"A1:G{read_rows}")
+        if len(prior_values) > _MAX_CALENDAR_BODY_ROWS + 1:
+            _out("ERROR: prior calendar exceeds bounded full-table capacity — preserving tab")
+            return 2
+        prior_extent = max(min(read_rows, _MAX_CALENDAR_BODY_ROWS + 1), len(prior_values))
+        prior = parse_prior(prior_values)
     except Exception as e:
         _out(f"WARN: prior-tab read failed ({e}) — no carry this run")
+        if write and type(e).__name__ != "WorksheetNotFound":
+            _out("ERROR: cannot establish prior event provenance — preserving tab")
+            return 2
     symbols, ctx, carried, n_fill, n_res = apply_sticky(symbols, ctx, prior)
+    if len(symbols) > _MAX_CALENDAR_BODY_ROWS:
+        _out("ERROR: merged calendar exceeds bounded full-table capacity — preserving tab")
+        return 2
     rows = build_rows(symbols, ctx, source, carried)
     filled = sum(1 for r in rows if r[1] or r[3])
     _out(f"rows: {len(rows)} | with at least one date: {filled} | "
@@ -449,7 +484,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             ws = book.add_worksheet(title=tab, rows=1000, cols=len(HEADERS))
         ws.update(values=[HEADERS], range_name="A1")
-        ws.batch_clear([f"A2:G{max(1000, len(rows) + 1)}"])
+        ws.batch_clear([f"A2:G{max(1000, len(rows) + 1, prior_extent)}"])
         ws.update(values=rows, range_name=f"A2:G{len(rows) + 1}",
                   value_input_option="RAW")
         try:
@@ -504,7 +539,7 @@ def _selftest() -> int:
     checks.append(("rows: carried marked, days computed",
                    by["EXE.US"][6].endswith("+carried")
                    and by["EXE.US"][2] == 6
-                   and by["NEW.US"][6] == "eodhd v1.2.0"))
+                   and by["NEW.US"][6] == "eodhd v1.2.0 [events unknown:ex-div]"))
     # --- v1.1.1: the exact 2026-07-22 production leak, both guard states ---
     leak_page = [["Rank", "Symbol", "Name"],
                  ["1", "1050.SR", "BSF"],
@@ -538,9 +573,11 @@ def _selftest() -> int:
                    and "FORECAST" in p_off and "402" in p_off
                    and parse_prior.junk_purged == 0))
     os.environ.pop("TFB_CALENDAR_TICKER_GUARD", None)
-    checks.append(("shape edge cases: suffix required, 8+dot+4 bound",
+    checks.append(("shape edge cases: suffix required, bounded canonical class roots",
                    _is_ticker_shaped("1050.SR") and _is_ticker_shaped("0405.HK")
                    and _is_ticker_shaped("MPHASIS.NS")
+                   and _is_ticker_shaped("GRT-UN.TO")
+                   and _is_ticker_shaped("BRK.B.US")
                    and not _is_ticker_shaped("FICO")
                    and not _is_ticker_shaped("GC=F")
                    and not _is_ticker_shaped("BRK-B")

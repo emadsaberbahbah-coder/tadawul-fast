@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.12.2 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
@@ -1569,7 +1569,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.12.2';
+var DT10_VERSION = '1.13.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -4135,48 +4135,70 @@ function dt10HardVerdictStrict_() {
     return true;
   }
 }
-/** v1.6.0 (W-3): PURE — {SYMBOL: daysToEarnings} from a raw Calendar_Events
- * matrix. Header row = the one whose cells contain 'symbol'; the days come
- * from the 'Days To Earnings' column; only finite values >= 0 are kept
- * (blank, junk, and past dates never tag). */
-function dt10EarningsMapFromValues_(values) {
+// Calendar_Events is a bounded facts table, not a cockpit-sized sample.
+var DT10_CALENDAR_MAX_ROWS = 5000; // body rows; overflow produces no annotation
+/** Calendar day as an integer UTC day. Dates represent spreadsheet instants
+ * in Riyadh (UTC+3); ISO date-only strings represent literal calendar dates.
+ * Reject rollover dates, timestamps in text cells, and numeric sheet serials.
+ * A missing observation is never interpreted as an event occurring today. */
+function dt10CalendarDay_(value) {
+  var text, shifted;
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (!isFinite(value.getTime())) return null;
+    shifted = new Date(value.getTime() + 3 * 60 * 60 * 1000);
+    text = shifted.toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    text = value.trim();
+  } else {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || text.slice(0, 4) === '0000') return null;
+  var parsed = new Date(text + 'T00:00:00.000Z');
+  if (!isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== text) {
+    return null;
+  }
+  return Math.floor(parsed.getTime() / 86400000);
+}
+/** PURE — {SYMBOL: daysToEarnings} from dated Calendar_Events facts. The
+ * consumer derives days for its current Riyadh date, so a yesterday counter
+ * cannot survive midnight. Blank/invalid dates never fall back to a counter. */
+function dt10EarningsMapFromValues_(values, asOfDate) {
   var map = {};
   if (!values || !values.length) return map;
-  var iSym = -1, iDays = -1, r, c, cells, tok;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, r, c, cells, tok, rowSym, rowDate;
   for (r = 0; r < values.length && iSym < 0; r++) {
     cells = values[r] || [];
+    rowSym = -1; rowDate = -1;
     for (c = 0; c < cells.length; c++) {
       tok = dt10NormToken_(cells[c]);
-      if (tok === 'symbol') iSym = c;
-      else if (tok === 'daystoearnings') iDays = c;
+      if (tok === 'symbol') rowSym = c;
+      else if (tok === 'nextearningsdate' || tok === 'earningsdate') rowDate = c;
     }
-    if (iSym >= 0 && iDays < 0) iSym = -1; // need both on the same row
+    if (rowSym >= 0 && rowDate >= 0) { iSym = rowSym; iDate = rowDate; }
   }
-  if (iSym < 0 || iDays < 0) return map;
+  if (iSym < 0 || iDate < 0) return map;
   for (; r < values.length; r++) {
     cells = values[r] || [];
     var sym = dt10NormSym_(cells[iSym]);
-    if (!sym || map.hasOwnProperty(sym)) continue;
-    // v1.8.3: a BLANK days cell must not coerce to 0 ("earnings today").
-    // Number('') === 0 passed the >=0 gate, so every Calendar_Events row
-    // with an empty Days-To-Earnings cell false-tagged its symbol with a
-    // same-day \u26a0 on the board — the exact case the v1.6.0 self-test
-    // fixture (JUNK.X) was written to catch, and did: 'earnings tag
-    // core: FAIL' on 2026-08-09 led straight here.
-    if (String(cells[iDays] === null || cells[iDays] === undefined ?
-               '' : cells[iDays]).trim() === '') continue;
-    var d = Number(cells[iDays]);
-    if (isFinite(d) && d >= 0) map[sym] = Math.floor(d);
+    if (!sym || sym === 'SYMBOL' || map.hasOwnProperty(sym)) continue;
+    var eventDay = dt10CalendarDay_(cells[iDate]);
+    if (eventDay !== null && eventDay >= today) map[sym] = eventDay - today;
   }
   return map;
 }
 /** v1.6.0 (W-3): live Calendar_Events read. ANY failure => empty map =>
  * zero tags — the annotation must never be able to break the render. */
-function dt10EarningsMap_(ss) {
+function dt10EarningsMap_(ss, asOfDate) {
   try {
     var sh = ss.getSheetByName('Calendar_Events');
     if (!sh) return {};
-    return dt10EarningsMapFromValues_(sh.getRange('A1:H200').getValues());
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 7);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10EarningsMapFromValues_(
+        sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
   } catch (eEm) {
     return {};
   }
@@ -6041,10 +6063,10 @@ function dt10SelfTest() {
                ['Symbol', 'Next Earnings Date', 'Days To Earnings'],
                ['EXE.US', '2026-07-28', 7],
                ['MRP.US', '2026-08-04', 14],
-               ['FAR.US', '2026-09-01', 15],
+               ['FAR.US', '2026-08-05', 15],
                ['JUNK.X', '', ''],
                ['OLD.US', '2026-07-01', -3]];
-  var eaMap = dt10EarningsMapFromValues_(eaFix);
+  var eaMap = dt10EarningsMapFromValues_(eaFix, '2026-07-21');
   var eaTk = [{ symbol: 'EXE.US', advisor_note: 'INVEST' },
               { symbol: 'MRP.US', advisor_note: 'grace' },
               { symbol: 'FAR.US', advisor_note: 'x' },
