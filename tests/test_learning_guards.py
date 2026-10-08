@@ -40,7 +40,7 @@ invented to make a function look tested:
      Regime was computed every run and overwritten every run.
 
   5. quarantine_placeholder_records.build_plan  (v1.0.0)
-  6. intraday_quote_refresh.plan_page_updates   (v1.0.1)
+  6. intraday_quote_refresh.plan_page_updates   (v1.0.2)
      Surgical repair/patch planners: both write into a live production
      workbook, so their refusal paths matter more than their happy paths.
 
@@ -59,6 +59,7 @@ import importlib.util
 import os
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -453,48 +454,81 @@ def test_quarantine_uses_the_existing_exclusion_status():
 
 
 # =========================================================================== #
-# 6. INTRADAY QUOTE PATCH PLANNER  (intraday_quote_refresh v1.0.1)            #
+# 6. INTRADAY QUOTE PATCH PLANNER  (intraday_quote_refresh v1.0.2)            #
 # =========================================================================== #
 pytestmark_iqr = pytest.mark.skipif(_IQR is None,
                                     reason="intraday refresh unavailable")
 
-_IQR_HDR = ["Symbol", "Name", "Current Price", "Last Updated (Riyadh)"]
-_IQR_PAGE = [_IQR_HDR,
-             ["AAPL", "Apple", "100.0", "2026-07-27 11:00:00"],
-             ["MSFT", "Microsoft", "380.0", "2026-07-27 11:00:00"],
-             ["ZZZZ", "Other", "5.0", "2026-07-27 11:00:00"]]
-_IQR_Q = {"AAPL": {"price": 333.02, "last_updated": "2026-07-27 13:45:00"},
-          "MSFT": {"price": 381.70, "last_updated": "2026-07-27 10:00:00"},
-          "NVDA": {"price": 206.84, "last_updated": "2026-07-27 13:45:00"}}
+@pytest.fixture
+def intraday_case(monkeypatch):
+    """Witnessed sources and declared Riyadh clocks; no provider/calendar I/O."""
+    from core.analysis import opportunity_builder as ob
+    now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(_IQR, "_clock", lambda: now)
+    monkeypatch.setattr(ob, "datetime", Clock)
+    monkeypatch.setattr(ob, "_venue_state", lambda *args: None)
+    monkeypatch.setenv("TFB_TICKET_MAX_QUOTE_AGE_MIN", "15")
+    header = ["Symbol", "Name", "Current Price", "Last Updated (Riyadh)",
+              "Currency", "Warnings", "Forecast Price (1M)", "Expected ROI (1M)"]
+    def stamp(minutes):
+        return (now - timedelta(minutes=minutes) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    page = [header, ["AAPL", "Apple", 100.0, stamp(10), "USD", "manual_note:keep", 110, .1],
+            ["MSFT", "Microsoft", 380.0, stamp(3), "USD", "manual_note:keep", 418, .1],
+            ["ZZZZ", "Other", 5.0, stamp(10), "USD", "manual_note:keep", 5.5, .1]]
+    def witnessed(symbol, price, age=0):
+        acquired = now - timedelta(minutes=age)
+        row = {"symbol": symbol, "current_price": price, "currency": "USD", "data_provider": "Yahoo",
+               "acquisition_status": "success", "acquisition_provider": "Yahoo",
+               "acquisition_acquired_at": acquired.isoformat(),
+               "acquisition_quote_asof": (acquired - timedelta(minutes=2)).isoformat()}
+        return _IQR._source_quote(row, symbol, acquired)
+    quotes = {"AAPL": witnessed("AAPL", 333.02), "MSFT": witnessed("MSFT", 381.70, 5),
+              "NVDA": witnessed("NVDA", 206.84)}
+    assert all(quote is not None for quote in quotes.values())
+    return page, quotes, witnessed
 
 
 @pytestmark_iqr
-def test_intraday_staleness_is_one_way():
+def test_intraday_staleness_is_one_way(intraday_case):
     """MSFT's incoming stamp is OLDER than the page. The patch must never move
     a page backwards in time."""
-    plan, stats = _IQR.plan_page_updates("Market_Leaders", _IQR_PAGE, _IQR_Q)
+    page, quotes, _factory = intraday_case
+    plan, stats = _IQR.plan_page_updates("Market_Leaders", page, quotes)
     assert [p["symbol"] for p in plan] == ["AAPL"]
     assert stats["skipped_not_newer"] == 1
 
 
 @pytestmark_iqr
-def test_intraday_never_inserts_a_symbol_absent_from_the_page():
-    plan, _s = _IQR.plan_page_updates("X", _IQR_PAGE, _IQR_Q)
+def test_intraday_never_inserts_a_symbol_absent_from_the_page(intraday_case):
+    page, quotes, _factory = intraday_case
+    plan, _s = _IQR.plan_page_updates("Market_Leaders", page, quotes)
+    assert plan, "membership guard must exercise a valid witnessed patch"
     assert all(p["symbol"] != "NVDA" for p in plan)
 
 
 @pytestmark_iqr
-def test_intraday_touches_exactly_two_columns():
-    plan, _s = _IQR.plan_page_updates("X", _IQR_PAGE, _IQR_Q)
+def test_intraday_touches_only_owned_quote_and_conflicting_return_columns(intraday_case):
+    page, quotes, _factory = intraday_case
+    plan, _s = _IQR.plan_page_updates("Market_Leaders", page, quotes)
     assert plan[0]["price_col"] == 2 and plan[0]["stamp_col"] == 3
     assert plan[0]["sheet_row"] == 2
+    assert set(plan[0]["changes"]) == {2, 3, 5, 7}
+    assert plan[0]["changes"][7] == ""
+    assert "acquisition_status:preserved" in plan[0]["changes"][5]
 
 
 @pytestmark_iqr
-def test_intraday_refuses_a_zero_price():
+def test_intraday_refuses_a_zero_price(intraday_case):
+    page, _quotes, factory = intraday_case
+    assert factory("AAPL", 0) is None
     plan, _s = _IQR.plan_page_updates(
-        "X", _IQR_PAGE, {"AAPL": {"price": 0,
-                                  "last_updated": "2026-07-27 13:45:00"}})
+        "Market_Leaders", page, {"AAPL": factory("AAPL", 0)})
     assert plan == []
 
 
@@ -514,10 +548,11 @@ def test_intraday_finds_a_header_block_that_is_not_row_one():
 
 
 @pytestmark_iqr
-def test_intraday_missing_columns_and_empty_page_are_not_crashes():
+def test_intraday_missing_columns_and_empty_page_are_not_crashes(intraday_case):
+    _page, quotes, _factory = intraday_case
     assert _IQR.plan_page_updates(
-        "X", [["Symbol", "Name"], ["AAPL", "x"]], _IQR_Q)[0] == []
-    assert _IQR.plan_page_updates("X", [], _IQR_Q)[0] == []
+        "Market_Leaders", [["Symbol", "Name"], ["AAPL", "x"]], quotes)[0] == []
+    assert _IQR.plan_page_updates("Market_Leaders", [], quotes)[0] == []
 
 
 # =========================================================================== #

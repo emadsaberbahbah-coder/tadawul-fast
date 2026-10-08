@@ -268,14 +268,15 @@ def test_real_sdk_writer_payload_is_fractional_and_idempotent(monkeypatch):
     api = FakeSheetsAPI()
     monkeypatch.setattr(sheets, "get_sheets_service", lambda: api)
     monkeypatch.setattr(sheets._CONFIG, "use_batch_update", True)
-    headers = ["Symbol", "Current Price", "Profit Margin", "Horizon Days", "Invest Period Label", "Warnings"]
+    headers, keys = de.get_sheet_spec("Global_Markets")
     _, rows = sheets.rows_to_grid(headers, [source_row()])
     original = copy.deepcopy(rows)
     written = sheets.write_grid_chunked("SYNTHETIC_BOOK", "Global_Markets", "A5", [headers] + rows)
-    assert written == 12
+    assert written == 230
     payload = api.requests[0]["body"]["data"][0]["values"]
-    assert payload[1][2] == pytest.approx(0.009) and payload[1][4] == "1Y"
-    assert "sheet_margin_unit:profit_margin:fraction:" + repr(payload[1][2]) in payload[1][5]
+    margin = payload[1][keys.index("profit_margin")]
+    assert margin == pytest.approx(0.009) and payload[1][keys.index("invest_period_label")] == "1Y"
+    assert "sheet_margin_unit:profit_margin:fraction:" + repr(margin) in payload[1][keys.index("warnings")]
     sheets.write_grid_chunked("SYNTHETIC_BOOK", "Global_Markets", "A5", payload)
     assert api.requests[1]["body"]["data"][0]["values"] == payload
     assert rows == original
@@ -401,13 +402,14 @@ def test_coherent_numeric_string_returns_are_numeric_in_actual_raw_writer(
     api = FakeSheetsAPI()
     monkeypatch.setattr(sheets, "get_sheets_service", lambda: api)
     monkeypatch.setattr(sheets._CONFIG, "use_batch_update", True)
-    headers = ["Symbol", "Current Price", price_header, return_header, "Warnings"]
+    headers, keys = de.get_sheet_spec("Global_Markets")
     _, matrix = sheets.rows_to_grid(headers, [row])
     sheets.write_grid_chunked("SYNTHETIC_BOOK", "Global_Markets", "A5", [headers] + matrix)
     body = api.requests[0]["body"]
     assert body["valueInputOption"] == "RAW"
-    assert type(body["data"][0]["values"][1][3]) is float
-    assert body["data"][0]["values"][1][3] == 0.2
+    value = body["data"][0]["values"][1][keys.index(return_field)]
+    assert type(value) is float
+    assert value == 0.2
     assert row == original
     assert present_instrument_row(displayed) == displayed
 
@@ -427,7 +429,7 @@ def test_finite_price_ratio_overflow_never_certifies_derived_return():
 
 def test_actual_refresh_preservation_cannot_resurrect_unknown_margin(monkeypatch):
     api = FakeSheetsAPI()
-    headers = ["Symbol", "Current Price", "Profit Margin", "Position Qty", "Warnings"]
+    headers, keys = de.get_sheet_spec("Global_Markets")
     row = source_row()
     row.pop("_margin_unit_basis")
     response = {"status": "success", "headers": headers, "rows": [row]}
@@ -435,14 +437,16 @@ def test_actual_refresh_preservation_cannot_resurrect_unknown_margin(monkeypatch
     monkeypatch.setattr(sheets, "get_canonical_headers", lambda page: headers)
     monkeypatch.setattr(sheets._CONFIG, "ensure_headers_match_schema", False)
     monkeypatch.setattr(sheets._CONFIG, "use_batch_update", True)
-    monkeypatch.setattr(sheets._CONFIG, "preserve_columns", ["Profit Margin", "Position Qty"])
+    monkeypatch.setattr(sheets._CONFIG, "preserve_columns", ["Profit Margin", "Position Size Hint"])
     monkeypatch.setattr(sheets._safe_mode_validator, "validate_backend_response", lambda *a, **kw: None)
     monkeypatch.setattr(sheets._backend_client, "call_api_chunked", lambda *a, **kw: response)
-    monkeypatch.setattr(sheets, "_build_preserve_map", lambda *a, **kw: {"SYNTH.US": {"profitmargin": 90.0, "positionqty": 5}})
+    monkeypatch.setattr(sheets, "_build_preserve_map", lambda *a, **kw: {"SYNTH.US": {"profitmargin": 90.0, "positionsizehint": "synthetic saved hint"}})
     result = sheets._refresh_logic("/synthetic", "SYNTHETIC_BOOK", "Global_Markets", ["SYNTH.US"])
     assert result["rows_written"] == 1
     values = api.requests[0]["body"]["data"][0]["values"]
-    assert values[1][2] is None and values[1][3] == 5
+    assert values[1][keys.index("profit_margin")] == ""
+    assert values[1][keys.index("current_price")] == 100
+    assert values[1][headers.index("Position Size Hint")] == "synthetic saved hint"
 
 
 def test_actual_formatter_uses_native_percent_format_only_on_fraction_columns(monkeypatch):

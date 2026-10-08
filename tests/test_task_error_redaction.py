@@ -12,6 +12,7 @@ import uuid
 import pytest
 
 from core import secret_redaction
+from core.sheets.schema_registry import get_sheet_headers
 from scripts import run_dashboard_sync as sync
 
 if os.getenv("TFB_REDACTION_SOURCE_ROOT"):
@@ -37,10 +38,15 @@ def test_real_task_errors_redact_without_changing_failed_outcome_or_write_counts
     }.items():
         monkeypatch.setenv(name, value)
     symbols = ["GC=F", "SI=F", "HG=F", "CL=F"]
-    headers = ["Symbol", "Name", "Current Price", "Data Provider", "Last Updated (UTC)", "Warnings"]
+    # Reach the intended writer failure through the production market schema;
+    # malformed partial headers now correctly fail before any write attempt.
+    headers = list(get_sheet_headers("Commodities_FX"))
     now = sync._utc_now().isoformat()
     warning = "acquisition_status:success; acquisition_provider:yahoo_chart; acquisition_acquired_at:" + now
-    rows = [[symbol, "Synthetic instrument", 12.5, "yahoo_chart", now, warning] for symbol in symbols]
+    facts = [{"Symbol": symbol, "Name": "Synthetic instrument", "Current Price": 12.5,
+              "Data Provider": "yahoo_chart", "Last Updated (UTC)": now, "Warnings": warning}
+             for symbol in symbols]
+    rows = [[row.get(header, "") for header in headers] for row in facts]
     observed = {"backend": 0, "write": 0, "clear": 0}
 
     class Backend:

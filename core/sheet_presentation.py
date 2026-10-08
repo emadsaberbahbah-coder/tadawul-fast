@@ -12,7 +12,54 @@ from typing import Any, Mapping
 
 from core.financial_units import MARGIN_FIELDS, MARGIN_UNIT_KEY, margin_unit_valid
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
+
+_MARKET_SHEET_PAGES = frozenset({
+    "Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX",
+})
+_TRANSPORT_CLEAR_FIELDS = frozenset({
+    *MARGIN_FIELDS, "upside_downside_pct", "upside_pct", "expected_roi_1m",
+    "expected_roi_3m", "expected_roi_12m", "invest_period_label", "horizon_label",
+})
+
+
+def validate_market_sheet_rows(sheet_name, headers, rows):
+    """Require the four market pages' exact current matrix before publication.
+
+    Other pages retain their existing writer contract. Imports stay lazy so
+    this presentation leaf remains safe in standalone and lean environments.
+    """
+    if sheet_name not in _MARKET_SHEET_PAGES:
+        return None
+    from core.sheets.schema_registry import get_sheet_headers, get_sheet_keys
+    expected = list(get_sheet_headers(sheet_name))
+    keys = list(get_sheet_keys(sheet_name))
+    if (len(expected) != 115 or len(keys) != 115 or len(set(expected)) != 115
+            or not isinstance(headers, (list, tuple)) or list(headers) != expected):
+        raise ValueError("Market presentation requires the exact canonical 115-column header")
+    if rows is not None and not isinstance(rows, (list, tuple)):
+        raise ValueError("Market presentation requires a row matrix")
+    if any(not isinstance(row, (list, tuple)) or len(row) != 115 for row in rows or ()):
+        raise ValueError("Market presentation requires exact 115-column rows")
+    return keys
+
+
+def present_market_sheet_rows(sheet_name, headers, rows):
+    """Copy market display values for Sheets' null-skip/empty-clear transport.
+
+    The API serializer still uses None for unknowns. At the actual Sheets
+    writer, only unknown presentation columns become explicit empty strings;
+    prices, source observations, scoring and acquisition timestamps stay raw.
+    """
+    keys = validate_market_sheet_rows(sheet_name, headers, rows)
+    if keys is None:
+        return rows
+    published = []
+    for row in rows or ():
+        displayed = present_instrument_row(dict(zip(headers, row)))
+        published.append(["" if displayed.get(header) is None and key in _TRANSPORT_CLEAR_FIELDS
+                          else displayed.get(header) for header, key in zip(headers, keys)])
+    return published
 
 _FIELDS = (
     *MARGIN_FIELDS, "current_price", "target_price", "upside_downside_pct",
