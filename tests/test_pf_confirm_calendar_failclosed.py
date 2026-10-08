@@ -309,3 +309,159 @@ def test_known_calendar_boundaries_and_same_session_counts_remain_unchanged(
     assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": current}
     assert pa._apply_add_confirmation(symbol, ADD, "q", None, CTL) == first
     assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": current}
+
+
+SHARE_CLASS_ALIASES = [form for dotted in ("BRK.B", "BF.B", "HEI.A")
+                       for form in (dotted, dotted.replace(".", "-"), dotted + ".US",
+                                    dotted.replace(".", "-") + ".US")]
+
+
+@pytest.mark.parametrize("symbol", SHARE_CLASS_ALIASES)
+def test_share_class_actual_gate_advances_only_after_a_new_completed_us_session(isolated_policy, symbol):
+    clock, cache, _ = isolated_policy
+    clock["now"] = at(2026, 10, 2, 21)
+    first = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert first[0] == HOLD and "day 1/2; session 2026-10-02" in first[1]
+    for unchanged in (at(2026, 10, 2, 21), at(2026, 10, 3, 12), at(2026, 10, 4, 12),
+                      at(2026, 10, 5, 3, 40), at(2026, 10, 5, 20, 59)):
+        clock["now"] = unchanged
+        assert pa._apply_add_confirmation(symbol, ADD, "q", None, CTL) == first
+        assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 1, "date": "2026-10-02"}
+    clock["now"] = at(2026, 10, 5, 21)
+    confirmed = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert confirmed[0] == ADD and "day 2/2; session 2026-10-05" in confirmed[1]
+    assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": "2026-10-05"}
+    assert pa._apply_add_confirmation(symbol, ADD, "q", None, CTL) == confirmed
+
+
+@pytest.mark.parametrize("symbol", SHARE_CLASS_ALIASES)
+def test_share_class_actual_build_waits_preclose_then_confirms_and_funds(isolated_policy, symbol):
+    clock, cache, _ = isolated_policy
+    original = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_STORE[symbol] = copy.deepcopy(original)
+    clock["now"] = at(2026, 10, 7, 20, 59)
+    held = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    assert held["actions"][0]["action"] == HOLD and held["kpis"]["adds_funded_sar"] == 0
+    assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == original
+    clock["now"] = at(2026, 10, 7, 21)
+    ready = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    assert ready["actions"][0]["action"] == ADD and ready["kpis"]["adds_funded_sar"] == 12040
+    assert "day 2/2; session 2026-10-07" in ready["actions"][0]["action_reason"]
+    assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": "2026-10-07"}
+    repeated = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    assert repeated["actions"][0]["action"] == ADD and repeated["kpis"]["adds_funded_sar"] == 12040
+    assert pa._ADD_CONFIRM_STORE[symbol] == cache[symbol] == {"count": 2, "date": "2026-10-07"}
+
+
+@pytest.mark.parametrize("symbol,venue", [("ABC.L", "EU"), ("ABC.T", "ASIA"),
+                                        ("ABC.V", "AMER"), ("ABC.SI", "ASIA")])
+def test_known_exchange_suffix_precedes_share_class_recognition(symbol, venue):
+    assert pa._confirm_venue(symbol) == venue
+
+
+@pytest.mark.parametrize("symbol", ["ABC.F", "ABC.N", "ABC.OQ", "ABC.NYSE", "ABC.SGX",
+                                   "ABC.UNKNOWN", "BRK.B.UNKNOWN", "BRK..B", "BRK. B",
+                                   "BRK.B.", "BRK-B.B", "123.B", "ABCDEF.B"])
+def test_registered_unsupported_and_malformed_suffixes_remain_closed(isolated_policy, symbol):
+    clock, cache, traffic = isolated_policy
+    clock["now"] = at(2026, 10, 7, 21)
+    original = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_STORE[symbol] = copy.deepcopy(original)
+    result = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert result[0] == HOLD and "calendar unavailable" in result[1]
+    assert pa._ADD_CONFIRM_STORE[symbol] == original and not cache and not traffic
+
+
+@pytest.mark.parametrize("symbol", ["ABC.İ", "ABC.K", "KRK.B", "ABC.ı", "ABC.ſ"])
+def test_unicode_share_class_shape_is_refused_at_resolver_gate_and_actual_build(isolated_policy, symbol):
+    clock, cache, traffic = isolated_policy
+    clock["now"] = at(2026, 10, 7, 21)
+    with pytest.raises(pa.ConfirmCalendarUnavailable):
+        pa._confirm_venue(symbol)
+    original = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_STORE[symbol.upper()] = copy.deepcopy(original)
+    result = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert result[0] == HOLD and "calendar unavailable" in result[1]
+    built = pa.build_portfolio_actions([_holding(symbol)], controls=CTL, fx_rates={"SAR": 1})
+    # This caller preserves the supplied candidate symbol; no claim is made
+    # about arbitrary upstream normalizers that already changed its identity.
+    assert built["actions"][0]["symbol"] == symbol
+    assert built["actions"][0]["action"] == HOLD and built["kpis"]["adds_funded_sar"] == 0
+    assert pa._ADD_CONFIRM_STORE[symbol.upper()] == original and not cache and not traffic
+
+
+@pytest.mark.parametrize("symbol", ["BRK.B", "BF.B", "HEI.A"])
+def test_share_class_registry_override_cannot_create_a_us_calendar(monkeypatch, isolated_policy, symbol):
+    from core.symbols import normalize
+    suffix = "." + symbol.rsplit(".", 1)[1]
+    normalize.split_symbol_exchange.cache_clear()
+    monkeypatch.setitem(normalize.EXCHANGE_SUFFIXES, suffix, "synthetic-unsupported-exchange")
+    try:
+        with pytest.raises(pa.ConfirmCalendarUnavailable):
+            pa._confirm_venue(symbol)
+        result = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+        assert result[0] == HOLD and "calendar unavailable" in result[1]
+    finally:
+        # Registry consumers cache splits; no test may leave an override result.
+        normalize.split_symbol_exchange.cache_clear()
+
+
+@pytest.mark.parametrize("mode", ["off", "observe"])
+@pytest.mark.parametrize("symbol", ["BRK.B", "BF.B", "HEI.A"])
+def test_share_class_off_and_observe_preserve_legacy_verdict_with_valid_shadow(
+        monkeypatch, isolated_policy, mode, symbol):
+    clock, cache, _ = isolated_policy
+    monkeypatch.setenv("TFB_PF_CONFIRM_SESSION", mode)
+    clock["now"] = at(2026, 10, 7, 21)
+    pa._ADD_CONFIRM_STORE[symbol] = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_SESSION_STORE[symbol] = {"count": 1, "date": "2026-10-06"}
+    gate = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert gate == (ADD, "q — ADD confirmed (day 2/2)", None)
+    reason = pa._apply_confirm_session_observe({"symbol": symbol}, ADD, *gate, CTL)
+    if mode == "observe":
+        assert "venue=US session=2026-10-07" in reason and "vs session 2/2" in reason
+        assert "unavailable" not in reason
+        assert cache[pa._CONFIRM_SESSION_SHADOW_NS + symbol] == {"count": 2, "date": "2026-10-07"}
+    else:
+        assert reason == gate[1] and pa._CONFIRM_SESSION_SHADOW_NS + symbol not in cache
+
+
+@pytest.mark.parametrize("raw", [" brk.b ", " bF.b ", " hei.A "])
+@pytest.mark.parametrize("mode", ["enforce", "observe"])
+def test_raw_share_class_classification_preserves_uppercase_live_and_shadow_cache_keys(
+        monkeypatch, isolated_policy, raw, mode):
+    clock, cache, _ = isolated_policy
+    monkeypatch.setenv("TFB_PF_CONFIRM_SESSION", mode)
+    clock["now"] = at(2026, 10, 7, 21)
+    key = raw.strip().upper()
+    shadow_key = pa._CONFIRM_SESSION_SHADOW_NS + key
+    previous = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_STORE[key] = copy.deepcopy(previous)
+    pa._ADD_CONFIRM_SESSION_STORE[key] = copy.deepcopy(previous)
+    cache[key] = cache[shadow_key] = copy.deepcopy(previous)
+    result = pa._apply_add_confirmation(raw, ADD, "q", None, CTL)
+    assert result[0] == ADD
+    assert pa._ADD_CONFIRM_STORE == {key: {"count": 2, "date": "2026-10-07"}}
+    assert cache[key] == pa._ADD_CONFIRM_STORE[key]
+    tagged = pa._apply_confirm_session_observe({"symbol": raw}, ADD, *result, CTL)
+    if mode == "observe":
+        assert "venue=US session=2026-10-07" in tagged
+        assert pa._ADD_CONFIRM_SESSION_STORE[key] == {"count": 2, "date": "2026-10-07"}
+    else:
+        assert tagged == result[1] and pa._ADD_CONFIRM_SESSION_STORE[key] == previous
+    assert set(pa._ADD_CONFIRM_SESSION_STORE) == {key}
+    assert set(cache) == {key, shadow_key} and cache[shadow_key] == pa._ADD_CONFIRM_SESSION_STORE[key]
+
+
+@pytest.mark.parametrize("symbol", ["BRK.B", "BF.B", "HEI.A"])
+def test_share_class_calendar_fault_still_freezes_previous_count_date(monkeypatch, isolated_policy, symbol):
+    clock, cache, traffic = isolated_policy
+    clock["now"] = at(2026, 10, 7, 21)
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("synthetic unavailable share-class calendar")
+    monkeypatch.setattr(pa, "_confirm_session_key", unavailable)
+    original = {"count": 1, "date": "2026-10-06"}
+    pa._ADD_CONFIRM_STORE[symbol] = copy.deepcopy(original)
+    result = pa._apply_add_confirmation(symbol, ADD, "q", None, CTL)
+    assert result[0] == HOLD and "calendar unavailable" in result[1]
+    assert pa._ADD_CONFIRM_STORE[symbol] == original and not cache and not traffic
