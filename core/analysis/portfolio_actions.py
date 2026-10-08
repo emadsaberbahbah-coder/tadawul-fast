@@ -348,6 +348,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 
 from core.secret_redaction import safe_error_text
+from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
 logger = logging.getLogger("core.analysis.portfolio_actions")
 
 # -----------------------------------------------------------------------------
@@ -818,7 +819,12 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.14.1"
+PORTFOLIO_ACTIONS_VERSION = "1.14.2"
+
+# v1.14.2: preserve exact ASCII US share-class dots (BRK.B / BF.B / HEI.A).
+# Known calendar suffixes take precedence; registered exchange suffixes with
+# no calendar remain unavailable. Raw share-class shape is checked before any
+# normalization, and confirmation keeps its original symbol for that check.
 
 # v1.14.1 (TFB-09): an unknown venue or failed completed-session lookup
 # cannot grant ADD confirmation under explicit enforce mode. The live count
@@ -2250,18 +2256,22 @@ def _env_confirm_session_mode():
 
 
 def _confirm_venue(sym):
-    """Resolve known suffixes; bare symbols retain the book's US convention.
+    """Resolve known suffixes and exact US share classes; bare symbols are US.
 
     An unrecognized explicit suffix supplies no completed-session evidence.
     This bounded mapping is not a canonical instrument/MIC registry.
     """
-    s = str(sym or "").strip().upper()
+    raw = str(sym or "").strip()
+    s = raw.upper()
     if not s:
         raise ConfirmCalendarUnavailable("missing symbol venue")
     if "." in s:
         suffix = s.rsplit(".", 1)[1]
         venue = _CONFIRM_SESSION_SUFFIX.get(suffix)
         if venue is None:
+            if (raw.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(raw)
+                    and split_symbol_exchange(raw)[1] is None):
+                return "US"
             detail = safe_error_text("unknown venue suffix %s" % (suffix or "<blank>"), limit=400)
             raise ConfirmCalendarUnavailable(detail)
         return venue
@@ -2404,7 +2414,7 @@ def _apply_confirm_session_observe(cand, raw_action, action, reason,
             return reason
         if days <= 1:
             return reason
-        venue = _confirm_venue(sym)
+        venue = _confirm_venue((cand or {}).get("symbol"))
         key, s_count = _confirm_session_shadow_count(sym, venue, now_utc)
         l_count = int((_ADD_CONFIRM_STORE.get(sym) or {}).get("count") or 0)
         flip = (l_count >= days) != (s_count >= days)
@@ -2458,7 +2468,7 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
             return action, reason, capped_from
         if days <= 1:
             return action, reason, capped_from  # gate off: v1.0.5 verbatim
-        today, _yday_key, _clock_basis = _confirm_clock(sym)  # v1.13.0 [P-168b]
+        today, _yday_key, _clock_basis = _confirm_clock(symbol)  # retain raw share-class identity
         _sk_note = ("; session %s" % today) if _clock_basis == "session" else ""
         st = _ADD_CONFIRM_STORE.get(sym)
         _persist = _confirm_persist_enabled()
