@@ -78,8 +78,11 @@ saving time, Thanksgiving, early close and the Saudi weekend. In lean CI only
 that dependency-backed calendar test may skip; deterministic production-path
 fixtures and missing-calendar fail-closed tests still run.
 
-`scripts/test_maturation.py` uses fixed synthetic receipt-bearing prices and
-an offline clock; fallback and corporate-action network paths are disabled.
+`scripts/test_maturation.py` uses fixed synthetic receipt-bearing prices, an
+explicit known-session calendar fixture and an offline clock; fallback and
+corporate-action network paths are disabled. It runs in the lean environment
+without installing a calendar dependency; production missing-calendar refusal
+is covered separately by the outcome-evidence suite.
 
 This conservative contract can defer thin symbols whose last-trade timestamp
 precedes the closing instant, and outcomes missed until a later session.

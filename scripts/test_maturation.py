@@ -52,6 +52,17 @@ _NOW = dt.datetime(2026, 10, 8, 21, tzinfo=dt.timezone.utc)
 _CLOSE = dt.datetime(2026, 10, 8, 20, tzinfo=dt.timezone.utc)
 
 
+def _synthetic_calendar(name: str, utc_day: str) -> Any:
+    """Explicit NYSE session for these fixed synthetic prices, no dependency.
+
+    Production calendar availability is checked by the outcome-evidence suite;
+    this pre-flight exercises maturation against an already known fixture.
+    """
+    assert name == "XNYS", name
+    opening = _CLOSE.replace(hour=13, minute=30)
+    return ((_CLOSE.date().isoformat(), opening, _CLOSE),)
+
+
 class _FakeBackend:
     """Serves exactly the prices it is told to, so 'fresh' vs 'missing' is
     controlled precisely. base_url non-empty so the LOUD empty-url path is
@@ -107,6 +118,7 @@ def _tracker(prices: Dict[str, float]) -> Any:
 def _run(tracker: Any, records: List[Any]) -> List[Any]:
     with patch.object(tp, "_utc_now", return_value=_NOW), \
             patch.object(tp.RiyadhTime, "now", return_value=_NOW), \
+            patch.object(tp, "_outcome_calendar_schedule", side_effect=_synthetic_calendar), \
             patch.object(tp, "_price_fallback_enabled", return_value=False), \
             patch.object(tp, "_ca_guard_enabled", return_value=False):
         return asyncio.run(tracker.audit_active_records(records))
