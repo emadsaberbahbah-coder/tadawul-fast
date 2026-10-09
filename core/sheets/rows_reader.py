@@ -69,7 +69,7 @@ from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # The one page whose rows must be read from the sheet (manual, user-authored cells).
 _PORTFOLIO_CANON = "myportfolio"
@@ -216,6 +216,42 @@ def _grid_to_rows(
 
 class RowsReader:
     """Canonical sheet rows reader discovered by DataEngineV5._bind_rows_reader."""
+
+    def get_membership_for_page(self, page: str) -> Dict[str, Any]:
+        """Read the entire portfolio symbol column, without row caps or caches.
+
+        Unlike quote snapshots or emergency universes, this is a complete
+        read-only workbook membership observation. It does not certify custody.
+        """
+        unknown = {"status": "unknown", "complete": False, "symbols": [],
+                   "source": "workbook_readonly"}
+        if not _reader_enabled() or _norm(page) != _PORTFOLIO_CANON:
+            return unknown
+        try:
+            sid = _resolve_spreadsheet_id()
+            if not sid:
+                return unknown
+            reader = _new_grid_reader()
+            # Open-ended rows: no 2,000-row default or _MAX_ROW_SPAN slicing.
+            # Reading only column A would guess the symbol's physical location.
+            grid = reader.read_range(sid, "%s!A:ZZ" % _quote_sheet(page))
+            if not grid:
+                return unknown
+            matches = [(i, j) for i, row in enumerate(grid[:6])
+                       for j, cell in enumerate(row) if _norm(cell) == "symbol"]
+            if len(matches) != 1:
+                return unknown
+            header_row, symbol_col = matches[0]
+            symbols = []
+            for row in grid[header_row + 1:]:
+                if symbol_col < len(row):
+                    value = row[symbol_col]
+                    if value is not None and str(value).strip():
+                        symbols.append(str(value).strip())
+            return {"status": "success", "complete": True,
+                    "symbols": symbols, "source": "workbook_readonly"}
+        except Exception:
+            return unknown
 
     def get_rows_for_page(self, page: str, limit: int = 2000, offset: int = 0) -> List[Dict[str, Any]]:
         # Gate OFF -> [] -> engine-only path (byte-identical to today).

@@ -2,8 +2,13 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.151.7
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.151.8
 ================================================================================
+
+WHY v5.151.8 - COMPLETE RESEARCH MEMBERSHIP
+- Reader-backed membership has an explicit complete/source receipt and never
+  falls back to per-quote caches, environment symbols or emergency holdings.
+  Complete workbook membership does not certify broker custody or money.
 
 WHY v5.151.7 - COPY-ONLY SHEET PRESENTATION CONTRACT
 - Value-bound margin receipts survive strict projection as display evidence;
@@ -3900,7 +3905,7 @@ from core.financial_units import (
 # withhold failed funding rows while retaining protective exits and source facts.
 # v5.151.6: score witnessed margin units consistently across supplier, cache
 # and publication paths without changing source values or policy thresholds.
-__version__ = "5.151.7"
+__version__ = "5.151.8"
 
 from core.sheet_presentation import present_instrument_row
 
@@ -17092,6 +17097,26 @@ class DataEngineV5:
         canon = _canonicalize_sheet_name(sheet)
         async with self._snapshot_lock:
             return [dict(r) for r in self._page_snapshots.get(canon, [])]
+
+    async def get_sheet_membership(self, sheet: str) -> Dict[str, Any]:
+        """Complete reader-backed research membership; no quote-cache fallback."""
+        unknown = {"status": "unknown", "complete": False, "symbols": [],
+                   "source": "workbook_readonly"}
+        reader = self._bind_rows_reader()
+        fn = getattr(reader, "get_membership_for_page", None)
+        if not callable(fn):
+            return unknown
+        try:
+            canon = _canonicalize_sheet_name(sheet)
+            result = await fn(canon) if inspect.iscoroutinefunction(fn) else await asyncio.to_thread(fn, canon)
+            if (isinstance(result, dict) and result.get("status") == "success"
+                    and result.get("complete") is True
+                    and isinstance(result.get("symbols"), list)
+                    and result.get("source") == "workbook_readonly"):
+                return result
+        except Exception:
+            pass
+        return unknown
 
     async def _get_symbol_snapshot_row(self, sheet: str, symbol: str) -> Optional[Dict[str, Any]]:
         canon = _canonicalize_sheet_name(sheet)

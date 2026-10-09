@@ -8,7 +8,7 @@ from routes import advanced_analysis as route
 
 def test_special_route_preserves_criteria_opt_out_and_builder_receipt():
     class Engine:
-        async def get_cached_sheet_snapshot(self, page):
+        async def get_sheet_membership(self, page):
             raise AssertionError("Portfolio opt-out must reach the real builder")
 
         async def get_enriched_quotes_batch(self, symbols, **kwargs):

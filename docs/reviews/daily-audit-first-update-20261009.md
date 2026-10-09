@@ -6,10 +6,10 @@ other findings or certify investment readiness.
 
 ## Delivered source behavior
 
-- Explicit selected-symbol requests include available My_Portfolio snapshot
-  membership when portfolio health is requested. Snapshot membership is research
+- Explicit selected-symbol requests include complete reader-backed My_Portfolio
+  membership when portfolio health is requested. Workbook membership is research
   evidence; it is not authenticated custody or cash evidence.
-- Holdings are fetched before other cohorts. An unavailable snapshot remains
+- Holdings are fetched before other cohorts. An unavailable complete membership read remains
   unknown; the engine's emergency portfolio symbols are never used as holdings.
 - Each cohort reports requested, sampled, returned, rejected and unsampled counts.
   Symbol-only placeholders, missing/nonfinite prices and mismatched identities do
@@ -26,7 +26,7 @@ other findings or certify investment readiness.
 The real builder, the real special-page route, normalized API envelope, and
 existing final publication/blocking regressions are exercised offline. The new
 builder and route suites participate in required CI. A missing requested
-portfolio snapshot produces partial status, so existing fail-closed publication
+portfolio membership read produces partial status, so existing fail-closed publication
 guards can retain the prior accepted bundle.
 
 ## Remaining dependencies
@@ -55,3 +55,9 @@ are outside this source patch.
 Execution remains withheld until existing evidence gates pass. No orders,
 financial ledger amendments, guessed cash repairs, credential rotations or
 native installation claims are part of this update.
+
+Review correction: per-quote engine snapshots are incomplete and cannot prove
+portfolio membership. The complete membership reader fetches an open-ended
+workbook range without row truncation, validates a unique Symbol header, and
+returns an explicit complete read receipt. Neither cold nor warm partial quote
+caches, environment universes, nor emergency symbols participate in this path.

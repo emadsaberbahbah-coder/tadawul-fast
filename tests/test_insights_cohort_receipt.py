@@ -1,4 +1,4 @@
-"""Actual Insights builder: snapshot membership and bounded research receipts."""
+"""Actual Insights builder: complete reader membership and bounded research receipts."""
 import asyncio
 from copy import deepcopy
 from unittest.mock import patch
@@ -12,12 +12,16 @@ class Engine:
         self.quotes = quotes or {}
         self.calls = []
 
-    async def get_cached_sheet_snapshot(self, page):
+    async def get_sheet_membership(self, page):
         assert page == "My_Portfolio"
-        return deepcopy(self.holdings)
+        return {"status": "success", "complete": True, "source": "workbook_readonly",
+                "symbols": [r["symbol"] for r in self.holdings]}
 
     async def list_symbols_for_page(self, page):
         raise AssertionError("Emergency membership must not be used")
+
+    async def get_cached_sheet_snapshot(self, page):
+        raise AssertionError("Partial per-quote snapshots must not be used")
 
     async def get_enriched_quotes_batch(self, symbols, **kwargs):
         self.calls.append(list(symbols))
@@ -39,7 +43,7 @@ def test_explicit_symbols_include_snapshot_holdings_first_without_claiming_custo
     payload = build(engine)
     assert engine.calls[0] == ["DDI.US"]
     receipt = payload["meta"]["coverage_receipt"]
-    assert receipt["portfolio_membership"] == "cached_snapshot_research_only"
+    assert receipt["portfolio_membership"] == "workbook_readonly_research_only"
     assert receipt["cohorts"]["My_Portfolio"]["requested"] == ["DDI.US"]
     assert receipt["cohorts"]["Selected Symbols"]["requested"] == ["AAPL", "NVDA"]
     assert receipt["scope"] == "sampled_research_only"
@@ -91,7 +95,7 @@ def test_hash_is_stable_and_binds_membership_criteria_and_results():
 
 def test_timeout_cannot_synthesize_holdings():
     class SlowEngine(Engine):
-        async def get_cached_sheet_snapshot(self, page):
+        async def get_sheet_membership(self, page):
             await asyncio.sleep(1)
     payload = build(SlowEngine(), quotes_timeout_sec=0.1)
     assert payload["meta"]["coverage_receipt"]["portfolio_membership"] == "unknown"
@@ -107,3 +111,13 @@ def test_decision_scope_uses_snapshot_not_emergency_portfolio_membership():
             return await builder._resolve_decision_universe(DecisionEngine(holdings=[]))
     result = asyncio.run(run())
     assert result == {"Decision Set": ["AAPL"]}
+
+
+def test_incomplete_or_unproven_membership_packet_is_unknown():
+    for override in ({"complete": False}, {"source": "quote_cache"}, {"status": "partial"}):
+        class PartialEngine(Engine):
+            async def get_sheet_membership(self, page):
+                return {"status": "success", "complete": True, "source": "workbook_readonly",
+                        "symbols": ["DDI.US"], **override}
+        payload = build(PartialEngine())
+        assert payload["meta"]["coverage_receipt"]["portfolio_membership"] == "unknown"

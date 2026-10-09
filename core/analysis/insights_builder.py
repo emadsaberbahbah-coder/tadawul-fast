@@ -3,7 +3,7 @@
 core/analysis/insights_builder.py
 ================================================================================
 Insights Analysis Builder -- v8.7.2
-(v8.7.2: bind research cohort receipts and include snapshot holdings on explicit requests)
+(v8.7.2: bind research cohort receipts and include reader-backed holdings on explicit requests)
 (v8.2.1 DISPLAY FIX: Coverage / Data Quality VALUE cells render "{n} of {d}"
  instead of "{n}/{d}", which Google Sheets was date-coercing to a serial
  (e.g. "5/5" -> May 5 -> 46147). Display-only; row set/ordering/contract intact)
@@ -718,7 +718,7 @@ async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
         return _dedupe_keep_order(res or [])
 
     leaders = await _page_syms("Market_Leaders")
-    holdings = await _resolve_portfolio_snapshot_symbols(engine, _DEFAULT_QUOTES_TIMEOUT_SEC)
+    holdings = await _resolve_portfolio_membership_symbols(engine, _DEFAULT_QUOTES_TIMEOUT_SEC)
 
     top10: List[str] = []
     try:
@@ -751,18 +751,19 @@ async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
     return out
 
 
-async def _resolve_portfolio_snapshot_symbols(engine: Any, timeout_sec: float) -> List[str]:
-    """Research membership from cached rows; never emergency symbol fallback."""
-    snapshot_fn = getattr(engine, "get_cached_sheet_snapshot", None)
+async def _resolve_portfolio_membership_symbols(engine: Any, timeout_sec: float) -> List[str]:
+    """Complete reader-backed research membership; never quote-cache fallback."""
+    snapshot_fn = getattr(engine, "get_sheet_membership", None)
     if not callable(snapshot_fn):
         return []
     snapshot = await _invoke_with_timeout(
         lambda: _maybe_await(snapshot_fn("My_Portfolio")), timeout_sec,
     )
-    return _dedupe_keep_order(
-        _safe_str(row.get("symbol") or row.get("ticker") or row.get("Symbol"))
-        for row in _coerce_to_rows(snapshot)
-    )
+    if not isinstance(snapshot, Mapping) or snapshot.get("status") != "success" or \
+            snapshot.get("complete") is not True or snapshot.get("source") != "workbook_readonly" or \
+            not isinstance(snapshot.get("symbols"), list):
+        return []
+    return _dedupe_keep_order(snapshot["symbols"])
 
 
 def _compact_json(obj: Any) -> str:
@@ -3591,22 +3592,22 @@ async def build_insights_analysis_rows(
         auto_used = True
 
     # Explicit symbol requests previously bypassed holdings entirely. Read the
-    # snapshot API, not list_symbols_for_page: that method can return emergency
-    # portfolio symbols when the real reader is unavailable. This is research
+    # complete membership API, not quote snapshots or list_symbols_for_page:
+    # those may contain partial or emergency holdings. This is research
     # membership only; it does not certify positions, cash or quote freshness.
     portfolio_membership = "not_requested"
     if engine and do_portfolio_kpis:
         portfolio_keys = [name for name in effective_universes
                           if name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}]
         if portfolio_keys:
-            portfolio_membership = "cached_snapshot_research_only" if auto_used else "caller_supplied"
+            portfolio_membership = "workbook_readonly_research_only" if auto_used else "caller_supplied"
         else:
-            holdings = await _resolve_portfolio_snapshot_symbols(
+            holdings = await _resolve_portfolio_membership_symbols(
                 engine, min(quotes_timeout_sec, max(0.1, _remaining() / 4)),
             )
             if holdings:
                 effective_universes = {"My_Portfolio": holdings, **effective_universes}
-                portfolio_membership = "cached_snapshot_research_only"
+                portfolio_membership = "workbook_readonly_research_only"
             else:
                 portfolio_membership = "unknown"
                 warnings.append("Portfolio membership unavailable; no emergency symbols substituted")

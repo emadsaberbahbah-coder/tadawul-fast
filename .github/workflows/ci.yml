@@ -335,6 +335,7 @@ jobs:
             tests/test_scheduled_portfolio_refresh.py \
             tests/test_news_intelligence_contracts.py \
             tests/test_insights_cohort_receipt.py \
+            tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
