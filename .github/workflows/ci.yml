@@ -2,7 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.1 (2026-10-09) -- FINAL WRITER PRESENTATION
+# VERSION 1.1.2 (2026-10-09) -- GLOBAL MARKETS SCORING BASIS
+#
+# v1.1.2: require model/display intrinsic-basis and recommendation-provenance
+# regressions alongside the existing fail-closed scoring settlement suite.
 #
 # v1.1.1: guard restored market rows at both writers; explicit empty cells
 # clear withheld presentation facts under Google Sheets RAW semantics.
@@ -387,6 +390,12 @@ jobs:
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
 
+      - name: 🧮 Run model and display basis regressions (lean)
+        run: |
+          python -m pytest -q \
+            tests/test_de_f7_scoring_settle.py \
+            tests/test_de_f7_intrinsic_display_basis.py
+
       - name: 🛡️ Run isolated protective legacy harnesses
         run: |
           # These harnesses modify policy environment during collection.
@@ -499,6 +508,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
+            tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
 
       - name: 💵 Run exported-workbook cash certification regressions
