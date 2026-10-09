@@ -3599,7 +3599,7 @@ async def build_insights_analysis_rows(
         portfolio_keys = [name for name in effective_universes
                           if name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}]
         if portfolio_keys:
-            portfolio_membership = "caller_supplied"
+            portfolio_membership = "cached_snapshot_research_only" if auto_used else "caller_supplied"
         else:
             holdings = await _resolve_portfolio_snapshot_symbols(
                 engine, min(quotes_timeout_sec, max(0.1, _remaining() / 4)),
