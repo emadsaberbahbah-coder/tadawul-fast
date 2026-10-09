@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.18.0
+Advanced Analysis Root Owner — v4.18.1
 FINAL BOARD FUNDING REPLAY (2026-10-07)
 ================================================================================
 The existing opportunity endpoint accepts a signed frozen allocation replay.
@@ -535,7 +535,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.18.0"  # frozen final-board allocation replay
+ADVANCED_ANALYSIS_VERSION = "4.18.1"  # bind Insights request criteria and budget
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -3200,7 +3200,7 @@ async def _build_special_page_payload(
         if timeout_s is None
         else max(0.5, min(configured_budget, float(timeout_s)))
     )
-    del merged_body, offset  # reserved for future builder-specific controls
+    del offset  # reserved for future builder-specific controls
     try:
         if page == _TOP10_PAGE and _build_top10_rows is not None:
             lease = await _opp_acquire_build_lease()
@@ -3260,6 +3260,8 @@ async def _build_special_page_payload(
                     _build_insights_rows,
                     engine=engine,
                     symbols=(list(symbols) or None),
+                    criteria=_opp_criteria_from_body(merged_body.get("criteria")),
+                    build_budget_sec=budget,
                     mode=mode or "",
                     offload_sync=True,
                 )

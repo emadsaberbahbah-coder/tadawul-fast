@@ -2,7 +2,8 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v8.2.1
+Insights Analysis Builder -- v8.7.2
+(v8.7.2: bind research cohort receipts and include snapshot holdings on explicit requests)
 (v8.2.1 DISPLAY FIX: Coverage / Data Quality VALUE cells render "{n} of {d}"
  instead of "{n}/{d}", which Google Sheets was date-coercing to a serial
  (e.g. "5/5" -> May 5 -> 46147). Display-only; row set/ordering/contract intact)
@@ -161,9 +162,11 @@ Design Rules
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -180,7 +183,7 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.7.1"
+INSIGHTS_BUILDER_VERSION = "8.7.2"
 # v8.7.1 - DECISION-SCOPE ORDERING FIX (A1). Live verification showed the
 # Market_Leaders book is ~120 names -- large enough that the decision-set union,
 # previously ordered leaders-first, would hit TFB_INSIGHTS_DECISION_MAX_SYMBOLS
@@ -715,7 +718,7 @@ async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
         return _dedupe_keep_order(res or [])
 
     leaders = await _page_syms("Market_Leaders")
-    holdings = await _page_syms("My_Portfolio")
+    holdings = await _resolve_portfolio_snapshot_symbols(engine, _DEFAULT_QUOTES_TIMEOUT_SEC)
 
     top10: List[str] = []
     try:
@@ -746,6 +749,20 @@ async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
     if holdings:
         out["My_Portfolio"] = _dedupe_keep_order(holdings)
     return out
+
+
+async def _resolve_portfolio_snapshot_symbols(engine: Any, timeout_sec: float) -> List[str]:
+    """Research membership from cached rows; never emergency symbol fallback."""
+    snapshot_fn = getattr(engine, "get_cached_sheet_snapshot", None)
+    if not callable(snapshot_fn):
+        return []
+    snapshot = await _invoke_with_timeout(
+        lambda: _maybe_await(snapshot_fn("My_Portfolio")), timeout_sec,
+    )
+    return _dedupe_keep_order(
+        _safe_str(row.get("symbol") or row.get("ticker") or row.get("Symbol"))
+        for row in _coerce_to_rows(snapshot)
+    )
 
 
 def _compact_json(obj: Any) -> str:
@@ -2769,9 +2786,9 @@ def _build_portfolio_kpis_rows(
     if not have_positions:
         rows.append(_make_row(
             keys=ctx.keys, section="Portfolio KPIs", item="Portfolio",
-            metric="status", value="No Positions",
-            signal=_SIGNAL_OK, priority=_PRI_LOW,
-            notes="No position_qty / avg_cost found. Enter holdings in My_Portfolio.",
+            metric="status", value="Position Evidence Unavailable",
+            signal=_SIGNAL_WARN, priority=_PRI_LOW,
+            notes="Quotes do not establish custody quantities or cost basis; portfolio money remains unknown.",
             last_updated_riyadh=ctx.ts,
         ))
         return rows
@@ -3474,6 +3491,11 @@ async def build_insights_analysis_rows(
     timestamp = _now_riyadh_iso()
     norm_criteria = _normalize_criteria(criteria)
     warnings: List[str] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, build_budget_sec)
+
+    def _remaining() -> float:
+        return deadline - loop.time()
 
     do_market_summary = norm_criteria.get("include_market_summary", True)
     do_top_picks = include_top10_section and norm_criteria.get("include_top_opportunities", True)
@@ -3568,6 +3590,27 @@ async def build_insights_analysis_rows(
                 effective_universes.setdefault(_name, _seq)
         auto_used = True
 
+    # Explicit symbol requests previously bypassed holdings entirely. Read the
+    # snapshot API, not list_symbols_for_page: that method can return emergency
+    # portfolio symbols when the real reader is unavailable. This is research
+    # membership only; it does not certify positions, cash or quote freshness.
+    portfolio_membership = "not_requested"
+    if engine and do_portfolio_kpis:
+        portfolio_keys = [name for name in effective_universes
+                          if name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}]
+        if portfolio_keys:
+            portfolio_membership = "caller_supplied"
+        else:
+            holdings = await _resolve_portfolio_snapshot_symbols(
+                engine, min(quotes_timeout_sec, max(0.1, _remaining() / 4)),
+            )
+            if holdings:
+                effective_universes = {"My_Portfolio": holdings, **effective_universes}
+                portfolio_membership = "cached_snapshot_research_only"
+            else:
+                portfolio_membership = "unknown"
+                warnings.append("Portfolio membership unavailable; no emergency symbols substituted")
+
     build_ok = bool(engine) and bool(effective_universes)
 
     rows.append(_make_row(
@@ -3618,11 +3661,12 @@ async def build_insights_analysis_rows(
             },
         }
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(1.0, build_budget_sec)
-
-    def _remaining() -> float:
-        return deadline - loop.time()
+    cohort_receipts: Dict[str, Dict[str, Any]] = {}
+    for name, members in effective_universes.items():
+        cohort_receipts[name] = {
+            "requested": _dedupe_keep_order(members), "sampled": [],
+            "returned": [], "rejected": [],
+        }
 
     for section_name, sym_list in effective_universes.items():
         remaining = _remaining()
@@ -3638,6 +3682,8 @@ async def build_insights_analysis_rows(
             break
 
         syms = _dedupe_keep_order(sym_list or [])[:max_symbols_per_universe]
+        receipt = cohort_receipts[section_name]
+        receipt["sampled"] = syms
         try:
             quotes = await _fetch_quotes(
                 engine, syms, mode=mode,
@@ -3646,6 +3692,19 @@ async def build_insights_analysis_rows(
         except Exception as exc:
             quotes = {}
             warnings.append(f"Quote fetch degraded for '{section_name}': {exc}")
+
+        # _fetch_quotes includes symbol-only placeholders for absent results.
+        # Count positive-price, matching research rows separately from them;
+        # returned never means acquired-fresh or execution-certified.
+        for sym in syms:
+            quote = quotes.get(sym, {})
+            price = _as_float(quote.get("current_price"))
+            identity = _safe_str(quote.get("symbol") or quote.get("ticker"))
+            usable = (price is not None and math.isfinite(price) and price > 0
+                      and identity == sym and not quote.get("error"))
+            receipt["returned" if usable else "rejected"].append(sym)
+            if identity and identity != sym:
+                quotes[sym] = {"symbol": sym, "warning": "insights_quote_identity_mismatch"}
 
         ctx.all_quotes.update(quotes)
 
@@ -3755,9 +3814,9 @@ async def build_insights_analysis_rows(
         else:
             rows.append(_make_row(
                 keys=keys, section="Portfolio KPIs", item="Status",
-                metric="portfolio_status", value="Not Included",
-                signal=_SIGNAL_OK, priority=_PRI_LOW,
-                notes="My_Portfolio not in universes. Add My_Portfolio to pages_selected",
+                metric="portfolio_status", value="Membership Evidence Unavailable",
+                signal=_SIGNAL_WARN, priority=_PRI_LOW,
+                notes="Requested portfolio coverage could not be established; custody and money remain unknown.",
                 last_updated_riyadh=timestamp,
             ))
 
@@ -3766,6 +3825,33 @@ async def build_insights_analysis_rows(
 
     if do_macro_signals and ctx.all_quotes:
         rows.extend(_build_macro_signal_rows(ctx, ctx.all_quotes))
+
+    coverage = {
+        "scope": "sampled_research_only",
+        "portfolio_membership": portfolio_membership,
+        "criteria_snapshot": _criteria_snapshot(norm_criteria),
+        "cohorts": cohort_receipts,
+    }
+    coverage["cohort_hash"] = hashlib.sha256(
+        json.dumps(coverage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    for name, receipt in cohort_receipts.items():
+        requested_count = len(receipt["requested"])
+        sampled_count = len(receipt["sampled"])
+        returned_count = len(receipt["returned"])
+        rejected_count = len(receipt["rejected"])
+        rows.append(_make_row(
+            keys=keys, section="System", item=f"Cohort Coverage: {name}",
+            metric="cohort_coverage", value=f"{returned_count} of {requested_count}",
+            signal=_SIGNAL_OK if returned_count == requested_count else _SIGNAL_WARN,
+            priority=_PRI_LOW,
+            notes=(f"Requested={requested_count}; sampled={sampled_count}; "
+                   f"returned={returned_count}; rejected={rejected_count}; "
+                   f"unsampled={requested_count - sampled_count}. Sampled research only; "
+                   f"not whole-market coverage, fresh acquisition or custody certification. "
+                   f"Cohort SHA256={coverage['cohort_hash']}"),
+            last_updated_riyadh=timestamp,
+        ))
 
     # v8.2.0 E1: Executive Summary headline, derived from the built section
     # rows (single source of truth -- counts mirror the detail rows). Appended
@@ -3835,6 +3921,7 @@ async def build_insights_analysis_rows(
             "mode": mode,
             "builder_version": INSIGHTS_BUILDER_VERSION,
             "criteria_snapshot": _criteria_snapshot(norm_criteria),
+            "coverage_receipt": coverage,
             "warnings": warnings,
             "decision_scope_used": _decision_scope_used,
             "decision_set_size": _decision_set_size,
