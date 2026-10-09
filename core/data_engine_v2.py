@@ -3905,7 +3905,10 @@ from core.financial_units import (
 # withhold failed funding rows while retaining protective exits and source facts.
 # v5.151.6: score witnessed margin units consistently across supplier, cache
 # and publication paths without changing source values or policy thresholds.
-__version__ = "5.151.8"
+# v5.151.9: preserve a value-bound raw intrinsic model basis through F7;
+# compress only display values once, and never recapture a missing-price HOLD
+# as an upstream provider rating. Settlement failures remain fail-closed.
+__version__ = "5.151.9"
 
 from core.sheet_presentation import present_instrument_row
 
@@ -5201,11 +5204,9 @@ def _intrinsic_display_cap_enabled() -> bool:
 
 def _intrinsic_display_cap_max_pct() -> float:
     """v5.87.0 (Fix AG): displayed-upside ceiling in PERCENT POINTS (default 35,
-    FLOORED at 30). The 30 floor is a HARD INVARIANT, not a preference:
-    intrinsic_value/upside_pct feed valuation_score (contribution clamped at +25),
-    the value_view label (CHEAP at >=30) and the top-factors note (>=15), so any
-    ceiling >= 30 leaves all three -- and therefore every score, label and
-    recommendation -- byte-identical. Read at call time. Env:
+    FLOORED at 30). Preserve the existing display-policy floor. Current scoring
+    consumes intrinsic values directly; this floor does not prove scores or
+    recommendations are equivalent to the uncapped model. Read at call time. Env:
     TFB_INTRINSIC_DISPLAY_MAX_PCT."""
     v = _get_env_float("TFB_INTRINSIC_DISPLAY_MAX_PCT", 35.0)
     if v < 30.0:
@@ -5213,20 +5214,124 @@ def _intrinsic_display_cap_max_pct() -> float:
     return v
 
 
+_INTRINSIC_DISPLAY_BASIS_KEY = "_intrinsic_display_basis"
+_INTRINSIC_DISPLAY_SOURCE_FIELDS = (
+    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    "data_provider", "current_price", "price", "eps_ttm", "pb_ratio", "target_mean_price",
+)
+
+
+def _intrinsic_display_source_signature(row: Mapping[str, Any]) -> str:
+    """Exact source identity/type binding; private receipts never use a tag."""
+    import hashlib
+    import json
+    try:
+        values = {key: row.get(key) for key in _INTRINSIC_DISPLAY_SOURCE_FIELDS}
+        # The existing classifier owns configured fixed-income identity and
+        # stamps it after the display cap. Bind that effective identity from
+        # the start; a later policy change invalidates an old equity receipt.
+        if _sukuk_classification_enabled() and _row_is_fixed_income(row):
+            values["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+        encoded = json.dumps(values,
+                             sort_keys=True, allow_nan=False, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _intrinsic_display_number(value: Any) -> Optional[float]:
+    number = _as_float(value) if not isinstance(value, bool) else None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _intrinsic_display_values(cp: float, iv: float, upside: Any, policy: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """The existing hard/soft display map, applied to one raw model value."""
+    max_pct = policy["max_pct"]
+    ceiling = cp * (1.0 + max_pct / 100.0)
+    if iv <= ceiling:
+        return iv, upside
+    if policy["soft"]:
+        band_pp = policy["band_pp"]
+        excess = (iv - ceiling) / cp * 100.0
+        soft_pct = max_pct + band_pp * (1.0 - math.exp(-excess / band_pp))
+        return round(cp * (1.0 + soft_pct / 100.0), 4), round(soft_pct / 100.0, 6)
+    return round(ceiling, 4), round(max_pct / 100.0, 6)
+
+
+def _intrinsic_display_basis(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """Validate source, raw/output values and the policy that minted the copy."""
+    basis = row.get(_INTRINSIC_DISPLAY_BASIS_KEY)
+    if not isinstance(basis, Mapping) or type(basis.get("version")) is not int or basis.get("version") != 1:
+        return None
+    if basis.get("unproven") is not None:
+        return None
+    signature = _intrinsic_display_source_signature(row)
+    if not signature or basis.get("source_signature") != signature:
+        return None
+    cp = _intrinsic_display_number(row.get("current_price"))
+    raw_iv = _intrinsic_display_number(basis.get("raw_intrinsic"))
+    raw_upside = _intrinsic_display_number(basis.get("raw_upside"))
+    policy = basis.get("policy")
+    if cp is None or cp <= 0 or raw_iv is None or raw_iv <= 0 or raw_upside is None or not isinstance(policy, Mapping):
+        return None
+    max_pct, band = _intrinsic_display_number(policy.get("max_pct")), _intrinsic_display_number(policy.get("band_pp"))
+    if max_pct is None or max_pct < 30 or policy.get("soft") not in (True, False) or \
+            type(policy.get("soft")) is not bool or band is None or not 1 <= band <= 15:
+        return None
+    try:
+        displayed = _intrinsic_display_values(cp, raw_iv, raw_upside, policy)
+        if any(_intrinsic_display_number(basis.get(key)) is None for key in ("display_intrinsic", "display_upside")) or \
+                tuple(basis.get(key) for key in ("display_intrinsic", "display_upside")) != displayed:
+            return None
+        current = tuple(row.get(key) for key in ("intrinsic_value", "upside_pct"))
+        if any(_intrinsic_display_number(value) is None for value in current) or current not in (displayed, (raw_iv, raw_upside)):
+            return None
+        return basis
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _intrinsic_settlement_model_basis(row: Dict[str, Any]) -> Tuple[bool, Optional[Tuple[Any, Any]]]:
+    """Only a current value-bound receipt may recover a capped model input."""
+    basis = _intrinsic_display_basis(row)
+    if basis is not None:
+        return True, (basis["raw_intrinsic"], basis["raw_upside"])
+    parts = _mpc_warning_parts(row)
+    was_capped = any(part in {"intrinsic_ceiling_applied", "intrinsic_soft_ceiling_applied"} for part in parts)
+    return not (was_capped or _INTRINSIC_DISPLAY_BASIS_KEY in row), None
+
+
+def _intrinsic_display_receipt_matches(row: Mapping[str, Any], policy: Mapping[str, Any]) -> bool:
+    """Display-only evidence may prevent recompression, never prove a model."""
+    basis = row.get(_INTRINSIC_DISPLAY_BASIS_KEY)
+    if not isinstance(basis, Mapping) or type(basis.get("version")) is not int or basis.get("version") != 1:
+        return False
+    current = tuple(row.get(key) for key in ("intrinsic_value", "upside_pct"))
+    signature = _intrinsic_display_source_signature(row)
+    cp = _intrinsic_display_number(row.get("current_price"))
+    iv, upside = (_intrinsic_display_number(value) for value in current)
+    max_pct, band = _intrinsic_display_number(policy.get("max_pct")), _intrinsic_display_number(policy.get("band_pp"))
+    if cp is None or cp <= 0 or iv is None or iv <= 0 or upside is None or max_pct is None or max_pct < 30 or \
+            band is None or not 1 <= band <= 15 or type(policy.get("soft")) is not bool:
+        return False
+    upper_fraction = (max_pct + (band if policy["soft"] else 0)) / 100.0
+    upper_price = round(cp * (1 + upper_fraction), 4)
+    coherent = abs(upside - (iv - cp) / cp) <= .00005 / cp + .0000005
+    return bool(signature and signature == basis.get("source_signature") and basis.get("policy") == policy
+                and iv <= upper_price and upside <= upper_fraction + .0000005 and coherent
+                and all(_intrinsic_display_number(basis.get(key)) is not None for key in ("display_intrinsic", "display_upside"))
+                and current == (basis.get("display_intrinsic"), basis.get("display_upside")))
+
+
 def _cap_intrinsic_display(row: Dict[str, Any]) -> None:
     """v5.87.0 (Fix AG): clamp the DISPLAYED intrinsic_value / upside_pct so the
     sector-multiple fair-value model can no longer emit a ~2x-price 'fair value'
-    (COL.MC: intrinsic 11.98 vs price 5.71 = 109.8% upside) that the Top_10
-    builder then renders as a 100%+ valuation ticket, and that inflates the
-    Intrinsic Value / Upside % columns on every market page. DISPLAY-ONLY by
-    construction, on two independent guarantees:
-      1. called AFTER _phase_ii_quality_forecast (see the orchestrator, line
-         ~4320), so the synthetic forecast has ALREADY consumed the original
-         intrinsic_value -> forecast_price_*, expected_roi_* and every downstream
-         recommendation are untouched; and
-      2. the ceiling is floored at 30 (_intrinsic_display_cap_max_pct), so the
-         three score/label consumers (valuation_score clamp +25; value_view >=30;
-         top-factors >=15) are byte-identical.
+    as a display ticket. This runs after Phase-II and outside active F7
+    iterations. Source/value-bound receipts retain the raw model basis for
+    settlement; repeat display serialization is idempotent. The current
+    scorer DOES read intrinsic values, so a display ceiling cannot establish
+    equivalent scores. Its existing minimum ceiling and compression policy
+    remain unchanged.
     No-op -- byte-identical to v5.86.0 -- unless TFB_INTRINSIC_DISPLAY_CAP is set.
     Clamp-only, fail-open, adds NO column (schema 115). The transparency tag
     'intrinsic_ceiling_applied' avoids the reliability-scan substrings
@@ -5238,15 +5343,27 @@ def _cap_intrinsic_display(row: Dict[str, Any]) -> None:
         return
     if not _intrinsic_display_cap_enabled():
         return
-    cp = _as_float(row.get("current_price"))
+    cp = _intrinsic_display_number(row.get("current_price"))
     if cp is None or cp <= 0:
         return
-    iv = _as_float(row.get("intrinsic_value"))
+    iv = _intrinsic_display_number(row.get("intrinsic_value"))
     if iv is None or iv <= 0:
         return
-    max_pct = _intrinsic_display_cap_max_pct()
-    ceiling = cp * (1.0 + max_pct / 100.0)
-    if iv <= ceiling:
+    policy = {"max_pct": _intrinsic_display_cap_max_pct(),
+              "soft": _intrinsic_display_softcap_enabled(), "band_pp": _intrinsic_display_softcap_band_pp()}
+    basis = _intrinsic_display_basis(row)
+    upside = row.get("upside_pct")
+    unproven = basis is None and (_INTRINSIC_DISPLAY_BASIS_KEY in row or any(
+        part in {"intrinsic_ceiling_applied", "intrinsic_soft_ceiling_applied"} for part in _mpc_warning_parts(row)))
+    if basis is not None:
+        current = (row.get("intrinsic_value"), upside)
+        if basis["policy"] == policy and current == (basis["display_intrinsic"], basis["display_upside"]):
+            return
+        iv, upside = basis["raw_intrinsic"], basis["raw_upside"]
+    elif unproven and _intrinsic_display_receipt_matches(row, policy):
+        return
+    displayed_iv, displayed_upside = _intrinsic_display_values(cp, iv, upside, policy)
+    if displayed_iv == iv and basis is None and not unproven:
         return
     # v5.124.0 (Fix B5): OPT-IN soft compression above the ceiling, the exact
     # v5.79.3 (Fix O) pattern already proven on provider targets. WHY
@@ -5262,18 +5379,21 @@ def _cap_intrinsic_display(row: Dict[str, Any]) -> None:
     # byte-identical to v5.123.0. Tag 'intrinsic_soft_ceiling_applied'
     # avoids the reliability-scan substrings (cap/forecast/target/roi/
     # drop/reject) exactly like the hard tag it parallels.
-    if _intrinsic_display_softcap_enabled():
-        band_pp = _intrinsic_display_softcap_band_pp()
-        excess = (iv - ceiling) / cp * 100.0          # percent points over
-        soft_pct = max_pct + band_pp * (1.0 - math.exp(-excess / band_pp))
-        soft_iv = cp * (1.0 + soft_pct / 100.0)
-        row["intrinsic_value"] = round(soft_iv, 4)
-        row["upside_pct"] = round(soft_pct / 100.0, 6)
-        _v573_append_warning(row, "intrinsic_soft_ceiling_applied")
-        return
-    row["intrinsic_value"] = round(ceiling, 4)
-    row["upside_pct"] = round(max_pct / 100.0, 6)
-    _v573_append_warning(row, "intrinsic_ceiling_applied")
+    row["intrinsic_value"], row["upside_pct"] = displayed_iv, displayed_upside
+    signature = _intrinsic_display_source_signature(row)
+    if signature and _intrinsic_display_number(upside) is not None and \
+            all(_intrinsic_display_number(value) is not None for value in (displayed_iv, displayed_upside)):
+        receipt = {
+            "version": 1, "source_signature": signature,
+            "display_intrinsic": displayed_iv, "display_upside": displayed_upside, "policy": dict(policy),
+        }
+        if unproven:
+            receipt["unproven"] = True  # Current display is bounded; raw model remains unknown.
+        else:
+            receipt.update(raw_intrinsic=iv, raw_upside=upside)
+        row[_INTRINSIC_DISPLAY_BASIS_KEY] = receipt
+    if displayed_iv != iv:
+        _v573_append_warning(row, "intrinsic_soft_ceiling_applied" if policy["soft"] else "intrinsic_ceiling_applied")
 
 
 def _intrinsic_display_softcap_enabled() -> bool:
@@ -7739,6 +7859,8 @@ _ENGINE_WRITTEN_RECO_SOURCES: frozenset = frozenset({
     "provider_override",
     "enrichment_failed",
     "empty_row",
+    "price_unavailable",
+    "fixed_income_sukuk",
 })
 
 
@@ -8961,7 +9083,8 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     _synthesize_market_cap_if_zero(row)
     _compute_intrinsic_and_upside(row)
     _phase_ii_quality_forecast(row)
-    _cap_intrinsic_display(row)  # v5.87.0 (Fix AG): display-only, AFTER the forecast read
+    if not row.get("_f7_settlement_active"):
+        _cap_intrinsic_display(row)  # Display only; F7 reads the witnessed raw model basis.
 
     has_scores = any(
         _as_float(row.get(k)) is not None
@@ -9066,6 +9189,8 @@ def _f7_settle_holdback(row: Dict[str, Any], result: Optional[F7SettlementResult
     """Withhold dependent scores/new capital while retaining facts and exits."""
     if not isinstance(row, dict):
         return
+    if result is not None or _f7_settle_failed(row):
+        _cap_intrinsic_display(row)  # Holding a score never bypasses the active display policy.
     if result is not None and result.status != "stable":
         import json
         _v573_append_warning(row, _F7_SETTLE_FAILURE_TAG + result.status)
@@ -9246,7 +9371,17 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
             cand = _copy.deepcopy(prev)
             cand["_f7_settlement_active"] = True
             passes_run += 1
+            proved_basis, model_values = _intrinsic_settlement_model_basis(cand)
+            if not proved_basis:
+                return F7SettlementResult("error", passes_run=passes_run, first_diff=first_diff,
+                                          reason="intrinsic_model_basis_unproven")
+            if model_values is not None:
+                cand["intrinsic_value"], cand["upside_pct"] = model_values
             _compute_scores_canonical_first(cand)
+            if model_values is not None:
+                # The canonical patch rounds its display upside independently;
+                # Phase-II must consume the same witnessed raw tuple as scoring.
+                cand["intrinsic_value"], cand["upside_pct"] = model_values
             _apply_phase_dd_enhancements(cand)
             cand.pop("_f7_settlement_active", None)
             changed_inputs = [key for key, value in source_input.items() if cand.get(key) != value]
@@ -9263,6 +9398,8 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 first_diff = last_diff
             if not last_diff:
                 stable_row = row if k == 2 else cand
+                if stable_row is not row:
+                    _cap_intrinsic_display(stable_row)
                 return F7SettlementResult("stable", stable_row, k, passes_run, first_diff)
             if any(not _f7_settle_diff(prior, cand, strict=True) for prior in history):
                 return F7SettlementResult("non_converged", passes_run=passes_run,
@@ -10070,6 +10207,25 @@ def _portfolio_rebalance_action(gap: Optional[float], band: float) -> str:
     return "HOLD"
 
 
+def _portfolio_missing_price_holdback(row: Dict[str, Any]) -> None:
+    """No new-capital portfolio display without a positive usable quote.
+
+    A carried position value can still support factual drift arithmetic while
+    the current quote is absent. Keep that arithmetic and protective exits,
+    but do not turn it into an ADD instruction.
+    """
+    value = row.get("current_price")
+    price = _as_float(value)
+    if price is None:
+        value = row.get("price")
+        price = _as_float(value)
+    if not isinstance(value, bool) and price is not None and math.isfinite(price) and price > 0.0:
+        return
+    for field in ("action_flag", "decision"):
+        if row.get(field) == "ADD":
+            row[field] = "HOLD"
+
+
 def _position_math_authoritative_enabled() -> bool:
     """v5.92.0 (Fix AH): master switch (default ON) for recomputing the
     price-dependent My_Portfolio position fields (position_value, unrealized_pl,
@@ -10503,6 +10659,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     r["portfolio_fx_status"] = _msg
                     r["action_flag"] = _portfolio_rebalance_action(None, band)
                     r["decision"] = _portfolio_decision(r, None, band, weak)
+                    _portfolio_missing_price_holdback(r)
                     _f7_settle_holdback(r)
                 return
             for r in rows:
@@ -10535,6 +10692,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                 r["weight_gap"] = gap
             r["action_flag"] = _portfolio_rebalance_action(gap, band)
             r["decision"] = _portfolio_decision(r, gap, band, weak)
+            _portfolio_missing_price_holdback(r)
             _f7_settle_holdback(r)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(
