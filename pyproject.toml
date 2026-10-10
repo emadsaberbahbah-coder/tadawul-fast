@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = [
+  "ignore:Support for class-based `config` is deprecated:DeprecationWarning",
+  "ignore:datetime.datetime.utcnow\\(\\) is deprecated:DeprecationWarning",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:Warning",
+]

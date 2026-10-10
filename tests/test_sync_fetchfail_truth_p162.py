@@ -27,7 +27,14 @@ SYNC = os.environ.get("TFB_TEST_SYNC_DELIVERED") or os.path.join(ROOT, "scripts"
 BASE = os.environ.get("TFB_TEST_SYNC_BASE", "")
 EXPORT = os.environ.get("TFB_TEST_EXPORT_DIR", "")
 csv.field_size_limit(10 ** 9)
-os.environ.setdefault("GITHUB_RUN_ID", "36199188352")   # both trees stamp the same run id (else each module mints a uuid)
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run_id(monkeypatch):
+    monkeypatch.setenv('GITHUB_RUN_ID', '36199188352')
 
 
 def _load(path, name):

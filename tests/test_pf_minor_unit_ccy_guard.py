@@ -17,13 +17,14 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.sheets.schema_registry import get_sheet_headers  # noqa: E402
 
-HARNESS_VERSION = (1, 0, 0)
+HARNESS_VERSION = (1, 1, 0)
 GATE = "TFB_PF_MINOR_UNIT_CCY_GUARD"
 H = get_sheet_headers("My_Portfolio")
 
@@ -112,6 +113,27 @@ def test_on_rejects_every_minor_unit_spelling():
                        ("ILA", "ILS"), ("ILa", "ILS")):
         pre, _final, _out = _contract("AAA.L", major, ccy, 100.0, "1")
         assert pre[0] is False, (ccy, pre)
+
+
+def test_usx_joins_native_holdings_guard_only_with_both_flags():
+    # A legacy ledger declaring USX passed both sides of the old currency
+    # equality test. In the armed lane it must not certify native holdings.
+    for usx_gate in ("0", "1"):
+        for guard in ("0", "1"):
+            for quote_ccy in ("USX", "usx", "UsX"):
+                with patch.dict(os.environ, {"TFB_OPP_FX_USX_SUBUNIT": usx_gate}):
+                    pre, final, _out = _contract("SYNTH=F", "USX", quote_ccy, 479.75, guard)
+                    rejects = usx_gate == "1" and guard == "1"
+                    assert pre[0] is not rejects and final[0] is not rejects
+                    if rejects:
+                        assert "minor unit" in pre[1]
+
+
+def test_armed_usx_never_matches_usd_ledger_even_with_guard_off():
+    with patch.dict(os.environ, {"TFB_OPP_FX_USX_SUBUNIT": "1"}):
+        for guard in ("0", "1"):
+            pre, _final, _out = _contract("SYNTH.US", "USD", "USX", 479.75, guard)
+            assert pre == (False, "holding quote currency does not match native ledger currency")
 
 
 def test_on_keeps_major_unit_holdings_working():

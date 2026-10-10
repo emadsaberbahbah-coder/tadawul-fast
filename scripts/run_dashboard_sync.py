@@ -3,9 +3,18 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.64.14)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.65.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.65.0 WHY (2026-10-10 work brief WP-05): seven crypto collisions were
+repeatedly preserved by last-good. TFB_SYNC_KLG_CRYPTO_NAME_GATE accepts
+only off|observe|enforce (default off): observe logs without altering rows;
+enforce refuses mismatched predecessors and stubs definite curated-name
+mismatches after all persistence passes. Reuse the audit vocabulary exactly;
+unknown roots are not judged and token matches are not identity proof.
+WHY WP-04: USX minor units join the portfolio currency guard only when
+TFB_OPP_FX_USX_SUBUNIT is armed; existing defaults remain unchanged.
 
 v6.64.14: validate and copy canonical market presentation after all last-good
 restoration and at the direct Sheets writer. Unknown margin/return/label cells
@@ -1365,6 +1374,7 @@ from core.secret_redaction import (
 try:
     from scripts.critical_symbol_identity import (
         CRITICAL_FETCH_SYMBOLS,
+        crypto_name_matches,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -1375,6 +1385,7 @@ try:
 except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
     from critical_symbol_identity import (
         CRITICAL_FETCH_SYMBOLS,
+        crypto_name_matches,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -1876,7 +1887,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.64.14"
+SCRIPT_VERSION = "6.65.0"
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -4168,7 +4179,20 @@ def _inject_portfolio_holdings(
     return out, injected
 
 
-_PF_MINOR_UNIT_CCY = frozenset({"GBp", "GBX", "GBx", "ZAc", "ZAC", "ILA", "ILa"})
+_PF_MINOR_UNIT_CCY = frozenset({"GBp", "GBX", "GBx", "ZAc", "ZAC", "ILA", "ILa", "USX"})
+
+
+def _pf_quote_is_minor_unit(currency: Any) -> bool:
+    """USX joins the existing guard only with TFB_OPP_FX_USX_SUBUNIT armed.
+
+    WHY: cents quotes cannot establish a native USD ledger refresh. The
+    optional USX lane must preserve the legacy membership check when off.
+    """
+    raw = str(currency or "").strip()
+    if raw.upper() == "USX":
+        return (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}
+    return raw in _PF_MINOR_UNIT_CCY
 
 
 def _pf_minor_unit_ccy_guard() -> bool:
@@ -4218,7 +4242,7 @@ def _portfolio_holdings_contract(
         if currency != cost_basis[symbol]["currency"]:
             return False, "holding quote currency does not match native ledger currency"
         if _pf_minor_unit_ccy_guard() and currency_i < len(row) and \
-                str(row[currency_i] or "").strip() in _PF_MINOR_UNIT_CCY:
+                _pf_quote_is_minor_unit(row[currency_i]):
             return False, "holding quote currency is a minor unit; native ledger is major"
         if require_complete:
             qty = _pm_to_float(row[qty_i]) if qty_i < len(row) else None
@@ -8932,6 +8956,68 @@ def _klg_fetchfail_selftest() -> str:
     return "PASS" if passed == total else "FAIL %d/%d" % (passed, total)
 
 
+def _klg_crypto_name_mode() -> str:
+    raw = (os.getenv("TFB_SYNC_KLG_CRYPTO_NAME_GATE") or "off").strip().lower()
+    return raw if raw in {"observe", "enforce"} else "off"
+
+
+def _crypto_name_firewall(headers: List[Any], rows_matrix: List[List[Any]]) -> tuple:
+    """Final, pure name screen after all restoration seams; off is a no-op.
+
+    Data-free stubs are already honest and must retain their original tags.
+    Unknown symbols are unjudged; no provider IDs are guessed from a name.
+    """
+    mode = _klg_crypto_name_mode()
+    suspects: List[str] = []
+    if mode == "off" or not headers or not rows_matrix:
+        return rows_matrix, suspects
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+    warn_i = _guard_find_col(list(headers), _FG_WARN_ALIASES)
+    if min(sym_i, name_i) < 0:
+        return rows_matrix, suspects
+    for index, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or len(row) <= max(sym_i, name_i):
+            continue
+        if _guard_is_blank(row[name_i]):
+            continue
+        if crypto_name_matches(row[sym_i], row[name_i]) is not False:
+            continue
+        symbol = str(row[sym_i]).strip().upper()
+        suspects.append(symbol)
+        if mode == "enforce":
+            stub = ["" for _ in row]
+            stub[sym_i] = row[sym_i]
+            if 0 <= warn_i < len(stub):
+                stub[warn_i] = "identity_quarantined:crypto_name:v6.65.0"
+            rows_matrix[index] = stub
+    return rows_matrix, suspects
+
+
+def _append_runlog_crypto_name(sheets: Any, spreadsheet_id: str, page: str,
+                              mode: str, symbols: List[str]) -> None:
+    """One telemetry-only line; never receives or records instrument names."""
+    if sheets is None or not symbols or mode == "off":
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        msg = (f"[CRYPTO-NAME v{SCRIPT_VERSION}] {page} mode={mode} "
+               f"suspects={len(symbols)} stubbed={len(symbols) if mode == 'enforce' else 0}")
+        svc.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range="'_Run_Log'!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [[datetime.now(timezone.utc).isoformat(), "WARNING",
+                              "run_dashboard_sync", page, mode.upper(), msg,
+                              "", "", "", _runlog_meta_json(json.dumps({
+                                  "version": SCRIPT_VERSION, "mode": mode,
+                                  "suspects": len(symbols)}))]]},
+        ).execute()
+    except Exception as exc:
+        logger.warning("[CRYPTO-NAME] run-log append unavailable (%s)", type(exc).__name__)
+
+
 def _keep_last_good_rows(
     sheets: "SheetsWriter",
     spreadsheet_id: str,
@@ -9061,6 +9147,15 @@ def _keep_last_good_rows(
             continue  # old row not good -> keep the fresh stub
         if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
             continue
+        crypto_mode = _klg_crypto_name_mode()
+        if crypto_mode != "off" and crypto_name_matches(
+            t, row[old_name_i] if 0 <= old_name_i < len(row) else ""
+        ) is False:
+            logger.warning("[CRYPTO-NAME v%s] last-good name mismatch mode=%s symbol=%s",
+                           SCRIPT_VERSION, crypto_mode, t)
+            if crypto_mode == "enforce":
+                _LAST_KLG_ID_SUSPECTS.append(t)
+                continue
         # v6.24.0 FW-1: price+provider is no longer enough - the 2026-07-13
         # poison rode back in on exactly that certification. The old row
         # must also carry a Name and agree with its own P/E==Price/EPS
@@ -12941,6 +13036,25 @@ async def _run_one_task(
                 fail_result_on_identity(res, _critical_identity_failures)
                 return res
         # ---------------------------------------------------------------------
+
+        # WP-05 final name screen: after PV-2, FW-KEEP and operator quarantine,
+        # so no later last-good restoration can resurrect a rejected identity.
+        if task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES:
+            rows_matrix, _crypto_suspects = _crypto_name_firewall(headers, rows_matrix)
+            if _crypto_suspects:
+                _crypto_mode = _klg_crypto_name_mode()
+                _crypto_msg = (f"[CRYPTO-NAME v{SCRIPT_VERSION}] {task.sheet_name} "
+                               f"mode={_crypto_mode} suspects={len(_crypto_suspects)}")
+                logger.warning(_crypto_msg)
+                res.warnings.append(_crypto_msg)
+                _append_runlog_crypto_name(sheets, spreadsheet_id, task.sheet_name,
+                                          _crypto_mode, _crypto_suspects)
+                if _crypto_mode == "enforce":
+                    res._stamp_meta["stubbed"] = int(res._stamp_meta.get("stubbed") or 0) + len(_crypto_suspects)
+                    _noncurrent_fetched_symbols = _merge_noncurrent_fetched_lineage(
+                        _fetched_origin_symbols, _noncurrent_fetched_symbols, _crypto_suspects)
+                    res._stamp_meta["noncurrent_fetched"] = len(_noncurrent_fetched_symbols)
+                    res._stamp_meta["ff_new_fetched"] = len(_fetchfail_origin_symbols - _noncurrent_fetched_symbols)
 
         # v6.20.0 (Fix 1b): harvest (page, symbol, price) from the FINAL matrix
         # for the cross-page price-delta report. Read-only; flag-gated; can

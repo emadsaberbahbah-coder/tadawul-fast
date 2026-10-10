@@ -12,8 +12,8 @@ disagree, and the in-workbook validator (Dashboard_Audit) samples only 1,500
 rows per page (P-190). This script runs the full population of every tab in
 one pass and prints the same numbers every time.
 
-It is READ-ONLY and STANDALONE: it needs openpyxl and nothing from the repo,
-so it runs on any machine against any .xlsx export of "Market Share
+It is READ-ONLY: it needs openpyxl plus the repository's reviewed crypto
+identity registry, and runs offline against any .xlsx export of "Market Share
 Deepseek-V3". It never opens the live Sheet, never writes to it, and never
 calls a provider. Sharing / ACL state cannot be checked offline and is
 reported as NOT CHECKED, never as PASS.
@@ -72,6 +72,21 @@ one halala. Cash and FX default to a maximum age of 24 hours, configurable with
 --cash-max-age-hours; future timestamps always fail. An invalid latest record
 retains its raw amount and reasons, but cannot supply certified cash or NAV.
 This offline check does not authenticate a broker read or approve funding.
+
+WHY (v1.2.0, 2026-10-11): WP-06 reporting corrections
+---------------------------------------------------
+Margin publishing already emits exact-value fraction receipts. Opt-in
+--margin-receipts / TFB_AUDIT_MARGIN_RECEIPTS=1 separates certified positive
+fractions above 100% and negative margins below -100% from unknown units.
+Conflicting, malformed, non-finite or stale receipts establish no unit.
+Opt-in --eodhd-fail-pct / TFB_AUDIT_EODHD_FAIL_PCT retains the plan at each
+counter maximum: cost-target overruns become WARN below that plan threshold.
+Both switches default off; legacy reporting remains unchanged except this
+version stamp and the required distinction between blank risk measurements
+and numeric zero placeholders. Performance_Log headers at row 5 are by
+design (the KPI panel occupies AG1:AK13). _Cash_Snapshot also permits operator
+template rows marked _Status; only actual appended cash records certify cash.
+No sheet/provider calls or production recommendation changes are introduced.
 """
 from __future__ import annotations
 
@@ -88,7 +103,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.2.0"
 
 try:
     import openpyxl
@@ -108,48 +123,13 @@ DEAD_TABS = ["_Diag_Response_Shape", "_Data_Audit", "Diagnostic_Report", "Sheet9
 LABEL_DAYS = {"1W": 7, "2W": 14, "1M": 30, "3M": 90, "6M": 180, "12M": 365, "1Y": 365}
 SELL_CLASS = {"SELL", "STRONG_SELL", "REDUCE", "AVOID"}
 
-# Curated crypto identity map: base symbol -> name keywords (any must appear).
-CRYPTO_NAMES = {
-    "BTC": ["bitcoin"], "ETH": ["ethereum"], "SOL": ["solana"], "XRP": ["xrp", "ripple"],
-    "BNB": ["bnb", "binance"], "ADA": ["cardano"], "DOGE": ["dogecoin"], "TRX": ["tron"],
-    "AVAX": ["avalanche"], "DOT": ["polkadot"], "LINK": ["chainlink"], "MATIC": ["polygon"],
-    "POL": ["polygon"], "LTC": ["litecoin"], "SHIB": ["shiba"], "UNI": ["uniswap"],
-    "APT": ["aptos"], "SUI": ["sui"], "COMP": ["compound"], "ATOM": ["cosmos"],
-    "NEAR": ["near"], "ARB": ["arbitrum"], "OP": ["optimism"], "AAVE": ["aave"],
-    "MKR": ["maker"], "LDO": ["lido"], "TIA": ["celestia"], "EGLD": ["multiversx", "elrond"],
-    "FIL": ["filecoin"], "ICP": ["internet computer"], "XLM": ["stellar"],
-    "BCH": ["bitcoin cash"], "ETC": ["ethereum classic"], "HBAR": ["hedera"],
-    "VET": ["vechain"], "ALGO": ["algorand"], "IMX": ["immutable"], "INJ": ["injective"],
-    "RNDR": ["render"], "RENDER": ["render"], "GRT": ["graph"], "SAND": ["sandbox"],
-    "MANA": ["decentraland"], "AXS": ["axie"], "FTM": ["fantom"], "XMR": ["monero"],
-    "TON": ["toncoin", "ton"], "PEPE": ["pepe"], "SEI": ["sei"], "STX": ["stacks"],
-    "KAS": ["kaspa"], "TAO": ["bittensor"], "USDT": ["tether"], "USDC": ["usd coin", "usdc"],
-    "DAI": ["dai"], "CRO": ["cronos", "crypto.com"], "QNT": ["quant"], "THETA": ["theta"],
-    "FLOW": ["flow"], "CHZ": ["chiliz"], "ENS": ["ethereum name"], "GALA": ["gala"],
-    "APE": ["apecoin"], "CRV": ["curve"], "SNX": ["synthetix"], "RUNE": ["thorchain"],
-    "KAVA": ["kava"], "ZEC": ["zcash"], "DASH": ["dash"], "NEO": ["neo"], "EOS": ["eos"],
-    "XTZ": ["tezos"], "MINA": ["mina"], "ROSE": ["oasis"], "ONE": ["harmony"],
-    "ZIL": ["zilliqa"], "ENJ": ["enjin"], "BAT": ["basic attention"], "1INCH": ["1inch"],
-    "SUSHI": ["sushi"], "YFI": ["yearn"], "DYDX": ["dydx"], "GMX": ["gmx"],
-    "PENDLE": ["pendle"], "JUP": ["jupiter"], "PYTH": ["pyth"], "ONDO": ["ondo"],
-    "ENA": ["ethena"], "BONK": ["bonk"], "FLOKI": ["floki"], "AR": ["arweave"],
-    "FET": ["fetch", "artificial superintelligence"], "WLD": ["worldcoin"],
-    "BLUR": ["blur"], "CFX": ["conflux"], "MNT": ["mantle"], "STRK": ["starknet"],
-    "AKT": ["akash"], "JASMY": ["jasmy"], "IOTA": ["iota"], "HNT": ["helium"],
-    "RAY": ["raydium"], "CAKE": ["pancake"], "LUNC": ["terra"], "LUNA": ["terra"],
-    "FXS": ["frax"], "BTT": ["bittorrent"], "NEXO": ["nexo"], "GNO": ["gnosis"],
-    "RPL": ["rocket pool"], "CVX": ["convex"], "BAL": ["balancer"], "LRC": ["loopring"],
-    "ANKR": ["ankr"], "CELO": ["celo"], "KSM": ["kusama"], "GLMR": ["moonbeam"],
-    "ASTR": ["astar"], "WAVES": ["waves"], "ZRX": ["0x"], "QTUM": ["qtum"], "ICX": ["icon"],
-    "ONT": ["ontology"], "STORJ": ["storj"], "SC": ["siacoin"], "DCR": ["decred"],
-    "RVN": ["ravencoin"], "XEC": ["ecash"], "BSV": ["bitcoin sv"], "XEM": ["nem"],
-    "LSK": ["lisk"], "DGB": ["digibyte"], "XNO": ["nano"], "HOT": ["holo"],
-    "CKB": ["nervos"], "MASK": ["mask"], "LPT": ["livepeer"], "UMA": ["uma"],
-    "KNC": ["kyber"], "PAXG": ["pax gold"], "XAUT": ["tether gold"], "TUSD": ["trueusd"],
-    "FDUSD": ["first digital"], "PYUSD": ["paypal"], "WIF": ["dogwifhat", "wif"],
-    "NOT": ["notcoin"], "ORDI": ["ordi"], "BEAM": ["beam"], "W": ["wormhole"],
-    "ETHFI": ["ether.fi"], "AERO": ["aerodrome"], "ZK": ["zksync"], "TWT": ["trust wallet"],
-}
+# WP-05: the offline audit and provider guards share the reviewed registry.
+# Direct script execution puts scripts/, not the repository root, on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from core.symbols.crypto_identity import CRYPTO_NAME_TOKENS as CRYPTO_NAMES
+
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +150,40 @@ def _num(v):
 
 def _s(v):
     return "" if v is None else str(v).strip()
+
+
+def _margin_fraction_receipt(warnings, field, value):
+    """Match core.sheet_presentation._carry_unit's exact-value contract.
+
+    Warnings are untrusted: EVERY receipt for this field must be valid and
+    agree. A matching token cannot conceal another stale/conflicting token.
+    A receipt certifies display units, never supplier plausibility.
+    """
+    def finite_number(v):
+        if v is None or isinstance(v, bool):
+            return None
+        try:
+            n = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return n if math.isfinite(n) else None
+
+    prefix = "sheet_margin_unit:" + field + ":"
+    items = warnings if isinstance(warnings, (list, tuple)) else [warnings]
+    records = []
+    for item in items:
+        for part in str(item).split(";"):
+            part = part.strip()
+            if not part.startswith(prefix):
+                continue
+            unit, separator, witness = part[len(prefix):].partition(":")
+            number = finite_number(witness)
+            if not separator or unit not in {"fraction", "percent_points"} or number is None:
+                return False
+            records.append((unit, number))
+    number = finite_number(value)
+    return bool(records and number is not None and len(set(records)) == 1
+                and records[0] == ("fraction", number))
 
 
 def _parse_dt(v, tz_offset_hours=3):
@@ -326,7 +340,7 @@ def check_structure(book, now_utc):
     return out
 
 
-def check_market_pages(book, expect, asof_date, dq_floor, rel_floor):
+def check_market_pages(book, expect, asof_date, dq_floor, rel_floor, margin_receipts=False):
     out, metrics, allsyms = [], {}, collections.Counter()
     invest_total = invest_pass = 0
     for page in MARKET_PAGES:
@@ -385,6 +399,22 @@ def check_market_pages(book, expect, asof_date, dq_floor, rel_floor):
         pm_vals = [_num(r[pm_i]) for r in body if pm_i is not None]
         pm_n = sum(1 for v in pm_vals if v is not None)
         pm_bad = sum(1 for v in pm_vals if v is not None and abs(v) > 1.0)
+        pm_negative, pm_certified = [], []
+        if margin_receipts:
+            warning_i = ix.get("Warnings")
+            uncertified = []
+            for i, r in enumerate(body):
+                value = _num(r[pm_i]) if pm_i is not None else None
+                if value is None:
+                    continue
+                if value < -1.0:
+                    pm_negative.append(f"{syms[i]} {value:g}")
+                elif value > 1.0:
+                    target = (pm_certified if warning_i is not None and
+                              _margin_fraction_receipt(r[warning_i], "profit_margin", r[pm_i])
+                              else uncertified)
+                    target.append(f"{syms[i]} {value:g}")
+            pm_bad = len(uncertified)
         gm_bad = sum(1 for r in body if gm_i is not None and (_num(r[gm_i]) or 0) > 1.0)
         om_bad = sum(1 for r in body if om_i is not None and (_num(r[om_i]) or 0) > 1.0)
         confs = collections.Counter(_num(r[conf_i]) for r in body if conf_i is not None and _num(r[conf_i]) is not None)
@@ -408,6 +438,9 @@ def check_market_pages(book, expect, asof_date, dq_floor, rel_floor):
                  invest=inv, invest_eligible=inv_ok, sell_class_invest=sell_inv,
                  dates=dict(dates.most_common(5)), no_update_date=no_date)
         metrics[page] = m
+        if margin_receipts:
+            m.update(pm_below_minus_1=len(pm_negative),
+                     pm_receipt_certified_over_1=len(pm_certified))
         out.append(F("a", "DATA", f"{page}.duplicate_symbols", "PASS" if dup == 0 else "FAIL", dup))
         out.append(F("a", "DATA", f"{page}.blank_symbols", "PASS" if blank_sym == 0 else "FAIL", blank_sym))
         out.append(F("a", "DATA", f"{page}.missing_names", "PASS" if not miss_name else "WARN",
@@ -428,7 +461,16 @@ def check_market_pages(book, expect, asof_date, dq_floor, rel_floor):
             share = pm_bad / pm_n
             out.append(F("a", "DATA", f"{page}.profit_margin_unit_errors",
                          "PASS" if share < 0.05 else "FAIL", pm_bad,
-                         f"{share:.1%} of {pm_n} populated margins are > 1.0 (P-152 unit error)"))
+                         (f"{share:.1%} of {pm_n} populated margins are > 1.0 without a matching fraction receipt (P-152 unit error)"
+                          if margin_receipts else
+                          f"{share:.1%} of {pm_n} populated margins are > 1.0 (P-152 unit error)")))
+            if margin_receipts:
+                out.append(F("a", "DATA", f"{page}.margin_receipt_certified_over_100pct",
+                             "WARN" if pm_certified else "PASS", len(pm_certified),
+                             "exact-value fraction receipt; supplier plausibility requires owner review", pm_certified))
+                out.append(F("a", "DATA", f"{page}.profit_margin_below_minus_100pct",
+                             "WARN" if pm_negative else "PASS", len(pm_negative),
+                             "negative margin magnitude is not evidence of a percent-points unit error", pm_negative))
         if gm_bad or om_bad:
             out.append(F("a", "DATA", f"{page}.gross_operating_margin_over_1", "WARN",
                          gm_bad + om_bad, f"gross {gm_bad}, operating {om_bad}"))
@@ -1017,7 +1059,10 @@ def check_model(book, tz_offset):
         kc = collections.Counter(_s(r[key_i]) for r in matured)
         dups = sum(v - 1 for v in kc.values() if v > 1)
         risk_cols = [h for h in ix if any(k in h for k in ("Volatility", "Drawdown", "Sharpe"))]
-        zero_cols = [h for h in risk_cols if recs and all((_num(r[ix[h]]) or 0) == 0 for r in recs)]
+        blank_cols = [h for h in risk_cols if recs and all(not _s(r[ix[h]]) for r in recs)]
+        zero_cols = [h for h in risk_cols if recs
+                     and any(_s(r[ix[h]]) for r in recs)
+                     and all(not _s(r[ix[h]]) or _num(r[ix[h]]) == 0 for r in recs)]
         metrics.update(perf_records=len(recs), perf_matured=len(matured), perf_wins=wins, perf_losses=losses,
                        perf_win_rate=(round(wr * 100, 2) if wr is not None else None), perf_dup_matured_keys=dups,
                        perf_zero_risk_cols=zero_cols)
@@ -1029,6 +1074,12 @@ def check_model(book, tz_offset):
                      "P-189; dedup fix exists in track_performance v6.41.0 (TRACK_DEDUP_MATURED)"))
         out.append(F("d", "MODEL", "performance_log_risk_columns_all_zero", "PASS" if not zero_cols else "FAIL",
                      len(zero_cols), "P-188; zero is not 'unavailable'", zero_cols))
+        if any(not _s(r[ix[h]]) for h in risk_cols for r in recs):
+            metrics.update(perf_blank_risk_cols=blank_cols,
+                           perf_risk_blank_cells=sum(not _s(r[ix[h]]) for h in risk_cols for r in recs))
+            out.append(F("d", "MODEL", "performance_log_risk_columns_not_measured", "INFO",
+                         len(blank_cols), "blank risk cells mean not measured; numeric zero placeholders remain P-188 failures",
+                         blank_cols))
     ix, body = book.table("Signal_History")
     if ix and "Symbol" in ix:
         d_i = next((ix[h] for h in ix if h.startswith("Date")), None)
@@ -1091,14 +1142,14 @@ def _cron_slots(cron):
     return int(m.group(1)), sorted(int(h) for h in m.group(2).split(",") if h)
 
 
-def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_date):
+def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_date, eodhd_fail_pct=0):
     out, metrics = [], {}
     rows = book.rows("_Run_Log") or []
     if not rows:
         return [F("e", "PIPELINE", "run_log_present", "WARN", 0, "_Run_Log not in export")], metrics
     since = now_utc - dt.timedelta(days=since_days)
     recent, levels, errors = [], collections.Counter(), collections.Counter()
-    quota = {}
+    quota, quota_limits = {}, {}
     rows402 = 0
     refusals = 0
     sync_rows = []   # (ts, run id or None) for run_dashboard_sync rows in the window
@@ -1118,7 +1169,12 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
         m = re.search(r"\[EODHD-QUOTA[^\]]*\].*?used=(\d+)/(\d+).*?date=(\S+)", msg)
         if m:
             used, limit, date = int(m.group(1)), int(m.group(2)), m.group(3)
-            quota[date] = max(quota.get(date, 0), used)
+            # Bind the denominator to the peak observation; at tied maxima
+            # use the smaller plan so a conflicting receipt cannot relax it.
+            if date not in quota or used > quota[date]:
+                quota[date], quota_limits[date] = used, limit
+            elif used == quota[date]:
+                quota_limits[date] = min(quota_limits[date], limit)
             m2 = re.search(r"rows402 new=(\d+)", msg)
             if m2 and ts >= since:
                 rows402 += int(m2.group(1))
@@ -1146,9 +1202,19 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     recent_dates = [d for d in sorted(quota) if d >= (now_utc - dt.timedelta(days=since_days)).strftime("%Y-%m-%d")]
     over = [f"{d} {quota[d]:,}" for d in recent_dates if quota[d] > eodhd_target and d != asof_date]
     metrics["eodhd_daily_max"] = {d: quota[d] for d in recent_dates}
-    out.append(F("e", "PIPELINE", "eodhd_daily_over_target", "PASS" if not over else "FAIL", len(over),
-                 f"of {len([d for d in recent_dates if d != asof_date])} full counter dates in the window are above "
-                 f"{eodhd_target:,} calls (today excluded as partial)", over))
+    if eodhd_fail_pct:
+        full_dates = [d for d in recent_dates if d != asof_date]
+        plan_fail = [f"{d} {quota[d]:,}/{quota_limits[d]:,}" for d in full_dates
+                     if quota_limits[d] <= 0 or quota[d] * 100 >= quota_limits[d] * eodhd_fail_pct]
+        metrics["eodhd_daily_limit"] = {d: quota_limits[d] for d in recent_dates}
+        out.append(F("e", "PIPELINE", "eodhd_daily_over_target", "WARN" if over else "PASS", len(over),
+                     f"above cost target {eodhd_target:,}; plan threshold is a separate check (today excluded as partial)", over))
+        out.append(F("e", "PIPELINE", "eodhd_daily_plan_threshold", "FAIL" if plan_fail else "PASS", len(plan_fail),
+                     f"usage >= {eodhd_fail_pct:g}% of recorded plan, or invalid zero plan (today excluded as partial)", plan_fail))
+    else:
+        out.append(F("e", "PIPELINE", "eodhd_daily_over_target", "PASS" if not over else "FAIL", len(over),
+                     f"of {len([d for d in recent_dates if d != asof_date])} full counter dates in the window are above "
+                     f"{eodhd_target:,} calls (today excluded as partial)", over))
     out.append(F("e", "PIPELINE", "eodhd_http_402_rows", "PASS" if rows402 == 0 else "FAIL", rows402,
                  f"rows that hit HTTP 402 in the last {since_days} days"))
     # Schedule lateness
@@ -1207,9 +1273,12 @@ def verdicts(findings):
 
 def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(3, 40.0),
                    eodhd_target=90000, cron="17 4,12,20", tz_offset=3, since_days=7,
-                   manifest=None, now_utc=None, cash_max_age_hours=24.0):
+                   manifest=None, now_utc=None, cash_max_age_hours=24.0,
+                   margin_receipts=False, eodhd_fail_pct=0):
     """Run every gate on one export. Returns a JSON-serialisable result dict."""
     expect = dict(DEFAULT_EXPECT if expect is None else expect)
+    if not math.isfinite(eodhd_fail_pct) or not 0 <= eodhd_fail_pct <= 100:
+        raise ValueError("eodhd_fail_pct must be between 0 and 100")
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
     book = Book(path)
     # as-of date = the most common Last Updated (UTC) date across market pages unless given
@@ -1223,7 +1292,7 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
         asof = max(dates) if dates else now_utc.strftime("%Y-%m-%d")
     findings, metrics = [], {"asof": asof}
     findings += check_structure(book, now_utc)
-    f, m = check_market_pages(book, expect, asof, dq, rel)
+    f, m = check_market_pages(book, expect, asof, dq, rel, margin_receipts)
     findings += f
     metrics["pages"] = m
     findings += check_crypto_identity(book)
@@ -1242,20 +1311,25 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
     f, m = check_model(book, tz_offset)
     findings += f
     metrics["model"] = m
-    f, m = check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof)
+    f, m = check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof, eodhd_fail_pct)
     findings += f
     metrics["runlog"] = m
     findings.append(F("gov", "GOVERNANCE", "workbook_sharing_acl", "NOT_CHECKED", None,
                       "cannot be read from an export; check Drive sharing by hand (A1/C01)"))
     lanes, overall = verdicts(findings)
     fixes = [f"{f['lane']}: {f['check']} ({f['count']}) - {f['detail']}" for f in findings if f["status"] == "FAIL"]
+    params = {"expect": expect, "dq": dq, "rel": rel, "sector_cap": list(sector_cap),
+              "eodhd_target": eodhd_target, "cron": cron, "tz_offset": tz_offset,
+              "since_days": since_days, "manifest": bool(manifest),
+              "cash_max_age_hours": cash_max_age_hours}
+    if margin_receipts:
+        params["margin_receipts"] = True
+    if eodhd_fail_pct:
+        params["eodhd_fail_pct"] = eodhd_fail_pct
     return {"script": "tfb_export_audit", "version": SCRIPT_VERSION, "export": os.path.basename(path),
             "export_sha256": _sha256_file(path), "asof": asof, "overall": overall, "lanes": lanes,
             "findings": findings, "metrics": metrics, "fix_list": fixes,
-            "params": {"expect": expect, "dq": dq, "rel": rel, "sector_cap": list(sector_cap),
-                       "eodhd_target": eodhd_target, "cron": cron, "tz_offset": tz_offset,
-                       "since_days": since_days, "manifest": bool(manifest),
-                       "cash_max_age_hours": cash_max_age_hours}}
+            "params": params}
 
 
 def _jsonable(o):
@@ -1599,6 +1673,43 @@ def selftest():
             # markdown renders without error and names the overall verdict
             md = render_md(res)
             expect_(res["overall"] in md and "## Fix list" in md, f"{tag}: markdown renders")
+            if not clean:
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                                           eodhd_fail_pct=75)
+                switched_fs = {f["check"]: f for f in switched["findings"]}
+                expect_(switched_fs["eodhd_daily_over_target"]["status"] == "WARN"
+                        and switched_fs["eodhd_daily_plan_threshold"]["status"] == "PASS"
+                        and switched["metrics"]["runlog"]["eodhd_daily_limit"]["2026-10-01"] == 400000,
+                        "plan switch: above cost target below plan threshold is WARN")
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                                           eodhd_fail_pct=25)
+                switched_fs = {f["check"]: f for f in switched["findings"]}
+                expect_(switched_fs["eodhd_daily_plan_threshold"]["status"] == "FAIL",
+                        "plan switch: at or above plan threshold is FAIL")
+                wb = openpyxl.load_workbook(path)
+                ws = wb["Global_Markets"]
+                ws.cell(1, 31, "Warnings")
+                ws.cell(8, 31, "sheet_margin_unit:profit_margin:fraction:25.8")
+                ws.cell(7, 18, -2.0)
+                wb.save(path)
+                wb.close()
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                                           margin_receipts=True)
+                switched_fs = {f["check"]: f for f in switched["findings"]}
+                expect_(switched_fs["Global_Markets.profit_margin_unit_errors"]["count"] == 0
+                        and switched_fs["Global_Markets.margin_receipt_certified_over_100pct"]["count"] == 1
+                        and switched_fs["Global_Markets.profit_margin_below_minus_100pct"]["count"] == 1,
+                        "margin switch: matching receipt and negative magnitude are separated")
+                wb = openpyxl.load_workbook(path)
+                wb["Global_Markets"].cell(8, 31,
+                    "sheet_margin_unit:profit_margin:fraction:25.8;sheet_margin_unit:profit_margin:fraction:0.258")
+                wb.save(path)
+                wb.close()
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                                           margin_receipts=True)
+                switched_fs = {f["check"]: f for f in switched["findings"]}
+                expect_(switched_fs["Global_Markets.profit_margin_unit_errors"]["status"] == "FAIL",
+                        "margin switch: conflicting receipt cannot suppress unit failure")
     passed = sum(1 for ok, _ in checks if ok)
     for ok, label in checks:
         print(("PASS " if ok else "FAIL ") + label)
@@ -1609,6 +1720,15 @@ def selftest():
 
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None):
+    def fail_pct(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError("EODHD fail percent must be between 0 and 100")
+        if not math.isfinite(number) or not 0 <= number <= 100:
+            raise argparse.ArgumentTypeError("EODHD fail percent must be between 0 and 100")
+        return number
+
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("export", nargs="?", help="path to the .xlsx export of the workbook")
     ap.add_argument("--json", help="write the full result JSON here")
@@ -1620,6 +1740,12 @@ def parse_args(argv=None):
     ap.add_argument("--rel", type=float, default=70.0, help="cockpit reliability floor")
     ap.add_argument("--sector-cap", default="3/40", help="policy sector cap names/percent (default 3/40)")
     ap.add_argument("--eodhd-target", type=int, default=90000)
+    ap.add_argument("--margin-receipts", action=argparse.BooleanOptionalAction,
+                    default=os.getenv("TFB_AUDIT_MARGIN_RECEIPTS", "0").strip().lower() in {"1", "true", "yes", "on"},
+                    help="classify exact-value fraction receipts separately (default off)")
+    ap.add_argument("--eodhd-fail-pct", type=fail_pct,
+                    default=os.getenv("TFB_AUDIT_EODHD_FAIL_PCT", "0"),
+                    help="FAIL at this percent of recorded plan; 0 preserves legacy target failure")
     ap.add_argument("--cron", default="17 4,12,20", help="daily_sync cron 'minute hours' in UTC")
     ap.add_argument("--tz-offset", type=int, default=3, help="workbook local offset (Riyadh = 3)")
     ap.add_argument("--since-days", type=int, default=7)
@@ -1653,7 +1779,8 @@ def main(argv=None):
     res = audit_workbook(a.export, expect=expect, asof=a.asof, dq=a.dq, rel=a.rel,
                          sector_cap=(int(n), float(pct)), eodhd_target=a.eodhd_target, cron=a.cron,
                          tz_offset=a.tz_offset, since_days=a.since_days, manifest=manifest, now_utc=now,
-                         cash_max_age_hours=a.cash_max_age_hours)
+                         cash_max_age_hours=a.cash_max_age_hours, margin_receipts=a.margin_receipts,
+                         eodhd_fail_pct=a.eodhd_fail_pct)
     res["generated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     res["digest"] = digest(res)
     if a.json:

@@ -34,7 +34,7 @@ def _load():
                 return m
     raise RuntimeError("routes/investment_advisor.py not found")
 
-IA = _load()
+IA = None
 
 class _URL:
     path = "/v1/advanced/sheet-rows"
@@ -103,6 +103,10 @@ def auth_body_te(**kw):
     raise TypeError("'NoneType' object is not subscriptable")
 
 def main():
+    global IA
+    for name in ("OPEN_MODE", "TFB_OPEN_MODE", "AUTH_DISABLED"):
+        os.environ[name] = "false"
+    IA = _load()
     assert not IA._is_public_path(_URL.path)
 
     # T1 — signature walk still succeeds; typeerror attempts flagged retryable
@@ -140,6 +144,15 @@ def main():
     assert ok is False and n == 7, (ok, n)
 
     print("P-130 battery: T1-T6 PASS | module version", IA.INVESTMENT_ADVISOR_VERSION)
+
+def test_regression_battery():
+    from pathlib import Path
+    import subprocess
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+                            cwd=Path(__file__).resolve().parents[1],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
 
 if __name__ == "__main__":
     main()

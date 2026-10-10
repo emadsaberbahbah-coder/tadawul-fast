@@ -42,7 +42,14 @@ _VERIFIER = _REPO / "scripts" / "verify_deployment.py"
 
 # module dotted path -> file, for the MODULES manifest
 _MODULE_FILES = {
-    "scripts.performance_math": "scripts/performance_math.py",
+    "main": "main.py",
+    'core.price_precision': 'core/price_precision.py',
+    'core.symbols.crypto_identity': 'core/symbols/crypto_identity.py',
+    'core.symbols.normalize': 'core/symbols/normalize.py',
+    'core.analysis.identity_guard': 'core/analysis/identity_guard.py',
+    'core.surface_action_invariants': 'core/surface_action_invariants.py',
+    'scripts.performance_math': 'scripts/performance_math.py',
+
     "core.analysis.insights_builder": "core/analysis/insights_builder.py",
     "core.compliance_gate": "core/compliance_gate.py",
     "core.shariah_authority": "core/shariah_authority.py",
