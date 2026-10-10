@@ -534,7 +534,10 @@ from __future__ import annotations
 # _fix_metrics_units, _candidate_earnings_guard_enabled, _note_earn_days,
 # _filter_candidates_earnings, _earnings_held_line.
 # ---------------------------------------------------------------------------
-__version__ = "1.17.1"
+# v1.17.2 — per-event vendor evidence is displayed without issuer confirmation.
+# Dates, not old sheet/note countdowns, drive the current Riyadh warning and
+# presentation holdback. Estimated earnings remain a conservative warning.
+__version__ = "1.17.2"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -601,6 +604,7 @@ import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 # ----------------------------------------------------------------------------- #
 # Page names (override-able only via code; stable by design)
@@ -732,11 +736,41 @@ def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[Lis
     out: Dict[str, List[List[Any]]] = {}
     for p in pages:
         try:
-            out[p] = read_range(spreadsheet_id, f"{p}!{_bound}") or []
+            if p == PAGE_CALENDAR:
+                out[p] = _read_calendar_live(spreadsheet_id, read_range)
+            else:
+                out[p] = read_range(spreadsheet_id, f"{p}!{_bound}") or []
         except Exception as exc:  # one bad page must not kill the brief
             sys.stderr.write(f"[brief] WARN could not read {p}: {exc}\n")
             out[p] = []
     return out
+
+
+def _read_calendar_live(spreadsheet_id: str, reader) -> List[List[Any]]:
+    """Read one complete bounded calendar independently of market row caps.
+
+    Metadata proves the allocated extent before reading all supported rows;
+    truncation cannot hide a conflicting event beyond a prefix. This is a
+    read-only probe and supports both seven- and thirteen-column tables.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from integrations.google_sheets_service import get_sheets_service
+    from core.calendar_evidence import MAX_CALENDAR_BODY_ROWS
+    metadata = get_sheets_service().spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(title,gridProperties(rowCount,columnCount)))").execute()
+    matches = [sheet.get("properties") or {} for sheet in metadata.get("sheets", [])
+               if (sheet.get("properties") or {}).get("title") == PAGE_CALENDAR]
+    if len(matches) != 1:
+        raise ValueError("calendar grid extent unknown")
+    grid = matches[0].get("gridProperties") or {}
+    rows, cols = grid.get("rowCount"), grid.get("columnCount")
+    if type(rows) is not int or not 2 <= rows <= MAX_CALENDAR_BODY_ROWS + 1 or \
+            type(cols) is not int or cols < 7:
+        raise ValueError("calendar grid exceeds complete-table contract")
+    return reader(spreadsheet_id, f"{PAGE_CALENDAR}!A1:{chr(64 + min(cols, 13))}{rows}") or []
 
 
 # v1.6.0 (B1b): columns the WORKBOOK stores as FRACTIONS (0.0149) but the
@@ -1294,8 +1328,8 @@ def _filter_candidates_earnings(top10: Dict[str, Any],
                                 calendar: Dict[str, Dict[str, Any]],
                                 when: _dt.datetime):
     """v1.17.0 (D2): hold back candidates reporting inside the earnings
-    window (note-prefix days first, Calendar_Events fallback via the SAME
-    _earnings_flag_for the action cards use). Returns (top10, held) where
+    window using the same dated calendar fact as the action cards. Static
+    note/sheet countdowns cannot invent a current event. Returns (top10, held) where
     held is [{'symbol','days'}]; guard-off callers never reach here."""
     win = _earnings_flag_days()
     if win <= 0 or not top10:
@@ -1303,11 +1337,11 @@ def _filter_candidates_earnings(top10: Dict[str, Any],
     held: List[Dict[str, Any]] = []
 
     def _keep(p: Dict[str, Any]) -> bool:
-        days = _note_earn_days(p.get("note"))
-        if days is None and _earnings_flag_for(p.get("symbol") or "", calendar, when):
-            days = -1  # inside window, exact day unknown
-        if days is not None and days <= win:
-            held.append({"symbol": p.get("symbol"), "days": days})
+        info = (calendar or {}).get(_s(p.get("symbol")).upper()) or {}
+        days = _calendar_earnings_days(info, when)
+        if days is not None and 0 <= days <= win:
+            held.append({"symbol": p.get("symbol"), "days": days,
+                         "evidence": _calendar_earnings_label(info)})
             return False
         return True
 
@@ -1334,9 +1368,10 @@ def _earnings_held_line(model: Dict[str, Any]) -> str:
     for h in held:
         d = h.get("days")
         parts.append("%s (%s)" % (h.get("symbol"),
-                                  ("\u2264%dd" % win) if (d is None or d < 0) else ("%dd" % int(d))))
+                                  (("\u2264%dd" % win) if (d is None or d < 0) else ("%dd" % int(d))) +
+                                  "; " + str(h.get("evidence") or "evidence unknown")))
     return ("%d candidate(s) held back — earnings within %dd: %s. "
-            "They re-enter automatically after reporting."
+            "This calendar holdback clears when the date passes or is revised."
             % (len(held), win, ", ".join(parts)))
 
 
@@ -1373,7 +1408,12 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
             continue
         # v1.13.0: tag-tolerant — v1.6.0 prefixes "⚠ earnings ≤Nd · " before
         # INVEST; grace/exit notes carry no INVEST and stay excluded.
-        if "INVEST" not in note.upper()[:60]:
+        # The finite provenance extension must not consume the old 60-char
+        # decision-note window. Remove only this generated calendar prefix.
+        decision_note = re.sub(
+            r"^\u26a0 earnings \u2264\d+d \u00b7 (?:(?:\[(?:reported|estimated): (?:eodhd|yahoo)\]|\[evidence unknown\]) \u00b7 )?",
+            "", note)
+        if "INVEST" not in decision_note.upper()[:60]:
             continue
         if symbol.upper() in exclude:
             continue
@@ -1672,58 +1712,61 @@ def _earnings_flag_days() -> int:
 
 
 def _extract_calendar(rows: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
-    """v1.11.0 (E1): Calendar_Events -> {SYM: {"earn": "YYYY-MM-DD"|None,
-    "days": float|None}}. Fail-safe: missing tab/columns yield {} and
-    nothing renders."""
-    rows = _pad(rows or [])
-    out: Dict[str, Dict[str, Any]] = {}
-    h = _find_header(rows, ("symbol", "next earnings"))
-    if h < 0:
-        h = _find_header(rows, ("symbol", "earnings"))
-    if h < 0:
-        return out
-    hdr = rows[h]
-    i_sym = _col_index(hdr, "Symbol")
-    i_earn = _col_index(hdr, "Next Earnings Date")
-    i_days = _col_index(hdr, "Days To Earnings")
-    if i_sym is None or i_earn is None:
-        return out
-    for r in rows[h + 1:]:
-        sym = _s(_cell(r, i_sym)).upper()
-        if not sym or sym == "SYMBOL":
-            continue
-        earn = _s(_cell(r, i_earn))[:10]
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", earn):
-            earn = ""
-        out[sym] = {"earn": earn or None,
-                    "days": _num(_cell(r, i_days)) if i_days is not None else None}
-    return out
+    """Read the shared bounded date/evidence contract, including legacy rows.
+
+    Legacy valid dates keep conservative warnings with unknown provenance;
+    a static counter or free-form Source cell cannot establish an event.
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from core.calendar_evidence import parse_calendar_values
+        return {sym: {**info, "earn": info.get("next_earnings_date"), "days": None}
+                for sym, info in parse_calendar_values(rows or []).items()}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _calendar_earnings_days(info: Dict[str, Any], when: _dt.datetime) -> Optional[int]:
+    """Current Riyadh proximity from an actual strict calendar date."""
+    try:
+        raw = info.get("earn") or info.get("next_earnings_date")
+        if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return None
+        event = _dt.date.fromisoformat(raw)
+        local = when.astimezone(ZoneInfo("Asia/Riyadh")) if when.tzinfo is not None else when
+        return (event - local.date()).days
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _calendar_earnings_label(info: Dict[str, Any]) -> str:
+    """Display only validated vendor provenance, never issuer confirmation."""
+    from core.calendar_evidence import normalize_event_evidence
+    evidence = normalize_event_evidence(info, "earnings",
+                                        info.get("earn") or info.get("next_earnings_date"))
+    if evidence["earnings_status"] == "unknown":
+        return "evidence unknown"
+    return evidence["earnings_status"] + " by " + evidence["earnings_source"]
 
 
 def _earnings_flag_for(sym: str, calendar: Dict[str, Dict[str, Any]],
                        when: _dt.datetime) -> Optional[str]:
     """One factual proximity line ("Earnings 2026-08-12 (in 5d)") when the
-    symbol reports within the window; None otherwise. Days compute from
-    the date at render time; the sheet's Days-To column is the fallback."""
+    symbol has a dated event within the window; None otherwise. Days derive
+    from the current Riyadh day, never from an old sheet or note countdown."""
     win = _earnings_flag_days()
     if win <= 0:
         return None
     info = (calendar or {}).get(_s(sym).upper())
     if not info:
         return None
-    days: Optional[float] = None
-    if info.get("earn"):
-        try:
-            d = _dt.datetime.strptime(info["earn"], "%Y-%m-%d").date()
-            days = float((d - when.date()).days)
-        except Exception:
-            days = None
-    if days is None:
-        days = info.get("days")
+    days = _calendar_earnings_days(info, when)
     if days is None or days < 0 or days > win:
         return None
-    d_txt = info.get("earn") or "date on Calendar_Events"
-    return "Earnings %s (in %dd)" % (d_txt, int(days))
+    d_txt = info.get("earn") or info.get("next_earnings_date")
+    return "Earnings %s (in %dd; %s)" % (d_txt, int(days), _calendar_earnings_label(info))
 
 
 def _news_context_enabled() -> bool:
@@ -1803,7 +1846,7 @@ def _action_earn_chip(sym: str, model: Dict[str, Any],
     if not ef:
         return ""
     return (f'<span style="color:{TRIM_C}; font-weight:bold;">&#9888;&#65039; '
-            f'{_esc(ef)} &mdash; scheduled fact, not a signal.</span> ')
+            f'{_esc(ef)} &mdash; calendar context, not a signal.</span> ')
 
 
 def _ticket_flags_html(sym: str, model: Dict[str, Any],
@@ -1815,7 +1858,7 @@ def _ticket_flags_html(sym: str, model: Dict[str, Any],
     if ef:
         bits.append(f'<div style="font-family:{SANS}; font-size:11px; '
                     f'color:{TRIM_C}; margin:2px 0 0 2px;">&#9888;&#65039; '
-                    f'{_esc(ef)} &mdash; scheduled fact, not a signal</div>')
+                    f'{_esc(ef)} &mdash; calendar context, not a signal</div>')
     nl = (model.get("news_ctx") or {}).get(_s(sym).upper())
     if nl:
         bits.append(f'<div style="font-family:{SANS}; font-size:11px; '
@@ -3097,7 +3140,7 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                              f"(valuation path, reliability {_num_str(_m.get('rel'))})")
             _ef = _earnings_flag_for(r["symbol"], model.get("calendar") or {}, when)
             if _ef:
-                lines.append(f"       !! {_ef} - scheduled fact, not a signal")
+                lines.append(f"       !! {_ef} - calendar context, not a signal")
             _nl = (model.get("news_ctx") or {}).get(r["symbol"].upper())
             if _nl:
                 lines.append(f"       {_nl}")
@@ -3107,12 +3150,14 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
             lines.append(f"       {r['symbol']} was {r.get('coh_from','ACTION')}: {r.get('coh_reason','divergence')}")
             _efv = _earnings_flag_for(r["symbol"], model.get("calendar") or {}, when)
             if _efv:
-                lines.append(f"       !! {_efv} - scheduled fact, not a signal")
+                lines.append(f"       !! {_efv} - calendar context, not a signal")
             _nlv = (model.get("news_ctx") or {}).get(r["symbol"].upper())
             if _nlv:
                 lines.append(f"       {_nlv}")
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
+    if not t["top"] and _earnings_held_line(model):
+        lines += ["", "  !! " + _earnings_held_line(model)]
     if t["top"]:
         _sat_t = _fv_saturation(list(t["top"]))
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]

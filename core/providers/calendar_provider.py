@@ -2,9 +2,14 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.2 (FIELD-INDEPENDENT YAHOO FALLBACK)
+Calendar Provider — v1.3.0 (PER-EVENT SOURCE EVIDENCE)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.3.0 — new fetch_event_evidence APIs retain the actual source, UTC observation
+time and reported/estimated/unknown status for each event independently. The
+existing fetch_event_context APIs keep their exact date-only return shape.
+Reported means a provider supplied the date, never issuer confirmation.
 
 v1.2.2 — retry Yahoo when either earnings or ex-dividend is missing.
 Each event fills independently; existing EODHD dates are never overwritten.
@@ -147,7 +152,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -158,6 +163,8 @@ __all__ = [
     "is_enabled",
     "fetch_event_context",
     "fetch_event_context_sync",
+    "fetch_event_evidence",
+    "fetch_event_evidence_sync",
     "fetch_earnings_map",
     "fetch_next_exdiv_map",
     "fetch_ipos",
@@ -236,6 +243,12 @@ def is_enabled() -> bool:
 # ----------------------------------------------------------------------------- #
 def _today() -> _dt.date:
     return _dt.datetime.now(_dt.timezone.utc).date()
+
+
+def _observed_at_utc() -> str:
+    """Source observation clock, distinct from sheet publication time."""
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
 
 
 def _iso(d: _dt.date) -> str:
@@ -557,7 +570,8 @@ async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
 
 
 async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
-                               today: _dt.date) -> Tuple[int, int]:
+                               today: _dt.date, *,
+                               include_evidence: bool = False) -> Tuple[int, int]:
     """Fill-only pass over `base` for symbols missing either event date.
     Earnings and ex-dividend fill independently. EODHD values are never
     overwritten. Returns (earnings_filled, exdiv_filled). Never raises."""
@@ -587,10 +601,18 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
         for s, d in f_earn.items():
             if base.get(s, {}).get("next_earnings_date") is None:
                 base[s]["next_earnings_date"] = d
+                if include_evidence:
+                    base[s].update(earnings_source="yahoo",
+                                   earnings_observed_at=_observed_at_utc(),
+                                   earnings_status="estimated")
                 n_e += 1
         for s, d in f_exdiv.items():
             if base.get(s, {}).get("next_ex_div_date") is None:
                 base[s]["next_ex_div_date"] = d
+                if include_evidence:
+                    base[s].update(exdiv_source="yahoo",
+                                   exdiv_observed_at=_observed_at_utc(),
+                                   exdiv_status="reported")
                 n_d += 1
         if n_e or n_d or _throttled[0]:
             logger.info("[calendar_provider v%s F2] yahoo fallback filled "
@@ -607,14 +629,20 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
 # ----------------------------------------------------------------------------- #
 # The one call consumers need: merged per-symbol event context
 # ----------------------------------------------------------------------------- #
-async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
-    """{SYMBOL: {"next_earnings_date": str|None, "next_ex_div_date": str|None}}
-    for EVERY input symbol (uniform shape — KSA symbols carry None/None).
-    These keys are exactly what track_performance v6.14.0 reads to compute
-    the Signal_History "Days To Earnings" / "Days To ExDiv" columns."""
+async def fetch_event_evidence(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+    """Dates plus per-event source, UTC observation and evidence status.
+
+    Every input symbol has the same shape. Missing facts have unknown source /
+    status and an empty observation; neither a failed lookup nor publishing a
+    row manufactures evidence. Yahoo earnings dates are estimates. A reported
+    date is a provider report, not a verified issuer announcement.
+    """
     syms = [str(s or "").strip().upper() for s in (symbols or []) if str(s or "").strip()]
     base: Dict[str, Dict[str, Optional[str]]] = {
-        s: {"next_earnings_date": None, "next_ex_div_date": None} for s in syms
+        s: {"next_earnings_date": None, "next_ex_div_date": None,
+            "earnings_source": "unknown", "earnings_observed_at": "",
+            "earnings_status": "unknown", "exdiv_source": "unknown",
+            "exdiv_observed_at": "", "exdiv_status": "unknown"} for s in syms
     }
     if not syms or not _flag_enabled():
         return base
@@ -633,16 +661,30 @@ async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optiona
         for s, d in earn.items():
             if s in base:
                 base[s]["next_earnings_date"] = d
+                base[s].update(earnings_source="eodhd",
+                               earnings_observed_at=_observed_at_utc(),
+                               earnings_status="reported")
         for s, d in exdiv.items():
             if s in base:
                 base[s]["next_ex_div_date"] = d
+                base[s].update(exdiv_source="eodhd",
+                               exdiv_observed_at=_observed_at_utc(),
+                               exdiv_status="reported")
         # v1.1.0 (Fix F2): Yahoo fills what EODHD left blank (fill-only).
-        await _yahoo_calendar_fill(base, _today())
+        await _yahoo_calendar_fill(base, _today(), include_evidence=True)
         return base
     except Exception as e:
-        logger.error("[calendar_provider v%s] fetch_event_context failed: %s",
+        logger.error("[calendar_provider v%s] fetch_event_evidence failed: %s",
                      __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return base
+
+
+async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+    """Compatibility API: the original two date keys, without metadata."""
+    evidence = await fetch_event_evidence(symbols)
+    return {s: {"next_earnings_date": row.get("next_earnings_date"),
+                "next_ex_div_date": row.get("next_ex_div_date")}
+            for s, row in evidence.items()}
 
 
 # ----------------------------------------------------------------------------- #
@@ -661,6 +703,10 @@ def _run_sync(coro: Any) -> Any:
 
 def fetch_event_context_sync(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
     return _run_sync(fetch_event_context(symbols))
+
+
+def fetch_event_evidence_sync(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+    return _run_sync(fetch_event_evidence(symbols))
 
 
 def fetch_ipos_sync(days_ahead: int = 30) -> List[Dict[str, Any]]:

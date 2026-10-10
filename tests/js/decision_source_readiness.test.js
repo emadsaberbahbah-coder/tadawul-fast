@@ -202,11 +202,14 @@ test('source changes during sheet preparation are rechecked before painting mone
 test('actual render preserves final earnings prefix while withholding the old order narrative',()=> {
   const ctx=load(),p=payload(ctx),grid=goodGrid();grid[1][2]='PARTIAL';const ss=statusWorkbook(grid);
   const oldGetter=ss.getSheetByName.bind(ss);
-  ss.getSheetByName=name=>name==='Calendar_Events'?{getLastRow(){return 2;},getLastColumn(){return 7;},
+  ss.getSheetByName=name=>name==='Calendar_Events'?{getLastRow(){return 2;},getLastColumn(){return 13;},
     getRange(){return {getValues(){return [['Symbol','Next Earnings Date','Days To Earnings'],
-      ['SYNTH.US','2026-10-14',99]];}};}}:oldGetter(name);
+      ['SYNTH.US','2026-10-14',99]].map((row,index)=>row.concat(index===0?
+      ['Next Ex-Div Date','Days To ExDiv','Updated At (Riyadh)','Source','Earnings Source','Earnings Observed At (UTC)','Earnings Evidence Status',
+       'ExDiv Source','ExDiv Observed At (UTC)','ExDiv Evidence Status']:
+      ['','','2026-10-10 12:00','summary','yahoo','2026-10-10T09:00:00Z','estimated','unknown','','unknown']));}};}}:oldGetter(name);
   const r=renderer(ctx,ss),earn=ctx.dt10RenderPayload_(r.sheet,p,{});
-  assert(r.tables[0].rows[0][29].startsWith('⚠ earnings ≤4d · SIZING WITHHELD'));
+  assert(r.tables[0].rows[0][29].startsWith('⚠ earnings ≤4d · [estimated: yahoo] · SIZING WITHHELD'));
   assert(!r.tables[0].rows[0][29].includes('20 shares'));assert.equal(earn.note,'earn ⚠1/1');
 });
 test('direct render without an original source capture cannot promote an old payload',()=> {

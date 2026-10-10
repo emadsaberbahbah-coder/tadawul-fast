@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # WHAT: runs scripts/run_calendar_sync.py --write: harvests the decision
 #       symbols (Top_10_Investments + My_Portfolio), fetches next-earnings and
-#       next-ex-dividend dates from EODHD via core.providers.calendar_provider,
+#       next-ex-dividend dates from EODHD/Yahoo via core.providers.calendar_provider,
 #       and REPLACES the Calendar_Events tab. track_performance v6.15.0 reads
 #       that tab and merges the dates into Signal_History snapshots — this is
 #       how the "Days To Earnings"/"Days To ExDiv" columns fill.
@@ -14,8 +14,9 @@
 # WHY off the request path: the Top10 build runs behind the ~100s Render edge
 #       timeout; live calendar calls there would risk it. This job runs in
 #       Actions, the backend and every route are untouched (zero Render
-#       changes). KSA symbols get blank dates by design (EODHD has no Saudi
-#       coverage) — nothing is faked.
+#       changes). Yahoo-only fallback remains available without an EODHD key.
+#       Every event has its own provider, observed UTC time and evidence status;
+#       Yahoo earnings estimates remain labeled estimates.
 # SECRETS: GOOGLE_SHEETS_CREDENTIALS (existing) + EODHD_API_KEY (NEW GitHub
 #       secret — use the ROTATED token). TFB_CALENDAR_ENABLED=1 is scoped to
 #       this job only; the Render flag stays unset (no backend caller exists).
@@ -96,8 +97,7 @@ jobs:
           TFB_CALENDAR_ENABLED: "1"
         run: |
           if [[ -z "${EODHD_API_KEY:-}" ]]; then
-            echo "::error::EODHD_API_KEY secret not set (add the rotated token in repo Settings → Secrets)."
-            exit 1
+            echo "::notice::EODHD key unavailable; calendar provider will try Yahoo-only fallback. Missing event dates remain unknown."
           fi
           # Schedule always writes; a manual dispatch writes ONLY when
           # write=true was explicitly ticked (dry-run otherwise).

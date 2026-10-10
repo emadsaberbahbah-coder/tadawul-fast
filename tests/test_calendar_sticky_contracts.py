@@ -137,13 +137,16 @@ def test_prior_telemetry_resets_even_for_empty_or_no_header_input():
     assert sync.parse_prior.junk_purged == 1
     assert sync.parse_prior([]) == {} and sync.parse_prior.junk_purged == 0
     sync.parse_prior.junk_purged = 9
-    assert sync.parse_prior([["not a header"]]) == {} and sync.parse_prior.junk_purged == 0
+    with pytest.raises(ValueError, match="unrecognized prior calendar schema"):
+        sync.parse_prior([["not a header"]])
+    assert sync.parse_prior.junk_purged == 0
 
 
 def test_actual_write_boundary_survives_bad_prior_cell_without_extra_fetch(monkeypatch):
     class Sheet:
         def __init__(self, values):
             self.values = values
+            self.row_count, self.col_count = 1000, len(sync.HEADERS)
             self.updates = []
         def get(self, _range):
             return self.values
@@ -167,7 +170,7 @@ def test_actual_write_boundary_survives_bad_prior_cell_without_extra_fetch(monke
     def fetch(symbols):
         fetch_calls.append(symbols)
         return {s: {"next_earnings_date": None, "next_ex_div_date": None} for s in symbols}
-    provider.fetch_event_context_sync = fetch
+    provider.fetch_event_evidence_sync = fetch
     monkeypatch.setitem(sys.modules, "core.providers.calendar_provider", provider)
     monkeypatch.setattr(sync, "_open_book", lambda: Book())
     monkeypatch.setenv("TFB_CALENDAR_PAGES", "My_Portfolio")

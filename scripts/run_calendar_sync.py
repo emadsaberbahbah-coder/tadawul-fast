@@ -2,7 +2,7 @@
 # scripts/run_calendar_sync.py
 """
 ================================================================================
-Calendar Sync — v1.0.0 (F1 wiring, Option B: sheet-as-bus, off request path)
+Calendar Sync — v1.2.0 (per-event evidence, off request path)
 ================================================================================
 NEW script (owner greenlight 2026-07-05: "go with the recommended one").
 
@@ -10,11 +10,14 @@ WHAT THIS DOES
     Once a day (GitHub Actions: calendar_sync.yml), for the DECISION symbols:
       1. harvests symbols from the pages in TFB_CALENDAR_PAGES
          (default: Top_10_Investments + My_Portfolio),
-      2. calls core.providers.calendar_provider.fetch_event_context_sync()
-         (EODHD earnings + ex-dividend calendars; KSA symbols honestly None),
-      3. REPLACES the Calendar_Events tab with one row per symbol:
+      2. calls core.providers.calendar_provider.fetch_event_evidence_sync()
+         (EODHD primary dates and independent Yahoo fallback fields),
+      3. atomically REPLACES the Calendar_Events tab with one row per symbol:
          Symbol | Next Earnings Date | Days To Earnings | Next Ex-Div Date |
-         Days To ExDiv | Updated At (Riyadh) | Source
+         Days To ExDiv | Updated At (Riyadh) | Source, followed by each event's
+         Source | Observed At (UTC) | Evidence Status. The first seven columns
+         remain compatible. Reported means provider-reported, not confirmed by
+         an issuer; Yahoo earnings dates are estimated.
     track_performance.py v6.15.0 reads this tab and merges the two date keys
     into the Top10 rows BEFORE building Signal_History snapshots — which is
     how the v6.14.0 "Days To Earnings"/"Days To ExDiv" columns fill.
@@ -33,15 +36,17 @@ WHY OPTION B (vs in-process cache on the backend)
       wanted — the code already supports it.
 
 FAIL-SAFETY
-    Provider disabled / key missing / any fetch error -> the tab still gets a
-    full symbol list with blank dates and a Source note, so the tracker merge
-    degrades to no-op instead of breaking. Sheet errors log and exit non-zero
-    (the workflow surfaces red) but never raise tracebacks at the user.
+    Missing EODHD key permits Yahoo-only fallback. Disabled/unavailable sources
+    leave unknown fields; prior future dates retain their original independent
+    evidence. Unreadable or ambiguous prior tables prevent publication. One
+    atomic values request replaces the full header/body/tail. A lost response
+    is reported as unconfirmed and is never blindly retried.
 
 ENV
     DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID   production workbook id
     GOOGLE_SHEETS_CREDENTIALS                 service-account JSON (or base64)
-    EODHD_API_KEY (+ TFB_CALENDAR_ENABLED=1)  consumed by calendar_provider
+    TFB_CALENDAR_ENABLED=1                  enable the calendar provider
+    EODHD_API_KEY                           optional primary-provider key
     TFB_CALENDAR_PAGES     default "Top_10_Investments,My_Portfolio"
     TFB_CALENDAR_SHEET     default "Calendar_Events"
 
@@ -59,8 +64,15 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.calendar_evidence import CALENDAR_HEADERS, normalize_event_evidence
 
 # v1.1.0 (2026-07-22): STICKY DATES — replace-mode amnesia cured.
 # EVIDENCE: EXE.US (earnings 2026-07-28, known since Monday) was stripped
@@ -110,12 +122,13 @@ from zoneinfo import ZoneInfo
 # v1.1.4: replace the complete header/body/tail in one atomic values request.
 # A transport failure before commit no longer leaves known events erased;
 # lost acknowledgement after commit leaves the complete new table, not a mix.
-__version__ = "1.1.4"
+# v1.2.0: publish independent source/UTC observation/evidence fields, retaining
+# the original seven columns and every carried field's original evidence.
+__version__ = "1.2.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
 
-HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
-           "Next Ex-Div Date", "Days To ExDiv", "Updated At (Riyadh)", "Source"]
+HEADERS = list(CALENDAR_HEADERS)
 
 
 def _out(msg: str) -> None:
@@ -181,6 +194,30 @@ def _prior_asof(value: Any) -> str:
         return text
     except ValueError:
         return ""
+
+
+def _event_evidence(ctx: Dict[str, Any], prefix: str, event_date: Optional[str]) -> Dict[str, str]:
+    """Closed typed evidence; legacy display notes never establish a source."""
+    return normalize_event_evidence(ctx, prefix, event_date)
+
+
+def _nonblank(value: Any) -> bool:
+    """Zero and False are owned data, not empty extension cells."""
+    return value is not None and bool(str(value).strip())
+
+
+def _validate_prior_schema(values: List[List[Any]], header_index: int) -> None:
+    header = [str(cell if cell is not None else "").strip().lower()
+              for cell in values[header_index]]
+    expected = [heading.lower() for heading in HEADERS]
+    if header[:len(HEADERS)] == expected and not any(header[len(HEADERS):]):
+        return
+    if header[:7] != expected[:7] or any(header[7:]):
+        raise ValueError("unrecognized prior calendar schema")
+    # A seven-column header does not establish ownership of the extension.
+    # Read the complete allocated table before claiming its new H:M columns.
+    if any(_nonblank(cell) for row in values for cell in row[7:len(HEADERS)]):
+        raise ValueError("legacy calendar evidence columns contain unowned data")
 
 
 # ----------------------------------------------------------------------------- #
@@ -260,14 +297,24 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
     if not values:
         return out
     hdr_i, cs, ce, cx, ca, cp = -1, -1, -1, -1, -1, -1
+    evidence_columns: Dict[str, int] = {}
+    evidence_headers = dict(zip(HEADERS[7:], (
+        "earnings_source", "earnings_observed_at", "earnings_status",
+        "exdiv_source", "exdiv_observed_at", "exdiv_status")))
     for i, row in enumerate(values[:5]):
         low = [str(c or "").strip().lower() for c in row]
         if "symbol" in low:
+            nonempty = [h for h in low if h]
+            if len(nonempty) != len(set(nonempty)):
+                raise ValueError("duplicate prior calendar headers")
             hdr_i, cs = i, low.index("symbol")
             for j, h in enumerate(low):
-                if "next earnings" in h:
+                for label, key in evidence_headers.items():
+                    if h == label.lower():
+                        evidence_columns[key] = j
+                if h == "next earnings date":
                     ce = j
-                elif "ex-div" in h or "ex div" in h:
+                elif h in ("next ex-div date", "next ex div date"):
                     cx = j
                 elif h == "updated at (riyadh)":
                     ca = j
@@ -275,7 +322,12 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
                     cp = j
             break
     if hdr_i < 0 or cs < 0:
+        if any(_nonblank(cell) for row in values for cell in row):
+            raise ValueError("unrecognized prior calendar schema")
         return out
+    if ce < 0 or cx < 0:
+        raise ValueError("missing prior calendar date headers")
+    _validate_prior_schema(values, hdr_i)
     for row in values[hdr_i + 1:]:
         sym = str(row[cs] if cs < len(row) else "").strip().upper()
         if not sym or sym == "SYMBOL":
@@ -294,6 +346,12 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
         if rec:
             rec["asof"] = _prior_asof(row[ca] if 0 <= ca < len(row) else "")
             rec["source"] = str(row[cp] if 0 <= cp < len(row) else "").strip()
+            typed = {key: row[index] if index < len(row) else ""
+                     for key, index in evidence_columns.items()}
+            rec.update(_event_evidence(typed, "earnings", rec.get("e")))
+            rec.update(_event_evidence(typed, "exdiv", rec.get("x")))
+            if sym in out and out[sym] != rec:
+                raise ValueError(f"conflicting prior calendar rows for {sym}")
             out[sym] = rec
     return out
 
@@ -311,6 +369,8 @@ def apply_sticky(symbols: List[str],
     for c in ctx_out.values():
         for key in ("next_earnings_date", "next_ex_div_date"):
             c[key] = _future_date(c.get(key))
+        c.update(_event_evidence(c, "earnings", c.get("next_earnings_date")))
+        c.update(_event_evidence(c, "exdiv", c.get("next_ex_div_date")))
     carried: set = set()
     n_fill = 0
     for s in symbols:
@@ -323,6 +383,8 @@ def apply_sticky(symbols: List[str],
             d = _future_date(p.get(prior_key))
             if not c.get(key) and d:
                 c[key] = d
+                prefix = "earnings" if prior_key == "e" else "exdiv"
+                c.update(_event_evidence(p, prefix, d))
                 fields.append(prior_key)
         if fields:
             c["_carried_fields"] = ",".join(fields)
@@ -341,6 +403,8 @@ def apply_sticky(symbols: List[str],
                       "_carried_fields": ",".join(k for k, d in (("e", e), ("x", x)) if d),
                       "_carried_asof": _prior_asof(p.get("asof")),
                       "_carried_source": str(p.get("source") or "").strip()}
+        ctx_out[s].update(_event_evidence(p, "earnings", e))
+        ctx_out[s].update(_event_evidence(p, "exdiv", x))
         carried.add(s)
         n_res += 1
     return symbols_out, ctx_out, carried, n_fill, n_res
@@ -356,7 +420,13 @@ def build_rows(symbols: List[str],
     for s in symbols:
         c = ctx.get(s) or {}
         e, x = _future_date(c.get("next_earnings_date")), _future_date(c.get("next_ex_div_date"))
+        typed = {**_event_evidence(c, "earnings", e), **_event_evidence(c, "exdiv", x)}
         row_src, row_stamp = source, stamp if (e or x) else ""
+        known_sources = [f"{label}: {typed[prefix + '_source']} ({typed[prefix + '_status']})"
+                         for prefix, d, label in (("earnings", e, "earnings"), ("exdiv", x, "ex-div"))
+                         if d and typed[prefix + "_source"] != "unknown"]
+        if known_sources:
+            row_src = "; ".join(known_sources)
         if s in carried:
             row_stamp = _prior_asof(c.get("_carried_asof"))
             prior_source = _UNKNOWN_EVENT_NOTE_RE.sub(
@@ -370,6 +440,19 @@ def build_rows(symbols: List[str],
                 row_src = f"fresh {'/'.join(fresh)}: {source}; carried {old}: {prior_source} +carried"
             else:
                 row_src = prior_source + " +carried"
+            if known_sources:
+                # Typed fields are authoritative for the readable summary.
+                # Rebuilding it avoids recursively nesting mixed carry notes
+                # and attributing one field's source to its sibling.
+                parts = []
+                for key, prefix, d, label in (("e", "earnings", e, "earnings"),
+                                              ("x", "exdiv", x, "ex-div")):
+                    if not d:
+                        continue
+                    kind = "carried" if key in fields else "fresh"
+                    parts.append(f"{kind} {label}: {typed[prefix + '_source']} "
+                                 f"({typed[prefix + '_status']})")
+                row_src = "; ".join(parts) + " +carried"
         # Missing facts are not a neutral event result or a successful lookup.
         # This is derived row status, not provider provenance; remove the prior
         # annotation on roundtrip so newly known fields do not retain old status.
@@ -379,7 +462,9 @@ def build_rows(symbols: List[str],
             row_src = row_src.removesuffix(suffix) if suffix else row_src
             row_src += f" [events unknown:{'/'.join(unknown)}]" + suffix
         rows.append([s, e or "", _days_until(e), x or "", _days_until(x),
-                     row_stamp, row_src])
+                     row_stamp, row_src,
+                     typed["earnings_source"], typed["earnings_observed_at"], typed["earnings_status"],
+                     typed["exdiv_source"], typed["exdiv_observed_at"], typed["exdiv_status"]])
     return rows
 
 
@@ -427,17 +512,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     _out(f"decision symbols total: {len(symbols)}")
 
-    source = f"eodhd calendar via calendar_provider"
+    source = "calendar provider — evidence unknown"
     try:
         from core.providers.calendar_provider import (  # noqa: PLC0415
-            fetch_event_context_sync, is_enabled, __version__ as pv)
-        if not is_enabled():
-            _out("provider disabled (TFB_CALENDAR_ENABLED!=1 or key missing) "
-                 "— writing blank dates")
-            ctx, source = {}, "provider disabled — blank dates"
-        else:
-            ctx = fetch_event_context_sync(symbols)
-            source = f"eodhd via calendar_provider v{pv}"
+            fetch_event_evidence_sync, __version__ as pv)
+        # The merged provider gates its layer and sources independently. A
+        # missing EODHD key still permits its documented Yahoo-only fallback.
+        ctx = fetch_event_evidence_sync(symbols)
+        source = f"calendar_provider v{pv} — evidence unknown"
     except Exception as e:
         _out(f"WARN: provider failed ({e}) — writing blank dates")
         ctx, source = {}, f"provider error — blank dates"
@@ -450,12 +532,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         prior_sheet = book.worksheet(tab)
         allocated_rows = getattr(prior_sheet, "row_count", None)
+        allocated_cols = getattr(prior_sheet, "col_count", None)
+        if write and (type(allocated_rows) is not int or allocated_rows <= 0
+                      or type(allocated_cols) is not int or allocated_cols <= 0):
+            _out("ERROR: cannot establish complete prior grid extent — preserving tab")
+            return 2
         if isinstance(allocated_rows, int) and allocated_rows > _MAX_CALENDAR_BODY_ROWS + 1:
             _out("ERROR: prior calendar grid exceeds bounded full-table capacity — preserving tab")
             return 2
         read_rows = allocated_rows if isinstance(allocated_rows, int) and allocated_rows > 0 \
             else _MAX_CALENDAR_BODY_ROWS + 2
-        prior_values = prior_sheet.get(f"A1:G{read_rows}")
+        read_cols = min(allocated_cols, len(HEADERS)) if isinstance(allocated_cols, int) \
+            and allocated_cols > 0 else len(HEADERS)
+        read_end = chr(ord("A") + read_cols - 1)
+        prior_values = prior_sheet.get(f"A1:{read_end}{read_rows}")
         if len(prior_values) > _MAX_CALENDAR_BODY_ROWS + 1:
             _out("ERROR: prior calendar exceeds bounded full-table capacity — preserving tab")
             return 2
@@ -489,17 +579,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             ws = book.add_worksheet(title=tab, rows=extent, cols=len(HEADERS))
         else:
             allocated_rows = getattr(ws, "row_count", None)
-            if isinstance(allocated_rows, int) and allocated_rows < extent:
+            allocated_cols = getattr(ws, "col_count", None)
+            grow_rows = isinstance(allocated_rows, int) and allocated_rows < extent
+            grow_cols = isinstance(allocated_cols, int) and allocated_cols < len(HEADERS)
+            if grow_rows or grow_cols:
                 # Growing the grid preserves all existing cells. A cancelled
                 # or rejected publication after resize still has its old facts.
-                ws.resize(rows=extent)
+                dimensions = {}
+                if grow_rows:
+                    dimensions["rows"] = extent
+                if grow_cols:
+                    dimensions["cols"] = len(HEADERS)
+                ws.resize(**dimensions)
         values = [list(HEADERS)] + rows + [
             [""] * len(HEADERS) for _ in range(extent - len(rows) - 1)]
         # Sheets applies one Values.update atomically. Include explicit blanks
         # through the entire old extent: null/omitted cells would retain stale
         # values. Do not clear separately or retry after an ambiguous response;
         # acknowledgement loss may mean the complete replacement already won.
-        ws.update(values=values, range_name=f"A1:G{extent}",
+        ws.update(values=values, range_name=f"A1:M{extent}",
                   value_input_option="RAW")
         try:
             ws.freeze(rows=1)

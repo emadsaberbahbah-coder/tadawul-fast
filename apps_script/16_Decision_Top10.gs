@@ -1,11 +1,18 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.3 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.4 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.4 (2026-10-10) -- EVENT EVIDENCE DISPLAY
+ * Read optional per-event source, observation and evidence status in the
+ * thirteen-column Calendar_Events contract. Reported vendor dates and
+ * estimated Yahoo earnings are labelled separately; legacy dates retain
+ * a conservative warning with unknown evidence. No calendar fact qualifies
+ * or funds a ticket. Withholding preserves only the bounded warning prefix.
  *
  * v1.13.3 (2026-10-10) -- SOURCE READINESS AND PUBLICATION COHORT
  * Validate factual acquisition/data receipts and approved source row floors
@@ -1601,7 +1608,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.3';
+var DT10_VERSION = '1.13.4';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3519,7 +3526,7 @@ function dt10UvWithholdRow_(row, idxList, noteIdx, reason) {
   if (noteIdx < row.length) {
     // Calendar proximity is research context. Keep only the generated
     // prefix; never preserve the previous order narrative or numbers.
-    var earnings = String(row[noteIdx] || '').match(/^(\u26a0 earnings \u2264\d+d \u00b7 )/);
+    var earnings = String(row[noteIdx] || '').match(/^(\u26a0 earnings \u2264\d+d \u00b7 (?:(?:\[(?:reported|estimated): (?:eodhd|yahoo)\]|\[evidence unknown\]) \u00b7 )?)/);
     row[noteIdx] = (earnings ? earnings[1] : '') + dt10UvWithholdNote_(reason);
   }
   return row;
@@ -4594,54 +4601,108 @@ function dt10CalendarDay_(value) {
   }
   return Math.floor(parsed.getTime() / 86400000);
 }
-/** PURE — {SYMBOL: daysToEarnings} from dated Calendar_Events facts. The
- * consumer derives days for its current Riyadh date, so a yesterday counter
- * cannot survive midnight. Blank/invalid dates never fall back to a counter. */
-function dt10EarningsMapFromValues_(values, asOfDate) {
+/** Only the closed vendor/status vocabulary and an actual precise UTC
+ * observation can describe provenance. Row publication time is never used. */
+function dt10CalendarEvidence_(source, observedAt, status) {
+  var out = {earnings_source: 'unknown', earnings_observed_at: '', earnings_status: 'unknown'};
+  source = String(source || '').trim().toLowerCase();
+  status = String(status || '').trim().toLowerCase();
+  var stamp = typeof observedAt === 'string' ? observedAt.trim() : '';
+  if (!/^(eodhd|yahoo)$/.test(source) || !/^(reported|estimated)$/.test(status) ||
+      (status === 'estimated' && source !== 'yahoo') ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$/.test(stamp)) return out;
+  // JavaScript stores milliseconds; retain the supplier observation text.
+  var ms = dt10SourceStampMs_(stamp.replace(/(\.\d{3})\d+/, '$1'));
+  if (ms === null || ms > Date.now()) return out;
+  out.earnings_source = source; out.earnings_observed_at = stamp; out.earnings_status = status;
+  return out;
+}
+/** PURE dated earnings facts with optional field-specific evidence. The
+ * current Riyadh date determines proximity; static sheet counters do not.
+ * Conflicting duplicate symbols or headers never select one witness. */
+function dt10EarningsFactsFromValues_(values, asOfDate) {
   var map = {};
   if (!values || !values.length) return map;
   var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
   if (today === null) return map;
-  var iSym = -1, iDate = -1, r, c, cells, tok, rowSym, rowDate;
+  var iSym = -1, iDate = -1, iSource = -1, iObserved = -1, iStatus = -1;
+  var r, c, cells, tok, rowSym, rowDate, indexes, duplicate;
   for (r = 0; r < values.length && iSym < 0; r++) {
     cells = values[r] || [];
-    rowSym = -1; rowDate = -1;
+    rowSym = -1; rowDate = -1; indexes = {}; duplicate = false;
     for (c = 0; c < cells.length; c++) {
       tok = dt10NormToken_(cells[c]);
+      if (tok === 'earningsdate') tok = 'nextearningsdate';
+      if (/^(symbol|nextearningsdate|earningssource|earningsobservedatutc|earningsevidencestatus)$/.test(tok)) {
+        if (Object.prototype.hasOwnProperty.call(indexes, tok)) duplicate = true;
+        indexes[tok] = c;
+      }
       if (tok === 'symbol') rowSym = c;
-      else if (tok === 'nextearningsdate' || tok === 'earningsdate') rowDate = c;
+      else if (tok === 'nextearningsdate') rowDate = c;
     }
-    if (rowSym >= 0 && rowDate >= 0) { iSym = rowSym; iDate = rowDate; }
+    if (rowSym >= 0 && rowDate >= 0) {
+      if (duplicate) return {};
+      iSym = rowSym; iDate = rowDate;
+      iSource = indexes.earningssource; iObserved = indexes.earningsobservedatutc;
+      iStatus = indexes.earningsevidencestatus;
+    }
   }
   if (iSym < 0 || iDate < 0) return map;
+  var seen = {}, conflicts = {};
   for (; r < values.length; r++) {
     cells = values[r] || [];
     var sym = dt10NormSym_(cells[iSym]);
-    if (!sym || sym === 'SYMBOL' || map.hasOwnProperty(sym)) continue;
+    if (!sym || sym === 'SYMBOL') continue;
     var eventDay = dt10CalendarDay_(cells[iDate]);
-    if (eventDay !== null && eventDay >= today) map[sym] = eventDay - today;
+    var fact = dt10CalendarEvidence_(cells[iSource], cells[iObserved], cells[iStatus]);
+    fact.date = eventDay === null ? '' : new Date(eventDay * 86400000).toISOString().slice(0, 10);
+    fact.days = eventDay === null ? null : eventDay - today;
+    var signature = JSON.stringify(fact);
+    if (Object.prototype.hasOwnProperty.call(seen, sym) && seen[sym] !== signature) conflicts[sym] = true;
+    seen[sym] = signature;
+    if (eventDay !== null && eventDay >= today) map[sym] = fact;
   }
+  Object.keys(conflicts).forEach(function (sym) { delete map[sym]; });
+  return map;
+}
+/** Compatibility API — {SYMBOL: daysToEarnings}, with no metadata coercion. */
+function dt10EarningsMapFromValues_(values, asOfDate) {
+  var facts = dt10EarningsFactsFromValues_(values, asOfDate), map = {};
+  Object.keys(facts).forEach(function (sym) { map[sym] = facts[sym].days; });
   return map;
 }
 /** v1.6.0 (W-3): live Calendar_Events read. ANY failure => empty map =>
  * zero tags — the annotation must never be able to break the render. */
-function dt10EarningsMap_(ss, asOfDate) {
+function dt10CalendarValues_(ss) {
   try {
     var sh = ss.getSheetByName('Calendar_Events');
-    if (!sh) return {};
-    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 7);
+    if (!sh) return [];
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 13);
     if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
-        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
-    return dt10EarningsMapFromValues_(
-        sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return [];
+    return sh.getRange(1, 1, rows, cols).getValues();
   } catch (eEm) {
-    return {};
+    return [];
   }
+}
+function dt10EarningsMap_(ss, asOfDate) {
+  return dt10EarningsMapFromValues_(dt10CalendarValues_(ss), asOfDate);
+}
+function dt10EarningsFacts_(ss, asOfDate) {
+  return dt10EarningsFactsFromValues_(dt10CalendarValues_(ss), asOfDate);
+}
+function dt10CalendarEvidenceLabel_(fact) {
+  var input = fact || {};
+  var evidence = dt10CalendarEvidence_(input.earnings_source,
+      input.earnings_observed_at, input.earnings_status);
+  return /^(reported|estimated)$/.test(evidence.earnings_status || '') &&
+      /^(eodhd|yahoo)$/.test(evidence.earnings_source || '') ?
+      '[' + evidence.earnings_status + ': ' + evidence.earnings_source + ']' : '[evidence unknown]';
 }
 /** v1.6.0 (W-3): PURE core — prefixes '⚠ earnings ≤Nd · ' onto
  * advisor_note for tickets within the horizon. Idempotent (a note already
  * carrying the prefix is never doubled). Returns the tag count. */
-function dt10ApplyEarningsTags_(tickets, map, maxDays) {
+function dt10ApplyEarningsTags_(tickets, map, maxDays, evidence) {
   var n = 0;
   if (!tickets || !tickets.length || !map) return n;
   for (var i = 0; i < tickets.length; i++) {
@@ -4653,7 +4714,8 @@ function dt10ApplyEarningsTags_(tickets, map, maxDays) {
     if (!(d >= 0 && d <= maxDays)) continue;
     var note = String(t.advisor_note || '');
     if (note.indexOf('\u26a0 earnings') === 0) continue;
-    t.advisor_note = '\u26a0 earnings \u2264' + d + 'd \u00b7 ' + note;
+    t.advisor_note = '\u26a0 earnings \u2264' + d + 'd \u00b7 ' +
+        dt10CalendarEvidenceLabel_(evidence && evidence[sym]) + ' \u00b7 ' + note;
     n++;
   }
   return n;
@@ -4665,9 +4727,10 @@ function dt10EarningsAnnotate_(payload, ss) {
   try {
     if (!dt10EarningsTagEnabled_()) return { note: '' };
     var days = dt10EarningsTagDays_();
-    var map = dt10EarningsMap_(ss);
+    var facts = dt10EarningsFacts_(ss), map = {};
+    Object.keys(facts).forEach(function (sym) { map[sym] = facts[sym].days; });
     var sel = (payload && payload.selected) || [];
-    var n = dt10ApplyEarningsTags_(sel, map, days);
+    var n = dt10ApplyEarningsTags_(sel, map, days, facts);
     Logger.log('[DT10 v' + DT10_VERSION + '] earnings tags: ' + n + '/' +
                sel.length + ' tickets (\u2264' + days + 'd; calendar rows ' +
                (function (m) { var k = 0, q; for (q in m) {

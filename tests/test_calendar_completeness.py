@@ -84,6 +84,7 @@ def test_new_field_does_not_retain_prior_unknown_status():
 class Sheet:
     def __init__(self, values, row_count=1000, read_error=None):
         self.values, self.row_count, self.read_error = values, row_count, read_error
+        self.col_count = len(sync.HEADERS)
         self.reads, self.updates, self.clears = [], [], []
 
     def get(self, range_name):
@@ -116,7 +117,7 @@ def run_main(monkeypatch, calendar, page=None):
     def fetch(symbols):
         calls.append(list(symbols))
         return {s: {"next_earnings_date": None, "next_ex_div_date": None} for s in symbols}
-    provider.fetch_event_context_sync = fetch
+    provider.fetch_event_evidence_sync = fetch
     monkeypatch.setitem(sys.modules, "core.providers.calendar_provider", provider)
     monkeypatch.setattr(sync, "_open_book", lambda: Book())
     monkeypatch.setenv("TFB_CALENDAR_PAGES", "Top_10_Investments")
@@ -129,7 +130,7 @@ def test_actual_write_boundary_keeps_known_event_after_old_400_row_cap(monkeypat
     calendar = Sheet(values)
     result, calls = run_main(monkeypatch, calendar)
     assert result == 0 and calls == [["GRT-UN.TO"]]
-    assert calendar.reads == ["A1:G1000"]
+    assert calendar.reads == ["A1:M1000"]
     rows = {r[0]: r for r in calendar.updates[-1]["values"]}
     assert rows["LATE.US"][1:3] == ["2026-10-22", 13]
     assert rows["LATE.US"][5] == ASOF and "original provider" in rows["LATE.US"][6]
