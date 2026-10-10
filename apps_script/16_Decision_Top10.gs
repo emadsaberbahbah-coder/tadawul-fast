@@ -1,11 +1,21 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.2 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.2 (2026-10-10) -- HELD SEAT DISPLAY CONSISTENCY
+ * The Selected KPI separates fast-track suspension, research and grace.
+ * Qualified and audit rows explain visible held research seats while their
+ * Selected flag remains executable-only; backend deferrals stay unchanged.
+ * Earnings annotations run after the final render-time finalization so
+ * held-seat note replacement cannot erase the per-ticket calendar warning.
+ * Feed withholding retains only that calendar prefix and replaces the
+ * order narrative and levels with the existing withheld explanation.
+ * No qualification, stability, funding, policy or reset behavior changes.
  *
  * v1.13.1 (2026-10-10) -- QUOTE HANDOFF AND FINAL BANNER TRUTH
  * Preserve actual provider, typed acquisition/quote witnesses and their
@@ -1579,7 +1589,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.1';
+var DT10_VERSION = '1.13.2';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -1772,7 +1782,7 @@ function dt10FinalizeBoard_(payload) {
   var feedOk = !payload._dt10_uv || payload._dt10_uv.state === 'EXECUTABLE';
   var allocatedSafe = funding.finalized === true && funding.stage === 'allocate' &&
       funding.contract_version === 1 && funding.allocation_version === payload.version;
-  var executable = [], selectedSymbols = {};
+  var executable = [], selectedSymbols = {}, heldSeatReasons = {};
   (payload.selected || []).forEach(function (t) {
     var executableNow = feedOk && allocatedSafe &&
         (funding.eligible_symbols || []).indexOf(dt10NormSym_(t.symbol)) >= 0 &&
@@ -1791,6 +1801,10 @@ function dt10FinalizeBoard_(payload) {
       t.detail = t.detail || {}; t.detail.funds_from = 'Research — no allocation';
       if (!allocatedSafe || t._board_research === true || t._board_unfunded === true || !feedOk) {
         t.advisor_note = 'Research seat — no executable allocation today. ' + String(t._stab_status || '');
+      }
+      var heldKey = dt10NormSym_(t.symbol);
+      if (heldKey && !Object.prototype.hasOwnProperty.call(heldSeatReasons, heldKey)) {
+        heldSeatReasons[heldKey] = dt10HeldSeatReason_(t);
       }
     }
   });
@@ -1833,7 +1847,16 @@ function dt10FinalizeBoard_(payload) {
       return out;
     });
   }
-  (payload.candidates_rows || []).forEach(function (c) { c.selected = !!selectedSymbols[dt10NormSym_(c.symbol)]; });
+  (payload.candidates_rows || []).forEach(function (c) {
+    var key = dt10NormSym_(c.symbol);
+    c.selected = !!selectedSymbols[key];
+    // Display annotation only: the executable flag and backend deferral
+    // retain their own meanings. Re-finalization clears stale membership.
+    delete c._dt10_held_seat_reason;
+    if (!c.selected && Object.prototype.hasOwnProperty.call(heldSeatReasons, key)) {
+      c._dt10_held_seat_reason = heldSeatReasons[key];
+    }
+  });
   payload.meta.board_execution = {executable_count: executable.length,
       spend_sar: k.total_suggested_sar, gain_sar: k.expected_gain_12m_sar,
       allocation_finalized: funding.finalized === true};
@@ -3307,7 +3330,12 @@ function dt10UvWithholdRow_(row, idxList, noteIdx, reason) {
   for (var wi = 0; wi < idxList.length; wi++) {
     if (idxList[wi] < row.length) row[idxList[wi]] = '\u2014';
   }
-  if (noteIdx < row.length) row[noteIdx] = dt10UvWithholdNote_(reason);
+  if (noteIdx < row.length) {
+    // Calendar proximity is research context. Keep only the generated
+    // prefix; never preserve the previous order narrative or numbers.
+    var earnings = String(row[noteIdx] || '').match(/^(\u26a0 earnings \u2264\d+d \u00b7 )/);
+    row[noteIdx] = (earnings ? earnings[1] : '') + dt10UvWithholdNote_(reason);
+  }
   return row;
 }
 var DT10_NEARMISS_HEADERS = ['Symbol', 'Failed Gate', 'Current', 'Required',
@@ -3705,6 +3733,8 @@ var DT10_CAND_HEADERS = ['Symbol', 'Name', 'Market', 'Sector', 'Ccy', 'Price',
   'Failure Reason', 'Structural', 'Selected', 'Deferral'];
 function dt10CandToRow_(c) {
   var ff = c.first_fail || null;
+  var deferral = c.deferral;
+  if (!dt10HasValue_(deferral) && dt10SeatTruthOn_()) deferral = c._dt10_held_seat_reason;
   return [dt10Cell_(c.symbol), dt10Cell_(c.name), dt10Cell_(c.market),
           dt10Cell_(c.sector), dt10Cell_(c.currency), dt10Cell_(c.price),
           dt10Cell_(c.price_sar), dt10Cell_(c.roi_pct),
@@ -3717,7 +3747,7 @@ function dt10CandToRow_(c) {
           dt10Cell_(c.opportunity_score),
           dt10Cell_(ff ? ff.gate : null), dt10Cell_(c.failure_reason),
           c.structural_block === true ? 'Yes' : 'No',
-          c.selected === true ? 'Yes' : 'No', dt10Cell_(c.deferral)];
+          c.selected === true ? 'Yes' : 'No', dt10Cell_(deferral)];
 }
 // v1.2.0 — ALL QUALIFIED (full INVEST opportunity set). Derived view, not a
 // payload zone; purely filters candidates_rows the page already receives.
@@ -3825,6 +3855,9 @@ function dt10QualToRow_(c, rank, pendingMap, qualifiedCount, seatsFilled, ticket
     why = dt10HasValue_(c.failure_reason)
         ? String(c.failure_reason)
         : ('structural: ' + String(c.first_fail.gate));
+  }
+  else if (dt10SeatTruthOn_() && dt10HasValue_(c._dt10_held_seat_reason)) {
+    why = String(c._dt10_held_seat_reason);
   }
   else if (pend) {
     why = 'stability: awaiting confirmation (' + pend + ' days) — ' +
@@ -4077,6 +4110,20 @@ function dt10TicketClasses_(selected) {
     else out.suspended++;
   }
   return out;
+}
+/** v1.13.2 PURE: visible held membership is separate from executable
+ * selection. Preserve the actual stability label and its confirmation or
+ * miss count; this text does not assign money or replace backend deferrals. */
+function dt10HeldSeatReason_(ticket) {
+  var t = ticket || {};
+  var kind = t._grace_hold === true ? 'GRACE-HELD' :
+      (t._ft_suspended === true ? 'FAST-TRACK (SIZING SUSPENDED)' :
+       'RESEARCH (NO ALLOCATION)');
+  var stability = String(t._stab_status || '');
+  if (!stability && dt10HasValue_(t._stab_days)) stability = 'day ' + String(t._stab_days);
+  return 'Held research seat — ' + kind +
+      (stability ? '; stability: ' + stability : '') +
+      '; no executable allocation today';
 }
 /** v1.11.0 (2) / v1.11.1: the OUTPUT state of the board, separate from the
  * route status. EXECUTABLE = >= 1 funded, non-held ticket on an actionable
@@ -5125,7 +5172,8 @@ function dt10SeatCheckNote_(payload) {
 }
 /**
  * v1.8.8 (G-a) PURE: the seat-truth text for KPI cell 3 —
- * 'E exec + P pend + G grace / M'. Sources: payload.selected._grace_hold
+ * 'E exec + F fast-track suspended + R research + P pend + G grace / M'.
+ * Sources: final ticket classification, payload.selected._grace_hold
  * (the D-1 annotation), the BE-1 pending source
  * (payload.meta.stability.audit.pending, via dt10StabPendingMap_), and
  * kpis.max_selected. Returns '' when there is nothing to say or on ANY
@@ -5135,14 +5183,24 @@ function dt10SeatTruthKpi_(payload) {
   try {
     var sel = (payload && payload.selected) || [];
     var cls = dt10TicketClasses_(sel);            /* v1.11.1 */
-    var execN = cls.exec, graceN = cls.grace + cls.suspended;
+    var execN = cls.exec, graceN = cls.grace;
+    var fastN = sel.filter(function (t) {
+      return t && t._ft_suspended === true && t._grace_hold !== true;
+    }).length;
+    var researchN = Math.max(0, cls.suspended - fastN);
     var pendMap = dt10StabPendingMap_(payload);
-    var pendN = 0, pk;
+    var pendN = 0, pk, seatKeys = {};
+    sel.forEach(function (t) {
+      var key = dt10NormToken_(t && t.symbol);
+      if (key) seatKeys[key] = true;
+    });
     for (pk in pendMap) {
-      if (Object.prototype.hasOwnProperty.call(pendMap, pk)) pendN++;
+      if (Object.prototype.hasOwnProperty.call(pendMap, pk) && !seatKeys[pk]) pendN++;
     }
-    if (execN === 0 && graceN === 0 && pendN === 0) return '';
+    if (cls.total === 0 && pendN === 0) return '';
     var bits = [execN + ' exec'];
+    if (fastN) bits.push(fastN + ' fast-track suspended');
+    if (researchN) bits.push(researchN + ' research');
     if (pendN) bits.push(pendN + ' pend');
     if (graceN) bits.push(graceN + ' grace');
     var txt = bits.join(' + ');
@@ -5692,13 +5750,11 @@ function refreshDecisionTop10() {
   payload._dt10_uv = dt10BoardVerdict_(ss);
   dt10ReallocateBoard_(payload, body);
   dt10FinalizeBoard_(payload);
-  // v1.6.0 (W-3): earnings proximity tag — annotation-only, never gates.
-  var earn = dt10EarningsAnnotate_(payload, ss);
   // v1.6.6 (S-5): board-vs-backend KPI verification — token only.
   var kpiNote;
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
   var seatNote;
-  dt10RenderPayload_(sheet, payload, tokens);
+  var earn = dt10RenderPayload_(sheet, payload, tokens);
   kpiNote = dt10KpiCheckNote_(payload);
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
@@ -5926,6 +5982,9 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // The live caller reads once before replay; direct render callers fail closed.
   payload._dt10_uv = dt10BoardVerdict_(sheet.getParent());
   dt10FinalizeBoard_(payload);
+  // v1.13.2: annotate after the last note-replacing finalization, before
+  // painting the board. The refresh status and selection log use this result.
+  var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
   // Clear dynamic zones (breakApart first: section headers and empty-state
   // lines are merged ranges; writing over stale merges throws in GAS).
   var lastRow = sheet.getMaxRows();
@@ -6134,6 +6193,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   sheet.getRange(row, 1, 1, DT10_LAST_COL).merge()
       .setValue(dt10MetaLine_(payload.meta))
       .setFontColor(DT10_MUTED).setFontSize(8).setFontStyle('italic');
+  return earn;
 }
 // ---------------------------------------------------------------------------
 // Self-test
@@ -6625,6 +6685,44 @@ function dt10SelfTest() {
       ((btHeld.indexOf('FEED ACTIONABLE — HELD') >= 0 &&
         btEmpty.indexOf('FEED ACTIONABLE — NO_TRADE') >= 0)
        ? 'ok (grace HELD; empty NO_TRADE)' : 'FAIL'));
+  /* v1.13.2: synthetic display-only held seats; no calendar/broker writes. */
+  var hsMixed = {selected: [{symbol: 'E', suggested_shares: 1},
+      {symbol: 'F', _ft_suspended: true, suggested_shares: 0},
+      {symbol: 'G', _grace_hold: true, _ft_suspended: true, suggested_shares: 0},
+      {symbol: 'R', suggested_shares: 0}], kpis: {max_selected: 10}};
+  var hsPayload = {version: 'synthetic', selected: [{symbol: 'F',
+      _ft_suspended: true, _stab_status: 'FAST-TRACK (day 1, 1/3 confirmed)'},
+      {symbol: 'G', _grace_hold: true, _stab_status: 'GRACE (2/3 missed)'}],
+      candidates_rows: [{symbol: 'f', deferral: ''}, {symbol: 'G', deferral: ''}],
+      kpis: {max_selected: 10}, meta: {}};
+  dt10FinalizeBoard_(hsPayload);
+  var hsQual = dt10QualToRow_(hsPayload.candidates_rows[0], 1, {}, 2, 2, {});
+  var hsTruth = dt10SeatTruthOn_();
+  report.push('held seat labels core: ' +
+      ((dt10SeatTruthKpi_(hsMixed) ===
+          '1 exec + 1 fast-track suspended + 1 research + 1 grace / 10' &&
+        dt10SeatTruthKpi_(hsPayload) === '0 exec + 1 fast-track suspended + 1 grace / 10' &&
+        hsPayload.candidates_rows[0].selected === false && hsQual[13] === 'No' &&
+        hsPayload.candidates_rows[0].deferral === '' &&
+        (!hsTruth || (hsQual[14].indexOf('Held research seat') === 0 &&
+          hsQual[14].indexOf('1/3 confirmed') > 0 &&
+          dt10CandToRow_(hsPayload.candidates_rows[0])[24] === hsQual[14])))
+       ? 'ok (exec / fast-track suspended / research / grace; held qualifier stays No)' : 'FAIL'));
+  var hsEarnMap = {F: 4, G: 15};
+  dt10ApplyEarningsTags_(hsPayload.selected, hsEarnMap, 14);
+  dt10FinalizeBoard_(hsPayload); // render-time finalization can replace held notes
+  var hsEarnCount = dt10ApplyEarningsTags_(hsPayload.selected, hsEarnMap, 14);
+  var hsEarnAgain = dt10ApplyEarningsTags_(hsPayload.selected, hsEarnMap, 14);
+  var hsEarnWithheld = dt10UvWithholdRow_(dt10TicketToRow_(hsPayload.selected[0]),
+      DT10_UV_BOARD_WITHHOLD_IDX, DT10_UV_BOARD_NOTE_IDX, 'synthetic');
+  report.push('final earnings annotation core: ' +
+      ((hsEarnCount === 1 && hsEarnAgain === 0 &&
+        hsPayload.selected[0].advisor_note.indexOf('\u26a0 earnings \u22644d \u00b7 ') === 0 &&
+        hsPayload.selected[1].advisor_note.indexOf('\u26a0 earnings') < 0 &&
+        hsEarnWithheld[DT10_UV_BOARD_NOTE_IDX].indexOf(
+            '\u26a0 earnings \u22644d \u00b7 SIZING WITHHELD') === 0 &&
+        hsEarnWithheld[10] === '\u2014' && hsEarnWithheld[12] === '\u2014')
+       ? 'ok (post-finalization; 15d excluded; idempotent; withheld prefix only)' : 'FAIL'));
   /* v1.11.12 [P-181b]: the four timing-gate fields project from a GM-shaped
      header and travel on the pool row; the legacy filter drops exactly them. */
   var w52Hdr = ['Symbol', 'Name', 'Current Price', '52W High', '52W Low',
