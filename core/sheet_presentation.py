@@ -3,6 +3,12 @@
 This boundary certifies display units, not trading eligibility. Supplier facts,
 scores, policies, prices and the caller's row remain unchanged. Unknown margins
 and conflicting derived returns are withheld instead of guessed or recalculated.
+
+WHY v1.0.2 (WP-03, 2026-10-10 export): forecast prices rounded to four
+decimals can disagree with six-decimal returns. TFB_PRICE_PRECISION OFF
+keeps the existing tuple check byte-identical; ON adds the actual price
+rounding quantum divided by current price. Seven-significant-digit prices
+use their smaller quantum, so a tiny quote never permits arbitrary returns.
 """
 from __future__ import annotations
 
@@ -11,8 +17,9 @@ import re
 from typing import Any, Mapping
 
 from core.financial_units import MARGIN_FIELDS, MARGIN_UNIT_KEY, margin_unit_valid
+from core.price_precision import price_precision_enabled, price_round_half_quantum
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 _MARKET_SHEET_PAGES = frozenset({
     "Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX",
@@ -245,6 +252,8 @@ def present_instrument_row(row: Mapping[str, Any]) -> dict[str, Any]:
         # one-cent price allowance would accept arbitrary returns on tiny
         # crypto/FX prices. This permits existing six-decimal ROI rounding.
         tolerance = max(0.000005, abs(implied) * 0.000001)
+        if price_precision_enabled():
+            tolerance += price_round_half_quantum(price) / cp
         if not math.isfinite(implied) or not math.isfinite(tolerance):
             write(return_field, None)
             added.append("sheet_tuple_unknown:" + return_field)

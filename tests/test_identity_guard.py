@@ -15,7 +15,9 @@ Run:  python3 -m pytest tests/test_identity_guard.py -v
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -77,6 +79,26 @@ def test_gbx_and_gbp_are_the_same_venue():
     assert currency_is_consistent("HSBA.L", "GBP") is True
     assert currency_is_consistent("7203.T", "USD") is False
     assert currency_is_consistent("AAPL", "USD") is None
+
+
+def test_usx_is_usd_subunit_only_while_armed():
+    for flag, expected in (("0", False), ("1", True), ("true", True), ("on", True)):
+        with patch.dict(os.environ, {"TFB_OPP_FX_USX_SUBUNIT": flag}):
+            assert currency_is_consistent("SYNTH.US", "USX") is expected
+            assert currency_is_consistent("SYNTH.US", "usx") is expected
+            assert currency_is_consistent("7203.T", "USX") is False
+            assert currency_is_consistent("HSBA.L", "GBP") is True
+
+
+def test_usx_watchlist_future_survives_identity_guard():
+    # Bare Yahoo futures do not imply an equity venue; the guard must keep
+    # good cents prices intact without making the contract executable.
+    row = _row("ZC=F", "Corn Futures", "USX", 479.75, asset_class="Future")
+    row["Investability Status"] = "WATCHLIST"
+    for flag in ("0", "1"):
+        with patch.dict(os.environ, {"TFB_OPP_FX_USX_SUBUNIT": flag}):
+            plan = guard_sheet_rows([row], sheet="Commodities_FX")
+            assert plan.rows == [row] and plan.counts() == {}
 
 
 # ---------------------------------------------------------------------------

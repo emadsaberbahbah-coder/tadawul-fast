@@ -1,5 +1,11 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.0 (2026-10-11) -- WP-02 OPERATOR FLAG MAPPINGS
+# WHY: the 2026-10-10 export still has 27 duplicate matured keys and 11,791
+# matured rows with zero-valued risk placeholders. Existing v6.41.0 guards
+# could not run because their repository Variables were never mapped here.
+# Defaults remain off/0; mirror both mappings in daily_sync's tracker step.
+
 # =============================================================================
 # WHY THIS EXISTS
 # -----------------------------------------------------------------------------
@@ -251,6 +257,14 @@ jobs:
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
           # 2026-09-01: one-shot opt-in (v6.38.0) — set the repo Variable to 1 for ONE run, then remove it
           TRACK_DROP_DUPLICATE_ROWS: ${{ vars.TRACK_DROP_DUPLICATE_ROWS || '0' }}
+          # WP-02 (2026-10-11): wiring only; unset Variables reproduce the
+          # v6.41.0 script defaults. Observe logs would-expire duplicates;
+          # enforce changes duplicate treatment. TRACK_RISK_BLANK=1 blanks
+          # unavailable risk cells; arming is a separate operator decision.
+          # Read-back: DEDUP-MATURED and PERF-VERDICT dedup_matured receipt;
+          # risk cells blank only after TRACK_RISK_BLANK=1. Rollback: off/0.
+          TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
+          TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,

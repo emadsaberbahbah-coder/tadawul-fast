@@ -11,6 +11,7 @@ from collections import Counter
 import datetime as dt
 from decimal import Decimal, localcontext
 import math
+import os
 import re
 from typing import Any
 
@@ -19,7 +20,11 @@ from core.execution_accounting import (
     payload_fingerprint,
 )
 
-__version__ = "1.0.0"
+# v1.0.1 (2026-10-11) WHY: the optional USX/USD quote relationship must
+# never turn a cents quote into a native cash or holdings declaration.
+# Reject USX in lockstep with TFB_OPP_FX_USX_SUBUNIT; DEFAULT OFF preserves
+# the previous strict currency parser and evidence contract.
+__version__ = "1.0.1"
 SCHEMA_VERSION = 1
 MAX_ACCOUNTS = 100
 MAX_HOLDINGS = 500
@@ -35,7 +40,10 @@ def _token(value: Any) -> str:
 def _native_currency(value: Any) -> str:
     text = _text(value, "currency")
     # Minor quote units cannot be silently capitalized into a cash currency.
-    if text != text.upper() or text in {"GBX", "ZAC", "ILA"}:
+    usx_enabled = (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+        "1", "true", "yes", "on"}
+    if text != text.upper() or text in {"GBX", "ZAC", "ILA"} or \
+            (text == "USX" and usx_enabled):
         raise AccountingError("ambiguous_currency")
     return _currency(text)
 

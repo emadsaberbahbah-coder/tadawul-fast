@@ -2,7 +2,7 @@
 # core/analysis/identity_guard.py
 """
 ================================================================================
-Identity Guard — v1.2.0   (replaces the destructive ID-FIREWALL dedup stage)
+Identity Guard — v1.3.1   (replaces the destructive ID-FIREWALL dedup stage)
 ================================================================================
 
 v1.2.0 — TOTAL-WIPE BLIND SPOT CLOSED (2026-08-20 production log)
@@ -287,8 +287,15 @@ from core.analysis.symbol_dedup import (
 #   NOT attempted: shifted values need a trustworthy re-fetch, not a guess.
 # Functions added: 3 (+2 constants, +1 Reason). Removed: 0.
 # -----------------------------------------------------------------------------
-IDENTITY_GUARD_VERSION = "1.3.0"
+# v1.3.1 (2026-10-11) WHY: USX is USD quoted in cents. Recognize the
+# parent relationship and schema currency token only while the shared
+# TFB_OPP_FX_USX_SUBUNIT gate is armed (DEFAULT OFF). Existing quarantine
+# markers retain their rule version so unarmed rows remain byte-identical.
+# The new crypto_patch_name_matches adapter also reuses the shared crypto
+# identity contract; it adds no policy or mutation to this guard.
+IDENTITY_GUARD_VERSION = "1.3.1"
 __version__ = IDENTITY_GUARD_VERSION
+_IDENTITY_MARK_VERSION = "1.3.0"
 
 __all__ = [
     "Action",
@@ -332,7 +339,12 @@ SUFFIX_CURRENCY: Dict[str, str] = {
 }
 
 # Currencies that are minor units of another (price magnitudes differ x100).
-SUBUNIT_OF = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}
+SUBUNIT_OF = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS", "USX": "USD"}
+
+
+def _usx_subunit_enabled() -> bool:
+    return (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+        "1", "true", "yes", "on"}
 
 # Plausible listed-price range per currency, as (low, high).
 #
@@ -372,7 +384,7 @@ def row_asset_class(row: Mapping[str, Any]) -> str:
 # --- v1.3.0 signature 0: column-shift / schema coherence --------------------
 _SS_CCY_RE = re.compile(r"^[A-Z]{3}$")
 _SS_KNOWN_CCY = frozenset(set(SUFFIX_CURRENCY.values())
-                          | set(SUBUNIT_OF) | set(SUBUNIT_OF.values())
+                          | (set(SUBUNIT_OF) - {"USX"}) | set(SUBUNIT_OF.values())
                           | {"USD", "EUR", "GBP", "JPY", "CNY", "OMR", "BHD",
                              "JOD", "AED", "KWD", "QAR"})
 _SS_ASSET_CLASS_TOKENS = frozenset({
@@ -411,7 +423,8 @@ def schema_shift_signals(row: Mapping[str, Any]) -> List[str]:
     if ccy and not _SS_CCY_RE.match(ccy.upper()):
         sigs.append("currency_not_code")
     exch = _ss_first(row, _SS_EXCH_KEYS)
-    if exch and exch.upper() in _SS_KNOWN_CCY:
+    if exch and (exch.upper() in _SS_KNOWN_CCY
+                 or (exch.upper() == "USX" and _usx_subunit_enabled())):
         sigs.append("exchange_is_currency")
     country = _ss_first(row, _SS_COUNTRY_KEYS)
     if country and country.lower() in _SS_ASSET_CLASS_TOKENS:
@@ -517,6 +530,12 @@ _ACTION_KEYS: Tuple[str, ...] = ("Final Action", "final_action")
 # that is the canonical 115-key contract this module sits inside; a Title-Case
 # key would be stripped at projection (the v1.0.0 defect).
 _WARNING_FALLBACK_KEY = "warnings"
+
+
+def crypto_patch_name_matches(symbol: Any, name: Any) -> Optional[bool]:
+    """WP-05 shared curated-name screen; a match is not identifier proof."""
+    from core.symbols.crypto_identity import crypto_name_matches
+    return crypto_name_matches(symbol, name)
 
 
 def _env_flag_on(name: str, default: str = "0") -> bool:
@@ -681,6 +700,8 @@ def currency_is_consistent(symbol: Any, currency: Any) -> Optional[bool]:
     if expected == actual:
         return True
     # GBP/GBX and friends are the same venue, different unit.
+    if (expected == "USX" or actual == "USX") and not _usx_subunit_enabled():
+        return False
     if SUBUNIT_OF.get(expected) == actual or SUBUNIT_OF.get(actual) == expected:
         return True
     return False
@@ -841,7 +862,7 @@ def guard_sheet_rows(
                 _append_guard_warning(
                     working[index],
                     "identity_guard_v%s:schema_shift_%s:%s"
-                    % (IDENTITY_GUARD_VERSION, "+".join(_ss), _ss_mode))
+                    % (_IDENTITY_MARK_VERSION, "+".join(_ss), _ss_mode))
                 if _ss_mode == "enforce":
                     contaminated.add(index)
                     plan.findings.append(
@@ -955,7 +976,7 @@ def guard_sheet_rows(
     # --- clear only the contaminated fields, never the whole row ------------
     quarantine_keys_on = _quarantine_keys_enabled()   # v1.1.0
     action_precedence_on = _action_precedence_enabled()  # v1.1.0
-    stamp = f"identity_guard_v{IDENTITY_GUARD_VERSION}:fields_quarantined"
+    stamp = f"identity_guard_v{_IDENTITY_MARK_VERSION}:fields_quarantined"
     for index in contaminated:
         row = working[index]
         if quarantine_keys_on:

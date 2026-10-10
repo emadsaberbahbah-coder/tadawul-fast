@@ -83,3 +83,19 @@ The live Node harnesses that remain in `tests/` (`test_dt10_cash_source.js`,
 `apps_script/16_Decision_Top10.gs` relative to the test file, so they run from
 any working directory; `test_dt10_p142_containment.js` also accepts LF line
 endings (it previously required CRLF).
+
+## Added 2026-10-11: remaining uncommitted dual trees
+
+| File | Missing prerequisites | Active single-tree coverage |
+| --- | --- | --- |
+| `test_de_horizon_coherence_dualtree.py` | `bpkg/` and `rpkg/` engine 5.140/5.141 copies | `tests/test_de_horizon_coherence_f6.py`: both backfill entry points, off/observe/enforce, label/day round trips |
+| `test_eq_roi_unit_sentry_dualtree.py` | `base_pkg/` and `rev_pkg/` enriched-quote 4.10/4.11 copies | `tests/test_eq_roi_unit_sentry.py`: unchanged observe values, exact tags, ground-truth scaling, tiny-points protection and idempotence |
+| `test_pf_dd_fee_guards_local_dualtree.py` | sibling `../rev` tree and obsolete uncertified portfolio fixture | `tests/test_pf_dd_fee_guards.py`: real drawdown/time guard and exact 2-to-1 share fee boundary; certified builder integration remains in `tests/test_portfolio_exact_funding.py` |
+
+Historical base equivalence needs the historical artifact; active tests now
+assert every reproducible safety property against the actual current modules.
+The preserved archives are never substitutes for pytest-visible assertions.
+
+The explicit live-server CLI now lives at `scripts/smoke_endpoints.py`.
+`tests/test_endpoints.py` only checks its offline help/parser path and retains
+the old `python tests/test_endpoints.py ...` invocation as a compatibility shim.

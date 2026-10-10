@@ -2,11 +2,17 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.7.2
+Scoring Module — v5.11.4
 FULL REVISED VERSION / CONFIDENCE-PENALTY-NEUTRAL-POINT
 ================================================================================
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
 (Top changelog condensed for working copy; code + inline comments verbatim.)
+
+WHY v5.11.4 (WP-03): the 2026-10-10 workbook publishes zero forecast
+prices for SHIB-USD (5.47e-6) and COMP-USD through fixed four-decimal
+rounding. TFB_PRICE_PRECISION is default OFF; armed (1/true/on/yes),
+the shared price contract retains seven significant digits below 10.
+Return/score precision and invalid-value behavior remain unchanged.
 
 Canonical tiers (best -> worst):
     STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID
@@ -248,6 +254,11 @@ try:
 except ImportError:  # local script-style import from the core directory
     from financial_units import margin_value as _margin_value
 
+try:
+    from core.price_precision import round_price as _precision_round_price
+except ImportError:  # same standalone import contract as financial_units
+    from price_precision import round_price as _precision_round_price
+
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -296,7 +307,7 @@ logger.addHandler(logging.NullHandler())
 # v5.11.3: value-bound margin receipts determine the economic unit for quality
 # scoring. Absent receipts keep the legacy parser; explicit invalid receipts
 # contribute no margin. Source values and all score thresholds stay unchanged.
-__version__ = "5.11.3"
+__version__ = "5.11.4"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -790,6 +801,19 @@ def _round(value: Optional[float], ndigits: int = SCORE_PRECISION) -> Optional[f
         if math.isnan(float(value)) or math.isinf(float(value)):
             return None
         return round(float(value), ndigits)
+    except Exception:
+        return None
+
+
+def _round_price(value: Optional[float], ndigits: int = 4) -> Optional[float]:
+    """Keep the scorer's null/non-finite contract with shared price rounding."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return _precision_round_price(number, ndigits)
     except Exception:
         return None
 
@@ -1517,9 +1541,9 @@ def derive_forecast_patch(row: Mapping[str, Any], forecasts: ForecastParameters)
 
     patch = _empty_forecast_patch()
     patch.update({
-        "forecast_price_1m": _round(fp1, 4),
-        "forecast_price_3m": _round(fp3, 4),
-        "forecast_price_12m": _round(fp12, 4),
+        "forecast_price_1m": _round_price(fp1),
+        "forecast_price_3m": _round_price(fp3),
+        "forecast_price_12m": _round_price(fp12),
         "expected_roi_1m": _round(roi1, ROI_PRECISION),
         "expected_roi_3m": _round(roi3, ROI_PRECISION),
         "expected_roi_12m": _round(roi12, ROI_PRECISION),

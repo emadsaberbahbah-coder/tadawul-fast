@@ -170,7 +170,7 @@ def main():
 
     fix = load("sb_fix", DELIVERED)
     base = load("sb_base", BASE) if os.path.exists(BASE) else None
-    T("versions", fix.SCRIPT_VERSION == "1.5.0" and (base is None or base.SCRIPT_VERSION == "1.4.0"), f"fix={fix.SCRIPT_VERSION} base={(base.SCRIPT_VERSION if base else 'absent')}")
+    T("versions", tuple(map(int, fix.SCRIPT_VERSION.split("."))) >= (1, 5, 0) and (base is None or base.SCRIPT_VERSION == "1.4.0"), f"fix={fix.SCRIPT_VERSION} base={(base.SCRIPT_VERSION if base else 'absent')}")
     from datetime import date
     # F1 pure battery
     T("F1 weekend Sat/Sun", fix._is_nontrading_day(date(2026, 9, 26)) == (True, "weekend:Sat") and fix._is_nontrading_day(date(2026, 9, 27)) == (True, "weekend:Sun"))
@@ -255,6 +255,15 @@ def main():
     print("\n".join(out))
     print(f"SUMMARY {len(out) - fails}/{len(out)} PASS | digest {digest}")
     return 1 if fails else 0
+
+
+def test_regression_battery():
+    from pathlib import Path
+    import subprocess
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+                            cwd=Path(__file__).resolve().parents[1],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":

@@ -2,10 +2,17 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.5.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.6.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.6.0 WHY (2026-10-10 work brief WP-05): seven wrong-identity crypto
+rows were preserved after Yahoo short-ticker collisions. Add a provider
+native .CC path for explicit curated BASE-USD pairs only, behind
+TFB_EODHD_CRYPTO_MAP=1 (default off). OFF preserves all existing mappings;
+Yahoo identifiers and universe membership remain operator choices. Cached
+normalization requires a process restart after arming, like existing FX maps.
 
 v5.5.0 (over v5.4.0) — BARE ROOT IS AN EQUITY (identity-collision fix,
 2026-09-04 six-gate audit + acceptance A3 re-execution):
@@ -111,7 +118,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.5.0"
+__version__ = "5.6.0"
 
 __all__ = [
     "MarketType",
@@ -1333,6 +1340,16 @@ def to_eodhd_symbol(symbol: str, *, default_exchange: Optional[str] = None) -> s
             _base = _m.group(1)
             _pair = f"USD{_base}" if len(_base) == 3 else _base
             return f"{_pair}.FOREX"
+
+    # Native EODHD crypto pairs; explicit USD pairs only, no bare ticker
+    # inference and no automatic adoption of collision-prone Yahoo IDs.
+    if _env_bool("TFB_EODHD_CRYPTO_MAP", False):
+        from core.symbols.crypto_identity import CRYPTO_NAME_TOKENS
+        pair = re.fullmatch(r"([A-Z0-9]+)-USD(?:\.CC)?", s)
+        if pair and pair.group(1) in CRYPTO_NAME_TOKENS:
+            # The engine and provider both normalize. Native forms must be
+            # idempotent or the provider adds .US on the second pass.
+            return f"{pair.group(1)}-USD.CC"
 
     if is_special_symbol(s):
         return s

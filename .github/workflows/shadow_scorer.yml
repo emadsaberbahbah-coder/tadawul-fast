@@ -1,5 +1,9 @@
 name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
+# VERSION 1.0.0 (2026-10-11) -- WP-02 DEFAULT-OFF S-1 V2 MAPPING
+# WHY: the 2026-10-10 export shows criterion 5 PASS on an empty
+# _Corporate_Actions register. v1.9.2's criteria guard was never mapped.
+
 # Wave S deliverable #15 (Master Plan v2.1 §3, §15). Daily Champion-vs-
 # Challenger scoring and the S-1 acceptance gate. Runs AFTER the shadow board
 # so it scores the board the challenger actually published that day.
@@ -56,6 +60,13 @@ jobs:
       # an unrecovered day records the honest reason `stale-board` instead
       # of `no-challenger`. Rollback: re-comment the line below.
       TFB_S1_BOARD_FRESH_GUARD: "observe"
+      # WP-02 (2026-10-11): strict default-off wiring; no arming decision
+      # is implied. Observe annotates criteria details without changing
+      # status/verdict/history. Read-back: criterion 5's "| v2:" detail says
+      # empty _Corporate_Actions would be NOT_EVALUABLE. Before enforce,
+      # record the Register section 5 evidence-window boundary (criterion 1
+      # was 17/28 on 2026-10-10). Rollback: unset/off repository Variable.
+      TFB_S1_CRITERIA_V2: ${{ vars.TFB_S1_CRITERIA_V2 || 'off' }}
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is
