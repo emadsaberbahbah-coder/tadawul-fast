@@ -2,7 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.3 (2026-10-10) -- FUNDING AND COMPLETE FINAL PUBLICATION
+# VERSION 1.1.4 (2026-10-10) -- CALENDAR EVIDENCE AND COMPLETE CONSUMPTION
+#
+# v1.1.4: require per-event provider evidence, safe legacy schema migration,
+# complete calendar consumption and dated native/brief warnings. Provider
+# transport tests run under the pinned contract dependencies.
 #
 # v1.1.3: require exact portfolio budgets, conflicting quote aliases, atomic
 # calendar replacement and field-independent fallback, and final publication
@@ -346,6 +350,8 @@ jobs:
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
+            tests/test_calendar_evidence_consumers.py \
+            tests/test_daily_brief_calendar_evidence.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -481,6 +487,8 @@ jobs:
             tests/test_portfolio_reconciliation_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
+            tests/test_calendar_event_evidence.py \
+            tests/test_calendar_sync_evidence.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \

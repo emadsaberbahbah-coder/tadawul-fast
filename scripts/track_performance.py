@@ -1478,8 +1478,11 @@ from urllib.error import HTTPError, URLError
 # v6.43.0 (2026-10-09): outcome labels require value-bound acquisition and
 # source quote timestamps for the intended exchange session. Positive scalars,
 # last-good/stale prices, and later-session quotes never become fake WIN/LOSS.
-# Evidence is versioned in Notes; the 32-column schema and historical rows stay.
-SCRIPT_VERSION = "6.43.0"
+# Evidence is versioned in Notes; the 32-column outcome schema stays.
+# v6.44.0: read the complete bounded calendar and preserve each event's date,
+# provider, observation clock and evidence status in appended Signal_History
+# columns. Legacy event provenance remains unknown; outcome policy is unchanged.
+SCRIPT_VERSION = "6.44.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2443,11 +2446,26 @@ def _days_until(raw: Any) -> Optional[int]:
         return None
 
 
+def _snapshot_calendar_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture each dated context and its own evidence as an additive tuple."""
+    from core.calendar_evidence import EVENT_FIELDS, calendar_date, normalize_event_evidence
+
+    out: Dict[str, Any] = {}
+    for key, prefix, heading in EVENT_FIELDS:
+        event_date = calendar_date(row.get(key) or row.get(heading))
+        out[key] = event_date or ""
+        out.update(normalize_event_evidence(row, prefix, event_date))
+    return out
+
+
 def _merge_calendar_context(rows: List[Dict[str, Any]],
                             ctx: Dict[str, Dict[str, Any]]) -> int:
-    """v6.15.0 (F1 wiring): setdefault next_earnings_date / next_ex_div_date
-    onto each row from the Calendar_Events context. Backend-supplied values
-    always win (setdefault). Returns how many rows received at least one key."""
+    """Fill missing dates together with their own calendar evidence.
+
+    Never attach sheet provenance to a different backend date. Equal dates
+    can inherit missing evidence, while existing backend evidence wins.
+    """
+    from core.calendar_evidence import EVENT_FIELDS, calendar_date
     if not rows or not ctx:
         return 0
     n = 0
@@ -2458,14 +2476,23 @@ def _merge_calendar_context(rows: List[Dict[str, Any]],
         if not c:
             continue
         hit = False
-        for k in ("next_earnings_date", "next_ex_div_date"):
+        for k, prefix, _ in EVENT_FIELDS:
             v = c.get(k)
             existing = row.get(k)
             # NOTE: _safe_str(None) returns the string 'None' in this module,
             # so the emptiness check must be explicit, not _safe_str-based.
             if v and (existing is None or not str(existing).strip()):
                 row[k] = v
+                for suffix in ("_source", "_observed_at", "_status"):
+                    row[prefix + suffix] = c.get(prefix + suffix, "")
                 hit = True
+            elif v and calendar_date(existing) == v:
+                # Evidence is an indivisible tuple: filling one member of an
+                # existing partial backend receipt would mix acquisition legs.
+                evidence_keys = [prefix + suffix for suffix in ("_source", "_observed_at", "_status")]
+                if not any(row.get(key) for key in evidence_keys):
+                    for key in evidence_keys:
+                        row[key] = c.get(key, "")
         n += 1 if hit else 0
     return n
 
@@ -4632,6 +4659,14 @@ class SignalSnapshot:
     target_price: float = 0.0
     days_to_earnings: Optional[int] = None
     days_to_exdiv: Optional[int] = None
+    next_earnings_date: str = ""
+    earnings_source: str = "unknown"
+    earnings_observed_at: str = ""
+    earnings_status: str = "unknown"
+    next_ex_div_date: str = ""
+    exdiv_source: str = "unknown"
+    exdiv_observed_at: str = ""
+    exdiv_status: str = "unknown"
 
     @property
     def date_key(self) -> str:
@@ -4663,6 +4698,14 @@ class SignalSnapshot:
             "target_price": self.target_price,
             "days_to_earnings": self.days_to_earnings,
             "days_to_exdiv": self.days_to_exdiv,
+            "next_earnings_date": self.next_earnings_date,
+            "earnings_source": self.earnings_source,
+            "earnings_observed_at": self.earnings_observed_at,
+            "earnings_status": self.earnings_status,
+            "next_ex_div_date": self.next_ex_div_date,
+            "exdiv_source": self.exdiv_source,
+            "exdiv_observed_at": self.exdiv_observed_at,
+            "exdiv_status": self.exdiv_status,
         }
 
     @classmethod
@@ -4703,6 +4746,16 @@ class SignalSnapshot:
                               if _safe_str(get("Days To Earnings")) else None),
             days_to_exdiv=(int(_safe_float(get("Days To ExDiv")))
                            if _safe_str(get("Days To ExDiv")) else None),
+            **_snapshot_calendar_fields({
+                "next_earnings_date": get("Next Earnings Date"),
+                "earnings_source": get("Earnings Source"),
+                "earnings_observed_at": get("Earnings Observed At (UTC)"),
+                "earnings_status": get("Earnings Evidence Status"),
+                "next_ex_div_date": get("Next Ex-Div Date"),
+                "exdiv_source": get("ExDiv Source"),
+                "exdiv_observed_at": get("ExDiv Observed At (UTC)"),
+                "exdiv_status": get("ExDiv Evidence Status"),
+            }),
         )
 
 
@@ -5869,6 +5922,10 @@ class SignalHistoryStore:
         "Target Price",
         "Days To Earnings",
         "Days To ExDiv",
+        # v6.44.0: preserve the date/provenance used by the day's context.
+        "Next Earnings Date", "Earnings Source", "Earnings Observed At (UTC)",
+        "Earnings Evidence Status", "Next Ex-Div Date", "ExDiv Source",
+        "ExDiv Observed At (UTC)", "ExDiv Evidence Status",
     ]
 
     def __init__(self, spreadsheet_id: str, sheet_name: str):
@@ -5945,17 +6002,39 @@ class SignalHistoryStore:
     def _ensure_headers(self) -> None:
         if not self.ws:
             return
-        try:
-            existing = self.ws.row_values(self.START_ROW)
-        except Exception:
-            existing = []
+        existing = self.ws.row_values(self.START_ROW)
         existing_norm = [str(h).strip() for h in (existing or [])]
-        # Widen/repair the header row whenever it differs from canonical
-        # HEADERS by length OR content (same discipline as PerformanceStore).
+        # Additive migration may widen only the exact recognized legacy shape.
+        # Never relabel existing cells after an unreadable or ambiguous header.
+        while existing_norm and not existing_norm[-1]:
+            existing_norm.pop()
+        if existing_norm not in ([], list(self.HEADERS[:18]), list(self.HEADERS)):
+            raise ValueError("unrecognized Signal_History headers; preserving table")
+        if not existing_norm:
+            rows, cols = getattr(self.ws, "row_count", None), getattr(self.ws, "col_count", None)
+            if (not isinstance(rows, int) or isinstance(rows, bool) or rows < 1
+                    or not isinstance(cols, int) or isinstance(cols, bool) or cols < 1):
+                raise ValueError("cannot establish empty Signal_History grid")
+            body = self.ws.get(f"A2:{_col_to_a1(cols)}{rows}") if rows > 1 else []
+            if any(str("" if cell is None else cell).strip() for row in body or [] for cell in row):
+                raise ValueError("missing Signal_History header above existing data")
         if existing_norm != list(self.HEADERS):
             end_col = len(self.HEADERS)
+            cols = getattr(self.ws, "col_count", None)
+            if existing_norm == list(self.HEADERS[:18]):
+                rows = getattr(self.ws, "row_count", None)
+                if (not isinstance(rows, int) or isinstance(rows, bool) or rows < 1
+                        or not isinstance(cols, int) or isinstance(cols, bool) or cols < 18):
+                    raise ValueError("cannot establish Signal_History migration extent")
+                if rows > 1 and cols > 18:
+                    extension = self.ws.get(f"S2:{_col_to_a1(min(cols, end_col))}{rows}")
+                    if any(str("" if cell is None else cell).strip()
+                           for row in extension or [] for cell in row):
+                        raise ValueError("Signal_History extension contains existing data")
+            if isinstance(cols, int) and cols < end_col:
+                self.ws.resize(cols=end_col)
             rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
-            self.ws.update(values=[self.HEADERS], range_name=rng)
+            self.ws.update(values=[self.HEADERS], range_name=rng, value_input_option="RAW")
             try:
                 self.ws.freeze(rows=self.START_ROW)
             except Exception:
@@ -6018,6 +6097,9 @@ class SignalHistoryStore:
             s.target_price if s.target_price else "",
             s.days_to_earnings if s.days_to_earnings is not None else "",
             s.days_to_exdiv if s.days_to_exdiv is not None else "",
+            s.next_earnings_date, s.earnings_source, s.earnings_observed_at,
+            s.earnings_status, s.next_ex_div_date, s.exdiv_source,
+            s.exdiv_observed_at, s.exdiv_status,
         ]
 
     def append_snapshots(self, snaps: List[SignalSnapshot]) -> int:
@@ -8415,6 +8497,7 @@ class PerformanceTrackerApp:
             # doesn't carry the key; days_to_* stay None until the F1
             # calendar layer supplies next_earnings_date / next_ex_div_date.
             if _env_bool("TRACK_EVENT_CONTEXT", True):
+                _calendar_fields = _snapshot_calendar_fields(row)
                 _arating = _safe_str(
                     row.get("analyst_rating") or row.get("Analyst Rating")
                 )
@@ -8422,13 +8505,14 @@ class PerformanceTrackerApp:
                     row.get("target_price") or row.get("Target Price"), default=0.0
                 )
                 _dte = _days_until(
-                    row.get("next_earnings_date") or row.get("Next Earnings Date")
+                    _calendar_fields["next_earnings_date"]
                 )
                 _dtx = _days_until(
-                    row.get("next_ex_div_date") or row.get("Next Ex-Div Date")
+                    _calendar_fields["next_ex_div_date"]
                 )
             else:
                 _arating, _tprice, _dte, _dtx = "", 0.0, None, None
+                _calendar_fields = _snapshot_calendar_fields({})
             snap = SignalSnapshot(
                 snapshot_id=str(uuid.uuid4()),
                 symbol=sym,
@@ -8448,6 +8532,7 @@ class PerformanceTrackerApp:
                 target_price=_tprice,
                 days_to_earnings=_dte,
                 days_to_exdiv=_dtx,
+                **_calendar_fields,
             )
             if snap.key in seen:
                 continue
@@ -8456,10 +8541,13 @@ class PerformanceTrackerApp:
         return out
 
     def _load_calendar_context(self) -> Dict[str, Dict[str, Any]]:
-        """v6.15.0 (F1 wiring): read the Calendar_Events tab written daily by
-        scripts/run_calendar_sync.py. Best-effort: piggybacks the already-open
-        Signal_History spreadsheet handle; ANY problem returns {} silently
-        (one debug line) — snapshots then behave exactly as v6.14.0."""
+        """Read the complete bounded calendar, including per-event evidence.
+
+        A truncated or ambiguous table supplies no context. Legacy seven-column
+        grids remain readable and keep unknown typed provenance.
+        """
+        from core.calendar_evidence import (CALENDAR_HEADERS, MAX_CALENDAR_BODY_ROWS,
+                                            parse_calendar_values)
         if not _env_bool("TRACK_EVENT_CONTEXT", True):
             return {}
         store = self.signal_store
@@ -8468,35 +8556,20 @@ class PerformanceTrackerApp:
         tab = os.getenv("TFB_CALENDAR_SHEET", "Calendar_Events").strip() or "Calendar_Events"
         try:
             ws = store.sheet.worksheet(tab)
-            values = ws.get("A1:E2000") or []
+            rows = getattr(ws, "row_count", None)
+            cols = getattr(ws, "col_count", None)
+            if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+                raise ValueError("calendar grid row extent unavailable")
+            if rows > MAX_CALENDAR_BODY_ROWS + 1:
+                raise ValueError("calendar grid exceeds full-table capacity")
+            if not isinstance(cols, int) or isinstance(cols, bool) or cols < 7:
+                raise ValueError("calendar grid column extent unavailable")
+            end_col = _col_to_a1(min(len(CALENDAR_HEADERS), cols))
+            values = ws.get(f"A1:{end_col}{rows}") or []
+            return parse_calendar_values(values)
         except Exception as e:
-            logger.debug("calendar context unavailable (%s): %s", tab, e)
+            logger.warning("calendar context unavailable (%s): %s", tab, e)
             return {}
-        if not values:
-            return {}
-        hdr = [_safe_str(h) for h in values[0]]
-        hmap = {h: i for i, h in enumerate(hdr)}
-        ci_s = hmap.get("Symbol")
-        ci_e = hmap.get("Next Earnings Date")
-        ci_x = hmap.get("Next Ex-Div Date")
-        if ci_s is None:
-            return {}
-
-        def _cell_at(row: List[Any], idx: Optional[int]) -> str:
-            if idx is None or idx >= len(row):
-                return ""
-            return _safe_str(row[idx])
-
-        out: Dict[str, Dict[str, Any]] = {}
-        for r in values[1:]:
-            sym = _cell_at(r, ci_s).upper()
-            if not sym:
-                continue
-            e, x = _cell_at(r, ci_e), _cell_at(r, ci_x)
-            if e or x:
-                out[sym] = {"next_earnings_date": e or None,
-                            "next_ex_div_date": x or None}
-        return out
 
     async def _augment_with_decision_symbols(
         self, prefetched: Optional[List[Dict[str, Any]]]

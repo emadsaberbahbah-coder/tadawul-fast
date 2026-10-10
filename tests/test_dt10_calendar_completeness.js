@@ -43,6 +43,8 @@ function include(name) {
 include('dt10EarningsMapFromValues_');
 include('dt10EarningsMap_');
 include('dt10ApplyEarningsTags_');
+include('dt10EarningsFacts_');
+include('dt10UvWithholdRow_');
 
 const capMatch = source.match(/^var\s+DT10_CALENDAR_MAX_ROWS\s*=\s*(\d+)\s*;/m);
 if (!capMatch) throw new Error('Missing production DT10_CALENDAR_MAX_ROWS constant');
@@ -285,11 +287,11 @@ test('Reader uses actual used columns and never requests nonexistent H', () => {
   assert.deepStrictEqual(book.calls.ranges, [[1, 1, 2, 2]]);
 });
 
-test('Extra used columns are bounded to the seven-column calendar contract', () => {
+test('Extra used columns are bounded to the thirteen-column calendar evidence contract', () => {
   const values = grid([row('EVENT.US', '2026-10-10')]);
-  const book = workbook(values, { lastColumn: 12, maxColumns: 12 });
+  const book = workbook(values, { lastColumn: 15, maxColumns: 15 });
   eq(load().dt10EarningsMap_(book.ss, '2026-10-09'), { 'EVENT.US': 1 });
-  assert.deepStrictEqual(book.calls.ranges, [[1, 1, 2, 7]]);
+  assert.deepStrictEqual(book.calls.ranges, [[1, 1, 2, 13]]);
 });
 
 test('Body-row safety cap permits the complete final row at its exact limit', () => {
@@ -353,6 +355,76 @@ test('Derived dates flow to annotation horizon without changing verdict or sizin
     assert.strictEqual(ticket.verdict, 'WATCH');
     assert.strictEqual(ticket.suggested_shares, 0);
   }
+});
+
+const evidenceHeader = [...header, 'Earnings Source', 'Earnings Observed At (UTC)',
+  'Earnings Evidence Status', 'ExDiv Source', 'ExDiv Observed At (UTC)', 'ExDiv Evidence Status'];
+const observedAt = '2026-10-07T11:46:12.123456Z';
+function evidenceRow(symbol = 'EVENT.US', source = 'yahoo', status = 'estimated', observed = observedAt) {
+  return [...row(symbol, '2026-10-10'), source, observed, status, 'unknown', '', 'unknown'];
+}
+test('Actual extended reader preserves estimated observation and the date-only map API', () => {
+  const book = workbook(grid([evidenceRow()], evidenceHeader), { lastColumn:13 });
+  const ctx = load(), facts = ctx.dt10EarningsFacts_(book.ss, '2026-10-09');
+  eq(facts['EVENT.US'], {earnings_source:'yahoo', earnings_observed_at:observedAt,
+    earnings_status:'estimated', date:'2026-10-10', days:1});
+  eq(ctx.dt10EarningsMap_(book.ss, '2026-10-09'), {'EVENT.US':1});
+  assert.deepStrictEqual(book.calls.ranges, [[1,1,2,13], [1,1,2,13]]);
+  assert.strictEqual(book.calls.writes,0);
+});
+test('Reported vendor and estimated earnings retain conservative warning and unchanged ticket math', () => {
+  const ctx = load(), values = grid([evidenceRow('EST.US'), evidenceRow('REP.US','eodhd','reported')], evidenceHeader);
+  const facts = ctx.dt10EarningsFactsFromValues_(values,'2026-10-09');
+  const map = ctx.dt10EarningsMapFromValues_(values,'2026-10-09');
+  const tickets = ['EST.US','REP.US'].map(symbol=>({symbol,advisor_note:'INVEST',suggested_shares:20,suggested_sar:7500}));
+  assert.strictEqual(ctx.dt10ApplyEarningsTags_(tickets,map,14,facts),2);
+  assert(tickets[0].advisor_note.startsWith('⚠ earnings ≤1d · [estimated: yahoo] · INVEST'));
+  assert(tickets[1].advisor_note.startsWith('⚠ earnings ≤1d · [reported: eodhd] · INVEST'));
+  for (const ticket of tickets) {assert.strictEqual(ticket.suggested_shares,20);assert.strictEqual(ticket.suggested_sar,7500);}
+  assert.strictEqual(ctx.dt10ApplyEarningsTags_(tickets,map,14,facts),0);
+});
+test('Legacy seven-column date is warned with unknown evidence without using the row source or update time', () => {
+  const ctx = load(), values = grid([row('LEG.US','2026-10-10')]);
+  const facts = ctx.dt10EarningsFactsFromValues_(values,'2026-10-09');
+  assert.strictEqual(facts['LEG.US'].earnings_status,'unknown');
+  assert.strictEqual(facts['LEG.US'].earnings_observed_at,'');
+  const tickets=[{symbol:'LEG.US',advisor_note:'Research'}];
+  ctx.dt10ApplyEarningsTags_(tickets,ctx.dt10EarningsMapFromValues_(values,'2026-10-09'),14,facts);
+  assert.strictEqual(tickets[0].advisor_note,'⚠ earnings ≤1d · [evidence unknown] · Research');
+});
+for (const [name,source,status,stamp] of [
+  ['free-form issuer','issuer website','reported',observedAt],
+  ['invented confirmation','eodhd','confirmed',observedAt],
+  ['missing observation','eodhd','reported',''],
+  ['date-only observation','yahoo','estimated','2026-10-07'],
+  ['naive observation','eodhd','reported','2026-10-07T11:46:12'],
+  ['impossible observation','eodhd','reported','2026-02-30T11:46:12Z'],
+  ['unsupported estimate','eodhd','estimated',observedAt]
+]) test(name+' stays unknown evidence while retaining the dated conservative warning',()=> {
+  const ctx=load(), values=grid([evidenceRow('BAD.US',source,status,stamp)],evidenceHeader);
+  const facts=ctx.dt10EarningsFactsFromValues_(values,'2026-10-09');
+  assert.strictEqual(facts['BAD.US'].earnings_status,'unknown');
+  eq(ctx.dt10EarningsMapFromValues_(values,'2026-10-09'),{'BAD.US':1});
+});
+test('Metadata without a valid future event never creates a warning from a counter',()=> {
+  const ctx=load(), invalid=evidenceRow(); invalid[1]=''; invalid[2]=0;
+  const expired=evidenceRow('OLD.US'); expired[1]='2026-10-08'; expired[2]=1;
+  eq(ctx.dt10EarningsFactsFromValues_(grid([invalid,expired],evidenceHeader),'2026-10-09'),{});
+});
+test('Conflicting duplicate date or metadata and duplicate evidence headings stay ambiguous',()=> {
+  const ctx=load(), original=evidenceRow(), alternate=evidenceRow(); alternate[1]='2026-10-11';
+  eq(ctx.dt10EarningsMapFromValues_(grid([original,alternate],evidenceHeader),'2026-10-09'),{});
+  alternate[1]=original[1]; alternate[7]='eodhd'; alternate[9]='reported';
+  eq(ctx.dt10EarningsMapFromValues_(grid([original,alternate],evidenceHeader),'2026-10-09'),{});
+  eq(ctx.dt10EarningsMapFromValues_(grid([original],[...evidenceHeader,'Earnings Source']),'2026-10-09'),{});
+  eq(ctx.dt10EarningsMapFromValues_(grid([original,original],evidenceHeader),'2026-10-09'),{'EVENT.US':1});
+});
+test('Financial withholding retains only the finite estimate prefix and no old order narrative',()=> {
+  const ctx=load(), row=['7500','⚠ earnings ≤1d · [estimated: yahoo] · Buy 20 shares for 7500 SAR'];
+  ctx.dt10UvWithholdRow_(row,[0],1,'synthetic withheld');
+  assert.strictEqual(row[0],'—');
+  assert(row[1].startsWith('⚠ earnings ≤1d · [estimated: yahoo] · SIZING WITHHELD'));
+  assert(!row[1].includes('20 shares'));assert(!row[1].includes('7500'));
 });
 
 const passed = results.filter(result => result.pass).length;
