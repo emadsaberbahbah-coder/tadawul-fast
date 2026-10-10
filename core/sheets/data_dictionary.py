@@ -982,7 +982,7 @@ def __dir__() -> List[str]:
 __all__ = [
     # Version constants
     "DATA_DICTIONARY_VERSION",
-    "SCHEMA_VERSION",
+    "SCHEMA_VERSION",  # noqa: F822 -- served lazily by the module __getattr__ above
     "DATA_DICTIONARY_SHEET_NAME",
     "DATA_DICTIONARY_OUTPUT_KIND",
     # Contract helpers

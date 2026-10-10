@@ -22,7 +22,6 @@ future activation are next-session-open, monthly cadence (§18.1).
 
 from __future__ import annotations
 
-import math
 from datetime import date
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 

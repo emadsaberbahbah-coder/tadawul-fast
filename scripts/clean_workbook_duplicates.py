@@ -55,7 +55,7 @@ EXCHANGE_SUFFIXES = {
     "PR", "BUD", "AT", "IS", "TA", "SA", "MX", "BA", "SN", "LM", "CR",
     "HK", "SS", "SZ", "T", "KS", "KQ", "TW", "TWO", "BK", "JK", "SI",
     "KL", "NS", "BO", "CM", "AX", "NZ", "VN", "PH", "JO", "KW", "QA",
-    "AE", "EG", "MA", "NG", "KE", "ZA", "JO", "TR", "IL", "PSE",
+    "AE", "EG", "MA", "NG", "KE", "ZA", "TR", "IL", "PSE",
 }
 
 # Legal-form tokens stripped when normalising a company name.

@@ -5,10 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from core.sheets.schema_registry import get_sheet_headers
 from scripts import run_dashboard_sync as rds
 from scripts.critical_symbol_identity import (
     CRITICAL_FETCH_SYMBOLS,
-    CRITICAL_IDENTITIES,
     CRITICAL_IDENTITY_TAG,
     POLICY_VERSION,
     build_isolated_batches,
@@ -29,6 +29,19 @@ _NYSE_CANARY = "BNY.US" if _V11 else "BK.US"
 
 HEADERS = ["Symbol", "Name", "Exchange", "Currency", "Country", "Current Price", "Warnings"]
 PRODUCTION_HEADERS = HEADERS + ["Data Provider"]
+# The Sheets writer refuses any ranked market page whose header is not the exact
+# canonical 115-column schema (core.sheet_presentation), so the write-path test
+# must present rows in that shape.
+MARKET_HEADERS = get_sheet_headers("Market_Leaders")
+
+
+def _market_row(symbol, name, exchange, currency, country, price, warnings, provider):
+    values = {
+        "Symbol": symbol, "Name": name, "Exchange": exchange, "Currency": currency,
+        "Country": country, "Current Price": price, "Warnings": warnings,
+        "Data Provider": provider,
+    }
+    return [values.get(header, "") for header in MARKET_HEADERS]
 
 
 def _chunks(seq, n):
@@ -149,14 +162,15 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
 
 
 class _Backend:
-    def __init__(self, response_rows):
+    def __init__(self, response_rows, headers=None):
         self.response_rows = response_rows
+        self.headers = list(headers or PRODUCTION_HEADERS)
         self.calls = []
 
     async def post_json(self, path, payload):
         self.calls.append((path, dict(payload)))
         return {
-            "headers": list(PRODUCTION_HEADERS),
+            "headers": list(self.headers),
             "rows_matrix": self.response_rows(payload),
         }, None, 200
 
@@ -248,10 +262,10 @@ class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.rows_written, 0)
 
     async def test_run_one_task_successful_write_still_fails_missing_fresh_proof(self):
-        fresh_aapl = ["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, "", "test"]
-        old_fisv = ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, "", "eodhd"]
-        sheets = _Sheets([PRODUCTION_HEADERS, fresh_aapl, old_fisv])
-        backend = _Backend(lambda payload: [list(fresh_aapl)])
+        fresh_aapl = _market_row("AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, "", "test")
+        old_fisv = _market_row("FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, "", "eodhd")
+        sheets = _Sheets([MARKET_HEADERS, fresh_aapl, old_fisv])
+        backend = _Backend(lambda payload: [list(fresh_aapl)], headers=MARKET_HEADERS)
         task = rds.TaskSpec("MARKET_LEADERS", "Market_Leaders", "analysis", max_symbols=10)
         env = {
             "TFB_MARKET_SYMBOL_READBACK": "0",

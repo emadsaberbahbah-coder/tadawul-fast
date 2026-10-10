@@ -20,6 +20,14 @@ import re
 import subprocess
 import sys
 
+try:
+    import openpyxl  # noqa: F401 -- scripts/tfb_export_audit.py refuses to run without it
+except ImportError:  # pragma: no cover
+    if "pytest" in sys.modules:
+        import pytest
+
+        pytest.skip("openpyxl is required by scripts/tfb_export_audit.py", allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "scripts", "tfb_export_audit.py")
 EXPECT = "46/46 PASS  cases-digest=3de969895c97a7d6"

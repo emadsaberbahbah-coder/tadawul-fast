@@ -2,7 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.3 (2026-10-10) -- FUNDING AND COMPLETE FINAL PUBLICATION
+# VERSION 1.1.4 (2026-10-10) -- UNDEFINED-NAME GATE AND ACTION PINS
+#
+# v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
+# (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
+# only fails when the line executes (the yahoo_chart identity-mismatch metric
+# referenced an undefined `metrics`); this gate catches it on the push. Action
+# pins follow scripts/audit_repository_workflows.py (checkout/setup-python v6).
 #
 # v1.1.3: require exact portfolio budgets, conflicting quote aliases, atomic
 # calendar replacement and field-independent fallback, and final publication
@@ -264,7 +270,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v6
@@ -283,6 +289,15 @@ jobs:
           python -m compileall -q tests
           echo "✅ every test file parses"
 
+      - name: 🔎 ruff — syntax errors and undefined names (whole tree)
+        run: |
+          # v1.1.4: E9 = syntax/io errors, F63 = invalid comparisons, F7 = misplaced
+          # statements, F82 = undefined names. No style rules; nothing here can
+          # fail on formatting. Exact pin, matching requirements.txt convention.
+          python -m pip install -q "ruff==0.16.8"
+          ruff check --select E9,F63,F7,F82 --output-format concise .
+          echo "✅ no syntax errors or undefined names"
+
   # ==========================================================================
   # JOB 2 — decision-layer unit suites (BLOCKING)
   # ==========================================================================
@@ -300,7 +315,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v6
@@ -444,7 +459,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v6
@@ -501,7 +516,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v6

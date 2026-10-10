@@ -12,8 +12,9 @@ import json
 import subprocess
 import sys
 
-import openpyxl
 import pytest
+
+openpyxl = pytest.importorskip("openpyxl")  # heavy-lane dependency; lean environments skip this module
 
 from scripts import tfb_export_audit as audit
 

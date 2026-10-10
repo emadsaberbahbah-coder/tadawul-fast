@@ -80,9 +80,8 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import os
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pytest
 

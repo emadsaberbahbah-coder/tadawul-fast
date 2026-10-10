@@ -409,7 +409,7 @@ def plan_page_updates(page: str,
         if tokens.get("acquisition_status") == "conflict" or (tokens.get("acquisition_quote_asof") and old_quote is None):
             stats["skipped_schema"] += 1
             continue
-        if old_ts is not None and q.retrieved_at <= old_ts or old_quote is not None and q.quote_asof <= old_quote:
+        if (old_ts is not None and q.retrieved_at <= old_ts) or (old_quote is not None and q.quote_asof <= old_quote):
             stats["skipped_not_newer"] += 1
             continue
         original = {name: row[i] if i < len(row) else "" for i, name in enumerate(header)}

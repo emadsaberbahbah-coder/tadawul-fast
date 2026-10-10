@@ -101,6 +101,12 @@ try:
     import requests
     from requests.exceptions import RequestException
 except Exception as e:  # pragma: no cover
+    if "pytest" in sys.modules:
+        # Collected by pytest in a lean environment: skip this module instead of
+        # raising SystemExit, which aborts the whole session during collection.
+        import pytest
+
+        pytest.skip(f"requests library required ({e})", allow_module_level=True)
     sys.stderr.write(f"FATAL: requests library required ({e})\n")
     raise SystemExit(1)
 
@@ -268,6 +274,8 @@ class Colors:
 # ---------------------------------------------------------------------------
 @dataclass(slots=True)
 class TestResult:
+    __test__ = False  # result record, not a pytest test class
+
     name: str
     status: str  # "pass" | "warn" | "fail" | "skip"
     duration_sec: float

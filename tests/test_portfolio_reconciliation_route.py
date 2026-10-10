@@ -1,5 +1,4 @@
 """Actual authenticated route transports private evidence and renders safe blocks."""
-import copy
 import json
 
 import pytest

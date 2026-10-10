@@ -2224,7 +2224,6 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     sell_syms = ", ".join(r["symbol"].split(".")[0] for r in d["sell"][:3]) or "—"
     trim_sym = d["trim"][0]["symbol"].split(".")[0] if d["trim"] else "—"
     add_sym = add["symbol"] if add else "—"
-    adds_syms = ", ".join(r["symbol"] for r in adds) or "—"
     adds_list_html = ", ".join(
         f'<strong style="color:{ADD_C};">{_esc(r["symbol"])}</strong>'
         f'&nbsp;(~{_money(r.get("sar") or 0.0)})' for r in adds)

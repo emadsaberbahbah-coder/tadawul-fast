@@ -610,6 +610,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 # =============================================================================
 # v1.0.21 [QUALIFIED-GRID BASIS PARITY + HELD-SYMBOL VARIANT MATCH]

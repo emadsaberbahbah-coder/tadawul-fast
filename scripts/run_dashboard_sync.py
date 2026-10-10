@@ -7810,7 +7810,6 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # COMPLETE only when the leg succeeded, nothing failed, refresh coverage
     # met the floor, and the readback either matched or was repaired back to
     # the prewrite baseline. Anything else is PARTIAL — never false-green.
-    rbst = str(meta.get("rb_status") or "").strip().upper()
     rep_after = meta.get("repair_after")
     pw_fl = int(meta.get("pw_flagged") or 0)
     # v6.51.0: single source of truth - the same arithmetic now also decides

@@ -203,3 +203,14 @@ else:
 
 print("\n".join(out))
 print("RUN-DIGEST", hashlib.sha256(json.dumps(digest_parts, sort_keys=True, default=str).encode()).hexdigest()[:16])
+
+# The battery above runs at import. Re-enable logging for the rest of the
+# process: pytest imports every module before running any test, and a
+# process-wide logging.disable() blanked the records that the redaction suites
+# (test_redaction_boundaries, test_route_error_redaction) assert on.
+logging.disable(logging.NOTSET)
+
+
+def test_track_force_coverage_harness():
+    """pytest entry point: every V-case above passed (T() raises on the first failure)."""
+    assert out and all(line.startswith(("PASS ", "SKIP ")) for line in out), out

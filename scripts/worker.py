@@ -82,7 +82,6 @@ import logging
 import os
 import random
 import signal
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -233,28 +232,26 @@ class TraceContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self._span is not None and exc_val is not None:
-                try:
-                    if hasattr(self._span, "record_exception"):
-                        self._span.record_exception(exc_val)
-                except Exception:
-                    pass
-                try:
-                    if (
-                        Status is not None
-                        and StatusCode is not None
-                        and hasattr(self._span, "set_status")
-                    ):
-                        self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-                except Exception:
-                    pass
-        finally:
-            if self._cm is not None:
-                try:
-                    return self._cm.__exit__(exc_type, exc_val, exc_tb)
-                except Exception:
-                    return False
+        if self._span is not None and exc_val is not None:
+            try:
+                if hasattr(self._span, "record_exception"):
+                    self._span.record_exception(exc_val)
+            except Exception:
+                pass
+            try:
+                if (
+                    Status is not None
+                    and StatusCode is not None
+                    and hasattr(self._span, "set_status")
+                ):
+                    self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            except Exception:
+                pass
+        if self._cm is not None:
+            try:
+                return self._cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                return False
         return False
 
     async def __aenter__(self):

@@ -30,7 +30,6 @@ P7 idempotence x2
 """
 import re
 import copy, csv, hashlib, importlib.util, json, os, sys
-from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))

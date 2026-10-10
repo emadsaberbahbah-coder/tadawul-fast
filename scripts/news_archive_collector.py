@@ -67,7 +67,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 SCRIPT_VERSION = "1.1.0"
 SCRIPT_NAME = "news_archive_collector"

@@ -20,7 +20,7 @@ fetch and the clock are the only injected parts.
   C7 --dry-run under observe: zero writes, token printed
 Run x3, identical digest."""
 import importlib.util, os, sys, json, hashlib, subprocess, copy, io, contextlib
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DELIV = os.environ.get("S1_DELIV", "scripts/run_shadow_scorer.py")

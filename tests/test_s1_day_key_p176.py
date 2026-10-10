@@ -17,7 +17,7 @@ after 21:00 UTC and keyed the 09-28 board as 2026-09-29; run #77 (the real
      S1_Gate body and _Run_Log verdict
 Run x3, identical digest."""
 import importlib.util, os, sys, json, hashlib, subprocess, copy, io, contextlib
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone
 
 spec = importlib.util.spec_from_file_location("s1", "scripts/run_shadow_scorer.py")
 s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)

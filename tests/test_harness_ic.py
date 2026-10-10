@@ -15,7 +15,6 @@ tests assert three things:
 Runs with numpy only (no scipy / gspread required).
 """
 import io
-import os
 import sys
 import contextlib
 from datetime import datetime

@@ -5,14 +5,19 @@
  * Run three times; digests must be identical.                       ES5. */
 var fs = require('fs');
 var crypto = require('crypto');
-var src = fs.readFileSync(process.argv[2] || '16_Decision_Top10.gs', 'utf8');
+var path = require('path');
+var src = fs.readFileSync(
+  process.argv[2] || path.join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs'), 'utf8');
 
 function extract(name) {
   var i = src.indexOf('function ' + name + '(');
   if (i < 0) throw new Error('missing ' + name);
-  var j = src.indexOf('\r\n}\r\n', i);
+  // The delivered file may carry either LF or CRLF line endings; accept both.
+  var j = src.indexOf('\n}\n', i);
+  if (j >= 0 && src.charAt(j - 1) === '\r') { j -= 1; }
   if (j < 0) throw new Error('unterminated ' + name);
-  return src.slice(i, j + 3);
+  var k = src.indexOf('}', j);
+  return src.slice(i, k + 1);
 }
 var code = ['dt10IsFundingAlert_', 'dt10IsFundingNearMiss_',
             'dt10ContainFundingCore_'].map(extract).join('\n');

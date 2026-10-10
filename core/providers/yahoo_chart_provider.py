@@ -573,7 +573,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import logging
 import math
 import os
@@ -1300,7 +1299,7 @@ async def fetch_chart_meta(
                     PROVIDER_VERSION, symbol, _yc4_got,
                 )
                 try:
-                    metrics.requests_total.labels(
+                    _get_metrics().requests_total.labels(
                         symbol=str(symbol), op="chart_meta", status="identity_mismatch",
                     ).inc()
                 except Exception:

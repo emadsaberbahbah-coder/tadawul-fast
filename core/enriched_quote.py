@@ -334,7 +334,6 @@ from decimal import Decimal
 from enum import Enum
 from typing import (
     Any,
-    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -343,8 +342,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
-    cast,
 )
 
 # =============================================================================

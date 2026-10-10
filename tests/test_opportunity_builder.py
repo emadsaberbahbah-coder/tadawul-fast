@@ -51,7 +51,6 @@ WIRING
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 import unittest
@@ -80,7 +79,7 @@ except Exception as _e1:
         _IMPORT_ERR = (_e1, _e2)
 
 
-from decision_evidence_fixtures import build_with_observed_inputs, observed_portfolio
+from decision_evidence_fixtures import build_with_observed_inputs
 
 # ---------------------------------------------------------------------------
 # Hygiene-safe output helper (no print())

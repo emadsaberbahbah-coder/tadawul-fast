@@ -18,8 +18,7 @@ leg is replaced by a sync stub, `_configured` is forced True, Redis stays off.
      survives 3 loops x contention; base raises or drops
   G6 versions, +2/0 defs, no asyncio.Lock construction left in code
 Run x3, identical digest."""
-import importlib.util, os, sys, json, hashlib, asyncio, threading, ast
-from typing import Any, Dict
+import importlib.util, os, sys, hashlib, asyncio, threading, ast
 
 DELIV = os.environ.get("YF_DELIV", "core/providers/yahoo_fundamentals_provider.py")
 BASE = os.environ.get("YF_BASE")   # optional v6.8.0 file for the golden-negative
@@ -196,4 +195,13 @@ check("G6 zero awaits inside any threading-lock section (AST)", not awaits_under
 digest = hashlib.sha256("|".join(digest_parts).encode()).hexdigest()[:16]
 total = len(digest_parts)
 print(f"[YF LOOPGUARD HARNESS] {total - fails}/{total} {'PASS' if not fails else 'FAIL'}  cases-digest={digest}")
-sys.exit(1 if fails else 0)
+
+
+def test_yf_loopguard_harness():
+    """pytest entry point: the battery above runs at import; surface its verdict here
+    instead of exiting the interpreter, which aborted every other module's collection."""
+    assert fails == 0, f"{fails}/{total} YF loopguard case(s) failed (see printed FAIL lines)"
+
+
+if __name__ == "__main__":
+    sys.exit(1 if fails else 0)

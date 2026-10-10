@@ -255,9 +255,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from core.analysis.symbol_dedup import (
     DedupVerdict,
     SecurityIdentity,
-    base_symbol_of,
     dedupe_symbol_rows,
-    normalise_company_name,
     resolve_identity,
 )
 

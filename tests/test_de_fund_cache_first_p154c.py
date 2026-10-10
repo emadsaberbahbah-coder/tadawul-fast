@@ -11,8 +11,6 @@ the module stores are cleared in a fixture.
 from __future__ import annotations
 
 import asyncio
-import copy
-import os
 import time
 import types
 
@@ -350,7 +348,7 @@ def test_t3_observe_tag_only(monkeypatch):
             fb = {k: v for k, v in b.items() if k != "warnings"}
             assert fa == fb                         # values byte-identical
             extra = set(_tags(b)) - set(_tags(a))
-            assert extra and all(t.startswith("fund_cache:would_") for t in extra) or not extra
+            assert (extra and all(t.startswith("fund_cache:would_") for t in extra)) or not extra
     # pass 2: every hit-class row is a would_hit, every noop row a would_neg
     hits = [t for r in obs[1][:4] for t in _fc(r)]
     assert len(hits) == 4 and all(t.startswith("fund_cache:would_hit:0h:") for t in hits)

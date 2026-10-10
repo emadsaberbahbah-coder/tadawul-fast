@@ -2322,7 +2322,7 @@ async def advisor_metrics() -> Response:
 
 
 @router.get("/sheet-rows")
-@router.get("/sheet_rows")
+@router.get("/sheet_rows", operation_id="advisor_sheet_rows_get__underscore_alias")
 async def advisor_sheet_rows_get(request: Request, page: Optional[str] = Query(default=None), sheet: Optional[str] = Query(default=None), sheet_name: Optional[str] = Query(default=None), name: Optional[str] = Query(default=None), tab: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None), ticker: Optional[str] = Query(default=None), symbols: Optional[str] = Query(default=None), tickers: Optional[str] = Query(default=None), mode: str = Query(default="live"), include_matrix: Optional[bool] = Query(default=None), schema_only: Optional[bool] = Query(default=None), headers_only: Optional[bool] = Query(default=None), top_n: Optional[int] = Query(default=None, ge=1, le=500), limit: int = Query(default=200, ge=1, le=5000), offset: int = Query(default=0, ge=0), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
     started_at = time.perf_counter()
     fallback_page = _canonicalize_page_name(page or sheet or sheet_name or name or tab or DEFAULT_ADVISOR_PAGE) or DEFAULT_ADVISOR_PAGE
@@ -2338,7 +2338,7 @@ async def advisor_sheet_rows_get(request: Request, page: Optional[str] = Query(d
 
 
 @router.post("/sheet-rows")
-@router.post("/sheet_rows")
+@router.post("/sheet_rows", operation_id="advisor_sheet_rows_post__underscore_alias")
 async def advisor_sheet_rows_post(request: Request, body: Dict[str, Any] = Body(default_factory=dict), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
     started_at = time.perf_counter()
     fallback_page = _extract_page(_safe_dict(body))

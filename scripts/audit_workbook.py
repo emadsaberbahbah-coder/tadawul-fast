@@ -68,8 +68,8 @@ import csv
 import json
 import math
 import sys
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -915,7 +915,6 @@ def _report_lines(report: Dict[str, Any], include_info: bool) -> List[str]:
 
 def print_console(report: Dict[str, Any], include_info: bool) -> None:
     # Console caps the findings list; the saved .txt holds the complete list.
-    g = report["global_severity_counts"]
     lines = _report_lines(report, include_info)
     # Find where the FINDINGS section starts so we can cap just that part.
     out: List[str] = []

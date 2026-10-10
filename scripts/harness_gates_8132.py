@@ -34,7 +34,7 @@ class FutureInstance:          # hypothetical instance-level exposure
                                            "via": "instance"}
 
 print("== H1  LIVE-EQUIVALENT: real module + attr-less instance ==")
-import core.data_engine_v2 as REAL   # real full import, into sys.modules
+import core.data_engine_v2 as REAL   # noqa: F401 -- real full import, into sys.modules (the harness pops it below)
 g = snap(InstanceNoAttr())
 check("returns the REAL nine-key dict (the 12:17 {} is dead)",
       isinstance(g, dict) and len(g) == 9 and g["surface_blocked"] is False
