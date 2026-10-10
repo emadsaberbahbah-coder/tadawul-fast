@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.11.0  (header synced to runtime; history below)
+Version: 1.15.1  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -822,7 +822,11 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.15.0"
+PORTFOLIO_ACTIONS_VERSION = "1.15.1"
+
+# v1.15.1: exact principal debits are mandatory independently of fee policy.
+# Funding keeps Decimal cash/cap/sector ledgers; whole-SAR row rounding is
+# presentation only. A default fee-off ADD cannot spend rounding leftovers.
 
 # v1.15.0: current holding membership and available funding require a fresh,
 # explicitly account-scoped position/cash capture. Missing evidence produces
@@ -2888,23 +2892,37 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
     """entries: list of dicts {cand, action, ...} mutated in place.
 
     Returns (deployable, proceeds_included, adds_funded, cash_floor).
+
+    Keep monetary ledgers exact until the public float/display boundary. The
+    optional fee flag controls only fees, never whether principal is debited.
     """
-    proceeds = 0.0
+    with localcontext() as context:
+        context.prec = 512
+        return _fund_adds_exact(entries, controls, cash_sar, total_value_sar)
+
+
+def _fund_adds_exact(entries, controls, cash_sar, total_value_sar):
+    def money(value):
+        return Decimal(str(value or 0))
+
+    zero = Decimal(0)
+    cash = money(cash_sar)
+    total_value = money(total_value_sar)
+    proceeds = zero
     for e in entries:
         if e["action"] in (ACTION_TRIM, ACTION_EXIT):
-            proceeds += e["proceeds_sar"] or 0.0
+            proceeds += money(e["proceeds_sar"])
     include_proceeds = controls["rebalance_mode"] != REBALANCE_NEW_CASH
-    cash_floor = (controls["target_cash_pct"] / 100.0) * (
-        total_value_sar or 0.0)
+    cash_floor = money(controls["target_cash_pct"]) * total_value / 100
     # v1.8.0 F5 (policy change, documented): proceeds first restore the
     # target cash floor; only the surplus funds ADDs.
     if include_proceeds:
-        deployable = max(0.0, (cash_sar or 0.0) + proceeds - cash_floor)
+        deployable = max(zero, cash + proceeds - cash_floor)
     else:
-        deployable = max(0.0, (cash_sar or 0.0) - cash_floor)
-    cash_left = max(0.0, (cash_sar or 0.0) - cash_floor)
-    proceeds_left = (max(0.0, deployable - cash_left)
-                     if include_proceeds else 0.0)
+        deployable = max(zero, cash - cash_floor)
+    cash_left = max(zero, cash - cash_floor)
+    proceeds_left = (max(zero, deployable - cash_left)
+                     if include_proceeds else zero)
 
     adds = [e for e in entries if e["action"] == ACTION_ADD]
     adds.sort(key=lambda e: (-(e["cand"].get("ann_roi_pct") or 0.0),
@@ -2912,46 +2930,47 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
                              e["cand"].get("symbol") or ""))
     remaining = deployable
     _sec_ledger = {}                       # F4
-    funded_total = 0.0
+    funded_total = zero
     lot = max(1, int(controls["lot_size"]))
     for e in adds:
         cand = e["cand"]
-        mv = cand.get("market_value_sar") or 0.0
-        price_sar = (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0)
-        cap_room = max(0.0, (controls["max_position_pct"] / 100.0) *
-                       (total_value_sar or 0.0) - mv)
+        mv = money(cand.get("market_value_sar"))
+        # Multiply the independently normalized native price and certified FX
+        # as decimals; a float product can lose a native-currency boundary.
+        price_sar = money(cand.get("price")) * money(cand.get("fx_to_sar"))
+        cap_room = max(zero, money(controls["max_position_pct"]) * total_value / 100 - mv)
         _fb = _sector_bucket(cand)                          # F4
         if _fb not in _sec_ledger:
             _r0 = e.get("_sector_room_sar")
-            _sec_ledger[_fb] = (float("inf") if _r0 is None else float(_r0))
+            _sec_ledger[_fb] = (Decimal("Infinity") if _r0 is None else money(_r0))
         sector_room = _sec_ledger[_fb]
         budget = min(cap_room, sector_room, remaining)
         shares = 0
         suggested = 0.0
-        # v1.11.0 [P-122 FEE-AWARE FUNDING]: default OFF path is verbatim
-        # v1.10.0 arithmetic (_charge == suggested). Armed: fee comes off the
-        # fundable budget BEFORE sizing and the ledger is debited with the
-        # EXACT gross cost + fee, closing the rounded-debit / zero-fee gap
-        # that sized the 2026-09-11 DDI ADD into a reserve breach.
+        # Existing fee policy remains optional. Exact principal funding is
+        # unconditional; the row's whole-SAR amount never funds another ADD.
         _fee_on = str(os.environ.get(
             "TFB_PF_FEE_FUNDING", "")).strip().lower() in (
             "1", "true", "on", "yes")
-        _fee_sar = abs(_env_float("TFB_PF_FEE_SAR", 9.0)) if _fee_on else 0.0
-        _charge = 0.0
+        _fee_sar = money(abs(_env_float("TFB_PF_FEE_SAR", 9.0))) if _fee_on else zero
+        _charge = zero
+        principal = zero
         if price_sar > 0 and budget > 0:
             _budget_eff = (budget - _fee_sar) if _fee_on else budget
             shares = int(_budget_eff // price_sar) if _budget_eff > 0 else 0
             shares = (shares // lot) * lot
-            suggested = round(shares * price_sar, 0)
-            _charge = ((shares * price_sar) + _fee_sar) if _fee_on else suggested
+            principal = shares * price_sar
+            # Retain the existing row display contract after exact sizing.
+            suggested = round(float(principal), 0)
+            _charge = principal + _fee_sar
         if shares > 0 and suggested > 0:
             take_cash = min(_charge, cash_left)
             take_proc = min(_charge - take_cash, proceeds_left)
             cash_left -= take_cash
             proceeds_left -= take_proc
             remaining -= _charge
-            _sec_ledger[_fb] = max(0.0, _sec_ledger[_fb] - _charge)  # F4
-            funded_total += suggested
+            _sec_ledger[_fb] = max(zero, _sec_ledger[_fb] - _charge)  # F4
+            funded_total += principal
             if take_proc > 0 and take_cash > 0:
                 ff = ("cash %d + proceeds %d SAR"
                       % (round(take_cash), round(take_proc)))
@@ -2967,8 +2986,8 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
             e["suggested_delta_shares"] = 0
             e["funds_from"] = None
             e["action_reason"] += " — no deployable capital to size the add"
-    return deployable, (proceeds if include_proceeds else 0.0), \
-        funded_total, cash_floor
+    return float(deployable), (float(proceeds) if include_proceeds else 0.0), \
+        float(funded_total), float(cash_floor)
 
 # ---------------------------------------------------------------------------
 # Payload assembly

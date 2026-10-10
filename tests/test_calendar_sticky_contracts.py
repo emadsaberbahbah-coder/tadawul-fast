@@ -175,7 +175,7 @@ def test_actual_write_boundary_survives_bad_prior_cell_without_extra_fetch(monke
     assert fetch_calls == [["ACME.US"]]
     published = calendar.updates[-1]
     assert published["value_input_option"] == "RAW"
-    rows = {row[0]: row for row in published["values"]}
+    rows = {row[0]: row for row in published["values"][1:] if row[0]}
     assert rows["ACME.US"][1] == "2026-11-04"
     assert rows["BAD.US"][3] == "2026-10-20"
     assert all(row[5] == ASOF for row in rows.values())

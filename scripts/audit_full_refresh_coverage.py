@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.2.2 — callers may supply explicit audited rules. The final publication
+guard uses this to prevent environment settings weakening its acceptance floor.
+Default standalone rules and exit-code behavior are unchanged.
+
 VERSION 1.2.1 — fundamentals-only margin quarantine does not invalidate a
 successful price acquisition. Its flag and fundamentals controls remain intact.
 
@@ -35,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -257,14 +261,14 @@ def audit_grid(grid, rule, expected, now, active=()):
         elif r.missing_cost: r.failures.append("missing/non-positive cost: "+", ".join(r.missing_cost))
     return r.finish()
 
-async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None):
+async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None, *, policy_rules=None):
     reader,registry,now=reader or resolve_reader(),registry or resolve_registry(),now or datetime.now(timezone.utc); rep=Report(now.isoformat(),sid[:5]+"..."+sid[-5:] if len(sid)>10 else "***",s(getattr(registry,"SCHEMA_VERSION",getattr(registry,"__version__","unknown"))) if registry else "unknown",[])
     if not sid: rep.fatal="spreadsheet ID missing"; return rep
     if not reader: rep.fatal="read_range unavailable"; return rep
     if not registry: rep.fatal="schema_registry unavailable"; return rep
     try: rep.active_holdings,warn=ledger_symbols(await read(reader,sid,"_Portfolio_CostBasis",limit))
     except Exception as e: warn=[f"ledger unreadable: {e}"]
-    for rule in rules():
+    for rule in rules() if policy_rules is None else policy_rules:
         try:
             out=audit_grid(await read(reader,sid,rule.page,limit),rule,list(registry.get_sheet_headers(rule.page)),now,rep.active_holdings)
             if rule.portfolio and warn: out.warnings+=warn; out.failures+=(["active ledger universe not proven"] if not rep.active_holdings else []); out.finish()

@@ -2,7 +2,7 @@
 # scripts/intraday_quote_refresh.py
 """
 ================================================================================
-Intraday Quote Refresh — v1.0.2 (2026-10-09)
+Intraday Quote Refresh — v1.0.3 (2026-10-10)
 ================================================================================
 NEW script. Closes the largest recoverable loss in the system.
 
@@ -77,7 +77,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.3"
+# v1.0.3: share supplier quote-time parsing with acquisition validity so an
+# EODHD integer epoch serialized as a string retains its actual quote receipt.
 
 RUN_LOG_TAB = "_Run_Log"
 PRICE_HEADERS = ("Current Price", "Price")
@@ -211,7 +213,7 @@ def _fresh_quote(evidence: QuoteEvidence, now: datetime) -> bool:
 
 def _source_quote(row: Dict[str, Any], requested: str, retrieved: datetime) -> Optional[QuoteEvidence]:
     from core.analysis import opportunity_builder as ob
-    from core.data_validity import acquisition_tokens, precise_utc, row_acquisition
+    from core.data_validity import acquisition_tokens, row_acquisition, source_quote_instant
     try:
         grouped: Dict[str, List[Any]] = {}
         for name, value in row.items():
@@ -235,14 +237,7 @@ def _source_quote(row: Dict[str, Any], requested: str, retrieved: datetime) -> O
             for value in grouped.get(key, []):
                 if value in (None, ""):
                     continue
-                if isinstance(value, bool):
-                    return None
-                if isinstance(value, (int, float)):
-                    if not math.isfinite(value) or value <= 0:
-                        return None
-                    stamp = datetime.fromtimestamp(value / 1000 if value > 1e12 else value, timezone.utc)
-                else:
-                    stamp = precise_utc(value)
+                stamp = source_quote_instant(value)
                 if stamp is None or stamp != proof.quote_asof:
                     return None
         currency = _currency(grouped.get("currency", []))

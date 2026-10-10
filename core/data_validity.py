@@ -16,7 +16,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from core.provider_capabilities import provider_supports_instrument
 
 MAX_CLOCK_SKEW_SECONDS = 900  # Match the decision audit's existing 15 min allowance.
-DATA_VALIDITY_VERSION = "1.0.1"
+DATA_VALIDITY_VERSION = "1.0.2"
+# v1.0.2 (2026-10-10): every provider alias and observed market-time alias
+# participates in the acquisition verdict. A fresh receipt cannot conceal
+# a nonlive primary provider or a contradictory supplier quote instant.
 # v1.0.1 (2026-10-07): invalid-warning tokens must start a token. The
 #   unanchored v1.0.0 pattern matched 'identity_quarantined' inside the
 #   engine's fundamentals-only tag 'fund_identity_quarantined' (data_engine_v2
@@ -44,6 +47,8 @@ _TOKEN_KEYS = frozenset({
     "acquisition_status", "acquisition_acquired_at", "acquisition_quote_asof",
     "acquisition_provider",
 })
+_PROVIDER_KEYS = frozenset({"dataprovider", "provider", "datasource", "source", "primaryprovider"})
+_QUOTE_TIME_KEYS = frozenset({"pricebarts", "quotetimestamp", "regularmarkettime"})
 _SYMBOL_DOMAIN_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 
 
@@ -98,6 +103,31 @@ def precise_utc(value: Any) -> datetime | None:
         return stamp.astimezone(timezone.utc)
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def source_quote_instant(value: Any) -> datetime | None:
+    """Read supplier market time as precise ISO or epoch seconds/milliseconds.
+
+    EODHD serializes its integer epoch as a digit string; the engine mints
+    quote-asof from that same source. Accept that declared supplier encoding,
+    retaining strict agreement with the receipt. This parser never supplies
+    an acquisition/retrieval time or infers a timezone for an ISO value.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        try:
+            value = float(value.strip())
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, (int, float)):
+        try:
+            if not math.isfinite(value) or value <= 0:
+                return None
+            return datetime.fromtimestamp(value / 1000 if value > 1e12 else value, timezone.utc)
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
+    return precise_utc(value)
 
 
 def retrieval_timestamp(row: Mapping[str, Any]) -> tuple[datetime | None, str]:
@@ -224,7 +254,7 @@ def row_acquisition(row: Mapping[str, Any], now: datetime, max_age_seconds: floa
     if _text(symbol) and not symbol_domain_ok(symbol):
         return AcquisitionValidity("INVALID", "symbol_domain_invalid")
     providers = [_text(value) for name,values in grouped.items()
-                 if name in {"dataprovider", "provider", "datasource", "source"} for value in values if _text(value)]
+                 if name in _PROVIDER_KEYS for value in values if _text(value)]
     if any(_NONLIVE_PROVIDER.search(value) or value.lower() in {"none", "error", "unknown"} for value in providers):
         return AcquisitionValidity("INVALID", "nonlive_provider")
     if len({_key(value) for value in providers}) > 1:
@@ -271,6 +301,20 @@ def row_acquisition(row: Mapping[str, Any], now: datetime, max_age_seconds: floa
     else:
         acquired, precision = retrieval_timestamp(row)
     quote = precise_utc(tokens.get("acquisition_quote_asof"))
+    source_quotes = []
+    for name, values in grouped.items():
+        if name not in _QUOTE_TIME_KEYS:
+            continue
+        for value in values:
+            if value in (None, ""):
+                continue
+            stamp = source_quote_instant(value)
+            if stamp is None:
+                return AcquisitionValidity("INVALID", "quote_timestamp_invalid", acquired, quote)
+            source_quotes.append(stamp)
+    if (len(set(source_quotes)) > 1
+            or (quote is not None and any(stamp != quote for stamp in source_quotes))):
+        return AcquisitionValidity("INVALID", "quote_timestamp_conflict", acquired, quote)
     if acquired is None or precision != "datetime":
         return AcquisitionValidity("UNKNOWN", "acquisition_time_unknown", acquired, quote)
     ok, _age, reason = timestamp_freshness(acquired, now, max_age_seconds=max_age_seconds)
