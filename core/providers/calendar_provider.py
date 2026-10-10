@@ -2,9 +2,13 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.1 (CREDENTIAL-SAFE DIAGNOSTICS)
+Calendar Provider — v1.2.2 (FIELD-INDEPENDENT YAHOO FALLBACK)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.2.2 — retry Yahoo when either earnings or ex-dividend is missing.
+Each event fills independently; existing EODHD dates are never overwritten.
+Disabled or unavailable Yahoo fallback remains a no-op.
 
 v1.2.1 — redact credentials from exception diagnostics before logging.
 Calendar requests, fallback behavior, and returned event maps are unchanged.
@@ -143,7 +147,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -554,8 +558,8 @@ async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
 
 async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
                                today: _dt.date) -> Tuple[int, int]:
-    """Fill-only pass over `base` for symbols whose earnings date is still
-    None (ex-div fills ride along where also None). EODHD values are never
+    """Fill-only pass over `base` for symbols missing either event date.
+    Earnings and ex-dividend fill independently. EODHD values are never
     overwritten. Returns (earnings_filled, exdiv_filled). Never raises."""
     try:
         if not _yahoo_fallback_enabled():
@@ -566,7 +570,8 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
                         __version__)
             return 0, 0
         missing = [s for s, d in base.items()
-                   if d.get("next_earnings_date") is None]
+                   if (d.get("next_earnings_date") is None
+                       or d.get("next_ex_div_date") is None)]
         if not missing:
             return 0, 0
         sem = asyncio.Semaphore(_env_int("TFB_CALENDAR_CONCURRENCY", 4,

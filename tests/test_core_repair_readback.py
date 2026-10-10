@@ -9,6 +9,8 @@ from scripts import verify_core_repair_readback as probe
 class ReadbackProtocolTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.portfolio_version = probe.source_version(
+            "core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION")
         self.health = {"ready": True, "engine_version": "engine-test",
                        "deploy": {"render_git_commit": "commit-test"},
                        "engine_gates": {"margin_publish": "observe"}}
@@ -27,7 +29,7 @@ class ReadbackProtocolTests(unittest.TestCase):
                               "contract_version": 1, "snapshot_id": "synthetic-signature",
                               "eligible_symbols": [],
                               "snapshot_available": True}}}
-        self.protective = {"version": "1.15.0", "status": "ok", "sector_summary": [],
+        self.protective = {"version": self.portfolio_version, "status": "ok", "sector_summary": [],
             "kpis": {"deployable_sar": 0, "adds_funded_sar": 0, "proceeds_pending_sar": 0,
                      "capital_unallocated_sar": 0, "portfolio_value_sar": None, "holdings_value_sar": None,
                      "cash_sar": None, "cash_pct": None, "cost_basis_sar": None, "pnl_sar": None, "pnl_pct": None},
@@ -38,7 +40,8 @@ class ReadbackProtocolTests(unittest.TestCase):
                          "detail": {"execution_ready": False, "position_evidence_matched": False, "sector_weight_pct": None}}],
             "alerts": [{"type": "portfolio_inputs_unverified"}],
             "meta": {"execution_ready": False, "input_certification": {"funding_eligible": False},
-                     "versions": {"portfolio_actions": "1.15.0"}, "route": {"portfolio_actions_version": "1.15.0"}}}
+                     "versions": {"portfolio_actions": self.portfolio_version},
+                     "route": {"portfolio_actions_version": self.portfolio_version}}}
         self.rejected = {"status": "board_funding_mismatch", "selected": [],
                          "kpis": copy.deepcopy(self.zero_kpis), "alerts": []}
 
@@ -56,7 +59,8 @@ class ReadbackProtocolTests(unittest.TestCase):
         return copy.deepcopy(self.allocated)
 
     def run_probe(self):
-        return probe.verify(self.request, "commit-test", "engine-test", "builder-test", expected_portfolio_actions="1.15.0")
+        return probe.verify(self.request, "commit-test", "engine-test", "builder-test",
+                            expected_portfolio_actions=self.portfolio_version)
 
     def test_complete_protocol_is_blocked_zero_cash_and_does_not_publish_snapshot(self):
         result = self.run_probe()
@@ -77,7 +81,7 @@ class ReadbackProtocolTests(unittest.TestCase):
         self.assertEqual(portfolio_body["rows"][0]["Recommendation"], "BUY")
         self.assertTrue(result["unreconciled_portfolio_blocked"])
         self.assertTrue(result["uncertified_replay_withheld"])
-        self.assertEqual(result["portfolio_actions_version"], "1.15.0")
+        self.assertEqual(result["portfolio_actions_version"], self.portfolio_version)
 
     def test_replay_and_portfolio_need_explicit_false_booleans(self):
         for payload in (self.allocated, self.protective):
@@ -158,9 +162,19 @@ class ReadbackProtocolTests(unittest.TestCase):
             self.assertNotIn(value, serialized)
 
     def test_explicit_expected_portfolio_version_preserves_old_verify_arguments(self):
+        current = probe.verify(self.request, "commit-test", "engine-test", "builder-test")
+        self.assertTrue(current["ok"])
+        self.assertEqual(current["portfolio_actions_version"], self.portfolio_version)
+        # An explicitly requested historical version still uses the original
+        # positional API. It must not be accepted by the current-source default.
+        self.protective["version"] = "1.15.0"
+        self.protective["meta"]["versions"]["portfolio_actions"] = "1.15.0"
+        self.protective["meta"]["route"]["portfolio_actions_version"] = "1.15.0"
         result = probe.verify(self.request, "commit-test", "engine-test", "builder-test", 1, "1.15.0")
         self.assertTrue(result["ok"])
-        self.assertTrue(probe.verify(self.request, "commit-test", "engine-test", "builder-test")["ok"])
+        self.assertEqual(result["portfolio_actions_version"], "1.15.0")
+        with self.assertRaisesRegex(probe.ReadbackError, "version or status differs from source"):
+            probe.verify(self.request, "commit-test", "engine-test", "builder-test")
 
     def test_wrong_commit_stops_before_authenticated_call(self):
         self.health["deploy"]["render_git_commit"] = "older-release"
@@ -233,6 +247,9 @@ class ReadbackProtocolTests(unittest.TestCase):
             return result
         with self.assertRaisesRegex(probe.ReadbackError, "changed during"):
             probe.verify(changing_request, "commit-test", "engine-test", "builder-test")
+        self.assertEqual(len(self.calls), 7)
+        self.assertEqual(self.calls[-2][0], probe.PORTFOLIO_ACTIONS_PATH)
+        self.assertEqual(self.calls[-1][0], "/health")
 
     def test_authenticated_redirect_is_refused(self):
         with self.assertRaisesRegex(probe.ReadbackError, "redirect refused"):

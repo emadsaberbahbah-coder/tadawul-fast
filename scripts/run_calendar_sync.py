@@ -107,7 +107,10 @@ from zoneinfo import ZoneInfo
 # preserve a carried record's original source/as-of instead of stamping it now.
 # v1.1.3: retain canonical hyphenated/class symbols, read the bounded full
 # prior event table, and label missing event facts without inventing an as-of.
-__version__ = "1.1.3"
+# v1.1.4: replace the complete header/body/tail in one atomic values request.
+# A transport failure before commit no longer leaves known events erased;
+# lost acknowledgement after commit leaves the complete new table, not a mix.
+__version__ = "1.1.4"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
 
@@ -443,6 +446,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # truncated prior table: that would erase unseen future sticky events.
     prior: Dict[str, Dict[str, str]] = {}
     prior_extent = 0
+    prior_sheet = None
     try:
         prior_sheet = book.worksheet(tab)
         allocated_rows = getattr(prior_sheet, "row_count", None)
@@ -479,13 +483,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     try:
-        try:
-            ws = book.worksheet(tab)
-        except Exception:
-            ws = book.add_worksheet(title=tab, rows=1000, cols=len(HEADERS))
-        ws.update(values=[HEADERS], range_name="A1")
-        ws.batch_clear([f"A2:G{max(1000, len(rows) + 1, prior_extent)}"])
-        ws.update(values=rows, range_name=f"A2:G{len(rows) + 1}",
+        extent = max(1000, len(rows) + 1, prior_extent)
+        ws = prior_sheet
+        if ws is None:
+            ws = book.add_worksheet(title=tab, rows=extent, cols=len(HEADERS))
+        else:
+            allocated_rows = getattr(ws, "row_count", None)
+            if isinstance(allocated_rows, int) and allocated_rows < extent:
+                # Growing the grid preserves all existing cells. A cancelled
+                # or rejected publication after resize still has its old facts.
+                ws.resize(rows=extent)
+        values = [list(HEADERS)] + rows + [
+            [""] * len(HEADERS) for _ in range(extent - len(rows) - 1)]
+        # Sheets applies one Values.update atomically. Include explicit blanks
+        # through the entire old extent: null/omitted cells would retain stale
+        # values. Do not clear separately or retry after an ambiguous response;
+        # acknowledgement loss may mean the complete replacement already won.
+        ws.update(values=values, range_name=f"A1:G{extent}",
                   value_input_option="RAW")
         try:
             ws.freeze(rows=1)
@@ -494,7 +508,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"wrote {len(rows)} rows -> {tab}")
         return 0
     except Exception as e:
-        _out(f"ERROR: sheet write failed: {e}")
+        _out(f"ERROR: sheet publication unconfirmed: {e}; read back before retrying")
         return 3
 
 

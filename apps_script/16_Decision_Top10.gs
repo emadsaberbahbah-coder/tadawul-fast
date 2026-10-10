@@ -1,11 +1,21 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.2 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.3 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.3 (2026-10-10) -- SOURCE READINESS AND PUBLICATION COHORT
+ * Validate factual acquisition/data receipts and approved source row floors
+ * in _Status A:J in addition to the composite feed token. Bind the source
+ * generation and shared producer run before reading the sheet pool; recheck
+ * before allocation and final rendering. A changed/partial/stale source withholds the order
+ * surface. Available sheet rows are never described as a full approved
+ * universe. Empty Sheets input stays an explicit research input. Source
+ * failures freeze stability writes; no roster, floor or quote is invented.
+ * Installed source and a successful live readback still require attestation.
  *
  * v1.13.2 (2026-10-10) -- HELD SEAT DISPLAY CONSISTENCY
  * The Selected KPI separates fast-track suspension, research and grace.
@@ -1410,8 +1420,9 @@
  * audit grid. The intelligence lives in core/analysis/opportunity_builder.py
  * (P2) behind POST /sheet-rows/opportunity-candidates
  * (routes/advanced_analysis.py P3). This file ONLY collects inputs, calls the
- * endpoint, and renders the FROZEN §5 payload zones verbatim. No gating,
- * scoring, sizing, or verdict logic is re-implemented here (§8).
+ * endpoint, and renders the FROZEN §5 payload zones. Qualification,
+ * scoring and sizing stay in the backend (§8); native source-readiness
+ * checks can withhold the displayed order surface.
  *
  * §5 POOL-SOURCE AMENDMENT (adopted 2026-06-12)
  * ---------------------------------------------
@@ -1421,9 +1432,10 @@
  * the PRIMARY pool source is the spreadsheet itself: this file reads the
  * already-refreshed Market_Leaders / Global_Markets / Commodities_FX /
  * Mutual_Funds rows and POSTs them as `rows` (the route's body_rows path,
- * live-tested). The backend selector remains the automatic fallback when
- * Pool Source = "Backend" or when the sheets yield no rows. Bonus: decisions
- * are computed from exactly the data visible on the pages (transparency).
+ * live-tested). The backend selector is used only when Pool Source =
+ * "Backend". Empty Sheets input produces a local empty research display
+ * without a provider fallback or allocation request. Source receipts and
+ * approved row floors must be ready before any order surface is shown.
  *
  * v1.0.1 ENGINE ROI % COLUMN (additive — adopted 2026-06-15)
  * ----------------------------------------------------------
@@ -1589,7 +1601,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.2';
+var DT10_VERSION = '1.13.3';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -1610,10 +1622,184 @@ function dt10BoardEligible_(t) {
 function dt10BoardFundingAlert_(a) {
   return dt10IsFundingAlert_(a) || String((a && a.type) || '') === 'rotation_proposal';
 }
-function dt10BoardVerdict_(ss) {
-  if (!dt10UvOn_()) return { state: 'EXECUTABLE', reason: '', ageMin: null };
-  try { return dt10UvParse_(dt10UvRead_(ss), Date.now()); }
-  catch (e) { return { state: 'NOT_ACTIONABLE', reason: 'verdict read failed', ageMin: null }; }
+function dt10BoardVerdict_(ss, sourceContext) {
+  var out;
+  if (!dt10UvOn_()) out = { state: 'EXECUTABLE', reason: '', ageMin: null };
+  else {
+    try { out = dt10UvParse_(dt10UvRead_(ss), Date.now()); }
+    catch (e) { out = { state: 'NOT_ACTIONABLE', reason: 'verdict read failed', ageMin: null }; }
+  }
+  // The rollout token cannot override factual incomplete source evidence.
+  var source = dt10SourceReadiness_(ss, sourceContext);
+  out.source_readiness = source;
+  if (!source.ready) {
+    out.state = 'NOT_ACTIONABLE'; out.source_blocked = true;
+    out.reason = 'source readiness: ' + source.reason;
+  }
+  return out;
+}
+// Same approved minimums as the coverage and decision-surface audits.
+// Script Properties may tighten these contracts, never reduce them.
+var DT10_SOURCE_MIN_ROWS = {Market_Leaders: 1025, Global_Markets: 6512,
+                          Commodities_FX: 453, Mutual_Funds: 4496};
+var DT10_SOURCE_STATUS_MAX_ROWS = 1000;
+function dt10SourcePolicy_() {
+  return dt10PropMemoGet_('source_readiness_policy', function () {
+    var policy = {floors: {}, freshMin: 95, maxAgeMs: 30 * 3600000};
+    var props;
+    try { props = PropertiesService.getScriptProperties(); } catch (eP) {}
+    DT10_POOL_PAGES.forEach(function (page) {
+      var floor = DT10_SOURCE_MIN_ROWS[page], value;
+      try { value = Number(props.getProperty('TFB_EXPECTED_MIN_ROWS_' + page.toUpperCase())); } catch (eF) {}
+      if (isFinite(value) && value > floor && Math.floor(value) === value) floor = value;
+      policy.floors[page] = floor;
+    });
+    return policy;
+  });
+}
+/** _Status clocks use their declared offset, or established Riyadh wall time.
+ * Date-only, malformed and impossible dates never acquire an invented age. */
+function dt10SourceStampMs_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    var dateMs = value.getTime(); return isFinite(dateMs) ? dateMs : null;
+  }
+  var m = String(value || '').trim().match(
+      /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:?\d{2})?$/);
+  if (!m) return null;
+  var year = +m[1], month = +m[2], day = +m[3], hour = +m[4], minute = +m[5], second = +m[6];
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour > 23 || minute > 59 || second > 59) return null;
+  var utc = Date.UTC(year, month - 1, day, hour, minute, second,
+      m[7] ? Number((m[7] + '00').slice(0, 3)) : 0);
+  var check = new Date(utc);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 ||
+      check.getUTCDate() !== day) return null;
+  var offset = 180; // _Status naive Last Updated is Riyadh, never UTC.
+  if (m[8] === 'Z') offset = 0;
+  else if (m[8]) {
+    var parts = m[8].match(/^([+-])(\d{2}):?(\d{2})$/);
+    if (+parts[2] > 23 || +parts[3] > 59) return null;
+    offset = (+parts[2] * 60 + +parts[3]) * (parts[1] === '-' ? -1 : 1);
+  }
+  return utc - offset * 60000;
+}
+function dt10SourceToken_(message, name) {
+  var re = new RegExp('(?:^|[\\s|])' + name + '=([^\\s|]+)', 'gi');
+  var first = re.exec(String(message || ''));
+  return first && !re.exec(String(message || '')) ? first[1] : '';
+}
+function dt10SourceCount_(value) {
+  if (typeof value === 'boolean' || value === null || value === undefined || String(value).trim() === '') return null;
+  var n = Number(String(value).replace(/,/g, ''));
+  return isFinite(n) && n >= 0 && n <= 9007199254740991 && Math.floor(n) === n ? n : null;
+}
+/** PURE readiness facts; sourceContext binds the exact pre-pool generation. */
+function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
+  var out = {ready: false, reason: '', issues: [], generation: {}, cohort: ''};
+  var rows = {}, index = {}, header = (grid || [])[0] || [];
+  policy = policy || {floors: DT10_SOURCE_MIN_ROWS, freshMin: 95, maxAgeMs: 30 * 3600000};
+  function issue(text) { out.issues.push(text); }
+  for (var h = 0; h < header.length; h++) {
+    var token = dt10NormToken_(header[h]);
+    if (token && !Object.prototype.hasOwnProperty.call(index, token)) index[token] = h;
+    else if (token) issue('duplicate _Status header ' + token);
+  }
+  ['page', 'lastupdated', 'status', 'message', 'rows'].forEach(function (key) {
+    if (!Object.prototype.hasOwnProperty.call(index, key)) issue('_Status missing ' + key);
+  });
+  if (typeof nowMs !== 'number' || !isFinite(nowMs)) issue('decision clock invalid');
+  if (out.issues.length) { out.reason = out.issues.join('; '); return out; }
+  for (var r = 1; r < grid.length; r++) {
+    var row = grid[r] || [], page = String(row[index.page] || '').trim();
+    if (!Object.prototype.hasOwnProperty.call(policy.floors, page)) continue;
+    if (Object.prototype.hasOwnProperty.call(rows, page)) { issue(page + ' duplicate source status'); continue; }
+    rows[page] = row;
+  }
+  DT10_POOL_PAGES.forEach(function (page) {
+    var row = rows[page], floor = policy.floors[page];
+    if (!row) { issue(page + ' source status missing'); return; }
+    var state = String(row[index.status] || '').trim().toUpperCase();
+    var message = String(row[index.message] || '');
+    var stamp = dt10SourceStampMs_(row[index.lastupdated]);
+    var count = dt10SourceCount_(row[index.rows]);
+    out.generation[page] = JSON.stringify([String(row[index.lastupdated]), state, message, count]);
+    // Fresh independent page stamps cannot certify one publication cycle.
+    // The scheduled producer publishes one positive GitHub run ID per row;
+    // a missing/duplicate/reusable "local" value proves no shared cohort.
+    var run = dt10SourceToken_(message, 'run');
+    if (!/^[1-9]\d*$/.test(run)) issue(page + ' source publication run unverified');
+    else if (!out.cohort) out.cohort = run;
+    else if (out.cohort !== run) issue(page + ' source run ' + run + ' differs from cohort ' + out.cohort);
+    if (!/^(OK|SUCCESS|VALID|PASS|COMPLETE)$/.test(state)) issue(page + ' status=' + (state || 'unknown'));
+    if (stamp === null) issue(page + ' source timestamp unverified');
+    else if (stamp > nowMs) issue(page + ' source publication is in the future');
+    else if (nowMs - stamp > policy.maxAgeMs) issue(page + ' source stale (>30h)');
+    if (count === null || count < floor) issue(page + ' rows ' + (count === null ? 'unknown' : count) + ' below floor ' + floor);
+    var acquired = dt10SourceToken_(message, 'acquired').match(/^(\d+)\/(\d+)$/);
+    var fresh = acquired ? Number(acquired[1]) : null, requested = acquired ? Number(acquired[2]) : null;
+    if (fresh === null || requested === null || !isFinite(fresh) || !isFinite(requested) ||
+        requested > 9007199254740991 || requested <= 0 || fresh > requested) issue(page + ' acquisition receipt unknown/invalid');
+    else {
+      if (requested < floor) issue(page + ' acquired denominator ' + requested + ' below floor ' + floor);
+      if (fresh * 100 < policy.freshMin * requested) issue(page + ' acquired ' + fresh + '/' + requested + ' below ' + policy.freshMin + '%');
+    }
+    if (dt10SourceToken_(message, 'acquisition').toUpperCase() !== 'COMPLETE') issue(page + ' acquisition not COMPLETE');
+    if (dt10SourceToken_(message, 'data').toUpperCase() !== 'COMPLETE') issue(page + ' data not COMPLETE');
+    var effective = dt10SourceToken_(message, 'fetchfail_effective').toLowerCase();
+    if (effective === 'error') issue(page + ' acquisition policy error');
+    else if (!/^(off|observe|enforce)$/.test(effective)) issue(page + ' acquisition policy unknown/ambiguous');
+    if (sourceContext) {
+      if (!sourceContext.generation || sourceContext.generation[page] !== out.generation[page]) issue(page + ' changed after decision source capture');
+      if (stamp !== null && stamp > sourceContext.captured_at_ms) issue(page + ' source newer than decision capture');
+      if (sourceContext.pool_counts) {
+        var poolN = dt10SourceCount_(sourceContext.pool_counts[page]);
+        if (poolN === null || poolN < floor) issue(page + ' available pool ' + (poolN === null ? 'unknown' : poolN) + ' below floor ' + floor);
+      }
+    }
+  });
+  if (sourceContext && (sourceContext.initial_ready !== true || typeof sourceContext.captured_at_ms !== 'number' ||
+      !isFinite(sourceContext.captured_at_ms))) {
+    issue('decision source capture was not ready');
+  }
+  out.ready = out.issues.length === 0; out.reason = out.issues.join('; ');
+  return out;
+}
+/** Bounded read, once per readiness boundary; no row or sheet mutations. */
+function dt10SourceReadiness_(ss, sourceContext) {
+  try {
+    var sheet = ss.getSheetByName('_Status');
+    if (!sheet) throw new Error('_Status missing');
+    var rows = sheet.getLastRow(), cols = sheet.getLastColumn();
+    if (!(rows >= 2) || rows > DT10_SOURCE_STATUS_MAX_ROWS || !(cols >= 7)) throw new Error('_Status dimensions invalid');
+    var values = sheet.getRange(1, 1, rows, Math.min(cols, 10)).getValues();
+    return dt10SourceReadinessCore_(values, Date.now(), sourceContext, dt10SourcePolicy_());
+  } catch (eSource) {
+    return {ready: false, reason: 'source status unavailable', issues: ['source status unavailable'], generation: {}};
+  }
+}
+function dt10SourceCapture_(ss) {
+  var captured = Date.now(), source = dt10SourceReadiness_(ss);
+  return {captured_at_ms: captured, initial_ready: source.ready, generation: source.generation};
+}
+/** Counts describe available sheet input, never approved-universe membership. */
+function dt10PoolNote_(pool, source) {
+  var parts = DT10_POOL_PAGES.map(function (page) {
+    return page + ' ' + (pool.perPage[page] || 0) + '/' + (pool.available[page] || 0);
+  });
+  return 'sheets pool ' + pool.rows.length + ' rows [' + parts.join(', ') + '] ' +
+      (pool.duplicatesSkipped ? '(' + pool.duplicatesSkipped + ' duplicate symbols removed) ' : '') +
+      (pool.truncated ? '(TRUNCATED to cap ' + pool.cap + ' of ' + pool.total + ' available)' : '(all available sheet rows)') +
+      ' | source readiness ' + (source.ready ? 'VERIFIED (run ' + source.cohort + ')' : 'WITHHELD: ' + source.reason);
+}
+/** Local display result only; an empty Sheets pool never invokes providers
+ * or fabricates backend acquisition/allocation proof. */
+function dt10EmptySheetPayload_() {
+  return {version: 'native-empty-sheet-pool', status: 'ok', selected: [],
+      candidates_rows: [], alerts: [], near_miss: [],
+      kpis: {scanned: 0, passed: 0, selected_count: 0},
+      meta: {pool_source: 'sheets_empty', board_funding: {contract_version: 1,
+          stage: 'research', finalized: true, eligible_symbols: [],
+          reason: 'empty sheet pool; no allocation requested'}}};
 }
 function dt10BoardFundingFail_(payload, reason) {
   payload.meta = payload.meta || {};
@@ -2223,7 +2409,7 @@ var DT10_POOL_EVIDENCE_TOKENS = {
   acquisitionacquiredat: true, acquisitionquoteasof: true,
   instrumentid: true, providersymbol: true, isin: true,
   pricebasis: true, quotecurrency: true, quotesession: true,
-  quoteasof: true, quotetimestamp: true, pricebarts: true
+  quoteasof: true, quotetimestamp: true, pricebarts: true, regularmarkettime: true
 };
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
@@ -4148,7 +4334,8 @@ function dt10OutputStatus_(payload) {
       try { uv = String((p.meta && p.meta.upstream_verdict) || p.upstream_verdict || ''); } catch (e1) {}
       feedOk = !/NOT_ACTIONABLE|WITHHELD|STALE|AGED/i.test(uv);
     }
-    if (!feedOk && (cls.total > 0 || passed > 0)) return 'WITHHELD';
+    if (!feedOk && (cls.total > 0 || passed > 0 ||
+        (p._dt10_uv && p._dt10_uv.source_blocked === true))) return 'WITHHELD';
     if (cls.exec > 0) return 'EXECUTABLE';
     var funding = p.meta && p.meta.board_funding;
     if (funding && funding.finalized === true && funding.stage === 'allocate' &&
@@ -4699,7 +4886,7 @@ function dt10CriteriaFromPanel_(panel) {
  * Phase 1 collects EVERY valid row from EACH page independently (no shared cap
  * during collection), so a large Market_Leaders can never exhaust the budget
  * before the other pages are read. Phase 2 then: if the four-sheet total fits
- * within the cap, sends it ALL (full universe); otherwise round-robins across
+ * within the cap, sends all available input; otherwise round-robins across
  * the pages so each is fairly represented. Returns per-page included AND
  * available counts plus total/truncated for an honest status line.
  */
@@ -5329,7 +5516,7 @@ function dt10AppendEmptyBoardRow_(ss, runInfo, panel, mode) {
   }
 }
 
-function dt10AppendSelectionLog_(ss, tickets, runInfo, panel, outputState) {
+function dt10AppendSelectionLog_(ss, tickets, runInfo, panel, outputState, sourceContext) {
   try {
     var mode = '';
     try {
@@ -5367,10 +5554,10 @@ function dt10AppendSelectionLog_(ss, tickets, runInfo, panel, outputState) {
     }
     /* v1.10.0 (R3): fail-closed verdict read (mirrors dt10RenderPayload_);
      * read trouble withholds. */
-    if (dt10UvOn_()) {
+    if (dt10UvOn_() || sourceContext) {
       var slUv;
       try {
-        slUv = dt10UvParse_(dt10UvRead_(ss), Date.now());
+        slUv = dt10BoardVerdict_(ss, sourceContext);
       } catch (eUv) {
         slUv = { state: 'NOT_ACTIONABLE', reason: 'verdict read failed' };
       }
@@ -5642,7 +5829,7 @@ function refreshDecisionTop10() {
     }
   }
   var poolLimit = parseInt(panel['Pool Limit'], 10);
-  // v1.2.3: blank / 0 / non-positive Pool Limit == scan the full universe.
+  // v1.2.3: blank / 0 / non-positive Pool Limit == scan all available input.
   if (!(poolLimit > 0)) poolLimit = DT10_POOL_HARD_CAP;
   var useSheets = String(panel['Pool Source'] || 'Sheets')
       .toLowerCase().indexOf('backend') === -1;
@@ -5680,36 +5867,27 @@ function refreshDecisionTop10() {
   }
   var poolNote = 'backend selector';
   var dt10Outage = null;   // v1.11.10 [P-168]: sheet-pool outage sightings
+  // Capture source generations BEFORE reading pool rows. A late source
+  // publication cannot relabel this older in-memory board as current.
+  var sourceContext = dt10SourceCapture_(ss);
+  var pool = null;
   if (useSheets) {
-    var pool = dt10CollectPoolRows_(ss, poolLimit);
+    pool = dt10CollectPoolRows_(ss, poolLimit);
+    sourceContext.pool_counts = pool.available;
+    // Empty sheet input is explicit; never silently switch to another pool.
+    body.rows = pool.rows;
     if (pool.rows.length) {
-      body.rows = pool.rows;
       dt10Outage = dt10OutageMapFromPool_(pool.rows);   // v1.11.10 [P-168]
-      // v1.2.0: included/available per sheet so empty/stale pages are visible.
-      var parts = [];
-      for (var pp = 0; pp < DT10_POOL_PAGES.length; pp++) {
-        var pn = DT10_POOL_PAGES[pp];
-        parts.push(pn + ' ' + (pool.perPage[pn] || 0) + '/' +
-                   (pool.available[pn] || 0));
-      }
-      poolNote = 'sheets pool ' + pool.rows.length + ' rows [' +
-                 parts.join(', ') + '] ' +
-                 (pool.duplicatesSkipped ?
-                  '(' + pool.duplicatesSkipped + ' duplicate symbols removed) ' :
-                  '') +
-                 (pool.truncated ? '(TRUNCATED to cap ' + pool.cap + ' of ' +
-                  pool.total + ' available — raise Pool Limit to scan ' +
-                  'all)' : '(full universe)');
-    } else {
-      poolNote = 'sheets pool EMPTY \u2192 backend selector fallback';
     }
+    poolNote = dt10PoolNote_(pool, dt10SourceReadiness_(ss, sourceContext));
   }
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
   var resp;
   try {
-    resp = dt10Post_(body);
+    resp = pool && !pool.rows.length ?
+        {code: 200, json: dt10EmptySheetPayload_(), local: true} : dt10Post_(body);
   } catch (eNet) {
     statusCell.setValue(dt10StatusLine_('NETWORK ERROR',
         String(eNet) + dt10StaleNote_()));
@@ -5746,19 +5924,28 @@ function refreshDecisionTop10() {
   // v1.3.0: membership hysteresis between response and render. The audit
   // grid / qualified / near-miss zones keep the backend's RAW truth; only
   // the SELECTED board gains memory.
-  var stab = dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]
-  payload._dt10_uv = dt10BoardVerdict_(ss);
-  dt10ReallocateBoard_(payload, body);
+  payload._dt10_source_context = sourceContext;
+  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
+  // Incomplete source evidence must not advance confirmation/miss memory.
+  var stab = payload._dt10_uv.source_blocked === true ?
+      {note: 'stab: frozen (source readiness withheld)'} :
+      dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]
+  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
+  if (resp.local !== true) dt10ReallocateBoard_(payload, body);
   dt10FinalizeBoard_(payload);
   // v1.6.6 (S-5): board-vs-backend KPI verification — token only.
   var kpiNote;
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
   var seatNote;
   var earn = dt10RenderPayload_(sheet, payload, tokens);
+  var finalSource = payload._dt10_uv.source_readiness;
+  if (pool) poolNote = dt10PoolNote_(pool, finalSource);
+  else poolNote += ' | source readiness ' + (finalSource.ready ? 'VERIFIED (run ' + finalSource.cohort + ')' : 'WITHHELD: ' + finalSource.reason);
+  if (resp.local === true) poolNote += ' | empty Sheets input; no backend request or allocation';
   kpiNote = dt10KpiCheckNote_(payload);
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
-  var statusLine = dt10StatusLine_(String(payload.status || '?'),
+  var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
       poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
       (stab && stab.note ? ' | ' + stab.note : '') +
       (earn && earn.note ? ' | ' + earn.note : '') +
@@ -5772,7 +5959,7 @@ function refreshDecisionTop10() {
   // Run Info column carries this exact status line, pre-'SelLog' tail.
   var selLogNote = dt10AppendSelectionLog_(ss, payload.selected || [],
                                            statusLine, panel,
-                                           dt10OutputStatus_(payload));  // v1.11.2 [P-62]
+                                           dt10OutputStatus_(payload), sourceContext);  // v1.11.2 [P-62]
   // v1.6.6 (S-4): membership departures logged with an Outcome stamp.
   var exitNote = dt10AppendExitLog_(ss,
       (stab && stab.audit) ? stab.audit : {}, statusLine);
@@ -5786,7 +5973,7 @@ function refreshDecisionTop10() {
           Session.getScriptTimeZone() || 'Asia/Riyadh', 'yyyy-MM-dd HH:mm'),
       (payload.selected || []).length);
   // v1.4.0: cockpit-owned _Status — same text as the banner, one truth.
-  dt10WritePageStatus_('OK', finalStatusLine, resp.code,
+  dt10WritePageStatus_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : 'OK', finalStatusLine, resp.local === true ? '' : resp.code,
       (payload.selected || []).length, Math.round(secs * 1000), []);
   Logger.log('[DT10 v' + DT10_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's');
@@ -5978,13 +6165,6 @@ function dt10UvParse_(raw, nowMs) {
 }
 
 function dt10RenderPayload_(sheet, payload, tokens) {
-  // Read the authoritative gate before any KPI, alert, or ticket is written.
-  // The live caller reads once before replay; direct render callers fail closed.
-  payload._dt10_uv = dt10BoardVerdict_(sheet.getParent());
-  dt10FinalizeBoard_(payload);
-  // v1.13.2: annotate after the last note-replacing finalization, before
-  // painting the board. The refresh status and selection log use this result.
-  var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
   // Clear dynamic zones (breakApart first: section headers and empty-state
   // lines are merged ranges; writing over stale merges throws in GAS).
   var lastRow = sheet.getMaxRows();
@@ -5995,6 +6175,13 @@ function dt10RenderPayload_(sheet, payload, tokens) {
     zone.breakApart();
     zone.clear();
   }
+  // Recheck after sheet preparation and before any financial values are
+  // painted. The pre-pool generation must still match the latest sources.
+  payload._dt10_uv = dt10BoardVerdict_(sheet.getParent(), payload._dt10_source_context || {});
+  dt10FinalizeBoard_(payload);
+  // v1.13.2: annotate after the last note-replacing finalization, before
+  // painting the board. The refresh status and selection log use this result.
+  var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
   // KPI strip
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
                                 DT10_KPI_LABELS.length);
@@ -6027,7 +6214,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // SELECTED: finalization above already applied funding and feed controls.
   // The upstream token may label input readiness but never invent a ticket.
   var dt10Uv = payload._dt10_uv;
-  var dt10SelTitle = dt10SelectedTitle_(payload, dt10UvOn_());
+  var dt10SelTitle = dt10SelectedTitle_(payload, dt10UvOn_() || dt10Uv.source_blocked === true);
   if (dt10UvOn_()) {
     Logger.log('[DT10 v' + DT10_VERSION + '] upstream verdict: ' +
         (dt10Uv.state === 'EXECUTABLE' ? 'EXECUTABLE' : dt10Uv.reason) +
@@ -6244,11 +6431,17 @@ function dt10SelfTest() {
               ' members=' + stabMembers + ' tracked=' + stabSyms +
               ' (dt10StabilityReset() clears)');
   var pool = dt10CollectPoolRows_(ss, DT10_POOL_HARD_CAP);
-  report.push('pool scan (full universe): ' + pool.rows.length + ' of ' +
+  report.push('pool scan (available sheet rows): ' + pool.rows.length + ' of ' +
               pool.total + ' rows, per-sheet incl/avail ' +
               JSON.stringify(pool.perPage) + ' / ' +
               JSON.stringify(pool.available) +
               (pool.truncated ? ' (TRUNCATED)' : ' (full)'));
+  var sourceLive = dt10SourceReadiness_(ss);
+  report.push('source readiness: ' + (sourceLive.ready ? 'VERIFIED' : 'WITHHELD: ' + sourceLive.reason));
+  var sourceClockTest = dt10SourceStampMs_('2026-10-10 12:00:00+03:00');
+  report.push('source clock core: ' + ((sourceClockTest === Date.UTC(2026, 9, 10, 9) &&
+      dt10SourceStampMs_('2026-10-10') === null &&
+      dt10SourceStampMs_('2026-02-30 12:00:00+03:00') === null) ? 'ok' : 'FAIL'));
   if (pool.rows.length) {
     report.push('first pool row keys: ' +
                 JSON.stringify(pool.rows[0]).slice(0, 300));

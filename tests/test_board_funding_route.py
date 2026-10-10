@@ -410,7 +410,7 @@ def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
     assert len(requests) == 7 and len(responses) == 5
     assert result["uncertified_replay_withheld"] is True
     assert result["unreconciled_portfolio_blocked"] is True
-    assert result["portfolio_actions_version"] == "1.15.0"
+    assert result["portfolio_actions_version"] == pa.PORTFOLIO_ACTIONS_VERSION
     protective = responses[-1]
     assert requests[-2][0] == probe.PORTFOLIO_ACTIONS_PATH
     assert "reconciliation_evidence" not in requests[-2][1]

@@ -1740,6 +1740,152 @@ jobs:
             shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
           fi
 
+  # Final audits run after every matrix leg and recovery, while this workflow
+  # still owns the production write lease. They can downgrade only the bounded
+  # _Status decision-feed key; native cockpit refresh remains Apps Script-owned.
+  verify-final-decision-publication:
+    name: 🛡️ Verify final decision publication
+    needs: [sync-dashboard, recover-missing-market-pages]
+    if: >-
+      ${{
+        always() &&
+        (
+          github.event_name == 'schedule' ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            github.event.inputs.run_mode == 'full_sync'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_DECISION_SOURCE_MAX_AGE_H: '30'
+      TFB_DECISION_SURFACE_MAX_AGE_H: '8'
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
+      TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+    steps:
+      - name: Checkout this run's source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: Configure final-audit credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          if not os.environ.get('TARGET_SHEET_ID', '').strip():
+              raise SystemExit('::error::Spreadsheet ID is missing.')
+          raw = os.environ.get('SECRET_CREDS', '')
+          if not raw:
+              try:
+                  raw = base64.b64decode(os.environ.get('SECRET_CREDS_B64', ''), validate=True).decode()
+              except Exception:
+                  raise SystemExit('::error::Google Sheets credentials are invalid.')
+          try:
+              credentials = json.loads(raw)
+              valid = isinstance(credentials, dict) and credentials.get('type') == 'service_account'
+              valid = valid and credentials.get('client_email') and credentials.get('private_key')
+              if not valid:
+                  raise ValueError('invalid service-account structure')
+          except Exception:
+              raise SystemExit('::error::Google Sheets credentials are invalid.')
+          path = Path(os.environ['RUNNER_TEMP']) / 'final_publication_credentials.json'
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          os.fchmod(fd, 0o600)
+          with os.fdopen(fd, 'w') as handle:
+              handle.write(raw)
+          print('::add-mask::' + credentials['client_email'])
+          with open(os.environ['GITHUB_ENV'], 'a') as handle:
+              handle.write('GOOGLE_APPLICATION_CREDENTIALS=' + str(path) + '\n')
+          PY
+
+      - name: Audit final coverage and decision clocks
+        id: final_audit
+        run: |
+          set -euo pipefail
+          code=0
+          python scripts/finalize_decision_publication.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --max-rows 20000 \
+            --publish-blockers \
+            --json-out final_decision_publication.json || code=$?
+          echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
+          if [[ "$code" -ge 2 ]]; then
+            echo "::error::Final coverage or decision publication is not accepted (exit $code)."
+            exit "$code"
+          fi
+          if [[ "$code" -eq 1 ]]; then
+            echo '::warning::Final publication audit completed with warnings.'
+          fi
+
+      - name: Publish final audit summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('final_decision_publication.json')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write('## Final decision publication\n\n')
+              if not path.exists():
+                  handle.write('Final audit did not complete. No acceptance was issued.\n')
+              else:
+                  result = json.loads(path.read_text())
+                  handle.write('| Check | Result |\n|---|---|\n')
+                  for key in ('exit_code', 'audit_exit_codes', 'blockers', 'blocker_published', 'feed_promoted'):
+                      handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
+                  handle.write('\nNative installation and refresh are required before executable decisions.\n')
+          PY
+
+      - name: Upload final publication evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: final-decision-publication-${{ github.run_id }}
+          path: final_decision_publication.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Secure credential cleanup
+        if: always()
+        run: |
+          CREDS_PATH="$RUNNER_TEMP/final_publication_credentials.json"
+          if [[ -f "$CREDS_PATH" ]]; then
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
+          fi
+
   # =============================================================================
   # 🔔 RUN VERDICT (2026-10-06) -- A CANCELLED LEG MUST NOT BE SILENT
   # -----------------------------------------------------------------------------
@@ -1767,7 +1913,7 @@ jobs:
   # =============================================================================
   notify-run-verdict:
     name: 🔔 Run verdict
-    needs: [sync-dashboard, recover-missing-market-pages]
+    needs: [sync-dashboard, recover-missing-market-pages, verify-final-decision-publication]
     if: >-
       ${{
         always() &&
@@ -1785,6 +1931,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SYNC_RESULT: ${{ needs.sync-dashboard.result }}
           RECOVERY_RESULT: ${{ needs.recover-missing-market-pages.result }}
+          FINAL_RESULT: ${{ needs.verify-final-decision-publication.result }}
         run: |
           set -euo pipefail
 
@@ -1792,7 +1939,7 @@ jobs:
           RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
 
           # Always visible in the Actions summary, with or without a webhook.
-          echo "::error::Daily Sync did not complete cleanly - sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT} (${RIYADH_TIME}). A matrix leg that is 'cancelled' with no steps was starved of a hosted runner; the in-sync Track Performance step is gated on the global-markets leg and will NOT have run."
+          echo "::error::Daily Sync did not complete cleanly - sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT} final-publication=${FINAL_RESULT} (${RIYADH_TIME}). Check final decision publication before using cockpit tickets."
           {
             echo "## 🔔 Run verdict"
             echo ""
@@ -1800,6 +1947,7 @@ jobs:
             echo "|---|---|"
             echo "| sync-dashboard | \`${SYNC_RESULT}\` |"
             echo "| recover-missing-market-pages | \`${RECOVERY_RESULT}\` |"
+            echo "| verify-final-decision-publication | \`${FINAL_RESULT}\` |"
             echo ""
             echo "Time (Riyadh): ${RIYADH_TIME}"
             echo ""
@@ -1817,6 +1965,7 @@ jobs:
             --arg time     "$RIYADH_TIME" \
             --arg sync     "${SYNC_RESULT:-unknown}" \
             --arg recovery "${RECOVERY_RESULT:-unknown}" \
+            --arg final    "${FINAL_RESULT:-unknown}" \
             --arg url      "$RUN_URL" \
             '{
               text: "❌ Tadawul Daily Sync run did not complete cleanly",
@@ -1827,6 +1976,7 @@ jobs:
                   {title: "Time (Riyadh)",  value: $time,     short: true},
                   {title: "sync-dashboard", value: $sync,     short: true},
                   {title: "recovery",       value: $recovery, short: true},
+                  {title: "final publication", value: $final, short: true},
                   {title: "Details",        value: ("<" + $url + "|View Logs>"), short: false}
                 ]
               }]

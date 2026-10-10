@@ -56,6 +56,7 @@ _MODULE_FILES = {
     "core.execution_accounting": "core/execution_accounting.py",
     "core.portfolio_reconciliation": "core/portfolio_reconciliation.py",
     "core.sheet_presentation": "core/sheet_presentation.py",
+    "core.data_validity": "core/data_validity.py",
     "integrations.google_sheets_service": "integrations/google_sheets_service.py",
     "core.enriched_quote": "core/enriched_quote.py",
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",

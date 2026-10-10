@@ -2,7 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.2 (2026-10-09) -- GLOBAL MARKETS SCORING BASIS
+# VERSION 1.1.3 (2026-10-10) -- FUNDING AND COMPLETE FINAL PUBLICATION
+#
+# v1.1.3: require exact portfolio budgets, conflicting quote aliases, atomic
+# calendar replacement and field-independent fallback, and final publication
+# acceptance. Native source edits trigger push CI and source-readiness checks.
+# The pinned contract lane also checks native epoch quote producers end to end.
 #
 # v1.1.2: require model/display intrinsic-basis and recommendation-provenance
 # regressions alongside the existing fail-closed scoring settlement suite.
@@ -219,6 +224,7 @@ on:
       - 'routes/**'
       - 'scripts/**'
       - 'integrations/**'
+      - 'apps_script/**'
       - 'tests/**'
       - 'requirements*.txt'
       - '.github/workflows/**'
@@ -349,19 +355,24 @@ jobs:
             tests/test_execution_accounting.py \
             tests/test_portfolio_reconciliation.py \
             tests/test_portfolio_action_reconciliation.py \
+            tests/test_portfolio_exact_funding.py \
             tests/test_portfolio_reconciliation_cli.py \
             tests/test_ob_quote_evidence.py \
+            tests/test_executable_quote_conflicts.py \
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
+            tests/test_calendar_atomic_publication.py \
             tests/test_outcome_price_evidence.py \
             tests/test_portfolio_blank_fee_witness.py \
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
+            tests/test_final_decision_publication.py \
+            tests/test_final_publication_workflow.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
@@ -409,6 +420,9 @@ jobs:
 
       - name: 🧪 Final board funding (full Apps Script source)
         run: node tests/js/decision_board_funding.test.js
+
+      - name: 🧪 Native decision source readiness (full Apps Script source)
+        run: node tests/js/decision_source_readiness.test.js
 
       - name: 🧪 Native reconciliation and complete calendar inputs
         run: |
@@ -466,6 +480,8 @@ jobs:
             tests/test_insights_cohort_route.py \
             tests/test_portfolio_reconciliation_route.py \
             tests/test_calendar_completeness.py \
+            tests/test_calendar_partial_fill.py \
+            tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
             tests/test_eodhd_error_redaction.py \

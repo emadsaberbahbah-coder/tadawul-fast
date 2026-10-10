@@ -8,6 +8,9 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.2.2 — explicit final-publication policy and optional source-run cohort
+proof. Defaults retain the standalone audit's existing policy and behavior.
+
 VERSION 1.2.1 — consumes the corrected price-acquisition facts: a margin-only
 fundamentals quarantine remains a fundamentals flag, not a price failure.
 Configured feed policy and decision-readiness checks remain unchanged.
@@ -54,7 +57,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
 from core.data_validity import coverage_validity  # noqa: E402
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -277,6 +280,8 @@ def audit_surfaces(
     market_max_age_h: float = 30.0,
     decision_max_age_h: float = 8.0,
     min_rows: Optional[Mapping[str, int]] = None,
+    min_fresh_percent: Optional[float | Mapping[str, float]] = None,
+    expected_source_run: Optional[str] = None,
 ) -> DecisionSurfaceReport:
     now_utc = now_utc or datetime.now(timezone.utc)
     now_riyadh = now_utc.astimezone(timezone(timedelta(hours=3))).replace(tzinfo=None)
@@ -356,8 +361,17 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "SOURCE_STATUS_MISSING", "Top_10_Investments", f"{page} is absent from _Status."))
             continue
         report.source_status[page] = asdict(item)
-        acquisition_findings = _acquisition_findings(item,"Top_10_Investments","SOURCE",floor,
-            _env_float("TFB_REFRESH_MIN_FRESH_PCT_"+page.upper(),95.0))
+        if expected_source_run is not None:
+            runs = re.findall(r"(?<![a-z0-9_])run\s*=\s*([^\s;|,]*)", item.message, re.I)
+            if (not re.fullmatch(r"[1-9][0-9]*", str(expected_source_run))
+                    or len(runs) != 1 or runs[0] != str(expected_source_run)):
+                report.findings.append(Finding("FAIL", "SOURCE_PUBLICATION_COHORT", "Top_10_Investments",
+                    f"{page} does not prove the expected final-publication source run."))
+        fresh_minimum = (_env_float("TFB_REFRESH_MIN_FRESH_PCT_"+page.upper(),95.0)
+                         if min_fresh_percent is None else
+                         min_fresh_percent.get(page,95.0) if isinstance(min_fresh_percent,Mapping)
+                         else min_fresh_percent)
+        acquisition_findings = _acquisition_findings(item,"Top_10_Investments","SOURCE",floor,fresh_minimum)
         if acquisition_findings:
             incomplete_sources.append(page)
             report.findings.extend(acquisition_findings)
@@ -409,7 +423,12 @@ async def _read_range(reader: Callable[..., Any], spreadsheet_id: str, a1: str) 
     return [list(row) if isinstance(row, (list, tuple)) else [row] for row in value]
 
 
-async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = None) -> DecisionSurfaceReport:
+async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = None, *,
+                   min_rows: Optional[Mapping[str, int]] = None,
+                   market_max_age_h: Optional[float] = None,
+                   decision_max_age_h: Optional[float] = None,
+                   min_fresh_percent: Optional[float | Mapping[str, float]] = None,
+                   expected_source_run: Optional[str] = None) -> DecisionSurfaceReport:
     if not spreadsheet_id:
         report = DecisionSurfaceReport(datetime.now(timezone.utc).isoformat(), "***")
         report.fatal = "spreadsheet ID missing"
@@ -435,8 +454,13 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
         portfolio_grid,
         top10_grid,
         spreadsheet=masked,
-        market_max_age_h=_env_float("TFB_DECISION_SOURCE_MAX_AGE_H", 30.0),
-        decision_max_age_h=_env_float("TFB_DECISION_SURFACE_MAX_AGE_H", 8.0),
+        market_max_age_h=(_env_float("TFB_DECISION_SOURCE_MAX_AGE_H", 30.0)
+                          if market_max_age_h is None else market_max_age_h),
+        decision_max_age_h=(_env_float("TFB_DECISION_SURFACE_MAX_AGE_H", 8.0)
+                            if decision_max_age_h is None else decision_max_age_h),
+        min_rows=min_rows,
+        min_fresh_percent=min_fresh_percent,
+        expected_source_run=expected_source_run,
     )
 
 
