@@ -42,6 +42,7 @@ _VERIFIER = _REPO / "scripts" / "verify_deployment.py"
 
 # module dotted path -> file, for the MODULES manifest
 _MODULE_FILES = {
+    "scripts.performance_math": "scripts/performance_math.py",
     "core.analysis.insights_builder": "core/analysis/insights_builder.py",
     "core.compliance_gate": "core/compliance_gate.py",
     "core.shariah_authority": "core/shariah_authority.py",
