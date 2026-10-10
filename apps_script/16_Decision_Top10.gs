@@ -1,11 +1,21 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.1 (2026-10-10) -- QUOTE HANDOFF AND FINAL BANNER TRUTH
+ * Preserve actual provider, typed acquisition/quote witnesses and their
+ * source aliases through the sheet request. Duplicate or contradictory
+ * evidence is retained for backend validation; no missing proof is invented.
+ * Retrieval timestamps retain their declared UTC/Riyadh basis. The selected
+ * banner derives EXECUTABLE/HELD/NO_TRADE from the finalized board rather
+ * than copying an upstream EXECUTABLE verdict onto an empty or grace board.
+ * Repository version only: installed source and live request/readback still
+ * require native attestation before claiming production repair.
  *
  * v1.12.2 (2026-10-07) -- FINAL CASH-FLOOR OBSERVATION DENOMINATOR
  * Cash-floor sizing/loss observations use only final executable displayed
@@ -1569,7 +1579,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.0';
+var DT10_VERSION = '1.13.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2097,6 +2107,19 @@ var DT10_POOL_FIELDS = [
   { send: 'Exchange', match: ['exchange', 'market', 'marketregion'] },
   { send: 'Currency', match: ['currency', 'tradingcurrency', 'currencycode'] },
   { send: 'Current Price', match: ['currentprice', 'price', 'lastprice'] },
+  // TFB-01: a retrieval clock alone never proves an executable quote.
+  // Send only actual source evidence; backend row_acquisition owns validation.
+  { send: 'Data Provider',
+    match: ['dataprovider', 'provider', 'datasource', 'source', 'primaryprovider'] },
+  { send: 'acquisition_status', match: ['acquisitionstatus'] },
+  { send: 'acquisition_provider', match: ['acquisitionprovider'] },
+  { send: 'acquisition_acquired_at', match: ['acquisitionacquiredat'] },
+  { send: 'acquisition_quote_asof', match: ['acquisitionquoteasof'] },
+  { send: 'Instrument ID', match: ['instrumentid'] },
+  { send: 'Provider Symbol', match: ['providersymbol'] },
+  { send: 'Price Basis', match: ['pricebasis'] },
+  { send: 'Quote Currency', match: ['quotecurrency'] },
+  { send: 'Quote Session', match: ['quotesession'] },
   { send: 'Target Price',
     match: ['pricetarget', 'targetprice', 'analysttarget'] },
   { send: 'Intrinsic Value',
@@ -2125,12 +2148,12 @@ var DT10_POOL_FIELDS = [
   // permanently-empty witness. Verbatim passthrough; builder alias
   // 'warnings' (v1.13.0).
   { send: 'Warnings', match: ['warnings'] },
-  // v1.6.1: the quote's own timestamp MUST travel with the row — without it
-  // the backend's freshness + data-trust gates skip every body_rows
-  // candidate by design (proven-staleness-only). Source pages publish
-  // 'Last Updated (UTC)'; builder alias: lastupdatedutc.
+  // Retrieval and quote clocks are separate. A generic/Riyadh retrieval
+  // stamp must never be relabeled UTC, nor an AsOf treated as acquisition.
   { send: 'Last Updated (UTC)',
-    match: ['lastupdatedutc', 'lastupdated', 'asof'] },
+    match: ['lastupdatedutc'] },
+  { send: 'Last Updated (Riyadh)', match: ['lastupdatedriyadh'] },
+  { send: 'Last Updated', match: ['lastupdated'] },
   // v1.8.1: forecast PROVENANCE must travel with the row — opportunity_builder
   // v1.10.0's B4 gate (env TFB_T10_EXCLUDE_DEFAULT_CONF, armed 2026-08-08)
   // matches forecast_source == 'phase_ii_synthetic', and the builder's
@@ -2158,6 +2181,27 @@ var DT10_POOL_FIELDS = [
   { send: 'Percent Change',
     match: ['percentchange', 'pctchange', 'changepct'] }
 ];
+/** TFB-01: retain original evidence headers as well as canonical sends.
+ * First-column selection must not erase an invalid provider, contradictory
+ * alias, duplicate timestamp or alternate instrument/price/currency witness.
+ * No values are parsed, reconciled or fabricated at this adapter boundary. */
+var DT10_POOL_EVIDENCE_TOKENS = {
+  symbol: true, ticker: true,
+  dataprovider: true, provider: true, datasource: true, source: true,
+  primaryprovider: true,
+  currentprice: true, price: true, lastprice: true,
+  currency: true, tradingcurrency: true, currencycode: true, ccy: true,
+  exchange: true, market: true, marketregion: true,
+  warnings: true, warning: true, rowwarnings: true, flags: true,
+  error: true, errors: true, errormessage: true,
+  lastupdatedutc: true, lastupdatedriyadh: true, lastupdated: true,
+  asof: true, timestamp: true,
+  acquisitionstatus: true, acquisitionprovider: true,
+  acquisitionacquiredat: true, acquisitionquoteasof: true,
+  instrumentid: true, providersymbol: true, isin: true,
+  pricebasis: true, quotecurrency: true, quotesession: true,
+  quoteasof: true, quotetimestamp: true, pricebarts: true
+};
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
                          '52W Position %': true, 'Percent Change': true };
@@ -2232,24 +2276,46 @@ function dt10FindHeaderRow_(values, scanRows) {
 /** Map DT10_POOL_FIELDS → column index from a header row array; null=absent */
 function dt10MapHeaderCols_(headerRow) {
   var byToken = {};
+  var aliases = {};
+  var evidenceCols = [];
   for (var c = 0; c < headerRow.length; c++) {
     var t = dt10NormToken_(headerRow[c]);
     if (t && byToken[t] === undefined) byToken[t] = c;
+    if (t) {
+      if (!aliases[t]) aliases[t] = [];
+      aliases[t].push(c);
+      if (DT10_POOL_EVIDENCE_TOKENS[t]) {
+        evidenceCols.push({ key: String(headerRow[c]).trim(), col: c });
+      }
+    }
   }
-  var map = {};
+  var map = { _dt10_alias_cols: {}, _dt10_evidence_cols: evidenceCols };
   var fields = dt10PoolFieldsActive_();   // v1.11.12 [P-181b]
   for (var i = 0; i < fields.length; i++) {
     var spec = fields[i];
     var col = null;
+    var cols = [];
     for (var m = 0; m < spec.match.length; m++) {
       if (byToken[spec.match[m]] !== undefined) {
-        col = byToken[spec.match[m]];
-        break;
+        if (col === null) col = byToken[spec.match[m]];
+        cols = cols.concat(aliases[spec.match[m]]);
       }
     }
     map[spec.send] = col;
+    map._dt10_alias_cols[spec.send] = cols;
   }
   return map;
+}
+/** First meaningful source value for a canonical field, without discarding
+ * the other evidence values (dt10PoolRowFromSheetRow_ forwards those below). */
+function dt10PoolValue_(row, colMap, send) {
+  var cols = colMap._dt10_alias_cols && colMap._dt10_alias_cols[send];
+  if (!cols) cols = [colMap[send]];
+  for (var i = 0; i < cols.length; i++) {
+    var col = cols[i];
+    if (col !== null && col !== undefined && dt10HasValue_(row[col])) return row[col];
+  }
+  return undefined;
 }
 /** True if a cell value is a meaningful (non-placeholder) payload value. */
 function dt10HasValue_(v) {
@@ -2267,7 +2333,7 @@ function dt10HasValue_(v) {
 function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
   var symCol = colMap['Symbol'];
   if (symCol === null || symCol === undefined) return null;
-  var sym = row[symCol];
+  var sym = dt10PoolValue_(row, colMap, 'Symbol');
   if (!dt10HasValue_(sym)) return null;
   var s = String(sym).trim();
   if (s.charAt(0) === '—' || s.toLowerCase().indexOf('no data') === 0) {
@@ -2282,10 +2348,27 @@ function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
     var send = fields[i].send;
     var col = colMap[send];
     if (col === null || col === undefined) continue;
-    var v = row[col];
+    var v = dt10PoolValue_(row, colMap, send);
     if (dt10HasValue_(v)) out[send] = v;
   }
-  if (!dt10HasValue_(out['Exchange'])) out['Exchange'] = pageName;
+  var evidenceCols = colMap._dt10_evidence_cols || [];
+  for (var e = 0; e < evidenceCols.length; e++) {
+    var witness = evidenceCols[e], value = row[witness.col];
+    // Unlike display placeholders, explicit nonlive/unknown evidence such as
+    // provider="none" must survive so a second valid alias cannot hide it.
+    if (value === null || value === undefined || String(value).trim() === '') continue;
+    var key = witness.key;
+    if (Object.prototype.hasOwnProperty.call(out, key)) {
+      if (String(out[key]) === String(value)) continue;
+      // JSON objects cannot hold identical headers twice. Punctuation-only
+      // suffixes preserve both values under the SAME backend normalized key.
+      while (Object.prototype.hasOwnProperty.call(out, key)) key += '_';
+    }
+    out[key] = value;
+  }
+  // Sheet membership is context, not an observed exchange. Preserve even an
+  // explicit unknown Exchange value; source_page is a separate builder alias.
+  if (!dt10HasValue_(out['Exchange'])) out['Source Page'] = pageName;
   return out;
 }
 /** v1.2.2 — normalize a symbol for de-duplication (trim + uppercase). */
@@ -4029,6 +4112,40 @@ function dt10OutputStatus_(payload) {
   } catch (e) {
     return 'UNKNOWN';
   }
+}
+
+/** TFB-02 narrow renderer fix: an upstream-ready feed is input evidence,
+ * while only the finalized board may claim executable opportunities.
+ * Pure given the payload and display flag; call after dt10FinalizeBoard_. */
+function dt10SelectedTitle_(payload, showFeed) {
+  var p = payload || {}, selected = p.selected || [];
+  var cls = dt10TicketClasses_(selected);
+  var output = dt10OutputStatus_(p);
+  var execN = output === 'EXECUTABLE' ? cls.exec : 0;
+  var fastN = selected.filter(function (t) {
+    return t && t._ft_suspended === true && t._grace_hold !== true;
+  }).length;
+  var researchN = Math.max(0, cls.suspended - fastN);
+  var title = 'SELECTED — ' + execN + ' EXECUTABLE TICKET' + (execN === 1 ? '' : 'S') +
+      (fastN > 0 ? ' + ' + fastN + ' FAST-TRACK (SIZING SUSPENDED)' : '') +
+      (researchN > 0 ? ' + ' + researchN + ' RESEARCH (NO ALLOCATION)' : '') +
+      (cls.grace > 0 ? ' + ' + cls.grace + ' GRACE-HELD (NO PLAN TODAY)' : '');
+  var uv = p._dt10_uv || {};
+  if (showFeed && uv.state !== 'EXECUTABLE') {
+    var qualN = cls.exec + cls.suspended;
+    return '\u26d4 FEED NOT ACTIONABLE \u2014 ' + String(uv.reason || 'verdict unknown') +
+        ' \u2014 SELECTED \u2014 0 EXECUTABLE / ' + qualN + ' QUALIFIED PLAN' +
+        (qualN === 1 ? '' : 'S') +
+        (cls.grace > 0 ? ' + ' + cls.grace + ' GRACE-HELD (NO PLAN TODAY)' : '') +
+        ' \u2014 SIZING WITHHELD';
+  }
+  var finalState = output === 'EXECUTABLE' ? 'EXECUTABLE' :
+      (cls.total > 0 || output === 'QUALIFIED_UNFUNDED' ? 'HELD' : 'NO_TRADE');
+  if (!showFeed) return finalState + ' \u2014 ' + title;
+  return (finalState === 'EXECUTABLE' ? '\u2705' : '\u2139') +
+      ' FEED ACTIONABLE \u2014 ' + finalState +
+      (uv.ageMin != null ? ' (verdict age ' + Math.round(uv.ageMin) + 'm)' : '') +
+      ' \u2014 ' + title;
 }
 
 function dt10StatusLine_(status, extra, output) {
@@ -5848,59 +5965,14 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   nearMiss = _p142.nearMiss;
   alerts = _p142.alerts;
   var cands = payload.candidates_rows || [];
-  // SELECTED
-  // v1.6.7 (D-1): separate the two classes in the TITLE. A grace-held ghost
-  // has no entry/ticket/stop/TP - calling it an executable ticket is what
-  // misled a reader on 2026-07-27.
-  /* v1.11.1: exec (funded, not held) / fast-track suspended (seat filled,
-   * sizing withheld under strict) / grace ghost. A suspended seat is never
-   * titled as an executable ticket (2026-09-03 13:09 board). */
-  var dt10Cls = dt10TicketClasses_(selected);
-  var dt10ExecN = dt10Cls.exec, dt10GraceN = dt10Cls.grace,
-      dt10SuspN = dt10Cls.suspended;
-  var dt10FastN = selected.filter(function (t) { return t._ft_suspended === true && t._grace_hold !== true; }).length;
-  var dt10ResearchN = Math.max(0, dt10SuspN - dt10FastN);
-  var dt10SelTitle;
-  if (dt10GraceN > 0 || dt10SuspN > 0) {
-    dt10SelTitle = 'SELECTED — ' + dt10ExecN + ' EXECUTABLE TICKET' +
-        (dt10ExecN === 1 ? '' : 'S') +
-        (dt10FastN > 0 ? ' + ' + dt10FastN +
-            ' FAST-TRACK (SIZING SUSPENDED)' : '') +
-        (dt10ResearchN > 0 ? ' + ' + dt10ResearchN + ' RESEARCH (NO ALLOCATION)' : '') +
-        (dt10GraceN > 0 ? ' + ' + dt10GraceN +
-            ' GRACE-HELD (NO PLAN TODAY)' : '');
-  } else {
-    dt10SelTitle = 'SELECTED — EXECUTABLE TICKETS (' + selected.length + ')';
-  }
-  /* v1.9.0 W1A-4a: consume the upstream verdict BEFORE any sizing is
-   * shown. Fail-closed: read/parse trouble withholds sizing. */
+  // SELECTED: finalization above already applied funding and feed controls.
+  // The upstream token may label input readiness but never invent a ticket.
   var dt10Uv = payload._dt10_uv;
+  var dt10SelTitle = dt10SelectedTitle_(payload, dt10UvOn_());
   if (dt10UvOn_()) {
-    if (dt10Uv.state !== 'EXECUTABLE') {
-      /* v1.9.1 (IR-089): under a blocked feed nothing is executable —
-       * recount the embedded title as qualified PLANS (review Q1).
-       * Wording only; gate + sizing blanking below are untouched. */
-      var dt10QualN = dt10ExecN + dt10SuspN;   /* v1.11.1: seats with/without sizing */
-      dt10SelTitle = 'SELECTED \u2014 0 EXECUTABLE / ' + dt10QualN +
-          ' QUALIFIED PLAN' + (dt10QualN === 1 ? '' : 'S') +
-          (dt10GraceN > 0 ? ' + ' + dt10GraceN +
-              ' GRACE-HELD (NO PLAN TODAY)' : '');
-      dt10SelTitle = '\u26d4 FEED NOT ACTIONABLE \u2014 ' + dt10Uv.reason +
-          ' \u2014 ' + dt10SelTitle + ' \u2014 SIZING WITHHELD';
-      Logger.log('[DT10 v' + DT10_VERSION + '] \u26d4 upstream verdict: ' +
-          dt10Uv.reason);
-    } else {
-      /* v1.10.1: DECLARE the feed state on EVERY render, not only when
-       * blocked — decision.feed_banner_present has exit-2 authority and
-       * the healthy state must not render silently. Both finder tokens
-       * (FEED + ACTIONABLE), never the blocked phrase. */
-      dt10SelTitle = '\u2705 FEED ACTIONABLE \u2014 EXECUTABLE' +
-          (dt10Uv.ageMin != null ? ' (verdict age ' +
-              Math.round(dt10Uv.ageMin) + 'm)' : '') +
-          ' \u2014 ' + dt10SelTitle;
-      Logger.log('[DT10 v' + DT10_VERSION +
-          '] \u2705 upstream verdict: EXECUTABLE');
-    }
+    Logger.log('[DT10 v' + DT10_VERSION + '] upstream verdict: ' +
+        (dt10Uv.state === 'EXECUTABLE' ? 'EXECUTABLE' : dt10Uv.reason) +
+        '; final board: ' + dt10OutputStatus_(payload));
   }
   payload._dt10_uv = dt10Uv;   /* v1.11.1: the verdict the render acted on */
   /* v1.11.6 [K-1b]: the withheld-truth KPI pass runs HERE, where the
@@ -6532,6 +6604,27 @@ function dt10SelfTest() {
         ekB.state.symbols['E.US'].co === 2 && ekB.state.date === '2026-09-26')
        ? 'ok' : 'FAIL [' + ek1.key + '/' + ek1.src + ' ' + ek2.key + '/' + ek2.src +
          ' ' + ek3.key + ' ' + ek4.key + ' ' + ek7.key + ' ' + ek8.key + ']'));
+  /* v1.13.1 [TFB-01/02]: synthetic adapter and final-state smoke checks.
+     They do not attest provider validity or the installed request/board. */
+  var qpHeader = ['Symbol', 'Current Price', 'Data Provider', 'provider',
+                  'acquisition_quote_asof', 'Last Updated (Riyadh)'];
+  var qpRow = dt10PoolRowFromSheetRow_(
+      ['SYNTH.US', 25, 'eodhd', 'yahoo_chart', '2026-10-09T20:00:00Z',
+       '2026-10-10 09:00:00'], dt10MapHeaderCols_(qpHeader), 'Global_Markets');
+  report.push('quote projection core: ' +
+      ((qpRow && qpRow['Data Provider'] === 'eodhd' && qpRow.provider === 'yahoo_chart' &&
+        qpRow.acquisition_quote_asof === '2026-10-09T20:00:00Z' &&
+        qpRow['Last Updated (Riyadh)'] === '2026-10-10 09:00:00' &&
+        !Object.prototype.hasOwnProperty.call(qpRow, 'Last Updated (UTC)'))
+       ? 'ok (provider/witness aliases retained; clock basis unchanged)' : 'FAIL'));
+  var btHeld = dt10SelectedTitle_({selected: [{_grace_hold: true, suggested_shares: 0}],
+      kpis: {passed: 0}, _dt10_uv: {state: 'EXECUTABLE'}}, true);
+  var btEmpty = dt10SelectedTitle_({selected: [], kpis: {passed: 0},
+      _dt10_uv: {state: 'EXECUTABLE'}}, true);
+  report.push('final banner core: ' +
+      ((btHeld.indexOf('FEED ACTIONABLE — HELD') >= 0 &&
+        btEmpty.indexOf('FEED ACTIONABLE — NO_TRADE') >= 0)
+       ? 'ok (grace HELD; empty NO_TRADE)' : 'FAIL'));
   /* v1.11.12 [P-181b]: the four timing-gate fields project from a GM-shaped
      header and travel on the pool row; the legacy filter drops exactly them. */
   var w52Hdr = ['Symbol', 'Name', 'Current Price', '52W High', '52W Low',
