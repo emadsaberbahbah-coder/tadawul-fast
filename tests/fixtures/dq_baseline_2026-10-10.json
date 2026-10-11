@@ -1,0 +1,1318 @@
+{
+ "asof": "2026-10-10",
+ "checks": {
+  "DQ-01": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX": 453,
+    "Global_Markets": 6609,
+    "Market_Leaders": 255,
+    "Mutual_Funds": 2474
+   }
+  },
+  "DQ-02": {
+   "count": 2760,
+   "status": "WARN",
+   "values": {
+    "Calendar_Events": 614,
+    "Commodities_FX": 146,
+    "Global_Markets": 140,
+    "Insights_Analysis": 887,
+    "Market_Leaders": 94,
+    "Mutual_Funds": 225,
+    "Top_10_Investments": 154,
+    "_Cash_Snapshot": 39,
+    "_Portfolio_CostBasis": 461
+   }
+  },
+  "DQ-03": {
+   "count": 61.44,
+   "status": "WARN",
+   "values": {
+    "allocated_cells": 6143692,
+    "allocated_pct": 61.44
+   }
+  },
+  "DQ-04": {
+   "count": 22487265,
+   "status": "INFO",
+   "values": {
+    "export_bytes": 22487265
+   }
+  },
+  "DQ-05": {
+   "count": 11,
+   "status": "FAIL",
+   "values": {
+    "known_n": 39,
+    "tabs_n": 50
+   }
+  },
+  "DQ-06": {
+   "count": 1,
+   "status": "FAIL",
+   "values": {
+    "dictionary_rows": 831,
+    "ghost_rows": 115
+   }
+  },
+  "DQ-07": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX": 115,
+    "Global_Markets": 115,
+    "Investable Symbol": 115,
+    "Market_Leaders": 115,
+    "Mutual_Funds": 115,
+    "My_Portfolio": 122
+   }
+  },
+  "DQ-08": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX": 0,
+    "Global_Markets": 0,
+    "Market_Leaders": 0,
+    "Mutual_Funds": 0
+   }
+  },
+  "DQ-09": {
+   "count": 5,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX": 4,
+    "Global_Markets": 1,
+    "Mutual_Funds": 5
+   }
+  },
+  "DQ-10": {
+   "count": 14,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX": 0,
+    "Global_Markets": 3,
+    "Market_Leaders": 0,
+    "Mutual_Funds": 11
+   }
+  },
+  "DQ-11": {
+   "count": 519,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:blank": 0,
+    "Commodities_FX:distinct": 8,
+    "Commodities_FX:variant_groups": 0,
+    "Commodities_FX:variant_minority_rows": 0,
+    "Global_Markets:blank": 76,
+    "Global_Markets:distinct": 4,
+    "Global_Markets:variant_groups": 1,
+    "Global_Markets:variant_minority_rows": 441,
+    "Market_Leaders:blank": 0,
+    "Market_Leaders:distinct": 2,
+    "Market_Leaders:variant_groups": 0,
+    "Market_Leaders:variant_minority_rows": 0,
+    "Mutual_Funds:blank": 0,
+    "Mutual_Funds:distinct": 3,
+    "Mutual_Funds:variant_groups": 1,
+    "Mutual_Funds:variant_minority_rows": 2
+   }
+  },
+  "DQ-12": {
+   "count": 4676,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:blank": 293,
+    "Commodities_FX:gics_only_rows": 0,
+    "Commodities_FX:other": 159,
+    "Commodities_FX:violations": 453,
+    "Commodities_FX:yahoo_only": 1,
+    "Global_Markets:blank": 231,
+    "Global_Markets:gics_only_rows": 11,
+    "Global_Markets:other": 4,
+    "Global_Markets:violations": 4622,
+    "Global_Markets:yahoo_only": 4387,
+    "Market_Leaders:blank": 1,
+    "Market_Leaders:gics_only_rows": 117,
+    "Market_Leaders:other": 0,
+    "Market_Leaders:violations": 54,
+    "Market_Leaders:yahoo_only": 53,
+    "Mutual_Funds:blank": 0,
+    "Mutual_Funds:gics_only_rows": 0,
+    "Mutual_Funds:other": 2474,
+    "Mutual_Funds:violations": 2474,
+    "Mutual_Funds:yahoo_only": 0
+   }
+  },
+  "DQ-13": {
+   "count": 52,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:canonical": 229,
+    "Commodities_FX:minority": 7,
+    "Commodities_FX:placeholder": 0,
+    "Global_Markets:canonical": 4939,
+    "Global_Markets:minority": 30,
+    "Global_Markets:placeholder": 4,
+    "Market_Leaders:canonical": 0,
+    "Market_Leaders:minority": 0,
+    "Market_Leaders:placeholder": 0,
+    "Mutual_Funds:canonical": 2434,
+    "Mutual_Funds:minority": 11,
+    "Mutual_Funds:placeholder": 0
+   }
+  },
+  "DQ-14": {
+   "count": 1,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:blank": 0,
+    "Commodities_FX:distinct": 51,
+    "GBX_rows": 147,
+    "Global_Markets:blank": 75,
+    "Global_Markets:distinct": 30,
+    "Market_Leaders:blank": 0,
+    "Market_Leaders:distinct": 1,
+    "Mutual_Funds:blank": 0,
+    "Mutual_Funds:distinct": 1,
+    "fx_table_codes": 55,
+    "gap_rows": 13,
+    "subunit_pairs": 2
+   }
+  },
+  "DQ-15": {
+   "count": 275,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX": 10,
+    "Commodities_FX:identity_quarantined_tag_rows": 0,
+    "Commodities_FX:price_unavailable": 10,
+    "Commodities_FX:share_pct": 2.21,
+    "Global_Markets": 211,
+    "Global_Markets:identity_quarantined": 74,
+    "Global_Markets:identity_quarantined_tag_rows": 83,
+    "Global_Markets:price_unavailable": 134,
+    "Global_Markets:share_pct": 3.19,
+    "Global_Markets:untagged": 3,
+    "Market_Leaders": 0,
+    "Market_Leaders:identity_quarantined_tag_rows": 0,
+    "Market_Leaders:share_pct": 0.0,
+    "Mutual_Funds": 54,
+    "Mutual_Funds:identity_quarantined_tag_rows": 0,
+    "Mutual_Funds:price_unavailable": 54,
+    "Mutual_Funds:share_pct": 2.18
+   }
+  },
+  "DQ-16": {
+   "count": 10,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:altsymbol": 2,
+    "Commodities_FX:misclassed_crypto": 7,
+    "Commodities_FX:name_mismatch": 7,
+    "Global_Markets:altsymbol": 0,
+    "Global_Markets:misclassed_crypto": 0,
+    "Global_Markets:name_mismatch": 0,
+    "Market_Leaders:altsymbol": 0,
+    "Market_Leaders:misclassed_crypto": 0,
+    "Market_Leaders:name_mismatch": 0,
+    "Mutual_Funds:altsymbol": 0,
+    "Mutual_Funds:misclassed_crypto": 0,
+    "Mutual_Funds:name_mismatch": 0,
+    "union_rows": 8
+   }
+  },
+  "DQ-17": {
+   "count": 11,
+   "status": "FAIL",
+   "values": {
+    "dividend_rows": 4,
+    "ledger_lots": 7,
+    "lots_total": 39
+   }
+  },
+  "DQ-18": {
+   "count": 3,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:low_gt_high": 0,
+    "Commodities_FX:outside": 2,
+    "Global_Markets:low_gt_high": 0,
+    "Global_Markets:outside": 1,
+    "Market_Leaders:low_gt_high": 0,
+    "Market_Leaders:outside": 0,
+    "Mutual_Funds:low_gt_high": 0,
+    "Mutual_Funds:outside": 0
+   }
+  },
+  "DQ-19": {
+   "count": 8,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:above_high": 0,
+    "Commodities_FX:below_low": 3,
+    "Commodities_FX:position_mismatch": 3,
+    "Commodities_FX:sentinel": 0,
+    "Global_Markets:above_high": 0,
+    "Global_Markets:below_low": 1,
+    "Global_Markets:position_mismatch": 1,
+    "Global_Markets:sentinel": 0,
+    "Market_Leaders:above_high": 0,
+    "Market_Leaders:below_low": 0,
+    "Market_Leaders:position_mismatch": 0,
+    "Market_Leaders:sentinel": 0,
+    "Mutual_Funds:above_high": 0,
+    "Mutual_Funds:below_low": 0,
+    "Mutual_Funds:position_mismatch": 0,
+    "Mutual_Funds:sentinel": 0
+   }
+  },
+  "DQ-20": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX:checked": 436,
+    "Commodities_FX:mismatch": 0,
+    "Global_Markets:checked": 6355,
+    "Global_Markets:mismatch": 0,
+    "Market_Leaders:checked": 255,
+    "Market_Leaders:mismatch": 0,
+    "Mutual_Funds:checked": 2398,
+    "Mutual_Funds:mismatch": 0
+   }
+  },
+  "DQ-21": {
+   "count": 81,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:older_24h": 7,
+    "Commodities_FX:unstamped": 0,
+    "Global_Markets:older_24h": 0,
+    "Global_Markets:unstamped": 74,
+    "Market_Leaders:older_24h": 0,
+    "Market_Leaders:unstamped": 0,
+    "Mutual_Funds:older_24h": 0,
+    "Mutual_Funds:unstamped": 0
+   }
+  },
+  "DQ-22": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX:stale": 4,
+    "Commodities_FX:unblocked": 0,
+    "Global_Markets:stale": 64,
+    "Global_Markets:unblocked": 0,
+    "Market_Leaders:stale": 2,
+    "Market_Leaders:unblocked": 0,
+    "Mutual_Funds:stale": 28,
+    "Mutual_Funds:unblocked": 0,
+    "stale_total": 98
+   }
+  },
+  "DQ-23": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX:bad": 0,
+    "Commodities_FX:ok": 453,
+    "Global_Markets:bad": 0,
+    "Global_Markets:ok": 6535,
+    "Market_Leaders:bad": 0,
+    "Market_Leaders:ok": 255,
+    "Mutual_Funds:bad": 0,
+    "Mutual_Funds:ok": 2474
+   }
+  },
+  "DQ-24": {
+   "count": 795,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:gross_gt1": 0,
+    "Commodities_FX:gross_ltm1": 0,
+    "Commodities_FX:gross_n": 1,
+    "Commodities_FX:gross_oob": 0,
+    "Commodities_FX:operating_gt1": 0,
+    "Commodities_FX:operating_ltm1": 0,
+    "Commodities_FX:operating_n": 1,
+    "Commodities_FX:operating_oob": 0,
+    "Commodities_FX:profit_gt1": 0,
+    "Commodities_FX:profit_ltm1": 0,
+    "Commodities_FX:profit_n": 1,
+    "Commodities_FX:profit_oob": 0,
+    "Commodities_FX:rows_frac_tag": 1,
+    "Commodities_FX:rows_pts_tag": 0,
+    "Commodities_FX:tag_frac": 3,
+    "Global_Markets:gross_gt1": 32,
+    "Global_Markets:gross_ltm1": 75,
+    "Global_Markets:gross_n": 5976,
+    "Global_Markets:gross_oob": 74,
+    "Global_Markets:operating_gt1": 25,
+    "Global_Markets:operating_ltm1": 559,
+    "Global_Markets:operating_n": 6276,
+    "Global_Markets:operating_oob": 504,
+    "Global_Markets:profit_gt1": 114,
+    "Global_Markets:profit_ltm1": 213,
+    "Global_Markets:profit_n": 6243,
+    "Global_Markets:profit_oob": 204,
+    "Global_Markets:rows_frac_tag": 3930,
+    "Global_Markets:rows_pts_tag": 3290,
+    "Global_Markets:tag_frac": 10151,
+    "Global_Markets:tag_frac_amb": 46,
+    "Global_Markets:tag_oob": 65,
+    "Global_Markets:tag_pts": 8525,
+    "Global_Markets:tag_pts_thin": 65,
+    "Market_Leaders:gross_gt1": 0,
+    "Market_Leaders:gross_ltm1": 0,
+    "Market_Leaders:gross_n": 254,
+    "Market_Leaders:gross_oob": 0,
+    "Market_Leaders:operating_gt1": 2,
+    "Market_Leaders:operating_ltm1": 10,
+    "Market_Leaders:operating_n": 254,
+    "Market_Leaders:operating_oob": 8,
+    "Market_Leaders:profit_gt1": 1,
+    "Market_Leaders:profit_ltm1": 8,
+    "Market_Leaders:profit_n": 253,
+    "Market_Leaders:profit_oob": 5,
+    "Market_Leaders:rows_frac_tag": 254,
+    "Market_Leaders:rows_pts_tag": 10,
+    "Market_Leaders:tag_frac": 748,
+    "Market_Leaders:tag_pts": 13,
+    "Mutual_Funds:gross_gt1": 0,
+    "Mutual_Funds:gross_ltm1": 0,
+    "Mutual_Funds:gross_n": 0,
+    "Mutual_Funds:gross_oob": 0,
+    "Mutual_Funds:operating_gt1": 0,
+    "Mutual_Funds:operating_ltm1": 0,
+    "Mutual_Funds:operating_n": 2,
+    "Mutual_Funds:operating_oob": 0,
+    "Mutual_Funds:profit_gt1": 0,
+    "Mutual_Funds:profit_ltm1": 0,
+    "Mutual_Funds:profit_n": 2,
+    "Mutual_Funds:profit_oob": 0,
+    "Mutual_Funds:rows_frac_tag": 3,
+    "Mutual_Funds:rows_pts_tag": 0,
+    "Mutual_Funds:tag_frac": 5
+   }
+  },
+  "DQ-25": {
+   "count": 80,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:gt10": 0,
+    "Commodities_FX:gt100": 0,
+    "Commodities_FX:gt10_untagged": 0,
+    "Commodities_FX:n": 0,
+    "Commodities_FX:negative": 0,
+    "Global_Markets:gt10": 88,
+    "Global_Markets:gt100": 3,
+    "Global_Markets:gt10_untagged": 80,
+    "Global_Markets:n": 5881,
+    "Global_Markets:negative": 285,
+    "Market_Leaders:gt10": 1,
+    "Market_Leaders:gt100": 0,
+    "Market_Leaders:gt10_untagged": 0,
+    "Market_Leaders:n": 232,
+    "Market_Leaders:negative": 0,
+    "Mutual_Funds:gt10": 0,
+    "Mutual_Funds:gt100": 0,
+    "Mutual_Funds:gt10_untagged": 0,
+    "Mutual_Funds:n": 0,
+    "Mutual_Funds:negative": 0
+   }
+  },
+  "DQ-26": {
+   "count": 11,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX": 0,
+    "Global_Markets": 9,
+    "Market_Leaders": 1,
+    "Mutual_Funds": 1
+   }
+  },
+  "DQ-27": {
+   "count": 211,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:beta_gt10": 0,
+    "Commodities_FX:beta_gt5": 0,
+    "Commodities_FX:beta_max": 2.18,
+    "Commodities_FX:beta_min": 0.361,
+    "Commodities_FX:beta_n": 2,
+    "Commodities_FX:growth_gt1_5": 0,
+    "Commodities_FX:growth_gt20": 0,
+    "Commodities_FX:growth_n": 0,
+    "Global_Markets:beta_gt10": 9,
+    "Global_Markets:beta_gt5": 40,
+    "Global_Markets:beta_max": 545.588,
+    "Global_Markets:beta_min": -3669.127,
+    "Global_Markets:beta_n": 5843,
+    "Global_Markets:growth_gt1_5": 171,
+    "Global_Markets:growth_gt20": 24,
+    "Global_Markets:growth_max": 127584.267,
+    "Global_Markets:growth_n": 5860,
+    "Market_Leaders:beta_gt10": 0,
+    "Market_Leaders:beta_gt5": 0,
+    "Market_Leaders:beta_max": 0.856,
+    "Market_Leaders:beta_min": -0.472,
+    "Market_Leaders:beta_n": 236,
+    "Market_Leaders:growth_gt1_5": 0,
+    "Market_Leaders:growth_gt20": 0,
+    "Market_Leaders:growth_max": 1.298,
+    "Market_Leaders:growth_n": 248,
+    "Mutual_Funds:beta_gt10": 0,
+    "Mutual_Funds:beta_gt5": 0,
+    "Mutual_Funds:beta_max": 1.5,
+    "Mutual_Funds:beta_min": -0.16,
+    "Mutual_Funds:beta_n": 34,
+    "Mutual_Funds:growth_gt1_5": 0,
+    "Mutual_Funds:growth_gt20": 0,
+    "Mutual_Funds:growth_n": 0
+   }
+  },
+  "DQ-28": {
+   "count": 1370,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:between_0_1": 0,
+    "Commodities_FX:n": 6,
+    "Commodities_FX:zero": 0,
+    "Commodities_FX:zero_with_valuation": 0,
+    "Global_Markets:between_0_1": 57,
+    "Global_Markets:n": 5389,
+    "Global_Markets:zero": 1369,
+    "Global_Markets:zero_with_valuation": 1222,
+    "Market_Leaders:between_0_1": 0,
+    "Market_Leaders:n": 185,
+    "Market_Leaders:zero": 0,
+    "Market_Leaders:zero_with_valuation": 0,
+    "Mutual_Funds:between_0_1": 0,
+    "Mutual_Funds:n": 108,
+    "Mutual_Funds:zero": 1,
+    "Mutual_Funds:zero_with_valuation": 0
+   }
+  },
+  "DQ-29": {
+   "count": 72,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX": 3,
+    "Global_Markets": 59,
+    "Market_Leaders": 0,
+    "Mutual_Funds": 10
+   }
+  },
+  "DQ-30": {
+   "count": 360,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:at_dq100": 0,
+    "Commodities_FX:at_dq100_investable": 0,
+    "Commodities_FX:garbage_rows": 0,
+    "Global_Markets:at_dq100": 358,
+    "Global_Markets:at_dq100_investable": 6,
+    "Global_Markets:garbage_rows": 395,
+    "Market_Leaders:at_dq100": 2,
+    "Market_Leaders:at_dq100_investable": 0,
+    "Market_Leaders:garbage_rows": 3,
+    "Mutual_Funds:at_dq100": 0,
+    "Mutual_Funds:at_dq100_investable": 0,
+    "Mutual_Funds:garbage_rows": 0
+   }
+  },
+  "DQ-31": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX:12M_checked": 345,
+    "Commodities_FX:12M_mismatch": 0,
+    "Commodities_FX:1M_checked": 348,
+    "Commodities_FX:1M_mismatch": 0,
+    "Commodities_FX:3M_checked": 346,
+    "Commodities_FX:3M_mismatch": 0,
+    "Global_Markets:12M_checked": 5287,
+    "Global_Markets:12M_mismatch": 0,
+    "Global_Markets:1M_checked": 5284,
+    "Global_Markets:1M_mismatch": 0,
+    "Global_Markets:3M_checked": 5271,
+    "Global_Markets:3M_mismatch": 0,
+    "Market_Leaders:12M_checked": 230,
+    "Market_Leaders:12M_mismatch": 0,
+    "Market_Leaders:1M_checked": 225,
+    "Market_Leaders:1M_mismatch": 0,
+    "Market_Leaders:3M_checked": 229,
+    "Market_Leaders:3M_mismatch": 0,
+    "Mutual_Funds:12M_checked": 2414,
+    "Mutual_Funds:12M_mismatch": 0,
+    "Mutual_Funds:1M_checked": 2410,
+    "Mutual_Funds:1M_mismatch": 0,
+    "Mutual_Funds:3M_checked": 2414,
+    "Mutual_Funds:3M_mismatch": 0
+   }
+  },
+  "DQ-32": {
+   "count": 1238,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:12M": 96,
+    "Commodities_FX:1M": 93,
+    "Commodities_FX:3M": 95,
+    "Commodities_FX:rows_tagged_12m": 443,
+    "Commodities_FX:tag_synth_observe": 1329,
+    "Global_Markets:12M": 1111,
+    "Global_Markets:1M": 1114,
+    "Global_Markets:3M": 1127,
+    "Global_Markets:rows_tagged_12m": 5784,
+    "Global_Markets:tag_synth_observe": 9687,
+    "Global_Markets:tag_t12_observe": 7665,
+    "Market_Leaders:12M": 25,
+    "Market_Leaders:1M": 30,
+    "Market_Leaders:3M": 26,
+    "Market_Leaders:rows_tagged_12m": 167,
+    "Market_Leaders:tag_synth_observe": 498,
+    "Market_Leaders:tag_t12_observe": 3,
+    "Mutual_Funds:12M": 6,
+    "Mutual_Funds:1M": 10,
+    "Mutual_Funds:3M": 6,
+    "Mutual_Funds:rows_tagged_12m": 2420,
+    "Mutual_Funds:tag_synth_observe": 7260
+   }
+  },
+  "DQ-33": {
+   "count": 153,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX": 0,
+    "Commodities_FX:at_cap": 0,
+    "Global_Markets": 153,
+    "Global_Markets:at_cap": 3,
+    "Global_Markets:capped_tag": 153,
+    "Global_Markets:roi12_max": 0.65599,
+    "Global_Markets:roi12_min": 0.350205,
+    "Global_Markets:source_provider_target": 153,
+    "Global_Markets:status_BLOCKED": 5,
+    "Global_Markets:status_INVESTABLE": 3,
+    "Global_Markets:status_WATCHLIST": 145,
+    "Market_Leaders": 0,
+    "Market_Leaders:at_cap": 4,
+    "Mutual_Funds": 0,
+    "Mutual_Funds:at_cap": 0
+   }
+  },
+  "DQ-34": {
+   "count": 9,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:board": 0,
+    "Commodities_FX:field_expected_roi_12m": 96,
+    "Commodities_FX:field_expected_roi_1m": 93,
+    "Commodities_FX:field_expected_roi_3m": 95,
+    "Commodities_FX:field_upside_pct": 4,
+    "Commodities_FX:holdings": 0,
+    "Commodities_FX:investable": 0,
+    "Commodities_FX:rows": 109,
+    "Global_Markets:board": 0,
+    "Global_Markets:field_expected_roi_12m": 1107,
+    "Global_Markets:field_expected_roi_1m": 1114,
+    "Global_Markets:field_expected_roi_3m": 1126,
+    "Global_Markets:field_upside_pct": 468,
+    "Global_Markets:holdings": 0,
+    "Global_Markets:investable": 7,
+    "Global_Markets:rows": 1618,
+    "Market_Leaders:board": 1,
+    "Market_Leaders:field_expected_roi_12m": 25,
+    "Market_Leaders:field_expected_roi_1m": 30,
+    "Market_Leaders:field_expected_roi_3m": 26,
+    "Market_Leaders:field_upside_pct": 18,
+    "Market_Leaders:holdings": 0,
+    "Market_Leaders:investable": 1,
+    "Market_Leaders:rows": 51,
+    "Mutual_Funds:board": 0,
+    "Mutual_Funds:field_expected_roi_12m": 6,
+    "Mutual_Funds:field_expected_roi_1m": 10,
+    "Mutual_Funds:field_expected_roi_3m": 6,
+    "Mutual_Funds:holdings": 0,
+    "Mutual_Funds:investable": 0,
+    "Mutual_Funds:rows": 18,
+    "My_Portfolio:rows": 0,
+    "qualified_hits": 1,
+    "rows_total": 1796
+   }
+  },
+  "DQ-35": {
+   "count": 103,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:investable": 0,
+    "Commodities_FX:investable_total": 1,
+    "Commodities_FX:rows": 0,
+    "Global_Markets:investable": 103,
+    "Global_Markets:investable_total": 170,
+    "Global_Markets:rows": 2555,
+    "Market_Leaders:investable": 0,
+    "Market_Leaders:investable_total": 2,
+    "Market_Leaders:rows": 1,
+    "Mutual_Funds:investable": 0,
+    "Mutual_Funds:investable_total": 0,
+    "Mutual_Funds:rows": 0,
+    "investable_hours_max": 162,
+    "investable_hours_median": 21
+   }
+  },
+  "DQ-36": {
+   "count": 9514,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:label_unknown_tag": 0,
+    "Commodities_FX:mismatch": 443,
+    "Commodities_FX:pairs_distinct": 1,
+    "Commodities_FX:reason_long": 443,
+    "Commodities_FX:reason_month": 0,
+    "Commodities_FX:reason_year": 0,
+    "Global_Markets:label_unknown_tag": 6474,
+    "Global_Markets:mismatch": 6396,
+    "Global_Markets:pairs_distinct": 2,
+    "Global_Markets:reason_long": 0,
+    "Global_Markets:reason_month": 6396,
+    "Global_Markets:reason_year": 0,
+    "Market_Leaders:label_unknown_tag": 255,
+    "Market_Leaders:mismatch": 255,
+    "Market_Leaders:pairs_distinct": 1,
+    "Market_Leaders:reason_long": 0,
+    "Market_Leaders:reason_month": 255,
+    "Market_Leaders:reason_year": 0,
+    "Mutual_Funds:label_unknown_tag": 2421,
+    "Mutual_Funds:mismatch": 2420,
+    "Mutual_Funds:pairs_distinct": 1,
+    "Mutual_Funds:reason_long": 0,
+    "Mutual_Funds:reason_month": 2420,
+    "Mutual_Funds:reason_year": 0,
+    "My_Portfolio:365/3M": 4
+   }
+  },
+  "DQ-37": {
+   "count": 2618,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:delta_ge10": 19,
+    "Commodities_FX:delta_ge5": 87,
+    "Commodities_FX:flips": 54,
+    "Commodities_FX:flips_investable": 1,
+    "Commodities_FX:non_converged": 1,
+    "Commodities_FX:tagged": 443,
+    "Global_Markets:delta_ge10": 1011,
+    "Global_Markets:delta_ge5": 2981,
+    "Global_Markets:flips": 2185,
+    "Global_Markets:flips_investable": 43,
+    "Global_Markets:non_converged": 45,
+    "Global_Markets:tagged": 6397,
+    "Market_Leaders:delta_ge10": 63,
+    "Market_Leaders:delta_ge5": 126,
+    "Market_Leaders:flips": 85,
+    "Market_Leaders:flips_investable": 1,
+    "Market_Leaders:non_converged": 0,
+    "Market_Leaders:tagged": 254,
+    "Mutual_Funds:delta_ge10": 39,
+    "Mutual_Funds:delta_ge5": 463,
+    "Mutual_Funds:flips": 294,
+    "Mutual_Funds:flips_investable": 0,
+    "Mutual_Funds:non_converged": 0,
+    "Mutual_Funds:tagged": 2421,
+    "flips_total": 2618,
+    "non_converged_total": 46,
+    "pair_accumulate>hold": 164,
+    "pair_hold>reduce": 418,
+    "pair_reduce>sell": 319,
+    "pair_sell>reduce": 542,
+    "pair_sell>strong_sell": 239
+   }
+  },
+  "DQ-38": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "Commodities_FX:eligible_dq80_frs70": 0,
+    "Commodities_FX:invest_on_sell_class": 0,
+    "Commodities_FX:invest_rows": 1,
+    "Commodities_FX:investable_rows": 1,
+    "Commodities_FX:investable_without_price_or_fp12": 0,
+    "Commodities_FX:investable_without_roi12": 0,
+    "Global_Markets:eligible_dq80_frs70": 18,
+    "Global_Markets:invest_on_sell_class": 0,
+    "Global_Markets:invest_rows": 170,
+    "Global_Markets:investable_rows": 170,
+    "Global_Markets:investable_without_price_or_fp12": 0,
+    "Global_Markets:investable_without_roi12": 4,
+    "Market_Leaders:eligible_dq80_frs70": 0,
+    "Market_Leaders:invest_on_sell_class": 0,
+    "Market_Leaders:invest_rows": 2,
+    "Market_Leaders:investable_rows": 2,
+    "Market_Leaders:investable_without_price_or_fp12": 0,
+    "Market_Leaders:investable_without_roi12": 0,
+    "Mutual_Funds:eligible_dq80_frs70": 0,
+    "Mutual_Funds:invest_on_sell_class": 0,
+    "Mutual_Funds:invest_rows": 0,
+    "Mutual_Funds:investable_rows": 0,
+    "Mutual_Funds:investable_without_price_or_fp12": 0,
+    "Mutual_Funds:investable_without_roi12": 0
+   }
+  },
+  "DQ-39": {
+   "count": 6,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:dq_mode": 73.7,
+    "Commodities_FX:dq_mode_rows": 257,
+    "Commodities_FX:dq_mode_share": 0.5673,
+    "Commodities_FX:frs_mode": 31.3,
+    "Commodities_FX:frs_mode_rows": 176,
+    "Commodities_FX:frs_mode_share": 0.3885,
+    "Global_Markets:dq_mode": 100.0,
+    "Global_Markets:dq_mode_rows": 5866,
+    "Global_Markets:dq_mode_share": 0.8876,
+    "Global_Markets:frs_mode": 59.3,
+    "Global_Markets:frs_mode_rows": 1501,
+    "Global_Markets:frs_mode_share": 0.2271,
+    "Market_Leaders:dq_mode": 100.0,
+    "Market_Leaders:dq_mode_rows": 239,
+    "Market_Leaders:dq_mode_share": 0.9373,
+    "Market_Leaders:frs_mode": 64.0,
+    "Market_Leaders:frs_mode_rows": 10,
+    "Market_Leaders:frs_mode_share": 0.0392,
+    "Mutual_Funds:dq_mode": 73.7,
+    "Mutual_Funds:dq_mode_rows": 2356,
+    "Mutual_Funds:dq_mode_share": 0.9523,
+    "Mutual_Funds:frs_mode": 31.3,
+    "Mutual_Funds:frs_mode_rows": 2147,
+    "Mutual_Funds:frs_mode_share": 0.8678
+   }
+  },
+  "DQ-40": {
+   "count": 143,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:<blank>": 9,
+    "Commodities_FX:both_present_fallback": 6,
+    "Commodities_FX:investable_non_roi": 0,
+    "Commodities_FX:investable_non_roi_share": 0.0,
+    "Commodities_FX:investable_rows": 1,
+    "Commodities_FX:momentum_only_fallback": 352,
+    "Commodities_FX:roi_based": 86,
+    "Global_Markets:<blank>": 102,
+    "Global_Markets:both_present_fallback": 5107,
+    "Global_Markets:investable_non_roi": 143,
+    "Global_Markets:investable_non_roi_share": 0.8412,
+    "Global_Markets:investable_rows": 170,
+    "Global_Markets:momentum_only_fallback": 188,
+    "Global_Markets:roi_based": 1169,
+    "Market_Leaders:both_present_fallback": 2,
+    "Market_Leaders:investable_non_roi": 0,
+    "Market_Leaders:investable_non_roi_share": 0.0,
+    "Market_Leaders:investable_rows": 2,
+    "Market_Leaders:roi_based": 253,
+    "Mutual_Funds:<blank>": 38,
+    "Mutual_Funds:both_present_fallback": 106,
+    "Mutual_Funds:investable_non_roi": 0,
+    "Mutual_Funds:investable_non_roi_share": 0.0,
+    "Mutual_Funds:investable_rows": 0,
+    "Mutual_Funds:momentum_only_fallback": 2329,
+    "Mutual_Funds:roi_based": 1
+   }
+  },
+  "DQ-41": {
+   "count": 6533,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:distinct": 22,
+    "Commodities_FX:populated": 92,
+    "Global_Markets:distinct": 25,
+    "Global_Markets:populated": 6168,
+    "Market_Leaders:distinct": 25,
+    "Market_Leaders:populated": 253,
+    "Mutual_Funds:distinct": 14,
+    "Mutual_Funds:populated": 106
+   }
+  },
+  "DQ-42": {
+   "count": 18,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:peg_blank": 1.0,
+    "Commodities_FX:provider_rating_eq_analyst": 1.0,
+    "Commodities_FX:provider_secondary_blank": 1.0,
+    "Commodities_FX:reco_detail_eq_reco": 1.0,
+    "Commodities_FX:row_source_blank": 1.0,
+    "Global_Markets:peg_blank": 0.749,
+    "Global_Markets:provider_rating_eq_analyst": 1.0,
+    "Global_Markets:provider_secondary_blank": 1.0,
+    "Global_Markets:reco_detail_eq_reco": 1.0,
+    "Global_Markets:row_source_blank": 1.0,
+    "Market_Leaders:peg_blank": 0.9961,
+    "Market_Leaders:provider_rating_eq_analyst": 1.0,
+    "Market_Leaders:provider_secondary_blank": 1.0,
+    "Market_Leaders:reco_detail_eq_reco": 1.0,
+    "Market_Leaders:row_source_blank": 1.0,
+    "Mutual_Funds:peg_blank": 1.0,
+    "Mutual_Funds:provider_rating_eq_analyst": 1.0,
+    "Mutual_Funds:provider_secondary_blank": 1.0,
+    "Mutual_Funds:reco_detail_eq_reco": 1.0,
+    "Mutual_Funds:row_source_blank": 1.0
+   }
+  },
+  "DQ-43": {
+   "count": 9413635,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:mean_len": 714.3,
+    "Commodities_FX:mean_tags": 16.7,
+    "Commodities_FX:rows_gt20_tags": 1,
+    "Commodities_FX:total_chars": 323576,
+    "Global_Markets:mean_len": 1052.5,
+    "Global_Markets:mean_tags": 24.0,
+    "Global_Markets:rows_gt20_tags": 6150,
+    "Global_Markets:total_chars": 6956079,
+    "Market_Leaders:mean_len": 981.6,
+    "Market_Leaders:mean_tags": 21.3,
+    "Market_Leaders:rows_gt20_tags": 177,
+    "Market_Leaders:total_chars": 250304,
+    "Mutual_Funds:mean_len": 761.4,
+    "Mutual_Funds:mean_tags": 17.9,
+    "Mutual_Funds:rows_gt20_tags": 3,
+    "Mutual_Funds:total_chars": 1883676
+   }
+  },
+  "DQ-44": {
+   "count": 9514,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX:mean_len": 149.8,
+    "Commodities_FX:rows_gt120": 443,
+    "Commodities_FX:total_chars": 67868,
+    "Global_Markets:mean_len": 156.0,
+    "Global_Markets:rows_gt120": 6396,
+    "Global_Markets:total_chars": 1030940,
+    "Market_Leaders:mean_len": 156.7,
+    "Market_Leaders:rows_gt120": 255,
+    "Market_Leaders:total_chars": 39967,
+    "Mutual_Funds:mean_len": 151.5,
+    "Mutual_Funds:rows_gt120": 2420,
+    "Mutual_Funds:total_chars": 374827
+   }
+  },
+  "DQ-45": {
+   "count": 0,
+   "status": "INFO",
+   "values": {
+    "board_seats": 10,
+    "exec_seats": 0,
+    "grace": 6,
+    "pending": 9,
+    "qualified": 13,
+    "suspended": 4
+   }
+  },
+  "DQ-46": {
+   "count": 3,
+   "status": "FAIL",
+   "values": {
+    "action_rows": 4,
+    "block_rows": 4,
+    "consecutive_block_runs": 3,
+    "kpi_blank": 6,
+    "kpi_cells": 10,
+    "log_runs": 153
+   }
+  },
+  "DQ-47": {
+   "count": 3,
+   "status": "FAIL",
+   "values": {
+    "default_pf_max_position_pct": 15.0,
+    "default_pf_max_sector_pct": 30.0,
+    "default_t10_max_per_sector": 2.0,
+    "default_t10_period_months": 12.0,
+    "default_t10_require_investable": 0,
+    "info_t10_period_months": 3.0,
+    "info_t10_require_investable": 1,
+    "max_per_sector_panel": 2.0,
+    "max_per_sector_policy": 3.0,
+    "pf_max_position_pct_panel": 20.0,
+    "pf_max_position_pct_policy": 10.0,
+    "pf_max_sector_pct_panel": 30.0,
+    "pf_max_sector_pct_policy": 40.0
+   }
+  },
+  "DQ-48": {
+   "count": 940,
+   "status": "FAIL",
+   "values": {
+    "conflict_no": 350,
+    "conflict_yes": 150,
+    "first_fail_blank": 13,
+    "first_fail_eligibility_venue": 2,
+    "first_fail_investability": 325,
+    "first_fail_quote_freshness": 32,
+    "first_fail_reliability": 126,
+    "first_fail_risk_reward": 2,
+    "news_neutral": 50,
+    "news_positive": 10,
+    "news_unknown": 440,
+    "news_unknown_share": 0.88,
+    "rows": 500,
+    "sector_trend_unknown": 500,
+    "sector_trend_unknown_share": 1.0,
+    "verdict_do_not_invest": 477,
+    "verdict_invest": 13,
+    "verdict_watch": 10
+   }
+  },
+  "DQ-49": {
+   "count": 108,
+   "status": "FAIL",
+   "values": {
+    "board_covered": 8,
+    "board_total": 10,
+    "calendar_rows": 385,
+    "cohort": 177,
+    "coverage_share": 0.3898,
+    "covered": 69,
+    "dated_rows": 383,
+    "earnings_rows": 383,
+    "exdiv_rows": 17,
+    "holdings_covered": 3,
+    "holdings_total": 4,
+    "invest_covered": 67,
+    "invest_total": 173,
+    "shell_rows": 2
+   }
+  },
+  "DQ-50": {
+   "count": 13,
+   "status": "FAIL",
+   "values": {
+    "cash_floor": 0.0,
+    "missing_fx": 13.0,
+    "missing_valuation": 3486.0,
+    "price_xcheck": 13.0
+   }
+  },
+  "DQ-51": {
+   "count": 4,
+   "status": "FAIL",
+   "values": {
+    "actual_weight_blank": 4,
+    "holdings": 4,
+    "rebalance_action_blank": 4,
+    "target_weight_blank": 4,
+    "weight_gap_blank": 4
+   }
+  },
+  "DQ-52": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "extra_in_view": 0,
+    "invest_rows": 173,
+    "missing_from_view": 0,
+    "view_grid_rows": 300,
+    "view_rows": 173
+   }
+  },
+  "DQ-53": {
+   "count": 4,
+   "status": "FAIL",
+   "values": {
+    "holdings": 4,
+    "mv_blank": 4,
+    "stop_blank": 4,
+    "tp1_blank": 4,
+    "tp2_blank": 4,
+    "weight_blank": 4
+   }
+  },
+  "DQ-54": {
+   "count": 6,
+   "status": "FAIL",
+   "values": {
+    "lots": 39
+   }
+  },
+  "DQ-55": {
+   "count": 58,
+   "status": "FAIL",
+   "values": {
+    "buy_fees_populated": 6,
+    "lots": 39,
+    "sell_fees_populated": 10,
+    "sold_lots": 35
+   }
+  },
+  "DQ-56": {
+   "count": 1,
+   "status": "FAIL",
+   "values": {
+    "fx_blank": 0,
+    "usd_lots": 25
+   }
+  },
+  "DQ-57": {
+   "count": 199,
+   "status": "FAIL",
+   "values": {
+    "amount_blank_on_snapshots": 58,
+    "certification_errors": 7,
+    "delta_blank": 59,
+    "duplicate_dates": 2,
+    "identical_note_rows": 56,
+    "records": 59,
+    "snapshot_rows": 58,
+    "stale_note_rows": 14,
+    "time_blank": 59
+   }
+  },
+  "DQ-58": {
+   "count": 1,
+   "status": "FAIL",
+   "values": {
+    "duplicate_keys": 1,
+    "rows": 9
+   }
+  },
+  "DQ-59": {
+   "count": 5,
+   "status": "FAIL",
+   "values": {
+    "fills_since_program_v2": 5,
+    "notes": 0
+   }
+  },
+  "DQ-60": {
+   "count": 0,
+   "status": "PASS",
+   "values": {
+    "active_lots": 4,
+    "unpriced_lots": 0
+   }
+  },
+  "DQ-61": {
+   "count": 21670,
+   "status": "FAIL",
+   "values": {
+    "distinct_keys": 7801,
+    "max_rows_per_pair": 19,
+    "pairs": 7801,
+    "rows": 29471
+   }
+  },
+  "DQ-62": {
+   "count": 117,
+   "status": "FAIL",
+   "values": {
+    "matured": 11791,
+    "mixed_units": 1,
+    "realized_gt_1_5": 7980,
+    "realized_le_1_5": 3811,
+    "records": 20585,
+    "target_gt_1_5": 117,
+    "target_le_1_5": 20468
+   }
+  },
+  "DQ-63": {
+   "count": 30,
+   "status": "FAIL",
+   "values": {
+    "dead_columns": 3,
+    "duplicate_matured_keys": 27,
+    "factor_exposures_empty": 20585,
+    "factor_exposures_empty_share": 1.0,
+    "hold_entry_rows": 14321,
+    "records": 20585
+   }
+  },
+  "DQ-64": {
+   "count": 792,
+   "status": "WARN",
+   "values": {
+    "breakeven": 205,
+    "investable_3m_loss": 79,
+    "investable_3m_win": 39,
+    "investable_3m_win_share": 0.3305,
+    "loss": 6218,
+    "matured": 11791,
+    "target_hit": 4576,
+    "target_hit_checked": 11791,
+    "target_hit_column_present": 0,
+    "target_hit_share": 0.3881,
+    "win": 5368,
+    "win_rate_sign_share": 0.4633
+   }
+  },
+  "DQ-65": {
+   "count": 426,
+   "status": "FAIL",
+   "values": {
+    "action_log_outcome_filled": 0,
+    "action_log_rows": 402,
+    "selection_outcome_filled": 184,
+    "selection_overdue": 426,
+    "selection_rows": 2209
+   }
+  },
+  "DQ-66": {
+   "count": 1847,
+   "status": "FAIL",
+   "values": {
+    "glyph_cells": 2984,
+    "junk_rows": 115,
+    "legacy_timestamp_rows": 78,
+    "market_cap_numeric_share": 0.0,
+    "non_numeric_rows": 1740,
+    "pe_numeric_share": 0.0,
+    "price_numeric_share": 0.0,
+    "rows": 1847,
+    "rows_legacy_window": 654,
+    "snapshot_dates": 80
+   }
+  },
+  "DQ-67": {
+   "count": 6,
+   "status": "FAIL",
+   "values": {
+    "hypotheses": 6,
+    "insufficient_data": 6,
+    "sample_zero": 6
+   }
+  },
+  "DQ-68": {
+   "count": 55,
+   "status": "WARN",
+   "values": {
+    "compliance_block_open": 55,
+    "fork_compliance_block": 55,
+    "fork_edge_below_cost": 1,
+    "fork_floor_lock": 30,
+    "forks": 86,
+    "scored_on_blank": 86
+   }
+  },
+  "DQ-69": {
+   "count": 94,
+   "status": "FAIL",
+   "values": {
+    "days": 75,
+    "saudi_rows": 151,
+    "unknown_days": 65,
+    "unknown_rows": 94,
+    "unknown_share": 0.6225
+   }
+  },
+  "DQ-70": {
+   "count": 1506,
+   "status": "WARN",
+   "values": {
+    "duplicate_severity_spellings": 1,
+    "endpoint_rows": 1777,
+    "http_code_coverage_share": 0.1536,
+    "http_code_populated": 273,
+    "kind_datetime": 13697,
+    "kind_iso_naive_string": 315,
+    "kind_iso_tz_string": 1782,
+    "kind_unparseable": 1,
+    "level_error": 4,
+    "level_info": 11958,
+    "level_warn": 1304,
+    "level_warning": 2529,
+    "rows": 15795,
+    "unparseable": 1,
+    "unparseable_share": 0.0001
+   }
+  },
+  "DQ-71": {
+   "count": 3,
+   "status": "WARN",
+   "values": {
+    "page_rows": 8,
+    "stamp_formats": 2,
+    "stamp_naive": 2,
+    "stamp_tz_string": 6,
+    "status_ok": 1,
+    "status_spellings": 3,
+    "status_success": 1
+   }
+  },
+  "DQ-72": {
+   "count": 2,
+   "status": "FAIL",
+   "values": {
+    "Commodities_FX:coverage": 453.0,
+    "Commodities_FX:roi12_audit": 0.0,
+    "Global_Markets:coverage": 1500.0,
+    "Global_Markets:roi12_audit": 10.0,
+    "Global_Markets:roi12_dq33": 153,
+    "Market_Leaders:coverage": 255.0,
+    "Market_Leaders:roi12_audit": 0.0,
+    "Mutual_Funds:coverage": 1500.0,
+    "Mutual_Funds:roi12_audit": 0.0,
+    "My_Portfolio:coverage": 4.0,
+    "My_Portfolio:roi12_audit": 0.0
+   }
+  },
+  "DQ-73": {
+   "count": 43,
+   "status": "WARN",
+   "values": {
+    "excluded_infra_days": 43,
+    "excluded_share": 0.7167,
+    "needed_days": 28,
+    "scored_days": 17
+   }
+  },
+  "DQ-74": {
+   "count": 194,
+   "status": "WARN",
+   "values": {
+    "events_402": 0,
+    "events_429": 194,
+    "events_502": 0,
+    "f404": 0,
+    "f429": 0,
+    "fb429": 144,
+    "http_rows_402": 0,
+    "http_rows_429": 0,
+    "http_rows_502": 0,
+    "plan_limit": 400000,
+    "quote_http_429": 50,
+    "rows402_new": 0,
+    "window_hours": 48,
+    "window_rows": 554
+   }
+  },
+  "DQ-75": {
+   "count": 1,
+   "status": "WARN",
+   "values": {
+    "Commodities_FX_budget_share": 0.0905,
+    "Commodities_FX_ms": 325751.0,
+    "Global_Markets_budget_share": 0.9049,
+    "Global_Markets_ms": 3257721.0,
+    "Market_Leaders_budget_share": 0.0559,
+    "Market_Leaders_ms": 201115.0,
+    "Mutual_Funds_budget_share": 0.3729,
+    "Mutual_Funds_ms": 1342390.0,
+    "budget_ms": 3600000
+   }
+  }
+ },
+ "expect": {
+  "Commodities_FX": 453,
+  "Global_Markets": 6609,
+  "Market_Leaders": 255,
+  "Mutual_Funds": 2474
+ },
+ "export_sha256": "f5d327afc9fb409ccc1200ec3580c81b53d2b9bcda91ac9a2bd7929466c905c3",
+ "script": "tfb_workbook_dq_audit",
+ "version": "1.0.0"
+}

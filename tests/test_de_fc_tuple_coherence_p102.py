@@ -19,7 +19,6 @@ from __future__ import annotations
 import copy
 import inspect
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

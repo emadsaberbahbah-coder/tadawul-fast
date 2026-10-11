@@ -89,7 +89,31 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
+# v1.5.0 (2026-10-11) [WP-0] — ENV-GATED LOCAL COPY OF THE EXPORTED BYTES.
+# WHY: the WP-0 DQ harness (scripts/tfb_workbook_dq_audit.py) must measure
+# the SAME bytes this job just exported, in the SAME job, without a second
+# Drive export and without ever turning the xlsx into a GitHub artifact (the
+# repository is public; the export carries portfolio quantities). Until now
+# `data` lived only in memory: export -> min-bytes check -> dry-run return or
+# upload; nothing was ever written to disk. v1.5.0 adds ONE additive helper,
+# _write_local_copy(data, sha), called after the TFB_BACKUP_MIN_BYTES check and
+# before the dry-run return (so dry runs also produce the copy when asked).
+# GATE: TFB_BACKUP_LOCAL_COPY = absolute file path (the workflow derives it
+# from the repo Variable TFB_DQ_AUDIT_MODE and places it under $RUNNER_TEMP).
+# UNSET / EMPTY (the default) -> the helper returns before any I/O or log line,
+# so v1.5.0 is byte-identical in behaviour to v1.4.0: export, upload,
+# retention, _Run_Log rows and every exit code are untouched. SET -> the
+# bytes are written with mode 0600 and one stderr line `local copy: <path>
+# (<bytes> bytes sha256=<12hex>)` is logged; ANY exception is logged as
+# `NOTE: local copy failed: ...` and never changes the return code. The
+# always() cleanup step of the workflow removes the file. Evidence that made
+# this necessary: 2026-10-10 export 22,487,265 bytes, 50 tabs (10 visible),
+# 9,791 live rows (255 / 6,609 / 453 / 2,474) measured by WP-0 — 275 rows
+# without a price, 153 ROI-12M soft-cap breaches, 2,618 F-7 flips, 21,670
+# duplicate Signal_History keys — none of which any workflow could see
+# because no step ever held the exported file. ROLLBACK: revert this file.
+#
 # v1.4.0 (2026-07-26) — OAUTH USER-DELEGATED DRIVE DESTINATION ("oauth").
 # WHY: the service account cannot own Drive files (storageQuotaExceeded,
 # run #8) and GCS needs billing, which is unavailable for individual
@@ -236,6 +260,30 @@ def _env_int(name: str, default: int) -> int:
 
 def _now_riyadh() -> _dt.datetime:
     return _dt.datetime.now(_RIYADH)
+
+
+def _write_local_copy(data: bytes, sha: str) -> None:
+    """v1.5.0 [WP-0]: write the exported bytes to TFB_BACKUP_LOCAL_COPY when set.
+
+    Unset or empty (the default) -> no I/O, no log line, nothing changes.
+    Set -> the file is written with mode 0600 for the same-job DQ audit step;
+    any failure is logged as a NOTE and never alters the backup's return code.
+    """
+    path = _env("TFB_BACKUP_LOCAL_COPY")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        _out(f"local copy: {path} ({len(data):,} bytes sha256={sha})")
+    except Exception as exc:  # noqa: BLE001 — a local copy must never fail the backup
+        _out(f"NOTE: local copy failed: {type(exc).__name__}: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -769,6 +817,8 @@ def run_backup(dry_run: bool) -> int:
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"bytes": len(data), "sha": sha})
         return 3
+
+    _write_local_copy(data, sha)      # v1.5.0 [WP-0]: no-op unless TFB_BACKUP_LOCAL_COPY is set
 
     if dry_run:
         _out("dry-run — export verified, nothing uploaded")

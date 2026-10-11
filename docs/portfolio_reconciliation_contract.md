@@ -106,3 +106,99 @@ the same private evidence separately. Until then its backend safely renders
 blocked research rows. No installation, live property/ledger/cash change,
 broker ingestion credential or trade is performed by this patch. Safe rollback
 is research-only operation; restoring unfunded legacy trust is unsafe.
+
+## Operator-maintained cash export template (v1.0.0)
+
+`_Cash_Snapshot` is an operator-maintained export-audit record. The backend and
+native Top10 do not read it for funding. The export audit certifies only the
+last appended cash record; it neither aggregates accounts nor falls back to
+an older valid row. Its default cash/FX age bound is 24 hours. This audit check
+is separate from the backend's 900-second account evidence requirement.
+
+Keep the seven v1.0.1 columns in their existing order and append the evidence
+columns; existing cash histories need not be rewritten:
+
+| Existing columns | Appended for every account | Also appended for non-SAR accounts |
+| --- | --- | --- |
+| Date, Time, Type, Amount SAR, Balance SAR, Delta vs Prev, Note | Account, Currency, Balance Type | Balance, FX to SAR, FX As Of |
+
+The audit accepts exactly these header names and aliases:
+
+| Field | Header names | Requirement |
+| --- | --- | --- |
+| Account scope | `Account`, `Account ID` | Nonblank explicit identity |
+| Native currency | `Currency`, `Ccy` | Three-letter currency |
+| Balance semantics | `Balance Type` | `settled_cash` (spaces are normalized to underscores) |
+| Full timestamp | `As Of`, `Timestamp` | Optional replacement for Date + Time; a populated invalid alias fails closed |
+| Legacy timestamp | `Date`, `Time` | Actual date and Time; explicit `00:00` is valid and a blank Time fails |
+| Native settled balance | `Balance`, `Native Balance` | Required for non-SAR; absent SAR native-balance headers use `Balance SAR` |
+| Recorded converted balance | `Balance SAR` | If populated, must equal native Balance × FX within 0.01 SAR |
+| Conversion rate | `FX to SAR` | Positive, explicit for non-SAR; SAR is exactly one |
+| FX vintage | `FX As Of` | Full timestamp for non-SAR, no later than the cash timestamp |
+
+`Type=SNAPSHOT`, note text, `Amount SAR` and `Delta vs Prev` do not establish
+settled cash. A custodian's “Available to Trade” figure is not accepted as
+`settled_cash` under the current contract. Settled and reserved amounts must be
+obtained separately for backend evidence; available funding remains settled
+minus reserved, with complete outstanding commitments captured once. The
+choice of per-account or consolidated export rows remains an owner decision;
+the current audit certifies one latest row and cannot certify a consolidated
+custody capture from that row alone.
+
+## Offline custodian capture builder (v1.0.0)
+
+`scripts/tfb_capture_evidence.py` writes only a validated schema-version 1
+evidence packet to an explicitly chosen local file. It calls the same pure
+certifier as `tfb_reconcile_portfolio.py`, keeps the 900-second bound, prints
+only nonidentifying status/counts, and atomically writes mode `0600`. Invalid
+captures leave an existing destination untouched. It contacts neither a broker
+nor a workbook and does not authenticate the declared source.
+
+For JSON, supply the existing offline review object: `holdings`,
+`reconciliation_evidence` (the exact packet shown above), and caller `fx_rates`
+(a currency-to-rate object). Explicit quantities, account coverage, instrument
+links, native settled cash, reserved cash and reservation completeness remain
+mandatory. The tool does not derive these facts from generic balances.
+
+```sh
+python scripts/tfb_capture_evidence.py custodian-capture.json \
+  --now 2026-10-09T09:01:00Z --max-age-check --output private-evidence.json
+```
+
+`--now` requires seconds and a timezone. The regular certification checks all
+positions, capture and FX timestamps, plus funding-account cash; the additional
+`--max-age-check` checks *every* account's declared cash timestamp too. Any
+timestamp older than 900 seconds, in the future or after capture fails. Exactly
+900 seconds is accepted. The historical clock is for review only: live callers
+must certify the original evidence again using the current server clock.
+
+For CSV, use a `record_type` column plus the union of the fields below. Blank
+unused cells are allowed; nonblank fields outside a record's listed fields,
+unknown/duplicate headers, missing fields and extra cells fail. One `capture`
+record is required. Records may appear in any order; `holding.row_index` must
+cover contiguous zero-based rows, matching My_Portfolio order. Booleans must
+be lowercase `true` or `false`; quantities, cash and rates retain their exact
+decimal strings. Explicit `caller_fx` records keep caller rates separate from
+FX evidence. SAR needs no market FX proof.
+
+| record_type | Required nonblank fields |
+| --- | --- |
+| `capture` | source_ref, captured_at |
+| `account` | account_id, positions_asof, positions_complete, cash_asof, cash_complete |
+| `position` | account_id, instrument_id, symbol, currency, quantity |
+| `cash` | account_id, currency, settled_cash, reserved_cash, reservations_complete |
+| `holding` | row_index, symbol, currency, quantity |
+| `link` | row_index, account_id, instrument_id, position_symbol, symbol, currency |
+| `funding` | account_id |
+| `fx` | currency, rate_to_sar, asof, source_ref |
+| `caller_fx` | currency, rate_to_sar |
+
+Replace the input extension with `.csv` or pass `--format csv` to use that
+mapping. Operator captures must originate at the real custodians; the tool
+supplies no credentials, origin witnesses, missing balances or timestamps.
+After private review, an authorized operator may populate document property
+`TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1` (maximum 9,000 characters) and arrange
+the separate Portfolio_Decision caller to forward it. `packet_bytes` in stdout
+is a size count for review; saving a packet does not install it or certify a
+later decision run. A packet above the property limit cannot be forwarded by
+the native Top10 transport.

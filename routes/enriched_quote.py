@@ -125,7 +125,7 @@ import time
 import uuid
 from datetime import date, datetime, time as dt_time
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
@@ -1281,7 +1281,7 @@ async def _call_with_tolerant_signatures(
             })
             last_error = exc
             continue
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
             call_summary.append({
                 "attempt_idx": attempt_idx,
                 "kwargs_keys": kwargs_keys,
@@ -2122,7 +2122,7 @@ async def headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]
 
 @router.post("/v1/enriched/quote")
 @router.post("/v1/enriched_quote/quote")
-@router.post("/v1/enriched-quote/quote")
+@router.post("/v1/enriched-quote/quote", operation_id="quote_post__v1_enriched_hyphen_alias")
 @router.post("/quote")
 async def quote_post(
     request: Request,
@@ -2225,7 +2225,7 @@ async def quotes_get(
 
 @router.post("/v1/enriched/sheet-rows")
 @router.post("/v1/enriched_quote/sheet-rows")
-@router.post("/v1/enriched-quote/sheet-rows")
+@router.post("/v1/enriched-quote/sheet-rows", operation_id="sheet_rows_post__v1_enriched_hyphen_alias")
 async def sheet_rows_post(
     request: Request,
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -2241,7 +2241,7 @@ async def sheet_rows_post(
 
 @router.get("/v1/enriched/sheet-rows")
 @router.get("/v1/enriched_quote/sheet-rows")
-@router.get("/v1/enriched-quote/sheet-rows")
+@router.get("/v1/enriched-quote/sheet-rows", operation_id="sheet_rows_get__v1_enriched_hyphen_alias")
 async def sheet_rows_get(
     request: Request,
     page: Optional[str] = Query(default=None),
@@ -2290,7 +2290,7 @@ async def sheet_rows_get(
 
 @router.post("/v1/enriched")
 @router.post("/v1/enriched_quote")
-@router.post("/v1/enriched-quote")
+@router.post("/v1/enriched-quote", operation_id="alias_root_post__v1_enriched_hyphen_alias")
 async def alias_root_post(
     request: Request,
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -2309,7 +2309,7 @@ async def alias_root_post(
 
 @router.get("/v1/enriched")
 @router.get("/v1/enriched_quote")
-@router.get("/v1/enriched-quote")
+@router.get("/v1/enriched-quote", operation_id="alias_root_get__v1_enriched_hyphen_alias")
 async def alias_root_get(
     request: Request,
     symbol: Optional[str] = Query(default=None),

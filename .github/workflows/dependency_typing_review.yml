@@ -1,0 +1,48 @@
+name: Dependency and typed-module review (advisory)
+
+# VERSION 1.0.0 (2026-10-11, WP-12)
+# WHY: the 2026-10-10 brief found exact dependency pins but no CVE review or
+# typed baseline. These read-only checks are advisory while their baseline is
+# reviewed. They install no credentials, write no workbook and arm no flags.
+
+on:
+  pull_request:
+    paths: ['requirements.txt', 'core/sheets/**', 'core/symbols/**', 'core/portfolio_reconciliation.py', 'core/execution_accounting.py', 'scripts/performance_math.py', 'pyrightconfig.json', '.github/workflows/dependency_typing_review.yml']
+  schedule:
+    - cron: '43 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Audit exact dependency pins
+        run: |
+          python -m pip install 'pip-audit==2.9.0'
+          pip-audit --requirement requirements.txt --no-deps --disable-pip
+  typed-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check the initial typed-module scope
+        run: |
+          python -m pip install 'pyright==1.1.405'
+          pyright --project pyrightconfig.json --level error

@@ -39,7 +39,6 @@ import csv
 import glob
 import os
 import sys
-import types
 import typing
 from typing import Any, Dict, List, Optional
 

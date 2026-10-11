@@ -9,7 +9,7 @@
  * Run: node tests/test_dt10_p145_grace_sizing.js [path-to-v1.11.9.gs] [path-to-base.gs]
  */
 var fs = require('fs'), vm = require('vm');
-var NEW_PATH = process.argv[2] || '16_Decision_Top10.gs';
+var NEW_PATH = process.argv[2] || require('path').join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs');
 var BASE_PATH = process.argv[3] || '';
 
 function ctx(props) {

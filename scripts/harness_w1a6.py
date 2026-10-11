@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.3.0  (2026-10-08)
+W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.4.0  (2026-10-11)
 ================================================================================
+v2.4.0: upstream readiness writes a separate diagnostic; it cannot promote
+  the final feed. Exercise real scoped writes, sticky final vetoes, absent
+  feeds, ordinary downgrades and API failures with a stateful Sheets boundary.
 v2.3.0: retained page fixtures use the current writer's explicit-offset format;
   an offsetless legacy clock is explicitly unverified rather than executable.
 v2.0.0 (external W1A-6 Deployment Audit adjudicated):
@@ -29,6 +32,7 @@ MODES:
 Exit code: 0 iff every executed check passes.
 """
 import contextlib
+from copy import deepcopy
 import csv
 import importlib.util
 import io
@@ -141,6 +145,59 @@ def rec_writer(**kw):
     sw = M.SheetsWriter()                      # REAL class, real __init__
     sw._get_service = lambda: rec              # third-party boundary only
     return rec, sw
+
+
+class UpstreamRecorder(GoogleClientRecorder):
+    """Apply bounded L:M writes and exact-range reads at the SDK boundary.
+
+    Earlier suites need only a call recorder. The veto checks also need the
+    current remote value so the real publisher's re-read is exercised.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.grid = deepcopy(self.grid)
+
+    def _ex(self, kind, kw):
+        self.calls.append((kind, kw))
+        outer = self
+
+        class _E:
+            def execute(self):
+                if kind in outer.fail:
+                    raise RuntimeError(f"simulated {kind} failure")
+                if kind == "get":
+                    match = re.fullmatch(r"'_Status'!L([0-9]+):M([0-9]+)", kw.get("range", ""))
+                    if match:
+                        return {"values": deepcopy(outer.grid[int(match[1]) - 1:int(match[2])])}
+                    return {"values": deepcopy(outer.grid)}
+                if kind == "update":
+                    match = re.fullmatch(r"'_Status'!L([0-9]+):M\1", kw.get("range", ""))
+                    if not match or kw.get("valueInputOption") != "RAW":
+                        raise AssertionError("upstream publication must be a bounded RAW pair")
+                    slot = int(match[1]) - 1
+                    while len(outer.grid) <= slot:
+                        outer.grid.append([])
+                    outer.grid[slot] = deepcopy(kw["body"]["values"][0])
+                    return {"updatedRows": 1}
+                raise AssertionError("upstream publication must never append")
+
+        return _E()
+
+    def value(self, key):
+        return next((row[1] for row in self.grid if len(row) == 2 and row[0] == key), None)
+
+
+def upstream_writer(**kwargs):
+    rec = UpstreamRecorder(**kwargs)
+    sw = M.SheetsWriter()
+    sw._get_service = lambda: rec
+    return rec, sw
+
+
+def written_key(rec, key):
+    values = [kw["body"]["values"][0] for kind, kw in rec.calls
+              if kind == "update" and kw["body"]["values"][0][0] == key]
+    return values[-1] if values else []
 
 
 GHDR = ["Symbol", "Open", "Day High", "Day Low", "Current Price", "Warnings"]
@@ -592,7 +649,7 @@ else:
 # =============================================================================
 print()
 print("=" * 78)
-print("S12 W1A-4a upstream verdict (v6.40.0) — pure compose + writer")
+print("S12 upstream readiness and final-veto ownership — pure compose + real writer")
 print("=" * 78)
 env(TFB_SYNC_UPSTREAM_VERDICT=None)
 check("S12.1 gate unset -> disabled (v6.39.5 byte-behaviour)",
@@ -609,7 +666,7 @@ ALL_OK = {p: ("OK", _now - 60) for p in
           ["Market_Leaders", "Global_Markets", "Commodities_FX",
            "Mutual_Funds"]}
 v, s = M._uv_compose(dict(ALL_OK), _now)
-check("S12.3 all four OK+fresh -> EXECUTABLE", v == "EXECUTABLE", v)
+check("S12.3 all four OK+fresh -> readiness composite (not final acceptance)", v == "EXECUTABLE", v)
 check("S12.4 summary lists all four abbreviations",
       all(t in s for t in ("ML:OK", "GM:OK", "CFX:OK", "MF:OK")), s)
 bad = dict(ALL_OK); bad["Global_Markets"] = ("STALE_COV", _now - 60)
@@ -647,7 +704,7 @@ res_gm = fresh_res(sheet_name="Global_Markets", status="success",
                    symbols_requested=6626)
 res_gm._stamp_meta = {"requested": 6626, "pre_persist_rows": 6626,
                       "klg_kept": 0}
-rec, sw = rec_writer(grid=UVGRID)
+rec, sw = upstream_writer(grid=UVGRID)
 M._write_upstream_verdict(sw, "SID", [res_gm])
 ups = [kw for k, kw in rec.calls if k == "update"]
 # v2.2.0 (sync v6.53.0): the writer now upserts a THIRD bounded key,
@@ -673,13 +730,15 @@ check("S12.11b capacity key: third bounded L6:M6 RAW update, UNKNOWN when "
 check("S12.12 new page key took first blank slot L4:M4, RAW",
       ups[0]["range"] == "'_Status'!L4:M4"
       and ups[0]["valueInputOption"] == "RAW", ups[0]["range"])
-check("S12.13 composite upserted at next blank L5:M5",
+check("S12.13 diagnostic upserted at next blank L5:M5",
       ups[1]["range"] == "'_Status'!L5:M5", ups[1]["range"])
 comp = ups[1]["body"]["values"][0]
-check("S12.14 composite key/value: GM fresh-OK but ML/CFX/MF missing "
+check("S12.14 diagnostic key/value: GM fresh-OK but ML/CFX/MF missing "
       "-> NOT_ACTIONABLE(missing:ML)",
-      comp[0] == "TFB Decision Feed"
+      comp[0] == "TFB Upstream Feed Diagnostic"
       and comp[1].startswith("NOT_ACTIONABLE(missing:ML)"), comp[1][:60])
+check("S12.14b absent final feed stays absent; no financial acceptance fabricated",
+      rec.value("TFB Decision Feed") is None and not written_key(rec, "TFB Decision Feed"))
 FULLGRID = [["Global Key", "Value"], ["Backend URL", "https://x"],
             ["TFB Feed Market_Leaders",
              f"OK | cov=100 | run=1 | {M._status_ts_str()}"],
@@ -690,22 +749,24 @@ FULLGRID = [["Global Key", "Value"], ["Backend URL", "https://x"],
             ["TFB Feed Global_Markets", "FAILED | cov=n/a | run=1 | "
              + M._status_ts_str()],
             ["TFB Decision Feed", "stale"], []]
-rec, sw = rec_writer(grid=FULLGRID)
+rec, sw = upstream_writer(grid=FULLGRID)
 M._write_upstream_verdict(sw, "SID", [res_gm])
-comp = [kw for k, kw in rec.calls if k == "update"
-        and kw["range"].endswith("L7:M7")][0]["body"]["values"][0]
+comp = written_key(rec, "TFB Upstream Feed Diagnostic")
 check("S12.15 overlay: this job's fresh GM:OK overrides stored FAILED; "
-      "other legs' keys honoured -> EXECUTABLE",
-      comp[1].startswith("EXECUTABLE"), comp[1][:70])
+      "other legs' keys honoured -> UPSTREAM_READY diagnostic",
+      len(comp) == 2 and comp[1].startswith("UPSTREAM_READY |")
+      and "final_acceptance=not_issued" in comp[1], str(comp)[:120])
+check("S12.15b healthy upstream cannot promote or rewrite the existing final feed",
+      rec.value("TFB Decision Feed") == "stale" and not written_key(rec, "TFB Decision Feed"))
 NOKEY = [["Wrong", "Block"], [], []]
-rec, sw = rec_writer(grid=NOKEY)
+rec, sw = upstream_writer(grid=NOKEY)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     M._write_upstream_verdict(sw, "SID", [res_gm])
 check("S12.16 layout self-check: unknown block -> refuse, loud, ZERO writes",
       not [1 for k, _ in rec.calls if k == "update"]
       and "self-check failed" in buf.getvalue())
-rec, sw = rec_writer(grid=UVGRID, fail=["update"])
+rec, sw = upstream_writer(grid=UVGRID, fail=["update"])
 buf = io.StringIO(); raised = None
 try:
     with contextlib.redirect_stdout(buf):
@@ -714,13 +775,48 @@ except Exception as e:
     raised = e
 check("S12.17 write failure: fail-open, no raise, loud ::warning::",
       raised is None and "::warning::" in buf.getvalue())
+
+for suffix, veto_run in (("current", os.getenv("GITHUB_RUN_ID") or "local"),
+                         ("other", "prior-final-run")):
+    for upstream_ok in (True, False):
+        veto = f"NOT_ACTIONABLE(final_publication) | run={veto_run} | coverage_failed"
+        blocked_grid = deepcopy(FULLGRID)
+        blocked_grid[6][1] = veto
+        result = res_gm if upstream_ok else fresh_res(sheet_name="Global_Markets", status="failed")
+        rec, sw = upstream_writer(grid=blocked_grid)
+        M._write_upstream_verdict(sw, "SID", [result])
+        check(f"S12.18-{suffix}-{upstream_ok}: final veto survives scoped readiness/failure writes",
+              rec.value("TFB Decision Feed") == veto
+              and not written_key(rec, "TFB Decision Feed")
+              and bool(written_key(rec, "TFB Upstream Feed Diagnostic")))
+
+for failure in ("get", "update"):
+    veto = "NOT_ACTIONABLE(final_publication) | run=prior-final-run | decision_failed"
+    blocked_grid = deepcopy(FULLGRID)
+    blocked_grid[6][1] = veto
+    rec, sw = upstream_writer(grid=blocked_grid, fail=[failure])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        M._write_upstream_verdict(sw, "SID", [res_gm])
+    check(f"S12.19-{failure}: API failure preserves exact final veto and is loud",
+          rec.value("TFB Decision Feed") == veto and "::warning::" in buf.getvalue()
+          and not written_key(rec, "TFB Decision Feed"))
+
+failed_gm = fresh_res(sheet_name="Global_Markets", status="failed")
+rec, sw = upstream_writer(grid=FULLGRID)
+M._write_upstream_verdict(sw, "SID", [failed_gm])
+check("S12.20 ordinary upstream failure can downgrade an existing non-final feed",
+      str(rec.value("TFB Decision Feed")).startswith("NOT_ACTIONABLE(failed:GM) |")
+      and str(rec.value("TFB Upstream Feed Diagnostic")).startswith("NOT_ACTIONABLE(failed:GM) |")
+      and len([1 for kind, kw in rec.calls if kind == "update"
+               and kw["body"]["values"][0][0] == "TFB Decision Feed"]) == 1)
 env(TFB_SYNC_UPSTREAM_VERDICT="0")
 
 # =============================================================================
 print()
 print("=" * 78)
 npass = sum(1 for _, ok, _ in RESULTS if ok)
-print(f"HARNESS v2.3.0 RESULT: {npass}/{len(RESULTS)} PASS"
+print(f"HARNESS v2.4.0 RESULT: {npass}/{len(RESULTS)} PASS"
       + (f"  ({len(SKIPPED)} suite(s) skipped)" if SKIPPED else ""))
 for n, ok, d in RESULTS:
     if not ok:

@@ -80,9 +80,8 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import os
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pytest
 
@@ -729,8 +728,10 @@ def _build_test_app(monkeypatch: pytest.MonkeyPatch, sr: Any) -> Any:
 
 
 def _find_sheet_rows_endpoints(app: Any) -> List[Tuple[str, str]]:
+    from main import _iter_effective_routes
+
     found: Set[Tuple[str, str]] = set()
-    for r in getattr(app.router, "routes", []) or []:
+    for r in _iter_effective_routes(getattr(app.router, "routes", []) or []):
         p = str(getattr(r, "path", "") or "")
         methods = {str(m).upper() for m in (getattr(r, "methods", None) or set())}
         if p.endswith("/sheet-rows"):

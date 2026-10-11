@@ -489,7 +489,7 @@ import re
 import threading
 import time
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import (
@@ -504,8 +504,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
-    cast,
 )
 
 try:

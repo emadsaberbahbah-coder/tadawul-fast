@@ -1,5 +1,5 @@
 """Frozen production-shaped rows prove acquisition truth across all surfaces."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest import mock
 import asyncio
 import copy

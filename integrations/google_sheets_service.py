@@ -66,7 +66,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -81,7 +80,6 @@ from typing import (
     Sequence,
     Set,
     Tuple,
-    Union,
 )
 
 # =============================================================================

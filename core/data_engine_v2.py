@@ -2,8 +2,249 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.151.8
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.154.0
 ================================================================================
+
+WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
+- Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
+  seams alongside default-off price precision, USX currency and crypto identity.
+- Route the late 12M softcap rounding through the shared precision contract;
+  use the actual price quantum for armed noise and idempotence bounds. All
+  flags unset retain the original rounding and publication behavior.
+
+WHY v5.153.0 - WP-2b SETTLE-UNRESOLVED PUBLICATION RULE (env TFB_SETTLE_UNRESOLVED
+= off | observe | enforce, explicit words only, default OFF -> byte-identical)
+- EVIDENCE (export 2026-10-10, sync run 38071484709; live rows ML 255 / GM
+  6,609 / CFX 453 / MF 2,474; WP-0 scripts/tfb_workbook_dq_audit.py v1.0.0
+  DQ-37 non_converged 0 / 45 / 1 / 0 = 46). Every one of the 46 rows carries
+  f7_settle_failed:non_converged (GM 45 + CFX IDRUSD=X), Scoring Errors
+  scoring_settlement JSON reason pass_limit with passes_run 3, Block Reason
+  'Scoring settlement failed; clean rebuild required', Final Action
+  DO_NOT_INVEST, blank Overall Score and Rank (Overall) and the tag
+  rank_skipped_settlement_failure. INVESTABLE among them: 0. Status GM 42
+  WATCHLIST + 3 BLOCKED (PMT.US, MOV.US, HAYW.US, all published HOLD) + CFX 1
+  WATCHLIST. Pass-1 overall on the 45 GM rows 13.65..65.12 (none reaches the
+  conservative 68 floor), IDRUSD=X 48.25. 44 of 45 GM rows are
+  provider_target + analyst_lkg + the short-horizon derivation cap tag, 43
+  with last-known r12 > 0.35, drifting monotonically within the 0.05 tolerance
+  each pass (AC.TO last diff op 70.31>70.16): a WP-3 symptom (hypothesis, not
+  code-traced), not a ranking fault. 5,809 rows settle only at pass 4 (ML 148
+  / GM 2,824 / CFX 431 / MF 2,406), so TFB_SCORING_SETTLE_MAX_PASSES stays 4:
+  the framework's 'cap at 3 passes' already IS the default (pass 1 + 3
+  re-passes, tags p3). Nothing here changes MAX_PASSES.
+- REFUTED PREMISES: (1) no INVESTABLE leak exists (0 of 46); what remains is
+  the publication posture (blanked scores, BLOCKED on 3 HOLD rows, a block
+  reason nobody can act on). (2) 'publish the last stable pass' has no object:
+  F7SettlementResult carries no row for non_converged, so the only basis
+  outside the loop is PASS 1 - the basis every observe-mode row publishes.
+  (3) TFB_SCORING_SETTLE=observe is already fail-closed for non_converged and
+  error (the non-stable branch runs before the mode check), so OFF of the new
+  gate reproduces today's holdback byte-for-byte.
+- off (unset): _f7_settle_pass runs the v5.152.0 lines unchanged.
+- observe: today's holdback values PLUS one countable tag composed from the
+  still-intact pass-1 row BEFORE the holdback blanks it:
+  settle_unresolved:observe:<pass_limit|oscillation>:p<n>:ov=<pass-1 overall>
+  :rc=<pass-1 recommendation> (AC.TO -> ...:pass_limit:p3:ov=52.11:rc=reduce).
+- enforce (non_converged only; status error stays fail-closed in EVERY mode):
+  _f7_settle_unresolved_publish keeps the pass-1 scores, forecast tuple,
+  opportunity source and recommendation, applies the intrinsic display cap,
+  withholds rank_overall, appends settle_unresolved:enforce:<reason>:p<n>:
+  ov=..:rc=.., KEEPS the scoring_settlement:{...} JSON in scoring_errors (the
+  tag is the countable read-back; first_diff / last_diff are the only per-row
+  drift evidence WP-0 / WP-3 need), turns an ADD-family action_flag / decision
+  into HOLD and, on a non-exit non-sell row, writes position_size_hint
+  'Hold existing; no new capital (scoring unresolved)'. It writes NO
+  f7_settle_failed receipt and no investability / final action / block
+  reason at settle time.
+- TAG-DRIVEN, MODE-INDEPENDENT READERS (exact prefix 'settle_unresolved:',
+  never the substring 'unresolved', which margin_publish receipts end with):
+  _apply_investability_gate gains a tier after Fix W: INVESTABLE ->
+  WATCHLIST / WATCH, reason 'Scoring unresolved after settlement passes
+  (settle_unresolved) -- research only, no new capital' (BLOCKED stays
+  BLOCKED, WATCHLIST keeps its own reason); because that reason is non-empty,
+  Fix AP rewrites a buy-family recommendation on the demoted row to HOLD at
+  every boundary (scores stay pass-1). _top10_row_is_eligible returns False;
+  _apply_rank_overall skips the row (rank None, rank_skipped_settle_unresolved);
+  _portfolio_decision returns HOLD and _compute_portfolio_fields turns an ADD
+  Rebalance Action into HOLD (an unresolved score never funds an ADD).
+  A later switch to off cannot promote a cached unresolved row. A fresh STABLE
+  settlement retires a stale settle_unresolved:* part and its
+  rank_skipped_settle_unresolved companion (L2 / KLG carried warnings), so the
+  row ranks again; no such part exists while the gate was never armed.
+- COMPANION SEAMS (same WP, other files): routes/analysis_sheet_rows.py 4.8.2
+  (the per-request rank withholds f7_settle_failed: / settle_unresolved:
+  rows), core/analysis/opportunity_builder.py 1.25.1 (settle_unresolved:
+  enforce:<reason> fails the Scoring Settlement gate MAJOR as
+  unresolved_<reason>), scripts/run_dashboard_sync.py 6.66.0 (WP-2c page rank
+  excludes both prefixes).
+- EXPECTED ENFORCE READ-BACK (hypothesis until the first enforce export):
+  f7_settle_failed:non_converged 46 -> 0, settle_unresolved:enforce: 0 -> 46,
+  blank Overall Score on them 46 -> 0, Rank (Overall) blank on all 46,
+  INVESTABLE among them 0 (by construction), BLOCKED among them expected <= 3,
+  decided by the base chain; 'clean rebuild required' 46 -> 0. The DQ-37 rc=
+  flip count (2,618) is not moved by this build (that is WP-12 #1). WP-0
+  DQ-37 must count settle_unresolved:* beside f7_settle_failed:non_converged.
+- Disclosure: surface_gate_states()['settle_unresolved'] (/health
+  engine_gates) and the [GUARDS] boot leg settle_unresolved=<mode>. Functions
+  added 8 (_f7_unresolved_mode, _f7_settle_unresolved_parts,
+  _f7_settle_unresolved, _f7_unresolved_part, _f7_unresolved_strip,
+  _f7_settle_unresolved_tag, _f7_unresolved_capital_hold,
+  _f7_settle_unresolved_publish), constants 6, removed 0. Rollback: unset
+  TFB_SETTLE_UNRESOLVED (= off) or git revert; rows already published under
+  enforce stay capped and unranked by their tag until a stable settlement
+  retires it (tag-driven by design).
+
+WHY v5.152.0 - WP-3ab FORECAST TUPLE PUBLISH SEAMS (env TFB_TUPLE_NOISE_RELEASE,
+TFB_ROI12_SOFTCAP_GATE, both off|observe|enforce, default OFF -> byte-identical)
+- EVIDENCE (export 2026-10-10, sync run 38071484709; live rows ML 255 / GM
+  6,609 / CFX 453 / MF 2,474). DQ-32: 1,238 rows publish Forecast Price 12M
+  with Expected ROI 12M BLANK (ML 25 / GM 1,111 / CFX 96 / MF 6); 1,234 of
+  them carry sheet_tuple_conflict:expected_roi_12m. The engine DID write the
+  ROI (_phase_ii_quality_forecast synth/honor branches, round(x, 6)) and the
+  sentry IS armed (eq_roi_backfill:expected_roi_12m:synth:observe on 1,182).
+  The blank is produced downstream by core/sheet_presentation.py
+  present_instrument_row: tolerance = max(0.000005, |implied| * 0.000001),
+  while forecast prices are written round(x, 4), so |FP/CP-1 - ROI| can reach
+  0.00005/cp + 5e-7, which exceeds 5e-6 for every cp < 10 (1,129 of the 1,238
+  blank rows are priced below 10). Classes: 1,190 noise (the reason text
+  roi12m=X.X% agrees with FP/CP-1 within 0.05 pp + 4-dp noise; ML 25 / GM
+  1,079 / CFX 80 / MF 6), 21 precision-limited (cp < 0.05; GM 5 / CFX 16),
+  20 fctuple_vintage:12m:observe (P-102's class), 4 acquisition_status:
+  preserved rows without a conflict tag, 3 whose reason disagrees beyond
+  _fc_tuple_tol (F-7 flip rows). DQ-38 residual: 4 INVESTABLE rows inside the
+  noise class. DQ-31 (identity within 1 pp): 0 mismatches on 230 / 5,287 /
+  345 / 2,414 pairs, max |FP/CP-1 - ROI| = 4.9999e-06 on every page -- the
+  presenter tolerance is exactly what partitions published from withheld.
+- DQ-33: 153 GM provider_target rows publish Expected ROI 12M in
+  0.350205..0.65599 (WATCHLIST 145 / BLOCKED 5 / INVESTABLE 3); 153/153 carry
+  analyst_lkg:<age>h and the short-horizon derivation cap tag, 0/153 carry
+  the Fix-O tag provider_target_12m_capped_to_phase_ii_ceiling. ROOT CAUSE
+  (ordering): _apply_phase_bb_sanity -> _cap_provider_target_forecasts (Fix
+  B / Fix O) runs BEFORE scoring and returns early because the target leg
+  failed on this run (forecast_source != provider_target); later, inside
+  _phase_ii_quality_forecast, _tgt_lkg_restore re-plants the CAPTURE-DAY
+  forecast_price_12m and forecast_source = provider_target, and the honor
+  branch writes the UNCAPPED return_12m (its +/-0.30 clamp bounds only the
+  derived 3M/1M legs). Nothing re-caps against today's price, so a price fall
+  re-opens the ceiling (AKAM.US: lkg fp12 146.8138 vs cp 106.95 -> 0.3727).
+  Corroboration: GM provider_target rows in (0.30, 0.35] split 140 Fix-O-
+  tagged without analyst_lkg (fresh, bounded) vs 498 analyst_lkg without the
+  Fix-O tag (late, unbounded, inside the band by luck); 7 GM + 1 ML
+  analyst_lkg rows sit below -0.30 likewise.
+- (b) _roi12_softcap(row), gate TFB_ROI12_SOFTCAP_GATE: at the publish
+  boundary, a provider_target row whose |FP12/CP-1| exceeds the Phase-II
+  ceiling (0.30) and was never bounded by Fix-O at today's price is mapped by
+  the SAME Fix-O curve cap + band*(1-exp(-excess/band)) (asymptote 0.30 +
+  TFB_PROVIDER_TARGET_SOFT_CAP_BAND, default 0.35; TFB_PROVIDER_TARGET_SOFT_CAP
+  off -> hard clamp to +/-0.30, mirroring Fix-O) to forecast_price_12m and
+  expected_roi_12m in lockstep (Fix-D identity: round(fp, 4) then
+  round((fp-cp)/cp, 6)); a percent-domain ROI is never scaled (P-102 rule).
+  PARITY WORDING: the seam compresses fp12_lkg/cp - 1 where fp12_lkg is the
+  capture-day price that was already soft-capped against THAT day's price,
+  whereas Fix-O on a fresh row compresses the raw target; the result is
+  therefore bounded by the Fix-O asymptote and AT OR BELOW the fresh-regime
+  value, monotone in fp12_lkg -- not "the same regime". Tags
+  r12_ceiling:<observe|enforce>:<hi|band> (hi = |ret| > asymptote, the DQ-33
+  breaches; band = ceiling < |ret| <= asymptote, <= 3.4 pp movement); the
+  split lets the owner choose narrow vs parity AFTER the observe read-back.
+  The idempotence guard is VALUE-CONDITIONED: a row carrying the Fix-O tag or
+  r12_ceiling:enforce* is skipped only while |ret| <= asymptote + 0.00005/cp
+  (the 4-dp rounding headroom), so a stale tag can never suppress a real
+  re-breach. Disclosed: the in-process row cache serves the SAME dict by
+  reference (Fix BC-3 precedent), so an enforce -> observe flip leaves
+  tagged, capped rows in cache until TTL.
+- (a) _tuple_noise_release(row), gate TFB_TUPLE_NOISE_RELEASE: for each ROI
+  leg (12m/3m/1m) whose stored fraction disagrees with FP/CP-1 by MORE than
+  the presenter tolerance (mirrored: max(5e-6, |implied|*1e-6)) but by no
+  more than noise_bound + 0.0005, where noise_bound = 0.00005/cp + 5e-7 (the
+  4-dp price / 6-dp ROI rounding noise) and 0.0005 is P-102's own tolerance
+  floor, publish the row's OWN fraction snapped to round(implied, 6) so the
+  always-on presenter check accepts it. Classes: round (diff <= noise_bound),
+  drift (noise_bound < diff <= noise_bound + 0.0005). Rows priced below 0.05
+  (noise_bound > 0.001 = 0.1 pp) are tagged tuple_noise:<h>:precision_limited
+  and NEVER rewritten (that is the TFB_PRICE_PRECISION read-back); a diff in
+  (noise_bound + 0.0005, _fc_tuple_tol] is tagged tuple_noise:<h>:gap and
+  never rewritten (0 rows today); above _fc_tuple_tol the leg is P-102's
+  vintage class and untouched. The release band is deliberately NARROW: the
+  wide _fc_tuple_tol (0.1002 at cp 0.10) would let enforce silently rewrite a
+  drifted ROI and hide it from DQ-31 by construction.
+  DOCTRINE: core/sheet_presentation.py ("publish the witnessed existing
+  numeric return after validation; never derive a new ROI") binds the
+  PRESENTER, which still only witnesses. The ENGINE already re-derives at the
+  boundary under P-102 enforce (_fc_tuple_coherence: row[roi_key] =
+  round(implied, 6)); (a) extends that precedent into the gap that P-102
+  tolerates and the presenter rejects. RETIREMENT CRITERION vs findings.json
+  "crypto-forecast-precision" (TFB_PRICE_PRECISION, ordered AFTER this build
+  and re-anchored on its SHA): once significant-digit price rounding is
+  enforced, tuple_noise:*:round counts fall toward 0 and
+  tuple_noise:*:precision_limited (21 today) must reach 0; (a) measures the
+  actual discrepancy, so it stays correct under either rounding regime. The
+  rounding sites inside _phase_ii_quality_forecast and
+  _cap_provider_target_forecasts are untouched; _r12_round_price is the ONE
+  forecast-price rounding this build adds (the symbol PRICE_PRECISION must
+  also redirect).
+- WIRING: one wrapper _publish_tuple_seams(row) runs (b) then (a), fail-open
+  per sub-seam, at the two FIRST-presentation sites only: _strict_project_row
+  (after _f7_settle_holdback, before present_instrument_row) and the
+  get_page_rows per-row loop (after _apply_analyst_trend_block). Both run
+  AFTER _apply_investability_gate, _margin_publish_contract,
+  _apply_reco_coherence, _apply_analyst_trend_block and the F-7 holdback, so
+  no decision field reads the changed values in this request (decision-
+  neutral by construction); at site #2 the seam precedes
+  _compute_portfolio_fields, _apply_news_veto and
+  _apply_surface_invariants_safe, none of which reads expected_roi_* or
+  forecast_price_* (grep: 0 hits). Engine Top_10 membership and order are
+  untouched (the direct block filters and ranks BEFORE projection and reads
+  only scores and the SIGN of the governing ROI); the readers that DO see
+  released or capped values are the published sheet's consumers (GAS
+  cockpit, opportunity_builder engine_roi_12m_pct). The Top_10 direct block
+  and the re-presentation sites (_strict_project_row_display,
+  _rows_matrix_from_rows, get_sheet_rows) are NOT touched: they re-present
+  rows already projected through site #1; the P-102/P-152 seam-distance
+  contracts are unaffected. Gate exposure: surface_gate_states() keys
+  roi12_softcap and tuple_noise_release (-> /health engine_gates) and the
+  [GUARDS] boot line fields r12_ceiling= and tuple_noise=. The tag vocabulary
+  r12_ceiling:* / tuple_noise:* contains none of the _REL_PATH_FORBIDDEN
+  substrings (the doc's roi12_softcap_applied would have triggered the
+  gate's reliability penalty).
+- NOT changed: scoring, Fix-O, the LKG store, the 3M/1M legs of late targets
+  (hard-cap regime; follow-up (f) belongs at the source), TFB_EQ_ROI_UNIT_
+  SENTRY (enforce must NOT be armed: tag-only here, x100 in
+  core/enriched_quote.normalize_rows), core/sheet_presentation.py,
+  core/enriched_quote.py, scripts/run_dashboard_sync.py, main.py;
+  scripts/verify_deployment.py takes the manifest pin only. Symbols in the
+  regression battery: 8150.SR, XXII.US, LSE.US (noise), SUI-USD (precision-
+  limited), GRC.US (vintage), AKAM.US, AC.TO, TMUS.US, WGO.US, PXLW.US,
+  PMT.US (ceiling). Functions added 7 (_tuple_noise_mode, _roi12_softcap_mode,
+  _r12_round_price, _roi12_softcap_target, _roi12_softcap,
+  _tuple_noise_release, _publish_tuple_seams), removed 0; constants added 11,
+  every one a literal defined before use. Rollback: unset both env (= off,
+  byte-identical) or git revert.
+- HEADER REPAIR (v5.139.0 precedent): the title read v5.151.8 while
+  __version__ was 5.151.9; both now read 5.152.0. Every prior WHY block is
+  preserved verbatim.
+
+WHY v5.152.0 - DEFAULT-OFF PRICE PRECISION (WP-03)
+- 2026-10-10 export: SHIB-USD at 5.47e-6 and COMP-USD publish zero
+  forecast prices; twelve other sub-cent rows lose significant digits.
+- TFB_PRICE_PRECISION unset/off retains each site's original round exactly.
+  Armed (1/true/on/yes), forecast/intrinsic prices below 10 keep at least
+  seven significant digits. Scoring uses the same leaf rounding contract.
+- Include six-decimal target_mean_price and target_price now: leaving those
+  anchors rounded would erase a tiny provider target before forecasts use it.
+  price_change, history/52-week quotes and position amounts keep their own
+  existing six-decimal contracts; return and score precision stay unchanged.
+- Expose price_precision in surface_gate_states and the GUARDS boot line.
+  Presentation permits only the actual price rounding quantum, not an
+  unbounded four-decimal allowance for tiny crypto/FX instruments.
+- Repair the stale title (5.151.8) to match the current module version.
+- WP-04: with TFB_OPP_FX_USX_SUBUNIT armed, recognize USX (USD cents)
+  in the existing shares/price-witnessed market-cap normalizer. The export
+  contains thirteen USX futures rows; unset keeps their old treatment.
+- WP-05: default-off TFB_CRYPTO_NAME_GATE checks known crypto names
+  on Yahoo fundamentals patches before merging them into an honest quote.
+  Observe logs; enforce discards only a conflicting patch. Seven wrong-name
+  crypto rows in the export motivate the separate operator quarantine step.
 
 WHY v5.151.8 - COMPLETE RESEARCH MEMBERSHIP
 - Reader-backed membership has an explicit complete/source receipt and never
@@ -3908,9 +4149,19 @@ from core.financial_units import (
 # v5.151.9: preserve a value-bound raw intrinsic model basis through F7;
 # compress only display values once, and never recapture a missing-price HOLD
 # as an upstream provider rating. Settlement failures remain fail-closed.
-__version__ = "5.151.9"
+# v5.152.0 (WP-3ab): publish-boundary tuple seams -- noise-class ROI release
+# and the 12M ceiling for keep-last-good targets; both gated, default off.
+# v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
+# non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
+# never ranked, never funded.
+__version__ = "5.154.0"
 
 from core.sheet_presentation import present_instrument_row
+from core.price_precision import (
+    price_precision_enabled as _price_precision_enabled,
+    price_round_half_quantum as _price_round_half_quantum,
+    round_price as _round_price,
+)
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -4904,6 +5155,7 @@ _SUBUNIT_PRICE_CURRENCIES: frozenset = frozenset({
     "GBX", "GBp",
     "ZAC", "ZAc",
     "ILA", "ILa",
+    "USX",
 })
 
 _SUBUNIT_MC_RATIO_LO: float = 0.5
@@ -4927,7 +5179,13 @@ def _normalize_subunit_market_cap(row: Dict[str, Any]) -> None:
         return
     if not _subunit_market_cap_normalize_enabled():
         return
-    if _safe_str(row.get("currency")) not in _SUBUNIT_PRICE_CURRENCIES:
+    currency = _safe_str(row.get("currency"))
+    if currency.upper() == "USX":
+        if (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() not in {
+                "1", "true", "yes", "on"}:
+            return
+        currency = "USX"  # only this unambiguous token folds; GBP/GBp stay distinct
+    if currency not in _SUBUNIT_PRICE_CURRENCIES:
         return
 
     # Idempotency: never divide twice within one pipeline run (the normalizer is
@@ -5188,7 +5446,7 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     upside_fraction = max(_INTRINSIC_UPSIDE_MIN_PCT / 100.0,
                           min(_INTRINSIC_UPSIDE_MAX_PCT / 100.0, upside_fraction))
 
-    row["intrinsic_value"] = round(intrinsic, 4)
+    row["intrinsic_value"] = _round_price(intrinsic)
     row["upside_pct"] = round(upside_fraction, 6)
 
 
@@ -5254,8 +5512,8 @@ def _intrinsic_display_values(cp: float, iv: float, upside: Any, policy: Mapping
         band_pp = policy["band_pp"]
         excess = (iv - ceiling) / cp * 100.0
         soft_pct = max_pct + band_pp * (1.0 - math.exp(-excess / band_pp))
-        return round(cp * (1.0 + soft_pct / 100.0), 4), round(soft_pct / 100.0, 6)
-    return round(ceiling, 4), round(max_pct / 100.0, 6)
+        return _round_price(cp * (1.0 + soft_pct / 100.0)), round(soft_pct / 100.0, 6)
+    return _round_price(ceiling), round(max_pct / 100.0, 6)
 
 
 def _intrinsic_display_basis(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
@@ -5315,8 +5573,9 @@ def _intrinsic_display_receipt_matches(row: Mapping[str, Any], policy: Mapping[s
             band is None or not 1 <= band <= 15 or type(policy.get("soft")) is not bool:
         return False
     upper_fraction = (max_pct + (band if policy["soft"] else 0)) / 100.0
-    upper_price = round(cp * (1 + upper_fraction), 4)
-    coherent = abs(upside - (iv - cp) / cp) <= .00005 / cp + .0000005
+    upper_price = _round_price(cp * (1 + upper_fraction))
+    half_quantum = _price_round_half_quantum(iv) if _price_precision_enabled() else .00005
+    coherent = abs(upside - (iv - cp) / cp) <= half_quantum / cp + .0000005
     return bool(signature and signature == basis.get("source_signature") and basis.get("policy") == policy
                 and iv <= upper_price and upside <= upper_fraction + .0000005 and coherent
                 and all(_intrinsic_display_number(basis.get(key)) is not None for key in ("display_intrinsic", "display_upside"))
@@ -5683,7 +5942,7 @@ def _top10_quality_filter_enabled() -> bool:
 # =============================================================================
 # v5.128.1 (audit P1-1/P1-4) — SHARED SURFACE-INVARIANT WRAPPER + STATE
 # =============================================================================
-_SAI_REQUIRED_VERSION = "1.4.1"   # v5.130.3 (F-01/F-02): engine<->module contract
+_SAI_REQUIRED_VERSION = "1.4.2"   # v5.152.0 (WP-04): optional USX currency contract
 _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
                               "error": ""}
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
@@ -5802,6 +6061,10 @@ def surface_gate_states() -> Dict[str, Any]:
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
             "fund_cache_stats": _fund_cache_stats(),                   # v5.150.0 (P-154c)
             "margin_publish": _margin_publish_mode(),                  # v5.151.0 (P-152)
+            "roi12_softcap": _roi12_softcap_mode(),                    # v5.152.0 (WP-3b)
+            "tuple_noise_release": _tuple_noise_mode(),                # v5.152.0 (WP-3a)
+            "settle_unresolved": _f7_unresolved_mode(),                # v5.153.0 (WP-2b)
+            "price_precision": "on" if _price_precision_enabled() else "off",  # v5.152.0
         }
     except Exception:
         return {}
@@ -5854,6 +6117,8 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return False
     if _f7_settle_failed(row):
+        return False
+    if _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never seats a board row
         return False
     if not _top10_quality_filter_enabled():
         return True
@@ -7388,6 +7653,197 @@ def _fc_tuple_release_factory_basis(row: Dict[str, Any], *, live_priced: bool, s
     row["warnings"] = kept if isinstance(row.get("warnings"), list) else "; ".join(kept)
 
 
+# =============================================================================
+# v5.152.0 (WP-3ab) -- PUBLISH-BOUNDARY TUPLE SEAMS (see WHY v5.152.0)
+# -----------------------------------------------------------------------------
+# Two display-only seams that run immediately before present_instrument_row at
+# the two FIRST-presentation sites (_strict_project_row, get_page_rows):
+#   (b) _roi12_softcap        gate TFB_ROI12_SOFTCAP_GATE   off|observe|enforce
+#   (a) _tuple_noise_release  gate TFB_TUPLE_NOISE_RELEASE  off|observe|enforce
+# Explicit words only ("1"/"true"/"on" read as off); unset = off = rows byte-
+# identical to v5.151.9. observe = countable tags, values untouched. enforce
+# changes only expected_roi_* (a) and forecast_price_12m/expected_roi_12m (b).
+# RULE: every module-level constant in this block is a LITERAL. The Phase-II
+# ceiling _PHASE_II_MAX_12M_ABS_RETURN, the Fix-O band helpers and
+# _soft_compress_excess are defined ~2,100 lines further down; they are
+# referenced inside function bodies only (call time), never at module level.
+# =============================================================================
+_TNR_ENV: str = "TFB_TUPLE_NOISE_RELEASE"
+_TNR_TAG: str = "tuple_noise"
+# Mirror of core/sheet_presentation.py present_instrument_row:
+#   tolerance = max(0.000005, abs(implied) * 0.000001)
+# The regression battery cross-checks this pair against the real presenter.
+_TNR_PRES_TOL_ABS: float = 0.000005
+_TNR_PRES_TOL_REL: float = 0.000001
+_TNR_PRICE_HALF_ULP: float = 0.00005    # forecast_price_* are written round(x, 4)
+_TNR_ROI_HALF_ULP: float = 0.0000005    # expected_roi_* are written round(x, 6)
+_TNR_MAX_NOISE: float = 0.001           # release only while 4-dp price noise moves the ROI by <= 0.1 pp (cp >= 0.05)
+_TNR_DRIFT_SLACK: float = 0.0005        # P-102's own tolerance floor (_fc_tuple_tol); the release band ends here
+_R12_ENV: str = "TFB_ROI12_SOFTCAP_GATE"
+_R12_TAG: str = "r12_ceiling"
+_R12_FIXO_TAG: str = "provider_target_12m_capped_to_phase_ii_ceiling"
+
+
+def _tuple_noise_mode() -> str:
+    """TFB_TUPLE_NOISE_RELEASE: off (default) | observe | enforce. Explicit
+    words only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_TNR_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _roi12_softcap_mode() -> str:
+    """TFB_ROI12_SOFTCAP_GATE: off (default) | observe | enforce. Explicit
+    words only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_R12_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _r12_round_price(x: float) -> float:
+    """Use the shared price contract at the late provider-target publish seam.
+    With price precision off, this remains exactly the legacy round(x, 4)."""
+    return _round_price(x, 4)
+
+
+def _roi12_softcap_target(ret: float, cap_abs: float, band: float) -> float:
+    """v5.152.0 (WP-3b): the pure Fix-O 12M mapping. |ret| <= cap_abs -> ret
+    unchanged; otherwise sign(ret) * (cap_abs + band*(1-exp(-excess/band)))
+    through the real _soft_compress_excess (band <= 0 -> exactly +/-cap_abs,
+    the v5.79.2 hard clamp). Monotone in ret, bounded by cap_abs + band."""
+    mag = abs(ret)
+    if mag <= cap_abs:
+        return ret
+    out = cap_abs + _soft_compress_excess(mag - cap_abs, band)
+    return out if ret >= 0.0 else -out
+
+
+def _roi12_softcap(row: Dict[str, Any]) -> int:
+    """v5.152.0 (WP-3b): bound a provider-target 12M leg that Fix-O never saw
+    at today's price (keep-last-good restore after _apply_phase_bb_sanity).
+    Returns 1 when the row was tagged (observe) or compressed (enforce), else
+    0. off -> 0 with no row access. Never raises (fail-open)."""
+    mode = _roi12_softcap_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    try:
+        if _safe_str(row.get("forecast_source")).lower() != "provider_target":
+            return 0
+        cp = _as_float(row.get("current_price"))
+        fp12 = _as_float(row.get("forecast_price_12m"))
+        if cp is None or cp <= 0 or fp12 is None or fp12 <= 0:
+            return 0
+        ret = (fp12 - cp) / cp
+        if not math.isfinite(ret):
+            return 0
+        cap_abs = _PHASE_II_MAX_12M_ABS_RETURN
+        if abs(ret) <= cap_abs + 1e-9:
+            return 0  # in band: Fix-O leaves these untouched as well
+        soft = _provider_target_soft_cap_enabled()
+        band = _provider_target_soft_cap_band() if soft else 0.0
+        asym = cap_abs + band
+        parts = _mpc_warning_parts(row)
+        bounded = _R12_FIXO_TAG in parts or any(p.startswith(_R12_TAG + ":enforce") for p in parts)
+        price_noise = (_price_round_half_quantum(fp12) if _price_precision_enabled()
+                       else _TNR_PRICE_HALF_ULP)
+        if bounded and abs(ret) <= asym + price_noise / cp + 1e-9:
+            return 0  # already bounded at today's price (value-conditioned idempotence guard)
+        cls = "hi" if abs(ret) > asym + 1e-9 else "band"
+        if mode != "enforce":
+            _v573_append_warning(row, "%s:observe:%s" % (_R12_TAG, cls))
+            return 1
+        new_ret = _roi12_softcap_target(ret, cap_abs, band)
+        new_fp = _r12_round_price(cp * (1.0 + new_ret))
+        row["forecast_price_12m"] = new_fp
+        stored = _as_float(row.get("expected_roi_12m"))
+        if stored is not None and abs(stored) <= _FCT_FRACTION_DOMAIN_MAX:
+            row["expected_roi_12m"] = round((new_fp - cp) / cp, 6)  # Fix-D lockstep; never invents a missing ROI
+        _v573_append_warning(row, "%s:enforce:%s" % (_R12_TAG, cls))
+        return 1
+    except Exception:
+        return 0
+
+
+def _tuple_noise_release(row: Dict[str, Any]) -> int:
+    """v5.152.0 (WP-3a): release an ROI leg the presenter withholds for 4-dp
+    price rounding noise. Per leg: skip when the stored fraction already sits
+    inside the presenter tolerance (published as-is), when it is absent (the
+    backfill's job), percent-domain (never scaled), or further than
+    _fc_tuple_tol from FP/CP-1 (P-102's vintage class). Inside that window:
+    cp < 0.05 -> tuple_noise:<h>:precision_limited (both modes, value kept);
+    diff > noise_bound + 0.0005 -> tuple_noise:<h>:gap (both modes, value
+    kept); else class round|drift -> observe tags, enforce snaps the stored
+    fraction to round(implied, 6). Returns the number of legs acted on. Never
+    raises (fail-open); off -> 0 with no row access."""
+    mode = _tuple_noise_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    n = 0
+    try:
+        cp = _as_float(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return 0
+        precision = _price_precision_enabled()
+        fct_tol = _fc_tuple_tol(cp)
+        for h, fp_key, roi_key in _FCT_LEGS:
+            fp = _as_float(row.get(fp_key))
+            if fp is None or fp <= 0:
+                continue
+            stored = _as_float(row.get(roi_key))
+            if stored is None:
+                continue  # absent ROI is the backfill's job; the presenter already blanks unknown cases
+            if abs(stored) > _FCT_FRACTION_DOMAIN_MAX:
+                continue  # percent domain: units are the sentries' job, never scaled here
+            implied = (fp - cp) / cp
+            if not math.isfinite(implied):
+                continue
+            diff = abs(implied - stored)
+            price_noise = (_price_round_half_quantum(fp) if precision
+                           else _TNR_PRICE_HALF_ULP)
+            noise_bound = price_noise / cp + _TNR_ROI_HALF_ULP
+            release_bound = noise_bound + _TNR_DRIFT_SLACK
+            pres_tol = max(_TNR_PRES_TOL_ABS, abs(implied) * _TNR_PRES_TOL_REL)
+            if precision:
+                pres_tol += price_noise / cp
+            if diff <= pres_tol:
+                continue  # the presenter publishes it already (also what makes a second pass a no-op)
+            if diff > fct_tol:
+                continue  # vintage class: P-102's seam owns it
+            if noise_bound > _TNR_MAX_NOISE:
+                _v573_append_warning(row, "%s:%s:precision_limited" % (_TNR_TAG, h))
+                n += 1
+                continue
+            if diff > release_bound:
+                _v573_append_warning(row, "%s:%s:gap" % (_TNR_TAG, h))
+                n += 1
+                continue
+            cls = "round" if diff <= noise_bound + 1e-12 else "drift"
+            if mode == "enforce":
+                row[roi_key] = round(implied, 6)
+                _v573_append_warning(row, "%s:%s:%s:enforce" % (_TNR_TAG, h, cls))
+            else:
+                _v573_append_warning(row, "%s:%s:%s:observe" % (_TNR_TAG, h, cls))
+            n += 1
+    except Exception:
+        return n
+    return n
+
+
+def _publish_tuple_seams(row: Dict[str, Any]) -> None:
+    """v5.152.0 (WP-3ab): run (b) then (a) at a first-presentation site. Order
+    matters: a leg compressed by (b) reaches (a) in lockstep (no action).
+    Fail-open per sub-seam; both gates off -> two env reads and no row
+    access, so unset == v5.151.9 byte-identical."""
+    if not isinstance(row, dict):
+        return
+    try:
+        _roi12_softcap(row)
+    except Exception:
+        pass
+    try:
+        _tuple_noise_release(row)
+    except Exception:
+        pass
+
+
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """v5.78.0: compute the decision-readiness layer (8 canonical columns).
 
@@ -7753,6 +8209,16 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         if not (w_hi is not None and w_lo is not None and w_hi > 0.0 and w_lo > 0.0):
             status, action = "WATCHLIST", "WATCH"
             reason = "Thin trading history (no 52W range) -- treat as new/IPO listing"
+
+    # -- v5.153.0 (WP-2b): settle-unresolved cap. Tag-driven (survives cache,
+    # projection and a later switch of TFB_SETTLE_UNRESOLVED to off) and
+    # DEMOTE-only: a row published with pass-1 scores under enforce is never
+    # INVESTABLE. BLOCKED / WATCHLIST rows keep the base chain's verdict and
+    # reason. No tag on the row (every row while the gate was never armed) ->
+    # this tier cannot fire (byte-identical).
+    if status == "INVESTABLE" and _f7_settle_unresolved(row):
+        status, action = "WATCHLIST", "WATCH"
+        reason = _F7_UNRESOLVED_REASON
 
     # -- v5.84.0 (Fix AA-1/AA-2): transparency tags, POST-verdict ---------------
     # Placed after the reliability computation and the entire verdict chain so
@@ -9117,6 +9583,16 @@ _F7_SETTLE_MAX_DEFAULT: int = 4
 _F7_SETTLE_MAX_CAP: int = 5
 _F7_SETTLE_TAG: str = "f7_settle"
 _F7_SETTLE_FAILURE_TAG: str = "f7_settle_failed:"
+# v5.153.0 (WP-2b): settle_unresolved publication rule (see WHY v5.153.0). The
+# tag prefix is distinct from f7_settle_failed: so no holdback site, test regex
+# or builder regex that reads the failure receipt can match it.
+_F7_UNRESOLVED_ENV: str = "TFB_SETTLE_UNRESOLVED"
+_F7_UNRESOLVED_TAG: str = "settle_unresolved"
+_F7_UNRESOLVED_PREFIX: str = _F7_UNRESOLVED_TAG + ":"
+_F7_UNRESOLVED_RANK_TAG: str = "rank_skipped_" + _F7_UNRESOLVED_TAG
+_F7_UNRESOLVED_REASON: str = (
+    "Scoring unresolved after settlement passes (settle_unresolved) -- research only, no new capital")
+_F7_UNRESOLVED_SIZE_HINT: str = "Hold existing; no new capital (scoring unresolved)"
 # Source observations remain fixed while generated forecasts and scores settle.
 # The broader TFB-05 canonical tuple / execution-policy split is independent.
 _F7_SETTLE_SOURCE_FIELDS: Tuple[str, ...] = (
@@ -9169,6 +9645,133 @@ def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
 def _f7_settle_failed(row: Mapping[str, Any]) -> bool:
     """A known failure survives projection, cache reuse and later mode changes."""
     return bool(_f7_settle_failure_parts(row))
+
+
+def _f7_unresolved_mode() -> str:
+    """v5.153.0 (WP-2b) TFB_SETTLE_UNRESOLVED: off (default) | observe | enforce.
+    Explicit words only -- "1"/"true"/"on" read as off (the _f7_settle_mode
+    convention). Read at call time, only inside the non_converged branch of
+    _f7_settle_pass, so the gate is inert while TFB_SCORING_SETTLE is off."""
+    raw = (os.getenv(_F7_UNRESOLVED_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _f7_settle_unresolved_parts(row: Mapping[str, Any]) -> List[str]:
+    """v5.153.0 (WP-2b): settle_unresolved:* warning parts across every warning
+    alias (the _f7_settle_failure_parts scan; exact prefix, never a substring)."""
+    if not isinstance(row, Mapping):
+        return []
+    aliases = {_norm_key(key) for key in ("warnings", *_CANONICAL_FIELD_ALIASES.get("warnings", ()))}
+    parts: List[str] = []
+    for key, value in row.items():
+        normalized_key = key.lower().strip("_") if isinstance(key, str) and key.isidentifier() else _norm_key(key)
+        if normalized_key in aliases:
+            parts.extend(part for part in _mpc_warning_parts({"warnings": value})
+                         if part.startswith(_F7_UNRESOLVED_PREFIX))
+    return list(dict.fromkeys(parts))
+
+
+def _f7_settle_unresolved(row: Mapping[str, Any]) -> bool:
+    """v5.153.0 (WP-2b): the row was published with an unresolved (non-converged)
+    pass-1 score. Tag-driven and mode-independent like _f7_settle_failed, so a
+    cached row stays capped, unranked and unfunded after any mode switch."""
+    return bool(_f7_settle_unresolved_parts(row))
+
+
+def _f7_unresolved_part(part: Any) -> bool:
+    """v5.153.0 (WP-2b): a settle_unresolved:* receipt or its rank companion."""
+    text = _safe_str(part).strip()
+    return text.startswith(_F7_UNRESOLVED_PREFIX) or text == _F7_UNRESOLVED_RANK_TAG
+
+
+def _f7_unresolved_strip(row: Dict[str, Any]) -> int:
+    """v5.153.0 (WP-2b): drop settle_unresolved:* parts and the
+    rank_skipped_settle_unresolved companion from every warning alias. A row
+    without such a part is left untouched (not re-joined, not normalized), so
+    every row of a never-armed deployment is byte-identical. Returns the
+    number of parts removed."""
+    if not isinstance(row, dict):
+        return 0
+    aliases = {_norm_key(key) for key in ("warnings", *_CANONICAL_FIELD_ALIASES.get("warnings", ()))}
+    removed = 0
+    for key in tuple(row):
+        normalized_key = key.lower().strip("_") if isinstance(key, str) and key.isidentifier() else _norm_key(key)
+        if normalized_key not in aliases:
+            continue
+        value = row[key]
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(";") if p.strip()]
+            kept = [p for p in parts if not _f7_unresolved_part(p)]
+            if len(kept) != len(parts):
+                removed += len(parts) - len(kept)
+                row[key] = "; ".join(kept)
+        elif isinstance(value, (list, tuple)):
+            kept_items = [p for p in value if not _f7_unresolved_part(p)]
+            if len(kept_items) != len(value):
+                removed += len(value) - len(kept_items)
+                row[key] = tuple(kept_items) if isinstance(value, tuple) else kept_items
+    return removed
+
+
+def _f7_settle_unresolved_tag(mode: str, result: "F7SettlementResult", row: Mapping[str, Any]) -> str:
+    """v5.153.0 (WP-2b): ONE substring-safe receipt
+    settle_unresolved:<mode>:<reason>:p<n>:ov=<pass-1 overall>:rc=<pass-1 rec>.
+    Reason and recommendation pass through _f7_settle_token; if a forbidden
+    gate substring ever survived, the tag degrades to its first four parts
+    (the _f7_settle_tag discipline)."""
+    parts = [_F7_UNRESOLVED_TAG, _safe_str(mode).strip().lower() or "na",
+             _f7_settle_token(result.reason or "na"), "p%d" % int(result.passes_run or 0),
+             "ov=" + _f7_settle_fmt("num", row.get("overall_score")),
+             "rc=" + _f7_settle_token(row.get("recommendation"))]
+    tag = ":".join(parts)
+    if any(f in tag.lower() for f in _REL_PATH_FORBIDDEN):
+        tag = ":".join(parts[:4])
+    return tag
+
+
+def _f7_unresolved_capital_hold(row: Dict[str, Any]) -> None:
+    """v5.153.0 (WP-2b): the holdback's ADD -> HOLD neutralisation for a row
+    published under TFB_SETTLE_UNRESOLVED=enforce - neither the drift-only
+    Rebalance Action (action_flag) nor the blended decision may instruct new
+    capital on an unresolved score. Tag-driven; no tag -> no-op."""
+    if not isinstance(row, dict) or not _f7_settle_unresolved(row):
+        return
+    for key in ("action_flag", "decision"):
+        if _safe_str(row.get(key)).strip().upper() in {"ADD", "BUY", "INVEST", "ACCUMULATE"}:
+            row[key] = "HOLD"
+
+
+def _f7_settle_unresolved_publish(row: Dict[str, Any], result: "F7SettlementResult") -> None:
+    """v5.153.0 (WP-2b) TFB_SETTLE_UNRESOLVED=enforce on a non_converged result:
+    publish the PASS-1 row as research-only. Scores, forecast tuple,
+    opportunity source and recommendation stay pass-1 (a buy-family
+    recommendation on a gate-demoted row becomes HOLD by Fix AP at the
+    boundary). Rank and new capital are withheld; the scoring_settlement JSON
+    stays beside the tag as evidence. No f7_settle_failed receipt, no
+    investability / final action / block reason write."""
+    if not isinstance(row, dict):
+        return
+    import json
+    _cap_intrinsic_display(row)  # the holdback's display policy applies here too
+    _f7_unresolved_strip(row)  # one receipt per row: a stale one never doubles up
+    _v573_append_warning(row, _f7_settle_unresolved_tag("enforce", result, row))
+    details = {
+        "status": result.status, "reason": result.reason,
+        "passes_run": result.passes_run, "error_type": result.error_type,
+        "first_diff": result.first_diff, "last_diff": result.last_diff,
+        "pass1_scores": {k: _json_safe(row.get(k)) for k in _F7_SETTLE_DEPENDENT_FIELDS if k in row},
+    }
+    error = "scoring_settlement:" + json.dumps(details, sort_keys=True, separators=(",", ":"))
+    existing = _coerce_scoring_errors_for_sheet(row.get("scoring_errors"))
+    row["scoring_errors"] = (existing + "; " + error) if existing else error
+    for alias in _CANONICAL_FIELD_ALIASES.get("rank_overall", ("rank_overall",)):
+        if alias in row or alias == "rank_overall":
+            row[alias] = None
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) or _canonical_recommendation(row.get("recommendation"))
+    exit_action = _safe_str(row.get("final_action")).strip().upper() in {"EXIT", "SELL", "REDUCE", "TRIM"}
+    _f7_unresolved_capital_hold(row)
+    if not exit_action and rec not in _TOP10_EXCLUDED_RECO_FAMILIES:
+        row["position_size_hint"] = _F7_UNRESOLVED_SIZE_HINT
 
 
 def _f7_reject_scoring_patch_failures(row: Mapping[str, Any], patch: Mapping[str, Any]) -> None:
@@ -9430,13 +10033,37 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
         return row
     result = _f7_settle_result(row)
     if result.status != "stable":
+        # v5.153.0 (WP-2b): only a non_converged result consults
+        # TFB_SETTLE_UNRESOLVED; status error stays fail-closed in every mode.
+        # off -> the v5.152.0 lines below run unchanged (byte-identical).
+        _unres = _f7_unresolved_mode() if result.status == "non_converged" else "off"
+        if _unres == "enforce":
+            _f7_settle_unresolved_publish(row, result)
+            logger.debug(
+                "[engine_v2 v%s F-7b] unresolved published for %s (page=%s): %s",
+                __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+                result.reason,
+            )
+            return row
+        # observe: compose the receipt from the still-intact pass-1 row BEFORE
+        # the holdback blanks it; the values below are exactly today's.
+        _obs_tag = _f7_settle_unresolved_tag("observe", result, row) if _unres == "observe" else ""
         _f7_settle_holdback(row, result)
+        if _obs_tag:
+            _f7_unresolved_strip(row)
+            _v573_append_warning(row, _obs_tag)
         logger.debug(
             "[engine_v2 v%s F-7] settlement withheld for %s (page=%s): %s: %s",
             __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
             result.status, result.reason,
         )
         return row
+    # v5.153.0 (WP-2b): a fresh STABLE settlement retires a stale
+    # settle_unresolved receipt (L2 / KLG carried warnings) so the row is no
+    # longer capped or unranked. No such part -> no-op (byte-identical).
+    _f7_unresolved_strip(row)
+    if result.row is not None and result.row is not row:
+        _f7_unresolved_strip(result.row)
     if not result.first_diff:
         return row
     tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
@@ -9613,7 +10240,7 @@ def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
                 capped_ret = -cap_abs
         if capped_ret is None:
             continue
-        new_fp = round(cp * (1.0 + capped_ret), 4)
+        new_fp = _round_price(cp * (1.0 + capped_ret))
         row[field] = new_fp
         # v5.77.21 (Fix D): keep the matching ROI in lockstep with the capped price.
         row[roi_field] = round((new_fp - cp) / cp, 6)
@@ -9659,10 +10286,10 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 _v573_append_warning(row, "provider_target_capped_for_short_horizon_derivation")
             if not _forecast_price_is_populated(row.get("forecast_price_3m")):
                 derived_3m_return = capped_12m * _PHASE_II_RATIO_3M_OF_12M
-                row["forecast_price_3m"] = round(cp * (1.0 + derived_3m_return), 4)
+                row["forecast_price_3m"] = _round_price(cp * (1.0 + derived_3m_return))
             if not _forecast_price_is_populated(row.get("forecast_price_1m")):
                 derived_1m_return = capped_12m * _PHASE_II_RATIO_1M_OF_12M
-                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+                row["forecast_price_1m"] = _round_price(cp * (1.0 + derived_1m_return))
             if row.get("expected_roi_12m") is None:
                 row["expected_roi_12m"] = round(return_12m, 6)
                 _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t12")
@@ -9705,7 +10332,7 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 else:
                     ratio_1m_of_3m = 0.0
                 derived_1m_return = capped_3m * ratio_1m_of_3m
-                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+                row["forecast_price_1m"] = _round_price(cp * (1.0 + derived_1m_return))
             if not _forecast_price_is_populated(row.get("forecast_price_12m")):
                 # 12M return ~ capped 3M return scaled UP to the 12M horizon.
                 if _PHASE_II_RATIO_3M_OF_12M > 0:
@@ -9713,7 +10340,7 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 else:
                     derived_12m_return = capped_3m
                 derived_12m_return = max(min(derived_12m_return, _PHASE_II_MAX_12M_ABS_RETURN), -_PHASE_II_MAX_12M_ABS_RETURN)
-                row["forecast_price_12m"] = round(cp * (1.0 + derived_12m_return), 4)
+                row["forecast_price_12m"] = _round_price(cp * (1.0 + derived_12m_return))
             if row.get("expected_roi_3m") is None:
                 row["expected_roi_3m"] = round(return_3m, 6)
                 _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t3")
@@ -9828,9 +10455,9 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     forecast_3m = cp * (1.0 + expected_3m_return)
     forecast_1m = cp * (1.0 + expected_1m_return)
 
-    row["forecast_price_1m"] = round(forecast_1m, 4)
-    row["forecast_price_3m"] = round(forecast_3m, 4)
-    row["forecast_price_12m"] = round(forecast_12m, 4)
+    row["forecast_price_1m"] = _round_price(forecast_1m)
+    row["forecast_price_3m"] = _round_price(forecast_3m)
+    row["forecast_price_12m"] = _round_price(forecast_12m)
     row["expected_roi_1m"] = round(expected_1m_return, 6)
     _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "synth")
     row["expected_roi_3m"] = round(expected_3m_return, 6)
@@ -10187,7 +10814,7 @@ def _portfolio_decision(row: Dict[str, Any], gap: Optional[float], band: float, 
         return "SELL"
     if (overweight and weak_signal) or (forecast_negative and at_or_above_target):
         return "REDUCE"
-    if _f7_settle_failed(row):
+    if _f7_settle_failed(row) or _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never funds an ADD
         return "HOLD"
     if underweight and constructive and (not forecast_negative) and risk != "HIGH":
         return "ADD"
@@ -10661,6 +11288,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     r["decision"] = _portfolio_decision(r, None, band, weak)
                     _portfolio_missing_price_holdback(r)
                     _f7_settle_holdback(r)
+                    _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
                 return
             for r in rows:
                 if isinstance(r, dict):
@@ -10694,6 +11322,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
             r["decision"] = _portfolio_decision(r, gap, band, weak)
             _portfolio_missing_price_holdback(r)
             _f7_settle_holdback(r)
+            _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b): no ADD on an unresolved score
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(
             "[engine_v2 v%s] _compute_portfolio_fields failed: %s: %s",
@@ -11911,6 +12540,31 @@ def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Op
         if _au1_identity_token_set(s) & want:
             return None
     return declared[0]
+
+
+def _crypto_name_guard_mode() -> str:
+    raw = (os.getenv("TFB_CRYPTO_NAME_GATE") or "off").strip().lower()
+    return raw if raw in {"observe", "enforce"} else "off"
+
+
+def _crypto_fundamentals_name_ok(symbol: str, patch: Dict[str, Any]) -> bool:
+    """WP-05: no Yahoo fundamentals from a definite curated-name mismatch.
+
+    Off and observe preserve the patch; unknown roots/absent names are not
+    judged. This is a name plausibility screen, not proof of a provider ID.
+    """
+    mode = _crypto_name_guard_mode()
+    if mode == "off":
+        return True
+    name = patch.get("name") or patch.get("longName") or patch.get("shortName")
+    if not name:
+        return True
+    from core.analysis.identity_guard import crypto_patch_name_matches
+    mismatch = crypto_patch_name_matches(symbol, name) is False
+    if mismatch:
+        logger.warning("[engine_v2 v%s CRYPTO-NAME] fundamentals mismatch mode=%s symbol=%s",
+                       __version__, mode, symbol)
+    return not mismatch or mode != "enforce"
 
 
 def _fund_identity_guard_enabled() -> bool:
@@ -15110,7 +15764,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                     and _as_float(out.get("target_mean_price")) is None:
                 _tgt12_raw = _as_float(out.get("forecast_price_12m"))
                 if _tgt12_raw is not None and _tgt12_raw > 0:
-                    out["target_mean_price"] = round(float(_tgt12_raw), 6)
+                    out["target_mean_price"] = _round_price(float(_tgt12_raw), 6)
 
     inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
     inferred_name = _infer_display_name_from_symbol(inferred_symbol)
@@ -15585,7 +16239,7 @@ def _apply_forecast_pair_coherence(row: Dict[str, Any]) -> None:
             continue
         if abs(implied - fp) <= abs(fp) * _FORECAST_PAIR_REL_TOLERANCE:
             continue
-        row[price_key] = round(implied, 4)
+        row[price_key] = _round_price(implied)
         touched = True
     if touched:
         _v573_append_warning(row, _FORECAST_PAIR_TAG)
@@ -15754,7 +16408,7 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     if px is None:
         px = _as_float(row.get("price"))
     if tgt is not None and tgt > 0:
-        _fill("target_price", round(tgt, 6), "analyst_target_price")
+        _fill("target_price", _round_price(tgt, 6), "analyst_target_price")
         # 3) Upside/Downside % <- signed FRACTION (matches upside_pct units).
         if px not in (None, 0):
             try:
@@ -15838,6 +16492,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     _f7_settle_holdback(row)
+    _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
@@ -16270,15 +16925,15 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
 
     if price is not None and row.get("forecast_price_1m") is None:
         drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
-        row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
+        row["forecast_price_1m"] = _round_price(price * (1.0 + drift / 300.0))
         _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_3m") is None:
         drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
-        row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
+        row["forecast_price_3m"] = _round_price(price * (1.0 + drift / 100.0))
         _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_12m") is None:
         drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
-        row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
+        row["forecast_price_12m"] = _round_price(price * (1.0 + drift / 100.0))
         _fallback_created_forecast = True
 
     if _fallback_created_forecast and not _safe_str(row.get("forecast_source")):
@@ -16369,6 +17024,10 @@ def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
         if isinstance(row, dict) and _f7_settle_failed(row):
             _f7_settle_holdback(row)
             _v573_append_warning(row, "rank_skipped_settlement_failure")
+            continue
+        if isinstance(row, dict) and _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): tag-driven, no mode check
+            row["rank_overall"] = None
+            _v573_append_warning(row, _F7_UNRESOLVED_RANK_TAG)
             continue
         # v5.88.0: a LOW-trust row is withheld from the ranking entirely -- a
         # sparse / blocked / low-completeness name must not occupy a market-page
@@ -17129,7 +17788,8 @@ class DataEngineV5:
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
-                "w52_ceiling=%s fund_cache=%s margin_publish=%s",
+                "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
+                "settle_unresolved=%s price_precision=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -17149,6 +17809,10 @@ class DataEngineV5:
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
                 _margin_publish_mode(),     # v5.151.0 (P-152): publish contract provable at boot
+                _roi12_softcap_mode(),      # v5.152.0 (WP-3b): 12M ceiling mode provable at boot
+                _tuple_noise_mode(),        # v5.152.0 (WP-3a): noise release mode provable at boot
+                _f7_unresolved_mode(),      # v5.153.0 (WP-2b): unresolved publication provable at boot
+                "on" if _price_precision_enabled() else "off",  # v5.152.0 (WP-03)
             )
         except Exception:
             pass
@@ -17879,6 +18543,11 @@ class DataEngineV5:
                     __version__, symbol, ysym, _au1b_got,
                 )
                 return {}
+        # Default-off name screen shares the writer/auditor vocabulary.
+        # Drop the entire conflicting fundamentals patch: retaining its numeric
+        # fields would still graft the wrong token's fundamentals onto the coin.
+        if not _crypto_fundamentals_name_ok(symbol, out):
+            return {}
         return out
 
     async def _fetch_yahoo_chart_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:
@@ -19080,6 +19749,7 @@ class DataEngineV5:
             _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
+            _publish_tuple_seams(_r)  # v5.152.0 (WP-3ab): same boundary as _strict_project_row
         # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
         # Runs once on the full holdings list after the per-row gate, so
         # actual_weight/weight_gap see the whole book.

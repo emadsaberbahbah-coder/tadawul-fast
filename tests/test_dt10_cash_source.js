@@ -4,8 +4,9 @@
 // N3 choose(): panel byte-identical, observe log-only, portfolio switch,
 // unreadable fallback | N4 payload-equivalence: mode 'panel' yields the
 // exact legacy value. Run x3, identical digest.
-const fs = require("fs"), crypto = require("crypto");
-const src = fs.readFileSync("16_Decision_Top10.gs", "utf8");
+const fs = require("fs"), crypto = require("crypto"), path = require("path");
+const src = fs.readFileSync(
+  process.argv[2] || path.join(__dirname, "..", "apps_script", "16_Decision_Top10.gs"), "utf8");
 function extract(name) {
   const i = src.indexOf("function " + name);
   if (i < 0) throw new Error("missing " + name);

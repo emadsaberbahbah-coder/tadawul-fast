@@ -1,0 +1,78 @@
+{
+  "events": {
+    "firewall": 771,
+    "quota": 232
+  },
+  "firewall_notes": "Details JSON may cap symbol arrays; reported message count is authoritative for event strip count; distinct names are only a lower bound.",
+  "global_markets_october_firewall": {
+    "2026-10-01": {
+      "events": 3,
+      "max_stripped": 181,
+      "min_stripped": 72
+    },
+    "2026-10-02": {
+      "events": 3,
+      "max_stripped": 151,
+      "min_stripped": 134
+    },
+    "2026-10-03": {
+      "events": 3,
+      "max_stripped": 112,
+      "min_stripped": 72
+    },
+    "2026-10-04": {
+      "events": 3,
+      "max_stripped": 19,
+      "min_stripped": 5
+    },
+    "2026-10-05": {
+      "events": 2,
+      "max_stripped": 17,
+      "min_stripped": 16
+    },
+    "2026-10-06": {
+      "events": 3,
+      "max_stripped": 136,
+      "min_stripped": 112
+    }
+  },
+  "last_runlog_timestamp_riyadh_naive": "2026-10-06 23:46:43",
+  "october_max_observed_used_not_daily_total": {
+    "2026-10-01": 118631,
+    "2026-10-02": 113987,
+    "2026-10-03": 111947,
+    "2026-10-04": 104366,
+    "2026-10-05": 91674,
+    "2026-10-06": 96584
+  },
+  "october_new_402_total": 0,
+  "october_ray_us_listed_events": 8,
+  "october_reported_strips_range": [
+    5,
+    181
+  ],
+  "october_sampled_distinct_symbols": 216,
+  "quota_events": 201,
+  "quota_limit_values": [
+    400000
+  ],
+  "quota_notes": "Shared account counters; missing endpoint/cache/retry telemetry prevents calls-per-symbol attribution. Daily maxima are observed lower bounds, not complete day totals.",
+  "read_mode": "openpyxl read_only=True data_only=True",
+  "runlog_rows": 14730,
+  "september_30_firewall": [
+    {
+      "out_stripped_reported": 120,
+      "row": 13292
+    },
+    {
+      "out_stripped_reported": 53,
+      "row": 13376
+    },
+    {
+      "out_stripped_reported": 108,
+      "row": 13450
+    }
+  ],
+  "source_filename": "_Market Share Deepseek-V3 (1).xlsx",
+  "source_sha256": "9c8b34812eee7d5554a3586f1f86a232e79159f24e228a4eac070e2436441ef4"
+}

@@ -170,10 +170,15 @@ def test_current_producer_keeps_consumer_compatible_wire_format(zone):
 
 class FakeSheets:
     """Fake only the Google resource boundary; successful updates alter its grid."""
-    def __init__(self, grid, *, failures=0):
+    def __init__(self, grid, *, failures=0, failure_key="TFB Decision Feed", read_failure_at=None,
+                 veto_after_failure=None):
         self.grid = deepcopy(grid)
         self.calls = []
         self.failures = failures
+        self.failure_key = failure_key
+        self.read_failure_at = read_failure_at
+        self.reads = 0
+        self.veto_after_failure = veto_after_failure
 
     def spreadsheets(self):
         return self
@@ -183,14 +188,25 @@ class FakeSheets:
 
     def get(self, **kwargs):
         self.calls.append(("get", deepcopy(kwargs)))
-        return SimpleNamespace(execute=lambda: {"values": deepcopy(self.grid)})
+        def execute():
+            self.reads += 1
+            if self.reads == self.read_failure_at:
+                raise OSError("synthetic Sheets read failure")
+            if kwargs["range"] == "'_Status'!L1:M60":
+                return {"values": deepcopy(self.grid)}
+            slot = int(re.fullmatch(r"'_Status'!L([0-9]+):M\1", kwargs["range"])[1]) - 1
+            return {"values": [deepcopy(self.grid[slot])]}
+        return SimpleNamespace(execute=execute)
 
     def update(self, **kwargs):
         self.calls.append(("update", deepcopy(kwargs)))
         def execute():
             key, value = kwargs["body"]["values"][0]
-            if key == "TFB Decision Feed" and self.failures:
+            if key == self.failure_key and self.failures:
                 self.failures -= 1
+                if self.veto_after_failure:
+                    row = next(row for row in self.grid if row and row[0] == "TFB Decision Feed")
+                    row[1] = self.veto_after_failure
                 raise RuntimeError("synthetic Sheets retry failure")
             slot = int(re.fullmatch(r"'_Status'!L([0-9]+):M\1", kwargs["range"])[1]) - 1
             while len(self.grid) <= slot:
@@ -206,13 +222,17 @@ class FakeSheets:
         return next((row[1] for row in self.grid if row and row[0] == key), None)
 
 
-def publisher(monkeypatch, *, bad_stamp=None, now=NOW, failures=0, result_page="Market_Leaders"):
+def publisher(monkeypatch, *, bad_stamp=None, now=NOW, failures=0, result_page="Market_Leaders",
+              feed="previous composite sentinel", failure_key="TFB Decision Feed", read_failure_at=None,
+              veto_after_failure=None):
     grid = [["Backend URL", "https://synthetic.invalid"]]
     for index, page in enumerate(PAGES):
         stamp = bad_stamp if page == "Global_Markets" and bad_stamp is not None else STAMP
         grid.append(["TFB Feed " + page, feed_value(stamp, run=f"synthetic-old-{index}")])
-    grid.append(["TFB Decision Feed", "previous composite sentinel"])
-    fake = FakeSheets(grid, failures=failures)
+    if feed is not None:
+        grid.append(["TFB Decision Feed", feed])
+    fake = FakeSheets(grid, failures=failures, failure_key=failure_key, read_failure_at=read_failure_at,
+                      veto_after_failure=veto_after_failure)
     writer = sync.SheetsWriter()
     monkeypatch.setattr(writer, "_get_service", lambda: fake)
     sleeps = []
@@ -237,14 +257,15 @@ def test_actual_publisher_withholds_unproved_retained_page(monkeypatch, stamp, r
     assert f"GM:{reason.upper()}" in fake.value("TFB Decision Feed")
     assert sleeps == []
     updates = [kwargs for kind, kwargs in fake.calls if kind == "update"]
-    assert len(updates) == 2 and all(kwargs["valueInputOption"] == "RAW" for kwargs in updates)
+    assert len(updates) == 3 and all(kwargs["valueInputOption"] == "RAW" for kwargs in updates)
     assert all(re.fullmatch(r"'_Status'!L([0-9]+):M\1", kwargs["range"]) for kwargs in updates)
 
 
-def test_actual_publisher_retains_valid_trailing_pages_from_distinct_runs(monkeypatch):
+def test_actual_publisher_reports_trailing_freshness_without_promoting_final_feed(monkeypatch):
     fake, sleeps = publisher(monkeypatch)
-    assert fake.value("TFB Decision Feed") == (
-        f"EXECUTABLE | run=synthetic-current | {STAMP} | ML:OK GM:OK CFX:OK MF:OK")
+    assert fake.value("TFB Upstream Feed Diagnostic") == (
+        f"UPSTREAM_READY | run=synthetic-current | {STAMP} | ML:OK GM:OK CFX:OK MF:OK | final_acceptance=not_issued")
+    assert fake.value("TFB Decision Feed") == "previous composite sentinel"
     assert "run=synthetic-current" in fake.value("TFB Feed Market_Leaders")
     assert "run=synthetic-old-1" in fake.value("TFB Feed Global_Markets")
     assert sleeps == []
@@ -253,7 +274,8 @@ def test_actual_publisher_retains_valid_trailing_pages_from_distinct_runs(monkey
 def test_actual_publisher_current_page_can_replace_its_unverified_previous_stamp(monkeypatch):
     fake, _ = publisher(monkeypatch, bad_stamp="offsetless old value", result_page="Global_Markets")
     assert fake.value("TFB Feed Global_Markets") == f"OK | cov=100.0 | run=synthetic-current | {STAMP}"
-    assert fake.value("TFB Decision Feed").startswith("EXECUTABLE |")
+    assert fake.value("TFB Upstream Feed Diagnostic").startswith("UPSTREAM_READY |")
+    assert fake.value("TFB Decision Feed") == "previous composite sentinel"
 
 
 @pytest.mark.parametrize("anchor", [float("nan"), float("inf"), True])
@@ -285,3 +307,59 @@ def test_disabled_publication_gate_performs_no_api_calls(monkeypatch):
         raise AssertionError("disabled gate must not construct a service")
     monkeypatch.setattr(writer, "_get_service", prohibited_service)
     sync._write_upstream_verdict(writer, "synthetic-sheet", [])
+
+
+@pytest.mark.parametrize("run", ["synthetic-current", "synthetic-previous"])
+@pytest.mark.parametrize("bad_stamp", [None, ""])
+def test_actual_publisher_preserves_final_veto_for_any_run_and_upstream_result(monkeypatch, run, bad_stamp):
+    veto = f"NOT_ACTIONABLE(final_publication) | run={run} | {STAMP} | coverage_failed"
+    fake, sleeps = publisher(monkeypatch, feed=veto, bad_stamp=bad_stamp)
+    assert fake.value("TFB Decision Feed") == veto and sleeps == []
+    assert fake.value("TFB Upstream Feed Diagnostic")
+    assert not any(kwargs["body"]["values"][0][0] == "TFB Decision Feed"
+                   for kind, kwargs in fake.calls if kind == "update")
+
+
+@pytest.mark.parametrize("read_failure_at", [1, 2])
+def test_actual_publisher_read_failure_cannot_erase_final_veto(monkeypatch, capsys, read_failure_at):
+    veto = "NOT_ACTIONABLE(final_publication) | run=prior | coverage_failed"
+    fake, _ = publisher(monkeypatch, feed=veto, bad_stamp="", read_failure_at=read_failure_at)
+    assert fake.value("TFB Decision Feed") == veto
+    assert "::warning::" in capsys.readouterr().out
+    assert not any(kwargs["body"]["values"][0][0] == "TFB Decision Feed"
+                   for kind, kwargs in fake.calls if kind == "update")
+
+
+@pytest.mark.parametrize("failure_key", ["TFB Feed Market_Leaders", "TFB Upstream Feed Diagnostic"])
+def test_actual_publisher_write_failure_keeps_final_veto(monkeypatch, capsys, failure_key):
+    veto = "NOT_ACTIONABLE(final_publication) | run=prior | decision_failed"
+    fake, sleeps = publisher(monkeypatch, feed=veto, failures=2, failure_key=failure_key)
+    assert fake.value("TFB Decision Feed") == veto and sleeps == [1.0, 1.0]
+    assert "write FAILED" in capsys.readouterr().out
+
+
+def test_retry_after_ambiguous_update_failure_respects_a_new_final_veto(monkeypatch):
+    veto = "NOT_ACTIONABLE(final_publication) | run=new_final | decision_failed"
+    fake, sleeps = publisher(monkeypatch, bad_stamp="", failures=1, veto_after_failure=veto)
+    assert fake.value("TFB Decision Feed") == veto and sleeps == [1.0]
+    final_attempts = [kwargs for kind, kwargs in fake.calls if kind == "update"
+                      and kwargs["body"]["values"][0][0] == "TFB Decision Feed"]
+    assert len(final_attempts) == 1
+
+
+def test_ready_upstream_without_a_final_feed_issues_no_acceptance(monkeypatch):
+    fake, _ = publisher(monkeypatch, feed=None)
+    assert fake.value("TFB Decision Feed") is None
+    assert fake.value("TFB Upstream Feed Diagnostic").startswith("UPSTREAM_READY |")
+
+
+def test_ambiguous_final_feed_layout_cannot_hide_an_existing_veto(monkeypatch, capsys):
+    veto = "NOT_ACTIONABLE(final_publication) | run=prior | decision_failed"
+    fake = FakeSheets([["Backend URL", "https://synthetic.invalid"],
+                       ["TFB Decision Feed", veto], ["TFB DECISION FEED", "EXECUTABLE | stale"]])
+    writer = sync.SheetsWriter()
+    monkeypatch.setattr(writer, "_get_service", lambda: fake)
+    sync._write_upstream_verdict(writer, "synthetic-sheet", [])
+    assert fake.value("TFB Decision Feed") == veto
+    assert not any(kind == "update" for kind, _kwargs in fake.calls)
+    assert "duplicate key" in capsys.readouterr().out

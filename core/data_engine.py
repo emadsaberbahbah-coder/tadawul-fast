@@ -330,19 +330,17 @@ class TraceContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self._span is not None and exc_val is not None and Status is not None and StatusCode is not None:
-                try:
-                    self._span.record_exception(exc_val)
-                    self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-                except Exception:
-                    pass
-        finally:
-            if self._cm is not None:
-                try:
-                    return self._cm.__exit__(exc_type, exc_val, exc_tb)
-                except Exception:
-                    return False
+        if self._span is not None and exc_val is not None and Status is not None and StatusCode is not None:
+            try:
+                self._span.record_exception(exc_val)
+                self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            except Exception:
+                pass
+        if self._cm is not None:
+            try:
+                return self._cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                return False
         return False
 
     async def __aenter__(self):

@@ -1,5 +1,11 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.0 (2026-10-11) -- WP-02 OPERATOR FLAG MAPPINGS
+# WHY: the 2026-10-10 export still has 27 duplicate matured keys and 11,791
+# matured rows with zero-valued risk placeholders. Existing v6.41.0 guards
+# could not run because their repository Variables were never mapped here.
+# Defaults remain off/0; mirror both mappings in daily_sync's tracker step.
+
 # =============================================================================
 # WHY THIS EXISTS
 # -----------------------------------------------------------------------------
@@ -25,6 +31,19 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # This workflow does NOT touch the 15-minute dashboard sync and changes no
 # application code. It is fully reversible: disable or delete this file and the
 # clock simply stops advancing (existing records are untouched).
+#
+# (2026-10-11) CORRECTION + FLAG MAPPING. The Signal_History half of the
+# idempotency claim above has never held on the live sheet:
+# SignalHistoryStore.append_snapshots dedups against an in-memory cache that
+# only load_snapshots fills, and run_once appends before it loads, so every
+# --record run (this clock x2 + daily_sync x3 per day) appends the whole
+# snapshot set again (10-10 export: 21,670 of 29,471 rows are same-day
+# repeats, max 19 per Symbol|Date key). Performance_Log keys ARE idempotent
+# (append_records filters against the primed load_records cache).
+# track_performance v6.44.0 measures the repeats under
+# TRACK_DEDUP_SIGNAL_HISTORY=observe; the run step below now maps it together
+# with TRACK_DEDUP_MATURED and TRACK_RISK_BLANK (v6.41.0, unmapped until
+# today). Unset = unchanged behaviour. Rollback: delete the three env lines.
 # =============================================================================
 
 on:
@@ -251,6 +270,36 @@ jobs:
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
           # 2026-09-01: one-shot opt-in (v6.38.0) — set the repo Variable to 1 for ONE run, then remove it
           TRACK_DROP_DUPLICATE_ROWS: ${{ vars.TRACK_DROP_DUPLICATE_ROWS || '0' }}
+          # (2026-10-11) P-189b / P-188 / P-191 FLAG MAPPING - the kill-switch-without-
+          # mapping class (daily_sync.yml W1A-6g). track_performance v6.41.0 shipped
+          # TRACK_DEDUP_MATURED and TRACK_RISK_BLANK on 2026-10-01 and named THIS step
+          # as their env lane, but no workflow ever mapped them, so a repo Variable
+          # never reached os.getenv: the 2026-10-10 export still holds the same 27
+          # MATURED/MATURED duplicate Keys (20 W/W, 7 L/L), all 11,791 matured rows
+          # carry 0.0 in Volatility / Max Drawdown % / Sharpe Ratio, and none of the
+          # 284 [PERF-VERDICT] _Run_Log lines carries 'dedup_matured'. v6.44.0 adds
+          # TRACK_DEDUP_SIGNAL_HISTORY (Signal_History same-day repeats: 21,670 of
+          # 29,471 rows on 10-10, max 19 per Symbol|Date key; in v6.44.0 'enforce' is
+          # parsed but MEASURE-ONLY and says so in its token). Unset -> 'off' / '0' /
+          # 'off' = the script defaults = byte-identical. Operator contract: observe
+          # for >= 1 run and read the [DEDUP-MATURED] / [DEDUP-SIGNAL] job-log lines
+          # and the [PERF-VERDICT] tokens in _Run_Log, then arm per read-back. MUST
+          # stay identical to the daily_sync.yml tracker step (ENV PARITY rule
+          # below; tests/test_track_flags_mapped.py pins it): TRACK_RISK_BLANK in one
+          # lane only would be rewritten to 0.0 by the other lane's next save.
+          # ROLLBACK: delete the three lines (or unset the Variables).
+          TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
+          TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
+          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
+          # (2026-10-11) v6.45.0 prospective schema / publication identities.
+          # Defaults off: arm one measured lane-consistent feature at a time.
+          # Immutable snapshots retain first and subsequent daily publications;
+          # reruns use the same run ID. Canonical targets require price evidence.
+          # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
+          # Rollback: off/0; historical target values and publications stay.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
+          TRACK_PUBLICATION_ID: ${{ github.run_id }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,
@@ -348,6 +397,7 @@ jobs:
             perf_clock_*.log
             *_performance*.json
             *_signal_trends.json
+            *_signal_publications.json
             *_calibration.json
             dropped_duplicates_*.csv
           retention-days: 14

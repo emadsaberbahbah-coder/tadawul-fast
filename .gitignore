@@ -531,7 +531,8 @@ azure-credentials.json
 # Cursor / Claude Code / AI editors (session state, not project source)
 .cursor/
 .cursorrules.local
-.claude/                # v7.0.2: Claude Code session state
+# v7.0.2: Claude Code session state (incl. agent worktrees under .claude/worktrees/)
+.claude/
 *.cursor.md
 
 # OS files

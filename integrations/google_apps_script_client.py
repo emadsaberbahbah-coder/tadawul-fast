@@ -84,7 +84,6 @@ from functools import lru_cache
 from typing import (
     Any,
     AsyncGenerator,
-    Callable,
     Dict,
     List,
     Optional,

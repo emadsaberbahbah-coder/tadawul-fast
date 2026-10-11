@@ -44,6 +44,33 @@ import core.data_engine_v2 as de  # noqa: E402
 
 ENV = "TFB_SCORING_SETTLE"
 MAX_ENV = "TFB_SCORING_SETTLE_MAX_PASSES"
+
+# 2026-10-11 (whole-tree order hygiene): _env() and _prep() set TFB_SCORING_SETTLE,
+# TFB_SCORING_SETTLE_MAX_PASSES and TFB_ENGINE_TARGET_KLG=1 and seed
+# de._TGT_LKG_STORE, and nothing restored them, so in one pytest process every later
+# suite ran with the keep-last-good target gate ON and a stored 12M target for
+# 3328.HK / BNY.US / FCN.US / SUBC.OL (first victim found: the P-143 battery, whose
+# BNY.US fixture was then tagged as a 12M source). Restore all of it after each test;
+# the tests and the __main__ runner are unchanged.
+try:
+    import pytest
+except ImportError:  # the __main__ runner needs no pytest
+    pytest = None
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _f7_state_restored():
+        keys = (ENV, MAX_ENV, "TFB_ENGINE_TARGET_KLG")
+        prev = {k: os.environ.get(k) for k in keys}
+        store = dict(de._TGT_LKG_STORE)
+        yield
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        de._TGT_LKG_STORE.clear()
+        de._TGT_LKG_STORE.update(store)
 FORBIDDEN = ("cap", "forecast", "target", "roi", "drop", "reject", "provider_target",
              "price_bar_stale", "xprovider_price_conflict")
 TAG_RE = re.compile(r"f7_settle:(observe|enforce):st[0-9x]+:p\d+(?::[a-z0-9]+=[^:;]*>[^:;]*)*(?::chg\d+)?$")

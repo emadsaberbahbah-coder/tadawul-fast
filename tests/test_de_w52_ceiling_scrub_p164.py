@@ -37,7 +37,6 @@ import csv
 import inspect
 import json
 import os
-import sys
 
 import pytest
 
@@ -173,7 +172,6 @@ def _replay(path, on):
     n_rows = 0
     for r in _gm_rows(path):
         n_rows += 1
-        before = copy.deepcopy(r)
         SAN(r)
         if TAG_HI in _tags(r) or TAG_LO in _tags(r):
             fired.append(r["symbol"])

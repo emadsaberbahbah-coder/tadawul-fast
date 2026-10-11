@@ -46,7 +46,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 

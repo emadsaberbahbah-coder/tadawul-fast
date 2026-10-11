@@ -1,5 +1,9 @@
 """Offline, append-only execution replay. This module never applies ledger changes.
 
+VERSION 1.0.1 (2026-10-11, WP-12). WHY: the initial pyright baseline inferred
+the cost-basis reference dictionary as string-only before execution_keys was
+added. Declare its mixed-value type explicitly; values and execution unchanged.
+
 Reported commissions are broker fields, not a reconciled fee statement. A
 net_amount field is retained raw and never supplies a fee-inclusive total.
 The supported captured-feed contract treats an omitted commission/fee currency
@@ -34,7 +38,7 @@ import json
 import re
 from typing import Any
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 SCHEMA_VERSION = 1
 MAX_RECORDS = 10_000
 MAX_RAW_BYTES = 65_536
@@ -246,7 +250,7 @@ def _reference_record(reference: dict, executions: list[dict], default_keys=None
     raw_json = _canonical(reference)
     if len(raw_json.encode()) > MAX_RAW_BYTES:
         raise AccountingError("cost-basis reference exceeds limit")
-    result = {"account_id": _text(reference.get("account_id"), "reference account_id"),
+    result: dict[str, Any] = {"account_id": _text(reference.get("account_id"), "reference account_id"),
             "symbol": _text(reference.get("symbol"), "reference symbol").upper(),
             "currency": _currency(reference.get("currency")),
             "quantity": _amount(_number(reference.get("quantity"), "reference quantity")),

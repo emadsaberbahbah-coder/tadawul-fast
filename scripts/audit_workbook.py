@@ -2,7 +2,7 @@
 """
 scripts/audit_workbook.py
 ================================================================================
-TADAWUL FAST BRIDGE — OFFLINE WORKBOOK AUDITOR (v1.2.0)
+TADAWUL FAST BRIDGE — OFFLINE WORKBOOK AUDITOR (v1.2.1)
 ================================================================================
 Static / file-based / network-free / deterministic / engine-contract-aware
 
@@ -67,9 +67,10 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -100,7 +101,9 @@ def _ensure_openpyxl():
 
 load_workbook = _ensure_openpyxl()
 
-__version__ = "1.2.0"
+# v1.2.1 (2026-10-11) WHY: recognize USX/USD-cent market-cap scale in
+# lockstep with the optional engine lane; DEFAULT OFF preserves audit output.
+__version__ = "1.2.1"
 
 # =============================================================================
 # Severity model
@@ -289,7 +292,7 @@ GATE_CONTRADICTIONS: set = {
 
 # Currencies quoted in a 1/100 subunit (pence / agorot / cents) — market-cap
 # normalisation (÷100) is required or the cap inflates ~100×.
-SUBUNIT_CURRENCIES = {"GBp", "GBX", "ZAC", "ILA", "ZAr", "KWf"}
+SUBUNIT_CURRENCIES = {"GBp", "GBX", "ZAC", "ILA", "ZAr", "KWf", "USX"}
 
 # Magic sentinels that leak in as fallbacks.
 EXACT_MAGIC = {999999.9999, 999999.0, -999999.9999}
@@ -653,6 +656,11 @@ def check_market_cap_subunit(pd: PageData, out: List[Finding]) -> None:
         return
     for rownum, row in zip(pd.real_row_numbers, pd.real_rows):
         ccy = _norm_str(_cell(row, ci))
+        if ccy.upper() == "USX":
+            if (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() \
+                    not in {"1", "true", "yes", "on"}:
+                continue
+            ccy = "USX"
         if ccy not in SUBUNIT_CURRENCIES:
             continue
         mc, price, fs = _cell(row, mci), _cell(row, pi), _cell(row, fi)
@@ -915,7 +923,6 @@ def _report_lines(report: Dict[str, Any], include_info: bool) -> List[str]:
 
 def print_console(report: Dict[str, Any], include_info: bool) -> None:
     # Console caps the findings list; the saved .txt holds the complete list.
-    g = report["global_severity_counts"]
     lines = _report_lines(report, include_info)
     # Find where the FINDINGS section starts so we can cap just that part.
     out: List[str] = []

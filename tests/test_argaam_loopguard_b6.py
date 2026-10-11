@@ -202,8 +202,8 @@ def test_g1_base_loses_symbols_on_the_second_loop() -> None:
 
 def test_g2_delivered_keeps_every_symbol_across_loops() -> None:
     mod = _load(DELIV, "argaam_deliv_b6")
-    assert mod.PROVIDER_VERSION == "6.2.0", mod.PROVIDER_VERSION
-    assert mod.VERSION == "6.2.0", mod.VERSION
+    assert tuple(map(int, mod.PROVIDER_VERSION.split("."))) >= (6, 2, 0), mod.PROVIDER_VERSION
+    assert tuple(map(int, mod.VERSION.split("."))) >= (6, 2, 0), mod.VERSION
 
     res = _drive_two_loops(mod)
     print("G2 delivered loop1 ok=%d/%d calls=%d | loop2 ok=%d/%d calls=%d" % (

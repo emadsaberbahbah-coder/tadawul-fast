@@ -93,7 +93,6 @@ import hashlib
 import importlib
 import importlib.util  # v5.1.0: REQUIRED so importlib.util.find_spec(...) works
 import inspect
-import json
 import logging
 import math
 import os
@@ -115,13 +114,11 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
-    Iterable,
     List,
     Optional,
     Sequence,
     Tuple,
     Union,
-    cast,
 )
 from urllib.parse import quote_plus, urlparse
 

@@ -1,5 +1,10 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.0 (2026-10-11) -- WP-02/WP-05 OPERATOR FLAG MAPPINGS
+# WHY: the 2026-10-10 export has 27 duplicate matured keys and 198 unavailable
+# symbols re-fetched every run. Wire existing guards and the crypto KLG name
+# guard to repository Variables in every writer lane, with default-off modes.
+
 on:
   # ✅ CI quality gate
   pull_request:
@@ -68,7 +73,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 permissions:
   contents: read
-  id-token: write
   actions: read
 
 defaults:
@@ -104,7 +108,7 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -311,6 +315,17 @@ jobs:
       # fetch-failed rows. Explicit words only; delete the line (or "off") for
       # v6.61.0 stamp text verbatim.
       TFB_SYNC_FETCHFAIL_TRUTH: "observe"
+      # v6.65.0 WP-6 WARNINGS-COMPACT (2026-10-11): off = byte-identical cells,
+      # _Status, _Run_Log and sync_summary.json (one startup boot line only);
+      # observe = one [WARNINGS-COMPACT] line + one _Run_Log WOULD_COMPACT row
+      # per market page per leg (values untouched); enforce = the enumerated
+      # engine-internal telemetry families leave the Warnings cell for the
+      # per-leg artifact sync_row_telemetry_<Page>_<run>.jsonl (every token
+      # with a sheet reader stays). Explicit words only ('1'/'true' read as
+      # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
+      # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -372,6 +387,17 @@ jobs:
       TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}
       TFB_SYNC_QUARANTINE_SYMBOLS: ${{ vars.TFB_SYNC_QUARANTINE_SYMBOLS || '' }}
       TFB_SYNC_IDENTITY_REFETCH: ${{ vars.TFB_SYNC_IDENTITY_REFETCH || '0' }}
+      # WP-02 (2026-10-11): 198 dead symbols still recur in the export;
+      # v6.64.0's retirement filter was unreachable without env mappings.
+      # Off reads no tab and preserves requests; observe logs would-retire.
+      # Read-back: [UNIVERSE-RETIRE] counts/tab/max_pct in both writer lanes.
+      # Enforce needs the operator's reviewed retirement list; rollback: off.
+      TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
+      TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
+      TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # WP-04: arm the runner's USX minor-unit screen in lockstep with Render.
+      # Unset preserves the existing portfolio currency contract; rollback: 0.
+      TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
@@ -403,6 +429,11 @@ jobs:
       TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
       TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
       TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
+      # WP-05 (2026-10-11): seven crypto identity rows were preserved from
+      # 2026-09-23. Default-off wiring for the restored-row name guard;
+      # observe logs suspicious crypto names, enforce withholds those rows.
+      # Read-back: crypto KLG name receipt; rollback: unset/off in both jobs.
+      TFB_SYNC_KLG_CRYPTO_NAME_GATE: ${{ vars.TFB_SYNC_KLG_CRYPTO_NAME_GATE || 'off' }}
       TFB_SYNC_APPEND_FAIL_IS_ERROR: ${{ vars.TFB_SYNC_APPEND_FAIL_IS_ERROR || '1' }}
       # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
@@ -541,6 +572,16 @@ jobs:
       # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
       # adds a pause between batches for extra upstream cooldown.
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # v6.66.0 WP-2c [RANK-PAGE] (2026-10-11): the batch size above makes Rank
+      # (Overall) a WITHIN-BATCH rank (10-10 export: 25/25/22/14 distinct values
+      # on 253/6,168/92/106 ranked rows). off = within-batch ranks exactly as
+      # today (byte-identical payload, no log); observe = one [RANK-PAGE] line +
+      # one _Run_Log OBSERVE row per market page per write (values untouched);
+      # enforce = Rank 1..N per page by Overall Score desc (Symbol tie-break),
+      # withheld rows written "". Explicit words only ('1'/'true' read as off).
+      # Armed through the repo Variable after the observe read-back; no YAML
+      # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
       # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
       # runner stops fetching new batches once 3600s of wall clock are spent
       # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
@@ -604,7 +645,7 @@ jobs:
 
     steps:
       - name: 📥 Secure Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -1141,6 +1182,9 @@ jobs:
       # (no Performance_Log spam). Non-blocking: a tracking hiccup must never
       # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
       # wall — empty secret keeps today's anonymous behavior exactly.
+      # (2026-10-11) True for Performance_Log; Signal_History snapshots are NOT
+      # deduped by immutable publication identity only when the opt-in
+      # TRACK_SIGNAL_PUBLICATION_MODE is armed; WP-7 remains measurement.
       - name: 📈 Track Performance (record + audit)
         # 2026-09-01 (duplicate-cohort ROOT CAUSE): this step ran in EVERY matrix
         # leg, so each sync recorded the day's cohorts three times (plus the
@@ -1178,6 +1222,28 @@ jobs:
           # env var would never be seen. Enforce = separate sitting with the S-1
           # criterion-4 boundary note.
           TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
+          # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
+          # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
+          # Unset -> 'off' / '0' / 'off' = the script defaults = byte-identical.
+          # WHY HERE TOO: PerformanceStore.save_records rewrites every row, so
+          # TRACK_RISK_BLANK armed in one lane only would be undone by this lane's
+          # next save. READ-BACK: job-log lines '[v6.41.0 DEDUP-MATURED] mode=...'
+          # and '[v6.44.0 DEDUP-SIGNAL] mode=...' plus the ' | dedup_matured' and
+          # ' | dedup_signal' tokens on the [PERF-VERDICT] _Run_Log line.
+          # ROLLBACK: delete the three lines (or unset the Variables).
+          TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
+          TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
+          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
+          # (2026-10-11) v6.45.0 prospective schema / publication identities.
+          # Defaults off: arm one measured lane-consistent feature at a time.
+          # Immutable snapshots retain first and subsequent daily publications;
+          # reruns use the same run ID. Canonical targets require price evidence.
+          # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
+          # Rollback: off/0; historical target values and publications stay.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
+          TRACK_PUBLICATION_ID: ${{ github.run_id }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
@@ -1351,6 +1417,7 @@ jobs:
             sync_execution.log
             sync_summary.json
             validate_dashboard.json
+            sync_row_telemetry_*.jsonl
           retention-days: 7
           compression-level: 6
           if-no-files-found: warn
@@ -1508,6 +1575,14 @@ jobs:
       TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}
       TFB_SYNC_QUARANTINE_SYMBOLS: ${{ vars.TFB_SYNC_QUARANTINE_SYMBOLS || '' }}
       TFB_SYNC_IDENTITY_REFETCH: ${{ vars.TFB_SYNC_IDENTITY_REFETCH || '0' }}
+      # WP-02 (2026-10-11): mirror sync-dashboard's v6.64.0 retirement
+      # configuration so recovery cannot resurrect a retired symbol.
+      # Read-back: [UNIVERSE-RETIRE] with the same tab/ceiling; rollback: off.
+      TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
+      TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
+      TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # WP-04: mirror the primary runner's default-off minor-unit screen.
+      TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
       # in code since 6.41.0 but was never mapped here — the exact v6.39.4
       # failure mode (a repo Variable that is not in env: never reaches
@@ -1539,6 +1614,9 @@ jobs:
       TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
       TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
       TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
+      # WP-05 (2026-10-11): mirror the default-off crypto restored-row name
+      # guard; read back the same crypto KLG receipt. Rollback: unset/off.
+      TFB_SYNC_KLG_CRYPTO_NAME_GATE: ${{ vars.TFB_SYNC_KLG_CRYPTO_NAME_GATE || 'off' }}
       TFB_SYNC_APPEND_FAIL_IS_ERROR: ${{ vars.TFB_SYNC_APPEND_FAIL_IS_ERROR || '1' }}
       # ─────────────────────────────────────────────────────────────────────
 
@@ -1552,6 +1630,16 @@ jobs:
       #           TFB_SYNC_PRIORITY_EXTRA "SYM1,SYM2".
       TFB_SYNC_PRIORITY_FETCH: "0"
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # v6.66.0 WP-2c [RANK-PAGE] (2026-10-11): the batch size above makes Rank
+      # (Overall) a WITHIN-BATCH rank (10-10 export: 25/25/22/14 distinct values
+      # on 253/6,168/92/106 ranked rows). off = within-batch ranks exactly as
+      # today (byte-identical payload, no log); observe = one [RANK-PAGE] line +
+      # one _Run_Log OBSERVE row per market page per write (values untouched);
+      # enforce = Rank 1..N per page by Overall Score desc (Symbol tie-break),
+      # withheld rows written "". Explicit words only ('1'/'true' read as off).
+      # Armed through the repo Variable after the observe read-back; no YAML
+      # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
       # FULL-FILL v1.1.0 (2026-08-04): arm the data-complete criterion + cycle loop.
       # Kill-switches: remove these three lines (or set 0/"1" resp.) to restore the
       # single-pass "process-success" behavior byte-identically.
@@ -1589,6 +1677,17 @@ jobs:
       # v6.62.0 P-162 stamp truth - same observe arming as the sync-dashboard job
       # (the replay subprocess stamps pages too).
       TFB_SYNC_FETCHFAIL_TRUTH: "observe"
+      # v6.65.0 WP-6 WARNINGS-COMPACT (2026-10-11): off = byte-identical cells,
+      # _Status, _Run_Log and sync_summary.json (one startup boot line only);
+      # observe = one [WARNINGS-COMPACT] line + one _Run_Log WOULD_COMPACT row
+      # per market page per replay (values untouched); enforce = the enumerated
+      # engine-internal telemetry families leave the Warnings cell for the
+      # per-leg artifact sync_row_telemetry_<Page>_<run>.jsonl (every token
+      # with a sheet reader stays). Explicit words only ('1'/'true' read as
+      # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
+      # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
       # page replay run_inline_page_recovery.py parses the page's last
       # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
@@ -1693,6 +1792,7 @@ jobs:
           path: |
             inline-recovery-plan.json
             inline-recovery-summary.json
+            sync_row_telemetry_*.jsonl
           retention-days: 30
           if-no-files-found: warn
 

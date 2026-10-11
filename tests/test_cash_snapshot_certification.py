@@ -12,8 +12,9 @@ import json
 import subprocess
 import sys
 
-import openpyxl
 import pytest
+
+openpyxl = pytest.importorskip("openpyxl")  # heavy-lane dependency; lean environments skip this module
 
 from scripts import tfb_export_audit as audit
 
@@ -213,6 +214,36 @@ def test_legacy_sar_header_layout_requires_new_account_currency_and_balance_type
     _assert_uncertified(findings, metrics, "missing_account")
     assert "missing_or_invalid_currency" in metrics["cash_certification_errors"]
     assert "balance_type_must_be_settled_cash" in metrics["cash_certification_errors"]
+
+
+@pytest.mark.parametrize("currency,time,balance_sar,reason", [
+    ("SAR", dt.time(14, 30), 53769.2625, None),
+    ("SAR", None, 53769.2625, "missing_or_invalid_timestamp"),
+    ("USD", dt.time(14, 30), 34263.064, None),
+    ("USD", dt.time(14, 30), 53769.2625, "recorded_sar_disagrees_with_native_balance_and_fx"),
+])
+def test_live_v101_header_with_appended_columns_certifies(tmp_path, currency, time, balance_sar, reason):
+    """Additive migration preserves the live seven-column cash layout."""
+    headers = ["Date", "Time", "Type", "Amount SAR", "Balance SAR", "Delta vs Prev", "Note",
+               "Account", "Currency", "Balance Type"]
+    row = [dt.date(2026, 10, 8), time, "SNAPSHOT", 0, balance_sar, 0,
+           "synthetic declared capture", "synthetic-account", currency, "settled_cash"]
+    if currency == "USD":
+        headers += ["Balance", "FX to SAR", "FX As Of"]
+        row += [9130, 3.7528, "2026-10-08T11:25:00Z"]
+    path = tmp_path / "live-header.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "_Cash_Snapshot"
+    ws.append(headers)
+    ws.append(row)
+    wb.save(path)
+    findings, metrics = _check(path)
+    if reason:
+        _assert_uncertified(findings, metrics, reason)
+    else:
+        assert findings["cash_snapshot_certification"]["status"] == "PASS"
+        assert metrics["cash_sar"] == pytest.approx(balance_sar, rel=0, abs=1e-9)
 
 
 def test_native_usd_cash_uses_recorded_fx_and_vintage(tmp_path):

@@ -99,7 +99,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Awaitable
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback

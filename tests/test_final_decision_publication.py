@@ -2,14 +2,14 @@
 import asyncio
 import copy
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import finalize_decision_publication as final
 from tests.test_decision_surface_freshness import (
-    NOW, FLOORS, portfolio_grid, status_grid, top10_grid,
+    NOW, FLOORS, portfolio_grid, status_grid, top10_grid, publication_grids,
 )
 
 
@@ -132,9 +132,11 @@ def reports(*, coverage_failure=False, decision_failure=False, warning=False):
     if warning:
         full.pages[0].warnings.append("synthetic maintenance warning")
         full.pages[0].finish()
-    decision = final.freshness.audit_surfaces(
-        status_grid(), portfolio_grid("2026-07-31 19:00:00" if decision_failure else "2026-07-31 20:05:00"),
-        top10_grid(), now_utc=NOW, min_rows=FLOORS)
+    grids = list(publication_grids())
+    if decision_failure:
+        grids[1][1][1] = grids[1][1][1].replace("2026-07-31 20:05:00", "2026-07-31 19:00:00")
+    decision = final.freshness.audit_surfaces(*grids, now_utc=NOW, min_rows=FLOORS,
+                                            expected_source_run="90001")
     return full, decision
 
 
@@ -323,11 +325,58 @@ def test_actual_decision_auditor_requires_one_current_source_cohort_receipt(rece
 
 
 def test_actual_decision_auditor_accepts_current_cohort_without_changing_default_api():
-    grid = status_grid()
-    for row in grid[1:]:
-        if row[0] in FLOORS:
-            row[3] += " run=90001"
-    assert final.freshness.audit_surfaces(grid, portfolio_grid(), top10_grid(), now_utc=NOW,
+    assert final.freshness.audit_surfaces(*publication_grids(), now_utc=NOW,
                                          min_rows=FLOORS, expected_source_run="90001").exit_code == 0
     assert final.freshness.audit_surfaces(status_grid(), portfolio_grid(), top10_grid(), now_utc=NOW,
                                          min_rows=FLOORS).exit_code == 0
+
+
+@pytest.mark.parametrize("fault", [None, "missing_pf", "stale_pf", "duplicate_top10", "stale_top10", "stale_portfolio_source"])
+def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(monkeypatch, fault):
+    full, _decision = reports()
+    now_riyadh = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
+    source_stamp = (now_riyadh - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    decision_stamp = (now_riyadh - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    sources, portfolio, top10 = publication_grids()
+    for row in sources[1:]:
+        row[1] = source_stamp
+    for surface in (portfolio, top10):
+        surface[1][1] = surface[1][1].replace("2026-07-31 20:05:00", decision_stamp).replace("2026-07-31 20:10:00", decision_stamp)
+    if fault == "missing_pf":
+        portfolio[1][1] = portfolio[1][1].split(" | source readiness")[0]
+    elif fault == "stale_pf":
+        portfolio[1][1] = portfolio[1][1].replace("(run 90001)", "(run 80000)")
+    elif fault == "duplicate_top10":
+        top10[1][1] += " | source readiness VERIFIED (run 90001)"
+    elif fault == "stale_top10":
+        top10[1][1] = top10[1][1].replace("(run 90001)", "(run 80000)")
+    elif fault == "stale_portfolio_source":
+        next(row for row in sources[1:] if row[0] == "My_Portfolio")[3] = \
+            next(row for row in sources[1:] if row[0] == "My_Portfolio")[3].replace("run=90001", "run=80000")
+    grids = {"_Status!A1:J100": sources, "Portfolio_Decision!A1:B3": portfolio,
+             "Top_10_Investments!A1:B3": top10}
+    reads = []
+
+    def reader(sheet_id, a1):
+        assert sheet_id == "synthetic-sheet"
+        reads.append(a1)
+        return copy.deepcopy(grids[a1])
+
+    async def actual_coverage_fixture(*_args, **_kwargs):
+        return full
+
+    # Only coverage is stubbed. The finalizer invokes the real run_live reader,
+    # strict freshness auditor, report verification and bounded blocker writer.
+    monkeypatch.setattr(final.coverage, "run", actual_coverage_fixture)
+    service = GoogleValues()
+    before = copy.deepcopy(service.rows)
+    result = run(service, reader=reader)
+    assert set(reads) == set(grids)
+    assert result["exit_code"] == (0 if fault is None else 2)
+    if fault is None:
+        assert not result["blocker_published"] and result["blockers"] == []
+        assert service.rows == before and service.calls == []
+    else:
+        assert result["blocker_published"] and result["blockers"] == ["decision_failed"]
+        assert service.rows[3][12].startswith("NOT_ACTIONABLE(final_publication) | run=90001")
+        assert not result["feed_promoted"]

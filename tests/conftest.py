@@ -36,6 +36,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 # =============================================================================
 # Path bootstrap
@@ -47,6 +50,19 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REPO_ROOT_STR = str(_REPO_ROOT)
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
+
+# 2026-10-11: several suites import the shared helper by its bare module name
+# (`from decision_evidence_fixtures import ...`). That only resolved when an
+# earlier file in the same process had put tests/ on sys.path itself
+# (test_ob_quote_evidence.py, test_ob_portfolio_certification.py), so
+# test_ob_board_funding.py and test_ob_research_diversify.py failed to collect
+# when run alone or in a different order, and one collection error aborts a whole
+# CI pytest step.
+# Appending tests/ here gives every order the import path the forward order
+# already had; the bare name keeps resolving to the same single module object.
+_TESTS_DIR_STR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR_STR not in sys.path:
+    sys.path.append(_TESTS_DIR_STR)
 
 
 # =============================================================================
@@ -82,6 +98,18 @@ os.environ.setdefault("TFB_TEST_SCORE_BUDGET_MS", "200")
 # =============================================================================
 # Shared fixtures (add as needed)
 # =============================================================================
+@pytest.fixture(autouse=True)
+def _restore_policy_environment():
+    """Legacy batteries may set policies directly; each test owns its changes.
+
+    WHY (WP-11): whole-suite discovery must not let one test's off/enforce
+    settings become another test's defaults. This also restores removed keys.
+    Tests that use monkeypatch retain pytest's normal fixture teardown order.
+    """
+    with patch.dict(os.environ):
+        yield
+
+
 # Example placeholder -- uncomment and expand when shared fixtures are needed:
 #
 # import pytest

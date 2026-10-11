@@ -2,12 +2,34 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.3  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+v4.8.3: raw symbol fallback rows cross the engine's shared strict publication
+boundary before serialization. Internal tuple and margin evidence survives
+until that boundary; a failed finalizer cannot publish an unguarded raw row.
+
+v4.8.2 (2026-10-11) [WP-2b]: the per-request GLOBAL-RANK pass withholds a
+row the engine itself withheld from Rank (Overall). EVIDENCE (export
+2026-10-10, run 38071484709): the daily sync fetches the four market pages
+through this router (daily_sync.yml TFB_SYNC_MARKET_GATEWAY "analysis") in
+25-row batches, so _apply_global_rank_overall is the LAST ranker before the
+sheet; its predicate read only "numeric score and no low_data_trust". Under
+data_engine_v2 5.153.0 TFB_SETTLE_UNRESOLVED=enforce the 46 non-converged
+rows (GM 45 + CFX 1 today, all f7_settle_failed:non_converged) publish a
+numeric pass-1 score tagged settle_unresolved:enforce:..., and this pass
+would stamp them a within-batch rank over the engine's withheld one. FIX
+(tag-driven, exact token prefix, never a substring): a warning part starting
+with f7_settle_failed: or settle_unresolved: blanks the rank like a LOW-trust
+row (_RANK_WITHHELD_PREFIXES). Today every f7_settle_failed row already has
+a blank score, so the predicate changes nothing until the engine gate is
+armed: rows without either tag are byte-identical (ranked 1..N exactly as
+v4.8.1). This module is not pinned in scripts/verify_deployment.py MODULES.
+Functions added 1 (_rank_withheld_by_tag), removed 0; constants added 1. Rollback: git revert.
 
 v4.8.1: redact credentials from caught route, engine, and proxy diagnostics.
 
@@ -266,6 +288,7 @@ Co-deployment matrix (Wave 2A + Wave 3)
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import inspect
 import json
@@ -355,7 +378,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.1"
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.3"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -458,6 +481,10 @@ _RANKED_MARKET_PAGES = {
 # token in `warnings`; this router preserves that row's blank Rank (Overall)
 # instead of re-ranking it (keeps the engine's trust drop intact).
 _LOW_TRUST_TAG = "low_data_trust"
+# v4.8.2 (WP-2b): engine-withheld ranks are never re-ranked per request. Exact
+# token-prefix match on each ';' part of the warnings cell (never a substring:
+# margin_publish receipts end ':unresolved').
+_RANK_WITHHELD_PREFIXES = ("f7_settle_failed:", "settle_unresolved:")
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
     "Market_Leaders": 90,
@@ -1270,6 +1297,21 @@ def _coerce_rank_score(value: Any) -> Optional[float]:
     return f if f == f else None
 
 
+def _rank_withheld_by_tag(warnings: Any) -> bool:
+    """v4.8.2 [GLOBAL-RANK] (WP-2b): True when any ';' part of the warnings
+    cell (a string, or a list/tuple of strings) starts with one of
+    _RANK_WITHHELD_PREFIXES. Exact token prefix, case-insensitive; a cell
+    without such a part (every cell before the engine gate is armed) -> False."""
+    if warnings is None:
+        return False
+    items = warnings if isinstance(warnings, (list, tuple)) else (warnings,)
+    for item in items:
+        for part in str(item if item is not None else "").lower().split(";"):
+            if part.strip().startswith(_RANK_WITHHELD_PREFIXES):
+                return True
+    return False
+
+
 def _global_rank_enabled() -> bool:
     """v4.4.0 [GLOBAL-RANK]: master switch for the page-level Rank (Overall)
     pass (default ON). When OFF, rank_overall is passed through from upstream
@@ -1299,7 +1341,7 @@ def _apply_global_rank_overall(rows: List[Dict[str, Any]], page: str) -> int:
             continue
         score = _coerce_rank_score(row.get("overall_score"))
         warns = str(row.get("warnings") or "").lower()
-        if score is None or _LOW_TRUST_TAG in warns:
+        if score is None or _LOW_TRUST_TAG in warns or _rank_withheld_by_tag(row.get("warnings")):
             # Not rankable -> clear any per-batch rank it arrived with so the
             # blank correctly signals "not ranked" (engine no-score / LOW-trust).
             if "rank_overall" in row:
@@ -1676,6 +1718,28 @@ def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Seq
     if "current_price" in out and out.get("current_price") is None:
         out["current_price"] = _extract_from_nested_raw(raw, _key_variants("current_price"))
     return out
+
+
+def _finalize_raw_instrument_row(*, schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Mapping[str, Any], requested_symbol: str) -> Dict[str, Any]:
+    """Use the same publication boundary as the engine's sheet adapter.
+
+    Normalize aliases without discarding the raw row's private unit/tuple
+    receipts before finalization. Work on a copy so publication does not mutate
+    an enriched-quote cache. Already published adapter/proxy payloads bypass
+    this helper: presentation seams must run once per raw publication.
+    """
+    from core.data_engine_v2 import _strict_project_row
+
+    candidate = copy.deepcopy(dict(raw))
+    canonical = _normalize_to_schema_keys(
+        schema_keys=schema_keys, schema_headers=schema_headers, raw=candidate,
+    )
+    if "symbol" in schema_keys and not canonical.get("symbol"):
+        canonical["symbol"] = requested_symbol
+    candidate.update(canonical)
+    # Do not fail open here. The route's outer guard returns an empty partial
+    # response if the canonical finalizer is unavailable or fails.
+    return _strict_project_row(schema_keys, candidate)
 
 
 def _to_number(value: Any) -> float:
@@ -3226,12 +3290,19 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                     errors += 1
                 elif isinstance(raw, dict) and raw.get("error"):
                     errors += 1
-                normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
-                if "symbol" in keys and not normalized.get("symbol"):
-                    normalized["symbol"] = sym
+                normalized = _finalize_raw_instrument_row(
+                    schema_keys=keys, schema_headers=headers, raw=raw,
+                    requested_symbol=sym,
+                )
                 normalized_rows.append(normalized)
 
             if page == _TOP10_PAGE:
+                from core.data_engine_v2 import _top10_row_is_eligible, _t10_post_invariant_keep
+
+                normalized_rows = [
+                    row for row in normalized_rows
+                    if _top10_row_is_eligible(row) and _t10_post_invariant_keep(row)
+                ]
                 normalized_rows = _ensure_top10_rows(
                     normalized_rows,
                     requested_symbols=requested_symbols,
@@ -3240,6 +3311,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                     schema_headers=headers,
                 )
 
+            _apply_global_symbol_dedup(normalized_rows, page)
+            _apply_global_rank_overall(normalized_rows, page)
             normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
             status_out = "success" if errors == 0 else ("partial" if errors < len(requested_symbols) else "error")
             return _payload_envelope(
@@ -3259,6 +3332,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                     "returned": len(normalized_rows),
                     "errors": errors,
                     "dispatch": "instrument_mode",
+                    "publication_boundary": "core.data_engine_v2._strict_project_row",
                     "schema_source": schema_source,
                     "engine_source": engine_source,
                     "best_source": best_name or "engine",

@@ -37,7 +37,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Optional
 
 VERSION = "1.2.2"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000

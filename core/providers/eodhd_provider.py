@@ -2,6 +2,11 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
+v4.18.3 WHY (2026-10-11): explicitly retain USX as a USD-cent quote code
+with TFB_OPP_FX_USX_SUBUNIT armed (DEFAULT OFF). Keep prices in cents;
+the opportunity resolver owns conversion to SAR. Unarmed canonicalization
+retains the existing unknown-code uppercase pass-through byte-for-byte.
+
 v4.18.2: producer-owned margin unit receipts (TFB-05).
 Margins retain the supplier unit, raw scalar, source field and transform version
 before caching. Native ProfitMargin and OperatingMarginTTM carry fractions;
@@ -614,7 +619,7 @@ import random
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -638,6 +643,9 @@ PROVIDER_NAME = "eodhd"
 # scoring.py, sheet display) can reliably reason about them.
 
 _CURRENCY_CODE_CANONICAL: Dict[str, str] = {
+    # v4.18.3 WHY: USD cents keep their price unit. Do not relabel USX as
+    # USD; the opportunity resolver performs the /100 conversion when armed.
+    "USX": "USX",
     # GBP / pence
     "GBP": "GBP",
     "GBp": "GBX", "GBX": "GBX",
@@ -676,9 +684,12 @@ def _canonicalize_currency_code(code: Any) -> Optional[str]:
     s = s.strip()
     if not s:
         return None
+    su = s.upper()
+    if su == "USX" and (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() \
+            not in {"1", "true", "yes", "on"}:
+        return su  # legacy unknown-code pass-through, preserving cents prices
     if s in _CURRENCY_CODE_CANONICAL:
         return _CURRENCY_CODE_CANONICAL[s]
-    su = s.upper()
     if su in _CURRENCY_CODE_CANONICAL:
         return _CURRENCY_CODE_CANONICAL[su]
     return su
@@ -1141,7 +1152,7 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
-PROVIDER_VERSION = "4.18.2"
+PROVIDER_VERSION = "4.18.3"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens

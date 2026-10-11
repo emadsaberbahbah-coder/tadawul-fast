@@ -8,6 +8,15 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.2.3 — final publication requires current source publication runs and
+explicit consumed-source receipts on both decision surfaces. The receipt schema
+is ``source readiness VERIFIED (run <id>)``. Portfolio_Decision must emit this
+only after consuming the matching My_Portfolio publication; its current producer
+does not yet provide that proof, so final publication remains blocked until it
+does. A source checksum or warning archive receipt does not prove consumption,
+and these receipts do not authenticate custody. Standalone audits without an
+expected source run retain their existing behavior and approved row floors.
+
 VERSION 1.2.2 — explicit final-publication policy and optional source-run cohort
 proof. Defaults retain the standalone audit's existing policy and behavior.
 
@@ -57,7 +66,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
 from core.data_validity import coverage_validity  # noqa: E402
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -66,6 +75,10 @@ RUN_RE = re.compile(
     re.I,
 )
 POOL_RE = re.compile(r"(?P<page>[A-Za-z][A-Za-z0-9_]+)\s+(?P<used>\d+)\/(?P<total>\d+)")
+SOURCE_RUN_RE = re.compile(r"(?<![a-z0-9_])run\s*=\s*([^\s;|,]*)", re.I)
+SOURCE_READINESS_RE = re.compile(r"(?<![a-z0-9_])source\s+readiness\b", re.I)
+CONSUMED_SOURCE_RE = re.compile(
+    r"(?<![a-z0-9_])source readiness VERIFIED \(run ([1-9][0-9]*)\)", re.I)
 
 
 @dataclass(frozen=True)
@@ -233,6 +246,40 @@ def parse_status_grid(grid: Sequence[Sequence[Any]]) -> dict[str, StatusRow]:
     return rows
 
 
+def _source_publication_runs(grid: Sequence[Sequence[Any]]) -> dict[str, Optional[str]]:
+    """Only one page row and one positive run token establish its publication."""
+    headers = [s(value).casefold() for value in grid[0]] if grid else []
+    if headers.count("page") != 1 or headers.count("message") != 1:
+        return {}
+    pi, mi = headers.index("page"), headers.index("message")
+    messages: dict[str, list[str]] = {}
+    for row in grid[1:]:
+        if not isinstance(row, (list, tuple)) or max(pi, mi) >= len(row):
+            continue
+        page = s(row[pi])
+        if page:
+            messages.setdefault(page, []).append(s(row[mi]))
+    runs = {}
+    for page, values in messages.items():
+        tokens = SOURCE_RUN_RE.findall(values[0]) if len(values) == 1 else []
+        runs[page] = (tokens[0] if len(tokens) == 1 and
+                      re.fullmatch(r"[1-9][0-9]*", tokens[0]) else None)
+    return runs
+
+
+def _consumed_source_run(text: Any) -> Optional[str]:
+    """A unique producer receipt proves the consumed cohort, never wall time.
+
+    Count every source-readiness declaration, including withheld/malformed
+    declarations, so a valid marker cannot mask a contradictory one.
+    """
+    value = s(text)
+    matches = CONSUMED_SOURCE_RE.findall(value)
+    if len(SOURCE_READINESS_RE.findall(value)) != 1 or len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _age_hours(stamp: Optional[datetime], now_riyadh: datetime) -> Optional[float]:
     """v1.1.0 P-104: SIGNED age in hours (negative = stamp in the future).
     The old max(0.0, ...) clamp silently certified future timestamps as
@@ -290,6 +337,12 @@ def audit_surfaces(
     if not status_rows:
         report.fatal = "_Status header or rows could not be parsed"
         return report
+    strict_run = expected_source_run is not None
+    expected_run = str(expected_source_run) if strict_run else None
+    publication_runs = _source_publication_runs(status_grid) if strict_run else {}
+    if strict_run and not re.fullmatch(r"[1-9][0-9]*", expected_run):
+        report.findings.append(Finding("FAIL", "EXPECTED_SOURCE_RUN_INVALID", "Final_Publication",
+            "Expected source run must be one positive publication run ID; final readiness cannot use an unknown/local run."))
 
     floors = dict(
         min_rows
@@ -314,6 +367,15 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "PF_RUN_STALE", "Portfolio_Decision", f"Decision surface age exceeds {decision_max_age_h:g} hours."))
     if portfolio_state != "OK":
         report.findings.append(Finding("FAIL", "PF_STATUS_NOT_OK", "Portfolio_Decision", f"Embedded status is {portfolio_state or 'unknown'}, not OK."))
+    if strict_run:
+        portfolio_source_run = publication_runs.get("My_Portfolio")
+        if portfolio_source_run is None or portfolio_source_run != expected_run:
+            report.findings.append(Finding("FAIL", "PF_SOURCE_PUBLICATION_COHORT", "Portfolio_Decision",
+                f"My_Portfolio must have one _Status row with a unique run={expected_run} publication receipt; missing, repeated or different runs cannot certify this final publication."))
+        consumed = _consumed_source_run(portfolio_text)
+        if consumed is None or consumed != expected_run or consumed != portfolio_source_run:
+            report.findings.append(Finding("FAIL", "PF_SOURCE_CONSUMPTION_UNPROVEN", "Portfolio_Decision",
+                f"Portfolio_Decision must publish exactly one 'source readiness VERIFIED (run {expected_run})' receipt after consuming that My_Portfolio run. Its timestamp, holdings count and source checksum do not prove consumption; update the authenticated producer before final publication."))
 
     my_portfolio = status_rows.get("My_Portfolio")
     if my_portfolio is None:
@@ -352,6 +414,9 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "T10_RUN_STALE", "Top_10_Investments", f"Top-10 surface age exceeds {decision_max_age_h:g} hours."))
     if top10_state != "OK":
         report.findings.append(Finding("FAIL", "T10_STATUS_NOT_OK", "Top_10_Investments", f"Embedded status is {top10_state or 'unknown'}, not OK."))
+    if strict_run and _consumed_source_run(top10_text) != expected_run:
+        report.findings.append(Finding("FAIL", "T10_SOURCE_CONSUMPTION_UNPROVEN", "Top_10_Investments",
+            f"Top-10 must publish exactly one 'source readiness VERIFIED (run {expected_run})' receipt for its consumed source cohort; refresh after that run completes. A recent Last run stamp does not prove current source consumption."))
 
     incomplete_sources: list[str] = []
     for page, floor in floors.items():
@@ -361,12 +426,10 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "SOURCE_STATUS_MISSING", "Top_10_Investments", f"{page} is absent from _Status."))
             continue
         report.source_status[page] = asdict(item)
-        if expected_source_run is not None:
-            runs = re.findall(r"(?<![a-z0-9_])run\s*=\s*([^\s;|,]*)", item.message, re.I)
-            if (not re.fullmatch(r"[1-9][0-9]*", str(expected_source_run))
-                    or len(runs) != 1 or runs[0] != str(expected_source_run)):
+        if strict_run:
+            if publication_runs.get(page) != expected_run:
                 report.findings.append(Finding("FAIL", "SOURCE_PUBLICATION_COHORT", "Top_10_Investments",
-                    f"{page} does not prove the expected final-publication source run."))
+                    f"{page} must have one _Status row with a unique run={expected_run} receipt for this final-publication source cohort."))
         fresh_minimum = (_env_float("TFB_REFRESH_MIN_FRESH_PCT_"+page.upper(),95.0)
                          if min_fresh_percent is None else
                          min_fresh_percent.get(page,95.0) if isinstance(min_fresh_percent,Mapping)

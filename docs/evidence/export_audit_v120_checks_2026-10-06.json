@@ -1,0 +1,233 @@
+{
+  "defaults_identical_to_v111": {
+    "market_pages": true,
+    "run_log": true
+  },
+  "margin_findings": [
+    {
+      "check": "Market_Leaders.profit_margin_unit_errors",
+      "count": 151,
+      "detail": "63.7% of 237 populated margins are > 1.0 without a matching fraction receipt (P-152 unit error)",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "FAIL"
+    },
+    {
+      "check": "Market_Leaders.margin_receipt_certified_over_100pct",
+      "count": 0,
+      "detail": "exact-value fraction receipt; supplier plausibility requires owner review",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Market_Leaders.profit_margin_below_minus_100pct",
+      "count": 3,
+      "detail": "negative margin magnitude is not evidence of a percent-points unit error",
+      "examples": [
+        "2130.SR -1.07297",
+        "4335.SR -1.06417",
+        "3091.SR -1.12169"
+      ],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "WARN"
+    },
+    {
+      "check": "Market_Leaders.gross_operating_margin_over_1",
+      "count": 2,
+      "detail": "gross 0, operating 2",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "WARN"
+    },
+    {
+      "check": "Global_Markets.profit_margin_unit_errors",
+      "count": 2253,
+      "detail": "41.9% of 5378 populated margins are > 1.0 without a matching fraction receipt (P-152 unit error)",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "FAIL"
+    },
+    {
+      "check": "Global_Markets.margin_receipt_certified_over_100pct",
+      "count": 0,
+      "detail": "exact-value fraction receipt; supplier plausibility requires owner review",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Global_Markets.profit_margin_below_minus_100pct",
+      "count": 172,
+      "detail": "negative margin magnitude is not evidence of a percent-points unit error",
+      "examples": [
+        "JAGX.US -1.3085",
+        "PSTV.US -2.3024",
+        "NUWE.US -1.2563",
+        "WW.US -15.22",
+        "FTFT.US -1.5755",
+        "SLE.US -1.9033",
+        "SECZ.US -1.0005",
+        "MPU.US -1.3138"
+      ],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "WARN"
+    },
+    {
+      "check": "Global_Markets.gross_operating_margin_over_1",
+      "count": 5497,
+      "detail": "gross 3121, operating 2376",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "WARN"
+    },
+    {
+      "check": "Commodities_FX.profit_margin_unit_errors",
+      "count": 0,
+      "detail": "0.0% of 2 populated margins are > 1.0 without a matching fraction receipt (P-152 unit error)",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Commodities_FX.margin_receipt_certified_over_100pct",
+      "count": 0,
+      "detail": "exact-value fraction receipt; supplier plausibility requires owner review",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Commodities_FX.profit_margin_below_minus_100pct",
+      "count": 0,
+      "detail": "negative margin magnitude is not evidence of a percent-points unit error",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Mutual_Funds.profit_margin_unit_errors",
+      "count": 0,
+      "detail": "0.0% of 2 populated margins are > 1.0 without a matching fraction receipt (P-152 unit error)",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Mutual_Funds.margin_receipt_certified_over_100pct",
+      "count": 0,
+      "detail": "exact-value fraction receipt; supplier plausibility requires owner review",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    },
+    {
+      "check": "Mutual_Funds.profit_margin_below_minus_100pct",
+      "count": 0,
+      "detail": "negative margin magnitude is not evidence of a percent-points unit error",
+      "examples": [],
+      "gate": "a",
+      "lane": "DATA",
+      "status": "PASS"
+    }
+  ],
+  "margin_metrics": {
+    "Commodities_FX": {
+      "pm_below_minus_1": 0,
+      "pm_n": 2,
+      "pm_over_1": 0,
+      "pm_receipt_certified_over_1": 0
+    },
+    "Global_Markets": {
+      "pm_below_minus_1": 172,
+      "pm_n": 5378,
+      "pm_over_1": 2253,
+      "pm_receipt_certified_over_1": 0
+    },
+    "Market_Leaders": {
+      "pm_below_minus_1": 3,
+      "pm_n": 237,
+      "pm_over_1": 151,
+      "pm_receipt_certified_over_1": 0
+    },
+    "Mutual_Funds": {
+      "pm_below_minus_1": 0,
+      "pm_n": 2,
+      "pm_over_1": 0,
+      "pm_receipt_certified_over_1": 0
+    }
+  },
+  "observed_asof": "2026-10-06",
+  "quota_findings": [
+    {
+      "check": "eodhd_daily_over_target",
+      "count": 7,
+      "detail": "above cost target 90,000; plan threshold is a separate check (today excluded as partial)",
+      "examples": [
+        "2026-09-29 138,061",
+        "2026-09-30 103,425",
+        "2026-10-01 118,631",
+        "2026-10-02 113,987",
+        "2026-10-03 111,947",
+        "2026-10-04 104,366",
+        "2026-10-05 91,674"
+      ],
+      "gate": "e",
+      "lane": "PIPELINE",
+      "status": "WARN"
+    },
+    {
+      "check": "eodhd_daily_plan_threshold",
+      "count": 0,
+      "detail": "usage >= 75% of recorded plan, or invalid zero plan (today excluded as partial)",
+      "examples": [],
+      "gate": "e",
+      "lane": "PIPELINE",
+      "status": "PASS"
+    }
+  ],
+  "quota_metrics": {
+    "eodhd_daily_limit": {
+      "2026-09-29": 400000,
+      "2026-09-30": 400000,
+      "2026-10-01": 400000,
+      "2026-10-02": 400000,
+      "2026-10-03": 400000,
+      "2026-10-04": 400000,
+      "2026-10-05": 400000,
+      "2026-10-06": 400000
+    },
+    "eodhd_daily_max": {
+      "2026-09-29": 138061,
+      "2026-09-30": 103425,
+      "2026-10-01": 118631,
+      "2026-10-02": 113987,
+      "2026-10-03": 111947,
+      "2026-10-04": 104366,
+      "2026-10-05": 91674,
+      "2026-10-06": 96584
+    }
+  },
+  "replay_now": "2026-10-06T21:00:00+00:00",
+  "scope": "market pages and quota checks only; workbook data dates are 2026-10-06, not the brief 2026-10-10 export",
+  "source": "_Market Share Deepseek-V3 (1).xlsx",
+  "source_sha256": "9c8b34812eee7d5554a3586f1f86a232e79159f24e228a4eac070e2436441ef4",
+  "switches": {
+    "eodhd_fail_pct": 75,
+    "margin_receipts": true,
+    "note": "75% is an evidence demonstration, not an owner-selected production threshold"
+  }
+}

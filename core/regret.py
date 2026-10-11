@@ -42,7 +42,7 @@ inventing a number when a price is missing.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 __version__ = "1.0.0"

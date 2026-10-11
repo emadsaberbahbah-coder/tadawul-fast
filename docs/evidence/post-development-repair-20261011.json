@@ -1,0 +1,250 @@
+{
+  "schema": "tfb.post-development-release/v1",
+  "generated_at_utc": "2026-10-11T21:31:34.932136+00:00",
+  "state": "repository_repairs_verified_live_acceptance_blocked",
+  "release_accepted": false,
+  "live_writes_performed": false,
+  "deployed_by_this_session": false,
+  "repository": {
+    "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast",
+    "branch": "codex/tfb-post-review-2026-10-11",
+    "commit_binding": "The enclosing git commit identifies this repository evidence. The exported manifest resolves its exact SHA.",
+    "base_main_sha": "616f60605b6113dfdda362c3b0b9d689507d65ee",
+    "integrated_claude_sha": "1199db5f15727071d1f1894722301161c90af0ba",
+    "integrated_pr_750_sha": "4e500744139ddeba4b6a330b2b4cc9ba57c5d855"
+  },
+  "request_basis": {
+    "attachment": "TFB_Post_Development_Review_2026-10-11 (1).pdf",
+    "attachment_sha256": "1d3ffc3975d3880e51b97b229fd0fcfbaed411b04844cfb9fed29ac1340ac211",
+    "user_request": "Let's do the required update",
+    "boundary": "Attachment findings inform implementation; operator actions in the attachment do not independently authorize live financial execution."
+  },
+  "components": {
+    "core/data_engine_v2.py": {
+      "version": "5.154.0",
+      "sha256": "9a829b7f9fe373362ee0e0d71373054ff4da4fbd068ef6e8fea773e000afbf1f"
+    },
+    "core/analysis/opportunity_builder.py": {
+      "version": "1.26.1",
+      "sha256": "3f8542e88927b3068f833a3d7fd3dba055a45d871f97411e831fce3b1465bb31"
+    },
+    "core/enriched_quote.py": {
+      "version": "4.11.2",
+      "sha256": "a2484395f0df6c0951614217b79a3f6cf626159168570d867c9f0920a03dca4d"
+    },
+    "routes/analysis_sheet_rows.py": {
+      "version": "4.8.3",
+      "sha256": "73df2b382ab104454ca9cc4091c88953db4ebe7af8b29ce932ceeec1cccbaac0"
+    },
+    "scripts/run_dashboard_sync.py": {
+      "version": "6.67.0",
+      "sha256": "58a3deb69d4a0c4c2585b8b0ed873eb1137c5cfd7a0d40471cf5514308830682"
+    },
+    "scripts/run_daily_brief.py": {
+      "version": "1.18.0",
+      "sha256": "a04501ebc514fd18a78ac0c81597c9d2843a2a07272b62217671b85dd6fa5c90"
+    },
+    "scripts/track_performance.py": {
+      "version": "6.45.0",
+      "sha256": "f58f2dafb2759b5dcaa6e0fcc50d8838f2f89422995f8902c198e34563ecdf5a"
+    },
+    "scripts/audit_decision_surface_freshness.py": {
+      "version": "1.2.3",
+      "sha256": "cd5a9a31fdf3992fb7d35f463d6bbb4c423d1e71b1eb28156f2bc2eed03af52c"
+    },
+    "scripts/verify_deployment.py": {
+      "version": "1.0.51",
+      "sha256": "e476bea3320af91ce48d1427e9706f5b011020a3c5e57379312dcabe86960df0"
+    },
+    "apps_script/16_Decision_Top10.gs": {
+      "version": "1.13.5",
+      "sha256": "0835c54b1db79b8effbfa0733129791215351a7fba444e89dbf707ee24144dd8",
+      "installed_version": null,
+      "installed_sha256": null
+    },
+    ".github/workflows/ci.yml": {
+      "sha256": "42355f898f47bc22f43c40098124f1956f1d655e88a2fa880d590c5c4f3a14fb"
+    },
+    ".github/workflows/daily_sync.yml": {
+      "sha256": "da8bfedc4daa113504f7575c9119462ed7e25d9a70e57d7eebc200a43c788e0e"
+    },
+    ".github/workflows/track_performance.yml": {
+      "sha256": "d5362f74fbce31ec588514da8eed1b49bb30847bfda30c25dce1dae4a745f4a2"
+    },
+    ".github/workflows/decision_surface_freshness.yml": {
+      "sha256": "d90c7c3cfae1023f90e34d68f1b0f2d9db5d9568c1ed43774414e6d17091818e"
+    },
+    ".github/workflows/workflow_repair_tests.yml": {
+      "sha256": "39b42fcc49c2660de7cac008bf204337fb838cf858ccbd9a3ea3d1574d6e9297"
+    },
+    "scripts/harness_w1a6.py": {
+      "sha256": "f0cfef55847ac495f58fb2d31e757a4e1331679a478f5142ff483d4ae4e01dea",
+      "version": "2.4.0"
+    }
+  },
+  "repairs": [
+    "Integrate latest Claude development and PR 750 without dropping either branch feature set.",
+    "Retain original warning details on archive failure; bind compaction to verified archive receipts and distinguish RAW-update acknowledgement from live readback.",
+    "Keep upstream freshness diagnostic separate from final feed acceptance; preserve final-publication vetoes across scoped legs and retries.",
+    "Apply the shared strict publication boundary to raw quote fallback and preserve eligibility/ranking invariants.",
+    "Keep unavailable portfolio values unavailable in all brief formats; honor the final feed veto and identify blocked actions.",
+    "Remove EQ fraction-to-percentage 100x conflict; retain small-price forecasts through combined precision, soft-cap and tuple gates.",
+    "Clear stale native input-truth indicators; validate partial/invalid policy and use actual backend news-gate evidence.",
+    "Require dated target vintage, normalize quote clocks and enforce USD/100 for USX.",
+    "Stage and checksum native candidate publications, including empty runs; refuse incomplete, corrupted or mismatched receipts.",
+    "Require matching source-run and consumed-source receipts on both panels during final-publication auditing.",
+    "Add opt-in prospective canonical target receipts and publication replay protection; keep legacy records and calibration unchanged.",
+    "Register the repairs in blocking CI and refresh deployment pins and static flag inventory.",
+    "Run parameterized audit regressions in dedicated workflows, install PDF test dependencies for full discovery and update the legacy sync harness for final-veto preservation."
+  ],
+  "verification": {
+    "python": "3.11.9",
+    "production_dependencies": "requirements.txt exact pins; no production dependency upgrades",
+    "full_pytest": "4046 passed, 9 skipped, 3 warnings, 131 subtests passed in 142.64s (0:02:22)",
+    "full_pytest_exit": 0,
+    "ci_environment_replay": {
+      "CI": "true",
+      "GITHUB_ACTIONS": "true",
+      "GITHUB_EVENT_NAME": "pull_request",
+      "GITHUB_RUN_ID": "90001 (synthetic fixture identity)",
+      "TZ": "Asia/Riyadh"
+    },
+    "skip_reasons": [
+      "Unavailable historical negative baselines",
+      "Unavailable real GM/My_Portfolio/export workbook fixtures",
+      "Two existing optional Top10 schema capability checks"
+    ],
+    "node_harnesses": {
+      "active_harnesses_passed": 11,
+      "scope": "All active repository Node harnesses; no live Google services"
+    },
+    "gas_input_truth_dual_tree": {
+      "passed": 23,
+      "baseline_version": "1.13.3",
+      "baseline": "origin/main"
+    },
+    "deterministic_sync_harness": {
+      "version": "2.4.0",
+      "passed": 94,
+      "total": 94,
+      "exit": 0,
+      "unavailable_actual_export_suite_skipped": true
+    },
+    "dedicated_audit_workflows_minimal_environment": {
+      "workflow_repair_tests": "64 passed, 7 subtests passed",
+      "decision_surface_freshness": "35 passed"
+    },
+    "brief_without_reportlab": "40 passed, 3 explicit PDF skips; feed/model/HTML/text veto tests remain unconditional",
+    "ruff_fatal_rules": "PASS (E9,F63,F7,F82)",
+    "compile": "PASS",
+    "scoped_pyright_errors": 0,
+    "local_deployment_version_pins": {
+      "module_pins_matched": 34,
+      "script_pins_matched": 23,
+      "not_deployed_readback": true
+    },
+    "workflow_audit": {
+      "errors": 0,
+      "existing_warnings": 2
+    },
+    "export_audit_selftest": {
+      "passed": 50,
+      "total": 50,
+      "digest": "e4a1dd8650ad62f9"
+    },
+    "remote_ci": {
+      "state": "pending_exact_commit_readback"
+    },
+    "limits": "Fixture and offline checks do not establish custody, supplier coverage, installed GAS behavior, live idempotence or investment performance."
+  },
+  "rollout": {
+    "effective_live_configuration": null,
+    "new_controls_armed_in_production_by_this_session": false,
+    "static_defaults_only": {
+      "Render": {
+        "TFB_PRICE_PRECISION": "0",
+        "TFB_ROI12_SOFTCAP_GATE": "off",
+        "TFB_TUPLE_NOISE_RELEASE": "off",
+        "TFB_EQ_ROI_UNIT_SENTRY": "off",
+        "TFB_SETTLE_UNRESOLVED": "off",
+        "TFB_OPP_FX_USX_SUBUNIT": "0"
+      },
+      "GitHub_Actions": {
+        "TFB_DQ_AUDIT_MODE": "off",
+        "TFB_WARNINGS_COMPACT": "off",
+        "TRACK_CANONICAL_TARGETS": "0",
+        "TRACK_SIGNAL_PUBLICATION_MODE": "off"
+      },
+      "Apps_Script": {
+        "DT10_INPUT_TRUTH": "off",
+        "DT10_CAND_TAB": "off",
+        "DT10_VINTAGE_COLS": "off"
+      }
+    },
+    "flag_inventory": {
+      "static_names": 869,
+      "path": "docs/flags.md",
+      "not_live_configuration": true
+    },
+    "sequence": "Capture baseline, observe, then one enforce change with a successful refresh, exact live readback and outcome audit.",
+    "rollback_reference": "Prior production/main SHA 616f60605b6113dfdda362c3b0b9d689507d65ee; disable each new control and restore affected worksheet state from a verified backup. Rollback has not been executed or certified."
+  },
+  "preserved_acceptance_requirements": {
+    "approved_roster_floors": {
+      "Market_Leaders": 1025,
+      "Global_Markets": 6512,
+      "Commodities_FX": 453,
+      "Mutual_Funds": 4496
+    },
+    "minimum_approved_names_pct": 99,
+    "minimum_fresh_market_acquisition_pct": 95,
+    "portfolio_without_authenticated_inputs": "BLOCK",
+    "strict_audits_required_exit": 0,
+    "historical_performance_migration": "not performed"
+  },
+  "live_observation": {
+    "read_at_utc": "2026-10-11 21:16:01 UTC",
+    "spreadsheet_url": "https://docs.google.com/spreadsheets/d/1QaOSNHqKlCaqlnaB45O4RlajWeMNe5cAE-r2HGwsG04/edit",
+    "ranges": [
+      "_Status!L1:M60",
+      "Top_10_Investments!A18:B18",
+      "Portfolio_Decision!A15:A18"
+    ],
+    "decision_feed": "NOT_ACTIONABLE(final_publication) | run=38160764856 | 2026-10-11 22:07:30+03:00 | coverage_failed,decision_failed",
+    "top10_executable_tickets": 0,
+    "portfolio_actions": [
+      "BLOCK",
+      "BLOCK",
+      "BLOCK",
+      "BLOCK"
+    ],
+    "interpretation": "Read-only production baseline, not acceptance of the prepared code.",
+    "public_health": {
+      "read_at_utc": "2026-10-11T21:20:19.277223+00:00",
+      "url": "https://tadawul-fast-bridge.onrender.com/health",
+      "http_status": 200,
+      "status": "healthy",
+      "ready": true,
+      "engine_version": "5.151.9",
+      "render_git_commit": "616f60605b6113dfdda362c3b0b9d689507d65ee"
+    }
+  },
+  "remaining_live_acceptance_evidence": [
+    "Owner-approved roster restoration and fresh acquisitions at the original floors; no missing-symbol list has been invented.",
+    "Authentic bound-project exports for My_Portfolio, Portfolio_PnL, Lists_Config, Portfolio_Ledger and Trade_Notes; installed script hash/version, properties and selftest witnesses.",
+    "Authoritative broker positions/costs, settled and reserved cash, account/instrument links, source clocks and dated FX; declared references alone do not authenticate custody.",
+    "Portfolio_Decision authentic producer must emit its consumed My_Portfolio run receipt; both panels also need actual source checksum binding before full run/hash acceptance can be certified.",
+    "Exact reviewed-candidate Render SHA, health and effective configuration; public health still reports the prior main SHA. Workspace confirmation is pending for connector control-plane reads.",
+    "Successful complete refresh, strict source/coverage/decision audits, explicit final release and saved exact live write readbacks.",
+    "Tracker simultaneous-writer serialization and live replay evidence before claiming global idempotence; historical units, target/stop path hits, fills, fees/FX net outcomes and calibration cohorts remain separate."
+  ],
+  "live_release_receipts": {
+    "candidate_render_sha": null,
+    "observed_production_sha": "616f60605b6113dfdda362c3b0b9d689507d65ee",
+    "installed_gas_hash": null,
+    "effective_flags": null,
+    "input_evidence_ids": null,
+    "worksheet_write_ids": [],
+    "final_acceptance": null
+  }
+}

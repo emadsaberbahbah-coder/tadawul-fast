@@ -32,7 +32,7 @@ import copy
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 

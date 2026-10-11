@@ -6,13 +6,19 @@ permanent request and KEEP-LAST-GOOD can preserve it indefinitely. This module
 contains the small, auditable set of symbol lifecycle and identity rules needed
 for known collision cases. It performs no network calls and has no investment
 or scoring logic.
+
+v1.3.0 WHY (2026-10-10 WP-05): share the export audit crypto-name
+vocabulary with runner last-good certification, without changing existing
+canonicalization or curated token semantics.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableSequence, Sequence
 
-POLICY_VERSION = "1.2.0"
+from core.symbols.crypto_identity import CRYPTO_NAME_TOKENS, crypto_name_matches
+
+POLICY_VERSION = "1.3.0"
 CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.0.0"
 
 # Provider-safe canonical identifiers. EODHD uses the .US exchange suffix and
