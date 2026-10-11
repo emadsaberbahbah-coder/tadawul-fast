@@ -33,6 +33,33 @@ name: "💾 TFB Workbook Backup"
 #      — two overlapping exports could race the retention prune.
 # ROLLBACK: revert this file (each item is independent).
 # ============================================================================
+# v1.2.0 (2026-10-11) — [WP-0] SAME-JOB WORKBOOK DQ AUDIT, OFF BY DEFAULT.
+# WHY: the audit framework's 75-check catalogue (DQ-01..DQ-75) was measured by
+# hand on the 2026-10-11 export; nothing in CI produced the numbers daily. The
+# 2026-10-10 export (22,487,265 bytes, 50 tabs, 9,791 live rows) showed 275
+# rows without a price, 153 ROI-12M soft-cap breaches, 2,618 F-7 flips, 21,670
+# duplicate Signal_History keys and a 4/4 BLOCK portfolio page on 3 consecutive
+# runs — invisible to every workflow because no step ever held the exported
+# bytes (backup_workbook.py keeps them in memory; there is no upload-artifact).
+# GATE: repo Variable TFB_DQ_AUDIT_MODE = off | observe | enforce.
+#   unset / off (default) -> TFB_BACKUP_LOCAL_COPY resolves to '' (backup
+#       script v1.5.0 behaves exactly as v1.4.0), the two new steps are skipped
+#       by their `if:` -> the workflow is byte-equivalent in effect to v1.1.0.
+#   observe -> backup_workbook.py v1.5.0 also writes the export to
+#       $RUNNER_TEMP/tfb_export.xlsx; scripts/tfb_workbook_dq_audit.py runs on
+#       it with the committed baseline fixture; continue-on-error keeps the
+#       nightly backup green (an amber annotation only); the scorecard goes to
+#       the step summary and dq_report.json + dq_scorecard.md (counts, symbols,
+#       dates — redaction-guarded, never a balance or quantity) are uploaded as
+#       artifact tfb-dq-audit-<run_id> (30 days).
+#   enforce -> same, but a decision-critical regression vs the baseline
+#       reddens the job (the backup itself has already succeeded by then).
+# THE XLSX IS NEVER UPLOADED: it stays on the runner and is removed in the
+# always() cleanup step together with the credentials file.
+# Arming: set the Variable to observe, read the `[DQ-AUDIT v1.0.0] ...` line
+# of the next run, then enforce. ROLLBACK: delete the env line, the two steps
+# and the cleanup extension (or set the Variable to off — same effect).
+# ============================================================================
 
 on:
   schedule:
@@ -116,6 +143,9 @@ jobs:
           # interpolated into the shell line. Scheduled runs: both empty.
           INPUT_RESTORE_TEST: ${{ github.event.inputs.restore_test }}
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          # v1.2.0 [WP-0]: empty unless TFB_DQ_AUDIT_MODE is observe/enforce, so
+          # backup_workbook.py v1.5.0 behaves exactly as v1.4.0 by default.
+          TFB_BACKUP_LOCAL_COPY: ${{ (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && format('{0}/tfb_export.xlsx', runner.temp) || '' }}
         run: |
           set -euo pipefail
           EXTRA=""
@@ -124,7 +154,38 @@ jobs:
           echo "restore_test='${INPUT_RESTORE_TEST:-<scheduled: none>}' dry_run='${INPUT_DRY_RUN:-<scheduled: none>}' -> args='${EXTRA:-<full backup>}'"
           python scripts/backup_workbook.py $EXTRA
 
+      # v1.2.0 [WP-0]: offline DQ-01..DQ-75 audit of the bytes just exported.
+      # Skipped unless the repo Variable TFB_DQ_AUDIT_MODE is observe/enforce;
+      # observe never reddens the backup (continue-on-error). The xlsx is read
+      # from the runner and is never uploaded. Exit 1 = decision-critical
+      # regression vs the committed baseline fixture.
+      - name: Workbook DQ audit (WP-0)
+        if: ${{ success() && (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && github.event.inputs.restore_test != 'true' }}
+        continue-on-error: ${{ vars.TFB_DQ_AUDIT_MODE != 'enforce' }}
+        env:
+          TFB_DQ_AUDIT_MODE: ${{ vars.TFB_DQ_AUDIT_MODE }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/tfb_export.xlsx"
+          python scripts/tfb_workbook_dq_audit.py "$RUNNER_TEMP/tfb_export.xlsx" \
+            --json dq_report.json --md dq_scorecard.md \
+            --baseline tests/fixtures/dq_baseline_2026-10-10.json --quiet | tee -a "$GITHUB_STEP_SUMMARY"
+          cat dq_scorecard.md >> "$GITHUB_STEP_SUMMARY"
+
+      # v1.2.0 [WP-0]: only the redacted report and scorecard — never the xlsx.
+      - name: Upload DQ report
+        if: ${{ always() && (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && github.event.inputs.restore_test != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfb-dq-audit-${{ github.run_id }}
+          path: |
+            dq_report.json
+            dq_scorecard.md
+          retention-days: 30
+          if-no-files-found: warn
+
       # v1.1.0: the key file never outlives the job, whatever failed above.
+      # v1.2.0 [WP-0]: the local export copy never outlives the job either.
       - name: Remove Google credentials
         if: always()
-        run: rm -f "$RUNNER_TEMP/gcreds.json"
+        run: rm -f "$RUNNER_TEMP/gcreds.json" "$RUNNER_TEMP/tfb_export.xlsx"
