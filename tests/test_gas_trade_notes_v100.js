@@ -57,6 +57,14 @@ function makeWorld(props) {
 const out = []; let fails = 0;
 function T(name, cond, detail) { out.push((cond ? 'PASS ' : 'FAIL ') + name + (detail ? ' | ' + detail : '')); if (!cond) { fails++; } }
 
+// Version floor, not an exact pin: a later release must not turn this
+// harness red (2026-10-07, v1.0.1 bumped the constant).
+function verAtLeast(v, floor) {
+  const a = String(v).split('.').map(Number), b = floor.split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== (b[i] || 0)) { return (a[i] || 0) > (b[i] || 0); } }
+  return true;
+}
+
 function formIndex(ctx, key) {
   const rows = ctx.TFB_TN_FORM.concat(ctx.TFB_TN_SCORE_FORM);
   return rows.findIndex((r) => r[0] === key) + 2;
@@ -68,7 +76,7 @@ function run() {
     const w = makeWorld();
     const v = w.ctx.tbTradeNotesSelfTest();
     T('T1 selftest', v === 'trade notes core: ok', v);
-    T('T1 header 28 cols, Gen-independent', w.ctx.TFB_TN_HEADER.length === 28 && w.ctx.TFB_TRADE_NOTES_VERSION === '1.0.0');
+    T('T1 header 28 cols, Gen-independent', w.ctx.TFB_TN_HEADER.length === 28 && verAtLeast(w.ctx.TFB_TRADE_NOTES_VERSION, '1.0.0'));
   }
   // T2 setup idempotent
   {
@@ -98,7 +106,7 @@ function run() {
     const ok = w.ctx.tbLogTradeNoteFromInput();
     T('T3 logged id', ok === 'OK:TN-20260928-001', ok);
     const row = w.sheets._Trade_Notes.rows[1];
-    T('T3 row content', row[0] === 'TN-20260928-001' && row[2] === 'FILL+DIVERGENCE' && row[3] === '2026-09-28' && row[4] === 'AER.US' && row[5] === 'BUY' && row[6] === 14 && row[7] === 148.18 && row[11] === 'OVERRIDE' && row[12] === 'YES' && row[13] === 'JUDGMENT' && row[14] === 'D-1' && row[16].indexOf('AER earns') === 0 && row[21] === 8.3 && row[22] === '' && row[27] === '1.0.0', JSON.stringify([row[0]].concat(row.slice(2, 16))).slice(0, 200));
+    T('T3 row content', row[0] === 'TN-20260928-001' && row[2] === 'FILL+DIVERGENCE' && row[3] === '2026-09-28' && row[4] === 'AER.US' && row[5] === 'BUY' && row[6] === 14 && row[7] === 148.18 && row[11] === 'OVERRIDE' && row[12] === 'YES' && row[13] === 'JUDGMENT' && row[14] === 'D-1' && row[16].indexOf('AER earns') === 0 && row[21] === 8.3 && row[22] === '' && row[27] === w.ctx.TFB_TRADE_NOTES_VERSION, JSON.stringify([row[0]].concat(row.slice(2, 16))).slice(0, 200));
     const formVals = inp.getRange(2, 2, w.ctx.TFB_TN_FORM.length, 1).getValues().map((r) => r[0]);
     T('T3 form cleared after log', formVals.every((v) => v === ''));
     // D2 same day -> -002
