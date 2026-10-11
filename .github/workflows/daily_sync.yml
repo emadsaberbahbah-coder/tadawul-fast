@@ -1140,6 +1140,9 @@ jobs:
       # (no Performance_Log spam). Non-blocking: a tracking hiccup must never
       # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
       # wall — empty secret keeps today's anonymous behavior exactly.
+      # (2026-10-11) True for Performance_Log; Signal_History snapshots are NOT
+      # deduped on write until TRACK_DEDUP_SIGNAL_HISTORY reaches enforce
+      # (track_performance v6.44.0 measures them; see the env block below).
       - name: 📈 Track Performance (record + audit)
         # 2026-09-01 (duplicate-cohort ROOT CAUSE): this step ran in EVERY matrix
         # leg, so each sync recorded the day's cohorts three times (plus the
@@ -1177,6 +1180,19 @@ jobs:
           # env var would never be seen. Enforce = separate sitting with the S-1
           # criterion-4 boundary note.
           TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
+          # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
+          # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
+          # Unset -> 'off' / '0' / 'off' = the script defaults = byte-identical.
+          # WHY HERE TOO: PerformanceStore.save_records rewrites every row, so
+          # TRACK_RISK_BLANK armed in one lane only would be undone by this lane's
+          # next save. READ-BACK: job-log lines '[v6.41.0 DEDUP-MATURED] mode=...'
+          # and '[v6.44.0 DEDUP-SIGNAL] mode=...' plus the ' | dedup_matured' and
+          # ' | dedup_signal' tokens on the [PERF-VERDICT] _Run_Log line.
+          # ROLLBACK: delete the three lines (or unset the Variables).
+          TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
+          TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
+          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
