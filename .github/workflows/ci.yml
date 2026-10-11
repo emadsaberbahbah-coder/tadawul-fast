@@ -7,7 +7,8 @@
 # v1.1.5: enumerate the suites delivered by the 2026-10-11 audit-framework work
 # packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
 # tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity);
-# tests/js/decision_input_truth.test.js (WP-8 cockpit input truth, native job).
+# tests/js/decision_input_truth.test.js (WP-8 cockpit input truth, native job);
+# tests/test_workbook_dq_audit.py (WP-0 DQ-01..75 harness, heavy job, openpyxl).
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -554,6 +555,11 @@ jobs:
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py
+
+      - name: 📊 Run workbook DQ audit harness (WP-0)
+        # The golden run on the real export (P12) is skipped here: the export is
+        # never committed. P1-P11 exercise the checks on synthetic workbooks.
+        run: python -m pytest -q tests/test_workbook_dq_audit.py
 
       - name: ⚙️ Run outcome evidence with production calendars
         run: python -m pytest -q tests/test_outcome_price_evidence.py
