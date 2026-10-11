@@ -310,6 +310,17 @@ jobs:
       # fetch-failed rows. Explicit words only; delete the line (or "off") for
       # v6.61.0 stamp text verbatim.
       TFB_SYNC_FETCHFAIL_TRUTH: "observe"
+      # v6.65.0 WP-6 WARNINGS-COMPACT (2026-10-11): off = byte-identical cells,
+      # _Status, _Run_Log and sync_summary.json (one startup boot line only);
+      # observe = one [WARNINGS-COMPACT] line + one _Run_Log WOULD_COMPACT row
+      # per market page per leg (values untouched); enforce = the enumerated
+      # engine-internal telemetry families leave the Warnings cell for the
+      # per-leg artifact sync_row_telemetry_<Page>_<run>.jsonl (every token
+      # with a sheet reader stays). Explicit words only ('1'/'true' read as
+      # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
+      # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -1350,6 +1361,7 @@ jobs:
             sync_execution.log
             sync_summary.json
             validate_dashboard.json
+            sync_row_telemetry_*.jsonl
           retention-days: 7
           compression-level: 6
           if-no-files-found: warn
@@ -1588,6 +1600,17 @@ jobs:
       # v6.62.0 P-162 stamp truth - same observe arming as the sync-dashboard job
       # (the replay subprocess stamps pages too).
       TFB_SYNC_FETCHFAIL_TRUTH: "observe"
+      # v6.65.0 WP-6 WARNINGS-COMPACT (2026-10-11): off = byte-identical cells,
+      # _Status, _Run_Log and sync_summary.json (one startup boot line only);
+      # observe = one [WARNINGS-COMPACT] line + one _Run_Log WOULD_COMPACT row
+      # per market page per replay (values untouched); enforce = the enumerated
+      # engine-internal telemetry families leave the Warnings cell for the
+      # per-leg artifact sync_row_telemetry_<Page>_<run>.jsonl (every token
+      # with a sheet reader stays). Explicit words only ('1'/'true' read as
+      # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
+      # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
       # page replay run_inline_page_recovery.py parses the page's last
       # [EODHD-QUOTA v6.60.0] line from the same artifact logs the audit reads
@@ -1692,6 +1715,7 @@ jobs:
           path: |
             inline-recovery-plan.json
             inline-recovery-summary.json
+            sync_row_telemetry_*.jsonl
           retention-days: 30
           if-no-files-found: warn
 
