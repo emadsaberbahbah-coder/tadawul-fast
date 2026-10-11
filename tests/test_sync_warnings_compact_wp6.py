@@ -65,6 +65,19 @@ OFFLINE = {
     "TFB_SYNC_OHLC_FILLGUARD": "off", "TFB_SYNC_OHLC_READBACK": "0",
     "TFB_SYNC_IDFW_RUNLOG": "0", "TFB_SVC_CAPACITY_GUARD": "0",
     "TFB_SYNC_KLG_FETCHFAIL": "off",
+    # Integration 2026-10-11: pinned INSIDE every _Env block, not only via the
+    # module-level setdefault above - in a whole-tree pytest process another
+    # suite (tests/test_sync_fetchfail_truth_p162.py) has already exported its
+    # own GITHUB_RUN_ID, and the sync reads the variable at call time, so T3/T9
+    # compared against a run id this file never set. Restored on block exit.
+    "GITHUB_RUN_ID": "38071484709",
+    # Integration 2026-10-11: the fill-guard MASTER gate is TFB_SYNC_OHLC_FILL_GUARD
+    # (with the underscore; the "FILLGUARD" spelling above is inherited from the
+    # pattern file and reads nothing). tests/test_ohlc_fillguard.py leaves the real
+    # gate armed in enforce in the process env, which turned the Open/High/Low
+    # None cells into "" in T7's second projection. Pin the real names too.
+    "TFB_SYNC_OHLC_FILL_GUARD": "0", "TFB_SYNC_OHLC_FILL_GUARD_MODE": None,
+    "TFB_SYNC_OHLC_FILL_GUARD_COLS": None,
 }
 
 

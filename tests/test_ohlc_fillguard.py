@@ -31,6 +31,30 @@ _spec.loader.exec_module(M)
 
 HDR = ["Symbol", "Name", "Open", "Day High", "Day Low", "Target Price"]
 
+try:
+    import pytest
+except ImportError:  # the __main__ runner below needs no pytest
+    pytest = None
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _fill_guard_env_restored():
+        """Integration 2026-10-11 (whole-tree gate): these tests arm
+        TFB_SYNC_OHLC_FILL_GUARD / _MODE / _COLS in os.environ and never unset
+        them, so in a single pytest process every later suite saw the guard
+        armed in ENFORCE (first victim: the WP-6 T7 second-projection check,
+        whose Open/High/Low None cells became ""). Restore the prior values
+        after each test; the tests themselves are unchanged."""
+        keys = ("TFB_SYNC_OHLC_FILL_GUARD", "TFB_SYNC_OHLC_FILL_GUARD_MODE",
+                "TFB_SYNC_OHLC_FILL_GUARD_COLS")
+        prev = {k: os.environ.get(k) for k in keys}
+        yield
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
 
 def _fixture():
     return [
