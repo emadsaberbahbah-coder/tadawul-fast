@@ -795,6 +795,16 @@ WRITER_FILES = {"core/data_engine_v2.py", "core/enriched_quote.py", "core/sheet_
                 "scripts/repo_hygiene_check.py", "scripts/audit_data_quality.py"}
 CLASSIFIED_NON_READERS = {"core/analysis/identity_guard.py", "scripts/harness_ob_1_13_0.py",
                           "scripts/diag_eodhd_fundamentals.py"}
+# Integration 2026-10-11 (WP-0 landed in the same wave as WP-6): the offline
+# export auditor counts these heads in the exported Warnings column (DQ-36
+# label census, FUND_LKG classification, its own synthetic fixture rows). It
+# reads the xlsx export, never the live Sheet through the app, and it is the
+# documented reason the first ENFORCE keep list must carry these heads until
+# the audit learns the JSONL telemetry sink (WP-0 v1.1.0 candidate). Any NEW
+# head it starts reading must be declared here, so the census stays a tripwire.
+OFFLINE_EXPORT_READERS = {
+    "scripts/tfb_workbook_dq_audit.py": {"fund_cache", "fundamentals_lkg", "rel_path", "sheet_horizon_label"},
+}
 
 
 def _t12():
@@ -826,8 +836,12 @@ def _t12():
                         for h, pat in pats.items():
                             if pat.search(line):
                                 hits.setdefault(rel, []).append((i, h))
-    unexpected = {k: v for k, v in hits.items() if k not in WRITER_FILES | CLASSIFIED_NON_READERS}
+    known = WRITER_FILES | CLASSIFIED_NON_READERS | set(OFFLINE_EXPORT_READERS)
+    unexpected = {k: v for k, v in hits.items() if k not in known}
     assert not unexpected, "new reader of a MOVABLE head: %s" % json.dumps(unexpected)
+    for rel, allowed in OFFLINE_EXPORT_READERS.items():
+        extra = sorted({h for _, h in hits.get(rel, [])} - allowed)
+        assert not extra, "offline export reader %s now reads undeclared MOVABLE heads: %s" % (rel, extra)
     assert "core/sheet_presentation.py" in hits          # the sheet_horizon_label writer is present
     return {k: len(v) for k, v in sorted(hits.items())}
 
