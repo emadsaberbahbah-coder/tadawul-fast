@@ -4,10 +4,12 @@
 # ============================================================================
 # VERSION 1.1.6 (2026-10-11) -- WAVE-2 SUITE ENUMERATION
 #
-# v1.1.6: enumerate the WP-2bc suites in the lean job: tests/test_de_f7_settle_unresolved.py
+# v1.1.6: enumerate the WP-2bc suites: the lean job runs tests/test_de_f7_settle_unresolved.py
 # (engine settle_unresolved rule), tests/test_sync_rank_overall_page.py (whole-page rank at
-# the sync write boundary), tests/test_analysis_sheet_rows_rank_withheld.py (route rank
-# withholds engine-withheld rows), tests/test_ob_settle_unresolved.py (builder reader).
+# the sync write boundary) and tests/test_ob_settle_unresolved.py (builder reader); the
+# contract job runs tests/test_analysis_sheet_rows_rank_withheld.py (route rank withholds
+# engine-withheld rows) because it imports routes/, which needs FastAPI - the lean job
+# installs numpy and pytest only, and one collection error aborts its whole pytest step.
 #
 # v1.1.5: enumerate the suites delivered by the 2026-10-11 audit-framework work
 # packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
@@ -431,7 +433,6 @@ jobs:
             tests/test_de_margin_publish_p152.py \
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
-            tests/test_analysis_sheet_rows_rank_withheld.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
@@ -530,7 +531,8 @@ jobs:
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
             tests/test_eodhd_error_redaction.py \
-            tests/test_margin_unit_cache_contract.py
+            tests/test_margin_unit_cache_contract.py \
+            tests/test_analysis_sheet_rows_rank_withheld.py
           echo "::endgroup::"
 
   # ==========================================================================
