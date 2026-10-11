@@ -2,7 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.7 (2026-10-11) -- INTEGRATED REVIEW REGRESSIONS
+# VERSION 1.1.8 (2026-10-11) -- INTEGRATED REVIEW REGRESSIONS
+#
+# v1.1.8: install the same PDF regression dependencies in whole-suite discovery
+# as in the required heavy job; production requirements remain unchanged.
 #
 # v1.1.6: enumerate the WP-2bc suites: the lean job runs tests/test_de_f7_settle_unresolved.py
 # (engine settle_unresolved rule), tests/test_sync_rank_overall_page.py (whole-page rank at
@@ -295,7 +298,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install production pins and test-only workbook dependency
-        run: python -m pip install -r requirements.txt pytest "openpyxl==3.1.5"
+        run: python -m pip install -r requirements.txt pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.20.0"
       - name: Discover every offline regression
         run: python -m pytest -q tests
 

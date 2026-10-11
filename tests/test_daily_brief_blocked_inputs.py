@@ -243,14 +243,16 @@ def test_selected_table_boundary_prevents_later_invest_rows(spacer):
     assert [r["symbol"] for r in brief.extract_top10(rows)["top"]] == ["SELECTED.US"]
 
 
-@pytest.mark.parametrize("feed", ["NOT_ACTIONABLE(final_publication) | run=90001 | synthetic audit failure",
-                                  "WITHHELD | synthetic final receipt"])
-def test_final_status_feed_veto_overrides_older_executable_plan(cockpit_layouts, feed):
+FINAL_FEED_VETO_CASES = ["NOT_ACTIONABLE(final_publication) | run=90001 | synthetic audit failure",
+                        "WITHHELD | synthetic final receipt"]
+
+
+def _model_with_final_feed_veto(cockpit_layouts, feed):
     # Full _Status A:M layout as read by the brief; the final publisher owns L:M.
     status = [["Page", "Last Updated", "Status", "Message"],
               ["Top_10_Investments", "2026-10-11 08:00:00", "OK", "old executable page",
                "", "", "", "", "", "", "", "TFB Decision Feed", feed]]
-    data = brief.build_model({
+    return brief.build_model({
         brief.PAGE_STATUS: status,
         brief.PAGE_TOP10: cockpit_layouts["EXECUTABLE"],
         brief.PAGE_DECISION: [HEADER,
@@ -258,6 +260,11 @@ def test_final_status_feed_veto_overrides_older_executable_plan(cockpit_layouts,
             row("TRIM", "TRIM.US", note="Trim ~200 SAR"),
             row("ADD", "ADD.US", note="ADD 10 sh ~700 SAR")],
     })
+
+
+@pytest.mark.parametrize("feed", FINAL_FEED_VETO_CASES)
+def test_final_status_feed_veto_overrides_older_executable_plan(cockpit_layouts, feed):
+    data = _model_with_final_feed_veto(cockpit_layouts, feed)
     decision = data["decision"]
     assert brief.PAGE_STATUS in brief.ALL_PAGES
     assert decision["execution_veto"] == feed
@@ -272,8 +279,25 @@ def test_final_status_feed_veto_overrides_older_executable_plan(cockpit_layouts,
     assert ">Act now " not in html and ">Best new buys " not in html
     assert "  Free ~" not in text and "  ADD:" not in text and "  TRIM:" not in text
     assert "funded</strong>" not in html and "WHERE YOUR DRY POWDER GOES" not in html
+
+
+@pytest.mark.parametrize("feed", FINAL_FEED_VETO_CASES)
+def test_final_status_feed_veto_is_preserved_in_pdf(cockpit_layouts, feed):
+    # Keep the feed/model/HTML/text contract independent of optional PDF deps.
+    # The required heavy CI lane installs these and exercises real PDF output.
+    pytest.importorskip("reportlab")
+    PdfReader = pytest.importorskip("pypdf").PdfReader
+    data = _model_with_final_feed_veto(cockpit_layouts, feed)
     pdf = brief.render_pdf(data, "Synthetic owner", WHEN)
     assert pdf is not None and pdf.startswith(b"%PDF-")
+    pdf_text = " ".join(" ".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf)).pages).split())
+    assert "Final decision feed withheld execution" in pdf_text
+    assert feed in pdf_text
+    assert "New opportunities withheld" in pdf_text
+    assert "No executable new-buy candidates are shown." in pdf_text
+    assert "Best new buys" not in pdf_text
+    assert "SELECTED.US" not in pdf_text and "AUDIT.US" not in pdf_text
+    assert "~500 SAR" not in pdf_text and "~700 SAR" not in pdf_text
 
 
 def test_final_feed_veto_cannot_look_actionable_when_portfolio_only_has_holds(cockpit_layouts):

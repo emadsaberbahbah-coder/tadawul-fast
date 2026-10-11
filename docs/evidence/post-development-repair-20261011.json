@@ -1,6 +1,6 @@
 {
   "schema": "tfb.post-development-release/v1",
-  "generated_at_utc": "2026-10-11T21:21:38.853548+00:00",
+  "generated_at_utc": "2026-10-11T21:31:34.932136+00:00",
   "state": "repository_repairs_verified_live_acceptance_blocked",
   "release_accepted": false,
   "live_writes_performed": false,
@@ -63,13 +63,23 @@
       "installed_sha256": null
     },
     ".github/workflows/ci.yml": {
-      "sha256": "7ce051824efb286c3a20a4f49fbc7818bfbdca084bdf5d3460d4715944e7ce6a"
+      "sha256": "42355f898f47bc22f43c40098124f1956f1d655e88a2fa880d590c5c4f3a14fb"
     },
     ".github/workflows/daily_sync.yml": {
       "sha256": "da8bfedc4daa113504f7575c9119462ed7e25d9a70e57d7eebc200a43c788e0e"
     },
     ".github/workflows/track_performance.yml": {
       "sha256": "d5362f74fbce31ec588514da8eed1b49bb30847bfda30c25dce1dae4a745f4a2"
+    },
+    ".github/workflows/decision_surface_freshness.yml": {
+      "sha256": "d90c7c3cfae1023f90e34d68f1b0f2d9db5d9568c1ed43774414e6d17091818e"
+    },
+    ".github/workflows/workflow_repair_tests.yml": {
+      "sha256": "39b42fcc49c2660de7cac008bf204337fb838cf858ccbd9a3ea3d1574d6e9297"
+    },
+    "scripts/harness_w1a6.py": {
+      "sha256": "f0cfef55847ac495f58fb2d31e757a4e1331679a478f5142ff483d4ae4e01dea",
+      "version": "2.4.0"
     }
   },
   "repairs": [
@@ -84,13 +94,21 @@
     "Stage and checksum native candidate publications, including empty runs; refuse incomplete, corrupted or mismatched receipts.",
     "Require matching source-run and consumed-source receipts on both panels during final-publication auditing.",
     "Add opt-in prospective canonical target receipts and publication replay protection; keep legacy records and calibration unchanged.",
-    "Register the repairs in blocking CI and refresh deployment pins and static flag inventory."
+    "Register the repairs in blocking CI and refresh deployment pins and static flag inventory.",
+    "Run parameterized audit regressions in dedicated workflows, install PDF test dependencies for full discovery and update the legacy sync harness for final-veto preservation."
   ],
   "verification": {
     "python": "3.11.9",
     "production_dependencies": "requirements.txt exact pins; no production dependency upgrades",
-    "full_pytest": "4044 passed, 9 skipped, 3 warnings, 131 subtests passed in 122.16s (0:02:02)",
+    "full_pytest": "4046 passed, 9 skipped, 3 warnings, 131 subtests passed in 142.64s (0:02:22)",
     "full_pytest_exit": 0,
+    "ci_environment_replay": {
+      "CI": "true",
+      "GITHUB_ACTIONS": "true",
+      "GITHUB_EVENT_NAME": "pull_request",
+      "GITHUB_RUN_ID": "90001 (synthetic fixture identity)",
+      "TZ": "Asia/Riyadh"
+    },
     "skip_reasons": [
       "Unavailable historical negative baselines",
       "Unavailable real GM/My_Portfolio/export workbook fixtures",
@@ -105,6 +123,18 @@
       "baseline_version": "1.13.3",
       "baseline": "origin/main"
     },
+    "deterministic_sync_harness": {
+      "version": "2.4.0",
+      "passed": 94,
+      "total": 94,
+      "exit": 0,
+      "unavailable_actual_export_suite_skipped": true
+    },
+    "dedicated_audit_workflows_minimal_environment": {
+      "workflow_repair_tests": "64 passed, 7 subtests passed",
+      "decision_surface_freshness": "35 passed"
+    },
+    "brief_without_reportlab": "40 passed, 3 explicit PDF skips; feed/model/HTML/text veto tests remain unconditional",
     "ruff_fatal_rules": "PASS (E9,F63,F7,F82)",
     "compile": "PASS",
     "scoped_pyright_errors": 0,
@@ -129,7 +159,7 @@
   },
   "rollout": {
     "effective_live_configuration": null,
-    "new_controls_armed_by_this_session": false,
+    "new_controls_armed_in_production_by_this_session": false,
     "static_defaults_only": {
       "Render": {
         "TFB_PRICE_PRECISION": "0",

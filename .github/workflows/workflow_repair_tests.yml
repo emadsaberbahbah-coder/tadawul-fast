@@ -40,6 +40,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      - name: Install regression test dependency
+        run: python -m pip install pytest==9.1.1
       - name: Run audit contracts without live credentials
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -47,8 +49,11 @@ jobs:
           set -euo pipefail
           python scripts/audit_provider_target_coverage.py --selftest
           python scripts/audit_decision_surface_freshness.py --selftest
-          python -m unittest tests/test_full_refresh_coverage.py tests/test_decision_surface_freshness.py tests/test_workflow_audit_repairs.py -v
-          python -m unittest tests/test_repository_workflow_audit.py -v
+          python -m pytest -q \
+            tests/test_full_refresh_coverage.py \
+            tests/test_decision_surface_freshness.py \
+            tests/test_workflow_audit_repairs.py \
+            tests/test_repository_workflow_audit.py
           python scripts/audit_repository_workflows.py
 
   verify-live:
