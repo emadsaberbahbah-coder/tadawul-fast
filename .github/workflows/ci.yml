@@ -2,7 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.5 (2026-10-11) -- WAVE-1 SUITE ENUMERATION
+# VERSION 1.1.6 (2026-10-11) -- WAVE-2 SUITE ENUMERATION
+#
+# v1.1.6: enumerate the WP-2bc suites in the lean job: tests/test_de_f7_settle_unresolved.py
+# (engine settle_unresolved rule), tests/test_sync_rank_overall_page.py (whole-page rank at
+# the sync write boundary), tests/test_analysis_sheet_rows_rank_withheld.py (route rank
+# withholds engine-withheld rows), tests/test_ob_settle_unresolved.py (builder reader).
 #
 # v1.1.5: enumerate the suites delivered by the 2026-10-11 audit-framework work
 # packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
@@ -424,6 +429,10 @@ jobs:
             tests/test_de_fc_tuple_coherence_p102.py \
             tests/test_de_eq_roi_backfill_sentry_p143.py \
             tests/test_de_margin_publish_p152.py \
+            tests/test_de_f7_settle_unresolved.py \
+            tests/test_sync_rank_overall_page.py \
+            tests/test_analysis_sheet_rows_rank_withheld.py \
+            tests/test_ob_settle_unresolved.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
