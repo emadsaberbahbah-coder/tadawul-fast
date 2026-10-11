@@ -9,8 +9,8 @@ build of its own; it closes the WP-0 parser gap the WP-2bc builder reported.
 |---|---|
 | Base | v1.0.0 as published at `18a8416` (branch `claude/pensive-hypatia-smnxqe`) |
 | Base file | sha256 `d84ef01738ef680a…`, 4,043 lines |
-| Delivered file | sha256 `6b5b424f8b5c1e52…`, 4,071 lines |
-| Test file | `tests/test_workbook_dq_audit.py` sha256 `cb600f91e02d80e6…` (P13 added; version pins 1.0.0 → 1.0.1) |
+| Delivered file | sha256 `2419cda6010db833…`, 4,078 lines (first integration commit `71fcce6` was `6b5b424f8b5c1e52…`, 4,071 lines; the review fixes in this landing changed it) |
+| Test file | `tests/test_workbook_dq_audit.py` sha256 `bb25b3226499e3bd…`, 320 lines (P13 added and extended with the example-precedence case; version pins 1.0.0 → 1.0.1) |
 | Fixture | `tests/fixtures/dq_baseline_2026-10-10.json` unchanged (still `"version": "1.0.0"`, the generator of record) |
 
 ## S2 — Design (WHY on the file header)
@@ -25,7 +25,8 @@ would have dropped DQ-37's non-converged count to 0 while the rows were still un
   prefix. The bare substring `unresolved` is never used, because other tokens contain it:
   the engine's enforce-only margin receipt `margin_publish:<field>:unresolved` (since
   engine 5.151.4; none on 2026-10-10 because margin publication runs in observe) and the
-  provider token `name_unresolved` (1 Global_Markets row on 2026-10-10).
+  engine's ghost-ticker tag `name_unresolved` (data_engine_v2 v5.93.0 investability gate;
+  1 Global_Markets row on 2026-10-10).
 - The same predicate feeds the per-row DQ-37 flag.
 - An INVESTABLE row among the non-converged ones is listed FIRST in the DQ-37 examples
   (`<SYM> INVESTABLE non-converged (<page>)`), ahead of the INVESTABLE rc-flip examples.

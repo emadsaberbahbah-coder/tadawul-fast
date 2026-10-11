@@ -129,6 +129,51 @@ def t6_existing_roi_untagged():
     assert (d["expected_roi_1m"], d["expected_roi_3m"], d["expected_roi_12m"]) == (0.01, 0.02, 0.03)
     print("T6 ok")
 
+# 2026-10-11: pytest entry points. ci.yml (lean job) enumerates this file, but it
+# only ran its battery under __main__, so pytest collected 0 tests and CI checked
+# nothing. _run() sets TFB_EQ_ROI_UNIT_SENTRY and never restores it, so under pytest
+# an autouse fixture restores the prior value after each test (no leak into the
+# suites that follow in the same process). The __main__ runner below is unchanged.
+try:
+    import pytest
+except ImportError:  # the __main__ runner needs no pytest
+    pytest = None
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _sentry_env_restored():
+        prev = os.environ.get("TFB_EQ_ROI_UNIT_SENTRY")
+        yield
+        if prev is None:
+            os.environ.pop("TFB_EQ_ROI_UNIT_SENTRY", None)
+        else:
+            os.environ["TFB_EQ_ROI_UNIT_SENTRY"] = prev
+
+
+def test_t1_off_no_tags_and_fraction_values():
+    t1_off_no_tags_and_fraction_values()
+
+
+def test_t2_observe_exact_tags_zero_value_drift():
+    t2_observe_exact_tags_zero_value_drift()
+
+
+def test_t3_enforce_is_deferred():
+    t3_enforce_is_deferred()
+
+
+def test_t4_idempotent_under_observe():
+    t4_idempotent_under_observe()
+
+
+def test_t5_bad_mode_is_off():
+    t5_bad_mode_is_off()
+
+
+def test_t6_existing_roi_untagged():
+    t6_existing_roi_untagged()
+
+
 if __name__ == "__main__":
     for i in range(3):
         t1_off_no_tags_and_fraction_values(); t2_observe_exact_tags_zero_value_drift()

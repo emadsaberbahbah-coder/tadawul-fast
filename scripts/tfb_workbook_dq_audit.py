@@ -16,7 +16,8 @@ F7_NONCONV_PREFIXES = ("f7_settle_failed", "settle_unresolved:"), matched as a
 token PREFIX, never as the substring "unresolved", which other tokens contain:
 the engine's enforce-only margin receipt margin_publish:<field>:unresolved
 (since v5.151.4; 0 on 10-10 because margin publication runs in observe) and the
-provider token name_unresolved (1 GM row on 10-10). The same predicate feeds the per-row
+engine's ghost-ticker tag name_unresolved (data_engine_v2 v5.93.0 investability
+gate; 1 GM row on 10-10). The same predicate feeds the per-row
 DQ-37 flag. An INVESTABLE row among the non-converged ones (0 on 10-10, 0 by
 construction under the engine's gate tier) is listed FIRST in the examples, ahead
 of the INVESTABLE rc-flip examples that otherwise fill all six slots on a real
