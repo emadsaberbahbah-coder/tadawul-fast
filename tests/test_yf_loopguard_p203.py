@@ -28,7 +28,29 @@ os.environ.setdefault("YF_MAX_CONCURRENCY", "1")   # provider cap 1 vs batch con
 
 sys.path.insert(0, os.getcwd())
 
+def _release_prometheus_series(prefix="yf_fund_"):
+    """Harness-only. The provider registers its Prometheus collectors at module
+    level; executing the same file again under a fresh module name (what `load`
+    does) re-registers them and the default registry rejects duplicates
+    ("Duplicated timeseries"). That only bites when prometheus_client is installed
+    AND another test already imported core.providers.yahoo_fundamentals_provider
+    in the same pytest process (full-requirements run of the whole tests/ tree).
+    Unregister the earlier module's collectors first; production imports once,
+    so nothing there changes. No-op without prometheus_client."""
+    try:
+        from prometheus_client import REGISTRY  # type: ignore
+    except ImportError:
+        return
+    names = getattr(REGISTRY, "_names_to_collectors", None) or {}
+    stale = {c for n, c in list(names.items()) if str(n).startswith(prefix)}
+    for collector in stale:
+        try:
+            REGISTRY.unregister(collector)
+        except Exception:
+            pass
+
 def load(path, name):
+    _release_prometheus_series()
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)
     sys.modules[name] = m          # dataclass(slots=True) resolves annotations via sys.modules
