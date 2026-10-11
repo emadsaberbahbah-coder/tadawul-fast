@@ -3,6 +3,21 @@
 tfb_workbook_dq_audit.py - offline DQ-01..DQ-75 measurement harness over a TFB
 workbook export (WP-0 of the 2026-10-11 audit framework).
 
+REVIEW FIX (2026-10-11, pre-merge amendment of the same v1.0.0) [WP-0]
+-----------------------------------------------------------------------
+compare_to_baseline: BASELINE_HIGHER_IS_BETTER emptied. The build spec listed
+DQ-23 as an inverted measure on the assumption that its count is the share of
+rows at +3 h (100 %); the delivered dq_23_stamp_offset returns count = rows
+whose Riyadh - UTC offset is NOT +3 h (0 on 10-10), i.e. lower is better like
+every other delivered count. The reviewer reproduced baseline FAIL 5 -> current
+FAIL 10 labelled as improvements ['DQ-23'] (and 5 -> 2 as a regression). Exit
+code and decision_critical_regressions were never affected (DQ-23 is not
+decision-critical); the '## Trend vs baseline' section and report['baseline']
+were. Fixture, digests 8804aa3208d8abe6 / a92e4b7c9a54807f (0 vs 0 on 10-10)
+and the selftest cases-digest c1bdd1a2cc1c3927 (label-based) are unchanged;
+tests/test_workbook_dq_audit.py P6 now pins the direction (5 -> 10 regresses,
+5 -> 2 improves).
+
 WHY (v1.0.0, 2026-10-11) [WP-0]
 -------------------------------
 The audit framework's check catalogue (section 2.5, 75 DQ-ids) was measured by
@@ -173,7 +188,7 @@ DE_UNIT_TAG = "fund_unit_contract:yahoo:debt_to_equity"
 DECISION_CRITICAL_IDS = {"DQ-07", "DQ-08", "DQ-09", "DQ-10", "DQ-16", "DQ-22", "DQ-24", "DQ-25", "DQ-30",
                          "DQ-33", "DQ-34", "DQ-38", "DQ-46", "DQ-53", "DQ-62"}
 # baseline comparison: ids where a higher count is NOT a regression
-BASELINE_HIGHER_IS_BETTER = {"DQ-23"}
+BASELINE_HIGHER_IS_BETTER = set()   # every delivered count is lower-is-better (DQ-23 count = bad rows); DQ-01/04/07/64 are excluded instead
 BASELINE_COUNT_EXCLUDED = {"DQ-01", "DQ-04", "DQ-07", "DQ-64"}   # direction-free or inverted measures
 STATUS_RANK = {"PASS": 0, "INFO": 1, "NOT_CHECKED": 1, "WARN": 2, "FAIL": 3}
 PRIVATE_EXAMPLE_IDS = {"DQ-17", "DQ-51", "DQ-53", "DQ-54", "DQ-55", "DQ-56", "DQ-57", "DQ-58", "DQ-59", "DQ-60"}

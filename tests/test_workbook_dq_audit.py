@@ -150,6 +150,17 @@ def test_p6_fixture_self_comparison():
     noncrit["checks"]["DQ-43"]["count"] = fx["checks"]["DQ-43"]["count"] + 1
     cmp2 = dq.compare_to_baseline(_as_report(noncrit), fx)
     assert [e["id"] for e in cmp2["regressions"]] == ["DQ-43"] and cmp2["decision_critical_regressions"] == []
+    # review fix: DQ-23 count = bad rows (lower is better) - 5 -> 10 must regress, 5 -> 2 must improve (non-critical)
+    base23 = copy.deepcopy(fx)
+    base23["checks"]["DQ-23"]["count"] = 5
+    base23["checks"]["DQ-23"]["status"] = "FAIL"
+    for cur_count, regressed, improved in ((10, ["DQ-23"], []), (2, [], ["DQ-23"])):
+        cur23 = copy.deepcopy(base23)
+        cur23["checks"]["DQ-23"]["count"] = cur_count
+        cmp23 = dq.compare_to_baseline(_as_report(cur23), base23)
+        assert [e["id"] for e in cmp23["regressions"]] == regressed, (cur_count, cmp23["regressions"])
+        assert [e["id"] for e in cmp23["improvements"]] == improved, (cur_count, cmp23["improvements"])
+        assert cmp23["decision_critical_regressions"] == []
     better = copy.deepcopy(fx)
     better["checks"]["DQ-33"]["count"] = 0
     better["checks"]["DQ-33"]["status"] = "PASS"
