@@ -3,7 +3,7 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.9.0 (STATIC-NAME-FALLBACK / SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED)
+TFB Enriched Quote Core — v4.11.2 (STATIC-NAME-FALLBACK / SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED)
 ==============================================================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
@@ -387,7 +387,12 @@ logger.addHandler(logging.NullHandler())
 # skips. Scope: expected_roi_1m/3m/12m only; upside_pct / percent_change are
 # a vNEXT decision after their own residual count.
 # -----------------------------------------------------------------------------
-MODULE_VERSION = "4.11.1"
+# v4.11.2 (2026-10-11): the canonical publication schema uses fractions.
+# The legacy enforce sentry multiplied an already-normalized ROI by 100,
+# causing the presenter to withhold a valid forecast tuple. Keep off/observe
+# behavior unchanged; enforce now preserves the normalized fraction and emits
+# a fraction receipt. Percent formatting belongs to the Sheet number format.
+MODULE_VERSION = "4.11.2"
 
 from core.sheet_presentation import present_instrument_row
 
@@ -1619,16 +1624,14 @@ def _eq_roi_sentry_mode() -> str:
 
 
 def _roi_points_output_sentry(row: Dict[str, Any]) -> None:
-    """v4.11.0 [P-101]: emit expected_roi_* in PERCENT POINTS at the module
-    boundary, ground-truth-confirmed, gated default OFF.
+    """Keep expected_roi_* in canonical fractions at the publication boundary.
 
-    enforce: value proven fraction-scale by fp/cp  -> value*100 + tag
-             roi_unit_points:eq:<field>:enforce
-    observe: same detection, value untouched       -> ...:observe tag
-    no ground truth: NEVER scales; |v|<=1.5 nonzero gets a countable
-             roi_unit_ambiguous:eq:<field>:<mode> tag (fail-safe — this is
-             what makes the F01 inverse defect impossible here).
-    Idempotent: once in points the discriminator prefers points and skips."""
+    The historical function name remains for callers. Step 4 already converts
+    witnessed point inputs to fractions. Enforce preserves those values and
+    records roi_unit_fraction:eq:<field>:enforce; it never multiplies by 100.
+    Off and observe retain the existing diagnostic protocol. Unknown units
+    remain untouched and the presenter still withholds unproved tuples.
+    """
     mode = _eq_roi_sentry_mode()
     if mode == "off" or not isinstance(row, dict):
         return
@@ -1648,9 +1651,13 @@ def _roi_points_output_sentry(row: Dict[str, Any]) -> None:
                 err_as_points = abs(stored - true_frac * 100.0)
                 if err_as_fraction < err_as_points:
                     if mode == "enforce":
-                        row[roi_key] = stored * 100.0
-                        _append_warning(
-                            row, "roi_unit_points:eq:%s:enforce" % roi_key)
+                        receipt = "roi_unit_fraction:eq:%s:enforce" % roi_key
+                        warnings = row.get("warnings")
+                        items = warnings if isinstance(warnings, (list, tuple)) else (warnings,)
+                        existing = {part.strip() for item in items if item is not None
+                                    for part in str(item).split(";")}
+                        if receipt not in existing:
+                            _append_warning(row, receipt)
                     else:
                         _append_warning(
                             row, "roi_unit_points:eq:%s:observe" % roi_key)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import copy
 from datetime import datetime, timezone
+
+import pytest
 
 from scripts.audit_decision_surface_freshness import audit_surfaces
 
@@ -62,6 +65,84 @@ def top10_grid(stamp="2026-07-31 20:10:00", state="ok", full=True):
             ),
         ],
     ]
+
+
+def publication_grids(run="90001"):
+    """Synthetic producer receipts; no broker/custody authenticity claim."""
+    sources, portfolio, top10 = status_grid(), portfolio_grid(), top10_grid()
+    for row in sources[1:]:
+        row[3] += f" run={run} sha=0123abcd"
+    for surface in (portfolio, top10):
+        surface[1][1] += f" | source readiness VERIFIED (run {run})"
+    return sources, portfolio, top10
+
+
+def strict_audit(grids):
+    return audit_surfaces(*grids, now_utc=NOW, min_rows=FLOORS,
+                          expected_source_run="90001")
+
+
+def test_matching_publication_and_consumption_receipts_pass_strict_barrier():
+    report = strict_audit(publication_grids())
+    assert report.exit_code == 0 and report.executable and report.findings == []
+
+
+@pytest.mark.parametrize("surface,code", [
+    (1, "PF_SOURCE_CONSUMPTION_UNPROVEN"), (2, "T10_SOURCE_CONSUMPTION_UNPROVEN"),
+])
+@pytest.mark.parametrize("receipt", [
+    "", " | run=90001 sha=0123abcd", " | source readiness VERIFIED (run 80000)",
+    " | source readiness VERIFIED (run 90001) | source readiness VERIFIED (run 90001)",
+    " | source readiness VERIFIED (run 90001) | source readiness VERIFIED (run 80000)",
+    " | source readiness VERIFIED (run 90001) | source readiness WITHHELD: source stale",
+    " | source readiness VERIFIED (run local)", " | source readiness VERIFIED (run 0)",
+])
+def test_recent_decision_timestamp_cannot_replace_unique_consumption_receipt(surface, code, receipt):
+    grids = list(publication_grids())
+    grids[surface][1][1] = grids[surface][1][1].split(" | source readiness")[0] + receipt
+    report = strict_audit(grids)
+    assert report.exit_code == 2 and not report.executable
+    assert code in {finding.code for finding in report.findings}
+
+
+@pytest.mark.parametrize("receipt", [
+    "", " run=80000", " run=0", " run=local", " run=90001 run=90001",
+    " run=90001 run=80000", " run=90001,run=80000",
+])
+def test_portfolio_requires_unique_current_source_publication(receipt):
+    grids = list(publication_grids())
+    source = next(row for row in grids[0][1:] if row[0] == "My_Portfolio")
+    source[3] = source[3].split(" run=")[0] + receipt
+    report = strict_audit(grids)
+    assert report.exit_code == 2 and not report.executable
+    codes = {finding.code for finding in report.findings}
+    assert "PF_SOURCE_PUBLICATION_COHORT" in codes
+    assert "PF_SOURCE_CONSUMPTION_UNPROVEN" in codes
+
+
+@pytest.mark.parametrize("page,code", [
+    ("My_Portfolio", "PF_SOURCE_PUBLICATION_COHORT"),
+    ("Global_Markets", "SOURCE_PUBLICATION_COHORT"),
+])
+def test_repeated_status_rows_cannot_certify_one_source_run(page, code):
+    grids = list(publication_grids())
+    grids[0].append(copy.deepcopy(next(row for row in grids[0][1:] if row[0] == page)))
+    report = strict_audit(grids)
+    assert report.exit_code == 2 and not report.executable
+    assert code in {finding.code for finding in report.findings}
+
+
+@pytest.mark.parametrize("expected", ["", "local", "0", "90001 90001"])
+def test_unknown_expected_run_is_explicitly_blocked(expected):
+    report = audit_surfaces(*publication_grids(), now_utc=NOW, min_rows=FLOORS,
+                            expected_source_run=expected)
+    assert report.exit_code == 2 and not report.executable
+    assert "EXPECTED_SOURCE_RUN_INVALID" in {finding.code for finding in report.findings}
+
+
+def test_standalone_policy_does_not_require_new_producer_receipts():
+    assert audit_surfaces(status_grid(), portfolio_grid(), top10_grid(), now_utc=NOW,
+                          min_rows=FLOORS, expected_source_run=None).exit_code == 0
 
 
 class DecisionSurfaceFreshnessTests(unittest.TestCase):

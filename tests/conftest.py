@@ -36,6 +36,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 # =============================================================================
 # Path bootstrap
@@ -95,6 +98,18 @@ os.environ.setdefault("TFB_TEST_SCORE_BUDGET_MS", "200")
 # =============================================================================
 # Shared fixtures (add as needed)
 # =============================================================================
+@pytest.fixture(autouse=True)
+def _restore_policy_environment():
+    """Legacy batteries may set policies directly; each test owns its changes.
+
+    WHY (WP-11): whole-suite discovery must not let one test's off/enforce
+    settings become another test's defaults. This also restores removed keys.
+    Tests that use monkeypatch retain pytest's normal fixture teardown order.
+    """
+    with patch.dict(os.environ):
+        yield
+
+
 # Example placeholder -- uncomment and expand when shared fixtures are needed:
 #
 # import pytest

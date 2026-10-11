@@ -1,11 +1,20 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.4 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.5 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.5 (2026-10-11) -- POST-REVIEW ACTIVATION REPAIRS
+ * Owned KPIs become inactive when a mode changes or properties fail. Strict
+ * partial policy references retain seed comparisons for undeclared controls.
+ * News uses backend gate receipts separately from display-label coverage;
+ * undated analyst targets remain unknown. Candidate publication stages and
+ * verifies complete values, including zero rows, then commits a run/digest
+ * receipt last. Readers reject stale, partial or changed results. All gates
+ * remain default off; decision/funding controls are unchanged.
  *
  * v1.13.4 (2026-10-11) [WP-8 / DQ-14, 47, 48, 49, 50, 52; P-196] -- COCKPIT INPUT TRUTH
  * WHY (workbook export 2026-10-10, GitHub run 38071484709; Top_10 run
@@ -1678,7 +1687,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.4';
+var DT10_VERSION = '1.13.5';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2275,11 +2284,13 @@ var DT10_IT_REF_LABELS = ['T10: Max Per Sector', 'PF: Max Sector %',
 var DT10_IT_DECISION_REF = { 'T10: Max Per Sector': 3, 'PF: Max Sector %': 40 };
 var DT10_CANDTAB_PROP = 'DT10_CAND_TAB';        // off (default) | observe | enforce
 var DT10_CANDTAB_SHEET = '_T10_Candidates';
+var DT10_CANDTAB_STAGE_SHEET = '_T10_Candidates_Staging';
 var DT10_CANDTAB_COCKPIT_TARGET_ROWS = 80;     // audit acceptance: cockpit <= 80 rows
 var DT10_VINTAGE_PROP = 'DT10_VINTAGE_COLS';    // off (default) | observe | enforce
 var DT10_VINTAGE_HEADERS = ['Quote As-Of (UTC)', 'Target Vintage'];
 var DT10_VINT_ASOF_RE = /(?:^|[;\s|,])acquisition_quote_asof:([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+\-Z]+)/i;
 var DT10_VINT_LKG_RE = /(?:^|[;\s|,])analyst_lkg:(\d+)h/i;
+var DT10_VINT_PUBLISHED_RE = /(?:^|[;\s|,])analyst_target_(?:published_at|asof):([0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9:.+\-Z]+)?)/i;
 var DT10_STAB_PROP_SOFT_MAX = 8500; // chars; 9KB ScriptProperties value limit
 // Safety-class verdicts hard-exit immediately (never grace-held). Plain
 // DO_NOT_INVEST criteria-misses stay grace-holdable — that IS the jitter
@@ -3845,37 +3856,68 @@ function dt10CandTabMode_() {
 function dt10VintageColsMode_() {
   return dt10ModeProp_(DT10_VINTAGE_PROP, 'vintage_mode');
 }
-/** v1.13.4 [WP-8] PURE: DT10_POLICY_REF text -> {label: number} or null
- * (junk / array / no numeric member => null). */
-function dt10PolicyRefParse_(raw) {
+/** PURE: validate exact sizing-control keys and values. Partial references
+ * remain explicit: controls not declared by policy still compare to seed.
+ * Percent limits are (0,100]; sector counts are positive whole numbers,
+ * bounded by the existing pool ceiling. No null/boolean coercion. */
+function dt10PolicyRefInspect_(raw) {
+  var out = { values: null, status: 'none', errors: [], missing: [] };
   try {
-    var s = String(raw === null || raw === undefined ? '' : raw)
-        .replace(/^\s+|\s+$/g, '');
-    if (!s) return null;
-    var obj = JSON.parse(s);
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
-    var out = {}, any = false;
+    var obj = raw;
+    if (typeof raw === 'string' || raw === null || raw === undefined) {
+      var s = String(raw === null || raw === undefined ? '' : raw)
+          .replace(/^\s+|\s+$/g, '');
+      if (!s) return out;
+      obj = JSON.parse(s);
+    }
+    out.status = 'invalid';
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      out.errors.push('policy must be an object'); return out;
+    }
+    var vals = {}, any = false;
     for (var k in obj) {
       if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-      var n = Number(String(obj[k]).replace(/,/g, ''));
-      if (isFinite(n)) { out[k] = n; any = true; }
+      if (DT10_IT_REF_LABELS.indexOf(k) === -1) {
+        out.errors.push('unknown control: ' + k); continue;
+      }
+      var v = obj[k], text = typeof v === 'string' ?
+          v.replace(/^\s+|\s+$/g, '') : '';
+      var n = (typeof v === 'number' ||
+               (text && /^[+]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text))) ? Number(v) : NaN;
+      var count = k === 'T10: Max Per Sector';
+      if (!isFinite(n) || n <= 0 || n > (count ? DT10_POOL_HARD_CAP : 100) ||
+          (count && Math.floor(n) !== n)) {
+        out.errors.push('invalid range/type: ' + k); continue;
+      }
+      vals[k] = n; any = true;
     }
-    return any ? out : null;
+    for (var i = 0; i < DT10_IT_REF_LABELS.length; i++) {
+      if (!Object.prototype.hasOwnProperty.call(vals, DT10_IT_REF_LABELS[i])) {
+        out.missing.push(DT10_IT_REF_LABELS[i]);
+      }
+    }
+    if (!any) out.errors.push('zero recognized controls');
+    if (out.errors.length) return out;
+    out.values = vals;
+    out.status = out.missing.length ? 'partial' : 'complete';
+    return out;
   } catch (ePr) {
-    return null;
+    out.status = 'invalid'; out.errors.push('invalid JSON'); return out;
   }
 }
+function dt10PolicyRefParse_(raw) { return dt10PolicyRefInspect_(raw).values; }
 /** v1.13.4 [WP-8]: the optional policy reference; read only when
  * DT10_INPUT_TRUTH is armed (callers guard), memoized per execution. */
-function dt10PolicyRef_() {
+function dt10PolicyRefState_() {
   return dt10PropMemoGet_('policy_ref', function () {
     try {
-      return dt10PolicyRefParse_(PropertiesService.getScriptProperties()
+      return dt10PolicyRefInspect_(PropertiesService.getScriptProperties()
           .getProperty(DT10_IT_POLICY_PROP));
     } catch (ePf) {}
-    return null;
+    return { values: null, status: 'unavailable', errors: ['property read failed'], missing: [] };
   });
 }
+function dt10PolicyRef_() { return dt10PolicyRefState_().values; }
 /** v1.11.12 [SYNC-INFLIGHT] I/O: read both legs from _Status and evaluate.
  * Returns the core result plus mode; mode 'off' short-circuits the read. */
 function dt10SyncInflight_(ss) {
@@ -4268,22 +4310,34 @@ function dt10GapToRow_(g, total) {
 // ---------------------------------------------------------------------------
 // v1.13.4 [WP-8] COCKPIT INPUT TRUTH -- pure cores (no I/O, never throw).
 // ---------------------------------------------------------------------------
-/** PURE: gate-evaluability facts from the candidate audit rows. 'Unknown',
- * null, '' and non-string trend labels count as unknown (the builder's
- * _norm_trend emits exactly 'Unknown'). newsMeta = meta.route.news_display
- * ({enabled, labeled, cap}) when the route attached display-only labels. */
+/** PURE: the backend's per-row gates are evaluation receipts. A display
+ * label cannot attest which input the News gate actually consumed. */
 function dt10GateEvaluabilityCore_(cands, newsMeta) {
   cands = cands || [];
   function unknown(v) {
-    return typeof v !== 'string' || v.replace(/^\s+|\s+$/g, '') === '' ||
-           v === 'Unknown';
+    if (typeof v !== 'string') return true;
+    return !/^(positive|neutral|negative)$/i.test(v.replace(/^\s+|\s+$/g, ''));
   }
-  var total = 0, newsUnk = 0, secUnk = 0, cYes = 0, cNo = 0, cUnk = 0;
+  function newsReceipt(c) {
+    var gates = c.gates;
+    if (!Array.isArray(gates)) return null;
+    var found = null;
+    for (var j = 0; j < gates.length; j++) {
+      var g = gates[j];
+      if (!g || g.gate !== 'News') continue;
+      // Duplicate/contradictory receipts are ambiguous, never evaluable.
+      if (found || typeof g.passed !== 'boolean' || unknown(g.current)) return null;
+      found = g;
+    }
+    return found;
+  }
+  var total = 0, newsUnk = 0, newsLabels = 0, secUnk = 0, cYes = 0, cNo = 0, cUnk = 0;
   for (var i = 0; i < cands.length; i++) {
     var c = cands[i];
     if (!c) continue;
     total++;
-    if (unknown(c.news_trend)) newsUnk++;
+    if (!unknown(c.news_trend)) newsLabels++;
+    if (!newsReceipt(c)) newsUnk++;
     if (unknown(c.sector_trend)) secUnk++;
     if (c.conflict === true) cYes++;
     else if (c.conflict === false) cNo++;
@@ -4295,6 +4349,9 @@ function dt10GateEvaluabilityCore_(cands, newsMeta) {
              not_evaluable: total > 0 && p > DT10_IT_UNKNOWN_MAX_PCT };
   }
   var news = gate(newsUnk), sector = gate(secUnk);
+  news.display_evaluable = newsLabels;
+  news.display_unknown = total - newsLabels;
+  news.receipt_required = true;
   news.display_only = !!(newsMeta && newsMeta.enabled === true);
   news.cap = (newsMeta && newsMeta.cap !== undefined) ? newsMeta.cap : null;
   news.labeled = (newsMeta && newsMeta.labeled !== undefined) ?
@@ -4309,7 +4366,8 @@ function dt10GateEvaluabilityNote_(ev, mode) {
   var n = ev.news, s = ev.sector, c = ev.conflict;
   return 'gates: news ' + n.evaluable + '/' + ev.total + ' evaluable (' +
       n.pct_unknown + '% unknown' +
-      (n.display_only ? '; display-only labels, gate input decoupled' : '') +
+      '; display labels ' + n.display_evaluable + '/' + ev.total +
+      (n.display_only ? ', display-only' : '') + '; backend gate receipts required' +
       ')' + (n.not_evaluable ? ' NOT EVALUABLE' : '') +
       ' \u00b7 sector ' + s.evaluable + '/' + ev.total + ' evaluable (' +
       s.pct_unknown + '% unknown)' + (s.not_evaluable ? ' NOT EVALUABLE' : '') +
@@ -4329,7 +4387,9 @@ function dt10GateEvaluabilityAlerts_(ev) {
     if (!g.not_evaluable) continue;
     out.push({ type: 'gate_not_evaluable', count: g.unknown,
       required_action: gates[i][0] + ' gate not evaluable: ' + g.unknown +
-        '/' + ev.total + ' candidates Unknown (' + g.pct_unknown + '% > ' +
+        '/' + ev.total + ' candidates without usable ' +
+        (gates[i][0] === 'News' ? 'backend gate receipts' : 'inputs') +
+        ' (' + g.pct_unknown + '% > ' +
         DT10_IT_UNKNOWN_MAX_PCT + '%); the gate passes Unknown by design ' +
         '(opportunity_builder) \u2014 wire the input or read the gate as ' +
         'not applied' +
@@ -4350,6 +4410,20 @@ function dt10GateKpiCells_(ev) {
   return [['News Gate', 'Sector Gate'],
           [txt(ev && ev.news), txt(ev && ev.sector)]];
 }
+/** Clear stale feature-owned values on observe/off/property-failure paths.
+ * A never-activated sheet gets no write; unrelated panel cells are kept. */
+function dt10InputTruthKpiState_(sheet, mode, ev) {
+  var col = DT10_KPI_LABELS.length + 1;
+  if (mode === 'enforce') {
+    sheet.getRange(DT10_ROW_KPI_LABELS, col, 2, 2).setValues(dt10GateKpiCells_(ev));
+    return;
+  }
+  var labels = sheet.getRange(DT10_ROW_KPI_LABELS, col, 1, 2).getValues()[0];
+  if (labels[0] === 'News Gate' && labels[1] === 'Sector Gate') {
+    sheet.getRange(DT10_ROW_KPI_LABELS + 1, col, 1, 2)
+        .setValues([['INACTIVE \u2014 ' + mode, 'INACTIVE \u2014 ' + mode]]);
+  }
+}
 /** PURE: the three sizing parameters against their DECLARED references --
  * _Lists_Config seed (TFB_PANEL_DEFAULTS, label-keyed), the GAS built-in
  * (DT10_PANEL def; T10 labels only), the dated operator decision
@@ -4359,6 +4433,10 @@ function dt10GateKpiCells_(ev) {
 function dt10PanelRefCore_(panel, defaults, pfRead, policyRef) {
   panel = panel || {};
   defaults = defaults || {};
+  var policyState = policyRef && typeof policyRef.status === 'string' &&
+      Object.prototype.hasOwnProperty.call(policyRef, 'values') ? policyRef :
+      dt10PolicyRefInspect_(policyRef);
+  policyRef = policyState.values;
   function numv(x) {
     if (x === null || x === undefined || x === '') return null;
     var n = Number(String(x).replace(/,/g, '').replace(/^\s+|\s+$/g, ''));
@@ -4368,6 +4446,7 @@ function dt10PanelRefCore_(panel, defaults, pfRead, policyRef) {
     return a !== null && b !== null && Math.abs(a - b) > 1e-9;
   }
   var items = [], driftSeed = 0, driftPolicy = 0, driftDecision = 0;
+  var policyCompared = 0, compared = 0, driftActive = 0;
   for (var i = 0; i < DT10_IT_REF_LABELS.length; i++) {
     var label = DT10_IT_REF_LABELS[i];
     var isT10 = label.indexOf('T10: ') === 0;
@@ -4394,14 +4473,26 @@ function dt10PanelRefCore_(panel, defaults, pfRead, policyRef) {
     it.drift_builtin = drift(it.panel, it.builtin);
     it.drift_decision = drift(it.panel, it.decision);
     it.drift_policy = drift(it.panel, it.policy);
+    it.reference = it.policy !== null ? 'policy' : 'seed';
+    it.reference_value = it.policy !== null ? it.policy : it.seed;
+    it.compared = it.panel !== null && it.reference_value !== null;
+    it.drift_active = drift(it.panel, it.reference_value);
+    if (it.panel !== null && it.policy !== null) policyCompared++;
+    if (it.compared) compared++;
+    if (it.drift_active) driftActive++;
     if (it.drift_seed) driftSeed++;
     if (it.drift_decision) driftDecision++;
     if (it.drift_policy) driftPolicy++;
     items.push(it);
   }
   return { items: items, drift_seed: driftSeed, drift_decision: driftDecision,
-           drift_policy: policyRef ? driftPolicy : null,
-           ref: policyRef ? 'policy' : 'seed',
+           drift_policy: policyCompared ? driftPolicy : null,
+           policy_status: policyState.status, policy_errors: policyState.errors,
+           policy_missing: policyState.missing, policy_comparisons: policyCompared,
+           comparisons: compared, drift_active: driftActive,
+           not_evaluable: compared === 0 ||
+               (policyState.status !== 'none' && policyCompared === 0),
+           ref: policyRef ? (policyState.status === 'partial' ? 'mixed' : 'policy') : 'seed',
            pf_err: (pfRead && !pfRead.found) ? (pfRead.err || 'unreadable') : '' };
 }
 /** PURE: the ' | panel: ...' status token. Prints 'policy \u2014' per
@@ -4425,8 +4516,11 @@ function dt10PanelRefNote_(ref, mode) {
   return ' | panel: ' + parts.join(dot) +
       (ref.pf_err ? dot + 'PF n/a (' + ref.pf_err + ')' : '') +
       dot + 'ref=' + ref.ref + ' drift ' +
-      (ref.ref === 'policy' ? ref.drift_policy : ref.drift_seed) +
-      dot + 'policy ref ' + (ref.ref === 'policy' ? 'set' : 'none') +
+      ref.drift_active +
+      dot + 'policy ref ' + (ref.policy_status === 'complete' ? 'set' : ref.policy_status) +
+      (ref.policy_status === 'partial' ? ' (undeclared controls use seed)' : '') +
+      (ref.not_evaluable ? ' NOT EVALUABLE (zero policy comparisons)' : '') +
+      (ref.policy_errors.length ? ' (' + ref.policy_errors.join('; ') + ')' : '') +
       (mode === 'observe' ? ' [observe]' : '');
 }
 /** PURE: one countable 'panel_reference_drift' object when the panel differs
@@ -4435,13 +4529,19 @@ function dt10PanelRefNote_(ref, mode) {
 function dt10PanelRefAlerts_(ref) {
   var out = [];
   if (!ref) return out;
-  var usePolicy = ref.ref === 'policy';
+  if (ref.policy_status === 'invalid' || ref.policy_status === 'unavailable' ||
+      ref.not_evaluable) {
+    out.push({ type: 'policy_reference_not_evaluable', count: ref.policy_comparisons,
+      required_action: 'Policy reference NOT EVALUABLE: ' +
+          (ref.policy_errors.join('; ') || 'zero usable comparisons') +
+          '; undeclared controls still compare to seed.' });
+  }
   var parts = [];
   for (var i = 0; i < ref.items.length; i++) {
     var it = ref.items[i];
-    if (usePolicy ? it.drift_policy : it.drift_seed) {
-      parts.push(it.label + ' ' + it.panel + ' vs ' + ref.ref + ' ' +
-                 (usePolicy ? it.policy : it.seed));
+    if (it.drift_active) {
+      parts.push(it.label + ' ' + it.panel + ' vs ' + it.reference + ' ' +
+                 it.reference_value);
     }
   }
   if (!parts.length) return out;
@@ -4449,7 +4549,7 @@ function dt10PanelRefAlerts_(ref) {
     required_action: 'Panel differs from the ' + ref.ref + ' reference on: ' +
       parts.join('; ') + '. Operator decision: keep the panel value and ' +
       'update _Lists_Config TFB_PANEL_DEFAULTS' +
-      (usePolicy ? ' / DT10_POLICY_REF' : '') +
+      (ref.policy_comparisons ? ' / DT10_POLICY_REF' : '') +
       ', or change the panel cell. The cockpit never writes panel cells.' });
   return out;
 }
@@ -4516,31 +4616,44 @@ function dt10PoolVintageIndex_(poolRows) {
     var w = String(r['Warnings'] === null || r['Warnings'] === undefined ?
                    '' : r['Warnings']);
     var m1 = DT10_VINT_ASOF_RE.exec(w), m2 = DT10_VINT_LKG_RE.exec(w);
+    var mp = DT10_VINT_PUBLISHED_RE.exec(w);
+    var published = r['Analyst Target Published At'] || r['Target Publication Date'] ||
+        r['analyst_target_published_at'] || r['analyst_target_asof'] || (mp ? mp[1] : null);
+    if (published) {
+      published = iso(published);
+      if (!/^\d{4}-\d{2}-\d{2}(?:$|T\d{2}:\d{2}.*(?:Z|[+-]\d{2}:\d{2})$)/.test(published) ||
+          !isFinite(Date.parse(published)) || Date.parse(published) > Date.now() + 300000) published = null;
+      if (published) {
+        var calendarDate = published.slice(0, 10);
+        if (new Date(calendarDate + 'T00:00:00Z').toISOString().slice(0, 10) !== calendarDate) published = null;
+      }
+    }
     out[sym] = {
       quote_asof: dt10HasValue_(r['acquisition_quote_asof']) ?
           iso(r['acquisition_quote_asof']) : (m1 ? m1[1] : null),
       retrieved: dt10HasValue_(r['Last Updated (UTC)']) ?
           iso(r['Last Updated (UTC)']) : null,
       lkg_h: m2 ? parseInt(m2[1], 10) : null,
+      analyst_published: published,
       has_target: dt10HasValue_(r['Target Price'])
     };
   }
   return out;
 }
 /** PURE: 'YYYY-MM-DDTHH:MM[:SS[.ffffff]](+00:00|Z|+hh:mm)' -> 'YYYY-MM-DD
- * HH:MMZ' by string slicing (no Date parse, no TZ surprise; microseconds
- * survive because the suffix regex anchors at the end). Non-ISO passes
- * through, clipped. */
+ * HH:MMZ'. Explicit offsets are converted to UTC; a naive timestamp is
+ * labelled timezone unknown rather than silently presented as UTC. */
 function dt10VintageFmt_(iso) {
   var s = String(iso === null || iso === undefined ? '' : iso);
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) return s.slice(0, 25);
-  var tz = /(\+00:00|Z)$/.test(s) ? 'Z' :
-      (s.match(/[+-]\d\d:\d\d$/) ? s.slice(-6) : '');
-  return s.slice(0, 10) + ' ' + s.slice(11, 16) + tz;
+  if (/(Z|[+-]\d\d:\d\d)$/.test(s) && isFinite(Date.parse(s))) {
+    return new Date(Date.parse(s)).toISOString().slice(0, 16).replace('T', ' ') + 'Z';
+  }
+  return s.slice(0, 10) + ' ' + s.slice(11, 16) + ' (timezone unknown)';
 }
 /** PURE: ['Quote As-Of (UTC)', 'Target Vintage'] cells for one ticket.
  * 'retrieved <clock>' names the retrieval clock (never quote time);
- * 'current' = a Target Price without a held-target (lkg) tag. */
+ * A target's presence or retrieval clock never proves its analyst vintage. */
 function dt10VintageCells_(ticket, idx) {
   var e = (idx && ticket) ? idx[dt10NormSym_(ticket.symbol)] : null;
   var asOf = '\u2014', vint = '\u2014';
@@ -4548,7 +4661,8 @@ function dt10VintageCells_(ticket, idx) {
     if (e.quote_asof) asOf = dt10VintageFmt_(e.quote_asof);
     else if (e.retrieved) asOf = 'retrieved ' + dt10VintageFmt_(e.retrieved);
     if (e.lkg_h !== null && e.lkg_h !== undefined) vint = 'lkg ' + e.lkg_h + 'h';
-    else if (e.has_target) vint = 'current';
+    else if (e.has_target && e.analyst_published) vint = 'analyst ' + dt10VintageFmt_(e.analyst_published);
+    else if (e.has_target) vint = 'unknown (analyst date unavailable)';
   }
   return [asOf, vint];
 }
@@ -5773,29 +5887,88 @@ function dt10SelLogSheet_(ss) {
   }
   return sh;
 }
-/** v1.13.4 [WP-8] I/O: write the audit grid to the hidden tab
- * _T10_Candidates (row 1 run stamp, row 2 DT10_CAND_HEADERS, rows 3.. data;
- * same column formats + verdict colouring as the cockpit grid). Modelled on
- * dt10SelLogSheet_. Never throws: {ok:true, rows:N} or {ok:false, err} --
- * the caller then renders today's in-cockpit grid (fail-open). Restores the
- * cockpit as the active sheet (insertSheet/hideSheet move the UI focus). */
-function dt10CandTabWrite_(ss, cRows, stampLine, tokens) {
+/** Canonical digest covers exactly the header and values readers consume. */
+function dt10CandTabChecksum_(headers, rows) {
+  var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,
+      JSON.stringify([headers, rows]), Utilities.Charset.UTF_8);
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) hex += ('0' + ((bytes[i] + 256) % 256).toString(16)).slice(-2);
+  if (hex.length !== 64) throw new Error('candidate checksum unavailable');
+  return hex;
+}
+function dt10CandRunId_(meta) {
+  var m = meta || {}, route = m.route || {};
+  return String(route.request_id || m.run_id || m.request_id || '').replace(/^\s+|\s+$/g, '');
+}
+/** A current reader requires the final COMMITTED receipt, exact run ID,
+ * exact dimensions and digest of a fresh values read. Old/partial grids
+ * never authorize a current read, including a current empty result. */
+function dt10CandTabRead_(ss, runId) {
   try {
+    var sh = ss.getSheetByName(DT10_CANDTAB_SHEET);
+    if (!sh || !runId) throw new Error('current candidate run missing');
+    var receiptRaw = String(sh.getRange(1, 2).getValue() || '');
+    var receipt = JSON.parse(receiptRaw);
+    if (receipt.state !== 'COMMITTED' || receipt.run_id !== String(runId) ||
+        typeof receipt.rows !== 'number' || receipt.rows < 0 ||
+        Math.floor(receipt.rows) !== receipt.rows || receipt.cols !== DT10_CAND_HEADERS.length ||
+        sh.getLastRow() !== receipt.rows + 2) throw new Error('candidate run not committed/current');
+    var header = sh.getRange(2, 1, 1, receipt.cols).getValues()[0];
+    var data = receipt.rows ? sh.getRange(3, 1, receipt.rows, receipt.cols).getValues() : [];
+    if (JSON.stringify(header) !== JSON.stringify(DT10_CAND_HEADERS) ||
+        dt10CandTabChecksum_(header, data) !== receipt.checksum) throw new Error('candidate readback mismatch');
+    if (String(sh.getRange(1, 2).getValue() || '') !== receiptRaw ||
+        sh.getLastRow() !== receipt.rows + 2) throw new Error('candidate commit changed during read');
+    return { ok: true, rows: receipt.rows, run_id: receipt.run_id,
+             checksum: receipt.checksum, data: data };
+  } catch (eCr) {
+    return { ok: false, rows: 0, err: String(eCr && eCr.message || eCr) };
+  }
+}
+/** Stage, read back and verify the complete grid before touching the public
+ * tab. Invalidate its receipt before mutation; COMMITTED is the final write.
+ * A fault falls back to today's cockpit grid and leaves no trusted partial
+ * publication. The same protocol commits zero rows, replacing old results. */
+function dt10CandTabWrite_(ss, cRows, stampLine, tokens, runId) {
+  var lock = null, locked = false;
+  try {
+    lock = LockService.getScriptLock();
+    locked = lock.tryLock(5000);
+    if (!locked) throw new Error('candidate publication already running');
     var n = cRows.length, cols = DT10_CAND_HEADERS.length;
+    if (!runId) throw new Error('current candidate run ID missing');
+    for (var ri = 0; ri < n; ri++) {
+      if (!Array.isArray(cRows[ri]) || cRows[ri].length !== cols) throw new Error('candidate row shape invalid');
+    }
+    var checksum = dt10CandTabChecksum_(DT10_CAND_HEADERS, cRows);
+    var receipt = { state: 'PENDING', run_id: String(runId), rows: n, cols: cols, checksum: checksum };
+    var stamp = [stampLine, JSON.stringify(receipt)];
+    for (var k = 2; k < cols; k++) stamp.push('');
+    var grid = [stamp, DT10_CAND_HEADERS].concat(cRows);
+    var stage = ss.getSheetByName(DT10_CANDTAB_STAGE_SHEET);
+    if (!stage) stage = ss.insertSheet(DT10_CANDTAB_STAGE_SHEET);
+    function capacity(sh) {
+      if (sh.getMaxColumns() < cols) sh.insertColumnsAfter(sh.getMaxColumns(), cols - sh.getMaxColumns());
+      if (sh.getMaxRows() < n + 2) sh.insertRowsAfter(sh.getMaxRows(), n + 2 - sh.getMaxRows());
+    }
+    capacity(stage);
+    stage.clear();
+    stage.getRange(1, 1, n + 2, cols).setValues(grid);
+    SpreadsheetApp.flush();
+    var stagedHeader = stage.getRange(2, 1, 1, cols).getValues()[0];
+    var stagedData = n ? stage.getRange(3, 1, n, cols).getValues() : [];
+    if (stage.getLastRow() !== n + 2 ||
+        dt10CandTabChecksum_(stagedHeader, stagedData) !== checksum) throw new Error('candidate staging readback mismatch');
+    if (!stage.isSheetHidden()) stage.hideSheet();
     var sh = ss.getSheetByName(DT10_CANDTAB_SHEET);
     if (!sh) sh = ss.insertSheet(DT10_CANDTAB_SHEET);
-    if (sh.getMaxColumns() < cols) {
-      sh.insertColumnsAfter(sh.getMaxColumns(), cols - sh.getMaxColumns());
-    }
-    if (sh.getMaxRows() < n + 2) {
-      sh.insertRowsAfter(sh.getMaxRows(), n + 2 - sh.getMaxRows());
-    }
+    capacity(sh);
+    // Invalidate before clear/copy, so even a torn multi-cell write cannot
+    // retain an old COMMITTED marker beside current-stamped partial rows.
+    sh.getRange(1, 2).setValue(JSON.stringify(receipt));
     sh.clear();
-    var stamp = [stampLine];
-    for (var k = 1; k < cols; k++) stamp.push('');
-    sh.getRange(1, 1, 1, cols).setValues([stamp]);
-    sh.getRange(2, 1, 1, cols).setValues([DT10_CAND_HEADERS])
-        .setFontWeight('bold');
+    sh.getRange(1, 1, n + 2, cols).setValues(grid);
+    sh.getRange(2, 1, 1, cols).setFontWeight('bold');
     if (n) {
       sh.getRange(3, 1, n, cols).setValues(cRows);
       dt10ApplyColFormats_(sh, 3, n, {
@@ -5806,10 +5979,22 @@ function dt10CandTabWrite_(ss, cRows, stampLine, tokens) {
     }
     sh.setFrozenRows(2);
     if (!sh.isSheetHidden()) sh.hideSheet();
-    try { ss.setActiveSheet(ss.getSheetByName(DT10_SHEET)); } catch (eAct) {}
-    return { ok: true, rows: n };
+    SpreadsheetApp.flush();
+    var writtenHeader = sh.getRange(2, 1, 1, cols).getValues()[0];
+    var writtenData = n ? sh.getRange(3, 1, n, cols).getValues() : [];
+    if (sh.getLastRow() !== n + 2 ||
+        dt10CandTabChecksum_(writtenHeader, writtenData) !== checksum) throw new Error('candidate final readback mismatch');
+    receipt.state = 'COMMITTED';
+    sh.getRange(1, 2).setValue(JSON.stringify(receipt));
+    SpreadsheetApp.flush();
+    var committed = dt10CandTabRead_(ss, runId);
+    if (!committed.ok) throw new Error(committed.err);
+    return { ok: true, rows: n, run_id: String(runId), checksum: checksum, state: 'COMMITTED' };
   } catch (eCt) {
     return { ok: false, rows: 0, err: String(eCt && eCt.message || eCt) };
+  } finally {
+    if (locked) { try { lock.releaseLock(); } catch (eLock) {} }
+    try { ss.setActiveSheet(ss.getSheetByName(DT10_SHEET)); } catch (eFocus) {}
   }
 }
 /** v1.13.4 [WP-8]: ONE _Run_Log INPUT-TRUTH row per run when any gate is
@@ -6360,14 +6545,16 @@ function refreshDecisionTop10() {
   SpreadsheetApp.flush();
   var panel = dt10ReadPanel_(sheet, ss);
   // v1.13.4 [WP-8]: input-truth gates -- three memoized property reads;
-  // off (default) => no further service call and the payload is untouched.
+  // off (default) => no feature input reads; a narrow owned-KPI read
+  // prevents prior enforce cells surviving an off/property-failure run.
   var itMode = dt10InputTruthMode_();
   var candMode = dt10CandTabMode_();
   var vintMode = dt10VintageColsMode_();
+  if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
     itRef = dt10PanelRefCore_(panel, dt10PanelDefaults_(ss),
-        dt10PfPanelRead_(ss, DT10_IT_REF_LABELS), dt10PolicyRef_());
+        dt10PfPanelRead_(ss, DT10_IT_REF_LABELS), dt10PolicyRefState_());
   }
   // v1.11.12 [P-195]: judge the previous run's marker, then store ours.
   dt10RunMarkerCheck_('refreshDecisionTop10');
@@ -6452,6 +6639,12 @@ function refreshDecisionTop10() {
   try {
     resp = pool && !pool.rows.length ?
         {code: 200, json: dt10EmptySheetPayload_(), local: true} : dt10Post_(body);
+    if (resp.local && candMode === 'enforce') {
+      // This identifies a local empty publication only; it does not attest
+      // any backend/provider acquisition. Each refresh gets a distinct run.
+      resp.json.meta.run_id = 'native-empty-sheet-pool:' + new Date().toISOString() +
+          ':' + Utilities.getUuid();
+    }
   } catch (eNet) {
     statusCell.setValue(dt10StatusLine_('NETWORK ERROR',
         String(eNet) + dt10StaleNote_()));
@@ -6800,7 +6993,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   var cands = payload.candidates_rows || [];
   // v1.13.4 [WP-8] DT10_INPUT_TRUTH: evaluability facts + KPI cells L15:M16
   // (enforce only). Pure reads of the audit rows; payload.alerts and the
-  // ALERTS table are untouched; off => nothing here runs.
+  // ALERTS table are untouched; off only checks for previously owned KPIs.
   var _it = payload._dt10_it || { mode: 'off' };
   if (_it.mode !== 'off') {
     var _ev = dt10GateEvaluabilityCore_(cands,
@@ -6809,11 +7002,8 @@ function dt10RenderPayload_(sheet, payload, tokens) {
     payload._dt10_it_ev = _ev;
     payload._dt10_it_note = dt10GateEvaluabilityNote_(_ev, _it.mode) +
                             dt10PanelRefNote_(_it.ref, _it.mode);
-    if (_it.mode === 'enforce') {
-      sheet.getRange(DT10_ROW_KPI_LABELS, DT10_KPI_LABELS.length + 1, 2, 2)
-          .setValues(dt10GateKpiCells_(_ev));
-    }
   }
+  dt10InputTruthKpiState_(sheet, _it.mode, payload._dt10_it_ev || null);
   // SELECTED: finalization above already applied funding and feed controls.
   // The upstream token may label input readiness but never invent a ticket.
   var dt10Uv = payload._dt10_uv;
@@ -6999,9 +7189,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // identical calls in identical order (the else branch IS v1.13.3).
   var _cm = payload._dt10_cand_mode || 'off';
   var _tab = null;
-  if (_cm === 'enforce' && cRows.length) {
+  if (_cm === 'enforce') {
     _tab = dt10CandTabWrite_(sheet.getParent(), cRows,
-        dt10CandTabStampLine_(payload.meta, cRows.length, new Date()), tokens);
+        dt10CandTabStampLine_(payload.meta, cRows.length, new Date()), tokens,
+        dt10CandRunId_(payload.meta));
     payload._dt10_cand_result = _tab;
   }
   var cT;
@@ -7024,12 +7215,15 @@ function dt10RenderPayload_(sheet, payload, tokens) {
           DT10_CANDTAB_SHEET + ' (cockpit footer row ' + row + ')';
     } else if (_cm === 'enforce') {
       payload._dt10_cand_note = 'cands ' + DT10_CANDTAB_SHEET + ' write ' +
-          (cRows.length ? 'FAILED (' + ((_tab && _tab.err) || 'unknown') + ')' :
-                          'skipped (no candidate rows)') +
+          'FAILED (' + ((_tab && _tab.err) || 'unknown') + ')' +
           ' \u2014 grid kept in cockpit (footer row ' + row + ')';
     } else {
       payload._dt10_cand_note = 'cands ' + cRows.length + ' in cockpit (footer row ' +
           row + '; target <= ' + DT10_CANDTAB_COCKPIT_TARGET_ROWS + ') [observe]';
+    }
+    if (_cm === 'enforce' && row > DT10_CANDTAB_COCKPIT_TARGET_ROWS) {
+      payload._dt10_cand_note += ' | layout OVERFLOW: ' + row + ' > ' +
+          DT10_CANDTAB_COCKPIT_TARGET_ROWS + ' rows; all decision evidence retained';
     }
   }
   // Meta footer
@@ -7055,8 +7249,9 @@ function dt10SelfTest() {
   report.push('fx rates from TFB_FX_LOOKUP: ' + fxCount);
   // v1.13.4 [WP-8 / DQ-14, DQ-50]: US-cent quoted rows need a USX FX row.
   report.push('fx USX row: ' +
-      (Object.prototype.hasOwnProperty.call(fx, 'USX') && fx.USX > 0 ?
-       'present (' + fx.USX + ')' :
+      (Object.prototype.hasOwnProperty.call(fx, 'USX') && fx.USD > 0 &&
+       Math.abs(fx.USX - fx.USD / 100) < 1e-9 ?
+       'valid USD/100 (' + fx.USX + ')' :
        'ABSENT \u2014 US-cent quoted Commodities_FX rows raise missing_fx; ' +
        'operator adds "USX | Subunit Of USD" to LC_FX_Table now (resolves ' +
        'via raw-key lookup); backend USX subunit fix tracked separately ' +
@@ -7682,20 +7877,20 @@ function dt10SelfTest() {
   var itKpi = dt10GateKpiCells_(itEv);
   var itEv0 = dt10GateEvaluabilityCore_([], null);
   report.push('evaluability core: ' +
-      ((itEv.total === 5 && itEv.news.unknown === 3 && itEv.news.evaluable === 2 &&
-        itEv.news.pct_unknown === 60 && itEv.news.not_evaluable &&
+      ((itEv.total === 5 && itEv.news.unknown === 5 && itEv.news.evaluable === 0 &&
+        itEv.news.display_evaluable === 2 && itEv.news.pct_unknown === 100 && itEv.news.not_evaluable &&
         itEv.news.display_only && itEv.news.cap === 60 &&
         itEv.sector.unknown === 5 && itEv.sector.not_evaluable &&
         itEv.conflict.yes === 2 && itEv.conflict.no === 2 &&
         itEv.conflict.unknown === 1 &&
-        itAl.length === 2 && itAl[0].count === 3 && itAl[1].count === 5 &&
+        itAl.length === 2 && itAl[0].count === 5 && itAl[1].count === 5 &&
         itKpi[0][0] === 'News Gate' && itKpi[0][1] === 'Sector Gate' &&
         itKpi[1][0].indexOf('NOT EVALUABLE') === 0 &&
         itEv0.total === 0 && !itEv0.news.not_evaluable &&
         dt10GateEvaluabilityNote_(itEv0, 'observe') === 'gates: no candidates [observe]' &&
         dt10GateEvaluabilityAlerts_(itEv0).length === 0 &&
         dt10GateKpiCells_(itEv0)[1][0] === 'n/a') ?
-       'ok (3/5 news, 5/5 sector unknown -> 2 alerts; empty -> n/a)' : 'FAIL'));
+       'ok (display labels are not gate receipts; empty -> n/a)' : 'FAIL'));
   var itDefs = { 'T10: Max Per Sector': 2, 'PF: Max Sector %': 30,
                  'PF: Max Position %': 15 };
   var itPf = { found: true, values: { 'PF: Max Sector %': 30,
@@ -7747,7 +7942,7 @@ function dt10SelfTest() {
       ((itIdx['INDV.US'].lkg_h === 45 &&
         itIdx['INDV.US'].quote_asof === '2026-10-09T20:00:00+00:00' &&
         itVc1[0] === '2026-10-09 20:00Z' && itVc1[1] === 'lkg 45h' &&
-        itVc2[0] === 'retrieved 2026-10-10 17:48Z' && itVc2[1] === 'current' &&
+        itVc2[0] === 'retrieved 2026-10-10 17:48Z' && itVc2[1] === 'unknown (analyst date unavailable)' &&
         itVc3[0] === '\u2014' && itVc3[1] === '\u2014' &&
         itVc4[0] === '\u2014' && itVc4[1] === '\u2014' &&
         dt10VintageCells_({ symbol: 'INDV.US' }, null)[0] === '\u2014' &&

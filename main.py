@@ -2,12 +2,20 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.2)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.3)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.3 (2026-10-11, WP-15): count and inspect effective route contexts when
+FastAPI uses lazy included-router nodes. WHY: all six routers still served
+but the flat route scan falsely reported every business family missing on
+Python 3.13 / FastAPI 0.143. Feature detection preserves the pinned eager
+stack's diagnostics and native include_router behavior; no production pins
+or routing policy changed. Rollback: restore the flat diagnostic scans and
+APP_ENTRY_VERSION to v8.14.2.
 
 v8.14.2: redact credential-bearing diagnostic text and wrap existing logging
 formatters while retaining handler routing, error classes and request IDs.
@@ -379,7 +387,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.2"
+APP_ENTRY_VERSION = "8.14.3"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1363,6 +1371,23 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
 # =============================================================================
 # Route diagnostics helpers
 # =============================================================================
+def _iter_effective_routes(routes: Iterable[Any]) -> Iterable[Any]:
+    """v8.14.3: inspect eager routes and FastAPI's lazy include contexts.
+
+    WHY: FastAPI 0.143 includes routers as branch nodes without path/methods.
+    The endpoints still serve, but inspecting those nodes reports every
+    business family missing. Its effective contexts retain prefix, methods
+    and endpoint ownership. Feature detection keeps the pinned eager stack
+    byte-identical and leaves include_router's execution semantics intact.
+    """
+    for route in routes:
+        effective = getattr(route, "effective_route_contexts", None)
+        if callable(effective):
+            yield from effective()
+        else:
+            yield route
+
+
 def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
     path = str(getattr(route, "path", "") or "")
     methods = getattr(route, "methods", None)
@@ -1374,7 +1399,7 @@ def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
 
 def _app_route_signature_set(app: Any, *, include_builtin: bool = True) -> Set[Tuple[str, str]]:
     sigs: Set[Tuple[str, str]] = set()
-    for route in getattr(app, "routes", []) or []:
+    for route in _iter_effective_routes(getattr(app, "routes", []) or []):
         path = str(getattr(route, "path", "") or "")
         if not include_builtin and path in _BUILTIN_META_PATHS:
             continue
@@ -1476,7 +1501,7 @@ def _canonical_route_match_rank(
 
 
 def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
-    routes = list(getattr(app, "routes", []) or [])
+    routes = list(_iter_effective_routes(getattr(app, "routes", []) or []))
     owners: Dict[str, str] = {}
     for canonical_path in _CANONICAL_DIAGNOSTIC_PATHS:
         candidates: List[Tuple[Tuple[int, int, int], int, Any]] = []
@@ -1529,7 +1554,7 @@ def _effective_failed_modules(src: Dict[str, Any]) -> List[str]:
 def _verify_required_route_families(app: FastAPI) -> List[str]:
     paths = {
         str(getattr(r, "path", "") or "")
-        for r in (getattr(app, "routes", []) or [])
+        for r in _iter_effective_routes(getattr(app, "routes", []) or [])
     }
     presence = _route_family_presence_from_paths(paths)
     required = {
@@ -1550,7 +1575,7 @@ def _live_route_metrics(app: Optional[FastAPI]) -> Tuple[int, int]:
     if app is None:
         return 0, 0
     try:
-        live_route_count = len(getattr(app, "routes", []) or [])
+        live_route_count = sum(1 for _ in _iter_effective_routes(getattr(app, "routes", []) or []))
     except Exception:
         live_route_count = 0
     try:
@@ -1630,7 +1655,7 @@ def _normalize_routes_snapshot(
         try:
             all_paths = {
                 str(getattr(r, "path", "") or "")
-                for r in (getattr(app, "routes", []) or [])
+                for r in _iter_effective_routes(getattr(app, "routes", []) or [])
             }
             route_family_presence = _route_family_presence_from_paths(all_paths)
             path_owners = _canonical_path_owners_from_routes(app)
@@ -2117,7 +2142,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
             path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
             all_paths = {
                 str(getattr(r, "path", "") or "")
-                for r in (getattr(app, "routes", []) or [])
+                for r in _iter_effective_routes(getattr(app, "routes", []) or [])
             }
             route_family_presence = _route_family_presence_from_paths(all_paths)
             missing_required_keys = _verify_required_route_families(app)

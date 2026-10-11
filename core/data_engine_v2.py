@@ -2,8 +2,15 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.153.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.154.0
 ================================================================================
+
+WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
+- Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
+  seams alongside default-off price precision, USX currency and crypto identity.
+- Route the late 12M softcap rounding through the shared precision contract;
+  use the actual price quantum for armed noise and idempotence bounds. All
+  flags unset retain the original rounding and publication behavior.
 
 WHY v5.153.0 - WP-2b SETTLE-UNRESOLVED PUBLICATION RULE (env TFB_SETTLE_UNRESOLVED
 = off | observe | enforce, explicit words only, default OFF -> byte-identical)
@@ -216,6 +223,28 @@ TFB_ROI12_SOFTCAP_GATE, both off|observe|enforce, default OFF -> byte-identical)
 - HEADER REPAIR (v5.139.0 precedent): the title read v5.151.8 while
   __version__ was 5.151.9; both now read 5.152.0. Every prior WHY block is
   preserved verbatim.
+
+WHY v5.152.0 - DEFAULT-OFF PRICE PRECISION (WP-03)
+- 2026-10-10 export: SHIB-USD at 5.47e-6 and COMP-USD publish zero
+  forecast prices; twelve other sub-cent rows lose significant digits.
+- TFB_PRICE_PRECISION unset/off retains each site's original round exactly.
+  Armed (1/true/on/yes), forecast/intrinsic prices below 10 keep at least
+  seven significant digits. Scoring uses the same leaf rounding contract.
+- Include six-decimal target_mean_price and target_price now: leaving those
+  anchors rounded would erase a tiny provider target before forecasts use it.
+  price_change, history/52-week quotes and position amounts keep their own
+  existing six-decimal contracts; return and score precision stay unchanged.
+- Expose price_precision in surface_gate_states and the GUARDS boot line.
+  Presentation permits only the actual price rounding quantum, not an
+  unbounded four-decimal allowance for tiny crypto/FX instruments.
+- Repair the stale title (5.151.8) to match the current module version.
+- WP-04: with TFB_OPP_FX_USX_SUBUNIT armed, recognize USX (USD cents)
+  in the existing shares/price-witnessed market-cap normalizer. The export
+  contains thirteen USX futures rows; unset keeps their old treatment.
+- WP-05: default-off TFB_CRYPTO_NAME_GATE checks known crypto names
+  on Yahoo fundamentals patches before merging them into an honest quote.
+  Observe logs; enforce discards only a conflicting patch. Seven wrong-name
+  crypto rows in the export motivate the separate operator quarantine step.
 
 WHY v5.151.8 - COMPLETE RESEARCH MEMBERSHIP
 - Reader-backed membership has an explicit complete/source receipt and never
@@ -4125,9 +4154,14 @@ from core.financial_units import (
 # v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
 # non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
 # never ranked, never funded.
-__version__ = "5.153.0"
+__version__ = "5.154.0"
 
 from core.sheet_presentation import present_instrument_row
+from core.price_precision import (
+    price_precision_enabled as _price_precision_enabled,
+    price_round_half_quantum as _price_round_half_quantum,
+    round_price as _round_price,
+)
 
 from core.provider_capabilities import (
     provider_supports_instrument,
@@ -5121,6 +5155,7 @@ _SUBUNIT_PRICE_CURRENCIES: frozenset = frozenset({
     "GBX", "GBp",
     "ZAC", "ZAc",
     "ILA", "ILa",
+    "USX",
 })
 
 _SUBUNIT_MC_RATIO_LO: float = 0.5
@@ -5144,7 +5179,13 @@ def _normalize_subunit_market_cap(row: Dict[str, Any]) -> None:
         return
     if not _subunit_market_cap_normalize_enabled():
         return
-    if _safe_str(row.get("currency")) not in _SUBUNIT_PRICE_CURRENCIES:
+    currency = _safe_str(row.get("currency"))
+    if currency.upper() == "USX":
+        if (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() not in {
+                "1", "true", "yes", "on"}:
+            return
+        currency = "USX"  # only this unambiguous token folds; GBP/GBp stay distinct
+    if currency not in _SUBUNIT_PRICE_CURRENCIES:
         return
 
     # Idempotency: never divide twice within one pipeline run (the normalizer is
@@ -5405,7 +5446,7 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     upside_fraction = max(_INTRINSIC_UPSIDE_MIN_PCT / 100.0,
                           min(_INTRINSIC_UPSIDE_MAX_PCT / 100.0, upside_fraction))
 
-    row["intrinsic_value"] = round(intrinsic, 4)
+    row["intrinsic_value"] = _round_price(intrinsic)
     row["upside_pct"] = round(upside_fraction, 6)
 
 
@@ -5471,8 +5512,8 @@ def _intrinsic_display_values(cp: float, iv: float, upside: Any, policy: Mapping
         band_pp = policy["band_pp"]
         excess = (iv - ceiling) / cp * 100.0
         soft_pct = max_pct + band_pp * (1.0 - math.exp(-excess / band_pp))
-        return round(cp * (1.0 + soft_pct / 100.0), 4), round(soft_pct / 100.0, 6)
-    return round(ceiling, 4), round(max_pct / 100.0, 6)
+        return _round_price(cp * (1.0 + soft_pct / 100.0)), round(soft_pct / 100.0, 6)
+    return _round_price(ceiling), round(max_pct / 100.0, 6)
 
 
 def _intrinsic_display_basis(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
@@ -5532,8 +5573,9 @@ def _intrinsic_display_receipt_matches(row: Mapping[str, Any], policy: Mapping[s
             band is None or not 1 <= band <= 15 or type(policy.get("soft")) is not bool:
         return False
     upper_fraction = (max_pct + (band if policy["soft"] else 0)) / 100.0
-    upper_price = round(cp * (1 + upper_fraction), 4)
-    coherent = abs(upside - (iv - cp) / cp) <= .00005 / cp + .0000005
+    upper_price = _round_price(cp * (1 + upper_fraction))
+    half_quantum = _price_round_half_quantum(iv) if _price_precision_enabled() else .00005
+    coherent = abs(upside - (iv - cp) / cp) <= half_quantum / cp + .0000005
     return bool(signature and signature == basis.get("source_signature") and basis.get("policy") == policy
                 and iv <= upper_price and upside <= upper_fraction + .0000005 and coherent
                 and all(_intrinsic_display_number(basis.get(key)) is not None for key in ("display_intrinsic", "display_upside"))
@@ -5900,7 +5942,7 @@ def _top10_quality_filter_enabled() -> bool:
 # =============================================================================
 # v5.128.1 (audit P1-1/P1-4) — SHARED SURFACE-INVARIANT WRAPPER + STATE
 # =============================================================================
-_SAI_REQUIRED_VERSION = "1.4.1"   # v5.130.3 (F-01/F-02): engine<->module contract
+_SAI_REQUIRED_VERSION = "1.4.2"   # v5.152.0 (WP-04): optional USX currency contract
 _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
                               "error": ""}
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
@@ -6022,6 +6064,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "roi12_softcap": _roi12_softcap_mode(),                    # v5.152.0 (WP-3b)
             "tuple_noise_release": _tuple_noise_mode(),                # v5.152.0 (WP-3a)
             "settle_unresolved": _f7_unresolved_mode(),                # v5.153.0 (WP-2b)
+            "price_precision": "on" if _price_precision_enabled() else "off",  # v5.152.0
         }
     except Exception:
         return {}
@@ -7656,12 +7699,9 @@ def _roi12_softcap_mode() -> str:
 
 
 def _r12_round_price(x: float) -> float:
-    """v5.152.0 (WP-3b): the ONE forecast-price rounding this build adds (4 dp,
-    the engine's forecast_price_* convention). A later TFB_PRICE_PRECISION
-    build redirects this symbol; the rounding sites inside
-    _phase_ii_quality_forecast and _cap_provider_target_forecasts are not
-    touched here."""
-    return round(x, 4)
+    """Use the shared price contract at the late provider-target publish seam.
+    With price precision off, this remains exactly the legacy round(x, 4)."""
+    return _round_price(x, 4)
 
 
 def _roi12_softcap_target(ret: float, cap_abs: float, band: float) -> float:
@@ -7702,7 +7742,9 @@ def _roi12_softcap(row: Dict[str, Any]) -> int:
         asym = cap_abs + band
         parts = _mpc_warning_parts(row)
         bounded = _R12_FIXO_TAG in parts or any(p.startswith(_R12_TAG + ":enforce") for p in parts)
-        if bounded and abs(ret) <= asym + _TNR_PRICE_HALF_ULP / cp + 1e-9:
+        price_noise = (_price_round_half_quantum(fp12) if _price_precision_enabled()
+                       else _TNR_PRICE_HALF_ULP)
+        if bounded and abs(ret) <= asym + price_noise / cp + 1e-9:
             return 0  # already bounded at today's price (value-conditioned idempotence guard)
         cls = "hi" if abs(ret) > asym + 1e-9 else "band"
         if mode != "enforce":
@@ -7739,8 +7781,7 @@ def _tuple_noise_release(row: Dict[str, Any]) -> int:
         cp = _as_float(row.get("current_price"))
         if cp is None or cp <= 0:
             return 0
-        noise_bound = _TNR_PRICE_HALF_ULP / cp + _TNR_ROI_HALF_ULP
-        release_bound = noise_bound + _TNR_DRIFT_SLACK
+        precision = _price_precision_enabled()
         fct_tol = _fc_tuple_tol(cp)
         for h, fp_key, roi_key in _FCT_LEGS:
             fp = _as_float(row.get(fp_key))
@@ -7755,7 +7796,13 @@ def _tuple_noise_release(row: Dict[str, Any]) -> int:
             if not math.isfinite(implied):
                 continue
             diff = abs(implied - stored)
+            price_noise = (_price_round_half_quantum(fp) if precision
+                           else _TNR_PRICE_HALF_ULP)
+            noise_bound = price_noise / cp + _TNR_ROI_HALF_ULP
+            release_bound = noise_bound + _TNR_DRIFT_SLACK
             pres_tol = max(_TNR_PRES_TOL_ABS, abs(implied) * _TNR_PRES_TOL_REL)
+            if precision:
+                pres_tol += price_noise / cp
             if diff <= pres_tol:
                 continue  # the presenter publishes it already (also what makes a second pass a no-op)
             if diff > fct_tol:
@@ -10193,7 +10240,7 @@ def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
                 capped_ret = -cap_abs
         if capped_ret is None:
             continue
-        new_fp = round(cp * (1.0 + capped_ret), 4)
+        new_fp = _round_price(cp * (1.0 + capped_ret))
         row[field] = new_fp
         # v5.77.21 (Fix D): keep the matching ROI in lockstep with the capped price.
         row[roi_field] = round((new_fp - cp) / cp, 6)
@@ -10239,10 +10286,10 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 _v573_append_warning(row, "provider_target_capped_for_short_horizon_derivation")
             if not _forecast_price_is_populated(row.get("forecast_price_3m")):
                 derived_3m_return = capped_12m * _PHASE_II_RATIO_3M_OF_12M
-                row["forecast_price_3m"] = round(cp * (1.0 + derived_3m_return), 4)
+                row["forecast_price_3m"] = _round_price(cp * (1.0 + derived_3m_return))
             if not _forecast_price_is_populated(row.get("forecast_price_1m")):
                 derived_1m_return = capped_12m * _PHASE_II_RATIO_1M_OF_12M
-                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+                row["forecast_price_1m"] = _round_price(cp * (1.0 + derived_1m_return))
             if row.get("expected_roi_12m") is None:
                 row["expected_roi_12m"] = round(return_12m, 6)
                 _eq_roi_backfill_sentry_tag(row, "expected_roi_12m", "t12")
@@ -10285,7 +10332,7 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 else:
                     ratio_1m_of_3m = 0.0
                 derived_1m_return = capped_3m * ratio_1m_of_3m
-                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+                row["forecast_price_1m"] = _round_price(cp * (1.0 + derived_1m_return))
             if not _forecast_price_is_populated(row.get("forecast_price_12m")):
                 # 12M return ~ capped 3M return scaled UP to the 12M horizon.
                 if _PHASE_II_RATIO_3M_OF_12M > 0:
@@ -10293,7 +10340,7 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 else:
                     derived_12m_return = capped_3m
                 derived_12m_return = max(min(derived_12m_return, _PHASE_II_MAX_12M_ABS_RETURN), -_PHASE_II_MAX_12M_ABS_RETURN)
-                row["forecast_price_12m"] = round(cp * (1.0 + derived_12m_return), 4)
+                row["forecast_price_12m"] = _round_price(cp * (1.0 + derived_12m_return))
             if row.get("expected_roi_3m") is None:
                 row["expected_roi_3m"] = round(return_3m, 6)
                 _eq_roi_backfill_sentry_tag(row, "expected_roi_3m", "t3")
@@ -10408,9 +10455,9 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     forecast_3m = cp * (1.0 + expected_3m_return)
     forecast_1m = cp * (1.0 + expected_1m_return)
 
-    row["forecast_price_1m"] = round(forecast_1m, 4)
-    row["forecast_price_3m"] = round(forecast_3m, 4)
-    row["forecast_price_12m"] = round(forecast_12m, 4)
+    row["forecast_price_1m"] = _round_price(forecast_1m)
+    row["forecast_price_3m"] = _round_price(forecast_3m)
+    row["forecast_price_12m"] = _round_price(forecast_12m)
     row["expected_roi_1m"] = round(expected_1m_return, 6)
     _eq_roi_backfill_sentry_tag(row, "expected_roi_1m", "synth")
     row["expected_roi_3m"] = round(expected_3m_return, 6)
@@ -12493,6 +12540,31 @@ def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Op
         if _au1_identity_token_set(s) & want:
             return None
     return declared[0]
+
+
+def _crypto_name_guard_mode() -> str:
+    raw = (os.getenv("TFB_CRYPTO_NAME_GATE") or "off").strip().lower()
+    return raw if raw in {"observe", "enforce"} else "off"
+
+
+def _crypto_fundamentals_name_ok(symbol: str, patch: Dict[str, Any]) -> bool:
+    """WP-05: no Yahoo fundamentals from a definite curated-name mismatch.
+
+    Off and observe preserve the patch; unknown roots/absent names are not
+    judged. This is a name plausibility screen, not proof of a provider ID.
+    """
+    mode = _crypto_name_guard_mode()
+    if mode == "off":
+        return True
+    name = patch.get("name") or patch.get("longName") or patch.get("shortName")
+    if not name:
+        return True
+    from core.analysis.identity_guard import crypto_patch_name_matches
+    mismatch = crypto_patch_name_matches(symbol, name) is False
+    if mismatch:
+        logger.warning("[engine_v2 v%s CRYPTO-NAME] fundamentals mismatch mode=%s symbol=%s",
+                       __version__, mode, symbol)
+    return not mismatch or mode != "enforce"
 
 
 def _fund_identity_guard_enabled() -> bool:
@@ -15692,7 +15764,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                     and _as_float(out.get("target_mean_price")) is None:
                 _tgt12_raw = _as_float(out.get("forecast_price_12m"))
                 if _tgt12_raw is not None and _tgt12_raw > 0:
-                    out["target_mean_price"] = round(float(_tgt12_raw), 6)
+                    out["target_mean_price"] = _round_price(float(_tgt12_raw), 6)
 
     inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
     inferred_name = _infer_display_name_from_symbol(inferred_symbol)
@@ -16167,7 +16239,7 @@ def _apply_forecast_pair_coherence(row: Dict[str, Any]) -> None:
             continue
         if abs(implied - fp) <= abs(fp) * _FORECAST_PAIR_REL_TOLERANCE:
             continue
-        row[price_key] = round(implied, 4)
+        row[price_key] = _round_price(implied)
         touched = True
     if touched:
         _v573_append_warning(row, _FORECAST_PAIR_TAG)
@@ -16336,7 +16408,7 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     if px is None:
         px = _as_float(row.get("price"))
     if tgt is not None and tgt > 0:
-        _fill("target_price", round(tgt, 6), "analyst_target_price")
+        _fill("target_price", _round_price(tgt, 6), "analyst_target_price")
         # 3) Upside/Downside % <- signed FRACTION (matches upside_pct units).
         if px not in (None, 0):
             try:
@@ -16853,15 +16925,15 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
 
     if price is not None and row.get("forecast_price_1m") is None:
         drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
-        row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
+        row["forecast_price_1m"] = _round_price(price * (1.0 + drift / 300.0))
         _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_3m") is None:
         drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
-        row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
+        row["forecast_price_3m"] = _round_price(price * (1.0 + drift / 100.0))
         _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_12m") is None:
         drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
-        row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
+        row["forecast_price_12m"] = _round_price(price * (1.0 + drift / 100.0))
         _fallback_created_forecast = True
 
     if _fallback_created_forecast and not _safe_str(row.get("forecast_source")):
@@ -17717,7 +17789,7 @@ class DataEngineV5:
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
                 "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
-                "settle_unresolved=%s",
+                "settle_unresolved=%s price_precision=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -17740,6 +17812,7 @@ class DataEngineV5:
                 _roi12_softcap_mode(),      # v5.152.0 (WP-3b): 12M ceiling mode provable at boot
                 _tuple_noise_mode(),        # v5.152.0 (WP-3a): noise release mode provable at boot
                 _f7_unresolved_mode(),      # v5.153.0 (WP-2b): unresolved publication provable at boot
+                "on" if _price_precision_enabled() else "off",  # v5.152.0 (WP-03)
             )
         except Exception:
             pass
@@ -18470,6 +18543,11 @@ class DataEngineV5:
                     __version__, symbol, ysym, _au1b_got,
                 )
                 return {}
+        # Default-off name screen shares the writer/auditor vocabulary.
+        # Drop the entire conflicting fundamentals patch: retaining its numeric
+        # fields would still graft the wrong token's fundamentals onto the coin.
+        if not _crypto_fundamentals_name_ok(symbol, out):
+            return {}
         return out
 
     async def _fetch_yahoo_chart_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:

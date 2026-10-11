@@ -40,7 +40,10 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -49,7 +52,6 @@ if ROOT not in sys.path:
 SYNC = os.environ.get("TFB_TEST_SYNC_DELIVERED") or os.path.join(ROOT, "scripts", "run_dashboard_sync.py")
 BASE = os.environ.get("TFB_TEST_SYNC_BASE", "")
 EXPORT = os.environ.get("TFB_TEST_EXPORT_XLSX", "")
-os.environ.setdefault("GITHUB_RUN_ID", "38071484709")
 FIXED_NOW = datetime(2026, 10, 10, 18, 0, 0, tzinfo=timezone.utc)
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 WC_ENV = ("TFB_WARNINGS_COMPACT", "TFB_WARNINGS_COMPACT_KEEP", "TFB_WARNINGS_SINK_DIR")
@@ -65,8 +67,8 @@ OFFLINE = {
     "TFB_SYNC_OHLC_FILLGUARD": "off", "TFB_SYNC_OHLC_READBACK": "0",
     "TFB_SYNC_IDFW_RUNLOG": "0", "TFB_SVC_CAPACITY_GUARD": "0",
     "TFB_SYNC_KLG_FETCHFAIL": "off",
-    # Integration 2026-10-11: pinned INSIDE every _Env block, not only via the
-    # module-level setdefault above - in a whole-tree pytest process another
+    # Integration 2026-10-11: pinned INSIDE every _Env block; importing tests
+    # must not export process-global variables. In a whole-tree pytest process another
     # suite (tests/test_sync_fetchfail_truth_p162.py) has already exported its
     # own GITHUB_RUN_ID, and the sync reads the variable at call time, so T3/T9
     # compared against a run id this file never set. Restored on block exit.
@@ -688,7 +690,7 @@ def _t9():
         res = _res(mod)
         with contextlib.redirect_stdout(buf), _captured_log(mod) as log:
             got = mod._wc_publish_seam(_task(mod), res, _writer(mod, api), "BOOK", hdr, rows)
-    assert got is rows and rows[0][wi] == GM_FULL
+    assert got == rows and got._wc_archive["receipt"] is None and rows[0][wi] == GM_FULL
     assert "::warning::" in buf.getvalue() and "sink write FAILED for Global_Markets" in buf.getvalue()
     assert res._stamp_meta["wc"]["status"] == "SINK_FAILED" and res._stamp_meta["wc"]["sink"] == "-"
     apps = api.appends()
@@ -960,6 +962,205 @@ def test_t13_real_export_frozen_numbers():
         import pytest
         pytest.skip("TFB_TEST_EXPORT_XLSX not set or openpyxl unavailable")
     _t13()
+
+
+def test_sink_failure_stays_blocked_through_the_actual_writer(monkeypatch, tmp_path):
+    mod = m()
+    hdr, rows = fixture()
+    wi = _warn_col(hdr)
+    before = [row[wi] for row in rows]
+    calls = []
+
+    def fail_sink(*args):
+        calls.append(args)
+        raise OSError("forced archive failure")
+
+    monkeypatch.setattr(mod, "_wc_write_sink", fail_sink)
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        res = _res(mod)
+        out = mod._wc_publish_seam(_task(mod), res, writer, "BOOK", hdr, rows)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, out)
+        # Includes blank warning cells for which the real second projection
+        # would otherwise introduce sheet_horizon_label diagnostics.
+        assert [row[wi] for row in api.updates()[-1]["body"]["values"][1:]] == before
+        assert len(calls) == 1
+        receipt = writer._write_receipts[("BOOK", "Global_Markets")]
+        assert receipt["warnings_compact"]["status"] == "SINK_FAILED"
+        assert res._stamp_meta["wc"]["tags_removed"] == 0
+        assert res._stamp_meta["wc"]["would_remove_tags"] > 0
+        assert res._stamp_meta["wc"]["tags_after"] == res._stamp_meta["wc"]["tags_before"]
+
+
+def test_verified_sink_receipt_survives_final_projection(tmp_path):
+    mod = m()
+    hdr, rows = fixture()
+    rows = mod._present_market_sheet_rows("Global_Markets", hdr, rows)
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        out = mod._wc_publish_seam(_task(mod), _res(mod), writer, "BOOK", hdr, rows)
+        assert out._wc_archive["receipt"]["verified"] is True
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, out)
+        values = api.updates()[-1]["body"]["values"]
+        assert values[1][_warn_col(hdr)] == GM_COMPACT
+        final = writer._write_receipts[("BOOK", "Global_Markets")]
+        assert final["warnings_compact"]["sink_receipt"] == out._wc_archive["receipt"]
+        assert final["written_payload_sha8"] == mod._payload_sha8(hdr, values[1:])
+        assert final["live_readback"] is False
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt"])
+def test_lost_or_changed_sink_receipt_restores_original_warning_bytes(tmp_path, fault):
+    mod = m()
+    hdr, rows = fixture()
+    wi = _warn_col(hdr)
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        out = mod._wc_publish_seam(_task(mod), _res(mod), writer, "BOOK", hdr, rows)
+        path = Path(out._wc_archive["receipt"]["path"])
+        if fault == "missing":
+            path.unlink()
+        else:
+            path.write_text("{}\n", encoding="utf-8")
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, out)
+        written = api.updates()[-1]["body"]["values"][1:]
+        assert [row[wi] for row in written] == [row[wi] for row in rows]
+
+
+def test_sink_return_without_promised_records_cannot_authorize_compaction(monkeypatch, tmp_path):
+    mod = m()
+    hdr, rows = fixture()
+    path = tmp_path / "false_receipt.jsonl"
+    path.write_bytes(b"{}\n")
+    sha8 = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
+    monkeypatch.setattr(mod, "_wc_write_sink", lambda *_args: (str(path), sha8))
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        res = _res(mod)
+        out = mod._wc_publish_seam(_task(mod), res, writer, "BOOK", hdr, rows)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, out)
+        wi = _warn_col(hdr)
+        assert res._stamp_meta["wc"]["status"] == "SINK_FAILED"
+        assert [row[wi] for row in api.updates()[-1]["body"]["values"][1:]] == [row[wi] for row in rows]
+
+
+@pytest.mark.parametrize("late_fails", [False, True])
+def test_late_projection_tokens_require_their_own_verified_archive(monkeypatch, tmp_path, late_fails):
+    mod = m()
+    hdr, rows = fixture()
+    wi = _warn_col(hdr)
+    real_present = mod._present_market_sheet_rows
+    projected = real_present("Global_Markets", hdr, rows)
+    candidate = []
+
+    def reemit(page, headers, matrix):
+        out = real_present(page, headers, matrix)
+        out[0][wi] += "; rel_path:late_projection_detail"
+        candidate[:] = copy.deepcopy(out)
+        return out
+
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        out = mod._wc_publish_seam(_task(mod), _res(mod), writer, "BOOK", hdr, projected)
+        path = Path(out._wc_archive["receipt"]["path"])
+        initial_records = [json.loads(line) for line in path.read_text().splitlines()]
+        monkeypatch.setattr(mod, "_present_market_sheet_rows", reemit)
+        if late_fails:
+            def fail_sink(*_args):
+                raise OSError("forced late archive failure")
+            monkeypatch.setattr(mod, "_wc_write_sink", fail_sink)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, out)
+        written = api.updates()[-1]["body"]["values"][1:]
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert all(record in records for record in initial_records)
+        if late_fails:
+            assert [row[wi] for row in written] == [row[wi] for row in candidate]
+            assert records == initial_records
+        else:
+            assert "rel_path:late_projection_detail" not in written[0][wi]
+            assert len(records) == len(initial_records) + 1
+            assert records[-1]["warnings_full"] == candidate[0][wi]
+            assert records[-1]["removed"] == ["rel_path:late_projection_detail"]
+
+
+def test_direct_writer_sink_failure_preserves_input_warning_bytes(monkeypatch, tmp_path):
+    mod = m()
+    hdr, rows = fixture()
+    wi = _warn_col(hdr)
+
+    def fail_sink(*_args):
+        raise OSError("forced direct-write archive failure")
+
+    monkeypatch.setattr(mod, "_wc_write_sink", fail_sink)
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        values, _api = _payload(mod, "Global_Markets", hdr, rows)
+        assert [row[wi] for row in values[1:]] == [row[wi] for row in rows]
+
+
+def test_repeated_page_writes_preserve_prior_sink_records(tmp_path):
+    mod = m()
+    hdr, rows = fixture()
+    wi = _warn_col(hdr)
+    with _Env(TFB_WARNINGS_COMPACT="enforce", TFB_WARNINGS_SINK_DIR=str(tmp_path)):
+        writer = _writer(mod, FakeSheetsAPI())
+        first = mod._wc_publish_seam(_task(mod), _res(mod), writer, "BOOK", hdr, rows)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, first)
+        path = Path(first._wc_archive["receipt"]["path"])
+        records_before = [json.loads(line) for line in path.read_text().splitlines()]
+        next_rows = copy.deepcopy(rows)
+        next_rows[0][wi] += "; rel_path:second_write_original"
+        second = mod._wc_publish_seam(_task(mod), _res(mod), writer, "BOOK", hdr, next_rows)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, second)
+        records_after = [json.loads(line) for line in path.read_text().splitlines()]
+        assert all(record in records_after for record in records_before)
+        assert any(record["warnings_full"] == next_rows[0][wi] for record in records_after)
+
+
+def test_ranking_write_receipt_fingerprints_outgoing_cells_without_changing_input(tmp_path):
+    mod = m()
+    hdr = _headers("Global_Markets")
+    rows = [_row(hdr, Symbol="LOW.US", **{"Overall Score": 50, "Rank (Overall)": 1}),
+            _row(hdr, Symbol="HIGH.US", **{"Overall Score": 75, "Rank (Overall)": 1})]
+    before = copy.deepcopy(rows)
+    before_sha = mod._payload_sha8(hdr, rows)
+    with _Env(TFB_WARNINGS_COMPACT="off", TFB_RANK_OVERALL_PAGE="enforce"):
+        api = FakeSheetsAPI()
+        writer = _writer(mod, api)
+        writer.write_table("BOOK", "Global_Markets", "A5", hdr, rows)
+        written = api.updates()[-1]["body"]["values"][1:]
+        receipt = writer._write_receipts[("BOOK", "Global_Markets")]
+        assert [row[hdr.index("Rank (Overall)")] for row in written] == [2, 1]
+        assert rows == before and mod._payload_sha8(hdr, rows) == before_sha
+        assert receipt["written_payload_sha8"] == mod._payload_sha8(hdr, written) != before_sha
+        assert receipt["rank_page"]["written_payload_sha8"] == receipt["written_payload_sha8"]
+        assert receipt["evidence"] == "successful_RAW_update" and receipt["live_readback"] is False
+        res = _res(mod)
+        assert "write_receipt" not in res.to_dict()
+        res._stamp_meta["write_receipt"] = receipt
+        assert res.to_dict()["write_receipt"] == receipt
+
+
+def test_failed_update_cannot_reuse_a_prior_successful_write_receipt():
+    mod = m()
+    hdr, rows = fixture()
+
+    class RejectUpdate(FakeSheetsAPI):
+        def execute(self):
+            if self.requests[-1]["_method"] == "update":
+                raise RuntimeError("synthetic rejected update")
+            return super().execute()
+
+    with _Env(TFB_WARNINGS_COMPACT="off", TFB_RANK_OVERALL_PAGE="enforce"):
+        writer = _writer(mod, RejectUpdate())
+        writer._write_receipts[("BOOK", "Global_Markets")] = {"written_payload_sha8": "stale"}
+        with pytest.raises(RuntimeError, match="rejected update"):
+            writer.write_table("BOOK", "Global_Markets", "A5", hdr, rows)
+        assert ("BOOK", "Global_Markets") not in writer._write_receipts
 
 
 def _run_all():

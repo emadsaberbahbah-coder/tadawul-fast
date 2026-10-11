@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.25.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.26.1  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.26.1 (2026-10-11): integrate the optional USX FX path with the tag-driven
+settle-unresolved exclusion; unresolved rows never rank or receive funding.
+
+v1.26.0 (2026-10-11) WHY — USX quotes are US cents, not USD. With
+TFB_OPP_FX_USX_SUBUNIT armed (DEFAULT OFF), resolve their parent USD rate
+before dividing by 100. Validate exact supplied subunit rates in major
+units too, so TFB_OPP_FX_SANITY cannot replace 0.0375 SAR/cent with
+3.75 SAR/cent. Unarmed FX resolution, including supplied Sheet USX rows
+and the legacy GBp path, keeps the v1.25.0 behavior.
 
 v1.25.1 (2026-10-11) [WP-2b]: a row the engine published under
 TFB_SETTLE_UNRESOLVED=enforce (tag settle_unresolved:enforce:<reason>) fails
@@ -1436,7 +1446,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.25.1"
+OPPORTUNITY_BUILDER_VERSION = "1.26.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2157,11 +2167,11 @@ FX_STATIC_TO_SAR = {
     "PHP": 0.065, "PKR": 0.0133, "RON": 0.82, "VND": 0.000148,
 }
 FX_SUBUNIT_PARENT = {"GBP_SUB": "GBP", "GBX": "GBP", "ZAC": "ZAR",
-                     "ILA": "ILS"}
+                     "ILA": "ILS", "USX": "USD"}
 # "GBp" lowercases to "gbp" == parent code, so subunit detection must happen
 # BEFORE case folding — handled in _resolve_fx via the raw token check below.
 _RAW_SUBUNIT_TOKENS = {"GBp": "GBP", "GBX": "GBP", "ZAC": "ZAR", "ZAc": "ZAR",
-                       "ILA": "ILS", "ILa": "ILS"}
+                       "ILA": "ILS", "ILa": "ILS", "USX": "USD"}
 
 # ---------------------------------------------------------------------------
 # Env helpers (read per call — Render env changes apply without reimport)
@@ -3003,6 +3013,11 @@ def _env_fx_sanity():
     return _env_flag01("TFB_OPP_FX_SANITY", "0")
 
 
+def _env_fx_usx_subunit():
+    """v1.26.0: USD-cent quote support and unit-safe peg checking; DEFAULT OFF."""
+    return _env_flag01("TFB_OPP_FX_USX_SUBUNIT", "0")
+
+
 def _env_held_target_no_new_money():
     """v1.19.3: DEFAULT OFF. When on, a candidate carrying an analyst_lkg:
     warning (R-6 held target) is never funded for a NEW ticket."""
@@ -3583,23 +3598,38 @@ def _resolve_fx(currency_raw, fx_rates):
         return None, "missing"
     divisor = 1.0
     token = raw
-    if raw in _RAW_SUBUNIT_TOKENS:
+    usx_enabled = _env_fx_usx_subunit()
+    if raw in _RAW_SUBUNIT_TOKENS and (raw != "USX" or usx_enabled):
         token = _RAW_SUBUNIT_TOKENS[raw]
         divisor = 100.0
     else:
         up = raw.upper()
-        if up in ("GBX", "ZAC", "ILA"):
-            token = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}[up]
+        if up in ("GBX", "ZAC", "ILA") or (up == "USX" and usx_enabled):
+            token = FX_SUBUNIT_PARENT[up]
             divisor = 100.0
     code = token.upper()
     provided = fx_rates or {}
     # provided map may itself be keyed by the subunit code — honor the EXACT
     # raw key only (never case-fold: "GBp".upper() collides with parent GBP)
     r = _to_float(provided.get(raw))
+    if usx_enabled and raw.upper() == "USX" and (r is None or r <= 0):
+        # Unlike GBp, USX has no case-colliding major token. In the armed
+        # lane only, honor the canonical cents key for lowercase inputs too.
+        r = _to_float(provided.get("USX"))
     if r is not None and r > 0:
+        if usx_enabled and divisor != 1.0 and code in _FX_PEG_BAND:
+            # The exact raw rate is ALREADY per minor unit. The peg band is
+            # defined per major unit, so check r*100 and restore minor units.
+            major, source = _fx_peg_guard(code, r * divisor, "provided")
+            if source == "provided":
+                return r, source  # preserve the exact supplied subunit rate
+            return major / divisor, source + "/100"
         return _fx_peg_guard(code, r, "provided")  # v1.19.3
     r = _to_float(provided.get(code))
     if r is not None and r > 0:
+        if usx_enabled and divisor != 1.0 and code in _FX_PEG_BAND:
+            major, source = _fx_peg_guard(code, r, "provided")
+            return major / divisor, source + "/100"
         return _fx_peg_guard(  # v1.19.3
             code, r / divisor, "provided" if divisor == 1.0 else "provided/100")
     if code in FX_STATIC_TO_SAR:
@@ -3625,6 +3655,13 @@ def normalize_candidate(row, fx_rates, criteria):
     row_fx = _to_float(_field(view, "fx_to_sar"))
     if row_fx is not None and row_fx > 0:
         fx, fx_source = row_fx, "row"
+        if _env_fx_usx_subunit() and _to_text(currency_raw) and \
+                str(currency_raw).strip().upper() == "USX":
+            # Row overrides are also SAR per cent, so they must pass the
+            # same major-unit peg check as an exact provided FX map entry.
+            major, source = _fx_peg_guard("USD", row_fx * 100.0, "row")
+            if source != "row":
+                fx, fx_source = major / 100.0, source + "/100"
 
     target = _to_float(_field(view, "target_price"))
     iv = _to_float(_field(view, "intrinsic_value"))

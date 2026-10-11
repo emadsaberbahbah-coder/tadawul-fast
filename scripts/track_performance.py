@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.42.1)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.45.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -847,6 +847,7 @@ import concurrent.futures
 import csv
 import io
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -1572,7 +1573,18 @@ from urllib.error import HTTPError, URLError
 #   default) or restore v6.43.0 of this file; the mapped workflow lines are
 #   inert while the repo Variables are unset.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.44.0"
+# v6.43.1 (2026-10-11, WP-12): the 2026-10-10 brief identifies this
+# 10k-line module as a maintainability risk. Extract only the pure Wilson
+# interval/shrinkage leaves into scripts.performance_math, re-exporting the
+# original names and quantile constant. Math, rounding and callers unchanged.
+# v6.45.0 (2026-10-11): integrate WP-7 measurement and WP-12 extraction.
+# TRACK_CANONICAL_TARGETS=1 creates price-corroborated percentage-point
+# targets with an explicit horizon/version receipt in Notes, and exports a
+# read-only canonical outcome audit. Historical target cells are untouched.
+# TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
+# identities, preserving successive states and refusing writes without a
+# readable identity index. Legacy and WP-7 measurement modes stay available.
+SCRIPT_VERSION = "6.45.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2582,33 +2594,7 @@ def _a1_range(start_col: int, start_row: int, end_col: int, end_row: int) -> str
 # ---------------------------------------------------------------------------
 # v6.8.0: calibration math (pure, unit-tested)
 # ---------------------------------------------------------------------------
-_Z95 = 1.959963984540054  # 95% two-sided normal quantile
-
-
-def wilson_interval(wins: int, decided: int, z: float = _Z95) -> Tuple[float, float]:
-    """Wilson score interval for a binomial proportion, returned as PERCENT.
-    Stays inside [0,100] and is honest at small n. (0,0) when decided==0."""
-    n = int(decided)
-    if n <= 0:
-        return 0.0, 0.0
-    w = max(0, min(int(wins), n))
-    p = w / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    center = (p + z2 / (2.0 * n)) / denom
-    half = (z * math.sqrt((p * (1.0 - p) / n) + (z2 / (4.0 * n * n)))) / denom
-    lo = max(0.0, min(100.0, (center - half) * 100.0))
-    hi = max(0.0, min(100.0, (center + half) * 100.0))
-    return round(lo, 1), round(hi, 1)
-
-
-def shrink_factor(raw: float, decided: int, k: int) -> float:
-    """Shrink a raw calibration factor toward 1.0 by sample size:
-    1 + (raw-1) * n/(n+k). Small n -> ~1.0 (no correction asserted)."""
-    n = max(0, int(decided))
-    if n <= 0:
-        return 1.0
-    return 1.0 + (raw - 1.0) * (n / (n + max(1, int(k))))
+from scripts.performance_math import _Z95, shrink_factor, wilson_interval  # noqa: E402,F401
 
 
 class FullJitterBackoff:
@@ -3790,6 +3776,48 @@ def _dedup_signal_mode() -> str:
         return "off"
 
 
+def _signal_publication_mode() -> str:
+    """Explicit rollout word; immutable publication identities are opt-in."""
+    value = (os.getenv("TRACK_SIGNAL_PUBLICATION_MODE") or "off").strip().lower()
+    return "immutable" if value == "immutable" else "off"
+
+
+def _canonical_targets_enabled() -> bool:
+    return (os.getenv("TRACK_CANONICAL_TARGETS") or "0").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
+def _publication_key(symbol: str, date_key: str, publication_id: str) -> str:
+    if not publication_id:
+        return ""
+    # Publication IDs identify the source globally. The capture clock is not
+    # identity: replaying after Riyadh midnight must still skip the same row.
+    identity = json.dumps([symbol.upper(), publication_id],
+                          ensure_ascii=False, separators=(",", ":"))
+    return "tfb-signal-publication/v1:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+def signal_daily_publications(snaps: Any) -> List[Dict[str, Any]]:
+    """Separate first publication from the latest observed daily state.
+
+    The latest state is final only after the day has closed and capture is
+    complete; this projection deliberately does not invent that evidence.
+    """
+    days: Dict[str, List[Any]] = defaultdict(list)
+    for snap in snaps or []:
+        if getattr(snap, "publication_key", ""):
+            days[snap.key].append(snap)
+    result = []
+    for day, values in sorted(days.items()):
+        # Stable sort retains append order when timestamp resolution ties.
+        ordered = sorted(values, key=lambda snap: snap.recorded_at)
+        first, latest = ordered[0], ordered[-1]
+        result.append({"day_key": day, "first_publication": first.to_dict(),
+                       "latest_daily_state": latest.to_dict(),
+                       "publication_count": len(ordered), "finality": "latest_observed"})
+    return result
+
+
 def _dedup_signal_measure(sheet_keys: Any, snaps: Any) -> Dict[str, Any]:
     """v6.44.0 [P-191] PURE (no I/O, never raises): how many of this run's
     snapshots carry a Symbol|YYYYMMDD Key already present on the sheet, plus
@@ -4148,6 +4176,161 @@ def _perf_unit_sibling_index(
         except Exception:
             continue
     return idx
+
+
+_TARGET_SCHEMA_TAG = "[TFB_TARGET_SCHEMA "
+
+
+def _target_schema(notes: str) -> Optional[Dict[str, Any]]:
+    """Read the prospective schema receipt without inferring a version/date."""
+    try:
+        start = str(notes or "").index(_TARGET_SCHEMA_TAG) + len(_TARGET_SCHEMA_TAG)
+        value, size = json.JSONDecoder().raw_decode(str(notes)[start:])
+        if str(notes)[start + size:start + size + 1] != "]":
+            return None
+        return value if isinstance(value, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def canonical_performance_report(records: Any) -> Dict[str, Any]:
+    """Read-only unit migration audit, terminal target achievement and error.
+
+    Legacy units require a unique price-corroborated interpretation AND an
+    independently recorded forecast provenance. Otherwise the audit emits
+    only a candidate: old writers could synthesize target_price from raw ROI.
+    Tiny values matching both hypotheses stay ambiguous. Legacy checkpoints
+    need a proven unique same-day 1M thesis witness because their own target
+    price was affected by the fraction/percent defect. No stored row changes.
+    Terminal achievement does not assert an intrahorizon touch or net trade.
+    """
+    items = list(records or [])
+    siblings = _perf_unit_sibling_index(items)
+    proven_siblings: set = set()
+    for item in items:
+        schema = _target_schema(item.notes)
+        if (item.horizon.value == "1M" and schema is not None
+                and schema.get("version") == 2 and schema.get("horizon") == "1M"
+                and schema.get("roi_unit") == "percent_points"
+                and schema.get("basis") == "forecast_price"):
+            try:
+                truth = (float(item.target_price) / float(item.entry_price) - 1.0) * 100.0
+                if math.isclose(float(item.target_roi), truth, rel_tol=1e-9, abs_tol=1e-8):
+                    proven_siblings.add(_perf_unit_day_key(item))
+            except (ValueError, TypeError, ZeroDivisionError):
+                pass
+    rows: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = defaultdict(int)
+    buckets: Dict[str, Dict[str, Any]] = {}
+    decided_keys: Dict[str, int] = defaultdict(int)
+    for record in items:
+        if record.status == PerformanceStatus.MATURED and record.realized_roi is not None:
+            decided_keys[record.key] += 1
+    for record in items:
+        hz = record.horizon.value
+        schema = _target_schema(record.notes)
+        reason = ""
+        unit = "unresolved"
+        canonical = None
+        price_consistent_candidate = None
+        candidate_unit = None
+        legacy_provenance = False
+        try:
+            entry, target_price, stored = (
+                float(record.entry_price), float(record.target_price), float(record.target_roi))
+            if not all(math.isfinite(v) for v in (entry, target_price, stored)):
+                reason = "nonfinite_target"
+            elif entry <= 0 or target_price <= 0:
+                reason = "missing_price_witness"
+            elif schema is None and _TARGET_SCHEMA_TAG in str(record.notes or ""):
+                reason = "invalid_schema_receipt"
+            elif schema is not None:
+                truth = (target_price / entry - 1.0) * 100.0
+                if (schema.get("version") != 2 or schema.get("horizon") != hz
+                        or schema.get("roi_unit") != "percent_points"):
+                    reason = "unsupported_schema"
+                elif schema.get("basis") != "forecast_price":
+                    reason = "missing_forecast"
+                elif not math.isclose(stored, truth, rel_tol=1e-9, abs_tol=1e-8):
+                    reason = "schema_price_mismatch"
+                else:
+                    unit, canonical = "percent_points", stored
+            elif hz in ("1W", "2W"):
+                witness = siblings.get(_perf_unit_day_key(record))
+                if witness is None or entry != witness[0]:
+                    reason = "missing_or_ambiguous_1m_witness"
+                else:
+                    truth = witness[1] * (7.0 if hz == "1W" else 14.0) / 30.0
+                    legacy_provenance = _perf_unit_day_key(record) in proven_siblings
+            elif hz in ("1M", "3M", "1Y"):
+                truth = (target_price / entry - 1.0) * 100.0
+            else:
+                reason = "unsupported_horizon"
+            if schema is None and not reason:
+                if stored == 0.0:
+                    reason = "missing_forecast"
+                else:
+                    tolerance = max(_PERF_UNIT_TOL_ABS_PP, _PERF_UNIT_TOL_REL * abs(truth))
+                    hypotheses = [("fraction", stored * 100.0), ("percent_points", stored)]
+                    matches = [(name, value) for name, value in hypotheses
+                               if math.isfinite(value) and abs(value - truth) <= tolerance]
+                    if len(matches) == 1:
+                        candidate_unit, price_consistent_candidate = matches[0]
+                        if legacy_provenance:
+                            unit, canonical = matches[0]
+                        else:
+                            # Older writers synthesized target_price from the
+                            # raw ROI when the producer omitted its forecast.
+                            # A self-consistent tuple cannot attest its unit.
+                            reason = "unproven_forecast_provenance"
+                    else:
+                        reason = "ambiguous_units" if matches else "target_price_mismatch"
+        except (ValueError, TypeError, OverflowError):
+            reason = "invalid_target"
+        if decided_keys.get(record.key, 0) > 1:
+            reason, canonical = "duplicate_matured_key", None
+        resolved = canonical is not None and not reason
+        counts[unit if resolved else reason or "unresolved"] += 1
+        result: Dict[str, Any] = {
+            "record_id": record.record_id, "key": record.key, "horizon": hz,
+            "schema": schema, "unit_evidence": unit if resolved else "unresolved",
+            "reason": reason, "canonical_target_roi_pp": canonical if resolved else None,
+            "price_consistent_candidate_pp": price_consistent_candidate,
+            "candidate_unit": candidate_unit,
+            "directional_outcome": record.outcome,
+            "target_achieved_at_horizon": None, "forecast_error_pp": None,
+            "intrahorizon_target_hit": None, "stop_hit": None, "net_realized_roi_pp": None,
+            "realized_evidence": ("valid" if record.realized_roi_source_valid
+                                  else "invalid_or_missing_stored_realized_roi"),
+        }
+        if resolved and record.status == PerformanceStatus.MATURED and record.realized_roi_source_valid:
+            try:
+                realized = float(record.realized_roi)
+                if math.isfinite(realized):
+                    hit = (realized >= canonical if canonical > 0
+                           else realized <= canonical if canonical < 0 else None)
+                    error = realized - canonical
+                    result.update(target_achieved_at_horizon=hit, forecast_error_pp=error)
+                    bucket = buckets.setdefault(hz, {"n": 0, "target_n": 0, "achieved": 0, "errors": []})
+                    bucket["n"] += 1
+                    if hit is not None:
+                        bucket["target_n"] += 1
+                        bucket["achieved"] += int(hit)
+                    bucket["errors"].append(error)
+            except (ValueError, TypeError):
+                pass
+        rows.append(result)
+    summary = {
+        hz: {"n": values["n"], "target_achieved_at_horizon": values["achieved"],
+             "target_achievement_n": values["target_n"],
+             "achievement_rate_pct": (values["achieved"] / values["target_n"] * 100.0
+                                      if values["target_n"] else None),
+             "mean_abs_error_pp": sum(abs(v) for v in values["errors"]) / values["n"],
+             "mean_signed_error_pp": sum(values["errors"]) / values["n"]}
+        for hz, values in sorted(buckets.items())}
+    return {"schema": "tfb-canonical-performance/v1", "stored_rows_changed": False,
+            "unit_counts": dict(counts), "by_horizon": summary, "records": rows,
+            "missing_evidence": "Intrahorizon target/stop hits need price-path evidence; net returns need broker fills and costs."}
 
 
 def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
@@ -4618,6 +4801,9 @@ class PerformanceRecord:
     # 'NO' (audited but unseated), '' (feature off / board unreadable).
     # END-APPENDED per the v6.6.0 law above.
     entry_selected: str = ""
+    # Loader evidence only: malformed historical outcome text must not
+    # become a certified zero in the canonical audit. No sheet schema change.
+    realized_roi_source_valid: bool = True
 
     @property
     def key(self) -> str:
@@ -4627,7 +4813,7 @@ class PerformanceRecord:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "record_id": self.record_id,
             "key": self.key,
             "symbol": self.symbol,
@@ -4664,6 +4850,10 @@ class PerformanceRecord:
             ),
             "notes": self.notes,
         }
+        schema = _target_schema(self.notes)
+        if schema is not None:
+            result["target_schema"] = schema
+        return result
 
     @classmethod
     def from_sheet_row(cls, row: List[Any], headers: List[str]) -> "PerformanceRecord":
@@ -4747,6 +4937,7 @@ class PerformanceRecord:
             entry_investability_status=_safe_str(get("Entry Investability") or ""),
             entry_final_action=_safe_str(get("Entry Final Action") or ""),
             entry_selected=_safe_str(get("Entry Selected") or ""),
+            realized_roi_source_valid=math.isfinite(_safe_float(realized, default=float("nan"))),
         )
 
 
@@ -4812,6 +5003,9 @@ class SignalSnapshot:
     target_price: float = 0.0
     days_to_earnings: Optional[int] = None
     days_to_exdiv: Optional[int] = None
+    publication_key: str = ""
+    publication_id: str = ""
+    publication_schema: str = ""
 
     @property
     def date_key(self) -> str:
@@ -4843,6 +5037,9 @@ class SignalSnapshot:
             "target_price": self.target_price,
             "days_to_earnings": self.days_to_earnings,
             "days_to_exdiv": self.days_to_exdiv,
+            "publication_key": self.publication_key,
+            "publication_id": self.publication_id,
+            "publication_schema": self.publication_schema,
         }
 
     @classmethod
@@ -4883,6 +5080,9 @@ class SignalSnapshot:
                               if _safe_str(get("Days To Earnings")) else None),
             days_to_exdiv=(int(_safe_float(get("Days To ExDiv")))
                            if _safe_str(get("Days To ExDiv")) else None),
+            publication_key=str(get("Publication Key") or ""),
+            publication_id=str(get("Publication ID") or ""),
+            publication_schema=str(get("Publication Schema") or ""),
         )
 
 
@@ -6049,6 +6249,10 @@ class SignalHistoryStore:
         "Target Price",
         "Days To Earnings",
         "Days To ExDiv",
+        # v6.45.0: immutable identity; day Key remains available to readers.
+        "Publication Key",
+        "Publication ID",
+        "Publication Schema",
     ]
 
     def __init__(self, spreadsheet_id: str, sheet_name: str):
@@ -6225,13 +6429,75 @@ class SignalHistoryStore:
             s.target_price if s.target_price else "",
             s.days_to_earnings if s.days_to_earnings is not None else "",
             s.days_to_exdiv if s.days_to_exdiv is not None else "",
+            s.publication_key,
+            s.publication_id,
+            s.publication_schema,
         ]
+
+    def _append_immutable_snapshots(self, snaps: List[SignalSnapshot]) -> int:
+        """Append each publication once, retaining first and later daily states.
+
+        The identity index is re-read INSIDE each retry, so a committed append
+        followed by a lost response is detected before another append. Sheets
+        has no unique constraint: simultaneous independent writers still need
+        orchestration serialization. A failed read refuses this opt-in write.
+        """
+        candidates: Dict[str, SignalSnapshot] = {}
+        for snap in snaps:
+            if (snap.publication_schema != "tfb-signal-publication/v1"
+                    or not snap.publication_id
+                    or snap.publication_key != _publication_key(
+                        snap.symbol, snap.date_key, snap.publication_id)):
+                reason = "immutable publication requires an explicit publication ID and valid identity"
+                logger.error("[SIGNAL-PUBLICATION v%s] REFUSED: %s", SCRIPT_VERSION, reason)
+                _note_evidence_append_failure("Signal_History", reason)
+                return 0
+            candidates.setdefault(snap.publication_key, snap)
+        if not candidates:
+            return 0
+
+        def write() -> int:
+            col = self.HEADERS.index("Publication Key") + 1
+            # Open-ended SINGLE column, because cached row_count can be stale
+            # after Google extends a full grid on a committed/lost response.
+            rows = self.ws.get(f"{_col_to_a1(col)}{self.DATA_ROW0}:{_col_to_a1(col)}")
+            if (not isinstance(rows, (list, tuple))
+                    or any(not isinstance(row, (list, tuple)) or len(row) > 1
+                           or (row and row[0] not in (None, "")
+                               and (not isinstance(row[0], str)
+                                    or not row[0].startswith("tfb-signal-publication/v1:")))
+                           for row in rows)):
+                raise RuntimeError("immutable publication identity index has an invalid response shape")
+            existing = {str(row[0]).strip() for row in (rows or []) if row and row[0]}
+            new = [snap for key, snap in candidates.items() if key not in existing]
+            if not new:
+                logger.info("[SIGNAL-PUBLICATION v%s] replay skipped=%d", SCRIPT_VERSION, len(candidates))
+                return 0
+            reason = _capacity_block_reason(
+                getattr(self, "_ws_book", None) or self.sheet,
+                getattr(self, "_ws_sid", None) or self.spreadsheet_id)
+            if reason:
+                raise RuntimeError(reason)
+            self.ws.append_rows([self._snapshot_to_row(snap) for snap in new],
+                                value_input_option="RAW")
+            logger.info("[SIGNAL-PUBLICATION v%s] appended=%d replay_skipped=%d",
+                        SCRIPT_VERSION, len(new), len(candidates) - len(new))
+            return len(new)
+
+        try:
+            return int(self.backoff.execute_sync(write) or 0)
+        except Exception as exc:
+            logger.error("[SIGNAL-PUBLICATION v%s] write REFUSED/FAILED: %s", SCRIPT_VERSION, exc)
+            _note_evidence_append_failure("Signal_History", str(exc))
+            return 0
 
     def append_snapshots(self, snaps: List[SignalSnapshot]) -> int:
         """Append only snapshots whose key isn't already present (idempotent
         per symbol-per-day). Returns the count actually written."""
         if not self.ws:
             return 0
+        if _signal_publication_mode() == "immutable":
+            return self._append_immutable_snapshots(snaps)
         with self.cache_lock:
             existing = set(self.cache_keys)
         seen_now: set = set()
@@ -7257,6 +7523,8 @@ class ReportGenerator:
             "confidence_intervals": {"win_rate": ci} if ci else {},
             "records": [r.to_dict() for r in records],
         }
+        if _canonical_targets_enabled():
+            report["canonical_performance"] = canonical_performance_report(records)
         return json_dumps(report, indent=2)
 
     def generate_csv(
@@ -7265,7 +7533,7 @@ class ReportGenerator:
         if not records:
             return
         rows = [r.to_dict() for r in records]
-        fieldnames = list(rows[0].keys())
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
         with open(filepath, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
@@ -8302,6 +8570,15 @@ class PerformanceTrackerApp:
         rkey = f"expected_roi_{suffix}" if suffix else ""
 
         tgt_price = _safe_float(row.get(fkey), default=0.0) if fkey else 0.0
+        if _canonical_targets_enabled():
+            # The price pair establishes both the unit and target. A raw ROI
+            # without its forecast price is insufficient evidence; do not
+            # fabricate that witness or guess a unit from its magnitude.
+            entry_price = _safe_float(entry_price, default=0.0)
+            if tgt_price <= 0.0 or entry_price <= 0.0:
+                return 0.0, 0.0
+            roi_pp = (tgt_price / entry_price - 1.0) * 100.0
+            return (tgt_price, roi_pp) if math.isfinite(roi_pp) else (0.0, 0.0)
         tgt_roi = _safe_float(row.get(rkey), default=0.0) if rkey else 0.0
         # v6.39.0 (P-158): gate off -> identity.
         tgt_roi = _perf_unit_creation(tgt_roi, tgt_price, entry_price)
@@ -8544,6 +8821,7 @@ class PerformanceTrackerApp:
 
             for h in horizons:
                 tgt_price, tgt_roi = self._derive_target(row, h, entry_price)
+                target_basis = "forecast_price" if tgt_price > 0.0 else "missing_forecast"
                 if tgt_price <= 0.0:
                     tgt_price = entry_price
                     tgt_roi = 0.0
@@ -8574,6 +8852,11 @@ class PerformanceTrackerApp:
                     entry_final_action=entry_final_action,
                     entry_selected=entry_sel,
                 )
+                if _canonical_targets_enabled():
+                    schema = {"version": 2, "horizon": h.value,
+                              "roi_unit": "percent_points", "basis": target_basis,
+                              "producer_version": SCRIPT_VERSION}
+                    r.notes = _TARGET_SCHEMA_TAG + json_dumps(schema) + "]"
                 if r.key not in existing_keys:
                     existing_keys.add(r.key)
                     new_records.append(r)
@@ -8656,9 +8939,16 @@ class PerformanceTrackerApp:
                 days_to_earnings=_dte,
                 days_to_exdiv=_dtx,
             )
-            if snap.key in seen:
+            if _signal_publication_mode() == "immutable":
+                publication_id = str(row.get("publication_id") or row.get("source_run_id")
+                                     or os.getenv("TRACK_PUBLICATION_ID") or "").strip()
+                snap.publication_id = publication_id
+                snap.publication_schema = "tfb-signal-publication/v1"
+                snap.publication_key = _publication_key(sym, snap.date_key, publication_id)
+            seen_key = snap.publication_key if _signal_publication_mode() == "immutable" else snap.key
+            if seen_key in seen:
                 continue
-            seen.add(snap.key)
+            seen.add(seen_key)
             out.append(snap)
         return out
 
@@ -8913,6 +9203,8 @@ class PerformanceTrackerApp:
             return []
         if not snaps:
             return []
+        if _signal_publication_mode() == "immutable":
+            self._daily_publications = signal_daily_publications(snaps)
         return self.trend_analyzer.analyze(snaps, window=self.trend_window)
 
     def _compute_calibration(
@@ -9140,6 +9432,13 @@ class PerformanceTrackerApp:
                         r.outcome = "BREAKEVEN"
                     _n_matured += 1
                     _context.update(roi_basis=_verdict, realized_roi_pp=r.realized_roi)
+                    if _target_schema(r.notes) is not None:
+                        target_result = canonical_performance_report([r])["records"][0]
+                        _context.update(
+                            target_schema=_target_schema(r.notes),
+                            target_achieved_at_horizon=target_result["target_achieved_at_horizon"],
+                            forecast_error_pp=target_result["forecast_error_pp"],
+                            intrahorizon_target_hit=None, stop_hit=None, net_realized_roi_pp=None)
                     _outcome_receipt(r, now_r, "MATURED", "", _evidence, _context)
             r.last_updated = _utc_now()
 
@@ -9253,6 +9552,11 @@ class PerformanceTrackerApp:
             if _LAST_DEDUP_SIGNAL.get("mode") in ("observe", "enforce"):   # v6.44.0
                 st["dedup_signal"] = {k: v for k, v in _LAST_DEDUP_SIGNAL.items()
                                       if k != "keys"}
+            if _signal_publication_mode() == "immutable":
+                st["signal_publication_mode"] = "immutable"
+            if _canonical_targets_enabled():
+                st["canonical_targets"] = {"enabled": True, "schema_version": 2,
+                                           "roi_unit": "percent_points"}
             row[9] = json_dumps(st)
             self.store.backoff.execute_sync(
                 lambda: ws.append_row(row, value_input_option="USER_ENTERED")
@@ -9921,6 +10225,10 @@ class PerformanceTrackerApp:
             if self.args.analyze or self.args.export
             else PerformanceSummary(total_records=len(records))
         )
+        if _canonical_targets_enabled():
+            canonical_audit = canonical_performance_report(records)
+            logger.info("[CANONICAL-PERFORMANCE v%s] schema=v2 counts=%s by_horizon=%s",
+                        SCRIPT_VERSION, canonical_audit["unit_counts"], canonical_audit["by_horizon"])
         try:
             perf_records_processed.inc(len(records))
         except Exception:
@@ -10069,6 +10377,12 @@ class PerformanceTrackerApp:
                 or f"performance_report_{RiyadhTime.format(fmt='%Y%m%d_%H%M%S')}"
             ).strip()
             fmt = (self.args.format or "html").lower()
+            if _canonical_targets_enabled():
+                Path(out_base + "_canonical_performance.json").write_text(
+                    json_dumps(canonical_performance_report(records), indent=2), encoding="utf-8")
+            if _signal_publication_mode() == "immutable":
+                Path(out_base + "_signal_publications.json").write_text(
+                    json_dumps(getattr(self, "_daily_publications", []), indent=2), encoding="utf-8")
             if fmt in {"json", "all"}:
                 Path(out_base + ".json").write_text(
                     self.reporter.generate_json(records, summary), encoding="utf-8"

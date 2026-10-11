@@ -1,0 +1,15 @@
+{
+  "include": [
+    "core/sheets",
+    "core/symbols",
+    "core/portfolio_reconciliation.py",
+    "core/execution_accounting.py",
+    "scripts/performance_math.py"
+  ],
+  "exclude": ["**/__pycache__", "scripts/harness_archive"],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false,
+  "reportMissingTypeStubs": false
+}

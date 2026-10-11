@@ -2,7 +2,7 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.6 (2026-10-11) -- WAVE-2 SUITE ENUMERATION
+# VERSION 1.1.7 (2026-10-11) -- INTEGRATED REVIEW REGRESSIONS
 #
 # v1.1.6: enumerate the WP-2bc suites: the lean job runs tests/test_de_f7_settle_unresolved.py
 # (engine settle_unresolved rule), tests/test_sync_rank_overall_page.py (whole-page rank at
@@ -21,6 +21,19 @@
 # three seam-distance contracts it builds on that were never enumerated here:
 # tests/test_de_fc_tuple_coherence_p102.py, tests/test_de_eq_roi_backfill_sentry_p143.py,
 # tests/test_de_margin_publish_p152.py.
+#
+# WHY v1.1.6: the whole-suite lane remains advisory during its first green
+# week. Register the new work-brief regressions in existing required jobs now:
+# pure capture/repair/control contracts in lean, real routes in the pinned
+# contract job, engine/workbook regressions in heavy (openpyxl is installed).
+# Preserve every existing gate, dependency pin and required verdict job.
+#
+# v1.1.5 (2026-10-11) -- FULL DISCOVERY AND FRAMEWORK DRIFT
+#
+# WHY v1.1.5: explicit lanes missed newly added batteries. The full pinned
+# suite observes every tests/ module; it remains advisory during its first
+# green week, before the repository owner promotes it to a required check.
+# Python 3.13/latest FastAPI observes forward drift without moving prod pins.
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -218,19 +231,10 @@
 #   concurrency group, CI reports in ~2 minutes regardless of what the sync is
 #   doing. The two changes are designed to compose.
 #
-# WHY THE TEST LIST IS EXPLICIT AND NOT `pytest tests/`
-#   Deliberate. Two suites in tests/ cannot pass in a bare CI image and would
-#   turn this gate permanently red — and a gate that cries wolf is worse than no
-#   gate (the lesson verify_deployment.py v1.0.14 learned the same day):
-#     - tests/test_endpoints.py is a LIVE smoke-test CLI (argparse + requests)
-#       that expects a running backend. It is a tool, not a unit suite. It is
-#       the natural seed for a post-window authenticated smoke workflow and is
-#       intentionally excluded here.
-#     - tests/test_data_engine_v2.py imports the 738 KB engine and its provider
-#       stack. It runs separately in the blocking `heavy` job below using full
-#       production dependencies; its deterministic tests do not call providers.
-#   Adding a suite to the blocking jobs is a deliberate act with evidence, never
-#   a wildcard.
+# Enumerated lanes retain their fast, dependency-specific checks. Whole-suite
+# discovery below now runs every repository test on the pinned full stack.
+# Live endpoint requests remain in scripts/smoke_endpoints.py and are never
+# triggered by pytest discovery.
 #
 # RELATIONSHIP TO tests.yml
 #   tests.yml (foundations-tests) is left untouched and now overlaps this file.
@@ -253,6 +257,7 @@ on:
       - 'apps_script/**'
       - 'tests/**'
       - 'requirements*.txt'
+      - 'pyproject.toml'
       - '.github/workflows/**'
   # v1.0.5 (2026-08-31): pull_request is UNFILTERED on purpose. The required
   # '📋 CI verdict' status can only exist when this workflow runs; a paths
@@ -277,6 +282,41 @@ env:
   PYTHON_VERSION: "3.11"
 
 jobs:
+
+  # Advisory for one green week; making it required is a repo-settings action.
+  whole-suite:
+    name: 🧪 Whole suite (pinned Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install production pins and test-only workbook dependency
+        run: python -m pip install -r requirements.txt pytest "openpyxl==3.1.5"
+      - name: Discover every offline regression
+        run: python -m pytest -q tests
+
+  framework-drift:
+    name: 🔭 Python 3.13 and latest FastAPI (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install current contract framework in its own job
+        run: >-
+          python -m pip install --upgrade fastapi starlette httpx pydantic
+          pydantic-settings python-dotenv pytest numpy prometheus-client requests
+          PyYAML anyio aiohttp gspread google-auth tenacity
+      - name: Verify real mounted families and their response contracts
+        run: python -m pytest -q tests/test_schema_alignment.py tests/test_route_mount_compat.py
+
 
   # ==========================================================================
   # JOB 1 — syntax floor across the ENTIRE codebase (BLOCKING)
@@ -321,7 +361,8 @@ jobs:
   # ==========================================================================
   # JOB 2 — decision-layer unit suites (BLOCKING)
   # ==========================================================================
-  # Lean install (numpy + pytest only) is inherited from tests.yml on purpose:
+  # Lean install (numpy + pytest, with PyYAML for workflow mapping tests)
+  # preserves the deliberately small image inherited from tests.yml:
   # it forces the pure-numpy statistical fallbacks and the graceful-degradation
   # paths (gspread/pandas absent) to be exercised, exactly as they run in the
   # lean web image. If these pass on numpy alone, they pass everywhere.
@@ -342,10 +383,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Install minimal deps (numpy + pytest only)
+      - name: 📦 Install minimal deps (numpy + pytest + workflow YAML parser)
         run: |
           python -m pip install -U pip
-          python -m pip install "numpy>=1.26.4,<2.0.0" pytest
+          python -m pip install "numpy>=1.26.4,<2.0.0" pytest "PyYAML==6.0.3"
 
       - name: 🎯 py_compile the decision layer
         run: |
@@ -434,17 +475,30 @@ jobs:
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
             tests/test_ob_settle_unresolved.py \
+            tests/test_workflow_flag_mappings.py \
+            tests/test_verify_optional_rollout_flags.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_dedup_signal_p191.py \
             tests/test_track_flags_mapped.py \
+            tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
+
+      - name: 🧪 Work-brief capture, repair and pure contract regressions
+        run: |
+          python -m pytest -q \
+            tests/test_capture_evidence.py \
+            tests/test_pit_repair.py \
+            tests/test_ob_usx_subunit.py \
+            tests/test_performance_math_extraction.py \
+            tests/test_flag_registry.py \
+            tests/test_validation_embargo_properties.py
 
       - name: 🧮 Run model and display basis regressions (lean)
         run: |
@@ -468,6 +522,9 @@ jobs:
 
       - name: 🧪 Native decision source readiness (full Apps Script source)
         run: node tests/js/decision_source_readiness.test.js
+
+      - name: 🧪 Syntax of every versioned Apps Script source
+        run: node tests/js/apps_script_syntax.test.js
 
       - name: 🧪 Native reconciliation and complete calendar inputs
         run: |
@@ -532,7 +589,9 @@ jobs:
             tests/test_route_error_redaction.py \
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
-            tests/test_analysis_sheet_rows_rank_withheld.py
+            tests/test_analysis_fallback_publication.py \
+            tests/test_analysis_sheet_rows_rank_withheld.py \
+            tests/test_route_mount_compat.py
           echo "::endgroup::"
 
   # ==========================================================================
@@ -559,7 +618,7 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -r requirements.txt
-          python -m pip install pytest "openpyxl==3.1.5"
+          python -m pip install pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.20.0"
 
       - name: ⚙️ Run data engine suite
         run: |
@@ -573,6 +632,9 @@ jobs:
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
+
+      - name: 🧪 Daily brief unavailable-evidence and blocked-decision regressions
+        run: python -m pytest -q tests/test_daily_brief_blocked_inputs.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py
@@ -590,6 +652,28 @@ jobs:
           python -m pytest -q \
             tests/test_margin_scoring_unit_contract.py \
             tests/test_margin_producer_unit_receipts.py
+
+      - name: 🧪 Work-brief publication, policy and workbook regressions
+        # Full production dependencies exercise the real engine/provider
+        # modules; installed openpyxl keeps export/calibration suites active.
+        run: |
+          python -m pytest -q \
+            tests/test_forecast_precision_settlement_integration.py \
+            tests/test_de_price_precision.py \
+            tests/test_usx_currency_lockstep.py \
+            tests/test_identity_guard.py \
+            tests/test_crypto_provider_identity.py \
+            tests/test_sync_klg_crypto_name_p192.py \
+            tests/test_de_horizon_coherence_f6.py \
+            tests/test_de_strict_invest_gate_fixp.py \
+            tests/test_export_audit_v120.py \
+            tests/test_calibration_report.py \
+            tests/test_eq_roi_unit_sentry.py \
+            tests/test_pf_dd_fee_guards.py \
+            tests/test_no_import_side_effects.py
+
+      - name: 🛡️ Run isolated Yahoo fundamentals loop-guard regression
+        run: python -m pytest -q tests/test_yf_loopguard_p203.py
 
   # ==========================================================================
   # JOB 5 — gate summary

@@ -1,5 +1,5 @@
 /* tests/js/decision_input_truth.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.13.4 [WP-8 COCKPIT INPUT TRUTH].
+ * 16_Decision_Top10.gs v1.13.5 [WP-8 COCKPIT INPUT TRUTH].
  *
  * Executes the COMPLETE delivered Apps Script source (and, with --base, the
  * pristine v1.13.3 file in a second context) under service stubs whose every
@@ -12,7 +12,7 @@
  *   T2  evaluability core on the 500 exported audit rows
  *   T3  panel-vs-reference core (seed / built-in / decision / policy)
  *   T4  DEFAULT OFF IS BYTE-IDENTICAL: write log, read log, payload object
- *       base (v1.13.3) vs delivered (v1.13.4); delivered idempotent
+ *       base (v1.13.3) vs delivered (v1.13.5); delivered idempotent
  *   T5  observe = tokens only (write log identical to off)
  *   T6  enforce = KPI L15:M16, hidden _T10_Candidates, vintage columns,
  *       footer = 75 + alerts.length (pointer path) <= 80
@@ -118,20 +118,30 @@ function mkSheet(env, name, opts) {
 function mkRange(sheet, r, c, nr, nc, a1) {
   const env = sheet.getParent()._env;
   const log = (method, values) => sheet._log(method, r, c, nr || 1, nc || 1, values);
+  function fault(method) {
+    const f = env.failWrite;
+    if (!f || f.sheet !== sheet._name || f.method !== method || (f.r !== undefined && f.r !== r) || (f.c !== undefined && f.c !== c)) return null;
+    if (f.skip) { f.skip--; return null; }
+    env.failWrite = null; return f;
+  }
   const self = {
     getValue() { env.reads.push(['getValue', sheet._name, r, c]); return sheet._val(r, c); },
     getValues() {
       env.reads.push(['getValues', sheet._name, a1 || r, a1 ? 0 : c, nr || 1, nc || 1]);
+      if (env.onReadValues) env.onReadValues(sheet, r, c, nr || 1, nc || 1);
       if (a1 && sheet._a1[a1]) return copy(sheet._a1[a1]);
       if (sheet._grid) return copy(sheet._grid);
       const out = [];
       for (let i = 0; i < (nr || 1); i++) { const row = []; for (let j = 0; j < (nc || 1); j++) row.push(sheet._val(r + i, c + j)); out.push(row); }
       return out;
     },
-    setValue(v) { log('setValue', v); sheet._set(r, c, v); return self; },
+    setValue(v) { log('setValue', v); if (fault('setValue')) throw new Error('synthetic write fault'); sheet._set(r, c, v); return self; },
     setValues(vv) {
       log('setValues', vv);
-      for (let i = 0; i < vv.length; i++) for (let j = 0; j < vv[i].length; j++) sheet._set(r + i, c + j, vv[i][j]);
+      const f = fault('setValues');
+      const limit = f ? (f.partialRows || 0) : vv.length;
+      for (let i = 0; i < limit; i++) for (let j = 0; j < vv[i].length; j++) sheet._set(r + i, c + j, vv[i][j]);
+      if (f) throw new Error('synthetic partial write fault');
       return self;
     },
     getNumRows() { return nr || 1; }, getNumColumns() { return nc || 1; },
@@ -148,7 +158,7 @@ const STATUS_HEADER = ['Page', 'Last Updated', 'Status', 'Message', 'Endpoint', 
 function makeEnv(opts) {
   opts = opts || {};
   const props = Object.assign({}, opts.props || {});
-  const env = { calls: [], reads: [], appended: {}, propReads: { total: 0, byKey: {} }, props, sheets: {} };
+  const env = { calls: [], reads: [], appended: {}, propReads: { total: 0, byKey: {} }, props, sheets: {}, options: opts, failWrite: null };
   const ss = {
     _env: env,
     getSheetByName(n) { return env.sheets[n] || null; },
@@ -188,9 +198,9 @@ function makeEnv(opts) {
   };
   const ctx = {
     console, Logger: { log() {} }, Date: FixedDate,
-    Utilities: { formatDate: fmtDate, sleep() {}, computeDigest() { return []; }, base64Encode() { return ''; }, DigestAlgorithm: { MD5: 'MD5' } },
+    Utilities: { formatDate: fmtDate, sleep() {}, getUuid() { env.uuidCount = (env.uuidCount || 0) + 1; return 'test-uuid-' + env.uuidCount; }, computeDigest(alg, value) { return [...crypto.createHash(alg === 'SHA_256' ? 'sha256' : 'md5').update(value).digest()]; }, base64Encode() { return ''; }, DigestAlgorithm: { MD5: 'MD5', SHA_256: 'SHA_256' }, Charset: { UTF_8: 'UTF_8' } },
     PropertiesService: {
-      getScriptProperties() { if (opts.propsThrow) throw new Error('synthetic property outage'); return propsService; },
+      getScriptProperties() { if (env.options.propsThrow) throw new Error('synthetic property outage'); return propsService; },
       getDocumentProperties() { return null; },
       getUserProperties() { return propsService; }
     },
@@ -198,7 +208,7 @@ function makeEnv(opts) {
     UrlFetchApp: { fetch() { throw new Error('no network'); } },
     Session: { getScriptTimeZone() { return 'Asia/Riyadh'; } },
     CacheService: { getScriptCache() { return { get() { return null; }, put() {} }; } },
-    LockService: { getScriptLock() { return { tryLock() { return true; }, releaseLock() {} }; } }
+    LockService: { getScriptLock() { return { tryLock() { return !env.options.lockHeld; }, releaseLock() { env.lockReleases = (env.lockReleases || 0) + 1; } }; } }
   };
   env.ctx = ctx;
   return env;
@@ -234,6 +244,8 @@ function render(tree, modes, extra) {
   ctx.dt10BoardVerdict_ = verdictStub(extra.state, extra.reason);
   const sheet = env.sheets['Top_10_Investments'];
   const p = buildPayload();
+  if (extra.candidates !== undefined) p.candidates_rows = copy(extra.candidates);
+  if (extra.alerts !== undefined) p.alerts = copy(extra.alerts);
   p._dt10_source_context = { captured_at_ms: NOW, initial_ready: true, generation: {} };
   if (modes.it && modes.it !== 'off') {
     p._dt10_it = { mode: modes.it, ref: ctx.dt10PanelRefCore_(copy(FIX.panel), ctx.dt10PanelDefaults_(env.ss),
@@ -249,6 +261,7 @@ function render(tree, modes, extra) {
 }
 const find = (calls, pred) => calls.filter(pred);
 const setValuesAt = (calls, sheetName, r, c, nr, nc) => find(calls, x => x[0] === 'setValues' && x[1] === sheetName && x[2] === r && x[3] === c && x[4] === nr && x[5] === nc).map(x => JSON.parse(x[6]));
+const withoutOwnershipReads = reads => reads.filter(x => !(x[0] === 'getValues' && x[1] === 'Top_10_Investments' && x[2] === 15 && x[3] === 12 && x[4] === 1 && x[5] === 2));
 const mergesOn = (calls, sheetName) => find(calls, x => x[0] === 'merge' && x[1] === sheetName).map(x => x[2]);
 const lastWrittenRow = (calls, sheetName) => Math.max(...find(calls, x => x[1] === sheetName && (x[0] === 'setValue' || x[0] === 'setValues' || x[0] === 'merge')).map(x => x[2] + (x[0] === 'setValues' ? x[4] - 1 : 0)));
 
@@ -276,27 +289,27 @@ check('T1 mode readers: absent/junk/OFF -> off; Observe/ENFORCE bind; service er
 });
 
 /* ================================================================== T2 */
-check('T2 evaluability core on the 500 exported audit rows: news 440 unknown (88%), sector 500 (100%), conflict 150/350', () => {
+check('T2 display labels do not prove evaluation: 500 missing News receipts; sector 500 unknown; conflict 150/350', () => {
   const { ctx } = loadTree(source);
   const ev = ctx.dt10GateEvaluabilityCore_(copy(FIX.candidates), FIX.meta.route.news_display);
   assert.equal(ev.total, 500);
-  deq([ev.news.unknown, ev.news.evaluable, ev.news.pct_unknown, ev.news.not_evaluable, ev.news.display_only, ev.news.cap], [440, 60, 88, true, true, 60]);
+  deq([ev.news.unknown, ev.news.evaluable, ev.news.pct_unknown, ev.news.not_evaluable, ev.news.display_only, ev.news.cap], [500, 0, 100, true, true, 60]);
   deq([ev.sector.unknown, ev.sector.evaluable, ev.sector.pct_unknown, ev.sector.not_evaluable], [500, 0, 100, true]);
   deq(ev.conflict, { yes: 150, no: 350, unknown: 0 });
   const note = ctx.dt10GateEvaluabilityNote_(ev, 'enforce');
-  assert.equal(note, 'gates: news 60/500 evaluable (88% unknown; display-only labels, gate input decoupled) NOT EVALUABLE · sector 0/500 evaluable (100% unknown) NOT EVALUABLE · conflict yes 150/no 350');
+  assert.equal(note, 'gates: news 0/500 evaluable (100% unknown; display labels 60/500, display-only; backend gate receipts required) NOT EVALUABLE · sector 0/500 evaluable (100% unknown) NOT EVALUABLE · conflict yes 150/no 350');
   assert(ctx.dt10GateEvaluabilityNote_(ev, 'observe').endsWith(' [observe]'));
   const alerts = ctx.dt10GateEvaluabilityAlerts_(ev);
   assert.equal(alerts.length, 2);
-  deq(alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 440], ['gate_not_evaluable', 500]]);
+  deq(alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 500], ['gate_not_evaluable', 500]]);
   assert(alerts[0].required_action.includes('News labels are display-only (route NEWS-DISPLAY cap 60)'));
   const kpi = ctx.dt10GateKpiCells_(ev);
   deq(kpi[0], ['News Gate', 'Sector Gate']);
-  assert.match(kpi[1][0], /^NOT EVALUABLE — 440\/500 Unknown$/); assert.match(kpi[1][1], /^NOT EVALUABLE — 500\/500 Unknown$/);
+  assert.match(kpi[1][0], /^NOT EVALUABLE — 500\/500 Unknown$/); assert.match(kpi[1][1], /^NOT EVALUABLE — 500\/500 Unknown$/);
   const empty = ctx.dt10GateEvaluabilityCore_([], null);
   assert.equal(ctx.dt10GateEvaluabilityNote_(empty, 'observe'), 'gates: no candidates [observe]');
   assert.equal(ctx.dt10GateEvaluabilityAlerts_(empty).length, 0); deq(ctx.dt10GateKpiCells_(empty)[1], ['n/a', 'n/a']);
-  const rows = n => Array.from({ length: 100 }, (_, i) => ({ news_trend: i < n ? 'Unknown' : 'Neutral', sector_trend: 'Positive', conflict: false }));
+  const rows = n => Array.from({ length: 100 }, (_, i) => ({ news_trend: 'Positive', gates: [{ gate: 'News', passed: true, current: i < n ? ' Unknown ' : 'Neutral' }], sector_trend: 'Positive', conflict: false }));
   assert.equal(ctx.dt10GateEvaluabilityCore_(rows(20), null).news.not_evaluable, false, '20% is the pass boundary');
   assert.equal(ctx.dt10GateEvaluabilityCore_(rows(21), null).news.not_evaluable, true);
   assert.equal(ctx.dt10GateEvaluabilityCore_(rows(21), null).sector.not_evaluable, false);
@@ -355,10 +368,10 @@ check('T4 delivered OFF render is deterministic (idempotent write log + payload)
   digestParts.push(['T4-off', a.calls, a.p]);
 });
 if (baseSource) {
-  check('T4 OFF BYTE-IDENTITY base v1.13.3 vs delivered v1.13.4: write log, read log and payload JSON deep-equal', () => {
+  check('T4 default-off values/write log/payload match v1.13.3; only KPI ownership reads added', () => {
     const b = render(loadTree(baseSource), {});
     deq(offRun.calls, b.calls, 'write log');
-    deq(offRun.reads, b.reads, 'read log (zero extra sheet reads)');
+    deq(withoutOwnershipReads(offRun.reads), b.reads, 'only ownership reads added');
     assert.equal(JSON.stringify(offRun.p), JSON.stringify(b.p), 'payload object');
     assert.equal(offRun.earn.note, b.earn.note);
     assert.equal(b.env.ctx.DT10_VERSION, '1.13.3');
@@ -372,7 +385,7 @@ check('T5 observe: write log identical to off; tokens present; cal(earn-dated) 8
   deq(o.calls, offRun.calls, 'observe never changes a written value');
   assert.equal(JSON.stringify(o.p.alerts), JSON.stringify(offRun.p.alerts));
   assert(o.p._dt10_it_note.endsWith('[observe]') && o.p._dt10_cand_note.endsWith('[observe]') && o.p._dt10_vint_note.endsWith('[observe]'));
-  assert.equal(o.p._dt10_it_note, 'gates: news 60/500 evaluable (88% unknown; display-only labels, gate input decoupled) NOT EVALUABLE · sector 0/500 evaluable (100% unknown) NOT EVALUABLE · conflict yes 150/no 350 [observe]' +
+  assert.equal(o.p._dt10_it_note, 'gates: news 0/500 evaluable (100% unknown; display labels 60/500, display-only; backend gate receipts required) NOT EVALUABLE · sector 0/500 evaluable (100% unknown) NOT EVALUABLE · conflict yes 150/no 350 [observe]' +
     ' | panel: Max Per Sector 2 (seed 2 · built-in 3 · decision-0910 3 · policy —) · PF Max Sector % 30 (seed 30 · decision-0910 40 · policy —) · PF Max Position % 20 (seed 15 · policy —) · ref=seed drift 1 · policy ref none [observe]');
   assert.equal(o.p._dt10_cand_note, 'cands 500 in cockpit (footer row 578; target <= 80) [observe]');
   assert.equal(Math.max(...mergesOn(o.calls, 'Top_10_Investments')), 578);
@@ -393,20 +406,19 @@ let enforceRun = null;
 check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), pointer line, footer 79 = 75 + alerts.length, vintage columns 31/32', () => {
   const e = render(loadTree(source), { it: 'enforce', cand: 'enforce', vint: 'enforce' });
   const C = e.calls, ctx = e.env.ctx;
-  deq(setValuesAt(C, 'Top_10_Investments', 15, 12, 2, 2), [[['News Gate', 'Sector Gate'], ['NOT EVALUABLE — 440/500 Unknown', 'NOT EVALUABLE — 500/500 Unknown']]]);
+  deq(setValuesAt(C, 'Top_10_Investments', 15, 12, 2, 2), [[['News Gate', 'Sector Gate'], ['NOT EVALUABLE — 500/500 Unknown', 'NOT EVALUABLE — 500/500 Unknown']]]);
   // ALERTS unchanged: 4 rows, no input-truth rows (cockpit <= 80 rows).
   const alertsTitle = find(C, x => x[0] === 'setValue' && x[1] === 'Top_10_Investments' && /^"ALERTS \(/.test(x[6]));
   assert.equal(alertsTitle.length, 1); assert.equal(alertsTitle[0][6], JSON.stringify('ALERTS (' + FIX.alerts.length + ')')); assert.equal(alertsTitle[0][2], 60);
   assert.equal(setValuesAt(C, 'Top_10_Investments', 62, 1, 4, 3).length, 1);
   assert.equal(JSON.stringify(e.p.alerts), JSON.stringify(offRun.p.alerts), 'payload.alerts never mutated');
   // hidden tab
-  deq(find(C, x => x[0] === 'insertSheet').map(x => x[1]), ['_T10_Candidates']);
-  const stamp = setValuesAt(C, '_T10_Candidates', 1, 1, 1, 25)[0][0][0];
-  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.13\.4$/);
-  deq(setValuesAt(C, '_T10_Candidates', 2, 1, 1, 25)[0][0], ctx.DT10_CAND_HEADERS);
-  const tabRows = setValuesAt(C, '_T10_Candidates', 3, 1, 500, 25);
-  assert.equal(tabRows.length, 1);
-  deq(tabRows[0], setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
+  deq(find(C, x => x[0] === 'insertSheet').map(x => x[1]), ['_T10_Candidates_Staging', '_T10_Candidates']);
+  const tabGrid = setValuesAt(C, '_T10_Candidates', 1, 1, 502, 25)[0];
+  const stamp = tabGrid[0][0];
+  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.13\.5$/);
+  deq(tabGrid[1], ctx.DT10_CAND_HEADERS);
+  deq(tabGrid.slice(2), setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
   assert.equal(find(C, x => x[0] === 'hideSheet' && x[1] === '_T10_Candidates').length, 1);
   deq(find(C, x => x[0] === 'setFrozenRows' && x[1] === '_T10_Candidates').map(x => x[2]), [2]);
   deq(find(C, x => x[0] === 'setActiveSheet').map(x => x[1]), ['Top_10_Investments']);
@@ -424,7 +436,10 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   assert.equal(footer, FIX.shape.cand_section_row + 4); assert(footer <= 80);
   assert.equal(lastWrittenRow(C, 'Top_10_Investments'), 79);
   assert.equal(e.p._dt10_cand_note, 'cands 500 -> _T10_Candidates (cockpit footer row 79)');
-  deq(e.p._dt10_cand_result, { ok: true, rows: 500 });
+  const committed = ctx.dt10CandTabRead_(e.env.ss, 'd2c065e9fd85');
+  assert.equal(committed.ok, true); assert.equal(committed.rows, 500);
+  assert.match(committed.checksum, /^[0-9a-f]{64}$/);
+  deq(e.p._dt10_cand_result, { ok: true, rows: 500, run_id: committed.run_id, checksum: committed.checksum, state: 'COMMITTED' });
   // SELECTED 32 columns
   const selHdr = setValuesAt(C, 'Top_10_Investments', 19, 1, 1, 32);
   assert.equal(selHdr.length, 1); assert.equal(selHdr[0][0].length, 32);
@@ -435,7 +450,7 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   deq(row('INDV.US').slice(30), ['2026-10-09 20:00Z', 'lkg 45h']);
   deq(row('GRT-UN.TO').slice(30), ['2026-10-09 20:00Z', 'lkg 17h']);
   deq(row('2286.SR').slice(30), ['2026-10-08 12:10Z', '—'], 'no Target Price -> em dash');
-  deq(row('CRC.US').slice(30), ['2026-10-09 20:00Z', 'current'], 'Target Price without lkg tag -> current');
+  deq(row('CRC.US').slice(30), ['2026-10-09 20:00Z', 'unknown (analyst date unavailable)'], 'Target Price without analyst date remains unknown');
   deq(row('NVDA.US').slice(30), ['2026-10-09 20:29Z', 'lkg 6h']);
   deq(row('EBC.US').slice(0, 30), setValuesAt(offRun.calls, 'Top_10_Investments', 20, 1, 10, 30)[0].find(r => r[1] === 'EBC.US'), 'first 30 cells identical to the off board');
   assert.equal(find(C, x => x[0] === 'setNumberFormat' && x[1] === 'Top_10_Investments' && x[2] === 20 && x[3] === 31 && x[4] === 10 && x[5] === 2).length, 1);
@@ -465,13 +480,15 @@ check('T7 fail-open: insertSheet fault keeps the in-cockpit grid (footer 578) an
   assert.equal(f.p._dt10_cand_result.ok, false);
   assert.equal(find(f.calls, x => x[0] === 'hideSheet').length, 0);
   // the grid write log equals the off run except the attempted insertSheet
-  deq(f.calls.filter(x => x[0] !== 'insertSheet'), offRun.calls);
-  // sanity: an empty candidate list skips the tab and tokens the skip
+  deq(f.calls.filter(x => x[0] !== 'insertSheet' && x[0] !== 'setActiveSheet'), offRun.calls);
+  // A current empty result commits zero rows, replacing any prior grid.
   const zz = loadTree(source); const p = buildPayload(); p.candidates_rows = []; p._dt10_cand_mode = 'enforce';
   p._dt10_source_context = { captured_at_ms: NOW, initial_ready: true, generation: {} };
   zz.ctx.dt10BoardVerdict_ = verdictStub();
   zz.ctx.dt10RenderPayload_(zz.env.sheets['Top_10_Investments'], p, {});
-  assert(p._dt10_cand_note.includes('skipped (no candidate rows)')); assert.equal(find(zz.env.calls, x => x[0] === 'insertSheet').length, 0);
+  assert(p._dt10_cand_note.includes('cands 0 -> _T10_Candidates'));
+  const empty = zz.ctx.dt10CandTabRead_(zz.env.ss, 'd2c065e9fd85');
+  assert.equal(empty.ok, true); assert.equal(empty.rows, 0); deq(empty.data, []);
   digestParts.push(['T7', f.p._dt10_cand_note]);
 });
 
@@ -486,7 +503,7 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
     'fx USX row: ABSENT', 'finding usx-subunit',
     'input truth (DT10_INPUT_TRUTH): off | cand tab (DT10_CAND_TAB): off | vintage cols (DT10_VINTAGE_COLS): off | policy ref: none',
     'evaluability core: ok', 'panel reference core: ok', 'label scan core: ok', 'vintage core: ok', 'cand pointer core: ok',
-    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v1.13.4] self-test'];
+    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v1.13.5] self-test'];
   const missing = need.filter(n => !rep.includes(n));
   deq(missing, []);
   assert(!/FAIL/.test(rep), 'self-test must not print FAIL');
@@ -498,18 +515,18 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
 });
 
 /* ================================================================== T9 */
-const DESIGNED_FUNCTIONS = ['dt10ModeProp_', 'dt10InputTruthMode_', 'dt10CandTabMode_', 'dt10VintageColsMode_', 'dt10PolicyRefParse_', 'dt10PolicyRef_',
+const DESIGNED_FUNCTIONS = ['dt10PolicyRefInspect_', 'dt10PolicyRefState_', 'dt10InputTruthKpiState_', 'dt10CandTabChecksum_', 'dt10CandRunId_', 'dt10CandTabRead_', 'dt10ModeProp_', 'dt10InputTruthMode_', 'dt10CandTabMode_', 'dt10VintageColsMode_', 'dt10PolicyRefParse_', 'dt10PolicyRef_',
   'dt10GateEvaluabilityCore_', 'dt10GateEvaluabilityNote_', 'dt10GateEvaluabilityAlerts_', 'dt10GateKpiCells_', 'dt10PanelRefCore_', 'dt10PanelRefNote_',
   'dt10PanelRefAlerts_', 'dt10CalCoverageCore_', 'dt10CandPointerText_', 'dt10CandTabStampLine_', 'dt10PoolVintageIndex_', 'dt10VintageFmt_',
   'dt10VintageCells_', 'dt10VintageNote_', 'dt10LabelScan_', 'dt10PfPanelRead_', 'dt10CandTabWrite_', 'dt10InputTruthRunLog_'].sort();
-const DESIGNED_VARS = ['DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
+const DESIGNED_VARS = ['DT10_CANDTAB_STAGE_SHEET', 'DT10_VINT_PUBLISHED_RE', 'DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
   'DT10_CANDTAB_SHEET', 'DT10_CANDTAB_COCKPIT_TARGET_ROWS', 'DT10_VINTAGE_PROP', 'DT10_VINTAGE_HEADERS', 'DT10_VINT_ASOF_RE', 'DT10_VINT_LKG_RE'].sort();
 function census(src, re) { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; }
-check('T9 static: DT10_VERSION 1.13.4 in lockstep with header line 4, ES5 source compiles, zero smart quotes, designed names present', () => {
+check('T9 static: DT10_VERSION 1.13.5 in lockstep with header line 4, ES5 source compiles, zero smart quotes, designed names present', () => {
   const { ctx } = loadTree(source);
-  assert.equal(ctx.DT10_VERSION, '1.13.4');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.4 /);
-  assert(source.includes("var DT10_VERSION = '1.13.4';"));
+  assert.equal(ctx.DT10_VERSION, '1.13.5');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.5 /);
+  assert(source.includes("var DT10_VERSION = '1.13.5';"));
   assert.doesNotThrow(() => new vm.Script(source, { filename: '16_Decision_Top10.gs' }), 'syntax (node --check equivalent)');
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
@@ -550,12 +567,12 @@ check('T10 _Run_Log: off -> no row; observe/enforce -> exactly one INPUT-TRUTH r
   assert.equal(rows.length, 1);
   const row = rows[0];
   assert.equal(row[1], 'INFO'); assert.equal(row[2], 'refreshDecisionTop10'); assert.equal(row[3], 'Top_10_Investments'); assert.equal(row[4], 'INPUT-TRUTH');
-  assert(row[5].startsWith('gates: news 60/500')); assert(row[5].length <= 400);
+  assert(row[5].startsWith('gates: news 0/500')); assert(row[5].length <= 400);
   const details = JSON.parse(row[9]);
   deq(Object.keys(details).sort(), ['alerts', 'cal', 'cand_rows', 'cand_tab', 'cand_tab_result', 'ev', 'input_truth', 'notes', 'ref', 'version', 'vintage_cols']);
-  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.13.4', 'observe', 'observe', 'observe', 500]);
-  assert.equal(details.ev.news.unknown, 440); assert.equal(details.ref.drift_seed, 1); assert.equal(details.cal.sel_covered, 8);
-  deq(details.alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 440], ['gate_not_evaluable', 500], ['panel_reference_drift', 1]]);
+  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.13.5', 'observe', 'observe', 'observe', 500]);
+  assert.equal(details.ev.news.unknown, 500); assert.equal(details.ref.drift_seed, 1); assert.equal(details.cal.sel_covered, 8);
+  deq(details.alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 500], ['gate_not_evaluable', 500], ['panel_reference_drift', 1]]);
   assert(!/cash|nav|deployable/i.test(row[9]), 'details carry no portfolio words');
   assert.equal(row[0], new Date(NOW).toISOString(), 'frozen clock stamp');
   digestParts.push(['T10', rows]);
@@ -588,11 +605,11 @@ check('T11 REAL refreshDecisionTop10 off: deterministic status line, one POST, n
   digestParts.push(['T11-off', a.status, a.calls.length, a.runLog]);
 });
 if (baseSource) {
-  check('T11 OFF BYTE-IDENTITY orchestrator base vs delivered: status line, write log, read log, _Run_Log rows; delivered reads +3 properties only', () => {
+  check('T11 default-off orchestrator status/write/log unchanged; three property reads and KPI ownership reads added', () => {
     const b = orchestrate(baseSource, {});
     assert.equal(orchOff.status, b.status, 'B2 status line');
     deq(orchOff.calls, b.calls, 'write log incl. _Selection_Log / _Run_Log');
-    deq(orchOff.reads, b.reads, 'read log');
+    deq(withoutOwnershipReads(orchOff.reads), b.reads, 'only ownership reads added');
     deq(orchOff.runLog, b.runLog);
     assert.equal(orchOff.propReads.total, b.propReads.total + 3);
     const keys = Object.keys(orchOff.propReads.byKey).filter(k => orchOff.propReads.byKey[k] !== b.propReads.byKey[k]).sort();
@@ -614,7 +631,7 @@ check('T11 observe orchestrator: tokens in B2, one INPUT-TRUTH row, sheet writes
   deq(o.calls.filter(x => x[0] === 'appendRow' && x[1] === '_Run_Log').length, orchOff.calls.filter(x => x[0] === 'appendRow' && x[1] === '_Run_Log').length + 1);
   const it = o.runLog.filter(r => r[4] === 'INPUT-TRUTH');
   assert.equal(it.length, 1);
-  assert(o.status.includes(' | gates: news 60/500 evaluable (88% unknown; display-only labels, gate input decoupled) NOT EVALUABLE'));
+  assert(o.status.includes(' | gates: news 0/500 evaluable (100% unknown; display labels 60/500, display-only; backend gate receipts required) NOT EVALUABLE'));
   assert(o.status.includes(' | panel: Max Per Sector 2 (seed 2 · built-in 3 · decision-0910 3 · policy —)'));
   assert(o.status.includes(' | cal(earn-dated): sel 8/10 · qual 10/13'));
   // the orchestrator path fails the frozen funding replay closed (+1 board_funding_unavailable
@@ -629,7 +646,7 @@ check('T11 observe orchestrator: tokens in B2, one INPUT-TRUTH row, sheet writes
   assert.equal(o.propReads.byKey.DT10_POLICY_REF, 1);
   // same tokens reach the _Selection_Log Run Info column (status line pre-'SelLog' tail)
   const selLog = o.calls.filter(x => x[0] === 'setValues' && x[1] === '_Selection_Log' && x[4] === 10);
-  assert.equal(selLog.length, 1); assert(JSON.parse(selLog[0][6])[0][1].includes(' | gates: news 60/500'));
+  assert.equal(selLog.length, 1); assert(JSON.parse(selLog[0][6])[0][1].includes(' | gates: news 0/500'));
   digestParts.push(['T11-observe', o.status, it]);
 });
 check('T11 enforce orchestrator: hidden tab written once, footer = 71 + alerts.length + 4 <= 80, KPI cells, 32 selected columns', () => {
@@ -645,6 +662,175 @@ check('T11 enforce orchestrator: hidden tab written once, footer = 71 + alerts.l
   assert(!e.status.includes('[observe]'));
   assert.equal(e.runLog.filter(r => r[4] === 'INPUT-TRUTH').length, 1);
   digestParts.push(['T11-enforce', e.status, footer, nAlerts]);
+});
+
+check('T12 same-sheet mode/property transitions deactivate owned KPIs; never-active cells keep their values', () => {
+  for (const mode of ['observe', 'off', 'property-fault']) {
+    const t = loadTree(source, { props: { DT10_INPUT_TRUTH: 'enforce' } });
+    render(t, { it: 'enforce' });
+    assert.equal(t.env.sheets.Top_10_Investments._val(16, 12), 'NOT EVALUABLE — 500/500 Unknown');
+    t.env.props.DT10_INPUT_TRUTH = mode;
+    if (mode === 'property-fault') t.env.options.propsThrow = true;
+    t.ctx.dt10PropMemoReset_();
+    const effective = t.ctx.dt10InputTruthMode_();
+    render(t, { it: effective });
+    for (const col of [12, 13]) assert.equal(t.env.sheets.Top_10_Investments._val(16, col), 'INACTIVE — ' + effective);
+    render(t, { it: 'enforce' });
+    assert.equal(t.env.sheets.Top_10_Investments._val(16, 12), 'NOT EVALUABLE — 500/500 Unknown');
+  }
+  const t = loadTree(source), sh = t.env.sheets.Top_10_Investments;
+  sh._set(15, 12, 'Operator metric'); sh._set(16, 12, 42);
+  for (const mode of ['off', 'observe']) {
+    const r = render(t, { it: mode });
+    assert.equal(sh._val(15, 12), 'Operator metric'); assert.equal(sh._val(16, 12), 42);
+    assert.equal(find(r.calls, x => x[0] === 'setValues' && x[1] === 'Top_10_Investments' && x[2] >= 15 && x[2] <= 16 && x[3] === 12).length, 0);
+  }
+});
+
+check('T13 policy rejects unknown keys/ranges/types; partial references retain seed drift; zero comparisons NOT EVALUABLE', () => {
+  const { ctx, env } = loadTree(source);
+  for (const raw of [JSON.stringify({ typo: 3 }), '{}', '{"T10: Max Per Sector":null}', '{"T10: Max Per Sector":true}',
+      '{"T10: Max Per Sector":0}', '{"T10: Max Per Sector":2.5}', '{"T10: Max Per Sector":50001}',
+      '{"PF: Max Sector %":101}', '{"PF: Max Position %":-1}', '{"PF: Max Position %":""}',
+      '{"T10: Max Per Sector":3,"typo":2}']) {
+    assert.equal(ctx.dt10PolicyRefParse_(raw), null, raw);
+    const state = ctx.dt10PolicyRefInspect_(raw);
+    assert.equal(state.status, 'invalid'); assert(state.errors.length > 0);
+    const ref = ctx.dt10PanelRefCore_(copy(FIX.panel), ctx.dt10PanelDefaults_(env.ss), ctx.dt10PfPanelRead_(env.ss, ctx.DT10_IT_REF_LABELS), state);
+    assert.equal(ref.drift_policy, null); assert.equal(ref.drift_active, 1); assert.equal(ref.not_evaluable, true);
+    const alerts = ctx.dt10PanelRefAlerts_(ref);
+    assert(alerts.some(a => a.type === 'policy_reference_not_evaluable'));
+    assert(alerts.some(a => a.type === 'panel_reference_drift' && a.required_action.includes('PF: Max Position % 20 vs seed 15')));
+  }
+  const state = ctx.dt10PolicyRefInspect_('{"T10: Max Per Sector":3}');
+  assert.equal(state.status, 'partial'); assert.equal(state.missing.length, 2);
+  const ref = ctx.dt10PanelRefCore_(copy(FIX.panel), ctx.dt10PanelDefaults_(env.ss), ctx.dt10PfPanelRead_(env.ss, ctx.DT10_IT_REF_LABELS), state);
+  assert.equal(ref.ref, 'mixed'); assert.equal(ref.policy_comparisons, 1); assert.equal(ref.comparisons, 3);
+  assert.equal(ref.drift_policy, 1); assert.equal(ref.drift_active, 2);
+  const action = ctx.dt10PanelRefAlerts_(ref)[0].required_action;
+  assert(action.includes('T10: Max Per Sector 2 vs policy 3')); assert(action.includes('PF: Max Position % 20 vs seed 15'));
+  assert(ctx.dt10PanelRefNote_(ref, 'observe').includes('policy ref partial (undeclared controls use seed)'));
+  const zero = ctx.dt10PanelRefCore_({}, {}, { found: false, values: {} }, state);
+  assert.equal(zero.policy_comparisons, 0); assert.equal(zero.drift_policy, null);
+  assert(ctx.dt10PanelRefNote_(zero, 'enforce').includes('NOT EVALUABLE'));
+  const fault = loadTree(source, { propsThrow: true });
+  assert.equal(fault.ctx.dt10PolicyRefState_().status, 'unavailable');
+});
+
+check('T14 News uses backend gate receipts independently of display labels and normalizes unknown trends', () => {
+  const { ctx } = loadTree(source);
+  const labelsOnly = Array.from({ length: 3 }, () => ({ news_trend: 'Positive', sector_trend: ' unknown ' }));
+  const noReceipt = ctx.dt10GateEvaluabilityCore_(labelsOnly, { enabled: true, labeled: 3 });
+  assert.equal(noReceipt.news.display_evaluable, 3); assert.equal(noReceipt.news.evaluable, 0); assert(noReceipt.news.not_evaluable);
+  const rows = [
+    { news_trend: 'Positive', gates: [{ gate: 'News', passed: true, current: 'Unknown' }], sector_trend: 'UNKNOWN' },
+    { news_trend: 'Unknown', gates: [{ gate: 'News', passed: false, current: 'Negative' }], sector_trend: ' Neutral ' },
+    { news_trend: 'Neutral', gates: [{ gate: 'News', passed: true, current: 'Positive' }, { gate: 'News', passed: true, current: 'Positive' }], sector_trend: null },
+    { news_trend: 'Positive', gates: [{ gate: 'News', passed: 'true', current: 'Positive' }], sector_trend: 'N/A' }
+  ];
+  const ev = ctx.dt10GateEvaluabilityCore_(rows, { enabled: true });
+  assert.equal(ev.news.evaluable, 1); assert.equal(ev.news.display_evaluable, 3);
+  assert.equal(ev.news.unknown, 3); assert.equal(ev.sector.unknown, 3);
+});
+
+check('T15 target/retrieval/quote presence never implies analyst vintage; provider dates and held age stay distinct', () => {
+  const { ctx } = loadTree(source);
+  const idx = ctx.dt10PoolVintageIndex_([
+    { Symbol: 'UNDATED.US', 'Target Price': 10, 'Last Updated (UTC)': '2026-10-10T20:00:00+03:00', Warnings: 'acquisition_quote_asof:2026-10-09T20:00:00Z' },
+    { Symbol: 'DATED.US', 'Target Price': 10, 'Analyst Target Published At': '2026-09-01T00:00:00+03:00' },
+    { Symbol: 'TOKEN.US', 'Target Price': 10, Warnings: 'analyst_target_asof:2026-09-01' },
+    { Symbol: 'FUTURE.US', 'Target Price': 10, 'Target Publication Date': '2027-01-01' },
+    { Symbol: 'INVALID.US', 'Target Price': 10, 'Target Publication Date': '2026-02-31' },
+    { Symbol: 'NAIVE.US', 'Target Price': 10, 'Analyst Target Published At': '2026-09-01T00:00:00' },
+    { Symbol: 'HELD.US', 'Target Price': 10, Warnings: 'analyst_lkg:30h' }
+  ]);
+  deq(ctx.dt10VintageCells_({ symbol: 'UNDATED.US' }, idx), ['2026-10-09 20:00Z', 'unknown (analyst date unavailable)']);
+  assert.equal(ctx.dt10VintageCells_({ symbol: 'DATED.US' }, idx)[1], 'analyst 2026-08-31 21:00Z');
+  assert.equal(ctx.dt10VintageCells_({ symbol: 'TOKEN.US' }, idx)[1], 'analyst 2026-09-01');
+  for (const symbol of ['FUTURE.US', 'INVALID.US', 'NAIVE.US']) assert.equal(ctx.dt10VintageCells_({ symbol }, idx)[1], 'unknown (analyst date unavailable)');
+  assert.equal(ctx.dt10VintageCells_({ symbol: 'HELD.US' }, idx)[1], 'lkg 30h');
+  assert.equal(ctx.dt10VintageFmt_('2026-10-10T20:00:00+03:00'), '2026-10-10 17:00Z');
+  assert(ctx.dt10VintageFmt_('2026-10-10T20:00:00').includes('timezone unknown'));
+});
+
+check('T16 candidate commits replace stale/empty runs; readers reject corruption and partial-write boundaries', () => {
+  const t = loadTree(source), { ctx, env } = t;
+  const rows = copy(FIX.candidates.slice(0, 3)).map(c => ctx.dt10CandToRow_(c));
+  const write = (run, data) => ctx.dt10CandTabWrite_(env.ss, data, 'run ' + run, null, run);
+  assert(write('old', rows).ok); assert(ctx.dt10CandTabRead_(env.ss, 'old').ok);
+  assert.equal(ctx.dt10CandTabRead_(env.ss, 'new').ok, false);
+  env.failWrite = { sheet: '_T10_Candidates_Staging', method: 'setValues', r: 1, partialRows: 3 };
+  assert.equal(write('stage-fault', rows).ok, false);
+  assert(ctx.dt10CandTabRead_(env.ss, 'old').ok); assert.equal(ctx.dt10CandTabRead_(env.ss, 'stage-fault').ok, false);
+  env.failWrite = { sheet: '_T10_Candidates', method: 'setValues', r: 1, partialRows: 3 };
+  assert.equal(write('copy-fault', rows).ok, false); assert.equal(ctx.dt10CandTabRead_(env.ss, 'copy-fault').ok, false);
+  assert.equal(JSON.parse(env.sheets._T10_Candidates._val(1, 2)).state, 'PENDING');
+  env.failWrite = { sheet: '_T10_Candidates', method: 'setValue', r: 1, c: 2, skip: 1 };
+  assert.equal(write('commit-fault', rows).ok, false); assert.equal(ctx.dt10CandTabRead_(env.ss, 'commit-fault').ok, false);
+  assert(write('new', rows.slice(0, 1)).ok); assert.equal(env.sheets._T10_Candidates.getLastRow(), 3);
+  assert.equal(ctx.dt10CandTabRead_(env.ss, 'old').ok, false);
+  env.sheets._T10_Candidates._set(3, 1, 'CORRUPT.US'); assert.equal(ctx.dt10CandTabRead_(env.ss, 'new').ok, false);
+  assert(write('empty', []).ok);
+  const empty = ctx.dt10CandTabRead_(env.ss, 'empty');
+  assert.equal(empty.ok, true); assert.equal(empty.rows, 0); deq(empty.data, []);
+  assert.equal(env.sheets._T10_Candidates.getLastRow(), 2); assert.equal(ctx.dt10CandTabRead_(env.ss, 'new').ok, false);
+  assert.equal(write('bad-shape', [['bad']]).ok, false); assert(ctx.dt10CandTabRead_(env.ss, 'empty').ok);
+  assert(write('interleave', rows).ok);
+  env.onReadValues = (sheet, r) => {
+    if (sheet._name === '_T10_Candidates' && r === 3) {
+      env.onReadValues = null;
+      const receipt = JSON.parse(sheet._val(1, 2)); receipt.state = 'PENDING'; sheet._set(1, 2, JSON.stringify(receipt));
+    }
+  };
+  const changed = ctx.dt10CandTabRead_(env.ss, 'interleave');
+  assert.equal(changed.ok, false); assert(changed.err.includes('commit changed during read'));
+  assert(write('checksum-base', rows).ok);
+  for (const [sheetName, run] of [['_T10_Candidates_Staging', 'stage-corrupt'], ['_T10_Candidates', 'live-corrupt']]) {
+    env.onReadValues = (sheet, r) => {
+      if (sheet._name === sheetName && r === 3) {
+        env.onReadValues = null; sheet._set(3, 1, 'CORRUPT.US');
+      }
+    };
+    const result = write(run, rows);
+    assert.equal(result.ok, false); assert(result.err.includes('readback mismatch'));
+    assert.equal(ctx.dt10CandTabRead_(env.ss, run).ok, false);
+  }
+  assert(write('lock-base', rows).ok);
+  env.options.lockHeld = true;
+  assert.equal(write('lock-held', rows).ok, false); assert(ctx.dt10CandTabRead_(env.ss, 'lock-base').ok);
+  env.options.lockHeld = false;
+  assert(env.lockReleases > 8, 'lock releases on success and write faults');
+});
+
+check('T17 overflow retains every alert and discloses excess rows; USX must equal USD/100', () => {
+  const r = render(loadTree(source), { cand: 'enforce' }, { alerts: copy(FIX.alerts).concat(copy(FIX.alerts)) });
+  assert(r.p._dt10_cand_note.includes('layout OVERFLOW: 83 > 80 rows; all decision evidence retained'));
+  assert.equal(r.p.alerts.length, 8);
+  const t = loadTree(source);
+  t.ctx.dt10FxRates_ = () => ({ USD: 3.75, USX: 3.75 });
+  assert(!t.ctx.dt10SelfTest().includes('fx USX row: valid'));
+  t.ctx.dt10FxRates_ = () => ({ USD: 3.75, USX: 0.0375 });
+  assert(t.ctx.dt10SelfTest().includes('fx USX row: valid USD/100 (0.0375)'));
+});
+
+check('T18 real native-empty refresh commits a distinct current zero-row snapshot without a backend call', () => {
+  const t = loadTree(source, { props: { DT10_CAND_TAB: 'enforce' } });
+  t.ctx.dt10BoardVerdict_ = verdictStub();
+  const oldRows = copy(FIX.candidates.slice(0, 2)).map(c => t.ctx.dt10CandToRow_(c));
+  assert(t.ctx.dt10CandTabWrite_(t.env.ss, oldRows, 'old', null, 'old').ok);
+  t.ctx.dt10CollectPoolRows_ = () => ({ rows: [], available: {}, perPage: {}, counts: {}, totalRows: 0 });
+  t.ctx.dt10Post_ = () => { throw new Error('native-empty must not call backend'); };
+  t.ctx.refreshDecisionTop10();
+  const receipt = JSON.parse(t.env.sheets._T10_Candidates._val(1, 2));
+  assert.equal(receipt.state, 'COMMITTED'); assert.equal(receipt.rows, 0);
+  assert.match(receipt.run_id, /^native-empty-sheet-pool:2026-10-10T19:28:22.000Z:test-uuid-1$/);
+  assert.equal(t.ctx.dt10CandTabRead_(t.env.ss, receipt.run_id).ok, true);
+  assert.equal(t.ctx.dt10CandTabRead_(t.env.ss, 'old').ok, false);
+  assert(String(t.env.sheets.Top_10_Investments._val(2, 2)).includes('cands 0 -> _T10_Candidates'));
+  t.ctx.refreshDecisionTop10();
+  const next = JSON.parse(t.env.sheets._T10_Candidates._val(1, 2));
+  assert.notEqual(next.run_id, receipt.run_id); assert.equal(next.rows, 0);
+  assert.equal(t.ctx.dt10CandTabRead_(t.env.ss, receipt.run_id).ok, false);
 });
 
 /* ================================================================ digest */

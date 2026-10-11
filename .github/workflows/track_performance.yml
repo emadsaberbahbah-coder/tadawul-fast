@@ -1,5 +1,11 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.0 (2026-10-11) -- WP-02 OPERATOR FLAG MAPPINGS
+# WHY: the 2026-10-10 export still has 27 duplicate matured keys and 11,791
+# matured rows with zero-valued risk placeholders. Existing v6.41.0 guards
+# could not run because their repository Variables were never mapped here.
+# Defaults remain off/0; mirror both mappings in daily_sync's tracker step.
+
 # =============================================================================
 # WHY THIS EXISTS
 # -----------------------------------------------------------------------------
@@ -285,6 +291,15 @@ jobs:
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
+          # (2026-10-11) v6.45.0 prospective schema / publication identities.
+          # Defaults off: arm one measured lane-consistent feature at a time.
+          # Immutable snapshots retain first and subsequent daily publications;
+          # reruns use the same run ID. Canonical targets require price evidence.
+          # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
+          # Rollback: off/0; historical target values and publications stay.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
+          TRACK_PUBLICATION_ID: ${{ github.run_id }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,
@@ -382,6 +397,7 @@ jobs:
             perf_clock_*.log
             *_performance*.json
             *_signal_trends.json
+            *_signal_publications.json
             *_calibration.json
             dropped_duplicates_*.csv
           retention-days: 14

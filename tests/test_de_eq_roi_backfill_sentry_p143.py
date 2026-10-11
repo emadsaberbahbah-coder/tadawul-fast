@@ -14,9 +14,20 @@ synthesis (harness discovery during this build).
 Run:  python tests/test_de_eq_roi_backfill_sentry_p143.py
 """
 import copy, os, sys, importlib
+import pytest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-de = importlib.import_module("core.data_engine_v2")
+de = None
+
+@pytest.fixture(autouse=True)
+def _isolated_engine():
+    global de
+    with patch.dict(os.environ):
+        # BNY.US must exercise the 3M branch rather than a stored LKG target.
+        os.environ["TFB_ENGINE_TARGET_KLG"] = "0"
+        de = importlib.import_module('core.data_engine_v2')
+        yield
 
 # Real 2026-09-16 GM export rows (Forecast Source = provider_target).
 FIX_T12 = {"symbol": "FISV.US", "current_price": 50.02, "forecast_price_1m": 51.9,
@@ -59,7 +70,7 @@ def _tags(d):
     return {t.strip() for t in (d.get("warnings") or "").split(";")
             if "eq_roi_backfill" in t}
 
-def t1_off_no_tags_and_fraction_values():
+def test_t1_off_no_tags_and_fraction_values():
     for fx, fn in ((FIX_T12, de._phase_ii_quality_forecast),
                    (FIX_T3, de._phase_ii_quality_forecast),
                    (FIX_SYN, de._phase_ii_quality_forecast),
@@ -75,7 +86,7 @@ def t1_off_no_tags_and_fraction_values():
     assert abs(d["expected_roi_3m"] - round((54.4 - 50.02) / 50.02, 6)) < 1e-9
     print("T1 ok")
 
-def t2_observe_exact_tags_zero_value_drift():
+def test_t2_observe_exact_tags_zero_value_drift():
     exp = {
         "t12": {"eq_roi_backfill:%s:t12:observe" % k for k in ROI},
         "t3": {"eq_roi_backfill:%s:t3:observe" % k for k in ROI},
@@ -92,7 +103,7 @@ def t2_observe_exact_tags_zero_value_drift():
         assert _tags(obs) == exp[src], (src, _tags(obs))
     print("T2 ok")
 
-def t3_enforce_is_deferred():
+def test_t3_enforce_is_deferred():
     for fx, fn in ((FIX_T12, de._phase_ii_quality_forecast),
                    (FIX_FB, de._compute_scores_local_fallback)):
         obs = _run(fn, fx, "observe")
@@ -102,7 +113,7 @@ def t3_enforce_is_deferred():
         assert "enforce_deferred" not in obs["warnings"]
     print("T3 ok")
 
-def t4_idempotent_under_observe():
+def test_t4_idempotent_under_observe():
     os.environ["TFB_EQ_ROI_UNIT_SENTRY"] = "observe"
     d = copy.deepcopy(FIX_T12)
     de._phase_ii_quality_forecast(d)
@@ -111,7 +122,7 @@ def t4_idempotent_under_observe():
     assert d["warnings"] == w1 and _vals(d) == v1, "second pass mutated"
     print("T4 ok")
 
-def t5_bad_mode_is_off():
+def test_t5_bad_mode_is_off():
     for mode in ("", "1", "on", "OFF", "Enforce "):
         d = _run(de._phase_ii_quality_forecast, FIX_T12,
                  mode if mode.strip().lower() in ("observe", "enforce") else mode)
@@ -121,7 +132,7 @@ def t5_bad_mode_is_off():
             assert not _tags(d), (mode, d["warnings"])
     print("T5 ok")
 
-def t6_existing_roi_untagged():
+def test_t6_existing_roi_untagged():
     fx = copy.deepcopy(FIX_T12)
     fx["expected_roi_1m"], fx["expected_roi_3m"], fx["expected_roi_12m"] = 0.01, 0.02, 0.03
     d = _run(de._phase_ii_quality_forecast, fx, "observe")
@@ -129,60 +140,12 @@ def t6_existing_roi_untagged():
     assert (d["expected_roi_1m"], d["expected_roi_3m"], d["expected_roi_12m"]) == (0.01, 0.02, 0.03)
     print("T6 ok")
 
-# 2026-10-11: pytest entry points. ci.yml (lean job) enumerates this file, but it
-# only ran its battery under __main__, so pytest collected 0 tests and CI checked
-# nothing. _run() sets TFB_EQ_ROI_UNIT_SENTRY and never restores it, so under pytest
-# an autouse fixture restores the prior value after each test (no leak into the
-# suites that follow in the same process). The __main__ runner below is unchanged.
-try:
-    import pytest
-except ImportError:  # the __main__ runner needs no pytest
-    pytest = None
-
-if pytest is not None:
-    @pytest.fixture(autouse=True)
-    def _sentry_env_restored():
-        # The fixtures' expected tags assume the engine defaults: the keep-last-good
-        # target gate OFF (a stored 12M target would turn the BNY.US t3 row into a
-        # t12 row). Pin it for the test, restore both variables afterwards.
-        keys = ("TFB_EQ_ROI_UNIT_SENTRY", "TFB_ENGINE_TARGET_KLG")
-        prev = {k: os.environ.get(k) for k in keys}
-        os.environ["TFB_ENGINE_TARGET_KLG"] = "0"
-        yield
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-def test_t1_off_no_tags_and_fraction_values():
-    t1_off_no_tags_and_fraction_values()
-
-
-def test_t2_observe_exact_tags_zero_value_drift():
-    t2_observe_exact_tags_zero_value_drift()
-
-
-def test_t3_enforce_is_deferred():
-    t3_enforce_is_deferred()
-
-
-def test_t4_idempotent_under_observe():
-    t4_idempotent_under_observe()
-
-
-def test_t5_bad_mode_is_off():
-    t5_bad_mode_is_off()
-
-
-def test_t6_existing_roi_untagged():
-    t6_existing_roi_untagged()
-
-
 if __name__ == "__main__":
-    for i in range(3):
-        t1_off_no_tags_and_fraction_values(); t2_observe_exact_tags_zero_value_drift()
-        t3_enforce_is_deferred(); t4_idempotent_under_observe()
-        t5_bad_mode_is_off(); t6_existing_roi_untagged()
-    print("P-143 battery T1-T6 PASS x3")
+    de = importlib.import_module("core.data_engine_v2")
+    with patch.dict(os.environ):
+        os.environ["TFB_ENGINE_TARGET_KLG"] = "0"
+        for i in range(3):
+            test_t1_off_no_tags_and_fraction_values(); test_t2_observe_exact_tags_zero_value_drift()
+            test_t3_enforce_is_deferred(); test_t4_idempotent_under_observe()
+            test_t5_bad_mode_is_off(); test_t6_existing_roi_untagged()
+        print("P-143 battery T1-T6 PASS x3")

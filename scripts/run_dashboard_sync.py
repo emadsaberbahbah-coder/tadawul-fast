@@ -3,9 +3,22 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.66.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.67.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.67.0 - integrated review corrections (2026-10-11)
+================================================================================
+Warnings compaction requires a verified JSONL sink receipt. The receipt and
+original warning cells travel into the final writer; failed or lost receipts
+preserve those exact cells through re-projection. Late/direct writes archive
+and verify their own removals, preserving previous sink records. Successful
+writes record a separate outgoing-payload digest after whole-page ranking;
+payload_sha8 keeps its existing pre-writer input meaning. The outgoing digest
+attests the submitted RAW values, not a live sheet readback.
+The upstream feed publisher is downgrade-only for the final decision feed;
+freshness-only success is a separate diagnostic. A final-publication veto
+survives later scoped sync legs until an explicit accepted release replaces it.
 
 v6.66.0 - WP-2c [RANK-PAGE]: gate TFB_RANK_OVERALL_PAGE = off | observe | enforce
 ================================================================================
@@ -158,9 +171,9 @@ SEAM: _run_one_task, right after the final presentation copy and before
   API boundaries the cockpit / builder / intraday refresh consume, so an
   engine-side compaction would alter API rows and run on Render - rejected.
   An enforce-only pass inside SheetsWriter.write_table (after the second
-  projection) is the safety net: once the :unknown literal is KEEP it removes
-  0 tokens; a non-zero late count is logged at WARNING and compacted and is
-  the signal that a new re-emitting diagnostic entered core/sheet_presentation.
+  projection) carries the verified receipt forward. A non-zero late count
+  is archived and verified before removal; archive failure preserves the
+  candidate cells. Failed initial receipts preserve exact original warnings.
   observe = counts only: one [WARNINGS-COMPACT] log line + one _Run_Log row
   (Status WOULD_COMPACT) per ranked page per leg, res._stamp_meta['wc'], a
   warnings_compact block in --json-out; cells untouched. enforce = the full
@@ -191,6 +204,15 @@ EXPECTED ENFORCE RESULT (measured offline on the 10-10 export with the REAL
 off (default) is BYTE-IDENTICAL to v6.64.14 on the sheet payload, the _Status
   stamp, sync_summary.json and _Run_Log; the only emission is the startup boot
   line next to the P-162 / P-162b lines. ZERO functions removed.
+
+v6.65.0 WHY (2026-10-10 work brief WP-05): seven crypto collisions were
+repeatedly preserved by last-good. TFB_SYNC_KLG_CRYPTO_NAME_GATE accepts
+only off|observe|enforce (default off): observe logs without altering rows;
+enforce refuses mismatched predecessors and stubs definite curated-name
+mismatches after all persistence passes. Reuse the audit vocabulary exactly;
+unknown roots are not judged and token matches are not identity proof.
+WHY WP-04: USX minor units join the portfolio currency guard only when
+TFB_OPP_FX_USX_SUBUNIT is armed; existing defaults remain unchanged.
 
 v6.64.14: validate and copy canonical market presentation after all last-good
 restoration and at the direct Sheets writer. Unknown margin/return/label cells
@@ -1550,6 +1572,7 @@ from core.secret_redaction import (
 try:
     from scripts.critical_symbol_identity import (
         CRITICAL_FETCH_SYMBOLS,
+        crypto_name_matches,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -1560,6 +1583,7 @@ try:
 except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
     from critical_symbol_identity import (
         CRITICAL_FETCH_SYMBOLS,
+        crypto_name_matches,
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
@@ -2061,7 +2085,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.66.0"
+SCRIPT_VERSION = "6.67.0"
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -3061,6 +3085,8 @@ class TaskResult:
             "error": redact_text(self.error) if isinstance(self.error, str) else self.error,
             "request_id": self.request_id,
             "version": SCRIPT_VERSION,
+            **({"write_receipt": dict(self._stamp_meta["write_receipt"])}
+               if self._stamp_meta.get("write_receipt") else {}),
         }
 
 
@@ -3679,20 +3705,121 @@ def _wc_write_sink(page: str, records: List[Dict[str, Any]]) -> Tuple[str, str]:
     any cell is compacted. The per-process _RUN_ID suffix keeps a multi-cycle
     inline recovery from overwriting the cycle whose cells reached the sheet.
     Raises on failure - the seam turns that into SINK_FAILED (cells
-    untouched). Returns (path, sha256(file)[:8])."""
+    untouched). Existing records survive late writes and repeated page writes.
+    Read the atomic replacement back before issuing (path, sha256(file)[:8])."""
     import hashlib as _wc_hashlib
     safe_page = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(page or "page"))
     path = Path(_wc_sink_dir()) / ("%s%s_%s.jsonl" % (_WC_SINK_PREFIX, safe_page, _RUN_ID))
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = "".join(json.dumps(r, ensure_ascii=False, default=str, sort_keys=True) + "\n"
-                   for r in (records or [])).encode("utf-8")
+    prior = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+             if line.strip()] if path.exists() else []
+    lines = [json.dumps(r, ensure_ascii=False, default=str, sort_keys=True) for r in prior]
+    seen = set(lines)
+    for record in records or []:
+        line = json.dumps(record, ensure_ascii=False, default=str, sort_keys=True)
+        if line not in seen:
+            lines.append(line)
+            seen.add(line)
+    data = "".join(line + "\n" for line in lines).encode("utf-8")
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "wb") as fh:
         fh.write(data)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    if path.read_bytes() != data:
+        raise OSError("warnings sink readback differs from the archived records")
     return str(path), _wc_hashlib.sha256(data).hexdigest()[:8]
+
+
+class _WCArchivedRows(list):
+    """Publication-local archive state, carried with the matrix to its writer.
+
+    A failed seam carries an explicit blocked receipt so the final writer
+    cannot mistake that matrix for a direct write and retry its compaction.
+    """
+    def __init__(self, rows: Any, page: str, headers: Any, original: Any,
+                 receipt: Any = None):
+        super().__init__(rows)
+        wi = _guard_find_col(list(headers or []), _FG_WARN_ALIASES)
+        self._wc_archive = {
+            "page": page, "headers": list(headers or []), "receipt": receipt,
+            "warnings": [row[wi] if isinstance(row, (list, tuple)) and 0 <= wi < len(row)
+                         else None for row in original or []],
+        }
+
+
+def _wc_sink_receipt(page: str, records: Any, path: str, sha8: str) -> dict:
+    """Verify the bytes and all promised records, independently of the writer."""
+    import hashlib
+    data = Path(path).read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if not sha8 or digest[:8] != sha8:
+        raise OSError("warnings sink digest does not match its receipt")
+    archived = {json.dumps(json.loads(line), ensure_ascii=False, default=str, sort_keys=True)
+                for line in data.decode("utf-8").splitlines() if line.strip()}
+    expected = {json.dumps(record, ensure_ascii=False, default=str, sort_keys=True)
+                for record in records or []}
+    if not expected.issubset(archived):
+        raise OSError("warnings sink omitted promised records")
+    return {"page": page, "path": path, "sha256": digest, "verified": True}
+
+
+def _wc_receipt_valid(archive: Any, page: str, headers: Any) -> bool:
+    import hashlib
+    receipt = (archive or {}).get("receipt") or {}
+    return bool(receipt.get("verified") and archive.get("page") == page
+                and archive.get("headers") == list(headers or [])
+                and receipt.get("page") == page
+                and hashlib.sha256(Path(receipt["path"]).read_bytes()).hexdigest()
+                == receipt.get("sha256"))
+
+
+def _wc_restore_warning_cells(matrix: Any, hdr: Any, archive: dict) -> Any:
+    """Keep failed-seam warning bytes exact even when presentation adds tags."""
+    wi = _guard_find_col(hdr, _FG_WARN_ALIASES)
+    if wi >= 0:
+        for row, warning in zip(matrix, archive.get("warnings") or []):
+            if isinstance(row, list) and wi < len(row):
+                row[wi] = warning
+    return matrix
+
+
+def _wc_final_writer_seam(page: str, hdr: Any, matrix: Any, archive: Any,
+                          original: Any = None) -> Tuple[Any, dict]:
+    """Authorize every removal against a verified sink, including late tags."""
+    receipt = None
+    if archive is not None:
+        try:
+            valid = _wc_receipt_valid(archive, page, hdr)
+        except Exception:  # a disappeared/corrupt archive cannot authorize removal
+            valid = False
+        if not valid:
+            print("::warning::%s %s final compaction blocked: no verified sink receipt; "
+                  "warning cells preserved" % (_WC_TAG, page))
+            logger.warning("%s %s final compaction blocked: no verified sink receipt",
+                           _WC_TAG, page)
+            return _wc_restore_warning_cells(matrix, hdr, archive), {"status": "SINK_FAILED"}
+        receipt = archive["receipt"]
+    try:
+        out, stats, records = _wc_compact_rows(page, hdr, matrix, "enforce", _wc_keep_extra())
+        if records:
+            sink, sha8 = _wc_write_sink(page, records)
+            receipt = _wc_sink_receipt(page, records, sink, sha8)
+            logger.warning("%s late compaction on %s removed %d token(s) after "
+                           "verified archive (families %s)", _WC_TAG, page,
+                           int(stats.get("tags_removed") or 0), stats.get("removed_families"))
+        return out, {"status": "COMPACTED", "sink_receipt": receipt,
+                     "late_tags_removed": int(stats.get("tags_removed") or 0)}
+    except Exception as exc:
+        print("::warning::%s late telemetry sink write FAILED for %s - %s; warning cells preserved"
+              % (_WC_TAG, page, type(exc).__name__))
+        logger.warning("%s late archive failed on %s (%s); warning cells preserved",
+                       _WC_TAG, page, type(exc).__name__)
+        if archive is None and original is not None:
+            matrix = _wc_restore_warning_cells(matrix, hdr, original)
+        return matrix, {"status": "SINK_FAILED", "sink_receipt": receipt,
+                        "late_tags_removed": 0}
 
 
 def _wc_log_line(page: str, stats: Dict[str, Any], status: str) -> str:
@@ -3715,7 +3842,8 @@ def _wc_stats_subset(stats: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("mode", "requested", "status", "rows", "rows_with_removable", "tags_before",
             "tags_after", "tags_removed", "chars_before", "chars_after", "chars_removed",
             "mean_chars_before", "mean_chars_after", "mean_tags_before", "mean_tags_after",
-            "rows_gt5_before", "rows_gt5_after", "max_tags_after", "sink", "sink_sha8",
+            "rows_gt5_before", "rows_gt5_after", "max_tags_after", "sink", "sink_sha8", "sink_verified",
+            "would_remove_tags", "would_remove_chars", "final_status", "written_payload_sha8",
             "selftest", "keep_extra", "version")
     return {k: stats.get(k) for k in keys if k in stats}
 
@@ -3749,6 +3877,7 @@ def _append_runlog_warnings_compact(sheets: Any, spreadsheet_id: str, page: str,
             "top_removed_families": list(fam.items())[:12],
             "keep_extra": list(stats.get("keep_extra") or []),
             "sink": stats.get("sink"), "sink_sha8": stats.get("sink_sha8"),
+            "sink_verified": stats.get("sink_verified"),
             "selftest": stats.get("selftest"), "version": SCRIPT_VERSION}))
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", str(page or ""),
@@ -3794,11 +3923,11 @@ def _wc_publish_seam(task: Any, res: Any, sheets: Any, spreadsheet_id: str,
     log line, one _Run_Log WOULD_COMPACT row, res._stamp_meta['wc'], the
     report block; the SAME object is returned. enforce: the records go to the
     JSONL sink FIRST; a sink failure prints ::warning::, appends SINK_FAILED
-    and returns the UNCOMPACTED matrix (the page behaves as observe) -
+    and returns the UNCOMPACTED values with an explicit failed receipt -
     telemetry is never destroyed without a copy. dry_run never sinks or
     appends (defence only: _run_one_task returns before this seam on
-    dry_run). Because the seam sits before write_table, _payload_sha8 and
-    the post-write census see the written (compacted) payload. The whole
+    dry_run). The existing _payload_sha8 sees this input to write_table;
+    the writer separately attests its final outgoing cells. The whole
     body is fail-open: a telemetry fault never touches the write path."""
     page = str(getattr(task, "sheet_name", "") or "")
     try:
@@ -3818,19 +3947,26 @@ def _wc_publish_seam(task: Any, res: Any, sheets: Any, spreadsheet_id: str,
                                    "status": stats.get("status"), "selftest": selftest}
             return rows_matrix
         status = "WOULD_COMPACT"
-        sink, sink_sha8 = "-", ""
+        sink, sink_sha8, receipt = "-", "", None
         if mode == "enforce" and not dry:
             try:
                 sink, sink_sha8 = _wc_write_sink(page, records)
+                receipt = _wc_sink_receipt(page, records, sink, sink_sha8)
                 status = "COMPACTED"
             except Exception as _se:  # noqa: BLE001
                 status = "SINK_FAILED"
                 rows_out = rows_matrix
+                stats["would_remove_tags"] = stats["tags_removed"]
+                stats["would_remove_chars"] = stats["chars_removed"]
+                stats["tags_removed"] = stats["chars_removed"] = 0
+                for key in ("tags", "chars", "mean_chars", "mean_tags", "rows_gt5", "max_tags"):
+                    stats[key + "_after"] = stats[key + "_before"]
                 print("::warning::%s telemetry sink write FAILED for %s - %s; cells left "
                       "untouched (observe fallback for this page)"
                       % (_WC_TAG, page, type(_se).__name__))
         stats.update({"mode": mode, "requested": requested, "status": status, "sink": sink,
                       "sink_sha8": sink_sha8, "selftest": selftest,
+                      "sink_verified": bool(receipt),
                       "keep_extra": sorted(keep_extra), "dry_run": dry,
                       "version": SCRIPT_VERSION})
         line = _wc_log_line(page, stats, status)
@@ -3848,16 +3984,21 @@ def _wc_publish_seam(task: Any, res: Any, sheets: Any, spreadsheet_id: str,
         except Exception:  # noqa: BLE001
             pass
         _WC_RUN_STATS[page] = dict(subset)
+        if mode == "enforce" and not dry:
+            return _WCArchivedRows(rows_out, page, headers, rows_matrix, receipt)
         return rows_out
     except Exception as _e:  # noqa: BLE001
         logger.warning("%s seam skipped on %s (%s); the write proceeds unchanged",
                        _WC_TAG, page or "?", type(_e).__name__)
+        if _wc_mode_raw() == "enforce" and _wc_page_in_scope(page):
+            return _WCArchivedRows(rows_matrix, page, headers, rows_matrix)
         return rows_matrix
 
 
 class SheetsWriter:
     def __init__(self):
         self._service = None  # lazy
+        self._write_receipts = {}
 
     def _fix_private_key(self, d: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -3937,6 +4078,7 @@ class SheetsWriter:
         headers: List[Any],
         rows: List[List[Any]],
     ) -> int:
+        self._write_receipts.pop((spreadsheet_id, sheet_name), None)
         svc = self._get_service()
         if not svc:
             return 0
@@ -3949,6 +4091,11 @@ class SheetsWriter:
         from core.sheet_presentation import validate_market_sheet_rows
         market_keys = validate_market_sheet_rows(sheet_name, hdr, rows)
 
+        # Keep the explicit seam result across copy/coercion/ranking/projection.
+        _wc_archive = getattr(rows, "_wc_archive", None)
+        _wc_original = None
+        if _wc_page_in_scope(sheet_name) and _wc_mode() == "enforce":
+            _wc_original = _WCArchivedRows(rows, sheet_name, hdr, rows)._wc_archive
         matrix: List[List[Any]] = []
         for r in rows or []:
             rr = list(r) if isinstance(r, list) or (market_keys is not None and isinstance(r, tuple)) else [r]
@@ -3967,26 +4114,12 @@ class SheetsWriter:
         matrix, _fg_stats = _ohlc_fill_guard_apply(hdr, matrix)
         matrix, _rp_stats = _rank_overall_page_apply(sheet_name, hdr, matrix)  # v6.66.0 [RANK-PAGE]: whole page, after restoration, before copy-only presentation
         matrix = _present_market_sheet_rows(sheet_name, hdr, matrix)
-        # v6.65.0 (WP-6) enforce-only safety net at the single write choke
-        # point: the second projection above re-adds nothing MOVABLE once
-        # sheet_horizon_label:invest_period_label:unknown is KEEP (the only
-        # token present_instrument_row re-emits on a projected row); a non-zero
-        # late count is logged at WARNING and compacted, and is the signal that
-        # a new re-emitting diagnostic entered core/sheet_presentation.py. No
-        # sink, no _Run_Log here. off / observe: no call (byte-identical).
+        # Every removal, including a direct write or newly re-emitted token,
+        # must have a verified sink receipt. A failed earlier seam stays blocked.
+        _wc_final = None
         if market_keys is not None and _wc_mode() == "enforce":
-            try:
-                matrix, _wc_late = _wc_compact_rows(
-                    sheet_name, hdr, matrix, "enforce", _wc_keep_extra())[:2]
-                if int(_wc_late.get("tags_removed") or 0) > 0:
-                    logger.warning(
-                        "%s late compaction on %s removed %d token(s) after "
-                        "re-projection (families %s) - investigate",
-                        _WC_TAG, sheet_name, int(_wc_late.get("tags_removed") or 0),
-                        _wc_late.get("removed_families"))
-            except Exception as _wce:  # noqa: BLE001
-                logger.warning("%s late pass skipped on %s (%s)",
-                               _WC_TAG, sheet_name, type(_wce).__name__)
+            matrix, _wc_final = _wc_final_writer_seam(
+                sheet_name, hdr, matrix, _wc_archive, _wc_original)
 
         values: List[List[Any]] = []
         if hdr:
@@ -4020,6 +4153,24 @@ class SheetsWriter:
                     f"{_backoffs[min(_try, len(_backoffs) - 1)]:.0f}s: {_we}"
                 )
                 time.sleep(_backoffs[min(_try, len(_backoffs) - 1)])
+
+        # Separate the historical input digest from the actual submitted RAW
+        # values after final fill guard, ranking and warning publication. This
+        # attests a successful update request, not an independent live readback.
+        if _rp_stats or _wc_final:
+            receipt = {"written_payload_sha8": _payload_sha8(hdr, matrix),
+                       "evidence": "successful_RAW_update", "live_readback": False,
+                       "rows": len(matrix)}
+            if _rp_stats:
+                _rp_stats["written_payload_sha8"] = receipt["written_payload_sha8"]
+                receipt["rank_page"] = dict(_rp_stats)
+            if _wc_final:
+                receipt["warnings_compact"] = _wc_final
+                if sheet_name in _WC_RUN_STATS:
+                    _WC_RUN_STATS[sheet_name].update({
+                        "final_status": _wc_final["status"],
+                        "written_payload_sha8": receipt["written_payload_sha8"]})
+            self._write_receipts[(spreadsheet_id, sheet_name)] = receipt
 
         # v6.44.0 (W1A-6f) FG-2: one FILLGUARD line per page per write.
         try:
@@ -4983,7 +5134,20 @@ def _inject_portfolio_holdings(
     return out, injected
 
 
-_PF_MINOR_UNIT_CCY = frozenset({"GBp", "GBX", "GBx", "ZAc", "ZAC", "ILA", "ILa"})
+_PF_MINOR_UNIT_CCY = frozenset({"GBp", "GBX", "GBx", "ZAc", "ZAC", "ILA", "ILa", "USX"})
+
+
+def _pf_quote_is_minor_unit(currency: Any) -> bool:
+    """USX joins the existing guard only with TFB_OPP_FX_USX_SUBUNIT armed.
+
+    WHY: cents quotes cannot establish a native USD ledger refresh. The
+    optional USX lane must preserve the legacy membership check when off.
+    """
+    raw = str(currency or "").strip()
+    if raw.upper() == "USX":
+        return (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}
+    return raw in _PF_MINOR_UNIT_CCY
 
 
 def _pf_minor_unit_ccy_guard() -> bool:
@@ -5033,7 +5197,7 @@ def _portfolio_holdings_contract(
         if currency != cost_basis[symbol]["currency"]:
             return False, "holding quote currency does not match native ledger currency"
         if _pf_minor_unit_ccy_guard() and currency_i < len(row) and \
-                str(row[currency_i] or "").strip() in _PF_MINOR_UNIT_CCY:
+                _pf_quote_is_minor_unit(row[currency_i]):
             return False, "holding quote currency is a minor unit; native ledger is major"
         if require_complete:
             qty = _pm_to_float(row[qty_i]) if qty_i < len(row) else None
@@ -7680,7 +7844,7 @@ def _runlog_meta_json(details: str) -> str:
 
 
 def _payload_sha8(headers: list, rows_matrix: list) -> str:
-    """v6.45.0 R4: stable 8-hex fingerprint of the written payload."""
+    """Stable input-payload fingerprint; the final writer issues a separate receipt."""
     try:
         h = _sh_hashlib.sha256()
         h.update(("|".join(str(x) for x in (headers or []))).encode(
@@ -9520,6 +9684,7 @@ _UPSTREAM_VERDICT_TAG = f"[UPSTREAM-VERDICT v{SCRIPT_VERSION}]"
 #   "<STATE> | cov=<pct|n/a> | run=<id> | <ts>"   STATE in
 #   OK / PARTIAL / STALE_COV / FAILED / SKIPPED.
 _UPSTREAM_VERDICT_KEY = "TFB Decision Feed"
+_UPSTREAM_DIAGNOSTIC_KEY = "TFB Upstream Feed Diagnostic"
 _UV_PAGE_KEY_PREFIX = "TFB Feed "
 _UV_BLOCK_RANGE = "L1:M60"          # the documented global key-value block
 _UV_SELFCHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -9711,7 +9876,9 @@ def _capacity_value(alloc: Optional[int], run_id: str, ts: str) -> str:
 def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                             results: list) -> None:
     """v6.40.0 W1A-4a producer. Upsert this job's per-page keys, then the
-    composite, into `_Status` L:M. Bounded L{r}:M{r} RAW updates ONLY —
+    freshness diagnostic, into `_Status` L:M. Final feed writes can downgrade
+    only, and cannot replace a final_publication veto from any run. Per-page
+    tokens are not an accepted final-publication receipt. Bounded RAW updates —
     NEVER values.append (row insertion would shear the A:J page grid).
     Fail-open at every step; loud ::warning:: on final write failure."""
     if not _upstream_verdict_enabled() or sheets is None:
@@ -9731,18 +9898,26 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                   % (_UPSTREAM_VERDICT_TAG, _STATUS_SHEET_NAME,
                      type(_re).__name__, _re))
             return
+        if not isinstance(grid, list) or len(grid) > 60:
+            raise ValueError("upstream verdict layout is unavailable or oversized")
         keys = {}
         blanks = []
         known = False
         for i in range(60):
             row = grid[i] if i < len(grid) else []
+            if not isinstance(row, list) or len(row) > 2:
+                raise ValueError("upstream verdict layout has an invalid row")
             k = str(row[0]).strip() if row and len(row) > 0 else ""
             v = str(row[1]).strip() if row and len(row) > 1 else ""
             if k:
+                if k.casefold() in keys:
+                    raise ValueError("upstream verdict layout has a duplicate key")
                 keys[k.casefold()] = (i + 1, v)
                 if k.casefold() in _UV_SELFCHECK_KEYS:
                     known = True
             else:
+                if v:
+                    raise ValueError("upstream verdict layout has an orphaned value")
                 blanks.append(i + 1)
         if not known:
             print("::warning::%s self-check failed — no known global key in "
@@ -9751,19 +9926,33 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
                      _UV_BLOCK_RANGE))
             return
 
-        def _upsert(key: str, value: str) -> None:
+        def _upsert(key: str, value: str) -> bool:
             slot = keys.get(key.casefold(), (None, ""))[0]
             if slot is None:
                 if not blanks:
                     print("::warning::%s no free L-slot for '%s' in %s — "
                           "skipped." % (_UPSTREAM_VERDICT_TAG, key,
                                         _UV_BLOCK_RANGE))
-                    return
+                    return False
                 slot = blanks.pop(0)
                 keys[key.casefold()] = (slot, "")
             body = {"values": [[key, value]]}
             _err = None
             for _ in (1, 2):
+                if key == _UPSTREAM_VERDICT_KEY:
+                    # Repeat before retries after an ambiguous failure too;
+                    # a newly published final veto is never retry collateral.
+                    current = svc.spreadsheets().values().get(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!L{slot}:M{slot}",
+                    ).execute().get("values", [])
+                    if (not isinstance(current, list) or len(current) != 1
+                            or not isinstance(current[0], list) or len(current[0]) != 2
+                            or str(current[0][0]).strip().casefold() != _UPSTREAM_VERDICT_KEY.casefold()):
+                        raise ValueError("final feed pair changed or is unavailable")
+                    if re.match(r"^\s*NOT_ACTIONABLE\s*\(\s*final_publication\s*\)",
+                                str(current[0][1] or ""), re.I):
+                        return False
                 try:
                     svc.spreadsheets().values().update(
                         spreadsheetId=spreadsheet_id,
@@ -9779,6 +9968,7 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
             if _err is not None:
                 raise _err
             keys[key.casefold()] = (slot, value)
+            return True
 
         ts = _status_ts_str()  # v6.46.0: explicit offset
         run_id = (os.getenv("GITHUB_RUN_ID") or "").strip() or "local"
@@ -9798,9 +9988,20 @@ def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
             page_states[page] = (_uv_parse_value(stored[1]) if stored
                                  else ("", None))
         verdict, summary = _uv_compose(page_states, now_e)
-        _upsert(_UPSTREAM_VERDICT_KEY,
-                f"{verdict} | run={run_id} | {ts} | {summary}")
-        line = f"{_UPSTREAM_VERDICT_TAG} {verdict} | {summary}"
+        value = f"{verdict} | run={run_id} | {ts} | {summary}"
+        diagnostic = (f"UPSTREAM_READY | run={run_id} | {ts} | {summary} | final_acceptance=not_issued"
+                      if verdict == "EXECUTABLE" else value)
+        _upsert(_UPSTREAM_DIAGNOSTIC_KEY, diagnostic)
+        final_feed = keys.get(_UPSTREAM_VERDICT_KEY.casefold())
+        preserved = False
+        if final_feed and verdict != "EXECUTABLE":
+            preserved = not _upsert(_UPSTREAM_VERDICT_KEY, value)
+        elif final_feed:
+            preserved = bool(re.match(r"^\s*NOT_ACTIONABLE\s*\(\s*final_publication\s*\)",
+                                      final_feed[1], re.I))
+        line = (f"{_UPSTREAM_VERDICT_TAG} upstream={verdict} | {summary}"
+                + (" | final_publication veto preserved" if preserved else "")
+                + (" | final acceptance not issued" if verdict == "EXECUTABLE" else ""))
         (logger.info if verdict == "EXECUTABLE" else logger.warning)(line)
         # v6.53.0: grid-capacity key - the same bounded in-place _upsert, so
         # it lands even when the workbook is AT the allocation cap.
@@ -9973,6 +10174,68 @@ def _klg_fetchfail_selftest() -> str:
     return "PASS" if passed == total else "FAIL %d/%d" % (passed, total)
 
 
+def _klg_crypto_name_mode() -> str:
+    raw = (os.getenv("TFB_SYNC_KLG_CRYPTO_NAME_GATE") or "off").strip().lower()
+    return raw if raw in {"observe", "enforce"} else "off"
+
+
+def _crypto_name_firewall(headers: List[Any], rows_matrix: List[List[Any]]) -> tuple:
+    """Final, pure name screen after all restoration seams; off is a no-op.
+
+    Data-free stubs are already honest and must retain their original tags.
+    Unknown symbols are unjudged; no provider IDs are guessed from a name.
+    """
+    mode = _klg_crypto_name_mode()
+    suspects: List[str] = []
+    if mode == "off" or not headers or not rows_matrix:
+        return rows_matrix, suspects
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+    warn_i = _guard_find_col(list(headers), _FG_WARN_ALIASES)
+    if min(sym_i, name_i) < 0:
+        return rows_matrix, suspects
+    for index, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or len(row) <= max(sym_i, name_i):
+            continue
+        if _guard_is_blank(row[name_i]):
+            continue
+        if crypto_name_matches(row[sym_i], row[name_i]) is not False:
+            continue
+        symbol = str(row[sym_i]).strip().upper()
+        suspects.append(symbol)
+        if mode == "enforce":
+            stub = ["" for _ in row]
+            stub[sym_i] = row[sym_i]
+            if 0 <= warn_i < len(stub):
+                stub[warn_i] = "identity_quarantined:crypto_name:v6.65.0"
+            rows_matrix[index] = stub
+    return rows_matrix, suspects
+
+
+def _append_runlog_crypto_name(sheets: Any, spreadsheet_id: str, page: str,
+                              mode: str, symbols: List[str]) -> None:
+    """One telemetry-only line; never receives or records instrument names."""
+    if sheets is None or not symbols or mode == "off":
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        msg = (f"[CRYPTO-NAME v{SCRIPT_VERSION}] {page} mode={mode} "
+               f"suspects={len(symbols)} stubbed={len(symbols) if mode == 'enforce' else 0}")
+        svc.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range="'_Run_Log'!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [[datetime.now(timezone.utc).isoformat(), "WARNING",
+                              "run_dashboard_sync", page, mode.upper(), msg,
+                              "", "", "", _runlog_meta_json(json.dumps({
+                                  "version": SCRIPT_VERSION, "mode": mode,
+                                  "suspects": len(symbols)}))]]},
+        ).execute()
+    except Exception as exc:
+        logger.warning("[CRYPTO-NAME] run-log append unavailable (%s)", type(exc).__name__)
+
+
 def _keep_last_good_rows(
     sheets: "SheetsWriter",
     spreadsheet_id: str,
@@ -10102,6 +10365,15 @@ def _keep_last_good_rows(
             continue  # old row not good -> keep the fresh stub
         if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
             continue
+        crypto_mode = _klg_crypto_name_mode()
+        if crypto_mode != "off" and crypto_name_matches(
+            t, row[old_name_i] if 0 <= old_name_i < len(row) else ""
+        ) is False:
+            logger.warning("[CRYPTO-NAME v%s] last-good name mismatch mode=%s symbol=%s",
+                           SCRIPT_VERSION, crypto_mode, t)
+            if crypto_mode == "enforce":
+                _LAST_KLG_ID_SUSPECTS.append(t)
+                continue
         # v6.24.0 FW-1: price+provider is no longer enough - the 2026-07-13
         # poison rode back in on exactly that certification. The old row
         # must also carry a Name and agree with its own P/E==Price/EPS
@@ -13983,6 +14255,25 @@ async def _run_one_task(
                 return res
         # ---------------------------------------------------------------------
 
+        # WP-05 final name screen: after PV-2, FW-KEEP and operator quarantine,
+        # so no later last-good restoration can resurrect a rejected identity.
+        if task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES:
+            rows_matrix, _crypto_suspects = _crypto_name_firewall(headers, rows_matrix)
+            if _crypto_suspects:
+                _crypto_mode = _klg_crypto_name_mode()
+                _crypto_msg = (f"[CRYPTO-NAME v{SCRIPT_VERSION}] {task.sheet_name} "
+                               f"mode={_crypto_mode} suspects={len(_crypto_suspects)}")
+                logger.warning(_crypto_msg)
+                res.warnings.append(_crypto_msg)
+                _append_runlog_crypto_name(sheets, spreadsheet_id, task.sheet_name,
+                                          _crypto_mode, _crypto_suspects)
+                if _crypto_mode == "enforce":
+                    res._stamp_meta["stubbed"] = int(res._stamp_meta.get("stubbed") or 0) + len(_crypto_suspects)
+                    _noncurrent_fetched_symbols = _merge_noncurrent_fetched_lineage(
+                        _fetched_origin_symbols, _noncurrent_fetched_symbols, _crypto_suspects)
+                    res._stamp_meta["noncurrent_fetched"] = len(_noncurrent_fetched_symbols)
+                    res._stamp_meta["ff_new_fetched"] = len(_fetchfail_origin_symbols - _noncurrent_fetched_symbols)
+
         # v6.20.0 (Fix 1b): harvest (page, symbol, price) from the FINAL matrix
         # for the cross-page price-delta report. Read-only; flag-gated; can
         # never affect the write path. Runs in dry-run too (reads the fetched
@@ -14146,8 +14437,8 @@ async def _run_one_task(
         rows_matrix = _present_market_sheet_rows(task.sheet_name, headers, rows_matrix)
         # v6.65.0 (WP-6) WARNINGS-COMPACT seam: off returns the same object
         # with zero side effects; observe counts only; enforce sinks first,
-        # then returns the compacted COPY so _payload_sha8 and the post-write
-        # census see the written payload. Fail-open (never touches the write).
+        # then carries the receipt and compacted COPY into the final writer.
+        # _payload_sha8 continues to identify the input to that writer.
         rows_matrix = _wc_publish_seam(task, res, sheets, spreadsheet_id, headers, rows_matrix)
         _trim_mode = clear_before_write and _write_then_trim_enabled()
         if clear_before_write and not _trim_mode:
@@ -14166,6 +14457,13 @@ async def _run_one_task(
             try:
                 _sm = dict(getattr(res, "_stamp_meta", None) or {})
                 _sm["payload_sha8"] = _payload_sha8(headers, rows_matrix)
+                _written_receipt = getattr(sheets, "_write_receipts", {}).get(
+                    (spreadsheet_id, task.sheet_name))
+                if _written_receipt:
+                    _sm["written_payload_sha8"] = _written_receipt["written_payload_sha8"]
+                    _sm["write_receipt"] = dict(_written_receipt)
+                    if "wc" in _sm and _written_receipt.get("warnings_compact"):
+                        _sm["wc"]["final_status"] = _written_receipt["warnings_compact"]["status"]
                 _sm["pw_flagged"] = int(
                     (_oc_stats_for_readback or {}).get("flagged") or 0)
                 _sm["pw_checked"] = int(

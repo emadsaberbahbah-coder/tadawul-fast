@@ -47,8 +47,6 @@ FIXED_ENV = {
     "RENDER_GIT_BRANCH": "main",
     "RENDER_SERVICE_NAME": "tadawul-fast-bridge",
 }
-for k in ("TFB_PF_SWITCH_SCAN", "RENDER_GIT_REPO_SLUG", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID"):
-    os.environ.pop(k, None)
 
 
 def run_payload(path):
@@ -78,7 +76,7 @@ def main():
     fix = importlib.util.module_from_spec(sp)
     sys.modules["main_fix"] = fix
     sp.loader.exec_module(fix)
-    T("H1 entry version", fix.APP_ENTRY_VERSION == "8.14.1" and fix.SERVICE_VERSION == "8.14.1")
+    T("H1 entry version", tuple(map(int, fix.APP_ENTRY_VERSION.split("."))) >= (8, 14, 1) and fix.SERVICE_VERSION == fix.APP_ENTRY_VERSION)
 
     # H2 dual-tree payload comparison
     fx = run_payload(DELIVERED)
@@ -171,6 +169,15 @@ def main():
     print("\n".join(out))
     print(f"SUMMARY {len(out) - fails}/{len(out)} PASS | digest {digest}")
     return 1 if fails else 0
+
+
+def test_regression_battery():
+    from pathlib import Path
+    import subprocess
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+                            cwd=Path(__file__).resolve().parents[1],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":

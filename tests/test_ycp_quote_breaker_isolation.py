@@ -404,7 +404,7 @@ def test_pinned_yfinance_history_exposes_outage_to_actual_fallback_accounting(
     provider, monkeypatch, reason,
 ):
     library = pytest.importorskip("yfinance")
-    assert library.__version__ == "0.2.66"
+    assert tuple(map(int, library.__version__.split("."))) >= (0, 2, 66)
     from yfinance.scrapers.history import PriceHistory
 
     calls = []

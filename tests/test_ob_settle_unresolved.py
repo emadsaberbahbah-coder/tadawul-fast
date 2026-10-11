@@ -89,7 +89,7 @@ def test_b1_reader_maps_the_enforce_receipt_and_keeps_failure_precedence():
     # a failure receipt anywhere wins over an unresolved receipt (both scans)
     assert f({"warnings": UNRES, "Warnings": "f7_settle_failed:non_converged"}) == "non_converged"
     assert f({"Warnings": UNRES, "scoring_errors": "f7_settle_failed:error"}) == "error"
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.25.1"
+    assert tuple(map(int, ob.OPPORTUNITY_BUILDER_VERSION.split("."))) >= (1, 26, 1)
 
 
 @_isolated

@@ -534,7 +534,14 @@ from __future__ import annotations
 # _fix_metrics_units, _candidate_earnings_guard_enabled, _note_earn_days,
 # _filter_candidates_earnings, _earnings_held_line.
 # ---------------------------------------------------------------------------
-__version__ = "1.17.1"
+# v1.18.0 (2026-10-11) — preserve BLOCK decisions and unknown book amounts.
+# Missing or partial MV/cost inputs remain unavailable rather than becoming
+# zero/partial totals. BLOCK rows retain their source reasons in HTML, text
+# and PDF, stay out of executable/HOLD groups, and remain held for candidate
+# exclusion. Empty/missing-number briefs render without numeric-format crashes.
+# Final feed/Top10 output vetoes also suppress executable claims; candidate
+# parsing is bounded to SELECTED and requires a positive INVEST token.
+__version__ = "1.18.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -611,9 +618,10 @@ PAGE_PORTFOLIO = "My_Portfolio"  # v1.5.0: fetched for position ROI + ratios
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
 PAGE_CALENDAR = "Calendar_Events"  # v1.11.0 (E1): earnings-proximity source
 PAGE_SHADOW = "Shadow_Board"  # v1.15.0: shadow rotation top pair
-ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES + [PAGE_CALENDAR, PAGE_SHADOW]
+PAGE_STATUS = "_Status"  # Final TFB Decision Feed receipt, including L:M globals.
+ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES + [PAGE_CALENDAR, PAGE_SHADOW, PAGE_STATUS]
 
-VALID_ACTIONS = {"EXIT", "SELL", "TRIM", "REDUCE", "ADD", "BUY", "HOLD"}
+VALID_ACTIONS = {"EXIT", "SELL", "TRIM", "REDUCE", "ADD", "BUY", "HOLD", "BLOCK"}
 SELL_ACTIONS = {"EXIT", "SELL"}
 TRIM_ACTIONS = {"TRIM", "REDUCE"}
 ADD_ACTIONS = {"ADD", "BUY"}
@@ -637,7 +645,8 @@ def _num(v: Any) -> Optional[float]:
         s = s.replace(t, "")
     s = s.strip()
     try:
-        return float(s)
+        value = float(s)
+        return value if math.isfinite(value) else None
     except ValueError:
         return None
 
@@ -661,6 +670,25 @@ def _money(x: Optional[float]) -> str:
     if x is None:
         return "—"
     return f"{x:,.0f}"
+
+
+def _book_money(x: Optional[float]) -> str:
+    """Unknown book amounts must not look like zero or a partial total."""
+    return "unavailable" if x is None else _money(x)
+
+
+def _decision_input_notice(d: Dict[str, Any]) -> str:
+    """Explain withheld evidence consistently on every brief surface."""
+    notices = []
+    if d.get("execution_veto"):
+        notices.append("Final decision feed withheld execution: " + d["execution_veto"] + ".")
+    if d.get("block"):
+        notices.append(f"{len(d['block'])} blocked holding(s): input review/reconciliation "
+                       "required before execution; see the source reasons below.")
+    if d.get("mv") is None or d.get("cost") is None or d.get("pl_pct") is None:
+        notices.append("Book totals/P&L unavailable where inputs cannot establish them; refresh/reconcile "
+                       "portfolio inputs before using these totals.")
+    return " ".join(notices)
 
 
 def _esc(v: Any) -> str:
@@ -796,8 +824,9 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
     """Parse Portfolio_Decision -> {actions, totals, freed_cash, add}."""
     rows = _pad(rows)
     h = _find_header(rows, ("action", "symbol"))
-    out: Dict[str, Any] = {"sell": [], "trim": [], "add": [], "hold": [],
-                           "cost": 0.0, "mv": 0.0, "freed_cash": 0.0}
+    out: Dict[str, Any] = {"sell": [], "trim": [], "add": [], "hold": [], "block": [],
+                           "cost": None, "mv": None, "pl_pct": None, "freed_cash": 0.0,
+                           "min_ticket": _min_ticket_sar(), "folded": [], "dropped_small": []}
     if h < 0:
         return out
     hdr = rows[h]
@@ -818,15 +847,19 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
         "tp1": _col_index(hdr, "TP1 SAR", "TP1"),
         "tp2": _col_index(hdr, "TP2 SAR", "TP2"),
     }
+    mv_total = cost_total = 0.0
+    mv_complete = cost_complete = True
+    holdings_count = 0
     for r in rows[h + 1:]:
         action = _s(_cell(r, ci["action"])).upper()
         symbol = _s(_cell(r, ci["symbol"]))
         if action not in VALID_ACTIONS or not symbol or symbol.lower() == "symbol":
             # past the holdings block (section tables follow) -> stop
-            if out["sell"] or out["trim"] or out["add"] or out["hold"]:
+            if holdings_count:
                 break
             continue
         note = _s(_cell(r, ci["note"]))
+        holdings_count += 1
         rec = {
             "symbol": symbol,
             "name": _s(_cell(r, ci["name"])),
@@ -845,10 +878,19 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
         }
         mv, cost = _num(_cell(r, ci["mv"])), _num(_cell(r, ci["cost"]))
         if mv is not None:
-            out["mv"] += mv
+            mv_total += mv
+        else:
+            mv_complete = False
         if cost is not None:
-            out["cost"] += cost
-        if action in SELL_ACTIONS:
+            cost_total += cost
+        else:
+            cost_complete = False
+        if action == "BLOCK":
+            # Preserve the source reason without treating an unreconciled row
+            # as a HOLD or allowing note amounts into today's executable plan.
+            rec["sar"] = 0.0
+            out["block"].append(rec)
+        elif action in SELL_ACTIONS:
             out["sell"].append(rec)
             out["freed_cash"] += rec["sar"] or 0.0
         elif action in TRIM_ACTIONS:
@@ -859,7 +901,10 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
             out["add"].append(rec)  # v1.8.0: floored post-loop by _enforce_min_ticket
         else:
             out["hold"].append(rec)
-    out["pl_pct"] = ((out["mv"] - out["cost"]) / out["cost"] * 100.0) if out["cost"] else None
+    out["mv"] = mv_total if holdings_count and mv_complete else None
+    out["cost"] = cost_total if holdings_count and cost_complete else None
+    if out["mv"] is not None and out["cost"]:
+        out["pl_pct"] = (out["mv"] - out["cost"]) / out["cost"] * 100.0
     # v1.8.0: minimum executable ticket (default 200 SAR; TFB_MIN_TICKET_SAR=0 disables)
     out["min_ticket"] = _min_ticket_sar()
     out["add"], out["folded"], out["dropped_small"] = _enforce_min_ticket(out["add"])
@@ -1340,10 +1385,74 @@ def _earnings_held_line(model: Dict[str, Any]) -> str:
             % (len(held), win, ", ".join(parts)))
 
 
+def _feed_execution_veto(raw: str) -> bool:
+    head = _s(raw).split("|", 1)[0].strip().upper()
+    return bool(re.match(r"^(?:NOT[_ ]ACTIONABLE|WITHHELD)(?:\b|\()", head))
+
+
+def _extract_final_feed(rows: List[List[Any]]) -> str:
+    """Read the exact final feed key, from full _Status grids or L:M reads."""
+    receipts = []
+    for row in rows or []:
+        for i, cell in enumerate(row[:-1]):
+            if _s(cell).lower() == "tfb decision feed":
+                receipts.append(_s(row[i + 1]))
+    # A veto wins over a conflicting older receipt; never promote a plan.
+    return next((raw for raw in receipts if _feed_execution_veto(raw)),
+                receipts[-1] if receipts else "")
+
+
+def _apply_final_feed_veto(d: Dict[str, Any], raw: str) -> None:
+    if not _feed_execution_veto(raw):
+        return
+    d["execution_veto"] = raw
+    for group in ("sell", "trim", "add"):
+        for rec in d[group]:
+            rec["withheld_action"] = group.upper()
+            rec["withheld_note"] = rec.get("note")
+            rec["note"] = f"Final decision feed withheld {group.upper()} execution: {raw}"
+            rec["sar"] = 0.0
+            for key in ("shares", "stop", "tp1", "tp2"):
+                rec[key] = None
+            d["block"].append(rec)
+        d[group] = []
+    d["freed_cash"] = 0.0
+
+
+def _top10_execution_veto(rows: List[List[Any]], final_feed: str) -> str:
+    if _feed_execution_veto(final_feed):
+        return "Final decision feed: " + final_feed
+    for row in rows[:40]:
+        first = _s(row[0]) if row else ""
+        if first.lower() == "status:":
+            status = " ".join(_s(c) for c in row[1:])
+            match = re.search(r"\boutput:\s*([A-Z_]+)", status, re.I)
+            if match and match.group(1).upper() != "EXECUTABLE":
+                return "Top10 final output: " + match.group(1).upper()
+            if re.search(r"\bstatus:\s*(?:WITHHELD|NOT_ACTIONABLE)\b", status, re.I):
+                return "Top10 decision status withheld"
+            if re.search(r"\bboard\s+0\s+exec\b", status, re.I):
+                return "Top10 final board: 0 executable tickets"
+        if "SELECTED" in first.upper() and (
+                re.search(r"NOT[_ ]ACTIONABLE|SIZING WITHHELD|\b0\s+EXECUTABLE\b", first, re.I)):
+            return "Top10 selected board: " + first
+    return ""
+
+
+def _positive_invest_note(note: str) -> bool:
+    prefix = note.upper()
+    if re.search(r"\b(?:DO[ _-]*NOT[ _-]*INVEST|NOT[ _-]*INVEST|NO[ _-]*INVEST|NOT_ACTIONABLE|WITHHELD|SUSPENDED|RESEARCH)\b", prefix):
+        return False
+    return bool(re.match(r"^(?:⚠\ufe0f?\s*EARNINGS\s*(?:≤|<=)\s*\d+\s*D\s*[·|:]\s*)?INVEST\b", prefix))
+
+
 def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
-                  top_n: int = 5) -> Dict[str, Any]:
-    """Parse Top_10_Investments funded picks (Advisor Note starts with INVEST)."""
+                  top_n: int = 5, final_feed: str = "") -> Dict[str, Any]:
+    """Read executable SELECTED rows, preserving the final publication veto."""
     rows = _pad(rows)
+    veto = _top10_execution_veto(rows, final_feed)
+    if veto:
+        return {"top": [], "rest": {}, "withheld_reason": veto}
     exclude = {e.upper() for e in (exclude or set())}
     h = _find_header(rows, ("rank", "symbol"))
     if h < 0:
@@ -1351,6 +1460,11 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
     picks: List[Dict[str, Any]] = []
     if h < 0:
         return {"top": [], "rest": {}}
+    # A qualified/research table is never a substitute for SELECTED. Legacy
+    # exports with a single bare table remain readable.
+    if any(re.search(r"ALL QUALIFIED|CANDIDATES|NEAR MISS|DATA GAPS", _s(r[0]), re.I)
+           for r in rows[:h] if r):
+        return {"top": [], "rest": {}, "withheld_reason": "No executable SELECTED table"}
     hdr = rows[h]
     ci = {
         "symbol": _col_index(hdr, "Symbol"),
@@ -1365,15 +1479,22 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
         "entry": _col_index(hdr, "Entry Zone", "Entry"),   # v1.16.0 [L]
         "stop": _col_index(hdr, "Stop SAR", "Stop"),
         "tp1": _col_index(hdr, "TP1 SAR", "TP1"),
+        "shares": _col_index(hdr, "Shares"),
+        "stability": _col_index(hdr, "Stability"),
     }
     for r in rows[h + 1:]:
         note = _s(_cell(r, ci["note"]))
         symbol = _s(_cell(r, ci["symbol"]))
-        if not symbol:
-            continue
+        if not symbol or symbol.lower() == "symbol":
+            break  # spacer, empty-table marker or another table's header
         # v1.13.0: tag-tolerant — v1.6.0 prefixes "⚠ earnings ≤Nd · " before
         # INVEST; grace/exit notes carry no INVEST and stay excluded.
-        if "INVEST" not in note.upper()[:60]:
+        if not _positive_invest_note(note):
+            continue
+        if ci["shares"] is not None and (_num(_cell(r, ci["shares"])) or 0) <= 0:
+            continue
+        if re.search(r"GRACE|FAST-TRACK|SUSPENDED|RESEARCH|NO ALLOCATION",
+                     _s(_cell(r, ci["stability"])), re.I):
             continue
         if symbol.upper() in exclude:
             continue
@@ -1456,13 +1577,15 @@ def _shadow_rotation_html(model: Dict[str, Any]) -> str:
     pair whose SELL leg is still held; annotates when none matches."""
     if not _shadow_rotation_enabled():
         return ""
+    if (model.get("decision") or {}).get("execution_veto"):
+        return ""
     sh = model.get("shadow") or {}
     pairs = sh.get("pairs") or []
     if not pairs:
         return ""
     d = model.get("decision") or {}
     held = set()
-    for grp in ("sell", "trim", "add", "hold", "verify"):
+    for grp in ("sell", "trim", "add", "hold", "verify", "block"):
         for r in d.get(grp) or []:
             held.add(_s(r.get("symbol")).upper())
     # v1.15.1 (H2): prefer a pair that is a genuine ROTATION — sell leg held,
@@ -1830,6 +1953,8 @@ def _ticket_flags_html(sym: str, model: Dict[str, Any],
 # ----------------------------------------------------------------------------- #
 def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     decision = extract_decision(pages_data.get(PAGE_DECISION, []))
+    final_feed = _extract_final_feed(pages_data.get(PAGE_STATUS, []))
+    _apply_final_feed_veto(decision, final_feed)
     metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
     # v1.17.0 (D1) [UNIT-COHERENCE]: price-anchored unit repair — see WHY.
     if _unit_coherence_enabled():
@@ -1843,8 +1968,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     # v1.10.0 (BR-1): send-time coherence guard — demote ADD/EXIT recs whose
     # decision-layer signal disagrees with the freshest per-symbol reading.
     _apply_signal_coherence(decision, metrics)
-    held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify") for r in decision[grp]}
-    top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held)
+    held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify", "block") for r in decision[grp]}
+    top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held, final_feed=final_feed)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
     # v1.11.0 (E1): earnings-proximity source.
     calendar = _extract_calendar(pages_data.get(PAGE_CALENDAR, []))
@@ -2090,40 +2215,44 @@ def _range52_bar(m: Optional[Dict[str, Any]]) -> str:
 
 def _glance_block(d: Dict[str, Any]) -> str:
     """v1.3.0: diverging unrealized-P&L bar per holding + weight column."""
-    holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or [])
+    holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or []) + (d.get("block") or [])
 
     def v(r: Dict[str, Any]) -> float:
         # v1.6.0 (B1): percent-POINTS as stored; the old <=1.5 fraction guess
         # inflated real small P&Ls x100 and set the whole bar scale to 150%.
         return float(r["pl"])
 
-    rows = sorted([r for r in holdings if r.get("pl") is not None], key=v, reverse=True)
+    measured = sorted([r for r in holdings if r.get("pl") is not None], key=v, reverse=True)
+    rows = measured + [r for r in holdings if r.get("pl") is None]
     if not rows:
         return ""
-    maxabs = max(abs(v(r)) for r in rows) or 1.0
+    maxabs = max((abs(v(r)) for r in measured), default=0.0) or 1.0
+    scale_note = (f"Bars are scaled to the largest move ({maxabs:.0f}%). " if measured else "")
+    scale_note += "Unavailable P&amp;L has no bar. Right column is each name's share of the book."
     trs = []
     for r in rows:
-        val = v(r)
-        w = min(100.0, abs(val) / maxabs * 100.0)
+        val = v(r) if r.get("pl") is not None else None
+        w = min(100.0, abs(val) / maxabs * 100.0) if val is not None else 0.0
         neg = (f'<div style="margin-left:{max(0.0, 100 - w):.0f}%; width:{w:.0f}%; height:10px; '
-               f'background:{SELL_C}; font-size:0; line-height:0;">&nbsp;</div>') if val < 0 else ""
+               f'background:{SELL_C}; font-size:0; line-height:0;">&nbsp;</div>') if val is not None and val < 0 else ""
         pos_ = (f'<div style="width:{max(w, 1.0):.0f}%; height:10px; background:{ADD_C}; '
-                f'font-size:0; line-height:0;">&nbsp;</div>') if val > 0 else ""
+                f'font-size:0; line-height:0;">&nbsp;</div>') if val is not None and val > 0 else ""
         wt_s = _pct(r.get("weight"), 1).lstrip("+") if r.get("weight") is not None else "—"
-        col = SELL_C if val < 0 else ADD_C
+        col = HOLD_C if val is None else (SELL_C if val < 0 else ADD_C)
+        pl_s = "unavailable" if val is None else _pct(val)
         trs.append(
             f'<tr style="font-family:{SANS};">'
             f'<td style="padding:5px 10px; font-size:12px; color:#1A1A1A; width:92px; border-bottom:1px solid #EFECE4;"><strong>{_esc(r["symbol"])}</strong></td>'
             f'<td width="29%" style="padding:5px 0; border-bottom:1px solid #EFECE4; border-right:1px solid #C9C4B8;">{neg}</td>'
             f'<td width="29%" style="padding:5px 0; border-bottom:1px solid #EFECE4;">{pos_}</td>'
-            f'<td align="right" style="padding:5px 10px; font-size:12px; color:{col}; width:66px; border-bottom:1px solid #EFECE4;"><strong>{val:+.1f}%</strong></td>'
+            f'<td align="right" style="padding:5px 10px; font-size:12px; color:{col}; width:66px; border-bottom:1px solid #EFECE4;"><strong>{pl_s}</strong></td>'
             f'<td align="right" style="padding:5px 10px; font-size:11px; color:#8A8A8A; width:56px; border-bottom:1px solid #EFECE4;">{wt_s}</td>'
             f'</tr>')
     return f"""
   <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {BRASS}; padding-bottom:6px;">Your book at a glance <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">UNREALIZED&nbsp;P&amp;L&nbsp;PER&nbsp;HOLDING&nbsp;·&nbsp;WEIGHT</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FCFBF7; border:1px solid #E6E1D6;">{''.join(trs)}</table>
-    <div style="font-family:{SANS}; font-size:10px; color:#A09B90; padding:5px 2px 0 2px;">Bars are scaled to the largest move ({maxabs:.0f}%). Right column is each name's share of the book.</div>
+    <div style="font-family:{SANS}; font-size:10px; color:#A09B90; padding:5px 2px 0 2px;">{scale_note}</div>
   </td></tr>"""
 
 
@@ -2274,6 +2403,28 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                      'no buy clears it either. Your holdings stay as they are; the opportunity list '
                      'below is for monitoring.')
 
+    input_notice = _decision_input_notice(d)
+    if (d.get("execution_veto") or d.get("block")) and not (d["sell"] or d["trim"] or d["add"]):
+        preheader = "Portfolio inputs require review/reconciliation before execution."
+        hero_title = ('Final decision feed withheld execution' if d.get("execution_veto") else
+                      'Review/reconcile portfolio inputs before acting')
+        hero_body = ('The decision feed withheld execution. ' if d.get("execution_veto") else
+                     'The decision layer withheld execution for blocked holdings. ') + (
+                     'Review the source reasons below and reconcile the missing inputs; '
+                     'this brief cannot establish a current executable portfolio plan.')
+    elif d.get("mv") is None and not (d["sell"] or d["trim"] or d["add"] or d["hold"] or d.get("verify")):
+        preheader = "Portfolio decision unavailable — refresh/reconcile inputs before acting."
+        hero_title = 'Portfolio decision unavailable'
+        hero_body = ('No current holdings decision could be read. Refresh/reconcile portfolio '
+                     'inputs before relying on this brief for a portfolio action.')
+    action_heading = "Act now"
+    action_chip = "HIGH-CONFIDENCE CALLS"
+    hero_disclaimer = "All high-confidence calls. A plan for your decision, not an instruction."
+    if not (d["sell"] or d["trim"] or d["add"]) and (d.get("execution_veto") or d.get("block") or d.get("mv") is None):
+        action_heading = "Portfolio execution withheld" if d.get("execution_veto") or d.get("block") else "Portfolio execution unavailable"
+        action_chip = "INPUT REVIEW REQUIRED"
+        hero_disclaimer = "Execution withheld pending input review."
+
     # ---- action rows ----
     sell_rows = "".join(
         _action_row(r, "EXIT" if r else "EXIT", SELL_C, "#FBEEEC", "#EBD5D1",
@@ -2307,11 +2458,25 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     {verify_rows}
   </td></tr>""" if d.get("verify") else "")
 
+    blocked_rows = "".join(
+        _action_row(r, "BLOCK", SELL_C, "#FBEEEC", "#EBD5D1",
+                    _esc(r.get("note") or "Input review/reconciliation required; do not execute."),
+                    "Do not execute", "input review required", SELL_C)
+        for r in d.get("block", []))
+    blocked_block = (f"""
+  <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{SELL_C}; border-bottom:2px solid {SELL_C}; padding-bottom:6px;">Blocked &mdash; input review/reconciliation required</div></td></tr>
+  <tr><td style="padding:10px 32px 0 32px;">{blocked_rows}</td></tr>""" if blocked_rows else "")
+
     hold_rows = "".join(_hold_row(r) for r in d["hold"])
     # v1.14.1: hold copy composed from the actual reason mix.
     hold_chip, hold_intro = _hold_section_copy(d)
 
     # ---- opportunities ----
+    opp_heading = "New opportunities withheld" if t.get("withheld_reason") else "Best new buys"
+    opp_chip = "FINAL OUTPUT NOT EXECUTABLE" if t.get("withheld_reason") else "ALL MARKETS · WHERE YOUR DRY POWDER GOES"
+    opp_intro = (_esc(t["withheld_reason"]) + ". No executable new-buy candidates are shown."
+                 if t.get("withheld_reason") else
+                 'Ranked entry candidates you <strong>don\'t hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strip under each name is the engine\'s valuation path with its stated reliability — <strong>targets, not predictions</strong>. Full entry/stop/target levels are in your Top&nbsp;10 sheet.')
     # v1.9.0: judge FV saturation on EVERYTHING shown (top + rest), once.
     _all_shown = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
                                    for p in names]
@@ -2327,7 +2492,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
     # ---- v1.14.0 (F1): why-zero funnel (renders ONLY on an empty buy list)
     funnel_html = ""
-    if _funnel_enabled() and not t["top"]:
+    if _funnel_enabled() and not t["top"] and not t.get("withheld_reason"):
         _fu = model.get("funnel") or {}
         if _fu.get("scanned") is not None:
             # v1.15.1 (H1): the universe count leads and is named honestly —
@@ -2375,22 +2540,24 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px; border:1px solid #C9D2C4; border-left:4px solid {ADD_C}; background:#F2F8F4;"><tr><td style="padding:18px 20px;">
       <div style="font-family:{SERIF}; font-size:20px; color:#1A1A1A; line-height:1.4;">{hero_title}</div>
       <div style="font-family:{SANS}; font-size:14px; color:#4A4A4A; line-height:1.65; margin-top:8px;">{hero_body}</div>
-      <div style="font-family:{SANS}; font-size:12px; color:#888; line-height:1.6; margin-top:10px; padding-top:9px; border-top:1px dashed #CDD8CC;">All high-confidence calls. A plan for your decision, not an instruction.</div>
+      <div style="font-family:{SANS}; font-size:12px; color:#888; line-height:1.6; margin-top:10px; padding-top:9px; border-top:1px dashed #CDD8CC;">{hero_disclaimer}</div>
     </td></tr></table>
   </td></tr>
 
   <tr><td style="padding:18px 32px 4px 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F4EF; border:1px solid #E6E1D6;"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:13px; color:#3A3A3A; line-height:1.7;">
-      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_money(d['mv'])} vs {_money(d['cost'])}&nbsp;SAR). {_book_snapshot_hold_phrase(d)} {_concentration(d)}
+      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])+len(d.get('block') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_book_money(d['mv'])} vs {_book_money(d['cost'])}&nbsp;SAR). {_book_snapshot_hold_phrase(d)} {_concentration(d)} {_esc(input_notice)}
     </td></tr></table>
   </td></tr>
 
 {glance_block}
 
-  <tr><td style="padding:22px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">Act now <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">HIGH-CONFIDENCE CALLS</span></div></td></tr>
+  <tr><td style="padding:22px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">{action_heading} <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">{action_chip}</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">{sell_rows}{trim_rows}{add_rows}</td></tr>
 
 {verify_block}
+
+{blocked_block}
 
   <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Hold &mdash; no action <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">{hold_chip}</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
@@ -2398,9 +2565,9 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F0F2F4; border:1px solid #DDE2E7;">{hold_rows}</table>
   </td></tr>
 
-  <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#0E7C5A; border-bottom:2px solid {ADD_C}; padding-bottom:6px;">Best new buys <span style="font-family:{SANS}; font-size:11px; color:#8A958E; letter-spacing:0.5px;">ALL MARKETS · WHERE YOUR DRY POWDER GOES</span></div></td></tr>
+  <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#0E7C5A; border-bottom:2px solid {ADD_C}; padding-bottom:6px;">{opp_heading} <span style="font-family:{SANS}; font-size:11px; color:#8A958E; letter-spacing:0.5px;">{opp_chip}</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
-    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">Ranked entry candidates you <strong>don't hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strip under each name is the engine's valuation path with its stated reliability — <strong>targets, not predictions</strong>. Full entry/stop/target levels are in your Top&nbsp;10 sheet.</div>
+    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">{opp_intro}</div>
     {funnel_html}{opp_rows}{rest_block}
     {('<div style="font-family:' + SANS + '; font-size:11px; color:#B26B00; line-height:1.6; padding:8px 2px 0 2px;">&#9888;&#65039; ' + _esc(_earnings_held_line(model)) + '</div>') if _earnings_held_line(model) else ''}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
@@ -2650,6 +2817,7 @@ def _summary_table_html(model: Dict[str, Any]) -> str:
               ("TRIM", d["trim"], TRIM_C, True),
               ("ADD / BUY", d["add"], ADD_C, True),
               ("VERIFY", d.get("verify", []), "#8A6D1F", False),
+              ("BLOCK", d.get("block", []), SELL_C, False),
               ("HOLD", d["hold"], HOLD_C, False))
     body = ""
     for label, recs, color, cash in groups:
@@ -2670,7 +2838,7 @@ def _summary_table_html(model: Dict[str, Any]) -> str:
              f'<td align="right" style="padding:7px 10px; font-family:{SANS}; font-size:11px; color:#8C97A3;">&mdash;</td>'
              f'</tr>')
     pl = _pct(d.get("pl_pct")) if d.get("pl_pct") is not None else "&mdash;"
-    totals = (f'Book <strong>{_money(d["mv"])}&nbsp;SAR</strong> &nbsp;&middot;&nbsp; '
+    totals = (f'Book <strong>{_book_money(d["mv"])}&nbsp;SAR</strong> &nbsp;&middot;&nbsp; '
               f'P&amp;L <strong>{pl}</strong> &nbsp;&middot;&nbsp; '
               f'Freed cash <strong>~{_money(d["freed_cash"])}&nbsp;SAR</strong>')
     return f"""  <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">Action summary <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">EVERYTHING ABOVE, AT A GLANCE</span></div></td></tr>
@@ -2726,7 +2894,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
     try:
         d = model["decision"]; t = model["top10"]
         mx: Dict[str, Dict[str, Any]] = model.get("metrics", {}) or {}
-        holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or [])
+        holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or []) + (d.get("block") or [])
 
         ink = colors.HexColor(INK); brass = colors.HexColor(BRASS)
         grid = colors.HexColor("#DAD5CA"); zebra = colors.HexColor("#F6F4EF")
@@ -2817,7 +2985,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         _n_actions = (len(d["sell"]) + len(d["trim"]) + len(d["add"])
                       + len(d.get("verify", [])))
         _lv = _brief_levels_enabled()
-        kpis = [("BOOK VALUE", f"{d['mv']:,.0f} SAR", gray6),
+        kpis = [("BOOK VALUE", f"{_book_money(d['mv'])} SAR", gray6),
                 ("CURRENT ROI", _p(pl), (green if (pl or 0) >= 0 else red)),
                 ("FREED CASH", f"~{d['freed_cash']:,.0f} SAR", gray6),
                 ("HOLDINGS", str(len(holdings)), gray6),
@@ -2840,6 +3008,8 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         story.append(Paragraph("Actions come from the confidence-gated Portfolio_Decision layer. "
                                "Daily-horizon decision support - not advice; verify before acting.",
                                st_note))
+        if _decision_input_notice(d):
+            story.append(Paragraph(_esc(_decision_input_notice(d)), st_note))
         rows: List[List[Any]] = ([["Action", "Symbol", "P&L %", "Wt %",
                                    "Rel /100", "Stop", "TP1", "Note"]] if _lv
                                  else [["Action", "Symbol", "Name", "P&L %",
@@ -2848,6 +3018,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         for label, recs, hexc in (("EXIT/SELL", d["sell"], SELL_C), ("TRIM", d["trim"], TRIM_C),
                                   ("ADD", d["add"], ADD_C),
                                   ("VERIFY", d.get("verify", []), TRIM_C),
+                                  ("BLOCK", d.get("block", []), SELL_C),
                                   ("HOLD", d["hold"], HOLD_C)):
             for r in recs:
                 if _lv:
@@ -2920,8 +3091,12 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
                            style=_base([("ALIGN", (1, 1), (-1, -1), "RIGHT")])))
 
         # ---- 4) Best new buys ----
-        story.append(Paragraph("4 - Best new buys (all markets)", st_h2))
-        story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the gap to "
+        story.append(Paragraph("4 - New opportunities withheld" if t.get("withheld_reason") else
+                               "4 - Best new buys (all markets)", st_h2))
+        if t.get("withheld_reason"):
+            story.append(Paragraph(_esc(t["withheld_reason"]) + ". No executable new-buy candidates are shown.", st_note))
+        else:
+            story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the gap to "
                                "estimated fair value - a valuation target, not a prediction; "
                                "reliability and confidence show how much weight to give each.", st_note))
         # v1.17.0 (D2): earnings-held note.
@@ -2989,6 +3164,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
                                         ("TRIM", d["trim"], TRIM_C, True),
                                         ("ADD / BUY", d["add"], ADD_C, True),
                                         ("VERIFY", d.get("verify", []), TRIM_C, False),
+                                        ("BLOCK", d.get("block", []), SELL_C, False),
                                         ("HOLD", d["hold"], HOLD_C, False)):
             sar = _grp_cash(recs)
             rows5.append([label, str(len(recs)),
@@ -3001,7 +3177,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
                       _pdf_txt(", ".join(p["symbol"] for p in t["top"]) or "-", 88), "-"])
         story.append(Table(rows5, colWidths=[34*mm, 8*mm, 106*mm, 32*mm], repeatRows=1,
                            style=_base(extra5)))
-        story.append(Paragraph(_pdf_txt(f"Book {d['mv']:,.0f} SAR  |  Current ROI {_p(pl)}  |  "
+        story.append(Paragraph(_pdf_txt(f"Book {_book_money(d['mv'])} SAR  |  Current ROI {_p(pl)}  |  "
                                         f"Freed cash ~{d['freed_cash']:,.0f} SAR", 120), st_note))
 
         story.append(Paragraph("Prepared from your own screening engine for monitoring and decision "
@@ -3057,9 +3233,17 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                  if dry >= 1 else "; freed cash fully deployed.")
         lines.append(f"  Free ~{freed:,.0f} SAR (exit/trim below); fund {_adds_txt} SAR"
                      f" (~{_adds_total:,.0f} total){_tail}")
+    elif d.get("execution_veto"):
+        lines.append("  Final decision feed withheld execution; no executable portfolio plan is shown.")
+    elif d.get("block"):
+        lines.append("  Portfolio inputs require review/reconciliation; do not execute blocked holdings.")
+    elif d.get("mv") is None and not (d["sell"] or d["trim"] or d["hold"] or d.get("verify")):
+        lines.append("  Portfolio decision unavailable; refresh/reconcile inputs before acting.")
     else:
         lines.append("  No high-confidence portfolio action today.")
-    lines += ["", f"BOOK: {d['pl_pct']:+.1f}% overall ({d['mv']:,.0f} vs {d['cost']:,.0f} SAR)", ""]
+    lines += ["", f"BOOK: {_pct(d.get('pl_pct'))} overall ({_book_money(d.get('mv'))} vs {_book_money(d.get('cost'))} SAR)", ""]
+    if _decision_input_notice(d):
+        lines += [_decision_input_notice(d), ""]
     # v1.7.0 (A): one-line data-vintage summary (dominant dates per page).
     _vin_t = model.get("vintage", {}) or {}
     _vparts: List[str] = []
@@ -3112,6 +3296,13 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                 lines.append(f"       {_nlv}")
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
+    if d.get("block"):
+        lines.append("BLOCK (input review/reconciliation required - do NOT execute):")
+        for r in d["block"]:
+            lines.append(f"       {r['symbol']}: {r.get('note') or 'Review/reconcile portfolio inputs.'}")
+    if t.get("withheld_reason"):
+        lines += ["", "NEW OPPORTUNITIES WITHHELD: " + t["withheld_reason"],
+                  "  No executable new-buy candidates are shown."]
     if t["top"]:
         _sat_t = _fv_saturation(list(t["top"]))
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
@@ -3133,6 +3324,7 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     for label, grp, cash in (("EXIT/SELL", d["sell"], True), ("TRIM", d["trim"], True),
                              ("ADD", d["add"], True),
                              ("VERIFY", d.get("verify", []), False),
+                             ("BLOCK", d.get("block", []), False),
                              ("HOLD", d["hold"], False)):
         if not grp:
             continue
@@ -3142,7 +3334,7 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     if t["top"]:
         lines.append(f"  NEW BUYS: {len(t['top'])} - " + ", ".join(p["symbol"] for p in t["top"]))
     _pl = f"{d['pl_pct']:+.1f}%" if d.get("pl_pct") is not None else "-"
-    lines.append(f"  BOOK: {d['mv']:,.0f} SAR | P&L {_pl} | freed cash ~{d['freed_cash']:,.0f} SAR")
+    lines.append(f"  BOOK: {_book_money(d.get('mv'))} SAR | P&L {_pl} | freed cash ~{d['freed_cash']:,.0f} SAR")
     lines += ["", "When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US 16:30-23:00 - "
               "Europe ~10:00-19:30 - Tokyo/HK early morning.", ""]
     return "\n".join(lines)

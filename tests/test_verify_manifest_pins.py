@@ -42,6 +42,14 @@ _VERIFIER = _REPO / "scripts" / "verify_deployment.py"
 
 # module dotted path -> file, for the MODULES manifest
 _MODULE_FILES = {
+    "main": "main.py",
+    'core.price_precision': 'core/price_precision.py',
+    'core.symbols.crypto_identity': 'core/symbols/crypto_identity.py',
+    'core.symbols.normalize': 'core/symbols/normalize.py',
+    'core.analysis.identity_guard': 'core/analysis/identity_guard.py',
+    'core.surface_action_invariants': 'core/surface_action_invariants.py',
+    'scripts.performance_math': 'scripts/performance_math.py',
+
     "core.analysis.insights_builder": "core/analysis/insights_builder.py",
     "core.compliance_gate": "core/compliance_gate.py",
     "core.shariah_authority": "core/shariah_authority.py",
@@ -62,6 +70,7 @@ _MODULE_FILES = {
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",
     "core.analysis.portfolio_actions": "core/analysis/portfolio_actions.py",
     "routes.advanced_analysis": "routes/advanced_analysis.py",
+    "routes.analysis_sheet_rows": "routes/analysis_sheet_rows.py",
     "core.analysis.top10_selector": "core/analysis/top10_selector.py",
     "core.providers.yahoo_chart_provider": "core/providers/yahoo_chart_provider.py",
     "core.providers.eodhd_provider": "core/providers/eodhd_provider.py",
@@ -72,7 +81,7 @@ _MODULE_FILES = {
 
 # the SCRIPTS manifest checks SCRIPT_VERSION, falling back to __version__
 # (the calendar_sync convention the verifier itself documents).
-_SCRIPT_ATTRS = ("SCRIPT_VERSION", "__version__")
+_SCRIPT_ATTRS = ("SCRIPT_VERSION", "__version__", "VERSION")
 
 
 def _string_const(path: Path, name: str) -> str | None:

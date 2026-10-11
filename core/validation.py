@@ -1,7 +1,12 @@
 """
 core/validation.py — TFB Gen-2 Statistical Validation Harness
 ==============================================================
-VERSION 1.0.0  (2026-07-19)  — NEW MODULE (Wave B foundation, deliverable #19)
+VERSION 1.0.1 (2026-10-11) — PAST-ONLY EMBARGO CONTRACT CLARIFIED
+
+WHY (WP-14, 2026-10-10 brief): the unused embargo length suggested leakage.
+Every fold already excludes all observations after its test block. Therefore
+every post-test embargo interval is excluded by construction. Remove only the
+unused local and correct the documentation; split indices remain identical.
 
 WHY (Master Plan v2.1 §8, and the standing constraint that "every event->sector
 and theme->rotation linkage requires a registered hypothesis + backtest before
@@ -21,7 +26,8 @@ WHAT IT ENFORCES:
   1. PURGED WALK-FORWARD + EMBARGO. Overlapping forward-return labels leak:
      a 1M label on day t overlaps every label from t-29..t+29. Naive k-fold
      therefore trains on the future. Splits purge overlapping observations
-     and apply an embargo after each test block (Lopez de Prado's method).
+     and exclude all future training observations. A post-test embargo is
+     consequently satisfied for any length, without a separate cutoff.
   2. EFFECTIVE SAMPLE SIZE. 200 overlapping 30-day returns are NOT 200
      independent observations; the induced MA(h-1) structure inflates every
      t-stat. ESS is computed from the actual overlap autocorrelation, and the
@@ -48,7 +54,7 @@ import itertools
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 VALIDATION_VERSION = __version__
 
 EULER_GAMMA = 0.5772156649015329
@@ -140,16 +146,21 @@ def purged_walk_forward_splits(n: int, n_splits: int = 5, horizon: int = 30,
                                embargo_pct: float = 0.01
                                ) -> List[Tuple[List[int], List[int]]]:
     """Forward-chaining splits. Training indices that OVERLAP the test block's
-    label window are purged; an embargo of `embargo_pct * n` observations
-    after the test block is also removed. -> [(train_idx, test_idx), ...]
+    label window are purged. -> [(train_idx, test_idx), ...]
 
     Train is strictly past-only (walk-forward): a model is never fitted on
-    observations that postdate its test block."""
+    observations that postdate its test block. This excludes every post-test
+    embargo interval regardless of its length; ``embargo_pct`` remains a
+    compatibility argument and does not change these past-only folds. A
+    future two-sided CV implementation must apply its own explicit embargo.
+    """
     n = int(n)
     if n <= 0 or n_splits < 2:
         return []
     fold = max(1, n // (n_splits + 1))
-    embargo = int(math.ceil(max(0.0, embargo_pct) * n))
+    # Preserve legacy argument validation (e.g. infinity/type errors) even
+    # though the length cannot change a past-only fold. No unused local.
+    int(math.ceil(max(0.0, embargo_pct) * n))
     h = max(0, int(horizon) - 1)
     out: List[Tuple[List[int], List[int]]] = []
     for k in range(1, n_splits + 1):
@@ -161,8 +172,7 @@ def purged_walk_forward_splits(n: int, n_splits: int = 5, horizon: int = 30,
         # purge: drop training points whose label window reaches the test block
         purge_from = max(0, test_start - h)
         train_idx = [i for i in range(0, purge_from)]
-        # embargo is enforced by walk-forward (nothing after test is used),
-        # but is recorded so the caller can widen it for anytime-CV variants.
+        # All post-test indices, including any embargo interval, are absent.
         if train_idx:
             out.append((train_idx, test_idx))
     return out

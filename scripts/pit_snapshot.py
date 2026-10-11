@@ -2,7 +2,7 @@
 # scripts/pit_snapshot.py
 """
 ================================================================================
-PIT Snapshot — v1.0.0 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
+PIT Snapshot — v1.1.1 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
 ================================================================================
 NEW script (window whitelist W-6, scheduled Jul 22–24; adopted 2026-07-20).
 
@@ -33,7 +33,7 @@ after the US close so each day's row set carries full-day data)
        counts — silent failure impossible; the seven-gate audit reads it.
 
 GROWTH HONESTY
-    ~50 symbols × 16 columns × 365 days ≈ 300k cells/year — comfortably
+    ~50 symbols × 24 columns × 365 days ≈ 438k cells/year — comfortably
     inside Sheets limits for the stopgap's lifetime; the Postgres store
     inherits this tab as its seed corpus.
 
@@ -107,10 +107,13 @@ from zoneinfo import ZoneInfo
 #   (phase_ii_synthetic vs provider_target). Without it in the archive, a
 #   matured miss gets blamed on the model when the input was the fault.
 #   MIGRATION: an existing 16-column tab has its header row rewritten in place
-#   to the 24-column set. Historical rows keep 16 values and the new columns
-#   stay blank for them — which is the honest record: those fields were never
-#   captured, and back-filling them would invent evidence.
-__version__ = "1.1.0"
+#   to the 24-column set. Historical rows keep 16 values: their timestamps
+#   occupy the new Forecast Source/Reliability columns until repaired.
+# v1.1.1 WHY (2026-10-11): document that migration accurately. The separate
+#   repair_pit_legacy_rows planner moves only the two original timestamps to
+#   their 24-column destinations. Uncaptured diagnostic values remain blank;
+#   this writer's append and duplicate-guard behavior is unchanged.
+__version__ = "1.1.1"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Snapshot Date", "Symbol", "Source Page", "Price", "Market Cap",
@@ -435,9 +438,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
         else:
             # v1.1.0 HEADER MIGRATION, once. An existing 16-column tab is
-            # widened to 24 in place. Historical rows keep their 16 values and
-            # the new columns stay BLANK for them -- those fields were never
-            # captured, and back-filling them would invent evidence.
+            # widened to 24 in place. Historical rows retain their 16 values,
+            # leaving timestamps under Forecast Source/Reliability. The
+            # separate operator-run repair tool realigns these original
+            # values; diagnostic fields were never captured and stay blank.
             try:
                 cur = (existing[0] if existing else []) or []
                 cur = [str(c or "").strip() for c in cur]
@@ -445,7 +449,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         and len(cur) < len(HEADERS):
                     ws.update(values=[HEADERS], range_name="A1")
                     _out(f"header migrated {len(cur)} -> {len(HEADERS)} cols "
-                         f"(historical rows keep blanks in the new columns)")
+                         f"(historical timestamps require separate realignment)")
             except Exception as e:  # noqa: BLE001
                 _out(f"WARN: header migration skipped ({e}); append continues")
         if rows:

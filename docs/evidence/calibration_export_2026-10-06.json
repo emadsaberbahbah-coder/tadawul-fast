@@ -1,0 +1,344 @@
+{
+  "by_horizon_page": [
+    {
+      "breakeven": 3,
+      "brier": 0.28893958,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 54.26407,
+      "brier_n": 860,
+      "brier_realized_win_rate_pct": 49.186047,
+      "calibration_gap_pp": 5.078023,
+      "decided": 860,
+      "horizon": "1M",
+      "losses": 437,
+      "matured": 863,
+      "missing_or_invalid_reliability": 0,
+      "page": "Decision_Coverage",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        45.855834,
+        52.523499
+      ],
+      "win_rate_pct": 49.186047,
+      "wins": 423
+    },
+    {
+      "breakeven": 48,
+      "brier": 0.26848397,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 55.215494,
+      "brier_n": 3156,
+      "brier_realized_win_rate_pct": 56.115336,
+      "calibration_gap_pp": -0.899842,
+      "decided": 3156,
+      "horizon": "1M",
+      "losses": 1385,
+      "matured": 3204,
+      "missing_or_invalid_reliability": 0,
+      "page": "Top_10_Investments",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        54.37762,
+        57.838182
+      ],
+      "win_rate_pct": 56.115336,
+      "wins": 1771
+    },
+    {
+      "breakeven": 12,
+      "brier": 0.31648033,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 58.113656,
+      "brier_n": 1362,
+      "brier_realized_win_rate_pct": 32.15859,
+      "calibration_gap_pp": 25.955066,
+      "decided": 1362,
+      "horizon": "1W",
+      "losses": 924,
+      "matured": 1374,
+      "missing_or_invalid_reliability": 0,
+      "page": "Decision_Coverage",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        29.73116,
+        34.68638
+      ],
+      "win_rate_pct": 32.15859,
+      "wins": 438
+    },
+    {
+      "breakeven": 85,
+      "brier": 0.26690194,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 53.722442,
+      "brier_n": 1925,
+      "brier_realized_win_rate_pct": 51.220779,
+      "calibration_gap_pp": 2.501662,
+      "decided": 1925,
+      "horizon": "1W",
+      "losses": 939,
+      "matured": 2010,
+      "missing_or_invalid_reliability": 0,
+      "page": "Top_10_Investments",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        48.987651,
+        53.449045
+      ],
+      "win_rate_pct": 51.220779,
+      "wins": 986
+    },
+    {
+      "breakeven": 4,
+      "brier": 0.31944688,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 57.735133,
+      "brier_n": 1130,
+      "brier_realized_win_rate_pct": 32.654867,
+      "calibration_gap_pp": 25.080265,
+      "decided": 1130,
+      "horizon": "2W",
+      "losses": 761,
+      "matured": 1134,
+      "missing_or_invalid_reliability": 0,
+      "page": "Decision_Coverage",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        29.9834,
+        35.443865
+      ],
+      "win_rate_pct": 32.654867,
+      "wins": 369
+    },
+    {
+      "breakeven": 51,
+      "brier": 0.2710139,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 53.465542,
+      "brier_n": 1808,
+      "brier_realized_win_rate_pct": 47.179204,
+      "calibration_gap_pp": 6.286338,
+      "decided": 1808,
+      "horizon": "2W",
+      "losses": 955,
+      "matured": 1859,
+      "missing_or_invalid_reliability": 0,
+      "page": "Top_10_Investments",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        44.886564,
+        49.483804
+      ],
+      "win_rate_pct": 47.179204,
+      "wins": 853
+    },
+    {
+      "breakeven": 0,
+      "brier": 0.28996288,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 51.503846,
+      "brier_n": 26,
+      "brier_realized_win_rate_pct": 38.461538,
+      "calibration_gap_pp": 13.042308,
+      "decided": 26,
+      "horizon": "3M",
+      "losses": 16,
+      "matured": 26,
+      "missing_or_invalid_reliability": 0,
+      "page": "Decision_Coverage",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        22.428594,
+        57.46515
+      ],
+      "win_rate_pct": 38.461538,
+      "wins": 10
+    },
+    {
+      "breakeven": 1,
+      "brier": 0.30750681,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 57.008889,
+      "brier_n": 720,
+      "brier_realized_win_rate_pct": 38.888889,
+      "calibration_gap_pp": 18.12,
+      "decided": 720,
+      "horizon": "3M",
+      "losses": 440,
+      "matured": 721,
+      "missing_or_invalid_reliability": 0,
+      "page": "Top_10_Investments",
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        35.39597,
+        42.499743
+      ],
+      "win_rate_pct": 38.888889,
+      "wins": 280
+    }
+  ],
+  "by_investability": [
+    {
+      "breakeven": 88,
+      "brier": 0.27768029,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 52.752336,
+      "brier_n": 535,
+      "brier_realized_win_rate_pct": 20.934579,
+      "calibration_gap_pp": 31.817757,
+      "decided": 535,
+      "investability": "BLOCKED",
+      "losses": 423,
+      "matured": 623,
+      "missing_or_invalid_reliability": 0,
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        17.700417,
+        24.583162
+      ],
+      "win_rate_pct": 20.934579,
+      "wins": 112
+    },
+    {
+      "breakeven": 2,
+      "brier": 0.34310508,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 73.418409,
+      "brier_n": 880,
+      "brier_realized_win_rate_pct": 48.068182,
+      "calibration_gap_pp": 25.350227,
+      "decided": 880,
+      "investability": "INVESTABLE",
+      "losses": 457,
+      "matured": 882,
+      "missing_or_invalid_reliability": 0,
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        44.782697,
+        51.370459
+      ],
+      "win_rate_pct": 48.068182,
+      "wins": 423
+    },
+    {
+      "breakeven": 2,
+      "brier": 0.67857143,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 0.0,
+      "brier_n": 28,
+      "brier_realized_win_rate_pct": 67.857143,
+      "calibration_gap_pp": -67.857143,
+      "decided": 28,
+      "investability": "NONE",
+      "losses": 9,
+      "matured": 30,
+      "missing_or_invalid_reliability": 0,
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        49.338843,
+        82.066753
+      ],
+      "win_rate_pct": 67.857143,
+      "wins": 19
+    },
+    {
+      "breakeven": 112,
+      "brier": 0.27777415,
+      "brier_baseline": 0.25,
+      "brier_mean_claimed_pct": 53.955878,
+      "brier_n": 9544,
+      "brier_realized_win_rate_pct": 47.946354,
+      "calibration_gap_pp": 6.009524,
+      "decided": 9544,
+      "investability": "WATCHLIST",
+      "losses": 4968,
+      "matured": 9656,
+      "missing_or_invalid_reliability": 0,
+      "sufficient": true,
+      "win_rate_ci95_pct": [
+        46.945108,
+        48.949252
+      ],
+      "win_rate_pct": 47.946354,
+      "wins": 4576
+    }
+  ],
+  "exclusions": {
+    "duplicate_matured_excluded": 27,
+    "matured_rows_raw": 11218,
+    "non_matured_excluded": 8419,
+    "performance_rows": 19637
+  },
+  "method": {
+    "dedup": "first matured finite-realized-ROI record per nonblank Key",
+    "min_sample": 20,
+    "outcome": "sign of stored Realized ROI %; breakeven excluded from win rate/Brier",
+    "probability": "Entry Forecast Reliability / 100; missing/nonfinite/out-of-range excluded",
+    "promotion_gate": "advisory evidence only; Brier gating requires owner decision",
+    "risk": "blank/invalid and all-zero triplets excluded as risk measurements; outcomes retained",
+    "signal_join": "coverage on symbol + entry date + origin page; never used to impute probabilities/outcomes"
+  },
+  "overall": {
+    "breakeven": 204,
+    "brier": 0.28402366,
+    "brier_baseline": 0.25,
+    "brier_mean_claimed_pct": 55.318613,
+    "brier_n": 10987,
+    "brier_realized_win_rate_pct": 46.691545,
+    "calibration_gap_pp": 8.627068,
+    "decided": 10987,
+    "losses": 5857,
+    "matured": 11191,
+    "missing_or_invalid_reliability": 0,
+    "sufficient": true,
+    "win_rate_ci95_pct": [
+      45.759983,
+      47.625418
+    ],
+    "win_rate_pct": 46.691545,
+    "wins": 5130
+  },
+  "risk_measurement_exclusions": {
+    "all_zero_placeholder_triplets_excluded": 11191
+  },
+  "script": "calibration_report",
+  "signals": {
+    "ambiguous_entry_date_matches": 8161,
+    "available": true,
+    "by_page": {
+      "Decision_Coverage": 14110,
+      "Top_10_Investments": 14266
+    },
+    "entry_date_matches": 11191,
+    "multi_version_symbol_days": 5156,
+    "rows": 28376,
+    "symbol_days": 7552
+  },
+  "source": {
+    "data_only": true,
+    "export": "_Market Share Deepseek-V3 (1).xlsx",
+    "global_markets_dominant_date": "2026-10-06",
+    "global_markets_updated_dates": {
+      "2026-10-02": 1,
+      "2026-10-05": 52,
+      "2026-10-06": 6555
+    },
+    "performance_header_row": 5,
+    "performance_recorded_dates": {
+      "earliest": "2026-06-28",
+      "latest": "2026-10-06"
+    },
+    "performance_updated_dates": {
+      "earliest": "2026-07-27",
+      "latest": "2026-10-06"
+    },
+    "read_only": true,
+    "sha256": "9c8b34812eee7d5554a3586f1f86a232e79159f24e228a4eac070e2436441ef4",
+    "signal_dates": {
+      "earliest": "2026-06-18",
+      "latest": "2026-10-06"
+    },
+    "signal_header_row": 1
+  },
+  "version": "1.0.0"
+}

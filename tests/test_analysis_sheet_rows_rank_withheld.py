@@ -101,7 +101,7 @@ def test_r3_predicate_exact_prefix_and_list_cells():
     assert not w(None) and not w("") and not w([]) and not w("f7_settle:observe:st3:p2:chg1")
     assert not w("margin_publish:profit_margin:unresolved") and not w("rank_skipped_settle_unresolved")
     assert asr._RANK_WITHHELD_PREFIXES == ("f7_settle_failed:", "settle_unresolved:")
-    assert asr.ANALYSIS_SHEET_ROWS_VERSION == "4.8.2"
+    assert asr.ANALYSIS_SHEET_ROWS_VERSION == "4.8.3"
 
 
 @_isolated

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/surface_action_invariants.py — W1A-1/2/7/8 (v1.4.1, 2026-08-20)
+core/surface_action_invariants.py — W1A-1/2/7/8 (v1.4.2, 2026-10-11)
 ================================================================================
 THE TWO INVARIANTS (spec v1.4.x, W1A table):
   W1A-1  BLOCKED ⇒ DO_NOT_INVEST. A row carrying a non-empty block_reason (or
@@ -239,16 +239,20 @@ from typing import Any, Dict, List, Tuple
 #   NOT CHANGED: every hard row-sanity class incl. v1.4.0's
 #   open_outside_day_range; _RS_MARK stays :v1.4.0 (row-sanity
 #   vocabulary unchanged); all gates, aliases, combo matrix.
-__version__ = "1.4.1"
+# v1.4.2 (2026-10-11) WHY: USX is an approved USD-cent quote code only
+# with TFB_OPP_FX_USX_SUBUNIT armed. Keep the established rule stamps so
+# default-off row annotations remain byte-identical to v1.4.1.
+__version__ = "1.4.2"
 SAI_TAG = f"[SURFACE-INV v{__version__}]"
+_RULE_MARK_VERSION = "1.4.1"
 
 _BUY_FAMILY = {"STRONG_BUY", "BUY", "ACCUMULATE"}
 _INVEST_CLASS = {"INVEST", "INVESTABLE", "BUY", "STRONG_BUY", "ACCUMULATE"}
-_BLOCKED_MARK = f"blocked_invariant_applied:v{__version__}"
-_FETCH_MARK = f"fetchfail_blocked_applied:v{__version__}"
+_BLOCKED_MARK = f"blocked_invariant_applied:v{_RULE_MARK_VERSION}"
+_FETCH_MARK = f"fetchfail_blocked_applied:v{_RULE_MARK_VERSION}"
 _FETCH_TOKEN = "fetch_failed"
 # --- W1A-8 identity-warning markers (spec-literal set) -----------------------
-_WARN_MARK = f"warn_invest_invariant_applied:v{__version__}"
+_WARN_MARK = f"warn_invest_invariant_applied:v{_RULE_MARK_VERSION}"
 _IDW_SUBSTRINGS = ("quote_current_price_missing", "quote_exchange_missing",
                    "quote_currency_missing", "name_unresolved")
 # v1.4.1 (F-01): the former _IDW_XPROV_RE (matching :0.0%) is REMOVED —
@@ -270,8 +274,14 @@ _ISO4217 = {
  "TMT","TND","TOP","TRY","TTD","TWD","TZS","UAH","UGX","USD","UYU","UZS",
  "VED","VES","VND","VUV","WST","XAF","XCD","XOF","XPF","YER","ZAR","ZMW",
  "ZWL"}
-_CCY_SUBUNITS = {"GBX", "ZAC", "ILA"}          # engine v5.77.22 quote units
-_CCY_ALLOWED = _ISO4217 | _CCY_SUBUNITS
+_CCY_SUBUNITS = {"GBX", "ZAC", "ILA", "USX"}  # USX is optional USD cents
+_CCY_ALLOWED = _ISO4217 | (_CCY_SUBUNITS - {"USX"})
+
+
+def _currency_allowed(code: str) -> bool:
+    return code in _CCY_ALLOWED or (code == "USX" and
+        (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"})
 # --- W1A-7 row-sanity vocab (v1.4.0: +open_outside_day_range) ---------------
 _RS_PREFIX = "row_sanity:"
 _RS_MARK = ":v" + "1.4.0"   # v1.4.0: row-sanity vocabulary changed
@@ -454,13 +464,13 @@ def _row_sanity_classes(row: Dict[str, Any]) -> list:
         if op > hi * (1.0 + _RANGE_TOL) or op < lo * (1.0 - _RANGE_TOL):
             out.append("open_outside_day_range")
     exch = _s(row.get("exchange")).upper()
-    if exch in _CCY_ALLOWED:
+    if _currency_allowed(exch):
         out.append("currency_in_exchange")
     ccy = _s(row.get("currency")).upper()
     if ccy:
         if not re.fullmatch(r"[A-Z]{3}", ccy) and ccy not in _CCY_SUBUNITS:
             out.append("invalid_currency_value")
-        elif ccy not in _CCY_ALLOWED:
+        elif not _currency_allowed(ccy):
             # v1.3.0 (F-06): syntactically valid garbage ('XYZ') quarantines.
             out.append("unsupported_currency_code")
     if _s(row.get("country")).upper() in _GICS_SECTORS:
