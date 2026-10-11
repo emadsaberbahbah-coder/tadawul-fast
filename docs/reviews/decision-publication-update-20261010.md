@@ -81,7 +81,7 @@ failure. Keep the 1,025 / 6,512 / 453 / 4,496 floors and 99% name requirement.
    workbook and run `dt10SelfTest`. Repository changes alone do not install it.
    (2026-10-11: superseded by 1.13.4, which contains 1.13.3 unchanged plus the
    WP-8 input-truth gates, all default off; install that file instead — see
-   `docs/reviews/audit-framework-wave1-20261011.md`.)
+   `docs/reviews/audit-framework-waves-20261011.md`.)
 3. Finish verified membership/name recovery and run a complete source sync,
    including inline recovery and final publication evidence. Existing coverage
    failures are expected until this recovery is complete.

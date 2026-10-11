@@ -1,9 +1,10 @@
-# Audit framework wave 1 — integration record and arming plan (2026-10-11)
+# Audit framework waves 1 and 2 — integration record and arming plan (2026-10-11)
 
 Source: `TFB_Workbook_Audit_Framework_and_Findings_v1.0_2026-10-11.pdf` (owner's
 check catalogue DQ-01..DQ-75 and work packages WP-0..WP-12), measured against the
 2026-10-10 workbook export (run 38071484709). Base commit of the wave:
-`a6668c2` on `claude/pensive-hypatia-smnxqe`; published head after the wave: `741ab66`.
+`a6668c2` on `claude/pensive-hypatia-smnxqe`; published head after wave 1: `741ab66`;
+after wave 2 (WP-2 b/c, section below): `454e6e2`.
 
 Every package was built in its own git worktree from a challenged build spec, then
 reviewed by an independent agent that re-ran the tests three times, re-proved the
@@ -50,7 +51,7 @@ never enumerated before and are now).
   the duplicate metric registration aborted collection of the whole tree. The loader now
   releases the earlier collectors first (commit `c44968d`).
 
-## Gates on the published head (`741ab66`)
+## Gates on the published head (`741ab66`, wave 1)
 
 | Gate | Result |
 |---|---|
@@ -136,9 +137,88 @@ would scale by 100 in enriched_quote).
 - The 2026-10-11 export (run 38095726629) that the framework measured is still needed to
   reconcile its §2.5 figures line by line; the committed baseline is the 2026-10-10 export.
 
+## Wave 2 — WP-2 (b)(c), published on top of wave 1
+
+| WP | File(s) and version | Gate (default off) | Observe read-back | Closes / measures |
+|---|---|---|---|---|
+| WP-2b | `core/data_engine_v2.py` 5.153.0, `core/analysis/opportunity_builder.py` 1.25.1, `routes/analysis_sheet_rows.py` 4.8.2, `tests/test_de_f7_settle_unresolved.py`, `tests/test_ob_settle_unresolved.py`, `tests/test_analysis_sheet_rows_rank_withheld.py` | Render env `TFB_SETTLE_UNRESOLVED` off/observe/enforce (effective only while `TFB_SCORING_SETTLE` is observe or enforce) | each non-converged row (46 on 2026-10-10) gains one `settle_unresolved:observe:<reason>:p<n>:ov=..:rc=..` part; every value unchanged; `/health engine_gates.settle_unresolved`; boot `[v5.153.0 GUARDS] … settle_unresolved=…` | DQ-37 posture: under enforce the 46 rows publish their pass-1 scores as WATCHLIST, never funded (HOLD guard in `_portfolio_decision`), never ranked (engine, per-request route and page rank all withhold them), and the opportunity builder still fails them MAJOR on Scoring Settlement |
+| WP-2c | `scripts/run_dashboard_sync.py` 6.66.0, `daily_sync.yml` (both market jobs), `page_refresh_recovery.yml` (recover-page), `tests/test_sync_rank_overall_page.py`, `scripts/harness_wp2bc.py` | repo Variable `TFB_RANK_OVERALL_PAGE` off/observe/enforce | per page per write one `[RANK-PAGE v6.66.0] page=… mode=observe …` line and one `_Run_Log` row (Status OBSERVE); expected `distinct_before` 25 / 25 / 22 / 14 and `changed` about 252 / 6,167 / 91 / 105 | DQ-41: Rank (Overall) becomes one rank over the whole page instead of a rank inside each 25-row batch; on the 2026-10-10 rows enforce gives distinct ranks = ranked rows (253 / 6,168 / 92 / 106) and WP-0 DQ-41 PASS, count 0 |
+
+Integrator-owned changes in the same landing: `scripts/verify_deployment.py` 1.0.49 (pins engine
+5.153.0, sync 6.66.0, opportunity builder 1.25.1; registers `TFB_SCORING_SETTLE`,
+`TFB_SETTLE_UNRESOLVED` and `TFB_RANK_OVERALL_PAGE` as value flags; `TFB_SCORING_SETTLE` reads
+ARMED on observe or enforce because observe already withholds rows, the other two only on enforce;
+the rank gate is workflow-scoped), `.github/workflows/ci.yml` 1.1.6, and
+`scripts/tfb_workbook_dq_audit.py` 1.0.1.
+
+### Wave-2 integration findings
+
+- **CI job environments.** The new route test imports `routes/`, which needs FastAPI. The lean CI
+  job installs numpy and pytest only, so listing the test there would have aborted the whole lean
+  pytest step on its first collection error. The test runs in the contract job instead. The gate
+  that missed it ran the lean suites in an environment that had FastAPI; the integration gate now
+  replays every `ci.yml` job in an environment built from that job's own install step, and the
+  replay of the already-published wave-1 head is green.
+- **Recovery job mapping.** `page_refresh_recovery.yml` (job `recover-page`) also runs the sync with
+  batch size 25. It now maps `TFB_RANK_OVERALL_PAGE` from the same Variable; without it a recovery
+  write after arming would republish within-batch ranks. `test_y4` pins the mapping.
+- **DQ-37 receipt.** Under `TFB_SETTLE_UNRESOLVED=enforce` the engine no longer writes the
+  `f7_settle_failed` receipt that WP-0 v1.0.0 counted, so DQ-37 would have read zero non-converged
+  rows while the 46 rows were still unresolved. WP-0 1.0.1 counts the tag prefixes
+  `f7_settle_failed` or `settle_unresolved:`, never the bare substring, which the enforce-only
+  margin receipt and the provider token `name_unresolved` also contain. An INVESTABLE row among
+  them is listed first in the DQ-37 examples. The 2026-10-10 numbers are unchanged and the
+  committed baseline stays valid; the nightly line now reads `[DQ-AUDIT v1.0.1]`.
+- **Independent review of the integrator's own commits.** Three reviewers, each finding checked by
+  two refuters, confirmed four defects in the integration layer, all fixed before publication:
+  the verifier printed an explicit `TFB_SCORING_SETTLE=observe` as DEFAULT; it reported that flag
+  unarmed on observe although observe already withholds rows; the DQ-37 INVESTABLE example shared
+  a six-slot cap that the rc-flip examples fill first on a real export; and two evidence sentences
+  were wrong. A re-review then checked the fixes.
+- **Test-order independence.** Two older problems surfaced when the lean list and the whole tree
+  ran in reverse: three suites imported a shared helper by a bare name that only resolved after an
+  earlier file had changed `sys.path`, and the Yahoo loop-guard harness left its private metric
+  collectors registered. `tests/conftest.py` now puts `tests/` on the path and the harness releases
+  its collectors. Activating the P-143 seam contract under pytest (it had run only as a script,
+  so CI checked nothing) then showed the F-7 suites leaving the keep-last-good gate ON and stored
+  12-month targets behind; both suites now restore them. The tree passes forward, reversed and in a
+  fixed-seed shuffle, and the integration gate runs all three plus the per-job CI replay.
+- **Reviewer note, not a defect.** Under rank enforce the `_Status` stamp's `payload_sha8` is computed
+  before `write_table` applies the page rank, as it already is for the OHLC fill guard; it fingerprints
+  the projected rows, not the written cells.
+
+### Wave-2 arming (extends phases B and C above)
+
+1. Phase B: repo Variable `TFB_RANK_OVERALL_PAGE = observe`. Read back the four `[RANK-PAGE v6.66.0]`
+   lines and `_Run_Log` rows per write.
+2. Phase B: Render `TFB_SETTLE_UNRESOLVED = observe` (production already runs
+   `TFB_SCORING_SETTLE=observe`). Read back exactly one `settle_unresolved:observe:` part on each
+   non-converged row, 0 of them INVESTABLE, every value unchanged; DQ-37 non-converged count unchanged.
+3. Phase C: `TFB_RANK_OVERALL_PAGE = enforce` first. Read back WP-0 DQ-41 PASS, count 0; Rank 1 on the
+   page tops (2223.SR / 0939.HK / ZL=F / JPXN.US on the 2026-10-10 rows, ± drift).
+4. Phase C: record `/health` `TFB_OPP_INVESTABILITY_GATE` in the read-back, then
+   `TFB_SETTLE_UNRESOLVED = enforce`. Read back `f7_settle_failed:non_converged` 46 → 0,
+   `settle_unresolved:enforce:` 0 → 46, blank Overall Score on them 46 → 0, Rank (Overall) still blank
+   on all of them, BLOCKED among them ≤ 3 (decided by the base gate chain), and DQ-37 non-converged
+   still 46.
+5. Out of scope here: `TFB_SCORING_SETTLE=enforce` (WP-12 #1). `TFB_SCORING_SETTLE_MAX_PASSES` must stay
+   at 4 or more.
+
+### Gates on the published head after wave 2 (`454e6e2`)
+
+| Gate | Result |
+|---|---|
+| compileall, ruff E9/F63/F7/F82 | OK |
+| pytest, lean CI pins (Python 3.11) | 3335 passed, 15 skipped |
+| pytest, full requirements + openpyxl, forward / reversed / fixed-seed shuffle | 3424 passed, 9 skipped in each order |
+| CI replay: every `ci.yml` job in an environment built from its own install step | green (lean 2662 + 99 + 14 passed, contract 225, heavy suites, node suites) |
+| manifest pins, workflow audit, verifier self-tests | pass (workflow audit warnings=2, pre-existing) |
+
 ## Next
 
-Wave 2 builds WP-2 (b)(c): `TFB_SETTLE_UNRESOLVED` (engine 5.153.0, with the
-`_portfolio_decision` HOLD guard, the opportunity-builder settlement regex and the
-per-request ranker's withheld-rank rule) and `TFB_RANK_OVERALL_PAGE` (sync 6.66.0, pure
-core at the publish boundary, DQ-41), on this published head.
+- Arm in the order above, one lever per evidence run, and regenerate the WP-0 baseline after each
+  arming that legitimately moves counts.
+- Open work packages from the framework not built in these waves: WP-1 (portfolio page), WP-4/5
+  (universe hygiene), WP-9/10/11, WP-12 (the enforce sittings themselves), plus the deferred WP-7
+  follow-ups (Signal_History write policy v6.45.0, Performance_Log Target Hit, PIT numeric storage).
+- The 2026-10-11 export the framework measured is still needed to reconcile its figures line by line.
