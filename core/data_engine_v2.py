@@ -2,8 +2,138 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.151.8
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.152.0
 ================================================================================
+
+WHY v5.152.0 - WP-3ab FORECAST TUPLE PUBLISH SEAMS (env TFB_TUPLE_NOISE_RELEASE,
+TFB_ROI12_SOFTCAP_GATE, both off|observe|enforce, default OFF -> byte-identical)
+- EVIDENCE (export 2026-10-10, sync run 38071484709; live rows ML 255 / GM
+  6,609 / CFX 453 / MF 2,474). DQ-32: 1,238 rows publish Forecast Price 12M
+  with Expected ROI 12M BLANK (ML 25 / GM 1,111 / CFX 96 / MF 6); 1,234 of
+  them carry sheet_tuple_conflict:expected_roi_12m. The engine DID write the
+  ROI (_phase_ii_quality_forecast synth/honor branches, round(x, 6)) and the
+  sentry IS armed (eq_roi_backfill:expected_roi_12m:synth:observe on 1,182).
+  The blank is produced downstream by core/sheet_presentation.py
+  present_instrument_row: tolerance = max(0.000005, |implied| * 0.000001),
+  while forecast prices are written round(x, 4), so |FP/CP-1 - ROI| can reach
+  0.00005/cp + 5e-7, which exceeds 5e-6 for every cp < 10 (1,129 of the 1,238
+  blank rows are priced below 10). Classes: 1,190 noise (the reason text
+  roi12m=X.X% agrees with FP/CP-1 within 0.05 pp + 4-dp noise; ML 25 / GM
+  1,079 / CFX 80 / MF 6), 21 precision-limited (cp < 0.05; GM 5 / CFX 16),
+  20 fctuple_vintage:12m:observe (P-102's class), 4 acquisition_status:
+  preserved rows without a conflict tag, 3 whose reason disagrees beyond
+  _fc_tuple_tol (F-7 flip rows). DQ-38 residual: 4 INVESTABLE rows inside the
+  noise class. DQ-31 (identity within 1 pp): 0 mismatches on 230 / 5,287 /
+  345 / 2,414 pairs, max |FP/CP-1 - ROI| = 4.9999e-06 on every page -- the
+  presenter tolerance is exactly what partitions published from withheld.
+- DQ-33: 153 GM provider_target rows publish Expected ROI 12M in
+  0.350205..0.65599 (WATCHLIST 145 / BLOCKED 5 / INVESTABLE 3); 153/153 carry
+  analyst_lkg:<age>h and the short-horizon derivation cap tag, 0/153 carry
+  the Fix-O tag provider_target_12m_capped_to_phase_ii_ceiling. ROOT CAUSE
+  (ordering): _apply_phase_bb_sanity -> _cap_provider_target_forecasts (Fix
+  B / Fix O) runs BEFORE scoring and returns early because the target leg
+  failed on this run (forecast_source != provider_target); later, inside
+  _phase_ii_quality_forecast, _tgt_lkg_restore re-plants the CAPTURE-DAY
+  forecast_price_12m and forecast_source = provider_target, and the honor
+  branch writes the UNCAPPED return_12m (its +/-0.30 clamp bounds only the
+  derived 3M/1M legs). Nothing re-caps against today's price, so a price fall
+  re-opens the ceiling (AKAM.US: lkg fp12 146.8138 vs cp 106.95 -> 0.3727).
+  Corroboration: GM provider_target rows in (0.30, 0.35] split 140 Fix-O-
+  tagged without analyst_lkg (fresh, bounded) vs 498 analyst_lkg without the
+  Fix-O tag (late, unbounded, inside the band by luck); 7 GM + 1 ML
+  analyst_lkg rows sit below -0.30 likewise.
+- (b) _roi12_softcap(row), gate TFB_ROI12_SOFTCAP_GATE: at the publish
+  boundary, a provider_target row whose |FP12/CP-1| exceeds the Phase-II
+  ceiling (0.30) and was never bounded by Fix-O at today's price is mapped by
+  the SAME Fix-O curve cap + band*(1-exp(-excess/band)) (asymptote 0.30 +
+  TFB_PROVIDER_TARGET_SOFT_CAP_BAND, default 0.35; TFB_PROVIDER_TARGET_SOFT_CAP
+  off -> hard clamp to +/-0.30, mirroring Fix-O) to forecast_price_12m and
+  expected_roi_12m in lockstep (Fix-D identity: round(fp, 4) then
+  round((fp-cp)/cp, 6)); a percent-domain ROI is never scaled (P-102 rule).
+  PARITY WORDING: the seam compresses fp12_lkg/cp - 1 where fp12_lkg is the
+  capture-day price that was already soft-capped against THAT day's price,
+  whereas Fix-O on a fresh row compresses the raw target; the result is
+  therefore bounded by the Fix-O asymptote and AT OR BELOW the fresh-regime
+  value, monotone in fp12_lkg -- not "the same regime". Tags
+  r12_ceiling:<observe|enforce>:<hi|band> (hi = |ret| > asymptote, the DQ-33
+  breaches; band = ceiling < |ret| <= asymptote, <= 3.4 pp movement); the
+  split lets the owner choose narrow vs parity AFTER the observe read-back.
+  The idempotence guard is VALUE-CONDITIONED: a row carrying the Fix-O tag or
+  r12_ceiling:enforce* is skipped only while |ret| <= asymptote + 0.00005/cp
+  (the 4-dp rounding headroom), so a stale tag can never suppress a real
+  re-breach. Disclosed: the in-process row cache serves the SAME dict by
+  reference (Fix BC-3 precedent), so an enforce -> observe flip leaves
+  tagged, capped rows in cache until TTL.
+- (a) _tuple_noise_release(row), gate TFB_TUPLE_NOISE_RELEASE: for each ROI
+  leg (12m/3m/1m) whose stored fraction disagrees with FP/CP-1 by MORE than
+  the presenter tolerance (mirrored: max(5e-6, |implied|*1e-6)) but by no
+  more than noise_bound + 0.0005, where noise_bound = 0.00005/cp + 5e-7 (the
+  4-dp price / 6-dp ROI rounding noise) and 0.0005 is P-102's own tolerance
+  floor, publish the row's OWN fraction snapped to round(implied, 6) so the
+  always-on presenter check accepts it. Classes: round (diff <= noise_bound),
+  drift (noise_bound < diff <= noise_bound + 0.0005). Rows priced below 0.05
+  (noise_bound > 0.001 = 0.1 pp) are tagged tuple_noise:<h>:precision_limited
+  and NEVER rewritten (that is the TFB_PRICE_PRECISION read-back); a diff in
+  (noise_bound + 0.0005, _fc_tuple_tol] is tagged tuple_noise:<h>:gap and
+  never rewritten (0 rows today); above _fc_tuple_tol the leg is P-102's
+  vintage class and untouched. The release band is deliberately NARROW: the
+  wide _fc_tuple_tol (0.1002 at cp 0.10) would let enforce silently rewrite a
+  drifted ROI and hide it from DQ-31 by construction.
+  DOCTRINE: core/sheet_presentation.py ("publish the witnessed existing
+  numeric return after validation; never derive a new ROI") binds the
+  PRESENTER, which still only witnesses. The ENGINE already re-derives at the
+  boundary under P-102 enforce (_fc_tuple_coherence: row[roi_key] =
+  round(implied, 6)); (a) extends that precedent into the gap that P-102
+  tolerates and the presenter rejects. RETIREMENT CRITERION vs findings.json
+  "crypto-forecast-precision" (TFB_PRICE_PRECISION, ordered AFTER this build
+  and re-anchored on its SHA): once significant-digit price rounding is
+  enforced, tuple_noise:*:round counts fall toward 0 and
+  tuple_noise:*:precision_limited (21 today) must reach 0; (a) measures the
+  actual discrepancy, so it stays correct under either rounding regime. The
+  rounding sites inside _phase_ii_quality_forecast and
+  _cap_provider_target_forecasts are untouched; _r12_round_price is the ONE
+  forecast-price rounding this build adds (the symbol PRICE_PRECISION must
+  also redirect).
+- WIRING: one wrapper _publish_tuple_seams(row) runs (b) then (a), fail-open
+  per sub-seam, at the two FIRST-presentation sites only: _strict_project_row
+  (after _f7_settle_holdback, before present_instrument_row) and the
+  get_page_rows per-row loop (after _apply_analyst_trend_block). Both run
+  AFTER _apply_investability_gate, _margin_publish_contract,
+  _apply_reco_coherence, _apply_analyst_trend_block and the F-7 holdback, so
+  no decision field reads the changed values in this request (decision-
+  neutral by construction); at site #2 the seam precedes
+  _compute_portfolio_fields, _apply_news_veto and
+  _apply_surface_invariants_safe, none of which reads expected_roi_* or
+  forecast_price_* (grep: 0 hits). Engine Top_10 membership and order are
+  untouched (the direct block filters and ranks BEFORE projection and reads
+  only scores and the SIGN of the governing ROI); the readers that DO see
+  released or capped values are the published sheet's consumers (GAS
+  cockpit, opportunity_builder engine_roi_12m_pct). The Top_10 direct block
+  and the re-presentation sites (_strict_project_row_display,
+  _rows_matrix_from_rows, get_sheet_rows) are NOT touched: they re-present
+  rows already projected through site #1; the P-102/P-152 seam-distance
+  contracts are unaffected. Gate exposure: surface_gate_states() keys
+  roi12_softcap and tuple_noise_release (-> /health engine_gates) and the
+  [GUARDS] boot line fields r12_ceiling= and tuple_noise=. The tag vocabulary
+  r12_ceiling:* / tuple_noise:* contains none of the _REL_PATH_FORBIDDEN
+  substrings (the doc's roi12_softcap_applied would have triggered the
+  gate's reliability penalty).
+- NOT changed: scoring, Fix-O, the LKG store, the 3M/1M legs of late targets
+  (hard-cap regime; follow-up (f) belongs at the source), TFB_EQ_ROI_UNIT_
+  SENTRY (enforce must NOT be armed: tag-only here, x100 in
+  core/enriched_quote.normalize_rows), core/sheet_presentation.py,
+  core/enriched_quote.py, scripts/run_dashboard_sync.py, main.py;
+  scripts/verify_deployment.py takes the manifest pin only. Symbols in the
+  regression battery: 8150.SR, XXII.US, LSE.US (noise), SUI-USD (precision-
+  limited), GRC.US (vintage), AKAM.US, AC.TO, TMUS.US, WGO.US, PXLW.US,
+  PMT.US (ceiling). Functions added 7 (_tuple_noise_mode, _roi12_softcap_mode,
+  _r12_round_price, _roi12_softcap_target, _roi12_softcap,
+  _tuple_noise_release, _publish_tuple_seams), removed 0; constants added 11,
+  every one a literal defined before use. Rollback: unset both env (= off,
+  byte-identical) or git revert.
+- HEADER REPAIR (v5.139.0 precedent): the title read v5.151.8 while
+  __version__ was 5.151.9; both now read 5.152.0. Every prior WHY block is
+  preserved verbatim.
 
 WHY v5.151.8 - COMPLETE RESEARCH MEMBERSHIP
 - Reader-backed membership has an explicit complete/source receipt and never
@@ -3908,7 +4038,9 @@ from core.financial_units import (
 # v5.151.9: preserve a value-bound raw intrinsic model basis through F7;
 # compress only display values once, and never recapture a missing-price HOLD
 # as an upstream provider rating. Settlement failures remain fail-closed.
-__version__ = "5.151.9"
+# v5.152.0 (WP-3ab): publish-boundary tuple seams -- noise-class ROI release
+# and the 12M ceiling for keep-last-good targets; both gated, default off.
+__version__ = "5.152.0"
 
 from core.sheet_presentation import present_instrument_row
 
@@ -5802,6 +5934,8 @@ def surface_gate_states() -> Dict[str, Any]:
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
             "fund_cache_stats": _fund_cache_stats(),                   # v5.150.0 (P-154c)
             "margin_publish": _margin_publish_mode(),                  # v5.151.0 (P-152)
+            "roi12_softcap": _roi12_softcap_mode(),                    # v5.152.0 (WP-3b)
+            "tuple_noise_release": _tuple_noise_mode(),                # v5.152.0 (WP-3a)
         }
     except Exception:
         return {}
@@ -7386,6 +7520,193 @@ def _fc_tuple_release_factory_basis(row: Dict[str, Any], *, live_priced: bool, s
         return
     kept = [p for p in parts if p != _FCT_BASIS_TAG]
     row["warnings"] = kept if isinstance(row.get("warnings"), list) else "; ".join(kept)
+
+
+# =============================================================================
+# v5.152.0 (WP-3ab) -- PUBLISH-BOUNDARY TUPLE SEAMS (see WHY v5.152.0)
+# -----------------------------------------------------------------------------
+# Two display-only seams that run immediately before present_instrument_row at
+# the two FIRST-presentation sites (_strict_project_row, get_page_rows):
+#   (b) _roi12_softcap        gate TFB_ROI12_SOFTCAP_GATE   off|observe|enforce
+#   (a) _tuple_noise_release  gate TFB_TUPLE_NOISE_RELEASE  off|observe|enforce
+# Explicit words only ("1"/"true"/"on" read as off); unset = off = rows byte-
+# identical to v5.151.9. observe = countable tags, values untouched. enforce
+# changes only expected_roi_* (a) and forecast_price_12m/expected_roi_12m (b).
+# RULE: every module-level constant in this block is a LITERAL. The Phase-II
+# ceiling _PHASE_II_MAX_12M_ABS_RETURN, the Fix-O band helpers and
+# _soft_compress_excess are defined ~2,100 lines further down; they are
+# referenced inside function bodies only (call time), never at module level.
+# =============================================================================
+_TNR_ENV: str = "TFB_TUPLE_NOISE_RELEASE"
+_TNR_TAG: str = "tuple_noise"
+# Mirror of core/sheet_presentation.py present_instrument_row:
+#   tolerance = max(0.000005, abs(implied) * 0.000001)
+# The regression battery cross-checks this pair against the real presenter.
+_TNR_PRES_TOL_ABS: float = 0.000005
+_TNR_PRES_TOL_REL: float = 0.000001
+_TNR_PRICE_HALF_ULP: float = 0.00005    # forecast_price_* are written round(x, 4)
+_TNR_ROI_HALF_ULP: float = 0.0000005    # expected_roi_* are written round(x, 6)
+_TNR_MAX_NOISE: float = 0.001           # release only while 4-dp price noise moves the ROI by <= 0.1 pp (cp >= 0.05)
+_TNR_DRIFT_SLACK: float = 0.0005        # P-102's own tolerance floor (_fc_tuple_tol); the release band ends here
+_R12_ENV: str = "TFB_ROI12_SOFTCAP_GATE"
+_R12_TAG: str = "r12_ceiling"
+_R12_FIXO_TAG: str = "provider_target_12m_capped_to_phase_ii_ceiling"
+
+
+def _tuple_noise_mode() -> str:
+    """TFB_TUPLE_NOISE_RELEASE: off (default) | observe | enforce. Explicit
+    words only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_TNR_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _roi12_softcap_mode() -> str:
+    """TFB_ROI12_SOFTCAP_GATE: off (default) | observe | enforce. Explicit
+    words only -- "1"/"true"/"on" read as off. Read at call time."""
+    raw = (os.getenv(_R12_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _r12_round_price(x: float) -> float:
+    """v5.152.0 (WP-3b): the ONE forecast-price rounding this build adds (4 dp,
+    the engine's forecast_price_* convention). A later TFB_PRICE_PRECISION
+    build redirects this symbol; the rounding sites inside
+    _phase_ii_quality_forecast and _cap_provider_target_forecasts are not
+    touched here."""
+    return round(x, 4)
+
+
+def _roi12_softcap_target(ret: float, cap_abs: float, band: float) -> float:
+    """v5.152.0 (WP-3b): the pure Fix-O 12M mapping. |ret| <= cap_abs -> ret
+    unchanged; otherwise sign(ret) * (cap_abs + band*(1-exp(-excess/band)))
+    through the real _soft_compress_excess (band <= 0 -> exactly +/-cap_abs,
+    the v5.79.2 hard clamp). Monotone in ret, bounded by cap_abs + band."""
+    mag = abs(ret)
+    if mag <= cap_abs:
+        return ret
+    out = cap_abs + _soft_compress_excess(mag - cap_abs, band)
+    return out if ret >= 0.0 else -out
+
+
+def _roi12_softcap(row: Dict[str, Any]) -> int:
+    """v5.152.0 (WP-3b): bound a provider-target 12M leg that Fix-O never saw
+    at today's price (keep-last-good restore after _apply_phase_bb_sanity).
+    Returns 1 when the row was tagged (observe) or compressed (enforce), else
+    0. off -> 0 with no row access. Never raises (fail-open)."""
+    mode = _roi12_softcap_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    try:
+        if _safe_str(row.get("forecast_source")).lower() != "provider_target":
+            return 0
+        cp = _as_float(row.get("current_price"))
+        fp12 = _as_float(row.get("forecast_price_12m"))
+        if cp is None or cp <= 0 or fp12 is None or fp12 <= 0:
+            return 0
+        ret = (fp12 - cp) / cp
+        if not math.isfinite(ret):
+            return 0
+        cap_abs = _PHASE_II_MAX_12M_ABS_RETURN
+        if abs(ret) <= cap_abs + 1e-9:
+            return 0  # in band: Fix-O leaves these untouched as well
+        soft = _provider_target_soft_cap_enabled()
+        band = _provider_target_soft_cap_band() if soft else 0.0
+        asym = cap_abs + band
+        parts = _mpc_warning_parts(row)
+        bounded = _R12_FIXO_TAG in parts or any(p.startswith(_R12_TAG + ":enforce") for p in parts)
+        if bounded and abs(ret) <= asym + _TNR_PRICE_HALF_ULP / cp + 1e-9:
+            return 0  # already bounded at today's price (value-conditioned idempotence guard)
+        cls = "hi" if abs(ret) > asym + 1e-9 else "band"
+        if mode != "enforce":
+            _v573_append_warning(row, "%s:observe:%s" % (_R12_TAG, cls))
+            return 1
+        new_ret = _roi12_softcap_target(ret, cap_abs, band)
+        new_fp = _r12_round_price(cp * (1.0 + new_ret))
+        row["forecast_price_12m"] = new_fp
+        stored = _as_float(row.get("expected_roi_12m"))
+        if stored is not None and abs(stored) <= _FCT_FRACTION_DOMAIN_MAX:
+            row["expected_roi_12m"] = round((new_fp - cp) / cp, 6)  # Fix-D lockstep; never invents a missing ROI
+        _v573_append_warning(row, "%s:enforce:%s" % (_R12_TAG, cls))
+        return 1
+    except Exception:
+        return 0
+
+
+def _tuple_noise_release(row: Dict[str, Any]) -> int:
+    """v5.152.0 (WP-3a): release an ROI leg the presenter withholds for 4-dp
+    price rounding noise. Per leg: skip when the stored fraction already sits
+    inside the presenter tolerance (published as-is), when it is absent (the
+    backfill's job), percent-domain (never scaled), or further than
+    _fc_tuple_tol from FP/CP-1 (P-102's vintage class). Inside that window:
+    cp < 0.05 -> tuple_noise:<h>:precision_limited (both modes, value kept);
+    diff > noise_bound + 0.0005 -> tuple_noise:<h>:gap (both modes, value
+    kept); else class round|drift -> observe tags, enforce snaps the stored
+    fraction to round(implied, 6). Returns the number of legs acted on. Never
+    raises (fail-open); off -> 0 with no row access."""
+    mode = _tuple_noise_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return 0
+    n = 0
+    try:
+        cp = _as_float(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return 0
+        noise_bound = _TNR_PRICE_HALF_ULP / cp + _TNR_ROI_HALF_ULP
+        release_bound = noise_bound + _TNR_DRIFT_SLACK
+        fct_tol = _fc_tuple_tol(cp)
+        for h, fp_key, roi_key in _FCT_LEGS:
+            fp = _as_float(row.get(fp_key))
+            if fp is None or fp <= 0:
+                continue
+            stored = _as_float(row.get(roi_key))
+            if stored is None:
+                continue  # absent ROI is the backfill's job; the presenter already blanks unknown cases
+            if abs(stored) > _FCT_FRACTION_DOMAIN_MAX:
+                continue  # percent domain: units are the sentries' job, never scaled here
+            implied = (fp - cp) / cp
+            if not math.isfinite(implied):
+                continue
+            diff = abs(implied - stored)
+            pres_tol = max(_TNR_PRES_TOL_ABS, abs(implied) * _TNR_PRES_TOL_REL)
+            if diff <= pres_tol:
+                continue  # the presenter publishes it already (also what makes a second pass a no-op)
+            if diff > fct_tol:
+                continue  # vintage class: P-102's seam owns it
+            if noise_bound > _TNR_MAX_NOISE:
+                _v573_append_warning(row, "%s:%s:precision_limited" % (_TNR_TAG, h))
+                n += 1
+                continue
+            if diff > release_bound:
+                _v573_append_warning(row, "%s:%s:gap" % (_TNR_TAG, h))
+                n += 1
+                continue
+            cls = "round" if diff <= noise_bound + 1e-12 else "drift"
+            if mode == "enforce":
+                row[roi_key] = round(implied, 6)
+                _v573_append_warning(row, "%s:%s:%s:enforce" % (_TNR_TAG, h, cls))
+            else:
+                _v573_append_warning(row, "%s:%s:%s:observe" % (_TNR_TAG, h, cls))
+            n += 1
+    except Exception:
+        return n
+    return n
+
+
+def _publish_tuple_seams(row: Dict[str, Any]) -> None:
+    """v5.152.0 (WP-3ab): run (b) then (a) at a first-presentation site. Order
+    matters: a leg compressed by (b) reaches (a) in lockstep (no action).
+    Fail-open per sub-seam; both gates off -> two env reads and no row
+    access, so unset == v5.151.9 byte-identical."""
+    if not isinstance(row, dict):
+        return
+    try:
+        _roi12_softcap(row)
+    except Exception:
+        pass
+    try:
+        _tuple_noise_release(row)
+    except Exception:
+        pass
 
 
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
@@ -15838,6 +16159,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     _f7_settle_holdback(row)
+    _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
@@ -17129,7 +17451,7 @@ class DataEngineV5:
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
-                "w52_ceiling=%s fund_cache=%s margin_publish=%s",
+                "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -17149,6 +17471,8 @@ class DataEngineV5:
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
                 _margin_publish_mode(),     # v5.151.0 (P-152): publish contract provable at boot
+                _roi12_softcap_mode(),      # v5.152.0 (WP-3b): 12M ceiling mode provable at boot
+                _tuple_noise_mode(),        # v5.152.0 (WP-3a): noise release mode provable at boot
             )
         except Exception:
             pass
@@ -19080,6 +19404,7 @@ class DataEngineV5:
             _margin_publish_contract(_r)  # v5.151.0 (P-152): same boundary as _strict_project_row
             _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
+            _publish_tuple_seams(_r)  # v5.152.0 (WP-3ab): same boundary as _strict_project_row
         # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
         # Runs once on the full holdings list after the per-row gate, so
         # actual_weight/weight_gap see the whole book.
