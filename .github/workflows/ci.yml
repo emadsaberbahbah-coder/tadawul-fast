@@ -2,7 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.4 (2026-10-10) -- UNDEFINED-NAME GATE AND ACTION PINS
+# VERSION 1.1.5 (2026-10-11) -- WAVE-1 SUITE ENUMERATION
+#
+# v1.1.5: enumerate the suites delivered by the 2026-10-11 audit-framework work
+# packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
+# tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity).
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -87,6 +91,8 @@
 #     tests/test_track_force_coverage_p180.py   (P-180 forced coverage)
 #     tests/test_tp_dedup_matured_p189b.py      (P-189b matured duplicates)
 #     tests/test_tp_zero_baseline_p201.py       (P-201 zero-forecast baseline)
+#     tests/test_tp_dedup_signal_p191.py       (P-191 Signal_History same-day repeats)
+#     tests/test_track_flags_mapped.py         (tracker flag env mapping + parity)
 #     tests/test_sync_outcome_audit.py          (did the pages refresh?)
 #     tests/test_sync_audit_cancelled_source.py (cancelled-source audit gate)
 #     tests/test_verify_manifest_pins.py        (deployment-manifest drift)
@@ -409,6 +415,8 @@ jobs:
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
+            tests/test_tp_dedup_signal_p191.py \
+            tests/test_track_flags_mapped.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
