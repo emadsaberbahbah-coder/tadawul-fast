@@ -6,7 +6,8 @@
 #
 # v1.1.5: enumerate the suites delivered by the 2026-10-11 audit-framework work
 # packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
-# tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity).
+# tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity);
+# tests/js/decision_input_truth.test.js (WP-8 cockpit input truth, native job).
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -451,6 +452,7 @@ jobs:
         run: |
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
+          node tests/js/decision_input_truth.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
