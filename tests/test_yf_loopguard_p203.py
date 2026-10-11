@@ -217,6 +217,11 @@ check("G6 zero awaits inside any threading-lock section (AST)", not awaits_under
 digest = hashlib.sha256("|".join(digest_parts).encode()).hexdigest()[:16]
 total = len(digest_parts)
 print(f"[YF LOOPGUARD HARNESS] {total - fails}/{total} {'PASS' if not fails else 'FAIL'}  cases-digest={digest}")
+# The private copies loaded above registered their own yf_fund_* collectors. Release
+# them too, so a LATER normal import of core.providers.yahoo_fundamentals_provider in
+# the same pytest process (whole-tree run in reverse order) does not hit
+# "Duplicated timeseries". No-op without prometheus_client.
+_release_prometheus_series()
 
 
 def test_yf_loopguard_harness():
