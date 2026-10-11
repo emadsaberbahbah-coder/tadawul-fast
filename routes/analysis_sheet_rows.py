@@ -2,12 +2,30 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.2  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+v4.8.2 (2026-10-11) [WP-2b]: the per-request GLOBAL-RANK pass withholds a
+row the engine itself withheld from Rank (Overall). EVIDENCE (export
+2026-10-10, run 38071484709): the daily sync fetches the four market pages
+through this router (daily_sync.yml TFB_SYNC_MARKET_GATEWAY "analysis") in
+25-row batches, so _apply_global_rank_overall is the LAST ranker before the
+sheet; its predicate read only "numeric score and no low_data_trust". Under
+data_engine_v2 5.153.0 TFB_SETTLE_UNRESOLVED=enforce the 46 non-converged
+rows (GM 45 + CFX 1 today, all f7_settle_failed:non_converged) publish a
+numeric pass-1 score tagged settle_unresolved:enforce:..., and this pass
+would stamp them a within-batch rank over the engine's withheld one. FIX
+(tag-driven, exact token prefix, never a substring): a warning part starting
+with f7_settle_failed: or settle_unresolved: blanks the rank like a LOW-trust
+row (_RANK_WITHHELD_PREFIXES). Today every f7_settle_failed row already has
+a blank score, so the predicate changes nothing until the engine gate is
+armed: rows without either tag are byte-identical (ranked 1..N exactly as
+v4.8.1). This module is not pinned in scripts/verify_deployment.py MODULES.
+Functions added 1 (_rank_withheld_by_tag), removed 0; constants added 1. Rollback: git revert.
 
 v4.8.1: redact credentials from caught route, engine, and proxy diagnostics.
 
@@ -355,7 +373,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.1"
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.2"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -458,6 +476,10 @@ _RANKED_MARKET_PAGES = {
 # token in `warnings`; this router preserves that row's blank Rank (Overall)
 # instead of re-ranking it (keeps the engine's trust drop intact).
 _LOW_TRUST_TAG = "low_data_trust"
+# v4.8.2 (WP-2b): engine-withheld ranks are never re-ranked per request. Exact
+# token-prefix match on each ';' part of the warnings cell (never a substring:
+# margin_publish receipts end ':unresolved').
+_RANK_WITHHELD_PREFIXES = ("f7_settle_failed:", "settle_unresolved:")
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
     "Market_Leaders": 90,
@@ -1270,6 +1292,21 @@ def _coerce_rank_score(value: Any) -> Optional[float]:
     return f if f == f else None
 
 
+def _rank_withheld_by_tag(warnings: Any) -> bool:
+    """v4.8.2 [GLOBAL-RANK] (WP-2b): True when any ';' part of the warnings
+    cell (a string, or a list/tuple of strings) starts with one of
+    _RANK_WITHHELD_PREFIXES. Exact token prefix, case-insensitive; a cell
+    without such a part (every cell before the engine gate is armed) -> False."""
+    if warnings is None:
+        return False
+    items = warnings if isinstance(warnings, (list, tuple)) else (warnings,)
+    for item in items:
+        for part in str(item if item is not None else "").lower().split(";"):
+            if part.strip().startswith(_RANK_WITHHELD_PREFIXES):
+                return True
+    return False
+
+
 def _global_rank_enabled() -> bool:
     """v4.4.0 [GLOBAL-RANK]: master switch for the page-level Rank (Overall)
     pass (default ON). When OFF, rank_overall is passed through from upstream
@@ -1299,7 +1336,7 @@ def _apply_global_rank_overall(rows: List[Dict[str, Any]], page: str) -> int:
             continue
         score = _coerce_rank_score(row.get("overall_score"))
         warns = str(row.get("warnings") or "").lower()
-        if score is None or _LOW_TRUST_TAG in warns:
+        if score is None or _LOW_TRUST_TAG in warns or _rank_withheld_by_tag(row.get("warnings")):
             # Not rankable -> clear any per-batch rank it arrived with so the
             # blank correctly signals "not ranked" (engine no-score / LOW-trust).
             if "rank_overall" in row:

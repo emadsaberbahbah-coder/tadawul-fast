@@ -551,6 +551,16 @@ jobs:
       # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
       # adds a pause between batches for extra upstream cooldown.
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # v6.66.0 WP-2c [RANK-PAGE] (2026-10-11): the batch size above makes Rank
+      # (Overall) a WITHIN-BATCH rank (10-10 export: 25/25/22/14 distinct values
+      # on 253/6,168/92/106 ranked rows). off = within-batch ranks exactly as
+      # today (byte-identical payload, no log); observe = one [RANK-PAGE] line +
+      # one _Run_Log OBSERVE row per market page per write (values untouched);
+      # enforce = Rank 1..N per page by Overall Score desc (Symbol tie-break),
+      # withheld rows written "". Explicit words only ('1'/'true' read as off).
+      # Armed through the repo Variable after the observe read-back; no YAML
+      # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
       # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
       # runner stops fetching new batches once 3600s of wall clock are spent
       # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
@@ -1579,6 +1589,16 @@ jobs:
       #           TFB_SYNC_PRIORITY_EXTRA "SYM1,SYM2".
       TFB_SYNC_PRIORITY_FETCH: "0"
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # v6.66.0 WP-2c [RANK-PAGE] (2026-10-11): the batch size above makes Rank
+      # (Overall) a WITHIN-BATCH rank (10-10 export: 25/25/22/14 distinct values
+      # on 253/6,168/92/106 ranked rows). off = within-batch ranks exactly as
+      # today (byte-identical payload, no log); observe = one [RANK-PAGE] line +
+      # one _Run_Log OBSERVE row per market page per write (values untouched);
+      # enforce = Rank 1..N per page by Overall Score desc (Symbol tie-break),
+      # withheld rows written "". Explicit words only ('1'/'true' read as off).
+      # Armed through the repo Variable after the observe read-back; no YAML
+      # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
       # FULL-FILL v1.1.0 (2026-08-04): arm the data-complete criterion + cycle loop.
       # Kill-switches: remove these three lines (or set 0/"1" resp.) to restore the
       # single-pass "process-success" behavior byte-identically.

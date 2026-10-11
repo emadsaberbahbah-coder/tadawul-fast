@@ -3,9 +3,75 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.65.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.66.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.66.0 - WP-2c [RANK-PAGE]: gate TFB_RANK_OVERALL_PAGE = off | observe | enforce
+================================================================================
+EVIDENCE (export 2026-10-10, run 38071484709, [STATUS-STAMP v6.64.14]; WP-0
+scripts/tfb_workbook_dq_audit.py v1.0.0 DQ-41 FAIL, count 6,533): Rank
+(Overall) carries 25 / 25 / 22 / 14 distinct values on 253 / 6,168 / 92 / 106
+ranked rows (ML / GM / CFX / MF), each set exactly the integers 1..N - a
+WITHIN-BATCH rank. Mechanism (code + config): daily_sync.yml
+TFB_SYNC_SYMBOL_BATCH_SIZE "25" in both market jobs and the "analysis" market
+gateway, so routes/analysis_sheet_rows.py _apply_global_rank_overall
+re-ranks each 25-symbol request (the v6.17.0 trade-off this header records);
+no engine or route call ever sees more than one batch. The complete page
+exists only here, at SheetsWriter.write_table (the single write choke
+point). Eligibility = numeric Overall Score AND no low_data_trust token AND
+no f7_settle_failed: / settle_unresolved: token (exact token prefixes);
+on the export it reproduces the current withholding exactly (eligible ==
+ranked on every page, 0 eligible-but-unranked, 0 ranked-but-ineligible).
+DESIGN: PURE CORE _rank_overall_page_core(hdr, matrix, mode) -> (matrix,
+  stats) beside _ohlc_fill_guard_core (env-free; tests + harness target);
+  the env wrapper _rank_overall_page_apply runs in write_table AFTER the
+  fill guard and BEFORE the copy-only presentation (which never touches
+  Rank). Order: Overall Score descending, Symbol ascending on exact ties
+  (deterministic across runs and batch orders; GM's largest tie is 8 rows
+  at 45.49) - the engine/route break ties by arrival order, so DQ-41 trend
+  comparisons must use this rule.
+off (default; unset or any word but observe/enforce, '1'/'true'/'on'
+  included): the same matrix object, no log line, no _Run_Log row - the
+  sheet payload, _Status and _Run_Log are byte-identical to v6.65.0.
+observe: the same matrix object (values untouched) + one INFO line
+  [RANK-PAGE v6.66.0] page=.. mode=observe rows=.. eligible=..
+  distinct_before=.. max_before=.. changed=.. withheld(low_trust/settle/
+  no_score)=../../.. + one _Run_Log row per market page per write, Status
+  OBSERVE (a NEW status word in the run-log vocabulary; FG-2 writes
+  OK/SUSPECT and WP-6 WOULD_COMPACT). No per-row Warnings tag.
+enforce: a NEW matrix with the int page rank 1..N on eligible rows and ""
+  on every other row's Rank cell (None would be null-skipped by the RAW
+  in-place values.update and leave the stale within-batch rank; "" is also
+  what the route already writes for an ineligible row - blank-string Rank
+  cells on the export: ML 2 / GM 441 / CFX 361 / MF 2,368). Every other cell
+  is copied verbatim; idempotent (a second pass changes 0). _Run_Log Status OK.
+FAIL-OPEN in both armed modes: an exception, or a failed postcondition (the
+  written ranks must be exactly 1..eligible), publishes the within-batch
+  ranks unchanged, logs WARNING and writes one _Run_Log Status ERROR row. A
+  rank is presentation, not a trade input (opportunity_builder recomputes
+  its own rank_overall on every build; the GAS cockpit never reads Rank
+  (Overall)).
+TELEMETRY: the _Run_Log line rides the FW-3 channel and honors the existing
+  TFB_SYNC_OHLC_RUNLOG kill switch (the FG-2 lever); its own append failure
+  is annotated (::warning:: + logger) and NOT counted into
+  _RUNLOG_APPEND_FAILS (the WP-6 rule: telemetry never flips the exit code).
+  Header-repair writes ([] rows) and every non-market page (My_Portfolio,
+  Top_10_Investments, Insights, meta tabs) are never touched. The WP-6
+  Warnings compaction is unaffected (Rank is not a Warnings token).
+EXPECTED ENFORCE READ-BACK (the pure core run offline on the 10-10 export
+  matrices): distinct = ranked = 253 / 6,168 / 92 / 106; rows whose Rank
+  value changes 252 / 6,167 / 91 / 105; page tops 2223.SR 76.85, 0939.HK
+  85.71, ZL=F 76.66, JPXN.US 75.08; WP-0 DQ-41 count 6,533 -> 0 (PASS). The
+  observe read-back must print the same distinct_before / changed numbers
+  (+/- input drift).
+ARMING: repo Variable TFB_RANK_OVERALL_PAGE (daily_sync.yml maps
+  ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }} in sync-dashboard and
+  recover-missing-market-pages): observe for one evidence run, then enforce;
+  arm it BEFORE data_engine_v2 TFB_SETTLE_UNRESOLVED. Functions added 5
+  (_rank_page_score, _rank_overall_page_core, _rank_overall_page_mode,
+  _rank_overall_page_apply, _append_runlog_rank_page), constants 7, removed
+  0. Rollback: unset the Variable (= off, byte-identical) or git revert.
 
 v6.65.0 - WP-6 WARNINGS-COMPACT: gate TFB_WARNINGS_COMPACT = off | observe | enforce
 ================================================================================
@@ -1995,7 +2061,10 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.65.0"
+SCRIPT_VERSION = "6.66.0"
+# v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
+#   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
+#   (default off = byte-identical v6.65.0). Full WHY in the module header.
 # v6.64.8 (2026-10-07) - PORTFOLIO MINOR-UNIT CURRENCY GUARD (gated, OFF)
 # WHY: v6.64.6 compares the quote Currency with the ledger currency after
 #   .upper() on both sides. The engine quotes .L in pence as 'GBp'
@@ -3896,6 +3965,7 @@ class SheetsWriter:
         # keeps its last-good content, and the task fails loud (DS-02).
         _fg_stats = None
         matrix, _fg_stats = _ohlc_fill_guard_apply(hdr, matrix)
+        matrix, _rp_stats = _rank_overall_page_apply(sheet_name, hdr, matrix)  # v6.66.0 [RANK-PAGE]: whole page, after restoration, before copy-only presentation
         matrix = _present_market_sheet_rows(sheet_name, hdr, matrix)
         # v6.65.0 (WP-6) enforce-only safety net at the single write choke
         # point: the second projection above re-adds nothing MOVABLE once
@@ -3956,6 +4026,13 @@ class SheetsWriter:
             if _fg_stats:
                 _append_runlog_ohlc_fillguard(self, spreadsheet_id,
                                               sheet_name, _fg_stats)
+        except Exception:
+            pass
+        # v6.66.0 [RANK-PAGE] (WP-2c): one line per market page per write
+        # (observe and enforce; off -> _rp_stats is None, nothing appended).
+        try:
+            if _rp_stats:
+                _append_runlog_rank_page(self, spreadsheet_id, sheet_name, _rp_stats)
         except Exception:
             pass
 
@@ -9165,6 +9242,232 @@ def _append_runlog_ohlc_fillguard(sheets: Any, spreadsheet_id: str, page: str,
         print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
               % (_OHLC_FILLGUARD_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log line skipped: %s", _OHLC_FILLGUARD_TAG, _e)
+
+
+# -----------------------------------------------------------------------------
+# v6.66.0 (WP-2c) [RANK-PAGE] - whole-page Rank (Overall) at the single write
+# choke point. Gate TFB_RANK_OVERALL_PAGE = off (default; byte-identical) |
+# observe | enforce (explicit words). Full WHY (2026-10-10 export / run
+# 38071484709 evidence, design, telemetry, arming) in the module header. PURE
+# CORE first (env-free: tests + harness target, the _ohlc_fill_guard_core
+# precedent), then the env wrapper and the fail-open FW-3 run-log appender.
+# -----------------------------------------------------------------------------
+_RANK_PAGE_TAG = f"[RANK-PAGE v{SCRIPT_VERSION}]"
+_RANK_PAGE_ENV = "TFB_RANK_OVERALL_PAGE"
+_RANK_PAGE_RANK_HEADER = "Rank (Overall)"
+_RANK_PAGE_SCORE_HEADER = "Overall Score"
+_RANK_PAGE_WARNINGS_HEADER = "Warnings"
+_RANK_PAGE_LOW_TRUST = "low_data_trust"
+# Exact token prefixes, never substrings (margin_publish receipts end
+# ':unresolved'); the same pair routes/analysis_sheet_rows.py 4.8.2 withholds.
+_RANK_PAGE_WITHHELD_PREFIXES = ("f7_settle_failed:", "settle_unresolved:")
+
+
+def _rank_page_score(value: Any) -> Optional[float]:
+    """PURE: an Overall Score cell -> finite float, else None. bool / None /
+    blank / NaN / inf / non-numeric -> None; strings are parsed with ','
+    removed (mirrors routes/analysis_sheet_rows._coerce_rank_score, plus the
+    finite check)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return f if math.isfinite(f) else None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        f = float(s.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _rank_overall_page_core(hdr: List[Any], matrix: List[List[Any]],
+                            mode: str) -> Tuple[List[List[Any]], Optional[dict]]:
+    """v6.66.0 [RANK-PAGE] PURE CORE (env-free, no I/O, never raises on a
+    malformed cell - such a row is ineligible). Ranks the WHOLE page matrix by
+    Overall Score descending, Symbol ascending on exact ties; eligible = a
+    numeric score AND no exact low_data_trust token AND no token starting
+    with f7_settle_failed: / settle_unresolved: (first matching reason counted:
+    no_score, then low_trust, then settle).
+    mode not observe/enforce -> (matrix, None). observe -> (the SAME matrix
+    object, untouched, stats). enforce -> (a NEW matrix - list(row) per row -
+    with the int rank on eligible rows and "" on every other row's Rank cell,
+    stats). Missing Rank / Overall Score column -> (matrix, stats with
+    skipped)."""
+    if mode not in ("observe", "enforce"):
+        return matrix, None
+    names = [str(h).strip() for h in (hdr or [])]
+    rows = matrix or []
+    stats: dict = {
+        "mode": mode, "rows": len(rows), "eligible": 0, "ranked": 0,
+        "withheld_low_trust": 0, "withheld_settle": 0, "withheld_no_score": 0,
+        "distinct_before": 0, "max_before": 0, "changed": 0,
+        "top": "", "top_score": None,
+    }
+    try:
+        ri = names.index(_RANK_PAGE_RANK_HEADER)
+        si = names.index(_RANK_PAGE_SCORE_HEADER)
+    except ValueError:
+        stats["skipped"] = "no_rank_or_score_column"
+        return matrix, stats
+    wi = names.index(_RANK_PAGE_WARNINGS_HEADER) if _RANK_PAGE_WARNINGS_HEADER in names else None
+    yi = names.index("Symbol") if "Symbol" in names else None
+
+    def _cell(row: Any, i: Optional[int]) -> Any:
+        if i is None or not isinstance(row, (list, tuple)) or i >= len(row):
+            return None
+        return row[i]
+
+    eligible: List[Tuple[float, str, int]] = []
+    before: List[Optional[float]] = []
+    for n, row in enumerate(rows):
+        before.append(_rank_page_score(_cell(row, ri)))
+        score = _rank_page_score(_cell(row, si))
+        if score is None:
+            stats["withheld_no_score"] += 1
+            continue
+        parts = _wc_cell_parts(_cell(row, wi))
+        if any(p == _RANK_PAGE_LOW_TRUST for p in parts):
+            stats["withheld_low_trust"] += 1
+            continue
+        if any(p.startswith(_RANK_PAGE_WITHHELD_PREFIXES) for p in parts):
+            stats["withheld_settle"] += 1
+            continue
+        sym = _cell(row, yi)
+        eligible.append((score, "" if sym is None else str(sym).strip(), n))
+    eligible.sort(key=lambda t: (-t[0], t[1], t[2]))
+    new_rank: Dict[int, int] = {n: r for r, (_s, _y, n) in enumerate(eligible, start=1)}
+    prior = [b for b in before if b is not None]
+    stats["eligible"] = stats["ranked"] = len(eligible)
+    stats["distinct_before"] = len(set(prior))
+    stats["max_before"] = int(max(prior)) if prior else 0
+    stats["changed"] = sum(
+        1 for n, b in enumerate(before)
+        if (b is None) != (new_rank.get(n) is None)
+        or (b is not None and new_rank.get(n) is not None and b != float(new_rank[n])))
+    if eligible:
+        stats["top"] = eligible[0][1]
+        stats["top_score"] = eligible[0][0]
+    if mode == "observe":
+        return matrix, stats
+    out: List[List[Any]] = []
+    for n, row in enumerate(rows):
+        rr = list(row) if isinstance(row, (list, tuple)) else row
+        if isinstance(rr, list) and ri < len(rr):
+            rr[ri] = new_rank.get(n, "")
+        out.append(rr)
+    return out, stats
+
+
+def _rank_overall_page_mode() -> str:
+    """v6.66.0 [RANK-PAGE] TFB_RANK_OVERALL_PAGE: off (default) | observe |
+    enforce. Explicit words only - "1"/"true"/"on" read as off (the sync's
+    tri-state convention, cf. _wc_mode_raw)."""
+    raw = (os.getenv(_RANK_PAGE_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _rank_overall_page_apply(sheet_name: str, hdr: List[Any], matrix: List[List[Any]]):
+    """v6.66.0 [RANK-PAGE] env wrapper. off, a page outside the four ranked
+    market pages, or an empty matrix (header-repair write) -> (matrix, None):
+    the SAME object, no log (byte-identical v6.65.0). Armed -> the pure core +
+    one INFO line; FAIL-OPEN in both modes: an exception or a failed enforce
+    postcondition (ranks exactly 1..eligible) returns the incoming matrix
+    with error stats (today's within-batch ranks are the fallback)."""
+    mode = _rank_overall_page_mode()
+    if mode == "off" or sheet_name not in _RANKED_MARKET_PAGES or not matrix:
+        return matrix, None
+    try:
+        out, stats = _rank_overall_page_core(hdr, matrix, mode)
+        if stats is None:
+            return matrix, None
+        if mode == "enforce" and not stats.get("skipped"):
+            ri = [str(h).strip() for h in hdr].index(_RANK_PAGE_RANK_HEADER)
+            got = sorted(r[ri] for r in out if isinstance(r, list) and ri < len(r)
+                         and isinstance(r[ri], int) and not isinstance(r[ri], bool))
+            if got != list(range(1, int(stats.get("ranked") or 0) + 1)):
+                raise ValueError("rank postcondition failed")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s %s failed open (%s); within-batch ranks published unchanged",
+                       _RANK_PAGE_TAG, sheet_name, type(exc).__name__)
+        return matrix, {"mode": mode, "page": sheet_name, "rows": len(matrix),
+                        "error": type(exc).__name__}
+    stats["page"] = sheet_name
+    logger.info(
+        "%s page=%s mode=%s rows=%d eligible=%d distinct_before=%d max_before=%d "
+        "changed=%d withheld(low_trust/settle/no_score)=%d/%d/%d%s",
+        _RANK_PAGE_TAG, sheet_name, mode, int(stats.get("rows") or 0),
+        int(stats.get("eligible") or 0), int(stats.get("distinct_before") or 0),
+        int(stats.get("max_before") or 0), int(stats.get("changed") or 0),
+        int(stats.get("withheld_low_trust") or 0), int(stats.get("withheld_settle") or 0),
+        int(stats.get("withheld_no_score") or 0),
+        (" skipped=%s" % stats["skipped"]) if stats.get("skipped") else "")
+    return out, stats
+
+
+def _append_runlog_rank_page(sheets: Any, spreadsheet_id: str, page: str,
+                             stats: dict) -> None:
+    """v6.66.0 [RANK-PAGE]: one _Run_Log line per market page per write through
+    the FW-3 channel (10-column shape, two attempts). Status OK (enforce) /
+    OBSERVE (observe) / ERROR (the core failed open). Honors the
+    TFB_SYNC_OHLC_RUNLOG kill switch (the FG-2 lever). Telemetry only: its own
+    append failure is annotated and never counted into _RUNLOG_APPEND_FAILS.
+    Never raises."""
+    if not stats or sheets is None:
+        return
+    if not _ohlc_prewrite_runlog_enabled():
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        err = stats.get("error")
+        mode = str(stats.get("mode") or "")
+        status = "ERROR" if err else ("OK" if mode == "enforce" else "OBSERVE")
+        level = "WARNING" if err else "INFO"
+        msg = (
+            f"[RANK-PAGE] {page} | rows={int(stats.get('rows') or 0)} "
+            f"eligible={int(stats.get('eligible') or 0)} "
+            f"ranked={int(stats.get('ranked') or 0)} "
+            f"distinct_before={int(stats.get('distinct_before') or 0)} "
+            f"max_before={int(stats.get('max_before') or 0)} "
+            f"changed={int(stats.get('changed') or 0)} | withheld lt/settle/noscore="
+            f"{int(stats.get('withheld_low_trust') or 0)}/"
+            f"{int(stats.get('withheld_settle') or 0)}/"
+            f"{int(stats.get('withheld_no_score') or 0)} | mode={mode}"
+            + (f" | top={stats['top']}" if stats.get("top") else "")
+            + (f" | skipped={stats['skipped']}" if stats.get("skipped") else "")
+            + (f" | error={err}" if err else "")
+        )
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            msg, "", "", "",
+                            _runlog_meta_json(json.dumps(
+                                dict(stats, version=SCRIPT_VERSION)))]]}
+        _last = None
+        for _ in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last = None
+                break
+            except Exception as _ae:  # noqa: BLE001
+                _last = _ae
+                time.sleep(1.0)
+        if _last is not None:
+            raise _last
+    except Exception as _e:  # noqa: BLE001
+        print("::warning::%s _Run_Log append FAILED for %s - %s"
+              % (_RANK_PAGE_TAG, page, type(_e).__name__))
+        logger.warning("%s _Run_Log append failed for %s (%s); telemetry only, exit code untouched",
+                       _RANK_PAGE_TAG, page, type(_e).__name__)
 
 
 def _ohlc_fillguard_selftest_() -> bool:

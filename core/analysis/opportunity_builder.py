@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.25.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.25.1  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.25.1 (2026-10-11) [WP-2b]: a row the engine published under
+TFB_SETTLE_UNRESOLVED=enforce (tag settle_unresolved:enforce:<reason>) fails
+the Scoring Settlement gate MAJOR as unresolved_<reason>, exactly like an
+f7_settle_failed:<reason> receipt, so its pass-1 score can never rank or be
+funded even while the Investability gate is off. Rows without that tag are
+byte-identical to v1.25.0 (only the version stamp moves).
 
 v1.25.0 (2026-10-09): executable quote freshness consumes the original
 acquisition proof and actual market quote instant, never the retrieval stamp.
@@ -1404,7 +1411,32 @@ from typing import Optional
 #   (_env_research_diversify). Removed: 0.
 # Rollback: unset TFB_OPP_RESEARCH_DIVERSIFY; or revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.25.0"
+# -----------------------------------------------------------------------------
+# v1.25.1 (2026-10-11) [WP-2b SETTLE-UNRESOLVED READER] - tag-driven, no env.
+# WHY: data_engine_v2 5.153.0 adds TFB_SETTLE_UNRESOLVED (off|observe|enforce).
+#   Under enforce the 46 non-converged rows of the 2026-10-10 export (run
+#   38071484709; GM 45 + CFX IDRUSD=X, all f7_settle_failed:non_converged
+#   today) stop carrying the f7_settle_failed receipt this builder's only
+#   settlement reader matched, and publish a numeric pass-1 score tagged
+#   settle_unresolved:enforce:<reason>:p<n>:ov=..:rc=.. instead. They would
+#   then reach the board as ordinary WATCHLIST rows whose only exclusion is
+#   the Investability gate, which is appended only when
+#   criteria.investability_gate_enabled (env TFB_OPP_INVESTABILITY_GATE or the
+#   panel 'T10: Require Investable', default 'No' since GAS v1.6.9).
+# WHAT (one site, _scoring_settlement_failure): after the unchanged
+#   f7_settle_failed:<reason> scan over every alias (that receipt still wins
+#   when both exist), a second scan matches settle_unresolved:enforce:<reason>
+#   (exact token prefix) and returns 'unresolved_' + reason, which feeds the
+#   existing Scoring Settlement FAIL_MAJOR gate, the board eligibility
+#   pre-filter and the score blank exactly as a failure does. Observe-mode
+#   rows still carry f7_settle_failed and are caught by the first scan.
+# OFF-equivalence: no row carries settle_unresolved:enforce: until the engine
+#   gate is armed (0 on the 10-10 export), so every candidate, gate list and
+#   payload field except the version stamp is byte-identical to v1.25.0.
+#   Functions added 0. Removed 0.
+#   Rollback: git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.25.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3486,6 +3518,18 @@ def _scoring_settlement_failure(row):
                               _to_text(item) or "", re.IGNORECASE)
             if match:
                 return match.group(1).lower()
+    # v1.25.1 (WP-2b): an engine row published under TFB_SETTLE_UNRESOLVED=
+    # enforce carries no failure receipt but an unresolved pass-1 score; it
+    # fails the same gate. Second scan so a failure receipt always wins.
+    for key, value in row.items():
+        if _norm_token(key) not in aliases:
+            continue
+        items = value if isinstance(value, (list, tuple)) else (value,)
+        for item in items:
+            match = re.search(r"(?:^|[;\s|,])settle_unresolved:enforce:([a-z_]+)(?=$|[;\s|,:])",
+                              _to_text(item) or "", re.IGNORECASE)
+            if match:
+                return "unresolved_" + match.group(1).lower()
     return None
 
 
