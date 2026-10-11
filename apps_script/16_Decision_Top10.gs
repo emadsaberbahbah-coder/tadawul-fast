@@ -1,11 +1,21 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.5 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.6 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.6 (2026-10-12) -- OWNER-APPROVED EXACT SOURCE SCOPE
+ * Dated approval 2026-10-12.current-workbook.v1 replaces the staged 1,025
+ * Saudi-leader and 4,496 fund floors with the approved 255/2,474 memberships.
+ * Every readiness boundary reads each complete physical Symbol column and
+ * verifies one sorted-symbol SHA256, without alias mapping or filtering bad
+ * rows. A count alone cannot certify the scope. Missing, duplicate, extra or
+ * substituted symbols withhold execution; membership is bound to the source
+ * capture. Global/commodities floors, freshness, cohort and funding guards
+ * remain in force. No raw approved roster is embedded in this source.
  *
  * v1.13.5 (2026-10-11) -- POST-REVIEW ACTIVATION REPAIRS
  * Owned KPIs become inactive when a mode changes or properties fail. Strict
@@ -1687,7 +1697,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.5';
+var DT10_VERSION = '1.13.6';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -1724,20 +1734,34 @@ function dt10BoardVerdict_(ss, sourceContext) {
   }
   return out;
 }
-// Same approved minimums as the coverage and decision-surface audits.
-// Script Properties may tighten these contracts, never reduce them.
-var DT10_SOURCE_MIN_ROWS = {Market_Leaders: 1025, Global_Markets: 6512,
-                          Commodities_FX: 453, Mutual_Funds: 4496};
+// ML/MF counts are effective only with the exact dated membership receipt.
+// Legacy staged-expansion properties do not override this explicit approval.
+// Unscoped Global/commodities properties may still tighten their floors.
+var DT10_SOURCE_MIN_ROWS = {Market_Leaders: 255, Global_Markets: 6512,
+                          Commodities_FX: 453, Mutual_Funds: 2474};
+var DT10_SOURCE_APPROVED_SCOPE = {
+  policy_revision: '2026-10-12.current-workbook.v1', approved_on: '2026-10-12',
+  pages: {
+    Market_Leaders: {approved_count: 255, supersedes_min_rows: 1025,
+      symbol_set_sha256: '9c9949e0952b3b6c7ac4de2cdefd7fdc084e0649ecffef48e3e27cdaab703c66'},
+    Mutual_Funds: {approved_count: 2474, supersedes_min_rows: 4496,
+      symbol_set_sha256: 'd9a3fcb8aefc9de60de28c1e4d2c89464be2dbaf0907e11edd904bd48214bc02'}
+  }
+};
 var DT10_SOURCE_STATUS_MAX_ROWS = 1000;
 function dt10SourcePolicy_() {
   return dt10PropMemoGet_('source_readiness_policy', function () {
-    var policy = {floors: {}, freshMin: 95, maxAgeMs: 30 * 3600000};
+    var policy = {floors: {}, freshMin: 95, maxAgeMs: 30 * 3600000,
+                  approved_scope: DT10_SOURCE_APPROVED_SCOPE, superseded_properties: {}};
     var props;
     try { props = PropertiesService.getScriptProperties(); } catch (eP) {}
     DT10_POOL_PAGES.forEach(function (page) {
       var floor = DT10_SOURCE_MIN_ROWS[page], value;
       try { value = Number(props.getProperty('TFB_EXPECTED_MIN_ROWS_' + page.toUpperCase())); } catch (eF) {}
-      if (isFinite(value) && value > floor && Math.floor(value) === value) floor = value;
+      if (Object.prototype.hasOwnProperty.call(DT10_SOURCE_APPROVED_SCOPE.pages, page)) {
+        floor = DT10_SOURCE_APPROVED_SCOPE.pages[page].approved_count;
+        if (isFinite(value) && value > 0 && Math.floor(value) === value) policy.superseded_properties[page] = value;
+      } else if (isFinite(value) && value > floor && Math.floor(value) === value) floor = value;
       policy.floors[page] = floor;
     });
     return policy;
@@ -1779,11 +1803,88 @@ function dt10SourceCount_(value) {
   var n = Number(String(value).replace(/,/g, ''));
   return isFinite(n) && n >= 0 && n <= 9007199254740991 && Math.floor(n) === n ? n : null;
 }
+/** One digest of the complete physical column. Trim+upper spelling is the
+ * only normalization: aliases are distinct, duplicate/bad rows are failures,
+ * and the digest serializes sorted names plus one trailing newline. */
+function dt10SourceScopeCore_(rawSymbols, spec, approval) {
+  var out = {ready: false, policy_revision: approval.policy_revision,
+      approved_on: approval.approved_on, expected_count: spec.approved_count,
+      expected_symbol_set_sha256: spec.symbol_set_sha256,
+      supersedes_min_rows: spec.supersedes_min_rows, actual_count: rawSymbols.length,
+      actual_unique_count: 0, duplicate_count: 0, bad_rows: 0,
+      observed_symbol_set_sha256: '', reason: ''};
+  var symbols = [], seen = {};
+  for (var i = 0; i < rawSymbols.length; i++) {
+    var raw = rawSymbols[i], symbol = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+    if (!symbol || symbol.length > 256 || /[\s\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(symbol)) {
+      out.bad_rows++; continue;
+    }
+    var key = '$' + symbol;
+    if (Object.prototype.hasOwnProperty.call(seen, key)) out.duplicate_count++;
+    else { seen[key] = true; symbols.push(symbol); }
+  }
+  out.actual_unique_count = symbols.length;
+  var errors = [];
+  if (out.bad_rows) errors.push('invalid Symbol rows ' + out.bad_rows);
+  if (out.duplicate_count) errors.push('duplicate Symbol rows ' + out.duplicate_count);
+  if (out.actual_count !== spec.approved_count) errors.push('physical count ' + out.actual_count + ' differs from approved ' + spec.approved_count);
+  if (!out.bad_rows && !out.duplicate_count) {
+    try {
+      var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,
+          symbols.sort().join('\n') + '\n', Utilities.Charset.UTF_8), hex = '';
+      for (var b = 0; b < bytes.length; b++) hex += ('0' + ((bytes[b] + 256) % 256).toString(16)).slice(-2);
+      if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error('digest unavailable');
+      out.observed_symbol_set_sha256 = hex;
+      if (hex !== spec.symbol_set_sha256) errors.push('exact approved membership mismatch');
+    } catch (eDigest) { errors.push('membership digest unavailable'); }
+  }
+  out.reason = errors.join('; '); out.ready = !errors.length;
+  return out;
+}
+/** Read full source columns, independently of pool caps/deduplication and
+ * before trusting _Status. Header-only, missing, torn or oversized reads are
+ * unverified; no row may disappear through filtering or projection. */
+function dt10SourceScopeRead_(ss, policy) {
+  var approval = policy.approved_scope, receipts = {};
+  ['Market_Leaders', 'Mutual_Funds'].forEach(function (page) {
+    try {
+      var spec = approval.pages[page], sheet = ss.getSheetByName(page);
+      if (!sheet) throw new Error('source sheet missing');
+      var rows = sheet.getLastRow(), cols = sheet.getLastColumn();
+      if (!(rows >= 2) || rows > DT10_POOL_HARD_CAP + DT10_HEADER_SCAN_ROWS ||
+          !(cols >= 1) || cols > 512) throw new Error('source dimensions invalid');
+      var head = sheet.getRange(1, 1, Math.min(rows, DT10_HEADER_SCAN_ROWS), cols).getValues();
+      var headerRow = -1, symbolCol = -1;
+      for (var r = 0; r < head.length; r++) {
+        for (var c = 0; c < head[r].length; c++) {
+          if (typeof head[r][c] !== 'string' || head[r][c].trim().toUpperCase() !== 'SYMBOL') continue;
+          if (headerRow !== -1) throw new Error('ambiguous Symbol header');
+          headerRow = r + 1; symbolCol = c + 1;
+        }
+      }
+      if (headerRow < 0 || rows <= headerRow) throw new Error('Symbol header/data missing');
+      var grid = sheet.getRange(headerRow + 1, symbolCol, rows - headerRow, 1).getValues();
+      if (grid.length !== rows - headerRow) throw new Error('incomplete Symbol read');
+      var rawSymbols = [];
+      for (var g = 0; g < grid.length; g++) {
+        if (!Array.isArray(grid[g]) || grid[g].length !== 1) throw new Error('invalid Symbol column shape');
+        rawSymbols.push(grid[g][0]);
+      }
+      if (sheet.getLastRow() !== rows || sheet.getLastColumn() !== cols) throw new Error('source dimensions changed during membership read');
+      receipts[page] = dt10SourceScopeCore_(rawSymbols, spec, approval);
+    } catch (eScope) {
+      receipts[page] = {ready: false, policy_revision: approval.policy_revision,
+          reason: String(eScope && eScope.message || eScope)};
+    }
+  });
+  return receipts;
+}
 /** PURE readiness facts; sourceContext binds the exact pre-pool generation. */
-function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
-  var out = {ready: false, reason: '', issues: [], generation: {}, cohort: ''};
+function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy, scopeReceipts) {
+  var out = {ready: false, reason: '', issues: [], generation: {}, cohort: '', approved_scope: {}};
   var rows = {}, index = {}, header = (grid || [])[0] || [];
-  policy = policy || {floors: DT10_SOURCE_MIN_ROWS, freshMin: 95, maxAgeMs: 30 * 3600000};
+  policy = policy || {floors: DT10_SOURCE_MIN_ROWS, freshMin: 95, maxAgeMs: 30 * 3600000,
+      approved_scope: DT10_SOURCE_APPROVED_SCOPE, superseded_properties: {}};
   function issue(text) { out.issues.push(text); }
   for (var h = 0; h < header.length; h++) {
     var token = dt10NormToken_(header[h]);
@@ -1808,7 +1909,20 @@ function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
     var message = String(row[index.message] || '');
     var stamp = dt10SourceStampMs_(row[index.lastupdated]);
     var count = dt10SourceCount_(row[index.rows]);
-    out.generation[page] = JSON.stringify([String(row[index.lastupdated]), state, message, count]);
+    var scope = policy.approved_scope.pages[page], receipt = scopeReceipts && scopeReceipts[page];
+    var scopeGeneration = null;
+    if (scope) {
+      if (!receipt || receipt.ready !== true || receipt.policy_revision !== policy.approved_scope.policy_revision ||
+          receipt.actual_count !== scope.approved_count || receipt.actual_unique_count !== scope.approved_count ||
+          receipt.observed_symbol_set_sha256 !== scope.symbol_set_sha256) {
+        issue(page + ' approved scope unverified: ' + ((receipt && receipt.reason) || 'membership receipt unavailable'));
+      }
+      out.approved_scope[page] = receipt || {ready: false, reason: 'membership receipt unavailable'};
+      if (count !== scope.approved_count) issue(page + ' status count differs from approved scope ' + scope.approved_count);
+      scopeGeneration = [policy.approved_scope.policy_revision, receipt ? receipt.actual_count : null,
+          receipt ? receipt.observed_symbol_set_sha256 : null, receipt ? receipt.ready : false];
+    }
+    out.generation[page] = JSON.stringify([String(row[index.lastupdated]), state, message, count, scopeGeneration]);
     // Fresh independent page stamps cannot certify one publication cycle.
     // The scheduled producer publishes one positive GitHub run ID per row;
     // a missing/duplicate/reusable "local" value proves no shared cohort.
@@ -1826,6 +1940,7 @@ function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
     if (fresh === null || requested === null || !isFinite(fresh) || !isFinite(requested) ||
         requested > 9007199254740991 || requested <= 0 || fresh > requested) issue(page + ' acquisition receipt unknown/invalid');
     else {
+      if (scope && requested !== scope.approved_count) issue(page + ' acquisition denominator differs from approved scope ' + scope.approved_count);
       if (requested < floor) issue(page + ' acquired denominator ' + requested + ' below floor ' + floor);
       if (fresh * 100 < policy.freshMin * requested) issue(page + ' acquired ' + fresh + '/' + requested + ' below ' + policy.freshMin + '%');
     }
@@ -1840,6 +1955,14 @@ function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
       if (sourceContext.pool_counts) {
         var poolN = dt10SourceCount_(sourceContext.pool_counts[page]);
         if (poolN === null || poolN < floor) issue(page + ' available pool ' + (poolN === null ? 'unknown' : poolN) + ' below floor ' + floor);
+        if (scope) {
+          var used = sourceContext.pool_scope_receipts && sourceContext.pool_scope_receipts[page];
+          if (!used || used.ready !== true || used.policy_revision !== policy.approved_scope.policy_revision ||
+              used.actual_count !== scope.approved_count || used.actual_unique_count !== scope.approved_count ||
+              used.observed_symbol_set_sha256 !== scope.symbol_set_sha256) {
+            issue(page + ' collected physical pool scope unverified');
+          }
+        }
       }
     }
   });
@@ -1853,12 +1976,17 @@ function dt10SourceReadinessCore_(grid, nowMs, sourceContext, policy) {
 /** Bounded read, once per readiness boundary; no row or sheet mutations. */
 function dt10SourceReadiness_(ss, sourceContext) {
   try {
+    var policy = dt10SourcePolicy_();
+    var scopeReceipts = dt10SourceScopeRead_(ss, policy);
     var sheet = ss.getSheetByName('_Status');
     if (!sheet) throw new Error('_Status missing');
     var rows = sheet.getLastRow(), cols = sheet.getLastColumn();
     if (!(rows >= 2) || rows > DT10_SOURCE_STATUS_MAX_ROWS || !(cols >= 7)) throw new Error('_Status dimensions invalid');
     var values = sheet.getRange(1, 1, rows, Math.min(cols, 10)).getValues();
-    return dt10SourceReadinessCore_(values, Date.now(), sourceContext, dt10SourcePolicy_());
+    var result = dt10SourceReadinessCore_(values, Date.now(), sourceContext, policy, scopeReceipts);
+    result.scope_policy_revision = policy.approved_scope.policy_revision;
+    result.superseded_scope_properties = policy.superseded_properties;
+    return result;
   } catch (eSource) {
     return {ready: false, reason: 'source status unavailable', issues: ['source status unavailable'], generation: {}};
   }
@@ -5511,8 +5639,11 @@ function dt10CollectPoolRows_(ss, limit) {
   var order = [];
   var seen = {};
   var duplicatesSkipped = 0;
+  var scopeReceipts = {};
   for (var p = 0; p < DT10_POOL_PAGES.length; p++) {
     var pageName = DT10_POOL_PAGES[p];
+    var scope = DT10_SOURCE_APPROVED_SCOPE.pages[pageName];
+    if (scope) scopeReceipts[pageName] = {ready: false, reason: 'physical pool scope unavailable'};
     perPageRows[pageName] = [];
     available[pageName] = 0;
     var sheet = ss.getSheetByName(pageName);
@@ -5526,6 +5657,23 @@ function dt10CollectPoolRows_(ss, limit) {
     if (!values || !values.length) continue;
     var hIdx = dt10FindHeaderRow_(values, DT10_HEADER_SCAN_ROWS);
     if (hIdx < 0) continue;
+    if (scope) {
+      try {
+        var symbolColumn = -1;
+        for (var hc = 0; hc < values[hIdx].length; hc++) {
+          if (typeof values[hIdx][hc] === 'string' && values[hIdx][hc].trim().toUpperCase() === 'SYMBOL') {
+            if (symbolColumn !== -1) throw new Error('ambiguous pool Symbol header');
+            symbolColumn = hc;
+          }
+        }
+        if (symbolColumn === -1) throw new Error('pool Symbol header missing');
+        var physicalSymbols = [];
+        for (var pr = hIdx + 1; pr < values.length; pr++) physicalSymbols.push(values[pr][symbolColumn]);
+        scopeReceipts[pageName] = dt10SourceScopeCore_(physicalSymbols, scope, DT10_SOURCE_APPROVED_SCOPE);
+      } catch (ePoolScope) {
+        scopeReceipts[pageName] = {ready: false, reason: String(ePoolScope && ePoolScope.message || ePoolScope)};
+      }
+    }
     var colMap = dt10MapHeaderCols_(values[hIdx]);
     for (var r = hIdx + 1; r < values.length; r++) {
       var obj = dt10PoolRowFromSheetRow_(values[r], colMap, pageName);
@@ -5578,7 +5726,7 @@ function dt10CollectPoolRows_(ss, limit) {
   }
   return { rows: rows, perPage: perPage, available: available,
            cap: cap, total: total, truncated: (total > cap),
-           duplicatesSkipped: duplicatesSkipped };
+           duplicatesSkipped: duplicatesSkipped, approved_scope: scopeReceipts };
 }
 // ---------------------------------------------------------------------------
 // HTTP
@@ -6625,6 +6773,7 @@ function refreshDecisionTop10() {
   if (useSheets) {
     pool = dt10CollectPoolRows_(ss, poolLimit);
     sourceContext.pool_counts = pool.available;
+    sourceContext.pool_scope_receipts = pool.approved_scope || {};
     // Empty sheet input is explicit; never silently switch to another pool.
     body.rows = pool.rows;
     if (pool.rows.length) {

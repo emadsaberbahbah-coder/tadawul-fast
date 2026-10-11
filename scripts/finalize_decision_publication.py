@@ -25,8 +25,11 @@ if str(ROOT) not in sys.path:
 from core.secret_redaction import redact_text, safe_error_text
 from scripts import audit_decision_surface_freshness as freshness
 from scripts import audit_full_refresh_coverage as coverage
+from scripts.approved_universe_scope import (
+    approved_floors, load_scope, receipt_matches_policy,
+)
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.1"
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -34,8 +37,8 @@ REQUIRED_PAGES = {
     "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
     "My_Portfolio", "Insights_Analysis", "Data_Dictionary",
 }
-MARKET_FLOORS = {"Market_Leaders": 1025, "Global_Markets": 6512,
-                 "Commodities_FX": 453, "Mutual_Funds": 4496}
+MARKET_FLOORS = {"Market_Leaders": 255, "Global_Markets": 6512,
+                 "Commodities_FX": 453, "Mutual_Funds": 2474}
 
 
 def _bounded_env(name: str, default: float, *, minimum=None, maximum=None) -> float:
@@ -53,15 +56,18 @@ def _bounded_env(name: str, default: float, *, minimum=None, maximum=None) -> fl
     return value
 
 
-def final_policy() -> tuple[list[coverage.Rule], dict[str, Any]]:
+def final_policy(*, approved_scope=None) -> tuple[list[coverage.Rule], dict[str, Any]]:
     """Pass an explicit policy to both auditors without mutating process env."""
+    scope = approved_scope if approved_scope is not None else load_scope()
+    current = approved_floors(policy=scope)
     floors, minimum_fresh, rules = {}, {}, []
     market_age = _bounded_env("TFB_DECISION_SOURCE_MAX_AGE_H", 30, maximum=30)
     decision_age = _bounded_env("TFB_DECISION_SURFACE_MAX_AGE_H", 8, maximum=8)
     for page, baseline in MARKET_FLOORS.items():
         suffix = page.upper()
-        floors[page] = math.ceil(_bounded_env("TFB_EXPECTED_MIN_ROWS_" + suffix,
-                                             baseline, minimum=baseline))
+        floors[page] = (current[page] if page in current else
+                        math.ceil(_bounded_env("TFB_EXPECTED_MIN_ROWS_" + suffix,
+                                               baseline, minimum=baseline)))
         minimum_fresh[page] = _bounded_env("TFB_REFRESH_MIN_FRESH_PCT_" + suffix,
                                           95, minimum=95, maximum=100)
         age = _bounded_env("TFB_REFRESH_MAX_AGE_H_" + suffix, market_age, maximum=market_age)
@@ -75,6 +81,30 @@ def final_policy() -> tuple[list[coverage.Rule], dict[str, Any]]:
     ])
     return rules, {"min_rows": floors, "market_max_age_h": market_age,
                    "decision_max_age_h": decision_age, "min_fresh_percent": minimum_fresh}
+
+
+def complete_membership_proven(receipt: dict, page: str, scope) -> bool:
+    """A matching bounded snapshot cannot attest the unexamined sparse tail."""
+    proof = receipt.get("complete_column_proof")
+    if not isinstance(proof, dict) or proof.get("valid") is not True or proof.get("crossbound") is not True:
+        return False
+    if proof.get("range") != page + "!A:A":
+        return False
+    if type(proof.get("bound")) is not int or proof["bound"] != 20050:
+        return False
+    if type(proof.get("symbol_column")) is not int or proof["symbol_column"] != 1:
+        return False
+    header, extent = proof.get("header_row"), proof.get("returned_rows")
+    if type(header) is not int or not 1 <= header <= 45 or type(extent) is not int:
+        return False
+    if not header + scope.pages[page].approved_count <= extent <= 20050:
+        return False
+    return all(proof.get(key) == receipt.get(outer) for key, outer in (
+        ("observed_symbol_set_sha256", "observed_symbol_set_sha256"),
+        ("bounded_symbol_set_sha256", "observed_symbol_set_sha256"),
+        ("actual_membership_sha256", "actual_membership_sha256"),
+        ("bounded_membership_sha256", "actual_membership_sha256"),
+    ))
 
 
 def publication_slot(grid: Any) -> int:
@@ -135,16 +165,24 @@ async def run(spreadsheet_id: str, *, reader=None, registry=None,
         raise ValueError("final publication requires the full 20,000-row audit bound")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", str(run_id)):
         raise ValueError("run identity is invalid")
-    rules, policy = final_policy()
-    if publish or str(run_id) != "local":
-        policy["expected_source_run"] = str(run_id)
-    reports = await asyncio.gather(
-        coverage.run(spreadsheet_id, max_rows, reader=reader, registry=registry, policy_rules=rules),
-        freshness.run_live(spreadsheet_id, reader=reader, **policy),
-        return_exceptions=True,
-    )
+    scope, policy_fault = None, None
+    try:
+        scope = load_scope()
+        rules, policy = final_policy(approved_scope=scope)
+        if publish or str(run_id) != "local":
+            policy["expected_source_run"] = str(run_id)
+        reports = await asyncio.gather(
+            coverage.run(spreadsheet_id, max_rows, reader=reader, registry=registry,
+                         policy_rules=rules, approved_scope=scope),
+            freshness.run_live(spreadsheet_id, reader=reader, approved_scope=scope, **policy),
+            return_exceptions=True,
+        )
+    except Exception as exc:
+        policy_fault = exc
+        policy = {"approved_scope_error": safe_error_text(exc)}
+        reports = (exc, exc)
     full, decision = reports
-    reasons, audit_payloads, codes = [], {}, []
+    reasons, audit_payloads, codes = (["approved_scope_unavailable"] if policy_fault else []), {}, []
     for name, report, attr in (("coverage", full, "code"),
                                ("decision", decision, "exit_code")):
         if isinstance(report, BaseException):
@@ -167,6 +205,15 @@ async def run(spreadsheet_id: str, *, reader=None, registry=None,
             if name == "decision" and code <= 1:
                 if type(report.executable) is not bool or (code == 0 and report.executable is not True):
                     raise ValueError("decision audit has no accepted verdict")
+            if code <= 1:
+                for page in scope.pages:
+                    receipt = (next(item.approved_scope for item in report.pages if item.page == page)
+                               if name == "coverage" else
+                               report.source_status.get(page, {}).get("approved_scope"))
+                    if (not isinstance(receipt, dict) or receipt.get("page") != page
+                            or not receipt_matches_policy(receipt, policy=scope)
+                            or not complete_membership_proven(receipt, page, scope)):
+                        raise ValueError(name + " audit has no verified approved membership for " + page)
             payload = json.loads(redact_text(json.dumps(payload, default=str, allow_nan=False)))
         except Exception as exc:
             code, payload = 3, {"fatal": safe_error_text(exc), "exit_code": 3}
@@ -175,7 +222,7 @@ async def run(spreadsheet_id: str, *, reader=None, registry=None,
         if code >= 2:
             reasons.append(name + "_failed")
     result = {"script_version": SCRIPT_VERSION, "run_id": run_id,
-              "policy": policy,
+              "policy": {**policy, **({"approved_scope": scope.receipt()} if scope else {})},
               "audits": audit_payloads, "audit_exit_codes": codes,
               "blockers": reasons, "feed_promoted": False,
               "blocker_published": False, "exit_code": max(codes)}

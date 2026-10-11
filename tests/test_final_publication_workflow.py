@@ -192,16 +192,16 @@ class FinalPublicationShellTests(unittest.TestCase):
         self.assertNotIn(self.credentials["client_email"], unmasked)
         self.assertFalse((self.root / "credential-shell-injection").exists())
 
-    def test_audit_exit_0_and_1_are_accepted_but_2_and_3_fail_job(self):
+    def test_only_audit_exit_0_is_accepted_and_every_nonzero_fails_job(self):
         for code in (0, 1, 2, 3, 127):
             with self.subTest(code=code):
                 output_path = Path(self.env["GITHUB_OUTPUT"])
                 output_path.unlink(missing_ok=True)
                 result = self.run_step("Audit final coverage and decision clocks", STUB_AUDIT_EXIT=str(code))
-                self.assertEqual(result.returncode, code if code >= 2 else 0, result.stderr)
+                self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(output_path.read_text(), f"audit_exit={code}\n")
-                self.assertEqual("::error::" in result.stdout, code >= 2)
-                self.assertEqual("::warning::" in result.stdout, code == 1)
+                self.assertEqual("::error::" in result.stdout, code != 0)
+                self.assertNotIn("::warning::", result.stdout)
                 self.assert_no_credential_disclosure(result)
         self.assertEqual(json.loads(Path(self.env["STUB_CALL_PATH"]).read_text()), [
             "scripts/finalize_decision_publication.py", "--sheet-id", "fake-workbook",
@@ -308,7 +308,7 @@ class FinalPublicationShellTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertEqual(self.run_step("Configure final-audit credentials").returncode, 0)
                 audit = self.run_step("Audit final coverage and decision clocks", STUB_AUDIT_EXIT=str(code))
-                self.assertEqual(audit.returncode, code if code >= 2 else 0)
+                self.assertEqual(audit.returncode, code)
                 for name in ("Publish final audit summary", "Secure credential cleanup"):
                     result = self.run_step(name)
                     self.assertEqual(result.returncode, 0, result.stderr)

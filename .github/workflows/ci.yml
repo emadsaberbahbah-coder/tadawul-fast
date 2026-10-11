@@ -2,7 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.8 (2026-10-11) -- INTEGRATED REVIEW REGRESSIONS
+# VERSION 1.1.9 (2026-10-12) -- APPROVED ROSTER SCOPE
+#
+# v1.1.9: exact membership, workflow bindings and read-only identity evidence
+# regressions join the required lean lane. Data quality stays strict.
 #
 # v1.1.8: install the same PDF regression dependencies in whole-suite discovery
 # as in the required heavy job; production requirements remain unchanged.
@@ -253,6 +256,7 @@ on:
   push:
     paths:
       - 'main.py'
+      - 'config/approved_universe_scope_v1.json'
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
@@ -450,6 +454,11 @@ jobs:
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
+            tests/test_approved_universe_scope.py \
+            tests/test_approved_universe_workflow.py \
+            tests/test_approved_scope_native_binding.py \
+            tests/test_name_identity_evidence.py \
+            tests/test_name_identity_workflow.py \
             tests/test_decision_surface_freshness.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
