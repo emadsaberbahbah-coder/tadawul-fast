@@ -2,8 +2,90 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.152.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.153.0
 ================================================================================
+
+WHY v5.153.0 - WP-2b SETTLE-UNRESOLVED PUBLICATION RULE (env TFB_SETTLE_UNRESOLVED
+= off | observe | enforce, explicit words only, default OFF -> byte-identical)
+- EVIDENCE (export 2026-10-10, sync run 38071484709; live rows ML 255 / GM
+  6,609 / CFX 453 / MF 2,474; WP-0 scripts/tfb_workbook_dq_audit.py v1.0.0
+  DQ-37 non_converged 0 / 45 / 1 / 0 = 46). Every one of the 46 rows carries
+  f7_settle_failed:non_converged (GM 45 + CFX IDRUSD=X), Scoring Errors
+  scoring_settlement JSON reason pass_limit with passes_run 3, Block Reason
+  'Scoring settlement failed; clean rebuild required', Final Action
+  DO_NOT_INVEST, blank Overall Score and Rank (Overall) and the tag
+  rank_skipped_settlement_failure. INVESTABLE among them: 0. Status GM 42
+  WATCHLIST + 3 BLOCKED (PMT.US, MOV.US, HAYW.US, all published HOLD) + CFX 1
+  WATCHLIST. Pass-1 overall on the 45 GM rows 13.65..65.12 (none reaches the
+  conservative 68 floor), IDRUSD=X 48.25. 44 of 45 GM rows are
+  provider_target + analyst_lkg + the short-horizon derivation cap tag, 43
+  with last-known r12 > 0.35, drifting monotonically within the 0.05 tolerance
+  each pass (AC.TO last diff op 70.31>70.16): a WP-3 symptom (hypothesis, not
+  code-traced), not a ranking fault. 5,809 rows settle only at pass 4 (ML 148
+  / GM 2,824 / CFX 431 / MF 2,406), so TFB_SCORING_SETTLE_MAX_PASSES stays 4:
+  the framework's 'cap at 3 passes' already IS the default (pass 1 + 3
+  re-passes, tags p3). Nothing here changes MAX_PASSES.
+- REFUTED PREMISES: (1) no INVESTABLE leak exists (0 of 46); what remains is
+  the publication posture (blanked scores, BLOCKED on 3 HOLD rows, a block
+  reason nobody can act on). (2) 'publish the last stable pass' has no object:
+  F7SettlementResult carries no row for non_converged, so the only basis
+  outside the loop is PASS 1 - the basis every observe-mode row publishes.
+  (3) TFB_SCORING_SETTLE=observe is already fail-closed for non_converged and
+  error (the non-stable branch runs before the mode check), so OFF of the new
+  gate reproduces today's holdback byte-for-byte.
+- off (unset): _f7_settle_pass runs the v5.152.0 lines unchanged.
+- observe: today's holdback values PLUS one countable tag composed from the
+  still-intact pass-1 row BEFORE the holdback blanks it:
+  settle_unresolved:observe:<pass_limit|oscillation>:p<n>:ov=<pass-1 overall>
+  :rc=<pass-1 recommendation> (AC.TO -> ...:pass_limit:p3:ov=52.11:rc=reduce).
+- enforce (non_converged only; status error stays fail-closed in EVERY mode):
+  _f7_settle_unresolved_publish keeps the pass-1 scores, forecast tuple,
+  opportunity source and recommendation, applies the intrinsic display cap,
+  withholds rank_overall, appends settle_unresolved:enforce:<reason>:p<n>:
+  ov=..:rc=.., KEEPS the scoring_settlement:{...} JSON in scoring_errors (the
+  tag is the countable read-back; first_diff / last_diff are the only per-row
+  drift evidence WP-0 / WP-3 need), turns an ADD-family action_flag / decision
+  into HOLD and, on a non-exit non-sell row, writes position_size_hint
+  'Hold existing; no new capital (scoring unresolved)'. It writes NO
+  f7_settle_failed receipt and no investability / final action / block
+  reason at settle time.
+- TAG-DRIVEN, MODE-INDEPENDENT READERS (exact prefix 'settle_unresolved:',
+  never the substring 'unresolved', which margin_publish receipts end with):
+  _apply_investability_gate gains a tier after Fix W: INVESTABLE ->
+  WATCHLIST / WATCH, reason 'Scoring unresolved after settlement passes
+  (settle_unresolved) -- research only, no new capital' (BLOCKED stays
+  BLOCKED, WATCHLIST keeps its own reason); because that reason is non-empty,
+  Fix AP rewrites a buy-family recommendation on the demoted row to HOLD at
+  every boundary (scores stay pass-1). _top10_row_is_eligible returns False;
+  _apply_rank_overall skips the row (rank None, rank_skipped_settle_unresolved);
+  _portfolio_decision returns HOLD and _compute_portfolio_fields turns an ADD
+  Rebalance Action into HOLD (an unresolved score never funds an ADD).
+  A later switch to off cannot promote a cached unresolved row. A fresh STABLE
+  settlement retires a stale settle_unresolved:* part and its
+  rank_skipped_settle_unresolved companion (L2 / KLG carried warnings), so the
+  row ranks again; no such part exists while the gate was never armed.
+- COMPANION SEAMS (same WP, other files): routes/analysis_sheet_rows.py 4.8.2
+  (the per-request rank withholds f7_settle_failed: / settle_unresolved:
+  rows), core/analysis/opportunity_builder.py 1.25.1 (settle_unresolved:
+  enforce:<reason> fails the Scoring Settlement gate MAJOR as
+  unresolved_<reason>), scripts/run_dashboard_sync.py 6.66.0 (WP-2c page rank
+  excludes both prefixes).
+- EXPECTED ENFORCE READ-BACK (hypothesis until the first enforce export):
+  f7_settle_failed:non_converged 46 -> 0, settle_unresolved:enforce: 0 -> 46,
+  blank Overall Score on them 46 -> 0, Rank (Overall) blank on all 46,
+  INVESTABLE among them 0 (by construction), BLOCKED among them expected <= 3,
+  decided by the base chain; 'clean rebuild required' 46 -> 0. The DQ-37 rc=
+  flip count (2,618) is not moved by this build (that is WP-12 #1). WP-0
+  DQ-37 must count settle_unresolved:* beside f7_settle_failed:non_converged.
+- Disclosure: surface_gate_states()['settle_unresolved'] (/health
+  engine_gates) and the [GUARDS] boot leg settle_unresolved=<mode>. Functions
+  added 8 (_f7_unresolved_mode, _f7_settle_unresolved_parts,
+  _f7_settle_unresolved, _f7_unresolved_part, _f7_unresolved_strip,
+  _f7_settle_unresolved_tag, _f7_unresolved_capital_hold,
+  _f7_settle_unresolved_publish), constants 6, removed 0. Rollback: unset
+  TFB_SETTLE_UNRESOLVED (= off) or git revert; rows already published under
+  enforce stay capped and unranked by their tag until a stable settlement
+  retires it (tag-driven by design).
 
 WHY v5.152.0 - WP-3ab FORECAST TUPLE PUBLISH SEAMS (env TFB_TUPLE_NOISE_RELEASE,
 TFB_ROI12_SOFTCAP_GATE, both off|observe|enforce, default OFF -> byte-identical)
@@ -4040,7 +4122,10 @@ from core.financial_units import (
 # as an upstream provider rating. Settlement failures remain fail-closed.
 # v5.152.0 (WP-3ab): publish-boundary tuple seams -- noise-class ROI release
 # and the 12M ceiling for keep-last-good targets; both gated, default off.
-__version__ = "5.152.0"
+# v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
+# non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
+# never ranked, never funded.
+__version__ = "5.153.0"
 
 from core.sheet_presentation import present_instrument_row
 
@@ -5936,6 +6021,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "margin_publish": _margin_publish_mode(),                  # v5.151.0 (P-152)
             "roi12_softcap": _roi12_softcap_mode(),                    # v5.152.0 (WP-3b)
             "tuple_noise_release": _tuple_noise_mode(),                # v5.152.0 (WP-3a)
+            "settle_unresolved": _f7_unresolved_mode(),                # v5.153.0 (WP-2b)
         }
     except Exception:
         return {}
@@ -5988,6 +6074,8 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return False
     if _f7_settle_failed(row):
+        return False
+    if _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never seats a board row
         return False
     if not _top10_quality_filter_enabled():
         return True
@@ -8075,6 +8163,16 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
             status, action = "WATCHLIST", "WATCH"
             reason = "Thin trading history (no 52W range) -- treat as new/IPO listing"
 
+    # -- v5.153.0 (WP-2b): settle-unresolved cap. Tag-driven (survives cache,
+    # projection and a later switch of TFB_SETTLE_UNRESOLVED to off) and
+    # DEMOTE-only: a row published with pass-1 scores under enforce is never
+    # INVESTABLE. BLOCKED / WATCHLIST rows keep the base chain's verdict and
+    # reason. No tag on the row (every row while the gate was never armed) ->
+    # this tier cannot fire (byte-identical).
+    if status == "INVESTABLE" and _f7_settle_unresolved(row):
+        status, action = "WATCHLIST", "WATCH"
+        reason = _F7_UNRESOLVED_REASON
+
     # -- v5.84.0 (Fix AA-1/AA-2): transparency tags, POST-verdict ---------------
     # Placed after the reliability computation and the entire verdict chain so
     # neither tag can feed back into rel/status within this pass; both tag
@@ -9438,6 +9536,16 @@ _F7_SETTLE_MAX_DEFAULT: int = 4
 _F7_SETTLE_MAX_CAP: int = 5
 _F7_SETTLE_TAG: str = "f7_settle"
 _F7_SETTLE_FAILURE_TAG: str = "f7_settle_failed:"
+# v5.153.0 (WP-2b): settle_unresolved publication rule (see WHY v5.153.0). The
+# tag prefix is distinct from f7_settle_failed: so no holdback site, test regex
+# or builder regex that reads the failure receipt can match it.
+_F7_UNRESOLVED_ENV: str = "TFB_SETTLE_UNRESOLVED"
+_F7_UNRESOLVED_TAG: str = "settle_unresolved"
+_F7_UNRESOLVED_PREFIX: str = _F7_UNRESOLVED_TAG + ":"
+_F7_UNRESOLVED_RANK_TAG: str = "rank_skipped_" + _F7_UNRESOLVED_TAG
+_F7_UNRESOLVED_REASON: str = (
+    "Scoring unresolved after settlement passes (settle_unresolved) -- research only, no new capital")
+_F7_UNRESOLVED_SIZE_HINT: str = "Hold existing; no new capital (scoring unresolved)"
 # Source observations remain fixed while generated forecasts and scores settle.
 # The broader TFB-05 canonical tuple / execution-policy split is independent.
 _F7_SETTLE_SOURCE_FIELDS: Tuple[str, ...] = (
@@ -9490,6 +9598,133 @@ def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
 def _f7_settle_failed(row: Mapping[str, Any]) -> bool:
     """A known failure survives projection, cache reuse and later mode changes."""
     return bool(_f7_settle_failure_parts(row))
+
+
+def _f7_unresolved_mode() -> str:
+    """v5.153.0 (WP-2b) TFB_SETTLE_UNRESOLVED: off (default) | observe | enforce.
+    Explicit words only -- "1"/"true"/"on" read as off (the _f7_settle_mode
+    convention). Read at call time, only inside the non_converged branch of
+    _f7_settle_pass, so the gate is inert while TFB_SCORING_SETTLE is off."""
+    raw = (os.getenv(_F7_UNRESOLVED_ENV) or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _f7_settle_unresolved_parts(row: Mapping[str, Any]) -> List[str]:
+    """v5.153.0 (WP-2b): settle_unresolved:* warning parts across every warning
+    alias (the _f7_settle_failure_parts scan; exact prefix, never a substring)."""
+    if not isinstance(row, Mapping):
+        return []
+    aliases = {_norm_key(key) for key in ("warnings", *_CANONICAL_FIELD_ALIASES.get("warnings", ()))}
+    parts: List[str] = []
+    for key, value in row.items():
+        normalized_key = key.lower().strip("_") if isinstance(key, str) and key.isidentifier() else _norm_key(key)
+        if normalized_key in aliases:
+            parts.extend(part for part in _mpc_warning_parts({"warnings": value})
+                         if part.startswith(_F7_UNRESOLVED_PREFIX))
+    return list(dict.fromkeys(parts))
+
+
+def _f7_settle_unresolved(row: Mapping[str, Any]) -> bool:
+    """v5.153.0 (WP-2b): the row was published with an unresolved (non-converged)
+    pass-1 score. Tag-driven and mode-independent like _f7_settle_failed, so a
+    cached row stays capped, unranked and unfunded after any mode switch."""
+    return bool(_f7_settle_unresolved_parts(row))
+
+
+def _f7_unresolved_part(part: Any) -> bool:
+    """v5.153.0 (WP-2b): a settle_unresolved:* receipt or its rank companion."""
+    text = _safe_str(part).strip()
+    return text.startswith(_F7_UNRESOLVED_PREFIX) or text == _F7_UNRESOLVED_RANK_TAG
+
+
+def _f7_unresolved_strip(row: Dict[str, Any]) -> int:
+    """v5.153.0 (WP-2b): drop settle_unresolved:* parts and the
+    rank_skipped_settle_unresolved companion from every warning alias. A row
+    without such a part is left untouched (not re-joined, not normalized), so
+    every row of a never-armed deployment is byte-identical. Returns the
+    number of parts removed."""
+    if not isinstance(row, dict):
+        return 0
+    aliases = {_norm_key(key) for key in ("warnings", *_CANONICAL_FIELD_ALIASES.get("warnings", ()))}
+    removed = 0
+    for key in tuple(row):
+        normalized_key = key.lower().strip("_") if isinstance(key, str) and key.isidentifier() else _norm_key(key)
+        if normalized_key not in aliases:
+            continue
+        value = row[key]
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(";") if p.strip()]
+            kept = [p for p in parts if not _f7_unresolved_part(p)]
+            if len(kept) != len(parts):
+                removed += len(parts) - len(kept)
+                row[key] = "; ".join(kept)
+        elif isinstance(value, (list, tuple)):
+            kept_items = [p for p in value if not _f7_unresolved_part(p)]
+            if len(kept_items) != len(value):
+                removed += len(value) - len(kept_items)
+                row[key] = tuple(kept_items) if isinstance(value, tuple) else kept_items
+    return removed
+
+
+def _f7_settle_unresolved_tag(mode: str, result: "F7SettlementResult", row: Mapping[str, Any]) -> str:
+    """v5.153.0 (WP-2b): ONE substring-safe receipt
+    settle_unresolved:<mode>:<reason>:p<n>:ov=<pass-1 overall>:rc=<pass-1 rec>.
+    Reason and recommendation pass through _f7_settle_token; if a forbidden
+    gate substring ever survived, the tag degrades to its first four parts
+    (the _f7_settle_tag discipline)."""
+    parts = [_F7_UNRESOLVED_TAG, _safe_str(mode).strip().lower() or "na",
+             _f7_settle_token(result.reason or "na"), "p%d" % int(result.passes_run or 0),
+             "ov=" + _f7_settle_fmt("num", row.get("overall_score")),
+             "rc=" + _f7_settle_token(row.get("recommendation"))]
+    tag = ":".join(parts)
+    if any(f in tag.lower() for f in _REL_PATH_FORBIDDEN):
+        tag = ":".join(parts[:4])
+    return tag
+
+
+def _f7_unresolved_capital_hold(row: Dict[str, Any]) -> None:
+    """v5.153.0 (WP-2b): the holdback's ADD -> HOLD neutralisation for a row
+    published under TFB_SETTLE_UNRESOLVED=enforce - neither the drift-only
+    Rebalance Action (action_flag) nor the blended decision may instruct new
+    capital on an unresolved score. Tag-driven; no tag -> no-op."""
+    if not isinstance(row, dict) or not _f7_settle_unresolved(row):
+        return
+    for key in ("action_flag", "decision"):
+        if _safe_str(row.get(key)).strip().upper() in {"ADD", "BUY", "INVEST", "ACCUMULATE"}:
+            row[key] = "HOLD"
+
+
+def _f7_settle_unresolved_publish(row: Dict[str, Any], result: "F7SettlementResult") -> None:
+    """v5.153.0 (WP-2b) TFB_SETTLE_UNRESOLVED=enforce on a non_converged result:
+    publish the PASS-1 row as research-only. Scores, forecast tuple,
+    opportunity source and recommendation stay pass-1 (a buy-family
+    recommendation on a gate-demoted row becomes HOLD by Fix AP at the
+    boundary). Rank and new capital are withheld; the scoring_settlement JSON
+    stays beside the tag as evidence. No f7_settle_failed receipt, no
+    investability / final action / block reason write."""
+    if not isinstance(row, dict):
+        return
+    import json
+    _cap_intrinsic_display(row)  # the holdback's display policy applies here too
+    _f7_unresolved_strip(row)  # one receipt per row: a stale one never doubles up
+    _v573_append_warning(row, _f7_settle_unresolved_tag("enforce", result, row))
+    details = {
+        "status": result.status, "reason": result.reason,
+        "passes_run": result.passes_run, "error_type": result.error_type,
+        "first_diff": result.first_diff, "last_diff": result.last_diff,
+        "pass1_scores": {k: _json_safe(row.get(k)) for k in _F7_SETTLE_DEPENDENT_FIELDS if k in row},
+    }
+    error = "scoring_settlement:" + json.dumps(details, sort_keys=True, separators=(",", ":"))
+    existing = _coerce_scoring_errors_for_sheet(row.get("scoring_errors"))
+    row["scoring_errors"] = (existing + "; " + error) if existing else error
+    for alias in _CANONICAL_FIELD_ALIASES.get("rank_overall", ("rank_overall",)):
+        if alias in row or alias == "rank_overall":
+            row[alias] = None
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) or _canonical_recommendation(row.get("recommendation"))
+    exit_action = _safe_str(row.get("final_action")).strip().upper() in {"EXIT", "SELL", "REDUCE", "TRIM"}
+    _f7_unresolved_capital_hold(row)
+    if not exit_action and rec not in _TOP10_EXCLUDED_RECO_FAMILIES:
+        row["position_size_hint"] = _F7_UNRESOLVED_SIZE_HINT
 
 
 def _f7_reject_scoring_patch_failures(row: Mapping[str, Any], patch: Mapping[str, Any]) -> None:
@@ -9751,13 +9986,37 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
         return row
     result = _f7_settle_result(row)
     if result.status != "stable":
+        # v5.153.0 (WP-2b): only a non_converged result consults
+        # TFB_SETTLE_UNRESOLVED; status error stays fail-closed in every mode.
+        # off -> the v5.152.0 lines below run unchanged (byte-identical).
+        _unres = _f7_unresolved_mode() if result.status == "non_converged" else "off"
+        if _unres == "enforce":
+            _f7_settle_unresolved_publish(row, result)
+            logger.debug(
+                "[engine_v2 v%s F-7b] unresolved published for %s (page=%s): %s",
+                __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+                result.reason,
+            )
+            return row
+        # observe: compose the receipt from the still-intact pass-1 row BEFORE
+        # the holdback blanks it; the values below are exactly today's.
+        _obs_tag = _f7_settle_unresolved_tag("observe", result, row) if _unres == "observe" else ""
         _f7_settle_holdback(row, result)
+        if _obs_tag:
+            _f7_unresolved_strip(row)
+            _v573_append_warning(row, _obs_tag)
         logger.debug(
             "[engine_v2 v%s F-7] settlement withheld for %s (page=%s): %s: %s",
             __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
             result.status, result.reason,
         )
         return row
+    # v5.153.0 (WP-2b): a fresh STABLE settlement retires a stale
+    # settle_unresolved receipt (L2 / KLG carried warnings) so the row is no
+    # longer capped or unranked. No such part -> no-op (byte-identical).
+    _f7_unresolved_strip(row)
+    if result.row is not None and result.row is not row:
+        _f7_unresolved_strip(result.row)
     if not result.first_diff:
         return row
     tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
@@ -10508,7 +10767,7 @@ def _portfolio_decision(row: Dict[str, Any], gap: Optional[float], band: float, 
         return "SELL"
     if (overweight and weak_signal) or (forecast_negative and at_or_above_target):
         return "REDUCE"
-    if _f7_settle_failed(row):
+    if _f7_settle_failed(row) or _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never funds an ADD
         return "HOLD"
     if underweight and constructive and (not forecast_negative) and risk != "HIGH":
         return "ADD"
@@ -10982,6 +11241,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     r["decision"] = _portfolio_decision(r, None, band, weak)
                     _portfolio_missing_price_holdback(r)
                     _f7_settle_holdback(r)
+                    _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
                 return
             for r in rows:
                 if isinstance(r, dict):
@@ -11015,6 +11275,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
             r["decision"] = _portfolio_decision(r, gap, band, weak)
             _portfolio_missing_price_holdback(r)
             _f7_settle_holdback(r)
+            _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b): no ADD on an unresolved score
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(
             "[engine_v2 v%s] _compute_portfolio_fields failed: %s: %s",
@@ -16692,6 +16953,10 @@ def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
             _f7_settle_holdback(row)
             _v573_append_warning(row, "rank_skipped_settlement_failure")
             continue
+        if isinstance(row, dict) and _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): tag-driven, no mode check
+            row["rank_overall"] = None
+            _v573_append_warning(row, _F7_UNRESOLVED_RANK_TAG)
+            continue
         # v5.88.0: a LOW-trust row is withheld from the ranking entirely -- a
         # sparse / blocked / low-completeness name must not occupy a market-page
         # Rank (Overall). Mirrors the rank_skipped_no_overall_score path. Only
@@ -17451,7 +17716,8 @@ class DataEngineV5:
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
-                "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s",
+                "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
+                "settle_unresolved=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -17473,6 +17739,7 @@ class DataEngineV5:
                 _margin_publish_mode(),     # v5.151.0 (P-152): publish contract provable at boot
                 _roi12_softcap_mode(),      # v5.152.0 (WP-3b): 12M ceiling mode provable at boot
                 _tuple_noise_mode(),        # v5.152.0 (WP-3a): noise release mode provable at boot
+                _f7_unresolved_mode(),      # v5.153.0 (WP-2b): unresolved publication provable at boot
             )
         except Exception:
             pass
