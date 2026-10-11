@@ -1479,7 +1479,100 @@ from urllib.error import HTTPError, URLError
 # source quote timestamps for the intended exchange session. Positive scalars,
 # last-good/stale prices, and later-session quotes never become fake WIN/LOSS.
 # Evidence is versioned in Notes; the 32-column schema and historical rows stay.
-SCRIPT_VERSION = "6.43.0"
+# -----------------------------------------------------------------------------
+# v6.44.0 (2026-10-11) - P-191 SIGNAL_HISTORY SAME-DAY REPEATS
+# (TRACK_DEDUP_SIGNAL_HISTORY, observe-only build; DEFAULT OFF = v6.43.0
+# byte-identical on every Signal_History / Performance_Log value)
+# -----------------------------------------------------------------------------
+# EVIDENCE (workbook export 2026-10-10, GitHub run 38071484709; openpyxl
+# read_only probes over the export, reproduced independently by the WP-7
+# challenge): Signal_History 29,471 rows / 7,801 unique Symbol|YYYYMMDD Keys /
+# 21,670 same-day repeat rows (73.5 % of the tab) / 5,373 keys with more than
+# one row / max 19 rows per key (rows-per-key histogram 1:2428 2:1255 3:687
+# 4:1122 5:929 6:308 ... 17:80 18:52 19:60). Key == Symbol|YYYYMMDD on
+# 29,471/29,471 rows, so the KEY is sound; only the write-side guard is
+# missing. On 10-10 the four --record runs (Riyadh 04:08 / 14:42 / 19:25 /
+# 21:21) built 46 / 47 / 48 / 40 snapshots, of which 0 / 46 / 43 / 36 repeated
+# a key already on the sheet (10-09: built 42/40/49/49, repeats 0/36/38/48).
+# _Run_Log holds 284 [PERF-VERDICT] lines, none carrying a dedup token; the
+# last reads '[PERF-VERDICT v6.43.0] ... selftest=PASS 20/20 | loaded
+# 20585/extent 20590 | dup_expired 0 | ca_deferred 0'.
+# ROOT CAUSE: SignalHistoryStore.append_snapshots dedups only against
+#   self.cache_keys; cache_keys starts empty and is filled ONLY by
+#   load_snapshots, and run_once calls record_signal_snapshots BEFORE the one
+#   load_snapshots call (inside _compute_signal_trends), in a fresh Actions
+#   process every run - 4-5 --record runs per Riyadh day across daily_sync.yml
+#   (cron '17 4,12,20') and track_performance.yml ('47 11' / '47 15'), each
+#   appending the whole snapshot set again. The v6.19.0 WHY block above
+#   already states that the documented first-of-day idempotency 'is not
+#   enforced on the live sheet'; the v6.7.0 contract text stays as history.
+# WHAT CHANGED (gate TRACK_DEDUP_SIGNAL_HISTORY = off (DEFAULT) | observe |
+# enforce; explicit words, case/space-insensitive; anything else, including
+# '1', -> off):
+#   off     -> nothing new runs: no extra Sheets read, no log line, no verdict
+#              token, no Details key; append_snapshots is untouched.
+#   observe -> ONE bounded read of the Key column (B2:B<end>, clamped to the
+#              grid by the same three lines as load_snapshots) BEFORE the
+#              append; a PURE measure: would_skip = this run's snapshots whose
+#              Symbol|Date is already on the sheet, new, sheet rows, unique
+#              keys, backlog = rows - keys (the size of the one-off
+#              compaction), max rows per key, 12 sample keys; one WARNING
+#              '[v6.44.0 DEDUP-SIGNAL] mode=<m> would_skip=<k>/<built> ...';
+#              the [PERF-VERDICT] token ' | dedup_signal observe would_skip
+#              k/built backlog B' and a 'dedup_signal' object in its Details
+#              JSON. VALUES UNTOUCHED: every snapshot is still appended and
+#              cache_keys is never primed here (priming it would silently
+#              become the first-of-day enforce).
+#   enforce -> ACCEPTED BY THE READER BUT MEASURE-ONLY IN v6.44.0: it behaves
+#              exactly like observe, logs a second WARNING saying so, and its
+#              token reads 'dedup_signal enforce(measure-only) ...' with
+#              read-back 'applied': False, so an operator can never believe
+#              values changed. The apply step (policy: last-of-day upsert vs
+#              first-of-day skip) is an owner decision and the v6.45.0
+#              follow-up, together with the one-off compaction of the ~21.7k
+#              backlog rows (expected on the 10-10 shape: keep 7,801 rows,
+#              archive 21,670).
+#   A failed Key-column read is REPORTED, never zeroed: load_key_column
+#   returns None, the read-back carries 'read_ok': False, the log line says
+#   'key-column read FAILED - no measurement this run' and the token reads
+#   ' | dedup_signal <mode> read-failed' (no numbers). The append proceeds.
+# UNDER DEFAULT OFF the [PERF-VERDICT] _Run_Log line differs from v6.43.0
+#   ONLY in the version tag and 'selftest=PASS 22/22' (precedent: v6.41.0
+#   16->18, v6.42.0 18->20). Signal_History / Performance_Log values and the
+#   appended snapshot rows are byte-identical to v6.43.0, which the harness
+#   tests/test_tp_dedup_signal_p191.py proves by driving BOTH files through
+#   the same record_signal_snapshots path on one fixture.
+# ENV LANE: GitHub Actions, BOTH tracker steps (.github/workflows/
+#   track_performance.yml 'Run performance clock' and daily_sync.yml 'Track
+#   Performance (record + audit)'), mapped as
+#   ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }} in both (ENV PARITY). The
+#   same delivery maps the v6.41.0 TRACK_DEDUP_MATURED and TRACK_RISK_BLANK,
+#   which no workflow had ever mapped: the 10-10 export still carries the 27
+#   MATURED/MATURED duplicate Keys (20 W/W, 7 L/L) and 0.0 in the three risk
+#   cells on 11,791/11,791 matured rows. Not Render; no /health state.
+# FINDINGS SURFACED BY THIS BUILD, NOT ACTED ON (register candidates, each a
+#   value change that needs its own gate): (a) Analyst Rating carries the
+#   literal string 'None' on 15,072 of 29,471 Signal_History rows because
+#   _build_signal_snapshots passes _safe_str(None) -> 'None' (1,191 blank,
+#   13,208 real values). (b) 'one row per symbol-day on write is safe for
+#   every reader' stays a HYPOTHESIS: SignalTrendAnalyzer's intraday flip
+#   count (every same-day snapshot inside the window) and
+#   scripts/audit_data_quality.py's flap meter consume intraday versions,
+#   while the day-keyed trend representative and
+#   scripts/backtest_pf_thesis_exit.py already collapse to the day's LAST
+#   snapshot. Code readers of the tab: SignalTrendAnalyzer, backtest_pf_
+#   thesis_exit.py, audit_data_quality.py (no workflow runs it),
+#   repair_stores.py, tfb_export_audit.py; other mentions are comments.
+# Embedded self-test 20 -> 22 cases. ZERO functions removed. Additions:
+#   _dedup_signal_mode, _dedup_signal_measure, _dedup_signal_token,
+#   SignalHistoryStore.load_key_column (+ the _LAST_DEDUP_SIGNAL read-back
+#   dict). No import line changed: the measure counts with a plain dict
+#   because this module's name 'Counter' is the prometheus metric class (or
+#   its dummy), not collections.Counter. Rollback: unset the env (off is the
+#   default) or restore v6.43.0 of this file; the mapped workflow lines are
+#   inert while the repo Variables are unset.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.44.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3668,6 +3761,93 @@ def _risk_cells(r: Any) -> List[Any]:
         except Exception:
             out.append(v)
     return out
+
+
+# v6.44.0 [P-191]: per-run read-back of the Signal_History same-day-repeat
+# measurement (TRACK_DEDUP_SIGNAL_HISTORY). Untouched while the gate is off,
+# so the OFF verdict line and Details JSON stay byte-identical to v6.43.0.
+# "requested" keeps the operator's word; "applied" is False in v6.44.0 by
+# contract (enforce is measure-only); "read_ok" False = the Key column could
+# not be read and NO number below was measured this run.
+_LAST_DEDUP_SIGNAL: Dict[str, Any] = {"mode": "off", "requested": "off",
+                                      "applied": False, "read_ok": True,
+                                      "built": 0, "would_skip": 0, "new": 0,
+                                      "sheet_rows": 0, "sheet_keys": 0,
+                                      "backlog": 0, "max_per_key": 0,
+                                      "keys": []}
+
+
+def _dedup_signal_mode() -> str:
+    """v6.44.0 [P-191]: TRACK_DEDUP_SIGNAL_HISTORY off (DEFAULT) | observe |
+    enforce. Anything else (incl. '1') -> off (v6.43.0 byte-identical). Never
+    raises. In v6.44.0 'enforce' is accepted by this reader but the apply
+    step is deliberately not built: the caller measures exactly as under
+    observe and labels its verdict token '(measure-only)'."""
+    try:
+        v = (os.getenv("TRACK_DEDUP_SIGNAL_HISTORY") or "off").strip().lower()
+        return v if v in ("observe", "enforce") else "off"
+    except Exception:
+        return "off"
+
+
+def _dedup_signal_measure(sheet_keys: Any, snaps: Any) -> Dict[str, Any]:
+    """v6.44.0 [P-191] PURE (no I/O, never raises): how many of this run's
+    snapshots carry a Symbol|YYYYMMDD Key already present on the sheet, plus
+    the sheet's own same-day-repeat backlog. `sheet_keys` is the Key column
+    as read (blank cells ignored; matched case-insensitively), `snaps` the
+    built snapshot list (anything with a .key). Counting uses a plain dict on
+    purpose: this module's 'Counter' is the prometheus metric class, and the
+    import lines stay byte-identical."""
+    out: Dict[str, Any] = {"built": 0, "would_skip": 0, "new": 0,
+                           "sheet_rows": 0, "sheet_keys": 0, "backlog": 0,
+                           "max_per_key": 0, "keys": []}
+    try:
+        cnt: Dict[str, int] = {}
+        for k in (sheet_keys or []):
+            if isinstance(k, str) and k.strip():
+                kk = k.strip().upper()
+                cnt[kk] = cnt.get(kk, 0) + 1
+        built: List[str] = []
+        for s in (snaps or []):
+            try:
+                built.append(_safe_str(getattr(s, "key", "")))
+            except Exception:
+                built.append("")
+        would_skip = [k for k in built if k and k.upper() in cnt]
+        rows = sum(cnt.values())
+        out["built"] = len(built)
+        out["would_skip"] = len(would_skip)
+        out["new"] = len(built) - len(would_skip)
+        out["sheet_rows"] = rows
+        out["sheet_keys"] = len(cnt)
+        out["backlog"] = rows - len(cnt)
+        out["max_per_key"] = max(cnt.values()) if cnt else 0
+        out["keys"] = would_skip[:12]
+    except Exception:
+        pass
+    return out
+
+
+def _dedup_signal_token(d: Any) -> str:
+    """v6.44.0 [P-191] PURE: the [PERF-VERDICT] suffix for a read-back dict.
+    '' unless mode is observe|enforce (the OFF verdict line stays byte-
+    identical to v6.43.0); ' | dedup_signal <mode> read-failed' when the Key
+    column could not be read (never zeros for an unmeasured run); otherwise
+    ' | dedup_signal <mode>[(measure-only)] would_skip k/built backlog B'.
+    enforce always carries '(measure-only)' in v6.44.0. Never raises."""
+    try:
+        d = d or {}
+        mode = str(d.get("mode") or "off")
+        if mode not in ("observe", "enforce"):
+            return ""
+        tag = mode + ("" if mode == "observe" else "(measure-only)")
+        if d.get("read_ok") is False:
+            return " | dedup_signal %s read-failed" % tag
+        return " | dedup_signal %s would_skip %d/%d backlog %d" % (
+            tag, int(d.get("would_skip") or 0), int(d.get("built") or 0),
+            int(d.get("backlog") or 0))
+    except Exception:
+        return ""
 
 
 def _publish_calibration_enabled() -> bool:
@@ -5997,6 +6177,33 @@ class SignalHistoryStore:
                     out.append(snap)
                     self.cache_keys.add(snap.key)
         return out
+
+    def load_key_column(self, max_records: int = 200000) -> Optional[List[str]]:
+        """v6.44.0 [P-191]: ONE bounded read of the Key column (B2:B<end>),
+        clamped to the grid by the SAME three lines as load_snapshots, for the
+        TRACK_DEDUP_SIGNAL_HISTORY measurement. Returns the non-blank Key cells
+        in sheet order; None (never []) when the read failed, so a failed read
+        is never mistaken for an empty tab; [] when there is no worksheet.
+        MUST NOT touch self.cache_keys: priming the cache would make
+        append_snapshots skip, which is the first-of-day enforce that v6.44.0
+        deliberately does not build."""
+        if not self.ws:
+            return []
+        end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
+        try:  # v6.35.0 (1): clamp to the grid (same class as load_records)
+            _rc = int(getattr(self.ws, "row_count", 0) or 0)
+        except Exception:
+            _rc = 0
+        if _rc >= self.DATA_ROW0:
+            end_row = min(end_row, _rc)
+        _kc = self.HEADERS.index("Key") + 1
+        rng = _a1_range(_kc, self.DATA_ROW0, _kc, end_row)
+        try:
+            rows = self.backoff.execute_sync(lambda: self.ws.get(rng))  # type: ignore
+        except Exception as e:
+            logger.warning("[v6.44.0 DEDUP-SIGNAL] key column read failed: %s", e)
+            return None
+        return [_safe_str(r[0]) for r in (rows or []) if r and _safe_str(r[0])]
 
     def _snapshot_to_row(self, s: SignalSnapshot) -> List[Any]:
         return [
@@ -8612,6 +8819,8 @@ class PerformanceTrackerApp:
         # v6.7.0: log one daily verdict snapshot per decision symbol from the
         # ALREADY-FETCHED Top10 rows. Idempotent per symbol-per-day. Best
         # effort: a Sheets hiccup here must never break --record/--audit.
+        # v6.44.0: the idempotency above was never enforced on the live sheet
+        # (P-191); measured here under TRACK_DEDUP_SIGNAL_HISTORY.
         if not self.signal_history_enabled or self.signal_store is None:
             return 0
         if not self.signal_store.is_available():
@@ -8628,6 +8837,52 @@ class PerformanceTrackerApp:
         if not snaps:
             return 0
         loop = asyncio.get_running_loop()
+        # v6.44.0 [P-191]: measure same-day repeats BEFORE the append, gated.
+        # off (default) -> nothing in this block runs: no read, no log line,
+        # no read-back change. observe / enforce(measure-only) -> one Key-
+        # column read + the pure measure; fail-open, one warning, and the
+        # append below ALWAYS runs exactly as in v6.43.0 (snapshots are never
+        # skipped or rewritten in this version; cache_keys is never primed).
+        _ds_mode = _dedup_signal_mode()
+        if _ds_mode != "off":
+            try:
+                _keys = await loop.run_in_executor(
+                    _get_executor(), self.signal_store.load_key_column,
+                    int(self.args.max_records or _track_max_records_default()))
+                if _keys is None:
+                    _LAST_DEDUP_SIGNAL.update({
+                        "mode": _ds_mode, "requested": _ds_mode,
+                        "applied": False, "read_ok": False,
+                        "built": len(snaps), "would_skip": 0, "new": 0,
+                        "sheet_rows": 0, "sheet_keys": 0, "backlog": 0,
+                        "max_per_key": 0, "keys": []})
+                    logger.warning(
+                        "[v6.44.0 DEDUP-SIGNAL] mode=%s key-column read FAILED - "
+                        "no measurement this run (built=%d; the append proceeds "
+                        "unchanged)", _ds_mode, len(snaps))
+                else:
+                    _rep = _dedup_signal_measure(_keys, snaps)
+                    _rep["mode"] = _ds_mode
+                    _rep["requested"] = _ds_mode
+                    _rep["applied"] = False
+                    _rep["read_ok"] = True
+                    _LAST_DEDUP_SIGNAL.update(_rep)
+                    logger.warning(
+                        "[v6.44.0 DEDUP-SIGNAL] mode=%s would_skip=%d/%d new=%d | "
+                        "sheet rows=%d keys=%d backlog=%d max_per_key=%d | "
+                        "sample=%s",
+                        _ds_mode, int(_rep["would_skip"]), int(_rep["built"]),
+                        int(_rep["new"]), int(_rep["sheet_rows"]),
+                        int(_rep["sheet_keys"]), int(_rep["backlog"]),
+                        int(_rep["max_per_key"]),
+                        ",".join(_rep["keys"]) if _rep["keys"] else "-")
+                if _ds_mode == "enforce":
+                    logger.warning(
+                        "[v6.44.0 DEDUP-SIGNAL] enforce requested but NOT built in "
+                        "v6.44.0 (policy last|first pending owner decision) - "
+                        "measuring only, values untouched")
+            except Exception as e:
+                logger.warning("[v6.44.0 DEDUP-SIGNAL] measurement skipped: %s", e)
         try:
             written = await loop.run_in_executor(
                 _get_executor(), self.signal_store.append_snapshots, snaps
@@ -8972,6 +9227,7 @@ class PerformanceTrackerApp:
                 msg += " | dedup_matured %s %d" % (
                     _LAST_DEDUP_MATURED.get("mode"),
                     int(_LAST_DEDUP_MATURED.get("count") or 0))
+            msg += _dedup_signal_token(_LAST_DEDUP_SIGNAL)   # v6.44.0 [P-191]: '' when off
             level = (
                 "INFO"
                 if int(st.get("priced") or 0) > 0
@@ -8994,6 +9250,9 @@ class PerformanceTrackerApp:
             if _LAST_FEED_RETRY_STATS:
                 st["feed_retry"] = dict(_LAST_FEED_RETRY_STATS)
             st["selftest"] = _TRACK_SELFTEST_MSG
+            if _LAST_DEDUP_SIGNAL.get("mode") in ("observe", "enforce"):   # v6.44.0
+                st["dedup_signal"] = {k: v for k, v in _LAST_DEDUP_SIGNAL.items()
+                                      if k != "keys"}
             row[9] = json_dumps(st)
             self.store.backoff.execute_sync(
                 lambda: ws.append_row(row, value_input_option="USER_ENTERED")
@@ -9212,7 +9471,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 20   # v6.42.0: +2 (P-201 zero baseline, Detail token)
+        total = 22   # v6.44.0: +2 (P-191 signal-dedup reader + measure + token); v6.42.0: +2 (P-201 zero baseline, Detail token)
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -9487,6 +9746,72 @@ class PerformanceTrackerApp:
             if (_c20 and _m20 is not None
                     and abs(float(_m20.group(1)) - 3.0) < 1e-12
                     and _re20.search("mean |err| 2.00pp vs band 10.00pp") is None):
+                passed += 1
+            # case 21 (v6.44.0 P-191): TRACK_DEDUP_SIGNAL_HISTORY reader
+            # vocabulary (explicit words only; '1' and junk -> off) and the
+            # PURE same-day-repeat measure on a canned Key column (case-
+            # insensitive match, blank cell ignored, backlog = rows - keys).
+            _sv21 = os.environ.get("TRACK_DEDUP_SIGNAL_HISTORY")
+            try:
+                os.environ.pop("TRACK_DEDUP_SIGNAL_HISTORY", None)
+                _c21 = _dedup_signal_mode() == "off"
+                os.environ["TRACK_DEDUP_SIGNAL_HISTORY"] = " Observe "
+                _c21 = _c21 and _dedup_signal_mode() == "observe"
+                os.environ["TRACK_DEDUP_SIGNAL_HISTORY"] = "ENFORCE"
+                _c21 = _c21 and _dedup_signal_mode() == "enforce"
+                os.environ["TRACK_DEDUP_SIGNAL_HISTORY"] = "1"
+                _c21 = _c21 and _dedup_signal_mode() == "off"
+                os.environ["TRACK_DEDUP_SIGNAL_HISTORY"] = "junk"
+                _c21 = _c21 and _dedup_signal_mode() == "off"
+            finally:
+                if _sv21 is None:
+                    os.environ.pop("TRACK_DEDUP_SIGNAL_HISTORY", None)
+                else:
+                    os.environ["TRACK_DEDUP_SIGNAL_HISTORY"] = _sv21
+            _r21 = _dedup_signal_measure(
+                ["A.US|20261010", "A.US|20261010", "a.us|20261010",
+                 "B.US|20261010", "C.US|20261009", ""],
+                [_NS(key="A.US|20261010"), _NS(key="B.US|20261010"),
+                 _NS(key="D.US|20261010")])
+            if (_c21 and _r21["built"] == 3 and _r21["would_skip"] == 2
+                    and _r21["new"] == 1 and _r21["sheet_rows"] == 5
+                    and _r21["sheet_keys"] == 3 and _r21["backlog"] == 2
+                    and _r21["max_per_key"] == 3
+                    and _r21["keys"] == ["A.US|20261010", "B.US|20261010"]):
+                passed += 1
+            # case 22 (v6.44.0 P-191): measure edge cases (empty sheet, empty
+            # snaps, 12-key sample cap, None inputs never raise), the verdict
+            # token (off -> '', observe, enforce(measure-only), read-failed
+            # carries NO numbers) and a store without a worksheet returning []
+            # from load_key_column with no I/O.
+            _e22 = _dedup_signal_measure([], [_NS(key="A.US|20261010")])
+            _f22 = _dedup_signal_measure(["A.US|20261010"], [])
+            _g22 = _dedup_signal_measure(["Z.US|20261010"] * 20,
+                                         [_NS(key="Z.US|20261010")] * 20)
+            _n22 = _dedup_signal_measure(None, None)
+            _st22 = object.__new__(SignalHistoryStore)
+            _st22.ws = None
+            _t22a = _dedup_signal_token({"mode": "off", "would_skip": 9,
+                                         "built": 9, "backlog": 9})
+            _t22b = _dedup_signal_token({"mode": "observe", "read_ok": True,
+                                         "would_skip": 2, "built": 3, "backlog": 3})
+            _t22c = _dedup_signal_token({"mode": "enforce", "read_ok": True,
+                                         "would_skip": 2, "built": 3, "backlog": 3})
+            _t22d = _dedup_signal_token({"mode": "observe", "read_ok": False,
+                                         "built": 3})
+            if (_e22["sheet_rows"] == 0 and _e22["backlog"] == 0
+                    and _e22["max_per_key"] == 0 and _e22["would_skip"] == 0
+                    and _e22["new"] == _e22["built"] == 1
+                    and _f22["built"] == 0 and _f22["sheet_rows"] == 1
+                    and _g22["would_skip"] == 20 and len(_g22["keys"]) == 12
+                    and _g22["backlog"] == 19 and _g22["max_per_key"] == 20
+                    and _n22["built"] == 0 and _n22["sheet_rows"] == 0
+                    and _st22.load_key_column() == []
+                    and _t22a == "" and _dedup_signal_token(None) == ""
+                    and _t22b == " | dedup_signal observe would_skip 2/3 backlog 3"
+                    and _t22c == " | dedup_signal enforce(measure-only) would_skip 2/3 backlog 3"
+                    and _t22d == " | dedup_signal observe read-failed"
+                    and "would_skip" not in _t22d):
                 passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
