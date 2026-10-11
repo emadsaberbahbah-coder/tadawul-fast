@@ -142,12 +142,18 @@ except ImportError:  # the __main__ runner needs no pytest
 if pytest is not None:
     @pytest.fixture(autouse=True)
     def _sentry_env_restored():
-        prev = os.environ.get("TFB_EQ_ROI_UNIT_SENTRY")
+        # The fixtures' expected tags assume the engine defaults: the keep-last-good
+        # target gate OFF (a stored 12M target would turn the BNY.US t3 row into a
+        # t12 row). Pin it for the test, restore both variables afterwards.
+        keys = ("TFB_EQ_ROI_UNIT_SENTRY", "TFB_ENGINE_TARGET_KLG")
+        prev = {k: os.environ.get(k) for k in keys}
+        os.environ["TFB_ENGINE_TARGET_KLG"] = "0"
         yield
-        if prev is None:
-            os.environ.pop("TFB_EQ_ROI_UNIT_SENTRY", None)
-        else:
-            os.environ["TFB_EQ_ROI_UNIT_SENTRY"] = prev
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_t1_off_no_tags_and_fraction_values():

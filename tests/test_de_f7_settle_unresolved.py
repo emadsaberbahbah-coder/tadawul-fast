@@ -63,6 +63,9 @@ def _isolated(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         saved = dict(os.environ)
+        # integration 2026-10-11: f7._prep() seeds de._TGT_LKG_STORE; restore it too,
+        # else a later suite sees stored 12M targets for the fixture symbols.
+        saved_store = dict(de._TGT_LKG_STORE)
         try:
             for key in list(os.environ):
                 if key.startswith("TFB_"):
@@ -71,6 +74,8 @@ def _isolated(fn):
         finally:
             os.environ.clear()
             os.environ.update(saved)
+            de._TGT_LKG_STORE.clear()
+            de._TGT_LKG_STORE.update(saved_store)
     return wrapper
 
 
