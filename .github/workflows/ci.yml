@@ -9,7 +9,11 @@
 # tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity);
 # tests/js/decision_input_truth.test.js (WP-8 cockpit input truth, native job);
 # tests/test_workbook_dq_audit.py (WP-0 DQ-01..75 harness, heavy job, openpyxl);
-# tests/test_sync_warnings_compact_wp6.py (WP-6 Warnings compaction, lean job).
+# tests/test_sync_warnings_compact_wp6.py (WP-6 Warnings compaction, lean job);
+# tests/test_de_roi12_ceiling_tuple_noise_wp3ab.py (WP-3ab tuple seams) plus the
+# three seam-distance contracts it builds on that were never enumerated here:
+# tests/test_de_fc_tuple_coherence_p102.py, tests/test_de_eq_roi_backfill_sentry_p143.py,
+# tests/test_de_margin_publish_p152.py.
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -416,6 +420,10 @@ jobs:
             tests/test_sync_outcome_audit.py \
             tests/test_sync_audit_cancelled_source.py \
             tests/test_verify_manifest_pins.py \
+            tests/test_de_roi12_ceiling_tuple_noise_wp3ab.py \
+            tests/test_de_fc_tuple_coherence_p102.py \
+            tests/test_de_eq_roi_backfill_sentry_p143.py \
+            tests/test_de_margin_publish_p152.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
