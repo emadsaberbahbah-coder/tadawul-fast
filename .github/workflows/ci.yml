@@ -8,7 +8,8 @@
 # packages in the lean job as each lands: tests/test_tp_dedup_signal_p191.py and
 # tests/test_track_flags_mapped.py (WP-7 tracker measurement + env parity);
 # tests/js/decision_input_truth.test.js (WP-8 cockpit input truth, native job);
-# tests/test_workbook_dq_audit.py (WP-0 DQ-01..75 harness, heavy job, openpyxl).
+# tests/test_workbook_dq_audit.py (WP-0 DQ-01..75 harness, heavy job, openpyxl);
+# tests/test_sync_warnings_compact_wp6.py (WP-6 Warnings compaction, lean job).
 #
 # v1.1.4: the compile job also runs ruff's syntax and undefined-name rules
 # (E9, F63, F7, F82) over the whole tree. compileall cannot see a name that
@@ -385,6 +386,7 @@ jobs:
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
+            tests/test_sync_warnings_compact_wp6.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_atomic_publication.py \
