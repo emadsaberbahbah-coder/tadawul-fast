@@ -3,6 +3,28 @@
 tfb_workbook_dq_audit.py - offline DQ-01..DQ-75 measurement harness over a TFB
 workbook export (WP-0 of the 2026-10-11 audit framework).
 
+v1.0.1 (2026-10-11) [WP-2bc integration] - DQ-37 READS THE NEW RECEIPT
+-------------------------------------------------------------------------
+Engine 5.153.0 (WP-2b, gate TFB_SETTLE_UNRESOLVED) publishes a non-converged
+row under enforce WITHOUT the f7_settle_failed:non_converged receipt: the row
+keeps its pass-1 scores as WATCHLIST and carries settle_unresolved:enforce:...
+instead (observe adds settle_unresolved:observe:... next to the holdback). v1.0.0
+counted non-convergence only by the f7_settle_failed prefix, so arming enforce
+would have dropped DQ-37's non_converged count to 0 while the 46 rows (10-10:
+GM 45 + CFX 1) were still unresolved - a false PASS. The predicate is now
+F7_NONCONV_PREFIXES = ("f7_settle_failed", "settle_unresolved:"), matched as a
+token PREFIX, never as the substring "unresolved": since engine v5.151.6 the
+margin publication writes receipts ending in ":unresolved" (1 GM row on 10-10),
+which a substring rule would miscount. The same predicate feeds the per-row
+DQ-37 flag. An INVESTABLE row among the non-converged ones (0 on 10-10, 0 by
+construction under the engine's gate tier) is listed in the examples so the
+operator sees it without a schema change. On the 2026-10-10 export every
+count, status and value is unchanged (0 settle_unresolved tags exist), so the
+committed baseline fixture stays valid; only the version token and the DQ-37
+detail text change in the report. Selftest cases are unchanged (label-based
+cases-digest c1bdd1a2cc1c3927); tests/test_workbook_dq_audit.py P13 pins the
+prefix rule, the substring exclusion and the INVESTABLE example.
+
 REVIEW FIX (2026-10-11, pre-merge amendment of the same v1.0.0) [WP-0]
 -----------------------------------------------------------------------
 compare_to_baseline: BASELINE_HIGHER_IS_BETTER emptied. The build spec listed
@@ -104,12 +126,15 @@ import sys
 import tempfile
 import time
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"   # v1.0.1: DQ-37 also counts the settle_unresolved: receipt (WP-2bc)
 
 # --------------------------------------------------------------------------- #
 # CONFIG - every threshold, vocabulary and policy constant lives here
 # --------------------------------------------------------------------------- #
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
+# v1.0.1: tag PREFIXES that mark a non-converged F-7 row (engine 5.153.0 publishes the
+# second one under TFB_SETTLE_UNRESOLVED). Never match the bare substring "unresolved".
+F7_NONCONV_PREFIXES = ("f7_settle_failed", "settle_unresolved:")
 PAGE_SHORT = {"Market_Leaders": "ML", "Global_Markets": "GM", "Commodities_FX": "CFX", "Mutual_Funds": "MF",
               "My_Portfolio": "MP"}
 PORTFOLIO_PAGE = "My_Portfolio"
@@ -1641,8 +1666,10 @@ def dq_37_f7(ctx):
         tagged = flips = flips_inv = d5 = d10 = nonconv = 0
         for r, tg in zip(pg.body, pg.tags):
             f7 = [t for t in tg if t.startswith("f7_settle:")]
-            if any(t.startswith("f7_settle_failed") for t in tg):
+            if any(t.startswith(F7_NONCONV_PREFIXES) for t in tg):
                 nonconv += 1
+                if pg.s(r, "Investability Status").upper() == "INVESTABLE" and len(ex) < 6:
+                    ex.append(f"{pg.s(r, 'Symbol')} INVESTABLE non-converged ({PAGE_SHORT[p]})")
             if not f7:
                 continue
             tagged += 1
@@ -1686,7 +1713,8 @@ def dq_37_f7(ctx):
     status = "FAIL" if flips_total or nonconv_total else "PASS"
     return check("DQ-37", "f7_pass_dependence", "E", "scores", status, flips_total, vals, ex,
                  "count = rows whose f7_settle tag carries rc=a>b (recommendation flip); |delta overall| >= 5 / >= 10 and "
-                 "f7_settle_failed:non_converged rows in values", "0 rc flips; 0 non-converged", "WP-2")
+                 "non-converged rows in values (tag prefix f7_settle_failed or settle_unresolved:, v1.0.1)",
+                 "0 rc flips; 0 non-converged", "WP-2")
 
 
 def dq_38_investable_coherence(ctx):
@@ -2893,7 +2921,7 @@ def _row_flags(pg, r, tg, ctx, m):
     reason, lbl = pg.s(r, "Recommendation Reason"), pg.s(r, "Invest Period Label").upper()
     if lbl in ("1Y", "12M") and ("horizon=month" in reason or "horizon=long" in reason):
         f.add("DQ-36")
-    if any(t.startswith("f7_settle_failed") for t in tg) or any(F7_RC_RE.search(t) for t in tg if t.startswith("f7_settle:")):
+    if any(t.startswith(F7_NONCONV_PREFIXES) for t in tg) or any(F7_RC_RE.search(t) for t in tg if t.startswith("f7_settle:")):
         f.add("DQ-37")
     fa, inv = pg.s(r, "Final Action").upper(), pg.s(r, "Investability Status").upper()
     if (fa == "INVEST" and pg.s(r, "Recommendation").upper() in SELL_CLASS) or \

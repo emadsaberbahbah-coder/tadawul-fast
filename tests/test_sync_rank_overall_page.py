@@ -496,6 +496,23 @@ def test_y1_both_market_jobs_map_the_gate_through_the_repo_variable():
     assert owners == ["sync-dashboard", "recover-missing-market-pages"]
 
 
+def test_y4_recovery_job_maps_the_gate_too():
+    """Integration 2026-10-11: .github/workflows/page_refresh_recovery.yml job recover-page
+    also runs run_dashboard_sync.py with TFB_SYNC_SYMBOL_BATCH_SIZE '25'; it must read the
+    same Variable, else a recovery write after arming republishes within-batch ranks."""
+    path = ROOT / ".github" / "workflows" / "page_refresh_recovery.yml"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    decl = [(i, ln.split(":", 1)[1].strip()) for i, ln in enumerate(lines)
+            if re.match(r"^\s+TFB_RANK_OVERALL_PAGE:", ln)]
+    assert [v for _, v in decl] == ["${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}"], decl
+    jobs = [(i, ln.strip()[:-1]) for i, ln in enumerate(lines) if re.match(r"^  [a-z][a-z0-9-]*:$", ln)]
+    owner = None
+    for i, name in jobs:
+        if i <= decl[0][0]:
+            owner = name
+    assert owner == "recover-page", owner
+
+
 def test_y2_rank_tokens_stay_in_the_warnings_cell_under_wp6():
     for token in ("settle_unresolved:enforce:pass_limit:p3:ov=55.02:rc=hold",
                   "settle_unresolved:observe:oscillation:p2:ov=48.25:rc=sell",

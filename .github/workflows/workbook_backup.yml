@@ -56,7 +56,7 @@ name: "💾 TFB Workbook Backup"
 #       reddens the job (the backup itself has already succeeded by then).
 # THE XLSX IS NEVER UPLOADED: it stays on the runner and is removed in the
 # always() cleanup step together with the credentials file.
-# Arming: set the Variable to observe, read the `[DQ-AUDIT v1.0.0] ...` line
+# Arming: set the Variable to observe, read the `[DQ-AUDIT v1.0.x] ...` line
 # of the next run, then enforce. ROLLBACK: delete the env line, the two steps
 # and the cleanup extension (or set the Variable to off — same effect).
 # ============================================================================

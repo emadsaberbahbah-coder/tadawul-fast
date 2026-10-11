@@ -127,6 +127,11 @@ Lean "decision-layer suites" list, after `            tests/test_de_margin_publi
 5. Silence telemetry only (keep the gate): `TFB_SYNC_OHLC_RUNLOG=0` (also silences FG-2 lines).
 6. **Rollback:** set the Variable to `off` or delete it (byte-identical next run) or `git revert`; an enforce-written page keeps its page ranks until the next write overwrites them with within-batch ranks.
 
+## Integration 2026-10-11 (applied by the integrator in the same landing)
+- `scripts/verify_deployment.py` 1.0.49 and `.github/workflows/ci.yml` 1.1.6 carry the pins and the four suite lines reported above.
+- `.github/workflows/page_refresh_recovery.yml` job `recover-page` now maps `TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}` (the open item this sheet raised); `tests/test_sync_rank_overall_page.py::test_y4_recovery_job_maps_the_gate_too` pins it and fails without the mapping.
+- `scripts/tfb_workbook_dq_audit.py` v1.0.1 counts DQ-37 non-converged rows by the prefixes `f7_settle_failed` or `settle_unresolved:` (never the substring), so arming `TFB_SETTLE_UNRESOLVED=enforce` cannot turn DQ-37 into a false PASS; see `TFB_Commit_Sheet_tfb_workbook_dq_audit_v1.0.1_2026-10-11.md`.
+
 ## Known limits (stated, not hidden)
 - Exact ties are ordered by Symbol, while the engine / route break ties by arrival order: DQ-41 trend comparisons must use the page rule.
 - KLG / persistence-preserved rows keep their (possibly stale) Overall Score and receive a page rank, as they receive a batch rank today; the rank reflects what is published, not freshness.

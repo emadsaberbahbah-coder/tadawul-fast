@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_workbook_dq_audit.py - harness for scripts/tfb_workbook_dq_audit.py v1.0.0 (WP-0).
+"""tests/test_workbook_dq_audit.py - harness for scripts/tfb_workbook_dq_audit.py v1.0.1 (WP-0; v1.0.1 = WP-2bc DQ-37 receipt).
 
 Pattern: tests/test_export_audit_v1.py (the REAL script runs as a subprocess; no
 stand-ins) plus the namespace import used by tests/test_cash_snapshot_certification.py.
@@ -7,10 +7,10 @@ Offline: no network, no credentials, no live Sheet. The golden-fixture compariso
 against the real 2026-10-10 export runs only when TFB_TEST_EXPORT_XLSX points at it.
 
 Contract:
-  P1  --selftest exits 0 and prints "[DQ-SELFTEST v1.0.0] N/N PASS  cases-digest=<frozen>"
+  P1  --selftest exits 0 and prints "[DQ-SELFTEST v1.0.1] N/N PASS  cases-digest=<frozen>"
   P2  CLI: no args -> 2; missing export -> 2; missing --baseline -> 2; --help -> 0
   P3  determinism: two --selftest runs print the same cases-digest
-  P4  D7 guard: the script is not this file; SCRIPT_VERSION = "1.0.0"; no def test_
+  P4  D7 guard: the script is not this file; SCRIPT_VERSION = "1.0.1"; no def test_
   P5  golden fixture structure and spot values (tests/fixtures/dq_baseline_2026-10-10.json)
   P6  fixture self-comparison through compare_to_baseline (regressions / critical)
   P7  redaction guard accepts the fixture and rejects injected money
@@ -19,6 +19,8 @@ Contract:
   P10 workflow wiring (regex, no PyYAML) in .github/workflows/workbook_backup.yml
   P11 backup_workbook._write_local_copy: unset env -> nothing written; set -> 0600 file
   P12 golden run on the real export (skipped without TFB_TEST_EXPORT_XLSX)
+  P13 v1.0.1 DQ-37 non-converged predicate: f7_settle_failed or the settle_unresolved: prefix,
+      never the bare substring "unresolved"; an INVESTABLE one is listed in the examples
 Runs under pytest or directly (python tests/test_workbook_dq_audit.py).
 """
 from __future__ import annotations
@@ -50,7 +52,7 @@ if REPO not in sys.path:
 SCRIPT = os.path.join(REPO, "scripts", "tfb_workbook_dq_audit.py")
 FIXTURE = os.path.join(HERE, "fixtures", "dq_baseline_2026-10-10.json")
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "workbook_backup.yml")
-EXPECT = "[DQ-SELFTEST v1.0.0] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
+EXPECT = "[DQ-SELFTEST v1.0.1] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
 EXPORT_SHA16 = "f5d327afc9fb409c"
 DECISION_CRITICAL = {"DQ-07", "DQ-08", "DQ-09", "DQ-10", "DQ-16", "DQ-22", "DQ-24", "DQ-25", "DQ-30", "DQ-33", "DQ-34",
                      "DQ-38", "DQ-46", "DQ-53", "DQ-62"}
@@ -106,7 +108,7 @@ def test_p4_not_a_copy_of_the_script():
     with open(os.path.abspath(__file__), "rb") as f:
         me = f.read()
     assert hashlib.sha256(script).hexdigest() != hashlib.sha256(me).hexdigest()
-    assert b'SCRIPT_VERSION = "1.0.0"' in script
+    assert b'SCRIPT_VERSION = "1.0.1"' in script
     assert b"def test_" not in script
 
 
@@ -205,7 +207,7 @@ def test_p9_import_is_side_effect_free():
             "assert 'scripts.tfb_export_audit' not in sys.modules; print(m.SCRIPT_VERSION)")
     p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=REPO, timeout=120)
     assert p.returncode == 0, p.stderr
-    assert p.stdout.strip() == "1.0.0"
+    assert p.stdout.strip() == "1.0.1"
 
 
 def test_p10_workflow_wiring():
@@ -259,7 +261,7 @@ def test_p12_golden_run_on_the_real_export():
         out = os.path.join(tmp, "dq_report.json")
         rc, text = _run(export, "--json", out, "--baseline", FIXTURE, "--quiet")
         assert rc == 0, text[-600:]
-        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.0]")][-1]
+        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.1]")][-1]
         assert "regressions=0 critical_regressions=0" in line, line
         report = json.load(open(out, encoding="utf-8"))
     fx = _fixture()
@@ -269,11 +271,35 @@ def test_p12_golden_run_on_the_real_export():
     dq._assert_redacted(report)
 
 
+def test_p13_dq37_counts_both_receipts_by_prefix():
+    """v1.0.1 (WP-2bc integration): engine 5.153.0 under TFB_SETTLE_UNRESOLVED=enforce publishes a
+    non-converged row with settle_unresolved:enforce:... and WITHOUT f7_settle_failed:non_converged.
+    DQ-37 must still count it; a margin receipt ending in ':unresolved' must not be counted."""
+    hdr = ["Symbol", "Investability Status", "Warnings"]
+    rows = [hdr,
+            ["AAA.US", "WATCHLIST", "f7_settle_failed:non_converged;rel_path:sheet"],
+            ["BBB.US", "WATCHLIST", "settle_unresolved:enforce:pass_limit:p3:ov=55.02:rc=hold;rank_skipped_settle_unresolved"],
+            ["CCC.US", "WATCHLIST", "margin_publish:gross_margin:unresolved;rel_path:sheet"],
+            ["DDD.US", "INVESTABLE", "settle_unresolved:observe:pass_limit:p3:ov=61.2:rc=buy;f7_settle_failed:non_converged"],
+            ["EEE.US", "WATCHLIST", "unresolved_settle_unresolved:x;f7_settle:observe:st3"]]
+    page = dq.Page("Global_Markets", rows, len(rows))
+    rec = dq.dq_37_f7({"pages": {"Global_Markets": page}})
+    assert rec["values"]["Global_Markets:non_converged"] == 3, rec["values"]
+    assert rec["values"]["non_converged_total"] == 3 and rec["status"] == "FAIL", rec
+    assert rec["count"] == 0          # no rc=a>b flip among these rows: count is the flip count
+    assert any("DDD.US INVESTABLE non-converged (GM)" == e for e in rec["examples"]), rec["examples"]
+    assert dq.F7_NONCONV_PREFIXES == ("f7_settle_failed", "settle_unresolved:")
+    # v1.0.0 predicate on the same rows would have missed BBB.US (the enforce receipt)
+    v100 = sum(1 for tg in page.tags if any(t.startswith("f7_settle_failed") for t in tg))
+    assert v100 == 2
+
+
 if __name__ == "__main__":
     tests = [test_p1_selftest_passes, test_p2_cli_contract, test_p3_selftest_deterministic, test_p4_not_a_copy_of_the_script,
              test_p5_golden_fixture_structure, test_p6_fixture_self_comparison, test_p7_redaction_guard,
              test_p8_synthetic_negatives_through_the_real_path, test_p9_import_is_side_effect_free, test_p10_workflow_wiring,
-             test_p11_backup_local_copy_flag_default, test_p12_golden_run_on_the_real_export]
+             test_p11_backup_local_copy_flag_default, test_p12_golden_run_on_the_real_export,
+             test_p13_dq37_counts_both_receipts_by_prefix]
     fails = skipped = 0
     for t in tests:
         try:
@@ -287,5 +313,5 @@ if __name__ == "__main__":
                 raise
             skipped += 1
             print("SKIP", t.__name__, "::", str(exc)[:160])
-    print("[DQ-AUDIT HARNESS v1.0.0] %d/%d PASS (%d skipped)" % (len(tests) - fails - skipped, len(tests), skipped))
+    print("[DQ-AUDIT HARNESS v1.0.1] %d/%d PASS (%d skipped)" % (len(tests) - fails - skipped, len(tests), skipped))
     sys.exit(1 if fails else 0)
