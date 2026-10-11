@@ -1,12 +1,53 @@
 name: Core repair deployed readback
 on:
   workflow_dispatch:
+    inputs:
+      name_identity_evidence:
+        description: Collect current missing-name evidence without changing the workbook
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 concurrency:
   group: core-repair-readback
   cancel-in-progress: false
 jobs:
+  collect-name-identity:
+    if: ${{ inputs.name_identity_evidence }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install read-only authentication dependencies
+        run: python -m pip install 'google-auth==2.49.2' 'requests==2.33.1'
+      - name: Collect fresh exact-code listing evidence
+        env:
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEFAULT_SPREADSHEET_ID"
+          python scripts/name_identity_evidence.py \
+            --sheet-id "$DEFAULT_SPREADSHEET_ID" \
+            --output name-identity-evidence/evidence.json
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: name-identity-evidence-${{ github.run_id }}
+          path: name-identity-evidence/
+          retention-days: 7
+          if-no-files-found: error
   readback:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
