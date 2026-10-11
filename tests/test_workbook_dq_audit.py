@@ -276,18 +276,21 @@ def test_p13_dq37_counts_both_receipts_by_prefix():
     non-converged row with settle_unresolved:enforce:... and WITHOUT f7_settle_failed:non_converged.
     DQ-37 must still count it; a margin receipt ending in ':unresolved' must not be counted."""
     hdr = ["Symbol", "Investability Status", "Warnings"]
-    rows = [hdr,
+    # six INVESTABLE rc-flip rows first: on the real export such flips fill every
+    # example slot before the later non-converged rows are reached
+    flips = [["F%d.US" % i, "INVESTABLE", "f7_settle:observe:st3:ov=60.0>55.0:rc=buy>hold"] for i in range(6)]
+    rows = [hdr] + flips + [
             ["AAA.US", "WATCHLIST", "f7_settle_failed:non_converged;rel_path:sheet"],
             ["BBB.US", "WATCHLIST", "settle_unresolved:enforce:pass_limit:p3:ov=55.02:rc=hold;rank_skipped_settle_unresolved"],
             ["CCC.US", "WATCHLIST", "margin_publish:gross_margin:unresolved;rel_path:sheet"],
             ["DDD.US", "INVESTABLE", "settle_unresolved:observe:pass_limit:p3:ov=61.2:rc=buy;f7_settle_failed:non_converged"],
-            ["EEE.US", "WATCHLIST", "unresolved_settle_unresolved:x;f7_settle:observe:st3"]]
+            ["EEE.US", "WATCHLIST", "unresolved_settle_unresolved:x;f7_settle:observe:st3;name_unresolved"]]
     page = dq.Page("Global_Markets", rows, len(rows))
     rec = dq.dq_37_f7({"pages": {"Global_Markets": page}})
     assert rec["values"]["Global_Markets:non_converged"] == 3, rec["values"]
     assert rec["values"]["non_converged_total"] == 3 and rec["status"] == "FAIL", rec
-    assert rec["count"] == 0          # no rc=a>b flip among these rows: count is the flip count
-    assert any("DDD.US INVESTABLE non-converged (GM)" == e for e in rec["examples"]), rec["examples"]
+    assert rec["count"] == 6          # count is the rc-flip count (the six F*.US rows)
+    assert rec["examples"][0] == "DDD.US INVESTABLE non-converged (GM)", rec["examples"]
     assert dq.F7_NONCONV_PREFIXES == ("f7_settle_failed", "settle_unresolved:")
     # v1.0.0 predicate on the same rows would have missed BBB.US (the enforce receipt)
     v100 = sum(1 for tg in page.tags if any(t.startswith("f7_settle_failed") for t in tg))

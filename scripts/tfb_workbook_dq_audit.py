@@ -13,12 +13,14 @@ counted non-convergence only by the f7_settle_failed prefix, so arming enforce
 would have dropped DQ-37's non_converged count to 0 while the 46 rows (10-10:
 GM 45 + CFX 1) were still unresolved - a false PASS. The predicate is now
 F7_NONCONV_PREFIXES = ("f7_settle_failed", "settle_unresolved:"), matched as a
-token PREFIX, never as the substring "unresolved": since engine v5.151.6 the
-margin publication writes receipts ending in ":unresolved" (1 GM row on 10-10),
-which a substring rule would miscount. The same predicate feeds the per-row
+token PREFIX, never as the substring "unresolved", which other tokens contain:
+the engine's enforce-only margin receipt margin_publish:<field>:unresolved
+(since v5.151.4; 0 on 10-10 because margin publication runs in observe) and the
+provider token name_unresolved (1 GM row on 10-10). The same predicate feeds the per-row
 DQ-37 flag. An INVESTABLE row among the non-converged ones (0 on 10-10, 0 by
-construction under the engine's gate tier) is listed in the examples so the
-operator sees it without a schema change. On the 2026-10-10 export every
+construction under the engine's gate tier) is listed FIRST in the examples, ahead
+of the INVESTABLE rc-flip examples that otherwise fill all six slots on a real
+export, so the operator sees it without a schema change (review fix). On the 2026-10-10 export every
 count, status and value is unchanged (0 settle_unresolved tags exist), so the
 committed baseline fixture stays valid; only the version token and the DQ-37
 detail text change in the report. Selftest cases are unchanged (label-based
@@ -1660,6 +1662,7 @@ def dq_36_horizon(ctx):
 
 def dq_37_f7(ctx):
     vals, ex, flips_total, nonconv_total = {}, [], 0, 0
+    ex_nc = []   # v1.0.1: INVESTABLE non-converged rows get their own list and precedence
     pairs = collections.Counter()
     for p in _pages_present(ctx):
         pg = ctx["pages"][p]
@@ -1668,8 +1671,8 @@ def dq_37_f7(ctx):
             f7 = [t for t in tg if t.startswith("f7_settle:")]
             if any(t.startswith(F7_NONCONV_PREFIXES) for t in tg):
                 nonconv += 1
-                if pg.s(r, "Investability Status").upper() == "INVESTABLE" and len(ex) < 6:
-                    ex.append(f"{pg.s(r, 'Symbol')} INVESTABLE non-converged ({PAGE_SHORT[p]})")
+                if pg.s(r, "Investability Status").upper() == "INVESTABLE" and len(ex_nc) < 6:
+                    ex_nc.append(f"{pg.s(r, 'Symbol')} INVESTABLE non-converged ({PAGE_SHORT[p]})")
             if not f7:
                 continue
             tagged += 1
@@ -1709,6 +1712,9 @@ def dq_37_f7(ctx):
     vals["non_converged_total"] = nonconv_total
     for k, v in pairs.most_common(5):
         vals["pair_" + k] = v
+    # v1.0.1: the 6 example slots fill with INVESTABLE rc flips long before the last
+    # non-converged rows on a real export, so a non-converged INVESTABLE row goes FIRST.
+    ex = ex_nc + ex[:max(0, 6 - len(ex_nc))]
     ex += [f"{k} x{v}" for k, v in pairs.most_common(3)]
     status = "FAIL" if flips_total or nonconv_total else "PASS"
     return check("DQ-37", "f7_pass_dependence", "E", "scores", status, flips_total, vals, ex,

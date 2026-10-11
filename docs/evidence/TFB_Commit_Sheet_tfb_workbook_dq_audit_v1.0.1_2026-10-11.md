@@ -22,13 +22,18 @@ v1.0.0 counted non-convergence only by the `f7_settle_failed` prefix, so arming 
 would have dropped DQ-37's non-converged count to 0 while the rows were still unresolved.
 
 - `F7_NONCONV_PREFIXES = ("f7_settle_failed", "settle_unresolved:")`, matched as a tag
-  prefix. The bare substring `unresolved` is never used: margin-publication receipts end
-  in `:unresolved` (1 Global_Markets row on 2026-10-10).
+  prefix. The bare substring `unresolved` is never used, because other tokens contain it:
+  the engine's enforce-only margin receipt `margin_publish:<field>:unresolved` (since
+  engine 5.151.4; none on 2026-10-10 because margin publication runs in observe) and the
+  provider token `name_unresolved` (1 Global_Markets row on 2026-10-10).
 - The same predicate feeds the per-row DQ-37 flag.
-- An INVESTABLE row among the non-converged ones is listed in the DQ-37 examples
-  (`<SYM> INVESTABLE non-converged (<page>)`). There are none on 2026-10-10, and none can
-  exist by construction under the engine's gate tier; examples are not part of the
-  committed fixture, so the schema is unchanged.
+- An INVESTABLE row among the non-converged ones is listed FIRST in the DQ-37 examples
+  (`<SYM> INVESTABLE non-converged (<page>)`), ahead of the INVESTABLE rc-flip examples.
+  On the real export those flips fill all six example slots before 28 of the 46
+  non-converged rows are reached, so a shared cap would hide such a row (independent
+  review finding). There are none on 2026-10-10, and none can exist by construction
+  under the engine's gate tier; examples are not part of the committed fixture, so the
+  schema is unchanged.
 
 ## S4 — Audits
 
