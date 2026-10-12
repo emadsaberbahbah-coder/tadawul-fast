@@ -92,35 +92,45 @@ def test_scheduled_inherit_preserves_source_normalization_and_repository_default
     assert evidence["requested"] == {"rank": "inherit", "warnings": "inherit"}
     assert evidence["effective"] == {"rank": expected_rank, "warnings": "observe" if warnings_raw.strip().lower() == "observe" else "off"}
     job = workflow(lane[0])["jobs"][lane[1]]
-    assert job["env"]["TFB_RANK_OVERALL_PAGE"] == "${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}"
+    assert job["env"]["TFB_RANK_OVERALL_PAGE"] == "${{ vars.TFB_RANK_OVERALL_PAGE || 'enforce' }}"
     assert job["env"]["TFB_WARNINGS_COMPACT"] == "${{ vars.TFB_WARNINGS_COMPACT || 'observe' }}"
 
 
 @pytest.mark.parametrize("lane", LANES)
 @pytest.mark.parametrize("event", ("schedule", "workflow_dispatch"))
-@pytest.mark.parametrize("variable,override,expected", (
-    (None, "inherit", "observe"), ("", "inherit", "observe"),
-    ("off", "inherit", "off"), ("false", "inherit", "off"),
-    ("invalid", "inherit", "off"), ("observe", "inherit", "observe"),
-    (None, "off", "off"), ("observe", "off", "off"),
+@pytest.mark.parametrize("rank_variable,warnings_variable,rank_override,warnings_override,rank,warnings", (
+    (None, None, "inherit", "inherit", "enforce", "observe"),
+    ("", "", "inherit", "inherit", "enforce", "observe"),
+    ("off", None, "inherit", "inherit", "off", "observe"),
+    ("invalid", None, "inherit", "inherit", "off", "observe"),
+    (None, "off", "inherit", "inherit", "enforce", "off"),
+    (None, "invalid", "inherit", "inherit", "enforce", "off"),
+    ("false", "false", "inherit", "inherit", "off", "off"),
+    ("observe", None, "inherit", "inherit", "observe", "observe"),
+    (None, None, "observe", "inherit", "observe", "observe"),
+    (None, None, "off", "inherit", "off", "observe"),
+    (None, None, "inherit", "off", "enforce", "off"),
+    ("observe", "observe", "off", "off", "off", "off"),
 ))
-def test_persistent_observe_defaults_preserve_explicit_disable_in_all_writer_lanes(lane, event, variable, override, expected, tmp_path):
+def test_rank_only_promotion_preserves_separate_modes_and_overrides_in_all_writer_lanes(
+        lane, event, rank_variable, warnings_variable, rank_override, warnings_override, rank, warnings, tmp_path):
     job = workflow(lane[0])["jobs"][lane[1]]
     configured = {}
-    for name in ("TFB_RANK_OVERALL_PAGE", "TFB_WARNINGS_COMPACT"):
-        assert job["env"][name] == "${{ vars." + name + " || 'observe' }}"
+    for name, variable, fallback in (("TFB_RANK_OVERALL_PAGE", rank_variable, "enforce"),
+                                     ("TFB_WARNINGS_COMPACT", warnings_variable, "observe")):
+        assert job["env"][name] == "${{ vars." + name + " || '" + fallback + "' }}"
         configured[name] = workflow_variable_value(job["env"][name], name, variable)
     result = resolve(lane, tmp_path, GITHUB_EVENT_NAME=event,
-                     RANK_MODE_OVERRIDE=override, WARNINGS_MODE_OVERRIDE=override, **configured)
+                     RANK_MODE_OVERRIDE=rank_override, WARNINGS_MODE_OVERRIDE=warnings_override, **configured)
     assert result.returncode == 0, result.stdout + result.stderr
     value = json.loads((tmp_path / "rollout_modes.json").read_text())
-    assert value["requested"] == {"rank":override, "warnings":override}
+    assert value["requested"] == {"rank":rank_override, "warnings":warnings_override}
     assert value["configured"] == {"rank":configured["TFB_RANK_OVERALL_PAGE"],
                                     "warnings":configured["TFB_WARNINGS_COMPACT"]}
-    assert value["effective"] == {"rank":expected, "warnings":expected}
+    assert value["effective"] == {"rank":rank, "warnings":warnings}
     assert value["warnings_enforcement"] == "blocked_no_prewrite_external_archive"
     assert (tmp_path / "github-env").read_text() == (
-        "TFB_RANK_OVERALL_PAGE=" + expected + "\nTFB_WARNINGS_COMPACT=" + expected + "\n")
+        "TFB_RANK_OVERALL_PAGE=" + rank + "\nTFB_WARNINGS_COMPACT=" + warnings + "\n")
 
 
 @pytest.mark.parametrize("lane", LANES)
