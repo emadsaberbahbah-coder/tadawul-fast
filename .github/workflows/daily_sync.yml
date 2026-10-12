@@ -606,10 +606,10 @@ jobs:
       # withheld rows written "". Explicit words only ('1'/'true' read as off).
       # Armed through the repo Variable after the observe read-back; no YAML
       # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
-      # (2026-10-12) Operator-authorized initial rollout remains observe;
-      # enforcement requires full-page proof. Explicit Variables win.
-      # Rollback: set the Variable to off; unsetting reactivates observe.
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
+      # (2026-10-12) Rank-only promotion requires full-page observe evidence
+      # and independent readback. Explicit Variables and manual overrides win.
+      # Rollback: set the Variable to off; unsetting reactivates enforce.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'enforce' }}
       # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
       # runner stops fetching new batches once 3600s of wall clock are spent
       # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
@@ -1714,9 +1714,9 @@ jobs:
       # withheld rows written "". Explicit words only ('1'/'true' read as off).
       # Armed through the repo Variable after the observe read-back; no YAML
       # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
-      # (2026-10-12) Same operator-authorized observation as the primary lane.
-      # Rollback: set the Variable to off; unsetting reactivates observe.
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
+      # (2026-10-12) Same rank-only gate as the primary lane.
+      # Rollback: set the Variable to off; unsetting reactivates enforce.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'enforce' }}
       # FULL-FILL v1.1.0 (2026-08-04): arm the data-complete criterion + cycle loop.
       # Kill-switches: remove these three lines (or set 0/"1" resp.) to restore the
       # single-pass "process-success" behavior byte-identically.

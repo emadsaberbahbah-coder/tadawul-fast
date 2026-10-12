@@ -213,9 +213,9 @@ jobs:
       # v6.66.0 WP-2c RANK-PAGE (2026-10-11): a recovery write ranks Rank (Overall)
       # over the whole page under the same gate as the scheduled legs; without this
       # mapping a recovery after arming would republish within-batch ranks (batch 25).
-      # (2026-10-12) Same operator-authorized observation as scheduled legs.
-      # Rollback: set the Variable to off; unsetting reactivates observe.
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
+      # (2026-10-12) Same rank-only gate as scheduled legs.
+      # Rollback: set the Variable to off; unsetting reactivates enforce.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'enforce' }}
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
     steps:
       - name: Checkout
