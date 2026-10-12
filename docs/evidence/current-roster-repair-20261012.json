@@ -1,0 +1,129 @@
+{
+  "schema": "tfb-current-roster-repair-evidence/v1",
+  "approval_date": "2026-10-12",
+  "approval_basis": "Owner chose the recommended current Saudi-only leader scope and current fund-tab membership after reviewing the July backup discrepancy.",
+  "policy_revision": "2026-10-12.current-workbook.v1",
+  "policy_sha256": "f88cafa5240afe4cddb9c48f796d33319e599ae88b88a3d83d055b4ce5b4a8f8",
+  "approved_pages": {
+    "Market_Leaders": {
+      "scope": "saudi_only",
+      "approved_count": 255,
+      "supersedes_min_rows": 1025,
+      "membership_sha256": "65cdc44757f690aa68d70d53315432810b21c99c40d3df4f629728d5069fba3b",
+      "symbol_set_sha256": "9c9949e0952b3b6c7ac4de2cdefd7fdc084e0649ecffef48e3e27cdaab703c66"
+    },
+    "Mutual_Funds": {
+      "scope": "current_fund_tab",
+      "approved_count": 2474,
+      "supersedes_min_rows": 4496,
+      "membership_sha256": "10b7327f802d7c346708c347a4d40945bdc28db2daf385c5456c8dc28366e151",
+      "symbol_set_sha256": "d9a3fcb8aefc9de60de28c1e4d2c89464be2dbaf0907e11edd904bd48214bc02"
+    }
+  },
+  "historical_comparison": {
+    "july_leader_count": 1025,
+    "july_fund_count": 2475,
+    "current_leader_count": 255,
+    "current_fund_count": 2474,
+    "older_fund_numeric_target": 4496,
+    "historical_names_not_approved_identity_evidence": true
+  },
+  "fresh_export_verification": {
+    "observed_at_utc": "2026-10-11T22:46:14.135637+00:00",
+    "xlsx_sha256": "97bd390dddaf532c374dc9bf406f22fcbeb686a41fec6de9eea731add33116ba",
+    "read_only": true,
+    "membership_matches": {
+      "Market_Leaders": true,
+      "Mutual_Funds": true
+    },
+    "name_coverage_pct": {
+      "Global_Markets": 97.7909,
+      "Mutual_Funds": 98.0194
+    },
+    "missing_names": {
+      "Global_Markets": 146,
+      "Mutual_Funds": 49
+    },
+    "coverage_exit": 2,
+    "decision_surface_exit": 2,
+    "decision_findings": [
+      "PF_SOURCE_CONSUMPTION_UNPROVEN",
+      "T10_SOURCE_CONSUMPTION_UNPROVEN",
+      "T10_POOL_APPROVED_COUNT",
+      "FALSE_FULL_UNIVERSE_CLAIM"
+    ],
+    "snapshot_limit": "Export-time values do not prove subsequent live state.",
+    "complete_symbol_column_crossbound": true
+  },
+  "provider_name_evidence": {
+    "workflow_run": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38181213034",
+    "collector_commit": "9c5c6a76f069028f788f826167370173d7924c6d",
+    "artifact_sha256": "877fa1fb9201edd56b002e9365f951c5f90773681b712ca4bfbe37b69406f646",
+    "read_only": true,
+    "target_rows": 195,
+    "classifications": {
+      "unsupported_or_conflicting_namespace": 26,
+      "provider_delisted": 154,
+      "not_listed_in_provider_catalogs": 8,
+      "metadata_conflict": 5,
+      "candidate": 2
+    },
+    "delisted_catalog_by_page": {
+      "Global_Markets": 105,
+      "Mutual_Funds": 49
+    },
+    "classification_limit": "EODHD delisted catalog classification is provider evidence; it does not authorize aliases, retirement or attest legal/broker listing status. A fresh HTTP response does not establish underlying catalog freshness.",
+    "active_candidates_written": 0,
+    "independent_issuer_conflicts": 1,
+    "issuer_conflict_source": "https://www.fgen.com/",
+    "independently_corroborated_active_candidates": 1,
+    "issuer_conflict_evidence": [
+      "https://media.umbraco.io/foresight/ouekohzi/fgen-kid_20240916.pdf",
+      "https://media.umbraco.io/foresight/5enp54bj/web_fgen_ar26.pdf"
+    ],
+    "cross_provider_listing_conflicts_require_review": true
+  },
+  "native_source": {
+    "version": "1.13.6",
+    "sha256": "39c97bf9b0c5d7315f542b76e550a3ca2a0f1daca290990f749258749470ec48",
+    "installed": false,
+    "checks": {
+      "default_readiness": 60,
+      "actual_approved_roster_readiness": 62,
+      "all_javascript_harnesses_passed": 11
+    }
+  },
+  "live_acceptance": {
+    "accepted": false,
+    "feed_promoted": false,
+    "sheet_writes_by_this_repair": false,
+    "provider_baseline_frozen": true,
+    "provider_baseline_accepted": false,
+    "remaining_controls": [
+      "Review unresolved and provider-delisted identities with current authoritative listing evidence; do not fill historical names to clear coverage.",
+      "Install the reviewed native Apps Script and refresh decision panels with genuine consumed-source receipts.",
+      "Review fund pool exclusions; source membership must not be replaced by a count-only claim.",
+      "Create or approve a valid provider-target baseline only after a healthy verified refresh."
+    ]
+  },
+  "versions": {
+    "approved_universe_scope": "1.0.0",
+    "full_refresh_coverage": "1.3.1",
+    "decision_surface_freshness": "1.3.1",
+    "final_decision_publication": "1.1.1",
+    "name_identity_evidence": "1.0.0",
+    "deployment_verifier": "1.0.52",
+    "universal_ci": "1.1.9"
+  },
+  "offline_validation": {
+    "python_passed": 4328,
+    "python_skipped": 9,
+    "subtests_passed": 131,
+    "existing_return_warnings": 3,
+    "javascript_harnesses_passed": 11,
+    "blocking_ruff": "passed",
+    "compileall": "passed",
+    "workflow_audit_errors": 0,
+    "workflow_audit_existing_warnings": 2
+  }
+}

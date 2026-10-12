@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.3.1 — exact scoped membership requires an independent complete A:A
+read crossbound to the quality scan. Sparse tails beyond the audit bound fail
+closed instead of certifying a partial window as the full approved membership.
+
+VERSION 1.3.0 — standalone live audits require the approved current universe
+policy. Market Leaders and Mutual Funds use its exact physical-symbol
+membership, with explicit receipts for superseded historical/configured row
+floors. Other coverage, acquisition and portfolio gates remain mandatory.
+
 VERSION 1.2.2 — callers may supply explicit audited rules. The final publication
 guard uses this to prevent environment settings weakening its acceptance floor.
 Default standalone rules and exit-code behavior are unchanged.
@@ -34,12 +43,12 @@ floors, coverage math, exit codes: UNTOUCHED.
 from __future__ import annotations
 import argparse, asyncio, importlib, inspect, json, math, os, sys
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.2.2"
+VERSION = "1.3.1"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -56,6 +65,9 @@ from core.data_validity import (  # noqa: E402
     timestamp_freshness,
 )
 from scripts.critical_symbol_identity import canonicalize_symbol  # noqa: E402
+from scripts.approved_universe_scope import (  # noqa: E402
+    ScopePolicy, approved_floors, load_scope, validate_symbols,
+)
 
 @dataclass(frozen=True)
 class Rule:
@@ -78,6 +90,7 @@ class Result:
     extra_portfolio: list[str] = field(default_factory=list)
     missing_qty: list[str] = field(default_factory=list); missing_cost: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list); warnings: list[str] = field(default_factory=list)
+    approved_scope: dict = field(default_factory=dict)
     def finish(self):
         self.status = "FAIL" if self.failures else ("WARN" if self.warnings else "PASS"); return self
 
@@ -85,6 +98,7 @@ class Result:
 class Report:
     generated_at_utc: str; sheet: str; schema_version: str; active_holdings: list[str]
     pages: list[Result] = field(default_factory=list); fatal: str = ""
+    approved_scope: dict = field(default_factory=dict)
     @property
     def code(self): return 3 if self.fatal else (2 if any(p.failures for p in self.pages) else (1 if any(p.warnings for p in self.pages) else 0))
     def payload(self):
@@ -92,7 +106,8 @@ class Report:
                 "sheet": self.sheet, "schema_version": self.schema_version,
                 "summary": {"pages": len(self.pages), "failures": sum(bool(p.failures) for p in self.pages),
                             "warnings": sum(bool(p.warnings) for p in self.pages), "exit_code": self.code, "fatal": self.fatal},
-                "active_holdings": self.active_holdings, "pages": [asdict(p) for p in self.pages]}
+                "active_holdings": self.active_holdings, "approved_scope": self.approved_scope,
+                "pages": [asdict(p) for p in self.pages]}
 
 def s(v):
     try: return "" if v is None else str(v).strip()
@@ -178,6 +193,14 @@ async def read(reader, sid, page, limit):
     if not isinstance(val,list): raise TypeError("read_range did not return a list")
     return [list(r) if isinstance(r,(list,tuple)) else [r] for r in val]
 
+async def read_symbol_column(reader, sid, page):
+    """A complete A:A read proves that no sparse tail symbol escaped the window."""
+    loop=asyncio.get_running_loop()
+    val=await loop.run_in_executor(None,lambda:reader(sid,f"{page}!A:A"))
+    if inspect.isawaitable(val): val=await val
+    if not isinstance(val,list): raise TypeError("complete Symbol column did not return a list")
+    return val
+
 def header_row(grid, expected):
     exp={s(x).casefold() for x in expected if s(x)}; best=(-1,0)
     for i,row in enumerate(grid[:45]):
@@ -199,14 +222,27 @@ def ledger_symbols(grid):
         if sym and status not in {"inactive","closed","sold"} and (q is None or q>0): active.append(sym)
     return sorted(set(active)), []
 
-def rules():
+def _strict_setting(name, default, *, minimum=None, maximum=None):
+    value=env_f(name,default)
+    if not math.isfinite(value) or value<=0: value=default
+    if minimum is not None: value=max(minimum,value)
+    if maximum is not None: value=min(maximum,value)
+    return value
+
+def rules(*, approved_scope: ScopePolicy | None=None):
+    scope=approved_scope if approved_scope is not None else load_scope()
+    current=approved_floors(policy=scope)
     def R(page,count,price=95,name=99):
-        key=page.upper(); return Rule(page,env_i(f"TFB_EXPECTED_MIN_ROWS_{key}",count),env_f(f"TFB_REFRESH_MAX_AGE_H_{key}",30),env_f(f"TFB_REFRESH_MIN_FRESH_PCT_{key}",95),name,price)
-    return [R("Market_Leaders",1025),R("Global_Markets",6512),R("Commodities_FX",453,95,95),R("Mutual_Funds",4496,90),
-            Rule("My_Portfolio",1,env_f("TFB_REFRESH_MAX_AGE_H_MY_PORTFOLIO",8),100,100,100,True,True),
+        key=page.upper()
+        floor=current[page] if page in current else math.ceil(_strict_setting(f"TFB_EXPECTED_MIN_ROWS_{key}",count,minimum=count))
+        return Rule(page,floor,_strict_setting(f"TFB_REFRESH_MAX_AGE_H_{key}",30,maximum=30),_strict_setting(f"TFB_REFRESH_MIN_FRESH_PCT_{key}",95,minimum=95,maximum=100),name,price)
+    return [R("Market_Leaders",current["Market_Leaders"]),R("Global_Markets",6512),R("Commodities_FX",453,95,95),R("Mutual_Funds",current["Mutual_Funds"],90,99),
+            Rule("My_Portfolio",1,_strict_setting("TFB_REFRESH_MAX_AGE_H_MY_PORTFOLIO",8,maximum=8),100,100,100,True,True),
             Rule("Insights_Analysis",1,None,0,0,0,False),Rule("Data_Dictionary",1,None,0,0,0,False)]
 
-def audit_grid(grid, rule, expected, now, active=()):
+def audit_grid(grid, rule, expected, now, active=(), *, approved_scope: ScopePolicy | None=None, source_column=None):
+    if approved_scope is not None and rule.page in approved_scope.pages:
+        rule=replace(rule,min_rows=approved_scope.pages[rule.page].approved_count)
     hr=header_row(grid,expected); r=Result(rule.page,min_rows=rule.min_rows,expected_cols=len(expected),header_row=hr+1 if hr>=0 else 0)
     if hr<0: r.failures.append("header row not found"); return r.finish()
     headers=trim(grid[hr]); r.actual_cols=len(headers)
@@ -216,6 +252,54 @@ def audit_grid(grid, rule, expected, now, active=()):
     if not rule.symbols: return r.finish()
     si,ni,pi,ti,qi,ci=idx(headers,SYMBOL),idx(headers,NAME),idx(headers,PRICE),idx(headers,STAMP),idx(headers,QTY),idx(headers,COST)
     if si<0: r.failures.append("Symbol column missing"); return r.finish()
+    if approved_scope is not None and rule.page in approved_scope.pages:
+        wide_validation=validate_symbols(rule.page,[row[si] if si<len(row) else None for row in rows],policy=approved_scope)
+        wide_receipt=wide_validation.to_dict()
+        r.approved_scope=wide_receipt.copy()
+        proof={"range":f"{rule.page}!A:A","bound":DEFAULT_MAX_ROWS+50,"valid":False,"crossbound":False,
+               "returned_rows":len(source_column) if isinstance(source_column,list) else None,
+               "header_row":hr+1,"symbol_column":1}
+        try:
+            if si!=0 or sum(s(h).casefold()=="symbol" for h in headers)!=1:
+                raise ValueError("approved universe requires exactly one physical Symbol column in A")
+            if not isinstance(source_column,list):
+                raise ValueError("complete Symbol column was not supplied")
+            if len(source_column)>DEFAULT_MAX_ROWS+50 or len(grid)>DEFAULT_MAX_ROWS+50:
+                raise ValueError("complete Symbol column exceeds the 20,050-row audit bound")
+            if any(not isinstance(row,(list,tuple)) or len(row)>1 for row in source_column):
+                raise ValueError("complete Symbol column has malformed or extra-column rows")
+            column_headers=[i for i,row in enumerate(source_column[:45]) if row and s(row[0]).casefold()=="symbol"]
+            if column_headers!=[hr]:
+                raise ValueError("complete and bounded Symbol headers are ambiguous or do not match")
+            column_symbols=[row[0] for row in source_column[hr+1:] if row and s(row[0])]
+            full_validation=validate_symbols(rule.page,column_symbols,policy=approved_scope)
+            r.approved_scope=full_validation.to_dict()
+            proof["observed_symbol_set_sha256"]=r.approved_scope["observed_symbol_set_sha256"]
+            proof["actual_membership_sha256"]=r.approved_scope["actual_membership_sha256"]
+            proof["bounded_symbol_set_sha256"]=wide_receipt["observed_symbol_set_sha256"]
+            proof["bounded_membership_sha256"]=wide_receipt["actual_membership_sha256"]
+            if not full_validation.valid or not wide_validation.valid:
+                raise ValueError("complete and bounded memberships must both match the approved scope")
+            extent=max(len(grid),len(source_column))
+            for position in range(hr+1,extent):
+                wide=s(grid[position][0] if position<len(grid) and grid[position] else None).upper()
+                full=s(source_column[position][0] if position<len(source_column) and source_column[position] else None).upper()
+                if wide!=full:
+                    raise ValueError("complete and bounded Symbol columns changed between reads")
+            proof.update(valid=True,crossbound=True)
+        except Exception as exc:
+            proof["error"]=f"{type(exc).__name__}: {exc}"
+            r.failures.append("complete approved universe membership unproven: "+proof["error"])
+        r.approved_scope["complete_column_proof"]=proof
+        r.approved_scope["valid"]=r.approved_scope["valid"] is True and proof["valid"] is True
+        setting="TFB_EXPECTED_MIN_ROWS_"+rule.page.upper()
+        r.approved_scope["superseded_configured_floor"]={"environment":setting,"value":os.getenv(setting),
+            "legacy_effective_min_rows":env_i(setting,approved_scope.pages[rule.page].supersedes_min_rows)}
+        r.approved_scope["applied_min_rows"]=rule.min_rows
+        if not wide_validation.valid:
+            r.failures.append("approved universe membership failed: "
+                f"missing={wide_receipt['missing_count']}, unexpected={wide_receipt['unexpected_count']}, "
+                f"duplicates={wide_receipt['duplicate_count']}, invalid={wide_receipt['bad_symbol_count']}")
     symbols=[]; names=prices=0; ages=[]; qmap={}; cmap={}
     timestamp_symbols=set(); bad_symbols=set(); quote_symbols=set()
     for row in rows:
@@ -261,16 +345,27 @@ def audit_grid(grid, rule, expected, now, active=()):
         elif r.missing_cost: r.failures.append("missing/non-positive cost: "+", ".join(r.missing_cost))
     return r.finish()
 
-async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None, *, policy_rules=None):
-    reader,registry,now=reader or resolve_reader(),registry or resolve_registry(),now or datetime.now(timezone.utc); rep=Report(now.isoformat(),sid[:5]+"..."+sid[-5:] if len(sid)>10 else "***",s(getattr(registry,"SCHEMA_VERSION",getattr(registry,"__version__","unknown"))) if registry else "unknown",[])
+async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None, *, policy_rules=None, approved_scope: ScopePolicy | None=None):
+    now=now or datetime.now(timezone.utc)
+    rep=Report(now.isoformat(),sid[:5]+"..."+sid[-5:] if len(sid)>10 else "***","unknown",[])
+    try:
+        scope=approved_scope if approved_scope is not None else (load_scope() if policy_rules is None else None)
+        selected=rules(approved_scope=scope) if policy_rules is None else policy_rules
+        if scope is not None: rep.approved_scope=scope.receipt()
+    except Exception as e:
+        rep.fatal=f"approved universe policy unavailable: {e}"; return rep
+    reader,registry=reader or resolve_reader(),registry or resolve_registry()
+    rep.schema_version=s(getattr(registry,"SCHEMA_VERSION",getattr(registry,"__version__","unknown"))) if registry else "unknown"
     if not sid: rep.fatal="spreadsheet ID missing"; return rep
     if not reader: rep.fatal="read_range unavailable"; return rep
     if not registry: rep.fatal="schema_registry unavailable"; return rep
     try: rep.active_holdings,warn=ledger_symbols(await read(reader,sid,"_Portfolio_CostBasis",limit))
     except Exception as e: warn=[f"ledger unreadable: {e}"]
-    for rule in rules() if policy_rules is None else policy_rules:
+    for rule in selected:
         try:
-            out=audit_grid(await read(reader,sid,rule.page,limit),rule,list(registry.get_sheet_headers(rule.page)),now,rep.active_holdings)
+            grid=await read(reader,sid,rule.page,limit)
+            column=await read_symbol_column(reader,sid,rule.page) if scope is not None and rule.page in scope.pages else None
+            out=audit_grid(grid,rule,list(registry.get_sheet_headers(rule.page)),now,rep.active_holdings,approved_scope=scope,source_column=column)
             if rule.portfolio and warn: out.warnings+=warn; out.failures+=(["active ledger universe not proven"] if not rep.active_holdings else []); out.finish()
             rep.pages.append(out)
         except Exception as e: rep.pages.append(Result(rule.page,status="FAIL",min_rows=rule.min_rows,failures=[f"audit failed: {e}"]))

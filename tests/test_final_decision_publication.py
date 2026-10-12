@@ -11,6 +11,28 @@ from scripts import finalize_decision_publication as final
 from tests.test_decision_surface_freshness import (
     NOW, FLOORS, portfolio_grid, status_grid, top10_grid, publication_grids,
 )
+from tests.test_full_refresh_coverage import scoped_grid, scoped_symbols, synthetic_approved_scope, symbol_column
+from scripts.approved_universe_scope import ScopePolicyError
+
+
+@pytest.fixture(autouse=True)
+def approved_scope_fixture(tmp_path, monkeypatch):
+    """Simulate a validated approval at full current counts, never reduced floors."""
+    scope = synthetic_approved_scope(tmp_path)
+    monkeypatch.setattr(final, "load_scope", lambda: scope)
+    return scope
+
+
+def current_publication_grids():
+    sources, portfolio, top10 = publication_grids()
+    for row in sources[1:]:
+        if row[0] in scoped_symbols():
+            approved = len(scoped_symbols()[row[0]])
+            row[3] = row[3].replace(f"acquired={row[6]}/{row[6]}", f"acquired={approved}/{approved}")
+            row[6] = approved
+    top10[1][1] = top10[1][1].replace("Market_Leaders 1356/1356", "Market_Leaders 255/255").replace(
+        "Mutual_Funds 4496/4496", "Mutual_Funds 2474/2474")
+    return sources, portfolio, top10
 
 
 class Request:
@@ -121,6 +143,8 @@ def reports(*, coverage_failure=False, decision_failure=False, warning=False):
     headers = ["Symbol", "Name", "Current Price", "Last Updated (UTC)",
                "Position Qty", "Avg Cost", "Data Provider"]
     full = final.coverage.Report(now.isoformat(), "***", "synthetic", [])
+    scope = final.load_scope()
+    full.approved_scope = scope.receipt()
     for page in sorted(final.REQUIRED_PAGES):
         symbol = page.upper().replace("_", "")[:10] + ".SR"
         rule = final.coverage.Rule(page, 1, 8, 100, 100, 100,
@@ -128,15 +152,19 @@ def reports(*, coverage_failure=False, decision_failure=False, warning=False):
                                    portfolio=page == "My_Portfolio")
         row = [symbol, "Synthetic name", 0 if coverage_failure and page == "Global_Markets" else 50,
                now.isoformat(), 1, 40, "eodhd"]
-        full.pages.append(final.coverage.audit_grid([headers, row], rule, headers, now, [symbol]))
+        grid = scoped_grid(page, now=now) if page in scope.pages else [headers, row]
+        full.pages.append(final.coverage.audit_grid(grid, rule, headers, now, [symbol], approved_scope=scope,
+                                                   source_column=symbol_column(grid) if page in scope.pages else None))
     if warning:
         full.pages[0].warnings.append("synthetic maintenance warning")
         full.pages[0].finish()
-    grids = list(publication_grids())
+    grids = list(current_publication_grids())
     if decision_failure:
         grids[1][1][1] = grids[1][1][1].replace("2026-07-31 20:05:00", "2026-07-31 19:00:00")
-    decision = final.freshness.audit_surfaces(*grids, now_utc=NOW, min_rows=FLOORS,
-                                            expected_source_run="90001")
+    decision = final.freshness.audit_surfaces(*grids, now_utc=NOW, min_rows=final.MARKET_FLOORS,
+        expected_source_run="90001", approved_scope=scope,
+        source_grids={page: scoped_grid(page) for page in scope.pages},
+        source_columns={page: symbol_column(scoped_grid(page)) for page in scope.pages})
     return full, decision
 
 
@@ -312,6 +340,76 @@ def test_stricter_operator_policy_reaches_both_actual_auditor_interfaces(monkeyp
     assert policy["decision_max_age_h"] == 4
 
 
+@pytest.mark.parametrize("page,configured", [("Market_Leaders", "1025"), ("Mutual_Funds", "4496"),
+                                              ("Market_Leaders", "9000"), ("Mutual_Funds", "9000")])
+def test_only_current_approved_memberships_supersede_configured_row_floor(monkeypatch, page, configured):
+    calls = install_reports(monkeypatch, *reports())
+    monkeypatch.setenv("TFB_EXPECTED_MIN_ROWS_" + page.upper(), configured)
+    result = run(GoogleValues())
+    rule = next(rule for rule in calls["coverage"][1]["policy_rules"] if rule.page == page)
+    assert rule.min_rows == len(scoped_symbols()[page])
+    assert calls["coverage"][1]["approved_scope"] is calls["decision"][1]["approved_scope"]
+    assert result["policy"]["approved_scope"]["pages"][page]["supersedes_min_rows"] == (
+        1025 if page == "Market_Leaders" else 4496)
+
+
+@pytest.mark.parametrize("name", ["coverage", "decision"])
+@pytest.mark.parametrize("fault", ["missing", "other_page", "policy_hash", "symbol_hash", "duplicate", "false"])
+def test_final_acceptance_requires_complete_page_bound_membership_receipts(monkeypatch, name, fault):
+    full, decision = reports()
+    receipt = (next(page.approved_scope for page in full.pages if page.page == "Market_Leaders")
+               if name == "coverage" else decision.source_status["Market_Leaders"]["approved_scope"])
+    if fault == "missing":
+        receipt.clear()
+    elif fault == "other_page":
+        other = (next(page.approved_scope for page in full.pages if page.page == "Mutual_Funds")
+                 if name == "coverage" else decision.source_status["Mutual_Funds"]["approved_scope"])
+        receipt.clear()
+        receipt.update(copy.deepcopy(other))
+    else:
+        key, value = {"policy_hash": ("policy_sha256", "0" * 64),
+                      "symbol_hash": ("observed_symbol_set_sha256", "0" * 64),
+                      "duplicate": ("duplicate_count", 1), "false": ("valid", False)}[fault]
+        receipt[key] = value
+    install_reports(monkeypatch, full, decision)
+    result = run(GoogleValues())
+    assert result["exit_code"] == 3 and result["blocker_published"]
+    assert name + "_failed" in result["blockers"] and not result["feed_promoted"]
+
+
+@pytest.mark.parametrize("name", ["coverage", "decision"])
+@pytest.mark.parametrize("fault", ["missing", "partial_range", "not_crossbound", "oversized", "bool_extent", "wrong_hash", "wrong_column"])
+def test_final_acceptance_requires_independent_complete_column_proof(monkeypatch, name, fault):
+    full, decision = reports()
+    receipt = (next(page.approved_scope for page in full.pages if page.page == "Market_Leaders")
+               if name == "coverage" else decision.source_status["Market_Leaders"]["approved_scope"])
+    if fault == "missing":
+        receipt.pop("complete_column_proof")
+    else:
+        key, value = {"partial_range": ("range", "Market_Leaders!A1:A20050"),
+                      "not_crossbound": ("crossbound", False), "oversized": ("returned_rows", 20051),
+                      "bool_extent": ("returned_rows", True), "wrong_hash": ("bounded_symbol_set_sha256", "0" * 64),
+                      "wrong_column": ("symbol_column", 2)}[fault]
+        receipt["complete_column_proof"][key] = value
+    install_reports(monkeypatch, full, decision)
+    result = run(GoogleValues())
+    assert result["exit_code"] == 3 and result["blocker_published"] and not result["feed_promoted"]
+    assert name + "_failed" in result["blockers"]
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_missing_or_invalid_approval_blocks_without_audit_or_membership_fabrication(monkeypatch, publish):
+    calls = install_reports(monkeypatch, *reports())
+    def bad_scope():
+        raise ScopePolicyError("Synthetic approval missing or invalid")
+    monkeypatch.setattr(final, "load_scope", bad_scope)
+    service = GoogleValues()
+    result = run(service, publish=publish)
+    assert result["exit_code"] == 3 and "approved_scope_unavailable" in result["blockers"]
+    assert result["blocker_published"] is publish and not result["feed_promoted"]
+    assert calls == {} and "approved_scope_error" in result["policy"]
+
+
 @pytest.mark.parametrize("receipt", ["", " run=80000", " run=0", " run=oops", " run=90001 run=80000", " run=90001 run=90001"])
 def test_actual_decision_auditor_requires_one_current_source_cohort_receipt(receipt):
     grid = status_grid()
@@ -331,13 +429,15 @@ def test_actual_decision_auditor_accepts_current_cohort_without_changing_default
                                          min_rows=FLOORS).exit_code == 0
 
 
-@pytest.mark.parametrize("fault", [None, "missing_pf", "stale_pf", "duplicate_top10", "stale_top10", "stale_portfolio_source"])
+@pytest.mark.parametrize("fault", [None, "missing_pf", "stale_pf", "duplicate_top10", "stale_top10", "stale_portfolio_source",
+                                   "source_substitution", "source_loss", "source_duplicate", "source_extra",
+                                   "complete_column_tail", "complete_column_reorder"])
 def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(monkeypatch, fault):
     full, _decision = reports()
     now_riyadh = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     source_stamp = (now_riyadh - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     decision_stamp = (now_riyadh - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-    sources, portfolio, top10 = publication_grids()
+    sources, portfolio, top10 = current_publication_grids()
     for row in sources[1:]:
         row[1] = source_stamp
     for surface in (portfolio, top10):
@@ -354,7 +454,25 @@ def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(mo
         next(row for row in sources[1:] if row[0] == "My_Portfolio")[3] = \
             next(row for row in sources[1:] if row[0] == "My_Portfolio")[3].replace("run=90001", "run=80000")
     grids = {"_Status!A1:J100": sources, "Portfolio_Decision!A1:B3": portfolio,
-             "Top_10_Investments!A1:B3": top10}
+             "Top_10_Investments!A1:B3": top10,
+             **{page + "!A1:EZ20050": scoped_grid(page) for page in scoped_symbols()},
+             **{page + "!A:A": symbol_column(scoped_grid(page)) for page in scoped_symbols()}}
+    source = grids["Market_Leaders!A1:EZ20050"]
+    if fault == "source_substitution":
+        source[1][0] = "UNAPPROVED.SR"
+    elif fault == "source_loss":
+        source.pop()
+    elif fault == "source_duplicate":
+        source[-1][0] = source[1][0]
+    elif fault == "source_extra":
+        source.append(["UNAPPROVED.SR", "Synthetic", 50, source_stamp, "", "", "eodhd"])
+    elif fault == "complete_column_tail":
+        column = grids["Market_Leaders!A:A"]
+        column.extend([[] for _ in range(20050 - len(column))])
+        column.append(["UNAPPROVED.SR"])
+    elif fault == "complete_column_reorder":
+        column = grids["Market_Leaders!A:A"]
+        column[1], column[2] = column[2], column[1]
     reads = []
 
     def reader(sheet_id, a1):

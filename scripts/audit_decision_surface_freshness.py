@@ -8,6 +8,15 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.3.1 — independent full-column Symbol reads prove there is no unseen
+tail beyond the wide audit bound and agree by physical row with that read.
+
+VERSION 1.3.0 — approved Market_Leaders and Mutual_Funds membership is checked
+against physical Symbol cells, independently of _Status counts. The current
+255 Saudi-only / 2474 retained-fund approval supersedes historical row floors
+only for those two pages; a missing or invalid approval fails closed. Explicit
+in-memory min_rows fixtures can still exercise the generic audit policy.
+
 VERSION 1.2.3 — final publication requires current source publication runs and
 explicit consumed-source receipts on both decision surfaces. The receipt schema
 is ``source readiness VERIFIED (run <id>)``. Portfolio_Decision must emit this
@@ -57,7 +66,7 @@ import sys
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 
 for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
     if str(_path) not in sys.path:
@@ -66,7 +75,12 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 from scripts.audit_full_refresh_coverage import parse_dt, parse_dt_precision, resolve_reader, s  # noqa: E402
 from core.data_validity import coverage_validity  # noqa: E402
 
-VERSION = "1.2.3"
+if TYPE_CHECKING:
+    from scripts.approved_universe_scope import ScopePolicy
+
+VERSION = "1.3.1"
+SOURCE_SCOPE_BOUND = 20050
+SOURCE_SCOPE_RANGE = f"A1:EZ{SOURCE_SCOPE_BOUND}"
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -115,6 +129,7 @@ class DecisionSurfaceReport:
     top10_run_riyadh: Optional[str] = None
     my_portfolio_updated_riyadh: Optional[str] = None
     source_status: dict[str, dict[str, Any]] = field(default_factory=dict)
+    approved_scope: dict[str, Any] = field(default_factory=dict)
     top10_pool_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
     fatal: str = ""
@@ -139,6 +154,7 @@ class DecisionSurfaceReport:
             "top10_run_riyadh": self.top10_run_riyadh,
             "my_portfolio_updated_riyadh": self.my_portfolio_updated_riyadh,
             "source_status": self.source_status,
+            "approved_scope": self.approved_scope,
             "top10_pool_counts": self.top10_pool_counts,
             "summary": {
                 "failures": sum(item.severity == "FAIL" for item in self.findings),
@@ -317,6 +333,91 @@ def _acquisition_findings(item: StatusRow, surface: str, prefix: str,
     return findings
 
 
+def _physical_source(grid: Sequence[Sequence[Any]]) -> tuple[list[Any], int, int]:
+    """Read the literal Symbol column; neither ticker aliases nor row counts
+    establish the approved physical membership.
+    """
+    candidates = []
+    for row_number, row in enumerate(grid[:45]):
+        if not isinstance(row, (list, tuple)):
+            continue
+        columns = [i for i, value in enumerate(row) if s(value).casefold() == "symbol"]
+        if columns:
+            if len(columns) != 1:
+                raise ValueError("physical source has repeated Symbol header columns")
+            candidates.append((row_number, columns[0]))
+    if len(candidates) != 1:
+        raise ValueError("physical source must have one unambiguous Symbol header")
+    header_row, symbol_column = candidates[0]
+    symbols = []
+    for row in grid[header_row + 1:]:
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("physical source contains a malformed row")
+        if any(s(value) for value in row):
+            symbols.append(row[symbol_column] if symbol_column < len(row) else None)
+    return symbols, header_row, symbol_column
+
+
+def _column_cell(grid: Sequence[Sequence[Any]], row_number: int) -> str:
+    row = grid[row_number] if row_number < len(grid) else ()
+    return s(row[0] if row else None).upper()
+
+
+def _scope_membership(page: str, wide_grid: Sequence[Sequence[Any]],
+                      column_grid: Sequence[Sequence[Any]], scope: "ScopePolicy",
+                      receipt: dict[str, Any]) -> Any:
+    """Bind complete-column evidence to the bounded wide snapshot before using
+    either read to certify membership. A set hash alone cannot detect a reorder.
+    """
+    from scripts.approved_universe_scope import validate_symbols
+    proof = {"range": f"{page}!A:A", "returned_rows": len(column_grid),
+             "bound": SOURCE_SCOPE_BOUND, "symbol_column": 1,
+             "valid": False, "crossbound": False}
+    receipt["complete_column_proof"] = proof
+    if len(column_grid) > SOURCE_SCOPE_BOUND or len(wide_grid) > SOURCE_SCOPE_BOUND:
+        raise ValueError(f"complete Symbol column extends beyond row {SOURCE_SCOPE_BOUND}")
+    if any(not isinstance(row, (list, tuple)) or len(row) > 1 for row in column_grid):
+        raise ValueError("complete Symbol column has malformed or multiple-column rows")
+    wide_symbols, wide_header, wide_column = _physical_source(wide_grid)
+    complete_symbols, complete_header, complete_column = _physical_source(column_grid)
+    proof["header_row"] = complete_header + 1
+    if wide_column != 0 or complete_column != 0 or wide_header != complete_header:
+        raise ValueError("complete Symbol column and wide source must share their column-A header row")
+    if any(_column_cell(wide_grid, row) != _column_cell(column_grid, row)
+           for row in range(max(len(wide_grid), len(column_grid)))):
+        raise ValueError("complete Symbol column and wide source changed between reads")
+    wide_validation = validate_symbols(page, wide_symbols, policy=scope)
+    complete_validation = validate_symbols(page, complete_symbols, policy=scope)
+    wide_receipt, complete_receipt = wide_validation.to_dict(), complete_validation.to_dict()
+    receipt.update(wide_receipt)
+    for key in ("actual_membership_sha256", "observed_symbol_set_sha256",
+                "actual_count", "actual_unique_count", "duplicate_count", "bad_symbol_count"):
+        if wide_receipt[key] != complete_receipt[key]:
+            raise ValueError("complete Symbol column and wide source membership evidence differs")
+    proof.update({"observed_symbol_set_sha256": complete_receipt["observed_symbol_set_sha256"],
+                  "actual_membership_sha256": complete_receipt["actual_membership_sha256"],
+                  "bounded_membership_sha256": wide_receipt["actual_membership_sha256"],
+                  "bounded_symbol_set_sha256": wide_receipt["observed_symbol_set_sha256"],
+                  "valid": wide_validation.valid and complete_validation.valid,
+                  "crossbound": True})
+    return complete_validation
+
+
+def _configured_floors(min_rows: Optional[Mapping[str, int]]) -> dict[str, int]:
+    return dict(min_rows or {
+        "Market_Leaders": _env_int("TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS", 1025),
+        "Global_Markets": _env_int("TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS", 6512),
+        "Commodities_FX": _env_int("TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX", 453),
+        "Mutual_Funds": _env_int("TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS", 4496),
+    })
+
+
+def _load_approved_scope() -> "ScopePolicy":
+    # Deliberately no environment or command-line policy bypass.
+    from scripts.approved_universe_scope import load_scope
+    return load_scope()
+
+
 def audit_surfaces(
     status_grid: Sequence[Sequence[Any]],
     portfolio_grid: Sequence[Sequence[Any]],
@@ -329,6 +430,9 @@ def audit_surfaces(
     min_rows: Optional[Mapping[str, int]] = None,
     min_fresh_percent: Optional[float | Mapping[str, float]] = None,
     expected_source_run: Optional[str] = None,
+    approved_scope: Optional["ScopePolicy"] = None,
+    source_grids: Optional[Mapping[str, Sequence[Sequence[Any]]]] = None,
+    source_columns: Optional[Mapping[str, Sequence[Sequence[Any]]]] = None,
 ) -> DecisionSurfaceReport:
     now_utc = now_utc or datetime.now(timezone.utc)
     now_riyadh = now_utc.astimezone(timezone(timedelta(hours=3))).replace(tzinfo=None)
@@ -344,15 +448,23 @@ def audit_surfaces(
         report.findings.append(Finding("FAIL", "EXPECTED_SOURCE_RUN_INVALID", "Final_Publication",
             "Expected source run must be one positive publication run ID; final readiness cannot use an unknown/local run."))
 
-    floors = dict(
-        min_rows
-        or {
-            "Market_Leaders": _env_int("TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS", 1025),
-            "Global_Markets": _env_int("TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS", 6512),
-            "Commodities_FX": _env_int("TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX", 453),
-            "Mutual_Funds": _env_int("TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS", 4496),
-        }
-    )
+    configured_floors = _configured_floors(min_rows)
+    floors = dict(configured_floors)
+    scope_counts: dict[str, int] = {}
+    if approved_scope is not None or min_rows is None:
+        try:
+            from scripts.approved_universe_scope import approved_floors
+            approved_scope = approved_scope or _load_approved_scope()
+            scope_counts = approved_floors(policy=approved_scope)
+            floors.update(scope_counts)
+            floors["Global_Markets"] = max(floors.get("Global_Markets", 0), 6512)
+            floors["Commodities_FX"] = max(floors.get("Commodities_FX", 0), 453)
+            market_max_age_h = min(30.0, market_max_age_h)
+            decision_max_age_h = min(8.0, decision_max_age_h)
+            report.approved_scope = approved_scope.receipt()
+        except Exception as exc:
+            report.fatal = f"approved universe scope unavailable: {type(exc).__name__}: {exc}"
+            return report
 
     portfolio_text = _cell(portfolio_grid, 1, 1)
     portfolio_run, portfolio_state = parse_surface_status(portfolio_text)
@@ -426,6 +538,46 @@ def audit_surfaces(
             report.findings.append(Finding("FAIL", "SOURCE_STATUS_MISSING", "Top_10_Investments", f"{page} is absent from _Status."))
             continue
         report.source_status[page] = asdict(item)
+        if page in scope_counts:
+            scope_receipt = {
+                "applied_min_rows": floor,
+                "superseded_configured_floor": {
+                    "environment": "TFB_EXPECTED_MIN_ROWS_" + page.upper(),
+                    "value": os.getenv("TFB_EXPECTED_MIN_ROWS_" + page.upper()),
+                    "legacy_effective_min_rows": _env_int(
+                        "TFB_EXPECTED_MIN_ROWS_" + page.upper(),
+                        1025 if page == "Market_Leaders" else 4496),
+                },
+            }
+            if min_rows is not None:
+                scope_receipt["supplied_min_rows"] = min_rows.get(page)
+            report.source_status[page]["approved_scope"] = scope_receipt
+            try:
+                if source_grids is None or page not in source_grids:
+                    raise ValueError("physical source grid was not supplied")
+                if source_columns is None or page not in source_columns:
+                    raise ValueError("independent complete Symbol column was not supplied")
+                validation = _scope_membership(page, source_grids[page], source_columns[page],
+                                                approved_scope, scope_receipt)
+                scope_receipt.update(validation.to_dict())
+                if not validation.valid:
+                    incomplete_sources.append(page)
+                    report.findings.append(Finding("FAIL", "SOURCE_APPROVED_MEMBERSHIP", "Top_10_Investments",
+                        f"{page} physical Symbol membership does not match the approved scope; missing, substituted, extra, duplicate or invalid symbols cannot certify a full universe."))
+            except Exception as exc:
+                incomplete_sources.append(page)
+                scope_receipt["valid"] = False
+                scope_receipt["error"] = f"{type(exc).__name__}: {exc}"
+                report.findings.append(Finding("FAIL", "SOURCE_APPROVED_MEMBERSHIP_UNPROVEN", "Top_10_Investments",
+                    f"{page} physical Symbol membership cannot be verified: {type(exc).__name__}: {exc}"))
+            if item.rows != floor:
+                incomplete_sources.append(page)
+                report.findings.append(Finding("FAIL", "SOURCE_APPROVED_ROW_COUNT", "Top_10_Investments",
+                    f"{page} _Status rows {item.rows if item.rows is not None else 'unknown'} do not equal the approved physical membership count {floor}."))
+            if item.acquired_requested != floor:
+                incomplete_sources.append(page)
+                report.findings.append(Finding("FAIL", "SOURCE_APPROVED_ACQUISITION_DENOMINATOR", "Top_10_Investments",
+                    f"{page} acquisition denominator {item.acquired_requested if item.acquired_requested is not None else 'unknown'} does not equal the approved count {floor}."))
         if strict_run:
             if publication_runs.get(page) != expected_run:
                 report.findings.append(Finding("FAIL", "SOURCE_PUBLICATION_COHORT", "Top_10_Investments",
@@ -434,6 +586,8 @@ def audit_surfaces(
                          if min_fresh_percent is None else
                          min_fresh_percent.get(page,95.0) if isinstance(min_fresh_percent,Mapping)
                          else min_fresh_percent)
+        if approved_scope is not None:
+            fresh_minimum = max(95.0, fresh_minimum)
         acquisition_findings = _acquisition_findings(item,"Top_10_Investments","SOURCE",floor,fresh_minimum)
         if acquisition_findings:
             incomplete_sources.append(page)
@@ -464,6 +618,9 @@ def audit_surfaces(
         if pool is None:
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "T10_POOL_COUNT_MISSING", "Top_10_Investments", f"Top-10 status does not disclose the {page} pool count."))
+        elif page in scope_counts and pool["total"] != floor:
+            incomplete_sources.append(page)
+            report.findings.append(Finding("FAIL", "T10_POOL_APPROVED_COUNT", "Top_10_Investments", f"Top-10 declares {pool['total']} {page} source rows; the approved scope contains exactly {floor}."))
         elif pool["total"] < floor:
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "T10_POOL_BELOW_FLOOR", "Top_10_Investments", f"Top-10 used {pool['total']} {page} rows, below approved minimum {floor}."))
@@ -491,7 +648,8 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
                    market_max_age_h: Optional[float] = None,
                    decision_max_age_h: Optional[float] = None,
                    min_fresh_percent: Optional[float | Mapping[str, float]] = None,
-                   expected_source_run: Optional[str] = None) -> DecisionSurfaceReport:
+                   expected_source_run: Optional[str] = None,
+                   approved_scope: Optional["ScopePolicy"] = None) -> DecisionSurfaceReport:
     if not spreadsheet_id:
         report = DecisionSurfaceReport(datetime.now(timezone.utc).isoformat(), "***")
         report.fatal = "spreadsheet ID missing"
@@ -502,12 +660,30 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
         report.fatal = "read_range unavailable"
         return report
     masked = spreadsheet_id[:5] + "..." + spreadsheet_id[-5:] if len(spreadsheet_id) > 10 else "***"
+    source_grids = {}
+    source_columns = {}
+    if approved_scope is not None or min_rows is None:
+        try:
+            approved_scope = approved_scope or _load_approved_scope()
+        except Exception as exc:
+            report = DecisionSurfaceReport(datetime.now(timezone.utc).isoformat(), masked)
+            report.fatal = f"approved universe scope unavailable: {type(exc).__name__}: {exc}"
+            return report
     try:
-        status_grid, portfolio_grid, top10_grid = await asyncio.gather(
+        reads = [
             _read_range(reader, spreadsheet_id, "_Status!A1:J100"),
             _read_range(reader, spreadsheet_id, "Portfolio_Decision!A1:B3"),
             _read_range(reader, spreadsheet_id, "Top_10_Investments!A1:B3"),
-        )
+        ]
+        scope_pages = tuple(approved_scope.pages) if approved_scope is not None else ()
+        reads.extend(_read_range(reader, spreadsheet_id, f"{page}!{SOURCE_SCOPE_RANGE}")
+                     for page in scope_pages)
+        reads.extend(_read_range(reader, spreadsheet_id, f"{page}!A:A")
+                     for page in scope_pages)
+        values = await asyncio.gather(*reads)
+        status_grid, portfolio_grid, top10_grid = values[:3]
+        source_grids = dict(zip(scope_pages, values[3:3 + len(scope_pages)]))
+        source_columns = dict(zip(scope_pages, values[3 + len(scope_pages):]))
     except Exception as exc:
         report = DecisionSurfaceReport(datetime.now(timezone.utc).isoformat(), masked)
         report.fatal = f"live read failed: {type(exc).__name__}: {exc}"
@@ -524,6 +700,9 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
         min_rows=min_rows,
         min_fresh_percent=min_fresh_percent,
         expected_source_run=expected_source_run,
+        approved_scope=approved_scope,
+        source_grids=source_grids,
+        source_columns=source_columns,
     )
 
 

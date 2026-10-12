@@ -1865,10 +1865,13 @@ jobs:
       TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
       TFB_DECISION_SOURCE_MAX_AGE_H: '30'
       TFB_DECISION_SURFACE_MAX_AGE_H: '8'
-      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      # (2026-10-12) Owner-approved current scope: Saudi-only 255 leaders /
+      # 2,474 funds. The explicit versioned scope supersedes July floor vars;
+      # preserve source clocks, acquisition, names, prices and custody gates.
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '255' }}
       TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
       TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
-      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '2474' }}
     steps:
       - name: Checkout this run's source
         uses: actions/checkout@v6
@@ -1942,12 +1945,9 @@ jobs:
             --publish-blockers \
             --json-out final_decision_publication.json || code=$?
           echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
-          if [[ "$code" -ge 2 ]]; then
+          if [[ "$code" -ne 0 ]]; then
             echo "::error::Final coverage or decision publication is not accepted (exit $code)."
             exit "$code"
-          fi
-          if [[ "$code" -eq 1 ]]; then
-            echo '::warning::Final publication audit completed with warnings.'
           fi
 
       - name: Publish final audit summary

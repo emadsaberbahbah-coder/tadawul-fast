@@ -6,6 +6,9 @@ on:
     branches: [main, 'fix/actions-health-20260917']
     paths:
       - '.github/workflows/workflow_repair_tests.yml'
+      - 'config/approved_universe_scope_v1.json'
+      - 'scripts/approved_universe_scope.py'
+      - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_*coverage.py'
       - 'scripts/audit_decision_surface_freshness.py'
       - 'scripts/workflow_*.py'
@@ -15,6 +18,9 @@ on:
   pull_request:
     paths:
       - '.github/workflows/workflow_repair_tests.yml'
+      - 'config/approved_universe_scope_v1.json'
+      - 'scripts/approved_universe_scope.py'
+      - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_*coverage.py'
       - 'scripts/audit_decision_surface_freshness.py'
       - 'scripts/workflow_*.py'
@@ -40,8 +46,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      - name: Install regression test dependency
-        run: python -m pip install pytest==9.1.1
+      - name: Install regression test dependencies
+        run: python -m pip install pytest==9.1.1 pyyaml==6.0.3
       - name: Run audit contracts without live credentials
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -53,7 +59,9 @@ jobs:
             tests/test_full_refresh_coverage.py \
             tests/test_decision_surface_freshness.py \
             tests/test_workflow_audit_repairs.py \
-            tests/test_repository_workflow_audit.py
+            tests/test_repository_workflow_audit.py \
+            tests/test_approved_universe_scope.py \
+            tests/test_approved_universe_workflow.py
           python scripts/audit_repository_workflows.py
 
   verify-live:
@@ -68,10 +76,15 @@ jobs:
       PYTHONUNBUFFERED: '1'
       TZ: Asia/Riyadh
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
-      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      # (2026-10-12) Owner-approved current roster scope: 255 Saudi-only
+      # leaders / 2,474 funds; July's mixed roster is not restored. The
+      # versioned scope is authoritative, including membership fingerprints,
+      # even if legacy repository floor variables still contain July values.
+      # GM 6,512 / CFX 453, freshness, names, prices and custody stay intact.
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '255' }}
       TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
       TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
-      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '2474' }}
       TFB_DECISION_SURFACE_MAX_AGE_H: '8'
       TFB_DECISION_SOURCE_MAX_AGE_H: '30'
       TFB_PTC_DROP_PCT: ${{ vars.TFB_PTC_DROP_PCT || '20' }}
@@ -118,8 +131,8 @@ jobs:
           if not sid:
               raise SystemExit('DEFAULT_SPREADSHEET_ID is missing')
           commands = [
-              ('full_refresh', 'scripts/audit_full_refresh_coverage.py', ['--max-rows', '20000'], {0, 1}),
-              ('decision_surface', 'scripts/audit_decision_surface_freshness.py', [], {0, 1}),
+              ('full_refresh', 'scripts/audit_full_refresh_coverage.py', ['--max-rows', '20000'], {0}),
+              ('decision_surface', 'scripts/audit_decision_surface_freshness.py', [], {0}),
               ('provider_target', 'scripts/audit_provider_target_coverage.py', [
                   '--state', 'provider_target_last_good.json',
                   '--observation-out', str(out / 'provider_target_observation.json')], {0}),
@@ -143,7 +156,7 @@ jobs:
           (out / 'verification.json').write_text(json.dumps(payload, indent=2) + '\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('# Post-merge live control verification\n\n')
-              stream.write('Workbook read-only; provider baseline frozen. No thresholds changed.\n\n')
+              stream.write('Workbook read-only; provider baseline frozen. Owner-approved 12 October roster scope; data-quality controls unchanged.\n\n')
               stream.write('| Audit | Exit | Result |\n|---|---:|---|\n')
               for r in results:
                   stream.write(f"| {r['audit']} | {r['exit_code']} | {'PASS' if r['passed'] else 'FAIL — see evidence'} |\n")
