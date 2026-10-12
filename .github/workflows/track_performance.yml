@@ -43,7 +43,9 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # track_performance v6.44.0 measures the repeats under
 # TRACK_DEDUP_SIGNAL_HISTORY=observe; the run step below now maps it together
 # with TRACK_DEDUP_MATURED and TRACK_RISK_BLANK (v6.41.0, unmapped until
-# today). Unset = unchanged behaviour. Rollback: delete the three env lines.
+# today). (2026-10-12) Operator-authorized initial rollout observes signal
+# repeats when its Variable is unset/empty; the script default stays off.
+# Rollback: set TRACK_DEDUP_SIGNAL_HISTORY to off; unsetting restores observe.
 # =============================================================================
 
 on:
@@ -290,17 +292,20 @@ jobs:
           # 284 [PERF-VERDICT] _Run_Log lines carries 'dedup_matured'. v6.44.0 adds
           # TRACK_DEDUP_SIGNAL_HISTORY (Signal_History same-day repeats: 21,670 of
           # 29,471 rows on 10-10, max 19 per Symbol|Date key; in v6.44.0 'enforce' is
-          # parsed but MEASURE-ONLY and says so in its token). Unset -> 'off' / '0' /
-          # 'off' = the script defaults = byte-identical. Operator contract: observe
+          # parsed but MEASURE-ONLY and says so in its token). Matured/risk
+          # defaults remain off/0. Operator contract: observe
           # for >= 1 run and read the [DEDUP-MATURED] / [DEDUP-SIGNAL] job-log lines
           # and the [PERF-VERDICT] tokens in _Run_Log, then arm per read-back. MUST
           # stay identical to the daily_sync.yml tracker step (ENV PARITY rule
           # below; tests/test_track_flags_mapped.py pins it): TRACK_RISK_BLANK in one
           # lane only would be rewritten to 0.0 by the other lane's next save.
-          # ROLLBACK: delete the three lines (or unset the Variables).
+          # (2026-10-12) Operator-authorized signal-repeat observation: absent
+          # Variables select observe; explicit off/invalid still reach the parser.
+          # ROLLBACK: set TRACK_DEDUP_SIGNAL_HISTORY to off; unsetting
+          # reactivates observe. No historical deduplication is performed.
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
-          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
+          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}
           # (2026-10-11) v6.45.0 prospective schema / publication identities.
           # Defaults off: arm one measured lane-consistent feature at a time.
           # Immutable snapshots retain first and subsequent daily publications;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tests/test_track_flags_mapped.py - the tracker's env-gated flags are MAPPED
-in BOTH tracker steps, with identical values (ENV PARITY), and the workflow
-fallbacks equal the script defaults.
+in BOTH tracker steps, with identical values (ENV PARITY). The authorized
+signal-observation workflow fallback is distinct from the source default.
 
 WHY (2026-10-11, WP-7 / findings 'track-flags-unmapped')
 --------------------------------------------------------
@@ -32,10 +32,10 @@ CLOCK = ROOT / ".github/workflows/track_performance.yml"
 DAILY = ROOT / ".github/workflows/daily_sync.yml"
 TRACKER = ROOT / "scripts/track_performance.py"
 
-# (env name, workflow fallback) - the fallback MUST equal the script default
+# (env name, workflow fallback) - only signal observation is activated here.
 FLAGS = [("TRACK_DEDUP_MATURED", "off"),
          ("TRACK_RISK_BLANK", "0"),
-         ("TRACK_DEDUP_SIGNAL_HISTORY", "off")]
+         ("TRACK_DEDUP_SIGNAL_HISTORY", "observe")]
 
 # the reader function and the literal it falls back to in the script
 READERS = {"TRACK_DEDUP_MATURED": ("_dedup_matured_mode", "off"),
@@ -97,11 +97,11 @@ def test_tracker_env_parity_for_dedup_flags():
     assert clock == ["%s: %s" % (n, _expected(n, d)) for n, d in FLAGS], clock
 
 
-def test_workflow_defaults_match_script_defaults():
+def test_script_defaults_stay_off_under_authorized_workflow_observation():
     src = TRACKER.read_text(encoding="utf-8")
-    for name, default in FLAGS:
-        fn, literal = READERS[name]
-        assert literal == default, (name, literal, default)
+    assert dict(FLAGS) == {name: ('observe' if name == 'TRACK_DEDUP_SIGNAL_HISTORY' else default)
+                           for name, (_fn, default) in READERS.items()}
+    for name, (fn, default) in READERS.items():
         m = re.search(r"^def %s\(\)[^\n]*:\n(.*?)(?=^def |\Z)" % re.escape(fn), src, re.M | re.S)
         assert m, "reader %s missing from scripts/track_performance.py" % fn
         body = m.group(1)
@@ -114,7 +114,9 @@ def test_mapping_comments_carry_date_and_rollback():
     for path in (CLOCK, DAILY):
         step = _tracker_step(path)
         assert "(2026-10-11)" in step, path.name
-        assert re.search(r"ROLLBACK: delete the three lines", step), path.name
+        assert "(2026-10-12)" in step, path.name
+        assert "ROLLBACK: set TRACK_DEDUP_SIGNAL_HISTORY to off" in step, path.name
+        assert "reactivates observe" in step, path.name
 
 
 if __name__ == "__main__":
