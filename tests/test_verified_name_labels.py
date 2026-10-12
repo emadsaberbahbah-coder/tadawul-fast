@@ -52,8 +52,8 @@ def registry_file(tmp_path, transform):
     return path
 
 
-def test_all_54_reviewed_bindings_change_only_name_without_promoting_any_guard():
-    assert len(BINDINGS) == 54
+def test_all_55_reviewed_bindings_change_only_name_without_promoting_any_guard():
+    assert len(BINDINGS) == 55
     assert sum(x["page"] == "Mutual_Funds" for x in BINDINGS) == 39
     for item in BINDINGS:
         headers = get_sheet_headers(item["page"])
@@ -286,9 +286,10 @@ def test_final_primary_and_repeat_recovery_writer_retains_caption_and_truthful_r
 
 def test_committed_registry_is_only_public_authority_identity_data():
     raw = labels.REGISTRY_PATH.read_text()
-    assert all(word not in raw for word in ("/workspace/", "account", "holdings", "broker", "api_token", "eodhd.com"))
+    assert all(word not in raw for word in ("/workspace/", "account", "holdings", "broker", "api_token"))
     loaded, _ = labels._load_registry(labels.REGISTRY_PATH)
-    assert len(loaded) == 54
+    assert len(loaded) == 55
+    assert all("eodhd.com" not in source["url"] for item in BINDINGS for source in item["sources"])
     nvei = binding("NVEI.TO")
     assert nvei["native_metadata"] == {"Asset Class": "Equity", "Exchange": "TSX", "Currency": "CAD", "Country": "Canada"}
     assert "Subordinate voting" in nvei["identifiers"]["security_class"]
@@ -297,3 +298,14 @@ def test_committed_registry_is_only_public_authority_identity_data():
     assert binding("SVA.US")["identifiers"]["security_class"] == "caption only; security class not certified"
     assert binding("RYOJ.US")["identifiers"]["security_class"].startswith("Common Shares")
     assert nvei["reviewed_at_utc"] == "2026-10-12T12:24:43.455134+00:00"
+    stm = binding("STM.PA")
+    assert stm["name"] == "STMicroelectronics N.V."
+    assert stm["reviewed_at_utc"] == "2026-10-12T13:21:08.737969+00:00"
+    assert stm["review_receipt_sha256"] == "f6ca297854c26856996b8d08657f0f55817827dc166278510846487b0e217b0f"
+    assert stm["identifiers"]["namespace_bridge_receipt_source"] == "https://eodhd.com/api/exchange-symbol-list/PA"
+    public_without_approved_bridge = copy.deepcopy(DATA)
+    approved = next(item for item in public_without_approved_bridge["bindings"] if item["symbol"] == "STM.PA")
+    approved["identifiers"].pop("namespace_bridge_receipt_source")
+    assert "eodhd.com" not in json.dumps(public_without_approved_bridge)
+    assert "not been independently rehashed" in stm["identifiers"]["namespace_bridge_limitation"]
+    assert len(stm["sources"]) == 5

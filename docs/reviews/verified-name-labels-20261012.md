@@ -3,7 +3,7 @@ sync then clears a reviewed issuer caption from the workbook. The final RAW
 writer now fills that blank from `data/verified_name_labels.json` after restoration
 and identity guards and before whole-page ranking and copy-only presentation.
 
-The reviewed registry contains 39 fund captions and 15 global-market captions.
+The reviewed registry contains 39 fund captions and 16 global-market captions.
 Each entry exposes its exact raw Symbol, page, unchanged native metadata fence,
 legal-name caption, security-class identifiers, bounded listing-state statement,
 public authority URLs, raw response SHA256 digests, capture times and review
