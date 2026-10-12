@@ -2,7 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.11 (2026-10-12) -- VERIFIED NAME CAPTIONS
+# VERSION 1.1.12 (2026-10-12) -- FULL TYPED MARKET PAYLOAD EVIDENCE
+#
+# v1.1.12: require complete typed final RAW intent digest regressions in lean.
 #
 # v1.1.11: require the bounded public-authority Name-only publication guards
 # and final primary/recovery writer regressions in the blocking lean lane.
@@ -495,6 +497,7 @@ jobs:
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
             tests/test_verified_name_labels.py \
+            tests/test_sheet_payload_digest.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
             tests/test_verify_optional_rollout_flags.py \
