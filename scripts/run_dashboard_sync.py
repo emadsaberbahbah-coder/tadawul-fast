@@ -3,9 +3,17 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.68.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.69.0 - full typed final market-payload intent digest (2026-10-12)
+================================================================================
+Successful market RAW updates expose a complete structural SHA256 after Name,
+ranking, warning and presentation seams. Exact binary64 values, typed strings,
+booleans and blank-state semantics preserve financial cells without rounding.
+Uncertifiable cells yield explicit UNVERIFIABLE evidence without aborting the
+write. Legacy SHA8 remains; live_readback stays false until independent proof.
 
 v6.68.0 - reviewed non-actionable issuer captions (2026-10-12)
 ================================================================================
@@ -2094,7 +2102,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.68.0"
+SCRIPT_VERSION = "6.69.0"
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -4136,6 +4144,11 @@ class SheetsWriter:
             matrix, _wc_final = _wc_final_writer_seam(
                 sheet_name, hdr, matrix, _wc_archive, _wc_original)
 
+        # Final intended hdr+matrix, after every publication transform. This
+        # leaf makes no mutations or reads; unsupported evidence stays explicit.
+        from core.sheet_payload_digest import market_payload_evidence
+        _payload_evidence = market_payload_evidence(sheet_name, hdr, matrix)
+
         values: List[List[Any]] = []
         if hdr:
             values.append(hdr)
@@ -4172,10 +4185,13 @@ class SheetsWriter:
         # Separate the historical input digest from the actual submitted RAW
         # values after final fill guard, ranking and warning publication. This
         # attests a successful update request, not an independent live readback.
-        if _rp_stats or _wc_final or _nl_stats:
+        if _rp_stats or _wc_final or _nl_stats or _payload_evidence:
             receipt = {"written_payload_sha8": _payload_sha8(hdr, matrix),
                        "evidence": "successful_RAW_update", "live_readback": False,
-                       "rows": len(matrix)}
+                       "rows": len(matrix), "written_range": rng,
+                       "start_a1": start_a1}
+            if _payload_evidence:
+                receipt.update(_payload_evidence)
             if _rp_stats:
                 _rp_stats["written_payload_sha8"] = receipt["written_payload_sha8"]
                 receipt["rank_page"] = dict(_rp_stats)
