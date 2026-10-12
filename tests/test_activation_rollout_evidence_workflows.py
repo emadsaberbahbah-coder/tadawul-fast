@@ -42,6 +42,31 @@ def test_dispatch_controls_allow_rank_enforce_but_no_warning_enforce(file):
     assert not any("creds" in name or "token" in name for name in inputs)
 
 
+@pytest.mark.parametrize("event,choice,group,mode,expected", [
+    ("workflow_dispatch", "false", "global-markets", "full_sync", False),
+    ("workflow_dispatch", "true", "global-markets", "full_sync", True),
+    ("workflow_dispatch", "", "global-markets", "full_sync", True),
+    ("schedule", "false", "global-markets", "full_sync", True),
+    ("workflow_dispatch", "true", "core", "full_sync", False),
+    ("workflow_dispatch", "true", "global-markets", "single_key", False),
+])
+def test_activation_can_refresh_all_sources_without_bundled_historical_save(event, choice, group, mode, expected):
+    daily = workflow("daily_sync.yml")
+    control = daily["on"]["workflow_dispatch"]["inputs"]["run_tracker"]
+    assert control["type"] == "boolean" and str(control["default"]).lower() == "true"
+    expression = step(LANES[0], "📈 Track Performance (record + audit)")["if"]
+    expression = expression.removeprefix("${{").removesuffix("}}")
+    for token, value in {
+        "success()": True, "matrix.group": group, "steps.scope_keys.outputs.has_keys": "true",
+        "env.RUN_MODE": mode, "github.event_name": event, "github.event.inputs.run_tracker": choice,
+    }.items():
+        expression = expression.replace(token, repr(value))
+    assert eval(expression.replace("&&", "and").replace("||", "or"), {"__builtins__": {}}, {}) is expected
+    # Source recovery and final acceptance must still run in this full-sync mode.
+    for job in ("recover-missing-market-pages", "verify-final-decision-publication"):
+        assert "run_tracker" not in daily["jobs"][job]["if"]
+
+
 @pytest.mark.parametrize("lane", LANES)
 @pytest.mark.parametrize("rank,warnings,expected", [
     ("inherit", "inherit", {"rank": "off", "warnings": "off"}),

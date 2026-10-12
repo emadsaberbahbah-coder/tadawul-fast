@@ -162,7 +162,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
 
 # scripts are checked by SCRIPT_VERSION via a light import
 SCRIPTS: List[Tuple[str, str, str]] = [
-    ("workflow_activation_receipt", "1.0.0", "non-secret DQ/tracker execution receipts"),
+    ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.1", "read-only full row coverage audit"),

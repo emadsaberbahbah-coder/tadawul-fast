@@ -16,7 +16,7 @@ import re
 import subprocess
 from typing import Mapping
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 REPOSITORY = Path(__file__).resolve().parents[1]
 _VERSION = re.compile(r"\d+\.\d+\.\d+\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -45,12 +45,17 @@ def _identity(env: Mapping[str, str], root: Path) -> dict:
         raise ValueError("Source checkout does not have a valid commit identity")
     event_sha = str(env.get("GITHUB_SHA", ""))
     event_sha = event_sha if _SHA.fullmatch(event_sha) else None
+    # actions/checkout's actual commit output identifies the executed source.
+    # GITHUB_SHA describes the triggering event and can differ for ref: main.
+    checkout_sha = str(env.get("TFB_CHECKOUT_SHA", ""))
+    checkout_sha = checkout_sha if _SHA.fullmatch(checkout_sha) else None
     run_id, attempt = str(env.get("GITHUB_RUN_ID", "")), str(env.get("GITHUB_RUN_ATTEMPT", ""))
     return {"schema": "tfb.workflow-activation/v1", "receipt_version": SCRIPT_VERSION,
             "workflow_run_id": int(run_id) if run_id.isdecimal() else None,
             "run_attempt": int(attempt) if attempt.isdecimal() else None,
             "source_sha": source_sha, "event_sha": event_sha,
             "source_matches_event": source_sha == event_sha,
+            "checkout_sha": checkout_sha, "source_matches_checkout": source_sha == checkout_sha,
             "sheet_readback_verified": None, "historical_prefix_verified": None}
 
 
@@ -74,7 +79,7 @@ def dq_receipt(exit_code: int, *, root: Path = REPOSITORY,
     digest_matches = False
     if export_path.is_file():
         digest_matches = hashlib.sha256(export_path.read_bytes()).hexdigest() == report.get("export_sha256")
-    verified = (receipt["source_matches_event"] and selected in {"observe", "enforce"} and report_mode == selected
+    verified = (receipt["source_matches_checkout"] and selected in {"observe", "enforce"} and report_mode == selected
                 and report_version == expected_version and expected_version is not None and digest_matches)
     receipt.update(workflow="workbook_backup", audit_exit_code=exit_code,
                    source_versions={"backup_workbook": _version(root / "scripts/backup_workbook.py"),
@@ -111,7 +116,7 @@ def tracker_receipt(exit_code: int, log_path: Path, help_path: Path, audit_enabl
     publication = _accepted(values.get("TRACK_SIGNAL_PUBLICATION_MODE"), ("immutable",))
     canonical = str(values.get("TRACK_CANONICAL_TARGETS", "0")).strip().lower() in {"1", "true", "yes", "on"}
     unit = _accepted(values.get("TFB_PERF_TARGET_UNIT_SENTRY"), ("observe", "enforce"))
-    verified = (receipt["source_matches_event"] and exit_code == 0
+    verified = (receipt["source_matches_checkout"] and exit_code == 0
                 and cli_version == source_version and source_version is not None
                 and (mode == "off" or measurement_matches) and not append_failures)
     receipt.update(workflow="track_performance", tracker_exit_code=exit_code,

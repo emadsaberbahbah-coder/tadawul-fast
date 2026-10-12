@@ -76,6 +76,24 @@ def test_one_dq_mode_controls_export_execution_report_and_soft_failure():
         assert parameter['options'] == ['inherit', 'off', 'observe']
 
 
+@pytest.mark.parametrize('name,label', (
+    ('workbook_backup.yml', 'Workbook DQ audit (WP-0)'),
+    ('track_performance.yml', 'Run performance clock'),
+))
+def test_receipt_identity_comes_from_actual_checkout_output(name, label):
+    checkouts = [item for job in workflow(name)['jobs'].values() for item in job['steps']
+                 if item.get('uses') == 'actions/checkout@v6']
+    assert len(checkouts) == 1
+    checkout = checkouts[0]
+    assert checkout['id'] == 'source_checkout'
+    assert step(name, label)['env']['TFB_CHECKOUT_SHA'] == '${{ steps.source_checkout.outputs.commit }}'
+    # Preserve each workflow's source selection, including manual dispatch refs.
+    if name == 'workbook_backup.yml':
+        assert checkout['with']['ref'] == 'main'
+    else:
+        assert 'ref' not in checkout['with']
+
+
 @pytest.fixture
 def wrapper_repo(tmp_path):
     scripts = tmp_path / 'scripts'
@@ -118,7 +136,8 @@ sys.exit(int(os.getenv('OFFLINE_AUDIT_EXIT','0')))
     runner = tmp_path / 'runner'
     runner.mkdir()
     (runner / 'tfb_export.xlsx').write_bytes(b'offline current export')
-    return tmp_path, dict(os.environ, GITHUB_SHA=source, GITHUB_RUN_ID='12345', GITHUB_RUN_ATTEMPT='1',
+    return tmp_path, dict(os.environ, GITHUB_SHA=source, TFB_CHECKOUT_SHA=source,
+        GITHUB_RUN_ID='12345', GITHUB_RUN_ATTEMPT='1',
         RUNNER_TEMP=str(runner), GITHUB_STEP_SUMMARY=str(tmp_path / 'summary'),
         TARGET_SHEET_ID='offline-sheet', GOOGLE_SHEETS_CREDENTIALS='NEVER_EXPORT_SECRET',
         BACKEND_TOKEN='NEVER_EXPORT_TOKEN', TRACK_CANONICAL_TARGETS='0',
@@ -136,6 +155,8 @@ def test_actual_dq_audit_wrapper_exports_verified_metadata_without_private_repor
     assert value['reported_mode'] == value['selected_mode'] == 'observe'
     assert value['reported_version'] == '1.0.1'
     assert value['source_matches_event'] is True
+    assert value['source_matches_checkout'] is True
+    assert value['source_sha'] == value['checkout_sha'] == env['TFB_CHECKOUT_SHA']
     assert value['workflow_run_id'] == 12345 and value['execution_evidence_complete'] is True
     assert value['sheet_readback_verified'] is value['data_quality_accepted'] is None
     rendered = json.dumps(value)
@@ -158,12 +179,70 @@ def test_dq_receipt_rejects_source_mode_version_or_input_digest_mismatch(wrapper
     report = {'version':'1.0.1','mode':'observe',
               'export_sha256':hashlib.sha256(export.read_bytes()).hexdigest()}
     env['TFB_DQ_AUDIT_MODE'] = 'observe'
-    if change == 'source': env['GITHUB_SHA'] = '0' * 40
+    if change == 'source': env['TFB_CHECKOUT_SHA'] = '0' * 40
     elif change == 'version': report['version'] = '1.0.0'
     elif change == 'mode': report['mode'] = 'off'
     else: report['export_sha256'] = '0' * 64
     (root / 'dq_report.json').write_text(json.dumps(report))
     assert receipt.dq_receipt(0, root=root, env=env)['execution_evidence_complete'] is False
+
+
+@pytest.mark.parametrize('kind', ('dq', 'tracker'))
+def test_actual_wrappers_accept_checkout_commit_different_from_event(wrapper_repo, kind):
+    root, env = wrapper_repo
+    env |= {'GITHUB_SHA':'0' * 40, 'TFB_DQ_AUDIT_MODE':'observe',
+            'INPUT_SIGNAL_HISTORY_MODE':'observe', 'INPUT_RUN_AUDIT':'false'}
+    name, label = ('workbook_backup.yml', 'Workbook DQ audit (WP-0)') if kind == 'dq' else (
+        'track_performance.yml', 'Run performance clock')
+    block = step(name, label)['run'].replace('${{ github.event.inputs.enable_debug }}', 'false')
+    run = subprocess.run(['bash', '-c', block], cwd=root, env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    path = 'dq_activation_receipt.json' if kind == 'dq' else 'tracker_activation_receipt.json'
+    value = json.loads((root / path).read_text())
+    assert value['source_sha'] == value['checkout_sha'] == env['TFB_CHECKOUT_SHA']
+    assert value['event_sha'] == env['GITHUB_SHA']
+    assert value['source_matches_event'] is False
+    assert value['source_matches_checkout'] is value['execution_evidence_complete'] is True
+
+
+def current_lane_receipt(kind, root, env):
+    """Create valid execution artifacts so identity is the only failing guard."""
+    if kind == 'dq':
+        export = Path(env['RUNNER_TEMP']) / 'tfb_export.xlsx'
+        (root / 'dq_report.json').write_text(json.dumps({'version':'1.0.1','mode':'observe',
+            'export_sha256':hashlib.sha256(export.read_bytes()).hexdigest()}))
+        return receipt.dq_receipt(0, root=root, env=env | {'TFB_DQ_AUDIT_MODE':'observe'})
+    help_path, log = root / 'help.txt', root / 'log.txt'
+    help_path.write_text('Performance Tracker v6.45.0')
+    log.write_text('record_signal_snapshots: wrote 2 new daily snapshot(s)')
+    return receipt.tracker_receipt(0, log, help_path, False, root=root,
+                                   env=env | {'TRACK_DEDUP_SIGNAL_HISTORY':'off'})
+
+
+@pytest.mark.parametrize('kind', ('dq', 'tracker'))
+@pytest.mark.parametrize('witness', ('missing', '', 'not-a-commit', 'whitespace', '0' * 40))
+def test_receipts_reject_missing_malformed_or_wrong_checkout_even_when_event_matches(wrapper_repo, kind, witness):
+    root, env = wrapper_repo
+    if witness == 'missing':
+        env.pop('TFB_CHECKOUT_SHA')
+    else:
+        env['TFB_CHECKOUT_SHA'] = ' ' + env['GITHUB_SHA'] if witness == 'whitespace' else witness
+    value = current_lane_receipt(kind, root, env)
+    assert value['source_matches_event'] is True
+    assert value['source_matches_checkout'] is value['execution_evidence_complete'] is False
+    assert value['checkout_sha'] == ('0' * 40 if witness == '0' * 40 else None)
+
+
+@pytest.mark.parametrize('kind', ('dq', 'tracker'))
+def test_receipts_reject_head_drift_after_checkout_even_when_event_matches(wrapper_repo, kind):
+    root, env = wrapper_repo
+    subprocess.run(['git', '-c', 'user.name=Offline Fixture', '-c', 'user.email=offline@example.invalid',
+                    'commit', '--allow-empty', '-qm', 'post-checkout drift'], cwd=root, check=True)
+    env['GITHUB_SHA'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+    value = current_lane_receipt(kind, root, env)
+    assert value['source_matches_event'] is True
+    assert value['source_sha'] != value['checkout_sha'] == env['TFB_CHECKOUT_SHA']
+    assert value['source_matches_checkout'] is value['execution_evidence_complete'] is False
 
 
 @pytest.mark.parametrize('explicit,repository,effective', (
@@ -186,6 +265,7 @@ def test_actual_tracker_wrapper_observe_is_measurement_and_noaudit_blocks_histor
         assert actual['audit_env'] == actual['calibration_publish'] == actual['trends'] == '0'
         assert actual['summary_side'] == '1'
     value = json.loads((root / 'tracker_activation_receipt.json').read_text())
+    assert value['source_matches_checkout'] is value['execution_evidence_complete'] is True
     assert value['cli_version'] == value['source_versions']['track_performance'] == '6.45.0'
     assert value['signal_history_mode'] == effective
     assert value['same_day_deduplication_applied'] is False

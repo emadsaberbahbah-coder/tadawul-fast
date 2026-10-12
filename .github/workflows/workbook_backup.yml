@@ -112,6 +112,7 @@ jobs:
     steps:
       # v1.1.0: pinned to main; the job token is not persisted into .git.
       - uses: actions/checkout@v6
+        id: source_checkout
         with:
           ref: main
           fetch-depth: 1
@@ -190,6 +191,7 @@ jobs:
         continue-on-error: ${{ steps.dq_mode.outputs.mode != 'enforce' }}
         env:
           TFB_DQ_AUDIT_MODE: ${{ steps.dq_mode.outputs.mode }}
+          TFB_CHECKOUT_SHA: ${{ steps.source_checkout.outputs.commit }}
         run: |
           set -euo pipefail
           test -s "$RUNNER_TEMP/tfb_export.xlsx"
