@@ -3,9 +3,18 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.67.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.68.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.68.0 - reviewed non-actionable issuer captions (2026-10-12)
+================================================================================
+At the final primary/recovery RAW writer, fill only blank Names from the
+bounded current-authority registry. Exact page/Symbol/metadata, unpriced rows,
+existing non-actionable guards and seven-day review expiry are required.
+Prices, warnings, scores, ranks, symbols, holdings and eligibility are untouched.
+Producer receipts record actual applied/held/skipped counts and registry SHA256;
+they attest a submitted Name caption, never a live readback or trading identity.
 
 v6.67.0 - integrated review corrections (2026-10-11)
 ================================================================================
@@ -2085,7 +2094,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.67.0"
+SCRIPT_VERSION = "6.68.0"
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -4112,6 +4121,12 @@ class SheetsWriter:
         # keeps its last-good content, and the task fails loud (DS-02).
         _fg_stats = None
         matrix, _fg_stats = _ohlc_fill_guard_apply(hdr, matrix)
+        # Reviewed public-authority captions are independent of price/eligibility.
+        # Apply only at this final primary/recovery write boundary, after all
+        # restoration/identity guards and before ranking/presentation. No old
+        # workbook Name is used, and every non-Name cell remains unchanged.
+        from core.verified_name_labels import apply_verified_name_labels
+        matrix, _nl_stats = apply_verified_name_labels(sheet_name, hdr, matrix)
         matrix, _rp_stats = _rank_overall_page_apply(sheet_name, hdr, matrix)  # v6.66.0 [RANK-PAGE]: whole page, after restoration, before copy-only presentation
         matrix = _present_market_sheet_rows(sheet_name, hdr, matrix)
         # Every removal, including a direct write or newly re-emitted token,
@@ -4157,7 +4172,7 @@ class SheetsWriter:
         # Separate the historical input digest from the actual submitted RAW
         # values after final fill guard, ranking and warning publication. This
         # attests a successful update request, not an independent live readback.
-        if _rp_stats or _wc_final:
+        if _rp_stats or _wc_final or _nl_stats:
             receipt = {"written_payload_sha8": _payload_sha8(hdr, matrix),
                        "evidence": "successful_RAW_update", "live_readback": False,
                        "rows": len(matrix)}
@@ -4170,7 +4185,14 @@ class SheetsWriter:
                     _WC_RUN_STATS[sheet_name].update({
                         "final_status": _wc_final["status"],
                         "written_payload_sha8": receipt["written_payload_sha8"]})
+            if _nl_stats:
+                receipt["name_labels"] = dict(_nl_stats)
             self._write_receipts[(spreadsheet_id, sheet_name)] = receipt
+
+        if _nl_stats:
+            logger.info("[NAME-LABELS] %s | map_sha256=%s registry=%s applied=%s held=%s skipped=%s",
+                        sheet_name, _nl_stats["map_sha256"], _nl_stats["registry_status"],
+                        _nl_stats["applied"], _nl_stats["held"], _nl_stats["skipped"])
 
         # v6.44.0 (W1A-6f) FG-2: one FILLGUARD line per page per write.
         try:

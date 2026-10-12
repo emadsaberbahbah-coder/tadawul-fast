@@ -2,7 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.10 (2026-10-12) -- PRODUCTION ACTIVATION EVIDENCE
+# VERSION 1.1.11 (2026-10-12) -- VERIFIED NAME CAPTIONS
+#
+# v1.1.11: require the bounded public-authority Name-only publication guards
+# and final primary/recovery writer regressions in the blocking lean lane.
 #
 # v1.1.10: exercise manual observe controls, historical tracker preservation
 # and per-invocation sync/recovery receipts in the required lean lane.
@@ -491,6 +494,7 @@ jobs:
             tests/test_de_margin_publish_p152.py \
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
+            tests/test_verified_name_labels.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
             tests/test_verify_optional_rollout_flags.py \
