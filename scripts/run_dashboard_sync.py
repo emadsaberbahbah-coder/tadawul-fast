@@ -4188,7 +4188,8 @@ class SheetsWriter:
         if _rp_stats or _wc_final or _nl_stats or _payload_evidence:
             receipt = {"written_payload_sha8": _payload_sha8(hdr, matrix),
                        "evidence": "successful_RAW_update", "live_readback": False,
-                       "rows": len(matrix)}
+                       "rows": len(matrix), "written_range": rng,
+                       "start_a1": start_a1}
             if _payload_evidence:
                 receipt.update(_payload_evidence)
             if _rp_stats:

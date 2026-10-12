@@ -120,6 +120,21 @@ def test_every_market_writer_records_full_intent_even_when_other_receipt_feature
     assert receipt["canonical_width"] == 115 and receipt["canonical_rows"] == 1
     assert receipt["written_payload_sha8"] == sync._payload_sha8(values[0], values[1:])
     assert receipt["evidence"] == "successful_RAW_update" and receipt["live_readback"] is False
+    assert receipt["written_range"] == api.requests[-1]["range"] == f"{page}!A1"
+    assert receipt["start_a1"] == "A1"
+
+
+def test_receipt_binds_the_actual_nondefault_runtime_physical_start(writer):
+    actual, api = writer
+    headers = get_sheet_headers("Commodities_FX")
+    row = [""] * len(headers)
+    row[headers.index("Symbol")] = "EXACT.US"
+    actual.write_table("test", "Commodities_FX", "$B$7", headers, [row])
+    receipt = actual._write_receipts[("test", "Commodities_FX")]
+    assert receipt["written_range"] == api.requests[-1]["range"] == "Commodities_FX!$B$7"
+    assert receipt["start_a1"] == "$B$7"
+    values = api.requests[-1]["body"]["values"]
+    assert receipt["written_payload_sha256"] == digest.typed_payload_sha256(values[0], values[1:])
 
 
 def test_receipt_captures_the_actual_post_name_rank_and_presentation_submission(writer, monkeypatch):
