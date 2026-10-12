@@ -8,6 +8,7 @@ No writes, provider requests, or freshness fallback is performed here.
 from __future__ import annotations
 
 import importlib
+import threading
 from typing import Any, Callable, Optional
 
 MODULES = (
@@ -15,15 +16,23 @@ MODULES = (
     "google_sheets_service", "core.google_sheets_service",
 )
 
+# The service factories return one cached googleapiclient service. Its
+# httplib2 transport (including SSL connections/auth refresh) is not safe for
+# concurrent requests. Audits may schedule complete-source reads concurrently,
+# but every reader instance must share this transport boundary. Initialization
+# and execute stay protected; retry backoff runs outside the lock.
+_AUDIT_TRANSPORT_LOCK = threading.RLock()
+
 
 def make_reader(service_factory: Callable[[], Any], retry: Optional[Callable] = None) -> Callable:
     def read(spreadsheet_id: str, range_name: str) -> list:
         def operation() -> list:
-            result = service_factory().spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=range_name,
-                majorDimension="ROWS", valueRenderOption="UNFORMATTED_VALUE",
-                dateTimeRenderOption="SERIAL_NUMBER",
-            ).execute()
+            with _AUDIT_TRANSPORT_LOCK:
+                result = service_factory().spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id, range=range_name,
+                    majorDimension="ROWS", valueRenderOption="UNFORMATTED_VALUE",
+                    dateTimeRenderOption="SERIAL_NUMBER",
+                ).execute()
             values = result.get("values", [])
             if not isinstance(values, list):
                 raise TypeError("Sheets values response must be a list")
