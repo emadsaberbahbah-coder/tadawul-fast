@@ -8,6 +8,11 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.3.2 — an opportunity-pool shortfall is accepted only when a native
+per-symbol exclusion receipt agrees with independently crossbound complete
+source grids, source cohort and first-page ownership. Physical membership
+remains unchanged; missing rows and unverifiable deductions fail closed.
+
 VERSION 1.3.1 — independent full-column Symbol reads prove there is no unseen
 tail beyond the wide audit bound and agree by physical row with that read.
 
@@ -57,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import json
 import math
@@ -78,9 +84,10 @@ from core.data_validity import coverage_validity  # noqa: E402
 if TYPE_CHECKING:
     from scripts.approved_universe_scope import ScopePolicy
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 SOURCE_SCOPE_BOUND = 20050
 SOURCE_SCOPE_RANGE = f"A1:EZ{SOURCE_SCOPE_BOUND}"
+POOL_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 FUTURE_SKEW_H = 0.25                              # v1.1.0 P-104: allowed clock skew
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -131,6 +138,7 @@ class DecisionSurfaceReport:
     source_status: dict[str, dict[str, Any]] = field(default_factory=dict)
     approved_scope: dict[str, Any] = field(default_factory=dict)
     top10_pool_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    top10_pool_reconciliation: dict[str, Any] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
     fatal: str = ""
 
@@ -156,6 +164,7 @@ class DecisionSurfaceReport:
             "source_status": self.source_status,
             "approved_scope": self.approved_scope,
             "top10_pool_counts": self.top10_pool_counts,
+            "top10_pool_reconciliation": self.top10_pool_reconciliation,
             "summary": {
                 "failures": sum(item.severity == "FAIL" for item in self.findings),
                 "warnings": sum(item.severity == "WARN" for item in self.findings),
@@ -403,6 +412,149 @@ def _scope_membership(page: str, wide_grid: Sequence[Sequence[Any]],
     return complete_validation
 
 
+def _complete_pool_source(page: str, wide_grid: Sequence[Sequence[Any]],
+                          column_grid: Sequence[Sequence[Any]]) -> tuple[list[str], str]:
+    """Complete raw identity evidence for cross-page ownership, with no aliases."""
+    from scripts.approved_universe_scope import symbol_set_sha256
+    if len(column_grid) > SOURCE_SCOPE_BOUND or len(wide_grid) > SOURCE_SCOPE_BOUND:
+        raise ValueError(f"{page} complete Symbol column exceeds audit bound")
+    if any(not isinstance(row, (list, tuple)) or len(row) > 1 for row in column_grid):
+        raise ValueError(f"{page} complete Symbol column is malformed")
+    wide_symbols, wide_header, wide_column = _physical_source(wide_grid)
+    complete_symbols, complete_header, complete_column = _physical_source(column_grid)
+    if wide_column != 0 or complete_column != 0 or wide_header != complete_header:
+        raise ValueError(f"{page} complete and wide Symbol headers differ")
+    if any(_column_cell(wide_grid, row) != _column_cell(column_grid, row)
+           for row in range(max(len(wide_grid), len(column_grid)))):
+        raise ValueError(f"{page} complete and wide Symbol rows changed between reads")
+    # The shared hash contract rejects numeric, blank, malformed and duplicate
+    # identities. A within-page duplicate is never an authorized exclusion.
+    digest = symbol_set_sha256(wide_symbols)
+    if digest != symbol_set_sha256(complete_symbols) or len(wide_symbols) != len(complete_symbols):
+        raise ValueError(f"{page} complete and wide membership evidence differs")
+    return [identity.strip().upper() for identity in complete_symbols], digest
+
+
+def _pool_receipt(text: Any) -> Optional[dict[str, Any]]:
+    """The native producer emits one canonical, hashed JSON field in B2."""
+    value = s(text)
+    occurrences = re.findall(r"(?<![A-Za-z0-9_])pool_reconciliation_v1\s*=", value)
+    if not occurrences:
+        return None
+    matches = re.findall(r"(?:^|\|)\s*pool_reconciliation_v1=([^|]*)", value)
+    if len(occurrences) != 1 or len(matches) != 1:
+        raise ValueError("native pool reconciliation receipt must occur exactly once")
+    raw = matches[0].strip()
+    if len(raw) > 30000:
+        raise ValueError("native pool reconciliation exceeds producer receipt bound")
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("native pool receipt contains duplicate JSON keys")
+            result[key] = item
+        return result
+    receipt = json.loads(raw, object_pairs_hook=unique_object,
+                         parse_constant=lambda _value: (_ for _ in ()).throw(
+                             ValueError("native pool receipt contains non-finite numbers")))
+    if not isinstance(receipt, dict) or list(receipt) != [
+            "version", "run", "pages", "excluded", "physical_symbol_sha256", "sha256"]:
+        raise ValueError("native pool reconciliation schema/order differs")
+    if type(receipt["version"]) is not int or receipt["version"] != 1:
+        raise ValueError("native pool reconciliation version unsupported")
+    if not isinstance(receipt["run"], str) or not re.fullmatch(r"[1-9][0-9]*", receipt["run"]):
+        raise ValueError("native pool reconciliation run invalid")
+    claimed = receipt["sha256"]
+    if not isinstance(claimed, str) or not re.fullmatch(r"[0-9a-f]{64}", claimed):
+        raise ValueError("native pool reconciliation checksum invalid")
+    canonical = json.dumps(receipt, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
+    digest = hashlib.sha256(json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False,
+                                      allow_nan=False).encode("utf-8")).hexdigest()
+    if raw != canonical or digest != claimed:
+        raise ValueError("native pool reconciliation checksum/canonical bytes differ")
+    return receipt
+
+
+def _pool_reconciliation(text: Any, pools: Mapping[str, Mapping[str, int]],
+                         status_rows: Mapping[str, StatusRow],
+                         publication_runs: Mapping[str, Optional[str]],
+                         expected_run: Optional[str],
+                         source_grids: Optional[Mapping[str, Sequence[Sequence[Any]]]],
+                         source_columns: Optional[Mapping[str, Sequence[Sequence[Any]]]]) -> dict[str, Any]:
+    """Count equality alone cannot authorize loss from a physical source roster.
+
+    Independently derive every duplicate's earlier-page owner. Native included
+    counts describe the actual capped pool; physical totals describe the source
+    pages. Neither assertion authenticates custody or provider acquisition.
+    """
+    receipt = _pool_receipt(text)
+    if not source_grids or not source_columns:
+        raise ValueError("complete source grids required for opportunity-pool reconciliation")
+    physical, digests, excluded, owned_counts, owners = {}, {}, [], {}, {}
+    for page in POOL_PAGES:
+        if page not in source_grids or page not in source_columns:
+            raise ValueError(f"{page} independent complete source evidence missing")
+        symbols, digest = _complete_pool_source(page, source_grids[page], source_columns[page])
+        physical[page], digests[page] = len(symbols), digest
+        item = status_rows.get(page)
+        if item is None or item.rows != len(symbols) or item.acquired_requested != len(symbols):
+            raise ValueError(f"{page} status/acquisition counters differ from complete physical source")
+        owned_counts[page] = 0
+        for identity in sorted(symbols):
+            if identity in owners:
+                excluded.append({"symbol": identity, "page": page, "owner": owners[identity]})
+            else:
+                owners[identity] = page
+                owned_counts[page] += 1
+    if receipt is None:
+        if excluded:
+            raise ValueError("cross-page exclusions require individual native producer receipts")
+        for page in POOL_PAGES:
+            pool = pools.get(page)
+            if not pool or pool["total"] != physical[page] or pool["used"] > physical[page]:
+                raise ValueError(f"{page} pool counts differ from complete physical source")
+            if pool["used"] != physical[page]:
+                raise ValueError(f"{page} capped or incomplete pool cannot certify full publication")
+        return {"valid": True, "receipt_required": False, "physical_counts": physical,
+                "unique_counts": owned_counts, "excluded": []}
+    if expected_run is not None and receipt["run"] != expected_run:
+        raise ValueError("native pool reconciliation does not match expected source run")
+    if _consumed_source_run(text) != receipt["run"] or any(
+            publication_runs.get(page) != receipt["run"] for page in POOL_PAGES):
+        raise ValueError("native pool reconciliation does not match one consumed/current source cohort")
+    if not isinstance(receipt["pages"], dict) or tuple(receipt["pages"]) != POOL_PAGES:
+        raise ValueError("native pool reconciliation page schema/order differs")
+    if not isinstance(receipt["physical_symbol_sha256"], dict) or \
+            tuple(receipt["physical_symbol_sha256"]) != POOL_PAGES or \
+            receipt["physical_symbol_sha256"] != digests:
+        raise ValueError("native pool reconciliation physical Symbol hashes differ")
+    if not isinstance(receipt["excluded"], list) or receipt["excluded"] != excluded or any(
+            not isinstance(record, dict) or list(record) != ["symbol", "page", "owner"]
+            for record in receipt["excluded"]):
+        raise ValueError("native pool exclusions differ from exact independent first-page ownership")
+    for page in POOL_PAGES:
+        claimed = receipt["pages"][page]
+        if not isinstance(claimed, dict) or list(claimed) != ["physical", "unique", "included"] or any(
+                type(value) is not int or value < 0 for value in claimed.values()):
+            raise ValueError(f"{page} native pool counters invalid")
+        if claimed["physical"] != physical[page] or claimed["unique"] != owned_counts[page] or \
+                claimed["included"] > owned_counts[page]:
+            raise ValueError(f"{page} native pool counters do not reconcile with physical ownership")
+        if claimed["included"] != owned_counts[page]:
+            raise ValueError(f"{page} explicit pool cap omitted unique rows; a truncated scan cannot certify full readiness")
+        pool_matches = [match for match in POOL_RE.finditer(s(text)) if match.group("page") == page]
+        if len(pool_matches) != 1 or pools.get(page) != {
+                "used": claimed["included"], "total": physical[page]}:
+            raise ValueError(f"{page} native status must disclose included/physical counts exactly once")
+    totals = re.findall(r"(?<![A-Za-z0-9_])sheets pool ([0-9]+) rows\b", s(text))
+    if len(totals) != 1 or int(totals[0]) != sum(owned_counts.values()):
+        raise ValueError("native submitted-pool total differs from the complete unique ownership count")
+    return {"valid": True, "receipt_required": True, "run": receipt["run"],
+            "sha256": receipt["sha256"], "physical_counts": physical,
+            "unique_counts": owned_counts, "excluded": excluded, "receipt": receipt}
+
+
 def _configured_floors(min_rows: Optional[Mapping[str, int]]) -> dict[str, int]:
     return dict(min_rows or {
         "Market_Leaders": _env_int("TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS", 1025),
@@ -443,7 +595,7 @@ def audit_surfaces(
         return report
     strict_run = expected_source_run is not None
     expected_run = str(expected_source_run) if strict_run else None
-    publication_runs = _source_publication_runs(status_grid) if strict_run else {}
+    publication_runs = _source_publication_runs(status_grid)
     if strict_run and not re.fullmatch(r"[1-9][0-9]*", expected_run):
         report.findings.append(Finding("FAIL", "EXPECTED_SOURCE_RUN_INVALID", "Final_Publication",
             "Expected source run must be one positive publication run ID; final readiness cannot use an unknown/local run."))
@@ -625,9 +777,22 @@ def audit_surfaces(
             incomplete_sources.append(page)
             report.findings.append(Finding("FAIL", "T10_POOL_BELOW_FLOOR", "Top_10_Investments", f"Top-10 used {pool['total']} {page} rows, below approved minimum {floor}."))
 
+    if approved_scope is not None or "pool_reconciliation_v1" in s(top10_text):
+        try:
+            report.top10_pool_reconciliation = _pool_reconciliation(
+                top10_text, report.top10_pool_counts, status_rows, publication_runs,
+                expected_run, source_grids, source_columns)
+        except Exception as exc:
+            incomplete_sources.append("opportunity_pool")
+            report.top10_pool_reconciliation = {"valid": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+            report.findings.append(Finding("FAIL", "T10_POOL_RECONCILIATION_UNPROVEN",
+                "Top_10_Investments",
+                f"Physical source membership and deduplicated opportunity pool cannot be reconciled: {type(exc).__name__}: {exc}"))
+
     claims_full = "(full universe)" in s(top10_text).casefold()
     if claims_full and incomplete_sources:
-        report.findings.append(Finding("FAIL", "FALSE_FULL_UNIVERSE_CLAIM", "Top_10_Investments", "Status claims a full universe while one or more required source pages are partial, stale, or below their approved row floors."))
+        report.findings.append(Finding("FAIL", "FALSE_FULL_UNIVERSE_CLAIM", "Top_10_Investments", "Status claims a full universe while required source pages are partial, stale, below their approved row floors, or physical-to-pool reconciliation is unproven."))
 
     report.executable = report.exit_code == 0
     return report
@@ -675,7 +840,10 @@ async def run_live(spreadsheet_id: str, reader: Optional[Callable[..., Any]] = N
             _read_range(reader, spreadsheet_id, "Portfolio_Decision!A1:B3"),
             _read_range(reader, spreadsheet_id, "Top_10_Investments!A1:B3"),
         ]
-        scope_pages = tuple(approved_scope.pages) if approved_scope is not None else ()
+        # Ownership exclusions must be proved from every source page, rather
+        # than treating the two approved-page membership hashes as proof that
+        # the removed symbols exist on a different complete source page.
+        scope_pages = POOL_PAGES if approved_scope is not None else ()
         reads.extend(_read_range(reader, spreadsheet_id, f"{page}!{SOURCE_SCOPE_RANGE}")
                      for page in scope_pages)
         reads.extend(_read_range(reader, spreadsheet_id, f"{page}!A:A")

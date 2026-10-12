@@ -98,6 +98,12 @@ on:
         required: false
         default: false
         type: boolean
+      signal_history_mode:
+        description: "Same-day repetition measurement for this run (observe does not deduplicate)"
+        required: false
+        type: choice
+        default: inherit
+        options: ["inherit", "off", "observe"]
 
 # Never overlap two clock runs (a cold Top_10 build can take ~90s).
 #
@@ -259,6 +265,8 @@ jobs:
         if: steps.overlap.outputs.skip != 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
+          INPUT_SIGNAL_HISTORY_MODE: ${{ github.event.inputs.signal_history_mode }}
+          INPUT_RUN_AUDIT: ${{ github.event.inputs.run_audit }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
@@ -361,6 +369,13 @@ jobs:
           if [[ "${{ github.event.inputs.enable_debug }}" == "true" ]]; then
             export LOG_LEVEL=DEBUG
           fi
+          # (2026-10-12) Explicit per-run observation; inherit leaves both
+          # scheduled defaults and repository Variables unchanged.
+          case "${INPUT_SIGNAL_HISTORY_MODE:-inherit}" in
+            inherit) ;;
+            off|observe) export TRACK_DEDUP_SIGNAL_HISTORY="$INPUT_SIGNAL_HISTORY_MODE" ;;
+            *) echo '::error::Manual signal mode must be inherit, off or observe.'; exit 2 ;;
+          esac
 
           # --record : capture today's picks + per-symbol verdict snapshots
           # --audit  : mature active picks against realized prices (default ON;
@@ -370,7 +385,18 @@ jobs:
           #            also runs here unless TRACK_CALIBRATION=0)
           # --export : write <base>_*.json (perf / signal_trends / calibration)
           AUDIT_FLAG="--audit"
-          if [[ "${{ github.event.inputs.run_audit }}" == "false" ]]; then AUDIT_FLAG=""; fi
+          AUDIT_ENABLED=true
+          if [[ "${INPUT_RUN_AUDIT:-}" == "false" ]]; then
+            AUDIT_FLAG=""
+            AUDIT_ENABLED=false
+            export TRACK_AUDIT=0
+            export TRACK_PUBLISH_CALIBRATION=0
+            export TFB_SIGNAL_TRENDS_TAB=0
+            export TFB_TRACK_SUMMARY_SIDE=1
+          fi
+
+          # Genuine CLI version witness, without initializing a Sheet store.
+          python scripts/track_performance.py --help > tracker_cli_help.txt
 
           CMD=(python scripts/track_performance.py
                --sheet-id "$TARGET_SHEET_ID"
@@ -380,7 +406,12 @@ jobs:
           TS="$(date +%Y%m%d_%H%M%S)"
           LOG="perf_clock_${TS}.log"
           set -o pipefail
-          "${CMD[@]}" 2>&1 | tee "$LOG"
+          code=0
+          "${CMD[@]}" 2>&1 | tee "$LOG" || code=$?
+          python scripts/workflow_activation_receipt.py tracker --exit-code "$code" \
+            --log "$LOG" --help-witness tracker_cli_help.txt \
+            --audit-enabled "$AUDIT_ENABLED" --receipt tracker_activation_receipt.json
+          if [[ "$code" -ne 0 ]]; then exit "$code"; fi
 
           # Surface the honest "start the clock" / "insufficient evidence" lines
           # in the job log so a non-technical owner can see the clock state.
@@ -395,6 +426,8 @@ jobs:
           name: tfb-performance-clock-${{ github.run_id }}
           path: |
             perf_clock_*.log
+            tracker_activation_receipt.json
+            tracker_cli_help.txt
             *_performance*.json
             *_signal_trends.json
             *_signal_publications.json
@@ -420,5 +453,5 @@ jobs:
             echo "| Backend | \`${TARGET_URL:-?}\` |"
             echo "| Sheet | \`${TARGET_SHEET_ID:-?}\` |"
             echo ""
-            echo "Records + snapshots are idempotent per day; re-running is safe."
+            echo "Signal-history observe measures repeated day keys; it does not deduplicate them."
           } >> "$GITHUB_STEP_SUMMARY"

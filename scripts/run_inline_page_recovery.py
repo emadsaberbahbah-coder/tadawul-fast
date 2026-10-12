@@ -9,6 +9,10 @@ Each page retry launches a fresh ``run_dashboard_sync.py`` process, so every pag
 receives an independent ``TFB_SYNC_TIME_BUDGET_SEC`` budget. Existing persistence,
 last-good-row, and page-verdict safeguards remain authoritative.
 
+v1.2.1 retains a separate actual runner report for every page/cycle and links
+its content digest and declared update receipt from the recovery summary.
+These are submitted-payload receipts; no live Sheet readback is inferred.
+
 v1.2.0 (P-154b, 2026-09-22) QUOTA-AWARE RECOVERY. Every page replay is a FULL
 page re-fetch (``--keys <page>``): measured on 2026-09-21/22, one Global_Markets
 replay costs ~53-60k EODHD calls (13-15% of the 400k/day allowance) and the
@@ -32,6 +36,7 @@ the line stops the next cycle.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -46,7 +51,46 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.audit_sync_outcome import audit_artifacts
 from scripts.plan_sync_recovery import build_recovery_plan
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
+
+
+def _runner_report_evidence(path: Path, page: str) -> dict:
+    """Retain actual child evidence without inventing proof on parse failures."""
+    evidence = {"path": str(path), "status": "missing", "live_readback": False}
+    if not path.is_file():
+        return evidence
+    try:
+        raw = path.read_bytes()
+        evidence["sha256"] = hashlib.sha256(raw).hexdigest()
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("runner report exceeds the evidence bound")
+        payload = json.loads(raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("non-finite report")))
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise ValueError("runner report structure is invalid")
+        matches = [result for result in payload["results"]
+                   if isinstance(result, dict) and result.get("sheet_name") == page]
+        if len(matches) != 1:
+            raise ValueError("runner report has no unique requested page")
+        result = matches[0]
+        evidence.update(status="available", runner_version=result.get("version"),
+                        result_status=result.get("status"), request_id=result.get("request_id"))
+        receipt = result.get("write_receipt")
+        if receipt is not None:
+            if (not isinstance(receipt, dict) or receipt.get("evidence") != "successful_RAW_update"
+                    or receipt.get("live_readback") is not False
+                    or not isinstance(receipt.get("written_payload_sha8"), str)
+                    or not _re.fullmatch(r"[0-9a-f]{8}", receipt["written_payload_sha8"])
+                    or type(receipt.get("rows")) is not int or receipt["rows"] < 0
+                    or result.get("status") not in {"success", "partial"}
+                    or type(result.get("rows_written")) is not int
+                    or result["rows_written"] != receipt["rows"]):
+                raise ValueError("runner update receipt is invalid")
+            evidence["write_receipt"] = receipt
+        return evidence
+    except (OSError, ValueError, UnicodeError, TypeError):
+        evidence.update(status="invalid")
+        evidence.pop("write_receipt", None)
+        return evidence
 
 
 def _max_cycles() -> int:
@@ -258,6 +302,7 @@ def run_inline_recovery(
             group = str(item["group"])
             page_root = evidence_root / group if cycle == 1 else evidence_root / group / f"cycle{cycle}"
             log_path = page_root / "sync_execution.log"
+            runner_report_path = page_root / "sync_runner_receipt.json"
 
             print(f"::group::Recover {page} (cycle {cycle})")
             # v1.2.0 (P-154b): quota-aware guard. Cycle 1 reads the matrix leg's
@@ -297,7 +342,11 @@ def run_inline_recovery(
                 key,
                 "--start-cell",
                 "A1",
+                "--json-out",
+                str(runner_report_path),
             )
+            # A failed child must not be attributed an older invocation's receipt.
+            runner_report_path.unlink(missing_ok=True)
             runner_exit = _stream_process(command, env=env, log_path=log_path)
 
             audit_status = "blocked"
@@ -342,6 +391,7 @@ def run_inline_recovery(
                     "audit_status": audit_status,
                     "passed": passed,
                     "evidence_root": str(page_root),
+                    "runner_report": _runner_report_evidence(runner_report_path, page),
                 }
             )
             print("::endgroup::")

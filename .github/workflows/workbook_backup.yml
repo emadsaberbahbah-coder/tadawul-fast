@@ -72,6 +72,12 @@ on:
       dry_run:
         description: "true = export + verify only, upload nothing"
         default: "false"
+      dq_audit_mode:
+        description: "DQ for this run: inherit repository setting, off, or observe"
+        type: choice
+        required: false
+        default: inherit
+        options: ["inherit", "off", "observe"]
 
 concurrency:
   group: tfb-workbook-backup
@@ -119,6 +125,26 @@ jobs:
       - name: Install deps
         run: pip install --quiet "gspread==6.2.1" "google-auth==2.49.2" "requests==2.33.1" "openpyxl==3.1.5"
 
+      # (2026-10-12) Manual observation does not require repository Variables
+      # write permission. Scheduled/inherit runs retain the existing setting.
+      - name: Resolve this run's DQ mode
+        id: dq_mode
+        env:
+          INPUT_DQ_MODE: ${{ github.event.inputs.dq_audit_mode }}
+          REPOSITORY_DQ_MODE: ${{ vars.TFB_DQ_AUDIT_MODE }}
+        run: |
+          set -euo pipefail
+          case "${INPUT_DQ_MODE:-inherit}" in
+            inherit)
+              MODE="${REPOSITORY_DQ_MODE:-off}"
+              case "$MODE" in observe|enforce) ;; *) MODE=off ;; esac
+              ;;
+            off|observe) MODE="$INPUT_DQ_MODE" ;;
+            *) echo '::error::Manual DQ mode must be inherit, off or observe.'; exit 2 ;;
+          esac
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "DQ effective mode for this run: $MODE"
+
       - name: Materialize Google credentials
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -145,7 +171,7 @@ jobs:
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
           # v1.2.0 [WP-0]: empty unless TFB_DQ_AUDIT_MODE is observe/enforce, so
           # backup_workbook.py v1.5.0 behaves exactly as v1.4.0 by default.
-          TFB_BACKUP_LOCAL_COPY: ${{ (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && format('{0}/tfb_export.xlsx', runner.temp) || '' }}
+          TFB_BACKUP_LOCAL_COPY: ${{ (steps.dq_mode.outputs.mode == 'observe' || steps.dq_mode.outputs.mode == 'enforce') && format('{0}/tfb_export.xlsx', runner.temp) || '' }}
         run: |
           set -euo pipefail
           EXTRA=""
@@ -160,27 +186,32 @@ jobs:
       # from the runner and is never uploaded. Exit 1 = decision-critical
       # regression vs the committed baseline fixture.
       - name: Workbook DQ audit (WP-0)
-        if: ${{ success() && (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && github.event.inputs.restore_test != 'true' }}
-        continue-on-error: ${{ vars.TFB_DQ_AUDIT_MODE != 'enforce' }}
+        if: ${{ success() && (steps.dq_mode.outputs.mode == 'observe' || steps.dq_mode.outputs.mode == 'enforce') && github.event.inputs.restore_test != 'true' }}
+        continue-on-error: ${{ steps.dq_mode.outputs.mode != 'enforce' }}
         env:
-          TFB_DQ_AUDIT_MODE: ${{ vars.TFB_DQ_AUDIT_MODE }}
+          TFB_DQ_AUDIT_MODE: ${{ steps.dq_mode.outputs.mode }}
         run: |
           set -euo pipefail
           test -s "$RUNNER_TEMP/tfb_export.xlsx"
+          code=0
           python scripts/tfb_workbook_dq_audit.py "$RUNNER_TEMP/tfb_export.xlsx" \
             --json dq_report.json --md dq_scorecard.md \
-            --baseline tests/fixtures/dq_baseline_2026-10-10.json --quiet | tee -a "$GITHUB_STEP_SUMMARY"
-          cat dq_scorecard.md >> "$GITHUB_STEP_SUMMARY"
+            --baseline tests/fixtures/dq_baseline_2026-10-10.json --quiet | tee -a "$GITHUB_STEP_SUMMARY" || code=$?
+          python scripts/workflow_activation_receipt.py dq --exit-code "$code" \
+            --receipt dq_activation_receipt.json
+          if [ -f dq_scorecard.md ]; then cat dq_scorecard.md >> "$GITHUB_STEP_SUMMARY"; fi
+          exit "$code"
 
       # v1.2.0 [WP-0]: only the redacted report and scorecard — never the xlsx.
       - name: Upload DQ report
-        if: ${{ always() && (vars.TFB_DQ_AUDIT_MODE == 'observe' || vars.TFB_DQ_AUDIT_MODE == 'enforce') && github.event.inputs.restore_test != 'true' }}
+        if: ${{ always() && (steps.dq_mode.outputs.mode == 'observe' || steps.dq_mode.outputs.mode == 'enforce') && github.event.inputs.restore_test != 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: tfb-dq-audit-${{ github.run_id }}
           path: |
             dq_report.json
             dq_scorecard.md
+            dq_activation_receipt.json
           retention-days: 30
           if-no-files-found: warn
 

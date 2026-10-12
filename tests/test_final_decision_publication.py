@@ -10,6 +10,7 @@ import pytest
 from scripts import finalize_decision_publication as final
 from tests.test_decision_surface_freshness import (
     NOW, FLOORS, portfolio_grid, status_grid, top10_grid, publication_grids,
+    approved_grids, _native_pool_case, _attach_pool_receipt,
 )
 from tests.test_full_refresh_coverage import scoped_grid, scoped_symbols, synthetic_approved_scope, symbol_column
 from scripts.approved_universe_scope import ScopePolicyError
@@ -33,6 +34,13 @@ def current_publication_grids():
     top10[1][1] = top10[1][1].replace("Market_Leaders 1356/1356", "Market_Leaders 255/255").replace(
         "Mutual_Funds 4496/4496", "Mutual_Funds 2474/2474")
     return sources, portfolio, top10
+
+
+def complete_source_grids():
+    # Approval covers two source pages, but individual pool exclusions require
+    # all four real-cardinality owner grids, not count-only owner placeholders.
+    _surfaces, physical = approved_grids(scoped_symbols())
+    return physical
 
 
 class Request:
@@ -161,10 +169,11 @@ def reports(*, coverage_failure=False, decision_failure=False, warning=False):
     grids = list(current_publication_grids())
     if decision_failure:
         grids[1][1][1] = grids[1][1][1].replace("2026-07-31 20:05:00", "2026-07-31 19:00:00")
+    physical = complete_source_grids()
     decision = final.freshness.audit_surfaces(*grids, now_utc=NOW, min_rows=final.MARKET_FLOORS,
         expected_source_run="90001", approved_scope=scope,
-        source_grids={page: scoped_grid(page) for page in scope.pages},
-        source_columns={page: symbol_column(scoped_grid(page)) for page in scope.pages})
+        source_grids=physical,
+        source_columns={page: symbol_column(grid) for page, grid in physical.items()})
     return full, decision
 
 
@@ -431,13 +440,25 @@ def test_actual_decision_auditor_accepts_current_cohort_without_changing_default
 
 @pytest.mark.parametrize("fault", [None, "missing_pf", "stale_pf", "duplicate_top10", "stale_top10", "stale_portfolio_source",
                                    "source_substitution", "source_loss", "source_duplicate", "source_extra",
-                                   "complete_column_tail", "complete_column_reorder"])
+                                   "complete_column_tail", "complete_column_reorder", "pool_proven",
+                                   "pool_missing_receipt", "pool_wrong_owner", "pool_owner_torn", "pool_capped"])
 def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(monkeypatch, fault):
     full, _decision = reports()
     now_riyadh = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     source_stamp = (now_riyadh - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     decision_stamp = (now_riyadh - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
     sources, portfolio, top10 = current_publication_grids()
+    physical = complete_source_grids()
+    if fault and fault.startswith("pool_"):
+        _scope, surfaces, physical, receipt = _native_pool_case((final.load_scope(), scoped_symbols()))
+        sources, portfolio, top10 = surfaces
+        if fault == "pool_wrong_owner":
+            receipt["excluded"][0]["owner"] = "Commodities_FX"
+        elif fault == "pool_capped":
+            receipt["pages"]["Mutual_Funds"]["included"] -= 1
+            top10[1][1] = top10[1][1].replace("2469/2474", "2468/2474")
+        if fault != "pool_missing_receipt":
+            _attach_pool_receipt(surfaces, receipt)
     for row in sources[1:]:
         row[1] = source_stamp
     for surface in (portfolio, top10):
@@ -455,8 +476,8 @@ def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(mo
             next(row for row in sources[1:] if row[0] == "My_Portfolio")[3].replace("run=90001", "run=80000")
     grids = {"_Status!A1:J100": sources, "Portfolio_Decision!A1:B3": portfolio,
              "Top_10_Investments!A1:B3": top10,
-             **{page + "!A1:EZ20050": scoped_grid(page) for page in scoped_symbols()},
-             **{page + "!A:A": symbol_column(scoped_grid(page)) for page in scoped_symbols()}}
+             **{page + "!A1:EZ20050": grid for page, grid in physical.items()},
+             **{page + "!A:A": symbol_column(grid) for page, grid in physical.items()}}
     source = grids["Market_Leaders!A1:EZ20050"]
     if fault == "source_substitution":
         source[1][0] = "UNAPPROVED.SR"
@@ -473,6 +494,8 @@ def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(mo
     elif fault == "complete_column_reorder":
         column = grids["Market_Leaders!A:A"]
         column[1], column[2] = column[2], column[1]
+    elif fault == "pool_owner_torn":
+        grids["Global_Markets!A:A"][1][0] = "SYNTH_CHANGED_OWNER"
     reads = []
 
     def reader(sheet_id, a1):
@@ -490,8 +513,9 @@ def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(mo
     before = copy.deepcopy(service.rows)
     result = run(service, reader=reader)
     assert set(reads) == set(grids)
-    assert result["exit_code"] == (0 if fault is None else 2)
-    if fault is None:
+    accepted = fault in {None, "pool_proven"}
+    assert result["exit_code"] == (0 if accepted else 2)
+    if accepted:
         assert not result["blocker_published"] and result["blockers"] == []
         assert service.rows == before and service.calls == []
     else:

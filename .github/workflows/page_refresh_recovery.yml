@@ -10,6 +10,7 @@ on:
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
       - 'tests/test_inline_page_recovery.py'
+      - 'tests/test_activation_rollout_evidence_workflows.py'
   push:
     branches: [main]
     paths:
@@ -20,12 +21,25 @@ on:
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
       - 'tests/test_inline_page_recovery.py'
+      - 'tests/test_activation_rollout_evidence_workflows.py'
   workflow_dispatch:
     inputs:
       run_id:
         description: 'Completed Advanced Sync run ID to inspect and recover'
         required: true
         type: string
+      rank_mode:
+        description: 'Whole-page ranking override for this recovery (inherit repository variable)'
+        required: false
+        default: inherit
+        type: choice
+        options: ['inherit', 'off', 'observe', 'enforce']
+      warnings_mode:
+        description: 'Warning compaction override; enforcement awaits a verified external archive'
+        required: false
+        default: inherit
+        type: choice
+        options: ['inherit', 'off', 'observe']
 
 permissions:
   contents: read
@@ -63,12 +77,16 @@ jobs:
             tests/test_sync_recovery_plan.py \
             tests/test_inline_page_recovery.py
 
+      - name: Install rollout workflow test dependencies
+        run: python -m pip install pytest==9.1.1 pyyaml==6.0.3
+
       - name: Run recovery regression tests
         run: |
           python -m unittest \
             tests/test_sync_outcome_audit.py \
             tests/test_sync_recovery_plan.py \
             tests/test_inline_page_recovery.py
+          python -m pytest -q tests/test_activation_rollout_evidence_workflows.py
 
   plan:
     name: Plan missing page refreshes
@@ -224,6 +242,40 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve publication rollout modes
+        env:
+          RANK_MODE_OVERRIDE: ${{ github.event.inputs.rank_mode || 'inherit' }}
+          WARNINGS_MODE_OVERRIDE: ${{ github.event.inputs.warnings_mode || 'inherit' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          requested = {"rank": os.getenv("RANK_MODE_OVERRIDE", "inherit"),
+                       "warnings": os.getenv("WARNINGS_MODE_OVERRIDE", "inherit")}
+          for feature, allowed in (("rank", {"inherit", "off", "observe", "enforce"}),
+                                   ("warnings", {"inherit", "off", "observe"})):
+              if requested[feature] not in allowed:
+                  raise SystemExit("::error::Invalid " + feature + " rollout override")
+          configured = {"rank": os.getenv("TFB_RANK_OVERALL_PAGE", "off"),
+                        "warnings": os.getenv("TFB_WARNINGS_COMPACT", "off")}
+          effective = {}
+          for feature in requested:
+              value = (configured[feature] if requested[feature] == "inherit" else requested[feature]).strip().lower()
+              effective[feature] = value if value in {"observe", "enforce"} else "off"
+          if effective["warnings"] == "enforce":
+              raise SystemExit("::error::Warning enforcement is blocked: no verified prewrite external archive")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("TFB_RANK_OVERALL_PAGE=" + effective["rank"] + "\n")
+              env.write("TFB_WARNINGS_COMPACT=" + effective["warnings"] + "\n")
+          evidence = {"run_id": os.getenv("GITHUB_RUN_ID"), "source_sha": os.getenv("GITHUB_SHA"),
+                      "event": os.getenv("GITHUB_EVENT_NAME"), "requested": requested,
+                      "configured": configured, "effective": effective,
+                      "warnings_enforcement": "blocked_no_prewrite_external_archive"}
+          Path("rollout_modes.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(evidence))
+          PY
+
       - name: Configure production credentials
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -278,6 +330,7 @@ jobs:
             --sheet-id "$TARGET_SHEET_ID" \
             --keys "${{ matrix.key }}" \
             --start-cell A1 \
+            --json-out "sync_runner_${{ matrix.group }}_${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}.json" \
             2>&1 | tee sync_execution.log
           RC=${PIPESTATUS[0]}
           set -e
@@ -302,6 +355,8 @@ jobs:
           path: |
             sync_execution.log
             sync_summary.json
+            sync_runner_*.json
+            rollout_modes.json
             page-audit.json
             sync_row_telemetry_*.jsonl
           retention-days: 30
