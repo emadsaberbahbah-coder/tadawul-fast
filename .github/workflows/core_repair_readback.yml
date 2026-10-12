@@ -7,6 +7,16 @@ on:
         type: boolean
         required: false
         default: false
+      tiny_quote_readback:
+        description: Capture actual SHIB/DOGE/XRP all-horizon forecast and ROI precision without Sheet writes
+        type: boolean
+        required: false
+        default: false
+      expected_backend_commit:
+        description: Optional tested backend full 40-character hexadecimal SHA; default workflow SHA
+        type: string
+        required: false
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -62,8 +72,16 @@ jobs:
       - name: Verify deployed SHA, authenticated signing and empty allocation
         env:
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
-          EXPECTED_COMMIT: ${{ github.sha }}
-        run: python scripts/verify_core_repair_readback.py --expected-commit "$EXPECTED_COMMIT"
+          EXPECTED_COMMIT: ${{ inputs.expected_backend_commit || github.sha }}
+          WORKFLOW_SOURCE_SHA: ${{ github.sha }}
+          TINY_QUOTE_READBACK: ${{ inputs.tiny_quote_readback }}
+        run: |
+          set -euo pipefail
+          args=(--expected-commit "$EXPECTED_COMMIT" --workflow-source-sha "$WORKFLOW_SOURCE_SHA")
+          if [ "$TINY_QUOTE_READBACK" = "true" ]; then
+            args+=(--tiny-quote-readback)
+          fi
+          python scripts/verify_core_repair_readback.py "${args[@]}"
       - name: Save sanitized readback
         if: always()
         uses: actions/upload-artifact@v7
