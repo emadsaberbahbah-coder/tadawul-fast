@@ -1,0 +1,2703 @@
+{
+  "schema": "tfb.verified-name-labels/v1",
+  "label_only": true,
+  "current_authority_only": true,
+  "bindings": [
+    {
+      "page": "Global_Markets",
+      "symbol": "ADVB.US",
+      "name": "Advanced Biomed Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Current exact Nasdaq directory/SEC issuer caption; no tradability or price claim.",
+      "identifiers": {
+        "CIK": "1941029",
+        "exact_exchange_code": "ADVB",
+        "security_class": "Common Stock"
+      },
+      "reviewed_at_utc": "2026-10-12T11:11:51.645241+00:00",
+      "expires_at_utc": "2026-10-19T11:11:51.645241+00:00",
+      "sources": [
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "59e7857c5b9da15c22497ff61eb50a5915494df4116e31d62c5b0597368f4d13",
+          "captured_at_utc": "2026-10-11T22:21:47.464855+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt",
+          "sha256": "6253cd52421b35c39fa604e5e2aa580d6d802e0341c19a7786062740ffdf5573",
+          "captured_at_utc": "2026-10-11T22:21:50.035233+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        }
+      ],
+      "review_receipt_sha256": "670ff1fed2d45a82fc66be7306268c0b0d2ab767d15c76132b74d3c1e1bcc9a1"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AVNS.US",
+      "name": "Avanos Medical, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Former public common stock canceled/converted on acquisition; delisted; not an active listing or tradability certification",
+      "identifiers": {
+        "CIK": "0001606498",
+        "exact_exchange_code": "AVNS",
+        "security_class": "Common Stock - $0.01 Par Value"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1606498/000160649826000115/avns-20260727.htm",
+          "sha256": "ffb98279b8b20ee6edd50f1f4600f74eb11ce73fff12ff144435fa2950fcfa08",
+          "captured_at_utc": "2026-10-12T12:19:48.661657+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1606498/000160649826000115/avnsform8k_07272026xex32.htm",
+          "sha256": "354750747da7ce21fd94f516c002cd2521dac3328a5c835bc00b0419ac0be2a8",
+          "captured_at_utc": "2026-10-12T12:19:48.878495+00:00"
+        },
+        {
+          "url": "https://avanos.com/former-shareholder-information/",
+          "sha256": "e2cf96091d85f6cdb9e8d9d27efb963ee031ad70292e979b2a7196d8014bb912",
+          "captured_at_utc": "2026-10-12T12:19:50.289420+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001606498.json",
+          "sha256": "08d89e1595670ffbc34afda56b7fe4f3307bdd904f844b44cfcfa03b5ace22fd",
+          "captured_at_utc": "2026-10-12T12:19:49.632095+00:00"
+        }
+      ],
+      "review_receipt_sha256": "68a334a38656277f8fc41598b3f196a9fe301640ccbdcdb7539e67e28b9358f1"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CCRN.US",
+      "name": "Cross Country Healthcare, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Former public common stock canceled/converted on acquisition; delisted; not an active listing or tradability certification",
+      "identifiers": {
+        "CIK": "0001141103",
+        "exact_exchange_code": "CCRN",
+        "security_class": "Common Stock, par value $0.0001 per share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1141103/000095010326011218/dp250670_8k.htm",
+          "sha256": "4e2260443867bf34d0ab5c3b0a3db74312ca60e551a541cb0f36dbf76818a7fe",
+          "captured_at_utc": "2026-10-12T12:19:49.855658+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1141103/000095010326011218/dp250670_ex0301.htm",
+          "sha256": "ced31bfdd89b7a4d5ca7a0e8c4867a7118a1ccf3e45bcb58e6c4ec05430785b6",
+          "captured_at_utc": "2026-10-12T12:19:50.162886+00:00"
+        },
+        {
+          "url": "https://www.crosscountry.com/blog/knox-lane-completes-acquisition-of-cross-country-healthcare",
+          "sha256": "55dfc227afc20d5160c5a6ef4bab24edf348e784f846edf78456d7b8048cd5ea",
+          "captured_at_utc": "2026-10-12T12:19:50.883202+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001141103.json",
+          "sha256": "702e94432698ea59fb05e7d2a843ce1dcef3d059dfe73227dc2146873ce6e894",
+          "captured_at_utc": "2026-10-12T12:19:50.867299+00:00"
+        }
+      ],
+      "review_receipt_sha256": "110a2cc509b72a28963f5a628ee34dd97753fb7b3e9b601f7f5e784762e0449d"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "HEES.US",
+      "name": "H&E Equipment Services, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NASDAQ common stock suspended before 2025-06-02 opening; SEC 15-12G filed 2025-06-12.",
+      "identifiers": {
+        "CIK": "0001339605",
+        "exact_exchange_code": "HEES",
+        "security_class": "Common Stock, $0.01 par value"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1339605/000119312525133372/d92977d8k.htm",
+          "sha256": "1b6ebb7497e9e6cc325e9ef203cdca6657bbf2dcbb805611c90cd23fdadd6aae",
+          "captured_at_utc": "2026-10-12T12:16:07.850259+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001339605.json",
+          "sha256": "e4ea3791dbc4e3bb9c3bf78b3e94db29e854ef2f527524d177a78b48d19968b5",
+          "captured_at_utc": "2026-10-12T12:16:09.125265+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://api.gleif.org/api/v1/lei-records/254900KVLRCDMQRYY541",
+          "sha256": "9a50f99d498d64e2c5289df121812430ea3b7a1931455371626ed81bd89787e8",
+          "captured_at_utc": "2026-10-12T12:17:16.171768+00:00"
+        },
+        {
+          "url": "https://heequipment.gcs-web.com/financial-information/sec-filings",
+          "sha256": "017f326c6fa0e9f0209d73108d3e0155d4f46c1f986bb56289f6991d31838f72",
+          "captured_at_utc": "2026-10-12T12:16:08.711980+00:00"
+        }
+      ],
+      "review_receipt_sha256": "37ffcaf7483a973731a1857ecf064d4fa23d5609a971f4967fd1eb7176662336"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "NVEI.TO",
+      "name": "Nuvei Corporation",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "TSX",
+        "Currency": "CAD",
+        "Country": "Canada"
+      },
+      "requires_quarantine": false,
+      "state": "Issuer confirms completed take-private15November2024; Bourse states TSX share delisting at close18November2024. No current tradability claim.",
+      "identifiers": {
+        "CIK": "0001765159",
+        "exact_exchange_code": "NVEI",
+        "security_class": "Subordinate voting shares quoted in CAD on TSX; multiple-voting shares are separately identified and not the native listed class"
+      },
+      "reviewed_at_utc": "2026-10-12T12:24:43.455134+00:00",
+      "expires_at_utc": "2026-10-19T12:24:43.455134+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1765159/000176515924000007/nuvei-aifx2023xfvcleanv2.htm",
+          "sha256": "c9968d7f88883ee7ea5a15d08388f034a18422c15145d7496ce4874c238b1d6f",
+          "captured_at_utc": "2026-10-12T12:19:31.667505+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1765159/000095010324016364/dp220747_ex9901.htm",
+          "sha256": "80bef7f60fbdb654ff09bfc0d1ce8edfa13af4039ff85b0dce7b863b6ffd4775",
+          "captured_at_utc": "2026-10-12T12:15:41.961910+00:00"
+        },
+        {
+          "url": "https://www.nuvei.com/posts/nuvei-announces-completion-of-going-private-transaction",
+          "sha256": "953b7782567072d4996ca920b32bfaff6ffd88a5d0355da5a10da2c02d0c5406",
+          "captured_at_utc": "2026-10-12T12:15:42.221283+00:00"
+        },
+        {
+          "url": "https://www.m-x.ca/f_circulaires_en/134-24_en.pdf",
+          "sha256": "d4e1358d207656834bec0a2c96cfe13de8f978ec84adab3325d9ace85532d25e",
+          "captured_at_utc": "2026-10-12T12:19:31.665906+00:00"
+        },
+        {
+          "url": "https://www.nuvei.com/service-pages/anti-modern-slavery-reporting-uk",
+          "sha256": "1d1a3e0ae46ab1a62a083c26981f1a59e74c0b10a8204c2b9f0559f9c3d346a6",
+          "captured_at_utc": "2026-10-12T12:19:31.673714+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e36f902698dbb0fc22860980e1ca856d9a2cc2e4c1a09641f3ba84804ba2cd93"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PDCO.US",
+      "name": "Patterson Companies, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NASDAQ common stock halted before 2025-04-17 opening and converted to cash; SEC 15-12G filed 2025-04-28.",
+      "identifiers": {
+        "CIK": "0000891024",
+        "exact_exchange_code": "PDCO",
+        "security_class": "Common Stock, par value $.01"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/891024/000119312525083614/d904320d8k.htm",
+          "sha256": "34c65aaa2782c0f13585267258d99711b16e1bfac6612d28b7533d0d9a98b0da",
+          "captured_at_utc": "2026-10-12T12:16:07.851488+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0000891024.json",
+          "sha256": "84f344febc792b2f7432a93a7d010544ce251c3453949d64a51e6f9da28d2782",
+          "captured_at_utc": "2026-10-12T12:16:09.449755+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://ourpattersonfoundation.org/global-privacy-notice/",
+          "sha256": "986eb152206292576ca16f64abacac1f2e88b461c24a8d9662fbd2753ca89152",
+          "captured_at_utc": "2026-10-12T12:17:16.172301+00:00"
+        },
+        {
+          "url": "https://jobs.pattersoncompanies.com/intern",
+          "sha256": "a302a9965387d242998cde8e6a727dc0148070d669893922b265866c37438077",
+          "captured_at_utc": "2026-10-12T12:17:16.703940+00:00"
+        },
+        {
+          "url": "https://www.pattersoncompanies.com/news/patterson-companies-completes-aaquisition-by-patient-square-capital/",
+          "sha256": "3791b66639f13268051ba343a7b171cb1174fcdd7020e7b73286c1ad8b0f3bb2",
+          "captured_at_utc": "2026-10-12T12:16:08.495221+00:00"
+        }
+      ],
+      "review_receipt_sha256": "59acf9b622ba91938ce970810f4c19fc8661b202a55fa5079d0b52486d33e1e6"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PE&OLES.MX",
+      "name": "Industrias Peñoles, S.A.B. de C.V.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "BMV",
+        "Currency": "MXN",
+        "Country": "Mexico"
+      },
+      "requires_quarantine": false,
+      "state": "Current issuer ordinary-voting-share caption; no quote, eligibility or custody certification.",
+      "identifiers": {
+        "exact_exchange_code": "PE&OLES",
+        "security_class": "ordinary voting shares"
+      },
+      "reviewed_at_utc": "2026-10-12T11:28:15+00:00",
+      "expires_at_utc": "2026-10-19T11:28:15+00:00",
+      "sources": [
+        {
+          "url": "https://www.penoles.com.mx/inversionistas/accion.html",
+          "sha256": "77fad2d207e7faa1bc66b301078b3c3344a33aae3bd2b481df55078890ae543a",
+          "captured_at_utc": "2026-10-12T09:07:03.259090+00:00"
+        },
+        {
+          "url": "https://www.penoles.com.mx/assets/files/inversionistas/comunicados/aviso-a-los-accionistas/IPSAB_Aviso_Accionistas_Penoles_05mayo_2026.pdf",
+          "sha256": "60dd2f6948dd8fa9e7b01a5db4d412cf9d0eda3c3ba9c1f4a6fe05acc877edbe",
+          "captured_at_utc": "2026-10-11T22:44:17.965423+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e438d7b3def0dfb3a735ddaf41505022f752543eea81b92e1978a6333b381419"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "RCM.US",
+      "name": "R1 RCM Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NASDAQ common stock cancelled/converted on 2024-11-19; SEC 15-12G filed 2024-11-29.",
+      "identifiers": {
+        "CIK": "0001910851",
+        "exact_exchange_code": "RCM",
+        "security_class": "Common stock, $0.01 par value per share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1910851/000119312524261654/d845809d8k.htm",
+          "sha256": "a1e759c467250f6985d39d60f0fd78af8d0fddd5ae0f4f6749a4fc1c51ec58ad",
+          "captured_at_utc": "2026-10-12T12:16:07.848135+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001910851.json",
+          "sha256": "dc5cf4010365cf01fc59f5b5987bafb6f2d31e1f97e160f5109531cebde40473",
+          "captured_at_utc": "2026-10-12T12:16:08.827711+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://www.r1rcm.com/careers/jobs/him-release-of-information-manager",
+          "sha256": "e101bfdf83bb2eb793f53eaf62f7d6d519cd8ea177dd0dbedf7f469044adee27",
+          "captured_at_utc": "2026-10-12T12:19:59.906874+00:00"
+        },
+        {
+          "url": "https://www.r1rcm.com/terms-of-use",
+          "sha256": "43f0d6067974256ec539009ea3f0a5187d103a9689a92e3994dfd950ac309daf",
+          "captured_at_utc": "2026-10-12T12:16:08.105294+00:00"
+        }
+      ],
+      "review_receipt_sha256": "259d2c9b68563f6222aa59f443d632833fda6a3465a93685ed9696c76ff790ad"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "RYOJ.US",
+      "name": "rYojbaba Co., Ltd.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Current exact Nasdaq directory/SEC issuer caption; no tradability or price claim.",
+      "identifiers": {
+        "CIK": "2012600",
+        "exact_exchange_code": "RYOJ",
+        "security_class": "Common Shares (official Nasdaq directory label; caption only)"
+      },
+      "reviewed_at_utc": "2026-10-12T11:11:51.645241+00:00",
+      "expires_at_utc": "2026-10-19T11:11:51.645241+00:00",
+      "sources": [
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "59e7857c5b9da15c22497ff61eb50a5915494df4116e31d62c5b0597368f4d13",
+          "captured_at_utc": "2026-10-11T22:21:47.464855+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt",
+          "sha256": "6253cd52421b35c39fa604e5e2aa580d6d802e0341c19a7786062740ffdf5573",
+          "captured_at_utc": "2026-10-11T22:21:50.035233+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        }
+      ],
+      "review_receipt_sha256": "86272bd90b184ee3d910c89e27be3cf1f4514d73b9e4902fe7a6dce49f9f9642"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SEM.US",
+      "name": "Select Medical Holdings Corporation",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Former public common stock canceled/converted on acquisition; delisted; not an active listing or tradability certification",
+      "identifiers": {
+        "CIK": "0001320414",
+        "exact_exchange_code": "SEM",
+        "security_class": "Common Stock, par value $0.001 per share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1320414/000110465926079643/tm2619266d7_8k.htm",
+          "sha256": "1a2ef78a5e9dfab5896097b7afef44b0fe2f125f51a2a8618cd1b31d27de38bf",
+          "captured_at_utc": "2026-10-12T12:19:47.366598+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001320414.json",
+          "sha256": "1194c2f1da3ebc755f82d914174d771cbda15795a68c856f95dbd8dba0049680",
+          "captured_at_utc": "2026-10-12T12:19:47.658314+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7b67b0c79323684856531c0f2dcc733e0949cdef68cc305672bd5ed7330e9f73"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SILK.US",
+      "name": "Silk Road Medical, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NASDAQ common stock suspended before 2024-09-17 opening, cancelled/converted to cash; SEC 15-12G filed 2024-09-27.",
+      "identifiers": {
+        "CIK": "0001397702",
+        "exact_exchange_code": "SILK",
+        "security_class": "Common Stock, Par Value $0.001 Per Share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1397702/000114036124041264/ef20035938_8k.htm",
+          "sha256": "04a11058de7a1c14a0f745b7afc70cdca912971932481bd53836561a275c59e0",
+          "captured_at_utc": "2026-10-12T12:16:07.849414+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001397702.json",
+          "sha256": "750607c11f1cfec8938edeede86d4c1833f0e8f3261d3ffe32d0ede4dcb7b9fe",
+          "captured_at_utc": "2026-10-12T12:16:09.031508+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/885725/000088572526000010/exhibit21-listofsubsidiari.htm",
+          "sha256": "b0eb03a9621970fd430c6c703122be7cb557685dfad9daa30f64cab4a08260fc",
+          "captured_at_utc": "2026-10-12T12:17:16.170105+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0000885725.json",
+          "sha256": "5d348b260162f0ff9e72f1cdb4251338fb0cc11b7fe04da110e518e93c91f9af",
+          "captured_at_utc": "2026-10-12T12:20:36.453107+00:00"
+        },
+        {
+          "url": "https://silkroadmed.com/",
+          "sha256": "046b69ddf4e1770467c716edd6207228cec82fb93a6d57b8398b0fa075e114bc",
+          "captured_at_utc": "2026-10-12T12:17:16.171019+00:00"
+        }
+      ],
+      "review_receipt_sha256": "98dd5332a6cd29fdff94fb68913975093417e5890276da6f67f7cec11cf1bfbf"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SMAR.US",
+      "name": "Smartsheet Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NYSE Class A common stock ceased trading before 2025-01-22 opening and converted to merger consideration.",
+      "identifiers": {
+        "CIK": "0001366561",
+        "exact_exchange_code": "SMAR",
+        "security_class": "Class A common stock, no par value per share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1366561/000162828025002101/smar-20250122.htm",
+          "sha256": "7c4e547ecdbc864d959246b37e6b7b42a011d9ceedc4fde541fe960e87adb6ac",
+          "captured_at_utc": "2026-10-12T12:16:07.848857+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001366561.json",
+          "sha256": "dac518df475ad3eb8c023ceb20c88b68d5e4f575143448ea081ce0a7bef2e621",
+          "captured_at_utc": "2026-10-12T12:16:08.953143+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://www.smartsheet.com/legal/user-agreement",
+          "sha256": "ce3fae38adf202e76f5440dd7c7a49d92551a011d22e499021c701fbed045c0d",
+          "captured_at_utc": "2026-10-12T12:16:08.149864+00:00"
+        },
+        {
+          "url": "https://www.smartsheet.com/sites/default/files/2026-05/modern-slavery-act-statement-2026.pdf",
+          "sha256": "d224d68d641f51a8b3ffe57a22a0941d063524c50d1018e26f2f4392152d51cc",
+          "captured_at_utc": "2026-10-12T12:16:08.193193+00:00"
+        }
+      ],
+      "review_receipt_sha256": "fc22a4b59f148ce2d788d0c83592c1f93749bce50c6e902657a9dce7b8526c1e"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SVA.US",
+      "name": "Sinovac Biotech, Ltd.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Current exact Nasdaq directory/SEC issuer caption; no tradability or price claim.",
+      "identifiers": {
+        "CIK": "1084201",
+        "exact_exchange_code": "SVA",
+        "security_class": "caption only; security class not certified"
+      },
+      "reviewed_at_utc": "2026-10-12T11:11:51.645241+00:00",
+      "expires_at_utc": "2026-10-19T11:11:51.645241+00:00",
+      "sources": [
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "59e7857c5b9da15c22497ff61eb50a5915494df4116e31d62c5b0597368f4d13",
+          "captured_at_utc": "2026-10-11T22:21:47.464855+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt",
+          "sha256": "6253cd52421b35c39fa604e5e2aa580d6d802e0341c19a7786062740ffdf5573",
+          "captured_at_utc": "2026-10-11T22:21:50.035233+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        }
+      ],
+      "review_receipt_sha256": "fec6c362c59fc15d11c4e4f1009409607a42ec3e7864b49711c2a8b717e723b2"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "THS.US",
+      "name": "TreeHouse Foods, Inc.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Former public common stock canceled/converted on acquisition; delisted; not an active listing or tradability certification",
+      "identifiers": {
+        "CIK": "0001320695",
+        "exact_exchange_code": "THS",
+        "security_class": "Common Stock, $0.01 par value"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-11T22:22:50.019686+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1320695/000132069526000014/ths-20260211.htm",
+          "sha256": "6724599bf4e65bff78d1eefbcf1013753e5ae57ebf8be4f99aeeb4a67cae3634",
+          "captured_at_utc": "2026-10-12T12:19:47.873948+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1320695/000132069526000014/projecttaste-arcertificate.htm",
+          "sha256": "93e928e4edbcd12770eef4b63178d1facfdfabbd414ded73fea402a24175388e",
+          "captured_at_utc": "2026-10-12T12:19:48.379568+00:00"
+        },
+        {
+          "url": "https://www.treehousefoods.com/about-us/contingent-value-right--cvr/default.aspx",
+          "sha256": "9fd4e0ef921fd4d82a393da525b78957090e1d1eddd5f064c73a13c33a4485eb",
+          "captured_at_utc": "2026-10-12T12:19:48.385159+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001320695.json",
+          "sha256": "a658e01e9d59c4c1608d633ec54c83d4e895b80298da9e9f48b929c0be0ce64d",
+          "captured_at_utc": "2026-10-12T12:19:48.936775+00:00"
+        }
+      ],
+      "review_receipt_sha256": "780b7b9812ba30d96861b1531d56f0ad9ee3dd284bc33e682dc1697bf7e9ec81"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "TRTN.US",
+      "name": "Triton International Limited",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "NYSE common TRTN last traded 2023-09-27 and was cancelled/converted at 2023-09-28 merger. Continuing TRTN-PA through TRTN-PG are preference shares and are distinct securities.",
+      "identifiers": {
+        "CIK": "0001660734",
+        "exact_exchange_code": "TRTN",
+        "security_class": "Common shares, $0.01 par value per share"
+      },
+      "reviewed_at_utc": "2026-10-12T12:29:22.412536+00:00",
+      "expires_at_utc": "2026-10-19T12:29:22.412536+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1660734/000119312523245616/d551781d8k.htm",
+          "sha256": "bca67abf167db3123856785ca2b27d106d31d022353faae5aa8f45ed813847ec",
+          "captured_at_utc": "2026-10-12T12:16:08.034923+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0001660734.json",
+          "sha256": "6f7c416c99cd14223caa51001116a199cc4e342677e24dff3bac955a9a81541c",
+          "captured_at_utc": "2026-10-12T12:16:09.505016+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "d981e6f99ecf09c53163932671bab9aa6e3184e4cdecdd89ac0fd06805c21f88",
+          "captured_at_utc": "2026-10-12T12:19:02.526617+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1660734/000162828026051232/trtn-20260630.htm",
+          "sha256": "3a9f3b731a51c710daae8450ad8f363766be26519adbfa6ab402543d1a48f378",
+          "captured_at_utc": "2026-10-12T12:16:08.075298+00:00"
+        },
+        {
+          "url": "https://www.tritoninternational.com/company/investors-resources",
+          "sha256": "d38e1545b3414618cb4e3bbf2c8e7df6410608a4fb29ef8a8866bd50a5481da8",
+          "captured_at_utc": "2026-10-12T12:16:08.501435+00:00"
+        },
+        {
+          "url": "https://www.tritoninternational.com/news/press-release/91229/triton-international-announces-preliminary-election-results-in-connection-with-acquisition-by-brookfield-infrastructure",
+          "sha256": "4a164a2f46d601c1c60b471c6637206e8b4d1e6441839872681483b2a70c387c",
+          "captured_at_utc": "2026-10-12T12:17:16.980155+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e0fe0046f5fa87f106d84ae95024162678870668efc669dacc727f545bf2751a"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "CZAR.US",
+      "name": "Themes Natural Monopoly ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "scheduled_last_trading_day_2026-07-28; liquidation_expected_2026-07-31; completion_unverified",
+      "identifiers": {
+        "cusip": "882927809",
+        "series_id": "S000081024",
+        "class_id": "C000243663",
+        "exact_exchange_code": "CZAR",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker",
+        "CIK": "1976322"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/themesetftrust_497.htm",
+          "sha256": "73610b1b8765b3f87b83a7ec71480cb37534a0fde84b368a5004033f26efeef9",
+          "captured_at_utc": "2026-10-12T12:17:34.641283+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2023/InfoCircular/CZAR_Circular_NQ.pdf",
+          "sha256": "1c9b51a2d61373ac192ec7b94def81f08da5120e3d4acfdf3f9b1093de5119e3",
+          "captured_at_utc": "2026-10-12T12:22:13.450421+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000089418926001971/0000894189-26-001971-index.html",
+          "sha256": "6b082bd530faf19a92857eef0d439b98ea0bebee54fc237f5031a18ad7bd0c80",
+          "captured_at_utc": "2026-10-12T12:19:48.767715+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/0001829126-26-007289-index.html",
+          "sha256": "a282e0de2f13b8fc711dcb5612b44a78242df0b06a9d8ccb8238f26262047f14",
+          "captured_at_utc": "2026-10-12T12:17:34.642075+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "881be260124569092c487aac1a31137894f21ce6fd2fe90f45868acd5a411ca0"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "DEFA.US",
+      "name": "iShares Adaptive Currency Hedged MSCI EAFE ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G656",
+        "series_id": "S000052533",
+        "class_id": "C000164987",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "DEFA",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2016/infocircular/ishares01072016.pdf",
+          "sha256": "ab4b4602c51664618bc1eb483168c74fa104539a78a5b406a6145902607eb7bc",
+          "captured_at_utc": "2026-10-12T12:21:09.901883+00:00"
+        }
+      ],
+      "review_receipt_sha256": "92726178cb075dbdd67ec283cc29365c826f59875c232b244a70201918cc9121"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "EMBH.US",
+      "name": "iShares Interest Rate Hedged Emerging Markets Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46431W820",
+        "series_id": "S000044146",
+        "class_id": "C000137262",
+        "owner_cik": "0001524513",
+        "exact_exchange_code": "EMBH",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312522229997/0001193125-22-229997-index.html",
+          "sha256": "aabab265e870c8e25128d3c4ed3a0efe723dc02af225f6579611e5c7d909c945",
+          "captured_at_utc": "2026-10-12T12:12:53.925006+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2015/infocircular/ishares07232015.pdf",
+          "sha256": "9f25539585ecc5d202c5dcb137b6c306b02bb812c07f0534670887f305ebb966",
+          "captured_at_utc": "2026-10-12T12:21:11.518183+00:00"
+        }
+      ],
+      "review_receipt_sha256": "11a2f6978ba26add54887b1b38551501e9cff559396dd1ac34b6b986ac4f63a9"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "EWGS.US",
+      "name": "iShares MSCI Germany Small-Cap ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46429B465",
+        "series_id": "S000035387",
+        "class_id": "C000108738",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "EWGS",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523216004/0001193125-23-216004-index.htm",
+          "sha256": "55a1a7d0bac7f66117610e91ac4f3c57e581252e9a86f0e6130440cff4a7aa3c",
+          "captured_at_utc": "2026-10-12T12:15:53.528506+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2012/infocirculars/iShares01242012.pdf",
+          "sha256": "ba9d93b38793c9de6eba98f886b16d0c08d3a73e470bfe681ede3a242ee9db51",
+          "captured_at_utc": "2026-10-12T12:21:09.083546+00:00"
+        }
+      ],
+      "review_receipt_sha256": "14f0e87a95faf3d332995c9489b6325fd371f60cf99a0f9405e20a015a75e30a"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "FLFR.US",
+      "name": "Franklin FTSE France ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "official_closure_plan; scheduled_trading_cutoff_after_2023-11-09; liquidation_expected_2023-11-16; completion_not_independently_verified",
+      "identifiers": {
+        "cusip": "35473P793",
+        "series_id": "S000059510",
+        "class_id": "C000194944",
+        "exact_exchange_code": "FLFR",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1655589/000174177323003133/c497k.htm",
+          "sha256": "38bf90f39198991cb64034a0a6ec0caa405b1a4bd7ea26f89099f449ce667063",
+          "captured_at_utc": "2026-10-12T12:19:48.771055+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2017/infocircular/Franklin11062017.pdf",
+          "sha256": "97f4a657c0b72a487dd172056d9a6e1fe2068ea008059d7c3561569dc89d57a7",
+          "captured_at_utc": "2026-10-12T12:24:59.878455+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1655589/000174177323003133/0001741773-23-003133-index.html",
+          "sha256": "901880b68b9c23e07413d214df9f9eba1c957631edb2682844b7723685cb424b",
+          "captured_at_utc": "2026-10-12T12:19:48.772462+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1655589/000175272425135528/0001752724-25-135528-index.html",
+          "sha256": "5092864ec08f79ea05efad8b72283f9c5be973302d626526d7566f66c907fac1",
+          "captured_at_utc": "2026-10-12T12:22:13.446685+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "44b3c90a3966e65ad4d28041ac845f76ebabc8a9b2aef6cda13b44ca7a82a728"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HEWC.US",
+      "name": "iShares Currency Hedged MSCI Canada ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G706",
+        "series_id": "S000049794",
+        "class_id": "C000157305",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "HEWC",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523216004/0001193125-23-216004-index.htm",
+          "sha256": "55a1a7d0bac7f66117610e91ac4f3c57e581252e9a86f0e6130440cff4a7aa3c",
+          "captured_at_utc": "2026-10-12T12:15:53.528506+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2015/infocircular/ishares07012015.pdf",
+          "sha256": "31ec0f42d49d3ec3875e5885853e11c090cea15942d6e70f402d732fbfbcc835",
+          "captured_at_utc": "2026-10-12T12:19:52.748997+00:00"
+        }
+      ],
+      "review_receipt_sha256": "787916fc803d468077acfd238e61a80238a30b42c7f10e352596b95ed2af89ea"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HEWG.US",
+      "name": "iShares Currency Hedged MSCI Germany ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434V704",
+        "series_id": "S000043042",
+        "class_id": "C000133233",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "HEWG",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312524157424/0001193125-24-157424-index.html",
+          "sha256": "20b4da8f853415583ff4ee4fc9f66e47dfbb00990e359e7d35ef0c5e712abc2a",
+          "captured_at_utc": "2026-10-12T12:12:05.678825+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2014/infocircular/iShares02032014.pdf",
+          "sha256": "7abaf066770e4874895d684ccbca8992df81fee5b2ad3114a215ef71ba5ef3c2",
+          "captured_at_utc": "2026-10-12T12:21:09.014619+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b96feaca343a07786409d04a3aa3f18def21b40fa65d44e72f5a3bb2ecc89161"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HEWU.US",
+      "name": "iShares Currency Hedged MSCI United Kingdom ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G862",
+        "series_id": "S000049801",
+        "class_id": "C000157312",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "HEWU",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523216004/0001193125-23-216004-index.htm",
+          "sha256": "55a1a7d0bac7f66117610e91ac4f3c57e581252e9a86f0e6130440cff4a7aa3c",
+          "captured_at_utc": "2026-10-12T12:15:53.528506+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2015/infocircular/ishares07012015.pdf",
+          "sha256": "31ec0f42d49d3ec3875e5885853e11c090cea15942d6e70f402d732fbfbcc835",
+          "captured_at_utc": "2026-10-12T12:19:52.748997+00:00"
+        }
+      ],
+      "review_receipt_sha256": "46f4291225996fa0e864e92733f61ac1f8d21c412bf898ff671242827b748595"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HEWW.US",
+      "name": "iShares Currency Hedged MSCI Mexico ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G805",
+        "series_id": "S000049797",
+        "class_id": "C000157308",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "HEWW",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2015/infocircular/ishares07012015.pdf",
+          "sha256": "31ec0f42d49d3ec3875e5885853e11c090cea15942d6e70f402d732fbfbcc835",
+          "captured_at_utc": "2026-10-12T12:19:52.748997+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f9f1790906dfe4e7b0b221f61b2d10dbbd787f0897fbdf30f319688deb8753bd"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HJPX.US",
+      "name": "iShares Currency Hedged JPX-Nikkei 400 ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G722",
+        "series_id": "S000050721",
+        "class_id": "C000160171",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "HJPX",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312522229997/0001193125-22-229997-index.html",
+          "sha256": "aabab265e870c8e25128d3c4ed3a0efe723dc02af225f6579611e5c7d909c945",
+          "captured_at_utc": "2026-10-12T12:12:53.925006+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2015/infocircular/HJPXcircular.pdf",
+          "sha256": "cd797369c0854b158dd229cb7dbc92acbdeeda285fc54d72d2ecabdc71556bdb",
+          "captured_at_utc": "2026-10-12T12:19:52.814272+00:00"
+        }
+      ],
+      "review_receipt_sha256": "9f64e9cbcd2be4fde5d0dba18d30d4ab3b908e2e6e21ec4d9c844c58290b8436"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "HWAY.US",
+      "name": "Themes US Infrastructure ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "scheduled_last_trading_day_2026-07-28; liquidation_expected_2026-07-31; completion_unverified",
+      "identifiers": {
+        "cusip": "882927726",
+        "series_id": "S000085500",
+        "class_id": "C000250783",
+        "exact_exchange_code": "HWAY",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker",
+        "CIK": "1976322"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/themesetftrust_497.htm",
+          "sha256": "73610b1b8765b3f87b83a7ec71480cb37534a0fde84b368a5004033f26efeef9",
+          "captured_at_utc": "2026-10-12T12:17:34.641283+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2024/InfoCircular/HWAY_Circular_NQ.pdf",
+          "sha256": "4a08fa5703a2914840b98b70581df402207e1a9cfa8bf26ab6be0c1fc9a1f78e",
+          "captured_at_utc": "2026-10-12T12:22:13.447443+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000089418926001971/0000894189-26-001971-index.html",
+          "sha256": "6b082bd530faf19a92857eef0d439b98ea0bebee54fc237f5031a18ad7bd0c80",
+          "captured_at_utc": "2026-10-12T12:19:48.767715+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/0001829126-26-007289-index.html",
+          "sha256": "a282e0de2f13b8fc711dcb5612b44a78242df0b06a9d8ccb8238f26262047f14",
+          "captured_at_utc": "2026-10-12T12:17:34.642075+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e86b66ebbc0c80807fc384aa4f71cbb7c59b00f72a5c7191166e91d370c8e4cc"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IAUF.US",
+      "name": "iShares Gold Strategy ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46431W614",
+        "series_id": "S000061161",
+        "class_id": "C000198135",
+        "owner_cik": "0001524513",
+        "exact_exchange_code": "IAUF",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312524157424/0001193125-24-157424-index.html",
+          "sha256": "20b4da8f853415583ff4ee4fc9f66e47dfbb00990e359e7d35ef0c5e712abc2a",
+          "captured_at_utc": "2026-10-12T12:12:05.678825+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2018/infocircular/IAUFcircular.pdf",
+          "sha256": "03062918251eed0042c1516560e85577d632b1897145b816d23d07ba72c900ff",
+          "captured_at_utc": "2026-10-12T12:19:52.681814+00:00"
+        }
+      ],
+      "review_receipt_sha256": "2e891bc7d4eb0263eba8596cd7585161779d574fc8bb15b7c7f490ec0ad24eaf"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBCE.US",
+      "name": "iShares iBonds Mar 2023 Term Corporate ex-Financials ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46432FAN7",
+        "series_id": "S000039663",
+        "class_id": "C000122833",
+        "exact_exchange_code": "IBCE",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "34c06df95517d3b9facd5a4ba04e6e41944b45436dc1136416071e893679a86e"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDD.US",
+      "name": "iShares iBonds Mar 2023 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46432FAZ0",
+        "series_id": "S000040347",
+        "class_id": "C000125276",
+        "exact_exchange_code": "IBDD",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "3b4eed709412f901f8839510689a5b526b2088f373326e20b452888c2d304a3a"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDM.US",
+      "name": "iShares iBonds Dec 2021 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434VBK5",
+        "series_id": "S000048149",
+        "class_id": "C000152176",
+        "exact_exchange_code": "IBDM",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "d37fcaeaafcfe54659f234e9533a926d283673cc440c526b31d4a8881ac7be3d"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDN.US",
+      "name": "iShares iBonds Dec 2022 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434VBA7",
+        "series_id": "S000048150",
+        "class_id": "C000152177",
+        "exact_exchange_code": "IBDN",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a255e12ac150a1e50979b2661ad89fd0f82ff71ea209a838485f9303aedce3a8"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDO.US",
+      "name": "iShares iBonds Dec 2023 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434VAX8",
+        "series_id": "S000048151",
+        "class_id": "C000152178",
+        "exact_exchange_code": "IBDO",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "8d17ddd305dc6f7fe17e14603190ab208c196ee8bef92cb5bcfa6364c7723c94"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDP.US",
+      "name": "iShares iBonds Dec 2024 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434VBG4",
+        "series_id": "S000048152",
+        "class_id": "C000152179",
+        "exact_exchange_code": "IBDP",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/0001193125-24-281940-index.htm",
+          "sha256": "9ec1cd81344b2e61d5617d2d67e7b29e7018679a11943ff4316380490fb00201",
+          "captured_at_utc": "2026-10-12T12:12:21.290533+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/d826977d497.htm",
+          "sha256": "c5ab2d46f88f146aa992a93a48fcd43575f842e2a556ea84d5473d0d46ce8c01",
+          "captured_at_utc": "2026-10-12T12:16:06.392754+00:00"
+        }
+      ],
+      "review_receipt_sha256": "c0a0057eb77371902c38ac53dd406d988b21e10ecf6465bb7d3e21c25583716c"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBDQ.US",
+      "name": "iShares iBonds Dec 2025 Term Corporate ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434VBD1",
+        "series_id": "S000048153",
+        "class_id": "C000152180",
+        "exact_exchange_code": "IBDQ",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312525240193/0001193125-25-240193-index.htm",
+          "sha256": "8dd7412b419d5c07ac5fe1f0d8355d654964dbd64e7c582213bb55381963e50e",
+          "captured_at_utc": "2026-10-12T12:12:21.291749+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312525240193/d46937d497.htm",
+          "sha256": "87c0fb8f8b271a766e6b0fbd36e4be6a514eb4b00d6e40aff8daeaff9fe54364",
+          "captured_at_utc": "2026-10-12T12:16:06.393760+00:00"
+        }
+      ],
+      "review_receipt_sha256": "d1c93c3b9b3832d209eb99fface8d9d704632fd00d1488226cfbf9bbe5869fb8"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBHA.US",
+      "name": "iShares iBonds 2021 Term High Yield and Income ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U226",
+        "series_id": "S000065337",
+        "class_id": "C000211396",
+        "exact_exchange_code": "IBHA",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "57458a566518eae24ef04a73e1f35b2eb13bfce2713bd7e395f351f6cb3837a9"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBHB.US",
+      "name": "iShares iBonds 2022 Term High Yield and Income ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U176",
+        "series_id": "S000065339",
+        "class_id": "C000211398",
+        "exact_exchange_code": "IBHB",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "508d7d88c6aff9790c9540888d6f3536f4cbaf01a016af9904979dc1f92637cd"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBHC.US",
+      "name": "iShares iBonds 2023 Term High Yield and Income ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U150",
+        "series_id": "S000065341",
+        "class_id": "C000211400",
+        "exact_exchange_code": "IBHC",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7b38d6ef21a3154dc2066ce4329a87184c74fb9edc1db1125b4f579594d251af"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBHD.US",
+      "name": "iShares iBonds 2024 Term High Yield and Income ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U184",
+        "series_id": "S000065343",
+        "class_id": "C000211402",
+        "exact_exchange_code": "IBHD",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/0001193125-24-281940-index.htm",
+          "sha256": "9ec1cd81344b2e61d5617d2d67e7b29e7018679a11943ff4316380490fb00201",
+          "captured_at_utc": "2026-10-12T12:12:21.290533+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/d826977d497.htm",
+          "sha256": "c5ab2d46f88f146aa992a93a48fcd43575f842e2a556ea84d5473d0d46ce8c01",
+          "captured_at_utc": "2026-10-12T12:16:06.392754+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f62093076736d6896e0ff28dcc1725a177d3da53957c392ac236c55237baeb54"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBMJ.US",
+      "name": "iShares iBonds Dec 2021 Term Muni Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G789",
+        "series_id": "S000048147",
+        "class_id": "C000152174",
+        "exact_exchange_code": "IBMJ",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "35b025155bb1c6c8d1fcbd2375546dfe3b755c05f6c5507c76cefc7eaef713a2"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBMK.US",
+      "name": "iShares iBonds Dec 2022 Term Muni Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G755",
+        "series_id": "S000049023",
+        "class_id": "C000154546",
+        "exact_exchange_code": "IBMK",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "d846e12e0ec58dbed47c423aabd9b4a756b567e4f68977f29bff40ab906072ff"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBML.US",
+      "name": "iShares iBonds Dec 2023 Term Muni Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435G318",
+        "series_id": "S000054724",
+        "class_id": "C000171897",
+        "exact_exchange_code": "IBML",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "c784b93127277f5b911e73422315c6d334362ae6f0b5bdabf3541a2fd68f9648"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBMM.US",
+      "name": "iShares iBonds Dec 2024 Term Muni Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U697",
+        "series_id": "S000054725",
+        "class_id": "C000171898",
+        "exact_exchange_code": "IBMM",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e8cc13b604f6e5754c46a987bf35c82e7dfed99aa365ce05e28885ccc3d291b9"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBMN.US",
+      "name": "iShares iBonds Dec 2025 Term Muni Bond ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U432",
+        "series_id": "S000063114",
+        "class_id": "C000204675",
+        "exact_exchange_code": "IBMN",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312519233631/0001193125-19-233631-index.htm",
+          "sha256": "4d02d5d99b0b37a995936d7167bdbef080a6a6901f505f8e3508822b8a748655",
+          "captured_at_utc": "2026-10-12T12:12:21.291182+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a543ebe4becbf4bb91697fd394cd0fc63c58008b1e447adb10c09b5ef521f024"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBTB.US",
+      "name": "iShares iBonds Dec 2022 Term Treasury ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46436E809",
+        "series_id": "S000067557",
+        "class_id": "C000217182",
+        "exact_exchange_code": "IBTB",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "07c06604922998ce58eee74de57993291fc25d9c899212ea65722d56a7493718"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBTD.US",
+      "name": "iShares iBonds Dec 2023 Term Treasury ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46436E882",
+        "series_id": "S000067558",
+        "class_id": "C000217184",
+        "exact_exchange_code": "IBTD",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "0cce7b41cc3399596c7d21cb65a60743ef8163b9f8e830952a4de969af484ace"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBTE.US",
+      "name": "iShares iBonds Dec 2024 Term Treasury ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46436E874",
+        "series_id": "S000067559",
+        "class_id": "C000217185",
+        "exact_exchange_code": "IBTE",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/0001193125-24-281940-index.htm",
+          "sha256": "9ec1cd81344b2e61d5617d2d67e7b29e7018679a11943ff4316380490fb00201",
+          "captured_at_utc": "2026-10-12T12:12:21.290533+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524281940/d826977d497.htm",
+          "sha256": "c5ab2d46f88f146aa992a93a48fcd43575f842e2a556ea84d5473d0d46ce8c01",
+          "captured_at_utc": "2026-10-12T12:16:06.392754+00:00"
+        }
+      ],
+      "review_receipt_sha256": "3174651dc4e895bf386b9802b131848ef9f155f6a369c71a8c0f38940ddc3538"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IBTF.US",
+      "name": "iShares iBonds Dec 2025 Term Treasury ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46436E866",
+        "series_id": "S000067560",
+        "class_id": "C000217186",
+        "exact_exchange_code": "IBTF",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "2fd09075a847a998d99c4e5b13a08ed44c8ae8e458a2dfe95b915d2351546e9e",
+          "captured_at_utc": "2026-10-12T12:11:27.077675+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/us/literature/tax-information/qualified-interest-income-qii-percentages-2021.pdf",
+          "sha256": "d8c90cfe87369114a0892259105135005dbd6817c57b0e2cdafdb670be1c48cf",
+          "captured_at_utc": "2026-10-12T12:13:52.216722+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521062934/0001193125-21-062934-index.htm",
+          "sha256": "ec6709f7b49ebf006b568c7bd7111e9a3ec76665a91c68895e172ce7efed0375",
+          "captured_at_utc": "2026-10-12T12:12:21.582368+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312523000442/0001193125-23-000442-index.htm",
+          "sha256": "53f0a87bb51671a08a9a0ab4712d54969e0d845e5fcd5a2ee7a594deae7d0999",
+          "captured_at_utc": "2026-10-12T12:12:21.289560+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312525240193/0001193125-25-240193-index.htm",
+          "sha256": "8dd7412b419d5c07ac5fe1f0d8355d654964dbd64e7c582213bb55381963e50e",
+          "captured_at_utc": "2026-10-12T12:12:21.291749+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312525240193/d46937d497.htm",
+          "sha256": "87c0fb8f8b271a766e6b0fbd36e4be6a514eb4b00d6e40aff8daeaff9fe54364",
+          "captured_at_utc": "2026-10-12T12:16:06.393760+00:00"
+        }
+      ],
+      "review_receipt_sha256": "eb3db4c746349d2ec1a77bfac0f9294b830cdf3b24d10654ff1795ce98f823c0"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "ICOL.US",
+      "name": "iShares MSCI Colombia ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46434G202",
+        "series_id": "S000040976",
+        "class_id": "C000127144",
+        "owner_cik": "0000930667",
+        "exact_exchange_code": "ICOL",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312522229997/0001193125-22-229997-index.html",
+          "sha256": "aabab265e870c8e25128d3c4ed3a0efe723dc02af225f6579611e5c7d909c945",
+          "captured_at_utc": "2026-10-12T12:12:53.925006+00:00"
+        },
+        {
+          "url": "https://classic.nasdaqtrader.com/content/newsalerts/2013/infocircular/ICOLcircular.pdf",
+          "sha256": "906e64a95f4a9cfd0eb0b2b69ddad9f4a3dc0f3ef201e4a7dd04d3396a2482dc",
+          "captured_at_utc": "2026-10-12T12:21:09.486250+00:00"
+        }
+      ],
+      "review_receipt_sha256": "cf239b76959d12a67716226fc5459178ed7d4033f3f0fd26b40ab408f736fd44"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IECS.US",
+      "name": "iShares Evolved U.S. Consumer Staples ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46431W671",
+        "series_id": "S000061254",
+        "class_id": "C000198374",
+        "owner_cik": "0001524513",
+        "exact_exchange_code": "IECS",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312522229997/0001193125-22-229997-index.html",
+          "sha256": "aabab265e870c8e25128d3c4ed3a0efe723dc02af225f6579611e5c7d909c945",
+          "captured_at_utc": "2026-10-12T12:12:53.925006+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2018/infocircular/iShares03232018.pdf",
+          "sha256": "579ebfabbffb104e70bc6bae6415d96f866e0a6a01886bab72c49fefbc8d2e7d",
+          "captured_at_utc": "2026-10-12T12:21:09.055391+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b96ae648085d7a031fee37b025bae2b8c59568fc4688690ca54b7d3f253e719a"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "JKH.US",
+      "name": "iShares Morningstar Mid-Cap Growth ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "historical_ticker_replaced_current_fund_active",
+      "identifiers": {
+        "cusip": "464288307",
+        "series_id": "S000004430",
+        "class_id": "C000012193",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "JKH",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/239583/ishares-morningstar-mid-cap-growth-etf",
+          "sha256": "1adbb5ac8a4a811e7dcaedcbb7467df6706e42f46395947988d084a3bf67943c",
+          "captured_at_utc": "2026-10-12T12:16:36.504762+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312513350187/0001193125-13-350187-index.htm",
+          "sha256": "2111f7728d953bd875b41c291b3dcb6f3e5ade33ab7b3274cb088ab4f1f632a0",
+          "captured_at_utc": "2026-10-12T12:14:18.470136+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312520317481/d221060d497.htm",
+          "sha256": "999194ae8ee387f3f38a2b1ec8e3c88812f9860e6946b2edf0fcec0e81d975cb",
+          "captured_at_utc": "2026-10-12T12:16:36.395153+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312520318198/d73267ddefa14a.htm",
+          "sha256": "7c9a75c8754259beb97da7014f92f1772f019ddf5ce58ff454afe2127ecaa0ef",
+          "captured_at_utc": "2026-10-12T12:16:36.254042+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/ch/professionals/en/products/239583/ishares-morningstar-mid-cap-growth-etf",
+          "sha256": "9ab53db06e069d83fb4dd122d032c8ed17cbeda6c5d64d758bd2a8cdf337d960",
+          "captured_at_utc": "2026-10-12T12:16:37.743814+00:00"
+        }
+      ],
+      "review_receipt_sha256": "39b6ef652de783ab0a2d6483c11d73a55b5ee32a5b4064ea9259678187248957"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "JKK.US",
+      "name": "iShares Morningstar Small-Cap Growth ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "historical_ticker_replaced_current_fund_active",
+      "identifiers": {
+        "cusip": "464288604",
+        "series_id": "S000004434",
+        "class_id": "C000012197",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "JKK",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/239587/ishares-morningstar-small-cap-growth-etf",
+          "sha256": "93762e96844acacbaf617371e1e0733b9cecf2e525dc47da063faa5629ebfeb1",
+          "captured_at_utc": "2026-10-12T12:16:36.536151+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312513350187/0001193125-13-350187-index.htm",
+          "sha256": "2111f7728d953bd875b41c291b3dcb6f3e5ade33ab7b3274cb088ab4f1f632a0",
+          "captured_at_utc": "2026-10-12T12:14:18.470136+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312520317481/d221060d497.htm",
+          "sha256": "999194ae8ee387f3f38a2b1ec8e3c88812f9860e6946b2edf0fcec0e81d975cb",
+          "captured_at_utc": "2026-10-12T12:16:36.395153+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312520318198/d73267ddefa14a.htm",
+          "sha256": "7c9a75c8754259beb97da7014f92f1772f019ddf5ce58ff454afe2127ecaa0ef",
+          "captured_at_utc": "2026-10-12T12:16:36.254042+00:00"
+        },
+        {
+          "url": "https://www.ishares.com/ch/professionals/en/products/239587/ishares-morningstar-small-cap-growth-etf",
+          "sha256": "9e81c94b96a7919eaf7da174c70cbf2974c6605e0db311d6f9918bef22429517",
+          "captured_at_utc": "2026-10-12T12:16:38.251314+00:00"
+        }
+      ],
+      "review_receipt_sha256": "325c33e6ab0314338a3112f8b3f1fc67e3665192ddd2205a79f0693097561d28"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "MIDF.US",
+      "name": "iShares MSCI USA Mid-Cap Multifactor ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "closed_liquidated",
+      "identifiers": {
+        "cusip": "46435U143",
+        "series_id": "S000065416",
+        "class_id": "C000211556",
+        "owner_cik": "0001100663",
+        "exact_exchange_code": "MIDF",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.ishares.com/us/products/closed-funds/updates",
+          "sha256": "1da80b2ee58aa31ef663f5488271c6dc6ee9890634a2d17b5c90c466b90db654",
+          "captured_at_utc": "2026-10-12T12:12:04.458027+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521213714/0001193125-21-213714-index.htm",
+          "sha256": "56af4c4c7d6c0bf7310610d6ae25fa21d583bd4ddba2945d5c79c4cb85065764",
+          "captured_at_utc": "2026-10-12T12:12:53.523525+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1524513/000119312522229997/0001193125-22-229997-index.html",
+          "sha256": "aabab265e870c8e25128d3c4ed3a0efe723dc02af225f6579611e5c7d909c945",
+          "captured_at_utc": "2026-10-12T12:12:53.925006+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2019/infocircular/MIDFcircular.pdf",
+          "sha256": "23cbec8f4a59026375e9290ef7cd46a5915975b36d47737d28f398eaa5503920",
+          "captured_at_utc": "2026-10-12T12:19:52.717166+00:00"
+        }
+      ],
+      "review_receipt_sha256": "6811f733957a57d8822a1538fb162ce241da2958ab305c240032da37629c44a8"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "USRD.US",
+      "name": "Themes US R&D Champions ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "scheduled_last_trading_day_2026-07-28; liquidation_expected_2026-07-31; completion_unverified",
+      "identifiers": {
+        "cusip": "882927874",
+        "series_id": "S000081033",
+        "class_id": "C000243672",
+        "exact_exchange_code": "USRD",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker",
+        "CIK": "1976322"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/themesetftrust_497.htm",
+          "sha256": "73610b1b8765b3f87b83a7ec71480cb37534a0fde84b368a5004033f26efeef9",
+          "captured_at_utc": "2026-10-12T12:17:34.641283+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/content/newsalerts/2023/InfoCircular/USRD_Circular_NQ.pdf",
+          "sha256": "7e55f014ab12496e4a32b5718117f7888597d214eb08b130053db6ad0c56af31",
+          "captured_at_utc": "2026-10-12T12:22:13.451966+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000089418926001971/0000894189-26-001971-index.html",
+          "sha256": "6b082bd530faf19a92857eef0d439b98ea0bebee54fc237f5031a18ad7bd0c80",
+          "captured_at_utc": "2026-10-12T12:19:48.767715+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1976322/000182912626007289/0001829126-26-007289-index.html",
+          "sha256": "a282e0de2f13b8fc711dcb5612b44a78242df0b06a9d8ccb8238f26262047f14",
+          "captured_at_utc": "2026-10-12T12:17:34.642075+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "23a85e417c40d44e9434f64cc20b44e79187ee9e4be24cbcc86bdb75c47e1eef"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "VFLQ.US",
+      "name": "Vanguard U.S. Liquidity Factor ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "issuer_confirmed_completely_liquidated_2022-11-28",
+      "identifiers": {
+        "cusip": "921935300",
+        "series_id": "S000061300",
+        "class_id": "C000198464",
+        "exact_exchange_code": "VFLQ",
+        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+      },
+      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
+      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "sources": [
+        {
+          "url": "https://personal.vanguard.com/pdf/form-8937-us-liquidity-factor-etf.pdf",
+          "sha256": "f57e7ff1f470488bf1874a14571c5949a1e3bc02f3f3853993bb30dd14998eae",
+          "captured_at_utc": "2026-10-12T12:18:51.078805+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/105563/000168386322005251/0001683863-22-005251-index.html",
+          "sha256": "b32e72f65bc2c913d49396884f3b0be9af5f1724b0bd19082b5bea83c0afacbd",
+          "captured_at_utc": "2026-10-12T12:17:34.646512+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/105563/000110465925016068/0001104659-25-016068-index.htm",
+          "sha256": "4e800ce16cf3d07851c49c6c7a868560b8f80a168fab229a0b68b0144a774748",
+          "captured_at_utc": "2026-10-12T12:17:35.121733+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/files/company_tickers_mf.json",
+          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
+          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+        }
+      ],
+      "review_receipt_sha256": "dc0d3af55bc2c7ed0004154ce807c13a61bd4d3bd227071baa5ce00fb51cc0d6"
+    }
+  ]
+}
