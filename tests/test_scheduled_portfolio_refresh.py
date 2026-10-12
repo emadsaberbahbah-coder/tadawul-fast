@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +41,7 @@ def step_script(name: str, substitutions=None) -> str:
     return script
 
 
-def resolve(tmp_path, *, event="schedule", mode="", keys=LEGACY_KEYS, single=""):
+def resolve(tmp_path, *, event="schedule", mode="", keys=LEGACY_KEYS, single="", include_portfolio=None):
     output = tmp_path / "github_env"
     output.write_text("", encoding="utf-8")
     env = {
@@ -55,6 +56,8 @@ def resolve(tmp_path, *, event="schedule", mode="", keys=LEGACY_KEYS, single="")
         "VAR_DEFAULT_KEYS": keys,
         "SECRET_CREDS": json.dumps({"client_email": "fixture@example.invalid"}),
     }
+    if include_portfolio is not None:
+        env["INPUT_INCLUDE_PORTFOLIO"] = include_portfolio
     assert shutil.which("bash") and shutil.which("jq"), "Actions shell tools are required"
     proc = subprocess.run(
         ["bash", "-c", step_script("⚙️ Smart Configuration Resolution (robust for schedule + manual)")],
@@ -77,9 +80,56 @@ def test_real_scheduled_override_includes_portfolio(tmp_path, keys):
     assert values["SYNC_KEYS"].split() == LEGACY_KEYS.split() + ["MY_PORTFOLIO"]
 
 
+def test_portfolio_full_sync_opt_in_is_a_scoped_boolean_with_false_default():
+    workflow = yaml.load(DAILY.read_text(), Loader=yaml.BaseLoader)
+    control = workflow["on"]["workflow_dispatch"]["inputs"]["include_portfolio"]
+    assert control["type"] == "boolean" and control["default"] == "false"
+    assert control["required"] == "false"
+    step = next(item for item in workflow["jobs"]["sync-dashboard"]["steps"]
+                if item.get("id") == "smart_config")
+    assert step["env"]["INPUT_INCLUDE_PORTFOLIO"] == "${{ github.event.inputs.include_portfolio }}"
+    assert "INPUT_INCLUDE_PORTFOLIO" not in workflow.get("env", {})
+    assert "INPUT_INCLUDE_PORTFOLIO" not in workflow["jobs"]["sync-dashboard"].get("env", {})
+
+
+@pytest.mark.parametrize("keys", [LEGACY_KEYS, LEGACY_KEYS.lower().replace(" ", ","),
+                                  json.dumps(LEGACY_KEYS.split()), "GLOBAL_MARKETS COMMODITIES_FX"])
+def test_manual_full_sync_opt_in_adds_only_portfolio_after_legacy_keys(tmp_path, keys):
+    proc, values = resolve(tmp_path, event="workflow_dispatch", mode="full_sync", keys=keys,
+                           include_portfolio="true")
+    assert proc.returncode == 0, proc.stderr
+    expected = "GLOBAL_MARKETS COMMODITIES_FX" if keys.startswith("GLOBAL_MARKETS") else LEGACY_KEYS
+    assert values["RUN_MODE"] == "full_sync"
+    assert values["SYNC_KEYS"].split() == expected.split() + ["MY_PORTFOLIO"]
+
+
+@pytest.mark.parametrize("choice", [None, "", "false", "off", "invalid", "1", "TRUE"])
+def test_manual_full_sync_requires_exact_true_to_expand_legacy_scope(tmp_path, choice):
+    proc, values = resolve(tmp_path, event="workflow_dispatch", mode="full_sync",
+                           include_portfolio=choice)
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"] == LEGACY_KEYS
+
+
+def test_false_opt_in_preserves_portfolio_already_in_canonical_defaults(tmp_path):
+    proc, values = resolve(tmp_path, event="workflow_dispatch", mode="full_sync", keys="",
+                           include_portfolio="false")
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"].split() == ["MARKET_LEADERS", "GLOBAL_MARKETS", "MUTUAL_FUNDS",
+        "COMMODITIES_FX", "MY_PORTFOLIO", "INSIGHTS_ANALYSIS", "TOP_10_INVESTMENTS", "DATA_DICTIONARY"]
+
+
+@pytest.mark.parametrize("choice", ["false", "invalid"])
+def test_scheduled_full_sync_still_includes_portfolio_without_manual_opt_in(tmp_path, choice):
+    proc, values = resolve(tmp_path, include_portfolio=choice)
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"].split() == LEGACY_KEYS.split() + ["MY_PORTFOLIO"]
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
 @pytest.mark.parametrize("keys", ["MY_PORTFOLIO MARKET_LEADERS", "MY_PORTFOLIO,MY_PORTFOLIO,GLOBAL_MARKETS", ""])
-def test_existing_portfolio_is_not_duplicated_or_reordered(tmp_path, keys):
-    proc, values = resolve(tmp_path, keys=keys)
+def test_existing_portfolio_is_not_duplicated_or_reordered(tmp_path, keys, event):
+    proc, values = resolve(tmp_path, event=event, include_portfolio="true", keys=keys)
     assert proc.returncode == 0, proc.stderr
     actual = values["SYNC_KEYS"].split()
     assert actual.count("MY_PORTFOLIO") == 1
@@ -94,24 +144,34 @@ def test_manual_and_ci_subset_requests_are_preserved(tmp_path, event):
     assert values["SYNC_KEYS"] == "GLOBAL_MARKETS COMMODITIES_FX"
 
 
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+def test_ci_events_cannot_expand_scope_with_portfolio_opt_in(tmp_path, event):
+    proc, values = resolve(tmp_path, event=event, mode="full_sync", include_portfolio="true")
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"] == LEGACY_KEYS
+
+
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
 @pytest.mark.parametrize("key", ["GLOBAL_MARKETS", "MY_PORTFOLIO"])
 def test_single_key_is_never_expanded(tmp_path, event, key):
-    proc, values = resolve(tmp_path, event=event, mode="single_key", single=key)
+    proc, values = resolve(tmp_path, event=event, mode="single_key", single=key, include_portfolio="true")
     assert proc.returncode == 0, proc.stderr
     assert values["SYNC_KEYS"] == key
 
 
-def test_health_only_is_not_expanded(tmp_path):
-    proc, values = resolve(tmp_path, mode="health_only", keys="COMMODITIES_FX")
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+def test_health_only_is_not_expanded(tmp_path, event):
+    proc, values = resolve(tmp_path, event=event, mode="health_only", keys="COMMODITIES_FX",
+                           include_portfolio="true")
     assert proc.returncode == 0, proc.stderr
     assert values["RUN_MODE"] == "health_only"
     assert values["SYNC_KEYS"] == "COMMODITIES_FX"
 
 
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
 @pytest.mark.parametrize("keys", ["UNKNOWN_PAGE", "KSA_TADAWUL ADVISOR_CRITERIA", "GLOBAL_MARKETS WRONG_PAGE"])
-def test_invalid_or_empty_sanitized_override_still_fails_before_publish(tmp_path, keys):
-    proc, values = resolve(tmp_path, keys=keys)
+def test_invalid_or_empty_sanitized_override_still_fails_before_publish(tmp_path, keys, event):
+    proc, values = resolve(tmp_path, event=event, keys=keys, include_portfolio="true")
     assert proc.returncode != 0
     assert "SYNC_KEYS" not in values
 

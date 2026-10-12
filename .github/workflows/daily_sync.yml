@@ -44,6 +44,11 @@ on:
         required: false
         default: "MARKET_LEADERS"
         type: string
+      include_portfolio:
+        description: "Include My_Portfolio in a manual full_sync when the configured key list omits it"
+        required: false
+        default: false
+        type: boolean
       rank_mode:
         description: "Whole-page ranking override for this run (inherit repository variable)"
         required: false
@@ -773,6 +778,7 @@ jobs:
           INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
           INPUT_MODE: ${{ github.event.inputs.run_mode }}
           INPUT_KEY: ${{ github.event.inputs.single_key }}
+          INPUT_INCLUDE_PORTFOLIO: ${{ github.event.inputs.include_portfolio }}
           INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
 
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
@@ -924,10 +930,13 @@ jobs:
 
           validate_keys_allowed "$KEYS"
 
-          # Scheduled full refreshes must include the active portfolio even
-          # when a legacy DEFAULT_SYNC_KEYS override omits it. Preserve manual
-          # subset requests, health-only mode, validated keys and key order.
-          if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "$MODE" == "full_sync" ]]; then
+          # (2026-10-12) Scheduled full refreshes include the active portfolio
+          # despite a legacy key list. Manual full_sync can explicitly opt in;
+          # absent/false/invalid inputs preserve the requested subset. Single-key
+          # and health-only scope and the portfolio no-clear path stay intact.
+          if [[ "$MODE" == "full_sync" &&
+                ( "${GITHUB_EVENT_NAME:-}" == "schedule" ||
+                  ( "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_INCLUDE_PORTFOLIO:-false}" == "true" ) ) ]]; then
             KEYS="$(sanitize_keys "$KEYS MY_PORTFOLIO")"
           fi
 
