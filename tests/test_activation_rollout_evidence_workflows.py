@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from tests.test_approved_universe_workflow import workflow
+from tests.test_scheduled_portfolio_refresh import accepts
 
 LANES = (("daily_sync.yml", "sync-dashboard"),
          ("daily_sync.yml", "recover-missing-market-pages"),
@@ -55,13 +56,8 @@ def test_activation_can_refresh_all_sources_without_bundled_historical_save(even
     control = daily["on"]["workflow_dispatch"]["inputs"]["run_tracker"]
     assert control["type"] == "boolean" and str(control["default"]).lower() == "true"
     expression = step(LANES[0], "📈 Track Performance (record + audit)")["if"]
-    expression = expression.removeprefix("${{").removesuffix("}}")
-    for token, value in {
-        "success()": True, "matrix.group": group, "steps.scope_keys.outputs.has_keys": "true",
-        "env.RUN_MODE": mode, "github.event_name": event, "github.event.inputs.run_tracker": choice,
-    }.items():
-        expression = expression.replace(token, repr(value))
-    assert eval(expression.replace("&&", "and").replace("||", "or"), {"__builtins__": {}}, {}) is expected
+    expression = expression.removeprefix("${{").removesuffix("}}").strip()
+    assert accepts(expression, group=group, mode=mode, event=event, run_tracker=choice) is expected
     # Source recovery and final acceptance must still run in this full-sync mode.
     for job in ("recover-missing-market-pages", "verify-final-decision-publication"):
         assert "run_tracker" not in daily["jobs"][job]["if"]
