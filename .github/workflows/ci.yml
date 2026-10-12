@@ -2,7 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.9 (2026-10-12) -- APPROVED ROSTER SCOPE
+# VERSION 1.1.10 (2026-10-12) -- PRODUCTION ACTIVATION EVIDENCE
+#
+# v1.1.10: exercise manual observe controls, historical tracker preservation
+# and per-invocation sync/recovery receipts in the required lean lane.
 #
 # v1.1.9: exact membership, workflow bindings and read-only identity evidence
 # regressions join the required lean lane. Data quality stays strict.
@@ -457,6 +460,8 @@ jobs:
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py \
             tests/test_approved_scope_native_binding.py \
+            tests/test_workflow_activation_observe.py \
+            tests/test_activation_rollout_evidence_workflows.py \
             tests/test_name_identity_evidence.py \
             tests/test_name_identity_workflow.py \
             tests/test_decision_surface_freshness.py \

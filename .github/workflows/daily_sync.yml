@@ -44,6 +44,23 @@ on:
         required: false
         default: "MARKET_LEADERS"
         type: string
+      rank_mode:
+        description: "Whole-page ranking override for this run (inherit repository variable)"
+        required: false
+        default: "inherit"
+        type: choice
+        options: ["inherit", "off", "observe", "enforce"]
+      warnings_mode:
+        description: "Warning compaction override; enforcement awaits a verified external archive"
+        required: false
+        default: "inherit"
+        type: choice
+        options: ["inherit", "off", "observe"]
+      run_tracker:
+        description: "Run the bundled historical maturity audit (use false for activation; run the separate record-only tracker)"
+        required: false
+        default: true
+        type: boolean
       # (2026-07-26 PY-5) google_creds_json input REMOVED. workflow_dispatch
       # inputs are recorded in run metadata — on a PUBLIC repo, a service-
       # account key pasted there is published. Secrets are the only creds
@@ -164,7 +181,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py tests/test_ycp_quote_breaker_isolation.py tests/test_ycp_singleflight_cancellation.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py tests/test_activation_rollout_evidence_workflows.py tests/test_ycp_quote_breaker_isolation.py tests/test_ycp_singleflight_cancellation.py
           # W1A-6b (2026-08-18, external audit F-13 ACCEPTED): the OHLC
           # guard + _Run_Log + _Status contracts are merge-blocking. The
           # harness self-detects CI (no fixture exports) and runs its
@@ -709,6 +726,40 @@ jobs:
           fi
           echo "::endgroup::"
 
+      - name: Resolve publication rollout modes
+        env:
+          RANK_MODE_OVERRIDE: ${{ github.event.inputs.rank_mode || 'inherit' }}
+          WARNINGS_MODE_OVERRIDE: ${{ github.event.inputs.warnings_mode || 'inherit' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          requested = {"rank": os.getenv("RANK_MODE_OVERRIDE", "inherit"),
+                       "warnings": os.getenv("WARNINGS_MODE_OVERRIDE", "inherit")}
+          for feature, allowed in (("rank", {"inherit", "off", "observe", "enforce"}),
+                                   ("warnings", {"inherit", "off", "observe"})):
+              if requested[feature] not in allowed:
+                  raise SystemExit("::error::Invalid " + feature + " rollout override")
+          configured = {"rank": os.getenv("TFB_RANK_OVERALL_PAGE", "off"),
+                        "warnings": os.getenv("TFB_WARNINGS_COMPACT", "off")}
+          effective = {}
+          for feature in requested:
+              value = (configured[feature] if requested[feature] == "inherit" else requested[feature]).strip().lower()
+              effective[feature] = value if value in {"observe", "enforce"} else "off"
+          if effective["warnings"] == "enforce":
+              raise SystemExit("::error::Warning enforcement is blocked: no verified prewrite external archive")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("TFB_RANK_OVERALL_PAGE=" + effective["rank"] + "\n")
+              env.write("TFB_WARNINGS_COMPACT=" + effective["warnings"] + "\n")
+          evidence = {"run_id": os.getenv("GITHUB_RUN_ID"), "source_sha": os.getenv("GITHUB_SHA"),
+                      "event": os.getenv("GITHUB_EVENT_NAME"), "requested": requested,
+                      "configured": configured, "effective": effective,
+                      "warnings_enforcement": "blocked_no_prewrite_external_archive"}
+          Path("rollout_modes.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(evidence))
+          PY
+
       - name: ⚙️ Smart Configuration Resolution (robust for schedule + manual)
         id: smart_config
         env:
@@ -1071,7 +1122,10 @@ jobs:
             # (Market_Leaders/Global_Markets/Commodities_FX/Mutual_Funds/Insights/
             # Data_Dictionary/My_Portfolio); the cockpit pages (Top_10,
             # Portfolio_Decision) are route-owned and skipped here, so unaffected.
-            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS --start-cell A1)
+            local REPORT_GROUP="market"
+            [ "$EXTRA" = "--no-clear" ] && REPORT_GROUP="portfolio"
+            local REPORT_FILE="sync_runner_${{ matrix.group }}_${REPORT_GROUP}_${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}.json"
+            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS --start-cell A1 --json-out "$REPORT_FILE")
             [ -n "$EXTRA" ] && C+=("$EXTRA")
             [ -n "$DRY_RUN_FLAG" ] && C+=("$DRY_RUN_FLAG")
             echo "📋 Command: ${C[*]}"
@@ -1194,7 +1248,7 @@ jobs:
         # Exactly ONE leg records after a full sync that includes GM.
         # A no-key GM leg, single-page refresh or health probe must not record
         # unrelated page cohorts or rewrite Performance_Log.
-        if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' }}
+        if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_tracker != 'false') }}
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -1416,6 +1470,8 @@ jobs:
             sync_*.log
             sync_execution.log
             sync_summary.json
+            sync_runner_*.json
+            rollout_modes.json
             validate_dashboard.json
             sync_row_telemetry_*.jsonl
           retention-days: 7
@@ -1729,6 +1785,40 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve publication rollout modes
+        env:
+          RANK_MODE_OVERRIDE: ${{ github.event.inputs.rank_mode || 'inherit' }}
+          WARNINGS_MODE_OVERRIDE: ${{ github.event.inputs.warnings_mode || 'inherit' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          requested = {"rank": os.getenv("RANK_MODE_OVERRIDE", "inherit"),
+                       "warnings": os.getenv("WARNINGS_MODE_OVERRIDE", "inherit")}
+          for feature, allowed in (("rank", {"inherit", "off", "observe", "enforce"}),
+                                   ("warnings", {"inherit", "off", "observe"})):
+              if requested[feature] not in allowed:
+                  raise SystemExit("::error::Invalid " + feature + " rollout override")
+          configured = {"rank": os.getenv("TFB_RANK_OVERALL_PAGE", "off"),
+                        "warnings": os.getenv("TFB_WARNINGS_COMPACT", "off")}
+          effective = {}
+          for feature in requested:
+              value = (configured[feature] if requested[feature] == "inherit" else requested[feature]).strip().lower()
+              effective[feature] = value if value in {"observe", "enforce"} else "off"
+          if effective["warnings"] == "enforce":
+              raise SystemExit("::error::Warning enforcement is blocked: no verified prewrite external archive")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("TFB_RANK_OVERALL_PAGE=" + effective["rank"] + "\n")
+              env.write("TFB_WARNINGS_COMPACT=" + effective["warnings"] + "\n")
+          evidence = {"run_id": os.getenv("GITHUB_RUN_ID"), "source_sha": os.getenv("GITHUB_SHA"),
+                      "event": os.getenv("GITHUB_EVENT_NAME"), "requested": requested,
+                      "configured": configured, "effective": effective,
+                      "warnings_enforcement": "blocked_no_prewrite_external_archive"}
+          Path("rollout_modes.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(evidence))
+          PY
+
       - name: 📥 Download current sync evidence
         uses: actions/download-artifact@v8
         with:
@@ -1792,6 +1882,7 @@ jobs:
           path: |
             inline-recovery-plan.json
             inline-recovery-summary.json
+            rollout_modes.json
             sync_row_telemetry_*.jsonl
           retention-days: 30
           if-no-files-found: warn

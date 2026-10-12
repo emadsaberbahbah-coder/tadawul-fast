@@ -4,6 +4,7 @@ import unittest
 import copy
 import asyncio
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -197,6 +198,9 @@ def approved_grids(symbols):
     )
     source_grids = {page: [["Symbol", "Name"]] + [[identity, "Synthetic"]
                     for identity in identities] for page, identities in symbols.items()}
+    for page, count in (("Global_Markets", 6512), ("Commodities_FX", 453)):
+        source_grids[page] = [["Symbol", "Name"]] + [
+            [f"SYNTH_{page}_{index:04d}", "Synthetic"] for index in range(count)]
     return (sources, portfolio, top10), source_grids
 
 
@@ -213,6 +217,177 @@ def approved_audit(approved_fixture, *, mutate=None):
 def source_columns_for(source_grids):
     return {page: [[row[0]] if row else [] for row in grid]
             for page, grid in source_grids.items()}
+
+
+def _native_pool_case(approved_fixture):
+    """Synthetic physical 2474 -> unique 2469 with five exact earlier owners."""
+    from scripts.approved_universe_scope import symbol_set_sha256
+    scope, symbols = approved_fixture
+    grids, source_grids = approved_grids(symbols)
+    identities = symbols["Mutual_Funds"][:5]
+    source_grids["Global_Markets"][1][0] = identities[0]
+    for row, identity in enumerate(identities[1:], 1):
+        source_grids["Commodities_FX"][row][0] = identity
+    physical = {"Market_Leaders": 255, "Global_Markets": 6512,
+                "Commodities_FX": 453, "Mutual_Funds": 2474}
+    receipt = {"version": 1, "run": "90001", "pages": {
+        page: {"physical": count, "unique": count - (5 if page == "Mutual_Funds" else 0),
+               "included": count - (5 if page == "Mutual_Funds" else 0)}
+        for page, count in physical.items()},
+        "excluded": [{"symbol": identity, "page": "Mutual_Funds",
+                      "owner": "Global_Markets" if index == 0 else "Commodities_FX"}
+                     for index, identity in enumerate(identities)],
+        "physical_symbol_sha256": {page: symbol_set_sha256([row[0] for row in grid[1:]])
+                                   for page, grid in source_grids.items()}}
+    # Native protocol fixes page order independently of Python fixture order.
+    receipt["physical_symbol_sha256"] = {
+        page: receipt["physical_symbol_sha256"][page] for page in freshness.POOL_PAGES}
+    grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2474/2474", "Mutual_Funds 2469/2474").replace(
+        "sheets pool [", "sheets pool 9689 rows [")
+    return scope, grids, source_grids, receipt
+
+
+def _attach_pool_receipt(grids, receipt):
+    unsigned = {key: value for key, value in receipt.items() if key != "sha256"}
+    receipt["sha256"] = hashlib.sha256(json.dumps(unsigned, separators=(",", ":"),
+                                                 ensure_ascii=False).encode()).hexdigest()
+    grids[2][1][1] += " | pool_reconciliation_v1=" + json.dumps(
+        receipt, separators=(",", ":"), ensure_ascii=False)
+
+
+def _native_pool_audit(scope, grids, source_grids, *, columns=None):
+    return audit_surfaces(*grids, now_utc=NOW, approved_scope=scope,
+                          source_grids=source_grids,
+                          source_columns=source_columns_for(source_grids) if columns is None else columns,
+                          expected_source_run="90001")
+
+
+def test_five_individually_proven_cross_page_exclusions_preserve_approved_physical_roster(approved_fixture):
+    scope, grids, source_grids, receipt = _native_pool_case(approved_fixture)
+    _attach_pool_receipt(grids, receipt)
+    report = _native_pool_audit(scope, grids, source_grids)
+    assert report.exit_code == 0 and report.executable
+    proof = report.payload()["top10_pool_reconciliation"]
+    assert proof["valid"] is True and proof["run"] == "90001"
+    assert proof["excluded"] == receipt["excluded"]
+    assert proof["physical_counts"]["Mutual_Funds"] == 2474
+    assert proof["unique_counts"]["Mutual_Funds"] == 2469
+    assert report.top10_pool_counts["Mutual_Funds"] == {"used": 2469, "total": 2474}
+    assert report.source_status["Mutual_Funds"]["approved_scope"]["actual_count"] == 2474
+
+
+@pytest.mark.parametrize("claim", ["(full universe)", "(all available sheet rows)",
+                                 "(TRUNCATED to cap 1)", ""])
+@pytest.mark.parametrize("page,physical", [("Market_Leaders", 255), ("Mutual_Funds", 2474)])
+def test_a_capped_approved_pool_cannot_certify_publication_without_an_exclusion_receipt(
+        approved_fixture, claim, page, physical):
+    scope, symbols = approved_fixture
+    grids, source_grids = approved_grids(symbols)
+    grids[2][1][1] = grids[2][1][1].replace("(full universe)", claim).replace(
+        f"{page} {physical}/{physical}", f"{page} 1/{physical}")
+    report = _native_pool_audit(scope, grids, source_grids)
+    assert report.exit_code == 2 and not report.executable
+    assert "T10_POOL_RECONCILIATION_UNPROVEN" in {item.code for item in report.findings}
+
+
+def test_generic_explicit_min_rows_fixture_keeps_deliberate_cap_semantics_without_approval():
+    top10 = top10_grid(full=False)
+    top10[1][1] = top10[1][1].replace("Market_Leaders 1356/1356", "Market_Leaders 1/1356")
+    top10[1][1] += " | (TRUNCATED to cap 1)"
+    report = audit_surfaces(status_grid(), portfolio_grid(), top10, now_utc=NOW, min_rows=FLOORS)
+    assert report.exit_code == 0 and report.executable
+
+
+@pytest.mark.parametrize("fault", [
+    "absent", "count_only", "wrong_owner", "missing_exclusion", "extra_exclusion",
+    "duplicate_exclusion", "reordered_exclusions", "stale_receipt", "stale_source",
+    "duplicate_source_cohort", "physical_hash", "physical_count", "unique_overcount",
+    "included_overcount", "truncated", "non_integer", "wrong_count_label", "count_duplicate",
+    "sent_total", "missing_sent_total", "duplicate_sent_total",
+    "missing_owner_grid", "missing_owner_column", "owner_duplicate_symbol",
+    "owner_substitution", "torn_owner_column", "owner_counter", "checksum", "duplicate_receipt",
+    "extra_key", "exclusion_extra_key", "duplicate_json_key", "noncanonical", "bad_run",
+])
+def test_pool_exclusions_fail_closed_without_exact_current_individual_evidence(approved_fixture, fault):
+    scope, grids, source_grids, receipt = _native_pool_case(approved_fixture)
+    columns = None
+    if fault == "count_only":
+        receipt["excluded"] = []
+    elif fault == "wrong_owner":
+        receipt["excluded"][0]["owner"] = "Commodities_FX"
+    elif fault == "missing_exclusion":
+        receipt["excluded"].pop()
+    elif fault == "extra_exclusion":
+        receipt["excluded"].append({"symbol": "SYNTH_EXTRA", "page": "Mutual_Funds", "owner": "Global_Markets"})
+    elif fault == "duplicate_exclusion":
+        receipt["excluded"].append(dict(receipt["excluded"][0]))
+    elif fault == "reordered_exclusions":
+        receipt["excluded"].reverse()
+    elif fault == "stale_receipt":
+        receipt["run"] = "80000"
+    elif fault in {"stale_source", "duplicate_source_cohort", "owner_counter"}:
+        row = next(row for row in grids[0][1:] if row[0] == "Global_Markets")
+        if fault == "stale_source":
+            row[3] = row[3].replace("run=90001", "run=80000")
+        elif fault == "duplicate_source_cohort":
+            grids[0].append(list(row))
+        else:
+            row[6] += 1
+    elif fault == "physical_hash":
+        receipt["physical_symbol_sha256"]["Commodities_FX"] = "0" * 64
+    elif fault == "physical_count":
+        receipt["pages"]["Mutual_Funds"]["physical"] -= 5
+    elif fault == "unique_overcount":
+        receipt["pages"]["Mutual_Funds"]["unique"] += 1
+    elif fault == "included_overcount":
+        receipt["pages"]["Mutual_Funds"]["included"] += 1
+    elif fault == "truncated":
+        receipt["pages"]["Mutual_Funds"]["included"] -= 1
+        grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2469/2474", "Mutual_Funds 2468/2474")
+    elif fault == "non_integer":
+        receipt["pages"]["Mutual_Funds"]["included"] = True
+    elif fault == "wrong_count_label":
+        grids[2][1][1] = grids[2][1][1].replace("2469/2474", "2469/2469")
+    elif fault == "count_duplicate":
+        grids[2][1][1] += " | Mutual_Funds 2469/2474"
+    elif fault == "sent_total":
+        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9689 rows", "sheets pool 9690 rows")
+    elif fault == "missing_sent_total":
+        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9689 rows", "sheets pool")
+    elif fault == "duplicate_sent_total":
+        grids[2][1][1] += " | sheets pool 9689 rows"
+    elif fault == "missing_owner_grid":
+        source_grids.pop("Commodities_FX")
+    elif fault == "missing_owner_column":
+        columns = source_columns_for(source_grids)
+        columns.pop("Commodities_FX")
+    elif fault == "owner_duplicate_symbol":
+        source_grids["Global_Markets"][2][0] = source_grids["Global_Markets"][1][0]
+    elif fault == "owner_substitution":
+        source_grids["Global_Markets"][1][0] = "SYNTH_DIFFERENT_OWNER"
+    elif fault == "torn_owner_column":
+        columns = source_columns_for(source_grids)
+        columns["Commodities_FX"][1][0] = "SYNTH_TORN_SNAPSHOT"
+    elif fault == "extra_key":
+        receipt["unreviewed"] = "ignored?"
+    elif fault == "exclusion_extra_key":
+        receipt["excluded"][0]["unreviewed"] = "ignored?"
+    elif fault == "bad_run":
+        receipt["run"] = 90001
+    if fault != "absent":
+        _attach_pool_receipt(grids, receipt)
+    if fault == "checksum":
+        grids[2][1][1] = grids[2][1][1].replace(receipt["sha256"], "0" * 64)
+    elif fault == "duplicate_receipt":
+        grids[2][1][1] += " | pool_reconciliation_v1=" + json.dumps(receipt, separators=(",", ":"))
+    elif fault == "duplicate_json_key":
+        grids[2][1][1] = grids[2][1][1].replace('"version":1,', '"version":1,"version":1,')
+    elif fault == "noncanonical":
+        grids[2][1][1] = grids[2][1][1].replace('"version":1,', '"version": 1,')
+    report = _native_pool_audit(scope, grids, source_grids, columns=columns)
+    assert report.exit_code == 2 and not report.executable
+    assert report.top10_pool_reconciliation["valid"] is False
+    assert "T10_POOL_RECONCILIATION_UNPROVEN" in {item.code for item in report.findings}
 
 
 def test_approved_physical_membership_supersedes_only_two_legacy_floors(approved_fixture, monkeypatch):

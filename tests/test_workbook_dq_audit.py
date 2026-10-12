@@ -214,10 +214,10 @@ def test_p10_workflow_wiring():
     text = open(WORKFLOW, encoding="utf-8").read()
     run_backup = text.split("- name: Run backup", 1)[1].split("- name:", 1)[0]
     assert "TFB_BACKUP_LOCAL_COPY:" in run_backup
-    assert "vars.TFB_DQ_AUDIT_MODE == 'observe'" in run_backup and "format('{0}/tfb_export.xlsx', runner.temp)" in run_backup
+    assert "steps.dq_mode.outputs.mode == 'observe'" in run_backup and "format('{0}/tfb_export.xlsx', runner.temp)" in run_backup
     audit = text.split("- name: Workbook DQ audit (WP-0)", 1)[1].split("- name:", 1)[0]
-    assert re.search(r"if:\s*\$\{\{.*vars\.TFB_DQ_AUDIT_MODE", audit)
-    assert "continue-on-error: ${{ vars.TFB_DQ_AUDIT_MODE != 'enforce' }}" in audit
+    assert re.search(r"if:\s*\$\{\{.*steps\.dq_mode\.outputs\.mode", audit)
+    assert "continue-on-error: ${{ steps.dq_mode.outputs.mode != 'enforce' }}" in audit
     assert "scripts/tfb_workbook_dq_audit.py" in audit and "--baseline tests/fixtures/dq_baseline_2026-10-10.json" in audit
     upload = text.split("- name: Upload DQ report", 1)[1].split("- name:", 1)[0]
     assert "uses: actions/upload-artifact@v7" in upload

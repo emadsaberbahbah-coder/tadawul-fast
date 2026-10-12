@@ -13,7 +13,8 @@ const NOW = Date.parse('2026-10-12T09:30:00Z');
 const STAMP = '2026-10-12 12:00:00+03:00';
 const FLOORS = {Market_Leaders:255, Global_Markets:6512, Commodities_FX:453, Mutual_Funds:2474};
 const SCOPE_PAGES = ['Market_Leaders','Mutual_Funds'];
-const SYMBOLS = Object.fromEntries(SCOPE_PAGES.map(page => [page, Array.from({length:FLOORS[page]},(_,i) => 'SYNTH_' + page.toUpperCase() + '_' + String(i).padStart(4,'0'))]));
+const FULL_PAGES = ['Market_Leaders','Global_Markets','Commodities_FX','Mutual_Funds'];
+const SYMBOLS = Object.fromEntries(FULL_PAGES.map(page => [page, Array.from({length:FLOORS[page]},(_,i) => 'SYNTH_' + page.toUpperCase() + '_' + String(i).padStart(4,'0'))]));
 const symbolDigest = values => crypto.createHash('sha256').update(values.map(x=>x.trim().toUpperCase()).sort().join('\n')+'\n').digest('hex');
 const HEADER = ['Page','Last Updated','Status','Message','Endpoint','HTTP Code','Rows','Columns','Duration ms','Warnings'];
 let passed = 0;
@@ -43,12 +44,15 @@ function load(props = {}, options = {}) {
 }
 function core(ctx,grid=goodGrid(),sourceContext,policy,bookOptions) {
   policy=policy||ctx.dt10SourcePolicy_();
-  const receipts=ctx.dt10SourceScopeRead_(statusWorkbook(grid,bookOptions),policy);
+  const receipts=ctx.dt10SourceScopeRead_(statusWorkbook(grid,bookOptions),policy,sourceContext);
   return ctx.dt10SourceReadinessCore_(grid,NOW,sourceContext,policy,receipts);
 }
 function capture(ctx,grid = goodGrid(),pool = FLOORS) {
   const source = core(ctx,grid);
-  return {captured_at_ms:NOW,initial_ready:source.ready,generation:plain(source.generation),pool_counts:{...pool},pool_scope_receipts:plain(source.approved_scope)};
+  const before={captured_at_ms:NOW,initial_ready:source.ready,generation:plain(source.generation),cohort:source.cohort};
+  const collected=ctx.dt10CollectPoolRows_(statusWorkbook(grid),50000,before);
+  Object.assign(before,{pool_counts:{...pool},pool_scope_receipts:plain(collected.approved_scope),pool_included_counts:plain(collected.perPage),pool_sent_total:collected.rows.length,pool_reconciliation:plain(collected.pool_reconciliation)});
+  return before;
 }
 function statusWorkbook(grid = goodGrid(), options = {}) {
   const calls = [], scopeCalls = [];
@@ -62,7 +66,7 @@ function statusWorkbook(grid = goodGrid(), options = {}) {
         return grid;
       }};
     }};
-  const sourceGrids = options.sourceGrids || Object.fromEntries(SCOPE_PAGES.map(page=>[page,[['Name','Symbol'],...SYMBOLS[page].map(s=>['fixture',s])]]));
+  const sourceGrids = options.sourceGrids || Object.fromEntries(FULL_PAGES.map(page=>[page,[['Name','Symbol'],...SYMBOLS[page].map(s=>['fixture',s])]]));
   return {calls,scopeCalls,sourceGrids, getSheetByName(name) {
     if(name==='_Status') return !options.missing ? status : null;
     const rows=sourceGrids[name]; if(!rows) return null;
@@ -133,7 +137,7 @@ test('dated scoped approval supersedes old properties; unscoped properties may o
 test('embedded dated scope counts/hashes exactly match the approved manifest without an embedded raw roster',()=> {
   const ctx=load({}, {nativeHashes:true});
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../../config/approved_universe_scope_v1.json'),'utf8'));
-  assert.equal(ctx.DT10_VERSION,'1.13.6');assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
+  assert.equal(ctx.DT10_VERSION,'1.13.7');assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
   assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.approved_on,manifest.approved_on);
   for(const page of SCOPE_PAGES) {
     const declared=ctx.DT10_SOURCE_APPROVED_SCOPE.pages[page],approved=manifest.pages[page];
@@ -203,7 +207,7 @@ test('the actual full-grid collector attests complete physical membership before
   const ctx=load(),ss=statusWorkbook();
   const collected=ctx.dt10CollectPoolRows_(ss,1);
   assert.equal(collected.rows.length,1);assert.equal(collected.truncated,true);
-  assert.equal(ctx._digestCalls.length,2);
+  assert.equal(ctx._digestCalls.length,4);
   for(const page of SCOPE_PAGES) {
     assert.equal(collected.approved_scope[page].ready,true);
     assert.equal(collected.approved_scope[page].actual_count,FLOORS[page]);
@@ -213,15 +217,94 @@ test('the actual full-grid collector attests complete physical membership before
 test('a transient collected substitution cannot be certified by later restoration of physical cells/status',()=> {
   const ctx=load(),ss=statusWorkbook(),before=ctx.dt10SourceCapture_(ss);
   const old=ss.sourceGrids.Market_Leaders[1][1];ss.sourceGrids.Market_Leaders[1][1]='TEMPORARY.SUBSTITUTION';
-  const collected=ctx.dt10CollectPoolRows_(ss,50000);assert.equal(collected.approved_scope.Market_Leaders.ready,false);
+  const collected=ctx.dt10CollectPoolRows_(ss,50000,before);assert.equal(collected.approved_scope.Market_Leaders.ready,false);
   ss.sourceGrids.Market_Leaders[1][1]=old;
-  before.pool_counts={...FLOORS};before.pool_scope_receipts=collected.approved_scope;
+  before.pool_counts=collected.available;before.pool_scope_receipts=collected.approved_scope;
+  before.pool_included_counts=collected.perPage;before.pool_sent_total=collected.rows.length;before.pool_reconciliation=collected.pool_reconciliation;
   const result=ctx.dt10SourceReadiness_(ss,before);
   assert.equal(result.approved_scope.Market_Leaders.ready,true,'current restored membership itself is approved');
-  assert.equal(result.ready,false);assert(result.reason.includes('collected physical pool scope unverified'));
+  assert.equal(result.ready,false);assert(result.reason.includes('collected pool reconciliation unverified'));
   assert.equal(ctx.dt10BoardVerdict_(ss,before).state,'NOT_ACTIONABLE');
   delete before.pool_scope_receipts;
   assert.equal(ctx.dt10SourceReadiness_(ss,before).ready,false,'no consumption witness can be invented from current status');
+});
+function overlappedPool(cap=50000, symbolFirst=false) {
+  const ctx=load(),ss=statusWorkbook();
+  const funds=['URA.US','XOP.US','REMX.US','LIT.US','COPX.US'];
+  for(let i=0;i<funds.length;i++) ss.sourceGrids.Mutual_Funds[i+1][1]=funds[i];
+  for(let i=0;i<4;i++) ss.sourceGrids.Commodities_FX[i+1][1]=['URA.US','REMX.US','LIT.US','COPX.US'][i];
+  ss.sourceGrids.Global_Markets[1][1]='XOP.US';
+  ctx.DT10_SOURCE_APPROVED_SCOPE.pages.Mutual_Funds.symbol_set_sha256=symbolDigest(ss.sourceGrids.Mutual_Funds.slice(1).map(r=>r[1]));
+  if(symbolFirst) for(const page of FULL_PAGES) ss.sourceGrids[page]=ss.sourceGrids[page].map(r=>[r[1],r[0]]);
+  const before=ctx.dt10SourceCapture_(ss);
+  const collected=ctx.dt10CollectPoolRows_(ss,cap,before);
+  Object.assign(before,{pool_counts:collected.available,pool_scope_receipts:collected.approved_scope,
+    pool_included_counts:collected.perPage,pool_sent_total:collected.rows.length,pool_reconciliation:collected.pool_reconciliation});
+  return {ctx,ss,before,collected};
+}
+test('five individual earlier-owner duplicates reconcile approved physical funds with the smaller complete unique pool',()=> {
+  const {ctx,ss,before,collected}=overlappedPool();
+  assert.equal(collected.available.Mutual_Funds,2469);assert.equal(collected.approved_scope.Mutual_Funds.actual_count,2474);
+  assert.equal(collected.pool_reconciliation.run,'90001');assert.equal(collected.pool_reconciliation.excluded.length,5);
+  assert.deepEqual(plain(collected.pool_reconciliation.excluded),[
+    {symbol:'COPX.US',page:'Mutual_Funds',owner:'Commodities_FX'},
+    {symbol:'LIT.US',page:'Mutual_Funds',owner:'Commodities_FX'},
+    {symbol:'REMX.US',page:'Mutual_Funds',owner:'Commodities_FX'},
+    {symbol:'URA.US',page:'Mutual_Funds',owner:'Commodities_FX'},
+    {symbol:'XOP.US',page:'Mutual_Funds',owner:'Global_Markets'}
+  ]);
+  const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,true,result.reason);
+  assert.equal(result.pool_reconciliation.ready,true);
+  const text=ctx.dt10PoolNote_(collected,result);
+  assert(text.includes('Mutual_Funds 2469/2474'));assert(text.includes('pool_reconciliation_v1='));
+  assert(text.includes('source readiness VERIFIED (run 90001)'));
+  const unsigned=plain(collected.pool_reconciliation);delete unsigned.sha256;
+  assert.equal(collected.pool_reconciliation.sha256,crypto.createHash('sha256').update(JSON.stringify(unsigned)).digest('hex'));
+});
+for(const [name,mutate] of [
+  ['missing exclusion',f=>f.excluded.pop()],
+  ['extra exclusion',f=>f.excluded.push({symbol:'NOT.A.DUPLICATE',page:'Mutual_Funds',owner:'Global_Markets'})],
+  ['wrong owner',f=>f.excluded[0].owner='Global_Markets'],
+  ['same-page owner',f=>f.excluded[0].owner='Mutual_Funds'],
+  ['different excluded identity',f=>f.excluded[0].symbol='UNPROVED.US'],
+  ['unique count overclaim',f=>f.pages.Mutual_Funds.unique++],
+  ['wrong physical count',f=>f.pages.Global_Markets.physical--],
+  ['extra receipt field',f=>f.unrelated=true],
+  ['altered hash',f=>f.physical_symbol_sha256.Commodities_FX='0'.repeat(64)],
+  ['another cohort',f=>f.run='90002']
+]) test(name+' cannot permit a below-physical pool even with a recomputed receipt checksum',()=> {
+  const {ctx,ss,before}=overlappedPool();mutate(before.pool_reconciliation);
+  const unsigned=plain(before.pool_reconciliation);delete unsigned.sha256;
+  before.pool_reconciliation.sha256=ctx.dt10PoolFrameSha_(unsigned);
+  const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,false);
+  assert.equal(result.pool_reconciliation.ready,false);
+});
+test('missing receipt, changed earlier-owner grid, bad checksum and explicit caps remain WITHHELD',()=> {
+  for(const mode of ['missing','owner-changed','bad-checksum','cap']) {
+    const {ctx,ss,before,collected}=overlappedPool(mode==='cap'?100:50000);
+    if(mode==='missing') before.pool_reconciliation=null;
+    if(mode==='owner-changed') ss.sourceGrids.Commodities_FX[1][1]='OWNER.REPLACED';
+    if(mode==='bad-checksum') before.pool_reconciliation.sha256='0'.repeat(64);
+    const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,false,mode);
+    assert.equal(ctx.dt10BoardVerdict_(ss,before).state,'NOT_ACTIONABLE');
+    if(mode==='cap') {
+      assert.equal(collected.pool_reconciliation.pages.Mutual_Funds.physical,2474);
+      assert(collected.pool_reconciliation.pages.Mutual_Funds.included<2469);
+      assert(ctx.dt10PoolNote_(collected,result).includes('TRUNCATED'));
+    }
+  }
+});
+test('a legitimate exclusion receipt does not suppress stale, mixed-run or deficient acquisition guards',()=> {
+  for(const mode of ['stale','mixed','acquired-low','status-count','acquired-denominator']) {
+    const {ctx,ss,before}=overlappedPool();
+    const row=ss.getSheetByName('_Status').getRange(1,1,5,10).getValues()[3]; // Commodities_FX
+    if(mode==='stale') row[1]='2026-10-08 12:00:00+03:00';
+    if(mode==='mixed') row[3]=row[3].replace('run=90001','run=90002');
+    if(mode==='acquired-low') row[3]=row[3].replace('acquired=453/453','acquired=400/453');
+    if(mode==='status-count') row[6]=454;
+    if(mode==='acquired-denominator') row[3]=row[3].replace('acquired=453/453','acquired=453/454');
+    const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,false,mode);
+  }
 });
 test('source generation changes after pool capture block even when still fresh and complete',()=> {
   const ctx=load(),grid=goodGrid(),before=capture(ctx,grid);grid[2][1]='2026-10-12 12:01:00+03:00';
@@ -373,7 +456,8 @@ function refreshFixture({initialDeficit=false,initialMixed=false,finalPublicatio
   ctx.dt10ReadPanel_=()=>({'Pool Source':'Sheets','Pool Limit':0,'T10: Max Selected':10});
   ctx.dt10SyncInflight_=()=>({active:false});ctx.dt10FxRates_=()=>({USD:3.75,SAR:1});
   ctx.dt10PortfolioInputs_=()=>({cash_available_sar:10000,holdings:[],holdings_input_incomplete:false});
-  ctx.dt10CollectPoolRows_=()=>empty?{...pool(),rows:[],perPage:{},available:{},total:0}:{...pool(),approved_scope:ctx.dt10SourceScopeRead_(ss,ctx.dt10SourcePolicy_())};
+  const realCollect=ctx.dt10CollectPoolRows_;
+  ctx.dt10CollectPoolRows_=(_ss,limit,sourceContext)=>empty?{...pool(),rows:[],perPage:{},available:{},total:0}:realCollect(ss,limit,sourceContext);
   ctx.dt10ApplyStability_=()=>{stabilityCalls++;return {note:'synthetic unchanged stability'};};
   ctx.dt10WritePageStatus_=(...args)=>pageStatuses.push(args);
   ctx.dt10AppendSelectionLog_=(...args)=>{selectionLogs.push(plain(args.slice(1)));return '';};
@@ -448,5 +532,15 @@ if(approvedArg>=0) {
     const result=ctx.dt10SourceReadiness_(statusWorkbook(undefined,{sourceGrids:grids}));
     assert.equal(result.ready,false);assert(result.reason.includes('exact approved membership mismatch'));
   });
+}
+const receiptArg=process.argv.indexOf('--receipt-fixture');
+if(receiptArg>=0) {
+  const {ctx,ss,before,collected}=overlappedPool(50000,true);
+  const result=ctx.dt10SourceReadiness_(ss,before);
+  const fixture={synthetic_test_fixture:true,not_a_live_execution_receipt:true,source_grids:ss.sourceGrids,
+    status_grid:goodGrid(),frame:plain(collected.pool_reconciliation),
+    b2:ctx.dt10PoolNote_(collected,result)};
+  fs.writeFileSync(process.argv[receiptArg+1],JSON.stringify(fixture));
+  console.log('WROTE synthetic cross-language pool frame fixture');
 }
 console.log('Full-source native source readiness: '+passed+' passed');
