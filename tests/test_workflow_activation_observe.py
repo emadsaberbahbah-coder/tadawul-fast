@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -32,6 +33,14 @@ def step(name, label):
     return matches[0]
 
 
+def workflow_variable_value(expression, name, value):
+    """Materialize the actual simple Actions string-Variable fallback."""
+    match = re.fullmatch(r"\$\{\{ vars\." + re.escape(name) + r" \|\| '([^']*)' \}\}", expression)
+    assert match, expression
+    # GitHub Variables are strings: nonempty 'off'/'false' are truthy.
+    return value if value not in (None, '') else match.group(1)
+
+
 @pytest.mark.parametrize('explicit,repository,expected', (
     ('', '', 'off'), ('inherit', '', 'off'), ('inherit', 'observe', 'observe'),
     ('inherit', 'enforce', 'enforce'), ('', 'invalid', 'off'),
@@ -42,6 +51,25 @@ def test_actual_dq_resolver_preserves_scheduled_defaults_and_manual_observe(expl
                GITHUB_OUTPUT=str(tmp_path / 'outputs'))
     run = subprocess.run(['bash', '-c', step('workbook_backup.yml', "Resolve this run's DQ mode")['run']],
                          cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert (tmp_path / 'outputs').read_text() == f'mode={expected}\n'
+
+
+@pytest.mark.parametrize('variable,explicit,expected', (
+    (None, 'inherit', 'observe'), ('', 'inherit', 'observe'),
+    (None, '', 'observe'), ('off', 'inherit', 'off'), ('false', 'inherit', 'off'),
+    ('invalid', 'inherit', 'off'), ('observe', 'inherit', 'observe'),
+    ('enforce', 'inherit', 'enforce'), (None, 'off', 'off'), ('', 'off', 'off'),
+))
+def test_dq_workflow_fallback_observes_without_overriding_explicit_disable(variable, explicit, expected, tmp_path):
+    resolver = step('workbook_backup.yml', "Resolve this run's DQ mode")
+    expression = resolver['env']['REPOSITORY_DQ_MODE']
+    assert expression == "${{ vars.TFB_DQ_AUDIT_MODE || 'observe' }}"
+    configured = workflow_variable_value(expression, 'TFB_DQ_AUDIT_MODE', variable)
+    env = dict(os.environ, INPUT_DQ_MODE=explicit, REPOSITORY_DQ_MODE=configured,
+               GITHUB_OUTPUT=str(tmp_path / 'outputs'))
+    run = subprocess.run(['bash', '-c', resolver['run']], cwd=tmp_path,
+                         env=env, capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     assert (tmp_path / 'outputs').read_text() == f'mode={expected}\n'
 
@@ -275,6 +303,37 @@ def test_actual_tracker_wrapper_observe_is_measurement_and_noaudit_blocks_histor
     rendered = json.dumps(value)
     for forbidden in ('NEVER_EXPORT_SECRET','NEVER_EXPORT_TOKEN','offline-sheet','private_key','cash_balance'):
         assert forbidden not in rendered
+
+
+@pytest.mark.parametrize('variable,explicit,expected', (
+    (None, 'inherit', 'observe'), ('', 'inherit', 'observe'),
+    (None, '', 'observe'), ('off', 'inherit', 'off'), ('false', 'inherit', 'off'),
+    ('invalid', 'inherit', 'off'), ('observe', 'inherit', 'observe'),
+    (None, 'off', 'off'), ('observe', 'off', 'off'),
+))
+def test_tracker_persistent_observe_keeps_lane_parity_and_real_reader_disable(wrapper_repo, variable, explicit, expected, monkeypatch):
+    from scripts import track_performance as tracker
+    root, env = wrapper_repo
+    clock = step('track_performance.yml', 'Run performance clock')
+    daily = step('daily_sync.yml', 'Track Performance (record + audit)')
+    expression = clock['env']['TRACK_DEDUP_SIGNAL_HISTORY']
+    assert expression == daily['env']['TRACK_DEDUP_SIGNAL_HISTORY'] == (
+        "${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}")
+    configured = workflow_variable_value(expression, 'TRACK_DEDUP_SIGNAL_HISTORY', variable)
+    env |= {'INPUT_SIGNAL_HISTORY_MODE':explicit, 'INPUT_RUN_AUDIT':'false',
+            'TRACK_DEDUP_SIGNAL_HISTORY':configured}
+    block = clock['run'].replace('${{ github.event.inputs.enable_debug }}', 'false')
+    run = subprocess.run(['bash', '-c', block], cwd=root, env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    actual = json.loads((root / 'actual_tracker_call.json').read_text())
+    monkeypatch.setenv('TRACK_DEDUP_SIGNAL_HISTORY', actual['mode'])
+    assert tracker._dedup_signal_mode() == expected
+    value = json.loads((root / 'tracker_activation_receipt.json').read_text())
+    assert value['signal_history_mode'] == expected
+    assert value['execution_evidence_complete'] is True
+    assert value['audit_enabled'] is value['historical_grid_save_requested'] is False
+    assert value['signal_history_measurement_only'] is True
+    assert value['same_day_deduplication_applied'] is False
 
 
 def test_tracker_manual_enforce_is_refused_before_execution(wrapper_repo):

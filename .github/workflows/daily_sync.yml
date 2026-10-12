@@ -44,6 +44,11 @@ on:
         required: false
         default: "MARKET_LEADERS"
         type: string
+      include_portfolio:
+        description: "Include My_Portfolio in a manual full_sync when the configured key list omits it"
+        required: false
+        default: false
+        type: boolean
       rank_mode:
         description: "Whole-page ranking override for this run (inherit repository variable)"
         required: false
@@ -341,7 +346,10 @@ jobs:
       # with a sheet reader stays). Explicit words only ('1'/'true' read as
       # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
       # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
-      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      # (2026-10-12) Operator-authorized initial rollout observes by default.
+      # Enforcement stays blocked without a verified external archive.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'observe' }}
       TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
@@ -598,7 +606,10 @@ jobs:
       # withheld rows written "". Explicit words only ('1'/'true' read as off).
       # Armed through the repo Variable after the observe read-back; no YAML
       # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
+      # (2026-10-12) Operator-authorized initial rollout remains observe;
+      # enforcement requires full-page proof. Explicit Variables win.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
       # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
       # runner stops fetching new batches once 3600s of wall clock are spent
       # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
@@ -767,6 +778,7 @@ jobs:
           INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
           INPUT_MODE: ${{ github.event.inputs.run_mode }}
           INPUT_KEY: ${{ github.event.inputs.single_key }}
+          INPUT_INCLUDE_PORTFOLIO: ${{ github.event.inputs.include_portfolio }}
           INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
 
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
@@ -918,10 +930,13 @@ jobs:
 
           validate_keys_allowed "$KEYS"
 
-          # Scheduled full refreshes must include the active portfolio even
-          # when a legacy DEFAULT_SYNC_KEYS override omits it. Preserve manual
-          # subset requests, health-only mode, validated keys and key order.
-          if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "$MODE" == "full_sync" ]]; then
+          # (2026-10-12) Scheduled full refreshes include the active portfolio
+          # despite a legacy key list. Manual full_sync can explicitly opt in;
+          # absent/false/invalid inputs preserve the requested subset. Single-key
+          # and health-only scope and the portfolio no-clear path stay intact.
+          if [[ "$MODE" == "full_sync" &&
+                ( "${GITHUB_EVENT_NAME:-}" == "schedule" ||
+                  ( "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_INCLUDE_PORTFOLIO:-false}" == "true" ) ) ]]; then
             KEYS="$(sanitize_keys "$KEYS MY_PORTFOLIO")"
           fi
 
@@ -1279,16 +1294,20 @@ jobs:
           # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
           # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
           # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
-          # Unset -> 'off' / '0' / 'off' = the script defaults = byte-identical.
+          # Matured/risk defaults remain off/0; signal observation is authorized
+          # below while all three source-code defaults remain unchanged.
           # WHY HERE TOO: PerformanceStore.save_records rewrites every row, so
           # TRACK_RISK_BLANK armed in one lane only would be undone by this lane's
           # next save. READ-BACK: job-log lines '[v6.41.0 DEDUP-MATURED] mode=...'
           # and '[v6.44.0 DEDUP-SIGNAL] mode=...' plus the ' | dedup_matured' and
           # ' | dedup_signal' tokens on the [PERF-VERDICT] _Run_Log line.
-          # ROLLBACK: delete the three lines (or unset the Variables).
+          # (2026-10-12) Operator-authorized signal-repeat observation: absent
+          # Variables select observe; explicit off/invalid still reach the parser.
+          # ROLLBACK: set TRACK_DEDUP_SIGNAL_HISTORY to off; unsetting
+          # reactivates observe. No historical deduplication is performed.
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
-          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'off' }}
+          TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}
           # (2026-10-11) v6.45.0 prospective schema / publication identities.
           # Defaults off: arm one measured lane-consistent feature at a time.
           # Immutable snapshots retain first and subsequent daily publications;
@@ -1695,7 +1714,9 @@ jobs:
       # withheld rows written "". Explicit words only ('1'/'true' read as off).
       # Armed through the repo Variable after the observe read-back; no YAML
       # edit per sitting. Arm BEFORE the engine's TFB_SETTLE_UNRESOLVED.
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
+      # (2026-10-12) Same operator-authorized observation as the primary lane.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
       # FULL-FILL v1.1.0 (2026-08-04): arm the data-complete criterion + cycle loop.
       # Kill-switches: remove these three lines (or set 0/"1" resp.) to restore the
       # single-pass "process-success" behavior byte-identically.
@@ -1742,7 +1763,10 @@ jobs:
       # with a sheet reader stays). Explicit words only ('1'/'true' read as
       # off). Armed through the repo Variable (the OHLC_PREWRITE pattern), no
       # YAML edit per sitting. KEEP = csv of extra tag heads kept in-cell.
-      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      # (2026-10-12) Same operator-authorized observation as the primary lane.
+      # Enforcement stays blocked without a verified external archive.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'observe' }}
       TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v1.2.0 P-154b QUOTA-AWARE RECOVERY - OBSERVE (2026-09-23). Before each
       # page replay run_inline_page_recovery.py parses the page's last

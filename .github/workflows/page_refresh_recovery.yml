@@ -205,13 +205,17 @@ jobs:
       TFB_SYNC_MARKET_GATEWAY: analysis
       # v6.65.0 WP-6 WARNINGS-COMPACT (2026-10-11): a recovery write obeys the
       # same gate as the scheduled legs (off | observe | enforce, explicit
-      # words); the enforce sink file is uploaded by the evidence step below.
-      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'off' }}
+      # words). (2026-10-12) Operator-authorized initial rollout observes;
+      # enforcement stays blocked without a verified external archive.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_WARNINGS_COMPACT: ${{ vars.TFB_WARNINGS_COMPACT || 'observe' }}
       TFB_WARNINGS_COMPACT_KEEP: ${{ vars.TFB_WARNINGS_COMPACT_KEEP || '' }}
       # v6.66.0 WP-2c RANK-PAGE (2026-10-11): a recovery write ranks Rank (Overall)
       # over the whole page under the same gate as the scheduled legs; without this
       # mapping a recovery after arming would republish within-batch ranks (batch 25).
-      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}
+      # (2026-10-12) Same operator-authorized observation as scheduled legs.
+      # Rollback: set the Variable to off; unsetting reactivates observe.
+      TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
     steps:
       - name: Checkout

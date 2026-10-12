@@ -33,7 +33,7 @@ name: "💾 TFB Workbook Backup"
 #      — two overlapping exports could race the retention prune.
 # ROLLBACK: revert this file (each item is independent).
 # ============================================================================
-# v1.2.0 (2026-10-11) — [WP-0] SAME-JOB WORKBOOK DQ AUDIT, OFF BY DEFAULT.
+# v1.2.0 (2026-10-11) — [WP-0] SAME-JOB WORKBOOK DQ AUDIT.
 # WHY: the audit framework's 75-check catalogue (DQ-01..DQ-75) was measured by
 # hand on the 2026-10-11 export; nothing in CI produced the numbers daily. The
 # 2026-10-10 export (22,487,265 bytes, 50 tabs, 9,791 live rows) showed 275
@@ -42,7 +42,7 @@ name: "💾 TFB Workbook Backup"
 # runs — invisible to every workflow because no step ever held the exported
 # bytes (backup_workbook.py keeps them in memory; there is no upload-artifact).
 # GATE: repo Variable TFB_DQ_AUDIT_MODE = off | observe | enforce.
-#   unset / off (default) -> TFB_BACKUP_LOCAL_COPY resolves to '' (backup
+#   off -> TFB_BACKUP_LOCAL_COPY resolves to '' (backup
 #       script v1.5.0 behaves exactly as v1.4.0), the two new steps are skipped
 #       by their `if:` -> the workflow is byte-equivalent in effect to v1.1.0.
 #   observe -> backup_workbook.py v1.5.0 also writes the export to
@@ -56,9 +56,10 @@ name: "💾 TFB Workbook Backup"
 #       reddens the job (the backup itself has already succeeded by then).
 # THE XLSX IS NEVER UPLOADED: it stays on the runner and is removed in the
 # always() cleanup step together with the credentials file.
-# Arming: set the Variable to observe, read the `[DQ-AUDIT v1.0.x] ...` line
-# of the next run, then enforce. ROLLBACK: delete the env line, the two steps
-# and the cleanup extension (or set the Variable to off — same effect).
+# (2026-10-12) Operator-authorized initial rollout: unset/empty Variables
+# select observe; explicit off and invalid values still disable the audit.
+# Keep observe while DQ failures remain. ROLLBACK: set the Variable to off
+# or restore the workflow fallback to off; unsetting reactivates observe.
 # ============================================================================
 
 on:
@@ -126,13 +127,13 @@ jobs:
       - name: Install deps
         run: pip install --quiet "gspread==6.2.1" "google-auth==2.49.2" "requests==2.33.1" "openpyxl==3.1.5"
 
-      # (2026-10-12) Manual observation does not require repository Variables
-      # write permission. Scheduled/inherit runs retain the existing setting.
+      # (2026-10-12) Scheduled/inherit runs observe by default under the
+      # operator-authorized rollout; explicit Variables and manual off win.
       - name: Resolve this run's DQ mode
         id: dq_mode
         env:
           INPUT_DQ_MODE: ${{ github.event.inputs.dq_audit_mode }}
-          REPOSITORY_DQ_MODE: ${{ vars.TFB_DQ_AUDIT_MODE }}
+          REPOSITORY_DQ_MODE: ${{ vars.TFB_DQ_AUDIT_MODE || 'observe' }}
         run: |
           set -euo pipefail
           case "${INPUT_DQ_MODE:-inherit}" in
@@ -182,7 +183,7 @@ jobs:
           python scripts/backup_workbook.py $EXTRA
 
       # v1.2.0 [WP-0]: offline DQ-01..DQ-75 audit of the bytes just exported.
-      # Skipped unless the repo Variable TFB_DQ_AUDIT_MODE is observe/enforce;
+      # Skipped unless this run's resolved DQ mode is observe/enforce;
       # observe never reddens the backup (continue-on-error). The xlsx is read
       # from the runner and is never uploaded. Exit 1 = decision-critical
       # regression vs the committed baseline fixture.

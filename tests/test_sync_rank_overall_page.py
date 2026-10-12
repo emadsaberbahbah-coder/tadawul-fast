@@ -481,7 +481,7 @@ def test_a2_runlog_kill_switch_and_failure_never_counted(monkeypatch):
 def test_y1_both_market_jobs_map_the_gate_through_the_repo_variable():
     text = DAILY.read_text(encoding="utf-8")
     declarations = re.findall(r"^\s+TFB_RANK_OVERALL_PAGE:\s*(.+)$", text, re.M)
-    assert declarations == ["${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}"] * 2
+    assert declarations == ["${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}"] * 2
     lines = text.splitlines()
     jobs = [(i, ln.strip()[:-1]) for i, ln in enumerate(lines) if re.match(r"^  [a-z][a-z0-9-]*:$", ln)]
 
@@ -504,7 +504,7 @@ def test_y4_recovery_job_maps_the_gate_too():
     lines = path.read_text(encoding="utf-8").splitlines()
     decl = [(i, ln.split(":", 1)[1].strip()) for i, ln in enumerate(lines)
             if re.match(r"^\s+TFB_RANK_OVERALL_PAGE:", ln)]
-    assert [v for _, v in decl] == ["${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}"], decl
+    assert [v for _, v in decl] == ["${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}"], decl
     jobs = [(i, ln.strip()[:-1]) for i, ln in enumerate(lines) if re.match(r"^  [a-z][a-z0-9-]*:$", ln)]
     owner = None
     for i, name in jobs:

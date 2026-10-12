@@ -10,6 +10,7 @@ import pytest
 
 from tests.test_approved_universe_workflow import workflow
 from tests.test_scheduled_portfolio_refresh import accepts
+from tests.test_workflow_activation_observe import workflow_variable_value
 
 LANES = (("daily_sync.yml", "sync-dashboard"),
          ("daily_sync.yml", "recover-missing-market-pages"),
@@ -91,8 +92,35 @@ def test_scheduled_inherit_preserves_source_normalization_and_repository_default
     assert evidence["requested"] == {"rank": "inherit", "warnings": "inherit"}
     assert evidence["effective"] == {"rank": expected_rank, "warnings": "observe" if warnings_raw.strip().lower() == "observe" else "off"}
     job = workflow(lane[0])["jobs"][lane[1]]
-    assert job["env"]["TFB_RANK_OVERALL_PAGE"] == "${{ vars.TFB_RANK_OVERALL_PAGE || 'off' }}"
-    assert job["env"]["TFB_WARNINGS_COMPACT"] == "${{ vars.TFB_WARNINGS_COMPACT || 'off' }}"
+    assert job["env"]["TFB_RANK_OVERALL_PAGE"] == "${{ vars.TFB_RANK_OVERALL_PAGE || 'observe' }}"
+    assert job["env"]["TFB_WARNINGS_COMPACT"] == "${{ vars.TFB_WARNINGS_COMPACT || 'observe' }}"
+
+
+@pytest.mark.parametrize("lane", LANES)
+@pytest.mark.parametrize("event", ("schedule", "workflow_dispatch"))
+@pytest.mark.parametrize("variable,override,expected", (
+    (None, "inherit", "observe"), ("", "inherit", "observe"),
+    ("off", "inherit", "off"), ("false", "inherit", "off"),
+    ("invalid", "inherit", "off"), ("observe", "inherit", "observe"),
+    (None, "off", "off"), ("observe", "off", "off"),
+))
+def test_persistent_observe_defaults_preserve_explicit_disable_in_all_writer_lanes(lane, event, variable, override, expected, tmp_path):
+    job = workflow(lane[0])["jobs"][lane[1]]
+    configured = {}
+    for name in ("TFB_RANK_OVERALL_PAGE", "TFB_WARNINGS_COMPACT"):
+        assert job["env"][name] == "${{ vars." + name + " || 'observe' }}"
+        configured[name] = workflow_variable_value(job["env"][name], name, variable)
+    result = resolve(lane, tmp_path, GITHUB_EVENT_NAME=event,
+                     RANK_MODE_OVERRIDE=override, WARNINGS_MODE_OVERRIDE=override, **configured)
+    assert result.returncode == 0, result.stdout + result.stderr
+    value = json.loads((tmp_path / "rollout_modes.json").read_text())
+    assert value["requested"] == {"rank":override, "warnings":override}
+    assert value["configured"] == {"rank":configured["TFB_RANK_OVERALL_PAGE"],
+                                    "warnings":configured["TFB_WARNINGS_COMPACT"]}
+    assert value["effective"] == {"rank":expected, "warnings":expected}
+    assert value["warnings_enforcement"] == "blocked_no_prewrite_external_archive"
+    assert (tmp_path / "github-env").read_text() == (
+        "TFB_RANK_OVERALL_PAGE=" + expected + "\nTFB_WARNINGS_COMPACT=" + expected + "\n")
 
 
 @pytest.mark.parametrize("lane", LANES)
