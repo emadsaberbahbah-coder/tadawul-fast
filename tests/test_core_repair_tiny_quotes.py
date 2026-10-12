@@ -14,7 +14,8 @@ from unittest.mock import patch
 from scripts import verify_core_repair_readback as probe
 
 COMMIT = "a" * 40
-WORKFLOW_COMMIT = "f" * 40
+WORKFLOW_COMMIT = COMMIT
+OTHER_COMMIT = "f" * 40
 ENGINE = "5.154.0"
 ROUTE = "4.8.3"
 SYMBOLS = ["SHIB-USD", "DOGE-USD", "XRP-USD"]
@@ -65,6 +66,9 @@ class FakeRequest:
         self.receipts = []
         self.post_error = None
         self.post_status = 200
+        self.default_warnings = {row["symbol"]: row["warnings"]
+                                 for row in self.payload["row_objects"]}
+        self.last_post_payload = None
 
     def __call__(self, path, body=None, authenticated=False):
         self.calls.append((path, copy.deepcopy(body), authenticated))
@@ -72,7 +76,17 @@ class FakeRequest:
             payload = self.after if self.after is not None and len(self.calls) > 1 else self.health
             status = 200
         elif path == PATH:
-            payload, status = self.payload, self.post_status
+            payload, status = copy.deepcopy(self.payload), self.post_status
+            # The fake provider mints genuine fixture acquisition evidence
+            # during POST, never in the probe. Explicit cached/bad overrides
+            # survive unchanged; the configured payload remains immutable.
+            rows = payload.get("row_objects", [])
+            if isinstance(rows, list):
+                for row in rows:
+                    if (isinstance(row, dict) and row.get("warnings") ==
+                            self.default_warnings.get(row.get("symbol"))):
+                        row["warnings"] = acquisition(stamp=datetime.now(UTC))
+            self.last_post_payload = copy.deepcopy(payload)
         else:
             raise AssertionError("Unexpected route: " + path)
         raw = json.dumps(payload, allow_nan=True, sort_keys=True).encode()
@@ -116,7 +130,7 @@ class TinyQuoteReadbackTests(unittest.TestCase):
         self.assertEqual(post[1]["symbols"], SYMBOLS)
         self.assertEqual(post[1]["limit"], 3)
         self.assertIs(post[1]["include_matrix"], False)
-        self.assertIs(post[1]["refresh"], True)
+        self.assertNotIn("refresh", post[1])
         self.assertNotIn("rows", post[1], "Real quote request must not manufacture probe rows")
         self.assertEqual(result["expected_backend_commit"], COMMIT)
         self.assertEqual(result["workflow_source_sha"], WORKFLOW_COMMIT)
@@ -125,6 +139,47 @@ class TinyQuoteReadbackTests(unittest.TestCase):
         self.assertEqual({r["symbol"] for r in result["rows"]}, set(SYMBOLS))
         self.assertEqual(result["response_receipt"]["response_sha256"], self.post_receipt()["response_sha256"])
         self.assertEqual(result["response_receipt"]["response_bytes"], self.post_receipt()["response_bytes"])
+        started = datetime.fromisoformat(result["request_started_at_utc"])
+        captured = datetime.fromisoformat(self.post_receipt()["captured_at_utc"])
+        for row in result["rows"]:
+            acquired = datetime.fromisoformat(row["acquisition_receipt"]["acquisition_acquired_at"])
+            self.assertGreaterEqual(acquired, started)
+            self.assertLessEqual(acquired, captured)
+
+    def test_workflow_sha_drift_or_missing_source_fails_before_any_request(self):
+        for workflow_commit in (OTHER_COMMIT, None):
+            with self.subTest(workflow_commit=workflow_commit):
+                request = FakeRequest()
+                result = probe.verify_tiny_quotes(request, COMMIT, ENGINE, ROUTE,
+                                                   workflow_commit=workflow_commit)
+                self.assert_status(result, "failed")
+                self.assertEqual(request.calls, [])
+                self.assertEqual(request.receipts, [])
+                self.assertIsNone(result["response_receipt"])
+
+    def test_cached_under_fifteen_minutes_is_withheld_without_rewriting_evidence(self):
+        stamp = datetime.now(UTC) - timedelta(seconds=30)
+        warning = acquisition(stamp=stamp)
+        row = self.request.payload["row_objects"][0]
+        row["warnings"] = warning
+        original = copy.deepcopy(self.request.payload)
+        result = self.run_probe()
+        self.assert_status(result, "withheld")
+        observed = next(r for r in result["rows"] if r["symbol"] == "SHIB-USD")
+        self.assertEqual(observed["status"], "withheld")
+        for check in observed["tuples"].values():
+            self.assertEqual(check["status"], "withheld")
+            self.assertEqual(check["arithmetic_status"], "verified")
+            self.assertIn("derived_roi_fraction", check)
+            self.assertIn("rounding_tolerance", check)
+        self.assertEqual(observed["warnings"], warning)
+        self.assertEqual(observed["acquisition_receipt"]["acquisition_acquired_at"], iso(stamp))
+        self.assertLess(stamp, datetime.fromisoformat(result["request_started_at_utc"]))
+        for key in ("current_price", *[prefix + horizon for horizon in HORIZONS
+                                      for prefix in ("forecast_price_", "expected_roi_")]):
+            self.assertEqual(observed[key], row[key])
+        self.assertEqual(self.request.payload, original)
+        self.assertEqual(result["response_receipt"]["response_sha256"], self.post_receipt()["response_sha256"])
 
     def test_start_health_requires_boolean_readiness_exact_engine_modes_and_no_warnings(self):
         patches = [("ready", 1), ("engine_ready", "true"), ("engine_version", "5.153.0"),
@@ -324,10 +379,11 @@ class TinyQuoteReadbackTests(unittest.TestCase):
 
 
 class TinyQuoteCliTests(unittest.TestCase):
-    def invoke(self, token="local-test-token", tiny=False, core=None, version_reader=None):
+    def invoke(self, token="local-test-token", tiny=False, core=None, version_reader=None,
+               workflow_sha=WORKFLOW_COMMIT):
         request = FakeRequest()
         stream = io.StringIO()
-        environment = {"BACKEND_TOKEN": token, "GITHUB_SHA": WORKFLOW_COMMIT,
+        environment = {"BACKEND_TOKEN": token, "GITHUB_SHA": workflow_sha,
                        "GITHUB_RUN_ID": "38210000000"}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "artifact.json"
@@ -363,6 +419,28 @@ class TinyQuoteCliTests(unittest.TestCase):
         transport.assert_not_called()
         verify.assert_not_called()
         tiny.assert_not_called()
+
+    def test_cli_sha_drift_writes_failure_before_constructing_transport(self):
+        code, artifact, stdout, request, transport, verify, tiny = self.invoke(
+            tiny=True, workflow_sha=OTHER_COMMIT)
+        self.assertEqual(code, 1)
+        self.assertIs(artifact["ok"], False)
+        self.assertEqual(artifact["expected_backend_commit"], COMMIT)
+        self.assertEqual(artifact["workflow_source_sha"], OTHER_COMMIT)
+        self.assertEqual(artifact["http_receipts"], [])
+        self.assertEqual(stdout, artifact)
+        self.assertEqual(request.calls, [])
+        transport.assert_not_called()
+        verify.assert_not_called()
+        tiny.assert_not_called()
+
+    def test_workflow_has_no_backend_override_and_binds_expected_sha_to_workflow(self):
+        root = Path(probe.__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/core_repair_readback.yml").read_text()
+        self.assertNotIn("expected_backend_commit:", workflow)
+        self.assertNotIn("inputs.expected_backend_commit", workflow)
+        self.assertIn("EXPECTED_COMMIT: ${{ github.sha }}", workflow)
+        self.assertIn("WORKFLOW_SOURCE_SHA: ${{ github.sha }}", workflow)
 
     def test_quoted_and_backslashed_credential_is_redacted_recursively_before_encoding(self):
         token = 'quoted"\\credential-sentinel'

@@ -16,7 +16,7 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 BACKEND = "https://tadawul-fast-bridge.onrender.com"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 OPPORTUNITY_PATH = "/sheet-rows/opportunity-candidates"
 PORTFOLIO_ACTIONS_PATH = "/sheet-rows/portfolio-actions"
 PORTFOLIO_PROBE_SYMBOL = "SYNTH.SR"
@@ -153,7 +153,7 @@ def _quote_error(exc):
     return "backend HTTP " + match.group(1) if match else "tiny quote request failed"
 
 
-def _quote_acquisition(row, now):
+def _quote_acquisition(row, now, request_started_at):
     warnings = row.get("warnings")
     if not isinstance(warnings, str):
         return {}, ["acquisition_receipt_missing"]
@@ -187,6 +187,9 @@ def _quote_acquisition(row, now):
             reasons.append(name + "_missing_or_invalid")
     if (len(times) == 2 and (times["acquisition_quote_asof"] - times["acquisition_acquired_at"]).total_seconds() > 60):
         reasons.append("quote_after_acquisition")
+    if ("acquisition_acquired_at" in times
+            and times["acquisition_acquired_at"] < request_started_at):
+        reasons.append("acquisition_predates_quote_request")
     return {key: _safe_quote_text(value, 128) for key, value in tokens.items()}, reasons
 
 
@@ -211,15 +214,21 @@ def verify_tiny_quotes(request, expected_commit, expected_engine, expected_route
 
     Null/erased values remain unavailable. A returned target is an observed
     model output, not a supplier target or actionable investment certificate.
+    A recent cached acquisition predating this request cannot certify the
+    current price boundary; its numbers are retained as withheld observations.
     """
     result = {"ok": False, "status": "withheld", "requested_symbols": list(TINY_SYMBOLS),
               "expected_backend_commit": expected_commit, "workflow_source_sha": workflow_commit,
               "health_before": None, "health_after": None, "response_receipt": None,
+              "request_started_at_utc": None,
               "rows": [], "reasons": [], "read_only": True,
               "scope": "actual API quote/forecast precision witness only; no funding, custody or native installation attested"}
     if (not re.fullmatch(r"[0-9a-f]{40}", str(expected_commit)) or
-            (workflow_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", str(workflow_commit)))):
+            not re.fullmatch(r"[0-9a-f]{40}", str(workflow_commit))):
         result.update(status="failed", reasons=["full_commit_sha_required"])
+        return result
+    if workflow_commit != expected_commit:
+        result.update(status="failed", reasons=["workflow_backend_sha_mismatch"])
         return result
     quote_requested = False
     final_health_attempted = False
@@ -227,8 +236,10 @@ def verify_tiny_quotes(request, expected_commit, expected_engine, expected_route
         result["health_before"] = _quote_health(request("/health"), expected_commit, expected_engine)
         body = {"page": "Commodities_FX", "symbols": list(TINY_SYMBOLS), "tickers": list(TINY_SYMBOLS),
                 "limit": 3, "offset": 0, "include_meta": True, "include_matrix": False,
-                "refresh": True, "request_id": "tiny-quote-readback"}
+                "request_id": "tiny-quote-readback"}
         quote_requested = True
+        request_started_at = datetime.now(UTC)
+        result["request_started_at_utc"] = request_started_at.isoformat()
         payload = request(TINY_QUOTE_PATH, body, True)
         result["response_receipt"] = _quote_receipt(request)
         receipt = result["response_receipt"] or {}
@@ -255,6 +266,8 @@ def verify_tiny_quotes(request, expected_commit, expected_engine, expected_route
             out = {"symbol": row["symbol"], "data_provider": _safe_quote_text(row.get("data_provider"), 128),
                    "forecast_source": _safe_quote_text(row.get("forecast_source"), 128),
                    "warnings": _safe_quote_text(row.get("warnings")), "tuples": {}, "reasons": []}
+            for key in ("investability_status", "final_action", "block_reason", "scoring_errors"):
+                out[key] = _safe_quote_text(row.get(key))
             numeric = ["current_price"] + [field + horizon for horizon in ("1m", "3m", "12m")
                                          for field in ("forecast_price_", "expected_roi_")]
             for key in numeric:
@@ -264,7 +277,7 @@ def verify_tiny_quotes(request, expected_commit, expected_engine, expected_route
             cp = out["current_price"]
             if cp is not None and (cp <= 0 or cp >= 10 or (row["symbol"] == "SHIB-USD" and cp >= 0.0001)):
                 out["reasons"].append("current_price:outside_tiny_positive_scope")
-            out["acquisition_receipt"], acquisition_reasons = _quote_acquisition(row, now)
+            out["acquisition_receipt"], acquisition_reasons = _quote_acquisition(row, now, request_started_at)
             out["reasons"].extend(acquisition_reasons)
             if not out["forecast_source"]:
                 out["reasons"].append("forecast_source_missing")
@@ -273,6 +286,9 @@ def verify_tiny_quotes(request, expected_commit, expected_engine, expected_route
                 check = {"status": "withheld", "reasons": ["tuple_missing_or_nonpositive"], "roi_unit": "fraction"}
                 if cp is not None and cp > 0 and fp is not None and fp > 0 and roi is not None:
                     check = {**_quote_tuple(cp, fp, roi), "roi_unit": "fraction"}
+                    if acquisition_reasons and check["status"] == "verified":
+                        check.update(status="withheld", arithmetic_status="verified",
+                                     reasons=list(acquisition_reasons))
                 check.update(forecast_price=fp, expected_roi_fraction=roi)
                 out["tuples"][horizon] = check
             invalid = any(reason.endswith((":invalid_numeric_type", ":nonfinite")) for reason in out["reasons"])
@@ -509,8 +525,10 @@ def main():
             raise ReadbackError("BACKEND_TOKEN is not configured")
         if not re.fullmatch(r"[0-9a-f]{40}", args.expected_commit):
             raise ReadbackError("expected backend commit must be a full 40-character hexadecimal SHA")
-        if args.workflow_source_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", args.workflow_source_sha):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(args.workflow_source_sha)):
             raise ReadbackError("workflow source SHA must be a full 40-character hexadecimal SHA")
+        if args.workflow_source_sha != args.expected_commit:
+            raise ReadbackError("workflow source SHA differs from expected backend commit")
         request = transport(token)
         result = verify(request, args.expected_commit,
                         source_version("core/data_engine_v2.py", "__version__"),

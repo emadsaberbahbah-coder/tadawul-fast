@@ -12,11 +12,6 @@ on:
         type: boolean
         required: false
         default: false
-      expected_backend_commit:
-        description: Optional tested backend full 40-character hexadecimal SHA; default workflow SHA
-        type: string
-        required: false
-        default: ''
 permissions:
   contents: read
 concurrency:
@@ -72,7 +67,7 @@ jobs:
       - name: Verify deployed SHA, authenticated signing and empty allocation
         env:
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
-          EXPECTED_COMMIT: ${{ inputs.expected_backend_commit || github.sha }}
+          EXPECTED_COMMIT: ${{ github.sha }}
           WORKFLOW_SOURCE_SHA: ${{ github.sha }}
           TINY_QUOTE_READBACK: ${{ inputs.tiny_quote_readback }}
         run: |
