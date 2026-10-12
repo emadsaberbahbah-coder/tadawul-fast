@@ -1,6 +1,8 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
-# VERSION 1.0.0 (2026-10-11) -- WP-02/WP-05 OPERATOR FLAG MAPPINGS
+# VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
+# Historical maturity auditing requires explicit manual opt-in; schedules
+# keep recording/analyzing/exporting with old-grid publication disabled.
 # WHY: the 2026-10-10 export has 27 duplicate matured keys and 198 unavailable
 # symbols re-fetched every run. Wire existing guards and the crypto KLG name
 # guard to repository Variables in every writer lane, with default-off modes.
@@ -62,9 +64,9 @@ on:
         type: choice
         options: ["inherit", "off", "observe"]
       run_tracker:
-        description: "Run the bundled historical maturity audit (use false for activation; run the separate record-only tracker)"
+        description: "Allow historical maturity audit (explicit opt-in)"
         required: false
-        default: true
+        default: false
         type: boolean
       # (2026-07-26 PY-5) google_creds_json input REMOVED. workflow_dispatch
       # inputs are recorded in run metadata — on a PUBLIC repo, a service-
@@ -1243,10 +1245,11 @@ jobs:
           exit 0
 
       # -------------------------------------------------------------------------
-      # 📈 Forward-performance tracking: record today's picks + audit actives (NEW)
+      # 📈 Forward-performance tracking: record today; maturity audit is opt-in
       # -------------------------------------------------------------------------
       # Records the current Top-10 picks (entry snapshot incl. the gate fields)
-      # and re-prices / matures active records. Records are keyed by
+      # with historical maturity auditing only on explicit manual opt-in.
+      # Records are keyed by
       # symbol|horizon|YYYYMMDD, so the 15-minute cron re-runs are idempotent
       # (no Performance_Log spam). Non-blocking: a tracking hiccup must never
       # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
@@ -1266,6 +1269,7 @@ jobs:
         if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_tracker != 'false') }}
         continue-on-error: true
         env:
+          INPUT_RUN_TRACKER: ${{ github.event.inputs.run_tracker }}
           PYTHONPATH: ${{ github.workspace }}
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
@@ -1337,9 +1341,22 @@ jobs:
           # fail the sync) but now makes a failure VISIBLE: capture the exit
           # code AND scan the run log for write/permission failure signatures,
           # emitting ::error:: in either case so it can't hide again.
+          AUDIT_FLAG=""
+          if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_RUN_TRACKER:-}" == "true" ]]; then
+            AUDIT_FLAG="--audit"
+          else
+            # Scheduled recording and blank inputs must not inherit an audit
+            # or calibration/trend writeback that rewrites old history.
+            export TRACK_AUDIT=0
+            export TRACK_PUBLISH_CALIBRATION=0
+            export TFB_SIGNAL_TRENDS_TAB=0
+            export TFB_TRACK_SUMMARY_SIDE=1
+          fi
+          CMD=(python scripts/track_performance.py --record $AUDIT_FLAG --analyze --export
+               --sheet-id "$TARGET_SHEET_ID")
+          echo "📋 ${CMD[*]}"
           set +e
-          python scripts/track_performance.py --record --audit --analyze \
-            --sheet-id "$TARGET_SHEET_ID" 2>&1 | tee /tmp/track_performance.log
+          "${CMD[@]}" 2>&1 | tee /tmp/track_performance.log
           TRACK_RC=${PIPESTATUS[0]}
           set -e
           if [ "$TRACK_RC" -ne 0 ]; then

@@ -55,7 +55,7 @@ def test_dispatch_controls_allow_rank_enforce_but_no_warning_enforce(file):
 def test_activation_can_refresh_all_sources_without_bundled_historical_save(event, choice, group, mode, expected):
     daily = workflow("daily_sync.yml")
     control = daily["on"]["workflow_dispatch"]["inputs"]["run_tracker"]
-    assert control["type"] == "boolean" and str(control["default"]).lower() == "true"
+    assert control["type"] == "boolean" and str(control["default"]).lower() == "false"
     expression = step(LANES[0], "📈 Track Performance (record + audit)")["if"]
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     assert accepts(expression, group=group, mode=mode, event=event, run_tracker=choice) is expected

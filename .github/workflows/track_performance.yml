@@ -1,6 +1,8 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
-# VERSION 1.0.0 (2026-10-11) -- WP-02 OPERATOR FLAG MAPPINGS
+# VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
+# Historical maturity auditing requires explicit manual opt-in; schedules
+# keep recording/analyzing/exporting with old-grid publication disabled.
 # WHY: the 2026-10-10 export still has 27 duplicate matured keys and 11,791
 # matured rows with zero-valued risk placeholders. Existing v6.41.0 guards
 # could not run because their repository Variables were never mapped here.
@@ -91,9 +93,9 @@ on:
         required: false
         type: string
       run_audit:
-        description: "🔁 Also --audit (mature active picks)"
+        description: "Allow historical maturity audit (explicit opt-in)"
         required: false
-        default: true
+        default: false
         type: boolean
       enable_debug:
         description: "🐛 LOG_LEVEL=DEBUG"
@@ -385,17 +387,19 @@ jobs:
           esac
 
           # --record : capture today's picks + per-symbol verdict snapshots
-          # --audit  : mature active picks against realized prices (default ON;
-          #            without it picks never resolve to win/loss, so calibration
-          #            never gets decided outcomes)
+          # --audit  : historical maturity audit; explicit manual opt-in only.
+          #            The audit clears and reserializes old Performance rows.
           # --analyze: action-trend block + reliability calibration (calibration
           #            also runs here unless TRACK_CALIBRATION=0)
           # --export : write <base>_*.json (perf / signal_trends / calibration)
-          AUDIT_FLAG="--audit"
-          AUDIT_ENABLED=true
-          if [[ "${INPUT_RUN_AUDIT:-}" == "false" ]]; then
-            AUDIT_FLAG=""
-            AUDIT_ENABLED=false
+          AUDIT_FLAG=""
+          AUDIT_ENABLED=false
+          if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_RUN_AUDIT:-}" == "true" ]]; then
+            AUDIT_FLAG="--audit"
+            AUDIT_ENABLED=true
+          else
+            # Schedules and absent/false inputs record prospectively. Override
+            # inherited app defaults so --analyze cannot publish old outcomes.
             export TRACK_AUDIT=0
             export TRACK_PUBLISH_CALIBRATION=0
             export TFB_SIGNAL_TRENDS_TAB=0
