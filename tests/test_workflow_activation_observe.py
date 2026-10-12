@@ -165,7 +165,7 @@ sys.exit(int(os.getenv('OFFLINE_AUDIT_EXIT','0')))
     runner.mkdir()
     (runner / 'tfb_export.xlsx').write_bytes(b'offline current export')
     return tmp_path, dict(os.environ, GITHUB_SHA=source, TFB_CHECKOUT_SHA=source,
-        GITHUB_RUN_ID='12345', GITHUB_RUN_ATTEMPT='1',
+        GITHUB_RUN_ID='12345', GITHUB_RUN_ATTEMPT='1', GITHUB_EVENT_NAME='workflow_dispatch',
         RUNNER_TEMP=str(runner), GITHUB_STEP_SUMMARY=str(tmp_path / 'summary'),
         TARGET_SHEET_ID='offline-sheet', GOOGLE_SHEETS_CREDENTIALS='NEVER_EXPORT_SECRET',
         BACKEND_TOKEN='NEVER_EXPORT_TOKEN', TRACK_CANONICAL_TARGETS='0',
