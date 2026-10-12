@@ -2698,6 +2698,62 @@
         }
       ],
       "review_receipt_sha256": "dc0d3af55bc2c7ed0004154ce807c13a61bd4d3bd227071baa5ce00fb51cc0d6"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "STM.PA",
+      "name": "STMicroelectronics N.V.",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "Euronext Paris",
+        "Currency": "EUR",
+        "Country": "France"
+      },
+      "requires_quarantine": false,
+      "state": "Name caption only. Unchanged rawSymbol STM.PA retained without alias/replacement; exact vendor STM/PA/ISIN witness binds current Paris equity. Supplier inactive classification, blank price, BLOCK and low-trust guards retained; no tradability, eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000932787",
+        "ISIN": "NL0000226223",
+        "exact_exchange_code": "STMPA",
+        "native_provider_code": "STM",
+        "native_provider_exchange": "PA",
+        "namespace_bridge_receipt_sha256": "4b617de391dd536b1a0ac2660dc99e48aac428be8ba5033cb010454dc9ac6d4d",
+        "security_class": "Common shares, nominal EUR1.04; exact Paris ISIN (SEC); Name caption only",
+        "namespace_bridge_receipt_source": "https://eodhd.com/api/exchange-symbol-list/PA",
+        "namespace_bridge_receipt_capture_utc": "2026-10-11T22:38:30.922972+00:00",
+        "namespace_bridge_evidence_artifact_sha256": "2480db90686447ad648208706760495f277e641caf9cc49010c796cdeeec6ae9",
+        "namespace_bridge_limitation": "Original catalog body not retained; SHA256 is genuine producer-reported only and has not been independently rehashed."
+      },
+      "reviewed_at_utc": "2026-10-12T13:21:08.737969+00:00",
+      "expires_at_utc": "2026-10-19T13:21:08.737969+00:00",
+      "sources": [
+        {
+          "url": "https://live.euronext.com/en/product/equities/NL0000226223-XPAR",
+          "sha256": "f754d74484864890fffe20c810ebd014d117b50429b69ca3808b85aa99f71371",
+          "captured_at_utc": "2026-10-12T13:12:37.669734+00:00"
+        },
+        {
+          "url": "https://investors.st.com/resources/faqs",
+          "sha256": "87fd03e61ea0966d2ead323d54ab9e93b1d05c476c79b743fce66c8b0512e7f1",
+          "captured_at_utc": "2026-10-12T13:14:16.686981+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/932787/000093278726000009/stm-20251231.htm",
+          "sha256": "25cfab30ce1a2abdf580a25ed006174a42c8ee55cbb0485963be345022bb1cb3",
+          "captured_at_utc": "2026-10-12T13:18:41.389260+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/932787/000093278726000069/stm_sarxmaster-semiannual2.htm",
+          "sha256": "5ce1e75d1e0dcb284d2f6db8c1bfc10d5c966e069bc19c276bc7a431e0f0ee75",
+          "captured_at_utc": "2026-10-12T13:18:41.390187+00:00"
+        },
+        {
+          "url": "https://data.sec.gov/submissions/CIK0000932787.json",
+          "sha256": "2b5f22052803c6796b20f3d03415a843a6b4a8cb057c830e4e057f34756a8fb7",
+          "captured_at_utc": "2026-10-12T13:18:11.406558+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f6ca297854c26856996b8d08657f0f55817827dc166278510846487b0e217b0f"
     }
   ]
 }
