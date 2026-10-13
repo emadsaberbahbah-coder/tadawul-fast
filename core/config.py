@@ -2,7 +2,7 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.8.0
+Core Configuration Module — v5.8.1
 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE / ROUTE-AUTH-CONTROLLED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
@@ -22,6 +22,24 @@ Primary goals:
 
 Safe-by-default philosophy:
 - Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
+
+--------------------------------------------------------------------------------
+v5.8.1 (2026-10-13, SECURITY) -- auth_ok reads the routed path
+--------------------------------------------------------------------------------
+When a caller passes a request but no path, auth_ok took the path for its
+public-path check from request.url.path first. Starlette 0.41.3 re-parses
+that from f"{scheme}://{Host header}{scope['path']}" while the router
+dispatches on scope["path"], so a crafted Host such as "x/health?x=" or
+"x/static?" made it read a public path for a request routed to a protected
+one, and auth_ok(request=...) returned True with REQUIRE_AUTH on and no
+token. FIX: new _request_scope_path(request) (the ASGI scope path, root_path
+included; "" without a scope, which leaves the path empty: not public, a
+token is required). An explicit path argument is used exactly as before.
+INERT FOR VALID TRAFFIC: a valid Host cannot contain "/", "?" or "#", so
+url.path equals scope["path"] byte for byte and every decision is unchanged
+(tests/test_auth_wall_scope_path.py W14-W18). main.py v8.14.5 and the route
+modules now pass the scope path explicitly; this closes the fallback too.
+No ENV gate. Functions added 1, removed 0. Rollback: git revert.
 
 ────────────────────────────────────────────────────────────────────────────────
 Why v5.8.0 (vs v5.7.0) — OPEN PRICE ROUTING (Phase 1.3 of upgrade plan)
@@ -143,12 +161,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.8.0"
+# v5.8.1 (2026-10-13, SECURITY): auth_ok's request fallback reads the ASGI
+# scope path, not the Host-derived request.url.path (see the docstring).
+__version__ = "5.8.1"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -1970,6 +1990,25 @@ def is_public_path(path: Optional[str], settings: Optional[Settings] = None) -> 
     return False
 
 
+def _request_scope_path(request: Any) -> str:
+    """v5.8.1 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" when the request carries no scope path.
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def auth_ok(
     token: Optional[str] = None,
     authorization: Optional[str] = None,
@@ -1999,7 +2038,9 @@ def auth_ok(
     if request is not None:
         try:
             if not req_path:
-                req_path = getattr(getattr(request, "url", None), "path", None) or getattr(request, "scope", {}).get("path")
+                # v5.8.1: the routed (scope) path, never the Host-derived
+                # request.url.path (see _request_scope_path).
+                req_path = _request_scope_path(request) or None
         except Exception:
             pass
         try:
