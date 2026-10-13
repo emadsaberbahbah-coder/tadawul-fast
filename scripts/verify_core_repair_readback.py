@@ -16,7 +16,40 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 BACKEND = "https://tadawul-fast-bridge.onrender.com"
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.2.1"
+# v1.2.1 (2026-10-13) - [P0-6 ENFORCE MUST PUBLISH ITS LEVELS]
+# WHY: review of v1.2.0 (PR #764): a declared enforce accepted a blank
+# (None) research amount, so a deployed regression that blanked every
+# newly exposed value still passed the readback. The probe row supplies a
+# positive quantity, buy price, current price, SAR FX and intrinsic value;
+# portfolio_actions 1.16.0 under enforce serves MV 1000, cost 900, P&L 100,
+# P&L % 11.1, stop 92, TP1 115, TP2 130 and the same four holdings KPIs.
+# WHAT: under a declared enforce, every _RESEARCH_ROW_KEYS amount on the
+# probe row and every _RESEARCH_KPI_KEYS total must be present and a valid
+# research amount (finite; positive except P&L). off and observe are
+# unchanged, and every money / execution / weight / alert check is kept.
+# v1.2.0 (2026-10-13) - [P0-6 RESEARCH VIEW LOCKSTEP]
+# WHY: portfolio_actions 1.16.0 adds TFB_PF_RESEARCH_VIEW (default off).
+# Under enforce an unreconciled holding stays BLOCK with zero money but
+# shows market value, cost, P&L and stop / TP levels, and the holdings
+# KPIs can be filled. The unchanged probe below rejects that with
+# "uncertified portfolio amount was published: holdings_value_sar", so
+# arming enforce would turn the next manual readback red.
+# WHAT: new --expect-pf-research-view off|observe|enforce (default off).
+#   off     -> require_blocked_portfolio is byte-identical to v1.1.1 and
+#              the artifact gains no key (an armed enforce is still caught).
+#   observe -> the same strict checks, plus the served page must declare
+#              observe and carry the observe tag on the probe row.
+#   enforce -> row market value / cost / P&L / P&L % / stop / TP1 / TP2
+#              and the four holdings KPIs may be numbers ONLY when the page
+#              declares enforce and the row is BLOCK, carries the
+#              "[custody-unverified]" tag, ends "; not executable" and names
+#              no ADD verdict. Every money, execution, weight, sector, cash
+#              KPI and alert assertion is kept unchanged.
+#   A payload's own meta.research_view.mode is never enough: the workflow
+#   must declare the mode, so an accidental arming still fails.
+PF_RESEARCH_VIEW_MODES = ("off", "observe", "enforce")
+PF_RESEARCH_TAG = "[custody-unverified]"
 OPPORTUNITY_PATH = "/sheet-rows/opportunity-candidates"
 PORTFOLIO_ACTIONS_PATH = "/sheet-rows/portfolio-actions"
 PORTFOLIO_PROBE_SYMBOL = "SYNTH.SR"
@@ -358,7 +391,61 @@ def require_uncertified(payload, label):
         raise ReadbackError(label + " did not explicitly withhold certified funding")
 
 
-def require_blocked_portfolio(payload, expected_version):
+_RESEARCH_KPI_KEYS = ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct")
+_RESEARCH_ROW_KEYS = ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop_sar", "tp1_sar", "tp2_sar")
+_RESEARCH_SIGNED_KEYS = ("pnl_sar", "pnl_pct")
+
+
+def _research_amount(key, value):
+    """v1.2.0: a research-view display amount is blank or a finite number;
+    every amount except P&L must also be positive."""
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return False
+    return key in _RESEARCH_SIGNED_KEYS or value > 0
+
+
+def _require_research_view(payload, action, mode):
+    """v1.2.0: the served page must carry the mode the workflow declared."""
+    view = payload["meta"].get("research_view")
+    detail = action.get("detail") if isinstance(action.get("detail"), dict) else {}
+    row_view = detail.get("research_view")
+    if not isinstance(view, dict) or view.get("mode") != mode or view.get("status") != "ok" or \
+            not isinstance(row_view, dict) or row_view.get("mode") != mode:
+        raise ReadbackError("declared portfolio research view mode not served: " + mode)
+    reason = action.get("action_reason")
+    if not isinstance(reason, str) or not reason.startswith("RECONCILIATION_REQUIRED: "):
+        raise ReadbackError("portfolio research view row lost its reconciliation prefix")
+    if row_view.get("verdict") == "ADD" or "research verdict ADD" in reason:
+        raise ReadbackError("portfolio research view named an ADD verdict")
+    if mode == "observe":
+        if " | [research-observe] " + PF_RESEARCH_TAG + " " not in reason:
+            raise ReadbackError("observe portfolio research view tag missing")
+        return
+    if " | " + PF_RESEARCH_TAG + " " not in reason or "[research-observe]" in reason or \
+            not reason.endswith("; not executable"):
+        raise ReadbackError("enforce portfolio research view tag missing")
+    # v1.2.1: the probe has every input, so a declared enforce must publish
+    # every research amount; a blank one is a regression, not a pass.
+    for key in _RESEARCH_ROW_KEYS:
+        if action.get(key) is None or not _research_amount(key, action[key]):
+            raise ReadbackError("enforce portfolio research view did not publish: " + key)
+    for key in _RESEARCH_KPI_KEYS:
+        if payload["kpis"].get(key) is None or not _research_amount(key, payload["kpis"][key]):
+            raise ReadbackError("enforce portfolio research view did not publish KPI: " + key)
+    holdings = payload["kpis"].get("holdings_value_sar")
+    value = action.get("market_value_sar")
+    if holdings is not None and (value is None or abs(holdings - value) > 1):
+        raise ReadbackError("portfolio research view holdings total disagrees with its row")
+
+
+def require_blocked_portfolio(payload, expected_version, expected_research_view="off"):
+    # v1.2.0: off keeps every v1.1.1 check, order and message; only a
+    # declared enforce may show research display amounts (see header).
+    if expected_research_view not in PF_RESEARCH_VIEW_MODES:
+        raise ReadbackError("unsupported expected portfolio research view mode")
+    research = expected_research_view == "enforce"
     if payload.get("version") != expected_version or payload.get("status") != "ok":
         raise ReadbackError("portfolio actions version or status differs from source")
     require_uncertified(payload, "portfolio probe")
@@ -377,6 +464,8 @@ def require_blocked_portfolio(payload, expected_version):
             raise ReadbackError("nonzero or invalid withheld portfolio KPI: " + key)
     for key in ("portfolio_value_sar", "holdings_value_sar", "cash_sar", "cash_pct",
                 "cost_basis_sar", "pnl_sar", "pnl_pct"):
+        if research and key in _RESEARCH_KPI_KEYS and key in kpis and _research_amount(key, kpis[key]):
+            continue
         if key not in kpis or kpis[key] is not None:
             raise ReadbackError("uncertified portfolio amount was published: " + key)
     actions = payload.get("actions")
@@ -391,6 +480,8 @@ def require_blocked_portfolio(payload, expected_version):
             raise ReadbackError("unreconciled holding produced execution money: " + key)
     for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "weight_pct",
                 "post_trade_weight_pct", "stop_sar", "tp1_sar", "tp2_sar", "funds_from"):
+        if research and key in _RESEARCH_ROW_KEYS and key in action and _research_amount(key, action[key]):
+            continue
         if key not in action or action[key] is not None:
             raise ReadbackError("unreconciled holding produced an execution level: " + key)
     detail = action.get("detail")
@@ -404,10 +495,14 @@ def require_blocked_portfolio(payload, expected_version):
     if not isinstance(alerts, list) or len(alerts) != 1 or not isinstance(alerts[0], dict) or \
             alerts[0].get("type") != "portfolio_inputs_unverified":
         raise ReadbackError("portfolio protective alert missing or replaced with funding advice")
+    if expected_research_view != "off":
+        _require_research_view(payload, action, expected_research_view)
 
 
 def verify(request, expected_commit, expected_engine, expected_builder, expected_contract=1,
-           expected_portfolio_actions=None):
+           expected_portfolio_actions=None, expected_pf_research_view="off"):
+    if expected_pf_research_view not in PF_RESEARCH_VIEW_MODES:
+        raise ReadbackError("unsupported expected portfolio research view mode")
     if expected_portfolio_actions is None:
         expected_portfolio_actions = source_version("core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION")
     health = request("/health")
@@ -483,7 +578,7 @@ def verify(request, expected_commit, expected_engine, expected_builder, expected
     # These are fabricated probe inputs, with no account/custody capture and
     # no reconciliation packet. The real route must withhold all execution.
     protective = request(PORTFOLIO_ACTIONS_PATH, portfolio_probe, True)
-    require_blocked_portfolio(protective, expected_portfolio_actions)
+    require_blocked_portfolio(protective, expected_portfolio_actions, expected_pf_research_view)
     final_health = request("/health")
     if (final_health.get("deploy") or {}).get("render_git_commit") != expected_commit:
         raise ReadbackError("deployment changed during readback")
@@ -497,6 +592,9 @@ def verify(request, expected_commit, expected_engine, expected_builder, expected
             "portfolio_actions_version": expected_portfolio_actions,
             "unreconciled_portfolio_blocked": True,
             "margin_publish": margin_mode,
+            # v1.2.0: recorded only when declared, so off stays byte-identical.
+            **({"pf_research_view": expected_pf_research_view}
+               if expected_pf_research_view != "off" else {}),
             "scope": "blocked synthetic board and unreconciled holding API probes; Apps Script and live coverage not attested"}
 
 
@@ -517,7 +615,11 @@ def main():
     parser.add_argument("--tiny-quote-readback", action="store_true", default=False,
                         help="Capture actual three-symbol crypto forecast/ROI precision evidence; no Sheet writes")
     parser.add_argument("--output", default="artifacts/core-repair-readback.json")
+    # v1.2.0: the portfolio research view mode this run expects (see header).
+    parser.add_argument("--expect-pf-research-view", default="off",
+                        help="Declared TFB_PF_RESEARCH_VIEW mode: off (default), observe or enforce")
     args = parser.parse_args()
+    research_view = str(args.expect_pf_research_view or "").strip().lower()
     token = os.getenv("BACKEND_TOKEN", "").strip()
     request = None
     try:
@@ -529,12 +631,17 @@ def main():
             raise ReadbackError("workflow source SHA must be a full 40-character hexadecimal SHA")
         if args.workflow_source_sha != args.expected_commit:
             raise ReadbackError("workflow source SHA differs from expected backend commit")
+        if research_view not in PF_RESEARCH_VIEW_MODES:
+            raise ReadbackError("unsupported expected portfolio research view mode")
         request = transport(token)
+        # v1.2.0: off passes exactly the v1.1.1 arguments.
+        research_kwargs = {} if research_view == "off" else {"expected_pf_research_view": research_view}
         result = verify(request, args.expected_commit,
                         source_version("core/data_engine_v2.py", "__version__"),
                         source_version("core/analysis/opportunity_builder.py", "OPPORTUNITY_BUILDER_VERSION"),
                         int(source_version("core/analysis/opportunity_builder.py", "_BOARD_FUNDING_VERSION")),
-                        source_version("core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION"))
+                        source_version("core/analysis/portfolio_actions.py", "PORTFOLIO_ACTIONS_VERSION"),
+                        **research_kwargs)
     except ReadbackError as exc:
         result = {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - never serialize arbitrary backend exception text
@@ -543,6 +650,9 @@ def main():
         result = {"ok": False, "error": "readback failed: " + type(exc).__name__}
     result["expected_backend_commit"] = args.expected_commit
     result["workflow_source_sha"] = args.workflow_source_sha
+    if research_view != "off":
+        result["expected_pf_research_view"] = (
+            research_view if research_view in PF_RESEARCH_VIEW_MODES else "unsupported")
     result["readback_version"] = SCRIPT_VERSION
     result["helper_source_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     run_id = os.getenv("GITHUB_RUN_ID", "")

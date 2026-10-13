@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.13 (2026-10-13) -- SECURITY PIN FLOORS
+# VERSION 1.1.17 (2026-10-14) -- SECURITY PIN FLOORS
 #
-# v1.1.13 (2026-10-13): requirements.txt v1.1.4 moves twelve pins to the
+# v1.1.17 (2026-10-14): requirements.txt v1.1.4 moves twelve pins to the
 # minimal versions that close their pip-audit advisories (89 -> 8). WHY: the
 # lean lane now runs tests/test_security_pins_20261013.py, so a later edit
 # cannot silently drop a pin below its fixed version; the contract job's
@@ -14,6 +14,93 @@
 # 20261013.py with TFB_LIBSMOKE_REQUIRE_PINNED=1 -- the twelve bumped
 # libraries driven offline in the call shapes production uses (no other test
 # imports them), and the installed stack must equal requirements.txt.
+# WHY integration (2026-10-14): keep the security floors and library smoke
+# alongside main's Render ENV contract and runner-image regression gates.
+#
+# VERSION 1.1.16 (2026-10-13) -- RENDER ENV CONTRACT HARNESS (BUILD SPEC H-8)
+#
+# v1.1.16: require tests/test_render_env_contract.py in the blocking lean lane
+# (the pure-contract step, next to the flag registry test). It checks that
+# docs/render_env_contract.md, written by scripts/render_env_contract.py
+# 1.0.0, lists every /health gate key (main.py _PF_GATE_ENVS / _OB_GATE_ENVS
+# and the engine_gates keys) and every Render-scoped verify_deployment FLAGS
+# entry, says MUST be unset for TFB_APP_VERSION and APP_VERSION, carries no
+# secret-looking value or auth/token key name (owner decision D7), and equals
+# the generator output. Stdlib and pytest only; no network. Its golden
+# negative needs TFB_RENDER_ENV_CONTRACT_BASE and skips in CI. The push paths
+# filter also gains config/render_env_expected.json and
+# docs/render_env_contract.md, so a push that edits either one runs the
+# check itself instead of turning the next unrelated push red.
+# WHY (2026-10-13): H-8 asks for a Render ENV contract and the repo had none.
+# On 13 Oct 2026 /health showed app_version 5.111.0 against entry_version
+# 8.14.3: a stale APP_VERSION or TFB_APP_VERSION in the Render ENV or a
+# linked env group, which no file in the repo recorded as forbidden. Nothing
+# is removed and no existing entry moves.
+# REGENERATE after changing a gate table, an ENV reader default,
+# surface_gate_states or verify_deployment FLAGS:
+#   python scripts/render_env_contract.py
+# v1.1.16 review fix (2026-10-13, same unreleased v1.1.16, nothing removed):
+# the push paths filter also gains the root config.py and env.py. Both are
+# generator inputs (section A read order and "Read by"), so a push that edits
+# only one of them must run the check itself; without them, such a push
+# would skip CI and the next core/** or scripts/** push would go red on R7.
+# MERGE NOTE: the dt10-cohort-binding-2026-10-13 branch also claims v1.1.16 on
+# the same base (fbc4d07d). Whichever branch merges second renumbers its own
+# header block to v1.1.17 and keeps both WHY blocks; only this header
+# conflicts.
+#
+# VERSION 1.1.15 (2026-10-13) -- P0-6 PORTFOLIO RESEARCH VIEW HARNESS
+#
+# v1.1.15: require the portfolio_actions 1.16.0 research-view harness
+# (tests/test_pf_research_view_p06.py; TFB_PF_RESEARCH_VIEW default off) in
+# the blocking lean lane. It pins and restores its own policy env per build,
+# so it shares the lean process. Its golden negative needs TFB_TEST_PA_BASE
+# and skips in CI. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.14 (2026-10-13) -- AUDITED DECISION-FEED RELEASE (P0-1)
+#
+# v1.1.14: require the P0-1 decision-feed release harness
+# (tests/test_release_decision_feed.py) in the blocking lean lane. WHY: the new
+# release step is the only path that may write EXECUTABLE; its gates, grammar,
+# refusals and workflow env parity must be red on the push that breaks them.
+# WHY (2026-10-13, Codex P1 on PR #763, same entry, no list change): the same
+# harness now also blocks on the writer-start supersede step being present,
+# gated and ordered in every page-writing job, and on the release expires=
+# being enforced by send_digest, run_daily_brief and tfb_acceptance.
+#
+# VERSION 1.1.13 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
+#
+# v1.1.13: every job here (and in every other workflow) runs on the explicit
+# ubuntu-24.04 label instead of ubuntu-latest. Pure label substitution: 55
+# labels in 34 files; no job, step, dependency, gate or verdict moved. The
+# lean lane also runs tests/test_runner_pin_ubuntu2404.py, which keeps the
+# pin and, given the dda1211 base copies, proves by yaml.safe_load equality
+# that nothing but the labels changed. A new manual-only workflow,
+# runner_image_canary.yml, tests a candidate image without touching this one.
+#
+# WHY v1.1.13 (2026-10-13): GitHub is moving the ubuntu-latest label to a
+# newer Ubuntu image (26.04) from 19 Oct 2026. Every scheduled lane depends on
+# what the image ships: daily_sync preflight uses the image's own curl, jq,
+# python3 and pip3; lean-unit and several Python tests start the image's
+# node; and setup-python needs a Python 3.11 build for the image's Ubuntu
+# release. A silent image swap would change all of that at once, unreviewed. ubuntu-24.04 is the image
+# ubuntu-latest resolves to today, so the pin changes nothing now; it only
+# stops the swap. The pin freezes the OS release, not tool versions: GitHub
+# keeps updating the 24.04 image weekly.
+# UN-PIN (owner): when GitHub offers the ubuntu-26.04 label, dispatch
+# .github/workflows/runner_image_canary.yml with runner_image=ubuntu-26.04.
+# Only after a green canary, flip the labels (preferably to the explicit
+# ubuntu-26.04, not back to ubuntu-latest) in one reviewed commit and update
+# PINNED_LABEL in tests/test_runner_pin_ubuntu2404.py in the same commit.
+# ROLLBACK (date-dependent): a full revert is neutral only BEFORE 19 Oct
+# 2026, while ubuntu-latest still resolves to ubuntu-24.04. From 19 Oct 2026
+# a revert would move all 55 jobs, every scheduled writer included, onto the
+# unverified new image at once - the swap this pin exists to prevent. After
+# that date roll back with a forward edit instead: remove the canary
+# workflow, the pin harness and the harness's lean-list line together (each
+# references the other), keep every runs-on on the explicit ubuntu-24.04,
+# and never return a label to ubuntu-latest without a green canary on the
+# image ubuntu-latest then points to.
 #
 # v1.1.12: require complete typed final RAW intent digest regressions in lean.
 #
@@ -276,6 +363,10 @@ on:
     paths:
       - 'main.py'
       - 'config/approved_universe_scope_v1.json'
+      - 'config/render_env_expected.json'
+      - 'docs/render_env_contract.md'
+      - 'config.py'
+      - 'env.py'
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
@@ -312,7 +403,7 @@ jobs:
   # Advisory for one green week; making it required is a repo-settings action.
   whole-suite:
     name: 🧪 Whole suite (pinned Python 3.11)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     continue-on-error: true
     steps:
@@ -327,7 +418,7 @@ jobs:
 
   framework-drift:
     name: 🔭 Python 3.13 and latest FastAPI (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     continue-on-error: true
     steps:
@@ -352,7 +443,7 @@ jobs:
   # that covers all 111 Python files including the ones no suite touches.
   compile:
     name: 🧱 Compile all production code
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: 📥 Checkout
@@ -398,7 +489,7 @@ jobs:
   # directory is importable. Both are required for `from core...` to resolve.
   lean-unit:
     name: 🧪 Decision-layer suites (lean)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: 📥 Checkout
@@ -457,6 +548,7 @@ jobs:
             tests/test_execution_accounting.py \
             tests/test_portfolio_reconciliation.py \
             tests/test_portfolio_action_reconciliation.py \
+            tests/test_pf_research_view_p06.py \
             tests/test_portfolio_exact_funding.py \
             tests/test_portfolio_reconciliation_cli.py \
             tests/test_ob_quote_evidence.py \
@@ -483,6 +575,7 @@ jobs:
             tests/test_decision_surface_freshness.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
+            tests/test_release_decision_feed.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
@@ -513,6 +606,7 @@ jobs:
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
             tests/test_verify_optional_rollout_flags.py \
+            tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
             tests/test_tp_dedup_matured_p189b.py \
@@ -534,6 +628,7 @@ jobs:
             tests/test_ob_usx_subunit.py \
             tests/test_performance_math_extraction.py \
             tests/test_flag_registry.py \
+            tests/test_render_env_contract.py \
             tests/test_validation_embargo_properties.py
 
       - name: 🧮 Run model and display basis regressions (lean)
@@ -579,7 +674,7 @@ jobs:
   # so the contract gate validates what Render actually deploys.
   contract:
     name: 📐 Schema & route contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: 📥 Checkout
@@ -639,7 +734,7 @@ jobs:
   # dependency stack. Dependency-install failures also block the final verdict.
   heavy:
     name: ⚙️ Data engine suite (blocking)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: 📥 Checkout
@@ -712,7 +807,7 @@ jobs:
         run: python -m pytest -q tests/test_yf_loopguard_p203.py
 
       - name: Security pin library behaviour smoke (pinned production stack)
-        # v1.1.13: offline; L12 uses a 127.0.0.1 server, L15 imports main:app
+        # v1.1.17: offline; L12 uses a 127.0.0.1 server, L15 imports main:app
         # in a child process with outbound sockets blocked.
         env:
           TFB_LIBSMOKE_REQUIRE_PINNED: "1"
@@ -726,7 +821,7 @@ jobs:
   # separate job logs. Every required job, including the engine, must succeed.
   summary:
     name: 📋 CI verdict
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [compile, lean-unit, contract, heavy]
     if: always()
     steps:

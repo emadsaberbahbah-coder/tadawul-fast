@@ -29,7 +29,7 @@ concurrency:
 jobs:
   backtest:
     name: 🔬 Backtest signals on the live log
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout

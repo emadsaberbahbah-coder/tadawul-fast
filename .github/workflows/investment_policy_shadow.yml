@@ -16,7 +16,7 @@ concurrency:
 jobs:
   shadow-report:
     name: Generate non-enforcing shadow report
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       TFB_INVESTMENT_POLICY_PATH: config/project_wide_execution_learning_policy_v1.json

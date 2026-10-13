@@ -2,12 +2,20 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.3)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.4)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.4 (2026-10-13, P0-6): /health pf_gates lists TFB_PF_RESEARCH_VIEW.
+WHY: portfolio_actions 1.16.0 reads TFB_PF_RESEARCH_VIEW (off | observe |
+enforce) per call and prints no boot line, so an arming was invisible on
+/health - the same gap v8.14.1 closed for TFB_PF_ADD_LOSER_VETO. One
+ADDITIVE key in the existing portfolio_actions block; an unset gate reports
+the literal "unset". No route, mount, auth or engine change. Rollback:
+remove the key and restore APP_ENTRY_VERSION to v8.14.3.
 
 v8.14.3 (2026-10-11, WP-15): count and inspect effective route contexts when
 FastAPI uses lazy included-router nodes. WHY: all six routers still served
@@ -387,7 +395,7 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.3"
+APP_ENTRY_VERSION = "8.14.4"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -2025,6 +2033,9 @@ _PF_GATE_ENVS: Tuple[str, ...] = (
     # so an arming of TFB_PF_ADD_LOSER_VETO=observe was invisible on /health.
     "TFB_PF_ADD_LOSER_VETO", "TFB_PF_ADD_LOSER_PCT",
     "TFB_PF_ADD_STOP_PROX_PCT",
+    # v8.14.4 (2026-10-13): P0-6 research view. portfolio_actions v1.16.0
+    # reads it per call (_env_research_view_mode) and prints no boot line.
+    "TFB_PF_RESEARCH_VIEW",
 )
 _OB_GATE_ENVS: Tuple[str, ...] = (
     "TFB_FORECAST_BASIS", "TFB_T10_REQ_ROI_3M_PCT", "TFB_OPP_CASH_FLOOR_MODE",
