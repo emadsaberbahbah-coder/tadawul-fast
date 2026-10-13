@@ -202,3 +202,110 @@ the separate Portfolio_Decision caller to forward it. `packet_bytes` in stdout
 is a size count for review; saving a packet does not install it or certify a
 later decision run. A packet above the property limit cannot be forwarded by
 the native Top10 transport.
+
+## Research view (portfolio actions 1.16.0, default off)
+
+Added 2026-10-13 (P0-6, review blocker 4). Nothing in this section changes the
+certifier, its 900-second bound, funding or any rule above. With the gate off
+the portfolio page is exactly the 1.15.1 output apart from the version string.
+
+### Transport correction
+
+Two separate callers carry evidence, and only one of them reads the document
+property:
+
+- The Top10 cockpit (`apps_script/16_Decision_Top10.gs`) reads document
+  property `TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1` and forwards it inside
+  the opportunity body. That property feeds only the Top10 board.
+- Portfolio_Decision is produced by `POST /sheet-rows/portfolio-actions`. The
+  route reads evidence only from `body.reconciliation_evidence`, sent by its
+  native Apps Script caller. That caller is not in this repository and does
+  not read the document property. Writing the property therefore cannot
+  change Portfolio_Decision; its caller must forward the packet itself.
+
+A live reason of `missing_evidence` on Portfolio_Decision means the request
+carried no packet at all. It does not show whether the property is populated.
+A packet older than 900 seconds is reported as `invalid_evidence`, not as a
+stale status, because the certifier rejects the whole packet.
+
+### What the gate does
+
+`TFB_PF_RESEARCH_VIEW` is read on every call. Accepted values are `off` (the
+default), `observe` and `enforce`, in any letter case. Any other value,
+including a blank one, is treated as `off`.
+
+When funding is not eligible, each holding gets a tier from the 900-second
+certification:
+
+| Certifier row result | Tier | Tag | Row shown |
+| --- | --- | --- | --- |
+| trusted, but funding withheld (cash, quote, FX, truncated holdings) | matched | `[custody-matched]` | research row |
+| `missing_evidence`, `invalid_evidence`, `custody_unknown`, `stale_positions`, `future_positions`, `invalid_positions_time`, `positions_incomplete` | unverified | `[custody-unverified]` | research row |
+| `quantity_mismatch`, `position_closed`, `position_missing`, `position_identity_mismatch`, `inactive_zero`, or any other status | contradicted | none | the 1.15.1 blank row, unchanged |
+
+For a research row the engine computes the rule verdict with `decide_action`
+(weights unavailable, so no cap trim), then the de-minimis, reduce-policy and
+drawdown seams. It never runs the ADD confirmation clock, its session shadow,
+the ADD-loser veto or the F-1a tag, so persisted confirmation state is never
+read or advanced from an unreconciled run. An ADD verdict is never named or
+sized. The row says "new-money verdict withheld until fresh positions and
+settled cash are reconciled".
+
+- `observe`: every number, KPI and alert is identical to `off`. The reason and
+  advisor note gain ` | [research-observe] <tag> research verdict <X>:
+  <reason>`. `detail.research_view` and `meta.research_view` are added.
+- `enforce`: the action stays `BLOCK` and the reason keeps the prefix
+  `RECONCILIATION_REQUIRED: <status>`, followed by ` | <tag> research verdict
+  EXIT|TRIM|HOLD|BLOCK: <reason>; not executable`. Market value, cost, P&L,
+  P&L % and stop / TP1 / TP2 are shown. A sukuk row keeps a blank ladder.
+  When the verdict is a cost-basis BLOCK, that row's cost, P&L and P&L % stay
+  blank.
+
+### What stays withheld in every mode
+
+Proceeds, suggested deltas, `funds_from`, weights and sector weights stay zero
+or blank, and `detail.execution_ready` and `meta.execution_ready` stay false.
+The funding KPIs (`deployable_sar`, `adds_funded_sar`, `proceeds_pending_sar`,
+`capital_unallocated_sar`) stay 0. `portfolio_value_sar`, `cash_sar` and
+`cash_pct` stay blank. `sector_summary` stays empty. The single
+`portfolio_inputs_unverified` alert and `meta.input_certification` are
+unchanged. No account ID, source reference, cash or reservation figure from
+the packet is ever emitted.
+
+Under `enforce` the holdings KPIs follow the F3/F7 rules.
+`holdings_value_sar` is filled only when no row is contradicted, the holdings
+input is complete, and every research row has a positive market value.
+`cost_basis_sar`, `pnl_sar` and `pnl_pct` use only rows that carry both cost
+and P&L. They are withheld when any row is contradicted or the holdings input
+is incomplete. `meta.research_view.kpi_basis` is
+`sheet_quantities_custody_unverified` when any of them is filled and
+`withheld` otherwise. `kpi_withheld` names the reasons. These totals come from
+sheet quantities whose custody is not proven, so they are not a reconciled
+book value.
+
+If the research view itself fails, the page falls back to the `off` output
+and `meta.research_view.status` reads `error`.
+
+### Deployed readback lockstep
+
+`scripts/verify_core_repair_readback.py` 1.2.0 accepts research amounts only
+when the run declares the mode with `--expect-pf-research-view`. The workflow
+passes the value of the Actions Variable `TFB_PF_RESEARCH_VIEW_EXPECT`,
+defaulting to `off`. With `off` the probe is unchanged, and an enforce page
+fails with `uncertified portfolio amount was published: holdings_value_sar`.
+Under a declared `enforce` every money, execution, weight, sector, cash KPI
+and alert check is kept. The served page must also declare `enforce`, carry
+`[custody-unverified]`, end with `; not executable` and name no ADD verdict. A
+mode the page declares about itself is never enough.
+
+Arming order: set `observe` on Render first (the unchanged readback stays
+green). Set `enforce` only after readback 1.2.0 is on main, and set
+`TFB_PF_RESEARCH_VIEW_EXPECT` to the same word at the same time.
+
+### Not provided by this build
+
+The research view does not supply evidence. A holding becomes executable only
+through a valid 900-second packet forwarded by the Portfolio_Decision caller.
+A longer daily custody tier, which could let HOLD, TRIM or EXIT act on
+evidence up to 24 hours old, is a separate owner decision (D4). It is not
+built here.

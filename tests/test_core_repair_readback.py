@@ -256,5 +256,214 @@ class ReadbackProtocolTests(unittest.TestCase):
             probe.NoRedirect().redirect_request(None, None, 302, "", {}, "https://elsewhere.example")
 
 
+class PortfolioResearchViewLockstepTests(unittest.TestCase):
+    """v1.2.0 (2026-10-13, P0-6): research-view amounts need a declared mode.
+
+    Reuses the protocol fixture above (the v1.1.1 tests keep running there
+    unchanged with the default off) and adds the declared observe / enforce
+    contract for portfolio_actions 1.16.0.
+    """
+
+    setUp = ReadbackProtocolTests.setUp
+    request = ReadbackProtocolTests.request
+    run_probe = ReadbackProtocolTests.run_probe
+    TAIL = (" | [custody-unverified] new-money verdict withheld until fresh positions and settled cash"
+            " are reconciled")
+
+    def serve_research_view(self, mode):
+        """Turn the protective fixture into a served research-view page."""
+        row = self.protective["actions"][0]
+        prefix = "RECONCILIATION_REQUIRED: missing_evidence"
+        if mode == "observe":
+            row["action_reason"] = prefix + " | [research-observe] [custody-unverified] new-money verdict withheld"
+        else:
+            row["action_reason"] = prefix + self.TAIL + "; not executable"
+            row.update({"market_value_sar": 1000.0, "cost_sar": 900.0, "pnl_sar": 100.0, "pnl_pct": 11.1,
+                        "stop_sar": 92.0, "tp1_sar": 115.0, "tp2_sar": 130.0})
+            self.protective["kpis"].update({"holdings_value_sar": 1000.0, "cost_basis_sar": 900.0,
+                                            "pnl_sar": 100.0, "pnl_pct": 11.1})
+        row["detail"]["research_view"] = {"mode": mode, "tier": "unverified", "verdict": "NEW_MONEY_WITHHELD"}
+        self.protective["meta"]["research_view"] = {"mode": mode, "status": "ok"}
+
+    def run_declared(self, mode):
+        return probe.verify(self.request, "commit-test", "engine-test", "builder-test",
+                            expected_portfolio_actions=self.portfolio_version,
+                            expected_pf_research_view=mode)
+
+    def test_declared_enforce_accepts_levels_and_holdings_kpis(self):
+        self.serve_research_view("enforce")
+        result = self.run_declared("enforce")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pf_research_view"], "enforce")
+
+    def test_undeclared_research_amounts_are_rejected_even_when_the_page_says_enforce(self):
+        self.serve_research_view("enforce")
+        with self.assertRaisesRegex(probe.ReadbackError,
+                                    "uncertified portfolio amount was published: holdings_value_sar"):
+            self.run_probe()
+        with self.assertRaisesRegex(probe.ReadbackError, "uncertified portfolio amount was published"):
+            self.run_declared("observe")
+        for key in ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct"):
+            self.protective["kpis"][key] = None
+        with self.assertRaisesRegex(probe.ReadbackError, "execution level: market_value_sar"):
+            self.run_probe()
+
+    def test_declared_enforce_keeps_every_money_execution_weight_sector_and_alert_check(self):
+        cases = (("kpis", "deployable_sar", 5, "withheld portfolio KPI"),
+                 ("kpis", "cash_sar", 10_000, "published: cash_sar"),
+                 ("kpis", "portfolio_value_sar", 1000, "published: portfolio_value_sar"),
+                 ("kpis", "cash_pct", 10.0, "published: cash_pct"),
+                 ("row", "suggested_delta_sar", 100, "execution money"),
+                 ("row", "suggested_delta_shares", -10, "execution money"),
+                 ("row", "proceeds_sar", 1000, "execution money"),
+                 ("row", "weight_pct", 10.0, "execution level: weight_pct"),
+                 ("row", "post_trade_weight_pct", 5.0, "execution level: post_trade_weight_pct"),
+                 ("row", "funds_from", "cash", "execution level: funds_from"),
+                 ("row", "action", "EXIT", "was not blocked"))
+        for section, key, value, message in cases:
+            with self.subTest(key=key):
+                self.setUp()
+                self.serve_research_view("enforce")
+                target = self.protective["kpis"] if section == "kpis" else self.protective["actions"][0]
+                target[key] = value
+                with self.assertRaisesRegex(probe.ReadbackError, message):
+                    self.run_declared("enforce")
+        mutations = (
+            (lambda: self.protective["actions"][0]["detail"].update(execution_ready=True), "not withheld"),
+            (lambda: self.protective["actions"][0]["detail"].update(position_evidence_matched=True), "not withheld"),
+            (lambda: self.protective["actions"][0]["detail"].update(sector_weight_pct=12.0), "not withheld"),
+            (lambda: self.protective.update(sector_summary=[{"sector": "Energy"}]), "sector weights"),
+            (lambda: self.protective.update(alerts=[{"type": "capital_call"}]), "protective alert"),
+            (lambda: self.protective["meta"].update(execution_ready=True), "explicitly withhold"))
+        for mutate, message in mutations:
+            self.setUp()
+            self.serve_research_view("enforce")
+            mutate()
+            with self.subTest(message=message), self.assertRaisesRegex(probe.ReadbackError, message):
+                self.run_declared("enforce")
+
+    def test_declared_enforce_rejects_invalid_research_amounts(self):
+        for key, value in (("market_value_sar", 0), ("market_value_sar", -5.0), ("stop_sar", True),
+                           ("tp1_sar", "115"), ("cost_sar", float("nan")), ("pnl_sar", float("inf"))):
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                self.serve_research_view("enforce")
+                self.protective["actions"][0][key] = value
+                with self.assertRaisesRegex(probe.ReadbackError, "execution level: " + key):
+                    self.run_declared("enforce")
+        self.setUp()
+        self.serve_research_view("enforce")
+        self.protective["kpis"]["holdings_value_sar"] = 0
+        with self.assertRaisesRegex(probe.ReadbackError, "published: holdings_value_sar"):
+            self.run_declared("enforce")
+
+    def test_declared_mode_must_be_served_with_its_tag(self):
+        with self.assertRaisesRegex(probe.ReadbackError, "research view mode not served: enforce"):
+            self.run_declared("enforce")
+        with self.assertRaisesRegex(probe.ReadbackError, "research view mode not served: observe"):
+            self.run_declared("observe")
+        self.serve_research_view("observe")
+        self.assertTrue(self.run_declared("observe")["ok"])
+        self.assertTrue(self.run_probe()["ok"])  # observe numbers equal off
+        with self.assertRaisesRegex(probe.ReadbackError, "research view mode not served: enforce"):
+            self.run_declared("enforce")
+        self.protective["actions"][0]["action_reason"] = "RECONCILIATION_REQUIRED: missing_evidence"
+        with self.assertRaisesRegex(probe.ReadbackError, "observe portfolio research view tag missing"):
+            self.run_declared("observe")
+        self.setUp()
+        self.serve_research_view("enforce")
+        prefix = "RECONCILIATION_REQUIRED: missing_evidence"
+        for reason, message in (
+                (prefix + self.TAIL, "enforce portfolio research view tag missing"),
+                (prefix + " | [custody-matched] x; not executable", "enforce portfolio research view tag missing"),
+                ("missing_evidence" + self.TAIL + "; not executable", "reconciliation prefix"),
+                (prefix + " | [custody-unverified] research verdict ADD: x; not executable", "named an ADD verdict")):
+            self.protective["actions"][0]["action_reason"] = reason
+            with self.subTest(reason=reason), self.assertRaisesRegex(probe.ReadbackError, message):
+                self.run_declared("enforce")
+        self.protective["actions"][0]["action_reason"] = prefix + self.TAIL + "; not executable"
+        self.protective["actions"][0]["detail"]["research_view"]["verdict"] = "ADD"
+        with self.assertRaisesRegex(probe.ReadbackError, "named an ADD verdict"):
+            self.run_declared("enforce")
+
+    def test_declared_enforce_holdings_total_must_match_the_row(self):
+        self.serve_research_view("enforce")
+        self.protective["kpis"]["holdings_value_sar"] = 5000.0
+        with self.assertRaisesRegex(probe.ReadbackError, "holdings total disagrees"):
+            self.run_declared("enforce")
+        self.protective["kpis"]["holdings_value_sar"] = None
+        self.protective["actions"][0]["market_value_sar"] = None
+        self.assertTrue(self.run_declared("enforce")["ok"])
+
+    def test_unsupported_mode_is_refused_before_any_request(self):
+        for mode in ("ENFORCE", "on", "", None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(probe.ReadbackError, "unsupported"):
+                self.run_declared(mode)
+        self.assertEqual(self.calls, [])
+        with self.assertRaisesRegex(probe.ReadbackError, "unsupported"):
+            probe.require_blocked_portfolio(self.protective, self.portfolio_version, "bogus")
+
+    def test_cli_declares_the_mode_only_when_not_off(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        commit = "a" * 40
+
+        def invoke(*extra):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "artifact.json"
+                argv = ["readback", "--expected-commit", commit, "--workflow-source-sha", commit,
+                        "--output", str(output), *extra]
+                with mock.patch.dict(os.environ, {"BACKEND_TOKEN": "local-test-token"}), \
+                        mock.patch("sys.argv", argv), \
+                        mock.patch.object(probe, "transport", return_value=lambda *_a, **_k: {}) as transport, \
+                        mock.patch.object(probe, "verify", return_value={"ok": True}) as verify, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = probe.main()
+                return code, json.loads(output.read_text()), transport, verify
+
+        code, artifact, _transport, verify = invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(verify.call_args.kwargs, {})
+        self.assertNotIn("expected_pf_research_view", artifact)
+        code, artifact, _transport, verify = invoke("--expect-pf-research-view", "off")
+        self.assertEqual(verify.call_args.kwargs, {})
+        self.assertNotIn("expected_pf_research_view", artifact)
+        for mode in ("observe", "enforce", " Enforce "):
+            code, artifact, _transport, verify = invoke("--expect-pf-research-view", mode)
+            self.assertEqual(code, 0)
+            self.assertEqual(verify.call_args.kwargs, {"expected_pf_research_view": mode.strip().lower()})
+            self.assertEqual(artifact["expected_pf_research_view"], mode.strip().lower())
+        code, artifact, transport, verify = invoke("--expect-pf-research-view", "armed")
+        self.assertEqual(code, 1)
+        self.assertEqual(artifact["error"], "unsupported expected portfolio research view mode")
+        self.assertEqual(artifact["expected_pf_research_view"], "unsupported")
+        transport.assert_not_called()
+        verify.assert_not_called()
+
+    def test_workflow_passes_the_declared_mode_default_off(self):
+        import yaml
+        from pathlib import Path
+        root = Path(probe.__file__).resolve().parents[1]
+        workflow = yaml.safe_load((root / ".github/workflows/core_repair_readback.yml").read_text())
+        step = next(s for s in workflow["jobs"]["readback"]["steps"]
+                    if "verify_core_repair_readback.py" in s.get("run", ""))
+        self.assertEqual(step["env"]["TFB_PF_RESEARCH_VIEW_EXPECT"],
+                         "${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'off' }}")
+        self.assertIn('--expect-pf-research-view "$TFB_PF_RESEARCH_VIEW_EXPECT"', step["run"])
+
+    def test_off_result_is_unchanged(self):
+        result = self.run_declared("off")
+        self.assertNotIn("pf_research_view", result)
+        result.pop("checked_at_utc")
+        legacy = self.run_probe()
+        legacy.pop("checked_at_utc")
+        self.assertEqual(result, legacy)
+        self.assertEqual(probe.SCRIPT_VERSION, "1.2.0")
+
+
 if __name__ == "__main__":
     unittest.main()
