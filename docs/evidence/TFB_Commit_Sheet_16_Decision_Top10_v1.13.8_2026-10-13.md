@@ -44,7 +44,7 @@ Tests and CI:
 - tests/js/decision_input_truth.test.js: the version pins moved to 1.13.8, the census moved to 191/103, the designed lists gained the three names, T8 needs the two new self-test lines, and an armed self-test line check was added. The header carries a dated note.
 - tests/js/decision_source_readiness.test.js: the version pin moved to 1.13.8.
 - tests/test_release_decision_feed.py, docstring VERSION 1.1.1 (1.1.2 after the review fixes). G4 still requires byte identity for every other protected file. It now accepts a 16_Decision_Top10.gs that differs from its supplied dda1211 sibling only when the new harness passes against that same copy with nothing skipped (since 1.1.2: D5 included, and only after every other pair was compared).
-- .github/workflows/ci.yml v1.1.15 -> v1.1.16 (the orchestrator renumbers when stacking). The harness was added to the lean job's 'Native reconciliation and complete calendar inputs' node step. Nothing was removed or moved.
+- .github/workflows/ci.yml v1.1.16 -> v1.1.17 (stacked on the Render ENV contract change, which takes v1.1.16). The harness was added to the lean job's 'Native reconciliation and complete calendar inputs' node step. Nothing was removed or moved.
 
 Docs: docs/evidence/TFB_Commit_Sheet_release_decision_feed_v1.0.0_2026-10-13.md received line-level updates. Prerequisite 2 now reads 'BUILT in DT10 v1.13.8 (paste required, Script Property DT10_FEED_COHORT_BIND=on before arming the release)', with the original text kept after it. A dated 'Stacked follow-up' paragraph was added, along with parenthetical updates where the sheet called prerequisite 2 owed.
 
@@ -209,7 +209,7 @@ A reviewer raised three minor findings on the build commit. Each was re-checked 
   D5 also proves that it rejects four synthetic mutants: the reviewer's dt10SourceCount_ line, a statement after the guard, a top-level statement among the new functions, and an assignment in the self-test lines. The skip list gained 'D5 designed regions only'. No helper, case or assertion was removed.
 - This sheet: the review-fix note under the header, line-level updates to the What changed and Measured results lines that described the harness and G4, operator step 6 rewritten (see Operator steps), and this section.
 - docs/evidence/TFB_Commit_Sheet_release_decision_feed_v1.0.0_2026-10-13.md: the harness note in the 'Stacked follow-up' paragraph now names G4 v1.1.2, the compare-others-first order and D5.
-- Not touched: apps_script/16_Decision_Top10.gs, .github/workflows/ci.yml (the harness is already enrolled at v1.1.16, and no new harness file was added), every Python script, and scripts/verify_deployment.py.
+- Not touched: apps_script/16_Decision_Top10.gs, .github/workflows/ci.yml (the harness is already enrolled at v1.1.17, and no new harness file was added), every Python script, and scripts/verify_deployment.py.
 
 ### Measured results
 
