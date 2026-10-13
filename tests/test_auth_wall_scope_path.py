@@ -1,6 +1,14 @@
 """tests/test_auth_wall_scope_path.py - global auth wall routed-path harness.
 
 HARNESS_VERSION 1.0.0 (2026-10-13) for main.py v8.14.5.
+HARNESS_VERSION 1.1.1 (2026-10-13, CI fix on PR #769): W19 skips, with its
+reason, when orjson is not importable. The contract job installs only
+fastapi/starlette/httpx/pydantic/anyio/numpy/pytest; routes/config renders
+through ORJSONResponse, which then raises, and the wall's fail-closed
+except turns that into a 401 for EVERY request (token or not), so W19 could
+neither pass nor discriminate there. W14/W15 still prove the route layer in
+that job; W19 runs wherever the full requirements (orjson) are installed,
+e.g. the whole-suite lane. No assertion was weakened.
 HARNESS_VERSION 1.1.0 (2026-10-13) adds W14-W19 for the route-layer
 follow-up: routes/investment_advisor 2.18.1, analysis_sheet_rows 4.8.4,
 advanced_analysis 4.18.2, config 5.9.1, enriched_quote 8.5.2 and core.config
@@ -113,6 +121,7 @@ Run:  python tests/test_auth_wall_scope_path.py   -> "PASS k/k", exit 0/1
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import subprocess
@@ -125,7 +134,7 @@ except ImportError:  # pragma: no cover - script mode without pytest
     pytest = None
 
 
-HARNESS_VERSION = "1.1.0"
+HARNESS_VERSION = "1.1.1"
 ROOT = Path(__file__).resolve().parents[1]
 DELIVERED = ROOT / "main.py"
 ENV_BASE = "TFB_AUTH_WALL_BASE"
@@ -1134,6 +1143,13 @@ def case_w18():
 
 
 def case_w19(res=None):
+    # 1.1.1: the full-stack route renders through ORJSONResponse; without
+    # orjson every request becomes the wall's fail-closed 401, so this case
+    # cannot discriminate. Skip with the reason instead of passing or failing.
+    if importlib.util.find_spec("orjson") is None:
+        return "SKIP", ("orjson not installed in this interpreter: /v1/config/settings cannot render, "
+                        "so every request is a fail-closed 401 and the full-stack case cannot "
+                        "discriminate (W14/W15 cover the route layer here)")
     res = res or _run_routes(ROOT)
     fs = res["full_stack"]
     bad = []
