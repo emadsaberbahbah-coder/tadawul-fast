@@ -20,7 +20,7 @@ concurrency:
 jobs:
   collect-name-identity:
     if: ${{ inputs.name_identity_evidence }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: production
     steps:
@@ -55,7 +55,7 @@ jobs:
           if-no-files-found: error
   readback:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v6

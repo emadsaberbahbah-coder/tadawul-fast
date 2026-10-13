@@ -36,7 +36,7 @@ jobs:
   regression-tests:
     name: Sync outcome audit tests
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -63,7 +63,7 @@ jobs:
         (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') ||
         github.event_name == 'workflow_dispatch'
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The standalone audit must enforce the same data-complete contract as
     # Daily Sync recovery. A positive PAGE-VERDICT can contain mostly

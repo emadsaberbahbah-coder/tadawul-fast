@@ -23,6 +23,8 @@ name: "🕶️ TFB Shadow Board"
 #      one place where a plausible-looking "fix" silently kills the archive.
 #   4. Credential file mode 600.
 # ROLLBACK: each item is independently removable; none depends on another.
+# v1.2.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
+# ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # ============================================================================
 
 on:
@@ -66,7 +68,7 @@ permissions:
 
 jobs:
   shadow:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
