@@ -2,10 +2,27 @@
 # routes/config.py
 """
 ================================================================================
-TFB Config Routes — v5.9.0
+TFB Config Routes — v5.9.1
 ================================================================================
 CONFIG-ONLY • SCHEMA-DECOUPLED • PROMETHEUS-SAFE • RENDER-SAFE • AUTH-COMPATIBLE
 FLEXIBLE-AUTH-OK • STATE-AWARE-REQUEST-ID • RESPONSE-HEADER-PROPAGATION
+
+v5.9.1 (2026-10-13, SECURITY) -- _auth_ok reads the routed path
+---------------------------------------------------------------
+_auth_ok handed core.config.auth_ok (which checks its public list against
+that value) a path read from request.url.path. Starlette 0.41.3 re-parses
+that from f"{scheme}://{Host header}{scope['path']}" while the router
+dispatches on scope["path"], so a crafted Host such as "x/health?x=" made
+the path read "/health" for GET /v1/config/settings, and with REQUIRE_AUTH
+on and no token _auth_ok returned True (the masked settings were served).
+main.py v8.14.5's global wall answers such a request with 401 first, but
+with TFB_GLOBAL_AUTH_ENFORCE falsy this layer is the only check. FIX: new
+_request_scope_path(request) (the ASGI scope path, root_path included; ""
+without a scope, which matches no built-in public path) feeds that path.
+INERT FOR VALID TRAFFIC: a valid Host cannot contain "/", "?" or "#", so
+url.path equals scope["path"] byte for byte and every decision is unchanged
+(tests/test_auth_wall_scope_path.py W14-W19). No ENV gate. Functions added
+1, removed 0. Rollback: git revert.
 
 Why this revision vs v5.8.0
 ---------------------------
@@ -72,7 +89,9 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.config")
 
-ROUTER_VERSION = "5.9.0"
+# v5.9.1 (2026-10-13, SECURITY): _auth_ok reads the ASGI scope path, not
+# the Host-derived request.url.path (see the module docstring).
+ROUTER_VERSION = "5.9.1"
 ROUTE_OWNER_NAME = "config"
 ROUTE_FAMILY_NAME = "config"
 
@@ -302,6 +321,26 @@ def _call_auth_ok_flexible(
     return False
 
 
+def _request_scope_path(request: Any) -> str:
+    """v5.9.1 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" (no scope path) matches no built-in
+    public path, so such a request still needs a token (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def _auth_ok(request: Request, *, query_token: Optional[str] = None) -> bool:
     # 1) Open-mode short-circuit
     if _is_open_mode_effective():
@@ -319,7 +358,8 @@ def _auth_ok(request: Request, *, query_token: Optional[str] = None) -> bool:
     token = info.get("token")
     authz = info.get("authorization")
 
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    # v5.9.1: the routed (scope) path, never the Host-derived request.url.path.
+    path = _request_scope_path(request)
     headers_dict = dict(request.headers)
     settings = _get_settings_cached(force_reload=False)
 

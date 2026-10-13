@@ -4,9 +4,10 @@ Reviewed repository `emadsaberbahbah-coder/tadawul-fast` at main commit
 `f3a7ab152f1fc8d545cc451d19ff5eb93d32d21a`. Dates and times below use
 Asia/Riyadh unless marked UTC. Render inspection was read-only in the
 owner-confirmed workspace `My Workspace` (`tea-d3m0uuumcj7s73aatrpg`).
-The patch was subsequently integrated with main `2add3b4` after PRs #767 and
-#768 merged, preserving the environment-contract generator, manifest pin,
-blocking tests, and default-off decision-feed cohort guard.
+The patch was subsequently integrated with main `c588c51` after PRs #767, #768
+and #769 merged, preserving the environment-contract generator, manifest pin,
+blocking tests, default-off decision-feed cohort guard, and routed-path
+authentication fixes.
 
 Scope: all 36 workflow definitions and their action expressions, build/start
 commands, deployment verifier, publication/recovery audit scripts, dependency
@@ -36,7 +37,7 @@ was changed.
 | P2 | Verifier `--json` stdout included imported-module startup messages, and omitted the wiring evidence explaining drift. | Import diagnostics go to stderr; stdout contains one JSON document including wiring findings. |
 | P2 | Render's current build command logs `grep: unrecognized option '--hash=sha256:[0-9a-f]{64}'`, ignores `pip check` failure, and traverses its virtual environment during compilation. | New executable `scripts/build_web.sh` installs the selected requirements, requires `pip check` to pass, and compiles source while excluding environments and scratch/cache trees. The dashboard still needs its build command updated. |
 
-Provider audit is version 1.2.1, launcher 2.6.2, verifier 1.0.59, and CI 1.1.18.
+Provider audit is version 1.2.1, launcher 2.6.2, verifier 1.0.62, and CI 1.1.19.
 New deployment, target-resolution, shell-input, and baseline regressions run in
 the blocking lean CI lane. No audit threshold was lowered and no release gate
 was armed.
@@ -54,8 +55,9 @@ succeeded. There is no evidence of a failed deployment of reviewed main
 
 Public `/health` and `/readyz` returned HTTP 200, with engine ready, no missing
 required keys, no failed modules, and global authentication enforcement enabled.
-They reported entry version 8.14.3 and deployed commit `dda1211`, while reviewed
-main contains entry 8.14.4. `app_version=5.111.0` is a separate environment-facing
+They reported entry version 8.14.3 and deployed commit `dda1211`, while the
+initially reviewed main contained entry 8.14.4; the integrated security update
+contains entry 8.14.5. `app_version=5.111.0` is a separate environment-facing
 label; use the deploy commit and entry/engine versions for release identity.
 
 Render's **Health Check Path is blank**, so its configured check does not verify
@@ -139,12 +141,14 @@ fixes extend beyond that range. Existing newer-framework testing records route
 compatibility failures. The remaining NLTK advisory has no published fix; this
 repository only checks availability and does not call the affected model APIs.
 
-The Host-derived authentication-path issue has a separate active fix in
-[PR #769](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/769).
+The Host-derived authentication-path fix in
+[PR #769](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/769) merged
+during the follow-up CI repair. Its scope-path checks and route version pins
+are preserved in this integrated patch.
 [PR #767](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/767), covering
 the generated Render environment contract and stale `APP_VERSION` handling,
 merged during this review and is preserved in the integrated patch base. The
-dependency and authentication fixes remain separate proposals.
+dependency fixes remain a separate proposal.
 
 Direct dependency pins resolve successfully, but transitive dependencies are
 not locked. The advisory dependency workflow audits direct requirements and
@@ -168,6 +172,7 @@ the new environment-contract and affected deployment/workflow suites separately.
 | Integrated deployment/workflow/verifier/manifest/release suites after PR #767 | 127 passed, 10 skipped, 69 subtests passed |
 | Integrated Render environment contract and generated-document check | 14 passed, 1 optional skip; document current |
 | Final integration with PR #768: affected Python suites and all 12 Node harnesses | 238 Python tests passed, 14 skipped, 53 subtests passed; all Node harnesses passed |
+| Authentication integration with PR #769: pinned contract lane and affected deployment/workflow checks | 412 passed, 19 optional skips, 127 subtests passed; auth and repair changes preserved |
 | All workflow action/schema/expression checks, actionlint 1.7.12 | Pass; external shellcheck/pyflakes integrations disabled |
 | Python compilation and ruff E9/F63/F7/F82 across the repository | Pass |
 | All JavaScript harnesses, including the newly merged cohort guard | Pass |
