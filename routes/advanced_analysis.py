@@ -2,7 +2,27 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.18.1
+Advanced Analysis Root Owner — v4.18.2
+ROUTE AUTH ON THE ROUTED PATH (2026-10-13, SECURITY)
+================================================================================
+_auth_passed handed auth_ok (core.config.auth_ok, which checks its public
+list against that value) a path read from request.url.path. Starlette
+0.41.3 re-parses that from f"{scheme}://{Host header}{scope['path']}" while
+the router dispatches on scope["path"], so a crafted Host such as
+"x/health?x=" or "x/static?" made the path read public for a request routed
+to a protected path, and with REQUIRE_AUTH on and no token _auth_passed
+returned True. main.py v8.14.5's global wall answers such a request with 401
+first, but with TFB_GLOBAL_AUTH_ENFORCE falsy this layer is the only check.
+FIX: new _request_scope_path(request) (the ASGI scope path, root_path
+included; "" without a scope, which matches no built-in public path) feeds
+the path handed to auth_ok. INERT FOR VALID TRAFFIC: a valid Host cannot
+contain "/", "?" or "#", so url.path equals scope["path"] byte for byte and
+every decision is unchanged (tests/test_auth_wall_scope_path.py W14-W18).
+No ENV gate. Zero functions removed; addition: _request_scope_path. The
+"path" fields of the health/provider-health payloads are echoes only and
+keep request.url.path. Rollback: git revert.
+================================================================================
+Advanced Analysis Root Owner -- v4.18.1
 FINAL BOARD FUNDING REPLAY (2026-10-07)
 ================================================================================
 The existing opportunity endpoint accepts a signed frozen allocation replay.
@@ -535,7 +555,10 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.18.1"  # bind Insights request criteria and budget
+# v4.18.2 (2026-10-13, SECURITY): _auth_passed reads the ASGI scope path,
+# not the Host-derived request.url.path (see the module docstring). The
+# trailing note on the next line is the v4.18.1 entry, kept as it was.
+ADVANCED_ANALYSIS_VERSION = "4.18.2"  # bind Insights request criteria and budget
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -2187,6 +2210,26 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
         auth_token = _strip(token_query)
     return auth_token
 
+def _request_scope_path(request: Any) -> str:
+    """v4.18.2 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" (no scope path) matches no built-in
+    public path, so such a request still needs a token (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def _auth_passed(
     *,
     request: Request,
@@ -2243,7 +2286,9 @@ def _auth_passed(
 
     if callable(auth_ok):
         headers_dict = dict(request.headers)
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        # v4.18.2: the routed (scope) path, never the Host-derived
+        # request.url.path (see _request_scope_path).
+        path = _request_scope_path(request)
         attempts = [
             {
                 "token": auth_token,

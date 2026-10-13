@@ -2,7 +2,7 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.17.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.18.1
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
@@ -45,6 +45,28 @@ SCOPE: read-only over rows already in hand; no new provider/engine calls, no
 change to bridge selection, timeout, or fail-soft logic. ENV-GATED, DEFAULT ON
 (purely additive -- extra meta fields only, nothing removed/renamed): set
 TFB_ADV_LIFT_TRUST_WARNINGS=0 to revert to v2.16.1 (silent) behavior exactly.
+
+WHY v2.18.1 (2026-10-13, SECURITY) -- route auth reads the routed path
+-------------------------------------------------------------------------------
+_auth_passed matched its public-path list, and built the path it hands to
+auth_ok, from request.url.path. Starlette 0.41.3 re-parses that value from
+f"{scheme}://{Host header}{scope['path']}" while the router dispatches on
+scope["path"], so a crafted Host such as "x/health?x=" (or
+"x/v1/advanced/health?") made url.path read a public path for a request
+routed to /v1/advanced/sheet-rows, and with REQUIRE_AUTH on and no token
+_auth_passed returned True. main.py v8.14.5's global wall now answers such
+a request with 401 before routing, but with TFB_GLOBAL_AUTH_ENFORCE falsy
+this layer is the only check, so it was still open there.
+FIX: new _request_scope_path(request) returns the ASGI scope path (the full
+path, root_path included, which is what url.path held for a valid Host; ""
+when the request carries no scope, which matches no public path, so a token
+is required). _auth_passed uses it for _is_public_path and for auth_ok.
+INERT FOR VALID TRAFFIC: a valid Host (reg-name, IPv4 or bracketed IPv6,
+optional port, any case) cannot contain "/", "?" or "#", so url.path equals
+scope["path"] byte for byte and every decision is unchanged
+(tests/test_auth_wall_scope_path.py W14-W18). No ENV gate: an off switch
+would only keep the bypass available. The public list itself, including
+"/v1/advanced", is unchanged (owner decision). Rollback: git revert.
 
 WHY v2.18.0 — P-130: TypeError retry discrimination (twin sites)
 -------------------------------------------------------------------------------
@@ -264,7 +286,9 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.18.0"
+# v2.18.1 (2026-10-13, SECURITY): _auth_passed reads the ASGI scope path,
+# not the Host-derived request.url.path (see the module docstring WHY).
+INVESTMENT_ADVISOR_VERSION = "2.18.1"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -1206,12 +1230,34 @@ def _signature_typeerror_is_retryable(exc: TypeError) -> bool:
     return any(marker in msg for marker in signature_markers)
 
 
+def _request_scope_path(request: Any) -> str:
+    """v2.18.1 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" (no scope path) matches no public path,
+    so such a request still needs a token (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> bool:
     if _is_open_mode_enabled():
         return True
 
     try:
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        # v2.18.1: the routed (scope) path, never the Host-derived
+        # request.url.path (see _request_scope_path).
+        path = _request_scope_path(request)
     except Exception:
         path = ""
 

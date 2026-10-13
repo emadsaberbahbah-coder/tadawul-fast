@@ -17,7 +17,9 @@ COMMIT = "a" * 40
 WORKFLOW_COMMIT = COMMIT
 OTHER_COMMIT = "f" * 40
 ENGINE = "5.154.0"
-ROUTE = "4.8.3"
+# 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
+# the CLI compares this with the source constant, so the pin moves in place.
+ROUTE = "4.8.4"
 SYMBOLS = ["SHIB-USD", "DOGE-USD", "XRP-USD"]
 PATH = "/v1/analysis/sheet-rows"
 HORIZONS = ("1m", "3m", "12m")
