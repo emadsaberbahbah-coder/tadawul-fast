@@ -27,7 +27,7 @@ New files:
 Edited files (additive only):
 
 - scripts/verify_deployment.py: SCRIPT_VERSION 1.0.55 -> 1.0.56 with a dated v1.0.56 WHY block. SCRIPTS gains ("release_decision_feed", "1.0.0", ...). FLAGS gains TFB_DECISION_RELEASE and TFB_DECISION_RELEASE_KILL, both with default "0" and kill-switch field False, and both join _WORKFLOW_SCOPED. kill=False for the KILL flag is deliberate: its unset state is the safe default, so scoring it as a disarmed protection would be a permanent false DRIFT. No verifier logic changed; the AST def inventory is 14 -> 14, 0 removed, 0 added.
-- .github/workflows/ci.yml: VERSION 1.1.12 -> 1.1.13 with a dated WHY line; tests/test_release_decision_feed.py added to the blocking lean pytest list right after tests/test_final_publication_workflow.py. Nothing removed. The push path filter already covers scripts/**, tests/** and .github/workflows/**, and the py_compile step lists only decision-layer core modules, so neither needed a change.
+- .github/workflows/ci.yml: VERSION 1.1.13 -> 1.1.14 with a dated WHY line (stacked on the runner-pin change, which takes 1.1.13); tests/test_release_decision_feed.py added to the blocking lean pytest list right after tests/test_final_publication_workflow.py. Nothing removed. The push path filter already covers scripts/**, tests/** and .github/workflows/**, and the py_compile step lists only decision-layer core modules, so neither needed a change.
 
 Review fixes (a second commit on the same branch, 2026-10-13; the script, workflow and harness stay at their unreleased v1.0.0 and the verifier stays at v1.0.56 with the same 1.0.0 pin, so no pin changes; nothing removed):
 
