@@ -12,6 +12,15 @@ docs/render_env_contract.md from the code (stdlib + ast, never importing what
 it scans). This harness keeps that document complete, safe to publish and in
 step with its generator.
 
+REVIEW FIXES (2026-10-13, same unreleased 1.0.0, nothing removed): R8 now
+looks for a unique sentinel instead of the bare word "probe", which a future
+FLAGS meaning could legitimately contain. R10 also covers the reviewer's
+leak probes (a *_URL value, "user:pass", a key block, a spaced opaque string,
+a long letters-and-digits run). New R13 (env_combo names its four ENV inputs
+and its cross-key rule), R14 (section C says which kill switches read
+disarmed when unset) and R15 (the generator refuses to emit a document that
+fails its own secret check). R13 and R14 join the golden-negative set.
+
 Cases (offline; read-only except a temporary directory; no network, no
 credentials):
   R1 the generator exists, imports only the standard library, and builds the
@@ -32,18 +41,29 @@ credentials):
   R7 the committed document equals the generator output; the failure says
      how to regenerate
   R8 the output does not depend on the environment: APP_VERSION,
-     TFB_APP_VERSION, a gate and REDIS_URL set to probe values change nothing
+     TFB_APP_VERSION, a gate and REDIS_URL set to probe values change nothing,
+     and the probe sentinel never appears in it
   R9 CLI: --check exits 0 on the committed document and 1 on a stale or
      missing copy; the default mode writes, prints WARN on a change, exits 0
   R10 expected values: with no file every row says 'not recorded' and the
      preamble says 'expected production value: not recorded'; with an owner
      file a plain value is shown, a secret-looking value and a D7 name are
-     withheld, and APP_VERSION stays MUST be unset
-  R11 [needs TFB_RENDER_ENV_CONTRACT_BASE] golden negative: R1, R2, R3 and R7
-     each FAIL against the base copy (no generator, no document)
+     withheld, a *_URL value is never shown, and APP_VERSION stays MUST be
+     unset
+  R11 [needs TFB_RENDER_ENV_CONTRACT_BASE] golden negative: R1, R2, R3, R7,
+     R13 and R14 each FAIL against the base copy (no generator, no document)
   R12 guard self-test: the R5 check reports each seeded secret (credentials
      in a URL, a D7 key name, a long opaque token, a private key block)
      appended to an in-memory copy of the document; nothing is written
+  R13 engine_gates env_combo lists every ENV name that
+     core/surface_action_invariants.env_combo_violations() reads (found here
+     by AST, independently), shows 'ok' when unset, prints one rule line per
+     violation code in that function, and no B.3 row claims "no ENV read"
+  R14 section C explains "Kill switch", and every Render-scoped kill switch
+     whose manifest default is not in the verifier's _ARMED (and is not a
+     declared disarm) says "unset reads DISARMED"
+  R15 the generator's own guard reports every R12 seed, and its CLI exits 2
+     without writing or printing when the finished text would carry one
 
 Env (optional):
   TFB_RENDER_ENV_CONTRACT_BASE=<dir>  a full source copy of the base commit,
@@ -328,17 +348,21 @@ def case_r7(root=ROOT):
                     f"(first difference at line {first + 1})")
 
 
+PROBE_SENTINEL = "tfbprobe7f3c"
+
+
 def case_r8(root=ROOT):
     baseline = _generated(root)
-    probe = {"APP_VERSION": "9.9.9-probe", "TFB_APP_VERSION": "9.9.9-probe",
+    tag = PROBE_SENTINEL
+    probe = {"APP_VERSION": f"9.9.9-{tag}", "TFB_APP_VERSION": f"9.9.9-{tag}",
              "TFB_PF_ENABLED": "0", "TFB_PF_RESEARCH_VIEW": "enforce",
-             "REDIS_URL": "rediss://probe-user:probe-pass@probe.invalid:6379/0",
+             "REDIS_URL": f"rediss://{tag}-user:{tag}-pass@{tag}.invalid:6379/0",
              "PYTHONHASHSEED": "7"}
     with mock.patch.dict(os.environ, probe):
         text = _load_generator(root).generate(Path(root))
     if text != baseline:
         return "FAIL", "the document changes with the environment"
-    if "probe" in text:
+    if tag in text:
         return "FAIL", "an environment value leaked into the document"
     return "PASS", "identical output with APP_VERSION, gates and REDIS_URL set"
 
@@ -382,20 +406,39 @@ def case_r10(root=ROOT):
             return "FAIL", "no file: a B.1 row is not 'not recorded'"
         owner = tmp / "render_env_expected.json"
         secretish = "Zq8" * 12
-        owner.write_text(json.dumps({"recorded": "2026-10-13", "expected": {
+        # The reviewer's leak probes: none of these may reach the document.
+        leaks = {
+            "REDIS_URL": "redis-host.internal:6379",
+            "TFB_PF_TRUST_GATE": "hunter2:pw",
+            "TFB_T10_SHOCK_PCT": "-----" + "BEGIN",
+            "TFB_PF_SWITCH_SCAN": "Zq8Zq8Zq8 Zq8Zq8Zq8 Zq8Zq8Zq8 Zq8Zq8",
+            "TFB_PF_NULL_LEVELS": "abcd1234efgh5678ijkl",
+            "TFB_PF_IDENTITY_GATE": "k=v",
+        }
+        owner.write_text(json.dumps({"recorded": "2026-10-13", "expected": dict(leaks, **{
             "TFB_PF_DD_EXIT": "observe",
             "TFB_PF_ENABLED": secretish,
             "TFB_PROBE_" + "AUTH_" + "TOKEN": "x",
             "APP_VERSION": "5.111.0",
-        }}), encoding="utf-8")
+        })}), encoding="utf-8")
         text = gen.generate(Path(root), owner)
         b1 = _rows(_section(text, "### B.1", "### B.2"))
+        b2 = _rows(_section(text, "### B.2", "### B.3"))
         a = _rows(_section(text, "## A.", "## B."))
         problems = []
         if b1.get("TFB_PF_DD_EXIT", [""])[-1] != "`observe`":
             problems.append("plain value not shown")
         if secretish in text or "withheld" not in b1.get("TFB_PF_ENABLED", [""])[-1]:
             problems.append("secret-looking value not withheld")
+        for name, value in leaks.items():
+            row = a.get(name) or b1.get(name) or b2.get(name) or [""]
+            if value in text or "withheld" not in row[-1]:
+                problems.append(f"{name}: owner value not withheld ({row[-1]!r})")
+        if a.get("REDIS_URL", [""])[-1] != "recorded (value withheld)":
+            problems.append("REDIS_URL expected cell is not 'recorded (value withheld)'")
+        if secret_problems(text):
+            problems.append("R5 objects to the owner-file output: "
+                            + "; ".join(secret_problems(text)))
         if "PROBE_AUTH" in text:
             problems.append("D7 name printed")
         if a.get("APP_VERSION", [""])[-1] != MUST_UNSET:
@@ -406,19 +449,23 @@ def case_r10(root=ROOT):
             return "FAIL", "; ".join(problems)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return "PASS", "absent -> not recorded; plain shown, secret and D7 withheld, MUST be unset kept"
+    return "PASS", ("absent -> not recorded; plain shown; secret, *_URL, leak probes and D7 "
+                    "withheld; MUST be unset kept")
+
+
+R12_SEEDS = {
+    "credentials in a URL": "| `REDIS_URL` | x | `rediss://u:p@host.invalid:6379` |",
+    "D7 key name": "| `TFB_" + "APP_" + "TOKEN` | x |",
+    "long opaque token": "| `X` | `" + "Ab3" * 10 + "` |",
+    "private key block": "-----BEGIN " + "PRIVATE KEY-----",
+}
 
 
 def case_r12():
     clean = _committed(ROOT)
     if secret_problems(clean):
         return "FAIL", "the committed document is not clean (see R5)"
-    seeds = {
-        "credentials in a URL": "| `REDIS_URL` | x | `rediss://u:p@host.invalid:6379` |",
-        "D7 key name": "| `TFB_" + "APP_" + "TOKEN` | x |",
-        "long opaque token": "| `X` | `" + "Ab3" * 10 + "` |",
-        "private key block": "-----BEGIN " + "PRIVATE KEY-----",
-    }
+    seeds = R12_SEEDS
     missed = [label for label, line in seeds.items()
               if not secret_problems(clean + "\n" + line + "\n")]
     if missed:
@@ -426,7 +473,159 @@ def case_r12():
     return "PASS", f"{len(seeds)}/{len(seeds)} seeded secrets reported; committed doc clean"
 
 
-GATE_CASES = (("R1", case_r1), ("R2", case_r2), ("R3", case_r3), ("R7", case_r7))
+SAI_FILE = "core/surface_action_invariants.py"
+COMBO_FUNC = "env_combo_violations"
+RULE_CODE_RE = re.compile(r"^([A-Z][A-Z0-9_]{3,}):")
+
+
+def _function_env_names(tree, fn_name, seen=None):
+    """ENV names a module function reads through string-literal calls to
+    os.getenv or to module helpers, following plain calls in the same file."""
+    seen = set() if seen is None else seen
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    fn = funcs.get(fn_name)
+    if fn is None or fn_name in seen:
+        return []
+    seen.add(fn_name)
+    names = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            value = node.args[0].value
+            if KEY_NAME_RE.fullmatch(value) and value not in names:
+                names.append(value)
+        if isinstance(node.func, ast.Name) and node.func.id in funcs:
+            for name in _function_env_names(tree, node.func.id, seen):
+                if name not in names:
+                    names.append(name)
+    return names
+
+
+def case_r13(root=ROOT):
+    doc = _committed(root)
+    sai_text = _read(root, SAI_FILE)
+    if sai_text is None:
+        return "FAIL", f"{SAI_FILE} is missing"
+    sai_tree = ast.parse(sai_text)
+    expected = _function_env_names(sai_tree, COMBO_FUNC)
+    combo_fn = next((n for n in sai_tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name == COMBO_FUNC), None)
+    codes = []
+    for node in ast.walk(combo_fn) if combo_fn is not None else ():
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            match = RULE_CODE_RE.match(node.value)
+            if match and match.group(1) not in codes:
+                codes.append(match.group(1))
+    if not expected or not codes:
+        return "FAIL", f"{SAI_FILE} {COMBO_FUNC}() reads {expected}, codes {codes}; re-check this case"
+    b3_text = _section(doc, "### B.3", "## C.")
+    b3 = _rows(b3_text)
+    row = b3.get("env_combo")
+    problems = []
+    if not row:
+        problems.append("no env_combo row")
+    else:
+        missing = [n for n in expected if f"`{n}`" not in row[1]]
+        if missing:
+            problems.append(f"env_combo row lacks {missing}")
+        if row[3] != "'ok'":
+            problems.append(f"env_combo /health value when unset is {row[3]!r}, not 'ok'")
+    claims = [k for k, cells in b3.items() if any("no ENV read" in c for c in cells)]
+    if claims:
+        problems.append(f"B.3 rows still claim 'no ENV read': {claims}")
+    lines = b3_text.splitlines()
+    for rule_code in codes:
+        rule = [ln for ln in lines if ln.startswith(f"- `{rule_code}` holds when ")]
+        if not rule or not any(n in rule[0] for n in expected):
+            problems.append(f"cross-key rule {rule_code} is not printed with its ENV names")
+    if problems:
+        return "FAIL", "; ".join(problems)
+    return "PASS", (f"env_combo names {len(expected)} ENV inputs, 'ok' when unset; "
+                    f"rule(s) printed: {codes}")
+
+
+def case_r14(root=ROOT):
+    doc = _committed(root)
+    c_text = _section(doc, "## C.", "## D.")
+    c = _rows(c_text)
+    flags = _module_assign(root, "scripts/verify_deployment.py", "FLAGS")
+    workflow = set(_module_assign(root, "scripts/verify_deployment.py", "_WORKFLOW_SCOPED"))
+    disarms = set(_module_assign(root, "scripts/verify_deployment.py", "DECLARED_DISARMS"))
+    armed = {str(w) for w in _module_assign(root, "scripts/verify_deployment.py", "_ARMED")}
+    problems = []
+    if "`Kill switch` yes:" not in c_text or "DRIFT" not in c_text:
+        problems.append("section C does not explain the Kill switch column")
+    must_set = []
+    for name, default, _meaning, kill in flags:
+        if not kill or name in workflow or name in disarms or D7_NAME_RE.search(name):
+            continue
+        cells = c.get(name)
+        if cells is None:
+            problems.append(f"{name}: no section C row")
+            continue
+        if str(default).strip().lower() not in armed:
+            must_set.append(name)
+            if "unset reads DISARMED" not in cells[3]:
+                problems.append(f"{name}: kill cell {cells[3]!r} hides the disarmed default")
+        elif "armed when unset" not in cells[3]:
+            problems.append(f"{name}: kill cell {cells[3]!r}")
+    if problems:
+        return "FAIL", "; ".join(problems[:5])
+    return "PASS", f"{len(must_set)} kill switch(es) flagged as must-set in Render: {must_set}"
+
+
+def case_r15(root=ROOT):
+    gen = _load_generator(root)
+    if not hasattr(gen, "secret_findings") or not hasattr(gen, "check_publishable"):
+        return "FAIL", "the generator has no secret guard"
+    clean = _committed(root)
+    if gen.secret_findings(clean):
+        return "FAIL", f"the guard objects to the committed doc: {gen.secret_findings(clean)}"
+    missed = [label for label, line in R12_SEEDS.items()
+              if not gen.secret_findings(clean + "\n" + line + "\n")]
+    if missed:
+        return "FAIL", f"the generator guard missed seeded: {missed}"
+    seeded = clean + "\n" + R12_SEEDS["credentials in a URL"] + "\n"
+    tmp = Path(tempfile.mkdtemp(prefix="tfb_render_env_"))
+    try:
+        target = tmp / "out.md"
+        with mock.patch.object(gen, "render_markdown", lambda _data: (seeded, 0)), \
+                mock.patch.object(sys, "stderr", new=_Capture()):
+            rc_file = gen.main(["--root", str(root), "--output", str(target)])
+            with mock.patch.object(sys, "stdout", new=_Capture()) as out, \
+                    mock.patch.object(sys, "stderr", new=_Capture()) as err:
+                rc_stdout = gen.main(["--root", str(root), "--output", "-"])
+        if "refusing to emit" not in err.getvalue():
+            return "FAIL", "the guard did not explain why it refused"
+        if rc_file != 2 or target.exists():
+            return "FAIL", f"file mode: rc={rc_file}, written={target.exists()}"
+        if rc_stdout != 2 or "rediss://" in out.getvalue():
+            return "FAIL", f"stdout mode: rc={rc_stdout}, leaked={'rediss://' in out.getvalue()}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return "PASS", f"{len(R12_SEEDS)}/{len(R12_SEEDS)} seeds caught; exit 2 with nothing written or printed"
+
+
+class _Capture:
+    """A minimal stdout stand-in (keeps this harness stdlib-only)."""
+
+    def __init__(self):
+        self.parts = []
+
+    def write(self, text):
+        self.parts.append(text)
+        return len(text)
+
+    def flush(self):
+        return None
+
+    def getvalue(self):
+        return "".join(self.parts)
+
+
+GATE_CASES = (("R1", case_r1), ("R2", case_r2), ("R3", case_r3), ("R7", case_r7),
+              ("R13", case_r13), ("R14", case_r14))
 
 
 def case_r11():
@@ -462,6 +661,9 @@ CASES = (
     ("R10 expected values file handling", case_r10),
     ("R11 base golden negative", case_r11),
     ("R12 R5 check reports seeded secrets", case_r12),
+    ("R13 env_combo names its ENV inputs and rule", case_r13),
+    ("R14 section C flags kill switches that read disarmed", case_r14),
+    ("R15 generator refuses a secret-bearing document", case_r15),
 )
 
 

@@ -24,6 +24,15 @@
 # REGENERATE after changing a gate table, an ENV reader default,
 # surface_gate_states or verify_deployment FLAGS:
 #   python scripts/render_env_contract.py
+# v1.1.16 review fix (2026-10-13, same unreleased v1.1.16, nothing removed):
+# the push paths filter also gains the root config.py and env.py. Both are
+# generator inputs (section A read order and "Read by"), so a push that edits
+# only one of them must run the check itself; without them, such a push
+# would skip CI and the next core/** or scripts/** push would go red on R7.
+# MERGE NOTE: the dt10-cohort-binding-2026-10-13 branch also claims v1.1.16 on
+# the same base (fbc4d07d). Whichever branch merges second renumbers its own
+# header block to v1.1.17 and keeps both WHY blocks; only this header
+# conflicts.
 #
 # VERSION 1.1.15 (2026-10-13) -- P0-6 PORTFOLIO RESEARCH VIEW HARNESS
 #
@@ -341,6 +350,8 @@ on:
       - 'config/approved_universe_scope_v1.json'
       - 'config/render_env_expected.json'
       - 'docs/render_env_contract.md'
+      - 'config.py'
+      - 'env.py'
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'

@@ -26,6 +26,39 @@ WHAT IT WRITES (docs/render_env_contract.md):
      in its _WORKFLOW_SCOPED set are left out);
   D. a pointer to docs/flags.md (not a copy of it).
 
+REVIEW FIXES (2026-10-13, same unreleased v1.0.0, nothing removed)
+WHY (2026-10-13): a review of the first draft found real defects; this block
+closes them. The version stays 1.0.0 because the script has never been
+released (precedent: scripts/release_decision_feed.py), so the
+verify_deployment SCRIPTS pin stays 1.0.0 as well.
+  1. engine_gates env_combo was labelled "runtime state (no ENV read)". It
+     is an ENV-combination check: the engine imports
+     core/surface_action_invariants.py inside _sai_probe() and calls its
+     env_combo_violations(), which reads four gate names. The name walk now
+     follows a module that a function imports in its own body, or receives
+     from a function that imports and returns it, up to three call levels.
+     The B.3 row lists the four names, /health shows 'ok' when they are
+     unset, and the cross-key rule is printed under the table, rendered from
+     the code. A row where no name is found now says "none found statically
+     (see source)", which is all a static walk can claim.
+  2. Section C did not say what "Kill switch yes" means. verify_deployment
+     scores a kill switch DRIFT whenever it reads disarmed, unless it is a
+     declared disarm. Each kill-switch row now says whether it reads armed
+     when unset; the rows whose manifest default reads disarmed say they
+     must be set to an armed value in Render.
+  3. The preamble claimed to list the ENV names the web service reads, and
+     section D called flags.md "the remaining Render-side names". Both are
+     narrowed, and section D names the main.py settings fallback and the
+     scripts/start_web.sh launcher keys as not covered. The PORT row no
+     longer contradicts start_web.sh, which lists PORT in tfb-server.
+  4. Owner-filled values: a *_URL, *_URI or *_DSN name never shows a value
+     (REDIS_URL says "recorded (value withheld)"). A value with a space or
+     with ':', ';' or '=', a key block, a URL, a provider key shape or a
+     16+ character run mixing letters and digits is withheld. The finished
+     text then passes the same secret checks the harness applies (R5); if
+     any matches, the script exits 2 and writes nothing, so a leak is
+     stopped before it can be committed.
+
 RULES:
   - Stdlib and ast only. It NEVER imports the modules it scans: every source
     file is read as text and parsed. Defaults come from a small static
@@ -39,7 +72,10 @@ RULES:
   - Expected production values come only from the owner-filled
     config/render_env_expected.json. When it is absent the document says
     "expected production value: not recorded". Values that do not look like a
-    plain flag value are withheld, never printed.
+    plain flag value are withheld, never printed, and a connection-string
+    name (*_URL, *_URI, *_DSN) never shows its value.
+  - The finished document is checked for secret-looking content before it is
+    written or compared; a match is an error (exit 2), never a WARN.
 
 USAGE:
   python scripts/render_env_contract.py              # write the doc; WARN-only
@@ -52,9 +88,10 @@ USAGE:
 EXIT CODES:
   default  0 (prints WARN when the written content differs from what was on
            disk); 2 on a usage or input error (for example an unreadable
-           expected-values file).
+           expected-values file) or when the finished document would carry a
+           secret-looking value (nothing is written).
   --check  0 when the file equals the generator output, 1 when it differs or
-           is missing; nothing is written.
+           is missing, 2 as above; nothing is written.
 """
 from __future__ import annotations
 
@@ -96,11 +133,37 @@ ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$|^[A-Z]{3,}$")
 WITHHELD_NAME_RE = re.compile(
     r"AUTH|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|PRIVATE|CREDENTIAL|"
     r"BEARER|OPEN_MODE|SIGNING|COOKIE|SESSION_KEY|_KEYS?$|^KEY_")
-PLAIN_VALUE_RE = re.compile(r"^[A-Za-z0-9_.,:;+\-/ %=]{0,64}$")
+# v1.0.0 review fix (2026-10-13): no space, ':', ';' or '=' (a "user:pass" or
+# "k=v" pair is never a plain flag value); length 1..64.
+PLAIN_VALUE_RE = re.compile(r"^[A-Za-z0-9_.,+\-/%]{1,64}$")
 SECRETISH_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=_\-]{24,}$")
+# A connection-string name never shows an owner-filled value, however plain.
+NAME_ONLY_RE = re.compile(r"(?:_URL|_URI|_DSN)$")
+# Secret shapes, checked on every owner value and on the finished document.
+# The harness keeps its own copy on purpose (R5), so one cannot weaken both.
+SECRET_PATTERNS = (
+    ("private key block", re.compile(r"-----BEGIN")),
+    ("URL", re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")),
+    ("credentials in a URL", re.compile(r"//[^/\s]*:[^/\s]*@")),
+    ("provider key prefix", re.compile(r"\b(?:sk|pk|rk)[-_][A-Za-z0-9]{16,}")),
+    ("cloud access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("Slack token", re.compile(r"\bxox[baprs]-")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.")),
+)
+KEY_NAME_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+LONG_TOKEN_RE = re.compile(r"`([^`]{24,})`")
+SNAKE_RE = re.compile(r"_*[a-z0-9]+(?:_[a-z0-9]+)*(?:\(\))?")
+# engine_gates name walk: call levels followed below a surface_gate_states
+# entry (3 reaches env_combo -> env_combo_violations -> row_sanity_enabled).
+MAX_CALL_DEPTH = 3
+COMBO_KEY = "env_combo"
 
 MUST_UNSET = "MUST be unset"
 NOT_RECORDED = "not recorded"
+VALUE_WITHHELD = "recorded (value withheld)"
+NONE_FOUND = "none found statically (see source)"
 
 
 class GeneratorError(Exception):
@@ -151,6 +214,35 @@ def is_withheld_name(name: str) -> bool:
     return bool(WITHHELD_NAME_RE.search(str(name).upper()))
 
 
+def is_plain_value(value: str) -> bool:
+    """v1.0.0 review fix: True only for a value that looks like a flag value
+    (a word, a number, a symbol list). Anything else is withheld."""
+    if not PLAIN_VALUE_RE.match(value) or SECRETISH_VALUE_RE.match(value):
+        return False
+    if any(pattern.search(value) for _, pattern in SECRET_PATTERNS):
+        return False
+    for word in re.split(r"[,./+%\-]", value):
+        if len(word) >= 16 and re.search(r"[0-9]", word) and re.search(r"[A-Za-z]", word):
+            return False
+    return True
+
+
+def secret_findings(text: str) -> List[str]:
+    """v1.0.0 review fix: what would make the document unsafe to publish
+    (empty when clean). Mirrors the harness R5 check."""
+    problems = [label for label, pattern in SECRET_PATTERNS if pattern.search(text)]
+    names = sorted({n for n in KEY_NAME_RE.findall(text) if is_withheld_name(n)})
+    if names:
+        problems.append(f"{len(names)} name(s) covered by D7")
+    for token in LONG_TOKEN_RE.findall(text):
+        if " " in token or KEY_NAME_RE.fullmatch(token) or SNAKE_RE.fullmatch(token):
+            continue  # ENV names and code identifiers
+        if (re.fullmatch(r"[A-Za-z0-9+/=_\-]{24,}", token) and re.search(r"[0-9]", token)
+                and re.search(r"[a-z]", token) and re.search(r"[A-Z]", token)):
+            problems.append(f"long opaque token ({len(token)} chars)")
+    return problems
+
+
 # --------------------------------------------------------------------------
 # Static source model (parsed, never imported)
 # --------------------------------------------------------------------------
@@ -173,6 +265,7 @@ class SourceModule:
         self.getenv_names = set()
         self.environ_names = set()
         self._reader_nodes: Optional[List[ast.AST]] = None
+        self._module_returners: Optional[Dict[str, str]] = None
         for node in self.tree.body:
             self._index_top_level(node)
         self.env_funcs = self._env_funcs()
@@ -284,6 +377,56 @@ class SourceModule:
                         break
             changed = len(helpers) != before
         return helpers
+
+    # -- function-local imports (v1.0.0 review fix) ---------------------------
+    @staticmethod
+    def local_imports(fn: ast.AST) -> Dict[str, str]:
+        """Names a function binds with an import in its own body:
+        local name -> dotted module path (never executed)."""
+        aliases: Dict[str, str] = {}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases[alias.asname] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = node.module + "." + alias.name
+        return aliases
+
+    def module_returners(self) -> Dict[str, str]:
+        """Module functions that import a module in their body and return it
+        (the engine's _sai_probe): function name -> dotted module path."""
+        cached = self._module_returners
+        if cached is None:
+            cached = {}
+            for name, fn in self.funcs.items():
+                aliases = self.local_imports(fn)
+                if not aliases:
+                    continue
+                for node in ast.walk(fn):
+                    if (isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+                            and node.value.id in aliases):
+                        cached[name] = aliases[node.value.id]
+                        break
+            self._module_returners = cached
+        return cached
+
+    def module_bindings(self, fn: ast.AST) -> Dict[str, Tuple[str, Optional[str]]]:
+        """Local names inside fn that hold a module: name -> (dotted module
+        path, the module function that returned it, or None for a direct
+        import in fn's own body)."""
+        bindings: Dict[str, Tuple[str, Optional[str]]] = {
+            local: (dotted, None) for local, dotted in self.local_imports(fn).items()}
+        returners = self.module_returners()
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in returners):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bindings[target.id] = (returners[node.value.func.id], node.value.func.id)
+        return bindings
 
     # -- static read sites ----------------------------------------------------
     def const_str(self, node: ast.AST) -> Optional[str]:
@@ -798,11 +941,19 @@ def surface_gate_dict(mod: SourceModule) -> List[Tuple[str, ast.AST]]:
 
 
 def static_env_names(repo: Repo, mod: SourceModule, node: ast.AST, depth: int = 0,
-                     seen: Optional[set] = None) -> List[str]:
+                     seen: Optional[set] = None,
+                     trail: Optional[List[Tuple[SourceModule, ast.AST]]] = None) -> List[str]:
     """ENV names a gate expression can read: constant name arguments, plus
-    names read by the module functions it calls (two levels deep)."""
+    names read by the module functions it calls (MAX_CALL_DEPTH levels deep).
+    v1.0.0 review fix: a call on a module that the function imports in its
+    own body, or receives from a function that imports and returns it (the
+    engine's `_mod = _sai_probe(); _mod.env_combo_violations()`), is followed
+    into that module's file. trail, when given, collects every function
+    visited, in order."""
     seen = set() if seen is None else seen
     names: List[str] = []
+    bindings = (mod.module_bindings(node)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else {})
 
     def add(name: Optional[str]) -> None:
         if name and ENV_NAME_RE.match(name) and name not in names:
@@ -821,15 +972,22 @@ def static_env_names(repo: Repo, mod: SourceModule, node: ast.AST, depth: int = 
                 other = repo.module_for_import(mod.imports[fname][0])
                 if other is not None and mod.imports[fname][1] in other.funcs:
                     target_mod, target_fn = other, other.funcs[mod.imports[fname][1]]
+        elif (isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+              and call.func.value.id in bindings):
+            other = repo.module_for_import(bindings[call.func.value.id][0])
+            if other is not None and call.func.attr in other.funcs:
+                target_mod, target_fn = other, other.funcs[call.func.attr]
         if target_fn is None:
             continue
         if (target_fn.name in target_mod.env_funcs or target_fn.name in target_mod.helper_readers):
             for arg in call.args:
                 add(mod.const_str(arg))
         key = (target_mod.rel, target_fn.name)
-        if depth < 2 and key not in seen:
+        if depth < MAX_CALL_DEPTH and key not in seen:
             seen.add(key)
-            for name in static_env_names(repo, target_mod, target_fn, depth + 1, seen):
+            if trail is not None:
+                trail.append((target_mod, target_fn))
+            for name in static_env_names(repo, target_mod, target_fn, depth + 1, seen, trail):
                 add(name)
     return names
 
@@ -837,7 +995,8 @@ def static_env_names(repo: Repo, mod: SourceModule, node: ast.AST, depth: int = 
 def engine_rows(repo: Repo, mod: SourceModule) -> List[Dict[str, Any]]:
     rows = []
     for key, value_node in surface_gate_dict(mod):
-        names = static_env_names(repo, mod, value_node)
+        trail: List[Tuple[SourceModule, ast.AST]] = []
+        names = static_env_names(repo, mod, value_node, trail=trail)
         ok, value, reads = evaluate_expr(repo, mod, value_node)
         raw_by_name: Dict[str, str] = {}
         for rname, rdefault in reads:
@@ -845,6 +1004,17 @@ def engine_rows(repo: Repo, mod: SourceModule) -> List[Dict[str, Any]]:
         for rname, _ in reads:
             if ENV_NAME_RE.match(rname) and rname not in names:
                 names.append(rname)
+        if any(n not in raw_by_name for n in names):
+            # v1.0.0 review fix: a name the whole expression did not reach
+            # (short-circuit, or an import the evaluator does not follow) takes
+            # its raw default from evaluating the visited readers one by one.
+            for tmod, tfn in trail:
+                if tmod.funcs.get(tfn.name) is not tfn or not takes_no_required_args(tfn):
+                    continue
+                _ok, _value, treads = evaluate_function(repo, tmod, tfn.name)
+                for rname, rdefault in treads:
+                    if rname in names:
+                        raw_by_name.setdefault(rname, rdefault)
         raws = []
         for name in names:
             raw = raw_by_name.get(name)
@@ -860,6 +1030,72 @@ def engine_rows(repo: Repo, mod: SourceModule) -> List[Dict[str, Any]]:
             unset_value = "-"
         rows.append({"key": key, "names": names, "raw": raws, "unset": unset_value})
     return rows
+
+
+def render_condition(repo: Repo, mod: SourceModule, node: ast.AST) -> str:
+    """v1.0.0 review fix: an if-test built from and/or/not over zero-argument
+    ENV readers, as text ("(A or B on) and not (C on)"). Undetermined for
+    anything else."""
+    if isinstance(node, ast.BoolOp):
+        joiner = " and " if isinstance(node.op, ast.And) else " or "
+        return joiner.join(render_condition(repo, mod, v) for v in node.values)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return "not " + render_condition(repo, mod, node.operand)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.args
+            and not node.keywords and node.func.id in mod.funcs):
+        names = static_env_names(repo, mod, mod.funcs[node.func.id])
+        if names:
+            return "(" + " or ".join(names) + " on)"
+    raise Undetermined("condition")
+
+
+def combo_rules(repo: Repo, engine_mod: SourceModule) -> Optional[Dict[str, Any]]:
+    """v1.0.0 review fix: the cross-key ENV rules behind engine_gates
+    env_combo, read statically. The entry calls an engine function that gets
+    the invariant module from an import probe and calls its rule function;
+    each `if <test>:` there whose body names a CODE: string is one rule.
+    None when that shape is not found (the doc then prints no rule list)."""
+    value_node = dict(surface_gate_dict(engine_mod)).get(COMBO_KEY)
+    if not (isinstance(value_node, ast.Call) and isinstance(value_node.func, ast.Name)
+            and value_node.func.id in engine_mod.funcs):
+        return None
+    state_fn = engine_mod.funcs[value_node.func.id]
+    bindings = engine_mod.module_bindings(state_fn)
+    for call in ast.walk(state_fn):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name) and call.func.value.id in bindings):
+            continue
+        dotted, probe = bindings[call.func.value.id]
+        target = repo.module_for_import(dotted)
+        if target is None or call.func.attr not in target.funcs:
+            continue
+        rule_fn = target.funcs[call.func.attr]
+        rules: List[Tuple[str, str]] = []
+        for node in ast.walk(rule_fn):
+            if not isinstance(node, ast.If):
+                continue
+            codes: List[str] = []
+            for stmt in node.body:
+                for inner in ast.walk(stmt):
+                    if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                        match = re.match(r"^([A-Z][A-Z0-9_]{3,}):", inner.value)
+                        if match and match.group(1) not in codes:
+                            codes.append(match.group(1))
+            if not codes:
+                continue
+            try:
+                condition = render_condition(repo, target, node.test)
+            except Undetermined:
+                condition = "a condition the generator cannot render; see the source"
+            rules.extend((c, condition) for c in codes)
+        consts = {n.value for n in ast.walk(state_fn)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        ok, value, _ = evaluate_function(repo, target, rule_fn.name)
+        unset = "'ok'" if ok and value == [] and "ok" in consts else "-"
+        return {"key": COMBO_KEY, "state_fn": state_fn.name, "probe": probe,
+                "file": target.rel, "func": rule_fn.name, "rules": rules,
+                "unset": unset, "consts": consts}
+    return None
 
 
 def env_first_call(mod: Optional[SourceModule], func_name: str, member: str) -> Optional[Dict[str, Any]]:
@@ -943,10 +1179,37 @@ def verifier_flags(mod: SourceModule) -> Dict[str, Any]:
         # A set, tuple or dict literal; a dict contributes its keys.
         return set(mod.consts.get(const) or ())
 
+    # v1.0.0 review fix: what "armed" means to check_flags. A toggle reads
+    # armed when its value is in _ARMED; a name check_flags compares by
+    # string has its own rule there and is reported as such.
+    flag_names = {entry[0] for entry in flags_value if entry}
+    check_fn = mod.funcs.get("check_flags")
+    special = set()
+    if check_fn is not None:
+        special = {n.value for n in ast.walk(check_fn)
+                   if isinstance(n, ast.Constant) and n.value in flag_names}
     return {"flags": flags_value,
             "workflow": names_of("_WORKFLOW_SCOPED"),
             "value": names_of("_VALUE_FLAGS"),
-            "disarms": names_of("DECLARED_DISARMS")}
+            "disarms": names_of("DECLARED_DISARMS"),
+            "armed_words": sorted(str(w) for w in names_of("_ARMED")),
+            "special": special}
+
+
+def kill_switch_cell(ver: Dict[str, Any], name: str, default: str, kill: bool) -> str:
+    """v1.0.0 review fix: section C "Kill switch" cell, saying whether the
+    verifier reads the switch armed when it is unset in Render."""
+    if not kill:
+        return "no"
+    if name in ver["disarms"]:
+        return "yes (declared disarm: reported, not scored)"
+    if name in ver["special"]:
+        return "yes (own rule in check_flags; see source)"
+    if name in ver["value"]:
+        return "yes; armed only when set: set it in Render"
+    if str(default).strip().lower() in set(ver["armed_words"]):
+        return "yes; armed when unset"
+    return "yes; unset reads DISARMED: set an armed value in Render"
 
 
 # --------------------------------------------------------------------------
@@ -991,8 +1254,10 @@ class Expected:
             return "empty string"
         if value.strip().lower() == "unset":
             return "unset"
-        if (not PLAIN_VALUE_RE.match(value) or SECRETISH_VALUE_RE.match(value)
-                or "@" in value or "://" in value):
+        if NAME_ONLY_RE.search(name):
+            # v1.0.0 review fix: a connection string is name-only, always.
+            return VALUE_WITHHELD
+        if not is_plain_value(value) or "@" in value or "://" in value:
             return "(withheld: not a plain flag value)"
         return code(value)
 
@@ -1020,6 +1285,7 @@ def build_contract(root: Path, expected_path: Optional[Path] = None) -> Dict[str
     engine_mod = repo.require(ENGINE_FILE)
     verifier = repo.require(VERIFIER_FILE)
     expected = Expected(Path(expected_path) if expected_path else repo.root / DEFAULT_EXPECTED)
+    combo = combo_rules(repo, engine_mod)
     return {
         "repo": repo,
         "main": main_mod,
@@ -1028,10 +1294,21 @@ def build_contract(root: Path, expected_path: Optional[Path] = None) -> Dict[str
         "deploy_names": module_tuple(main_mod, "_DEPLOY_ENVS"),
         "pf_rows": gate_rows(repo, pf_mod, module_tuple(main_mod, "_PF_GATE_ENVS")),
         "ob_rows": gate_rows(repo, ob_mod, module_tuple(main_mod, "_OB_GATE_ENVS")),
-        "engine_rows": engine_rows(repo, engine_mod),
+        "engine_rows": _with_combo_unset(engine_rows(repo, engine_mod), combo),
+        "combo": combo,
         "verifier": verifier_flags(verifier),
         "expected": expected,
     }
+
+
+def _with_combo_unset(rows: List[Dict[str, Any]], combo: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """v1.0.0 review fix: the env_combo /health value when unset comes from
+    the rule function (the import probe stops the expression evaluator)."""
+    if combo:
+        for row in rows:
+            if row["key"] == combo["key"] and row["names"] and row["unset"] == "-":
+                row["unset"] = combo["unset"]
+    return rows
 
 
 def _platform_rows(data: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
@@ -1079,8 +1356,10 @@ def _platform_rows(data: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
                      order(env_call, "config.py") + ". Read by: " + _files(files),
                      env_default))
     for key, contract, note in (
-            ("PORT", "supplied by Render; do not set by hand",
-             "scripts/start_web.sh binds it (see its header)"),
+            ("PORT", "Render injects it (default 10000); a value in "
+             f"{ENV_GROUP} is optional",
+             "scripts/start_web.sh binds it and lists it among the "
+             f"{ENV_GROUP} keys (see its header)"),
             ("WEB_CONCURRENCY", f"owner setting (Procfile names env group {ENV_GROUP})",
              "worker count for scripts/start_web.sh (see its header)"),
             ("REDIS_URL", "secret connection string: name only, never a value in this repo",
@@ -1120,8 +1399,11 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
       "exits 1 when this file is stale.")
     w("")
     w("Build Spec item H-8. This is a static contract read from the source code by AST. "
-      "It is not a readback of the live Render service. It lists the ENV names the web "
-      "service reads and their code defaults, never a secret value.")
+      "It is not a readback of the live Render service. It covers the platform keys in "
+      "section A, the gates /health reports (section B) and the Render-scoped verifier "
+      "flags (section C), with their code defaults, never a secret value. It is not an "
+      "inventory of every ENV name the web service reads: section D says where the "
+      "others are.")
     w("")
     w("Rules:")
     w("")
@@ -1203,8 +1485,11 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
         w("")
     w("### B.3 engine_gates (" + ENGINE_FILE + " `surface_gate_states()`)")
     w("")
-    w("ENV names are derived statically from each entry's expression and the functions it "
-      "calls. Entries with no ENV read report runtime state, not configuration.")
+    w(f"ENV names are derived statically from each entry's expression and the functions it "
+      f"calls, up to {MAX_CALL_DEPTH} call levels, including a module the engine imports "
+      f"inside a function. `{NONE_FOUND}` means that walk found no ENV read; it is not "
+      "proof that none exists, so read the source before treating the entry as runtime "
+      "state.")
     w("")
     e_rows = []
     for row in data["engine_rows"]:
@@ -1219,11 +1504,37 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
             else:
                 exp_cell = "; ".join(f"{n}: {exp(n)}" for n, _ in shown)
         else:
-            names_cell, raw_cell, exp_cell = "runtime state (no ENV read)", "-", "-"
+            names_cell, raw_cell, exp_cell = NONE_FOUND, "-", "-"
         e_rows.append([code(row["key"]), names_cell, raw_cell, cell(row["unset"]), exp_cell])
     lines.extend(_table(["/health key", "ENV read", "Raw code default",
                          "/health value when unset", "Expected production value"], e_rows))
     w("")
+    combo = data.get("combo")
+    if combo:
+        # v1.0.0 review fix: the cross-key rule env_combo reports, from the code.
+        via = f", which `{combo['state_fn']}` reaches"
+        via += f" through `{combo['probe']}`" if combo["probe"] else ""
+        states = []
+        if "ok" in combo["consts"]:
+            states.append("`ok` when no rule holds")
+        if any(c.startswith("VIOLATION") for c in combo["consts"]):
+            states.append("`VIOLATION:<code>: ...` for the first rule that holds")
+        if "unavailable" in combo["consts"]:
+            states.append("`unavailable` when the invariant module cannot be used")
+        w(f"#### Cross-key rules behind `{combo['key']}`")
+        w("")
+        w(f"`{combo['key']}` checks ENV combinations in {combo['file']} "
+          f"`{combo['func']}()`{via}. /health shows " + "; ".join(states or ["its state"])
+          + ". Contract: no rule below may hold in Render.")
+        w("")
+        if combo["rules"]:
+            for rule_code, condition in combo["rules"]:
+                if any(is_withheld_name(n) for n in KEY_NAME_RE.findall(condition)):
+                    condition = "a condition on names withheld under D7"
+                w(f"- `{rule_code}` holds when {condition}.")
+        else:
+            w("- No rule found statically; read the source.")
+        w("")
 
     # ---- C ---------------------------------------------------------------
     ver = data["verifier"]
@@ -1235,15 +1546,21 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
     w("Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and "
       "are left out here. `Manifest default` is the verifier's declared default.")
     w("")
+    armed_words = ", ".join(ver["armed_words"]) or "(not found)"
+    w("`Kill switch` yes: scripts/verify_deployment.py scores the flag DRIFT whenever it "
+      "reads disarmed on the live service, unless it is listed in `DECLARED_DISARMS` "
+      f"(reported, not scored). A toggle reads armed when its value is one of {armed_words} "
+      "(the verifier's `_ARMED`). A row that says `unset reads DISARMED` must be set to an "
+      "armed value in Render for a CLEAN verdict: its manifest default is not the intended "
+      "production state.")
+    w("")
     c_rows = []
     for entry in ver["flags"]:
         name, default, meaning, kill = entry[0], entry[1], entry[2], bool(entry[3])
         if name in ver["workflow"] or not keep(name):
             continue
         kind = "value" if name in ver["value"] else "toggle"
-        kill_cell = "yes" if kill else "no"
-        if name in ver["disarms"]:
-            kill_cell += " (declared disarm)"
+        kill_cell = kill_switch_cell(ver, name, default, kill)
         c_rows.append([code(name), code(default) if default != "" else code("''"), cell(meaning),
                        kill_cell, kind, "yes" if name in on_health else "no", exp(name)])
     lines.extend(_table(["Key", "Manifest default", "Meaning when armed", "Kill switch",
@@ -1251,12 +1568,20 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
     w("")
 
     # ---- D ---------------------------------------------------------------
-    w("## D. Every other flag: docs/flags.md")
+    w("## D. TFB_ and TRACK_ flags: docs/flags.md")
     w("")
     w(f"`{FLAGS_DOC}` is the full static inventory of TFB_ and TRACK_ flags, generated by "
       f"`python scripts/flag_registry.py --output {FLAGS_DOC}`. Its rows whose consumer "
-      "lane includes `Render/library` are the remaining Render-side names. They are not "
-      "copied here, and that file is not a readback of Render either.")
+      "lane includes `Render/library` are the other TFB_ and TRACK_ names read on the "
+      "Render side. They are not copied here, and that file is not a readback of Render "
+      "either.")
+    w("")
+    settings_fn = ("`_load_settings` and the helpers it calls"
+                   if "_load_settings" in data["main"].funcs else "its settings readers")
+    w("Not covered by either file: names outside the TFB_ and TRACK_ prefixes that section "
+      f"A does not list. Two places read them: main.py ({settings_fn}) and the gunicorn "
+      "launcher scripts/start_web.sh, whose header lists the keys it expects in the "
+      f"`{ENV_GROUP}` group. Read those files for them.")
     w("")
 
     # ---- refresh ---------------------------------------------------------
@@ -1267,9 +1592,12 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
       f"run `{REGENERATE_COMMAND}` and commit the result.")
     w(f"- `{DEFAULT_EXPECTED}` is owner-filled: "
       '`{"recorded": "YYYY-MM-DD", "expected": {"NAME": "value"}}`. Plain values only; '
-      "the generator withholds anything that does not look like a plain flag value, and "
-      "names covered by D7 are never printed. The word `unset` records a key that must "
-      "stay unset.")
+      "the generator withholds anything that does not look like a plain flag value "
+      "(spaces, `:`, `;` or `=`, URL or key shapes, long runs of letters and digits), "
+      f"says `{VALUE_WITHHELD}` for a `*_URL`, `*_URI` or `*_DSN` name, and never prints a "
+      "name covered by D7. The word `unset` records a key that must stay unset. If the "
+      "finished document would still carry a secret-looking value, the generator exits 2 "
+      "and writes nothing.")
     w("")
     text = "\n".join(lines)
     note = (f"{len(withheld)} such name(s) from sections A-C were withheld."
@@ -1278,10 +1606,21 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, int]:
     return ascii_text(text), len(withheld)
 
 
+def check_publishable(text: str) -> str:
+    """v1.0.0 review fix: raise GeneratorError (exit 2, nothing written) when
+    the finished document would carry a secret-looking value."""
+    problems = secret_findings(text)
+    if problems:
+        raise GeneratorError("refusing to emit the document: it would carry "
+                             + "; ".join(problems)
+                             + ". Fix the input (usually the expected-values file).")
+    return text
+
+
 def generate(root: Path, expected_path: Optional[Path] = None) -> str:
     data = build_contract(root, expected_path)
     text, _ = render_markdown(data)
-    return text
+    return check_publishable(text)
 
 
 # --------------------------------------------------------------------------
@@ -1307,6 +1646,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         data = build_contract(root, Path(args.expected) if args.expected else None)
         text, withheld = render_markdown(data)
+        check_publishable(text)
     except GeneratorError as exc:
         print(f"{tag} ERROR: {exc}", file=sys.stderr)
         return 2
