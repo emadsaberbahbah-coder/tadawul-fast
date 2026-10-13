@@ -1,6 +1,19 @@
 /* tests/js/dt10_feed_cohort_binding.test.js -- full-source node vm harness
  * for 16_Decision_Top10.gs v1.13.8 FEED/COHORT BINDING (P0-1 arming
- * prerequisite 2). VERSION 1.0.0 (2026-10-13).
+ * prerequisite 2). VERSION 1.0.1 (2026-10-13).
+ *
+ * v1.0.1 (2026-10-13) WHY: review finding. D4 checked removed lines and the
+ * added NAMES only, so an unrelated behavioural line added inside another
+ * function (for example dt10SourceCount_) passed 25/25, and G4 of
+ * tests/test_release_decision_feed.py relied on exactly this gate. New D5
+ * removes the designed v1.13.8 regions from the delivered file (the header
+ * WHY block, the guarded block in dt10BoardVerdict_, the doc comments, var
+ * and two new functions, the two dt10SelfTest lines), undoes the designed
+ * one-line edits (header Version, DT10_VERSION, 'var out', the feed read
+ * line) and requires the result to equal the base copy byte for byte. Each
+ * region is also checked for shape so code cannot hide in it outside its
+ * designed place, and D5 proves it rejects four synthetic mutants. Nothing
+ * else changed; C1-C11, D1-D4 and G1 are as in 1.0.0.
  *
  * WHY (2026-10-13): the audited release (scripts/release_decision_feed.py)
  * writes 'EXECUTABLE | run=<SOURCE> | <anchor> | ...' into the _Status
@@ -36,11 +49,13 @@
  *   C11 pure helper edge cases, version lockstep, ES5/ASCII of the new code
  *   D1-D4 (DT10_BASE set): off verdicts, render, refresh and census against
  *       the base copy
+ *   D5  (DT10_BASE set, v1.0.1): every changed line lies inside a designed
+ *       v1.13.8 region (delivered minus those regions == base, byte for byte)
  *   G1  (DT10_BASE set): GOLDEN NEGATIVE -- every blocking armed case FAILS
  *       on the base copy (and the golden itself fails on a HEAD copy)
  *
  * Usage: node tests/js/dt10_feed_cohort_binding.test.js
- *   DT10_BASE=<copy of the dda1211 16_Decision_Top10.gs> enables D1-D4 and
+ *   DT10_BASE=<copy of the dda1211 16_Decision_Top10.gs> enables D1-D5 and
  *   G1; they print SKIP when it is unset (CI). TFB_PYTHON (default python3)
  *   runs the real release grammar for C7/C8; SKIP only when no interpreter
  *   exists. DT10_DELIVERED=<file> runs every case against another copy
@@ -540,6 +555,113 @@ test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new
   assert(/^[\x00-\x7f]*$/.test(why), 'WHY block is ASCII');
 });
 
+/* ============================================================ D5 helpers (v1.0.1) */
+/* revertDesigned(src) cuts the designed v1.13.8 regions out of a delivered
+ * source and undoes its designed one-line edits; it throws an AssertionError
+ * when a region is missing, duplicated or shaped wrongly. D5 then requires
+ * the result to equal the base copy byte for byte, so any other change (an
+ * added, removed or edited line anywhere else) fails. The shape checks are
+ * line and token structural, not a JavaScript parser. */
+function onlyIndex(lines, line, label) {
+  const hits = [];
+  lines.forEach((l, i) => { if (l === line) hits.push(i); });
+  assert.equal(hits.length, 1, label + ': expected exactly one line ' + JSON.stringify(line));
+  return hits[0];
+}
+const stripStrings = l => l.replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""');
+/* Brace depth over the code lines (strings removed): it must stay open
+ * (>= 1) from the end of the first line to the end of the line before the
+ * last, and close to 0 on the last line, so no line closes the scope early. */
+function staysInside(code, label) {
+  let depth = 0;
+  code.forEach((l, i) => {
+    for (const ch of stripStrings(l)) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+      assert(depth >= 0, label + ': brace closes below zero at ' + JSON.stringify(l));
+    }
+    if (i < code.length - 1) assert(depth >= 1, label + ': scope closed early at ' + JSON.stringify(l));
+  });
+  assert.equal(depth, 0, label + ': braces balance');
+}
+function revertDesigned(src) {
+  let lines = src.split('\n');
+  const cut = (from, to) => { const region = lines.slice(from, to); lines = lines.slice(0, from).concat(lines.slice(to)); return region; };
+  // 1. The header WHY block: comment lines only, above the v1.13.7 entry.
+  const why = onlyIndex(lines, ' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)', 'WHY block');
+  const prior = onlyIndex(lines, ' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS', 'v1.13.7 WHY');
+  assert(prior > why, 'WHY block sits above the v1.13.7 entry');
+  for (const l of cut(why, prior)) assert(/^ \*( |$)/.test(l) && !l.includes('*/'), 'WHY region is comment only: ' + l);
+  // 2. The header Version line and the version constant.
+  assert(lines[3].startsWith(' * Version: 1.13.8 ') && count(lines[3], '1.13.8') === 1, 'header Version line: ' + lines[3]);
+  lines[3] = lines[3].replace('1.13.8', '1.13.7');
+  lines[onlyIndex(lines, "var DT10_VERSION = '1.13.8';", 'DT10_VERSION')] = "var DT10_VERSION = '1.13.7';";
+  // 3. dt10BoardVerdict_: the two edited lines and the one guarded block.
+  const fn = onlyIndex(lines, 'function dt10BoardVerdict_(ss, sourceContext) {', 'dt10BoardVerdict_');
+  assert.equal(lines[fn + 1], '  var out, feedRaw = null;'); lines[fn + 1] = '  var out;';
+  assert.equal(lines[fn + 4], '    try { feedRaw = dt10UvRead_(ss); out = dt10UvParse_(feedRaw, Date.now()); }');
+  lines[fn + 4] = '    try { out = dt10UvParse_(dt10UvRead_(ss), Date.now()); }';
+  const blockStart = onlyIndex(lines, '  // v1.13.8: DT10_FEED_COHORT_BIND=on binds an EXECUTABLE feed to this', 'binding block');
+  assert(blockStart > fn, 'binding block inside dt10BoardVerdict_');
+  const blockEnd = lines.indexOf('  return out;', blockStart);
+  assert(blockEnd > blockStart, 'binding block ends before return out');
+  const block = cut(blockStart, blockEnd);
+  let k = 0;
+  while (k < block.length && /^  \/\/ /.test(block[k])) k++;
+  assert.equal(block[k], "  if (out.state === 'EXECUTABLE' && feedRaw !== null) {", 'binding block guard');
+  assert.equal(block[block.length - 1], '  }', 'binding block guard close');
+  for (const l of block.slice(k + 1, -1)) assert(/^ {4,}\S/.test(l), 'binding block body indented inside the guard: ' + JSON.stringify(l));
+  staysInside(block.slice(k), 'binding block');
+  // 4. Doc comments, the var and the two new top-level functions.
+  const r2Start = onlyIndex(lines, "/** v1.13.8: Script Property DT10_FEED_COHORT_BIND. Exactly 'on' (trimmed,", 'new functions');
+  assert.equal(lines[r2Start - 1], '}', 'new functions follow dt10BoardVerdict_');
+  const checkFn = onlyIndex(lines, 'function dt10FeedCohortCheck_(raw, cohort) {', 'dt10FeedCohortCheck_');
+  const r2End = lines.indexOf('}', checkFn) + 1;
+  assert(r2End > checkFn && checkFn > r2Start, 'new functions region');
+  const r2 = cut(r2Start, r2End), top = [];
+  let inDoc = false, body = [];
+  for (const l of r2) {
+    if (inDoc) {
+      assert(/^ \*/.test(l), 'doc comment line: ' + JSON.stringify(l));
+      if (l.includes('*/')) { assert(/\*\/$/.test(l), 'nothing after a doc comment close: ' + l); inDoc = false; }
+      continue;
+    }
+    if (/^\/\*\*/.test(l)) { assert(!body.length, 'no comment inside a new function'); inDoc = !/\*\/$/.test(l); continue; }
+    if (/^\S/.test(l)) {
+      top.push(l);
+      if (/^function /.test(l)) body = [l];
+      else if (l === '}') { body.push(l); staysInside(body, top[top.length - 2]); body = []; }
+      continue;
+    }
+    assert(/^ +\S/.test(l) && body.length, 'indented code only inside a new function: ' + JSON.stringify(l));
+    body.push(l);
+  }
+  assert.deepEqual(top, ["var DT10_FEED_COHORT_BIND_PROP = 'DT10_FEED_COHORT_BIND';", 'function dt10FeedCohortBindOn_() {', '}',
+    'function dt10FeedCohortCheck_(raw, cohort) {', '}'], 'top-level code of the new region');
+  const sandbox = {};
+  vm.createContext(sandbox); vm.runInContext(r2.join('\n'), sandbox);
+  assert.deepEqual(Object.keys(sandbox).sort(), ['DT10_FEED_COHORT_BIND_PROP', 'dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_'],
+    'the new region defines exactly the designed globals and nothing else');
+  // 5. dt10SelfTest: one comment and exactly two report.push statements.
+  const st = onlyIndex(lines, '  // v1.13.8: feed/cohort binding -- mode line + pure core (no feed read).', 'self-test lines');
+  const msg = lines.indexOf("  var msg = report.join('\\n');", st);
+  assert(msg > st, 'self-test lines end before report.join');
+  const selfTest = cut(st, msg).slice(1);
+  for (const l of selfTest) assert(/^  report\.push\(/.test(l) || /^ {6,}\S/.test(l), 'self-test region: ' + JSON.stringify(l));
+  assert.equal(selfTest.filter(l => /^  \S/.test(l)).length, 2, 'two report.push statements');
+  const pushes = stripStrings(selfTest.join('\n'));
+  assert(/^(\s*report\.push\([^;{}]*\);)+$/.test(pushes), 'self-test region holds only report.push(...) statements');
+  assert(!/[^=!<>]=[^=]|\bfunction\b|\+\+|--/.test(pushes.replace(/report\.push\(/g, '')), 'no assignment or function in the self-test lines');
+  return lines.join('\n');
+}
+function firstDifference(a, b) {
+  const x = a.split('\n'), y = b.split('\n');
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] !== y[i]) return 'line ' + (i + 1) + ': delivered-minus-regions ' + JSON.stringify(x[i]) + ' vs base ' + JSON.stringify(y[i]);
+  }
+  return '';
+}
+
 /* ============================================================ D1-D4, G1 */
 if (baseSource) {
   test('D1 OFF identity vs base: full verdict objects deep-equal for every corpus value and off spelling', () => {
@@ -587,6 +709,29 @@ if (baseSource) {
     assert.deepEqual(removed.sort(), ['try { out = dt10UvParse_(dt10UvRead_(ss), Date.now()); }',
       'var DT10_VERSION = \'1.13.7\';', 'var out;'].sort(), 'only the feed read line, its var line and the version line changed');
   });
+  test('D5 designed regions only: delivered minus the v1.13.8 regions equals the base copy byte for byte', () => {
+    const reverted = revertDesigned(source);
+    assert(reverted === baseSource, 'a change outside the designed v1.13.8 regions: ' + firstDifference(reverted, baseSource));
+    // Negative controls: D5 must reject a line added anywhere else, code hidden
+    // after the guard, a top-level statement among the new functions and an
+    // assignment in the self-test lines.
+    const inject = (after, line) => {
+      assert.equal(count(source, after), 1, 'mutation anchor ' + after);
+      return source.replace(after, after + line);
+    };
+    const mutants = [
+      ['unrelated line in dt10SourceCount_', inject('function dt10SourceCount_(value) {\n', "  if (String(value) === '424242') return 9007199254740991;\n")],
+      ['statement after the guard', inject("      out.reason = 'feed cohort check failed';\n    }\n  }\n", '  out.ageMin = 0;\n')],
+      ['top-level statement among the new functions', inject("var DT10_FEED_COHORT_BIND_PROP = 'DT10_FEED_COHORT_BIND';\n", 'dt10SourceCount_ = function (v) { return 1; };\n')],
+      ['assignment in the self-test lines', inject("  report.push('feed cohort bind (DT10_FEED_COHORT_BIND): ' +\n", '      (DT10_VERSION = \'x\') +\n')]
+    ];
+    for (const [name, mutant] of mutants) {
+      let accepted = false;
+      try { accepted = revertDesigned(mutant) === baseSource; }
+      catch (e) { if (!(e instanceof assert.AssertionError)) throw e; }
+      assert.equal(accepted, false, 'D5 must reject the mutant: ' + name);
+    }
+  });
   test('G1 GOLDEN NEGATIVE: every blocking armed case FAILS on the base copy (DT10_BASE)', () => {
     const cases = BLOCKING.map(([name, feed, , on]) => ['verdict ' + name, () => onCase(baseSource, name, feed, on)])
       .concat([['renderer other run', () => renderOther(baseSource)], ['refresh other run', () => refreshOther(baseSource)]]);
@@ -599,7 +744,7 @@ if (baseSource) {
     assert.equal(cases.length, 13);
   });
 } else {
-  for (const name of ['D1 OFF identity verdicts', 'D2 OFF identity renderer', 'D3 OFF identity refresh', 'D4 census vs base', 'G1 GOLDEN NEGATIVE'])
+  for (const name of ['D1 OFF identity verdicts', 'D2 OFF identity renderer', 'D3 OFF identity refresh', 'D4 census vs base', 'D5 designed regions only', 'G1 GOLDEN NEGATIVE'])
     skip(name, 'DT10_BASE unset');
 }
 

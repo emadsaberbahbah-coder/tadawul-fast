@@ -66,6 +66,17 @@ base copy (DT10_BASE), passes with nothing skipped: default-off verdict,
 render and refresh identity (D1-D3), zero removals and exactly the designed
 additions (D4) and its golden negative (G1). Nothing else changed.
 
+VERSION 1.1.2 (2026-10-13) -- review fixes on the DT10 v1.13.8 stack.
+WHY: (1) G4 ran the .gs harness inside its loop, so when node was missing
+pytest.skip ended the case before 11_Manual_Refresh_Coordinator.gs and
+24_Sync_Dispatch.gs were compared: drift in those two went unreported. G4 now
+compares every other pair first and runs the .gs proof after the loop, so a
+missing node skips only that proof. (2) the harness's census check (D4) did
+not confine ADDED code to the designed regions, so an unrelated behavioural
+line elsewhere in the .gs passed. G4 now also requires the harness's new D5
+(the delivered file minus the designed v1.13.8 regions equals the base copy
+byte for byte) and its message says only what D5 checks.
+
 Run: pytest -q tests/test_release_decision_feed.py
   or python3 tests/test_release_decision_feed.py      (prints PASS k/k)
 """
@@ -1603,20 +1614,24 @@ def case_g4_protected_sources_byte_identical(mp, tmp_path):
                 "apps_script/24_Sync_Dispatch.gs"):
         if (base_dir / Path(rel).name).exists():
             pairs.append((ROOT / rel, base_dir / Path(rel).name))
-    identical = 0
+    identical, gas_base = 0, None
     for current, base in pairs:
         digest = [hashlib.sha256(path.read_bytes()).hexdigest() for path in (current, base)]
         if digest[0] != digest[1] and current == GAS:
-            _gas_changed_only_by_feed_cohort_binding(base)   # v1.1.1
+            gas_base = base   # v1.1.2: proved after the loop, so a missing node skips only that proof
             continue
         assert digest[0] == digest[1], current
         identical += 1
     print("G4 byte-identical: %d protected files" % identical)
+    if gas_base is not None:
+        _gas_changed_only_by_feed_cohort_binding(gas_base)   # v1.1.1
 
 
 def _gas_changed_only_by_feed_cohort_binding(base):
     """v1.1.1 (2026-10-13): DT10 v1.13.8 changes the .gs on purpose. Accept the
-    difference only through the binding harness run against this base copy."""
+    difference only through the binding harness run against this base copy.
+    v1.1.2 (2026-10-13): also require the harness's D5, which proves that the
+    delivered file minus the designed v1.13.8 regions equals this base copy."""
     node = node_binary()
     if node is None:
         pytest.skip("node is required to prove the DT10 v1.13.8 default-off identity")
@@ -1628,8 +1643,9 @@ def _gas_changed_only_by_feed_cohort_binding(base):
     lines = proc.stdout.strip().splitlines()
     assert proc.returncode == 0 and lines and lines[-1].startswith("PASS ") \
         and "SKIP " not in proc.stdout, proc.stdout[-3000:] + proc.stderr[-2000:]
-    print("G4 16_Decision_Top10.gs: differs from base only by the gated v1.13.8 "
-          "feed cohort binding (%s)" % lines[-1])
+    assert "\nPASS D5 " in "\n" + proc.stdout, "harness D5 (designed regions only) did not run"   # v1.1.2
+    print("G4 16_Decision_Top10.gs: differs from base only inside the designed v1.13.8 "
+          "feed cohort binding regions (harness D5; %s)" % lines[-1])
 
 
 def case_g5_verifier_ast_inventory_zero_removed(mp, tmp_path):
