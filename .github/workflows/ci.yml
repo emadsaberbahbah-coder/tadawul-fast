@@ -8,6 +8,10 @@
 # (tests/test_release_decision_feed.py) in the blocking lean lane. WHY: the new
 # release step is the only path that may write EXECUTABLE; its gates, grammar,
 # refusals and workflow env parity must be red on the push that breaks them.
+# WHY (2026-10-13, Codex P1 on PR #763, same entry, no list change): the same
+# harness now also blocks on the writer-start supersede step being present,
+# gated and ordered in every page-writing job, and on the release expires=
+# being enforced by send_digest, run_daily_brief and tfb_acceptance.
 #
 # VERSION 1.1.13 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
 #

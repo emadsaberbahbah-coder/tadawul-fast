@@ -541,7 +541,21 @@ from __future__ import annotations
 # exclusion. Empty/missing-number briefs render without numeric-format crashes.
 # Final feed/Top10 output vetoes also suppress executable claims; candidate
 # parsing is bounded to SELECTED and requires a positive INVEST token.
-__version__ = "1.18.0"
+# ---------------------------------------------------------------------------
+# v1.18.1 (2026-10-13, P0-1, Codex P1 on PR #763) -- RELEASE EXPIRY ENFORCED.
+# WHY: scripts/release_decision_feed.py may now write an audited EXECUTABLE
+# carrying 'expires=<YYYY-mm-ddTHH:MM:SS+03:00>'. The cockpit stops honouring
+# it after 480 minutes, but _feed_execution_veto read only the head, so an
+# expired release kept the brief's executable plan alive until a sweep ran.
+# CHANGE: an EXECUTABLE head whose value carries an expires= token is a veto
+# once now > expires, and when the token repeats or is malformed (fail
+# closed); the veto text is prefixed with the reason (release_expired /
+# release_expiry_invalid). INERT TODAY: no value written before P0-1 carries
+# expires=, and a value without the token gives exactly the v1.18.0 result
+# (harness: corpus comparison against the v1.18.0 copy). ZERO functions
+# removed. Added: _feed_release_expiry (a lockstep copy shared verbatim with
+# send_digest and tfb_acceptance) and _feed_veto_label.
+__version__ = "1.18.1"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -1385,8 +1399,46 @@ def _earnings_held_line(model: Dict[str, Any]) -> str:
             % (len(held), win, ", ".join(parts)))
 
 
+# P0-1 RELEASE EXPIRY (2026-10-13). LOCKSTEP COPY: these two constants and
+# _feed_release_expiry are byte-identical in scripts/send_digest.py,
+# scripts/run_daily_brief.py and scripts/tfb_acceptance.py (kept stdlib-only so
+# no consumer gains an import edge); tests/test_release_decision_feed.py fails
+# when the copies drift.
+_FEED_EXPIRES_RE = re.compile(r"(?<![A-Za-z0-9_])expires\s*=\s*([^\s|]*)", re.I)
+_FEED_EXPIRES_FORM = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+03:00", re.A)
+
+
+def _feed_release_expiry(raw: Any, now: Any = None) -> str:
+    """PURE. '' when the value carries no expires= token (every value written
+    before P0-1: behaviour unchanged) or its release is still live;
+    'release_expired' once now > expires; 'release_expiry_invalid' when the
+    token repeats or is not exactly YYYY-mm-ddTHH:MM:SS+03:00 (fail closed)."""
+    from datetime import datetime as _datetime, timezone as _timezone
+    found = _FEED_EXPIRES_RE.findall(str(raw or ""))
+    if not found:
+        return ""
+    if len(found) != 1 or not _FEED_EXPIRES_FORM.fullmatch(found[0]):
+        return "release_expiry_invalid"
+    try:
+        expires = _datetime.strptime(found[0], "%Y-%m-%dT%H:%M:%S%z")
+        current = now if now is not None else _datetime.now(_timezone.utc)
+        return "release_expired" if current > expires else ""
+    except (TypeError, ValueError):
+        return "release_expiry_invalid"
+
+
+def _feed_veto_label(raw: str) -> str:
+    """v1.18.1: the feed text shown with a veto; an expired or unreadable
+    release is prefixed with its reason. Unchanged for every other value."""
+    head = _s(raw).split("|", 1)[0].strip().upper()
+    expiry = _feed_release_expiry(raw) if head.startswith("EXECUTABLE") else ""
+    return (expiry + ": " + raw) if expiry else raw
+
+
 def _feed_execution_veto(raw: str) -> bool:
     head = _s(raw).split("|", 1)[0].strip().upper()
+    if head.startswith("EXECUTABLE") and _feed_release_expiry(raw):
+        return True   # v1.18.1: an expired or unreadable release is a veto
     return bool(re.match(r"^(?:NOT[_ ]ACTIONABLE|WITHHELD)(?:\b|\()", head))
 
 
@@ -1405,6 +1457,7 @@ def _extract_final_feed(rows: List[List[Any]]) -> str:
 def _apply_final_feed_veto(d: Dict[str, Any], raw: str) -> None:
     if not _feed_execution_veto(raw):
         return
+    raw = _feed_veto_label(raw)   # v1.18.1: identity unless an expired release
     d["execution_veto"] = raw
     for group in ("sell", "trim", "add"):
         for rec in d[group]:
@@ -1421,7 +1474,7 @@ def _apply_final_feed_veto(d: Dict[str, Any], raw: str) -> None:
 
 def _top10_execution_veto(rows: List[List[Any]], final_feed: str) -> str:
     if _feed_execution_veto(final_feed):
-        return "Final decision feed: " + final_feed
+        return "Final decision feed: " + _feed_veto_label(final_feed)
     for row in rows[:40]:
         first = _s(row[0]) if row else ""
         if first.lower() == "status:":

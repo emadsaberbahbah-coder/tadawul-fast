@@ -1,6 +1,44 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.1.0 (2026-10-13) -- SUPERSEDE AT WRITER START (Codex P1 on PR #763,
+"bind execution permission to the audited cohort"). Nothing removed.
+
+WHY (2026-10-13)
+----------------
+With TFB_DECISION_RELEASE armed, a release of run N stayed EXECUTABLE while a
+later production writer (a scheduled or dispatched daily_sync, a rerun attempt
+of N, the inline recovery job or page_refresh_recovery.yml) re-stamped the
+pages: run_dashboard_sync.py leaves an EXECUTABLE feed alone when its own
+composite is ready, and the cockpit's dt10UvParse_ never compares the feed's
+run= with its cohort. So an unaudited cohort N+1 could render under N's
+permission until N+1's final job re-vetoed it.
+- New mode 'supersede' (--current-run <GITHUB_RUN_ID>, attempt read from
+  GITHUB_RUN_ATTEMPT), run by a gated step at the start of EVERY page-writing
+  production job, after its credentials step and before its first write. If
+  ANY consumer would read the current feed as EXECUTABLE (reads_executable,
+  the widest head rule), it writes exactly ONE downgrade through the
+  UNCHANGED finalize.publish_blocker:
+    NOT_ACTIONABLE(final_publication) | run=<released run> | <now +03:00> |
+    superseded_by_run=<current run>.<attempt>
+  and otherwise writes nothing. It never promotes. The released run stays in
+  run=, so classify_prior refuses a re-release of it.
+- Exit 0 on a no-op or a confirmed downgrade (exact readback, or a re-read
+  showing that a parallel leg already downgraded it, key still present);
+  exit 3 on any read, layout or readback fault. FAIL CLOSED: the workflow step fails, so every
+  later default-success step of that job, including its page write, is
+  skipped. A supersede fault therefore never lets a leg write pages under a
+  live release.
+- classify_prior: a value in the EXACT supersede grammar is eligible only for
+  a SOURCE newer than the superseded run AND not older than the superseding
+  run (reason superseded_older_run); everything else carrying
+  superseded_by_run stays refused. Without this, a superseding run whose own
+  final job passed (and therefore wrote no veto) could never be released.
+- mode=release, armed: refuse (release_gate_not_canonical, zero I/O) when the
+  raw TFB_DECISION_RELEASE value carries surrounding whitespace. The supersede
+  step's condition matches the armed words case-insensitively but cannot
+  strip, so this keeps "a promotion is possible" => "the supersede step runs".
+
 VERSION 1.0.0 (2026-10-13) -- NEW SCRIPT: review blocker 1 / plan item P0-1 /
 owner decision D1 (the explicit, audited release step).
 
@@ -68,10 +106,12 @@ REVIEW FIXES (2026-10-13, same unreleased v1.0.0, nothing removed)
   write the downgrade.
 
 EXIT CODES
-  0 released, already released, dry-run accepted, swept or killed
+  0 released, already released, dry-run accepted, swept or killed;
+    supersede: nothing to supersede, or the downgrade is confirmed
   1 deferred (in-flight run or probe/provenance unavailable) or warning-only
   2 audits failed
-  3 refused, compare-and-set/readback failure, layout fault or fatal error
+  3 refused, compare-and-set/readback failure, layout fault or fatal error;
+    supersede: invalid run/attempt, read/layout fault or unconfirmed downgrade
 """
 from __future__ import annotations
 
@@ -95,11 +135,14 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
 KILL_ENV = "TFB_DECISION_RELEASE_KILL"
 _ARMED = {"1", "true", "yes", "on"}
 MODES = ("release", "sweep", "kill")
+# v1.1.0: writer-start supersede. Deliberately NOT in MODES: run() (the
+# release entry point) keeps refusing it; main() routes it to supersede().
+SUPERSEDE_MODE = "supersede"
 # DT10_UV_MAX_AGE_MIN / DT10_UV_FUTURE_SKEW_MIN in apps_script/16_Decision_Top10.gs.
 # Not configurable: the cockpit honours 480 minutes from the first stamp
 # whatever this script says (tests read both constants out of the .gs).
@@ -128,6 +171,13 @@ RELEASE_VALUE_RE = re.compile(
     r" \| audits=0,0", re.ASCII)
 _RELEASE_TOKEN_RE = re.compile(r"(?<![a-z0-9_])release\s*=", re.I)
 _SUPERSEDED_RE = re.compile(r"superseded_by_run", re.I)
+# v1.1.0: the one value supersede() may write (validated before the write).
+# run= is the superseded run, or 'unknown' when the EXECUTABLE it replaced did
+# not carry exactly one numeric run token.
+SUPERSEDE_VALUE_RE = re.compile(
+    r"NOT_ACTIONABLE\(final_publication\) \| run=(?P<run>[1-9][0-9]*|unknown)"
+    r" \| \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\+03:00"
+    r" \| superseded_by_run=(?P<by>[1-9][0-9]*)\.(?P<attempt>[1-9][0-9]*)", re.ASCII)
 _PAYLOAD_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", re.ASCII)
 
 # Production writers whose in-flight runs defer a release (fail closed).
@@ -275,6 +325,15 @@ def downgrade_value(run_token: str, now: datetime, reason: str, release_token: s
             + reason + " | release=" + release_token)
 
 
+def supersede_value(run_token: str, now: datetime, current_run: str, attempt: str) -> str:
+    """PURE (v1.1.0). The one downgrade supersede() may write."""
+    value = (DOWNGRADE_PREFIX + "run=" + str(run_token) + " | " + riyadh_stamp(now)
+             + " | superseded_by_run=" + str(current_run) + "." + str(attempt))
+    if SUPERSEDE_VALUE_RE.fullmatch(value) is None or reads_executable(value):
+        raise ValueError("supersede value grammar violated")
+    return value
+
+
 def sweep_reason(value: str, now: datetime) -> Optional[str]:
     """None while a well-formed release is live; else the downgrade reason."""
     match = RELEASE_VALUE_RE.fullmatch(value or "")
@@ -301,6 +360,14 @@ def classify_prior(prior: Optional[str], source: str) -> tuple[str, str]:
     if not text:
         return "eligible", "absent"
     if _SUPERSEDED_RE.search(text):
+        # v1.1.0: only the EXACT supersede grammar can be eligible, and only
+        # for a SOURCE newer than the superseded run (never a re-release) and
+        # not older than the superseding run (its cohort came after the
+        # downgrade). Every other superseded_by_run value stays refused.
+        sup = SUPERSEDE_VALUE_RE.fullmatch(text)
+        if (sup is not None and int(source) >= int(sup.group("by"))
+                and (sup.group("run") == "unknown" or int(source) > int(sup.group("run")))):
+            return "eligible", "superseded_older_run"
         return "refused", "superseded_by_run"
     head = text.split("|", 1)[0].strip()
     tokens = _run_tokens(text)
@@ -582,6 +649,12 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         return _finish(out, 3, "refused", "sheet_id_missing")
     if mode == "release" and not kill and armed and not (in_actions and release_numeric):
         return _finish(out, 3, "refused", "promotion_requires_github_actions")
+    raw_gate = os.getenv(RELEASE_ENV) or ""
+    if mode == "release" and not kill and armed and raw_gate != raw_gate.strip():
+        # v1.1.0: the writer-start supersede step matches the armed words
+        # case-insensitively but cannot strip whitespace; never promote under a
+        # gate spelling that would leave that step skipped.
+        return _finish(out, 3, "refused", "release_gate_not_canonical")
 
     # 1. one bounded read of the global key block
     try:
@@ -740,16 +813,126 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     return _finish(out, 0, "released")
 
 
+# --------------------------------------------------------------------------- supersede
+def _read_feed(service: Any, sheet_id: str, fin: Any) -> tuple[int, Optional[str]]:
+    """One bounded read of the key block: (slot, value or None when absent)."""
+    grid = service.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=fin.KEY_RANGE,
+        valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
+    slot = fin.publication_slot(grid)
+    pair = _pair(grid[slot - 1] if slot - 1 < len(grid) else [])
+    return slot, (str(pair[1]) if str(pair[0]).strip() else None)
+
+
+def supersede(sheet_id: str, current_run_id: Any, *, attempt: Any = None, service: Any = None,
+              now_utc: Any = None, finalize: Any = None) -> dict:
+    """v1.1.0 writer-start supersede. Downgrade-only, never promotes.
+
+    Run at the start of every page-writing production job, before its first
+    write. If any consumer would read the feed as EXECUTABLE, write ONE
+    downgrade through the unchanged finalize.publish_blocker; otherwise write
+    nothing. Exit 0: nothing to supersede, or the downgrade is confirmed.
+    Exit 3: invalid identity, read/layout fault, or unconfirmed downgrade (the
+    calling step fails, so the job writes no pages under a live release).
+    """
+    fin = finalize or final
+    if callable(now_utc):
+        clock = now_utc
+    elif now_utc is not None:
+        clock = (lambda fixed=now_utc: fixed)
+    else:
+        clock = (lambda: datetime.now(timezone.utc))
+    run_attempt = os.getenv("GITHUB_RUN_ATTEMPT", "") if attempt is None else attempt
+    current = current_run_id if isinstance(current_run_id, str) else None
+    run_attempt = run_attempt if isinstance(run_attempt, str) else None
+    out: dict = {
+        "script_version": SCRIPT_VERSION, "mode": SUPERSEDE_MODE,
+        "current_run_id": current, "current_run_attempt": run_attempt,
+        "slot": None, "prior": None, "prior_executable": None, "superseded_run": None,
+        "downgrade": None, "blocker_published": False, "feed_promoted": False,
+        "released": False, "reasons": [], "exit_code": 3, "outcome": None,
+    }
+    # 0. identity, before any I/O
+    if current is None or not SOURCE_RE.fullmatch(current):
+        out["current_run_id"] = None
+        return _finish(out, 3, "refused", "current_run_invalid")
+    if run_attempt is None or not SOURCE_RE.fullmatch(run_attempt):
+        out["current_run_attempt"] = None
+        return _finish(out, 3, "refused", "run_attempt_invalid")
+    if not isinstance(sheet_id, str) or not sheet_id.strip():
+        return _finish(out, 3, "refused", "sheet_id_missing")
+    # 1. one bounded read of the global key block
+    try:
+        if service is None:
+            from integrations.google_sheets_service import get_sheets_service
+            service = get_sheets_service()
+        slot, prior = _read_feed(service, sheet_id, fin)
+    except Exception as exc:  # noqa: BLE001 - layout or transport fault: fail closed
+        out["fatal"] = safe_error_text(exc)
+        return _finish(out, 3, "layout_fault", "layout_or_read_failed")
+    out["slot"], out["prior"] = slot, prior
+    out["prior_executable"] = executable = prior is not None and reads_executable(prior)
+    if not executable:
+        return _finish(out, 0, "nothing_to_supersede")
+    # 2. exactly one downgrade, keeping the released run in run=
+    run_token = _single_run(prior) or "unknown"
+    out["superseded_run"] = run_token
+    value = supersede_value(run_token, clock(), current, run_attempt)
+    try:
+        fin.publish_blocker(service, sheet_id, value)
+    except Exception as exc:  # noqa: BLE001 - the write may or may not have landed
+        out["publication_error"] = safe_error_text(exc)
+        # A parallel leg of the same run may have downgraded the cell between
+        # this leg's update and its readback. What must hold before any page
+        # write is only that NO consumer reads EXECUTABLE: re-read once.
+        try:
+            _slot, after = _read_feed(service, sheet_id, fin)
+        except Exception as again:  # noqa: BLE001
+            out["reread_error"] = safe_error_text(again)
+            return _finish(out, 3, "supersede_unconfirmed", "supersede_unconfirmed")
+        out["after"] = after
+        # An absent key is not a confirmed downgrade (the brief and the digest
+        # fall back to their pre-feed paths on it): fail closed.
+        if after is None or reads_executable(after):
+            return _finish(out, 3, "supersede_unconfirmed", "supersede_unconfirmed")
+        return _finish(out, 0, "superseded_confirmed_by_reread", "readback_raced")
+    out["downgrade"], out["blocker_published"] = value, True
+    return _finish(out, 0, "superseded")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--sheet-id", default=os.getenv("DEFAULT_SPREADSHEET_ID", ""))
-    parser.add_argument("--source-run-id", required=True,
+    # v1.1.0: no longer required at the parser (mode=supersede takes
+    # --current-run instead); every other mode still exits 3 without it.
+    parser.add_argument("--source-run-id", default=None,
                         help="completed daily_sync run ID; never read from GITHUB_RUN_ID")
     parser.add_argument("--mode", default="release")
+    parser.add_argument("--current-run", default=None,
+                        help="mode=supersede only: this writer's own run ID")
     parser.add_argument("--json-out", default="release_decision_feed.json")
     try:
         args = parser.parse_args(argv)
     except SystemExit:
+        return 3
+    if args.mode == SUPERSEDE_MODE:
+        try:
+            result = supersede(args.sheet_id, args.current_run)
+        except Exception as exc:  # noqa: BLE001
+            result = {"script_version": SCRIPT_VERSION, "mode": SUPERSEDE_MODE, "exit_code": 3,
+                      "outcome": "fatal", "fatal": safe_error_text(exc),
+                      "feed_promoted": False, "released": False}
+        text = json.dumps(result, ensure_ascii=True, default=str, indent=2)
+        Path(args.json_out).write_text(text + "\n", encoding="utf-8")
+        print(json.dumps({key: result.get(key) for key in (
+            "script_version", "mode", "exit_code", "outcome", "current_run_id",
+            "current_run_attempt", "prior_executable", "superseded_run", "downgrade",
+            "reasons", "blocker_published", "feed_promoted", "fatal", "publication_error")},
+            ensure_ascii=True))
+        return result["exit_code"]
+    if args.source_run_id is None:
+        print("release_decision_feed.py: error: the following arguments are required: "
+              "--source-run-id", file=sys.stderr)
         return 3
     try:
         result = asyncio.run(run(args.sheet_id, args.source_run_id, mode=args.mode))
