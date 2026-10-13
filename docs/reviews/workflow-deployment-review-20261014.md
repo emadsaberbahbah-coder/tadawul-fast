@@ -4,13 +4,15 @@ Reviewed repository `emadsaberbahbah-coder/tadawul-fast` at main commit
 `f3a7ab152f1fc8d545cc451d19ff5eb93d32d21a`. Dates and times below use
 Asia/Riyadh unless marked UTC. Render inspection was read-only in the
 owner-confirmed workspace `My Workspace` (`tea-d3m0uuumcj7s73aatrpg`).
-The patch was subsequently integrated with main `2ab90e7` after PR #767 merged,
-preserving its environment-contract generator, manifest pin, and blocking tests.
+The patch was subsequently integrated with main `2add3b4` after PRs #767 and
+#768 merged, preserving the environment-contract generator, manifest pin,
+blocking tests, and default-off decision-feed cohort guard.
 
 Scope: all 36 workflow definitions and their action expressions, build/start
 commands, deployment verifier, publication/recovery audit scripts, dependency
 resolution and vulnerability reports, whole Python test discovery, and all 11
-JavaScript test harnesses. Passing these checks establishes tested behavior;
+JavaScript test harnesses (12 after the cohort guard merged). Passing these
+checks establishes tested behavior;
 it does not certify the correctness of live market data or every production
 integration. No production workbook, Apps Script, service setting, or deployment
 was changed.
@@ -34,7 +36,7 @@ was changed.
 | P2 | Verifier `--json` stdout included imported-module startup messages, and omitted the wiring evidence explaining drift. | Import diagnostics go to stderr; stdout contains one JSON document including wiring findings. |
 | P2 | Render's current build command logs `grep: unrecognized option '--hash=sha256:[0-9a-f]{64}'`, ignores `pip check` failure, and traverses its virtual environment during compilation. | New executable `scripts/build_web.sh` installs the selected requirements, requires `pip check` to pass, and compiles source while excluding environments and scratch/cache trees. The dashboard still needs its build command updated. |
 
-Provider audit is version 1.2.1, launcher 2.6.2, verifier 1.0.59, and CI 1.1.17.
+Provider audit is version 1.2.1, launcher 2.6.2, verifier 1.0.59, and CI 1.1.18.
 New deployment, target-resolution, shell-input, and baseline regressions run in
 the blocking lean CI lane. No audit threshold was lowered and no release gate
 was armed.
@@ -124,11 +126,12 @@ transitive/test-tool advisories. Python 3.11 resolution and auditing of the full
 closure for [PR #766](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/766)
 confirmed **8 remaining advisories** after its compatible dependency updates.
 That existing PR should be reviewed and merged rather than duplicated here.
-Its conflicting CI header was resolved by merging reviewed main `2ab90e7` into
-the existing security branch (commit `2f508a6`), preserving all five security
-change files and the Render/runner checks. The newer-pin integration passed
-45 focused tests with 6 optional skips; all 143 installed packages remained
-compatible. This updates the proposed PR, not main or the live deployment.
+Its conflicting CI header was resolved by merging current main `2add3b4` into
+the existing security branch (commit `aad228f`), preserving all five security
+change files, Render/runner checks and cohort guard. The newer-pin integration
+passed 45 focused Python tests and 20 cohort Node checks, with 6 optional skips
+in each; all 143 installed packages remained compatible. This updates the
+proposed PR, not main or the live deployment.
 
 Seven remaining advisories are in Starlette 0.41.3 and need a coordinated FastAPI
 upgrade: current FastAPI metadata requires Starlette `<0.47.0`, while required
@@ -164,9 +167,10 @@ the new environment-contract and affected deployment/workflow suites separately.
 | Blocking repair suites in a separate lean environment (numpy, pytest, PyYAML only) | 67 passed, 30 subtests passed |
 | Integrated deployment/workflow/verifier/manifest/release suites after PR #767 | 127 passed, 10 skipped, 69 subtests passed |
 | Integrated Render environment contract and generated-document check | 14 passed, 1 optional skip; document current |
+| Final integration with PR #768: affected Python suites and all 12 Node harnesses | 238 Python tests passed, 14 skipped, 53 subtests passed; all Node harnesses passed |
 | All workflow action/schema/expression checks, actionlint 1.7.12 | Pass; external shellcheck/pyflakes integrations disabled |
 | Python compilation and ruff E9/F63/F7/F82 across the repository | Pass |
-| All 11 JavaScript harnesses | Pass |
+| All JavaScript harnesses, including the newly merged cohort guard | Pass |
 | Shell syntax and whitespace/error checks | Pass |
 | Provider control self-test | 16/16 passed |
 | Decision freshness self-test | 6/6 passed |

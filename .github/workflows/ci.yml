@@ -2,10 +2,23 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.17 (2026-10-14) -- DEPLOYMENT AND WORKFLOW REPAIR REGRESSIONS
+# VERSION 1.1.18 (2026-10-14) -- DEPLOYMENT AND WORKFLOW REPAIR REGRESSIONS
 #
 # Run launcher, build, verifier, target-resolution, and shell-input regressions
 # in the blocking lean lane so production repairs remain covered after merge.
+#
+# VERSION 1.1.17 (2026-10-13) -- DT10 FEED/COHORT BINDING HARNESS (P0-1 PREREQ 2)
+#
+# v1.1.17: run tests/js/dt10_feed_cohort_binding.test.js in the blocking
+# lean lane's native Apps Script step. WHY (2026-10-13): 16_Decision_Top10.gs
+# v1.13.8 adds Script Property DT10_FEED_COHORT_BIND (default off), which
+# withholds an EXECUTABLE decision feed whose run= is not the cockpit's
+# source cohort (release arming prerequisite 2). The harness loads the real
+# .gs and pins the off verdicts, the armed reasons, the fail-closed faults
+# and the release-grammar parity (it calls python3 for the release grammar;
+# the lean job already sets Python up). Its dual-tree identity and golden
+# negative need DT10_BASE and skip in CI. Nothing is removed and no existing
+# entry moves.
 #
 # VERSION 1.1.16 (2026-10-13) -- RENDER ENV CONTRACT HARNESS (BUILD SPEC H-8)
 #
@@ -662,6 +675,7 @@ jobs:
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
           node tests/js/decision_input_truth.test.js
+          node tests/js/dt10_feed_cohort_binding.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
