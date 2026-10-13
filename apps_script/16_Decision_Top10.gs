@@ -1,11 +1,51 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.7 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.8 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)
+ * WHY (2026-10-13): the audited release (scripts/release_decision_feed.py,
+ * PR #763) writes 'EXECUTABLE | run=<SOURCE> | <anchor> | ...' into the
+ * _Status 'TFB Decision Feed' cell. dt10BoardVerdict_ honoured an
+ * EXECUTABLE feed on its state and age alone (dt10UvParse_) and never
+ * compared the feed's run= with this board's own source cohort (the one
+ * shared run= of the four market _Status rows, dt10SourceReadinessCore_).
+ * A release for run A could therefore render EXECUTABLE over a newer,
+ * unaudited cohort B written by a writer the writer-start supersede step
+ * does not cover (a stale workflow definition, a writer outside those
+ * workflows, a disarmed gate, a run-listing race). Arming prerequisite 2
+ * of docs/evidence/TFB_Commit_Sheet_release_decision_feed_v1.0.0_2026-10-13.md
+ * asks for exactly this check, as defence in depth.
+ * WHAT: Script Property DT10_FEED_COHORT_BIND. Exactly 'on' (trimmed, any
+ * case) arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
+ * v1.13.7 in every function apart from the version string and two
+ * diagnostic dt10SelfTest lines (one memoized property read is added, and
+ * only while the feed reads EXECUTABLE). A property-service failure reads
+ * as on (fail-closed; the check can only withhold). Armed, and only when
+ * the parsed feed state is EXECUTABLE after source readiness passed, the
+ * raw feed value must carry exactly one run=<digits> token equal to the
+ * readiness cohort. Tokens are counted with the Python consumers' widest
+ * rule (SOURCE_RUN_RE: 'run' '=' not preceded by a letter, digit or
+ * underscore, any case), so superseded_by_run= is not a run token. A miss
+ * makes the verdict NOT_ACTIONABLE with reason 'feed run X != cohort Y' or
+ * 'feed run token missing/ambiguous' ('cockpit source cohort unverified'
+ * or 'feed cohort check failed' on a fault). Nothing is ever upgraded to
+ * EXECUTABLE; a source-blocked verdict keeps its source reason; the B2
+ * receipt 'source readiness VERIFIED (run N)' is untouched, so the release
+ * still bootstraps from it. DT10_UPSTREAM_VERDICT=off stays the existing
+ * cockpit BYPASS: the feed is not read, so this check is bypassed too.
+ * Never use it as a kill switch.
+ * Functions added (0 removed): dt10FeedCohortBindOn_, dt10FeedCohortCheck_;
+ * var added: DT10_FEED_COHORT_BIND_PROP. dt10BoardVerdict_ keeps the raw
+ * feed value it already read and makes one guarded call. dt10SelfTest
+ * gains 'feed cohort bind (DT10_FEED_COHORT_BIND): off|on' and 'feed
+ * cohort core: ok'. Harness: tests/js/dt10_feed_cohort_binding.test.js.
+ * Rollback: delete the property (the next run is v1.13.7 behaviour) or
+ * re-paste v1.13.7.
  *
  * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS
  * Five approved fund-tab rows legitimately repeat earlier source pages.
@@ -1708,7 +1748,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.7';
+var DT10_VERSION = '1.13.8';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -1730,10 +1770,10 @@ function dt10BoardFundingAlert_(a) {
   return dt10IsFundingAlert_(a) || String((a && a.type) || '') === 'rotation_proposal';
 }
 function dt10BoardVerdict_(ss, sourceContext) {
-  var out;
+  var out, feedRaw = null;
   if (!dt10UvOn_()) out = { state: 'EXECUTABLE', reason: '', ageMin: null };
   else {
-    try { out = dt10UvParse_(dt10UvRead_(ss), Date.now()); }
+    try { feedRaw = dt10UvRead_(ss); out = dt10UvParse_(feedRaw, Date.now()); }
     catch (e) { out = { state: 'NOT_ACTIONABLE', reason: 'verdict read failed', ageMin: null }; }
   }
   // The rollout token cannot override factual incomplete source evidence.
@@ -1742,6 +1782,76 @@ function dt10BoardVerdict_(ss, sourceContext) {
   if (!source.ready) {
     out.state = 'NOT_ACTIONABLE'; out.source_blocked = true;
     out.reason = 'source readiness: ' + source.reason;
+  }
+  // v1.13.8: DT10_FEED_COHORT_BIND=on binds an EXECUTABLE feed to this
+  // board's source cohort. Downgrade only. DT10_UPSTREAM_VERDICT=off never
+  // reads the feed (feedRaw stays null), so that bypass skips it as well.
+  if (out.state === 'EXECUTABLE' && feedRaw !== null) {
+    try {
+      if (dt10FeedCohortBindOn_()) {
+        var bind = dt10FeedCohortCheck_(feedRaw, source.cohort);
+        out.feed_cohort = bind;
+        if (bind.ok !== true) {
+          out.state = 'NOT_ACTIONABLE'; out.feed_cohort_blocked = true;
+          out.reason = bind.reason || 'feed cohort check failed';
+        }
+      }
+    } catch (eBind) {
+      out.state = 'NOT_ACTIONABLE'; out.feed_cohort_blocked = true;
+      out.reason = 'feed cohort check failed';
+    }
+  }
+  return out;
+}
+/** v1.13.8: Script Property DT10_FEED_COHORT_BIND. Exactly 'on' (trimmed,
+ * any case) arms the feed/cohort binding; absent or any other word is off.
+ * A property-service failure reads as ON (fail-closed): the binding can
+ * only withhold an EXECUTABLE feed, never permit one. Memoized (P-202). */
+var DT10_FEED_COHORT_BIND_PROP = 'DT10_FEED_COHORT_BIND';
+function dt10FeedCohortBindOn_() {
+  return dt10PropMemoGet_('feed_cohort_bind', function () {
+    try {
+      return String(PropertiesService.getScriptProperties()
+          .getProperty(DT10_FEED_COHORT_BIND_PROP) || '')
+          .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+    } catch (eProp) { return true; }
+  });
+}
+/** v1.13.8 PURE: does the raw feed value name exactly this cohort?
+ * Run tokens follow the Python consumers' widest rule (SOURCE_RUN_RE in
+ * scripts/audit_decision_surface_freshness.py): 'run', optional spaces,
+ * '=', optional spaces, value up to whitespace ; | or comma, not preceded
+ * by a letter, digit or underscore, any case. superseded_by_run= is
+ * therefore not a run token. ES5 has no lookbehind, so the preceding
+ * character is matched instead; the classes spell out Python's str
+ * whitespace (JS \s lacks U+001C-U+001F and U+0085 and adds U+FEFF) and the
+ * four non-ASCII letters Python's case-insensitive [a-z] also matches, so
+ * the count equals release_decision_feed._run_tokens. Exactly one token, a
+ * positive integer equal to the positive-integer cohort, is ok; anything
+ * else is a reason. */
+function dt10FeedCohortCheck_(raw, cohort) {
+  var out = { ok: false, reason: '', run: '', cohort: '' };
+  try {
+    var text = String(raw === null || raw === undefined ? '' : raw);
+    out.cohort = String(cohort === null || cohort === undefined ? '' : cohort);
+    var ws = '\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a' +
+        '\\u2028\\u2029\\u202f\\u205f\\u3000';
+    var re = new RegExp('(^|[^a-z0-9_\\u0130\\u0131\\u017f\\u212a])run[' + ws +
+        ']*=[' + ws + ']*([^' + ws + ';|,]*)', 'gi'), runs = [], m;
+    while ((m = re.exec(text)) !== null) runs.push(m[2]);
+    if (!/^[1-9]\d*$/.test(out.cohort)) {
+      out.reason = 'cockpit source cohort unverified'; return out;
+    }
+    if (runs.length !== 1 || !/^[1-9]\d*$/.test(runs[0])) {
+      out.reason = 'feed run token missing/ambiguous'; return out;
+    }
+    out.run = runs[0];
+    if (out.run !== out.cohort) {
+      out.reason = 'feed run ' + out.run + ' != cohort ' + out.cohort; return out;
+    }
+    out.ok = true;
+  } catch (eCheck) {
+    out.ok = false; out.reason = 'feed cohort check failed';
   }
   return out;
 }
@@ -8256,6 +8366,16 @@ function dt10SelfTest() {
         dt10PolicyRefParse_('{"a":"x"}') === null &&
         dt10PolicyRefParse_('{"T10: Max Per Sector": "3"}')['T10: Max Per Sector'] === 3) ?
        'ok' : 'FAIL'));
+  // v1.13.8: feed/cohort binding -- mode line + pure core (no feed read).
+  report.push('feed cohort bind (DT10_FEED_COHORT_BIND): ' +
+      (dt10FeedCohortBindOn_() ? 'on' : 'off'));
+  report.push('feed cohort core: ' +
+      ((dt10FeedCohortCheck_('EXECUTABLE | run=7 | x', '7').ok === true &&
+        dt10FeedCohortCheck_('EXECUTABLE | run=6 | x', '7').reason === 'feed run 6 != cohort 7' &&
+        dt10FeedCohortCheck_('EXECUTABLE | run=7 run=7', '7').reason ===
+            'feed run token missing/ambiguous' &&
+        dt10FeedCohortCheck_('x | superseded_by_run=7.1', '7').ok === false &&
+        dt10FeedCohortCheck_('EXECUTABLE | run=7', '').ok === false) ? 'ok' : 'FAIL'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {
