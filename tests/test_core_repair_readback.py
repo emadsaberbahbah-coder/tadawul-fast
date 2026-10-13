@@ -296,6 +296,23 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["pf_research_view"], "enforce")
 
+    def test_declared_enforce_rejects_blanked_research_amounts(self):
+        # v1.2.1 (PR #764 review): the probe has every input, so a served
+        # enforce page that blanks any newly exposed amount is a regression.
+        for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct",
+                    "stop_sar", "tp1_sar", "tp2_sar"):
+            self.setUp()
+            self.serve_research_view("enforce")
+            self.protective["actions"][0][key] = None
+            with self.assertRaisesRegex(probe.ReadbackError, "did not publish: " + key):
+                self.run_declared("enforce")
+        for key in ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct"):
+            self.setUp()
+            self.serve_research_view("enforce")
+            self.protective["kpis"][key] = None
+            with self.assertRaisesRegex(probe.ReadbackError, "did not publish KPI: " + key):
+                self.run_declared("enforce")
+
     def test_undeclared_research_amounts_are_rejected_even_when_the_page_says_enforce(self):
         self.serve_research_view("enforce")
         with self.assertRaisesRegex(probe.ReadbackError,
@@ -391,9 +408,12 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         self.protective["kpis"]["holdings_value_sar"] = 5000.0
         with self.assertRaisesRegex(probe.ReadbackError, "holdings total disagrees"):
             self.run_declared("enforce")
+        # v1.2.1: a blank row value and a blank total no longer pass under a
+        # declared enforce; the probe has every input (PR #764 review).
         self.protective["kpis"]["holdings_value_sar"] = None
         self.protective["actions"][0]["market_value_sar"] = None
-        self.assertTrue(self.run_declared("enforce")["ok"])
+        with self.assertRaisesRegex(probe.ReadbackError, "did not publish: market_value_sar"):
+            self.run_declared("enforce")
 
     def test_unsupported_mode_is_refused_before_any_request(self):
         for mode in ("ENFORCE", "on", "", None):
@@ -462,7 +482,7 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         legacy = self.run_probe()
         legacy.pop("checked_at_utc")
         self.assertEqual(result, legacy)
-        self.assertEqual(probe.SCRIPT_VERSION, "1.2.0")
+        self.assertEqual(probe.SCRIPT_VERSION, "1.2.1")
 
 
 if __name__ == "__main__":

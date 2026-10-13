@@ -64,7 +64,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      # 2026-10-13 (P0-6, readback 1.2.0): declare the portfolio research view
+      # 2026-10-13 (P0-6, readback 1.2.0; 1.2.1 requires enforce amounts): declare the portfolio research view
       # mode armed on Render (TFB_PF_RESEARCH_VIEW). Unset Variable = off =
       # the previous probe exactly. Set the Variable only after arming the
       # same mode on Render; enforce needs this declaration or it fails.

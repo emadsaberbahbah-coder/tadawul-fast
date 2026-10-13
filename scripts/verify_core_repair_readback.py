@@ -16,7 +16,18 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 BACKEND = "https://tadawul-fast-bridge.onrender.com"
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
+# v1.2.1 (2026-10-13) - [P0-6 ENFORCE MUST PUBLISH ITS LEVELS]
+# WHY: review of v1.2.0 (PR #764): a declared enforce accepted a blank
+# (None) research amount, so a deployed regression that blanked every
+# newly exposed value still passed the readback. The probe row supplies a
+# positive quantity, buy price, current price, SAR FX and intrinsic value;
+# portfolio_actions 1.16.0 under enforce serves MV 1000, cost 900, P&L 100,
+# P&L % 11.1, stop 92, TP1 115, TP2 130 and the same four holdings KPIs.
+# WHAT: under a declared enforce, every _RESEARCH_ROW_KEYS amount on the
+# probe row and every _RESEARCH_KPI_KEYS total must be present and a valid
+# research amount (finite; positive except P&L). off and observe are
+# unchanged, and every money / execution / weight / alert check is kept.
 # v1.2.0 (2026-10-13) - [P0-6 RESEARCH VIEW LOCKSTEP]
 # WHY: portfolio_actions 1.16.0 adds TFB_PF_RESEARCH_VIEW (default off).
 # Under enforce an unreconciled holding stays BLOCK with zero money but
@@ -415,6 +426,14 @@ def _require_research_view(payload, action, mode):
     if " | " + PF_RESEARCH_TAG + " " not in reason or "[research-observe]" in reason or \
             not reason.endswith("; not executable"):
         raise ReadbackError("enforce portfolio research view tag missing")
+    # v1.2.1: the probe has every input, so a declared enforce must publish
+    # every research amount; a blank one is a regression, not a pass.
+    for key in _RESEARCH_ROW_KEYS:
+        if action.get(key) is None or not _research_amount(key, action[key]):
+            raise ReadbackError("enforce portfolio research view did not publish: " + key)
+    for key in _RESEARCH_KPI_KEYS:
+        if payload["kpis"].get(key) is None or not _research_amount(key, payload["kpis"][key]):
+            raise ReadbackError("enforce portfolio research view did not publish KPI: " + key)
     holdings = payload["kpis"].get("holdings_value_sar")
     value = action.get("market_value_sar")
     if holdings is not None and (value is None or abs(holdings - value) > 1):

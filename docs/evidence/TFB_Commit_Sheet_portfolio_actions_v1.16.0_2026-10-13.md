@@ -125,7 +125,7 @@ it still never sizes, funds or executes anything.
      `meta.research_view.fx_rejected_rows` record the result.
    - An exception inside the view falls back to the off output and adds
      `meta.research_view.status = "error"`.
-2. `scripts/verify_core_repair_readback.py` 1.1.1 -> 1.2.0 (WHY block).
+2. `scripts/verify_core_repair_readback.py` 1.1.1 -> 1.2.0 (WHY block), then 1.2.1 after PR review: under a declared enforce every research amount on the probe row (MV, cost, P&L, P&L %, stop, TP1, TP2) and the four holdings KPIs must be published; a blank one fails the readback, because the probe supplies every input.
    - A new `--expect-pf-research-view off|observe|enforce` option was added,
      with `off` as the default. `verify(..., expected_pf_research_view="off")`
      and `require_blocked_portfolio(payload, version, expected_research_view="off")`
@@ -411,7 +411,7 @@ Related existing suites, all run in the venv:
    served page, not from `/health`.
 3. Read the observe verdicts on the page or in the brief for a few runs. In
    particular, check whether any held name shows `research verdict EXIT`.
-4. Arm `enforce` only after this commit (readback 1.2.0) is on main. Set
+4. Arm `enforce` only after this commit (readback 1.2.1) is on main. Set
    `TFB_PF_RESEARCH_VIEW=enforce` on Render and the Actions Variable
    `TFB_PF_RESEARCH_VIEW_EXPECT=enforce` at the same time, then run the
    readback. It must be green.
