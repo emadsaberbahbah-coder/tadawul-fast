@@ -27,6 +27,12 @@
 # run of daily_sync, page_refresh_recovery or grid_capacity_repair is not
 # completed, re-probes immediately before the write, and compare-and-sets
 # the slot and prior value.
+# (2026-10-13 review) mode=kill shares this group: a kill dispatched while a
+# release runs WAITS for it (up to the 30-minute timeout), and GitHub cancels
+# a PENDING member of a group when a newer dispatch queues, so a later
+# dispatch can silently cancel a queued kill. The sticky variable is what
+# makes a kill robust: every run started after TFB_DECISION_RELEASE_KILL=1
+# is set, whatever its mode, takes the kill branch and retracts.
 #
 # CHECKOUT: this workflow's own ref (github.sha), refused unless the dispatch
 # ref is refs/heads/main. The release code that may write EXECUTABLE is the
@@ -38,10 +44,14 @@
 # two default-off gates. TARGET_SHEET_ID has no inputs fallback: the sheet
 # is always vars.DEFAULT_SPREADSHEET_ID.
 #
-# ROLLBACK: delete this file (and the script). Set vars.TFB_DECISION_RELEASE
-# to 0 to disarm; set vars.TFB_DECISION_RELEASE_KILL to 1 and dispatch
-# mode=kill to retract a live release. DT10_UPSTREAM_VERDICT=off is a cockpit
-# BYPASS, never a kill switch.
+# ROLLBACK: delete this file (and the script). To RETRACT a live release, all
+# three: (1) set vars.TFB_DECISION_RELEASE_KILL=1 (blocks later promotions;
+# it is read only when a run starts and writes nothing by itself), (2)
+# dispatch mode=kill, (3) read back the _Status 'TFB Decision Feed' cell and
+# confirm it is NOT_ACTIONABLE (re-dispatch if the kill was cancelled or
+# queued behind a release). Setting vars.TFB_DECISION_RELEASE to 0 only
+# disarms future promotions; it NEVER retracts a live release.
+# DT10_UPSTREAM_VERDICT=off is a cockpit BYPASS, never a kill switch.
 # =============================================================================
 name: Release Decision Feed (P0-1)
 
@@ -217,7 +227,7 @@ jobs:
                   handle.write('| Check | Result |\n|---|---|\n')
                   for key in ('mode', 'exit_code', 'outcome', 'source_run_id', 'prior_class',
                               'accepted', 'reasons', 'audit_exit_codes', 'blockers',
-                              'deferred', 'released', 'expires', 'downgrade',
+                              'deferred', 'released', 'expires', 'downgrade', 'would_downgrade',
                               'display_pending_cockpit_refresh'):
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nA released value is shown on the board only after both cockpits re-render.\n')

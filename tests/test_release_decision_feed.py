@@ -16,12 +16,24 @@ are fixtures. Offline: no network, no credentials, no live Sheet.
 
 WALK  W0 seed veto, W1 gate off dry-run, W2 armed release, W3 re-dispatch,
       W3b sync legs after a release, W4 sweep at 480 min / +1 s, W5 re-release.
-NEG   N1-N24 (identity, cohort, audits, classification, CAS, readback, layout,
+NEG   N1-N25 (identity, cohort, audits, classification, CAS, readback, layout,
       probes, provenance, kill, context, env policy, constants, workflow YAML
-      and env parity, gate-off zero writes, expiry anchor, CLI, registration).
-GOLD  G1-G5 against base copies (TFB_TEST_FINALIZE_BASE, TFB_TEST_SYNC_BASE;
-      sibling files in the same directory for G4/G5). SKIP when unset.
+      and env parity, gate-off zero writes, expiry anchor, CLI, registration,
+      pre-write read fault).
+GOLD  G1-G6 against base copies (TFB_TEST_FINALIZE_BASE, TFB_TEST_SYNC_BASE;
+      sibling files in the same directory for G4-G6). SKIP when unset.
+      G1-G4 are base-PROPERTY checks: the finalizer, sync, audits and .gs are
+      byte-identical at HEAD, so they hold on a HEAD copy too. G5 (the N24
+      registration absent from the base verifier) and G6 (the W2 armed walk
+      run against the base tree's release_decision_feed.py, which is EMPTY at
+      dda1211) are the DISCRIMINATING negatives: both FAIL when the env points
+      at HEAD copies.
 NODE  parse_feed parity with the real dt10UvParse_ (SKIP when node is absent).
+
+REVIEW FIXES (2026-10-13): N24 pins a lower bound on the verifier version, not
+an exact value (a routine later pin bump must not turn this lane red); N25
+pre-write read fault keeps the release window; N17 checks would_downgrade;
+G5 made discriminating; G6 added.
 
 Run: pytest -q tests/test_release_decision_feed.py
   or python3 tests/test_release_decision_feed.py      (prints PASS k/k)
@@ -707,8 +719,16 @@ def case_n17_gate_off_release_mode_never_writes(mp, tmp_path):
                            ("clean", expired), ("clean", "executable | run=90001 | 2026-07-31 20:00:00+03:00")):
         ctx = setup(mp, tmp_path / str(abs(hash((coverage, feed)))), coverage=coverage, feed=feed)
         before = copy.deepcopy(ctx.service.rows)
-        ctx.release()
+        result = ctx.release()
         assert ctx.updates() == [] and ctx.service.rows == before, (coverage, feed)
+        if (coverage, feed) == ("failed", live_release_value()):
+            # Disarming never retracts a live release: the retraction is only reported.
+            assert result["exit_code"] == 2 and result["downgrade"] is None
+            assert result["would_downgrade"] == (
+                "NOT_ACTIONABLE(final_publication) | run=90001 | 2026-07-31 21:00:00+03:00 | "
+                "coverage_failed | release=777001")
+        elif feed == W0_VETO:
+            assert result["would_downgrade"] is None, (coverage, feed)
     ctx = setup(mp, tmp_path / "sweep", feed=expired)        # sweep still allowed with the gate off
     result = ctx.release(mode="sweep")
     assert result["outcome"] == "swept" and len(ctx.updates()) == 1
@@ -843,7 +863,10 @@ def case_n23_cli_contract(mp, tmp_path):
 
 def case_n24_verifier_registration(mp, tmp_path):
     from scripts import verify_deployment as V
-    assert V.SCRIPT_VERSION == "1.0.56"
+    # Lower bound only: the verifier is re-pinned often, and a later routine
+    # bump must not turn this harness red (tests/test_verify_manifest_pins.py
+    # owns pin freshness). The registration asserts below are what P0-1 needs.
+    assert tuple(int(part) for part in V.SCRIPT_VERSION.split(".")) >= (1, 0, 56), V.SCRIPT_VERSION
     assert ("release_decision_feed", "1.0.0") in {(n, v) for n, v, _ in V.SCRIPTS}
     flags = {name: (default, kill) for name, default, _meaning, kill in V.FLAGS}
     assert flags["TFB_DECISION_RELEASE"] == ("0", False)
@@ -859,6 +882,50 @@ def case_n24_verifier_registration(mp, tmp_path):
     for word in ("0", "off", "false", "enforce", ""):
         mp.setenv("TFB_DECISION_RELEASE", word)
         assert not R.release_enabled()
+
+
+def case_n25_prewrite_read_fault_zero_writes_window_kept(mp, tmp_path):
+    """A transport/layout fault on the compare-and-set re-read happens BEFORE any
+    update: refuse with zero writes and keep the run's release window."""
+    ctx = setup(mp, tmp_path)
+    mp.setenv("TFB_DECISION_RELEASE", "1")
+
+    class FlakyRead(GoogleValues):
+        def __init__(self, fault, **kwargs):
+            super().__init__(**kwargs)
+            self.fault, self.key_reads = fault, 0
+
+        def get(self, **kwargs):
+            if kwargs["range"] == final.KEY_RANGE:
+                self.key_reads += 1
+                if self.key_reads == 2 and self.fault == "transport":
+                    raise ConnectionError("synthetic transient 503 on the compare-and-set read")
+                if self.key_reads == 2 and self.fault == "layout":
+                    self.calls.append(("get", copy.deepcopy(kwargs)))
+                    return SimpleNamespace(execute=lambda: {"values": None})
+            return super().get(**kwargs)
+
+    for fault in ("transport", "layout"):
+        service = FlakyRead(fault)
+        service.rows[3][11:13] = [final.KEY, W0_VETO]
+        result = ctx.release(service=service)
+        assert result["exit_code"] == 3 and result["outcome"] == "refused", (fault, result["reasons"])
+        assert result["reasons"] == ["compare_and_set_read_failed"], (fault, result["reasons"])
+        assert "before any write" in result["publication_error"]
+        assert ctx.updates(service) == [] and not result["blocker_published"], fault
+        assert service.rows[3][12] == W0_VETO and not result["released"]
+        # The window is NOT consumed: once the fault clears, the same run releases.
+        service.fault = None
+        again = ctx.release(service=service)
+        assert again["outcome"] == "released" and again["prior_class"] == "eligible", again["reasons"]
+        assert service.rows[3][12] == W2_VALUE
+    # Contrast: a fault once the update was attempted still leaves the
+    # best-effort release_unconfirmed downgrade (the write may have landed).
+    service = GoogleValues(write_error=True)
+    service.rows[3][11:13] = [final.KEY, W0_VETO]
+    result = ctx.release(service=service)
+    assert result["outcome"] == "release_unconfirmed"
+    assert [u["body"]["values"][0][1] for u in ctx.updates(service)][0] == W2_VALUE
 
 
 # =========================================================================== GOLDEN
@@ -934,6 +1001,69 @@ def case_g5_verifier_ast_inventory_zero_removed(mp, tmp_path):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
     before, after = inventory(base), inventory(ROOT / "scripts" / "verify_deployment.py")
     assert before - after == set() and after - before == set()
+    # DISCRIMINATING: the N24 registration holds on this tree and FAILS on base
+    # (read by AST literal, no import). A HEAD copy in the base dir fails here.
+    names = {"TFB_DECISION_RELEASE", "TFB_DECISION_RELEASE_KILL"}
+    here, then = registration(ROOT / "scripts" / "verify_deployment.py"), registration(base)
+    assert ("release_decision_feed", "1.0.0") in here["scripts"] and names <= here["flags"]
+    assert names <= here["workflow_scoped"]
+    assert "release_decision_feed" not in {name for name, _ in then["scripts"]}, \
+        "base verifier already pins release_decision_feed: TFB_TEST_FINALIZE_BASE is not a base copy"
+    assert not names & then["flags"] and not names & then["workflow_scoped"]
+
+
+def registration(path):
+    """SCRIPTS (name, pin), FLAGS names and _WORKFLOW_SCOPED, by AST literal."""
+    found = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        targets = node.targets if isinstance(node, ast.Assign) else (
+            [node.target] if isinstance(node, ast.AnnAssign) else [])
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in ("SCRIPTS", "FLAGS", "_WORKFLOW_SCOPED"):
+                found[target.id] = ast.literal_eval(node.value)
+    return {"scripts": {(row[0], row[1]) for row in found["SCRIPTS"]},
+            "flags": {row[0] for row in found["FLAGS"]}, "workflow_scoped": set(found["_WORKFLOW_SCOPED"])}
+
+
+def case_g6_armed_walk_fails_on_base_tree(mp, tmp_path):
+    """The DISCRIMINATING gate-on golden negative: W2 (gate armed) run against
+    the base tree. scripts/release_decision_feed.py does not exist at dda1211,
+    so `git show dda1211:scripts/release_decision_feed.py > <base>/release_decision_feed.py`
+    leaves an EMPTY file: the base tree has no release step, and the armed walk
+    reduces to the base final job plus the base sync legs, which never lift the
+    veto. A HEAD copy in its place releases the feed and FAILS this case."""
+    _require_base()
+    base_copy = Path(FINALIZE_BASE).parent / "release_decision_feed.py"
+    if not base_copy.exists():
+        pytest.skip("base release_decision_feed.py copy not supplied (git show dda1211:"
+                    "scripts/release_decision_feed.py > <base dir>/release_decision_feed.py)")
+    # Positive control: the identical armed walk on THIS tree yields the W2 cell.
+    ctx = setup(mp, tmp_path / "head")
+    mp.setenv("TFB_DECISION_RELEASE", "1")
+    assert ctx.release()["outcome"] == "released" and ctx.service.rows[3][12] == W2_VALUE
+    # The same walk on the base tree.
+    ctx = setup(mp, tmp_path / "base")
+    mp.setenv("TFB_DECISION_RELEASE", "1")
+    base_run = None
+    if base_copy.read_text(encoding="utf-8").strip():
+        base_run = getattr(_load_base(base_copy, "tfb_release_base_release"), "run", None)
+    if base_run is not None:
+        asyncio.run(base_run("synthetic-sheet", SOURCE, mode="release", service=ctx.service,
+                             now_utc=ctx.clock["now"], inflight=ctx.inflight, provenance=ctx.provenance))
+    else:
+        base = finalize_module(FINALIZE_BASE)
+        mp.setattr(base, "load_scope", lambda: ctx.scope)
+        result = asyncio.run(base.run("synthetic-sheet", service=ctx.service, publish=True,
+                                      max_rows=20000, run_id=SOURCE))
+        assert result["exit_code"] == 0 and result["feed_promoted"] is False
+        sync = sync_module(SYNC_BASE)
+        run_sync_verdict(sync, mp, ctx.service, fresh_pages=sync._upstream_verdict_pages())
+    cell = ctx.service.rows[3][12]
+    # The W2 expectation (an EXECUTABLE cell) FAILS on base.
+    assert cell != W2_VALUE and not R.reads_executable(cell), \
+        "the base tree released the feed: the base dir holds a HEAD copy, not dda1211"
+    assert cell == W0_VETO
+    assert not [u for u in ctx.updates() if u["body"]["values"][0][0] == final.KEY]
 
 
 CASES = [value for _name, value in sorted(

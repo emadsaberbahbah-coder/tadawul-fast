@@ -44,13 +44,28 @@ HOW (fail closed at every step)
   schedule|workflow_dispatch, completed, final job executed), an in-flight
   probe of the production writers (re-probed immediately before the write),
   compare-and-set of the slot and prior value, one RAW update and exact
-  readback. Any failure after an attempted write leaves a best-effort
+  readback. A conflict or a read/transport fault BEFORE the update is
+  attempted is a refusal with zero writes (the release window is kept); any
+  failure once the update was attempted leaves a best-effort
   release_unconfirmed downgrade.
 - Runs OUTSIDE the tadawul-production-write lease (finalize's docstring says
   it runs under that lease). Deliberate: joining the lease group cancels a
   pending production sync (track_performance.yml documents this). The
   private group tfb-decision-release, the fail-closed in-flight probe and the
   compare-and-set bound the residual race to seconds; see the commit sheet.
+
+REVIEW FIXES (2026-10-13, same unreleased v1.0.0, nothing removed)
+- publish_release: a fault in the compare-and-set re-read (transport error,
+  layout fault) now raises ReleaseConflict, so run() refuses with ZERO writes
+  instead of writing a release_unconfirmed downgrade that would spend the
+  run's release window (classify_prior -> release_window_consumed) for a
+  write that was never attempted. The update and the readback keep the
+  "may have landed" downgrade.
+- Gate off, mode=release: when the strict re-verification of a LIVE release
+  of SOURCE fails, the downgrade the armed path would write is reported as
+  would_downgrade (still zero writes). Disarming never retracts a live
+  release; only mode=kill / mode=sweep (or an armed failed re-verification)
+  write the downgrade.
 
 EXIT CODES
   0 released, already released, dry-run accepted, swept or killed
@@ -480,6 +495,7 @@ def _pair(row: Any) -> tuple:
 
 class ReleaseConflict(ValueError):
     """Refused before any write: guard or compare-and-set failure."""
+    reason = "compare_and_set_failed"
 
 
 def publish_release(service: Any, spreadsheet_id: str, value: str, *, expected_slot: int,
@@ -487,14 +503,19 @@ def publish_release(service: Any, spreadsheet_id: str, value: str, *, expected_s
     """Compare-and-set, ONE bounded RAW update, exact readback."""
     if not isinstance(value, str) or not RELEASE_VALUE_RE.fullmatch(value):
         raise ReleaseConflict("release writer refuses a value outside the release grammar")
-    values = service.spreadsheets().values()
-    grid = values.get(spreadsheetId=spreadsheet_id, range=fin.KEY_RANGE,
-                      valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
     try:
+        # Nothing has been attempted yet: ANY fault here (transport, layout)
+        # is a refusal with zero writes, never a "may have landed" downgrade.
+        values = service.spreadsheets().values()
+        grid = values.get(spreadsheetId=spreadsheet_id, range=fin.KEY_RANGE,
+                          valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
         slot = fin.publication_slot(grid)
-    except ValueError as exc:
-        raise ReleaseConflict(str(exc)) from exc
-    current = _pair(grid[slot - 1] if slot - 1 < len(grid) else [])
+        current = _pair(grid[slot - 1] if slot - 1 < len(grid) else [])
+    except Exception as exc:  # noqa: BLE001 - pre-write: nothing can have landed
+        conflict = ReleaseConflict("compare-and-set read failed before any write: "
+                                   + safe_error_text(exc))
+        conflict.reason = "compare_and_set_read_failed"
+        raise conflict from exc
     if slot != expected_slot or current != tuple(expected_pair):
         raise ReleaseConflict("decision feed changed since it was read; release refused")
     target = f"'_Status'!L{slot}:M{slot}"
@@ -660,13 +681,19 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     out["reasons"] += [reason for reason in reasons if reason not in out["reasons"]]
 
     # 7. not accepted: never promote; retract this run's own release when armed
+    #    (gate off: report it as would_downgrade, zero writes)
     if not ok:
         code = result.get("exit_code")
         code = code if type(code) is int and code in (1, 2, 3) else 3
-        if armed and executable_prior and prior_run == source:
+        if executable_prior and prior_run == source:
             blockers = result.get("blockers") or reasons or ["release_reverify_failed"]
-            if not downgrade(source, ",".join(str(item) for item in blockers)):
-                code = 3
+            why = ",".join(str(item) for item in blockers)
+            if armed:
+                if not downgrade(source, why):
+                    code = 3
+            else:
+                # Gate off: report only. Disarming never retracts a live release.
+                out["would_downgrade"] = downgrade_value(source, clock(), why, release_token)
         return _finish(out, code, "not_accepted")
 
     value = None
@@ -703,7 +730,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         publish_release(service, sheet_id, value, expected_slot=slot, expected_pair=pair, fin=fin)
     except ReleaseConflict as exc:
         out["publication_error"] = safe_error_text(exc)
-        return _finish(out, 3, "refused", "compare_and_set_failed")
+        return _finish(out, 3, "refused", getattr(exc, "reason", "compare_and_set_failed"))
     except Exception as exc:  # noqa: BLE001 - the write may have landed
         out["publication_error"] = safe_error_text(exc)
         downgrade(source, "release_unconfirmed")
