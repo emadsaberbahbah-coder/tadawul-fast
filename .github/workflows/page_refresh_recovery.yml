@@ -56,7 +56,7 @@ jobs:
   regression-tests:
     name: Test page refresh recovery
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -91,7 +91,7 @@ jobs:
   plan:
     name: Plan missing page refreshes
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # A successful write can still contain last-good rows retained after an
     # incomplete fetch. Keep the planner on the same 95% fresh-data contract as
@@ -164,7 +164,7 @@ jobs:
     name: Recover ${{ matrix.page }}
     needs: plan
     if: ${{ needs.plan.outputs.needs_recovery == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 115
     strategy:
@@ -383,7 +383,7 @@ jobs:
         needs.plan.result == 'success' &&
         needs.plan.outputs.needs_recovery == 'true'
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every targeted page retry to pass
         env:

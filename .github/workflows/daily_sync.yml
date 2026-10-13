@@ -1,5 +1,7 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.2 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
+# WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
 # Historical maturity auditing requires explicit manual opt-in; schedules
 # keep recording/analyzing/exporting with old-grid publication disabled.
@@ -126,7 +128,7 @@ jobs:
   # =============================================================================
   ci-tests:
     name: 🧪 CI Tests (Schema Alignment + Contracts)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
     timeout-minutes: 15
 
@@ -201,7 +203,7 @@ jobs:
   # =============================================================================
   preflight-validation:
     name: 🛡️ Pre-flight Validation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
@@ -261,7 +263,7 @@ jobs:
     # one leg's failure never cancels the other mid-write. Artifacts and the
     # step summary are suffixed per leg. Everything else is verbatim.
     name: 🚀 Data Sync (${{ matrix.group }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     strategy:
       fail-fast: false
@@ -1603,7 +1605,7 @@ jobs:
           )
         )
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 360
     env:
@@ -1989,7 +1991,7 @@ jobs:
           )
         )
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 30
     env:
@@ -2155,7 +2157,7 @@ jobs:
           contains(needs.*.result, 'cancelled')
         )
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: 🔔 Announce the run verdict

@@ -10,6 +10,9 @@ name: Provider Target Coverage Alert
 # with bootstrap=true after a verified healthy sync.
 #
 # Exit codes: 0 healthy/bootstrap · 1 coverage failure · 2 control-health.
+#
+# W1B-1 v1.1.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
+# ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
 
 on:
   pull_request:
@@ -52,7 +55,7 @@ concurrency:
 jobs:
   regression-tests:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -65,7 +68,7 @@ jobs:
 
   audit:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6

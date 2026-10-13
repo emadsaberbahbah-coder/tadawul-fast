@@ -1,5 +1,7 @@
 name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
+# VERSION 1.0.1 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
+# WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.0 (2026-10-11) -- WP-02 DEFAULT-OFF S-1 V2 MAPPING
 # WHY: the 2026-10-10 export shows criterion 5 PASS on an empty
 # _Corporate_Actions register. v1.9.2's criteria guard was never mapped.
@@ -33,7 +35,7 @@ permissions:
 
 jobs:
   score:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
