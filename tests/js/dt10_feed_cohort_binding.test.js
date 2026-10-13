@@ -1,6 +1,12 @@
 /* tests/js/dt10_feed_cohort_binding.test.js -- full-source node vm harness
  * for 16_Decision_Top10.gs v1.13.8 FEED/COHORT BINDING (P0-1 arming
- * prerequisite 2). VERSION 1.0.1 (2026-10-13).
+ * prerequisite 2). VERSION 1.0.2 (2026-10-13).
+ *
+ * v1.0.2 (2026-10-13): DT10 v1.13.9 (held seats kept in the written audit)
+ * is stacked on top. C11 pins the delivered version 1.13.9; D5 first
+ * removes the designed v1.13.9 regions byte for byte through the shared
+ * tests/js/dt10_v1139_regions.js (stripV1139), then applies the
+ * unchanged v1.13.8 revert. Nothing else changed.
  *
  * v1.0.1 (2026-10-13) WHY: review finding. D4 checked removed lines and the
  * added NAMES only, so an unrelated behavioural line added inside another
@@ -71,6 +77,7 @@ const vm = require('node:vm');
 const ROOT = path.join(__dirname, '../..');
 const SOURCE_PATH = process.env.DT10_DELIVERED || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const source = fs.readFileSync(SOURCE_PATH, 'utf8');
+const SOURCE_TEXT = source;
 const BASE_PATH = process.env.DT10_BASE || '';
 const baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : null;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
@@ -533,8 +540,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.8');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.8 /);
+  assert.equal(ctx.DT10_VERSION, '1.13.9');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.9 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
@@ -584,7 +591,12 @@ function staysInside(code, label) {
   });
   assert.equal(depth, 0, label + ': braces balance');
 }
+/* v1.0.2: undo the designed v1.13.9 regions, exact text, via the shared
+ * tests/js/dt10_v1139_regions.js (throws on any other shape), so the
+ * v1.13.8 revert below runs on the v1.13.8 text. */
+const stripV1139 = require('./dt10_v1139_regions.js').stripDesigned;
 function revertDesigned(src) {
+  if (src.includes("var DT10_VERSION = '1.13.9';")) src = stripV1139(src);
   let lines = src.split('\n');
   const cut = (from, to) => { const region = lines.slice(from, to); lines = lines.slice(0, from).concat(lines.slice(to)); return region; };
   // 1. The header WHY block: comment lines only, above the v1.13.7 entry.
@@ -693,6 +705,8 @@ if (baseSource) {
   test('D4 census vs base: zero functions or vars removed; added exactly the designed names; added code ES5 and ASCII', () => {
     const census = (src, re) => { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; };
     const fnRe = () => /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg, varRe = () => /^var\s+([A-Za-z_$][\w$]*)/mg;
+    // v1.0.2: census on the v1.13.8 text; the v1.13.9 regions are stripped byte-exact.
+    const source = SOURCE_TEXT.includes("var DT10_VERSION = '1.13.9';") ? stripV1139(SOURCE_TEXT) : SOURCE_TEXT;
     const bf = census(baseSource, fnRe()), df = census(source, fnRe()), bv = census(baseSource, varRe()), dv = census(source, varRe());
     assert.deepEqual([...bf].filter(f => !df.has(f)), []); assert.deepEqual([...bv].filter(v => !dv.has(v)), []);
     assert.deepEqual([...df].filter(f => !bf.has(f)).sort(), ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_']);

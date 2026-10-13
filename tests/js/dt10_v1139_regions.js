@@ -1,0 +1,30 @@
+/* tests/js/dt10_v1139_regions.js -- the designed regions of
+ * 16_Decision_Top10.gs v1.13.9 (held seats kept in the written audit),
+ * byte for byte. Shared by tests/js/dt10_audit_keep.test.js (D2) and
+ * tests/js/dt10_feed_cohort_binding.test.js (D4/D5 pre-strip), so both
+ * remove exactly these texts and any other edit fails their byte diffs.
+ * Not a test file: it runs nothing on load. */
+'use strict';
+const assert = require('node:assert/strict');
+const count = (text, needle) => String(text).split(needle).length - 1;
+const DESIGNED = [
+  [' * Version: 1.13.9 (see DT10_VERSION;', ' * Version: 1.13.8 (see DT10_VERSION;'],
+  ["var DT10_VERSION = '1.13.9';", "var DT10_VERSION = '1.13.8';"],
+];
+/* The designed v1.13.9 regions, byte for byte (JSON literals). D2 removes
+ * exactly these texts; any edit inside or outside them fails the diff. */
+const HEADER_REGION = " * v1.13.9 (2026-10-13) -- HELD SEATS KEPT IN THE WRITTEN AUDIT\n * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held\n * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank\n * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit\n * (TFB_OPP_AUDIT_ROWS_MAX keeps selected, unfunded, near-miss and INVEST\n * rows only), so dt10StabIdFallback_ built an identity-only shell: the\n * backend never learns which incumbents this cockpit holds.\n * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)\n * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to\n * v1.13.8 in every request and render (one memoized property read is\n * added). Armed, body.criteria gains audit_keep_symbols = the sorted\n * stability members (seated and grace-held, fast-track included; at most\n * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.\n * The allocation replay deep-copies body, so it carries the same list.\n * opportunity_builder 1.27.0 writes those rows into the capped audit only\n * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and\n * either alone is inert. The list is display context, never a decision\n * input: it moves no gate, score, seat or ticket. A property or state read\n * failure sends nothing (the v1.13.8 body).\n * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;\n * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10\n * makes one guarded call before the POST. Harness:\n * tests/js/dt10_audit_keep.test.js.\n * Rollback: delete the property (the next run is v1.13.8 behaviour) or\n * re-paste v1.13.8.\n *\n";
+const FN_REGION = "/** v1.13.9: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any\n * case) arms the held-seat hand-off; absent or any other word is off. A\n * property-service failure reads as OFF: the list is display context only,\n * so failing open keeps the v1.13.8 request. Memoized (P-202). */\nvar DT10_AUDIT_KEEP_PROP = 'DT10_AUDIT_KEEP';\nvar DT10_AUDIT_KEEP_MAX = 60;   // mirrors opportunity_builder _AUDIT_KEEP_MAX\nfunction dt10AuditKeepOn_() {\n  return dt10PropMemoGet_('audit_keep', function () {\n    try {\n      return String(PropertiesService.getScriptProperties()\n          .getProperty(DT10_AUDIT_KEEP_PROP) || '')\n          .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n    } catch (eProp) { return false; }\n  });\n}\n/** v1.13.9 PURE: the stability members (member === true: seated, grace-held\n * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at\n * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */\nfunction dt10AuditKeepSymbols_(state) {\n  var out = [];\n  var syms = state && state.symbols;\n  if (!syms || typeof syms !== 'object') return out;\n  for (var k in syms) {\n    if (syms.hasOwnProperty(k) && k && syms[k] && syms[k].member === true) {\n      out.push(String(k));\n    }\n  }\n  out.sort();\n  return out.slice(0, DT10_AUDIT_KEEP_MAX);\n}\n";
+const CALL_REGION = "  // v1.13.9: held seats kept in the backend's written audit (display only).\n" +
+  '  if (dt10AuditKeepOn_()) {\n    try {\n      var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());\n' +
+  '      if (akSyms.length) body.criteria.audit_keep_symbols = akSyms;\n' +
+  '    } catch (eAk) { /* send nothing: the v1.13.8 body */ }\n  }\n';
+function stripDesigned(src) {
+  let out = src;
+  for (const [delivered, base] of DESIGNED.concat([[HEADER_REGION, ''], [FN_REGION, ''], [CALL_REGION, '']])) {
+    assert.equal(count(out, delivered), 1, 'designed region once: ' + delivered.slice(0, 60));
+    out = out.replace(delivered, base);
+  }
+  return out;
+}
+module.exports = {DESIGNED, HEADER_REGION, FN_REGION, CALL_REGION, stripDesigned};
