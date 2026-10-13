@@ -18,10 +18,12 @@ live workbook, Render dashboard, repo Variables and mailbox were not read.
 | ci.yml whole-suite lane is advisory | Confirmed, by design | Advisory for one green week from #751 (12 Oct). Removing `continue-on-error` alone would not make it required; the owner adds the check to the ruleset after about 19 Oct. |
 | 55 unpinned `ubuntu-latest` runners | Confirmed | No job installs apt packages; daily_sync preflight relies on the image's `curl jq python3 pip3`. Pinned in this change set. |
 | `/health` app_version 5.111.0 | Confirmed, cause corrected | Not a code constant: the Render ENV `APP_VERSION` (or `TFB_APP_VERSION`, possibly in the `tfb-server` env group) overrides the 8.14.3 default. Fix is deleting the ENV key, not code. |
-| Decision Digest silent after 10 Oct | Not by design | An enabled, non-dry-run, non-error digest run always sends mail. Under NOT_ACTIONABLE the subject is `TFB Brief - <session> - NOT ACTIONABLE (...)`, not `TFB Digest`. Owner checks below. |
+| Decision Digest silent after 10 Oct | Not by design while the feed is NOT_ACTIONABLE | An enabled, non-dry-run, non-error digest run sends mail, with one intended exception: on the actionable path with no qualifying BUY or SELL and the repo variable `DIGEST_SKIP_IF_EMPTY=1`, it logs the suppression and sends nothing. Under NOT_ACTIONABLE the subject is `TFB Brief - <session> - NOT ACTIONABLE (...)`, not `TFB Digest`. Owner checks below. |
 | `docs/render_env_contract.md` (H-8) absent | Confirmed | Not built in this change set (work-in-progress cap of 3 builds). |
 
-## Built in this change set (all default OFF, nothing armed)
+## Built in this change set
+
+The runner pin (#762) takes effect on merge: every job moves to the explicit `ubuntu-24.04` label, which is the image `ubuntu-latest` resolves to before 19 Oct. It has no flag; its canary, readback and date-dependent rollback are in its commit sheet. The other two changes (#763, #764) are default OFF and nothing is armed.
 
 1. PR #762: runner pin to `ubuntu-24.04` plus a manual 26.04 canary workflow (merge before 19 Oct).
 2. PR #763 (stacked on #762): P0-1 release step, `scripts/release_decision_feed.py` and a dispatch-only workflow. Dry-run unless `TFB_DECISION_RELEASE=1`; five arming prerequisites are listed in its commit sheet.
@@ -39,8 +41,8 @@ Merge in that order. Each has a commit sheet with arming steps and rollback. The
 
 ## Owner checks (read-only, minutes each)
 
-1. `_Status` L1:M60: the `TFB Decision Feed` value should carry the latest scheduled run id with `coverage_failed,decision_failed`. `TFB Upstream Feed Diagnostic` exists only when the repo variable `TFB_SYNC_UPSTREAM_VERDICT` is armed.
+1. `_Status` L1:M60: the `TFB Decision Feed` value should carry the latest scheduled run id with `coverage_failed,decision_failed`. `TFB Upstream Feed Diagnostic` is written only while the repo variable `TFB_SYNC_UPSTREAM_VERDICT` is armed, but it is never cleared when the variable is turned off. Its presence therefore does not prove the variable is armed now: check the variable directly, or require the diagnostic's `run=` to match the run being inspected.
 2. Render: delete `APP_VERSION` and `TFB_APP_VERSION` from the service ENV and from the `tfb-server` env group (batch with other ENV edits; saving redeploys).
-3. Digest: Gmail search `subject:"TFB Brief" after:2026/10/10` including Spam and All Mail; the log lines of digest runs #297 and #298 (`email sent to`, `DRY RUN`, `DIGEST_ENABLE=0`); the `DIGEST_ENABLE` repo variable.
+3. Digest: Gmail search `subject:"TFB Brief" after:2026/10/10` including Spam and All Mail; the log lines of digest runs #297 and #298 (`email sent to`, `DRY RUN`, `DIGEST_ENABLE=0`, `DIGEST_SKIP_IF_EMPTY=1 - not sending`); the `DIGEST_ENABLE` and `DIGEST_SKIP_IF_EMPTY` repo variables.
 4. Live cockpit version: Top_10_Investments!B2 must contain exactly one `pool_reconciliation_v1=` token for v1.13.7 or later.
 5. Zero-code ordering experiment: after a scheduled sync completes, refresh Top_10 and Portfolio_Decision by hand, then re-run only that run's `Verify final decision publication` job (never "Re-run failed jobs"). Expected: the T10 receipt check passes and the PF check still fails, which proves the ordering half without any new code.
