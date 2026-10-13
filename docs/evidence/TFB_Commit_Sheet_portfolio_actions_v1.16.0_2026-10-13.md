@@ -459,6 +459,9 @@ Related existing suites, all run in the venv:
   enforce holdings KPIs, as `unrepresented_positions` and
   `holding_fx_mismatch` now do. Adding them is a one-line change to
   `RESEARCH_KPI_BLOCKING_REASONS`.
-- (i) **Optional item G.** Decide whether to schedule the separate `main.py`
+- (i) **Optional item G. BUILT (2026-10-13, follow-up commit):** `main.py` 8.14.4 lists
+  `TFB_PF_RESEARCH_VIEW` in `_PF_GATE_ENVS`, so `/health` `pf_gates.portfolio_actions`
+  shows the armed mode (or `unset`); the pin in `tests/test_main_health_pf_gates_v8140.py`
+  moves 24 -> 25 and `verify_deployment` pins `APP_ENTRY_VERSION` 8.14.4. Original note: Decide whether to schedule the separate `main.py`
   build that lists `TFB_PF_RESEARCH_VIEW` in `_PF_GATE_ENVS`, so that an
   armed mode shows on `/health`.
