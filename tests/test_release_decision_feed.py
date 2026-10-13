@@ -35,6 +35,27 @@ an exact value (a routine later pin bump must not turn this lane red); N25
 pre-write read fault keeps the release window; N17 checks would_downgrade;
 G5 made discriminating; G6 added.
 
+VERSION 1.1.0 (2026-10-13) -- Codex P1 findings on PR #763.
+WHY: (1) a release of run N stayed EXECUTABLE while a later production writer
+re-stamped the pages; scripts/release_decision_feed.py v1.1.0 adds a gated
+writer-start 'supersede' mode wired into every page-writing job. (2) the
+age-blind consumers (send_digest, run_daily_brief, tfb_acceptance) honoured an
+expired release; each now enforces the release's expires= token.
+NEW   W6 the superseding run is releasable after its own final job passed;
+      N26-N36 supersede no-op / downgrade / identity / faults / eligibility /
+      CLI / workflow structure and gate semantics / consumer expiry, lockstep
+      and inertness. N24 and G5 now read the pin from R.SCRIPT_VERSION; W2
+      reads the consumers at the release instant (its 2026-07-31 window is
+      long past in real time).
+GOLD  G7-G10 against PRE-CHANGE copies (TFB_TEST_SUPERSEDE_BASE_DIR: the
+      0825561 copies of release_decision_feed.py, send_digest.py,
+      run_daily_brief.py, tfb_acceptance.py, daily_sync.yml,
+      page_refresh_recovery.yml, grid_capacity_repair.yml). Each runs a NEW
+      case's expectation on the base copy and requires it to FAIL, and G8/G9
+      also prove the off-path identity (yaml minus the added steps, and the
+      consumers on today's value shapes) against the same copies. SKIP when
+      unset; all four FAIL when the directory holds HEAD copies.
+
 Run: pytest -q tests/test_release_decision_feed.py
   or python3 tests/test_release_decision_feed.py      (prints PASS k/k)
 """
@@ -76,6 +97,12 @@ RELEASE_YML = ROOT / ".github" / "workflows" / "release_decision_feed.yml"
 DAILY_YML = ROOT / ".github" / "workflows" / "daily_sync.yml"
 FINALIZE_BASE = os.environ.get("TFB_TEST_FINALIZE_BASE", "")
 SYNC_BASE = os.environ.get("TFB_TEST_SYNC_BASE", "")
+# v1.1.0: pre-change (0825561) copies for the supersede / expiry golden negatives.
+PREV_DIR = os.environ.get("TFB_TEST_SUPERSEDE_BASE_DIR", "")
+RECOVERY_YML = ROOT / ".github" / "workflows" / "page_refresh_recovery.yml"
+GRID_YML = ROOT / ".github" / "workflows" / "grid_capacity_repair.yml"
+SUPERSEDE_STEP = "Supersede released decision feed (P0-1)"
+CURRENT_RUN = "90002"
 SOURCE = "90001"
 RELEASE_RUN = "777001"
 RIYADH = timezone(timedelta(hours=3))
@@ -280,6 +307,259 @@ def workflow(path):
     return data
 
 
+# --------------------------------------------------------------------------- v1.1.0 helpers
+def pin_expiry_clock(mp, module, now):
+    """Read a consumer's release expiry at a fixed instant (integration path kept)."""
+    original = getattr(module._feed_release_expiry, "tfb_original", module._feed_release_expiry)
+
+    def pinned(raw, _now=None):
+        return original(raw, now)
+    pinned.tfb_original = original
+    mp.setattr(module, "_feed_release_expiry", pinned)
+
+
+def supersede(ctx, *, current=CURRENT_RUN, attempt="1", service=None, module=None):
+    return (module or R).supersede("synthetic-sheet", current, attempt=attempt,
+                                   service=service if service is not None else ctx.service,
+                                   now_utc=ctx.clock["now"])
+
+
+def supersede_value(run, by=CURRENT_RUN, attempt="1", stamp="2026-07-31 21:10:00+03:00"):
+    return ("NOT_ACTIONABLE(final_publication) | run=%s | %s | superseded_by_run=%s.%s"
+            % (run, stamp, by, attempt))
+
+
+class _CI(str):
+    """A GitHub expression string: == / != compare case-insensitively."""
+    def __eq__(self, other):
+        return str(self).casefold() == str(other).casefold()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = str.__hash__
+
+
+def evaluate_step_if(expression, *, variable, event, run_mode="full_sync"):
+    """Evaluate the small Actions subset the supersede step uses (contains,
+    fromJSON, &&, ||, ==, !=) with GitHub's case-insensitive string semantics."""
+    assert expression.startswith("${{") and expression.endswith("}}"), expression
+    source = expression[3:-2].strip().replace("&&", " and ").replace("||", " or ")
+    tree = ast.parse(source, mode="eval")
+    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq,
+               ast.Constant, ast.Name, ast.Load, ast.Attribute, ast.Call)
+    for node in ast.walk(tree):
+        assert isinstance(node, allowed), type(node).__name__
+        if isinstance(node, ast.Call):
+            assert isinstance(node.func, ast.Name) and node.func.id in {"contains", "fromJSON"}
+    scope = {
+        "vars": SimpleNamespace(TFB_DECISION_RELEASE=_CI(variable)),
+        "github": SimpleNamespace(event_name=_CI(event)),
+        "env": SimpleNamespace(RUN_MODE=_CI(run_mode)),
+        "fromJSON": lambda text: [_CI(item) for item in json.loads(text)],
+        "contains": lambda items, item: any(_CI(x) == item for x in items),
+    }
+    return bool(eval(compile(tree, "<step if>", "eval"), {"__builtins__": {}}, scope))
+
+
+# (file, job) -> (first page-write command, production events, health_only exempt)
+PAGE_WRITERS = {
+    ("daily_sync.yml", "sync-dashboard"): ("python scripts/run_dashboard_sync.py",
+                                           ("schedule", "workflow_dispatch"), True),
+    ("daily_sync.yml", "recover-missing-market-pages"): ("python scripts/run_inline_page_recovery.py",
+                                                         ("schedule", "workflow_dispatch"), False),
+    ("page_refresh_recovery.yml", "recover-page"): ("python scripts/run_dashboard_sync.py",
+                                                    ("workflow_dispatch",), False),
+}
+WRITER_COMMANDS = ("python scripts/run_dashboard_sync.py", "python scripts/run_inline_page_recovery.py")
+EXPECTED_STEP_IF = {
+    True: ("${{ contains(fromJSON('[\"1\",\"true\",\"yes\",\"on\"]'), vars.TFB_DECISION_RELEASE)"
+           " && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')"
+           " && env.RUN_MODE != 'health_only' }}"),
+    False: ("${{ contains(fromJSON('[\"1\",\"true\",\"yes\",\"on\"]'), vars.TFB_DECISION_RELEASE)"
+            " && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}"),
+    "recovery": ("${{ contains(fromJSON('[\"1\",\"true\",\"yes\",\"on\"]'), vars.TFB_DECISION_RELEASE)"
+                 " && github.event_name == 'workflow_dispatch' }}"),
+}
+
+
+def _load_yaml(path):
+    return __import__("yaml").safe_load(Path(path).read_text(encoding="utf-8"))
+
+
+def page_writer_jobs(directory):
+    """Every (file, job) whose steps invoke a market-page writer."""
+    found = set()
+    for path in sorted(Path(directory).glob("*.yml")):
+        for name, job in (_load_yaml(path).get("jobs") or {}).items():
+            runs = [str(step.get("run", "")) for step in (job.get("steps") or []) if isinstance(step, dict)]
+            if any(command in run for run in runs for command in WRITER_COMMANDS):
+                found.add((path.name, name))
+    return found
+
+
+def supersede_workflow_expectation(directory):
+    """NEW-CASE EXPECTATION (N35; G8 requires it to FAIL on the base copies)."""
+    directory = Path(directory)
+    assert page_writer_jobs(directory) == set(PAGE_WRITERS), page_writer_jobs(directory)
+    for (file_name, job_name), (command, events, has_mode) in PAGE_WRITERS.items():
+        job = _load_yaml(directory / file_name)["jobs"][job_name]
+        steps = job["steps"]
+        names = [step.get("name") for step in steps]
+        assert names.count(SUPERSEDE_STEP) == 1, (file_name, job_name, "supersede step missing")
+        sup = names.index(SUPERSEDE_STEP)
+        creds = [i for i, step in enumerate(steps)
+                 if "GOOGLE_APPLICATION_CREDENTIALS=" in str(step.get("run", ""))
+                 and "GITHUB_ENV" in str(step.get("run", ""))]
+        writes = [i for i, step in enumerate(steps) if command in str(step.get("run", ""))]
+        assert len(creds) == 1 and writes, (file_name, job_name)
+        assert sup == creds[0] + 1 and sup < writes[0], (file_name, job_name, creds, sup, writes)
+        step = steps[sup]
+        key = "recovery" if file_name == "page_refresh_recovery.yml" else has_mode
+        assert step["if"] == EXPECTED_STEP_IF[key], (file_name, job_name, step["if"])
+        assert set(step) == {"name", "if", "timeout-minutes", "run"}, set(step)
+        assert step["timeout-minutes"] == 5
+        run = step["run"]
+        assert "${{" not in run and "set -euo pipefail" in run
+        assert "python scripts/release_decision_feed.py --mode supersede" in run
+        assert '--current-run "$GITHUB_RUN_ID"' in run and '--sheet-id "$TARGET_SHEET_ID"' in run
+        assert '--json-out "$RUNNER_TEMP/' in run
+        write = steps[writes[0]]
+        assert not write.get("continue-on-error"), (file_name, job_name)
+        assert not re.search(r"always\(\)|failure\(\)|cancelled\(\)", str(write.get("if", ""))), write.get("if")
+        assert job["runs-on"] == "ubuntu-24.04"
+        # Gate semantics: runs exactly when the release script reads the gate
+        # as armed (no whitespace), on a production event, and not health_only.
+        for variable in ("", "0", "1", "true", "TRUE", "True", "yes", "YES", "on", "On", "off",
+                         "false", "no", "2", "enforce", " 1", "1 ", "on "):
+            for event in ("schedule", "workflow_dispatch", "push", "pull_request", "workflow_run"):
+                for mode in ("full_sync", "health_only", "single_key"):
+                    expected = (variable.lower() in R._ARMED and event in events
+                                and not (has_mode and mode == "health_only"))
+                    assert evaluate_step_if(step["if"], variable=variable, event=event,
+                                            run_mode=mode) is expected, (job_name, variable, event, mode)
+
+
+def strip_supersede_steps(document):
+    removed = 0
+    for job in (document.get("jobs") or {}).values():
+        steps = job.get("steps") or []
+        kept = [step for step in steps if step.get("name") != SUPERSEDE_STEP]
+        removed += len(steps) - len(kept)
+        job["steps"] = kept
+    return document, removed
+
+
+def status_rows(value):
+    """A minimal '_Status' grid carrying the feed in L:M (tfb_acceptance layout)."""
+    return [["Page", "Last Updated", "Status", "Message", "", "", "", "", "", "", "", "Global Key", "Value"],
+            ["", "", "", "", "", "", "", "", "", "", "", "TFB Decision Feed", value]]
+
+
+def _d10(acc, value):
+    return {c.cid: c for c in acc.check_feed_truth(acc._MemSource({"_Status": status_rows(value)}))}["D10-4c"]
+
+
+def malformed_expiry_values(live):
+    expires = R.RELEASE_VALUE_RE.fullmatch(live).group("expires")
+    return [live.replace("expires=" + expires, "expires=x" + expires),
+            live.replace("expires=" + expires, "expires=" + expires.replace("T", " ")),
+            live.replace("expires=" + expires, "expires=" + expires[:-6] + "+04:00"),
+            live + " | expires=2030-01-01T00:00:00+03:00",
+            "EXECUTABLE | run=1 | 2026-07-31 20:00:00+03:00 | expires=",
+            "EXECUTABLE | run=1 | 2026-07-31 20:00:00+03:00 | expires=2026-13-01T00:00:00+03:00"]
+
+
+def consumer_expiry_expectation(sd, rdb, acc):
+    """NEW-CASE EXPECTATION (N36; G9 requires it to FAIL on the base copies),
+    read at the REAL clock: a release one hour into its window is live, the
+    fixture's 2026-07-31 release is long expired, a malformed expires= fails
+    closed in every consumer."""
+    real = datetime.now(timezone.utc).astimezone(RIYADH).replace(microsecond=0)
+    live = live_release_value(anchor=real - timedelta(minutes=60))
+    expired = live_release_value()
+    assert sd._decision_feed_state({"tfb decision feed": live}) == ("EXECUTABLE", "", live)
+    assert sd._decision_feed_state({"tfb decision feed": expired}) == (
+        "NOT_ACTIONABLE", "release_expired", expired), "send_digest honours an expired release"
+    assert rdb._feed_execution_veto(live) is False
+    assert rdb._feed_execution_veto(expired) is True, "run_daily_brief honours an expired release"
+    assert _d10(acc, live).verdict == "PASS"
+    assert (_d10(acc, expired).verdict, _d10(acc, expired).measured) == ("WARN", "release_expired"), \
+        "tfb_acceptance passes an expired release"
+    for bad in malformed_expiry_values(live):
+        assert sd._decision_feed_state({"tfb decision feed": bad}) == (
+            "NOT_ACTIONABLE", "release_expiry_invalid", bad), bad
+        assert rdb._feed_execution_veto(bad) is True, bad
+        assert (_d10(acc, bad).verdict, _d10(acc, bad).measured) == ("FAIL", "release_expiry_invalid"), bad
+
+
+# Value shapes that exist today (no expires= token): every consumer must answer
+# exactly as before the change (G9 compares against the pre-change copies).
+TODAY_SHAPES = (
+    "", "   ", "EXECUTABLE", "EXECUTABLE | run=1", " EXECUTABLE | run=1 ",
+    "EXECUTABLE | run=90001 | 2026-07-31 20:00:00+03:00",
+    "EXECUTABLE | run=90001 | 2026-07-31 20:00:00 | ML:OK GM:OK CFX:OK MF:OK",
+    "executable | run=1", "EXECUTABLE(release) | run=1", "EXECUTABLE | no stamp", W0_VETO,
+    "NOT_ACTIONABLE(missing:ML) | run=777002 | 2026-07-31 20:10:00+03:00 | ML:MISSING GM:OK",
+    "NOT_ACTIONABLE(final_publication) | run=90001 | 2026-08-01 04:00:01+03:00 | release_expired | release=777001",
+    "NOT_ACTIONABLE(final_publication) | run=90001 | 2026-07-31 21:00:00+03:00 | release_killed | release=777001",
+    supersede_value("90001"), supersede_value("unknown"), "NOT_ACTIONABLE(owner hold)",
+    "NOT ACTIONABLE | x", "WITHHELD | x", "NOT_ACTIONABLE(partial:GM) | run=1", "UPSTREAM_READY | run=1",
+    "stale", "ACTIONABLE | run=1", "EXECUTABLE | run=1 | expired | release_expired",
+)
+
+
+def consumer_outputs(sd, rdb, acc):
+    """Every consumer surface the change touches, on TODAY_SHAPES."""
+    out = []
+    model = {"sell": [{"note": "n", "sar": 5.0, "shares": 2, "stop": 1.0, "tp1": 2.0, "tp2": 3.0}],
+             "trim": [{"note": "t", "sar": 1.0, "shares": 1, "stop": 1.0, "tp1": 2.0, "tp2": 3.0}],
+             "add": [], "block": [], "freed_cash": 7.0}
+    for value in TODAY_SHAPES:
+        d = copy.deepcopy(model)
+        rdb._apply_final_feed_veto(d, value)
+        out.append({
+            "value": value,
+            "digest": sd._decision_feed_state({"tfb decision feed": value}),
+            "veto": rdb._feed_execution_veto(value),
+            "extract": rdb._extract_final_feed([["TFB Decision Feed", value]]),
+            "extract_pair": rdb._extract_final_feed([["TFB Decision Feed", "EXECUTABLE | run=0"],
+                                                     ["TFB Decision Feed", value]]),
+            "top10": rdb._top10_execution_veto([["Status:", "output: EXECUTABLE"]], value),
+            "model": d,
+            "acceptance": [c.row() for c in acc.check_feed_truth(acc._MemSource({"_Status": status_rows(value)}))],
+        })
+    out.append({"digest_absent": sd._decision_feed_state({})})
+    return out
+
+
+def supersede_cli_expectation(module, mp, tmp_path):
+    """NEW-CASE EXPECTATION (N34; G7 requires it to FAIL on the base copy): the
+    exact workflow command line downgrades a live release of SOURCE."""
+    ctx, _ = released(mp, tmp_path)
+    import integrations.google_sheets_service as gss
+    mp.setattr(gss, "get_sheets_service", lambda *args, **kwargs: ctx.service)
+    mp.setenv("GITHUB_RUN_ATTEMPT", "1")
+    out = tmp_path / "supersede.json"
+    code = module.main(["--mode", "supersede", "--current-run", CURRENT_RUN,
+                        "--sheet-id", "synthetic-sheet", "--json-out", str(out)])
+    cell = ctx.service.rows[3][12]
+    assert code == 0, "supersede CLI exit %r" % (code,)
+    assert cell.startswith("NOT_ACTIONABLE(final_publication) | run=90001 | "), cell
+    assert cell.endswith(" | superseded_by_run=90002.1") and not R.reads_executable(cell), cell
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["outcome"] == "superseded" and payload["downgrade"] == cell
+    return ctx
+
+
+def supersede_eligibility_expectation(module):
+    """NEW-CASE EXPECTATION (N31; G10 requires it to FAIL on the base copy)."""
+    value = supersede_value("90001")
+    assert module.classify_prior(value, CURRENT_RUN) == ("eligible", "superseded_older_run"), \
+        "the superseding run is not releasable"
+    assert module.classify_prior(value, SOURCE) == ("refused", "superseded_by_run")
+
+
 # =========================================================================== WALK
 def case_w1_gate_off_dry_run_reads_only(mp, tmp_path):
     ctx = setup(mp, tmp_path)
@@ -315,6 +595,10 @@ def case_w2_armed_release_one_bounded_write(mp, tmp_path):
     assert result["feed_promoted"] and result["display_pending_cockpit_refresh"]
     assert len(ctx.probe_calls) == 2 and ctx.provenance_calls == [SOURCE]
     from scripts import run_daily_brief, send_digest
+    # v1.1.0: the consumers enforce expires=; read them at the release instant
+    # (this fixture's 2026-07-31 window is long past in real time).
+    for module in (send_digest, run_daily_brief):
+        pin_expiry_clock(mp, module, NOW)
     assert send_digest._decision_feed_state({"tfb decision feed": value})[0] == "EXECUTABLE"
     assert run_daily_brief._feed_execution_veto(value) is False
     assert not SYNC_VETO_RE.match(value)   # a later non-ready sync leg can still downgrade it
@@ -867,7 +1151,8 @@ def case_n24_verifier_registration(mp, tmp_path):
     # bump must not turn this harness red (tests/test_verify_manifest_pins.py
     # owns pin freshness). The registration asserts below are what P0-1 needs.
     assert tuple(int(part) for part in V.SCRIPT_VERSION.split(".")) >= (1, 0, 56), V.SCRIPT_VERSION
-    assert ("release_decision_feed", "1.0.0") in {(n, v) for n, v, _ in V.SCRIPTS}
+    # v1.1.0: the pin follows the module (1.0.0 -> 1.1.0 in the same commit).
+    assert ("release_decision_feed", R.SCRIPT_VERSION) in {(n, v) for n, v, _ in V.SCRIPTS}
     flags = {name: (default, kill) for name, default, _meaning, kill in V.FLAGS}
     assert flags["TFB_DECISION_RELEASE"] == ("0", False)
     assert flags["TFB_DECISION_RELEASE_KILL"] == ("0", False)
@@ -926,6 +1211,331 @@ def case_n25_prewrite_read_fault_zero_writes_window_kept(mp, tmp_path):
     result = ctx.release(service=service)
     assert result["outcome"] == "release_unconfirmed"
     assert [u["body"]["values"][0][1] for u in ctx.updates(service)][0] == W2_VALUE
+
+
+# =========================================================================== v1.1.0 SUPERSEDE
+def case_w6_superseding_run_releasable_after_its_final_job_passed(mp, tmp_path):
+    """Release 90001, run 90002 supersedes it at writer start, 90002's final job
+    passes (so it writes no veto): 90002 must still be releasable, 90001 not."""
+    ctx, _ = released(mp, tmp_path)
+    ctx.clock["now"] = NOW + timedelta(minutes=10)
+    result = supersede(ctx)
+    expected = supersede_value("90001", stamp="2026-07-31 21:10:00+03:00")
+    assert result["exit_code"] == 0 and result["outcome"] == "superseded", result
+    assert ctx.service.rows[3][12] == expected
+    run_sync_verdict(sync_module(), mp, ctx.service)        # the sync preserves the downgrade
+    assert ctx.service.rows[3][12] == expected
+    mp.setenv("GITHUB_RUN_ID", RELEASE_RUN)
+    ctx.service.calls.clear()
+    again = ctx.release()                                    # re-release of the superseded run
+    assert again["exit_code"] == 3 and again["reasons"] == ["superseded_by_run"]
+    assert ctx.updates() == [] and len(ctx.captured["coverage"]) == 1
+    ctx.grids = grids_for_run(CURRENT_RUN)                   # the 90002 cohort, audits pass
+    ctx.clock["now"] = NOW + timedelta(minutes=30)
+    result = ctx.release(source=CURRENT_RUN)
+    assert result["outcome"] == "released" and result["prior_class"] == "eligible", result["reasons"]
+    cell = ctx.service.rows[3][12]
+    assert R.RELEASE_VALUE_RE.fullmatch(cell) and R._single_run(cell) == CURRENT_RUN
+
+
+def case_n26_supersede_noop_writes_nothing(mp, tmp_path):
+    shapes = [W0_VETO, "NOT_ACTIONABLE(owner hold)", "NOT_ACTIONABLE(missing:ML) | run=1 | x",
+              supersede_value("90001"), "not_actionable(final_publication) | run=1",
+              "NOT_ACTIONABLE(final_publication) | run=90001 | x | release_expired | release=777001",
+              "", "stale", "ACTIONABLE | run=1", "UPSTREAM_READY | run=1"]
+    for index, feed in enumerate(shapes + [None]):
+        ctx = setup(mp, tmp_path / str(index), feed=feed or "", absent=feed is None)
+        before = copy.deepcopy(ctx.service.rows)
+        result = supersede(ctx)
+        assert result["exit_code"] == 0 and result["outcome"] == "nothing_to_supersede", (feed, result)
+        assert [kind for kind, _ in ctx.service.calls] == ["get"], feed
+        assert ctx.service.rows == before and result["downgrade"] is None
+        assert result["prior_executable"] is False and not result["feed_promoted"]
+    assert R.SUPERSEDE_MODE not in R.MODES     # run() keeps refusing it: never a promotion path
+    ctx = setup(mp, tmp_path / "run")
+    mp.setenv("TFB_DECISION_RELEASE", "1")
+    assert ctx.release(mode="supersede")["reasons"] == ["mode_invalid"] and ctx.service.calls == []
+
+
+def case_n27_supersede_downgrades_live_and_legacy_executable(mp, tmp_path):
+    ctx, _ = released(mp, tmp_path)
+    ctx.clock["now"] = NOW + timedelta(minutes=5)
+    result = supersede(ctx)
+    value = supersede_value("90001", stamp="2026-07-31 21:05:00+03:00")
+    assert result["exit_code"] == 0 and result["outcome"] == "superseded" and result["downgrade"] == value
+    assert result["superseded_run"] == SOURCE and result["blocker_published"] and not result["feed_promoted"]
+    assert [(kind, kw["range"]) for kind, kw in ctx.service.calls] == [
+        ("get", final.KEY_RANGE), ("get", final.KEY_RANGE), ("update", "'_Status'!L4:M4"),
+        ("get", "'_Status'!L4:M4")]
+    assert ctx.updates()[0]["valueInputOption"] == "RAW" and ctx.service.rows[3][12] == value
+    assert R.SUPERSEDE_VALUE_RE.fullmatch(value) and SYNC_VETO_RE.match(value)
+    assert R.parse_feed(value, ctx.clock["now"])["state"] == "NOT_ACTIONABLE"
+    from scripts import run_daily_brief, send_digest
+    assert send_digest._decision_feed_state({"tfb decision feed": value})[0] == "NOT_ACTIONABLE"
+    assert run_daily_brief._feed_execution_veto(value) is True
+    assert R.classify_prior(value, SOURCE) == ("refused", "superseded_by_run")
+    ctx.service.calls.clear()                                 # second leg of the same run: no-op
+    assert supersede(ctx)["outcome"] == "nothing_to_supersede" and ctx.updates() == []
+    # Legacy and malformed EXECUTABLE shapes every age-blind consumer honours.
+    legacy = {"EXECUTABLE | run=90001 | 2026-07-31 20:00:00+03:00": "90001",
+              "executable | run=90001 | 2026-07-31 20:00:00+03:00": "90001",
+              "EXECUTABLE(release) | run=77 | x": "77", "EXECUTABLE": "unknown",
+              "EXECUTABLE | no stamp": "unknown", "EXECUTABLE | run=1 run=2": "unknown",
+              "EXECUTABLE | run=local | x": "unknown", live_release_value(run="90000"): "90000"}
+    for index, (feed, run) in enumerate(legacy.items()):
+        ctx = setup(mp, tmp_path / ("legacy%d" % index), feed=feed)
+        result = supersede(ctx, attempt="2")
+        expected = supersede_value(run, attempt="2", stamp="2026-07-31 21:00:00+03:00")
+        assert result["exit_code"] == 0 and result["downgrade"] == expected, (feed, result)
+        assert [u["body"]["values"][0][1] for u in ctx.updates()] == [expected]
+    # A rerun attempt of the RELEASED run supersedes its own release too.
+    ctx, _ = released(mp, tmp_path / "rerun")
+    result = supersede(ctx, current=SOURCE, attempt="2")
+    assert ctx.service.rows[3][12] == supersede_value("90001", by=SOURCE, attempt="2",
+                                                      stamp="2026-07-31 21:00:00+03:00")
+    assert R.classify_prior(ctx.service.rows[3][12], SOURCE) == ("refused", "superseded_by_run")
+
+
+def case_n28_supersede_identity_zero_io(mp, tmp_path):
+    ctx, _ = released(mp, tmp_path)
+    for current in ("", "local", "0", "0123", " 90002", "9e3", None, 90002, "90002\n", "-1"):
+        result = supersede(ctx, current=current)
+        assert result["exit_code"] == 3 and result["reasons"] == ["current_run_invalid"], current
+    for attempt in ("", "0", "x", "01", " 1", 1):
+        result = supersede(ctx, attempt=attempt)
+        assert result["exit_code"] == 3 and result["reasons"] == ["run_attempt_invalid"], attempt
+    mp.delenv("GITHUB_RUN_ATTEMPT", raising=False)
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, service=ctx.service, now_utc=ctx.clock["now"])
+    assert result["reasons"] == ["run_attempt_invalid"]          # read from GITHUB_RUN_ATTEMPT
+    mp.setenv("GITHUB_RUN_ATTEMPT", "3")
+    for sheet in ("", "  ", None):
+        result = R.supersede(sheet, CURRENT_RUN, service=ctx.service, now_utc=ctx.clock["now"])
+        assert result["exit_code"] == 3 and result["reasons"] == ["sheet_id_missing"]
+    assert ctx.service.calls == [] and ctx.service.rows[3][12] == W2_VALUE
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, service=ctx.service, now_utc=ctx.clock["now"])
+    assert result["downgrade"].endswith("superseded_by_run=90002.3")
+
+
+def case_n29_supersede_faults_fail_closed(mp, tmp_path):
+    ctx, _ = released(mp, tmp_path)
+    for grid in LAYOUTS:
+        calls = []
+
+        class Layout:
+            def spreadsheets(self):
+                return self
+
+            def values(self):
+                return self
+
+            def get(self, **kwargs):
+                calls.append("get")
+                return SimpleNamespace(execute=lambda: {"values": copy.deepcopy(grid)})
+
+            def update(self, **kwargs):
+                raise AssertionError("no write on a layout fault")
+
+        result = supersede(ctx, service=Layout())
+        assert result["exit_code"] == 3 and result["outcome"] == "layout_fault", grid
+        assert calls == ["get"]
+
+    class Down(GoogleValues):
+        def get(self, **kwargs):
+            raise ConnectionError("synthetic 503")
+    result = supersede(ctx, service=Down())
+    assert result["exit_code"] == 3 and result["reasons"] == ["layout_or_read_failed"]
+    # The update fails and the cell still reads EXECUTABLE: unconfirmed, exit 3.
+    service = GoogleValues(write_error=True)
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    result = supersede(ctx, service=service)
+    assert result["exit_code"] == 3 and result["outcome"] == "supersede_unconfirmed"
+    assert service.rows[3][12] == W2_VALUE and not result["blocker_published"]
+
+    class RereadDown(GoogleValues):
+        def get(self, **kwargs):
+            if self.write_error and kwargs["range"] == final.KEY_RANGE and \
+                    any(kind == "update" for kind, _ in self.calls):
+                raise ConnectionError("synthetic 503 on the re-read")
+            return super().get(**kwargs)
+    service = RereadDown(write_error=True)
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    result = supersede(ctx, service=service)
+    assert result["exit_code"] == 3 and "reread_error" in result
+
+    class PeerRace(GoogleValues):
+        """A parallel leg of the same run lands its own downgrade between this
+        leg's update and its readback: publish_blocker raises, the re-read shows
+        a non-EXECUTABLE value, and the leg may proceed."""
+        def update(self, **kwargs):
+            request = super().update(**kwargs)
+
+            def write():
+                result = request.execute()
+                self.rows[3][12] = supersede_value("90001", stamp="2026-07-31 21:00:01+03:00")
+                return result
+            return SimpleNamespace(execute=write)
+    service = PeerRace()
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    result = supersede(ctx, service=service)
+    assert result["exit_code"] == 0 and result["outcome"] == "superseded_confirmed_by_reread", result
+    assert result["reasons"] == ["readback_raced"] and not R.reads_executable(service.rows[3][12])
+
+    class KeyVanished(GoogleValues):
+        """The key row is cleared between the update and the readback: the
+        re-read finds no feed at all, which is NOT a confirmed downgrade."""
+        def update(self, **kwargs):
+            request = super().update(**kwargs)
+
+            def write():
+                result = request.execute()
+                self.rows[3][11:13] = ["", ""]
+                return result
+            return SimpleNamespace(execute=write)
+    service = KeyVanished()
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    vanished = supersede(ctx, service=service)
+    assert vanished["exit_code"] == 3 and vanished["outcome"] == "supersede_unconfirmed", vanished
+    # The workflow step fails on exit 3: the supersede code path never returns 1 or 2.
+    assert {supersede(ctx, current="x")["exit_code"], result["exit_code"]} <= {0, 3}
+
+
+def case_n30_release_gate_spelling_never_outruns_the_supersede_step(mp, tmp_path):
+    for word in (" 1", "1 ", " on", "TRUE "):
+        ctx = setup(mp, tmp_path / repr(word))
+        mp.setenv("TFB_DECISION_RELEASE", word)
+        assert R.release_enabled()
+        result = ctx.release()
+        assert result["exit_code"] == 3 and result["reasons"] == ["release_gate_not_canonical"], word
+        assert ctx.service.calls == [] and ctx.captured["coverage"] == [] and ctx.probe_calls == []
+        assert not evaluate_step_if(EXPECTED_STEP_IF[True], variable=word, event="schedule")
+    for word in ("1", "true", "TRUE", "Yes", "on"):
+        ctx = setup(mp, tmp_path / ("ok" + word))
+        mp.setenv("TFB_DECISION_RELEASE", word)
+        assert ctx.release()["outcome"] == "released", word
+        assert evaluate_step_if(EXPECTED_STEP_IF[True], variable=word, event="schedule")
+
+
+def case_n31_superseded_value_eligibility_matrix(mp, tmp_path):
+    supersede_eligibility_expectation(R)
+    expect = {
+        (supersede_value("90001"), "90002"): ("eligible", "superseded_older_run"),
+        (supersede_value("90001"), "90003"): ("eligible", "superseded_older_run"),
+        (supersede_value("90001"), "90001"): ("refused", "superseded_by_run"),
+        (supersede_value("90001"), "90000"): ("refused", "superseded_by_run"),
+        (supersede_value("90000"), "90001"): ("refused", "superseded_by_run"),   # older than the superseder
+        (supersede_value("unknown"), "90002"): ("eligible", "superseded_older_run"),
+        (supersede_value("unknown"), "90001"): ("refused", "superseded_by_run"),
+        (supersede_value("90001", by="90001", attempt="2"), "90001"): ("refused", "superseded_by_run"),
+        (supersede_value("90001", by="90001", attempt="2"), "90002"): ("eligible", "superseded_older_run"),
+        # Not the exact grammar: refused exactly as in v1.0.0.
+        ("NOT_ACTIONABLE(final_publication) | run=90000 | superseded_by_run=90001", "90001"):
+            ("refused", "superseded_by_run"),
+        (supersede_value("90001").replace("90002.1", "90002"), "90002"): ("refused", "superseded_by_run"),
+        (supersede_value("90001") + " | x", "90002"): ("refused", "superseded_by_run"),
+        (supersede_value("90001").lower(), "90002"): ("refused", "superseded_by_run"),
+        (supersede_value("90001").replace("21:10:00", "21:10"), "90002"): ("refused", "superseded_by_run"),
+        (supersede_value("local"), "90002"): ("refused", "superseded_by_run"),
+        ("EXECUTABLE | run=90001 | superseded_by_run=90002.1", "90002"): ("refused", "superseded_by_run"),
+    }
+    for (prior, source), verdict in expect.items():
+        assert R.classify_prior(prior, source) == verdict, (prior, source)
+    with pytest.raises(ValueError):
+        R.supersede_value("local", NOW, CURRENT_RUN, "1")
+
+
+def case_n32_supersede_never_promotes_ast(mp, tmp_path):
+    tree = ast.parse((ROOT / "scripts" / "release_decision_feed.py").read_text(encoding="utf-8"))
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "supersede")
+    calls = [ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    assert "fin.publish_blocker" in calls and calls.count("fin.publish_blocker") == 1
+    assert not [c for c in calls if c.endswith((".update", "publish_release", "compose_release_value", "fin.run"))]
+    assert "EXECUTABLE |" not in ast.unparse(fn)
+
+
+def case_n33_supersede_cli_contract(mp, tmp_path):
+    supersede_cli_expectation(R, mp, tmp_path)
+    out = tmp_path / "bad.json"
+    assert R.main(["--mode", "supersede", "--sheet-id", "s", "--json-out", str(out)]) == 3
+    assert json.loads(out.read_text(encoding="utf-8"))["reasons"] == ["current_run_invalid"]
+    assert R.main(["--mode", "release", "--sheet-id", "s", "--json-out", str(tmp_path / "x.json")]) == 3
+    assert not (tmp_path / "x.json").exists()                 # unchanged: no source, no JSON
+
+
+def case_n34_supersede_wired_into_every_page_writer(mp, tmp_path):
+    workflows = ROOT / ".github" / "workflows"
+    supersede_workflow_expectation(workflows)
+    for name in ("release_decision_feed.yml", "grid_capacity_repair.yml"):
+        text = (workflows / name).read_text(encoding="utf-8")
+        assert SUPERSEDE_STEP not in text and "--mode supersede" not in text, name
+    # grid_capacity_repair.yml: no step, by design. It only shrinks empty grid
+    # rows above data extent + buffer and prunes old _Run_Log rows; it never
+    # writes a page cell or a run= token, so it cannot re-stamp a cohort. The
+    # release still defers while it is in flight.
+    tool = (ROOT / "scripts" / "repair_grid_capacity.py").read_text(encoding="utf-8")
+    assert "run=" not in tool and "GITHUB_RUN_ID" not in tool and "_Status" not in tool
+    assert "grid_capacity_repair.yml" in R.INFLIGHT_WORKFLOWS
+    for path in (DAILY_YML, RECOVERY_YML):
+        text = path.read_text(encoding="utf-8")
+        added = [line for line in text.splitlines() if "Supersede" in line or "supersede" in line]
+        assert added and all(ord(ch) < 128 for line in added for ch in line)
+
+
+def case_n35_consumer_expiry_boundaries_and_lockstep(mp, tmp_path):
+    from scripts import run_daily_brief, send_digest, tfb_acceptance
+    consumer_expiry_expectation(send_digest, run_daily_brief, tfb_acceptance)
+    value = live_release_value()
+    expires = R._parse_t(R.RELEASE_VALUE_RE.fullmatch(value).group("expires"))
+    helpers = [m._feed_release_expiry for m in (send_digest, run_daily_brief, tfb_acceptance)]
+    for helper in helpers:
+        assert helper(value, expires - timedelta(seconds=1)) == ""
+        assert helper(value, expires) == ""                     # inclusive, like the sweep
+        assert helper(value, expires + timedelta(seconds=1)) == "release_expired"
+        assert helper(value, expires.replace(tzinfo=None)) == "release_expiry_invalid"
+        assert helper(value.replace("expires=", "EXPIRES="), expires + timedelta(seconds=1)) == "release_expired"
+        for shape in TODAY_SHAPES:
+            assert helper(shape, expires) == "", shape         # inert on every value of today
+        for minutes in (0, 1, 240, 479, 480, 481, 600):
+            at = ANCHOR + timedelta(minutes=minutes)
+            for extra in (0, 1):
+                when = at + timedelta(seconds=extra)
+                assert (helper(value, when) == "release_expired") is \
+                    (R.sweep_reason(value, when) == "release_expired"), (minutes, extra)
+    # Lockstep: the helper and its two constants are byte-identical in all three.
+    sources = []
+    for module in (send_digest, run_daily_brief, tfb_acceptance):
+        text = Path(module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        parts = [ast.get_source_segment(text, node) for node in tree.body
+                 if (isinstance(node, ast.FunctionDef) and node.name == "_feed_release_expiry")
+                 or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in (
+                     "_FEED_EXPIRES_RE", "_FEED_EXPIRES_FORM") for t in node.targets))]
+        assert len(parts) == 3, module.__name__
+        sources.append(parts)
+    assert sources[0] == sources[1] == sources[2]
+    # Consumers at the release instant: live; one second after expires=: not.
+    for module in (send_digest, run_daily_brief, tfb_acceptance):
+        pin_expiry_clock(mp, module, expires)
+    assert send_digest._decision_feed_state({"tfb decision feed": value})[0] == "EXECUTABLE"
+    assert run_daily_brief._feed_execution_veto(value) is False and _d10(tfb_acceptance, value).verdict == "PASS"
+    for module in (send_digest, run_daily_brief, tfb_acceptance):
+        pin_expiry_clock(mp, module, expires + timedelta(seconds=1))
+    assert send_digest._decision_feed_state({"tfb decision feed": value})[1] == "release_expired"
+    assert run_daily_brief._feed_execution_veto(value) is True
+    d = {"sell": [{"note": "n", "sar": 1.0}], "trim": [], "add": [], "block": [], "freed_cash": 1.0}
+    run_daily_brief._apply_final_feed_veto(d, value)
+    assert d["execution_veto"] == "release_expired: " + value and d["sell"] == []
+    assert run_daily_brief._top10_execution_veto([], value) == "Final decision feed: release_expired: " + value
+
+
+def case_n36_consumer_import_graph_unchanged(mp, tmp_path):
+    for name in ("send_digest", "run_daily_brief", "tfb_acceptance"):
+        text = (ROOT / "scripts" / (name + ".py")).read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        top = {ast.unparse(node) for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))}
+        assert not [line for line in top if "release_decision_feed" in line or "scripts" in line], (name, top)
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_feed_release_expiry")
+        imports = [ast.unparse(n) for n in ast.walk(fn) if isinstance(n, (ast.Import, ast.ImportFrom))]
+        assert imports == ["from datetime import datetime as _datetime, timezone as _timezone"], imports
 
 
 # =========================================================================== GOLDEN
@@ -1005,7 +1615,7 @@ def case_g5_verifier_ast_inventory_zero_removed(mp, tmp_path):
     # (read by AST literal, no import). A HEAD copy in the base dir fails here.
     names = {"TFB_DECISION_RELEASE", "TFB_DECISION_RELEASE_KILL"}
     here, then = registration(ROOT / "scripts" / "verify_deployment.py"), registration(base)
-    assert ("release_decision_feed", "1.0.0") in here["scripts"] and names <= here["flags"]
+    assert ("release_decision_feed", R.SCRIPT_VERSION) in here["scripts"] and names <= here["flags"]
     assert names <= here["workflow_scoped"]
     assert "release_decision_feed" not in {name for name, _ in then["scripts"]}, \
         "base verifier already pins release_decision_feed: TFB_TEST_FINALIZE_BASE is not a base copy"
@@ -1064,6 +1674,89 @@ def case_g6_armed_walk_fails_on_base_tree(mp, tmp_path):
         "the base tree released the feed: the base dir holds a HEAD copy, not dda1211"
     assert cell == W0_VETO
     assert not [u for u in ctx.updates() if u["body"]["values"][0][0] == final.KEY]
+
+
+# --------------------------------------------------------------------------- v1.1.0 GOLDEN
+PREV_FILES = ("release_decision_feed.py", "send_digest.py", "run_daily_brief.py", "tfb_acceptance.py",
+              "daily_sync.yml", "page_refresh_recovery.yml", "grid_capacity_repair.yml")
+
+
+def _require_prev():
+    if not PREV_DIR or not os.path.isdir(PREV_DIR):
+        pytest.skip("TFB_TEST_SUPERSEDE_BASE_DIR unset")
+    missing = [name for name in PREV_FILES if not (Path(PREV_DIR) / name).exists()]
+    if missing:
+        pytest.skip("pre-change copies missing: %s" % missing)
+    return Path(PREV_DIR)
+
+
+def _prev_module(name):
+    return _load_base(Path(PREV_DIR) / (name + ".py"), "tfb_prev_" + name)
+
+
+def must_fail(expectation, *args, match=""):
+    """Run a NEW case's expectation on the pre-change copies: it must FAIL.
+    Raises AssertionError (a counted FAIL in the script runner too) when it
+    passes, i.e. when the directory holds HEAD copies."""
+    try:
+        expectation(*args)
+    except AssertionError as exc:
+        assert match in str(exc), (match, str(exc))
+        return str(exc)
+    raise AssertionError(expectation.__name__ + " PASSED on the pre-change copies: "
+                         "TFB_TEST_SUPERSEDE_BASE_DIR holds HEAD copies, not 0825561")
+
+
+def case_g7_supersede_cli_fails_on_prechange_release_script(mp, tmp_path):
+    """N33's expectation (the workflow's exact command line downgrades a live
+    release) against the pre-change script: no supersede mode, so the release
+    stays EXECUTABLE. A HEAD copy in the directory passes it and FAILS here."""
+    _require_prev()
+    supersede_cli_expectation(R, mp, tmp_path / "head")      # positive control
+    base = _prev_module("release_decision_feed")
+    must_fail(supersede_cli_expectation, base, mp, tmp_path / "base", match="supersede CLI exit 3")
+    assert not hasattr(base, "supersede"), "the pre-change dir holds a HEAD copy"
+
+
+def case_g8_workflows_prechange_lack_the_step_and_off_path_identity(mp, tmp_path):
+    """N34's expectation fails on the pre-change workflows (no supersede step),
+    and HEAD minus the added steps equals them exactly (yaml.safe_load), so an
+    unset variable leaves every other line where it was."""
+    prev = _require_prev()
+    must_fail(supersede_workflow_expectation, prev, match="supersede step missing")
+    total = 0
+    for name, expected_removed in (("daily_sync.yml", 2), ("page_refresh_recovery.yml", 1),
+                                   ("grid_capacity_repair.yml", 0)):
+        current, removed = strip_supersede_steps(_load_yaml(ROOT / ".github" / "workflows" / name))
+        assert removed == expected_removed, (name, removed)
+        assert current == _load_yaml(prev / name), name + ": differs beyond the added steps"
+        total += removed
+    assert total == 3
+
+
+def case_g9_consumers_prechange_honour_expired_release_and_today_identical(mp, tmp_path):
+    """N35's expectation fails on the pre-change consumers (an expired release
+    reads as EXECUTABLE), and on every value shape of today the HEAD consumers
+    answer exactly as the pre-change copies."""
+    _require_prev()
+    from scripts import run_daily_brief, send_digest, tfb_acceptance
+    base = [_prev_module(name) for name in ("send_digest", "run_daily_brief", "tfb_acceptance")]
+    must_fail(consumer_expiry_expectation, *base, match="send_digest honours an expired release")
+    assert not hasattr(base[0], "_feed_release_expiry"), "the pre-change dir holds a HEAD copy"
+    here = consumer_outputs(send_digest, run_daily_brief, tfb_acceptance)
+    then = consumer_outputs(*base)
+    assert json.dumps(here, sort_keys=True, default=str) == json.dumps(then, sort_keys=True, default=str)
+    print("G9 identical on %d value shapes" % len(TODAY_SHAPES))
+
+
+def case_g10_eligibility_fails_on_prechange_release_script(mp, tmp_path):
+    """N31's expectation (the superseding run is releasable) fails on the
+    pre-change classify_prior, which refused every superseded_by_run value;
+    the re-release refusal holds on both."""
+    _require_prev()
+    base = _prev_module("release_decision_feed")
+    must_fail(supersede_eligibility_expectation, base, match="superseding run is not releasable")
+    assert base.classify_prior(supersede_value("90001"), SOURCE) == ("refused", "superseded_by_run")
 
 
 CASES = [value for _name, value in sorted(

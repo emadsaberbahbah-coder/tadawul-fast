@@ -112,6 +112,11 @@ sys.path.insert(0, _ROOT)
 # release_decision_feed.yml; this shell cannot observe them. WHY kill=False for
 # the KILL flag: unset is its safe default (no kill), so scoring an unset kill as
 # a disarmed protection would be a permanent false DRIFT. No verifier logic changed.
+# v1.0.56 extended (2026-10-13, Codex P1 on PR #763, same unreleased 1.0.56):
+# re-pin release_decision_feed 1.0.0 -> 1.1.0 (writer-start supersede mode),
+# run_daily_brief 1.18.0 -> 1.18.1 and send_digest 2.1.0 -> 2.1.1 (release
+# expires= enforced in the age-blind consumers). tfb_acceptance is not pinned
+# here. Pins only; no verifier logic changed.
 # v1.0.57 (2026-10-13) WHY: pin portfolio_actions 1.15.1->1.16.0 (P0-6
 # research view behind TFB_PF_RESEARCH_VIEW, default off = v1.15.1 output
 # except the version string). Manifest pin only; no verifier logic changed.
@@ -193,7 +198,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.1", "final decision-publication acceptance"),
-    ("release_decision_feed", "1.0.0", "gated audited decision-feed release (P0-1)"),
+    ("release_decision_feed", "1.1.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
@@ -206,8 +211,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.0", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
-    ("run_daily_brief", "1.18.0", "daily brief"),
-    ("send_digest", "2.1.0", "digest"),
+    ("run_daily_brief", "1.18.1", "daily brief"),
+    ("send_digest", "2.1.1", "digest"),
     ("run_calendar_sync", "1.1.4", "calendar sync"),
 ]
 

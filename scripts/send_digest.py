@@ -134,7 +134,23 @@ from typing import Any, Dict, List, Optional, Tuple
 #   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
 #   the correct fail-closed answer.
 # =============================================================================
-__version__ = "2.1.0"
+__version__ = "2.1.1"
+# -----------------------------------------------------------------------------
+# v2.1.1 (2026-10-13, P0-1, Codex P1 on PR #763) -- RELEASE EXPIRY ENFORCED
+# -----------------------------------------------------------------------------
+# WHY: scripts/release_decision_feed.py may now write an audited EXECUTABLE
+# that carries 'expires=<YYYY-mm-ddTHH:MM:SS+03:00>'. The cockpit stops
+# honouring it after 480 minutes, but _decision_feed_state read only the head
+# token, so an expired release stayed actionable here until a sweep ran.
+# CHANGE: an EXECUTABLE head whose value carries an expires= token is
+# NOT_ACTIONABLE once now > expires (reason release_expired), and when the
+# token repeats or is malformed (reason release_expiry_invalid, fail closed).
+# NOT UNKNOWN: UNKNOWN is actionable on a manifest PASS, so it would fail open.
+# INERT TODAY: no value written before P0-1 carries expires= (the sync and the
+# finalizer write none), and a value without the token returns exactly what
+# v2.1.0 returned (harness: corpus comparison against the v2.1.0 copy).
+# Functions added: 1 (_feed_release_expiry, a lockstep copy shared verbatim
+# with run_daily_brief and tfb_acceptance). Removed: 0.
 # -----------------------------------------------------------------------------
 # v2.1.0 (2026-08-31, 10-day program Day 5) — THE DAILY STATE BRIEF
 # -----------------------------------------------------------------------------
@@ -593,14 +609,46 @@ def _read_status_globals(read_range, sheet_id: str) -> Dict[str, str]:
     return out
 
 
+# P0-1 RELEASE EXPIRY (2026-10-13). LOCKSTEP COPY: these two constants and
+# _feed_release_expiry are byte-identical in scripts/send_digest.py,
+# scripts/run_daily_brief.py and scripts/tfb_acceptance.py (kept stdlib-only so
+# no consumer gains an import edge); tests/test_release_decision_feed.py fails
+# when the copies drift.
+_FEED_EXPIRES_RE = re.compile(r"(?<![A-Za-z0-9_])expires\s*=\s*([^\s|]*)", re.I)
+_FEED_EXPIRES_FORM = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+03:00", re.A)
+
+
+def _feed_release_expiry(raw: Any, now: Any = None) -> str:
+    """PURE. '' when the value carries no expires= token (every value written
+    before P0-1: behaviour unchanged) or its release is still live;
+    'release_expired' once now > expires; 'release_expiry_invalid' when the
+    token repeats or is not exactly YYYY-mm-ddTHH:MM:SS+03:00 (fail closed)."""
+    from datetime import datetime as _datetime, timezone as _timezone
+    found = _FEED_EXPIRES_RE.findall(str(raw or ""))
+    if not found:
+        return ""
+    if len(found) != 1 or not _FEED_EXPIRES_FORM.fullmatch(found[0]):
+        return "release_expiry_invalid"
+    try:
+        expires = _datetime.strptime(found[0], "%Y-%m-%dT%H:%M:%S%z")
+        current = now if now is not None else _datetime.now(_timezone.utc)
+        return "release_expired" if current > expires else ""
+    except (TypeError, ValueError):
+        return "release_expiry_invalid"
+
+
 def _decision_feed_state(globals_kv: Dict[str, str]) -> Tuple[str, str, str]:
     """v2.1.0 PURE: (state, reason, raw) from the 'TFB Decision Feed' key.
-    state in EXECUTABLE / NOT_ACTIONABLE / UNKNOWN (key absent or unparseable)."""
+    state in EXECUTABLE / NOT_ACTIONABLE / UNKNOWN (key absent or unparseable).
+    v2.1.1: an expired or unreadable release expires= is NOT_ACTIONABLE."""
     raw = str((globals_kv or {}).get("tfb decision feed", "") or "").strip()
     if not raw:
         return "UNKNOWN", "no TFB Decision Feed key in _Status", ""
     head = raw.split("|", 1)[0].strip()
     if head.upper().startswith("EXECUTABLE"):
+        expiry = _feed_release_expiry(raw)
+        if expiry:
+            return "NOT_ACTIONABLE", expiry, raw
         return "EXECUTABLE", "", raw
     if head.upper().startswith("NOT_ACTIONABLE"):
         m = re.search(r"NOT_ACTIONABLE\(([^)]*)\)", head, re.I)
