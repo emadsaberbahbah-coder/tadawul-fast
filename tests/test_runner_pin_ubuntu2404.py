@@ -1,6 +1,17 @@
 """tests/test_runner_pin_ubuntu2404.py - GitHub Actions runner image pin harness.
 
-HARNESS_VERSION 1.0.0 (2026-10-13)
+HARNESS_VERSION 1.0.1 (2026-10-13)
+
+WHY 1.0.1 (2026-10-13): review found two regressions that P3 let through: a
+job-level `concurrency:` on the canary job (e.g. group ci-${{ github.ref }}
+with cancel-in-progress true, which would let the canary cancel in-flight CI
+on main) and a dispatch-input expression in a non-run field such as the
+`with: script:` of actions/github-script. P3 now rejects any job-level
+concurrency in the canary, rejects any other workflow (at workflow or job
+level) using a runner-image-canary group, and allows an `inputs` expression
+only in env values, runs-on and the workflow-level concurrency group. The new
+case P8 seeds those regressions into in-memory copies of the canary and
+proves P3's check reports each one. No check was removed or relaxed.
 
 WHY (2026-10-13): GitHub is moving the ubuntu-latest runner label to a newer
 Ubuntu image (26.04) from 19 Oct 2026. Every workflow in this repository ran
@@ -19,9 +30,12 @@ Cases (offline, read-only, YAML text only; no network, no credentials):
      runs-on is exactly the dispatch-input expression with the 24.04 fallback
   P3 the canary workflow: dispatch-only trigger, a runner_image choice of
      ubuntu-26.04 (default) / ubuntu-24.04, its own concurrency group (not
-     ci-*, not the production write lease, shared with no other workflow),
+     ci-*, not the production write lease, shared with no other workflow
+     at workflow or job level), no job-level concurrency in the canary,
      permissions contents: read, a bounded timeout, checkout without
      persisted credentials, no ${{ ... }} expression inside any run block,
+     a dispatch-input expression only in env values, runs-on and the
+     workflow-level concurrency group (never in with:, name:, if: or run:),
      the daily_sync preflight tool check copied verbatim, node --version,
      setup-python@v6 3.11, pip install -r requirements.txt pytest, compileall
      and only tests that the blocking lean lane also runs
@@ -38,6 +52,12 @@ Cases (offline, read-only, YAML text only; no network, no credentials):
      the base copies, every one of them ubuntu-latest
   P7 [needs TFB_RUNNER_PIN_BASE_DIR] golden negative: the gate cases P1, P2
      and P3 each FAIL when pointed at the base copies
+  P8 guard self-test: the shipped canary passes the P3 check unchanged, and
+     each seeded regression (job-level ci-* concurrency with cancel-in-progress,
+     an input expression in github-script `with: script:`, a
+     github.event.inputs expression in another `with:` value, an input
+     expression inside run, a ci-* workflow-level group) makes the same check
+     report it. In-memory copies only; nothing is written
 
 Env (all optional):
   TFB_RUNNER_PIN_BASE_DIR=<dir>       directory of base workflow copies, e.g.
@@ -53,8 +73,10 @@ Run:  python tests/test_runner_pin_ubuntu2404.py        -> "PASS k/k", exit 0/1
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -66,7 +88,7 @@ except ImportError:  # pragma: no cover - script mode without pytest
     pytest = None
 
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.0.1"
 ROOT = Path(__file__).resolve().parents[1]
 REPO_WORKFLOWS = ROOT / ".github" / "workflows"
 
@@ -80,6 +102,21 @@ CANARY_MAX_TIMEOUT = 30
 PREFLIGHT_SOURCE = ("daily_sync.yml", "preflight-validation", "validate")
 LEAN_SOURCE = ("ci.yml", "lean-unit")
 PRODUCTION_LEASE_MARKERS = ("tadawul-production-write", "tadawul-ci-")
+CANARY_GROUP_MARKER = "runner-image-canary"
+# A ${{ ... }} expression that reads a dispatch input (inputs.x, inputs['x'],
+# github.event.inputs.x). In the canary it may appear only at these paths
+# ("*" is any job / step / env key): env values, runs-on and the
+# workflow-level concurrency group.
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+INPUTS_WORD = re.compile(r"\binputs\b")
+INPUT_EXPRESSION_ALLOWED = (
+    ("concurrency",),
+    ("concurrency", "group"),
+    ("env", "*"),
+    ("jobs", "*", "runs-on"),
+    ("jobs", "*", "env", "*"),
+    ("jobs", "*", "steps", "*", "env", "*"),
+)
 
 BASE_COMMIT = "dda1211"
 BASE_UNPINNED_LABELS = 55
@@ -150,6 +187,40 @@ def _concurrency_group(doc):
     return value
 
 
+def _all_concurrency_groups(doc):
+    """The workflow-level group plus every job-level group, as strings."""
+    groups = [_concurrency_group(doc)]
+    groups += [_concurrency_group(job) for job in _jobs(doc).values()]
+    return [group for group in groups if isinstance(group, str)]
+
+
+def _string_paths(node, path=()):
+    """(path, value) for every string value; dict keys and list indices form the path."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _string_paths(value, path + (key,))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _string_paths(item, path + (index,))
+    elif isinstance(node, str):
+        yield path, node
+
+
+def _path_allowed(path, patterns):
+    return any(
+        len(path) == len(pattern)
+        and all(want == "*" or want == got for want, got in zip(pattern, path))
+        for pattern in patterns)
+
+
+def input_expression_paths(doc):
+    """Every path whose value interpolates a dispatch input in ${{ ... }}."""
+    return [
+        path for path, value in _string_paths(doc)
+        if any(INPUTS_WORD.search(body) for body in EXPRESSION.findall(value))
+    ]
+
+
 # ------------------------------------------------------------ the checks
 def floating_hits(directory: Path):
     """Every place ubuntu-latest still appears as workflow content."""
@@ -209,12 +280,16 @@ def _lean_text(directory: Path):
     return "\n".join(str(step.get("run", "")) for step in _steps(job))
 
 
-def canary_problems(directory: Path):
+def canary_problems(directory: Path, doc=None):
+    """The canary contract. `doc` (optional) checks an in-memory canary
+    document instead of the file; the rest of `directory` is still used for
+    the preflight, lean-list and shared-group comparisons (P8 uses this)."""
     problems = []
     path = directory / CANARY_FILE
-    if not path.exists():
-        return [f"{CANARY_FILE} is missing"]
-    doc = _load(path)
+    if doc is None:
+        if not path.exists():
+            return [f"{CANARY_FILE} is missing"]
+        doc = _load(path)
     if not isinstance(doc, dict):
         return [f"{CANARY_FILE} is not a mapping"]
 
@@ -249,6 +324,12 @@ def canary_problems(directory: Path):
         for other in _files(directory):
             if other.name != CANARY_FILE and _concurrency_group(_load(other)) == group:
                 problems.append(f"concurrency group shared with {other.name}")
+    for other in _files(directory):
+        if other.name == CANARY_FILE:
+            continue
+        for other_group in _all_concurrency_groups(_load(other)):
+            if CANARY_GROUP_MARKER in other_group:
+                problems.append(f"{other.name} uses a canary concurrency group: {other_group}")
 
     if doc.get("permissions") != {"contents": "read"}:
         problems.append(f"permissions must be exactly contents: read, got {doc.get('permissions')!r}")
@@ -263,6 +344,10 @@ def canary_problems(directory: Path):
             problems.append(f"job {job_name} runs-on must be {CANARY_RUNS_ON}, got {job.get('runs-on')!r}")
         if "permissions" in job and job["permissions"] != {"contents": "read"}:
             problems.append(f"job {job_name} must not widen permissions")
+        if "concurrency" in job:
+            problems.append(
+                f"job {job_name} sets job-level concurrency {job['concurrency']!r}; "
+                "the workflow-level group must be the canary's only group")
         timeout = job.get("timeout-minutes")
         if not isinstance(timeout, int) or not 1 <= timeout <= CANARY_MAX_TIMEOUT:
             problems.append(f"job {job_name} timeout-minutes must be 1..{CANARY_MAX_TIMEOUT}, got {timeout!r}")
@@ -273,6 +358,12 @@ def canary_problems(directory: Path):
                     problems.append(f"step {step.get('name')!r} interpolates an expression inside run")
             if "uses" in step:
                 uses.append(step)
+
+    for where in input_expression_paths(doc):
+        if not _path_allowed(where, INPUT_EXPRESSION_ALLOWED):
+            problems.append(
+                "input expression outside env/runs-on/workflow concurrency at "
+                + ".".join(str(part) for part in where))
 
     checkouts = [s for s in uses if str(s["uses"]).startswith("actions/checkout@")]
     if not checkouts:
@@ -445,6 +536,62 @@ def case_p7():
         f"{name}={'FAIL' if failed else 'pass'}" for name, failed in red.items())
 
 
+def _seeded_canaries(doc):
+    """(label, expected problem substring, mutated copy) for P8."""
+    seeded = []
+    job_name = next(iter(_jobs(doc)), None)
+    if job_name is None:
+        return seeded
+
+    def mutate(label, expect, change):
+        clone = copy.deepcopy(doc)
+        change(clone["jobs"][job_name])
+        seeded.append((label, expect, clone))
+
+    def job_concurrency(job):
+        job["concurrency"] = {"group": "ci-${{ github.ref }}", "cancel-in-progress": True}
+
+    def script_input(job):
+        job["steps"].append({"name": "seeded", "uses": "actions/github-script@v8",
+                             "with": {"script": "console.log('${{ inputs.runner_image }}')"}})
+
+    def with_event_input(job):
+        job["steps"].append({"name": "seeded", "uses": "actions/upload-artifact@v4",
+                             "with": {"name": "x-${{ github.event.inputs.runner_image }}",
+                                      "path": "README.md"}})
+
+    def run_input(job):
+        job["steps"].append({"name": "seeded", "run": "echo ${{ inputs.runner_image }}"})
+
+    mutate("job-level ci-* concurrency", "job-level concurrency", job_concurrency)
+    mutate("inputs in github-script with: script", "input expression outside", script_input)
+    mutate("github.event.inputs in with:", "input expression outside", with_event_input)
+    mutate("inputs inside run", "inside run", run_input)
+    clone = copy.deepcopy(doc)
+    clone["concurrency"] = {"group": "ci-${{ github.ref }}", "cancel-in-progress": True}
+    seeded.append(("workflow-level ci-* group", "must not be ci-*", clone))
+    return seeded
+
+
+def case_p8():
+    directory = _workflows_dir()
+    path = directory / CANARY_FILE
+    if not path.exists():
+        return "FAIL", f"{CANARY_FILE} is missing"
+    doc = _load(path)
+    baseline = canary_problems(directory, doc)
+    if baseline:
+        return "FAIL", "shipped canary is not clean: " + "; ".join(baseline[:3])
+    missed = []
+    seeded = _seeded_canaries(doc)
+    for label, expect, clone in seeded:
+        if not any(expect in problem for problem in canary_problems(directory, clone)):
+            missed.append(label)
+    if not seeded or missed:
+        return "FAIL", f"guard missed {missed or 'everything (no canary job)'}"
+    return "PASS", f"shipped canary clean; {len(seeded)}/{len(seeded)} seeded regressions reported"
+
+
 CASES = (
     ("P1 no ubuntu-latest in workflow content", case_p1),
     ("P2 every runs-on pinned (canary expression excepted)", case_p2),
@@ -453,6 +600,7 @@ CASES = (
     ("P5 base: label-only yaml.safe_load equality", case_p5),
     ("P6 base golden negative: 55 unpinned labels", case_p6),
     ("P7 base golden negative: gate cases fail on base", case_p7),
+    ("P8 canary guard reports seeded regressions", case_p8),
 )
 
 

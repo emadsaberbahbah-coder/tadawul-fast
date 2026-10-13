@@ -18,7 +18,12 @@ name: Runner image canary (manual)
 # CONCURRENCY: its own group (never ci-*, never the production write lease),
 # so a canary can neither cancel nor be cancelled by CI or a sync.
 # INPUTS reach run blocks only through env (no expression inside run).
-# ROLLBACK: delete this file. Nothing depends on it.
+# ROLLBACK: delete this file together with tests/test_runner_pin_ubuntu2404.py
+# and that harness's line in ci.yml's lean list (the harness requires this
+# file; this file runs the harness). Keep every runs-on on ubuntu-24.04: from
+# 19 Oct 2026 ubuntu-latest is the new image (see ci.yml v1.1.13 ROLLBACK).
+# The harness (P3) also forbids a job-level concurrency here and allows an
+# inputs expression only in env values, runs-on and the workflow group.
 
 on:
   workflow_dispatch:

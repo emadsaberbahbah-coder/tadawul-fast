@@ -26,7 +26,15 @@
 # Only after a green canary, flip the labels (preferably to the explicit
 # ubuntu-26.04, not back to ubuntu-latest) in one reviewed commit and update
 # PINNED_LABEL in tests/test_runner_pin_ubuntu2404.py in the same commit.
-# ROLLBACK: revert this commit; every label returns to ubuntu-latest.
+# ROLLBACK (date-dependent): a full revert is neutral only BEFORE 19 Oct
+# 2026, while ubuntu-latest still resolves to ubuntu-24.04. From 19 Oct 2026
+# a revert would move all 55 jobs, every scheduled writer included, onto the
+# unverified new image at once - the swap this pin exists to prevent. After
+# that date roll back with a forward edit instead: remove the canary
+# workflow, the pin harness and the harness's lean-list line together (each
+# references the other), keep every runs-on on the explicit ubuntu-24.04,
+# and never return a label to ubuntu-latest without a green canary on the
+# image ubuntu-latest then points to.
 #
 # v1.1.12: require complete typed final RAW intent digest regressions in lean.
 #
