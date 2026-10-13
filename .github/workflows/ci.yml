@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.20 (2026-10-13) -- DT10 v1.13.9 HELD-SEAT HARNESS
+#
+# v1.1.20: run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-13): 16_Decision_Top10.gs v1.13.9
+# adds Script Property DT10_AUDIT_KEEP (default off), which sends the
+# stability-held seats as criteria.audit_keep_symbols so opportunity_builder
+# 1.27.0 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
+# harness runs the full .gs in a node vm (K1-K5: reader, pure list, REAL
+# refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
+# DT10_BASE and skip in CI. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.19 (2026-10-14) -- SECURITY PIN FLOORS
 #
 # v1.1.19 (2026-10-14): requirements.txt v1.1.4 moves twelve pins to the
@@ -692,6 +703,7 @@ jobs:
           node tests/test_dt10_calendar_completeness.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
+          node tests/js/dt10_audit_keep.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
