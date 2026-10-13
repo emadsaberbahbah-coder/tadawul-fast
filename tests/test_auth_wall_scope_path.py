@@ -1,6 +1,15 @@
 """tests/test_auth_wall_scope_path.py - global auth wall routed-path harness.
 
 HARNESS_VERSION 1.0.0 (2026-10-13) for main.py v8.14.5.
+HARNESS_VERSION 1.1.0 (2026-10-13) adds W14-W19 for the route-layer
+follow-up: routes/investment_advisor 2.18.1, analysis_sheet_rows 4.8.4,
+advanced_analysis 4.18.2, config 5.9.1, enriched_quote 8.5.2 and core.config
+5.8.1 read the ASGI scope path too. WHY (2026-10-13, review of 8.14.5): their
+per-route auth still matched its public-path lists against the Host-derived
+request.url.path. With the wall up an anonymous request never reaches them,
+but with TFB_GLOBAL_AUTH_ENFORCE falsy they are the only check, and a Host
+such as "x/health?x=" passed all six (the masked settings at
+/v1/config/settings were served to an anonymous caller, W17/W19 on the base).
 
 WHY (2026-10-13): GlobalAuthEnforcementMiddleware (main.py v8.13.0 to
 v8.14.4) exempted a request from the global token wall when
@@ -60,6 +69,33 @@ Cases:
      (bypass reproduced) and W3 FAILS
   W13 [needs TFB_AUTH_WALL_BASE] zero removals: every def/class of the base
      is still defined; the additions are exactly the three helpers
+  W14 route layer (auth functions called directly, no handler runs, wall
+     not involved): investment_advisor._auth_passed,
+     analysis_sheet_rows._auth_passed, advanced_analysis._auth_passed,
+     config._auth_ok, enriched_quote svc.auth_guard and core.config.auth_ok
+     (request only) refuse an anonymous protected request with a normal Host
+     and with every crafted Host shape built on every public path any layer
+     knows; a valid token passes with a normal or a crafted Host; a wrong
+     token is refused
+  W15 route-layer identity, always on: each module's _request_scope_path
+     equals request.url.path for the valid-Host corpus (the path is the only
+     input that changed, so every decision is unchanged) and returns "" for
+     a request object without a scope; the six auth functions read no
+     request.url (AST); versions bumped; verify_deployment pins
+     advanced_analysis and analysis_sheet_rows
+  W16 [needs TFB_ROUTE_AUTH_BASE] dual tree: every route-layer decision for
+     the valid-Host corpus (anonymous and with a token) and for the public
+     paths is identical to the pre-change tree
+  W17 [needs TFB_ROUTE_AUTH_BASE] golden negative: on the pre-change tree a
+     crafted Host passes all six auth functions and the real app serves
+     /v1/config/settings to an anonymous crafted-Host request with the wall
+     dropped; W14 and W19 FAIL there
+  W18 [needs TFB_ROUTE_AUTH_BASE] zero removals in the six modules; the only
+     addition in each is _request_scope_path
+  W19 full stack with the wall dropped (TFB_GLOBAL_AUTH_ENFORCE=0): the real
+     app answers GET /v1/config/settings (masked settings; no engine, no
+     provider) with the route's own 401 for a normal Host and for crafted
+     Hosts, 401 for a wrong token and 200 for a valid one
 
 Env (optional):
   TFB_AUTH_WALL_BASE=<file or dir>  the pre-change main.py (or a directory
@@ -67,6 +103,9 @@ Env (optional):
         git show 0fc8d6c0:main.py > /tmp/main_base_v8.14.4.py
       or the dda1211 copy (v8.14.3; same wall code). Unset: W9, W12, W13
       SKIP cleanly.
+  TFB_ROUTE_AUTH_BASE=<dir>  a pre-change TREE (routes/, core/, main.py),
+      e.g.  mkdir /tmp/base && git archive 9a73f48c | tar -x -C /tmp/base
+      (0fc8d6c0 has the same routes/ and core/). Unset: W16, W17, W18 SKIP.
 
 Run:  python tests/test_auth_wall_scope_path.py   -> "PASS k/k", exit 0/1
       python -m pytest -q tests/test_auth_wall_scope_path.py
@@ -86,10 +125,11 @@ except ImportError:  # pragma: no cover - script mode without pytest
     pytest = None
 
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 ROOT = Path(__file__).resolve().parents[1]
 DELIVERED = ROOT / "main.py"
 ENV_BASE = "TFB_AUTH_WALL_BASE"
+ENV_ROUTE_BASE = "TFB_ROUTE_AUTH_BASE"
 EXPECTED_VERSION = "8.14.5"
 NEW_HELPERS = ["_global_auth_exempt_request", "_request_scope_path", "_scope_route_path"]
 TOKEN = "harness-wall-token-7q2"
@@ -277,6 +317,10 @@ _DROP_ENV = (
     "ENABLE_CORS_ALL_ORIGINS", "CORS_ORIGINS", "CORS_ALLOW_CREDENTIALS", "DEBUG",
     "STATUS_DETAILS_REQUIRE_AUTH", "PUBLIC_PATHS", "AUTH_PUBLIC_PATHS",
     "PUBLIC_EXACT_PATHS", "PUBLIC_PATH_PREFIXES", "AUTH_HEADER_NAME", "TFB_ENV", "ENV",
+    # 1.1.0: core.config reads these token lists (before APP_TOKEN) and
+    # protected-path lists, so a developer shell cannot change the answers
+    "ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS", "PROTECTED_EXACT_PATHS",
+    "PROTECTED_PATH_PREFIXES",
 )
 _MODES = {
     "armed": {},
@@ -405,6 +449,234 @@ def _walled(rec, path=None) -> bool:
 def _unquote(p: str) -> str:
     from urllib.parse import unquote
     return unquote(p.split("?", 1)[0])
+
+
+# ------------------------------------------------- route layer (1.1.0)
+# The six route-layer auth sites, in the order the cases report them.
+ROUTE_SITES = ["investment_advisor._auth_passed", "analysis_sheet_rows._auth_passed",
+               "advanced_analysis._auth_passed", "config._auth_ok",
+               "enriched_quote.auth_guard", "core.config.auth_ok"]
+# file -> (version constant, expected version, auth function qualname)
+ROUTE_FILES = {
+    "routes/investment_advisor.py": ("INVESTMENT_ADVISOR_VERSION", "2.18.1", "_auth_passed"),
+    "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.8.4", "_auth_passed"),
+    "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.18.2", "_auth_passed"),
+    "routes/config.py": ("ROUTER_VERSION", "5.9.1", "_auth_ok"),
+    "routes/enriched_quote.py": ("ROUTER_VERSION", "8.5.2", "_Service.auth_guard"),
+    "core/config.py": ("__version__", "5.8.1", "auth_ok"),
+}
+ROUTE_HELPER = "_request_scope_path"
+# Every path some route-layer list treats as public (investment_advisor,
+# analysis_sheet_rows "*/health", core.config exact and prefixes); the wall's
+# exempt set is added at run time.
+ROUTE_PUBLIC = ["/", "/health", "/readyz", "/livez", "/meta", "/v1/health", "/x/health",
+                "/openapi.json", "/docs", "/docs/x", "/redoc", "/favicon.ico", "/static",
+                "/static/x", "/v1/advanced", "/v1/advanced/health", "/v1/advanced/meta",
+                "/v1/advanced/metrics", "/v1/advisor/health", "/v1/schema/health"]
+# Protected under every route-layer list.
+ROUTE_TARGETS = ["/v1/advanced/sheet-rows", "/v1/analysis/sheet-rows", "/v1/config/settings", "/quote"]
+ROUTE_TOKEN_HOSTS = ["testserver", "testserver/health?x=", "h/static?", "h/v1/advanced/health?"]
+FULL_STACK_HOSTS = ["testserver/health?x=", "h/livez#", "h/static?", "h/v1/advanced/health?",
+                    "testserver/?x=", "u@h/readyz?"]
+
+ROUTE_RUNNER = r"""
+import importlib.util, json, os, random, socket, sys
+TREE = sys.argv[1]
+SPEC = json.loads(sys.stdin.read())
+sys.path.insert(0, TREE)
+
+def _blocked(*a, **k):
+    raise OSError("network blocked by tests/test_auth_wall_scope_path.py")
+socket.socket.connect = _blocked
+socket.socket.connect_ex = _blocked
+socket.create_connection = _blocked
+socket.getaddrinfo = _blocked
+
+from starlette.requests import Request
+from fastapi import HTTPException
+import core.config as cc
+import routes.investment_advisor as ia
+import routes.analysis_sheet_rows as asr
+import routes.advanced_analysis as aa
+import routes.config as rc
+import routes.enriched_quote as eq
+
+TOKEN = SPEC["token"]
+
+def req(path, host, token=None, server=("testserver", 80)):
+    headers = [] if host is None else [(b"host", host.encode("latin-1"))]
+    if token:
+        headers.append((b"x-app-token", token.encode("latin-1")))
+    return Request({"type": "http", "method": "GET", "scheme": "http", "path": path,
+                    "raw_path": path.encode("utf-8"), "root_path": "", "query_string": b"",
+                    "headers": headers, "client": ("203.0.113.9", 50000), "server": server})
+
+def _settings(mod):
+    fn = getattr(mod, "get_settings_cached", None)
+    try:
+        return fn() if callable(fn) else None
+    except Exception:
+        return None
+
+def s_ia(r, tok):
+    return ia._auth_passed(request=r, token_query=None, x_app_token=tok, authorization=None)
+def s_asr(r, tok):
+    return asr._auth_passed(request=r, settings=_settings(asr), auth_token=tok or "", authorization=None)
+def s_aa(r, tok):
+    return aa._auth_passed(request=r, settings=_settings(aa), auth_token=tok or "", authorization=None)
+def s_rc(r, tok):
+    return rc._auth_ok(r, query_token=None)
+def s_eq(r, tok):
+    try:
+        eq.svc.auth_guard(r, None, tok, None)
+        return True
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return False
+        raise
+def s_cc(r, tok):
+    return cc.auth_ok(request=r)
+
+SITES = dict(zip(SPEC["sites"], (s_ia, s_asr, s_aa, s_rc, s_eq, s_cc)))
+MODS = {"routes/investment_advisor.py": ia, "routes/analysis_sheet_rows.py": asr,
+        "routes/advanced_analysis.py": aa, "routes/config.py": rc,
+        "routes/enriched_quote.py": eq, "core/config.py": cc}
+
+def call(fn, r, tok):
+    try:
+        return bool(fn(r, tok))
+    except Exception as exc:
+        return "EXC " + type(exc).__name__
+
+os.environ.pop("TFB_GLOBAL_AUTH_ENFORCE", None)
+out = {"plain": {}, "spoof": {}, "token": {}, "wrong": {}, "public": {}, "corpus": {}}
+for site, fn in SITES.items():
+    for p in SPEC["targets"]:
+        out["plain"][site + "|" + p] = call(fn, req(p, "testserver"), None)
+        for shape in SPEC["shapes"]:
+            out["spoof"][site + "|" + shape + "|" + p] = call(fn, req(p, shape), None)
+        for host in SPEC["token_hosts"]:
+            out["token"][site + "|" + host + "|" + p] = call(fn, req(p, host, TOKEN), TOKEN)
+            out["wrong"][site + "|" + host + "|" + p] = call(fn, req(p, host, "nope"), "nope")
+    for p in SPEC["public"]:
+        out["public"][site + "|" + p] = call(fn, req(p, "testserver"), None)
+    for host in SPEC["valid_hosts"] + [None]:
+        for p in SPEC["corpus_paths"]:
+            for tok in (None, TOKEN):
+                out["corpus"]["%s|%r|%s|%s" % (site, host, p, bool(tok))] = call(fn, req(p, host, tok), tok)
+
+# helper identity (delivered tree only: the base has no helper)
+rng = random.Random(20261013)
+alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&'()*+,;=:@/% "
+paths = list(SPEC["corpus_paths"])
+for _ in range(300):
+    paths.append("/" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14))))
+
+class _Duck:
+    url = type("U", (), {"path": "/health"})()
+    headers = {}
+
+helpers = {}
+for name, mod in MODS.items():
+    fn = getattr(mod, "_request_scope_path", None)
+    if not callable(fn):
+        helpers[name] = None
+        continue
+    n = mism = 0
+    examples = []
+    for host in SPEC["valid_hosts"] + [None]:
+        servers = [("testserver", 80), ("10.0.0.1", 8443)] + ([None] if host is not None else [])
+        for p in paths:
+            for server in servers:
+                r = req(p, host, server=server)
+                n += 1
+                if fn(r) != r.url.path:
+                    mism += 1
+                    if len(examples) < 4:
+                        examples.append([host, p, fn(r), r.url.path])
+    helpers[name] = {"n": n, "mismatch": mism, "examples": examples, "duck": fn(_Duck()),
+                     "none": fn(None)}
+out["helpers"] = helpers
+
+# full stack, wall dropped: the route layer is the only check
+os.environ["TFB_GLOBAL_AUTH_ENFORCE"] = "0"
+sp = importlib.util.spec_from_file_location("main", os.path.join(TREE, "main.py"))
+m = importlib.util.module_from_spec(sp)
+sys.modules["main"] = m
+sp.loader.exec_module(m)
+from starlette.testclient import TestClient
+client = TestClient(m.app, raise_server_exceptions=False)
+FS = {"wall_active": bool(m._global_auth_enforcement_active()), "entry_version": getattr(m, "APP_ENTRY_VERSION", "")}
+for key, host, tok in SPEC["full_stack"]:
+    h = {"X-Request-ID": "harness-rid-2"}
+    if host is not None:
+        h["Host"] = host
+    if tok:
+        h["X-APP-TOKEN"] = tok
+    resp = client.get("/v1/config/settings", headers=h)
+    try:
+        obj = resp.json()
+    except Exception:
+        obj = {}
+    obj = obj if isinstance(obj, dict) else {}
+    # status and envelope keys only: the masked settings body is never kept
+    FS[key] = [resp.status_code, obj.get("error"), obj.get("route_owner"), "path" in obj]
+out["full_stack"] = FS
+print("@@JSON@@" + json.dumps(out, sort_keys=True))
+"""
+
+
+def _route_spec() -> dict:
+    public = sorted(set(ROUTE_PUBLIC) | _exempt_paths())
+    shapes = sorted({s for p in public for s in _host_shapes(p)})
+    full = [["anon|testserver", "testserver", None], ["wrong|testserver", "testserver", "nope"],
+            ["token|testserver", "testserver", TOKEN], ["token|testserver/health?x=", "testserver/health?x=", TOKEN]]
+    full += [["anon|" + h, h, None] for h in FULL_STACK_HOSTS]
+    return {"sites": ROUTE_SITES, "token": TOKEN, "targets": ROUTE_TARGETS, "shapes": shapes,
+            "token_hosts": ROUTE_TOKEN_HOSTS, "public": public, "valid_hosts": VALID_HOSTS,
+            "corpus_paths": sorted(set(public + ROUTE_TARGETS + NEAR_MISS + UNKNOWN + DATA_PROTECTED)),
+            "full_stack": full}
+
+
+_ROUTE_CACHE: dict = {}
+
+
+def _run_routes(tree: Path) -> dict:
+    key = str(tree)
+    if key in _ROUTE_CACHE:
+        return _ROUTE_CACHE[key]
+    env = dict(os.environ)
+    for name in _DROP_ENV:
+        env.pop(name, None)
+    env.update(_BASE_ENV)
+    proc = subprocess.run([sys.executable, "-c", ROUTE_RUNNER, str(tree)],
+                          input=json.dumps(_route_spec()), cwd=str(tree), env=env,
+                          capture_output=True, text=True, timeout=600)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("@@JSON@@")]
+    if proc.returncode != 0 or not lines:
+        raise AssertionError(f"route runner failed for {tree} rc={proc.returncode}: "
+                             f"{proc.stdout[-600:]} {proc.stderr[-1500:]}")
+    _ROUTE_CACHE[key] = json.loads(lines[-1][len("@@JSON@@"):])
+    return _ROUTE_CACHE[key]
+
+
+def _route_base():
+    raw = os.environ.get(ENV_ROUTE_BASE, "").strip()
+    return Path(raw) if raw else None
+
+
+def _route_base_problem(base: Path):
+    if not base.is_dir():
+        return f"{ENV_ROUTE_BASE}={base} is not a directory"
+    missing = [f for f in list(ROUTE_FILES) + ["main.py"] if not (base / f).is_file()]
+    if missing:
+        return f"{ENV_ROUTE_BASE}={base} lacks {missing}"
+    return None
+
+
+def _route_401(rec) -> bool:
+    """The config route's own 401 (the wall's 401 carries a "path" key)."""
+    return rec[0] == 401 and rec[1] == "unauthorized" and rec[2] == "config" and not rec[3]
 
 
 # ----------------------------------------------------------------- cases
@@ -695,6 +967,192 @@ def case_w13():
     return "PASS", f"{len(b)} -> {len(d)} defs: 0 removed, added {added}"
 
 
+def case_w14(res=None):
+    res = res or _run_routes(ROOT)
+    bad, n = [], 0
+    passed_by_site = {}
+    for group, want in (("plain", False), ("spoof", False), ("wrong", False), ("token", True)):
+        for key, got in sorted(res[group].items()):
+            n += 1
+            if got is not want:
+                site = key.split("|", 1)[0]
+                if group == "spoof" and got is True:
+                    passed_by_site[site] = passed_by_site.get(site, 0) + 1
+                bad.append(f"{group} {key} -> {got}")
+    for key in ("investment_advisor._auth_passed|/v1/advanced/health", "analysis_sheet_rows._auth_passed|/health",
+                "core.config.auth_ok|/health", "config._auth_ok|/static/x"):
+        n += 1
+        if res["public"].get(key) is not True:
+            bad.append(f"public {key} -> {res['public'].get(key)}")
+    if bad:
+        spoof = sum(passed_by_site.values())
+        return "FAIL", (f"{len(bad)}/{n} route-layer decisions wrong, {spoof} crafted-Host requests passed; "
+                        f"per site {dict(sorted(passed_by_site.items()))}; e.g. " + "; ".join(bad[:4]))
+    n_spoof = len(res["spoof"])
+    return "PASS", (f"{n}/{n} route-layer decisions right: {n_spoof} crafted-Host requests refused at all "
+                    f"{len(ROUTE_SITES)} sites; a token passes with normal and crafted Hosts")
+
+
+def _route_ast_problems(root: Path) -> list:
+    problems = []
+    for rel, (const, want, qual) in ROUTE_FILES.items():
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        version = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == const for t in node.targets):
+                version = ast.literal_eval(node.value)
+        if version != want:
+            problems.append(f"{rel} {const} {version!r} != {want!r}")
+        if not any(isinstance(n, ast.FunctionDef) and n.name == ROUTE_HELPER for n in tree.body):
+            problems.append(f"{rel} has no module-level {ROUTE_HELPER}")
+        body = tree.body
+        fn = None
+        for part in qual.split("."):
+            fn = next((n for n in body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == part), None)
+            body = getattr(fn, "body", [])
+        if fn is None:
+            problems.append(f"{rel} has no {qual}")
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Attribute) and node.attr == "url" and isinstance(node.value, ast.Name) and node.value.id == "request":
+                problems.append(f"{rel} {qual} reads request.url at line {node.lineno}")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                    and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == "url"):
+                problems.append(f"{rel} {qual} reads getattr(..., 'url') at line {node.lineno}")
+    vd = (root / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
+    for mod, rel in (("routes.advanced_analysis", "routes/advanced_analysis.py"),
+                     ("routes.analysis_sheet_rows", "routes/analysis_sheet_rows.py")):
+        const, want, _ = ROUTE_FILES[rel]
+        if f'("{mod}", "{const}", "{want}",' not in vd:
+            problems.append(f"verify_deployment.py does not pin {mod} {want}")
+    return problems
+
+
+def case_w15(res=None):
+    res = res or _run_routes(ROOT)
+    problems = _route_ast_problems(ROOT)
+    total = 0
+    for rel, h in sorted(res["helpers"].items()):
+        if h is None:
+            problems.append(f"{rel}: no {ROUTE_HELPER} at run time")
+            continue
+        total += h["n"]
+        if h["mismatch"]:
+            problems.append(f"{rel}: {h['mismatch']}/{h['n']} differ from url.path {h['examples']}")
+        if h["duck"] != "" or h["none"] != "":
+            problems.append(f"{rel}: no-scope request gave {h['duck']!r} / {h['none']!r}, not ''")
+    if problems:
+        return "FAIL", "; ".join(problems[:6])
+    return "PASS", (f"{total} valid-Host requests over {len(res['helpers'])} modules: scope path == url.path; "
+                    "no-scope objects give ''; no request.url read in the six auth functions; versions and "
+                    "verify_deployment pins match")
+
+
+def case_w16():
+    base = _route_base()
+    if base is None:
+        return "SKIP", f"{ENV_ROUTE_BASE} unset"
+    problem = _route_base_problem(base)
+    if problem:
+        return "FAIL", problem
+    old, new = _run_routes(base), _run_routes(ROOT)
+    diffs, n = [], 0
+    for group in ("corpus", "plain", "public"):
+        for key in sorted(set(old[group]) | set(new[group])):
+            n += 1
+            if old[group].get(key) != new[group].get(key):
+                diffs.append(f"{group} {key}: {old[group].get(key)} vs {new[group].get(key)}")
+    for key in sorted(old["token"]):
+        if "|testserver|" in key:
+            n += 1
+            if old["token"][key] != new["token"][key]:
+                diffs.append(f"token {key}: {old['token'][key]} vs {new['token'][key]}")
+    for key in ("anon|testserver", "wrong|testserver", "token|testserver"):
+        n += 1
+        if old["full_stack"][key] != new["full_stack"][key]:
+            diffs.append(f"full stack {key}: {old['full_stack'][key]} vs {new['full_stack'][key]}")
+    if diffs:
+        return "FAIL", f"{len(diffs)}/{n} differ: " + "; ".join(diffs[:5])
+    return "PASS", (f"{n}/{n} route-layer decisions (valid Hosts, anonymous and token, public paths, "
+                    f"full stack) identical to the pre-change tree")
+
+
+def case_w17():
+    base = _route_base()
+    if base is None:
+        return "SKIP", f"{ENV_ROUTE_BASE} unset"
+    problem = _route_base_problem(base)
+    if problem:
+        return "FAIL", problem
+    old = _run_routes(base)
+    problems = []
+    key = "testserver/health?x=|/v1/advanced/sheet-rows"
+    reached = {site: old["spoof"].get(f"{site}|{key}") for site in ROUTE_SITES}
+    not_spoofed = [site for site, got in reached.items() if got is not True]
+    if not_spoofed:
+        problems.append(f"base not spoofed at {not_spoofed}")
+    w14, w14_detail = case_w14(old)
+    w19, _ = case_w19(old)
+    if w14 != "FAIL":
+        problems.append("W14 did not FAIL on the base")
+    if w19 != "FAIL":
+        problems.append("W19 did not FAIL on the base")
+    fs = old["full_stack"].get("anon|testserver/health?x=")
+    if not fs or fs[0] != 200:
+        problems.append(f"base real app did not serve /v1/config/settings to the crafted Host: {fs}")
+    if problems:
+        return "FAIL", "; ".join(problems)
+    per_site = {site: sum(1 for k, v in old["spoof"].items() if k.startswith(site + "|") and v is True)
+                for site in ROUTE_SITES}
+    return "PASS", (f"base: Host 'testserver/health?x=' passes all {len(ROUTE_SITES)} auth functions and the "
+                    f"real app (wall dropped) serves /v1/config/settings {fs[0]} to it; W14 FAILs there "
+                    f"({w14_detail.split('; per site')[0]}; per site of {len(old['spoof']) // len(ROUTE_SITES)} "
+                    f"crafted: {per_site}) and W19 FAILs")
+
+
+def case_w18():
+    base = _route_base()
+    if base is None:
+        return "SKIP", f"{ENV_ROUTE_BASE} unset"
+    problem = _route_base_problem(base)
+    if problem:
+        return "FAIL", problem
+
+    def defs(path):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        return {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    bad, nb, nd = [], 0, 0
+    for rel in ROUTE_FILES:
+        b, d = defs(base / rel), defs(ROOT / rel)
+        nb, nd = nb + len(b), nd + len(d)
+        removed, added = sorted(b - d), sorted(d - b)
+        if removed or added != [ROUTE_HELPER]:
+            bad.append(f"{rel}: removed {removed}, added {added}")
+    if bad:
+        return "FAIL", "; ".join(bad)
+    return "PASS", f"{len(ROUTE_FILES)} modules, {nb} -> {nd} defs: 0 removed, added {ROUTE_HELPER} in each"
+
+
+def case_w19(res=None):
+    res = res or _run_routes(ROOT)
+    fs = res["full_stack"]
+    bad = []
+    if fs["wall_active"]:
+        bad.append("wall still active with TFB_GLOBAL_AUTH_ENFORCE=0")
+    for host in ["testserver"] + FULL_STACK_HOSTS:
+        if not _route_401(fs[f"anon|{host}"]):
+            bad.append(f"anon Host={host!r} -> {fs[f'anon|{host}'][0]}")
+    if not _route_401(fs["wrong|testserver"]):
+        bad.append(f"wrong token -> {fs['wrong|testserver'][0]}")
+    for key in ("token|testserver", "token|testserver/health?x="):
+        if fs[key][0] != 200:
+            bad.append(f"{key} -> {fs[key][0]}")
+    if bad:
+        return "FAIL", "; ".join(bad)
+    return "PASS", (f"wall dropped: /v1/config/settings gives the route's own 401 to a normal Host and "
+                    f"{len(FULL_STACK_HOSTS)} crafted Hosts, 401 to a wrong token, 200 to a valid one")
+
+
 CASES = (
     ("W1 v8.14.5, helpers present, no request.url reads", case_w1),
     ("W2 anonymous protected requests get 401", case_w2),
@@ -709,6 +1167,12 @@ CASES = (
     ("W11 unparseable Host fails closed without a crash", case_w11),
     ("W12 golden negative on the base", case_w12),
     ("W13 zero removals against the base", case_w13),
+    ("W14 route-layer auth refuses crafted Hosts", case_w14),
+    ("W15 route-layer valid-Host identity (in process)", case_w15),
+    ("W16 route-layer dual-tree identity against the base", case_w16),
+    ("W17 route-layer golden negative on the base", case_w17),
+    ("W18 route-layer zero removals against the base", case_w18),
+    ("W19 full stack with the wall dropped", case_w19),
 )
 
 
@@ -734,7 +1198,7 @@ def main() -> int:
         failed += status == "FAIL"
         skipped += status == "SKIP"
     ran = passed + failed
-    note = f" ({skipped} skipped: {ENV_BASE} unset)" if skipped else ""
+    note = f" ({skipped} skipped: {ENV_BASE} or {ENV_ROUTE_BASE} unset)" if skipped else ""
     if failed:
         print(f"FAIL {failed}/{ran} (PASS {passed}/{ran}){note}")
         return 1

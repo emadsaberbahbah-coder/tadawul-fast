@@ -2,12 +2,29 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.3  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.4  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+v4.8.4 (2026-10-13, SECURITY): _auth_passed reads the routed path. It
+matched _is_public_path, and built the path it hands to auth_ok, from
+request.url.path, which Starlette 0.41.3 re-parses from
+f"{scheme}://{Host header}{scope['path']}" while the router dispatches on
+scope["path"]. A crafted Host such as "x/health?x=" made url.path read
+"/health" for a request routed to /v1/analysis/sheet-rows, so with
+REQUIRE_AUTH on and no token _auth_passed returned True. main.py v8.14.5's
+global wall answers such a request with 401 first, but with
+TFB_GLOBAL_AUTH_ENFORCE falsy this layer is the only check. FIX: new
+_request_scope_path(request) (the ASGI scope path, root_path included; ""
+without a scope, which matches no built-in public path). INERT FOR VALID
+TRAFFIC: a valid Host cannot contain "/", "?" or "#", so url.path equals
+scope["path"] byte for byte and every decision is unchanged
+(tests/test_auth_wall_scope_path.py W14-W18). No ENV gate. The health
+payload's "path" field is an echo only and keeps request.url.path. Functions
+added 1 (_request_scope_path), removed 0. Rollback: git revert.
 
 v4.8.3: raw symbol fallback rows cross the engine's shared strict publication
 boundary before serialization. Internal tuple and margin evidence survives
@@ -378,7 +395,9 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.3"
+# v4.8.4 (2026-10-13, SECURITY): _auth_passed reads the ASGI scope path,
+# not the Host-derived request.url.path (see the module docstring).
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.4"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -1001,6 +1020,26 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
     return auth_token
 
 
+def _request_scope_path(request: Any) -> str:
+    """v4.8.4 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" (no scope path) matches no built-in
+    public path, so such a request still needs a token (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorization: Optional[str]) -> bool:
     if auth_ok is None:
         return True
@@ -1009,7 +1048,8 @@ def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorizat
             return True
     except Exception:
         pass
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    # v4.8.4: the routed (scope) path, never the Host-derived request.url.path.
+    path = _request_scope_path(request)
     if _is_public_path(settings, path):
         return True
     headers_dict = dict(request.headers)

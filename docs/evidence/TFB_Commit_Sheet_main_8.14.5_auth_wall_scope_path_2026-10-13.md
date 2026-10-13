@@ -1,6 +1,6 @@
 # TFB Commit Sheet - main.py 8.14.5: the global auth wall decides on the routed path (SECURITY)
 
-Date: 2026-10-13 (Tuesday). Base: branch claude/auth-path-scope-2026-10-13 at 0fc8d6c0 (the stacked dt10-cohort-binding head: main.py 8.14.4, ci.yml v1.1.17, verify_deployment 1.0.58). main.py was also compared against dda1211 (8.14.3), whose wall code is identical. Lane: Render/Python service entrypoint, plus one verifier pin, one CI enrolment and one new harness. main.py 8.14.4 -> 8.14.5, verify_deployment 1.0.58 -> 1.0.59, ci.yml v1.1.17 -> v1.1.18.
+Date: 2026-10-13 (Tuesday). Base: branch claude/auth-path-scope-2026-10-13 at 0fc8d6c0 (the stacked dt10-cohort-binding head: main.py 8.14.4, ci.yml v1.1.17, verify_deployment 1.0.58). main.py was also compared against dda1211 (8.14.3), whose wall code is identical. Lane: Render/Python service entrypoint, plus one verifier pin, one CI enrolment and one new harness. main.py 8.14.4 -> 8.14.5, verify_deployment 1.0.58 -> 1.0.59, ci.yml v1.1.17 -> v1.1.18. A review-fix follow-up commit on top of 9a73f48c (the 8.14.5 commit) closes the same hole in the route-layer auth: see Review fixes at the end.
 
 ## Why
 
@@ -176,14 +176,14 @@ Framework:
 - Starlette's redirect_slashes builds its Location from the Host header (`URL(scope=redirect_scope)`). That only reflects the caller's own Host back to the caller. With the wall up, an anonymous caller gets the wall's 401 before the router can redirect.
 - `--forwarded-allow-ips "*"` in scripts/start_web.sh lets any client set X-Forwarded-For/Proto. Nothing in main.py or routes/ keys on client IP or scheme.
 
-routes/, NOT changed here (follow-up), all reading `getattr(request.url, "path")`:
+routes/, NOT changed in the 8.14.5 commit, all reading `getattr(request.url, "path")` there. The review-fix follow-up commit fixes the five mounted modules and core/config.py (see Review fixes); the three unmounted modules are unchanged:
 - routes/investment_advisor.py `_auth_passed` (L1214-1218) and its `_is_public_path`, which includes /v1/advanced, /v1/advanced/health, /meta and /metrics.
 - routes/analysis_sheet_rows.py `_auth_passed` (L1012-1013).
 - routes/advanced_analysis.py `_auth_passed` (L2246, passed as `path` to core.config.auth_ok).
 - routes/config.py `_auth_ok` (L322).
 - routes/enriched_quote.py `_Service.auth_guard` (L1005).
-- routes/data_dictionary.py (L515, L530) and routes/routes_argaam.py (L336): optional modules.
-- routes/advanced_sheet_rows.py (L823-824): not mounted.
+- routes/data_dictionary.py (L515, L530) and routes/routes_argaam.py (L336): optional modules, not mounted (main.py mounts only `_CONTROLLED_ROUTE_PLAN`). Unchanged by the follow-up.
+- routes/advanced_sheet_rows.py (L823-824): not mounted. Unchanged by the follow-up.
 - core/config.py auth_ok reads `request.url.path` first (L2002) when no path is given.
 - routes/advisor.py passes no path, so it cannot be spoofed.
 
@@ -191,7 +191,7 @@ With the wall up, none of these is reachable by an anonymous caller after this c
 
 ## Known limits
 
-- The route layer stays Host-spoofable. Only the wall protects business routes from a crafted Host. With TFB_GLOBAL_AUTH_ENFORCE falsy, REQUIRE_AUTH on and OPEN_MODE off, the per-route auth is the only check, and on the base it let a crafted Host through to /v1/advanced/sheet-rows. Treat the kill switch as an emergency control until the route follow-up lands.
+- With the 8.14.5 commit alone the route layer stays Host-spoofable: only the wall protects business routes from a crafted Host. With TFB_GLOBAL_AUTH_ENFORCE falsy, REQUIRE_AUTH on and OPEN_MODE off, the per-route auth is the only check, and on the base it let a crafted Host through to /v1/advanced/sheet-rows. The review-fix follow-up commit closes this for the five mounted modules and core.config (see Review fixes). Dropping the wall still opens the wall-only routes (Evidence 3: 33 signatures, POST /v1/advanced included) to anonymous callers, so the kill switch stays an emergency control.
 - Render's edge was not tested. Whether the edge forwards a Host such as `x/health?x=` to the service is unknown: no request was sent to Render.
 - The harness proves the decision against Starlette 0.41.3, the production pin. `_scope_route_path` is a local copy of `get_route_path`. W8 compares it with Starlette's function and reports, without failing, when that function is unavailable, as it would be in an unpinned future stack.
 - W9, W12 and W13 need a pre-change copy and skip in CI, like every other golden negative in this repo.
@@ -203,10 +203,137 @@ With the wall up, none of these is reachable by an anonymous caller after this c
 2. After Render deploys, check with one GET /health that entry_version reads 8.14.5 and global_auth_enforcement reads true. Run verify_deployment: main 8.14.5 should report OK; until the deploy lands it reports BEHIND, the normal manifest-ahead state.
 3. Do not test the bypass against production from a browser or script. The harness is the acceptance test.
 4. Keep TFB_GLOBAL_AUTH_ENFORCE unset (or truthy). See Known limits.
-5. Rollback: `git revert` this commit. main.py returns to 8.14.4, verify_deployment to 1.0.58 and ci.yml to v1.1.17, and the harness is removed. Rolling back reopens the bypass.
+5. Rollback: `git revert` this commit. main.py returns to 8.14.4, verify_deployment to 1.0.58 and ci.yml to v1.1.17, and the harness is removed. Rolling back reopens the bypass. Revert the review-fix follow-up commit first (see Review fixes).
 
 ## Owner decisions
 
-- Fix the route layer: the five mounted modules plus core/config.py `auth_ok` should read the scope path, with version bumps, verifier pins and a golden negative of their own. This commit deliberately stays main.py-only.
+- Fix the route layer: the five mounted modules plus core/config.py `auth_ok` should read the scope path, with version bumps, verifier pins and a golden negative of their own. This commit deliberately stays main.py-only. Done in the review-fix follow-up commit (see Review fixes).
 - Whether routes/investment_advisor should keep "/v1/advanced" (POST runs the Top-10 build) on its route-level public list. It is protected only by the wall today.
 - Whether to ask Render support (or test on a staging service) whether the edge forwards Host values that contain "/", "?" or "#".
+
+## Review fixes (follow-up commit, 2026-10-13)
+
+Base: 9a73f48c, the 8.14.5 commit above and the branch head before this fix (its routes/ and core/ are identical to 0fc8d6c0). Lane: route-layer auth and core.config, one verifier pin pair, two in-place test pins and harness 1.1.0. main.py and ci.yml are not changed.
+
+### Finding (minor): the route-layer auth still read the Host-derived path
+
+Re-verified offline on 9a73f48c. The auth functions were called directly (no handler ran), with REQUIRE_AUTH on and no token:
+
+    Host 'testserver'             -> investment_advisor False, analysis_sheet_rows False, advanced_analysis False, config False
+    Host 'testserver/health?x='   -> all four True; enriched_quote.auth_guard lets it through; core.config.auth_ok(request=) True
+    Host 'h/livez#', 'h/static?', 'h/v1/advanced/health?' -> all four True
+
+End to end on the 9a73f48c tree, with the wall dropped by the documented kill switch (TFB_GLOBAL_AUTH_ENFORCE=0), the real app answered GET /v1/config/settings (the masked settings; no engine, no provider) with 200 to an anonymous request with Host 'testserver/health?x=' and to five other crafted shapes. A normal Host got the route's 401. With the wall up the full stack answers every crafted Host with the wall's 401 (W3), so 8.14.5 alone is not exploitable in the production posture. The finding is real; this commit fixes it.
+
+The finding's second point is also confirmed: routes/investment_advisor `_is_public_path` lists "/v1/advanced" as public even with a normal Host. It is not changed here:
+- It is a route-level policy, not a Host defect.
+- With the wall up, an anonymous /v1/advanced gets the wall's 401 (it is not an exempt path).
+- Removing it changes what a tokenless caller gets when the wall is dropped. It stays an owner decision (Owner decisions, second bullet).
+
+### What changed
+
+Six modules now read the ASGI scope path at their auth site instead of `getattr(request.url, "path")`:
+
+- routes/investment_advisor.py 2.18.0 -> 2.18.1: `_auth_passed` (public-path check and the path handed to auth_ok). The stale v2.17.0 title now reads v2.18.1.
+- routes/analysis_sheet_rows.py 4.8.3 -> 4.8.4: `_auth_passed`.
+- routes/advanced_analysis.py 4.18.1 -> 4.18.2: `_auth_passed` (the path handed to core.config.auth_ok). A new top banner carries the WHY, as tests/test_learning_guards.py reads the first title line; the v4.18.1 banner follows it.
+- routes/config.py 5.9.0 -> 5.9.1: `_auth_ok`.
+- routes/enriched_quote.py 8.5.1 -> 8.5.2: `_Service.auth_guard`.
+- core/config.py 5.8.0 -> 5.8.1: `auth_ok`, the request fallback used when a caller passes a request but no path. An explicit path is used exactly as before. `Mapping` joins its typing import.
+
+Each module gets:
+- a dated WHY in its docstring;
+- a comment at its version constant;
+- a module-level `_request_scope_path(request)`, the same helper as main.py's. It returns the ASGI scope path, or "" when the request carries no scope. "" matches no built-in public path, so such a request still needs a token.
+
+The value is the full scope path, root_path included, which is exactly what request.url.path held for a valid Host. The route layer has no root_path step to mirror, so none is added. The helper is copied into each module, not imported, so no route module gains an import dependency.
+
+Other files:
+- scripts/verify_deployment.py 1.0.59 -> 1.0.60 (dated WHY) pins advanced_analysis 4.18.2 and analysis_sheet_rows 4.8.4. The other four modules are not in MODULES. No entry was added and no verifier logic changed.
+- tests/test_analysis_sheet_rows_rank_withheld.py (R3) and tests/test_core_repair_tiny_quotes.py (`ROUTE`): the analysis_sheet_rows pin moves 4.8.3 -> 4.8.4 in place, with a dated comment. The tiny-quote CLI compares that fixture with the source constant, so without the move its tiny-readback subtest failed ("AssertionError: 1 != 0", found by the related-suite run).
+- tests/test_auth_wall_scope_path.py 1.0.0 -> 1.1.0 adds W14-W19 (below). core.config's token-list and protected-path ENV names join the dropped ENV list, so a developer shell cannot change the answers.
+- Not changed: main.py and ci.yml. The harness already runs in the contract job, and the push paths already cover routes/** and core/**.
+
+### Why it is inert for valid traffic (no ENV gate)
+
+The proof is the same as for the wall. A valid Host cannot contain "/", "?" or "#", so request.url.path equals scope["path"] byte for byte, and the path is the only input that changed.
+- W15 checks each of the six helpers against request.url.path for 111,936 valid-Host requests. It is always on.
+- W16 compares 11,451 route-layer decisions with the 9a73f48c tree: valid Hosts, anonymous and with a token, public paths and the full stack.
+
+An off switch would only keep the bypass available, so there is no ENV gate.
+
+Not changed, with the reason:
+- The "path" fields of the analysis_sheet_rows and advanced_analysis health and provider-health payloads are echoes to the caller and decide nothing.
+- routes/data_dictionary.py, routes/routes_argaam.py and routes/advanced_sheet_rows.py are not mounted: main.py mounts only `_CONTROLLED_ROUTE_PLAN`, and `_OPTIONAL_ROUTE_MODULES` only affects failure accounting. They keep request.url.path. A future mount should take the same helper.
+- routes/advisor.py passes no path or request, so it cannot be spoofed.
+
+### Harness 1.1.0 cases
+
+- W14: the six auth sites are called directly. They refuse anonymous protected requests with a normal Host and with 896 crafted Host shapes per site, built on every public path any layer knows. A valid token passes with a normal or a crafted Host, and a wrong token is refused.
+- W15: identity, always on. The helper equals request.url.path for valid Hosts and returns "" without a scope. There is no request.url read in the six auth functions (AST check). The versions and verify_deployment pins match.
+- W16 [TFB_ROUTE_AUTH_BASE]: dual-tree identity.
+- W17 [TFB_ROUTE_AUTH_BASE]: golden negative. On the base a crafted Host passes all six sites, and the real app (wall dropped) serves /v1/config/settings with 200. W14 and W19 FAIL there.
+- W18 [TFB_ROUTE_AUTH_BASE]: zero removals.
+- W19: full stack with the wall dropped. /v1/config/settings gives the route's own 401 to a normal Host and to six crafted Hosts, 401 to a wrong token and 200 to a valid one.
+
+### Measured results
+
+B = `git show 0fc8d6c0:main.py` (as above). T = `git archive 9a73f48c` extracted to <scratchpad>/build/auth-path/fix/base_tree_9a73f48c.
+
+`python tests/test_auth_wall_scope_path.py` (no base) ends with:
+
+    PASS W14 route-layer auth refuses crafted Hosts | 5596/5596 route-layer decisions right: 5376 crafted-Host requests refused at all 6 sites; a token passes with normal and crafted Hosts
+    PASS W15 route-layer valid-Host identity (in process) | 111936 valid-Host requests over 6 modules: scope path == url.path; no-scope objects give ''; no request.url read in the six auth functions; versions and verify_deployment pins match
+    SKIP W16 / W17 / W18 | TFB_ROUTE_AUTH_BASE unset
+    PASS W19 full stack with the wall dropped | wall dropped: /v1/config/settings gives the route's own 401 to a normal Host and 6 crafted Hosts, 401 to a wrong token, 200 to a valid one
+    PASS 13/13 (6 skipped: TFB_AUTH_WALL_BASE or TFB_ROUTE_AUTH_BASE unset)
+
+`TFB_AUTH_WALL_BASE=$B TFB_ROUTE_AUTH_BASE=$T python tests/test_auth_wall_scope_path.py` gives `PASS 19/19`. Its W16 to W18 lines:
+
+    PASS W16 route-layer dual-tree identity against the base | 11451/11451 route-layer decisions (valid Hosts, anonymous and token, public paths, full stack) identical to the pre-change tree
+    PASS W17 route-layer golden negative on the base | base: Host 'testserver/health?x=' passes all 6 auth functions and the real app (wall dropped) serves /v1/config/settings 200 to it; W14 FAILs there (2572/5596 route-layer decisions wrong, 2500 crafted-Host requests passed; per site of 896 crafted: investment_advisor 468, analysis_sheet_rows 496, advanced_analysis 384, config 384, enriched_quote 384, core.config 384) and W19 FAILs
+    PASS W18 route-layer zero removals against the base | 6 modules, 463 -> 469 defs: 0 removed, added _request_scope_path in each
+
+The same run with the dda1211 main.py and the 0fc8d6c0 tree also gives `PASS 19/19`.
+
+The new cases evaluated directly on T:
+- W14 FAIL, as above.
+- W15 FAIL: 20 problems, e.g. "INVESTMENT_ADVISOR_VERSION '2.18.0' != '2.18.1'", "has no module-level _request_scope_path" and "_auth_passed reads getattr(..., 'url') at line 1214".
+- W19 FAIL: "anon Host='testserver/health?x=' -> 200; anon Host='h/livez#' -> 200; anon Host='h/static?' -> 200; anon Host='h/v1/advanced/health?' -> 200; anon Host='testserver/?x=' -> 200; anon Host='u@h/readyz?' -> 200".
+
+Under pytest: "13 passed, 6 skipped in 20.99s"; with both bases, "19 passed in 39.56s".
+
+Related suites: 24 files, all with every proxy variable at 127.0.0.1:9 and NO_PROXY=127.0.0.1,localhost.
+- Files: every test that imports a changed module, main or verify_deployment, plus the route, redaction, schema, health, CI-verdict and workflow-audit suites.
+- Result: "327 passed, 13 skipped, 74 subtests passed".
+- Script mode: `tests/test_verify_manifest_pins.py` "[MANIFEST PIN GUARD] 3/3 PASS"; `tests/test_analysis_sheet_rows_rank_withheld.py` "RESULT PASS 4/4 route 4.8.4"; `tests/test_adv_typeerror_retry_p130.py` "T1-T6 PASS | module version 2.18.1".
+
+CI lists, extracted from ci.yml by yaml.safe_load and run locally with the pinned stack (Python 3.11.17, FastAPI 0.115.14, Starlette 0.41.3, Node 22):
+- Contract job: "252 passed, 8 skipped in 72.80s". On the 9a73f48c tree it gave "249 passed, 5 skipped"; the difference is W14, W15 and W19 passing and W16 to W18 skipping.
+- Lean job: all 11 steps rc 0. The main pytest step gives "3525 passed, 18 skipped, 162 subtests passed"; tests/test_learning_guards.py is in it and reads the advanced_analysis title.
+
+Whole suite: `python -m pytest -q tests` (proxies at 127.0.0.1:9, NO_PROXY=127.0.0.1,localhost) gives "4879 passed, 34 skipped, 3 warnings, 243 subtests passed in 475.87s". There are no failures. The three loopback suites listed under Whole suite pass with that NO_PROXY.
+
+Static checks:
+- `py_compile` of the six modules, verify_deployment and the harness: clean.
+- `ruff 0.16.8 check --select E9,F63,F7,F82 .`: "All checks passed!".
+- `ruff check --select F,E9` on the six modules and the harness: "All checks passed!".
+- `python scripts/render_env_contract.py --check`: "OK ... is current".
+
+Zero removals: W18 counts 463 -> 469 defs in the six modules, with 0 removed. The 26 deleted code lines are all replaced in place:
+- six title versions and six version constants;
+- six path reads and core.config's typing import;
+- SCRIPT_VERSION and the two verifier pins;
+- the two test pins;
+- HARNESS_VERSION and one harness summary line.
+
+ASCII: every added line is ASCII except two kinds of in-place change, where only digits changed:
+- the six module title lines, whose em dash already existed (only the version digits changed);
+- the SCRIPT_VERSION line, whose trailing history comment is carried over unchanged, as in 1.0.59.
+
+### Operator steps for the follow-up
+
+1. Merge the follow-up together with the 8.14.5 commit. No ENV change is needed.
+2. After Render deploys, verify_deployment should report advanced_analysis 4.18.2 and analysis_sheet_rows 4.8.4 OK (BEHIND until the deploy lands).
+3. The route layer is no longer Host-spoofable. Dropping the wall still opens the wall-only routes to anonymous callers, so TFB_GLOBAL_AUTH_ENFORCE stays an emergency control (Known limits).
+4. Rollback: `git revert` the follow-up commit. The six modules, verify_deployment, the two test pins and the harness return to their 8.14.5-commit state, and the wall fix stays. Revert the 8.14.5 commit after it only if the wall itself must go.
