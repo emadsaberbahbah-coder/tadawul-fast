@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.15 (2026-10-13) -- P0-6 PORTFOLIO RESEARCH VIEW HARNESS
+#
+# v1.1.15: require the portfolio_actions 1.16.0 research-view harness
+# (tests/test_pf_research_view_p06.py; TFB_PF_RESEARCH_VIEW default off) in
+# the blocking lean lane. It pins and restores its own policy env per build,
+# so it shares the lean process. Its golden negative needs TFB_TEST_PA_BASE
+# and skips in CI. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.14 (2026-10-13) -- AUDITED DECISION-FEED RELEASE (P0-1)
 #
 # v1.1.14: require the P0-1 decision-feed release harness
@@ -489,6 +497,7 @@ jobs:
             tests/test_execution_accounting.py \
             tests/test_portfolio_reconciliation.py \
             tests/test_portfolio_action_reconciliation.py \
+            tests/test_pf_research_view_p06.py \
             tests/test_portfolio_exact_funding.py \
             tests/test_portfolio_reconciliation_cli.py \
             tests/test_ob_quote_evidence.py \
