@@ -20,7 +20,7 @@ concurrency:
 jobs:
   collect-name-identity:
     if: ${{ inputs.name_identity_evidence }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: production
     steps:
@@ -55,7 +55,7 @@ jobs:
           if-no-files-found: error
   readback:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v6
@@ -64,15 +64,21 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # 2026-10-13 (P0-6, readback 1.2.0; 1.2.1 requires enforce amounts): declare the portfolio research view
+      # mode armed on Render (TFB_PF_RESEARCH_VIEW). Unset Variable = off =
+      # the previous probe exactly. Set the Variable only after arming the
+      # same mode on Render; enforce needs this declaration or it fails.
       - name: Verify deployed SHA, authenticated signing and empty allocation
         env:
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           EXPECTED_COMMIT: ${{ github.sha }}
           WORKFLOW_SOURCE_SHA: ${{ github.sha }}
           TINY_QUOTE_READBACK: ${{ inputs.tiny_quote_readback }}
+          TFB_PF_RESEARCH_VIEW_EXPECT: ${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'off' }}
         run: |
           set -euo pipefail
-          args=(--expected-commit "$EXPECTED_COMMIT" --workflow-source-sha "$WORKFLOW_SOURCE_SHA")
+          args=(--expected-commit "$EXPECTED_COMMIT" --workflow-source-sha "$WORKFLOW_SOURCE_SHA"
+                --expect-pf-research-view "$TFB_PF_RESEARCH_VIEW_EXPECT")
           if [ "$TINY_QUOTE_READBACK" = "true" ]; then
             args+=(--tiny-quote-readback)
           fi

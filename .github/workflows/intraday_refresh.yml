@@ -112,7 +112,7 @@ permissions:
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A refresh that cannot finish inside the gate window is worthless; fail
     # fast rather than pile up against the next scheduled tick.
     timeout-minutes: 8

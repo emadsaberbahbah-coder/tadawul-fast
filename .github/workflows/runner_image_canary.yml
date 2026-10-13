@@ -1,0 +1,124 @@
+name: Runner image canary (manual)
+
+# VERSION 1.0.0 (2026-10-13) -- NEW, MANUAL-ONLY RUNNER IMAGE CANARY
+# WHY (2026-10-13): GitHub is moving the ubuntu-latest label to a newer Ubuntu
+# image (26.04) from 19 Oct 2026, so every workflow is now pinned to
+# ubuntu-24.04 (ci.yml v1.1.13). Un-pinning needs evidence that the new image
+# still runs this repository. This workflow is that evidence, and nothing
+# else: it runs only when the owner dispatches it, on the image the owner
+# picks, and it checks what the production lanes rely on from the image:
+#   - the exact daily_sync preflight tool check (system curl, jq, python3,
+#     pip3; scheduled syncs fail at preflight if any is missing),
+#   - the reported Ubuntu release equals the requested label,
+#   - the image's node (lean-unit and several Python tests start it),
+#   - actions/setup-python 3.11 exists for that Ubuntu release,
+#   - requirements.txt installs, compileall passes, and a handful of fast
+#     offline tests from the blocking lean list pass.
+# It needs no secrets, writes nothing, and never touches the workbook.
+# CONCURRENCY: its own group (never ci-*, never the production write lease),
+# so a canary can neither cancel nor be cancelled by CI or a sync.
+# INPUTS reach run blocks only through env (no expression inside run).
+# ROLLBACK: delete this file together with tests/test_runner_pin_ubuntu2404.py
+# and that harness's line in ci.yml's lean list (the harness requires this
+# file; this file runs the harness). Keep every runs-on on ubuntu-24.04: from
+# 19 Oct 2026 ubuntu-latest is the new image (see ci.yml v1.1.13 ROLLBACK).
+# The harness (P3) also forbids a job-level concurrency here and allows an
+# inputs expression only in env values, runs-on and the workflow group.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_image:
+        description: 'Runner image label to test (ubuntu-26.04 is the candidate; ubuntu-24.04 is the current pin, as a control)'
+        type: choice
+        options:
+          - ubuntu-26.04
+          - ubuntu-24.04
+        default: ubuntu-26.04
+
+concurrency:
+  group: runner-image-canary-${{ inputs.runner_image }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Runner image canary
+    runs-on: ${{ inputs.runner_image || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate runner environment (daily_sync preflight, verbatim)
+        id: validate
+        run: |
+          set -euo pipefail
+          echo "::group::System Information"
+          echo "OS: $(uname -a)"
+          df -h /
+          free -h || true
+          echo "::endgroup::"
+
+          MISSING_TOOLS=()
+          for tool in curl jq python3 pip3; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              MISSING_TOOLS+=("$tool")
+            fi
+          done
+
+          if [ ${#MISSING_TOOLS[@]} -ne 0 ]; then
+            echo "::error::Missing required tools: ${MISSING_TOOLS[*]}"
+            exit 1
+          fi
+
+          echo "validated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm the runner is the requested Ubuntu release
+        env:
+          REQUESTED_IMAGE: ${{ inputs.runner_image || 'ubuntu-24.04' }}
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          echo "requested=${REQUESTED_IMAGE} os=${PRETTY_NAME} ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          if [ "ubuntu-${VERSION_ID}" != "${REQUESTED_IMAGE}" ]; then
+            echo "::error::runner reports ubuntu-${VERSION_ID}, requested ${REQUESTED_IMAGE}"
+            exit 1
+          fi
+
+      - name: Image tool versions (node, jq, curl, system python3/pip3)
+        run: |
+          set -euo pipefail
+          node --version
+          jq --version
+          curl --version | sed -n 1p
+          python3 --version
+          pip3 --version
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install production pins and pytest
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: compileall (main.py, core, routes, scripts)
+        run: python -m compileall -q main.py core routes scripts
+
+      - name: Fast offline tests from the blocking lean list
+        run: |
+          python -m pytest -q \
+            tests/test_runner_pin_ubuntu2404.py \
+            tests/test_ci_required_verdict.py \
+            tests/test_executable_quote_conflicts.py \
+            tests/test_stats.py \
+            tests/test_quality_gates.py \
+            tests/test_verify_manifest_pins.py
+
+      - name: Apps Script syntax harness (image node)
+        run: node tests/js/apps_script_syntax.test.js

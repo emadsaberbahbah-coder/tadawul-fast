@@ -1,5 +1,7 @@
 name: Dependency and typed-module review (advisory)
 
+# VERSION 1.0.1 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
+# WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.0 (2026-10-11, WP-12)
 # WHY: the 2026-10-10 brief found exact dependency pins but no CVE review or
 # typed baseline. These read-only checks are advisory while their baseline is
@@ -17,7 +19,7 @@ permissions:
 
 jobs:
   dependencies:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     continue-on-error: true
     steps:
@@ -32,7 +34,7 @@ jobs:
           python -m pip install 'pip-audit==2.9.0'
           pip-audit --requirement requirements.txt --no-deps --disable-pip
   typed-baseline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     continue-on-error: true
     steps:

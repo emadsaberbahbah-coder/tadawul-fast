@@ -1,5 +1,7 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.2 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
+# WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
 # Historical maturity auditing requires explicit manual opt-in; schedules
 # keep recording/analyzing/exporting with old-grid publication disabled.
@@ -146,7 +148,7 @@ env:
 jobs:
   performance-clock:
     name: 📈 Record · Audit · Calibrate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 45
 

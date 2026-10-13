@@ -22,6 +22,8 @@ name: "📋 TFB Board Scorecard"
 # script anyway (manual dispatch during a session is safe).
 # ROLLBACK: delete this file (or set TFB_BOARD_SCORECARD: "off"). The v0.1.0
 # ticket path of the script does not depend on any of this.
+# v1.0.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
+# ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # ============================================================================
 
 on:
@@ -49,7 +51,7 @@ permissions:
 
 jobs:
   scorecard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}

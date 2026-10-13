@@ -1,5 +1,11 @@
 name: 🧯 Page Refresh Recovery
 
+# (2026-10-13) P0-1 SUPERSEDE AT WRITER START (Codex P1 on PR #763): the
+# recover-page job gains ONE step, 'Supersede released decision feed (P0-1)',
+# after its credentials step and before its page write, gated on
+# vars.TFB_DECISION_RELEASE (unset: skipped, nothing else moves). This file has
+# no VERSION header, so none is invented here; the WHY is on the step.
+
 on:
   pull_request:
     paths:
@@ -56,7 +62,7 @@ jobs:
   regression-tests:
     name: Test page refresh recovery
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -91,7 +97,7 @@ jobs:
   plan:
     name: Plan missing page refreshes
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # A successful write can still contain last-good rows retained after an
     # incomplete fetch. Keep the planner on the same 95% fresh-data contract as
@@ -164,7 +170,7 @@ jobs:
     name: Recover ${{ matrix.page }}
     needs: plan
     if: ${{ needs.plan.outputs.needs_recovery == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 115
     strategy:
@@ -307,6 +313,26 @@ jobs:
           [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
+      # (2026-10-13) P0-1 SUPERSEDE AT WRITER START (Codex P1 on PR #763).
+      # WHY: this job re-runs run_dashboard_sync.py, which re-stamps the page
+      # with THIS recovery run's id, so a released EXECUTABLE for an older run
+      # must not survive into the recovered cohort. Before the page write
+      # below, scripts/release_decision_feed.py --mode supersede downgrades any
+      # feed a consumer would read as EXECUTABLE through the unchanged
+      # finalize.publish_blocker. Gated on the release variable (armed words
+      # 1/true/yes/on, case-insensitive): unset or any other value skips this
+      # step and nothing else moves. FAIL CLOSED: a fault exits 3 and fails
+      # this step, so the page write is skipped.
+      - name: Supersede released decision feed (P0-1)
+        if: ${{ contains(fromJSON('["1","true","yes","on"]'), vars.TFB_DECISION_RELEASE) && github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python scripts/release_decision_feed.py --mode supersede \
+            --current-run "$GITHUB_RUN_ID" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --json-out "$RUNNER_TEMP/release_decision_feed_supersede.json"
+
       - name: Check backend health
         run: |
           set -euo pipefail
@@ -383,7 +409,7 @@ jobs:
         needs.plan.result == 'success' &&
         needs.plan.outputs.needs_recovery == 'true'
       }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every targeted page retry to pass
         env:

@@ -28,7 +28,7 @@ concurrency:
 jobs:
   backtest:
     name: 🧪 Replay the exit rule on the ledger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
