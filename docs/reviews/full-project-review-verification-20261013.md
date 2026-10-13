@@ -23,11 +23,11 @@ live workbook, Render dashboard, repo Variables and mailbox were not read.
 
 ## Built in this change set (all default OFF, nothing armed)
 
-1. Runner pin to `ubuntu-24.04` plus a manual 26.04 canary workflow (before 19 Oct).
-2. P0-1 release step: `scripts/release_decision_feed.py` and a dispatch-only workflow. Dry-run unless `TFB_DECISION_RELEASE=1`.
-3. P0-6 Build 1, portfolio research view: `TFB_PF_RESEARCH_VIEW=off|observe|enforce` in portfolio_actions 1.16.0, with a lockstep in the readback verifier.
+1. PR #762: runner pin to `ubuntu-24.04` plus a manual 26.04 canary workflow (merge before 19 Oct).
+2. PR #763 (stacked on #762): P0-1 release step, `scripts/release_decision_feed.py` and a dispatch-only workflow. Dry-run unless `TFB_DECISION_RELEASE=1`; five arming prerequisites are listed in its commit sheet.
+3. PR #764 (stacked on #763): P0-6 Build 1, portfolio research view, `TFB_PF_RESEARCH_VIEW=off|observe|enforce` in portfolio_actions 1.16.0, with a lockstep in the readback verifier.
 
-Each has its own pull request and commit sheet with arming steps and rollback.
+Merge in that order. Each has a commit sheet with arming steps and rollback. The stacked branch passed the full ci.yml lean list offline (3512 passed, 0 failed).
 
 ## Not built, and why
 
