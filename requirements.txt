@@ -1,7 +1,45 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.3)
+# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.4)
 # ============================================================================
-# WHY this revision (2026-06-11):
+# WHY v1.1.4 (2026-10-13):
+# - SECURITY: the advisory dependency audit (dependency_typing_review.yml,
+#   "pip-audit==2.9.0 --requirement requirements.txt --no-deps
+#   --disable-pip") reported 89 known advisories in 13 pinned packages, and
+#   Render installs exactly these pins. Twelve pins move to the MINIMAL
+#   version that closes their reported advisories AND resolves with every
+#   other pin below on Python 3.11 (uv and pip resolvers; pip check clean).
+#   Same audit afterwards: 8 advisories in 2 packages (see NOT moved).
+#     aiohttp            3.13.5 -> 3.14.3
+#     anyio              4.13.0 -> 4.14.2
+#     cryptography       43.0.3 -> 50.0.0  (49.0.0 itself carries
+#                                           PYSEC-2026-3552, introduced in
+#                                           44.0.0 and fixed in 50.0.0)
+#     h2                 4.3.0  -> 4.4.1
+#     lxml               5.4.0  -> 6.1.0
+#     nltk               3.9.4  -> 3.10.3  (now pulls defusedxml 0.7.1)
+#     protobuf           5.26.1 -> 5.29.6  (stays on 5.x, see below)
+#     pydantic-settings  2.13.1 -> 2.14.2
+#     PyJWT              2.12.1 -> 2.15.0
+#     pyOpenSSL          24.3.0 -> 26.4.0  (26.0.0 caps cryptography <47;
+#                                           26.4.0 is the first release
+#                                           accepting cryptography 50)
+#     python-dotenv      1.0.1  -> 1.2.2
+#     python-multipart   0.0.12 -> 0.0.31
+# - NOT moved, on purpose (advisories left open):
+#     starlette 0.41.3 -- every fix (0.47.2, 0.49.1, 1.0.1, 1.1.0, 1.3.0,
+#       1.3.1) is outside fastapi 0.115.14's "starlette<0.47.0", so it needs
+#       a FastAPI framework upgrade (owner decision). 7 advisories open.
+#     nltk GHSA-8mgp-746c-j5xp -- no fixed release exists (3.10.3 is the
+#       newest nltk). nltk is reserved/unused here. 1 advisory open.
+#     httpcore 1.0.9 -- the audit SKIPS URL requirements ("URL requirements
+#       cannot be pinned to a specific package version"); audited on its own
+#       as httpcore==1.0.9: no known advisories. Pin unchanged.
+# - Guard: tests/test_security_pins_20261013.py (CI lean lane). Evidence:
+#   docs/evidence/TFB_Commit_Sheet_security_pins_2026-10-13.md
+# - NOT default-off: the next Render build installs these libraries.
+#   ROLLBACK: revert this commit; every pin returns to v1.1.3 verbatim.
+#
+# WHY v1.1.3 (2026-06-11):
 # - FIX: Render builds failed with "No matching distribution found for
 #   httpcore==1.0.9" -- pypi.org/simple/httpcore/ (the INDEX page only)
 #   timed out on 10 consecutive retries from Render's CDN edge, while
@@ -17,6 +55,8 @@
 # Carried from v1.1.2:
 # - protobuf 5.26.1 kept for grpcio-status 1.64.3 compatibility
 # - OpenTelemetry family at 1.28.0 / 0.49b0 (protobuf 5.x support)
+#   (v1.1.4: protobuf 5.29.6 is still inside grpcio-status 1.64.3's
+#   ">=5.26.1,<6" and opentelemetry-proto 1.28.0's ">=5.0,<6".)
 #
 # Conventions:
 # - Exact pins (==) everywhere by design: reproducible builds on Render.
@@ -27,18 +67,20 @@
 # Web framework (FastAPI core)
 # ----------------------------------------------------------------------------
 fastapi==0.115.14
+# v1.1.4: starlette HELD at 0.41.3 -- fastapi 0.115.14 requires
+# starlette<0.47.0 and every published fix is >=0.47.2 (see header).
 starlette==0.41.3
 uvicorn[standard]==0.32.1
 gunicorn==23.0.0
-anyio==4.13.0
-python-multipart==0.0.12
+anyio==4.14.2
+python-multipart==0.0.31
 
 # ----------------------------------------------------------------------------
 # Pydantic (models + settings)
 # ----------------------------------------------------------------------------
 pydantic==2.13.2
 pydantic-core==2.46.2
-pydantic-settings==2.13.1
+pydantic-settings==2.14.2
 typing-extensions==4.15.0
 
 # ----------------------------------------------------------------------------
@@ -54,8 +96,9 @@ rapidfuzz==3.14.5
 # ----------------------------------------------------------------------------
 # Security / crypto
 # ----------------------------------------------------------------------------
-cryptography==43.0.3
-pyOpenSSL==24.3.0
+# v1.1.4: moved as a pair -- pyOpenSSL 26.4.0 requires cryptography>=49,<51.
+cryptography==50.0.0
+pyOpenSSL==26.4.0
 
 # ----------------------------------------------------------------------------
 # HTTP clients
@@ -63,10 +106,12 @@ pyOpenSSL==24.3.0
 httpx==0.27.2
 # v1.1.3: direct wheel URL == httpcore 1.0.9 (see header). Satisfies
 # httpx 0.27.2's requirement httpcore>=1.0.0,<2.0.0.
+# v1.1.4: pip-audit skips URL pins; httpcore==1.0.9 audited on its own:
+# no known advisories (see header).
 httpcore @ https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
-h2==4.3.0
+h2==4.4.1
 requests==2.33.1
-aiohttp==3.13.5
+aiohttp==3.14.3
 websockets==13.1
 
 # ----------------------------------------------------------------------------
@@ -86,7 +131,7 @@ py-googletrans==4.0.0
 # ----------------------------------------------------------------------------
 # gRPC / protobuf
 # ----------------------------------------------------------------------------
-protobuf==5.26.1
+protobuf==5.29.6
 grpcio==1.64.3
 grpcio-status==1.64.3
 googleapis-common-protos==1.64.0
@@ -124,7 +169,7 @@ opentelemetry-exporter-otlp==1.28.0
 # ----------------------------------------------------------------------------
 # Config / env file loading
 # ----------------------------------------------------------------------------
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 pyyaml==6.0.3
 
 # ============================================================================
@@ -137,7 +182,7 @@ slowapi==0.1.9
 limits==3.14.1
 
 # --- Auth / passwords --------------------------------------------------------
-PyJWT==2.12.1
+PyJWT==2.15.0
 passlib==1.7.4
 bcrypt==4.3.0
 
@@ -158,9 +203,9 @@ sentry-sdk==2.58.0
 
 # --- Scraping / feeds / NLP (news intelligence) ------------------------------
 beautifulsoup4==4.14.3
-lxml==5.4.0
+lxml==6.1.0
 feedparser==6.0.12
-nltk==3.9.4
+nltk==3.10.3
 
 # --- Async file / cache IO ---------------------------------------------------
 aiofiles==24.1.0

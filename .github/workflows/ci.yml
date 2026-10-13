@@ -2,7 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.12 (2026-10-12) -- FULL TYPED MARKET PAYLOAD EVIDENCE
+# VERSION 1.1.13 (2026-10-13) -- SECURITY PIN FLOORS
+#
+# v1.1.13 (2026-10-13): requirements.txt v1.1.4 moves twelve pins to the
+# minimal versions that close their pip-audit advisories (89 -> 8). WHY: the
+# lean lane now runs tests/test_security_pins_20261013.py, so a later edit
+# cannot silently drop a pin below its fixed version; the contract job's
+# anyio pin follows production (4.13.0 -> 4.14.2) per the v1.0.1 rule that
+# contract deps match requirements.txt exactly. Nothing is removed.
 #
 # v1.1.12: require complete typed final RAW intent digest regressions in lean.
 #
@@ -490,6 +497,7 @@ jobs:
             tests/test_sync_outcome_audit.py \
             tests/test_sync_audit_cancelled_source.py \
             tests/test_verify_manifest_pins.py \
+            tests/test_security_pins_20261013.py \
             tests/test_de_roi12_ceiling_tuple_noise_wp3ab.py \
             tests/test_de_fc_tuple_coherence_p102.py \
             tests/test_de_eq_roi_backfill_sentry_p143.py \
@@ -589,7 +597,7 @@ jobs:
             "httpx==0.27.2" \
             "pydantic==2.13.2" \
             "pydantic-core==2.46.2" \
-            "anyio==4.13.0"
+            "anyio==4.14.2"
 
       - name: 📐 Run schema alignment
         run: |
