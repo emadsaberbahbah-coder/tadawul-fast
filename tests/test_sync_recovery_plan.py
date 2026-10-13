@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from scripts.plan_sync_recovery import PAGE_CONFIG, RECOVERY_ORDER, build_recovery_plan
+from tests.test_final_publication_workflow import job_source, step_source, expression_field
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +69,38 @@ class SyncRecoveryPlanTests(unittest.TestCase):
         ))
         plan = self._plan(text)
         self.assertEqual(plan["retry_pages"], ["Commodities_FX"])
+
+    def test_source_inline_recovery_supersedes_failed_original_leg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "tadawul-sync-logs-123-core-pages"
+            source.mkdir()
+            (source / "sync_execution.log").write_text("".join((
+                self._verdict("Market_Leaders"),
+                self._verdict("Global_Markets", "skipped", 0),
+                self._verdict("Commodities_FX"),
+                self._verdict("Mutual_Funds"),
+            )), encoding="utf-8")
+            self.assertEqual(build_recovery_plan(root)["retry_pages"], ["Global_Markets"])
+            recovery = root / "zz-recovery" / "page-refresh-123-global-markets"
+            recovery.mkdir(parents=True)
+            (recovery / "sync_execution.log").write_text(
+                self._verdict("Global_Markets"), encoding="utf-8")
+            plan = build_recovery_plan(root)
+            self.assertEqual(plan["retry_pages"], [])
+            self.assertFalse(plan["needs_recovery"])
+
+    def test_manual_planner_downloads_source_recovery_before_building_matrix(self):
+        workflow = (ROOT / ".github/workflows/page_refresh_recovery.yml").read_text(encoding="utf-8")
+        job = job_source(workflow, "plan")
+        download = step_source(job, "Download source recovery evidence (best-effort)")
+        self.assertEqual(expression_field(download, "continue-on-error", 8), "true")
+        self.assertEqual(expression_field(download, "pattern", 10),
+                         "page-refresh-${{ steps.source.outputs.run_id }}-*")
+        self.assertEqual(expression_field(download, "path", 10), "source-sync-artifacts/zz-recovery")
+        self.assertEqual(expression_field(download, "run-id", 10), "${{ steps.source.outputs.run_id }}")
+        self.assertLess(job.index("- name: Download source recovery evidence"),
+                        job.index("- name: Build targeted recovery matrix"))
 
     def test_recovery_order_pairs_large_and_small_pages(self):
         self.assertEqual(

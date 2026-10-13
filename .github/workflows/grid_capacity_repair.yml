@@ -45,7 +45,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: tadawul-production-write-${{ github.ref }}
+  # All refs write the same workbook; branch dispatches must share main's lease.
+  group: tadawul-production-write
   cancel-in-progress: false
 
 jobs:
@@ -71,27 +72,28 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           TFB_GRID_REPAIR_APPLY: ${{ inputs.apply == 'true' && '1' || '0' }}
+          INPUT_APPLY: ${{ inputs.apply }}
+          INPUT_HAVE_BACKUP: ${{ inputs.have_backup }}
+          INPUT_CONFIRM: ${{ inputs.confirm }}
+          INPUT_TARGETS_JSON: ${{ inputs.targets_json }}
         run: |
-          set -o pipefail
-          ARGS=""
-          if [ "${{ inputs.apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
-          if [ "${{ inputs.have_backup }}" = "yes" ]; then ARGS="$ARGS --i-have-backup"; fi
+          set -euo pipefail
+          ARGS=()
+          if [[ "$INPUT_APPLY" == "true" ]]; then ARGS+=(--apply); fi
+          if [[ "$INPUT_HAVE_BACKUP" == "yes" ]]; then ARGS+=(--i-have-backup); fi
           # v1.1.0 (2026-08-31): optional target-map override (the tool's own
           # --targets-json). Dry-run 2026-08-31 measured 9,999,995/10,000,000
           # allocated; the default map projects 7,261,044 (> the 7,000,000
           # closure bar), so the operator can pass a wider map without a code
           # change. Same safety contract: data-extent guard, reductions only.
-          TJ='${{ inputs.targets_json }}'
-          if [ -n "$TJ" ]; then
-            python scripts/repair_grid_capacity.py $ARGS \
-              --confirm "${{ inputs.confirm }}" \
-              --targets-json "$TJ" \
-              --artifacts-dir artifacts | tee artifacts_console.txt
-          else
-            python scripts/repair_grid_capacity.py $ARGS \
-              --confirm "${{ inputs.confirm }}" \
-              --artifacts-dir artifacts | tee artifacts_console.txt
+          # Inputs are data: environment variables and quoted array elements
+          # preserve JSON apostrophes, spaces and shell metacharacters verbatim.
+          ARGS+=(--confirm "$INPUT_CONFIRM")
+          if [[ -n "$INPUT_TARGETS_JSON" ]]; then
+            ARGS+=(--targets-json "$INPUT_TARGETS_JSON")
           fi
+          ARGS+=(--artifacts-dir artifacts)
+          python scripts/repair_grid_capacity.py "${ARGS[@]}" | tee artifacts_console.txt
 
       - name: Upload artifacts (report + _Run_Log archive)
         if: always()

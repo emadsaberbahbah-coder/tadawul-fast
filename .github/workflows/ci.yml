@@ -2,6 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.20 (2026-10-14) -- DEPLOYMENT AND WORKFLOW REPAIR REGRESSIONS
+#
+# Run launcher, build, verifier, target-resolution, and shell-input regressions
+# in the blocking lean lane so production repairs remain covered after merge.
+#
 # VERSION 1.1.19 (2026-10-14) -- SECURITY PIN FLOORS
 #
 # v1.1.19 (2026-10-14): requirements.txt v1.1.4 moves twelve pins to the
@@ -648,6 +653,17 @@ jobs:
             tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py $EXTRA
           echo "::endgroup::"
+
+      - name: 🛠️ Deployment and workflow repair regressions
+        run: |
+          python -m pytest -q \
+            tests/test_web_launcher.py \
+            tests/test_web_build.py \
+            tests/test_verify_deployment_budgets.py \
+            tests/test_sync_target_workflow.py \
+            tests/test_grid_capacity_workflow.py \
+            tests/test_sync_recovery_plan.py \
+            tests/test_workflow_audit_repairs.py
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
         run: |

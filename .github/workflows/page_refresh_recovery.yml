@@ -34,6 +34,14 @@ on:
         description: 'Completed Advanced Sync run ID to inspect and recover'
         required: true
         type: string
+      backend_url:
+        description: 'Exact backend URL used by the source run (see its target summary)'
+        required: true
+        type: string
+      sheet_id:
+        description: 'Exact spreadsheet ID used by the source run (see its target summary)'
+        required: true
+        type: string
       rank_mode:
         description: 'Whole-page ranking override for this recovery (inherit repository variable)'
         required: false
@@ -54,8 +62,9 @@ permissions:
 # Automatic recovery now runs inside Advanced Sync and keeps the same production
 # lease. This workflow remains for manual historical-run recovery only. Its CI
 # tests use a separate cancellable group and never compete with production writes.
+# Production dispatches share the workbook across refs, including branch runs.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && format('tadawul-production-write-{0}', github.ref) || format('page-recovery-ci-{0}-{1}', github.event_name, github.ref) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && 'tadawul-production-write' || format('page-recovery-ci-{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
@@ -149,6 +158,19 @@ jobs:
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
 
+      # Inline recovery is part of the completed source run. Its final page
+      # verdict must supersede a failed original leg, just as in the outcome
+      # audit, so manual recovery does not fetch and overwrite it again.
+      - name: Download source recovery evidence (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: page-refresh-${{ steps.source.outputs.run_id }}-*
+          path: source-sync-artifacts/zz-recovery
+          merge-multiple: false
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
       - name: Build targeted recovery matrix
         id: plan
         run: |
@@ -187,8 +209,6 @@ jobs:
       # current-run fresh coverage remains below the recovery contract.
       TFB_AUDIT_REQUIRE_FULL_FETCH: '1'
       TFB_AUDIT_MIN_FRESH_PCT: '95'
-      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_XPAGE_PRICE_CHECK: '1'
       TFB_SYNC_PAGE_ORDER: ${{ matrix.page }}
       TFB_SYNC_EMPTY_RETRY: '0'
@@ -286,6 +306,28 @@ jobs:
           print(json.dumps(evidence))
           PY
 
+      # Historical artifacts carry page verdicts but no trustworthy target
+      # identity. Require the operator's explicit source target instead of
+      # silently replaying a different workbook with repository defaults.
+      - name: Resolve explicit source target
+        env:
+          INPUT_URL: ${{ inputs.backend_url }}
+          INPUT_SHEET: ${{ inputs.sheet_id }}
+        run: |
+          set -euo pipefail
+          URL="${INPUT_URL:-}"
+          URL="${URL%/}"
+          SHEET="${INPUT_SHEET:-}"
+          if [[ ! "$URL" =~ ^https?:// ||
+                -z "${SHEET//[[:space:]]/}" || "$SHEET" == "null" || "$SHEET" == "undefined" ||
+                "$URL" == *$'\n'* || "$URL" == *$'\r'* ||
+                "$SHEET" == *$'\n'* || "$SHEET" == *$'\r'* ]]; then
+            echo "::error::Explicit source backend_url and sheet_id are required and must be single-line values."
+            exit 1
+          fi
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
+
       - name: Configure production credentials
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -293,7 +335,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
-            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
+            echo "::error::Resolved source spreadsheet ID is empty."
             exit 1
           fi
 

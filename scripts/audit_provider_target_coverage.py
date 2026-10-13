@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Read-only audit of forecast provenance coverage across the market pages.
 
+v1.2.1 — detect historical row collapse before the minimum-sample exemption.
+A page collapse cannot be hidden by that exemption, and a small-sample
+shortfall cannot replace an accepted measurable baseline.
+Malformed accepted shares and row counts fail closed as control-health errors.
+
 WHY (W1B-1, evidence 2026-08-16 / 2026-08-17)
 ---------------------------------------------
 The engine derives ``forecast_source`` from scratch on every fetch: a row
@@ -73,6 +78,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -86,7 +92,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -321,17 +327,6 @@ def judge(cov: PageCoverage, prior: Optional[dict], cfg: Config,
     cov.baseline_pct = prior_share
     cov.baseline_rows = prior_rows
 
-    if cov.rows < cfg.min_rows:
-        cov.verdict = "TOO_SMALL"
-        cov.detail = f"{cov.rows} rows < min {cfg.min_rows}; reported, not judged"
-        return out
-
-    # -- unknown provenance vocabulary ---------------------------------------
-    if cov.rows and 100.0 * cov.unknown / cov.rows > UNKNOWN_WARN_PCT:
-        out.append(Finding("WARN", "PTC_UNKNOWN_SOURCE", cov.page,
-                           f"{cov.page}: {cov.unknown} rows carry unknown forecast_source "
-                           f"tokens {cov.unknown_tokens} — vocabulary drift, classify before trusting"))
-
     # -- row-count collapse (independent of share) ---------------------------
     if prior_rows and prior_rows >= cfg.min_rows:
         rdrop = round(100.0 * (prior_rows - cov.rows) / prior_rows, 2)
@@ -343,6 +338,20 @@ def judge(cov: PageCoverage, prior: Optional[dict], cfg: Config,
                                f"({rdrop:.1f}% drop >= {cfg.row_drop_pct:.1f}%) — page shrank "
                                f"materially even if share held"))
             return out
+
+    # The minimum sample size exempts pages that are inherently small. It
+    # must not hide loss of rows from an accepted, measurable source roster.
+    # Check the historical row count first, including structural-zero pages.
+    if cov.rows < cfg.min_rows:
+        cov.verdict = "TOO_SMALL"
+        cov.detail = f"{cov.rows} rows < min {cfg.min_rows}; reported, not judged"
+        return out
+
+    # -- unknown provenance vocabulary ---------------------------------------
+    if cov.rows and 100.0 * cov.unknown / cov.rows > UNKNOWN_WARN_PCT:
+        out.append(Finding("WARN", "PTC_UNKNOWN_SOURCE", cov.page,
+                           f"{cov.page}: {cov.unknown} rows carry unknown forecast_source "
+                           f"tokens {cov.unknown_tokens} — vocabulary drift, classify before trusting"))
 
     # -- structural-zero pages: policy exemption from floor AND drop ---------
     if structural_zero:
@@ -433,6 +442,17 @@ def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
                                 "baseline contains no accepted page measurements; "
                                 "an empty file is not a last-good reference"))
         return {}, findings, None
+    for page, entry in pages.items():
+        share = entry.get("share_pct") if isinstance(entry, dict) else None
+        rows = entry.get("rows") if isinstance(entry, dict) else None
+        if (not isinstance(page, str) or not page.strip()
+                or type(share) not in (int, float) or not 0 <= share <= 100
+                or not math.isfinite(share) or type(rows) is not int or rows <= 0):
+            findings.append(Finding("CONTROL", "CH_BASELINE_MISMATCH", str(page),
+                                    "accepted baseline measurement must have a finite "
+                                    "0–100% share and a positive integer row count"))
+    if findings:
+        return {}, findings, None
     if state.get("config_hash") and state["config_hash"] != cfg.hash():
         findings.append(Finding("CONTROL", "CH_BASELINE_POLICY_MISMATCH", "*",
                                 "baseline policy differs from current configuration; "
@@ -489,6 +509,11 @@ def next_last_good(report: CoverageReport, prior_pages: dict, accept: bool) -> t
             continue
         if report.exit_code == 1:
             continue  # never promote any page from a failing run
+        if (cov.get("verdict") == "TOO_SMALL"
+                and prior.get("rows", 0) >= report.config.get("min_rows", 50)):
+            # A small, sub-threshold loss may remain an unjudged observation,
+            # but it must not erase the measurable reference for the next run.
+            continue
         if cov.get("verdict") in ("OK", "STRUCTURAL_ZERO", "BOOTSTRAP", "TOO_SMALL"):
             if prior_share is None or float(share) >= float(prior_share):
                 new[page] = entry

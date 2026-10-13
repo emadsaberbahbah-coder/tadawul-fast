@@ -52,6 +52,34 @@ class BaselineLifecycleTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 2)
         self.assertIn("CH_BASELINE_EMPTY", [f.code for f in report.findings])
 
+    def test_malformed_accepted_measurement_cannot_certify_or_replace_reference(self):
+        malformed = [
+            {"share_pct": float("nan"), "rows": 200},
+            {"share_pct": float("inf"), "rows": 200},
+            {"share_pct": -1, "rows": 200},
+            {"share_pct": 101, "rows": 200},
+            {"share_pct": 10 ** 400, "rows": 200},
+            {"share_pct": True, "rows": 200},
+            {"share_pct": 50, "rows": "200"},
+            {"share_pct": 50, "rows": 200.5},
+            {"share_pct": 50, "rows": 0},
+            {"share_pct": 50, "rows": -1},
+            {"share_pct": 50, "rows": True},
+            {},
+        ]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                base = {**self.base, "pages": {"GM": entry}}
+                self.save_base(base)
+                before = Path(self.path).read_bytes()
+                report = ptc.audit_pages({"GM": grid(50)}, base, self.cfg)
+                self.assertEqual(report.exit_code, 2)
+                self.assertIn("CH_BASELINE_MISMATCH", [f.code for f in report.findings])
+                self.assertFalse(report.baseline_updated)
+                self.assertEqual(ptc.save_last_good(self.path, report, "***"),
+                                 "kept: control-health failure")
+                self.assertEqual(Path(self.path).read_bytes(), before)
+
     def test_stale_baseline_retains_actual_reference_for_diagnosis(self):
         base = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00"}
         report = ptc.audit_pages({"GM": grid(10)}, base, self.cfg)
@@ -92,6 +120,69 @@ class BaselineLifecycleTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 1)
         ptc.save_last_good(self.path, report, "***")
         self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_row_collapse_below_sample_minimum_keeps_accepted_reference(self):
+        for page, share in (("GM", 50), ("Commodities_FX", 0)):
+            with self.subTest(page=page):
+                base = {**self.base, "pages": {
+                    page: {"share_pct": share, "rows": 200, "provider": share * 2},
+                }}
+                self.save_base(base)
+                before = Path(self.path).read_bytes()
+                report = ptc.audit_pages({page: grid(share, rows=10)}, base, self.cfg)
+                self.assertEqual(report.exit_code, 1)
+                self.assertIn("PTC_ROW_COLLAPSE", [f.code for f in report.findings])
+                self.assertEqual(report.pages[page]["row_drop_pct"], 95)
+                self.assertEqual(report.pages[page]["verdict"], "ROW_COLLAPSE")
+                self.assertFalse(report.baseline_updated)
+                self.assertEqual(ptc.save_last_good(self.path, report, "***"),
+                                 "kept: coverage failure")
+                self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_inherently_small_page_remains_exempt(self):
+        base = {**self.base, "pages": {
+            "GM": {"share_pct": 50, "rows": 10, "provider": 5},
+        }}
+        report = ptc.audit_pages({"GM": grid(50, rows=10)}, base, self.cfg)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(report.pages["GM"]["verdict"], "TOO_SMALL")
+
+    def test_small_observation_cannot_erase_measurable_reference_before_collapse(self):
+        for another_page_advances in (False, True):
+            with self.subTest(another_page_advances=another_page_advances):
+                base = {**self.base, "pages": {
+                    "GM": {"share_pct": 100, "rows": 50, "provider": 50},
+                }}
+                grids = {"GM": grid(100, rows=49)}
+                if another_page_advances:
+                    base["pages"]["Other"] = {"share_pct": 50, "rows": 200, "provider": 100}
+                    grids["Other"] = grid(60)
+                self.save_base(base)
+                first = ptc.audit_pages(grids, base, self.cfg)
+                self.assertEqual(first.exit_code, 0)
+                self.assertEqual(first.pages["GM"]["verdict"], "TOO_SMALL")
+                self.assertEqual(first._next_pages["GM"], base["pages"]["GM"])
+                self.assertEqual(ptc.save_last_good(self.path, first, "***"),
+                                 "written" if another_page_advances else "unchanged")
+                persisted, error = ptc.load_state(self.path)
+                self.assertIsNone(error)
+                self.assertEqual(persisted["pages"]["GM"], base["pages"]["GM"])
+                before = Path(self.path).read_bytes()
+                grids["GM"] = grid(100, rows=1)
+                second = ptc.audit_pages(grids, persisted, self.cfg)
+                self.assertEqual(second.exit_code, 1)
+                self.assertEqual(second.pages["GM"]["verdict"], "ROW_COLLAPSE")
+                self.assertEqual(second.pages["GM"]["row_drop_pct"], 98)
+                self.assertEqual(ptc.save_last_good(self.path, second, "***"),
+                                 "kept: coverage failure")
+                self.assertEqual(Path(self.path).read_bytes(), before)
+
+    def test_inherently_small_bootstrap_retains_its_measurement(self):
+        report = ptc.audit_pages({"GM": grid(100, rows=10)}, None, self.cfg,
+                                 bootstrap=True)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(report._next_pages["GM"]["rows"], 10)
+        self.assertEqual(ptc.save_last_good(self.path, report, "***"), "written")
 
     def test_explicit_bootstrap_can_repair_empty_initial_state(self):
         base = {**self.base, "pages": {}}
