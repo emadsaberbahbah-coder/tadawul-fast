@@ -170,7 +170,7 @@ ARMING PREREQUISITES, all owed and NOT built in this commit. Do not arm TFB_DECI
 
 Zero-code observe experiment (safe today, the gate stays off): after a scheduled sync completes and BOTH cockpits (Top_10 and Portfolio_Decision) have been refreshed, dispatch 'Release Decision Feed (P0-1)' from main with mode=release and source_run_id = that sync's run id. Download the artifact release-decision-feed-<run id> and read release_decision_feed.json: outcome, reasons, audit_exit_codes, the decision findings and would_release. Expect exit 2 with PF_SOURCE_CONSUMPTION_UNPROVEN until prerequisite 1 lands; the T10 receipt check should pass if the Top_10 refresh followed the sync.
 
-Commit: this change is two commits on a review branch (the build, then the review fixes) over the six files listed under What changed; the owner reviews them and pushes. Nothing is pushed from the build session.
+Commit: this change is three commits on a review branch (the build, the review fixes, and the stacking note), stacked on the runner-pin branch, opened as a pull request for owner review and merge.
 
 Arming, only after prerequisites 1-5 and a dispatched dry-run artifact showing accepted: true with both receipts:
 
