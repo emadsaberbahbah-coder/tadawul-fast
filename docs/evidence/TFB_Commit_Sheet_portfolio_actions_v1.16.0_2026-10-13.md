@@ -54,6 +54,17 @@ it still never sizes, funds or executes anything.
   - Amendment 5: the DQ-46 and DQ-53 notes below.
   - Amendment 10: the verifier requires a declared mode.
   - Amendment 11 does not apply, because `main.py` is not touched.
+- Second review round (three minor findings), all reproduced before fixing:
+  - Enforce totals ignored portfolio-level reasons that prove them wrong
+    (`unrepresented_positions`, `holding_fx_mismatch`). A row whose FX the
+    funded path rejects still showed SAR figures. Fixed in code; see R20 and
+    R21.
+  - The harness stamped its main rows at import, so a late start in the
+    long lean CI process could age the quotes past 15 minutes. Fixed in the
+    harness; see H1.
+  - The mode is not visible on `/health` `pf_gates`. This is documented in
+    Known limits and Operator steps. `main.py` is unchanged (item G stays
+    optional and separate).
 
 ## What changed
 
@@ -65,7 +76,7 @@ it still never sizes, funds or executes anything.
      funding is not eligible, the `off` mode calls `_unverified_portfolio`
      exactly as before. Any other mode calls the new
      `_research_view_portfolio`.
-   - Three functions were added:
+   - Four functions were added:
      - `_env_research_view_mode` reads `TFB_PF_RESEARCH_VIEW` on each call.
        `off` is the default; `observe` and `enforce` are accepted in any
        letter case, and anything else counts as `off`.
@@ -73,11 +84,16 @@ it still never sizes, funds or executes anything.
        `_apply_deminimis`, `_apply_reduce_policy` and
        `_apply_drawdown_guard`. It never calls the ADD confirmation, the
        confirmation session shadow, the ADD-loser veto or the F-1a tag.
+     - `_research_fx_rejected` (review fix) applies the funded path's FX
+       rule from `_build` to one research row. SAR must be exactly 1, any
+       other currency must equal the caller rate, and row FX columns are
+       checked too. A value it cannot evaluate counts as rejected.
      - `_research_view_portfolio` takes the off output as its skeleton and
        adds a verdict to each row.
-   - Four constants were added: `RESEARCH_UNVERIFIED_STATES`,
+   - Six constants were added: `RESEARCH_UNVERIFIED_STATES`,
      `RESEARCH_TAG_UNVERIFIED` (`[custody-unverified]`), `RESEARCH_TAG_MATCHED`
-     (`[custody-matched]`) and `RESEARCH_ADD_WITHHELD`.
+     (`[custody-matched]`), `RESEARCH_ADD_WITHHELD`,
+     `RESEARCH_KPI_BLOCKING_REASONS` and `RESEARCH_FX_WITHHELD`.
    - Each row gets a tier from the 900 s certification:
      - A trusted row whose funding is withheld is `matched`.
      - A row with missing, invalid, unknown, stale or incomplete custody is
@@ -96,6 +112,17 @@ it still never sizes, funds or executes anything.
      withheld until fresh positions and settled cash are reconciled".
    - The holdings KPIs follow F3/F7, and `meta.research_view.kpi_basis` and
      `kpi_withheld` record the basis.
+   - Review fix, enforce only. Two certification reasons show that a total
+     is wrong, so either one withholds all four holdings KPIs:
+     - `unrepresented_positions`: the packet holds a positive position that
+       no sheet row links to.
+     - `holding_fx_mismatch`: a holding FX differs from the caller rate.
+     Every research row is also put through `_research_fx_rejected`. This
+     matters because `_build` checks FX only after custody and cash pass. A
+     rejected row shows none of the seven SAR display fields, and its reason
+     gains `; SAR figures withheld: holding FX differs from the supplied
+     rate` before `; not executable`. `detail.research_view.fx_rejected` and
+     `meta.research_view.fx_rejected_rows` record the result.
    - An exception inside the view falls back to the off output and adds
      `meta.research_view.status = "error"`.
 2. `scripts/verify_core_repair_readback.py` 1.1.1 -> 1.2.0 (WHY block).
@@ -125,9 +152,15 @@ it still never sizes, funds or executes anything.
    gates (`TFB_PF_DD_EXIT`, `TFB_PF_ADD_LOSER_VETO`, `TFB_PF_CONFIRM_SESSION`)
    are not registered either.
 5. `tests/test_pf_research_view_p06.py` (new) covers R0, R0b, R0c, R0d,
-   R1-R4, R5, R6-R11, R15-R19, V1, V2 and G1-G3. It runs as a script and prints
-   `PASS k/k`, and it also runs under pytest. Its golden negative is read from
-   the env var `TFB_TEST_PA_BASE`.
+   R1-R4, R5, R6-R11, R15-R21, R21b, H1, V1, V2 and G1-G3. It runs as a
+   script and prints `PASS k/k`, and it also runs under pytest. Its golden
+   negative is read from the env var `TFB_TEST_PA_BASE`.
+   - Review fix: `run()` and every case that builds rows call `main_rows()`
+     when the case runs. The quote stamps are therefore never older than the
+     case itself. The module-level `ROWS` now only gives the fixture shape
+     (symbols, quantities, row count).
+   - H1 ages the import-time `ROWS` by 16 minutes and reruns R2, R15, R8 and
+     R20, which must still pass.
 6. `tests/test_core_repair_readback.py`: a new class,
    `PortfolioResearchViewLockstepTests`, is added. Nothing existing was
    changed.
@@ -145,13 +178,13 @@ AST inventory against `dda1211`. No module lost a function:
 
 | File | defs base -> delivered | added | removed |
 | --- | --- | --- | --- |
-| `core/analysis/portfolio_actions.py` | 111 -> 114 | `_env_research_view_mode`, `_research_verdict`, `_research_view_portfolio` | 0 |
+| `core/analysis/portfolio_actions.py` | 111 -> 115 | `_env_research_view_mode`, `_research_verdict`, `_research_fx_rejected`, `_research_view_portfolio` | 0 |
 | `scripts/verify_core_repair_readback.py` | 21 -> 23 | `_research_amount`, `_require_research_view` | 0 |
 | `scripts/verify_deployment.py` | 14 -> 14 | none | 0 |
 | `tests/test_core_repair_readback.py` | 23 -> 37 | the new lockstep class and its methods | 0 |
 
 All new text is ASCII. Across the diff and the new files (this sheet
-excluded), 1,494 lines were added. The only one with non-ASCII characters is the existing
+excluded), 1,706 lines were added. The only one with non-ASCII characters is the existing
 `SCRIPT_VERSION` line of `verify_deployment.py`, where the literal changed
 from "1.0.55" to "1.0.57" and the em dashes belong to the older inline
 comment.
@@ -160,7 +193,7 @@ File hashes (sha256, first 16 hex characters):
 
 | File | Base | Delivered |
 | --- | --- | --- |
-| `core/analysis/portfolio_actions.py` | `0c390a15ccb11a13` (4,041 lines) | `574a066214edcb96` (4,279 lines) |
+| `core/analysis/portfolio_actions.py` | `0c390a15ccb11a13` (4,041 lines) | `3b4442e8e2f779dc` (4,341 lines) |
 | `scripts/verify_core_repair_readback.py` | `845e6e34a1c126af` (575 lines) | `e6775e7c8314d24e` (666 lines) |
 
 ## Default OFF identity
@@ -200,25 +233,25 @@ Base copy for the golden negatives:
 Harness as a script, without the base copy (the CI shape):
 
     $ python tests/test_pf_research_view_p06.py
-    PASS 24/24  (skipped 2)
+    PASS 28/28  (skipped 2)
 
 Harness as a script, with the base copy:
 
     $ TFB_TEST_PA_BASE=<scratch>/base_portfolio_actions.py python tests/test_pf_research_view_p06.py
-    G1 gate-on predicates: base fails 11/11, delivered passes 11/11
-    G2 defs base=111 delivered=114 added=['_env_research_view_mode', '_research_verdict', '_research_view_portfolio'] removed=[]
-    G3 241 lines added vs base, all checked for ASCII
+    G1 gate-on predicates: base fails 13/13, delivered passes 13/13
+    G2 defs base=111 delivered=115 added=['_env_research_view_mode', '_research_fx_rejected', '_research_verdict', '_research_view_portfolio'] removed=[]
+    G3 303 lines added vs base, all checked for ASCII
     R0 off byte-identical to base on 42 fixture x spelling pairs
-    PASS 26/26
+    PASS 30/30
 
 Harness under pytest:
 
     $ python -m pytest -q tests/test_pf_research_view_p06.py
-    24 passed, 2 skipped
+    28 passed, 2 skipped
     $ TFB_TEST_PA_BASE=<scratch>/base_portfolio_actions.py python -m pytest -q tests/test_pf_research_view_p06.py
-    26 passed
+    30 passed
 
-Golden negative (G1). With the gate on, the base module fails all 11 gate-on
+Golden negative (G1). With the gate on, the base module fails all 13 gate-on
 predicates:
 
 - R1, observe text only
@@ -231,10 +264,33 @@ predicates:
 - R16, the cost-basis scrub
 - R17, the missing price
 - R18, the real 5023.SR row
+- R20, an unlinked custody position withholding the totals
+- R21, an FX-rejected row showing no SAR figure
 - V2, the lockstep readback accepting enforce
 
-The delivered module passes all 11. Without `TFB_TEST_PA_BASE`, R0 and G1
+The delivered module passes all 13. Without `TFB_TEST_PA_BASE`, R0 and G1
 skip with a message.
+
+Review-fix negatives, run from a scratch script against the first commit of
+this branch (`5715373`, module and harness taken with `git show`):
+
+    pre-fix 5715373 pred_r20_unrepresented_withholds_totals False | delivered True
+    pre-fix 5715373 pred_r21_fx_rejected_row_blank False | delivered True
+    H1 with import-time rows: FAIL AssertionError (expected)
+    H1 delivered harness: PASS
+
+The H1 negative was measured at 07:48 UTC on 2026-10-13, inside the Tadawul
+session. Outside the session a 16-minute-old local quote can still pass when
+`exchange_calendars` is installed. The lean CI job does not install it, so
+there the old harness could fail at any hour.
+
+Before the fix, an enforce run with a fresh packet plus one unlinked position
+published `holdings_value_sar` 5,010, `cost_basis_sar` 4,900 and `pnl_sar` 110
+with `kpi_withheld` empty. A `[custody-matched]` row with `FX To SAR` 3.75 on
+a SAR price of 100 showed a market value of 3,750 and a stop of 345. After
+the fix, both runs publish no holdings KPI (`kpi_withheld`
+`['unrepresented_positions']` and `['holding_fx_mismatch']`), and the FX row
+shows no SAR figure.
 
 Verifier golden negative. The new `tests/test_core_repair_readback.py` class
 was run against the `dda1211` readback script in a scratch tree:
@@ -262,8 +318,8 @@ KPIs are 0, and there is one `portfolio_inputs_unverified` alert.
 
 Related existing suites, all run in the venv:
 
-    $ python -m pytest -q <all 90 files of the ci.yml lean list, harness included, one process>
-    3466 passed, 5 skipped, 2 warnings, 162 subtests passed in 238.36s
+    $ python -m pytest -q <the 91 files the ci.yml lean step runs (90 listed plus the existence-gated EXTRA), harness included, one process>
+    3476 passed, 5 skipped, 2 warnings, 162 subtests passed in 240.02s
     $ python -m pytest -q <the lean "work-brief capture, repair and pure contract" list>
     275 passed
     $ python -m pytest -q tests/test_core_repair_readback.py tests/test_core_repair_tiny_quotes.py tests/test_name_identity_workflow.py
@@ -272,6 +328,10 @@ Related existing suites, all run in the venv:
     135 passed, 3 skipped   (the 3 skips: reportlab not installed locally)
     $ python -m pytest -q tests/test_pf_add_loser_veto_p183.py      -> 14 passed
     $ python -m pytest -q tests/test_pf_sukuk_ladder_p153.py        -> 14 passed
+    $ python -m pytest -q tests/test_de_f7_scoring_settle.py tests/test_de_f7_intrinsic_display_basis.py
+    99 passed
+    $ python -m pytest -q tests/test_portfolio_action_reconciliation.py tests/test_portfolio_reconciliation.py tests/test_portfolio_exact_funding.py tests/test_ob_portfolio_certification.py
+    113 passed
     $ python tests/test_verify_manifest_pins.py                     -> [MANIFEST PIN GUARD] 3/3 PASS
     $ node tests/js/portfolio_reconciliation_inputs.test.js         -> 16 native reconciliation input checks passed
 
@@ -305,6 +365,28 @@ Related existing suites, all run in the venv:
   in the repository. Whether it writes the market value, stop and TP cells
   for BLOCK rows cannot be verified here, so the visible effect on the sheet
   is unproven until that source is pulled.
+- **Not shown on /health.** `TFB_PF_RESEARCH_VIEW` is read on every call
+  and prints no boot line, but it is not in `main.py` `_PF_GATE_ENVS`. An
+  armed mode is therefore not visible in `/health` `pf_gates`, which the
+  v8.14.1 rule expects for per-call PF gates. Until the optional item G
+  lands, the only attestation is a readback run with
+  `TFB_PF_RESEARCH_VIEW_EXPECT` set to the armed word, together with
+  `meta.research_view.mode` on the served page. Item G was left out of
+  Build 1 on purpose. It adds the name to `_PF_GATE_ENVS` and moves the
+  length pin in `tests/test_main_health_pf_gates_v8140.py` (line 117) from
+  24 to 25.
+- **Unproven quotes and FX still total.** Under `enforce`,
+  `holding_quote_unverified` (for example a `kept_last_good` quote) and
+  `fx_unverified` (the packet did not prove the caller rate) do not withhold
+  the holdings KPIs. Those totals use the sheet quote and the caller rate.
+  The reason prefix names the code on trusted rows. Only reasons that show a
+  total is wrong (`unrepresented_positions`, `holding_fx_mismatch`, a
+  contradicted row, incomplete holdings) withhold it. Whether unproven inputs
+  should also withhold the totals is owner decision (h).
+- **FX rule is stricter than the funded path's order.** The research view
+  checks every research row's FX even when no packet was sent. A non-SAR row
+  whose currency is missing from the caller rates therefore shows no SAR
+  figure under `enforce`. The funded path would never reach that row.
 - **Manual readback only.** `core_repair_readback.yml` runs only on
   `workflow_dispatch` from main. A mismatched arming is caught on the next
   manual readback, not by a schedule.
@@ -322,6 +404,10 @@ Related existing suites, all run in the venv:
    must stay green, because observe passes the unchanged probe. Optionally,
    set the Variable to `observe` and run it again to confirm the tag is
    served.
+
+   `/health` `pf_gates` does not list this gate (see Known limits). Confirm
+   the armed mode from the readback and from `meta.research_view.mode` on a
+   served page, not from `/health`.
 3. Read the observe verdicts on the page or in the brief for a few runs. In
    particular, check whether any held name shows `research verdict EXIT`.
 4. Arm `enforce` only after this commit (readback 1.2.0) is on main. Set
@@ -367,3 +453,11 @@ Related existing suites, all run in the venv:
 - (g) **Book totals.** Decide whether research-view holdings KPIs, built from
   unverified sheet quantities, may appear as book totals. The brief also sums
   row MV and cost (`run_daily_brief.py` L880-L904).
+- (h) **Unproven inputs and the totals.** Decide whether
+  `holding_quote_unverified` and `fx_unverified` should also withhold the
+  enforce holdings KPIs, as `unrepresented_positions` and
+  `holding_fx_mismatch` now do. Adding them is a one-line change to
+  `RESEARCH_KPI_BLOCKING_REASONS`.
+- (i) **Optional item G.** Decide whether to schedule the separate `main.py`
+  build that lists `TFB_PF_RESEARCH_VIEW` in `_PF_GATE_ENVS`, so that an
+  armed mode shows on `/health`.

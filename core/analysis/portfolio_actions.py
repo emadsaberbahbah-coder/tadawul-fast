@@ -882,6 +882,18 @@ PORTFOLIO_ACTIONS_VERSION = "1.16.0"
 #              has a positive market value; cost_basis_sar / pnl_sar /
 #              pnl_pct only from rows carrying both cost and P&L;
 #              meta.research_view.kpi_basis records which.
+#   Review fix (2026-10-13), enforce only: (a) the four holdings KPIs are
+#              also withheld when the certification reports
+#              unrepresented_positions (custody holds a position no sheet
+#              row links to, so any total is short) or holding_fx_mismatch;
+#              (b) every research row is put through the _build FX rule
+#              (_research_fx_rejected; SAR = 1, else the caller rate, row
+#              FX columns included). A rejected row shows none of the
+#              seven SAR display fields, its reason gains "SAR figures
+#              withheld: holding FX differs from the supplied rate", and
+#              the KPIs are withheld. holding_quote_unverified and
+#              fx_unverified (unproven, not contradicted) still publish;
+#              that is an owner decision recorded in the commit sheet.
 #   Any exception inside the research view falls back to the off output
 #   (plus meta.research_view.status "error"), never to an error page.
 # NOT changed: _unverified_portfolio, _build_verified, the certifier and
@@ -891,9 +903,11 @@ PORTFOLIO_ACTIONS_VERSION = "1.16.0"
 #   supplier. Arming order: observe first (the deployed readback stays
 #   green), enforce only after scripts/verify_core_repair_readback.py
 #   1.2.0 is merged and the readback declares --expect-pf-research-view.
-# Functions added: 3 (_env_research_view_mode, _research_verdict,
-#   _research_view_portfolio); constants RESEARCH_UNVERIFIED_STATES,
-#   RESEARCH_TAG_UNVERIFIED, RESEARCH_TAG_MATCHED, RESEARCH_ADD_WITHHELD.
+# Functions added: 4 (_env_research_view_mode, _research_verdict,
+#   _research_fx_rejected, _research_view_portfolio); constants
+#   RESEARCH_UNVERIFIED_STATES, RESEARCH_TAG_UNVERIFIED,
+#   RESEARCH_TAG_MATCHED, RESEARCH_ADD_WITHHELD,
+#   RESEARCH_KPI_BLOCKING_REASONS, RESEARCH_FX_WITHHELD.
 #   Removed: 0. Rollback: unset TFB_PF_RESEARCH_VIEW (= v1.15.1 output
 #   except the version string) or revert.
 
@@ -3671,6 +3685,34 @@ def _research_verdict(cand, ctl):
     return action, reason, proceeds
 
 
+# Review fix (2026-10-13): portfolio-level certifier / _build reasons that
+# prove a holdings total wrong - a positive custody position that no sheet
+# row links to, or a holding FX the funded path rejects. Under either one the
+# enforce holdings KPIs are withheld.
+RESEARCH_KPI_BLOCKING_REASONS = ("unrepresented_positions", "holding_fx_mismatch")
+RESEARCH_FX_WITHHELD = "SAR figures withheld: holding FX differs from the supplied rate"
+
+
+def _research_fx_rejected(raw, cand, fx_rates):
+    """v1.16.0 [P0-6] review fix: True when the funded path's FX rule in
+    _build would reject this row (the holding FX, or any row FX column,
+    differs from the caller rate; SAR is exactly 1). It runs on every
+    research row, because _build checks FX only after custody and cash have
+    passed. A value that cannot be evaluated counts as rejected."""
+    try:
+        ccy = cand.get("currency")
+        expected_fx = Decimal(1) if ccy == "SAR" else _number(fx_rates.get(ccy), "FX")
+        if _number(cand.get("fx_to_sar"), "holding FX") != expected_fx:
+            return True
+        for key, value in raw.items():
+            if (_ob._norm_token(key) in {"fxtosar", "fxrate", "fxratetosar", "sarfx"}
+                    and value not in (None, "") and _number(value, "row FX") != expected_fx):
+                return True
+    except Exception:  # noqa: BLE001 - an unprovable FX is a rejected FX
+        return True
+    return False
+
+
 def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
     """v1.16.0 [P0-6]: the off output plus per-row research verdicts.
 
@@ -3691,6 +3733,7 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
             raise ValueError("research rows do not align with the protective rows")
         actions = list(result["actions"])
         tiers, verdicts, shown_cands = {}, {}, []
+        fx_rows = 0
         for pos, index in enumerate(indices):
             state = row_states.get(index, {"trusted": False, "status": "invalid_evidence"})
             if state["trusted"]:
@@ -3709,6 +3752,9 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
             verdicts[shown] = verdicts.get(shown, 0) + 1
             note = (RESEARCH_ADD_WITHHELD if verdict == ACTION_ADD
                     else "research verdict %s: %s" % (verdict, why))
+            fx_rejected = _research_fx_rejected(rows[index], cand, fx_rates)
+            if fx_rejected:
+                fx_rows += 1
             if mode == "enforce":
                 if _is_cost_basis_block(verdict, why):
                     # The v1.0.2 scrub: never show figures derived from a
@@ -3716,6 +3762,12 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
                     cand["cost_sar"] = None
                     cand["pnl_sar"] = None
                     cand["pnl_pct"] = None
+                if fx_rejected:
+                    # Review fix: SAR figures at an FX the funded path
+                    # rejects are never shown (the legacy seven blanks).
+                    for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop", "tp1", "tp2"):
+                        cand[key] = None
+                    note = "%s; %s" % (note, RESEARCH_FX_WITHHELD)
                 reason = "%s | %s %s; not executable" % (legacy["action_reason"], tag, note)
                 shown_cand = cand
             else:
@@ -3738,7 +3790,8 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
             else:
                 for key in ("position_evidence_matched", "reconciliation_status", "execution_ready"):
                     rendered["detail"][key] = legacy["detail"][key]
-            rendered["detail"]["research_view"] = {"mode": mode, "tier": tier, "verdict": shown}
+            rendered["detail"]["research_view"] = {"mode": mode, "tier": tier, "verdict": shown,
+                                                   "fx_rejected": fx_rejected}
             actions[pos] = rendered
             shown_cands.append(shown_cand)
         kpis = dict(result["kpis"])
@@ -3753,6 +3806,14 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
                 withheld.append("holdings_input_incomplete")
             if not shown_cands:
                 withheld.append("no_research_rows")
+            # Review fix: a reason proving the total wrong withholds it
+            # (an unlinked custody position; a rejected holding FX).
+            reason_counts = certification.get("reason_counts") or {}
+            for code in RESEARCH_KPI_BLOCKING_REASONS:
+                if reason_counts.get(code):
+                    withheld.append(code)
+            if fx_rows:
+                withheld.append("holding_fx_mismatch")
         pnl_rows = 0
         if not withheld:
             # F3: a holdings total needs every research row valued.
@@ -3781,6 +3842,7 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
             "kpi_basis": "sheet_quantities_custody_unverified" if published else "withheld",
             "kpi_withheld": sorted(set(withheld)),
             "kpi_pnl_rows": pnl_rows,
+            "fx_rejected_rows": fx_rows,
         }
     except Exception as exc:  # fail closed to the off output
         logger.warning("[PF v1.16.0] research view withheld: %s", type(exc).__name__)

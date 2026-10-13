@@ -283,6 +283,25 @@ is incomplete. `meta.research_view.kpi_basis` is
 sheet quantities whose custody is not proven, so they are not a reconciled
 book value.
 
+Two more reasons withhold all four holdings KPIs. Each one shows that a total
+is wrong, not only that it is unproven:
+
+- `unrepresented_positions`: the packet shows a positive position that no
+  sheet row links to, so any sheet total is short. The rows keep their own
+  figures.
+- `holding_fx_mismatch`: a holding's FX differs from the caller's rate. Every
+  research row goes through the FX rule of the funded path (SAR is exactly 1;
+  any other currency must equal the caller rate, row FX columns included).
+  This applies even when the certifier stopped before reaching its own FX
+  check. A rejected row shows none of its seven SAR display fields, and its
+  reason gains `SAR figures withheld: holding FX differs from the supplied
+  rate`. `detail.research_view.fx_rejected` and
+  `meta.research_view.fx_rejected_rows` record the result.
+
+`holding_quote_unverified` and `fx_unverified` mean an input is unproven, not
+contradicted. In this build they do not withhold the totals; that is an open
+owner decision.
+
 If the research view itself fails, the page falls back to the `off` output
 and `meta.research_view.status` reads `error`.
 

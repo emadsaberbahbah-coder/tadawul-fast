@@ -33,6 +33,13 @@ BLOCK with zero money. The D4 daily custody tier is NOT part of this build.
   R17  a row without a price: holdings_value_sar None
   R18  real 5023.SR + real classifier: levels on 3 of 4 rows
   R19  an exception inside the view falls back to the off output
+  R20  review fix: an unlinked custody position (unrepresented_positions)
+       withholds the four holdings KPIs; rows keep their figures
+  R21  review fix: a row whose FX the funded path rejects shows no SAR
+       figure and withholds the KPIs (fresh packet and no packet)
+  R21b the FX rule helper on SAR, USD, row FX columns and bad inputs
+  H1   review fix: every case stamps its rows when it runs, so a late
+       start in a long CI process cannot age the quotes past 15 minutes
   V1   observe output passes the deployed readback verifier unchanged
   V2   enforce output fails the default verifier, passes the lockstep one
   G1   GOLDEN NEGATIVE: every gate-on predicate is False on the base
@@ -73,7 +80,8 @@ from scripts import verify_core_repair_readback as vr  # noqa: E402
 
 DELIVERED = ROOT / "core" / "analysis" / "portfolio_actions.py"
 BASE_PATH = (os.environ.get("TFB_TEST_PA_BASE") or "").strip()
-NEW_FUNCTIONS = {"_env_research_view_mode", "_research_verdict", "_research_view_portfolio"}
+NEW_FUNCTIONS = {"_env_research_view_mode", "_research_verdict", "_research_fx_rejected",
+                 "_research_view_portfolio"}
 
 # Policy the harness pins for every build; everything in CLEARED is unset
 # unless a case names it. Restored after each build (no env leaks).
@@ -94,6 +102,8 @@ INSTRUMENT = "instr-private-sentinel-%d"
 TAG_U = "[custody-unverified]"
 TAG_M = "[custody-matched]"
 LEVEL_KEYS = ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop_sar", "tp1_sar", "tp2_sar")
+KPI_KEYS = ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct")
+FX_NOTE = "SAR figures withheld: holding FX differs from the supplied rate"
 OFF_SPELLINGS = ({}, {"TFB_PF_RESEARCH_VIEW": "OFF"}, {"TFB_PF_RESEARCH_VIEW": "bogus"},
                  {"TFB_PF_RESEARCH_VIEW": ""}, {"TFB_PF_RESEARCH_VIEW": "enforced"},
                  {"TFB_PF_RESEARCH_VIEW": "1"}, {"TFB_PF_CUSTODY_DAILY_MAX_AGE_S": "86400"})
@@ -132,6 +142,9 @@ def main_rows():
                                         "Intrinsic Value": 104})]
 
 
+# The shape of the main fixture (symbols, quantities, row count). Its quote
+# stamps date from import, so a build never reads it: run() and every case
+# that builds rows call main_rows() when they run (review fix H1).
 ROWS = main_rows()
 
 
@@ -183,7 +196,7 @@ def policy_env(env=None):
 
 
 def run(mod, evidence=None, rows=None, env=None, controls=None):
-    rows = ROWS if rows is None else rows
+    rows = main_rows() if rows is None else rows
     meta = {"rows_supplied_by": "harness"}
     if evidence is not None:
         meta["reconciliation_evidence"] = copy.deepcopy(evidence)
@@ -350,7 +363,7 @@ def pred_r7_stale_packet(mod):
 @_safe
 def pred_r8_matched(mod):
     cash = run(mod, packet(ROWS, cash=5), env=mode_env("enforce"))
-    stale_quote = [dict(row) for row in ROWS]
+    stale_quote = main_rows()
     stale_quote[0]["Warnings"] += "; kept_last_good"
     quote = run(mod, packet(stale_quote), rows=stale_quote, env=mode_env("enforce"))
     return (all(TAG_M in row["action_reason"] and "cash_request_mismatch" in row["action_reason"]
@@ -400,6 +413,54 @@ def pred_r18_real_sukuk(mod):
             and bond["stop_sar"] is bond["tp1_sar"] is bond["tp2_sar"] is None
             and bond["detail"].get("ladder_display") == "sukuk_na"
             and bond["market_value_sar"] == 1010 and TAG_U in bond["action_reason"])
+
+
+def unlinked_packet(rows):
+    """A fresh packet whose account also holds a position no row links to."""
+    evidence = packet(rows)
+    evidence["accounts"][0]["positions"].append({"instrument_id": INSTRUMENT % 99, "symbol": "UNLINKED.SR",
+                                                 "currency": "SAR", "quantity": 1000})
+    return evidence
+
+
+def fx_rows():
+    return [holding("ADDME.SR"), holding("FXBAD.SR", **{"FX To SAR": 3.75})]
+
+
+@_safe
+def pred_r20_unrepresented_withholds_totals(mod):
+    rows = main_rows()
+    out = run(mod, unlinked_packet(rows), rows=rows, env=mode_env("enforce"))
+    rv = out["meta"]["research_view"]
+    return (out["meta"]["input_certification"]["reason_counts"] == {"unrepresented_positions": 1}
+            and all(out["kpis"][key] is None for key in KPI_KEYS)
+            and "unrepresented_positions" in rv["kpi_withheld"] and rv["kpi_basis"] == "withheld"
+            and rv["tiers"] == {"matched": len(ROWS)}
+            and all(TAG_M in row["action_reason"] and row["action"] == "BLOCK" for row in out["actions"])
+            and by_symbol(out)["ADDME.SR"]["market_value_sar"] == 1000)
+
+
+@_safe
+def pred_r21_fx_rejected_row_blank(mod):
+    rows = fx_rows()
+    funded = run(mod, packet(rows), rows=rows, env=mode_env("enforce"))
+    bare = run(mod, None, rows=rows, env=mode_env("enforce"))
+    if funded["meta"]["input_certification"]["reason_counts"] != {"holding_fx_mismatch": 1}:
+        return False
+    for out, prefix in ((funded, "RECONCILIATION_REQUIRED: holding_fx_mismatch | " + TAG_M + " "),
+                        (bare, "RECONCILIATION_REQUIRED: missing_evidence | " + TAG_U + " ")):
+        rv = out["meta"]["research_view"]
+        good, bad = by_symbol(out)["ADDME.SR"], by_symbol(out)["FXBAD.SR"]
+        if not (bad["action"] == "BLOCK" and bad["action_reason"].startswith(prefix)
+                and bad["action_reason"].endswith("; " + FX_NOTE + "; not executable")
+                and all(bad[key] is None for key in LEVEL_KEYS)
+                and research_of(bad).get("fx_rejected") is True
+                and good["market_value_sar"] == 1000 and research_of(good).get("fx_rejected") is False
+                and FX_NOTE not in good["action_reason"]
+                and all(out["kpis"][key] is None for key in KPI_KEYS)
+                and "holding_fx_mismatch" in rv["kpi_withheld"] and rv["fx_rejected_rows"] == 1):
+            return False
+    return True
 
 
 class _FakeBackend:
@@ -467,7 +528,8 @@ def pred_v2_lockstep_accepts_enforce(mod):
 GATE_ON_PREDICATES = (pred_r1_observe_text_only, pred_r2_enforce_levels, pred_r3_rule_verdicts,
                       pred_r3b_guard_and_rule_exit, pred_r4_add_withheld, pred_r7_stale_packet,
                       pred_r8_matched, pred_r16_cost_basis_scrub, pred_r17_missing_price,
-                      pred_r18_real_sukuk, pred_v2_lockstep_accepts_enforce)
+                      pred_r18_real_sukuk, pred_r20_unrepresented_withholds_totals,
+                      pred_r21_fx_rejected_row_blank, pred_v2_lockstep_accepts_enforce)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +542,8 @@ def case_r0_off_byte_identical_to_base():
     compared = 0
     for env in OFF_SPELLINGS:
         for name, evidence in fixtures().items():
-            new, old = run(pa, evidence, env=env), run(base, evidence, env=env)
+            rows = main_rows()
+            new, old = run(pa, evidence, rows=rows, env=env), run(base, evidence, rows=rows, env=env)
             assert norm(new) == norm(old), "off differs from base: %s %s" % (env, name)
             assert tuple(map(int, new["version"].split("."))) >= (1, 16, 0) and old["version"] == "1.15.1"
             compared += 1
@@ -497,9 +560,10 @@ def case_r0b_off_never_enters_research_view():
     pa._research_view_portfolio = boom
     try:
         for name, evidence in fixtures().items():
-            reference = norm(run(pa, evidence))
+            rows = main_rows()
+            reference = norm(run(pa, evidence, rows=rows))
             for env in OFF_SPELLINGS:
-                out = run(pa, evidence, env=env)
+                out = run(pa, evidence, rows=rows, env=env)
                 assert out["status"] == "ok", (name, env, out["meta"].get("reason"))
                 assert norm(out) == reference, (name, env)
                 assert "research_view" not in out["meta"], (name, env)
@@ -512,9 +576,10 @@ def case_r0d_direct_call_with_gate_off_returns_off_output():
     from core.portfolio_reconciliation import certify_portfolio_inputs
     with policy_env():
         ctl = pa.make_controls(dict(CTL))
-        cert = certify_portfolio_inputs(copy.deepcopy(ROWS), None, dict(FX))
-        direct = pa._research_view_portfolio(copy.deepcopy(ROWS), ctl, dict(FX), {}, copy.deepcopy(cert))
-        legacy = pa._unverified_portfolio(copy.deepcopy(ROWS), ctl, dict(FX), {}, copy.deepcopy(cert))
+        rows = main_rows()
+        cert = certify_portfolio_inputs(copy.deepcopy(rows), None, dict(FX))
+        direct = pa._research_view_portfolio(copy.deepcopy(rows), ctl, dict(FX), {}, copy.deepcopy(cert))
+        legacy = pa._unverified_portfolio(copy.deepcopy(rows), ctl, dict(FX), {}, copy.deepcopy(cert))
     direct["meta"].pop("generated_utc")
     legacy["meta"].pop("generated_utc")
     assert direct == legacy and "research_view" not in direct["meta"]
@@ -668,11 +733,12 @@ def case_r11_sukuk_ladder_stays_blank():
 
 
 def case_r15_funded_path_unaffected():
-    evidence = packet(ROWS)
-    off_out = run(pa, evidence)
+    rows = main_rows()
+    evidence = packet(rows)
+    off_out = run(pa, evidence, rows=rows)
     assert off_out["meta"]["execution_ready"] is True, off_out["meta"]["input_certification"]
     for mode in ("observe", "enforce"):
-        out = run(pa, evidence, env=mode_env(mode))
+        out = run(pa, evidence, rows=rows, env=mode_env(mode))
         assert norm(out) == norm(off_out), mode
         assert "research_view" not in out["meta"]
 
@@ -706,6 +772,68 @@ def case_r19_failure_falls_back_to_off_output():
             assert norm(out) == norm(off_out), mode
     finally:
         pa._research_verdict = original
+
+
+def case_r20_unrepresented_position_withholds_holdings_kpis():
+    assert pred_r20_unrepresented_withholds_totals(pa)
+    rows = main_rows()
+    evidence = unlinked_packet(rows)
+    off_out = run(pa, evidence, rows=rows)
+    obs = run(pa, evidence, rows=rows, env=mode_env("observe"))
+    assert all(off_out["kpis"][key] is None for key in KPI_KEYS)
+    assert obs["kpis"] == off_out["kpis"] and obs["alerts"] == off_out["alerts"]
+    for new, old in zip(obs["actions"], off_out["actions"]):
+        assert strip_text(new) == strip_text(old), new["symbol"]
+
+
+def case_r21_fx_rejected_row_shows_no_sar_figures():
+    assert pred_r21_fx_rejected_row_blank(pa)
+    rows = fx_rows()
+    for evidence in (None, packet(rows)):
+        off_out = run(pa, evidence, rows=rows)
+        obs = run(pa, evidence, rows=rows, env=mode_env("observe"))
+        assert obs["kpis"] == off_out["kpis"] and obs["alerts"] == off_out["alerts"]
+        for new, old in zip(obs["actions"], off_out["actions"]):
+            assert strip_text(new) == strip_text(old), new["symbol"]
+        assert research_of(by_symbol(obs)["FXBAD.SR"]).get("fx_rejected") is True
+    # A clean portfolio is unaffected: no row rejected, totals published.
+    out = run(pa, None, env=mode_env("enforce"))
+    assert out["meta"]["research_view"]["fx_rejected_rows"] == 0
+    assert out["kpis"]["holdings_value_sar"] == 5010
+
+
+def case_r21b_fx_rule_helper():
+    rejected = pa._research_fx_rejected
+    usd = {"currency": "USD", "fx_to_sar": 3.75}
+    assert rejected({}, {"currency": "SAR", "fx_to_sar": 1.0}, {}) is False
+    assert rejected({"FX To SAR": ""}, {"currency": "SAR", "fx_to_sar": 1.0}, {"SAR": 1}) is False
+    assert rejected({"FX To SAR": 1}, {"currency": "SAR", "fx_to_sar": 1.0}, {"SAR": 1}) is False
+    assert rejected({}, usd, {"USD": 3.75}) is False
+    assert rejected({"FX Rate": "3.75"}, usd, {"USD": 3.75}) is False
+    assert rejected({}, usd, {"USD": 3.7}) is True
+    assert rejected({}, usd, {}) is True
+    assert rejected({"FX Rate": 3.7}, usd, {"USD": 3.75}) is True
+    assert rejected({}, {"currency": "SAR", "fx_to_sar": 3.75}, {"SAR": 1}) is True
+    assert rejected({}, {"currency": "SAR", "fx_to_sar": None}, {"SAR": 1}) is True
+    assert rejected({}, {"currency": None, "fx_to_sar": 1.0}, {"SAR": 1}) is True
+    assert rejected({}, usd, ["not", "a", "map"]) is True
+
+
+def case_h1_cases_restamp_rows_when_they_run():
+    """Age the import-time ROWS past the 15-minute quote bound: the funded
+    and certified-value cases must still pass, so none reads ROWS stamps."""
+    saved = copy.deepcopy(ROWS)
+    aged = _stamp(16 * 60)
+    try:
+        for row in ROWS:
+            row["Warnings"] = row["Warnings"].replace(row["Last Updated"], aged)
+            row["Last Updated"] = aged
+        case_r2_enforce_levels_equal_certified_values()
+        case_r15_funded_path_unaffected()
+        assert pred_r8_matched(pa)
+        assert pred_r20_unrepresented_withholds_totals(pa)
+    finally:
+        ROWS[:] = saved
 
 
 def case_v1_observe_passes_unchanged_readback():
@@ -776,8 +904,11 @@ def case_g3_added_lines_ascii():
         added = delivered[start:delivered.index("# v1.15.1:", start)].splitlines()
         added += inspect.getsource(pa._env_research_view_mode).splitlines()
         added += inspect.getsource(pa._research_verdict).splitlines()
+        added += inspect.getsource(pa._research_fx_rejected).splitlines()
         added += inspect.getsource(pa._research_view_portfolio).splitlines()
-        added += [pa.RESEARCH_TAG_UNVERIFIED, pa.RESEARCH_TAG_MATCHED, pa.RESEARCH_ADD_WITHHELD]
+        added += [pa.RESEARCH_TAG_UNVERIFIED, pa.RESEARCH_TAG_MATCHED, pa.RESEARCH_ADD_WITHHELD,
+                  pa.RESEARCH_FX_WITHHELD]
+        added += list(pa.RESEARCH_KPI_BLOCKING_REASONS)
         added += sorted(pa.RESEARCH_UNVERIFIED_STATES)
     bad = [line for line in added if any(ord(ch) > 127 for ch in line)]
     assert added and not bad, bad[:5]
