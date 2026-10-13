@@ -282,6 +282,24 @@ def case_w10_audit_keep_on_writes_the_held_seat(mp, _tmp):
     assert p["near_miss"] == off["near_miss"]
 
 
+def case_w10b_audit_keep_never_grows_the_cap(mp, _tmp):
+    """Review (Codex P2): held seats only fill the room the cap leaves."""
+    _setup(mp, arm=("TFB_OPP_AUDIT_KEEP",))
+    mp.setattr(ob, "_venue_state", lambda *_a: None)
+    rows = _keep_pool() + [row("KEEP%d.US" % i, NOW - timedelta(minutes=2),
+                               intrinsic_value=101.0, expected_roi_12m=1.0)
+                           for i in (2, 3)]
+    crit = dict(KEEP_CRIT, audit_keep_symbols=["KEEP.US", "KEEP2.US", "KEEP3.US"])
+    p = build(rows, crit)                       # cap 2, one near-miss row
+    assert len(p["candidates_rows"]) == 2
+    meta = p["meta"]["audit_keep"]
+    assert meta["requested"] == 3 and meta["written"] == 1 and len(meta["missing"]) == 2
+    full = build(rows, dict(crit, near_miss_n=2))   # cap already full
+    assert len(full["candidates_rows"]) == 2
+    assert full["meta"]["audit_keep"]["written"] == 0
+    assert sorted(full["meta"]["audit_keep"]["missing"]) == ["KEEP.US", "KEEP2.US", "KEEP3.US"]
+
+
 def case_w11_keep_list_parsing(mp, _tmp):
     f = ob._audit_keep_symbols
     assert f(None) == [] and f({}) == [] and f({"audit_keep_symbols": 5}) == []

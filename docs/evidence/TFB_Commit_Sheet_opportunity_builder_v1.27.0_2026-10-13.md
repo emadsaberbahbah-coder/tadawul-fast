@@ -59,8 +59,12 @@ Grace-held seats:
      re-qualifies.
    - Display only.
 3. **`TFB_OPP_AUDIT_KEEP=1`: keep held symbols in the audit.**
-   - `criteria.audit_keep_symbols` (a list or comma string, at most 60) joins the set that the
-     audit cap always writes. The kept rows take free slots and never exceed the cap.
+   - `criteria.audit_keep_symbols` (a list or comma string, at most 60) fills the room the
+     audit cap leaves after the always-written rows, in audit order, ahead of the depth-ordered
+     filler. The cap never grows; held rows that do not fit are reported as missing.
+   - Review fix (Codex P2 on #770): the first build added held symbols to the always-written set,
+     so a full cap could grow by up to 60 rows. W10b proves the cap now holds (it fails on the
+     first build).
    - `meta.audit_keep` reports requested, written and missing.
    - The key is read from the RAW criteria. `make_criteria` drops unknown keys, so
      `criteria_snapshot` is unchanged.
@@ -90,10 +94,10 @@ exchange_calendars or pandas. Enrolling it in the lean list is a follow-up once 
 
 ## Measured results (offline, no provider, no workbook)
 
-- `python3 tests/test_ob_top10_data_quality.py`: PASS 18/18 (2 golden cases skip without a
+- `python3 tests/test_ob_top10_data_quality.py`: PASS 19/19 (2 golden cases skip without a
   base copy).
 - With `TFB_TEST_OB_BASE` set to the output of
-  `git show 278f148:core/analysis/opportunity_builder.py`: PASS 20/20.
+  `git show 278f148:core/analysis/opportunity_builder.py`: PASS 21/21.
   - G1: the OFF payload is byte-identical to v1.26.1.
   - G2: the armed env does nothing on v1.26.1. There is no `stale_quotes` alert, 1295.KL stays
     uncertified and there is no `meta.audit_keep`. This proves the armed cases detect the

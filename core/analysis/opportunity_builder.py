@@ -1476,8 +1476,10 @@ from typing import Optional
 #       "How To Qualify" text for a Quote Freshness row says when it
 #       re-qualifies. Display only: no gate, verdict, score or ticket moves.
 #   (3) TFB_OPP_AUDIT_KEEP=1 - criteria.audit_keep_symbols (list or comma
-#       string, max 60) is added to the rows the TFB_OPP_AUDIT_ROWS_MAX cap
-#       always writes, and meta.audit_keep reports requested / written. Read
+#       string, max 60) take the room the TFB_OPP_AUDIT_ROWS_MAX cap leaves
+#       after the always-written rows, ahead of the depth-ordered filler; the
+#       cap never grows, and meta.audit_keep reports requested / written /
+#       missing. Read
 #       from the RAW criteria (make_criteria drops unknown keys), so
 #       criteria_snapshot is unchanged. The cockpit half (sending the held
 #       symbols) is a separate Apps Script paste.
@@ -7361,14 +7363,23 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     if _audit_cap > 0 and len(audit) > _audit_cap:
         _nm_syms = {r.get("symbol") for r in near_miss if isinstance(r, dict)}
         _keep_syms = set(selected_syms) | set(unfunded_syms) | _nm_syms
-        if _keep_req:
-            _keep_syms |= set(_keep_req)
         _must, _rest = [], []
         for a in audit:
             if a.get("symbol") in _keep_syms or a.get("verdict") == VERDICT_INVEST:
                 _must.append(a)
             else:
                 _rest.append(a)
+        if _keep_req:
+            # v1.27.0 [AUDIT-KEEP] (review, Codex P2): held seats take only the
+            # room the cap leaves after the always-written rows, in audit
+            # order; any that do not fit stay out and meta.audit_keep lists
+            # them as missing. The cap never grows.
+            _held_set = set(_keep_req)
+            _held = [a for a in _rest if a.get("symbol") in _held_set]
+            _held = _held[:max(0, _audit_cap - len(_must))]
+            _held_ids = {id(a) for a in _held}
+            _rest = [a for a in _rest if id(a) not in _held_ids]
+            _must = _must + _held
         _room = _audit_cap - len(_must)
         # v1.19.1 [AUDIT-DEPTH-ORDER]: the free slots go to the rows that got
         # furthest through the gate chain, so a Risk/Reward failure is written
