@@ -10,6 +10,10 @@
 # cannot silently drop a pin below its fixed version; the contract job's
 # anyio pin follows production (4.13.0 -> 4.14.2) per the v1.0.1 rule that
 # contract deps match requirements.txt exactly. Nothing is removed.
+# Also (same date): the heavy job runs tests/test_security_pins_libsmoke_
+# 20261013.py with TFB_LIBSMOKE_REQUIRE_PINNED=1 -- the twelve bumped
+# libraries driven offline in the call shapes production uses (no other test
+# imports them), and the installed stack must equal requirements.txt.
 #
 # v1.1.12: require complete typed final RAW intent digest regressions in lean.
 #
@@ -706,6 +710,13 @@ jobs:
 
       - name: 🛡️ Run isolated Yahoo fundamentals loop-guard regression
         run: python -m pytest -q tests/test_yf_loopguard_p203.py
+
+      - name: Security pin library behaviour smoke (pinned production stack)
+        # v1.1.13: offline; L12 uses a 127.0.0.1 server, L15 imports main:app
+        # in a child process with outbound sockets blocked.
+        env:
+          TFB_LIBSMOKE_REQUIRE_PINNED: "1"
+        run: python -m pytest -q tests/test_security_pins_libsmoke_20261013.py
 
   # ==========================================================================
   # JOB 5 — gate summary

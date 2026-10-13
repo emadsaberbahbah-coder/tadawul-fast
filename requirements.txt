@@ -34,10 +34,17 @@
 #     httpcore 1.0.9 -- the audit SKIPS URL requirements ("URL requirements
 #       cannot be pinned to a specific package version"); audited on its own
 #       as httpcore==1.0.9: no known advisories. Pin unchanged.
-# - Guard: tests/test_security_pins_20261013.py (CI lean lane). Evidence:
+# - Guard: tests/test_security_pins_20261013.py (CI lean lane) and the
+#   library behaviour smoke tests/test_security_pins_libsmoke_20261013.py
+#   (CI heavy lane). Evidence:
 #   docs/evidence/TFB_Commit_Sheet_security_pins_2026-10-13.md
-# - NOT default-off: the next Render build installs these libraries.
-#   ROLLBACK: revert this commit; every pin returns to v1.1.3 verbatim.
+# - NOT default-off: the next Render build installs these libraries, and
+#   every workflow that runs "pip install -r requirements.txt" from main
+#   (daily_sync, track_performance, calendar_sync, news_archive,
+#   daily_brief, backtest_harness, investment_policy_shadow,
+#   provider_target_coverage, and the jobs they trigger) uses them from its
+#   first run after merge.
+#   ROLLBACK: revert the commits; every pin returns to v1.1.3 verbatim.
 #
 # WHY v1.1.3 (2026-06-11):
 # - FIX: Render builds failed with "No matching distribution found for
@@ -109,6 +116,9 @@ httpx==0.27.2
 # v1.1.4: pip-audit skips URL pins; httpcore==1.0.9 audited on its own:
 # no known advisories (see header).
 httpcore @ https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
+# v1.1.4: h2 4.4 makes a client reject a server SETTINGS ENABLE_PUSH=1
+# (RFC 9113 6.5.2); 4.3.0 accepted it. The http2=True providers would then
+# log network_error...LocalProtocolError (see commit sheet, Known limits).
 h2==4.4.1
 requests==2.33.1
 aiohttp==3.14.3
