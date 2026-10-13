@@ -2,11 +2,27 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.5.1
+TFB Enriched Quote Routes Wrapper — v8.5.2
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • CONSERVATIVE-PLACEHOLDERS
+
+v8.5.2 (2026-10-13, SECURITY): _Service.auth_guard reads the routed path.
+It handed auth_ok (core.config.auth_ok, which checks its public list against
+that value) a path read from request.url.path. Starlette 0.41.3 re-parses
+that from f"{scheme}://{Host header}{scope['path']}" while the router
+dispatches on scope["path"], so a crafted Host such as "x/health?x=" made
+the path read "/health" for a request routed to /v1/enriched/quote, and with
+REQUIRE_AUTH on and no token auth_guard let it through. main.py v8.14.5's
+global wall answers such a request with 401 first, but with
+TFB_GLOBAL_AUTH_ENFORCE falsy this layer is the only check. FIX: new
+_request_scope_path(request) (the ASGI scope path, root_path included; ""
+without a scope, which matches no built-in public path) feeds that path.
+INERT FOR VALID TRAFFIC: a valid Host cannot contain "/", "?" or "#", so
+url.path equals scope["path"] byte for byte and every decision is unchanged
+(tests/test_auth_wall_scope_path.py W14-W18). No ENV gate. Functions added
+1, removed 0. Rollback: git revert.
 
 v8.5.1: redact credentials from caught route and engine diagnostics.
 
@@ -134,7 +150,9 @@ from core.secret_redaction import redact_text, safe_error_text
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.5.1"
+# v8.5.2 (2026-10-13, SECURITY): auth_guard reads the ASGI scope path, not
+# the Host-derived request.url.path (see the module docstring).
+ROUTER_VERSION = "8.5.2"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -936,6 +954,26 @@ def _build_nonempty_special_rows(page: str, headers: Sequence[str], keys: Sequen
     return []
 
 
+def _request_scope_path(request: Any) -> str:
+    """v8.5.2 (2026-10-13, SECURITY): the ASGI scope path of a request.
+
+    This is the path the router dispatched on. request.url.path is not: it
+    is re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" (no scope path) matches no built-in
+    public path, so such a request still needs a token (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 # -----------------------------------------------------------------------------
 # Service wrapper
 # -----------------------------------------------------------------------------
@@ -1002,7 +1040,9 @@ class _Service:
             auth_token = _strip(token_query)
 
         headers = dict(request.headers)
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        # v8.5.2: the routed (scope) path, never the Host-derived
+        # request.url.path (see _request_scope_path).
+        path = _request_scope_path(request)
         attempts = [
             {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request, "settings": settings},
             {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request},

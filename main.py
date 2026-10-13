@@ -2,12 +2,55 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.4)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.5)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.5 (2026-10-13, SECURITY): the global auth wall decides its probe/meta
+exemption on the ROUTED path (the ASGI scope path), not request.url.path.
+WHY: Starlette 0.41.3 builds request.url as
+f"{scheme}://{Host header}{scope['path']}" and re-parses it with urlsplit,
+while the router matches scope["path"]. A crafted Host such as
+"x/health?x=" made request.url.path read "/health" for a request the
+router dispatched to /v1/advanced/sheet-rows, so the wall exempted it and
+an anonymous caller passed the wall. Production /health shows
+global_auth_enforcement:true, so the wall, and the hole, are live (uvicorn
+0.32.1, httptools and h11, hands such a Host to the app unchanged - checked
+offline; whether Render's edge forwards it was not tested from here). The
+per-route auth of routes/investment_advisor, analysis_sheet_rows,
+advanced_analysis, config and enriched_quote checks its public-path list
+against the same request.url.path, so it did not stop the call either.
+That route layer is NOT changed here; with the wall up, an anonymous
+request to any non-meta scope path now gets the wall's 401 before routing.
+With TFB_GLOBAL_AUTH_ENFORCE falsy the route layer is the only check and
+stays Host-spoofable until it is fixed, so do not use the kill switch as a
+routine toggle before that follow-up lands.
+INERT FOR VALID TRAFFIC: a valid Host (uri-host[:port]: a reg-name, an
+IPv4 address or a bracketed IPv6 literal, in any case) cannot contain "/",
+"?" or "#", so urlsplit keeps all of it in netloc and request.url.path is
+byte-identical to scope["path"]; the old and new decisions are the same.
+The only other inputs that differ are decoded paths containing "?", "#",
+TAB, LF or CR (e.g. /health%3F), which no meta route serves: the old code
+exempted them on the truncated url.path, and they now get the 401 that
+every other unknown path gets. No ENV gate: an off-by-default switch would
+leave the bypass open, and the change only alters the answer for
+malformed Host values and for paths no route serves. TFB_GLOBAL_AUTH_ENFORCE,
+REQUIRE_AUTH, OPEN_MODE, the exempt list and OPTIONS preflight keep their
+exact semantics.
+root_path: the exemption also requires the path the router matches
+(Starlette get_route_path: the scope path minus root_path) to be exempt.
+Without a root_path (production, TestClient) it is the same string; with
+one, an exempt scope path that the router would send to a non-meta route
+is no longer exempted.
+The 401 body "path", the NoResponseGuard and unhandled-exception "path"
+(log extra and body) and the path handed to config.auth_ok now carry the
+scope path too: identical for valid traffic, never Host-shaped, and no
+re-raise when an unparseable Host (an unbalanced "[") makes request.url
+itself raise. Rollback: git revert (request.url.path at those sites and
+APP_ENTRY_VERSION 8.14.4).
 
 v8.14.4 (2026-10-13, P0-6): /health pf_gates lists TFB_PF_RESEARCH_VIEW.
 WHY: portfolio_actions 1.16.0 reads TFB_PF_RESEARCH_VIEW (off | observe |
@@ -395,7 +438,10 @@ class _StrictJSONResponse(JSONResponse):
 # Fail-open: engine absent or older engine (no attr) => {} — same
 # backward-safe-default rule as every prior additive key (engine_version,
 # global_auth_enforcement). No route, auth, or behavior change.
-APP_ENTRY_VERSION = "8.14.4"
+# v8.14.5 (2026-10-13, SECURITY): the global auth wall exempts on the ASGI
+# scope path the router matches, not on the Host-derived request.url.path.
+# See the module docstring for the WHY and the valid-Host identity proof.
+APP_ENTRY_VERSION = "8.14.5"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1070,6 +1116,27 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
 # =============================================================================
 # Auth
 # =============================================================================
+def _request_scope_path(request: Any) -> str:
+    """v8.14.5: the ASGI scope path of a request, or "" when it has none.
+
+    This is the string Starlette's router matches routes against (after
+    the root_path step in _scope_route_path). request.url.path is NOT: it is
+    re-parsed from f"{scheme}://{Host header}{scope['path']}", so a Host
+    carrying "/", "?" or "#" rewrites it. For every valid Host the two are
+    byte-identical. Never raises; "" is not an exempt path, so a request
+    without a scope path stays behind the wall (fail-closed).
+    """
+    try:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            value = scope.get("path")
+            if isinstance(value, str):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
 def _call_auth_ok_flexible(
     fn: Any,
     request: Request,
@@ -1077,7 +1144,10 @@ def _call_auth_ok_flexible(
     authorization: str,
     api_key_value: str = "",
 ) -> bool:
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    # v8.14.5: scope path, not the Host-derived request.url.path, so a
+    # path-aware auth_ok (core.config checks its public-path list against
+    # this value) can never be steered by the Host header.
+    path = _request_scope_path(request)
     headers_dict = dict(request.headers)
 
     settings = None
@@ -1223,6 +1293,46 @@ def _auth_ok(request: Request) -> bool:
 # with a production 401 of its own (defense in depth, not an opening).
 _GLOBAL_AUTH_EXEMPT_PATHS: Set[str] = set(_BUILTIN_META_PATHS)
 
+
+def _scope_route_path(scope_path: str, root_path: str) -> str:
+    """v8.14.5: the path Starlette's router matches, given the scope path
+    and root_path -- the same steps as starlette._utils.get_route_path in
+    0.41.3 (kept local so a framework upgrade cannot silently change it; the
+    harness checks it against Starlette's own function). Without a
+    root_path it returns scope_path unchanged."""
+    if not root_path:
+        return scope_path
+    if not scope_path.startswith(root_path):
+        return scope_path
+    if scope_path == root_path:
+        return ""
+    if scope_path[len(root_path)] == "/":
+        return scope_path[len(root_path):]
+    return scope_path
+
+
+def _global_auth_exempt_request(request: Any) -> bool:
+    """v8.14.5: True only when the request is ROUTED to a probe/meta path.
+
+    Both the ASGI scope path and the path the router matches after its
+    root_path step must be in _GLOBAL_AUTH_EXEMPT_PATHS. Without a
+    root_path (production, TestClient) the two are the same string, and for
+    every valid Host the scope path equals request.url.path, which the
+    wall used up to v8.14.4 -- so legitimate traffic gets the same answer.
+    A crafted Host ("x/health?x=") can no longer make a protected route look
+    exempt. Any error answers False (stay behind the wall).
+    """
+    try:
+        scope_path = _request_scope_path(request)
+        if scope_path not in _GLOBAL_AUTH_EXEMPT_PATHS:
+            return False
+        root_path = request.scope.get("root_path", "") or ""
+        if not isinstance(root_path, str):
+            return False
+        return _scope_route_path(scope_path, root_path) in _GLOBAL_AUTH_EXEMPT_PATHS
+    except Exception:
+        return False
+
 # Keep in LOCKSTEP with the v8.11.1 env fallback list inside _auth_ok and
 # config.py v7.3.0 allowed_tokens(). Presence-only check: never logs values.
 _AUTH_TOKEN_ENV_NAMES: Tuple[str, ...] = (
@@ -1293,7 +1403,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     "Downstream returned None response",
                     extra={
                         "request_id": request_id,
-                        "path": str(request.url.path),
+                        "path": _request_scope_path(request),  # v8.14.5
                         "status_code": 500,
                     },
                 )
@@ -1304,7 +1414,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     content={
                         "status": "error",
                         "error": "internal_server_error",
-                        "path": str(request.url.path),
+                        "path": _request_scope_path(request),  # v8.14.5
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
                     },
@@ -1316,7 +1426,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     "Caught downstream no-response runtime error",
                     extra={
                         "request_id": request_id,
-                        "path": str(request.url.path),
+                        "path": _request_scope_path(request),  # v8.14.5
                         "status_code": 500,
                     },
                 )
@@ -1327,7 +1437,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     content={
                         "status": "error",
                         "error": _public_error_text(exc),
-                        "path": str(request.url.path),
+                        "path": _request_scope_path(request),  # v8.14.5
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
                     },
@@ -1348,7 +1458,14 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
     (browsers cannot attach custom headers to a preflight by design).
     Inactive whenever REQUIRE_AUTH resolves false, OPEN_MODE is on, or the
     TFB_GLOBAL_AUTH_ENFORCE kill-switch is set falsy -- which makes deploying
-    this build a behavioural no-op in today's production posture."""
+    this build a behavioural no-op in today's production posture.
+
+    v8.14.5 (2026-10-13): the probe/meta exemption is decided on the ASGI
+    scope path the router dispatches on (_global_auth_exempt_request), not on
+    request.url.path, which Starlette rebuilds from the Host header. For every
+    valid Host the two are byte-identical; a crafted Host ("x/health?x=") no
+    longer turns a protected route into an exempt one. Activation, the
+    kill-switch, the exempt list and OPTIONS handling are unchanged."""
 
     async def dispatch(self, request: Request, call_next):
         try:
@@ -1356,7 +1473,9 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
             if str(request.method or "").upper() == "OPTIONS":
                 return await call_next(request)
-            if str(request.url.path or "") in _GLOBAL_AUTH_EXEMPT_PATHS:
+            # v8.14.5: exempt on the ROUTED (scope) path, never on the
+            # Host-derived request.url.path (see _global_auth_exempt_request).
+            if _global_auth_exempt_request(request):
                 return await call_next(request)
             if _auth_ok(request):
                 return await call_next(request)
@@ -1370,7 +1489,8 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
             content={
                 "status": "error",
                 "error": "unauthorized",
-                "path": str(request.url.path),
+                # v8.14.5: echo the routed (scope) path, not a Host-shaped one.
+                "path": _request_scope_path(request),
                 "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
             },
@@ -2670,12 +2790,16 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         request_id = _request_id_from_request(request)
+        # v8.14.5: the routed (scope) path, never the Host-derived
+        # request.url.path. Read inline so this nested handler stays
+        # self-contained (same value as _request_scope_path).
+        scope_path = str((getattr(request, "scope", None) or {}).get("path") or "")
         logger.error(
             "Unhandled exception",
             exc_info=True,
             extra={
                 "request_id": request_id,
-                "path": str(request.url.path),
+                "path": scope_path,  # v8.14.5
                 "status_code": 500,
             },
         )
@@ -2686,7 +2810,7 @@ def create_app() -> FastAPI:
             content={
                 "status": "error",
                 "error": _public_error_text(exc),
-                "path": str(request.url.path),
+                "path": scope_path,  # v8.14.5
                 "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
             },

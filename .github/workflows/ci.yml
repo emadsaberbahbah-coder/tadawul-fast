@@ -2,6 +2,22 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.18 (2026-10-13) -- AUTH WALL ROUTED-PATH HARNESS (main.py 8.14.5)
+#
+# v1.1.18: run tests/test_auth_wall_scope_path.py in the blocking contract
+# job. WHY (2026-10-13, SECURITY): main.py v8.13.0 to v8.14.4 exempted a
+# request from the global token wall when request.url.path was a probe/meta
+# path, and Starlette builds request.url from the Host header, so a crafted
+# Host such as "x/health?x=" let an anonymous request through the wall to
+# a protected route. main.py v8.14.5 decides on the ASGI scope path the
+# router matches. The harness builds the real app and drives it with
+# TestClient, so it needs FastAPI, Starlette and httpx at the production
+# pins: the contract job installs exactly those (the lean job installs numpy
+# and pytest only, where it could not even collect). It blocks sockets and
+# never executes a data route. Its dual-tree identity, golden negative and
+# zero-removal cases need TFB_AUTH_WALL_BASE and skip in CI. Nothing is
+# removed and no existing entry moves.
+#
 # VERSION 1.1.17 (2026-10-13) -- DT10 FEED/COHORT BINDING HARNESS (P0-1 PREREQ 2)
 #
 # v1.1.17: run tests/js/dt10_feed_cohort_binding.test.js in the blocking
@@ -720,6 +736,7 @@ jobs:
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \
+            tests/test_auth_wall_scope_path.py \
             tests/test_route_mount_compat.py
           echo "::endgroup::"
 
