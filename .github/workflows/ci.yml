@@ -2,6 +2,29 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.16 (2026-10-13) -- RENDER ENV CONTRACT HARNESS (BUILD SPEC H-8)
+#
+# v1.1.16: require tests/test_render_env_contract.py in the blocking lean lane
+# (the pure-contract step, next to the flag registry test). It checks that
+# docs/render_env_contract.md, written by scripts/render_env_contract.py
+# 1.0.0, lists every /health gate key (main.py _PF_GATE_ENVS / _OB_GATE_ENVS
+# and the engine_gates keys) and every Render-scoped verify_deployment FLAGS
+# entry, says MUST be unset for TFB_APP_VERSION and APP_VERSION, carries no
+# secret-looking value or auth/token key name (owner decision D7), and equals
+# the generator output. Stdlib and pytest only; no network. Its golden
+# negative needs TFB_RENDER_ENV_CONTRACT_BASE and skips in CI. The push paths
+# filter also gains config/render_env_expected.json and
+# docs/render_env_contract.md, so a push that edits either one runs the
+# check itself instead of turning the next unrelated push red.
+# WHY (2026-10-13): H-8 asks for a Render ENV contract and the repo had none.
+# On 13 Oct 2026 /health showed app_version 5.111.0 against entry_version
+# 8.14.3: a stale APP_VERSION or TFB_APP_VERSION in the Render ENV or a
+# linked env group, which no file in the repo recorded as forbidden. Nothing
+# is removed and no existing entry moves.
+# REGENERATE after changing a gate table, an ENV reader default,
+# surface_gate_states or verify_deployment FLAGS:
+#   python scripts/render_env_contract.py
+#
 # VERSION 1.1.15 (2026-10-13) -- P0-6 PORTFOLIO RESEARCH VIEW HARNESS
 #
 # v1.1.15: require the portfolio_actions 1.16.0 research-view harness
@@ -316,6 +339,8 @@ on:
     paths:
       - 'main.py'
       - 'config/approved_universe_scope_v1.json'
+      - 'config/render_env_expected.json'
+      - 'docs/render_env_contract.md'
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
@@ -576,6 +601,7 @@ jobs:
             tests/test_ob_usx_subunit.py \
             tests/test_performance_math_extraction.py \
             tests/test_flag_registry.py \
+            tests/test_render_env_contract.py \
             tests/test_validation_embargo_properties.py
 
       - name: 🧮 Run model and display basis regressions (lean)
