@@ -146,8 +146,8 @@ it still never sizes, funds or executes anything.
    A dated comment was added. No trigger, concurrency, permission or
    environment changed.
 4. `scripts/verify_deployment.py`: the pin for `portfolio_actions` moves from
-   1.15.1 to 1.16.0, and `SCRIPT_VERSION` moves from 1.0.55 to 1.0.57 (1.0.56
-   is reserved by a parallel change), with a dated WHY entry.
+   1.15.1 to 1.16.0, and `SCRIPT_VERSION` moves from 1.0.56 to 1.0.57 (this
+   change is stacked on P0-1, which takes 1.0.56), with a dated WHY entry.
    `TFB_PF_RESEARCH_VIEW` is not added to FLAGS. The existing portfolio mode
    gates (`TFB_PF_DD_EXIT`, `TFB_PF_ADD_LOSER_VETO`, `TFB_PF_CONFIRM_SESSION`)
    are not registered either.
@@ -164,7 +164,8 @@ it still never sizes, funds or executes anything.
 6. `tests/test_core_repair_readback.py`: a new class,
    `PortfolioResearchViewLockstepTests`, is added. Nothing existing was
    changed.
-7. `.github/workflows/ci.yml` 1.1.12 -> 1.1.13: the harness was added to the
+7. `.github/workflows/ci.yml` 1.1.14 -> 1.1.15 (stacked on the runner pin
+   1.1.13 and P0-1 1.1.14): the harness was added to the
    blocking lean pytest list, after
    `tests/test_portfolio_action_reconciliation.py`. Nothing was removed or
    moved.
@@ -186,7 +187,7 @@ AST inventory against `dda1211`. No module lost a function:
 All new text is ASCII. Across the diff and the new files (this sheet
 excluded), 1,706 lines were added. The only one with non-ASCII characters is the existing
 `SCRIPT_VERSION` line of `verify_deployment.py`, where the literal changed
-from "1.0.55" to "1.0.57" and the em dashes belong to the older inline
+from "1.0.56" to "1.0.57" and the em dashes belong to the older inline
 comment.
 
 File hashes (sha256, first 16 hex characters):
