@@ -5,18 +5,16 @@
 # Process types
 # -----------------------------------------------------------------------------
 #
-# web     FastAPI ASGI app via scripts/start_web.sh (v2.6.0)
-#         Launcher handles: uvicorn/gunicorn selection, cgroup-aware worker
-#         calculation, optional DB/Redis health checks, uvloop/httptools probing.
+# web     FastAPI ASGI app via scripts/start_web.sh (v2.6.2)
+#         Launcher starts Gunicorn + UvicornWorker with bounded workers,
+#         timeouts, keep-alive, and backlog settings.
 #         Render provides PORT (default 10000, matching main.py fallback);
 #         WEB_CONCURRENCY controls worker count.
 #         Canonical env group: tfb-server (UVICORN_KEEPALIVE,
 #         UVICORN_GRACEFUL_TIMEOUT, UVICORN_BACKLOG, WEB_CONCURRENCY,
 #         WORKERS_MAX).
-#         Invoked via `./scripts/start_web.sh` to match render.yaml's
-#         canonical `exec ./scripts/start_web.sh` and honor the script's
-#         `#!/usr/bin/env bash` shebang. The launcher MUST be executable
-#         (ensured by render.yaml's pre-step `chmod +x scripts/start_web.sh`).
+#         Invoked via `./scripts/start_web.sh` to honor the script's
+#         `#!/usr/bin/env bash` shebang. The launcher is executable in git.
 #
 # worker  Background job processor (scripts/worker.py v4.3.0)
 #         Connects to Redis (REDIS_URL) and processes tfb_background_jobs queue.
@@ -46,17 +44,18 @@
 #
 # Render deployment note
 # -----------------------------------------------------------------------------
-# render.yaml defines the web service directly via:
-#     startCommand: |
-#       chmod +x scripts/start_web.sh
-#       exec ./scripts/start_web.sh
+# This repository has no render.yaml Blueprint. Configure the Render
+# dashboard's Build Command as `bash scripts/build_web.sh` and Start Command as
+# `bash -lc 'set -euo pipefail; source .venv/bin/activate; exec ./scripts/start_web.sh'`.
+# A custom TFB_BUILD_VENV needs its corresponding activation path. Validate
+# READY_REQUIRE_* gates and TFB_READYZ_STRICT before using `/readyz` as the
+# Health Check Path; default HTTP 200 alone does not enforce readiness.
 # This Procfile is the canonical process declaration for:
 #   Heroku / Railway / Fly.io / local Foreman / local Honcho
 #
-# For Render: to run the worker alongside the web service, add a `workers`
-# or `backgroundWorker` block to render.yaml (render.yaml v6.x supports
-# `type: worker`). This Procfile does NOT affect Render deployments -- Render
-# reads render.yaml, not Procfile.
+# For Render: to run the worker alongside the web service, create a separate
+# background worker in the dashboard (or add a `type: worker` service to a
+# future Blueprint). This Procfile does not configure Render services.
 #
 # Local usage
 #   pip install honcho          # or: brew install foreman

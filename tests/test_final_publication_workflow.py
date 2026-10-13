@@ -110,9 +110,11 @@ class FinalPublicationStructureTests(unittest.TestCase):
         expression = expression_field(self.workflow, "group", 2)
         manual_recovery = (ROOT / ".github/workflows/page_refresh_recovery.yml").read_text(encoding="utf-8")
         recovery_expression = expression_field(manual_recovery, "group", 2)
+        grid_repair = (ROOT / ".github/workflows/grid_capacity_repair.yml").read_text(encoding="utf-8")
+        self.assertEqual(expression_field(grid_repair, "group", 2), "tadawul-production-write")
         for ref in ("refs/heads/main", "refs/heads/master", "refs/heads/review"):
             lease = evaluate_condition(expression, event="schedule", ref=ref)
-            self.assertEqual(lease, "tadawul-production-write-" + ref)
+            self.assertEqual(lease, "tadawul-production-write")
             self.assertEqual(evaluate_condition(expression, event="workflow_dispatch", ref=ref), lease)
             self.assertEqual(evaluate_condition(recovery_expression, event="workflow_dispatch", ref=ref), lease)
         for event in ("schedule", "workflow_dispatch"):

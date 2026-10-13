@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/start_web.sh
 # ==============================================================================
-# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.1)
+# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.2)
 # ==============================================================================
 # Purpose
 # - Render-safe startup path
@@ -66,8 +66,7 @@
 #   WEB_CONCURRENCY           worker count (default 1)
 #   UVICORN_KEEPALIVE         keep-alive seconds (default 10, capped 300)
 #   UVICORN_GRACEFUL_TIMEOUT  graceful shutdown seconds (default 45, cap 300)
-#   UVICORN_BACKLOG           socket listen backlog (informational here;
-#                             UvicornWorker sets it internally)
+#   UVICORN_BACKLOG           socket listen backlog (default 2048, cap 65535)
 #   WORKERS_MAX               hard cap on workers (default 8)
 #
 # Project-wide:
@@ -93,7 +92,7 @@
 # ----------
 #   0   never (exec gunicorn replaces process)
 #   1   gunicorn binary not found
-#   2   --help invoked (prints plan and exits)
+#   2   invalid PORT, or --help / --print-plan invoked
 #   130 interrupted (SIGINT)
 #   143 terminated (SIGTERM)
 # ==============================================================================
@@ -102,7 +101,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.6.2"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -134,7 +133,14 @@ as_int() {
       printf "%s" "$def"
       ;;
     *)
-      printf "%s" "$raw"
+      raw="${raw#"${raw%%[!0]*}"}"
+      raw="${raw:-0}"
+      # Reject values that cannot safely participate in shell integer tests.
+      if [ "${#raw}" -gt 18 ]; then
+        printf "%s" "$def"
+      else
+        printf "%s" "$raw"
+      fi
       ;;
   esac
 }
@@ -247,12 +253,25 @@ if [ -z "${PORT:-}" ]; then
   log_warn "PORT not set by environment; defaulting to 10000 (matches main.py)"
   PORT=10000
 else
-  PORT="$(as_int "$PORT" 10000)"
+  case "$PORT" in
+    *[!0-9]*)
+      log_err "PORT must be a decimal integer in 1..65535"
+      exit 2
+      ;;
+  esac
+  # Remove leading zeros before range checks and before passing the value to
+  # Gunicorn. Compare length first so huge values cannot overflow shell tests.
+  PORT="${PORT#"${PORT%%[!0]*}"}"
+  PORT="${PORT:-0}"
+  if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    log_err "PORT must be a decimal integer in 1..65535"
+    exit 2
+  fi
 fi
 
 # Workers: prefer WEB_CONCURRENCY (Render canonical), then TFB_WORKERS.
 # Hard-cap by WORKERS_MAX (Render canonical) with fallback 8.
-_WORKERS_MAX="$(as_int "${WORKERS_MAX:-${WORKERS_MAX_DEFAULT:-}}" 8)"
+_WORKERS_MAX="$(clamp_range "${WORKERS_MAX:-${WORKERS_MAX_DEFAULT:-}}" 1 0 8)"
 WORKERS="$(clamp_range "${WEB_CONCURRENCY:-${TFB_WORKERS:-}}" 1 "$_WORKERS_MAX" 1)"
 
 # Timeouts: canonical UVICORN_* env vars preferred; legacy TFB_* honored.
@@ -260,6 +279,7 @@ WORKERS="$(clamp_range "${WEB_CONCURRENCY:-${TFB_WORKERS:-}}" 1 "$_WORKERS_MAX" 
 TIMEOUT="$(clamp_range "${TFB_TIMEOUT:-${TIMEOUT:-}}" 1 600 180)"
 GRACEFUL_TIMEOUT="$(clamp_range "${UVICORN_GRACEFUL_TIMEOUT:-${TFB_GRACEFUL_TIMEOUT:-${GRACEFUL_TIMEOUT:-}}}" 1 300 45)"
 KEEPALIVE="$(clamp_range "${UVICORN_KEEPALIVE:-${TFB_KEEPALIVE:-${KEEPALIVE:-}}}" 1 300 10)"
+BACKLOG="$(clamp_range "${UVICORN_BACKLOG:-}" 1 65535 2048)"
 
 # Log level
 RAW_LOG_LEVEL="${TFB_LOG_LEVEL:-${LOG_LEVEL:-info}}"
@@ -301,7 +321,12 @@ if [ -n "$APP_DIR" ]; then
 fi
 
 # Raise file descriptor limit (best-effort; not fatal if unsupported)
-( ulimit -n 65535 >/dev/null 2>&1 ) || true
+_NOFILE_TARGET=65535
+_NOFILE_HARD="$(ulimit -Hn)"
+if [ "$_NOFILE_HARD" != "unlimited" ] && [ "$_NOFILE_HARD" -lt "$_NOFILE_TARGET" ]; then
+  _NOFILE_TARGET="$_NOFILE_HARD"
+fi
+ulimit -Sn "$_NOFILE_TARGET" >/dev/null 2>&1 || true
 
 # v2.6.0: ensure Python can import from workdir (after any cd above).
 export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}$(pwd)"
@@ -312,7 +337,7 @@ export HOST
 log "TFB start_web.sh v${SCRIPT_VERSION}"
 log "boot config: app=$APP_MODULE host=$HOST port=$PORT workers=$WORKERS \
 workers_max=$_WORKERS_MAX gunicorn_log_level=$GUNICORN_LOG_LEVEL \
-timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE \
+timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE backlog=$BACKLOG \
 access_log=$ACCESS_LOGFILE worker_tmp_dir=$WORKER_TMP_DIR"
 
 # Verify gunicorn is present (fail-fast diagnostic)
@@ -331,6 +356,7 @@ GUNI_ARGS=(
   "--timeout"             "${TIMEOUT}"
   "--graceful-timeout"    "${GRACEFUL_TIMEOUT}"
   "--keep-alive"          "${KEEPALIVE}"
+  "--backlog"            "${BACKLOG}"
   "--log-level"           "${GUNICORN_LOG_LEVEL}"
   "--error-logfile"       "-"
   "--access-logfile"      "${ACCESS_LOGFILE}"
