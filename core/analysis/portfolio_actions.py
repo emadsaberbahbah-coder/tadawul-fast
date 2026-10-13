@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.15.1  (header synced to runtime; history below)
+Version: 1.16.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -822,7 +822,94 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.15.1"
+PORTFOLIO_ACTIONS_VERSION = "1.16.0"
+
+# v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
+# LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
+# WHY: since v1.15.0 every holding without a fresh (900 s) account-scoped
+# position/cash packet renders BLOCK with market value, cost, P&L, stop,
+# TP1 and TP2 blanked (_unverified_portfolio). Nothing in the repository
+# supplies that packet: the document property is read only by the Top10
+# cockpit, and Portfolio_Decision (POST /sheet-rows/portfolio-actions)
+# sees evidence only in body.reconciliation_evidence from its native Apps
+# Script caller, which is not in this repository. The live page therefore
+# shows 4 of 4 rows BLOCK "RECONCILIATION_REQUIRED: missing_evidence".
+# Worse than blank: on that path decide_action, the drawdown guard and the
+# section 4.6 EXIT-BY-RULE are never evaluated, so a compliance or
+# sell-tier exit on a held name is invisible, not merely unexecutable.
+# A supplier (owner decision D4) is the real fix; this build only makes
+# the protective page informative while it waits.
+# WHAT: the single change on the existing path is the dispatch in _build
+# at the 'if not certification["funding_eligible"]' branch. Off calls
+# _unverified_portfolio exactly as v1.15.1 did (no new code runs). The
+# research view reuses that output as its skeleton, so alerts,
+# meta.input_certification, funding KPIs (0), portfolio_value / cash /
+# cash_pct (None), weights (None) and sector_summary ([]) are inherited.
+#   * Per row the 900 s certification result picks a tier: trusted row
+#     with funding withheld (cash, quote, FX, truncation) = "matched",
+#     tag "[custody-matched]"; missing/invalid/unknown/stale/incomplete
+#     custody = "unverified", tag "[custody-unverified]"; contradicting
+#     evidence (quantity_mismatch, position_closed, position_missing,
+#     position_identity_mismatch, inactive_zero, or any other status) =
+#     "contradicted": the legacy blank row, untouched.
+#   * _research_verdict runs decide_action with weights None (the F3
+#     convention: no cap trim on an unverified denominator), then
+#     _apply_deminimis, _apply_reduce_policy and _apply_drawdown_guard in
+#     the _build_verified order. It NEVER calls _apply_add_confirmation,
+#     _apply_confirm_session_observe, _apply_add_loser_veto or
+#     _apply_f1_observe_tag, so the Redis-persisted confirmation clock is
+#     never read or advanced from an unreconciled run.
+#   * An ADD verdict is never named or sized; the row says "new-money
+#     verdict withheld until fresh positions and settled cash are
+#     reconciled".
+# GATE TFB_PF_RESEARCH_VIEW = off (default) | observe | enforce, read at
+#   call time (no restart); any other value, blank included, is off.
+#   observe -> every number, KPI and alert identical to off; action_reason
+#              and advisor_note gain " | [research-observe] <tag> research
+#              verdict <X>: <reason>"; detail.research_view and
+#              meta.research_view are added.
+#   enforce -> action stays BLOCK; reason = the unchanged legacy prefix
+#              "RECONCILIATION_REQUIRED: <status>" + " | <tag> research
+#              verdict EXIT|TRIM|HOLD|BLOCK: <reason>; not executable".
+#              Market value, cost, P&L, P&L % and stop / TP1 / TP2 are
+#              shown (a sukuk keeps its blank ladder through the P-153
+#              path in _action_row). Proceeds, deltas, funds_from, weights
+#              stay 0 / None and detail.execution_ready stays False.
+#              A cost-basis BLOCK verdict nulls that row's cost / P&L /
+#              P&L % (the v1.0.2 scrub in _build_verified). Holdings KPIs
+#              follow F3/F7: holdings_value_sar only when no row is
+#              contradicted, the cohort is complete and every research row
+#              has a positive market value; cost_basis_sar / pnl_sar /
+#              pnl_pct only from rows carrying both cost and P&L;
+#              meta.research_view.kpi_basis records which.
+#   Review fix (2026-10-13), enforce only: (a) the four holdings KPIs are
+#              also withheld when the certification reports
+#              unrepresented_positions (custody holds a position no sheet
+#              row links to, so any total is short) or holding_fx_mismatch;
+#              (b) every research row is put through the _build FX rule
+#              (_research_fx_rejected; SAR = 1, else the caller rate, row
+#              FX columns included). A rejected row shows none of the
+#              seven SAR display fields, its reason gains "SAR figures
+#              withheld: holding FX differs from the supplied rate", and
+#              the KPIs are withheld. holding_quote_unverified and
+#              fx_unverified (unproven, not contradicted) still publish;
+#              that is an owner decision recorded in the commit sheet.
+#   Any exception inside the research view falls back to the off output
+#   (plus meta.research_view.status "error"), never to an error page.
+# NOT changed: _unverified_portfolio, _build_verified, the certifier and
+#   its 900 s bound, funding, the confirmation clock, alerts. The D4 daily
+#   custody tier (a second, longer certification that could promote
+#   HOLD / TRIM / EXIT) is NOT built here; it needs owner decision D4 and a
+#   supplier. Arming order: observe first (the deployed readback stays
+#   green), enforce only after scripts/verify_core_repair_readback.py
+#   1.2.0 is merged and the readback declares --expect-pf-research-view.
+# Functions added: 4 (_env_research_view_mode, _research_verdict,
+#   _research_fx_rejected, _research_view_portfolio); constants
+#   RESEARCH_UNVERIFIED_STATES, RESEARCH_TAG_UNVERIFIED,
+#   RESEARCH_TAG_MATCHED, RESEARCH_ADD_WITHHELD,
+#   RESEARCH_KPI_BLOCKING_REASONS, RESEARCH_FX_WITHHELD.
+#   Removed: 0. Rollback: unset TFB_PF_RESEARCH_VIEW (= v1.15.1 output
+#   except the version string) or revert.
 
 # v1.15.1: exact principal debits are mandatory independently of fee policy.
 # Funding keeps Decimal cash/cap/sector ledgers; whole-SAR row rounding is
@@ -3558,6 +3645,216 @@ def _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
     return result
 
 
+# ---------------------------------------------------------------------------
+# v1.16.0 [P0-6] research view - TFB_PF_RESEARCH_VIEW (default off). See the
+# version block above. Nothing below can size, fund or execute a row.
+# ---------------------------------------------------------------------------
+# Certifier row statuses meaning "custody not proven" (as opposed to evidence
+# that contradicts the sheet row, which keeps the legacy blank row).
+RESEARCH_UNVERIFIED_STATES = frozenset({
+    "missing_evidence", "invalid_evidence", "custody_unknown",
+    "stale_positions", "future_positions", "invalid_positions_time",
+    "positions_incomplete"})
+RESEARCH_TAG_UNVERIFIED = "[custody-unverified]"
+RESEARCH_TAG_MATCHED = "[custody-matched]"
+RESEARCH_ADD_WITHHELD = ("new-money verdict withheld until fresh positions "
+                         "and settled cash are reconciled")
+
+
+def _env_research_view_mode():
+    """v1.16.0 [P0-6]: off | observe | enforce, read at call time (the
+    _env_dd_guard_mode convention). Any other value, blank included, is
+    off, so a misspelt value can never arm the view."""
+    v = str(os.environ.get("TFB_PF_RESEARCH_VIEW", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _research_verdict(cand, ctl):
+    """v1.16.0 [P0-6]: the rule verdict for one unreconciled holding.
+
+    decide_action with weights None (F3: no cap trim on an unverified
+    denominator), then the de-minimis, reduce-policy and drawdown seams in
+    the _build_verified order. The ADD confirmation clock, its session
+    shadow, the ADD-loser veto and the F-1a tag are deliberately NOT run:
+    a research row never reads or advances persisted confirmation state.
+    Returns (action, reason, proceeds); the caller never emits proceeds."""
+    action, reason, proceeds, _capped = decide_action(cand, ctl, None, None, None)
+    action, reason, proceeds = _apply_deminimis(action, reason, proceeds)
+    action, reason, proceeds = _apply_reduce_policy(cand, action, reason, proceeds)
+    action, reason, proceeds = _apply_drawdown_guard(cand, action, reason, proceeds)
+    return action, reason, proceeds
+
+
+# Review fix (2026-10-13): portfolio-level certifier / _build reasons that
+# prove a holdings total wrong - a positive custody position that no sheet
+# row links to, or a holding FX the funded path rejects. Under either one the
+# enforce holdings KPIs are withheld.
+RESEARCH_KPI_BLOCKING_REASONS = ("unrepresented_positions", "holding_fx_mismatch")
+RESEARCH_FX_WITHHELD = "SAR figures withheld: holding FX differs from the supplied rate"
+
+
+def _research_fx_rejected(raw, cand, fx_rates):
+    """v1.16.0 [P0-6] review fix: True when the funded path's FX rule in
+    _build would reject this row (the holding FX, or any row FX column,
+    differs from the caller rate; SAR is exactly 1). It runs on every
+    research row, because _build checks FX only after custody and cash have
+    passed. A value that cannot be evaluated counts as rejected."""
+    try:
+        ccy = cand.get("currency")
+        expected_fx = Decimal(1) if ccy == "SAR" else _number(fx_rates.get(ccy), "FX")
+        if _number(cand.get("fx_to_sar"), "holding FX") != expected_fx:
+            return True
+        for key, value in raw.items():
+            if (_ob._norm_token(key) in {"fxtosar", "fxrate", "fxratetosar", "sarfx"}
+                    and value not in (None, "") and _number(value, "row FX") != expected_fx):
+                return True
+    except Exception:  # noqa: BLE001 - an unprovable FX is a rejected FX
+        return True
+    return False
+
+
+def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
+    """v1.16.0 [P0-6]: the off output plus per-row research verdicts.
+
+    Every row stays BLOCK with zero money; alerts, funding KPIs and the
+    certification summary are the off output's own. observe changes only
+    reason/note text; enforce also shows market value, cost, P&L and
+    levels. A failure inside the view returns the off output with a
+    meta.research_view error marker, never an error page."""
+    mode = _env_research_view_mode()
+    result = _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification)
+    if mode == "off":  # gate changed since the dispatch read: off output
+        return result
+    try:
+        row_states = {row["row_index"]: row for row in certification["row_results"]}
+        listed = rows if isinstance(rows, list) else []
+        indices = [index for index, raw in enumerate(listed[:MAX_HOLDINGS]) if isinstance(raw, dict)]
+        if len(indices) != len(result["actions"]):
+            raise ValueError("research rows do not align with the protective rows")
+        actions = list(result["actions"])
+        tiers, verdicts, shown_cands = {}, {}, []
+        fx_rows = 0
+        for pos, index in enumerate(indices):
+            state = row_states.get(index, {"trusted": False, "status": "invalid_evidence"})
+            if state["trusted"]:
+                tier, tag = "matched", RESEARCH_TAG_MATCHED
+            elif state["status"] in RESEARCH_UNVERIFIED_STATES:
+                tier, tag = "unverified", RESEARCH_TAG_UNVERIFIED
+            else:
+                # Evidence contradicts the sheet row: the legacy blank row.
+                tiers["contradicted"] = tiers.get("contradicted", 0) + 1
+                continue
+            tiers[tier] = tiers.get(tier, 0) + 1
+            legacy = actions[pos]
+            cand = normalize_holding(rows[index], fx_rates, ctl)
+            verdict, why, _proceeds = _research_verdict(cand, ctl)
+            shown = "NEW_MONEY_WITHHELD" if verdict == ACTION_ADD else verdict
+            verdicts[shown] = verdicts.get(shown, 0) + 1
+            note = (RESEARCH_ADD_WITHHELD if verdict == ACTION_ADD
+                    else "research verdict %s: %s" % (verdict, why))
+            fx_rejected = _research_fx_rejected(rows[index], cand, fx_rates)
+            if fx_rejected:
+                fx_rows += 1
+            if mode == "enforce":
+                if _is_cost_basis_block(verdict, why):
+                    # The v1.0.2 scrub: never show figures derived from a
+                    # basis the rule chain just rejected.
+                    cand["cost_sar"] = None
+                    cand["pnl_sar"] = None
+                    cand["pnl_pct"] = None
+                if fx_rejected:
+                    # Review fix: SAR figures at an FX the funded path
+                    # rejects are never shown (the legacy seven blanks).
+                    for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop", "tp1", "tp2"):
+                        cand[key] = None
+                    note = "%s; %s" % (note, RESEARCH_FX_WITHHELD)
+                reason = "%s | %s %s; not executable" % (legacy["action_reason"], tag, note)
+                shown_cand = cand
+            else:
+                reason = "%s | [research-observe] %s %s" % (legacy["action_reason"], tag, note)
+                shown_cand = dict(cand)
+                for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop", "tp1", "tp2"):
+                    shown_cand[key] = None
+            entry = {"cand": shown_cand, "action": ACTION_BLOCK, "action_reason": reason,
+                     "proceeds_sar": 0.0, "capped_from": None, "weight_pct": None,
+                     "sector_weight_pct": None, "confidence_band": legacy["confidence_band"],
+                     "suggested_delta_sar": 0.0, "suggested_delta_shares": 0, "funds_from": None}
+            rendered = _action_row(entry, legacy["detail"]["review_date"], ctl)
+            if mode == "observe":
+                # Every legacy field stays as it was; only the text changes.
+                note_text = rendered["advisor_note"]
+                rendered = dict(legacy)
+                rendered["detail"] = dict(legacy["detail"])
+                rendered["action_reason"] = reason
+                rendered["advisor_note"] = note_text
+            else:
+                for key in ("position_evidence_matched", "reconciliation_status", "execution_ready"):
+                    rendered["detail"][key] = legacy["detail"][key]
+            rendered["detail"]["research_view"] = {"mode": mode, "tier": tier, "verdict": shown,
+                                                   "fx_rejected": fx_rejected}
+            actions[pos] = rendered
+            shown_cands.append(shown_cand)
+        kpis = dict(result["kpis"])
+        withheld = []
+        if mode == "observe":
+            withheld.append("observe_mode")
+        else:
+            if tiers.get("contradicted"):
+                withheld.append("contradicting_evidence")
+            if (certification.get("reason_counts") or {}).get("holdings_input_incomplete") \
+                    or len(indices) != len(listed):
+                withheld.append("holdings_input_incomplete")
+            if not shown_cands:
+                withheld.append("no_research_rows")
+            # Review fix: a reason proving the total wrong withholds it
+            # (an unlinked custody position; a rejected holding FX).
+            reason_counts = certification.get("reason_counts") or {}
+            for code in RESEARCH_KPI_BLOCKING_REASONS:
+                if reason_counts.get(code):
+                    withheld.append(code)
+            if fx_rows:
+                withheld.append("holding_fx_mismatch")
+        pnl_rows = 0
+        if not withheld:
+            # F3: a holdings total needs every research row valued.
+            if all(_pos_float(c.get("market_value_sar")) is not None for c in shown_cands):
+                kpis["holdings_value_sar"] = _round(sum(c["market_value_sar"] for c in shown_cands), 0)
+            else:
+                withheld.append("market_value_incomplete")
+            # F7: cost and P&L only from rows carrying both.
+            covered = [c for c in shown_cands
+                       if c.get("cost_sar") is not None and c.get("pnl_sar") is not None]
+            pnl_rows = len(covered)
+            if covered:
+                cost = sum(c["cost_sar"] for c in covered)
+                pnl = sum(c["pnl_sar"] for c in covered)
+                kpis["cost_basis_sar"] = _round(cost, 0) if cost else None
+                kpis["pnl_sar"] = _round(pnl, 0)
+                kpis["pnl_pct"] = _round(pnl / cost * 100.0, 1) if _pos_float(cost) else None
+            else:
+                withheld.append("cost_basis_incomplete")
+        published = any(kpis.get(key) is not None for key in
+                        ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct"))
+        research_meta = {
+            "mode": mode, "status": "ok",
+            "tiers": dict(sorted(tiers.items())),
+            "verdicts": dict(sorted(verdicts.items())),
+            "kpi_basis": "sheet_quantities_custody_unverified" if published else "withheld",
+            "kpi_withheld": sorted(set(withheld)),
+            "kpi_pnl_rows": pnl_rows,
+            "fx_rejected_rows": fx_rows,
+        }
+    except Exception as exc:  # fail closed to the off output
+        logger.warning("[PF v1.16.0] research view withheld: %s", type(exc).__name__)
+        result["meta"]["research_view"] = {"mode": mode, "status": "error",
+                                           "error_class": type(exc).__name__}
+        return result
+    result["actions"] = actions
+    result["kpis"] = kpis
+    result["meta"]["research_view"] = research_meta
+    return result
+
+
 def _build(rows, ctl, fx_rates, upstream_meta):
     upstream = dict(upstream_meta) if isinstance(upstream_meta, dict) else {}
     evidence = upstream.pop("reconciliation_evidence", None)
@@ -3608,7 +3905,10 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         if not certification["funding_eligible"]:
             certification["status"] = "withheld"
     if not certification["funding_eligible"]:
-        return _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
+        # v1.16.0 [P0-6]: off (default) is the v1.15.1 call verbatim.
+        if _env_research_view_mode() == "off":
+            return _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
+        return _research_view_portfolio(rows, ctl, fx_rates, upstream, certification)
     effective = dict(ctl)
     effective["cash_available_sar"] = certification["certified_cash_available_sar"]
     effective["rebalance_mode"] = REBALANCE_NEW_CASH

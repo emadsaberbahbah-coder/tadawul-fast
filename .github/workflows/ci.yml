@@ -2,6 +2,59 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.17 (2026-10-13) -- DT10 FEED/COHORT BINDING HARNESS (P0-1 PREREQ 2)
+#
+# v1.1.17: run tests/js/dt10_feed_cohort_binding.test.js in the blocking
+# lean lane's native Apps Script step. WHY (2026-10-13): 16_Decision_Top10.gs
+# v1.13.8 adds Script Property DT10_FEED_COHORT_BIND (default off), which
+# withholds an EXECUTABLE decision feed whose run= is not the cockpit's
+# source cohort (release arming prerequisite 2). The harness loads the real
+# .gs and pins the off verdicts, the armed reasons, the fail-closed faults
+# and the release-grammar parity (it calls python3 for the release grammar;
+# the lean job already sets Python up). Its dual-tree identity and golden
+# negative need DT10_BASE and skip in CI. Nothing is removed and no existing
+# entry moves.
+#
+# VERSION 1.1.16 (2026-10-13) -- RENDER ENV CONTRACT HARNESS (BUILD SPEC H-8)
+#
+# v1.1.16: require tests/test_render_env_contract.py in the blocking lean lane
+# (the pure-contract step, next to the flag registry test). It checks that
+# docs/render_env_contract.md, written by scripts/render_env_contract.py
+# 1.0.0, lists every /health gate key (main.py _PF_GATE_ENVS / _OB_GATE_ENVS
+# and the engine_gates keys) and every Render-scoped verify_deployment FLAGS
+# entry, says MUST be unset for TFB_APP_VERSION and APP_VERSION, carries no
+# secret-looking value or auth/token key name (owner decision D7), and equals
+# the generator output. Stdlib and pytest only; no network. Its golden
+# negative needs TFB_RENDER_ENV_CONTRACT_BASE and skips in CI. The push paths
+# filter also gains config/render_env_expected.json and
+# docs/render_env_contract.md, so a push that edits either one runs the
+# check itself instead of turning the next unrelated push red.
+# WHY (2026-10-13): H-8 asks for a Render ENV contract and the repo had none.
+# On 13 Oct 2026 /health showed app_version 5.111.0 against entry_version
+# 8.14.3: a stale APP_VERSION or TFB_APP_VERSION in the Render ENV or a
+# linked env group, which no file in the repo recorded as forbidden. Nothing
+# is removed and no existing entry moves.
+# REGENERATE after changing a gate table, an ENV reader default,
+# surface_gate_states or verify_deployment FLAGS:
+#   python scripts/render_env_contract.py
+# v1.1.16 review fix (2026-10-13, same unreleased v1.1.16, nothing removed):
+# the push paths filter also gains the root config.py and env.py. Both are
+# generator inputs (section A read order and "Read by"), so a push that edits
+# only one of them must run the check itself; without them, such a push
+# would skip CI and the next core/** or scripts/** push would go red on R7.
+# MERGE NOTE: the dt10-cohort-binding-2026-10-13 branch also claims v1.1.16 on
+# the same base (fbc4d07d). Whichever branch merges second renumbers its own
+# header block to v1.1.17 and keeps both WHY blocks; only this header
+# conflicts.
+#
+# VERSION 1.1.15 (2026-10-13) -- P0-6 PORTFOLIO RESEARCH VIEW HARNESS
+#
+# v1.1.15: require the portfolio_actions 1.16.0 research-view harness
+# (tests/test_pf_research_view_p06.py; TFB_PF_RESEARCH_VIEW default off) in
+# the blocking lean lane. It pins and restores its own policy env per build,
+# so it shares the lean process. Its golden negative needs TFB_TEST_PA_BASE
+# and skips in CI. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.14 (2026-10-13) -- AUDITED DECISION-FEED RELEASE (P0-1)
 #
 # v1.1.14: require the P0-1 decision-feed release harness
@@ -308,6 +361,10 @@ on:
     paths:
       - 'main.py'
       - 'config/approved_universe_scope_v1.json'
+      - 'config/render_env_expected.json'
+      - 'docs/render_env_contract.md'
+      - 'config.py'
+      - 'env.py'
       - 'core/**'
       - 'routes/**'
       - 'scripts/**'
@@ -489,6 +546,7 @@ jobs:
             tests/test_execution_accounting.py \
             tests/test_portfolio_reconciliation.py \
             tests/test_portfolio_action_reconciliation.py \
+            tests/test_pf_research_view_p06.py \
             tests/test_portfolio_exact_funding.py \
             tests/test_portfolio_reconciliation_cli.py \
             tests/test_ob_quote_evidence.py \
@@ -567,6 +625,7 @@ jobs:
             tests/test_ob_usx_subunit.py \
             tests/test_performance_math_extraction.py \
             tests/test_flag_registry.py \
+            tests/test_render_env_contract.py \
             tests/test_validation_embargo_properties.py
 
       - name: 🧮 Run model and display basis regressions (lean)
@@ -600,6 +659,7 @@ jobs:
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
           node tests/js/decision_input_truth.test.js
+          node tests/js/dt10_feed_cohort_binding.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
