@@ -56,6 +56,16 @@ GOLD  G7-G10 against PRE-CHANGE copies (TFB_TEST_SUPERSEDE_BASE_DIR: the
       consumers on today's value shapes) against the same copies. SKIP when
       unset; all four FAIL when the directory holds HEAD copies.
 
+VERSION 1.1.1 (2026-10-13) -- DT10 v1.13.8 (arming prerequisite 2) stacked.
+WHY: apps_script/16_Decision_Top10.gs now changes on purpose (Script Property
+DT10_FEED_COHORT_BIND, default off), so the G4 byte-identity pair for that
+file would turn red whenever its dda1211 sibling copy is supplied. G4 keeps
+byte identity for every other protected file and accepts a different .gs
+ONLY when tests/js/dt10_feed_cohort_binding.test.js, run against that same
+base copy (DT10_BASE), passes with nothing skipped: default-off verdict,
+render and refresh identity (D1-D3), zero removals and exactly the designed
+additions (D4) and its golden negative (G1). Nothing else changed.
+
 Run: pytest -q tests/test_release_decision_feed.py
   or python3 tests/test_release_decision_feed.py      (prints PASS k/k)
 """
@@ -1593,10 +1603,33 @@ def case_g4_protected_sources_byte_identical(mp, tmp_path):
                 "apps_script/24_Sync_Dispatch.gs"):
         if (base_dir / Path(rel).name).exists():
             pairs.append((ROOT / rel, base_dir / Path(rel).name))
+    identical = 0
     for current, base in pairs:
         digest = [hashlib.sha256(path.read_bytes()).hexdigest() for path in (current, base)]
+        if digest[0] != digest[1] and current == GAS:
+            _gas_changed_only_by_feed_cohort_binding(base)   # v1.1.1
+            continue
         assert digest[0] == digest[1], current
-    print("G4 byte-identical: %d protected files" % len(pairs))
+        identical += 1
+    print("G4 byte-identical: %d protected files" % identical)
+
+
+def _gas_changed_only_by_feed_cohort_binding(base):
+    """v1.1.1 (2026-10-13): DT10 v1.13.8 changes the .gs on purpose. Accept the
+    difference only through the binding harness run against this base copy."""
+    node = node_binary()
+    if node is None:
+        pytest.skip("node is required to prove the DT10 v1.13.8 default-off identity")
+    harness = ROOT / "tests" / "js" / "dt10_feed_cohort_binding.test.js"
+    env = dict(os.environ, DT10_BASE=str(base), TFB_PYTHON=sys.executable)
+    env.pop("DT10_DELIVERED", None)
+    proc = subprocess.run([node, str(harness)], env=env, capture_output=True, text=True,
+                          timeout=600, cwd=str(ROOT))
+    lines = proc.stdout.strip().splitlines()
+    assert proc.returncode == 0 and lines and lines[-1].startswith("PASS ") \
+        and "SKIP " not in proc.stdout, proc.stdout[-3000:] + proc.stderr[-2000:]
+    print("G4 16_Decision_Top10.gs: differs from base only by the gated v1.13.8 "
+          "feed cohort binding (%s)" % lines[-1])
 
 
 def case_g5_verifier_ast_inventory_zero_removed(mp, tmp_path):
