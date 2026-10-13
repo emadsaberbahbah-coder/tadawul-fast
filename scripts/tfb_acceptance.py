@@ -73,7 +73,19 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.7"
+# v1.0.8 (2026-10-13, P0-1, Codex P1 on PR #763) -- RELEASE EXPIRY ENFORCED.
+# WHY: scripts/release_decision_feed.py may now write an audited EXECUTABLE
+# carrying 'expires=<YYYY-mm-ddTHH:MM:SS+03:00>'. D10-4c PASSed any EXECUTABLE
+# head, so an expired release still measured as actionable. CHANGE: an
+# EXECUTABLE head whose value carries an expires= token is WARN
+# (release_expired, no permission, a sweep is owed) once now > expires, and
+# FAIL (release_expiry_invalid, fail closed) when the token repeats or is
+# malformed. INERT TODAY: no value written before P0-1 carries expires=, and a
+# value without the token gives exactly the v1.0.7 checks (harness: corpus
+# comparison against the v1.0.7 copy). Read-only as before. Functions added: 1
+# (_feed_release_expiry, a lockstep copy shared verbatim with send_digest and
+# run_daily_brief). Removed: 0.
+VERSION = "1.0.8"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -566,13 +578,50 @@ def check_learning(src: Source) -> List[Check]:
     return out
 
 
+# P0-1 RELEASE EXPIRY (2026-10-13). LOCKSTEP COPY: these two constants and
+# _feed_release_expiry are byte-identical in scripts/send_digest.py,
+# scripts/run_daily_brief.py and scripts/tfb_acceptance.py (kept stdlib-only so
+# no consumer gains an import edge); tests/test_release_decision_feed.py fails
+# when the copies drift.
+_FEED_EXPIRES_RE = re.compile(r"(?<![A-Za-z0-9_])expires\s*=\s*([^\s|]*)", re.I)
+_FEED_EXPIRES_FORM = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+03:00", re.A)
+
+
+def _feed_release_expiry(raw: Any, now: Any = None) -> str:
+    """PURE. '' when the value carries no expires= token (every value written
+    before P0-1: behaviour unchanged) or its release is still live;
+    'release_expired' once now > expires; 'release_expiry_invalid' when the
+    token repeats or is not exactly YYYY-mm-ddTHH:MM:SS+03:00 (fail closed)."""
+    from datetime import datetime as _datetime, timezone as _timezone
+    found = _FEED_EXPIRES_RE.findall(str(raw or ""))
+    if not found:
+        return ""
+    if len(found) != 1 or not _FEED_EXPIRES_FORM.fullmatch(found[0]):
+        return "release_expiry_invalid"
+    try:
+        expires = _datetime.strptime(found[0], "%Y-%m-%dT%H:%M:%S%z")
+        current = now if now is not None else _datetime.now(_timezone.utc)
+        return "release_expired" if current > expires else ""
+    except (TypeError, ValueError):
+        return "release_expiry_invalid"
+
+
 def check_feed_truth(src: Source) -> List[Check]:
     kv = _status_globals(src)
     feed = kv.get("tfb decision feed", "")
     head = feed.split("|", 1)[0].strip() if feed else ""
     out = [Check("D10-4a", "decision feed key present", "PASS" if feed else "FAIL", head or None, feed[:120])]
     # v1.0.2: presence is not permission — the STATE is its own criterion.
-    if head.upper().startswith("EXECUTABLE"):
+    expiry = _feed_release_expiry(feed) if head.upper().startswith("EXECUTABLE") else ""
+    if expiry == "release_expired":
+        # v1.0.8: an audited release past its expires= grants no permission.
+        out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "WARN", expiry,
+                         "release past its expires= -- no investment/deployment permission (sweep owed)"))
+    elif expiry:
+        # v1.0.8: an unreadable or repeated expires= fails closed.
+        out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "FAIL", expiry,
+                         "release expires= unreadable -- not actionable (fail closed)"))
+    elif head.upper().startswith("EXECUTABLE"):
         out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "PASS", "EXECUTABLE", feed[:120]))
     elif head.upper().startswith("NOT_ACTIONABLE"):
         out.append(Check("D10-4c", "decision feed state (EXECUTABLE = actionable)", "WARN", head[:40],
