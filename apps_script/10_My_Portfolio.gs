@@ -1,7 +1,68 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.11
+ * Version: 1.5.12
+ *
+ * v1.5.12 MAIN CHANGES  (IBKR CAPTURE EVIDENCE + EXECUTION SCOPE + USD PEG +
+ *                        QUOTE PROVENANCE + CAPTURE WATCHER -- default OFF;
+ *                        ALL v1.5.11 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (2026-10-14; the REAL portfolio_actions build replayed offline on the
+ * owner's read-only IBKR positions, balances and working orders): every
+ * holding stays BLOCK because the request can never be certified. The
+ * build withheld, in order, on (1) custody_unknown: the 5023.SR sukuk is
+ * held outside the IBKR account, so no capture can link it;
+ * (2) fx_basis_mismatch / cash_request_mismatch: the caller FX (TFB_FX_LOOKUP
+ * USD 3.75547) and the panel cash are on a different basis from any
+ * evidence; (3) holding_quote_unverified: this page never sent the quote
+ * provenance columns (Data Provider, Warnings acquisition tokens, Last
+ * Updated (UTC)); (4) the evidence must reach the request within 900 s of
+ * the broker read. With the sukuk outside the execution scope, USD at the
+ * 3.75 peg in both places, the provenance columns sent and a fresh capture
+ * attached, the same build returned certified / funding_eligible.
+ * WHAT: Script Property PD_IBKR_EVIDENCE = off (default) | observe | enforce
+ * (any other value = off).
+ *  off     -> no Drive read; request, render and status line are v1.5.11
+ *             byte-identical.
+ *  observe -> reads the newest capture and appends ' | [ibkr-observe] ...'
+ *             (what enforce would send, or why not); request unchanged.
+ *  enforce -> (a) rows whose Symbol is listed in PD_EXECUTION_EXCLUDE (comma
+ *             list, e.g. 5023.SR) are not sent; they render in an OUTSIDE
+ *             EXECUTION SCOPE section and still count as consumed for the
+ *             v1.5.11 receipt; (b) fx_rates.USD = 3.75 (SAMA peg); (c) the
+ *             three provenance columns travel with each holding; (d) the
+ *             IBKR capture is the only evidence source: when the newest
+ *             capture in PD_IBKR_CAPTURE_FOLDER_ID is at most 14 minutes
+ *             old it becomes body.reconciliation_evidence (schema_version 1:
+ *             one account, complete positions, settled cash less working
+ *             BUY limit reservations, explicit links SYMBOL.US + USD ->
+ *             IBKR contract, a USD 3.75 policy proof) and the request cash
+ *             becomes that certified cash, rounded half-even to the cent
+ *             exactly as the backend compares it. Otherwise no evidence is
+ *             sent and the status line says why.
+ *  A capture is a JSON file 'TFB_IBKR_Capture_*.json' (schema
+ *  tfb.ibkr-capture/v1) carrying the verbatim read-only IBKR positions,
+ *  balances and orders responses and captured_at with an explicit offset.
+ *  It is rejected when captured_at is in the future or disagrees with the
+ *  Drive creation time by more than 10 minutes. Orders carry no currency, so
+ *  a BUY limit order is reserved against the only cash currency (rounded up
+ *  to the cent); with several cash currencies, or a BUY without a limit
+ *  price, reservations are declared incomplete and the cash stays withheld.
+ *  pdIbkrCaptureWatch (pdInstallCaptureWatcher: every 5 min; acts only in
+ *  observe/enforce and inside PD_IBKR_WATCH_WINDOW, default 08:30-10:30
+ *  Riyadh) runs refreshPortfolioDecision once per new capture at most 10
+ *  minutes old (PD_IBKR_LAST_PROCESSED, set after a completed refresh).
+ *  pdSelfTest also reports the mode, exclusions, the newest capture's
+ *  verdict and the watcher trigger, never amounts or the packet. The packet
+ *  is never logged or rendered.
+ * NOTE: this adds DriveApp to the project. Run pdSelfTest once from the
+ * editor right after pasting and approve the Drive permission; until then
+ * time-driven triggers in this project may fail authorization.
+ * ES5. Functions added: 27. Changed: pdCollectHoldings_ (optional extra
+ * fields), refreshPortfolioDecision (IBKR hook; returns its outcome),
+ * pdRenderPayload_ (optional out-of-scope section), pdSelfTest (report
+ * lines). Removed: 0. Rollback: unset PD_IBKR_EVIDENCE and run
+ * pdRemoveCaptureWatcher, or reinstall v1.5.11.
  *
  * v1.5.11 MAIN CHANGES  (SOURCE RECEIPT + RECONCILIATION EVIDENCE TRANSPORT —
  *                        receipt default OFF, evidence inert until the owner
@@ -470,6 +531,8 @@
  *      buildPortfolioDecisionLayout()  one-time/repair: panel + formats
  *      refreshPortfolioDecision()      collect -> POST -> render
  *      pdSelfTest()                    config/named-range/mapping dry checks
+ *      pdInstallCaptureWatcher()       v1.5.12: 5-min IBKR capture watcher
+ *      pdRemoveCaptureWatcher()        v1.5.12: remove that trigger
  *    Honest empties per L13; §3.4 design tokens with hardcoded fallbacks;
  *    breakApart() guards before every merged-zone rewrite.
  *
@@ -2456,7 +2519,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.11';
+var PD_VERSION = '1.5.12';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2926,6 +2989,629 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload) {
       : ' | source readiness ' + verdict;
 }
 
+/* ----- v1.5.12 IBKR capture evidence + execution scope ---------------------- */
+
+var PD_IBKR_MODE_PROP = 'PD_IBKR_EVIDENCE';       /* off (default) | observe | enforce */
+var PD_IBKR_FOLDER_PROP = 'PD_IBKR_CAPTURE_FOLDER_ID';
+var PD_IBKR_EXCLUDE_PROP = 'PD_EXECUTION_EXCLUDE'; /* comma list, e.g. 5023.SR */
+var PD_IBKR_WINDOW_PROP = 'PD_IBKR_WATCH_WINDOW';  /* HH:MM-HH:MM Riyadh | always */
+var PD_IBKR_LAST_PROP = 'PD_IBKR_LAST_PROCESSED';
+var PD_IBKR_WINDOW_DEFAULT = '08:30-10:30';
+var PD_IBKR_SCHEMA = 'tfb.ibkr-capture/v1';
+var PD_IBKR_NAME_PREFIX = 'TFB_IBKR_Capture_';
+var PD_IBKR_SEND_MAX_AGE_MS = 840000;   /* backend 900 s less a 60 s request margin */
+var PD_IBKR_WATCH_MAX_AGE_MS = 600000;  /* the watcher acts on captures <= 10 min */
+var PD_IBKR_CREATED_SKEW_MS = 600000;   /* captured_at vs Drive creation time */
+var PD_IBKR_FUTURE_SKEW_MS = 120000;
+var PD_IBKR_LOOKBACK_MS = 36 * 3600000;
+var PD_IBKR_MAX_CHARS = 200000;
+var PD_IBKR_MAX_ITEMS = 500;
+var PD_IBKR_CASH_LABEL = 'PF: Cash Available SAR';
+var PD_IBKR_USD_PEG = 3.75;
+var PD_IBKR_USD_PEG_TEXT = '3.75';
+var PD_IBKR_RATE_X100 = {USD: 375, SAR: 100};   /* exact SAR rate x 100 */
+var PD_IBKR_FX_SOURCE = 'policy://sama-usd-peg-3.75';
+var PD_IBKR_WATCH_HANDLER = 'pdIbkrCaptureWatch';
+var PD_IBKR_WATCH_EVERY_MIN = 5;
+var PD_IBKR_SAFE = 9007199254740991;
+var PD_IBKR_PROVENANCE_FIELDS = [
+  { send: 'Data Provider', match: ['Data Provider'] },
+  { send: 'Warnings', match: ['Warnings'] },
+  { send: 'Last Updated (UTC)', match: ['Last Updated (UTC)'] }
+];
+var PD_IBKR_DONE_STATES = {FILLED: true, CANCELLED: true, CANCELED: true,
+                           INACTIVE: true, EXPIRED: true, REJECTED: true};
+var PD_SCOPE_HEADERS = ['Symbol', 'Name', 'Ccy', 'Qty', 'Avg Cost', 'Price',
+  'Scope'];
+
+function pdIbkrMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_IBKR_MODE_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return (v === 'observe' || v === 'enforce') ? v : 'off';
+  } catch (e) {
+    return 'off';
+  }
+}
+
+function pdIbkrProp_(name) {
+  try {
+    var v = PropertiesService.getScriptProperties().getProperty(name);
+    return String(v === null || v === undefined ? '' : v)
+        .replace(/^\s+|\s+$/g, '');
+  } catch (e) {
+    return '';
+  }
+}
+
+function pdIbkrSym_(v) {
+  return String(v === null || v === undefined ? '' : v)
+      .replace(/^\s+|\s+$/g, '').toUpperCase();
+}
+
+/** PURE: 'a, B;c' -> ['A', 'B', 'C'] (trimmed, upper, unique). */
+function pdIbkrExcludeList_(raw) {
+  var out = [], seen = {};
+  var parts = String(raw === null || raw === undefined ? '' : raw)
+      .split(/[,;\s]+/);
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i].toUpperCase();
+    if (s && !seen.hasOwnProperty(s)) { seen[s] = true; out.push(s); }
+  }
+  return out;
+}
+
+/** PURE: rows split by the exclusion list on Symbol (trimmed, upper). */
+function pdIbkrSplitRows_(rows, exclude) {
+  var set = {};
+  for (var i = 0; i < (exclude || []).length; i++) set[exclude[i]] = true;
+  var kept = [], excluded = [];
+  for (var r = 0; r < (rows || []).length; r++) {
+    var s = pdIbkrSym_(rows[r] ? rows[r]['Symbol'] : '');
+    if (s && set.hasOwnProperty(s)) excluded.push(rows[r]);
+    else kept.push(rows[r]);
+  }
+  return {kept: kept, excluded: excluded};
+}
+
+/** PURE: a copy of the caller FX with USD at the 3.75 peg. */
+function pdIbkrPegRates_(rates) {
+  var out = {};
+  for (var k in rates) {
+    if (rates.hasOwnProperty(k)) out[k] = rates[k];
+  }
+  out.USD = PD_IBKR_USD_PEG;
+  return out;
+}
+
+/** PURE: a plain decimal (text exactly; a number via toFixed(scale), which
+ * absorbs binary float noise) -> integer units of 10^-scale, or null when
+ * malformed, finer than the scale, or not exactly representable. */
+function pdIbkrUnits_(value, scale) {
+  if (typeof value === 'boolean' || value === null || value === undefined) return null;
+  var text;
+  if (typeof value === 'number') {
+    if (!isFinite(value) || Math.abs(value) >= 1e15) return null;
+    text = value.toFixed(scale);
+  } else {
+    text = String(value).replace(/^\s+|\s+$/g, '');
+  }
+  var m = text.match(/^(-)?(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  var frac = m[3] || '';
+  if (frac.length > scale) {
+    if (/[^0]/.test(frac.slice(scale))) return null;
+    frac = frac.slice(0, scale);
+  }
+  while (frac.length < scale) frac += '0';
+  var digits = (m[2] + frac).replace(/^0+(?=\d)/, '');
+  if (digits.length > 15) return null;
+  var n = Number(digits);
+  return (m[1] && n !== 0) ? -n : n;
+}
+
+/** PURE: integer units -> plain decimal text ('12345.67', '0', '40'). */
+function pdIbkrUnitsText_(units, scale) {
+  var neg = units < 0;
+  var s = String(Math.abs(units));
+  while (s.length <= scale) s = '0' + s;
+  var whole = s.slice(0, s.length - scale);
+  var frac = s.slice(s.length - scale).replace(/0+$/, '');
+  return (neg ? '-' : '') + whole + (frac ? '.' + frac : '');
+}
+
+/** PURE: exact integer division of safe integers; mode 'up' (ceiling) or
+ * 'even' (round half to even, Python's Decimal default). */
+function pdIbkrDiv_(num, div, mode) {
+  var q = Math.floor(num / div);
+  var r = num - q * div;
+  while (r < 0) { q -= 1; r += div; }
+  while (r >= div) { q += 1; r -= div; }
+  if (r === 0) return q;
+  if (mode === 'up') return q + 1;
+  if (r * 2 > div) return q + 1;
+  if (r * 2 < div) return q;
+  return q % 2 === 0 ? q : q + 1;
+}
+
+/** PURE: cents -> '46296.26'. */
+function pdIbkrCentsText_(cents) {
+  var a = Math.abs(cents), c = a % 100;
+  return (cents < 0 ? '-' : '') + Math.floor(a / 100) + '.' + (c < 10 ? '0' : '') + c;
+}
+
+/** PURE: the decision Symbol an IBKR position stands for: a USD stock is
+ * SYMBOL.US (IBKR 'BRK B' -> 'BRK-B.US'); anything else links nothing. */
+function pdIbkrNative_(symbol, currency, assetClass) {
+  if (assetClass !== 'STK' || currency !== 'USD') return '';
+  var s = String(symbol || '').replace(/\s+/g, '-');
+  return /^[A-Z0-9][A-Z0-9.\-]{0,15}$/.test(s) ? s + '.US' : '';
+}
+
+/** captured_at must carry a full time and an explicit offset (Z or +HH:MM). */
+function pdIbkrStampMs_(value) {
+  if (typeof value !== 'string') return null;
+  var text = value.replace(/^\s+|\s+$/g, '');
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/
+      .test(text)) return null;
+  return pdSrcStampMs_(text);
+}
+
+function pdIbkrList_(value, key) {
+  var isArr = function (v) {
+    return Object.prototype.toString.call(v) === '[object Array]';
+  };
+  var list = isArr(value) ? value : ((value && isArr(value[key])) ? value[key] : null);
+  return (list && list.length <= PD_IBKR_MAX_ITEMS) ? list : null;
+}
+
+function pdIbkrAge_(ms) {
+  var m = Math.max(0, Math.round(ms / 60000));
+  if (m < 60) return m + 'm';
+  var h = Math.floor(m / 60);
+  if (h < 48) return h + 'h' + (m % 60 ? (m % 60) + 'm' : '');
+  return Math.floor(h / 24) + 'd' + (h % 24 ? (h % 24) + 'h' : '');
+}
+
+/** Riyadh wall clock HH:MM (UTC+3, no DST). */
+function pdIbkrRiyadh_(ms) {
+  return new Date(ms + 3 * 3600000).toISOString().slice(11, 16);
+}
+
+/** PURE: a parsed capture + the rows that WILL be sent -> the evidence plan.
+ * Bad input never throws: {ok: false, reason}. The packet carries nothing
+ * that is not in the capture except the declared USD peg proof. */
+function pdIbkrPlan_(cap, rows, nowMs, createdMs, sourceRef) {
+  var out = {ok: false, reason: '', packet: null, cashCents: null, cashNote: '',
+             capturedMs: null, ageMs: null, positions: 0, linked: 0,
+             rows: (rows || []).length, unlinked: [], unrepresented: []};
+  function fail(why) {
+    out.ok = false; out.reason = why; out.packet = null; out.cashCents = null;
+    return out;
+  }
+  if (!cap || typeof cap !== 'object' || cap.schema !== PD_IBKR_SCHEMA) {
+    return fail('capture schema unsupported');
+  }
+  var capMs = pdIbkrStampMs_(cap.captured_at);
+  if (capMs === null) return fail('captured_at needs a full timestamp with offset');
+  out.capturedMs = capMs;
+  out.ageMs = nowMs - capMs;
+  if (capMs - nowMs > PD_IBKR_FUTURE_SKEW_MS) return fail('capture is in the future');
+  if (typeof createdMs === 'number' && isFinite(createdMs) &&
+      (createdMs - capMs > PD_IBKR_CREATED_SKEW_MS ||
+       capMs - createdMs > PD_IBKR_FUTURE_SKEW_MS)) {
+    return fail('captured_at disagrees with the Drive file time');
+  }
+  var alias = typeof cap.account_alias === 'string' ? cap.account_alias : '';
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(alias)) return fail('account alias invalid');
+  var rawPos = pdIbkrList_(cap.positions, 'positions');
+  var rawBal = pdIbkrList_(cap.balances, 'balances');
+  var rawOrd = pdIbkrList_(cap.orders, 'orders');
+  if (!rawPos) return fail('positions read missing');
+  if (!rawBal) return fail('balances read missing');
+  if (!rawOrd) return fail('orders read missing');
+
+  var positions = [], seen = {};
+  for (var p = 0; p < rawPos.length; p++) {
+    var pos = rawPos[p] || {};
+    var cid = pos.contract_id;
+    var id = (typeof cid === 'number' && isFinite(cid) && cid > 0 &&
+              Math.floor(cid) === cid) ? String(cid)
+        : ((typeof cid === 'string' && /^\d{1,20}$/.test(cid)) ? cid : '');
+    var sym = pdIbkrSym_(pos.contract_description);
+    var ccy = pdIbkrSym_(pos.currency);
+    var qty = pdIbkrUnits_(pos.position, 6);
+    if (!id || !sym || sym.length > 32) return fail('position identity invalid');
+    if (seen.hasOwnProperty(id)) return fail('position repeated (' + sym + ')');
+    seen[id] = true;
+    if (!/^[A-Z]{3}$/.test(ccy)) return fail('position currency invalid (' + sym + ')');
+    if (qty === null || qty < 0) return fail('position quantity invalid (' + sym + ')');
+    positions.push({id: id, symbol: sym, currency: ccy,
+                    quantity: pdIbkrUnitsText_(qty, 6), positive: qty > 0,
+                    native: pdIbkrNative_(sym, ccy, pdIbkrSym_(pos.asset_class))});
+    if (qty > 0) out.positions++;
+  }
+
+  var cash = [], ccySeen = {};
+  for (var b = 0; b < rawBal.length; b++) {
+    var bal = rawBal[b] || {};
+    var bc = pdIbkrSym_(bal.currency);
+    if (bc === 'BASE') continue;
+    if (!/^[A-Z]{3}$/.test(bc)) return fail('balance currency invalid');
+    if (ccySeen.hasOwnProperty(bc)) return fail('balance repeated (' + bc + ')');
+    ccySeen[bc] = true;
+    var settled = pdIbkrUnits_(bal.settled_cash, 6);
+    if (settled === null) return fail('settled cash unreadable (' + bc + ')');
+    if (settled < 0) return fail('settled cash negative (' + bc + ')');
+    if (!PD_IBKR_RATE_X100.hasOwnProperty(bc)) {
+      if (settled === 0) continue;
+      return fail('cash in ' + bc + ' has no FX proof');
+    }
+    cash.push({currency: bc, settled: settled, reserved: 0});
+  }
+  if (!cash.length) return fail('no cash balance in the capture');
+
+  var complete = true, why = '';
+  for (var o = 0; o < rawOrd.length; o++) {
+    var ord = rawOrd[o] || {};
+    if (PD_IBKR_DONE_STATES.hasOwnProperty(pdIbkrSym_(ord.order_status))) continue;
+    var side = pdIbkrSym_(ord.side);
+    if (side === 'SELL') continue;
+    if (side !== 'BUY') { complete = false; why = 'order side unknown'; continue; }
+    var limit = pdIbkrUnits_(ord.limit_price, 4);
+    var left = pdIbkrUnits_(ord.remaining_shares_qty, 4);
+    if (limit === null || limit <= 0 || left === null || left < 0) {
+      complete = false; why = 'BUY order without a limit price'; continue;
+    }
+    if (cash.length !== 1) {
+      complete = false; why = 'BUY order currency ambiguous'; continue;
+    }
+    if (left > 0 && limit > Math.floor(PD_IBKR_SAFE / left)) {
+      complete = false; why = 'BUY order too large to reserve exactly'; continue;
+    }
+    /* qty x limit at 10^-8 -> cents, rounded up -> 10^-6 units */
+    cash[0].reserved += pdIbkrDiv_(left * limit, 1000000, 'up') * 10000;
+  }
+
+  if (!complete) {
+    out.cashNote = 'reservations incomplete (' + why + ')';
+  } else {
+    var total = 0, exact = true;
+    for (var c = 0; c < cash.length; c++) {
+      var net = cash[c].settled - cash[c].reserved;
+      var rate = PD_IBKR_RATE_X100[cash[c].currency];
+      if (net < 0) { exact = false; out.cashNote = 'cash over-reserved'; break; }
+      if (net > Math.floor(PD_IBKR_SAFE / rate) || total > PD_IBKR_SAFE - net * rate) {
+        exact = false; out.cashNote = 'cash too large for an exact check'; break;
+      }
+      total += net * rate;           /* SAR at 10^-8 */
+    }
+    if (exact) out.cashCents = pdIbkrDiv_(total, 1000000, 'even');
+  }
+
+  var links = [], used = {};
+  for (var i = 0; i < out.rows; i++) {
+    var row = rows[i] || {};
+    var rs = pdIbkrSym_(row['Symbol']);
+    var rc = pdIbkrSym_(row['Currency']);
+    var hit = null, hits = 0;
+    for (var q = 0; q < positions.length; q++) {
+      if (positions[q].native && positions[q].native === rs &&
+          positions[q].currency === rc) { hit = positions[q]; hits++; }
+    }
+    if (hits === 1 && !used.hasOwnProperty(hit.id)) {
+      used[hit.id] = true;
+      links.push({row_index: i, account_id: alias, instrument_id: hit.id,
+                  position_symbol: hit.symbol, symbol: rs, currency: rc});
+    } else {
+      out.unlinked.push(rs || '?');
+    }
+  }
+  for (var u = 0; u < positions.length; u++) {
+    if (positions[u].positive && !used.hasOwnProperty(positions[u].id)) {
+      out.unrepresented.push(positions[u].symbol);
+    }
+  }
+  out.linked = links.length;
+
+  var iso = new Date(capMs).toISOString();
+  var posRows = [], cashRows = [];
+  for (var w = 0; w < positions.length; w++) {
+    posRows.push({instrument_id: positions[w].id, symbol: positions[w].symbol,
+                  currency: positions[w].currency, quantity: positions[w].quantity});
+  }
+  for (var k = 0; k < cash.length; k++) {
+    cashRows.push({currency: cash[k].currency,
+                   settled_cash: pdIbkrUnitsText_(cash[k].settled, 6),
+                   reserved_cash: pdIbkrUnitsText_(cash[k].reserved, 6),
+                   reservations_complete: complete});
+  }
+  out.packet = {
+    schema_version: 1,
+    source_ref: String(sourceRef || 'ibkr-capture'),
+    captured_at: iso,
+    accounts: [{account_id: alias, positions_asof: iso, positions_complete: true,
+                positions: posRows, cash_asof: iso, cash_complete: true,
+                cash: cashRows}],
+    holding_links: links,
+    funding_accounts: [alias],
+    fx_rates: [{currency: 'USD', rate_to_sar: PD_IBKR_USD_PEG_TEXT, asof: iso,
+                source_ref: PD_IBKR_FX_SOURCE}]
+  };
+  out.ok = true;
+  return out;
+}
+
+/** PURE: the status-line fragment (never the receipt phrase, never the
+ * packet; the certified cash is shown because it replaces the panel's). */
+function pdIbkrNote_(mode, plan, fresh, excluded) {
+  var ex = [];
+  for (var i = 0; i < (excluded || []).length; i++) {
+    ex.push(pdIbkrSym_(excluded[i] ? excluded[i]['Symbol'] : '') || '?');
+  }
+  var detail = [];
+  if (plan && plan.ok) {
+    detail.push('capture ' + pdIbkrRiyadh_(plan.capturedMs) + ' age ' +
+                pdIbkrAge_(plan.ageMs));
+    detail.push('linked ' + plan.linked + '/' + plan.rows);
+    if (plan.unrepresented.length) {
+      detail.push('IBKR not on page: ' + plan.unrepresented.join(','));
+    }
+    detail.push(plan.cashCents !== null
+        ? 'cash ' + pdIbkrCentsText_(plan.cashCents) + ' SAR'
+        : (plan.cashNote || 'cash withheld'));
+  }
+  var why;
+  if (!(plan && plan.ok)) why = String((plan && plan.reason) || 'no capture');
+  else if (plan.ageMs < 0) why = 'capture time is ahead of this clock';
+  else {
+    why = 'capture ' + pdIbkrRiyadh_(plan.capturedMs) + ' is ' +
+        pdIbkrAge_(plan.ageMs) + ' old (limit 14m)';
+  }
+  var scope = ex.length ? (mode === 'enforce' ? 'excluded ' : 'would exclude ') +
+      ex.join(',') : '';
+  var text;
+  if (mode === 'enforce') {
+    text = fresh
+        ? ' | ibkr evidence SENT (' + detail.join('; ') + '; USD 3.75' +
+          (scope ? '; ' + scope : '') + ')'
+        : ' | ibkr evidence NOT SENT: ' + why + '; USD 3.75' +
+          (scope ? '; ' + scope : '');
+  } else {
+    text = fresh
+        ? ' | [ibkr-observe] would send (' + detail.join('; ') +
+          (scope ? '; ' + scope : '') + '; USD 3.75)'
+        : ' | [ibkr-observe] would not send: ' + why + (scope ? '; ' + scope : '');
+  }
+  return text.replace(/source\s+readiness/gi, 'source check').slice(0, 400);
+}
+
+/** Newest capture file in the configured folder (bounded Drive search).
+ * Never throws: {ok, reason, id, name, createdMs, json}. */
+function pdIbkrLatestCapture_(nowMs) {
+  var res = {ok: false, reason: '', id: '', name: '', createdMs: null, json: null};
+  var folderId = pdIbkrProp_(PD_IBKR_FOLDER_PROP);
+  if (!folderId) {
+    res.reason = 'capture folder not set (' + PD_IBKR_FOLDER_PROP + ')';
+    return res;
+  }
+  if (!/^[A-Za-z0-9_-]{10,200}$/.test(folderId)) {
+    res.reason = 'capture folder id invalid';
+    return res;
+  }
+  try {
+    var since = new Date(nowMs - PD_IBKR_LOOKBACK_MS).toISOString().slice(0, 19);
+    var files = DriveApp.searchFiles("'" + folderId + "' in parents and " +
+        "trashed = false and title contains '" + PD_IBKR_NAME_PREFIX +
+        "' and modifiedDate > '" + since + "'");
+    var best = null, scanned = 0;
+    while (files.hasNext() && scanned < 100) {
+      var f = files.next();
+      scanned++;
+      var name = String(f.getName() || '');
+      if (name.indexOf(PD_IBKR_NAME_PREFIX) !== 0 || !/\.json$/i.test(name)) continue;
+      var created = f.getDateCreated().getTime();
+      if (!best || created > best.created) best = {file: f, name: name, created: created};
+    }
+    if (!best) { res.reason = 'no capture in the last 36h'; return res; }
+    var text = best.file.getBlob().getDataAsString('UTF-8');
+    if (!text || text.length > PD_IBKR_MAX_CHARS) {
+      res.reason = 'capture size invalid';
+      return res;
+    }
+    var parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (eJ) {
+      res.reason = 'capture is not JSON';
+      return res;
+    }
+    res.ok = true;
+    res.id = String(best.file.getId());
+    res.name = best.name;
+    res.createdMs = best.created;
+    res.json = parsed;
+    return res;
+  } catch (e) {
+    var msg = String(e && e.message ? e.message : e);
+    res.reason = /permission|authori[sz]/i.test(msg)
+        ? 'Drive not authorized (run pdSelfTest from the editor)'
+        : 'capture read failed';
+    return res;
+  }
+}
+
+/** v1.5.12: apply the observe/enforce mode to the request body IN PLACE.
+ * Returns {note, excluded, controls, sent}. Never throws. */
+function pdIbkrApply_(mode, body) {
+  var res = {note: '', excluded: [], controls: null, sent: false};
+  try {
+    var nowMs = Date.now();
+    var split = pdIbkrSplitRows_(body.rows,
+        pdIbkrExcludeList_(pdIbkrProp_(PD_IBKR_EXCLUDE_PROP)));
+    var cap = pdIbkrLatestCapture_(nowMs);
+    var plan = cap.ok
+        ? pdIbkrPlan_(cap.json, split.kept, nowMs, cap.createdMs,
+                      'ibkr-capture:' + cap.name)
+        : {ok: false, reason: cap.reason};
+    var fresh = plan.ok === true && plan.ageMs >= 0 &&
+        plan.ageMs <= PD_IBKR_SEND_MAX_AGE_MS;
+    if (mode === 'enforce') {
+      var rates = pdIbkrPegRates_(body.fx_rates);
+      var controls = null;
+      if (fresh && plan.cashCents !== null) {
+        controls = {};
+        for (var k in body.controls) {
+          if (body.controls.hasOwnProperty(k)) controls[k] = body.controls[k];
+        }
+        controls[PD_IBKR_CASH_LABEL] = plan.cashCents / 100;
+      }
+      body.rows = split.kept;
+      body.fx_rates = rates;
+      delete body.reconciliation_evidence;     /* enforce: the capture only */
+      if (fresh) body.reconciliation_evidence = plan.packet;
+      if (controls) {
+        body.controls = controls;
+        res.controls = controls;
+      }
+      res.excluded = split.excluded;
+      res.sent = fresh;
+    }
+    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded);
+  } catch (e) {
+    res.note = ' | ibkr evidence ERROR (' +
+        String(e && e.message ? e.message : e).slice(0, 80) + ')';
+  }
+  return res;
+}
+
+/** PURE: 'HH:MM-HH:MM' (Riyadh) or 'always'; blank/invalid -> the default. */
+function pdIbkrWindow_(raw) {
+  var text = String(raw === null || raw === undefined ? '' : raw)
+      .replace(/\s+/g, '').toLowerCase();
+  if (text === 'always') return {always: true, text: 'always'};
+  var m = text.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+  if (!m || +m[1] > 23 || +m[2] > 59 || +m[3] > 23 || +m[4] > 59) {
+    m = PD_IBKR_WINDOW_DEFAULT.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+  }
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return {always: false, from: +m[1] * 60 + +m[2], to: +m[3] * 60 + +m[4],
+          text: pad(+m[1]) + ':' + m[2] + '-' + pad(+m[3]) + ':' + m[4]};
+}
+
+function pdIbkrWindowOpen_(win, nowMs) {
+  if (win.always) return true;
+  var d = new Date(nowMs + 3 * 3600000);
+  var t = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return win.from <= win.to ? (t >= win.from && t < win.to)
+                            : (t >= win.from || t < win.to);
+}
+
+/** Time-driven (pdInstallCaptureWatcher). One decision refresh per new
+ * capture that is at most 10 minutes old; observe/enforce only. */
+function pdIbkrCaptureWatch() {
+  var mode = pdIbkrMode_();
+  if (mode === 'off') return 'off';
+  var nowMs = Date.now();
+  if (!pdIbkrWindowOpen_(pdIbkrWindow_(pdIbkrProp_(PD_IBKR_WINDOW_PROP)), nowMs)) {
+    return 'outside window';
+  }
+  var lock = null;
+  try {
+    lock = LockService.getScriptLock();
+    if (!lock.tryLock(5000)) { lock = null; return 'busy'; }
+  } catch (eL) {
+    return 'lock unavailable';
+  }
+  try {
+    var cap = pdIbkrLatestCapture_(nowMs);
+    if (!cap.ok) return 'no capture: ' + cap.reason;
+    var props = PropertiesService.getScriptProperties();
+    if (props.getProperty(PD_IBKR_LAST_PROP) === cap.id) return 'already processed';
+    var capMs = pdIbkrStampMs_(cap.json ? cap.json.captured_at : null);
+    if (capMs !== null && capMs > nowMs) return 'capture time ahead of the clock';
+    if (capMs === null || nowMs - capMs > PD_IBKR_WATCH_MAX_AGE_MS) {
+      props.setProperty(PD_IBKR_LAST_PROP, cap.id);
+      return 'capture not usable for a decision';
+    }
+    var outcome = String(refreshPortfolioDecision() || '');
+    if (/^(NETWORK ERROR|HTTP )/.test(outcome)) return 'refresh failed: ' + outcome;
+    props.setProperty(PD_IBKR_LAST_PROP, cap.id);
+    Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher refreshed (' +
+               mode + ', status ' + outcome + ')');
+    return 'refreshed';
+  } catch (e) {
+    Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher error: ' +
+               String(e && e.message ? e.message : e).slice(0, 120));
+    return 'error';
+  } finally {
+    if (lock) {
+      try { lock.releaseLock(); } catch (eR) {}
+    }
+  }
+}
+
+function pdRemoveCaptureWatcher_() {
+  var n = 0;
+  var all = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getHandlerFunction() === PD_IBKR_WATCH_HANDLER) {
+      ScriptApp.deleteTrigger(all[i]);
+      n++;
+    }
+  }
+  return n;
+}
+
+/** Operator: install (or replace) the 5-minute capture watcher. */
+function pdInstallCaptureWatcher() {
+  var replaced = pdRemoveCaptureWatcher_();
+  ScriptApp.newTrigger(PD_IBKR_WATCH_HANDLER).timeBased()
+      .everyMinutes(PD_IBKR_WATCH_EVERY_MIN).create();
+  var msg = '[MP-DEC v' + PD_VERSION + '] capture watcher installed: every ' +
+      PD_IBKR_WATCH_EVERY_MIN + ' min, window ' +
+      pdIbkrWindow_(pdIbkrProp_(PD_IBKR_WINDOW_PROP)).text + ' Riyadh, mode ' +
+      pdIbkrMode_() + (replaced ? ' (replaced ' + replaced + ')' : '');
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
+  return msg;
+}
+
+/** Operator: remove the capture watcher trigger(s). */
+function pdRemoveCaptureWatcher() {
+  var msg = '[MP-DEC v' + PD_VERSION + '] capture watcher removed: ' +
+      pdRemoveCaptureWatcher_();
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
+  return msg;
+}
+
+function pdIbkrWatcherState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_WATCH_HANDLER) n++;
+    }
+    return n ? 'installed (' + n + ', every ' + PD_IBKR_WATCH_EVERY_MIN +
+               ' min, window ' + pdIbkrWindow_(pdIbkrProp_(PD_IBKR_WINDOW_PROP)).text +
+               ' Riyadh)'
+             : 'not installed (run pdInstallCaptureWatcher)';
+  } catch (e) {
+    return 'unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE: one OUTSIDE EXECUTION SCOPE display row. */
+function pdScopeToRow_(r) {
+  r = r || {};
+  return [pdCell_(r['Symbol']), pdCell_(r['Name']), pdCell_(r['Currency']),
+          pdCell_(r['Quantity']), pdCell_(r['Avg Cost']),
+          pdCell_(r['Current Price']), 'outside execution scope'];
+}
+
 function pdTokens_(ss) {
   var out = {};
   for (var k in PD_FALLBACK_TOKENS) {
@@ -3004,16 +3690,19 @@ function pdReadPanel_(sheet, ss) {
 
 /* ----- holdings pool (reads the 122-col My_Portfolio page) ----------------- */
 
-function pdCollectHoldings_() {
+function pdCollectHoldings_(extraFields) {
   var sheet = ensureSheetExists_(MY_PORTFOLIO_PAGE_);
   var headers = readCurrentSheetHeaders_(sheet);
   if (!headers.length || sheet.getLastRow() < 2) {
     return { rows: [], reason: 'My_Portfolio has no data rows' };
   }
   var headerMap = getHeaderMapMyPortfolio_(headers);
+  /* v1.5.12: optional extra send fields (enforce: quote provenance). */
+  var fields = (extraFields && extraFields.length)
+      ? PD_HOLDING_FIELDS.concat(extraFields) : PD_HOLDING_FIELDS;
   var colByField = {};
-  for (var f = 0; f < PD_HOLDING_FIELDS.length; f++) {
-    var spec = PD_HOLDING_FIELDS[f];
+  for (var f = 0; f < fields.length; f++) {
+    var spec = fields[f];
     var col = null;
     for (var m = 0; m < spec.match.length; m++) {
       col = myPortfolioResolveHeaderColumn_(headerMap, spec.match[m]);
@@ -3057,8 +3746,8 @@ function pdCollectHoldings_() {
     var sym = values[r][colByField['Symbol'] - 1];
     if (!pdHasValue_(sym)) continue;
     var obj = {};
-    for (var i = 0; i < PD_HOLDING_FIELDS.length; i++) {
-      var send = PD_HOLDING_FIELDS[i].send;
+    for (var i = 0; i < fields.length; i++) {
+      var send = fields[i].send;
       var c = colByField[send];
       if (!c) continue;
       var v = values[r][c - 1];
@@ -3266,7 +3955,10 @@ function refreshPortfolioDecision() {
    * read; off = no _Status read (the v1.5.10 path). */
   var receiptMode = pdReceiptMode_();
   var sourceCtx = receiptMode === 'off' ? null : pdSrcCapture_(ss);
-  var pool = pdCollectHoldings_();
+  /* v1.5.12: enforce also sends the quote provenance columns. */
+  var ibkrMode = pdIbkrMode_();
+  var pool = pdCollectHoldings_(ibkrMode === 'enforce'
+      ? PD_IBKR_PROVENANCE_FIELDS : null);
   var poolNote = pool.rows.length
       ? 'holdings ' + pool.rows.length + ' rows from ' + MY_PORTFOLIO_PAGE_ +
         ' (qty/cost from cost-basis: ' + (pool.costBasisApplied || 0) + ')'
@@ -3283,40 +3975,45 @@ function refreshPortfolioDecision() {
    * (absent -> request unchanged). Never logged. */
   var evidence = pdEvidencePacket_();
   if (evidence) body.reconciliation_evidence = evidence;
+  /* v1.5.12: IBKR capture evidence + execution scope; off -> no Drive
+   * read and the request is unchanged. Never logged. */
+  var ibkr = ibkrMode === 'off' ? null : pdIbkrApply_(ibkrMode, body);
 
   var resp;
   try {
     resp = pdPost_(body);
   } catch (eNet) {
     statusCell.setValue(pdStatusLine_('NETWORK ERROR', String(eNet)));
-    return;
+    return 'NETWORK ERROR';
   }
   if (resp.code !== 200 || !resp.json) {
     statusCell.setValue(pdStatusLine_('HTTP ' + resp.code,
         (resp.text || '').slice(0, 180)));
-    return;
+    return 'HTTP ' + resp.code;
   }
   var payload = resp.json;
-  pdRenderPayload_(sheet, payload, tokens);
+  pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null);
 
   /* v1.5.9: append the just-rendered board to _Portfolio_Action_Log from
    * memory (16 v1.3.1 pattern). Never throws — failures become the note. */
   var logNote = pdAppendActionLog_(ss, payload.actions || [],
-      pdMetaLine_(payload.meta), panel);
+      pdMetaLine_(payload.meta), ibkr && ibkr.controls ? ibkr.controls : panel);
 
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   /* v1.5.11 (A): '' when off, so the line stays v1.5.10 byte-identical. */
   var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,
       pool.rows.length, payload);
-  var statusLine = poolNote + receiptNote + ' | ' + pdMetaLine_(payload.meta) +
+  var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
+      pdMetaLine_(payload.meta) +
       ' | ' + secs + 's';
   statusCell.setValue(pdStatusLine_(String(payload.status || '?'),
       logNote ? statusLine + ' | ' + logNote : statusLine));
   Logger.log('[MP-DEC v' + PD_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's' + (logNote ? ' | ' + logNote : ''));
+  return String(payload.status || '?');
 }
 
-function pdRenderPayload_(sheet, payload, tokens) {
+function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
   var lastRow = sheet.getMaxRows();
   if (lastRow >= PD_ZONES_START) {
     var zone = sheet.getRange(PD_ZONES_START, 1,
@@ -3383,6 +4080,23 @@ function pdRenderPayload_(sheet, payload, tokens) {
   var alT = pdWriteTable_(sheet, row, PD_ALERT_HEADERS, alRows,
       'None \u2014 no data or capital alerts raised.');
   row = alT.next + 1;
+
+  /* v1.5.12: enforce-mode rows outside the execution scope (absent -> the
+   * v1.5.11 render). Display only: never weighted, funded or actioned. */
+  if (outOfScope && outOfScope.length) {
+    row = pdWriteSection_(sheet, row, 'OUTSIDE EXECUTION SCOPE (' +
+        outOfScope.length + ') \u2014 held, not weighted, funded or actioned ' +
+        '(PD_EXECUTION_EXCLUDE)', tokens);
+    var oRows = [];
+    for (var o = 0; o < outOfScope.length; o++) {
+      oRows.push(pdScopeToRow_(outOfScope[o]));
+    }
+    var oT = pdWriteTable_(sheet, row, PD_SCOPE_HEADERS, oRows, '');
+    pdApplyColFormats_(sheet, oT.firstDataRow, oT.count, {
+      4: PD_FMT_INT, 5: PD_FMT_PRICE, 6: PD_FMT_PRICE
+    });
+    row = oT.next + 1;
+  }
 
   sheet.getRange(row, 1, 1, PD_LAST_COL).merge()
       .setValue(pdMetaLine_(payload.meta))
@@ -3668,6 +4382,29 @@ function pdSelfTest() {
       ? 'ready, run ' + srcNow.cohort : 'not ready: ' + srcNow.reason));
   report.push('reconciliation evidence property: ' +
       (pdEvidencePacket_() ? 'present (schema 1)' : 'absent'));
+  /* v1.5.12: IBKR capture evidence (read-only; never amounts or the packet). */
+  report.push('IBKR evidence mode (PD_IBKR_EVIDENCE): ' + pdIbkrMode_());
+  var ibEx = pdIbkrExcludeList_(pdIbkrProp_(PD_IBKR_EXCLUDE_PROP));
+  report.push('execution scope exclusions (PD_EXECUTION_EXCLUDE): ' +
+      (ibEx.length ? ibEx.join(', ') : 'none'));
+  var ibNow = Date.now();
+  var ibCap = pdIbkrLatestCapture_(ibNow);
+  if (!ibCap.ok) {
+    report.push('IBKR capture: ' + ibCap.reason);
+  } else {
+    var ibPlan = pdIbkrPlan_(ibCap.json, pdIbkrSplitRows_(pool.rows, ibEx).kept,
+        ibNow, ibCap.createdMs, 'ibkr-capture:' + ibCap.name);
+    report.push('IBKR capture: ' + ibCap.name + ' -> ' + (ibPlan.ok
+        ? 'valid; captured ' + pdIbkrRiyadh_(ibPlan.capturedMs) + ' Riyadh, age ' +
+          pdIbkrAge_(ibPlan.ageMs) + '; positions ' + ibPlan.positions +
+          '; linked ' + ibPlan.linked + '/' + ibPlan.rows +
+          (ibPlan.unrepresented.length
+              ? '; IBKR not on page: ' + ibPlan.unrepresented.join(',') : '') +
+          '; cash ' + (ibPlan.cashCents !== null ? 'certifiable'
+                                                 : (ibPlan.cashNote || 'withheld'))
+        : 'rejected: ' + ibPlan.reason));
+  }
+  report.push('capture watcher: ' + pdIbkrWatcherState_());
   var msg = report.join('\n');
   Logger.log(msg);
   try {
