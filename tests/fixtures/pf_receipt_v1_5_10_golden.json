@@ -1,0 +1,39 @@
+{
+ "note": "refreshPortfolioDecision off-mode output of 10_My_Portfolio.gs v1.5.10 on the synthetic scenario",
+ "source_sha256": "cb351aa67c7c905e1c951e6c201ca5a04b843ea3d575345e41e5b3b628444001",
+ "b2": "Last run 2026-10-14 08:50:11 | status: ok | holdings 2 rows from My_Portfolio (qty/cost from cost-basis: 0) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+ "post_body": {
+  "rows": [
+   {
+    "Symbol": "SYNTH1.US",
+    "Name": "Synthetic One",
+    "Sector": "Energy",
+    "Currency": "USD",
+    "Quantity": 10,
+    "Buy Price": 20.5,
+    "Avg Cost": 20.5,
+    "Current Price": 21.25
+   },
+   {
+    "Symbol": "SYNTH2.SR",
+    "Name": "Synthetic Two",
+    "Sector": "Financials",
+    "Currency": "SAR",
+    "Quantity": 5,
+    "Buy Price": 100,
+    "Avg Cost": 100,
+    "Current Price": 99.5
+   }
+  ],
+  "controls": {
+   "PF: Cash Available SAR": 0,
+   "PF: Target Cash %": 10,
+   "PF: Max Position %": 15,
+   "PF: Max Sector %": 30,
+   "PF: Min Reliability to Add": 70,
+   "PF: Min DQ to Add": 80,
+   "PF: Rebalance Mode": "Advisory Only"
+  },
+  "fx_rates": {}
+ }
+}
