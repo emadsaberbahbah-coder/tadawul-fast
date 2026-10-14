@@ -1,5 +1,13 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.4 (2026-10-14) -- FW-2 SCOPE VARIABLE IN BOTH WRITER JOBS
+# WHY (2026-10-14): run_dashboard_sync v6.70.0 adds TFB_SYNC_FW2_SCOPE
+# (off | observe | enforce, default off = v6.69.0 byte-identical). The FW-2
+# row firewall turned 76 healthy Global_Markets rows (JNJ, AMAT, Samsung,
+# Tokyo Electron, Givaudan) into symbol-only stubs on run 38486122061, which
+# alone fails the 99% name gate. Mapped in sync-dashboard AND
+# recover-missing-market-pages so recovery cannot undo the primary leg.
+# Unset Variable -> 'off' -> nothing moves. Rollback: unset the Variable.
 # VERSION 1.0.3 (2026-10-13) -- SUPERSEDE A RELEASED DECISION FEED AT WRITER START (P0-1)
 # WHY (2026-10-13, Codex P1 on PR #763): with TFB_DECISION_RELEASE armed, a
 # release of run N stayed EXECUTABLE while this workflow re-stamped every page
@@ -435,6 +443,11 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # v6.70.0 FW-2 SCOPE (2026-10-14): off = v6.69.0; observe adds the
+      # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
+      # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
+      # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.
+      TFB_SYNC_FW2_SCOPE: ${{ vars.TFB_SYNC_FW2_SCOPE || 'off' }}
       # WP-04: arm the runner's USX minor-unit screen in lockstep with Render.
       # Unset preserves the existing portfolio currency contract; rollback: 0.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
@@ -1708,6 +1721,11 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # v6.70.0 FW-2 SCOPE (2026-10-14): off = v6.69.0; observe adds the
+      # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
+      # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
+      # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.
+      TFB_SYNC_FW2_SCOPE: ${{ vars.TFB_SYNC_FW2_SCOPE || 'off' }}
       # WP-04: mirror the primary runner's default-off minor-unit screen.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
