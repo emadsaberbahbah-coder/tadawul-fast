@@ -14,8 +14,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 REGISTRY_PATH = Path(__file__).resolve().parents[1] / "data" / "verified_name_labels.json"
+# A finite reviewed-label capacity accommodates the 122 public-authority
+# bindings, including the 67 exact US captions added on 14 October. The
+# independent 256 kB file limit and every identity/quarantine fence remain.
+MAX_BINDINGS = 256
 _PAGES = {"Global_Markets", "Mutual_Funds"}
 _METADATA = ("Asset Class", "Exchange", "Currency", "Country")
 _REQUIRED = ("Symbol", "Name", *_METADATA, "Current Price", "Warnings",
@@ -64,7 +68,8 @@ def _load_registry(path):
             or set(data) != {"schema", "label_only", "current_authority_only", "bindings"}
             or data["schema"] != "tfb.verified-name-labels/v1"
             or data["label_only"] is not True or data["current_authority_only"] is not True
-            or not isinstance(data["bindings"], list) or not 1 <= len(data["bindings"]) <= 100):
+            or not isinstance(data["bindings"], list)
+            or not 1 <= len(data["bindings"]) <= MAX_BINDINGS):
         raise ValueError("invalid registry schema")
     bindings = {}
     for item in data["bindings"]:

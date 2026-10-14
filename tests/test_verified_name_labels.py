@@ -52,8 +52,8 @@ def registry_file(tmp_path, transform):
     return path
 
 
-def test_all_55_reviewed_bindings_change_only_name_without_promoting_any_guard():
-    assert len(BINDINGS) == 55
+def test_all_reviewed_bindings_change_only_name_without_promoting_any_guard():
+    assert len(BINDINGS) == 122
     assert sum(x["page"] == "Mutual_Funds" for x in BINDINGS) == 39
     for item in BINDINGS:
         headers = get_sheet_headers(item["page"])
@@ -288,7 +288,7 @@ def test_committed_registry_is_only_public_authority_identity_data():
     raw = labels.REGISTRY_PATH.read_text()
     assert all(word not in raw for word in ("/workspace/", "account", "holdings", "broker", "api_token"))
     loaded, _ = labels._load_registry(labels.REGISTRY_PATH)
-    assert len(loaded) == 55
+    assert len(loaded) == 122
     assert all("eodhd.com" not in source["url"] for item in BINDINGS for source in item["sources"])
     nvei = binding("NVEI.TO")
     assert nvei["native_metadata"] == {"Asset Class": "Equity", "Exchange": "TSX", "Currency": "CAD", "Country": "Canada"}
@@ -309,3 +309,49 @@ def test_committed_registry_is_only_public_authority_identity_data():
     assert "eodhd.com" not in json.dumps(public_without_approved_bridge)
     assert "not been independently rehashed" in stm["identifiers"]["namespace_bridge_limitation"]
     assert len(stm["sources"]) == 5
+
+
+def test_new_us_authority_captions_keep_the_entire_identity_quarantine():
+    reviewed = [item for item in BINDINGS
+                if item["reviewed_at_utc"].startswith("2026-10-14")]
+    assert len(reviewed) == 67
+    headers = get_sheet_headers("Global_Markets")
+    rows = [row_for(item) for item in reviewed]
+    original = copy.deepcopy(rows)
+    output, receipt = labels.apply_verified_name_labels(
+        "Global_Markets", headers, rows, now=NOW)
+    assert receipt["applied"] == 67 and receipt["held"] == 0
+    name_i = headers.index("Name")
+    for item, before, after in zip(reviewed, original, output):
+        assert item["requires_quarantine"] is True
+        assert not any(item["native_metadata"].values())
+        assert item["identifiers"]["exact_authority_ticker"] + ".US" == item["symbol"]
+        assert len(item["sources"]) == 2
+        assert {source["url"].split("/")[2] for source in item["sources"]} == {
+            "www.sec.gov", "www.nasdaqtrader.com"}
+        assert before[:name_i] + before[name_i + 1:] == after[:name_i] + after[name_i + 1:]
+        assert after[headers.index("Warnings")].startswith("identity_quarantined:")
+        assert after[headers.index("Current Price")] is None
+        assert after[headers.index("Data Provider")] == ""
+        assert after[headers.index("Final Action")] == ""
+    assert rows == original
+
+
+def test_registry_entry_capacity_is_finite_independently_of_byte_limit(tmp_path):
+    item = binding("ADVB.US")
+    item.update(state="Caption only.", identifiers={"CIK": "1"},
+                sources=[{"url": "https://www.sec.gov/a", "sha256": "0" * 64,
+                          "captured_at_utc": item["reviewed_at_utc"]}])
+    entries = []
+    for index in range(labels.MAX_BINDINGS + 1):
+        entry = copy.deepcopy(item)
+        entry["symbol"] = str(index) + ".US"
+        entry["review_receipt_sha256"] = labels._binding_digest(entry)
+        entries.append(entry)
+    data = {"schema": DATA["schema"], "label_only": True, "current_authority_only": True,
+            "bindings": entries}
+    path = tmp_path / "over-capacity.json"
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    assert path.stat().st_size < 256_000
+    with pytest.raises(ValueError, match="invalid registry schema"):
+        labels._load_registry(path)
