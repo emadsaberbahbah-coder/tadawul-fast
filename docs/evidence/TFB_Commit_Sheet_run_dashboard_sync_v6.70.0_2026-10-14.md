@@ -14,7 +14,7 @@ The repository's real final-publication audit (`finalize_decision_publication.ru
 
 | Effect on the 14 Oct cohort | Measured |
 | --- | --- |
-| GM name coverage | 97.00% (198 nameless rows), below the 99% gate. 76 of the 198 are FW-2 stubs. |
+| GM name coverage | 97.00% (198 nameless rows), below the 99% gate. 75 of the 198 are FW-2 stubs; the 76th stub (RYOJ.US) kept its name. |
 | GM timestamps | 76 blank, unparseable or date-only, all of them stubs. That is a coverage WARNING, so exit 1, and the P0-1 release refuses anything but [0, 0]. |
 | Counterfactual: stubs keep their rows, other blockers fixed | coverage exit 0 is reachable only once the stubs are gone (scenario S8 below). |
 
@@ -67,7 +67,7 @@ Offline final-publication replays on the 14 Oct export (real audit code, edited 
 | Scenario | Audit codes | Remaining blockers |
 | --- | --- | --- |
 | S0 as exported | [2, 2] | GM names 97.00%; PF and T10 receipts; T10 pool count and reconciliation; false full-universe claim |
-| S3 cockpit + PF receipt + names back on the 76 stubs | [2, 0] | GM names 98.14% (the 123 no-data rows) |
+| S3 cockpit + PF receipt + names back on the 75 nameless stubs | [2, 0] | GM names 98.14% (the 123 no-data rows) |
 | S6 ... + all 198 GM names repaired | [1, 0] | 76 blank stamps (warning). A release refuses this. |
 | S8 ... + the 76 stub rows written as real rows (name + stamp) | **[0, 0]** | none |
 

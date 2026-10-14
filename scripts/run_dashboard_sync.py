@@ -15,9 +15,10 @@ legs before it, Q3 earnings season). 38 came back from last-good; 76 stayed
 symbol-only stubs because their previous sheet row was already a stub. The
 stubs include JNJ, AMAT, CDW, FLEX, INFY, Samsung Electronics (005930.KS),
 Tokyo Electron (8035.T) and Givaudan (GIVN.SW). Replaying the real
-final-publication audit offline on that export: the stubs are 76 of the 198
-nameless GM rows (name coverage 97.00% < 99%) and all 76 of its blank
-timestamps (a coverage warning, so exit 1, which a release refuses). The
+final-publication audit offline on that export: 75 stubs are among the 198
+nameless GM rows (name coverage 97.00% < 99%; the 76th stub kept its name),
+and the 76 stubs are all of its blank timestamps (a coverage warning, so
+exit 1, which a release refuses). The
 trigger is |Price/EPS - P/E| / P/E >= 5% outside the 50-200x unit band. P/E
 and EPS arrive from different providers and vintages, so a fresh earnings
 print on one side trips it on healthy rows (the v6.25.1 note already records
