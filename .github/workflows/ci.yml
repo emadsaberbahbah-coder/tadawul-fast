@@ -2,7 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.19 (2026-10-14) -- SECURITY PIN FLOORS
+# VERSION 1.1.20 (2026-10-14) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+#
+# v1.1.20 (2026-10-14): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v6.70.0 FW-2 SCOPE: off == v6.69.0, observe census, enforce keeps drift
+# rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
+# right after the WP-6 sync harness. WHY: the gate edits the outgoing row
+# firewall, so its default-off identity must stay proven on every push.
+# Nothing is removed.
 #
 # v1.1.19 (2026-10-14): requirements.txt v1.1.4 moves twelve pins to the
 # minimal versions that close their pip-audit advisories (89 -> 8). WHY: the
@@ -586,6 +593,7 @@ jobs:
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
             tests/test_sync_warnings_compact_wp6.py \
+            tests/test_sync_fw2_scope.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_atomic_publication.py \
