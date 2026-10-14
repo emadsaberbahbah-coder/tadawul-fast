@@ -100,3 +100,65 @@ def test_offloop_builder_uses_same_private_evidence_and_protective_contract(clie
     monkeypatch.setattr(route, "_portfolio_build_offloop_enabled", lambda: True)
     result = post(client, body())
     assert result["meta"]["execution_ready"] and result["meta"]["route"]["builder_offloop"]
+
+
+@pytest.mark.parametrize("declaration", [True, "false", "true", "", None, 0, 1, [], {}])
+def test_native_incomplete_or_malformed_declaration_cannot_certify_visible_rows(client, declaration):
+    request = body()
+    request["holdings_input_incomplete"] = declaration
+    result = post(client, request)
+    assert result["status"] == "ok" and result["meta"]["execution_ready"] is False
+    assert result["meta"]["input_certification"]["reason_counts"]["holdings_input_incomplete"] == 1
+    assert result["meta"]["route"]["holdings"]["input_incomplete"] is True
+    assert result["actions"][0]["action"] == "BLOCK"
+    assert result["kpis"]["portfolio_value_sar"] is None
+    assert result["kpis"]["adds_funded_sar"] == result["kpis"]["deployable_sar"] == 0
+
+
+def test_explicit_boolean_complete_declaration_preserves_verified_route(client):
+    request = body()
+    request["holdings_input_incomplete"] = False
+    result = post(client, request)
+    assert result["meta"]["execution_ready"] is True
+    assert result["meta"]["route"]["holdings"]["input_incomplete"] is False
+
+
+@pytest.mark.parametrize("rows", [None, {}, "", 0, False])
+def test_malformed_rows_cannot_certify_an_empty_account(client, rows):
+    request = body()
+    request["rows"] = rows
+    request["reconciliation_evidence"] = packet([])
+    request["holdings_input_incomplete"] = False
+    result = post(client, request)
+    assert result["meta"]["execution_ready"] is False
+    assert result["meta"]["input_certification"]["reason_counts"]["holdings_input_incomplete"] == 1
+    assert result["kpis"]["cash_sar"] is None
+    assert result["kpis"]["adds_funded_sar"] == 0
+
+
+def test_missing_rows_cannot_certify_an_empty_account(client):
+    request = body()
+    request.pop("rows")
+    request["reconciliation_evidence"] = packet([])
+    result = post(client, request)
+    assert result["meta"]["execution_ready"] is False
+    assert result["meta"]["input_certification"]["reason_counts"]["holdings_input_incomplete"] == 1
+
+
+def test_explicitly_complete_empty_rows_with_complete_empty_custody_remain_valid(client):
+    request = body()
+    request["rows"] = []
+    request["reconciliation_evidence"] = packet([])
+    request["holdings_input_incomplete"] = False
+    result = post(client, request)
+    assert result["status"] == "empty" and result["meta"]["execution_ready"] is True
+    assert result["kpis"]["cash_sar"] == 10_000
+
+
+def test_backend_row_filter_cannot_be_overridden_by_false_native_declaration(client):
+    request = body()
+    request["rows"].append("invalid-row")
+    request["holdings_input_incomplete"] = False
+    result = post(client, request)
+    assert result["meta"]["execution_ready"] is False
+    assert result["meta"]["route"]["holdings"]["input_incomplete"] is True

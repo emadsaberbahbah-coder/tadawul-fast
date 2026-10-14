@@ -1,10 +1,12 @@
 /* tests/js/dt10_audit_keep.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.13.9 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 16_Decision_Top10.gs v1.13.10 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * VERSION 1.1.0 (2026-10-14): renumbered with the cockpit (v1.13.9 draft ->
+ * v1.13.10 over #774's v1.13.9); base copies are now v1.13.9. No case changed.
  * VERSION 1.0.0 (2026-10-13).
  *
  * WHY: the 2026-10-13 20:37 Riyadh Top_10 export rendered six grace-held
  * seats with blank Rel / DQ / Conf / Engine ROI because the backend's capped
- * written audit never contained them. v1.13.9 sends the stability members as
+ * written audit never contained them. v1.13.10 sends the stability members as
  * body.criteria.audit_keep_symbols when Script Property DT10_AUDIT_KEEP is
  * exactly 'on'; opportunity_builder 1.27.0 honours them only under its own
  * TFB_OPP_AUDIT_KEEP=1.
@@ -22,12 +24,12 @@
  *   K4 REAL refresh, on: research and allocation bodies carry the sorted
  *      members; nothing else in the body changes versus off.
  *   K5 REAL refresh, on with no members / unparsable state: body as off.
- *   D1 (DT10_BASE set): off POST bodies equal the v1.13.8 base's.
- *   D2 (DT10_BASE set): removing the designed v1.13.9 regions from the
+ *   D1 (DT10_BASE set): off POST bodies equal the v1.13.9 base's.
+ *   D2 (DT10_BASE set): removing the designed v1.13.10 regions from the
  *      delivered file gives the base byte for byte.
  *
  *   node tests/js/dt10_audit_keep.test.js
- *   DT10_BASE=<copy of v1.13.8 16_Decision_Top10.gs> enables D1-D2.
+ *   DT10_BASE=<copy of v1.13.9 16_Decision_Top10.gs> enables D1-D2.
  */
 'use strict';
 const assert = require('node:assert/strict');
@@ -230,7 +232,7 @@ test('K1 reader: exact on (trimmed, any case) arms; every other word, empty or a
   assert.equal(load(source, {}).DT10_AUDIT_KEEP_PROP, KEEP);
   assert.equal(load(source, {}).DT10_AUDIT_KEEP_MAX, 60);
 });
-test('K1 property failure reads as off (fail-open to the v1.13.8 body); one memoized read', () => {
+test('K1 property failure reads as off (fail-open to the v1.13.9 body); one memoized read', () => {
   assert.equal(load(source, {}, {propsThrow: true}).dt10AuditKeepOn_(), false);
   const props = {[KEEP]: 'on'}, ctx = load(source, props);
   for (let i = 0; i < 3; i++) assert.equal(ctx.dt10AuditKeepOn_(), true);
@@ -281,17 +283,17 @@ test('K5 REAL refresh, on with no members or an unparsable state: body as off', 
 });
 
 /* ============================================================ D1-D2 */
-const {HEADER_REGION, FN_REGION, CALL_REGION, stripDesigned} = require('./dt10_v1139_regions.js');
+const {HEADER_REGION, FN_REGION, CALL_REGION, stripDesigned} = require('./dt10_audit_keep_regions.js');
 
 if (baseSource) {
-  test('D1 off: POST bodies equal the v1.13.8 base (with and without a stability state)', () => {
+  test('D1 off: POST bodies equal the v1.13.9 base (with and without a stability state)', () => {
     for (const props of [{}, {[STAB]: stabState()}, {[STAB]: stabState(), [KEEP]: 'off'}]) {
       const a = refresh(source, Object.assign({}, props)), b = refresh(baseSource, Object.assign({}, props));
       assert.deepEqual(a.calls, b.calls);
       assert.deepEqual(a.tables, b.tables);
     }
   });
-  test('D2 every changed line lies inside a designed v1.13.9 region; regions are exact text', () => {
+  test('D2 every changed line lies inside a designed v1.13.10 region; regions are exact text', () => {
     assert.equal(stripDesigned(source), baseSource);
     assert.equal((FN_REGION.match(/^function /mg) || []).length, 2, 'two top-level functions');
     assert.ok(/^[\x00-\x7f]*$/.test(HEADER_REGION + FN_REGION + CALL_REGION), 'designed regions are ASCII');

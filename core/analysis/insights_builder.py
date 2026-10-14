@@ -172,6 +172,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
+from core.analysis.research_money import research_amount, research_currency
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1870,6 +1872,14 @@ def _reco_to_signal(recommendation: str) -> str:
 # Section Builders
 # ---------------------------------------------------------------------------
 
+def _quality_measurement_known(row: Mapping[str, Any]) -> bool:
+    """A tagged-error check needs usable price and a nonzero measured score."""
+    score = _as_float(row.get("data_quality_score"))
+    price = _as_float(row.get("current_price"))
+    return bool(score is not None and math.isfinite(score) and 0 < score <= 100
+                and price is not None and math.isfinite(price) and price > 0)
+
+
 def _build_universe_snapshot_rows(
     ctx: BuildContext,
     section_name: str,
@@ -1904,20 +1914,27 @@ def _build_universe_snapshot_rows(
 
     if quotes:
         flagged = 0
+        measured = 0
+        clean = 0
         for d in quotes.values():
-            if (
+            known = _quality_measurement_known(d)
+            measured += int(known)
+            has_flag = bool(
                 _provider_error_from_row(d)
                 or _row_has_engine_dropped_valuation(d)
                 or _row_is_forecast_unavailable(d)
-            ):
+            )
+            if has_flag:
                 flagged += 1
-        clean = len(quotes) - flagged
-        if flagged > 0:
+            elif known:
+                clean += 1
+        unknown = len(quotes) - measured
+        if flagged > 0 or unknown > 0:
             signal = _SIGNAL_WARN
             priority = _PRI_MEDIUM if flagged * 4 >= len(quotes) else _PRI_LOW
             notes_text = (
-                f"{clean}/{len(quotes)} symbol(s) with clean data; "
-                f"{flagged} flagged (see Data Quality Alerts section)"
+                f"{clean}/{len(quotes)} symbol(s) without tagged errors and with usable quality score/price; "
+                f"{flagged} flagged; {unknown} quality evaluation(s) unknown (see Data Quality Alerts section)"
             )
         else:
             signal = _SIGNAL_OK
@@ -2020,12 +2037,27 @@ def _build_risk_alert_rows(
     high_risk: List[Tuple[float, str, Dict[str, Any]]] = []
     cautions: List[Tuple[str, str, str]] = []
     reco_alerts: List[Tuple[str, str, str, Dict[str, Any]]] = []
+    measured = {"risk_score": 0, "max_drawdown_1y": 0, "volatility_30d": 0, "rsi_signal": 0}
+    measured_symbols: Set[str] = set()
 
     for sym, d in quotes.items():
         risk_score = _as_float(d.get("risk_score"))
         drawdown = _as_float(d.get("max_drawdown_1y"))
         rsi_signal = _safe_str(d.get("rsi_signal", "")).lower()
         vol_30d = _as_percent_points(d.get("volatility_30d"))
+        if risk_score is not None and (not math.isfinite(risk_score) or not 0 <= risk_score <= 100):
+            risk_score = None
+        if drawdown is not None and not math.isfinite(drawdown):
+            drawdown = None
+        if vol_30d is not None and (not math.isfinite(vol_30d) or vol_30d < 0):
+            vol_30d = None
+        for key, known in (("risk_score", risk_score is not None),
+                           ("max_drawdown_1y", drawdown is not None),
+                           ("volatility_30d", vol_30d is not None),
+                           ("rsi_signal", rsi_signal in {"neutral", "overbought", "oversold"})):
+            if known:
+                measured[key] += 1
+                measured_symbols.add(sym)
 
         if risk_score is not None and risk_score >= 55.0:
             high_risk.append((risk_score, sym, d))
@@ -2045,12 +2077,26 @@ def _build_risk_alert_rows(
         elif reco == "STRONG_SELL":
             reco_alerts.append((_PRI_MEDIUM, sym, reco, d))
 
+    coverage_note = "Measured risk inputs: " + "; ".join(
+        f"{key}={count} of {len(quotes)}" for key, count in measured.items())
+    unknown = len(quotes) - len(measured_symbols)
+    if unknown:
+        rows.append(_make_row(
+            keys=ctx.keys, section="Risk Alerts", item="Risk Coverage",
+            metric="risk_measurement_status", value="Unknown",
+            signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
+            notes=f"{unknown} symbol(s) have no measured risk inputs. {coverage_note}",
+            last_updated_riyadh=ctx.ts,
+        ))
+
     if not high_risk and not cautions and not reco_alerts:
+        if unknown:
+            return rows
         rows.append(_make_row(
             keys=ctx.keys, section="Risk Alerts", item="Summary",
             metric="risk_alert_count", value=0,
             signal=_SIGNAL_OK, priority=_PRI_LOW,
-            notes="No high-risk conditions detected",
+            notes="No high-risk conditions detected. " + coverage_note,
             last_updated_riyadh=ctx.ts,
         ))
         return rows
@@ -2063,6 +2109,7 @@ def _build_risk_alert_rows(
     summary_notes_parts = [
         f"{len(high_risk)} symbol(s) with risk_score > 55",
         f"{high_count} above 70",
+        coverage_note,
     ]
     if reco_alerts:
         summary_notes_parts.append(
@@ -2173,6 +2220,7 @@ def _build_data_quality_rows(
     provider_errors: List[Tuple[str, str]] = []
     engine_drops: List[Tuple[str, str]] = []
     forecast_skips: List[Tuple[str, str]] = []
+    measured = sum(_quality_measurement_known(d) for d in quotes.values())
 
     for sym, d in quotes.items():
         err_class = _provider_error_from_row(d)
@@ -2194,13 +2242,14 @@ def _build_data_quality_rows(
     )
 
     if not affected_symbols:
+        unknown = len(quotes) - measured
         rows.append(_make_row(
             keys=ctx.keys, section="Data Quality Alerts", item="Summary",
-            metric="data_quality_status", value="Clean",
-            signal=_SIGNAL_OK, priority=_PRI_LOW,
+            metric="data_quality_status", value="Unknown" if unknown else "Clean",
+            signal=_SIGNAL_WARN if unknown else _SIGNAL_OK, priority=_PRI_LOW,
             notes=(
-                f"No provider errors or engine-dropped fields across "
-                f"{len(quotes)} symbol(s) scanned"
+                f"Usable quality score and price available for {measured} of {len(quotes)} symbol(s); "
+                f"{unknown} quality evaluation(s) unknown. No provider errors or engine-dropped fields detected."
             ),
             last_updated_riyadh=ctx.ts,
         ))
@@ -2221,7 +2270,7 @@ def _build_data_quality_rows(
             f"{len(provider_errors)} provider error(s) | "
             f"{len(engine_drops)} engine-dropped valuation(s) | "
             f"{len(forecast_skips)} forecast skip(s) "
-            f"across {total_affected} symbol(s)"
+            f"across {total_affected} symbol(s). Usable quality score and price available for {measured} of {len(quotes)}."
         ),
         last_updated_riyadh=ctx.ts,
     ))
@@ -2733,14 +2782,47 @@ def _build_portfolio_kpis_rows(
     symbols: List[str],
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Build Portfolio KPIs section rows."""
+    """Research KPIs only for a complete, single-currency position cohort."""
     rows: List[Dict[str, Any]] = []
+
+    issues: List[str] = []
+    currencies: Set[str] = set()
+    for sym in symbols:
+        d = quotes.get(sym, {})
+        qty = research_amount(d.get("position_qty"))
+        if qty is None:
+            issues.append(sym + ":position_qty_unknown_or_invalid")
+            continue
+        if qty == 0:
+            continue
+        for key in ("avg_cost", "current_price"):
+            value = research_amount(d.get(key), positive=(key == "current_price"))
+            if value is None:
+                issues.append(sym + ":" + key + "_unknown_or_invalid")
+        ccy = research_currency(d.get("currency"))
+        if ccy:
+            currencies.add(ccy)
+        else:
+            issues.append(sym + ":currency_unknown_or_ambiguous")
+    if len(currencies) > 1:
+        issues.append("mixed_currency_requires_base_currency_reconciliation")
+    if issues:
+        rows.append(_make_row(
+            keys=ctx.keys, section="Portfolio KPIs", item="Portfolio",
+            metric="status", value="Position Evidence Unavailable",
+            signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
+            notes="Money and health withheld: " + "; ".join(issues) + ". Quotes do not certify custody.",
+            last_updated_riyadh=ctx.ts,
+        ))
+        return rows
 
     total_cost = 0.0
     total_value = 0.0
     total_day_pl = 0.0
     position_count = 0
     at_risk_count = 0
+    risk_measured = 0
+    day_pl_measured = 0
     have_positions = False
 
     stop_alerts: List[Tuple[str, float, str]] = []
@@ -2748,10 +2830,10 @@ def _build_portfolio_kpis_rows(
 
     for sym in symbols:
         d = quotes.get(sym, {})
-        qty = _as_float(d.get("position_qty"))
-        avg_cost = _as_float(d.get("avg_cost"))
-        current_price = _as_float(d.get("current_price"))
-        day_pl = _as_float(d.get("day_pl"))
+        qty = research_amount(d.get("position_qty"))
+        avg_cost = research_amount(d.get("avg_cost"))
+        current_price = research_amount(d.get("current_price"), positive=True)
+        day_pl = research_amount(d.get("day_pl"), signed=True)
         risk_score = _as_float(d.get("risk_score"))
         dist_to_sl = _as_float(d.get("distance_to_sl_pct"))
         weight_dev = _as_float(d.get("weight_deviation"))
@@ -2766,10 +2848,13 @@ def _build_portfolio_kpis_rows(
         total_cost += cost
         if current_price is not None:
             total_value += qty * current_price
-        if day_pl is not None:
+        if day_pl is not None and math.isfinite(day_pl):
             total_day_pl += day_pl
-        if risk_score is not None and risk_score > 60.0:
-            at_risk_count += 1
+            day_pl_measured += 1
+        if risk_score is not None and math.isfinite(risk_score) and 0 <= risk_score <= 100:
+            risk_measured += 1
+            if risk_score > 60.0:
+                at_risk_count += 1
 
         if dist_to_sl is not None:
             dist_pp = _as_percent_points(dist_to_sl) or 0.0
@@ -2794,28 +2879,46 @@ def _build_portfolio_kpis_rows(
         ))
         return rows
 
+    if not all(math.isfinite(v) for v in (total_value, total_cost, total_value - total_cost)):
+        rows.append(_make_row(
+            keys=ctx.keys, section="Portfolio KPIs", item="Portfolio",
+            metric="status", value="Position Evidence Unavailable",
+            signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
+            notes="Money and health withheld: nonfinite position totals. Quotes do not certify custody.",
+            last_updated_riyadh=ctx.ts,
+        ))
+        return rows
+
+    ccy = next(iter(currencies))
+    research_note = f"Research inputs in {ccy}; custody not certified"
     unrealized_pl = total_value - total_cost
     unrealized_pct = (unrealized_pl / total_cost) if total_cost > 0 else None
-    pl_pct_pts = _as_percent_points(unrealized_pct) or 0.0
+    # This ratio's units are known from our own division, even above 150%.
+    if unrealized_pct is not None and not math.isfinite(unrealized_pct * 100.0):
+        unrealized_pct = None
+    pl_pct_pts = unrealized_pct * 100.0 if unrealized_pct is not None else 0.0
+    pl_pct_label = f"{pl_pct_pts:.2f}%" if unrealized_pct is not None else "N/A"
     pl_signal = _SIGNAL_OK if pl_pct_pts >= 0 else _SIGNAL_ALERT
 
-    health_score = 60.0 + min(30.0, max(-30.0, pl_pct_pts))
-    if position_count > 0:
+    if risk_measured == position_count and unrealized_pct is not None:
+        health_score = 60.0 + min(30.0, max(-30.0, pl_pct_pts))
         health_score -= (at_risk_count / position_count) * 20.0
-    health_score = _clamp(health_score, 0.0, 100.0)
+        health_note = f"Research health={_clamp(health_score, 0.0, 100.0):.1f}/100"
+    else:
+        health_note = "Health unavailable: incomplete risk or return inputs"
 
     rows.append(_make_row(
         keys=ctx.keys, section="Portfolio KPIs", item="Positions",
         metric="position_count", value=position_count,
         priority=_PRI_LOW,
-        notes=f"Health={health_score:.1f}/100. {at_risk_count} position(s) with risk_score > 60",
+        notes=f"{health_note}. {at_risk_count} high-risk position(s) among {risk_measured} measured of {position_count}. {research_note}",
         last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section="Portfolio KPIs", item="Total Value",
         metric="total_value", value=round(total_value, 2),
         priority=_PRI_LOW,
-        notes=f"Cost basis: {round(total_cost, 2)}",
+        notes=f"Cost basis: {round(total_cost, 2)}. {research_note}",
         last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
@@ -2823,17 +2926,17 @@ def _build_portfolio_kpis_rows(
         metric="unrealized_pl", value=round(unrealized_pl, 2),
         signal=pl_signal,
         priority=_PRI_HIGH if pl_pct_pts < -15 else (_PRI_MEDIUM if pl_pct_pts < -5 else _PRI_LOW),
-        notes=f"{_format_percent(unrealized_pct)} | total_value - total_cost",
+        notes=f"{pl_pct_label} | total_value - total_cost. {research_note}",
         last_updated_riyadh=ctx.ts,
     ))
 
-    if total_day_pl != 0.0:
+    if day_pl_measured == position_count and math.isfinite(total_day_pl):
         rows.append(_make_row(
             keys=ctx.keys, section="Portfolio KPIs", item="Today's P/L",
             metric="day_pl", value=round(total_day_pl, 2),
             signal=_SIGNAL_OK if total_day_pl > 0 else _SIGNAL_ALERT,
             priority=_PRI_MEDIUM if abs(total_day_pl) > total_cost * 0.01 else _PRI_LOW,
-            notes=f"Sum(day_pl) across {position_count} positions",
+            notes=f"Sum(day_pl) across {position_count} positions. {research_note}",
             last_updated_riyadh=ctx.ts,
         ))
 

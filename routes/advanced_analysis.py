@@ -4512,6 +4512,17 @@ async def portfolio_actions_post(
             for row in raw_rows[:cap]
             if isinstance(row, Mapping)
         ]
+    # A bounded native read can be incomplete before this route receives it.
+    # Honor that declaration and reject malformed declarations instead of
+    # certifying only the visible subset. Omitted flags remain compatible with
+    # legacy callers that send a valid full list; missing/non-list rows do not
+    # establish an empty account. Native false cannot override our own drops.
+    holdings_input_incomplete = (
+        not isinstance(raw_rows, list)
+        or received_count != len(holdings)
+        or ("holdings_input_incomplete" in merged_body
+            and merged_body["holdings_input_incomplete"] is not False)
+    )
 
     if _build_portfolio_actions is None:
         return _json_safe({
@@ -4531,6 +4542,7 @@ async def portfolio_actions_post(
                     "holdings": {
                         "received": received_count,
                         "used": len(holdings),
+                        "input_incomplete": holdings_input_incomplete,
                     },
                     "duration_ms": round(
                         (time.time() - started_wall) * 1000.0, 3),
@@ -4554,7 +4566,7 @@ async def portfolio_actions_post(
         # Private declared capture: builder strips it before rendering/logging.
         # Never substitute the sheet's cash/date fields for broker evidence.
         "reconciliation_evidence": merged_body.get("reconciliation_evidence"),
-        "holdings_input_incomplete": (received_count != len(holdings)),
+        "holdings_input_incomplete": holdings_input_incomplete,
     }
 
     build_started = time.monotonic()
@@ -4642,6 +4654,7 @@ async def portfolio_actions_post(
             "received": received_count,
             "used": len(holdings),
             "truncated": received_count > len(holdings),
+            "input_incomplete": holdings_input_incomplete,
             "cap": cap,
         },
         "builder_offloop": _portfolio_build_offloop_enabled(),

@@ -1631,7 +1631,11 @@ def _gas_changed_only_by_feed_cohort_binding(base):
     """v1.1.1 (2026-10-13): DT10 v1.13.8 changes the .gs on purpose. Accept the
     difference only through the binding harness run against this base copy.
     v1.1.2 (2026-10-13): also require the harness's D5, which proves that the
-    delivered file minus the designed v1.13.8 regions equals this base copy."""
+    historical v1.13.8 file minus its designed regions equals this base copy.
+    v1.13.9: the harness reverses only its enumerated cash-label/UTC adapter
+    edits, pins the complete historical SHA256, and mutation-tests that boundary
+    before running the unchanged historical D5 guard. Current feed tests still
+    execute the delivered file."""
     node = node_binary()
     if node is None:
         pytest.skip("node is required to prove the DT10 v1.13.8 default-off identity")
@@ -1644,8 +1648,8 @@ def _gas_changed_only_by_feed_cohort_binding(base):
     assert proc.returncode == 0 and lines and lines[-1].startswith("PASS ") \
         and "SKIP " not in proc.stdout, proc.stdout[-3000:] + proc.stderr[-2000:]
     assert "\nPASS D5 " in "\n" + proc.stdout, "harness D5 (designed regions only) did not run"   # v1.1.2
-    print("G4 16_Decision_Top10.gs: differs from base only inside the designed v1.13.8 "
-          "feed cohort binding regions (harness D5; %s)" % lines[-1])
+    print("G4 16_Decision_Top10.gs: v1.13.9 cash-label/UTC edits match the pinned "
+          "v1.13.8 fixture; historical feed binding regions pass harness D5; %s" % lines[-1])
 
 
 def case_g5_verifier_ast_inventory_zero_removed(mp, tmp_path):

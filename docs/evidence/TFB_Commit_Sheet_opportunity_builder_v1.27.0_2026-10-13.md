@@ -72,8 +72,8 @@ Grace-held seats:
 
 Other files:
 
-- `scripts/verify_deployment.py` 1.0.61: pins the builder at 1.27.0 and registers the three
-  flags. It is numbered after the open #764-#769 stack (1.0.57-1.0.60).
+- `scripts/verify_deployment.py` 1.0.63: pins the builder at 1.27.0 and registers the three
+  flags. It is numbered after #775 (1.0.61) and the open #773 (1.0.62).
 - `tests/test_ob_top10_data_quality.py`: new harness.
 
 Not touched: `ci.yml`. The new harness runs in the whole-suite job, which installs
@@ -132,10 +132,14 @@ exchange_calendars or pandas. Enrolling it in the lean list is a follow-up once 
 - MWG.VN is labelled NASDAQ/NYSE and USD on the sheet while its price is in VND (74,700), so its
   Price SAR reads 280,653. This is an upstream identity defect. It is reported, not fixed here,
   and Quote Freshness defers the row today.
-- AUDIT-KEEP needs both halves: the backend env and the pasted cockpit v1.13.9 with its Script
+- AUDIT-KEEP needs both halves: the backend env and the pasted cockpit v1.13.10 with its Script
   Property. Either alone is inert.
 
-## Cockpit half: 16_Decision_Top10.gs v1.13.8 -> v1.13.9 (added after #768 merged)
+## Cockpit half: 16_Decision_Top10.gs v1.13.9 -> v1.13.10
+
+Built 2026-10-13 as an unreleased v1.13.9 draft; #774 then shipped a different v1.13.9 (entered-cash label
+and holding UTC provenance), so this change was re-applied on top of it as v1.13.10 on 2026-10-14. The
+designed regions are byte-identical apart from the version words.
 
 - Script Property `DT10_AUDIT_KEEP`. Exactly `on` (trimmed, any case) arms it; anything else, or
   a property-service failure, is off.
@@ -144,29 +148,31 @@ exchange_calendars or pandas. Enrolling it in the lean list is a follow-up once 
   already uses.
   - The allocation replay deep-copies the body, so it carries the same list.
   - Display context only: no gate, score, seat or ticket moves.
-- Off: every request and render is identical to v1.13.8.
+- Off: every request and render is identical to v1.13.9.
 - Functions added: `dt10AuditKeepOn_` and `dt10AuditKeepSymbols_` (0 removed). Vars added:
   `DT10_AUDIT_KEEP_PROP` and `DT10_AUDIT_KEEP_MAX`.
 - Harness `tests/js/dt10_audit_keep.test.js`: the full source runs in a node vm with the
   cohort-binding fixtures.
   - K1-K5: the reader, the pure list, and REAL `refreshDecisionTop10` off, on, and with an
     empty or broken state.
-  - D1: off POST bodies equal v1.13.8.
-  - D2: the delivered file minus the exact-text v1.13.9 regions equals v1.13.8 byte for byte,
+  - D1: off POST bodies equal v1.13.9.
+  - D2: the delivered file minus the exact-text v1.13.10 regions equals v1.13.9 byte for byte,
     and a stray line inside a region is rejected.
-  - Results: PASS 8/8 with `DT10_BASE` (a v1.13.8 copy), and 6/6 plus 2 skipped without it.
-- Version pins moved 1.13.8 -> 1.13.9 in `decision_input_truth` (census 193/105) and
+  - Results: PASS 8/8 with `DT10_BASE` (main's v1.13.9, 030e22e), and 6/6 plus 2 skipped without it.
+- Version pins moved 1.13.9 -> 1.13.10 in `decision_input_truth` (census 193/105) and
   `decision_source_readiness`.
-  - The cohort-binding harness (v1.0.2) strips the v1.13.9 regions byte-exact through the shared
-    `tests/js/dt10_v1139_regions.js` before its v1.13.8 revert.
-  - It passes 26/26 with the v1.13.7 base, so G4 of `tests/test_release_decision_feed.py` still
+  - `tests/js/dt10_feed_cohort_binding.test.js` and `decision_input_truth.test.js` strip the v1.13.10
+    regions byte-exact through the shared `tests/js/dt10_audit_keep_regions.js`, then hand the
+    v1.13.9 text to #774's history helper (`tests/js/dt10_cash_utc_history.js`), whose digest still
+    verifies. The H1 mutation checks run on the stripped text, so they still fail for their own reason.
+  - Cohort binding passes 27/27 with the v1.13.7 base, so G4 of `tests/test_release_decision_feed.py` still
     holds.
 - CI enrolment of the new node harness is added once the open stack's `ci.yml` headers land.
   Until then the updated pinned harnesses run in CI and this one runs locally.
 
 Paste (after merge): paste the whole `apps_script/16_Decision_Top10.gs` and save, then run
-`dt10SelfTest` and expect `[DT10 v1.13.9] self-test`. Leave `DT10_AUDIT_KEEP` unset until
-`TFB_OPP_AUDIT_KEEP=1` is on Render. Rollback: delete the property, or re-paste v1.13.8.
+`dt10SelfTest` and expect `[DT10 v1.13.10] self-test`. Leave `DT10_AUDIT_KEEP` unset until
+`TFB_OPP_AUDIT_KEEP=1` is on Render. Rollback: delete the property, or re-paste v1.13.9.
 
 ## Operator steps (Render ENV; nothing is armed by this PR)
 
@@ -176,7 +182,7 @@ Paste (after merge): paste the whole `apps_script/16_Decision_Top10.gs` and save
    whose quote is the latest close become eligible for the later gates. Compare Passed before and
    after on one refresh.
 3. `TFB_OPP_AUDIT_KEEP=1` on Render, then Script Property `DT10_AUDIT_KEEP=on` after the
-   v1.13.9 paste.
+   v1.13.10 paste.
 4. Rollback: unset each one. No redeploy is needed (each is read at call time).
 
 Separately, to clear `missing_fx 13` today, use either of these:

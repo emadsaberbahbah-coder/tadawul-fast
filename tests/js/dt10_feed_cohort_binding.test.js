@@ -1,12 +1,6 @@
 /* tests/js/dt10_feed_cohort_binding.test.js -- full-source node vm harness
  * for 16_Decision_Top10.gs v1.13.8 FEED/COHORT BINDING (P0-1 arming
- * prerequisite 2). VERSION 1.0.2 (2026-10-13).
- *
- * v1.0.2 (2026-10-13): DT10 v1.13.9 (held seats kept in the written audit)
- * is stacked on top. C11 pins the delivered version 1.13.9; D5 first
- * removes the designed v1.13.9 regions byte for byte through the shared
- * tests/js/dt10_v1139_regions.js (stripV1139), then applies the
- * unchanged v1.13.8 revert. Nothing else changed.
+ * prerequisite 2). VERSION 1.0.1 (2026-10-13).
  *
  * v1.0.1 (2026-10-13) WHY: review finding. D4 checked removed lines and the
  * added NAMES only, so an unrelated behavioural line added inside another
@@ -73,11 +67,15 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {feedHistorySource, HISTORY_SHA256} = require('./dt10_cash_utc_history');
+// v1.13.10 (held seats kept in the written audit) is stripped byte-exact
+// first, so the v1.13.9 history helper sees exactly the v1.13.9 text.
+const stripAuditKeep = require('./dt10_audit_keep_regions.js').stripDesigned;
 
 const ROOT = path.join(__dirname, '../..');
 const SOURCE_PATH = process.env.DT10_DELIVERED || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const source = fs.readFileSync(SOURCE_PATH, 'utf8');
-const SOURCE_TEXT = source;
+const historySource = feedHistorySource(stripAuditKeep(source));
 const BASE_PATH = process.env.DT10_BASE || '';
 const baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : null;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
@@ -540,8 +538,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.9');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.9 /);
+  assert.equal(ctx.DT10_VERSION, '1.13.10');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.10 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
@@ -591,12 +589,7 @@ function staysInside(code, label) {
   });
   assert.equal(depth, 0, label + ': braces balance');
 }
-/* v1.0.2: undo the designed v1.13.9 regions, exact text, via the shared
- * tests/js/dt10_v1139_regions.js (throws on any other shape), so the
- * v1.13.8 revert below runs on the v1.13.8 text. */
-const stripV1139 = require('./dt10_v1139_regions.js').stripDesigned;
 function revertDesigned(src) {
-  if (src.includes("var DT10_VERSION = '1.13.9';")) src = stripV1139(src);
   let lines = src.split('\n');
   const cut = (from, to) => { const region = lines.slice(from, to); lines = lines.slice(0, from).concat(lines.slice(to)); return region; };
   // 1. The header WHY block: comment lines only, above the v1.13.7 entry.
@@ -674,29 +667,43 @@ function firstDifference(a, b) {
   return '';
 }
 
-/* ============================================================ D1-D4, G1 */
+/* v1.13.9's approved extension is separate from the historical default-off
+ * gate. A full-source digest prevents an unrelated change being hidden by
+ * reversing this release's cosmetic/input-adapter edits. */
+test('H1 immutable v1.13.8 fixture digest and current edit mutation guard', () => {
+  assert.equal(crypto.createHash('sha256').update(historySource).digest('hex'), HISTORY_SHA256);
+  assert.equal(count(source, 'function dt10SourceCount_(value) {\n'), 1);
+  const unrelated = source.replace('function dt10SourceCount_(value) {\n',
+    'function dt10SourceCount_(value) {\n  if (value === 424242) return 1;\n');
+  assert.throws(() => feedHistorySource(stripAuditKeep(unrelated)), assert.AssertionError);
+  const timestampMutation = source.replace("extra.updatedKey = t === 'lastupdatedutc' ? 'last_updated_utc' : 'last_updated';",
+    "extra.updatedKey = 'last_updated';");
+  assert.throws(() => feedHistorySource(stripAuditKeep(timestampMutation)), assert.AssertionError);
+});
+
+/* ============================================================ D1-D5, G1: immutable v1.13.8 */
 if (baseSource) {
   test('D1 OFF identity vs base: full verdict objects deep-equal for every corpus value and off spelling', () => {
     for (const value of OFF_VALUES) {
       const props = value === undefined ? {} : {[BIND]: value};
-      for (const [name, feed] of CORPUS) assert.deepEqual(verdict(source, props, feed).v, verdict(baseSource, props, feed).v, name + ' / ' + JSON.stringify(value));
+      for (const [name, feed] of CORPUS) assert.deepEqual(verdict(historySource, props, feed).v, verdict(baseSource, props, feed).v, name + ' / ' + JSON.stringify(value));
     }
     for (const [name, feed] of CORPUS) {
-      assert.deepEqual(verdict(source, {DT10_UPSTREAM_VERDICT: 'off', [BIND]: 'on'}, feed).v,
+      assert.deepEqual(verdict(historySource, {DT10_UPSTREAM_VERDICT: 'off', [BIND]: 'on'}, feed).v,
         verdict(baseSource, {DT10_UPSTREAM_VERDICT: 'off', [BIND]: 'on'}, feed).v, 'bypass ' + name);
     }
     const grid = goodGrid(); grid[1][6] = 254;
-    assert.deepEqual(verdict(source, ON, CORPUS[1][1], {grid}).v, verdict(baseSource, ON, CORPUS[1][1], {grid}).v, 'source block');
+    assert.deepEqual(verdict(historySource, ON, CORPUS[1][1], {grid}).v, verdict(baseSource, ON, CORPUS[1][1], {grid}).v, 'source block');
   });
   test('D2 OFF identity vs base: REAL renderer titles, tables, writes and payload verdict', () => {
     for (const [name, feed] of CORPUS) {
-      const a = render(source, {}, feed), b = render(baseSource, {}, feed);
+      const a = render(historySource, {}, feed), b = render(baseSource, {}, feed);
       assert.deepEqual([a.titles, a.tables, a.writes, a.output, a.uv, plain(a.p.kpis)], [b.titles, b.tables, b.writes, b.output, b.uv, plain(b.p.kpis)], name);
     }
   });
   test('D3 OFF identity vs base: REAL refreshDecisionTop10 (B2 status, POSTs, writes, selection log args)', () => {
     for (const feed of [CORPUS[0][1], CORPUS[1][1], CORPUS[13][1], RELEASE_FIXTURE['90000']]) {
-      const a = refresh(source, {}, feed), b = refresh(baseSource, {}, feed);
+      const a = refresh(historySource, {}, feed), b = refresh(baseSource, {}, feed);
       for (const key of ['calls', 'pageStatuses', 'selectionLogs', 'stabilityCalls', 'titles', 'tables', 'writes', 'feedReads']) {
         assert.deepEqual(a[key], b[key], key + ' / ' + feed.slice(0, 40));
       }
@@ -705,33 +712,31 @@ if (baseSource) {
   test('D4 census vs base: zero functions or vars removed; added exactly the designed names; added code ES5 and ASCII', () => {
     const census = (src, re) => { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; };
     const fnRe = () => /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg, varRe = () => /^var\s+([A-Za-z_$][\w$]*)/mg;
-    // v1.0.2: census on the v1.13.8 text; the v1.13.9 regions are stripped byte-exact.
-    const source = SOURCE_TEXT.includes("var DT10_VERSION = '1.13.9';") ? stripV1139(SOURCE_TEXT) : SOURCE_TEXT;
-    const bf = census(baseSource, fnRe()), df = census(source, fnRe()), bv = census(baseSource, varRe()), dv = census(source, varRe());
+    const bf = census(baseSource, fnRe()), df = census(historySource, fnRe()), bv = census(baseSource, varRe()), dv = census(historySource, varRe());
     assert.deepEqual([...bf].filter(f => !df.has(f)), []); assert.deepEqual([...bv].filter(v => !dv.has(v)), []);
     assert.deepEqual([...df].filter(f => !bf.has(f)).sort(), ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_']);
     assert.deepEqual([...dv].filter(v => !bv.has(v)), ['DT10_FEED_COHORT_BIND_PROP']);
     const baseLines = new Set(baseSource.split('\n'));
-    const added = source.split('\n').filter(l => !baseLines.has(l));
+    const added = historySource.split('\n').filter(l => !baseLines.has(l));
     // The header Version line keeps its pre-existing em dash; only 1.13.7 -> 1.13.8 changed there.
     for (const l of added) assert(/^[\x00-\x7f]*$/.test(l) || baseLines.has(l.split('1.13.8').join('1.13.7')), 'ASCII: ' + l);
     for (const l of added.filter(x => !/^\s*(\*|\/\*|\/\/)/.test(x)).map(x => x.replace(/\/\/.*$/, ''))) {
       assert(!/\b(let|const)\b|=>|`|\bclass\b|\.\.\.|\.includes\(/.test(l), 'ES5 guard: ' + l);
     }
-    const newLines = new Set(source.split('\n'));
+    const newLines = new Set(historySource.split('\n'));
     const removed = baseSource.split('\n').filter(l => !newLines.has(l)).map(l => l.trim()).filter(l => l && !/^\*/.test(l));
     assert.deepEqual(removed.sort(), ['try { out = dt10UvParse_(dt10UvRead_(ss), Date.now()); }',
       'var DT10_VERSION = \'1.13.7\';', 'var out;'].sort(), 'only the feed read line, its var line and the version line changed');
   });
   test('D5 designed regions only: delivered minus the v1.13.8 regions equals the base copy byte for byte', () => {
-    const reverted = revertDesigned(source);
+    const reverted = revertDesigned(historySource);
     assert(reverted === baseSource, 'a change outside the designed v1.13.8 regions: ' + firstDifference(reverted, baseSource));
     // Negative controls: D5 must reject a line added anywhere else, code hidden
     // after the guard, a top-level statement among the new functions and an
     // assignment in the self-test lines.
     const inject = (after, line) => {
-      assert.equal(count(source, after), 1, 'mutation anchor ' + after);
-      return source.replace(after, after + line);
+      assert.equal(count(historySource, after), 1, 'mutation anchor ' + after);
+      return historySource.replace(after, after + line);
     };
     const mutants = [
       ['unrelated line in dt10SourceCount_', inject('function dt10SourceCount_(value) {\n', "  if (String(value) === '424242') return 9007199254740991;\n")],

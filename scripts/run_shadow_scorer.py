@@ -136,6 +136,7 @@ sys.path.insert(0, _ROOT)
 
 from core.analysis import opportunity_builder as ob   # noqa: E402
 from core import regret as rg                        # noqa: E402
+from core.data_validity import timestamp_freshness     # noqa: E402
 
 _SB_PATH = os.path.join(_ROOT, "scripts", "run_shadow_board.py")
 _spec = importlib.util.spec_from_file_location("tfb_shadow_board", _SB_PATH)
@@ -649,12 +650,20 @@ def read_s1_calibration(sh, now_local: Optional[datetime] = None
             continue
     if stamp is None:
         return "PENDING", f"unreadable as_of {as_of_raw!r}"
-    ref = now_local or datetime.now()
-    age_h = (ref - stamp).total_seconds() / 3600.0
+    riyadh = timezone(timedelta(hours=3))
+    ref = now_local or datetime.now(riyadh)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=riyadh)
     limit = _s1_cal_max_age_h()
-    if age_h > limit:
+    fresh, age_s, reason = timestamp_freshness(
+        stamp.replace(tzinfo=riyadh), ref, max_age_seconds=limit * 3600.0,
+    )
+    age_h = age_s / 3600.0 if age_s is not None else None
+    if not fresh and reason == "timestamp_stale":
         return "PENDING", (f"calibration row stale ({age_h:.0f}h > "
                            f"{limit:.0f}h) — tracker not publishing")
+    if not fresh:
+        return "PENDING", "calibration freshness unavailable: " + reason
     detail = _cell("detail") or f"n={_cell('n checkpoints')}"
     return state, detail
 

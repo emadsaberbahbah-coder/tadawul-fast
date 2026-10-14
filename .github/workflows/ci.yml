@@ -2,16 +2,23 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.20 (2026-10-13) -- DT10 v1.13.9 HELD-SEAT HARNESS
+# VERSION 1.1.22 (2026-10-14) -- DT10 v1.13.10 HELD-SEAT HARNESS
 #
-# v1.1.20: run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
-# native Apps Script step. WHY (2026-10-13): 16_Decision_Top10.gs v1.13.9
+# v1.1.22: run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.10
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
 # 1.27.0 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
 # harness runs the full .gs in a node vm (K1-K5: reader, pure list, REAL
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
-# DT10_BASE and skip in CI. Nothing is removed and no existing entry moves.
+# DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
+# (1.1.21). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.20 (2026-10-14) -- TOP-10 KPI LABEL COMPATIBILITY
+#
+# v1.1.20: run the acceptance/digest KPI-reader regressions in the blocking
+# lean lane. The current Entered cash (SAR) label must preserve measured
+# board counts, while missing or ambiguous KPI strips remain unknown.
 #
 # VERSION 1.1.19 (2026-10-14) -- SECURITY PIN FLOORS
 #
@@ -630,6 +637,7 @@ jobs:
             tests/test_pf_confirm_session_p168b.py \
             tests/test_scoring_engine_contract.py \
             tests/test_top10_selector.py \
+            tests/test_top10_kpi_label_compat.py \
             tests/test_learning_guards.py \
             tests/test_sync_outcome_audit.py \
             tests/test_sync_audit_cancelled_source.py \
