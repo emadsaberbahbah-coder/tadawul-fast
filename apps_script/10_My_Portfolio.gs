@@ -1,7 +1,40 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.12
+ * Version: 1.5.13
+ *
+ * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
+ *                        only when PD_SOURCE_RECEIPT is observe/enforce;
+ *                        ALL v1.5.12 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (Codex P1 review on PR #776, verified on the 14 Oct export): the
+ * v1.5.11 receipt bound only the _Status row. The export shows the sync
+ * publication of My_Portfolio at 02:46 Riyadh (run 38486122061), then the
+ * GAS auto refresh (tfbAutoRefreshTrigger -> refreshPageInBatches) rewrote
+ * every My_Portfolio row at 07:40 without touching _Status. The 08:50
+ * decision therefore consumed 07:40 rows while v1.5.11 would have written
+ * 'source readiness VERIFIED (run 38486122061)', an overclaim the final
+ * audit cannot see. A sync that rewrites rows before stamping _Status is
+ * the same blind spot.
+ * WHAT (observe/enforce only; off still never reads _Status):
+ *  pdCollectHoldings_ returns, on request, each consumed row's Symbol and
+ *  Last Updated (UTC) instant (a naive value in that column is UTC). The
+ *  receipt is VERIFIED only when every consumed row lies inside the run
+ *  window [publication - 3 h, publication + 2 min] and the same rows
+ *  re-read after the decision are unchanged. Otherwise WITHHELD with
+ *  'holdings refreshed after the publication (HH:MM > HH:MM Riyadh)',
+ *  'holdings older than the publication', 'holdings changed during the
+ *  decision', 'holdings re-read failed', 'holding timestamp unverified
+ *  (SYM)' or 'holdings timestamps unavailable'. pdSrcReadinessCore_ now
+ *  exposes the publication instant (stamp_ms); pdSelfTest reports the
+ *  binding verdict for the rows on the page now.
+ * LIMIT: an edit that leaves Last Updated (UTC) untouched is not
+ * detectable here; that needs a producer-issued digest of the written rows
+ * that GAS can reproduce.
+ * ES5. Functions added: 2 (pdSrcUtcMs_, pdSrcBindingCore_). Changed:
+ * pdSrcReadinessCore_ (adds stamp_ms), pdReceiptNote_ (optional binding),
+ * pdCollectHoldings_ (optional stamps), refreshPortfolioDecision,
+ * pdSelfTest. Removed: 0. Rollback: PD_SOURCE_RECEIPT=off, or v1.5.12.
  *
  * v1.5.12 MAIN CHANGES  (IBKR CAPTURE EVIDENCE + EXECUTION SCOPE + USD PEG +
  *                        QUOTE PROVENANCE + CAPTURE WATCHER -- default OFF;
@@ -2519,7 +2552,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.12';
+var PD_VERSION = '1.5.13';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2890,6 +2923,7 @@ function pdSrcReadinessCore_(grid, nowMs, ctx, consumedRows) {
   var message = String(row[index.message] === null || row[index.message] === undefined
       ? '' : row[index.message]);
   var stamp = pdSrcStampMs_(row[index.lastupdated]);
+  out.stamp_ms = stamp;   /* v1.5.13: binding window */
   var count = pdSrcCount_(row[index.rows]);
   out.generation = JSON.stringify([String(row[index.lastupdated]), state, message, count]);
   var run = pdSrcToken_(message, 'run');
@@ -2966,9 +3000,63 @@ function pdSrcCapture_(ss) {
           reason: source.reason || ''};
 }
 
+/** v1.5.13: 'Last Updated (UTC)' cell -> instant. A Date keeps its instant;
+ * text needs a full time; a naive time in this UTC column is UTC. */
+function pdSrcUtcMs_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    var t = value.getTime();
+    return isFinite(t) ? t : null;
+  }
+  var text = String(value === null || value === undefined ? '' : value)
+      .replace(/^\s+|\s+$/g, '');
+  if (!text) return null;
+  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(text)) text = text + 'Z';
+  return pdSrcStampMs_(text);
+}
+
+var PD_SRC_BIND_EARLY_MS = 3 * 3600000;   /* rows the run did not rewrite */
+var PD_SRC_BIND_LATE_MS = 120000;         /* clock tolerance after the stamp */
+
+/** PURE v1.5.13: bind the consumed rows ([[SYMBOL, ms]...]) to the
+ * publication instant. Every row must lie in [stamp - 3 h, stamp + 2 min]
+ * and the post-decision re-read must equal the rows consumed. */
+function pdSrcBindingCore_(pre, post, stampMs) {
+  var isArr = function (v) {
+    return Object.prototype.toString.call(v) === '[object Array]';
+  };
+  if (!isArr(pre) || !pre.length) {
+    return {ok: false, reason: 'holdings timestamps unavailable'};
+  }
+  if (typeof stampMs !== 'number' || !isFinite(stampMs)) {
+    return {ok: false, reason: 'publication timestamp unverified'};
+  }
+  var newest = null, oldest = null;
+  for (var i = 0; i < pre.length; i++) {
+    var ms = pre[i] ? pre[i][1] : null;
+    if (typeof ms !== 'number' || !isFinite(ms)) {
+      return {ok: false, reason: 'holding timestamp unverified (' +
+          String((pre[i] && pre[i][0]) || '?').slice(0, 24) + ')'};
+    }
+    if (newest === null || ms > newest) newest = ms;
+    if (oldest === null || ms < oldest) oldest = ms;
+  }
+  if (newest > stampMs + PD_SRC_BIND_LATE_MS) {
+    return {ok: false, reason: 'holdings refreshed after the publication (' +
+        pdIbkrRiyadh_(newest) + ' > ' + pdIbkrRiyadh_(stampMs) + ' Riyadh)'};
+  }
+  if (oldest < stampMs - PD_SRC_BIND_EARLY_MS) {
+    return {ok: false, reason: 'holdings older than the publication'};
+  }
+  if (!isArr(post)) return {ok: false, reason: 'holdings re-read failed'};
+  if (JSON.stringify(post) !== JSON.stringify(pre)) {
+    return {ok: false, reason: 'holdings changed during the decision'};
+  }
+  return {ok: true, reason: ''};
+}
+
 /** Status-line fragment. off -> '' (v1.5.10 byte-identical); observe -> a
  * tag the final audit does not parse; enforce -> exactly one receipt. */
-function pdReceiptNote_(mode, ss, ctx, consumedRows, payload) {
+function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
   if (mode !== 'observe' && mode !== 'enforce') return '';
   var src;
   try {
@@ -2977,6 +3065,10 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload) {
         ? String(payload.status).toLowerCase() : '';
     if (src.ready && st !== 'ok') {
       src = {ready: false, reason: 'decision status ' + (st || 'unknown'), cohort: ''};
+    }
+    if (src.ready && binding) {
+      var bound = pdSrcBindingCore_(binding.pre, binding.post, src.stamp_ms);
+      if (!bound.ok) src = {ready: false, reason: bound.reason, cohort: ''};
     }
   } catch (e) {
     src = {ready: false, reason: 'receipt check failed', cohort: ''};
@@ -3690,7 +3782,7 @@ function pdReadPanel_(sheet, ss) {
 
 /* ----- holdings pool (reads the 122-col My_Portfolio page) ----------------- */
 
-function pdCollectHoldings_(extraFields) {
+function pdCollectHoldings_(extraFields, wantStamps) {
   var sheet = ensureSheetExists_(MY_PORTFOLIO_PAGE_);
   var headers = readCurrentSheetHeaders_(sheet);
   if (!headers.length || sheet.getLastRow() < 2) {
@@ -3729,6 +3821,10 @@ function pdCollectHoldings_(extraFields) {
    * layout is detected — readCostBasisMap_ reads header row 1 and returns an
    * empty map against a v2 sheet, which would send every holding back to
    * BLOCK "missing quantity". Same {qty, buyPrice} shape either way. */
+  /* v1.5.13: per-row Last Updated (UTC) for the receipt binding. */
+  var stampCol = wantStamps
+      ? myPortfolioResolveHeaderColumn_(headerMap, 'Last Updated (UTC)') : null;
+  var stamps = [];
   var cb = null;
   try { cb = _myPortfolioLedgerMap_(); } catch (eLV) { cb = null; }
   if (!cb) {
@@ -3770,8 +3866,13 @@ function pdCollectHoldings_(extraFields) {
     }
 
     rows.push(obj);
+    if (wantStamps && stampCol) {
+      stamps.push([pdIbkrSym_(sym), pdSrcUtcMs_(values[r][stampCol - 1])]);
+    }
   }
-  return { rows: rows, reason: '', costBasisApplied: cbApplied };
+  var collected = { rows: rows, reason: '', costBasisApplied: cbApplied };
+  if (wantStamps) collected.stamps = stamps;
+  return collected;
 }
 
 /* ----- HTTP ----------------------------------------------------------------- */
@@ -3958,7 +4059,7 @@ function refreshPortfolioDecision() {
   /* v1.5.12: enforce also sends the quote provenance columns. */
   var ibkrMode = pdIbkrMode_();
   var pool = pdCollectHoldings_(ibkrMode === 'enforce'
-      ? PD_IBKR_PROVENANCE_FIELDS : null);
+      ? PD_IBKR_PROVENANCE_FIELDS : null, receiptMode !== 'off');
   var poolNote = pool.rows.length
       ? 'holdings ' + pool.rows.length + ' rows from ' + MY_PORTFOLIO_PAGE_ +
         ' (qty/cost from cost-basis: ' + (pool.costBasisApplied || 0) + ')'
@@ -4001,8 +4102,15 @@ function refreshPortfolioDecision() {
 
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   /* v1.5.11 (A): '' when off, so the line stays v1.5.10 byte-identical. */
+  /* v1.5.13: bind the receipt to the rows consumed (re-read after). */
+  var binding = null;
+  if (receiptMode !== 'off') {
+    var postStamps = null;
+    try { postStamps = pdCollectHoldings_(null, true).stamps; } catch (eRb) {}
+    binding = {pre: pool.stamps, post: postStamps};
+  }
   var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,
-      pool.rows.length, payload);
+      pool.rows.length, payload, binding);
   var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
       pdMetaLine_(payload.meta) +
       ' | ' + secs + 's';
@@ -4380,6 +4488,14 @@ function pdSelfTest() {
   var srcNow = pdSrcReadiness_(ss, null, null);
   report.push('My_Portfolio publication: ' + (srcNow.ready
       ? 'ready, run ' + srcNow.cohort : 'not ready: ' + srcNow.reason));
+  /* v1.5.13: would the rows on the page now bind to that publication? */
+  if (srcNow.ready) {
+    var bindRows = null;
+    try { bindRows = pdCollectHoldings_(null, true).stamps; } catch (eBs) {}
+    var bindNow = pdSrcBindingCore_(bindRows, bindRows, srcNow.stamp_ms);
+    report.push('receipt binding (page rows vs run ' + srcNow.cohort + '): ' +
+        (bindNow.ok ? 'inside the run window' : 'WITHHELD: ' + bindNow.reason));
+  }
   report.push('reconciliation evidence property: ' +
       (pdEvidencePacket_() ? 'present (schema 1)' : 'absent'));
   /* v1.5.12: IBKR capture evidence (read-only; never amounts or the packet). */

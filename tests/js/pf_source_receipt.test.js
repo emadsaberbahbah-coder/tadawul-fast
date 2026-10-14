@@ -1,5 +1,7 @@
-/* 10_My_Portfolio v1.5.11: Portfolio_Decision source receipt and private
- * reconciliation-evidence transport. Runs the REAL bound source in a vm with
+/* 10_My_Portfolio v1.5.11+: Portfolio_Decision source receipt and private
+ * reconciliation-evidence transport; v1.5.13 binds the receipt to the rows
+ * actually read (each row's Last Updated (UTC) inside the run window and
+ * unchanged after the decision). Runs the REAL bound source in a vm with
  * Apps Script service stubs; holdings, accounts and runs are synthetic.
  *
  *   node tests/js/pf_source_receipt.test.js
@@ -53,9 +55,16 @@ function statusGrid(o) {
   if (o.duplicate) grid.push(mp.slice());
   return grid;
 }
-const HOLD_HEADERS = ['Symbol', 'Name', 'Sector', 'Currency', 'Position Qty', 'Avg Cost', 'Current Price'];
-const HOLD_ROWS = [['SYNTH1.US', 'Synthetic One', 'Energy', 'USD', 10, 20.5, 21.25],
-                   ['SYNTH2.SR', 'Synthetic Two', 'Financials', 'SAR', 5, 100, 99.5]];
+const HOLD_HEADERS = ['Symbol', 'Name', 'Sector', 'Currency', 'Position Qty', 'Avg Cost', 'Current Price',
+                      'Last Updated (UTC)'];
+/* Last Updated (UTC) sits inside run 4242424242's window (published 23:46:45Z). */
+const HOLD_ROWS = [['SYNTH1.US', 'Synthetic One', 'Energy', 'USD', 10, 20.5, 21.25,
+                    '2026-10-13T23:45:10.123456+00:00'],
+                   ['SYNTH2.SR', 'Synthetic Two', 'Financials', 'SAR', 5, 100, 99.5,
+                    '2026-10-13 23:45:11']];
+function rowsWithStamps(a, b) {
+  return [HOLD_ROWS[0].slice(0, 7).concat([a]), HOLD_ROWS[1].slice(0, 7).concat([b])];
+}
 const RESPONSE = {status: 'ok', kpis: {}, sector_summary: [], alerts: [],
   actions: [{action: 'BLOCK', symbol: 'SYNTH1.US', name: 'Synthetic One'},
             {action: 'BLOCK', symbol: 'SYNTH2.SR', name: 'Synthetic Two'}],
@@ -86,6 +95,8 @@ function run(opts) {
   const logs = [];
   const calls = {status_reads: 0, posts: []};
   let grid = opts.grid || statusGrid();
+  let holdRows = opts.rows || HOLD_ROWS;
+  const holdHeaders = opts.headers || HOLD_HEADERS;
   const statusSets = [];
   const pd = {
     getRange(r, c, nr, nc) {
@@ -98,12 +109,12 @@ function run(opts) {
     getMaxRows() { return 60; }, getMaxColumns() { return 26; }
   };
   const mp = {
-    __headers: HOLD_HEADERS,
-    getLastRow() { return HOLD_ROWS.length + 1; },
-    getLastColumn() { return HOLD_HEADERS.length; },
+    __headers: holdHeaders,
+    getLastRow() { return holdRows.length + 1; },
+    getLastColumn() { return holdHeaders.length; },
     getRange(r, c, nr, nc) {
       assert.equal(r, 2); assert.equal(c, 1);
-      return {getValues() { return HOLD_ROWS.slice(0, nr).map((x) => x.slice(0, nc)); }};
+      return {getValues() { return holdRows.slice(0, nr).map((x) => x.slice(0, nc)); }};
     }
   };
   const status = {
@@ -141,6 +152,7 @@ function run(opts) {
     UrlFetchApp: {fetch(url, options) {
       calls.posts.push({url: url, body: JSON.parse(options.payload), headers: options.headers});
       if (opts.onFetch) grid = opts.onFetch(grid, clock) || grid;
+      if (opts.onFetchRows) holdRows = opts.onFetchRows(holdRows) || holdRows;
       const response = opts.response || RESPONSE;
       return {getContentText() { return JSON.stringify(response); },
               getResponseCode() { return opts.code || 200; }};
@@ -238,6 +250,19 @@ const WITHHELD = [
    {onFetch(g, clock) { clock.now += 60000; const n = g.map((x) => x.slice());
      n[2][1] = '2026-10-14 08:50:41+03:00'; return n; }},
    'publication newer than the holdings read'],
+  ['rows refreshed after the publication (GAS auto refresh, 14 Oct shape)',
+   {rows: rowsWithStamps('2026-10-14T04:40:17.486516+00:00', '2026-10-14T04:40:16.867444+00:00')},
+   'holdings refreshed after the publication (07:40 > 02:46 Riyadh)'],
+  ['rows the run did not rewrite',
+   {rows: rowsWithStamps('2026-10-13T19:00:00+00:00', '2026-10-13T23:45:11+00:00')},
+   'holdings older than the publication'],
+  ['rows rewritten during the decision',
+   {onFetchRows() { return rowsWithStamps('2026-10-13T23:46:00+00:00', '2026-10-13 23:45:11'); }},
+   'holdings changed during the decision'],
+  ['row without a timestamp', {rows: rowsWithStamps('2026-10-13T23:45:10Z', '')},
+   'holding timestamp unverified (SYNTH2.SR)'],
+  ['no Last Updated (UTC) column', {headers: HOLD_HEADERS.slice(0, 7)},
+   'holdings timestamps unavailable'],
   ['not ready before the read',
    {grid: statusGrid({tokens: {data: 'PARTIAL'}}),
     onFetch() { return statusGrid(); }},
@@ -285,6 +310,13 @@ check('T07 _Status clock parsing (port of dt10SourceStampMs_)', () => {
   assert.equal(ms('2026-10-14 02:46:45'), Date.parse('2026-10-13T23:46:45Z'));
   assert.equal(ms('2026-10-14T08:46:22.499000'), Date.parse('2026-10-14T05:46:22.499Z'));
   assert.equal(ms('2026-10-13T23:46:45Z'), Date.parse('2026-10-13T23:46:45Z'));
+  const utc = (v) => ctx.pdSrcUtcMs_ ? ctx.pdSrcUtcMs_(v) : 'missing';
+  if (ctx.pdSrcUtcMs_) {                     /* v1.5.13: the (UTC) column is UTC when naive */
+    assert.equal(utc('2026-10-13 23:45:11'), Date.parse('2026-10-13T23:45:11Z'));
+    assert.equal(utc('2026-10-14T04:40:17.486516+00:00'), Date.parse('2026-10-14T04:40:17.486Z'));
+    assert.equal(utc(new Date(Date.parse('2026-10-13T23:45:11Z'))), Date.parse('2026-10-13T23:45:11Z'));
+    for (const bad of ['', '2026-10-13', 'soon', null]) assert.equal(utc(bad), null, String(bad));
+  }
   assert.equal(ms(new Date(Date.parse('2026-10-13T23:46:45Z'))), Date.parse('2026-10-13T23:46:45Z'));
   for (const bad of ['2026-10-14', '2026-02-30 10:00:00', '2026-10-14 24:00:00', '', null, 'soon']) {
     assert.equal(ms(bad), null, String(bad));
@@ -295,6 +327,10 @@ check('T08 self-test reports mode, publication verdict and evidence presence, ne
   const quiet = run({selfTest: true});
   assert.ok(quiet.report.indexOf('source receipt mode (PD_SOURCE_RECEIPT): off') >= 0);
   assert.ok(quiet.report.indexOf('My_Portfolio publication: ready, run ' + RUN) >= 0);
+  if (SOURCE.indexOf('pdSrcBindingCore_') >= 0) {
+    assert.ok(quiet.report.indexOf('receipt binding (page rows vs run ' + RUN + '): inside the run window') >= 0,
+              quiet.report);
+  }
   assert.ok(quiet.report.indexOf('reconciliation evidence property: absent') >= 0);
   const loud = run({selfTest: true, scriptProps: {PD_SOURCE_RECEIPT: 'observe'},
     docProps: {TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1: JSON.stringify(PACKET)}});

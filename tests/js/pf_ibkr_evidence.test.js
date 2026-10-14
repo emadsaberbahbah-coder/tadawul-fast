@@ -1,4 +1,4 @@
-/* 10_My_Portfolio v1.5.12: IBKR capture evidence, execution scope, USD peg,
+/* 10_My_Portfolio v1.5.12+: IBKR capture evidence, execution scope, USD peg,
  * quote provenance and the capture watcher. Runs the REAL bound source in a
  * vm with Apps Script service stubs. Every holding, contract id, amount and
  * account here is synthetic.
@@ -362,14 +362,21 @@ check('P03 enforce + fresh capture: scope, peg, provenance, exact packet, certif
   assert.equal(r.ret, 'ok');
 });
 
-check('P04 v1.5.11 receipt still binds: excluded rows count as consumed (4 of 4)', () => {
+check('P04 receipt still binds: excluded rows count as consumed (4 of 4); rows newer than the run withhold', () => {
+  /* the publication was stamped 1 min before the decision, after the rows' 08:43 acquisition */
   const r = run(world({props: Object.assign({PD_SOURCE_RECEIPT: 'enforce'}, ENFORCE),
-                       files: [driveFile(capture())]}));
+                       files: [driveFile(capture())], statusMs: START - 60000}));
   dump.receipt_and_ibkr = r.b2;
   assert.equal(r.b2, withNote(' | source readiness VERIFIED (run ' + RUN + ')' + SENT));
   assert.equal(count(DECLARATION_RE, r.b2), 1);
   const m = [...r.b2.matchAll(RECEIPT_RE)];
   assert.equal(m.length, 1); assert.equal(m[0][1], RUN);
+  /* v1.5.13: the page was refreshed after a publication stamped at 05:45 */
+  const late = run(world({props: Object.assign({PD_SOURCE_RECEIPT: 'enforce'}, ENFORCE),
+                          files: [driveFile(capture())]}));
+  assert.equal(late.b2, withNote(' | source readiness WITHHELD: holdings refreshed after the publication ' +
+    '(08:43 > 05:45 Riyadh)' + SENT));
+  assert.equal(count(RECEIPT_RE, late.b2), 0);
 });
 
 check('P05 enforce + stale capture: scope, peg and provenance only; no evidence, panel cash kept', () => {
