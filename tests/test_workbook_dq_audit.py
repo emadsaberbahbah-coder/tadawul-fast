@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_workbook_dq_audit.py - harness for scripts/tfb_workbook_dq_audit.py v1.0.2 (WP-0; v1.0.2 = WP-2bc DQ-37 receipt).
+"""tests/test_workbook_dq_audit.py - harness for scripts/tfb_workbook_dq_audit.py v1.0.3 (WP-0; v1.0.3 = truthful Top-10 KPI observations).
 
 Pattern: tests/test_export_audit_v1.py (the REAL script runs as a subprocess; no
 stand-ins) plus the namespace import used by tests/test_cash_snapshot_certification.py.
@@ -7,10 +7,10 @@ Offline: no network, no credentials, no live Sheet. The golden-fixture compariso
 against the real 2026-10-10 export runs only when TFB_TEST_EXPORT_XLSX points at it.
 
 Contract:
-  P1  --selftest exits 0 and prints "[DQ-SELFTEST v1.0.2] N/N PASS  cases-digest=<frozen>"
+  P1  --selftest exits 0 and prints "[DQ-SELFTEST v1.0.3] N/N PASS  cases-digest=<frozen>"
   P2  CLI: no args -> 2; missing export -> 2; missing --baseline -> 2; --help -> 0
   P3  determinism: two --selftest runs print the same cases-digest
-  P4  D7 guard: the script is not this file; SCRIPT_VERSION = "1.0.2"; no def test_
+  P4  D7 guard: the script is not this file; SCRIPT_VERSION = "1.0.3"; no def test_
   P5  golden fixture structure and spot values (tests/fixtures/dq_baseline_2026-10-10.json)
   P6  fixture self-comparison through compare_to_baseline (regressions / critical)
   P7  redaction guard accepts the fixture and rejects injected money
@@ -19,8 +19,12 @@ Contract:
   P10 workflow wiring (regex, no PyYAML) in .github/workflows/workbook_backup.yml
   P11 backup_workbook._write_local_copy: unset env -> nothing written; set -> 0600 file
   P12 golden run on the real export (skipped without TFB_TEST_EXPORT_XLSX)
-  P13 v1.0.2 DQ-37 non-converged predicate: f7_settle_failed or the settle_unresolved: prefix,
+  P13 v1.0.3 DQ-37 non-converged predicate: f7_settle_failed or the settle_unresolved: prefix,
       never the bare substring "unresolved"; an INVESTABLE one is listed in the examples
+  P14 DQ-45 accepts current/legacy KPI titles by unique headers; missing, ambiguous
+      or malformed observations stay unknown; execution text or zero-withheld
+      proves exec counts, while plain selected/funded counts do not
+  P15 cohort evidence references use physical worksheet rows after blank filtering
 Runs under pytest or directly (python tests/test_workbook_dq_audit.py).
 """
 from __future__ import annotations
@@ -52,7 +56,7 @@ if REPO not in sys.path:
 SCRIPT = os.path.join(REPO, "scripts", "tfb_workbook_dq_audit.py")
 FIXTURE = os.path.join(HERE, "fixtures", "dq_baseline_2026-10-10.json")
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "workbook_backup.yml")
-EXPECT = "[DQ-SELFTEST v1.0.2] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
+EXPECT = "[DQ-SELFTEST v1.0.3] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
 EXPORT_SHA16 = "f5d327afc9fb409c"
 DECISION_CRITICAL = {"DQ-07", "DQ-08", "DQ-09", "DQ-10", "DQ-16", "DQ-22", "DQ-24", "DQ-25", "DQ-30", "DQ-33", "DQ-34",
                      "DQ-38", "DQ-46", "DQ-53", "DQ-62"}
@@ -108,7 +112,7 @@ def test_p4_not_a_copy_of_the_script():
     with open(os.path.abspath(__file__), "rb") as f:
         me = f.read()
     assert hashlib.sha256(script).hexdigest() != hashlib.sha256(me).hexdigest()
-    assert b'SCRIPT_VERSION = "1.0.2"' in script
+    assert b'SCRIPT_VERSION = "1.0.3"' in script
     assert b"def test_" not in script
 
 
@@ -207,7 +211,7 @@ def test_p9_import_is_side_effect_free():
             "assert 'scripts.tfb_export_audit' not in sys.modules; print(m.SCRIPT_VERSION)")
     p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=REPO, timeout=120)
     assert p.returncode == 0, p.stderr
-    assert p.stdout.strip() == "1.0.2"
+    assert p.stdout.strip() == "1.0.3"
 
 
 def test_p10_workflow_wiring():
@@ -261,7 +265,7 @@ def test_p12_golden_run_on_the_real_export():
         out = os.path.join(tmp, "dq_report.json")
         rc, text = _run(export, "--json", out, "--baseline", FIXTURE, "--quiet")
         assert rc == 0, text[-600:]
-        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.2]")][-1]
+        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.3]")][-1]
         assert "regressions=0 critical_regressions=0" in line, line
         report = json.load(open(out, encoding="utf-8"))
     fx = _fixture()
@@ -272,7 +276,7 @@ def test_p12_golden_run_on_the_real_export():
 
 
 def test_p13_dq37_counts_both_receipts_by_prefix():
-    """v1.0.2 (WP-2bc integration): engine 5.153.0 under TFB_SETTLE_UNRESOLVED=enforce publishes a
+    """v1.0.3 (WP-2bc integration): engine 5.153.0 under TFB_SETTLE_UNRESOLVED=enforce publishes a
     non-converged row with settle_unresolved:enforce:... and WITHOUT f7_settle_failed:non_converged.
     DQ-37 must still count it; a margin receipt ending in ':unresolved' must not be counted."""
     hdr = ["Symbol", "Investability Status", "Warnings"]
@@ -346,13 +350,105 @@ def test_dq37_structured_error_also_marks_real_row_flags():
         assert any("DQ-37" in r.get("checks_failed", []) for r in report["rows"])
 
 
+def _dq45_context(header, values):
+    return {"t10": [header, values],
+            "status_globals": {"TFB Decision Feed": "NOT_ACTIONABLE(synthetic)"},
+            "board": {"AAA.US", "BBB.US"}, "qualified": {"AAA.US", "BBB.US"}}
+
+
+def test_dq45_reads_both_cash_titles_and_selected_header():
+    for cash in ("Deployable (SAR)", "Entered cash (SAR)"):
+        for selected, expected in (("2 exec + 1 pend / 10", 2),
+                                   ("2 exec + 1 fast-track suspended + 1 research + 1 grace / 10", 2),
+                                   ("0 / 10 (withheld)", 0), ("0 exec", 0),
+                                   ("0 exec + 1 grace / 10", 0)):
+            for header, values in (([cash, "Selected", "Passed"], [None, selected, 4]),
+                                   (["Passed", "Selected", cash], [4, selected, None]),
+                                   ([cash, "Scanned", "Passed", "Selected"], [None, 10, 4, selected])):
+                result = dq.dq_45_feed_state(_dq45_context(header, values))
+                assert result["status"] == "INFO"
+                assert result["count"] == result["values"]["exec_seats"] == expected, (header, selected, result)
+                dq._assert_redacted(result)
+
+
+def test_dq45_unknown_for_missing_or_ambiguous_kpi_strip():
+    valid = ["Entered cash (SAR)", "Selected", "Passed"]
+    cases = [([], []), (["Selected", "Passed"], ["2 exec", 2]),
+             (["Entered cash (SAR)", "Selected"], [None, "2 exec"]),
+             (["Entered cash (SAR)", "Passed"], [None, 2]),
+             (["Entered cash (SAR)", "Selected", "Selected", "Passed"], [None, "2 exec", "2 exec", 2]),
+             (["Entered cash (SAR)", "Selected", "Passed", "Passed"], [None, "2 exec", 2, 2]),
+             (["Entered cash (SAR)", "Deployable (SAR)", "Selected", "Passed"], [None, None, "2 exec", 2]),
+             (["Entered cash (SAR)", "Selected", "Passed", "Scanned", "Scanned"], [None, "2 exec", 2, 10, 10]),
+             (valid, [None])]
+    for header, values in cases:
+        result = dq.dq_45_feed_state(_dq45_context(header, values))
+        assert result["status"] == "INFO"
+        assert result["count"] is None and result["values"]["exec_seats"] is None, (header, values, result)
+    ctx = _dq45_context(valid, [None, "2 exec", 2])
+    ctx["t10"] += [["Deployable (SAR)", "Selected", "Passed"], [None, "2 exec", 2]]
+    assert dq.dq_45_feed_state(ctx)["values"]["exec_seats"] is None
+    ctx["t10"] = [valid]
+    assert dq.dq_45_feed_state(ctx)["values"]["exec_seats"] is None
+    # A separate cash-only portfolio strip is not a Top-10 KPI block.
+    ctx["t10"] = [["Deployable (SAR)"], [None], valid, [None, "2 exec", 2]]
+    assert dq.dq_45_feed_state(ctx)["values"]["exec_seats"] == 2
+
+
+def test_dq45_malformed_selected_is_unknown_not_zero():
+    for selected in (None, "", True, False, float("inf"), float("nan"), -1, 1.5,
+                     0, 0.0, "0", 4, "3 / 10", "0 / 10",
+                     "-1 exec", "-2 exec", "1.5 exec", "2e3 exec", "2 / 1", "two",
+                     "2 exec + 3 exec", "2 exec + 3 exec / 10", "withheld", "unknown (withheld)",
+                     "2 exec / 10 garbage", "0 / 10 (withheld) extra", "2 / 10 (withheld)", "10%",
+                     "2 exec + 1 pend + 1 pending / 10", "9 exec + 2 grace / 10", "9" * 5000):
+        result = dq.dq_45_feed_state(_dq45_context(
+            ["Entered cash (SAR)", "Selected", "Passed"], [None, selected, 2]))
+        assert result["status"] == "INFO"
+        assert result["count"] is None and result["values"]["exec_seats"] is None, (selected, result)
+        dq._assert_redacted(result)
+
+
+def test_row_evidence_refs_preserve_physical_worksheet_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = dq.build_synthetic(tmp, clean=True)
+        wb = openpyxl.load_workbook(path)
+        mp = wb["My_Portfolio"]
+        another_holding = [cell.value for cell in mp[2]]
+        another_holding[0] = "G2.US"
+        mp.append(another_holding)
+        wb.save(path)
+        before = dq.audit_workbook(path, include_rows=True)
+        # Both symbol tables have real records at rows 2 and 4, separated by
+        # a completely blank row. Filtering must not renumber the evidence.
+        for page in ("Market_Leaders", "My_Portfolio"):
+            wb[page].insert_rows(3)
+        wb.save(path)
+        wb.close()
+        after = dq.audit_workbook(path, include_rows=True)
+    refs = {(r["page"], r["symbol"]): int(r["evidence_ref"].rsplit("!", 1)[1]) for r in after["rows"]}
+    assert refs[("Market_Leaders", "S1.SR")] == 2
+    assert refs[("Market_Leaders", "S2.SR")] == 4
+    assert refs[("My_Portfolio", "G1.US")] == 2
+    assert refs[("My_Portfolio", "G2.US")] == 4
+    assert before["rows_summary"] == after["rows_summary"]
+    B, A = ({c["id"]: c for c in report["checks"]} for report in (before, after))
+    # Adding blank storage legitimately changes padding/size; symbol business
+    # measurements, contracts, arithmetic and permission checks are unchanged.
+    for cid in ("DQ-01", "DQ-07", "DQ-08", "DQ-30", "DQ-31", "DQ-38", "DQ-45", "DQ-53", "DQ-60"):
+        assert B[cid] == A[cid], cid
+    dq._assert_redacted(after)
+
+
 if __name__ == "__main__":
     tests = [test_p1_selftest_passes, test_p2_cli_contract, test_p3_selftest_deterministic, test_p4_not_a_copy_of_the_script,
              test_p5_golden_fixture_structure, test_p6_fixture_self_comparison, test_p7_redaction_guard,
              test_p8_synthetic_negatives_through_the_real_path, test_p9_import_is_side_effect_free, test_p10_workflow_wiring,
              test_p11_backup_local_copy_flag_default, test_p12_golden_run_on_the_real_export,
              test_p13_dq37_counts_both_receipts_by_prefix, test_dq37_reads_structured_failure_and_deduplicates_warning,
-             test_dq37_structured_error_also_marks_real_row_flags]
+             test_dq37_structured_error_also_marks_real_row_flags, test_dq45_reads_both_cash_titles_and_selected_header,
+             test_dq45_unknown_for_missing_or_ambiguous_kpi_strip, test_dq45_malformed_selected_is_unknown_not_zero,
+             test_row_evidence_refs_preserve_physical_worksheet_rows]
     fails = skipped = 0
     for t in tests:
         try:
@@ -366,5 +462,5 @@ if __name__ == "__main__":
                 raise
             skipped += 1
             print("SKIP", t.__name__, "::", str(exc)[:160])
-    print("[DQ-AUDIT HARNESS v1.0.2] %d/%d PASS (%d skipped)" % (len(tests) - fails - skipped, len(tests), skipped))
+    print("[DQ-AUDIT HARNESS v1.0.3] %d/%d PASS (%d skipped)" % (len(tests) - fails - skipped, len(tests), skipped))
     sys.exit(1 if fails else 0)

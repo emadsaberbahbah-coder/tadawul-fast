@@ -3,6 +3,15 @@
 tfb_workbook_dq_audit.py - offline DQ-01..DQ-75 measurement harness over a TFB
 workbook export (WP-0 of the 2026-10-11 audit framework).
 
+v1.0.3 (2026-10-14) - preserve unknown Top-10 KPI observations.
+Both Entered cash (SAR) and legacy Deployable (SAR) strips are recognized by
+unique Selected/Passed headers. Missing, ambiguous or malformed Selected
+observations remain None. Only explicit exec seat text or the zero-withheld
+contract proves execution counts; plain Selected counts do not. DQ-45 remains
+INFO and cannot issue or change a decision-feed permission.
+Row evidence references retain physical worksheet row numbers through blank
+symbol filtering, rather than reporting a filtered body position as a row.
+
 v1.0.2 (2026-10-14) - count structured settlement failures as well as warnings.
 PDN.AX in the reviewed export records non_converged in Scoring Errors without
 a warning receipt. Parse only the explicit scoring_settlement JSON record;
@@ -134,7 +143,7 @@ import sys
 import tempfile
 import time
 
-SCRIPT_VERSION = "1.0.2"   # DQ-37 includes explicit structured settlement errors.
+SCRIPT_VERSION = "1.0.3"   # DQ-45 recognizes both KPI titles and preserves unknown.
 
 # --------------------------------------------------------------------------- #
 # CONFIG - every threshold, vocabulary and policy constant lives here
@@ -365,7 +374,10 @@ VERSION_STAMP_RE = re.compile(r"v(\d+\.\d+\.\d+)")
 GRID_CAPACITY_RE = re.compile(r"allocated=([\d,]+) \(([\d.]+)%\)")
 STATUS_STAMP_RE = re.compile(r"\[STATUS-STAMP v([\d.]+)\]")
 NAV_TEXT_RE = re.compile(r"NAV ([\d,]+) SAR")
-SELECTED_EXEC_RE = re.compile(r"(\d+) exec")
+SELECTED_EXEC_RE = re.compile(
+    r"(?P<count>\d+)\s+exec"
+    r"(?:\s*\+\s*\d+\s+(?:fast-track suspended|research|pend(?:ing)?|grace))*"
+    r"(?:\s*/\s*(?P<limit>\d+))?", re.I)
 S1_CRITERION1_RE = re.compile(r"(\d+)/(\d+) scored days · (\d+) excluded-infra")
 RUNLOG_TOKENS = {"rows402_new": re.compile(r"rows402 new=(\d+)"), "f429": re.compile(r"\bf429=(\d+)"),
                  "f404": re.compile(r"\bf404=(\d+)"), "fb429": re.compile(r"fb=429:(\d+)"),
@@ -562,7 +574,10 @@ class Page:
         self.grid_rows = grid_rows
         self.header = [_s(h) for h in rows[0]] if rows else []
         self.ix = _header_index(rows) if rows else {}
-        self.body = [r for r in rows[1:] if _s(r[self.ix["Symbol"]])] if "Symbol" in self.ix else []
+        indexed = [(ri, r) for ri, r in enumerate(rows[1:], 2)
+                   if _s(r[self.ix["Symbol"]])] if "Symbol" in self.ix else []
+        self.body = [r for _, r in indexed]
+        self.row_numbers = [ri for ri, _ in indexed]
         wi = self.ix.get("Warnings")
         self.tags = [_tags(r[wi]) if wi is not None else [] for r in self.body]
         self.syms = [_s(r[self.ix["Symbol"]]) for r in self.body] if self.body else []
@@ -1953,19 +1968,63 @@ def dq_44_reason_length(ctx):
 # --------------------------------------------------------------------------- #
 # G - Decision surfaces
 # --------------------------------------------------------------------------- #
+def _top10_selected_observation(rows):
+    """Read one unambiguous KPI strip; cash-only portfolio rows are unrelated."""
+    cash_labels = {"Entered cash (SAR)", "Deployable (SAR)"}
+    blocks = []
+    for i, row in enumerate(rows):
+        header = [_s(v) for v in row]
+        cash_n = sum(h in cash_labels for h in header)
+        if not cash_n or not ("Selected" in header or "Passed" in header):
+            continue
+        populated = [h for h in header if h]
+        if (cash_n != 1 or header.count("Selected") != 1 or header.count("Passed") != 1
+                or len(populated) != len(set(populated))):
+            return None, "ambiguous or incomplete KPI header"
+        blocks.append((i, header.index("Selected")))
+    if len(blocks) != 1:
+        return None, "KPI strip missing" if not blocks else "multiple KPI strips"
+    ri, ci = blocks[0]
+    if ri + 1 >= len(rows) or ci >= len(rows[ri + 1]):
+        return None, "Selected value missing"
+    return rows[ri + 1][ci], None
+
+
+def _selected_exec_count(value):
+    """Only execution-seat disclosure proves exec; plain Selected is not proof."""
+    if not isinstance(value, str):
+        return None
+    selected = value.strip()
+    if len(selected) > 512:
+        return None
+    if re.fullmatch(r"0\s*/\s*\d+\s*\(withheld\)", selected, re.I):
+        return 0
+    match = SELECTED_EXEC_RE.fullmatch(selected)
+    if match is None:
+        return None
+    count = int(match.group("count"))
+    limit = match.group("limit")
+    qualifiers = re.findall(r"\+\s*(\d+)\s+(fast-track suspended|research|pend(?:ing)?|grace)", selected, re.I)
+    labels = [label.casefold().replace("pending", "pend") for _, label in qualifiers]
+    if len(labels) != len(set(labels)):
+        return None
+    if limit is not None and count + sum(int(n) for n, _ in qualifiers) > int(limit):
+        return None
+    return count
+
+
 def dq_45_feed_state(ctx):
     t10 = ctx["t10"]
     feed = ctx["status_globals"].get("TFB Decision Feed", "")
     if not t10 and not feed:
         return not_checked("DQ-45", "feed_state", "G", "surface", "Top_10_Investments and the _Status feed global are absent")
     vals, ex = {}, []
-    selected = ""
-    ki = _find_row(t10, lambda r: _s(r[0]) == "Deployable (SAR)")
-    if ki is not None and ki + 1 < len(t10) and len(t10[ki + 1]) > 2:
-        selected = _s(t10[ki + 1][2])
-    m = SELECTED_EXEC_RE.search(selected)
-    exec_n = int(m.group(1)) if m else None
-    vals["exec_seats"] = exec_n if exec_n is not None else 0
+    observation, selected_error = _top10_selected_observation(t10)
+    exec_n = _selected_exec_count(observation) if selected_error is None else None
+    if exec_n is None and selected_error is None:
+        selected_error = "Selected value missing or malformed"
+    selected = _s(observation) if exec_n is not None else ""
+    vals["exec_seats"] = exec_n
     vals["board_seats"] = len(ctx["board"])
     vals["qualified"] = len(ctx["qualified"])
     for key, rx in (("pending", r"(\d+) pend"), ("grace", r"(\d+) grace"), ("suspended", r"(\d+) fast-track suspended")):
@@ -1973,9 +2032,9 @@ def dq_45_feed_state(ctx):
         if mm:
             vals[key] = int(mm.group(1))
     state = feed.split("|")[0].strip() if feed else "?"
-    bi = _find_row(t10, lambda r: "FEED" in _s(r[0]))
+    bi = _find_row(t10, lambda r: bool(r) and "FEED" in _s(r[0]))
     banner = _s(t10[bi][0])[:60] if bi is not None else ""
-    ex = [f"feed {state}", f"selected '{selected}'" if selected else "selected cell not found"]
+    ex = [f"feed {state}", f"selected '{selected}'" if selected else f"Selected unknown: {selected_error}"]
     if banner:
         ex.append(banner.split("(")[0].strip()[:40])
     return check("DQ-45", "feed_state", "G", "surface", "INFO", vals["exec_seats"], vals, ex,
@@ -3186,7 +3245,7 @@ def row_records(ctx, checks, baseline=None):
             inv = pg.s(r, "Investability Status").upper()
             crit = ("board_seat" if sym in board else "holding" if sym in hold else "qualified" if sym in qual
                     else "investable" if inv == "INVESTABLE" else "invest")
-            out.append(record(pg, i + 1, r, tg, fl, crit))
+            out.append(record(pg, pg.row_numbers[i], r, tg, fl, crit))
     mp = ctx["portfolio"]
     if mp:
         meta = _page_meta(ctx)
@@ -3195,7 +3254,7 @@ def row_records(ctx, checks, baseline=None):
         m["bare"] = set()
         for i, (r, tg) in enumerate(zip(mp.body, mp.tags)):
             fl = _row_flags(mp, r, tg, ctx, m)
-            out.append(record(mp, i + 1, r, tg, fl, "holding"))
+            out.append(record(mp, mp.row_numbers[i], r, tg, fl, "holding"))
     return out
 
 
