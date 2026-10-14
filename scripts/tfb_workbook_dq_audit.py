@@ -3,6 +3,11 @@
 tfb_workbook_dq_audit.py - offline DQ-01..DQ-75 measurement harness over a TFB
 workbook export (WP-0 of the 2026-10-11 audit framework).
 
+v1.0.2 (2026-10-14) - count structured settlement failures as well as warnings.
+PDN.AX in the reviewed export records non_converged in Scoring Errors without
+a warning receipt. Parse only the explicit scoring_settlement JSON record;
+count its union with warning failures once in summary and row-level flags.
+
 v1.0.1 (2026-10-11) [WP-2bc integration] - DQ-37 READS THE NEW RECEIPT
 -------------------------------------------------------------------------
 Engine 5.153.0 (WP-2b, gate TFB_SETTLE_UNRESOLVED) publishes a non-converged
@@ -129,7 +134,7 @@ import sys
 import tempfile
 import time
 
-SCRIPT_VERSION = "1.0.1"   # v1.0.1: DQ-37 also counts the settle_unresolved: receipt (WP-2bc)
+SCRIPT_VERSION = "1.0.2"   # DQ-37 includes explicit structured settlement errors.
 
 # --------------------------------------------------------------------------- #
 # CONFIG - every threshold, vocabulary and policy constant lives here
@@ -1661,16 +1666,69 @@ def dq_36_horizon(ctx):
                  "count = rows labelled 1Y/12M whose Recommendation Reason says horizon=month or horizon=long", "label/days agree with the reason text", "WP-3 / F-1")
 
 
+def _settlement_state(pg, row, tags):
+    """Read explicit failure receipts, never arbitrary 'unresolved' text.
+
+    Scoring Errors can contain several semicolon-delimited diagnostic records.
+    JSONDecoder consumes only the settlement object, so a following record is
+    harmless and status text in an unrelated field never becomes evidence.
+    """
+    if any(tag.startswith(F7_NONCONV_PREFIXES) for tag in tags):
+        return "failed"
+    raw = pg.s(row, "Scoring Errors")
+    if not raw:
+        return "ok"
+    markers = list(re.finditer(r"(?:^|[;\n])\s*scoring_settlement:\s*", raw))
+    if not markers:
+        return "ok"
+    if len(raw) > 65536:
+        return "unknown"
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("ambiguous settlement diagnostic")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique)
+    unknown = False
+    for match in markers:
+        try:
+            record, _ = decoder.raw_decode(raw[match.end():])
+        except (ValueError, RecursionError):
+            unknown = True
+            continue
+        status = record.get("status") if isinstance(record, dict) else None
+        if not isinstance(status, str):
+            unknown = True
+        elif status in {"non_converged", "error"}:
+            return "failed"
+        elif status not in {"stable", "converged"}:
+            unknown = True
+    return "unknown" if unknown else "ok"
+
+
+def _settlement_failed(pg, row, tags):
+    # Unknown structured diagnostics fail the check without being counted as
+    # proven non-convergence. Row flags retain both kinds of unresolved input.
+    return _settlement_state(pg, row, tags) != "ok"
+
+
 def dq_37_f7(ctx):
-    vals, ex, flips_total, nonconv_total = {}, [], 0, 0
+    vals, ex, flips_total, nonconv_total, invalid_total = {}, [], 0, 0, 0
     ex_nc = []   # v1.0.1: INVESTABLE non-converged rows get their own list and precedence
     pairs = collections.Counter()
     for p in _pages_present(ctx):
         pg = ctx["pages"][p]
-        tagged = flips = flips_inv = d5 = d10 = nonconv = 0
+        tagged = flips = flips_inv = d5 = d10 = nonconv = invalid = 0
         for r, tg in zip(pg.body, pg.tags):
             f7 = [t for t in tg if t.startswith("f7_settle:")]
-            if any(t.startswith(F7_NONCONV_PREFIXES) for t in tg):
+            settlement_state = _settlement_state(pg, r, tg)
+            if settlement_state == "unknown":
+                invalid += 1
+            if settlement_state == "failed":
                 nonconv += 1
                 if pg.s(r, "Investability Status").upper() == "INVESTABLE" and len(ex_nc) < 6:
                     ex_nc.append(f"{pg.s(r, 'Symbol')} INVESTABLE non-converged ({PAGE_SHORT[p]})")
@@ -1705,22 +1763,27 @@ def dq_37_f7(ctx):
         vals[p + ":delta_ge5"] = d5
         vals[p + ":delta_ge10"] = d10
         vals[p + ":non_converged"] = nonconv
+        if invalid:
+            vals[p + ":invalid_settlement_diagnostics"] = invalid
+        invalid_total += invalid
         flips_total += flips
         nonconv_total += nonconv
     if not vals:
         return not_checked("DQ-37", "f7_pass_dependence", "E", "scores", "no market page")
     vals["flips_total"] = flips_total
     vals["non_converged_total"] = nonconv_total
+    if invalid_total:
+        vals["invalid_settlement_diagnostics_total"] = invalid_total
     for k, v in pairs.most_common(5):
         vals["pair_" + k] = v
     # v1.0.1: the 6 example slots fill with INVESTABLE rc flips long before the last
     # non-converged rows on a real export, so a non-converged INVESTABLE row goes FIRST.
     ex = ex_nc + ex[:max(0, 6 - len(ex_nc))]
     ex += [f"{k} x{v}" for k, v in pairs.most_common(3)]
-    status = "FAIL" if flips_total or nonconv_total else "PASS"
+    status = "FAIL" if flips_total or nonconv_total or invalid_total else "PASS"
     return check("DQ-37", "f7_pass_dependence", "E", "scores", status, flips_total, vals, ex,
                  "count = rows whose f7_settle tag carries rc=a>b (recommendation flip); |delta overall| >= 5 / >= 10 and "
-                 "non-converged rows in values (tag prefix f7_settle_failed or settle_unresolved:, v1.0.1)",
+                 "failed/unresolved rows in values (f7_settle_failed, settle_unresolved:, or explicit scoring_settlement JSON)",
                  "0 rc flips; 0 non-converged", "WP-2")
 
 
@@ -2928,7 +2991,7 @@ def _row_flags(pg, r, tg, ctx, m):
     reason, lbl = pg.s(r, "Recommendation Reason"), pg.s(r, "Invest Period Label").upper()
     if lbl in ("1Y", "12M") and ("horizon=month" in reason or "horizon=long" in reason):
         f.add("DQ-36")
-    if any(t.startswith(F7_NONCONV_PREFIXES) for t in tg) or any(F7_RC_RE.search(t) for t in tg if t.startswith("f7_settle:")):
+    if _settlement_failed(pg, r, tg) or any(F7_RC_RE.search(t) for t in tg if t.startswith("f7_settle:")):
         f.add("DQ-37")
     fa, inv = pg.s(r, "Final Action").upper(), pg.s(r, "Investability Status").upper()
     if (fa == "INVEST" and pg.s(r, "Recommendation").upper() in SELL_CLASS) or \

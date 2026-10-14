@@ -2754,6 +2754,2485 @@
         }
       ],
       "review_receipt_sha256": "f6ca297854c26856996b8d08657f0f55817827dc166278510846487b0e217b0f"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "EMBC.US",
+      "name": "Embecta Corp.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001872789",
+        "exact_authority_ticker": "EMBC",
+        "security_class": "Embecta Corp. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "1bae619940313ed08bb9a726e18fcc4c1e32f3f23d175df64ee6eb47d5ab1043"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SCOR.US",
+      "name": "COMSCORE, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001158172",
+        "exact_authority_ticker": "SCOR",
+        "security_class": "comScore, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a61933937a1f15e8e88ec6be6c82aac0c2330b04e2a7542d48a9e16dd13afac8"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "INSG.US",
+      "name": "INSEEGO CORP.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001022652",
+        "exact_authority_ticker": "INSG",
+        "security_class": "Inseego Corp. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "4d6da48cf0c4e7002d280983322de3c6f3ea7b856b5ea7b0132585df4a1e40b5"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "YSXT.US",
+      "name": "YSX Tech Co., Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001993463",
+        "exact_authority_ticker": "YSXT",
+        "security_class": "YSX Tech. Co., Ltd  - Class A Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f88ebb016d85efdb029d32e2f0dfd7de41c53d9b4bcedc0dca8d5ab7ce83916d"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CAF.US",
+      "name": "Morgan Stanley China A Share Fund, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001368493",
+        "exact_authority_ticker": "CAF",
+        "security_class": "Morgan Stanley China A Share Fund Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "37ba2c1032f85cd91e14499821fb16d4b23e09041608e09249babe75bff02f1b"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "DCOY.US",
+      "name": "Decoy Therapeutics Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001615219",
+        "exact_authority_ticker": "DCOY",
+        "security_class": "Decoy Therapeutics Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7a441b585291ff8f47cf90bb54d1a5301b3b13833e528ec9a0b74a27b10256e9"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PARR.US",
+      "name": "PAR PACIFIC HOLDINGS, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000821483",
+        "exact_authority_ticker": "PARR",
+        "security_class": "Par Pacific Holdings, Inc.  Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "378d3475ca32590bd4948af7b8d11470226998cac3006adf65bf499b0a2bdcd7"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "TRUG.US",
+      "name": "TruGolf Holdings, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001857086",
+        "exact_authority_ticker": "TRUG",
+        "security_class": "TruGolf Holdings, Inc. - Class A Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "D",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7ca1e7540010d09f60b6bae6d46c2f435b5be734bcc24276731cf6ca7204ab2c"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "BMHL.US",
+      "name": "Bluemount Holdings Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002027815",
+        "exact_authority_ticker": "BMHL",
+        "security_class": "Bluemount Holdings Limited - Class B Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b423242a37ed3062b294756d6d012e27a3758b3e9249d966663fceb37acf3daf"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CDNL.US",
+      "name": "Cardinal Infrastructure Group Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002079999",
+        "exact_authority_ticker": "CDNL",
+        "security_class": "Cardinal Infrastructure Group Inc. - Class A Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "1f0dc6a6836885adf989f58623b7859af558f5291be8069cae71c39473c995e3"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "NUWE.US",
+      "name": "Nuwellis, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001506492",
+        "exact_authority_ticker": "NUWE",
+        "security_class": "Nuwellis, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7097447f1aa369713512881ae7137910fd7a6f3ad3bb508549b719fc93380e2b"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "YJ.US",
+      "name": "Yunji Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001759614",
+        "exact_authority_ticker": "YJ",
+        "security_class": "Yunji Inc. - American Depository Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "4fd1dc29e56868d489b3e43854aaf571507a4fb2d7d9ef7872d40c6aeaba4d70"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SSRM.US",
+      "name": "SSR MINING INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000921638",
+        "exact_authority_ticker": "SSRM",
+        "security_class": "SSR Mining Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "93e9aefa25758faad16271b7d5f82bd5bbc9ea6de891972dbac18f516b62ed0f"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "ELOX.US",
+      "name": "Eloxx Pharmaceuticals, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001035354",
+        "exact_authority_ticker": "ELOX",
+        "security_class": "Eloxx Pharmaceuticals, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "5fc263f73afc8e3025814099d240419fc711e2f46a58fcde0821bae76e979f19"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "IDR.US",
+      "name": "Idaho Strategic Resources, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001030192",
+        "exact_authority_ticker": "IDR",
+        "security_class": "Idaho Strategic Resources, Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "A",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "ec8e895a698cd370aa0176f489996371350d076ad6c3e2b6f69bd5829d4a6830"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "KXIN.US",
+      "name": "Kaixin Holdings",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001713539",
+        "exact_authority_ticker": "KXIN",
+        "security_class": "Kaixin Holdings - Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "9f39d15b8b27bdb6ef04164cefcb70df559d8e75cbfa4f9a48187ce54dd487ce"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SORA.US",
+      "name": "AsiaStrategy",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002033515",
+        "exact_authority_ticker": "SORA",
+        "security_class": "AsiaStrategy - Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "257798b86ada264e119e5a80ef7b2bd4e6eb874f5e0c079e507a849cd6d735d3"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AISP.US",
+      "name": "Airship AI Holdings, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001842566",
+        "exact_authority_ticker": "AISP",
+        "security_class": "Airship AI Holdings, Inc - Class A Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a34f1c5ab1200341068d9ce3eb788ee6024d491669ed8e91757b4a7a4de9cf07"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "KPLT.US",
+      "name": "Katapult Holdings, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001785424",
+        "exact_authority_ticker": "KPLT",
+        "security_class": "Katapult Holdings, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "25997513f3b51ae3d282730e8b38c9d9bc50ba4ba0f240fa324bedc3b0109a72"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "HMR.US",
+      "name": "Heidmar Maritime Holdings Corp.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002029471",
+        "exact_authority_ticker": "HMR",
+        "security_class": "Heidmar Maritime Holdings Corp. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "2cbd6fc2e3bbef207455001a6501a321a9e62692df17defd756a17ed55aa76f6"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "MBAI.US",
+      "name": "MBody AI Ltd.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001610590",
+        "exact_authority_ticker": "MBAI",
+        "security_class": "MBody AI Ltd. - Ordinary Share",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "022c029fc4f0f9b92b68d16cd18e1e83b7a9e890d41954e601934fde288e333a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PSIX.US",
+      "name": "POWER SOLUTIONS INTERNATIONAL, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001137091",
+        "exact_authority_ticker": "PSIX",
+        "security_class": "Power Solutions International, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "ab8b6c6ede73dfc0b9f10d2f07cc72c941baca904d70ca1988775229a4bc48ad"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AVX.US",
+      "name": "AVAX ONE TECHNOLOGY LTD.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001826397",
+        "exact_authority_ticker": "AVX",
+        "security_class": "Avax One Technology Ltd. - Common Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "9a2a424ee6341a61d40a4efea42b6e1040a8b78382f46d13df2f41b4e02eaf55"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AGPU.US",
+      "name": "Axe Compute Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001446159",
+        "exact_authority_ticker": "AGPU",
+        "security_class": "Axe Compute Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "1aa01fcc816533a6b18c652467105a00dde4ee6b08045fbba052a2936d19e955"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PXS.US",
+      "name": "Pyxis Tankers Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001640043",
+        "exact_authority_ticker": "PXS",
+        "security_class": "Pyxis Tankers Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "0500dd37b45818a2fb201606d8468ae4749873a9a9ea17c70c692bc736655aa9"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "INHD.US",
+      "name": "INNO HOLDINGS INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001961847",
+        "exact_authority_ticker": "INHD",
+        "security_class": "Inno Holdings Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "195e806b71f51442e04c37377fc8159700d4a0212769b44c74b2d9331f37774a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PBF.US",
+      "name": "PBF Energy Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001534504",
+        "exact_authority_ticker": "PBF",
+        "security_class": "PBF Energy Inc. Class A Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "922c3f7b99ac151a248bb43a866124f722a7aca0535f505bb803bee61debbd57"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "GMEX.US",
+      "name": "GMEX Robotics Corp",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001928581",
+        "exact_authority_ticker": "GMEX",
+        "security_class": "GMEX ROBOTICS CORPORATION - Class A Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "ae6d60606bed30ecb6d7a8310456f1768da6a7f666b9a43dc8fb970d3c148f1c"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "GNLN.US",
+      "name": "Greenlane Holdings, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001743745",
+        "exact_authority_ticker": "GNLN",
+        "security_class": "Greenlane Holdings, Inc. - Class A Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b747dcfc9b8034e52a22ae7b51e91e0db09cade318108c895d765929c2492fef"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "VNCE.US",
+      "name": "VINCE HOLDING CORP.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001579157",
+        "exact_authority_ticker": "VNCE",
+        "security_class": "Vince Holding Corp. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "64a54bac505b1b9e6c982d2b30ad7edd5395aa8a0c19d13bcd5604c34fa49c6a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "LUD.US",
+      "name": "Luda Technology Group Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001984124",
+        "exact_authority_ticker": "LUD",
+        "security_class": "Luda Technology Group Limited Ordinary Shares",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "A",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "dce3ea48719cc52c4ef90dae36b55a151aec4feef27b23769a7acecabf3de242"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "KRMN.US",
+      "name": "Karman Holdings Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002040127",
+        "exact_authority_ticker": "KRMN",
+        "security_class": "Karman Holdings Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "5c4d04809291ee615428fcb4b8d66065e1646d29a854e65b0cccf38d972d0351"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "IVF.US",
+      "name": "INVO Fertility, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001417926",
+        "exact_authority_ticker": "IVF",
+        "security_class": "INVO Fertility, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "7af6040c22a61cb39c5d78150a4931478ef164cd13d45b24e574b1fe73f6c655"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "VSME.US",
+      "name": "VS MEDIA Holdings Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001951294",
+        "exact_authority_ticker": "VSME",
+        "security_class": "VS Media Holdings Limited - Class A Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "97cd7adf70521f6031e2dd5c3d425d4ec79948cb0d06b3e08bf034ceeb2e8a73"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "LGPS.US",
+      "name": "LOGPROSTYLE INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002040290",
+        "exact_authority_ticker": "LGPS",
+        "security_class": "LogProstyle Inc. Common Shares",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "A",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "2a375c3d499cf948d7eafbaffbe958dc35e6b5449be8324cc5b969f837ecae9a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "JLHL.US",
+      "name": "Julong Holding Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002007846",
+        "exact_authority_ticker": "JLHL",
+        "security_class": "Julong Holding Limited - Class A Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "67e827219db32ebe7e274699f45f2b0a32d1c8b115bc9996ff9cf5c6f7eea84a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "FN.US",
+      "name": "Fabrinet",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001408710",
+        "exact_authority_ticker": "FN",
+        "security_class": "Fabrinet Ordinary Shares",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f6c1d1a51c325d72070c6b7b98f211c49760d2d50157300765c87cc12b0f16b5"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CTW.US",
+      "name": "CTW",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002047148",
+        "exact_authority_ticker": "CTW",
+        "security_class": "CTW - Class A Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "0dd5d55d1305f7cd4614ce9164045f99c744cbcd73f295d47fa6808b49b7ae2c"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PTLO.US",
+      "name": "Portillo's Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001871509",
+        "exact_authority_ticker": "PTLO",
+        "security_class": "Portillo's Inc. - Class A Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b7ff6e7089a30381ec7e4a7e718b9f33e64e3ee99d424636eae64cfe1060c6a7"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "ZVRA.US",
+      "name": "ZEVRA THERAPEUTICS, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001434647",
+        "exact_authority_ticker": "ZVRA",
+        "security_class": "Zevra Therapeutics, Inc.  - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "33d3e2c82fa646b8c4effe1f71eb5e2fe51097f9b6c459385443aa5b8e100efb"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "LNZA.US",
+      "name": "LanzaTech Global, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001843724",
+        "exact_authority_ticker": "LNZA",
+        "security_class": "LanzaTech Global, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "fc8cb1870698288576813d0a82cd7d0680d3645e777eb5c18e55c795c65a0615"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "BLMN.US",
+      "name": "Bloomin' Brands, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001546417",
+        "exact_authority_ticker": "BLMN",
+        "security_class": "Bloomin' Brands, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "65ea72290556a536bdd01686ea5da56c3a5669db94238976856de52c3fd872ec"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "INFY.US",
+      "name": "Infosys Ltd",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001067491",
+        "exact_authority_ticker": "INFY",
+        "security_class": "Infosys Limited American Depositary Shares",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "3a5233edeeebbb603dc4ba8eb387e7ee66966b430f92ad19ca258397b93358d2"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "WIT.US",
+      "name": "WIPRO LTD",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001123799",
+        "exact_authority_ticker": "WIT",
+        "security_class": "Wipro Limited Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "6863d70cfc251259ef7319b32185580b6cff72e48b0113262e3ca55c775c326c"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CDW.US",
+      "name": "CDW Corp",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001402057",
+        "exact_authority_ticker": "CDW",
+        "security_class": "CDW Corporation - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e455460fae85b38abad2c30e0603fc6c09ff0393a1259ab16a9d5ab6f7964299"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "OMDA.US",
+      "name": "Omada Health, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001611115",
+        "exact_authority_ticker": "OMDA",
+        "security_class": "Omada Health, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "6ebf8a99daafdb6e15772ecfb36747742ad62e462c8033fc20cfcddeb65a278b"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CLWT.US",
+      "name": "EURO TECH HOLDINGS CO LTD",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001026662",
+        "exact_authority_ticker": "CLWT",
+        "security_class": "Euro Tech Holdings Company Limited - Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "dbd983e7c1a465cff2aa6d12c24cd5117a8b8afbb77dadab39bf11694b95f2cb"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "GPUS.US",
+      "name": "Hyperscale Data, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000896493",
+        "exact_authority_ticker": "GPUS",
+        "security_class": "Hyperscale Data, Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "A",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "034cb6834a1b5fabca0ddd30d874ffa28d033fd2ada8a50938899cac51dac488"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "API.US",
+      "name": "Agora, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001802883",
+        "exact_authority_ticker": "API",
+        "security_class": "Agora, Inc. - ADS",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "97f102821d281d2fb88326a3dc40ebc12cb6c1585236d1190474418ee6a0a41a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "PDFS.US",
+      "name": "PDF SOLUTIONS INC",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001120914",
+        "exact_authority_ticker": "PDFS",
+        "security_class": "PDF Solutions, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "98b319e4d8ab9b23e558b700ff7a81230d68f274c83282e3dd84cb478524bc47"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "FLEX.US",
+      "name": "FLEX LTD.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000866374",
+        "exact_authority_ticker": "FLEX",
+        "security_class": "Flex Ltd. - Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e50cc550487f5bd3c1f008410f2e348b32a7861c3976bab92fb0b3b8705b7778"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "GPRE.US",
+      "name": "Green Plains Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001309402",
+        "exact_authority_ticker": "GPRE",
+        "security_class": "Green Plains, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a4b13265c4f47da0b0713013cc293bc397adc0d383c1a65c8a50d1012f744dcc"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AGBK.US",
+      "name": "AGI Inc",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002081206",
+        "exact_authority_ticker": "AGBK",
+        "security_class": "AGI Inc Class A Common Shares",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "f5ad0c1b11a9f0332f46e2e9753d2afdfe1ee77fc2b3666b76ab3568f30b90dc"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "KOF.US",
+      "name": "COCA COLA FEMSA SAB DE CV",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000910631",
+        "exact_authority_ticker": "KOF",
+        "security_class": "Coca Cola Femsa S.A.B. de C.V.  American Depositary Shares, each representing 10 Units (each Unit consists of 3 Series B Shares and 5 Series L Shares)",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e1d76c29344ee7aa2297773a040ec06bf0853b16f276cd1c04f49339548143d2"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SUNS.US",
+      "name": "Sunrise Realty Trust, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0002012706",
+        "exact_authority_ticker": "SUNS",
+        "security_class": "Sunrise Realty Trust, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "4c65b3dd78c1c3ceadbe829e7d434b82b43e2235dd40a0cd111f3bb7ac7f755e"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CRSR.US",
+      "name": "Corsair Gaming, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001743759",
+        "exact_authority_ticker": "CRSR",
+        "security_class": "Corsair Gaming, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "d72000676973a353d72fa2e5c23ec151dc693fc7d0d74f7e9765888e7b488553"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "RECT.US",
+      "name": "Rectitude Holdings Ltd.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001995116",
+        "exact_authority_ticker": "RECT",
+        "security_class": "Rectitude Holdings Ltd - Ordinary Shares",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "006c155ab5da3d349ecdf38eeaa6532815b1ae3723044741a45f7518440e6da5"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "ASMB.US",
+      "name": "ASSEMBLY BIOSCIENCES, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001426800",
+        "exact_authority_ticker": "ASMB",
+        "security_class": "Assembly Biosciences, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "015c6c4be2dd86c90d2974a9e11c02fabb167c946badf7edf3d13a5e7e79c2dd"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "FWRG.US",
+      "name": "First Watch Restaurant Group, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001789940",
+        "exact_authority_ticker": "FWRG",
+        "security_class": "First Watch Restaurant Group, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "c90c3827fd304dd81cf6449ba7af9eb4832e529429ae7ac2d5d48871bf85706a"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "XFOR.US",
+      "name": "X4 Pharmaceuticals, Inc",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001501697",
+        "exact_authority_ticker": "XFOR",
+        "security_class": "X4 Pharmaceuticals, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "c97f7fca1468ec7d7d2842012241a3ba78510cf06fe9c0b16649549eed94cc0f"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "JNJ.US",
+      "name": "JOHNSON & JOHNSON",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000200406",
+        "exact_authority_ticker": "JNJ",
+        "security_class": "Johnson & Johnson Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b5f56b478c550e566258f84daf56457a143adef9300329dbf22df814378e65c9"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "TTI.US",
+      "name": "TETRA TECHNOLOGIES INC",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000844965",
+        "exact_authority_ticker": "TTI",
+        "security_class": "Tetra Technologies, Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "9cd98e61cf627b6e1562f5f6d0dc5fdd4515f39bdf91b99c22139e48a506bf59"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "JTAI.US",
+      "name": "Jet.AI Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001861622",
+        "exact_authority_ticker": "JTAI",
+        "security_class": "Jet.AI Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "e2aa9615aaa75c93d6b24dee69af7a504f4b172dd14c43c522a471ce1b1a2fd1"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "CVI.US",
+      "name": "CVR ENERGY INC",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001376139",
+        "exact_authority_ticker": "CVI",
+        "security_class": "CVR Energy Inc. Common Stock",
+        "SEC_exchange_group": "NYSE",
+        "directory_venue": "N",
+        "directory_financial_status": "not supplied",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+          "sha256": "9b65d01f08806840f93f7acb8e20635b86c507cc5430323468eedc2151bbdfc6",
+          "captured_at_utc": "2026-10-14T07:40:33.001471+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a10d17e53b8e87591976e2aa80096f0f3fd9f1bbba4fafff8f9ebe15b54b3b25"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "FBIO.US",
+      "name": "Fortress Biotech, Inc.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001429260",
+        "exact_authority_ticker": "FBIO",
+        "security_class": "Fortress Biotech, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "a427a6360301562d45540a04aace3ca07ef8e536d10b7cdc96ca99f8f541af4b"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "ARVN.US",
+      "name": "ARVINAS, INC.",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0001655759",
+        "exact_authority_ticker": "ARVN",
+        "security_class": "Arvinas, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b8c92989fbac33c84555126684ce5e932a3d26c984773f2cd19ec9e2b05c234b"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "AMAT.US",
+      "name": "APPLIED MATERIALS INC /DE",
+      "native_metadata": {
+        "Asset Class": "",
+        "Exchange": "",
+        "Currency": "",
+        "Country": ""
+      },
+      "requires_quarantine": true,
+      "state": "Name caption only for the exact unchanged US ticker. Current SEC issuer record and unique official Nasdaq directory security record agree on the exact ticker. All metadata, quotes and identity quarantine remain unchanged. No active-listing, tradability, financial eligibility or custody certification.",
+      "identifiers": {
+        "CIK": "0000006951",
+        "exact_authority_ticker": "AMAT",
+        "security_class": "Applied Materials, Inc. - Common Stock",
+        "SEC_exchange_group": "Nasdaq",
+        "directory_venue": "Nasdaq",
+        "directory_financial_status": "N",
+        "directory_creation_time": "1014202603:02"
+      },
+      "reviewed_at_utc": "2026-10-14T07:44:09.326782+00:00",
+      "expires_at_utc": "2026-10-21T07:44:09.326782+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/files/company_tickers_exchange.json",
+          "sha256": "33b3998934205f0ce54c874470a41689ea5aaaba7d04c909f20976eb3e551ba4",
+          "captured_at_utc": "2026-10-14T07:40:31.669322+00:00"
+        },
+        {
+          "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+          "sha256": "d93c72a17f9c331a6601a8aa15301e11318990dae0735ff9f6312d0a32a60f24",
+          "captured_at_utc": "2026-10-14T07:40:32.274952+00:00"
+        }
+      ],
+      "review_receipt_sha256": "6cb9f041e7a79ac5f372787b46005bab9ed6a8ac5ca965877e08a6111b1804cd"
     }
   ]
 }

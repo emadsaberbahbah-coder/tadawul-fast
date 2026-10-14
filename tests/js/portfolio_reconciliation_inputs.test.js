@@ -44,6 +44,45 @@ check('same bounded native row carries quantity currency price and quote provena
     warnings:row[8],last_updated:row[9]});
   assert.deepEqual(ss.ranges, [[1,1,2,10]]); assert.equal(p.reconciliation_evidence, undefined);
 });
+check('canonical UTC holding header preserves its field clock and original value', () => {
+  const {ctx} = context();
+  const utcHeader = header.slice(); utcHeader[9] = 'Last Updated (UTC)';
+  const utcRow = row.slice(); utcRow[9] = '2026-10-09 09:00:01';
+  const p = ctx.dt10PortfolioInputs_(workbook([utcHeader, utcRow]), panel);
+  assert.equal(p.holdings_input_incomplete, false);
+  assert.equal(p.holdings[0].last_updated_utc, utcRow[9]);
+  assert.equal(p.holdings[0].last_updated, undefined);
+  utcHeader.push('Last Updated (Riyadh)'); utcRow.push('2026-10-09 12:00:01');
+  const withDisplay = ctx.dt10PortfolioInputs_(workbook([utcHeader, utcRow]), panel);
+  assert.equal(withDisplay.holdings_input_incomplete, false);
+  assert.equal(withDisplay.holdings[0].last_updated_utc, utcRow[9]);
+});
+check('ambiguous generic or UTC timestamp headers withhold proof in either order', () => {
+  const {ctx} = context();
+  for (const names of [['Last Updated', 'Last Updated (UTC)'],
+    ['Last Updated (UTC)', 'Last Updated'], ['Last Updated (UTC)', 'Last Updated (UTC)'],
+    ['Source Last Updated', 'Last Updated (UTC)']]) {
+    const duplicateHeader = header.slice(); duplicateHeader[9] = names[0];
+    duplicateHeader.push(names[1]);
+    const p = ctx.dt10PortfolioInputs_(workbook([duplicateHeader,
+      row.concat('2001-01-01T00:00:00Z')]), panel);
+    assert.equal(p.holdings_input_incomplete, true);
+    assert.equal(p.holdings[0].last_updated, undefined);
+    assert.equal(p.holdings[0].last_updated_utc, undefined);
+  }
+});
+check('canonical UTC Date transports the stored instant through the actual POST', () => {
+  const {ctx} = context(); const utcHeader = header.slice(); utcHeader[9] = 'Last Updated (UTC)';
+  ctx.testUtcRow = row.slice();
+  vm.runInContext("testUtcRow[9] = new Date('2026-10-09T08:00:00Z')", ctx);
+  let sent;
+  ctx.dt10BackendUrl_ = () => 'https://synthetic.invalid'; ctx.dt10AppToken_ = () => 'synthetic-token';
+  ctx.UrlFetchApp = {fetch(_url, options) { sent = JSON.parse(options.payload);
+    return {getResponseCode() {return 200;}, getContentText() {return '{"status":"ok"}';}}; }};
+  ctx.dt10Post_({portfolio: ctx.dt10PortfolioInputs_(workbook([utcHeader, ctx.testUtcRow]), panel)});
+  assert.equal(sent.portfolio.holdings[0].last_updated_utc, '2026-10-09T08:00:00.000Z');
+  assert.equal(sent.portfolio.holdings[0].last_updated, undefined);
+});
 check('declared private document property forwards only the supplied packet', () => {
   const {ctx} = context(JSON.stringify(packet));
   const p = copy(ctx.dt10PortfolioInputs_(workbook(), panel));
@@ -107,5 +146,37 @@ check('actual native POST serializes the exact private evidence and all protecti
   assert.equal(sent.portfolio.holdings_input_incomplete,false);
   assert.equal(sent.portfolio.holdings[0].quantity,10); assert.equal(sent.portfolio.holdings[0].currency,'USD');
   assert.equal(sent.portfolio.holdings[0].warnings,row[8]); assert.equal(sent.portfolio.holdings[0].last_updated,row[9]);
+});
+check('real renderer refreshes existing cash title without altering entered cash or funding', () => {
+  for (const state of ['NOT_ACTIONABLE', 'EXECUTABLE']) {
+    const {ctx} = context(); const writes = [], values = [];
+    let label = 'Deployable (SAR)';
+    const sheet = {getMaxRows() {return 100;}, getMaxColumns() {return 60;}, getParent() {return {};},
+      getRange(r, c) {
+        const range = new Proxy({}, {get(_target, method) {
+          if (method === 'setValue') return value => {
+            writes.push({row: r, col: c, value});
+            if (r === ctx.DT10_ROW_KPI_LABELS && c === 1) label = value;
+            return range;
+          };
+          if (method === 'setValues') return rows => {values.push(copy(rows)); return range;};
+          return () => range;
+        }});
+        return range;
+      }};
+    ctx.dt10BoardVerdict_ = () => ({state, reason: 'Synthetic final gate'});
+    ctx.dt10EarningsAnnotate_ = () => null;
+    ctx.dt10WriteSection_ = (_sheet, r) => r + 1;
+    ctx.dt10WriteTable_ = (_sheet, r) => ({firstDataRow: 0, count: 0, next: r + 1});
+    const p = {kpis: {deployable_sar: 53769, passed: 1}, selected: [], alerts: [], near_miss: [], meta: {}};
+    ctx.dt10RenderPayload_(sheet, p, {});
+    assert.equal(label, 'Entered cash (SAR)');
+    assert.equal(writes.filter(w => w.row === ctx.DT10_ROW_KPI_LABELS && w.col === 1).length, 1);
+    assert.equal(values[0][0][0], 53769);
+    assert.equal(p.kpis.deployable_sar, 53769);
+    assert.equal(p._dt10_uv.state, state);
+    assert.equal(p.kpis.total_suggested_sar, 0);
+    assert.equal(p.meta.board_execution.executable_count, 0);
+  }
 });
 console.log(`${passed} native reconciliation input checks passed`);

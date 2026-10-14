@@ -2,7 +2,7 @@
 """
 core/sheets/rows_reader.py
 ================================================================================
-TADAWUL FAST BRIDGE — CANONICAL SHEET ROWS READER (v1.0.0)
+TADAWUL FAST BRIDGE — CANONICAL SHEET ROWS READER (v1.0.2)
 ================================================================================
 
 WHY THIS MODULE EXISTS
@@ -69,7 +69,7 @@ from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # The one page whose rows must be read from the sheet (manual, user-authored cells).
 _PORTFOLIO_CANON = "myportfolio"
@@ -101,10 +101,11 @@ def _reader_enabled() -> bool:
 
 
 def _norm(text: Any) -> str:
-    # Lowercase + drop every non-alphanumeric char. "Position Qty" -> "positionqty",
-    # "Avg Cost" -> "avgcost", "Unrealized P/L %" -> "unrealizedpl". Used both to
-    # detect the target page and to match sheet headers against engine headers.
-    return re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower())
+    # Preserve percentage units before punctuation folding. Otherwise the real
+    # portfolio's monetary "Unrealized P/L" and "Unrealized P/L %" both map to
+    # unrealized_pl, and the percentage overwrites the amount. Case, spacing and
+    # punctuation aliases retain their existing behavior; "Pct" and "%" agree.
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower().replace("%", "pct"))
 
 
 def _resolve_spreadsheet_id() -> str:
@@ -175,20 +176,40 @@ def _grid_to_rows(
 
     # engine header (normalized) -> canonical key
     norm_to_key: Dict[str, str] = {}
+    legacy_matches: Dict[str, set[str]] = {}
     for i, h in enumerate(headers):
         if i >= len(keys):
             break
         nk = _norm(h)
         if nk and nk not in norm_to_key:
             norm_to_key[nk] = keys[i]
+        # Retain old unit-omitting aliases only when the schema gives them one
+        # meaning. "Upside" may still mean "Upside %"; "Unrealized P/L" must
+        # never become an alias for both a monetary amount and a percentage.
+        unitless = re.sub(r"[^a-z0-9]+", "", str(h or "").strip().lower())
+        if unitless:
+            legacy_matches.setdefault(unitless, set()).add(keys[i])
+    legacy_aliases = {token: next(iter(matches)) for token, matches in legacy_matches.items()
+                      if len(matches) == 1}
 
-    # sheet column index -> canonical key (by normalized header match)
+    # Resolve each field once. Duplicated identity/quantity/basis headers make
+    # manual holdings unknowable; duplicated optional observations stay absent.
+    # Neither case may silently choose the last conflicting physical column.
     sheet_header = grid[0] if isinstance(grid[0], (list, tuple)) else []
-    col_to_key: Dict[int, str] = {}
+    key_to_col: Dict[str, int] = {}
+    ambiguous: set[str] = set()
     for j, sh in enumerate(sheet_header):
-        key = norm_to_key.get(_norm(sh))
+        token = _norm(sh)
+        key = norm_to_key.get(token) or legacy_aliases.get(token)
         if key:
-            col_to_key[j] = key
+            if key in key_to_col:
+                if key in {"symbol", "position_qty", "avg_cost"}:
+                    logger.warning("[rows_reader] ambiguous manual portfolio header: %s", key)
+                    return []
+                ambiguous.add(key)
+            else:
+                key_to_col[key] = j
+    col_to_key = {j: key for key, j in key_to_col.items() if key not in ambiguous}
     if not col_to_key:
         return []
 

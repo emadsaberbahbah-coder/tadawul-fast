@@ -11127,28 +11127,55 @@ def _insights_base_totals(pf: List[Dict[str, Any]],
     (live example 2026-08-17: USD+SGD+SAR holdings rendered ~27,430 "SAR"
     against a true ~70,327). Every row converts through the SAME fx table the
     weight math already uses (_pf_fx_table -> operator TFB_PF_FX_RATES wins).
-    A single holding whose currency is missing from the table SUPPRESSES the
-    totals entirely (complete=False) -- a blank is honest, a mixed-unit sum
-    is not. Pure function; no I/O."""
+    Quantity, currency, value and cost must be explicit and finite for every
+    holding. Missing inputs suppress totals rather than becoming zero or SAR.
+    These are research row totals, not reconciled account balances.
+    Pure function; no I/O."""
+    from core.analysis.research_money import research_amount, research_currency
+
     tot_mv = 0.0
     tot_cost = 0.0
     missing: List[str] = []
-    for r in pf:
+    issues: List[str] = []
+    if not pf:
+        issues.append("positions_unavailable")
+    for i, r in enumerate(pf):
+        ref = _safe_str(r.get("symbol")) if isinstance(r, dict) else ""
+        ref = ref or "row_%d" % (i + 1)
         if not isinstance(r, dict):
+            issues.append(ref + ":invalid_position_row")
             continue
-        if (_as_float(r.get("position_qty")) or 0.0) <= 0.0:
+        qty = research_amount(r.get("position_qty"))
+        if qty is None:
+            issues.append(ref + ":position_qty_unknown_or_invalid")
             continue
-        ccy = _safe_str(r.get("currency") or "").upper() or "SAR"
-        f = fx.get(ccy)
+        if qty == 0.0:
+            continue
+        ccy = research_currency(r.get("currency"))
+        if not ccy:
+            issues.append(ref + ":currency_unknown_or_ambiguous")
+        f = research_amount(fx.get(ccy), positive=True) if ccy else None
         if f is None or f <= 0.0:
-            missing.append(ccy or "?")
-            continue
-        tot_mv += (_as_float(r.get("position_value")) or 0.0) * f
-        tot_cost += (_as_float(r.get("position_cost")) or 0.0) * f
-    complete = not missing
+            missing.append(ccy or "(blank)")
+            issues.append(ref + ":fx_rate_unknown_or_invalid")
+        mv = research_amount(r.get("position_value"), positive=True)
+        cost = research_amount(r.get("position_cost"))
+        price = research_amount(r.get("current_price"), positive=True)
+        if price is None:
+            issues.append(ref + ":current_price_unknown_or_invalid")
+        if mv is None:
+            issues.append(ref + ":position_value_unknown_or_invalid")
+        if cost is None:
+            issues.append(ref + ":position_cost_unknown_or_invalid")
+        if f is not None and mv is not None and cost is not None and price is not None:
+            tot_mv += mv * f
+            tot_cost += cost * f
+    if not math.isfinite(tot_mv) or not math.isfinite(tot_cost):
+        issues.append("portfolio_totals_nonfinite")
+    complete = not issues
     return {"complete": complete, "tot_mv": tot_mv if complete else None,
             "tot_cost": tot_cost if complete else None,
-            "missing": sorted(set(missing))}
+            "missing": sorted(set(missing)), "issues": sorted(set(issues))}
 
 
 def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
@@ -19601,25 +19628,29 @@ class DataEngineV5:
         _fx_tbl = _pf_fx_table(None)
         _tot = _insights_base_totals(pf, _fx_tbl)
         _asof = _safe_str(os.getenv("TFB_PF_FX_AS_OF")) or "built-in/env"
+        from core.analysis.research_money import research_currency
+        _base_ccy = research_currency(os.getenv("TFB_PF_BASE_CCY") or "SAR")
+        if _base_ccy is None:
+            _tot.update(complete=False, tot_mv=None, tot_cost=None)
+            _tot["issues"].append("base_currency_unknown_or_ambiguous")
+            _base_ccy = "Currency unknown"
         held = [r for r in pf if isinstance(r, dict) and (_as_float(r.get("position_qty")) or 0.0) > 0.0]
         add("Portfolio Summary", "Holdings", "count", len(held))
         if _tot["complete"]:
             pl = _tot["tot_mv"] - _tot["tot_cost"]
             pl_pct = (pl / _tot["tot_cost"] * 100.0) if _tot["tot_cost"] > 0 else None
-            add("Portfolio Summary", "Total Market Value", "SAR",
-                round(_tot["tot_mv"], 2), notes="base=SAR; fx as-of %s" % _asof)
-            add("Portfolio Summary", "Total Cost", "SAR",
-                round(_tot["tot_cost"], 2), notes="base=SAR; fx as-of %s" % _asof)
-            add("Portfolio Summary", "Unrealized P/L", "SAR", round(pl, 2),
-                notes=("%+.2f%%" % pl_pct if pl_pct is not None else ""))
+            _money_note = "Research row totals; base=%s; fx as-of %s; custody not certified" % (_base_ccy, _asof)
+            add("Portfolio Summary", "Total Market Value", _base_ccy,
+                round(_tot["tot_mv"], 2), notes=_money_note)
+            add("Portfolio Summary", "Total Cost", _base_ccy,
+                round(_tot["tot_cost"], 2), notes=_money_note)
+            add("Portfolio Summary", "Unrealized P/L", _base_ccy, round(pl, 2),
+                notes=_money_note + ("; %+.2f%%" % pl_pct if pl_pct is not None else ""))
         else:
-            _miss = ",".join(_tot["missing"])
-            add("Portfolio Summary", "Total Market Value", "SAR", "",
-                notes="SUPPRESSED: no base-ccy rate for %s (IR-071/A20)" % _miss)
-            add("Portfolio Summary", "Total Cost", "SAR", "",
-                notes="SUPPRESSED: no base-ccy rate for %s" % _miss)
-            add("Portfolio Summary", "Unrealized P/L", "SAR", "",
-                notes="SUPPRESSED: no base-ccy rate for %s" % _miss)
+            _why = "SUPPRESSED: incomplete research position inputs: " + ",".join(_tot["issues"])
+            add("Portfolio Summary", "Total Market Value", _base_ccy, "", notes=_why)
+            add("Portfolio Summary", "Total Cost", _base_ccy, "", notes=_why)
+            add("Portfolio Summary", "Unrealized P/L", _base_ccy, "", notes=_why)
 
         # ---- Allocation vs Target ----
         for r in pf:
