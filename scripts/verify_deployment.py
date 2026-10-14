@@ -212,6 +212,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.2", "nightly offline workbook DQ audit"),
+    ("compare_broker_observation", "1.0.0", "offline research observation comparison; no funding certificate"),
     ('tfb_capture_evidence', '1.0.0', 'private offline custodian capture'),
     ('repair_pit_legacy_rows', '1.0.0', 'bounded operator PIT repair'),
     ('tfb_export_audit', '1.2.0', 'offline export audit'),
