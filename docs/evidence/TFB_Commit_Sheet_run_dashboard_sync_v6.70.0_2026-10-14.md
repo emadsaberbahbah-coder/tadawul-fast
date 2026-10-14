@@ -1,6 +1,6 @@
 # TFB Commit Sheet - run_dashboard_sync v6.70.0 [FW-2 SCOPE]
 
-Date: 2026-10-14. Base: origin/main `15812b6` (#765). Lane: GitHub Actions (the sync runs in daily_sync.yml). Gate: repository Variable `TFB_SYNC_FW2_SCOPE` = off | observe | enforce, default off = v6.69.0 byte-identical. Nothing is armed by this change.
+Date: 2026-10-14. Base: origin/main `15812b6` (#765), merged forward onto `030e22e` (#774, #775) with the version numbers moved past #775's. Lane: GitHub Actions (the sync runs in daily_sync.yml). Gate: repository Variable `TFB_SYNC_FW2_SCOPE` = off | observe | enforce, default off = v6.69.0 byte-identical. Nothing is armed by this change.
 
 ## Why
 
@@ -30,8 +30,8 @@ The repository's real final-publication audit (`finalize_decision_publication.ru
 - New pure helpers: `_fw2_scope_mode_raw`, `_fw2_scope_mode`, `_fw2_tier`, `_fw2_field_scope_row`, `_fw2_selftest`. enforce degrades to observe when the cached self-test fails.
 - `.github/workflows/daily_sync.yml` VERSION 1.0.3 -> 1.0.4: `TFB_SYNC_FW2_SCOPE: ${{ vars.TFB_SYNC_FW2_SCOPE || 'off' }}` in both writer jobs (sync-dashboard, recover-missing-market-pages), so recovery cannot undo the primary leg.
 - `tests/test_workflow_flag_mappings.py`: `TFB_SYNC_FW2_SCOPE: off` added to SYNC_DEFAULTS. The existing parity tests now cover it.
-- `scripts/verify_deployment.py` 1.0.60 -> 1.0.61: pin run_dashboard_sync 6.69.0 -> 6.70.0, pin only.
-- `.github/workflows/ci.yml` 1.1.19 -> 1.1.20: the new harness joins the blocking lean list.
+- `scripts/verify_deployment.py` 1.0.61 -> 1.0.62 (after #775 took 1.0.61): pin run_dashboard_sync 6.69.0 -> 6.70.0, pin only.
+- `.github/workflows/ci.yml` 1.1.20 -> 1.1.21 (after #775 took 1.1.20): the new harness joins the blocking lean list.
 - New `tests/test_sync_fw2_scope.py` (10 cases) and `tests/fixtures/fw2_scope_gm_rows_2026-10-14.json`: 50 real Global_Markets rows copied verbatim from the export, market data only.
 
 Why the tag is safe. `fw2_pe_eps_drift:v6.70.0` contains none of the substrings the engine investability gate tests (cap, forecast, target, roi, drop, reject, provider_target, price_bar_stale, xprovider_price_conflict). It is also not an invalid-acquisition token in `core.data_validity._INVALID_WARNINGS`, so a freshly acquired price still counts as acquired. The row is fenced by BLOCKED / DO_NOT_INVEST, not by the tag.

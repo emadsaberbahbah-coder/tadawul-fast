@@ -1,11 +1,20 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.8 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.9 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
+ * The cash KPI echoes an entered amount and cannot certify custody or
+ * executable funding. It now always says Entered cash (SAR), including
+ * existing layouts. Cash values, inputs, allocation and feed gates are
+ * unchanged. Holding reads accept the canonical Last Updated (UTC) header
+ * and retain its UTC field name and original instant. Multiple accepted
+ * timestamp columns make the input incomplete and omit timestamp proof;
+ * no first-column choice can conceal contradictory source timestamps.
  *
  * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)
  * WHY (2026-10-13): the audited release (scripts/release_decision_feed.py,
@@ -1748,7 +1757,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.8';
+var DT10_VERSION = '1.13.9';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3098,7 +3107,7 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
     if (isFinite(price) && price > 0) h.current_price = price;
   }
   var proofFields = [['iProvider', 'data_provider'], ['iWarnings', 'warnings'],
-                     ['iUpdated', 'last_updated']];
+                     ['iUpdated', extra.updatedKey || 'last_updated']];
   for (var pf = 0; pf < proofFields.length; pf++) {
     var col = extra[proofFields[pf][0]];
     if (col >= 0 && dt10HasValue_(row[col])) {
@@ -3153,7 +3162,7 @@ function dt10CollectHoldings_(ss) {
     var iSym = -1, iSec = -1, iValSar = -1, iVal = -1;
     var extra = { iMarket: -1, iBuyDate: -1, iTp1: -1,
                   iCcy: -1, iQuantity: -1, iPrice: -1, iProvider: -1,
-                  iWarnings: -1, iUpdated: -1, fx: null };
+                  iWarnings: -1, iUpdated: -1, updatedKey: 'last_updated', fx: null };
     var proofSeen = {};
     for (var c = 0; c < hdr.length; c++) {
       var t = dt10NormToken_(hdr[c]);
@@ -3161,9 +3170,9 @@ function dt10CollectHoldings_(ss) {
           t === 'currency' || t === 'ccy' ? 'currency' :
           t === 'quantity' || t === 'positionqty' || t === 'shares' ? 'quantity' :
           t === 'currentprice' || t === 'price' ? 'price' :
-          t === 'lastupdated' || t === 'sourcelastupdated' ? 'updated' : '';
+          t === 'lastupdated' || t === 'lastupdatedutc' || t === 'sourcelastupdated' ? 'updated' : '';
       if (proofKey && proofSeen[proofKey]) out._input_incomplete = true;
-      if (proofKey) proofSeen[proofKey] = true;
+      if (proofKey) proofSeen[proofKey] = (proofSeen[proofKey] || 0) + 1;
       if (iSym < 0 && (t === 'symbol' || t === 'ticker')) {
         iSym = c;
       } else if (iSec < 0 && t === 'sector') {
@@ -3184,8 +3193,9 @@ function dt10CollectHoldings_(ss) {
         extra.iProvider = c;
       } else if (extra.iWarnings < 0 && (t === 'warnings' || t === 'datawarnings')) {
         extra.iWarnings = c;
-      } else if (extra.iUpdated < 0 && (t === 'lastupdated' || t === 'sourcelastupdated')) {
+      } else if (extra.iUpdated < 0 && (t === 'lastupdated' || t === 'lastupdatedutc' || t === 'sourcelastupdated')) {
         extra.iUpdated = c;
+        extra.updatedKey = t === 'lastupdatedutc' ? 'last_updated_utc' : 'last_updated';
       } else if (extra.iMarket < 0 && (t === 'market' || t === 'exchange')) {
         extra.iMarket = c;
       } else if (extra.iBuyDate < 0 && (t === 'buydate' || t === 'purchasedate' ||
@@ -3198,6 +3208,7 @@ function dt10CollectHoldings_(ss) {
       }
     }
     if (iSym < 0) return unavailable();
+    if (proofSeen.updated > 1) extra.iUpdated = -1;
     var useVal = iValSar >= 0 ? iValSar : iVal;
     // v1.11.4 [P-78]: only a NATIVE value column needs the FX map.
     if (DT10_V1114_HOLDINGS_FX && iValSar < 0 && iVal >= 0 && extra.iCcy >= 0) {
@@ -5033,7 +5044,7 @@ function dt10VintageNote_(selected, idx, mode) {
       '/' + sel.length + (idx ? '' : ' (no sheet pool)') +
       (mode === 'observe' ? ' [observe]' : '');
 }
-var DT10_KPI_LABELS = ['Deployable (SAR)', 'Exp. Gain 12M (SAR)', 'Selected',
+var DT10_KPI_LABELS = ['Entered cash (SAR)', 'Exp. Gain 12M (SAR)', 'Selected',
   'Blended Reliability', 'Blended R/R (TP2)', 'Scanned', 'Passed',
   'Unallocated (SAR)',
   // v1.11.0 (4): funding-state layer (opportunity_builder v1.18.0 kpis)
@@ -5057,7 +5068,7 @@ function dt10KpiTruthEnabled_() {
  * Derived from dt10KpiValues_ (one source of truth for slot order), then
  * the EXECUTION/FUNDING claims are withheld: Exp. Gain 12M, Unallocated,
  * Fundable Now, By Rotation, Capital Call -> em dash; Selected -> '0 / N
- * (withheld)'. Pool/research stats stay real: Deployable (the operator's
+ * (withheld)'. Pool/research stats stay real: Entered cash (the operator's
  * own cash echo), Blended Reliability, Blended R/R, Scanned, Passed.
  * payload.kpis is NEVER mutated -- SEAT-CHECK still compares the raw
  * backend kpis against the board and keeps reporting the discrepancy. */
@@ -7353,6 +7364,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // painting the board. The refresh status and selection log use this result.
   var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
   // KPI strip
+  sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
                                 DT10_KPI_LABELS.length);
   kpiRange.setValues([dt10KpiValues_(payload.kpis)]);
