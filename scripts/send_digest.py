@@ -134,7 +134,10 @@ from typing import Any, Dict, List, Optional, Tuple
 #   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
 #   the correct fail-closed answer.
 # =============================================================================
-__version__ = "2.1.1"
+__version__ = "2.1.2"
+# v2.1.2 (2026-10-14): retain both displayed Top10 cash titles in the state
+# brief. Exactly one valid Selected/Passed strip is required; ambiguous strips
+# stay unknown. Entered cash is never renamed as funding/deployable evidence.
 # -----------------------------------------------------------------------------
 # v2.1.1 (2026-10-13, P0-1, Codex P1 on PR #763) -- RELEASE EXPIRY ENFORCED
 # -----------------------------------------------------------------------------
@@ -656,6 +659,24 @@ def _decision_feed_state(globals_kv: Dict[str, str]) -> Tuple[str, str, str]:
     return "UNKNOWN", f"unrecognised feed value: {head[:60]}", raw
 
 
+def _top10_kpis(rows: List[List[str]]) -> Dict[str, str]:
+    """One unambiguous research strip, retaining its actual cash label."""
+    blocks = []
+    for index, headers in enumerate(rows):
+        cash = [header for header in headers if header in {"Deployable (SAR)", "Entered cash (SAR)"}]
+        # A portfolio cash strip has neither research seat/count header.
+        if not cash or not ({"Selected", "Passed"} & set(headers)):
+            continue
+        named = [header for header in headers if header]
+        if (len(cash) != 1 or headers.count("Selected") != 1 or headers.count("Passed") != 1
+                or len(named) != len(set(named)) or index + 1 >= len(rows)):
+            return {}
+        values = rows[index + 1]
+        blocks.append({header: values[col] if col < len(values) else ""
+                       for col, header in enumerate(headers) if header})
+    return blocks[0] if len(blocks) == 1 else {}
+
+
 def _read_top10_summary(read_range, sheet_id: str) -> Dict[str, Any]:
     """v2.1.0: last-run line, KPI strip and alert types from the Top_10 tab.
     Layout-tolerant (finds rows by label); fail-open -> {}."""
@@ -664,17 +685,15 @@ def _read_top10_summary(read_range, sheet_id: str) -> Dict[str, Any]:
         rows = read_range(sheet_id, "'Top_10_Investments'!A1:L60") or []
     except Exception:  # noqa: BLE001
         return out
-    cells = [[str(c).strip() for c in (r or [])] for r in rows]
+    cells = [["" if c is None else str(c).strip() for c in (r or [])] for r in rows]
+    kpis = _top10_kpis(cells)
+    if kpis:
+        out["kpis"] = kpis
     for i, r in enumerate(cells):
         if not r:
             continue
         if r[0].startswith("Status:") and len(r) > 1 and not out.get("last_run"):
             out["last_run"] = r[1][:160]
-        if "Deployable (SAR)" in r and i + 1 < len(cells):
-            hdr, val = r, cells[i + 1]
-            for h, v in zip(hdr, val):
-                if h:
-                    out.setdefault("kpis", {})[h] = v
         if r[0].upper().startswith("ALERTS"):
             kinds: List[str] = []
             for rr in cells[i + 2:]:

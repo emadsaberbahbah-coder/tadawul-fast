@@ -1,0 +1,994 @@
+{
+  "export_sha256": "d4e671cc3f31fcf9ec3d84a800e0995832fcb9f4df105d5d667888f477ed3121",
+  "original_export_source_run": "38486122061",
+  "current_clock_captured_utc": "2026-10-14T09:15:08+00:00",
+  "fixed_clock_utc": "2026-10-14T06:40:00+00:00",
+  "registry_new_review_utc": [
+    "2026-10-14T07:44:09.326782+00:00"
+  ],
+  "registry_sha256": "6ed6ec9981f4c48c4875bd6e795c8113acdfdea6e3ad925217994414906b0788",
+  "no_network_attempts": true,
+  "publish": false,
+  "repo_floors_unchanged": true,
+  "supplied_s12_field_matches": {
+    "exit_code": true,
+    "audit_exit_codes": true,
+    "blockers": true,
+    "coverage_failures": true,
+    "coverage_warnings": true,
+    "decision_findings": true,
+    "fatal": true,
+    "gm_floor_used": true,
+    "clock_utc": true
+  },
+  "scenarios": [
+    {
+      "scenario": "BASELINE_FROZEN",
+      "clock_utc": "2026-10-14T06:40:00+00:00",
+      "run_id": "38486122061",
+      "transform": {},
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 97.00% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [
+        "PF_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_POOL_APPROVED_COUNT",
+        "T10_POOL_RECONCILIATION_UNPROVEN",
+        "FALSE_FULL_UNIVERSE_CLAIM"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 97.0041,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "REAL_PRODUCER_AT_FROZEN_CLOCK",
+      "clock_utc": "2026-10-14T06:40:00+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "applied": 0,
+        "held": 67,
+        "reasons": {
+          "existing_name": 16,
+          "outside_review_window": 67,
+          "unregistered_symbol": 6666
+        },
+        "authority_window_enforced": true
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 97.00% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [
+        "PF_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_POOL_APPROVED_COUNT",
+        "T10_POOL_RECONCILIATION_UNPROVEN",
+        "FALSE_FULL_UNIVERSE_CLAIM"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 97.0041,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "HYPOTHETICAL_NAME_EFFECT_FROZEN",
+      "clock_utc": "2026-10-14T06:40:00+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "applied": 67,
+        "authority_window_enforced": false,
+        "hypothesis": "Caption effects isolated; review is later than frozen audit clock."
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 98.02% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [
+        "PF_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_POOL_APPROVED_COUNT",
+        "T10_POOL_RECONCILIATION_UNPROVEN",
+        "FALSE_FULL_UNIVERSE_CLAIM"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 98.0179,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "HYPOTHETICAL_KIT_S12_FROZEN",
+      "clock_utc": "2026-10-14T06:40:00+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "applied": 67,
+        "authority_window_enforced": false,
+        "hypothesis": "Caption effects isolated; review is later than frozen audit clock.",
+        "synthetic_native_receipts": true,
+        "not_authenticated_producer_evidence": true
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        0
+      ],
+      "blockers": [
+        "coverage_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 98.02% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 98.0179,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "REAL_NAME_PATCH_CURRENT_CLOCK",
+      "clock_utc": "2026-10-14T09:15:08+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "applied": 67,
+        "held": 0,
+        "reasons": {
+          "existing_name": 16,
+          "unregistered_symbol": 6666
+        },
+        "authority_window_enforced": true
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 98.02% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [
+        "PF_SOURCE_CONSUMPTION_UNPROVEN",
+        "PF_SOURCE_STALE",
+        "T10_SOURCE_CONSUMPTION_UNPROVEN",
+        "T10_POOL_APPROVED_COUNT",
+        "T10_POOL_RECONCILIATION_UNPROVEN",
+        "FALSE_FULL_UNIVERSE_CLAIM"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 98.0179,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "HYPOTHETICAL_KIT_S12_CURRENT",
+      "clock_utc": "2026-10-14T09:15:08+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "applied": 67,
+        "held": 0,
+        "reasons": {
+          "existing_name": 16,
+          "unregistered_symbol": 6666
+        },
+        "authority_window_enforced": true,
+        "synthetic_native_receipts": true,
+        "not_authenticated_producer_evidence": true
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: name coverage 98.02% below 99.00%"
+      ],
+      "coverage_warnings": [
+        "Global_Markets: 76 blank/unparseable/date-only timestamp(s)"
+      ],
+      "decision_findings": [
+        "PF_SOURCE_STALE"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6609,
+          "fresh": 6293,
+          "stale": 316,
+          "name_pct": 98.0179,
+          "bad_stamps": 76,
+          "invalid_acquisitions": 316
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    },
+    {
+      "scenario": "HYPOTHETICAL_S10A_UNCHANGED_FLOOR_CONTROL",
+      "clock_utc": "2026-10-14T06:40:00+00:00",
+      "run_id": "38486122061",
+      "transform": {
+        "healed_stubs": 76,
+        "retired_rows": 123,
+        "gm_rows": 6486,
+        "synthetic_stamps_and_names": true,
+        "gm_floor_unchanged": 6512
+      },
+      "exit_code": 2,
+      "audit_exit_codes": [
+        2,
+        2
+      ],
+      "blockers": [
+        "coverage_failed",
+        "decision_failed"
+      ],
+      "feed_promoted": false,
+      "blocker_published": false,
+      "publish": false,
+      "gm_floor_used": 6512,
+      "coverage_failures": [
+        "Global_Markets: row count 6486 below minimum 6512"
+      ],
+      "coverage_warnings": [],
+      "decision_findings": [
+        "SOURCE_ACQUISITION_UNIVERSE",
+        "SOURCE_ROW_FLOOR",
+        "T10_POOL_BELOW_FLOOR"
+      ],
+      "coverage_pages": [
+        {
+          "page": "Market_Leaders",
+          "status": "PASS",
+          "rows": 255,
+          "fresh": 253,
+          "stale": 2,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 2
+        },
+        {
+          "page": "Global_Markets",
+          "status": "FAIL",
+          "rows": 6486,
+          "fresh": 6292,
+          "stale": 194,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 194
+        },
+        {
+          "page": "Commodities_FX",
+          "status": "PASS",
+          "rows": 453,
+          "fresh": 432,
+          "stale": 21,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 21
+        },
+        {
+          "page": "Mutual_Funds",
+          "status": "PASS",
+          "rows": 2474,
+          "fresh": 2393,
+          "stale": 81,
+          "name_pct": 99.5958,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 81
+        },
+        {
+          "page": "My_Portfolio",
+          "status": "PASS",
+          "rows": 4,
+          "fresh": 4,
+          "stale": 0,
+          "name_pct": 100.0,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Insights_Analysis",
+          "status": "PASS",
+          "rows": 64,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        },
+        {
+          "page": "Data_Dictionary",
+          "status": "PASS",
+          "rows": 831,
+          "fresh": 0,
+          "stale": 0,
+          "name_pct": null,
+          "bad_stamps": 0,
+          "invalid_acquisitions": 0
+        }
+      ],
+      "read_ranges": [
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A1:EZ20050",
+        "Commodities_FX!A:A",
+        "Data_Dictionary!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A1:EZ20050",
+        "Global_Markets!A:A",
+        "Insights_Analysis!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A1:EZ20050",
+        "Market_Leaders!A:A",
+        "Market_Leaders!A:A",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A1:EZ20050",
+        "Mutual_Funds!A:A",
+        "Mutual_Funds!A:A",
+        "My_Portfolio!A1:EZ20050",
+        "Portfolio_Decision!A1:B3",
+        "Top_10_Investments!A1:B3",
+        "_Portfolio_CostBasis!A1:EZ20050",
+        "_Status!A1:J100"
+      ],
+      "reader_calls": 21,
+      "fatal": ""
+    }
+  ],
+  "supplied_s10a_field_matches": {
+    "exit_code": true,
+    "audit_exit_codes": true,
+    "blockers": true,
+    "coverage_failures": true,
+    "coverage_warnings": true,
+    "decision_findings": true,
+    "fatal": true,
+    "gm_floor_used": true,
+    "clock_utc": true
+  },
+  "auditor_provenance": {
+    "scripts/finalize_decision_publication.py": {
+      "sha256": "a971b052a9e4d565e17f561da146683c1f1ff7e7463cc6b2ccfe5dfc653af5da",
+      "byte_identical_to_merged_sha": "31d4675079cefba90e321682c6dc2c3315be2e62"
+    },
+    "scripts/audit_full_refresh_coverage.py": {
+      "sha256": "22bcf13b4133e090265e33c3190965e75ca8588f92cb54918f4197628441d835",
+      "byte_identical_to_merged_sha": "31d4675079cefba90e321682c6dc2c3315be2e62"
+    },
+    "scripts/audit_decision_surface_freshness.py": {
+      "sha256": "d88f4627171dfcd209f2340cf4a8410e7a4badb6d1177cdd1d03be2c1c10bf3c",
+      "byte_identical_to_merged_sha": "31d4675079cefba90e321682c6dc2c3315be2e62"
+    },
+    "data/verified_name_labels.json": {
+      "sha256": "6ed6ec9981f4c48c4875bd6e795c8113acdfdea6e3ad925217994414906b0788",
+      "byte_identical_to_merged_sha": "31d4675079cefba90e321682c6dc2c3315be2e62"
+    },
+    "config/approved_universe_scope_v1.json": {
+      "sha256": "f88cafa5240afe4cddb9c48f796d33319e599ae88b88a3d83d055b4ce5b4a8f8",
+      "byte_identical_to_merged_sha": "31d4675079cefba90e321682c6dc2c3315be2e62"
+    }
+  },
+  "network_enforcement": "Python AF_INET/AF_INET6 socket construction and DNS/connection entrypoints denied before project imports; all reads served by injected XLSX reader; zero network attempts observed.",
+  "publication_enforcement": "Every fin.run invocation explicitly publish=False; fin.publish_blocker replaced by an assertion failure.",
+  "notes": "Hypothetical kit S12 uses directly inserted future-reviewed captions plus fabricated native source-consumption/pool receipts. These local memory changes never establish native installation or live producer evidence."
+}

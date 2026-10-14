@@ -66,6 +66,7 @@ import base64
 import csv
 import datetime as _dt
 import json
+import math
 import os
 import hashlib
 import re
@@ -85,7 +86,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # comparison against the v1.0.7 copy). Read-only as before. Functions added: 1
 # (_feed_release_expiry, a lockstep copy shared verbatim with send_digest and
 # run_daily_brief). Removed: 0.
-VERSION = "1.0.8"
+# v1.0.9 (2026-10-14): read both displayed Top10 cash titles without treating
+# entered cash as deployable evidence. Ambiguous KPI strips stay unknown;
+# qualified/funded counts require finite nonnegative whole values. Unknown
+# counts are NA while independent SEAT-CHECK execution/parity is checked.
+VERSION = "1.0.9"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -414,9 +419,44 @@ def _status_stamps(src: Source) -> List[Dict[str, str]]:
     return _table(src.tab("_Status"))
 
 
+def _top10_kpis(rows: List[List[str]]) -> Dict[str, str]:
+    """One unambiguous research strip, retaining its actual cash label."""
+    blocks = []
+    for index, headers in enumerate(rows):
+        cash = [header for header in headers if header in {"Deployable (SAR)", "Entered cash (SAR)"}]
+        # A portfolio cash strip has neither research seat/count header.
+        if not cash or not ({"Selected", "Passed"} & set(headers)):
+            continue
+        named = [header for header in headers if header]
+        if (len(cash) != 1 or headers.count("Selected") != 1 or headers.count("Passed") != 1
+                or len(named) != len(set(named)) or index + 1 >= len(rows)):
+            return {}
+        values = rows[index + 1]
+        blocks.append({header: values[col] if col < len(values) else ""
+                       for col, header in enumerate(headers) if header})
+    return blocks[0] if len(blocks) == 1 else {}
+
+
+def _top10_count(value: Any) -> Optional[int]:
+    """Read a whole displayed count, without stripping percent/glyph units."""
+    text = _s(value)
+    if not re.fullmatch(r"\+?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.0+)?", text):
+        return None
+    normalized = text.replace(",", "")
+    try:
+        if not math.isfinite(float(normalized)):
+            return None
+        return int(normalized.split(".", 1)[0])
+    except (ValueError, OverflowError):
+        return None
+
+
 def _top10(src: Source) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     rows = [[_s(c) for c in r] for r in src.tab("Top_10_Investments")]
+    kpis = _top10_kpis(rows)
+    if kpis:
+        out["kpis"] = kpis
     for i, r in enumerate(rows):
         if not r or not any(r):
             continue
@@ -425,8 +465,6 @@ def _top10(src: Source) -> Dict[str, Any]:
             out.setdefault("last_run_full", r[1])   # v1.0.7 (P-166): SEAT-CHECK lives past col 160
         if r[0].upper().startswith(("\u2705", "\u26d4", "\u23f8", "FEED ")) or "EXECUTABLE TICKET" in r[0].upper():
             out.setdefault("banner", r[0][:240])     # v1.0.7 (P-166): the output banner
-        if "Deployable (SAR)" in r and i + 1 < len(rows):
-            out["kpis"] = {h: v for h, v in zip(r, rows[i + 1]) if h}
         if r[0].upper().startswith("ALERTS"):
             kinds = []
             for rr in rows[i + 2:]:
@@ -475,23 +513,27 @@ def _top10_execution(t: Dict[str, Any]) -> Dict[str, Any]:
             out["exec"] = int(b.group(1))
             out["source"] = "banner"
     if out["kpi_funded"] is None:
-        f = _to_float((t.get("kpis") or {}).get("Fundable Now"))
+        f = _top10_count((t.get("kpis") or {}).get("Fundable Now"))
         if f is not None:
-            out["kpi_funded"] = int(f)
+            out["kpi_funded"] = f
     return out
 
 
 def check_board(src: Source, board_min: int) -> List[Check]:
     t = _top10(src)
     k = t.get("kpis") or {}
-    passed = _to_float(k.get("Passed"))
+    passed = _top10_count(k.get("Passed"))
     sel = _s(k.get("Selected"))
     alerts = dict(t.get("alerts") or [])
-    if not k:
-        return [Check("D10-1", "board qualified (Top_10 Passed >= %d)" % board_min, "NA", None, "Top_10 tab unreadable")]
-    v = "PASS" if (passed or 0) >= board_min else ("WARN" if (passed or 0) > 0 else "FAIL")
-    ev = f"Passed={passed:g} Selected={sel} | funding alerts: " + (", ".join(
+    if passed is None:
+        passed, v, passed_text = None, "NA", "unknown"
+    else:
+        v = "PASS" if passed >= board_min else ("WARN" if passed > 0 else "FAIL")
+        passed_text = f"{passed:g}"
+    ev = f"Passed={passed_text} Selected={sel} | funding alerts: " + (", ".join(
         f"{a}={c}" for a, c in alerts.items() if a in ("rotation_proposal", "capital_call", "unfunded_candidates")) or "none")
+    if not k:
+        ev += " | Top_10 KPI strip unavailable or ambiguous"
     if t.get("gates"):
         ev += " | first-fail: " + ", ".join(t["gates"][:4])
     # v1.0.7 (P-166): the qualified count is research capacity, not a filled board.
