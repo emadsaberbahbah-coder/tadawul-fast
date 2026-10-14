@@ -1,7 +1,56 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.10
+ * Version: 1.5.11
+ *
+ * v1.5.11 MAIN CHANGES  (SOURCE RECEIPT + RECONCILIATION EVIDENCE TRANSPORT —
+ *                        receipt default OFF, evidence inert until the owner
+ *                        populates it; ALL v1.5.10 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (2026-10-14 full project review; the repository's real
+ * final-publication audit replayed offline on the 14 Oct export, sync run
+ * 38486122061):
+ * (A) Final publication fails PF_SOURCE_CONSUMPTION_UNPROVEN on every run.
+ *     audit_decision_surface_freshness 1.3.x requires Portfolio_Decision B2
+ *     to carry exactly one 'source readiness VERIFIED (run <id>)' receipt
+ *     whose run equals the My_Portfolio _Status publication run. This
+ *     producer never wrote one; the replay shows a correct receipt clears
+ *     the finding.
+ * (B) Every holding renders BLOCK 'RECONCILIATION_REQUIRED: missing_evidence'.
+ *     portfolio_actions 1.15+ certifies holdings only from
+ *     body.reconciliation_evidence, and this caller never sent it.
+ *     16_Decision_Top10 already forwards the private document property
+ *     TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1; this page did not.
+ * WHAT:
+ *  (A) Script Property PD_SOURCE_RECEIPT = off (default) | observe | enforce
+ *      (any other value = off).
+ *      off     -> no _Status read; the status line is v1.5.10 byte-identical.
+ *      observe/enforce -> the _Status My_Portfolio row is captured BEFORE the
+ *      holdings read and re-checked after the render (a one-page port of
+ *      16_Decision_Top10 dt10SourceReadinessCore_): exactly one row; one
+ *      positive run= token; status OK/SUCCESS/VALID/PASS/COMPLETE; timestamp
+ *      parseable, not in the future, at most 8 h old (the final audit's
+ *      My_Portfolio window); acquired N/N (100%); acquisition=COMPLETE;
+ *      data=COMPLETE; fetchfail_effective off/observe/enforce; published
+ *      rows == holdings consumed; the row unchanged and no newer than the
+ *      capture; decision status ok.
+ *      observe -> appends ' | [receipt-observe] would publish VERIFIED
+ *                 (run N)' (or 'WITHHELD: why'), text the audit ignores.
+ *      enforce -> appends ' | source readiness VERIFIED (run N)' or
+ *                 ' | source readiness WITHHELD: why' (exactly one).
+ *  (B) pdEvidencePacket_ reads that document property with Top_10's
+ *      contract (string, <= 9,000 chars, JSON object, schema_version 1)
+ *      and, when present, sends it as body.reconciliation_evidence.
+ *      Nothing writes the property today, so the request is unchanged
+ *      until an authorized capture populates it. Never logged or rendered.
+ *  pdSelfTest also reports the receipt mode, the current My_Portfolio
+ *  publication verdict and whether the evidence property is present
+ *  (never its contents).
+ * ES5. Functions added: 10 (pdReceiptMode_, pdEvidencePacket_,
+ * pdSrcNormToken_, pdSrcStampMs_, pdSrcToken_, pdSrcCount_,
+ * pdSrcReadinessCore_, pdSrcReadiness_, pdSrcCapture_, pdReceiptNote_).
+ * Removed: 0. Rollback: unset PD_SOURCE_RECEIPT (receipt) and leave the
+ * evidence property unset, or reinstall v1.5.10.
  *
  * v1.5.10 MAIN CHANGES  (DELTA SHARES RENDERS FOR TRIM/EXIT — one-expression
  *                        render fix; ALL v1.5.9 logic carried verbatim,
@@ -2407,7 +2456,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.10';
+var PD_VERSION = '1.5.11';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2645,6 +2694,236 @@ function pdAppToken_() {
     }
   } catch (e2) {}
   return '';
+}
+
+/* ----- v1.5.11 source receipt + reconciliation evidence ------------------- */
+
+var PD_RECEIPT_MODE_PROP = 'PD_SOURCE_RECEIPT';  /* off (default) | observe | enforce */
+var PD_EVIDENCE_PROP = 'TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1';
+var PD_EVIDENCE_MAX_CHARS = 9000;
+var PD_SRC_PAGE = 'My_Portfolio';
+var PD_SRC_MAX_AGE_MS = 8 * 3600000;    /* final audit: My_Portfolio <= 8 h */
+var PD_SRC_STATUS_MAX_ROWS = 1000;
+
+function pdReceiptMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_RECEIPT_MODE_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return (v === 'observe' || v === 'enforce') ? v : 'off';
+  } catch (e) {
+    return 'off';
+  }
+}
+
+/** Private declared evidence; same document property and limits as
+ * 16_Decision_Top10 dt10ReconciliationEvidence_. Missing, unavailable,
+ * malformed or oversized -> null. Never logged or rendered. */
+function pdEvidencePacket_() {
+  try {
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) return null;
+    var raw = props.getProperty(PD_EVIDENCE_PROP);
+    if (typeof raw !== 'string' || !raw || raw.length > PD_EVIDENCE_MAX_CHARS) {
+      return null;
+    }
+    var packet = JSON.parse(raw);
+    if (!packet || Object.prototype.toString.call(packet) !== '[object Object]' ||
+        packet.schema_version !== 1) return null;
+    return packet;
+  } catch (e) {
+    return null;
+  }
+}
+
+function pdSrcNormToken_(v) {
+  return String(v === null || v === undefined ? '' : v).toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+}
+
+/** _Status clock (port of dt10SourceStampMs_): a Date keeps its instant, a
+ * naive string is Riyadh wall time, an explicit offset is honoured;
+ * date-only, malformed or impossible values -> null. */
+function pdSrcStampMs_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    var dateMs = value.getTime();
+    return isFinite(dateMs) ? dateMs : null;
+  }
+  var m = String(value === null || value === undefined ? '' : value)
+      .replace(/^\s+|\s+$/g, '')
+      .match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:?\d{2})?$/);
+  if (!m) return null;
+  var year = +m[1], month = +m[2], day = +m[3];
+  var hour = +m[4], minute = +m[5], second = +m[6];
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour > 23 || minute > 59 || second > 59) return null;
+  var utc = Date.UTC(year, month - 1, day, hour, minute, second,
+      m[7] ? Number((m[7] + '00').slice(0, 3)) : 0);
+  var check = new Date(utc);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 ||
+      check.getUTCDate() !== day) return null;
+  var offset = 180;  /* _Status naive Last Updated is Riyadh, never UTC */
+  if (m[8] === 'Z') {
+    offset = 0;
+  } else if (m[8]) {
+    var parts = m[8].match(/^([+-])(\d{2}):?(\d{2})$/);
+    if (+parts[2] > 23 || +parts[3] > 59) return null;
+    offset = (+parts[2] * 60 + +parts[3]) * (parts[1] === '-' ? -1 : 1);
+  }
+  return utc - offset * 60000;
+}
+
+/** Exactly one name=value token, or '' (absent or repeated). */
+function pdSrcToken_(message, name) {
+  var text = String(message === null || message === undefined ? '' : message);
+  var re = new RegExp('(?:^|[\\s|])' + name + '=([^\\s|]+)', 'gi');
+  var first = re.exec(text);
+  return first && !re.exec(text) ? first[1] : '';
+}
+
+function pdSrcCount_(value) {
+  if (typeof value === 'boolean' || value === null || value === undefined ||
+      String(value).replace(/^\s+|\s+$/g, '') === '') return null;
+  var n = Number(String(value).replace(/,/g, ''));
+  return isFinite(n) && n >= 0 && n <= 9007199254740991 && Math.floor(n) === n
+      ? n : null;
+}
+
+/** PURE readiness of the My_Portfolio publication this decision consumed.
+ * ctx = the pre-read capture (or null); consumedRows = holdings sent (or
+ * null). Reasons never contain the receipt phrase itself. */
+function pdSrcReadinessCore_(grid, nowMs, ctx, consumedRows) {
+  var out = {ready: false, reason: '', issues: [], generation: '', cohort: ''};
+  function issue(text) { out.issues.push(text); }
+  var header = (grid && grid[0]) || [];
+  var index = {};
+  for (var h = 0; h < header.length; h++) {
+    var tok = pdSrcNormToken_(header[h]);
+    if (!tok) continue;
+    if (index.hasOwnProperty(tok)) issue('duplicate _Status header ' + tok);
+    else index[tok] = h;
+  }
+  var need = ['page', 'lastupdated', 'status', 'message', 'rows'];
+  for (var k = 0; k < need.length; k++) {
+    if (!index.hasOwnProperty(need[k])) issue('_Status missing ' + need[k]);
+  }
+  if (typeof nowMs !== 'number' || !isFinite(nowMs)) issue('decision clock invalid');
+  if (out.issues.length) { out.reason = out.issues.join('; '); return out; }
+  var row = null, seen = 0;
+  for (var r = 1; r < grid.length; r++) {
+    var g = grid[r] || [];
+    var page = String(g[index.page] === null || g[index.page] === undefined
+        ? '' : g[index.page]).replace(/^\s+|\s+$/g, '');
+    if (page === PD_SRC_PAGE) { seen++; row = g; }
+  }
+  if (seen !== 1) {
+    issue(PD_SRC_PAGE + (seen ? ' status row repeated' : ' status row missing'));
+    out.reason = out.issues.join('; ');
+    return out;
+  }
+  var state = String(row[index.status] === null || row[index.status] === undefined
+      ? '' : row[index.status]).replace(/^\s+|\s+$/g, '').toUpperCase();
+  var message = String(row[index.message] === null || row[index.message] === undefined
+      ? '' : row[index.message]);
+  var stamp = pdSrcStampMs_(row[index.lastupdated]);
+  var count = pdSrcCount_(row[index.rows]);
+  out.generation = JSON.stringify([String(row[index.lastupdated]), state, message, count]);
+  var run = pdSrcToken_(message, 'run');
+  if (!/^[1-9]\d*$/.test(run)) issue('publication run unverified');
+  else out.cohort = run;
+  if (!/^(OK|SUCCESS|VALID|PASS|COMPLETE)$/.test(state)) {
+    issue('status=' + (state || 'unknown'));
+  }
+  if (stamp === null) issue('publication timestamp unverified');
+  else if (stamp > nowMs) issue('publication is in the future');
+  else if (nowMs - stamp > PD_SRC_MAX_AGE_MS) issue('publication stale (>8h)');
+  if (count === null || count < 1) {
+    issue('rows ' + (count === null ? 'unknown' : count) + ' below floor 1');
+  }
+  var acq = pdSrcToken_(message, 'acquired').match(/^(\d+)\/(\d+)$/);
+  var fresh = acq ? Number(acq[1]) : null;
+  var requested = acq ? Number(acq[2]) : null;
+  if (fresh === null || requested === null || !isFinite(fresh) || !isFinite(requested) ||
+      requested <= 0 || requested > 9007199254740991 || fresh > requested) {
+    issue('acquisition receipt unknown/invalid');
+  } else if (fresh !== requested) {
+    issue('acquired ' + fresh + '/' + requested + ' below 100%');
+  }
+  if (pdSrcToken_(message, 'acquisition').toUpperCase() !== 'COMPLETE') {
+    issue('acquisition not COMPLETE');
+  }
+  if (pdSrcToken_(message, 'data').toUpperCase() !== 'COMPLETE') issue('data not COMPLETE');
+  var effective = pdSrcToken_(message, 'fetchfail_effective').toLowerCase();
+  if (effective === 'error') issue('acquisition policy error');
+  else if (!/^(off|observe|enforce)$/.test(effective)) {
+    issue('acquisition policy unknown/ambiguous');
+  }
+  if (consumedRows !== null && consumedRows !== undefined && count !== null &&
+      consumedRows !== count) {
+    issue('consumed ' + consumedRows + ' holdings vs ' + count + ' published rows');
+  }
+  if (ctx) {
+    if (ctx.initial_ready !== true) {
+      issue('publication not ready before the holdings read (' +
+            (ctx.reason || 'unknown') + ')');
+    }
+    if (ctx.generation !== out.generation) issue('publication changed during the decision');
+    if (stamp !== null && typeof ctx.captured_at_ms === 'number' &&
+        stamp > ctx.captured_at_ms) issue('publication newer than the holdings read');
+  }
+  out.ready = out.issues.length === 0;
+  out.reason = out.issues.join('; ');
+  return out;
+}
+
+/** Bounded _Status read (A1:J); never writes. Any failure -> not ready. */
+function pdSrcReadiness_(ss, ctx, consumedRows) {
+  try {
+    var sheet = ss.getSheetByName('_Status');
+    if (!sheet) throw new Error('_Status missing');
+    var rows = sheet.getLastRow(), cols = sheet.getLastColumn();
+    if (!(rows >= 2) || rows > PD_SRC_STATUS_MAX_ROWS || !(cols >= 7)) {
+      throw new Error('_Status dimensions invalid');
+    }
+    var values = sheet.getRange(1, 1, rows, Math.min(cols, 10)).getValues();
+    return pdSrcReadinessCore_(values, Date.now(), ctx, consumedRows);
+  } catch (e) {
+    return {ready: false, reason: 'publication status unavailable',
+            issues: ['publication status unavailable'], generation: '', cohort: ''};
+  }
+}
+
+/** Taken immediately BEFORE the holdings read. */
+function pdSrcCapture_(ss) {
+  var captured = Date.now();
+  var source = pdSrcReadiness_(ss, null, null);
+  return {captured_at_ms: captured, initial_ready: source.ready,
+          generation: source.generation, cohort: source.cohort || '',
+          reason: source.reason || ''};
+}
+
+/** Status-line fragment. off -> '' (v1.5.10 byte-identical); observe -> a
+ * tag the final audit does not parse; enforce -> exactly one receipt. */
+function pdReceiptNote_(mode, ss, ctx, consumedRows, payload) {
+  if (mode !== 'observe' && mode !== 'enforce') return '';
+  var src;
+  try {
+    src = pdSrcReadiness_(ss, ctx, consumedRows);
+    var st = (payload && payload.status !== null && payload.status !== undefined)
+        ? String(payload.status).toLowerCase() : '';
+    if (src.ready && st !== 'ok') {
+      src = {ready: false, reason: 'decision status ' + (st || 'unknown'), cohort: ''};
+    }
+  } catch (e) {
+    src = {ready: false, reason: 'receipt check failed', cohort: ''};
+  }
+  var why = String(src.reason || 'unknown')
+      .replace(/source\s+readiness/gi, 'source check').slice(0, 240);
+  var verdict = src.ready ? 'VERIFIED (run ' + src.cohort + ')' : 'WITHHELD: ' + why;
+  return mode === 'observe'
+      ? ' | [receipt-observe] would publish ' + verdict
+      : ' | source readiness ' + verdict;
 }
 
 function pdTokens_(ss) {
@@ -2983,6 +3262,10 @@ function refreshPortfolioDecision() {
   SpreadsheetApp.flush();
 
   var panel = pdReadPanel_(sheet, ss);
+  /* v1.5.11 (A): capture the My_Portfolio publication BEFORE the holdings
+   * read; off = no _Status read (the v1.5.10 path). */
+  var receiptMode = pdReceiptMode_();
+  var sourceCtx = receiptMode === 'off' ? null : pdSrcCapture_(ss);
   var pool = pdCollectHoldings_();
   var poolNote = pool.rows.length
       ? 'holdings ' + pool.rows.length + ' rows from ' + MY_PORTFOLIO_PAGE_ +
@@ -2996,6 +3279,10 @@ function refreshPortfolioDecision() {
     controls: panel,             // PF: labels verbatim; route maps them
     fx_rates: pdFxRates_(ss)
   };
+  /* v1.5.11 (B): forward the private declared evidence when present
+   * (absent -> request unchanged). Never logged. */
+  var evidence = pdEvidencePacket_();
+  if (evidence) body.reconciliation_evidence = evidence;
 
   var resp;
   try {
@@ -3018,8 +3305,11 @@ function refreshPortfolioDecision() {
       pdMetaLine_(payload.meta), panel);
 
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
-  var statusLine = poolNote + ' | ' + pdMetaLine_(payload.meta) + ' | ' +
-      secs + 's';
+  /* v1.5.11 (A): '' when off, so the line stays v1.5.10 byte-identical. */
+  var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,
+      pool.rows.length, payload);
+  var statusLine = poolNote + receiptNote + ' | ' + pdMetaLine_(payload.meta) +
+      ' | ' + secs + 's';
   statusCell.setValue(pdStatusLine_(String(payload.status || '?'),
       logNote ? statusLine + ' | ' + logNote : statusLine));
   Logger.log('[MP-DEC v' + PD_VERSION + '] done status=' + payload.status +
@@ -3370,6 +3660,14 @@ function pdSelfTest() {
   report.push('action log: headers=' + PD_ACTLOG_HEADERS.length +
               ' rowCells=' + alRow.length + ' mode=' +
               (pdActLogMode_() || 'daily+change'));
+  /* v1.5.11: receipt mode, current publication verdict, evidence presence
+   * (read-only; the evidence packet itself is never printed). */
+  report.push('source receipt mode (PD_SOURCE_RECEIPT): ' + pdReceiptMode_());
+  var srcNow = pdSrcReadiness_(ss, null, null);
+  report.push('My_Portfolio publication: ' + (srcNow.ready
+      ? 'ready, run ' + srcNow.cohort : 'not ready: ' + srcNow.reason));
+  report.push('reconciliation evidence property: ' +
+      (pdEvidencePacket_() ? 'present (schema 1)' : 'absent'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {
