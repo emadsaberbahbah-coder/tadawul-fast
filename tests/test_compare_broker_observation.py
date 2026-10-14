@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import zipfile
 
 import pytest
@@ -211,3 +213,46 @@ def test_duplicate_json_fields_rejected_without_replacing_existing_private_repor
     assert compare.main([str(source), str(sheet), "--private", str(output)]) == 2
     assert json.loads(capsys.readouterr().out)["status"] == "withheld"
     assert output.read_text() == "PRIOR_PRIVATE_REPORT"
+
+
+def test_encrypted_xlsx_member_cli_withholds_without_leaks_or_replacing_private_report(tmp_path):
+    source = tmp_path / "private-broker-capture.json"
+    source.write_text(json.dumps(observation()))
+    sheet = workbook(tmp_path / "private-custody-export.xlsx")
+    target = "xl/worksheets/sheet1.xml"
+    with zipfile.ZipFile(sheet) as archive:
+        offset = archive.getinfo(target).header_offset
+    # Mark the real local and central ZIP headers encrypted. zipfile refuses
+    # this member before payload decoding because no password was supplied.
+    package = bytearray(sheet.read_bytes())
+    package[offset + 6] |= 1
+    cursor = package.find(b"PK\x01\x02")
+    while cursor >= 0:
+        name_length = int.from_bytes(package[cursor + 28:cursor + 30], "little")
+        extra_length = int.from_bytes(package[cursor + 30:cursor + 32], "little")
+        comment_length = int.from_bytes(package[cursor + 32:cursor + 34], "little")
+        name = package[cursor + 46:cursor + 46 + name_length].decode()
+        if name == target:
+            package[cursor + 8] |= 1
+            break
+        cursor = package.find(b"PK\x01\x02", cursor + 46 + name_length + extra_length + comment_length)
+    assert cursor >= 0
+    sheet.write_bytes(package)
+    with zipfile.ZipFile(sheet) as archive:
+        assert archive.getinfo(target).flag_bits & 1
+        with pytest.raises(RuntimeError):
+            archive.open(target)
+    output = tmp_path / "previous-private-report.json"
+    output.write_text("PRIOR_PRIVATE_REPORT")
+    before = {path: path.read_bytes() for path in (source, sheet, output)}
+    result = subprocess.run([sys.executable, str(Path(compare.__file__).resolve()),
+        str(source), str(sheet), "--private", str(output)], text=True, capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {"status": "withheld",
+        "error": "broker_observation_input_or_output_invalid",
+        "execution_ready": False, "funding_eligible": False}
+    assert result.stderr == ""
+    for sensitive in (str(tmp_path), source.name, sheet.name, output.name, target, "SYNTH", "PRIOR_PRIVATE_REPORT"):
+        assert sensitive not in result.stdout
+    assert before == {path: path.read_bytes() for path in before}
+    assert not list(tmp_path.glob(".broker-observation-*"))

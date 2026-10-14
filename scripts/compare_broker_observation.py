@@ -99,10 +99,15 @@ def _json_file(path):
 
 
 def _member(archive, name):
-    info = archive.getinfo(name)
-    if info.file_size > MAX_MEMBER_BYTES:
-        raise ObservationError("oversized XLSX member")
-    return archive.open(info)
+    try:
+        info = archive.getinfo(name)
+        if info.file_size > MAX_MEMBER_BYTES:
+            raise ObservationError("oversized XLSX member")
+        return archive.open(info)
+    except RuntimeError:
+        # Encrypted ZIP members require a password; their library exception
+        # includes the member name. Keep the CLI's redacted failure contract.
+        raise ObservationError("unreadable XLSX member") from None
 
 
 def _sheet_rows(archive, name, strings):
