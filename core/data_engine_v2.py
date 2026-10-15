@@ -2,8 +2,21 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.155.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.156.0
 ================================================================================
+
+WHY v5.156.0 (2026-10-15) - SUFFIX LOCALE FALLBACK DEFAULT ON (owner decision)
+- EVIDENCE: the Top_10_Investments export of 2026-10-15 00:56 Riyadh still
+  publishes VND prices labelled NASDAQ/NYSE USD: VNM.VN 216,308.99 SAR,
+  PLX.VN 136,035.15 and BID.VN 124,620.92; 26 Global_Markets .VN rows carry
+  the same wrong label. The owner chose on 2026-10-15 to arm the v5.155.0
+  fallback by default.
+- CHANGE: _suffix_locale_fallback_enabled reads TFB_ENGINE_SUFFIX_LOCALE_
+  FALLBACK with default "1". The fallback itself is unchanged (dotted suffix
+  absent from the local table, normalize gives a complete non-US answer).
+- OFF: TFB_ENGINE_SUFFIX_LOCALE_FALLBACK=0 (or false/off/no) restores
+  v5.155.0 with the gate unset, i.e. v5.154.0 values.
+- ROLLBACK: set it to 0 on Render (no redeploy needed); or revert.
 
 WHY v5.155.0 (2026-10-14) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
 TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identical)
@@ -4204,7 +4217,8 @@ from core.financial_units import (
 # v5.155.0 (2026-10-14): suffix locale fallback (gated, default off); a dotted
 # suffix the local table lacks asks core.symbols.normalize for exchange and
 # currency before the NASDAQ/NYSE and USD fallbacks (MWG.VN -> HOSE / VND).
-__version__ = "5.155.0"
+# v5.156.0 (2026-10-15): that fallback defaults ON (owner decision); =0 disarms.
+__version__ = "5.156.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -15263,7 +15277,7 @@ _SUFFIX_LOCALE_FALLBACK_ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 
 
 def _suffix_locale_fallback_enabled() -> bool:
-    return os.getenv(_SUFFIX_LOCALE_FALLBACK_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.getenv(_SUFFIX_LOCALE_FALLBACK_ENV, "1").strip().lower() in ("1", "true", "yes", "on")  # v5.156.0 default on
 
 
 def _suffix_locale_nz_for(symbol: str) -> Optional[Tuple[str, str, str]]:

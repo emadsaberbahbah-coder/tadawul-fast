@@ -822,7 +822,27 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.16.0"
+# v1.17.0 (2026-10-15) [DECISION-PAGES LAUNCH] - the P0-6 research view is
+#   DEFAULT ENFORCE (owner decision 2026-10-15).
+# EVIDENCE (Portfolio_Decision export of 2026-10-15 01:00 Riyadh, actions
+#   1.16.0): all 4 holdings render BLOCK "RECONCILIATION_REQUIRED:
+#   missing_evidence" with Price SAR only - MV, cost, P&L, stop and targets
+#   blank, KPIs blank, sector summary empty - because no broker evidence
+#   reached the request. The gate is correct and stays. A read-only IBKR read
+#   on 2026-10-14 22:35 UTC matched the three US quantities exactly; the
+#   replayed enforce view shows MV / P&L / levels per row with every row
+#   still BLOCK "; not executable" and zero money.
+# WHAT: _env_research_view_mode - unset or blank TFB_PF_RESEARCH_VIEW now
+#   reads "enforce". observe / enforce are honoured as before; an explicit
+#   off, or any other value, reads "off" (a misspelt value still can never
+#   arm the view). Certified (funded) paths are untouched; the view never
+#   sizes, funds or unblocks a row. core_repair_readback.yml and
+#   scripts/verify_core_repair_readback.py move their declared default to
+#   enforce in the same change (lockstep).
+# OFF: TFB_PF_RESEARCH_VIEW=off restores v1.16.0 exactly.
+#   Functions added 0. Removed 0. Rollback: set it to off on Render; or revert.
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.17.0"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3663,9 +3683,12 @@ RESEARCH_ADD_WITHHELD = ("new-money verdict withheld until fresh positions "
 
 def _env_research_view_mode():
     """v1.16.0 [P0-6]: off | observe | enforce, read at call time (the
-    _env_dd_guard_mode convention). Any other value, blank included, is
-    off, so a misspelt value can never arm the view."""
+    _env_dd_guard_mode convention). v1.17.0: unset or blank reads enforce;
+    any other value outside observe/enforce reads off, so a misspelt value
+    can never arm the view and an explicit off restores v1.16.0."""
     v = str(os.environ.get("TFB_PF_RESEARCH_VIEW", "")).strip().lower()
+    if v == "":
+        return "enforce"
     return v if v in ("observe", "enforce") else "off"
 
 

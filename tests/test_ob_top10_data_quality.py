@@ -60,7 +60,8 @@ def _clock(now):
 def _setup(mp, module=ob, now=NOW, arm=()):
     mp.setattr(module, "datetime", _clock(now))
     for name in GATES:
-        mp.delenv(name, raising=False)
+        # 2026-10-15: default armed in code; this case tests the legacy/off path
+        mp.setenv(name, "0")
     mp.setenv("TFB_OPP_ENABLED", "1")
     mp.setenv("TFB_TICKET_FRESHNESS_GATE", "1")
     mp.setenv("TFB_T10_PRICE_XCHECK", "off")
@@ -116,7 +117,7 @@ def canon(payload):
     p = copy.deepcopy(payload)
     p.get("meta", {}).pop("generated_at_utc", None)
     text = json.dumps(p, sort_keys=True, default=str)
-    return re.sub(r"1\.2[67]\.[01]", "<ver>", text)
+    return re.sub(r"1\.2[678]\.[01]", "<ver>", text)   # 2026-10-15: + v1.28.0
 
 
 def by_symbol(payload):
@@ -335,9 +336,11 @@ def case_w13_route_passes_the_key_through(mp, _tmp):
 def case_w14_verifier_registers_flags_and_pin(mp, _tmp):
     text = (ROOT / "scripts" / "verify_deployment.py").read_text()
     for name in GATES:
-        assert "('" + name + "', '0'," in text, name
-    assert '"1.27.0", "opportunity builder"' in text
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.0"
+        # 2026-10-15: v1.28.0 arms VENUE_CAL_EXT and FRESHNESS_ALERT by default
+        default = "0" if name == "TFB_OPP_AUDIT_KEEP" else "1"
+        assert "('" + name + "', '" + default + "'," in text, name
+    assert '"1.28.0", "opportunity builder"' in text
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.28.0"
 
 
 # --------------------------------------------------------------- negative ---
@@ -349,6 +352,9 @@ def case_n1_off_spellings_are_off(mp, _tmp):
         for name in GATES:
             mp.setenv(name, value)
         assert canon(build()) == ref, value
+    for name in GATES:   # 2026-10-15: unset now arms the two v1.28.0 defaults
+        mp.delenv(name)
+    assert canon(build()) != ref
 
 
 def case_n2_never_raises(mp, _tmp):
@@ -385,7 +391,7 @@ def case_n3_ascii_text(mp, _tmp):
     assert added.isascii() and src[src.index("def _venue_suffix("):
                                    src.index("def _venue_state(")].isascii()
     block = src[src.index("# v1.27.0 (2026-10-13) [TOP10 DATA-QUALITY]"):
-                src.index('OPPORTUNITY_BUILDER_VERSION = "1.27.0"')]
+                src.index('OPPORTUNITY_BUILDER_VERSION = "1.28.0"')]   # 2026-10-15 pin
     assert block.isascii()
 
 
