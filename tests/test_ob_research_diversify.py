@@ -7,6 +7,7 @@ built an undiversified board and the allocate replay deferred the over-cap
 seats, leaving cash unallocated (100,000 -> 50,000 SAR on the synthetic case
 below). Gate ON makes research seats consume the cash-independent
 diversification slots. Gate OFF must be byte-identical to v1.24.1.
+v1.28.0 (2026-10-15): unset/blank now means ON; OFF cases pin GATE=0.
 
 Runs as a script ("PASS k/k") and under pytest. Zero network, synthetic rows.
 Golden negative: TFB_ORD_BUILDER=<path to a base copy of
@@ -131,23 +132,32 @@ def _strip_volatile(payload):
 
 def test_off_research_lists_every_qualified_name():
     ob = _load_builder()
-    with _Env():
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    with _Env(**{GATE: "0"}):
         syms = [t["symbol"] for t in _research(ob)["selected"]]
     assert syms == ["E0.SR", "E1.SR", "E2.SR", "E3.SR", "M0.SR", "M1.SR"], syms
 
 
-def test_off_explicit_zero_equals_unset():
+def test_default_unset_and_blank_equal_explicit_one():
+    # 2026-10-15: default armed in code (v1.28.0); unset/blank moved to the
+    # armed side, explicit 0 stays the legacy/off path.
     ob = _load_builder()
     with _Env():
         a = _strip_volatile(_research(ob))
+    with _Env(**{GATE: ""}):
+        blank = _strip_volatile(_research(ob))
+    with _Env(**{GATE: "1"}):
+        on = _strip_volatile(_research(ob))
     with _Env(**{GATE: "0"}):
-        b = _strip_volatile(_research(ob))
-    assert a == b
+        off = _strip_volatile(_research(ob))
+    assert a == blank == on
+    assert a != off
 
 
 def test_off_regression_still_present_documents_the_bug():
     ob = _load_builder()
-    with _Env():
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    with _Env(**{GATE: "0"}):
         _res, board, alloc = _board_then_allocate(ob)
     assert board == ["E0.SR", "E1.SR", "E2.SR", "E3.SR"], board
     assert sum(s for _, s in _funded(alloc)) == 50000.0, _funded(alloc)
@@ -155,7 +165,8 @@ def test_off_regression_still_present_documents_the_bug():
 
 def test_single_pass_unaffected_by_gate():
     ob = _load_builder()
-    with _Env():
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    with _Env(**{GATE: "0"}):
         a = _strip_volatile(_single(ob))
     with _Env(**{GATE: "1"}):
         b = _strip_volatile(_single(ob))
@@ -203,7 +214,8 @@ def test_on_research_respects_issuer_dedup_when_enabled():
     with _Env(**{GATE: "1"}):
         on = [t["symbol"] for t in _research(ob, rows, crit)["selected"]]
         single = [s for s, _ in _funded(_single(ob, rows, crit))]
-    with _Env():
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    with _Env(**{GATE: "0"}):
         off = [t["symbol"] for t in _research(ob, rows, crit)["selected"]]
     # Research ON must drop exactly what the single pass drops.
     assert on == single, (on, single)
@@ -255,7 +267,8 @@ def test_on_cash_limited_seats_stay_on_research_board():
 
 def test_gate_is_bound_into_replay_fingerprint():
     ob = _load_builder()
-    with _Env():
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    with _Env(**{GATE: "0"}):
         base = ob._board_funding_basis(CRIT, PF, FX)
     with _Env(**{GATE: "1"}):
         armed = ob._board_funding_basis(CRIT, PF, FX)

@@ -70,7 +70,7 @@ main.py reports these on every status payload. `pf_gates` shows the raw ENV valu
 | `TFB_PF_ADD_LOSER_VETO` | `_env_add_loser_veto_mode` | '' | _env_add_loser_veto_mode() -> 'off' | not recorded |
 | `TFB_PF_ADD_LOSER_PCT` | `_env_add_loser_pct` | 2.0 | _env_add_loser_pct() -> 2.0 | not recorded |
 | `TFB_PF_ADD_STOP_PROX_PCT` | `_env_add_stop_prox_pct` | 2.0 | _env_add_stop_prox_pct() -> 2.0 | not recorded |
-| `TFB_PF_RESEARCH_VIEW` | `_env_research_view_mode` | '' | _env_research_view_mode() -> 'off' | not recorded |
+| `TFB_PF_RESEARCH_VIEW` | `_env_research_view_mode` | '' | _env_research_view_mode() -> 'enforce' | not recorded |
 
 ### B.2 pf_gates.opportunity_builder (main.py `_OB_GATE_ENVS`, read in core/analysis/opportunity_builder.py)
 
@@ -141,8 +141,8 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_MARGIN_PUBLISH` | `off` | margin publication receipt contract | no | value | yes | not recorded |
 | `TFB_PRICE_PRECISION` | `0` | seven significant digits for small prices | no | toggle | yes | not recorded |
 | `TFB_OPP_FX_USX_SUBUNIT` | `0` | US-cent currency parent conversion | no | toggle | no | not recorded |
-| `TFB_OPP_VENUE_CAL_EXT` | `0` | extra venue calendars for quote freshness | no | toggle | no | not recorded |
-| `TFB_OPP_FRESHNESS_ALERT` | `0` | stale_quotes alert and run-window near-miss text | no | toggle | no | not recorded |
+| `TFB_OPP_VENUE_CAL_EXT` | `1` | extra venue calendars for quote freshness | no | toggle | no | not recorded |
+| `TFB_OPP_FRESHNESS_ALERT` | `1` | stale_quotes alert and run-window near-miss text | no | toggle | no | not recorded |
 | `TFB_OPP_AUDIT_KEEP` | `0` | cockpit-held symbols kept in the capped audit | no | toggle | no | not recorded |
 | `TFB_EODHD_CRYPTO_MAP` | `0` | native EODHD explicit crypto pairs | no | toggle | no | not recorded |
 | `TFB_CRYPTO_NAME_GATE` | `off` | Yahoo fundamentals crypto-name screen | no | value | no | not recorded |

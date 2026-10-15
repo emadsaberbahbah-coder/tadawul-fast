@@ -94,6 +94,20 @@ os.environ.setdefault("DEFER_ROUTER_MOUNT", "false")
 # Performance budgets -- relax for slower CI machines
 os.environ.setdefault("TFB_TEST_SCORE_BUDGET_MS", "200")
 
+# 2026-10-15 (decision-pages launch): the owner armed five defaults in code
+# (opportunity_builder 1.28.0, portfolio_actions 1.17.0, data_engine_v2
+# 5.156.0, daily_sync.yml FW-2 enforce). The batteries written while these
+# were default-off assert that legacy behaviour without naming the variable,
+# so the test process pins the legacy value here, exactly like the auth
+# defaults above. A test that deletes or sets the name still controls it, and
+# tests/test_decision_pages_defaults.py proves the new production defaults
+# with every name unset. Production on Render is unaffected (setdefault).
+os.environ.setdefault("TFB_OPP_VENUE_CAL_EXT", "0")
+os.environ.setdefault("TFB_OPP_FRESHNESS_ALERT", "0")
+os.environ.setdefault("TFB_OPP_RESEARCH_DIVERSIFY", "0")
+os.environ.setdefault("TFB_PF_RESEARCH_VIEW", "off")
+os.environ.setdefault("TFB_ENGINE_SUFFIX_LOCALE_FALLBACK", "0")
+
 
 # =============================================================================
 # Shared fixtures (add as needed)
