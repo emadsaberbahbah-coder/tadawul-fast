@@ -52,7 +52,7 @@ Usage
   python scripts/tfb_export_audit.py export.xlsx [--json out.json] [--md out.md]
         [--expect Market_Leaders=255,Global_Markets=6609,...]
         [--dq 80] [--rel 70] [--sector-cap 3/40] [--eodhd-target 90000]
-        [--cron "17 4,12,20"] [--tz-offset 3] [--since-days 7]
+        [--cron "17 12,20"] [--dispatch "15 3"] [--tz-offset 3] [--since-days 7]
         [--manifest versions.json] [--asof 2026-10-03]
   python scripts/tfb_export_audit.py --selftest
 
@@ -87,6 +87,28 @@ and numeric zero placeholders. Performance_Log headers at row 5 are by
 design (the KPI panel occupies AG1:AK13). _Cash_Snapshot also permits operator
 template rows marked _Status; only actual appended cash records certify cash.
 No sheet/provider calls or production recommendation changes are introduced.
+
+WHY (v1.3.0, 2026-10-15): P-170c dispatched sync slot
+---------------------------------------------------
+PR #781 moved daily_sync's 04:17Z slot to the Apps Script dispatcher, which
+starts the morning run at 06:15 Riyadh (03:15Z) inside Apps Script's
++/-15 minute trigger window. The lateness model took one minute and a list of
+hours, so no --cron value could describe a :15 run next to the :17 crons: an
+on-time 03:16Z run was matched to the previous day's 20:17Z slot and reported
+as +418 min, schedule_lateness=FAIL, exit 1 on every export. The two kinds of
+slot are now separate:
+  --cron "17 12,20"  GitHub schedule slots (env TFB_AUDIT_CRON; blank = default),
+                     measured exactly as before: GitHub never fires early.
+  --dispatch "15 3"  Apps Script dispatched slots (env TFB_AUDIT_DISPATCH; blank
+                     = none). A run starting up to 20 min before such a slot
+                     belongs to it, and lateness counts only beyond the +15 min
+                     trigger window. Early grace is NOT given to cron slots, so
+                     a cron that fires hours late just before the next cron slot
+                     is still reported against its own slot.
+Both accept several "minute hours" groups separated by ";". The defaults are
+the schedule once TFB_GH_DISPATCH_TOKEN is armed; for an export whose window
+predates PR #781, pass --cron "17 4,12,20" --dispatch "". Legacy calls (no
+dispatch slots) produce byte-identical findings and params.
 """
 from __future__ import annotations
 
@@ -103,7 +125,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 
 try:
     import openpyxl
@@ -1135,14 +1157,27 @@ def check_model(book, tz_offset):
 # --------------------------------------------------------------------------- #
 # Gate (e): _Run_Log guard health
 # --------------------------------------------------------------------------- #
+DEFAULT_CRON = "17 12,20"        # daily_sync GitHub schedule slots after PR #781 (P-170b)
+DEFAULT_DISPATCH = "15 3"        # P-170c: 06:15 Riyadh run dispatched by apps_script/24_Sync_Dispatch.gs
+DISPATCH_WINDOW_MIN = 15         # Apps Script fires a trigger within +/-15 min of its minute
+EARLY_GRACE_MIN = 20             # dispatched slots only: the early side of that window, plus margin
+
+
 def _cron_slots(cron):
-    m = re.match(r"^\s*(\d{1,2})\s+([\d,]+)\s*$", cron)
-    if not m:
-        raise ValueError("cron must look like '17 4,12,20' (minute, hours UTC)")
-    return int(m.group(1)), sorted(int(h) for h in m.group(2).split(",") if h)
+    """'15 3;17 12,20' -> [(3, 15), (12, 17), (20, 17)] as sorted UTC (hour, minute); '' -> []."""
+    slots = set()
+    if not str(cron or "").strip():
+        return []
+    for group in str(cron).split(";"):
+        m = re.match(r"^\s*(\d{1,2})\s+(\d{1,2}(?:,\d{1,2})*)\s*$", group)
+        if not m or int(m.group(1)) > 59 or any(int(h) > 23 for h in m.group(2).split(",")):
+            raise ValueError("cron must look like '15 3;17 12,20' (minute hours[;minute hours], UTC)")
+        slots.update((int(h), int(m.group(1))) for h in m.group(2).split(","))
+    return sorted(slots)
 
 
-def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_date, eodhd_fail_pct=0):
+def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_date, eodhd_fail_pct=0,
+                  dispatch=""):
     out, metrics = [], {}
     rows = book.rows("_Run_Log") or []
     if not rows:
@@ -1219,7 +1254,10 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
                  f"rows that hit HTTP 402 in the last {since_days} days"))
     # Schedule lateness
     try:
-        minute, hours = _cron_slots(cron)
+        slots = [(h, m, False) for h, m in _cron_slots(cron)]
+        slots += [(h, m, True) for h, m in _cron_slots(dispatch)]
+        if not slots:
+            raise ValueError("no schedule slots: --cron and --dispatch are both empty")
     except ValueError as e:
         out.append(F("e", "PIPELINE", "schedule_lateness", "WARN", None, str(e)))
         return out, metrics
@@ -1227,21 +1265,28 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     worst = 0
     for rid, start in sorted(run_first.items(), key=lambda kv: kv[1]):
         cands = []
-        for dd in (0, 1):
+        for dd in (-1, 0, 1):
             day = (start - dt.timedelta(days=dd)).date()
-            for h in hours:
-                cands.append(dt.datetime(day.year, day.month, day.day, h, minute, tzinfo=dt.timezone.utc))
-        planned = max((c for c in cands if c <= start), default=None)
+            for h, minute, dispatched in slots:
+                cands.append((dt.datetime(day.year, day.month, day.day, h, minute, tzinfo=dt.timezone.utc), dispatched))
+        # P-170c: only a dispatched slot may claim a run that starts a little early.
+        early = [c for c in cands if c[1] and start < c[0] <= start + dt.timedelta(minutes=EARLY_GRACE_MIN)]
+        planned, dispatched = min(early) if early else max((c for c in cands if c[0] <= start), default=(None, False))
         if planned is None:
             continue
-        mins = int((start - planned).total_seconds() // 60)
+        mins = max(0, int((start - planned).total_seconds() // 60))
         if mins > 12 * 60:
             continue  # not attributable to a slot (manual dispatch)
+        if dispatched:
+            mins = max(0, mins - DISPATCH_WINDOW_MIN)   # lateness beyond the trigger window
         worst = max(worst, mins)
-        late.append(f"run {rid}: slot {planned:%m-%d %H:%M}Z started {start:%H:%M}Z, +{mins // 60}h{mins % 60:02d}m")
+        late.append(f"run {rid}: slot {planned:%m-%d %H:%M}Z{' (dispatch)' if dispatched else ''} "
+                    f"started {start:%H:%M}Z, +{mins // 60}h{mins % 60:02d}m")
     metrics["schedule_worst_lateness_min"] = worst
+    basis = f"cron '{cron}'" + (f" + dispatch '{dispatch}' (beyond its +{DISPATCH_WINDOW_MIN} min window)"
+                                if str(dispatch or "").strip() else "")
     out.append(F("e", "PIPELINE", "schedule_lateness", "PASS" if worst <= 15 else ("WARN" if worst <= 60 else "FAIL"),
-                 worst, f"worst start delay vs cron '{cron}' over {len(late)} runs (first _Run_Log row of each run); P-170",
+                 worst, f"worst start delay vs {basis} over {len(late)} runs (first _Run_Log row of each run); P-170",
                  late[-6:]))
     da = book.rows("Dashboard_Audit") or []
     capped = [f"{_s(r[0])} {_num(r[3]):g}" for r in da if _s(r[1]) == "scope.coverage" and _s(r[2]) == "WARN"]
@@ -1272,9 +1317,9 @@ def verdicts(findings):
 
 
 def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(3, 40.0),
-                   eodhd_target=90000, cron="17 4,12,20", tz_offset=3, since_days=7,
+                   eodhd_target=90000, cron=DEFAULT_CRON, tz_offset=3, since_days=7,
                    manifest=None, now_utc=None, cash_max_age_hours=24.0,
-                   margin_receipts=False, eodhd_fail_pct=0):
+                   margin_receipts=False, eodhd_fail_pct=0, dispatch=DEFAULT_DISPATCH):
     """Run every gate on one export. Returns a JSON-serialisable result dict."""
     expect = dict(DEFAULT_EXPECT if expect is None else expect)
     if not math.isfinite(eodhd_fail_pct) or not 0 <= eodhd_fail_pct <= 100:
@@ -1311,7 +1356,8 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
     f, m = check_model(book, tz_offset)
     findings += f
     metrics["model"] = m
-    f, m = check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof, eodhd_fail_pct)
+    f, m = check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof, eodhd_fail_pct,
+                        dispatch=dispatch)
     findings += f
     metrics["runlog"] = m
     findings.append(F("gov", "GOVERNANCE", "workbook_sharing_acl", "NOT_CHECKED", None,
@@ -1326,6 +1372,8 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
         params["margin_receipts"] = True
     if eodhd_fail_pct:
         params["eodhd_fail_pct"] = eodhd_fail_pct
+    if str(dispatch or "").strip():
+        params["dispatch"] = dispatch
     return {"script": "tfb_export_audit", "version": SCRIPT_VERSION, "export": os.path.basename(path),
             "export_sha256": _sha256_file(path), "asof": asof, "overall": overall, "lanes": lanes,
             "findings": findings, "metrics": metrics, "fix_list": fixes,
@@ -1600,6 +1648,7 @@ def _build_synthetic(path, clean, asof="2026-10-03", tz_offset=3):
 
 def selftest():
     now = dt.datetime(2026, 10, 3, 11, 0, tzinfo=dt.timezone.utc)
+    cron = "17 4,12,20"   # the synthetic _Run_Log predates PR #781 (slot 04:17Z, no dispatch)
     checks = []
     def expect_(cond, label):
         checks.append((bool(cond), label))
@@ -1607,7 +1656,7 @@ def selftest():
         for clean in (False, True):
             path = os.path.join(td, f"synthetic_{'clean' if clean else 'defects'}.xlsx")
             exp = _build_synthetic(path, clean)
-            res = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, since_days=7)
+            res = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="", since_days=7)
             fs = {f["check"]: f for f in res["findings"]}
             def st(name):
                 return fs[name]["status"] if name in fs else "MISSING"
@@ -1668,20 +1717,20 @@ def selftest():
                 expect_(st("trade_notes_vs_fills") == "PASS", f"{tag}: notes cover fills")
                 expect_(res["lanes"]["BOOK"]["rag"] == "GREEN" and res["lanes"]["MODEL"]["rag"] == "GREEN", f"{tag}: BOOK and MODEL green")
             # determinism: same workbook twice -> same digest
-            res2 = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, since_days=7)
+            res2 = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="", since_days=7)
             expect_(digest(res) == digest(res2), f"{tag}: deterministic digest")
             # markdown renders without error and names the overall verdict
             md = render_md(res)
             expect_(res["overall"] in md and "## Fix list" in md, f"{tag}: markdown renders")
             if not clean:
-                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="",
                                            eodhd_fail_pct=75)
                 switched_fs = {f["check"]: f for f in switched["findings"]}
                 expect_(switched_fs["eodhd_daily_over_target"]["status"] == "WARN"
                         and switched_fs["eodhd_daily_plan_threshold"]["status"] == "PASS"
                         and switched["metrics"]["runlog"]["eodhd_daily_limit"]["2026-10-01"] == 400000,
                         "plan switch: above cost target below plan threshold is WARN")
-                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="",
                                            eodhd_fail_pct=25)
                 switched_fs = {f["check"]: f for f in switched["findings"]}
                 expect_(switched_fs["eodhd_daily_plan_threshold"]["status"] == "FAIL",
@@ -1693,7 +1742,7 @@ def selftest():
                 ws.cell(7, 18, -2.0)
                 wb.save(path)
                 wb.close()
-                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="",
                                            margin_receipts=True)
                 switched_fs = {f["check"]: f for f in switched["findings"]}
                 expect_(switched_fs["Global_Markets.profit_margin_unit_errors"]["count"] == 0
@@ -1705,7 +1754,7 @@ def selftest():
                     "sheet_margin_unit:profit_margin:fraction:25.8;sheet_margin_unit:profit_margin:fraction:0.258")
                 wb.save(path)
                 wb.close()
-                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now,
+                switched = audit_workbook(path, expect=exp, asof="2026-10-03", now_utc=now, cron=cron, dispatch="",
                                            margin_receipts=True)
                 switched_fs = {f["check"]: f for f in switched["findings"]}
                 expect_(switched_fs["Global_Markets.profit_margin_unit_errors"]["status"] == "FAIL",
@@ -1746,7 +1795,12 @@ def parse_args(argv=None):
     ap.add_argument("--eodhd-fail-pct", type=fail_pct,
                     default=os.getenv("TFB_AUDIT_EODHD_FAIL_PCT", "0"),
                     help="FAIL at this percent of recorded plan; 0 preserves legacy target failure")
-    ap.add_argument("--cron", default="17 4,12,20", help="daily_sync cron 'minute hours' in UTC")
+    ap.add_argument("--cron", default=os.getenv("TFB_AUDIT_CRON", "").strip() or DEFAULT_CRON,
+                    help="daily_sync GitHub schedule slots 'minute hours[;minute hours]' in UTC "
+                         f"(default {DEFAULT_CRON!r}; '17 4,12,20' before PR #781)")
+    ap.add_argument("--dispatch", default=os.getenv("TFB_AUDIT_DISPATCH", DEFAULT_DISPATCH),
+                    help="Apps Script dispatched slots, same format; '' = none "
+                         f"(default {DEFAULT_DISPATCH!r}; +/-{DISPATCH_WINDOW_MIN} min trigger window)")
     ap.add_argument("--tz-offset", type=int, default=3, help="workbook local offset (Riyadh = 3)")
     ap.add_argument("--since-days", type=int, default=7)
     ap.add_argument("--cash-max-age-hours", type=float, default=24.0,
@@ -1778,6 +1832,7 @@ def main(argv=None):
     now = _parse_dt(a.now, 0) if a.now else None
     res = audit_workbook(a.export, expect=expect, asof=a.asof, dq=a.dq, rel=a.rel,
                          sector_cap=(int(n), float(pct)), eodhd_target=a.eodhd_target, cron=a.cron,
+                         dispatch=a.dispatch,
                          tz_offset=a.tz_offset, since_days=a.since_days, manifest=manifest, now_utc=now,
                          cash_max_age_hours=a.cash_max_age_hours, margin_receipts=a.margin_receipts,
                          eodhd_fail_pct=a.eodhd_fail_pct)
