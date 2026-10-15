@@ -24,8 +24,7 @@ def test_default_payload_matches_v111_before_version_stamp(tmp_path, clean, base
     # fixture's _Run_Log predates it, so the v1.1.1 schedule is passed here.
     path = tmp_path / "fixture.xlsx"
     expect = audit._build_synthetic(path, clean)
-    result = audit.audit_workbook(path, expect=expect, asof="2026-10-03", now_utc=NOW,
-                                  cron="17 4,12,20", dispatch="")
+    result = audit.audit_workbook(path, expect=expect, asof="2026-10-03", now_utc=NOW, cron="17 4,12,20")
     payload = {k: result[k] for k in ["findings", "metrics", "params", "lanes", "overall", "fix_list"]}
     assert hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest() == baseline
 
@@ -119,14 +118,23 @@ def test_cli_env_and_explicit_rollback(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# v1.3.0 (P-170c): the 03:15Z run dispatched by Apps Script is its own slot
+# v1.3.0 (P-170c): dispatched runs are recognised by provenance, not clock time
 # --------------------------------------------------------------------------- #
-def lateness(starts_local, cron=audit.DEFAULT_CRON, dispatch=audit.DEFAULT_DISPATCH):
-    rows = [["Timestamp", "Level", "Action", "Page", "Status", "Message"]]
-    for i, ts in enumerate(starts_local):
-        rows.append([ts, "INFO", "run_dashboard_sync", "Market_Leaders", "OK", f"leg run={9000 + i}"])
-    fs, metrics = audit.check_runlog(MemoryBook({"_Run_Log": rows}), 3, 7, 90000, cron, NOW, "2026-10-03",
-                                     dispatch=dispatch)
+HEADER = ["Timestamp", "Level", "Action", "Page", "Status", "Message"]
+
+
+def sync_row(local, i=0):
+    return [local, "INFO", "run_dashboard_sync", "Market_Leaders", "OK", f"leg run={9000 + i}"]
+
+
+def dispatch_row(local, status="OK", action="tfbDispatchDailySync"):
+    return [local, "INFO" if status == "OK" else "ERROR", action, "daily_sync.yml", status,
+            "workflow_dispatch accepted (HTTP 204)"]
+
+
+def lateness(rows, cron="17 12,20"):
+    fs, metrics = audit.check_runlog(MemoryBook({"_Run_Log": [HEADER] + rows}), 3, 7, 90000, cron, NOW,
+                                     "2026-10-03")
     return {f["check"]: f for f in fs}["schedule_lateness"], metrics
 
 
@@ -140,68 +148,82 @@ def test_slot_specs_accept_several_minute_hour_groups():
             audit._cron_slots(bad)
 
 
-def test_defaults_are_the_armed_schedule_and_env_overrides(monkeypatch):
-    assert (audit.DEFAULT_CRON, audit.DEFAULT_DISPATCH) == ("17 12,20", "15 3")
+def test_default_cron_follows_the_daily_sync_workflow(tmp_path):
+    def wf(*crons):
+        path = tmp_path / "daily_sync.yml"
+        path.write_text("on:\n  schedule:\n" + "".join(f'    - cron: "{c}"  # note\n' for c in crons))
+        return str(path)
+    assert audit._workflow_cron_default(wf("17 4,12,20 * * *")) == "17 4,12,20"
+    assert audit._workflow_cron_default(wf("17 12,20 * * *")) == "17 12,20"
+    assert audit._workflow_cron_default(wf("15 3 * * *", "17 12,20 * * *")) == "15 3;17 12,20"
+    assert audit._workflow_cron_default(wf()) == audit.FALLBACK_CRON
+    assert audit._workflow_cron_default(str(tmp_path / "missing.yml")) == audit.FALLBACK_CRON
+    # The module default is the checked-in workflow's schedule.
+    assert audit.DEFAULT_CRON == audit._workflow_cron_default(audit.DAILY_SYNC_WORKFLOW) != ""
+
+
+def test_env_overrides_default_cron_and_blank_falls_back(monkeypatch):
     monkeypatch.delenv("TFB_AUDIT_CRON", raising=False)
-    monkeypatch.delenv("TFB_AUDIT_DISPATCH", raising=False)
-    args = audit.parse_args([])
-    assert (args.cron, args.dispatch) == ("17 12,20", "15 3")
+    assert audit.parse_args([]).cron == audit.DEFAULT_CRON
     monkeypatch.setenv("TFB_AUDIT_CRON", "17 4,12,20")
-    monkeypatch.setenv("TFB_AUDIT_DISPATCH", "")
-    args = audit.parse_args([])
-    assert (args.cron, args.dispatch) == ("17 4,12,20", "")
-    # A blank cron variable must not silently switch the lateness gate off.
+    assert audit.parse_args([]).cron == "17 4,12,20"
     monkeypatch.setenv("TFB_AUDIT_CRON", " ")
     assert audit.parse_args([]).cron == audit.DEFAULT_CRON
 
 
-def test_on_time_dispatched_morning_run_is_not_418_minutes_late():
-    # 06:16 Riyadh = 03:16Z, one minute after the dispatcher's 03:15Z slot.
-    finding, metrics = lateness(["2026-10-03 06:16:00"])
-    assert finding["status"] == "PASS" and metrics["schedule_worst_lateness_min"] == 0
-    assert "slot 10-03 03:15Z (dispatch)" in finding["examples"][-1]
-    # The v1.2.0 model (cron slots only) matched it to the previous day's 20:17Z.
-    legacy, _ = lateness(["2026-10-03 06:16:00"], dispatch="")
+def test_on_time_dispatched_morning_run_is_measured_from_its_dispatch():
+    # Dispatcher OK row 06:14 Riyadh (03:14Z); first sync row 06:16 (03:16Z).
+    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"), sync_row("2026-10-03 06:16:00")])
+    assert finding["status"] == "PASS" and metrics["schedule_worst_lateness_min"] == 2
+    assert metrics["schedule_dispatched_runs"] == 1
+    assert "dispatch 10-03 03:14Z started 03:16Z" in finding["examples"][-1]
+    # Without the dispatcher row the v1.2.0 model matched it to the previous 20:17Z.
+    legacy, legacy_metrics = lateness([sync_row("2026-10-03 06:16:00")])
     assert legacy["status"] == "FAIL" and legacy["count"] == 419
+    assert "schedule_dispatched_runs" not in legacy_metrics
 
 
-@pytest.mark.parametrize("local,expected", [
-    ("2026-10-03 06:02:00", 0),    # 13 min early: inside the trigger window
-    ("2026-10-03 06:29:00", 0),    # +14 min: inside the window
-    ("2026-10-03 06:45:00", 15),   # +30 min: 15 beyond the window -> still PASS
-    ("2026-10-03 07:35:00", 65),   # +80 min: 65 beyond the window -> FAIL
-])
-def test_dispatched_slot_measures_lateness_beyond_its_trigger_window(local, expected):
-    finding, metrics = lateness([local])
-    assert metrics["schedule_worst_lateness_min"] == expected
-    assert finding["status"] == ("PASS" if expected <= 15 else "WARN" if expected <= 60 else "FAIL")
+def test_late_cron_just_before_the_dispatch_is_not_claimed_by_it():
+    # 20:17Z cron that fired at 03:00Z next day (06:00 Riyadh), then the 03:15Z
+    # dispatch and its run: the cron keeps its ~403-min lateness.
+    finding, metrics = lateness([sync_row("2026-10-03 06:00:00", 0), dispatch_row("2026-10-03 06:15:00"),
+                                 sync_row("2026-10-03 07:50:00", 1)])
+    assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 403
+    assert any("slot 10-02 20:17Z started 03:00Z" in e for e in finding["examples"])
+    assert any("dispatch 10-03 03:15Z started 04:50Z" in e for e in finding["examples"])
 
 
-def test_cron_slots_get_no_early_grace():
-    # 12:17Z cron that fired 7h42m late at 19:59Z (18 min before 20:17Z) is
-    # still measured against 12:17Z, not forgiven as an early 20:17Z run.
-    finding, metrics = lateness(["2026-10-02 22:59:00"])
-    assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 462
-    assert "slot 10-02 12:17Z started" in finding["examples"][-1]
+def test_one_dispatch_claims_one_run_and_unaccepted_dispatches_claim_none():
+    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"), sync_row("2026-10-03 06:16:00", 0),
+                                 sync_row("2026-10-03 08:30:00", 1)])
+    assert metrics["schedule_dispatched_runs"] == 1
+    # The second run (05:30Z) is unclaimed: a cron run, 553 min after 20:17Z.
+    assert metrics["schedule_worst_lateness_min"] == 553
+    for status in ("FAILED", "SKIPPED"):
+        _, m = lateness([dispatch_row("2026-10-03 06:14:00", status), sync_row("2026-10-03 06:16:00")])
+        assert "schedule_dispatched_runs" not in m and m["schedule_worst_lateness_min"] == 419
+
+
+def test_manual_dispatch_is_labelled_and_link_window_is_bounded():
+    finding, _ = lateness([dispatch_row("2026-10-03 06:14:00", action="tfbDispatchDailySyncNow"),
+                           sync_row("2026-10-03 06:20:00")])
+    assert "manual dispatch 10-03 03:14Z started 03:20Z" in finding["examples"][-1]
+    _, m = lateness([dispatch_row("2026-10-02 22:00:00"), sync_row("2026-10-03 06:16:00")])
+    assert "schedule_dispatched_runs" not in m   # 8h16m after the dispatch: not linked
 
 
 def test_late_cron_slot_is_still_measured_against_its_own_slot():
-    # 12:17Z cron that started 13:30Z (16:30 Riyadh): +73 min -> FAIL.
-    finding, metrics = lateness(["2026-10-02 16:30:00"])
+    finding, metrics = lateness([sync_row("2026-10-02 16:30:00")])
     assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 73
-    assert "slot 10-02 12:17Z started" in finding["examples"][-1]
+    assert "slot 10-02 12:17Z started 13:30Z" in finding["examples"][-1]
 
 
-def test_no_slots_at_all_is_a_warning_not_a_silent_pass():
-    finding, _ = lateness(["2026-10-03 06:16:00"], cron="", dispatch="")
-    assert finding["status"] == "WARN" and "no schedule slots" in finding["detail"]
+def test_pre_781_schedule_keeps_measuring_the_0417_cron():
+    # Codex P1 on #783: before #781 merges, a 04:31Z run is +14 vs 04:17Z.
+    finding, metrics = lateness([sync_row("2026-10-03 07:31:00")], cron="17 4,12,20")
+    assert finding["status"] == "PASS" and metrics["schedule_worst_lateness_min"] == 14
 
 
-def test_legacy_call_without_dispatch_keeps_params_byte_identical(tmp_path):
-    path = tmp_path / "fixture.xlsx"
-    expect = audit._build_synthetic(path, True)
-    legacy = audit.audit_workbook(path, expect=expect, asof="2026-10-03", now_utc=NOW,
-                                  cron="17 4,12,20", dispatch="")
-    armed = audit.audit_workbook(path, expect=expect, asof="2026-10-03", now_utc=NOW)
-    assert "dispatch" not in legacy["params"]
-    assert armed["params"]["cron"] == "17 12,20" and armed["params"]["dispatch"] == "15 3"
+def test_no_cron_slots_is_a_warning_not_a_silent_pass():
+    finding, _ = lateness([sync_row("2026-10-03 06:16:00")], cron="")
+    assert finding["status"] == "WARN" and "no cron slots" in finding["detail"]
