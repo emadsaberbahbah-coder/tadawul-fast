@@ -28,9 +28,12 @@ name: "🕶️ TFB Shadow Board"
 # ============================================================================
 
 on:
-  schedule:
-    - cron: "10 5 * * *"     # ~08:10 Riyadh (post morning refresh window)
-    - cron: "10 14 * * *"    # ~17:10 Riyadh (post afternoon refresh window)
+  # P-170b (2026-10-15): the 05:10 / 14:10 UTC crons were removed. The Apps
+  # Script dispatcher (24_Sync_Dispatch.gs, lane shadow_board, 08:10/17:10
+  # Riyadh) fires the same slots; keeping both ran every slot twice (a second
+  # Shadow_Board rewrite plus duplicate Regime_History rows). Production writes
+  # now come only from that dispatcher, which sends dry_run="false"; the
+  # dry_run input's name and options are a contract with that file.
   workflow_dispatch:
     inputs:
       dry_run:
@@ -144,7 +147,8 @@ jobs:
           # substitute "true" for that empty value and turn BOTH daily scheduled
           # runs into dry-runs — silently ending Shadow_History collection with
           # every workflow still green. Only an explicit "true" from a human
-          # dispatch may suppress the write.
+          # dispatch may suppress the write. (P-170b: no schedule remains; the
+          # Apps Script dispatch sends "false" explicitly. Keep this rule.)
           EXTRA=""
           if [[ "${INPUT_DRY_RUN:-}" == "true" ]]; then EXTRA="--dry-run"; fi
           echo "dry_run input='${INPUT_DRY_RUN:-<scheduled: none>}' -> args='${EXTRA:-<write>}'"
