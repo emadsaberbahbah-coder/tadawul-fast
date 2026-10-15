@@ -32,13 +32,23 @@
  *  enforce  re-seeds each panel cell as preserved operator input >
  *           _Lists_Config default > built-in default, and logs 'layout:
  *           preserved N operator input(s) (M differ from defaults: ...)'.
+ *           A snapshot read fault aborts the rebuild BEFORE the clear
+ *           (throws; the sheet is left untouched) instead of re-seeding
+ *           the defaults; observe logs the fault and carries on as off.
  *  A value is kept only when its label cell still holds the exact PF: label
  *  at the same position (a moved layout keeps nothing); a sheet with no
  *  panel yet seeds exactly as before.
- * LIMIT: values already lost are not recovered; the owner retypes B5 / H5
- * once (53,769.26 / 20 per the 10-14 snapshot) before arming.
- * ES5. Functions added: 3 (pdPanelPreserveMode_, pdPanelPreserve_,
- * pdPanelSeedValue_). Changed: buildPortfolioDecisionLayout. Removed: 0.
+ * LIMITS: values already lost are not recovered; the owner retypes the
+ * CURRENT cash and Max Position % once (the 10-14 snapshot read 53,769.2625
+ * and 20). Enforce keeps every non-blank cell, stale or not (the P-134
+ * lesson in 16_Decision_Top10 v1.11.7): to apply a changed _Lists_Config
+ * default or to reset a value, blank the cell first (or rebuild once with
+ * off). A formula in a panel cell is kept as its value. A moved panel (a row
+ * or column inserted above or left of it) keeps nothing; the log then reads
+ * 'preserved 0'.
+ * ES5. Functions added: 3 (pdPanelPreserveMode_, pdPanelPreserve_(sheet,
+ * faults), pdPanelSeedValue_). Changed: buildPortfolioDecisionLayout.
+ * Removed: 0.
  * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.13.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
@@ -3837,8 +3847,10 @@ function pdPanelPreserveMode_() {
 /** v1.5.14: snapshot of the panel's NON-BLANK operator values, read raw (no
  * defaults) BEFORE a layout rebuild clears the sheet. A value is kept only
  * when its label cell still holds the exact PD_PANEL label (a moved layout
- * keeps nothing). A sheet without a panel yet returns {}. Never throws. */
-function pdPanelPreserve_(sheet) {
+ * keeps nothing). A sheet without a panel yet returns {}. Never throws: a
+ * read fault is pushed onto the optional `faults` array (so the caller can
+ * tell a failed read from an empty panel) and returns what was read. */
+function pdPanelPreserve_(sheet, faults) {
   var out = {};
   try {
     if (!sheet || sheet.getLastRow() < PD_ROW_PANEL_FIRST) return out;
@@ -3851,7 +3863,9 @@ function pdPanelPreserve_(sheet) {
       var v = sheet.getRange(pos.row, pos.valueCol).getValue();
       if (pdHasValue_(v)) out[item.label] = v;
     }
-  } catch (e) {}
+  } catch (e) {
+    if (faults && faults.push) faults.push(String(e && e.message || e));
+  }
   return out;
 }
 
@@ -3995,9 +4009,23 @@ function buildPortfolioDecisionLayout() {
   var tokens = pdTokens_(ss);
   var header = tokens.HEADER || PD_FALLBACK_TOKENS.HEADER;
   var op = tokens.OPERATOR_INPUT || PD_FALLBACK_TOKENS.OPERATOR_INPUT;
-  /* v1.5.14: snapshot operator inputs BEFORE the clear (off reads nothing). */
+  /* v1.5.14: snapshot operator inputs BEFORE the clear (off reads nothing).
+   * Enforce aborts on a snapshot read fault, before anything is cleared:
+   * a failed read must not turn into the reset this mode exists to stop. */
   var preserveMode = pdPanelPreserveMode_();
-  var preserved = preserveMode === 'off' ? {} : pdPanelPreserve_(sheet);
+  var preserveFaults = [];
+  var preserved = preserveMode === 'off' ? {}
+                                         : pdPanelPreserve_(sheet, preserveFaults);
+  if (preserveFaults.length) {
+    var faultMsg = '[MP-DEC v' + PD_VERSION + '] layout: panel snapshot failed (' +
+        preserveFaults[0] + ')';
+    if (preserveMode === 'enforce') {
+      Logger.log(faultMsg + '; rebuild aborted, sheet left untouched');
+      throw new Error(faultMsg + '; rebuild aborted, sheet left untouched. ' +
+          'Retry, or set PD_PANEL_PRESERVE=off to rebuild with the defaults.');
+    }
+    Logger.log(faultMsg + '; observe continues with the defaults');
+  }
 
   sheet.clear();
   sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();

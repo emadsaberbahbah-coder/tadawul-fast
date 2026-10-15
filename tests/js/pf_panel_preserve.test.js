@@ -10,12 +10,15 @@
  *   PF_WRITE_GOLDEN=1      with PF_GAS=<v1.5.13 copy>: rewrite the golden fixture
  *   PF_DUMP=<file>         write the produced panels, controls and logs as JSON
  *
- * WORKS  W1-W6  enforce keeps typed inputs, re-seeds blanks, survives the
+ * WORKS  W1-W7  enforce keeps typed inputs, re-seeds blanks, survives the
  *               auto-build inside refreshPortfolioDecision, seeds a fresh
- *               sheet exactly as before; observe only logs.
- * NEVER  N1-N5  off and every unknown spelling are v1.5.13 byte-identical
+ *               sheet exactly as before; observe only logs (also when the
+ *               snapshot read faults).
+ * NEVER  N1-N7  off and every unknown spelling are v1.5.13 byte-identical
  *               and read no panel cell; a moved or renamed label keeps
- *               nothing; the pure seed and the snapshot never throw.
+ *               nothing; the pure seed and the snapshot never throw; a
+ *               snapshot read fault under enforce aborts BEFORE the clear
+ *               (sheet untouched, nothing posted); off ignores read faults.
  * GOLD   G1-G2  the v1.5.13 golden (and PF_BASE_GAS live) reset cash to 0
  *               and Max Position to 15 under the same inputs - the defect.
  */
@@ -30,20 +33,27 @@ const GAS = process.env.PF_GAS || path.join(__dirname, '../../apps_script/10_My_
 const GOLDEN = path.join(__dirname, '../fixtures/pf_panel_v1_5_13_golden.json');
 const SOURCE = fs.readFileSync(GAS, 'utf8');
 const START = Date.parse('2026-10-15T05:50:11Z');            // 08:50:11 Riyadh
-const TOTAL = 13;
+const TOTAL = 16;
 
 const LABELS = ['PF: Cash Available SAR', 'PF: Target Cash %', 'PF: Max Position %',
   'PF: Max Sector %', 'PF: Min Reliability to Add', 'PF: Min DQ to Add', 'PF: Rebalance Mode'];
-/* _Lists_Config TFB_PANEL_DEFAULTS as the 10-15 export reads it; 'PF: Min DQ
- * to Add' is left out so the built-in default (80) is exercised too. */
+/* _Lists_Config TFB_PANEL_DEFAULTS: cash 0 / Max Position 15 as the 10-15
+ * export reads them. Max Sector (25) and Min Reliability (65) deliberately
+ * differ from the built-in PD_PANEL defaults (30 / 70) so a seed that skips
+ * _Lists_Config is visible; 'PF: Min DQ to Add' is left out so the built-in
+ * default (80) is exercised too. */
 const DEFAULTS = [['PF: Cash Available SAR', 0], ['PF: Target Cash %', 10],
-  ['PF: Max Position %', 15], ['PF: Max Sector %', 30],
-  ['PF: Min Reliability to Add', 70], ['PF: Rebalance Mode', 'Advisory Only']];
+  ['PF: Max Position %', 15], ['PF: Max Sector %', 25],
+  ['PF: Min Reliability to Add', 65], ['PF: Rebalance Mode', 'Advisory Only']];
+const SEEDED = {'PF: Cash Available SAR': 0, 'PF: Target Cash %': 10, 'PF: Max Position %': 15,
+  'PF: Max Sector %': 25, 'PF: Min Reliability to Add': 65, 'PF: Min DQ to Add': 80,
+  'PF: Rebalance Mode': 'Advisory Only'};
 /* The operator panel of the _Portfolio_Action_Log snapshot, 2026-10-14 04:45:58. */
 const OPERATOR = {'PF: Cash Available SAR': 53769.2625, 'PF: Target Cash %': 10,
   'PF: Max Position %': 20, 'PF: Max Sector %': 30, 'PF: Min Reliability to Add': 70,
   'PF: Min DQ to Add': 80, 'PF: Rebalance Mode': 'Advisory'};
-const RESET = ['PF: Cash Available SAR', 'PF: Max Position %', 'PF: Rebalance Mode'];
+const RESET = ['PF: Cash Available SAR', 'PF: Max Position %', 'PF: Max Sector %',
+  'PF: Min Reliability to Add', 'PF: Rebalance Mode'];
 
 const HOLD_HEADERS = ['Symbol', 'Name', 'Sector', 'Currency', 'Position Qty', 'Avg Cost',
   'Current Price', 'Last Updated (UTC)'];
@@ -62,6 +72,24 @@ function check(label, fn) { fn(); passed++; console.log('PASS ' + label); }
 function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 function pos(i) { return {row: 5 + Math.floor(i / 3), labelCol: 1 + (i % 3) * 3, valueCol: 2 + (i % 3) * 3}; }
 function sha(x) { return crypto.createHash('sha256').update(JSON.stringify(x)).digest('hex'); }
+/* A golden trace with only the 7 panel seed values swapped: every other write
+ * (formats, colours, borders, order) must stay v1.5.13's. */
+function withValues(trace, values) {
+  const at = {};
+  LABELS.forEach((l, i) => {
+    const p = pos(i);
+    at['Portfolio_Decision!' + p.row + ',' + p.valueCol + ',1,1 setValue '] = l;
+  });
+  let swapped = 0;
+  const out = trace.map((t) => {
+    for (const prefix of Object.keys(at)) {
+      if (t.startsWith(prefix)) { swapped++; return prefix + JSON.stringify([values[at[prefix]]]); }
+    }
+    return t;
+  });
+  assert.equal(swapped, 7, 'each panel seed appears exactly once in the golden trace');
+  return out;
+}
 
 /* ----- cell-level sheet model -------------------------------------------- */
 const SKIP = new Set(['then', 'toJSON', 'inspect', 'constructor']);
@@ -79,7 +107,16 @@ function makeSheet(name, cells0, opts) {
     if (opts.throwOnRead) throw new Error('synthetic getRange fault');
     const rng = new Proxy({}, {get(_t, prop) {
       if (typeof prop === 'symbol' || SKIP.has(prop)) return undefined;
-      if (prop === 'getValue') return () => { reads.push([r, c, cleared]); return get(r, c); };
+      if (prop === 'getValue') {
+        return () => {
+          reads.push([r, c, cleared]);
+          /* a transient fault on the panel rows (5-7) before the clear */
+          if (opts.faultBeforeClear && !cleared && r >= 5 && r <= 7) {
+            throw new Error('Service Spreadsheets timed out');
+          }
+          return get(r, c);
+        };
+      }
       if (prop === 'getValues') {
         return () => Array.from({length: nr}, (_x, i) =>
           Array.from({length: nc}, (_y, j) => get(r + i, c + j)));
@@ -219,10 +256,13 @@ function refresh(o) {
   o = o || {};
   const cells = operatorCells(o.source);
   cells.delete('4,1');
-  const pd = makeSheet('Portfolio_Decision', cells);
+  const pd = makeSheet('Portfolio_Decision', cells, o.sheetOpts);
   const w = world({source: o.source, props: o.props, pd: pd});
-  w.ctx.refreshPortfolioDecision();
-  return {controls: w.posts[0].controls, panel: panelOf(pd), trace: pd.__trace.slice(), logs: w.logs};
+  let error = null;
+  try { w.ctx.refreshPortfolioDecision(); } catch (e) { error = e; }
+  if (error && !o.allowThrow) throw error;
+  return {controls: w.posts.length ? w.posts[0].controls : null, posts: w.posts.length,
+          panel: panelOf(pd), trace: pd.__trace.slice(), logs: w.logs, error: error};
 }
 
 const fresh = build({fresh: true});
@@ -249,9 +289,10 @@ dump.off = {panel: offOp.panel, controls: offRefresh.controls};
 check('W1 enforce: the typed panel survives the rebuild; the log names what differs', () => {
   const r = build({props: {PD_PANEL_PRESERVE: 'enforce'}});
   assert.deepEqual(r.panel, OPERATOR);
+  assert.deepEqual(r.trace, withValues(golden.operator_trace, OPERATOR));
   const line = r.logs.filter((l) => l.indexOf('layout: preserved') >= 0);
   assert.equal(line.length, 1);
-  assert.ok(line[0].endsWith('layout: preserved 7 operator input(s) (3 differ from defaults: ' +
+  assert.ok(line[0].endsWith('layout: preserved 7 operator input(s) (5 differ from defaults: ' +
                              RESET.join(', ') + ')'), line[0]);
   dump.enforce = {panel: r.panel, log: line[0]};
 });
@@ -262,9 +303,11 @@ check('W2 enforce: blank and dash cells re-seed from _Lists_Config, then the bui
     cells.set('6,8', '\u2014');           // PF: Min DQ to Add -> built-in 80
     cells.set('5,5', 12.5);               // PF: Target Cash % typed
   }});
-  assert.deepEqual(r.panel, Object.assign({}, OPERATOR,
-      {'PF: Target Cash %': 12.5, 'PF: Min Reliability to Add': 70, 'PF: Min DQ to Add': 80}));
-  assert.ok(r.logs.some((l) => /layout: preserved 5 operator input\(s\) \(4 differ/.test(l)));
+  const want = Object.assign({}, OPERATOR,
+      {'PF: Target Cash %': 12.5, 'PF: Min Reliability to Add': 65, 'PF: Min DQ to Add': 80});
+  assert.deepEqual(r.panel, want);
+  assert.deepEqual(r.trace, withValues(golden.operator_trace, want));
+  assert.ok(r.logs.some((l) => /layout: preserved 5 operator input\(s\) \(5 differ/.test(l)));
 });
 
 check('W3 enforce: the auto-build inside refreshPortfolioDecision posts the typed controls', () => {
@@ -279,6 +322,7 @@ check('W3 enforce: the auto-build inside refreshPortfolioDecision posts the type
 check('W4 enforce on a fresh workbook seeds exactly as v1.5.13 (nothing to keep)', () => {
   const r = build({fresh: true, props: {PD_PANEL_PRESERVE: 'enforce'}});
   assert.deepEqual(r.trace, golden.fresh_trace);
+  assert.deepEqual(r.panel, SEEDED);                      // _Lists_Config > built-in
   assert.ok(r.logs.some((l) => /layout: preserved 0 operator input\(s\) \(0 differ from defaults\)$/.test(l)));
 });
 
@@ -288,7 +332,7 @@ check('W5 observe: every sheet write is v1.5.13\'s; the log names the inputs it 
   assert.deepEqual(r.panel, golden.operator_panel);
   const line = r.logs.filter((l) => l.indexOf('layout: observe') >= 0);
   assert.equal(line.length, 1);
-  assert.ok(line[0].endsWith('layout: observe -- 3 operator input(s) reset to defaults: ' +
+  assert.ok(line[0].endsWith('layout: observe -- 5 operator input(s) reset to defaults: ' +
                              RESET.join(', ')), line[0]);
   const rr = refresh({props: {PD_PANEL_PRESERVE: 'observe'}});
   assert.deepEqual(rr.controls, golden.refresh_controls);
@@ -304,6 +348,14 @@ check('W6 the mode tolerates case and surrounding blanks like the other PD prope
   assert.ok(/\n \* Version: 1\.5\.14\n/.test(SOURCE));
 });
 
+check('W7 observe: a snapshot read fault is logged and the build carries on as v1.5.13', () => {
+  const r = build({props: {PD_PANEL_PRESERVE: 'observe'}, sheetOpts: {faultBeforeClear: true}});
+  assert.deepEqual(r.trace, golden.operator_trace);
+  assert.deepEqual(r.panel, golden.operator_panel);
+  assert.ok(r.logs.some((l) => l.endsWith('layout: panel snapshot failed (Service Spreadsheets ' +
+                                          'timed out); observe continues with the defaults')), r.logs.join('\n'));
+});
+
 /* ----------------------------------------------------------------- NEVER -- */
 check('N1 off and every unknown spelling: v1.5.13 byte-identical, no panel cell read', () => {
   for (const raw of [undefined, '', ' ', 'off', 'on', 'true', '1', 'yes', 'preserve',
@@ -316,6 +368,7 @@ check('N1 off and every unknown spelling: v1.5.13 byte-identical, no panel cell 
     assert.equal(r.logs.filter((l) => l.indexOf('layout: ') >= 0).length, 0);
   }
   assert.deepEqual(fresh.trace, golden.fresh_trace);
+  assert.deepEqual(golden.operator_panel, SEEDED);        // v1.5.13 honours _Lists_Config
   assert.deepEqual(offRefresh.controls, golden.refresh_controls);
   assert.equal(sha(offRefresh.trace), golden.refresh_trace_sha256);
   /* a PropertiesService fault reads off, never enforce */
@@ -372,6 +425,12 @@ check('N4 the snapshot never throws: no sheet, an empty sheet, a faulting sheet 
   assert.equal(JSON.stringify(snap(makeSheet('x'))), '{}');
   const faulty = makeSheet('Portfolio_Decision', operatorCells(), {throwOnRead: true});
   assert.equal(JSON.stringify(snap(faulty)), '{}');
+  const faults = [];
+  assert.equal(JSON.stringify(snap(faulty, faults)), '{}');
+  assert.deepEqual(faults, ['synthetic getRange fault']);
+  const clean = [];
+  snap(makeSheet('Portfolio_Decision', operatorCells()), clean);
+  assert.deepEqual(clean, []);                            // an ordinary read records nothing
   const ok = snap(makeSheet('Portfolio_Decision', operatorCells()));
   assert.deepEqual(JSON.parse(JSON.stringify(ok)), OPERATOR);
 });
@@ -388,6 +447,36 @@ check('N5 the v1.5.14 header block and the added functions are ASCII', () => {
   const e = SOURCE.indexOf('/* v1.5.14: snapshot operator inputs BEFORE the clear');
   const f = SOURCE.indexOf("Logger.log('[MP-DEC v' + PD_VERSION + '] layout built');");
   assert.ok(e > 0 && f > e && /^[\x00-\x7f]*$/.test(SOURCE.slice(e, f).replace(/\\u2014/g, '')));
+});
+
+check('N6 enforce: a snapshot read fault aborts BEFORE the clear; the panel is untouched', () => {
+  let thrown = null;
+  let r = null;
+  try {
+    r = build({props: {PD_PANEL_PRESERVE: 'enforce'}, sheetOpts: {faultBeforeClear: true}});
+  } catch (e) { thrown = e; }
+  assert.ok(thrown && /panel snapshot failed \(Service Spreadsheets timed out\); rebuild aborted, sheet left untouched/
+      .test(String(thrown.message)), String(thrown));
+  const pd = makeSheet('Portfolio_Decision', operatorCells(), {faultBeforeClear: true});
+  const w = world({props: {PD_PANEL_PRESERVE: 'enforce'}, pd: pd});
+  assert.throws(() => w.ctx.buildPortfolioDecisionLayout(), /rebuild aborted/);
+  assert.deepEqual(pd.__trace, []);                       // not one write, no clear
+  assert.deepEqual(panelOf(pd), OPERATOR);
+  const rr = refresh({props: {PD_PANEL_PRESERVE: 'enforce'}, sheetOpts: {faultBeforeClear: true},
+                      allowThrow: true});
+  assert.ok(rr.error && /rebuild aborted/.test(String(rr.error.message)));
+  assert.equal(rr.posts, 0);                              // nothing sized on defaults
+  assert.deepEqual(rr.trace, []);
+  assert.deepEqual(rr.panel, OPERATOR);
+});
+
+check('N7 off: read faults are irrelevant (no snapshot), v1.5.13 byte-identical', () => {
+  const r = build({sheetOpts: {faultBeforeClear: true}});
+  assert.deepEqual(r.trace, golden.operator_trace);
+  assert.equal(r.logs.filter((l) => l.indexOf('layout: ') >= 0).length, 0);
+  const rr = refresh({sheetOpts: {faultBeforeClear: true}, allowThrow: true});
+  assert.equal(rr.error, null);
+  assert.deepEqual(rr.controls, golden.refresh_controls);
 });
 
 /* ------------------------------------------------------------------ GOLD -- */

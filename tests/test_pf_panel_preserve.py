@@ -8,6 +8,9 @@ cell-level sheet model, synthetic holdings) and checks what it produced:
   Position 15 - the reset the 2026-10-15 export shows);
 - observe: logs which inputs the rebuild reset and changes nothing.
 The whole-suite CI job collects this file, so the native harness runs there.
+That job is advisory (continue-on-error, outside the CI verdict), like the
+other 10_My_Portfolio harnesses; moving them into the blocking lean lane is
+proposed separately so this PR does not touch ci.yml.
 """
 from __future__ import annotations
 
@@ -44,7 +47,7 @@ def dump(tmp_path_factory):
     proc = subprocess.run([node, str(HARNESS)], env=env, capture_output=True, text=True,
                           timeout=180)
     assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-2000:])
-    assert "PASS 13/13 digest" in proc.stdout, proc.stdout[-2000:]
+    assert "PASS 16/16 digest" in proc.stdout, proc.stdout[-2000:]
     return json.loads(out.read_text(encoding="utf-8"))
 
 
@@ -65,8 +68,9 @@ def test_off_is_the_v1_5_13_reset(dump):
 
 def test_observe_names_the_reset_inputs(dump):
     assert dump["observe"].endswith(
-        "layout: observe -- 3 operator input(s) reset to defaults: "
-        "PF: Cash Available SAR, PF: Max Position %, PF: Rebalance Mode")
+        "layout: observe -- 5 operator input(s) reset to defaults: "
+        "PF: Cash Available SAR, PF: Max Position %, PF: Max Sector %, "
+        "PF: Min Reliability to Add, PF: Rebalance Mode")
 
 
 def test_added_files_are_ascii():
