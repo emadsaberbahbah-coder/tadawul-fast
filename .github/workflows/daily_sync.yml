@@ -26,14 +26,16 @@ on:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler (UTC; Riyadh UTC+3): three slots every day.
-  # Configured Riyadh times are 07:17, 15:17 and 23:17. GitHub can delay them;
+  # ✅ Production scheduler (UTC; Riyadh UTC+3): three runs every day.
+  # Cron slots are 15:17 and 23:17 Riyadh; the 06:15 Riyadh run is dispatched
+  # by apps_script/24_Sync_Dispatch.gs (event workflow_dispatch; kill switch
+  # TFB_SYNC_DISPATCH_DISABLED). GitHub can delay them;
   # the actual run timestamp is the execution witness. This includes Sunday.
-  # Three slots retain the existing provider-quota budget. Cron does not know
+  # Three runs retain the existing provider-quota budget. Cron does not know
   # venue holidays or DST, and a scheduled start does not prove a completed
   # refresh. Check the source run, recovery and coverage-audit results.
   schedule:
-    - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
+    - cron: "17 12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day. P-170b (2026-10-15): 04:17Z slot moved to the Apps Script dispatcher (03:15Z)
                                  # P-170 (2026-09-26): minute 00 is GitHub's most-delayed schedule minute -
                                  # the 20Z slot fired 22:59Z and the 04Z slot 09:00Z; :17 keeps the slots off the hour.
 
