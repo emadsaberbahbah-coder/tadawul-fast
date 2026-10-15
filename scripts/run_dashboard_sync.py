@@ -3,10 +3,12 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.69.1 - _Run_Log Details carry run provenance: "event" (GITHUB_EVENT_NAME)
+and, for schedule runs, the cron line (2026-10-15, P-170c; see SCRIPT_VERSION)
 v6.69.0 - full typed final market-payload intent digest (2026-10-12)
 ================================================================================
 Successful market RAW updates expose a complete structural SHA256 after Name,
@@ -2102,7 +2104,21 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.69.0"
+SCRIPT_VERSION = "6.69.1"
+# v6.69.1 (2026-10-15) - RUN-META PROVENANCE (P-170c): _runlog_meta_json also
+#   records how the run was started - "event" = GITHUB_EVENT_NAME, "workflow"
+#   = the workflow file (from GITHUB_WORKFLOW_REF; page_refresh_recovery and
+#   sync_outcome_audit also run this script) and, for a schedule run,
+#   "schedule" = the cron line that fired (from the GITHUB_EVENT_PATH
+#   payload). The ID-FIREWALL row now goes through _runlog_meta_json too: it
+#   is the first row of each market page and carried no run_id at all.
+#   WHY: once the Apps Script dispatcher replaces
+#   the 04:17Z cron, the offline export audit (tfb_export_audit v1.3.0) must
+#   tell a dispatched run from a cron that fired hours late; timing alone
+#   cannot (a late cron whose first row lands just after the dispatch was
+#   scored as an on-time dispatched run). Keys are added only when the
+#   values exist (absent outside GitHub Actions) and fail-open; nothing
+#   else in any row, page, stamp or exit code changes.
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -6996,7 +7012,9 @@ def _append_runlog_idfirewall(
             f"{' | quarantined=' + str(len(name_dup_quarantined)) if name_dup_quarantined else ''}"
             f" | selftest={_IDFW_SELFTEST_MSG}"
         )
-        details = json.dumps({
+        # v6.69.1: RUN-META like every other channel - this is the first
+        # row of each market page, so it must carry the run's provenance.
+        details = _runlog_meta_json(json.dumps({
             "klg_kept": int(klg_kept),
             "klg_suspect_dropped": klg_suspects[:50],
             "out_stripped": out_stripped[:50],
@@ -7005,7 +7023,7 @@ def _append_runlog_idfirewall(
             "dedup_safe": bool(_name_dedup_safe_enabled()),
             "selftest": _IDFW_SELFTEST_MSG,
             "version": SCRIPT_VERSION,
-        })
+        }))
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status, msg, "", "", "", details]]}
         _last_err = None
@@ -7866,8 +7884,29 @@ _SH_KEY_NORM = "backendsyncholduntil"
 _SH_STATE = {"active": False, "row": None}
 
 
+_RUN_SCHEDULE_CACHE: list = []
+
+
+def _run_schedule() -> str:
+    """v6.69.1: the cron line of a schedule run, read once from the event
+    payload ('' outside a schedule run or on any error)."""
+    if not _RUN_SCHEDULE_CACHE:
+        cron = ""
+        try:
+            if (os.getenv("GITHUB_EVENT_NAME") or "").strip() == "schedule":
+                with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+                    cron = str(json.load(fh).get("schedule") or "").strip()
+        except Exception:
+            cron = ""
+        _RUN_SCHEDULE_CACHE.append(cron)
+    return _RUN_SCHEDULE_CACHE[0]
+
+
 def _runlog_meta_json(details: str) -> str:
     """v6.45.0 R5: inject run_id + ts_utc into a Details-JSON string.
+    v6.69.1: also event (GITHUB_EVENT_NAME), workflow (file name from
+    GITHUB_WORKFLOW_REF) and, for schedule runs, the cron line - only when
+    present, so rows written outside Actions are unchanged.
     FAIL-OPEN: any parse error returns the input unchanged."""
     try:
         d = json.loads(details or "{}")
@@ -7875,6 +7914,16 @@ def _runlog_meta_json(details: str) -> str:
             d.setdefault("run_id", (os.getenv("GITHUB_RUN_ID") or "").strip()
                          or _RUN_ID)
             d.setdefault("ts_utc", datetime.now(timezone.utc).isoformat())
+            event = (os.getenv("GITHUB_EVENT_NAME") or "").strip()
+            if event:
+                d.setdefault("event", event)
+                schedule = _run_schedule()
+                if schedule:
+                    d.setdefault("schedule", schedule)
+            # "owner/repo/.github/workflows/daily_sync.yml@refs/..." -> "daily_sync.yml"
+            wf_ref = (os.getenv("GITHUB_WORKFLOW_REF") or "").split("@", 1)[0].strip()
+            if wf_ref:
+                d.setdefault("workflow", os.path.basename(wf_ref))
             return json.dumps(d)
     except Exception:
         pass
