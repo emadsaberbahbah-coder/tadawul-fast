@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* tests/test_gas_s1_dispatch_p170b.js
- * Harness for apps_script/24_Sync_Dispatch.gs v1.1.0 [P-170b S-1 LANE DISPATCH].
+ * Harness for apps_script/24_Sync_Dispatch.gs v1.1.0 [P-170b S-1 LANE DISPATCH], re-pinned on v1.2.0.
  * Loads the REAL .gs source into a vm context whose only additions are stubs of
  * the Apps Script services (PropertiesService, UrlFetchApp, SpreadsheetApp,
  * ScriptApp, Logger) and an injectable clock (tfbSdNowMs_ overridden per test).
@@ -77,6 +77,11 @@ function T(name, cond, detail) {
   out.push(line);
   if (!cond) { fails++; }
 }
+// v1.2.0: trigger handlers throw on FAILED; returns the error text, or
+// 'NO-THROW:<result>' so a handler that stopped throwing fails its test.
+function raises(fn) {
+  try { return 'NO-THROW:' + fn(); } catch (e) { return String(e && e.message); }
+}
 function noTokenLeak(world, label) {
   const hay = JSON.stringify(world.logRows) + JSON.stringify(world.logger) + JSON.stringify(world.props['TFB_SYNC_DISPATCH_LAST_EVENT'] || '');
   T(label + ' token never leaks', hay.indexOf(TOKEN) === -1);
@@ -89,7 +94,7 @@ function run() {
     const w = makeWorld({});
     const v = w.ctx.tfbSyncDispatchSelfTest();
     T('S1 selftest both batteries', v === 'sync dispatch core: ok | s1 lane core: ok', v);
-    T('S1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.1.0');
+    T('S1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.2.0');
     T('S1 v1.0.0 surface present', ['tfbDispatchDailySync', 'tfbDispatchDailySyncNow', 'tfbSyncDispatchProbe', 'tfbInstallSyncDispatchTriggers', 'tfbRemoveSyncDispatchTriggers', 'tfbSyncDispatchStatus', 'tfbSdDecide_', 'tfbSdBuildDispatchRequest_'].every((f) => typeof w.ctx[f] === 'function'));
   }
   // S2 board dispatch at 08:10 Riyadh: stale board (yesterday) -> POST with dry_run=false, no run_mode, Page=shadow_board.yml
@@ -101,7 +106,7 @@ function run() {
     const p = payload(w, 0);
     T('S2 board payload dry_run=false and NO run_mode', p.ref === 'main' && p.inputs.dry_run === 'false' && p.inputs.run_mode === undefined, JSON.stringify(p));
     T('S2 board row', w.logRows.length === 1 && w.logRows[0][2] === 'tfbDispatchShadowBoard' && w.logRows[0][3] === 'shadow_board.yml' && w.logRows[0][4] === 'OK' && w.logRows[0][7] === 204, JSON.stringify(w.logRows[0].slice(1, 8)));
-    T('S2 board row age + version', /"board_asof_age_min":587/.test(String(w.logRows[0][9])) && /"version":"1.1.0"/.test(String(w.logRows[0][9])), String(w.logRows[0][9]).slice(0, 160));
+    T('S2 board row age + version', /"board_asof_age_min":587/.test(String(w.logRows[0][9])) && /"version":"1.2.0"/.test(String(w.logRows[0][9])), String(w.logRows[0][9]).slice(0, 160));
     T('S2 SB LAST_OK set, sync LAST_OK untouched', /^\d{13}$/.test(String(w.props.TFB_SB_DISPATCH_LAST_OK_MS || '')) && !w.props.TFB_SYNC_DISPATCH_LAST_OK_MS);
     noTokenLeak(w, 'S2');
     // second call within 60 min -> min_gap; manual Now -> forced
@@ -153,8 +158,9 @@ function run() {
   // S5 no token / kill switches
   {
     const w = makeWorld({ props: {} });
-    T('S5 board no token', w.ctx.tfbDispatchShadowBoard() === 'FAILED:no_token' && w.logRows[0][1] === 'ERROR' && w.logRows[0][3] === 'shadow_board.yml');
-    T('S5 scorer no token', w.ctx.tfbDispatchShadowScorer() === 'FAILED:no_token' && w.fetches.length === 0);
+    T('S5 board no token throws', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchShadowBoard FAILED:no_token/.test(raises(() => w.ctx.tfbDispatchShadowBoard())) && w.logRows[0][1] === 'ERROR' && w.logRows[0][3] === 'shadow_board.yml');
+    T('S5 scorer no token throws', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchShadowScorer FAILED:no_token/.test(raises(() => w.ctx.tfbDispatchShadowScorer())) && w.fetches.length === 0);
+    T('S5 manual Now still returns', w.ctx.tfbDispatchShadowBoardNow() === 'FAILED:no_token');
     T('S5 probe no token', w.ctx.tfbS1DispatchProbe() === 'shadow_board=FAILED:no_token | shadow_scorer=FAILED:no_token' && w.fetches.length === 0);
     const w2 = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN, TFB_SYNC_DISPATCH_DISABLED: '1' } });
     T('S5 global kill', w2.ctx.tfbDispatchShadowBoard() === 'SKIPPED:disabled' && w2.ctx.tfbDispatchShadowScorerNow() === 'SKIPPED:disabled' && w2.fetches.length === 0);
@@ -166,11 +172,11 @@ function run() {
   // S6 GitHub 422 (bad inputs) -> FAILED:422, no LAST_OK, token redacted; fetch throws -> FAILED:-1
   {
     const w = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, fetchCode: 422, fetchBody: '{"message":"Unexpected inputs provided ' + TOKEN + '"}' });
-    const r = w.ctx.tfbDispatchShadowScorer();
-    T('S6 422 result', r === 'FAILED:422' && !w.props.TFB_S1_DISPATCH_LAST_OK_MS && w.logRows[0][4] === 'FAILED' && w.logRows[0][7] === 422, r);
+    const r = raises(() => w.ctx.tfbDispatchShadowScorer());
+    T('S6 422 throws', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchShadowScorer FAILED:422 - nothing was dispatched/.test(r) && r.indexOf(TOKEN) === -1 && !w.props.TFB_S1_DISPATCH_LAST_OK_MS && w.logRows[0][4] === 'FAILED' && w.logRows[0][7] === 422, r);
     noTokenLeak(w, 'S6');
     const w2 = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, fetchThrow: 'DNS error ' + TOKEN, boardAsOf: '2026-09-29 22:23' });
-    T('S6 fetch throws -> FAILED:-1', w2.ctx.tfbDispatchShadowBoard() === 'FAILED:-1');
+    T('S6 fetch throws -> FAILED:-1 raised', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchShadowBoard FAILED:-1 - dispatch NOT CONFIRMED/.test(raises(() => w2.ctx.tfbDispatchShadowBoard())));
     noTokenLeak(w2, 'S6b');
   }
   // S7 probe 200 for both lanes (GET, no dispatch)
@@ -204,14 +210,14 @@ function run() {
     const w2 = makeWorld({ props: { TFB_SB_DISPATCH_HOURS: '9', TFB_SB_DISPATCH_MINUTE: '5', TFB_S1_DISPATCH_HOURS: '19', TFB_S1_DISPATCH_MINUTE: '0' } });
     T('S8 custom props', w2.ctx.tfbInstallS1DispatchTriggers() === 'OK:shadow_board:hours=9:minute=5:removed=0 | shadow_scorer:hours=19:minute=0:removed=0');
   }
-  // S9 v1.0.0 daily_sync path byte-behavior: payload still {run_mode}, Page daily_sync.yml, status line unchanged shape
+  // S9 daily_sync path: v1.2.0 payload {run_mode, include_portfolio, record_tracker}, Page daily_sync.yml, status line unchanged shape
   {
     const w = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, gmStamp: '2026-09-30 02:00:00+03:00', nowMs: Date.parse('2026-09-30T03:15:00Z') });
     const r = w.ctx.tfbDispatchDailySync();
     T('S9 daily_sync dispatch', r === 'OK:204' && /daily_sync\.yml\/dispatches$/.test(w.fetches[0].url), r);
-    T('S9 daily_sync payload unchanged', JSON.stringify(payload(w, 0)) === JSON.stringify({ ref: 'main', inputs: { run_mode: 'full_sync' } }), JSON.stringify(payload(w, 0)));
+    T('S9 daily_sync payload v1.2.0', JSON.stringify(payload(w, 0)) === JSON.stringify({ ref: 'main', inputs: { run_mode: 'full_sync', include_portfolio: 'true', record_tracker: 'true' } }), JSON.stringify(payload(w, 0)));
     T('S9 daily_sync row Page', w.logRows[0][3] === 'daily_sync.yml' && w.logRows[0][2] === 'tfbDispatchDailySync');
-    T('S9 v1.0.0 status still renders', /^SYNC-DISPATCH v1\.1\.0 \| token=present/.test(w.ctx.tfbSyncDispatchStatus()));
+    T('S9 v1.0.0 status still renders', /^SYNC-DISPATCH v1\.2\.0 \| token=present/.test(w.ctx.tfbSyncDispatchStatus()));
   }
 }
 

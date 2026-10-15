@@ -78,3 +78,29 @@ def test_daily_actual_step_gate_skips_manual_false_before_any_tracker_call(wrapp
                              text=True, capture_output=True, check=False)
         assert run.returncode == 0, run.stdout + run.stderr
     assert (root / 'actual_tracker_call.json').exists() is should_run
+
+
+@pytest.mark.parametrize('event,choice,record,should_run', (
+    ('workflow_dispatch', 'false', 'true', True), ('workflow_dispatch', 'false', 'false', False),
+    ('workflow_dispatch', 'false', '', False), ('workflow_dispatch', 'true', 'true', True),
+    ('schedule', '', '', True),
+))
+def test_dispatcher_record_tracker_input_records_without_historical_audit(wrapper_repo, event, choice, record, should_run):
+    # P-170c: the Apps Script dispatcher sends record_tracker="true" (run_tracker
+    # keeps its "false" default), so its full_sync records like a scheduled run
+    # but never opts into the historical audit.
+    root, env = wrapper_repo
+    item = step('daily_sync.yml', 'Track Performance (record + audit)')
+    condition = item['if'].removeprefix('${{').removesuffix('}}').strip()
+    allowed = accepts(condition, event=event, run_tracker=choice, record_tracker=record)
+    assert allowed is should_run
+    if allowed:
+        body = item['run'].replace('/tmp/track_performance.log', str(root / 'daily_tracker.log'))
+        run = subprocess.run(['bash', '-c', body], cwd=root,
+                             env=env | {'GITHUB_EVENT_NAME': event, 'INPUT_RUN_TRACKER': choice},
+                             text=True, capture_output=True, check=False)
+        assert run.returncode == 0, run.stdout + run.stderr
+        actual = json.loads((root / 'actual_tracker_call.json').read_text())
+        assert '--record' in actual['args']
+        assert ('--audit' in actual['args']) is (event == 'workflow_dispatch' and choice == 'true')
+    assert (root / 'actual_tracker_call.json').exists() is should_run

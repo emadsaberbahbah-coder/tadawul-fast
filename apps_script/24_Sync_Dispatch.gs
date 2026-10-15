@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
+// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.2.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
 //
 // Purpose
 // -------
@@ -6,6 +6,34 @@
 // sync) from a time-driven Apps Script trigger, so the morning sync starts ON
 // THE MINUTE instead of whenever GitHub gets round to a schedule event.
 //
+// -----------------------------------------------------------------------------
+// v1.2.0 (2026-10-15, One-Pass Script - P-170c ARMING PRECONDITIONS)
+// WHY: the dispatcher has never fired - TFB_GH_DISPATCH_TOKEN was never created
+//   and every trigger since 2026-09-30 logged "dispatch failed: no_token". The
+//   handlers RETURNED that string, so Apps Script recorded each trigger as a
+//   success and sent no failure email: a 15-day outage visible only in
+//   _Run_Log. The same path hides a 401 (expired 90-day PAT) or a 422. Review
+//   of the arming plan (PR #781) also found the dispatched morning sync is not
+//   equivalent to the 04:17Z scheduled run it replaces: daily_sync.yml adds
+//   MY_PORTFOLIO and runs the Track Performance record only for `schedule`
+//   events, so a run_mode-only dispatch skipped both.
+// WHAT:
+//   * The three TRIGGER handlers (tfbDispatchDailySync, tfbDispatchShadowBoard,
+//     tfbDispatchShadowScorer) now THROW on any FAILED outcome (no_token, any
+//     non-204 HTTP, fetch exception) AFTER writing the usual ERROR _Run_Log
+//     row, so the trigger execution fails and Apps Script notifies the owner.
+//     SKIPPED outcomes (kill switch, min gap, fresh page, hold, before-slot)
+//     and OK still return normally. Manual *Now functions, probes, installers
+//     and status keep returning strings for the editor.
+//   * The daily_sync payload adds include_portfolio="true" (existing input,
+//     daily_sync.yml step "Resolve Configuration") and record_tracker="true"
+//     (new input, record-only tracker; never the historical audit, which stays
+//     behind run_tracker). ORDER: daily_sync.yml must define record_tracker on
+//     main BEFORE this file is pasted, or GitHub answers 422 "Unexpected
+//     inputs" (which now fails the trigger loudly).
+//   COMPANION and COEXISTENCE notes below: done in PR #781 (P-170b, 2026-10-15)
+//   - daily_sync cron "17 12,20", shadow_board crons removed, shadow_scorer
+//   gained a non-cancelling concurrency lease.
 // -----------------------------------------------------------------------------
 // v1.1.0 (2026-09-30, One-Pass Script - P-170b S-1 LANE DISPATCH)
 // WHY (measured 2026-09-30 from _Run_Log, the Actions run pages and the
@@ -109,7 +137,7 @@
 //   and drop the schedule block entirely.
 // ES5 only (file is loaded by the classic runtime path); no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_SYNC_DISPATCH_VERSION = '1.1.0';
+var TFB_SYNC_DISPATCH_VERSION = '1.2.0';
 
 var TFB_SYNC_DISPATCH_ = Object.freeze({
   PROP_TOKEN: 'TFB_GH_DISPATCH_TOKEN',
@@ -132,6 +160,9 @@ var TFB_SYNC_DISPATCH_ = Object.freeze({
   DEFAULT_FRESH_SKIP_MIN: 90,
   HOLD_CEILING_MS: 16 * 60 * 1000,
   RUN_MODE: 'full_sync',
+  // v1.2.0: a dispatched full_sync must do what the scheduled run did.
+  INCLUDE_PORTFOLIO: 'true',
+  RECORD_TRACKER: 'true',
   HANDLER: 'tfbDispatchDailySync',
   TIMEZONE: 'Asia/Riyadh',
   API_BASE: 'https://api.github.com',
@@ -242,10 +273,34 @@ function tfbSdDecide_(inp) {
   return { dispatch: true, reason: i.force ? 'forced' : 'ok' };
 }
 
+// v1.2.0: inputs for the daily_sync dispatch (every key must be a declared
+// workflow_dispatch input of daily_sync.yml, or GitHub answers 422).
+function tfbSdDispatchInputs_() {
+  var C = TFB_SYNC_DISPATCH_;
+  return { run_mode: C.RUN_MODE, include_portfolio: C.INCLUDE_PORTFOLIO, record_tracker: C.RECORD_TRACKER };
+}
+
+// v1.2.0: a trigger handler must FAIL (throw) when the dispatch failed, so the
+// Apps Script trigger records a failure and emails the owner. The _Run_Log row
+// is already written by then; the message carries no token. A fetch exception
+// (-1) or a 5xx may come AFTER GitHub queued the run, so those say "not
+// confirmed" - a blind tfbDispatchDailySyncNow could double the production run.
+function tfbSdRaiseIfFailed_(action, result) {
+  var r = String(result);
+  if (r.indexOf('FAILED') === 0) {
+    var code = parseInt(r.split(':')[1], 10);
+    var unsure = code === -1 || (code >= 500 && code <= 599);
+    throw new Error('[SYNC-DISPATCH v' + TFB_SYNC_DISPATCH_VERSION + '] ' + action + ' ' + r +
+      (unsure ? ' - dispatch NOT CONFIRMED; check the Actions runs before re-dispatching'
+              : ' - nothing was dispatched') + '; see _Run_Log');
+  }
+  return result;
+}
+
 function tfbSdBuildDispatchRequest_(repo, workflow, ref, token) {
   var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
     '/actions/workflows/' + encodeURIComponent(workflow) + '/dispatches';
-  var payload = { ref: ref, inputs: { run_mode: TFB_SYNC_DISPATCH_.RUN_MODE } };
+  var payload = { ref: ref, inputs: tfbSdDispatchInputs_() };
   var options = {
     method: 'post',
     contentType: 'application/json',
@@ -452,7 +507,7 @@ function tfbSdDispatch_(force) {
   if (code === 204) {
     try { tfbSdProps_().setProperty(C.PROP_LAST_OK_MS, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
     ctx.http = 204;
-    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE, req.url, 204, dur, ctx, cfg.token);
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(tfbSdDispatchInputs_()), req.url, 204, dur, ctx, cfg.token);
     return 'OK:204';
   }
   ctx.http = code;
@@ -461,9 +516,10 @@ function tfbSdDispatch_(force) {
   return 'FAILED:' + code;
 }
 
-// Trigger handler (installed by tfbInstallSyncDispatchTriggers)
+// Trigger handler (installed by tfbInstallSyncDispatchTriggers). v1.2.0:
+// throws on FAILED so the trigger execution fails and the owner is notified.
 function tfbDispatchDailySync() {
-  return tfbSdDispatch_(false);
+  return tfbSdRaiseIfFailed_(TFB_SYNC_DISPATCH_.HANDLER, tfbSdDispatch_(false));
 }
 
 // Manual: bypasses the min-gap and fresh-page guards (NOT the kill switch,
@@ -629,6 +685,15 @@ function tfbSyncDispatchSelfTest() {
   ok(rq.options.method === 'post' && rq.options.muteHttpExceptions === true, 'dispatch method');
   var pl = JSON.parse(rq.options.payload);
   ok(pl.ref === 'main' && pl.inputs && pl.inputs.run_mode === 'full_sync', 'dispatch payload');
+  ok(pl.inputs.include_portfolio === 'true' && pl.inputs.record_tracker === 'true' && pl.inputs.run_tracker === undefined, 'dispatch payload v1.2.0 inputs');
+  // T4b v1.2.0 trigger failure surfacing
+  var raised = '';
+  try { tfbSdRaiseIfFailed_('h', 'FAILED:no_token'); } catch (eR) { raised = String(eR && eR.message); }
+  ok(raised.indexOf('h FAILED:no_token') !== -1 && raised.indexOf('nothing was dispatched') !== -1, 'raise on FAILED');
+  var unsure = '';
+  try { tfbSdRaiseIfFailed_('h', 'FAILED:-1'); } catch (eU) { unsure = String(eU && eU.message); }
+  ok(unsure.indexOf('NOT CONFIRMED') !== -1 && unsure.indexOf('nothing was dispatched') === -1, 'raise -1 says not confirmed');
+  ok(tfbSdRaiseIfFailed_('h', 'OK:204') === 'OK:204' && tfbSdRaiseIfFailed_('h', 'SKIPPED:min_gap') === 'SKIPPED:min_gap', 'no raise on OK/SKIPPED');
   ok(rq.options.headers.Authorization === 'Bearer tok_ABCDEFG' && rq.options.headers['X-GitHub-Api-Version'] === '2022-11-28', 'dispatch headers');
   var pr = tfbSdBuildProbeRequest_('o/r', 'daily_sync.yml', 'tok_ABCDEFG');
   ok(pr.url === 'https://api.github.com/repos/o/r/actions/workflows/daily_sync.yml' && pr.options.method === 'get', 'probe request');
@@ -871,13 +936,14 @@ function tfbS1Dispatch_(laneKey, force) {
   return 'FAILED:' + code;
 }
 
-// Trigger handlers (installed by tfbInstallS1DispatchTriggers)
+// Trigger handlers (installed by tfbInstallS1DispatchTriggers). v1.2.0: throw
+// on FAILED, like tfbDispatchDailySync.
 function tfbDispatchShadowBoard() {
-  return tfbS1Dispatch_('shadow_board', false);
+  return tfbSdRaiseIfFailed_('tfbDispatchShadowBoard', tfbS1Dispatch_('shadow_board', false));
 }
 
 function tfbDispatchShadowScorer() {
-  return tfbS1Dispatch_('shadow_scorer', false);
+  return tfbSdRaiseIfFailed_('tfbDispatchShadowScorer', tfbS1Dispatch_('shadow_scorer', false));
 }
 
 // Manual variants: bypass min-gap and board-fresh (NOT kill switches, token

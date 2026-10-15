@@ -198,13 +198,14 @@ def step_condition(name):
 
 
 def accepts(condition, *, success=True, group="global-markets", has_keys="true", mode="full_sync",
-            event="schedule", run_tracker=""):
+            event="schedule", run_tracker="", record_tracker=""):
     # Evaluate only the small boolean Actions expression actually in the file.
     # Unknown variables/operators fail this offline boundary rather than being
     # silently treated as an allowed write.
     values = {"success()": success, "matrix.group": group,
               "steps.scope_keys.outputs.has_keys": has_keys, "env.RUN_MODE": mode,
-              "github.event_name": event, "github.event.inputs.run_tracker": run_tracker}
+              "github.event_name": event, "github.event.inputs.run_tracker": run_tracker,
+              "github.event.inputs.record_tracker": record_tracker}
     for token, value in values.items():
         condition = condition.replace(token, repr(value))
     condition = condition.replace("&&", " and ").replace("||", " or ")
