@@ -109,11 +109,15 @@ line that fired into each _Run_Log Details JSON.
   * no event (rows written before v6.69.1): measured against --cron, default
     "17 4,12,20" = the schedule those rows ran under (env TFB_AUDIT_CRON;
     blank = default). --cron accepts several "minute hours" groups (";").
-Runs are split where the run id changes (back-to-back runs under one lease),
-a run that started before the window is dropped rather than measured from its
-middle, and an accepted dispatch with no run after 180 min is reported (WARN
-at least). An export with no provenance and no dispatcher rows gives
-byte-identical findings, metrics and params.
+With provenance, runs are split where the run id changes (back-to-back runs
+under one lease) and every piece of one run id is merged (recovery, re-runs);
+only daily_sync.yml runs are measured ("workflow" key; page_refresh_recovery
+and sync_outcome_audit also run the sync script); a run that started before
+the window still claims its dispatch but is not reported; a known cron run is
+reported however late; an accepted dispatch with no run after 180 min is
+reported (WARN at least). An export with no provenance at all (written before
+run_dashboard_sync v6.69.1) takes the v1.2.0 clustering verbatim, so its
+findings, metrics and params are byte-identical.
 """
 from __future__ import annotations
 
@@ -1194,7 +1198,7 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     quota, quota_limits = {}, {}
     rows402 = 0
     refusals = 0
-    sync_rows = []   # (ts, run id, event, cron line) for run_dashboard_sync rows (P-170c)
+    sync_rows = []   # (ts, run id, event, cron line, workflow) for run_dashboard_sync rows (P-170c)
     dispatches = []  # (ts, kind) for daily_sync dispatches that may have started a run
     last_ts = None   # the newest _Run_Log timestamp: the export's own "now"
     for r in rows[1:]:
@@ -1234,28 +1238,60 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
             rid = (re.search(r"run=(\d+)", msg) or re.search(r'"run_id":\s*"?(\d+)', details) or [None, None])[1]
             ev = re.search(r'"event":\s*"([a-z_]+)"', details)
             cr = re.search(r'"schedule":\s*"([^"]+)"', details)
-            sync_rows.append((ts, rid, ev.group(1) if ev else "", cr.group(1) if cr else ""))
-    # A run = a cluster of sync rows with no gap > 90 min, split where the run id changes
-    # (back-to-back runs queue under one lease) and kept whole across a long gap when the
-    # run id is the same (recovery); the first row of a run rarely carries the run id.
-    # A run that started before the window is dropped, not measured mid-run.
-    runs = []
-    cur = None
-    for ts, rid, ev, cr in sorted(sync_rows, key=lambda x: x[0]):
-        same_run = bool(rid) and rid == (cur or {}).get("rid")
-        if cur and not same_run and ((ts - cur["last"]).total_seconds() > 90 * 60
-                                     or (rid and cur["rid"] and rid != cur["rid"])):
-            runs.append(cur)
-            cur = None
-        if cur is None:
-            cur = {"start": ts, "last": ts, "rid": None, "event": "", "cron": ""}
-        cur["last"] = ts
-        cur["rid"] = cur["rid"] or rid
-        cur["event"] = cur["event"] or ev
-        cur["cron"] = cur["cron"] or cr
-    if cur:
-        runs.append(cur)
-    runs = [run for run in runs if run["start"] >= since]
+            wf = re.search(r'"workflow":\s*"([^"]+)"', details)
+            sync_rows.append((ts, rid, ev.group(1) if ev else "", cr.group(1) if cr else "",
+                              wf.group(1) if wf else ""))
+    provenance = any(ev for _, _, ev, _, _ in sync_rows)
+    if provenance:
+        # P-170c: pieces = clusters of sync rows with no gap > 90 min, split where the run
+        # id changes (back-to-back runs queue under one lease); then every piece of one run
+        # id is merged into its first piece wherever it lies (recovery, re-run after a gap).
+        # Only daily_sync.yml runs are measured (page_refresh_recovery and sync_outcome_audit
+        # also run run_dashboard_sync); rows without a workflow key are kept.
+        pieces = []
+        cur = None
+        for ts, rid, ev, cr, wf in sorted(sync_rows, key=lambda x: x[0]):
+            if cur and ((ts - cur["last"]).total_seconds() > 90 * 60
+                        or (rid and cur["rid"] and rid != cur["rid"])):
+                pieces.append(cur)
+                cur = None
+            if cur is None:
+                cur = {"start": ts, "last": ts, "rid": None, "event": "", "cron": "", "wf": ""}
+            cur["last"] = ts
+            cur["rid"] = cur["rid"] or rid
+            cur["event"] = cur["event"] or ev
+            cur["cron"] = cur["cron"] or cr
+            cur["wf"] = cur["wf"] or wf
+        if cur:
+            pieces.append(cur)
+        runs, first = [], {}
+        for piece in pieces:
+            head = first.get(piece["rid"]) if piece["rid"] else None
+            if head is None:
+                runs.append(piece)
+                if piece["rid"]:
+                    first[piece["rid"]] = piece
+                continue
+            head["start"] = min(head["start"], piece["start"])
+            head["last"] = max(head["last"], piece["last"])
+            for k in ("event", "cron", "wf"):
+                head[k] = head[k] or piece[k]
+        runs = [run for run in runs if not run["wf"] or run["wf"] == "daily_sync.yml"]
+    else:
+        # No provenance anywhere (rows written before run_dashboard_sync v6.69.1): the v1.2.0
+        # clustering verbatim, so a legacy export gives byte-identical findings.
+        run_first = {}
+        cluster, cid = [], None
+        for ts, rid, _ev, _cr, _wf in sorted((r for r in sync_rows if r[0] >= since), key=lambda x: x[0]):
+            if cluster and (ts - cluster[-1]).total_seconds() > 90 * 60:
+                run_first[cid or f"run@{cluster[0]:%m-%dT%H:%MZ}"] = cluster[0]
+                cluster, cid = [], None
+            cluster.append(ts)
+            cid = cid or rid
+        if cluster:
+            run_first[cid or f"run@{cluster[0]:%m-%dT%H:%MZ}"] = cluster[0]
+        runs = [{"key": k, "start": v, "last": v, "rid": None, "event": "", "cron": "", "wf": ""}
+                for k, v in run_first.items()]
     metrics.update(run_log_rows=len(rows) - 1, run_log_recent=len(recent), levels=dict(levels))
     out.append(F("e", "PIPELINE", "run_log_errors", "PASS" if not errors else "WARN", sum(errors.values()),
                  f"ERROR/CRITICAL rows in the last {since_days} days",
@@ -1304,7 +1340,10 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     used = set()
     dispatched = 0
     for run in sorted(runs, key=lambda x: x["start"]):
-        rid, start = run["rid"] or f"run@{run['start']:%m-%dT%H:%MZ}", run["start"]
+        rid = run.get("key") or run["rid"] or f"run@{run['start']:%m-%dT%H:%MZ}"
+        start = run["start"]
+        in_window = start >= since       # earlier runs still claim their dispatch, unreported
+        cap = True
         if run["event"] == "workflow_dispatch":
             # Measured from the latest unclaimed dispatcher row before it; none = a person
             # dispatched it from GitHub, which no slot or dispatch row describes.
@@ -1314,9 +1353,14 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
                 continue
             d_ts, kind = max(cands)
             used.add((d_ts, kind))
+            if not in_window:
+                continue
             dispatched += 1
             planned, label = d_ts, f"{kind} {d_ts:%m-%d %H:%M}Z"
         else:
+            if not in_window:
+                continue
+            cap = run["event"] != "schedule"   # a known cron run is reported however late
             run_slots = slots
             if run["event"] == "schedule" and run["cron"]:
                 try:
@@ -1328,13 +1372,14 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
                 continue
             label = f"slot {planned:%m-%d %H:%M}Z"
         mins = int((start - planned).total_seconds() // 60)
-        if mins > ATTRIBUTION_MAX_MIN:
+        if cap and mins > ATTRIBUTION_MAX_MIN:
             continue  # not attributable to a slot (manual dispatch)
         worst = max(worst, mins)
         late.append(f"run {rid}: {label} started {start:%H:%M}Z, +{mins // 60}h{mins % 60:02d}m")
     # An accepted dispatch that never produced a run is a missed slot, not silence.
-    orphans = [d for d in dispatches if d not in used and d[1] != "unconfirmed dispatch" and d[0] >= since
-               and last_ts is not None and (last_ts - d[0]).total_seconds() > DISPATCH_PENDING_MIN * 60]
+    orphans = [d for d in dispatches if provenance and d not in used and d[1] != "unconfirmed dispatch"
+               and d[0] >= since and last_ts is not None
+               and (last_ts - d[0]).total_seconds() > DISPATCH_PENDING_MIN * 60]
     for d_ts, kind in orphans:
         late.append(f"{kind} {d_ts:%m-%d %H:%M}Z accepted, no sync run recorded")
     metrics["schedule_worst_lateness_min"] = worst
