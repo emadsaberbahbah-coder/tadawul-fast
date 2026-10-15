@@ -235,7 +235,7 @@ def test_p10_workflow_wiring():
 
 def test_p11_backup_local_copy_flag_default():
     from scripts import backup_workbook as bw
-    assert bw.__version__ == "1.5.0"
+    assert bw.__version__ == "1.6.0"
     with tempfile.TemporaryDirectory() as tmp:
         old = os.environ.pop("TFB_BACKUP_LOCAL_COPY", None)
         try:

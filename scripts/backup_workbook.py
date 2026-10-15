@@ -72,6 +72,10 @@ USAGE
                                                       #   newest daily, open it,
                                                       #   assert core tabs, log
     python scripts/backup_workbook.py --selftest      # offline logic harness
+    python scripts/backup_workbook.py --attach dq_scorecard.md dq_report.json
+                                                      # v1.6.0: upload-only;
+                                                      #   small reports beside
+                                                      #   the backups, dated
 ================================================================================
 """
 from __future__ import annotations
@@ -89,7 +93,38 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
+# v1.6.0 (2026-10-15) — --attach: PUBLISH SMALL REPORTS BESIDE THE BACKUPS.
+# WHY: the nightly DQ audit (tfb_workbook_dq_audit.py, DQ-01..DQ-75) writes
+# dq_scorecard.md / dq_report.json / dq_activation_receipt.json, but they only
+# reach a 30-day GitHub artifact and the step summary, both behind a GitHub
+# sign-in, so the morning data-quality review is still done by hand from an
+# exported workbook. The same job already writes the workbook to the
+# operator's PRIVATE backup folder; the scorecard belongs next to it. It is
+# NOT committed to the repository: the repo is public and the scorecard names
+# symbols, counts and portfolio-state checks.
+# WHAT: `--attach PATH [PATH ...]` is an UPLOAD-ONLY mode (no export, no
+# workbook upload, no monthly copy). It resolves the destination exactly as
+# run_backup does (TFB_BACKUP_DEST / TFB_BACKUP_FOLDER_ID / the OAuth app
+# folder, via _backup_dest, _credentials, _oauth_session,
+# drive_ensure_app_folder — the run_restore_test composition) and uploads each
+# file as DAILY_TFB_<Label>_<YYYY-MM-DD><ext> (Riyadh date, the daily_name
+# convention), e.g. dq_scorecard.md -> DAILY_TFB_DQ_Scorecard_2026-10-15.md.
+# A same-name file from an earlier run that day is replaced, and each report
+# kind is pruned with plan_pruning to TFB_BACKUP_KEEP_DAILY (default 30).
+# Missing paths are skipped with a NOTE and never fail the run. GUARDS: only
+# .md / .json / .txt; never a zip/xlsx payload, the TFB_BACKUP_LOCAL_COPY
+# export, the GOOGLE_APPLICATION_CREDENTIALS file, or anything carrying a
+# private key / client secret / refresh token; 20 MB cap. Exit: 0 = done
+# (including nothing to upload), 2 = setup failure or a refused path,
+# 3 = an upload failed. One _Run_Log row "[BACKUP-ATTACH vX]".
+# ADDITIVE: drive_upload_resumable / gcs_upload_resumable / _store_upload
+# gain an optional `mime` (default the xlsx type, so the workbook upload is
+# byte-identical) and plan_pruning gains optional name patterns (default the
+# workbook patterns). Without --attach every mode, line and exit code is
+# unchanged. ROLLBACK: revert this file (the workflow step is
+# continue-on-error and skips cleanly).
+#
 # v1.5.0 (2026-10-11) [WP-0] — ENV-GATED LOCAL COPY OF THE EXPORTED BYTES.
 # WHY: the WP-0 DQ harness (scripts/tfb_workbook_dq_audit.py) must measure
 # the SAME bytes this job just exported, in the SAME job, without a second
@@ -240,6 +275,13 @@ _DAILY_RE = re.compile(r"^DAILY_TFB_Workbook_(\d{4}-\d{2}-\d{2})\.xlsx$")
 _MONTHLY_RE = re.compile(r"^MONTHLY_TFB_Workbook_(\d{4}-\d{2})\.xlsx$")
 _CORE_TABS = {"_Status", "_Run_Log", "Top_10_Investments",
               "_Portfolio_CostBasis", "My_Portfolio", "Shadow_History"}
+# v1.6.0 --attach: small text reports only.
+_ATTACH_MIME = {".md": "text/markdown", ".json": "application/json",
+                ".txt": "text/plain"}
+_ATTACH_MAX_BYTES = 20_000_000
+_ATTACH_SECRET_MARKERS = (b'"private_key"', b'"client_secret"',
+                          b'"refresh_token"', b"-----BEGIN ")
+_ATTACH_UPPER = {"dq", "pf", "tfb", "kpi", "roi", "s1"}
 
 
 def _out(msg: str) -> None:
@@ -301,13 +343,17 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def plan_pruning(names: List[str], keep_daily: int, keep_monthly: int
+def plan_pruning(names: List[str], keep_daily: int, keep_monthly: int,
+                 daily_re=None, monthly_re=None
                  ) -> Tuple[List[str], List[str]]:
     """(keep, delete) over folder file NAMES. Newest-by-embedded-date wins;
     anything not matching either pattern is LEFT ALONE (never delete a file
-    this script did not name)."""
-    dailies = sorted((n for n in names if _DAILY_RE.match(n)), reverse=True)
-    monthlies = sorted((n for n in names if _MONTHLY_RE.match(n)), reverse=True)
+    this script did not name). v1.6.0: the patterns default to the workbook's
+    (unchanged behaviour); --attach passes one pair per report kind."""
+    daily_re = daily_re or _DAILY_RE
+    monthly_re = monthly_re or _MONTHLY_RE
+    dailies = sorted((n for n in names if daily_re.match(n)), reverse=True)
+    monthlies = sorted((n for n in names if monthly_re.match(n)), reverse=True)
     keep = dailies[:keep_daily] + monthlies[:keep_monthly]
     delete = dailies[keep_daily:] + monthlies[keep_monthly:]
     return keep, delete
@@ -317,6 +363,52 @@ def monthly_needed(today: _dt.date, existing_names: List[str]) -> bool:
     """A MONTHLY_ copy is due when none exists yet for today's month."""
     want = monthly_name(today)
     return want not in set(existing_names)
+
+
+def attach_label(path: str) -> str:
+    """v1.6.0: 'dq_activation_receipt.json' -> 'DQ_Activation_Receipt'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", stem) if p]
+    return "_".join(p.upper() if p.lower() in _ATTACH_UPPER else p.capitalize()
+                    for p in parts) or "Report"
+
+
+def attach_name(path: str, d: _dt.date) -> str:
+    """v1.6.0: the daily_name convention for a report, e.g.
+    DAILY_TFB_DQ_Scorecard_2026-10-15.md (Riyadh date, sorts with the xlsx)."""
+    return (f"DAILY_TFB_{attach_label(path)}_{d.isoformat()}"
+            f"{os.path.splitext(path)[1].lower()}")
+
+
+def attach_patterns(path: str):
+    """v1.6.0: (daily_re, monthly_re) naming exactly one report kind, for
+    plan_pruning. No MONTHLY_ copies are made for reports; the pattern exists
+    so plan_pruning's policy applies unchanged."""
+    label = re.escape(attach_label(path))
+    ext = re.escape(os.path.splitext(path)[1].lower())
+    return (re.compile(rf"^DAILY_TFB_{label}_(\d{{4}}-\d{{2}}-\d{{2}}){ext}$"),
+            re.compile(rf"^MONTHLY_TFB_{label}_(\d{{4}}-\d{{2}}){ext}$"))
+
+
+def attach_refusal(path: str, data: bytes) -> str:
+    """v1.6.0: why `path` must NOT be uploaded by --attach ('' = allowed).
+    Never the workbook export, never a credential."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _ATTACH_MIME:
+        return f"extension {ext or '(none)'} not in {sorted(_ATTACH_MIME)}"
+    real = os.path.realpath(path)
+    for var in ("TFB_BACKUP_LOCAL_COPY", "GOOGLE_APPLICATION_CREDENTIALS"):
+        other = _env(var)
+        if other and os.path.realpath(other) == real:
+            return f"is the {var} file"
+    if data[:4] == b"PK\x03\x04":
+        return "zip/xlsx payload"
+    if len(data) > _ATTACH_MAX_BYTES:
+        return f"{len(data):,} bytes > {_ATTACH_MAX_BYTES:,} cap"
+    hits = [m.decode() for m in _ATTACH_SECRET_MARKERS if m in data]
+    if hits:
+        return "looks like a credential (" + ", ".join(hits) + ")"
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -566,13 +658,14 @@ def drive_list(sess, folder_id: str) -> List[Dict[str, Any]]:
 
 
 def drive_upload_resumable(sess, folder_id: str, name: str,
-                           data: bytes) -> Dict[str, Any]:
+                           data: bytes, mime: str = _XLSX_MIME
+                           ) -> Dict[str, Any]:
     meta = {"name": name, "parents": [folder_id]}
     r = sess.post(
         "https://www.googleapis.com/upload/drive/v3/files"
         "?uploadType=resumable&supportsAllDrives=true",
         json=meta,
-        headers={"X-Upload-Content-Type": _XLSX_MIME,
+        headers={"X-Upload-Content-Type": mime,
                  "X-Upload-Content-Length": str(len(data))},
         timeout=60)
     r.raise_for_status()
@@ -580,7 +673,7 @@ def drive_upload_resumable(sess, folder_id: str, name: str,
     if not loc:
         raise RuntimeError("resumable upload: no session Location header")
     r2 = sess.put(loc, data=data,
-                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
+                  headers={"Content-Type": mime}, timeout=600)
     r2.raise_for_status()
     return r2.json()
 
@@ -656,13 +749,14 @@ def gcs_list(sess, bucket: str) -> List[Dict[str, Any]]:
 
 
 def gcs_upload_resumable(sess, bucket: str, name: str,
-                         data: bytes) -> Dict[str, Any]:
+                         data: bytes, mime: str = _XLSX_MIME
+                         ) -> Dict[str, Any]:
     obj = _gcs_obj_path(name)
     r = sess.post(
         f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o",
         params={"uploadType": "resumable", "name": obj},
-        json={"name": obj, "contentType": _XLSX_MIME},
-        headers={"X-Upload-Content-Type": _XLSX_MIME,
+        json={"name": obj, "contentType": mime},
+        headers={"X-Upload-Content-Type": mime,
                  "X-Upload-Content-Length": str(len(data))},
         timeout=60)
     r.raise_for_status()
@@ -670,7 +764,7 @@ def gcs_upload_resumable(sess, bucket: str, name: str,
     if not loc:
         raise RuntimeError("gcs resumable upload: no session Location header")
     r2 = sess.put(loc, data=data,
-                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
+                  headers={"Content-Type": mime}, timeout=600)
     r2.raise_for_status()
     j = r2.json()
     full = j.get("name", obj)
@@ -717,9 +811,10 @@ def _store_list(sess, dest: str, container: str) -> List[Dict[str, Any]]:
 
 
 def _store_upload(sess, dest: str, container: str, name: str,
-                  data: bytes) -> Dict[str, Any]:
-    return (gcs_upload_resumable(sess, container, name, data) if dest == "gcs"
-            else drive_upload_resumable(sess, container, name, data))
+                  data: bytes, mime: str = _XLSX_MIME) -> Dict[str, Any]:
+    return (gcs_upload_resumable(sess, container, name, data, mime)
+            if dest == "gcs"
+            else drive_upload_resumable(sess, container, name, data, mime))
 
 
 def _store_copy(sess, dest: str, container: str, src_id: str,
@@ -987,6 +1082,123 @@ def run_restore_test() -> int:
     return 0
 
 
+def run_attach(paths: List[str]) -> int:
+    """v1.6.0: upload-only. Each existing, allowed PATH goes to the backup
+    destination as DAILY_TFB_<Label>_<date><ext>; no export, no workbook
+    upload. Missing paths are skipped (exit 0); see the v1.6.0 header."""
+    tag = f"[BACKUP-ATTACH v{__version__}]"
+    files: List[Tuple[str, bytes]] = []
+    skipped: List[str] = []
+    refused: List[str] = []
+    for path in paths:
+        if not os.path.isfile(path):
+            _out(f"NOTE: attach: {path} not found — skipped")
+            skipped.append(path)
+            continue
+        with open(path, "rb") as fh:
+            data = fh.read()
+        why = attach_refusal(path, data)
+        if why:
+            _out(f"WARN: attach: {path} refused — {why}")
+            refused.append(path)
+            continue
+        files.append((path, data))
+    if not files:
+        _out(f"attach: nothing to upload (skipped={len(skipped)} "
+             f"refused={len(refused)})")
+        return 2 if refused else 0
+
+    # Destination: the run_restore_test composition of the run_backup helpers.
+    # A setup failure is reported under the attach tag, never as an
+    # "[BACKUP v...] FAIL unhandled" row that reads like a failed backup.
+    folder_id = _drive_id(_env("TFB_BACKUP_FOLDER_ID"))
+    dest = _backup_dest()
+    container = _gcs_bucket() if dest == "gcs" else folder_id
+    stage = "credentials"
+    try:
+        sess = _session(_credentials())
+        if dest == "oauth":
+            stage = "oauth"
+            sess = _oauth_session()
+            container = drive_ensure_app_folder(sess, _oauth_folder_name())
+    except Exception as e:  # noqa: BLE001
+        msg = f"{tag} FAIL {stage} setup: {type(e).__name__}: {e}"
+        _out("ERROR: " + msg)
+        append_run_log("FAIL", msg, {"stage": "attach-" + stage})
+        return 2
+    if not container:
+        msg = (f"{tag} FAIL " + ("TFB_BACKUP_GCS_BUCKET not set" if dest == "gcs"
+                                 else "TFB_BACKUP_FOLDER_ID not set"))
+        _out("ERROR: " + msg)
+        append_run_log("FAIL", msg, {"stage": "attach-setup"})
+        return 2
+    _out(f"attach preflight: dest={dest} container={container} "
+         f"files={len(files)} skipped={len(skipped)} refused={len(refused)}")
+
+    today = _now_riyadh().date()
+    uploaded: List[Tuple[str, Dict[str, Any]]] = []
+    failed: List[str] = []
+    for path, data in files:
+        name = attach_name(path, today)
+        mime = _ATTACH_MIME[os.path.splitext(path)[1].lower()]
+        try:
+            up = _store_upload(sess, dest, container, name, data, mime)
+        except Exception as e:  # noqa: BLE001
+            reason = _api_reason(e)
+            _out(f"ERROR: attach upload {path} -> {name}: {e}"
+                 + (f" [api_reason={reason}]" if reason else ""))
+            failed.append(path)
+            continue
+        uploaded.append((path, up))
+        _out(f"attached {path} -> {up.get('name', name)} id={up.get('id')} "
+             f"({len(data):,} bytes)")
+
+    pruned = 0
+    if uploaded:
+        try:
+            listing = _store_list(sess, dest, container)
+        except Exception as e:  # noqa: BLE001
+            listing = None
+            _out(f"WARN: attach list failed ({e}) — pruning skipped")
+        if listing is not None:
+            keep_d = _env_int("TFB_BACKUP_KEEP_DAILY", 30)
+            keep_m = _env_int("TFB_BACKUP_KEEP_MONTHLY", 12)
+            gone = set()
+            for path, up in uploaded:
+                name = attach_name(path, today)
+                # Same-day re-run: the new upload replaces the older copy.
+                stale = [f for f in listing if f.get("name") == name
+                         and f.get("id") != up.get("id")]
+                daily_re, monthly_re = attach_patterns(path)
+                names = [f.get("name", "") for f in listing
+                         if f.get("id") not in gone and f not in stale]
+                _keep, delete = plan_pruning(names, keep_d, keep_m,
+                                             daily_re, monthly_re)
+                victims = stale + [f for f in listing if f.get("name") in set(delete)
+                                   and f.get("id") != up.get("id")]
+                for f in victims:
+                    if f.get("id") in gone:
+                        continue
+                    try:
+                        _store_delete(sess, dest, container, f.get("id"))
+                        gone.add(f.get("id"))
+                        pruned += 1
+                    except Exception as e:  # noqa: BLE001
+                        _out(f"WARN: attach prune failed for {f.get('name')}: {e}")
+
+    msg = (f"{tag} uploaded={len(uploaded)}/{len(paths)} "
+           f"skipped={len(skipped)} refused={len(refused)} failed={len(failed)} "
+           f"pruned={pruned} names="
+           + ",".join(attach_name(p, today) for p, _ in uploaded))
+    _out(msg)
+    append_run_log("FAIL" if failed or refused else "OK", msg,
+                   {"uploaded": len(uploaded), "skipped": skipped,
+                    "refused": refused, "failed": failed, "pruned": pruned})
+    if failed:
+        return 3
+    return 2 if refused else 0
+
+
 # --------------------------------------------------------------------------- #
 # Offline selftest                                                            #
 # --------------------------------------------------------------------------- #
@@ -1022,6 +1234,30 @@ def _selftest() -> int:
     h1, h2 = sha256_hex(b"tfb"), sha256_hex(b"tfb")
     checks.append(("sha stable 64-hex", h1 == h2 and len(h1) == 64))
     checks.append(("env int guard", _env_int("TFB_NOPE_X", 30) == 30))
+    # v1.6.0 --attach
+    checks.append(("attach names follow daily_name",
+                   attach_name("out/dq_scorecard.md", d)
+                   == "DAILY_TFB_DQ_Scorecard_2026-07-22.md"
+                   and attach_name("dq_activation_receipt.json", d)
+                   == "DAILY_TFB_DQ_Activation_Receipt_2026-07-22.json"))
+    a_daily, a_monthly = attach_patterns("dq_report.json")
+    a_names = ([attach_name("dq_report.json", d - _dt.timedelta(days=i))
+                for i in range(33)]
+               + [attach_name("dq_scorecard.md", d), daily_name(d)])
+    a_keep, a_delete = plan_pruning(a_names, 30, 12, a_daily, a_monthly)
+    checks.append(("attach prune: per kind, workbook and other kinds untouched",
+                   len(a_keep) == 30 and len(a_delete) == 3
+                   and attach_name("dq_report.json", d) in a_keep
+                   and daily_name(d) not in a_keep + a_delete
+                   and attach_name("dq_scorecard.md", d) not in a_keep + a_delete))
+    checks.append(("plan_pruning default patterns unchanged",
+                   plan_pruning(names, 30, 12)
+                   == plan_pruning(names, 30, 12, _DAILY_RE, _MONTHLY_RE)))
+    checks.append(("attach refuses xlsx/zip, credentials, unknown types",
+                   attach_refusal("a.json", b"PK\x03\x04...") != ""
+                   and attach_refusal("a.xlsx", b"x") != ""
+                   and attach_refusal("k.json", b'{"private_key": "x"}') != ""
+                   and attach_refusal("ok.md", b"# DQ scorecard") == ""))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)
@@ -1035,10 +1271,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     g.add_argument("--dry-run", action="store_true")
     g.add_argument("--restore-test", action="store_true")
     g.add_argument("--selftest", action="store_true")
+    g.add_argument("--attach", nargs="+", metavar="PATH",
+                   help="v1.6.0: upload-only — put these small reports "
+                        "beside the backups (no export, no workbook upload)")
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
     try:
+        if args.attach:
+            return run_attach(args.attach)
         if args.restore_test:
             return run_restore_test()
         return run_backup(dry_run=bool(args.dry_run))
