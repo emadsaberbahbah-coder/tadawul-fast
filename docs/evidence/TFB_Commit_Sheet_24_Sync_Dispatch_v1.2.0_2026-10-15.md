@@ -37,7 +37,7 @@ Date: 2026-10-15 (Thursday) · Lane: GAS + GitHub (yml merges FIRST, then the Ap
 | `tests/test_tracker_record_only_workflows.py` | +5 cases: `record_tracker=true` runs the record with no `--audit`; absent/false still skips a manual dispatch |
 
 ## S5 — Deploy order (operator)
-1. Merge PR #781 and this PR (the yml must declare `record_tracker` on `main` **before** the paste, or every sync dispatch answers 422).
+1. Merge PR #781, this PR and PR #783. The yml must declare `record_tracker` on `main` **before** the paste, or every sync dispatch answers 422. #783 (run_dashboard_sync 6.69.1) writes the `event` provenance the export audit needs to recognise dispatched runs; runs made before it merges are scored as ~7 h late crons.
 2. Paste v1.2.0 over `24_Sync_Dispatch` → `tfbSyncDispatchSelfTest` → `sync dispatch core: ok | s1 lane core: ok`.
 3. Create the PAT (fine-grained, repo `tadawul-fast`, Actions read/write + Metadata read, 90-day expiry; calendar the rotation) → `TFB_GH_DISPATCH_TOKEN`.
 4. `tfbSyncDispatchProbe` → `OK:200:active`; `tfbS1DispatchProbe` → `shadow_board=OK:200:active | shadow_scorer=OK:200:active`.
