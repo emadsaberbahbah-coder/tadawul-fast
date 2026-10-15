@@ -116,8 +116,13 @@ __version__ = "1.6.0"
 # .md / .json / .txt; never a zip/xlsx payload, the TFB_BACKUP_LOCAL_COPY
 # export, the GOOGLE_APPLICATION_CREDENTIALS file, or anything carrying a
 # private key / client secret / refresh token; 20 MB cap. Exit: 0 = done
-# (including nothing to upload), 2 = setup failure or a refused path,
-# 3 = an upload failed. One _Run_Log row "[BACKUP-ATTACH vX]".
+# (including nothing to upload), 2 = setup failure or a blocked path,
+# 3 = an upload failed. One _Run_Log row "[BACKUP-ATTACH vX]" (worded
+# "blocked", never "refus...", which tfb_export_audit counts as an
+# identity-guard refusal). Errors are logged without URLs (a resumable
+# session URL in a public log could be used to finish the upload). Two
+# inputs with one destination name: the second is skipped. The date is the
+# TFB_BACKUP_LOCAL_COPY export's mtime in Riyadh when present.
 # ADDITIVE: drive_upload_resumable / gcs_upload_resumable / _store_upload
 # gain an optional `mime` (default the xlsx type, so the workbook upload is
 # byte-identical) and plan_pruning gains optional name patterns (default the
@@ -1082,14 +1087,41 @@ def run_restore_test() -> int:
     return 0
 
 
+def _attach_error(exc) -> str:
+    """v1.6.0: an error for a PUBLIC log - type, HTTP status and Google's own
+    reason, never str(exc): a failed resumable PUT renders its session URL
+    (upload_id), which would let a log reader finish the upload."""
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    reason = _api_reason(exc)
+    return (type(exc).__name__ + (f" HTTP {code}" if code else "")
+            + (f" [api_reason={reason}]" if reason else ""))
+
+
+def _attach_date() -> _dt.date:
+    """v1.6.0: the date of the export these reports describe - the
+    TFB_BACKUP_LOCAL_COPY file's mtime in Riyadh when it exists (written just
+    before the workbook upload names its DAILY_ file), else today in Riyadh."""
+    path = _env("TFB_BACKUP_LOCAL_COPY")
+    if path:
+        try:
+            return _dt.datetime.fromtimestamp(os.path.getmtime(path), _RIYADH).date()
+        except OSError:
+            pass
+    return _now_riyadh().date()
+
+
 def run_attach(paths: List[str]) -> int:
     """v1.6.0: upload-only. Each existing, allowed PATH goes to the backup
     destination as DAILY_TFB_<Label>_<date><ext>; no export, no workbook
     upload. Missing paths are skipped (exit 0); see the v1.6.0 header."""
     tag = f"[BACKUP-ATTACH v{__version__}]"
+    # "blocked", never "refused": tfb_export_audit counts _Run_Log rows that
+    # contain REFUS as identity-guard refusals.
+    day = _attach_date()
     files: List[Tuple[str, bytes]] = []
     skipped: List[str] = []
-    refused: List[str] = []
+    blocked: List[str] = []
+    names_seen = set()
     for path in paths:
         if not os.path.isfile(path):
             _out(f"NOTE: attach: {path} not found — skipped")
@@ -1099,14 +1131,21 @@ def run_attach(paths: List[str]) -> int:
             data = fh.read()
         why = attach_refusal(path, data)
         if why:
-            _out(f"WARN: attach: {path} refused — {why}")
-            refused.append(path)
+            _out(f"WARN: attach: {path} blocked — {why}")
+            blocked.append(path)
             continue
+        name = attach_name(path, day)
+        if name in names_seen:
+            # Two inputs with one destination name would replace each other.
+            _out(f"NOTE: attach: {path} -> {name} duplicates an earlier input — skipped")
+            skipped.append(path)
+            continue
+        names_seen.add(name)
         files.append((path, data))
     if not files:
         _out(f"attach: nothing to upload (skipped={len(skipped)} "
-             f"refused={len(refused)})")
-        return 2 if refused else 0
+             f"blocked={len(blocked)})")
+        return 2 if blocked else 0
 
     # Destination: the run_restore_test composition of the run_backup helpers.
     # A setup failure is reported under the attach tag, never as an
@@ -1122,7 +1161,7 @@ def run_attach(paths: List[str]) -> int:
             sess = _oauth_session()
             container = drive_ensure_app_folder(sess, _oauth_folder_name())
     except Exception as e:  # noqa: BLE001
-        msg = f"{tag} FAIL {stage} setup: {type(e).__name__}: {e}"
+        msg = f"{tag} FAIL {stage} setup: {_attach_error(e)}"
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "attach-" + stage})
         return 2
@@ -1132,21 +1171,18 @@ def run_attach(paths: List[str]) -> int:
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "attach-setup"})
         return 2
-    _out(f"attach preflight: dest={dest} container={container} "
-         f"files={len(files)} skipped={len(skipped)} refused={len(refused)}")
+    _out(f"attach preflight: dest={dest} container={container} date={day} "
+         f"files={len(files)} skipped={len(skipped)} blocked={len(blocked)}")
 
-    today = _now_riyadh().date()
     uploaded: List[Tuple[str, Dict[str, Any]]] = []
     failed: List[str] = []
     for path, data in files:
-        name = attach_name(path, today)
+        name = attach_name(path, day)
         mime = _ATTACH_MIME[os.path.splitext(path)[1].lower()]
         try:
             up = _store_upload(sess, dest, container, name, data, mime)
         except Exception as e:  # noqa: BLE001
-            reason = _api_reason(e)
-            _out(f"ERROR: attach upload {path} -> {name}: {e}"
-                 + (f" [api_reason={reason}]" if reason else ""))
+            _out(f"ERROR: attach upload {path} -> {name}: {_attach_error(e)}")
             failed.append(path)
             continue
         uploaded.append((path, up))
@@ -1159,23 +1195,24 @@ def run_attach(paths: List[str]) -> int:
             listing = _store_list(sess, dest, container)
         except Exception as e:  # noqa: BLE001
             listing = None
-            _out(f"WARN: attach list failed ({e}) — pruning skipped")
+            _out(f"WARN: attach list failed ({_attach_error(e)}) — pruning skipped")
         if listing is not None:
             keep_d = _env_int("TFB_BACKUP_KEEP_DAILY", 30)
             keep_m = _env_int("TFB_BACKUP_KEEP_MONTHLY", 12)
+            mine = {up.get("id") for _, up in uploaded}     # never prune this run's uploads
             gone = set()
             for path, up in uploaded:
-                name = attach_name(path, today)
+                name = attach_name(path, day)
                 # Same-day re-run: the new upload replaces the older copy.
                 stale = [f for f in listing if f.get("name") == name
-                         and f.get("id") != up.get("id")]
+                         and f.get("id") not in mine]
                 daily_re, monthly_re = attach_patterns(path)
                 names = [f.get("name", "") for f in listing
                          if f.get("id") not in gone and f not in stale]
                 _keep, delete = plan_pruning(names, keep_d, keep_m,
                                              daily_re, monthly_re)
                 victims = stale + [f for f in listing if f.get("name") in set(delete)
-                                   and f.get("id") != up.get("id")]
+                                   and f.get("id") not in mine]
                 for f in victims:
                     if f.get("id") in gone:
                         continue
@@ -1184,19 +1221,20 @@ def run_attach(paths: List[str]) -> int:
                         gone.add(f.get("id"))
                         pruned += 1
                     except Exception as e:  # noqa: BLE001
-                        _out(f"WARN: attach prune failed for {f.get('name')}: {e}")
+                        _out(f"WARN: attach prune failed for {f.get('name')}: "
+                             f"{_attach_error(e)}")
 
     msg = (f"{tag} uploaded={len(uploaded)}/{len(paths)} "
-           f"skipped={len(skipped)} refused={len(refused)} failed={len(failed)} "
+           f"skipped={len(skipped)} blocked={len(blocked)} failed={len(failed)} "
            f"pruned={pruned} names="
-           + ",".join(attach_name(p, today) for p, _ in uploaded))
+           + ",".join(attach_name(p, day) for p, _ in uploaded))
     _out(msg)
-    append_run_log("FAIL" if failed or refused else "OK", msg,
+    append_run_log("FAIL" if failed or blocked else "OK", msg,
                    {"uploaded": len(uploaded), "skipped": skipped,
-                    "refused": refused, "failed": failed, "pruned": pruned})
+                    "blocked": blocked, "failed": failed, "pruned": pruned})
     if failed:
         return 3
-    return 2 if refused else 0
+    return 2 if blocked else 0
 
 
 # --------------------------------------------------------------------------- #

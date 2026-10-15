@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
+import json
+import os
 import re
 from pathlib import Path
 
@@ -146,6 +148,8 @@ def test_two_reports_land_dated_and_a_missing_one_is_skipped(drive, tmp_path, ca
     [(status, msg, det)] = drive.log
     assert status == "OK" and msg.startswith("[BACKUP-ATTACH v1.6.0] uploaded=2/3 skipped=1")
     assert "[BACKUP v" not in msg and "[RESTORE-TEST" not in msg
+    # tfb_export_audit counts any row containing REFUS as an identity-guard refusal.
+    assert "REFUS" not in msg.upper() and "REFUS" not in json.dumps(det).upper()
 
 
 def test_nothing_present_exits_zero_before_any_credential(monkeypatch, tmp_path):
@@ -178,6 +182,7 @@ def test_same_day_rerun_replaces_and_pruning_keeps_30_per_kind(drive, tmp_path, 
 def test_export_and_credentials_are_refused(drive, tmp_path, monkeypatch, capsys):
     export = tmp_path / "tfb_export.xlsx"
     export.write_bytes(b"PK\x03\x04workbook")
+    os.utime(export, (TODAY.timestamp(), TODAY.timestamp()))   # the reports take the export's date
     disguised = tmp_path / "export.json"
     disguised.write_bytes(b"PK\x03\x04workbook")
     key = tmp_path / "gcreds.json"
@@ -190,8 +195,8 @@ def test_export_and_credentials_are_refused(drive, tmp_path, monkeypatch, capsys
     assert bw.main(["--attach", str(export), str(disguised), str(key), str(token), md]) == 2
     assert drive.in_folder() == ["DAILY_TFB_DQ_Scorecard_2026-10-15.md"]
     err = capsys.readouterr().err
-    assert err.count("refused") >= 4 and "private_key" not in "".join(f["name"] for f in drive.files.values())
-    assert drive.log[-1][0] == "FAIL"
+    assert err.count("blocked —") == 4 and "private_key" not in "".join(f["name"] for f in drive.files.values())
+    assert drive.log[-1][0] == "FAIL" and "REFUS" not in drive.log[-1][1].upper()
 
 
 def test_oauth_destination_uses_the_app_folder(drive, tmp_path, monkeypatch):
@@ -265,3 +270,42 @@ def test_workflow_publishes_after_the_artifact_and_before_cleanup():
     assert not runs(dry_run="true")                  # a dry_run dispatch publishes nothing
     assert not runs(restore_test="true")
     assert not runs(mode="off")
+
+
+def test_two_inputs_with_one_destination_name_keep_the_first(drive, tmp_path, capsys):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first, second = tmp_path / "a" / "dq_report.json", tmp_path / "b" / "dq_report.json"
+    first.write_text('{"run": 1}')
+    second.write_text('{"run": 2}')
+    assert bw.main(["--attach", str(first), str(second)]) == 0
+    [f] = [f for f in drive.files.values() if not f["folder"]]
+    assert f["name"] == "DAILY_TFB_DQ_Report_2026-10-15.json" and f["data"] == b'{"run": 1}'
+    assert "duplicates an earlier input — skipped" in capsys.readouterr().err
+
+
+def test_upload_errors_never_print_the_session_url(drive, tmp_path, monkeypatch, capsys):
+    class SessionError(Exception):
+        response = Resp(503)
+
+    def fail(*a, **k):
+        raise SessionError("503 Server Error: for url: https://www.googleapis.com/upload/drive/v3/files"
+                           "?uploadType=resumable&upload_id=SECRET_SESSION")
+    monkeypatch.setattr(drive, "put", fail)
+    [md] = reports(tmp_path, "dq_scorecard.md")
+    assert bw.main(["--attach", md]) == 3
+    err = capsys.readouterr().err
+    assert "upload_id" not in err and "SECRET_SESSION" not in err
+    assert "SessionError HTTP 503" in err
+
+
+def test_reports_take_the_date_of_the_export_they_describe(drive, tmp_path, monkeypatch):
+    export = tmp_path / "tfb_export.xlsx"
+    export.write_bytes(b"PK\x03\x04")
+    stamp = dt.datetime(2026, 10, 14, 23, 50, tzinfo=bw._RIYADH).timestamp()   # before Riyadh midnight
+    os.utime(export, (stamp, stamp))
+    monkeypatch.setenv("TFB_BACKUP_LOCAL_COPY", str(export))
+    [md] = reports(tmp_path, "dq_scorecard.md")
+    assert bw.main(["--attach", md]) == 0                 # the clock says 2026-10-15
+    assert drive.in_folder() == ["DAILY_TFB_DQ_Scorecard_2026-10-14.md"]
+
