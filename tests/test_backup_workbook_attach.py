@@ -231,8 +231,8 @@ def test_default_modes_unchanged_dry_run_and_workbook_upload_mime(drive, capsys)
     assert captured.out == ""
     lines = [re.sub(r"\d+\.\d+s", "Ts", line) for line in captured.err.splitlines()]
     assert lines == [
-        "[workbook_backup v1.6.0] preflight: export_account=svc@example.iam.gserviceaccount.com dest=drive "
-        "sheet_id=SHEET1 folder_id=FOLDER123 dry_run=True",
+        ("[workbook_backup v1.6.0] preflight: export_account=svc@example.iam.gserviceaccount.com dest=drive "
+         "sheet_id=SHEET1 folder_id=FOLDER123 dry_run=True"),
         "[workbook_backup v1.6.0] export: 2,000,004 bytes in Ts sha256=" + bw.sha256_hex(b"PK\x03\x04" + b"x" * 2_000_000)[:12],
         "[workbook_backup v1.6.0] dry-run — export verified, nothing uploaded",
     ]
@@ -297,6 +297,26 @@ def test_upload_errors_never_print_the_session_url(drive, tmp_path, monkeypatch,
     err = capsys.readouterr().err
     assert "upload_id" not in err and "SECRET_SESSION" not in err
     assert "SessionError HTTP 503" in err
+
+
+def test_setup_failure_names_its_cause_but_library_errors_stay_redacted(drive, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TFB_BACKUP_DEST", "oauth")
+    guidance = ("oauth refresh failed (RefreshError: invalid_grant) — the refresh token is expired or "
+                "revoked. Re-run the OAuth Playground consent for scope drive.file and update "
+                "TFB_BACKUP_OAUTH_REFRESH_TOKEN.")
+    monkeypatch.setattr(bw, "_oauth_session", lambda: (_ for _ in ()).throw(RuntimeError(guidance)))
+    [md] = reports(tmp_path, "dq_scorecard.md")
+    assert bw.main(["--attach", md]) == 2
+    assert drive.log[-1][1] == "[BACKUP-ATTACH v1.6.0] FAIL oauth setup: RuntimeError: " + guidance
+    assert "TFB_BACKUP_OAUTH_REFRESH_TOKEN" in capsys.readouterr().err
+
+    class LibraryError(RuntimeError):   # not this module's own message: type only
+        pass
+    url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=SECRET_SESSION"
+    monkeypatch.setattr(bw, "_oauth_session", lambda: (_ for _ in ()).throw(LibraryError(url)))
+    assert bw.main(["--attach", md]) == 2
+    assert drive.log[-1][1] == "[BACKUP-ATTACH v1.6.0] FAIL oauth setup: LibraryError"
+    assert "SECRET_SESSION" not in capsys.readouterr().err
 
 
 def test_reports_take_the_date_of_the_export_they_describe(drive, tmp_path, monkeypatch):

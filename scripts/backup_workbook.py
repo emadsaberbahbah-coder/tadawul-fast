@@ -1089,11 +1089,16 @@ def run_restore_test() -> int:
 
 def _attach_error(exc) -> str:
     """v1.6.0: an error for a PUBLIC log - type, HTTP status and Google's own
-    reason, never str(exc): a failed resumable PUT renders its session URL
-    (upload_id), which would let a log reader finish the upload."""
-    code = getattr(getattr(exc, "response", None), "status_code", None)
+    reason, never str(exc) of a library error: a failed resumable PUT renders
+    its session URL (upload_id), which would let a log reader finish the
+    upload. This module's own RuntimeError messages (exact type, no HTTP
+    response) carry no URL and name the fix - an expired OAuth grant, a
+    missing secret - and run_backup already prints them, so they are kept."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
     reason = _api_reason(exc)
-    return (type(exc).__name__ + (f" HTTP {code}" if code else "")
+    own = f": {exc}" if type(exc) is RuntimeError and resp is None else ""
+    return (type(exc).__name__ + own + (f" HTTP {code}" if code else "")
             + (f" [api_reason={reason}]" if reason else ""))
 
 
