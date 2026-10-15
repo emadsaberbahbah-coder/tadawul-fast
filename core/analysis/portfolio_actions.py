@@ -840,6 +840,10 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   scripts/verify_core_repair_readback.py move their declared default to
 #   enforce in the same change (lockstep).
 # OFF: TFB_PF_RESEARCH_VIEW=off restores v1.16.0 exactly.
+#   SUPERSEDES the v1.16.0 block's "off (default)", "blank included, is off"
+#   and "Rollback: unset TFB_PF_RESEARCH_VIEW" lines (kept verbatim below as
+#   history): unset or blank now arms enforce; roll back with the explicit
+#   value off (and TFB_PF_RESEARCH_VIEW_EXPECT=off for the readback).
 #   Functions added 0. Removed 0. Rollback: set it to off on Render; or revert.
 # ---------------------------------------------------------------------------
 PORTFOLIO_ACTIONS_VERSION = "1.17.0"
