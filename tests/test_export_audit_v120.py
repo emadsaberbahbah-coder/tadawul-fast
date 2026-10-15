@@ -118,21 +118,26 @@ def test_cli_env_and_explicit_rollback(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# v1.3.0 (P-170c): dispatched runs are recognised by provenance, not clock time
+# v1.3.0 (P-170c): runs are classed by the provenance on their own rows
 # --------------------------------------------------------------------------- #
-HEADER = ["Timestamp", "Level", "Action", "Page", "Status", "Message"]
+HEADER = ["Timestamp", "Level", "Action", "Page", "Status", "Message", "Endpoint", "HTTP", "ms", "Details JSON"]
 
 
-def sync_row(local, i=0):
-    return [local, "INFO", "run_dashboard_sync", "Market_Leaders", "OK", f"leg run={9000 + i}"]
+def sync_row(local, run="9000", event="", cron=""):
+    det = {"run_id": run}
+    if event:
+        det["event"] = event
+    if cron:
+        det["schedule"] = cron
+    return [local, "INFO", "run_dashboard_sync", "Market_Leaders", "OK", "leg", "", "", "", json.dumps(det)]
 
 
-def dispatch_row(local, status="OK", action="tfbDispatchDailySync"):
+def dispatch_row(local, status="OK", action="tfbDispatchDailySync", http=204):
     return [local, "INFO" if status == "OK" else "ERROR", action, "daily_sync.yml", status,
-            "workflow_dispatch accepted (HTTP 204)"]
+            "workflow_dispatch", "", http, "", "{}"]
 
 
-def lateness(rows, cron="17 12,20"):
+def lateness(rows, cron="17 4,12,20"):
     fs, metrics = audit.check_runlog(MemoryBook({"_Run_Log": [HEADER] + rows}), 3, 7, 90000, cron, NOW,
                                      "2026-10-03")
     return {f["check"]: f for f in fs}["schedule_lateness"], metrics
@@ -148,80 +153,95 @@ def test_slot_specs_accept_several_minute_hour_groups():
             audit._cron_slots(bad)
 
 
-def test_default_cron_follows_the_daily_sync_workflow(tmp_path):
-    def wf(*crons):
-        path = tmp_path / "daily_sync.yml"
-        path.write_text("on:\n  schedule:\n" + "".join(f'    - cron: "{c}"  # note\n' for c in crons))
-        return str(path)
-    assert audit._workflow_cron_default(wf("17 4,12,20 * * *")) == "17 4,12,20"
-    assert audit._workflow_cron_default(wf("17 12,20 * * *")) == "17 12,20"
-    assert audit._workflow_cron_default(wf("15 3 * * *", "17 12,20 * * *")) == "15 3;17 12,20"
-    assert audit._workflow_cron_default(wf()) == audit.FALLBACK_CRON
-    assert audit._workflow_cron_default(str(tmp_path / "missing.yml")) == audit.FALLBACK_CRON
-    # The module default is the checked-in workflow's schedule.
-    assert audit.DEFAULT_CRON == audit._workflow_cron_default(audit.DAILY_SYNC_WORKFLOW) != ""
-
-
-def test_env_overrides_default_cron_and_blank_falls_back(monkeypatch):
+def test_default_cron_is_the_schedule_rows_without_provenance_ran_under(monkeypatch):
+    assert audit.DEFAULT_CRON == "17 4,12,20"
     monkeypatch.delenv("TFB_AUDIT_CRON", raising=False)
-    assert audit.parse_args([]).cron == audit.DEFAULT_CRON
-    monkeypatch.setenv("TFB_AUDIT_CRON", "17 4,12,20")
     assert audit.parse_args([]).cron == "17 4,12,20"
+    monkeypatch.setenv("TFB_AUDIT_CRON", "17 12,20")
+    assert audit.parse_args([]).cron == "17 12,20"
     monkeypatch.setenv("TFB_AUDIT_CRON", " ")
     assert audit.parse_args([]).cron == audit.DEFAULT_CRON
 
 
-def test_on_time_dispatched_morning_run_is_measured_from_its_dispatch():
-    # Dispatcher OK row 06:14 Riyadh (03:14Z); first sync row 06:16 (03:16Z).
-    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"), sync_row("2026-10-03 06:16:00")])
+def test_dispatched_run_is_measured_from_its_dispatch():
+    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"),
+                                 sync_row("2026-10-03 06:16:00", "501", "workflow_dispatch")])
     assert finding["status"] == "PASS" and metrics["schedule_worst_lateness_min"] == 2
     assert metrics["schedule_dispatched_runs"] == 1
-    assert "dispatch 10-03 03:14Z started 03:16Z" in finding["examples"][-1]
-    # Without the dispatcher row the v1.2.0 model matched it to the previous 20:17Z.
-    legacy, legacy_metrics = lateness([sync_row("2026-10-03 06:16:00")])
+    assert "run 501: dispatch 10-03 03:14Z started 03:16Z" in finding["examples"][-1]
+    # Without provenance the same row is a cron run: the v1.2.0 419-min FAIL.
+    legacy, legacy_metrics = lateness([sync_row("2026-10-03 06:16:00", "501")], cron="17 12,20")
     assert legacy["status"] == "FAIL" and legacy["count"] == 419
     assert "schedule_dispatched_runs" not in legacy_metrics
 
 
-def test_late_cron_just_before_the_dispatch_is_not_claimed_by_it():
-    # 20:17Z cron that fired at 03:00Z next day (06:00 Riyadh), then the 03:15Z
-    # dispatch and its run: the cron keeps its ~403-min lateness.
-    finding, metrics = lateness([sync_row("2026-10-03 06:00:00", 0), dispatch_row("2026-10-03 06:15:00"),
-                                 sync_row("2026-10-03 07:50:00", 1)])
-    assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 403
-    assert any("slot 10-02 20:17Z started 03:00Z" in e for e in finding["examples"])
-    assert any("dispatch 10-03 03:15Z started 04:50Z" in e for e in finding["examples"])
+def test_late_cron_whose_first_row_follows_the_dispatch_keeps_its_lateness():
+    # Reviewer case: 20:17Z cron fires ~03:00Z, the dispatch row lands at 03:05Z,
+    # the cron's first row at 03:14Z; the dispatched run queues and writes from 05:25Z.
+    rows = [dispatch_row("2026-10-03 06:05:00"),
+            sync_row("2026-10-03 06:14:00", "401", "schedule", "17 12,20 * * *"),
+            sync_row("2026-10-03 08:14:00", "401", "schedule", "17 12,20 * * *"),
+            sync_row("2026-10-03 08:25:00", "402", "workflow_dispatch")]
+    finding, metrics = lateness(rows)
+    assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 417
+    assert any("run 401: slot 10-02 20:17Z started 03:14Z, +6h57m" in e for e in finding["examples"])
+    assert any("run 402: dispatch 10-03 03:05Z started 05:25Z, +2h20m" in e for e in finding["examples"])
 
 
-def test_one_dispatch_claims_one_run_and_unaccepted_dispatches_claim_none():
-    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"), sync_row("2026-10-03 06:16:00", 0),
-                                 sync_row("2026-10-03 08:30:00", 1)])
-    assert metrics["schedule_dispatched_runs"] == 1
-    # The second run (05:30Z) is unclaimed: a cron run, 553 min after 20:17Z.
-    assert metrics["schedule_worst_lateness_min"] == 553
-    for status in ("FAILED", "SKIPPED"):
-        _, m = lateness([dispatch_row("2026-10-03 06:14:00", status), sync_row("2026-10-03 06:16:00")])
-        assert "schedule_dispatched_runs" not in m and m["schedule_worst_lateness_min"] == 419
-
-
-def test_manual_dispatch_is_labelled_and_link_window_is_bounded():
-    finding, _ = lateness([dispatch_row("2026-10-03 06:14:00", action="tfbDispatchDailySyncNow"),
-                           sync_row("2026-10-03 06:20:00")])
-    assert "manual dispatch 10-03 03:14Z started 03:20Z" in finding["examples"][-1]
-    _, m = lateness([dispatch_row("2026-10-02 22:00:00"), sync_row("2026-10-03 06:16:00")])
-    assert "schedule_dispatched_runs" not in m   # 8h16m after the dispatch: not linked
-
-
-def test_late_cron_slot_is_still_measured_against_its_own_slot():
-    finding, metrics = lateness([sync_row("2026-10-02 16:30:00")])
-    assert finding["status"] == "FAIL" and metrics["schedule_worst_lateness_min"] == 73
-    assert "slot 10-02 12:17Z started 13:30Z" in finding["examples"][-1]
-
-
-def test_pre_781_schedule_keeps_measuring_the_0417_cron():
-    # Codex P1 on #783: before #781 merges, a 04:31Z run is +14 vs 04:17Z.
-    finding, metrics = lateness([sync_row("2026-10-03 07:31:00")], cron="17 4,12,20")
+def test_schedule_runs_use_their_own_cron_line():
+    # A pre-#781 04:17Z cron row: measured against its own line even with --cron "17 12,20".
+    finding, metrics = lateness([sync_row("2026-10-03 07:31:00", "300", "schedule", "17 4,12,20 * * *")],
+                                cron="17 12,20")
     assert finding["status"] == "PASS" and metrics["schedule_worst_lateness_min"] == 14
+    # Rows without provenance use --cron (default = the schedule they ran under).
+    legacy, m2 = lateness([sync_row("2026-10-03 07:31:00", "300")])
+    assert legacy["status"] == "PASS" and m2["schedule_worst_lateness_min"] == 14
+
+
+def test_one_run_with_a_long_recovery_gap_stays_one_run():
+    finding, _ = lateness([sync_row("2026-10-03 15:20:00", "601", "schedule", "17 12,20 * * *"),
+                           sync_row("2026-10-03 18:30:00", "601", "schedule", "17 12,20 * * *")])
+    assert len(finding["examples"]) == 1 and "run 601: slot 10-03 12:17Z started 12:20Z" in finding["examples"][0]
+
+
+def test_back_to_back_runs_are_split_by_run_id():
+    finding, metrics = lateness([sync_row("2026-10-03 15:20:00", "601", "schedule", "17 12,20 * * *"),
+                                 sync_row("2026-10-03 16:00:00", "601", "schedule", "17 12,20 * * *"),
+                                 sync_row("2026-10-03 16:10:00", "602", "schedule", "17 12,20 * * *")])
+    runs = [e for e in finding["examples"] if e.startswith("run ")]
+    assert len(runs) == 2 and "run 602: slot 10-03 12:17Z started 13:10Z" in runs[1]
+
+
+def test_unconfirmed_dispatch_counts_and_rejected_one_does_not():
+    run = sync_row("2026-10-03 06:20:00", "501", "workflow_dispatch")
+    finding, _ = lateness([dispatch_row("2026-10-03 06:14:00", "FAILED", http=-1), run])
+    assert "unconfirmed dispatch 10-03 03:14Z started 03:20Z" in finding["examples"][-1]
+    _, m = lateness([dispatch_row("2026-10-03 06:14:00", "FAILED", http=401), run])
+    assert "schedule_dispatched_runs" not in m   # GitHub refused it: no dispatcher row explains the run
+
+
+def test_github_ui_dispatch_and_second_run_are_not_attributable():
+    finding, metrics = lateness([dispatch_row("2026-10-03 06:14:00"),
+                                 sync_row("2026-10-03 06:16:00", "501", "workflow_dispatch"),
+                                 sync_row("2026-10-03 09:00:00", "502", "workflow_dispatch")])
+    assert metrics["schedule_dispatched_runs"] == 1 and len(finding["examples"]) == 1
+
+
+def test_accepted_dispatch_with_no_run_is_reported():
+    rows = [dispatch_row("2026-10-03 06:14:00"), sync_row("2026-10-03 13:00:00", "700", "schedule", "17 12,20 * * *")]
+    finding, metrics = lateness(rows)
+    assert finding["status"] == "WARN" and metrics["schedule_dispatches_without_run"] == 1
+    assert "dispatch 10-03 03:14Z accepted, no sync run recorded" in finding["examples"][-1]
+    # A dispatch less than 180 min before the export's last row may still be running.
+    _, m = lateness([sync_row("2026-10-03 13:00:00", "700", "schedule", "17 12,20 * * *"),
+                     dispatch_row("2026-10-03 14:00:00")])
+    assert "schedule_dispatches_without_run" not in m
+
+
+def test_run_that_started_before_the_window_is_dropped():
+    # since = NOW - 7 days = 09-26 11:00Z; this run started 10:30Z (13:30 local).
+    finding, _ = lateness([sync_row("2026-09-26 13:30:00", "800"), sync_row("2026-09-26 14:30:00", "800")])
+    assert not [e for e in finding["examples"] if "run 800" in e]
 
 
 def test_no_cron_slots_is_a_warning_not_a_silent_pass():

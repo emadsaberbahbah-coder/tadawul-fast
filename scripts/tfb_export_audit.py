@@ -95,20 +95,25 @@ starts the morning run at 06:15 Riyadh (03:15Z, within a +/-15 min trigger
 window). The lateness model matched every run to the latest cron slot, so an
 on-time dispatched run at 03:16Z was scored against the previous day's 20:17Z
 slot: +419 min, schedule_lateness=FAIL, exit 1 on every export once armed.
-A run is now classed by PROVENANCE, not by clock time:
-  * dispatched: a tfbDispatchDailySync / tfbDispatchDailySyncNow _Run_Log row
-    with Status OK precedes the run's first sync row by at most 180 min; each
-    dispatch row claims at most one run (the earliest). Its lateness is
-    measured from that dispatch row.
-  * every other run is a cron run, measured against the cron slots exactly as
-    before - so a 20:17Z cron that fires at 03:00Z next morning is still
-    ~403 min late, even right before the 03:15Z dispatch.
-The default --cron is read from .github/workflows/daily_sync.yml (all
-"M H,H * * *" schedule lines, joined with ";"), so it follows the active
-workflow through PR #781 without a flag; TFB_AUDIT_CRON overrides it (blank =
-default) and "17 4,12,20" is the fallback when the file cannot be read. --cron
-accepts several "minute hours" groups separated by ";". An export with no
-dispatcher OK rows gives byte-identical findings, metrics and params.
+Timing alone cannot tell a dispatched run from a cron that fired hours late
+(a late cron whose first row lands just after the dispatch looks on time), so
+a run is classed by the PROVENANCE on its own rows: run_dashboard_sync
+v6.69.1 writes "event" (GITHUB_EVENT_NAME) and, for a schedule run, the cron
+line that fired into each _Run_Log Details JSON.
+  * event=workflow_dispatch: measured from the latest unclaimed dispatcher row
+    before it (tfbDispatchDailySync / ...Now with Status OK, or FAILED with
+    HTTP -1 / 5xx = "unconfirmed dispatch", since GitHub may have queued it).
+    No dispatcher row = a person dispatched it from GitHub: not attributable.
+  * event=schedule: measured against its OWN cron line, so a window that
+    straddles a schedule change needs no flag.
+  * no event (rows written before v6.69.1): measured against --cron, default
+    "17 4,12,20" = the schedule those rows ran under (env TFB_AUDIT_CRON;
+    blank = default). --cron accepts several "minute hours" groups (";").
+Runs are split where the run id changes (back-to-back runs under one lease),
+a run that started before the window is dropped rather than measured from its
+middle, and an accepted dispatch with no run after 180 min is reported (WARN
+at least). An export with no provenance and no dispatcher rows gives
+byte-identical findings, metrics and params.
 """
 from __future__ import annotations
 
@@ -1157,27 +1162,12 @@ def check_model(book, tz_offset):
 # --------------------------------------------------------------------------- #
 # Gate (e): _Run_Log guard health
 # --------------------------------------------------------------------------- #
-FALLBACK_CRON = "17 4,12,20"     # v1.2.0 default; used only when daily_sync.yml cannot be read
-DAILY_SYNC_WORKFLOW = os.path.join(_REPO_ROOT, ".github", "workflows", "daily_sync.yml")
+DEFAULT_CRON = "17 4,12,20"      # cron slots for rows WITHOUT run provenance (written before
+                                 # run_dashboard_sync v6.69.1); rows with it carry their own cron line
 # P-170c: _Run_Log actions written by apps_script/24_Sync_Dispatch.gs for a daily_sync dispatch.
 DISPATCH_ACTIONS = {"tfbDispatchDailySync": "dispatch", "tfbDispatchDailySyncNow": "manual dispatch"}
-DISPATCH_LINK_MIN = 180          # a dispatch claims the first run whose first sync row follows within this
-
-
-def _workflow_cron_default(path=DAILY_SYNC_WORKFLOW):
-    """The daily_sync.yml schedule as '17 12,20' (groups joined by ';'), else FALLBACK_CRON."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return FALLBACK_CRON
-    groups = re.findall(r'^\s*-\s*cron:\s*["\']\s*(\d{1,2})\s+(\d{1,2}(?:,\d{1,2})*)\s+\*\s+\*\s+\*\s*["\']',
-                        text, re.M)
-    spec = ";".join(f"{m} {h}" for m, h in groups)
-    try:
-        return spec if _cron_slots(spec) else FALLBACK_CRON
-    except ValueError:
-        return FALLBACK_CRON
+ATTRIBUTION_MAX_MIN = 12 * 60    # a run more than 12 h after its slot / dispatch is not attributable
+DISPATCH_PENDING_MIN = 180       # an accepted dispatch younger than this may still be running
 
 
 def _cron_slots(cron):
@@ -1193,8 +1183,6 @@ def _cron_slots(cron):
     return sorted(slots)
 
 
-DEFAULT_CRON = _workflow_cron_default()   # the active daily_sync.yml schedule (P-170c)
-
 
 def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_date, eodhd_fail_pct=0):
     out, metrics = [], {}
@@ -1206,8 +1194,9 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     quota, quota_limits = {}, {}
     rows402 = 0
     refusals = 0
-    sync_rows = []   # (ts, run id or None) for run_dashboard_sync rows in the window
-    dispatches = []  # (ts, kind) for daily_sync dispatches GitHub accepted (P-170c provenance)
+    sync_rows = []   # (ts, run id, event, cron line) for run_dashboard_sync rows (P-170c)
+    dispatches = []  # (ts, kind) for daily_sync dispatches that may have started a run
+    last_ts = None   # the newest _Run_Log timestamp: the export's own "now"
     for r in rows[1:]:
         ts = _parse_dt(r[0], tz_offset)
         if ts is None:
@@ -1233,23 +1222,40 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
             m2 = re.search(r"rows402 new=(\d+)", msg)
             if m2 and ts >= since:
                 rows402 += int(m2.group(1))
-        if (action in DISPATCH_ACTIONS and len(r) > 4 and _s(r[4]).upper() == "OK"
-                and ts >= since - dt.timedelta(minutes=DISPATCH_LINK_MIN)):
-            dispatches.append((ts, DISPATCH_ACTIONS[action]))
-        if action == "run_dashboard_sync" and ts >= since:
+        last_ts = ts if last_ts is None or ts > last_ts else last_ts
+        early = since - dt.timedelta(minutes=ATTRIBUTION_MAX_MIN)
+        if action in DISPATCH_ACTIONS and len(r) > 4 and ts >= early:
+            status, http = _s(r[4]).upper(), _num(r[7]) if len(r) > 7 else None
+            if status == "OK":
+                dispatches.append((ts, DISPATCH_ACTIONS[action]))
+            elif status == "FAILED" and http is not None and (http == -1 or 500 <= http <= 599):
+                dispatches.append((ts, "unconfirmed dispatch"))   # GitHub may have queued it
+        if action == "run_dashboard_sync" and ts >= early:
             rid = (re.search(r"run=(\d+)", msg) or re.search(r'"run_id":\s*"?(\d+)', details) or [None, None])[1]
-            sync_rows.append((ts, rid))
-    # A run = a cluster of sync rows with no gap > 90 min; the first row of a run rarely carries the run id.
-    run_first = {}
-    cluster, cid = [], None
-    for ts, rid in sorted(sync_rows, key=lambda x: x[0]):
-        if cluster and (ts - cluster[-1]).total_seconds() > 90 * 60:
-            run_first[cid or f"run@{cluster[0]:%m-%dT%H:%MZ}"] = cluster[0]
-            cluster, cid = [], None
-        cluster.append(ts)
-        cid = cid or rid
-    if cluster:
-        run_first[cid or f"run@{cluster[0]:%m-%dT%H:%MZ}"] = cluster[0]
+            ev = re.search(r'"event":\s*"([a-z_]+)"', details)
+            cr = re.search(r'"schedule":\s*"([^"]+)"', details)
+            sync_rows.append((ts, rid, ev.group(1) if ev else "", cr.group(1) if cr else ""))
+    # A run = a cluster of sync rows with no gap > 90 min, split where the run id changes
+    # (back-to-back runs queue under one lease) and kept whole across a long gap when the
+    # run id is the same (recovery); the first row of a run rarely carries the run id.
+    # A run that started before the window is dropped, not measured mid-run.
+    runs = []
+    cur = None
+    for ts, rid, ev, cr in sorted(sync_rows, key=lambda x: x[0]):
+        same_run = bool(rid) and rid == (cur or {}).get("rid")
+        if cur and not same_run and ((ts - cur["last"]).total_seconds() > 90 * 60
+                                     or (rid and cur["rid"] and rid != cur["rid"])):
+            runs.append(cur)
+            cur = None
+        if cur is None:
+            cur = {"start": ts, "last": ts, "rid": None, "event": "", "cron": ""}
+        cur["last"] = ts
+        cur["rid"] = cur["rid"] or rid
+        cur["event"] = cur["event"] or ev
+        cur["cron"] = cur["cron"] or cr
+    if cur:
+        runs.append(cur)
+    runs = [run for run in runs if run["start"] >= since]
     metrics.update(run_log_rows=len(rows) - 1, run_log_recent=len(recent), levels=dict(levels))
     out.append(F("e", "PIPELINE", "run_log_errors", "PASS" if not errors else "WARN", sum(errors.values()),
                  f"ERROR/CRITICAL rows in the last {since_days} days",
@@ -1275,7 +1281,8 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
                      f"{eodhd_target:,} calls (today excluded as partial)", over))
     out.append(F("e", "PIPELINE", "eodhd_http_402_rows", "PASS" if rows402 == 0 else "FAIL", rows402,
                  f"rows that hit HTTP 402 in the last {since_days} days"))
-    # Schedule lateness
+    # Schedule lateness. P-170c: a run is classed by the provenance on its own rows
+    # (run_dashboard_sync >= v6.69.1 writes "event" and, for a schedule run, its cron line).
     try:
         slots = _cron_slots(cron)
         if not slots:
@@ -1283,44 +1290,66 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     except ValueError as e:
         out.append(F("e", "PIPELINE", "schedule_lateness", "WARN", None, str(e)))
         return out, metrics
-    # P-170c provenance: each accepted dispatch claims the earliest unclaimed run
-    # whose first sync row follows it within DISPATCH_LINK_MIN.
-    runs = sorted(run_first.items(), key=lambda kv: kv[1])
-    claimed = {}
-    for d_ts, kind in sorted(dispatches):
-        for rid, start in runs:
-            if rid not in claimed and d_ts <= start <= d_ts + dt.timedelta(minutes=DISPATCH_LINK_MIN):
-                claimed[rid] = (d_ts, kind)
-                break
+
+    def latest_slot(start, run_slots):
+        cands = []
+        for dd in (0, 1):
+            day = (start - dt.timedelta(days=dd)).date()
+            for h, minute in run_slots:
+                cands.append(dt.datetime(day.year, day.month, day.day, h, minute, tzinfo=dt.timezone.utc))
+        return max((c for c in cands if c <= start), default=None)
+
     late = []
     worst = 0
-    for rid, start in runs:
-        if rid in claimed:
-            planned, kind = claimed[rid]
-            mins = int((start - planned).total_seconds() // 60)
-            label = f"{kind} {planned:%m-%d %H:%M}Z"
+    used = set()
+    dispatched = 0
+    for run in sorted(runs, key=lambda x: x["start"]):
+        rid, start = run["rid"] or f"run@{run['start']:%m-%dT%H:%MZ}", run["start"]
+        if run["event"] == "workflow_dispatch":
+            # Measured from the latest unclaimed dispatcher row before it; none = a person
+            # dispatched it from GitHub, which no slot or dispatch row describes.
+            cands = [d for d in dispatches if d not in used and d[0] <= start
+                     and (start - d[0]).total_seconds() <= ATTRIBUTION_MAX_MIN * 60]
+            if not cands:
+                continue
+            d_ts, kind = max(cands)
+            used.add((d_ts, kind))
+            dispatched += 1
+            planned, label = d_ts, f"{kind} {d_ts:%m-%d %H:%M}Z"
         else:
-            cands = []
-            for dd in (0, 1):
-                day = (start - dt.timedelta(days=dd)).date()
-                for h, minute in slots:
-                    cands.append(dt.datetime(day.year, day.month, day.day, h, minute, tzinfo=dt.timezone.utc))
-            planned = max((c for c in cands if c <= start), default=None)
+            run_slots = slots
+            if run["event"] == "schedule" and run["cron"]:
+                try:
+                    run_slots = _cron_slots(" ".join(run["cron"].split()[:2])) or slots
+                except ValueError:
+                    run_slots = slots
+            planned = latest_slot(start, run_slots)
             if planned is None:
                 continue
-            mins = int((start - planned).total_seconds() // 60)
-            if mins > 12 * 60:
-                continue  # not attributable to a slot (manual dispatch)
             label = f"slot {planned:%m-%d %H:%M}Z"
+        mins = int((start - planned).total_seconds() // 60)
+        if mins > ATTRIBUTION_MAX_MIN:
+            continue  # not attributable to a slot (manual dispatch)
         worst = max(worst, mins)
         late.append(f"run {rid}: {label} started {start:%H:%M}Z, +{mins // 60}h{mins % 60:02d}m")
+    # An accepted dispatch that never produced a run is a missed slot, not silence.
+    orphans = [d for d in dispatches if d not in used and d[1] != "unconfirmed dispatch" and d[0] >= since
+               and last_ts is not None and (last_ts - d[0]).total_seconds() > DISPATCH_PENDING_MIN * 60]
+    for d_ts, kind in orphans:
+        late.append(f"{kind} {d_ts:%m-%d %H:%M}Z accepted, no sync run recorded")
     metrics["schedule_worst_lateness_min"] = worst
     basis = f"cron '{cron}'"
-    if claimed:
-        metrics["schedule_dispatched_runs"] = len(claimed)
-        basis += f" ({len(claimed)} dispatched runs measured from their tfbDispatchDailySync row)"
-    out.append(F("e", "PIPELINE", "schedule_lateness", "PASS" if worst <= 15 else ("WARN" if worst <= 60 else "FAIL"),
-                 worst, f"worst start delay vs {basis} over {len(late)} runs (first _Run_Log row of each run); P-170",
+    if dispatched:
+        metrics["schedule_dispatched_runs"] = dispatched
+        basis += f" ({dispatched} dispatched runs measured from their tfbDispatchDailySync row)"
+    if orphans:
+        metrics["schedule_dispatches_without_run"] = len(orphans)
+        basis += f"; {len(orphans)} accepted dispatches with no run"
+    status = "PASS" if worst <= 15 else ("WARN" if worst <= 60 else "FAIL")
+    if orphans and status == "PASS":
+        status = "WARN"
+    out.append(F("e", "PIPELINE", "schedule_lateness", status,
+                 worst, f"worst start delay vs {basis} over {len(late) - len(orphans)} runs (first _Run_Log row of each run); P-170",
                  late[-6:]))
     da = book.rows("Dashboard_Audit") or []
     capped = [f"{_s(r[0])} {_num(r[3]):g}" for r in da if _s(r[1]) == "scope.coverage" and _s(r[2]) == "WARN"]
@@ -1827,9 +1856,9 @@ def parse_args(argv=None):
                     default=os.getenv("TFB_AUDIT_EODHD_FAIL_PCT", "0"),
                     help="FAIL at this percent of recorded plan; 0 preserves legacy target failure")
     ap.add_argument("--cron", default=os.getenv("TFB_AUDIT_CRON", "").strip() or DEFAULT_CRON,
-                    help="daily_sync GitHub schedule slots 'minute hours[;minute hours]' in UTC "
-                         f"(default {DEFAULT_CRON!r}, read from .github/workflows/daily_sync.yml; "
-                         "dispatched runs are recognised from their tfbDispatchDailySync _Run_Log row)")
+                    help="cron slots 'minute hours[;minute hours]' (UTC) for runs whose rows carry no "
+                         f"provenance (default {DEFAULT_CRON!r}); rows from run_dashboard_sync >= 6.69.1 "
+                         "carry their own event and cron line")
     ap.add_argument("--tz-offset", type=int, default=3, help="workbook local offset (Riyadh = 3)")
     ap.add_argument("--since-days", type=int, default=7)
     ap.add_argument("--cash-max-age-hours", type=float, default=24.0,
