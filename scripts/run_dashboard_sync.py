@@ -2124,8 +2124,14 @@ SCRIPT_VERSION = "6.70.0"
 #   both. observe: one `[FW-SKEW v6.70.0]` line per page (stripped,
 #   explained, reasons, rel bands, suffixes, samples); rows untouched.
 #   enforce: explained rows keep their freshly fetched cells (no strip, no
-#   last-good restore); unexplained rows are stripped exactly as before.
-#   No tolerance, floor or freshness threshold changes.
+#   last-good restore) EXCEPT the inconsistent pair: P/E, EPS and PEG are
+#   cleared and 'fw_skew_pe_cleared:v6.70.0' is appended to Warnings (not an
+#   invalid-acquisition token in core.data_validity), so no P/E that
+#   disagrees with the published price is ever written. Unexplained rows are
+#   stripped exactly as before. No tolerance, floor or freshness threshold
+#   changes. Relation to TFB_SYNC_FW2_SCOPE (#773, ratio-band drift rows kept
+#   BLOCKED): both observe modes are read-only and may run together; arm at
+#   most one enforce at a time.
 # Functions added: 4 (_fw_skew_mode, _fw_skew_max_rel, _fw_skew_explained,
 # _fw_skew_line; +4 nested formatters). Removed: 0. Kill: unset the Variable.
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
@@ -6055,7 +6061,8 @@ def _row_identity_firewall(
     triple -> nothing is ever stripped.
     v6.70.0: `skew` (None = v6.69.0 path) collects the FW-SKEW classification
     of every row that would be stripped; with skew["enforce"] true, rows the
-    classifier explains are left as fetched."""
+    classifier explains keep their fetched cells with P/E, EPS and PEG
+    cleared and the fw_skew_pe_cleared tag on Warnings."""
     stripped: list = []
     if not headers or not rows_matrix:
         return rows_matrix, stripped
@@ -6074,6 +6081,7 @@ def _row_identity_firewall(
     hi = max(px_i, eps_i, pe_i, sym_i)
     _h52_i = _guard_find_col(hdr, _PSAN_52WH_ALIASES) if skew is not None else -1
     _l52_i = _guard_find_col(hdr, _PSAN_52WL_ALIASES) if skew is not None else -1
+    _peg_i = _guard_find_col(hdr, _FW_SKEW_PEG_ALIASES) if skew is not None else -1
     for r_i, row in enumerate(rows_matrix):
         if not isinstance(row, list) or len(row) <= hi:
             continue
@@ -6103,6 +6111,14 @@ def _row_identity_firewall(
                 px, eps, pe, _h52, _l52, float(skew.get("max_rel", 0.35)))
             skew.setdefault("rows", []).append((sym, _ok, _rel, _why))
             if _ok and skew.get("enforce"):
+                # Identity is evidenced, the P/E-EPS pair is not: keep the
+                # fresh row, never publish the inconsistent pair.
+                for _ci in (pe_i, eps_i, _peg_i):
+                    if 0 <= _ci < len(row):
+                        row[_ci] = ""
+                if 0 <= warn_i < len(row):
+                    _w = str(row[warn_i] or "").strip()
+                    row[warn_i] = (_w + "; " if _w else "") + _FW_SKEW_TAG
                 skew.setdefault("kept", []).append(sym)
                 continue
         blanked = ["" for _ in row]
@@ -6120,6 +6136,10 @@ _PSAN_52WH_ALIASES = frozenset({
 _PSAN_52WL_ALIASES = frozenset({
     "52wlow", "week52low", "fiftytwoweeklow", "52weeklow", "yearlow",
 })
+
+
+_FW_SKEW_TAG = "fw_skew_pe_cleared:v6.70.0"
+_FW_SKEW_PEG_ALIASES = frozenset({"peg", "pegratio", "pegttm"})
 
 
 def _fw_skew_mode() -> str:

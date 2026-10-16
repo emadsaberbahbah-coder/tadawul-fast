@@ -9,8 +9,9 @@ an older fundamentals snapshot trips that rule without any identity problem.
 The real runner (_run_one_task with a fake backend and writer) proves:
   off      -> v6.69.0 behaviour, no FW-SKEW line
   observe  -> published rows identical to off, one FW-SKEW line
-  enforce  -> the skew-explained row keeps its fresh cells; the identity-broken
-              row is stripped and restored from last-good exactly as before
+  enforce  -> the skew-explained row keeps its fresh cells with P/E, EPS and PEG
+              cleared (tagged fw_skew_pe_cleared); the identity-broken row is
+              stripped and restored from last-good exactly as before
 """
 from datetime import datetime, timezone
 from unittest import mock
@@ -96,7 +97,9 @@ def test_firewall_observe_and_enforce_classification():
     enf = {"enforce": True, "max_rel": 0.35}
     out_e, s_e = sync._row_identity_firewall(HEADERS, matrix([COHERENT, SKEW, BROKEN]), enf)
     assert s_e == ["IBO.US"] and enf["kept"] == ["HOOD.US"]
-    assert out_e[1] == matrix([SKEW])[0]                       # untouched fresh cells
+    want = dict(SKEW, **{"P/E (TTM)": "", "EPS (TTM)": "", "Warnings": "fw_skew_pe_cleared:v6.70.0"})
+    assert out_e[1] == matrix([want])[0]                       # fresh cells, inconsistent pair cleared
+    assert out_e[0] == matrix([COHERENT])[0]                   # a coherent row is never touched
     line = sync._fw_skew_line("Global_Markets", "enforce", enf)
     assert "{" not in line and "}" not in line
     assert ("would_strip=2 explained=1 kept=1 reasons=explained:1,snap_outside_52w:1 "
@@ -163,7 +166,23 @@ def test_real_runner_off_observe_enforce(monkeypatch):
     assert p_enf["HOOD.US"]["Current Price"] == 120.0
     assert "identity_quarantined" not in p_enf["HOOD.US"]["Warnings"]
     assert "acquisition_status:preserved" not in p_enf["HOOD.US"]["Warnings"]
+    assert "fw_skew_pe_cleared:v6.70.0" in p_enf["HOOD.US"]["Warnings"]
+    assert p_enf["HOOD.US"]["P/E (TTM)"] in ("", None) and p_enf["HOOD.US"]["EPS (TTM)"] in ("", None)
+    assert p_enf["HOOD.US"]["Name"] == "HOOD Corp" and p_enf["HOOD.US"]["52W High"] == 140.0
     assert p_enf["IBO.US"] == p_off["IBO.US"] and p_enf["AAA.US"] == p_off["AAA.US"]
     f_off = sync._page_fresh_fetch_metrics(r_off)
     f_enf = sync._page_fresh_fetch_metrics(r_enf)
     assert f_enf[0] == f_off[0] + 1, (f_off, f_enf)
+
+
+def test_enforce_clears_peg_and_keeps_existing_warnings():
+    row = dict(SKEW, **{"PEG": 1.7, "Warnings": "sheet_horizon_label"})
+    enf = {"enforce": True, "max_rel": 0.35}
+    out, stripped = sync._row_identity_firewall(HEADERS, matrix([row]), enf)
+    got = dict(zip(HEADERS, out[0]))
+    assert stripped == [] and enf["kept"] == ["HOOD.US"]
+    assert got["PEG"] == "" and got["P/E (TTM)"] == "" and got["EPS (TTM)"] == ""
+    assert got["Warnings"] == "sheet_horizon_label; fw_skew_pe_cleared:v6.70.0"
+    assert got["Current Price"] == 120.0 and got["P/E (Forward)"] == row.get("P/E (Forward)", "")
+    from core import data_validity
+    assert not data_validity._INVALID_WARNINGS.search(got["Warnings"])
