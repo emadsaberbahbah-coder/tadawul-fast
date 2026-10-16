@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.70.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.71.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -2102,7 +2102,39 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.70.0"
+SCRIPT_VERSION = "6.71.0"
+# v6.71.0 (2026-10-16) - BATCH-CONC: BOUNDED CONCURRENT MARKET-PAGE BATCHES
+# WHY (GitHub Actions logs, runs 38711216198, 38774823513, 38821487562):
+#   Global_Markets (6,609 symbols) is fetched as a strictly serial chain of
+#   268 POST /v1/analysis/sheet-rows calls (25 symbols each, median ~10.0 s
+#   per call): 50.9-55.1 min per pass, and the whole-page recovery replay
+#   repeats it (48.6-51.4 min), together ~92% of every daily_sync run
+#   (108-116 min). Every call returned HTTP 200 and EODHD peaked at 32% of
+#   its daily quota, so the wall clock is latency, not throttling. Two
+#   overlapping legs earlier measured ~1.78x aggregate backend throughput
+#   with 2 streams: 2 batches in flight should cut a GM pass to ~26-31 min.
+# WHAT: TFB_SYNC_BATCH_CONCURRENCY = k (unset/blank/unparseable/<=1 -> 1;
+#   clamp 1..4). k = 1 runs the v6.70.0 sequential loop. k > 1: the loop
+#   still runs every batch through the one that resolves the endpoint
+#   (normally batch 0); the rest launch in ascending order under
+#   asyncio.Semaphore(k) on that endpoint, the time budget checked right
+#   before each launch (never mid-batch; the first refused batch ends the
+#   launches like the sequential `break`), TFB_SYNC_BATCH_DELAY_MS kept per
+#   slot. Outcomes are folded by the SAME closure in ascending batch order,
+#   so identity-bleed, first-occurrence dedupe, failed_batches, last_err,
+#   ok_batches and the TIME-BUDGET line equal k = 1 for the same
+#   responses; a raised batch re-raises at its place in that order. One
+#   `[BATCH-CONC v6.71.0] page=.. k=.. batches=.. launched=.. wall_s=..
+#   p50_s=.. p90_s=.. failed=..` line per batched fetch when k > 1 (no
+#   braces: the Actions log masks them).
+# UNTOUCHED: batch size, payloads and request ids, endpoint candidates, the
+#   v6.25.0 BATCH-RETRY pass (serial), every guard, floor and write path.
+#   The fetch/fold/budget-line code is the v6.70.0 loop body moved into
+#   closures (_bc_fetch, _bc_apply, _bc_budget_stop) that both paths call.
+# Functions added: 3 top-level (_sync_batch_concurrency, _batch_conc_pct,
+# _batch_conc_line) + 5 nested in _fetch_market_rows_batched (_bc_payload,
+# _bc_fetch, _bc_apply, _bc_budget_stop, _bc_worker). Removed: 0.
+# Rollback: delete the TFB_SYNC_BATCH_CONCURRENCY Variable (-> k = 1).
 # v6.70.0 (2026-10-16) - FW-SKEW: CLASSIFY P/E-COHERENCE QUARANTINES (C2)
 # WHY (GitHub Actions logs, 7 Global_Markets passes 10-14..10-16): every pass
 #   returned HTTP 200 on all 268 backend calls with f429=0 f404=0
@@ -11990,6 +12022,45 @@ def _batch_delay_ms() -> int:
     return n if n > 0 else 0
 
 
+_BATCH_CONC_TAG = "[BATCH-CONC v6.71.0]"
+_BATCH_CONC_MAX = 4
+
+
+def _sync_batch_concurrency() -> int:
+    """v6.71.0 BATCH-CONC: symbol batches in flight per market page
+    (TFB_SYNC_BATCH_CONCURRENCY). Unset, blank, unparseable or <= 1 -> 1, the
+    v6.70.0 sequential loop byte-identically. Values clamp to 1..4."""
+    raw = (os.getenv("TFB_SYNC_BATCH_CONCURRENCY", "") or "").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(_BATCH_CONC_MAX, n))
+
+
+def _batch_conc_pct(values: Sequence[float], q: float) -> float:
+    """v6.71.0 PURE: nearest-rank percentile q (0..1) of `values`; 0.0 when
+    empty."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    i = int(math.ceil(q * len(s))) - 1
+    return float(s[max(0, min(len(s) - 1, i))])
+
+
+def _batch_conc_line(page: str, k: int, batches: int, launched: int,
+                     wall_s: float, durations: Sequence[float], failed: int) -> str:
+    """v6.71.0 PURE: the one BATCH-CONC read-back line per page. No braces
+    (the Actions log masks them). durations = per-batch request seconds of
+    every first-pass batch launched; wall_s = first-pass wall clock."""
+    return (
+        f"{_BATCH_CONC_TAG} page={page} k={k} batches={batches} "
+        f"launched={launched} wall_s={wall_s:.2f} "
+        f"p50_s={_batch_conc_pct(durations, 0.5):.2f} "
+        f"p90_s={_batch_conc_pct(durations, 0.9):.2f} failed={failed}"
+    )
+
+
 def _should_batch_market_page(task: TaskSpec, symbols: List[str]) -> bool:
     """v6.17.0: batch this task iff batching is enabled, it is one of the
     cross-sectional market pages, and it actually carries MORE symbols than the
@@ -12021,6 +12092,15 @@ async def _fetch_market_rows_batched(
     My_Portfolio / Top_10, so the portfolio-injection, decision-reconcile and
     Top_10 header-repair steps are (by scope) no-ops and are intentionally not
     duplicated here.
+
+    v6.71.0 BATCH-CONC: TFB_SYNC_BATCH_CONCURRENCY = k (default 1 = the
+    sequential loop below, unchanged). With k > 1 the loop still runs every
+    batch up to and including the one that resolves the endpoint (normally
+    batch 0); the rest are launched under asyncio.Semaphore(k) with the time
+    budget checked before each launch, and their outcomes are folded by the
+    SAME closures in ascending batch order, so dedupe, identity-bleed,
+    failed_batches, last_err and every line are what k = 1 produces for the
+    same responses. The v6.25.0 retry pass stays serial and unchanged.
     """
     # v6.22.4 L5 [TIME-BUDGET]: a page whose fetch would START after the
     # budget is spent is skipped whole -> the caller's empty-fetch guards
@@ -12057,48 +12137,60 @@ async def _fetch_market_rows_batched(
     _idb_dupes = 0           # repeated symbol rows (first occurrence wins)
     _idb_blank = 0           # rows with a blank symbol cell (unaddressable)
 
-    for bi, batch in enumerate(batches):
-        # v6.22.4 L5: deadline check BETWEEN batches — stop fetching and let
-        # the accumulated partial proceed to the write path (coverage floor +
-        # persistence + KEEP-LAST-GOOD then decide safely). Never mid-batch;
-        # the first batch is always allowed so headers can resolve.
-        if bi > 0 and _time_budget_exceeded():
-            _tw = (
-                f"{_TIME_BUDGET_TAG} {task.sheet_name}: budget "
-                f"{_time_budget_sec():.0f}s exhausted after {ok_batches}/"
-                f"{len(batches)} batch(es); proceeding to write with the "
-                f"partial fetch instead of losing it to a hard kill."
-            )
-            res.warnings.append(_tw)
-            logger.warning(_tw)
-            break
+    # ---- v6.71.0 BATCH-CONC: ONE fetch, ONE fold and ONE budget-stop line,
+    # shared by the sequential loop (k = 1, the default) and the bounded
+    # concurrent phase (k > 1), so both build the same page from the same
+    # responses. The code inside is the v6.70.0 loop body, moved unchanged;
+    # _bc_fetch reports the batch's last error instead of writing last_err.
+    _bc_k = _sync_batch_concurrency()
+    _bc_next = len(batches)          # first batch handed to the concurrent phase
+    _bc_durs: List[float] = []       # per-batch request seconds (first pass)
+    _bc_t0 = time.monotonic()
 
+    def _bc_payload(bi: int, batch: List[str]) -> Dict[str, Any]:
         p = dict(base_payload)
         p["tickers"] = batch
         p["symbols"] = batch
         p["limit"] = min(_request_limit_ceiling(), max(1, len(batch)))
         p["request_id"] = f"{res.request_id}-b{bi + 1}"
+        return p
 
-        # Reuse the resolved endpoint once one answers; only the first batch
-        # pays the candidate-cycling cost.
-        cand = [used_endpoint] if used_endpoint else candidates
-        b_headers: List[Any] = []
-        b_matrix: List[List[Any]] = []
-        for ep in cand:
-            data, err, _code = await backend.post_json(ep, p)
-            if err:
-                last_err = f"{ep} -> {err}"
-                continue
-            if not isinstance(data, dict):
-                last_err = f"{ep} -> Non-dict response"
-                continue
-            b_headers, b_matrix = _extract_table_payload(data)
-            if not b_headers:
-                last_err = f"{ep} -> Missing headers"
-                continue
-            b_matrix = _rectify_matrix(b_headers, b_matrix)
-            used_endpoint = ep
-            break
+    async def _bc_fetch(
+        p: Dict[str, Any], cand: List[str]
+    ) -> Tuple[List[Any], List[List[Any]], Optional[str], Optional[str]]:
+        """One batch over `cand` -> (headers, rows, answering endpoint or
+        None, last error seen in THIS batch or None). Touches no page state."""
+        t = time.monotonic()
+        b_err: Optional[str] = None
+        try:
+            for ep in cand:
+                data, err, _code = await backend.post_json(ep, p)
+                if err:
+                    b_err = f"{ep} -> {err}"
+                    continue
+                if not isinstance(data, dict):
+                    b_err = f"{ep} -> Non-dict response"
+                    continue
+                b_headers, b_matrix = _extract_table_payload(data)
+                if not b_headers:
+                    b_err = f"{ep} -> Missing headers"
+                    continue
+                b_matrix = _rectify_matrix(b_headers, b_matrix)
+                return b_headers, b_matrix, ep, b_err
+            return [], [], None, b_err
+        finally:
+            _bc_durs.append(time.monotonic() - t)
+
+    def _bc_apply(bi: int, batch: List[str], outcome: Tuple[Any, ...]) -> None:
+        """Fold one batch outcome into the page accumulators. Callers apply
+        outcomes in ascending batch order."""
+        nonlocal headers, used_endpoint, last_err, ok_batches
+        nonlocal _idb_sym_i, _idb_bleed, _idb_dupes, _idb_blank
+        b_headers, b_matrix, b_ep, b_err = outcome
+        if b_err is not None:
+            last_err = b_err
+        if b_ep is not None:
+            used_endpoint = b_ep
 
         if b_headers:
             if not headers:
@@ -12133,8 +12225,106 @@ async def _fetch_market_rows_batched(
             # v6.25.0: remember the whole batch for the retry pass.
             failed_batches.append((bi, list(batch)))
 
+    def _bc_budget_stop() -> None:
+        _tw = (
+            f"{_TIME_BUDGET_TAG} {task.sheet_name}: budget "
+            f"{_time_budget_sec():.0f}s exhausted after {ok_batches}/"
+            f"{len(batches)} batch(es); proceeding to write with the "
+            f"partial fetch instead of losing it to a hard kill."
+        )
+        res.warnings.append(_tw)
+        logger.warning(_tw)
+
+    for bi, batch in enumerate(batches):
+        # v6.71.0 BATCH-CONC: k > 1 hands the remaining batches to the
+        # concurrent phase below once the endpoint has resolved (k = 1: never).
+        if _bc_k > 1 and bi > 0 and used_endpoint:
+            _bc_next = bi
+            break
+        # v6.22.4 L5: deadline check BETWEEN batches — stop fetching and let
+        # the accumulated partial proceed to the write path (coverage floor +
+        # persistence + KEEP-LAST-GOOD then decide safely). Never mid-batch;
+        # the first batch is always allowed so headers can resolve.
+        if bi > 0 and _time_budget_exceeded():
+            _bc_budget_stop()
+            break
+
+        p = _bc_payload(bi, batch)
+
+        # Reuse the resolved endpoint once one answers; only the first batch
+        # pays the candidate-cycling cost.
+        cand = [used_endpoint] if used_endpoint else candidates
+        _bc_apply(bi, batch, await _bc_fetch(p, cand))
+
         if delay_ms > 0 and bi < len(batches) - 1:
             await asyncio.sleep(delay_ms / 1000.0)
+
+    # ---- v6.71.0 BATCH-CONC concurrent phase (k > 1 only). Batches
+    # _bc_next.. are launched in ascending order, at most k in flight, on the
+    # resolved endpoint. The time budget is checked when a slot frees, right
+    # before each launch (never mid-batch); the first refused batch ends the
+    # launches exactly as the sequential loop's `break` does. Each slot keeps
+    # the TFB_SYNC_BATCH_DELAY_MS rest between its own batches. Outcomes are
+    # then folded by _bc_apply in batch order; a batch whose fetch raised is
+    # re-raised at its place in that order (later outcomes are discarded, as
+    # the sequential loop would never have fetched them).
+    if _bc_k > 1:
+        _bc_raised = 0
+        try:
+            if _bc_next < len(batches):
+                _bc_sem = asyncio.Semaphore(_bc_k)
+                _bc_out: Dict[int, Any] = {}
+                _bc_err_at: List[int] = []
+                _bc_tasks: List[Any] = []
+                _bc_stop: Optional[int] = None
+                _bc_cand = [used_endpoint]
+
+                async def _bc_worker(wbi: int, wp: Dict[str, Any]) -> None:
+                    try:
+                        _bc_out[wbi] = await _bc_fetch(wp, _bc_cand)
+                    except Exception as exc:  # noqa: BLE001 - re-raised in order below
+                        _bc_out[wbi] = exc
+                        _bc_err_at.append(wbi)
+                    else:
+                        if delay_ms > 0 and wbi < len(batches) - 1:
+                            await asyncio.sleep(delay_ms / 1000.0)
+                    finally:
+                        _bc_sem.release()
+
+                try:
+                    for wbi in range(_bc_next, len(batches)):
+                        await _bc_sem.acquire()
+                        if _bc_err_at:
+                            _bc_sem.release()
+                            break
+                        if _time_budget_exceeded():
+                            _bc_sem.release()
+                            _bc_stop = wbi
+                            break
+                        _bc_tasks.append(asyncio.ensure_future(
+                            _bc_worker(wbi, _bc_payload(wbi, batches[wbi]))))
+                    await asyncio.gather(*_bc_tasks)
+                finally:
+                    for _bt in _bc_tasks:
+                        if not _bt.done():
+                            _bt.cancel()
+
+                for wbi in range(_bc_next, _bc_next + len(_bc_tasks)):
+                    _bo = _bc_out[wbi]
+                    if isinstance(_bo, Exception):
+                        _bc_raised += 1
+                        raise _bo
+                    _bc_apply(wbi, batches[wbi], _bo)
+                if _bc_stop is not None:
+                    _bc_budget_stop()
+        finally:
+            _bc_msg = _batch_conc_line(
+                task.sheet_name, _bc_k, len(batches), len(_bc_durs),
+                time.monotonic() - _bc_t0, _bc_durs,
+                len(failed_batches) + _bc_raised,
+            )
+            res.warnings.append(_bc_msg)
+            logger.warning(_bc_msg)
 
     # ---- v6.25.0 RETRY PASS: one more attempt per failed batch, on the
     # sticky endpoint (or full candidates if none resolved), inside the same
