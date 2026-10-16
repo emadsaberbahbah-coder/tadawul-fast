@@ -2,6 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.22 (2026-10-16) -- RECOVERY TERMINAL EVIDENCE
+# WHY: manual retry planning must read inline artifacts and reject a later
+# attempted recovery without terminal proof instead of reusing older success.
+# Register both evidence regressions in the existing blocking lean lane.
+#
 # VERSION 1.1.21 (2026-10-16) -- WORKFLOW RELIABILITY REGRESSIONS
 # WHY: register failure-injected learning writes, requested historical depth,
 # recovery writer parity, duplicate backup retention and bounded acquisition
@@ -647,6 +652,8 @@ jobs:
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
             tests/test_recovery_writer_control_parity.py \
+            tests/test_manual_recovery_evidence_workflow.py \
+            tests/test_sync_outcome_missing_attempt.py \
             tests/test_workbook_backup_retention.py \
             tests/test_learning_workflow_publication_failures.py \
             tests/test_backtest_history_window.py \

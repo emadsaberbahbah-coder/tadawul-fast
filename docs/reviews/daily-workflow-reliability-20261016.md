@@ -24,6 +24,8 @@ The durable starting checkpoint is
 | --- | --- | --- |
 | P0 | All nine scheduled dashboard syncs observed in the three-day window failed. Latest source run [38821487562](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38821487562) published 6,609 Global Markets rows; recovery certified only 6,160 acquisitions, **93.2062%**, below 95%. All 6,609 retrieval timestamps were fresh, but 341 rows were failed/quarantined/preserved and 108 lacked a valid price. | Data availability/correctness and decision publication are the first repair priority. The audits are correctly refusing incomplete data. Do not weaken them. Recovery recorded 252 P/E quarantines; underlying source triples/vintages are absent, so a safe vendor-data correction is not yet established. Added count-only acquisition receipts to make subsequent diagnosis durable. |
 | P0 | Standalone recovery lacked safeguards and operator-control mappings present in both daily writer lanes. Persistence sanity could default off; quota checks lacked the local EODHD key. | Fixed recovery parity for restored-row sanity, quota protection, identity/retirement/quarantine/currency and hold/status controls. Independent page selection and recovery budget remain unchanged. New opt-in controls keep existing defaults. |
+| P0 | Adversarial replay testing found that a later recovery log with no terminal page verdict could leave an older successful attempt authoritative, in both full-fetch modes. | The follow-up requires scoped terminal evidence for the latest attempt. Missing/conflicting proof blocks the audit/planner; a page is never guessed from unrelated artifacts. Both coverage modes and the real recovery layouts are regression-tested. |
+| P1 | The manual recovery planner downloaded primary logs but omitted the same source run's inline-recovery receipts. A primary failure could therefore trigger another fetch after successful inline recovery. | Added narrowly scoped optional recovery-artifact download before planning. Filesystem regressions prove successful recovery avoids replay, while a later failed/incomplete recovery remains blocked; older source runs without receipts still use primary evidence. This reduces duplicate provider work without certifying missing evidence. |
 | P1 | The 11 October hypothesis run [38161414138](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38161414138) requested 730 days for 16 symbols, but every Yahoo request used `range=1mo`; all six hypotheses had zero events. | Fixed history argument adaptation: Yahoo receives `period=2y`, days-aware providers retain exact day counts. This restores the requested input depth and useful research coverage, not a promise of model accuracy or future trigger events. |
 | P1 | Scorer publication exceptions and false registry-save acknowledgements could leave jobs green despite missing/partial output. These are source defects reproduced offline; recent successful job logs do not show that they occurred in those runs. | Fixed nonzero operational failures, truthful `WRITE_FAILED` receipts and acknowledgement checks. A correctly published S-1 policy FAIL still counts as successful execution. No scoring/promotion policy changed. |
 | P1 | All three recent provider-target schedules rejected an empty cached reference originating from an older failed audit. Current cache-save guards are already correct. | This is an unresolved initial-reference prerequisite. Bootstrap only after an independently verified healthy full sync; do not accept a lower reference or bootstrap automatically to turn the alert green. Exact conditional operator procedure is documented. |
@@ -53,22 +55,37 @@ exercise them. The separate old PR #750 remains open and is not assumed deployed
 
 ## Validation and continuation
 
-All five new regression modules run in the genuine lean environment with only
-NumPy, pytest and PyYAML: **89 tests plus nine subtests passed**, with no skips,
-including existing audit/verdict checks. Additional mapping/manifest checks
-passed 37 tests. Failure injection exercises actual script entrypoints and the
-real Yahoo wrapper through a fake HTTP boundary; storage tests cover Drive,
-OAuth Drive and GCS without remote writes. The backup self-test passed 7/7.
+All seven new regression modules run in the genuine lean environment with only
+NumPy, pytest and PyYAML. The combined suite, including existing workflow audit,
+CI verdict, mapping and manifest checks, passed **164 tests plus nine subtests**
+with no skips. A separate recovery integration run passed **105 tests plus nine
+subtests**. Independent review also passed seven adversarial attempt-order and
+artifact-boundary probes. Failure injection exercises actual script entrypoints
+and the real Yahoo wrapper through a fake HTTP boundary; storage tests cover
+Drive, OAuth Drive and GCS without remote writes. The backup self-test passed 7/7.
+
+Before the final recovery-evidence repair, the complete local suite passed
+**5,180 tests plus 252 subtests**, with 33 skips. Remote full CI at the first
+published repair commit `45ceb27f` independently matched those counts; its modern
+framework lane passed 16 tests with two skips. The final recovery-evidence patch
+adds 58 test cases and is independently rechecked in the PR's next CI runs. Exact
+latest-head outcomes are recorded in the PR rather than treating older green
+checks as proof for a later revision. Four stale version expectations discovered
+during the first full pass were corrected with behavioral assertions retained.
+
 All 15 active Node harnesses passed, including Apps Script syntax. Python
 compilation, fatal-error Ruff checks and the Render environment contract passed.
-Local verifier v1.0.62 matches all 34 module and 32 script version pins. Its
+Local verifier v1.0.63 matches all 34 module and 33 script version pins. Its
 strict local verdict remains DRIFT because the existing timeout/offloop guards
 are unarmed in this shell. This is not a production flag readback; no controls
-were armed to manufacture a CLEAN verdict.
+were armed to manufacture a CLEAN verdict. The workflow audit reports **zero
+errors and zero warnings**; this static result is not a live-health verdict.
 
-The integration full suite, Node checks and remote CI are recorded in the repair
-PR after they finish. The workflow audit now reports **zero errors and zero
-warnings**; this static result is not a live-health verdict.
+A read-only dependency review dispatched on the repair branch passed its typed
+baseline and reported eight existing advisories across Starlette and nltk;
+httpcore's direct-URL distribution was not audited. These remain disclosed
+follow-up work, not a claim that dependency security is clear. No dependency pins
+were changed in this repair.
 
 During the observation window, re-read source SHAs and actual run artifacts,
 compare new outcomes with the checkpoint, and repair only evidenced defects.
