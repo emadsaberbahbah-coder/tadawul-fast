@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.70.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -2102,7 +2102,32 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.69.0"
+SCRIPT_VERSION = "6.70.0"
+# v6.70.0 (2026-10-16) - FW-SKEW: CLASSIFY P/E-COHERENCE QUARANTINES (C2)
+# WHY (GitHub Actions logs, 7 Global_Markets passes 10-14..10-16): every pass
+#   returned HTTP 200 on all 268 backend calls with f429=0 f404=0
+#   fetch_failed=0, yet GM fresh coverage sat at 91.6-93.2% against the 95%
+#   floor. fresh_rows = 6412 - FW-2 strips in all of them: the per-row
+#   identity firewall (|Price/EPS - P/E| / P/E >= 5%) quarantined 70-359 rows
+#   per pass (252 on the 10-16 recovery), FW-KEEP restored last-good rows and
+#   those count as not fresh. The same names recur (IBO.US, PRIM.US, FORM.US,
+#   NNNN.US, HOOD.US) and the count is higher in the US session, the shape of
+#   as-of skew: a live price against a P/E computed at an older fundamentals
+#   snapshot. With zero strips the 10-16 main leg reads 97.0%.
+# WHAT: TFB_SYNC_FW_SKEW_AWARE = off (default; v6.69.0 byte-identical) |
+#   observe | enforce. For every row FW-2 would strip, the pure
+#   _fw_skew_explained() asks whether the mismatch is explained by time
+#   rather than identity: the price the stated P/E was computed at
+#   (EPS x P/E) and today's price must both lie inside the row's OWN 52-week
+#   range (+-2%), with |implied/stated - 1| <= TFB_SYNC_FW_SKEW_MAX_REL
+#   (default 0.35). A row from another instrument almost never satisfies
+#   both. observe: one `[FW-SKEW v6.70.0]` line per page (stripped,
+#   explained, reasons, rel bands, suffixes, samples); rows untouched.
+#   enforce: explained rows keep their freshly fetched cells (no strip, no
+#   last-good restore); unexplained rows are stripped exactly as before.
+#   No tolerance, floor or freshness threshold changes.
+# Functions added: 4 (_fw_skew_mode, _fw_skew_max_rel, _fw_skew_explained,
+# _fw_skew_line; +4 nested formatters). Removed: 0. Kill: unset the Variable.
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -6020,13 +6045,17 @@ def _fabrication_tripwire(
 def _row_identity_firewall(
     headers: list,
     rows_matrix: list,
+    skew: Optional[dict] = None,
 ) -> tuple:
     """v6.24.0 FW-2: blank every cell except Symbol on each OUTGOING row
     that is testable and identity-broken (same per-row rules as
     _coherence_scan); the Warnings column (when locatable) is set to
     'identity_quarantined:v6.24.0'. Mutates rows in place. Returns
     (rows_matrix, stripped_symbols). FAIL-SAFE: any missing column of the
-    triple -> nothing is ever stripped."""
+    triple -> nothing is ever stripped.
+    v6.70.0: `skew` (None = v6.69.0 path) collects the FW-SKEW classification
+    of every row that would be stripped; with skew["enforce"] true, rows the
+    classifier explains are left as fetched."""
     stripped: list = []
     if not headers or not rows_matrix:
         return rows_matrix, stripped
@@ -6043,6 +6072,8 @@ def _row_identity_firewall(
             warn_i = i
             break
     hi = max(px_i, eps_i, pe_i, sym_i)
+    _h52_i = _guard_find_col(hdr, _PSAN_52WH_ALIASES) if skew is not None else -1
+    _l52_i = _guard_find_col(hdr, _PSAN_52WL_ALIASES) if skew is not None else -1
     for r_i, row in enumerate(rows_matrix):
         if not isinstance(row, list) or len(row) <= hi:
             continue
@@ -6065,6 +6096,15 @@ def _row_identity_firewall(
         if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
             continue
         sym = str(row[sym_i]).strip().upper()
+        if skew is not None:                       # v6.70.0 FW-SKEW
+            _h52 = _coh_float(row[_h52_i]) if 0 <= _h52_i < len(row) else None
+            _l52 = _coh_float(row[_l52_i]) if 0 <= _l52_i < len(row) else None
+            _ok, _rel, _why = _fw_skew_explained(
+                px, eps, pe, _h52, _l52, float(skew.get("max_rel", 0.35)))
+            skew.setdefault("rows", []).append((sym, _ok, _rel, _why))
+            if _ok and skew.get("enforce"):
+                skew.setdefault("kept", []).append(sym)
+                continue
         blanked = ["" for _ in row]
         blanked[sym_i] = row[sym_i]
         if 0 <= warn_i < len(blanked):
@@ -6080,6 +6120,88 @@ _PSAN_52WH_ALIASES = frozenset({
 _PSAN_52WL_ALIASES = frozenset({
     "52wlow", "week52low", "fiftytwoweeklow", "52weeklow", "yearlow",
 })
+
+
+def _fw_skew_mode() -> str:
+    """v6.70.0 FW-SKEW: off (default) | observe | enforce, read at call time."""
+    v = (os.getenv("TFB_SYNC_FW_SKEW_AWARE") or "off").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _fw_skew_max_rel() -> float:
+    """v6.70.0: largest |implied/stated - 1| a skew may explain (default 0.35,
+    clamped 0.05..1.0)."""
+    try:
+        v = float(os.getenv("TFB_SYNC_FW_SKEW_MAX_REL") or 0.35)
+    except (TypeError, ValueError):
+        v = 0.35
+    return min(1.0, max(0.05, v))
+
+
+def _fw_skew_explained(px: float, eps: float, pe: float, h52: Optional[float],
+                       l52: Optional[float], max_rel: float,
+                       margin: float = 0.02) -> Tuple[bool, float, str]:
+    """v6.70.0 PURE: is a P/E-coherence mismatch explained by as-of skew?
+    The stated P/E was computed at some price P_snap = EPS x P/E. If P_snap
+    and today's price both lie inside the row's own 52-week range (+-margin)
+    and the drift |px/P_snap - 1| is within max_rel, the fundamentals fit
+    this instrument's own trading history and the gap is time, not identity.
+    -> (explained, rel, reason). Never raises."""
+    try:
+        snap = eps * pe
+        rel = abs(px / snap - 1.0) if snap > 0 else float("inf")
+        if h52 is None or l52 is None:
+            return False, rel, "no_52w"
+        if not (h52 > 0 and l52 > 0 and h52 >= l52):
+            return False, rel, "range_invalid"
+        lo, hi = l52 * (1.0 - margin), h52 * (1.0 + margin)
+        if not (lo <= px <= hi):
+            return False, rel, "px_outside_52w"
+        if not (lo <= snap <= hi):
+            return False, rel, "snap_outside_52w"
+        if rel > max_rel:
+            return False, rel, "rel_over_cap"
+        return True, rel, "explained"
+    except Exception:  # noqa: BLE001 - a classifier must never break the write
+        return False, float("inf"), "error"
+
+
+def _fw_skew_line(page: str, mode: str, skew: dict) -> str:
+    """v6.70.0 PURE: the one FW-SKEW read-back line per page. No braces (the
+    Actions log masks them). Bands are |implied/stated - 1|."""
+    rows = list(skew.get("rows") or [])
+    expl = [r for r in rows if r[1]]
+    unex = [r for r in rows if not r[1]]
+
+    def _counts(items) -> str:
+        c: Dict[str, int] = {}
+        for k in items:
+            c[k] = c.get(k, 0) + 1
+        return ",".join(f"{k}:{v}" for k, v in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
+
+    def _band(rel: float) -> str:
+        if rel < 0.10:
+            return "lt10"
+        if rel < 0.20:
+            return "10-20"
+        if rel <= 0.35:
+            return "20-35"
+        return "gt35"
+
+    def _sfx(sym: str) -> str:
+        return sym.rsplit(".", 1)[1] if "." in sym else "bare"
+
+    def _pct(rel: float) -> str:
+        return "inf" if rel == float("inf") else f"{rel * 100:.1f}%"
+
+    return (f"[FW-SKEW v{SCRIPT_VERSION}] page={page} mode={mode} would_strip={len(rows)} "
+            f"explained={len(expl)} kept={len(skew.get('kept') or [])} "
+            f"reasons={_counts(r[3] for r in rows)} "
+            f"rel_explained={_counts(_band(r[2]) for r in expl)} "
+            f"rel_unexplained={_counts(_band(r[2]) for r in unex)} "
+            f"suffix_explained={_counts(_sfx(r[0]) for r in expl)} "
+            f"sample_explained=[{','.join(f'{r[0]}:{_pct(r[2])}' for r in expl[:8])}] "
+            f"sample_unexplained=[{','.join(f'{r[0]}:{r[3]}:{_pct(r[2])}' for r in unex[:8])}]")
 
 
 def _persist_sanity_enabled() -> bool:
@@ -13882,9 +14004,18 @@ async def _run_one_task(
                 and rows_matrix and headers
                 and task.sheet_name in _RANKED_MARKET_PAGES):
             try:
-                rows_matrix, _idfw_stripped = _row_identity_firewall(
-                    headers, rows_matrix
-                )
+                _skew_mode = _fw_skew_mode()       # v6.70.0 FW-SKEW (off = v6.69.0)
+                _skew = (None if _skew_mode == "off" else
+                         {"enforce": _skew_mode == "enforce",
+                          "max_rel": _fw_skew_max_rel()})
+                rows_matrix, _idfw_stripped = (
+                    _row_identity_firewall(headers, rows_matrix)
+                    if _skew is None else           # off: the exact v6.69.0 call
+                    _row_identity_firewall(headers, rows_matrix, _skew))
+                if _skew is not None and _skew.get("rows"):
+                    _skew_msg = _fw_skew_line(task.sheet_name, _skew_mode, _skew)
+                    res.warnings.append(_skew_msg)
+                    logger.warning(_skew_msg)
                 # --- v6.31.0 FW-5: fabricated-placeholder tripwire --------
                 # Merges into _idfw_stripped so FW-KEEP last-good restore
                 # and the FW-3 verdict cover FW-5 strips with zero plumbing.

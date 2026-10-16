@@ -23,6 +23,8 @@ SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_TAB": "off",
     "TFB_SYNC_RETIRE_TAB_NAME": "_Retired_Symbols",
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
+    "TFB_SYNC_FW_SKEW_AWARE": "off",
+    "TFB_SYNC_FW_SKEW_MAX_REL": "0.35",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
 }
