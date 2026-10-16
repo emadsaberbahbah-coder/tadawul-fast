@@ -84,3 +84,47 @@ def test_main_prints_one_notice_per_page_with_a_gap_and_exit_code_unchanged(monk
     payload = json.loads(out[: out.index("\n::")])
     assert payload["pages"][0]["blank_name_symbols"] == ["S0001.US", "S0002.US"]
     assert payload["summary"]["exit_code"] == 2
+
+
+def test_final_job_entry_point_prints_the_same_notice(monkeypatch, capsys, tmp_path):
+    """The scheduled final job runs finalize_decision_publication.py, not this
+    module's main(); it must print the same notice from its own result JSON."""
+    from scripts import finalize_decision_publication as finalize
+    gm = audit_grid(grid(100, {"S0002.US", "S0001.US"}), gm_rule(), HEADERS, NOW)
+    clean = audit_grid(grid(10, set()), Rule("Market_Leaders", 1, 30, 95, 99, 95), HEADERS, NOW)
+    cov_payload = Report(NOW.isoformat(), "x", "s", [], pages=[gm, clean]).payload()
+    fake = {"script_version": finalize.SCRIPT_VERSION, "run_id": "1", "policy": {},
+            "audits": {"coverage": json.loads(json.dumps(cov_payload)), "decision": {"exit_code": 0}},
+            "audit_exit_codes": [2, 0], "blockers": ["coverage_failed"], "feed_promoted": False,
+            "blocker_published": False, "exit_code": 2}
+
+    async def fake_run(*_a, **_k):
+        return fake
+    monkeypatch.setattr(finalize, "run", fake_run)
+    out_json = tmp_path / "final.json"
+    code = finalize.main(["--sheet-id", "abc", "--json-out", str(out_json)])
+    lines = capsys.readouterr().out.splitlines()
+    assert code == 2
+    summary = json.loads(lines[0])                      # first line is still the summary JSON
+    assert summary["blockers"] == ["coverage_failed"] and summary["exit_code"] == 2
+    assert lines[1:] == ["::notice::Global_Markets: blank-name symbols 2 (name_pct=98.0): S0001.US, S0002.US"]
+    assert json.loads(out_json.read_text()) == json.loads(json.dumps(fake))   # result JSON untouched
+
+
+def test_finalizer_prints_nothing_extra_without_a_gap(monkeypatch, capsys, tmp_path):
+    from scripts import finalize_decision_publication as finalize
+
+    async def fake_run(*_a, **_k):
+        return {"exit_code": 0, "audits": {"coverage": {"pages": [{"page": "Global_Markets", "blank_name_count": 0}]}}}
+    monkeypatch.setattr(finalize, "run", fake_run)
+    assert finalize.main(["--sheet-id", "abc", "--json-out", str(tmp_path / "f.json")]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 1
+
+
+def test_notice_helper_matches_both_entry_points():
+    page = {"page": "Global_Markets", "blank_name_count": 61, "name_pct": 97.5,
+            "blank_name_symbols": [f"S{i:04d}.US" for i in range(61)]}
+    line = coverage.name_gap_notice(page)
+    assert line.startswith("::notice::Global_Markets: blank-name symbols 61 (name_pct=97.5): S0000.US, ")
+    assert line.endswith("S0059.US ...") and "S0060.US" not in line
+    assert "{" not in line and "}" not in line

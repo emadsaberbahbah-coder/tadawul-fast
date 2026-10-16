@@ -10,10 +10,13 @@ said WHICH symbols, so the owner could not label them (NAME-LABELS registry)
 or retire them (P0-4/D3 list), and the gap never closed. WHAT: each page
 result gains blank_name_count and blank_name_symbols (sorted, first 200)
 for pages with a name rule; portfolio rules are excluded (no holdings data
-is ever listed). main() prints one ::notice line per page with a gap. Rules,
+is ever listed). Both entry points print one ::notice line per page with a
+gap (this main() and finalize_decision_publication.main(), the final-job
+entry point, via name_gap_notice). Rules,
 floors, failures, warnings, status and exit codes are UNCHANGED (pinned by
 a test that compares them with the field-free result). Functions added: 0;
-removed: 0. Rollback: revert.
+removed: 0 (one pure helper added:
+name_gap_notice). Rollback: revert.
 
 VERSION 1.3.1 — exact scoped membership requires an independent complete A:A
 read crossbound to the quality scan. Sparse tails beyond the audit bound fail
@@ -390,12 +393,19 @@ async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None,
         except Exception as e: rep.pages.append(Result(rule.page,status="FAIL",min_rows=rule.min_rows,failures=[f"audit failed: {e}"]))
     return rep
 
+def name_gap_notice(page: dict) -> str:
+    """v1.3.2 PURE: the one name-gap ::notice line for a page result dict
+    (asdict(Result) or the same dict inside a JSON payload). No braces."""
+    syms=[str(x) for x in (page.get("blank_name_symbols") or [])]; n=int(page.get("blank_name_count") or 0)
+    return (f"::notice::{page.get('page')}: blank-name symbols {n} (name_pct={page.get('name_pct')}): "
+            f"{', '.join(syms[:60])}{' ...' if n>60 else ''}")
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("--sheet-id",default=os.getenv("DEFAULT_SPREADSHEET_ID", "")); ap.add_argument("--max-rows",type=int,default=env_i("TFB_REFRESH_AUDIT_MAX_ROWS",DEFAULT_MAX_ROWS)); ap.add_argument("--json-out",default=""); a=ap.parse_args(argv)
     rep=asyncio.run(run(a.sheet_id,max(100,a.max_rows))); text=json.dumps(rep.payload(),ensure_ascii=False,indent=2); print(text)
     for p in rep.pages: print(f"::{'error' if p.failures else ('warning' if p.warnings else 'notice')}::{p.page}: {p.status}, rows={p.rows}, unique={p.unique}, fresh_pct={p.fresh_pct}, failures={'; '.join(p.failures[:3]) or 'none'}")
     for p in rep.pages:
-        if p.blank_name_count: print(f"::notice::{p.page}: blank-name symbols {p.blank_name_count} (name_pct={p.name_pct}): {', '.join(p.blank_name_symbols[:60])}{' ...' if p.blank_name_count>60 else ''}")
+        if p.blank_name_count: print(name_gap_notice(asdict(p)))
     if rep.fatal: print(f"::error::FULL_REFRESH_AUDIT_FATAL: {rep.fatal}")
     if a.json_out: Path(a.json_out).write_text(text+"\n",encoding="utf-8")
     return rep.code

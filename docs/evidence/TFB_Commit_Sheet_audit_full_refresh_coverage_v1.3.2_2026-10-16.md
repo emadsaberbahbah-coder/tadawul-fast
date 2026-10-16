@@ -6,7 +6,7 @@ S0/S1 — Base pin
 |---|---|
 | Base | `origin/main` 11ef1345, `audit_full_refresh_coverage.py` v1.3.1 (382 lines, 28 defs) |
 | Delivered | v1.3.2. Defs 28 → 28: 0 added, 0 removed (AST). Two `Result` fields added: `blank_name_count`, `blank_name_symbols` |
-| Other files | `tests/test_coverage_name_gap_v132.py` (NEW, 5 tests) · `.github/workflows/ci.yml` (lean list +1 line, next to `test_full_refresh_coverage.py`) · `scripts/verify_deployment.py` (pin line 1.3.1 → 1.3.2 only) · this sheet |
+| Other files | `tests/test_coverage_name_gap_v132.py` (NEW, 8 tests) · `scripts/finalize_decision_publication.py` 1.1.1 → 1.1.2 (log-only notice, see S7) · `.github/workflows/ci.yml` (lean list +1 line, next to `test_full_refresh_coverage.py`) · `scripts/verify_deployment.py` (two pin lines: coverage 1.3.2, finalize 1.1.2) · this sheet |
 
 S2 — Why (evidence)
 - The final publication audit applies `Rule(page, floor, age, fresh, 99, 95)` (`finalize_decision_publication.py:74`). The Global_Markets names floor of 99% failed in 5 of 5 sampled audits (names 97.00 / 97.99 / 98.11 % …).
@@ -37,3 +37,15 @@ S6 — Owner use (nothing armed)
 1. After the next sync, read the `blank-name symbols` notice in the "Verify final decision publication" job, or `pages[Global_Markets].blank_name_symbols` in `final_decision_publication.json`.
 2. Label the real instruments through the NAME-LABELS registry, and put the dead ones on the D3 retirement list (Saturday decision, k ∈ [68, 97]). Clearing 57+ names clears the names floor without touching it.
 Rollback: revert (the fields are additive).
+
+S7 — Review fix (Codex P2 on #789, comment 4292646971): the notice must reach the final job
+Problem: the scheduled "Verify final decision publication" job runs `finalize_decision_publication.py`, which calls `coverage.run()` directly and prints only a compact summary line. The v1.3.2 notice was printed only by the coverage module's own `main()`, so the final job's log would not have shown it.
+Fix:
+- New pure helper `audit_full_refresh_coverage.name_gap_notice(page_dict)`, used by both entry points.
+- `finalize_decision_publication` 1.1.2 prints the same `::notice::` line for each coverage page with a gap, after its unchanged summary line. The print is inside a try/except, so it can never change the result.
+- The result JSON, blockers, exit codes and the feed write are unchanged (pinned by test).
+Tests: 8 passed ×3. The 3 new tests cover:
+- the final entry point prints the notice, its first line is still the summary JSON, and the result file is unchanged;
+- nothing extra is printed when there is no gap;
+- the helper format (60-symbol cap, no braces).
+Related suites: 461 passed, 10 skipped. The dual-tree check is still identical on 300 grids.
