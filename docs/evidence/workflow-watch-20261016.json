@@ -1,0 +1,36 @@
+{
+  "observation_start": "2026-10-16T10:28:42+03:00",
+  "observation_end": "2026-10-17T10:28:42+03:00",
+  "timezone": "Asia/Riyadh",
+  "cadence": "hourly",
+  "scheduled_occurrences": 24,
+  "continuous_execution": false,
+  "source_main_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+  "repair_branch": "codex/daily-workflow-reliability-2026-10-16",
+  "initial_observations": {
+    "sync_run_id": 38821487562,
+    "global_requested": 6609,
+    "global_timestamp_fresh": 6609,
+    "global_successful_acquisitions": 6160,
+    "global_invalid_acquisitions": 449,
+    "global_reason_counts": {
+      "failed_or_quarantined_or_preserved": 341,
+      "price_missing_or_invalid": 108
+    },
+    "global_recovery_pe_quarantines": 252,
+    "global_name_coverage_pct": 98.1389,
+    "minimum_acquisition_pct": 95,
+    "minimum_name_pct": 99,
+    "backend_health": "healthy",
+    "backend_ready": true,
+    "backend_commit_matches_main": true,
+    "provider_reference": "empty historical baseline, explicit bootstrap requires independently healthy full sync"
+  },
+  "unresolved_inputs": [
+    "Same-run failed raw market price/EPS/P-E triples and supplier source/vintage receipts for the quarantined rows.",
+    "Reviewed instrument identities/availability for missing/invalid quotes; never substitute a fabricated price.",
+    "Independent healthy full-sync evidence before any provider-monitor baseline bootstrap.",
+    "Publication authorization before merging/deploying review-branch changes."
+  ],
+  "safety_contract": "Do not lower acquisition/name/identity/funding gates or change financial policy to make failed jobs green; never blindly replay writer or email jobs."
+}

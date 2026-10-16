@@ -2,6 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.21 (2026-10-16) -- WORKFLOW RELIABILITY REGRESSIONS
+# WHY: register failure-injected learning writes, requested historical depth,
+# recovery writer parity, duplicate backup retention and bounded acquisition
+# diagnostics in the existing blocking lean lane. Required verdict unchanged.
+#
 # VERSION 1.1.20 (2026-10-14) -- TOP-10 KPI LABEL COMPATIBILITY
 #
 # v1.1.20: run the acceptance/digest KPI-reader regressions in the blocking
@@ -641,6 +646,11 @@ jobs:
             tests/test_sheet_payload_digest.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
+            tests/test_recovery_writer_control_parity.py \
+            tests/test_workbook_backup_retention.py \
+            tests/test_learning_workflow_publication_failures.py \
+            tests/test_backtest_history_window.py \
+            tests/test_sync_acquisition_diagnostics.py \
             tests/test_verify_optional_rollout_flags.py \
             tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \

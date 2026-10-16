@@ -89,7 +89,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
+
+# WHY v1.5.1 (2026-10-16): Drive allows repeated names after a same-day
+# rerun. Retention counts distinct dated names, and pruning visits every
+# expired file ID once. Retained copies and foreign files remain untouched.
 # v1.5.0 (2026-10-11) [WP-0] — ENV-GATED LOCAL COPY OF THE EXPORTED BYTES.
 # WHY: the WP-0 DQ harness (scripts/tfb_workbook_dq_audit.py) must measure
 # the SAME bytes this job just exported, in the SAME job, without a second
@@ -303,11 +307,11 @@ def sha256_hex(data: bytes) -> str:
 
 def plan_pruning(names: List[str], keep_daily: int, keep_monthly: int
                  ) -> Tuple[List[str], List[str]]:
-    """(keep, delete) over folder file NAMES. Newest-by-embedded-date wins;
+    """(keep, delete) over distinct folder file NAMES. Newest-by-embedded-date wins;
     anything not matching either pattern is LEFT ALONE (never delete a file
     this script did not name)."""
-    dailies = sorted((n for n in names if _DAILY_RE.match(n)), reverse=True)
-    monthlies = sorted((n for n in names if _MONTHLY_RE.match(n)), reverse=True)
+    dailies = sorted({n for n in names if _DAILY_RE.match(n)}, reverse=True)
+    monthlies = sorted({n for n in names if _MONTHLY_RE.match(n)}, reverse=True)
     keep = dailies[:keep_daily] + monthlies[:keep_monthly]
     delete = dailies[keep_daily:] + monthlies[keep_monthly:]
     return keep, delete
@@ -898,25 +902,34 @@ def run_backup(dry_run: bool) -> int:
     keep_d = _env_int("TFB_BACKUP_KEEP_DAILY", 30)
     keep_m = _env_int("TFB_BACKUP_KEEP_MONTHLY", 12)
     _keep, delete = plan_pruning(names, keep_d, keep_m)
-    by_name = {f.get("name"): f.get("id") for f in listing}
+    expired_names = set(delete)
+    attempted_ids = set()
+    deleted_ids = set()
     deleted = 0
-    for n in delete:
-        fid = by_name.get(n)
-        if not fid:
+    for file in listing:
+        n = file.get("name")
+        fid = file.get("id")
+        if n not in expired_names or not fid or fid in attempted_ids:
             continue
+        attempted_ids.add(fid)
         try:
             _store_delete(dsess, dest, container, fid)
             deleted += 1
+            deleted_ids.add(fid)
         except Exception as e:  # noqa: BLE001
             _out(f"WARN: prune failed for {n}: {e}")
 
-    d_count = sum(1 for n in names if _DAILY_RE.match(n)) - deleted \
-        if deleted else sum(1 for n in names if _DAILY_RE.match(n))
-    m_count = sum(1 for n in names if _MONTHLY_RE.match(n))
+    remaining_names = {f.get("name", "") for f in listing
+                       if f.get("id") not in deleted_ids}
+    remaining_names.add(daily_name(today))
+    if monthly_done:
+        remaining_names.add(monthly_done)
+    d_count = sum(1 for n in remaining_names if _DAILY_RE.match(n))
+    m_count = sum(1 for n in remaining_names if _MONTHLY_RE.match(n))
     msg = (f"[BACKUP v{__version__}] name={daily_name(today)} "
            f"bytes={len(data)} sha={sha} monthly={monthly_done or '-'} "
-           f"pruned={deleted} daily~{min(d_count, keep_d)}/{keep_d} "
-           f"monthly~{min(m_count, keep_m)}/{keep_m}")
+           f"pruned={deleted} daily~{d_count}/{keep_d} "
+           f"monthly~{m_count}/{keep_m}")
     _out(msg)
     append_run_log("OK", msg, {"bytes": len(data), "sha": sha,
                                "monthly": monthly_done, "pruned": deleted})
