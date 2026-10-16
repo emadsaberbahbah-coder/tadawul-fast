@@ -2,6 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.23 (2026-10-16) -- HOURLY WATCH REGRESSIONS
+# WHY: the scheduled backtest skipped the producer Risk Bucket field. Keep
+# its CLI/legacy-column regression in the blocking lean decision suite.
+# Calendar request regressions use the blocking HTTP-capable contract lane.
+#
 # VERSION 1.1.22 (2026-10-16) -- RECOVERY TERMINAL EVIDENCE
 # WHY: manual retry planning must read inline artifacts and reject a later
 # attempted recovery without terminal proof instead of reusing older success.
@@ -585,6 +590,7 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_tfb_backtest_rank_evidence.py \
+            tests/test_tfb_backtest_risk_column.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
             tests/test_task_error_redaction.py \
@@ -769,6 +775,7 @@ jobs:
             tests/test_portfolio_reconciliation_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
+            tests/test_calendar_london_requests.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \

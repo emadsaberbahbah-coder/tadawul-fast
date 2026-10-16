@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tfb_backtest.py — v1.1.1 (2026-10-08)
+tfb_backtest.py — v1.1.2 (2026-10-16)
 ================================================================================
+WHY v1.1.2: scheduled run 38881044190 evaluated seven default signals and
+reported "Entry Risk Bucket" missing in every pass. PerformanceStore's
+canonical column is "Risk Bucket". Default all-signal selection now uses
+that source column; legacy exports fall back to "Entry Risk Bucket" only
+when the canonical header is absent. Explicit --signal requests stay exact,
+and a present canonical column is never filled from another column. No
+outcomes, scores, statistical calculations or policy thresholds change.
+
 WHY: the Strategy's rule is "register a hypothesis, backtest it, then change a
 weight or gate". H-28 (stated reliability predicts outcomes) was rejected by an
 ad-hoc computation; this makes that computation a repeatable instrument so any
@@ -47,9 +55,20 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
-                   "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
+                   "Entry Recommendation", "Risk Bucket", "Horizon", "Origin Tab"]
+
+
+def default_signals(headers: List[str]) -> List[str]:
+    """Resolve only the default risk-column alias, using header evidence.
+
+    Prefer the producer's canonical header even when its cells are blank;
+    never merge per-row values or reinterpret explicit --signal requests.
+    """
+    legacy_risk = "Risk Bucket" not in headers and "Entry Risk Bucket" in headers
+    return ["Entry Risk Bucket" if legacy_risk and signal == "Risk Bucket" else signal
+            for signal in DEFAULT_SIGNALS]
 
 
 def _s(v: Any) -> str:
@@ -392,7 +411,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             k, v = item.split("=", 1)
             flt[k.strip()] = v.strip()
     coh = decided_cohorts(recs, hz, flt or None, a.since.strip(), a.until.strip())
-    signals = a.signal or (DEFAULT_SIGNALS if a.all_signals else ["Entry Forecast Reliability"])
+    signals = a.signal or (default_signals(hdr) if a.all_signals else ["Entry Forecast Reliability"])
     edges = [float(x) for x in a.edges.split(",") if x.strip()] or None
     results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n) for sg in signals if sg in hdr]
     missing = [sg for sg in signals if sg not in hdr]

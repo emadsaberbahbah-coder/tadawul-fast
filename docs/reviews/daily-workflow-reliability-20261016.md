@@ -33,6 +33,68 @@ The durable starting checkpoint is
 | P2 | Only six of 63 intraday cron targets produced scheduled runs over 13–15 October; all six started after the declared market window despite green exits. | Scheduling delivery is a real service limitation, separate from script exceptions. Recorded exact target/start evidence. Do not treat a delayed green run as a 15-minute refresh SLA, backdate captures, or add provider load blindly. External dispatcher/cadence decisions remain open. |
 | P3 | The workflow auditor reported optional empty-fallback Variable mappings as active force-refetch overrides. | Fixed static reporting. Literal nonempty overrides remain visible; expressions are not presented as live Variable readbacks. |
 
+## Hourly follow-up: 16 October, 10:28 UTC / 13:28 Riyadh
+
+New scheduled sync [38878037327](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38878037327)
+is running unchanged main `11ef1345` with runner 6.69.0. Its primary Global
+Markets leg acquired **6,217/6,609 rows (94.0687%)**, leaving 392 nonfresh rows
+and needing 62 additional acquisitions to reach 95%. It restored 195 P/E
+quarantines from last-good; no quota restriction or time-budget exhaustion was
+observed. These are primary-leg counts, not a completed recovery result. Inline
+recovery and final publication remain pending. Mutual Funds acquired 2,390/2,474
+(96.6047%), Market Leaders 250/255 (98.0392%), and Commodities/FX 431/453
+(95.1435%). Final name coverage is not established by the primary leg's capped
+1,500-row validator.
+
+Four new scheduled jobs completed: digest, calendar, shadow board and signal
+backtest. Decoded logs confirm digest delivery with **NOT ACTIONABLE** status,
+calendar publication, board execution and backtest artifacts. The board's risk
+BREACH remains a domain outcome. Successful execution is not a live Sheet
+readback or evidence that final sync publication passed.
+
+The signal backtest run [38881044190](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38881044190)
+exposed a concrete lookup defect: every pass skipped `Entry Risk Bucket`, while
+the tracker writes the canonical `Risk Bucket` column. Backtester v1.1.2 uses
+that canonical column for default all-signal analysis, falls back to the legacy
+header only when the canonical header is absent, and preserves explicit signal
+requests. Blank canonical values are never filled from legacy data. Statistical
+calculations, evidence selection and policy thresholds are unchanged.
+
+Calendar run [38882697051](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38882697051)
+published successfully after an earnings-batch HTTP 404, also seen on 15 October.
+The API path and parameter keys match the vendor contract. The job's 383 rows
+include **355 retained prior-only rows** and 28 harvested rows, of which 27 have
+at least one date; this does not certify fresh earnings coverage. Yahoo fallback
+INFO messages are suppressed by the CLI's existing logging configuration, so
+its successful field counts cannot be reconstructed from this log. Prior ASOF
+and source preservation are unchanged; a maximum observation-age policy remains
+an owner decision.
+
+A separate request-format defect is verified: the calendar passed Yahoo's `.L`
+London suffix through to EODHD, whose documented exchange suffix is `.LSE`.
+Calendar provider v1.2.3 now canonicalizes that suffix only at its existing API
+request boundary, preserving original result keys and existing deduplication.
+The quote provider already implements this conversion. This adds no retry or
+batch splitting and leaves Saudi/other-market behavior unchanged. The live 404
+cause remains unproved until a deployed run supplies evidence; this repair is
+not a claim that the supplier outage is resolved. Contract references:
+[EODHD calendar](https://eodhd.com/financial-apis/calendar-upcoming-earnings-ipos-and-splits)
+[EODHD exchange-code catalogue](https://eodhd.com/financial-apis/exchanges-api-list-of-tickers-and-trading-hours).
+
+PRs #786, #787 and stacked #790 remain open and overlap the scorer/runner/version
+pins in #785. Preserve both sets of fixes during any later integration; none is
+assumed deployed. The backend remained healthy/ready at 10:28 UTC with deployed
+SHA matching main and zero route failures/startup warnings/readiness reasons.
+Follow-up validation passed 38 backtest tests and 122 calendar/publication/
+redaction tests, including 29 new regression cases. Calendar checks ran in the
+actual contract-only dependency environment. Independent review confirmed that
+cohort/statistical functions and all existing calendar functions except symbol
+splitting remain unchanged. Another 25 workflow/verdict/manifest checks plus
+nine subtests passed; compile, fatal Ruff and strict workflow audit passed.
+Verifier v1.0.64 matches 34 module and 34 script pins; its existing local
+unarmed-switch DRIFT is not a production readback. Final-head CI results are
+recorded in PR #785 after the follow-up commit is pushed.
+
 ## What was verified and what remains unknown
 
 The backend was healthy and ready at 07:28 UTC / 10:28 Riyadh, with Python
@@ -67,8 +129,10 @@ Drive, OAuth Drive and GCS without remote writes. The backup self-test passed 7/
 Before the final recovery-evidence repair, the complete local suite passed
 **5,180 tests plus 252 subtests**, with 33 skips. Remote full CI at the first
 published repair commit `45ceb27f` independently matched those counts; its modern
-framework lane passed 16 tests with two skips. The final recovery-evidence patch
-adds 58 test cases and is independently rechecked in the PR's next CI runs. Exact
+framework lane passed 16 tests with two skips. At recovery-evidence head
+`523cc4f6`, exact-head remote full CI passed **5,238 tests plus 252 subtests**,
+with 33 skips; the modern lane passed 16 tests with two skips. All blocking
+checks passed. The hourly follow-up above changes that head again; its exact
 latest-head outcomes are recorded in the PR rather than treating older green
 checks as proof for a later revision. Four stale version expectations discovered
 during the first full pass were corrected with behavioral assertions retained.
