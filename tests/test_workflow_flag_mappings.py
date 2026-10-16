@@ -117,9 +117,23 @@ def test_s1_base_policy_requires_an_operator_variable_and_defaults_legacy():
     assert workflow["jobs"]["score"]["env"]["TFB_S1_BASE_POLICY"] == _mapping("TFB_S1_BASE_POLICY", "legacy")
 
 
+def test_s1_window_start_is_inert_by_default():
+    workflow = _workflow("shadow_scorer.yml")
+    assert workflow["jobs"]["score"]["env"]["TFB_S1_WINDOW_START"] == _mapping("TFB_S1_WINDOW_START", "")
+
+
+@pytest.mark.parametrize("name,default", [("TFB_BOARD_FREEZE_NONTRADING", "off"),
+                                          ("TFB_BOARD_FREEZE_HOLIDAYS", "")])
+def test_board_freeze_requires_an_operator_variable_and_defaults_off(name, default):
+    workflow = _workflow("shadow_board.yml")
+    assert workflow["jobs"]["shadow"]["env"][name] == _mapping(name, default)
+
+
 def test_behavior_flags_are_scoped_to_writer_lanes_and_do_not_leak_into_ci():
-    names = TRACKER_DEFAULTS.keys() | SYNC_DEFAULTS.keys() | {"TFB_S1_CRITERIA_V2", "TFB_S1_BASE_POLICY"}
-    for workflow_name in ("track_performance.yml", "daily_sync.yml", "shadow_scorer.yml"):
+    names = TRACKER_DEFAULTS.keys() | SYNC_DEFAULTS.keys() | {
+        "TFB_S1_CRITERIA_V2", "TFB_S1_BASE_POLICY", "TFB_S1_WINDOW_START",
+        "TFB_BOARD_FREEZE_NONTRADING", "TFB_BOARD_FREEZE_HOLIDAYS"}
+    for workflow_name in ("track_performance.yml", "daily_sync.yml", "shadow_scorer.yml", "shadow_board.yml"):
         workflow = _workflow(workflow_name)
         assert not names.intersection(workflow.get("env", {}))
     daily = _workflow("daily_sync.yml")

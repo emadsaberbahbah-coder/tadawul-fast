@@ -77,6 +77,10 @@ jobs:
       # lastscored on run_shadow_scorer < 1.9.4 (empty-board base lock).
       # Rollback: delete the repository Variable.
       TFB_S1_BASE_POLICY: ${{ vars.TFB_S1_BASE_POLICY || 'legacy' }}
+      # Criteria-v2 window start (YYYY-MM-DD). INERT: empty = the script's
+      # own default (2026-09-16). Only read when TFB_S1_CRITERIA_V2 is armed;
+      # setting it records a Register section 5 boundary. Rollback: delete.
+      TFB_S1_WINDOW_START: ${{ vars.TFB_S1_WINDOW_START || '' }}
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is
