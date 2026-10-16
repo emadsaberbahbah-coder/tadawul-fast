@@ -490,6 +490,11 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 #   excluded:<reason>>`: what lastscored WOULD decide today, computed by
 #   the pure ls_day_verdict() from the same lastscored measurement, so one
 #   observe run answers the arming question without arithmetic by hand.
+#   (d) a lastscored base that holds NO stored price (a scored day whose
+#   seats were all new and unpriced, e.g. Saudi names on a US-only session)
+#   would pair nothing and stay the base forever; such a run pairs against
+#   the legacy rows for every basket instead and says `fallback=empty-base`
+#   (found independently by the 10-16 S-1 lane review).
 # UNTOUCHED: legacy (env unset) output on every surface is byte-identical to
 # v1.9.3 except the version token; observe rows are legacy rows; count_scored
 # _days, evaluate_s1, basket math, fresh floor, HISTORY_HEADER, constants.
@@ -2040,12 +2045,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bp_mode = _base_policy()
     _prev_legacy = prev
     _prev_ls: Dict[str, Optional[Dict[str, Any]]] = {}
+    _ls_fallback = ""                              # v1.9.4 aligned legacy fallback
     if _bp_mode != "legacy":
         _prev_ls = {b: last_scored_row_for(history, b) for b in prev}
         if _sg_on:
             _prev_ls = _sg_filter_prev(_prev_ls)
         if _bp_mode == "lastscored":
-            prev = _prev_ls
+            _lsc = _prev_ls.get(CHALLENGER)
+            if _lsc is not None and not any(_v for _v in (_lsc.get("prices") or {}).values()):
+                # v1.9.4: a scored base with no stored price can never pair, and
+                # it stays the base until another day scores - a lock. Pair this
+                # run against the legacy rows for EVERY basket (same interval).
+                _ls_fallback = "empty-base"
+            else:
+                prev = _prev_ls
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
     new_forks = dedupe_new_forks(
         existing_forks,
@@ -2116,20 +2129,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bp_pairable = len([1 for _s, _p0 in ((_chal_m["p"] or {}).get("prices") or {}).items()
                         if _p0]) if _chal_m["p"] else 0
     _chal_frac_legacy = _chal_frac
-    if _bp_mode == "lastscored" and _bp_pairable > 0 and chal_syms:
+    if _bp_mode == "lastscored" and not _ls_fallback and _bp_pairable > 0 and chal_syms:
         _chal_frac = _chal_m["n_fresh"] / _bp_pairable   # v1.9.4: empty stays 0.0
     _base_line = ""
     _ls_probe = None                               # v1.9.4 observe ls_day inputs
     if _bp_mode != "legacy":
         try:
-            _alt_prev = _prev_ls if _bp_mode == "observe" else _prev_legacy
+            _obs_like = _bp_mode == "observe" or bool(_ls_fallback)   # v1.9.4
+            _alt_prev = _prev_ls if _obs_like else _prev_legacy
             _m_cur_c, _m_cur_b = measured[CHALLENGER], measured[BENCHMARK]
             _m_alt_c = _measure_one(CHALLENGER, _alt_prev.get(CHALLENGER), spot, spot_asof)
             _m_alt_b = _measure_one(BENCHMARK, _alt_prev.get(BENCHMARK), spot, spot_asof)
-            _leg_c = _m_cur_c if _bp_mode == "observe" else _m_alt_c    # legacy pairing
-            _ls_c = _m_alt_c if _bp_mode == "observe" else _m_cur_c     # lastscored pairing
-            _leg_b = _m_cur_b if _bp_mode == "observe" else _m_alt_b
-            _ls_b = _m_alt_b if _bp_mode == "observe" else _m_cur_b
+            _leg_c = _m_cur_c if _obs_like else _m_alt_c    # legacy pairing
+            _ls_c = _m_alt_c if _obs_like else _m_cur_c     # lastscored pairing
+            _leg_b = _m_cur_b if _obs_like else _m_alt_b
+            _ls_b = _m_alt_b if _obs_like else _m_cur_b
             def _f(v: Optional[float]) -> str:
                 return "n/a" if v is None else f"{v:+.4f}%"
             _a_leg = (None if (_leg_c["ret"] is None or _leg_b["ret"] is None)
@@ -2137,11 +2151,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             _a_ls = (None if (_ls_c["ret"] is None or _ls_b["ret"] is None)
                      else _ls_c["ret"] - _ls_b["ret"])
             _a_delta = (None if (_a_leg is None or _a_ls is None) else _a_ls - _a_leg)
-            _ls_base = (_prev_ls.get(CHALLENGER) or {}).get("date") if _bp_mode == "observe" \
+            _ls_base = (_prev_ls.get(CHALLENGER) or {}).get("date") if _obs_like \
                 else (prev.get(CHALLENGER) or {}).get("date")
             _leg_base = (_prev_legacy.get(CHALLENGER) or {}).get("date")
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
-                          f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
+                          + (f"fallback={_ls_fallback} " if _ls_fallback else "")
+                          + f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
                           f"lastscored={_f(_ls_c['ret'])}@{_ls_base or '-'} "
                           f"legs={_ls_c['n_fresh']}/{_ls_c.get('pairable', _bp_pairable)} | "
                           f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "

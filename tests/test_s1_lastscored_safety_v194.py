@@ -16,6 +16,8 @@ new names and was excluded by the legacy denominator (`chal fresh=1/4`).
   L5 pure ls_day_verdict precedence table
   L6 legacy rows/gate/_Run_Log byte-identical to the base module on the L1 and
      L2 stubs (version token aside) - runs only when S1_BASE=<v1.9.3 file>
+  L7 a scored lastscored base with no stored price: aligned legacy fallback for
+     every basket, `fallback=empty-base` on the read-back
 Set S1_FILE=<path> to test a file outside the repo tree.
 Run under pytest in an isolated subprocess.
 """
@@ -246,6 +248,24 @@ def main():
     for args, want in table:
         assert f(*args) == want, (args, f(*args), want)
     print(f"L5 PASS  ls_day_verdict precedence table {len(table)}/{len(table)}")
+
+    # ------------------------------------------------------------------ L7 -- #
+    # A scored base row that stored no price (all seats new and unpriced): lastscored
+    # must not pair against it forever - aligned legacy fallback for this run.
+    def history_priceless_base():
+        h = history(upto_14=False)
+        h += [hrow("2026-10-14", "CHAMPION", CHAMP, P14, 0.2, 100.8, "n=2"),
+              ["2026-10-14", "CHALLENGER", "2286.SR,4280.SR", "{}", -0.3, 107.9, 0.0, 0.0, "n=3"],
+              hrow("2026-10-14", "BENCHMARK", BENCH, P14, 0.3, 102.8, "n=2")]
+        return h
+    sh_fb = sheet(history_priceless_base(), board("2026-10-15 17:10", NEW15))
+    sh_fl = sheet(history_priceless_base(), board("2026-10-15 17:10", NEW15))
+    assert run_at(s1, "2026-10-15T15:20:00Z", sh_fb, P15, "2026-10-15", "lastscored")[0] == 0
+    assert run_at(s1, "2026-10-15T15:20:00Z", sh_fl, P15, "2026-10-15")[0] == 0
+    v_fb = verdict(sh_fb)
+    assert rows_on(sh_fb, "2026-10-15") == rows_on(sh_fl, "2026-10-15"), "fallback must write the legacy rows"
+    assert f"[S1-BASE v{V}] mode=lastscored fallback=empty-base" in v_fb and "readback_error" not in v_fb, v_fb
+    print("L7 PASS  priceless lastscored base: aligned legacy fallback (rows == legacy), fallback=empty-base")
 
     # ------------------------------------------------------------------ L6 -- #
     base_path = os.environ.get("S1_BASE")

@@ -112,8 +112,13 @@ def test_s1_v2_requires_an_operator_variable_and_defaults_off():
     assert workflow["jobs"]["score"]["env"]["TFB_S1_CRITERIA_V2"] == _mapping("TFB_S1_CRITERIA_V2", "off")
 
 
+def test_s1_base_policy_requires_an_operator_variable_and_defaults_legacy():
+    workflow = _workflow("shadow_scorer.yml")
+    assert workflow["jobs"]["score"]["env"]["TFB_S1_BASE_POLICY"] == _mapping("TFB_S1_BASE_POLICY", "legacy")
+
+
 def test_behavior_flags_are_scoped_to_writer_lanes_and_do_not_leak_into_ci():
-    names = TRACKER_DEFAULTS.keys() | SYNC_DEFAULTS.keys() | {"TFB_S1_CRITERIA_V2"}
+    names = TRACKER_DEFAULTS.keys() | SYNC_DEFAULTS.keys() | {"TFB_S1_CRITERIA_V2", "TFB_S1_BASE_POLICY"}
     for workflow_name in ("track_performance.yml", "daily_sync.yml", "shadow_scorer.yml"):
         workflow = _workflow(workflow_name)
         assert not names.intersection(workflow.get("env", {}))
