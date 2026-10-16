@@ -210,7 +210,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
-    ("audit_full_refresh_coverage", "1.3.1", "read-only full row coverage audit"),
+    ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.3", "nightly offline workbook DQ audit"),
