@@ -441,6 +441,11 @@ jobs:
       # fresh. Arm observe first; enforce only after its read-back.
       TFB_SYNC_FW_SKEW_AWARE: ${{ vars.TFB_SYNC_FW_SKEW_AWARE || 'off' }}
       TFB_SYNC_FW_SKEW_MAX_REL: ${{ vars.TFB_SYNC_FW_SKEW_MAX_REL || '0.35' }}
+      # v6.71.0 BATCH-CONC (2026-10-16): symbol batches in flight per market
+      # page. 1 = the sequential loop, byte-identical (inert default); arm by
+      # repo Variable (2 first); read-back one [BATCH-CONC] line per page.
+      # Rollback: delete the Variable.
+      TFB_SYNC_BATCH_CONCURRENCY: ${{ vars.TFB_SYNC_BATCH_CONCURRENCY || '1' }}
       # WP-04: arm the runner's USX minor-unit screen in lockstep with Render.
       # Unset preserves the existing portfolio currency contract; rollback: 0.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
@@ -1717,6 +1722,9 @@ jobs:
       # v6.70.0 FW-SKEW: mirror sync-dashboard (recovery must classify alike).
       TFB_SYNC_FW_SKEW_AWARE: ${{ vars.TFB_SYNC_FW_SKEW_AWARE || 'off' }}
       TFB_SYNC_FW_SKEW_MAX_REL: ${{ vars.TFB_SYNC_FW_SKEW_MAX_REL || '0.35' }}
+      # v6.71.0 BATCH-CONC: mirror sync-dashboard (the GM replay is ~50 min
+      # of serial batches too). Inert at 1; rollback: delete the Variable.
+      TFB_SYNC_BATCH_CONCURRENCY: ${{ vars.TFB_SYNC_BATCH_CONCURRENCY || '1' }}
       # WP-04: mirror the primary runner's default-off minor-unit screen.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
