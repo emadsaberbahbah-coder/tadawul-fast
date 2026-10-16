@@ -461,7 +461,42 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+# -----------------------------------------------------------------------------
+# v1.9.4 (2026-10-16) - P-186 LASTSCORED MADE SAFE TO ARM (two latent defects)
+# WHY (replayed 2026-10-16 on the real main() with an in-memory sheet stub,
+# while preparing the lastscored arming that was planned for the 10-03
+# sitting and never happened): in the last 11 weekdays 4 were excluded as
+# fresh-floor with stale=- nopair=- - every held leg fresh, the day lost to
+# the legacy denominator (today's seat count, e.g. 10-15 fresh=1/4 after a
+# 1-name 10-14 basket). lastscored fixes that arithmetic, but as built:
+#   (a) its read-back always printed `[S1-BASE] mode=lastscored
+#       readback_error=KeyError`: the pass-1 measurement it reads under
+#       lastscored has no "pairable" key (only _measure_one returns it), so
+#       the arming read-back could never be read;
+#   (b) an EMPTY-CHALLENGER weekday was SCORED: the pairable-leg denominator
+#       replaced the 0.0 that the empty basket produces, so a board with no
+#       Gen2=YES seat scored at fresh=1/1 and wrote a CHALLENGER row with
+#       Symbols '' and Prices {} AND a numeric return. That row became the
+#       permanent last-scored base with zero pairable legs, so every later
+#       day read fresh=0/N and was excluded until the policy was rolled back
+#       - arming lastscored would have frozen criterion 1 at the first
+#       empty-board day.
+# FIX: (a) the read-back reads the base row's pairable legs when the
+#   measurement does not carry them (the same number the floor divides by);
+#   (b) the pairable-leg denominator applies only when today's challenger is
+#   non-empty, so an empty challenger stays `no-challenger` under every
+#   policy (the v1.7.2 label truth) and never becomes a scored base.
+#   (c) observe read-back gains ` ls_day=<scored | non-trading |
+#   excluded:<reason>>`: what lastscored WOULD decide today, computed by
+#   the pure ls_day_verdict() from the same lastscored measurement, so one
+#   observe run answers the arming question without arithmetic by hand.
+# UNTOUCHED: legacy (env unset) output on every surface is byte-identical to
+# v1.9.3 except the version token; observe rows are legacy rows; count_scored
+# _days, evaluate_s1, basket math, fresh floor, HISTORY_HEADER, constants.
+# Functions added: 1 (ls_day_verdict). Removed: 0. Rollback: legacy is the
+# default; unset TFB_S1_BASE_POLICY.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.9.4"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -1408,6 +1443,31 @@ def _board_extract(board: Sequence[Sequence[Any]], sg_on: bool
     return data_rows, sg_dropped, chal_syms, violations
 
 
+def ls_day_verdict(n_chal: int, ls_base_present: bool, ls_n_fresh: int,
+                   ls_pairable: int, floor_frac: float, non_trading: bool,
+                   stale_board: bool, bench_base_present: bool,
+                   bench_ret_none: bool) -> str:
+    """v1.9.4 PURE: the day class lastscored WOULD produce, mirroring main()'s
+    precedence: non-trading, then the stale-board guard, then the exclusion
+    test with its v1.7.2 reasons. Under lastscored the floor divides by the
+    base row's pairable legs when today's challenger is non-empty (v1.9.4),
+    otherwise by today's seats. Reads nothing, writes nothing, decides nothing."""
+    if not ls_base_present:
+        return "seed"
+    if non_trading:
+        return "non-trading"
+    if stale_board:
+        return "excluded:stale-board"
+    if not n_chal:
+        return "excluded:no-challenger"
+    frac = (ls_n_fresh / ls_pairable) if ls_pairable > 0 else (ls_n_fresh / n_chal)
+    if frac < floor_frac:
+        return "excluded:fresh-floor"
+    if bench_base_present and bench_ret_none:
+        return "excluded:benchmark-leg"
+    return "scored"
+
+
 def stale_board_override(day_non_trading: bool, mode: str,
                          stale: bool) -> bool:
     """v1.8.0 PURE: True iff the day must be EXCLUDED as stale-board —
@@ -2056,9 +2116,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bp_pairable = len([1 for _s, _p0 in ((_chal_m["p"] or {}).get("prices") or {}).items()
                         if _p0]) if _chal_m["p"] else 0
     _chal_frac_legacy = _chal_frac
-    if _bp_mode == "lastscored" and _bp_pairable > 0:
-        _chal_frac = _chal_m["n_fresh"] / _bp_pairable
+    if _bp_mode == "lastscored" and _bp_pairable > 0 and chal_syms:
+        _chal_frac = _chal_m["n_fresh"] / _bp_pairable   # v1.9.4: empty stays 0.0
     _base_line = ""
+    _ls_probe = None                               # v1.9.4 observe ls_day inputs
     if _bp_mode != "legacy":
         try:
             _alt_prev = _prev_ls if _bp_mode == "observe" else _prev_legacy
@@ -2082,11 +2143,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
                           f"lastscored={_f(_ls_c['ret'])}@{_ls_base or '-'} "
-                          f"legs={_ls_c['n_fresh']}/{_ls_c['pairable']} | "
+                          f"legs={_ls_c['n_fresh']}/{_ls_c.get('pairable', _bp_pairable)} | "
                           f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "
                           f"alpha legacy={_f(_a_leg)} lastscored={_f(_a_ls)} "
                           f"delta={'n/a' if _a_delta is None else f'{_a_delta:+.4f}pp'} | "
                           f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}")
+            if _bp_mode == "observe":
+                _ls_probe = (_ls_c, _ls_b, _prev_ls.get(CHALLENGER), _prev_ls.get(BENCHMARK))
         except Exception as _bp_exc:  # noqa: BLE001 - read-back is additive, never fatal
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"readback_error={type(_bp_exc).__name__}")
@@ -2116,6 +2179,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             _excl_reason = "fresh-floor"
         else:
             _excl_reason = "benchmark-leg"
+    if _ls_probe is not None:                      # v1.9.4 observe: what lastscored would do
+        try:
+            _lc, _lb, _lbase, _lbbase = _ls_probe
+            _l_nt = bool(_price_honesty_enabled() and _day_class_venue_enabled()
+                         and _lbase is not None
+                         and day_is_non_trading(chal_syms, _parse_iso_date(_lbase["date"]), today))
+            _base_line += " ls_day=" + ls_day_verdict(
+                len(chal_syms), _lbase is not None, _lc["n_fresh"],
+                int(_lc.get("pairable", 0)), _min_fresh_frac(), _l_nt,
+                stale_board_override(_l_nt, _bf_mode, _bf_stale),
+                _lbbase is not None, _lb["ret"] is None)
+        except Exception as _ls_exc:  # noqa: BLE001 - read-back is additive, never fatal
+            _base_line += f" ls_day=error:{type(_ls_exc).__name__}"
 
     new_rows: List[List[Any]] = []
     results: Dict[str, Dict[str, Any]] = {}
