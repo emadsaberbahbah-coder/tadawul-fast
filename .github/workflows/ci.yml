@@ -600,6 +600,7 @@ jobs:
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
+            tests/test_coverage_name_gap_v132.py \
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py \
             tests/test_approved_scope_native_binding.py \

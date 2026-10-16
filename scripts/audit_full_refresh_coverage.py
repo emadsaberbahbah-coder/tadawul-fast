@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.3.2 (2026-10-16) — NAME-GAP LIST (diagnostic only)
+WHY: the Global_Markets 99% names floor failed in 5 of 5 sampled final
+audits (names 97.00-98.11%) and was the ONLY coverage failure in 2 of them
+(10-14 00:48Z, 10-15 11:06Z). The floor allows at most 66 blank names in
+6,609 rows; HEAL-FIRST reports 123-129 blank-name symbols per pass. Nothing
+said WHICH symbols, so the owner could not label them (NAME-LABELS registry)
+or retire them (P0-4/D3 list), and the gap never closed. WHAT: each page
+result gains blank_name_count and blank_name_symbols (sorted, first 200)
+for pages with a name rule; portfolio rules are excluded (no holdings data
+is ever listed). Both entry points print one ::notice line per page with a
+gap (this main() and finalize_decision_publication.main(), the final-job
+entry point, via name_gap_notice). Rules,
+floors, failures, warnings, status and exit codes are UNCHANGED (pinned by
+a test that compares them with the field-free result). Functions added: 0;
+removed: 0 (one pure helper added:
+name_gap_notice). Rollback: revert.
+
 VERSION 1.3.1 — exact scoped membership requires an independent complete A:A
 read crossbound to the quality scan. Sparse tails beyond the audit bound fail
 closed instead of certifying a partial window as the full approved membership.
@@ -48,7 +65,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -91,6 +108,8 @@ class Result:
     missing_qty: list[str] = field(default_factory=list); missing_cost: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list); warnings: list[str] = field(default_factory=list)
     approved_scope: dict = field(default_factory=dict)
+    blank_name_count: int = 0
+    blank_name_symbols: list[str] = field(default_factory=list)
     def finish(self):
         self.status = "FAIL" if self.failures else ("WARN" if self.warnings else "PASS"); return self
 
@@ -301,11 +320,12 @@ def audit_grid(grid, rule, expected, now, active=(), *, approved_scope: ScopePol
                 f"missing={wide_receipt['missing_count']}, unexpected={wide_receipt['unexpected_count']}, "
                 f"duplicates={wide_receipt['duplicate_count']}, invalid={wide_receipt['bad_symbol_count']}")
     symbols=[]; names=prices=0; ages=[]; qmap={}; cmap={}
-    timestamp_symbols=set(); bad_symbols=set(); quote_symbols=set()
+    timestamp_symbols=set(); bad_symbols=set(); quote_symbols=set(); blank_names=set()
     for row in rows:
         sym=canonicalize_symbol(s(row[si] if si<len(row) else "").upper())
         if not sym: r.blank_symbols+=1; continue
         symbols.append(sym); names+=int(ni>=0 and ni<len(row) and bool(s(row[ni]))); prices+=int(pi>=0 and pi<len(row) and (f(row[pi]) or 0)>0)
+        if ni>=0 and not (ni<len(row) and s(row[ni])): blank_names.add(sym)
         if qi>=0: qmap[sym]=f(row[qi] if qi<len(row) else None)
         if ci>=0: cmap[sym]=f(row[ci] if ci<len(row) else None)
         if rule.max_age_h is not None:
@@ -320,6 +340,8 @@ def audit_grid(grid, rule, expected, now, active=(), *, approved_scope: ScopePol
     if r.blank_symbols: r.failures.append(f"{r.blank_symbols} blank-symbol row(s)")
     if r.duplicates: r.failures.append("duplicate symbols: "+", ".join(r.duplicates[:20]))
     r.name_pct=pct(names,len(symbols)) if ni>=0 else None; r.price_pct=pct(prices,len(symbols)) if pi>=0 else None
+    if ni>=0 and rule.min_name and not rule.portfolio:  # v1.3.2 diagnostic only
+        r.blank_name_count=len(blank_names); r.blank_name_symbols=sorted(blank_names)[:200]
     if ni<0 and rule.min_name: r.failures.append("Name column missing")
     elif r.name_pct is not None and r.name_pct<rule.min_name: r.failures.append(f"name coverage {r.name_pct:.2f}% below {rule.min_name:.2f}%")
     if pi<0 and rule.min_price: r.failures.append("Current Price column missing")
@@ -371,10 +393,19 @@ async def run(sid, limit=DEFAULT_MAX_ROWS, reader=None, registry=None, now=None,
         except Exception as e: rep.pages.append(Result(rule.page,status="FAIL",min_rows=rule.min_rows,failures=[f"audit failed: {e}"]))
     return rep
 
+def name_gap_notice(page: dict) -> str:
+    """v1.3.2 PURE: the one name-gap ::notice line for a page result dict
+    (asdict(Result) or the same dict inside a JSON payload). No braces."""
+    syms=[str(x) for x in (page.get("blank_name_symbols") or [])]; n=int(page.get("blank_name_count") or 0)
+    return (f"::notice::{page.get('page')}: blank-name symbols {n} (name_pct={page.get('name_pct')}): "
+            f"{', '.join(syms[:60])}{' ...' if n>60 else ''}")
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("--sheet-id",default=os.getenv("DEFAULT_SPREADSHEET_ID", "")); ap.add_argument("--max-rows",type=int,default=env_i("TFB_REFRESH_AUDIT_MAX_ROWS",DEFAULT_MAX_ROWS)); ap.add_argument("--json-out",default=""); a=ap.parse_args(argv)
     rep=asyncio.run(run(a.sheet_id,max(100,a.max_rows))); text=json.dumps(rep.payload(),ensure_ascii=False,indent=2); print(text)
     for p in rep.pages: print(f"::{'error' if p.failures else ('warning' if p.warnings else 'notice')}::{p.page}: {p.status}, rows={p.rows}, unique={p.unique}, fresh_pct={p.fresh_pct}, failures={'; '.join(p.failures[:3]) or 'none'}")
+    for p in rep.pages:
+        if p.blank_name_count: print(name_gap_notice(asdict(p)))
     if rep.fatal: print(f"::error::FULL_REFRESH_AUDIT_FATAL: {rep.fatal}")
     if a.json_out: Path(a.json_out).write_text(text+"\n",encoding="utf-8")
     return rep.code
