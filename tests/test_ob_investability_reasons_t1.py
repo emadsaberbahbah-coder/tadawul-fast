@@ -144,7 +144,7 @@ def test_certified_payload_carries_the_breakdown_summing_to_the_gaps_row(monkeyp
     assert block["other_reasons"] == 0 and sum(r["count"] for r in block["rows"]) == 8
     # INVESTABLE rows never appear
     assert all("OK.US" not in r["examples"] for r in block["rows"])
-    assert payload["version"] == "1.27.0"
+    assert payload["version"] == ob.OPPORTUNITY_BUILDER_VERSION
 
 
 def test_withheld_payload_carries_the_breakdown_too(monkeypatch):
