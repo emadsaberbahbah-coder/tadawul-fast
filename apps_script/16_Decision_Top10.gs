@@ -1,11 +1,26 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.17.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.18.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.18.0 (2026-10-17) -- SEND THE SCORECARD COHORTS TO THE EVIDENCE GATE (L4)
+ * WHY (Codex brief 2026-10-17 L4): opportunity_builder v1.30.0 gates (observe
+ * first) on the Forecast Scorecard's Investability x Recommendation cohorts,
+ * but the backend cannot read the workbook; the cockpit already reads the
+ * _Forecast_Scorecard tab for the MODEL EVIDENCE strip (v1.17.0). WHAT: with
+ * Script Property DT10_EVIDENCE_SCORECARD_SEND = 'on' the request body gains
+ * evidence_scorecard = [{horizon, cohort, n, hit}] -- the Investability x
+ * Recommendation rows of the tab (dt10EvidenceScorecardRows_, pure; capped at
+ * 400 rows). Property absent/off (default): the request is byte-identical to
+ * v1.17.0; the backend ignores the field unless TFB_T10_EVIDENCE_GATE is
+ * armed. Status line gains ' | scorecard sent (N cohorts)'. Functions added
+ * (0 removed): dt10EvidenceScorecardSendOn_, dt10EvidenceScorecardRows_.
+ * dt10SelfTest reports the property state + 'scorecard rows core: ok'.
+ * Harness: tests/js/dt10_v1180_evidence_send.test.js (+ dt10_v1180_history.js).
  *
  * v1.17.0 (2026-10-17) -- MODEL EVIDENCE STRIP FROM THE FORECAST SCORECARD (L3)
  * WHY (Codex brief 2026-10-17 L3): Performance_Log holds 11,791 matured
@@ -1875,7 +1890,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.17.0';
+var DT10_VERSION = '1.18.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3566,6 +3581,40 @@ function dt10FastTrackSuspend_(tk, label) {
       'strict until confirmed (' +
       'seat filled to avoid under-fill; not an executable ticket today).';
   return tk;
+}
+// ---------------------------------------------------------------------------
+// v1.18.0 [L4] -- send the scorecard cohorts to the backend evidence gate
+// ---------------------------------------------------------------------------
+/** v1.18.0 [L4]: Script Property DT10_EVIDENCE_SCORECARD_SEND = 'on' -> the
+ * request carries evidence_scorecard; anything else -> off (request
+ * byte-identical to v1.17.0). Never throws. */
+function dt10EvidenceScorecardSendOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_EVIDENCE_SCORECARD_SEND') || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eEss) {}
+  return false;
+}
+/** v1.18.0 [L4] PURE: compact rows [{horizon, cohort, n, hit}] of the
+ * 'Investability x Recommendation' dimension from a dt10ScorecardIndex_
+ * result; [] when absent; at most 400 rows (largest n first). */
+function dt10EvidenceScorecardRows_(idx) {
+  var out = [];
+  if (!idx || !idx.map) return out;
+  var prefix = 'Investability x Recommendation|';
+  for (var key in idx.map) {
+    if (!idx.map.hasOwnProperty(key) || key.indexOf(prefix) !== 0) continue;
+    var rest = key.slice(prefix.length);
+    var bar = rest.indexOf('|');
+    if (bar < 0) continue;
+    var e = idx.map[key] || {};
+    if (e.hit === null || e.hit === undefined) continue;
+    out.push({ horizon: rest.slice(0, bar), cohort: rest.slice(bar + 1),
+               n: Number(e.n) || 0, hit: Number(e.hit) });
+  }
+  out.sort(function (a, b) { return b.n - a.n; });
+  return out.slice(0, 400);
 }
 // ---------------------------------------------------------------------------
 // v1.17.0 [L3] -- model-evidence strip from the _Forecast_Scorecard tab
@@ -7662,6 +7711,19 @@ function refreshDecisionTop10() {
     portfolio: dt10PortfolioInputs_(ss, panel),
     pool_limit: poolLimit
   };
+  // v1.18.0 [L4]: the cockpit's copy of the Forecast Scorecard cohorts for the
+  // backend evidence gate (property-gated; off -> body unchanged).
+  var scorecardNote = '';
+  if (dt10EvidenceScorecardSendOn_()) {
+    var escRows = dt10EvidenceScorecardRows_(
+        dt10ScorecardIndex_(dt10ReadScorecard_(ss)));
+    if (escRows.length) {
+      body.evidence_scorecard = escRows;
+      scorecardNote = ' | scorecard sent (' + escRows.length + ' cohorts)';
+    } else {
+      scorecardNote = ' | scorecard: no cohorts to send';
+    }
+  }
   // v1.5.0 (Fix H1): give the builder's Portfolio gate the held symbols it
   // needs to enforce "Include Portfolio Holdings = No". Kill switch
   // DT10_SEND_HOLDINGS=0 restores the exact v1.4.0 body (key absent).
@@ -7799,7 +7861,7 @@ function refreshDecisionTop10() {
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
-      poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
+      poolNote + heldNote + cashNote + scorecardNote + ' | ' + dt10MetaLine_(payload.meta) +   // v1.18.0 [L4]
       (stab && stab.note ? ' | ' + stab.note : '') +
       (turnoverNote ? ' | ' + turnoverNote : '') +      // v1.14.0 [T6]
       (earn && earn.note ? ' | ' + earn.note : '') +
@@ -9066,6 +9128,16 @@ function dt10SelfTest() {
         dt10ModelEvidenceLines_(null, [], []).length === 0 &&
         dt10ScorecardIndex_([['x']]) === null) ? 'ok' : 'FAIL') +
       ' | ' + (dt10ModelEvidenceLegacy_() ? 'OFF (DT10_MODEL_EVIDENCE_LEGACY)' : 'ON'));
+  // v1.18.0 [L4]: compact rows from a synthetic index (largest n first).
+  var escT = dt10EvidenceScorecardRows_({ asOf: 'x', rows: 3, map: {
+      'Investability x Recommendation|1M|INVESTABLE|BUY': { n: 671, hit: 63.3 },
+      'Investability x Recommendation|3M|WATCHLIST|HOLD': { n: 5000, hit: 47 },
+      'Investability|1M|INVESTABLE': { n: 963, hit: 47.1 } } });
+  report.push('scorecard rows core: ' +
+      ((escT.length === 2 && escT[0].cohort === 'WATCHLIST|HOLD' && escT[0].horizon === '3M' &&
+        escT[1].cohort === 'INVESTABLE|BUY' && escT[1].n === 671 && escT[1].hit === 63.3 &&
+        dt10EvidenceScorecardRows_(null).length === 0) ? 'ok' : 'FAIL') +
+      ' | send (DT10_EVIDENCE_SCORECARD_SEND): ' + (dt10EvidenceScorecardSendOn_() ? 'on' : 'off (default)'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of

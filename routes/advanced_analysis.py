@@ -4232,6 +4232,10 @@ async def opportunity_candidates_post(
                         ),
                         "engine": engine_version,
                     },
+                    # v1.30.0 [L4] (opportunity_builder): the cockpit's copy of
+                    # the _Forecast_Scorecard cohorts; consumed only when
+                    # TFB_T10_EVIDENCE_GATE is observe/enforce, never echoed.
+                    "evidence_scorecard": merged_body.get("evidence_scorecard"),
                 }
                 if board_replay:
                     frozen = criteria.get("board_funding_snapshot") or {}

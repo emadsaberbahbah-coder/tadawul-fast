@@ -20,7 +20,8 @@ const ROOT = path.join(__dirname, '../..');
 // v1.17.0: this harness proves the v1.16.0 layer, so it runs on the delivered
 // file with the v1.17.0 edits reversed (proven by dt10_v1170_model_evidence.test.js).
 const {revertV1170} = require('./dt10_v1170_history');
-const source = revertV1170(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'));
+const {revertV1180} = require('./dt10_v1180_history');
+const source = revertV1170(revertV1180(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8')));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {

@@ -1,12 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.29.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.30.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.30.0 (2026-10-17) L4 — EVIDENCE GATE ON QUALIFICATION, OBSERVE FIRST (Codex
+brief 17-Oct §2 L4): the first place outcomes can change a decision.
+TFB_T10_EVIDENCE_GATE = off (default) | observe | enforce. A candidate's cohort
+(Entry Investability × Recommendation at the plan horizon) must show hit-rate
+>= TFB_T10_EVIDENCE_MIN_HIT (default 55) with n >= TFB_T10_EVIDENCE_MIN_N
+(default 100) on the Forecast Scorecard (_Forecast_Scorecard, track_performance
+v6.48.0 L3). The cockpit sends its copy of the tab as body.evidence_scorecard
+(16_Decision_Top10 v1.18.0, Script Property DT10_EVIDENCE_SCORECARD_SEND); the
+route forwards it in upstream_meta; the builder indexes the
+"Investability x Recommendation" rows per horizon. Plan horizon = period_months
+-> 1M / 3M / 6M / 1Y, falling back to the longest published horizon that
+carries the cohort, then ALL. WHAT: gate "Evidence (Scorecard)" appends after
+Earnings Proximity (NON_CRITICAL). observe: always PASSED; rows whose cohort is
+below the floors (or has no outcomes yet) gain ONE countable
+`[evidence-observe] cohort=INVESTABLE|BUY@1M hit=63.3% n=671` / `... BELOW` /
+`... no outcomes yet` tag on Failure Reason (certified and withheld paths);
+enforce: the gate FAILS for those rows (verdict follows the existing chain).
+No scorecard in the request -> the gate PASSES with `no scorecard` (absent
+evidence is not evidence against) and is counted. meta["evidence_gate"]
+read-back only when armed; off is byte-identical to v1.29.0 save the version
+stamp. Functions added 7 (_env_evidence_gate_mode, _env_evidence_min_hit,
+_env_evidence_min_n, _evidence_horizon, _evidence_index, _evidence_lookup,
+_evidence_gate, _evidence_tag_rows); constants/state 3. Removed 0.
 
 v1.29.0 (2026-10-17) T2 — CONCENTRATION: DISCLOSE THE CLUSTER (Codex brief 17-Oct
 §3 T2, builder half). Measured 17-Oct: 19 of the 24 qualified names are US
@@ -1513,7 +1537,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.29.0"
+OPPORTUNITY_BUILDER_VERSION = "1.30.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2188,6 +2212,7 @@ GATE_ORDER = (
     "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend",
     "Timing (52W)",          # v1.23.0 [P-181] (appends before Portfolio)
     "Earnings Proximity",    # v1.28.0 [T5] (appends after Timing, always PASSED)
+    "Evidence (Scorecard)",  # v1.30.0 [L4] (appends after Earnings; observe PASSED, enforce may fail)
     "Portfolio",
     "FX Evidence",           # certified currency proof, appended after policy gates
 )
@@ -3239,6 +3264,177 @@ def _earnings_gate(cand, mode, min_days):
     g["earnings_detail"] = {"days": (None if days is None else int(days)),
                             "min_days": int(min_days), "within": bool(within)}
     return g
+
+
+# ---------------------------------------------------------------------------
+# v1.30.0 [L4] — Evidence gate on the Forecast Scorecard (observe first)
+# ---------------------------------------------------------------------------
+_EVID_GATE_NAME = "Evidence (Scorecard)"
+_EVID_DIMENSION = "Investability x Recommendation"
+_EVID_STATE = {"mode": "off", "min_hit": 55.0, "min_n": 100, "horizon": None,
+               "scorecard_rows": 0, "evaluated": 0, "no_scorecard": 0,
+               "no_cohort": 0, "would_fail": 0, "failed": 0}
+_EVID_CTX = {"index": {}, "horizons": []}
+_EVID_FALLBACK = ("1Y", "6M", "3M", "1M", "2W", "1W", "ALL")
+
+
+def _env_evidence_gate_mode():
+    """v1.30.0 [L4]: TFB_T10_EVIDENCE_GATE off(default)|observe|enforce; any
+    other value -> off (byte-identical). Never raises."""
+    try:
+        raw = str(_env_str("TFB_T10_EVIDENCE_GATE", "off")).strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:
+        return "off"
+
+
+def _env_evidence_min_hit():
+    """v1.30.0 [L4]: TFB_T10_EVIDENCE_MIN_HIT (percent, default 55, 0..100)."""
+    try:
+        v = float(_env_float("TFB_T10_EVIDENCE_MIN_HIT", 55.0))
+    except Exception:
+        v = 55.0
+    return v if 0.0 <= v <= 100.0 else 55.0
+
+
+def _env_evidence_min_n():
+    """v1.30.0 [L4]: TFB_T10_EVIDENCE_MIN_N (default 100, 1..100000)."""
+    try:
+        v = int(_env_int("TFB_T10_EVIDENCE_MIN_N", 100))
+    except Exception:
+        v = 100
+    return v if 1 <= v <= 100000 else 100
+
+
+def _evidence_horizon(period_months):
+    """Plan horizon label the Scorecard uses: <=1 -> 1M, <=3 -> 3M, <=6 -> 6M,
+    else 1Y (the tracker's HorizonType vocabulary)."""
+    try:
+        m = float(period_months)
+    except (TypeError, ValueError):
+        m = 12.0
+    if m <= 1:
+        return "1M"
+    if m <= 3:
+        return "3M"
+    if m <= 6:
+        return "6M"
+    return "1Y"
+
+
+def _evidence_index(rows):
+    """{(horizon, cohort): (n, hit_pct)} from the cockpit's scorecard copy:
+    dicts with horizon / cohort / n / hit (or hit_pct / 'Hit Rate %'); rows
+    carrying a dimension other than Investability x Recommendation are
+    skipped; junk is ignored. Returns (index, sorted horizons)."""
+    index = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        dim = str(r.get("dimension") or r.get("Dimension") or _EVID_DIMENSION).strip()
+        if dim != _EVID_DIMENSION:
+            continue
+        hz = str(r.get("horizon") or r.get("Horizon") or "").strip()
+        coh = str(r.get("cohort") or r.get("Cohort") or "").strip().upper()
+        n = _to_float(r.get("n") if "n" in r else r.get("N"))
+        hit = _to_float(r.get("hit") if "hit" in r else (r.get("hit_pct") if "hit_pct" in r else r.get("Hit Rate %")))
+        if not hz or not coh or n is None or hit is None:
+            continue
+        index[(hz, coh)] = (int(n), float(hit))
+    horizons = sorted({hz for hz, _ in index})
+    return index, horizons
+
+
+def _evidence_lookup(index, cohort, horizon):
+    """(n, hit, horizon_used) for the cohort at the plan horizon, else at the
+    longest published horizon carrying it, else None."""
+    if not index:
+        return None
+    if (horizon, cohort) in index:
+        n, hit = index[(horizon, cohort)]
+        return n, hit, horizon
+    for hz in _EVID_FALLBACK:
+        if (hz, cohort) in index:
+            n, hit = index[(hz, cohort)]
+            return n, hit, hz
+    return None
+
+
+def _evidence_gate(cand, mode):
+    """v1.30.0 [L4]: the gate dict. observe -> always PASSED (note carries
+    the trace); enforce -> FAILS when the cohort is below the floors or has
+    no outcomes yet; no scorecard at all -> PASSED 'no scorecard' in both
+    modes. Updates _EVID_STATE counters. Never raises."""
+    _eg = (cand or {}).get("engine_gate") if isinstance((cand or {}).get("engine_gate"), dict) else {}
+    inv = (str(_eg.get("investability") or (cand or {}).get("investability") or "").strip().upper()
+           or "UNSPECIFIED")
+    rec = re.sub(r"[^A-Z_]+", "_", str((cand or {}).get("recommendation") or "").strip().upper()).strip("_") or "HOLD"
+    cohort = inv + "|" + rec
+    min_hit, min_n = float(_EVID_STATE["min_hit"]), int(_EVID_STATE["min_n"])
+    plan_hz = _EVID_STATE.get("horizon") or "1Y"
+    required = "hit >= %.0f%% and n >= %d on the Scorecard" % (min_hit, min_n)
+    try:
+        _EVID_STATE["evaluated"] += 1
+    except Exception:
+        pass
+    detail = {"cohort": cohort, "horizon": None, "n": None, "hit": None, "ok": True, "reason": None}
+    if not _EVID_CTX.get("index"):
+        _EVID_STATE["no_scorecard"] = _EVID_STATE.get("no_scorecard", 0) + 1
+        detail["reason"] = "no_scorecard"
+        note = "[evidence-%s] cohort=%s no scorecard" % (mode, cohort)
+        g = _gate(_EVID_GATE_NAME, True, FAIL_NON_CRITICAL, "n/a", required, note=note)
+        g["evidence_detail"] = detail
+        return g
+    found = _evidence_lookup(_EVID_CTX["index"], cohort, plan_hz)
+    if found is None:
+        ok = False
+        detail.update({"n": 0, "ok": False, "reason": "no_cohort"})
+        _EVID_STATE["no_cohort"] = _EVID_STATE.get("no_cohort", 0) + 1
+        current = "n=0"
+        note = "[evidence-%s] cohort=%s no outcomes yet" % (mode, cohort)
+    else:
+        n, hit, hz = found
+        ok = hit >= min_hit and n >= min_n
+        detail.update({"horizon": hz, "n": n, "hit": round(hit, 1), "ok": bool(ok),
+                       "reason": None if ok else ("hit_below" if hit < min_hit else "n_below")})
+        current = "hit=%.1f%% n=%d" % (hit, n)
+        note = "[evidence-%s] cohort=%s@%s hit=%.1f%% n=%d%s" % (
+            mode, cohort, hz, hit, n, "" if ok else " BELOW")
+    if not ok:
+        _EVID_STATE["would_fail"] = _EVID_STATE.get("would_fail", 0) + 1
+    passed = ok if mode == "enforce" else True
+    if mode == "enforce" and not ok:
+        _EVID_STATE["failed"] = _EVID_STATE.get("failed", 0) + 1
+    g = _gate(_EVID_GATE_NAME, passed, FAIL_NON_CRITICAL, current, required, note=note)
+    g["evidence_detail"] = detail
+    return g
+
+
+def _evidence_tag_rows(audit):
+    """v1.30.0 [L4]: ONE countable tag on Failure Reason for every audit row
+    whose evidence cohort is below the floors or absent (both modes).
+    Additive, never fatal. Returns the tagged count."""
+    if _EVID_STATE.get("mode") not in ("observe", "enforce"):
+        return 0
+    tagged = 0
+    for rec in audit or []:
+        try:
+            eg = None
+            for g in (rec.get("gates") or []):
+                if g.get("gate") == _EVID_GATE_NAME:
+                    eg = g
+                    break
+            if eg is None:
+                continue
+            ed = eg.get("evidence_detail") or {}
+            if ed.get("ok", True) or ed.get("reason") == "no_scorecard":
+                continue
+            fr = rec.get("failure_reason")
+            rec["failure_reason"] = ((str(fr) + " | ") if fr else "") + str(eg.get("note") or "[evidence-observe] n/a")
+            tagged += 1
+        except Exception:  # noqa: BLE001 - additive, never fatal
+            pass
+    return tagged
 
 
 def _env_w52_timing_mode():
@@ -5144,6 +5340,12 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     if _earn_mode != "off":
         g.append(_earnings_gate(cand, _earn_mode, _env_earnings_min_days()))
 
+    # v1.30.0 [L4]: Evidence (Scorecard) appends after Earnings; observe
+    # PASSED (trace only), enforce may FAIL. Off => nothing appended.
+    _evid_mode = _EVID_STATE.get("mode") or "off"
+    if _evid_mode != "off":
+        g.append(_evidence_gate(cand, _evid_mode))
+
     held_hit = (not criteria["include_portfolio_holdings"] and
                 (str(cand["symbol"] or "").strip().upper() in held
                  if _env_held_variant_match()
@@ -6953,6 +7155,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     _EARN_STATE.update({"mode": _env_earnings_gate_mode(),       # v1.28.0 [T5]
                         "min_days": _env_earnings_min_days(),
                         "evaluated": 0, "unknown": 0, "within": 0, "held": 0})
+    # v1.30.0 [L4]: per-build evidence context from the caller's scorecard copy.
+    _evid_index, _evid_hzs = _evidence_index((upstream_meta or {}).get("evidence_scorecard")
+                                             if isinstance(upstream_meta, dict) else None)
+    _EVID_CTX.update({"index": _evid_index, "horizons": _evid_hzs})
+    _EVID_STATE.update({"mode": _env_evidence_gate_mode(),
+                        "min_hit": _env_evidence_min_hit(), "min_n": _env_evidence_min_n(),
+                        "horizon": _evidence_horizon(crit.get("period_months")),
+                        "scorecard_rows": len(_evid_index), "evaluated": 0,
+                        "no_scorecard": 0, "no_cohort": 0, "would_fail": 0, "failed": 0})
 
     # 1) normalize → gates → verdict → score (audit grid, 1:1 trace)
     audit = []
@@ -7062,6 +7273,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         withheld = _skeleton("ok" if rows else "no_candidates", "Portfolio inputs unverified; executable funding withheld", crit)
         # v1.29.0 [T2]: stamp "cluster" BEFORE the _cand strip (the key is on it).
         _conc_w = None if _env_cluster_legacy() else concentration_breakdown(audit)
+        _evidence_tag_rows(audit)                        # v1.30.0 [L4] observe tags
         withheld["candidates_rows"] = [{k: v for k, v in item.items() if k != "_cand"}
                                         for item in audit]
         withheld["kpis"]["scanned"] = len(audit)
@@ -7074,6 +7286,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             withheld["meta"]["earnings_gate"] = dict(_EARN_STATE)   # v1.28.0 [T5]
         if _conc_w is not None:
             withheld["meta"]["concentration"] = _conc_w              # v1.29.0 [T2]
+        if _EVID_STATE.get("mode") in ("observe", "enforce"):
+            withheld["meta"]["evidence_gate"] = dict(_EVID_STATE)    # v1.30.0 [L4]
         if _board_replay:
             # Signing authenticates the frozen research inputs; certification
             # still independently controls whether any money can be allocated.
@@ -7288,6 +7502,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                         _EARN_STATE["held"] += 1
                 except Exception:  # noqa: BLE001
                     pass
+    _evidence_tag_rows(audit)                                # v1.30.0 [L4] observe tags
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
@@ -7542,6 +7757,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["earnings_gate"] = dict(_EARN_STATE)    # v1.28.0 [T5] read-back
     if _conc is not None:
         meta["concentration"] = _conc                # v1.29.0 [T2] read-back
+    if _EVID_STATE.get("mode") in ("observe", "enforce"):
+        meta["evidence_gate"] = dict(_EVID_STATE)    # v1.30.0 [L4] read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,

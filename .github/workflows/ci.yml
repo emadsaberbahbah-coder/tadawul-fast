@@ -662,6 +662,7 @@ jobs:
             tests/test_pf_uncertified_view_c1.py \
             tests/test_pf_switch_advisory_c4.py \
             tests/test_tp_forecast_scorecard_l3.py \
+            tests/test_ob_evidence_gate_l4.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
@@ -719,6 +720,7 @@ jobs:
           node tests/js/pf_uncertified_context.test.js
           node tests/js/pf_switch_advisory_col.test.js
           node tests/js/dt10_v1170_model_evidence.test.js
+          node tests/js/dt10_v1180_evidence_send.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
