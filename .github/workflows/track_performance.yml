@@ -1,5 +1,38 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.1.0 (2026-10-17) -- D-L1: SCHEDULED MATURITY AUDIT LANE (23:47 RIYADH)
+# WHY: v1.0.1 (#759) made every scheduled run record-only, so no active
+# Performance_Log record has matured since 2026-10-10 14:55 (17-Oct export:
+# 2,176 active records past their target date and unscored - 1W 490 / 2W 462 /
+# 1M 479 / 3M 745; _S1_Calibration as_of frozen at 2026-10-11 23:00:18; S-1
+# criterion 4 PENDING). --audit was reachable only through workflow_dispatch
+# run_audit=true. The comment #759 replaced had warned: "without it picks never
+# resolve to win/loss, so calibration never gets decided outcomes".
+# WHAT: both existing slots stay record-only EXACTLY as v1.0.1 left them
+# (the #759 intent - no reserialization race with daily_sync's tracker step).
+# ONE scheduled audit lane is added:
+#   - cron "47 20 * * *" (23:47 Riyadh, after the US close) runs
+#     --audit --analyze --export with TRACK_AUDIT=1 TRACK_PUBLISH_CALIBRATION=1;
+#   - the 🚦 step WAITS (poll, deadline) for every queued/running Daily Sync
+#     to clear before it grants the lane, and gives up - no audit, no record -
+#     when the sync state cannot be read or the deadline passes. The audit
+#     lane fails CLOSED where the record lanes fail open: auditing blind IS
+#     the #759 race (load -> audit -> save_records rewrites every row);
+#   - it does NOT --record: the slot sits 13 minutes before the Riyadh day
+#     boundary (21:00Z) and the measured cron drift is hours, so a --record
+#     there would be keyed to the NEXT Riyadh day from a pre-market board and
+#     pre-empt that day's 14:47 snapshot (keys are per Riyadh day). The two
+#     record slots and daily_sync's tracker step keep recording.
+# daily_sync.yml's tracker step carries the mirror guard (skips its record
+# while a Performance Clock run is in progress).
+# READ-BACK (first audited run): Performance_Log overdue-active count moves
+# from 2,176 toward 0 (matured/expired); _S1_Calibration!A2 as_of advances;
+# _Status "TFB Calibration" as_of advances; S1_Gate criterion 4 leaves
+# PENDING; a [PERF-VERDICT] line lands in _Run_Log; the job summary says
+# "Lane: scheduled-audit". GOLDEN NEGATIVE: the 14:47 and 18:47 slots still
+# write no calibration row (Lane: record-only).
+# ROLLBACK: delete the "47 20 * * *" cron line -> v1.0.2 behaviour exactly
+# (the lane code is unreachable without that schedule).
 # VERSION 1.0.2 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
 # WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
@@ -81,6 +114,12 @@ on:
   schedule:
     - cron: "47 11 * * *"   # 14:47 Riyadh - after the Tadawul close
     - cron: "47 15 * * *"   # 18:47 Riyadh - backstop before Riyadh midnight
+    # (2026-10-17) D-L1 AUDIT LANE - the only scheduled slot that may run
+    # --audit (see the v1.1.0 header). The 🚦 step waits for Daily Sync to
+    # clear before granting it and fails CLOSED. The same string must appear
+    # in AUDIT_LANE_CRON (🚦 step env) and in the job timeout expression;
+    # tests/test_tracker_audit_lane.py pins all three.
+    - cron: "47 20 * * *"   # 23:47 Riyadh - after the US close; maturity audit lane
 
   # Manual trigger — use this to START THE CLOCK immediately and to verify the
   # wiring without waiting for 14:00 UTC.
@@ -150,7 +189,10 @@ jobs:
     name: 📈 Record · Audit · Calibrate
     runs-on: ubuntu-24.04
     environment: production
-    timeout-minutes: 45
+    # (2026-10-17) D-L1: the audit lane may wait up to AUDIT_WAIT_MINUTES for
+    # a running Daily Sync before it audits, so its budget is wider. The
+    # record slots keep the 45-minute budget exactly.
+    timeout-minutes: ${{ github.event.schedule == '47 20 * * *' && 180 || 45 }}
 
     steps:
       - name: 📥 Checkout
@@ -192,6 +234,15 @@ jobs:
         id: overlap
         env:
           GH_TOKEN: ${{ github.token }}
+          # (2026-10-17) D-L1 audit-lane controls. EVENT_SCHEDULE is the cron
+          # string that fired this run (empty on workflow_dispatch). The lane
+          # is granted (output audit=true) only when EVENT_SCHEDULE equals
+          # AUDIT_LANE_CRON AND no Daily Sync is queued or running after up to
+          # AUDIT_WAIT_MINUTES of polling every AUDIT_POLL_SECONDS.
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          AUDIT_LANE_CRON: "47 20 * * *"
+          AUDIT_WAIT_MINUTES: "120"
+          AUDIT_POLL_SECONDS: "120"
         run: |
           set -euo pipefail
           # (2026-10-06) WHY THIS EXISTS. This clock and daily_sync's own
@@ -212,11 +263,57 @@ jobs:
           # missing day is worse than a rare overlap, and the overlap is the
           # condition this step merely makes less likely, not a correctness
           # guarantee.
-          RUNNING="$(curl -sS --max-time 25 \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?per_page=20" \
-            | jq -r '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length' 2>/dev/null || echo "ERR")"
+          sync_inflight() {
+            curl -sS --max-time 25 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?per_page=20" \
+              | jq -r '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length' 2>/dev/null || echo "ERR"
+          }
+
+          # (2026-10-17) D-L1 AUDIT LANE - WAIT, THEN FAIL CLOSED.
+          # The audit rewrites every Performance_Log row (load -> audit ->
+          # save_records), so it must be the ONLY writer. daily_sync's 20:17Z
+          # slot has fired as late as 23:00Z and a full sync has taken 4h37m,
+          # so "skip if in flight" would skip most nights: this lane WAITS for
+          # the sync to clear (poll every AUDIT_POLL_SECONDS, up to
+          # AUDIT_WAIT_MINUTES) and audits only once the API reports zero
+          # queued/running Daily Sync runs. Unlike the record lanes below it
+          # does NOT fail open: an unreadable sync state or an expired deadline
+          # skips the run (no audit, no record) with a warning - the next
+          # 23:47 slot or a manual run_audit=true dispatch covers it.
+          # daily_sync.yml's tracker step holds the mirror guard (it skips its
+          # record while a Performance Clock run is in progress).
+          if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "${EVENT_SCHEDULE:-}" == "${AUDIT_LANE_CRON}" ]]; then
+            deadline=$(( $(date +%s) + AUDIT_WAIT_MINUTES * 60 ))
+            while :; do
+              RUNNING="$(sync_inflight)"
+              if [[ "$RUNNING" == "ERR" || -z "${RUNNING:-}" || ! "$RUNNING" =~ ^[0-9]+$ ]]; then
+                echo "::warning::D-L1 audit lane: could not read Daily Sync state - auditing blind is the #759 race, so this audit is SKIPPED (fail-closed). The next 23:47 Riyadh slot or a manual run_audit=true dispatch covers it."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "audit=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [[ "$RUNNING" -eq 0 ]]; then
+                echo "✅ No Daily Sync in flight - audit lane granted."
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+                echo "audit=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if (( $(date +%s) >= deadline )); then
+                echo "::warning::D-L1 audit lane: ${RUNNING} Daily Sync run(s) still queued or in progress after ${AUDIT_WAIT_MINUTES} min - this audit is SKIPPED (fail-closed); the next 23:47 Riyadh slot covers it."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "audit=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "⏳ ${RUNNING} Daily Sync run(s) queued or in progress - audit lane waiting ${AUDIT_POLL_SECONDS}s (deadline $(date -u -d "@${deadline}" '+%H:%M:%SZ'))."
+              sleep "${AUDIT_POLL_SECONDS}"
+            done
+          fi
+
+          # Record lanes (14:47 / 18:47 / manual): unchanged v1.0.2 behaviour.
+          echo "audit=false" >> "$GITHUB_OUTPUT"
+          RUNNING="$(sync_inflight)"
 
           if [[ "$RUNNING" == "ERR" || -z "${RUNNING:-}" || ! "$RUNNING" =~ ^[0-9]+$ ]]; then
             echo "::warning::Could not read Daily Sync state; proceeding (fail-open)."
@@ -275,6 +372,9 @@ jobs:
           TFB_CHECKOUT_SHA: ${{ steps.source_checkout.outputs.commit }}
           INPUT_SIGNAL_HISTORY_MODE: ${{ github.event.inputs.signal_history_mode }}
           INPUT_RUN_AUDIT: ${{ github.event.inputs.run_audit }}
+          # (2026-10-17) D-L1: granted by the 🚦 step only on the audit cron
+          # and only once Daily Sync is clear. Anything else is record-only.
+          AUDIT_LANE: ${{ steps.overlap.outputs.audit }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
@@ -396,9 +496,28 @@ jobs:
           # --export : write <base>_*.json (perf / signal_trends / calibration)
           AUDIT_FLAG=""
           AUDIT_ENABLED=false
+          RECORD_FLAG="--record"
+          TRACKER_LANE="record-only"
           if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_RUN_AUDIT:-}" == "true" ]]; then
             AUDIT_FLAG="--audit"
             AUDIT_ENABLED=true
+            TRACKER_LANE="manual-audit"
+          elif [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "${AUDIT_LANE:-}" == "true" ]]; then
+            # (2026-10-17) D-L1 SCHEDULED AUDIT LANE. Reached only when the
+            # 🚦 step granted AUDIT_LANE on the "47 20 * * *" cron with no
+            # Daily Sync in flight (both conditions re-checked here on
+            # purpose). Explicit 1s: the record lanes export 0s below, and an
+            # inherited default must never decide a maturation.
+            # No --record: the slot is 13 minutes before the Riyadh day
+            # boundary and the measured cron drift is hours, so a record here
+            # would be keyed to the NEXT Riyadh day from a pre-market board
+            # and pre-empt that day's 14:47 snapshot (keys are per day).
+            AUDIT_FLAG="--audit"
+            AUDIT_ENABLED=true
+            RECORD_FLAG=""
+            TRACKER_LANE="scheduled-audit"
+            export TRACK_AUDIT=1
+            export TRACK_PUBLISH_CALIBRATION=1
           else
             # Schedules and absent/false inputs record prospectively. Override
             # inherited app defaults so --analyze cannot publish old outcomes.
@@ -413,9 +532,11 @@ jobs:
 
           CMD=(python scripts/track_performance.py
                --sheet-id "$TARGET_SHEET_ID"
-               --record $AUDIT_FLAG --analyze --export)
+               $RECORD_FLAG $AUDIT_FLAG --analyze --export)
 
           echo "📋 ${CMD[*]}"
+          echo "🧭 lane=${TRACKER_LANE}"
+          if [[ -n "${GITHUB_ENV:-}" ]]; then echo "TRACKER_LANE=${TRACKER_LANE}" >> "$GITHUB_ENV"; fi
           TS="$(date +%Y%m%d_%H%M%S)"
           LOG="perf_clock_${TS}.log"
           set -o pipefail
@@ -462,6 +583,7 @@ jobs:
             echo "| :--- | :--- |"
             echo "| Status | $ICON |"
             echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Lane | \`${TRACKER_LANE:-skipped (see the 🚦 step)}\` |"
             echo "| Time (Riyadh) | \`$RIYADH\` |"
             echo "| Backend | \`${TARGET_URL:-?}\` |"
             echo "| Sheet | \`${TARGET_SHEET_ID:-?}\` |"

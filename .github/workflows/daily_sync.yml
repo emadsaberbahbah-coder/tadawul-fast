@@ -1292,6 +1292,10 @@ jobs:
       # (2026-10-11) True for Performance_Log; Signal_History snapshots are NOT
       # deduped by immutable publication identity only when the opt-in
       # TRACK_SIGNAL_PUBLICATION_MODE is armed; WP-7 remains measurement.
+      # (2026-10-17) D-L1 MIRROR GUARD: track_performance.yml v1.1.0 audits on
+      # a 20:47Z schedule after waiting for THIS workflow to clear; this step
+      # now skips its record while a Performance Clock run is in progress (the
+      # guard is inside the run block). Its record-only contract is unchanged.
       - name: 📈 Track Performance (record + audit)
         # 2026-09-01 (duplicate-cohort ROOT CAUSE): this step ran in EVERY matrix
         # leg, so each sync recorded the day's cohorts three times (plus the
@@ -1357,6 +1361,10 @@ jobs:
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+          # (2026-10-17) D-L1 mirror guard reads the Actions API (the workflow
+          # already grants actions: read). Offline harnesses have no
+          # GITHUB_API_URL and take the recording path unchanged.
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
             echo "::warning::scripts/track_performance.py not found — skipping"
@@ -1364,6 +1372,31 @@ jobs:
           fi
           if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
             export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
+          fi
+          # (2026-10-17) D-L1 MIRROR GUARD. track_performance.yml v1.1.0 audits
+          # Performance_Log on a 20:47Z schedule (load -> audit -> save_records
+          # rewrites every row). This leg's --record APPENDS rows; an append
+          # inside that load->save window is lost or doubled - the 2026-09-01
+          # duplicate-cohort class. The clock waits for THIS workflow to clear
+          # before it audits; this is the other direction: if a Performance
+          # Clock run is in progress right now, skip this leg's record. Safe:
+          # the key is per Riyadh day and the clock's own record slots (14:47 /
+          # 18:47) record the same keys. Fail-OPEN: unreadable state records
+          # as before (the clock side fails CLOSED, so one blind side is the
+          # accepted residual). Only in_progress counts - a QUEUED clock run
+          # will itself wait for this sync to finish before it audits.
+          if [[ -n "${GITHUB_API_URL:-}" && -n "${GH_TOKEN:-}" ]]; then
+            CLOCK_RUNNING="$(curl -sS --max-time 25 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/track_performance.yml/runs?status=in_progress&per_page=5" \
+              | jq -r '.workflow_runs | length' 2>/dev/null || echo "ERR")"
+            if [[ "$CLOCK_RUNNING" =~ ^[0-9]+$ && "$CLOCK_RUNNING" -gt 0 ]]; then
+              echo "::notice::${CLOCK_RUNNING} Performance Clock run(s) in progress - skipping this leg's tracker record to keep one writer on Performance_Log (D-L1 mirror guard). The clock's own record slots cover today's keys."
+              exit 0
+            elif [[ ! "$CLOCK_RUNNING" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Could not read Performance Clock state; recording as before (fail-open)."
+            fi
           fi
           # Visibility (2026-06-18): the previous '|| echo non-fatal' hid a
           # standing Sheets 403 — the service account lacked Editor on the
