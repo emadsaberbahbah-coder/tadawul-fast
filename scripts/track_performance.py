@@ -1584,7 +1584,51 @@ from urllib.error import HTTPError, URLError
 # TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
 # identities, preserving successive states and refusing writes without a
 # readable identity index. Legacy and WP-7 measurement modes stay available.
-SCRIPT_VERSION = "6.45.0"
+# v6.46.0 (2026-10-17) - L2 HYPOTHESIS BACKTEST HAS NO BARS (Codex brief 17-Oct
+# s2 L2; diagnosis first, then the loud failure).
+# WHY (Hypothesis_Registry, 17-Oct export): 6 hypotheses, all INSUFFICIENT_DATA,
+# 0 trigger events, Universe Size 0, History Days 0, last backtest
+# 2026-10-11T17:52Z. The job log of that run (backtest_harness #21) shows
+# every history call as GET .../v8/finance/chart/<SYM>?range=1mo&interval=1d
+# and then "history fetched for 16/16 symbols" - the fetch did not fail, it
+# was SHALLOW. Mechanism: _fetch_backtest_history calls fn(sym, days=730);
+# yahoo_chart.fetch_history(symbol, period="1mo", interval="1d") has no
+# `days`, so the TypeError fallback fn(sym) asked for the 1mo default
+# (~22 bars) on every symbol; the provider loop breaks on the first non-empty
+# list so EODHD is never consulted; the v6.11.0/v6.25.0 yfinance deep pull is
+# gated on TFB_BACKTEST_KSA_YF, which backtest_harness.yml never sets. In
+# run_backtest every symbol then fails `len(bars) < min_window + h + 1`
+# (22 < 33) and is skipped BEFORE max_hist is updated - hence Universe 0 and
+# History Days 0 beside a fresh timestamp. Known since 2026-07-19 (v6.25.0
+# note: "~22 bars ... silently skipped") and never reached production
+# because the fix sat behind an unmapped flag.
+# WHAT:
+#   (1) _fetch_from translates the day window into Yahoo's `period`
+#       vocabulary on the TypeError path (730 -> "2y") before the bare retry.
+#       DEFAULT ON with kill-switch TFB_BACKTEST_PERIOD_FROM_DAYS=0 (restores
+#       the v6.45.0 1mo behaviour). Reason for default-on (brief s2 protocol):
+#       the off state is an accidental TypeError fallback nobody configured,
+#       nothing outside this file consumes an ACCEPTED hypothesis (grep: only
+#       the registry writer and core/regime.py's protocol text), and with 22
+#       bars no verdict is reachable, so no decision can change - the off
+#       state is the defect (P-127/P-130 class).
+#   (2) run_backtest counts fetched symbols and the deepest list it saw; when
+#       Universe Size is 0 the Notes cell names the cause ("no usable history:
+#       0/16 symbols with >= 33 bars (deepest 22) ...") instead of the bare
+#       "0 trigger events" that six rows carried for months.
+#   (3) run_backtest_mode prints a depth line, and when EVERY hypothesis has
+#       Universe Size 0 it writes one [BACKTEST-EMPTY] WARNING row to _Run_Log
+#       (fail-open) and exits 2 so the harness run is red - a registry full
+#       of INSUFFICIENT_DATA with Universe 0 is a broken instrument, not a
+#       verdict. The registry is still written (with the cause in Notes).
+# READ-BACK: next backtest_harness run - job log "history depth: usable
+# 16/16 (need >= 33 bars; deepest ~505 ...)", Hypothesis_Registry Universe
+# Size > 0 and History Days >= 60 on the four _PS_FIELDS hypotheses, trigger
+# events counting; on any future zero, Notes names the cause and the run
+# exits 2. Functions added 5 (_bt_period_from_days_enabled, _bt_days_to_period,
+# _bt_history_depth, _bt_empty_verdict, _append_runlog_backtest_warning);
+# removed 0. Tests: tests/test_backtest_history_depth_l2.py.
+SCRIPT_VERSION = "6.46.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -7881,6 +7925,59 @@ def _yf_ticker(sym: str) -> str:
     return raw
 
 
+_BT_MIN_WINDOW = 12   # run_backtest's lookback before the first testable day
+
+
+def _bt_period_from_days_enabled() -> bool:
+    """v6.46.0 (L2) kill-switch. Default ON; TFB_BACKTEST_PERIOD_FROM_DAYS=0/
+    false/off/no restores the v6.45.0 TypeError fallback (Yahoo's 1mo default)."""
+    return (os.getenv("TFB_BACKTEST_PERIOD_FROM_DAYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _bt_days_to_period(days: Any) -> str:
+    """v6.46.0 (L2) PURE: map a day window onto Yahoo's discrete `range`
+    vocabulary, rounding UP so the backtest never receives fewer bars than it
+    asked for (730 -> "2y"). Anything beyond ten years is "max"."""
+    try:
+        d = int(float(days or 0))
+    except Exception:
+        d = 0
+    for limit, period in ((5, "5d"), (31, "1mo"), (93, "3mo"), (186, "6mo"),
+                          (366, "1y"), (731, "2y"), (1827, "5y"), (3653, "10y")):
+        if d <= limit:
+            return period
+    return "max"
+
+
+def _bt_history_depth(history_by_symbol: Dict[str, Any], need: int,
+                      requested: Optional[int] = None) -> Dict[str, int]:
+    """v6.46.0 (L2) PURE: how deep the fetched history really is. `usable`
+    counts symbols whose bar list reaches `need` (= min_window + horizon + 1,
+    the guard run_backtest applies); `deepest`/`median` describe every list
+    returned, usable or not, so a shallow window is visible as such."""
+    lengths = sorted(len(b) for b in (history_by_symbol or {}).values() if isinstance(b, list))
+    median = lengths[len(lengths) // 2] if lengths else 0
+    return {"requested": int(requested if requested is not None else len(history_by_symbol or {})),
+            "fetched": len(lengths), "usable": sum(1 for n in lengths if n >= need),
+            "need": int(need), "deepest": lengths[-1] if lengths else 0, "median": median}
+
+
+def _bt_empty_verdict(results: List[Any], depth: Dict[str, int]) -> Optional[str]:
+    """v6.46.0 (L2) PURE: the loud verdict when EVERY backtested hypothesis
+    has Universe Size 0. None when at least one hypothesis saw a universe."""
+    if not results:
+        return None
+    if any(int(getattr(r, "universe_size", 0) or 0) > 0 for r in results):
+        return None
+    return ("[BACKTEST-EMPTY v%s] %d/%d symbols returned bars but 0 reached the "
+            "%d-bar minimum (deepest %d, median %d): every hypothesis is "
+            "INSUFFICIENT_DATA by construction, not by evidence. Cause class: "
+            "history window too shallow (TFB_BACKTEST_PERIOD_FROM_DAYS, "
+            "TFB_BACKTEST_KSA_YF, provider depth)."
+            % (SCRIPT_VERSION, int(depth.get("fetched", 0)), int(depth.get("requested", 0)),
+               int(depth.get("need", 0)), int(depth.get("deepest", 0)), int(depth.get("median", 0))))
+
+
 def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
     """v6.11.0: direct yfinance pull at an explicit multi-year depth. Used ONLY
     when TFB_BACKTEST_KSA_YF is enabled and a symbol came back shallow from the
@@ -8112,7 +8209,7 @@ def run_backtest(
     hypothesis: Hypothesis,
     history_by_symbol: Dict[str, List[Dict[str, Any]]],
     trigger_fn: Optional[Callable[[List[Dict[str, Any]]], bool]] = None,
-    min_window: int = 12,
+    min_window: int = _BT_MIN_WINDOW,
     *,
     nonoverlap: Optional[bool] = None,
     tstat_floor: Optional[float] = None,
@@ -8158,8 +8255,13 @@ def run_backtest(
     baseline_indep: List[float] = []
     universe = 0
     max_hist = 0
+    fetched = 0    # v6.46.0 (L2): symbols that returned a bar list at all
+    raw_max = 0    # v6.46.0 (L2): deepest list seen, usable or not
 
     for _sym, bars in (history_by_symbol or {}).items():
+        if isinstance(bars, list):
+            fetched += 1
+            raw_max = max(raw_max, len(bars))
         if not isinstance(bars, list) or len(bars) < (min_window + h + 1):
             continue
         max_hist = max(max_hist, len(bars))
@@ -8212,6 +8314,11 @@ def run_backtest(
         _purged = _purge_derived_stats(hyp, n, len(baseline_rois))
         hyp.notes = ("%d trigger events (< min %d); no verdict"
                      % (n, hypothesis.min_sample))
+        if universe == 0 and fetched:
+            # v6.46.0 (L2): name the cause instead of a silent zero row.
+            hyp.notes = ("no usable history: 0/%d symbols with >= %d bars "
+                         "(deepest %d); provider window too shallow -- %s"
+                         % (fetched, min_window + h + 1, raw_max, hyp.notes))
         if _purged:
             hyp.notes += "; stale statistics purged (%s)" % ", ".join(_purged)
         return hyp
@@ -10483,6 +10590,12 @@ class PerformanceTrackerApp:
         history = await self._fetch_backtest_history(universe, days)
         got = sum(1 for v in history.values() if v)
         _out("[backtest] history fetched for %d/%d symbols\n" % (got, len(universe)))
+        # v6.46.0 (L2): depth, not just presence. "usable" applies the same
+        # guard run_backtest applies (min_window + horizon + 1 bars).
+        _need = _BT_MIN_WINDOW + max(int(h.horizon_days) for h in testable) + 1
+        _depth = _bt_history_depth(history, _need, requested=len(universe))
+        _out("[backtest] history depth: usable %d/%d (need >= %d bars; deepest %d, median %d)\n"
+             % (_depth["usable"], _depth["fetched"], _need, _depth["deepest"], _depth["median"]))
         if got == 0:
             _out("[backtest] no history -> aborting (EODHD unavailable?)\n")
             return 1
@@ -10509,7 +10622,34 @@ class PerformanceTrackerApp:
         accepted = [r for r in results if r.status == HypothesisStatus.ACCEPTED]
         _out("[backtest] ACCEPTED %d/%d (only ACCEPTED may influence a recommendation)\n" % (
             len(accepted), len(results)))
+        # v6.46.0 (L2): a registry full of INSUFFICIENT_DATA with Universe
+        # Size 0 is a broken instrument, not a verdict. The rows above are
+        # written (Notes carry the cause); the run itself must not be green.
+        _cause = _bt_empty_verdict(results, _depth)
+        if _cause:
+            logger.warning("%s", _cause)
+            _out("[backtest] %s\n" % _cause)
+            self._append_runlog_backtest_warning(registry, _cause, _depth)
+            return 2
         return 0
+
+    def _append_runlog_backtest_warning(self, registry: Any, cause: str,
+                                        depth: Dict[str, int]) -> None:
+        """v6.46.0 (L2): one WARNING row in _Run_Log naming why the registry
+        carries no bars (the sheet the standing audit already reads). Best-
+        effort and fail-open, like the VT-1 verdict line."""
+        try:
+            sheet = getattr(registry, "sheet", None)
+            if sheet is None:
+                return
+            ws = sheet.worksheet("_Run_Log")
+            row = [RiyadhTime.format(), "WARNING", "track_performance",
+                   "Hypothesis_Registry", "BACKTEST_EMPTY", cause, "", "", "",
+                   json_dumps(dict(depth))]
+            registry.backoff.execute_sync(
+                lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+        except Exception as e:
+            logger.warning("[v6.46.0 L2] _Run_Log backtest warning skipped: %s", e)
 
     def _backtest_universe(self) -> List[str]:
         """Symbols to backtest over. Env TRACK_BACKTEST_UNIVERSE (CSV) or a
@@ -10586,10 +10726,26 @@ class PerformanceTrackerApp:
                 try:
                     bars = await fn(sym, days=days)
                 except TypeError:
-                    try:
-                        bars = await fn(sym)
-                    except Exception:
-                        continue
+                    # v6.46.0 (L2): yahoo_chart.fetch_history(symbol, period,
+                    # interval) has no `days`; the bare retry below asked for
+                    # its 1mo default (~22 bars) on every symbol since
+                    # v6.10.1, and 22 < min_window + h + 1 skips them all.
+                    # Translate the window into Yahoo's `period` first
+                    # (730 -> "2y"); TFB_BACKTEST_PERIOD_FROM_DAYS=0 restores
+                    # the bare retry exactly.
+                    bars = None
+                    if _bt_period_from_days_enabled():
+                        try:
+                            bars = await fn(sym, period=_bt_days_to_period(days))
+                        except TypeError:
+                            bars = None
+                        except Exception:
+                            continue
+                    if bars is None:
+                        try:
+                            bars = await fn(sym)
+                        except Exception:
+                            continue
                 except Exception:
                     continue
                 if isinstance(bars, list) and bars:
