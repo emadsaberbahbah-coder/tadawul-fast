@@ -17,7 +17,8 @@ const ROOT = path.join(__dirname, '../..');
 // file with the v1.15.0 edits reversed (dt10_v1150_history.js is itself proven
 // by tests/js/dt10_v1150_cluster_seat_cap.test.js).
 const {revertV1150} = require('./dt10_v1150_history');
-const source = revertV1150(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'));
+const {revertV1160} = require('./dt10_v1160_history');
+const source = revertV1150(revertV1160(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8')));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {

@@ -712,6 +712,7 @@ jobs:
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_v1140_reasons_earnings_turnover.test.js
           node tests/js/dt10_v1150_cluster_seat_cap.test.js
+          node tests/js/dt10_v1160_research_levels.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py

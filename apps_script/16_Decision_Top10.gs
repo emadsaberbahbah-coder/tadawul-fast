@@ -1,11 +1,43 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.16.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.16.0 (2026-10-17) -- RESEARCH LEVELS WHEN SIZING IS WITHHELD (T7)
+ * WHY (Codex brief 2026-10-17 T7, P1): on a withheld or held board every
+ * level reads '\u2014' (dt10FinalizeBoard_ blanks entry/stop/TP1/TP2 on
+ * every non-executable seat; the W1A-4a withhold pass blanks the row
+ * again), so the operator cannot review the plan he is asked to trust
+ * next week. WHAT, gated by Script Property DT10_RESEARCH_LEVELS = 'on'
+ * (default off -> this version renders byte-identically to v1.15.0):
+ * (1) dt10ResearchLevelsCapture_ snapshots the plan levels of every seat
+ * that still carries a plan, right before the refresh's finalize (holds
+ * -- grace, fast-track, P-145, earnings, seat-cap -- have no plan today by
+ * doctrine and are never captured); (2) on a board whose OUTPUT is not
+ * EXECUTABLE (WITHHELD / HELD / QUALIFIED_UNFUNDED; executable days are
+ * untouched) dt10ResearchLevelsRow_ restores Entry Zone, Stop, TP1, TP2
+ * on the rendered row AFTER the withhold pass, while Ticket SAR, Shares,
+ * Gain and Funds From stay withheld; the Advisor Note opens with
+ * 'RESEARCH LEVELS -- NOT EXECUTABLE -- reference size only [R/R(TP2) x;
+ * ref 5% = N SAR (s sh) -> at risk R SAR (p%)]' where the reference size
+ * is 5% of meta.cash_floor.nav_sar (NAV) or, when the cash floor is
+ * unarmed, 5% of kpis.deployable_sar labelled 'NAV unknown'; (3) the
+ * SELECTED title gains ' | RESEARCH LEVELS xN (NOT EXECUTABLE -- reference
+ * size only, <basis>)' and the four level cells are painted italic grey
+ * (the watermark). The payload tickets, KPIs, _Selection_Log rows and
+ * the withheld-truth KPI pass are untouched: the view is applied to the
+ * rendered row arrays only. Mirror of TFB_PF_RESEARCH_VIEW (portfolio
+ * side). Functions added (0 removed): dt10ResearchLevelsOn_,
+ * dt10ResearchLevelsCapture_, dt10ResearchLevelReal_,
+ * dt10ResearchLevelsCtx_, dt10ResearchFmtSar_, dt10ResearchLevelsRow_,
+ * dt10ResearchLevelsPaint_. dt10SelfTest gains 'research levels core:
+ * ok'. Harness: tests/js/dt10_v1160_research_levels.test.js (+
+ * tests/js/dt10_v1160_history.js reverses these edits for the hash
+ * chain). DT10_VERSION and the header bumped in lockstep.
  *
  * v1.15.0 (2026-10-17) -- SECTOR CAP ON CARRIED SEATS + CLUSTER COLUMN (T2)
  * WHY (Codex brief 2026-10-17 T2, cockpit half): on the 17-Oct board 5 of
@@ -1820,7 +1852,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.15.0';
+var DT10_VERSION = '1.16.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3511,6 +3543,147 @@ function dt10FastTrackSuspend_(tk, label) {
       'strict until confirmed (' +
       'seat filled to avoid under-fill; not an executable ticket today).';
   return tk;
+}
+// ---------------------------------------------------------------------------
+// v1.16.0 [T7] -- research levels when sizing is withheld (gate: default OFF)
+// ---------------------------------------------------------------------------
+/** v1.16.0 [T7]: gate. Script Property DT10_RESEARCH_LEVELS = 'on' -> the
+ * research view on a non-executable board; absent / 'off' / junk / read
+ * error -> off (the page is byte-identical to v1.15.0). Never throws. */
+function dt10ResearchLevelsOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_RESEARCH_LEVELS') || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eRlo) {}
+  return false;
+}
+/** v1.16.0 [T7] PURE: a level is real when it is a positive finite number
+ * or a non-empty string that is not the dash placeholder. */
+function dt10ResearchLevelReal_(v) {
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'number') return isFinite(v) && v > 0;
+  var str = String(v).replace(/^\s+|\s+$/g, '');
+  return !!str && str !== '—' && str !== '-';
+}
+/** v1.16.0 [T7]: snapshot the plan levels of every seat that still carries
+ * one, BEFORE dt10FinalizeBoard_ blanks them on a non-executable board.
+ * Holds (grace / fast-track / P-145 / earnings / seat-cap) have no plan
+ * today by doctrine and are never captured. In-memory marker only
+ * (_research_levels); returns the count; 0 when the gate is off. */
+function dt10ResearchLevelsCapture_(payload) {
+  try {
+    if (!dt10ResearchLevelsOn_()) return 0;
+    var sel = (payload && payload.selected) || [];
+    var n = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var t = sel[i];
+      if (!t || t._grace_hold === true || t._ft_suspended === true ||
+          t._p145_suspended === true || t._earn_hold === true ||
+          t._seat_cap_deferred === true) continue;
+      if (!dt10ResearchLevelReal_(t.entry_zone) &&
+          !dt10ResearchLevelReal_(t.stop_sar)) continue;
+      var d = t.detail || {};
+      t._research_levels = { entry_zone: t.entry_zone, stop_sar: t.stop_sar,
+                             tp1_sar: t.tp1_sar, tp2_sar: t.tp2_sar,
+                             rr: d.rr, rr_tp2: d.rr_tp2,
+                             price_sar: t.price_sar };
+      n++;
+    }
+    return n;
+  } catch (eRlc) {
+    return 0;
+  }
+}
+/** v1.16.0 [T7] PURE: '1,160 SAR' (rounded). */
+function dt10ResearchFmtSar_(v) {
+  var n = Math.round(Number(v) || 0);
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' SAR';
+}
+/** v1.16.0 [T7] PURE: the render context -- which SELECTED rows show the
+ * research view (indexes into payload.selected) and the reference size
+ * (5% of NAV from meta.cash_floor.nav_sar; else 5% of kpis.deployable_sar
+ * labelled 'NAV unknown'). rows is EMPTY when the gate is off, the board
+ * OUTPUT is EXECUTABLE (executable days untouched), or no seat captured
+ * levels / every captured seat is sized. Never throws. */
+function dt10ResearchLevelsCtx_(payload, selected) {
+  var ctx = { rows: [], ref_sar: 0, basis_label: '', pct: 5 };
+  try {
+    if (!dt10ResearchLevelsOn_()) return ctx;
+    if (dt10OutputStatus_(payload) === 'EXECUTABLE') return ctx;
+    selected = selected || [];
+    for (var i = 0; i < selected.length; i++) {
+      var t = selected[i];
+      if (!t || !t._research_levels) continue;
+      if (Number(t.suggested_shares) > 0 && Number(t.suggested_sar) > 0) continue;
+      ctx.rows.push(i);
+    }
+    if (!ctx.rows.length) return ctx;
+    var meta = (payload && payload.meta) || {};
+    var k = (payload && payload.kpis) || {};
+    var nav = Number(meta.cash_floor && meta.cash_floor.nav_sar);
+    var dep = Number(k.deployable_sar);
+    if (isFinite(nav) && nav > 0) {
+      ctx.ref_sar = Math.round(nav * ctx.pct / 100);
+      ctx.basis_label = ctx.pct + '%-NAV ref ' + dt10ResearchFmtSar_(ctx.ref_sar);
+    } else if (isFinite(dep) && dep > 0) {
+      ctx.ref_sar = Math.round(dep * ctx.pct / 100);
+      ctx.basis_label = ctx.pct + '%-deployable ref ' +
+          dt10ResearchFmtSar_(ctx.ref_sar) + ' (NAV unknown)';
+    } else {
+      ctx.basis_label = 'reference size n/a (NAV unknown)';
+    }
+  } catch (eRlx) {
+    ctx.rows = [];
+  }
+  return ctx;
+}
+/** v1.16.0 [T7] PURE: one research row -- restores Entry Zone, Stop, TP1,
+ * TP2 (board indexes 9, 12, 13, 14) AFTER the withhold pass; Ticket SAR,
+ * Shares, Gain and Funds From stay withheld; the Advisor Note opens with
+ * the watermark, R/R(TP2) and the at-risk SAR at the reference size.
+ * Mutates and returns row. */
+function dt10ResearchLevelsRow_(row, t, ctx) {
+  if (!row || !t || !t._research_levels) return row;
+  var L = t._research_levels;
+  row[9] = dt10Cell_(L.entry_zone);
+  row[12] = dt10Cell_(L.stop_sar);
+  row[13] = dt10Cell_(L.tp1_sar);
+  row[14] = dt10Cell_(L.tp2_sar);
+  var bits = [];
+  var rr = Number(L.rr_tp2);
+  if (!isFinite(rr) || rr <= 0) rr = Number(L.rr);
+  if (isFinite(rr) && rr > 0) bits.push('R/R(TP2) ' + (Math.round(rr * 100) / 100));
+  var px = Number(L.price_sar), st = Number(L.stop_sar);
+  if (ctx && ctx.ref_sar > 0 && isFinite(px) && px > 0 &&
+      isFinite(st) && st > 0 && st < px) {
+    var sh = Math.floor(ctx.ref_sar / px);
+    var risk = Math.round(sh * (px - st));
+    bits.push('ref ' + ctx.pct + '% = ' + dt10ResearchFmtSar_(ctx.ref_sar) +
+        ' (' + sh + ' sh) -> at risk ' + dt10ResearchFmtSar_(risk) + ' (' +
+        (Math.round((px - st) / px * 1000) / 10) + '%)');
+  } else if (ctx && ctx.basis_label) {
+    bits.push(ctx.basis_label);
+  }
+  row[DT10_UV_BOARD_NOTE_IDX] = 'RESEARCH LEVELS — NOT EXECUTABLE — ' +
+      'reference size only' + (bits.length ? ' [' + bits.join('; ') + ']' : '') +
+      '. ' + String(row[DT10_UV_BOARD_NOTE_IDX] || '');
+  return row;
+}
+/** v1.16.0 [T7]: the watermark -- the four level cells (Entry Zone, Stop,
+ * TP1, TP2 = 1-based 10, 13, 14, 15) italic grey on the research rows.
+ * Never throws (a paint fault leaves the values standing). */
+function dt10ResearchLevelsPaint_(sheet, firstDataRow, rows) {
+  try {
+    if (!rows || !rows.length || !(firstDataRow > 0)) return;
+    var cols = [10, 13, 14, 15];
+    for (var i = 0; i < rows.length; i++) {
+      for (var c = 0; c < cols.length; c++) {
+        sheet.getRange(firstDataRow + rows[i], cols[c])
+            .setFontStyle('italic').setFontColor('#6B7280');
+      }
+    }
+  } catch (eRlp) {}
 }
 // ---------------------------------------------------------------------------
 // v1.15.0 [T2] -- sector cap on CARRIED seats + deferred-seat table (pure cores)
@@ -7435,6 +7608,7 @@ function refreshDecisionTop10() {
       dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   if (resp.local !== true) dt10ReallocateBoard_(payload, body);
+  dt10ResearchLevelsCapture_(payload);   // v1.16.0 [T7]: before finalize blanks the levels
   dt10FinalizeBoard_(payload);
   var earnHoldNote = dt10ApplyEarningsHold_(payload);   // v1.14.0 [T5]
   var turnoverNote = dt10TurnoverNote_(payload);        // v1.14.0 [T6]
@@ -7766,6 +7940,15 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       dt10OutputStatus_(payload) === 'WITHHELD') {
     kpiRange.setValues([dt10KpiWithheldValues_(payload.kpis)]);
   }
+  // v1.16.0 [T7]: research levels on a non-executable board (Script
+  // Property DT10_RESEARCH_LEVELS = on; default off -> rows is empty and
+  // nothing below changes).
+  var rlCtx = dt10ResearchLevelsCtx_(payload, selected);
+  if (rlCtx.rows.length) {
+    dt10SelTitle += ' | RESEARCH LEVELS x' + rlCtx.rows.length +
+        ' (NOT EXECUTABLE \u2014 reference size only' +
+        (rlCtx.basis_label ? ', ' + rlCtx.basis_label : '') + ')';
+  }
   row = dt10WriteSection_(sheet, row, dt10SelTitle, tokens);
   // v1.13.4 [WP-8] DT10_VINTAGE_COLS: enforce appends two research-context
   // cells AFTER Advisor Note (idx 30/31); withhold indices (<= 29) and
@@ -7797,6 +7980,12 @@ function dt10RenderPayload_(sheet, payload, tokens) {
                          DT10_UV_BOARD_NOTE_IDX, dt10Uv.reason);
     }
   }
+  // v1.16.0 [T7]: restore the plan LEVELS (entry, stop, TP1, TP2) on the
+  // research rows AFTER the withhold pass; Ticket SAR, Shares, Gain and
+  // Funds From stay withheld; the note carries R/R and the reference risk.
+  for (var rlI = 0; rlI < rlCtx.rows.length; rlI++) {
+    dt10ResearchLevelsRow_(selRows[rlCtx.rows[rlI]], selected[rlCtx.rows[rlI]], rlCtx);
+  }
   var selT = dt10WriteTable_(sheet, row, selHeaders, selRows,   // v1.13.4 [WP-8]
       'No qualifying opportunities under the current criteria — ' +
       'an honest empty result (L13). See All Qualified / Near Miss for what ' +
@@ -7820,6 +8009,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   dt10TintGraceRows_(sheet, selT.firstDataRow, selT.count, selected, tokens);
   // v1.3.0: color the Stability column (25) by state.
   dt10ColorStability_(sheet, selT.firstDataRow, selT.count, 25, tokens);
+  dt10ResearchLevelsPaint_(sheet, selT.firstDataRow, rlCtx.rows);   // v1.16.0 [T7] watermark
   if (selT.firstDataRow > 0) {
     sheet.getRange(selT.firstDataRow, DT10_LAST_COL, selT.count, 1)
         .setWrap(true).setFontSize(9);
@@ -8661,6 +8851,26 @@ function dt10SelfTest() {
         scT.deferred[0]._stab_status === 'GRACE (2/3 missed) - sector cap deferred' &&
         scNo.kept.length === 1 && scNo.deferred.length === 0) ? 'ok' : 'FAIL') +
       ' | ' + (dt10SeatSectorCapLegacy_() ? 'OFF (DT10_SEAT_SECTOR_CAP_LEGACY)' : 'ON'));
+  // v1.16.0 [T7]: pure row core -- levels back at 9/12/13/14 after a
+  // withhold, Ticket SAR / Shares / Funds From still dashes, note watermark
+  // with R/R and the at-risk figure at the reference size.
+  var rlT = { _research_levels: { entry_zone: '96.5\u201398.0', stop_sar: 90, tp1_sar: 110,
+              tp2_sar: 120, rr: 1.8, rr_tp2: 2.5, price_sar: 100 } };
+  var rlRow = dt10UvWithholdRow_(dt10TicketToRow_({ symbol: 'R', price_sar: 100,
+      entry_zone: '96.5\u201398.0', stop_sar: 90, tp1_sar: 110, tp2_sar: 120,
+      suggested_sar: 4650, suggested_shares: 46, detail: { funds_from: 'Cash' } }),
+      DT10_UV_BOARD_WITHHOLD_IDX, DT10_UV_BOARD_NOTE_IDX, 'stale');
+  dt10ResearchLevelsRow_(rlRow, rlT, { rows: [0], ref_sar: 1160, basis_label: 'x', pct: 5 });
+  report.push('research levels core: ' +
+      ((rlRow[9] === '96.5\u201398.0' && rlRow[12] === 90 && rlRow[13] === 110 &&
+        rlRow[14] === 120 && rlRow[10] === '\u2014' && rlRow[11] === '\u2014' &&
+        rlRow[22] === '\u2014' && rlRow[18] === '\u2014' &&
+        String(rlRow[DT10_UV_BOARD_NOTE_IDX]).indexOf('RESEARCH LEVELS \u2014 NOT EXECUTABLE ' +
+            '\u2014 reference size only [R/R(TP2) 2.5; ref 5% = 1,160 SAR (11 sh) -> ' +
+            'at risk 110 SAR (10%)]. SIZING WITHHELD') === 0 &&
+        dt10ResearchLevelReal_('\u2014') === false && dt10ResearchLevelReal_(0) === false &&
+        dt10ResearchLevelReal_(90) === true) ? 'ok' : 'FAIL') +
+      ' | DT10_RESEARCH_LEVELS=' + (dt10ResearchLevelsOn_() ? 'on' : 'off (default)'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of
