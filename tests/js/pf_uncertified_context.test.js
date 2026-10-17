@@ -54,8 +54,8 @@ function load(props, sheets) {
 
 test('V1 version lockstep (header line 4, PD_VERSION), syntax, the five functions and two vars exist', () => {
   const ctx = load();
-  assert.equal(ctx.PD_VERSION, '1.5.15');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.15$/);
+  assert.equal(ctx.PD_VERSION, '1.5.16');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.16$/);
   assert(source.includes(' * v1.5.14 MAIN CHANGES  (UNCERTIFIED-VIEW CONTEXT + LEDGER CASH SNAPSHOT --'));
   assert(source.includes(' * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ'), 'prior block kept');
   for (const f of ['pdUncertifiedContextOn_', 'pdUncertifiedContext_', 'pdCashSnapshotParse_', 'pdCashSnapshotRead_', 'pdActionLabel_']) {

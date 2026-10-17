@@ -1,0 +1,20 @@
+symbol,name,currency,qty,buy_date,buy_price,sell_date,sell_price,exit_type,realized_pnl_ccy,realized_pnl_usd,realized_pnl_sar_at_3.75,source
+SHG,Shinhan Financial Group ADR,USD,70,2026-08-24,74.37,2026-09-03,84.34,limit take-profit,693.32,693.32,2599.95,IBKR connector trades DAYS_90
+T82U,Suntec REIT,SGD,3800,2026-08-12,1.50,2026-08-21,1.54,limit take-profit,106.23,82.90,310.88,IBKR connector trades DAYS_90 (SGD->USD 1.2815)
+PFLT,PennantPark Floating Rate,USD,500,2026-08-06,7.315,2026-08-10,7.48,limit take-profit,59.60,59.60,223.50,IBKR connector trades DAYS_90 (8 partial fills)
+CTO,CTO Realty Growth,USD,170,2026-08-05,21.75,2026-08-06,21.75-21.765,market exit,-6.28,-6.28,-23.55,IBKR connector trades DAYS_90
+PFS,Provident Financial Services,USD,5,2026-07-28,24.085,2026-09-08,23.67,market exit,-6.65,-6.65,-24.94,IBKR connector trades DAYS_90
+VEL,Velocity Financial,USD,24,2026-09-09,18.00,2026-09-16,16.97,stop,-29.30,-29.30,-109.88,IBKR connector trades DAYS_90
+ARCO,Arcos Dorados,USD,350,2026-08-06,8.40,2026-08-07,8.21-8.245,market exit,-76.37,-76.37,-286.39,IBKR connector trades DAYS_90
+AER,AerCap Holdings,USD,14,2026-09-28,148.18,2026-10-08,140.54,stop,-111.54,-111.54,-418.28,IBKR connector trades DAYS_90
+HCI,HCI Group,USD,30,2026-09-03,191.41,2026-09-08,186.35,market exit,-156.38,-156.38,-586.43,IBKR connector trades DAYS_90
+EPRT,Essential Properties Realty,USD,100,2026-08-27,30.59,2026-09-11,28.955,stop,-168.08,-168.08,-630.30,IBKR connector trades DAYS_90
+UVV,Universal Corp,USD,100,2026-08-06,52.88,2026-08-07,51.04,market exit,-188.78,-188.78,-707.93,IBKR connector trades DAYS_90
+CARE,Carter Bankshares,USD,100,2026-09-10,31.43,2026-09-29,29.55,stop,-192.58,-192.58,-722.18,IBKR connector trades DAYS_90
+OTIS,Otis Worldwide,USD,55,2026-08-12,72.75,2026-09-10,69.04,limit exit below cost,-208.63,-208.63,-782.36,IBKR connector trades DAYS_90
+YUM,Yum! Brands,USD,24,2026-08-12,144.61,2026-10-01,136.01,stop,-210.98,-210.98,-791.18,IBKR connector trades DAYS_90
+SBAC,SBA Communications,USD,21,2026-08-12,180.90,2026-09-24,167.34,stop,-289.33,-289.33,-1084.99,IBKR connector trades DAYS_90
+TOTAL,15 closed names (3 wins / 12 losses),USD,,,,,,,,-809.08,-3034.05,win rate 20% · avg win +278.6 · avg loss -137.1 · payoff 2.03 · expectancy -53.9 USD/trade · 6 stop-outs
+OPEN,CWBC Community West Bancshares,USD,100,2026-09-10,25.93,,,working bracket 29.60 / 25.09 (NEW),,,,open lot — avg cost incl. fees 25.9529
+OPEN,DDI DoubleDown Interactive ADR,USD,229,2026-09-08,12.71-12.72,,,working bracket 15.03 / 12.49 (NEW),,,,open lot — avg cost incl. fees 12.7385
+OPEN,KRP Kimbell Royalty Partners,USD,130,2026-09-28,14.68,,,bracket 16.40 / 13.95 status REPLACED — no successor listed,,,,open lot — avg cost incl. fees 14.7029 — VERIFY MON PRE-OPEN

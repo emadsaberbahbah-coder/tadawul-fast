@@ -1,7 +1,34 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.15
+ * Version: 1.5.16
+ *
+ * v1.5.16 MAIN CHANGES  (90-DAY PRICE SPARKLINE COLUMN -- Decision Pages v2
+ *                        plan 2026-10-17 package B3 (cockpit half); applies
+ *                        only when Script Property PD_SPARKLINE = on; ALL
+ *                        v1.5.15 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY: the Portfolio_Decision v2 renderer (plan A3) wants a 90-day price
+ * sparkline per holding without a backend history endpoint (none exists in
+ * routes/). Google Sheets can draw it itself from GOOGLEFINANCE.
+ * WHAT: with the property on, the ACTIONS table gains one more column
+ * 'Spark 90d' (after Advisor Note and, when present, 'Switch (adv)') whose
+ * cells carry =IFERROR(SPARKLINE(GOOGLEFINANCE(ticker,"close",TODAY()-91,
+ * TODAY()),style),"") and the column is HIDDEN (sheet.hideColumns) so the
+ * current layout is untouched until the v2 renderer shows it. The ticker is
+ * mapped by suffix (pdSparklineTicker_, pure): .US -> bare symbol, .L ->
+ * LON:, .HK -> HKG:, .SR -> TADAWUL:, .T -> TYO:, .PA -> EPA:, .IS -> IST:,
+ * .SI -> SGX: (full map PD_SPARK_EXCHANGES); an unknown suffix yields a
+ * blank cell, never a wrong instrument. LSE / HK therefore need no backend
+ * fallback (GOOGLEFINANCE serves LON:/HKG: directly). Formulas are written
+ * through setValues (a string starting with '=' is a formula). Property
+ * absent/off (default): headers, rows, formats, hidden state and the
+ * off-mode golden are byte-identical to v1.5.15. PD_ACTION_HEADERS itself is
+ * untouched (action-log width contract 26 -> 32 unchanged). Functions added:
+ * pdSparklineColOn_, pdSparklineTicker_, pdSparklineFormula_; vars
+ * PD_SPARK_COL_PROP, PD_SPARK_HEADER, PD_SPARK_DAYS, PD_SPARK_COLOR,
+ * PD_SPARK_EXCHANGES. Removed: 0. pdSelfTest reports the property state and
+ * the pure mapper. Harness: tests/js/pf_sparkline_col.test.js.
  *
  * v1.5.15 MAIN CHANGES  (SWITCH ADVISORY COLUMN -- Codex brief 2026-10-17 C4,
  *                        cockpit half; applies only when Script Property
@@ -2599,7 +2626,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.15';
+var PD_VERSION = '1.5.16';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3151,6 +3178,52 @@ function pdActionHeaders_(on) {
 /** PURE: the 'Switch (adv)' cell -- the backend's switch_advisory text or ''. */
 function pdSwitchAdvisoryCell_(a) {
   return pdCell_(a && a.switch_advisory);
+}
+
+/* ----- v1.5.16 [B3] 90-day price sparkline column (gated, hidden) ------------- */
+var PD_SPARK_COL_PROP = 'PD_SPARKLINE';   /* off (default) | on */
+var PD_SPARK_HEADER = 'Spark 90d';
+var PD_SPARK_DAYS = 91;                    /* TODAY()-91 .. TODAY() */
+var PD_SPARK_COLOR = '#2a78d6';
+/* Symbol suffix -> GOOGLEFINANCE exchange prefix ('' = bare US ticker). */
+var PD_SPARK_EXCHANGES = { US: '', L: 'LON', HK: 'HKG', SR: 'TADAWUL',
+  T: 'TYO', PA: 'EPA', IS: 'IST', SI: 'SGX', LS: 'ELI', JK: 'IDX', AS: 'AMS',
+  DE: 'ETR', MI: 'BIT', MC: 'BME', SW: 'SWX', TO: 'TSE', AX: 'ASX',
+  MX: 'BMV', HE: 'HEL', ST: 'STO', CO: 'CPH', OL: 'OSL', BR: 'EBR', VI: 'VIE' };
+/** Script Property PD_SPARKLINE = 'on' -> the ACTIONS table gains the hidden
+ * 'Spark 90d' column; anything else -> off (render byte-identical to
+ * v1.5.15). Never throws. */
+function pdSparklineColOn_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(PD_SPARK_COL_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (e) {
+    return false;
+  }
+}
+/** PURE: a page symbol -> the GOOGLEFINANCE ticker ('SHG.US' -> 'SHG',
+ * 'HSBA.L' -> 'LON:HSBA', '0005.HK' -> 'HKG:0005', '2222.SR' ->
+ * 'TADAWUL:2222'); a bare symbol passes through; an unknown suffix, a
+ * blank or an unsafe token -> '' (blank cell, never a wrong instrument). */
+function pdSparklineTicker_(symbol) {
+  var s = String(symbol === null || symbol === undefined ? '' : symbol)
+      .replace(/^\s+|\s+$/g, '').toUpperCase();
+  if (!s || !/^[A-Z0-9][A-Z0-9.\-]{0,19}$/.test(s)) return '';
+  var dot = s.lastIndexOf('.');
+  if (dot < 0) return s;
+  var base = s.slice(0, dot), suf = s.slice(dot + 1);
+  if (!base || !Object.prototype.hasOwnProperty.call(PD_SPARK_EXCHANGES, suf)) return '';
+  var ex = PD_SPARK_EXCHANGES[suf];
+  return ex ? ex + ':' + base : base;
+}
+/** PURE: the sparkline cell -- '' for a blank ticker, else the formula. */
+function pdSparklineFormula_(ticker) {
+  var t = String(ticker === null || ticker === undefined ? '' : ticker);
+  if (!t || !/^[A-Z0-9][A-Z0-9.:\-]{0,27}$/.test(t)) return '';
+  return '=IFERROR(SPARKLINE(GOOGLEFINANCE("' + t + '","close",TODAY()-' +
+      PD_SPARK_DAYS + ',TODAY()),{"charttype","line";"linewidth",1;"color","' +
+      PD_SPARK_COLOR + '"}),"")';
 }
 
 /* ----- v1.5.14 [C1 / C3] uncertified-view context + ledger cash snapshot ----- */
@@ -4327,9 +4400,18 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
   var aRows = [];
   var swCol = pdSwitchAdvisoryColOn_();   /* v1.5.15 [C4] */
   var aHeaders = pdActionHeaders_(swCol);
+  var spCol = pdSparklineColOn_();   /* v1.5.16 [B3] */
+  if (spCol) aHeaders = aHeaders.concat([PD_SPARK_HEADER]);
   for (var a = 0; a < actions.length; a++) {
     aRows.push(pdActionToRow_(actions[a]));
     if (swCol) aRows[aRows.length - 1].push(pdSwitchAdvisoryCell_(actions[a]));
+    if (spCol) {
+      aRows[aRows.length - 1].push(
+          pdSparklineFormula_(pdSparklineTicker_(actions[a] && actions[a].symbol)));
+    }
+  }
+  if (spCol && sheet.getMaxColumns() < aHeaders.length) {   /* v1.5.16 [B3] */
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), aHeaders.length - sheet.getMaxColumns());
   }
   if (swCol && sheet.getMaxColumns() < aHeaders.length) {
     sheet.insertColumnsAfter(sheet.getMaxColumns(), aHeaders.length - sheet.getMaxColumns());
@@ -4350,8 +4432,11 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
         .setWrap(true).setFontSize(9);
   }
   if (swCol && aT.firstDataRow > 0) {   /* v1.5.15 [C4]: wrap the advisory column */
-    sheet.getRange(aT.firstDataRow, aHeaders.length, aT.count, 1)
+    sheet.getRange(aT.firstDataRow, aHeaders.length - (spCol ? 1 : 0), aT.count, 1)
         .setWrap(true).setFontSize(9);
+  }
+  if (spCol) {   /* v1.5.16 [B3]: the sparkline column stays hidden until the v2 layout */
+    try { sheet.hideColumns(aHeaders.length); } catch (eSp) {}
   }
   row = aT.next + 1;
 
@@ -4653,6 +4738,15 @@ function pdSelfTest() {
         pdActionHeaders_(false) === PD_ACTION_HEADERS &&
         pdSwitchAdvisoryCell_({switch_advisory: 'x'}) === 'x' &&
         pdSwitchAdvisoryCell_({}) === '') ? 'ok' : 'FAIL'));
+  report.push('sparkline col (' + PD_SPARK_COL_PROP + '): ' +   /* v1.5.16 [B3] */
+      (pdSparklineColOn_() ? 'on (hidden column ' + PD_SPARK_HEADER + ')' : 'off (default)') +
+      ' | core: ' +
+      ((pdSparklineTicker_('SHG.US') === 'SHG' && pdSparklineTicker_('HSBA.L') === 'LON:HSBA' &&
+        pdSparklineTicker_('0005.HK') === 'HKG:0005' && pdSparklineTicker_('2222.SR') === 'TADAWUL:2222' &&
+        pdSparklineTicker_('BRK.B') === '' && pdSparklineTicker_('') === '' &&
+        pdSparklineFormula_('') === '' &&
+        pdSparklineFormula_('LON:HSBA').indexOf('=IFERROR(SPARKLINE(GOOGLEFINANCE("LON:HSBA","close",TODAY()-91,TODAY())') === 0)
+       ? 'ok' : 'FAIL'));
   report.push('backend: ' + pdBackendUrl_());
   report.push('token set: ' + (pdAppToken_() ? 'yes' : 'NO'));
   var fx = pdFxRates_(ss);
