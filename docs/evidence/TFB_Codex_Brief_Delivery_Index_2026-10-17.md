@@ -1,6 +1,6 @@
 # TFB Codex Brief v2 (2026-10-17) — delivery index for branch `claude/new-session-twoifp`
 
-Base: main `11ef134`. 19 commits, 80 files, +8,609 / −124 lines. Every behaviour change ships dark (default off / byte-identical) unless marked **default on**; no ENV, Script Property or workbook cell was changed; every commit has a sheet in `docs/evidence/`.
+Base: main `11ef134`. 22 commits, 95 files, +11,562 / −128 lines (19 commits for the Codex brief + 3 for the Decision Pages v2 plan packages, §B below). Every behaviour change ships dark (default off / byte-identical) unless marked **default on**; no ENV, Script Property or workbook cell was changed; every commit has a sheet in `docs/evidence/`.
 
 | Item | Status | Commit(s) | Gate / kill | Sheet |
 |---|---|---|---|---|
@@ -28,3 +28,20 @@ Base: main `11ef134`. 19 commits, 80 files, +8,609 / −124 lines. Every behavio
 | G11 hygiene | disposition note (2 code items prepared, 3 operator) | 4066d8b | — | G11 |
 
 Follow-ups outside this branch: T5 route-side Calendar_Events merge (earnings dates onto Top-10 rows), G4 row-telemetry read (artifact host blocked from this session), G11 items 2 and 5 as small PRs, L6/L7 builds on D-L6 / D-L7.
+
+## B. Decision Pages v2 Execution Plan (2026-10-17) — Codex packages on this branch
+
+Plan file: `TFB_Execution_Plan_Decision_Pages_v2_2026-10-17.pdf` (this folder). Owner split per the plan: A1–A5 Claude (IDE paste), B1–B4 Codex (this branch), C1–C5 Emad.
+
+| Package | Status | Commit | File / version | Gate (Emad) | Sheet |
+|---|---|---|---|---|---|
+| B1 Top_10 v2 layout | delivered (dark) | 58f8f01 | `16_Decision_Top10.gs` **v1.19.0** (not v1.14.0: taken by the brief layers) | `T10_V2_LAYOUT=1` | B1 |
+| B2 IBKR history plumbing | delivered (no gate; inert until the Flex query carries NAV / Cash Report / Trades — plan C3) | bf035c6 | new `26_IBKR_History.gs` v1.0.0 + `10_My_Portfolio.gs` v1.5.17 hook | — | B2 |
+| B3 sparkline (cockpit half) | delivered (dark) | 45f51fe | `10_My_Portfolio.gs` v1.5.16 | `PD_SPARKLINE=on` | B3 |
+| B3 number formats / `_Data_Audit` heading | **not in repo** (`04_Format.gs`, `99_Data_Audit.gs` live only in the IDE) | — | — | — | B3 §1 |
+| B4 Codex brief v2.1 | delivered above (§A) | — | — | — | — |
+| A1 menu v2.19.0 | Claude's; append block + commit sheet archived here (`01_Menu_v2.19.0_append_2026-10-17.gs`; note: 519 lines / sha `7fd04f6061f7` received vs 517 / `71b690a2fd00` pinned on the sheet — a trailing-newline difference, verify in the IDE) | — | `01_Menu.gs` (not repo-managed) | — | A1 sheet (PDF) |
+| A5 broker reconciliation input | CSV archived here and used as the B2 validation fixture (`tests/fixtures/ibkr_closed_trades_90d_2026-10-17.csv`) | 45f51fe | — | — | B2 §3 |
+
+**Version reconciliation for the plan's authors (A3 / B1):** the plan names base versions 16 v1.13.9 and 10 v1.5.13 (= main). This branch already carries 16 v1.14.0 → v1.19.0 and 10 v1.5.14 → v1.5.17. Any Portfolio_Decision v2 renderer (plan A3 "v1.6.0 on top of v1.5.13") must be built on **v1.5.17** from this branch, or it drops C1/C3 (uncertified view), C4 (switch advisory column), B3 (sparkline) and the B2 hook. The IDE paste order is unchanged: one paste of each branch file.
+
