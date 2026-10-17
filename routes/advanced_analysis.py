@@ -4567,6 +4567,11 @@ async def portfolio_actions_post(
         # Never substitute the sheet's cash/date fields for broker evidence.
         "reconciliation_evidence": merged_body.get("reconciliation_evidence"),
         "holdings_input_incomplete": holdings_input_incomplete,
+        # v1.17.0 [C1 / C3] (portfolio_actions): the caller's stale-capture
+        # context and ledger cash snapshot; the builder pops both before
+        # rendering and ignores them unless TFB_PF_UNCERTIFIED_VIEW=on.
+        "capture_context": merged_body.get("capture_context"),
+        "cash_snapshot": merged_body.get("cash_snapshot"),
     }
 
     build_started = time.monotonic()

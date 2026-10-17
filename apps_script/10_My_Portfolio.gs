@@ -1,7 +1,35 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.13
+ * Version: 1.5.14
+ *
+ * v1.5.14 MAIN CHANGES  (UNCERTIFIED-VIEW CONTEXT + LEDGER CASH SNAPSHOT --
+ *                        Codex brief 2026-10-17 C1 / C3, cockpit half; applies
+ *                        only when Script Property PD_UNCERTIFIED_CONTEXT = on;
+ *                        ALL v1.5.13 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (2026-10-17 09:37 Riyadh): the only IBKR capture was 24h 57m old, so
+ * evidence was NOT SENT and the backend rendered BLOCK x3 with every KPI 0
+ * and panel cash 0.0, although the ledger still knew MV, weights and P&L.
+ * portfolio_actions v1.17.0 renders those rows HOLD (uncertified) under
+ * TFB_PF_UNCERTIFIED_VIEW=on when the caller tells it (a) how stale the
+ * capture is and (b) the ledger cash balance when the panel cell is 0.
+ * WHAT: in enforce mode, when the capture is NOT fresh and the property is
+ * on, the request gains body.capture_context {captured_at, age_min,
+ * limit_min, reason} (pdUncertifiedContext_, pure) and body.cash_snapshot
+ * {balance_sar, as_of} read from the _Cash_Snapshot sheet's last row
+ * (pdCashSnapshotParse_, pure, header scan for 'Balance SAR' / a date
+ * column; pdCashSnapshotRead_ never throws). The ACTIONS table renders the
+ * backend's detail.uncertified rows as 'HOLD (uncertified)' etc.
+ * (pdActionLabel_). The status line gains ' | uncertified ctx sent (age; cash)'.
+ * Property absent/off (default): request body, render and status line are
+ * byte-identical to v1.5.13 (the off-mode golden of pf_ibkr_evidence stands).
+ * Nothing here certifies cash or sends an order; the backend keeps funding
+ * withheld on that path. Functions added: pdUncertifiedContextOn_,
+ * pdUncertifiedContext_, pdCashSnapshotParse_, pdCashSnapshotRead_,
+ * pdActionLabel_; var PD_UNCERT_CTX_PROP, PD_CASH_SNAPSHOT_SHEET. Removed: 0.
+ * Harness: tests/js/pf_uncertified_context.test.js. pdSelfTest gains the
+ * property state + 'uncertified ctx core: ok'.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
  *                        only when PD_SOURCE_RECEIPT is observe/enforce;
@@ -2552,7 +2580,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.13';
+var PD_VERSION = '1.5.14';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2675,7 +2703,7 @@ function pdActionToRow_(a) {
     delta = (a.proceeds_sar !== null && a.proceeds_sar !== undefined)
         ? -a.proceeds_sar : '';
   }
-  return [pdCell_(a.action), pdCell_(a.symbol), pdCell_(a.name),
+  return [pdActionLabel_(a), pdCell_(a.symbol), pdCell_(a.name),   /* v1.5.14 */
           pdCell_(a.sector), pdCell_(a.currency), pdCell_(a.quantity),
           pdCell_(a.avg_cost), pdCell_(a.price), pdCell_(a.price_sar),
           pdCell_(a.market_value_sar), pdCell_(a.cost_sar),
@@ -3079,6 +3107,97 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
   return mode === 'observe'
       ? ' | [receipt-observe] would publish ' + verdict
       : ' | source readiness ' + verdict;
+}
+
+/* ----- v1.5.14 [C1 / C3] uncertified-view context + ledger cash snapshot ----- */
+var PD_UNCERT_CTX_PROP = 'PD_UNCERTIFIED_CONTEXT';   /* off (default) | on */
+var PD_CASH_SNAPSHOT_SHEET = '_Cash_Snapshot';
+/** Script Property PD_UNCERTIFIED_CONTEXT = 'on' -> send the stale-capture
+ * context and the ledger cash snapshot; anything else -> off (request
+ * byte-identical to v1.5.13). Never throws. */
+function pdUncertifiedContextOn_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(PD_UNCERT_CTX_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (e) {
+    return false;
+  }
+}
+/** PURE: body.capture_context for a NOT-fresh plan (null when fresh). The
+ * backend prints age_min on every uncertified row; limit_min is the send
+ * limit in whole minutes; reason is the same text the status line prints. */
+function pdUncertifiedContext_(plan, fresh, nowMs) {
+  if (fresh) return null;
+  var out = {captured_at: null, age_min: null,
+             limit_min: Math.round(PD_IBKR_SEND_MAX_AGE_MS / 60000), reason: ''};
+  if (plan && plan.ok && plan.capturedMs !== null && plan.capturedMs !== undefined) {
+    out.captured_at = new Date(plan.capturedMs).toISOString();
+    var age = (plan.ageMs !== null && plan.ageMs !== undefined) ? plan.ageMs :
+        (nowMs - plan.capturedMs);
+    out.age_min = age >= 0 ? Math.round(age / 60000) : null;
+    out.reason = age >= 0 ? ('capture ' + pdIbkrRiyadh_(plan.capturedMs) + ' is ' +
+        pdIbkrAge_(age) + ' old (limit 14m)') : 'capture time is ahead of this clock';
+  } else {
+    out.reason = String((plan && plan.reason) || 'no capture');
+  }
+  return out;
+}
+/** PURE: {balance_sar, as_of} from the _Cash_Snapshot grid (header row +
+ * records): the column whose header normalises to 'balancesar' (exactly
+ * one), the LAST non-empty record; as_of from a 'date' / 'as of' /
+ * 'snapshot' header when present (string). null when absent/ambiguous. */
+function pdCashSnapshotParse_(values) {
+  if (!values || !values.length) return null;
+  var head = values[0] || [];
+  var norm = function (v) { return String(v === null || v === undefined ? '' : v).toLowerCase().replace(/[^a-z0-9]/g, ''); };
+  var balCols = [], dateCol = -1;
+  for (var c = 0; c < head.length; c++) {
+    var h = norm(head[c]);
+    if (h === 'balancesar') balCols.push(c);
+    else if (dateCol < 0 && (h === 'date' || h === 'asof' || h === 'snapshotdate' ||
+                             h === 'snapshotat' || h === 'asofutc' || h === 'asofriyadh')) dateCol = c;
+  }
+  if (balCols.length !== 1) return null;
+  for (var r = values.length - 1; r >= 1; r--) {
+    var row = values[r] || [];
+    var any = false;
+    for (var k = 0; k < row.length; k++) {
+      if (row[k] !== null && row[k] !== undefined && String(row[k]) !== '') { any = true; break; }
+    }
+    if (!any) continue;
+    var bal = Number(String(row[balCols[0]]).replace(/,/g, ''));
+    if (!isFinite(bal) || bal < 0) return null;
+    var asOf = '';
+    if (dateCol >= 0 && row[dateCol] !== null && row[dateCol] !== undefined && row[dateCol] !== '') {
+      var dv = row[dateCol];
+      asOf = (dv instanceof Date) ? dv.toISOString().slice(0, 10) : String(dv).slice(0, 32);
+    }
+    return {balance_sar: Math.round(bal * 100) / 100, as_of: asOf};
+  }
+  return null;
+}
+/** Read + parse the _Cash_Snapshot sheet; null on any fault (fail-open:
+ * the request then carries no snapshot and the backend says 'none'). */
+function pdCashSnapshotRead_() {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAPSHOT_SHEET);
+    if (!sh) return null;
+    return pdCashSnapshotParse_(sh.getDataRange().getValues());
+  } catch (e) {
+    return null;
+  }
+}
+/** PURE: the ACTIONS 'Action' cell -- 'HOLD (uncertified)' when the backend
+ * marked the row detail.uncertified (portfolio_actions v1.17.0); otherwise
+ * exactly pdCell_(a.action). */
+function pdActionLabel_(a) {
+  a = a || {};
+  var label = pdCell_(a.action);
+  if (a.detail && a.detail.uncertified === true && label !== '') {
+    return String(label) + ' (uncertified)';
+  }
+  return label;
 }
 
 /* ----- v1.5.12 IBKR capture evidence + execution scope ---------------------- */
@@ -3564,6 +3683,15 @@ function pdIbkrApply_(mode, body) {
       body.fx_rates = rates;
       delete body.reconciliation_evidence;     /* enforce: the capture only */
       if (fresh) body.reconciliation_evidence = plan.packet;
+      /* v1.5.14 [C1 / C3]: stale capture -> caller context + ledger cash
+       * snapshot for the backend's uncertified view (property-gated). */
+      if (!fresh && pdUncertifiedContextOn_()) {
+        body.capture_context = pdUncertifiedContext_(plan, fresh, nowMs);
+        var snap = pdCashSnapshotRead_();
+        if (snap) body.cash_snapshot = snap;
+        res.uncertified_ctx = {age_min: body.capture_context.age_min,
+                               cash: snap ? snap.balance_sar : null};
+      }
       if (controls) {
         body.controls = controls;
         res.controls = controls;
@@ -3572,6 +3700,12 @@ function pdIbkrApply_(mode, body) {
       res.sent = fresh;
     }
     res.note = pdIbkrNote_(mode, plan, fresh, split.excluded);
+    if (res.uncertified_ctx) {   /* v1.5.14 */
+      res.note += ' | uncertified ctx sent (age ' +
+          (res.uncertified_ctx.age_min === null ? '?' : res.uncertified_ctx.age_min + 'm') +
+          (res.uncertified_ctx.cash !== null ? '; cash snapshot ' + res.uncertified_ctx.cash + ' SAR' :
+           '; no cash snapshot') + ')';
+    }
   } catch (e) {
     res.note = ' | ibkr evidence ERROR (' +
         String(e && e.message ? e.message : e).slice(0, 80) + ')';
@@ -4448,6 +4582,16 @@ function pdSelfTest() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var report = [];
   report.push('[MP-DEC v' + PD_VERSION + '] self-test');
+  /* v1.5.14 [C1 / C3]: property state + pure cores (no sheet writes). */
+  var ucP = pdCashSnapshotParse_([['Date', 'Balance SAR', 'Note'], ['2026-10-16', '53,769.26', 'x'], ['', '', '']]);
+  var ucC = pdUncertifiedContext_({ok: true, capturedMs: 1760596867000, ageMs: 89820000}, false, 1760686687000);
+  report.push('uncertified ctx (' + PD_UNCERT_CTX_PROP + '): ' +
+      (pdUncertifiedContextOn_() ? 'on' : 'off (default)') + ' | core: ' +
+      ((ucP && ucP.balance_sar === 53769.26 && ucP.as_of === '2026-10-16' &&
+        ucC && ucC.age_min === 1497 && ucC.limit_min === 14 &&
+        pdUncertifiedContext_(null, true, 0) === null &&
+        pdActionLabel_({action: 'HOLD', detail: {uncertified: true}}) === 'HOLD (uncertified)' &&
+        pdActionLabel_({action: 'HOLD'}) === 'HOLD') ? 'ok' : 'FAIL'));
   report.push('backend: ' + pdBackendUrl_());
   report.push('token set: ' + (pdAppToken_() ? 'yes' : 'NO'));
   var fx = pdFxRates_(ss);

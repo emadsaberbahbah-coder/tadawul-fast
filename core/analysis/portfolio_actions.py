@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.16.0  (header synced to runtime; history below)
+Version: 1.17.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -822,7 +822,70 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.16.0"
+PORTFOLIO_ACTIONS_VERSION = "1.17.0"
+
+# v1.17.0 (2026-10-17) - [C1 / C3 UNCERTIFIED VIEW] HOLD-UNCERTIFIED, NOT
+# BLOCK-WITH-ZEROS; CASH FALLBACK FROM THE LEDGER SNAPSHOT (Codex brief 17-Oct
+# section 4, C1 + C3).
+# WHY: 2026-10-17 09:37 Riyadh: the only IBKR capture was 24 h 57 m old
+# (limit 14 m), so evidence was NOT SENT and Portfolio_Decision rendered
+# BLOCK x3 "RECONCILIATION_REQUIRED: missing_evidence", panel cash 0.0, every
+# KPI 0 and "No valued sectors" -- while the ledger (_Portfolio_CostBasis:
+# DDI 11,860 / CWBC 9,664 / KRP 7,943 SAR; quantities = the last capture's)
+# still knew every custody-independent fact. The day before, with a 2-minute
+# capture, the same rows read 3/3 HOLD with certified cash 53,769.26.
+# WHAT (gate TFB_PF_UNCERTIFIED_VIEW = off (default) | on, read at call
+# time; any other value is off; off = the v1.16.0 dispatch verbatim):
+#   * on + not funding_eligible -> _uncertified_view_portfolio: the
+#     _unverified_portfolio output is the skeleton (alerts, the
+#     portfolio_inputs_unverified alert, meta.input_certification kept).
+#     Per row the certification result picks the research-view tier:
+#     trusted = matched, custody-not-proven (RESEARCH_UNVERIFIED_STATES) =
+#     unverified, contradicting evidence = the legacy blank BLOCK row.
+#     Matched/unverified rows show market value, cost, P&L, weights
+#     (MV / (holdings + cash)), sector weights and the stop / TP ladder, and
+#     carry the RULE verdict (_research_verdict: decide_action with weights
+#     None, de-minimis, reduce policy, drawdown guard -- never the ADD
+#     confirmation clock) as the ACTION: HOLD / TRIM / EXIT read as the
+#     action with "(uncertified)" in the reason; an ADD verdict renders HOLD
+#     (new money withheld; capped_from ADD); a BLOCK verdict stays BLOCK.
+#     Sizing is withheld on every row: suggested_delta_sar 0, delta shares
+#     0, proceeds 0, funds_from None, detail.execution_ready False,
+#     detail.uncertified True, detail.uncertified_view {tier, verdict,
+#     fx_rejected, capture_age_min}. The v1.16.0 scrubs apply unchanged (a
+#     cost-basis BLOCK verdict nulls cost / P&L; a rejected holding FX
+#     blanks the seven SAR fields).
+#   * C3 cash: the request cash (panel cell) when > 0, else the caller's
+#     body.cash_snapshot {balance_sar, as_of} (the _Cash_Snapshot ledger
+#     balance the GAS reads when the capture is stale), always tagged
+#     "(uncertified)" in meta.uncertified_view.cash_basis and NEVER
+#     certified: deployable_sar, adds_funded_sar and capital_unallocated_sar
+#     stay 0 (funding withheld).
+#   * KPIs (F3 / F7 rules of the research view): holdings_value_sar only
+#     when every shown row is valued and no row is contradicted / FX-
+#     rejected / unlinked; portfolio_value_sar = holdings + cash; cash_sar,
+#     cash_pct; cost_basis / pnl from rows carrying both; action_counts by
+#     the SHOWN action; sector_summary rebuilt from the shown rows (value,
+#     weight, cap, over_cap, positions). Nothing here can size or fund.
+#   * The capture age (body.capture_context {captured_at, age_min,
+#     limit_min, reason}, sent by the GAS only when the capture is stale)
+#     appears on every row's reason ("capture 1497m old, limit 14m") and in
+#     meta.uncertified_view.capture_age_min; absent -> "capture age
+#     unknown".
+#   * Any exception inside the view falls back to the v1.16.0 dispatch
+#     output with meta.uncertified_view.status "error", never an error page.
+#   * The gate supersedes TFB_PF_RESEARCH_VIEW when both are set (the
+#     research view's observe/enforce rows are a strict subset of this
+#     view's information); unset -> the v1.16.0 dispatch, byte-identical.
+# Acceptance (tests/test_pf_uncertified_view_c1.py): the 17-Oct fixture
+#   (three rows, no packet, 1497 m capture age, panel cash 0, snapshot
+#   53,769.26) renders 3 x HOLD with MV / weights populated and delta shares
+#   0, KPIs populated, cash basis "_Cash_Snapshot (uncertified)"; the 16-Oct
+#   fixture (fresh packet) is byte-identical to the certified build.
+# Functions added: 3 (_env_uncertified_view, _uncertified_cash,
+#   _uncertified_view_portfolio); constants UNCERTIFIED_TAG. Removed: 0.
+#   Rollback: unset TFB_PF_UNCERTIFIED_VIEW (= v1.16.0 output except the
+#   version string) or revert.
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3855,9 +3918,208 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
     return result
 
 
+# ---------------------------------------------------------------------------
+# v1.17.0 [C1 / C3] uncertified view - TFB_PF_UNCERTIFIED_VIEW (default off).
+# See the version block above. Nothing below can size, fund or execute a row.
+# ---------------------------------------------------------------------------
+UNCERTIFIED_TAG = "[uncertified]"
+
+
+def _env_uncertified_view():
+    """v1.17.0 [C1]: True only for the exact value 'on' (case/space
+    tolerant). Blank, 'observe', '1', 'true' -> off: a misspelt value can
+    never arm the view."""
+    return str(os.environ.get("TFB_PF_UNCERTIFIED_VIEW", "")).strip().lower() == "on"
+
+
+def _uncertified_cash(ctl, cash_snapshot):
+    """v1.17.0 [C3]: (cash_sar, basis). The request cash (panel cell) when
+    > 0, else the caller's ledger snapshot balance when > 0, else (0.0,
+    'none'). Both bases are uncertified by construction; neither ever
+    funds anything."""
+    panel = _pos_float(ctl.get("cash_available_sar"))
+    if panel is not None:
+        return float(panel), "panel (uncertified)"
+    snap = cash_snapshot if isinstance(cash_snapshot, dict) else {}
+    bal = _pos_float(snap.get("balance_sar"))
+    if bal is not None:
+        as_of = str(snap.get("as_of") or "").strip()
+        return float(bal), "_Cash_Snapshot%s (uncertified)" % ((" " + as_of) if as_of else "")
+    return 0.0, "none"
+
+
+def _uncertified_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification,
+                                capture_context=None, cash_snapshot=None):
+    """v1.17.0 [C1 / C3]: HOLD-uncertified, not BLOCK-with-zeros.
+
+    The off output (_unverified_portfolio) is the skeleton. Matched and
+    custody-unproven rows show market value, cost, P&L, weights, sector
+    weights and levels and carry the rule verdict as the action with the
+    uncertified tag; sizing, funding and execution stay withheld on every
+    row. Contradicted rows keep the legacy blank BLOCK row. Any failure
+    returns the off output with a meta.uncertified_view error marker."""
+    result = _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification)
+    cap = capture_context if isinstance(capture_context, dict) else {}
+    try:
+        age_min = _pos_float(cap.get("age_min"))
+        age_min = int(round(age_min)) if age_min is not None else None
+        limit_min = _pos_float(cap.get("limit_min"))
+        limit_min = int(round(limit_min)) if limit_min is not None else 14
+        age_text = ("capture %dm old, limit %dm" % (age_min, limit_min)
+                    if age_min is not None else "capture age unknown")
+        cash, cash_basis = _uncertified_cash(ctl, cash_snapshot)
+        row_states = {row["row_index"]: row for row in certification["row_results"]}
+        listed = rows if isinstance(rows, list) else []
+        indices = [index for index, raw in enumerate(listed[:MAX_HOLDINGS]) if isinstance(raw, dict)]
+        if len(indices) != len(result["actions"]):
+            raise ValueError("uncertified rows do not align with the protective rows")
+        actions = list(result["actions"])
+        # pass 1: tiers, candidates, verdicts, scrubs
+        shown = []     # (pos, index, cand, verdict, why, tier, fx_rejected)
+        tiers, fx_rows = {}, 0
+        for pos, index in enumerate(indices):
+            state = row_states.get(index, {"trusted": False, "status": "invalid_evidence"})
+            if state["trusted"]:
+                tier = "matched"
+            elif state["status"] in RESEARCH_UNVERIFIED_STATES:
+                tier = "unverified"
+            else:
+                tiers["contradicted"] = tiers.get("contradicted", 0) + 1
+                continue
+            tiers[tier] = tiers.get(tier, 0) + 1
+            cand = normalize_holding(rows[index], fx_rates, ctl)
+            verdict, why, _proceeds = _research_verdict(cand, ctl)
+            if _is_cost_basis_block(verdict, why):
+                cand["cost_sar"] = None
+                cand["pnl_sar"] = None
+                cand["pnl_pct"] = None
+            fx_rejected = _research_fx_rejected(rows[index], cand, fx_rates)
+            if fx_rejected:
+                fx_rows += 1
+                for key in ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop", "tp1", "tp2"):
+                    cand[key] = None
+            shown.append((pos, index, cand, verdict, why, tier, fx_rejected, state))
+        # pass 2: totals and weights (F3: every shown row valued)
+        cands = [item[2] for item in shown]
+        valued = bool(cands) and all(_pos_float(c.get("market_value_sar")) is not None for c in cands)
+        holdings_value = sum(c["market_value_sar"] for c in cands) if valued else None
+        total_value = (holdings_value + cash) if holdings_value is not None else None
+        sector_value, sector_positions = {}, {}
+        for c in cands:
+            if c.get("market_value_sar"):
+                sec = _sector_bucket(c)
+                sector_value[sec] = sector_value.get(sec, 0.0) + c["market_value_sar"]
+                sector_positions[sec] = sector_positions.get(sec, 0) + 1
+        verdicts = {}
+        review_date = (datetime.now(timezone.utc) + timedelta(days=ctl["review_days"])).date().isoformat()
+        for pos, index, cand, verdict, why, tier, fx_rejected, state in shown:
+            legacy = actions[pos]
+            mv = cand.get("market_value_sar")
+            weight = (mv / total_value * 100.0) if (mv and total_value) else None
+            sec = _sector_bucket(cand)
+            sec_weight = (sector_value.get(sec, 0.0) / total_value * 100.0) if (total_value and sector_value.get(sec)) else None
+            capped_from = None
+            if verdict == ACTION_ADD:
+                action, note = ACTION_HOLD, RESEARCH_ADD_WITHHELD
+                capped_from = ACTION_ADD
+            else:
+                action, note = verdict, why
+            verdicts[action] = verdicts.get(action, 0) + 1
+            tag = RESEARCH_TAG_MATCHED if tier == "matched" else RESEARCH_TAG_UNVERIFIED
+            reason = "%s (uncertified): %s | %s %s custody %s; %s; sizing withheld" % (
+                action, note, UNCERTIFIED_TAG, tag, state["status"], age_text)
+            if fx_rejected:
+                reason = "%s; %s" % (reason, RESEARCH_FX_WITHHELD)
+            entry = {"cand": cand, "action": action, "action_reason": reason,
+                     "proceeds_sar": 0.0, "capped_from": capped_from, "weight_pct": weight,
+                     "sector_weight_pct": sec_weight, "confidence_band": legacy["confidence_band"],
+                     "suggested_delta_sar": 0.0, "suggested_delta_shares": 0, "funds_from": None}
+            rendered = _action_row(entry, review_date, ctl)
+            for key in ("position_evidence_matched", "reconciliation_status"):
+                rendered["detail"][key] = legacy["detail"][key]
+            rendered["detail"]["execution_ready"] = False
+            rendered["detail"]["uncertified"] = True
+            rendered["detail"]["uncertified_view"] = {"tier": tier, "verdict": verdict,
+                                                      "fx_rejected": fx_rejected,
+                                                      "capture_age_min": age_min}
+            actions[pos] = rendered
+        # pass 3: KPIs and sector summary (funding stays withheld: 0)
+        kpis = dict(result["kpis"])
+        withheld = []
+        if tiers.get("contradicted"):
+            withheld.append("contradicting_evidence")
+        if (certification.get("reason_counts") or {}).get("holdings_input_incomplete") \
+                or len(indices) != len(listed):
+            withheld.append("holdings_input_incomplete")
+        if not shown:
+            withheld.append("no_uncertified_rows")
+        reason_counts = certification.get("reason_counts") or {}
+        for code in RESEARCH_KPI_BLOCKING_REASONS:
+            if reason_counts.get(code):
+                withheld.append(code)
+        if fx_rows:
+            withheld.append("holding_fx_mismatch")
+        if not valued:
+            withheld.append("market_value_incomplete")
+        counts = {a: 0 for a in ACTIONS}
+        for row in actions:
+            counts[row["action"]] = counts.get(row["action"], 0) + 1
+        kpis["action_counts"] = counts
+        kpis["positions"] = len(actions)
+        kpis["cash_sar"] = _round(cash, 0) if cash_basis != "none" else None
+        sector_summary = []
+        if not withheld:
+            kpis["holdings_value_sar"] = _round(holdings_value, 0)
+            kpis["portfolio_value_sar"] = _round(total_value, 0)
+            kpis["cash_pct"] = _round(cash / total_value * 100.0, 1) if total_value else None
+            covered = [c for c in cands if c.get("cost_sar") is not None and c.get("pnl_sar") is not None]
+            if covered:
+                cost = sum(c["cost_sar"] for c in covered)
+                pnl = sum(c["pnl_sar"] for c in covered)
+                kpis["cost_basis_sar"] = _round(cost, 0) if cost else None
+                kpis["pnl_sar"] = _round(pnl, 0)
+                kpis["pnl_pct"] = _round(pnl / cost * 100.0, 1) if _pos_float(cost) else None
+            else:
+                withheld.append("cost_basis_incomplete")
+            for sec in sorted(sector_value):
+                val = sector_value[sec]
+                wpct = (val / total_value * 100.0) if total_value else None
+                sector_summary.append({
+                    "sector": sec, "value_sar": _round(val, 0), "weight_pct": _round(wpct, 1),
+                    "cap_pct": ctl["max_sector_pct"],
+                    "over_cap": bool(wpct is not None and not _is_exempt_bucket(sec)
+                                     and wpct > ctl["max_sector_pct"]),
+                    "positions": sector_positions.get(sec, 0)})
+        view_meta = {
+            "mode": "on", "status": "ok",
+            "tiers": dict(sorted(tiers.items())),
+            "verdicts": dict(sorted(verdicts.items())),
+            "cash_basis": cash_basis,
+            "capture_age_min": age_min,
+            "capture_limit_min": limit_min,
+            "kpi_basis": "sheet_quantities_custody_unverified" if kpis.get("holdings_value_sar") is not None else "withheld",
+            "kpi_withheld": sorted(set(withheld)),
+            "fx_rejected_rows": fx_rows,
+        }
+    except Exception as exc:  # fail closed to the off output
+        logger.warning("[PF v1.17.0] uncertified view withheld: %s", type(exc).__name__)
+        result["meta"]["uncertified_view"] = {"mode": "on", "status": "error",
+                                              "error_class": type(exc).__name__}
+        return result
+    result["actions"] = actions
+    result["kpis"] = kpis
+    result["sector_summary"] = sector_summary
+    result["meta"]["uncertified_view"] = view_meta
+    return result
+
+
 def _build(rows, ctl, fx_rates, upstream_meta):
     upstream = dict(upstream_meta) if isinstance(upstream_meta, dict) else {}
     evidence = upstream.pop("reconciliation_evidence", None)
+    # v1.17.0 [C1 / C3]: caller context for the uncertified view (never
+    # echoed into meta.upstream; harmless and ignored when the gate is off).
+    capture_context = upstream.pop("capture_context", None)
+    cash_snapshot = upstream.pop("cash_snapshot", None)
     certification = certify_portfolio_inputs(rows, evidence, fx_rates)
     if upstream.get("holdings_input_incomplete") or (ctl["max_holdings"] and len(rows) > ctl["max_holdings"]):
         certification["funding_eligible"] = False
@@ -3905,6 +4167,11 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         if not certification["funding_eligible"]:
             certification["status"] = "withheld"
     if not certification["funding_eligible"]:
+        # v1.17.0 [C1 / C3]: the uncertified view supersedes the research view.
+        if _env_uncertified_view():
+            return _uncertified_view_portfolio(rows, ctl, fx_rates, upstream, certification,
+                                               capture_context=capture_context,
+                                               cash_snapshot=cash_snapshot)
         # v1.16.0 [P0-6]: off (default) is the v1.15.1 call verbatim.
         if _env_research_view_mode() == "off":
             return _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
