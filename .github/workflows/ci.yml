@@ -706,6 +706,7 @@ jobs:
           node tests/test_dt10_calendar_completeness.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
+          node tests/js/dt10_v1140_reasons_earnings_turnover.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py

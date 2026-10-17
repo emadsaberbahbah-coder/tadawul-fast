@@ -1,11 +1,39 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.9 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.14.0 (2026-10-17) -- INVESTABILITY REASONS, EARNINGS HOLD, TURNOVER TOKEN (T1/T5/T6)
+ * WHY (Codex brief 2026-10-17): three cockpit halves whose builder halves
+ * landed in opportunity_builder v1.27.0/v1.28.0 and run_shadow_scorer
+ * v1.10.0. (T1) DATA GAPS said only 'Investability 466 (93.2%)'; the
+ * builder now publishes meta.investability_reasons (top engine reasons,
+ * counts summing to that row) and this page renders it as a second table
+ * directly under DATA GAPS. (T5) A sized ticket could be issued into an
+ * earnings print; under TFB_T10_EARNINGS_GATE=enforce the builder marks
+ * in-window seats sizing_hold='earnings' and this page applies the
+ * P-145 dash vocabulary to them (seat kept, clocks untouched) and prints
+ * the status token 'earn-held n'. (T6) Seat turnover is the S-1 fresh-
+ * floor lever (October: 4/4 exclusions fresh-floor); the status line
+ * gains 'turnover=N/M new' (seats whose stability clock started today,
+ * _stab_days === 1; stable across same-day reruns) and _Selection_Log
+ * gains column 34 'New Today' (YES/NO/blank; header healed on existing
+ * sheets; positional withhold indexes untouched). All three default ON
+ * -- display/read-back only, no selection, funding or clock change; the
+ * sizing hold only follows a builder marker that is itself dark. KILL
+ * (Script Properties, '1' each): DT10_INVEST_REASONS_LEGACY,
+ * DT10_EARN_HOLD_LEGACY, DT10_TURNOVER_TOKEN_LEGACY. Functions added (0
+ * removed): dt10InvestReasonsLegacy_, dt10InvestReasonRows_,
+ * dt10EarnHoldLegacy_, dt10EarningsSuspend_, dt10ApplyEarningsHold_,
+ * dt10TurnoverLegacy_, dt10TurnoverNote_, dt10SelLogNewToday_; var added:
+ * DT10_INVREASON_HEADERS. Harness: tests/js/dt10_v1140_reasons_earnings_
+ * turnover.test.js (+ tests/js/dt10_v1140_history.js reverses these edits
+ * so the v1.13.9 hash chain still proves the file). DT10_VERSION and the
+ * header bumped in lockstep.
  *
  * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
  * The cash KPI echoes an entered amount and cannot certify custody or
@@ -1757,7 +1785,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.9';
+var DT10_VERSION = '1.14.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2674,7 +2702,9 @@ var DT10_SELLOG_HEADERS = ['Logged At', 'Run Info', 'Source Page', 'Rank',
   'DQ', 'Conf', 'Funds From', 'Review By', 'Advisor Note', 'Panel Snapshot',
   'Outcome', 'Review Notes',
   // v1.3.1 appended (pre-existing rows keep blanks here):
-  'Stability', 'Days'];
+  'Stability', 'Days',
+  // v1.14.0 [T6] appended (pre-existing rows keep blanks here):
+  'New Today'];
 // Fixed layout anchors
 var DT10_ROW_TITLE = 1;
 var DT10_ROW_STATUS = 2;
@@ -3446,6 +3476,141 @@ function dt10FastTrackSuspend_(tk, label) {
       'strict until confirmed (' +
       'seat filled to avoid under-fill; not an executable ticket today).';
   return tk;
+}
+// ---------------------------------------------------------------------------
+// v1.14.0 [T1 / T5 / T6] -- pure cores + kill switches (Codex brief 2026-10-17)
+// ---------------------------------------------------------------------------
+var DT10_INVREASON_HEADERS = ['Engine Reason', 'Candidates', 'Share %',
+  'Example Symbols'];
+/** v1.14.0 [T1]: Script Property kill switch. Absent/junk -> table ON;
+ * DT10_INVEST_REASONS_LEGACY = '1' -> legacy (v1.13.9: no table). Never throws. */
+function dt10InvestReasonsLegacy_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_INVEST_REASONS_LEGACY') || '') === '1';
+  } catch (eIrl) {}
+  return false;
+}
+/** v1.14.0 [T1] PURE: table rows from the builder's meta.investability_reasons
+ * block ({total, rows: [{reason, count, share_pct, examples[]}]}) -- the rows
+ * sum to the DATA GAPS Investability row by construction. Any missing or odd
+ * shape -> [] (the section is then skipped). Never throws. */
+function dt10InvestReasonRows_(meta) {
+  var out = [];
+  try {
+    var blk = meta && meta.investability_reasons;
+    var rows = blk && blk.rows;
+    if (!Array.isArray(rows) || !rows.length) return out;
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i] || {};
+      var ex = (r.examples && r.examples.length) ? r.examples.join(', ') : '';
+      out.push([dt10Cell_(r.reason), dt10Cell_(r.count),
+                (typeof r.share_pct === 'number') ? r.share_pct : 0, ex]);
+    }
+  } catch (eIrr) {
+    return [];
+  }
+  return out;
+}
+/** v1.14.0 [T5]: kill switch. DT10_EARN_HOLD_LEGACY = '1' -> the builder's
+ * sizing_hold markers are ignored (v1.13.9 behaviour). Never throws. */
+function dt10EarnHoldLegacy_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_EARN_HOLD_LEGACY') || '') === '1';
+  } catch (eEhl) {}
+  return false;
+}
+/** v1.14.0 [T5] PURE: suspend sizing on a seat the builder marked
+ * sizing_hold === 'earnings' (TFB_T10_EARNINGS_GATE=enforce) -- the
+ * dt10FastTrackSuspend_ / dt10GraceSuspend_ dash vocabulary (P-145 family).
+ * The seat is KEPT (an earnings hold is a pause, not an exit; stability
+ * clocks are untouched); _earn_hold = true is the countable read-back;
+ * funds_from is blanked on a COPY (P-77 family). Mutates and returns tk. */
+function dt10EarningsSuspend_(tk) {
+  var days = (tk.earnings_hold_days === 0 || tk.earnings_hold_days) ?
+      String(tk.earnings_hold_days) : '?';
+  tk._earn_hold = true;
+  tk.entry_zone = '\u2014';
+  tk.suggested_sar = '\u2014';
+  tk.suggested_shares = '\u2014';
+  tk.stop_sar = '\u2014';
+  tk.tp1_sar = '\u2014';
+  tk.tp2_sar = '\u2014';
+  tk.exp_gain_12m_sar = '\u2014';
+  if (tk.detail && typeof tk.detail === 'object') {
+    var dcp = {};
+    for (var dk in tk.detail) {
+      if (tk.detail.hasOwnProperty(dk)) dcp[dk] = tk.detail[dk];
+    }
+    dcp.funds_from = '\u2014';
+    tk.detail = dcp;
+  }
+  tk.advisor_note = 'EARNINGS HOLD (' + days + 'd to print) \u2014 sizing ' +
+      'suspended until the earnings window clears (seat kept; stability ' +
+      'clocks unaffected; not an executable ticket today).';
+  return tk;
+}
+/** v1.14.0 [T5]: apply the hold to every marked seat of the final board;
+ * returns the status token 'earn-held n' ('' when none, or legacy). Never
+ * throws; a failure leaves the board as it was. */
+function dt10ApplyEarningsHold_(payload) {
+  try {
+    if (dt10EarnHoldLegacy_()) return '';
+    var sel = (payload && payload.selected) || [];
+    var n = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var tk = sel[i];
+      if (tk && tk.sizing_hold === 'earnings') {
+        dt10EarningsSuspend_(tk);
+        n++;
+      }
+    }
+    return n ? 'earn-held ' + n : '';
+  } catch (eEh) {
+    return '';
+  }
+}
+/** v1.14.0 [T6]: kill switch. DT10_TURNOVER_TOKEN_LEGACY = '1' -> no
+ * 'turnover=' status token (the SelLog column is unaffected). Never throws. */
+function dt10TurnoverLegacy_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_TURNOVER_TOKEN_LEGACY') || '') === '1';
+  } catch (eTol) {}
+  return false;
+}
+/** v1.14.0 [T6] PURE: 'turnover=N/M new' -- seats of today's final board
+ * whose stability clock started today (_stab_days === 1: confirmed entrants,
+ * fast-track fills and displacement entrants alike). Epoch-keyed, so the
+ * value is stable across same-day reruns (unlike the stab note's 'N new',
+ * which counts only confirmed entrants and empties on a rerun). '' when the
+ * board is empty, stability is OFF/frozen (no _stab_* fields) or legacy. */
+function dt10TurnoverNote_(payload) {
+  try {
+    if (dt10TurnoverLegacy_()) return '';
+    var sel = (payload && payload.selected) || [];
+    if (!sel.length) return '';
+    var n = 0, known = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var t = sel[i] || {};
+      if (t._stab_days === 0 || t._stab_days) {
+        known++;
+        if (Number(t._stab_days) === 1) n++;
+      }
+    }
+    if (!known) return '';
+    return 'turnover=' + n + '/' + sel.length + ' new';
+  } catch (eTo) {
+    return '';
+  }
+}
+/** v1.14.0 [T6] PURE: the _Selection_Log 'New Today' cell -- 'YES' when the
+ * seat's stability clock started today, 'NO' when older, '' when unknown. */
+function dt10SelLogNewToday_(t) {
+  t = t || {};
+  if (!(t._stab_days === 0 || t._stab_days)) return '';
+  return Number(t._stab_days) === 1 ? 'YES' : 'NO';
 }
 /** v1.11.9 [P-145]: suspend sizing on a GRACE-labeled seat that is
  * PRESENT in today's raw set (the src-copied full plan). Absent seats
@@ -6238,7 +6403,8 @@ function dt10SelLogRowFromTicket_(t, loggedAt, runInfo, panelJson) {
           dt10Cell_(t.confidence_band), dt10Cell_(d.funds_from),
           dt10Cell_(d.review_date), dt10Cell_(t.advisor_note),
           panelJson, '', '',
-          dt10Cell_(t._stab_status), dt10Cell_(t._stab_days)];
+          dt10Cell_(t._stab_status), dt10Cell_(t._stab_days),
+          dt10SelLogNewToday_(t)];   // v1.14.0 [T6]
 }
 function dt10SelLogLoadState_() {
   var raw = '';
@@ -6281,6 +6447,10 @@ function dt10SelLogSheet_(ss) {
   if (String(sh.getRange(1, 32).getValue() || '') === '') {
     sh.getRange(1, 32, 1, 2).setValues([['Stability', 'Days']])
         .setFontWeight('bold');
+  }
+  // v1.14.0 [T6]: heal column 34 on existing sheets (same pattern).
+  if (String(sh.getRange(1, 34).getValue() || '') === '') {
+    sh.getRange(1, 34).setValue('New Today').setFontWeight('bold');
   }
   return sh;
 }
@@ -7099,6 +7269,8 @@ function refreshDecisionTop10() {
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   if (resp.local !== true) dt10ReallocateBoard_(payload, body);
   dt10FinalizeBoard_(payload);
+  var earnHoldNote = dt10ApplyEarningsHold_(payload);   // v1.14.0 [T5]
+  var turnoverNote = dt10TurnoverNote_(payload);        // v1.14.0 [T6]
   // v1.6.6 (S-5): board-vs-backend KPI verification — token only.
   var kpiNote;
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
@@ -7123,7 +7295,9 @@ function refreshDecisionTop10() {
   var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
       poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
       (stab && stab.note ? ' | ' + stab.note : '') +
+      (turnoverNote ? ' | ' + turnoverNote : '') +      // v1.14.0 [T6]
       (earn && earn.note ? ' | ' + earn.note : '') +
+      (earnHoldNote ? ' | ' + earnHoldNote : '') +      // v1.14.0 [T5]
       (kpiNote ? ' | ' + kpiNote : '') +
       (seatNote ? ' | ' + seatNote : '') +
       (inflightNote ? ' | ' + inflightNote : '') +   // v1.11.12
@@ -7576,6 +7750,26 @@ function dt10RenderPayload_(sheet, payload, tokens) {
         .setWrap(true).setFontSize(9);
   }
   row = gapT.next + 1;
+  // v1.14.0 [T1]: WHY the Investability gate fails -- the builder's
+  // meta.investability_reasons (top engine reasons; counts sum to the DATA
+  // GAPS Investability row). Absent block or kill switch -> nothing drawn.
+  var irRows = dt10InvestReasonRows_(payload.meta);
+  if (irRows.length && !dt10InvestReasonsLegacy_()) {
+    var irBlk = payload.meta.investability_reasons;
+    row = dt10WriteSection_(sheet, row,
+        'INVESTABILITY \u2014 BY ENGINE REASON (' + irBlk.total +
+        ' candidates benched by the engine gate; builder ' +
+        'meta.investability_reasons)', tokens);
+    var irT = dt10WriteTable_(sheet, row, DT10_INVREASON_HEADERS, irRows, 'None');
+    dt10ApplyColFormats_(sheet, irT.firstDataRow, irT.count, {
+      2: DT10_FMT_INT, 3: DT10_FMT_PCT
+    });
+    if (irT.firstDataRow > 0) {
+      sheet.getRange(irT.firstDataRow, DT10_INVREASON_HEADERS.length, irT.count, 1)
+          .setWrap(true).setFontSize(9);
+    }
+    row = irT.next + 1;
+  }
   // CANDIDATES audit grid
   row = dt10WriteSection_(sheet, row,
       'CANDIDATES — FULL AUDIT — top ' + cands.length + ' rows written ' +
@@ -8260,6 +8454,10 @@ function dt10SelfTest() {
         !rmC.aborted && rmC.ageMin === null && !rmD.aborted)
        ? 'ok (17:06 run = aborted 244m; 2m = concurrent)' : 'FAIL') +
       ' | DT10_P195_MARKER_LEGACY=' + (dt10RunMarkerLegacy_() ? '1 (OFF)' : 'unset (ON)'));
+  report.push('v1.14.0 switches: invest reasons ' +
+              (dt10InvestReasonsLegacy_() ? 'OFF (DT10_INVEST_REASONS_LEGACY)' : 'ON') +
+              ' | earn hold ' + (dt10EarnHoldLegacy_() ? 'OFF (DT10_EARN_HOLD_LEGACY)' : 'ON') +
+              ' | turnover token ' + (dt10TurnoverLegacy_() ? 'OFF (DT10_TURNOVER_TOKEN_LEGACY)' : 'ON'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of

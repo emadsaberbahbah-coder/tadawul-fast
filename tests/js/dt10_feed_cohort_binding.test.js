@@ -68,11 +68,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {feedHistorySource, HISTORY_SHA256} = require('./dt10_cash_utc_history');
+const {revertV1140} = require('./dt10_v1140_history');   // v1.14.0 reversal layer
 
 const ROOT = path.join(__dirname, '../..');
 const SOURCE_PATH = process.env.DT10_DELIVERED || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const source = fs.readFileSync(SOURCE_PATH, 'utf8');
-const historySource = feedHistorySource(source);
+const historySource = feedHistorySource(revertV1140(source));
 const BASE_PATH = process.env.DT10_BASE || '';
 const baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : null;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
@@ -535,8 +536,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.9');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.9 /);
+  assert.equal(ctx.DT10_VERSION, '1.14.0');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.14\.0 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
