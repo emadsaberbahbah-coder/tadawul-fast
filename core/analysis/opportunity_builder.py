@@ -1,12 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.26.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.27.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.27.0 (2026-10-17) T1 — WHY the Investability gate fails (Codex brief 17-Oct
+§3 T1). DATA GAPS on Top_10 reads "Investability 466 (93.2%)" and nothing
+else; the engine row carries the reason in block_reason (data_engine_v2
+_apply_investability_gate), which already reaches every audit row as
+engine_gate.reasons (v1.0.1 alias map). Measured 17-Oct on Global_Markets:
+WATCHLIST 6,132 of 6,609 = Engine recommends SELL 1,778 · REDUCE 1,377 ·
+neutral HOLD 1,275 · STRONG_SELL 752 · AVOID 162 · Conservative gate 663 ·
+"Scoring settlement failed" 100 · incomplete fundamentals 23. WHAT: a pure
+investability_reason_breakdown() over the WRITTEN audit rows whose FIRST
+failed gate is Investability (the same rows the GAS DATA GAPS row counts), top
+6 primary reasons with counts, share and 3 example symbols plus an "Other"
+remainder, so the rows sum to the Investability row; attached as
+meta["investability_reasons"] on both the certified and the withheld path.
+No gate, verdict, ticket or score changes. Default ON (display-only meta
+block; nothing reads it; v1.0.6 gate_trace_counts precedent); kill-switch
+TFB_T10_INVEST_REASONS_LEGACY=1 removes the key (payload byte-identical to
+v1.26.1 save the version stamp). GAS renders it under the existing DATA GAPS
+table (16_Decision_Top10 bump). Functions added 3 (_env_invest_reasons_legacy,
+_primary_block_reason, investability_reason_breakdown). Removed 0.
 
 v1.26.1 (2026-10-11): integrate the optional USX FX path with the tag-driven
 settle-unresolved exclusion; unresolved rows never rank or receive funding.
@@ -1446,7 +1466,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.26.1"
+OPPORTUNITY_BUILDER_VERSION = "1.27.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2200,6 +2220,14 @@ def _env_int(name, default):
 def _env_enabled():
     return str(_env_str("TFB_OPP_ENABLED", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+def _env_invest_reasons_legacy():
+    """v1.27.0 [T1] kill-switch — DEFAULT ON (block present).
+    TFB_T10_INVEST_REASONS_LEGACY=1 removes meta["investability_reasons"];
+    the payload is then byte-identical to v1.26.1 save the version stamp."""
+    return str(_env_str("TFB_T10_INVEST_REASONS_LEGACY", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
 
 
 _DEFAULT_SYNTHETIC_SOURCES = ("phase_ii_synthetic",)
@@ -5027,6 +5055,66 @@ def first_failed_gate(gates):
     return failed[0] if failed else None
 
 
+_NO_REASON_LABEL = "(no reason on row)"
+_INVEST_GATE_NAME = "Investability"
+
+
+def _primary_block_reason(text):
+    """v1.27.0 [T1] PURE: the engine's primary reason class from a
+    block_reason cell. Compound cells join with ' | ' (settlement holdback
+    appends to a prior reason) — the FIRST segment is the primary; numeric
+    detail after ':' or '(' is dropped so 'Conservative gate: overall 61 < 68'
+    and 'Conservative gate: risk 52 > 45' land in one bucket. Blank ->
+    _NO_REASON_LABEL. Never raises."""
+    try:
+        head = str(text or "").split(" | ", 1)[0].strip()
+        if not head:
+            return _NO_REASON_LABEL
+        for sep in (":", "("):
+            if sep in head:
+                head = head.split(sep, 1)[0].strip()
+        return head or _NO_REASON_LABEL
+    except Exception:  # noqa: BLE001
+        return _NO_REASON_LABEL
+
+
+def investability_reason_breakdown(audit_rows, top=6, examples=3):
+    """v1.27.0 [T1] PURE: WHY the Investability gate fails, from the audit
+    rows whose FIRST failed gate is Investability — the same rows the GAS
+    DATA GAPS 'Investability' row counts, so the rows here sum to it.
+    Returns {"total", "rows": [{"reason", "count", "share_pct",
+    "examples"}...] (top N by count, ties by name), "other_reasons" (distinct
+    reasons folded into the 'Other' row), "distinct_reasons"}. Reads nothing
+    but the rows; decides nothing."""
+    counts, samples = {}, {}
+    total = 0
+    for a in audit_rows or []:
+        ff = a.get("first_fail") if isinstance(a, dict) else None
+        if not isinstance(ff, dict) or ff.get("gate") != _INVEST_GATE_NAME:
+            continue
+        total += 1
+        reason = _primary_block_reason(((a.get("engine_gate") or {}).get("reasons")))
+        counts[reason] = counts.get(reason, 0) + 1
+        bucket = samples.setdefault(reason, [])
+        sym = str(a.get("symbol") or "")
+        if sym and sym not in bucket:
+            bucket.append(sym)
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    rows = []
+    for reason, n in ordered[:max(0, int(top))]:
+        rows.append({"reason": reason, "count": n,
+                     "share_pct": round(n * 100.0 / total, 1) if total else 0.0,
+                     "examples": sorted(samples.get(reason, []))[:max(0, int(examples))]})
+    rest = ordered[max(0, int(top)):]
+    if rest:
+        n_rest = sum(n for _, n in rest)
+        rows.append({"reason": "Other (%d reasons)" % len(rest), "count": n_rest,
+                     "share_pct": round(n_rest * 100.0 / total, 1) if total else 0.0,
+                     "examples": []})
+    return {"total": total, "rows": rows, "other_reasons": len(rest),
+            "distinct_reasons": len(ordered)}
+
+
 _GATE_DEPTH_INDEX = {name: i for i, name in enumerate(GATE_ORDER)}  # v1.19.1
 
 
@@ -6752,6 +6840,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         withheld["kpis"]["scanned"] = len(audit)
         withheld["meta"].update(execution_ready=False, input_certification=input_certification,
                                   gate_trace_counts=gate_fail_counts)
+        if not _env_invest_reasons_legacy():       # v1.27.0 [T1] display-only
+            withheld["meta"]["investability_reasons"] = investability_reason_breakdown(
+                withheld["candidates_rows"])
         if _board_replay:
             # Signing authenticates the frozen research inputs; certification
             # still independently controls whether any money can be allocated.
@@ -7170,6 +7261,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     if _TIMING_STATE.get("mode") in ("observe", "enforce"):
         meta["timing_gate"] = dict(_TIMING_STATE)    # v1.23.0 [P-181] read-back
+    if not _env_invest_reasons_legacy():             # v1.27.0 [T1] display-only
+        meta["investability_reasons"] = investability_reason_breakdown(audit)
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,
