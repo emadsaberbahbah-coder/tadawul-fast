@@ -1,0 +1,36 @@
+{
+  "schema": 2,
+  "seed": {
+    "published": "2026-10-17",
+    "source_run_id": 39026626201,
+    "source_run": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39026626201",
+    "brief": "Codex brief 2026-10-17 v2 G9 / register P-206",
+    "note": "Per-page provider-target coverage measured by the scheduled run of 2026-10-17 10:54Z (the first clean run after the GM stale_cov recovery: UPSTREAM_READY, policy_cov 96.7%). Consulted only while the cached last-good reference is missing or empty; the first healthy scheduled run persists a live baseline and this file falls silent. Update by PR, never by hand on the runner."
+  },
+  "generated_at_utc": "2026-10-17T10:54:23.317495+00:00",
+  "version": "1.3.0",
+  "sheet": "1QaOS...wsG04",
+  "config_hash": "9a644ee2170c",
+  "pages": {
+    "Market_Leaders": {
+      "share_pct": 34.12,
+      "rows": 255,
+      "provider": 87
+    },
+    "Global_Markets": {
+      "share_pct": 51.78,
+      "rows": 6609,
+      "provider": 3422
+    },
+    "Commodities_FX": {
+      "share_pct": 0.0,
+      "rows": 453,
+      "provider": 0
+    },
+    "Mutual_Funds": {
+      "share_pct": 0.0,
+      "rows": 2474,
+      "provider": 0
+    }
+  }
+}

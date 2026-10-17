@@ -13,6 +13,18 @@ name: Provider Target Coverage Alert
 #
 # W1B-1 v1.1.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
 # ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
+#
+# W1B-1 v1.2.0 (2026-10-17) -- PUBLISHED SEED BASELINE (Codex brief G9 / P-206).
+# WHY: runs #66-#73 (13-17 Oct) all failed: the cache restores a 341-byte
+# baseline saved 2026-08-18 with EMPTY pages -> CH_BASELINE_EMPTY -> exit 2 ->
+# never persisted -> restored again tomorrow. The control could only be
+# repaired by a manual bootstrap nobody ran, so the alert was never live.
+# WHAT: the audit receives --seed config/provider_target_baseline_seed.json
+# (today's clean per-page coverage, reviewed in the PR); the script consults
+# it ONLY when the restored reference is missing or empty, warns
+# PTC_BASELINE_SEEDED while it does, and the first healthy run writes a live
+# baseline (the save step below then caches it and the seed falls silent).
+# Rollback: remove the --seed line (the control fails closed again).
 
 on:
   pull_request:
@@ -21,6 +33,8 @@ on:
       - 'scripts/audit_provider_target_coverage.py'
       - 'scripts/workflow_audit_support.py'
       - 'tests/test_workflow_audit_repairs.py'
+      - 'config/provider_target_baseline_seed.json'
+      - 'tests/test_ptc_seed_baseline_g9.py'
   push:
     branches: [main]
     paths:
@@ -28,6 +42,8 @@ on:
       - 'scripts/audit_provider_target_coverage.py'
       - 'scripts/workflow_audit_support.py'
       - 'tests/test_workflow_audit_repairs.py'
+      - 'config/provider_target_baseline_seed.json'
+      - 'tests/test_ptc_seed_baseline_g9.py'
   schedule:
     - cron: "20 6 * * *"   # after the morning sync legs write the pages
   workflow_dispatch:
@@ -110,6 +126,7 @@ jobs:
         run: |
           python scripts/audit_provider_target_coverage.py \
             --state provider_target_last_good.json \
+            --seed config/provider_target_baseline_seed.json \
             --observation-out provider_target_observation.json \
             --json-out provider_target_coverage.json
 

@@ -86,8 +86,30 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 STATE_SCHEMA = 2
+# v1.3.0 (2026-10-17, Codex brief G9 / register P-206) -- PUBLISHED SEED BASELINE
+# ---------------------------------------------------------------------------
+# EVIDENCE (runs #66-#73, 13-17 Oct, all `failure`): the cache restores a
+# 341-byte baseline saved on 2026-08-18 whose `pages` is EMPTY. Every
+# scheduled run therefore raises CH_BASELINE_EMPTY (+ per-page
+# CH_BASELINE_MISSING), exits 2, and -- because exit 2 never persists -- the
+# empty file is restored again the next day. A control that can only be
+# repaired by a manual bootstrap nobody ran has been red since at least
+# 14 Oct, so a real coverage drop is indistinguishable from the control
+# failure. The W1B-1 alert has never been live.
+# WHAT: a PUBLISHED, reviewed seed baseline (config/provider_target_baseline_seed.json,
+# today's clean observation: ML 34.12 % / GM 51.78 % / FX, MF structural zero)
+# is consulted ONLY when the restored reference is missing or carries no
+# pages, and never on bootstrap/accept runs. The seed must match schema,
+# sheet and policy hash exactly (CONTROL otherwise); its age is NOT a
+# staleness control (it is the published reference, not the prior run) but
+# every seeded comparison carries a WARN finding PTC_BASELINE_SEEDED naming
+# the seed, and the first healthy run persists a LIVE baseline (fresh
+# verification clock) so the normal last-good lifecycle resumes and the seed
+# falls silent. This is the "explicit bootstrap" of v1.1, done through a
+# commit instead of a dispatch -- never a silent re-baseline.
+# Functions added 1 (apply_seed). Removed 0. Kill: run without --seed.
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
 PROVIDER_TOKEN = "provider_target"
@@ -198,6 +220,7 @@ class CoverageReport:
     pages: dict[str, dict[str, Any]] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
     baseline_at_utc: Optional[str] = None
+    baseline_source: str = "none"          # v1.3.0: none | cache | seed
     baseline_age_h: Optional[float] = None
     baseline_verified_at_utc: Optional[str] = None
     baseline_updated: bool = False
@@ -401,11 +424,28 @@ def judge(cov: PageCoverage, prior: Optional[dict], cfg: Config,
 # ----------------------------------------------------------------------------
 # Baseline lifecycle
 # ----------------------------------------------------------------------------
+def apply_seed(state: Optional[dict], seed: Optional[dict], bootstrap: bool,
+               accept: bool) -> tuple[Optional[dict], bool]:
+    """v1.3.0 PURE: the published seed stands in for the restored reference
+    ONLY when that reference is missing or carries no pages, and never on a
+    bootstrap or accept run (those are explicit baseline writes). Returns
+    (effective_state, seeded)."""
+    if bootstrap or accept or not isinstance(seed, dict) or not seed:
+        return state, False
+    pages = state.get("pages") if isinstance(state, dict) else None
+    if isinstance(pages, dict) and pages:
+        return state, False
+    return dict(seed, seed=dict(seed.get("seed") or {}, applied=True)), True
+
+
 def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
-                      bootstrap: bool, now: datetime) -> tuple[dict, list[Finding], Optional[float]]:
+                      bootstrap: bool, now: datetime, seeded: bool = False
+                      ) -> tuple[dict, list[Finding], Optional[float]]:
     """Return (pages_map, findings, age_h). Missing/corrupt/stale/mismatched
     baselines are CONTROL failures on scheduled runs; bootstrap tolerates
-    absence (and only absence)."""
+    absence (and only absence). v1.3.0: a published seed (seeded=True) is
+    validated like any reference except for age -- it is the reviewed
+    reference, not the prior run -- and always carries a WARN naming it."""
     findings: list[Finding] = []
     if state is None:
         if bootstrap:
@@ -452,6 +492,15 @@ def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
     if age_h is not None and age_h < -0.25:
         findings.append(Finding("CONTROL", "CH_BASELINE_FUTURE", "*",
                                 "baseline verification timestamp is in the future"))
+        return pages, findings, age_h
+    if seeded:
+        meta = state.get("seed") if isinstance(state.get("seed"), dict) else {}
+        findings.append(Finding("WARN", "PTC_BASELINE_SEEDED", "*",
+                                f"comparing against the PUBLISHED seed baseline "
+                                f"(published {meta.get('published', '?')}, source run "
+                                f"{meta.get('source_run_id', '?')}) because the restored "
+                                f"reference is missing or empty; the first healthy run persists "
+                                f"a live baseline and the seed falls silent"))
         return pages, findings, age_h
     if age_h is not None and age_h > cfg.baseline_max_age_h and not bootstrap:
         findings.append(Finding("CONTROL", "CH_BASELINE_STALE", "*",
@@ -507,9 +556,13 @@ def next_last_good(report: CoverageReport, prior_pages: dict, accept: bool) -> t
 def audit_pages(grids: dict[str, Any], baseline_state: Optional[dict],
                 cfg: Config, spreadsheet: str = "***", bootstrap: bool = False,
                 accept: bool = False,
-                read_errors: Optional[dict] = None) -> CoverageReport:
-    """Pure core: grids in, report (with next-baseline decision) out."""
+                read_errors: Optional[dict] = None,
+                seed_state: Optional[dict] = None) -> CoverageReport:
+    """Pure core: grids in, report (with next-baseline decision) out.
+    v1.3.0: `seed_state` (the published seed) stands in for a missing or
+    empty `baseline_state` -- see apply_seed."""
     now = datetime.now(timezone.utc)
+    baseline_state, seeded = apply_seed(baseline_state, seed_state, bootstrap, accept)
     rep = CoverageReport(generated_at_utc=now.isoformat(), spreadsheet=spreadsheet,
                          config={"drop_pct": cfg.drop_pct, "row_drop_pct": cfg.row_drop_pct,
                                  "floor_pct": cfg.floor_pct, "min_rows": cfg.min_rows,
@@ -522,9 +575,10 @@ def audit_pages(grids: dict[str, Any], baseline_state: Optional[dict],
             rep.findings.append(Finding("CONTROL", "CH_CONFIG_INVALID", "*",
                                         f"invalid critical config: {e}"))
     prior_pages, base_findings, age_h = validate_baseline(
-        baseline_state, spreadsheet, cfg, bootstrap, now)
+        baseline_state, spreadsheet, cfg, bootstrap, now, seeded=seeded)
     rep.findings.extend(base_findings)
     rep.baseline_at_utc = (baseline_state or {}).get("generated_at_utc")
+    rep.baseline_source = "seed" if seeded else ("cache" if baseline_state else "none")
     rep.baseline_age_h = age_h
     rep.baseline_verified_at_utc = (baseline_state or {}).get("last_verified_at_utc")
     read_errors = read_errors or {}
@@ -554,7 +608,8 @@ async def _read(reader: Callable[..., Any], sid: str, page: str) -> list:
 
 
 async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Optional[dict],
-                   cfg: Config, bootstrap: bool, accept: bool, reader=None) -> CoverageReport:
+                   cfg: Config, bootstrap: bool, accept: bool, reader=None,
+                   seed_state: Optional[dict] = None) -> CoverageReport:
     masked = (spreadsheet_id[:5] + "..." + spreadsheet_id[-5:]
               if len(spreadsheet_id) > 10 else "***")
     if not spreadsheet_id:
@@ -575,7 +630,8 @@ async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Op
             grids[page] = []
             errors[page] = f"{type(exc).__name__}: {exc}"
     return audit_pages(grids, baseline_state, cfg, spreadsheet=masked,
-                       bootstrap=bootstrap, accept=accept, read_errors=errors)
+                       bootstrap=bootstrap, accept=accept, read_errors=errors,
+                       seed_state=seed_state)
 
 
 def load_state(path: str) -> tuple[Optional[dict], Optional[str]]:
@@ -613,7 +669,10 @@ def save_last_good(path: str, rep: CoverageReport, sheet_masked: str) -> str:
         return "kept: no eligible update"
     # Equal healthy observations must refresh the verification clock without
     # lowering the reference. A decline, WARN, failure or missing page cannot.
-    renewable = bool(rep.pages) and set(pages) == set(rep.pages) and not rep.findings
+    # v1.3.0: the seed's own WARN marker is not a health finding -- an equal
+    # healthy seeded run must write the first LIVE baseline (and its clock).
+    health = [f for f in rep.findings if f.code != "PTC_BASELINE_SEEDED"]
+    renewable = bool(rep.pages) and set(pages) == set(rep.pages) and not health
     for page, cov in rep.pages.items():
         ref = pages.get(page) or {}
         share = cov.get("share_pct")
@@ -628,6 +687,11 @@ def save_last_good(path: str, rep: CoverageReport, sheet_masked: str) -> str:
     old, error = load_state(path)
     if error:
         return "kept: corrupt baseline"
+    if rep.baseline_source == "seed":
+        # v1.3.0: the file on disk is the missing/empty reference the seed
+        # replaced -- never inherit its timestamps; this write IS the first
+        # live baseline.
+        old = None
     generated = rep.generated_at_utc if rep.baseline_updated else (old or {}).get("generated_at_utc", rep.generated_at_utc)
     blob = {"schema": STATE_SCHEMA, "generated_at_utc": generated,
             "version": VERSION, "sheet": sheet_masked,
@@ -717,6 +781,31 @@ def selftest() -> int:
     r = audit_pages({"GM": P(30)}, base, cfg, accept=True)
     checks.append(("operator acceptance writes lower baseline explicitly",
                    getattr(r, "_next_pages")["GM"]["share_pct"] == 30.0))
+    # v1.3.0 seed baseline (G9)
+    seed = {"schema": STATE_SCHEMA, "generated_at_utc": "2026-10-17T10:54:23+00:00",
+            "sheet": "***", "config_hash": cfg.hash(),
+            "seed": {"published": "2026-10-17", "source_run_id": 39026626201},
+            "pages": {"GM": {"share_pct": 50.0, "rows": 200, "provider": 100}}}
+    r = audit_pages({"GM": P(50)}, None, cfg, seed_state=seed)
+    checks.append(("seed: missing reference => seed compared, exit 0, WARN seeded, live baseline next",
+                   r.exit_code == 0 and r.baseline_source == "seed"
+                   and any(f.code == "PTC_BASELINE_SEEDED" for f in r.findings)
+                   and getattr(r, "_next_pages")["GM"]["share_pct"] == 50.0))
+    r = audit_pages({"GM": P(50)}, {**base, "pages": {}}, cfg, seed_state=seed)
+    checks.append(("seed: EMPTY reference (the 2026-08-18 file) => seed compared, exit 0",
+                   r.exit_code == 0 and r.baseline_source == "seed"))
+    r = audit_pages({"GM": P(10)}, None, cfg, seed_state=seed)
+    checks.append(("seed: a real collapse vs the seed still FAILS (exit 1) -- the alert is live",
+                   r.exit_code == 1 and r.pages["GM"]["verdict"] not in ("NO_BASELINE", "OK")))
+    r = audit_pages({"GM": P(50)}, base, cfg, seed_state=seed)
+    checks.append(("seed: ignored when a live reference exists",
+                   r.baseline_source == "cache" and not any(f.code == "PTC_BASELINE_SEEDED" for f in r.findings)))
+    r = audit_pages({"GM": P(50)}, None, cfg, seed_state={**seed, "config_hash": "deadbeef0000"})
+    checks.append(("seed: policy-hash mismatch => CONTROL (exit 2), never compared",
+                   r.exit_code == 2 and any(f.code == "CH_BASELINE_POLICY_MISMATCH" for f in r.findings)))
+    r = audit_pages({"GM": P(40)}, None, cfg, bootstrap=True, seed_state=seed)
+    checks.append(("seed: never on a bootstrap run (explicit write wins)",
+                   r.baseline_source == "none" and getattr(r, "_next_pages")["GM"]["share_pct"] == 40.0))
 
     ok = True
     for name, passed in checks:
@@ -741,6 +830,9 @@ def create_parser() -> argparse.ArgumentParser:
                    help="explicit first-deployment baseline creation")
     p.add_argument("--accept-baseline", action="store_true",
                    help="operator acceptance of a lower structural baseline (one-shot)")
+    p.add_argument("--seed", default="",
+                   help="v1.3.0: published seed baseline JSON, consulted only when the "
+                        "restored reference is missing or empty (never on bootstrap/accept)")
     p.add_argument("--selftest", action="store_true")
     return p
 
@@ -754,7 +846,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     accept = args.accept_baseline or _flag("TFB_PTC_ACCEPT_BASELINE")
     pages = tuple(x.strip() for x in args.pages.split(",") if x.strip()) or DEFAULT_PAGES
     state, state_err = load_state(args.state)
-    rep = asyncio.run(run_live(args.sheet_id, pages, state, cfg, bootstrap, accept))
+    seed_state, seed_err = load_state(args.seed) if args.seed else (None, None)
+    rep = asyncio.run(run_live(args.sheet_id, pages, state, cfg, bootstrap, accept,
+                               seed_state=seed_state))
+    if args.seed and (seed_err or seed_state is None):
+        rep.findings.append(Finding("WARN", "PTC_SEED_UNAVAILABLE", "*",
+                                    f"published seed {args.seed} unreadable ({seed_err or 'absent'}); "
+                                    f"the restored reference alone decides"))
     if state_err and not bootstrap:
         rep.findings.append(Finding("CONTROL", "CH_BASELINE_CORRUPT", "*",
                                     f"{state_err} — refusing to silently re-baseline; "
@@ -775,7 +873,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f"share={'n/a' if share is None else format(share, '.1f') + '%':>7} "
               f"last_good={'n/a' if basep is None else format(basep, '.1f') + '%':>7} "
               f"verdict={cov.get('verdict')}")
-    print(f"[PTC v{VERSION}] mode={rep.mode} baseline_updated={rep.baseline_updated} "
+    print(f"[PTC v{VERSION}] mode={rep.mode} baseline={rep.baseline_source} "
+          f"baseline_updated={rep.baseline_updated} "
           f"({rep.baseline_update_detail}) persist={rep.persist_status}")
     for f in rep.findings:
         ann = "error" if f.severity in ("FAIL", "CONTROL") else "warning"
