@@ -39,8 +39,8 @@ function load(props) {
 
 test('V1 version lockstep, functions and vars exist, PD_ACTION_HEADERS still 26 (action-log contract)', () => {
   const ctx = load();
-  assert.equal(ctx.PD_VERSION, '1.5.16');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.16$/);
+  assert.equal(ctx.PD_VERSION, '1.5.17');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.17$/);
   assert(source.includes(' * v1.5.16 MAIN CHANGES  (90-DAY PRICE SPARKLINE COLUMN -- Decision Pages v2'));
   for (const f of ['pdSparklineColOn_', 'pdSparklineTicker_', 'pdSparklineFormula_']) assert.equal(typeof ctx[f], 'function', f);
   assert.equal(ctx.PD_SPARK_COL_PROP, 'PD_SPARKLINE'); assert.equal(ctx.PD_SPARK_HEADER, 'Spark 90d'); assert.equal(ctx.PD_SPARK_DAYS, 91);

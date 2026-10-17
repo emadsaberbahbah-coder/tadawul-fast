@@ -1,7 +1,27 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.16
+ * Version: 1.5.17
+ *
+ * v1.5.17 MAIN CHANGES  (IBKR HISTORY HOOK -- Decision Pages v2 plan
+ *                        2026-10-17 package B2, the 3-line hook; applies only
+ *                        when 26_IBKR_History.gs is installed; ALL v1.5.16
+ *                        logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY: 26_IBKR_History.gs v1.0.0 appends every fresh Flex capture to
+ * _IBKR_NAV_History (date, NAV, flows, daily return, chain-linked TWR) and
+ * _IBKR_Trades (one row per fill), the data behind the Portfolio_Decision
+ * v2 TWR line and trade-record bar chart. It needs one caller per new
+ * capture; the capture watcher already sees each file exactly once.
+ * WHAT: pdIbkrCaptureWatch calls ibkrHistoryRecord_(cap.json, cap.id)
+ * (typeof-guarded, inside try) right after the capture has been judged new
+ * and not in the future -- i.e. BEFORE the 10-minute decision-freshness
+ * return and before refreshPortfolioDecision, so a capture too old for a
+ * decision, or a failed refresh, still lands in the history (the module is
+ * idempotent on NAV day and trade id). Without 26_IBKR_History.gs the
+ * watcher is byte-identical to v1.5.16. pdSelfTest reports the module's
+ * status line when present. Functions added: 0; lines added: 3 + selftest.
+ * Removed: 0. Harness: tests/js/ibkr_history_v100.test.js.
  *
  * v1.5.16 MAIN CHANGES  (90-DAY PRICE SPARKLINE COLUMN -- Decision Pages v2
  *                        plan 2026-10-17 package B3 (cockpit half); applies
@@ -2626,7 +2646,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.16';
+var PD_VERSION = '1.5.17';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3875,6 +3895,9 @@ function pdIbkrCaptureWatch() {
     if (props.getProperty(PD_IBKR_LAST_PROP) === cap.id) return 'already processed';
     var capMs = pdIbkrStampMs_(cap.json ? cap.json.captured_at : null);
     if (capMs !== null && capMs > nowMs) return 'capture time ahead of the clock';
+    if (typeof ibkrHistoryRecord_ === 'function') {   /* v1.5.17 [B2]: history before the decision gate */
+      try { ibkrHistoryRecord_(cap.json, cap.id); } catch (eIh) {}
+    }
     if (capMs === null || nowMs - capMs > PD_IBKR_WATCH_MAX_AGE_MS) {
       props.setProperty(PD_IBKR_LAST_PROP, cap.id);
       return 'capture not usable for a decision';
@@ -4738,6 +4761,8 @@ function pdSelfTest() {
         pdActionHeaders_(false) === PD_ACTION_HEADERS &&
         pdSwitchAdvisoryCell_({switch_advisory: 'x'}) === 'x' &&
         pdSwitchAdvisoryCell_({}) === '') ? 'ok' : 'FAIL'));
+  report.push(typeof ibkrHistoryStatus_ === 'function' ? ibkrHistoryStatus_() :   /* v1.5.17 [B2] */
+      'IBKR history: 26_IBKR_History.gs not installed (hook inert)');
   report.push('sparkline col (' + PD_SPARK_COL_PROP + '): ' +   /* v1.5.16 [B3] */
       (pdSparklineColOn_() ? 'on (hidden column ' + PD_SPARK_HEADER + ')' : 'off (default)') +
       ' | core: ' +

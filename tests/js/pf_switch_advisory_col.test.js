@@ -37,8 +37,8 @@ function load(props) {
 
 test('V1 version lockstep, functions and var exist, PD_ACTION_HEADERS still 26 (action-log contract)', () => {
   const ctx = load();
-  assert.equal(ctx.PD_VERSION, '1.5.16');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.16$/);
+  assert.equal(ctx.PD_VERSION, '1.5.17');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.5\.17$/);
   assert(source.includes(' * v1.5.15 MAIN CHANGES  (SWITCH ADVISORY COLUMN -- Codex brief 2026-10-17 C4,'));
   for (const f of ['pdSwitchAdvisoryColOn_', 'pdActionHeaders_', 'pdSwitchAdvisoryCell_']) assert.equal(typeof ctx[f], 'function', f);
   assert.equal(ctx.PD_SWITCH_COL_PROP, 'PD_SWITCH_ADVISORY_COL');

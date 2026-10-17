@@ -721,6 +721,7 @@ jobs:
           node tests/js/pf_uncertified_context.test.js
           node tests/js/pf_switch_advisory_col.test.js
           node tests/js/pf_sparkline_col.test.js
+          node tests/js/ibkr_history_v100.test.js
           node tests/js/dt10_v1170_model_evidence.test.js
           node tests/js/dt10_v1180_evidence_send.test.js
 
