@@ -211,17 +211,24 @@ the portfolio page is exactly the 1.15.1 output apart from the version string.
 
 ### Transport correction
 
-Two separate callers carry evidence, and only one of them reads the document
-property:
+Both native callers in the repository can forward declared evidence from the
+same document property:
 
 - The Top10 cockpit (`apps_script/16_Decision_Top10.gs`) reads document
   property `TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1` and forwards it inside
-  the opportunity body. That property feeds only the Top10 board.
+  the opportunity body.
 - Portfolio_Decision is produced by `POST /sheet-rows/portfolio-actions`. The
   route reads evidence only from `body.reconciliation_evidence`, sent by its
-  native Apps Script caller. That caller is not in this repository and does
-  not read the document property. Writing the property therefore cannot
-  change Portfolio_Decision; its caller must forward the packet itself.
+  native caller in `apps_script/10_My_Portfolio.gs`. Its `pdEvidencePacket_`
+  reader forwards a bounded schema-1 document-property packet. Version 1.5.13
+  also provides the default-off `PD_IBKR_EVIDENCE` capture path, which sends a
+  valid, sufficiently fresh capture when configured. Neither path makes a
+  stale or inconsistent packet acceptable to the backend.
+
+Correction (2026-10-17): the previous text predated the native caller's
+repository mirror and incorrectly said this page could not read the property.
+Check the installed Apps Script version and the actual request path before
+diagnosing missing transport; repository code alone does not prove installation.
 
 A live reason of `missing_evidence` on Portfolio_Decision means the request
 carried no packet at all. It does not show whether the property is populated.

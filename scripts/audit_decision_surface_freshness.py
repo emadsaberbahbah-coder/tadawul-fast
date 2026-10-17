@@ -8,6 +8,11 @@ because its own status text says ``ok``.
 
 No provider call and no Google Sheet write is performed.
 
+VERSION 1.3.3 — repeated pool counters are ambiguous, including identical
+copies. Keep their page count unknown instead of allowing the last counter
+to replace earlier evidence. Single-counter compatibility and native receipt
+requirements, coverage floors and publication policy remain unchanged.
+
 VERSION 1.3.2 — an opportunity-pool shortfall is accepted only when a native
 per-symbol exclusion receipt agrees with independently crossbound complete
 source grids, source cohort and first-page ownership. Physical membership
@@ -84,7 +89,7 @@ from core.data_validity import coverage_validity  # noqa: E402
 if TYPE_CHECKING:
     from scripts.approved_universe_scope import ScopePolicy
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 SOURCE_SCOPE_BOUND = 20050
 SOURCE_SCOPE_RANGE = f"A1:EZ{SOURCE_SCOPE_BOUND}"
 POOL_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
@@ -216,9 +221,18 @@ def parse_surface_status(text: Any) -> tuple[Optional[datetime], str]:
 
 
 def parse_pool_counts(text: Any) -> dict[str, dict[str, int]]:
+    """Return only unambiguous counters; no repeated page can certify a pool."""
     counts: dict[str, dict[str, int]] = {}
+    repeated: set[str] = set()
     for match in POOL_RE.finditer(s(text)):
-        counts[match.group("page")] = {
+        page = match.group("page")
+        if page in repeated:
+            continue
+        if page in counts:
+            counts.pop(page)
+            repeated.add(page)
+            continue
+        counts[page] = {
             "used": int(match.group("used")),
             "total": int(match.group("total")),
         }
