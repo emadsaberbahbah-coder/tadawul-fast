@@ -43,6 +43,13 @@ passes all 31 checks. Stale freeze-harness version literals now use the loaded
 script version; behavioral assertions remain intact. Workflow/manifest/verdict
 checks and the strict static workflow audit remain required.
 
+The first pushed follow-up exposed one more stale version expectation in the
+existing workbook DQ harness (`1.5.1` versus backup `1.5.2`). Only that expected
+version was updated; its local-copy default/environment/source assertions are
+unchanged. The module then passed 19 tests with its existing optional golden
+export test skipped because no private export fixture was supplied. A scan of
+19 related test files found no other stale exact-version assertions.
+
 The new regressions exercise actual entrypoints against fake Sheets, storage,
 provider and SMTP boundaries, including normal and deliberately failing paths.
 They do not certify live Sheet readback, SMTP inbox delivery, restored financial
