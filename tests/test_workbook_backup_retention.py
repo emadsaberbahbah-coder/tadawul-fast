@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import backup_workbook as backup
+from tests.workbook_backup_fixtures import workbook_export
 
 
 def test_duplicate_names_do_not_consume_dated_retention_slots():
@@ -54,7 +55,7 @@ def test_real_backup_prunes_every_expired_id_once_and_preserves_kept_copies(monk
     monkeypatch.setattr(backup, "_session", lambda _: object())
     monkeypatch.setattr(backup, "_oauth_session", lambda: object())
     monkeypatch.setattr(backup, "drive_ensure_app_folder", lambda *_: "test-folder")
-    monkeypatch.setattr(backup, "export_xlsx", lambda *_: b"offline-export")
+    monkeypatch.setattr(backup, "export_xlsx", lambda *_: workbook_export())
     monkeypatch.setattr(backup, "_store_upload", lambda *_: {"id": "keep-current-b", "name": current})
     monkeypatch.setattr(backup, "_store_list", lambda *_: listing)
     monkeypatch.setattr(backup, "_store_copy", lambda *_: pytest.fail("existing month must not be recopied"))

@@ -2,7 +2,7 @@
 # scripts/backup_workbook.py
 """
 ================================================================================
-Workbook Backup — v1.0.0 (W-4, Execution Plan v2.1; Gate & Evidence Register §8)
+Workbook Backup — v1.5.2 (W-4, Execution Plan v2.1; Gate & Evidence Register §8)
 ================================================================================
 NEW script (window whitelist W-4, scheduled Jul 22–24; adopted 2026-07-20).
 
@@ -20,6 +20,8 @@ WHAT IT DOES (nightly via .github/workflows/workbook_backup.yml)
        workbook is ~18 MB — the Docs URL streams the same bytes Google's own
        File▸Download produces, with no cap, authorized by the service
        account's bearer token.
+       Checks ZIP/XML integrity and required core worksheet bindings before
+       storing the export; this does not certify financial contents or restore.
     2. Uploads it to the operator's backup folder as
        DAILY_TFB_Workbook_YYYY-MM-DD.xlsx using a RESUMABLE upload
        (multipart caps at 5 MB — also too small).
@@ -83,14 +85,24 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
+from xml.parsers import expat
 from zoneinfo import ZoneInfo
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
+# WHY v1.5.2 (2026-10-17): a large HTTP error body or damaged XLSX passed
+# the byte floor, could replace today's backup and trigger retention.
+# Validate bounded ZIP/XML structure, sheet relationships and the existing
+# restore-test core tabs before local copying or destination mutation.
+# OAuth token preflight stays early; folder creation follows validation.
+# This checks the exported container, not restoration or financial contents.
 # WHY v1.5.1 (2026-10-16): Drive allows repeated names after a same-day
 # rerun. Retention counts distinct dated names, and pruning visits every
 # expired file ID once. Retained copies and foreign files remain untouched.
@@ -244,6 +256,131 @@ _DAILY_RE = re.compile(r"^DAILY_TFB_Workbook_(\d{4}-\d{2}-\d{2})\.xlsx$")
 _MONTHLY_RE = re.compile(r"^MONTHLY_TFB_Workbook_(\d{4}-\d{2})\.xlsx$")
 _CORE_TABS = {"_Status", "_Run_Log", "Top_10_Investments",
               "_Portfolio_CostBasis", "My_Portfolio", "Shadow_History"}
+# Generous package bounds, independent of compression ratio: current exports
+# have about 50 tabs. XML is streamed; only small package metadata is retained.
+_XLSX_MAX_PARTS = 10_000
+_XLSX_MAX_EXPANDED_BYTES = 2 * 1024**3
+_XLSX_MAX_METADATA_BYTES = 8 * 1024**2
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_SHEET_NAMESPACES = ("http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                     "http://purl.oclc.org/ooxml/spreadsheetml/main")
+_DOCUMENT_REL_NAMESPACES = ("http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                            "http://purl.oclc.org/ooxml/officeDocument/relationships")
+
+
+def _validate_export_xlsx(data: bytes) -> set[str]:
+    """Check ZIP CRCs, well-formed XML and core worksheet bindings, offline.
+
+    No cells, formulas or financial values are interpreted. A successful
+    check is necessary for storage, but does not replace a restore test.
+    """
+    def fail(message):
+        raise ValueError(message)
+
+    def part_target(source, relationship):
+        target = relationship.get("Target", "")
+        if relationship.get("TargetMode") == "External" or not target or "\\" in target:
+            fail("workbook relationship must target an internal part")
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(source), target)
+                                 if not target.startswith("/") else target[1:])
+        if path.startswith("../") or path == ".." or path not in parts:
+            fail("workbook relationship target is missing")
+        return path
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entries = archive.infolist()
+        parts = {entry.filename: entry for entry in entries}
+        if (len(entries) > _XLSX_MAX_PARTS or len(parts) != len(entries)
+                or sum(entry.file_size for entry in entries) > _XLSX_MAX_EXPANDED_BYTES):
+            fail("XLSX package exceeds bounds or repeats a part")
+        # Read every member to EOF: CRC checks cover worksheet and non-XML
+        # parts too. Expat checks XML without building a cell tree in memory.
+        xml_roots = {}
+        for entry in entries:
+            parser = None
+            if entry.filename.lower().endswith((".xml", ".rels")):
+                parser = expat.ParserCreate(namespace_separator="}")
+                parser.StartDoctypeDeclHandler = lambda *_: fail("XLSX XML must not contain a DTD")
+
+                def root(name, _attrs, part=entry.filename, xml_parser=parser):
+                    xml_roots[part] = name
+                    xml_parser.StartElementHandler = None
+
+                parser.StartElementHandler = root
+            with archive.open(entry) as stream:
+                while chunk := stream.read(64 * 1024):
+                    if parser is not None:
+                        parser.Parse(chunk, False)
+                if parser is not None:
+                    parser.Parse(b"", True)
+
+        def metadata(path):
+            if path not in parts or parts[path].file_size > _XLSX_MAX_METADATA_BYTES:
+                fail("XLSX package metadata is missing or exceeds bounds")
+            return ET.fromstring(archive.read(path))
+
+        def relationships(path):
+            root = metadata(path)
+            if root.tag != "{" + _PACKAGE_REL_NS + "}Relationships":
+                fail("invalid XLSX relationships root")
+            items = root.findall("{" + _PACKAGE_REL_NS + "}Relationship")
+            mapping = {item.get("Id"): item for item in items}
+            if any(not rid for rid in mapping) or len(mapping) != len(items):
+                fail("XLSX relationships require unique IDs")
+            return mapping
+
+        types = metadata("[Content_Types].xml")
+        if types.tag != "{" + _CONTENT_TYPES_NS + "}Types":
+            fail("invalid XLSX content-types root")
+        declarations = types.findall("{" + _CONTENT_TYPES_NS + "}Override")
+        defaults = types.findall("{" + _CONTENT_TYPES_NS + "}Default")
+        overrides = {item.get("PartName"): item.get("ContentType") for item in declarations}
+        extensions = {item.get("Extension"): item.get("ContentType") for item in defaults}
+        if len(overrides) != len(declarations) or len(extensions) != len(defaults):
+            fail("XLSX content types must be unambiguous")
+
+        def content_type(path):
+            return overrides.get("/" + path, extensions.get(path.rsplit(".", 1)[-1]))
+
+        documents = [rel for rel in relationships("_rels/.rels").values()
+                     if rel.get("Type") in {ns + "/officeDocument" for ns in _DOCUMENT_REL_NAMESPACES}]
+        if len(documents) != 1:
+            fail("XLSX requires one workbook relationship")
+        workbook_path = part_target("", documents[0])
+        workbook = metadata(workbook_path)
+        namespace = next((ns for ns in _SHEET_NAMESPACES
+                          if workbook.tag == "{" + ns + "}workbook"), None)
+        if namespace is None:
+            fail("invalid XLSX workbook root")
+        workbook_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+        if content_type(workbook_path) != workbook_type:
+            fail("XLSX workbook content type is missing")
+        rel_path = posixpath.join(posixpath.dirname(workbook_path), "_rels",
+                                 posixpath.basename(workbook_path) + ".rels")
+        bindings = relationships(rel_path)
+        tabs = set()
+        sheet_parts = set()
+        for sheet in workbook.findall("{" + namespace + "}sheets/{" + namespace + "}sheet"):
+            name = sheet.get("name")
+            rid = next((sheet.get("{" + ns + "}id") for ns in _DOCUMENT_REL_NAMESPACES
+                        if sheet.get("{" + ns + "}id") is not None), None)
+            if not name or name in tabs or rid not in bindings:
+                fail("XLSX sheets require unique names and valid relationships")
+            tabs.add(name)
+            target = part_target(workbook_path, bindings[rid])
+            if target in sheet_parts:
+                fail("XLSX sheets must reference distinct parts")
+            sheet_parts.add(target)
+            kind = next((kind for kind in ("worksheet", "chartsheet", "dialogsheet")
+                         if bindings[rid].get("Type") in {ns + "/" + kind for ns in _DOCUMENT_REL_NAMESPACES}), None)
+            if (kind is None or (name in _CORE_TABS and kind != "worksheet")
+                    or xml_roots.get(target) not in {ns + "}" + kind for ns in _SHEET_NAMESPACES}
+                    or content_type(target) != "application/vnd.openxmlformats-officedocument.spreadsheetml." + kind + "+xml"):
+                fail("sheet does not reference a valid typed sheet part")
+        if _CORE_TABS - tabs:
+            fail("XLSX is missing required core tabs: " + ", ".join(sorted(_CORE_TABS - tabs)))
+        return tabs
 
 
 def _out(msg: str) -> None:
@@ -782,10 +919,11 @@ def run_backup(dry_run: bool) -> int:
     dsess = sess                    # destination session (may differ)
     if dest == "oauth":
         # v1.4.0: the operator identity owns the storage. Resolved BEFORE
-        # the export so a dead grant costs 2 seconds, not 25.
+        # the export so a dead grant costs 2 seconds, not 25. The app folder
+        # itself is resolved only after the export passes validation.
+        container = ""
         try:
             dsess = _oauth_session()
-            container = drive_ensure_app_folder(dsess, _oauth_folder_name())
         except Exception as e:  # noqa: BLE001
             msg = f"[BACKUP v{__version__}] FAIL oauth setup: {e}"
             _out("ERROR: " + msg)
@@ -797,7 +935,7 @@ def run_backup(dry_run: bool) -> int:
          f"sheet_id={sheet_id} "
          + (f"bucket={container or '(unset)'} prefix={_gcs_prefix()!r} "
             if dest == "gcs"
-            else f"folder={_oauth_folder_name()!r} folder_id={container} "
+            else f"folder={_oauth_folder_name()!r} folder_id=(after export validation) "
             if dest == "oauth"
             else f"folder_id={container or '(unset)'} ")
          + f"dry_run={bool(dry_run)}")
@@ -822,11 +960,29 @@ def run_backup(dry_run: bool) -> int:
         append_run_log("FAIL", msg, {"bytes": len(data), "sha": sha})
         return 3
 
+    try:
+        _validate_export_xlsx(data)
+    except Exception as e:  # noqa: BLE001 -- no destination changes on invalid bytes
+        # Parser/ZIP messages may quote private member names or XML input.
+        msg = (f"[BACKUP v{__version__}] FAIL export validation: {type(e).__name__} "
+               "(invalid XLSX package or required worksheet structure)")
+        _out("ERROR: " + msg)
+        append_run_log("FAIL", msg, {"stage": "export_validation", "bytes": len(data), "sha": sha})
+        return 3
+
     _write_local_copy(data, sha)      # v1.5.0 [WP-0]: no-op unless TFB_BACKUP_LOCAL_COPY is set
 
     if dry_run:
         _out("dry-run — export verified, nothing uploaded")
         return 0
+    if dest == "oauth":
+        try:
+            container = drive_ensure_app_folder(dsess, _oauth_folder_name())
+        except Exception as e:  # noqa: BLE001
+            msg = f"[BACKUP v{__version__}] FAIL oauth setup: {e}"
+            _out("ERROR: " + msg)
+            append_run_log("FAIL", msg, {"stage": "oauth"})
+            return 2
     if dest == "drive" and not folder_id:      # v1.3.0: destination-aware
         email = getattr(creds, "_tfb_client_email", "?")
         msg = (f"[BACKUP v{__version__}] FAIL TFB_BACKUP_FOLDER_ID not set — "

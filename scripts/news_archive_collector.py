@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.1.0)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.1.1)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -32,6 +32,17 @@
 #     continuous series -- better for backtesting than a rotating Top_10.
 #   - news_intelligence uses Google-News RSS: NO provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
+# =============================================================================
+# v1.1.1 (2026-10-17) -- CONFIRMED ARCHIVE STATE BEFORE APPEND
+# -----------------------------------------------------------------------------
+# WHY: a failed idempotency read was treated as an empty archive, allowing a
+# successful duplicate append. A failed or incompatible header read could also
+# overwrite the header of populated historical rows. Require readable canonical
+# headers and a confirmed existing-day read; initialize headers only after a
+# full read proves the worksheet empty. An errored/unknown empty collection is
+# a failure, while explicit successful empty batches, valid partial observations
+# and confirmed same-day skips retain their behavior. Normal row values, sector
+# policy and the news engine are unchanged. No functions removed.
 # =============================================================================
 # v1.1.0 (2026-08-11) -- WRITE-TIME SECTOR JOIN (ENV-GATED, DEFAULT OFF)
 # -----------------------------------------------------------------------------
@@ -69,7 +80,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -248,6 +259,10 @@ def _import_news_module() -> Optional[Any]:
 # -----------------------------------------------------------------------------
 # Archive store (append-only)
 # -----------------------------------------------------------------------------
+class NewsArchiveStateError(RuntimeError):
+    """Archive state could not be confirmed safely before an append."""
+
+
 class NewsArchiveStore:
     SHEET_DEFAULT = "News_Archive"
     START_ROW = 5  # headers at row 5
@@ -315,15 +330,44 @@ class NewsArchiveStore:
             self.gc = self.sheet = self.ws = None
 
     def _ensure_headers(self) -> None:
-        if not self.ws:
-            return
+        if self.ws is None:
+            raise NewsArchiveStateError("archive worksheet unavailable")
         try:
             existing = self.ws.row_values(self.START_ROW)
-        except Exception:
-            existing = []
-        if [str(x).strip() for x in existing[: len(self.HEADERS)]] != self.HEADERS:
-            rng = _a1_range(1, self.START_ROW, len(self.HEADERS), self.START_ROW)
-            self.backoff.run(lambda: self.ws.update(values=[self.HEADERS], range_name=rng))
+        except Exception as exc:
+            raise NewsArchiveStateError("archive header unreadable") from exc
+        header = self._header_cells(existing)
+        if header == self.HEADERS:
+            return
+        if header:
+            raise NewsArchiveStateError("archive header incompatible; no rows relabelled")
+        # A blank header alone does not establish that the worksheet is new.
+        # Refuse to label existing data, including rows above the header.
+        rows = self._read_archive_values()
+        if any(str(cell if cell is not None else "").strip() for row in rows for cell in row):
+            raise NewsArchiveStateError("archive header missing on nonempty worksheet")
+        rng = _a1_range(1, self.START_ROW, len(self.HEADERS), self.START_ROW)
+        self.backoff.run(lambda: self.ws.update(values=[self.HEADERS], range_name=rng))
+
+    @staticmethod
+    def _header_cells(row: Any) -> list[str]:
+        if not isinstance(row, list):
+            raise NewsArchiveStateError("archive header read has invalid shape")
+        cells = [str(cell if cell is not None else "").strip() for cell in row]
+        while cells and not cells[-1]:
+            cells.pop()
+        return cells
+
+    def _read_archive_values(self) -> list[list[Any]]:
+        if self.ws is None:
+            raise NewsArchiveStateError("archive worksheet unavailable")
+        try:
+            rows = self.ws.get_all_values()
+        except Exception as exc:
+            raise NewsArchiveStateError("archive rows unreadable") from exc
+        if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
+            raise NewsArchiveStateError("archive row read has invalid shape")
+        return rows
 
     def load_symbol_sector_map(self) -> Dict[str, str]:
         """v1.1.0: Symbol->Sector from the pool pages of THIS workbook.
@@ -346,12 +390,10 @@ class NewsArchiveStore:
 
     def existing_keys_for_date(self, date_str: str) -> set:
         """Return {symbol} already archived for date_str (idempotency guard)."""
-        if not self.ws:
-            return set()
-        try:
-            rows = self.ws.get_all_values()
-        except Exception:
-            return set()
+        rows = self._read_archive_values()
+        header = rows[self.START_ROW - 1] if len(rows) >= self.START_ROW else []
+        if self._header_cells(header) != self.HEADERS:
+            raise NewsArchiveStateError("archive header missing or changed during collection")
         out: set = set()
         for row in rows[self.DATA_ROW0 - 1:]:
             if len(row) >= 2 and str(row[0]).strip() == date_str:
@@ -464,6 +506,18 @@ async def collect(args: argparse.Namespace) -> int:
     if len(rows) > 8:
         print("  ... (%d more)" % (len(rows) - 8))
 
+    if not rows:
+        # The engine explicitly distinguishes a successful empty batch from an
+        # error. Neither an error nor an unusable observation is an idempotent
+        # archive skip, and no worksheet needs to be opened for an empty fetch.
+        if (not results and meta.get("status") == "success"
+                and type(meta.get("errors")) is int and meta["errors"] == 0
+                and not getattr(batch, "errors", None)):
+            print("[news_archive] collection succeeded with no observations")
+            return 0
+        logger.error("news collection returned no valid observations -- archive unchanged")
+        return 1
+
     if args.dry_run:
         print("[news_archive] DRY RUN -- %d rows NOT written" % len(rows))
         return 0
@@ -479,7 +533,11 @@ async def collect(args: argparse.Namespace) -> int:
         return 1
 
     # idempotency: skip symbols already archived for today
-    already = store.existing_keys_for_date(date_str)
+    try:
+        already = store.existing_keys_for_date(date_str)
+    except NewsArchiveStateError as exc:
+        logger.error("archive idempotency state unconfirmed: %s -- nothing appended", exc)
+        return 1
     fresh = [row for row in rows if str(row[1]).strip().upper() not in already]
     skipped = len(rows) - len(fresh)
     if skipped:

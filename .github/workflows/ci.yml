@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.24 (2026-10-17) -- GREEN-RUN OUTPUT INTEGRITY
+# WHY: failed receipt/header reads, invalid backup bytes and partial SMTP
+# acceptance must not masquerade as completed output. Run the offline I/O
+# failure regressions in the blocking lean lane; use the existing pinned
+# restore reader for XLSX compatibility in the blocking heavy lane.
+#
 # VERSION 1.1.23 (2026-10-16) -- HOURLY WATCH REGRESSIONS
 # WHY: the scheduled backtest skipped the producer Risk Bucket field. Keep
 # its CLI/legacy-column regression in the blocking lean decision suite.
@@ -690,6 +696,16 @@ jobs:
             tests/test_render_env_contract.py \
             tests/test_validation_embargo_properties.py
 
+      - name: 🛡️ Successful-run output and publication integrity
+        run: |
+          python -m pytest -q \
+            tests/test_daily_brief_receipt_reads.py \
+            tests/test_digest_delivery_receipts.py \
+            tests/test_news_archive_safety.py \
+            tests/test_pit_snapshot_schema.py \
+            tests/test_shadow_board_holdings_receipts.py \
+            tests/test_workbook_backup_validation.py
+
       - name: 🧮 Run model and display basis regressions (lean)
         run: |
           python -m pytest -q \
@@ -828,6 +844,9 @@ jobs:
 
       - name: 🧪 Daily brief unavailable-evidence and blocked-decision regressions
         run: python -m pytest -q tests/test_daily_brief_blocked_inputs.py
+
+      - name: 🗄️ Backup XLSX compatibility with the pinned restore reader
+        run: python -m pytest -q tests/test_workbook_backup_openpyxl_compat.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py

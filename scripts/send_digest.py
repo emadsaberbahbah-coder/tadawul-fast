@@ -134,7 +134,11 @@ from typing import Any, Dict, List, Optional, Tuple
 #   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
 #   the correct fail-closed answer.
 # =============================================================================
-__version__ = "2.1.2"
+__version__ = "2.1.3"
+# v2.1.3 WHY (2026-10-17): SMTP sendmail returns a refusal dictionary even
+# when some recipients were accepted. Require its complete acknowledgement
+# before claiming success; disclose partial/unknown delivery without replaying
+# accepted recipients or logging private recipient/server-response payloads.
 # v2.1.2 (2026-10-14): retain both displayed Top10 cash titles in the state
 # brief. Exactly one valid Selected/Passed strip is required; ambiguous strips
 # stay unknown. Entered cash is never renamed as funding/deployable evidence.
@@ -1181,18 +1185,29 @@ def _send_email(subject: str, text: str, html: str, dry_run: bool) -> int:
             with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
                 if user:
                     s.login(user, pwd)
-                s.sendmail(msg["From"], recips, msg.as_string())
+                refused = s.sendmail(msg["From"], recips, msg.as_string())
         else:
             with smtplib.SMTP(host, port, timeout=30) as s:
                 if _env_bool("SMTP_USE_TLS", True):
                     s.starttls(context=ctx)
                 if user:
                     s.login(user, pwd)
-                s.sendmail(msg["From"], recips, msg.as_string())
+                refused = s.sendmail(msg["From"], recips, msg.as_string())
+        if not isinstance(refused, dict) or not set(refused).issubset(recips):
+            _log("ERROR email delivery acknowledgement unavailable; "
+                 "delivery unconfirmed, verify before retrying")
+            return 2
+        if refused:
+            rejected = sum(address in refused for address in recips)
+            _log(f"ERROR partial email delivery: requested={len(recips)} "
+                 f"accepted={len(recips) - rejected} refused={rejected}; "
+                 "verify accepted recipients before retrying")
+            return 2
         _log(f"email sent to {len(recips)} recipient(s): {subject}")
         return 0
     except Exception as exc:  # noqa: BLE001
-        _log(f"ERROR sending email: {exc}")
+        _log(f"ERROR sending email: {type(exc).__name__}; "
+             "delivery unconfirmed, verify before retrying")
         return 2
 
 

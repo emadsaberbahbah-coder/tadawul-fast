@@ -160,6 +160,7 @@ provider/configuration blocked, intentionally skipped, unrun and unverified.
 
 Supporting evidence:
 
+- [Successful-run integrity follow-up and seven operational repairs](successful-run-alignment-20261017.md)
 - [Complete workflow/entrypoint inventory](workflow-entrypoint-inventory-20261016.md)
 - [Scheduler and concurrency review](scheduler-concurrency-review-20261016.md)
 - [Learning workflow source/log evidence](learning-workflow-reliability-20261016.md)

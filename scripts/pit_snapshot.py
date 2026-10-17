@@ -2,7 +2,7 @@
 # scripts/pit_snapshot.py
 """
 ================================================================================
-PIT Snapshot — v1.1.1 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
+PIT Snapshot — v1.1.2 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
 ================================================================================
 NEW script (window whitelist W-6, scheduled Jul 22–24; adopted 2026-07-20).
 
@@ -113,7 +113,13 @@ from zoneinfo import ZoneInfo
 #   repair_pit_legacy_rows planner moves only the two original timestamps to
 #   their 24-column destinations. Uncaptured diagnostic values remain blank;
 #   this writer's append and duplicate-guard behavior is unchanged.
-__version__ = "1.1.1"
+# v1.1.2 WHY (2026-10-17): a failed 16-to-24 header migration previously
+#   warned and still appended 24-column rows under the surviving old schema.
+#   Accept only the recognized current or legacy header (or a proven empty
+#   tab), verify any header update before appending, and stop on schema or
+#   migration failure. Failure diagnostics expose only the exception class.
+#   Historical rows, dates, source-absence evidence and duplicate keys stay intact.
+__version__ = "1.1.2"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Snapshot Date", "Symbol", "Source Page", "Price", "Market Cap",
@@ -296,6 +302,20 @@ def existing_keys_for(values: List[List[Any]], date_str: str) -> set:
     return keys
 
 
+def _destination_header(values: list[list[Any]]) -> list[str]:
+    """Normalize header whitespace without accepting reordered/extra columns."""
+    if not values or not isinstance(values[0], (list, tuple)):
+        return []
+    return [str(cell or "").strip() for cell in values[0]]
+
+
+def _write_current_header(ws) -> None:
+    """Confirm the published schema before any snapshot rows can be appended."""
+    ws.update(values=[HEADERS], range_name="A1")
+    if _destination_header(ws.get("A1:X1")) != HEADERS:
+        raise RuntimeError("PIT destination header update was not verified")
+
+
 # --------------------------------------------------------------------------- #
 # Sheets I/O (CI-only imports; mirrors calendar_sync)                         #
 # --------------------------------------------------------------------------- #
@@ -428,10 +448,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out("dry-run — nothing written (pass --write to append)")
         return 0
 
+    stage = "header"
     try:
         if ws is None:
             ws = book.add_worksheet(title=tab, rows=2000, cols=len(HEADERS))
-            ws.update(values=[HEADERS], range_name="A1")
+            _write_current_header(ws)
             try:
                 ws.freeze(rows=1)
             except Exception:
@@ -442,16 +463,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             # leaving timestamps under Forecast Source/Reliability. The
             # separate operator-run repair tool realigns these original
             # values; diagnostic fields were never captured and stay blank.
-            try:
-                cur = (existing[0] if existing else []) or []
-                cur = [str(c or "").strip() for c in cur]
-                if cur and cur[:len(LEGACY_HEADERS_16)] == LEGACY_HEADERS_16 \
-                        and len(cur) < len(HEADERS):
-                    ws.update(values=[HEADERS], range_name="A1")
-                    _out(f"header migrated {len(cur)} -> {len(HEADERS)} cols "
-                         f"(historical timestamps require separate realignment)")
-            except Exception as e:  # noqa: BLE001
-                _out(f"WARN: header migration skipped ({e}); append continues")
+            cur = _destination_header(existing)
+            if existing == []:
+                _write_current_header(ws)
+            elif cur == LEGACY_HEADERS_16:
+                _write_current_header(ws)
+                _out(f"header migrated {len(cur)} -> {len(HEADERS)} cols "
+                     f"(historical timestamps require separate realignment)")
+            elif cur != HEADERS:
+                raise RuntimeError("PIT destination header is incompatible with the snapshot schema")
+        stage = "append"
         if rows:
             ws.append_rows(rows, value_input_option="RAW")
         msg = (f"[PIT-SNAPSHOT v{__version__}] date={today} "
@@ -463,9 +484,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "missing": missing})
         return 0
     except Exception as e:  # noqa: BLE001
-        msg = f"[PIT-SNAPSHOT v{__version__}] FAIL append: {e}"
+        msg = f"[PIT-SNAPSHOT v{__version__}] FAIL {stage}: {type(e).__name__}"
         _out("ERROR: " + msg)
-        append_run_log(book, "FAIL", msg, {"stage": "append"})
+        append_run_log(book, "FAIL", msg, {"stage": stage})
         return 3
 
 

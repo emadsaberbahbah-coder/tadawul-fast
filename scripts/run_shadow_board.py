@@ -172,7 +172,12 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 #   byte-untouched; prior excluded days stand; the counter continues.
 # Rollback: env off (or git revert). Functions added: 5. Removed: 0.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.5.0"
+# VERSION 1.5.1 (2026-10-17) - HOLDINGS READ FAILURE IS NOT AN EMPTY BOOK
+# WHY: a failed Portfolio_Decision read became [], publishing NO_ACTION and
+# an OK receipt without having checked any holdings. Stop before provider
+# work or publication on an actual read exception; report only its type.
+# Successful empty reads, freeze modes and all financial evaluators are unchanged.
+SCRIPT_VERSION = "1.5.1"
 # -----------------------------------------------------------------------------
 # v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
 # -----------------------------------------------------------------------------
@@ -781,8 +786,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     cands = rows_to_records(sh.worksheet(TAB_TOP10).get_all_values())
     try:
         holds = rows_to_records(sh.worksheet(TAB_HOLDINGS).get_all_values())
-    except Exception:  # noqa: BLE001
-        holds = []
+    except Exception as exc:  # noqa: BLE001 -- unavailable input is not verified empty
+        print(f"[SHADOW-BOARD v{SCRIPT_VERSION}] ERROR: {TAB_HOLDINGS} "
+              f"read failed ({type(exc).__name__}); no board or history published.",
+              file=sys.stderr)
+        return 2
 
     auth = sa.get_authority_index(force=True)
     monitor = sa.get_monitor_map()
