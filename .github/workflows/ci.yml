@@ -650,6 +650,8 @@ jobs:
             tests/test_track_flags_mapped.py \
             tests/test_tracker_audit_lane.py \
             tests/test_backtest_history_depth_l2.py \
+            tests/test_run_verdict_classes_g5.py \
+            tests/test_acceptance_check_headline_g10.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \

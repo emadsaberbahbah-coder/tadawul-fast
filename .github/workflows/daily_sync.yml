@@ -1,5 +1,22 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.4 (2026-10-17) -- RUN VERDICT TELLS A WITHHELD FEED FROM A DATA FAILURE (G5)
+# WHY (2026-10-17, Codex brief G5): scheduled runs #4898/#4899/#4905 all
+# concluded `failure` although every data job succeeded - the failing job was
+# the release gate (exit 2, coverage_failed/decision_failed). The 🔔 Run
+# verdict job emitted the same ::error:: and the same red Slack card as a real
+# data outage, so a withheld decision feed (a data-QUALITY verdict the gate is
+# designed to give) was indistinguishable from a sync that did not run: the
+# red-run blindness. The gate job now exports its audit exit code and the
+# blocker list as job outputs (the audit step itself is unchanged: it still
+# fails the job on any non-zero exit), and the verdict job classifies before
+# it announces: DATA_FAIL (a sync/recovery leg failed or was cancelled) keeps
+# the ::error:: and the danger card; DATA_OK / GATE_NOT_ACTIONABLE (data jobs
+# green, gate exit 1 or 2) becomes a ::warning:: and an amber card naming the
+# blockers; DATA_OK / GATE_ERROR (gate exit 3 or cancelled) stays an error.
+# Nothing here changes a write or a gate decision. Rollback: delete the
+# outputs block and the classification lines (the job text falls back to the
+# 1.0.3 single ::error::).
 # VERSION 1.0.3 (2026-10-13) -- SUPERSEDE A RELEASED DECISION FEED AT WRITER START (P0-1)
 # WHY (2026-10-13, Codex P1 on PR #763): with TFB_DECISION_RELEASE armed, a
 # release of run N stayed EXECUTABLE while this workflow re-stamped every page
@@ -2075,6 +2092,11 @@ jobs:
     runs-on: ubuntu-24.04
     environment: production
     timeout-minutes: 30
+    # (2026-10-17) G5: let the 🔔 Run verdict job tell a withheld feed (exit
+    # 1/2, blockers named) from a broken gate (exit 3) or a data failure.
+    outputs:
+      audit_exit: ${{ steps.final_audit.outputs.audit_exit }}
+      blockers: ${{ steps.final_summary.outputs.blockers }}
     env:
       PYTHONPATH: ${{ github.workspace }}
       TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
@@ -2166,22 +2188,31 @@ jobs:
           fi
 
       - name: Publish final audit summary
+        id: final_summary
         if: always()
         run: |
           python - <<'PY'
           import json, os
           from pathlib import Path
           path = Path('final_decision_publication.json')
+          # (2026-10-17) G5: the blocker list becomes a job output for the
+          # 🔔 Run verdict job. 'audit_missing' when the audit never wrote.
+          blockers = 'audit_missing'
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
               handle.write('## Final decision publication\n\n')
               if not path.exists():
                   handle.write('Final audit did not complete. No acceptance was issued.\n')
               else:
                   result = json.loads(path.read_text())
+                  blockers = ','.join(str(b) for b in (result.get('blockers') or [])) or 'none'
                   handle.write('| Check | Result |\n|---|---|\n')
                   for key in ('exit_code', 'audit_exit_codes', 'blockers', 'blocker_published', 'feed_promoted'):
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nNative installation and refresh are required before executable decisions.\n')
+          out = os.environ.get('GITHUB_OUTPUT')
+          if out:
+              with open(out, 'a') as handle:
+                  handle.write('blockers=' + blockers.replace('\n', ' ') + '\n')
           PY
 
       - name: Upload final publication evidence
@@ -2247,22 +2278,56 @@ jobs:
           SYNC_RESULT: ${{ needs.sync-dashboard.result }}
           RECOVERY_RESULT: ${{ needs.recover-missing-market-pages.result }}
           FINAL_RESULT: ${{ needs.verify-final-decision-publication.result }}
+          # (2026-10-17) G5: the gate's own verdict, exported by that job.
+          GATE_AUDIT_EXIT: ${{ needs.verify-final-decision-publication.outputs.audit_exit }}
+          GATE_BLOCKERS: ${{ needs.verify-final-decision-publication.outputs.blockers }}
         run: |
           set -euo pipefail
 
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
 
+          # (2026-10-17) G5 - CLASSIFY BEFORE ANNOUNCING. A withheld decision
+          # feed is the gate doing its job (data-quality verdict, exit 1 = not
+          # actionable without a hard failure, exit 2 = a FAIL finding such as
+          # coverage_failed / decision_failed); a sync or recovery leg that
+          # failed or never got a runner is a data outage. They must not read
+          # the same. Gate exit 3 (fatal / unavailable) or a cancelled gate is
+          # a broken instrument and stays an error.
+          data_bad=false
+          for r in "${SYNC_RESULT:-}" "${RECOVERY_RESULT:-}"; do
+            case "$r" in failure|cancelled) data_bad=true ;; esac
+          done
+          if [[ "$data_bad" == "true" ]]; then
+            VERDICT_CLASS="DATA_FAIL"
+          elif [[ "${FINAL_RESULT:-}" == "failure" && ( "${GATE_AUDIT_EXIT:-}" == "1" || "${GATE_AUDIT_EXIT:-}" == "2" ) ]]; then
+            VERDICT_CLASS="DATA_OK / GATE_NOT_ACTIONABLE"
+          elif [[ "${FINAL_RESULT:-}" == "failure" || "${FINAL_RESULT:-}" == "cancelled" ]]; then
+            VERDICT_CLASS="DATA_OK / GATE_ERROR"
+          else
+            VERDICT_CLASS="UNCLASSIFIED"
+          fi
+          BLOCKERS_TXT="${GATE_BLOCKERS:-unknown}"
+          echo "verdict_class=${VERDICT_CLASS}"
+
           # Always visible in the Actions summary, with or without a webhook.
-          echo "::error::Daily Sync did not complete cleanly - sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT} final-publication=${FINAL_RESULT} (${RIYADH_TIME}). Check final decision publication before using cockpit tickets."
+          if [[ "$VERDICT_CLASS" == "DATA_OK / GATE_NOT_ACTIONABLE" ]]; then
+            echo "::warning::Daily Sync data jobs succeeded (sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT}); the release gate withheld the decision feed - NOT_ACTIONABLE, audit exit ${GATE_AUDIT_EXIT}, blockers: ${BLOCKERS_TXT} (${RIYADH_TIME}). This is a data-quality verdict, not a run failure; the cockpit stays on its last actionable feed."
+          else
+            echo "::error::Daily Sync did not complete cleanly [${VERDICT_CLASS}] - sync-dashboard=${SYNC_RESULT} recovery=${RECOVERY_RESULT} final-publication=${FINAL_RESULT} gate-exit=${GATE_AUDIT_EXIT:-?} blockers=${BLOCKERS_TXT} (${RIYADH_TIME}). Check final decision publication before using cockpit tickets."
+          fi
           {
             echo "## 🔔 Run verdict"
+            echo ""
+            echo "**Verdict class:** \`${VERDICT_CLASS}\`"
             echo ""
             echo "| Job | Result |"
             echo "|---|---|"
             echo "| sync-dashboard | \`${SYNC_RESULT}\` |"
             echo "| recover-missing-market-pages | \`${RECOVERY_RESULT}\` |"
             echo "| verify-final-decision-publication | \`${FINAL_RESULT}\` |"
+            echo "| gate audit exit | \`${GATE_AUDIT_EXIT:-?}\` |"
+            echo "| gate blockers | \`${BLOCKERS_TXT}\` |"
             echo ""
             echo "Time (Riyadh): ${RIYADH_TIME}"
             echo ""
@@ -2275,7 +2340,19 @@ jobs:
             exit 0
           fi
 
+          # (2026-10-17) G5: amber card for a withheld feed, red for the rest.
+          if [[ "$VERDICT_CLASS" == "DATA_OK / GATE_NOT_ACTIONABLE" ]]; then
+            SLACK_TEXT="⚠️ Tadawul Daily Sync: data OK, decision feed NOT ACTIONABLE (gate withheld: ${BLOCKERS_TXT})"
+            SLACK_COLOR="warning"
+          else
+            SLACK_TEXT="❌ Tadawul Daily Sync run did not complete cleanly [${VERDICT_CLASS}]"
+            SLACK_COLOR="danger"
+          fi
           PAYLOAD="$(jq -n \
+            --arg text     "$SLACK_TEXT" \
+            --arg color    "$SLACK_COLOR" \
+            --arg class    "$VERDICT_CLASS" \
+            --arg blockers "$BLOCKERS_TXT" \
             --arg trigger  "${{ github.event_name }}" \
             --arg time     "$RIYADH_TIME" \
             --arg sync     "${SYNC_RESULT:-unknown}" \
@@ -2283,10 +2360,12 @@ jobs:
             --arg final    "${FINAL_RESULT:-unknown}" \
             --arg url      "$RUN_URL" \
             '{
-              text: "❌ Tadawul Daily Sync run did not complete cleanly",
+              text: $text,
               attachments: [{
-                color: "danger",
+                color: $color,
                 fields: [
+                  {title: "Verdict class",  value: $class,    short: true},
+                  {title: "Gate blockers",  value: $blockers, short: true},
                   {title: "Trigger",        value: $trigger,  short: true},
                   {title: "Time (Riyadh)",  value: $time,     short: true},
                   {title: "sync-dashboard", value: $sync,     short: true},

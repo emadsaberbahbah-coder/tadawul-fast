@@ -2,10 +2,20 @@
 # 📏 TFB Acceptance (Day-10 definition of done, measured) — acceptance_check.yml
 # =============================================================================
 # WHY: "done" is a printed table of measurements, not an opinion. This runs
-# scripts/tfb_acceptance.py v1.0.0 READ-ONLY against the live workbook every
-# morning after the sync legs (and on demand), publishes the table to the job
-# summary and an artifact, and never writes a cell. Non-strict by design: an
-# instrument, not a blocker (add strict=true on dispatch to make FAIL red).
+# scripts/tfb_acceptance.py (VERSION pinned in the script) READ-ONLY against
+# the live workbook every morning after the sync legs (and on demand),
+# publishes the table to the job summary and an artifact, and never writes a
+# cell. Non-strict by design: an instrument, not a blocker (add strict=true on
+# dispatch to make FAIL red).
+# (2026-10-17) G10 - THE TALLY IS VISIBLE WITHOUT OPENING THE ARTIFACT. The
+# green check hid "28 PASS 6 WARN 1 FAIL 7 NA" (17-Oct review): the tally was
+# the last line inside a fenced block in the step summary and nowhere else.
+# The headline step below reads artifacts/acceptance.json and writes one
+# heading to the step summary plus one annotation (notice on PASS, warning on
+# WARN, error on FAIL or a missing result). Annotations never change the exit
+# code, so the instrument stays non-strict; a job name cannot carry a step
+# output, and the script's "NO WRITES, EVER" contract keeps _Status untouched.
+# Rollback: delete the headline step.
 # =============================================================================
 name: 📏 TFB Acceptance (measured)
 on:
@@ -55,6 +65,40 @@ jobs:
           ARGS=(--live --json artifacts/acceptance.json --board-min "${{ inputs.board_min || '5' }}")
           if [ "${{ inputs.strict }}" = "true" ]; then ARGS+=(--strict); fi
           python scripts/tfb_acceptance.py "${ARGS[@]}" | tee artifacts_console.txt
+      - name: Acceptance headline (tally without opening the artifact)
+        id: headline
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          # (2026-10-17) G10: one line the run page shows on its own.
+          path = Path('artifacts/acceptance.json')
+          if not path.exists():
+              verdict, line = 'NO RESULT', 'artifacts/acceptance.json missing - the measurement did not complete'
+              kind = 'error'
+          else:
+              r = json.loads(path.read_text(encoding='utf-8'))
+              t = r.get('tally') or {}
+              verdict = str(r.get('overall_verdict') or '?')
+              line = ' '.join('%s=%s' % (k, t.get(k, 0)) for k in ('PASS', 'WARN', 'FAIL', 'NA'))
+              line += ' (NA_hard=%s NA_design=%s)' % (r.get('na_hard', 0), r.get('na_design', 0))
+              errs = r.get('read_errors') or []
+              if errs:
+                  line += ' read_errors=%d' % len(errs)
+              kind = {'PASS': 'notice', 'WARN': 'warning'}.get(verdict, 'error')
+          headline = 'Acceptance: %s - %s' % (verdict, line)
+          print('::%s::%s - non-strict instrument: the job stays green; FAIL means read the table.' % (kind, headline))
+          summ = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summ:
+              with open(summ, 'a', encoding='utf-8') as fh:
+                  fh.write('## 📏 %s\n\n' % headline)
+          out = os.environ.get('GITHUB_OUTPUT')
+          if out:
+              with open(out, 'a', encoding='utf-8') as fh:
+                  fh.write('verdict=%s\n' % verdict)
+                  fh.write('tally=%s\n' % line)
+          PY
       - name: Upload acceptance artifact
         if: always()
         uses: actions/upload-artifact@v7
