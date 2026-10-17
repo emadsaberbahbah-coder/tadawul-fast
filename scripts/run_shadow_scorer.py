@@ -1,6 +1,18 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.10.0 (2026-10-17) — DAY-0 SEAT PAIRING, DARK (Codex brief T6; S-1 lever)
+Shadow_History, October: 12 scored / 4 excluded days, all four `fresh-floor`,
+zero `no-challenger`. The starver is seat turnover (50–100 %/day): a seat with
+no prior price is in none of fresh/stale/nopair yet still counts in the floor's
+denominator (`n_fresh / len(chal_syms)`), so a day whose only defect is set
+turnover is excluded. TFB_S1_NEW_SEAT_DAY0 = legacy (default) | spot. Under
+`spot` a seat with no prior price and a fresh bar today is paired at its own
+day-0 spot (return 0, counted fresh); stale and nopair semantics are untouched;
+the [S1-FRESH] line names the day-0 seats (`day0=[…]`) and the row note carries
+`day0=N`. Default legacy is byte-identical. Scoring-integrity question for the
+Saturday sitting; this version only makes the alternative measurable.
+
 VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
 Lookup/read failures previously became empty regret or shadow history. A failed
 regret read could append an existing fork again, replace its summary and publish
@@ -461,7 +473,31 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+# v1.10.0 (2026-10-17) - DAY-0 SEAT PAIRING, DARK (Codex brief 17-Oct s3 T6)
+# -----------------------------------------------------------------------------
+# EVIDENCE (Shadow_History, 17-Oct export): October 12 scored / 4 excluded
+# (10-05, 10-08, 10-12, 10-15), every exclusion `reason=fresh-floor`, zero
+# `no-challenger`; challenger turnover 50-100 %/day; 16-Oct [S1-FRESH]
+# new=[AX,CRC,EPRT,GLPI,VICI]. A new seat has no prev price, so pairing (which
+# walks prev prices) never sees it: it is not fresh, not stale, not nopair -
+# but `_chal_frac = n_fresh / len(chal_syms)` counts it in the denominator.
+# Five new seats of ten cap fresh coverage at 50 % < 60 % even when every
+# pairable leg is fresh. The 16-Oct brief's C1 (withheld-board starvation)
+# was the wrong loop; this is the lever.
+# WHAT: TFB_S1_NEW_SEAT_DAY0 = legacy (default) | spot. Under `spot`, for the
+# equal-weight baskets (champion, challenger, EQW), a seat in today's basket
+# with no prev price and a bar strictly newer than the base row's date is
+# paired at its own day-0 spot: return 0, counted fresh. The basket return is
+# the equal-weight mean over paired legs including those zeros (the seat was
+# bought at today's close and earned nothing today). stale / nopair / seed-day
+# / benchmark semantics untouched. Read-back only when armed: `day0=[...]` on
+# the [S1-FRESH] line (verdict, S1_Gate meta cell, _Run_Log JSON) and
+# ` day0=N` on the Shadow_History note. Default legacy = byte-identical rows,
+# gate and log (the P-186 dual-tree test keeps passing).
+# Functions added: 3 (_new_seat_day0_mode, day0_spot_seats, blend_day0).
+# Removed: 0. Kill: unset the env (or any value but `spot`).
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.10.0"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -819,6 +855,7 @@ def _freshness_detail(basket_syms: List[str],
                       stale_syms: List[str],
                       floor_frac: float,
                       denom_override: Optional[int] = None,
+                      day0_syms: Optional[List[str]] = None,
                       ) -> Tuple[str, Dict[str, Any]]:
     """v1.7.3 PURE: (log line, JSON-safe details) naming WHY challenger fresh
     coverage sits where it does. `nopair` mirrors basket_return_fresh's exact
@@ -849,6 +886,9 @@ def _freshness_detail(basket_syms: List[str],
     details = {"fresh": n_fresh, "basket": denom,
                "floor_pct": round(pct, 1), "stale": stale_syms[:12],
                "nopair": nopair[:12], "new": new_syms[:12]}
+    if day0_syms:                                  # v1.10.0 [T6] armed + non-empty only
+        line += f" day0={_fmt(list(day0_syms))}"
+        details["day0"] = list(day0_syms)[:12]
     return line, details
 
 
@@ -1627,6 +1667,52 @@ def _base_policy() -> str:
         return "legacy"
 
 
+def _new_seat_day0_mode() -> str:
+    """v1.10.0 [T6]: TFB_S1_NEW_SEAT_DAY0 legacy(default)|spot. Anything else
+    -> legacy (byte-identical). Never raises."""
+    try:
+        raw = (os.getenv("TFB_S1_NEW_SEAT_DAY0") or "legacy").strip().lower()
+        return raw if raw == "spot" else "legacy"
+    except Exception:  # noqa: BLE001
+        return "legacy"
+
+
+def day0_spot_seats(basket_syms: Sequence[str],
+                    prev_prices: Optional[Dict[str, float]],
+                    spot: Dict[str, float],
+                    spot_asof: Dict[str, date],
+                    prev_date: Optional[date]) -> List[str]:
+    """v1.10.0 PURE [T6]: today's seats with NO prev price whose spot is a bar
+    strictly newer than the base row (the same honesty rule a paired leg must
+    meet). Seats without a spot, or whose bar is not newer, are NOT day-0 -
+    they stay invisible exactly as in legacy. Sorted for stable read-back."""
+    prev = prev_prices or {}
+    out: List[str] = []
+    honest = _price_honesty_enabled() and prev_date is not None
+    for s in basket_syms or []:
+        if s in prev or spot.get(s) is None:
+            continue
+        if honest:
+            a = spot_asof.get(s)
+            if a is None or a <= prev_date:
+                continue
+        out.append(s)
+    return sorted(out)
+
+
+def blend_day0(ret: Optional[float], n_fresh: int, n_day0: int
+               ) -> Tuple[Optional[float], int]:
+    """v1.10.0 PURE [T6]: fold `n_day0` zero-return legs into an equal-weight
+    mean of `n_fresh` paired legs. (None, 0, k>0) -> (0.0, k): a day whose only
+    legs are day-0 seats scores flat, not excluded. k == 0 -> unchanged."""
+    k = max(0, int(n_day0 or 0))
+    if k == 0:
+        return ret, n_fresh
+    n = max(0, int(n_fresh or 0))
+    base = 0.0 if ret is None else float(ret)
+    return (base * n) / float(n + k), n + k
+
+
 def last_scored_row_for(history: List[Dict[str, Any]], basket: str
                         ) -> Optional[Dict[str, Any]]:
     """v1.9.1 [P-186] PURE: the most recent row of `basket` that carries a
@@ -2027,6 +2113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         basket_pairs.append((BENCHMARK_EQW, eqw_syms))
 
     # ---- v1.2.0 honest pass 1: measure freshness per basket --------------- #
+    _day0_mode = _new_seat_day0_mode()             # v1.10.0 [T6]
     measured: Dict[str, Dict[str, Any]] = {}
     for basket, syms in basket_pairs:
         p = prev[basket]
@@ -2040,9 +2127,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             ret, n_fresh, n_stale, stale_syms = (
                 basket_return_fresh(p["prices"], spot, spot_asof, p_date)
                 if p else (None, 0, 0, []))
+        # v1.10.0 [T6]: under `spot`, seats with no prev price and a fresh bar
+        # are paired at their own day-0 spot (return 0, counted fresh). Seed
+        # days (no base row) and the benchmark are untouched; legacy -> [].
+        day0: List[str] = []
+        if _day0_mode == "spot" and p and basket != BENCHMARK:
+            day0 = day0_spot_seats(syms, p.get("prices"), spot, spot_asof, p_date)
+            ret, n_fresh = blend_day0(ret, n_fresh, len(day0))
         measured[basket] = {"ret": ret, "n_fresh": n_fresh,
                             "n_stale": n_stale, "stale_syms": stale_syms,
-                            "p": p}
+                            "p": p, "day0": day0}
 
     # Day gate (Register §5): the CHALLENGER is the evidence subject. If its
     # fresh coverage is under floor — or the benchmark produced no fresh leg —
@@ -2155,6 +2249,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 note += (f" stale={m['n_stale']}"
                          f"[{','.join(m['stale_syms'][:4])}"
                          f"{',…' if m['n_stale'] > 4 else ''}]")
+            if m.get("day0"):                      # v1.10.0 [T6] armed only
+                note += f" day0={len(m['day0'])}"
         if day_excluded and p and _excl_reason:    # v1.7.2 (prefix unchanged)
             note += f" reason={_excl_reason}"
         if basket == BENCHMARK_EQW:                # v1.3.0 W-7
@@ -2232,7 +2328,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         spot, _chal_m["n_fresh"], _chal_m["n_stale"],
         _chal_m["stale_syms"], _min_fresh_frac(),
         denom_override=(_bp_pairable if (_bp_mode == "lastscored" and _bp_pairable > 0)
-                        else None))                 # v1.9.1 [P-186]
+                        else None),                 # v1.9.1 [P-186]
+        day0_syms=(_chal_m.get("day0") or None) if _day0_mode == "spot" else None)  # v1.10.0 [T6]
     verdict += f" | {_fresh_line}"
     if _base_line:                                 # v1.9.1 [P-186] read-back
         verdict += f" | {_base_line}"
@@ -2947,6 +3044,34 @@ def _selftest() -> int:
     if _v2_saved is not None:
         os.environ["TFB_S1_CRITERIA_V2"] = _v2_saved
     checks.append(("V2: mode reader enforce / junk->off / unset->off", (_m1, _m2, _m3) == ("enforce", "off", "off")))
+
+    # v1.10.0 [T6] day-0 seat pairing (pure helpers; env reader)
+    _d0_saved = os.environ.get("TFB_S1_NEW_SEAT_DAY0")
+    os.environ["TFB_S1_NEW_SEAT_DAY0"] = "spot"; _d1 = _new_seat_day0_mode()
+    os.environ["TFB_S1_NEW_SEAT_DAY0"] = "SPOT "; _d2 = _new_seat_day0_mode()
+    os.environ["TFB_S1_NEW_SEAT_DAY0"] = "lastscored"; _d3 = _new_seat_day0_mode()
+    os.environ.pop("TFB_S1_NEW_SEAT_DAY0", None); _d4 = _new_seat_day0_mode()
+    if _d0_saved is not None:
+        os.environ["TFB_S1_NEW_SEAT_DAY0"] = _d0_saved
+    checks.append(("DAY0: mode reader spot / 'SPOT ' / junk->legacy / unset->legacy",
+                   (_d1, _d2, _d3, _d4) == ("spot", "spot", "legacy", "legacy")))
+    _pd = date(2026, 10, 15)
+    _d0 = day0_spot_seats(["A", "B", "C", "D", "E"],
+                          {"A": 1.0, "B": 2.0},
+                          {"A": 1.1, "B": 2.2, "C": 3.0, "D": 4.0},
+                          {"A": date(2026, 10, 16), "C": date(2026, 10, 16),
+                           "D": date(2026, 10, 15)}, _pd)
+    checks.append(("DAY0: new seat with a newer bar only (C yes; D same-day bar no; E unpriced no; A/B have prev)",
+                   _d0 == ["C"]))
+    checks.append(("DAY0: blend (10%, 5 legs) + 5 zero legs -> 5% over 10; None+0 legs -> 0.0 flat; k=0 unchanged",
+                   blend_day0(10.0, 5, 5) == (5.0, 10) and blend_day0(None, 0, 3) == (0.0, 3)
+                   and blend_day0(None, 0, 0) == (None, 0) and blend_day0(2.5, 4, 0) == (2.5, 4)))
+    _fl0, _fd0 = _freshness_detail(["A", "C"], {"A": 1.0}, {"A": 1.1, "C": 3.0}, 2, 0, [], 0.6,
+                                   day0_syms=["C"])
+    checks.append(("DAY0: [S1-FRESH] names day-0 seats only when armed",
+                   "day0=[C]" in _fl0 and _fd0["day0"] == ["C"]
+                   and "day0" not in _freshness_detail(["A", "C"], {"A": 1.0}, {"A": 1.1, "C": 3.0},
+                                                       1, 0, [], 0.6)[0]))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
