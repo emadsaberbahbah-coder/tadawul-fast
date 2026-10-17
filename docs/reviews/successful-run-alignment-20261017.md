@@ -49,6 +49,9 @@ version was updated; its local-copy default/environment/source assertions are
 unchanged. The module then passed 19 tests with its existing optional golden
 export test skipped because no private export fixture was supplied. A scan of
 19 related test files found no other stale exact-version assertions.
+The broader lean suite also caught a local XLSX path variable whose name
+matched a protected warning tag in the static reader census. It now uses the
+specific name `workbook_relationships_path`; the census guard is unchanged.
 
 The new regressions exercise actual entrypoints against fake Sheets, storage,
 provider and SMTP boundaries, including normal and deliberately failing paths.

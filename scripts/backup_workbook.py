@@ -356,9 +356,10 @@ def _validate_export_xlsx(data: bytes) -> set[str]:
         workbook_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
         if content_type(workbook_path) != workbook_type:
             fail("XLSX workbook content type is missing")
-        rel_path = posixpath.join(posixpath.dirname(workbook_path), "_rels",
-                                 posixpath.basename(workbook_path) + ".rels")
-        bindings = relationships(rel_path)
+        workbook_relationships_path = posixpath.join(
+            posixpath.dirname(workbook_path), "_rels",
+            posixpath.basename(workbook_path) + ".rels")
+        bindings = relationships(workbook_relationships_path)
         tabs = set()
         sheet_parts = set()
         for sheet in workbook.findall("{" + namespace + "}sheets/{" + namespace + "}sheet"):
