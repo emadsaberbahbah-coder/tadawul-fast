@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.17.0  (header synced to runtime; history below)
+Version: 1.18.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -822,7 +822,36 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.17.0"
+PORTFOLIO_ACTIONS_VERSION = "1.18.0"
+
+# v1.18.0 (2026-10-17) - [C4 SWITCH ADVISORY COLUMN] SURFACE WHAT THE SWITCH
+# SCAN ALREADY COMPUTES (Codex brief 17-Oct section 4, C4).
+# WHY: TFB_PF_SWITCH_SCAN=1 is live, but its proposals reach only
+# meta.switch_scan and the [PF SWITCH] log line (F15); Shadow_Board showed
+# 24 switch pairs on 17-Oct (e.g. sell KRP -> buy ATAT, delta 23.98% vs
+# hurdle 1.2%) that no holding row ever displayed. _run_switch_scan stamps
+# switch_note onto the holding dicts AFTER the action rows were rendered, so
+# the note never reached a row.
+# WHAT: _stamp_switch_advisory(action_rows, sw_meta) runs right after the
+# scan on the verified path: the best pair per holding (highest delta over
+# proposals + persist_pending; a confirmed pair wins a tie) becomes
+# row["switch_advisory"] = "switch: -> ATAT delta+24.0% (adv)" (a day-1 pair
+# reads "(adv, day 1/2)") and row["detail"]["switch_advisory"] = {buy,
+# delta_pct, hurdle_pct, persist_day, precedence} where precedence is the
+# section 4.7 note: the rule verdict and the funded action above stand;
+# advisory only, never an order. advisor_note, action, sizing, KPIs and
+# meta.switch_scan are untouched (meta.switch_scan gains advisory_rows).
+# GATE: rides TFB_PF_SWITCH_SCAN (no scan -> no field); kill-switch
+# TFB_PF_SWITCH_ADVISORY_LEGACY=1 removes the field and the counter (the
+# v1.17.0 payload under a live scan). The GAS column is Script-Property
+# gated on its side (10_My_Portfolio v1.5.15, PD_SWITCH_ADVISORY_COL).
+# Read-back harness tests/test_pf_switch_advisory_c4.py covers the scan with
+# TFB_PF_RESEARCH_VIEW off / observe / enforce and TFB_PF_UNCERTIFIED_VIEW on:
+# the advisory exists only on the verified (certified) path; the protective
+# paths carry their own view markers and never a switch field.
+# Functions added: 3 (_env_switch_advisory_legacy, _switch_advisory_text,
+#   _stamp_switch_advisory); constant SWITCH_ADVISORY_PRECEDENCE. Removed: 0.
+#   Rollback: TFB_PF_SWITCH_ADVISORY_LEGACY=1 or revert.
 
 # v1.17.0 (2026-10-17) - [C1 / C3 UNCERTIFIED VIEW] HOLD-UNCERTIFIED, NOT
 # BLOCK-WITH-ZEROS; CASH FALLBACK FROM THE LEDGER SNAPSHOT (Codex brief 17-Oct
@@ -1770,6 +1799,74 @@ def _switch_candidate_eligible(c):
         return _to_float((c or {}).get("roi_pct")) is not None
     except Exception:
         return False
+
+
+SWITCH_ADVISORY_PRECEDENCE = ("section 4.7 precedence: the rule verdict and the funded "
+                              "action stand; a switch is advisory only, never an order")
+
+
+def _env_switch_advisory_legacy():
+    """v1.18.0 [C4] kill-switch: TFB_PF_SWITCH_ADVISORY_LEGACY=1 removes the
+    per-row switch advisory (the v1.17.0 payload under a live scan)."""
+    return str(os.environ.get("TFB_PF_SWITCH_ADVISORY_LEGACY", "")).strip() == "1"
+
+
+def _switch_advisory_text(prop):
+    """v1.18.0 [C4] PURE: 'switch: -> ATAT delta+24.0% (adv)'; a day-1 pair
+    (not yet persisted twice) reads '(adv, day 1/2)'."""
+    buy = str((prop or {}).get("buy") or "?")
+    delta = _to_float((prop or {}).get("delta_pct")) or 0.0
+    try:
+        day = int((prop or {}).get("persist_day") or 1)
+    except (TypeError, ValueError):
+        day = 1
+    tag = "adv" if day >= 2 else "adv, day %d/2" % max(1, day)
+    return "switch: \u2192 %s \u0394%+.1f%% (%s)" % (buy, delta, tag)
+
+
+def _stamp_switch_advisory(action_rows, sw_meta):
+    """v1.18.0 [C4]: the best pair per holding from the scan's proposals
+    (confirmed and pending) onto the rendered rows -- display-only; the
+    action, note, sizing and KPIs are untouched. Returns the row count."""
+    if not isinstance(sw_meta, dict) or _env_switch_advisory_legacy():
+        return 0
+    best = {}
+    for prop in list(sw_meta.get("proposals") or []) + list(sw_meta.get("persist_pending") or []):
+        if not isinstance(prop, dict):
+            continue
+        sell = str(prop.get("sell") or "")
+        if not sell:
+            continue
+        delta = _to_float(prop.get("delta_pct")) or 0.0
+        cur = best.get(sell)
+        if cur is None:
+            best[sell] = prop
+            continue
+        cur_delta = _to_float(cur.get("delta_pct")) or 0.0
+        if delta > cur_delta or (delta == cur_delta and
+                                 int(prop.get("persist_day") or 0) > int(cur.get("persist_day") or 0)):
+            best[sell] = prop
+    stamped = 0
+    for row in action_rows or []:
+        if not isinstance(row, dict):
+            continue
+        prop = best.get(str(row.get("symbol") or ""))
+        if not prop:
+            continue
+        row["switch_advisory"] = _switch_advisory_text(prop)
+        detail = row.get("detail")
+        if not isinstance(detail, dict):
+            detail = {}
+            row["detail"] = detail
+        detail["switch_advisory"] = {
+            "buy": prop.get("buy"), "delta_pct": _round(prop.get("delta_pct")),
+            "hurdle_pct": _round(prop.get("hurdle_pct")),
+            "persist_day": prop.get("persist_day"),
+            "precedence": SWITCH_ADVISORY_PRECEDENCE,
+        }
+        stamped += 1
+    sw_meta["advisory_rows"] = stamped
+    return stamped
 
 
 def _run_switch_scan(cands, ctl):
@@ -4519,6 +4616,8 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
                         and c.get("cost_sar") is not None)
 
     _sw_meta = _run_switch_scan(cands, ctl) if _env_switch_scan() else None
+    if _sw_meta:
+        _stamp_switch_advisory(action_rows, _sw_meta)   # v1.18.0 [C4] display-only
 
     payload = {
         "version": PORTFOLIO_ACTIONS_VERSION,

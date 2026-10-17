@@ -1,7 +1,26 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.14
+ * Version: 1.5.15
+ *
+ * v1.5.15 MAIN CHANGES  (SWITCH ADVISORY COLUMN -- Codex brief 2026-10-17 C4,
+ *                        cockpit half; applies only when Script Property
+ *                        PD_SWITCH_ADVISORY_COL = on; ALL v1.5.14 logic
+ *                        carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY: portfolio_actions v1.18.0 puts the best switch pair per holding on
+ * the row (switch_advisory: 'switch: -> ATAT delta+24.0% (adv)', with the
+ * section 4.7 precedence in detail) when the live switch scan proposes one.
+ * WHAT: with the property on, the ACTIONS table gains a 27th column
+ * 'Switch (adv)' after Advisor Note (pdActionHeaders_, pure) filled from
+ * a.switch_advisory (pdSwitchAdvisoryCell_, pure); the sheet gains the
+ * column when narrower. PD_ACTION_HEADERS itself is untouched, so the
+ * Portfolio_Action_Log width contract (26 -> 32) is unchanged. Property
+ * absent/off (default): headers, rows, formats and the off-mode golden are
+ * byte-identical to v1.5.14. Functions added: pdSwitchAdvisoryColOn_,
+ * pdActionHeaders_, pdSwitchAdvisoryCell_; var PD_SWITCH_COL_PROP.
+ * Removed: 0. pdSelfTest reports the property state and the header width.
+ * Harness: tests/js/pf_switch_advisory_col.test.js.
  *
  * v1.5.14 MAIN CHANGES  (UNCERTIFIED-VIEW CONTEXT + LEDGER CASH SNAPSHOT --
  *                        Codex brief 2026-10-17 C1 / C3, cockpit half; applies
@@ -2580,7 +2599,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.14';
+var PD_VERSION = '1.5.15';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3107,6 +3126,31 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
   return mode === 'observe'
       ? ' | [receipt-observe] would publish ' + verdict
       : ' | source readiness ' + verdict;
+}
+
+/* ----- v1.5.15 [C4] switch advisory column (gated) ---------------------------- */
+var PD_SWITCH_COL_PROP = 'PD_SWITCH_ADVISORY_COL';   /* off (default) | on */
+/** Script Property PD_SWITCH_ADVISORY_COL = 'on' -> the ACTIONS table gains
+ * the 'Switch (adv)' column; anything else -> off (render byte-identical to
+ * v1.5.14). Never throws. */
+function pdSwitchAdvisoryColOn_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(PD_SWITCH_COL_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (e) {
+    return false;
+  }
+}
+/** PURE: the ACTIONS headers for this render -- PD_ACTION_HEADERS itself
+ * (the action-log width contract) or a copy with 'Switch (adv)' appended. */
+function pdActionHeaders_(on) {
+  if (on !== true) return PD_ACTION_HEADERS;
+  return PD_ACTION_HEADERS.concat(['Switch (adv)']);
+}
+/** PURE: the 'Switch (adv)' cell -- the backend's switch_advisory text or ''. */
+function pdSwitchAdvisoryCell_(a) {
+  return pdCell_(a && a.switch_advisory);
 }
 
 /* ----- v1.5.14 [C1 / C3] uncertified-view context + ledger cash snapshot ----- */
@@ -4281,10 +4325,16 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
   row = pdWriteSection_(sheet, row,
       'ACTIONS \u2014 one per holding (' + actions.length + ')', tokens);
   var aRows = [];
+  var swCol = pdSwitchAdvisoryColOn_();   /* v1.5.15 [C4] */
+  var aHeaders = pdActionHeaders_(swCol);
   for (var a = 0; a < actions.length; a++) {
     aRows.push(pdActionToRow_(actions[a]));
+    if (swCol) aRows[aRows.length - 1].push(pdSwitchAdvisoryCell_(actions[a]));
   }
-  var aT = pdWriteTable_(sheet, row, PD_ACTION_HEADERS, aRows,
+  if (swCol && sheet.getMaxColumns() < aHeaders.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), aHeaders.length - sheet.getMaxColumns());
+  }
+  var aT = pdWriteTable_(sheet, row, aHeaders, aRows,
       'No holdings \u2014 refresh My_Portfolio first, or the portfolio is ' +
       'empty (an honest result, L13).');
   pdApplyColFormats_(sheet, aT.firstDataRow, aT.count, {
@@ -4297,6 +4347,10 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
   pdColorActions_(sheet, aT.firstDataRow, aT.count, 1, tokens);
   if (aT.firstDataRow > 0) {
     sheet.getRange(aT.firstDataRow, PD_LAST_COL, aT.count, 1)
+        .setWrap(true).setFontSize(9);
+  }
+  if (swCol && aT.firstDataRow > 0) {   /* v1.5.15 [C4]: wrap the advisory column */
+    sheet.getRange(aT.firstDataRow, aHeaders.length, aT.count, 1)
         .setWrap(true).setFontSize(9);
   }
   row = aT.next + 1;
@@ -4592,6 +4646,13 @@ function pdSelfTest() {
         pdUncertifiedContext_(null, true, 0) === null &&
         pdActionLabel_({action: 'HOLD', detail: {uncertified: true}}) === 'HOLD (uncertified)' &&
         pdActionLabel_({action: 'HOLD'}) === 'HOLD') ? 'ok' : 'FAIL'));
+  report.push('switch advisory col (' + PD_SWITCH_COL_PROP + '): ' +   /* v1.5.15 [C4] */
+      (pdSwitchAdvisoryColOn_() ? 'on' : 'off (default)') + ' | headers ' +
+      pdActionHeaders_(pdSwitchAdvisoryColOn_()).length + ' | core: ' +
+      ((pdActionHeaders_(true).length === PD_ACTION_HEADERS.length + 1 &&
+        pdActionHeaders_(false) === PD_ACTION_HEADERS &&
+        pdSwitchAdvisoryCell_({switch_advisory: 'x'}) === 'x' &&
+        pdSwitchAdvisoryCell_({}) === '') ? 'ok' : 'FAIL'));
   report.push('backend: ' + pdBackendUrl_());
   report.push('token set: ' + (pdAppToken_() ? 'yes' : 'NO'));
   var fx = pdFxRates_(ss);
