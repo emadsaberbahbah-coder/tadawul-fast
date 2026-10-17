@@ -14,6 +14,12 @@ import re
 from typing import Iterable, Sequence
 
 
+SCRIPT_VERSION = "1.0.1"
+# WHY (2026-10-16): an optional Variables mapping is not a live readback.
+# Warn for literal nonempty force-refetch overrides only; expressions and
+# empty YAML values do not prove that an override is currently active.
+
+
 CURRENT_ACTION_MAJORS = {
     "actions/checkout": 6,
     "actions/setup-python": 6,
@@ -101,14 +107,19 @@ def audit_workflow_text(path: str, text: str) -> list[Finding]:
         ))
 
     for match in re.finditer(
-        r"(?m)^\s*TFB_SYNC_FORCE_REFETCH_SYMBOLS\s*:\s*.+$", text
+        r"(?m)^[ \t]*TFB_SYNC_FORCE_REFETCH_SYMBOLS[ \t]*:[ \t]*(?P<value>[^\n]*)$", text
     ):
+        value = match.group("value").strip()
+        if "${{" in value or not value or value.startswith("#"):
+            continue
+        if re.fullmatch(r'''(?:''|""|null|~)[ \t]*(?:\#.*)?''', value, flags=re.IGNORECASE):
+            continue
         findings.append(Finding(
             "WARN",
             "TEMPORARY_OVERRIDE_ACTIVE",
             path,
             _line_number(text, match.start()),
-            "one-run force-refetch override remains active; verify and remove after the repair run",
+            "literal force-refetch override is configured; verify and remove after the repair run",
         ))
 
     id_token = re.search(r"(?m)^\s*id-token\s*:\s*write\s*$", text)

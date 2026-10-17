@@ -3,9 +3,20 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.69.1 - count-only acquisition diagnostics (2026-10-16)
+================================================================================
+WHY: scheduled run 38821487562 wrote 6,609 Global_Markets rows but certified
+only 6,160 successful acquisitions. The existing final census retained reason
+counts privately in _stamp_meta and the live _Status message, while uploaded
+runner JSON and stdout omitted them. Publish a strict whitelist of those
+existing counts/reason codes in both local evidence channels, after the final
+restoration census. Unknowns remain unknown. No raw metadata, symbols, names,
+prices, timestamps or provider responses enter this diagnostic. Published cells,
+coverage thresholds, acquisition classification and every policy gate are intact.
 
 v6.69.0 - full typed final market-payload intent digest (2026-10-12)
 ================================================================================
@@ -2102,7 +2113,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.69.0"
+SCRIPT_VERSION = "6.69.1"
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -3102,6 +3113,7 @@ class TaskResult:
             "error": redact_text(self.error) if isinstance(self.error, str) else self.error,
             "request_id": self.request_id,
             "version": SCRIPT_VERSION,
+            "acquisition": _acquisition_diagnostics(self),
             **({"write_receipt": dict(self._stamp_meta["write_receipt"])}
                if self._stamp_meta.get("write_receipt") else {}),
         }
@@ -12791,6 +12803,69 @@ def _record_acquisition_census(res: Any, headers: Any, rows: Any,
     return set(success)
 
 
+_ACQUISITION_DIAGNOSTIC_REASONS = frozenset({
+    "failed_or_quarantined_or_preserved", "column_alias_conflict",
+    "symbol_alias_conflict", "symbol_domain_invalid", "nonlive_provider",
+    "price_missing_or_invalid", "provider_unknown", "provider_instrument_unsupported",
+    "acquisition_proof_conflict", "acquisition_preserved", "acquisition_unavailable",
+    "acquisition_failed", "acquisition_conflict", "acquisition_proof_missing",
+    "acquisition_provider_unknown", "acquisition_provider_invalid",
+    "acquisition_provider_conflict", "quote_timestamp_invalid", "quote_timestamp_conflict",
+    "acquisition_time_unknown", "acquired_timestamp_precision_unknown",
+    "acquired_timestamp_policy_invalid", "acquired_timestamp_basis_invalid",
+    "acquired_timestamp_future", "acquired_timestamp_stale", "quote_after_acquisition",
+    "response_missing", "preserved_or_replaced_origin",
+})
+_ACQUISITION_DIAGNOSTIC_PAGES = frozenset({
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+    "My_Portfolio", "Insights_Analysis", "Top_10_Investments", "Data_Dictionary",
+})
+
+
+def _acquisition_diagnostic_count(value: Any) -> Optional[int]:
+    """Only genuine nonnegative counters; malformed metadata stays unknown."""
+    return value if type(value) is int and 0 <= value <= 1_000_000 else None
+
+
+def _acquisition_diagnostics(res: Any) -> Dict[str, Any]:
+    """Project final existing census counts, never arbitrary _stamp_meta."""
+    raw_meta = getattr(res, "_stamp_meta", None)
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    known = meta.get("acquisition_known") is True
+    requested = meta.get("requested") if known else getattr(res, "symbols_requested", None)
+    counts = {
+        "schema_version": 1, "known": known,
+        "requested": _acquisition_diagnostic_count(requested),
+    }
+    for field, key in (
+        ("successful", "acquired_fresh"), ("timestamp_fresh", "timestamp_fresh"),
+        ("quote_asof_known", "quote_asof_known"), ("unknown", "acquisition_unknown"),
+        ("invalid", "acquisition_invalid"), ("noncurrent_fetched", "noncurrent_fetched"),
+    ):
+        counts[field] = _acquisition_diagnostic_count(meta.get(key)) if known else None
+    reasons: Dict[str, int] = {}
+    raw_reasons = meta.get("acquisition_reasons")
+    if known and isinstance(raw_reasons, dict):
+        for key, value in raw_reasons.items():
+            count = _acquisition_diagnostic_count(value)
+            if count is None or count == 0:
+                continue
+            reason = key if isinstance(key, str) and key in _ACQUISITION_DIAGNOSTIC_REASONS else "other_reason"
+            # Unknown future reasons retain their count without publishing
+            # arbitrary text supplied through a metadata or provider field.
+            reasons[reason] = min(1_000_000, reasons.get(reason, 0) + count)
+    counts["reason_counts"] = dict(sorted(reasons.items()))
+    return counts
+
+
+def _emit_acquisition_diagnostics(res: Any) -> None:
+    """One count-only console receipt after the final census; no Sheet I/O."""
+    page = getattr(res, "sheet_name", "")
+    label = page if isinstance(page, str) and page in _ACQUISITION_DIAGNOSTIC_PAGES else "unrecognized"
+    logger.info("[ACQUISITION-DIAGNOSTICS v%s] page=%s evidence=%s", SCRIPT_VERSION,
+                label, json.dumps(_acquisition_diagnostics(res), sort_keys=True, separators=(",", ":")))
+
+
 def _mark_preserved_acquisitions(headers: Any, rows: Any, restored_symbols: Any) -> int:
     """Keep restoration provenance in the published canonical warning cell.
 
@@ -14644,6 +14719,10 @@ async def _run_one_task(
                 res._stamp_meta["acquisition_known"] = False
                 res._stamp_meta["acquired_fresh"] = None
                 res.warnings.append(f"Acquisition evidence unavailable: {type(exc).__name__}")
+        try:
+            _emit_acquisition_diagnostics(res)
+        except Exception:
+            pass  # Diagnostics never change the task or publication outcome.
         # --- v6.39.1 (W1A-4b) BACKEND _Status STAMP (moved to finally) -------
         # External audit P0-3, ACCEPTED: the terminus-only stamp missed every
         # early return (skips, identity fails, floor vetoes) and ran before

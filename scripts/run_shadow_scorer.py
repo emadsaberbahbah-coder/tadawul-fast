@@ -1,6 +1,14 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.4 (2026-10-16) — FAIL THE RUN ON PUBLICATION ERRORS
+WHY: independently guarded writes could all fail while main returned zero
+and _Run_Log declared OK. Keep attempting every output so partial failures
+cannot suppress other evidence, but report WRITE_FAILED/ERROR and exit 1 on
+any publication failure. Diagnostics contain only fixed artifact names and
+exception classes, never exception payloads. A successfully published S-1
+FAIL is still a successful execution; criteria, prices and policy are unchanged.
+
 VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
 Lookup/read failures previously became empty regret or shadow history. A failed
 regret read could append an existing fork again, replace its summary and publish
@@ -461,7 +469,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+SCRIPT_VERSION = "1.9.4"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -2311,7 +2319,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _fn()
         except Exception as _exc:  # noqa: BLE001
             _write_errors.append(f"{_label}:{type(_exc).__name__}")
-            print(f"[S1-GATE v{SCRIPT_VERSION}] WRITE FAILED {_label}: {_exc}")
+            print(f"[S1-GATE v{SCRIPT_VERSION}] WRITE FAILED {_label}:{type(_exc).__name__}; "
+                  "partial writes possible; no rollback attempted")
     if _write_errors:
         verdict += " | write_errors=" + ",".join(_write_errors)
     _rl_details: Dict[str, Any] = {"version": SCRIPT_VERSION,
@@ -2328,16 +2337,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                                       "fresh_frac_used": round(_chal_frac, 4)}
     if _v2_line:                                   # v1.9.2 armed only
         _rl_details["criteria_v2"] = gate.get("v2")
+    if _write_errors:
+        _rl_details["publication_errors"] = list(_write_errors)
     try:
         sh.worksheet("_Run_Log").append_row(
-            [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
+            [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+             "ERROR" if _write_errors else "INFO",
              "shadow_scorer", TAB_GATE,
-             "OK" if gate["verdict"] != "FAIL" else "GATE_FAIL", verdict,
+             "WRITE_FAILED" if _write_errors else ("OK" if gate["verdict"] != "FAIL" else "GATE_FAIL"), verdict,
              "", "", "", json.dumps(_rl_details)],
             value_input_option="RAW")
-    except Exception:  # noqa: BLE001
-        pass
-    return 0
+    except Exception as _exc:  # noqa: BLE001
+        _write_errors.append(f"_Run_Log:{type(_exc).__name__}")
+        print(f"[S1-GATE v{SCRIPT_VERSION}] WRITE FAILED _Run_Log:{type(_exc).__name__}; "
+              "partial writes possible; no rollback attempted")
+    return 1 if _write_errors else 0
 
 
 # --------------------------------------------------------------------------- #

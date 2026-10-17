@@ -204,7 +204,8 @@ def main():
 
 
     def _strip_version(txt):
-        return str(txt).replace("v1.9.1", "vX").replace("v1.9.0", "vX")
+        # Compare behavior independently of a compatible producer patch stamp.
+        return str(txt).replace(f"v{s1.SCRIPT_VERSION}", "vX").replace("v1.9.0", "vX")
 
 
     # ---------------------------------------------------------------- B2 ------ #
@@ -265,7 +266,7 @@ def main():
     assert [json.dumps(rows_obs[b]) for b in ("CHAMPION", "CHALLENGER", "BENCHMARK")] == \
            [json.dumps(rows_leg[b]) for b in ("CHAMPION", "CHALLENGER", "BENCHMARK")], "observe must write legacy rows"
     v_obs = runlog_last(sh_obs)[5]
-    assert "[S1-BASE v1.9.3] mode=observe" in v_obs, v_obs
+    assert f"[S1-BASE v{s1.SCRIPT_VERSION}] mode=observe" in v_obs, v_obs
     assert f"chal legacy={legacy_chal:+.4f}%@2026-09-29 lastscored={ls_chal:+.4f}%@2026-09-28 legs=5/5" in v_obs, v_obs
     assert f"bench legacy={legacy_bench:+.4f}% lastscored={ls_bench:+.4f}%" in v_obs, v_obs
     assert "fresh_den legacy=3 pairable=5" in v_obs and "chal fresh=5/3" in v_obs, v_obs
@@ -273,7 +274,7 @@ def main():
     print("B4 PASS  observe: legacy rows written; read-back", tok)
     digest_parts.append([v_obs.split("[S1-BASE")[1][:160]])
     # the gate meta row carries the token too
-    assert any("[S1-BASE v1.9.3] mode=observe" in json.dumps(r) for r in gate_rows(sh_obs))
+    assert any(f"[S1-BASE v{s1.SCRIPT_VERSION}] mode=observe" in json.dumps(r) for r in gate_rows(sh_obs))
 
     # ---------------------------------------------------------------- B5 ------ #
     sh_ls = fresh_sheet(history_live_shape())
@@ -283,7 +284,7 @@ def main():
     assert abs(float(rows_ls["CHALLENGER"][4]) - round(ls_chal, 4)) < 1e-6, rows_ls["CHALLENGER"]
     assert abs(float(rows_ls["BENCHMARK"][4]) - round(ls_bench, 4)) < 1e-6, rows_ls["BENCHMARK"]
     v_ls = runlog_last(sh_ls)[5]
-    assert "[S1-BASE v1.9.3] mode=lastscored" in v_ls and "chal fresh=5/5" in v_ls and "day_scored" in v_ls, v_ls
+    assert f"[S1-BASE v{s1.SCRIPT_VERSION}] mode=lastscored" in v_ls and "chal fresh=5/5" in v_ls and "day_scored" in v_ls, v_ls
     # index chains: 09-28 index x (1 + ret - drag)
     i28 = 104.88; drag = float(rows_ls["CHALLENGER"][7])
     assert abs(float(rows_ls["CHALLENGER"][5]) - s1.chain_index(i28, ls_chal, drag)) < 1e-5, (rows_ls["CHALLENGER"][5], s1.chain_index(i28, ls_chal, drag))
@@ -310,7 +311,7 @@ def main():
     n_h = len(sh_dry.tabs[s1.TAB_HISTORY].rows); n_rl = len(sh_dry.tabs["_Run_Log"].rows)
     rc, out_dry = run_at(s1, "2026-09-30T15:20:00Z", sh_dry, P30, "2026-09-30", policy="lastscored", argv=["--dry-run"])
     assert rc == 0 and len(sh_dry.tabs[s1.TAB_HISTORY].rows) == n_h and len(sh_dry.tabs["_Run_Log"].rows) == n_rl
-    assert "[S1-BASE v1.9.3] mode=lastscored" in out_dry
+    assert f"[S1-BASE v{s1.SCRIPT_VERSION}] mode=lastscored" in out_dry
     print("B7 PASS  --dry-run under lastscored: zero writes, read-back printed")
     digest_parts.append([n_h, n_rl])
 
