@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.16.0  (header synced to runtime; history below)
+Version: 1.16.2  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
+
+v1.16.2 (2026-10-17) WHY — the engine's optional tiny-price precision was
+lost again at this page's two-decimal price/level boundary and one-decimal
+advisor text. Reuse TFB_PRICE_PRECISION (default off) for prices only, with
+the existing two-decimal baseline and seven significant digits below 10.
+An armed-only meta.price_precision receipt lets the native renderer use the
+same mode; off omits it and retains legacy output. Unknown prices/levels,
+financial totals, quantities, returns, decisions and funding are unchanged.
 
 v1.7.2 [B-7 ABSENT LEVELS RENDER BLANK, NEVER 0]: an absent stop/TP was
 being coerced to a printed 0.0. The idiom `(cand.get("tp1") or 0) * fx`
@@ -348,6 +356,11 @@ from datetime import datetime, timedelta, timezone
 import logging
 
 from core.secret_redaction import safe_error_text
+from core.price_precision import (
+    price_precision_enabled as _price_precision_enabled,
+    price_round_digits as _price_round_digits,
+    round_price as _precision_round_price,
+)
 from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
 from core.portfolio_reconciliation import MAX_HOLDINGS, certify_portfolio_inputs, certification_summary
 from core.execution_accounting import AccountingError, _number
@@ -833,7 +846,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # more proceeds than the sized sale or the existing policy amount.
 # When the existing fee-funding flag actually debits fees, report unallocated
 # capital from that exact remaining ledger; funded principal stays separate.
-PORTFOLIO_ACTIONS_VERSION = "1.16.1"
+PORTFOLIO_ACTIONS_VERSION = "1.16.2"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -2220,12 +2233,12 @@ def _cost_basis_block_reason(avg_cost_raw, current_price, position_qty,
         return (False,
                 "BLOCKED — review cost basis (buy price %s is %.1fx the "
                 "current price %s — likely a data-entry error)"
-                % (_fmt(cost), ratio, _fmt(price)))
+                % (_fmt_price(cost), ratio, _fmt_price(price)))
     if ratio < min_r:
         return (False,
                 "BLOCKED — review cost basis (buy price %s is %.2fx the "
                 "current price %s — likely a data-entry error)"
-                % (_fmt(cost), ratio, _fmt(price)))
+                % (_fmt_price(cost), ratio, _fmt_price(price)))
     return True, None
 
 
@@ -3111,6 +3124,26 @@ def _round(v, nd=2):
         return None
 
 
+def _round_price(v, nd=2):
+    """Price-only precision; retain _round's null/non-finite contract."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return _precision_round_price(f, nd) if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_price(v):
+    """Keep tiny armed levels readable without changing money/return text."""
+    if _price_precision_enabled() and v is not None:
+        f = float(v)
+        if math.isfinite(f) and 0 < abs(f) < 10:
+            return format(f, ".%df" % _price_round_digits(f, 2)).rstrip("0").rstrip(".")
+    return _fmt(v)
+
+
 def _null_levels_enabled():
     """v1.7.2 B-7 kill-switch. Default ON: an absent price level renders
     blank, never 0. TFB_PF_NULL_LEVELS=0 restores v1.7.1 coercion."""
@@ -3156,7 +3189,7 @@ def _level_sar(level, fx, nd=2):
     if not fx:
         return None
     if not _null_levels_enabled():
-        return _round((level or 0) * fx, nd)
+        return _round_price((level or 0) * fx, nd)
     if level is None:
         return None
     try:
@@ -3165,7 +3198,7 @@ def _level_sar(level, fx, nd=2):
         return None
     if not math.isfinite(f) or f <= 0:
         return None
-    return _round(f * fx, nd)
+    return _round_price(f * fx, nd)
 
 
 def _advisor_sentence(entry, controls, review_date):
@@ -3203,10 +3236,10 @@ def _advisor_sentence(entry, controls, review_date):
         _t2 = _level_sar(cand.get("tp2"), fx)
         if _null_levels_enabled() and (_t1 is None or _t2 is None):
             bits.append("stop %s SAR; no TP ladder — no valuation reference"
-                        % _fmt(_s))
+                        % _fmt_price(_s))
         else:
             bits.append("stop %s / TP1 %s / TP2 %s SAR"
-                        % (_fmt(_s), _fmt(_t1), _fmt(_t2)))
+                        % (_fmt_price(_s), _fmt_price(_t1), _fmt_price(_t2)))
     bits.append("confidence %s" % conf)
     bits.append("review by %s" % review_date)
     return "; ".join(bits) + "."
@@ -3523,9 +3556,9 @@ def _action_row(entry, review_date, controls):
         "currency": cand.get("currency"),
         "fx_to_sar": _round(fx, 4),
         "quantity": cand.get("quantity"),
-        "avg_cost": _round(cand.get("avg_cost")),
-        "price": _round(cand.get("price")),
-        "price_sar": _round(cand["price"] * fx) if cand.get("price") is not None and fx else None,
+        "avg_cost": _round_price(cand.get("avg_cost")),
+        "price": _round_price(cand.get("price")),
+        "price_sar": _round_price(cand["price"] * fx) if cand.get("price") is not None and fx else None,
         "market_value_sar": _round(cand.get("market_value_sar"), 0),
         "cost_sar": _round(cand.get("cost_sar"), 0),
         "pnl_sar": _round(cand.get("pnl_sar"), 0),
@@ -3549,8 +3582,8 @@ def _action_row(entry, review_date, controls):
         "advisor_note": note,
         "detail": {
             "valuation_basis": cand.get("valuation_basis"),
-            "target_price": _round(cand.get("target_price")),
-            "intrinsic_value": _round(cand.get("intrinsic_value")),
+            "target_price": _round_price(cand.get("target_price")),
+            "intrinsic_value": _round_price(cand.get("intrinsic_value")),
             "engine_forecast_roi_pct": detail_engine_roi,
             "engine_recommendation": cand.get("recommendation"),
             "risk_level": cand.get("risk_level") or "Unknown",
@@ -3623,17 +3656,21 @@ def build_portfolio_actions(rows, controls=None, fx_rates=None,
     """Main entry point. rows = GAS holdings dicts (display headers ok)."""
     ctl = make_controls(controls)
     if not _env_enabled():
-        return _json_sanitize(_skeleton("disabled", "TFB_PF_ENABLED=0", ctl))
-    if _ob is None:
-        return _json_sanitize(_skeleton(
-            "unavailable",
-            "opportunity_builder import failed: " + _OB_IMPORT_ERROR, ctl))
-    try:
-        return _json_sanitize(_build(rows or [], ctl, fx_rates or {},
-                                     upstream_meta or {}))
-    except Exception as exc:  # honest failure, never a fabricated page
-        sk = _skeleton("error", "%s: %s" % (type(exc).__name__, exc), ctl)
-        return _json_sanitize(sk)
+        result = _skeleton("disabled", "TFB_PF_ENABLED=0", ctl)
+    elif _ob is None:
+        result = _skeleton("unavailable",
+            "opportunity_builder import failed: " + _OB_IMPORT_ERROR, ctl)
+    else:
+        try:
+            result = _build(rows or [], ctl, fx_rates or {}, upstream_meta or {})
+            if _price_precision_enabled():
+                result["meta"]["price_precision"] = "on"
+            return _json_sanitize(result)
+        except Exception as exc:  # honest failure, never a fabricated page
+            result = _skeleton("error", "%s: %s" % (type(exc).__name__, exc), ctl)
+    if _price_precision_enabled():
+        result["meta"]["price_precision"] = "on"
+    return _json_sanitize(result)
 
 
 def _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification):

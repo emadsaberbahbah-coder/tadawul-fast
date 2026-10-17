@@ -1,0 +1,119 @@
+{
+  "schema": "tfb.decision-pages-completion-review/v1",
+  "review_date": "2026-10-17",
+  "base_pr": 791,
+  "base_commit": "afbfc13b10c28e4d51912f01f1bfafb33b27e878",
+  "preserved_reliability_pr": 785,
+  "orchestrator_source_pr": 788,
+  "orchestrator_source_commit": "64c7ec9b04bb639bcfb56f405ac2fd2e5e140ec4",
+  "publication_authorized": false,
+  "live_settings_changed": false,
+  "writers_or_email_replayed": false,
+  "monitoring_window_extended": false,
+  "source_of_name_counts": "uploaded workbook; not a fresh live measurement",
+  "name_gaps": {
+    "Global_Markets": {
+      "rows": 6609,
+      "missing_names": 129,
+      "verified_names_needed_for_99pct": 63
+    },
+    "Mutual_Funds": {
+      "rows": 2474,
+      "missing_names": 25,
+      "verified_names_needed_for_99pct": 1
+    },
+    "reviewed_caption_replay_applied": 0,
+    "metadata_conflicts": 20,
+    "nonactionable_evidence_missing": 1,
+    "unregistered": 133,
+    "new_pipeline_defect_proved": false
+  },
+  "policy_changes": [],
+  "prohibited_inferences": [
+    "Unmerged code improved production outcomes",
+    "A completed WITHHELD render authorizes funding",
+    "An earlier readiness read proves the rendered source cohort",
+    "Missing names can be replaced with symbols",
+    "Offline tests attest the installed bound Apps Script source",
+    "These repairs measure overall project performance or investment return"
+  ],
+  "stored_backup_verification": {
+    "source_run": 38990567104,
+    "actual_remote_object_downloaded": true,
+    "live_sheet_reexported": false,
+    "bytes": 23735837,
+    "same_run_sha256_match": true,
+    "zip_members_crc_checked": 171,
+    "xml_relationship_parts_parsed": 168,
+    "actual_tabs": 52,
+    "missing_tabs": 0,
+    "extra_tabs": 0,
+    "core_tabs_passed": 6,
+    "visible_tabs": 9,
+    "hidden_tabs": 43,
+    "formula_and_cached_value_modes_opened": true,
+    "bounded_rows_per_tab": 12,
+    "bounded_columns_per_tab": 156,
+    "financial_cells_published": false,
+    "google_import_or_recalculation_verified": false,
+    "apps_script_trigger_permission_restore_verified": false,
+    "production_restore_performed": false,
+    "business_data_quality_accepted": null
+  },
+  "source_versions": {
+    "portfolio_actions": "1.16.2",
+    "opportunity_builder": "1.26.2",
+    "native_portfolio": "1.5.16",
+    "native_top10": "1.13.12",
+    "decision_chain": "1.0.1",
+    "ci": "1.1.26",
+    "deployment_manifest": "1.0.67"
+  },
+  "native_source_sha256": {
+    "10_My_Portfolio.gs": "e8ca2b7961b0d61e5075daf59fbdf5a81fd3cda2764093d27af6395f29d1b601",
+    "16_Decision_Top10.gs": "b4f8319c0d20977efc514dc7dd2f798ecbf32f772b86cec261d7b18f72705132",
+    "26_Decision_Chain.gs": "d21abaeabec5e1dd1f6fa543e48f64f5a7b8528372a80544cdae4b07b8d8b4ae"
+  },
+  "runtime_invariants": [
+    "Default-off chain reads only its mode property; no spreadsheet/HTTP/state/trigger work",
+    "Completed output is distinct from proven no-action deferral and unverified consumption",
+    "Same run with a newer publication has a different completion identity",
+    "Expired unfinalized claim blocks all new writes until reconciliation",
+    "Only the owning nonce/action/run/start/publication can finish a claim",
+    "Operational failures and rendered-unverified outcomes retain the bounded three-attempt budget",
+    "Malformed state or feed clocks cannot reset attempts or authorize a writer",
+    "Final witness must bind the actual consumed source generation",
+    "Existing coordinator serializes known automatic/manual writers",
+    "Existing price option controls price-only formatting via backend metadata; absent while off",
+    "Amounts, returns, scoring, ranking, funding and eligibility policies unchanged"
+  ],
+  "native_source_access": {
+    "bounded_drive_search_found_authentic_core_or_autorefresh_export": false,
+    "apps_script_content_endpoint_available": false,
+    "installed_call_graph_verified": false,
+    "absence_of_installed_scripts_proved": false
+  },
+  "focused_validation": {
+    "new_python_discovered_cases": 35,
+    "native_checks_in_new_batteries": 248,
+    "counts_overlap": true,
+    "genuine_lean_new_and_manifest_passed": 38,
+    "manifest_ci_and_render_contract_passed": 31,
+    "manifest_ci_and_render_contract_skipped": 1,
+    "workflow_audit_errors": 0,
+    "workflow_audit_warnings": 0,
+    "compile_and_fatal_ruff_passed": true,
+    "historical_expected_hashes_changed": false
+  },
+  "combined_validation": {
+    "full_suite_passed": 5550,
+    "full_suite_skipped": 33,
+    "subtests_passed": 252,
+    "unchanged_legacy_return_value_warnings": 3,
+    "genuine_lean_passed": 38,
+    "new_python_discovered_cases": 35,
+    "native_checks_in_new_batteries": 248,
+    "counts_overlap": true,
+    "exact_head_github_checks": "recorded in PR body after completion"
+  }
+}
