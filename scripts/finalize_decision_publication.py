@@ -26,6 +26,7 @@ from core.secret_redaction import redact_text, safe_error_text
 from scripts import audit_decision_surface_freshness as freshness
 from scripts import audit_full_refresh_coverage as coverage
 from scripts.approved_universe_scope import (
+    market_floor,
     approved_floors, load_scope, receipt_matches_policy,
 )
 
@@ -37,8 +38,12 @@ REQUIRED_PAGES = {
     "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
     "My_Portfolio", "Insights_Analysis", "Data_Dictionary",
 }
-MARKET_FLOORS = {"Market_Leaders": 255, "Global_Markets": 6512,
-                 "Commodities_FX": 453, "Mutual_Funds": 2474}
+# G1 (2026-10-17): GM / CFX floors from config/market_floors_v1.json (literal
+# defaults = the pre-D3 values; the file changes on the D3 GO, not the code).
+MARKET_FLOORS = {"Market_Leaders": 255,
+                 "Global_Markets": market_floor("Global_Markets", 6512),
+                 "Commodities_FX": market_floor("Commodities_FX", 453),
+                 "Mutual_Funds": 2474}
 
 
 def _bounded_env(name: str, default: float, *, minimum=None, maximum=None) -> float:

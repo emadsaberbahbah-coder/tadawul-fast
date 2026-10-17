@@ -555,11 +555,20 @@ def _pool_reconciliation(text: Any, pools: Mapping[str, Mapping[str, int]],
             "unique_counts": owned_counts, "excluded": excluded, "receipt": receipt}
 
 
+def _market_floor(page: str, default: int) -> int:
+    """G1 (2026-10-17): config/market_floors_v1.json, else the literal default."""
+    try:
+        from scripts.approved_universe_scope import market_floor
+        return market_floor(page, default)
+    except Exception:
+        return default
+
+
 def _configured_floors(min_rows: Optional[Mapping[str, int]]) -> dict[str, int]:
     return dict(min_rows or {
         "Market_Leaders": _env_int("TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS", 1025),
-        "Global_Markets": _env_int("TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS", 6512),
-        "Commodities_FX": _env_int("TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX", 453),
+        "Global_Markets": _env_int("TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS", _market_floor("Global_Markets", 6512)),
+        "Commodities_FX": _env_int("TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX", _market_floor("Commodities_FX", 453)),
         "Mutual_Funds": _env_int("TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS", 4496),
     })
 
@@ -609,8 +618,8 @@ def audit_surfaces(
             approved_scope = approved_scope or _load_approved_scope()
             scope_counts = approved_floors(policy=approved_scope)
             floors.update(scope_counts)
-            floors["Global_Markets"] = max(floors.get("Global_Markets", 0), 6512)
-            floors["Commodities_FX"] = max(floors.get("Commodities_FX", 0), 453)
+            floors["Global_Markets"] = max(floors.get("Global_Markets", 0), _market_floor("Global_Markets", 6512))
+            floors["Commodities_FX"] = max(floors.get("Commodities_FX", 0), _market_floor("Commodities_FX", 453))
             market_max_age_h = min(30.0, market_max_age_h)
             decision_max_age_h = min(8.0, decision_max_age_h)
             report.approved_scope = approved_scope.receipt()

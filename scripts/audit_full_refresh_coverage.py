@@ -66,6 +66,7 @@ from core.data_validity import (  # noqa: E402
 )
 from scripts.critical_symbol_identity import canonicalize_symbol  # noqa: E402
 from scripts.approved_universe_scope import (  # noqa: E402
+    market_floor,
     ScopePolicy, approved_floors, load_scope, validate_symbols,
 )
 
@@ -236,7 +237,8 @@ def rules(*, approved_scope: ScopePolicy | None=None):
         key=page.upper()
         floor=current[page] if page in current else math.ceil(_strict_setting(f"TFB_EXPECTED_MIN_ROWS_{key}",count,minimum=count))
         return Rule(page,floor,_strict_setting(f"TFB_REFRESH_MAX_AGE_H_{key}",30,maximum=30),_strict_setting(f"TFB_REFRESH_MIN_FRESH_PCT_{key}",95,minimum=95,maximum=100),name,price)
-    return [R("Market_Leaders",current["Market_Leaders"]),R("Global_Markets",6512),R("Commodities_FX",453,95,95),R("Mutual_Funds",current["Mutual_Funds"],90,99),
+    # G1 (2026-10-17): GM / CFX floors from config/market_floors_v1.json (defaults = pre-D3).
+    return [R("Market_Leaders",current["Market_Leaders"]),R("Global_Markets",market_floor("Global_Markets",6512)),R("Commodities_FX",market_floor("Commodities_FX",453),95,95),R("Mutual_Funds",current["Mutual_Funds"],90,99),
             Rule("My_Portfolio",1,_strict_setting("TFB_REFRESH_MAX_AGE_H_MY_PORTFOLIO",8,maximum=8),100,100,100,True,True),
             Rule("Insights_Analysis",1,None,0,0,0,False),Rule("Data_Dictionary",1,None,0,0,0,False)]
 

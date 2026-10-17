@@ -663,6 +663,7 @@ jobs:
             tests/test_pf_switch_advisory_c4.py \
             tests/test_tp_forecast_scorecard_l3.py \
             tests/test_ob_evidence_gate_l4.py \
+            tests/test_market_floor_source_g1.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \

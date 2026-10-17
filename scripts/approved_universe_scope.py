@@ -16,9 +16,28 @@ import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 SCHEMA = "tfb.approved-universe-scope/v1"
 DEFAULT_SCOPE_PATH = Path(__file__).resolve().parents[1] / "config/approved_universe_scope_v1.json"
+# v1.1.0 (2026-10-17, Codex brief G1 prepare): the market-page row floors the
+# three auditors used to hard-code (Global_Markets 6512, Commodities_FX 453)
+# live in ONE versioned file. market_floor() never raises: an unreadable or
+# malformed file returns the caller's literal default, so every gate is
+# byte-identical until the file changes (the D3 retirement edits the file).
+DEFAULT_MARKET_FLOORS_PATH = Path(__file__).resolve().parents[1] / "config/market_floors_v1.json"
+MARKET_FLOORS_SCHEMA = "tfb.market-floors/v1"
+
+
+def market_floor(page: str, default: int, path: "str | Path | None" = None) -> int:
+    """The configured row floor for a market page, else the literal default."""
+    try:
+        raw = json.loads(Path(path or DEFAULT_MARKET_FLOORS_PATH).read_text(encoding="utf-8"))
+        if raw.get("schema") != MARKET_FLOORS_SCHEMA:
+            return int(default)
+        value = (raw.get("floors") or {}).get(page)
+        return value if _integer(value) and value > 0 else int(default)
+    except Exception:
+        return int(default)
 SYMBOL_HASH_DOMAIN = b"tfb.approved-symbol/v1\0"
 _PAGE_CONTRACT = {
     "Market_Leaders": ("saudi_only", 255, 1025),

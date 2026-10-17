@@ -1,0 +1,9 @@
+{
+  "schema": "tfb.market-floors/v1",
+  "revision": "2026-10-17.pre-D3",
+  "note": "One source for the market-page row floors the final publication gate, the full-refresh coverage audit and the decision-surface freshness audit used to hard-code (Codex brief 17-Oct G1, prepare). Global_Markets 6512 is the pre-D3 floor; the D3 retirement of the 133 nameless GM rows changes this file to the merged post-retirement count (6609 - 133 = 6476) in one PR on Emad's GO. Market_Leaders and Mutual_Funds floors come from config/approved_universe_scope_v1.json, not from here.",
+  "floors": {
+    "Global_Markets": 6512,
+    "Commodities_FX": 453
+  }
+}
