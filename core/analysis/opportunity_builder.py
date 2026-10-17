@@ -1,12 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.27.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.28.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.28.0 (2026-10-17) T5 — EARNINGS PROXIMITY GATE, DARK (Codex brief 17-Oct §3
+T5). The 17-Oct board carried `earn ⚠4/10` (VICI ≤11d, GLPI ≤12d, EPRT ≤4d,
+AX ≤12d) as advisory text only; a sized ticket can be issued into an earnings
+print. WHAT: TFB_T10_EARNINGS_GATE = off (default) | observe | enforce with
+TFB_T10_EARNINGS_MIN_DAYS (default 5, clamped 0..60). The candidate learns
+`days_to_earnings` from the row (aliases daystoearnings / nextearningsdate —
+the Calendar_Events fields the tracker already merges into Signal_History);
+unknown stays unknown. A PASSED gate "Earnings Proximity" (registered after
+Timing (52W)) carries the trace: `[earn-<mode>] Nd ≤ Md` inside the window,
+`Nd ok` outside, `n/a (no earnings date)` when unknown. observe: in-window
+audit rows get ONE countable `[earn-observe] Nd` tag beside the legacy
+failure_reason (the F-1b seam, after selection). enforce: the gate still never
+removes a seat (an earnings hold is a PAUSE, not an exit — the stability
+clocks must not read it as a gate removal); in-window TICKETS are marked
+`sizing_hold="earnings"`, `earnings_hold_days=N` and tagged
+`[earn-enforce] HOLD Nd`; the cockpit applies the FT-suspend dash vocabulary
+(P-145 class) to those seats and prints `earn-held n`. meta["earnings_gate"]
+read-back only when armed. Default off: byte-identical to v1.27.0 save the
+version stamp. Functions added 5 (_env_earnings_gate_mode,
+_env_earnings_min_days, _earn_today, _days_to_earnings, _earnings_gate).
+Removed 0. Rows carry no earnings date on the live route today (the pool is
+assembled from the market pages); the gate reads n/a until the route or the
+sync supplies the Calendar_Events fields — see the commit sheet.
 
 v1.27.0 (2026-10-17) T1 — WHY the Investability gate fails (Codex brief 17-Oct
 §3 T1). DATA GAPS on Top_10 reads "Investability 466 (93.2%)" and nothing
@@ -1466,7 +1490,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.0"
+OPPORTUNITY_BUILDER_VERSION = "1.28.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -2140,6 +2164,7 @@ GATE_ORDER = (
     "Sell-Class",
     "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend",
     "Timing (52W)",          # v1.23.0 [P-181] (appends before Portfolio)
+    "Earnings Proximity",    # v1.28.0 [T5] (appends after Timing, always PASSED)
     "Portfolio",
     "FX Evidence",           # certified currency proof, appended after policy gates
 )
@@ -3115,6 +3140,84 @@ _TIMING_STATE = {"mode": "off", "evaluated": 0, "unknown": 0, "fail_low": 0,
                  "low_pct": 15.0, "high_pct": 85.0, "shock_pct": -5.0}
 
 
+# v1.28.0 [T5 EARNINGS PROXIMITY] ------------------------------------------
+_EARN_GATE_NAME = "Earnings Proximity"
+_EARN_STATE = {"mode": "off", "min_days": 5, "evaluated": 0, "unknown": 0,
+               "within": 0, "held": 0}
+
+
+def _env_earnings_gate_mode():
+    """v1.28.0 [T5]: TFB_T10_EARNINGS_GATE off(default)|observe|enforce, read
+    per call. Any other value -> off (byte-identical). Never raises."""
+    try:
+        raw = str(_env_str("TFB_T10_EARNINGS_GATE", "off")).strip().lower()
+        return raw if raw in ("observe", "enforce") else "off"
+    except Exception:
+        return "off"
+
+
+def _env_earnings_min_days():
+    """v1.28.0 [T5]: TFB_T10_EARNINGS_MIN_DAYS (trading-day proxy in calendar
+    days as published by Calendar_Events; default 5, clamped 0..60)."""
+    try:
+        v = _env_int("TFB_T10_EARNINGS_MIN_DAYS", 5)
+    except Exception:
+        v = 5
+    return v if 0 <= v <= 60 else 5
+
+
+def _earn_today():
+    """v1.28.0 [T5]: today's UTC date (one seam for tests)."""
+    return datetime.now(timezone.utc).date()
+
+
+def _days_to_earnings(view):
+    """v1.28.0 [T5] PURE: integer days to the next earnings print from the row
+    — an explicit 'Days To Earnings' wins; else derived from an ISO
+    'next_earnings_date' against _earn_today(). None when neither parses."""
+    d = _to_float(_field(view, "days_to_earnings"))
+    if d is not None:
+        return int(d)
+    raw = _to_text(_field(view, "next_earnings_date"))
+    if not raw:
+        return None
+    try:
+        when = datetime.strptime(str(raw).strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    return (when - _earn_today()).days
+
+
+def _earnings_gate(cand, mode, min_days):
+    """v1.28.0 [T5]: the gate dict for evaluate_gates — ALWAYS PASSED in both
+    modes (an earnings hold pauses sizing, it never removes a seat); the note
+    and earnings_detail carry the trace the F-1b seam and the tickets read.
+    Updates _EARN_STATE counters. Never raises."""
+    days = cand.get("days_to_earnings") if isinstance(cand, dict) else None
+    within = days is not None and 0 <= int(days) <= int(min_days)
+    try:
+        _EARN_STATE["evaluated"] += 1
+        if days is None:
+            _EARN_STATE["unknown"] += 1
+        elif within:
+            _EARN_STATE["within"] += 1
+    except Exception:
+        pass
+    if days is None:
+        note = "[earn-" + mode + "] n/a (no earnings date)"
+    elif within:
+        note = ("[earn-" + mode + "] " + ("HOLD " if mode == "enforce" else "")
+                + "%dd <= %dd" % (int(days), int(min_days)))
+    else:
+        note = "[earn-" + mode + "] %dd ok" % int(days)
+    g = _gate(_EARN_GATE_NAME, True, FAIL_NON_CRITICAL,
+              ("%dd" % int(days)) if days is not None else "n/a",
+              "Days To Earnings > %d" % int(min_days), note=note)
+    g["earnings_detail"] = {"days": (None if days is None else int(days)),
+                            "min_days": int(min_days), "within": bool(within)}
+    return g
+
+
 def _env_w52_timing_mode():
     """v1.23.0 [P-181]: TFB_T10_W52_TIMING off(default)|observe|enforce, read
     per call (no restart). Any other value -> off (byte-identical). Never
@@ -3443,6 +3546,11 @@ _FIELD_ALIASES = {
     "forecast_source": ("forecastsource", "forecastbasis"),
     "dq": ("dataqualityscore", "dataquality", "dq", "dqscore",
            "dataqualitypct"),
+    # v1.28.0 [T5]: Calendar_Events fields (the tracker merges the same two
+    # onto Signal_History rows: 'Days To Earnings' / 'next_earnings_date').
+    "days_to_earnings": ("daystoearnings", "earningsindays", "daystonextearnings"),
+    "next_earnings_date": ("nextearningsdate", "earningsdate", "nextearnings",
+                           "upcomingearningsdate"),
     "risk_level": ("risklevel", "riskbucket", "riskband", "riskcategory"),
     "news_trend": ("newstrend", "newssentiment", "newssignal"),
     "sector_trend": ("sectortrend", "sectorsignal", "sectormomentum"),
@@ -3809,6 +3917,7 @@ def normalize_candidate(row, fx_rates, criteria):
         "recommendation": _to_text(_field(view, "recommendation")),
         "recommendation_reason": _to_text(
             _field(view, "recommendation_reason")),
+        "days_to_earnings": _days_to_earnings(view),   # v1.28.0 [T5]
         "engine_gate": {
             "investability": _to_text(_resolve_investability(row, view)),
             "reasons": _to_text(_field(view, "investability_reasons")),
@@ -5005,6 +5114,12 @@ def evaluate_gates(cand, criteria, held_symbols=None,
     _w52_mode = _env_w52_timing_mode()
     if _w52_mode != "off":
         g.append(_timing_gate(cand, _w52_mode))
+
+    # v1.28.0 [T5]: Earnings Proximity appends after Timing; always PASSED
+    # (trace only — the hold is applied to tickets at the F-1b seam).
+    _earn_mode = _env_earnings_gate_mode()
+    if _earn_mode != "off":
+        g.append(_earnings_gate(cand, _earn_mode, _env_earnings_min_days()))
 
     held_hit = (not criteria["include_portfolio_holdings"] and
                 (str(cand["symbol"] or "").strip().upper() in held
@@ -6728,6 +6843,9 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                           "low_pct": _env_w52_low_pct(),
                           "high_pct": _env_w52_high_pct(),
                           "shock_pct": _env_shock_pct()})
+    _EARN_STATE.update({"mode": _env_earnings_gate_mode(),       # v1.28.0 [T5]
+                        "min_days": _env_earnings_min_days(),
+                        "evaluated": 0, "unknown": 0, "within": 0, "held": 0})
 
     # 1) normalize → gates → verdict → score (audit grid, 1:1 trace)
     audit = []
@@ -6843,6 +6961,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         if not _env_invest_reasons_legacy():       # v1.27.0 [T1] display-only
             withheld["meta"]["investability_reasons"] = investability_reason_breakdown(
                 withheld["candidates_rows"])
+        if _EARN_STATE.get("mode") in ("observe", "enforce"):
+            withheld["meta"]["earnings_gate"] = dict(_EARN_STATE)   # v1.28.0 [T5]
         if _board_replay:
             # Signing authenticates the frozen research inputs; certification
             # still independently controls whether any money can be allocated.
@@ -7021,6 +7141,40 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     + _tag
             except Exception:  # noqa: BLE001 - observe is additive, never fatal
                 pass
+    # v1.28.0 [T5] EARNINGS PROXIMITY seam: in-window rows get the countable
+    # tag (observe and enforce); under enforce the in-window TICKETS are marked
+    # sizing_hold="earnings" for the cockpit's FT-suspend vocabulary. Gates,
+    # verdicts, picks and capital math above are byte-untouched; off -> inert.
+    if _EARN_STATE.get("mode") in ("observe", "enforce"):
+        _earn_days_by_symbol = {}
+        for _rec in audit:
+            try:
+                _eg = None
+                for _g in (_rec.get("gates") or []):
+                    if _g.get("gate") == _EARN_GATE_NAME:
+                        _eg = _g
+                        break
+                if _eg is None:
+                    continue
+                _ed = _eg.get("earnings_detail") or {}
+                if not _ed.get("within"):
+                    continue
+                _earn_days_by_symbol[str(_rec.get("symbol") or "")] = _ed.get("days")
+                _fr = _rec.get("failure_reason")
+                _rec["failure_reason"] = ((str(_fr) + " | ") if _fr else "") \
+                    + str(_eg.get("note") or "[earn-observe] n/a")
+            except Exception:  # noqa: BLE001 - additive, never fatal
+                pass
+        if _EARN_STATE.get("mode") == "enforce":
+            for _t in tickets:
+                try:
+                    _sym = str(_t.get("symbol") or "")
+                    if _sym in _earn_days_by_symbol:
+                        _t["sizing_hold"] = "earnings"
+                        _t["earnings_hold_days"] = _earn_days_by_symbol[_sym]
+                        _EARN_STATE["held"] += 1
+                except Exception:  # noqa: BLE001
+                    pass
     total_suggested = sum(t["suggested_sar"] for t in tickets)
     kpis = {
         "deployable_sar": round(deployable, 0),
@@ -7263,6 +7417,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["timing_gate"] = dict(_TIMING_STATE)    # v1.23.0 [P-181] read-back
     if not _env_invest_reasons_legacy():             # v1.27.0 [T1] display-only
         meta["investability_reasons"] = investability_reason_breakdown(audit)
+    if _EARN_STATE.get("mode") in ("observe", "enforce"):
+        meta["earnings_gate"] = dict(_EARN_STATE)    # v1.28.0 [T5] read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,

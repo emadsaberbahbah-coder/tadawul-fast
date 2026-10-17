@@ -654,6 +654,7 @@ jobs:
             tests/test_acceptance_check_headline_g10.py \
             tests/test_s1_day0_seat_pairing_t6.py \
             tests/test_ob_investability_reasons_t1.py \
+            tests/test_ob_earnings_gate_t5.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
