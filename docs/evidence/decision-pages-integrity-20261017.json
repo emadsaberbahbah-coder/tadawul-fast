@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-10-17",
+  "timezone": "Asia/Riyadh",
+  "sheets": [
+    "Portfolio_Decision",
+    "Top_10_Investments"
+  ],
+  "comparison_main_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+  "implementation_parent_pr": 785,
+  "implementation_parent_sha": "2981d4781f0986e587f2d03d0f3856eb6e5c4394",
+  "snapshot_evaluation_utc": "2026-10-17T06:37:52Z",
+  "expected_source_run": "38978392280",
+  "snapshot_strict_audit": {
+    "exit_code": 2,
+    "executable": false,
+    "portfolio_findings": [],
+    "top10_findings": [
+      "T10_SOURCE_CONSUMPTION_UNPROVEN",
+      "T10_POOL_APPROVED_COUNT",
+      "T10_POOL_RECONCILIATION_UNPROVEN",
+      "FALSE_FULL_UNIVERSE_CLAIM"
+    ],
+    "source_freshness_expires_riyadh": "2026-10-17T09:54:58+03:00"
+  },
+  "export_pool_reconstruction": {
+    "market_leaders": 255,
+    "global_markets": 6609,
+    "commodities_fx": 453,
+    "mutual_funds_physical": 2474,
+    "exact_cross_page_duplicates": 5,
+    "mutual_funds_contribution": 2469,
+    "total": 9786,
+    "native_same_run_receipt_verified": false
+  },
+  "export_name_coverage": {
+    "global_markets": {
+      "blank": 129,
+      "percent": 98.0481
+    },
+    "mutual_funds": {
+      "blank": 25,
+      "percent": 98.9895
+    },
+    "market_leaders": {
+      "blank": 0,
+      "percent": 100.0
+    },
+    "commodities_fx": {
+      "blank": 0,
+      "percent": 100.0
+    },
+    "required_percent": 99.0
+  },
+  "repair_versions": {
+    "portfolio_actions": "1.16.1",
+    "native_portfolio": "1.5.15",
+    "native_top10": "1.13.11",
+    "decision_surface_auditor": "1.3.3"
+  },
+  "validation": {
+    "new_and_manifest_lean_passed": 81,
+    "native_assertions_within_discovery_wrappers": 144,
+    "full_suite": {
+      "passed": 5515,
+      "skipped": 33,
+      "subtests_passed": 252,
+      "duration_seconds": 356.85
+    },
+    "workflow_audit_errors": 0,
+    "workflow_audit_warnings": 0,
+    "historical_native_hashes_preserved": true,
+    "new_python_discovered_cases": 78
+  },
+  "production_render_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+  "installed_native_source_hash_verified": false,
+  "live_writes_performed": false,
+  "merged_or_deployed": false,
+  "financial_or_ranking_policy_changed": false,
+  "overall_performance_improvement_percent": null,
+  "unresolved": [
+    "fresh_real_reconciliation_evidence",
+    "source_name_completeness",
+    "native_same_run_consumption_and_exclusion_receipts",
+    "installed_native_source_and_call_graph_verification",
+    "pending_pr788_intentional_deferral_acknowledgement",
+    "small_positive_price_display_precision"
+  ]
+}
