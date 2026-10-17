@@ -1,12 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.28.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.29.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.29.0 (2026-10-17) T2 — CONCENTRATION: DISCLOSE THE CLUSTER (Codex brief 17-Oct
+§3 T2, builder half). Measured 17-Oct: 19 of the 24 qualified names are US
+Financials (AX, VLY, FRST, PGC, AUB, BLX, CNOB, RDN, WTFC, FBK, UNTY, PB, UCB,
+COLB, EBC, JMSB, SPFI, AMAL, AVBC) and nothing on the page says so — the
+per-sector cap (max_per_sector) sees 2 seats, not a 79% cluster. WHAT: a pure
+concentration_breakdown() over the WRITTEN audit rows' qualified set (verdict
+INVEST): the cluster key is the row's Industry (GICS-style group) when the
+engine row carries one, else its Sector ('' / 'Unknown' never cluster — the
+v1.0.13 data-gap doctrine); every audit row gains "cluster" ("<key> ×N" on
+qualified rows, "" elsewhere) so the GAS ALL QUALIFIED grid renders
+"Banks - Regional ×19"; meta["concentration"] carries the ranked clusters
+(count, share, 3 examples) and ONE countable alert {"type": "concentration"}
+is raised when the top cluster holds > 50% of a qualified set of >= 4 names
+(below 4 a majority is arithmetic, not concentration). Present on both the
+certified and the withheld path. No gate, verdict, selection, sizing or score
+change — the seat-level cap on CARRIED seats is the cockpit's half
+(16_Decision_Top10 v1.15.0, DT10_SEAT_SECTOR_CAP_LEGACY). Default ON
+(display/read-back only; v1.27.0 investability_reasons precedent); kill-switch
+TFB_T10_CLUSTER_LEGACY=1 removes the field, the meta block and the alert
+(payload byte-identical to v1.28.0 save the version stamp). Functions added 4
+(_env_cluster_legacy, _cluster_key, concentration_breakdown,
+_concentration_alert); constants 2. Removed 0.
 
 v1.28.0 (2026-10-17) T5 — EARNINGS PROXIMITY GATE, DARK (Codex brief 17-Oct §3
 T5). The 17-Oct board carried `earn ⚠4/10` (VICI ≤11d, GLPI ≤12d, EPRT ≤4d,
@@ -1490,7 +1513,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.28.0"
+OPPORTUNITY_BUILDER_VERSION = "1.29.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -5559,6 +5582,90 @@ def _cash_floor_alert_text(ctx):
                _fmt_sar(ctx.get("would_unfund_sar"))))
 
 
+# ---------------------------------------------------------------------------
+# v1.29.0 [T2] — concentration disclosure over the qualified set (pure)
+# ---------------------------------------------------------------------------
+_CLUSTER_ALERT_PCT = 50.0     # a single cluster above this share of the qualified set alerts
+_CLUSTER_MIN_QUALIFIED = 4    # below this a majority is arithmetic, not concentration
+
+
+def _env_cluster_legacy():
+    """v1.29.0 [T2] kill-switch — DEFAULT ON (field + meta + alert present).
+    TFB_T10_CLUSTER_LEGACY=1 removes all three; the payload is then
+    byte-identical to v1.28.0 save the version stamp."""
+    return (os.getenv("TFB_T10_CLUSTER_LEGACY") or "").strip() == "1"
+
+
+def _cluster_key(rec):
+    """(key, basis) for one audit row: the engine row's Industry (GICS-style
+    group) when present, else the row's Sector. '' / 'Unknown' never cluster
+    (v1.0.13 data-gap doctrine) -> ('', '')."""
+    cand = rec.get("_cand") if isinstance(rec.get("_cand"), dict) else {}
+    industry = " ".join(str(cand.get("industry") or rec.get("industry") or "").split())
+    if industry and industry.lower() != "unknown":
+        return industry, "industry"
+    sector = " ".join(str(rec.get("sector") or "").split())
+    if sector and sector.lower() != "unknown":
+        return sector, "sector"
+    return "", ""
+
+
+def concentration_breakdown(audit_rows, alert_pct=_CLUSTER_ALERT_PCT,
+                            min_qualified=_CLUSTER_MIN_QUALIFIED, examples=3):
+    """v1.29.0 [T2] PURE over the written audit rows. Stamps rec["cluster"]
+    on EVERY row ("<key> ×N" when the row is qualified (verdict INVEST) and
+    clusters; "" otherwise) and returns the read-back block:
+    {"qualified": Q, "clusters": [{cluster, basis, count, share_pct,
+    examples}] (count desc, name asc, top 8), "top": first or None,
+    "alert": bool, "threshold_pct", "min_qualified"}. Never raises on odd
+    rows (non-dicts are ignored)."""
+    rows = [r for r in (audit_rows or []) if isinstance(r, dict)]
+    qualified = [r for r in rows if r.get("verdict") == VERDICT_INVEST]
+    counts, basis_of, examples_of, keyed = {}, {}, {}, []
+    for r in qualified:
+        key, basis = _cluster_key(r)
+        keyed.append((r, key))
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        basis_of.setdefault(key, basis)
+        ex = examples_of.setdefault(key, [])
+        if len(ex) < max(0, int(examples)):
+            ex.append(str(r.get("symbol") or ""))
+    for r in rows:
+        r["cluster"] = ""
+    for r, key in keyed:
+        if key:
+            r["cluster"] = "%s \u00d7%d" % (key, counts[key])
+    q = len(qualified)
+    clusters = []
+    for key in sorted(counts, key=lambda k: (-counts[k], k)):
+        n = counts[key]
+        clusters.append({"cluster": key, "basis": basis_of[key], "count": n,
+                         "share_pct": round(100.0 * n / q, 1) if q else 0.0,
+                         "examples": list(examples_of.get(key) or [])})
+    top = clusters[0] if clusters else None
+    alert = bool(top and q >= int(min_qualified) and top["share_pct"] > float(alert_pct))
+    return {"qualified": q, "clusters": clusters[:8], "top": top, "alert": alert,
+            "threshold_pct": float(alert_pct), "min_qualified": int(min_qualified)}
+
+
+def _concentration_alert(block):
+    """v1.29.0 [T2]: ONE countable alert from a breakdown whose alert is True."""
+    top = block["top"]
+    return {
+        "type": "concentration", "count": int(top["count"]),
+        "required_action": (
+            "Qualified set concentrated: %s (%s) = %d of %d qualified names "
+            "(%.1f%% > %.0f%%). One cluster carries the board; review T10: Max "
+            "Per Sector and cluster exposure before sizing (the cockpit applies "
+            "the sector cap to carried seats; this alert changes no selection)."
+            % (top["cluster"], top["basis"], int(top["count"]),
+               int(block["qualified"]), float(top["share_pct"]),
+               float(block["threshold_pct"]))),
+    }
+
+
 def _sector_cap_basis() -> str:
     """v1.0.24: 'budget' (default) -> sector-weight checks divide by
     budget_base = portfolio_value + deployable; 'legacy' -> v1.0.23
@@ -6953,6 +7060,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         # Publish a consumable empty allocation, rather than a failed response
         # that a native client might treat as permission to preserve old money.
         withheld = _skeleton("ok" if rows else "no_candidates", "Portfolio inputs unverified; executable funding withheld", crit)
+        # v1.29.0 [T2]: stamp "cluster" BEFORE the _cand strip (the key is on it).
+        _conc_w = None if _env_cluster_legacy() else concentration_breakdown(audit)
         withheld["candidates_rows"] = [{k: v for k, v in item.items() if k != "_cand"}
                                         for item in audit]
         withheld["kpis"]["scanned"] = len(audit)
@@ -6963,6 +7072,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 withheld["candidates_rows"])
         if _EARN_STATE.get("mode") in ("observe", "enforce"):
             withheld["meta"]["earnings_gate"] = dict(_EARN_STATE)   # v1.28.0 [T5]
+        if _conc_w is not None:
+            withheld["meta"]["concentration"] = _conc_w              # v1.29.0 [T2]
         if _board_replay:
             # Signing authenticates the frozen research inputs; certification
             # still independently controls whether any money can be allocated.
@@ -6974,6 +7085,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             }
         withheld["alerts"] = [{"type": "portfolio_inputs_unverified", "count": 1,
                                  "required_action": "Reconcile complete positions, settled cash, reservations, FX and holding prices before funding."}]
+        if _conc_w is not None and _conc_w["alert"]:
+            withheld["alerts"].append(_concentration_alert(_conc_w))   # v1.29.0 [T2]
         return _json_safe(withheld)
 
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
@@ -7295,6 +7408,14 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "type": "price_xcheck", "count": int(_XCHECK_STATE["fetched"]),
             "required_action": _xcheck_summary_text(),
         })
+    # v1.29.0 [T2]: cluster disclosure over the qualified set — per-row
+    # "cluster" field (display), meta read-back and ONE countable alert when
+    # a single cluster carries > 50% of >= 4 qualified names. Stamped BEFORE
+    # the _cand strip below (the Industry key lives on _cand). Kill-switch
+    # TFB_T10_CLUSTER_LEGACY=1 => none of the three (v1.28.0 payload).
+    _conc = None if _env_cluster_legacy() else concentration_breakdown(audit)
+    if _conc is not None and _conc["alert"]:
+        alerts.append(_concentration_alert(_conc))
     # 4) audit grid sorted by score; strip internals
     # v1.19.1 [AUDIT-DEPTH-ORDER]: depth order by default (display-only).
     if _env_audit_order() == "depth":
@@ -7419,6 +7540,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["investability_reasons"] = investability_reason_breakdown(audit)
     if _EARN_STATE.get("mode") in ("observe", "enforce"):
         meta["earnings_gate"] = dict(_EARN_STATE)    # v1.28.0 [T5] read-back
+    if _conc is not None:
+        meta["concentration"] = _conc                # v1.29.0 [T2] read-back
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,

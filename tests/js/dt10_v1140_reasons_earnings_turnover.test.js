@@ -13,7 +13,11 @@ const {revertV1140, addedLines1140, EDITS_1140} = require('./dt10_v1140_history'
 const {feedHistorySource} = require('./dt10_cash_utc_history');
 
 const ROOT = path.join(__dirname, '../..');
-const source = fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8');
+// v1.15.0: this harness proves the v1.14.0 layer, so it runs on the delivered
+// file with the v1.15.0 edits reversed (dt10_v1150_history.js is itself proven
+// by tests/js/dt10_v1150_cluster_seat_cap.test.js).
+const {revertV1150} = require('./dt10_v1150_history');
+const source = revertV1150(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {

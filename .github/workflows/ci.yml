@@ -658,6 +658,7 @@ jobs:
             tests/test_tp_dedup_signal_enforce_l5.py \
             tests/test_s1_alpha_since_l5.py \
             tests/test_ptc_seed_baseline_g9.py \
+            tests/test_ob_cluster_concentration_t2.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_argaam_loopguard_b6.py \
@@ -710,6 +711,7 @@ jobs:
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_v1140_reasons_earnings_turnover.test.js
+          node tests/js/dt10_v1150_cluster_seat_cap.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py

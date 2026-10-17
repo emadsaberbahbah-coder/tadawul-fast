@@ -146,7 +146,7 @@ def test_off_is_byte_identical_and_has_no_gate(monkeypatch):
     assert "earnings_gate" not in on["meta"]
     assert not any("earn-" in str(c.get("failure_reason")) for c in on["candidates_rows"])
     assert not any("sizing_hold" in t for t in on["selected"])
-    assert on["version"] == "1.28.0"
+    assert on["version"] == ob.OPPORTUNITY_BUILDER_VERSION
 
 
 def test_observe_tags_only_in_window_rows_and_keeps_verdicts(monkeypatch):

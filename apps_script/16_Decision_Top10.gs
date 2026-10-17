@@ -1,11 +1,46 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.15.0 (2026-10-17) -- SECTOR CAP ON CARRIED SEATS + CLUSTER COLUMN (T2)
+ * WHY (Codex brief 2026-10-17 T2, cockpit half): on the 17-Oct board 5 of
+ * 10 seats were Real Estate against panel 'T10: Max Per Sector' = 2. The
+ * builder applies the cap at selection (its raw picks honour it), but a
+ * carried seat (GRACE ghost held by stability memory, absent from today's
+ * raw selection) re-enters from dt10StabCore_ with no cap at all. WHAT:
+ * (a) dt10SeatSectorCapApply_ runs right after the core: raw seats count
+ * first (never deferred -- the builder already capped them), then carried
+ * seats fill what the cap leaves in rank order; the over-cap carried seats
+ * are DEFERRED -- taken off payload.selected (so SelLog, KPIs and the
+ * board show the capped set), listed in a 'SECTOR CAP -- CARRIED SEATS
+ * DEFERRED' table directly under SELECTED with the note 'sector cap --
+ * carried seat deferred (<sector> n/cap)', named in the stab token
+ * 'seat-cap deferred n (syms)' and in meta.stability.audit
+ * .sector_cap_deferred. Membership and clocks are untouched (the state
+ * blob is saved before the pass); '' / 'Unknown' sectors never cap
+ * (builder v1.0.13 doctrine); an unparseable panel value defers nothing
+ * (fail-open). No backfill: the freed seat stays empty today (a fill
+ * would be a selection change -- panel decision). (b) ALL QUALIFIED
+ * gains a 'Cluster' column (before 'Why Not Selected') from the
+ * builder's per-row cluster field ('Banks - Regional x19', v1.29.0);
+ * the CANDIDATES grid is unchanged because its header list is the WP-8
+ * hidden-tab checksum contract. DEFAULT ON -- the off state is the
+ * defect (P-127/P-130 precedent). KILL: Script Property
+ * DT10_SEAT_SECTOR_CAP_LEGACY = '1' (no deferral, no table, no token;
+ * the Cluster column stays, blank when the builder is legacy).
+ * Functions added (0 removed): dt10SeatSectorCapLegacy_,
+ * dt10SeatCapSector_, dt10SeatCapDefer_, dt10SeatSectorCapCore_,
+ * dt10SeatSectorCapApply_, dt10SeatCapRow_; var added:
+ * DT10_SEATCAP_HEADERS. Harness: tests/js/dt10_v1150_cluster_seat_cap
+ * .test.js (+ tests/js/dt10_v1150_history.js reverses these edits so the
+ * v1.14.0 -> v1.13.9 hash chain still proves the file). dt10SelfTest
+ * gains 'seat sector cap core: ok'. DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.14.0 (2026-10-17) -- INVESTABILITY REASONS, EARNINGS HOLD, TURNOVER TOKEN (T1/T5/T6)
  * WHY (Codex brief 2026-10-17): three cockpit halves whose builder halves
@@ -1785,7 +1820,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.14.0';
+var DT10_VERSION = '1.15.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3478,6 +3513,129 @@ function dt10FastTrackSuspend_(tk, label) {
   return tk;
 }
 // ---------------------------------------------------------------------------
+// v1.15.0 [T2] -- sector cap on CARRIED seats + deferred-seat table (pure cores)
+// ---------------------------------------------------------------------------
+var DT10_SEATCAP_HEADERS = ['Rank', 'Symbol', 'Name', 'Sector', 'Stability',
+  'Note'];
+/** v1.15.0 [T2]: Script Property kill switch. Absent/junk -> cap ON;
+ * DT10_SEAT_SECTOR_CAP_LEGACY = '1' -> v1.14.0 (carried seats bypass the
+ * cap). Never throws. */
+function dt10SeatSectorCapLegacy_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_SEAT_SECTOR_CAP_LEGACY') || '') === '1';
+  } catch (eScl) {}
+  return false;
+}
+/** v1.15.0 [T2] PURE: the cap bucket of a seat -- its trimmed sector; '' for
+ * blank or 'Unknown' (a data gap is not a sector; builder v1.0.13). */
+function dt10SeatCapSector_(t) {
+  var sec = String((t && t.sector) || '').replace(/^\s+|\s+$/g, '');
+  if (!sec || /^unknown$/i.test(sec)) return '';
+  return sec;
+}
+/** v1.15.0 [T2] PURE: mark one carried seat deferred by the cap. The seat
+ * keeps its identity, stability label (suffixed) and clock; the countable
+ * marker is _seat_cap_deferred; the original rank is kept for the table.
+ * Mutates and returns t. */
+function dt10SeatCapDefer_(t, sec, n, cap) {
+  t._seat_cap_deferred = true;
+  t._seat_cap_rank = t.rank;
+  t._seat_cap_note = 'sector cap — carried seat deferred (' + sec + ' ' +
+      n + '/' + cap + ')';
+  t._stab_status = String(t._stab_status || '') + ' - sector cap deferred';
+  t.advisor_note = 'SECTOR CAP — carried seat deferred: ' + sec +
+      ' already holds ' + cap + ' seat(s) (panel T10: Max Per Sector). ' +
+      'Listed, not seated, today; the stability clock is untouched.';
+  return t;
+}
+/** v1.15.0 [T2] PURE: apply the panel sector cap to the stability board.
+ *   tickets  dt10StabCore_ output (rank order)
+ *   rawSyms  { SYM: true } -- today's raw builder picks (already capped by
+ *            the builder among themselves; NEVER deferred here)
+ *   cap      panel 'T10: Max Per Sector' (int > 0; anything else -> no-op)
+ * Raw seats count first; carried seats then fill what the cap leaves, in
+ * rank order; the rest are deferred. Kept seats are re-ranked 1..N.
+ * Returns { kept: [tickets], deferred: [tickets] }. */
+function dt10SeatSectorCapCore_(tickets, rawSyms, cap) {
+  var res = { kept: [], deferred: [] };
+  tickets = tickets || [];
+  rawSyms = rawSyms || {};
+  cap = parseInt(cap, 10);
+  if (!(cap > 0)) { res.kept = tickets.slice(); return res; }
+  var counts = {};
+  var i, t, sec, sym;
+  for (i = 0; i < tickets.length; i++) {
+    t = tickets[i] || {};
+    sym = dt10NormSym_(t.symbol);
+    sec = dt10SeatCapSector_(t);
+    if (sec && rawSyms[sym] === true) counts[sec] = (counts[sec] || 0) + 1;
+  }
+  for (i = 0; i < tickets.length; i++) {
+    t = tickets[i] || {};
+    sym = dt10NormSym_(t.symbol);
+    sec = dt10SeatCapSector_(t);
+    if (!sec || rawSyms[sym] === true) { res.kept.push(t); continue; }
+    var n = counts[sec] || 0;
+    if (n >= cap) {
+      res.deferred.push(dt10SeatCapDefer_(t, sec, n + 1, cap));
+    } else {
+      counts[sec] = n + 1;
+      res.kept.push(t);
+    }
+  }
+  if (res.deferred.length) {
+    for (i = 0; i < res.kept.length; i++) {
+      if (res.kept[i] && (res.kept[i].rank === 0 || res.kept[i].rank)) {
+        res.kept[i].rank = i + 1;
+      }
+    }
+  }
+  return res;
+}
+/** v1.15.0 [T2]: run the cap on the core output IN PLACE -- out.tickets
+ * becomes the kept set, out.audit.sector_cap_deferred names the deferred
+ * symbols, payload._dt10_seat_cap_deferred carries the deferred tickets for
+ * the table under SELECTED. Returns the status token ('' when nothing was
+ * deferred, under the kill switch, or on any error -- the board is then
+ * exactly the core's). */
+function dt10SeatSectorCapApply_(out, rawTickets, panel, payload) {
+  try {
+    if (dt10SeatSectorCapLegacy_()) return '';
+    if (!out || !out.tickets) return '';
+    var rawSyms = {};
+    rawTickets = rawTickets || [];
+    for (var i = 0; i < rawTickets.length; i++) {
+      var rs = dt10NormSym_(rawTickets[i] && rawTickets[i].symbol);
+      if (rs) rawSyms[rs] = true;
+    }
+    var res = dt10SeatSectorCapCore_(out.tickets, rawSyms,
+        panel && panel['T10: Max Per Sector']);
+    if (!res.deferred.length) return '';
+    out.tickets = res.kept;
+    var syms = [];
+    for (var d = 0; d < res.deferred.length; d++) {
+      syms.push(String(res.deferred[d].symbol || ''));
+    }
+    if (out.audit && typeof out.audit === 'object') {
+      out.audit.sector_cap_deferred = syms;
+    }
+    if (payload && typeof payload === 'object') {
+      payload._dt10_seat_cap_deferred = res.deferred;
+    }
+    return 'seat-cap deferred ' + syms.length + ' (' + dt10JoinCap_(syms, 4) + ')';
+  } catch (eSca) {
+    return '';
+  }
+}
+/** v1.15.0 [T2] PURE: one DT10_SEATCAP_HEADERS row from a deferred seat. */
+function dt10SeatCapRow_(t) {
+  t = t || {};
+  return [dt10Cell_(t._seat_cap_rank), dt10Cell_(t.symbol), dt10Cell_(t.name),
+          dt10Cell_(t.sector), dt10Cell_(t._stab_status),
+          dt10Cell_(t._seat_cap_note)];
+}
+// ---------------------------------------------------------------------------
 // v1.14.0 [T1 / T5 / T6] -- pure cores + kill switches (Codex brief 2026-10-17)
 // ---------------------------------------------------------------------------
 var DT10_INVREASON_HEADERS = ['Engine Reason', 'Candidates', 'Share %',
@@ -4661,6 +4819,7 @@ function dt10CandToRow_(c) {
 // payload zone; purely filters candidates_rows the page already receives.
 var DT10_QUAL_HEADERS = ['Rank', 'Symbol', 'Name', 'Market', 'Sector',
   'ROI % (TP1)', 'Engine ROI % (12M)', 'Ann ROI %', 'R/R (TP2)', 'Rel', 'DQ', 'Risk', 'Score', 'Selected',
+  'Cluster',   // v1.15.0 [T2]: builder per-row cluster ('Banks - Regional x19')
   'Why Not Selected'];
 /**
  * Every candidate whose verdict is INVEST (passed all gates) — INCLUDING names
@@ -4789,7 +4948,9 @@ function dt10QualToRow_(c, rank, pendingMap, qualifiedCount, seatsFilled, ticket
           dt10Cell_(c.engine_roi_pct), dt10Cell_(c.ann_roi_pct),
           dt10Cell_(c.rr), dt10Cell_(c.reliability), dt10Cell_(c.dq),
           dt10Cell_(c.risk_level), dt10Cell_(c.opportunity_score),
-          c.selected === true ? 'Yes' : 'No', why];
+          c.selected === true ? 'Yes' : 'No',
+          dt10Cell_(c.cluster),   // v1.15.0 [T2]
+          why];
 }
 // v1.2.4 — DATA GAPS / FAILURE BREAKDOWN. Derived view (not a payload zone):
 // aggregates the audited candidates by the gate each FAILED FIRST. Headers.
@@ -6308,6 +6469,12 @@ function dt10ApplyStability_(payload, panel, outage) {
   var out = dt10StabCore_(payload.selected || [],
                           payload.candidates_rows || [],
                           state, knobs, limit, epoch.key, outageMap);
+  // v1.15.0 [T2]: the panel sector cap applies to CARRIED seats too (the
+  // builder capped only today's raw picks). Over-cap carried seats are
+  // listed under SELECTED, not seated; membership and clocks untouched.
+  var seatCapNote = dt10SeatSectorCapApply_(out, payload.selected || [],
+                                            panel, payload);
+  if (seatCapNote) out.note += ' | ' + seatCapNote;
   if (!dt10EpochKeyLegacy_()) {
     out.note += ' | epoch=' + epoch.key + '/' + epoch.src +
                 (epoch.held ? '(frozen)' : '');
@@ -7658,6 +7825,24 @@ function dt10RenderPayload_(sheet, payload, tokens) {
         .setWrap(true).setFontSize(9);
   }
   row = selT.next + 1;
+  // v1.15.0 [T2]: carried seats the panel sector cap deferred this run --
+  // listed (rank, symbol, sector, stability, note), never seated or sized.
+  var capDef = payload._dt10_seat_cap_deferred || [];
+  if (capDef.length && !dt10SeatSectorCapLegacy_()) {
+    row = dt10WriteSection_(sheet, row,
+        'SECTOR CAP \u2014 CARRIED SEATS DEFERRED (' + capDef.length +
+        '; panel T10: Max Per Sector applied to carried seats)', tokens);
+    var capRows = [];
+    for (var cd = 0; cd < capDef.length; cd++) {
+      capRows.push(dt10SeatCapRow_(capDef[cd]));
+    }
+    var capT = dt10WriteTable_(sheet, row, DT10_SEATCAP_HEADERS, capRows, 'None');
+    if (capT.firstDataRow > 0) {
+      sheet.getRange(capT.firstDataRow, DT10_SEATCAP_HEADERS.length, capT.count, 1)
+          .setWrap(true).setFontSize(9);
+    }
+    row = capT.next + 1;
+  }
   // ALL QUALIFIED — full INVEST opportunity set (v1.2.0). Every name that
   // passed all gates, including those deferred by a diversification cap, so
   // the operator can pick beyond the auto-selected tickets.
@@ -8352,9 +8537,9 @@ function dt10SelfTest() {
         dt10SeatTruthKpi_(hsPayload) === '0 exec + 1 fast-track suspended + 1 grace / 10' &&
         hsPayload.candidates_rows[0].selected === false && hsQual[13] === 'No' &&
         hsPayload.candidates_rows[0].deferral === '' &&
-        (!hsTruth || (hsQual[14].indexOf('Held research seat') === 0 &&
-          hsQual[14].indexOf('1/3 confirmed') > 0 &&
-          dt10CandToRow_(hsPayload.candidates_rows[0])[24] === hsQual[14])))
+        (!hsTruth || (hsQual[15].indexOf('Held research seat') === 0 &&   // v1.15.0 [T2]: Why Not Selected moved to col 16 (Cluster inserted)
+          hsQual[15].indexOf('1/3 confirmed') > 0 &&
+          dt10CandToRow_(hsPayload.candidates_rows[0])[24] === hsQual[15])))
        ? 'ok (exec / fast-track suspended / research / grace; held qualifier stays No)' : 'FAIL'));
   var hsEarnMap = {F: 4, G: 15};
   dt10ApplyEarningsTags_(hsPayload.selected, hsEarnMap, 14);
@@ -8458,6 +8643,24 @@ function dt10SelfTest() {
               (dt10InvestReasonsLegacy_() ? 'OFF (DT10_INVEST_REASONS_LEGACY)' : 'ON') +
               ' | earn hold ' + (dt10EarnHoldLegacy_() ? 'OFF (DT10_EARN_HOLD_LEGACY)' : 'ON') +
               ' | turnover token ' + (dt10TurnoverLegacy_() ? 'OFF (DT10_TURNOVER_TOKEN_LEGACY)' : 'ON'));
+  // v1.15.0 [T2]: raw A counts first; carried B fills the second slot;
+  // carried C, D deferred; Unknown E never caps; kept re-ranked 1..3.
+  var scT = dt10SeatSectorCapCore_([
+      { symbol: 'A', sector: 'Real Estate', rank: 1, _stab_status: 'ACTIVE (day 9)' },
+      { symbol: 'B', sector: 'Real Estate', rank: 2, _stab_status: 'GRACE (1/3 missed)' },
+      { symbol: 'C', sector: 'Real Estate', rank: 3, _stab_status: 'GRACE (2/3 missed)' },
+      { symbol: 'D', sector: 'Real Estate', rank: 4, _stab_status: 'GRACE (1/3 missed)' },
+      { symbol: 'E', sector: 'Unknown', rank: 5, _stab_status: 'GRACE (1/3 missed)' }],
+      { A: true }, 2);
+  var scNo = dt10SeatSectorCapCore_([{ symbol: 'A', sector: 'X', rank: 1 }], {}, 'junk');
+  report.push('seat sector cap core: ' +
+      ((scT.kept.length === 3 && scT.deferred.length === 2 &&
+        scT.deferred[0].symbol === 'C' && scT.deferred[1].symbol === 'D' &&
+        scT.kept[2].symbol === 'E' && scT.kept[2].rank === 3 &&
+        scT.deferred[0]._seat_cap_rank === 3 &&
+        scT.deferred[0]._stab_status === 'GRACE (2/3 missed) - sector cap deferred' &&
+        scNo.kept.length === 1 && scNo.deferred.length === 0) ? 'ok' : 'FAIL') +
+      ' | ' + (dt10SeatSectorCapLegacy_() ? 'OFF (DT10_SEAT_SECTOR_CAP_LEGACY)' : 'ON'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of
