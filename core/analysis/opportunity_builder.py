@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.26.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.26.2  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.26.2 (2026-10-17) WHY — two-decimal ticket/audit prices and price text
+erased positive tiny quotes and levels after the engine preserved them.
+Reuse default-off TFB_PRICE_PRECISION at price-only output boundaries;
+armed sub-10 prices keep seven significant digits, while the legacy baseline
+stays two decimals. Emit meta.price_precision='on' only when armed so native
+formatting follows the same response. Normalized inputs, gates, scores,
+ranking, sizing, financial amounts and return rounding are unchanged.
 
 v1.26.1 (2026-10-11): integrate the optional USX FX path with the tag-driven
 settle-unresolved exclusion; unresolved rows never rank or receive funding.
@@ -628,6 +636,11 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from core.price_precision import (
+    price_precision_enabled as _price_precision_enabled,
+    price_round_digits as _price_round_digits,
+    round_price as _precision_round_price,
+)
 
 # =============================================================================
 # v1.0.21 [QUALIFIED-GRID BASIS PARITY + HELD-SYMBOL VARIANT MATCH]
@@ -1446,7 +1459,7 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.26.1"
+OPPORTUNITY_BUILDER_VERSION = "1.26.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4179,7 +4192,7 @@ def _price_xcheck(cand, ctx):
         return xc
     sec, ts, _pc = q
     delta = (float(sec) / primary - 1.0) * 100.0
-    xc.update({"secondary": _round4(sec), "secondary_ts": ts,
+    xc.update({"secondary": _round_price(sec, 4), "secondary_ts": ts,
                "delta_pct": round(delta, 2)})
     if abs(delta) <= ctx["tol_pct"]:
         xc["verdict"] = "verified"
@@ -4208,12 +4221,13 @@ def _xcheck_should_defer(xc, strict):
 
 def _xcheck_fmt_px(v):
     """Price text for the xcheck note: 2 dp (4 dp below 1.0) so a 0.03
-    difference is visible (never the 1-dp _fmt_num rendering)."""
+    difference is visible; armed tiny prices use the shared precision."""
     try:
         f = float(v)
     except (TypeError, ValueError):
         return "?"
-    return ("%.4f" % f) if abs(f) < 1.0 else ("%.2f" % f)
+    digits = _price_round_digits(f, 4 if abs(f) < 1.0 else 2)
+    return format(f, ".%df" % digits)
 
 
 def _xcheck_summary_text():
@@ -5105,6 +5119,11 @@ def _round2(v):
     return None if v is None else round(float(v), 2)
 
 
+def _round_price(v, nd=2):
+    """Price-only variant of the unchanged two-decimal financial helper."""
+    return None if v is None else _precision_round_price(float(v), nd)
+
+
 def _fmt_num(v):
     if v is None:
         return "?"
@@ -5119,7 +5138,10 @@ def _fmt_sar(v):
 
 
 def _fmt_px(v):
-    return "?" if v is None else "{:,.2f}".format(v)
+    if v is None:
+        return "?"
+    digits = _price_round_digits(v, 2)
+    return format(v, ",.%df" % digits)
 
 # ---------------------------------------------------------------------------
 # §4.4 wealth math + L7 funding loop (selection-time)
@@ -6182,14 +6204,14 @@ def _build_ticket(rank, pick, criteria, review_date):
         "sector": cand["sector"],
         "currency": cand["currency"],
         "fx_to_sar": _round4(fx),
-        "price": _round2(cand["price"]),
-        "price_sar": _round2(cand["price_sar"]),
+        "price": _round_price(cand["price"]),
+        "price_sar": _round_price(cand["price_sar"]),
         "entry_zone": _entry_zone(cand),
         "suggested_sar": suggested,
         "suggested_shares": pick["suggested_shares"],
-        "stop_sar": _round2((cand["stop"] or 0) * fx if fx else None),
-        "tp1_sar": _round2((cand["tp1"] or 0) * fx if fx else None),
-        "tp2_sar": _round2((cand["tp2"] or 0) * fx if fx else None),
+        "stop_sar": _round_price((cand["stop"] or 0) * fx if fx else None),
+        "tp1_sar": _round_price((cand["tp1"] or 0) * fx if fx else None),
+        "tp2_sar": _round_price((cand["tp2"] or 0) * fx if fx else None),
         "roi_pct": (_plan_roi if _ticket_plan_primary
                     else _round1(engine_pct) if _ticket_engine_primary
                     else _val_roi),
@@ -6202,8 +6224,8 @@ def _build_ticket(rank, pick, criteria, review_date):
         "confidence_band": conf,
         "advisor_note": note,
         "detail": {
-            "target_price": _round2(cand["target_price"]),
-            "intrinsic_value": _round2(cand["intrinsic_value"]),
+            "target_price": _round_price(cand["target_price"]),
+            "intrinsic_value": _round_price(cand["intrinsic_value"]),
             "valuation_basis": cand["valuation_basis"],
             "engine_forecast_roi_pct": detail_engine_roi,
             "engine_recommendation": cand["recommendation"],
@@ -6543,12 +6565,18 @@ def build_opportunity_payload(rows, criteria=None, portfolio=None,
     """The one entry point P3 calls. Never raises: hard failures return an
     'error' skeleton so the page degrades zone-by-zone (§5)."""
     try:
-        return _build(rows, criteria, portfolio, fx_rates, upstream_meta)
+        result = _build(rows, criteria, portfolio, fx_rates, upstream_meta)
+        if _price_precision_enabled():
+            result["meta"]["price_precision"] = "on"
+        return result
     except Exception as exc:  # noqa: BLE001 — fail-soft by contract
-        return _json_safe(_skeleton(
+        result = _json_safe(_skeleton(
             status="error",
             message=type(exc).__name__ + ": " + str(exc),
             criteria=make_criteria(criteria)))
+    if _price_precision_enabled():
+        result["meta"]["price_precision"] = "on"
+    return result
 
 
 def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
@@ -6695,8 +6723,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "symbol": cand["symbol"], "name": cand["name"],
             "market": cand["market"], "sector": cand["sector"],
             "currency": cand["currency"], "fx_source": cand["fx_source"],
-            "price": _round2(cand["price"]),
-            "price_sar": _round2(cand["price_sar"]),
+            "price": _round_price(cand["price"]),
+            "price_sar": _round_price(cand["price_sar"]),
             "roi_pct": _round1(cand["roi_pct"]),
             "ann_roi_pct": _round1(cand["ann_roi_pct"]),
             "valuation_roi_pct": _round1(cand["roi_pct"]),

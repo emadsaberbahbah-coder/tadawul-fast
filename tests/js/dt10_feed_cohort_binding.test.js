@@ -535,8 +535,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.11');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.11 /);
+  assert.equal(ctx.DT10_VERSION, '1.13.12');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.12 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
@@ -687,6 +687,10 @@ test('H1 immutable v1.13.8 fixture digest and current edit mutation guard', () =
   );
   assert.notEqual(envelopeMutation, source, 'response envelope mutation anchor exists');
   assert.throws(() => feedHistorySource(envelopeMutation), assert.AssertionError);
+  const auditKeepMutation = source.replace('var DT10_AUDIT_KEEP_MAX = 60;',
+    'var DT10_AUDIT_KEEP_MAX = 600;');
+  assert.notEqual(auditKeepMutation, source, 'audit-keep mutation anchor exists');
+  assert.throws(() => feedHistorySource(auditKeepMutation), assert.AssertionError);
 });
 
 /* ============================================================ D1-D5, G1: immutable v1.13.8 */
