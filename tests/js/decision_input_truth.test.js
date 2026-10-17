@@ -46,6 +46,7 @@ const {revertV1150} = require('./dt10_v1150_history');   // v1.15.0 reversal lay
 const {revertV1160} = require('./dt10_v1160_history');   // v1.16.0 reversal layer
 const {revertV1170} = require('./dt10_v1170_history');   // v1.17.0 reversal layer
 const {revertV1180} = require('./dt10_v1180_history');   // v1.18.0 reversal layer
+const {revertV1190} = require('./dt10_v1190_history');   // v1.19.0 reversal layer
 
 const ROOT = path.join(__dirname, '../..');
 const args = process.argv.slice(2);
@@ -53,7 +54,7 @@ function arg(k) { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null;
 const DELIVERED_PATH = arg('--delivered') || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const BASE_PATH = arg('--base');
 const source = fs.readFileSync(DELIVERED_PATH, 'utf8');
-const historySource = feedHistorySource(revertV1140(revertV1150(revertV1160(revertV1170(revertV1180(source))))));
+const historySource = feedHistorySource(revertV1140(revertV1150(revertV1160(revertV1170(revertV1180(revertV1190(source)))))));
 const baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : null;
 const FIX = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/dt10_pages_2026-10-05.json'), 'utf8'));
@@ -442,7 +443,7 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   deq(find(C, x => x[0] === 'insertSheet').map(x => x[1]), ['_T10_Candidates_Staging', '_T10_Candidates']);
   const tabGrid = setValuesAt(C, '_T10_Candidates', 1, 1, 502, 25)[0];
   const stamp = tabGrid[0][0];
-  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.18\.0$/);
+  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.19\.0$/);
   deq(tabGrid[1], ctx.DT10_CAND_HEADERS);
   deq(tabGrid.slice(2), setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
   assert.equal(find(C, x => x[0] === 'hideSheet' && x[1] === '_T10_Candidates').length, 1);
@@ -529,7 +530,7 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
     'fx USX row: ABSENT', 'finding usx-subunit',
     'input truth (DT10_INPUT_TRUTH): off | cand tab (DT10_CAND_TAB): off | vintage cols (DT10_VINTAGE_COLS): off | policy ref: none',
     'evaluability core: ok', 'panel reference core: ok', 'label scan core: ok', 'vintage core: ok', 'cand pointer core: ok',
-    'cal coverage core: ok', 'policy ref parse core: ok', 'seat sector cap core: ok', 'research levels core: ok', 'model evidence core: ok', 'scorecard rows core: ok', '[DT10 v1.18.0] self-test',
+    'cal coverage core: ok', 'policy ref parse core: ok', 'seat sector cap core: ok', 'research levels core: ok', 'model evidence core: ok', 'scorecard rows core: ok', 'v2 layout core: ok', '[DT10 v1.19.0] self-test',
     'feed cohort bind (DT10_FEED_COHORT_BIND): off', 'feed cohort core: ok'];
   const missing = need.filter(n => !rep.includes(n));
   deq(missing, []);
@@ -552,16 +553,16 @@ const DESIGNED_FUNCTIONS = ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt
 const DESIGNED_VARS = ['DT10_FEED_COHORT_BIND_PROP', 'DT10_SOURCE_APPROVED_SCOPE', 'DT10_CANDTAB_STAGE_SHEET', 'DT10_VINT_PUBLISHED_RE', 'DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
   'DT10_CANDTAB_SHEET', 'DT10_CANDTAB_COCKPIT_TARGET_ROWS', 'DT10_VINTAGE_PROP', 'DT10_VINTAGE_HEADERS', 'DT10_VINT_ASOF_RE', 'DT10_VINT_LKG_RE'].sort();
 function census(src, re) { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; }
-check('T9 static: DT10_VERSION 1.18.0 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
+check('T9 static: DT10_VERSION 1.19.0 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
   const { ctx } = loadTree(source);
-  assert.equal(ctx.DT10_VERSION, '1.18.0');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.18\.0 /);
-  assert(source.includes("var DT10_VERSION = '1.18.0';"));
+  assert.equal(ctx.DT10_VERSION, '1.19.0');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.19\.0 /);
+  assert(source.includes("var DT10_VERSION = '1.19.0';"));
   assert.doesNotThrow(() => new vm.Script(source, { filename: '16_Decision_Top10.gs' }), 'syntax (node --check equivalent)');
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
   const fns = census(source, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), vars = census(source, /^var\s+([A-Za-z_$][\w$]*)/mg);
-  assert.equal(fns.size,219,'full v1.18.0 function census (v1.17.0 217 + 2)'); assert.equal(vars.size,106,'full v1.18.0 variable census (v1.17.0 106 + 0)');
+  assert.equal(fns.size,243,'full v1.19.0 function census (v1.18.0 219 + 24)'); assert.equal(vars.size,120,'full v1.19.0 variable census (v1.18.0 106 + 14)');
   for (const f of DESIGNED_FUNCTIONS) assert(fns.has(f), 'missing ' + f);
   for (const v of DESIGNED_VARS) assert(vars.has(v), 'missing ' + v);
   for (const f of DESIGNED_FUNCTIONS) assert.equal(typeof ctx[f], 'function', f);
@@ -601,7 +602,7 @@ check('T10 _Run_Log: off -> no row; observe/enforce -> exactly one INPUT-TRUTH r
   assert(row[5].startsWith('gates: news 0/500')); assert(row[5].length <= 400);
   const details = JSON.parse(row[9]);
   deq(Object.keys(details).sort(), ['alerts', 'cal', 'cand_rows', 'cand_tab', 'cand_tab_result', 'ev', 'input_truth', 'notes', 'ref', 'version', 'vintage_cols']);
-  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.18.0', 'observe', 'observe', 'observe', 500]);
+  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.19.0', 'observe', 'observe', 'observe', 500]);
   assert.equal(details.ev.news.unknown, 500); assert.equal(details.ref.drift_seed, 1); assert.equal(details.cal.sel_covered, 8);
   deq(details.alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 500], ['gate_not_evaluable', 500], ['panel_reference_drift', 1]]);
   assert(!/cash|nav|deployable/i.test(row[9]), 'details carry no portfolio words');

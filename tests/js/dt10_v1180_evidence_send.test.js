@@ -13,9 +13,10 @@ const {revertV1160} = require('./dt10_v1160_history');
 const {revertV1150} = require('./dt10_v1150_history');
 const {revertV1140} = require('./dt10_v1140_history');
 const {feedHistorySource} = require('./dt10_cash_utc_history');
+const {revertV1190} = require('./dt10_v1190_history');
 
 const ROOT = path.join(__dirname, '../..');
-const source = fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8');
+const source = revertV1190(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {

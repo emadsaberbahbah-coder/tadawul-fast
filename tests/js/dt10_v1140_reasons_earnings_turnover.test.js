@@ -20,7 +20,8 @@ const {revertV1150} = require('./dt10_v1150_history');
 const {revertV1160} = require('./dt10_v1160_history');
 const {revertV1170} = require('./dt10_v1170_history');
 const {revertV1180} = require('./dt10_v1180_history');
-const source = revertV1150(revertV1160(revertV1170(revertV1180(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8')))));
+const {revertV1190} = require('./dt10_v1190_history');
+const source = revertV1150(revertV1160(revertV1170(revertV1180(revertV1190(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'))))));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {

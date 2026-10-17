@@ -1,11 +1,61 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.18.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.19.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.19.0 (2026-10-17) -- TOP_10 V2 LAYOUT BEHIND T10_V2_LAYOUT (Decision Pages v2 plan, B1)
+ * WHY (TFB Decision Pages v2 Execution Plan, 17 Oct 2026, package B1): the
+ * cockpit's first screen must say in one glance whether today is actionable,
+ * what blocks it, and which run produced it; the seat table must never show
+ * an em dash for withheld money; the funnel, universe, concentration and hit
+ * rate deserve charts; the control panel belongs below the opportunity set.
+ * WHAT, only when Script Property T10_V2_LAYOUT = 1 (or on); absent or any
+ * other value = the v1.18.0 render byte-for-byte:
+ *  (1) Status block: B1 state chip (NOT ACTIONABLE / RESEARCH / ACTIONABLE,
+ *      dt10V2State_), B2 blocker in plain words (dt10V2Blocker_), B3 run
+ *      tokens 'epoch <key>/<src> . HH:mm Riyadh . vX . req <id>'
+ *      (dt10V2RunTokens_); the full status line moves to A4; rows 1-3 frozen.
+ *  (2) _Charts_Data_T10 hidden tab rewritten on each refresh with four
+ *      blocks: funnel (pool, eligible, kept, passed, seated, executable with
+ *      conversion %), universe (Investability Status counts on the sheet
+ *      pool: Global_Markets and all pages), concentration (sector counts for
+ *      the qualified set and the seats), hit rate (Forecast Scorecard by
+ *      horizon). Four EmbeddedChartBuilder charts (slot-1 #2a78d6, 2 px line
+ *      for the hit rate) anchored under the FUNNEL zone; a chart fault never
+ *      breaks the render.
+ *  (3) Seat table of 10 columns (DT10_V2_SEAT_HEADERS): #, Symbol . Name .
+ *      Sector, Seat status, Price, Research plan (TP1 = price x (1 + plan
+ *      ROI); stop shown as [withheld] unless executable), ROI plan / 12M
+ *      eng., R/R (TP2), Ref. size (5% of NAV = holdings + entered cash),
+ *      Rel . DQ . Score, Flags (earnings <= Nd, w52 tag, risk bucket, same-
+ *      industry cluster among the qualified). Grace seats collapse into one
+ *      row. No cell ever reads an em dash: withheld money is omitted or
+ *      written as [withheld] (dt10V2SeatRows_, pure).
+ *  (4) DATA GAPS (why-failed) directly under the seats, with the alerts as
+ *      one chip line (dt10V2AlertChips_); NEAR MISS keeps its table.
+ *  (5) Control panel written below the opportunity set; the operator's
+ *      values are read back by label scan before the zone is cleared
+ *      (dt10V2ReadPanel_), so blanks still re-seed from _Lists_Config and
+ *      the built-ins. dt10PanelPreserve_ gains the same label-scan fallback
+ *      so a later switch back to v1 keeps the operator inputs.
+ *  (6) dt10SelfTest: 'v2 layout core: ok' (state enum, 10-column header, no
+ *      em dash in the seat rows, funnel, chips) + the property state.
+ * Not in v2 (stated): the WP-8 vintage columns (30-column layout only; the
+ * status token still prints) and the T7 research-levels row restore (the
+ * plan column carries TP1; the stop stays [withheld] until executable). The
+ * input-truth KPI cells (enforce) sit beside the v2 KPI strip (row 5-6,
+ * columns 12-13). Functions added (0 removed): dt10V2LayoutOn_,
+ * dt10V2FailChip_, dt10V2State_, dt10V2Blocker_, dt10V2RunTokens_,
+ * dt10V2Fmt_, dt10V2Pct_, dt10V2NavSar_, dt10V2SeatFlags_, dt10V2SeatRows_,
+ * dt10V2AlertChips_, dt10V2Funnel_, dt10V2FunnelText_, dt10V2Universe_,
+ * dt10V2Concentration_, dt10V2HitRate_, dt10V2PanelScan_, dt10V2ReadPanel_,
+ * dt10V2EnsureLayout_, dt10V2StatusBlock_, dt10V2PanelWrite_,
+ * dt10V2ChartsData_, dt10V2ChartsDraw_, dt10RenderPayloadV2_.
+ * Harness: tests/js/dt10_v1190_v2_layout.test.js (+ dt10_v1190_history.js).
  *
  * v1.18.0 (2026-10-17) -- SEND THE SCORECARD COHORTS TO THE EVIDENCE GATE (L4)
  * WHY (Codex brief 2026-10-17 L4): opportunity_builder v1.30.0 gates (observe
@@ -1890,7 +1940,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.18.0';
+var DT10_VERSION = '1.19.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3581,6 +3631,692 @@ function dt10FastTrackSuspend_(tk, label) {
       'strict until confirmed (' +
       'seat filled to avoid under-fill; not an executable ticket today).';
   return tk;
+}
+// ---------------------------------------------------------------------------
+// v1.19.0 [B1] -- Top_10 v2 layout (Decision Pages v2 plan) behind T10_V2_LAYOUT
+// ---------------------------------------------------------------------------
+var DT10_V2_PROP = 'T10_V2_LAYOUT';        /* '1' | 'on' -> v2 layout; else v1 */
+var DT10_V2_ROW_STATUS = 4;                /* A4: the full status line */
+var DT10_V2_ROW_KPI_LABELS = 5;
+var DT10_V2_ROW_KPI_VALUES = 6;
+var DT10_V2_ZONES_START = 8;
+var DT10_V2_CHARTS_SHEET = '_Charts_Data_T10';
+var DT10_V2_CHART_ROWS = 20;               /* rows reserved for the four charts */
+var DT10_V2_CHART_TAG = 'TFB_T10 ';
+var DT10_V2_COLOR = '#2a78d6';
+var DT10_V2_COLOR_SOFT = '#9ec5ea';
+var DT10_V2_STATES = ['NOT ACTIONABLE', 'RESEARCH', 'ACTIONABLE'];
+var DT10_V2_SEAT_HEADERS = ['#', 'Symbol \u00b7 Name \u00b7 Sector', 'Seat', 'Price',
+  'Research plan', 'ROI plan / 12M eng.', 'R/R (TP2)', 'Ref. size (5% NAV)',
+  'Rel \u00b7 DQ \u00b7 Score', 'Flags'];
+var DT10_V2_HORIZONS = ['1W', '2W', '1M', '3M', '6M', '1Y'];
+var DT10_V2_FUNNEL_STAGES = ['Pool rows', 'Eligible (pre-gate)', 'Kept (audited)',
+  'Passed all gates', 'Seated', 'Executable'];
+/** v1.19.0 [B1]: Script Property T10_V2_LAYOUT = '1' or 'on' -> the v2 layout;
+ * anything else -> v1 (byte-identical). One read per execution; never throws. */
+function dt10V2LayoutOn_() {
+  return dt10PropMemoGet_(DT10_V2_PROP, function () {
+    try {
+      var v = String(PropertiesService.getScriptProperties()
+          .getProperty(DT10_V2_PROP) || '').replace(/^\s+|\s+$/g, '').toLowerCase();
+      return v === '1' || v === 'on';
+    } catch (eV2) {}
+    return false;
+  });
+}
+/** v1.19.0 [B1]: on a failed refresh the chip must not keep yesterday's word. */
+function dt10V2FailChip_(sheet, v2, why) {
+  if (!v2) return;
+  try {
+    dt10V2StatusBlock_(sheet, 'NOT ACTIONABLE', 'Refresh failed: ' + String(why || 'error') +
+        ' (board kept from the last render)', '');
+  } catch (eFc) {}
+}
+/** v1.19.0 [B1] PURE: the state chip. ACTIONABLE = an executable board on an
+ * actionable feed; NOT ACTIONABLE = the feed verdict (or source readiness)
+ * withholds; RESEARCH = everything else (held, unfunded, empty). */
+function dt10V2State_(payload) {
+  var p = payload || {};
+  var uv = p._dt10_uv || {};
+  if (uv.source_blocked === true || (uv.state && uv.state !== 'EXECUTABLE')) return DT10_V2_STATES[0];
+  var out = dt10OutputStatus_(p);
+  if (out === 'EXECUTABLE') return DT10_V2_STATES[2];
+  if (out === 'WITHHELD') return DT10_V2_STATES[0];
+  return DT10_V2_STATES[1];
+}
+/** v1.19.0 [B1] PURE: the blocker in plain words ('None' when actionable). */
+function dt10V2Blocker_(payload) {
+  var p = payload || {};
+  var uv = p._dt10_uv || {};
+  var cls = dt10TicketClasses_(p.selected || []);
+  if (uv.source_blocked === true) {
+    return 'Source readiness withheld: ' + String((uv.source_readiness && uv.source_readiness.reason) || uv.reason || 'see status');
+  }
+  if (uv.state && uv.state !== 'EXECUTABLE') return 'Feed not actionable: ' + String(uv.reason || 'verdict unknown');
+  var out = dt10OutputStatus_(p);
+  if (out === 'EXECUTABLE') return 'None \u2014 ' + cls.exec + ' executable ticket' + (cls.exec === 1 ? '' : 's');
+  if (out === 'HELD') {
+    return 'Every seat is held (' + cls.grace + ' grace, ' + cls.suspended +
+        ' suspended/research) \u2014 no executable allocation today';
+  }
+  if (out === 'QUALIFIED_UNFUNDED') {
+    var bf = (p.meta && p.meta.board_funding) || {};
+    return 'Qualified names, no funded seat \u2014 ' + String(bf.reason || 'allocation withheld');
+  }
+  if (out === 'EMPTY') return 'No candidate passed every gate under the current criteria';
+  return 'Board state ' + out;
+}
+/** v1.19.0 [B1] PURE: 'epoch 2026-10-17/feed . 08:07 Riyadh . v1.19.0 . req x'. */
+function dt10V2RunTokens_(payload, stabNote, stamp) {
+  var bits = [];
+  var m = String(stabNote || '').match(/epoch=([^\s|()]+)(\(frozen\))?/);
+  if (m) bits.push('epoch ' + m[1] + (m[2] ? ' frozen' : ''));
+  if (stamp) bits.push(String(stamp) + ' Riyadh');
+  bits.push('v' + DT10_VERSION);
+  var route = (payload && payload.meta && payload.meta.route) || {};
+  if (route.request_id) bits.push('req ' + route.request_id);
+  if (payload && payload.meta && payload.meta.run_id) bits.push('run ' + String(payload.meta.run_id).slice(0, 40));
+  return bits.join(' \u00b7 ');
+}
+/** v1.19.0 [B1] PURE: thousands-grouped number with the given decimals; '' when
+ * not finite (a blank, never an em dash). */
+function dt10V2Fmt_(v, digits) {
+  var n = Number(v);
+  if (v === null || v === undefined || v === '' || !isFinite(n)) return '';
+  var d = digits > 0 ? digits : 0;
+  var fixed = n.toFixed(d);
+  var parts = fixed.split('.');
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return parts.join('.');
+}
+/** v1.19.0 [B1] PURE: '+12.3%' / '-4.0%' / 'n/a'. */
+function dt10V2Pct_(v) {
+  var n = Number(v);
+  if (v === null || v === undefined || v === '' || !isFinite(n)) return 'n/a';
+  return (n > 0 ? '+' : '') + n.toFixed(1) + '%';
+}
+/** v1.19.0 [B1] PURE: NAV in SAR from the request body (holdings value_sar
+ * sum + entered cash); 0 when unknown. */
+function dt10V2NavSar_(body) {
+  var pf = (body && body.portfolio) || {};
+  var nav = Number(pf.cash_available_sar) || 0;
+  var hs = pf.holdings || [];
+  for (var i = 0; i < hs.length; i++) {
+    var v = Number(hs[i] && hs[i].value_sar);
+    if (isFinite(v) && v > 0) nav += v;
+  }
+  return nav > 0 ? Math.round(nav) : 0;
+}
+/** v1.19.0 [B1] PURE: the Flags cell for one seat. */
+function dt10V2SeatFlags_(t, cand, earnDays) {
+  var f = [];
+  if (earnDays !== null && earnDays !== undefined && isFinite(Number(earnDays))) {
+    f.push('earnings \u2264' + Number(earnDays) + 'd');
+  } else {
+    var note = String((t && t.advisor_note) || '');
+    var em = note.match(/\u26a0 earnings \u2264(\d+)d/);
+    if (em) f.push('earnings \u2264' + em[1] + 'd');
+  }
+  var fr = String((cand && cand.failure_reason) || '');
+  var w = fr.match(/\[w52-[a-z]+\][^;|]{0,50}/);
+  if (w) f.push(w[0].replace(/\s+$/, ''));
+  var risk = cand && cand.risk_level;
+  if (risk && String(risk) !== 'Unknown') f.push('risk ' + String(risk));
+  if (cand && cand.cluster) f.push('cluster ' + String(cand.cluster));
+  if (t && t._stab_trend && t._stab_trend !== 'n/a') f.push('trend ' + t._stab_trend);
+  return f.join(' \u00b7 ');
+}
+/** v1.19.0 [B1] PURE: the 10-column seat rows. Grace seats collapse into one
+ * row; withheld money is omitted or '[withheld]'; never an em dash.
+ * Returns { rows, grace, exec }. */
+function dt10V2SeatRows_(payload, cands, navSar, earnMap) {
+  var p = payload || {};
+  var sel = p.selected || [];
+  var k = p.kpis || {};
+  var uv = p._dt10_uv || {};
+  var feedOk = !(uv.state && uv.state !== 'EXECUTABLE') && uv.source_blocked !== true;
+  var bySym = {};
+  for (var c = 0; c < (cands || []).length; c++) {
+    var cs = dt10NormSym_(cands[c] && cands[c].symbol);
+    if (cs && !bySym[cs]) bySym[cs] = cands[c];
+  }
+  var ref = '';
+  var nav = Number(navSar) || 0;
+  var dep = Number(k.deployable_sar) || 0;
+  if (nav > 0) ref = dt10V2Fmt_(nav * 0.05, 0) + ' SAR';
+  else if (dep > 0) ref = dt10V2Fmt_(dep * 0.05, 0) + ' SAR (of deployable; NAV unknown)';
+  else ref = 'n/a (NAV unknown)';
+  var rows = [], grace = [], graceNotes = [], exec = 0;
+  for (var i = 0; i < sel.length; i++) {
+    var t = sel[i] || {};
+    var sym = dt10NormSym_(t.symbol);
+    if (t._grace_hold === true) {
+      grace.push(sym || '?');
+      var gm = String(t._stab_status || '').match(/(\d+)\/(\d+) missed/);
+      graceNotes.push(sym + (gm ? ' ' + gm[1] + '/' + gm[2] : ''));
+      continue;
+    }
+    var cand = bySym[sym] || {};
+    var shares = Number(t.suggested_shares), sar = Number(t.suggested_sar);
+    var isExec = feedOk && t._ft_suspended !== true && isFinite(shares) && shares > 0 &&
+        isFinite(sar) && sar > 0;
+    if (isExec) exec++;
+    var seat = isExec ? 'EXECUTABLE' : (t._ft_suspended === true ? 'FAST-TRACK (suspended)' : 'RESEARCH');
+    if (t._stab_status) seat += ' \u00b7 ' + String(t._stab_status);
+    var price = Number(t.price);
+    var roi = Number(t.roi_pct);
+    var plan;
+    if (isFinite(price) && price > 0 && isFinite(roi)) {
+      plan = 'TP1 ' + dt10V2Fmt_(price * (1 + roi / 100), 2);
+      var stop = Number(t.stop_sar);
+      plan += (isExec && isFinite(stop) && stop > 0) ? ' \u00b7 stop ' + dt10V2Fmt_(stop, 2) + ' SAR' : ' \u00b7 stop [withheld]';
+    } else {
+      plan = 'plan n/a';
+    }
+    var d = t.detail || {};
+    var rr = d.rr_tp2;
+    if (rr === null || rr === undefined || rr === '') rr = d.rr;
+    var score = cand.opportunity_score;
+    if (score === null || score === undefined) score = t._stab_smoothed;
+    rows.push([
+      t.rank === null || t.rank === undefined ? '' : t.rank,
+      sym + (t.name ? ' \u00b7 ' + String(t.name) : '') + (t.sector ? ' \u00b7 ' + String(t.sector) : ''),
+      seat,
+      (isFinite(price) && price > 0 ? dt10V2Fmt_(price, 2) : 'n/a') + (t.currency ? ' ' + String(t.currency) : ''),
+      plan,
+      'plan ' + dt10V2Pct_(t.roi_pct) + ' / eng ' + dt10V2Pct_(t.engine_roi_pct),
+      dt10V2Fmt_(rr, 2) || 'n/a',
+      isExec ? dt10V2Fmt_(sar, 0) + ' SAR (' + dt10V2Fmt_(shares, 0) + ' sh)' : ref,
+      (dt10V2Fmt_(t.reliability, 0) || 'n/a') + ' \u00b7 ' + (dt10V2Fmt_(t.dq, 0) || 'n/a') + ' \u00b7 ' +
+          (dt10V2Fmt_(score, 1) || 'n/a'),
+      dt10V2SeatFlags_(t, cand, earnMap && sym && earnMap.hasOwnProperty(sym) ? earnMap[sym] : null)
+    ]);
+  }
+  if (grace.length) {
+    rows.push(['', 'GRACE-HELD: ' + grace.join(', '), 'GRACE (' + grace.length + ')', '',
+               'no plan today', '', '', '', '', 'missed ' + graceNotes.join(', ')]);
+  }
+  return { rows: rows, grace: grace.length, exec: exec };
+}
+/** v1.19.0 [B1] PURE: 'capital_call x3 . missing_fx x1' or 'no alerts'. */
+function dt10V2AlertChips_(alerts) {
+  var out = [];
+  for (var i = 0; i < (alerts || []).length; i++) {
+    var a = alerts[i] || {};
+    if (!a.type) continue;
+    var n = Number(a.count);
+    out.push(String(a.type) + (isFinite(n) && n > 0 ? ' \u00d7' + n : ''));
+  }
+  return out.length ? out.join(' \u00b7 ') : 'no alerts';
+}
+/** v1.19.0 [B1] PURE: the six-stage funnel rows [stage, count, conversion %]
+ * from kpis.pregate (pool, eligible, kept), kpis.passed, the seats and the
+ * executable count. A missing stage keeps '' (never 0 invented). */
+function dt10V2Funnel_(payload, exec) {
+  var p = payload || {};
+  var k = p.kpis || {};
+  var pg = k.pregate || {};
+  var vals = [pg.pool, pg.eligible, pg.kept, k.passed, (p.selected || []).length, exec];
+  var rows = [], prev = null;
+  for (var i = 0; i < DT10_V2_FUNNEL_STAGES.length; i++) {
+    var n = Number(vals[i]);
+    var ok = vals[i] !== null && vals[i] !== undefined && vals[i] !== '' && isFinite(n);
+    var conv = '';
+    if (ok && prev !== null && prev > 0) conv = Math.round(1000 * n / prev) / 10;
+    rows.push([DT10_V2_FUNNEL_STAGES[i], ok ? n : '', conv]);
+    if (ok) prev = n;
+  }
+  return rows;
+}
+/** v1.19.0 [B1] PURE: '9,786 -> 238 -> 24 -> 10 -> 4 -> 0' (blank stages as '?'). */
+function dt10V2FunnelText_(rows) {
+  var bits = [];
+  for (var i = 0; i < (rows || []).length; i++) {
+    bits.push(rows[i][1] === '' ? '?' : dt10V2Fmt_(rows[i][1], 0));
+  }
+  return bits.join(' \u2192 ');
+}
+/** v1.19.0 [B1] PURE: Investability Status counts on the sheet pool rows
+ * ([status, Global_Markets, all pages]; WATCHLIST / INVESTABLE / BLOCKED
+ * first, then any other value, then '(blank)'). */
+function dt10V2Universe_(poolRows) {
+  var order = ['INVESTABLE', 'WATCHLIST', 'BLOCKED'];
+  var all = {}, gm = {};
+  for (var i = 0; i < (poolRows || []).length; i++) {
+    var r = poolRows[i] || {};
+    var st = String(r['Investability Status'] === null || r['Investability Status'] === undefined ?
+        '' : r['Investability Status']).replace(/^\s+|\s+$/g, '').toUpperCase() || '(blank)';
+    all[st] = (all[st] || 0) + 1;
+    var page = String(r['Source Page'] || r['Exchange'] || '');
+    if (page === 'Global_Markets') gm[st] = (gm[st] || 0) + 1;
+  }
+  var keys = order.slice();
+  for (var k in all) {
+    if (all.hasOwnProperty(k) && !dt10InList_(keys, k) && k !== '(blank)') keys.push(k);
+  }
+  if (all.hasOwnProperty('(blank)')) keys.push('(blank)');
+  var rows = [];
+  for (var j = 0; j < keys.length; j++) {
+    if (!all.hasOwnProperty(keys[j]) && order.indexOf(keys[j]) < 0) continue;
+    rows.push([keys[j], gm[keys[j]] || 0, all[keys[j]] || 0]);
+  }
+  return rows;
+}
+/** v1.19.0 [B1] PURE: sector counts for the qualified set and the seats,
+ * top 8 by qualified count ([sector, qualified, seats]). */
+function dt10V2Concentration_(qualified, selected) {
+  var q = {}, s = {}, order = [];
+  function sec(x) {
+    var v = String((x && x.sector) || '').replace(/^\s+|\s+$/g, '');
+    return v || 'Unknown';
+  }
+  for (var i = 0; i < (qualified || []).length; i++) {
+    var a = sec(qualified[i]);
+    if (!q.hasOwnProperty(a)) { q[a] = 0; order.push(a); }
+    q[a]++;
+  }
+  for (var j = 0; j < (selected || []).length; j++) {
+    if (selected[j] && selected[j]._grace_hold === true) continue;
+    var b = sec(selected[j]);
+    if (!q.hasOwnProperty(b)) { q[b] = 0; order.push(b); }
+    s[b] = (s[b] || 0) + 1;
+  }
+  order.sort(function (x, y) { return (q[y] - q[x]) || (x < y ? -1 : (x > y ? 1 : 0)); });
+  var rows = [];
+  for (var k = 0; k < order.length && rows.length < 8; k++) {
+    rows.push([order[k], q[order[k]] || 0, s[order[k]] || 0]);
+  }
+  return rows;
+}
+/** v1.19.0 [B1] PURE: hit rate by horizon from a dt10ScorecardIndex_ result
+ * ('Investability|HZ|INVESTABLE', else 'ALL|HZ|ALL'); [] without an index. */
+function dt10V2HitRate_(idx) {
+  var rows = [];
+  if (!idx || !idx.map) return rows;
+  for (var i = 0; i < DT10_V2_HORIZONS.length; i++) {
+    var hz = DT10_V2_HORIZONS[i];
+    var e = idx.map['Investability|' + hz + '|INVESTABLE'] || idx.map['ALL|' + hz + '|ALL'];
+    if (!e || e.hit === null || e.hit === undefined) continue;
+    rows.push([hz, Number(e.hit), Number(e.n) || 0]);
+  }
+  return rows;
+}
+/** v1.19.0 [B1] PURE: {label: value} of every DT10_PANEL label found anywhere
+ * in a values grid (value = the cell to the right); blanks are skipped. */
+function dt10V2PanelScan_(values) {
+  var want = {};
+  for (var i = 0; i < DT10_PANEL.length; i++) want[DT10_PANEL[i].label] = true;
+  var out = {};
+  for (var r = 0; r < (values || []).length; r++) {
+    var row = values[r] || [];
+    for (var c = 0; c < row.length - 1; c++) {
+      var t = String(row[c] === null || row[c] === undefined ? '' : row[c]).replace(/^\s+|\s+$/g, '');
+      if (want[t] && !out.hasOwnProperty(t) && dt10HasValue_(row[c + 1])) out[t] = row[c + 1];
+    }
+  }
+  return out;
+}
+/** v1.19.0 [B1] I/O: the panel for a v2 run -- label scan over the whole
+ * sheet (finds a v1 fixed panel or a v2 panel below the opportunity set),
+ * blanks resolved via _Lists_Config defaults then the built-ins. */
+function dt10V2ReadPanel_(sheet, ss) {
+  var found = {};
+  try {
+    if (sheet && sheet.getLastRow() > 0) found = dt10V2PanelScan_(sheet.getDataRange().getValues());
+  } catch (eRp) { found = {}; }
+  var defaults = dt10PanelDefaults_(ss);
+  var out = {};
+  for (var i = 0; i < DT10_PANEL.length; i++) {
+    var item = DT10_PANEL[i];
+    out[item.label] = found.hasOwnProperty(item.label) ? found[item.label] :
+        dt10PanelSeedValue_(item, defaults, null);
+  }
+  return out;
+}
+/** v1.19.0 [B1] I/O: the fixed v2 block (rows 1-4) is built when the
+ * fingerprint (A3 'Run:') is absent; frozen rows 1-3; returns the sheet. */
+function dt10V2EnsureLayout_(ss, sheet) {
+  if (!sheet) sheet = ss.insertSheet(DT10_SHEET);
+  var fp = '';
+  try { fp = String(sheet.getRange(3, 1).getValue() || ''); } catch (eFp) {}
+  if (fp === 'Run:') return sheet;
+  var tokens = dt10Tokens_(ss);
+  var header = tokens.HEADER || DT10_FALLBACK_TOKENS.HEADER;
+  sheet.clear();
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
+  if (sheet.getMaxColumns() < DT10_LAST_COL) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), DT10_LAST_COL - sheet.getMaxColumns());
+  }
+  sheet.getRange(1, 1).setValue('TOP 10 INVESTMENTS \u2014 DECISION')
+      .setBackground(header.bg).setFontColor(header.fg).setFontWeight('bold').setFontSize(13);
+  sheet.getRange(1, 3, 1, DT10_LAST_COL - 2).merge().setValue('')
+      .setBackground(header.bg);
+  sheet.getRange(1, 1, 1, DT10_LAST_COL).setBorder(null, null, true, null, null, null,
+      DT10_ACCENT_GOLD, SpreadsheetApp.BorderStyle.SOLID_THICK);
+  sheet.getRange(2, 1).setValue('Blocker:').setFontWeight('bold').setFontColor(DT10_MUTED);
+  sheet.getRange(2, 2, 1, DT10_LAST_COL - 1).merge().setValue('Never run').setFontColor(DT10_INK).setWrap(true);
+  sheet.getRange(3, 1).setValue('Run:').setFontWeight('bold').setFontColor(DT10_MUTED);
+  sheet.getRange(3, 2, 1, DT10_LAST_COL - 1).merge().setValue('').setFontColor(DT10_MUTED);
+  sheet.getRange(DT10_V2_ROW_STATUS, 1, 1, DT10_LAST_COL).merge()
+      .setValue('Never run \u2014 use menu: Refresh Decision Top 10').setFontColor(DT10_MUTED).setFontSize(9);
+  sheet.setFrozenRows(3);
+  sheet.setColumnWidths(1, DT10_LAST_COL, 95);
+  sheet.setColumnWidth(2, 220);
+  sheet.setColumnWidth(3, 160);
+  sheet.setColumnWidth(DT10_LAST_COL, 360);
+  Logger.log('[DT10 v' + DT10_VERSION + '] v2 layout built');
+  return sheet;
+}
+/** v1.19.0 [B1] I/O: B1 chip (coloured), B2 blocker, B3 run tokens. */
+function dt10V2StatusBlock_(sheet, state, blocker, runTokens) {
+  var tok = state === DT10_V2_STATES[2] ? DT10_FALLBACK_TOKENS.VERDICT_POSITIVE :
+      (state === DT10_V2_STATES[1] ? DT10_FALLBACK_TOKENS.VERDICT_WATCH : DT10_FALLBACK_TOKENS.VERDICT_NEGATIVE);
+  sheet.getRange(1, 2).setValue(state).setBackground(tok.bg).setFontColor(tok.fg)
+      .setFontWeight('bold').setFontSize(12).setHorizontalAlignment('center');
+  sheet.getRange(2, 2).setValue(String(blocker || ''));
+  sheet.getRange(3, 2).setValue(String(runTokens || ''));
+}
+/** v1.19.0 [B1] I/O: the control panel block at the given row (banner + 3-per-row
+ * grid, same geometry as the v1 panel, operator-blue inputs). Returns the
+ * next free row. */
+function dt10V2PanelWrite_(sheet, row, panel, tokens) {
+  var header = tokens.HEADER || DT10_FALLBACK_TOKENS.HEADER;
+  var op = tokens.OPERATOR_INPUT || DT10_FALLBACK_TOKENS.OPERATOR_INPUT;
+  sheet.getRange(row, 1, 1, DT10_LAST_COL).merge()
+      .setValue('CONTROL PANEL \u2014 blue cells are operator inputs (L14); edits are read back on the next refresh. ' +
+                'Blanks re-seed from _Lists_Config defaults.')
+      .setBackground(header.bg).setFontColor(header.fg).setFontWeight('bold');
+  var first = row + 1;
+  for (var i = 0; i < DT10_PANEL.length; i++) {
+    var item = DT10_PANEL[i];
+    var r = first + Math.floor(i / 3), slot = i % 3, lc = 1 + slot * 3;
+    sheet.getRange(r, lc).setValue(item.label).setFontWeight('bold').setFontSize(9)
+        .setWrap(true).setBackground(DT10_TINT).setFontColor(DT10_NAVY);
+    var cell = sheet.getRange(r, lc + 1);
+    cell.setValue(panel.hasOwnProperty(item.label) ? panel[item.label] : item.def)
+        .setBackground(op.bg).setFontColor(op.fg).setFontWeight('bold');
+    if (item.kind === 'sar') cell.setNumberFormat(DT10_FMT_SAR);
+    else if (item.kind === 'num') cell.setNumberFormat('0.0#');
+    else if (item.kind === 'int') cell.setNumberFormat('0');
+  }
+  var rows = Math.ceil(DT10_PANEL.length / 3);
+  sheet.getRange(first, 1, rows, 8).setBorder(true, true, true, true, true, true, DT10_BORDER,
+      SpreadsheetApp.BorderStyle.SOLID);
+  return first + rows + 1;
+}
+/** v1.19.0 [B1] I/O: rewrite the hidden _Charts_Data_T10 tab: funnel A:C,
+ * universe E:G, concentration I:K, hit rate M:O, stamp Q1:Q2. Returns the
+ * sheet or null (fail-open). */
+function dt10V2ChartsData_(ss, blocks, stamp) {
+  try {
+    var sh = ss.getSheetByName(DT10_V2_CHARTS_SHEET);
+    if (!sh) {
+      sh = ss.insertSheet(DT10_V2_CHARTS_SHEET);
+      try { sh.hideSheet(); } catch (eH) {}
+    }
+    sh.clearContents();
+    var specs = [
+      [1, ['Stage', 'Count', 'Conversion %'], blocks.funnel],
+      [5, ['Investability', 'Global_Markets', 'All pages'], blocks.universe],
+      [9, ['Sector', 'Qualified', 'Seats'], blocks.concentration],
+      [13, ['Horizon', 'Hit Rate %', 'n'], blocks.hitRate]];
+    for (var i = 0; i < specs.length; i++) {
+      var col = specs[i][0], hdr = specs[i][1], rows = specs[i][2] || [];
+      var vals = [hdr];
+      for (var r = 0; r < rows.length; r++) vals.push(rows[r].slice(0, 3));
+      sh.getRange(1, col, vals.length, 3).setValues(vals);
+    }
+    sh.getRange(1, 17, 2, 1).setValues([['as of'], [String(stamp || '')]]);
+    return sh;
+  } catch (eCd) {
+    try { Logger.log('[DT10 v' + DT10_VERSION + '] charts data skipped: ' + eCd); } catch (eL) {}
+    return null;
+  }
+}
+/** v1.19.0 [B1] I/O: the four charts anchored at the given row; existing charts of
+ * this module are removed first. Returns the number inserted (fail-open). */
+function dt10V2ChartsDraw_(sheet, data, row, counts) {
+  var n = 0;
+  if (!data) return n;
+  try {
+    var old = sheet.getCharts();
+    for (var i = 0; i < old.length; i++) {
+      var title = '';
+      try { title = String(old[i].getOptions().get('title') || ''); } catch (eT) {}
+      if (title.indexOf(DT10_V2_CHART_TAG) === 0) sheet.removeChart(old[i]);
+    }
+  } catch (eR) {}
+  function put(builder, title, col) {
+    try {
+      sheet.insertChart(builder.setOption('title', DT10_V2_CHART_TAG + title)
+          .setOption('legend', { position: 'bottom' }).setPosition(row, col, 0, 0).build());
+      n++;
+    } catch (eP) {
+      try { Logger.log('[DT10 v' + DT10_VERSION + '] chart skipped (' + title + '): ' + eP); } catch (eL) {}
+    }
+  }
+  var c = counts || {};
+  if (c.funnel > 0) {
+    put(sheet.newChart().asColumnChart().addRange(data.getRange(1, 1, c.funnel + 1, 2))
+        .setNumHeaders(1).setOption('colors', [DT10_V2_COLOR]), 'Funnel', 1);
+  }
+  if (c.universe > 0) {
+    put(sheet.newChart().asColumnChart().addRange(data.getRange(1, 5, c.universe + 1, 3))
+        .setNumHeaders(1).setOption('colors', [DT10_V2_COLOR, DT10_V2_COLOR_SOFT]), 'Universe (Investability Status)', 8);
+  }
+  if (c.concentration > 0) {
+    put(sheet.newChart().asBarChart().addRange(data.getRange(1, 9, c.concentration + 1, 3))
+        .setNumHeaders(1).setOption('colors', [DT10_V2_COLOR, DT10_V2_COLOR_SOFT]), 'Concentration (sector)', 15);
+  }
+  if (c.hitRate > 0) {
+    put(sheet.newChart().asLineChart().addRange(data.getRange(1, 13, c.hitRate + 1, 2))
+        .setNumHeaders(1).setOption('colors', [DT10_V2_COLOR]).setOption('lineWidth', 2), 'Hit rate by horizon', 22);
+  }
+  return n;
+}
+/** v1.19.0 [B1]: the v2 render. Same decision inputs as dt10RenderPayload_
+ * (verdict recheck, finalize, earnings, containment, KPI truth); a new
+ * geometry: status block rows 1-3, status line A4, KPI strip rows 5-6, then
+ * seats, DATA GAPS + alert chips, sector-cap deferrals, ALL QUALIFIED,
+ * CONTROL PANEL, FUNNEL + charts, NEAR MISS, INVESTABILITY reasons,
+ * CANDIDATES, footer. Returns the earnings result like v1. */
+function dt10RenderPayloadV2_(sheet, payload, tokens) {
+  var ss = sheet.getParent();
+  var v2 = payload._dt10_v2 || {};
+  var lastRow = sheet.getMaxRows();
+  if (lastRow >= DT10_V2_ROW_KPI_LABELS) {
+    var zone = sheet.getRange(DT10_V2_ROW_KPI_LABELS, 1, lastRow - DT10_V2_ROW_KPI_LABELS + 1,
+                              sheet.getMaxColumns());
+    zone.breakApart();
+    zone.clear();
+  }
+  payload._dt10_uv = dt10BoardVerdict_(ss, payload._dt10_source_context || {});
+  dt10FinalizeBoard_(payload);
+  var earn = dt10EarningsAnnotate_(payload, ss);
+  // KPI strip (rows 5-6)
+  sheet.getRange(DT10_V2_ROW_KPI_LABELS, 1, 1, DT10_KPI_LABELS.length).setValues([DT10_KPI_LABELS])
+      .setFontWeight('bold').setFontSize(9).setWrap(true).setBackground(DT10_TINT).setFontColor(DT10_MUTED);
+  var kpiRange = sheet.getRange(DT10_V2_ROW_KPI_VALUES, 1, 1, DT10_KPI_LABELS.length);
+  kpiRange.setValues([dt10KpiValues_(payload.kpis)]).setFontWeight('bold').setFontSize(11)
+      .setBackground(DT10_TINT).setFontColor(DT10_NAVY);
+  if (dt10SeatTruthOn_()) {
+    var stKpi = dt10SeatTruthKpi_(payload);
+    if (stKpi) sheet.getRange(DT10_V2_ROW_KPI_VALUES, 3).setValue(stKpi);
+  }
+  var kpiFmts = [DT10_FMT_SAR, DT10_FMT_SAR, '@', '0.0', '0.00', DT10_FMT_INT, DT10_FMT_INT, DT10_FMT_SAR];
+  for (var kf = 0; kf < kpiFmts.length; kf++) {
+    sheet.getRange(DT10_V2_ROW_KPI_VALUES, kf + 1).setNumberFormat(kpiFmts[kf]);
+  }
+  var selected = payload.selected || [];
+  var nearMiss = payload.near_miss || [];
+  var alerts = payload.alerts || [];
+  var p142 = dt10ContainFunding_(nearMiss, alerts, dt10OutputStatus_(payload));
+  nearMiss = p142.nearMiss;
+  alerts = p142.alerts;
+  var cands = payload.candidates_rows || [];
+  var it = payload._dt10_it || { mode: 'off' };
+  if (it.mode !== 'off') {
+    var ev = dt10GateEvaluabilityCore_(cands,
+        (payload.meta && payload.meta.route) ? payload.meta.route.news_display : null);
+    payload._dt10_it_ev = ev;
+    payload._dt10_it_note = dt10GateEvaluabilityNote_(ev, it.mode) + dt10PanelRefNote_(it.ref, it.mode);
+    if (it.mode === 'enforce') {
+      sheet.getRange(DT10_V2_ROW_KPI_LABELS, DT10_KPI_LABELS.length + 1, 2, 2).setValues(dt10GateKpiCells_(ev));
+    }
+  }
+  var dt10Uv = payload._dt10_uv;
+  if (dt10Uv.state !== 'EXECUTABLE' && dt10KpiTruthEnabled_() && dt10OutputStatus_(payload) === 'WITHHELD') {
+    kpiRange.setValues([dt10KpiWithheldValues_(payload.kpis)]);
+  }
+  var vt = payload._dt10_vint || { mode: 'off' };
+  if (vt.mode !== 'off') payload._dt10_vint_note = dt10VintageNote_(selected, vt.idx, vt.mode);
+  // Status block
+  var stamp = '';
+  try { stamp = Utilities.formatDate(new Date(), 'Asia/Riyadh', 'HH:mm'); } catch (eSt) {}
+  dt10V2StatusBlock_(sheet, dt10V2State_(payload), dt10V2Blocker_(payload),
+      dt10V2RunTokens_(payload, v2.stab_note, stamp));
+  var row = DT10_V2_ZONES_START;
+  // MODEL EVIDENCE strip (L3)
+  var scIdx = dt10ScorecardIndex_(dt10ReadScorecard_(ss));
+  var meLines = dt10ModelEvidenceLines_(scIdx, selected, cands);
+  for (var mi = 0; mi < meLines.length; mi++) {
+    sheet.getRange(row, 1, 1, DT10_LAST_COL).merge().setValue(meLines[mi])
+        .setFontSize(9).setFontColor(DT10_NAVY).setBackground(DT10_TINT).setWrap(true);
+    row++;
+  }
+  if (meLines.length) row++;
+  // SEATS (10 columns)
+  var seatTitle = dt10SelectedTitle_(payload, dt10UvOn_() || dt10Uv.source_blocked === true);
+  var seats = dt10V2SeatRows_(payload, cands, v2.nav_sar, earn && earn.map);
+  row = dt10WriteSection_(sheet, row, seatTitle, tokens);
+  var selT = dt10WriteTable_(sheet, row, DT10_V2_SEAT_HEADERS, seats.rows,
+      'No qualifying opportunities under the current criteria \u2014 an honest empty result (L13). ' +
+      'See All Qualified / Near Miss for what almost qualified.');
+  if (selT.firstDataRow > 0) {
+    sheet.getRange(selT.firstDataRow, 1, selT.count, DT10_V2_SEAT_HEADERS.length).setWrap(true).setFontSize(9);
+    var seatVals = sheet.getRange(selT.firstDataRow, 3, selT.count, 1).getValues();
+    for (var si = 0; si < selT.count; si++) {
+      var sv = String(seatVals[si][0] || '');
+      var tk = sv.indexOf('EXECUTABLE') === 0 ? tokens.VERDICT_POSITIVE :
+          (sv.indexOf('GRACE') === 0 || sv.indexOf('FAST-TRACK') === 0 ? tokens.VERDICT_WATCH : tokens.VERDICT_BLOCK);
+      if (tk) sheet.getRange(selT.firstDataRow + si, 3).setBackground(tk.bg).setFontColor(tk.fg).setFontWeight('bold');
+    }
+  }
+  row = selT.next + 1;
+  // DATA GAPS (why failed) + alert chips
+  var gap = dt10FailureBreakdown_(cands);
+  var gapHead = 'WHY CANDIDATES DIDN\u2019T QUALIFY';
+  if (gap.total > 0) {
+    gapHead += ' (' + gap.invest + ' of ' + gap.total + ' passed all gates' +
+        (gap.rows.length ? '; top blocker: ' + gap.rows[0].gate + ', ' + gap.rows[0].count + ' names' : '') + ')';
+  }
+  row = dt10WriteSection_(sheet, row, gapHead, tokens);
+  var gapRows = [];
+  for (var g2 = 0; g2 < gap.rows.length; g2++) gapRows.push(dt10GapToRow_(gap.rows[g2], gap.total));
+  var gapT = dt10WriteTable_(sheet, row, DT10_GAP_HEADERS, gapRows,
+      'None \u2014 every audited candidate passed all gates, or the pool was empty.');
+  dt10ApplyColFormats_(sheet, gapT.firstDataRow, gapT.count, { 2: DT10_FMT_INT, 3: DT10_FMT_PCT });
+  row = gapT.next;
+  sheet.getRange(row, 1, 1, DT10_LAST_COL).merge()
+      .setValue('ALERTS (' + alerts.length + '): ' + dt10V2AlertChips_(alerts))
+      .setFontSize(9).setFontColor(DT10_NAVY).setBackground(DT10_TINT).setWrap(true);
+  row += 2;
+  // Sector-cap deferrals (T2)
+  var capDef = payload._dt10_seat_cap_deferred || [];
+  if (capDef.length && !dt10SeatSectorCapLegacy_()) {
+    row = dt10WriteSection_(sheet, row, 'SECTOR CAP \u2014 CARRIED SEATS DEFERRED (' + capDef.length + ')', tokens);
+    var capRows = [];
+    for (var cd = 0; cd < capDef.length; cd++) capRows.push(dt10SeatCapRow_(capDef[cd]));
+    var capT = dt10WriteTable_(sheet, row, DT10_SEATCAP_HEADERS, capRows, 'None');
+    row = capT.next + 1;
+  }
+  // ALL QUALIFIED
+  var qualified = dt10QualifiedFromCands_(cands);
+  row = dt10WriteSection_(sheet, row, 'ALL QUALIFIED \u2014 INVEST opportunity set (' + qualified.length + ')', tokens);
+  var qPending = dt10StabPendingMap_(payload);
+  var qSeats = selected.length;
+  var qTicketRoi = {};
+  for (var qt = 0; qt < selected.length; qt++) {
+    var tkq = dt10NormToken_(selected[qt] && selected[qt].symbol);
+    if (tkq) qTicketRoi[tkq] = selected[qt].roi_pct;
+  }
+  var qRows = [];
+  for (var q2 = 0; q2 < qualified.length; q2++) {
+    qRows.push(dt10QualToRow_(qualified[q2], q2 + 1, qPending, qualified.length, qSeats, qTicketRoi));
+  }
+  var qT = dt10WriteTable_(sheet, row, DT10_QUAL_HEADERS, qRows,
+      'None \u2014 no candidate passed every gate (INVEST) under the current criteria.');
+  dt10ApplyColFormats_(sheet, qT.firstDataRow, qT.count, {
+    6: DT10_FMT_PCT, 7: DT10_FMT_PCT, 8: DT10_FMT_PCT, 9: DT10_FMT_NUM2, 10: '0.0', 11: '0.0', 13: '0.0' });
+  if (qT.firstDataRow > 0) {
+    sheet.getRange(qT.firstDataRow, DT10_QUAL_HEADERS.length, qT.count, 1).setWrap(true).setFontSize(9);
+  }
+  dt10ColorQualified_(sheet, qT.firstDataRow, qT.count, 14, qualified, tokens);
+  row = qT.next + 1;
+  // CONTROL PANEL (below the opportunity set)
+  row = dt10V2PanelWrite_(sheet, row, v2.panel || dt10V2ReadPanel_(null, ss), tokens);
+  // FUNNEL + charts
+  var funnel = dt10V2Funnel_(payload, seats.exec);
+  var blocks = { funnel: funnel, universe: v2.universe || [],
+                 concentration: dt10V2Concentration_(qualified, selected), hitRate: dt10V2HitRate_(scIdx) };
+  row = dt10WriteSection_(sheet, row, 'FUNNEL \u2014 ' + dt10V2FunnelText_(funnel) +
+      ' (pool \u2192 eligible \u2192 kept \u2192 passed \u2192 seated \u2192 executable)', tokens);
+  var dataSh = dt10V2ChartsData_(ss, blocks, dt10StatusLine_('v2', '').slice(9, 28));
+  var drawn = dt10V2ChartsDraw_(sheet, dataSh, row, {
+      funnel: funnel.length, universe: blocks.universe.length,
+      concentration: blocks.concentration.length, hitRate: blocks.hitRate.length });
+  payload._dt10_v2_note = 'v2 layout: ' + drawn + ' chart' + (drawn === 1 ? '' : 's') +
+      (dataSh ? '' : ' (data tab unavailable)');
+  row += DT10_V2_CHART_ROWS;
+  // NEAR MISS
+  row = dt10WriteSection_(sheet, row, 'NEAR MISS \u2014 closest to qualifying (' + nearMiss.length + ')', tokens);
+  var nmRows = [];
+  for (var nI = 0; nI < nearMiss.length; nI++) nmRows.push(dt10NearMissToRow_(nearMiss[nI]));
+  var nmT = dt10WriteTable_(sheet, row, DT10_NEARMISS_HEADERS, nmRows, 'None \u2014 no candidates were close to qualifying.');
+  dt10ColorVerdicts_(sheet, nmT.firstDataRow, nmT.count, 5, tokens);
+  row = nmT.next + 1;
+  // INVESTABILITY reasons (T1)
+  var irRows = dt10InvestReasonRows_(payload.meta);
+  if (irRows.length && !dt10InvestReasonsLegacy_()) {
+    row = dt10WriteSection_(sheet, row, 'INVESTABILITY \u2014 BY ENGINE REASON (' +
+        payload.meta.investability_reasons.total + ' benched)', tokens);
+    var irT = dt10WriteTable_(sheet, row, DT10_INVREASON_HEADERS, irRows, 'None');
+    dt10ApplyColFormats_(sheet, irT.firstDataRow, irT.count, { 2: DT10_FMT_INT, 3: DT10_FMT_PCT });
+    row = irT.next + 1;
+  }
+  // CANDIDATES (same cand-tab logic as v1)
+  row = dt10WriteSection_(sheet, row, 'CANDIDATES \u2014 FULL AUDIT \u2014 top ' + cands.length +
+      ' rows written (full scan size is the Scanned KPI)', tokens);
+  var cRows = [];
+  for (var cI = 0; cI < cands.length; cI++) cRows.push(dt10CandToRow_(cands[cI]));
+  var cm = payload._dt10_cand_mode || 'off';
+  var tab = null;
+  if (cm === 'enforce') {
+    tab = dt10CandTabWrite_(ss, cRows, dt10CandTabStampLine_(payload.meta, cRows.length, new Date()), tokens,
+        dt10CandRunId_(payload.meta));
+    payload._dt10_cand_result = tab;
+  }
+  var cT;
+  if (tab && tab.ok) {
+    cT = dt10WriteTable_(sheet, row, DT10_CAND_HEADERS, [], dt10CandPointerText_(cRows.length, dt10MetaLine_(payload.meta)));
+  } else {
+    cT = dt10WriteTable_(sheet, row, DT10_CAND_HEADERS, cRows, 'No candidates \u2014 pool was empty (see the status line).');
+    dt10ApplyColFormats_(sheet, cT.firstDataRow, cT.count, {
+      6: DT10_FMT_PRICE, 7: DT10_FMT_PRICE, 8: DT10_FMT_PCT, 9: DT10_FMT_PCT,
+      10: DT10_FMT_PCT, 11: DT10_FMT_NUM2, 12: '0.0', 13: '0.0', 20: '0.0' });
+    dt10ColorVerdicts_(sheet, cT.firstDataRow, cT.count, 18, tokens);
+  }
+  row = cT.next + 1;
+  if (cm !== 'off') {
+    payload._dt10_cand_note = (tab && tab.ok) ?
+        'cands ' + cRows.length + ' -> ' + DT10_CANDTAB_SHEET + ' (v2 footer row ' + row + ')' :
+        (cm === 'enforce' ? 'cands ' + DT10_CANDTAB_SHEET + ' write FAILED (' + ((tab && tab.err) || 'unknown') +
+            ') \u2014 grid kept in cockpit (v2 footer row ' + row + ')' :
+            'cands ' + cRows.length + ' in cockpit (v2 footer row ' + row + ') [observe]');
+  }
+  sheet.getRange(row, 1, 1, DT10_LAST_COL).merge().setValue(dt10MetaLine_(payload.meta))
+      .setFontColor(DT10_MUTED).setFontSize(8).setFontStyle('italic');
+  return earn;
 }
 // ---------------------------------------------------------------------------
 // v1.18.0 [L4] -- send the scorecard cohorts to the backend evidence gate
@@ -6502,6 +7238,9 @@ function dt10PanelPreserve_(sheet) {
       var v = sheet.getRange(pos.row, pos.valueCol).getValue();
       if (dt10HasValue_(v)) out[item.label] = v;
     }
+    var anyFixed = false;
+    for (var pk0 in out) { if (out.hasOwnProperty(pk0)) { anyFixed = true; break; } }
+    if (!anyFixed) out = dt10V2PanelScan_(sheet.getDataRange().getValues());   // v1.19.0 [B1]: v2 panel below
   } catch (e) {}
   return out;
 }
@@ -7653,18 +8392,24 @@ function refreshDecisionTop10() {
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
+  // v1.19.0 [B1]: the v2 layout reads the panel by label scan BEFORE the
+  // fixed block is (re)built; v1 keeps its guard and fixed reads.
+  var v2 = dt10V2LayoutOn_();
+  var v2Panel = v2 ? dt10V2ReadPanel_(sheet, ss) : null;
+  if (v2) sheet = dt10V2EnsureLayout_(ss, sheet);
   // v1.3.0 layout guard: the panel grew a row (KPI head moved 13 -> 14), so a
   // v1.2.x sheet would take KPI/zone writes one row high. 'KPIs' at the NEW
   // head row is the layout fingerprint; anything else auto-rebuilds once.
-  if (!sheet || sheet.getRange(DT10_ROW_PANEL_HEAD, 1).getValue() === '' ||
-      sheet.getRange(DT10_ROW_KPI_HEAD, 1).getValue() !== 'KPIs') {
+  if (!v2 && (!sheet || sheet.getRange(DT10_ROW_PANEL_HEAD, 1).getValue() === '' ||
+      sheet.getRange(DT10_ROW_KPI_HEAD, 1).getValue() !== 'KPIs')) {
     sheet = buildDecisionTop10Layout();
   }
   var tokens = dt10Tokens_(ss);
-  var statusCell = sheet.getRange(DT10_ROW_STATUS, 2);
+  var statusCell = v2 ? sheet.getRange(DT10_V2_ROW_STATUS, 1) :   // v1.19.0 [B1]: A4 in v2
+      sheet.getRange(DT10_ROW_STATUS, 2);
   statusCell.setValue(dt10StatusLine_('running\u2026', ''));
   SpreadsheetApp.flush();
-  var panel = dt10ReadPanel_(sheet, ss);
+  var panel = v2 ? v2Panel : dt10ReadPanel_(sheet, ss);   // v1.19.0 [B1]
   // v1.13.4 [WP-8]: input-truth gates -- three memoized property reads;
   // off (default) => no feature input reads; a narrow owned-KPI read
   // prevents prior enforce cells surviving an off/property-failure run.
@@ -7691,6 +8436,7 @@ function refreshDecisionTop10() {
           ' | board kept from the last render; re-run after the ' +
           'Global_Markets leg lands' + dt10StaleNote_(), 'HELD');
       statusCell.setValue(heldLine);
+      dt10V2FailChip_(sheet, v2, 'sync in flight (HELD)');   // v1.19.0 [B1]
       dt10WritePageStatus_('HELD', 'Decision cockpit: ' + heldLine, '', '',
           String(new Date().getTime() - t0), []);
       dt10RunLogRow_('INFO', 'HELD',
@@ -7786,6 +8532,7 @@ function refreshDecisionTop10() {
   } catch (eNet) {
     statusCell.setValue(dt10StatusLine_('NETWORK ERROR',
         String(eNet) + dt10StaleNote_()));
+    dt10V2FailChip_(sheet, v2, 'network error');   // v1.19.0 [B1]
     // v1.4.0: cockpit-owned _Status — failure is reported, never silent.
     dt10WritePageStatus_('ERROR',
         'Decision cockpit: NETWORK ERROR — ' + String(eNet).slice(0, 300),
@@ -7796,6 +8543,7 @@ function refreshDecisionTop10() {
   if (resp.code !== 200 || !resp.json) {
     statusCell.setValue(dt10StatusLine_('HTTP ' + resp.code,
         (resp.text || '').slice(0, 180) + dt10StaleNote_()));
+    dt10V2FailChip_(sheet, v2, 'HTTP ' + resp.code);   // v1.19.0 [B1]
     // v1.4.0: cockpit-owned _Status — failure is reported, never silent.
     dt10WritePageStatus_('ERROR',
         'Decision cockpit: HTTP ' + resp.code + ' — ' +
@@ -7810,6 +8558,7 @@ function refreshDecisionTop10() {
   if (degraded) {
     statusCell.setValue(dt10StatusLine_('DEGRADED',
         degraded + dt10StaleNote_()));
+    dt10V2FailChip_(sheet, v2, 'degraded payload');   // v1.19.0 [B1]
     dt10WritePageStatus_('WARN',
         'Decision cockpit: degraded payload (' + degraded +
         ') — board preserved, not refreshed', resp.code, '', '', []);
@@ -7843,7 +8592,12 @@ function refreshDecisionTop10() {
   var kpiNote;
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
   var seatNote;
+  if (v2) {   // v1.19.0 [B1]: private render inputs for the v2 layout
+    payload._dt10_v2 = { panel: panel, universe: pool ? dt10V2Universe_(pool.rows) : [],
+                         stab_note: (stab && stab.note) || '', nav_sar: dt10V2NavSar_(body) };
+  }
   var earn = dt10RenderPayload_(sheet, payload, tokens);
+  var v2Note = payload._dt10_v2_note || '';   // v1.19.0 [B1]
   // v1.13.4 [WP-8]: status tokens the render stored ('' when a gate is off).
   var itNote = payload._dt10_it_note || '';
   if (itMode !== 'off') {
@@ -7872,6 +8626,7 @@ function refreshDecisionTop10() {
       (itNote ? ' | ' + itNote : '') +               // v1.13.4 [WP-8]
       (candNote ? ' | ' + candNote : '') +
       (vintNote ? ' | ' + vintNote : '') +
+      (v2Note ? ' | ' + v2Note : '') +                 // v1.19.0 [B1]
       dt10FunnelNote_(payload) + ' | ' + secs + 's',
       dt10OutputStatus_(payload));   // v1.11.0 (2)
   // v1.3.1: the cockpit OWNS the selection audit trail — log the board it
@@ -8088,6 +8843,7 @@ function dt10UvParse_(raw, nowMs) {
 }
 
 function dt10RenderPayload_(sheet, payload, tokens) {
+  if (dt10V2LayoutOn_()) return dt10RenderPayloadV2_(sheet, payload, tokens);   // v1.19.0 [B1]
   // Clear dynamic zones (breakApart first: section headers and empty-state
   // lines are merged ranges; writing over stale merges throws in GAS).
   var lastRow = sheet.getMaxRows();
@@ -9138,6 +9894,37 @@ function dt10SelfTest() {
         escT[1].cohort === 'INVESTABLE|BUY' && escT[1].n === 671 && escT[1].hit === 63.3 &&
         dt10EvidenceScorecardRows_(null).length === 0) ? 'ok' : 'FAIL') +
       ' | send (DT10_EVIDENCE_SCORECARD_SEND): ' + (dt10EvidenceScorecardSendOn_() ? 'on' : 'off (default)'));
+  // v1.19.0 [B1]: v2 layout pure cores (state enum, seat rows without an em
+  // dash, 10-column header, funnel, chips) + the property state.
+  var v2P = { kpis: { passed: 24, deployable_sar: 100000, pregate: { pool: 9786, eligible: 238, kept: 24 } },
+      _dt10_uv: { state: 'EXECUTABLE' }, meta: { route: { request_id: 'abc' } },
+      selected: [{ rank: 1, symbol: 'SHG.US', name: 'Shinhan', sector: 'Financials', price: 84.3,
+          currency: 'USD', roi_pct: 12.5, engine_roi_pct: 9.1, reliability: 72, dq: 85,
+          suggested_shares: 0, suggested_sar: 0, stop_sar: '\u2014', _stab_status: 'ACTIVE (day 3)',
+          detail: { rr_tp2: 2.1 } },
+        { symbol: 'G.US', _grace_hold: true, _stab_status: 'GRACE (1/3 missed)' }],
+      candidates_rows: [{ symbol: 'SHG.US', opportunity_score: 71.8, risk_level: 'Medium', cluster: 'Banks \u00d719',
+          failure_reason: '[w52-observe] pos 19% | 1d +4.3%' }] };
+  var v2Seats = dt10V2SeatRows_(v2P, v2P.candidates_rows, 500000, { 'SHG.US': 4 });
+  var v2Dash = false;
+  for (var v2r = 0; v2r < v2Seats.rows.length; v2r++) {
+    for (var v2c = 0; v2c < v2Seats.rows[v2r].length; v2c++) {
+      if (String(v2Seats.rows[v2r][v2c]).indexOf('\u2014') >= 0) v2Dash = true;
+    }
+  }
+  var v2F = dt10V2Funnel_(v2P, 0);
+  report.push('v2 layout core: ' +
+      ((dt10InList_(DT10_V2_STATES, dt10V2State_(v2P)) && dt10V2State_(v2P) === 'RESEARCH' &&
+        dt10V2State_({ _dt10_uv: { state: 'NOT_ACTIONABLE', reason: 'x' }, selected: [] }) === 'NOT ACTIONABLE' &&
+        DT10_V2_SEAT_HEADERS.length === 10 && v2Seats.rows.length === 2 && v2Seats.rows[0].length === 10 &&
+        !v2Dash && v2Seats.rows[0][4] === 'TP1 94.84 \u00b7 stop [withheld]' &&
+        v2Seats.rows[0][7] === '25,000 SAR' && v2Seats.rows[1][2] === 'GRACE (1)' &&
+        v2Seats.rows[0][9].indexOf('earnings \u22644d') === 0 && v2Seats.rows[0][9].indexOf('cluster Banks') > 0 &&
+        dt10V2FunnelText_(v2F) === '9,786 \u2192 238 \u2192 24 \u2192 24 \u2192 2 \u2192 0' &&
+        dt10V2AlertChips_([{ type: 'capital_call', count: 3 }, { type: 'missing_fx' }]) === 'capital_call \u00d73 \u00b7 missing_fx' &&
+        dt10V2RunTokens_(v2P, 'stab: x | epoch=2026-10-17/feed', '08:07').indexOf('epoch 2026-10-17/feed \u00b7 08:07 Riyadh \u00b7 v' + DT10_VERSION) === 0)
+       ? 'ok' : 'FAIL') +
+      ' | layout (' + DT10_V2_PROP + '): ' + (dt10V2LayoutOn_() ? 'v2 ON' : 'v1 (default)'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of
