@@ -52,7 +52,7 @@ def _run(rows, mode, fail_get=False, publication_id=None, break_update=False):
 
 
 def test_version_and_contract_text():
-    assert tp.SCRIPT_VERSION == "6.47.0"
+    assert tp.SCRIPT_VERSION == "6.48.0"
     src = open(tp.__file__, encoding="utf-8").read()
     assert "# v6.47.0 (2026-10-17) - L5 SIGNAL_HISTORY DEDUP ENFORCE + PUBLICATION IDENTITY" in src
     assert "enforce requested but NOT built" not in src

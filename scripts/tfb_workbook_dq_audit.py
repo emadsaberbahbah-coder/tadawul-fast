@@ -352,6 +352,7 @@ KNOWN_TABS = {
     "Regret_Summary": ("GitHub/Python", "run_shadow_scorer", "regret summary", "per run", "overwrite", "low", True),
     "S1_Gate": ("GitHub/Python", "run_shadow_scorer", "S-1 gate verdict", "per run", "overwrite", "high", True),
     "_S1_Calibration": ("GitHub/Python", "track_performance", "calibration state", "per run", "append", "medium", True),
+    "_Forecast_Scorecard": ("GitHub/Python", "track_performance (audit lane)", "forecast scorecard: cohort hit-rates", "per audited run", "overwrite", "medium", True),
     "Shadow_Board": ("GitHub/Python", "run_shadow_board", "shadow board", "per run", "overwrite", "medium", True),
     "Shadow_History": ("GitHub/Python", "run_shadow_board", "shadow baskets", "per run", "append", "medium", True),
     "_Corporate_Actions": ("GitHub/Python", "pit_snapshot / corporate_actions", "corporate actions", "daily", "append", "medium", True),
@@ -366,6 +367,7 @@ TAB_STAMP_COLUMN = {
     "Signal_History": "Recorded At (Riyadh)", "Signal_Trends": "Recorded At (Riyadh)", "Calendar_Events": "Updated At (Riyadh)",
     "Regime_History": "Captured At (UTC)", "Regret_Ledger": "Date", "_PIT_Fundamentals": "Captured At (UTC)",
     "_S1_Calibration": "As Of (Riyadh)", "Shadow_History": "Date", "_Shariah_Authority": "Fetched At (UTC)",
+    "_Forecast_Scorecard": "As Of (Riyadh)",
     "_Corporate_Actions": "Detected At", "Hypothesis_Registry": "Last Backtest (UTC)",
 }
 TAB_SYMBOL_KEYED = set(MARKET_PAGES) | {PORTFOLIO_PAGE, INVESTABLE_VIEW, "Calendar_Events", "Signal_History",

@@ -1628,6 +1628,32 @@ from urllib.error import HTTPError, URLError
 # exits 2. Functions added 5 (_bt_period_from_days_enabled, _bt_days_to_period,
 # _bt_history_depth, _bt_empty_verdict, _append_runlog_backtest_warning);
 # removed 0. Tests: tests/test_backtest_history_depth_l2.py.
+# v6.48.0 (2026-10-17) - L3 FORECAST SCORECARD (Codex brief 17-Oct s2 L3): THE
+# OUTCOME FEEDBACK THE OPERATOR NEVER SEES. Performance_Log holds 11,791
+# matured records whose hit-rates are computed by --analyze and printed to a
+# job log nobody reads: INVESTABLE 47.1% (n=963) = WATCHLIST 47.1% (n=10,100);
+# BLOCKED 20.2%; ACCUMULATE/1M 63.3%; Origin Top_10 49.5% vs Decision_Coverage
+# 36.6%; mean realized ROI 1M +0.94%, 3M -1.32%. WHAT: forecast_scorecard_rows
+# (pure) folds the matured records into one row per cohort -- horizon x
+# {ALL, Entry Investability, Entry Recommendation, Entry Score decile, Origin
+# Tab, Entry Selected, Investability x Recommendation} -- with n, wins,
+# losses, decided-only hit-rate (the analyzer's own definition), a Wilson 95%
+# interval, mean and median realized ROI; cohorts below TRACK_SCORECARD_MIN_N
+# (default 5) are dropped except the ALL rows. _publish_forecast_scorecard
+# overwrites the _Forecast_Scorecard tab in place (header row 1, as_of stamp
+# on every row) on the AUDIT lane only, right after the S-1 calibration
+# publish: best-effort telemetry, never raises, never fails the clock.
+# Entry Forecast Source is NOT a Performance_Log column (the record has no
+# such field), so that dimension is deferred to the L6 writer change which
+# adds unit/source columns at record creation. GATE TRACK_FORECAST_SCORECARD
+# (default ON; 0/false/off/no disables -> no tab write, byte-identical lane).
+# Readers: 16_Decision_Top10 v1.17.0 renders a 3-line "Model evidence" strip;
+# tfb_workbook_dq_audit registers the tab; opportunity_builder L4 (observe)
+# consumes the Investability x Recommendation cohort. No scoring, gating or
+# record change. Functions added 4 (_forecast_scorecard_enabled,
+# _forecast_scorecard_min_n, forecast_scorecard_rows,
+# PerformanceTrackerApp._publish_forecast_scorecard); constants 2; removed 0.
+# Tests: tests/test_tp_forecast_scorecard_l3.py.
 # v6.47.0 (2026-10-17) - L5 SIGNAL_HISTORY DEDUP ENFORCE + PUBLICATION IDENTITY
 # (Codex brief 17-Oct s2 L5). Measured on the 17-Oct export: Signal_History
 # 31,168 rows, 8,281 unique symbol-day keys, 22,887 duplicates (73.4%), max 19
@@ -1665,7 +1691,7 @@ from urllib.error import HTTPError, URLError
 # row count grows by appended only; the next day's measure shows backlog flat.
 # Functions added 2 (load_key_rows, upsert_snapshots). Removed 0. Rollback:
 # TRACK_DEDUP_SIGNAL_HISTORY=observe (measure) or off.
-SCRIPT_VERSION = "6.47.0"
+SCRIPT_VERSION = "6.48.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -4078,6 +4104,109 @@ S1_CAL_HEADER = [
     "Mean Signed Error (pp)", "Band (pp)", "Min Sample", "By Horizon",
     "Detail", "Writer Version",
 ]
+
+
+# ---------------------------------------------------------------------------
+# v6.48.0 [L3] - Forecast Scorecard (pure fold + overwrite-in-place publisher)
+# ---------------------------------------------------------------------------
+FORECAST_SCORECARD_TAB = "_Forecast_Scorecard"
+FORECAST_SCORECARD_HEADER = [
+    "As Of (Riyadh)", "Horizon", "Dimension", "Cohort", "n", "Wins", "Losses",
+    "Hit Rate %", "Hit Lo %", "Hit Hi %", "Mean ROI %", "Median ROI %",
+    "Tracker Version",
+]
+_SCORECARD_DIMENSIONS = (
+    "ALL", "Investability", "Recommendation", "Score Decile", "Origin Tab",
+    "Entry Selected", "Investability x Recommendation",
+)
+
+
+def _forecast_scorecard_enabled() -> bool:
+    """v6.48.0 [L3]: TRACK_FORECAST_SCORECARD, default ON; 0/false/off/no
+    disables the tab write (the audit lane is then byte-identical)."""
+    return (os.getenv("TRACK_FORECAST_SCORECARD") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _forecast_scorecard_min_n() -> int:
+    """v6.48.0 [L3]: TRACK_SCORECARD_MIN_N (default 5, clamp 1..1000) -- a
+    cohort below it is not published (the ALL rows always are)."""
+    try:
+        v = int(float((os.getenv("TRACK_SCORECARD_MIN_N") or "5").strip()))
+    except (TypeError, ValueError):
+        v = 5
+    return max(1, min(1000, v))
+
+
+def _scorecard_cohorts(rec: Any) -> List[Tuple[str, str]]:
+    """(dimension, cohort) labels of one matured record."""
+    inv = (_safe_str(getattr(rec, "entry_investability_status", "")) or "UNSPECIFIED").upper()
+    rec_v = getattr(rec, "entry_recommendation", None)
+    rec_s = _safe_str(getattr(rec_v, "value", rec_v)) or "HOLD"
+    try:
+        score = float(getattr(rec, "entry_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    decile = "D%d" % max(0, min(9, int(score // 10.0)))
+    origin = _safe_str(getattr(rec, "origin_tab", "")) or "Unknown"
+    selected = (_safe_str(getattr(rec, "entry_selected", "")) or "UNSPECIFIED").upper()
+    return [("ALL", "ALL"), ("Investability", inv), ("Recommendation", rec_s),
+            ("Score Decile", decile), ("Origin Tab", origin),
+            ("Entry Selected", selected),
+            ("Investability x Recommendation", inv + "|" + rec_s)]
+
+
+def forecast_scorecard_rows(records: Any, as_of: Optional[str] = None,
+                            min_n: Optional[int] = None) -> List[List[Any]]:
+    """v6.48.0 [L3] PURE: one row per cohort (FORECAST_SCORECARD_HEADER
+    order) over the MATURED records with a realized ROI (loader-invalid
+    outcomes excluded). Horizons: each present horizon plus 'ALL'. Hit rate
+    is decided-only (wins / (wins + losses)) with a Wilson 95% interval;
+    mean/median over every matured ROI of the cohort. Cohorts with
+    n < min_n are dropped except Dimension 'ALL'. Sorted by horizon order,
+    dimension order, n desc, cohort name."""
+    min_n = _forecast_scorecard_min_n() if min_n is None else max(1, int(min_n))
+    stamp = as_of or _riyadh_now().strftime("%Y-%m-%d %H:%M:%S")
+    matured = []
+    for r in records or []:
+        try:
+            if getattr(r, "status", None) != PerformanceStatus.MATURED:
+                continue
+            roi = getattr(r, "realized_roi", None)
+            if roi is None or not getattr(r, "realized_roi_source_valid", True):
+                continue
+            matured.append((r, float(roi)))
+        except Exception:
+            continue
+    horizon_order = [h.value for h in HorizonType]
+    buckets: Dict[Tuple[str, str, str], List[float]] = {}
+    for r, roi in matured:
+        hz = getattr(getattr(r, "horizon", None), "value", None) or _safe_str(getattr(r, "horizon", "")) or "?"
+        for dim, cohort in _scorecard_cohorts(r):
+            for h in (hz, "ALL"):
+                buckets.setdefault((h, dim, cohort), []).append(roi)
+    rows = []
+    for (h, dim, cohort), rois in buckets.items():
+        n = len(rois)
+        if dim != "ALL" and n < min_n:
+            continue
+        wins = sum(1 for x in rois if x > 0)
+        losses = sum(1 for x in rois if x < 0)
+        decided = wins + losses
+        hit = round(wins / decided * 100.0, 1) if decided else 0.0
+        lo, hi = wilson_interval(wins, decided)
+        srt = sorted(rois)
+        mid = len(srt) // 2
+        median = srt[mid] if len(srt) % 2 else (srt[mid - 1] + srt[mid]) / 2.0
+        rows.append([stamp, h, dim, cohort, n, wins, losses, hit, lo, hi,
+                     round(sum(rois) / n, 2), round(median, 2), SCRIPT_VERSION])
+    def _key(row):
+        h = row[1]
+        hk = horizon_order.index(h) if h in horizon_order else (len(horizon_order) if h == "ALL" else len(horizon_order) + 1)
+        dk = _SCORECARD_DIMENSIONS.index(row[2]) if row[2] in _SCORECARD_DIMENSIONS else 99
+        return (hk, dk, -int(row[4]), str(row[3]))
+    rows.sort(key=_key)
+    return rows
 
 
 def _s1_cal_enabled() -> bool:
@@ -9903,6 +10032,43 @@ class PerformanceTrackerApp:
             logger.warning("[CALIBRATION v6.36.0] publish skipped: %s", e)
             return out
 
+    def _publish_forecast_scorecard(self, records: Any) -> bool:
+        """v6.48.0 [L3]: overwrite the _Forecast_Scorecard tab in place from
+        the freshly audited records (header row 1, as_of on every row).
+        Audit lane only; best-effort telemetry: never raises, never fails
+        the clock. Returns True on a successful write."""
+        if not _forecast_scorecard_enabled():
+            return False
+        try:
+            rows = forecast_scorecard_rows(records)
+            matured = sum(1 for r in (records or [])
+                          if getattr(r, "status", None) == PerformanceStatus.MATURED
+                          and getattr(r, "realized_roi", None) is not None)
+            _out(f"FORECAST SCORECARD: {len(rows)} cohort row(s) from "
+                 f"{matured} matured record(s) (min_n={_forecast_scorecard_min_n()})")
+            if not (self.store and self.store.is_available()
+                    and getattr(self.store, "sheet", None)):
+                logger.warning("[v6.48.0 L3] no sheet handle - scorecard "
+                               "computed but not published")
+                return False
+            sheet = self.store.sheet
+            try:
+                ws = sheet.worksheet(FORECAST_SCORECARD_TAB)
+            except Exception:
+                ws = sheet.add_worksheet(title=FORECAST_SCORECARD_TAB,
+                                         rows=max(50, len(rows) + 5),
+                                         cols=len(FORECAST_SCORECARD_HEADER) + 1)
+            self.store.backoff.execute_sync(ws.clear)
+            self.store.backoff.execute_sync(
+                ws.update, "A1", [list(FORECAST_SCORECARD_HEADER)] + rows
+            )
+            logger.info("[v6.48.0 L3 FORECAST-SCORECARD] wrote %d cohort row(s) "
+                        "(matured=%d)", len(rows), matured)
+            return True
+        except Exception as e:
+            logger.warning("[v6.48.0 L3] forecast scorecard publish skipped: %s", e)
+            return False
+
     def _publish_s1_calibration(self, records: Any) -> bool:
         """v6.29.0 [WAVE B]: compute criterion-4 calibration and overwrite
         the _S1_Calibration block. Returns True on a successful write.
@@ -10473,6 +10639,15 @@ class PerformanceTrackerApp:
             except Exception as _cal_e:
                 logger.warning("[v6.29.0 WAVE-B] calibration publish "
                                "skipped: %s", _cal_e)
+            # v6.48.0 [L3]: the Forecast Scorecard (outcome feedback), same
+            # best-effort contract: a tab fault never fails the clock.
+            try:
+                await loop.run_in_executor(
+                    _get_executor(), self._publish_forecast_scorecard, records
+                )
+            except Exception as _fs_e:
+                logger.warning("[v6.48.0 L3] forecast scorecard publish "
+                               "skipped: %s", _fs_e)
             if self.store.is_available():
                 await loop.run_in_executor(
                     _get_executor(), self.store.save_records, records

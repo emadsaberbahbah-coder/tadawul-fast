@@ -1,11 +1,34 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.16.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.17.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.17.0 (2026-10-17) -- MODEL EVIDENCE STRIP FROM THE FORECAST SCORECARD (L3)
+ * WHY (Codex brief 2026-10-17 L3): Performance_Log holds 11,791 matured
+ * outcomes and their hit-rates were printed to a job log nobody reads;
+ * track_performance v6.48.0 now writes them to the _Forecast_Scorecard tab
+ * (one row per horizon x dimension x cohort: n, wins, losses, hit-rate,
+ * Wilson interval, mean/median realized ROI). WHAT: a 3-line 'MODEL
+ * EVIDENCE' strip at the top of the dynamic zone (directly under the KPI
+ * strip, before SELECTED): (1) hit-rate by Entry Investability at 1M and
+ * 3M; (2) every seat's own cohort (Investability x Recommendation at 1M,
+ * falling back to the Recommendation cohort) with hit-rate and n; (3)
+ * Origin Top_10 vs Decision_Coverage and the mean realized ROI per
+ * horizon -- 'evidence, not a gate (L4 observe decides)'. Pure cores
+ * (dt10ScorecardIndex_, dt10ModelEvidenceLines_) over the tab grid; the
+ * reader never throws; an absent tab, an empty tab or the kill switch
+ * draws nothing (the page is then byte-identical to v1.16.0). No scoring,
+ * gating, selection or clock change. DEFAULT ON (display-only, reads a
+ * tab); KILL: Script Property DT10_MODEL_EVIDENCE_LEGACY = '1'. Functions
+ * added (0 removed): dt10ModelEvidenceLegacy_, dt10ReadScorecard_,
+ * dt10ScorecardIndex_, dt10ModelEvidenceLines_, dt10FmtN_; var added:
+ * DT10_SCORECARD_SHEET. dt10SelfTest gains 'model evidence core: ok'.
+ * Harness: tests/js/dt10_v1170_model_evidence.test.js (+
+ * tests/js/dt10_v1170_history.js for the hash chain).
  *
  * v1.16.0 (2026-10-17) -- RESEARCH LEVELS WHEN SIZING IS WITHHELD (T7)
  * WHY (Codex brief 2026-10-17 T7, P1): on a withheld or held board every
@@ -1852,7 +1875,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.16.0';
+var DT10_VERSION = '1.17.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3543,6 +3566,148 @@ function dt10FastTrackSuspend_(tk, label) {
       'strict until confirmed (' +
       'seat filled to avoid under-fill; not an executable ticket today).';
   return tk;
+}
+// ---------------------------------------------------------------------------
+// v1.17.0 [L3] -- model-evidence strip from the _Forecast_Scorecard tab
+// ---------------------------------------------------------------------------
+var DT10_SCORECARD_SHEET = '_Forecast_Scorecard';
+/** v1.17.0 [L3]: kill switch. DT10_MODEL_EVIDENCE_LEGACY = '1' -> no strip
+ * (v1.16.0 page). Never throws. */
+function dt10ModelEvidenceLegacy_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty('DT10_MODEL_EVIDENCE_LEGACY') || '') === '1';
+  } catch (eMel) {}
+  return false;
+}
+/** v1.17.0 [L3]: the scorecard grid (header + rows) or null; never throws. */
+function dt10ReadScorecard_(ss) {
+  try {
+    if (dt10ModelEvidenceLegacy_()) return null;
+    var sh = ss && ss.getSheetByName(DT10_SCORECARD_SHEET);
+    if (!sh) return null;
+    var vals = sh.getDataRange().getValues();
+    return (vals && vals.length > 1) ? vals : null;
+  } catch (eRs) {
+    return null;
+  }
+}
+/** v1.17.0 [L3] PURE: '10,100' from a number (whole). */
+function dt10FmtN_(v) {
+  var n = Math.round(Number(v) || 0);
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+/** v1.17.0 [L3] PURE: index the scorecard grid by header name ->
+ * { asOf, rows, map: { 'Dimension|Horizon|Cohort': {n, wins, losses, hit,
+ * lo, hi, mean, median} } }; null when the header lacks the four keys. */
+function dt10ScorecardIndex_(values) {
+  if (!values || values.length < 2) return null;
+  var head = values[0] || [];
+  var col = {};
+  for (var c = 0; c < head.length; c++) col[String(head[c] || '').trim()] = c;
+  var need = ['Horizon', 'Dimension', 'Cohort', 'n', 'Hit Rate %'];
+  for (var k = 0; k < need.length; k++) {
+    if (!col.hasOwnProperty(need[k])) return null;
+  }
+  function num(row, name) {
+    if (!col.hasOwnProperty(name)) return null;
+    var v = Number(row[col[name]]);
+    return isFinite(v) ? v : null;
+  }
+  var out = { asOf: '', rows: 0, map: {} };
+  for (var r = 1; r < values.length; r++) {
+    var row = values[r] || [];
+    var hz = String(row[col['Horizon']] || '').trim();
+    var dim = String(row[col['Dimension']] || '').trim();
+    var coh = String(row[col['Cohort']] || '').trim();
+    if (!hz || !dim || !coh) continue;
+    if (!out.asOf && col.hasOwnProperty('As Of (Riyadh)')) {
+      var ao = row[col['As Of (Riyadh)']];
+      out.asOf = (ao instanceof Date) ? ao.toISOString().slice(0, 16).replace('T', ' ') : String(ao || '');
+    }
+    out.map[dim + '|' + hz + '|' + coh] = {
+      n: num(row, 'n') || 0, wins: num(row, 'Wins'), losses: num(row, 'Losses'),
+      hit: num(row, 'Hit Rate %'), lo: num(row, 'Hit Lo %'), hi: num(row, 'Hit Hi %'),
+      mean: num(row, 'Mean ROI %'), median: num(row, 'Median ROI %')
+    };
+    out.rows++;
+  }
+  return out.rows ? out : null;
+}
+/** v1.17.0 [L3] PURE: the three strip lines, or [] when there is nothing to
+ * say (no index). selected = the final board; cands = candidates_rows (the
+ * seat's Entry Investability comes from engine_gate.investability). */
+function dt10ModelEvidenceLines_(idx, selected, cands) {
+  if (!idx || !idx.map) return [];
+  var m = idx.map;
+  function get(dim, hz, coh) { return m[dim + '|' + hz + '|' + coh] || null; }
+  function pct(v) { return (v === null || v === undefined) ? '?' : (Math.round(v * 10) / 10) + '%'; }
+  function cell(e) {
+    return pct(e.hit) + ' (n=' + dt10FmtN_(e.n) +
+        (e.lo !== null && e.hi !== null ? ', ' + pct(e.lo) + '–' + pct(e.hi) : '') + ')';
+  }
+  // line 1: hit-rate by Entry Investability at 1M and 3M
+  var l1parts = [];
+  var hzs = ['1M', '3M'];
+  var invs = ['INVESTABLE', 'WATCHLIST', 'BLOCKED', 'UNSPECIFIED'];
+  for (var h = 0; h < hzs.length; h++) {
+    var bits = [];
+    for (var i = 0; i < invs.length; i++) {
+      var e = get('Investability', hzs[h], invs[i]);
+      if (e) bits.push(invs[i] + ' ' + cell(e));
+    }
+    if (bits.length) l1parts.push(hzs[h] + ': ' + bits.join(' · '));
+  }
+  var line1 = 'MODEL EVIDENCE — matured Performance_Log outcomes' +
+      (idx.asOf ? ' (as of ' + idx.asOf + ')' : '') + ' — hit-rate by Entry Investability: ' +
+      (l1parts.length ? l1parts.join(' | ') : 'no cohort published yet');
+  // line 2: each seat's own cohort at 1M
+  var candBy = {};
+  cands = cands || [];
+  for (var ci = 0; ci < cands.length; ci++) {
+    var cs = dt10NormSym_(cands[ci] && cands[ci].symbol);
+    if (cs && !candBy[cs]) candBy[cs] = cands[ci];
+  }
+  var seats = [];
+  selected = selected || [];
+  for (var si = 0; si < selected.length && seats.length < 10; si++) {
+    var t = selected[si] || {};
+    var sym = dt10NormSym_(t.symbol);
+    if (!sym) continue;
+    var cRow = candBy[sym] || {};
+    var inv = String((cRow.engine_gate && cRow.engine_gate.investability) || '').toUpperCase() || 'UNSPECIFIED';
+    var rec = String((t.detail && t.detail.engine_recommendation) || '').toUpperCase()
+        .replace(/[^A-Z_]+/g, '_').replace(/^_+|_+$/g, '') || 'HOLD';
+    var ex = get('Investability x Recommendation', '1M', inv + '|' + rec);
+    var txt;
+    if (ex) txt = inv + '/' + rec + ' 1M ' + cell(ex);
+    else {
+      var er = get('Recommendation', '1M', rec);
+      txt = er ? (rec + ' (rec only) 1M ' + cell(er)) : (inv + '/' + rec + ' 1M n/a');
+    }
+    seats.push(String(t.symbol) + ' ' + txt);
+  }
+  var line2 = 'Seats: ' + (seats.length ? seats.join(' · ') : 'none');
+  // line 3: origin and mean realized ROI per horizon
+  var l3 = [];
+  var o1 = get('Origin Tab', '1M', 'Top_10_Investments'), o2 = get('Origin Tab', '1M', 'Decision_Coverage');
+  if (o1 || o2) {
+    l3.push('Origin 1M: ' + (o1 ? 'Top_10 ' + cell(o1) : '') + (o1 && o2 ? ' vs ' : '') +
+            (o2 ? 'Decision_Coverage ' + cell(o2) : ''));
+  }
+  var rois = [];
+  var allH = ['1W', '2W', '1M', '3M'];
+  for (var ah = 0; ah < allH.length; ah++) {
+    var ea = get('ALL', allH[ah], 'ALL');
+    if (ea && ea.mean !== null) {
+      rois.push(allH[ah] + ' ' + (ea.mean >= 0 ? '+' : '') + (Math.round(ea.mean * 100) / 100) + '%' +
+                (ea.median !== null ? ' (med ' + (Math.round(ea.median * 100) / 100) + '%)' : ''));
+    }
+  }
+  if (rois.length) l3.push('mean realized ROI ' + rois.join(' · '));
+  var line3 = (l3.length ? l3.join(' | ') : 'no origin / ROI cohorts published yet') +
+      ' — evidence, not a gate (L4 observe decides).';
+  return [line1, line2, line3];
 }
 // ---------------------------------------------------------------------------
 // v1.16.0 [T7] -- research levels when sizing is withheld (gate: default OFF)
@@ -7940,6 +8105,19 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       dt10OutputStatus_(payload) === 'WITHHELD') {
     kpiRange.setValues([dt10KpiWithheldValues_(payload.kpis)]);
   }
+  // v1.17.0 [L3]: MODEL EVIDENCE strip (three merged lines) under the KPI
+  // strip, before SELECTED; nothing drawn when the scorecard tab is absent,
+  // empty or the kill switch is set (page byte-identical to v1.16.0).
+  var meLines = dt10ModelEvidenceLines_(
+      dt10ScorecardIndex_(dt10ReadScorecard_(sheet.getParent())), selected,
+      payload.candidates_rows || []);
+  for (var mi = 0; mi < meLines.length; mi++) {
+    sheet.getRange(row, 1, 1, DT10_LAST_COL).merge().setValue(meLines[mi])
+        .setFontSize(9).setFontColor(DT10_NAVY).setBackground(DT10_TINT)
+        .setWrap(true);
+    row++;
+  }
+  if (meLines.length) row++;
   // v1.16.0 [T7]: research levels on a non-executable board (Script
   // Property DT10_RESEARCH_LEVELS = on; default off -> rows is empty and
   // nothing below changes).
@@ -8871,6 +9049,23 @@ function dt10SelfTest() {
         dt10ResearchLevelReal_('\u2014') === false && dt10ResearchLevelReal_(0) === false &&
         dt10ResearchLevelReal_(90) === true) ? 'ok' : 'FAIL') +
       ' | DT10_RESEARCH_LEVELS=' + (dt10ResearchLevelsOn_() ? 'on' : 'off (default)'));
+  // v1.17.0 [L3]: pure index + lines over a synthetic scorecard grid.
+  var meIdx = dt10ScorecardIndex_([
+      ['As Of (Riyadh)', 'Horizon', 'Dimension', 'Cohort', 'n', 'Wins', 'Losses', 'Hit Rate %', 'Hit Lo %', 'Hit Hi %', 'Mean ROI %', 'Median ROI %', 'Tracker Version'],
+      ['2026-10-17 11:00:00', '1M', 'ALL', 'ALL', 11791, 5000, 5100, 49.5, 48.6, 50.4, 0.94, -2.5, '6.48.0'],
+      ['2026-10-17 11:00:00', '1M', 'Investability', 'INVESTABLE', 963, 450, 505, 47.1, 44.0, 50.3, 1.1, -1.0, '6.48.0'],
+      ['2026-10-17 11:00:00', '1M', 'Investability x Recommendation', 'INVESTABLE|BUY', 671, 420, 243, 63.3, 59.6, 66.9, 2.0, 1.0, '6.48.0']]);
+  var meL = dt10ModelEvidenceLines_(meIdx,
+      [{ symbol: 'AX.US', detail: { engine_recommendation: 'Buy' } }],
+      [{ symbol: 'AX.US', engine_gate: { investability: 'INVESTABLE' } }]);
+  report.push('model evidence core: ' +
+      ((meIdx && meIdx.rows === 3 && meL.length === 3 &&
+        meL[0].indexOf('1M: INVESTABLE 47.1% (n=963, 44%\u201350.3%)') > 0 &&
+        meL[1] === 'Seats: AX.US INVESTABLE/BUY 1M 63.3% (n=671, 59.6%\u201366.9%)' &&
+        meL[2].indexOf('mean realized ROI 1M +0.94% (med -2.5%)') === 0 &&
+        dt10ModelEvidenceLines_(null, [], []).length === 0 &&
+        dt10ScorecardIndex_([['x']]) === null) ? 'ok' : 'FAIL') +
+      ' | ' + (dt10ModelEvidenceLegacy_() ? 'OFF (DT10_MODEL_EVIDENCE_LEGACY)' : 'ON'));
   report.push('seat truth (P-149 / KPI cell): ' +
               (dt10SeatTruthOn_() ? 'ON' : 'OFF (DT10_SEAT_TRUTH_LEGACY)'));
   // v1.13.4 [WP-8]: input-truth gates -- modes (first property read of

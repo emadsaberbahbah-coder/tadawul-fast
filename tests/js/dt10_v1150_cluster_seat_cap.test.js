@@ -21,7 +21,8 @@ const ROOT = path.join(__dirname, '../..');
 // file with the v1.16.0 edits reversed (dt10_v1160_history.js is itself proven
 // by tests/js/dt10_v1160_research_levels.test.js).
 const {revertV1160} = require('./dt10_v1160_history');
-const source = revertV1160(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8'));
+const {revertV1170} = require('./dt10_v1170_history');
+const source = revertV1160(revertV1170(fs.readFileSync(path.join(ROOT, 'apps_script/16_Decision_Top10.gs'), 'utf8')));
 const plain = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 let passed = 0, failed = 0;
 function test(name, fn) {
