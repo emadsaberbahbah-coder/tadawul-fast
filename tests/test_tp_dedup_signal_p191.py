@@ -138,6 +138,7 @@ class WS:
         self.row_count = 2 + len(rows) + 10
         self.gets = []
         self.appended = []
+        self.updates = []          # v6.47.0 [L5]: (range, row) of in-place upserts
         self.fail_get = fail_get
 
     def get(self, rng):
@@ -151,6 +152,11 @@ class WS:
     def append_rows(self, rows, value_input_option=None):
         self.appended.extend([list(r) for r in rows])
         return {"updates": {"updatedRows": len(rows)}}
+
+    def update(self, values=None, range_name=None):
+        # v6.47.0 [L5]: the enforce upsert writes TODAY's row in place.
+        self.updates.append((range_name, [list(r) for r in (values or [])]))
+        return {"updatedRows": len(values or [])}
 
 
 class _RunLogWS:
@@ -332,21 +338,34 @@ T("P3 observe: one WARNING line with the counts",
 T("P3 observe: no 'enforce' warning", not any("enforce requested" in l for l in log_obs))
 
 # ---------------------------------------------------------------- P4 ---- #
+# v6.47.0 [L5]: enforce APPLIES (last-of-day upsert of today's row; new keys
+# append). AAA (3 rows today) -> its LAST row (sheet row 4) is overwritten; BBB
+# -> row 5; DDD (new key) -> appended. Yesterday's CCC rows are never touched.
 w_enf, ws_enf, rb_enf, log_enf = _run(tp, FIX, "enforce")
-EXP_ENF = dict(EXP_OBS, mode="enforce", requested="enforce")
-T("P4 enforce (measure-only): rows identical to off, 3 appended",
-  w_enf == 3 and _rows_digest(ws_enf.appended) == d_off and ws_enf.gets == ["B2:B19"], (w_enf, ws_enf.gets))
-T("P4 enforce: read-back mode/requested 'enforce', applied False, same counts", rb_enf == EXP_ENF, _norm(rb_enf))
-T("P4 enforce: the 'NOT built in v6.44.0' warning is logged",
-  any("enforce requested but NOT built in v6.44.0" in l for l in log_enf), log_enf)
+EXP_ENF = dict(EXP_OBS, mode="enforce", requested="enforce", applied=True,
+               policy="last-of-day", updated=2, appended=1)
+T("P4 enforce (last-of-day): ONE Key-column read, 1 appended (DDD), 2 updated in place (AAA row 4, BBB row 5)",
+  w_enf == 1 and ws_enf.gets == ["B2:B19"] and len(ws_enf.appended) == 1
+  and ws_enf.appended[0][H.index("Symbol")] == "DDD.US"
+  and sorted(r for r, _ in ws_enf.updates) == ["A4:U4", "A5:U5"]
+  and {rows[0][H.index("Symbol")] for _, rows in ws_enf.updates} == {"AAA.US", "BBB.US"},
+  (w_enf, ws_enf.gets, [r for r, _ in ws_enf.updates], [r[H.index("Symbol")] for r in ws_enf.appended]))
+T("P4 enforce: read-back applied True / policy last-of-day / updated 2 / appended 1, measurement counts kept",
+  rb_enf == EXP_ENF, _norm(rb_enf))
+T("P4 enforce: the applied line is logged and the old 'NOT built' warning is gone",
+  any("enforce applied last-of-day: updated=2 appended=1" in l for l in log_enf)
+  and not any("NOT built" in l for l in log_enf), log_enf)
+T("P4 enforce: the appended row equals the off-run DDD row (values untouched, identity blank without TRACK_PUBLICATION_ID)",
+  _rows_digest(ws_enf.appended) == _rows_digest([r for r in ws_off.appended if r[H.index("Symbol")] == "DDD.US"])
+  and ws_enf.appended[0][H.index("Publication Key")] == "", ws_enf.appended)
 
 # ---------------------------------------------------------------- P5 ---- #
 tok_obs = tp._dedup_signal_token(rb_obs)
 tok_enf = tp._dedup_signal_token(rb_enf)
 tok_off = tp._dedup_signal_token(rb_off)
 T("P5 token observe", tok_obs == " | dedup_signal observe would_skip 2/3 backlog 3", tok_obs)
-T("P5 token enforce carries '(measure-only)'",
-  tok_enf == " | dedup_signal enforce(measure-only) would_skip 2/3 backlog 3", tok_enf)
+T("P5 token enforce names its policy and counts (v6.47.0)",
+  tok_enf == " | dedup_signal enforce(last-of-day) updated 2 appended 1 backlog 3", tok_enf)
 T("P5 token off is empty", tok_off == "", repr(tok_off))
 msg_off, js_off = _verdict(tp, None)
 msg_obs, js_obs = _verdict(tp, "observe")

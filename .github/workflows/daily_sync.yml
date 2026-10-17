@@ -1365,6 +1365,11 @@ jobs:
           # Variables select observe; explicit off/invalid still reach the parser.
           # ROLLBACK: set TRACK_DEDUP_SIGNAL_HISTORY to off; unsetting
           # reactivates observe. No historical deduplication is performed.
+          # (2026-10-17) track_performance v6.47.0 [L5]: enforce now de-duplicates
+          # AT WRITE TIME (last-of-day upsert of TODAY's row per symbol; prior
+          # days never rewritten; publication identity filled on new snapshots
+          # from TRACK_PUBLICATION_ID). Arm by Variable after the observe
+          # read-back; the historical backlog compaction stays a separate item.
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}

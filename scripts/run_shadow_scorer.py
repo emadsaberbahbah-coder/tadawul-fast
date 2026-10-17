@@ -1,6 +1,14 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.10.1 (2026-10-17) — "ALPHA SINCE <DATE>" INFORMATIONAL GATE ROW, DARK (Codex brief L5)
+The S-1 net alpha (+7.11%) was all earned before 31 Aug: re-indexing Shadow_History
+from 31 Aug to 16 Oct gives challenger −0.66%, champion −0.71%, benchmark +0.30%.
+Criterion 3 passes on the cumulative window only. TFB_S1_ALPHA_SINCE=YYYY-MM-DD
+adds ONE informational S1_Gate meta row (challenger / champion / benchmark / net
+alpha since that date, via the existing window_cum) beside the cumulative
+figures. Criteria byte-untouched; unset (default) → no row, byte-identical.
+
 VERSION 1.10.0 (2026-10-17) — DAY-0 SEAT PAIRING, DARK (Codex brief T6; S-1 lever)
 Shadow_History, October: 12 scored / 4 excluded days, all four `fresh-floor`,
 zero `no-challenger`. The starver is seat turnover (50–100 %/day): a seat with
@@ -497,7 +505,17 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # Functions added: 3 (_new_seat_day0_mode, day0_spot_seats, blend_day0).
 # Removed: 0. Kill: unset the env (or any value but `spot`).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.10.0"
+# v1.10.1 (2026-10-17) - "ALPHA SINCE <DATE>" INFORMATIONAL ROW, DARK (brief L5)
+# -----------------------------------------------------------------------------
+# WHAT: TFB_S1_ALPHA_SINCE (YYYY-MM-DD; unset/unparseable -> no row). When set,
+# the S1_Gate meta block gains one row - the BENCHMARK_EQW W-7 precedent -
+# with challenger / champion / benchmark cum return since that date (the last
+# index strictly before the date is the base; window_cum, v1.9.2) and the net
+# alpha, labelled INFORMATIONAL ONLY. Criteria, Shadow_History, counters and
+# the verdict line are byte-untouched. Emad sets 2026-08-31 (s8).
+# Functions added: 1 (_alpha_since). Removed: 0. Kill: unset the env.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.10.1"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -1032,6 +1050,17 @@ def _window_start(raw: Optional[str] = None) -> date:
         return datetime.strptime(str(txt).strip()[:10], "%Y-%m-%d").date()
     except Exception:  # noqa: BLE001
         return datetime.strptime(S1_WINDOW_START_DEFAULT, "%Y-%m-%d").date()
+
+
+def _alpha_since(raw: Optional[str] = None) -> Optional[date]:
+    """v1.10.1 PURE given raw [L5]: TFB_S1_ALPHA_SINCE (YYYY-MM-DD) -> date;
+    unset / unparseable -> None (no row). Never raises."""
+    txt = raw if raw is not None else (os.getenv("TFB_S1_ALPHA_SINCE") or "")
+    try:
+        txt = str(txt).strip()[:10]
+        return datetime.strptime(txt, "%Y-%m-%d").date() if txt else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def window_cum(history: Sequence[Dict[str, Any]], basket: str, start: date,
@@ -2393,6 +2422,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "cost-adjusted",
             "INFORMATIONAL ONLY — not an S-1 input; criteria and the §1 "
             "composite benchmark are byte-untouched"])
+    _as_date = _alpha_since()                      # v1.10.1 [L5] informational
+    if _as_date is not None:
+        _as = {b: window_cum(history, b, _as_date, (results.get(b) or {}).get("index"))
+               for b in (CHALLENGER, CHAMPION, BENCHMARK)}
+        _as_alpha = (None if (_as[CHALLENGER] is None or _as[BENCHMARK] is None)
+                     else _as[CHALLENGER] - _as[BENCHMARK])
+
+        def _fmt_as(v: Optional[float]) -> str:
+            return "n/a" if v is None else f"{v:+.2f}%"
+        meta.append([
+            f"alpha since {_as_date.isoformat()}: challenger {_fmt_as(_as[CHALLENGER])}",
+            f"champion {_fmt_as(_as[CHAMPION])}",
+            f"benchmark {_fmt_as(_as[BENCHMARK])}",
+            f"net alpha {_fmt_as(_as_alpha)}",
+            "INFORMATIONAL ONLY — not an S-1 input; criteria byte-untouched "
+            "(TFB_S1_ALPHA_SINCE)"])
     # v1.1.1: gate FIRST, then evidence, then the secondary summary. Each
     # write independently guarded so one failure cannot suppress the others.
     _write_errors: List[str] = []
@@ -3072,6 +3117,11 @@ def _selftest() -> int:
                    "day0=[C]" in _fl0 and _fd0["day0"] == ["C"]
                    and "day0" not in _freshness_detail(["A", "C"], {"A": 1.0}, {"A": 1.1, "C": 3.0},
                                                        1, 0, [], 0.6)[0]))
+
+    checks.append(("ALPHA-SINCE: reader date / blank->None / junk->None",   # v1.10.1 [L5]
+                   _alpha_since("2026-08-31") == date(2026, 8, 31)
+                   and _alpha_since("") is None and _alpha_since("junk") is None
+                   and _alpha_since("2026-08-31T00:00:00Z") == date(2026, 8, 31)))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:

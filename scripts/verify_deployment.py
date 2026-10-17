@@ -319,7 +319,7 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_ROI12_SOFTCAP_GATE", "off", "provider target ROI12 ceiling (off|observe|enforce)", False),
     ("TFB_TUPLE_NOISE_RELEASE", "off", "precision-evidenced tuple release (off|observe|enforce)", False),
     ("TFB_EQ_ROI_UNIT_SENTRY", "off", "enriched-quote fraction-unit sentry (off|observe|enforce)", False),
-    ("TRACK_DEDUP_SIGNAL_HISTORY", "off", "same-day repetition measurement only, including enforce", False),
+    ("TRACK_DEDUP_SIGNAL_HISTORY", "off", "same-day repeats: observe measures, enforce de-duplicates at write time (last-of-day, v6.47.0)", False),
     ("TRACK_CANONICAL_TARGETS", "0", "new tracker targets use versioned percentage-point receipts", False),
     ("TRACK_SIGNAL_PUBLICATION_MODE", "off", "immutable publication-key idempotent append (off|immutable)", False),
     ("TRACK_PUBLICATION_ID", "", "source publication identity; required for immutable writes", False),
@@ -663,7 +663,9 @@ def check_flags() -> List[Dict[str, Any]]:
             # TFB_SETTLE_UNRESOLVED take effect. So observe reads as ARMED too.
             armed = str(live).strip().lower() in ("observe", "enforce")
         elif name == "TRACK_DEDUP_SIGNAL_HISTORY":
-            armed = False  # Both observe/enforce are explicitly measurement-only.
+            # v6.47.0 [L5]: observe is measurement-only; enforce writes
+            # (last-of-day upsert of today's row), so it reads as ARMED.
+            armed = str(live).strip().lower() == "enforce"
         elif name == "TRACK_SIGNAL_PUBLICATION_MODE":
             armed = str(live).strip().lower() == "immutable"
         elif name == "TFB_DQ_AUDIT_MODE":

@@ -111,6 +111,10 @@ def tracker_receipt(exit_code: int, log_path: Path, help_path: Path, audit_enabl
             (int(value) for value in last[1:]))) }
     measurement_matches = bool(measurement and measurement["mode"] == mode)
     writes = re.findall(r"record_signal_snapshots: wrote (\d+) new daily snapshot\(s\)", log)
+    # v6.47.0 [L5]: an APPLIED enforce writes one line naming its policy and counts.
+    applied = re.findall(r"DEDUP-SIGNAL\] enforce applied (last-of-day): updated=(\d+) appended=(\d+)", log)
+    apply_receipt = ({"policy": applied[-1][0], "updated": int(applied[-1][1]),
+                      "appended": int(applied[-1][2])} if applied and mode == "enforce" else None)
     append_failures = any(token in log for token in (
         "[EVIDENCE-APPEND", "Failed to append", "init failed:", "record_signal_snapshots failed:"))
     publication = _accepted(values.get("TRACK_SIGNAL_PUBLICATION_MODE"), ("immutable",))
@@ -122,7 +126,9 @@ def tracker_receipt(exit_code: int, log_path: Path, help_path: Path, audit_enabl
     receipt.update(workflow="track_performance", tracker_exit_code=exit_code,
                    source_versions={"track_performance": source_version}, cli_version=cli_version,
                    signal_history_mode=mode, signal_history_measurement=measurement,
-                   signal_history_measurement_only=True, same_day_deduplication_applied=False,
+                   signal_history_measurement_only=apply_receipt is None,
+                   same_day_deduplication_applied=apply_receipt is not None,
+                   signal_history_apply=apply_receipt,
                    signal_snapshot_append_acknowledged=sum(int(value) for value in writes),
                    append_failure_logged=append_failures, audit_enabled=audit_enabled,
                    historical_grid_save_requested=audit_enabled,

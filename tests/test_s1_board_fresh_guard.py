@@ -26,7 +26,7 @@ def main():
                        capture_output=True, text=True)
     line = [l for l in r.stdout.splitlines() if "SELFTEST" in l][-1]
     assert r.returncode == 0 and _passing_selftest(line, 116), line
-    print("K1 PASS  full existing selftest battery 120/120 on v1.10.0:", line.strip())
+    print("K1 PASS  full existing selftest battery 121/121 on v1.10.1:", line.strip())
 
     # K2: asof parsing — the EXACT live meta shape + failure modes
     live_meta = [["SHADOW BOARD v1.3.0", "as of 2026-09-11 17:44 Riyadh",

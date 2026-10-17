@@ -46,7 +46,7 @@ def test_review_rollout_receipts_distinguish_measurement_from_enforcement(monkey
     assert not rows['TFB_ROI12_SOFTCAP_GATE']['armed']
     assert rows['TFB_TUPLE_NOISE_RELEASE']['armed']
     assert not rows['TFB_EQ_ROI_UNIT_SENTRY']['armed']
-    assert not rows['TRACK_DEDUP_SIGNAL_HISTORY']['armed']
+    assert rows['TRACK_DEDUP_SIGNAL_HISTORY']['armed']   # v6.47.0 [L5]: enforce writes
     assert rows['TRACK_SIGNAL_PUBLICATION_MODE']['armed']
     assert rows['TRACK_CANONICAL_TARGETS']['armed']
     assert rows['TFB_DQ_AUDIT_MODE']['armed']

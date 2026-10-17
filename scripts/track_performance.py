@@ -1628,7 +1628,44 @@ from urllib.error import HTTPError, URLError
 # exits 2. Functions added 5 (_bt_period_from_days_enabled, _bt_days_to_period,
 # _bt_history_depth, _bt_empty_verdict, _append_runlog_backtest_warning);
 # removed 0. Tests: tests/test_backtest_history_depth_l2.py.
-SCRIPT_VERSION = "6.46.0"
+# v6.47.0 (2026-10-17) - L5 SIGNAL_HISTORY DEDUP ENFORCE + PUBLICATION IDENTITY
+# (Codex brief 17-Oct s2 L5). Measured on the 17-Oct export: Signal_History
+# 31,168 rows, 8,281 unique symbol-day keys, 22,887 duplicates (73.4%), max 19
+# per key; the three publication-identity columns blank on every row.
+# TRACK_DEDUP_SIGNAL_HISTORY=enforce was parsed but MEASURE-ONLY since v6.44.0
+# (policy last|first pending the owner). The brief decides: dedup at write
+# time, one snapshot per symbol per Riyadh day, keep the LATEST, never rewrite
+# history. On an append-only tab "keep the latest" without rewriting means an
+# UPSERT OF TODAY'S ROW ONLY: a snapshot whose symbol|day key already exists
+# overwrites the LAST row carrying that key (today's row - the key embeds the
+# Riyadh day, so a prior day's row can never match); a new key appends. Prior
+# days are therefore byte-untouched and the backlog stops growing from the
+# first enforce run; the historical compaction stays a separate owner item.
+# WHAT (enforce only; off and observe byte-identical to v6.46.0):
+#   (1) SignalHistoryStore.load_key_rows: the same one bounded Key-column read
+#       as load_key_column, returning (sheet row, key) pairs so blank rows
+#       keep their position; load_key_column delegates to it.
+#   (2) SignalHistoryStore.upsert_snapshots(snaps, key_rows): in-batch last
+#       wins; existing key -> ws.update of that row (A..U); new key -> append
+#       (capacity guard as append_snapshots); returns {updated, appended} or
+#       None on any failure, in which case record_signal_snapshots FALLS BACK
+#       to the plain append (fail-open = the v6.46.0 behaviour).
+#   (3) publication identity on NEW snapshots under enforce: when
+#       TRACK_PUBLICATION_ID is set (both lanes map github.run_id) the
+#       Publication Key / ID / Schema columns are filled with the v6.45.0
+#       formulas; unset -> left blank (never guessed). Training cohorts can
+#       then key on publication identity, as the brief requires.
+#   (4) read-back: _LAST_DEDUP_SIGNAL gains applied=True, policy, updated,
+#       appended; the [PERF-VERDICT] token reads
+#       ' | dedup_signal enforce(last-of-day) updated u appended a backlog B';
+#       the job log gains '[v6.47.0 DEDUP-SIGNAL] enforce applied last-of-day:
+#       updated=u appended=a'; the tracker receipt reports
+#       same_day_deduplication_applied=True / measurement_only=False from it.
+# READ-BACK (first enforce run): appended < built, updated > 0, Signal_History
+# row count grows by appended only; the next day's measure shows backlog flat.
+# Functions added 2 (load_key_rows, upsert_snapshots). Removed 0. Rollback:
+# TRACK_DEDUP_SIGNAL_HISTORY=observe (measure) or off.
+SCRIPT_VERSION = "6.47.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3912,9 +3949,16 @@ def _dedup_signal_token(d: Any) -> str:
         mode = str(d.get("mode") or "off")
         if mode not in ("observe", "enforce"):
             return ""
-        tag = mode + ("" if mode == "observe" else "(measure-only)")
+        # v6.47.0 [L5]: enforce is no longer measure-only; an APPLIED enforce
+        # names its policy and counts, an unapplied one (read/apply failure)
+        # reads like the measurement so the operator sees it did not act.
+        tag = mode
         if d.get("read_ok") is False:
             return " | dedup_signal %s read-failed" % tag
+        if mode == "enforce" and d.get("applied") is True:
+            return " | dedup_signal enforce(%s) updated %d appended %d backlog %d" % (
+                str(d.get("policy") or "last-of-day"), int(d.get("updated") or 0),
+                int(d.get("appended") or 0), int(d.get("backlog") or 0))
         return " | dedup_signal %s would_skip %d/%d backlog %d" % (
             tag, int(d.get("would_skip") or 0), int(d.get("built") or 0),
             int(d.get("backlog") or 0))
@@ -6426,8 +6470,8 @@ class SignalHistoryStore:
                     self.cache_keys.add(snap.key)
         return out
 
-    def load_key_column(self, max_records: int = 200000) -> Optional[List[str]]:
-        """v6.44.0 [P-191]: ONE bounded read of the Key column (B2:B<end>),
+    def load_key_rows(self, max_records: int = 200000) -> Optional[List[Tuple[int, str]]]:
+        """v6.44.0 [P-191] / v6.47.0 [L5]: ONE bounded read of the Key column (B2:B<end>),
         clamped to the grid by the SAME three lines as load_snapshots, for the
         TRACK_DEDUP_SIGNAL_HISTORY measurement. Returns the non-blank Key cells
         in sheet order; None (never []) when the read failed, so a failed read
@@ -6451,7 +6495,86 @@ class SignalHistoryStore:
         except Exception as e:
             logger.warning("[v6.44.0 DEDUP-SIGNAL] key column read failed: %s", e)
             return None
-        return [_safe_str(r[0]) for r in (rows or []) if r and _safe_str(r[0])]
+        # v6.47.0 [L5]: keep the sheet row of every non-blank key (blank rows
+        # keep their position) so an enforce upsert can target TODAY's row.
+        out: List[Tuple[int, str]] = []
+        for i, r in enumerate(rows or []):
+            k = _safe_str(r[0]) if r else ""
+            if k:
+                out.append((self.DATA_ROW0 + i, k))
+        return out
+
+    def load_key_column(self, max_records: int = 200000) -> Optional[List[str]]:
+        """v6.44.0 contract kept: the non-blank Key cells in sheet order; None
+        when the read failed; [] without a worksheet. v6.47.0: one read via
+        load_key_rows (positions dropped here, kept there)."""
+        rows = self.load_key_rows(max_records)
+        if rows is None:
+            return None
+        return [k for _, k in rows]
+
+    def upsert_snapshots(self, snaps: List[SignalSnapshot],
+                         key_rows: Optional[List[Tuple[int, str]]]) -> Optional[Dict[str, int]]:
+        """v6.47.0 [L5] ENFORCE = LAST-OF-DAY. In-batch last wins; a snapshot
+        whose key already exists on the sheet OVERWRITES the last row carrying
+        it (the key embeds the Riyadh day, so only today's row can match);
+        new keys append. Returns {"updated", "appended"}; None on any failure
+        so the caller can fall back to the plain append. Never under
+        TRACK_SIGNAL_PUBLICATION_MODE=immutable (that path owns identity)."""
+        if not self.ws or key_rows is None:
+            return None
+        if _signal_publication_mode() == "immutable":
+            return None
+        try:
+            last_row: Dict[str, int] = {}
+            for rownum, k in key_rows:
+                kk = _safe_str(k).strip().upper()
+                if kk:
+                    last_row[kk] = max(int(rownum), last_row.get(kk, 0))
+            latest: Dict[str, SignalSnapshot] = {}
+            order: List[str] = []
+            for sn in snaps or []:
+                kk = _safe_str(getattr(sn, "key", "")).strip().upper()
+                if not kk:
+                    continue
+                if kk not in latest:
+                    order.append(kk)
+                latest[kk] = sn           # last in batch = latest
+            updated = 0
+            to_append: List[SignalSnapshot] = []
+            ncol = len(self.HEADERS)
+            for kk in order:
+                sn = latest[kk]
+                rownum = last_row.get(kk)
+                if rownum:
+                    rng = _a1_range(1, rownum, ncol, rownum)
+                    row = self._snapshot_to_row(sn)
+                    self.backoff.execute_sync(
+                        lambda: self.ws.update(values=[row], range_name=rng))  # type: ignore
+                    updated += 1
+                else:
+                    to_append.append(sn)
+            appended = 0
+            if to_append:
+                _blk = _capacity_block_reason(
+                    getattr(self, "_ws_book", None) or self.sheet,
+                    getattr(self, "_ws_sid", None) or self.spreadsheet_id)
+                if _blk:
+                    logger.error("[CAPACITY v6.34.0] Signal_History append REFUSED: %s", _blk)
+                    _note_evidence_append_failure("Signal_History", _blk)
+                else:
+                    rows = [self._snapshot_to_row(sn) for sn in to_append]
+                    self.backoff.execute_sync(
+                        lambda: self.ws.append_rows(rows, value_input_option="RAW"))  # type: ignore
+                    with self.cache_lock:
+                        for sn in to_append:
+                            self.cache_keys.add(sn.key)
+                    appended = len(to_append)
+            return {"updated": updated, "appended": appended}
+        except Exception as e:
+            logger.error("[v6.47.0 DEDUP-SIGNAL] enforce upsert failed: %s", e)
+            _note_evidence_append_failure("Signal_History", str(e))
+            return None
 
     def _snapshot_to_row(self, s: SignalSnapshot) -> List[Any]:
         return [
@@ -9243,9 +9366,10 @@ class PerformanceTrackerApp:
         _ds_mode = _dedup_signal_mode()
         if _ds_mode != "off":
             try:
-                _keys = await loop.run_in_executor(
-                    _get_executor(), self.signal_store.load_key_column,
+                _key_rows = await loop.run_in_executor(
+                    _get_executor(), self.signal_store.load_key_rows,
                     int(self.args.max_records or _track_max_records_default()))
+                _keys = None if _key_rows is None else [k for _, k in _key_rows]
                 if _keys is None:
                     _LAST_DEDUP_SIGNAL.update({
                         "mode": _ds_mode, "requested": _ds_mode,
@@ -9273,11 +9397,41 @@ class PerformanceTrackerApp:
                         int(_rep["sheet_keys"]), int(_rep["backlog"]),
                         int(_rep["max_per_key"]),
                         ",".join(_rep["keys"]) if _rep["keys"] else "-")
-                if _ds_mode == "enforce":
+                if _ds_mode == "enforce" and _keys is not None:
+                    # v6.47.0 [L5]: APPLY - last-of-day upsert of today's row per
+                    # symbol; prior days untouched. Publication identity is
+                    # filled on the built snapshots first (never guessed: blank
+                    # when TRACK_PUBLICATION_ID is unset). Any failure falls
+                    # through to the plain append below (fail-open).
+                    _pub_id = (os.getenv("TRACK_PUBLICATION_ID") or "").strip()
+                    if _pub_id:
+                        for _sn in snaps:
+                            if not getattr(_sn, "publication_key", ""):
+                                _sn.publication_id = _pub_id
+                                _sn.publication_schema = "tfb-signal-publication/v1"
+                                _sn.publication_key = _publication_key(
+                                    _sn.symbol, _sn.date_key, _pub_id)
+                    _applied = await loop.run_in_executor(
+                        _get_executor(), self.signal_store.upsert_snapshots, snaps, _key_rows)
+                    if _applied is not None:
+                        _LAST_DEDUP_SIGNAL.update({
+                            "applied": True, "policy": "last-of-day",
+                            "updated": int(_applied.get("updated") or 0),
+                            "appended": int(_applied.get("appended") or 0)})
+                        logger.warning(
+                            "[v6.47.0 DEDUP-SIGNAL] enforce applied last-of-day: "
+                            "updated=%d appended=%d (built=%d; prior days untouched; "
+                            "publication identity %s)",
+                            int(_applied.get("updated") or 0), int(_applied.get("appended") or 0),
+                            len(snaps), "filled" if _pub_id else "blank (TRACK_PUBLICATION_ID unset)")
+                        _written = int(_applied.get("appended") or 0)
+                        if _written:
+                            logger.info(
+                                "record_signal_snapshots: wrote %d new daily snapshot(s)", _written)
+                        return _written
                     logger.warning(
-                        "[v6.44.0 DEDUP-SIGNAL] enforce requested but NOT built in "
-                        "v6.44.0 (policy last|first pending owner decision) - "
-                        "measuring only, values untouched")
+                        "[v6.47.0 DEDUP-SIGNAL] enforce apply FAILED - falling back to the "
+                        "plain append (fail-open; values appended as in observe)")
             except Exception as e:
                 logger.warning("[v6.44.0 DEDUP-SIGNAL] measurement skipped: %s", e)
         try:
@@ -10210,6 +10364,9 @@ class PerformanceTrackerApp:
                                          "would_skip": 2, "built": 3, "backlog": 3})
             _t22d = _dedup_signal_token({"mode": "observe", "read_ok": False,
                                          "built": 3})
+            _t22e = _dedup_signal_token({"mode": "enforce", "read_ok": True,   # v6.47.0 [L5]
+                                         "applied": True, "policy": "last-of-day",
+                                         "updated": 2, "appended": 1, "backlog": 3})
             if (_e22["sheet_rows"] == 0 and _e22["backlog"] == 0
                     and _e22["max_per_key"] == 0 and _e22["would_skip"] == 0
                     and _e22["new"] == _e22["built"] == 1
@@ -10220,7 +10377,8 @@ class PerformanceTrackerApp:
                     and _st22.load_key_column() == []
                     and _t22a == "" and _dedup_signal_token(None) == ""
                     and _t22b == " | dedup_signal observe would_skip 2/3 backlog 3"
-                    and _t22c == " | dedup_signal enforce(measure-only) would_skip 2/3 backlog 3"
+                    and _t22c == " | dedup_signal enforce would_skip 2/3 backlog 3"
+                    and _t22e == " | dedup_signal enforce(last-of-day) updated 2 appended 1 backlog 3"
                     and _t22d == " | dedup_signal observe read-failed"
                     and "would_skip" not in _t22d):
                 passed += 1

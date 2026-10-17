@@ -185,7 +185,7 @@ def test_depth_and_empty_verdict():
     assert depth == {"requested": 16, "fetched": 16, "usable": 0, "need": 33, "deepest": 22, "median": 22}
     zero = [SimpleNamespace(universe_size=0) for _ in range(6)]
     cause = tracker._bt_empty_verdict(zero, depth)
-    assert cause.startswith("[BACKTEST-EMPTY v6.46.0] 16/16 symbols returned bars but 0 reached the 33-bar minimum (deepest 22, median 22)")
+    assert cause.startswith("[BACKTEST-EMPTY v%s] 16/16 symbols returned bars but 0 reached the 33-bar minimum (deepest 22, median 22)" % tracker.SCRIPT_VERSION)
     assert "TFB_BACKTEST_PERIOD_FROM_DAYS" in cause
     assert tracker._bt_empty_verdict([], depth) is None
     assert tracker._bt_empty_verdict(zero + [SimpleNamespace(universe_size=3)], depth) is None
@@ -225,7 +225,7 @@ def test_runlog_warning_row_is_fail_open_and_names_the_registry():
 
 
 def test_version_and_changelog():
-    assert tracker.SCRIPT_VERSION == "6.46.0"
+    assert tuple(int(x) for x in tracker.SCRIPT_VERSION.split(".")) >= (6, 46, 0)
     src = open(tracker.__file__, encoding="utf-8").read()
     assert "# v6.46.0 (2026-10-17) - L2 HYPOTHESIS BACKTEST HAS NO BARS" in src
     assert "TFB_BACKTEST_PERIOD_FROM_DAYS=0" in src
