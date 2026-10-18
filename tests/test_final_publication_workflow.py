@@ -110,15 +110,31 @@ class FinalPublicationStructureTests(unittest.TestCase):
         expression = expression_field(self.workflow, "group", 2)
         manual_recovery = (ROOT / ".github/workflows/page_refresh_recovery.yml").read_text(encoding="utf-8")
         recovery_expression = expression_field(manual_recovery, "group", 2)
+        grid_repair = (ROOT / ".github/workflows/grid_capacity_repair.yml").read_text(encoding="utf-8")
+        # All three workflows write the same workbook even when dispatched
+        # from different refs. A ref-qualified group would reopen that race.
+        production_group = "tadawul-production-write"
+        self.assertEqual(expression_field(grid_repair, "group", 2), production_group)
+        self.assertEqual(expression_field(grid_repair, "cancel-in-progress", 2), "false")
         for ref in ("refs/heads/main", "refs/heads/master", "refs/heads/review"):
-            lease = evaluate_condition(expression, event="schedule", ref=ref)
-            self.assertEqual(lease, "tadawul-production-write-" + ref)
-            self.assertEqual(evaluate_condition(expression, event="workflow_dispatch", ref=ref), lease)
-            self.assertEqual(evaluate_condition(recovery_expression, event="workflow_dispatch", ref=ref), lease)
+            with self.subTest(ref=ref):
+                self.assertEqual(evaluate_condition(expression, event="schedule", ref=ref), production_group)
+                self.assertEqual(evaluate_condition(expression, event="workflow_dispatch", ref=ref), production_group)
+                self.assertEqual(evaluate_condition(recovery_expression, event="workflow_dispatch", ref=ref), production_group)
         for event in ("schedule", "workflow_dispatch"):
             self.assertFalse(evaluate_condition(expression_field(self.workflow, "cancel-in-progress", 2), event=event))
+        self.assertFalse(evaluate_condition(expression_field(manual_recovery, "cancel-in-progress", 2),
+                                            event="workflow_dispatch"))
         for event in ("push", "pull_request"):
-            self.assertNotIn("production-write", evaluate_condition(expression, event=event))
+            for ref in ("refs/heads/main", "refs/heads/master", "refs/heads/review"):
+                with self.subTest(event=event, ref=ref):
+                    self.assertNotIn("production-write", evaluate_condition(expression, event=event, ref=ref))
+                    self.assertNotIn("production-write", evaluate_condition(recovery_expression, event=event, ref=ref))
+                    self.assertNotEqual(evaluate_condition(expression, event=event, ref=ref),
+                                        evaluate_condition(recovery_expression, event=event, ref=ref))
+                    for workflow in (self.workflow, manual_recovery):
+                        self.assertTrue(evaluate_condition(expression_field(workflow, "cancel-in-progress", 2),
+                                                           event=event, ref=ref))
 
     def test_checkout_pins_this_runs_commit_and_retains_no_auth(self):
         checkout = step_source(self.job, "Checkout this run's source")

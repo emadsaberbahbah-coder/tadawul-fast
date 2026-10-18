@@ -77,6 +77,12 @@ line elsewhere in the .gs passed. G4 now also requires the harness's new D5
 (the delivered file minus the designed v1.13.8 regions equals the base copy
 byte for byte) and its message says only what D5 checks.
 
+VERSION 1.1.3 (2026-10-18) -- source-target receipt before writer-start veto.
+N34 permits exactly the validated local receipt command between primary
+credentials and supersede. The veto remains before every page write, and the
+other writer lanes still supersede immediately after credentials. N34b rejects
+changed/conditional receipts, extra commands and reordered intervening steps.
+
 Run: pytest -q tests/test_release_decision_feed.py
   or python3 tests/test_release_decision_feed.py      (prints PASS k/k)
 """
@@ -123,6 +129,9 @@ PREV_DIR = os.environ.get("TFB_TEST_SUPERSEDE_BASE_DIR", "")
 RECOVERY_YML = ROOT / ".github" / "workflows" / "page_refresh_recovery.yml"
 GRID_YML = ROOT / ".github" / "workflows" / "grid_capacity_repair.yml"
 SUPERSEDE_STEP = "Supersede released decision feed (P0-1)"
+TARGET_RECEIPT_STEP = "Record the resolved source target before writing"
+TARGET_RECEIPT_COMMAND = ('python scripts/sync_target_receipt.py write '
+                          '--group "$SYNC_GROUP" --output sync_target.json')
 CURRENT_RUN = "90002"
 SOURCE = "90001"
 RELEASE_RUN = "777001"
@@ -434,7 +443,20 @@ def supersede_workflow_expectation(directory):
                  and "GITHUB_ENV" in str(step.get("run", ""))]
         writes = [i for i, step in enumerate(steps) if command in str(step.get("run", ""))]
         assert len(creds) == 1 and writes, (file_name, job_name)
-        assert sup == creds[0] + 1 and sup < writes[0], (file_name, job_name, creds, sup, writes)
+        next_step = creds[0] + 1
+        if (file_name, job_name) == ("daily_sync.yml", "sync-dashboard"):
+            # The sole permitted pre-veto operation validates and records the
+            # already resolved target locally. Pin the entire step contract so
+            # another command, action, condition or ignored failure cannot slip
+            # into this boundary under the receipt's name.
+            receipt = steps[next_step]
+            assert set(receipt) == {"name", "env", "run"}, (file_name, job_name, receipt)
+            assert receipt["name"] == TARGET_RECEIPT_STEP, (file_name, job_name, receipt)
+            assert receipt["env"] == {"SYNC_GROUP": "${{ matrix.group }}"}, receipt["env"]
+            command_line = " ".join(receipt["run"].replace("\\\n", "").split())
+            assert command_line == TARGET_RECEIPT_COMMAND, command_line
+            next_step += 1
+        assert sup == next_step and sup < writes[0], (file_name, job_name, creds, sup, writes)
         step = steps[sup]
         key = "recovery" if file_name == "page_refresh_recovery.yml" else has_mode
         assert step["if"] == EXPECTED_STEP_IF[key], (file_name, job_name, step["if"])
@@ -1499,6 +1521,39 @@ def case_n34_supersede_wired_into_every_page_writer(mp, tmp_path):
         text = path.read_text(encoding="utf-8")
         added = [line for line in text.splitlines() if "Supersede" in line or "supersede" in line]
         assert added and all(ord(ch) < 128 for line in added for ch in line)
+
+
+def case_n34b_target_receipt_cannot_delay_or_bypass_supersede(mp, tmp_path):
+    # JSON is valid YAML. These temporary workflow copies are parsed only;
+    # none of their commands, including the deliberately bad ones, are run.
+    documents = {name: _load_yaml(ROOT / ".github/workflows" / name)
+                 for name in {file_name for file_name, _ in PAGE_WRITERS}}
+    original = documents["daily_sync.yml"]["jobs"]["sync-dashboard"]["steps"]
+    receipt_index = next(i for i, step in enumerate(original)
+                         if step.get("name") == TARGET_RECEIPT_STEP)
+    receipt = original[receipt_index]
+    extra = {"name": "Unexpected pre-veto I/O", "run": "curl https://unexpected.invalid"}
+    mutations = {
+        "missing": [],
+        "extra-before": [extra, receipt],
+        "extra-after": [receipt, extra],
+        "duplicate": [receipt, receipt],
+        "extra-command": [dict(receipt, run=receipt["run"] + "\ncurl https://unexpected.invalid\n")],
+        "different-command": [dict(receipt, run=receipt["run"].replace(" write ", " resolve "))],
+        "conditional": [dict(receipt, **{"if": "${{ false }}"})],
+        "ignored-failure": [dict(receipt, **{"continue-on-error": True})],
+        "different-target": [dict(receipt, env={"SYNC_GROUP": "core-pages"})],
+    }
+    for label, replacement in mutations.items():
+        directory = tmp_path / label
+        directory.mkdir()
+        changed = copy.deepcopy(documents)
+        steps = changed["daily_sync.yml"]["jobs"]["sync-dashboard"]["steps"]
+        steps[receipt_index:receipt_index + 1] = copy.deepcopy(replacement)
+        for name, document in changed.items():
+            (directory / name).write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(AssertionError):
+            supersede_workflow_expectation(directory)
 
 
 def case_n35_consumer_expiry_boundaries_and_lockstep(mp, tmp_path):

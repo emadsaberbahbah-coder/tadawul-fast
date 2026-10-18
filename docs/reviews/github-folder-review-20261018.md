@@ -76,9 +76,11 @@ This is a code-review candidate. It does not constitute a live workbook repair o
 | `workflows/workbook_backup.yml` | Reviewed export/restore/DQ modes; reuse validated backup bytes and distinct-date retention. |
 | `workflows/workflow_repair_tests.yml` | Reviewed offline tests and main-only live guards; preserve nonzero results for actual data failures. |
 
-## What the recent red runs actually mean
+## Run history: initial evidence and final production refresh
 
 Current main CI [39115943771](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39115943771) passed all seven jobs. Its full suite reported **5,144 passed, 33 skipped, 274 subtests passed**. The current-main Daily Sync push run [39115943790](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39115943790) was CI-only: its live writers and publication jobs were skipped. It does not establish a successful live refresh.
+
+The following table preserves the initial review evidence. The later **17:00 UTC production update** immediately after it supersedes the morning data percentages and blocker counts.
 
 | Workflow/run | Observed result | Correct response |
 |---|---|---|
@@ -90,6 +92,16 @@ Current main CI [39115943771](https://github.com/emadsaberbahbah-coder/tadawul-f
 | Historical deployed readback [38655521187](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38655521187) | Healthy HTTP response at that time but deployed SHA differed from expected SHA. | Preserve the SHA check. Today's control-plane and runtime SHA match current main. |
 | Historical Daily Brief [38167875419](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/38167875419) | `NoneType.__format__` in BOOK rendering. | Already repaired on current main using null-safe formatting. Preserve the fix; do not replay the old revision. |
 | Separate development-branch CI [39048479442](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39048479442) | Stale manifest pins, JSON-format assertion and a full-framework import in a lean test lane. | Repair that branch if retained. Its failures are not failures of current main and are not resolved by importing its unrelated changes. |
+
+### Latest production update: 17:00 UTC
+
+The scheduled source run [39142793753](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39142793753), started at 15:57 UTC, ran current main `4c9e2cb` and completed all three source legs and inline recovery successfully. Its final publisher returned audit codes **`[1,2]`**, with **only `decision_failed`** in the blocker list, `blocker_published: true` and `feed_promoted: false`. These results predate this candidate's publication and are not effects of the proposed repairs.
+
+The latest [coverage audit](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518253/job/117734274828) reported **zero failures and one warning**. Global_Markets has **6,613 unique rows**, **6,584 fresh acquisitions (99.5615%)**, and **99.7429% accepted-name coverage**, above the 99% floor. The earlier accepted-name blocker has cleared. Its remaining warning is **10 blank, unparseable or date-only timestamps**. The standalone coverage workflow intentionally returns nonzero for warning exit 1; that red result does not mean the old name-floor failure persists.
+
+The latest [decision audit](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518255/job/117734274609) reported **eight failures**: Portfolio_Decision is older than My_Portfolio; Top10 is older than each of the four source pages; it declares 2,469 funds against the approved 2,474; individual native producer receipts for cross-page exclusions are missing; and its full-universe claim remains unproven. The count difference alone does not establish five missing source rows: physical source membership and valid deduplication must be reconciled explicitly. Fresh native decision generation and corresponding receipts remain required.
+
+The latest [provider coverage run](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39122743513/job/117661484074) still reports `CH_BASELINE_EMPTY` and missing accepted baselines for Market_Leaders and Global_Markets. The latest [Sync Outcome audit](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518250) passes. These later results establish no additional code defect: the remaining work concerns timestamp evidence, decision generation/reconciliation and explicit baseline initialization.
 
 ## Target-receipt behavior and compatibility
 
@@ -104,6 +116,8 @@ A partial GitHub rerun can leave older successful-leg artifacts beside a new att
 ## Deployment review
 
 The Render service `tadawul-fast-bridge` reported live deployment `dep-dba9qbs9v7es73fn5d90`, completed **2026-10-18 10:21:15 UTC**, on `4c9e2cbf98a22ecb3decc6894398b3dc74157592`. A fresh public `/health` readback reported that same SHA, `ready: true`, `engine_ready: true`, zero failed route mounts, no effective failed modules and no readiness reasons. `/readyz` returned HTTP200. Global authentication is enabled. These checks establish deployment alignment and reported readiness, not the accuracy of workbook rows.
+
+A final control-plane read at **17:24:08 UTC** confirmed the same latest deployment and SHA. Direct HTTP probes at **17:24:37–38 UTC** returned HTTP200 from both `/health` and `/readyz`, with `ready`, `engine_ready` and `global_auth_enforcement` all true. No deployment changed during the review.
 
 Automatic deployment is off. The live service still uses a dashboard-managed inline build and start command; there is no repository `render.yaml`. Consequently, neither this candidate nor a future merge automatically changes the reviewed dashboard build configuration.
 
@@ -130,7 +144,7 @@ Prioritize the remaining work in this order:
 
 1. Accept the reviewed code candidate after its checks pass; preserve the source relay and existing financial gates.
 2. Apply the paired Render build/start settings and deploy that exact accepted commit; verify runtime SHA, readiness and relevant authenticated workflow calls.
-3. Repair authoritative missing names and rebuild decision output against the completed source cohort; rerun read-only coverage/freshness audits.
+3. Resolve the ten timestamp warnings using actual source evidence and regenerate both portfolio and Top10 decision outputs against the completed source cohort, including native reconciliation receipts; rerun read-only coverage/freshness audits. Name coverage already passes the required floor in the final production snapshot; continue improving remaining identities without inventing replacements.
 4. Initialize the provider baseline only after a healthy refresh and verify ordinary scheduled cache reuse.
 5. Coordinate structural repair and high-frequency writers before any maintenance apply run; retain backup and readback evidence.
 6. Handle the separately reviewed financial/portfolio changes in their own remaining PRs. Do not blindly merge overlapping repair stacks twice.
@@ -152,3 +166,5 @@ The final Python 3.11 targeted runs reported **148 passed and 90 subtests passed
 Behavioral tests cover actual shell wrappers with inert child processes; in-memory Sheets errors and partial writes; producer-generated weekly rows; SMTP acknowledgements and required final-feed reads; request headers; real receipt CLI and workflow binding; fake Gunicorn startup; and fake-pip build failure propagation. New regressions were also run against the original implementations where applicable, reproducing the claimed defects before the repairs.
 
 The local broad suite encountered a runtime wakeup limitation independently reproduced using only stdlib asyncio and ThreadPoolExecutor, without pytest or repository imports. No production workaround, timeout change, assertion weakening or skip was introduced. Local split-suite counts are not represented as a complete full-suite pass. GitHub's actual Python3.11 workflow run is the decisive integration check; its exact receipt will accompany this review candidate.
+
+The [first candidate GitHub run](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606) completed the full suite without the local runtime limitation: 5,605 tests passed and two existing structural expectations failed. Those tests still required a ref-qualified production group and no local receipt step between credentials and the writer-start veto. Their reviewed updates now require one shared production group across all tested refs, preserve separate cancellable CI groups, and allow only the exact local receipt command/environment before the veto. Negative mutations reject missing, duplicated, conditional or altered receipts, ignored failures and extra intervening commands. No production gate or test selection was relaxed. The PR records the subsequent CI result for the final proposed revision.
