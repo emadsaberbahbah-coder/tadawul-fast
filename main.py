@@ -292,6 +292,10 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from core.platform_source_auth import (
+    platform_source_authorized,
+    platform_source_boundary_required,
+)
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -512,6 +516,7 @@ _BUILTIN_META_PATHS = {
 }
 
 _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
+    "/v1/platform",
     "/v1/advisor",
     "/v1/investment_advisor",
     "/v1/investment-advisor",
@@ -529,6 +534,7 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
 
 # Canonical owners are the route-family keys used in the controlled plan.
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
+    "/v1/platform/source-read": "platform_source",
     "/v1/advisor": "advisor",
     "/v1/advisor/sheet-rows": "advisor",
     "/v1/investment_advisor": "investment_advisor",
@@ -573,6 +579,7 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
 # in the repo but is no longer mounted; investment_advisor handles every
 # /v1/advanced/* path.
 _CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
+    ("platform_source", "routes.platform_source"),
     ("config", "routes.config"),
     ("advanced_analysis", "routes.advanced_analysis"),
     ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
@@ -1469,6 +1476,16 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         try:
+            # This new key only reads the fixed Site source. It must never
+            # become a general APP_TOKEN, and OPEN_MODE cannot open its route.
+            if platform_source_boundary_required(request):
+                if platform_source_authorized(request):
+                    return await call_next(request)
+                return _StrictJSONResponse(
+                    status_code=401,
+                    headers={"Cache-Control": "no-store, private"},
+                    content={"status": "error", "error": "unauthorized"},
+                )
             if not _global_auth_enforcement_active():
                 return await call_next(request)
             if str(request.method or "").upper() == "OPTIONS":
@@ -1847,6 +1864,7 @@ def _normalize_routes_snapshot(
 # =============================================================================
 def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
+        "platform_source": ("/v1/platform",),
         "config": ("/v1/config",),
         "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows"),
         "advanced_sheet_rows": ("/v1/advanced",),
@@ -2912,3 +2930,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "10000")),
         reload=False,
     )
+
