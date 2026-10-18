@@ -499,34 +499,56 @@ class RouteHTTPTests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "error", "error": "source_unavailable"})
 
     def test_actual_controlled_main_mount_and_auth_wall(self):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-        with patch.dict(os.environ, {"INIT_ENGINE_ON_BOOT": "false", "PRESTART_MOUNT_ROUTES": "false",
-                                    "ROUTES_STRICT_IMPORT": "false", "DISABLE_NETWORK_AT_IMPORT": "true",
-                                    "PROVIDERS_OFFLINE_MODE": "true"}):
-            import main
-            app = FastAPI()
-            snapshot = main._mount_routes_controlled(app)
-        self.assertIn(("platform_source", "routes.platform_source"), main._CONTROLLED_ROUTE_PLAN)
-        self.assertIn("routes.platform_source", snapshot["mounted"])
-        mounted = [(r.path, r.methods, r.endpoint.__module__) for r in app.routes
-                   if getattr(r, "path", "").startswith("/v1/platform")]
-        self.assertEqual(mounted, [(auth.SOURCE_READ_PATH, {"POST"}, "routes.platform_source")])
-        app.add_middleware(main.GlobalAuthEnforcementMiddleware)
-        with TestClient(app) as client, patch.object(main, "_global_auth_enforcement_active", return_value=True), \
-                patch.object(self.route, "read_source", return_value=metadata()) as read:
-            self.assertEqual(client.post(auth.SOURCE_READ_PATH, json={"operation": "metadata"}).status_code, 401)
-            response = client.post(auth.SOURCE_READ_PATH, json={"operation": "metadata"}, headers=self.headers)
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["data"], metadata())
-            self.assertEqual(client.get(auth.SOURCE_READ_PATH, headers=self.headers).status_code, 401)
-            self.assertEqual(client.post(auth.SOURCE_READ_PATH + "/", headers=self.headers,
-                                         follow_redirects=False).status_code, 401)
-            # This must stop at the real global wall, before an existing
-            # financial handler can run, even with a Host shaped like a probe.
-            self.assertEqual(client.post("/v1/advanced/sheet-rows", json={},
-                              headers={**self.headers, "Host": "x/health?x="}).status_code, 401)
-            read.assert_called_once_with({"operation": "metadata"})
+        # main caches its settings on first import. Run its real registration
+        # and auth checks in a child process so this test's deliberate
+        # PRESTART_MOUNT_ROUTES=false cannot disable later suites' routes.
+        import subprocess
+        script = r'''
+import logging, socket, sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_platform_source_read import KEY, metadata
+from core import platform_source_auth as auth
+from routes import platform_source
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+def blocked(*args, **kwargs):
+    raise OSError("network disabled by platform source regression test")
+socket.socket.connect = blocked
+socket.socket.connect_ex = blocked
+socket.create_connection = blocked
+socket.getaddrinfo = blocked
+logging.disable(logging.CRITICAL)
+import main
+app = FastAPI()
+snapshot = main._mount_routes_controlled(app)
+assert ("platform_source", "routes.platform_source") in main._CONTROLLED_ROUTE_PLAN
+assert "routes.platform_source" in snapshot["mounted"]
+mounted = [(r.path, r.methods, r.endpoint.__module__) for r in app.routes
+           if getattr(r, "path", "").startswith("/v1/platform")]
+assert mounted == [(auth.SOURCE_READ_PATH, {"POST"}, "routes.platform_source")]
+app.add_middleware(main.GlobalAuthEnforcementMiddleware)
+headers = {"X-TFB-Source-Read-Key": KEY}
+with TestClient(app) as client, patch.object(main, "_global_auth_enforcement_active", return_value=True), \
+        patch.object(platform_source, "read_source", return_value=metadata()) as read:
+    assert client.post(auth.SOURCE_READ_PATH, json={"operation": "metadata"}).status_code == 401
+    response = client.post(auth.SOURCE_READ_PATH, json={"operation": "metadata"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["data"] == metadata()
+    assert client.get(auth.SOURCE_READ_PATH, headers=headers).status_code == 401
+    assert client.post(auth.SOURCE_READ_PATH + "/", headers=headers, follow_redirects=False).status_code == 401
+    assert client.post("/v1/advanced/sheet-rows", json={},
+                       headers={**headers, "Host": "x/health?x="}).status_code == 401
+    read.assert_called_once_with({"operation": "metadata"})
+'''
+        child_env = {**os.environ, "INIT_ENGINE_ON_BOOT": "false", "PRESTART_MOUNT_ROUTES": "false",
+                     "ROUTES_STRICT_IMPORT": "false", "DISABLE_NETWORK_AT_IMPORT": "true",
+                     "PROVIDERS_OFFLINE_MODE": "true", auth.SOURCE_READ_ENV: KEY}
+        result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, env=child_env,
+                                text=True, capture_output=True, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class GoogleClientCompatibilityTests(unittest.TestCase):
