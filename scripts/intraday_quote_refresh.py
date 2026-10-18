@@ -2,8 +2,19 @@
 # scripts/intraday_quote_refresh.py
 """
 ================================================================================
-Intraday Quote Refresh — v1.0.3 (2026-10-10)
+Intraday Quote Refresh — v1.0.5 (2026-10-18)
 ================================================================================
+WHY v1.0.5: authenticate protected quote requests with the daily sync's
+existing token precedence and headers. Tokens stay in headers, never URLs or
+receipts; missing tokens retain anonymous development support. Quote evidence,
+timestamps, row fingerprints and publication policy are unchanged.
+
+WHY v1.0.4: failed backend requests and configured target reads previously
+became empty plans, then recorded OK/APPLIED and exited zero. Keep verified
+zero-change results and missing optional source tabs successful, but retain
+operational read/fetch/write failures in the receipt and exit nonzero. Other
+pages still run; no retry, quote eligibility or scheduling policy changes.
+
 NEW script. Closes the largest recoverable loss in the system.
 
 THE PROBLEM, PROVEN ARITHMETICALLY
@@ -55,6 +66,8 @@ USAGE
 ENV
     TARGET_SHEET_ID / DEFAULT_SPREADSHEET_ID     workbook id
     TFB_BACKEND_URL / BACKEND_URL                backend base url
+    TFB_TOKEN / X_APP_TOKEN / APP_TOKEN / BACKEND_TOKEN
+                                                optional auth, first nonempty wins
     GOOGLE_SHEETS_CREDENTIALS(_B64) | GOOGLE_APPLICATION_CREDENTIALS
     TFB_IQR_SYMBOL_PAGES   default "Top_10_Investments,My_Portfolio,Shadow_Board"
     TFB_IQR_TARGET_PAGES   default "Market_Leaders,Global_Markets"
@@ -77,7 +90,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.5"
 # v1.0.3: share supplier quote-time parsing with acquisition validity so an
 # EODHD integer epoch serialized as a string retains its actual quote receipt.
 
@@ -447,6 +460,14 @@ def plan_page_updates(page: str,
 # --------------------------------------------------------------------------- #
 # IO                                                                           #
 # --------------------------------------------------------------------------- #
+class QuoteFetchError(RuntimeError):
+    """A request/envelope failure, distinct from zero acceptable source quotes."""
+
+    def __init__(self, reason: str, quotes: Optional[Dict[str, QuoteEvidence]] = None):
+        super().__init__(reason)
+        self.quotes = quotes or {}
+
+
 def _open_sheet(cli_id: Optional[str]):
     import gspread                                       # noqa: WPS433
     from google.oauth2.service_account import Credentials  # noqa: WPS433
@@ -493,20 +514,33 @@ def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
                                  "symbols": ",".join(symbols),
                                  "limit": str(len(symbols))})
     url = "%s/v1/analysis/sheet-rows?%s" % (base_url.rstrip("/"), qs)
+    headers = {"Accept": "application/json"}
+    # Match run_dashboard_sync._env_token and BackendClient._headers without
+    # importing the full sync client into this lightweight refresh path.
+    for name in ("TFB_TOKEN", "X_APP_TOKEN", "APP_TOKEN", "BACKEND_TOKEN"):
+        token = _env(name)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-APP-TOKEN"] = token
+            break
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:                              # noqa: BLE001
-        print("  [FETCH-FAIL] %s: %s" % (page, type(exc).__name__))
-        return {}
+        raise QuoteFetchError(type(exc).__name__) from None
 
     retrieved = _clock()
     if not isinstance(payload, dict):
-        return {}
+        raise QuoteFetchError("InvalidEnvelope")
+    aliases = ("row_objects", "rows", "data", "items", "records", "quotes", "results")
+    backend_failed = _s(payload.get("status")).lower() in {"error", "failed", "unavailable"}
+    if not any(isinstance(payload.get(name), list) for name in aliases):
+        raise QuoteFetchError("InvalidEnvelope")
     # The real sheet-rows route has matrix rows and dictionary data/row_objects.
     # Collect only dictionary aliases; contradictory source duplicates fail
     # closed even when returned in different aliases in the same envelope.
-    rows = [row for name in ("row_objects", "rows", "data", "items", "records", "quotes", "results")
+    rows = [row for name in aliases
             for row in (payload.get(name) if isinstance(payload.get(name), list) else []) if isinstance(row, dict)]
     requested = {_s(symbol).upper() for symbol in symbols}
     grouped: Dict[str, List[Optional[QuoteEvidence]]] = {}
@@ -516,8 +550,13 @@ def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
         declared = {_s(value).upper() for name, value in row.items() if _key(name) in {"symbol", "ticker"} and _s(value)}
         for sym in declared & requested:
             grouped.setdefault(sym, []).append(_source_quote(row, sym, retrieved))
-    return {symbol: evidence[0] for symbol, evidence in grouped.items()
-            if evidence[0] is not None and len(set(evidence)) == 1}
+    quotes = {symbol: evidence[0] for symbol, evidence in grouped.items()
+              if evidence[0] is not None and len(set(evidence)) == 1}
+    if backend_failed:
+        # Retain independently verified rows under the unchanged per-row
+        # contract, while the envelope's failure still makes the run partial.
+        raise QuoteFetchError("BackendError", quotes)
+    return quotes
 
 
 def apply_page_plan(ws: Any, page: str, plan: Sequence[Dict[str, Any]]) -> Tuple[int, int, bool]:
@@ -602,12 +641,19 @@ def main() -> int:
 
     sh = _open_sheet(args.sheet_id)
 
+    operational_errors: List[str] = []
     src: Dict[str, Sequence[Sequence[Any]]] = {}
     for p in src_pages:
         try:
             src[p] = sh.worksheet(p).get_all_values(value_render_option="UNFORMATTED_VALUE")
         except Exception as exc:                          # noqa: BLE001
-            print("  [SRC-MISS] %s: %s" % (p, exc))
+            # Source pages form an optional union; an absent tab is not an
+            # unreadable tab. Keep real API/read errors distinct from absence.
+            if type(exc).__name__ == "WorksheetNotFound":
+                print("  [SRC-MISS] %s: WorksheetNotFound (optional)" % p)
+            else:
+                operational_errors.append("source_read:%s:%s" % (p, type(exc).__name__))
+                print("  [SRC-FAIL] %s: %s" % (p, type(exc).__name__))
     symbols = harvest_symbols(src, limit=max_syms)
 
     mode = "APPLY" if args.apply else "DRY-RUN"
@@ -615,22 +661,30 @@ def main() -> int:
           % (SCRIPT_VERSION, len(symbols), "set" if base else "MISSING", mode))
     if not symbols:
         print("  no decision symbols harvested — nothing to do.")
-        return 0
-    if not base:
+        if not operational_errors:
+            return 0
+    if symbols and not base:
         print("  no backend url — cannot fetch. Set TFB_BACKEND_URL.")
         return 2
 
     total_written = 0
-    write_failed = False
-    for page in tgt_pages:
+    for page in tgt_pages if symbols else []:
         try:
             ws = sh.worksheet(page)
             values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
         except Exception as exc:                          # noqa: BLE001
-            print("  [PAGE-MISS] %s: %s" % (page, exc))
+            operational_errors.append("target_read:%s:%s" % (page, type(exc).__name__))
+            print("  [PAGE-MISS] %s: %s" % (page, type(exc).__name__))
             continue
 
-        quotes = fetch_quotes(base, page, symbols, timeout=timeout)
+        try:
+            quotes = fetch_quotes(base, page, symbols, timeout=timeout)
+        except QuoteFetchError as exc:
+            operational_errors.append("fetch:%s:%s" % (page, exc))
+            print("  [FETCH-FAIL] %s: %s" % (page, exc))
+            quotes = exc.quotes
+            if not quotes:
+                continue
         plan, stats = plan_page_updates(page, values, quotes)
         print("  %-16s rows=%-6d quotes=%-4d matched=%-4d planned=%-4d "
               "not_newer=%-4d no_price=%d"
@@ -649,7 +703,8 @@ def main() -> int:
             continue
 
         written, abandoned, failed = apply_page_plan(ws, page, plan)
-        write_failed = write_failed or failed
+        if failed:
+            operational_errors.append("target_write:%s" % page)
         if abandoned:
             print("     [ROW-CHANGED] %d row(s) abandoned — raw input fingerprint/evidence changed" % abandoned)
         if failed:
@@ -660,17 +715,26 @@ def main() -> int:
     if args.apply:
         try:
             sh.worksheet(RUN_LOG_TAB).append_row(
-                [_now_utc(), "INFO", "intraday_quote_refresh", ",".join(tgt_pages),
-                 "PARTIAL" if write_failed else "OK", "[IQR v%s] symbols=%d cells=%d"
+                [_now_utc(), "ERROR" if operational_errors else "INFO", "intraday_quote_refresh", ",".join(tgt_pages),
+                 "PARTIAL" if operational_errors else "OK", "[IQR v%s] symbols=%d cells=%d"
                  % (SCRIPT_VERSION, len(symbols), total_written),
-                 "", "", "", json.dumps({"version": SCRIPT_VERSION})],
+                 "", "", "", json.dumps({"version": SCRIPT_VERSION,
+                                            "operational_errors": operational_errors})],
                 value_input_option="RAW")
-        except Exception:
-            pass
-        print("[IQR v%s] APPLIED cells=%d" % (SCRIPT_VERSION, total_written))
+        except Exception as exc:
+            # The change trail stays best-effort; this is not a new write gate.
+            print("  [RUNLOG-WARN] append failed: %s" % type(exc).__name__)
+        if operational_errors:
+            print("[IQR v%s] PARTIAL cells=%d operational_errors=%d"
+                  % (SCRIPT_VERSION, total_written, len(operational_errors)))
+        else:
+            print("[IQR v%s] APPLIED cells=%d" % (SCRIPT_VERSION, total_written))
     else:
         print("  (dry-run: nothing written; re-run with --apply)")
-    return 2 if write_failed else 0
+        if operational_errors:
+            print("[IQR v%s] SCAN FAILED operational_errors=%d"
+                  % (SCRIPT_VERSION, len(operational_errors)))
+    return 2 if operational_errors else 0
 
 
 # --------------------------------------------------------------------------- #

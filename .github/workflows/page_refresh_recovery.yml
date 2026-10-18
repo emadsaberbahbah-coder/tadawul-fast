@@ -1,5 +1,16 @@
 name: 🧯 Page Refresh Recovery
 
+# (2026-10-16) RECOVERY WRITER CONTROL PARITY. Manual recovery executes the
+# same persistence path as Advanced Sync. It must retain that writer's active
+# last-good sanity and quota protections and honor the same operator controls;
+# otherwise a repair can restore rows the scheduled writer quarantined or
+# ignore an armed retirement/currency/hold guard. Match daily_sync's two writer
+# lanes without copying tracker settings. Page selection and the independent
+# 3600-second recovery budget remain specific to this workflow. All newly wired
+# opt-in controls retain the scheduled writer's existing off/empty defaults.
+# Read-back: the runner's guard tokens and sync_runner_* evidence; regression:
+# tests/test_recovery_writer_control_parity.py. No production dispatch is added.
+
 # (2026-10-13) P0-1 SUPERSEDE AT WRITER START (Codex P1 on PR #763): the
 # recover-page job gains ONE step, 'Supersede released decision feed (P0-1)',
 # after its credentials step and before its page write, gated on
@@ -16,6 +27,7 @@ on:
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
       - 'tests/test_inline_page_recovery.py'
+      - 'tests/test_manual_recovery_evidence_workflow.py'
       - 'tests/test_activation_rollout_evidence_workflows.py'
   push:
     branches: [main]
@@ -27,11 +39,20 @@ on:
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
       - 'tests/test_inline_page_recovery.py'
+      - 'tests/test_manual_recovery_evidence_workflow.py'
       - 'tests/test_activation_rollout_evidence_workflows.py'
   workflow_dispatch:
     inputs:
       run_id:
         description: 'Completed Advanced Sync run ID to inspect and recover'
+        required: true
+        type: string
+      backend_url:
+        description: 'Exact backend URL used by the source run (see its target summary)'
+        required: true
+        type: string
+      sheet_id:
+        description: 'Exact spreadsheet ID used by the source run (see its target summary)'
         required: true
         type: string
       rank_mode:
@@ -54,8 +75,9 @@ permissions:
 # Automatic recovery now runs inside Advanced Sync and keeps the same production
 # lease. This workflow remains for manual historical-run recovery only. Its CI
 # tests use a separate cancellable group and never compete with production writes.
+# Production dispatches share the workbook across refs, including branch runs.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && format('tadawul-production-write-{0}', github.ref) || format('page-recovery-ci-{0}-{1}', github.event_name, github.ref) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && 'tadawul-production-write' || format('page-recovery-ci-{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
@@ -92,7 +114,7 @@ jobs:
             tests/test_sync_outcome_audit.py \
             tests/test_sync_recovery_plan.py \
             tests/test_inline_page_recovery.py
-          python -m pytest -q tests/test_activation_rollout_evidence_workflows.py
+          python -m pytest -q tests/test_activation_rollout_evidence_workflows.py tests/test_manual_recovery_evidence_workflow.py
 
   plan:
     name: Plan missing page refreshes
@@ -149,9 +171,36 @@ jobs:
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
 
+      # A completed Daily Sync can already have repaired a primary leg using
+      # its inline recovery. Plan from both artifact families of the SAME
+      # resolved source run, just like Sync Outcome Audit. The zz-recovery
+      # prefix makes later recovery verdicts supersede primary verdicts; the
+      # auditor orders cycleN attempts numerically. Sources predating inline
+      # recovery have no matching artifact and retain primary-only planning.
+      - name: Download source inline recovery evidence (best-effort)
+        id: source_inline_evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: page-refresh-${{ steps.source.outputs.run_id }}-*
+          path: source-sync-artifacts/zz-recovery
+          merge-multiple: false
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
       - name: Build targeted recovery matrix
         id: plan
+        env:
+          SOURCE_INLINE_DOWNLOAD_OUTCOME: ${{ steps.source_inline_evidence.outcome }}
         run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          if os.getenv("SOURCE_INLINE_DOWNLOAD_OUTCOME") != "success":
+              print("::warning::Source inline recovery download was unavailable; no recovery success is inferred.")
+          if not any(path.is_file() for path in Path("source-sync-artifacts/zz-recovery").rglob("sync_*.log")):
+              print("::notice::No source inline recovery logs are available; the planner must certify downloaded primary evidence or request a retry.")
+          PY
           python scripts/plan_sync_recovery.py \
             --root source-sync-artifacts \
             --json-out sync-recovery-plan.json \
@@ -187,17 +236,55 @@ jobs:
       # current-run fresh coverage remains below the recovery contract.
       TFB_AUDIT_REQUIRE_FULL_FETCH: '1'
       TFB_AUDIT_MIN_FRESH_PCT: '95'
-      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_XPAGE_PRICE_CHECK: '1'
       TFB_SYNC_PAGE_ORDER: ${{ matrix.page }}
       TFB_SYNC_EMPTY_RETRY: '0'
       TFB_SYNC_NAME_DEDUP_MODE: observe
+      # Already active in both scheduled writer lanes: validate restored rows
+      # before keeping them and stop spending/filling pages on exhausted quota.
+      TFB_SYNC_PERSIST_SANITY: '1'
+      TFB_SYNC_EODHD_QUOTA: observe
+      TFB_SYNC_EODHD_QUOTA_GUARD: enforce
+      TFB_SYNC_FETCHFAIL_TRUTH: observe
+      # Same fail-closed writer controls, including their operator kill switches.
+      TFB_SYNC_CAPACITY_STATUS: ${{ vars.TFB_SYNC_CAPACITY_STATUS || '1' }}
+      TFB_SYNC_FALSE_GREEN_SCREEN: ${{ vars.TFB_SYNC_FALSE_GREEN_SCREEN || '1' }}
+      TFB_SYNC_KLG_IDENTITY_GATE: ${{ vars.TFB_SYNC_KLG_IDENTITY_GATE || '1' }}
+      TFB_SYNC_APPEND_FAIL_IS_ERROR: ${{ vars.TFB_SYNC_APPEND_FAIL_IS_ERROR || '1' }}
+      # These mappings make existing controls reachable; they do not arm them.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}
+      TFB_SYNC_QUARANTINE_SYMBOLS: ${{ vars.TFB_SYNC_QUARANTINE_SYMBOLS || '' }}
+      TFB_SYNC_IDENTITY_REFETCH: ${{ vars.TFB_SYNC_IDENTITY_REFETCH || '0' }}
+      TFB_SYNC_KLG_CRYPTO_NAME_GATE: ${{ vars.TFB_SYNC_KLG_CRYPTO_NAME_GATE || 'off' }}
+      TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
+      TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
+      TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
+      TFB_SYNC_OHLC_PREWRITE: ${{ vars.TFB_SYNC_OHLC_PREWRITE || '0' }}
+      TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
+      TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
+      TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES: ${{ vars.TFB_SYNC_OHLC_PREWRITE_ENFORCE_CLASSES || '' }}
+      TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
       # W1A-6f (2026-08-25): v6.44 FILL-GUARD gates (DS-01) — same contract
       # as daily_sync; unset Variables keep the guard OFF.
       TFB_SYNC_OHLC_FILL_GUARD: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD || '0' }}
       TFB_SYNC_OHLC_FILL_GUARD_MODE: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_MODE || 'observe' }}
       TFB_SYNC_OHLC_FILL_GUARD_COLS: ${{ vars.TFB_SYNC_OHLC_FILL_GUARD_COLS || '' }}
+      TFB_SYNC_OHLC_READBACK: ${{ vars.TFB_SYNC_OHLC_READBACK || '0' }}
+      TFB_SYNC_RB_TOL_ROWS: ${{ vars.TFB_SYNC_RB_TOL_ROWS || '0' }}
+      TFB_SYNC_RB_TOL_PCT: ${{ vars.TFB_SYNC_RB_TOL_PCT || '0' }}
+      TFB_SYNC_NULL_CLEAR_SCOPE: ${{ vars.TFB_SYNC_NULL_CLEAR_SCOPE || 'ohlc' }}
+      TFB_SYNC_NULL_KEEP_COLS: ${{ vars.TFB_SYNC_NULL_KEEP_COLS || '' }}
+      TFB_SYNC_READBACK_REPAIR: ${{ vars.TFB_SYNC_READBACK_REPAIR || '' }}
+      TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
+      TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      TFB_SYNC_STATUS_TRUTH: ${{ vars.TFB_SYNC_STATUS_TRUTH || '0' }}
+      TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
+      TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
+      TFB_SYNC_VERDICT_MAX_AGE_MIN: ${{ vars.TFB_SYNC_VERDICT_MAX_AGE_MIN || '240' }}
+      TFB_SYNC_WRITE_SENTINEL: ${{ vars.TFB_SYNC_WRITE_SENTINEL || '0' }}
+      TFB_SYNC_HOLD_TTL_SEC: ${{ vars.TFB_SYNC_HOLD_TTL_SEC || '180' }}
+      TFB_SYNC_HOLD_POST_GRACE_SEC: ${{ vars.TFB_SYNC_HOLD_POST_GRACE_SEC || '45' }}
       TFB_PORTFOLIO_REBUILD: '1'
       # v6.64.8 (2026-10-07) portfolio minor-unit currency guard (GBp vs GBP
       # 100x Position Value / P/L). Guard the three production PF write lanes.
@@ -205,6 +292,7 @@ jobs:
       # major-currency cost/value math. An explicit Variable value 0 opts out.
       TFB_PF_MINOR_UNIT_CCY_GUARD: ${{ vars.TFB_PF_MINOR_UNIT_CCY_GUARD || '1' }}
       TFB_SYNC_DECISION_GUARD: '1'
+      TFB_SYNC_PRIORITY_FETCH: '0'
       TFB_SYNC_SYMBOL_BATCH_SIZE: '25'
       TFB_SYNC_TIME_BUDGET_SEC: '3600'
       TFB_SYNC_MAX_SYMBOLS_MARKET: '7000'
@@ -223,6 +311,9 @@ jobs:
       # Rollback: set the Variable to off; unsetting reactivates enforce.
       TFB_RANK_OVERALL_PAGE: ${{ vars.TFB_RANK_OVERALL_PAGE || 'enforce' }}
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+      # The quota observer/guard reads this locally; backend authentication
+      # alone cannot provide a usage snapshot (missing key is fail-open).
+      EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -286,6 +377,28 @@ jobs:
           print(json.dumps(evidence))
           PY
 
+      # Historical artifacts carry page verdicts but no trustworthy target
+      # identity. Require the operator's explicit source target instead of
+      # silently replaying a different workbook with repository defaults.
+      - name: Resolve explicit source target
+        env:
+          INPUT_URL: ${{ inputs.backend_url }}
+          INPUT_SHEET: ${{ inputs.sheet_id }}
+        run: |
+          set -euo pipefail
+          URL="${INPUT_URL:-}"
+          URL="${URL%/}"
+          SHEET="${INPUT_SHEET:-}"
+          if [[ ! "$URL" =~ ^https?://[^[:space:]]+$ ||
+                ! "$SHEET" =~ ^[A-Za-z0-9_-]+$ || "$SHEET" == "null" || "$SHEET" == "undefined" ||
+                "$URL" == *$'\n'* || "$URL" == *$'\r'* ||
+                "$SHEET" == *$'\n'* || "$SHEET" == *$'\r'* ]]; then
+            echo "::error::Explicit source backend_url and sheet_id are required and must be single-line values."
+            exit 1
+          fi
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
+
       - name: Configure production credentials
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -293,7 +406,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
-            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
+            echo "::error::Resolved source spreadsheet ID is empty."
             exit 1
           fi
 

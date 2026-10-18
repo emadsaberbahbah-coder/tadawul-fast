@@ -50,10 +50,12 @@ jobs:
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          INPUT_BOARD_MIN: ${{ inputs.board_min || '5' }}
+          INPUT_STRICT: ${{ inputs.strict }}
         run: |
-          set -o pipefail
-          ARGS=(--live --json artifacts/acceptance.json --board-min "${{ inputs.board_min || '5' }}")
-          if [ "${{ inputs.strict }}" = "true" ]; then ARGS+=(--strict); fi
+          set -euo pipefail
+          ARGS=(--live --json artifacts/acceptance.json --board-min "$INPUT_BOARD_MIN")
+          if [ "$INPUT_STRICT" = "true" ]; then ARGS+=(--strict); fi
           python scripts/tfb_acceptance.py "${ARGS[@]}" | tee artifacts_console.txt
       - name: Upload acceptance artifact
         if: always()

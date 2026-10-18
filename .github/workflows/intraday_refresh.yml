@@ -1,5 +1,9 @@
 name: Intraday Quote Refresh
 
+# 2026-10-18: pass the established backend token to protected quote requests.
+# Keep the free-form dispatch input in step env so shell metacharacters remain
+# literal data in both the main-branch apply guard and the scan/apply wrapper.
+
 # =============================================================================
 # WHY THIS WORKFLOW EXISTS
 #
@@ -128,10 +132,12 @@ jobs:
 
       - name: Guard - production apply only from main
         if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_APPLY: ${{ github.event.inputs.apply }}
         run: |
-          if [ "${{ github.event.inputs.apply }}" = "true" ] && \
-             [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::Production apply is allowed only from main (got ${{ github.ref }}). Dry-run (apply=false) is permitted from any ref."
+          if [ "${INPUT_APPLY:-}" = "true" ] && \
+             [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Production apply is allowed only from main (got $GITHUB_REF). Dry-run (apply=false) is permitted from any ref."
             exit 1
           fi
 
@@ -187,6 +193,7 @@ jobs:
 
       - name: Refresh decision-symbol quotes
         env:
+          INPUT_APPLY: ${{ github.event.inputs.apply }}
           # H4 2026-08-16: proven contract (see WHY addendum above).
           # Was: secrets.TARGET_SHEET_ID (nonexistent -> empty -> 31/31 dead).
           TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -201,13 +208,14 @@ jobs:
           # own lines 655 and 1273). Same idiom here; H0 item: create the
           # Variable so the fallback stops carrying production.
           TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
           TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
           TFB_IQR_MAX_SYMBOLS: "400"
           TFB_IQR_TIMEOUT_SEC: "45"
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
-             [ "${{ github.event.inputs.apply }}" != "true" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && \
+             [ "${INPUT_APPLY:-}" != "true" ]; then
             echo "::notice::dry-run (manual dispatch, apply=false)"
             python scripts/intraday_quote_refresh.py --scan
           else

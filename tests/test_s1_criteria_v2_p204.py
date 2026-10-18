@@ -215,11 +215,11 @@ def main():
     assert c_off[3][0] == "PASS" and "v2:" not in c_off[3][1] and c_off[5][0] == "PASS", c_off
     if s1b:
         sh_b = fresh_sheet(); rcb, out_b = run_at(s1b, WHEN, sh_b, SPOT, v2=None)
-        norm = lambda rows: [[str(c).replace("v1.9.1", "vX").replace("v1.9.3", "vX") for c in r] for r in rows]  # noqa: E731
+        norm = lambda rows: [[str(c).replace(f"v{s1b.SCRIPT_VERSION}", "vX").replace(f"v{s1.SCRIPT_VERSION}", "vX") for c in r] for r in rows]  # noqa: E731
         assert rcb == 0 and norm(hist_rows(sh_b)) == norm(hist_rows(sh_off)), "history parity"
         assert norm(gate_body(sh_b)) == norm(gate_body(sh_off)), "gate parity"
         vb, vd = runlog(sh_b)[-1][5], runlog(sh_off)[-1][5]
-        assert vb.replace("v1.9.1", "vX") == vd.replace("v1.9.3", "vX"), (vb, vd)
+        assert vb.replace(f"v{s1b.SCRIPT_VERSION}", "vX") == vd.replace(f"v{s1.SCRIPT_VERSION}", "vX"), (vb, vd)
         print("C3 PASS  dual-tree parity under mode off: history rows, S1_Gate body and verdict byte-identical (version token aside)")
     else:
         print("C3 SKIP  dual-tree parity (set S1_BASE=<v1.9.1 file>)")
@@ -235,7 +235,7 @@ def main():
     assert "0 rows (vacuous)" in c_obs[5][1] and "would NOT_EVALUABLE" in c_obs[5][1], c_obs[5]
     assert gate_body(sh_obs)[0][2] == gate_body(sh_off)[0][2], "verdict changed under observe"
     assert hist_rows(sh_obs) == hist_rows(sh_off), "observe must not touch Shadow_History"
-    tok = [l for l in out_obs.splitlines() if l.startswith("[S1-CRITERIA-V2 v1.9.3] mode=observe")]
+    tok = [l for l in out_obs.splitlines() if l.startswith(f"[S1-CRITERIA-V2 v{s1.SCRIPT_VERSION}] mode=observe")]
     # today's scored day moves every index by exactly +1.00 % (all spots x1.01, zero turnover), so the
     # window return = seed_index x 1.01 / pre-boundary index - 1 for each basket
     exp = {b: (i * 1.01 / p - 1) * 100 for b, i, p in (("chal", 106.892669, 107.164026), ("bench", 101.554736, 99.04464))}
@@ -246,9 +246,9 @@ def main():
         and "zero_mae=n/a" in tok[0] and "model_mae=3.13pp" in tok[0] \
         and "ca_rows=0" in tok[0] and "set=" in tok[0], (tok, exp_alpha)
     meta_cells = " ".join(str(c) for r in gate_body(sh_obs)[:6] for c in r)
-    assert "[S1-CRITERIA-V2 v1.9.3] mode=observe" in meta_cells, "meta cell token missing"
+    assert f"[S1-CRITERIA-V2 v{s1.SCRIPT_VERSION}] mode=observe" in meta_cells, "meta cell token missing"
     rl = runlog(sh_obs)[-1]
-    assert "[S1-CRITERIA-V2 v1.9.3]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
+    assert f"[S1-CRITERIA-V2 v{s1.SCRIPT_VERSION}]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
     print("C4 PASS  observe: statuses/verdict unchanged, 3/4/5 annotated, token on verdict + meta + _Run_Log JSON, history untouched")
     digest_parts.append(tok[0].split(" set=")[0])
 
@@ -281,7 +281,7 @@ def main():
     # ---------------------------------------------------------------- C7 ------ #
     sh7 = fresh_sheet(); before = (copy.deepcopy(hist_rows(sh7)), copy.deepcopy(runlog(sh7)))
     rc, out7 = run_at(s1, WHEN, sh7, SPOT, v2="observe", argv=["--dry-run"])
-    assert rc == 0 and "[S1-CRITERIA-V2 v1.9.3] mode=observe" in out7, out7
+    assert rc == 0 and f"[S1-CRITERIA-V2 v{s1.SCRIPT_VERSION}] mode=observe" in out7, out7
     assert (hist_rows(sh7), runlog(sh7)) == before and s1.TAB_GATE not in sh7.tabs, "dry-run wrote"
     print("C7 PASS  --dry-run under observe: token printed, zero writes")
     digest_parts.append("dryrun-ok")

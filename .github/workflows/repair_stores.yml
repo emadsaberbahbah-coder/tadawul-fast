@@ -1,6 +1,6 @@
 name: "🧹 TFB Repair Stores (one-time: identity + junk)"
 
-# Build 2 companion workflow for scripts/repair_stores.py v1.0.0.
+# Build 2 companion workflow for scripts/repair_stores.py v1.0.1.
 # SAFETY: dry-run by default. Run once with apply=false, read the
 # [REPAIR-VERDICT] in the job log (and in the workbook's _Run_Log),
 # then re-run with apply=true.

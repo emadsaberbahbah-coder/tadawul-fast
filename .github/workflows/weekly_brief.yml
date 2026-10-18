@@ -59,9 +59,12 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
       - name: Run weekly brief
+        env:
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_NO_MAIL: ${{ github.event.inputs.no_mail }}
         run: |
           set -euo pipefail
-          EXTRA=""
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
-          if [[ "${{ github.event.inputs.no_mail }}" == "true" ]]; then EXTRA="$EXTRA --no-mail"; fi
-          python scripts/run_weekly_brief.py $EXTRA
+          EXTRA=()
+          if [[ "${INPUT_DRY_RUN:-}" == "true" ]]; then EXTRA+=(--dry-run); fi
+          if [[ "${INPUT_NO_MAIL:-}" == "true" ]]; then EXTRA+=(--no-mail); fi
+          python scripts/run_weekly_brief.py "${EXTRA[@]}"

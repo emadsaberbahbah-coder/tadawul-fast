@@ -49,14 +49,16 @@ jobs:
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          INPUT_SINCE: ${{ inputs.since }}
+          INPUT_FILTER: ${{ inputs.filter }}
         run: |
-          set -o pipefail
+          set -euo pipefail
           mkdir -p artifacts
           python scripts/tfb_backtest.py --live --all-signals --edges 50,70,85 --json artifacts/backtest_all.json | tee -a artifacts/console.txt
           python scripts/tfb_backtest.py --live --all-signals --edges 50,70,85 --filter "Origin Tab=Top_10_Investments" --json artifacts/backtest_board.json | tee -a artifacts/console.txt
           ARGS=(--live --all-signals --edges 50,70,85 --json artifacts/backtest_window.json)
-          if [ -n "${{ inputs.since }}" ]; then ARGS+=(--since "${{ inputs.since }}"); fi
-          if [ -n "${{ inputs.filter }}" ]; then ARGS+=(--filter "${{ inputs.filter }}"); fi
+          if [ -n "$INPUT_SINCE" ]; then ARGS+=(--since "$INPUT_SINCE"); fi
+          if [ -n "$INPUT_FILTER" ]; then ARGS+=(--filter "$INPUT_FILTER"); fi
           python scripts/tfb_backtest.py "${ARGS[@]}" | tee -a artifacts/console.txt
           { echo '```'; cat artifacts/console.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload backtest artifact
