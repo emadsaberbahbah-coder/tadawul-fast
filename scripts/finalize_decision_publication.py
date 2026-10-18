@@ -29,7 +29,12 @@ from scripts.approved_universe_scope import (
     approved_floors, load_scope, receipt_matches_policy,
 )
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.1.2"
+# v1.1.2 (2026-10-16): the final job's log names the nameless symbols behind
+# the coverage names floor (audit_full_refresh_coverage v1.3.2 lists them in
+# each page result; this entry point now prints the same ::notice line per
+# page). Log-only: result JSON, blockers, exit codes and the feed write are
+# unchanged.
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -264,6 +269,12 @@ def main(argv=None) -> int:
     print(json.dumps({key: result.get(key) for key in (
         "script_version", "exit_code", "audit_exit_codes", "blockers",
         "blocker_published", "feed_promoted", "fatal", "publication_error")}, ensure_ascii=False))
+    try:  # v1.1.2 log-only name-gap notices; never changes the result
+        for page in ((result.get("audits") or {}).get("coverage") or {}).get("pages") or []:
+            if isinstance(page, dict) and page.get("blank_name_count"):
+                print(coverage.name_gap_notice(page))
+    except Exception:  # noqa: BLE001
+        pass
     return result["exit_code"]
 
 
