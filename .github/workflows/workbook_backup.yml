@@ -62,6 +62,14 @@ name: "💾 TFB Workbook Backup"
 # or restore the workflow fallback to off; unsetting reactivates observe.
 # v1.2.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
 # ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
+# v1.3.0 (2026-10-15) -- DQ SCORECARD TO THE PRIVATE BACKUP FOLDER. WHY: the three
+# DQ reports reached only the 30-day artifact and the step summary, both behind a
+# GitHub sign-in, so the morning DQ review was still done by hand. New step
+# "Publish DQ report to Drive" runs backup_workbook.py v1.6.0 --attach (upload-only,
+# same destination and credentials as the backup, dated DAILY_TFB_DQ_* names,
+# 30-day pruning). Never the xlsx; never on dry_run or restore_test;
+# continue-on-error so a report upload can never fail the backup. The artifact
+# upload stays as the CI-side copy. Not committed to the (public) repo.
 # ============================================================================
 
 on:
@@ -219,6 +227,24 @@ jobs:
             dq_activation_receipt.json
           retention-days: 30
           if-no-files-found: warn
+
+      # v1.3.0: the same three reports into the operator's PRIVATE backup folder,
+      # beside the workbook, so the morning review needs no GitHub sign-in.
+      # Upload-only (no export); the credentials are still materialised here.
+      # A dry run or restore test publishes nothing; a missing report is
+      # skipped; a failed upload never fails the backup (continue-on-error).
+      - name: Publish DQ report to Drive
+        if: ${{ always() && (steps.dq_mode.outputs.mode == 'observe' || steps.dq_mode.outputs.mode == 'enforce') && github.event.inputs.restore_test != 'true' && github.event.inputs.dry_run != 'true' }}
+        continue-on-error: true
+        env:
+          # Same env block as "Run backup". TFB_BACKUP_LOCAL_COPY lets --attach
+          # refuse the export path itself; the inputs are informational.
+          INPUT_RESTORE_TEST: ${{ github.event.inputs.restore_test }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          TFB_BACKUP_LOCAL_COPY: ${{ (steps.dq_mode.outputs.mode == 'observe' || steps.dq_mode.outputs.mode == 'enforce') && format('{0}/tfb_export.xlsx', runner.temp) || '' }}
+        run: |
+          set -euo pipefail
+          python scripts/backup_workbook.py --attach dq_scorecard.md dq_report.json dq_activation_receipt.json
 
       # v1.1.0: the key file never outlives the job, whatever failed above.
       # v1.2.0 [WP-0]: the local export copy never outlives the job either.
