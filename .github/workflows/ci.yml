@@ -2,6 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.26 (2026-10-18) -- OPT-IN YAHOO US SHARE-CLASS ROUTING
+# Exercise direct and repeated real-provider mapping in the blocking heavy lane.
+# Keep default-off output, registered exchange suffixes and canonical identity.
+#
 # VERSION 1.1.25 (2026-10-18) -- FOLDER-WIDE WORKFLOW REPAIR
 # Exercise dispatch argument boundaries, exact sync targets, store failure
 # receipts, weekly board-schema bindings, and the build/start wrappers in the
@@ -909,6 +913,7 @@ jobs:
             tests/test_usx_currency_lockstep.py \
             tests/test_identity_guard.py \
             tests/test_crypto_provider_identity.py \
+            tests/test_yahoo_share_class_mapping.py \
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
