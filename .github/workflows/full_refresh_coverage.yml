@@ -9,6 +9,9 @@ on:
       - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_full_refresh_coverage.py'
       - 'scripts/workflow_audit_support.py'
+      - 'scripts/sync_target_receipt.py'
+      - 'tests/test_sync_target_receipt.py'
+      - 'tests/test_followup_audit_target_workflows.py'
       - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_full_refresh_coverage.py'
   push:
@@ -20,6 +23,9 @@ on:
       - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_full_refresh_coverage.py'
       - 'scripts/workflow_audit_support.py'
+      - 'scripts/sync_target_receipt.py'
+      - 'tests/test_sync_target_receipt.py'
+      - 'tests/test_followup_audit_target_workflows.py'
       - 'tests/test_workflow_audit_repairs.py'
       - 'tests/test_full_refresh_coverage.py'
   workflow_run:
@@ -62,11 +68,14 @@ jobs:
           set -euo pipefail
           python -m py_compile \
             scripts/audit_full_refresh_coverage.py \
+            scripts/sync_target_receipt.py \
             scripts/approved_universe_scope.py \
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py \
             tests/test_full_refresh_coverage.py
           python -m pytest -q \
+            tests/test_sync_target_receipt.py \
+            tests/test_followup_audit_target_workflows.py \
             tests/test_full_refresh_coverage.py \
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py
@@ -88,12 +97,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: production
+    permissions:
+      contents: read
+      actions: read
     env:
       PYTHON_VERSION: "3.11"
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}
       TZ: Asia/Riyadh
-      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      DEFAULT_AUDIT_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_REFRESH_AUDIT_MAX_ROWS: "20000"
       # (2026-10-12) Owner-approved current roster scope: 255 Saudi-only
       # leaders / 2,474 funds; July's mixed roster is not restored. The
@@ -132,7 +144,35 @@ jobs:
             requirements.render.txt
             requirements.txt
 
+      # Source artifacts bind overrides and rerun attempts. A missing historical
+      # receipt must not turn an unrelated default-workbook scan into evidence
+      # for the source run. Download/integrity errors block target resolution.
+      - name: Download source target receipts
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: tadawul-sync-logs-${{ github.event.workflow_run.id }}-*
+          path: source-sync-targets
+          merge-multiple: false
+
+      - name: Resolve verified audit target and mode
+        id: target
+        run: |
+          set -euo pipefail
+          python scripts/sync_target_receipt.py resolve \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --receipts-root source-sync-targets \
+            --default-sheet-id "$DEFAULT_AUDIT_SHEET_ID" \
+            --json-out sync_audit_target.json \
+            --github-env "$GITHUB_ENV" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Install dependencies
+        if: ${{ steps.target.outputs.audit_required == 'true' }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
@@ -146,13 +186,14 @@ jobs:
           fi
 
       - name: Configure read-only audit credentials
+        if: ${{ steps.target.outputs.audit_required == 'true' }}
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
         run: |
           set -euo pipefail
           if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
-            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
+            echo "::error::The verified audit spreadsheet target is empty."
             exit 1
           fi
           RAW_CREDS="${SECRET_CREDS:-}"
@@ -172,6 +213,7 @@ jobs:
 
       - name: Scan all rows and pages
         id: coverage
+        if: ${{ steps.target.outputs.audit_required == 'true' }}
         run: |
           set -euo pipefail
           code=0
@@ -189,9 +231,17 @@ jobs:
       - name: Publish audit summary
         if: always()
         run: |
+          if [[ -f sync_audit_target.json ]]; then
+            echo "Target resolution: **$(jq -r '.status' sync_audit_target.json)**" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '.reason' sync_audit_target.json >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [[ ! -f full_refresh_coverage.json ]]; then
             echo "## Full Refresh Coverage" >> "$GITHUB_STEP_SUMMARY"
-            echo "Audit report was not produced." >> "$GITHUB_STEP_SUMMARY"
+            if [[ -f sync_audit_target.json ]] && [[ "$(jq -r '.status' sync_audit_target.json)" == "skipped" ]]; then
+              echo 'Full-refresh audit intentionally skipped for the source run mode.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'Audit report was not produced. Target validation must pass before a live audit.' >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 0
           fi
           FAILS="$(jq -r '.summary.failures // 0' full_refresh_coverage.json)"
@@ -211,7 +261,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: full-refresh-coverage-${{ github.event.workflow_run.id || github.run_id }}
-          path: full_refresh_coverage.json
+          path: |
+            full_refresh_coverage.json
+            sync_audit_target.json
           retention-days: 30
           if-no-files-found: warn
 

@@ -73,8 +73,17 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # BLOCKED, never TRADE, with economics suppressed; eligible rows byte-same.
 # Functions added: 1 (_hard_gate_rows). Removed: 0.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.0.3"
+# v1.0.4 (2026-10-18): bind memo/state fields to the shared board header.
+# The board inserted "ROI Src" before "Gen2 Eligible"; the old index 16
+# silently treated provenance as eligibility, blocked valid rows in the memo,
+# and saved provenance in the state gen2 field. Scoring and policy are unchanged.
+SCRIPT_VERSION = "1.0.4"
 TAB_STATE = "_Brief_State"
+
+
+def _board_columns(*names: str) -> List[int]:
+    """Resolve fields against the producer schema instead of positional copies."""
+    return [sb.OUT_HEADER.index(name) for name in names]
 
 
 def _now_riyadh() -> str:
@@ -87,9 +96,12 @@ def _now_riyadh() -> str:
 # --------------------------------------------------------------------------- #
 def snapshot(rows: List[List[Any]], scan_verdict: str) -> Dict[str, Any]:
     """Board rows -> compact state: {sym: {status, verdict, gen2}}."""
+    symbol, status, verdict, eligible = _board_columns(
+        "Symbol", "Shariah Status", "Edge Verdict", "Gen2 Eligible")
     return {"date": _now_riyadh(),
             "switch": scan_verdict,
-            "board": {r[0]: {"status": r[6], "verdict": r[14], "gen2": r[16]}
+            "board": {r[symbol]: {"status": r[status], "verdict": r[verdict],
+                                   "gen2": r[eligible]}
                       for r in rows}}
 
 
@@ -137,19 +149,25 @@ def save_state(sh, state: Dict[str, Any]) -> None:
 # memo rendering (pure)                                                        #
 # --------------------------------------------------------------------------- #
 def _hard_gate_rows(rows: List[List[Any]]) -> List[List[Any]]:
-    """v1.0.3: terminalize hard blocks at the render seam. A row whose
-    Gen2 Eligible cell (index 16) is not YES gets Edge Verdict (14)
-    overwritten to 'BLOCKED - <status(6)>' and ROI/RT/Net Edge (4/11/12)
-    suppressed. Pure (copies), FAIL-OPEN (any error -> row untouched)."""
+    """Terminalize hard blocks using the shared schema's eligibility field.
+
+    Suppress ROI/RT/Net Edge for ineligible rows. Pure (copies), retaining the
+    existing fail-open behavior for malformed rows; no scoring is performed.
+    """
+    eligible, status_col, verdict_col, *economics = _board_columns(
+        "Gen2 Eligible", "Shariah Status", "Edge Verdict", "ROI %",
+        "RT Cost %", "Net Edge %")
+    required_col = max(eligible, status_col, verdict_col, *economics)
     out: List[List[Any]] = []
     for r in rows or []:
         try:
-            if (isinstance(r, list) and len(r) >= 17
-                    and str(r[16] or "").strip().upper() != "YES"):
+            if (isinstance(r, list) and len(r) > required_col
+                    and str(r[eligible] or "").strip().upper() != "YES"):
                 c = list(r)
-                status = str(c[6] or "").strip() or "INELIGIBLE"
-                c[14] = "BLOCKED — " + status
-                c[4] = c[11] = c[12] = "—"
+                status = str(c[status_col] or "").strip() or "INELIGIBLE"
+                c[verdict_col] = "BLOCKED — " + status
+                for col in economics:
+                    c[col] = "—"
                 out.append(c)
                 continue
         except Exception:  # noqa: BLE001
@@ -178,7 +196,10 @@ def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
     ar, en = _verdict_headline(scan)
     subject = (f"TFB Weekly Decision Brief — {_now_riyadh()[:10]} — "
                f"{scan['verdict']} — SHADOW MODE")
-    key_cols = [0, 3, 4, 5, 6, 11, 12, 14, 15, 16]
+    key_cols = _board_columns(
+        "Symbol", "Sector", "ROI %", "Confidence", "Shariah Status",
+        "RT Cost %", "Net Edge %", "Edge Verdict", "Debt/MCap %",
+        "Gen2 Eligible")
     key_hdr = [sb.OUT_HEADER[i] for i in key_cols]
     # v1.0.3 D-2: retired-policy label; the field carries tradability codes.
     key_hdr = ["Status" if h == "Shariah Status" else h for h in key_hdr]
@@ -373,11 +394,14 @@ def _selftest() -> int:
     checks: List[Tuple[str, bool]] = []
     r1 = ["7010.SR", "STC", "", "Telecom", 14.5, "High", "AUTHORITY_PASS",
           "AL_RAJHI_OFFICIAL", "BROKER_TRADABLE", "TASI", "YES", 0.36, 8.5,
-          1.5, "TRADE", 12.1, "YES"]
+          1.5, "TRADE", 12.1, "champion", "YES"]
     r2 = ["2269.T", "Meiji", "", "Staples", 17.5, "High",
           "MODEL_SCREEN_PASS_NOT_FATWA", "MODEL_SCREEN_RAJHI_STYLE",
-          "BROKER_TRADABLE", "", "YES", 0.6, 10.7, 1.8, "TRADE", 18.2, "YES"]
+          "BROKER_TRADABLE", "", "YES", 0.6, 10.7, 1.8, "TRADE", 18.2,
+          "engine:Global_Markets", "YES"]
     rows = [r1, r2]
+    checks.append(("fixtures match the current board schema",
+                   all(len(row) == len(sb.OUT_HEADER) for row in rows)))
     cur = snapshot(rows, "NO_ACTION")
     checks.append(("snapshot shape", cur["board"]["7010.SR"]["gen2"] == "YES"
                    and cur["board"]["2269.T"]["status"].startswith("MODEL")))
@@ -439,7 +463,7 @@ def _selftest() -> int:
     # v1.0.3: the 1015.KL-shape fixture - blocked must terminalize.
     r3 = ["1015.KL", "AMMB", "", "Financial Services", 13.5, "High",
           "BROKER_UNTRADABLE", "SHADOW", "BROKER_UNTRADABLE", "KLSE", "NO",
-          0.55, 8.23, 1.2, "TRADE", 109.2, "NO"]
+          0.55, 8.23, 1.2, "TRADE", 109.2, "engine:Global_Markets", "NO"]
     _, t3, h3 = render_memo(rows + [r3],
                             {"compliance_eligible": 2,
                              "blocked": {"BROKER_UNTRADABLE": 1}},

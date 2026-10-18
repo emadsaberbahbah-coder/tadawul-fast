@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.0 (Build 2)
+TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.1 (Build 2)
 ================================================================================
 ONE-TIME remediation companion to run_dashboard_sync v6.24.0 (ID-FIREWALL)
 and track_performance v6.20.0 (SYMBOL-GUARD). Prevention without repair is
@@ -43,8 +43,9 @@ SAFETY MODEL:
   - DRY-RUN BY DEFAULT: REPAIR_APPLY unset/0 -> full scan, full report,
     ZERO writes (except the verdict line, tagged mode=DRY). Set
     REPAIR_APPLY=1 to execute. Run DRY first, read the verdict, then APPLY.
-  - Fail-open everywhere: any per-phase error is reported, never raised
-    past the phase; partial progress is preserved and counted.
+  - Per-phase errors preserve the remaining reports and partial progress.
+    Missing required tabs, failed reads/writes and safety refusals produce
+    a nonzero final exit status; an incomplete repair never reports success.
   - Never touches: Symbol cells, header rows, _Portfolio_CostBasis,
     My_Portfolio, Portfolio_Decision, Top_10_Investments, or any page not
     named in REPAIR_PAGES/REPAIR_STORES.
@@ -68,7 +69,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 TAG = f"[REPAIR-VERDICT v{TOOL_VERSION}]"
 
 # ---- constants mirrored from run_dashboard_sync v6.24.0 (attribution) ------
@@ -198,10 +199,10 @@ def _open_sheet():
 
 
 def _ws(sheet, name: str):
-    try:
-        return sheet.worksheet(name)
-    except Exception:
-        return None
+    # A missing required tab or failed API lookup is an operational failure.
+    # Each caller records the error in its own report instead of calling the
+    # worksheet absent and claiming that the repair completed successfully.
+    return sheet.worksheet(name)
 
 
 def _delete_rows(ws, sheet, one_based_rows: List[int], apply: bool) -> int:
@@ -240,19 +241,19 @@ def _delete_rows(ws, sheet, one_based_rows: List[int], apply: bool) -> int:
     return len(rows)
 
 
-def _append_runlog(sheet, level: str, status: str, msg: str, details: dict) -> None:
+def _append_runlog(sheet, level: str, status: str, msg: str, details: dict) -> bool:
     try:
         ws = _ws(sheet, "_Run_Log")
-        if ws is None:
-            return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         ws.append_row(
             [ts, level, "repair_stores", "MULTI", status, msg, "", "", "",
              json.dumps(details)[:45000]],
             value_input_option="USER_ENTERED",
         )
+        return True
     except Exception as e:
-        print(f"run-log verdict skipped: {e}", flush=True)
+        print(f"run-log verdict failed: {e}", flush=True)
+        return False
 
 
 # ------------------------------------------------------------------ phases --
@@ -260,16 +261,18 @@ def phase_a_junk(sheet, apply: bool, max_del: int) -> Dict[str, Any]:
     out: Dict[str, Any] = {"stores": {}, "blocklist_size": 0}
     # deterministic blocklist from the exact leaking cells
     block: Set[str] = set()
-    led = _ws(sheet, "_Portfolio_CostBasis")
-    if led is not None:
-        try:
-            for cell in (led.get_values("A1:A3") or []):
-                for tok in re.split(r"\s+", str(cell[0] if cell else "")):
-                    t = tok.strip().upper()
-                    if t:
-                        block.add(t)
-        except Exception as e:
-            out["ledger_read_error"] = str(e)
+    try:
+        led = _ws(sheet, "_Portfolio_CostBasis")
+        for cell in (led.get_values("A1:A3") or []):
+            for tok in re.split(r"\s+", str(cell[0] if cell else "")):
+                t = tok.strip().upper()
+                if t:
+                    block.add(t)
+    except Exception as e:
+        out["ledger_read_error"] = str(e)
+        # A partial blocklist cannot certify the junk purge. Other phases
+        # still produce their reports, but this phase makes no deletion.
+        return out
     out["blocklist_size"] = len(block)
 
     stores = [s.strip() for s in
@@ -277,12 +280,11 @@ def phase_a_junk(sheet, apply: bool, max_del: int) -> Dict[str, Any]:
                or "Signal_History,Signal_Trends,Performance_Log").split(",")
               if s.strip()]
     for name in stores:
-        ws = _ws(sheet, name)
-        rep: Dict[str, Any] = {"present": ws is not None}
+        rep: Dict[str, Any] = {"present": False}
         out["stores"][name] = rep
-        if ws is None:
-            continue
         try:
+            ws = _ws(sheet, name)
+            rep["present"] = True
             grid = ws.get_all_values()
             hdr_r = -1
             sym_i = -1
@@ -325,12 +327,11 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
              (os.getenv("REPAIR_PAGES") or "Market_Leaders,Global_Markets").split(",")
              if p.strip()]
     for page in pages:
-        ws = _ws(sheet, page)
-        rep: Dict[str, Any] = {"present": ws is not None}
+        rep: Dict[str, Any] = {"present": False}
         out["pages"][page] = rep
-        if ws is None:
-            continue
         try:
+            ws = _ws(sheet, page)
+            rep["present"] = True
             grid = ws.get_all_values()
             if not grid:
                 rep["error"] = "empty page"
@@ -394,22 +395,21 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
                         "values": [row],
                     })
                 CH = 200
+                rep["repaired"] = 0
                 for i in range(0, len(updates), CH):
-                    ws.batch_update(updates[i:i + CH],
-                                    value_input_option="USER_ENTERED")
-                rep["repaired"] = len(corrupt)
+                    batch = updates[i:i + CH]
+                    ws.batch_update(batch, value_input_option="USER_ENTERED")
+                    rep["repaired"] += len(batch)
         except Exception as e:
             rep["error"] = str(e)
     return out
 
 
 def phase_c_ghost_panel(sheet, apply: bool) -> Dict[str, Any]:
-    rep: Dict[str, Any] = {}
-    ws = _ws(sheet, "Performance_Log")
-    rep["present"] = ws is not None
-    if ws is None:
-        return rep
+    rep: Dict[str, Any] = {"present": False}
     try:
+        ws = _ws(sheet, "Performance_Log")
+        rep["present"] = True
         vals = ws.get_values("A1:E4") or []
         has = any(any(str(c).strip() for c in row) for row in vals)
         rep["ghost_present"] = has
@@ -423,10 +423,20 @@ def phase_c_ghost_panel(sheet, apply: bool) -> Dict[str, Any]:
 
 def main() -> int:
     apply = (os.getenv("REPAIR_APPLY") or "0").strip().lower() in {"1", "true", "yes", "on"}
-    max_del = max(1, int(os.getenv("REPAIR_MAX_DELETES") or "2000"))
+    try:
+        max_del = int(os.getenv("REPAIR_MAX_DELETES") or "2000")
+        if max_del < 1:
+            raise ValueError("positive integer required")
+    except ValueError:
+        print("FATAL: REPAIR_MAX_DELETES must be a positive integer", flush=True)
+        return 2
     mode = "APPLY" if apply else "DRY"
     print(f"{TAG} starting - mode={mode}", flush=True)
-    sheet = _open_sheet()
+    try:
+        sheet = _open_sheet()
+    except Exception as e:
+        print(f"FATAL: opening repair workbook failed: {e}", flush=True)
+        return 2
 
     a = phase_a_junk(sheet, apply, max_del)
     b = phase_b_identity(sheet, apply)
@@ -436,11 +446,13 @@ def main() -> int:
                "version": TOOL_VERSION}
     print(json.dumps(summary, indent=2)[:20000], flush=True)
 
-    a_n = sum(int(v.get("deleted", v.get("would_delete", 0)) or 0)
+    a_n = sum(int(v.get("deleted" if apply else "would_delete", 0) or 0)
               for v in a.get("stores", {}).values() if isinstance(v, dict))
     b_n = sum(int(v.get("corrupt", 0) or 0)
               for v in b.get("pages", {}).values() if isinstance(v, dict))
     errs = []
+    if a.get("ledger_read_error"):
+        errs.append(f"_Portfolio_CostBasis:{str(a['ledger_read_error'])[:60]}")
     for grp in (a.get("stores", {}), b.get("pages", {})):
         for k, v in grp.items():
             if isinstance(v, dict) and v.get("error"):
@@ -454,9 +466,9 @@ def main() -> int:
            f"{c.get('cleared', c.get('ghost_present', False))}"
            f"{' | ERRORS: ' + '; '.join(errs[:4]) if errs else ''}")
     print(msg, flush=True)
-    _append_runlog(sheet, "WARNING" if errs else "INFO",
-                   "OK" if not errs else "PARTIAL", msg, summary)
-    return 0
+    logged = _append_runlog(sheet, "WARNING" if errs else "INFO",
+                           "OK" if not errs else "PARTIAL", msg, summary)
+    return 0 if not errs and logged else 1
 
 
 if __name__ == "__main__":

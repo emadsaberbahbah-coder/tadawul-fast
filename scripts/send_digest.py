@@ -134,7 +134,14 @@ from typing import Any, Dict, List, Optional, Tuple
 #   TFB_SYNC_STATUS_STAMP is armed — until then the gate blocks, which is
 #   the correct fail-closed answer.
 # =============================================================================
-__version__ = "2.1.2"
+__version__ = "2.1.4"
+# v2.1.4 WHY (2026-10-18): a failed final decision-feed read is not a
+# successful legacy blank. Stop before picks, rendering or SMTP when this
+# required read fails; retain manifest-only behavior for readable legacy data.
+# v2.1.3 WHY (2026-10-17): SMTP sendmail returns a refusal dictionary even
+# when some recipients were accepted. Require its complete acknowledgement
+# before claiming success; disclose partial/unknown delivery without replaying
+# accepted recipients or logging private recipient/server-response payloads.
 # v2.1.2 (2026-10-14): retain both displayed Top10 cash titles in the state
 # brief. Exactly one valid Selected/Passed strip is required; ambiguous strips
 # stay unknown. Entered cash is never renamed as funding/deployable evidence.
@@ -594,13 +601,18 @@ def _state_brief_enabled() -> bool:
         "0", "false", "off", "no"}
 
 
+class DecisionFeedReadError(RuntimeError):
+    """The required final decision-feed read failed; details stay private."""
+
+
 def _read_status_globals(read_range, sheet_id: str) -> Dict[str, str]:
     """v2.1.0: the '_Status' L:M global key-value block -> {key.casefold(): value}.
-    Fail-open: any problem -> {} (the caller then falls back to v2.0.0)."""
+    A successful empty read preserves the v2.0.0 fallback. A failed read
+    cannot establish legacy absence and must stop the digest."""
     try:
         rows = read_range(sheet_id, "'_Status'!L1:M60") or []
-    except Exception:  # noqa: BLE001
-        return {}
+    except Exception as exc:  # noqa: BLE001
+        raise DecisionFeedReadError(type(exc).__name__) from None
     out: Dict[str, str] = {}
     for row in rows:
         if not row:
@@ -1181,18 +1193,29 @@ def _send_email(subject: str, text: str, html: str, dry_run: bool) -> int:
             with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
                 if user:
                     s.login(user, pwd)
-                s.sendmail(msg["From"], recips, msg.as_string())
+                refused = s.sendmail(msg["From"], recips, msg.as_string())
         else:
             with smtplib.SMTP(host, port, timeout=30) as s:
                 if _env_bool("SMTP_USE_TLS", True):
                     s.starttls(context=ctx)
                 if user:
                     s.login(user, pwd)
-                s.sendmail(msg["From"], recips, msg.as_string())
+                refused = s.sendmail(msg["From"], recips, msg.as_string())
+        if not isinstance(refused, dict) or not set(refused).issubset(recips):
+            _log("ERROR email delivery acknowledgement unavailable; "
+                 "delivery unconfirmed, verify before retrying")
+            return 2
+        if refused:
+            rejected = sum(address in refused for address in recips)
+            _log(f"ERROR partial email delivery: requested={len(recips)} "
+                 f"accepted={len(recips) - rejected} refused={rejected}; "
+                 "verify accepted recipients before retrying")
+            return 2
         _log(f"email sent to {len(recips)} recipient(s): {subject}")
         return 0
     except Exception as exc:  # noqa: BLE001
-        _log(f"ERROR sending email: {exc}")
+        _log(f"ERROR sending email: {type(exc).__name__}; "
+             "delivery unconfirmed, verify before retrying")
         return 2
 
 
@@ -1227,7 +1250,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         m_ok, m_summary, m_fails = _manifest_gate(read_range, sheet_id)
         if _state_brief_enabled():
             # v2.1.0: the composite feed is the actionability authority.
-            g_kv = _read_status_globals(read_range, sheet_id)
+            try:
+                g_kv = _read_status_globals(read_range, sheet_id)
+            except DecisionFeedReadError as exc:
+                _log(f"ERROR _Status final decision feed could not be read ({exc}); "
+                     "no digest generated or sent")
+                return 2
             f_state, f_reason, _ = _decision_feed_state(g_kv)
             top10 = _read_top10_summary(read_range, sheet_id)
             actionable = m_ok and f_state != "NOT_ACTIONABLE"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/start_web.sh
 # ==============================================================================
-# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.1)
+# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.2)
 # ==============================================================================
 # Purpose
 # - Render-safe startup path
@@ -11,16 +11,21 @@
 #   does NOT hard-fail outside Render so the script works for local dev
 # - Conservative defaults for heavy FastAPI startup
 #
+# Why this revision (v2.6.2 vs v2.6.1)
+# -------------------------------------
+# - FIX: Reject invalid ports and unsafe integer values; a zero worker cap
+#     no longer disables the bound. Offline launch probes reproduced both.
+# - FIX: Forward UVICORN_BACKLOG and raise the file-descriptor limit in the
+#     current shell so the setting survives exec into Gunicorn.
+# - DEPLOY: Track this launcher as executable and document the paired build
+#     wrapper/start commands so startup uses the build virtual environment.
+#
 # Why this revision (v2.6.1 vs v2.6.0)
 # -------------------------------------
-# - DOC: Scrubbed stale `render.yaml` references. This repo has NO Render
-#     Blueprint. The `tfb-server` env vars (PORT, WEB_CONCURRENCY, WORKERS_MAX,
-#     UVICORN_*) and the /readyz health check are configured in the Render
-#     DASHBOARD, not a render.yaml file. The old comments attributed them to a
-#     "render.yaml envVarGroup" that does not exist — the root render.yaml was
-#     an inert, misplaced GitHub Actions workflow (now deleted). NO behavioral
-#     change: every env var name and all resolution logic is byte-identical;
-#     only comments and --help text were corrected.
+# - DOC: Removed stale Blueprint references. This repository has no Render
+#     Blueprint; environment variables and health checks are managed in the
+#     Dashboard. The available /readyz route must be configured separately;
+#     its presence does not establish the live health-check path or policy.
 #
 # Why this revision (v2.6.0 vs v2.5.0)
 # -------------------------------------
@@ -56,7 +61,7 @@
 # - FIX: `PYTHONPATH` now includes app dir so imports work after `cd`.
 # - FIX: Added `--help` / `-h` to print the resolved gunicorn command line
 #     without starting the server — useful for config debugging.
-# - FIX: Documented readiness path (`/readyz`) — the Render health check.
+# - DOC: Documented the available application readiness route (`/readyz`).
 #
 # Environment
 # -----------
@@ -66,8 +71,7 @@
 #   WEB_CONCURRENCY           worker count (default 1)
 #   UVICORN_KEEPALIVE         keep-alive seconds (default 10, capped 300)
 #   UVICORN_GRACEFUL_TIMEOUT  graceful shutdown seconds (default 45, cap 300)
-#   UVICORN_BACKLOG           socket listen backlog (informational here;
-#                             UvicornWorker sets it internally)
+#   UVICORN_BACKLOG           socket listen backlog (default 2048, cap 65535)
 #   WORKERS_MAX               hard cap on workers (default 8)
 #
 # Project-wide:
@@ -80,20 +84,20 @@
 #   TFB_ACCESS_LOG, TFB_WORKER_CLASS, TFB_WORKER_TMP_DIR,
 #   TFB_MAX_REQUESTS, TFB_MAX_REQUESTS_JITTER, TFB_LOG_LEVEL
 #
-# Expected Render service config (Render dashboard — this repo has NO
-# render.yaml Blueprint)
+# Reviewed paired Render commands (Dashboard; no render.yaml Blueprint)
 # --------------------------------
-#   Start Command:
-#     set -euo pipefail
-#     chmod +x scripts/start_web.sh
-#     exec ./scripts/start_web.sh
-#   Health Check Path: /readyz   (ensure main.py exposes this route)
+#   Build: bash scripts/build_web.sh
+#   Start: bash -lc 'set -euo pipefail; source .venv/bin/activate; exec ./scripts/start_web.sh'
+#   If TFB_BUILD_VENV overrides .venv, activate that same path in Start.
+#   These examples do not change live Dashboard settings. Configure HTTP
+#   readiness separately: /readyz is advisory unless TFB_READYZ_STRICT is
+#   armed, and its requirement flags determine which conditions are checked.
 #
 # Exit codes
 # ----------
 #   0   never (exec gunicorn replaces process)
 #   1   gunicorn binary not found
-#   2   --help invoked (prints plan and exits)
+#   2   invalid PORT, or --help / --print-plan invoked
 #   130 interrupted (SIGINT)
 #   143 terminated (SIGTERM)
 # ==============================================================================
@@ -102,7 +106,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.6.2"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -134,7 +138,14 @@ as_int() {
       printf "%s" "$def"
       ;;
     *)
-      printf "%s" "$raw"
+      raw="${raw#"${raw%%[!0]*}"}"
+      raw="${raw:-0}"
+      # Reject values that cannot safely participate in shell integer tests.
+      if [ "${#raw}" -gt 18 ]; then
+        printf "%s" "$def"
+      else
+        printf "%s" "$raw"
+      fi
       ;;
   esac
 }
@@ -223,7 +234,14 @@ Primary env vars (aligned with the Render dashboard 'tfb-server' env group):
 
 Legacy TFB_* names still honored. See header of this script for full list.
 
-Health check path (Render dashboard): /readyz
+Reviewed paired Render commands (configure in the Dashboard):
+  Build: bash scripts/build_web.sh
+  Start: bash -lc 'set -euo pipefail; source .venv/bin/activate; exec ./scripts/start_web.sh'
+  If TFB_BUILD_VENV overrides .venv, activate that same path in Start.
+
+Configure HTTP readiness separately. The available /readyz route is advisory
+unless TFB_READYZ_STRICT is armed; its requirement flags select the checks.
+These examples do not establish the live Dashboard configuration.
 EOF
   exit 2
 fi
@@ -247,12 +265,25 @@ if [ -z "${PORT:-}" ]; then
   log_warn "PORT not set by environment; defaulting to 10000 (matches main.py)"
   PORT=10000
 else
-  PORT="$(as_int "$PORT" 10000)"
+  case "$PORT" in
+    *[!0-9]*)
+      log_err "PORT must be a decimal integer in 1..65535"
+      exit 2
+      ;;
+  esac
+  # Remove leading zeros before range checks and before passing the value to
+  # Gunicorn. Compare length first so huge values cannot overflow shell tests.
+  PORT="${PORT#"${PORT%%[!0]*}"}"
+  PORT="${PORT:-0}"
+  if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    log_err "PORT must be a decimal integer in 1..65535"
+    exit 2
+  fi
 fi
 
 # Workers: prefer WEB_CONCURRENCY (Render canonical), then TFB_WORKERS.
 # Hard-cap by WORKERS_MAX (Render canonical) with fallback 8.
-_WORKERS_MAX="$(as_int "${WORKERS_MAX:-${WORKERS_MAX_DEFAULT:-}}" 8)"
+_WORKERS_MAX="$(clamp_range "${WORKERS_MAX:-${WORKERS_MAX_DEFAULT:-}}" 1 0 8)"
 WORKERS="$(clamp_range "${WEB_CONCURRENCY:-${TFB_WORKERS:-}}" 1 "$_WORKERS_MAX" 1)"
 
 # Timeouts: canonical UVICORN_* env vars preferred; legacy TFB_* honored.
@@ -260,6 +291,7 @@ WORKERS="$(clamp_range "${WEB_CONCURRENCY:-${TFB_WORKERS:-}}" 1 "$_WORKERS_MAX" 
 TIMEOUT="$(clamp_range "${TFB_TIMEOUT:-${TIMEOUT:-}}" 1 600 180)"
 GRACEFUL_TIMEOUT="$(clamp_range "${UVICORN_GRACEFUL_TIMEOUT:-${TFB_GRACEFUL_TIMEOUT:-${GRACEFUL_TIMEOUT:-}}}" 1 300 45)"
 KEEPALIVE="$(clamp_range "${UVICORN_KEEPALIVE:-${TFB_KEEPALIVE:-${KEEPALIVE:-}}}" 1 300 10)"
+BACKLOG="$(clamp_range "${UVICORN_BACKLOG:-}" 1 65535 2048)"
 
 # Log level
 RAW_LOG_LEVEL="${TFB_LOG_LEVEL:-${LOG_LEVEL:-info}}"
@@ -301,7 +333,12 @@ if [ -n "$APP_DIR" ]; then
 fi
 
 # Raise file descriptor limit (best-effort; not fatal if unsupported)
-( ulimit -n 65535 >/dev/null 2>&1 ) || true
+_NOFILE_TARGET=65535
+_NOFILE_HARD="$(ulimit -Hn)"
+if [ "$_NOFILE_HARD" != "unlimited" ] && [ "$_NOFILE_HARD" -lt "$_NOFILE_TARGET" ]; then
+  _NOFILE_TARGET="$_NOFILE_HARD"
+fi
+ulimit -Sn "$_NOFILE_TARGET" >/dev/null 2>&1 || true
 
 # v2.6.0: ensure Python can import from workdir (after any cd above).
 export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}$(pwd)"
@@ -312,7 +349,7 @@ export HOST
 log "TFB start_web.sh v${SCRIPT_VERSION}"
 log "boot config: app=$APP_MODULE host=$HOST port=$PORT workers=$WORKERS \
 workers_max=$_WORKERS_MAX gunicorn_log_level=$GUNICORN_LOG_LEVEL \
-timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE \
+timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE backlog=$BACKLOG \
 access_log=$ACCESS_LOGFILE worker_tmp_dir=$WORKER_TMP_DIR"
 
 # Verify gunicorn is present (fail-fast diagnostic)
@@ -331,6 +368,7 @@ GUNI_ARGS=(
   "--timeout"             "${TIMEOUT}"
   "--graceful-timeout"    "${GRACEFUL_TIMEOUT}"
   "--keep-alive"          "${KEEPALIVE}"
+  "--backlog"            "${BACKLOG}"
   "--log-level"           "${GUNICORN_LOG_LEVEL}"
   "--error-logfile"       "-"
   "--access-logfile"      "${ACCESS_LOGFILE}"

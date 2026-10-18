@@ -60,6 +60,15 @@ on:
         self.assertEqual(findings[0].severity, "WARN")
         self.assertEqual(findings[0].code, "TEMPORARY_OVERRIDE_ACTIVE")
 
+    def test_optional_variable_mapping_is_not_a_live_override_readback(self):
+        for value in ("${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}",
+                      '"${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS }}"',
+                      "", "''", '""', "null", "~", "# optional",
+                      "'' # empty default"):
+            with self.subTest(value=value):
+                codes = self.codes("env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: " + value + "\n")
+                self.assertNotIn("TEMPORARY_OVERRIDE_ACTIVE", codes)
+
     def test_used_oidc_permission_is_not_flagged(self):
         text = """
 permissions:

@@ -1,5 +1,7 @@
 name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
+# VERSION 1.0.2 (2026-10-18) -- KEEP STRING DISPATCH INPUTS OUT OF SHELL SOURCE
+# Preserve exact true/false flag selection and composed dry-run/drill flags.
 # VERSION 1.0.1 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
 # WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.0 (2026-10-11) -- WP-02 DEFAULT-OFF S-1 V2 MAPPING
@@ -106,14 +108,17 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
       - name: Score shadow vs champion
+        env:
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_ROLLBACK_DRILL_PASSED: ${{ github.event.inputs.rollback_drill_passed }}
         run: |
           set -euo pipefail
-          EXTRA=""
+          EXTRA=()
           # 2026-08-25 fix: COMPOSE flags — the second assignment used to
           # OVERWRITE the first, so dry_run+rollback_drill_passed silently
           # dropped --dry-run. NOTE: composition alone does NOT guarantee a
           # zero-write dry run; run_shadow_scorer.py v1.6.0 (same delivery)
           # makes --dry-run authoritative inside the drill branch itself.
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="$EXTRA --dry-run"; fi
-          if [[ "${{ github.event.inputs.rollback_drill_passed }}" == "true" ]]; then EXTRA="$EXTRA --rollback-drill-passed"; fi
-          python scripts/run_shadow_scorer.py $EXTRA
+          if [[ "${INPUT_DRY_RUN:-}" == "true" ]]; then EXTRA+=(--dry-run); fi
+          if [[ "${INPUT_ROLLBACK_DRILL_PASSED:-}" == "true" ]]; then EXTRA+=(--rollback-drill-passed); fi
+          python scripts/run_shadow_scorer.py "${EXTRA[@]}"

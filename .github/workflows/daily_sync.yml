@@ -102,11 +102,13 @@ on:
 # must still share one lease to prevent chimeric Google Sheet writes.
 #
 # Production: schedule + workflow_dispatch share one non-cancelling write lease.
+# The workbook is shared across refs: a branch dispatch must wait for the main
+# schedule too. Only CI groups include the ref.
 # CI only: push + pull_request use their own cancellable group and never block data
 # refresh or recovery.
 # ============================================================================
 concurrency:
-  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('tadawul-production-write-{0}', github.ref) || format('tadawul-ci-{0}-{1}-{2}', github.workflow, github.event_name, github.ref) }}
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'tadawul-production-write' || format('tadawul-ci-{0}-{1}-{2}', github.workflow, github.event_name, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 permissions:
   contents: read
@@ -201,7 +203,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py tests/test_activation_rollout_evidence_workflows.py tests/test_ycp_quote_breaker_isolation.py tests/test_ycp_singleflight_cancellation.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py tests/test_activation_rollout_evidence_workflows.py tests/test_sync_target_workflow.py tests/test_ycp_quote_breaker_isolation.py tests/test_ycp_singleflight_cancellation.py
           # W1A-6b (2026-08-18, external audit F-13 ACCEPTED): the OHLC
           # guard + _Run_Log + _Status contracts are merge-blocking. The
           # harness self-detects CI (no fixture exports) and runs its
@@ -902,8 +904,8 @@ jobs:
           # 1) URL
           URL="$(get_val "${INPUT_URL:-}" "${VAR_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
           URL="${URL%/}"
-          if [[ ! "$URL" =~ ^https?:// ]]; then
-            echo "::error::Invalid URL format: $URL"
+          if [[ ! "$URL" =~ ^https?://[^[:space:]]+$ ]]; then
+            echo "::error::Backend URL must be a single-line HTTP(S) URL."
             exit 1
           fi
           echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
@@ -911,8 +913,8 @@ jobs:
 
           # 2) Sheet ID
           SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
-          if [[ -z "${SHEET:-}" ]]; then
-            echo "::error::Spreadsheet ID is empty. Set vars.DEFAULT_SPREADSHEET_ID or pass workflow input sheet_id."
+          if [[ ! "$SHEET" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Spreadsheet ID is missing or invalid. Set vars.DEFAULT_SPREADSHEET_ID or pass workflow input sheet_id."
             exit 1
           fi
           echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
@@ -997,6 +999,13 @@ jobs:
           fi
 
           echo "::endgroup::"
+
+      - name: Record the resolved source target before writing
+        env:
+          SYNC_GROUP: ${{ matrix.group }}
+        run: |
+          python scripts/sync_target_receipt.py write \
+            --group "$SYNC_GROUP" --output sync_target.json
 
       # (2026-10-13) P0-1 SUPERSEDE AT WRITER START (Codex P1 on PR #763).
       # WHY: this leg re-stamps pages with this run's id, so a released
@@ -1542,6 +1551,7 @@ jobs:
             sync_execution.log
             sync_summary.json
             sync_runner_*.json
+            sync_target.json
             rollout_modes.json
             validate_dashboard.json
             sync_row_telemetry_*.jsonl
@@ -1647,8 +1657,6 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       TZ: Asia/Riyadh
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_XPAGE_PRICE_CHECK: "1"
       TFB_SYNC_EMPTY_RETRY: "0"
       TFB_SYNC_NAME_DEDUP_MODE: "observe"
@@ -1895,6 +1903,40 @@ jobs:
           print(json.dumps(evidence))
           PY
 
+      # A manual full_sync can target a different backend or workbook. Resolve
+      # the same inputs as the source legs before configuring credentials or
+      # replaying writes, so recovery cannot silently write the default sheet.
+      - name: Resolve recovery target
+        env:
+          INPUT_URL: ${{ github.event.inputs.backend_url }}
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          VAR_URL: ${{ vars.BACKEND_BASE_URL }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          set -euo pipefail
+          get_val() {
+            for v in "$@"; do
+              if [[ -n "${v:-}" && "$v" != "null" && "$v" != "undefined" ]]; then
+                echo "$v"
+                return 0
+              fi
+            done
+            return 0
+          }
+          URL="$(get_val "${INPUT_URL:-}" "${VAR_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
+          URL="${URL%/}"
+          if [[ ! "$URL" =~ ^https?://[^[:space:]]+$ ]]; then
+            echo "::error::Backend URL must be a single-line HTTP(S) URL."
+            exit 1
+          fi
+          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
+          if [[ ! "$SHEET" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Spreadsheet ID is missing or invalid. Set vars.DEFAULT_SPREADSHEET_ID or pass workflow input sheet_id."
+            exit 1
+          fi
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
+
       - name: 📥 Download current sync evidence
         uses: actions/download-artifact@v8
         with:
@@ -2080,6 +2122,31 @@ jobs:
           else
             python -m pip install -r requirements.txt
           fi
+
+      # Match Smart Configuration's sentinel handling as well as ordinary
+      # sheet overrides. Auditing a literal "null" or "undefined" would inspect
+      # a different target from the source/recovery writers.
+      - name: Resolve final-audit target
+        env:
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          set -euo pipefail
+          get_val() {
+            for v in "$@"; do
+              if [[ -n "${v:-}" && "$v" != "null" && "$v" != "undefined" ]]; then
+                echo "$v"
+                return 0
+              fi
+            done
+            return 0
+          }
+          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
+          if [[ ! "$SHEET" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Spreadsheet ID is missing or invalid."
+            exit 1
+          fi
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
 
       - name: Configure final-audit credentials
         env:

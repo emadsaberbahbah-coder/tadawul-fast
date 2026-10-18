@@ -2,10 +2,16 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.6.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.6.1 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.6.1 (2026-10-18): the existing Yahoo share-class opt-in now also handles
+explicit US input such as BRK.B.US before the US-suffix return. Registered
+exchange suffixes inside the base retain precedence (VOD.L.US stays VOD.L).
+Default-off output, canonical symbols and non-Yahoo provider mappings are
+unchanged. Restart after changing the existing flag because results are cached.
 
 v5.6.0 WHY (2026-10-10 work brief WP-05): seven wrong-identity crypto
 rows were preserved after Yahoo short-ticker collisions. Add a provider
@@ -118,7 +124,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.6.0"
+__version__ = "5.6.1"
 
 __all__ = [
     "MarketType",
@@ -1288,6 +1294,12 @@ def to_yahoo_symbol(symbol: str) -> str:
 
     base, ex = split_symbol_exchange(s)
     if ex == "US":
+        # Apply the same opt-in to explicit US input without mistaking an
+        # inner registered exchange (e.g. VOD.L.US) for a share class.
+        if (_env_bool("TFB_YAHOO_SHARE_CLASS_DASH", False)
+                and US_SHARE_CLASS_DOT_RE.match(base)
+                and split_symbol_exchange(base)[1] is None):
+            return base.replace(".", "-")
         return base
     if ex:
         # v5.3.1: hand Yahoo the suffix IT expects (e.g. RELIANCE.NSE -> RELIANCE.NS).
