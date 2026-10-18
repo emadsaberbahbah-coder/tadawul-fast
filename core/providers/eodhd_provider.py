@@ -761,6 +761,21 @@ _GEO_BY_SUFFIX: Dict[str, Tuple[str, str, str]] = {
     ".SR":      ("Saudi Arabia",   "SAR", "Tadawul"),
     ".TADAWUL": ("Saudi Arabia",   "SAR", "Tadawul"),
     ".US":      ("United States",  "USD", "NYSE/NASDAQ"),
+    # v4.18.4 (P-180): suffixes the engine's identity guard already expects
+    # (identity_guard.SUFFIX_CURRENCY) but this table lacked.
+    ".VN":      ("Vietnam",        "VND", "HOSE"),
+    ".PH":      ("Philippines",    "PHP", "PSE Philippines"),
+    ".JK":      ("Indonesia",      "IDR", "IDX"),
+    ".IS":      ("Turkey",         "TRY", "BIST"),
+    ".AT":      ("Greece",         "EUR", "ATHEX"),
+    ".BK":      ("Thailand",       "THB", "SET"),
+    ".KL":      ("Malaysia",       "MYR", "Bursa Malaysia"),
+    ".SI":      ("Singapore",      "SGD", "SGX"),
+    ".WA":      ("Poland",         "PLN", "Warsaw"),
+    ".TWO":     ("Taiwan",         "TWD", "TPEx"),
+    ".IR":      ("Ireland",        "EUR", "Euronext Dublin"),
+    ".CN":      ("Canada",         "CAD", "CSE"),
+    ".NE":      ("Canada",         "CAD", "NEO Exchange"),
 }
 
 
@@ -1152,7 +1167,16 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
-PROVIDER_VERSION = "4.18.3"
+# =============================================================================
+# v4.18.4 (2026-10-18) — P-180 SUFFIX GEO COMPLETION
+# The real-time endpoint never returns exchange/currency, so every quote relies
+# on _GEO_BY_SUFFIX. Suffixes absent from the table came back tagged
+# quote_exchange_missing / quote_currency_missing and the engine fell to its
+# own NASDAQ/NYSE + USD default (live 2026-10-17/18: 26 .VN rows quarantined by
+# the identity guard). Additive entries only - no request, parsing or caching
+# change; every previously mapped suffix is byte-identical.
+# =============================================================================
+PROVIDER_VERSION = "4.18.4"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
