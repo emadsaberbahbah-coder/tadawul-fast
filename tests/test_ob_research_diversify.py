@@ -16,10 +16,12 @@ cases must then fail.
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import importlib.util
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -127,6 +129,23 @@ def _strip_volatile(payload):
     return p
 
 
+def _comparison_clock(ob):
+    """Evaluate both payloads at one instant, retaining all freshness evidence.
+
+    Imported quote fixtures can cross a rounded age boundary between calls.
+    The equivalence tests vary the policy gate, so time must stay identical.
+    """
+    instant = datetime.now(timezone.utc)
+
+    class ComparisonDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (instant.astimezone(tz) if tz is not None
+                    else instant.astimezone().replace(tzinfo=None))
+
+    return patch.object(ob, "datetime", ComparisonDateTime)
+
+
 # --- gate OFF: v1.24.1 behaviour preserved ------------------------------------
 
 def test_off_research_lists_every_qualified_name():
@@ -138,10 +157,11 @@ def test_off_research_lists_every_qualified_name():
 
 def test_off_explicit_zero_equals_unset():
     ob = _load_builder()
-    with _Env():
-        a = _strip_volatile(_research(ob))
-    with _Env(**{GATE: "0"}):
-        b = _strip_volatile(_research(ob))
+    with _comparison_clock(ob):
+        with _Env():
+            a = _strip_volatile(_research(ob))
+        with _Env(**{GATE: "0"}):
+            b = _strip_volatile(_research(ob))
     assert a == b
 
 
@@ -155,10 +175,11 @@ def test_off_regression_still_present_documents_the_bug():
 
 def test_single_pass_unaffected_by_gate():
     ob = _load_builder()
-    with _Env():
-        a = _strip_volatile(_single(ob))
-    with _Env(**{GATE: "1"}):
-        b = _strip_volatile(_single(ob))
+    with _comparison_clock(ob):
+        with _Env():
+            a = _strip_volatile(_single(ob))
+        with _Env(**{GATE: "1"}):
+            b = _strip_volatile(_single(ob))
     assert a == b
     assert _funded(_single(ob)) == [("E0.SR", 25000.0), ("E1.SR", 25000.0),
                                     ("M0.SR", 25000.0), ("M1.SR", 25000.0)]

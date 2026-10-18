@@ -2,6 +2,8 @@
 
 Review date: 18 October 2026. Repository: `emadsaberbahbah-coder/tadawul-fast`.
 
+Review candidate and final CI receipts: [PR795](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/795).
+
 Reviewed base: [`4c9e2cbf98a22ecb3decc6894398b3dc74157592`](https://github.com/emadsaberbahbah-coder/tadawul-fast/commit/4c9e2cbf98a22ecb3decc6894398b3dc74157592), including the source-read relay merged in PR793. The repair candidate preserves that change.
 
 ## Outcome and scope
@@ -30,6 +32,7 @@ This is a code-review candidate. It does not constitute a live workbook repair o
 | Medium | Backtest history requests could collapse to an unintended provider default; signal backtests omitted the producer's canonical `Risk Bucket` field; London calendar request symbols used the wrong provider suffix. | Preserve requested history depth, accept the canonical risk column with legacy compatibility, and normalize London provider requests. |
 | Medium | A ref-qualified production concurrency group allowed a branch recovery/grid run to overlap the main schedule on the same workbook. | Share one non-cancelling group across refs for Daily Sync, historical Page Refresh Recovery and Grid Capacity Repair. CI retains its own cancellable groups. This is not a global workbook transaction. |
 | Medium | The launcher accepted invalid port/cap inputs, omitted backlog, and raised file limits in a subshell. The dashboard build ignored dependency-check failures and used a broken option-like grep pattern. | Use the reviewed executable launcher and checked-in build wrapper. Enforce dependency checks and bounded launch arguments; document paired build/start commands. Dashboard configuration is a separate pending action. |
+| Medium | A full-suite gate-equivalence test compared calls against a moving wall clock, so unchanged quote evidence could differ by 0.1 minute and intermittently fail CI. | Give both compared calls one scoped clock; preserve complete payload equality, quote-age fields and financial assertions. |
 | Low | The repository audit reported an optional variable mapping as proof of a live force-refetch override. | Warn about actual literal overrides; do not infer configured values from expression plumbing. |
 
 ## Complete folder inventory
@@ -168,3 +171,5 @@ Behavioral tests cover actual shell wrappers with inert child processes; in-memo
 The local broad suite encountered a runtime wakeup limitation independently reproduced using only stdlib asyncio and ThreadPoolExecutor, without pytest or repository imports. No production workaround, timeout change, assertion weakening or skip was introduced. Local split-suite counts are not represented as a complete full-suite pass. GitHub's actual Python3.11 workflow run is the decisive integration check; its exact receipt will accompany this review candidate.
 
 The [first candidate GitHub run](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606) completed the full suite without the local runtime limitation: 5,605 tests passed and two existing structural expectations failed. Those tests still required a ref-qualified production group and no local receipt step between credentials and the writer-start veto. Their reviewed updates now require one shared production group across all tested refs, preserve separate cancellable CI groups, and allow only the exact local receipt command/environment before the veto. Negative mutations reject missing, duplicated, conditional or altered receipts, ignored failures and extra intervening commands. No production gate or test selection was relaxed. The PR records the subsequent CI result for the final proposed revision.
+
+The corrected structural revision passed the complete [PR suite](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39150212621) with **5,608 tests and 382 subtests passed, 33 skipped**. Its parallel [push suite](https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39150208823) exposed a pre-existing time-dependent equivalence test: two calls crossed a quote-age rounding boundary, yielding `age_min` 3.1 versus 3.2 for otherwise identical outputs. The review therefore also repairs the comparison fixture with one controlled clock. Freshness and full-payload equality assertions remain present; production age calculations and financial policy are unchanged. The final revision's actual PR and push results are recorded together in PR795, including the advisory full-suite job's real outcome.
