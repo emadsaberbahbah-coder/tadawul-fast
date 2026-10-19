@@ -1529,7 +1529,35 @@ from typing import Optional
 #   _conviction_weight, _conviction_targets, _sizing_cohort). Removed: 0.
 #   Rollback: unset TFB_OPP_SIZING_MODE, or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.0"
+# -----------------------------------------------------------------------------
+# v1.27.1 (2026-10-20) — ROTATION ROI BASIS (owner request)
+# WHY: the rotation funding plan (v1.18.0) compares an unfunded seat with the
+#   held names on the engine's 12-MONTH forecast (engine_roi_12m_pct) with an
+#   8 pp hurdle. The owner reasons on the 3-month plan ("an opportunity with
+#   20% over the next 3 months while a holding is expected to make 14%"):
+#   on the 12M basis that pair never rotates (6 pp − 1.1% cost < 8 pp), and the
+#   cockpit cannot show the 3M view at all.
+# WHAT: gate TFB_OPP_ROTATION_BASIS = 12m (DEFAULT) | plan3m, read per call.
+#   12m    -> v1.27.0 byte-identical (same map, same hurdle, same text).
+#   plan3m -> _holding_roi_map reads the pool row's plan ROI (roi_pct, the
+#             figure the Required ROI gate tests: (TP1 − entry) / entry from
+#             the CURRENT price, i.e. the holding's remaining upside to its
+#             first target) for the held names, the ordered needs carry the
+#             seat's plan ROI, and the hurdle is TFB_OPP_ROTATION_EDGE_PP_3M
+#             (default 5 pp; TFB_OPP_ROTATION_EDGE_PP stays the 12m hurdle).
+#             The deferral text, the rotation_proposal alert and the new
+#             additive kpis.rotation_basis name the basis in use ("engine 12M"
+#             / "plan 3M"), so a reader can never mistake one for the other.
+# NOT CHANGED: eligibility (min held days, TP1 proximity, exclusions, the
+#   degraded-forecast guard), the one-rotation-per-run rule, R1/R2 floor
+#   guards, TRIM/EXIT semantics, capital calls, sizing, gates, tickets.
+#   Functions added: 2 (_env_rotation_basis, _rotation_basis_label).
+#   Changed: _env_rotation_edge_pp (basis-aware hurdle), _holding_roi_map
+#   (basis-aware map), _funding_plan_text (label), the ordered-needs tuple and
+#   the rotation_proposal alert (label). Removed: 0.
+#   Rollback: unset TFB_OPP_ROTATION_BASIS, or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -5682,7 +5710,29 @@ def _env_funding_plan():
         not in ("0", "false", "off", "no")
 
 
+def _env_rotation_basis():
+    """v1.27.1: TFB_OPP_ROTATION_BASIS = 12m (default; v1.27.0 byte-identical)
+    | plan3m (the pool row's plan ROI to TP1 from the current price, for the
+    held names and the unfunded seats alike). Any other value -> 12m."""
+    v = str(_env_str("TFB_OPP_ROTATION_BASIS", "12m") or "12m").strip().lower()
+    return "plan3m" if v == "plan3m" else "12m"
+
+
+def _rotation_basis_label():
+    """v1.27.1 PURE text: the basis named in deferral text and alerts."""
+    return "plan 3M" if _env_rotation_basis() == "plan3m" else "engine 12M"
+
+
 def _env_rotation_edge_pp():
+    """Rotation hurdle in percentage points after cost. 12m basis:
+    TFB_OPP_ROTATION_EDGE_PP (default 8). plan3m basis (v1.27.1):
+    TFB_OPP_ROTATION_EDGE_PP_3M (default 5)."""
+    if _env_rotation_basis() == "plan3m":
+        try:
+            v3 = float(_env_str("TFB_OPP_ROTATION_EDGE_PP_3M", "5") or 5.0)
+            return v3 if v3 >= 0 else 5.0
+        except (TypeError, ValueError):
+            return 5.0
     try:
         v = float(_env_str("TFB_OPP_ROTATION_EDGE_PP", "8") or 8.0)
         return v if v >= 0 else 8.0
@@ -5744,6 +5794,7 @@ def _holding_roi_map(audit_rows, holdings):
     forecast in the map and never rotates."""
     pool = {}
     _guard = _env_rotation_floor_guard()   # v1.19.4
+    _plan3m = _env_rotation_basis() == "plan3m"   # v1.27.1
     for a in (audit_rows or []):
         c = a.get("_cand") if isinstance(a, dict) else None
         if not isinstance(c, dict):
@@ -5752,6 +5803,10 @@ def _holding_roi_map(audit_rows, holdings):
         if not s:
             continue
         if _guard and _holding_forecast_degraded(c):   # v1.19.4 [R3]
+            continue
+        if _plan3m:   # v1.27.1: the held name's remaining upside to TP1 from the current price
+            _r3 = _to_float(c.get("roi_pct"))
+            pool[s] = _r3 if (_r3 is not None and math.isfinite(_r3)) else None
             continue
         pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
     out = {}
@@ -5905,7 +5960,8 @@ def _funding_plan_text(plan, remaining):
         r = plan["rotation"]
         txt = (" | FUNDABLE_BY_ROTATION: " + r["action"].lower() + " " +
                r["symbol"] + " " + _fmt_sar(r["proceeds_sar"]) +
-               " (engine 12M edge +" + _fmt_num(r["edge_pp"]) + "pp after cost)"
+               " (" + _rotation_basis_label() + " edge +" + _fmt_num(r["edge_pp"]) +
+               "pp after cost)"
                " \u2192 ticket " + _fmt_sar(plan["need_sar"]))
         if (plan.get("shortfall_sar") or 0) > 0:
             txt += "; residual CAPITAL_CALL " + _fmt_sar(plan["shortfall_sar"])
@@ -5921,8 +5977,8 @@ def _funding_plan_text(plan, remaining):
         if _ins:
             txt += (" \u2014 ROTATION_INSUFFICIENT: exit " + _ins["symbol"] +
                     " covers " + _fmt_sar(_ins["covers_sar"]) + " of " +
-                    _fmt_sar(_ins["short_sar"]) + " (engine 12M edge +" +
-                    _fmt_num(_ins["edge_pp"]) + "pp after cost); no exit proposed")
+                    _fmt_sar(_ins["short_sar"]) + " (" + _rotation_basis_label() +
+                    " edge +" + _fmt_num(_ins["edge_pp"]) + "pp after cost); no exit proposed")
         return txt
     return ""
 
@@ -7175,12 +7231,17 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     _needs[_s] = {"need_sar": _nf, "sized_sar": 0.0,
                                   "remaining_sar": float(remaining)}
             _ordered = []
+            _plan3m_basis = _env_rotation_basis() == "plan3m"   # v1.27.1
             for _a in invest:  # rank order, only final eligible seats have needs
                 _s = _a["symbol"]
                 if _s in _needs:
-                    _ordered.append((
-                        _s, _needs[_s]["need_sar"],
-                        _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))))
+                    if _plan3m_basis:
+                        _opp_roi = _to_float(_a["_cand"].get("roi_pct"))
+                        if _opp_roi is not None and not math.isfinite(_opp_roi):
+                            _opp_roi = None
+                    else:
+                        _opp_roi = _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))
+                    _ordered.append((_s, _needs[_s]["need_sar"], _opp_roi))
             if _ordered:
                 _hold_roi = _holding_roi_map(audit, pf["holdings"])
                 _fp_plans = _funding_plans(
@@ -7285,6 +7346,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             1 for pl in _fp_plans if pl["state"] == "CAPITAL_CALL")
         kpis["capital_call_topn_sar"] = round(sum(
             (pl.get("shortfall_sar") or 0.0) for pl in _fp_plans[:_topn]), 0)
+        kpis["rotation_basis"] = _rotation_basis_label()   # v1.27.1 additive
         if _env_rotation_floor_guard():   # v1.19.4 additive key
             kpis["rotation_insufficient"] = sum(
                 1 for pl in _fp_plans if pl.get("rotation_insufficient"))
@@ -7341,7 +7403,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 "required_action": (
                     _rot[0]["symbol"] + " is fundable by " + _r["action"].lower() +
                     " of " + _r["symbol"] + " " + _fmt_sar(_r["proceeds_sar"]) +
-                    " (engine 12M edge +" + _fmt_num(_r["edge_pp"]) +
+                    " (" + _rotation_basis_label() + " edge +" + _fmt_num(_r["edge_pp"]) +
                     "pp after cost). A rotation is a ticket, not an order: "
                     "written GO with a live quote required."),
             })
