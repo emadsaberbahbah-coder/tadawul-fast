@@ -3,9 +3,18 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.69.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.70.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.70.0 - Hong Kong reporting-currency band in the identity checks (2026-10-19)
+================================================================================
+FW-2, FW-1 and the L3b tripwire share one unit-convention helper. Besides the
+unchanged GBX/GBP band, a .HK listing whose Price/EPS sits at the stated P/E
+times the HKD-per-CNY or HKD-per-USD rate is the reporting-currency convention,
+not an identity break, so healthy H-share rows stop being quarantined into blank
+stubs that make the coverage audit warn and refuse every release. Gate
+TFB_SYNC_COH_HK_REPORTING_FX (default on); FW-2 logs ratios, FW-KEEP names stubs.
 
 v6.69.0 - full typed final market-payload intent digest (2026-10-12)
 ================================================================================
@@ -2102,7 +2111,32 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.69.0"
+SCRIPT_VERSION = "6.70.0"
+# v6.70.0 (2026-10-19) - HK-FX [identity check, Hong Kong reporting currency]:
+#   WHY: FW-2 (_row_identity_firewall), FW-1 (_klg_old_row_identity_ok) and the
+#   L3b tripwire (_coherence_scan) test Price/EPS against the stated P/E with
+#   one unit exemption, the 50-200x GBX/GBP band. Hong Kong-listed mainland
+#   issuers (H-shares, red chips: 1398.HK, 0857.HK, 0386.HK, 0883.HK, 0728.HK,
+#   2601.HK ...) quote in HKD and report EPS in CNY, so Price/EPS reads the
+#   stated P/E times the HKD-per-CNY rate (~1.07-1.10): a 7-10% gap over the 5%
+#   tolerance. Run 39234358605 quarantined 47 Global_Markets rows, nearly all of
+#   them .HK; FW-KEEP froze 40 at last-good and left 7 as blank stubs whose
+#   blank Last Updated cells make the coverage audit warn (bad_stamps), and a
+#   coverage warning refuses every decision-feed release (release_decision_feed
+#   accepted(): coverage summary exit_code must be 0). The stubs never heal:
+#   FW-2 strips the fresh row again every run.
+#   FIX: _coh_ratio_is_unit_convention(ratio, symbol) - the GBX band unchanged
+#   and unconditional, plus, for a symbol ending .HK only, a ratio inside the
+#   HKD-per-CNY band (default 1.02-1.18) or the HKD-per-USD band (default
+#   7.40-8.25, the 7.75-7.85 peg widened by the as-of skew) counts as the
+#   reporting-currency convention, not an identity break. All three checks call
+#   it, so they still cannot disagree. Every other venue, every other ratio and
+#   the 5% tolerance are unchanged; the audit, finalizer and release are not
+#   touched. Diagnostics: FW-2 now logs each stripped row's ratio and Currency
+#   (first 20) and the .HK rows the band exempted; FW-KEEP names the symbols it
+#   left as stubs. Gate TFB_SYNC_COH_HK_REPORTING_FX (default on; 0/false/off/no
+#   = v6.69.0 byte-identical decisions); bands TFB_SYNC_COH_HK_CNY_BAND and
+#   TFB_SYNC_COH_HK_USD_BAND as "lo,hi" (invalid -> default).
 # v6.66.0 (2026-10-11) - RANK-PAGE (WP-2c): whole-page Rank (Overall) at the
 #   single write choke point, gate TFB_RANK_OVERALL_PAGE off|observe|enforce
 #   (default off = byte-identical v6.65.0). Full WHY in the module header.
@@ -5873,6 +5907,7 @@ def _klg_old_row_identity_ok(
     px_i: int,
     eps_i: int,
     pe_i: int,
+    symbol: Any = "",
 ) -> bool:
     """v6.24.0 FW-1: single-row identity check for a KEEP-LAST-GOOD
     candidate. Mirrors _coherence_scan's per-row rules exactly (testability
@@ -5908,8 +5943,8 @@ def _klg_old_row_identity_ok(
     if rel < _COH_REL_TOL:
         return True
     ratio = implied / pe
-    if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
-        return True  # pence/pound convention - healthy
+    if _coh_ratio_is_unit_convention(ratio, symbol):
+        return True  # pence/pound or (v6.70.0) HK reporting-currency convention - healthy
     return False
 
 
@@ -6028,6 +6063,10 @@ def _row_identity_firewall(
     (rows_matrix, stripped_symbols). FAIL-SAFE: any missing column of the
     triple -> nothing is ever stripped."""
     stripped: list = []
+    _diag_stripped: list = []
+    _diag_exempt: list = []
+    _LAST_FW2_DIAG["stripped"] = _diag_stripped
+    _LAST_FW2_DIAG["hk_fx_exempt"] = _diag_exempt
     if not headers or not rows_matrix:
         return rows_matrix, stripped
     hdr = list(headers)
@@ -6038,10 +6077,13 @@ def _row_identity_firewall(
     if min(px_i, eps_i, pe_i, sym_i) < 0:
         return rows_matrix, stripped
     warn_i = -1
+    ccy_i = -1
     for i, h in enumerate(hdr):
-        if str(h or "").strip().casefold() == "warnings":
+        _hc = str(h or "").strip().casefold()
+        if _hc == "warnings" and warn_i < 0:
             warn_i = i
-            break
+        elif _hc in ("currency", "ccy") and ccy_i < 0:
+            ccy_i = i
     hi = max(px_i, eps_i, pe_i, sym_i)
     for r_i, row in enumerate(rows_matrix):
         if not isinstance(row, list) or len(row) <= hi:
@@ -6064,7 +6106,12 @@ def _row_identity_firewall(
         ratio = implied / pe
         if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
             continue
+        if _coh_hk_reporting_fx_match(ratio, row[sym_i]):
+            _diag_exempt.append(str(row[sym_i]).strip().upper())
+            continue
         sym = str(row[sym_i]).strip().upper()
+        _diag_stripped.append((sym, round(ratio, 4),
+                               str(row[ccy_i]).strip() if 0 <= ccy_i < len(row) else ""))
         blanked = ["" for _ in row]
         blanked[sym_i] = row[sym_i]
         if 0 <= warn_i < len(blanked):
@@ -10417,7 +10464,7 @@ def _keep_last_good_rows(
         # must also carry a Name and agree with its own P/E==Price/EPS
         # identity (when testable) before it may be kept.
         if _klg_identity_gate_enabled() and not _klg_old_row_identity_ok(
-            row, old_name_i, old_px_i, old_eps_i, old_pe_i
+            row, old_name_i, old_px_i, old_eps_i, old_pe_i, t
         ):
             _LAST_KLG_ID_SUSPECTS.append(t)
             continue  # identity-suspect predecessor -> write the fresh stub
@@ -10619,6 +10666,74 @@ _COH_FX_UNIT_HI = 200.0
 # quote and the fundamentals snapshot).
 _COH_REL_TOL = 0.05
 
+# v6.70.0 HK-FX: a Hong Kong listing quotes in HKD while many issuers report EPS
+# in CNY (H-shares, red chips) or USD; Price/EPS then reads the stated P/E times
+# the HKD-per-CNY (~1.07-1.10) or HKD-per-USD (7.75-7.85 peg) rate. Bands are
+# widened by the same as-of skew _COH_REL_TOL allows on the identity itself.
+_COH_HK_CNY_BAND_DEFAULT = (1.02, 1.18)
+_COH_HK_USD_BAND_DEFAULT = (7.40, 8.25)
+_COH_HK_SUFFIX = ".HK"
+
+
+def _coh_hk_reporting_fx_enabled() -> bool:
+    """v6.70.0 HK-FX master switch. Default ON; TFB_SYNC_COH_HK_REPORTING_FX=
+    0/false/off/no restores the v6.69.0 identity decisions byte-identically."""
+    raw = (os.getenv("TFB_SYNC_COH_HK_REPORTING_FX") or "").strip().lower()
+    return raw not in {"0", "false", "off", "no", "n", "disabled", "disable"}
+
+
+def _coh_band_env(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    """'lo,hi' with 0 < lo < hi, both finite; anything else -> default."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        lo_s, hi_s = raw.split(",", 1)
+        lo, hi = float(lo_s), float(hi_s)
+    except (TypeError, ValueError):
+        return default
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi):
+        return default
+    return (lo, hi)
+
+
+def _coh_hk_reporting_fx_match(ratio: float, symbol: Any) -> bool:
+    """True only for a .HK symbol whose implied/stated ratio sits inside the
+    HKD-per-CNY or HKD-per-USD band (gate on). Never raises."""
+    try:
+        if not _coh_hk_reporting_fx_enabled():
+            return False
+        sym = str(symbol or "").strip().upper()
+        if not sym.endswith(_COH_HK_SUFFIX):
+            return False
+        r = float(ratio)
+        if not math.isfinite(r):
+            return False
+        for env_name, default in (("TFB_SYNC_COH_HK_CNY_BAND", _COH_HK_CNY_BAND_DEFAULT),
+                                  ("TFB_SYNC_COH_HK_USD_BAND", _COH_HK_USD_BAND_DEFAULT)):
+            lo, hi = _coh_band_env(env_name, default)
+            if lo <= r <= hi:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _coh_ratio_is_unit_convention(ratio: float, symbol: Any = "") -> bool:
+    """v6.70.0: the ONE place the three identity checks (FW-1, FW-2, L3b) ask
+    whether an off-identity ratio is a quoting/reporting unit convention rather
+    than an identity break: the GBX/GBP band (unconditional, as since v6.23.0)
+    or the gated Hong Kong reporting-currency band. With no symbol (callers
+    that do not pass one) only the GBX band applies, exactly as v6.69.0."""
+    if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
+        return True
+    return _coh_hk_reporting_fx_match(ratio, symbol)
+
+
+# v6.70.0: last FW-2 pass, for the call-site diagnostic line (page-scoped by the
+# caller). Overwritten on every _row_identity_firewall call.
+_LAST_FW2_DIAG: Dict[str, Any] = {"stripped": [], "hk_fx_exempt": []}
+
 
 def _coherence_enabled() -> bool:
     """v6.23.0 L3b master switch. Default ON; TFB_SYNC_COHERENCE_TRIPWIRE=
@@ -10721,8 +10836,9 @@ def _coherence_scan(
         if rel < _COH_REL_TOL:
             continue
         ratio = implied / pe
-        if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
-            continue  # GBX/GBP pence convention — healthy row, not a mismatch
+        if _coh_ratio_is_unit_convention(
+                ratio, row[sym_i] if 0 <= sym_i < len(row) else ""):
+            continue  # GBX/GBP pence or (v6.70.0) HK reporting-currency convention — healthy
         bad += 1
         if len(samples) < 8:
             s = ""
@@ -13885,6 +14001,18 @@ async def _run_one_task(
                 rows_matrix, _idfw_stripped = _row_identity_firewall(
                     headers, rows_matrix
                 )
+                try:
+                    _hk_ex = list(_LAST_FW2_DIAG.get("hk_fx_exempt") or [])
+                    if _hk_ex:
+                        logger.info(
+                            "[ID-FIREWALL v%s] HK-FX '%s': %d row(s) kept as the Hong Kong "
+                            "reporting-currency convention (HKD price vs CNY/USD EPS): %s%s",
+                            SCRIPT_VERSION, task.sheet_name, len(_hk_ex),
+                            ", ".join(_hk_ex[:20]),
+                            "…" if len(_hk_ex) > 20 else "",
+                        )
+                except Exception:
+                    pass
                 # --- v6.31.0 FW-5: fabricated-placeholder tripwire --------
                 # Merges into _idfw_stripped so FW-KEEP last-good restore
                 # and the FW-3 verdict cover FW-5 strips with zero plumbing.
@@ -13932,6 +14060,19 @@ async def _run_one_task(
                     )
                     res.warnings.append(_fw)
                     logger.warning(_fw)
+                    # v6.70.0 HK-FX: name each stripped row's ratio and Currency
+                    # so a recurring quarantine can be diagnosed from the log.
+                    try:
+                        _fd = list(_LAST_FW2_DIAG.get("stripped") or [])
+                        if _fd:
+                            logger.info(
+                                "[ID-FIREWALL v%s] FW-2 detail '%s': %s%s",
+                                SCRIPT_VERSION, task.sheet_name,
+                                ", ".join(f"{_s} ratio={_r} ccy={_c or '?'}" for _s, _r, _c in _fd[:20]),
+                                f" (+{len(_fd) - 20} more)" if len(_fd) > 20 else "",
+                            )
+                    except Exception:
+                        pass
 
                     # v6.25.1 FW-KEEP: the KLG stub-swap ran BEFORE FW-2, so
                     # these fresh stubs have no rescuer — run a targeted
@@ -13963,11 +14104,19 @@ async def _run_one_task(
                                                 and _w_i < len(_row2)):
                                             _row2[_w_i] = "identity_quarantined:kept_last_good:v6.25.1"
                             _unrest = len(_idfw_stripped) - len(_fwk_set)
+                            # v6.70.0: name the stubs (first 15) - they leave
+                            # both Last Updated cells blank, which the coverage
+                            # audit counts as bad stamps.
+                            _unrest_syms = [s for s in _idfw_stripped if s not in _fwk_set]
+                            _unrest_txt = (
+                                f": {', '.join(_unrest_syms[:15])}"
+                                f"{'…' if len(_unrest_syms) > 15 else ''}"
+                            ) if _unrest_syms else ""
                             _kw = (
                                 f"[v6.25.1 FW-KEEP] '{task.sheet_name}': restored "
                                 f"{len(_fwk_set)}/{len(_idfw_stripped)} quarantined "
                                 f"row(s) from last-good"
-                                f"{f'; {_unrest} had no last-good (left as stub)' if _unrest else ''}."
+                                f"{f'; {_unrest} had no last-good (left as stub){_unrest_txt}' if _unrest else ''}."
                             )
                             res.warnings.append(_kw)
                             logger.warning(_kw)

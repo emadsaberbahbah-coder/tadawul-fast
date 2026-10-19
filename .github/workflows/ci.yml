@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
+#
+# v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
+# the identity checks accept the HKD-price / CNY-or-USD-EPS convention on .HK
+# listings, so healthy H-share rows stop being quarantined into blank stubs
+# that make the coverage audit warn and refuse every decision-feed release) in
+# the blocking lean lane next to the other sync suites.
+#
 # VERSION 1.1.24 (2026-10-19) -- ENRICHED BRIDGE BINDING + GATED FALLBACK
 #
 # v1.1.24: run tests/test_enriched_bridge_binding.py (routes/enriched_quote
@@ -625,6 +633,7 @@ jobs:
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
+            tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_warnings_compact_wp6.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
