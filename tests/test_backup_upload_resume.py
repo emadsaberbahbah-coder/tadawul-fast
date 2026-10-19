@@ -39,9 +39,28 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from requests import exceptions as rx  # noqa: E402
-
 from scripts import backup_workbook as bw  # noqa: E402
+
+# The blocking lean lane installs no `requests`; the helper then falls back
+# to the builtin ConnectionError/TimeoutError tuple. Mirror that here so the
+# suite exercises the real mapping in BOTH lanes instead of skipping.
+try:
+    from requests import exceptions as _rx
+    ConnErr, TimeoutErr = _rx.ConnectionError, _rx.Timeout
+    SSLErr, ChunkErr, HTTPErr = _rx.SSLError, _rx.ChunkedEncodingError, _rx.HTTPError
+    HAVE_REQUESTS = True
+except ImportError:                      # lean lane
+    ConnErr, TimeoutErr = ConnectionError, TimeoutError
+
+    class SSLErr(ConnErr):
+        pass
+
+    ChunkErr = ConnErr
+
+    class HTTPErr(Exception):
+        pass
+
+    HAVE_REQUESTS = False
 
 DATA = bytes(range(256)) * 400          # 102,400 bytes, non-trivial content
 TOTAL = len(DATA)
@@ -59,7 +78,7 @@ class _Resp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            err = rx.HTTPError(f"{self.status_code} Client Error")
+            err = HTTPErr(f"{self.status_code} Client Error")
             err.response = self
             raise err
 
@@ -108,7 +127,7 @@ def test_t1_clean_path_is_single_put_without_content_range():
 def test_t2_transport_fault_resumes_from_server_range():
     persisted_end = 65_535                                   # server holds 0..65535
     sess = FakeSession([
-        rx.SSLError("EOF occurred in violation of protocol"),  # data PUT #1
+        SSLErr("EOF occurred in violation of protocol"),  # data PUT #1
         _Resp(308, {"Range": f"bytes=0-{persisted_end}"}),     # status probe
         _Resp(200),                                            # data PUT #2
     ])
@@ -128,7 +147,7 @@ def test_t2_transport_fault_resumes_from_server_range():
 
 def test_t2b_probe_without_range_header_restarts_from_zero():
     sess = FakeSession([
-        rx.ConnectionError("reset"),
+        ConnErr("reset"),
         _Resp(308),                       # 308 but no Range -> nothing persisted
         _Resp(201),
     ])
@@ -142,7 +161,7 @@ def test_t2b_probe_without_range_header_restarts_from_zero():
 def test_t3_probe_reporting_complete_returns_final_resource():
     final = {"id": "already", "name": "DAILY_done"}
     sess = FakeSession([
-        rx.ChunkedEncodingError("cut"),
+        ChunkErr("cut"),
         _Resp(200, body=final),           # probe: server finished anyway
     ])
     _, sl = _no_sleep()
@@ -171,21 +190,21 @@ def test_t4_308_to_data_put_is_followed_without_sleep_or_attempt():
 def test_t5_definite_4xx_raises_first_time_without_retry(status):
     sess = FakeSession([_Resp(status, body={"error": {"message": "nope"}})])
     slept, sl = _no_sleep()
-    with pytest.raises(rx.HTTPError) as ei:
+    with pytest.raises(HTTPErr) as ei:
         bw._resumable_put_with_resume(sess, LOC, DATA, attempts=4, sleep=sl)
     assert ei.value.response.status_code == status      # _api_reason() still works
     assert len(sess.calls) == 1 and slept == []
 
 
 def test_t6_attempts_are_bounded_and_last_fault_is_reraised_unchanged():
-    faults = [rx.SSLError("a"), rx.SSLError("b"), rx.SSLError("c")]
+    faults = [SSLErr("a"), SSLErr("b"), SSLErr("c")]
     sess = FakeSession([
         faults[0], _Resp(308, {"Range": "bytes=0-99"}),
         faults[1], _Resp(308, {"Range": "bytes=0-199"}),
         faults[2],
     ])
     slept, sl = _no_sleep()
-    with pytest.raises(rx.SSLError) as ei:
+    with pytest.raises(SSLErr) as ei:
         bw._resumable_put_with_resume(sess, LOC, DATA, attempts=3, sleep=sl)
     assert ei.value is faults[2]
     assert slept == [2.0, 4.0]
@@ -215,9 +234,9 @@ def test_t7b_transient_status_on_last_attempt_raises_runtime_error():
 def test_t8_env_retries_one_disables_retry(monkeypatch):
     monkeypatch.setenv("TFB_BACKUP_UPLOAD_RETRIES", "1")
     assert bw._upload_retry_attempts() == 1
-    sess = FakeSession([rx.SSLError("first")])
+    sess = FakeSession([SSLErr("first")])
     slept, sl = _no_sleep()
-    with pytest.raises(rx.SSLError):
+    with pytest.raises(SSLErr):
         bw._resumable_put_with_resume(sess, LOC, DATA, sleep=sl)
     assert slept == [] and len(sess.calls) == 1
 
@@ -253,8 +272,8 @@ def test_t9_drive_and_gcs_backends_route_through_the_helper(monkeypatch):
 
 def test_t10_probe_failure_keeps_loop_alive(capsys):
     sess = FakeSession([
-        rx.SSLError("data"),                        # attempt 1 fails
-        rx.ConnectionError("probe down"),           # probe fails too
+        SSLErr("data"),                        # attempt 1 fails
+        ConnErr("probe down"),           # probe fails too
         _Resp(200),                                 # attempt 2 succeeds from byte 0
     ])
     slept, sl = _no_sleep()
@@ -264,6 +283,20 @@ def test_t10_probe_failure_keeps_loop_alive(capsys):
     err = capsys.readouterr().err
     assert "status probe failed" in err
     assert "upload_id=SECRET" not in err            # the session URL is never printed
+
+
+def test_t0_transport_mapping_matches_this_lane():
+    """The helper's catch tuple must cover the classes this suite raises,
+    with requests present (SSLError is a ConnectionError subclass) and
+    without it (builtin fallback)."""
+    types = bw._transport_exception_types()
+    for exc in (SSLErr("x"), ConnErr("x"), TimeoutErr("x"), ChunkErr("x")):
+        assert isinstance(exc, types), (type(exc), types)
+    assert not isinstance(HTTPErr("x"), types)
+    if HAVE_REQUESTS:
+        assert _rx.ConnectionError in types and _rx.Timeout in types
+    else:
+        assert types == (ConnectionError, TimeoutError)
 
 
 def test_parse_range_end_is_total():

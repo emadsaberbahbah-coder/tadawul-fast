@@ -66,9 +66,13 @@ connector proves the broker view at 07:16 UTC, not a signed statement.
 
 ## 4. Built in this change set
 
-Both changes are small, additive and covered by new suites enrolled in the
-blocking lean lane of `ci.yml` (v1.1.21). Deployment manifest pins are
-updated in the same commit (`tests/test_verify_manifest_pins.py` passes).
+Both changes are small, additive and covered by new suites enrolled in
+blocking `ci.yml` jobs (v1.1.21): the upload suite in the lean lane, where it
+also exercises the helper's no-`requests` fallback, and the venue suite in
+the data-engine job, the one lane that installs the pinned
+`exchange_calendars` and pandas. Deployment manifest pins are updated in the
+same commit (`tests/test_verify_manifest_pins.py` passes), and the P11 pin in
+`tests/test_workbook_dq_audit.py` moves to 1.5.1.
 
 ### 4.1 `scripts/backup_workbook.py` v1.5.1: the resumable upload resumes
 
@@ -147,7 +151,13 @@ Offline, Python 3.11.17, pinned numpy/pandas/exchange_calendars:
   `TFB_VENUE_CAL_EXT` name outside the fingerprinted families and the replay
   fingerprint guard caught it, which is why the switch is `TFB_TICKET_...`;
 - `ruff check --select E9,F63,F7,F82` clean on the four touched Python files;
-- `py_compile` clean.
+- `py_compile` clean;
+- first CI round on `01b4ad6` failed twice and both were this PR's: the lean
+  lane has no `requests`, so the upload suite's module-level import broke
+  collection (now lane-independent, verified locally with `requests` blocked),
+  and the P11 harness pinned `backup_workbook` at 1.5.0 (moved to 1.5.1). The
+  venue suite also moved from the lean lane, where it would have skipped, to
+  the data-engine job.
 
 The full PR CI run on the branch is the authoritative receipt; see the PR.
 
