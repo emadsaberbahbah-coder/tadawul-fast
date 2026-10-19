@@ -337,15 +337,16 @@ unless 26_Decision_Chain is installed. Every Top_10 check passed. Coverage: exit
 `7 blank/unparseable/date-only timestamp(s)`, standing since at least 18 Oct (8 then). `accepted()` needs both exit codes 0.
 
 **Root cause of the warning** (multi-agent investigation, root cause confirmed by an adversarial reviewer): the 7 rows are
-FW-2 identity-firewall stubs that FW-KEEP cannot restore. FW-2 quarantined 47 rows, nearly all Hong Kong-listed mainland
-issuers quoting in HKD and reporting EPS in CNY; the identity check has a pence/pound exemption but none for this.
+FW-2 identity-firewall stubs that FW-KEEP cannot restore. FW-2 quarantined 47 rows. The Actions log names 15 of them, 12
+`.HK` (mostly mainland issuers quoting in HKD and reporting EPS in CNY; all 47 are in the run's FW-3 `_Run_Log` row), and
+the identity check has a pence/pound exemption but none for this.
 Built: `run_dashboard_sync` v6.70.0, a `.HK`-only HKD-per-CNY / HKD-per-USD band in the shared unit-convention helper,
 with ratio diagnostics (commit sheet `docs/evidence/TFB_Commit_Sheet_run_dashboard_sync_v6.70.0_2026-10-19.md`).
 Two other designs were rejected by the reviewers because they weaken what `accepted()` admits (stamping the stubs, or
-having the audit ignore them). Twelve of the fifteen symbols the log names are `.HK`; SGH.AX, HKIT.US and SIM.US are
-not, and v6.69.0 never named its 7 stubs, so how many stubs the band heals is known only after the next sync's FW-KEEP
-line names what is left. Any non-`.HK` stub keeps the warning until its logged ratio is read. The manual repair tool's copy
-of the identity check (`scripts/repair_stores.py` 1.0.1) takes the same band, so an apply run cannot re-blank these rows.
+having the audit ignore them). SGH.AX, HKIT.US and SIM.US are not `.HK`, and v6.69.0 never named its 7 stubs, so how
+many stubs the band heals is known only after the next sync's FW-KEEP line names what is left. Any non-`.HK` stub keeps
+the warning until its logged ratio is read. The manual repair tool's copy of the identity check (`scripts/repair_stores.py`
+1.0.2) takes the same band and reads raw cell values, so its B1 verdict matches the sync's on the same row.
 
 **New finding: caption registry expiry.** `data/verified_name_labels.json` holds 122 reviewed Name captions with a
 seven-day review window. 55 expired today (39 Mutual_Funds at 12:31 UTC, 16 Global_Markets); 67 Global_Markets captions

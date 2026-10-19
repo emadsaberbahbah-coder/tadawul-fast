@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.26 (2026-10-19) -- DECISION PAGES v2 MENU BLOCK
+#
+# v1.1.26: run tests/js/menu_pages_v2.test.js (01_Menu Decision Pages v2 block
+# v1.0.0: the menu-bar entry that refreshes Portfolio_Decision_v2 and
+# Top_10_Investments_v2 on demand; only owner-confirmed renderer functions run,
+# one refresh per page at a time) in the blocking lean lane next to the Apps
+# Script syntax step.
+#
 # VERSION 1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
 #
 # v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
@@ -738,6 +746,9 @@ jobs:
 
       - name: 🧪 Syntax of every versioned Apps Script source
         run: node tests/js/apps_script_syntax.test.js
+
+      - name: 🧪 Decision Pages v2 menu block (01_Menu append)
+        run: node tests/js/menu_pages_v2.test.js
 
       - name: 🧪 Native reconciliation and complete calendar inputs
         run: |

@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.1 (Build 2)
+TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.2 (Build 2)
 ================================================================================
+v1.0.2 (2026-10-19): Phase B reads the page UNFORMATTED (as the sync's FW-1
+does). The default FORMATTED read handed B1 the 2-decimal display values, so
+a small-EPS row the sync keeps (2600.HK raw 0.50 / 0.025 / 18.5, ratio 1.08)
+read 0.50 / 0.03 / 18.50 here (ratio 0.90) and was blanked on apply. Text
+cells are coerced with str() because unformatted numbers arrive as int/float.
 v1.0.1 (2026-10-19): B1 follows run_dashboard_sync v6.70.0 HK-FX. A .HK row
 whose Price/EPS over stated P/E sits in the HKD-per-CNY (1.02-1.18) or the
 HKD-per-USD (7.40-8.25) band is a reporting-currency convention, not a broken
@@ -75,7 +80,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-TOOL_VERSION = "1.0.1"
+TOOL_VERSION = "1.0.2"
 TAG = f"[REPAIR-VERDICT v{TOOL_VERSION}]"
 
 # ---- constants mirrored from run_dashboard_sync v6.24.0 (attribution) ------
@@ -391,7 +396,8 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
         if ws is None:
             continue
         try:
-            grid = ws.get_all_values()
+            # v1.0.2: raw values, never the 2-decimal display (B1 parity with FW-1)
+            grid = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
             if not grid:
                 rep["error"] = "empty page"
                 continue
@@ -410,8 +416,8 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
             name_owners: Dict[str, Set[str]] = {}
             for r in range(1, len(grid)):
                 row = grid[r]
-                sym = (row[si] if si < len(row) else "").strip().upper()
-                nm = (row[ni] if ni < len(row) else "").strip()
+                sym = str(row[si] if si < len(row) else "").strip().upper()
+                nm = str(row[ni] if ni < len(row) else "").strip()
                 if sym and nm:
                     name_owners.setdefault(nm, set()).add(sym)
             over = {nm for nm, owners in name_owners.items() if len(owners) >= 3}
@@ -419,10 +425,10 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
             corrupt: List[Tuple[int, str, str]] = []  # (1-based row, sym, reason)
             for r in range(1, len(grid)):
                 row = grid[r]
-                sym = (row[si] if si < len(row) else "").strip().upper()
+                sym = str(row[si] if si < len(row) else "").strip().upper()
                 if not sym:
                     continue
-                nm = (row[ni] if ni < len(row) else "").strip()
+                nm = str(row[ni] if ni < len(row) else "").strip()
                 px = row[pi] if 0 <= pi < len(row) else ""
                 eps = row[ei] if 0 <= ei < len(row) else ""
                 pe = row[qi] if 0 <= qi < len(row) else ""

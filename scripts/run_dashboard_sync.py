@@ -2119,8 +2119,8 @@ SCRIPT_VERSION = "6.70.0"
 #   issuers (H-shares, red chips: 1398.HK, 0857.HK, 0386.HK, 0883.HK, 0728.HK,
 #   2601.HK ...) quote in HKD and report EPS in CNY, so Price/EPS reads the
 #   stated P/E times the HKD-per-CNY rate (~1.07-1.10): a 7-10% gap over the 5%
-#   tolerance. Run 39234358605 quarantined 47 Global_Markets rows, nearly all of
-#   them .HK; FW-KEEP froze 40 at last-good and left 7 as blank stubs whose
+#   tolerance. Run 39234358605 quarantined 47 Global_Markets rows (12 of the 15
+#   the log names are .HK); FW-KEEP froze 40 at last-good and left 7 as stubs whose
 #   blank Last Updated cells make the coverage audit warn (bad_stamps), and a
 #   coverage warning refuses every decision-feed release (release_decision_feed
 #   accepted(): coverage summary exit_code must be 0). The stubs never heal:

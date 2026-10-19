@@ -29,9 +29,10 @@ Pinned here:
       are listed
   H10 the canned identity self-test still passes 9/9
   H11 version and manifest pin
-  H12 scripts/repair_stores.py v1.0.1 B1 gives the same verdict as the sync
-      on every fixture, gate on and off (a manual apply run must not blank
-      the rows the sync now publishes)
+  H12 scripts/repair_stores.py B1 gives the same verdict as the sync on every
+      fixture, for every gate token and band override (a manual apply run
+      must not blank the rows the sync now publishes); phase_b_identity
+      passes the symbol and (v1.0.2) reads the page unformatted
 
 Run: pytest -q tests/test_sync_hk_reporting_fx.py
 """
@@ -214,22 +215,76 @@ def test_h11_version_and_manifest_pin():
 ALL_FIXTURES = (HSHARE, USD_REPORTER, NON_HK, HK_BROKEN_HI, HK_BROKEN_LO, GBX, HEALTHY, POISONED)
 
 
-@pytest.mark.parametrize("gate", [None, "0"])
-def test_h12_repair_tool_agrees_with_the_sync(monkeypatch, gate):
-    if gate is not None:
-        monkeypatch.setenv(GATE, gate)
+_H12_ENVS = (
+    [{}]
+    + [{GATE: v} for v in ("0", "false", "off", "no", "n", "disabled", "disable", " OFF ")]
+    + [{CNY_BAND: "1.00,1.05"}, {USD_BAND: "7.0,7.5"},
+       {CNY_BAND: "junk"}, {USD_BAND: "8,7"}, {USD_BAND: "nan,9"}]
+)
+
+
+@pytest.mark.parametrize("env", _H12_ENVS, ids=lambda e: ",".join("%s=%s" % kv for kv in e.items()) or "default")
+def test_h12_repair_tool_agrees_with_the_sync(monkeypatch, env):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     _, stripped = _fw2(list(ALL_FIXTURES))
     broken = [r[0] for r in ALL_FIXTURES
               if repair._row_identity_broken(r[PI], r[EI], r[QI], r[0])]
     assert broken == stripped
-    if gate is None:
-        assert broken == ["XYZ.AX", "0386.HK", "0857.HK", "GOOG"]
-    else:
+    if GATE in env:
         assert "1398.HK" in broken and "0005.HK" in broken
+    elif not env:
+        assert broken == ["XYZ.AX", "0386.HK", "0857.HK", "GOOG"]
+
+
+# 2600.HK raw 0.50 / 0.025 / 18.5: ratio 1.081 (CNY band), healthy for the sync.
+# Its 2-decimal display 0.50 / 0.03 / 18.50 reads ratio 0.90 and would break.
+SMALL_EPS_HK = ["2600.HK", "Aluminum Corporation of China", 0.50, 0.025, 18.5, "HKD", ""]
+
+
+class _FakeWS:
+    """Worksheet stub: raw cells for UNFORMATTED_VALUE, 2-decimal text otherwise."""
+
+    def __init__(self, rows):
+        self.rows = [list(r) for r in rows]
+        self.render = []
+
+    def get_all_values(self, value_render_option=None):
+        self.render.append(value_render_option)
+        if value_render_option == "UNFORMATTED_VALUE":
+            return [list(H)] + [list(r) for r in self.rows]
+        fmt = lambda c: ("%.2f" % c) if isinstance(c, float) else str(c)  # noqa: E731
+        return [list(H)] + [[fmt(c) for c in r] for r in self.rows]
+
+
+def _phase_b(monkeypatch, rows):
+    ws = _FakeWS(rows)
+    monkeypatch.setenv("REPAIR_PAGES", "Global_Markets")
+    monkeypatch.setattr(repair, "_ws", lambda sheet, page: ws)
+    rep = repair.phase_b_identity(object(), apply=False)["pages"]["Global_Markets"]
+    return rep, ws
+
+
+@pytest.mark.parametrize("gate", [None, "0"])
+def test_h12c_phase_b_identity_passes_the_symbol(monkeypatch, gate):
+    if gate is not None:
+        monkeypatch.setenv(GATE, gate)
+    rep, _ws = _phase_b(monkeypatch, ALL_FIXTURES)
+    _, stripped = _fw2(list(ALL_FIXTURES))
+    assert rep["samples"] == ["%s(B1:pe_identity)" % s for s in stripped]
+
+
+def test_h12d_phase_b_reads_unformatted_values(monkeypatch):
+    assert sync._klg_old_row_identity_ok(SMALL_EPS_HK, NI, PI, EI, QI, "2600.HK") is True
+    assert repair._row_identity_broken("0.50", "0.03", "18.50", "2600.HK") is True  # the display read
+    numeric_symbol = [2222, "Saudi Arabian Oil Co", 27.5, 1.85, 14.86, "SAR", ""]
+    rep, ws = _phase_b(monkeypatch, [SMALL_EPS_HK, numeric_symbol, HEALTHY])
+    assert ws.render == ["UNFORMATTED_VALUE"]
+    assert rep.get("error") is None and rep["corrupt"] == 0
 
 
 def test_h12b_repair_tool_mirrors_bands_and_version(monkeypatch):
-    assert repair.TOOL_VERSION == "1.0.1"
+    assert repair.TOOL_VERSION == "1.0.2"
     assert repair._COH_HK_CNY_BAND_DEFAULT == sync._COH_HK_CNY_BAND_DEFAULT
     assert repair._COH_HK_USD_BAND_DEFAULT == sync._COH_HK_USD_BAND_DEFAULT
     assert repair._COH_REL_TOL == sync._COH_REL_TOL
