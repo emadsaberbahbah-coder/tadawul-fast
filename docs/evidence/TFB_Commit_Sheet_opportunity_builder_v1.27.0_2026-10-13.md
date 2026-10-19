@@ -1,5 +1,7 @@
 # TFB Commit Sheet - opportunity_builder v1.27.0 (Top_10 data quality)
 
+Renumbered 2026-10-19: main shipped a different 1.27.0 first (#797, conviction sizing). This build is now **v1.27.1**. Main's default venue-calendar map (v1.26.2, kill switch `TFB_TICKET_VENUE_CAL_EXT`) already covers most suffixes, so `TFB_OPP_VENUE_CAL_EXT` now adds only .NS, .AT and .SZ. The figures below are as measured on 2026-10-13 against 1.26.1.
+
 Date: 2026-10-13. Base: main 278f148 (builder 1.26.1). Gates: three, all default OFF.
 
 ## Why this item

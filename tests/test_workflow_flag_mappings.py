@@ -25,7 +25,7 @@ SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
-    # v6.70.0 FW-2 SCOPE (2026-10-14); 2026-10-15: owner armed the workflow
+    # v6.71.0 FW-2 SCOPE (2026-10-14); 2026-10-15: owner armed the workflow
     # fallback to enforce in both writer jobs (Variable still overrides).
     "TFB_SYNC_FW2_SCOPE": "enforce",
 }

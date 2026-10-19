@@ -316,3 +316,52 @@ between two builds seconds apart): the identity comparison now scrubs that clock
 **Owner, after merge and the Render deploy of `main`:** read-back list in the commit sheet (the reconcile log line with
 real action tokens, `Rel` / `DQ` numbers on Portfolio_Decision, no `bridge typed mismatch` line in Render, DQ-51 passing
 on the next backup audit, and one look at which endpoint the 07:40 Apps Script refresh uses).
+
+## 11. Afternoon read-back (14:17 to 16:30 Riyadh): what still stops the Top_10 board
+
+Inputs: the owner's Top_10 export rendered at 14:17:31 Riyadh, the in-sync final audit of run 39234358605 (14:01 Riyadh),
+and one release attempt dispatched from this session at 14:32 Riyadh (run 39245386428).
+
+**Working now.** The board runs builder 1.27.0 and consumed the current cohort (`source readiness VERIFIED (run
+39234358605)`). The cash buffer is enforced (the board's cash-floor line reads `ENFORCED`; its deployable figure is an
+account amount and is not copied here). Eighteen names qualified and Rel/DQ are populated on the board. The Render deploy of enriched_quote 8.6.0 went live at 13:53 Riyadh, after
+that sync's My_Portfolio leg (13:02 to 13:07), so My_Portfolio's decision columns come back with the next sync.
+
+**Release attempt.** The repository variable `TFB_DECISION_RELEASE` is already 1, so the 14:32 dispatch, intended as a
+dry run, ran armed. It was refused (exit 2, `not_accepted`) and wrote nothing (`released false, downgrade null,
+feed_promoted false`). The 13:45 Riyadh scheduled slot did not run at all; the dispatch is run #1 of the workflow.
+
+**Refusal reasons, in full.** Decision: only `PF_SOURCE_CONSUMPTION_UNPROVEN` and `PF_OLDER_THAN_SOURCE`. Portfolio_Decision
+last rendered at 11:25:14 Riyadh, before the My_Portfolio publication at 13:02:21, and nothing re-renders it after a sync
+unless 26_Decision_Chain is installed. Every Top_10 check passed. Coverage: exit code 1 from one warning, Global_Markets
+`7 blank/unparseable/date-only timestamp(s)`, standing since at least 18 Oct (8 then). `accepted()` needs both exit codes 0.
+
+**Root cause of the warning** (multi-agent investigation, root cause confirmed by an adversarial reviewer): the 7 rows are
+FW-2 identity-firewall stubs that FW-KEEP cannot restore. FW-2 quarantined 47 rows, nearly all Hong Kong-listed mainland
+issuers quoting in HKD and reporting EPS in CNY; the identity check has a pence/pound exemption but none for this.
+Built: `run_dashboard_sync` v6.70.0, a `.HK`-only HKD-per-CNY / HKD-per-USD band in the shared unit-convention helper,
+with ratio diagnostics (commit sheet `docs/evidence/TFB_Commit_Sheet_run_dashboard_sync_v6.70.0_2026-10-19.md`).
+Two other designs were rejected by the reviewers because they weaken what `accepted()` admits (stamping the stubs, or
+having the audit ignore them). Twelve of the fifteen symbols the log names are `.HK`; SGH.AX, HKIT.US and SIM.US are
+not, and v6.69.0 never named its 7 stubs, so how many stubs the band heals is known only after the next sync's FW-KEEP
+line names what is left. Any non-`.HK` stub keeps the warning until its logged ratio is read. The manual repair tool's copy
+of the identity check (`scripts/repair_stores.py` 1.0.1) takes the same band, so an apply run cannot re-blank these rows.
+
+**New finding: caption registry expiry.** `data/verified_name_labels.json` holds 122 reviewed Name captions with a
+seven-day review window. 55 expired today (39 Mutual_Funds at 12:31 UTC, 16 Global_Markets); 67 Global_Markets captions
+expire on 21 Oct 07:44 UTC. Mutual_Funds allows 24 blank Names (99% floor) and had 11 with the captions in force, so the
+next sync should fail the Mutual_Funds Name floor (a coverage failure), and Global_Markets follows on 21 Oct. Renewal means
+re-capturing each binding's public sources and writing a fresh receipt; it is open on the system side. The same expiry
+broke `tests/test_sheet_payload_digest.py` on main (it read the registry against the wall clock); fixed in this PR.
+
+**Owner actions still required for an EXECUTABLE board**
+1. Install `26_Decision_Chain` v1.0.1 (`tfbDecisionChainStatus`, Script Property `TFB_DECISION_CHAIN=observe`,
+   `tfbInstallDecisionChain`, then `on` after one sync shows OBSERVE rows). It is the only automatic path that renders
+   Portfolio_Decision after the sync publishes My_Portfolio. Without it, run `refreshPortfolioDecision` by hand after each
+   sync's My_Portfolio stamp and before any Apps Script rewrite of My_Portfolio.
+2. Stop the Apps Script auto refresh from rewriting My_Portfolio rows between the sync's publication and the
+   Portfolio_Decision render (about 20 minutes after each sync); a rewrite in that gap makes the receipt WITHHELD.
+3. Set `DT10_FEED_COHORT_BIND=on` (arming prerequisite 2; the release is already armed without it).
+4. Arming preconditions: restrict the `production` environment to `main` and keep `TFB_GH_DISPATCH_REF` unset or `main`
+   (B); for A, only deleting the pre-#763 sync runs or an explicit waiver satisfies it before about 12 Nov.
+5. Optional: `PD_IBKR_WATCH_WINDOW=always` only after item 2; add the `USX` FX rate in `_Lists_Config` (13 rows alert).

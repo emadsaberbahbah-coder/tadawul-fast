@@ -1,5 +1,7 @@
 # TFB Commit Sheet - run_dashboard_sync v6.70.0 [FW-2 SCOPE]
 
+Renumbered 2026-10-19: main shipped a different v6.70.0 first (#799, HK-FX, commit sheet `TFB_Commit_Sheet_run_dashboard_sync_v6.70.0_2026-10-19.md`). This build is now **v6.71.0**: default off is byte-identical to that v6.70.0, the Warnings tag reads `fw2_pe_eps_drift:v6.71.0`, and the verifier pins 6.71.0. A .HK row inside the HK-FX reporting-currency band is exempted before FW-2 SCOPE tiers anything. The figures below are as measured on 2026-10-14 against v6.69.0.
+
 Date: 2026-10-14. Base: origin/main `15812b6` (#765), merged forward onto `030e22e` (#774, #775) with the version numbers moved past #775's. Lane: GitHub Actions (the sync runs in daily_sync.yml). Gate: repository Variable `TFB_SYNC_FW2_SCOPE` = off | observe | enforce, default off = v6.69.0 byte-identical. Nothing is armed by this change.
 
 ## Why
