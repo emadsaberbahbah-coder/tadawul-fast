@@ -323,8 +323,8 @@ Inputs: the owner's Top_10 export rendered at 14:17:31 Riyadh, the in-sync final
 and one release attempt dispatched from this session at 14:32 Riyadh (run 39245386428).
 
 **Working now.** The board runs builder 1.27.0 and consumed the current cohort (`source readiness VERIFIED (run
-39234358605)`). The cash buffer is enforced (`Cash floor 3,750 SAR ... ENFORCED: deployable 50,019 SAR`). Eighteen names
-qualified and Rel/DQ are populated on the board. The Render deploy of enriched_quote 8.6.0 went live at 13:53 Riyadh, after
+39234358605)`). The cash buffer is enforced (the board's cash-floor line reads `ENFORCED`; its deployable figure is an
+account amount and is not copied here). Eighteen names qualified and Rel/DQ are populated on the board. The Render deploy of enriched_quote 8.6.0 went live at 13:53 Riyadh, after
 that sync's My_Portfolio leg (13:02 to 13:07), so My_Portfolio's decision columns come back with the next sync.
 
 **Release attempt.** The repository variable `TFB_DECISION_RELEASE` is already 1, so the 14:32 dispatch, intended as a
