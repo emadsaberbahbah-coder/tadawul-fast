@@ -3,7 +3,7 @@
 Date: 2026-10-19 (Monday, Riyadh afternoon). Owner request: "for this new 2 pages I need to be added in Menu bar as well to
 enable me to make auto refresh when needed Top_10_Investments_v2, Portfolio_Decision_v2 ... add this to the 01_Menu.gs".
 Delivered: `apps_script/01_Menu_Decision_Pages_v2_append.gs` (NEW, paste block), `tests/js/menu_pages_v2.test.js` (NEW,
-28 checks), `.github/workflows/ci.yml` 1.1.26 (lean lane step), this sheet.
+31 checks), `.github/workflows/ci.yml` 1.1.26 (lean lane step), this sheet.
 Not edited: every mirrored `.gs` file, the live `01_Menu.gs` body (the owner pastes the block and one line), triggers,
 gates, Script Property values.
 
@@ -43,9 +43,11 @@ Menu bar entry **🆕 Decision Pages v2**:
 
 - **Only a confirmed function runs.**
   - First use, or a saved name that no longer exists, opens the setup prompt. Cancel runs nothing.
-  - An unknown name, a number outside the list, or one of the block's own functions is refused and nothing is saved.
-    The own-function check uses the resolved function, so a dotted path such as `globalThis.tfbPagesV2Setup` is refused
-    too.
+  - An unknown name, a number outside the list, a class, or one of the block's own functions is refused and nothing is
+    saved.
+  - The own-function check uses the resolved function and its receiver, so a dotted path
+    (`globalThis.tfbPagesV2Setup`), `.call` or `.apply` to one of them is refused too. The check runs again at refresh
+    time, in case such a name was put in the Script Property by hand.
 - **Suggestions are conservative.**
   - A suggested name must contain `v2` or `dp2`.
   - Private helpers (trailing `_`), the v1 refreshers and the block's own functions are never suggested.
@@ -53,8 +55,10 @@ Menu bar entry **🆕 Decision Pages v2**:
     probe, audit, log, seed or layout are never suggested.
   - Names matching the page (`portfolio`/`pdv2` or `top10`/`t10`) rank first, then strong verbs (refresh, render, run,
     update, rebuild, generate, publish), then weak verbs (build, write, make, compute, create, draw).
-- **One run per renderer function at a time.**
-  - A document-cache flag is keyed by the function, not the page, so one function saved for both tabs is guarded once.
+- **One run per renderer function and per tab at a time.**
+  - Two document-cache flags are claimed together: one keyed by the function's own global name (so an alias such as
+    `globalThis.name` is the same function) and one keyed by the tab. One function saved for both tabs is guarded once,
+    and a different function for a tab that is already refreshing is refused.
   - The flag is claimed under `LockService.getUserLock()`, cleared in `finally` (also when the refresh is deferred or
     fails), and expires after 7 minutes.
   - The user lock is used instead of the document lock because a 05_Refresh pass can hold the document lock for
@@ -65,13 +69,16 @@ Menu bar entry **🆕 Decision Pages v2**:
   - Without a cache, which a bound script always has, no guard is possible and the click runs.
 - **Refresh both.**
   - Portfolio runs first, then Top 10.
-  - A function shared by both tabs runs once per click, even when it fails.
+  - A function shared by both tabs runs once per click, even when it fails. If it did not run (busy, deferred), the
+    message says "not retried" rather than "run once".
   - A Portfolio failure still runs a different Top 10 function.
-  - Top 10 is not started once Portfolio has used 4 of the 6 execution minutes, and the alert says so.
+  - Top 10 is not started once 4 of the 6 execution minutes are used, counting time spent in setup dialogs, and the
+    alert says so.
 - **Manual priority.** When the live menu defines `menuRunWithManualRefreshPriority_`, each refresh runs through it,
   which is how the existing morning-cockpit item yields automatic refresh. If that wrapper does not call the renderer,
   whatever it returns, the item reports "not run now" instead of "done". An error thrown by the wrapper itself is
-  attributed to the coordinator, not to the renderer.
+  attributed to the coordinator, not to the renderer, and the message says whether it came before the renderer ran or
+  after it finished.
 - **Errors are visible.** An alert names the function and its error. The renderer's own return value (for example
   `'HTTP 503'`, `{status}` or `{message}`) is shown in the toast. Without a Ui, for example when run from the editor, the
   handlers return quietly and never throw.
@@ -88,25 +95,31 @@ Menu bar entry **🆕 Decision Pages v2**:
 
 1. Apps Script editor, `01_Menu.gs`: paste the whole of `apps_script/01_Menu_Decision_Pages_v2_append.gs` at the end of the
    file. It may instead be added as its own file, but not both. Ctrl+S, no red marks.
-2. In `onOpen()`, directly after the line that builds the main menu (`buildMenu_();`), add this line:
+2. In `onOpen()`, directly after the line that builds the main menu (`buildMenu_();`), add this line, then press Ctrl+S
+   again:
    `tfbPagesV2AddMenu_();`
-   To put the items inside the main menu instead, add `.addSubMenu(tfbPagesV2Menu_(ui))` to the chain in `buildMenu_()`
-   and skip this line.
-3. Reload the spreadsheet. The menu bar shows **🆕 Decision Pages v2**.
+3. Reload the spreadsheet (after saving). The menu bar shows **🆕 Decision Pages v2**.
 4. Click **⚙️ Set up refresh functions**. For each page, press OK on the suggested name if it is the function that writes
    that tab; otherwise type the right name. Then click **🩺 Status**: both functions should read "(found)".
 5. Use **🔄 Refresh ...** whenever needed.
 
-Rollback: delete the one `onOpen` line (the menu disappears and the block is inert). Optionally delete the block and the
-two Script Properties.
+Rollback: delete the one `onOpen` line and save (the menu disappears and the block is inert). Only then, optionally,
+delete the block and the two Script Properties. If the block is deleted while the `onOpen` line is still there, `onOpen`
+stops at that line.
+
+There is a single install route on purpose. Adding the items inside `buildMenu_()` instead was dropped in review: on a
+v2.18.0 file a later v2.19.0 install renames that builder, so the items would disappear silently. That route also has no
+error guard, so a mistake there would break the main menu.
 
 ## Audits
 
 | Battery | Result |
 | --- | --- |
-| `node tests/js/menu_pages_v2.test.js` | 28 checks passed |
-| Mutation check: 37 mutants of the block (guard, ranking, exclusions, numbering, own-function refusal, const resolution, both-order, time budget, deferral, wrapper errors, load-time calls, status) | every mutant fails at least one check |
+| `node tests/js/menu_pages_v2.test.js` | 31 checks passed |
+| Mutation check: 45 mutants of the block (guard keys and lock, ranking, exclusions, numbering, own-function refusal incl. receiver and run time, class and const resolution, both-order, time budget incl. setup, deferral, wrapper errors before/after, shared-run notes, load-time calls, status) | every mutant fails at least one check |
 | Adversarial review (3 lenses, each finding verified independently) | code and docs: 1 high (decision-owned routing, found by two lenses), 2 medium (out-of-range number, shared-function guard), 6 low (dotted own-name bypass, stale setup toast, coordinator errors and deferrals, const renderers, 6-minute limit, overstated docs); tests: 16 coverage gaps; all fixed; 5 findings refuted |
+| Codex review (PR #801) | 1 P2 (unsynchronized claim when the document lock times out), fixed with the user lock |
+| Second adversarial review of the rewrite (2 lenses) | 2 medium (time budget missed setup dialogs; install route and rollback), 8 low (.call/.apply own bypass, coordinator error after the renderer, shared-run notes, class accepted, alias and tab keys, save step, alternative-route wording, alternative route lost on a later v2.19.0 install); all fixed; 1 refuted |
 | `node tests/js/apps_script_syntax.test.js` (every `apps_script/*.gs`, including the block) | 6 sources compiled |
 | Tests that read `ci.yml` | 80 passed, 4 skipped |
 | `scripts/audit_repository_workflows.py` | 0 errors (2 warnings already on main) |

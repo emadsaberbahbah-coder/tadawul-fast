@@ -13,12 +13,10 @@
  *   1. Paste this whole block at the END of 01_Menu.gs (after the last line).
  *      It may instead be added as its own file; never both. Ctrl+S.
  *   2. In onOpen() in 01_Menu.gs, directly after the line that builds the main
- *      menu (buildMenu_();), add this one line:
+ *      menu (buildMenu_();), add this one line, then Ctrl+S again:
  *          tfbPagesV2AddMenu_();
- *      To show the items inside the main menu instead of the menu bar, add
- *      .addSubMenu(tfbPagesV2Menu_(ui)) to the main menu chain in buildMenu_()
- *      (before .addToUi()) and skip the onOpen line.
- *   3. Reload the spreadsheet: the menu bar shows "🆕 Decision Pages v2".
+ *   3. Reload the spreadsheet (after saving): the menu bar shows
+ *      "🆕 Decision Pages v2".
  *   4. Click "⚙️ Set up refresh functions" once (a Refresh item does the same
  *      on first use). It lists the project functions that look like each v2
  *      renderer and asks you to confirm one per page; the choice is saved as
@@ -35,8 +33,9 @@
  *     service call and no change to any other global when the file loads.
  *   - Each refresh runs through menuRunWithManualRefreshPriority_ when the
  *     live menu defines it (automatic refresh yields), otherwise directly.
- *   - One run per renderer function at a time: a second click on a running
- *     function is refused (document-cache flag keyed by the function, claimed
+ *   - One run per renderer function and per tab at a time: a second click is
+ *     refused while either is running (document-cache flags keyed by the
+ *     function's own global name and by the tab, claimed together
  *     under LockService.getUserLock(), cleared in finally, expires after 7
  *     minutes if an execution dies). The user lock is used because the
  *     document lock can stay held for minutes by a 05_Refresh pass; no other
@@ -47,15 +46,18 @@
  *     name with test / install / remove / delete / clear / reset / purge /
  *     trigger / status / diag / debug / menu / setup / probe / audit / log /
  *     seed / layout in it. A typed name may be any function except this
- *     block's own (checked on the resolved function, so a dotted path to one
- *     of them is refused too).
- *   - "Refresh both" stops before Top 10 when Portfolio has used 4 of the
- *     6 execution minutes, and says so; refresh Top 10 on its own then.
+ *     block's own (checked on the resolved function and its receiver, so a
+ *     dotted path, .call or .apply to one of them is refused too) and except a
+ *     class (it cannot be called without new).
+ *   - "Refresh both" does not start Top 10 once 4 of the 6 execution minutes
+ *     are used (setup dialogs included), and says so; refresh it on its own.
  *   - The block does not change how the main menu's "Active Page" items treat
  *     the _v2 tabs; use this menu for them.
  *
- * ROLLBACK: delete the one onOpen line (the menu disappears; the block is inert
- * without it), optionally delete the block and the two Script Properties.
+ * ROLLBACK: delete the one onOpen line and save (the menu disappears; the block
+ * is inert without it). Only then, optionally, delete the block and the two
+ * Script Properties: a block deleted while the onOpen line is still there
+ * makes onOpen stop at that line.
  * Conventions: ES5 (var, function).
  * ========================================================================== */
 
@@ -136,7 +138,7 @@ function tfbPagesV2Status() {
     var sh = tfbPagesV2Sheet_(page.sheet);
     var cands = tfbPagesV2Candidates_(page);
     var resolved = !!(name && tfbPagesV2Resolve_(name));
-    var running = !!(name && tfbPagesV2InFlight_(name));
+    var running = tfbPagesV2InFlight_('page:' + page.key) || !!(name && tfbPagesV2InFlight_(tfbPagesV2Canon_(name)));
     report[page.key] = { configured: name, resolves: resolved, tab: !!sh, candidates: cands.slice(0, 5),
       running: running };
     lines.push(page.sheet + ':');
@@ -144,7 +146,7 @@ function tfbPagesV2Status() {
     lines.push('  refresh function: ' + (name ? name + (resolved ? ' (found)' : ' (NOT FOUND)') : '(not set)') +
       '  [Script Property ' + page.prop + ']');
     lines.push('  suggestions: ' + (cands.length ? cands.slice(0, 5).join(', ') : 'none found'));
-    if (running) lines.push('  its refresh function is running now');
+    if (running) lines.push('  a refresh of this tab or its function is running now');
     lines.push('');
   }
   lines.push('Manual-priority wrapper: ' +
@@ -156,6 +158,7 @@ function tfbPagesV2Status() {
 
 /* ---------------------------------------------------------------- refresh */
 function tfbPagesV2RefreshAndReport_(keys) {
+  var t0 = new Date().getTime();   /* the execution clock includes setup dialogs */
   var ui = tfbPagesV2Ui_();
   var targets = [];
   for (var i = 0; i < keys.length; i++) {
@@ -167,16 +170,16 @@ function tfbPagesV2RefreshAndReport_(keys) {
     }
     targets.push({ page: page, name: name });
   }
-  var t0 = new Date().getTime();
   var results = [];
   var attempted = {};
   for (var j = 0; j < targets.length; j++) {
     var t = targets[j];
-    var prior = attempted[t.name];
+    var canon = tfbPagesV2Canon_(t.name);
+    var prior = attempted[canon];
     if (prior) {
       /* One function renders both tabs: never run it a second time in this click. */
       results.push({ page: t.page.sheet, status: prior.status, fn: t.name, ms: 0, shared: prior.page,
-        error: prior.error, summary: prior.summary });
+        error: prior.error, summary: prior.summary, ran: prior.ran });
       continue;
     }
     if (j > 0 && new Date().getTime() - t0 > TFB_PAGES_V2_BOTH_BUDGET_MS_) {
@@ -185,13 +188,13 @@ function tfbPagesV2RefreshAndReport_(keys) {
     }
     var r = tfbPagesV2RunOne_(t.page, t.name);
     results.push(r);
-    attempted[t.name] = r;
+    attempted[canon] = r;
   }
   var failed = [];
   var parts = [];
   for (var k = 0; k < results.length; k++) {
     var x = results[k];
-    var sharedNote = x.shared ? ' (same function as ' + x.shared + ', run once)' : '';
+    var sharedNote = x.shared ? ' (same function as ' + x.shared + (x.ran ? ', run once' : ', not retried') + ')' : '';
     if (x.status === 'ok') {
       parts.push(x.page + ': done' + (x.shared ? sharedNote : ' in ' + Math.round(x.ms / 1000) + ' s') +
         (x.summary ? ' - ' + x.summary : ''));
@@ -206,7 +209,7 @@ function tfbPagesV2RefreshAndReport_(keys) {
       parts.push(x.page + ': not run now - the manual-refresh coordinator did not run ' + x.fn + '()' +
         (x.summary ? ' (it answered: ' + x.summary + ')' : '') + sharedNote);
     } else if (x.status === 'skipped_time') {
-      parts.push(x.page + ': not started, the first refresh used most of the 6-minute limit; refresh it on its own');
+      parts.push(x.page + ': not started, this run has used most of the 6-minute limit; refresh it on its own');
     } else {
       parts.push(x.page + ': FAILED - ' + x.error + sharedNote);
     }
@@ -233,10 +236,15 @@ function tfbPagesV2EnsureConfigured_(page, ui) {
 function tfbPagesV2RunOne_(page, name) {
   var target = tfbPagesV2Resolve_(name);
   if (!target) return { page: page.sheet, status: 'error', fn: name, ms: 0, error: name + '() not found' };
-  var claim = tfbPagesV2Claim_(name);
+  if (tfbPagesV2TargetIsOwn_(name, target)) {
+    return { page: page.sheet, status: 'error', fn: name, ms: 0, error: name + ' is part of this menu block' };
+  }
+  var guard = [tfbPagesV2Canon_(name), 'page:' + page.key];
+  var claim = tfbPagesV2Claim_(guard);
   if (claim !== 'claimed') return { page: page.sheet, status: claim, fn: name, ms: 0 };
   var t0 = new Date().getTime();
   var called = false;
+  var finished = false;
   var wrapped = typeof menuRunWithManualRefreshPriority_ === 'function';
   try {
     /* Open the tab first: the user sees the page being refreshed, and a
@@ -244,18 +252,19 @@ function tfbPagesV2RunOne_(page, name) {
     var sh = tfbPagesV2Sheet_(page.sheet);
     if (sh) { try { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(sh); } catch (actErr) {} }
     tfbPagesV2Toast_('Refreshing ' + page.sheet + ' with ' + name + '() ...', 5);
-    var call = function () { called = true; return target.fn.apply(target.self, []); };
+    var call = function () { called = true; var out = target.fn.apply(target.self, []); finished = true; return out; };
     var result = wrapped ? menuRunWithManualRefreshPriority_('Refresh ' + page.sheet, call) : call();
     try { SpreadsheetApp.flush(); } catch (flushErr) {}
     return { page: page.sheet, status: called ? 'ok' : 'deferred', fn: name, ms: new Date().getTime() - t0,
-      summary: tfbPagesV2Summary_(result) };
+      summary: tfbPagesV2Summary_(result), ran: called };
   } catch (err) {
     var msg = String((err && err.message) || err).slice(0, 300);
-    return { page: page.sheet, status: 'error', fn: name, ms: new Date().getTime() - t0,
-      error: called ? name + '(): ' + msg
+    return { page: page.sheet, status: 'error', fn: name, ms: new Date().getTime() - t0, ran: called,
+      error: finished ? 'the manual-refresh coordinator failed after ' + name + '() finished: ' + msg
+        : called ? name + '(): ' + msg
         : 'the manual-refresh coordinator failed before running ' + name + '(): ' + msg };
   } finally {
-    tfbPagesV2Release_(name);
+    tfbPagesV2Release_(guard);
   }
 }
 
@@ -310,7 +319,7 @@ function tfbPagesV2SetupPage_(page, ui, fromSetupItem) {
     return null;
   }
   var target = tfbPagesV2Resolve_(text);
-  if (tfbPagesV2IsOwn_(text) || (target && tfbPagesV2IsOwnFn_(target.fn))) {
+  if (tfbPagesV2TargetIsOwn_(text, target)) {
     ui.alert(TFB_PAGES_V2_MENU_TITLE_, text + ' is part of this menu block; choose the function that renders ' +
       page.sheet + '.', ui.ButtonSet.OK);
     return null;
@@ -346,8 +355,30 @@ function tfbPagesV2IsOwnFn_(fn) {
   return false;
 }
 
-/* A top-level const/let/class lives in the global lexical scope, not on the
- * global object; a Function body evaluates in global scope and can see it. */
+/* The typed name, the resolved function or its receiver (for .call/.apply/
+ * .bind paths) is one of this block's functions. */
+function tfbPagesV2TargetIsOwn_(name, target) {
+  if (tfbPagesV2IsOwn_(name)) return true;
+  return !!(target && (tfbPagesV2IsOwnFn_(target.fn) || tfbPagesV2IsOwnFn_(target.self)));
+}
+
+/* One key per function however it is named: its own global name when that
+ * name resolves back to it, else the saved text. */
+function tfbPagesV2Canon_(name) {
+  var t = tfbPagesV2Resolve_(name);
+  try {
+    var n = t && t.fn && t.fn.name;
+    if (n && tfbPagesV2Root_()[n] === t.fn) return n;
+  } catch (canonErr) {}
+  return String(name).trim();
+}
+
+function tfbPagesV2IsClass_(fn) {
+  try { return /^class[\s{]/.test(Function.prototype.toString.call(fn)); } catch (srcErr) { return false; }
+}
+
+/* A top-level const/let lives in the global lexical scope, not on the global
+ * object; a Function body evaluates in global scope and can see it. */
 function tfbPagesV2GlobalLexical_(ident) {
   try {
     return new Function('try { return typeof ' + ident + ' === "undefined" ? undefined : ' + ident +
@@ -377,7 +408,7 @@ function tfbPagesV2Resolve_(name) {
   } catch (resolveErr) {
     return null;
   }
-  if (typeof cur !== 'function') return null;
+  if (typeof cur !== 'function' || tfbPagesV2IsClass_(cur)) return null;
   return { fn: cur, self: parts.length > 1 ? self : null };
 }
 
@@ -442,20 +473,21 @@ function tfbPagesV2Candidates_(page) {
 }
 
 /* ---------------------------------------------------------------- in-flight guard */
-function tfbPagesV2FlagKey_(fnName) { return 'TFB_PAGES_V2_INFLIGHT_' + String(fnName).trim(); }
+function tfbPagesV2FlagKey_(key) { return 'TFB_PAGES_V2_INFLIGHT_' + String(key).trim(); }
 
 function tfbPagesV2Cache_() {
   try { return CacheService.getDocumentCache() || CacheService.getScriptCache(); } catch (cacheErr) { return null; }
 }
 
-function tfbPagesV2InFlight_(fnName) {
+function tfbPagesV2InFlight_(key) {
   var cache = tfbPagesV2Cache_();
-  try { return !!(cache && cache.get(tfbPagesV2FlagKey_(fnName))); } catch (getErr) { return false; }
+  try { return !!(cache && cache.get(tfbPagesV2FlagKey_(key))); } catch (getErr) { return false; }
 }
 
-/* 'claimed' | 'busy' (the function is running) | 'locked' (the claim could
- * not be made atomically). Without a cache no guard is possible: 'claimed'. */
-function tfbPagesV2Claim_(fnName) {
+/* keys: the function's canonical name and 'page:<key>'. Returns 'claimed' |
+ * 'busy' (either is running) | 'locked' (the claim could not be made
+ * atomically). Without a cache no guard is possible: 'claimed'. */
+function tfbPagesV2Claim_(keys) {
   var cache = tfbPagesV2Cache_();
   if (!cache) return 'claimed';
   var lock = null;
@@ -466,19 +498,26 @@ function tfbPagesV2Claim_(fnName) {
     return 'locked';
   }
   try {
-    if (cache.get(tfbPagesV2FlagKey_(fnName))) return 'busy';
-    cache.put(tfbPagesV2FlagKey_(fnName), String(new Date().getTime()), TFB_PAGES_V2_INFLIGHT_TTL_S_);
+    for (var i = 0; i < keys.length; i++) {
+      if (cache.get(tfbPagesV2FlagKey_(keys[i]))) return 'busy';
+    }
+    for (var j = 0; j < keys.length; j++) {
+      cache.put(tfbPagesV2FlagKey_(keys[j]), String(new Date().getTime()), TFB_PAGES_V2_INFLIGHT_TTL_S_);
+    }
     return 'claimed';
   } catch (claimErr) {
+    tfbPagesV2Release_(keys);   /* no half-made claim */
     return 'locked';
   } finally {
     try { lock.releaseLock(); } catch (relErr) {}
   }
 }
 
-function tfbPagesV2Release_(fnName) {
+function tfbPagesV2Release_(keys) {
   var cache = tfbPagesV2Cache_();
-  try { if (cache) cache.remove(tfbPagesV2FlagKey_(fnName)); } catch (remErr) {}
+  for (var i = 0; i < keys.length; i++) {
+    try { if (cache) cache.remove(tfbPagesV2FlagKey_(keys[i])); } catch (remErr) {}
+  }
 }
 
 /* ---------------------------------------------------------------- small helpers */

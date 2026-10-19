@@ -45,7 +45,8 @@ function refreshDecisionTop10() { calls.push('v1-t10'); }
 ${excludedFns.map(n => 'function ' + n + '() { calls.push("' + n + '"); }').join('\n')}
 var DP2Lib = { render: function () { calls.push('lib:' + (this === DP2Lib)); return 'lib ok'; } };
 `;
-const LEXICAL = 'const renderConstPortfolioDecisionV2 = function () { calls.push("const"); return "const ok"; };';
+const LEXICAL = 'const renderConstPortfolioDecisionV2 = function () { calls.push("const"); return "const ok"; };' +
+  'class RenderClassPortfolioDecisionV2 { constructor() { calls.push("class"); } }';
 
 function world(o) {
   o = o || {};
@@ -66,6 +67,7 @@ function world(o) {
   ui.prompt = function (title, body) {
     ui.prompts.push(String(body));
     const r = ui.promptReplies.length ? ui.promptReplies.shift() : {button: 'CANCEL', text: ''};
+    if (r.thinkMs) clock.now += r.thinkMs;
     return {getSelectedButton() { return r.button; }, getResponseText() { return r.text; }};
   };
   ui.createMenu = function (title) {
@@ -177,9 +179,9 @@ check('refresh: a saved function runs once, with its tab already active and its 
   assert.deepEqual(arr(w.calls), ['pd']);
   assert.equal(w.ui.prompts.length, 0);
   assert.equal(w.ctx.seenDuringRun[0].active, 'Portfolio_Decision_v2', 'tab activated before the renderer runs');
-  assert.deepEqual(arr(w.ctx.seenDuringRun[0].flags), ['TFB_PAGES_V2_INFLIGHT_' + PD_FN]);
-  assert.deepEqual(Object.keys(w.cache), [], 'flag released afterwards');
-  assert.deepEqual(w.ttls, [420], 'flag carries the 7-minute expiry');
+  assert.deepEqual(arr(w.ctx.seenDuringRun[0].flags), ['TFB_PAGES_V2_INFLIGHT_' + PD_FN, 'TFB_PAGES_V2_INFLIGHT_page:pd']);
+  assert.deepEqual(Object.keys(w.cache), [], 'flags released afterwards');
+  assert.deepEqual(w.ttls, [420, 420], 'both flags carry the 7-minute expiry');
   assert.equal(w.lockLog.tries, 1);
   assert.equal(w.lockLog.releases, 1, 'user lock released after the claim');
   assert.deepEqual(w.lockLog.waits, [10000]);
@@ -247,6 +249,27 @@ check('setup: this block\'s own functions are refused, also through a dotted pat
   }
 });
 
+check('own functions through .call / .apply / .bind are refused in setup and, if saved by hand, at run time', () => {
+  for (const own of ['tfbPagesV2Setup.call', 'tfbPagesV2RefreshBoth.apply', 'globalThis.tfbPagesV2Status.call']) {
+    const w = world({prompts: [{button: 'OK', text: own}]});
+    assert.equal(w.ctx.tfbPagesV2RefreshPortfolioDecision().status, 'not_configured', own);
+    assert.match(w.ui.alerts[0], /part of this menu block/, own);
+    assert.equal(w.props.TFB_V2_PD_REFRESH_FN, undefined, own);
+  }
+  const w2 = world({props: {TFB_V2_PD_REFRESH_FN: 'tfbPagesV2Status.call'}});
+  const r = w2.ctx.tfbPagesV2RefreshPortfolioDecision();
+  assert.equal(r.results[0].status, 'error');
+  assert.match(w2.ui.alerts[0], /tfbPagesV2Status\.call is part of this menu block/);
+  assert.equal(w2.ui.alerts.length, 1, 'the block\'s own Status was not run');
+});
+
+check('a class is not a refresh function (it cannot be called without new)', () => {
+  const w = world({prompts: [{button: 'OK', text: 'RenderClassPortfolioDecisionV2'}]});
+  assert.equal(w.ctx.tfbPagesV2RefreshPortfolioDecision().status, 'not_configured');
+  assert.match(w.ui.alerts[0], /No function named "RenderClassPortfolioDecisionV2"/);
+  assert.deepEqual(arr(w.calls), []);
+});
+
 check('setup: a library member runs on its library; a top-level const renderer can be typed in', () => {
   const w = world({prompts: [{button: 'OK', text: 'DP2Lib.render'}]});
   assert.equal(w.ctx.tfbPagesV2RefreshPortfolioDecision().status, 'ok');
@@ -288,6 +311,18 @@ check('in-flight: a running function refuses a second click; another page\'s dif
   assert.equal(w.ctx.tfbPagesV2RefreshTop10().status, 'ok');
   assert.deepEqual(arr(w.calls), ['t10']);
   assert.equal(w.ctx.tfbPagesV2Status().pd.running, true);
+});
+
+check('in-flight: a tab being refreshed refuses another function for the same tab; an alias of a running function is refused', () => {
+  const w = world({props: {TFB_V2_PD_REFRESH_FN: 'buildPortfolioV2'}});
+  w.cache['TFB_PAGES_V2_INFLIGHT_page:pd'] = '1';
+  assert.equal(w.ctx.tfbPagesV2RefreshPortfolioDecision().results[0].status, 'busy');
+  assert.deepEqual(arr(w.calls), []);
+  assert.equal(w.ctx.tfbPagesV2Status().pd.running, true);
+  const w2 = world({props: {TFB_V2_T10_REFRESH_FN: 'globalThis.' + T10_FN}});
+  w2.cache['TFB_PAGES_V2_INFLIGHT_' + T10_FN] = '1';
+  assert.equal(w2.ctx.tfbPagesV2RefreshTop10().results[0].status, 'busy');
+  assert.deepEqual(arr(w2.calls), []);
 });
 
 check('in-flight: one function saved for both pages is guarded as one (the second page\'s click is refused)', () => {
@@ -332,6 +367,11 @@ check('manual-priority wrapper: used when present; declining (any return) is "no
     after: 'function menuRunWithManualRefreshPriority_(label, fn) { throw new Error("coordinator state corrupt"); }'});
   w3.ctx.tfbPagesV2RefreshPortfolioDecision();
   assert.match(w3.ui.alerts[0], /coordinator failed before running dp2RefreshPortfolioDecisionV2\(\): coordinator state corrupt/);
+  const w4 = world({props: {TFB_V2_PD_REFRESH_FN: PD_FN},
+    after: 'function menuRunWithManualRefreshPriority_(label, fn) { fn(); throw new Error("resume failed"); }'});
+  w4.ctx.tfbPagesV2RefreshPortfolioDecision();
+  assert.deepEqual(arr(w4.calls), ['pd']);
+  assert.match(w4.ui.alerts[0], /coordinator failed after dp2RefreshPortfolioDecisionV2\(\) finished: resume failed/);
 });
 
 check('refresh both: Portfolio first, then Top 10; one function saved for both runs once', () => {
@@ -356,6 +396,12 @@ check('refresh both: a Portfolio failure still runs a different Top 10 function;
   assert.deepEqual(arr(w2.calls), ['boom'], 'the failing shared function is not run a second time');
   assert.equal(r2.results[1].status, 'error');
   assert.match(w2.ui.alerts[0], /Top_10_Investments_v2: FAILED - boomV2\(\): x \(same function as Portfolio_Decision_v2, run once\)/);
+  const w3 = world({props: {TFB_V2_PD_REFRESH_FN: 'refreshAllPagesV2', TFB_V2_T10_REFRESH_FN: 'refreshAllPagesV2'}});
+  w3.cache.TFB_PAGES_V2_INFLIGHT_refreshAllPagesV2 = '1';
+  w3.ctx.tfbPagesV2RefreshBoth();
+  assert.deepEqual(arr(w3.calls), []);
+  assert.match(w3.ui.alerts[0], /Top_10_Investments_v2: refreshAllPagesV2\(\) is already running.*not retried\)/);
+  assert.doesNotMatch(w3.ui.alerts[0], /run once/);
 });
 
 check('refresh both: Top 10 is not started once Portfolio used 4 of the 6 minutes, and the alert says why', () => {
@@ -366,7 +412,12 @@ check('refresh both: Top 10 is not started once Portfolio used 4 of the 6 minute
   const r = w.ctx.tfbPagesV2RefreshBoth();
   assert.deepEqual(arr(w.calls), ['slow']);
   assert.equal(r.results[1].status, 'skipped_time');
-  assert.match(w.ui.alerts[0], /Top_10_Investments_v2: not started, the first refresh used most of the 6-minute limit/);
+  assert.match(w.ui.alerts[0], /Top_10_Investments_v2: not started, this run has used most of the 6-minute limit/);
+  /* time spent answering the first-use dialog counts against the same limit */
+  const w2 = world({props: {TFB_V2_T10_REFRESH_FN: T10_FN}, prompts: [{button: 'OK', text: '', thinkMs: 250000}]});
+  const r2 = w2.ctx.tfbPagesV2RefreshBoth();
+  assert.deepEqual(arr(w2.calls), ['pd']);
+  assert.equal(r2.results[1].status, 'skipped_time');
 });
 
 check('refresh both: if Top 10 is not configured and setup is cancelled, nothing runs', () => {
@@ -420,7 +471,8 @@ check('loading the block: no service call, no visible effect, no change to an ex
 });
 
 check('conventions: ES5 source, no onOpen of its own, no trigger, version 1.0.0', () => {
-  assert.doesNotMatch(SRC, /\blet\s|\bconst\s|=>|`/);
+  const code = SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  assert.doesNotMatch(code, /\blet\s|\bconst\s|=>|`/);
   assert.doesNotMatch(SRC, /function\s+onOpen\s*\(|function\s+onEdit\s*\(|function\s+onInstall\s*\(/);
   assert.doesNotMatch(SRC, /ScriptApp\s*\.\s*newTrigger/);
   assert.equal(world().ctx.TFB_PAGES_V2_MENU_VERSION, '1.0.0');
