@@ -37,8 +37,12 @@
  *     live menu defines it (automatic refresh yields), otherwise directly.
  *   - One run per renderer function at a time: a second click on a running
  *     function is refused (document-cache flag keyed by the function, claimed
- *     under the document lock when it is free within 3 s, cleared in finally,
- *     expires after 7 minutes if an execution dies).
+ *     under LockService.getUserLock(), cleared in finally, expires after 7
+ *     minutes if an execution dies). The user lock is used because the
+ *     document lock can stay held for minutes by a 05_Refresh pass; no other
+ *     project code takes the user lock, so the claim only waits for another
+ *     click. If it cannot be taken within 10 s the click is refused, never
+ *     claimed without it.
  *   - Suggestions skip private helpers (trailing _), the v1 refreshers, and any
  *     name with test / install / remove / delete / clear / reset / purge /
  *     trigger / status / diag / debug / menu / setup / probe / audit / log /
@@ -196,6 +200,8 @@ function tfbPagesV2RefreshAndReport_(keys) {
     failed.push(x);
     if (x.status === 'busy') {
       parts.push(x.page + ': ' + x.fn + '() is already running, try again when it finishes' + sharedNote);
+    } else if (x.status === 'locked') {
+      parts.push(x.page + ': not started, another click was still reserving its refresh; try again in a moment' + sharedNote);
     } else if (x.status === 'deferred') {
       parts.push(x.page + ': not run now - the manual-refresh coordinator did not run ' + x.fn + '()' +
         (x.summary ? ' (it answered: ' + x.summary + ')' : '') + sharedNote);
@@ -227,7 +233,8 @@ function tfbPagesV2EnsureConfigured_(page, ui) {
 function tfbPagesV2RunOne_(page, name) {
   var target = tfbPagesV2Resolve_(name);
   if (!target) return { page: page.sheet, status: 'error', fn: name, ms: 0, error: name + '() not found' };
-  if (!tfbPagesV2Claim_(name)) return { page: page.sheet, status: 'busy', fn: name, ms: 0 };
+  var claim = tfbPagesV2Claim_(name);
+  if (claim !== 'claimed') return { page: page.sheet, status: claim, fn: name, ms: 0 };
   var t0 = new Date().getTime();
   var called = false;
   var wrapped = typeof menuRunWithManualRefreshPriority_ === 'function';
@@ -446,26 +453,26 @@ function tfbPagesV2InFlight_(fnName) {
   try { return !!(cache && cache.get(tfbPagesV2FlagKey_(fnName))); } catch (getErr) { return false; }
 }
 
+/* 'claimed' | 'busy' (the function is running) | 'locked' (the claim could
+ * not be made atomically). Without a cache no guard is possible: 'claimed'. */
 function tfbPagesV2Claim_(fnName) {
   var cache = tfbPagesV2Cache_();
-  if (!cache) return true;
+  if (!cache) return 'claimed';
   var lock = null;
   try {
-    lock = LockService.getDocumentLock();
-    /* A briefly held document lock (another short transaction) is not a
-     * running refresh: claim without it rather than refuse the click. */
-    if (lock && !lock.tryLock(3000)) lock = null;
+    lock = LockService.getUserLock();
+    if (!lock.tryLock(10000)) return 'locked';
   } catch (lockErr) {
-    lock = null;
+    return 'locked';
   }
   try {
-    if (cache.get(tfbPagesV2FlagKey_(fnName))) return false;
+    if (cache.get(tfbPagesV2FlagKey_(fnName))) return 'busy';
     cache.put(tfbPagesV2FlagKey_(fnName), String(new Date().getTime()), TFB_PAGES_V2_INFLIGHT_TTL_S_);
-    return true;
+    return 'claimed';
   } catch (claimErr) {
-    return true;
+    return 'locked';
   } finally {
-    try { if (lock) lock.releaseLock(); } catch (relErr) {}
+    try { lock.releaseLock(); } catch (relErr) {}
   }
 }
 

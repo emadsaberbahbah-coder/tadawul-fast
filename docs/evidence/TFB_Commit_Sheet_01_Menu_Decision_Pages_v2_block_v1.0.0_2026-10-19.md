@@ -3,7 +3,7 @@
 Date: 2026-10-19 (Monday, Riyadh afternoon). Owner request: "for this new 2 pages I need to be added in Menu bar as well to
 enable me to make auto refresh when needed Top_10_Investments_v2, Portfolio_Decision_v2 ... add this to the 01_Menu.gs".
 Delivered: `apps_script/01_Menu_Decision_Pages_v2_append.gs` (NEW, paste block), `tests/js/menu_pages_v2.test.js` (NEW,
-27 checks), `.github/workflows/ci.yml` 1.1.26 (lean lane step), this sheet.
+28 checks), `.github/workflows/ci.yml` 1.1.26 (lean lane step), this sheet.
 Not edited: every mirrored `.gs` file, the live `01_Menu.gs` body (the owner pastes the block and one line), triggers,
 gates, Script Property values.
 
@@ -55,10 +55,14 @@ Menu bar entry **🆕 Decision Pages v2**:
     update, rebuild, generate, publish), then weak verbs (build, write, make, compute, create, draw).
 - **One run per renderer function at a time.**
   - A document-cache flag is keyed by the function, not the page, so one function saved for both tabs is guarded once.
-  - The flag is claimed under the document lock when that lock is free within 3 s, cleared in `finally` (also when the
-    refresh is deferred or fails), and expires after 7 minutes.
-  - A second click on a running function is refused with "already running". A busy document lock or a missing cache
-    does not block a click.
+  - The flag is claimed under `LockService.getUserLock()`, cleared in `finally` (also when the refresh is deferred or
+    fails), and expires after 7 minutes.
+  - The user lock is used instead of the document lock because a 05_Refresh pass can hold the document lock for
+    minutes. No other project code takes the user lock, so the claim only waits for another click.
+  - If the user lock cannot be taken within 10 s, the click is refused ("try again in a moment"). The flag is never
+    claimed without the lock (Codex review, PR #801).
+  - A second click on a running function is refused with "already running".
+  - Without a cache, which a bound script always has, no guard is possible and the click runs.
 - **Refresh both.**
   - Portfolio runs first, then Top 10.
   - A function shared by both tabs runs once per click, even when it fails.
@@ -100,7 +104,7 @@ two Script Properties.
 
 | Battery | Result |
 | --- | --- |
-| `node tests/js/menu_pages_v2.test.js` | 27 checks passed |
+| `node tests/js/menu_pages_v2.test.js` | 28 checks passed |
 | Mutation check: 37 mutants of the block (guard, ranking, exclusions, numbering, own-function refusal, const resolution, both-order, time budget, deferral, wrapper errors, load-time calls, status) | every mutant fails at least one check |
 | Adversarial review (3 lenses, each finding verified independently) | code and docs: 1 high (decision-owned routing, found by two lenses), 2 medium (out-of-range number, shared-function guard), 6 low (dotted own-name bypass, stale setup toast, coordinator errors and deferrals, const renderers, 6-minute limit, overstated docs); tests: 16 coverage gaps; all fixed; 5 findings refuted |
 | `node tests/js/apps_script_syntax.test.js` (every `apps_script/*.gs`, including the block) | 6 sources compiled |

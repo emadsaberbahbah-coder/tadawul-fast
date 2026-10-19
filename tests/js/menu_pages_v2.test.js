@@ -52,7 +52,7 @@ function world(o) {
   const props = Object.assign({}, o.props || {});
   const cache = {};
   const svc = {props: 0, cache: 0, lock: 0, sheets: 0, ui: 0};
-  const lockLog = {tries: 0, releases: 0};
+  const lockLog = {tries: 0, releases: 0, waits: []};
   const ttls = [];
   const clock = {now: Date.parse('2026-10-19T13:00:00Z')};
   class FixedDate extends Date {
@@ -100,8 +100,10 @@ function world(o) {
       setProperty(k, v) { props[k] = String(v); }, deleteProperty(k) { delete props[k]; }}; }},
     CacheService: {getDocumentCache() { svc.cache++; if (o.noCache) throw new Error('cache unavailable'); return docCache; },
       getScriptCache() { return docCache; }},
-    LockService: {getDocumentLock() { svc.lock++; return {
-      tryLock() { lockLog.tries++; return !o.lockBusy; }, releaseLock() { lockLog.releases++; }}; }},
+    LockService: {
+      getUserLock() { svc.lock++; if (o.lockThrows) throw new Error('lock service down'); return {
+        tryLock(ms) { lockLog.tries++; lockLog.waits.push(ms); return !o.lockBusy; }, releaseLock() { lockLog.releases++; }}; },
+      getDocumentLock() { throw new Error('the block must not take the document lock'); }},
     SpreadsheetApp: {
       getUi() { svc.ui++; if (o.noUi) throw new Error('no ui'); return ui; },
       getActiveSpreadsheet() { svc.sheets++; return ss; }, flush() {},
@@ -178,7 +180,9 @@ check('refresh: a saved function runs once, with its tab already active and its 
   assert.deepEqual(arr(w.ctx.seenDuringRun[0].flags), ['TFB_PAGES_V2_INFLIGHT_' + PD_FN]);
   assert.deepEqual(Object.keys(w.cache), [], 'flag released afterwards');
   assert.deepEqual(w.ttls, [420], 'flag carries the 7-minute expiry');
-  assert.equal(w.lockLog.releases, w.lockLog.tries, 'document lock released');
+  assert.equal(w.lockLog.tries, 1);
+  assert.equal(w.lockLog.releases, 1, 'user lock released after the claim');
+  assert.deepEqual(w.lockLog.waits, [10000]);
   assert.match(lastToast(w), /Portfolio_Decision_v2: done in \d+ s - OK/);
 });
 
@@ -293,10 +297,18 @@ check('in-flight: one function saved for both pages is guarded as one (the secon
   assert.deepEqual(arr(w.calls), []);
 });
 
-check('a busy document lock is not a running refresh; a missing cache does not block either', () => {
-  const w = world({props: {TFB_V2_PD_REFRESH_FN: PD_FN}, lockBusy: true});
-  assert.equal(w.ctx.tfbPagesV2RefreshPortfolioDecision().status, 'ok');
-  assert.equal(w.lockLog.releases, 0, 'a lock never acquired is never released');
+check('the claim is never made without the user lock: a lock timeout or failure refuses the click (Codex P2)', () => {
+  for (const opt of [{lockBusy: true}, {lockThrows: true}]) {
+    const w = world(Object.assign({props: {TFB_V2_PD_REFRESH_FN: PD_FN}}, opt));
+    const r = w.ctx.tfbPagesV2RefreshPortfolioDecision();
+    assert.equal(r.results[0].status, 'locked', JSON.stringify(opt));
+    assert.deepEqual(arr(w.calls), []);
+    assert.deepEqual(Object.keys(w.cache), [], 'no unsynchronized claim');
+    assert.match(w.ui.alerts[0], /not started, another click was still reserving its refresh/);
+  }
+});
+
+check('a missing cache does not block a click (no guard is possible without one)', () => {
   const w2 = world({props: {TFB_V2_PD_REFRESH_FN: PD_FN}, noCache: true});
   assert.equal(w2.ctx.tfbPagesV2RefreshPortfolioDecision().status, 'ok');
   assert.deepEqual(arr(w2.calls), ['pd']);
