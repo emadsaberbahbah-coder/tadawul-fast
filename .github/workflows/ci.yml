@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.21 (2026-10-19) -- BACKUP RESUME + VENUE CALENDAR COVERAGE
+#
+# v1.1.21: run tests/test_backup_upload_resume.py (backup_workbook v1.5.1:
+# the Drive/GCS resumable upload resumes after a transport fault instead of
+# losing the day's backup, as run #102 did) in the blocking lean lane, where
+# it exercises the helper's no-`requests` fallback tuple, and
+# tests/test_venue_calendar_ext.py (opportunity_builder v1.26.2: the
+# venue-calendar lookup behind executable quote freshness covers the live
+# Global_Markets venues; TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
+# lookup) in the blocking data-engine job, the one lane that installs the
+# pinned exchange_calendars and pandas it needs.
+#
 # VERSION 1.1.20 (2026-10-14) -- TOP-10 KPI LABEL COMPATIBILITY
 #
 # v1.1.20: run the acceptance/digest KPI-reader regressions in the blocking
@@ -653,7 +665,8 @@ jobs:
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
-            tests/test_ycp_loopguard_b6.py $EXTRA
+            tests/test_ycp_loopguard_b6.py \
+            tests/test_backup_upload_resume.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
@@ -815,6 +828,12 @@ jobs:
 
       - name: ⚙️ Run outcome evidence with production calendars
         run: python -m pytest -q tests/test_outcome_price_evidence.py
+
+      # v1.1.21: opportunity_builder v1.26.2 venue-calendar coverage. Needs the
+      # pinned exchange_calendars + pandas, which only this job installs (the
+      # lean lane would importorskip the whole module and prove nothing).
+      - name: 🗓️ Run venue calendar coverage regressions (OB v1.26.2)
+        run: python -m pytest -q tests/test_venue_calendar_ext.py
 
       - name: 📐 Run supplier and scoring margin unit regressions
         run: |

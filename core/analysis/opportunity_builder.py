@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.26.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.26.2  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.26.2 (2026-10-19): the venue-calendar lookup behind executable quote
+freshness covers the venues the live Global_Markets page actually trades on
+(39 additional suffixes, exchange_calendars 4.13.2 MICs); an old quote on
+those venues can now be certified as the last session close or rejected as
+stale by the same rule the 16 original venues used. TFB_TICKET_VENUE_CAL_EXT=0
+restores the 16-venue lookup. Venues without a calendar stay uncertified.
 
 v1.26.1 (2026-10-11): integrate the optional USX FX path with the tag-driven
 settle-unresolved exclusion; unresolved rows never rank or receive funding.
@@ -1446,7 +1453,33 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.26.1"
+# v1.26.2 (2026-10-19) — VENUE CALENDAR COVERAGE FOR THE LIVE GLOBAL PAGE
+# WHY: _quote_freshness_assessment can certify an old quote only as "last
+#   close" through _venue_state, and _venue_state knew 16 suffixes. The live
+#   Global_Markets roster trades on ~25 more (Render: `venue calendar
+#   unavailable for '.MX' ... '.BH'` on every scheduled sync), so for those
+#   venues an older-than-15-minute quote was ALWAYS "UNVERIFIED_PRICE: Xh
+#   old and venue calendar unavailable" even when it was exactly the
+#   venue's last close. That is a coverage gap in the precise path, not a
+#   policy choice (v1.4.1: "the fallback REMAINS the safety net — this build
+#   makes the precise path work").
+# FIX: _VENUE_CAL_EXT_MAP (39 suffixes -> MICs present in
+#   exchange_calendars 4.13.2) consulted only when _VENUE_CAL_MAP misses;
+#   _venue_cal_code() is the single lookup. Verdict logic is untouched: the
+#   newly covered venues now get the same three answers the 16 old ones get
+#   (session_open -> STALE_PRICE intraday; session_closed and quote >= close
+#   - 2 min -> "last close"; earlier -> STALE_PRICE pre-close). Venues with
+#   no calendar in 4.13.2 (.AT .NS .VN .AE .QA .BH) are left out on purpose
+#   and keep logging. Kill switch TFB_TICKET_VENUE_CAL_EXT=0 restores v1.26.1
+#   lookups exactly.
+# OFF-equivalence: every suffix in _VENUE_CAL_MAP resolves before the
+#   extension is consulted, so all v1.26.1 venues are byte-identical.
+#   Cost: one lazy exchange_calendars build per NEW venue per process
+#   (0.2-0.5 s; XKRX ~4 s, XTAE ~1.6 s, XBOM ~1.3 s), then cached.
+#   Functions added 2 (_venue_cal_ext_enabled, _venue_cal_code). Removed 0.
+#   Rollback: TFB_TICKET_VENUE_CAL_EXT=0, or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.26.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4448,7 +4481,48 @@ _VENUE_CAL_MAP = {
     "MI": "XMIL", "MC": "XMAD", "ST": "XSTO", "TO": "XTSE", "SW": "XSWX",
     "US": "XNYS",
 }
+# v1.26.2 (2026-10-19): venues the live Global_Markets page carries but the
+# v1.4.1 map never knew. Every scheduled sync logged
+#   [FRESHNESS v1.26.1] venue calendar unavailable for '.MX' / '.AX' / ...
+# for these suffixes (Render logs 2026-10-18 23:46 UTC and 2026-10-19 05:08
+# UTC, 25 suffixes per run), so a correct last-session close on any of them
+# could never be certified: the row stayed UNVERIFIED_PRICE whatever its
+# quote instant said. Each ISO-10383 MIC below exists in the pinned
+# exchange_calendars==4.13.2 (verified by instantiation). Venues that share a
+# session with a listed one are aliased to it (KOSDAQ->XKRX, TPEx->XTAI,
+# CSE/NEO->XTSE, TSX-V->XTSX). Suffixes with NO calendar in 4.13.2 are
+# deliberately absent (.AT Athens, .NS NSE India, .VN, .AE, .QA, .BH): they
+# keep the v1.26.1 "calendar unavailable" verdict and keep logging, which is
+# the honest answer. Kill switch: TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
+# map exactly (the extended entries are consulted only when the base map
+# misses, so every v1.26.1 venue is byte-identical either way).
+_VENUE_CAL_EXT_MAP = {
+    "MX": "XMEX", "AX": "XASX", "OL": "XOSL", "VI": "XWBO", "SI": "XSES",
+    "JK": "XIDX", "KS": "XKRX", "KQ": "XKRX", "WA": "XWAR", "TW": "XTAI",
+    "TWO": "XTAI", "HE": "XHEL", "KL": "XKLS", "BO": "XBOM", "BA": "XBUE",
+    "CO": "XCSE", "SN": "XSGO", "LS": "XLIS", "BK": "XBKK", "NZ": "XNZE",
+    "JO": "XJSE", "SA": "BVMF", "TA": "XTAE", "IR": "XDUB", "V": "XTSX",
+    "CN": "XTSE", "NE": "XTSE", "SS": "XSHG", "IC": "XICE", "PR": "XPRA",
+    "BD": "XBUD", "LM": "XLIM", "PH": "XPHS", "TL": "XTAL", "RG": "XRIS",
+    "VS": "XLIT", "CR": "XZAG", "RO": "XBSE", "PK": "XKAR",
+}
 _VENUE_CAL_CACHE = {}
+
+
+def _venue_cal_ext_enabled():
+    """v1.26.2 kill switch: TFB_TICKET_VENUE_CAL_EXT=0/off/false -> base map only."""
+    v = (os.getenv("TFB_TICKET_VENUE_CAL_EXT") or "1").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+def _venue_cal_code(suffix):
+    """Suffix -> exchange_calendars code, base map first, extension second."""
+    code = _VENUE_CAL_MAP.get(suffix)
+    if code:
+        return code
+    if _venue_cal_ext_enabled():
+        return _VENUE_CAL_EXT_MAP.get(suffix)
+    return None
 _LOG = logging.getLogger("core.analysis.opportunity_builder")
 _VENUE_LAST_ERROR = {"msg": ""}
 _FRESHNESS_FALLBACK_LOGGED = set()
@@ -4467,7 +4541,7 @@ def _venue_state(symbol, now_utc):
             if (s.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(s)
                     and split_symbol_exchange(s)[1] is None):
                 suffix = "US"
-        code = _VENUE_CAL_MAP.get(suffix)
+        code = _venue_cal_code(suffix)        # v1.26.2: base, then extension
         if not code:
             return None
         cal = _VENUE_CAL_CACHE.get(code)

@@ -180,7 +180,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("integrations.google_sheets_service", "SERVICE_VERSION", "6.2.2", "Sheets publication writer"),
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.26.1", "opportunity builder"),
+     "1.26.2", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
      "1.16.0", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",
@@ -237,7 +237,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # (stdlib+asyncio at module level) before being added here.
     ("run_dashboard_sync", "6.69.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
-    ("backup_workbook", "1.5.0", "workbook backup"),
+    ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
     ("run_daily_brief", "1.18.1", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
