@@ -1,7 +1,13 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.1 (2026-10-20)
+ * Version: 1.2.2 (2026-10-20)
+ *   1.2.2: TWO REVIEW FINDINGS. (a) ONE CASH BASIS: both pages and the shared allocation memo use dp2CashBasis_ —
+ *          Top_10 'Entered cash' → _IBKR_Account cash (STALE-flagged) → _Cash_Snapshot; the memo is keyed on
+ *          cash|fx so a different balance recomputes; each page discloses the other reading and flags a gap
+ *          > DP2.CASH_DIFF_WARN_PCT. (b) ACTIVE ORDERS ONLY: dp2BracketFor_ takes broker TP / stop levels only
+ *          from active-status orders (dp2OrderActive_); REPLACED / CANCELLED / FILLED rows keep lastTp / lastStop
+ *          for the wording but never protect a lot; new 'inactive' state; 'partial' says which side is missing.
  *   1.2.1: NO SEEDING ON REFRESH (review finding). buildDecisionPagesV2 / buildPortfolioDecisionV2 no longer call
  *          dp2EnsureIbkrTabs_; the 17 Oct connector sample is written only by the explicit menu action Seed IBKR
  *          Tabs. Missing or empty _IBKR_Orders = broker orders UNKNOWN ('HOLD — broker orders unknown'), never
@@ -88,7 +94,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.1';
+var DP2_VERSION = '1.2.2';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -117,6 +123,7 @@ var DP2 = {
   REF_SIZE_PCT: 0.05,
   EVIDENCE_LIMIT_MIN: 14,
   IBKR_TABS_STALE_H: 30,   // _IBKR_* snapshot older than this is labelled STALE on the page (it is a manual read, not the Flex capture)
+  CASH_DIFF_WARN_PCT: 5,   // v1.2.2: the other cash balance (IBKR snapshot / _Cash_Snapshot) differing from the basis by more than this is flagged
   TZ: 'Asia/Riyadh'
 };
 var DP2C = {
@@ -673,6 +680,31 @@ function dp2ReadCash_() {
   for (var r = vals.length - 1; r >= 1; r--) { var b = dp2Num_(vals[r][bc]); if (b !== null) return { balance: b, date: vals[r][dc] }; }
   return null;
 }
+/* v1.2.2 — ONE cash basis for both pages and the shared allocation memo (Codex P1): Top_10 panel 'Entered cash'
+   (the owner-declared deployable cash) → _IBKR_Account cash_usd × fx (STALE-flagged past DP2.IBKR_TABS_STALE_H)
+   → _Cash_Snapshot → none. The balances not chosen are kept so the pages can disclose a discrepancy. */
+function dp2CashBasis_(t, ib, fx) {
+  var out = { sar: null, source: 'n/a', basis: 'none', entered: null, ibkrSar: null, snapSar: null, snapDate: '', other: null, otherLabel: '', diffPct: null, warn: false };
+  var cashUsd = dp2Num_(ib && ib.account ? ib.account['cash_usd'] : null);
+  if (cashUsd !== null) out.ibkrSar = cashUsd * (fx || DP2.FX_DEFAULT);
+  var snap = null; try { snap = dp2ReadCash_(); } catch (eC) { snap = null; }
+  if (snap) { out.snapSar = dp2Num_(snap.balance); out.snapDate = dp2DateStr_(snap.date) || dp2Str_(snap.date); }
+  out.entered = (t && t.enteredCash !== null && t.enteredCash !== undefined) ? dp2Num_(t.enteredCash) : null;
+  if (out.entered !== null) { out.sar = out.entered; out.basis = 'top10'; out.source = 'Top_10 panel (entered cash)'; }
+  else if (out.ibkrSar !== null) { out.sar = out.ibkrSar; out.basis = 'ibkr'; out.source = 'IBKR ' + dp2Str_(ib.account['as_of']) + (ib.stale ? ' — STALE snapshot' : ''); }
+  else if (out.snapSar !== null) { out.sar = out.snapSar; out.basis = 'snapshot'; out.source = '_Cash_Snapshot ' + out.snapDate; }
+  if (out.basis !== 'ibkr' && out.ibkrSar !== null) { out.other = out.ibkrSar; out.otherLabel = 'IBKR snapshot ' + dp2Str_(ib.account['as_of']) + (ib.ageH !== null ? ' (' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ', STALE' : '') + ')' : ''); }
+  else if (out.snapSar !== null && out.basis !== 'snapshot') { out.other = out.snapSar; out.otherLabel = '_Cash_Snapshot ' + out.snapDate; }
+  if (out.sar !== null && out.other !== null && out.sar > 0) { out.diffPct = (out.other - out.sar) / out.sar * 100; out.warn = Math.abs(out.diffPct) > DP2.CASH_DIFF_WARN_PCT; }
+  return out;
+}
+/* One line for the pages: which balance the allocation uses and how far the other reading is from it. */
+function dp2CashBasisText_(cb) {
+  if (!cb || cb.sar === null) return 'no cash figure — enter it in the Top_10 panel';
+  var t = dp2Fmt_(cb.sar) + ' SAR from ' + cb.source;
+  if (cb.other !== null) t += ' · ' + cb.otherLabel + ' reads ' + dp2Fmt_(cb.other) + ' SAR (' + (cb.diffPct >= 0 ? '+' : '') + dp2Fmt_(cb.diffPct, 1) + '%)' + (cb.warn ? ' — RECONCILE before placing orders' : '');
+  return t;
+}
 function dp2ReadGmInvestability_() {
   var sh = dp2Sheet_(DP2.SRC_GM, false);
   var out = { total: 0, counts: {} };
@@ -793,20 +825,38 @@ function dp2ReadIbkr_() {
   out.stale = out.ageH === null ? out.tabs.account : out.ageH > DP2.IBKR_TABS_STALE_H;
   return out;
 }
+/* v1.2.2 (Codex P1): broker TP / stop levels come ONLY from orders in an active status. Historical REPLACED,
+   CANCELLED, FILLED or unknown-status rows never supply a level, so a replaced stop can no longer make an
+   unprotected lot look protected; their last prices are kept separately (lastTp / lastStop) for the wording. */
+function dp2OrderActive_(status) {
+  var st = dp2Str_(status).toUpperCase();
+  if (/CANCEL|REPLACED|INACTIVE|REJECT|EXPIRED/.test(st)) return false;
+  if (st === 'FILLED') return false;
+  return /NEW|SUBMITTED|PRESUBMITTED|PENDING_SUBMIT|WORKING|PARTIALLY/.test(st);
+}
 function dp2BracketFor_(orders, symbolKey) {
-  var tp = null, stop = null, statuses = [], placed = '';
+  var tp = null, stop = null, lastTp = null, lastStop = null, statuses = [], placed = '', active = 0, replaced = 0;
   for (var i = 0; i < orders.length; i++) {
     var o = orders[i];
     if (o.symbol !== symbolKey || o.side.toUpperCase() !== 'SELL') continue;
     statuses.push(o.status);
-    if (o.type === 'LIMIT' || o.type === 'LMT') tp = o.price;
-    if (o.type === 'STOP' || o.type === 'STP') stop = o.price;
+    var isTp = (o.type === 'LIMIT' || o.type === 'LMT'), isStop = (o.type === 'STOP' || o.type === 'STP' || o.type === 'STOP_LIMIT' || o.type === 'STP LMT');
+    if (isTp) lastTp = o.price;
+    if (isStop) lastStop = o.price;
+    if (/REPLACED/.test(dp2Str_(o.status).toUpperCase())) replaced++;
+    if (!dp2OrderActive_(o.status)) continue;
+    active++;
+    if (isTp) tp = o.price;
+    if (isStop) stop = o.price;
     placed = o.placed || placed;
   }
-  var working = 0, replaced = 0;
-  for (i = 0; i < statuses.length; i++) { if (/NEW|SUBMITTED|PRESUBMITTED|WORKING/.test(statuses[i])) working++; if (/REPLACED/.test(statuses[i])) replaced++; }
-  var state = statuses.length === 0 ? 'none' : (working >= 2 ? 'working' : (replaced > 0 && working === 0 ? 'replaced' : 'partial'));
-  return { tp: tp, stop: stop, state: state, placed: placed, n: statuses.length };
+  var state;
+  if (statuses.length === 0) state = 'none';
+  else if (tp !== null && stop !== null) state = 'working';
+  else if (tp !== null || stop !== null) state = 'partial';
+  else if (replaced > 0) state = 'replaced';
+  else state = 'inactive';
+  return { tp: tp, stop: stop, lastTp: lastTp, lastStop: lastStop, state: state, placed: placed, n: statuses.length, active: active, statuses: statuses };
 }
 
 /* ========================================================= dynamic exits (v1.1.0): price history */
@@ -1386,16 +1436,16 @@ function dp2RotationHoldings_(eq, fi, ib) {
   for (i = 0; i < eq.length; i++) {
     var l = eq[i], m = l.mp || {};
     var br = dp2BracketFor_(ib.orders, dp2YahooKey_(l.symbol));
-    var working = (br.state === 'working' || br.state === 'partial');
-    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: working ? br.tp : null, price: l.price, isFI: false });
+    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: br.tp, price: l.price, isFI: false });
   }
   for (i = 0; i < fi.length; i++) out.push({ symbol: fi[i].symbol, valueSar: fi[i].mvSar || 0, roi12: null, roi3: null, holdingDays: fi[i].holdingDays, tp1: null, price: fi[i].price, isFI: true });
   return out;
 }
 /* One shared research allocation per execution: plans → allocation → funding plans on both bases. */
-var DP2A_MEMO_ = null;
+var DP2A_MEMO_ = null;   // { key: '<cash>|<fx>', alloc } — v1.2.2: a different cash figure or fx recomputes instead of returning the memo
 function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
-  if (DP2A_MEMO_) return DP2A_MEMO_;
+  var memoKey = String(Math.round((cashSar || 0) * 100) / 100) + '|' + String(Math.round((fx || 0) * 10000) / 10000);
+  if (DP2A_MEMO_ && DP2A_MEMO_.key === memoKey) return DP2A_MEMO_.alloc;
   var eq = [], fi = [], i;
   for (i = 0; i < led.lots.length; i++) {
     var lot = led.lots[i], m = mp[lot.symbol] || {};
@@ -1414,7 +1464,8 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   alloc.rotation12 = null; alloc.rotation3 = null;
   for (i = 0; i < alloc.plans12.length; i++) if (alloc.plans12[i].rotation) { alloc.rotation12 = alloc.plans12[i]; break; }
   for (i = 0; i < alloc.plans3.length; i++) if (alloc.plans3[i].rotation) { alloc.rotation3 = alloc.plans3[i]; break; }
-  DP2A_MEMO_ = alloc;
+  alloc.cashKey = memoKey;
+  DP2A_MEMO_ = { key: memoKey, alloc: alloc };
   return alloc;
 }
 
@@ -1426,15 +1477,16 @@ function buildPortfolioDecisionV2() {
   var pd = dp2ReadPortfolioDecision_();
   var led = dp2ReadLedger_();
   var mp = dp2ReadMyPortfolio_();
-  var cash = dp2ReadCash_();
   var ib = dp2ReadIbkr_();
   var s1 = dp2ReadS1_();
   var switches = dp2ReadShadowSwitch_();
+  var t10 = dp2ReadTop10_();
 
   var fx = dp2Num_(ib.account['fx_usd_sar']) || pd.fx || DP2.FX_DEFAULT;
-  var cashUsd = dp2Num_(ib.account['cash_usd']);
-  var cashSar = cashUsd !== null ? cashUsd * fx : (cash ? cash.balance : null);
-  var cashSource = cashUsd !== null ? 'IBKR (' + dp2Str_(ib.account['as_of']) + ')' : (cash ? '_Cash_Snapshot ' + dp2Str_(cash.date) : 'n/a');
+  // v1.2.2: the same cash basis as Top_10_Investments_v2 (dp2CashBasis_), so NAV, floor, deployable and the shared allocation agree
+  var cb = dp2CashBasis_(t10, ib, fx);
+  var cashSar = cb.sar;
+  var cashSource = cb.source;
 
   // lots: equities vs fixed income
   var eq = [], fi = [];
@@ -1449,7 +1501,6 @@ function buildPortfolioDecisionV2() {
   var xbars = {};
   try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; })); } catch (eX) { xbars = {}; }
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
-  var t10 = dp2ReadTop10_();
   var alloc = null;
   try {
     var planSyms = []; for (var pi = 0; pi < t10.seats.length; pi++) { if (/FAST-TRACK/.test(dp2Str_(t10.seats[pi]['Stability']))) planSyms.push(dp2Str_(t10.seats[pi]['Symbol']).trim()); }
@@ -1567,24 +1618,25 @@ function buildPortfolioDecisionV2() {
     if (xb && !xb.stale && x) xFresh++;
     if (xb && xb.source) xSources[xb.source] = true;
     if (x && x.lastDate > xBarsAsOf) xBarsAsOf = x.lastDate;
-    var brokerWorking = (br.state === 'working' || br.state === 'partial');
-    var brokerStop = brokerWorking ? br.stop : null;
-    var brokerTp = brokerWorking ? br.tp : null;
+    var brokerWorking = br.active > 0;
+    var brokerStop = br.stop;   // active-status orders only (v1.2.2)
+    var brokerTp = br.tp;
     var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price);
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
-    var stopEff = x ? x.stop : (brokerStop || br.stop);
+    var stopEff = x ? x.stop : brokerStop;
     var stopPct = (stopEff && last) ? (stopEff / last - 1) * 100 : null;
     var spark = dp2SparkFormula_(l.symbol);
-    var dynTxt = x ? (dp2Fmt_(x.stop, 2) + ' (' + dp2Pct_(stopPct, 1) + ')\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) + (x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' ↑ raise' : '') : (br.stop ? 'broker ' + dp2Fmt_(br.stop, 2) + ' not working' : 'no broker stop')))
-                   : ('—\n' + (br.stop ? 'broker ' + dp2Fmt_(br.stop, 2) + (brokerWorking ? '' : ' not working') : 'no broker stop'));
+    var dynTxt = x ? (dp2Fmt_(x.stop, 2) + ' (' + dp2Pct_(stopPct, 1) + ')\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) + (x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' ↑ raise' : '') : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')))
+                   : ('—\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')));
     var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
                    : ('no price history' + (xb && xb.error ? ' — ' + dp2Str_(xb.error).slice(0, 90) : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
     var ostat;
     if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
-    else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.tp, 2) + ' / ' + dp2Fmt_(br.stop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
+    else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.lastTp, 2) + ' / ' + dp2Fmt_(br.lastStop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
+    else if (br.state === 'inactive') { ostat = 'no active sell order — ' + br.n + ' listed (' + br.statuses.join(', ') + ') → verify at the broker'; actions.push({ p: 1, t: l.symbol + ': every sell order in _IBKR_Orders is ' + br.statuses.join(' / ') + ' — nothing active protects ' + dp2Fmt_(l.mvSar) + ' SAR' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '. Verify at the broker.' }); }
     else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — _IBKR_Orders tab missing or empty (🌱 Seed IBKR Tabs, or paste the connector read)'; }
-    else { ostat = 'partial — ' + br.n + ' order(s), check'; }
+    else { ostat = 'partial — ' + (brokerStop ? 'stop working, no take-profit' : 'take-profit working, NO STOP') + ' (' + br.active + ' active of ' + br.n + ')'; }
     // actions from the exit signal
     var item = { symbol: l.symbol, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
     exitItems.push(item);
@@ -1614,7 +1666,7 @@ function buildPortfolioDecisionV2() {
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
     sigKinds.push(sig.kind);
-    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.stop && !brokerWorking ? '\n(not working)' : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')), dynTxt, engTxt, ostat, decision]);
+    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : ''))), dynTxt, engTxt, ostat, decision]);
   }
   for (i = 0; i < fi.length; i++) {
     var f = fi[i];
@@ -1696,6 +1748,7 @@ function buildPortfolioDecisionV2() {
     ['Position cap ' + capPos + '% NAV', navSar ? dp2PctPlain_(maxPos / navSar * 100, 1) + ' max · ' + (maxPos / navSar * 100 <= capPos ? 'pass' : 'FAIL') : 'n/a', navSar && maxPos / navSar * 100 <= capPos ? DP2C.green : DP2C.red],
     ['Sector cap ' + capSec + '% NAV', navSar ? dp2PctPlain_(maxEq / navSar * 100, 1) + ' max · ' + (maxEq / navSar * 100 <= capSec ? 'pass' : 'FAIL') : 'n/a', navSar && maxEq / navSar * 100 <= capSec ? DP2C.green : DP2C.red],
     ['Cash floor 10% NAV', navSar ? dp2PctPlain_((cashSar || 0) / navSar * 100, 1) + ' · ' + ((cashSar || 0) >= floorSar ? 'pass' : 'FAIL') : 'n/a', (cashSar || 0) >= floorSar ? DP2C.green : DP2C.red],
+    ['Cash basis (shared with Top_10_v2)', dp2CashBasisText_(cb), cb.sar === null ? DP2C.red : (cb.warn ? DP2C.amber : DP2C.green)],
     ['Brackets working on every equity lot', workingBrackets + ' of ' + eq.length + (workingBrackets < eq.length ? ' · verify' : ' · pass'), workingBrackets === eq.length ? DP2C.green : DP2C.amber],
     ['Dynamic exit engine on fresh bars', xFresh + ' of ' + xTotal + ' lots · ' + srcList, (xTotal > 0 && xFresh === xTotal) ? DP2C.green : DP2C.amber],
     ['Broker stop ≥ dynamic stop on every lot', (function () { var n = 0; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP') n++; return n ? n + ' lot(s) to raise / place' : 'pass'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP') return DP2C.amber; return DP2C.green; })()],
@@ -1750,10 +1803,10 @@ function buildTop10V2() {
   var led = dp2ReadLedger_();
   var ib = dp2ReadIbkr_();
   var fx = dp2Num_(ib.account['fx_usd_sar']) || DP2.FX_DEFAULT;
-  var cashSar = t.enteredCash;
-  var cashSource = 'Top_10 panel';
-  if (cashSar === null) { var ibCash = dp2Num_(ib.account['cash_usd']); if (ibCash !== null) { cashSar = ibCash * fx; cashSource = 'IBKR ' + dp2Str_(ib.account['as_of']); } }
-  if (cashSar === null) { var snap = dp2ReadCash_(); if (snap) { cashSar = snap.balance; cashSource = '_Cash_Snapshot'; } }
+  // v1.2.2: the same cash basis as Portfolio_Decision_v2 (dp2CashBasis_); the allocation memo is keyed on it
+  var cb = dp2CashBasis_(t, ib, fx);
+  var cashSar = cb.sar;
+  var cashSource = cb.source;
   var navSar = 0;
   for (var i = 0; i < led.lots.length; i++) navSar += led.lots[i].mvSar || 0;
   navSar += cashSar || 0;
@@ -1907,6 +1960,7 @@ function buildTop10V2() {
     var evr = (alloc.riskSar !== null && alloc.riskSar > 0) ? alloc.gain3 / alloc.riskSar : null;
     var aRows = [
       ['Cash available (' + cashSource + ')', dp2Fmt_(alloc.cash) + ' SAR'],
+      ['Cash check (other reading)', cb.other !== null ? cb.otherLabel + ': ' + dp2Fmt_(cb.other) + ' SAR (' + (cb.diffPct >= 0 ? '+' : '') + dp2Fmt_(cb.diffPct, 1) + '%)' + (cb.warn ? ' — RECONCILE before placing orders' : ' · consistent') : 'no second reading', cb.warn ? DP2C.amber : DP2C.ink2],
       ['Cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% of NAV ' + dp2Fmt_(alloc.nav), dp2Fmt_(alloc.floorSar) + ' SAR'],
       ['Deployable', dp2Fmt_(alloc.deployable) + ' SAR', DP2C.green],
       ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + deployable)', dp2Fmt_(alloc.cap) + ' SAR'],
