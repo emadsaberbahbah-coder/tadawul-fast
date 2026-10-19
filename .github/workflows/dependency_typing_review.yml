@@ -1,5 +1,10 @@
 name: Dependency security and typed-module review
 
+# VERSION 1.1.1 (2026-10-19) -- INDEPENDENT BRANCH AUDIT COVERAGE
+# Audit changed dependency inputs on pushes as well as pull requests, so the
+# security receipt does not depend on availability of a synthetic PR merge ref.
+# Both events retain the same path filter and read-only permissions.
+#
 # VERSION 1.1.0 (2026-10-19) -- COMPLETE INSTALLED DEPENDENCY AUDIT
 # Install production pins in their own Python3.11 environment, then audit its
 # resolved distributions with an isolated tool. URL pins and transitive
@@ -15,6 +20,8 @@ name: Dependency security and typed-module review
 # reviewed. They install no credentials, write no workbook and arm no flags.
 
 on:
+  push:
+    paths: ['requirements.txt', 'core/sheets/**', 'core/symbols/**', 'core/portfolio_reconciliation.py', 'core/execution_accounting.py', 'scripts/performance_math.py', 'scripts/verify_dependency_audit.py', 'tests/test_dependency_audit_receipt.py', 'pyrightconfig.json', '.github/workflows/dependency_typing_review.yml']
   pull_request:
     paths: ['requirements.txt', 'core/sheets/**', 'core/symbols/**', 'core/portfolio_reconciliation.py', 'core/execution_accounting.py', 'scripts/performance_math.py', 'scripts/verify_dependency_audit.py', 'tests/test_dependency_audit_receipt.py', 'pyrightconfig.json', '.github/workflows/dependency_typing_review.yml']
   schedule:

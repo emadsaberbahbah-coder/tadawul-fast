@@ -74,6 +74,10 @@ framework/authentication compatibility, required workflow jobs and the new
 complete dependency audit must be checked on the published candidate SHA.
 The current candidate's GitHub run links and completion receipts belong in
 the PR description; an older successful run is not evidence for a newer tree.
+The dependency workflow also runs on pushes with the same input-path filter
+as pull requests, so a missing synthetic PR merge ref cannot suppress its
+independent security receipt. This does not replace PR checks or change
+repository merge policy.
 
 Local socket-denied execution is not a valid result for localhost server or
 TestClient integration tests. Those tests require local loopback permission;
