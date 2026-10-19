@@ -1,7 +1,13 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.3 (2026-10-20)
+ * Version: 1.2.4 (2026-10-20)
+ *   1.2.4: FIVE REVIEW FINDINGS. (a) A rotation sells only the SHORTFALL (cash left funds the rest). (b) Exit-signal
+ *          precedence: RAISE STOP / broker-unknown / NO WORKING STOP outrank TP WATCH; the TP proximity is carried in
+ *          the text (out.tpWatch). (c) Conviction weights use the engine's roi_pct = valuation (TP2) upside from
+ *          TP2 SAR / Price SAR (2 × TP1 ROI as fallback), not the TP1 plan ROI. (d) Cohort caps (max seats / per
+ *          sector / per market) come from the Top_10 panel (dp2CohortCaps_), DP2A only as fallback. (e) Max drawdown
+ *          is the worst decline from a preceding (running) peak, dated.
  *   1.2.3: TWO MORE REVIEW FINDINGS. (a) A rotation must COVER the shortfall (dp2RotationPick_ gets the shortfall as
  *          minValue, as the engine's floor guard does); a smaller eligible holding is reported as rotation-insufficient
  *          and the seat stays a CAPITAL CALL — the page never advises a sale that cannot fund the advertised seat.
@@ -100,7 +106,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.3';
+var DP2_VERSION = '1.2.4';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -179,7 +185,7 @@ var DP2A = {
   TILT: 1.0,                     // TFB_OPP_SIZING_TILT
   RISK_MULT: { Low: 1.0, Medium: 0.7, High: 0.4 }, RISK_DEFAULT: 0.7, REL_MIN: 0.5,
   REQUIRED_ROI_PCT: 12,          // T10: Required ROI % — fallback weight when a plan ROI is missing
-  MAX_SELECTED: 10, MAX_PER_SECTOR: 2, MAX_PER_MARKET: 10,
+  MAX_SELECTED: 10, MAX_PER_SECTOR: 2, MAX_PER_MARKET: 10,   // fallbacks only — v1.2.4 reads T10: Max Selected / Max Per Sector / Max Per Market from the Top_10 panel
   ROT_EDGE_PP_12M: 8,            // TFB_OPP_ROTATION_EDGE_PP (engine 12M basis — production)
   ROT_EDGE_PP_3M: 5,             // TFB_OPP_ROTATION_EDGE_PP_3M (plan 3M basis — proposed, PR)
   ROT_COST_PCT: 1.1,             // TFB_OPP_ROTATION_COST_PCT — round-trip cost
@@ -1085,11 +1091,16 @@ function dp2ExitSignal_(x, br, fallbackLast) {
   if (last !== null && last <= x.stop) { out.code = 'STOP_HIT'; out.kind = 'red'; out.text = 'SELL NOW — stop ' + dp2Fmt_(x.stop, 2) + ' hit'; out.alert = true; }
   else if (x.momentum) { out.code = 'SELL_NOW'; out.kind = 'red'; out.text = 'SELL NOW — protect profit'; out.alert = true; }
   else if (out.dist !== null && out.dist <= DP2X.NEAR_STOP_PCT) { out.code = 'STOP_NEAR'; out.kind = 'amber'; out.text = 'STOP NEAR — ' + dp2PctPlain_(out.dist, 1) + ' above ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
-  else if (tpDist !== null && tpDist <= DP2X.TP_WATCH_PCT) { out.code = 'TP_WATCH'; out.kind = 'amber'; out.text = 'TP WATCH — broker TP ' + dp2Fmt_(br.tp, 2) + ' ' + dp2Pct_(tpDist, 1); }
+  // v1.2.4 (review finding): a missing or low broker stop outranks the take-profit watch — an unprotected lot near its
+  // target is still unprotected; the TP proximity is carried alongside (out.tpWatch, text suffix).
   else if (br && br.stop && x.stop >= br.stop * (1 + DP2X.RAISE_MIN_PCT / 100)) { out.code = 'RAISE_STOP'; out.kind = 'amber'; out.text = 'RAISE STOP ' + dp2Fmt_(br.stop, 2) + ' → ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
   else if (br && br.known === false) { out.code = 'HOLD_BROKER_UNKNOWN'; out.kind = 'navy'; out.text = 'HOLD — broker orders unknown · rule stop ' + dp2Fmt_(x.stop, 2); }
   else if (!br || !br.stop) { out.code = 'NO_BROKER_STOP'; out.kind = 'amber'; out.text = 'NO WORKING STOP — place ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
+  else if (tpDist !== null && tpDist <= DP2X.TP_WATCH_PCT) { out.code = 'TP_WATCH'; out.kind = 'amber'; out.text = 'TP WATCH — broker TP ' + dp2Fmt_(br.tp, 2) + ' ' + dp2Pct_(tpDist, 1); }
   else if (x.beLocked) { out.code = 'HOLD_BE'; out.kind = 'green'; out.text = 'HOLD — breakeven locked'; }
+  out.tpDist = tpDist;
+  out.tpWatch = (tpDist !== null && tpDist <= DP2X.TP_WATCH_PCT);
+  if (out.tpWatch && out.code !== 'TP_WATCH' && (out.code === 'RAISE_STOP' || out.code === 'NO_BROKER_STOP')) out.text += ' · TP ' + dp2Fmt_(br.tp, 2) + ' ' + dp2Pct_(tpDist, 1) + ' away';
   return out;
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
@@ -1305,15 +1316,22 @@ function dp2FxToSar_(ccy, fx) {
   return { rate: null, source: 'none' };
 }
 /* Plan seats = FAST-TRACK seats in rank order within the sector / market caps (the engine's sizing cohort). */
+/* v1.2.4: the cohort caps come from the Top_10 panel (T10: Max Selected / Max Per Sector / Max Per Market), DP2A only as fallback. */
+function dp2CohortCaps_(t) {
+  var pnl = (t && t.panel) || {};
+  var n = function (k, d) { var v = dp2Num_(pnl[k]); return (v !== null && v > 0) ? Math.round(v) : d; };
+  return { maxSelected: n('T10: Max Selected', DP2A.MAX_SELECTED), maxPerSector: n('T10: Max Per Sector', DP2A.MAX_PER_SECTOR), maxPerMarket: n('T10: Max Per Market', DP2A.MAX_PER_MARKET), fromPanel: dp2Num_(pnl['T10: Max Per Sector']) !== null };
+}
 function dp2PlanSeats_(t, fx, xbars, qmap) {
   var out = [], sectors = {}, markets = {};
+  var caps = dp2CohortCaps_(t);
   for (var i = 0; i < t.seats.length; i++) {
     var s = t.seats[i];
     var stability = dp2Str_(s['Stability']);
     if (!/FAST-TRACK/.test(stability)) continue;
-    if (out.length >= DP2A.MAX_SELECTED) break;
+    if (out.length >= caps.maxSelected) break;
     var sym = dp2Str_(s['Symbol']).trim(), sec = dp2Str_(s['Sector']) || 'Unknown', mkt = dp2Str_(s['Market']) || 'Unknown';
-    if ((sectors[sec] || 0) >= DP2A.MAX_PER_SECTOR || (markets[mkt] || 0) >= DP2A.MAX_PER_MARKET) continue;
+    if ((sectors[sec] || 0) >= caps.maxPerSector || (markets[mkt] || 0) >= caps.maxPerMarket) continue;
     var q = (qmap && qmap[sym]) || {};
     var ccy = dp2Str_(s['Ccy']);
     var fxRow = dp2Num_(s['FX→SAR']);
@@ -1325,11 +1343,16 @@ function dp2PlanSeats_(t, fx, xbars, qmap) {
     if (xb && xb.bars && xb.bars.length > DP2X.ATR_N) { var a = dp2Atr_(xb.bars, DP2X.ATR_N); atr = a[a.length - 1]; }
     var roi3 = dp2Num_(s['ROI % (TP1)']); if (roi3 === null) roi3 = dp2Num_(q['ROI % (TP1)']);
     var roi12 = dp2Num_(s['Engine ROI % (12M)']); if (roi12 === null) roi12 = dp2Num_(q['Engine ROI % (12M)']);
+    // v1.2.4 (review finding): the conviction WEIGHT uses the engine's roi_pct = valuation (TP2) upside, (TP2 − price)/price,
+    // read from the cockpit's TP2 SAR / Price SAR; TP1 sits at the midpoint by construction, so 2 × ROI % (TP1) is the fallback.
+    var tp2Sar = dp2Num_(s['TP2 SAR']), pxSar = dp2Num_(s['Price SAR']);
+    var roiVal = (tp2Sar !== null && pxSar !== null && pxSar > 0) ? (tp2Sar / pxSar - 1) * 100 : (roi3 !== null ? roi3 * 2 : null);
+    var roiValSource = (tp2Sar !== null && pxSar !== null && pxSar > 0) ? 'tp2' : (roi3 !== null ? 'tp1x2' : 'none');
     var rel = dp2Num_(s['Rel']); if (rel === null) rel = dp2Num_(q['Rel']);
     var risk = dp2Str_(q['Risk']) || dp2Str_(s['Conf']) || '';
     sectors[sec] = (sectors[sec] || 0) + 1; markets[mkt] = (markets[mkt] || 0) + 1;
     out.push({ sym: sym, name: dp2Str_(s['Name']), sector: sec, market: mkt, ccy: ccy, fxUse: fxUse, fxSource: fxSource, price: price, priceSar: (price !== null && fxUse !== null) ? price * fxUse : null,
-               roi3: roi3, roi12: roi12, rel: rel, dq: dp2Num_(s['DQ']), risk: risk, rank: dp2Num_(s['Rank']), stability: stability, atr: atr,
+               roi3: roi3, roi12: roi12, roiVal: roiVal, roiValSource: roiValSource, rel: rel, dq: dp2Num_(s['DQ']), risk: risk, rank: dp2Num_(s['Rank']), stability: stability, atr: atr,
                stop0: (price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null, ticketEngine: dp2Num_(s['Ticket SAR']) });
   }
   return out;
@@ -1341,7 +1364,7 @@ function dp2Allocate_(plans, cashSar, pvSar) {
   var deployable = Math.max(0, cash - floorSar);
   var cap = DP2A.MAX_WEIGHT_PCT / 100 * (pv + deployable);
   var weights = {}, i, p;
-  for (i = 0; i < plans.length; i++) { p = plans[i]; if (p.priceSar) weights[p.sym] = dp2ConvWeight_(p.roi3, p.risk, p.rel); }
+  for (i = 0; i < plans.length; i++) { p = plans[i]; if (p.priceSar) weights[p.sym] = dp2ConvWeight_(p.roiVal, p.risk, p.rel); }   // v1.2.4: valuation ROI, as the engine
   var targets = dp2WaterFill_(weights, deployable, cap, DP2A.MIN_TICKET_SAR);
   var rows = [], allocated = 0, gain3 = 0, riskSum = 0, riskKnown = 0, remaining = deployable, needs = [];
   // rank order: cash covers targets top-down (the engine's greedy ledger); the rest become funding needs
@@ -1416,7 +1439,7 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
     var rot = used ? null : dp2RotationPick_(opp, holdings, basis, short);
     if (rot) {
       used = true;
-      var proceeds = Math.min(rot.valueSar, need);
+      var proceeds = Math.min(rot.valueSar, short);   // v1.2.4: sell only the shortfall — the cash left funds the rest (engine semantics)
       rot.action = proceeds >= rot.valueSar - 0.5 ? 'EXIT' : 'TRIM';
       if (rot.action === 'TRIM' && (rot.valueSar - proceeds) < DP2A.MIN_TICKET_SAR - 0.5) { rot.action = 'EXIT'; proceeds = rot.valueSar; rot.remnantExit = true; }
       rot.proceeds = proceeds;
@@ -1536,14 +1559,18 @@ function buildPortfolioDecisionV2() {
   var deploySar = (cashSar || 0) - floorSar;
 
   // TWR
-  var twr = null, twrPeak = null, twrTrough = null, twrPeakDate = '', twrTroughDate = '', twrRows = [];
+  var twr = null, twrPeak = null, twrTrough = null, twrPeakDate = '', twrTroughDate = '', twrRows = [], twrMaxDD = null, twrMaxDDDate = '';
   if (ib.nav.length > 1) {
-    var base = 1 + ib.nav[0].cps;
+    var base = 1 + ib.nav[0].cps, runPeak = null;
     for (i = 0; i < ib.nav.length; i++) {
       var v = (1 + ib.nav[i].cps) / base - 1;
       twrRows.push([ib.nav[i].date, v]);
       if (twrPeak === null || v > twrPeak) { twrPeak = v; twrPeakDate = ib.nav[i].date; }
       if (twrTrough === null || v < twrTrough) { twrTrough = v; twrTroughDate = ib.nav[i].date; }
+      // v1.2.4 (review finding): max drawdown = worst decline from a PRECEDING peak (running peak), not global trough / global peak
+      if (runPeak === null || v > runPeak) runPeak = v;
+      var dd = (1 + v) / (1 + runPeak) - 1;
+      if (twrMaxDD === null || dd < twrMaxDD) { twrMaxDD = dd; twrMaxDDDate = ib.nav[i].date; }
     }
     twr = twrRows[twrRows.length - 1][1];
   }
@@ -1587,7 +1614,7 @@ function buildPortfolioDecisionV2() {
     { label: 'Cash', value: dp2Fmt_(cashSar) + ' SAR', sub: dp2PctPlain_(navSar ? (cashSar || 0) / navSar * 100 : null) + ' · floor 10% = ' + dp2Fmt_(floorSar) },
     { label: 'Deployable', value: dp2Fmt_(deploySar) + ' SAR', sub: 'Tranche 0 · board-originated 0 (S-1 ' + (s1.verdict || 'n/a') + ')' },
     { label: 'Unrealized', value: dp2Signed_(unrealEqSar) + ' SAR', sub: 'equity lots, ledger · active lots total ' + dp2Signed_(activeTotal) + ' SAR', color: unrealEqSar >= 0 ? DP2C.green : DP2C.red },
-    { label: 'Return (TWR)', value: twr === null ? 'n/a' : dp2Pct_(twr * 100, 1), sub: twr === null ? 'add rows to _IBKR_NAV_History' : 'since ' + (twrRows[0][0]) + ' · inception ' + dp2Pct_(twrInception, 1) + ' · max DD ' + dp2Pct_(((1 + twrTrough) / (1 + twrPeak) - 1) * 100, 1), color: (twr !== null && twr >= 0) ? DP2C.green : DP2C.red },
+    { label: 'Return (TWR)', value: twr === null ? 'n/a' : dp2Pct_(twr * 100, 1), sub: twr === null ? 'add rows to _IBKR_NAV_History' : 'since ' + (twrRows[0][0]) + ' · inception ' + dp2Pct_(twrInception, 1) + ' · max DD ' + (twrMaxDD === null ? 'n/a' : dp2Pct_(twrMaxDD * 100, 1) + ' (to ' + (dp2DateStr_(twrMaxDDDate) || dp2Str_(twrMaxDDDate)) + ')'), color: (twr !== null && twr >= 0) ? DP2C.green : DP2C.red },
     { label: 'Feed / S-1', value: (feed.state || 'n/a').replace('NOT_ACTIONABLE', 'NOT ACTIONABLE'), sub: 'S-1 ' + (s1.verdict || 'n/a') + ' · calibration ' + (/as_of=([0-9-]+)/.exec(kv['TFB Calibration'] || '') || ['', 'n/a'])[1], color: /^ACTIONABLE/.test(feed.state) ? DP2C.green : DP2C.red }
   ];
   row = dp2Tiles_(sh, row, tiles); row++;
@@ -1985,7 +2012,7 @@ function buildTop10V2() {
       ['Cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% of NAV ' + dp2Fmt_(alloc.nav), dp2Fmt_(alloc.floorSar) + ' SAR'],
       ['Deployable', dp2Fmt_(alloc.deployable) + ' SAR', DP2C.green],
       ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + deployable)', dp2Fmt_(alloc.cap) + ' SAR'],
-      ['Plans in the sizing cohort', alloc.plans.length + ' · ' + alloc.plans.map(function (p) { return p.sym; }).join(', ')],
+      ['Plans in the sizing cohort', alloc.plans.length + ' · ' + alloc.plans.map(function (p) { return p.sym + ' (' + (p.roiVal !== null ? dp2PctPlain_(p.roiVal, 1) + ' val' + (p.roiValSource === 'tp1x2' ? '≈' : '') : 'ROI n/a → ' + DP2A.REQUIRED_ROI_PCT + '%') + ')'; }).join(', ') + ' · weight = valuation ROI × risk × reliability (engine roi_pct) · caps ' + (function () { var c = dp2CohortCaps_(t); return c.maxSelected + ' seats / ' + c.maxPerSector + ' per sector / ' + c.maxPerMarket + ' per market (' + (c.fromPanel ? 'Top_10 panel' : 'defaults') + ')'; })()],
       ['Allocated · cash after', dp2Fmt_(alloc.allocated) + ' SAR · ' + dp2Fmt_(alloc.cashAfter) + ' SAR left', alloc.allocated > 0 ? DP2C.green : DP2C.amber],
       ['Expected gain, 3-month plan', dp2Signed_(alloc.gain3) + ' SAR', alloc.gain3 > 0 ? DP2C.green : DP2C.ink],
       ['Risk if every initial stop is hit', alloc.riskSar !== null ? dp2Signed_(-alloc.riskSar) + ' SAR' + (alloc.nav ? ' (' + dp2PctPlain_(alloc.riskSar / alloc.nav * 100, 2) + ' NAV)' : '') + (alloc.riskKnown < alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length ? ' · ' + alloc.riskKnown + ' of the funded seats have ATR' : '') : 'n/a — no price history for the seats yet', alloc.riskSar !== null ? DP2C.red : DP2C.ink2],
