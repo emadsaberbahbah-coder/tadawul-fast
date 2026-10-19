@@ -1,12 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.26.1  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.27.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.27.0 (2026-10-19): conviction-weighted seat sizing, TFB_OPP_SIZING_MODE
+= cap (default, byte-identical) | conviction. Under conviction the deployable
+budget is spread across the seats the allocator will consider in proportion
+to plan ROI x risk multiplier x reliability (water-filled under the per-seat
+cap and above the minimum ticket), then any lot-rounding remainder tops up the
+highest-conviction seats. Gates, ranking, caps, funding plans and rotation are
+untouched; meta.sizing discloses the weights and targets.
+
+v1.26.2 (2026-10-19): the venue-calendar lookup behind executable quote
+freshness covers the venues the live Global_Markets page actually trades on
+(39 additional suffixes, exchange_calendars 4.13.2 MICs); an old quote on
+those venues can now be certified as the last session close or rejected as
+stale by the same rule the 16 original venues used. TFB_TICKET_VENUE_CAL_EXT=0
+restores the 16-venue lookup. Venues without a calendar stay uncertified.
 
 v1.26.1 (2026-10-11): integrate the optional USX FX path with the tag-driven
 settle-unresolved exclusion; unresolved rows never rank or receive funding.
@@ -1446,8 +1461,77 @@ from typing import Optional
 #   Functions added 0. Removed 0.
 #   Rollback: git revert.
 # -----------------------------------------------------------------------------
+# v1.26.2 (2026-10-19) — VENUE CALENDAR COVERAGE FOR THE LIVE GLOBAL PAGE
+# WHY: _quote_freshness_assessment can certify an old quote only as "last
+#   close" through _venue_state, and _venue_state knew 16 suffixes. The live
+#   Global_Markets roster trades on ~25 more (Render: `venue calendar
+#   unavailable for '.MX' ... '.BH'` on every scheduled sync), so for those
+#   venues an older-than-15-minute quote was ALWAYS "UNVERIFIED_PRICE: Xh
+#   old and venue calendar unavailable" even when it was exactly the
+#   venue's last close. That is a coverage gap in the precise path, not a
+#   policy choice (v1.4.1: "the fallback REMAINS the safety net — this build
+#   makes the precise path work").
+# FIX: _VENUE_CAL_EXT_MAP (39 suffixes -> MICs present in
+#   exchange_calendars 4.13.2) consulted only when _VENUE_CAL_MAP misses;
+#   _venue_cal_code() is the single lookup. Verdict logic is untouched: the
+#   newly covered venues now get the same three answers the 16 old ones get
+#   (session_open -> STALE_PRICE intraday; session_closed and quote >= close
+#   - 2 min -> "last close"; earlier -> STALE_PRICE pre-close). Venues with
+#   no calendar in 4.13.2 (.AT .NS .VN .AE .QA .BH) are left out on purpose
+#   and keep logging. Kill switch TFB_TICKET_VENUE_CAL_EXT=0 restores v1.26.1
+#   lookups exactly.
+# OFF-equivalence: every suffix in _VENUE_CAL_MAP resolves before the
+#   extension is consulted, so all v1.26.1 venues are byte-identical.
+#   Cost: one lazy exchange_calendars build per NEW venue per process
+#   (0.2-0.5 s; XKRX ~4 s, XTAE ~1.6 s, XBOM ~1.3 s), then cached.
+#   Functions added 2 (_venue_cal_ext_enabled, _venue_cal_code). Removed 0.
+#   Rollback: TFB_TICKET_VENUE_CAL_EXT=0, or git revert.
 # -----------------------------------------------------------------------------
-# v1.27.0 (2026-10-13) [TOP10 DATA-QUALITY] - three gates, all DEFAULT OFF.
+# v1.27.0 (2026-10-19) — CONVICTION-WEIGHTED SEAT SIZING (owner request)
+# WHY: _size_one gives every seat min(MaxWeight% x budget, remaining), so the
+#   live board funds the first seats at the per-seat cap and the rest with
+#   the scraps ("almost the same value" on the 19 Oct Top_10 export). The
+#   owner wants the deployable cash spread by opportunity: expected ROI with
+#   its risk, a small absolute cash buffer (the existing TFB_OPP_CASH_FLOOR_SAR
+#   + _MODE=enforce), and otherwise everything invested.
+# WHAT: gate TFB_OPP_SIZING_MODE = cap (DEFAULT) | conviction, read per call.
+#   cap        -> v1.26.2 byte-identical (no new code runs in the loop).
+#   conviction -> before the seat loop, the sizing cohort is the first
+#                 max_selected candidates the loop would consider (rank
+#                 order; replay eligibility; sector / market caps mirrored).
+#                 Each gets a conviction weight = plan ROI % (roi_pct, the
+#                 figure the Required ROI gate tests; a missing/non-positive
+#                 value counts as the required minimum) x risk multiplier
+#                 (Low 1.0, Medium 0.7, High 0.4, Unknown 0.7) x reliability
+#                 (0.5..1.0), raised to TFB_OPP_SIZING_TILT (default 1.0;
+#                 0 = equal split, 2 = aggressive; clamped 0..3). Targets are
+#                 water-filled: proportional to weight, each capped at the
+#                 per-seat cap, the cap surplus re-spread; a seat whose target
+#                 falls below the minimum ticket floor is released (lowest
+#                 weight first) and the budget re-spread. In the loop a seat
+#                 is sized as _size_one(..., min(remaining, target)) so every
+#                 existing deferral (lot, floor, sector weight, price check)
+#                 and the funding ledger apply unchanged; a released seat is
+#                 deferred with a countable reason. After the loop, the
+#                 lot-rounding remainder tops up funded seats in conviction
+#                 order, within the per-seat cap and the post-action sector
+#                 cap, through the same _size_one / _funds_from calls.
+#   meta.sizing = {mode, tilt, cohort, weights, targets, topup_sar}.
+#   ALSO (the owner's buffer): TFB_OPP_CASH_FLOOR_SAR with an EXPLICIT
+#   TFB_OPP_CASH_FLOOR_MODE=enforce and no percent floor now binds the sizing
+#   budget (v1.16.0 kept the absolute reserve out of the funding labels only;
+#   `remaining` still sized over it). SAR set with the mode unset stays
+#   byte-identical (mode off). The alert text names the absolute reserve.
+# NOT CHANGED: gates, ranking, max_selected, diversification caps, percent
+#   cash floor, funding plans, rotation, capital calls, the research stage (never
+#   sized), the frozen-snapshot replay contract, the ticket schema.
+#   Functions added: 5 (_env_sizing_mode, _env_sizing_tilt,
+#   _conviction_weight, _conviction_targets, _sizing_cohort). Removed: 0.
+#   Rollback: unset TFB_OPP_SIZING_MODE, or git revert.
+# -----------------------------------------------------------------------------
+# v1.27.1 (2026-10-13, renumbered 2026-10-19) [TOP10 DATA-QUALITY] - three
+#   gates, all DEFAULT OFF. Authored as v1.27.0 in PR #770/#778; main shipped a
+#   different v1.27.0 (conviction sizing, #797) first, so this build is 1.27.1.
 # EVIDENCE (Top_10_Investments export 2026-10-13 20:37 Riyadh = 17:37 UTC,
 #   pool 9,786, written audit 500): 481 of 500 written rows (96.2%) stop at
 #   Quote Freshness and only 2 pass every gate. By venue: 385 .US + 11 .TO
@@ -1491,8 +1575,23 @@ from typing import Optional
 #   _freshness_improve_note, _freshness_alert, _audit_keep_symbols).
 #   Removed: 0.
 # Rollback: unset the three env names; or revert.
+# MERGE NOTE (2026-10-19, main 6ebe737d): v1.26.2 (#796) shipped its own
+#   venue-calendar extension, _VENUE_CAL_EXT_MAP (39 suffixes, DEFAULT ON, kill
+#   switch TFB_TICKET_VENUE_CAL_EXT=0). 27 of the 30 suffixes in (1) above are
+#   in that map with the SAME exchange_calendars codes, so _VENUE_CAL_MAP_EXT
+#   now holds only the three v1.26.2 leaves out, read after _venue_cal_code()
+#   and only when TFB_OPP_VENUE_CAL_EXT=1: .AT -> ASEX (Athens; the code exists
+#   in exchange_calendars 4.13.2 - verified 2026-10-19 by get_calendar_names,
+#   so the v1.26.2 note that .AT has no calendar does not hold), .NS -> XBOM
+#   (NSE shares the BSE session and holiday calendar), .SZ -> XSHG (Shenzhen
+#   shares the Shanghai calendar). _venue_state resolves the suffix through
+#   _venue_suffix (v1.27.0's inline logic, moved verbatim) and the code
+#   through _venue_code = base map, then v1.26.2's extension, then these three.
+#   OFF (all three unset/0): byte-identical to v1.27.0 (#797) except the
+#   version stamp. The 'TFB_OPP_VENUE_CAL_EXT=1 certifies their latest close'
+#   hint therefore names only .AT/.NS/.SZ rows.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.0"
+OPPORTUNITY_BUILDER_VERSION = "1.27.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4509,19 +4608,58 @@ _VENUE_CAL_MAP = {
     "MI": "XMIL", "MC": "XMAD", "ST": "XSTO", "TO": "XTSE", "SW": "XSWX",
     "US": "XNYS",
 }
-# v1.27.0 [VENUE-CAL-EXT]: read only when TFB_OPP_VENUE_CAL_EXT is armed.
-# Every code exists in exchange_calendars 4.13.2 (requirements pin). .NS/.BO
-# share the XBOM session and holiday calendar; .SZ shares XSHG; .KQ shares
-# XKRX; .TWO shares XTAI. .AT is Athens (pool Market label ATHEX), not Vienna.
+# v1.26.2 (2026-10-19): venues the live Global_Markets page carries but the
+# v1.4.1 map never knew. Every scheduled sync logged
+#   [FRESHNESS v1.26.1] venue calendar unavailable for '.MX' / '.AX' / ...
+# for these suffixes (Render logs 2026-10-18 23:46 UTC and 2026-10-19 05:08
+# UTC, 25 suffixes per run), so a correct last-session close on any of them
+# could never be certified: the row stayed UNVERIFIED_PRICE whatever its
+# quote instant said. Each ISO-10383 MIC below exists in the pinned
+# exchange_calendars==4.13.2 (verified by instantiation). Venues that share a
+# session with a listed one are aliased to it (KOSDAQ->XKRX, TPEx->XTAI,
+# CSE/NEO->XTSE, TSX-V->XTSX). Suffixes with NO calendar in 4.13.2 are
+# deliberately absent (.AT Athens, .NS NSE India, .VN, .AE, .QA, .BH): they
+# keep the v1.26.1 "calendar unavailable" verdict and keep logging, which is
+# the honest answer. Kill switch: TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
+# map exactly (the extended entries are consulted only when the base map
+# misses, so every v1.26.1 venue is byte-identical either way).
+_VENUE_CAL_EXT_MAP = {
+    "MX": "XMEX", "AX": "XASX", "OL": "XOSL", "VI": "XWBO", "SI": "XSES",
+    "JK": "XIDX", "KS": "XKRX", "KQ": "XKRX", "WA": "XWAR", "TW": "XTAI",
+    "TWO": "XTAI", "HE": "XHEL", "KL": "XKLS", "BO": "XBOM", "BA": "XBUE",
+    "CO": "XCSE", "SN": "XSGO", "LS": "XLIS", "BK": "XBKK", "NZ": "XNZE",
+    "JO": "XJSE", "SA": "BVMF", "TA": "XTAE", "IR": "XDUB", "V": "XTSX",
+    "CN": "XTSE", "NE": "XTSE", "SS": "XSHG", "IC": "XICE", "PR": "XPRA",
+    "BD": "XBUD", "LM": "XLIM", "PH": "XPHS", "TL": "XTAL", "RG": "XRIS",
+    "VS": "XLIT", "CR": "XZAG", "RO": "XBSE", "PK": "XKAR",
+}
+# v1.27.1 [VENUE-CAL-EXT] (merged with v1.26.2): read only when
+# TFB_OPP_VENUE_CAL_EXT is armed, AFTER v1.26.2's map. Only the suffixes
+# v1.26.2 leaves out; every code exists in exchange_calendars 4.13.2
+# (verified by get_calendar_names, 2026-10-19). .AT is Athens (pool Market
+# label ATHEX), not Vienna; .NS shares the XBOM session and holiday
+# calendar; .SZ shares XSHG. The other 27 suffixes of the v1.27.0-as-authored
+# map are in _VENUE_CAL_EXT_MAP above with the same codes.
 _VENUE_CAL_MAP_EXT = {
-    "NS": "XBOM", "BO": "XBOM", "AX": "XASX", "JK": "XIDX", "BK": "XBKK",
-    "OL": "XOSL", "MX": "XMEX", "AT": "ASEX", "TW": "XTAI", "TWO": "XTAI",
-    "KL": "XKLS", "CO": "XCSE", "HE": "XHEL", "VI": "XWBO", "KS": "XKRX",
-    "KQ": "XKRX", "SI": "XSES", "NZ": "XNZE", "JO": "XJSE", "LS": "XLIS",
-    "IR": "XDUB", "WA": "XWAR", "SA": "BVMF", "SS": "XSHG", "SZ": "XSHG",
-    "TA": "XTAE", "PR": "XPRA", "BD": "XBUD", "IC": "XICE", "SN": "XSGO",
+    "NS": "XBOM", "AT": "ASEX", "SZ": "XSHG",
 }
 _VENUE_CAL_CACHE = {}
+
+
+def _venue_cal_ext_enabled():
+    """v1.26.2 kill switch: TFB_TICKET_VENUE_CAL_EXT=0/off/false -> base map only."""
+    v = (os.getenv("TFB_TICKET_VENUE_CAL_EXT") or "1").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+def _venue_cal_code(suffix):
+    """Suffix -> exchange_calendars code, base map first, extension second."""
+    code = _VENUE_CAL_MAP.get(suffix)
+    if code:
+        return code
+    if _venue_cal_ext_enabled():
+        return _VENUE_CAL_EXT_MAP.get(suffix)
+    return None
 _LOG = logging.getLogger("core.analysis.opportunity_builder")
 _VENUE_LAST_ERROR = {"msg": ""}
 _FRESHNESS_FALLBACK_LOGGED = set()
@@ -4542,10 +4680,12 @@ def _venue_suffix(symbol):
 
 
 def _venue_code(symbol):
-    """v1.27.0: exchange_calendars code for the symbol's venue or None. The
-    base map first; _VENUE_CAL_MAP_EXT only when TFB_OPP_VENUE_CAL_EXT=1."""
+    """v1.27.0: exchange_calendars code for the symbol's venue or None.
+    v1.27.1: the base map, then v1.26.2's extension (_venue_cal_code, kill
+    switch TFB_TICKET_VENUE_CAL_EXT), then _VENUE_CAL_MAP_EXT only when
+    TFB_OPP_VENUE_CAL_EXT=1."""
     suffix = _venue_suffix(symbol)
-    code = _VENUE_CAL_MAP.get(suffix)
+    code = _venue_cal_code(suffix)
     if not code and _env_venue_cal_ext():
         code = _VENUE_CAL_MAP_EXT.get(suffix)
     return code
@@ -4557,7 +4697,7 @@ def _venue_state(symbol, now_utc):
     failure, any exception) — an old quote then remains uncertified.
     Lazy exchange_calendars + pandas; NEVER raises."""
     try:
-        code = _venue_code(symbol)
+        code = _venue_code(symbol)      # v1.27.1: base, v1.26.2 ext, then v1.27.1 ext
         if not code:
             return None
         cal = _VENUE_CAL_CACHE.get(code)
@@ -5590,6 +5730,14 @@ def _cash_floor_pct_ctx(pf, deployable, abs_floor):
         ctx["floor_sar"] = max(ctx["abs_floor_sar"], ctx["pct_floor_sar"])
         ctx["deployable_post_sar"] = round(
             max(0.0, float(deployable) - min(cash, ctx["floor_sar"])), 0)
+    elif ctx["abs_floor_sar"] > 0.0 and _env_cash_floor_mode() == "enforce":
+        # v1.27.0: an EXPLICIT enforce makes the absolute reserve binding on
+        # the sizing budget without a percent floor. v1.16.0 only kept the
+        # reserve out of the funding labels while `remaining` still sized
+        # over it; an absolute floor with the mode unset stays exactly that.
+        ctx["mode"] = "enforce"
+        ctx["deployable_post_sar"] = round(
+            max(0.0, float(deployable) - min(cash, ctx["floor_sar"])), 0)
     _LAST_CASH_FLOOR.clear()
     _LAST_CASH_FLOOR.update(ctx)
     return ctx
@@ -5620,11 +5768,16 @@ def _cash_floor_finalize(ctx, picked):
 
 
 def _cash_floor_alert_text(ctx):
-    head = ("Cash floor %s%% of NAV %s = %s" % (
-        _fmt_num(ctx.get("pct")), _fmt_sar(ctx.get("nav_sar")),
-        _fmt_sar(ctx.get("floor_sar"))))
-    if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
-        head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
+    if ctx.get("pct") is None:
+        # v1.27.0: absolute reserve alone (TFB_OPP_CASH_FLOOR_MODE=enforce)
+        head = ("Cash floor %s (absolute reserve TFB_OPP_CASH_FLOOR_SAR; NAV %s)"
+                % (_fmt_sar(ctx.get("floor_sar")), _fmt_sar(ctx.get("nav_sar"))))
+    else:
+        head = ("Cash floor %s%% of NAV %s = %s" % (
+            _fmt_num(ctx.get("pct")), _fmt_sar(ctx.get("nav_sar")),
+            _fmt_sar(ctx.get("floor_sar"))))
+        if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
+            head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
     if ctx.get("mode") == "enforce":
         return (head + " ENFORCED: deployable %s (reserve kept out of sizing "
                 "and funding)." % _fmt_sar(ctx.get("deployable_post_sar")))
@@ -5691,6 +5844,127 @@ def _size_one(cand, criteria, budget_base, remaining):
     # book at the same price the sizing assumed. OFF: shares*price verbatim.
     suggested = shares * _sz_px
     return suggested, shares
+
+
+# v1.27.0 [CONVICTION SIZING] ---------------------------------------------------
+_SIZING_RISK_MULT = {"Low": 1.0, "Medium": 0.7, "High": 0.4}
+_LAST_SIZING: dict = {"mode": "cap"}
+
+
+def _env_sizing_mode():
+    """TFB_OPP_SIZING_MODE: cap (default; v1.26.2 byte-identical) | conviction."""
+    v = str(_env_str("TFB_OPP_SIZING_MODE", "cap") or "cap").strip().lower()
+    return "conviction" if v == "conviction" else "cap"
+
+
+def _env_sizing_tilt():
+    """TFB_OPP_SIZING_TILT: exponent on the conviction weight. 1.0 default
+    (proportional), 0 = equal split, up to 3. Invalid -> 1.0."""
+    try:
+        v = float(_env_str("TFB_OPP_SIZING_TILT", "1") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if math.isfinite(v) and 0.0 <= v <= 3.0 else 1.0
+
+
+def _conviction_weight(cand, criteria, tilt=None):
+    """PURE: plan ROI % x risk multiplier x reliability factor, tilted.
+    roi_pct is the figure the Required ROI gate tests; a missing or
+    non-positive value counts as the required minimum (never zero, so a
+    qualified seat is never silently unfunded by a data gap)."""
+    try:
+        roi = float(cand.get("roi_pct"))
+    except (TypeError, ValueError):
+        roi = float("nan")
+    if not math.isfinite(roi) or roi <= 0.0:
+        try:
+            roi = float(criteria.get("required_roi_pct") or 0.0)
+        except (TypeError, ValueError):
+            roi = 0.0
+        roi = roi if roi > 0.0 else 1.0
+    risk = _SIZING_RISK_MULT.get(str(cand.get("risk_level") or ""), 0.7)
+    try:
+        rel = float(cand.get("reliability"))
+        rel_mult = min(1.0, max(0.5, rel / 100.0)) if math.isfinite(rel) else 0.5
+    except (TypeError, ValueError):
+        rel_mult = 0.5
+    base = roi * risk * rel_mult
+    t = _env_sizing_tilt() if tilt is None else float(tilt)
+    if base <= 0.0:
+        return 0.0
+    return 1.0 if t == 0.0 else base ** t
+
+
+def _conviction_targets(weights, budget, cap_sar, floor_sar=0.0):
+    """PURE water-filling. weights: {symbol: w >= 0}. Targets are
+    proportional to weight, each at most cap_sar, with the surplus of capped
+    seats re-spread over the uncapped ones. A seat whose target would fall
+    below floor_sar is released (lowest weight first, symbol as tie-break)
+    and the budget re-spread. Returns {symbol: target_sar} for the seats
+    that keep a target; {} when nothing can be funded. Deterministic."""
+    try:
+        budget = max(0.0, float(budget or 0.0))
+        cap = max(0.0, float(cap_sar or 0.0))
+        floor = max(0.0, float(floor_sar or 0.0))
+    except (TypeError, ValueError):
+        return {}
+    active = {}
+    for sym, w in (weights or {}).items():
+        try:
+            wf = float(w)
+        except (TypeError, ValueError):
+            wf = 0.0
+        if math.isfinite(wf) and wf > 0.0:
+            active[str(sym)] = wf
+    if not active and weights:
+        active = {str(sym): 1.0 for sym in weights}     # all zero -> equal
+    if budget <= 0.0 or cap <= 0.0 or not active:
+        return {}
+    while active:
+        targets, pool, left = {}, dict(active), budget
+        for _ in range(len(active) + 1):
+            total = sum(pool.values())
+            if total <= 0.0 or left <= 0.0 or not pool:
+                break
+            capped = [sym for sym, w in pool.items() if left * w / total >= cap - 1e-9]
+            if capped:
+                for sym in capped:
+                    targets[sym] = cap
+                    pool.pop(sym, None)
+                left = budget - sum(targets.values())
+                continue
+            for sym, w in pool.items():
+                targets[sym] = left * w / total
+            break
+        below = [sym for sym, t in targets.items() if t < floor - 1e-9]
+        if not below:
+            return {sym: round(t, 2) for sym, t in targets.items() if t > 0.0}
+        active.pop(min(below, key=lambda sym: (active[sym], sym)))
+    return {}
+
+
+def _sizing_cohort(invest_cands, criteria, replay, eligible, canon_market):
+    """PURE: the seats the allocator loop will consider, in rank order:
+    replay eligibility, then the sector / market diversification caps,
+    stopping at max_selected. Mirrors the loop's cheap pre-sizing deferrals
+    so a released slot is not pre-assigned budget."""
+    out, sectors, markets = [], {}, {}
+    norm = _env_sector_normalize()
+    for cand in invest_cands:
+        if len(out) >= criteria["max_selected"]:
+            break
+        if replay and cand["symbol"].upper() not in eligible:
+            continue
+        sec, mkt = cand["sector"], cand["market"]
+        key = _market_cap_key(mkt) if canon_market else mkt
+        if sectors.get(sec, 0) >= criteria["max_per_sector"] and not (norm and sec in ("", "Unknown")):
+            continue
+        if markets.get(key, 0) >= criteria["max_per_market"]:
+            continue
+        sectors[sec] = sectors.get(sec, 0) + 1
+        markets[key] = markets.get(key, 0) + 1
+        out.append(cand)
+    return out
 
 
 _LAST_DEPLOYABLE_SPLIT = {"current": 0, "proforma": 0}
@@ -6070,6 +6344,26 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
+    # v1.27.0 [CONVICTION SIZING]: cap (default) runs none of this.
+    _sz_mode = _env_sizing_mode()
+    _sz_targets, _sz_weights, _sz_cohort = {}, {}, set()
+    _LAST_SIZING.clear()
+    _LAST_SIZING["mode"] = _sz_mode
+    if _sz_mode == "conviction" and criteria.get("board_funding_stage") != "research":
+        _sz_tilt = _env_sizing_tilt()
+        _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
+        _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
+                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+        _sz_weights = {c["symbol"]: _conviction_weight(c, criteria, _sz_tilt) for c in _sz_rows}
+        _sz_cohort = set(_sz_weights)
+        _sz_targets = _conviction_targets(_sz_weights, remaining, _sz_cap,
+                                          criteria.get("min_ticket_sar", 0.0) or 0.0)
+        _LAST_SIZING.update({"tilt": _sz_tilt, "cap_sar": round(_sz_cap, 0),
+                             "budget_sar": round(remaining, 0),
+                             "cohort": [c["symbol"] for c in _sz_rows],
+                             "weights": {k: round(v, 4) for k, v in _sz_weights.items()},
+                             "targets": {k: round(v, 0) for k, v in _sz_targets.items()},
+                             "topup_sar": 0.0})
     # v1.21.0 [PRICE-XCHECK]: per-build context, env read per call.
     _xc_mode = _env_xcheck_mode()
     _xcheck_reset(_xc_mode)
@@ -6193,7 +6487,18 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             picked.append({"cand": cand, "suggested_sar": 0,
                            "suggested_shares": 0, "funds_from": "Research — no allocation"})
             continue
-        suggested, shares = _size_one(cand, criteria, budget_base, remaining)
+        if _sz_mode == "conviction":
+            # v1.27.0: the seat's conviction target bounds its allocation;
+            # a cohort seat released by the floor rule is a countable deferral.
+            if cand["symbol"] in _sz_cohort and cand["symbol"] not in _sz_targets:
+                deferrals[cand["symbol"]] = (
+                    "Conviction sizing: weighted share below the minimum ticket floor "
+                    "\u2014 budget released to higher-conviction seats")
+                continue
+            suggested, shares = _size_one(cand, criteria, budget_base,
+                                          min(remaining, _sz_targets.get(cand["symbol"], 0.0)))
+        else:
+            suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
         # name out (allocation buys >= 1 share but < 1 lot), say so honestly
         # instead of letting it read as capital exhaustion. Inert while
@@ -6285,6 +6590,39 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                        "funds_from": funds_label})
         if issuer_dedup:
             funded_issuers[_ikey] = cand["symbol"]
+    if _sz_mode == "conviction" and not research and remaining > 0.0:
+        # v1.27.0: invest the lot-rounding remainder in conviction order,
+        # within the per-seat cap and the post-action sector cap, through
+        # the same sizing and funding calls as the seats themselves.
+        _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
+        _topup = 0.0
+        for p in sorted([x for x in picked if (x["suggested_sar"] or 0) > 0],
+                        key=lambda x: (-_sz_weights.get(x["cand"]["symbol"], 0.0), x["cand"]["symbol"])):
+            if remaining <= 0.0:
+                break
+            room = _sz_cap - p["suggested_sar"]
+            if room <= 0.0:
+                continue
+            add_sar, add_sh = _size_one(p["cand"], criteria, budget_base, min(remaining, room))
+            if add_sh <= 0 or add_sar <= 0.0:
+                continue
+            sec = p["cand"]["sector"]
+            if sector_ctx["available"]:
+                _scb_t = _sector_cap_basis()
+                post_total = (budget_base if _scb_t == "budget" else
+                              (pf["portfolio_value"] if _scb_t == "pd"
+                               else pf["portfolio_value"] + add_sar))
+                if post_total > 0 and (pf_sector_sar.get(sec, 0.0) + add_sar) / post_total * 100.0 \
+                        > criteria["pf_max_sector_pct"]:
+                    continue
+            _lbl, cash_left, proceeds_left = _funds_from(add_sar, cash_left, proceeds_left)
+            remaining -= add_sar
+            pf_sector_sar[sec] = pf_sector_sar.get(sec, 0.0) + add_sar
+            p["suggested_sar"] += add_sar
+            p["suggested_shares"] += add_sh
+            p["funds_from"] = _funds_from(p["suggested_sar"], pf["cash"], pf["proceeds"])[0]
+            _topup += add_sar
+        _LAST_SIZING["topup_sar"] = round(_topup, 0)
     _cash_floor_finalize(_cf, picked)  # v1.22.0 observe read-back
     return picked, deferrals, deployable, remaining
 
@@ -7476,6 +7814,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # armed — off keeps the payload byte-identical to v1.20.0.
     if _XCHECK_STATE.get("mode") in ("observe", "enforce"):
         meta["price_xcheck"] = dict(_XCHECK_STATE)
+    meta["sizing"] = dict(_LAST_SIZING)   # v1.27.0 (mode cap => {"mode": "cap"})
     if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     if _TIMING_STATE.get("mode") in ("observe", "enforce"):
