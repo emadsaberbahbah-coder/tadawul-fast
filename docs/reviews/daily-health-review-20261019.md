@@ -191,3 +191,43 @@ The full PR CI run on the branch is the authoritative receipt; see the PR.
 4. Twenty-three PRs are open (#772 to #795); most are default-off and each
    carries its own commit sheet. The decision layer cannot improve day over
    day while they wait, so a merge session is the highest-value hour.
+
+## 8. Midday cycle (11:00 to 13:00 Riyadh): the two decision pages
+
+Owner exports reviewed: `Portfolio_Decision` at 11:08 (4 BLOCK) and 11:25 (3 HOLD, certified), `Top_10_Investments` at 11:29.
+
+### Portfolio_Decision: BLOCK cleared the designed way
+
+The 11:08 page was BLOCK because the only IBKR capture of the day (08:41) was 2h27m old at a 14-minute limit, and
+My_Portfolio was 9h39m old at the 8-hour receipt window. The 4-hourly refresh overwrote the certified 08:45 page,
+exactly the known limit of the v1.5.12 commit sheet. Actions taken: Render `TFB_PF_RESEARCH_VIEW=enforce` (P0-6
+research view, owner-merged on 13 Oct), a fresh on-demand capture written to the evidence folder at 11:14:50
+(same read-only connector, same schema, honest producer label), owner refresh at 11:25 -> `ibkr evidence SENT
+(capture 11:14 age 10m; linked 3/3)`, three HOLD rows with stop/TP levels, `low_confidence_capped` alert (one
+TRIM capped to HOLD by `reliability ?`). Owner guidance given: `PD_IBKR_WATCH_WINDOW=always` (Script Property)
+so each capture renders within 5 minutes; D4 (daily custody tier) remains the structural fix for the 15-minute
+evidence window versus the 4-hourly refresh.
+
+### Top_10_Investments: the stopper is procedural
+
+12 names qualify on merit; `source readiness VERIFIED (run 39172358424)`; the pool reconciliation token is
+present. Sizing is withheld because `TFB Decision Feed` reads `NOT_ACTIONABLE(final_publication)` and is 536
+minutes old. The feed is downgrade-only; promotion needs `release_decision_feed.yml`, which was built on 13 Oct
+as a manual dispatch and was never dispatched. Delivered in the follow-up PR (commit sheet
+`docs/evidence/TFB_Commit_Sheet_release_decision_feed_v1.2.0_2026-10-19.md`): scheduled release attempts with
+automatic cohort discovery, and the decision chain (#788, ported) extended to re-render Top_10 after a release.
+Nothing is armed by that PR; the arming list is in the sheet.
+
+### Allocation (owner request, same PR, second commit)
+
+The export shows every sized seat at the per-seat cap (`min(15% x budget, remaining)`), so seats read as
+equal; the owner wants weights by expected ROI and risk, a small absolute cash buffer (USD 500 to 1,000) instead
+of a 10% target, and sell-to-fund rotation when cash is short. The rotation rule already exists
+(`FUNDABLE_BY_ROTATION`, engine-ROI edge >= 8 pp after 1.1% cost, one per run, sukuk excluded). Delivered as
+opportunity_builder v1.27.0 (commit sheet `docs/evidence/TFB_Commit_Sheet_opportunity_builder_v1.27.0_2026-10-19.md`):
+`TFB_OPP_SIZING_MODE=conviction` (default `cap`, byte-identical) water-fills the post-floor budget by plan ROI x
+risk x reliability under the per-seat cap and tops up the rounding remainder; and the absolute cash buffer
+(`TFB_OPP_CASH_FLOOR_SAR` with an explicit `TFB_OPP_CASH_FLOOR_MODE=enforce`) now binds the sizing budget, which
+on v1.16.0 to v1.26.2 it did not (label-only without a percent floor). Render ENV set this session:
+`TFB_OPP_CASH_FLOOR_SAR=3750`, `TFB_OPP_CASH_FLOOR_MODE=enforce`, `TFB_OPP_CASH_FLOOR_PCT=` (off); the sizing mode
+is armed only after the 1.27.0 deploy.
