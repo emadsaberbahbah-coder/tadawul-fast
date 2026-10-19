@@ -1,7 +1,15 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.4 (2026-10-20)
+ * Version: 1.2.5 (2026-10-20)
+ *   1.2.5: THREE REVIEW FINDINGS. (a) Rule exits LATCH: the first stop touch / profit-protection close since entry
+ *          recorded by the replay keeps the lot on 'SELL — rule exit <date> not acted' (EXIT_LATCHED, alerting) until
+ *          it is sold or the owner acknowledges it (menu: Acknowledge rule exit → Script Property DP2_EXIT_ACK); a
+ *          recovery before the next build never silently reverts to HOLD. (b) The holding-side 3M ROI for the
+ *          rotation is the plan-TP1 ROI (cockpit ladder, else working broker TP1), as the engine's plan3m basis —
+ *          never the My_Portfolio model forecast, which is display-only. (c) Broker orders are KNOWN only from a
+ *          dated snapshot within DP2.IBKR_TABS_STALE_H; a stale or undated snapshot = unknown (levels shown as
+ *          UNVERIFIED, no stop advisories, no protection assumed).
  *   1.2.4: FIVE REVIEW FINDINGS. (a) A rotation sells only the SHORTFALL (cash left funds the rest). (b) Exit-signal
  *          precedence: RAISE STOP / broker-unknown / NO WORKING STOP outrank TP WATCH; the TP proximity is carried in
  *          the text (out.tpWatch). (c) Conviction weights use the engine's roi_pct = valuation (TP2) upside from
@@ -106,7 +114,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.4';
+var DP2_VERSION = '1.2.5';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -170,7 +178,8 @@ var DP2X = {
   PROP_ALERTS: 'DP2_EXIT_ALERTS',
   PROP_ALERT_TO: 'DP2_EXIT_ALERT_TO',
   PROP_HISTORY_URL: 'DP2_HISTORY_URL',
-  PROP_HISTORY_KEY: 'DP2_HISTORY_KEY'
+  PROP_HISTORY_KEY: 'DP2_HISTORY_KEY',
+  PROP_EXIT_ACK: 'DP2_EXIT_ACK'      // v1.2.5: JSON { symbol: 'yyyy-MM-dd' } — rule exits acknowledged (hold by decision)
 };
 /* Research allocation + rotation (v1.2.0) — a faithful mirror of the backend's conviction-weighted seat sizing
  * (opportunity_builder v1.27.0, TFB_OPP_SIZING_MODE=conviction) and its rotation funding plans (v1.18.0+):
@@ -280,6 +289,7 @@ function dp2_addTopMenu(ui) {
     .addItem('🧭 Dynamic Exits — status', 'dp2ExitStatus')
     .addItem('✉️ Dynamic Exits — send test alert', 'dp2ExitTestAlert')
     .addItem('🔔 Dynamic Exits — alerts on/off', 'dp2ExitAlertsToggle')
+    .addItem('✅ Acknowledge rule exit (hold by decision)', 'dp2ExitAckLatched')
     .addSeparator()
     .addItem('⏱ Install hourly refresh + alerts', 'dp2InstallTrigger')
     .addItem('⏹ Remove hourly refresh', 'dp2RemoveTriggerUi')
@@ -825,7 +835,6 @@ function dp2ReadIbkr_() {
   out.tabs.orders = !!(dp2Sheet_(DP2.IB_ORDERS, false) && dp2Sheet_(DP2.IB_ORDERS, false).getLastRow() > 1);
   out.tabs.trades = !!(dp2Sheet_(DP2.IB_TRADES, false) && dp2Sheet_(DP2.IB_TRADES, false).getLastRow() > 1);
   out.tabs.nav = !!(dp2Sheet_(DP2.IB_NAV, false) && dp2Sheet_(DP2.IB_NAV, false).getLastRow() > 1);
-  out.ordersKnown = out.tabs.orders;   // an absent or empty orders tab = broker orders UNKNOWN, never 'no stop'
   if (a && a.getLastRow() > 1) { var av = a.getRange(2, 1, a.getLastRow() - 1, 2).getValues(); for (var i = 0; i < av.length; i++) { var k = dp2Str_(av[i][0]).trim(); if (k) out.account[k] = av[i][1]; } }
   var o = dp2Sheet_(DP2.IB_ORDERS, false);
   if (o && o.getLastRow() > 1) { var ov = o.getRange(2, 1, o.getLastRow() - 1, 7).getValues(); for (i = 0; i < ov.length; i++) { if (!dp2Str_(ov[i][0])) continue; out.orders.push({ symbol: dp2Str_(ov[i][0]).trim().toUpperCase(), side: dp2Str_(ov[i][1]), type: dp2Str_(ov[i][2]).toUpperCase(), qty: dp2Num_(ov[i][3]), price: dp2Num_(ov[i][4]), status: dp2Str_(ov[i][5]).toUpperCase(), placed: dp2Str_(ov[i][6]) }); } }
@@ -835,6 +844,11 @@ function dp2ReadIbkr_() {
   if (n && n.getLastRow() > 1) { var nv = n.getRange(2, 1, n.getLastRow() - 1, 2).getValues(); for (i = 0; i < nv.length; i++) { var d = nv[i][0]; var c = dp2Num_(nv[i][1]); if (d && c !== null) out.nav.push({ date: (d instanceof Date) ? Utilities.formatDate(d, DP2.TZ, 'yyyy-MM-dd') : dp2Str_(d), cps: c }); } }
   out.ageH = dp2IbkrAgeHours_(out.account['as_of']);
   out.stale = out.ageH === null ? out.tabs.account : out.ageH > DP2.IBKR_TABS_STALE_H;
+  // v1.2.5 (review finding): broker orders are KNOWN only from a dated, fresh snapshot. An absent/empty orders tab, a
+  // missing _IBKR_Account (no as_of) or a snapshot older than DP2.IBKR_TABS_STALE_H = unknown — cached NEW/SUBMITTED
+  // rows are never read as live protection.
+  out.ordersKnown = !!(out.tabs.orders && out.tabs.account && out.ageH !== null && !out.stale);
+  out.unknownWhy = !out.tabs.orders ? '_IBKR_Orders tab missing or empty' : (!out.tabs.account || out.ageH === null ? '_IBKR_Account has no as_of for the orders snapshot' : (out.stale ? 'snapshot ' + dp2Fmt_(out.ageH, 0) + ' h old (limit ' + DP2.IBKR_TABS_STALE_H + ' h) — order statuses unverified' : ''));
   return out;
 }
 /* v1.2.2 (Codex P1): broker TP / stop levels come ONLY from orders in an active status. Historical REPLACED,
@@ -1082,8 +1096,8 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
 }
 /* Signal for a held lot. x = dp2ExitCompute_ result (or null), br = { tp, stop } working broker levels (null when none), fallbackLast.
  * alert = immediate e-mail (SELL NOW); advisory = at most one e-mail per cooldown (stop near / raise / missing broker stop). */
-function dp2ExitSignal_(x, br, fallbackLast) {
-  var out = { code: 'HOLD', kind: 'navy', text: 'HOLD — trailing', alert: false, advisory: false, dist: null, last: x ? x.last : fallbackLast };
+function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
+  var out = { code: 'HOLD', kind: 'navy', text: 'HOLD — trailing', alert: false, advisory: false, dist: null, last: x ? x.last : fallbackLast, latched: null, latchedAck: false };
   if (!x) { out.code = 'ENGINE_NA'; out.kind = 'grey'; out.text = 'HOLD — exit engine n/a'; return out; }
   var last = x.last;
   out.dist = last ? (last / x.stop - 1) * 100 : null;
@@ -1101,6 +1115,18 @@ function dp2ExitSignal_(x, br, fallbackLast) {
   out.tpDist = tpDist;
   out.tpWatch = (tpDist !== null && tpDist <= DP2X.TP_WATCH_PCT);
   if (out.tpWatch && out.code !== 'TP_WATCH' && (out.code === 'RAISE_STOP' || out.code === 'NO_BROKER_STOP')) out.text += ' · TP ' + dp2Fmt_(br.tp, 2) + ' ' + dp2Pct_(tpDist, 1) + ' away';
+  // v1.2.5 (review finding): a rule exit recorded by the replay (first stop touch / first profit-protection close since
+  // entry) stays LATCHED while the lot is open — a recovery before the next build never silently reverts it to HOLD.
+  // The owner can acknowledge a dated exit (menu: Acknowledge rule exit) to hold by decision; it is then shown, not alerted.
+  var trig = null;
+  if (x.firstMom && x.firstHit) trig = x.firstMom.date <= x.firstHit.date ? x.firstMom : x.firstHit; else trig = x.firstMom || x.firstHit || null;
+  if (trig && out.code !== 'STOP_HIT' && out.code !== 'SELL_NOW') {
+    var isMom = (trig.price !== undefined);
+    var trigTxt = trig.date + ' (' + (isMom ? 'profit protection, close ' + dp2Fmt_(trig.price, 2) : 'stop ' + dp2Fmt_(trig.stop, 2) + ' touched') + ')';
+    out.latched = { date: trig.date, kind: isMom ? 'momentum' : 'stop', price: isMom ? trig.price : trig.stop, text: trigTxt };
+    if (ackDate && String(ackDate) >= trig.date) { out.latchedAck = true; out.text += ' · rule exit ' + trig.date + ' acknowledged'; }
+    else { out.code = 'EXIT_LATCHED'; out.kind = 'red'; out.alert = true; out.advisory = false; out.text = 'SELL — rule exit ' + trigTxt + ' not acted · last ' + dp2Fmt_(last, 2); }
+  }
   return out;
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
@@ -1184,12 +1210,14 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'STOP_NEAR') why = 'last ' + dp2Fmt_(x.last, 2) + ' is only ' + dp2PctPlain_(s.dist, 1) + ' above the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ATR ' + dp2Fmt_(x.atr, 2) + ')' + (it.brokerStop ? '; the fixed broker stop ' + dp2Fmt_(it.brokerStop, 2) + ' is ' + dp2Pct_((it.brokerStop / x.last - 1) * 100, 1) + ' away.' : '; no working broker stop is listed.');
   else if (s.code === 'RAISE_STOP') why = 'the trailing rule puts the stop at ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + dp2RFmt_(x.gainR) + ' at the high); the working broker stop is ' + dp2Fmt_(it.brokerStop, 2) + '.';
   else if (s.code === 'NO_BROKER_STOP') why = 'no working stop order is listed in _IBKR_Orders; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
+  else if (s.code === 'EXIT_LATCHED') why = 'the rule exited this lot on ' + s.latched.text + ' and the position is still open; the alert for that day was never acted on, and a later recovery does not reinstate the trade. Today: last ' + dp2Fmt_(x.last, 2) + ', trailing stop ' + dp2Fmt_(x.stop, 2) + '.';
   else why = s.text;
   // v1.2.3 (review finding): the action is specific to the signal code — a stop instruction only for RAISE_STOP /
   // NO_BROKER_STOP; HOLD-type codes never say "raise" to a lower level; a rotation-only mail carries the switch action.
   var action = null;
   var trailTxt = ' — or a trailing stop order, trail amount ' + (x ? dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR)' : 'n/a') + '.';
   if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ').';
+  else if (s.code === 'EXIT_LATCHED') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ') — or, to hold by decision, acknowledge the ' + s.latched.date + ' exit (📊 Decision v2 ▸ ✅ Acknowledge rule exit); the trailing stop ' + dp2Fmt_(x.stop, 2) + ' then governs and must be working at the broker.';
   else if (s.code === 'STOP_NEAR') action = 'Decide now: pre-empt at ' + dp2Fmt_(x.last, 2) + ', or let the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' decide — and make sure a broker stop at least that high is working.';
   else if (s.code === 'RAISE_STOP') action = 'Raise the IBKR stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) + trailTxt;
   else if (s.code === 'NO_BROKER_STOP') action = 'Place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop is listed)' + trailTxt;
@@ -1210,7 +1238,7 @@ function dp2ExitLine_(it, fx) {
 function dp2ExitSendMail_(items, fx, to) {
   if (!to) throw new Error('no recipient — set Script Property ' + DP2X.PROP_ALERT_TO);
   var sells = items.filter(function (it) { return it.sig.alert; });
-  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : 'SELL NOW'); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : 'raise stop'))); }).join(', ')) + ' · ' + dp2Today_();
+  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : (it.sig.code === 'EXIT_LATCHED' ? 'RULE EXIT ' + it.sig.latched.date + ' not acted' : 'SELL NOW')); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : 'raise stop'))); }).join(', ')) + ' · ' + dp2Today_();
   var text = [], html = ['<div style="font-family:Arial,sans-serif;font-size:13px;color:#14202b">', '<p><b>Decision Pages v2 ' + DP2_VERSION + '</b> · dynamic exit signals · ' + dp2Today_() + ' Riyadh</p>'];
   for (var i = 0; i < items.length; i++) {
     var L = dp2ExitLine_(items[i], fx);
@@ -1260,6 +1288,40 @@ function dp2ExitAlertsToggle() {
   var msg = 'Dynamic exit e-mail alerts are now ' + (on ? 'OFF' : 'ON') + ' (Script Property ' + DP2X.PROP_ALERTS + '). The Exit signal chips on Portfolio_Decision_v2 keep updating either way.';
   try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e2) { Logger.log(msg); }
   return !on;
+}
+/* v1.2.5: acknowledged rule exits — Script Property DP2_EXIT_ACK = JSON { 'CWBC.US': '2026-09-24' }. */
+function dp2ExitAckMap_() { var v = dp2Prop_(DP2X.PROP_EXIT_ACK); if (!v) return {}; try { var o = JSON.parse(v); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }
+function dp2ExitAckSet_(symbol, date) {
+  var m = dp2ExitAckMap_(); if (date) m[symbol] = date; else delete m[symbol];
+  try { PropertiesService.getScriptProperties().setProperty(DP2X.PROP_EXIT_ACK, JSON.stringify(m)); } catch (e) {}
+  return m;
+}
+function dp2ExitAckLatched() {
+  var ui = null; try { ui = SpreadsheetApp.getUi(); } catch (e) {}
+  var st = dp2ExitStateRead_(), latched = [], k;
+  for (k in st) { if (st.hasOwnProperty(k) && st[k].signal === 'EXIT_LATCHED') { var dm = /rule exit (\d{4}-\d{2}-\d{2})/.exec(st[k].text || ''); latched.push({ symbol: k, date: dm ? dm[1] : '' }); } }
+  var ack = dp2ExitAckMap_();
+  var cur = Object.keys(ack).map(function (s2) { return s2 + ' (' + ack[s2] + ')'; }).join(', ') || 'none';
+  if (!latched.length) {
+    var msg0 = 'No latched rule exit on the last build. Acknowledged so far: ' + cur + '. Type a symbol to clear its acknowledgement, or Cancel.';
+    if (!ui) { Logger.log(msg0); return null; }
+    var r0 = ui.prompt('Decision Pages v2 — rule exits', msg0, ui.ButtonSet.OK_CANCEL);
+    if (r0.getSelectedButton() !== ui.Button.OK) return null;
+    var c0 = dp2Str_(r0.getResponseText()).trim().toUpperCase();
+    if (c0) { dp2ExitAckSet_(c0, null); ui.alert('Decision Pages v2', 'Acknowledgement cleared for ' + c0 + '. Refresh Portfolio_Decision_v2.', ui.ButtonSet.OK); }
+    return c0 || null;
+  }
+  var list = latched.map(function (x) { return x.symbol + ' (exit ' + (x.date || 'date n/a') + ')'; }).join(', ');
+  var msg = 'Latched rule exits: ' + list + '.\nAcknowledged so far: ' + cur + '.\n\nType ONE symbol to acknowledge its exit and hold by decision (the signal becomes an advisory and the trailing stop governs). This is your decision, recorded in Script Property ' + DP2X.PROP_EXIT_ACK + '.';
+  if (!ui) { Logger.log(msg); return null; }
+  var r = ui.prompt('Decision Pages v2 — acknowledge rule exit', msg, ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return null;
+  var sym = dp2Str_(r.getResponseText()).trim().toUpperCase(); if (!sym) return null;
+  var hit = null; for (var i = 0; i < latched.length; i++) if (latched[i].symbol.toUpperCase() === sym) hit = latched[i];
+  if (!hit) { ui.alert('Decision Pages v2', sym + ' is not a latched exit on the last build.', ui.ButtonSet.OK); return null; }
+  dp2ExitAckSet_(hit.symbol, hit.date || dp2Today_());
+  ui.alert('Decision Pages v2', hit.symbol + ': rule exit ' + (hit.date || '') + ' acknowledged — refresh Portfolio_Decision_v2 to see the advisory state.', ui.ButtonSet.OK);
+  return hit.symbol;
 }
 function dp2FixtureBars_(f) { var out = []; for (var i = 0; i < f.t.length; i++) out.push({ date: f.t[i], o: f.o[i], h: f.h[i], l: f.l[i], c: f.c[i] }); return out; }
 
@@ -1475,12 +1537,19 @@ function dp2PlanText_(pl) {
   return pl.sym + ' — ' + pl.state;
 }
 /* Holdings for the rotation rule, from the ledger lots + My_Portfolio forward ROI + the working broker TP. */
-function dp2RotationHoldings_(eq, fi, ib) {
+function dp2RotationHoldings_(eq, fi, ib, qmap, seatMap) {
   var out = [], i;
   for (i = 0; i < eq.length; i++) {
     var l = eq[i], m = l.mp || {};
     var br = dp2BracketFor_(ib.orders, dp2YahooKey_(l.symbol));
-    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: br.tp, price: l.price, isFI: false });
+    var tp1 = ib.ordersKnown ? br.tp : null;
+    // v1.2.5 (review finding): the 3M figure is the PLAN-TP1 ROI, as _tp1_plan_roi on both sides of the engine's plan3m
+    // basis — the cockpit's own TP1 ladder for the held name first, the working broker TP1 second; a holding with
+    // neither has no 3M figure and never rotates on that basis. The My_Portfolio model forecast is display-only.
+    var row = (qmap && qmap[l.symbol]) || (seatMap && seatMap[l.symbol]) || null;
+    var roi3 = row ? dp2Num_(row['ROI % (TP1)']) : null, roi3Src = roi3 !== null ? 'cockpit TP1' : '';
+    if (roi3 === null && tp1 && l.price) { roi3 = (tp1 / l.price - 1) * 100; roi3Src = 'broker TP1'; }
+    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: roi3, roi3Src: roi3Src, roi3Model: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: tp1, price: l.price, isFI: false });
   }
   for (i = 0; i < fi.length; i++) out.push({ symbol: fi[i].symbol, valueSar: fi[i].mvSar || 0, roi12: null, roi3: null, holdingDays: fi[i].holdingDays, tp1: null, price: fi[i].price, isFI: true });
   return out;
@@ -1499,9 +1568,10 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   }
   var pv = 0; for (i = 0; i < led.lots.length; i++) pv += led.lots[i].mvSar || 0;
   var qmap = {}; for (i = 0; i < t.qualified.length; i++) qmap[dp2Str_(t.qualified[i]['Symbol']).trim()] = t.qualified[i];
+  var seatMap = {}; for (i = 0; i < t.seats.length; i++) seatMap[dp2Str_(t.seats[i]['Symbol']).trim()] = t.seats[i];
   var plans = dp2PlanSeats_(t, fx, xbars, qmap);
   var alloc = dp2Allocate_(plans, cashSar, pv);
-  var holdings = dp2RotationHoldings_(eq, fi, ib);
+  var holdings = dp2RotationHoldings_(eq, fi, ib, qmap, seatMap);
   alloc.holdings = holdings;
   alloc.plans12 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '12m');
   alloc.plans3 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '3m');
@@ -1652,6 +1722,7 @@ function buildPortfolioDecisionV2() {
   var actions = [];
   var limitsRows = [];
   var workingBrackets = 0, xFresh = 0, xTotal = 0, xSources = {}, xBarsAsOf = '';
+  var exitAck = dp2ExitAckMap_();   // v1.2.5: acknowledged rule exits { symbol: 'yyyy-MM-dd' }
   for (i = 0; i < eq.length; i++) {
     var l = eq[i], m2 = l.mp || {};
     var key = dp2YahooKey_(l.symbol);
@@ -1666,10 +1737,11 @@ function buildPortfolioDecisionV2() {
     if (xb && !xb.stale && x) xFresh++;
     if (xb && xb.source) xSources[xb.source] = true;
     if (x && x.lastDate > xBarsAsOf) xBarsAsOf = x.lastDate;
-    var brokerWorking = br.active > 0;
-    var brokerStop = br.stop;   // active-status orders only (v1.2.2)
-    var brokerTp = br.tp;
-    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price);
+    var brokerWorking = ib.ordersKnown && br.active > 0;
+    var brokerStop = ib.ordersKnown ? br.stop : null;   // active-status orders only (v1.2.2), from a fresh dated snapshot only (v1.2.5)
+    var brokerTp = ib.ordersKnown ? br.tp : null;
+    var ackDate = exitAck[l.symbol] || null;
+    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price, ackDate);
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
     var stopEff = x ? x.stop : brokerStop;
@@ -1680,15 +1752,18 @@ function buildPortfolioDecisionV2() {
     var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
                    : ('no price history' + (xb && xb.error ? ' — ' + dp2Str_(xb.error).slice(0, 90) : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
     var ostat;
-    if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
+    if (!ib.ordersKnown && br.n > 0) { ostat = 'UNVERIFIED — ' + ib.unknownWhy + ' · last listed: ' + br.statuses.join(', ') + ' → paste a fresh connector read'; }
+    else if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
     else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.lastTp, 2) + ' / ' + dp2Fmt_(br.lastStop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
     else if (br.state === 'inactive') { ostat = 'no active sell order — ' + br.n + ' listed (' + br.statuses.join(', ') + ') → verify at the broker'; actions.push({ p: 1, t: l.symbol + ': every sell order in _IBKR_Orders is ' + br.statuses.join(' / ') + ' — nothing active protects ' + dp2Fmt_(l.mvSar) + ' SAR' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '. Verify at the broker.' }); }
-    else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — _IBKR_Orders tab missing or empty (🌱 Seed IBKR Tabs, or paste the connector read)'; }
+    else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — ' + ib.unknownWhy + ' (🌱 Seed IBKR Tabs, or paste the connector read)'; }
     else { ostat = 'partial — ' + (brokerStop ? 'stop working, no take-profit' : 'take-profit working, NO STOP') + ' (' + br.active + ' active of ' + br.n + ')'; }
     // actions from the exit signal
     var item = { symbol: l.symbol, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
     exitItems.push(item);
-    if (sig.code === 'STOP_HIT' || sig.code === 'SELL_NOW') {
+    if (sig.code === 'EXIT_LATCHED') {
+      actions.push({ p: 0, t: 'SELL ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh) — rule exit ' + sig.latched.text + ' was never acted on; the lot is outside the rule. Unrealized ' + dp2Signed_((last - cost) * l.shares * lfx) + ' SAR now. Sell, or acknowledge the exit (📊 Decision v2 ▸ ✅ Acknowledge rule exit) to hold by decision under the trailing stop ' + (x ? dp2Fmt_(x.stop, 2) : '—') + '. No order was placed by this page — act at the broker.' });
+    } else if (sig.code === 'STOP_HIT' || sig.code === 'SELL_NOW') {
       actions.push({ p: 0, t: 'SELL NOW ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitLine_(item, fx).why + ' Unrealized ' + dp2Signed_((last - cost) * l.shares * lfx) + ' SAR now' + (brokerStop ? ' vs ' + dp2Signed_((brokerStop - cost) * l.shares * lfx) + ' SAR if the fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is left to fill' : '') + '. No order was placed by this page — act at the broker.' });
     } else if (sig.code === 'STOP_NEAR') {
       actions.push({ p: 1, t: l.symbol + ' is ' + dp2PctPlain_(sig.dist, 1) + ' above its dynamic stop ' + dp2Fmt_(x.stop, 2) + ' — a print at or below it is a SELL NOW; decide now whether to pre-empt at ' + dp2Fmt_(last, 2) + (brokerStop ? ' (fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is ' + dp2Pct_((brokerStop / last - 1) * 100, 1) + ' away)' : '') + '.' });
@@ -1714,7 +1789,7 @@ function buildPortfolioDecisionV2() {
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
     sigKinds.push(sig.kind);
-    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : ''))), dynTxt, engTxt, ostat, decision]);
+    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
   for (i = 0; i < fi.length; i++) {
     var f = fi[i];
@@ -2024,8 +2099,8 @@ function buildTop10V2() {
     for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis: ' + dp2PlanText_(alloc.plans12[i]));
     for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis: ' + dp2PlanText_(alloc.plans3[i]));
     if (!alloc.needs.length) pLines.push('All plans fundable from cash — no rotation needed today.' + (alloc.rotation12 || alloc.rotation3 ? '' : ''));
-    var holdTxt = alloc.holdings.filter(function (h) { return !h.isFI; }).map(function (h) { return h.symbol + ' fwd 12M ' + dp2PctPlain_(h.roi12, 1) + ' · 3M ' + dp2PctPlain_(h.roi3, 1) + ' · ' + dp2Fmt_(h.valueSar) + ' SAR · ' + (h.holdingDays !== null ? h.holdingDays + ' d' : '—'); }).join('\n');
-    pLines.push('Holdings (forward ROI from My_Portfolio):\n' + (holdTxt || 'none'));
+    var holdTxt = alloc.holdings.filter(function (h) { return !h.isFI; }).map(function (h) { return h.symbol + ' fwd 12M ' + dp2PctPlain_(h.roi12, 1) + ' · 3M plan ' + (h.roi3 !== null ? dp2PctPlain_(h.roi3, 1) + ' (' + h.roi3Src + ')' : 'n/a — no TP1 ladder, never rotates on 3M') + (h.roi3Model !== null ? ' · model 3M ' + dp2PctPlain_(h.roi3Model, 1) : '') + ' · ' + dp2Fmt_(h.valueSar) + ' SAR · ' + (h.holdingDays !== null ? h.holdingDays + ' d' : '—'); }).join('\n');
+    pLines.push('Holdings (12M = My_Portfolio engine forecast · 3M = plan-TP1 ROI, as the engine; the model 3M is shown, not used):\n' + (holdTxt || 'none'));
     var pRng = dp2Range_(sh, aTop, 9, 16, Math.max(aRows.length, 6)).merge();
     pRng.setValue(pLines.join('\n')).setWrap(true).setVerticalAlignment('top').setFontSize(9).setBackground(DP2C.surface).setBorder(true, true, true, true, false, false, DP2C.border, SpreadsheetApp.BorderStyle.SOLID);
     for (i = 0; i < Math.max(aRows.length, 6); i++) sh.setRowHeight(aTop + i, 24);
