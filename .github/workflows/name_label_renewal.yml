@@ -1,0 +1,105 @@
+# =============================================================================
+# Verified Name Label Renewal - .github/workflows/name_label_renewal.yml
+# =============================================================================
+# VERSION 1.0.0 (2026-10-20) -- NEW WORKFLOW
+#
+# WHY: data/verified_name_labels.json captions expire seven days after review.
+# On 19 Oct the 39 Mutual_Funds captions expired at 12:31 UTC and the 18:44 UTC
+# Advanced Sync (#4945) failed the coverage audit on the Mutual_Funds Name floor
+# (97.98% < 99%), adding coverage_failed to the decision-feed blockers. 67
+# Global_Markets captions expire on 21 Oct 07:44 UTC. Nothing renewed them.
+# WHAT: two jobs, both read-only towards the workbook and the repository.
+#   check  (schedule + dispatch, no network): fails RED when any binding
+#          expires within 48 h, so the cliff is visible two days ahead.
+#   renew  (dispatch only): scripts/renew_verified_name_labels.py re-captures
+#          every public source, re-checks each caption, validates the output
+#          with the production loader and uploads the renewed registry and its
+#          report as an artifact. It never pushes; the renewed file reaches
+#          main only through a reviewed PR.
+# sec.gov refuses requests without a declared contact User-Agent; set the
+# repository variable TFB_SEC_USER_AGENT (e.g. "Name contact@example.com").
+# Without it every binding that cites sec.gov is held, never guessed.
+# =============================================================================
+name: Verified Name Label Renewal
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check (expiry window only) | renew (re-capture sources, upload renewed registry)"
+        required: true
+        default: "renew"
+        type: choice
+        options: [check, renew]
+  schedule:
+    - cron: "15 4 * * *"   # 07:15 Riyadh, daily expiry check
+
+concurrency:
+  group: tfb-name-label-renewal
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  name-label-renewal:
+    name: Name label ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      MODE: ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
+      TFB_SEC_USER_AGENT: ${{ vars.TFB_SEC_USER_AGENT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run
+        run: |
+          set -uo pipefail
+          code=0
+          if [[ "$MODE" == "check" ]]; then
+            python scripts/renew_verified_name_labels.py --check --report renewal_report.json || code=$?
+          else
+            if [[ -z "${TFB_SEC_USER_AGENT// }" ]]; then
+              echo "::warning::vars.TFB_SEC_USER_AGENT is not set; bindings citing sec.gov will be held."
+            fi
+            python scripts/renew_verified_name_labels.py \
+              --out renewed_verified_name_labels.json \
+              --report renewal_report.json || code=$?
+          fi
+          {
+            echo "## Verified name labels ($MODE)"
+            echo
+            echo '```json'
+            head -c 6000 renewal_report.json 2>/dev/null || echo '{}'
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$code" -eq 1 && "$MODE" == "renew" ]]; then
+            echo "::warning::Some bindings were held; see the report. The renewed file still contains them unchanged."
+            code=0
+          fi
+          exit "$code"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: name-label-renewal-${{ github.run_id }}
+          path: |
+            renewal_report.json
+            renewed_verified_name_labels.json
+          retention-days: 14
+          if-no-files-found: warn
