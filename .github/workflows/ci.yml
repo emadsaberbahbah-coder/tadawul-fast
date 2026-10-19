@@ -2,6 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.21 (2026-10-19) -- BACKUP RESUME + VENUE CALENDAR COVERAGE
+#
+# v1.1.21: run tests/test_backup_upload_resume.py (backup_workbook v1.5.1:
+# the Drive/GCS resumable upload resumes after a transport fault instead of
+# losing the day's backup, as run #102 did) and tests/test_venue_calendar_ext.py
+# (opportunity_builder v1.26.2: the venue-calendar lookup behind executable
+# quote freshness covers the live Global_Markets venues; TFB_TICKET_VENUE_CAL_EXT=0
+# restores the 16-venue lookup) in the blocking lean lane.
+#
 # VERSION 1.1.20 (2026-10-14) -- TOP-10 KPI LABEL COMPATIBILITY
 #
 # v1.1.20: run the acceptance/digest KPI-reader regressions in the blocking
@@ -653,7 +662,9 @@ jobs:
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
-            tests/test_ycp_loopguard_b6.py $EXTRA
+            tests/test_ycp_loopguard_b6.py \
+            tests/test_backup_upload_resume.py \
+            tests/test_venue_calendar_ext.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions

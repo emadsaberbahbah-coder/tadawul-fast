@@ -89,7 +89,41 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
+# v1.5.1 (2026-10-19) — RESUMABLE UPLOAD ACTUALLY RESUMES.
+# WHY, from a real failed run (Actions #102, 2026-10-19 01:25 UTC): the export
+# SUCCEEDED (24,273,892 bytes, sha 9e92d34e1a73) and the single 24 MB PUT to
+# the resumable session then died mid-stream with
+#   SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol'))
+# -> exit 3, no backup for the day, and the generic hint "is the folder
+# shared EDITOR" pointed at permissions although nothing was wrong with
+# them. Both drive_upload_resumable and gcs_upload_resumable opened a
+# resumable session and then used NONE of its properties: one PUT, no
+# status query, no retry. A transport blip anywhere in the ~20 s transfer
+# lost the whole day. The file grows every week (18.5 MB in July, 23.1 MB on
+# 14 Oct, 24.3 MB now), so the window only widens.
+# FIX: ONE additive helper, _resumable_put_with_resume(), used by both
+# backends. On a transport fault (ConnectionError incl. SSLError, Timeout,
+# ChunkedEncodingError) or a transient status (408/429/5xx) it sleeps with
+# bounded backoff, asks the session where it stopped (PUT with
+# `Content-Range: bytes */N`, empty body -> 308 + `Range: bytes=0-K`, or
+# 200/201 when the server in fact already has everything), and re-sends ONLY
+# the bytes after K with the matching Content-Range. A 308 answer to a data
+# PUT is treated the same way without sleeping. Attempts are bounded by
+# TFB_BACKUP_UPLOAD_RETRIES (default 4; the first send counts as attempt 1);
+# the last fault is re-raised unchanged, so the v1.2.0 diagnosis path
+# (_api_reason, 403/404 remedies) sees exactly the exception it saw before.
+# A definite 4xx (401/403/404/412...) is NOT retried: raise_for_status()
+# raises the same HTTPError as v1.5.0 on the first answer.
+# OFF-equivalence: a clean single PUT that answers 200/201 takes the same
+# code path as v1.5.0 (one POST, one PUT, same headers, same JSON return).
+# Nothing else changed: export, min-bytes check, local copy, retention,
+# _Run_Log rows, exit codes. Each retry logs one stderr line
+# `upload retry k/N after <error> -> resuming at byte <K>` (no credentials,
+# no URL: the session URL carries an upload_id and is never printed).
+# ROLLBACK: revert this file; or TFB_BACKUP_UPLOAD_RETRIES=1 disables every
+# retry while keeping the 308 handling (which only ever follows the server).
+#
 # v1.5.0 (2026-10-11) [WP-0] — ENV-GATED LOCAL COPY OF THE EXPORTED BYTES.
 # WHY: the WP-0 DQ harness (scripts/tfb_workbook_dq_audit.py) must measure
 # the SAME bytes this job just exported, in the SAME job, without a second
@@ -579,10 +613,124 @@ def drive_upload_resumable(sess, folder_id: str, name: str,
     loc = r.headers.get("Location")
     if not loc:
         raise RuntimeError("resumable upload: no session Location header")
-    r2 = sess.put(loc, data=data,
-                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
-    r2.raise_for_status()
-    return r2.json()
+    return _resumable_put_with_resume(sess, loc, data)     # v1.5.1
+
+
+# --------------------------------------------------------------------------- #
+# v1.5.1 resumable PUT that honours the resumable protocol (Drive AND GCS)   #
+# --------------------------------------------------------------------------- #
+_UPLOAD_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+_UPLOAD_PUT_TIMEOUT = 600
+
+
+def _upload_retry_attempts() -> int:
+    """Total send attempts (first send included). Default 4; floor 1."""
+    return _env_int("TFB_BACKUP_UPLOAD_RETRIES", 4)
+
+
+def _upload_backoff_s(attempt: int) -> float:
+    """2s, 4s, 8s, ... capped at 30s; attempt is 1-based (the one that failed)."""
+    return float(min(2 ** attempt, 30))
+
+
+def _transport_exception_types() -> Tuple[type, ...]:
+    """requests' transport faults (SSLError is a ConnectionError subclass).
+    HTTPError is deliberately NOT in this tuple: a definite 4xx is final."""
+    try:
+        from requests import exceptions as _rx
+        return (_rx.ConnectionError, _rx.Timeout, _rx.ChunkedEncodingError)
+    except Exception:  # pragma: no cover — requests is always present here
+        return (ConnectionError, TimeoutError)
+
+
+def _parse_range_end(range_header: Optional[str]) -> int:
+    """`Range: bytes=0-1048575` -> 1048575. Absent/malformed -> -1
+    (nothing persisted yet, resume from byte 0)."""
+    m = re.match(r"^\s*bytes=(\d+)-(\d+)\s*$", str(range_header or ""))
+    if not m:
+        return -1
+    return int(m.group(2))
+
+
+def _resumable_status(sess, loc: str, total: int) -> Tuple[Optional[Any], int]:
+    """Ask the session how much it holds. Returns (completed_json | None,
+    next_offset). 200/201 means the server already finished -> json is the
+    final resource. 308 -> next_offset = last persisted byte + 1. Any other
+    answer raises exactly as the data PUT would (raise_for_status())."""
+    r = sess.put(loc, data=b"",
+                 headers={"Content-Range": f"bytes */{total}"},
+                 timeout=60)
+    if r.status_code in (200, 201):
+        return r.json(), total
+    if r.status_code == 308:
+        return None, _parse_range_end(r.headers.get("Range")) + 1
+    r.raise_for_status()
+    raise RuntimeError(f"resumable status: unexpected HTTP {r.status_code}")
+
+
+def _resumable_put_with_resume(sess, loc: str, data: bytes,
+                               mime: str = _XLSX_MIME,
+                               attempts: Optional[int] = None,
+                               sleep=time.sleep) -> Dict[str, Any]:
+    """PUT `data` to resumable session `loc`, resuming from the server's
+    last persisted byte after a transport fault or transient status.
+    Clean path == v1.5.0: one PUT, same headers, `.json()` of the 200/201."""
+    total = len(data)
+    max_attempts = max(1, int(attempts if attempts is not None
+                              else _upload_retry_attempts()))
+    transport = _transport_exception_types()
+    offset = 0
+    attempt = 0
+    while True:
+        attempt += 1
+        headers = {"Content-Type": mime}
+        body = data
+        if offset > 0:
+            headers["Content-Range"] = f"bytes {offset}-{total - 1}/{total}"
+            body = data[offset:]
+        fault: str = ""
+        try:
+            r = sess.put(loc, data=body, headers=headers,
+                         timeout=_UPLOAD_PUT_TIMEOUT)
+            if r.status_code in (200, 201):
+                return r.json()
+            if r.status_code == 308:
+                # Server persisted a prefix and wants the rest: follow it,
+                # no sleep, and do not count it as a failed attempt.
+                offset = _parse_range_end(r.headers.get("Range")) + 1
+                attempt -= 1
+                continue
+            if r.status_code in _UPLOAD_TRANSIENT_STATUS:
+                fault = f"HTTP {r.status_code}"
+            else:
+                r.raise_for_status()          # definite 4xx -> same HTTPError as v1.5.0
+                raise RuntimeError(
+                    f"resumable upload: unexpected HTTP {r.status_code}")
+        except transport as e:  # noqa: PERF203
+            fault = f"{type(e).__name__}: {str(e)[:160]}"
+            if attempt >= max_attempts:
+                raise
+        if attempt >= max_attempts:
+            raise RuntimeError(f"resumable upload: {fault} after "
+                               f"{attempt} attempt(s)")
+        sleep(_upload_backoff_s(attempt))
+        try:
+            done, offset = _resumable_status(sess, loc, total)
+        except transport as e_st:
+            # The status probe itself hit the same fault: keep the last
+            # known offset (a re-sent prefix is harmless to the protocol)
+            # and let the next data PUT spend the next attempt.
+            _out(f"upload retry {attempt}/{max_attempts} after {fault} -> "
+                 f"status probe failed ({type(e_st).__name__}); "
+                 f"re-sending from byte {offset:,}")
+            continue
+        if done is not None:
+            _out(f"upload retry {attempt}/{max_attempts} after {fault} -> "
+                 f"server already holds all {total:,} bytes")
+            return done
+        offset = max(0, min(int(offset), total))
+        _out(f"upload retry {attempt}/{max_attempts} after {fault} -> "
+             f"resuming at byte {offset:,} of {total:,}")
 
 
 def drive_copy(sess, file_id: str, folder_id: str, new_name: str
@@ -669,10 +817,7 @@ def gcs_upload_resumable(sess, bucket: str, name: str,
     loc = r.headers.get("Location")
     if not loc:
         raise RuntimeError("gcs resumable upload: no session Location header")
-    r2 = sess.put(loc, data=data,
-                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
-    r2.raise_for_status()
-    j = r2.json()
+    j = _resumable_put_with_resume(sess, loc, data)        # v1.5.1
     full = j.get("name", obj)
     return {"id": full, "name": full.rsplit("/", 1)[-1]}
 
