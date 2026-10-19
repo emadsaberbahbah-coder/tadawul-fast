@@ -29,6 +29,9 @@ Pinned here:
       are listed
   H10 the canned identity self-test still passes 9/9
   H11 version and manifest pin
+  H12 scripts/repair_stores.py v1.0.1 B1 gives the same verdict as the sync
+      on every fixture, gate on and off (a manual apply run must not blank
+      the rows the sync now publishes)
 
 Run: pytest -q tests/test_sync_hk_reporting_fx.py
 """
@@ -43,6 +46,7 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from scripts import repair_stores as repair  # noqa: E402
 from scripts import run_dashboard_sync as sync  # noqa: E402
 
 GATE = "TFB_SYNC_COH_HK_REPORTING_FX"
@@ -203,6 +207,36 @@ def test_h11_version_and_manifest_pin():
     assert '("run_dashboard_sync", "6.70.0", "dashboard sync")' in src
     ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "tests/test_sync_hk_reporting_fx.py" in ci
+
+
+# --- H12 ---------------------------------------------------------------------
+
+ALL_FIXTURES = (HSHARE, USD_REPORTER, NON_HK, HK_BROKEN_HI, HK_BROKEN_LO, GBX, HEALTHY, POISONED)
+
+
+@pytest.mark.parametrize("gate", [None, "0"])
+def test_h12_repair_tool_agrees_with_the_sync(monkeypatch, gate):
+    if gate is not None:
+        monkeypatch.setenv(GATE, gate)
+    _, stripped = _fw2(list(ALL_FIXTURES))
+    broken = [r[0] for r in ALL_FIXTURES
+              if repair._row_identity_broken(r[PI], r[EI], r[QI], r[0])]
+    assert broken == stripped
+    if gate is None:
+        assert broken == ["XYZ.AX", "0386.HK", "0857.HK", "GOOG"]
+    else:
+        assert "1398.HK" in broken and "0005.HK" in broken
+
+
+def test_h12b_repair_tool_mirrors_bands_and_version(monkeypatch):
+    assert repair.TOOL_VERSION == "1.0.1"
+    assert repair._COH_HK_CNY_BAND_DEFAULT == sync._COH_HK_CNY_BAND_DEFAULT
+    assert repair._COH_HK_USD_BAND_DEFAULT == sync._COH_HK_USD_BAND_DEFAULT
+    assert repair._COH_REL_TOL == sync._COH_REL_TOL
+    # no symbol: the v1.0.0 decision (only the GBX band)
+    assert repair._row_identity_broken(HSHARE[PI], HSHARE[EI], HSHARE[QI]) is True
+    monkeypatch.setenv(CNY_BAND, "1.00,1.05")
+    assert repair._row_identity_broken(HSHARE[PI], HSHARE[EI], HSHARE[QI], "1398.HK") is True
 
 
 if __name__ == "__main__":   # pragma: no cover
