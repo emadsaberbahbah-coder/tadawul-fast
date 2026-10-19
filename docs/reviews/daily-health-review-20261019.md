@@ -231,3 +231,88 @@ risk x reliability under the per-seat cap and tops up the rounding remainder; an
 on v1.16.0 to v1.26.2 it did not (label-only without a percent floor). Render ENV set this session:
 `TFB_OPP_CASH_FLOOR_SAR=3750`, `TFB_OPP_CASH_FLOOR_MODE=enforce`, `TFB_OPP_CASH_FLOOR_PCT=` (off); the sizing mode
 is armed only after the 1.27.0 deploy.
+
+## 9. Apps Script review (owner request, 12:30 Riyadh)
+
+Scope: the six files the repository mirrors (`apps_script/10_My_Portfolio.gs` 1.5.13, `11_Manual_Refresh_Coordinator.gs` 1.1.0,
+`16_Decision_Top10.gs` 1.13.9, `24_Sync_Dispatch.gs` 1.1.0, `26_Decision_Chain.gs` 1.0.1) against today's backend
+changes and the live page exports. The live project holds about 25 files (names seen in commit sheets: `00_Config`,
+`01_Menu`, `03_Schema`, `05_Refresh`, `06_Market_Leaders` to `09_Mutual_Funds`, `11_SpecialPages`, `13_AutoRefresh`,
+`14_Portfolio_PnL`, `15_Lists_Config`, `17_Selection_Log`, `18_Decision_Diagnostics`, `21_Portfolio_Ledger`,
+`23_Refresh_Chain`, `25_Trade_Notes`, `25_Divergence_Log`, `99_Diag`, `99_Data_Audit`, `_base`). Those are not in the
+repository and cannot be reviewed from here. The mirrored code calls nine helpers that exist only in those files
+(`getAppToken_`, `getBackendUrl_`, `getMappedHeaderCoverage_`, `getWorkingSymbolsForPage_`, `readCostBasisMap_`,
+`refreshPageInBatches_`, `refreshPage_`, `refreshSelectedRow_`, `writePageStatus_`), so the mirror is a partial one by
+design; a full `clasp push` from it would delete the rest (14 Oct review, blocker 5).
+
+### Verdicts
+
+| Item | Verdict |
+| --- | --- |
+| All native harnesses on the mirror (`tests/js/*.test.js`) | green: syntax 5/5, board funding 64, decision chain 17/17, input truth 20 (+3 dual-tree skips), source readiness 73, feed cohort binding 21/21, IBKR evidence 14/14, source receipt 8/8, reconciliation inputs 20 |
+| Installed versions, read from the page exports | `16_Decision_Top10` is 1.13.9 or later (`Entered cash (SAR)` KPI label, `pool_reconciliation_v1` token present); `10_My_Portfolio` is 1.5.12 or later (`ibkr evidence SENT`, receipt line present; 1.5.13 is indistinguishable from the export). `11` and `24` cannot be read from the exports. |
+| Compatibility with opportunity_builder 1.27.0 (`meta.sizing`, conviction tickets) | no change needed: the cockpit renders ticket fields from the payload and never assumes equal sizes; `meta.sizing` is an additive key it ignores |
+| Compatibility with the binding absolute cash floor | no change needed: the cockpit passes `cash_floor` alerts through by type (`dt10BoardFundingAlert_`, line 2342) and copies `meta.cash_floor`; it does not parse the alert text, whose wording changed for the absolute case |
+| Compatibility with the scheduled release (release grammar, 480-minute clock) | no change needed: `dt10UvParse_` is the parser the Python harness proves parity against; `DT10_UV_MAX_AGE_MIN` 480 equals `RELEASE_TTL_MIN` |
+| Compatibility with `TFB_PF_RESEARCH_VIEW=enforce` | no change needed: Portfolio_Decision renders `action_reason` / `advisor_note` verbatim, so the research verdict text appears in the note |
+
+### Required updates (owner, Apps Script editor)
+
+1. **Install `26_Decision_Chain` v1.0.1** (new file from #797), run `tfbInstallDecisionChain`, set `TFB_DECISION_CHAIN=observe`,
+   then `on` after one sync shows `OBSERVE` rows. This is the file that makes the release automation visible on the board.
+2. **Script Property `DT10_FEED_COHORT_BIND=on`** (prerequisite 2 of the release; the code is already installed in 1.13.8+).
+3. **Script Property `PD_IBKR_WATCH_WINDOW=always`** so every capture renders within 5 minutes (given earlier today).
+4. **Paste discipline**: the three pending Apps Script PRs conflict with each other and with `main` on the same files:
+   #780 (`10_My_Portfolio` 1.5.14, panel inputs survive a layout rebuild), #782 (`24_Sync_Dispatch` 1.2.0, loud trigger
+   failures, a precondition for arming the dispatcher), #791 and #792 (codex, 17 Oct: both edit `10_My_Portfolio` and
+   `16_Decision_Top10`; #792 also carries a different 679-line `26_Decision_Chain`). Since #797 merged the #788 chain,
+   #792's chain file is superseded; merge #780 and #782 first, then rebase or close #791/#792 against them.
+
+### Data-quality finding that is not a script defect
+
+Both Portfolio_Decision exports show `Rel` and `DQ` blank for all three US holdings and the backend writes
+`Reliability ? below add minimum 70` and `Low confidence (reliability ?) capped TRIM -> HOLD`. The script sends
+`Forecast Reliability Score` and `Data Quality Score` only when the My_Portfolio header resolves
+(`PD_HOLDING_FIELDS`, exact header names, `pdSelfTest` reports `hasForecastReliability`). Global_Markets carries
+reliability 71.5 and DQ 100 for the same DDI.US row, so the value exists in the engine. Until My_Portfolio carries it,
+no holding can reach ADD and every TRIM is capped to HOLD. Owner check: `pdSelfTest` line for the two headers, then the
+two cells for DDI.US / CWBC.US / KRP.US on My_Portfolio. If the headers resolve and the cells are blank, the gap is in
+the sync's My_Portfolio leg (backend), and that is the next thing to fix in Python, not in Apps Script.
+
+### Recommendation on the mirror
+
+Export the whole bound project into `apps_script/` (every file, verbatim) in one docs-only PR, so the next review can
+cover the 19 unmirrored files and the syntax harness compiles all of them. Nothing in that export runs from GitHub.
+
+## 10. Afternoon cycle (12:40 to 13:40 Riyadh): why My_Portfolio reached the cockpit without reliability
+
+Section 9 left one open question: are the `Forecast Reliability Score` / `Data Quality Score` cells blank on
+My_Portfolio, and if so where in the Python side do they go missing. Answered without the owner's check, from three
+artifacts and two offline reproductions (details and the audit table in
+`docs/evidence/TFB_Commit_Sheet_enriched_quote_v8.6.0_2026-10-19.md`).
+
+| Step | Evidence | Reading |
+| --- | --- | --- |
+| Sync run #4918, core-pages job | `[DECISION-RECONCILE] page=My_Portfolio ... rows=4 changed=3 distinct=[('ACCUMULATE', ''), ('BUY', ''), ('HOLD', '')]` | `Final Action` blank on 4/4 rows; three buy-family rows demoted to WATCH / HOLD because the Block Reason cell read `"None"` (the response carried `None`, a gate that ran writes `""`) |
+| DQ audit artifact of 17 Oct | DQ-51 `weight_basis` FAIL 4/4 blank weights; DQ-34 0 My_Portfolio rows | the portfolio pass (`_compute_portfolio_fields`) never ran on the rows the sheet received |
+| Render request log | one `POST /v1/enriched/sheet-rows 200` for the page; the four market pages use `/v1/analysis/sheet-rows` | only My_Portfolio takes the enriched route |
+| Offline engine reproduction | `get_sheet_rows("My_Portfolio")` with a fake sheet reader and fake quotes, default guards and the production `[GUARDS]` line | all eight gate columns populated: the engine path is sound |
+| Offline route reproduction | `inspect.signature(_analysis_sheet_rows_impl).bind(**attempt)` for the eight bridge attempts | `TypeError` on all eight (missing `x_api_key`, then `include_matrix_q` / `mode` / `request`): the enriched route's bridge never bound and every request fell silently to the engine-direct path, which skips `_strict_project_row` and therefore the investability gate |
+
+So the cockpit's `reliability ?` is a route defect, not a sheet or Apps Script defect: My_Portfolio has been written
+from ungated engine-direct rows on every sync (and, if the 07:40 Apps Script refresh uses the same endpoint, on every
+auto-refresh) at least since the analysis implementation gained its ninth parameter on 6 Oct (#719).
+
+**Built:** `routes/enriched_quote.py` v8.6.0. The bridge binds the implementation's own signature (attempt 0; a typed
+mismatch now logs a WARNING instead of falling through silently), and the engine-direct fallback publishes each row
+through the engine's publication boundary so even a bridge timeout yields gated decision columns. Both default ON with
+kill switches (`TFB_ENRICHED_BRIDGE_SIGBIND`, `TFB_ENRICHED_FALLBACK_BOUNDARY`). Tests
+`tests/test_enriched_bridge_binding.py` B1-B10 (10 passed), the route neighbours green after the W15 pin move, ci.yml
+1.1.24 enrols the suite in the schema-alignment step.
+
+**Also fixed:** the lean-lane flake on this PR's push run (`test_off_explicit_zero_equals_unset`, `age_min` 4.3 vs 4.4
+between two builds seconds apart): the identity comparison now scrubs that clock-derived field.
+
+**Owner, after merge and the Render deploy of `main`:** read-back list in the commit sheet (the reconcile log line with
+real action tokens, `Rel` / `DQ` numbers on Portfolio_Decision, no `bridge typed mismatch` line in Render, DQ-51 passing
+on the next backup audit, and one look at which endpoint the 07:40 Apps Script refresh uses).

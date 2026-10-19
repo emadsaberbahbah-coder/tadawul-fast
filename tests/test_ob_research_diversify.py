@@ -112,9 +112,26 @@ def _funded(payload):
     return [(t["symbol"], t["suggested_sar"]) for t in payload["selected"]]
 
 
+def _scrub_clock_fields(node):
+    """Remove wall-clock derived leaves wherever they sit. The quote-freshness
+    detail carries age_min = minutes since the quote instant rounded to 0.1,
+    so two builds a few seconds apart can read 4.3 and 4.4 (the CI failure on
+    2026-10-19, run 39230946600, a docs-only push): the field is not part of
+    the identity these tests pin."""
+    if isinstance(node, dict):
+        node.pop("age_min", None)
+        for v in node.values():
+            _scrub_clock_fields(v)
+    elif isinstance(node, list):
+        for v in node:
+            _scrub_clock_fields(v)
+    return node
+
+
 def _strip_volatile(payload):
     """Drop fields that legitimately differ between two calls (timestamps,
-    signed snapshot ids) so payloads can be compared for identity."""
+    signed snapshot ids, clock-derived ages) so payloads can be compared for
+    identity."""
     p = copy.deepcopy(payload)
     meta = p.get("meta", {})
     for key in ("generated_at", "generated_at_utc", "timestamp", "elapsed_ms", "timing"):
@@ -124,7 +141,7 @@ def _strip_volatile(payload):
     if isinstance(bf, dict):
         bf.pop("snapshot", None)
         bf.pop("snapshot_id", None)
-    return p
+    return _scrub_clock_fields(p)
 
 
 # --- gate OFF: v1.24.1 behaviour preserved ------------------------------------
