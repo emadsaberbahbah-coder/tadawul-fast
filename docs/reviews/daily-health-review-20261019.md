@@ -283,3 +283,36 @@ the sync's My_Portfolio leg (backend), and that is the next thing to fix in Pyth
 
 Export the whole bound project into `apps_script/` (every file, verbatim) in one docs-only PR, so the next review can
 cover the 19 unmirrored files and the syntax harness compiles all of them. Nothing in that export runs from GitHub.
+
+## 10. Afternoon cycle (12:40 to 13:40 Riyadh): why My_Portfolio reached the cockpit without reliability
+
+Section 9 left one open question: are the `Forecast Reliability Score` / `Data Quality Score` cells blank on
+My_Portfolio, and if so where in the Python side do they go missing. Answered without the owner's check, from three
+artifacts and two offline reproductions (details and the audit table in
+`docs/evidence/TFB_Commit_Sheet_enriched_quote_v8.6.0_2026-10-19.md`).
+
+| Step | Evidence | Reading |
+| --- | --- | --- |
+| Sync run #4918, core-pages job | `[DECISION-RECONCILE] page=My_Portfolio ... rows=4 changed=3 distinct=[('ACCUMULATE', ''), ('BUY', ''), ('HOLD', '')]` | `Final Action` blank on 4/4 rows; three buy-family rows demoted to WATCH / HOLD because the Block Reason cell read `"None"` (the response carried `None`, a gate that ran writes `""`) |
+| DQ audit artifact of 17 Oct | DQ-51 `weight_basis` FAIL 4/4 blank weights; DQ-34 0 My_Portfolio rows | the portfolio pass (`_compute_portfolio_fields`) never ran on the rows the sheet received |
+| Render request log | one `POST /v1/enriched/sheet-rows 200` for the page; the four market pages use `/v1/analysis/sheet-rows` | only My_Portfolio takes the enriched route |
+| Offline engine reproduction | `get_sheet_rows("My_Portfolio")` with a fake sheet reader and fake quotes, default guards and the production `[GUARDS]` line | all eight gate columns populated: the engine path is sound |
+| Offline route reproduction | `inspect.signature(_analysis_sheet_rows_impl).bind(**attempt)` for the eight bridge attempts | `TypeError` on all eight (missing `x_api_key`, then `include_matrix_q` / `mode` / `request`): the enriched route's bridge never bound and every request fell silently to the engine-direct path, which skips `_strict_project_row` and therefore the investability gate |
+
+So the cockpit's `reliability ?` is a route defect, not a sheet or Apps Script defect: My_Portfolio has been written
+from ungated engine-direct rows on every sync (and, if the 07:40 Apps Script refresh uses the same endpoint, on every
+auto-refresh) at least since the analysis implementation gained its ninth parameter on 6 Oct (#719).
+
+**Built:** `routes/enriched_quote.py` v8.6.0. The bridge binds the implementation's own signature (attempt 0; a typed
+mismatch now logs a WARNING instead of falling through silently), and the engine-direct fallback publishes each row
+through the engine's publication boundary so even a bridge timeout yields gated decision columns. Both default ON with
+kill switches (`TFB_ENRICHED_BRIDGE_SIGBIND`, `TFB_ENRICHED_FALLBACK_BOUNDARY`). Tests
+`tests/test_enriched_bridge_binding.py` B1-B10 (10 passed), the route neighbours green after the W15 pin move, ci.yml
+1.1.24 enrols the suite in the schema-alignment step.
+
+**Also fixed:** the lean-lane flake on this PR's push run (`test_off_explicit_zero_equals_unset`, `age_min` 4.3 vs 4.4
+between two builds seconds apart): the identity comparison now scrubs that clock-derived field.
+
+**Owner, after merge and the Render deploy of `main`:** read-back list in the commit sheet (the reconcile log line with
+real action tokens, `Rel` / `DQ` numbers on Portfolio_Decision, no `bridge typed mismatch` line in Render, DQ-51 passing
+on the next backup audit, and one look at which endpoint the 07:40 Apps Script refresh uses).

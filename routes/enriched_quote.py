@@ -2,11 +2,44 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.5.2
+TFB Enriched Quote Routes Wrapper — v8.6.0
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • CONSERVATIVE-PLACEHOLDERS
+
+v8.6.0 (2026-10-19, DECISION COLUMNS ON THE ENRICHED SHEET-ROWS PATH):
+the bridge-first design never bridged. _call_with_tolerant_signatures tried
+eight fixed keyword sets against routes.analysis_sheet_rows
+._analysis_sheet_rows_impl, whose nine parameters carry no defaults, so every
+attempt failed at binding (the first two miss x_api_key, the rest miss
+include_matrix_q / mode / request) and the helper returned None without a log
+line. _sheet_rows_handler then served every instrument page from
+_build_instrument_rows: engine get_enriched_quotes_batch rows normalised onto
+the contract keys and never passed through core.data_engine_v2
+._strict_project_row, so the eight investability-gate columns (Data Quality
+Score .. Block Reason) and the My_Portfolio decision block left this route
+blank (None). My_Portfolio is the only page the dashboard sync and the
+cockpit read through /v1/enriched/sheet-rows, which is why its holdings
+reached Portfolio_Decision with no reliability or data-quality score (every
+TRIM capped to HOLD, ADD unreachable) and why the DQ audit found the weight
+columns blank on every holding (DQ-51).
+FIX 1 [BRIDGE-SIGBIND]: attempt 0 of the ladder binds the callable's own
+signature (inspect.signature): named parameters take the matching bridge
+kwarg, required parameters absent from the kwargs take None, nothing else is
+passed, and a callable that only takes **kwargs keeps the old first attempt.
+A typed mismatch of every attempt now logs one WARNING naming the module and
+callable instead of falling through silently. TFB_ENRICHED_BRIDGE_SIGBIND=0
+restores the v8.5.2 ladder byte for byte.
+FIX 2 [FALLBACK-BOUNDARY]: _build_instrument_rows publishes each engine-
+direct row through _strict_project_row (the boundary the analysis router
+already uses in _finalize_raw_instrument_row), so a genuine bridge failure
+(timeout, exception) still emits gated decision columns instead of None;
+meta.publication_boundary / publication_boundary_rows disclose it.
+TFB_ENRICHED_FALLBACK_BOUNDARY=0 restores the bare _normalize_row projection.
+Functions added 3 (_bridge_sigbind_enabled, _fallback_boundary_enabled,
+_bind_kwargs_to_signature) + _publish_fallback_row, removed 0.
+Rollback: the two switches, or git revert.
 
 v8.5.2 (2026-10-13, SECURITY): _Service.auth_guard reads the routed path.
 It handed auth_ok (core.config.auth_ok, which checks its public list against
@@ -131,6 +164,7 @@ WHY v8.3.0 (preserved below)
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import inspect
 import logging
@@ -150,9 +184,12 @@ from core.secret_redaction import redact_text, safe_error_text
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-# v8.5.2 (2026-10-13, SECURITY): auth_guard reads the ASGI scope path, not
-# the Host-derived request.url.path (see the module docstring).
-ROUTER_VERSION = "8.5.2"
+# v8.6.0 (2026-10-19): the bridge binds the analysis implementation's own
+# signature and the instrument fallback publishes through the engine's
+# publication boundary (see the module docstring). v8.5.2 (2026-10-13,
+# SECURITY): auth_guard reads the ASGI scope path, not the Host-derived
+# request.url.path.
+ROUTER_VERSION = "8.6.0"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -309,6 +346,60 @@ def _enriched_debug_enabled() -> bool:
     """v8.4.0 [FIX-9]: cheap env-flag check for diagnostic logging."""
     raw = (os.getenv("ENRICHED_QUOTE_DEBUG", "") or "").strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+_OFF_WORDS = frozenset({"0", "false", "off", "no", "n", "disabled", "disable"})
+
+
+def _bridge_sigbind_enabled() -> bool:
+    """v8.6.0 [BRIDGE-SIGBIND]: default ON. TFB_ENRICHED_BRIDGE_SIGBIND set to
+    0/false/off/no restores the v8.5.2 fixed attempt ladder byte for byte."""
+    raw = (os.getenv("TFB_ENRICHED_BRIDGE_SIGBIND", "") or "").strip().lower()
+    return raw not in _OFF_WORDS
+
+
+def _fallback_boundary_enabled() -> bool:
+    """v8.6.0 [FALLBACK-BOUNDARY]: default ON. TFB_ENRICHED_FALLBACK_BOUNDARY
+    set to 0/false/off/no restores the bare _normalize_row projection of the
+    engine-direct instrument rows (no investability gate)."""
+    raw = (os.getenv("TFB_ENRICHED_FALLBACK_BOUNDARY", "") or "").strip().lower()
+    return raw not in _OFF_WORDS
+
+
+def _bind_kwargs_to_signature(fn: Any, payload_kwargs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """v8.6.0 [BRIDGE-SIGBIND]: the keyword set the callable's OWN signature
+    accepts, or None when the signature cannot be read or satisfied.
+
+    Every named parameter takes the matching bridge kwarg when one exists
+    (None values included: the analysis implementation types them Optional);
+    a required parameter absent from the kwargs takes None; nothing else is
+    passed. A callable that accepts **kwargs returns None so the ladder's
+    first attempt (every kwarg) keeps serving it as before. A required
+    positional-only parameter cannot be satisfied by keyword -> None.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    bound: Dict[str, Any] = {}
+    for name, param in sig.parameters.items():
+        if param.kind is param.VAR_KEYWORD:
+            return None
+        if param.kind is param.VAR_POSITIONAL:
+            continue
+        if param.kind is param.POSITIONAL_ONLY:
+            if param.default is param.empty:
+                return None
+            continue
+        if name in payload_kwargs:
+            bound[name] = payload_kwargs[name]
+        elif param.default is param.empty:
+            bound[name] = None
+    try:
+        sig.bind(**bound)
+    except TypeError:
+        return None
+    return bound
 
 router = APIRouter(tags=["enriched"])
 
@@ -1284,7 +1375,15 @@ async def _call_with_tolerant_signatures(
     distinction the v4.3.4 best-effort wrapper makes.
     """
     payload_kwargs = dict(kwargs or {})
-    attempts = [
+    # (kwargs, keep_none): the v8.6.0 bound attempt passes None for the
+    # required parameters it fills, so it is sent as-is; the v8.5.2 fixed
+    # attempts keep dropping None values exactly as before.
+    attempts: List[Tuple[Dict[str, Any], bool]] = []
+    if _bridge_sigbind_enabled():
+        bound = _bind_kwargs_to_signature(fn, payload_kwargs)
+        if bound is not None:
+            attempts.append((bound, True))
+    attempts.extend((a, False) for a in (
         payload_kwargs,
         {k: payload_kwargs.get(k) for k in ("request", "body", "payload", "mode", "include_matrix_q", "token", "x_app_token", "authorization", "x_request_id")},
         {k: payload_kwargs.get(k) for k in ("request", "body", "mode")},
@@ -1293,12 +1392,12 @@ async def _call_with_tolerant_signatures(
         {k: payload_kwargs.get(k) for k in ("body",)},
         {k: payload_kwargs.get(k) for k in ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers", "top_n", "limit", "offset", "mode")},
         {},
-    ]
+    ))
     call_summary: List[Dict[str, Any]] = []
     last_error: Optional[Exception] = None
 
-    for attempt_idx, attempt in enumerate(attempts):
-        call_kwargs = {k: v for k, v in attempt.items() if v is not None}
+    for attempt_idx, (attempt, keep_none) in enumerate(attempts):
+        call_kwargs = dict(attempt) if keep_none else {k: v for k, v in attempt.items() if v is not None}
         kwargs_keys = sorted(list(call_kwargs.keys()))[:15]
         try:
             if timeout_seconds > 0:
@@ -1309,6 +1408,7 @@ async def _call_with_tolerant_signatures(
                 "attempt_idx": attempt_idx,
                 "kwargs_keys": kwargs_keys,
                 "outcome": "success",
+                **({"bound": True} if keep_none else {}),
             })
             return result, call_summary, "success"
         except TypeError as exc:
@@ -1446,6 +1546,20 @@ async def _delegate_sheet_rows_via_bridge(
             logger.warning(
                 "[enriched_quote v%s] bridge raised: module=%r callable=%r error=%s",
                 ROUTER_VERSION, impl_meta.get("module"), impl_meta.get("callable"), bridge_error,
+            )
+        except Exception:
+            pass
+
+    if bridge_call_outcome == "all_signatures_typed_mismatch":
+        # v8.6.0: a bridge that cannot bind its implementation is a silent
+        # downgrade of every row to the engine-direct path -- say so.
+        try:
+            logger.warning(
+                "[enriched_quote v%s] bridge typed mismatch: module=%r callable=%r "
+                "attempts=%d; no call was made, the handler falls through to its "
+                "engine-direct path",
+                ROUTER_VERSION, impl_meta.get("module"), impl_meta.get("callable"),
+                len(bridge_call_summary),
             )
         except Exception:
             pass
@@ -1708,20 +1822,71 @@ async def _build_instrument_rows(
     quotes_map, engine_diagnostic = await _fetch_analysis_rows(engine, list(symbols), mode=mode or "", page=page)
     rows_out: List[Dict[str, Any]] = []
     errors = 0
+    boundary_on = _fallback_boundary_enabled()
+    boundary_rows = 0
     for sym in symbols:
         raw = _to_dict(quotes_map.get(sym)) or {"symbol": sym, "ticker": sym, "error": "missing_row"}
         if raw.get("error"):
             errors += 1
         # v8.4.0 [FIX-7]: strip internal fields before normalize
         _strip_internal_fields(raw)
-        rows_out.append(_normalize_row(keys, headers, raw, symbol_fallback=sym))
+        # v8.6.0 [FALLBACK-BOUNDARY]: engine-direct rows cross the engine's
+        # publication boundary (gate, reconcile, trend block) before they are
+        # projected; the bare projection stays as the fail-open path.
+        projected = _publish_fallback_row(keys, headers, raw, sym) if boundary_on else None
+        if projected is not None:
+            rows_out.append(projected)
+            boundary_rows += 1
+        else:
+            rows_out.append(_normalize_row(keys, headers, raw, symbol_fallback=sym))
     meta = {
         "batch_rows": len(symbols),
         "rehydrated_rows": 0,
         "sparse_after_rehydrate": errors,
+        "publication_boundary": ("core.data_engine_v2._strict_project_row" if boundary_rows else None),
+        "publication_boundary_rows": boundary_rows,
         **engine_diagnostic,
     }
     return rows_out, errors, meta
+
+
+def _publish_fallback_row(
+    keys: Sequence[str],
+    headers: Sequence[str],
+    raw: Mapping[str, Any],
+    symbol_fallback: str = "",
+) -> Optional[Dict[str, Any]]:
+    """v8.6.0 [FALLBACK-BOUNDARY]: project one engine-direct row through the
+    engine's own publication boundary (core.data_engine_v2._strict_project_row:
+    recommendation reconcile, investability gate, reco coherence, analyst/trend
+    block, settle holdback, presentation), the same boundary the analysis
+    router uses in _finalize_raw_instrument_row. Works on a deep copy so a
+    cached quote is never mutated; the alias-resolved contract values are laid
+    under the raw engine fields the gate reads. Returns None (caller keeps the
+    bare projection) when the engine module or the projection is unavailable.
+    """
+    try:
+        from core.data_engine_v2 import _strict_project_row
+    except Exception as exc:
+        logger.warning("[enriched_quote v%s] publication boundary unavailable: %s",
+                       ROUTER_VERSION, safe_error_text(exc, limit=120))
+        return None
+    try:
+        candidate = copy.deepcopy(dict(raw or {}))
+        aligned = _normalize_row(keys, headers, candidate, symbol_fallback=symbol_fallback)
+        for k, v in aligned.items():
+            if v is not None and candidate.get(k) in (None, ""):
+                candidate[k] = v
+        projected = _strict_project_row(list(keys), candidate)
+        if symbol_fallback:
+            for k in ("symbol", "ticker"):
+                if k in projected and not projected.get(k):
+                    projected[k] = symbol_fallback
+        return projected
+    except Exception as exc:
+        logger.warning("[enriched_quote v%s] publication boundary failed for %r: %s",
+                       ROUTER_VERSION, symbol_fallback, safe_error_text(exc, limit=160))
+        return None
 
 
 svc = _Service()
@@ -1826,6 +1991,11 @@ async def _sheet_rows_handler(
             normalized_rows = _slice_rows(normalized_rows, limit, offset)
             status_out, error_out, meta_out = _extract_status_error(bridge_result)
             extra_meta = dict(meta_out or {})
+            if "dispatch" in extra_meta:
+                # v8.6.0: keep THIS handler's dispatch label truthful (the
+                # upstream meta used to overwrite it in the envelope spread);
+                # the implementation's own label travels as upstream_dispatch.
+                extra_meta.setdefault("upstream_dispatch", extra_meta.pop("dispatch"))
             extra_meta.update(_canonical_owner_hint(page, route_family))
             extra_meta["engine_source"] = CORE_ENGINE_SOURCE
             return svc.envelope(

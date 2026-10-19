@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.24 (2026-10-19) -- ENRICHED BRIDGE BINDING + GATED FALLBACK
+#
+# v1.1.24: run tests/test_enriched_bridge_binding.py (routes/enriched_quote
+# v8.6.0: the bridge binds the analysis implementation's own signature, so
+# /v1/enriched/sheet-rows no longer serves My_Portfolio from the ungated
+# engine-direct path; the fallback itself now crosses the engine publication
+# boundary) in the schema-alignment step, next to the other route suites.
+#
 # VERSION 1.1.23 (2026-10-19) -- CONVICTION-WEIGHTED SEAT SIZING
 #
 # v1.1.23: run tests/test_ob_conviction_sizing.py (opportunity_builder
@@ -784,6 +792,7 @@ jobs:
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
+            tests/test_enriched_bridge_binding.py \
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \

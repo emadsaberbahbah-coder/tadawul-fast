@@ -471,7 +471,9 @@ ROUTE_FILES = {
     "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.8.4", "_auth_passed"),
     "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.18.2", "_auth_passed"),
     "routes/config.py": ("ROUTER_VERSION", "5.9.1", "_auth_ok"),
-    "routes/enriched_quote.py": ("ROUTER_VERSION", "8.5.2", "_Service.auth_guard"),
+    # 8.5.2 -> 8.6.0 (2026-10-19): bridge signature binding + gated instrument
+    # fallback; _Service.auth_guard and _request_scope_path untouched.
+    "routes/enriched_quote.py": ("ROUTER_VERSION", "8.6.0", "_Service.auth_guard"),
     "core/config.py": ("__version__", "5.8.1", "auth_ok"),
 }
 ROUTE_HELPER = "_request_scope_path"
