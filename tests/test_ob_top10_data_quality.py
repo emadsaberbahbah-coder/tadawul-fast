@@ -10,8 +10,8 @@ WIRING  W1-W14  the three gates through the real builder entry point
                 (build_opportunity_payload) at a pinned clock, 2026-10-13
                 17:37 UTC (a Tuesday: NYSE open, LSE and Bursa closed).
 NEG     N1-N4   off spellings, never-raise, ASCII, rule not widened.
-GOLD    G1-G2   against a base copy of v1.26.1 (TFB_TEST_OB_BASE =
-                path to `git show 278f148:core/analysis/opportunity_builder.py`):
+GOLD    G1-G2   against a base copy of v1.27.0 = main (TFB_TEST_OB_BASE =
+                path to `git show 6ebe737d:core/analysis/opportunity_builder.py`):
                 OFF payload byte-identical; the armed env does nothing on base.
 
 Real exchange_calendars cases SKIP when the package is absent (the lean CI
@@ -94,12 +94,17 @@ def row(sym, asof, **kw):
 US_PRIOR = datetime(2026, 10, 12, 20, 0, tzinfo=UTC)       # Mon NYSE close
 LSE_MIDDAY = datetime(2026, 10, 13, 12, 20, tzinfo=UTC)    # before 15:30 close
 KL_CLOSE = datetime(2026, 10, 13, 9, 0, 30, tzinfo=UTC)    # Bursa 17:00 MYT
+NS_CLOSE = datetime(2026, 10, 13, 10, 0, 30, tzinfo=UTC)   # NSE 15:30 IST
+# 2026-10-19 merge with main 1.27.0: v1.26.2 (#796) maps .KL (and 26 more of
+# this build's extension suffixes) by DEFAULT, so the pool's "venue without a
+# calendar unless TFB_OPP_VENUE_CAL_EXT=1" row is now RELIANCE.NS - one of the
+# three suffixes (.AT/.NS/.SZ) that still depend on this build's flag.
 
 
 def pool():
     return [row("AAA.US", US_PRIOR),
             row("BBB.L", LSE_MIDDAY, currency="GBP", market="LSE"),
-            row("1295.KL", KL_CLOSE, currency="MYR", market="KLS"),
+            row("RELIANCE.NS", NS_CLOSE, currency="INR", market="NSE"),
             row("CCC.US", NOW - timedelta(minutes=3))]
 
 
@@ -158,14 +163,20 @@ def case_w2_ext_codes_exist_in_pinned_calendars(mp, _tmp):
 def case_w3_ext_certifies_latest_close_only(mp, _tmp):
     _need_cal()
     _setup(mp)
-    ok, cur, det = assess("1295.KL", KL_CLOSE, currency="MYR")
-    assert not ok and "venue calendar unavailable" in cur
-    mp.setenv("TFB_OPP_VENUE_CAL_EXT", "1")
+    # .KL is in v1.26.2's default-on map: certified with this build's flag off,
+    # and v1.26.2's own kill switch still reverts it.
     ok, cur, det = assess("1295.KL", KL_CLOSE, currency="MYR")
     assert ok and cur.startswith("last close") and det["mode"] == "session_closed"
-    ok, cur, _ = assess("RELIANCE.NS", datetime(2026, 10, 13, 10, 0, 30, tzinfo=UTC),
-                        currency="INR")
-    assert ok, cur
+    mp.setenv("TFB_TICKET_VENUE_CAL_EXT", "0")
+    ok, cur, det = assess("1295.KL", KL_CLOSE, currency="MYR")
+    assert not ok and "venue calendar unavailable" in cur
+    mp.delenv("TFB_TICKET_VENUE_CAL_EXT", raising=False)
+    # .NS is only in this build's extension: unavailable until it is armed
+    ok, cur, _ = assess("RELIANCE.NS", NS_CLOSE, currency="INR")
+    assert not ok and "venue calendar unavailable" in cur
+    mp.setenv("TFB_OPP_VENUE_CAL_EXT", "1")
+    ok, cur, det = assess("RELIANCE.NS", NS_CLOSE, currency="INR")
+    assert ok and cur.startswith("last close") and det["mode"] == "session_closed"
     # yesterday's close is still stale once today's close exists
     ok, cur, det = assess("1295.KL", KL_CLOSE - timedelta(days=1), currency="MYR")
     assert not ok and cur.startswith("STALE_PRICE pre-close")
@@ -205,12 +216,12 @@ def case_w6_alert_on_explains_timing_display_only(mp, _tmp):
     assert "1 prior-session price(s) while the venue trades (.US 1)" in text
     assert ".US closes 20:00 UTC / 23:00 Riyadh" in text
     assert "1 price(s) older than the venue's latest close (.L 1)" in text
-    assert "1 on venues without a trading calendar (.KL 1)" in text
+    assert "1 on venues without a trading calendar (.NS 1)" in text
     assert "TFB_OPP_VENUE_CAL_EXT=1" in text and "No gate or ticket changed." in text
     notes = {n["symbol"]: n["improve_note"] for n in on["near_miss"]}
     assert "Re-run after the venue closes (20:00 UTC / 23:00 Riyadh)" in notes["AAA.US"]
     assert "latest close (15:30 UTC / 18:30 Riyadh)" in notes["BBB.L"]
-    assert "Arming TFB_OPP_VENUE_CAL_EXT=1" in notes["1295.KL"]
+    assert "Arming TFB_OPP_VENUE_CAL_EXT=1" in notes["RELIANCE.NS"]
     # display only: every candidate row, ticket and KPI is unchanged
     assert on["candidates_rows"] == off["candidates_rows"]
     assert on["selected"] == off["selected"] and on["kpis"] == off["kpis"]
@@ -225,7 +236,7 @@ def case_w7_all_armed_unblocks_only_the_certified_close(mp, _tmp):
     _need_cal()
     _setup(mp, arm=GATES)
     rows = by_symbol(build())
-    assert rows["1295.KL"]["verdict"] == "INVEST"
+    assert rows["RELIANCE.NS"]["verdict"] == "INVEST"
     assert rows["AAA.US"]["first_fail"]["gate"] == "Quote Freshness"
     assert rows["BBB.L"]["first_fail"]["gate"] == "Quote Freshness"
 
@@ -339,8 +350,8 @@ def case_w14_verifier_registers_flags_and_pin(mp, _tmp):
         # 2026-10-15: v1.28.0 arms VENUE_CAL_EXT and FRESHNESS_ALERT by default
         default = "0" if name == "TFB_OPP_AUDIT_KEEP" else "1"
         assert "('" + name + "', '" + default + "'," in text, name
-    assert '"1.28.0", "opportunity builder"' in text
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.28.0"
+    assert '"%s", "opportunity builder"' % ob.OPPORTUNITY_BUILDER_VERSION in text
+    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")[:3]) >= (1, 28, 0)
 
 
 # --------------------------------------------------------------- negative ---
@@ -390,8 +401,8 @@ def case_n3_ascii_text(mp, _tmp):
     added = src[src.index("def _venue_next_close("):src.index("def _data_trust_assessment(")]
     assert added.isascii() and src[src.index("def _venue_suffix("):
                                    src.index("def _venue_state(")].isascii()
-    block = src[src.index("# v1.27.0 (2026-10-13) [TOP10 DATA-QUALITY]"):
-                src.index('OPPORTUNITY_BUILDER_VERSION = "1.28.0"')]   # 2026-10-15 pin
+    block = src[src.index("# v1.27.1 (2026-10-13, renumbered 2026-10-19) [TOP10 DATA-QUALITY]"):
+                src.index('OPPORTUNITY_BUILDER_VERSION = "')]
     assert block.isascii()
 
 
@@ -408,10 +419,13 @@ def case_n4_extension_never_widens_thresholds(mp, _tmp):
 def _base():
     if not OB_BASE or not os.path.exists(OB_BASE):
         pytest.skip("TFB_TEST_OB_BASE unset")
-    spec = importlib.util.spec_from_file_location("ob_base_1261", OB_BASE)
+    spec = importlib.util.spec_from_file_location("ob_base_1270", OB_BASE)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.OPPORTUNITY_BUILDER_VERSION == "1.26.1", "TFB_TEST_OB_BASE is not v1.26.1"
+    # 2026-10-19 merge: this build now sits on main's v1.27.0 (#797), so the
+    # golden base is `git show origin/main:core/analysis/opportunity_builder.py`
+    # at 1.27.0 (it was the v1.26.1 copy before main moved).
+    assert mod.OPPORTUNITY_BUILDER_VERSION == "1.27.0", "TFB_TEST_OB_BASE is not v1.27.0"
     return mod
 
 
@@ -429,7 +443,7 @@ def case_g2_armed_env_is_inert_on_base(mp, _tmp):
     _setup(mp, module=base, arm=GATES)
     p = build(module=base)
     assert all(a["type"] != "stale_quotes" for a in p["alerts"])
-    assert by_symbol(p)["1295.KL"]["verdict"] != "INVEST"
+    assert by_symbol(p)["RELIANCE.NS"]["verdict"] != "INVEST"
     assert "audit_keep" not in build(_keep_pool(), KEEP_CRIT, module=base)["meta"]
 
 

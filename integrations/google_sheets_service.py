@@ -1746,6 +1746,26 @@ def get_sheets_service(
     )
 
 
+def create_readonly_sheets_session() -> Any:
+    """An isolated, read-only transport for the Site's bounded source relay.
+
+    Reuse the existing credential loader inside this runtime; never copy a
+    provider credential to the Site or share the sync client's HTTP transport.
+    Streaming in the relay caps response bytes before JSON parsing. No retry,
+    write scope, schema repair, quote refresh, or cache reset is requested.
+    """
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import AuthorizedSession
+
+    info = _credentials_manager.get_credentials()
+    if not info:
+        raise RuntimeError("Source read credentials unavailable")
+    credentials = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
+    return AuthorizedSession(credentials, max_refresh_attempts=0, refresh_timeout=10)
+
+
 def reset_sheets_service(
     reason: str = "manual_reset",
     clear_header_cache: bool = True,
@@ -3383,3 +3403,4 @@ __all__ = [
     "close",
     "_refresh_logic",
 ]
+
