@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.26 (2026-10-14, renumbered 2026-10-19) -- DT10 v1.13.10 HELD-SEAT HARNESS
+# VERSION 1.1.27 (2026-10-14, renumbered 2026-10-19) -- DT10 v1.13.10 HELD-SEAT HARNESS
 #
-# v1.1.26 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.24 first): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# v1.1.27 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.25 first): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
 # native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.10
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
@@ -13,14 +13,22 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.25 (2026-10-14, renumbered 2026-10-19) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.26 (2026-10-14, renumbered 2026-10-19) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.25 (authored as v1.1.21 in #773/#778): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
-# v6.70.0 FW-2 SCOPE: off == v6.69.0, observe census, enforce keeps drift
+# v1.1.26 (authored as v1.1.21 in #773/#778): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v6.71.0 FW-2 SCOPE: off == v6.70.0, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+# VERSION 1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
+#
+# v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
+# the identity checks accept the HKD-price / CNY-or-USD-EPS convention on .HK
+# listings, so healthy H-share rows stop being quarantined into blank stubs
+# that make the coverage audit warn and refuse every decision-feed release) in
+# the blocking lean lane next to the other sync suites.
+#
 # VERSION 1.1.24 (2026-10-19) -- ENRICHED BRIDGE BINDING + GATED FALLBACK
 #
 # v1.1.24: run tests/test_enriched_bridge_binding.py (routes/enriched_quote
@@ -644,6 +652,7 @@ jobs:
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
+            tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_warnings_compact_wp6.py \
             tests/test_sync_fw2_scope.py \
             tests/test_intraday_quote_refresh_contract.py \

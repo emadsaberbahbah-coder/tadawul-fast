@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.0 (Build 2)
+TFB REPAIR TOOL - identity corruption + learning-store junk - v1.0.1 (Build 2)
 ================================================================================
+v1.0.1 (2026-10-19): B1 follows run_dashboard_sync v6.70.0 HK-FX. A .HK row
+whose Price/EPS over stated P/E sits in the HKD-per-CNY (1.02-1.18) or the
+HKD-per-USD (7.40-8.25) band is a reporting-currency convention, not a broken
+identity; the sync publishes it, so this tool no longer blanks it. Same gate
+(TFB_SYNC_COH_HK_REPORTING_FX, default on) and band overrides as the sync.
 ONE-TIME remediation companion to run_dashboard_sync v6.24.0 (ID-FIREWALL)
 and track_performance v6.20.0 (SYMBOL-GUARD). Prevention without repair is
 why the 2026-07-06 poisoning survived three guard generations: the guards
@@ -22,8 +27,9 @@ WHAT IT DOES (evidence: v32 export forensics, 2026-07-14 audit):
   PHASE B - IDENTITY REPAIR (Market_Leaders, Global_Markets)
     A row is CORRUPT when any of:
       (B1) P/E-identity broken: stated P/E disagrees with Price/EPS beyond
-           the same tolerance and GBX/GBP unit band run_dashboard_sync's
-           L3b uses (constants mirrored below with attribution);
+           the same tolerance and unit-convention bands (GBX/GBP, and since
+           v1.0.1 the .HK reporting-currency bands) run_dashboard_sync's
+           FW-1/FW-2/L3b use (constants mirrored below with attribution);
       (B2) Name blank while the row carries a price (stub damage, e.g. the
            NMM.US blank-name row);
       (B3) Name over-assigned: the same non-blank Name on >= 3 distinct
@@ -62,19 +68,25 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 TAG = f"[REPAIR-VERDICT v{TOOL_VERSION}]"
 
 # ---- constants mirrored from run_dashboard_sync v6.24.0 (attribution) ------
 _COH_REL_TOL = 0.05
 _COH_FX_UNIT_LO = 50.0
 _COH_FX_UNIT_HI = 200.0
+# ---- v1.0.1: mirrored from run_dashboard_sync v6.70.0 HK-FX (attribution) ---
+# Mirrored, not imported: the repair workflow installs gspread + google-auth only.
+_COH_HK_CNY_BAND_DEFAULT = (1.02, 1.18)
+_COH_HK_USD_BAND_DEFAULT = (7.40, 8.25)
+_COH_HK_SUFFIX = ".HK"
 _SYMBOL_SHAPE_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")
 
 _SYMBOL_ALIASES = {"symbol", "ticker", "code"}
@@ -123,8 +135,53 @@ def _valid_symbol(s: Any) -> bool:
     return bool(_SYMBOL_SHAPE_RE.match(t))
 
 
-def _row_identity_broken(px: Any, eps: Any, pe: Any) -> bool:
-    """Single-row P/E == Price/EPS test; mirrors L3b's per-row rules."""
+def _coh_hk_reporting_fx_enabled() -> bool:
+    """Mirror of run_dashboard_sync v6.70.0: default ON; 0/false/off/no = off."""
+    raw = (os.getenv("TFB_SYNC_COH_HK_REPORTING_FX") or "").strip().lower()
+    return raw not in {"0", "false", "off", "no", "n", "disabled", "disable"}
+
+
+def _coh_band_env(name: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    """Mirror of run_dashboard_sync v6.70.0: 'lo,hi' with 0 < lo < hi, both
+    finite; anything else -> default."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        lo_s, hi_s = raw.split(",", 1)
+        lo, hi = float(lo_s), float(hi_s)
+    except (TypeError, ValueError):
+        return default
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi):
+        return default
+    return (lo, hi)
+
+
+def _coh_hk_reporting_fx_match(ratio: float, symbol: Any) -> bool:
+    """Mirror of run_dashboard_sync v6.70.0: True only for a .HK symbol whose
+    implied/stated ratio sits in the HKD-per-CNY or HKD-per-USD band (gate on)."""
+    try:
+        if not _coh_hk_reporting_fx_enabled():
+            return False
+        sym = str(symbol or "").strip().upper()
+        if not sym.endswith(_COH_HK_SUFFIX):
+            return False
+        r = float(ratio)
+        if not math.isfinite(r):
+            return False
+        for env_name, default in (("TFB_SYNC_COH_HK_CNY_BAND", _COH_HK_CNY_BAND_DEFAULT),
+                                  ("TFB_SYNC_COH_HK_USD_BAND", _COH_HK_USD_BAND_DEFAULT)):
+            lo, hi = _coh_band_env(env_name, default)
+            if lo <= r <= hi:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _row_identity_broken(px: Any, eps: Any, pe: Any, symbol: Any = "") -> bool:
+    """Single-row P/E == Price/EPS test; mirrors the sync's per-row rules
+    (FW-1/FW-2/L3b, v6.70.0). Without a symbol only the GBX band applies."""
     p, e, q = _f(px), _f(eps), _f(pe)
     if p is None or e is None or q is None:
         return False
@@ -136,8 +193,11 @@ def _row_identity_broken(px: Any, eps: Any, pe: Any) -> bool:
     rel = abs(implied - q) / abs(q)
     if rel < _COH_REL_TOL:
         return False
-    if _COH_FX_UNIT_LO <= (implied / q) <= _COH_FX_UNIT_HI:
+    ratio = implied / q
+    if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
         return False  # GBX/GBP pence convention - healthy
+    if _coh_hk_reporting_fx_match(ratio, symbol):
+        return False  # v1.0.1: HKD quote, CNY/USD-reported EPS - healthy
     return True
 
 
@@ -367,7 +427,7 @@ def phase_b_identity(sheet, apply: bool) -> Dict[str, Any]:
                 eps = row[ei] if 0 <= ei < len(row) else ""
                 pe = row[qi] if 0 <= qi < len(row) else ""
                 reason = ""
-                if min(pi, ei, qi) >= 0 and _row_identity_broken(px, eps, pe):
+                if min(pi, ei, qi) >= 0 and _row_identity_broken(px, eps, pe, sym):
                     reason = "B1:pe_identity"
                 elif not nm and not _blank(px):
                     reason = "B2:blank_name"

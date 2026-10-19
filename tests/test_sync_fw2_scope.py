@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tests/test_sync_fw2_scope.py
-run_dashboard_sync v6.70.0 FW-2 SCOPE (gate TFB_SYNC_FW2_SCOPE = off | observe |
+run_dashboard_sync v6.71.0 FW-2 SCOPE (gate TFB_SYNC_FW2_SCOPE = off | observe |
 enforce). Dual-tree, REAL-module harness: drives the REAL
 _row_identity_firewall, _fw2_* helpers, _idfw_selftest and
 _append_runlog_idfirewall. The only non-real object is a Sheets append
@@ -9,10 +9,18 @@ RECORDER. Fixture rows are real Global_Markets rows copied verbatim from the
 in a stated, deterministic way (EPS vintage drift, the HKD price / CNY EPS
 currency gap, an enrichment block transposed from another issuer).
 
-Base parity: TFB_TEST_SYNC_BASE = the v6.69.0 file (git show
-15812b6:scripts/run_dashboard_sync.py) -> off output == base output, value
+Base parity: TFB_TEST_SYNC_BASE = the v6.70.0 file (git show
+f24e9ff3:scripts/run_dashboard_sync.py; authored against the v6.69.0 file
+15812b6, renumbered 2026-10-19 after main's #799 HK-FX took v6.70.0)
+-> off output == base output, value
 for value, and observe output == base output. Without the variable the base
 cases skip. Offline: no network, no credentials, no live Sheet.
+
+Merge note (2026-10-19): main's v6.70.0 HK-FX band (gate
+TFB_SYNC_COH_HK_REPORTING_FX, default on) exempts a .HK row whose Price/EPS
+sits at the stated P/E times the HKD-per-CNY rate BEFORE FW-2 SCOPE tiers it.
+The H-share perturbation (case 3) therefore passes with the default; t11
+pins that ordering and, with the band off, the 2026-10-14 drift behaviour.
 
 Run: pytest -q tests/test_sync_fw2_scope.py
   or python3 tests/test_sync_fw2_scope.py   (x3, digest)"""
@@ -35,7 +43,7 @@ if ROOT not in sys.path:
 SYNC = os.environ.get("TFB_TEST_SYNC_DELIVERED") or os.path.join(ROOT, "scripts", "run_dashboard_sync.py")
 BASE = os.environ.get("TFB_TEST_SYNC_BASE", "")
 FIXTURE = os.path.join(HERE, "fixtures", "fw2_scope_gm_rows_2026-10-14.json")
-ENV = ("TFB_SYNC_FW2_SCOPE",)
+ENV = ("TFB_SYNC_FW2_SCOPE", "TFB_SYNC_COH_HK_REPORTING_FX")
 # Substrings the engine investability gate tests in a lower-cased Warnings
 # string (data_engine_v2 _apply_investability_gate, pinned 2026-09-20).
 ENGINE_GATE_SUBSTRINGS = ("cap", "forecast", "target", "roi", "drop", "reject",
@@ -103,9 +111,10 @@ def _col(h, name):
     return h.index(name)
 
 
-def _case_matrix():
+def _case_matrix(hk_fx=True):
     """Real rows + deterministic perturbations. Returns (headers, rows, expect)
-    where expect maps symbol -> 'pass' | 'drift' | 'gross'."""
+    where expect maps symbol -> 'pass' | 'drift' | 'gross'. hk_fx: the v6.70.0
+    HK-FX band is on (default), so the case-3 H-share rows pass."""
     h, rows = _fixture()
     sym, px, eps, pe = (_col(h, c) for c in ("Symbol", "Current Price", "EPS (TTM)", "P/E (TTM)"))
     by = {r[sym]: r for r in rows}
@@ -124,7 +133,7 @@ def _case_matrix():
     # 3. H-share currency gap: HKD price over CNY EPS (EPS / 1.09).
     for s in ("0939.HK", "1398.HK", "3988.HK"):
         r = list(by[s]); r[sym] = s.replace(".HK", "-C.HK"); r[eps] = round(float(r[eps]) / 1.09, 6)
-        out.append(r); expect[r[sym]] = "drift"
+        out.append(r); expect[r[sym]] = "pass" if hk_fx else "drift"
     # 4. transposed enrichment block (EPS + P/E + Name of another issuer):
     #    ratio = price_target / price_donor, far from 1 here -> gross.
     nm = _col(h, "Name")
@@ -137,8 +146,8 @@ def _case_matrix():
     return h, out, expect
 
 
-def _run(mod, mode, h, rows):
-    with _Env(TFB_SYNC_FW2_SCOPE=mode):
+def _run(mod, mode, h, rows, hk=None):
+    with _Env(TFB_SYNC_FW2_SCOPE=mode, TFB_SYNC_COH_HK_REPORTING_FX=hk):
         mm, stripped = mod._row_identity_firewall(list(h), copy.deepcopy(rows))
         census = dict(getattr(mod, "_LAST_FW2_CENSUS", {}) or {})
     return mm, stripped, census
@@ -319,7 +328,7 @@ def test_t10_runlog_default_equals_base_and_census_suffix():
     assert " | fw2=" not in row[5] and "fw2" not in json.loads(row[9])
     if b() is not None:
         brow = _runlog(b())
-        norm = lambda r: [re.sub(r"6\.(69|70)\.0", "X", str(c)) for c in r[1:]]
+        norm = lambda r: [re.sub(r"6\.(69|70|71)\.0", "X", str(c)) for c in r[1:]]
         assert norm(row) == norm(brow)
     census = {"mode": "enforce", "drift": 4, "gross": 1, "fielded": 4,
               "rows": [{"symbol": "JNJ", "tier": "drift", "action": "fielded"}]}
@@ -329,6 +338,36 @@ def test_t10_runlog_default_equals_base_and_census_suffix():
     assert det["fw2"]["fielded"] == 4 and det["fw2"]["rows"][0]["symbol"] == "JNJ"
     row3 = _runlog(mod, fw2_census={"mode": "observe", "drift": 0, "gross": 0, "fielded": 0, "rows": []})
     assert row3[5].endswith(" | fw2=observe drift=0 gross=0 fielded=0")
+
+
+def test_t11_hk_fx_exemption_runs_before_the_tiers():
+    mod = m()
+    h, rows, on = _case_matrix(hk_fx=True)
+    _h, _r, off = _case_matrix(hk_fx=False)
+    hk = {s for s in on if s.endswith("-C.HK")}
+    assert len(hk) == 3 and all(on[s] == "pass" and off[s] == "drift" for s in hk)
+    sym = _col(h, "Symbol")
+    src = {r[sym]: r for r in rows}
+    for mode in ("off", "observe", "enforce"):
+        mm, stripped, census = _run(mod, mode, h, rows)
+        assert not hk & set(stripped)
+        assert sorted(mod._LAST_FW2_DIAG["hk_fx_exempt"]) == sorted(hk)
+        assert not hk & {s for s, _r2, _c2 in mod._LAST_FW2_DIAG["stripped"]}
+        assert all(r == src[r[sym]] for r in mm if r[sym] in hk)
+        if mode != "off":
+            assert not hk & {row["symbol"] for row in census["rows"]}
+    # band off: the 2026-10-14 behaviour - tiered drift, enforce fields them
+    _mm, o_s, o_c = _run(mod, "observe", h, rows, hk="0")
+    assert hk <= set(o_s) and o_c["drift"] == sum(1 for t in off.values() if t == "drift")
+    e_mm, e_s, e_c = _run(mod, "enforce", h, rows, hk="0")
+    assert not hk & set(e_s) and e_c["fielded"] == sum(1 for t in off.values() if t == "drift")
+    assert {row["symbol"] for row in e_c["rows"] if row["action"] == "fielded"} >= hk
+    # a fielded row is not a strip: it never reaches the HK-FX strip detail
+    assert not hk & {s for s, _r2, _c2 in mod._LAST_FW2_DIAG["stripped"]}
+    if b() is not None:
+        b_mm, b_s, _bc = _run(b(), "off", h, rows, hk="0")
+        f_mm, f_s, _fc = _run(mod, "off", h, rows, hk="0")
+        assert (f_mm, f_s) == (b_mm, b_s) and hk <= set(b_s)
 
 
 def _digest():

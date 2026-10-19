@@ -1,8 +1,9 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
 # VERSION 1.0.4 (2026-10-14) -- FW-2 SCOPE VARIABLE IN BOTH WRITER JOBS
-# WHY (2026-10-14): run_dashboard_sync v6.70.0 adds TFB_SYNC_FW2_SCOPE
-# (off | observe | enforce, default off = v6.69.0 byte-identical). The FW-2
+# WHY (2026-10-14): run_dashboard_sync v6.71.0 (authored as v6.70.0; renumbered
+# 2026-10-19 after main's #799 HK-FX took v6.70.0) adds TFB_SYNC_FW2_SCOPE
+# (off | observe | enforce, default off = v6.70.0 byte-identical). The FW-2
 # row firewall turned 76 healthy Global_Markets rows (JNJ, AMAT, Samsung,
 # Tokyo Electron, Givaudan) into symbol-only stubs on run 38486122061, which
 # alone fails the 99% name gate. Mapped in sync-dashboard AND
@@ -443,7 +444,7 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
-      # v6.70.0 FW-2 SCOPE (2026-10-14): off = v6.69.0; observe adds the
+      # v6.71.0 FW-2 SCOPE (2026-10-14): off = v6.70.0; observe adds the
       # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
       # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
       # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.
@@ -1721,7 +1722,7 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
-      # v6.70.0 FW-2 SCOPE (2026-10-14): off = v6.69.0; observe adds the
+      # v6.71.0 FW-2 SCOPE (2026-10-14): off = v6.70.0; observe adds the
       # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
       # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
       # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.

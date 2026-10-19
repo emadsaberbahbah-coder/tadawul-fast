@@ -25,7 +25,7 @@ SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
-    "TFB_SYNC_FW2_SCOPE": "off",  # v6.70.0 FW-2 SCOPE (2026-10-14)
+    "TFB_SYNC_FW2_SCOPE": "off",  # v6.71.0 FW-2 SCOPE (2026-10-14)
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
 
