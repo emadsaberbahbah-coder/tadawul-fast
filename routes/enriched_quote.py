@@ -37,9 +37,12 @@ already uses in _finalize_raw_instrument_row), so a genuine bridge failure
 (timeout, exception) still emits gated decision columns instead of None;
 meta.publication_boundary / publication_boundary_rows disclose it.
 TFB_ENRICHED_FALLBACK_BOUNDARY=0 restores the bare _normalize_row projection.
-Functions added 3 (_bridge_sigbind_enabled, _fallback_boundary_enabled,
-_bind_kwargs_to_signature) + _publish_fallback_row, removed 0.
-Rollback: the two switches, or git revert.
+PAGINATION (Codex P2 on #798): with the bridge working, a nonzero offset was
+applied by the implementation and again by _sheet_rows_handler; the bridge
+now asks for the unsliced range [0, offset+limit) and the handler keeps the
+one slice. Functions added 3 (_bridge_sigbind_enabled,
+_fallback_boundary_enabled, _bind_kwargs_to_signature) + _publish_fallback_row,
+removed 0. Rollback: the two switches, or git revert.
 
 v8.5.2 (2026-10-13, SECURITY): _Service.auth_guard reads the routed path.
 It handed auth_ok (core.config.auth_ok, which checks its public list against
@@ -1500,6 +1503,18 @@ async def _delegate_sheet_rows_via_bridge(
     prepared["sheet_name"] = page
     prepared["name"] = page
     prepared["tab"] = page
+    # v8.6.0: _sheet_rows_handler paginates the bridged rows itself
+    # (_slice_rows(limit, offset)), and every implementation this bridge can
+    # reach paginates too (body wins over the query string there), so a
+    # nonzero offset would be applied twice: limit=10&offset=10 turned the
+    # upstream rows 10-19 into an empty page. Ask the implementation for the
+    # unsliced range [0, offset+limit) and leave the one slice to the handler.
+    _req_limit = _int_from_any(prepared.get("limit"), 0)
+    _req_offset = _int_from_any(prepared.get("offset"), 0)
+    if _req_offset > 0:
+        prepared["offset"] = 0
+        if _req_limit > 0:
+            prepared["limit"] = _req_limit + _req_offset
 
     symbols = _requested_symbols_from_body(prepared)
     kwargs = {

@@ -38,6 +38,8 @@ Pinned here:
       (gate columns None)
   B9  a typed mismatch logs one WARNING naming module and callable
   B10 version and CI enrolment
+  B11 a nonzero offset is applied once: the bridge asks the implementation
+      for the unsliced range and the handler keeps the single slice
 
 Run: pytest -q tests/test_enriched_bridge_binding.py
 """
@@ -148,11 +150,16 @@ def _fake_service(engine):
     return svc, list(headers), list(keys)
 
 
+SEEN_BODIES = []
+
+
 async def _analysis_like_impl(request, body, mode, include_matrix_q, token, x_app_token,
                               x_api_key, authorization, x_request_id):
     """Stands in for routes.analysis_sheet_rows._analysis_sheet_rows_impl:
     the exact no-default signature, returning an envelope whose rows already
-    crossed the engine boundary (gate columns populated)."""
+    crossed the engine boundary (gate columns populated). Like the real
+    routers it paginates by the body's limit / offset (body wins over query)."""
+    SEEN_BODIES.append(dict(body or {}))
     rows = []
     for s in SYMS:
         r = _raw_engine_row(s)
@@ -161,6 +168,9 @@ async def _analysis_like_impl(request, body, mode, include_matrix_q, token, x_ap
                   "final_decision_basis": "Engine", "investability_status": "INVESTABLE",
                   "final_action": "INVEST", "block_reason": ""})
         rows.append(r)
+    offset = max(0, int((body or {}).get("offset") or 0))
+    limit = int((body or {}).get("limit") or 0)
+    rows = rows[offset:offset + limit] if limit > 0 else rows[offset:]
     return {"status": "success", "page": "My_Portfolio", "rows": rows,
             "meta": {"dispatch": "instrument_mode", "x_api_key_seen": x_api_key is None}}
 
@@ -354,6 +364,27 @@ def test_b9_typed_mismatch_logs_a_warning(wired, monkeypatch, caplog):
             None, None, None, "req-b"))
     assert isinstance(out, dict) and out["meta"]["bridge_call_outcome"] == "success"
     assert not [rec for rec in caplog.records if "bridge typed mismatch" in rec.getMessage()]
+
+
+# --- B11: a nonzero offset is applied once (Codex P2 on #798) -----------------
+
+def test_b11_bridged_offset_is_applied_once(wired):
+    SEEN_BODIES.clear()
+    resp = asyncio.run(_post_sheet_rows({"page": "My_Portfolio", "symbols": SYMS,
+                                         "limit": 2, "offset": 1}))
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["meta"]["dispatch"] == "bridge_sheet_rows"
+    # the implementation was asked for the unsliced range [0, offset+limit)
+    assert SEEN_BODIES and SEEN_BODIES[-1]["offset"] == 0 and SEEN_BODIES[-1]["limit"] == 3
+    # and the handler's single slice yields rows 1..2, not an empty page
+    assert [r["symbol"] for r in payload["row_objects"]] == SYMS[1:3]
+    assert payload["count"] == 2
+    # offset 0 is passed through unchanged
+    SEEN_BODIES.clear()
+    resp = asyncio.run(_post_sheet_rows({"page": "My_Portfolio", "symbols": SYMS, "limit": 2}))
+    assert SEEN_BODIES[-1].get("offset") in (None, 0) and SEEN_BODIES[-1]["limit"] == 2
+    assert [r["symbol"] for r in resp.json()["row_objects"]] == SYMS[:2]
 
 
 # --- B10: version + CI ---------------------------------------------------------

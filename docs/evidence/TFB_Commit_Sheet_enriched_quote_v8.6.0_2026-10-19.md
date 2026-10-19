@@ -55,6 +55,10 @@ gateway), which is why the gap was invisible on Global_Markets and visible on ev
   attempt count. The handler's own `meta.dispatch` stays `bridge_sheet_rows`; the implementation's label travels as
   `meta.upstream_dispatch` (before, the upstream meta overwrote it in the envelope spread).
 - `=0`: the ladder is the v8.5.2 one byte for byte (B4 pins eight typed-mismatch attempts, no `bound` key).
+- Pagination (Codex P2 on #798, verified): with the bridge working, a nonzero `offset` was applied by the implementation
+  (body wins over the query string there) and again by `_sheet_rows_handler`, so `limit=10&offset=10` would have turned
+  the upstream rows 10-19 into an empty page. The bridge now asks for the unsliced range `[0, offset+limit)` and the
+  handler keeps the one slice (B11). No live caller sends an offset today (the sync sends `limit` only).
 
 ### FIX 2 [FALLBACK-BOUNDARY] (`TFB_ENRICHED_FALLBACK_BOUNDARY`, default ON)
 
@@ -72,7 +76,7 @@ The fallback does not run the cross-sectional `_compute_portfolio_fields` (weigh
 
 | Battery | Result |
 | --- | --- |
-| `tests/test_enriched_bridge_binding.py` B1 real callable binds, B2 the v8.5.2 ladder cannot (kept as the negative), B3 bound call reaches a no-default implementation, B4 kill switch, B5 `**kwargs` callable, B6 handler dispatch `bridge_sheet_rows` + `upstream_dispatch`, B7 gated fallback + cached quote untouched, B8 boundary kill switch, B9 one WARNING on mismatch and none when bound, B10 version + CI | 10 passed |
+| `tests/test_enriched_bridge_binding.py` B1 real callable binds, B2 the v8.5.2 ladder cannot (kept as the negative), B3 bound call reaches a no-default implementation, B4 kill switch, B5 `**kwargs` callable, B6 handler dispatch `bridge_sheet_rows` + `upstream_dispatch`, B7 gated fallback + cached quote untouched, B8 boundary kill switch, B9 one WARNING on mismatch and none when bound, B10 version + CI, B11 a nonzero offset applied once | 11 passed |
 | Route neighbours: `test_route_error_redaction`, `test_auth_wall_scope_path` (W15 pin moved), `test_board_funding_route`, `test_route_mount_compat`, `test_redaction_boundaries`, `test_schema_alignment`, `test_current_schema_contract`, `test_adv_typeerror_retry_p130` | see the PR CI receipt (local: 94 passed, 9 skipped after the pin move) |
 | `tests/test_ob_research_diversify.py` after the clock-field scrub | 13 passed |
 | ruff E9/F63/F7/F82, py_compile | clean |
