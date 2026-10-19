@@ -1539,11 +1539,12 @@ from typing import Optional
 #   cockpit cannot show the 3M view at all.
 # WHAT: gate TFB_OPP_ROTATION_BASIS = 12m (DEFAULT) | plan3m, read per call.
 #   12m    -> v1.27.0 byte-identical (same map, same hurdle, same text).
-#   plan3m -> _holding_roi_map reads the pool row's plan ROI (roi_pct, the
-#             figure the Required ROI gate tests: (TP1 − entry) / entry from
-#             the CURRENT price, i.e. the holding's remaining upside to its
-#             first target) for the held names, the ordered needs carry the
-#             seat's plan ROI, and the hurdle is TFB_OPP_ROTATION_EDGE_PP_3M
+#   plan3m -> _holding_roi_map reads the pool row's plan-TP1 ROI
+#             (_tp1_plan_roi: (TP1 − price) / price from the CURRENT price —
+#             the "ROI % (TP1)" column, i.e. the holding's remaining upside to
+#             its first target; NOT cand["roi_pct"], which is the valuation /
+#             TP2 upside) for the held names, the ordered needs carry the
+#             seat's plan-TP1 ROI, and the hurdle is TFB_OPP_ROTATION_EDGE_PP_3M
 #             (default 5 pp; TFB_OPP_ROTATION_EDGE_PP stays the 12m hurdle).
 #             The deferral text, the rotation_proposal alert and the new
 #             additive kpis.rotation_basis name the basis in use ("engine 12M"
@@ -5712,8 +5713,8 @@ def _env_funding_plan():
 
 def _env_rotation_basis():
     """v1.27.1: TFB_OPP_ROTATION_BASIS = 12m (default; v1.27.0 byte-identical)
-    | plan3m (the pool row's plan ROI to TP1 from the current price, for the
-    held names and the unfunded seats alike). Any other value -> 12m."""
+    | plan3m (the pool row's plan-TP1 ROI, _tp1_plan_roi, for the held names
+    and the unfunded seats alike). Any other value -> 12m."""
     v = str(_env_str("TFB_OPP_ROTATION_BASIS", "12m") or "12m").strip().lower()
     return "plan3m" if v == "plan3m" else "12m"
 
@@ -5804,9 +5805,8 @@ def _holding_roi_map(audit_rows, holdings):
             continue
         if _guard and _holding_forecast_degraded(c):   # v1.19.4 [R3]
             continue
-        if _plan3m:   # v1.27.1: the held name's remaining upside to TP1 from the current price
-            _r3 = _to_float(c.get("roi_pct"))
-            pool[s] = _r3 if (_r3 is not None and math.isfinite(_r3)) else None
+        if _plan3m:   # v1.27.1: the held name's remaining upside to its plan TP1 from the current price
+            pool[s] = _tp1_plan_roi(c)   # (tp1 - price) / price; None without a ladder -> never rotates
             continue
         pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
     out = {}
@@ -7236,9 +7236,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 _s = _a["symbol"]
                 if _s in _needs:
                     if _plan3m_basis:
-                        _opp_roi = _to_float(_a["_cand"].get("roi_pct"))
-                        if _opp_roi is not None and not math.isfinite(_opp_roi):
-                            _opp_roi = None
+                        _opp_roi = _tp1_plan_roi(_a["_cand"])   # v1.27.1: the seat's plan-TP1 ROI
                     else:
                         _opp_roi = _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))
                     _ordered.append((_s, _needs[_s]["need_sar"], _opp_roi))

@@ -25,7 +25,7 @@ Why today's page says "no rotation needed": you hold 53,769 SAR of cash. Deploya
 | Sizing cohort | FAST-TRACK plans in rank order, ≤ 2 per sector, ≤ 10 per market | panel `T10: Max Per Sector / Market` |
 | Rotation eligibility | held ≥ 7 d; not within 3 % of its TP1; sukuk / outside scope excluded; value ≥ minimum ticket | `TFB_OPP_ROTATION_MIN_HELD_DAYS` (7), `TFB_OPP_ROTATION_TP1_PROXIMITY_PCT` (3), `TFB_OPP_ROTATION_EXCLUDE` (5023.SR) |
 | Rotation test | opportunity ROI − holding forward ROI − 1.1 % round-trip cost ≥ hurdle; pick the holding with the **lowest** forward ROI; one rotation per run | `TFB_OPP_ROTATION_COST_PCT` (1.1), `TFB_OPP_ROTATION_EDGE_PP` (8, 12M), **new** `TFB_OPP_ROTATION_BASIS=plan3m` + `TFB_OPP_ROTATION_EDGE_PP_3M` (5) |
-| Forward ROI of a holding | 12M: engine forecast (My_Portfolio *Expected ROI 12M*); 3M: plan/expected 3M ROI (My_Portfolio *Expected ROI 3M*; engine: pool `roi_pct` = (TP1 − price)/price) | — |
+| Forward ROI of a holding | 12M: engine forecast (My_Portfolio *Expected ROI 12M*). 3M: the engine uses the plan-TP1 ROI (TP1 − price)/price from the pool row (`_tp1_plan_roi`); the research page approximates it with My_Portfolio *Expected ROI 3M* because the held names' TP1 ladder is not on the sheet while the feed is withheld | — |
 | Exits (unchanged, v1.1.0) | 2 × ATR14 initial stop, breakeven lock after +1R, trail 2 × ATR (1.5 × after +2R), SMA10 profit protection, e-mail alerts | `DP2X` in the script |
 
 The 12M basis is the engine's forecast horizon; the 3M basis is the plan horizon your Top 10 is built on (Required ROI 12 % per 3 months). The page shows both so the two never get confused; your example (20 % vs 14 %) gives 4.9 pp after cost — below the 5 pp default on the 3M basis, so set `TFB_OPP_ROTATION_EDGE_PP_3M=4` if you want that pair to rotate. Below ~4 pp the cost, slippage and forecast error eat the edge; I would not go lower.
@@ -62,9 +62,9 @@ PR #801 (another session, open) proposes a 550-line generic menu block with a se
 
 | File | Change |
 |---|---|
-| `core/analysis/opportunity_builder.py` | v1.27.1: `_env_rotation_basis`, `_rotation_basis_label`; basis-aware `_env_rotation_edge_pp`, `_holding_roi_map`, ordered needs; label in `_funding_plan_text`, the `rotation_proposal` alert and additive `kpis.rotation_basis`. Default `12m` = v1.27.0 byte-identical. |
+| `core/analysis/opportunity_builder.py` | v1.27.1: `_env_rotation_basis`, `_rotation_basis_label`; basis-aware `_env_rotation_edge_pp`, `_holding_roi_map`, ordered needs; label in `_funding_plan_text`, the `rotation_proposal` alert and additive `kpis.rotation_basis`. Default `12m` = v1.27.0 byte-identical. On `plan3m` both sides use the plan-TP1 ROI `_tp1_plan_roi(cand)` = (TP1 − price)/price — the "ROI % (TP1)" column — never `cand["roi_pct"]`, which is the valuation/TP2 upside (Codex P1 finding on the first push, fixed in the second). |
 | `scripts/verify_deployment.py` | pin 1.27.0 → 1.27.1 |
-| `tests/test_opp_rotation_basis_v1271.py` | T1–T6: default/invalid → 12m; plan3m map/hurdle/label; the owner's 20-vs-14 case (no rotation at 5 pp, rotates at 4); the live XIOR/CWBC pair on both bases; degraded-forecast guard; text/alert labels; manifest pin. 121 tests pass across the builder/funding suites. |
+| `tests/test_opp_rotation_basis_v1271.py` | T1–T6: default/invalid → 12m; plan3m map/hurdle/label on normalized-candidate shapes whose valuation `roi_pct` deliberately differs from the TP1 figure; a held name without a TP1 ladder never rotates on 3M; the owner's 20-vs-14 case (no rotation at 5 pp, rotates at 4); the live XIOR/CWBC pair on both bases (+18.2 pp 12M, +9.8 pp 3M); degraded-forecast guard; text/alert labels; manifest pin. 138 tests pass across the builder/funding/venue suites. |
 | `apps_script/27_Decision_Pages_v2.gs` | first repository mirror of the v2 renderer (v1.2.0) |
 | `apps_script/01_Menu.gs` | first repository mirror of the live menu (v2.20.3) |
 | `docs/evidence/…_2026-10-20.md` | this sheet |
