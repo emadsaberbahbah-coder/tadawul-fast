@@ -31,29 +31,34 @@
  * asks again instead of falling back to a guess.
  *
  * SAFETY:
- *   - Manual only: no trigger, no onOpen of its own, no automatic writer.
- *   - Each page refresh runs through menuRunWithManualRefreshPriority_ when the
+ *   - Manual only: no trigger, no onOpen of its own, no automatic writer, no
+ *     service call and no change to any other global when the file loads.
+ *   - Each refresh runs through menuRunWithManualRefreshPriority_ when the
  *     live menu defines it (automatic refresh yields), otherwise directly.
- *   - A second click while a page refresh is running is refused (document
- *     cache flag, claimed under the document lock, cleared in finally,
+ *   - One run per renderer function at a time: a second click on a running
+ *     function is refused (document-cache flag keyed by the function, claimed
+ *     under the document lock when it is free within 3 s, cleared in finally,
  *     expires after 7 minutes if an execution dies).
  *   - Suggestions skip private helpers (trailing _), the v1 refreshers, and any
  *     name with test / install / remove / delete / clear / reset / purge /
  *     trigger / status / diag / debug / menu / setup / probe / audit / log /
  *     seed / layout in it. A typed name may be any function except this
- *     block's own.
- *   - When pasted after the v2.19.0 block, both _v2 tabs join
- *     MENU_DECISION_OWNED_EXTRA_, so "Active Page > Refresh" does not run the
- *     generic engine refresh on them. Without v2.19.0 this is a no-op.
+ *     block's own (checked on the resolved function, so a dotted path to one
+ *     of them is refused too).
+ *   - "Refresh both" stops before Top 10 when Portfolio has used 4 of the
+ *     6 execution minutes, and says so; refresh Top 10 on its own then.
+ *   - The block does not change how the main menu's "Active Page" items treat
+ *     the _v2 tabs; use this menu for them.
  *
  * ROLLBACK: delete the one onOpen line (the menu disappears; the block is inert
  * without it), optionally delete the block and the two Script Properties.
- * Conventions: ES5 (var, function), no service call at load time.
+ * Conventions: ES5 (var, function).
  * ========================================================================== */
 
 var TFB_PAGES_V2_MENU_VERSION = '1.0.0';
 var TFB_PAGES_V2_MENU_TITLE_ = '🆕 Decision Pages v2';
 var TFB_PAGES_V2_INFLIGHT_TTL_S_ = 420;
+var TFB_PAGES_V2_BOTH_BUDGET_MS_ = 240000;
 var TFB_PAGES_V2_ = {
   pd: {
     key: 'pd', sheet: 'Portfolio_Decision_v2', prop: 'TFB_V2_PD_REFRESH_FN',
@@ -69,20 +74,6 @@ var TFB_PAGES_V2_EXCLUDE_ = ['test', 'selftest', 'install', 'uninstall', 'remove
   'menu', 'onopen', 'onedit', 'oninstall', 'setup', 'probe', 'audit', 'log', 'seed', 'layout'];
 var TFB_PAGES_V2_STRONG_VERBS_ = ['refresh', 'render', 'run', 'update', 'rebuild', 'generate', 'publish'];
 var TFB_PAGES_V2_WEAK_VERBS_ = ['build', 'write', 'make', 'compute', 'create', 'draw'];
-
-/* Both _v2 tabs are decision-owned for the v2.19.0 menu (no generic engine
- * refresh). Runs at load; effective only when MENU_DECISION_OWNED_EXTRA_ is
- * already defined, i.e. this block sits after the v2.19.0 block. */
-(function tfbPagesV2MarkDecisionOwned_() {
-  try {
-    if (typeof MENU_DECISION_OWNED_EXTRA_ === 'undefined' || !MENU_DECISION_OWNED_EXTRA_ ||
-        typeof MENU_DECISION_OWNED_EXTRA_.push !== 'function') return;
-    var names = [TFB_PAGES_V2_.pd.sheet, TFB_PAGES_V2_.t10.sheet];
-    for (var i = 0; i < names.length; i++) {
-      if (MENU_DECISION_OWNED_EXTRA_.indexOf(names[i]) < 0) MENU_DECISION_OWNED_EXTRA_.push(names[i]);
-    }
-  } catch (ownErr) {}
-})();
 
 /* ---------------------------------------------------------------- menu */
 function tfbPagesV2Menu_(ui) {
@@ -121,9 +112,13 @@ function tfbPagesV2Setup() {
   if (!ui) return null;
   var out = {};
   var keys = ['pd', 't10'];
-  for (var i = 0; i < keys.length; i++) out[keys[i]] = tfbPagesV2SetupPage_(TFB_PAGES_V2_[keys[i]], ui, true);
-  tfbPagesV2Toast_('Refresh functions: Portfolio_Decision_v2 = ' + (out.pd || '(not set)') +
-    ' · Top_10_Investments_v2 = ' + (out.t10 || '(not set)'), 8);
+  for (var i = 0; i < keys.length; i++) {
+    var page = TFB_PAGES_V2_[keys[i]];
+    tfbPagesV2SetupPage_(page, ui, true);
+    out[keys[i]] = tfbPagesV2Prop_(page.prop) || null;   // what is saved now, whatever was answered
+  }
+  tfbPagesV2Toast_('Saved refresh functions: Portfolio_Decision_v2 = ' + (out.pd || '(none)') +
+    ' · Top_10_Investments_v2 = ' + (out.t10 || '(none)'), 8);
   return out;
 }
 
@@ -137,19 +132,19 @@ function tfbPagesV2Status() {
     var sh = tfbPagesV2Sheet_(page.sheet);
     var cands = tfbPagesV2Candidates_(page);
     var resolved = !!(name && tfbPagesV2Resolve_(name));
+    var running = !!(name && tfbPagesV2InFlight_(name));
     report[page.key] = { configured: name, resolves: resolved, tab: !!sh, candidates: cands.slice(0, 5),
-      running: tfbPagesV2InFlight_(page.key) };
+      running: running };
     lines.push(page.sheet + ':');
     lines.push('  tab: ' + (sh ? 'present (' + sh.getLastRow() + ' rows)' : 'NOT FOUND'));
     lines.push('  refresh function: ' + (name ? name + (resolved ? ' (found)' : ' (NOT FOUND)') : '(not set)') +
       '  [Script Property ' + page.prop + ']');
     lines.push('  suggestions: ' + (cands.length ? cands.slice(0, 5).join(', ') : 'none found'));
-    if (report[page.key].running) lines.push('  a refresh is running now');
+    if (running) lines.push('  its refresh function is running now');
     lines.push('');
   }
   lines.push('Manual-priority wrapper: ' +
     (typeof menuRunWithManualRefreshPriority_ === 'function' ? 'used' : 'not in this project (direct run)'));
-  lines.push('Decision-owned in the menu: ' + (tfbPagesV2DecisionOwned_() ? 'yes' : 'no (needs the v2.19.0 block above this one)'));
   var ui = tfbPagesV2Ui_();
   if (ui) ui.alert(TFB_PAGES_V2_MENU_TITLE_, lines.join('\n'), ui.ButtonSet.OK);
   return report;
@@ -168,34 +163,46 @@ function tfbPagesV2RefreshAndReport_(keys) {
     }
     targets.push({ page: page, name: name });
   }
+  var t0 = new Date().getTime();
   var results = [];
-  var ran = {};
+  var attempted = {};
   for (var j = 0; j < targets.length; j++) {
     var t = targets[j];
-    if (ran[t.name]) {
-      results.push({ page: t.page.sheet, status: 'ok', fn: t.name, ms: 0, shared: ran[t.name] });
+    var prior = attempted[t.name];
+    if (prior) {
+      /* One function renders both tabs: never run it a second time in this click. */
+      results.push({ page: t.page.sheet, status: prior.status, fn: t.name, ms: 0, shared: prior.page,
+        error: prior.error, summary: prior.summary });
+      continue;
+    }
+    if (j > 0 && new Date().getTime() - t0 > TFB_PAGES_V2_BOTH_BUDGET_MS_) {
+      results.push({ page: t.page.sheet, status: 'skipped_time', fn: t.name, ms: 0 });
       continue;
     }
     var r = tfbPagesV2RunOne_(t.page, t.name);
     results.push(r);
-    if (r.status === 'ok') ran[t.name] = t.page.sheet;
+    attempted[t.name] = r;
   }
   var failed = [];
   var parts = [];
   for (var k = 0; k < results.length; k++) {
     var x = results[k];
+    var sharedNote = x.shared ? ' (same function as ' + x.shared + ', run once)' : '';
     if (x.status === 'ok') {
-      parts.push(x.page + ': done' + (x.shared ? ' (same function as ' + x.shared + ')' : ' in ' + Math.round(x.ms / 1000) + ' s') +
+      parts.push(x.page + ': done' + (x.shared ? sharedNote : ' in ' + Math.round(x.ms / 1000) + ' s') +
         (x.summary ? ' - ' + x.summary : ''));
-    } else if (x.status === 'busy') {
-      parts.push(x.page + ': already refreshing, try again when it finishes');
-      failed.push(x);
+      continue;
+    }
+    failed.push(x);
+    if (x.status === 'busy') {
+      parts.push(x.page + ': ' + x.fn + '() is already running, try again when it finishes' + sharedNote);
     } else if (x.status === 'deferred') {
-      parts.push(x.page + ': not run now (the manual-refresh coordinator answered: ' + (x.summary || 'busy') + ')');
-      failed.push(x);
+      parts.push(x.page + ': not run now - the manual-refresh coordinator did not run ' + x.fn + '()' +
+        (x.summary ? ' (it answered: ' + x.summary + ')' : '') + sharedNote);
+    } else if (x.status === 'skipped_time') {
+      parts.push(x.page + ': not started, the first refresh used most of the 6-minute limit; refresh it on its own');
     } else {
-      parts.push(x.page + ': FAILED in ' + x.fn + '() - ' + x.error);
-      failed.push(x);
+      parts.push(x.page + ': FAILED - ' + x.error + sharedNote);
     }
   }
   if (failed.length && ui) {
@@ -219,10 +226,11 @@ function tfbPagesV2EnsureConfigured_(page, ui) {
 
 function tfbPagesV2RunOne_(page, name) {
   var target = tfbPagesV2Resolve_(name);
-  if (!target) return { page: page.sheet, status: 'error', fn: name, ms: 0, error: 'function not found' };
-  if (!tfbPagesV2Claim_(page.key)) return { page: page.sheet, status: 'busy', fn: name, ms: 0 };
+  if (!target) return { page: page.sheet, status: 'error', fn: name, ms: 0, error: name + '() not found' };
+  if (!tfbPagesV2Claim_(name)) return { page: page.sheet, status: 'busy', fn: name, ms: 0 };
   var t0 = new Date().getTime();
   var called = false;
+  var wrapped = typeof menuRunWithManualRefreshPriority_ === 'function';
   try {
     /* Open the tab first: the user sees the page being refreshed, and a
      * renderer that writes to the active sheet writes to the right one. */
@@ -230,17 +238,17 @@ function tfbPagesV2RunOne_(page, name) {
     if (sh) { try { SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(sh); } catch (actErr) {} }
     tfbPagesV2Toast_('Refreshing ' + page.sheet + ' with ' + name + '() ...', 5);
     var call = function () { called = true; return target.fn.apply(target.self, []); };
-    var result = (typeof menuRunWithManualRefreshPriority_ === 'function')
-      ? menuRunWithManualRefreshPriority_('Refresh ' + page.sheet, call)
-      : call();
+    var result = wrapped ? menuRunWithManualRefreshPriority_('Refresh ' + page.sheet, call) : call();
     try { SpreadsheetApp.flush(); } catch (flushErr) {}
     return { page: page.sheet, status: called ? 'ok' : 'deferred', fn: name, ms: new Date().getTime() - t0,
       summary: tfbPagesV2Summary_(result) };
   } catch (err) {
+    var msg = String((err && err.message) || err).slice(0, 300);
     return { page: page.sheet, status: 'error', fn: name, ms: new Date().getTime() - t0,
-      error: String((err && err.message) || err).slice(0, 300) };
+      error: called ? name + '(): ' + msg
+        : 'the manual-refresh coordinator failed before running ' + name + '(): ' + msg };
   } finally {
-    tfbPagesV2Release_(page.key);
+    tfbPagesV2Release_(name);
   }
 }
 
@@ -255,6 +263,8 @@ function tfbPagesV2Summary_(result) {
 }
 
 /* ---------------------------------------------------------------- setup */
+/* Returns the name now saved for the page, or null when nothing was saved by
+ * this call. A blank answer takes the shown default; '-' removes the saved one. */
 function tfbPagesV2SetupPage_(page, ui, fromSetupItem) {
   var current = tfbPagesV2Prop_(page.prop);
   var cands = tfbPagesV2Candidates_(page);
@@ -269,23 +279,36 @@ function tfbPagesV2SetupPage_(page, ui, fromSetupItem) {
   }
   body += '\nType a function name or its number' +
     (suggestion ? ', or leave blank and press OK to use ' + suggestion : '') + '.';
-  if (fromSetupItem && current) body += '\nCurrently saved: ' + current;
+  if (fromSetupItem && current) body += '\nCurrently saved: ' + current + ' (type - to remove it).';
   var resp = ui.prompt(TFB_PAGES_V2_MENU_TITLE_ + ' - ' + page.sheet, body, ui.ButtonSet.OK_CANCEL);
   if (resp.getSelectedButton() !== ui.Button.OK) return null;
   var text = String(resp.getResponseText() || '').trim();
-  if (/^\d+$/.test(text)) text = listed[parseInt(text, 10) - 1] || '';
+  if (text === '-') {
+    PropertiesService.getScriptProperties().deleteProperty(page.prop);
+    return null;
+  }
+  if (/^\d+$/.test(text)) {
+    var n = parseInt(text, 10);
+    if (n < 1 || n > listed.length) {
+      ui.alert(TFB_PAGES_V2_MENU_TITLE_, 'There is no suggestion number ' + text + ' for ' + page.sheet +
+        '. Nothing was saved.', ui.ButtonSet.OK);
+      return null;
+    }
+    text = listed[n - 1];
+  }
   if (!text) text = suggestion;
   if (!text) {
     ui.alert(TFB_PAGES_V2_MENU_TITLE_, 'Nothing was chosen for ' + page.sheet + '. Open the tab\'s own script ' +
       'file, find the function that writes it, and type its name here.', ui.ButtonSet.OK);
     return null;
   }
-  if (tfbPagesV2IsOwn_(text)) {
+  var target = tfbPagesV2Resolve_(text);
+  if (tfbPagesV2IsOwn_(text) || (target && tfbPagesV2IsOwnFn_(target.fn))) {
     ui.alert(TFB_PAGES_V2_MENU_TITLE_, text + ' is part of this menu block; choose the function that renders ' +
       page.sheet + '.', ui.ButtonSet.OK);
     return null;
   }
-  if (!tfbPagesV2Resolve_(text)) {
+  if (!target) {
     ui.alert(TFB_PAGES_V2_MENU_TITLE_, 'No function named "' + text + '" exists in this project. Nothing was saved.',
       ui.ButtonSet.OK);
     return null;
@@ -304,15 +327,42 @@ function tfbPagesV2IsOwn_(name) {
   return String(name).replace(/^\s+/, '').toLowerCase().indexOf('tfbpagesv2') === 0;
 }
 
+/* True for every function this block defines, however it was reached. */
+function tfbPagesV2IsOwnFn_(fn) {
+  try {
+    var n = fn && fn.name;
+    if (n && tfbPagesV2IsOwn_(n)) {
+      var root = tfbPagesV2Root_();
+      return root[n] === fn;
+    }
+  } catch (ownErr) {}
+  return false;
+}
+
+/* A top-level const/let/class lives in the global lexical scope, not on the
+ * global object; a Function body evaluates in global scope and can see it. */
+function tfbPagesV2GlobalLexical_(ident) {
+  try {
+    return new Function('try { return typeof ' + ident + ' === "undefined" ? undefined : ' + ident +
+      '; } catch (e) { return undefined; }')();
+  } catch (lexErr) {
+    return undefined;
+  }
+}
+
 /* "fn" or "Library.fn"; returns {fn, self} or null. */
 function tfbPagesV2Resolve_(name) {
   var parts = String(name || '').trim().split('.');
-  if (!parts[0]) return null;
+  for (var p = 0; p < parts.length; p++) {
+    if (!/^[A-Za-z_$][\w$]*$/.test(parts[p])) return null;
+  }
   var self = null;
-  var cur = tfbPagesV2Root_();
+  var cur;
   try {
-    for (var i = 0; i < parts.length; i++) {
-      if (!/^[A-Za-z_$][\w$]*$/.test(parts[i])) return null;
+    var root = tfbPagesV2Root_();
+    cur = root[parts[0]];
+    if (cur === undefined) cur = tfbPagesV2GlobalLexical_(parts[0]);
+    for (var i = 1; i < parts.length; i++) {
       if (cur === null || cur === undefined) return null;
       self = cur;
       cur = cur[parts[i]];
@@ -385,18 +435,18 @@ function tfbPagesV2Candidates_(page) {
 }
 
 /* ---------------------------------------------------------------- in-flight guard */
-function tfbPagesV2FlagKey_(key) { return 'TFB_PAGES_V2_INFLIGHT_' + key; }
+function tfbPagesV2FlagKey_(fnName) { return 'TFB_PAGES_V2_INFLIGHT_' + String(fnName).trim(); }
 
 function tfbPagesV2Cache_() {
   try { return CacheService.getDocumentCache() || CacheService.getScriptCache(); } catch (cacheErr) { return null; }
 }
 
-function tfbPagesV2InFlight_(key) {
+function tfbPagesV2InFlight_(fnName) {
   var cache = tfbPagesV2Cache_();
-  try { return !!(cache && cache.get(tfbPagesV2FlagKey_(key))); } catch (getErr) { return false; }
+  try { return !!(cache && cache.get(tfbPagesV2FlagKey_(fnName))); } catch (getErr) { return false; }
 }
 
-function tfbPagesV2Claim_(key) {
+function tfbPagesV2Claim_(fnName) {
   var cache = tfbPagesV2Cache_();
   if (!cache) return true;
   var lock = null;
@@ -409,8 +459,8 @@ function tfbPagesV2Claim_(key) {
     lock = null;
   }
   try {
-    if (cache.get(tfbPagesV2FlagKey_(key))) return false;
-    cache.put(tfbPagesV2FlagKey_(key), String(new Date().getTime()), TFB_PAGES_V2_INFLIGHT_TTL_S_);
+    if (cache.get(tfbPagesV2FlagKey_(fnName))) return false;
+    cache.put(tfbPagesV2FlagKey_(fnName), String(new Date().getTime()), TFB_PAGES_V2_INFLIGHT_TTL_S_);
     return true;
   } catch (claimErr) {
     return true;
@@ -419,9 +469,9 @@ function tfbPagesV2Claim_(key) {
   }
 }
 
-function tfbPagesV2Release_(key) {
+function tfbPagesV2Release_(fnName) {
   var cache = tfbPagesV2Cache_();
-  try { if (cache) cache.remove(tfbPagesV2FlagKey_(key)); } catch (remErr) {}
+  try { if (cache) cache.remove(tfbPagesV2FlagKey_(fnName)); } catch (remErr) {}
 }
 
 /* ---------------------------------------------------------------- small helpers */
@@ -439,16 +489,6 @@ function tfbPagesV2Sheet_(name) {
 
 function tfbPagesV2Toast_(msg, seconds) {
   try { SpreadsheetApp.getActiveSpreadsheet().toast(String(msg).slice(0, 400), TFB_PAGES_V2_MENU_TITLE_, seconds || 5); } catch (toastErr) {}
-}
-
-function tfbPagesV2DecisionOwned_() {
-  try {
-    if (typeof menuIsDecisionOwnedPage_ === 'function') {
-      return menuIsDecisionOwnedPage_(TFB_PAGES_V2_.pd.sheet) === true &&
-        menuIsDecisionOwnedPage_(TFB_PAGES_V2_.t10.sheet) === true;
-    }
-  } catch (ownErr) {}
-  return false;
 }
 
 function tfbPagesV2Open_(key) {
