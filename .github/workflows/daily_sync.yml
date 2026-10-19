@@ -435,6 +435,12 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # v6.70.0 FW-SKEW (C2, 2026-10-16): classify FW-2 P/E-coherence
+      # quarantines as as-of skew vs identity. off = byte-identical; observe
+      # logs one [FW-SKEW] line per page; enforce keeps skew-explained rows
+      # fresh. Arm observe first; enforce only after its read-back.
+      TFB_SYNC_FW_SKEW_AWARE: ${{ vars.TFB_SYNC_FW_SKEW_AWARE || 'off' }}
+      TFB_SYNC_FW_SKEW_MAX_REL: ${{ vars.TFB_SYNC_FW_SKEW_MAX_REL || '0.35' }}
       # WP-04: arm the runner's USX minor-unit screen in lockstep with Render.
       # Unset preserves the existing portfolio currency contract; rollback: 0.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
@@ -1708,6 +1714,9 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
+      # v6.70.0 FW-SKEW: mirror sync-dashboard (recovery must classify alike).
+      TFB_SYNC_FW_SKEW_AWARE: ${{ vars.TFB_SYNC_FW_SKEW_AWARE || 'off' }}
+      TFB_SYNC_FW_SKEW_MAX_REL: ${{ vars.TFB_SYNC_FW_SKEW_MAX_REL || '0.35' }}
       # WP-04: mirror the primary runner's default-off minor-unit screen.
       TFB_OPP_FX_USX_SUBUNIT: ${{ vars.TFB_OPP_FX_USX_SUBUNIT || '0' }}
       # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
