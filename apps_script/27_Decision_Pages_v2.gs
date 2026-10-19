@@ -1,7 +1,13 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.2 (2026-10-20)
+ * Version: 1.2.3 (2026-10-20)
+ *   1.2.3: TWO MORE REVIEW FINDINGS. (a) A rotation must COVER the shortfall (dp2RotationPick_ gets the shortfall as
+ *          minValue, as the engine's floor guard does); a smaller eligible holding is reported as rotation-insufficient
+ *          and the seat stays a CAPITAL CALL — the page never advises a sale that cannot fund the advertised seat.
+ *          (b) Exit-alert actions are specific to the signal code: a stop instruction only for RAISE_STOP /
+ *          NO_BROKER_STOP; HOLD / HOLD_BE / TP_WATCH / broker-unknown never say 'raise' to a lower level ('No stop
+ *          change — never lower a stop'); a rotation-only mail carries the switch action instead.
  *   1.2.2: TWO REVIEW FINDINGS. (a) ONE CASH BASIS: both pages and the shared allocation memo use dp2CashBasis_ —
  *          Top_10 'Entered cash' → _IBKR_Account cash (STALE-flagged) → _Cash_Snapshot; the memo is keyed on
  *          cash|fx so a different balance recomputes; each page discloses the other reading and flags a gap
@@ -94,7 +100,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.2';
+var DP2_VERSION = '1.2.3';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1168,15 +1174,25 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'RAISE_STOP') why = 'the trailing rule puts the stop at ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + dp2RFmt_(x.gainR) + ' at the high); the working broker stop is ' + dp2Fmt_(it.brokerStop, 2) + '.';
   else if (s.code === 'NO_BROKER_STOP') why = 'no working stop order is listed in _IBKR_Orders; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
   else why = s.text;
-  var action;
+  // v1.2.3 (review finding): the action is specific to the signal code — a stop instruction only for RAISE_STOP /
+  // NO_BROKER_STOP; HOLD-type codes never say "raise" to a lower level; a rotation-only mail carries the switch action.
+  var action = null;
+  var trailTxt = ' — or a trailing stop order, trail amount ' + (x ? dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR)' : 'n/a') + '.';
   if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ').';
   else if (s.code === 'STOP_NEAR') action = 'Decide now: pre-empt at ' + dp2Fmt_(x.last, 2) + ', or let the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' decide — and make sure a broker stop at least that high is working.';
-  else action = 'Raise the IBKR stop to ' + dp2Fmt_(x.stop, 2) + ' — or replace it with a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR).';
+  else if (s.code === 'RAISE_STOP') action = 'Raise the IBKR stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) + trailTxt;
+  else if (s.code === 'NO_BROKER_STOP') action = 'Place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop is listed)' + trailTxt;
+  else if (s.code === 'TP_WATCH') action = 'No stop change. The broker take-profit ' + dp2Fmt_(it.brokerTp, 2) + ' is close: keep it to bank the gain, or cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.';
+  else if (s.code === 'HOLD_BROKER_UNKNOWN') action = 'No stop change from this page — the broker orders are unknown here; confirm at the broker that a stop at or above ' + dp2Fmt_(x.stop, 2) + ' is working.';
+  else if (s.code === 'HOLD' || s.code === 'HOLD_BE') action = 'No stop change — the working broker stop ' + (it.brokerStop ? dp2Fmt_(it.brokerStop, 2) + ' is at or above the rule\'s ' + dp2Fmt_(x.stop, 2) : 'is where the rule puts it') + '; keep it. Never lower a stop.';
+  else action = s.text + ' — no stop change.';
   if (it.rotation && it.rotation.plan) {
     var rp = it.rotation.plan, rr = rp.rotation;
     var rtxt = ' SWITCH (research): ' + rr.action.toLowerCase() + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' — ' + (rp.basis === '3m' ? 'plan 3M' : 'engine 12M') + ' ' + dp2PctPlain_(rp.oppRoi, 1) + ' vs this holding ' + dp2PctPlain_(rr.roi, 1) + ' (edge +' + dp2Fmt_(rr.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost).';
     why += rtxt;
-    if (s.code === 'HOLD' || s.code === 'HOLD_BE' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'STOP_NEAR') action += ' Consider the switch above when the feed is released; the engine will carry the same plan.';
+    var switchAct = 'SWITCH (research): ' + rr.action.toLowerCase() + ' ' + it.symbol + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' when the feed is released — the engine will carry the same plan. Research only; no order is placed by this page.';
+    if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
+    else action = switchAct + ' Stop: ' + action;
   }
   return { head: it.symbol + ' — ' + (it.name || '') + ' · ' + dp2Fmt_(it.qty) + ' × ' + dp2Fmt_(it.entry, 2) + ' → last ' + dp2Fmt_(x.last, 2) + (pnl !== null ? ' (' + dp2Signed_(pnl) + ' SAR unrealized)' : ''), signal: s.text + (it.rotation ? ' · SWITCH candidate' : ''), why: why, action: action };
 }
@@ -1395,7 +1411,9 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
     }
     var short = Math.max(0, need - avail);
     plan.short = short;
-    var rot = used ? null : dp2RotationPick_(opp, holdings, basis, 0);
+    // v1.2.3 (review finding): the holding must cover the shortfall (the engine's floor guard passes the shortfall as
+    // min_value_sar); a smaller eligible holding is reported as rotation-insufficient and the seat stays a capital call.
+    var rot = used ? null : dp2RotationPick_(opp, holdings, basis, short);
     if (rot) {
       used = true;
       var proceeds = Math.min(rot.valueSar, need);
@@ -1413,6 +1431,9 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
       var ins = null;
       if (!used) { for (var k = 0; k < holdings.length; k++) { var h = holdings[k]; if (h.isFI || !h.valueSar) continue; var rr = basis === '3m' ? h.roi3 : h.roi12; if (rr === null || rr === undefined || opp === null) continue; var e = opp - rr - DP2A.ROT_COST_PCT; if (ins === null || e > ins.edge) ins = { symbol: h.symbol, edge: Math.round(e * 10) / 10, roi: rr }; } }
       if (ins) plan.bestHolding = ins;
+      // an eligible holding that clears the hurdle but is worth less than the shortfall (engine: rotation_insufficient)
+      var small = used ? null : dp2RotationPick_(opp, holdings, basis, 0);
+      if (small && small.valueSar < short - 0.5) plan.rotationInsufficient = { symbol: small.symbol, covers: small.valueSar, short: short, edge: small.edge, roi: small.roi };
     }
     plans.push(plan);
   }
@@ -1427,7 +1448,7 @@ function dp2PlanText_(pl) {
     return pl.sym + ' — FUNDABLE BY ROTATION: ' + r.action.toLowerCase() + ' ' + r.symbol + ' (' + dp2Fmt_(r.proceeds) + ' SAR) → ticket ' + dp2Fmt_(pl.ticket) + ' SAR · ' + b + ': ' + pl.sym + ' ' + dp2PctPlain_(pl.oppRoi, 1) + ' vs ' + r.symbol + ' ' + dp2PctPlain_(r.roi, 1) + ' → edge +' + dp2Fmt_(r.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost (hurdle ' + hurdle + ')' +
       (pl.short > 0 ? '; a full seat would need ' + dp2Fmt_(pl.short) + ' SAR more' : '') + (r.remnantExit ? ' (a trim would leave a sub-floor remnant → full exit' + (r.surplus ? ', surplus ' + dp2Fmt_(r.surplus) + ' SAR to cash' : '') + ')' : '');
   }
-  if (pl.state === 'CAPITAL_CALL') return pl.sym + ' — CAPITAL CALL: ' + (pl.rotationTaken ? 'no cash left and this run\'s single rotation is already assigned (one switch per run, as in the engine)' : 'no cash and no holding trails it by ≥ ' + hurdle + ' pp (' + b + ') after cost' + (pl.bestHolding ? ' — closest: ' + pl.bestHolding.symbol + ' ' + dp2PctPlain_(pl.bestHolding.roi, 1) + ' (edge ' + (pl.bestHolding.edge >= 0 ? '+' : '') + dp2Fmt_(pl.bestHolding.edge, 1) + ' pp)' : '')) + '; a seat needs ' + dp2Fmt_(pl.need) + ' SAR';
+  if (pl.state === 'CAPITAL_CALL') return pl.sym + ' — CAPITAL CALL: ' + (pl.rotationTaken ? 'no cash left and this run\'s single rotation is already assigned (one switch per run, as in the engine)' : (pl.rotationInsufficient ? pl.rotationInsufficient.symbol + ' clears the hurdle (edge +' + dp2Fmt_(pl.rotationInsufficient.edge, 1) + ' pp, ' + b + ') but is worth ' + dp2Fmt_(pl.rotationInsufficient.covers) + ' SAR against a ' + dp2Fmt_(pl.rotationInsufficient.short) + ' SAR shortfall — rotation insufficient (floor guard), no sale advised' : 'no cash and no holding trails it by ≥ ' + hurdle + ' pp (' + b + ') after cost' + (pl.bestHolding ? ' — closest: ' + pl.bestHolding.symbol + ' ' + dp2PctPlain_(pl.bestHolding.roi, 1) + ' (edge ' + (pl.bestHolding.edge >= 0 ? '+' : '') + dp2Fmt_(pl.bestHolding.edge, 1) + ' pp)' : ''))) + '; a seat needs ' + dp2Fmt_(pl.need) + ' SAR';
   return pl.sym + ' — ' + pl.state;
 }
 /* Holdings for the rotation rule, from the ledger lots + My_Portfolio forward ROI + the working broker TP. */
