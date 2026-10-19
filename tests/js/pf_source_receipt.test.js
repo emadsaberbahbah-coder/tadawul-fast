@@ -165,7 +165,9 @@ function run(opts) {
   if (opts.selfTest) {
     return {report: ctx.pdSelfTest(), logs: logs, status_reads: calls.status_reads};
   }
-  ctx.refreshPortfolioDecision();
+  if (opts.expectResponseError) {
+    assert.throws(() => ctx.refreshPortfolioDecision(), /^Error: RESPONSE ERROR: backend status error$/);
+  } else ctx.refreshPortfolioDecision();
   return {b2: statusSets[statusSets.length - 1], post: calls.posts[0],
           status_reads: calls.status_reads, logs: logs, ctx: ctx};
 }
@@ -242,7 +244,8 @@ const WITHHELD = [
   ['row repeated', {grid: statusGrid({duplicate: true})}, 'My_Portfolio status row repeated'],
   ['row missing', {grid: statusGrid({drop: true})}, 'My_Portfolio status row missing'],
   ['_Status missing', {noStatusSheet: true}, 'publication status unavailable'],
-  ['decision status not ok', {response: Object.assign({}, RESPONSE, {status: 'error'})}, 'decision status error'],
+  ['decision status not ok', {response: Object.assign({}, RESPONSE, {status: 'error'}),
+                            expectResponseError: true}, 'backend status error'],
   ['publication changed during the decision',
    {onFetch(g) { const n = g.map((x) => x.slice()); n[2][3] = statusMessage({run: '4242424243'}); return n; }},
    'publication changed during the decision'],
@@ -268,14 +271,19 @@ const WITHHELD = [
     onFetch() { return statusGrid(); }},
    'publication not ready before the holdings read (data not COMPLETE)'],
 ];
-check('T04 enforce withholds with one declaration and a reason, for ' + WITHHELD.length + ' cases', () => {
+check('T04 enforce withholds with one declaration, or rejects an operational failure without a receipt, for ' + WITHHELD.length + ' cases', () => {
   dump.withheld = {};
   for (const [label, o, why] of WITHHELD) {
     const r = run(Object.assign({scriptProps: {PD_SOURCE_RECEIPT: 'enforce'}}, o));
     dump.withheld[label] = r.b2;
-    assert.equal(count(DECLARATION_RE, r.b2), 1, label);
+    if (o.expectResponseError) {
+      assert.equal(count(DECLARATION_RE, r.b2), 0, label);
+      assert.ok(r.b2.includes('status: RESPONSE ERROR'), label + ': ' + r.b2);
+    } else {
+      assert.equal(count(DECLARATION_RE, r.b2), 1, label);
+      assert.ok(r.b2.indexOf(' | source readiness WITHHELD: ') > 0, label + ': ' + r.b2);
+    }
     assert.equal(count(RECEIPT_RE, r.b2), 0, label);
-    assert.ok(r.b2.indexOf(' | source readiness WITHHELD: ') > 0, label + ': ' + r.b2);
     assert.ok(r.b2.indexOf(why) > 0, label + ' expected "' + why + '" in ' + r.b2);
   }
 });

@@ -2,7 +2,7 @@
 # scripts/backup_workbook.py
 """
 ================================================================================
-Workbook Backup — v1.5.2 (W-4, Execution Plan v2.1; Gate & Evidence Register §8)
+Workbook Backup — v1.5.3 (W-4, Execution Plan v2.1; Gate & Evidence Register §8)
 ================================================================================
 NEW script (window whitelist W-4, scheduled Jul 22–24; adopted 2026-07-20).
 
@@ -95,8 +95,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from xml.parsers import expat
 from zoneinfo import ZoneInfo
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 
+# WHY v1.5.3 (2026-10-19): the content PUT lost its TLS connection after
+# export, and the resumable session was never queried. Recover within that
+# same session using Google's acknowledged byte range; a lost final reply
+# may already represent a completed file. Bound requests/backoff and require
+# matching completion metadata before monthly copy or retention. Session
+# URLs and HTTP response bodies must not enter upload failure diagnostics.
 # WHY v1.5.2 (2026-10-17): a large HTTP error body or damaged XLSX passed
 # the byte floor, could replace today's backup and trigger retention.
 # Validate bounded ZIP/XML structure, sheet relationships and the existing
@@ -267,6 +273,9 @@ _SHEET_NAMESPACES = ("http://schemas.openxmlformats.org/spreadsheetml/2006/main"
                      "http://purl.oclc.org/ooxml/spreadsheetml/main")
 _DOCUMENT_REL_NAMESPACES = ("http://schemas.openxmlformats.org/officeDocument/2006/relationships",
                             "http://purl.oclc.org/ooxml/officeDocument/relationships")
+_DRIVE_UPLOAD_MAX_REQUESTS = 8
+_DRIVE_UPLOAD_RECOVERY_SECONDS = 600
+_DRIVE_RETRY_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
 
 
 def _validate_export_xlsx(data: bytes) -> set[str]:
@@ -707,24 +716,142 @@ def drive_list(sess, folder_id: str) -> List[Dict[str, Any]]:
             return files
 
 
+class DriveUploadError(RuntimeError):
+    """An upload failure whose message never contains a private session URI."""
+
+    def __init__(self, message, *, stage="content", response=None):
+        super().__init__(message)
+        self.stage = stage
+        self.response = response
+
+
+def _drive_error_code(response) -> str:
+    """Keep only known API reason codes, never the server's human message."""
+    try:
+        reason = response.json()["error"]["errors"][0]["reason"]
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        return ""
+    return reason if isinstance(reason, str) and reason in {
+        "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded",
+        "insufficientFilePermissions", "storageQuotaExceeded", "authError",
+        "notFound", "forbidden", "backendError", "internalError",
+    } else ""
+
+
+def _drive_upload_acknowledgement(response, name: str, data: bytes) -> Dict[str, Any]:
+    """A completed binary upload must identify the file and its exact bytes."""
+    try:
+        metadata = response.json()
+    except (TypeError, ValueError):
+        raise DriveUploadError("resumable upload acknowledgement is not JSON") from None
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("id"), str) \
+            or not metadata["id"].strip() or metadata.get("name") != name:
+        raise DriveUploadError("resumable upload acknowledgement has no matching file identity")
+    checksum = metadata.get("md5Checksum")
+    if str(metadata.get("size")) != str(len(data)) or not isinstance(checksum, str) or \
+            checksum.lower() != hashlib.md5(data, usedforsecurity=False).hexdigest():
+        raise DriveUploadError("resumable upload acknowledgement does not match exported bytes")
+    return metadata
+
+
 def drive_upload_resumable(sess, folder_id: str, name: str,
                            data: bytes) -> Dict[str, Any]:
+    """Resume only the known session; never create another file after ambiguity.
+
+    Google Drive's resumable protocol requires an empty status PUT after a
+    transport/5xx failure, then continuation at the server's Range offset.
+    A 308 is incomplete even when all bytes were received. Only 200/201 with
+    a matching file/content receipt authorizes the backup's later mutations.
+    Recovery uses at most eight PUTs, with timeouts capped by the remaining
+    ten-minute budget. Expired sessions and permanent errors fail closed.
+    """
+    from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
+
+    if not data:
+        raise DriveUploadError("resumable upload requires nonempty bytes", stage="initiate")
     meta = {"name": name, "parents": [folder_id]}
+    # Do not blindly retry this non-idempotent session creation request.
     r = sess.post(
         "https://www.googleapis.com/upload/drive/v3/files"
         "?uploadType=resumable&supportsAllDrives=true",
         json=meta,
+        params={"fields": "id,name,size,md5Checksum"},
         headers={"X-Upload-Content-Type": _XLSX_MIME,
                  "X-Upload-Content-Length": str(len(data))},
-        timeout=60)
-    r.raise_for_status()
+        timeout=60, allow_redirects=False)
+    if r.status_code != 200:
+        raise DriveUploadError(f"resumable upload initiation: HTTP {r.status_code}",
+                               stage="initiate", response=r)
     loc = r.headers.get("Location")
     if not loc:
-        raise RuntimeError("resumable upload: no session Location header")
-    r2 = sess.put(loc, data=data,
-                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
-    r2.raise_for_status()
-    return r2.json()
+        raise DriveUploadError("resumable upload: no session Location header", stage="initiate")
+
+    total, offset, status_only = len(data), 0, False
+    deadline = time.monotonic() + _DRIVE_UPLOAD_RECOVERY_SECONDS
+    recoveries = 0
+    last_reason = "completion was not acknowledged"
+    last_response = None
+
+    def pause(attempt, reason):
+        nonlocal recoveries, last_reason
+        last_reason = reason
+        recoveries += 1
+        remaining = deadline - time.monotonic()
+        if attempt < _DRIVE_UPLOAD_MAX_REQUESTS and remaining > 0:
+            delay = min(2 ** min(recoveries - 1, 4), remaining)
+            _out(f"Drive upload recovery {attempt}/{_DRIVE_UPLOAD_MAX_REQUESTS}: "
+                 f"{reason}; retry in {delay:g}s")
+            time.sleep(delay)
+
+    for attempt in range(1, _DRIVE_UPLOAD_MAX_REQUESTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        stage = "status" if status_only else "content"
+        body = b"" if status_only else data[offset:]
+        headers = {"Content-Type": _XLSX_MIME, "Content-Length": str(len(body)),
+                   "Content-Range": (f"bytes */{total}" if status_only
+                                     else f"bytes {offset}-{total - 1}/{total}")}
+        try:
+            result = sess.put(loc, data=body, headers=headers,
+                              timeout=min(60 if status_only else 600, remaining),
+                              allow_redirects=False)
+        except (ConnectionError, Timeout, ChunkedEncodingError) as exc:
+            status_only = True
+            last_response = None
+            pause(attempt, type(exc).__name__)
+            continue
+        status = result.status_code
+        if status in (200, 201):
+            return _drive_upload_acknowledgement(result, name, data)
+        if status == 308:
+            received = 0
+            acknowledged = result.headers.get("Range")
+            if acknowledged:
+                match = re.fullmatch(r"bytes=0-(\d+)", acknowledged.strip())
+                if not match or len(match[1]) > 20:
+                    raise DriveUploadError("resumable upload returned an invalid byte range", stage=stage)
+                received = int(match[1]) + 1
+            if received < offset or received > total:
+                raise DriveUploadError("resumable upload returned an inconsistent byte range", stage=stage)
+            if received == offset:
+                pause(attempt, "no acknowledged byte progress")
+            offset = received
+            status_only = offset == total
+            last_reason = "completion was not acknowledged"
+            last_response = None
+            continue
+        reason = _drive_error_code(result)
+        if 500 <= status <= 599 or status == 429 or \
+                (status == 403 and reason in _DRIVE_RETRY_REASONS):
+            status_only = True
+            last_response = result
+            pause(attempt, f"HTTP {status}" + (f" {reason}" if reason else ""))
+            continue
+        raise DriveUploadError(f"resumable upload {stage}: HTTP {status}",
+                               stage=stage, response=result)
+    raise DriveUploadError(f"resumable upload recovery exhausted ({last_reason})",
+                           stage="status", response=last_response)
 
 
 def drive_copy(sess, file_id: str, folder_id: str, new_name: str
@@ -1004,9 +1131,19 @@ def run_backup(dry_run: bool) -> int:
         up = _store_upload(dsess, dest, container, daily_name(today), data)
     except Exception as e:  # noqa: BLE001
         email = _creds_email(creds)
-        reason = _api_reason(e)          # v1.2.0: Google's own words
-        _err = str(e)
-        if "404" in _err:
+        response = getattr(e, "response", None)
+        status = getattr(response, "status_code", None)
+        reason = _drive_error_code(response)
+        # requests exception text includes the upload's private session URI.
+        # API response messages can quote it too. Keep structured status and
+        # known reason codes, plus only our own controlled failure messages.
+        _err = str(e) if isinstance(e, DriveUploadError) else type(e).__name__
+        if status is not None and not isinstance(e, DriveUploadError):
+            _err += f" HTTP {status}"
+        if status == 404 and isinstance(e, DriveUploadError) and e.stage != "initiate":
+            _hint = ("the resumable session is no longer available; completion "
+                     "was not confirmed and previous backups were retained")
+        elif status == 404:
             # Drive answers 404 for a parent this account cannot SEE,
             # which covers BOTH "not shared" and "wrong id" — say both.
             _hint = (("bucket " + repr(container) + " not found for "
@@ -1022,7 +1159,7 @@ def run_backup(dry_run: bool) -> int:
                      "as EDITOR, or the id is wrong (it must be the bare "
                      "id from drive.google.com/drive/folders/<ID>, no "
                      "?usp=... tail)")
-        elif "403" in _err:
+        elif status == 403 and reason not in _DRIVE_RETRY_REASONS:
             _hint = (("bucket " + repr(container) + " refused the write for "
                   + email + " — grant it the Storage Object Admin role "
                   "(roles/storage.objectAdmin) on that bucket")
@@ -1033,8 +1170,9 @@ def run_backup(dry_run: bool) -> int:
                  if dest == "oauth"
                  else _403_remedy(reason, email, folder_id))
         else:
-            _hint = "is the folder shared EDITOR with " + email + "?"
-        msg = (f"[BACKUP v{__version__}] FAIL upload: {e}"
+            _hint = ("destination upload was not confirmed; no monthly copy "
+                     "or retention ran and previous backups were retained")
+        msg = (f"[BACKUP v{__version__}] FAIL upload: {_err}"
                + (f" [api_reason={reason}]" if reason else "")
                + f" — {_hint}")
         _out("ERROR: " + msg)

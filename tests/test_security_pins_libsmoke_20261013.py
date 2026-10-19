@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # tests/test_security_pins_libsmoke_20261013.py
 """
-Library behaviour smoke for the requirements.txt v1.1.4 security bumps.
+Library behaviour smoke for the requirements.txt v1.1.5 security repairs.
 
-VERSION 1.0.0 (2026-10-13)
+VERSION 1.1.0 (2026-10-19)
+WHY: verify the fixed FastAPI/Starlette pair against its exact production
+pins. NLTK is removed because it is unused and GHSA-8mgp-746c-j5xp has no
+patched release. L7 now requires its absence and exercises the production
+news tokenizer; no financial or freshness gate changes are needed.
+
+HISTORY: VERSION 1.0.0 (2026-10-13)
 WHY: requirements.txt v1.1.4 moves twelve production pins (aiohttp, anyio,
 cryptography, h2, lxml, nltk, protobuf, pydantic-settings, PyJWT, pyOpenSSL,
 python-dotenv, python-multipart). No other test in tests/ imports any of
@@ -11,8 +17,8 @@ those twelve libraries directly and none drives httpx with http2=True, so
 whole-suite parity guards the application logic, not the library behaviour
 the code relies on. This harness is that missing guard, committed so the
 owner can re-run it: each check exercises the same call shape the
-production code uses, on whatever stack is installed. It passes on the old
-stack (v1.1.3) and on the new one (v1.1.4); L11 pins down the one disclosed
+production code uses, on whatever stack is installed. That version passed
+on the old stack (v1.1.3) and on the new one (v1.1.4); L11 pins down the disclosed
 behaviour change (h2 4.4 rejects a server SETTINGS ENABLE_PUSH=1).
 
 No external network: L10/L11 use scripted in-memory HTTP/2 frames (no
@@ -34,7 +40,8 @@ TFB_LIBSMOKE_REQUIRE_PINNED=1.
       googleapiclient (the protobuf 5.x consumers).
   L6  lxml parse, BeautifulSoup "lxml" and pandas.read_html(flavor="lxml") (the
       yfinance get_earnings_dates path used by calendar_provider).
-  L7  nltk tokenize (reserved; core/news_intelligence.py HAS_NLTK probe).
+  L7  NLTK is absent, its news capability flag is false, and the existing
+      production tokenizer handles English and Arabic without it.
   L8  python-dotenv dotenv_values.
   L9  pydantic-settings env binding.
   L10 httpx.AsyncClient over an http2=True transport (the eodhd, finnhub and
@@ -52,7 +59,8 @@ TFB_LIBSMOKE_REQUIRE_PINNED=1.
   L15 import main:app in a child process with outbound sockets blocked:
       FastAPI app, openapi() builds, routes mounted with failed=0, zero
       blocked socket attempts.
-  I1  the installed versions of the twelve bumped packages equal the pins in
+  I1  the installed versions of the retained security packages and framework
+      pair equal the pins in
       requirements.txt. When they differ (a stale local venv) it SKIPS,
       unless TFB_LIBSMOKE_REQUIRE_PINNED=1 (set in the heavy CI step), where
       it FAILS.
@@ -83,17 +91,17 @@ import unittest
 from pathlib import Path
 from typing import Dict, List
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements.txt"
 PINS_HARNESS = ROOT / "tests" / "test_security_pins_20261013.py"
 
-# Distribution names of the twelve pins requirements.txt v1.1.4 moved.
+# Retained v1.1.4 security pins plus the fixed v1.1.5 framework pair.
 BUMPED = (
-    "aiohttp", "anyio", "cryptography", "h2", "lxml", "nltk", "protobuf",
+    "aiohttp", "anyio", "cryptography", "fastapi", "h2", "lxml", "protobuf",
     "pydantic-settings", "pyjwt", "pyopenssl", "python-dotenv",
-    "python-multipart",
+    "python-multipart", "starlette",
 )
 
 
@@ -310,11 +318,13 @@ def test_l06_lxml_bs4_and_pandas_read_html() -> None:
     print("L6 lxml %s ok: %s" % (_version("lxml"), ", ".join(checked)))
 
 
-def test_l07_nltk_tokenize() -> None:
-    _need("nltk")
-    from nltk.tokenize import wordpunct_tokenize
-    assert wordpunct_tokenize("Hi, there") == ["Hi", ",", "there"]
-    print("L7 nltk %s ok" % _version("nltk"))
+def test_l07_news_tokenizer_does_not_require_nltk() -> None:
+    assert importlib.util.find_spec("nltk") is None, "unused vulnerable NLTK must not be installed"
+    from core import news_intelligence as news
+    assert news.HAS_NLTK is False
+    assert news._tokenize("Hi, there") == ["hi", "there"]
+    assert news._tokenize("Growth أرباح") == ["growth", "أرباح"]
+    print("L7 NLTK absent; production English/Arabic tokenizer ok")
 
 
 def test_l08_python_dotenv_values() -> None:

@@ -105,3 +105,142 @@ def test_out_of_range_entry_reliability_is_excluded_without_clamping(tmp_path):
     assert result["overall"]["decided"] == 4
     assert result["overall"]["brier_n"] == 2
     assert result["overall"]["brier"] == pytest.approx((.04 + .81) / 2)
+
+
+def learning_export_fixture(path):
+    export_fixture(path)
+    workbook = openpyxl.load_workbook(path)
+    sheet = workbook["Performance_Log"]
+    for column, title in enumerate(("Last Updated (Riyadh)", "Target Date (Riyadh)",
+                                   "Maturity Date", "Notes"), 14):
+        sheet.cell(5, column, title)
+    for row in range(6, 14):
+        sheet.cell(row, 9, "2026-10-01 10:00:00")
+        sheet.cell(row, 14, "2026-10-19 02:30:19")
+        sheet.cell(row, 15, "2026-10-08 10:00:00")
+        if sheet.cell(row, 5).value == "matured":
+            sheet.cell(row, 16, "2026-10-10 14:55:15")
+    # Neither a newer duplicate nor an invalid outcome may freshen the
+    # accepted calibration population. New recordings are a separate clock.
+    sheet.cell(7, 16, "2026-10-19 02:30:19")  # duplicate A
+    sheet.cell(11, 16, "2026-10-19 02:30:19")  # missing/nonfinite ROI
+    sheet.cell(12, 9, "2026-10-19 02:30:19")  # active recommendation
+    sheet.cell(12, 17, "private free text | " + report.OUTCOME_WITNESS + json.dumps({
+        "schema": "tfb.outcome-price.v1", "state": "pending",
+        "reason": "quote_session_unknown;quote_http_429", "evaluated_at": "2026-10-11T23:00:17+03:00",
+        "provider": "private provider text which must not appear in report",
+    }))
+    calibration = workbook.create_sheet("_S1_Calibration")
+    calibration.append(["As Of (Riyadh)", "State", "N Checkpoints"])
+    calibration.append(["2026-10-11 23:00:18", "PASS", 6647])
+    workbook.save(path)
+    workbook.close()
+
+
+def test_fresh_recording_and_export_do_not_freshen_matured_evidence(tmp_path):
+    path = tmp_path / "learning.xlsx"
+    learning_export_fixture(path)
+    original = path.read_bytes()
+    result = report.analyze_workbook(path, as_of="2026-10-19")
+    clock = result["learning_clock"]
+    assert clock["latest_recorded_at_riyadh"] == "2026-10-19T02:30:19+03:00"
+    assert result["source"]["performance_updated_dates"]["latest"] == "2026-10-19"
+    assert clock["latest_maturity_at_riyadh"] == "2026-10-10T14:55:15+03:00"
+    assert clock["maturity_age_calendar_days"] == 9
+    assert clock["active_target_before_as_of_date"] == 1
+    assert clock["overdue_by_target_date"] == {"2026-10-08": 1}
+    assert clock["overdue_outcome_witness_reasons"] == {"quote_session_unknown;quote_http_429": 1}
+    assert clock["outcome_evaluation_age_calendar_days"] == 8
+    assert clock["calibration_snapshot"] == {
+        "available": True, "published_at_riyadh": "2026-10-11T23:00:18+03:00",
+        "age_calendar_days": 8, "checkpoint_state": "PASS", "n_checkpoints": 6647,
+        "timestamp_after_as_of": False,
+    }
+    assert result["overall"]["matured"] == 5 and result["overall"]["decided"] == 4
+    rendered = report.render_md(result)
+    assert "does not prove a new matured outcome" in rendered
+    assert "not the overall S-1 promotion decision" in rendered
+    assert "private free text" not in rendered and "private provider" not in rendered
+    assert path.read_bytes() == original
+    assert result == report.analyze_workbook(path, as_of="2026-10-19")
+
+
+def test_no_as_of_has_no_invented_today_or_overdue_classification(tmp_path):
+    path = tmp_path / "learning.xlsx"
+    learning_export_fixture(path)
+    clock = report.analyze_workbook(path)["learning_clock"]
+    assert clock["as_of_riyadh_date"] is None
+    assert clock["maturity_age_calendar_days"] is None
+    assert clock["active_target_before_as_of_date"] is None
+    assert clock["active_target_on_as_of_date"] is None
+    assert clock["overdue_by_target_date"] == {}
+    assert clock["calibration_snapshot"]["age_calendar_days"] is None
+
+
+@pytest.mark.parametrize("target,overdue,today,unknown", [
+    ("2026-10-18 23:59:59", 1, 0, 0),
+    ("2026-10-19 00:00:00", 0, 1, 0),
+    ("2026-10-20 00:00:00", 0, 0, 0),
+    ("2026-10-18T22:30:00+00:00", 0, 1, 0),  # 19 Oct in Riyadh
+    ("2026-10-18", 1, 0, 0),  # day evidence, no invented session close
+    ("invalid", 0, 0, 1),
+])
+def test_backlog_is_explicit_riyadh_calendar_day_evidence(tmp_path, target, overdue, today, unknown):
+    path = tmp_path / "learning.xlsx"
+    learning_export_fixture(path)
+    workbook = openpyxl.load_workbook(path)
+    workbook["Performance_Log"].cell(12, 15, target)
+    workbook.save(path)
+    workbook.close()
+    result = report.analyze_workbook(path, as_of="2026-10-19")
+    clock = result["learning_clock"]
+    assert clock["active_target_before_as_of_date"] == overdue
+    assert clock["active_target_on_as_of_date"] == today
+    assert clock["active_missing_or_invalid_target_date"] == unknown
+    assert result["overall"]["matured"] == 5  # target passage supplies no outcome
+
+
+def test_missing_times_remain_unknown_and_future_publication_cannot_have_zero_age(tmp_path):
+    path = tmp_path / "learning.xlsx"
+    learning_export_fixture(path)
+    workbook = openpyxl.load_workbook(path)
+    for row in range(6, 14):
+        workbook["Performance_Log"].cell(row, 16, "2026-10-10")
+    workbook["_S1_Calibration"].cell(2, 1, "2026-10-20 00:00:00")
+    workbook.save(path)
+    workbook.close()
+    clock = report.analyze_workbook(path, as_of="2026-10-19")["learning_clock"]
+    assert clock["latest_maturity_at_riyadh"] is None
+    assert clock["maturity_age_calendar_days"] is None
+    assert clock["eligible_matured_rows_missing_maturity_timestamp"] == 5
+    assert clock["calibration_snapshot"]["timestamp_after_as_of"] is True
+    assert clock["calibration_snapshot"]["age_calendar_days"] is None
+
+
+def test_unknown_publication_and_private_or_malformed_witnesses_are_disclosed(tmp_path):
+    path = tmp_path / "export.xlsx"
+    export_fixture(path)
+    result = report.analyze_workbook(path, as_of="2026-10-19")
+    assert result["learning_clock"]["calibration_snapshot"]["available"] is False
+    assert report.outcome_witness("private note")[0] == "no_witness"
+    assert report.outcome_witness(report.OUTCOME_WITNESS + "{")[0] == "invalid_witness"
+    assert report.outcome_witness(report.OUTCOME_WITNESS + json.dumps({
+        "schema": "tfb.outcome-price.v1", "reason": "private URL https://example.invalid?token=private",
+    }))[0] == "unspecified_witness_reason"
+
+
+@pytest.mark.parametrize("as_of", ["today", "2026-02-30", "2026-10-19T12:00:00"])
+def test_invalid_explicit_as_of_is_rejected_before_workbook_read(tmp_path, as_of):
+    with pytest.raises(ValueError, match="as_of"):
+        report.analyze_workbook(tmp_path / "absent.xlsx", as_of=as_of)
+
+
+def test_cli_binds_explicit_as_of_without_changing_outcomes(tmp_path):
+    path = tmp_path / "learning.xlsx"
+    learning_export_fixture(path)
+    output = tmp_path / "report.json"
+    markdown = tmp_path / "report.md"
+    assert report.main([str(path), "--as-of", "2026-10-19", "--json", str(output), "--md", str(markdown)]) == 0
+    result = json.loads(output.read_text())
+    assert result["learning_clock"]["maturity_age_calendar_days"] == 9
+    assert result["overall"]["matured"] == 5

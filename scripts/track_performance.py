@@ -1596,7 +1596,13 @@ from urllib.error import HTTPError, URLError
 # silently used its default. Adapt the declared signature before invocation,
 # request a supported period covering the calendar window, and never retry
 # an internal TypeError with the history-window argument removed.
-SCRIPT_VERSION = "6.45.1"
+# v6.45.2 (2026-10-19): an armed audit requires an acknowledged history
+# load and save before publishing calibration. A failed read must never be
+# mistaken for an empty history that is safe to clear. Save or required
+# calibration write failures now exit nonzero with sanitized stage names;
+# partial I/O is not reported as complete. Audit/publisher kill switches,
+# target-session witnesses and every ROI/S-1 criterion remain unchanged.
+SCRIPT_VERSION = "6.45.2"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -5953,6 +5959,10 @@ class PerformanceStore:
         return bool(self.ws)
 
     def load_records(self, max_records: int = 200000) -> List[PerformanceRecord]:
+        # [] remains the public read API, but an audit must distinguish a
+        # genuinely empty log from an unreadable one before any write.
+        self._last_load_succeeded = False
+        self._last_load_complete = False
         if not self.ws:
             return []
         end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
@@ -5972,6 +5982,13 @@ class PerformanceStore:
 
         try:
             rows = self.backoff.execute_sync(_load)
+            if not isinstance(rows, list):
+                raise ValueError("Performance_Log read returned a non-grid response")
+            # Validate the complete response before changing extent/cache.
+            # list("...") or list({...}) would otherwise turn characters or
+            # keys into a plausible record and authorize a destructive save.
+            if any(not isinstance(row, (list, tuple)) for row in rows):
+                raise ValueError("Performance_Log read returned a non-row value")
             self._loaded_extent = self.DATA_ROW0 + len(rows or []) - 1  # v6.35.0
             records: List[PerformanceRecord] = []
             _dup_expired = 0
@@ -6041,9 +6058,14 @@ class PerformanceStore:
                     _dm_mode, "would_expire" if _dm_mode == "observe" else "expired",
                     _dm["count"], _dm["wins"], _dm["losses"], _dm["breakeven"],
                     _dm["keys"][:6])
+            self._last_load_succeeded = True
+            # save_records rewrites the loaded history; a capped read cannot
+            # authorize clearing rows it never read. Ordinary analysis may
+            # still use the caller's smaller --max-records window.
+            self._last_load_complete = _rc >= self.DATA_ROW0 and end_row >= _rc
             return records
         except Exception as e:
-            logger.error("Failed to load records: %s", e)
+            logger.error("Failed to load Performance_Log: %s", type(e).__name__)
             return []
 
     def _record_to_row(self, r: PerformanceRecord) -> List[Any]:
@@ -6147,7 +6169,8 @@ class PerformanceStore:
                 self.cache = {r.key: r for r in records}
             return True
         except Exception as e:
-            logger.error("Failed to save records: %s", e)
+            logger.error("Failed to save Performance_Log: %s; partial writes possible",
+                         type(e).__name__)
             return False
 
     def append_records(self, records: List[PerformanceRecord]) -> bool:
@@ -9630,6 +9653,8 @@ class PerformanceTrackerApp:
                                  range_name=f"L{slot}:M{slot}",
                                  value_input_option="RAW")
                 out["published"] = True
+            else:
+                logger.error("[CALIBRATION v6.45.2] _Status has no available calibration slot")
             # (2b) _S1_Calibration rows 12-18 in place (tab created by the
             # S-1 publisher; skipped, never created, when absent).
             try:
@@ -9647,10 +9672,17 @@ class PerformanceTrackerApp:
                 ws_cal.update(values=rows, range_name="A12:D18",
                               value_input_option="RAW")
             except Exception as _ce:
-                logger.warning("[CALIBRATION v6.36.0] _S1_Calibration block skipped: %s", _ce)
+                # An absent optional tab retains its established skip policy.
+                # A denied read or failed write to an existing block cannot
+                # turn the earlier _Status write into a complete publication.
+                _missing_tab = getattr(gspread, "WorksheetNotFound", ())
+                if not (_missing_tab and isinstance(_ce, _missing_tab)):
+                    out["published"] = False
+                logger.warning("[CALIBRATION v6.45.2] _S1_Calibration block unavailable: %s",
+                               type(_ce).__name__)
             # (3) change trail: previous env-string is the first token of prev.
             prev_env = prev.split(" | ", 1)[0].strip() if prev else ""
-            if prev_env != (env_s or "NONE"):
+            if out["published"] and prev_env != (env_s or "NONE"):
                 out["changed"] = True
                 line = (f"[CALIBRATION v6.36.0] factors changed: "
                         f"{prev_env or '(none)'} -> {env_s or 'NONE'} | n={note}")
@@ -9663,17 +9695,21 @@ class PerformanceTrackerApp:
                                      "samples": note, "version": SCRIPT_VERSION})],
                         value_input_option="USER_ENTERED")
                 except Exception as _le:
-                    logger.warning("[CALIBRATION v6.36.0] _Run_Log line skipped: %s", _le)
+                    logger.warning("[CALIBRATION v6.36.0] _Run_Log line skipped: %s",
+                                   type(_le).__name__)
                 logger.info(line)
             return out
         except Exception as e:
-            logger.warning("[CALIBRATION v6.36.0] publish skipped: %s", e)
+            out["published"] = False
+            logger.warning("[CALIBRATION v6.45.2] publish failed: %s; partial writes possible",
+                           type(e).__name__)
             return out
 
     def _publish_s1_calibration(self, records: Any) -> bool:
         """v6.29.0 [WAVE B]: compute criterion-4 calibration and overwrite
         the _S1_Calibration block. Returns True on a successful write.
-        Never raises — the caller treats this as best-effort telemetry."""
+        Never raises. An armed audit must check the returned acknowledgement;
+        a policy result such as PENDING is valid, a failed write is not."""
         if not _s1_cal_enabled():
             return False
         try:
@@ -9792,8 +9828,8 @@ class PerformanceTrackerApp:
                     logger.warning("[PERF-UNIT v6.39.0] block/log skipped: %s", _ue)
             return True
         except Exception as exc:
-            logger.warning("[v6.29.0 WAVE-B] calibration publish failed: %s",
-                           exc)
+            logger.warning("[v6.29.0 WAVE-B] calibration publish failed: %s; "
+                           "partial writes possible", type(exc).__name__)
             return False
 
     def _track_selftest_(self) -> bool:
@@ -10161,14 +10197,27 @@ class PerformanceTrackerApp:
         loop = asyncio.get_running_loop()
         records: List[PerformanceRecord] = []
 
+        if self.args.audit and not self.store.is_available():
+            logger.error("[LEARNING-PUBLICATION] Performance_Log unavailable; audit blocked")
+            return 1
+
         if self.store.is_available():
             records = await loop.run_in_executor(
                 _get_executor(),
                 self.store.load_records,
                 int(self.args.max_records or _track_max_records_default()),
             )
+            if getattr(self.store, "_last_load_succeeded", False) is not True:
+                logger.error("[LEARNING-PUBLICATION] Performance_Log load unacknowledged; "
+                             "recording, audit and calibration blocked")
+                return 1
         else:
             records = []
+
+        if self.args.audit and getattr(self.store, "_last_load_complete", False) is not True:
+            logger.error("[LEARNING-PUBLICATION] Performance_Log read is incomplete; "
+                         "historical audit blocked; load the full allocated grid")
+            return 1
 
         if self.args.record:
             # v6.7.0: fetch the Top10 universe once, feed both pipelines.
@@ -10225,21 +10274,36 @@ class PerformanceTrackerApp:
         self._track_selftest_()  # v6.21.0 ST-1
         if self.args.audit:
             records = await self.audit_active_records(records)
-            # v6.29.0 [WAVE B]: publish the S-1 criterion-4 measurement
-            # from the freshly-audited records. Strictly non-blocking:
-            # a publication failure must never fail the clock, and the
-            # scorer fails safe to PENDING when the tab is unreadable.
+            # Calibration must describe acknowledged stored outcomes. The
+            # legacy save clears before rewriting, so False/None or a raised
+            # exception may mean partial I/O, never an accepted audit. Do not
+            # publish a fresh calibration or summary from that in-memory state.
             try:
-                await loop.run_in_executor(
-                    _get_executor(), self._publish_s1_calibration, records
-                )
-            except Exception as _cal_e:
-                logger.warning("[v6.29.0 WAVE-B] calibration publish "
-                               "skipped: %s", _cal_e)
-            if self.store.is_available():
-                await loop.run_in_executor(
-                    _get_executor(), self.store.save_records, records
-                )
+                saved = await loop.run_in_executor(
+                    _get_executor(), self.store.save_records, records)
+            except Exception as exc:
+                logger.error("[LEARNING-PUBLICATION] Performance_Log save failed: %s; "
+                             "partial writes possible", type(exc).__name__)
+                return 1
+            if saved is not True:
+                logger.error("[LEARNING-PUBLICATION] Performance_Log save unacknowledged; "
+                             "partial writes possible; calibration blocked")
+                return 1
+            # A disabled publisher remains inert. Once explicitly armed, its
+            # write acknowledgement is an execution requirement; the measured
+            # PASS/FAIL/PENDING state and every S-1 threshold remain unchanged.
+            if _s1_cal_enabled():
+                try:
+                    published = await loop.run_in_executor(
+                        _get_executor(), self._publish_s1_calibration, records)
+                except Exception as exc:
+                    logger.error("[LEARNING-PUBLICATION] _S1_Calibration failed: %s; "
+                                 "partial writes possible", type(exc).__name__)
+                    return 1
+                if published is not True:
+                    logger.error("[LEARNING-PUBLICATION] _S1_Calibration write unacknowledged; "
+                                 "partial writes possible")
+                    return 1
             # v6.20.0 (VT-1): tripwire into the workbook, post-save.
             try:
                 await loop.run_in_executor(
@@ -10367,15 +10431,27 @@ class PerformanceTrackerApp:
         if calibration is not None and (self.args.analyze or self.args.calibrate):
             _out("")
             render_calibration_report(calibration, verbose=bool(self.args.verbose))
-            # v6.36.0: write-back (in-place cells + change trail), kill-switched.
-            if self.store.is_available():
-                _pub = await loop.run_in_executor(
-                    _get_executor(), self._publish_reliability_calibration,
-                    calibration)
-                if _pub.get("published"):
-                    _out(f"Calibration published: TFB_CALIBRATION_FACTORS="
-                         f"{_pub.get('env') or 'NONE'}"
-                         f"{' (CHANGED - see _Run_Log)' if _pub.get('changed') else ''}")
+            # A kill switch suppresses publication, not computation/export.
+            # An enabled writer must acknowledge success before a green exit.
+            if _publish_calibration_enabled():
+                if not self.store.is_available():
+                    logger.error("[LEARNING-PUBLICATION] calibration destination unavailable")
+                    return 1
+                try:
+                    _pub = await loop.run_in_executor(
+                        _get_executor(), self._publish_reliability_calibration,
+                        calibration)
+                except Exception as exc:
+                    logger.error("[LEARNING-PUBLICATION] reliability calibration failed: %s; "
+                                 "partial writes possible", type(exc).__name__)
+                    return 1
+                if not isinstance(_pub, dict) or _pub.get("published") is not True:
+                    logger.error("[LEARNING-PUBLICATION] reliability calibration write "
+                                 "unacknowledged; partial writes possible")
+                    return 1
+                _out(f"Calibration published: TFB_CALIBRATION_FACTORS="
+                     f"{_pub.get('env') or 'NONE'}"
+                     f"{' (CHANGED - see _Run_Log)' if _pub.get('changed') else ''}")
 
         if self.args.simulate:
             matured = [
@@ -10443,8 +10519,8 @@ class PerformanceTrackerApp:
         # Every registered append failure is logged loudly; with
         # TFB_TP_APPEND_FATAL=1 (default OFF, armed separately) the run
         # exits 1 so the workflow goes RED and the S-1 day cannot be
-        # credited on a broken evidence store. VT-1 _Run_Log verdict and
-        # the S-1 calibration publish above remain best-effort by design.
+        # credited on a broken evidence store. VT-1 _Run_Log remains
+        # best-effort; armed calibration publication is acknowledged above.
         _ev_fails = _evidence_append_failures()
         if _ev_fails:
             for _f in _ev_fails:

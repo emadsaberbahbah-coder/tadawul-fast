@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.16.0  (header synced to runtime; history below)
+Version: 1.16.2  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
+
+v1.16.2 (2026-10-17) WHY — the engine's optional tiny-price precision was
+lost again at this page's two-decimal price/level boundary and one-decimal
+advisor text. Reuse TFB_PRICE_PRECISION (default off) for prices only, with
+the existing two-decimal baseline and seven significant digits below 10.
+An armed-only meta.price_precision receipt lets the native renderer use the
+same mode; off omits it and retains legacy output. Unknown prices/levels,
+financial totals, quantities, returns, decisions and funding are unchanged.
 
 v1.7.2 [B-7 ABSENT LEVELS RENDER BLANK, NEVER 0]: an absent stop/TP was
 being coerced to a printed 0.0. The idiom `(cand.get("tp1") or 0) * fx`
@@ -348,6 +356,11 @@ from datetime import datetime, timedelta, timezone
 import logging
 
 from core.secret_redaction import safe_error_text
+from core.price_precision import (
+    price_precision_enabled as _price_precision_enabled,
+    price_round_digits as _price_round_digits,
+    round_price as _precision_round_price,
+)
 from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
 from core.portfolio_reconciliation import MAX_HOLDINGS, certify_portfolio_inputs, certification_summary
 from core.execution_accounting import AccountingError, _number
@@ -822,7 +835,18 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.16.0"
+# v1.16.1 WHY (2026-10-17): an unknown native quote rendered as a known
+# zero SAR price on withheld/BLOCK rows. Sell sizing also rounded fractional
+# custody quantity before deriving unit price, overstating EXIT quantities or
+# hiding residual holdings. Preserve full-position EXIT quantity, keep TRIM's
+# whole-share rule bounded by custody, and derive remaining weight from the
+# actual remainder. This represents the existing action intent; it grants no
+# new venue/broker execution permission and changes no action or funding policy.
+# Resolve sells before funding so fractional whole-share limits cannot credit
+# more proceeds than the sized sale or the existing policy amount.
+# When the existing fee-funding flag actually debits fees, report unallocated
+# capital from that exact remaining ledger; funded principal stays separate.
+PORTFOLIO_ACTIONS_VERSION = "1.16.2"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -2209,12 +2233,12 @@ def _cost_basis_block_reason(avg_cost_raw, current_price, position_qty,
         return (False,
                 "BLOCKED — review cost basis (buy price %s is %.1fx the "
                 "current price %s — likely a data-entry error)"
-                % (_fmt(cost), ratio, _fmt(price)))
+                % (_fmt_price(cost), ratio, _fmt_price(price)))
     if ratio < min_r:
         return (False,
                 "BLOCKED — review cost basis (buy price %s is %.2fx the "
                 "current price %s — likely a data-entry error)"
-                % (_fmt(cost), ratio, _fmt(price)))
+                % (_fmt_price(cost), ratio, _fmt_price(price)))
     return True, None
 
 
@@ -3018,6 +3042,9 @@ def _fund_adds_exact(entries, controls, cash_sar, total_value_sar):
     remaining = deployable
     _sec_ledger = {}                       # F4
     funded_total = zero
+    fees_paid = zero
+    for entry in entries:
+        entry.pop("_funding_remaining_sar", None)
     lot = max(1, int(controls["lot_size"]))
     for e in adds:
         cand = e["cand"]
@@ -3058,6 +3085,7 @@ def _fund_adds_exact(entries, controls, cash_sar, total_value_sar):
             remaining -= _charge
             _sec_ledger[_fb] = max(zero, _sec_ledger[_fb] - _charge)  # F4
             funded_total += principal
+            fees_paid += _fee_sar
             if take_proc > 0 and take_cash > 0:
                 ff = ("cash %d + proceeds %d SAR"
                       % (round(take_cash), round(take_proc)))
@@ -3073,6 +3101,10 @@ def _fund_adds_exact(entries, controls, cash_sar, total_value_sar):
             e["suggested_delta_shares"] = 0
             e["funds_from"] = None
             e["action_reason"] += " — no deployable capital to size the add"
+    if fees_paid > zero and entries:
+        # Internal only: the four-value return contract and fee-off payload
+        # remain unchanged; do not mistake paid fees for spendable capital.
+        entries[0]["_funding_remaining_sar"] = remaining
     return float(deployable), (float(proceeds) if include_proceeds else 0.0), \
         float(funded_total), float(cash_floor)
 
@@ -3090,6 +3122,26 @@ def _round(v, nd=2):
         return round(f, nd)
     except (TypeError, ValueError):
         return None
+
+
+def _round_price(v, nd=2):
+    """Price-only precision; retain _round's null/non-finite contract."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return _precision_round_price(f, nd) if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_price(v):
+    """Keep tiny armed levels readable without changing money/return text."""
+    if _price_precision_enabled() and v is not None:
+        f = float(v)
+        if math.isfinite(f) and 0 < abs(f) < 10:
+            return format(f, ".%df" % _price_round_digits(f, 2)).rstrip("0").rstrip(".")
+    return _fmt(v)
 
 
 def _null_levels_enabled():
@@ -3137,7 +3189,7 @@ def _level_sar(level, fx, nd=2):
     if not fx:
         return None
     if not _null_levels_enabled():
-        return _round((level or 0) * fx, nd)
+        return _round_price((level or 0) * fx, nd)
     if level is None:
         return None
     try:
@@ -3146,7 +3198,7 @@ def _level_sar(level, fx, nd=2):
         return None
     if not math.isfinite(f) or f <= 0:
         return None
-    return _round(f * fx, nd)
+    return _round_price(f * fx, nd)
 
 
 def _advisor_sentence(entry, controls, review_date):
@@ -3184,10 +3236,10 @@ def _advisor_sentence(entry, controls, review_date):
         _t2 = _level_sar(cand.get("tp2"), fx)
         if _null_levels_enabled() and (_t1 is None or _t2 is None):
             bits.append("stop %s SAR; no TP ladder — no valuation reference"
-                        % _fmt(_s))
+                        % _fmt_price(_s))
         else:
             bits.append("stop %s / TP1 %s / TP2 %s SAR"
-                        % (_fmt(_s), _fmt(_t1), _fmt(_t2)))
+                        % (_fmt_price(_s), _fmt_price(_t1), _fmt_price(_t2)))
     bits.append("confidence %s" % conf)
     bits.append("review by %s" % review_date)
     return "; ".join(bits) + "."
@@ -3217,9 +3269,12 @@ def _apply_reduce_policy(cand, action, reason, proceeds):
 
 
 def _sell_side_deltas(entries, ctl, total_value):
-    """v1.9.0 D1: signed integer share deltas for EXIT/TRIM + post-trade
-    weight. Pure arithmetic on fields already present; rows without a usable
-    quantity/price are left blank exactly as before. Idempotent."""
+    """Full-position EXIT / whole-share TRIM deltas and remaining weight.
+
+    Exact observed fractional quantity is retained for EXIT, without asserting
+    broker fractional tradability. TRIM never invents a whole share beyond
+    custody. Missing/non-finite arithmetic inputs stay unsized. Idempotent.
+    """
     cap = None
     for k in ("max_position_pct", "max_weight_pct", "max_pos_pct"):
         if isinstance(ctl, dict) and ctl.get(k) is not None:
@@ -3232,30 +3287,37 @@ def _sell_side_deltas(entries, ctl, total_value):
             if e.get("suggested_delta_shares") is not None:
                 continue
             cand = e.get("cand") or {}
-            qraw = cand.get("quantity")
-            q = int(round(float(qraw))) if qraw not in (None, "") else 0
-            if q <= 0:
+            q = _pos_float(cand.get("quantity"))
+            if q is None:
                 continue
-            mv = float(cand.get("market_value_sar") or 0.0)
-            px = (mv / q) if mv > 0 else float(
-                (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0))
+            mv = _pos_float(cand.get("market_value_sar"))
+            native, fx = _pos_float(cand.get("price")), _pos_float(cand.get("fx_to_sar"))
+            px = mv / q if mv is not None else native * fx if native is not None and fx is not None else None
+            if px is None or not math.isfinite(px) or px <= 0:
+                continue
             if act == ACTION_EXIT:
-                n = q
+                n = int(q) if q.is_integer() else q
             else:
-                if px <= 0:
+                proceeds = _pos_float(e.get("proceeds_sar"))
+                if proceeds is None:
                     continue
-                proceeds = float(e.get("proceeds_sar") or 0.0)
-                n = int(math.ceil(proceeds / px)) if proceeds > 0 else 0
-                n = max(1 if proceeds > 0 else 0, min(n, q))
-                if cap is not None and total_value:
-                    while n < q and (mv - n * px) / float(total_value) \
+                whole = math.floor(q)
+                n = min(int(math.ceil(proceeds / px)), whole)
+                if cap is not None and _pos_float(total_value) is not None:
+                    while n < whole and (q - n) * px / float(total_value) \
                             * 100.0 > cap + 1e-9:
                         n += 1
                 if n <= 0:
+                    e["suggested_delta_shares"] = 0
+                    e["proceeds_sar"] = 0.0
+                    if _pos_float(total_value) is not None:
+                        e["post_trade_weight_pct"] = round(q * px / float(total_value) * 100.0, 1)
+                    e["action_reason"] = (e.get("action_reason") or "") + " \u2014 whole-share trim unavailable; fractional position retained"
                     continue
+                e["proceeds_sar"] = min(proceeds, n * px)
             e["suggested_delta_shares"] = -n
-            if total_value:
-                post = max(0.0, (mv - n * px)) / float(total_value) * 100.0
+            if _pos_float(total_value) is not None:
+                post = max(0.0, q - n) * px / float(total_value) * 100.0
                 e["post_trade_weight_pct"] = round(post, 1)
         except Exception:
             continue
@@ -3494,9 +3556,9 @@ def _action_row(entry, review_date, controls):
         "currency": cand.get("currency"),
         "fx_to_sar": _round(fx, 4),
         "quantity": cand.get("quantity"),
-        "avg_cost": _round(cand.get("avg_cost")),
-        "price": _round(cand.get("price")),
-        "price_sar": _round((cand.get("price") or 0) * fx) if fx else None,
+        "avg_cost": _round_price(cand.get("avg_cost")),
+        "price": _round_price(cand.get("price")),
+        "price_sar": _round_price(cand["price"] * fx) if cand.get("price") is not None and fx else None,
         "market_value_sar": _round(cand.get("market_value_sar"), 0),
         "cost_sar": _round(cand.get("cost_sar"), 0),
         "pnl_sar": _round(cand.get("pnl_sar"), 0),
@@ -3520,8 +3582,8 @@ def _action_row(entry, review_date, controls):
         "advisor_note": note,
         "detail": {
             "valuation_basis": cand.get("valuation_basis"),
-            "target_price": _round(cand.get("target_price")),
-            "intrinsic_value": _round(cand.get("intrinsic_value")),
+            "target_price": _round_price(cand.get("target_price")),
+            "intrinsic_value": _round_price(cand.get("intrinsic_value")),
             "engine_forecast_roi_pct": detail_engine_roi,
             "engine_recommendation": cand.get("recommendation"),
             "risk_level": cand.get("risk_level") or "Unknown",
@@ -3594,17 +3656,21 @@ def build_portfolio_actions(rows, controls=None, fx_rates=None,
     """Main entry point. rows = GAS holdings dicts (display headers ok)."""
     ctl = make_controls(controls)
     if not _env_enabled():
-        return _json_sanitize(_skeleton("disabled", "TFB_PF_ENABLED=0", ctl))
-    if _ob is None:
-        return _json_sanitize(_skeleton(
-            "unavailable",
-            "opportunity_builder import failed: " + _OB_IMPORT_ERROR, ctl))
-    try:
-        return _json_sanitize(_build(rows or [], ctl, fx_rates or {},
-                                     upstream_meta or {}))
-    except Exception as exc:  # honest failure, never a fabricated page
-        sk = _skeleton("error", "%s: %s" % (type(exc).__name__, exc), ctl)
-        return _json_sanitize(sk)
+        result = _skeleton("disabled", "TFB_PF_ENABLED=0", ctl)
+    elif _ob is None:
+        result = _skeleton("unavailable",
+            "opportunity_builder import failed: " + _OB_IMPORT_ERROR, ctl)
+    else:
+        try:
+            result = _build(rows or [], ctl, fx_rates or {}, upstream_meta or {})
+            if _price_precision_enabled():
+                result["meta"]["price_precision"] = "on"
+            return _json_sanitize(result)
+        except Exception as exc:  # honest failure, never a fabricated page
+            result = _skeleton("error", "%s: %s" % (type(exc).__name__, exc), ctl)
+    if _price_precision_enabled():
+        result["meta"]["price_precision"] = "on"
+    return _json_sanitize(result)
 
 
 def _unverified_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
@@ -4027,6 +4093,10 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
             cb["pnl_sar"] = None
             cb["pnl_pct"] = None
 
+    # Bound sale proceeds by resolved quantities before any funding pass can
+    # consume them. Certified public requests still use settled new cash only.
+    _sell_side_deltas(entries, ctl, total_value)
+
     # Pass 3 — L7 funding
     if _pv_incomplete:                                               # F3
         cash_floor = (ctl["target_cash_pct"] / 100.0) * (total_value or 0.0)
@@ -4055,8 +4125,10 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
             deployable, proceeds_inc, adds_funded, cash_floor = fund_adds(
                 entries, ctl, cash, total_value)
 
-    # v1.9.0 D1: share-resolve the sell side once funding is settled.
-    _sell_side_deltas(entries, ctl, total_value)
+    # Funding attaches the exact post-fee ledger to the original first entry.
+    # Retain it locally before presentation sorting changes that first entry.
+    funding_remaining_sar = (entries[0].pop("_funding_remaining_sar", None)
+                             if entries else None)
 
     review_date = (datetime.now(timezone.utc) +
                    timedelta(days=ctl["review_days"])).date().isoformat()
@@ -4244,6 +4316,8 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
                "Qualified ADDs are unsized — raise cash or lower Target "
                "Cash %")
     unalloc = max(0.0, deployable - adds_funded)
+    if funding_remaining_sar is not None:
+        unalloc = float(max(Decimal(0), funding_remaining_sar))
 
     # e24: coverage over the POST-scrub population (v1.0.2 nulls a
     # cost-blocked holding's pnl, so the pre-loop figure overstated it).

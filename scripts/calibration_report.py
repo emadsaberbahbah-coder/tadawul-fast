@@ -12,7 +12,7 @@ interpretation, not a claim that reliability is a defined P(win). Signal_History
 provides entry-date coverage/population evidence only: later snapshots never
 replace entry forecasts or acquire outcomes by an ambiguous symbol-day join.
 
-Usage: python scripts/calibration_report.py export.xlsx --json report.json --md report.md
+Usage: python scripts/calibration_report.py export.xlsx --as-of 2026-10-19 --json report.json --md report.md
 Requires only openpyxl. All workbook reads use read_only=True, data_only=True.
 """
 from __future__ import annotations
@@ -29,8 +29,10 @@ import sys
 
 import openpyxl
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 RISK_COLUMNS = ("Volatility", "Max Drawdown %", "Sharpe Ratio")
+RIYADH = dt.timezone(dt.timedelta(hours=3))
+OUTCOME_WITNESS = "[OUTCOME-WITNESS v1]"
 
 
 def text(value):
@@ -57,6 +59,78 @@ def date(value):
         return dt.date.fromisoformat(match.group(1)).isoformat()
     except ValueError:
         return None
+
+
+def riyadh_timestamp(value):
+    """Read a declared Riyadh timestamp without inventing a missing time.
+
+    Naive times in these workbook columns are explicitly Riyadh local times.
+    Date-only cells can describe target days, but cannot prove when an outcome
+    was evaluated or calibration was published.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, dt.datetime):
+        stamp = value
+    else:
+        raw = text(value)
+        if ":" not in raw:
+            return None
+        try:
+            stamp = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    return (stamp.replace(tzinfo=RIYADH) if stamp.tzinfo is None else stamp.astimezone(RIYADH))
+
+
+def outcome_witness(notes):
+    """Read only reason/time from the last receipt; never emit private notes."""
+    receipts = [part[len(OUTCOME_WITNESS):] for part in text(notes).split(" | ")
+                if part.startswith(OUTCOME_WITNESS)]
+    if not receipts:
+        return "no_witness", None
+    try:
+        receipt = json.loads(receipts[-1])
+        if not isinstance(receipt, dict) or receipt.get("schema") != "tfb.outcome-price.v1":
+            return "invalid_witness", None
+        reason = receipt.get("reason")
+        if not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9_]+(?:;[a-z0-9_]+)*", reason):
+            reason = "unspecified_witness_reason"
+        return reason, riyadh_timestamp(receipt.get("evaluated_at"))
+    except (ValueError, TypeError):
+        return "invalid_witness", None
+
+
+def age_days(stamp, as_of):
+    if stamp is None or as_of is None or stamp.date() > as_of:
+        return None
+    return (as_of - stamp.date()).days
+
+
+def calibration_snapshot(workbook, as_of):
+    """Bounded read of the existing checkpoint publication, not a new score."""
+    result = {"available": "_S1_Calibration" in workbook.sheetnames,
+              "published_at_riyadh": None, "age_calendar_days": None,
+              "checkpoint_state": None, "n_checkpoints": None,
+              "timestamp_after_as_of": False}
+    if not result["available"]:
+        return result
+    rows = list(workbook["_S1_Calibration"].iter_rows(
+        min_row=1, max_row=2, min_col=1, max_col=12, values_only=True))
+    if len(rows) != 2:
+        return result
+    index = {text(value): i for i, value in enumerate(rows[0]) if text(value)}
+    stamp = riyadh_timestamp(cell(rows[1], index, "As Of (Riyadh)"))
+    state = text(cell(rows[1], index, "State"))
+    sample = number(cell(rows[1], index, "N Checkpoints"))
+    result.update(
+        published_at_riyadh=stamp.isoformat() if stamp else None,
+        age_calendar_days=age_days(stamp, as_of),
+        checkpoint_state=state if state in {"PASS", "FAIL", "PENDING", "NOT_DECIDABLE"} else None,
+        n_checkpoints=int(sample) if sample is not None and sample >= 0 and sample.is_integer() else None,
+        timestamp_after_as_of=bool(stamp and as_of and stamp.date() > as_of),
+    )
+    return result
 
 
 def table(ws, first_header):
@@ -118,9 +192,13 @@ def grouped(records, fields, min_sample):
     return [dict(zip(fields, key), **summarize(rows, min_sample)) for key, rows in sorted(buckets.items())]
 
 
-def analyze_workbook(path, min_sample=20):
+def analyze_workbook(path, min_sample=20, as_of=None):
     if min_sample < 1:
         raise ValueError("min_sample must be positive")
+    try:
+        as_of_day = dt.date.fromisoformat(str(as_of)) if as_of is not None else None
+    except ValueError as exc:
+        raise ValueError("as_of must be a YYYY-MM-DD Riyadh date") from exc
     sha = hashlib.sha256()
     with open(path, "rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -137,6 +215,9 @@ def analyze_workbook(path, min_sample=20):
         counts = Counter()
         records, first_decided = [], {}
         perf_dates, perf_updated = Counter(), Counter()
+        maturity_dates, active_target_dates, overdue_reasons = Counter(), Counter(), Counter()
+        latest_recorded = latest_maturity = latest_evaluated = None
+        active_records = active_unknown_target = matured_unknown_time = 0
         risk = Counter()
         for row in rows:
             if not text(cell(row, index, "Record ID")):
@@ -148,7 +229,24 @@ def analyze_workbook(path, min_sample=20):
                 perf_dates[recorded] += 1
             if updated:
                 perf_updated[updated] += 1
+            recorded_at = riyadh_timestamp(cell(row, index, "Date Recorded (Riyadh)", "Date"))
+            if recorded_at and (latest_recorded is None or recorded_at > latest_recorded):
+                latest_recorded = recorded_at
             status = text(cell(row, index, "Status")).lower()
+            reason, evaluated = outcome_witness(cell(row, index, "Notes"))
+            if evaluated and (latest_evaluated is None or evaluated > latest_evaluated):
+                latest_evaluated = evaluated
+            if status == "active":
+                active_records += 1
+                raw_target = cell(row, index, "Target Date (Riyadh)")
+                target_at = riyadh_timestamp(raw_target)
+                target = target_at.date().isoformat() if target_at else date(raw_target)
+                if target:
+                    active_target_dates[target] += 1
+                    if as_of_day and target < as_of_day.isoformat():
+                        overdue_reasons[reason] += 1
+                else:
+                    active_unknown_target += 1
             if status != "matured":
                 counts["non_matured_excluded"] += 1
                 continue
@@ -167,6 +265,16 @@ def analyze_workbook(path, min_sample=20):
                 first_decided[key] = roi
             else:
                 counts["matured_missing_key_retained"] += 1
+            # Evidence age follows the same accepted outcome population as
+            # calibration. A duplicate or missing-ROI row with a newer stamp
+            # cannot make unchanged usable outcomes look freshly matured.
+            maturity = riyadh_timestamp(cell(row, index, "Maturity Date"))
+            if maturity:
+                maturity_dates[maturity.date().isoformat()] += 1
+                if latest_maturity is None or maturity > latest_maturity:
+                    latest_maturity = maturity
+            else:
+                matured_unknown_time += 1
             reliability = number(cell(row, index, "Entry Forecast Reliability"))
             if reliability is not None and not 0 <= reliability <= 100:
                 reliability = None
@@ -230,6 +338,7 @@ def analyze_workbook(path, min_sample=20):
                        "read_only": True, "data_only": True,
                        "performance_header_row": header_row, "signal_header_row": signal_header,
                        "performance_recorded_dates": extent(perf_dates), "performance_updated_dates": extent(perf_updated),
+                       "performance_maturity_dates": extent(maturity_dates),
                        "signal_dates": extent(signal_dates),
                        "global_markets_updated_dates": dict(sorted(market_dates.items())),
                        "global_markets_dominant_date": market_dates.most_common(1)[0][0] if market_dates else None},
@@ -241,6 +350,28 @@ def analyze_workbook(path, min_sample=20):
                        "promotion_gate": "advisory evidence only; Brier gating requires owner decision"},
             "exclusions": dict(sorted(counts.items())), "risk_measurement_exclusions": dict(sorted(risk.items())),
             "overall": summarize(records, min_sample),
+            "learning_clock": {
+                "as_of_riyadh_date": as_of_day.isoformat() if as_of_day else None,
+                "latest_recorded_at_riyadh": latest_recorded.isoformat() if latest_recorded else None,
+                "latest_maturity_at_riyadh": latest_maturity.isoformat() if latest_maturity else None,
+                "maturity_age_calendar_days": age_days(latest_maturity, as_of_day),
+                "maturity_timestamp_after_as_of": bool(latest_maturity and as_of_day and latest_maturity.date() > as_of_day),
+                "eligible_matured_rows_missing_maturity_timestamp": matured_unknown_time,
+                "latest_outcome_evaluation_at_riyadh": latest_evaluated.isoformat() if latest_evaluated else None,
+                "outcome_evaluation_age_calendar_days": age_days(latest_evaluated, as_of_day),
+                "active_records": active_records,
+                "active_target_before_as_of_date": sum(n for day, n in active_target_dates.items()
+                                                       if day < as_of_day.isoformat()) if as_of_day else None,
+                "active_target_on_as_of_date": active_target_dates[as_of_day.isoformat()] if as_of_day else None,
+                "active_missing_or_invalid_target_date": active_unknown_target,
+                "overdue_by_target_date": {day: n for day, n in sorted(active_target_dates.items())
+                                           if as_of_day and day < as_of_day.isoformat()},
+                "overdue_outcome_witness_reasons": dict(sorted(overdue_reasons.items())),
+                "calibration_snapshot": calibration_snapshot(workbook, as_of_day),
+                "limits": "A new recording, report export or calibration publication does not prove a new matured outcome. "
+                          "Calendar target days do not prove exchange-session completion or supply a target-session price. "
+                          "Missing outcomes are not inferred. Ages/backlog need the explicitly supplied as-of date.",
+            },
             "by_horizon_page": grouped(records, ("horizon", "page"), min_sample),
             "by_investability": grouped(records, ("investability",), min_sample),
             "signals": {"available": "Signal_History" in workbook.sheetnames,
@@ -252,6 +383,7 @@ def analyze_workbook(path, min_sample=20):
 
 def render_md(report):
     source, overall = report["source"], report["overall"]
+    clock = report["learning_clock"]
     def fmt(value):
         return "unavailable" if value is None else f"{value:.4f}" if isinstance(value, float) else str(value)
     lines = ["# Offline calibration evidence", "",
@@ -259,6 +391,21 @@ def render_md(report):
              f"Observed Global_Markets dominant update date: {source['global_markets_dominant_date']}; "
              f"latest Signal_History date: {source['signal_dates']['latest']}. These are source data dates, not a live read-back.",
              f"Performance_Log header row {source['performance_header_row']} is intentional.", "",
+             "## Learning evidence dates", "",
+             f"As-of Riyadh date: {fmt(clock['as_of_riyadh_date'])}. Latest recorded recommendation: "
+             f"{fmt(clock['latest_recorded_at_riyadh'])}; latest matured outcome: "
+             f"{fmt(clock['latest_maturity_at_riyadh'])} "
+             f"(age {fmt(clock['maturity_age_calendar_days'])} calendar days).",
+             f"Active targets before that date: {fmt(clock['active_target_before_as_of_date'])}; "
+             f"targets on that date: {fmt(clock['active_target_on_as_of_date'])}; "
+             f"active rows with unknown target dates: {clock['active_missing_or_invalid_target_date']}.",
+             f"Existing checkpoint calibration publication: "
+             f"{fmt(clock['calibration_snapshot']['published_at_riyadh'])} "
+             f"(age {fmt(clock['calibration_snapshot']['age_calendar_days'])} calendar days); "
+             f"checkpoint state {fmt(clock['calibration_snapshot']['checkpoint_state'])}. "
+             "This is the stored checkpoint measurement, not the overall S-1 promotion decision.",
+             clock["limits"], "",
+             "## Outcome calibration", "",
              f"After deduplication: {overall['matured']:,} matured records; {overall['wins']:,} wins / "
              f"{overall['losses']:,} losses, win rate {fmt(overall['win_rate_pct'])}%. "
              f"Brier {fmt(overall['brier'])} over {overall['brier_n']:,} eligible records (baseline 0.25).", "",
@@ -271,7 +418,8 @@ def render_md(report):
                                    "brier_mean_claimed_pct", "calibration_gap_pp", "sufficient")]
         lines.append("| " + " | ".join(fmt(v).replace("|", "/") for v in values) + " |")
     lines.extend(["", "Exclusions and coverage:", "", "```json", json.dumps({
-        "exclusions": report["exclusions"], "risk": report["risk_measurement_exclusions"], "signals": report["signals"]
+        "exclusions": report["exclusions"], "risk": report["risk_measurement_exclusions"],
+        "signals": report["signals"], "learning_clock": clock,
     }, indent=2, sort_keys=True), "```", "", "Owner decision remains open: whether Brier above 0.25 should gate promotion. This report changes no production gate."])
     return "\n".join(lines) + "\n"
 
@@ -282,9 +430,10 @@ def main(argv=None):
     parser.add_argument("--json")
     parser.add_argument("--md")
     parser.add_argument("--min-sample", type=int, default=20)
+    parser.add_argument("--as-of", help="Explicit Riyadh date (YYYY-MM-DD) for calendar-day evidence ages and backlog; no wall-clock default")
     args = parser.parse_args(argv)
     try:
-        report = analyze_workbook(args.export, args.min_sample)
+        report = analyze_workbook(args.export, args.min_sample, args.as_of)
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"calibration_report: {exc}\n")
         return 2

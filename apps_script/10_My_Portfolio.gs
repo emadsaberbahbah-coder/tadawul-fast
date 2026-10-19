@@ -1,7 +1,48 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.13
+ * Version: 1.5.16
+ *
+ * v1.5.16 MAIN CHANGES (2026-10-17) -- PRICE DISPLAY AND TYPED COMPLETION
+ * WHY: two-decimal prices hid small nonzero values and a status string did
+ * not prove consumed source data. The reserved v1.5.14 panel preservation
+ * from PR #780 is integrated below; PD_PANEL_PRESERVE remains default off.
+ * Backend meta.price_precision exactly 'on' propagates the existing price
+ * flag. Price cells retain seven significant digits below 10, with scientific
+ * display for extreme values. Base formats reset every render; money amounts,
+ * quantities and numeric cell values are unchanged. No new native flag.
+ * An optional completionContract request returns a typed render outcome;
+ * source_run is supplied only after strict source and holdings rechecks.
+ * Ordinary callers retain their
+ * status strings and default-off read/write behavior; B2 receipts stay gated.
+ * Opt-in transport failures throw bounded errors to retain the retry limit.
+ *
+ * v1.5.15 MAIN CHANGES (2026-10-17) -- OPERATIONAL RESPONSE AND COST PROOF
+ * WHY: a truthy HTTP-200 failure envelope cleared the prior decision board,
+ * and the capture watcher then acknowledged that unsuccessful build. Refuse
+ * explicit operational failures and malformed renderer inputs before any
+ * render/action log; throw a bounded RESPONSE ERROR so orchestration cannot
+ * acknowledge it. Successful empty and policy-controlled results still render.
+ * The native ledger also applied a priced subset's average to all shares.
+ * Keep known quantity, but withhold cost unless every contributing lot proves
+ * its price and fee. A blank fee needs the same exact native Cost Basis
+ * zero-delta witness as the Python reader; malformed fees are never zero.
+ * Unknown ledger quantity/cost removes stale display aliases from the request.
+ * Zero or invalid active quantities do not establish a closed custody position.
+ * Fractional holding/exit quantities retain their numeric values and display
+ * decimals in quantity columns; whole-share action calculations are untouched.
+ * No action, funding, custody, arming, freeze or panel-preservation policy changes.
+ * Version 1.5.14 is reserved for the separate pending panel-preservation PR.
+ *
+ * v1.5.14 MAIN CHANGES -- INTEGRATED PANEL PRESERVATION (PR #780)
+ * WHY: a layout rebuild cleared operator panel inputs and replaced them with
+ * defaults. The same inputs feed portfolio sizing and optional Top-10 reads.
+ * PD_PANEL_PRESERVE is off by default. Observe snapshots and reports reset
+ * field names while retaining legacy writes; enforce preserves nonblank
+ * values only beneath their exact labels, then defaults, then built-ins.
+ * Enforce aborts before clearing on any snapshot fault. Missing or moved
+ * labels do not identify an operator value. No lost value is recovered and
+ * no property is armed. Runtime helpers are ported from 5a7b63cb unchanged.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
  *                        only when PD_SOURCE_RECEIPT is observe/enforce;
@@ -2041,12 +2082,12 @@ function _myPortfolioCostBasisSymbols_() {
  * HEADER NAME on row 4 ('Quantity' accepted as a defensive Shares alias),
  * and aggregates ACTIVE lots per symbol:
  *   qty      = sum of Shares across active lots;
- *   buyPrice = shares-weighted average cost INCLUDING Buy Fees, computed
- *              only over lots that carry BOTH shares and price (nothing is
- *              fabricated when either is missing), deliberately UNROUNDED
- *              — numerically identical to 21's syncLedgerToPortfolio and
- *              14 v2.5.0's pfReadCostBasisV2_, so the feeders can never
- *              oscillate the Avg Cost cell between runs;
+ *   buyPrice = shares-weighted average cost INCLUDING proven Buy Fees,
+ *              deliberately UNROUNDED; withheld if any contributing lot's
+ *              price/fee is unknown. An exact native Cost Basis equal to
+ *              Shares * Buy Price can establish a blank fee's zero component;
+ *   qtyIncomplete/costIncomplete = true when a contributing lot cannot
+ *              establish that aggregate; stale display aliases are not reused;
  *   buyDate  = earliest lot date.
  * A lot is INACTIVE only when Status trims to 'inactive' (case-
  * insensitive); blank status counts as active, matching the 21 dropdown
@@ -2058,6 +2099,14 @@ function _myPortfolioCostBasisSymbols_() {
  * through to the legacy chain and a transient ledger problem can never
  * blank the page (v1.5.1 wipe-guard preserved). Never throws.
  */
+function _myPortfolioLedgerNumber_(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  var text = String(value).replace(/,/g, '').trim();
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return null;
+  var number = Number(text);
+  return isFinite(number) ? number : null;
+}
+
 function _myPortfolioLedgerMap_() {
   try {
     var sh = SpreadsheetApp.getActive().getSheetByName('_Portfolio_CostBasis');
@@ -2090,6 +2139,14 @@ function _myPortfolioLedgerMap_() {
     var vals = sh.getRange(5, 1, lastRow - 4, lastCol).getValues();
     var wSum = {};
     var wQty = {};
+    var headerCounts = {}, nativeCostColumns = [], feeHeaders = [];
+    for (var hi = 0; hi < hdr.length; hi++) {
+      var hn = String(hdr[hi] == null ? '' : hdr[hi]).toLowerCase()
+          .replace(/[^a-z0-9]/g, '');
+      headerCounts[hn] = (headerCounts[hn] || 0) + 1;
+      if (hn === 'costbasis') nativeCostColumns.push(hi);
+      if (hn.indexOf('buyfees') === 0) feeHeaders.push(hn);
+    }
     for (var r = 0; r < vals.length; r++) {
       var row = vals[r];
       var sym = String(row[col.symbol - 1] == null ? '' : row[col.symbol - 1])
@@ -2101,24 +2158,41 @@ function _myPortfolioLedgerMap_() {
           : '';
       if (status === 'inactive') { continue; }
       if (!Object.prototype.hasOwnProperty.call(map, sym)) {
-        map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0 };
+        map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0,
+                     qtyIncomplete: false, costIncomplete: false };
         wSum[sym] = 0;
         wQty[sym] = 0;
       }
       var agg = map[sym];
       agg.lots = agg.lots + 1;
-      var qty = col.shares ? myPortfolioNumber_(row[col.shares - 1], null) : null;
+      var qty = col.shares ? _myPortfolioLedgerNumber_(row[col.shares - 1]) : null;
       var price = col.buyPrice
-          ? myPortfolioNumber_(row[col.buyPrice - 1], null) : null;
-      var fees = col.buyFees
-          ? myPortfolioNumber_(row[col.buyFees - 1], null) : null;
+          ? _myPortfolioLedgerNumber_(row[col.buyPrice - 1]) : null;
+      var feeRaw = col.buyFees ? row[col.buyFees - 1] : null;
+      var fees = col.buyFees ? _myPortfolioLedgerNumber_(feeRaw) : 0;
       if (qty !== null && qty > 0) {
         agg.qty = (agg.qty === null ? 0 : agg.qty) + qty;
-        if (price !== null && price > 0) {
-          wSum[sym] = wSum[sym] + qty * price +
-              (fees !== null && fees > 0 ? fees : 0);
-          wQty[sym] = wQty[sym] + qty;
+        if (col.buyFees && fees === null &&
+            (feeRaw === null || feeRaw === undefined ||
+             (typeof feeRaw === 'string' && feeRaw.trim() === '')) &&
+            headerCounts.buyprice === 1 && headerCounts.shares === 1 &&
+            !headerCounts.quantity && String(hdr[col.shares - 1]).trim() === 'Shares' &&
+            nativeCostColumns.length === 1) {
+          var witness = _myPortfolioLedgerNumber_(row[nativeCostColumns[0]]);
+          if (witness !== null && witness > 0 && witness === qty * price) fees = 0;
         }
+        var lotCost = price !== null && price > 0 && fees !== null && fees >= 0
+            ? qty * price + fees : null;
+        if (feeHeaders.length && (!col.buyFees || feeHeaders.length !== 1 || feeHeaders[0] !== 'buyfees')) {
+          lotCost = null;
+        }
+        if (lotCost !== null && isFinite(lotCost) && lotCost > 0) {
+          wSum[sym] = wSum[sym] + lotCost;
+          wQty[sym] = wQty[sym] + qty;
+        } else agg.costIncomplete = true;
+      } else {
+        agg.qtyIncomplete = true;
+        agg.costIncomplete = true;
       }
       var d = col.buyDate ? row[col.buyDate - 1] : null;
       if (d instanceof Date && !isNaN(d.getTime())) {
@@ -2129,8 +2203,17 @@ function _myPortfolioLedgerMap_() {
       }
     }
     for (var k in map) {
+      if (Object.prototype.hasOwnProperty.call(map, k) &&
+          (map[k].qtyIncomplete || !isFinite(map[k].qty))) {
+        map[k].qty = null;
+        map[k].qtyIncomplete = true;
+        map[k].costIncomplete = true;
+      }
       if (Object.prototype.hasOwnProperty.call(map, k) && wQty[k] > 0) {
-        map[k].buyPrice = wSum[k] / wQty[k];
+        var average = wSum[k] / wQty[k];
+        if (!map[k].costIncomplete && isFinite(average) && average > 0) {
+          map[k].buyPrice = average;
+        } else map[k].costIncomplete = true;
       }
     }
     return map;
@@ -2552,7 +2635,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.13';
+var PD_VERSION = '1.5.16';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2596,6 +2679,7 @@ var PD_FMT_SAR = '#,##0 "SAR"';
 var PD_FMT_PRICE = '#,##0.00';
 var PD_FMT_PCT = '0.0"%"';
 var PD_FMT_INT = '#,##0';
+var PD_FMT_QTY = '#,##0.########';
 
 /* §3.2 PF panel — labels verbatim (TFB_PANEL_DEFAULTS / route alias map). */
 var PD_PANEL = [
@@ -3780,6 +3864,60 @@ function pdReadPanel_(sheet, ss) {
   return out;
 }
 
+/* ----- v1.5.14 operator inputs survive a layout rebuild (P-76 port) ------- */
+
+var PD_PANEL_PRESERVE_PROP = 'PD_PANEL_PRESERVE';  /* off (default) | observe | enforce */
+
+function pdPanelPreserveMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_PANEL_PRESERVE_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return (v === 'observe' || v === 'enforce') ? v : 'off';
+  } catch (e) {
+    return 'off';
+  }
+}
+
+/** v1.5.14: snapshot of the panel's NON-BLANK operator values, read raw (no
+ * defaults) BEFORE a layout rebuild clears the sheet. A value is kept only
+ * when its label cell still holds the exact PD_PANEL label (a moved layout
+ * keeps nothing). A sheet without a panel yet returns {}. Never throws: a
+ * read fault is pushed onto the optional `faults` array (so the caller can
+ * tell a failed read from an empty panel) and returns what was read. */
+function pdPanelPreserve_(sheet, faults) {
+  var out = {};
+  try {
+    if (!sheet || sheet.getLastRow() < PD_ROW_PANEL_FIRST) return out;
+    for (var i = 0; i < PD_PANEL.length; i++) {
+      var item = PD_PANEL[i];
+      var pos = pdPanelPos_(i);
+      var lbl = sheet.getRange(pos.row, pos.labelCol).getValue();
+      if (String(lbl === null || lbl === undefined ? '' : lbl)
+          .replace(/^\s+|\s+$/g, '') !== item.label) continue;
+      var v = sheet.getRange(pos.row, pos.valueCol).getValue();
+      if (pdHasValue_(v)) out[item.label] = v;
+    }
+  } catch (e) {
+    if (faults && faults.push) faults.push(String(e && e.message || e));
+  }
+  return out;
+}
+
+/** v1.5.14 PURE: the value a rebuilt panel cell receives -- preserved
+ * operator input > _Lists_Config default > built-in default. With no
+ * preserved map this is exactly the v1.5.13 seed expression. */
+function pdPanelSeedValue_(item, defaults, preserved) {
+  if (preserved && preserved.hasOwnProperty(item.label) &&
+      pdHasValue_(preserved[item.label])) {
+    return preserved[item.label];
+  }
+  return defaults && defaults.hasOwnProperty(item.label) &&
+         pdHasValue_(defaults[item.label]) ? defaults[item.label]
+                                           : item.def;
+}
+
 /* ----- holdings pool (reads the 122-col My_Portfolio page) ----------------- */
 
 function pdCollectHoldings_(extraFields, wantStamps) {
@@ -3853,11 +3991,18 @@ function pdCollectHoldings_(extraFields, wantStamps) {
     var cbInfo = cb[String(sym).replace(/^\s+|\s+$/g, '').toUpperCase()];
     if (cbInfo) {
       var usedCb = false;
-      if (cbInfo.qty !== null && cbInfo.qty !== undefined) {
+      if (cbInfo.qtyIncomplete === true) {
+        delete obj['Quantity'];
+        usedCb = true;
+      } else if (cbInfo.qty !== null && cbInfo.qty !== undefined) {
         obj['Quantity'] = cbInfo.qty;
         usedCb = true;
       }
-      if (cbInfo.buyPrice !== null && cbInfo.buyPrice !== undefined) {
+      if (cbInfo.costIncomplete === true) {
+        delete obj['Buy Price'];
+        delete obj['Avg Cost'];
+        usedCb = true;
+      } else if (cbInfo.buyPrice !== null && cbInfo.buyPrice !== undefined) {
         obj['Buy Price'] = cbInfo.buyPrice;
         obj['Avg Cost'] = cbInfo.buyPrice;
         usedCb = true;
@@ -3898,6 +4043,57 @@ function pdPost_(body) {
   return { code: resp.getResponseCode(), json: json, text: text, url: url };
 }
 
+/** Pure operational envelope check; no action/funding/eligibility decisions.
+ * Unknown policy statuses remain supported when their renderer inputs are valid. */
+function pdResponseProblem_(payload) {
+  var object = function (value) {
+    return Object.prototype.toString.call(value) === '[object Object]';
+  };
+  var cells = function (values) {
+    for (var c = 0; c < values.length; c++) {
+      var value = values[c];
+      if (typeof value !== 'string' && typeof value !== 'boolean' &&
+          !(typeof value === 'number' && isFinite(value))) return false;
+    }
+    return true;
+  };
+  if (!object(payload)) return 'malformed response object';
+  if (typeof payload.status !== 'string' || !payload.status.trim()) {
+    return 'missing response status';
+  }
+  var state = payload.status.trim().toLowerCase();
+  if (/^(unavailable|degraded|failed|error)$/.test(state)) {
+    return 'backend status ' + state;
+  }
+  if (!object(payload.kpis)) return 'malformed kpis';
+  if (!cells(pdKpiValues_(payload.kpis))) return 'malformed kpi cell';
+  if (payload.kpis.action_counts !== null && payload.kpis.action_counts !== undefined) {
+    if (!object(payload.kpis.action_counts)) return 'malformed action counts';
+    var counts = payload.kpis.action_counts;
+    if (!cells(['ADD', 'HOLD', 'TRIM', 'EXIT', 'BLOCK'].map(function (action) {
+      return pdCell_(counts[action]);
+    }))) return 'malformed action counts';
+  }
+  var tables = ['actions', 'sector_summary', 'alerts'];
+  var mappers = [pdActionToRow_, pdSectorToRow_, pdAlertToRow_];
+  for (var t = 0; t < tables.length; t++) {
+    var rows = payload[tables[t]];
+    if (!Array.isArray(rows)) return 'malformed ' + tables[t];
+    for (var r = 0; r < rows.length; r++) {
+      if (!object(rows[r])) return 'malformed ' + tables[t] + ' entry';
+      if (t === 0 && (typeof rows[r].action !== 'string' || !rows[r].action.trim() ||
+          typeof rows[r].symbol !== 'string' || !rows[r].symbol.trim())) {
+        return 'malformed action identity';
+      }
+      if (!cells(mappers[t](rows[r]))) return 'malformed ' + tables[t] + ' cell';
+    }
+  }
+  if (payload.meta !== null && payload.meta !== undefined && !object(payload.meta)) {
+    return 'malformed meta';
+  }
+  return '';
+}
+
 /* ----- layout builder -------------------------------------------------------- */
 
 function buildPortfolioDecisionLayout() {
@@ -3907,6 +4103,23 @@ function buildPortfolioDecisionLayout() {
   var tokens = pdTokens_(ss);
   var header = tokens.HEADER || PD_FALLBACK_TOKENS.HEADER;
   var op = tokens.OPERATOR_INPUT || PD_FALLBACK_TOKENS.OPERATOR_INPUT;
+  /* v1.5.14: snapshot operator inputs BEFORE the clear (off reads nothing).
+   * Enforce aborts on a snapshot read fault, before anything is cleared:
+   * a failed read must not turn into the reset this mode exists to stop. */
+  var preserveMode = pdPanelPreserveMode_();
+  var preserveFaults = [];
+  var preserved = preserveMode === 'off' ? {}
+                                         : pdPanelPreserve_(sheet, preserveFaults);
+  if (preserveFaults.length) {
+    var faultMsg = '[MP-DEC v' + PD_VERSION + '] layout: panel snapshot failed (' +
+        preserveFaults[0] + ')';
+    if (preserveMode === 'enforce') {
+      Logger.log(faultMsg + '; rebuild aborted, sheet left untouched');
+      throw new Error(faultMsg + '; rebuild aborted, sheet left untouched. ' +
+          'Retry, or set PD_PANEL_PRESERVE=off to rebuild with the defaults.');
+    }
+    Logger.log(faultMsg + '; observe continues with the defaults');
+  }
 
   sheet.clear();
   sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
@@ -3940,14 +4153,33 @@ function buildPortfolioDecisionLayout() {
     sheet.getRange(pos.row, pos.labelCol).setValue(item.label)
         .setFontWeight('bold').setFontSize(9).setWrap(true)
         .setBackground(PD_TINT).setFontColor(PD_NAVY);
-    var seed = defaults.hasOwnProperty(item.label) &&
-               pdHasValue_(defaults[item.label]) ? defaults[item.label]
-                                                 : item.def;
+    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.14
+        preserveMode === 'enforce' ? preserved : null);
     var cell = sheet.getRange(pos.row, pos.valueCol);
     cell.setValue(seed).setBackground(op.bg).setFontColor(op.fg)
         .setFontWeight('bold');
     if (item.kind === 'sar') cell.setNumberFormat(PD_FMT_SAR);
     else if (item.kind === 'num') cell.setNumberFormat('0.0#');
+  }
+  if (preserveMode !== 'off') {                                  // v1.5.14
+    var kept = [], differ = [];
+    for (var pi = 0; pi < PD_PANEL.length; pi++) {
+      var pItem = PD_PANEL[pi];
+      if (!preserved.hasOwnProperty(pItem.label)) continue;
+      kept.push(pItem.label);
+      if (String(preserved[pItem.label]) !==
+          String(pdPanelSeedValue_(pItem, defaults, null))) {
+        differ.push(pItem.label);
+      }
+    }
+    Logger.log('[MP-DEC v' + PD_VERSION + '] layout: ' +
+        (preserveMode === 'enforce'
+            ? 'preserved ' + kept.length + ' operator input(s) (' +
+              differ.length + ' differ from defaults' +
+              (differ.length ? ': ' + differ.join(', ') : '') + ')'
+            : 'observe -- ' + differ.length +
+              ' operator input(s) reset to defaults' +
+              (differ.length ? ': ' + differ.join(', ') : '')));
   }
   sheet.getRange(PD_ROW_PANEL_FIRST, 1, PD_PANEL_ROWS, 8)
       .setBorder(true, true, true, true, true, true, PD_BORDER,
@@ -4037,9 +4269,50 @@ function pdApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
   }
 }
 
+/** PURE display format, matching the backend's seven-significant-digit rule. */
+function pdPriceFormat_(value) {
+  if (typeof value !== 'number' || !isFinite(value) || value === 0 || Math.abs(value) >= 10) {
+    return PD_FMT_PRICE;
+  }
+  var magnitude = Math.abs(value);
+  var exponent = Math.floor(Math.log(magnitude) / Math.LN10);
+  if (magnitude < Math.pow(10, exponent)) exponent--;
+  else if (magnitude >= Math.pow(10, exponent + 1)) exponent++;
+  var digits = Math.max(2, 6 - exponent);
+  return digits > 20 ? '0.000000E+00' : '#,##0.' + new Array(digits + 1).join('0');
+}
+
+/** Only trusted backend metadata enables this display; no property reads. */
+function pdApplyPriceFormats_(sheet, firstDataRow, rows, columns, payload) {
+  if (!payload || !payload.meta || payload.meta.price_precision !== 'on' ||
+      firstDataRow < 0 || !rows.length) return;
+  for (var c = 0; c < columns.length; c++) {
+    var col = columns[c], formats = [];
+    for (var r = 0; r < rows.length; r++) formats.push([pdPriceFormat_(rows[r][col - 1])]);
+    sheet.getRange(firstDataRow, col, rows.length, 1).setNumberFormats(formats);
+  }
+}
+
+/** Opt-in orchestration receipt, independent of funding and B2 receipt mode. */
+function pdRefreshCompletion_(ss, ctx, count, binding, outputState) {
+  var out = {contract: 'tfb_native_refresh_v1', page: 'Portfolio_Decision',
+    state: 'completed', source_run: '', reason: 'source_unverified',
+    output_state: String(outputState || '').slice(0, 48)};
+  var source = pdSrcReadiness_(ss, ctx, count);
+  if (!source.ready || !/^[1-9]\d*$/.test(source.cohort || '')) return out;
+  var held = pdSrcBindingCore_(binding && binding.pre, binding && binding.post, source.stamp_ms);
+  if (!held.ok) { out.reason = 'holdings_unverified'; return out; }
+  out.state = 'completed';
+  out.source_run = source.cohort;
+  out.source_stamp_ms = source.stamp_ms;
+  out.reason = '';
+  return out;
+}
+
 /* ----- main refresh --------------------------------------------------------------- */
 
-function refreshPortfolioDecision() {
+function refreshPortfolioDecision(options) {
+  var completionContract = !!options && options.completionContract === true;
   var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(PD_SHEET);
@@ -4055,11 +4328,11 @@ function refreshPortfolioDecision() {
   /* v1.5.11 (A): capture the My_Portfolio publication BEFORE the holdings
    * read; off = no _Status read (the v1.5.10 path). */
   var receiptMode = pdReceiptMode_();
-  var sourceCtx = receiptMode === 'off' ? null : pdSrcCapture_(ss);
+  var sourceCtx = receiptMode === 'off' && !completionContract ? null : pdSrcCapture_(ss);
   /* v1.5.12: enforce also sends the quote provenance columns. */
   var ibkrMode = pdIbkrMode_();
   var pool = pdCollectHoldings_(ibkrMode === 'enforce'
-      ? PD_IBKR_PROVENANCE_FIELDS : null, receiptMode !== 'off');
+      ? PD_IBKR_PROVENANCE_FIELDS : null, receiptMode !== 'off' || completionContract);
   var poolNote = pool.rows.length
       ? 'holdings ' + pool.rows.length + ' rows from ' + MY_PORTFOLIO_PAGE_ +
         ' (qty/cost from cost-basis: ' + (pool.costBasisApplied || 0) + ')'
@@ -4085,14 +4358,23 @@ function refreshPortfolioDecision() {
     resp = pdPost_(body);
   } catch (eNet) {
     statusCell.setValue(pdStatusLine_('NETWORK ERROR', String(eNet)));
+    if (completionContract) throw new Error('PD_REFRESH_FAILED: network request unavailable');
     return 'NETWORK ERROR';
   }
   if (resp.code !== 200 || !resp.json) {
     statusCell.setValue(pdStatusLine_('HTTP ' + resp.code,
         (resp.text || '').slice(0, 180)));
+    if (completionContract) throw new Error('PD_REFRESH_FAILED: HTTP response unavailable');
     return 'HTTP ' + resp.code;
   }
   var payload = resp.json;
+  var responseProblem = pdResponseProblem_(payload);
+  if (responseProblem) {
+    statusCell.setValue(pdStatusLine_('RESPONSE ERROR', responseProblem));
+    /* Throw: legacy coordinators acknowledge every non-HTTP/non-network return.
+     * The watcher catches this without retiring the still-fresh capture. */
+    throw new Error('RESPONSE ERROR: ' + responseProblem);
+  }
   pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null);
 
   /* v1.5.9: append the just-rendered board to _Portfolio_Action_Log from
@@ -4104,7 +4386,7 @@ function refreshPortfolioDecision() {
   /* v1.5.11 (A): '' when off, so the line stays v1.5.10 byte-identical. */
   /* v1.5.13: bind the receipt to the rows consumed (re-read after). */
   var binding = null;
-  if (receiptMode !== 'off') {
+  if (receiptMode !== 'off' || completionContract) {
     var postStamps = null;
     try { postStamps = pdCollectHoldings_(null, true).stamps; } catch (eRb) {}
     binding = {pre: pool.stamps, post: postStamps};
@@ -4118,7 +4400,8 @@ function refreshPortfolioDecision() {
       logNote ? statusLine + ' | ' + logNote : statusLine));
   Logger.log('[MP-DEC v' + PD_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's' + (logNote ? ' | ' + logNote : ''));
-  return String(payload.status || '?');
+  return completionContract ? pdRefreshCompletion_(ss, sourceCtx, pool.rows.length,
+      binding, payload.status) : String(payload.status || '?');
 }
 
 function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
@@ -4154,12 +4437,13 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
       'No holdings \u2014 refresh My_Portfolio first, or the portfolio is ' +
       'empty (an honest result, L13).');
   pdApplyColFormats_(sheet, aT.firstDataRow, aT.count, {
-    6: PD_FMT_INT, 7: PD_FMT_PRICE, 8: PD_FMT_PRICE, 9: PD_FMT_PRICE,
+    6: PD_FMT_QTY, 7: PD_FMT_PRICE, 8: PD_FMT_PRICE, 9: PD_FMT_PRICE,
     10: PD_FMT_SAR, 11: PD_FMT_SAR, 12: PD_FMT_SAR, 13: PD_FMT_PCT,
-    14: PD_FMT_PCT, 15: PD_FMT_SAR, 16: PD_FMT_INT, 18: PD_FMT_PRICE,
+    14: PD_FMT_PCT, 15: PD_FMT_SAR, 16: PD_FMT_QTY, 18: PD_FMT_PRICE,
     19: PD_FMT_PRICE, 20: PD_FMT_PRICE, 21: PD_FMT_PCT, 22: PD_FMT_PCT,
     23: '0.0', 24: '0.0'
   });
+  pdApplyPriceFormats_(sheet, aT.firstDataRow, aRows, [7, 8, 9, 18, 19, 20], payload);
   pdColorActions_(sheet, aT.firstDataRow, aT.count, 1, tokens);
   if (aT.firstDataRow > 0) {
     sheet.getRange(aT.firstDataRow, PD_LAST_COL, aT.count, 1)
@@ -4201,8 +4485,9 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
     }
     var oT = pdWriteTable_(sheet, row, PD_SCOPE_HEADERS, oRows, '');
     pdApplyColFormats_(sheet, oT.firstDataRow, oT.count, {
-      4: PD_FMT_INT, 5: PD_FMT_PRICE, 6: PD_FMT_PRICE
+      4: PD_FMT_QTY, 5: PD_FMT_PRICE, 6: PD_FMT_PRICE
     });
+    pdApplyPriceFormats_(sheet, oT.firstDataRow, oRows, [5, 6], payload);
     row = oT.next + 1;
   }
 

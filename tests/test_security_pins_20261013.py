@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # tests/test_security_pins_20261013.py
 """
-Security pin floors for requirements.txt v1.1.4 -- pure stdlib, ZERO network.
+Security pin floors for requirements.txt v1.1.5 -- pure stdlib, ZERO network.
 
-VERSION 1.0.0 (2026-10-13)
+VERSION 1.1.0 (2026-10-19)
+WHY: close the remaining seven Starlette advisories with Starlette 1.3.1
+and the first compatible FastAPI release, 0.133.0. NLTK has no patched
+release for GHSA-8mgp-746c-j5xp and production does not use it, so enforce
+its removal. S4 also rejects explicit regressions of all three decisions.
+
+HISTORY: VERSION 1.0.0 (2026-10-13)
 WHY: the advisory audit (dependency_typing_review.yml: pip-audit==2.9.0
 --requirement requirements.txt --no-deps --disable-pip) reported 89 known
 advisories in 13 pinned packages on main (dda1211). requirements.txt v1.1.4
 moves twelve pins to the minimal version that closes their reported
 advisories and still resolves with every other pin on Python 3.11 (89 -> 8).
-This harness keeps that true: a later edit that drops any of those pins
+The current harness preserves those floors and adds the framework and
+NLTK policy above: a later edit that drops any of those pins
 below its fixed version, loosens it from an exact pin, or lets the
 production-pinned contract job drift from requirements.txt goes red in the
 blocking lean lane. It parses text only; it imports none of the packages.
@@ -20,12 +27,13 @@ blocking lean lane. It parses text only; it imports none of the packages.
      opentelemetry-proto 1.28.0 needs >=5.0,<6).
   S3 pyOpenSSL and cryptography are a compatible pair (pyOpenSSL 26.4.x
      needs cryptography >=49,<51; 26.3.x needs >=49,<50).
-  S4 starlette is excluded on purpose: while fastapi is 0.115.x it must stay
-     below 0.47.0 (fastapi 0.115.14 requires starlette<0.47.0).
+  S4 framework versions below the fixed compatible floors and reintroduced
+     NLTK are rejected by the same guard used for the real requirements.
   S5 every "pkg==ver" pin in ci.yml's contract job equals requirements.txt.
-  S6 the httpcore direct-wheel URL pin (skipped by pip-audit) still names
-     the version audited on its own: httpcore 1.0.9, no known advisories.
-  S7 the requirements.txt header carries the v1.1.4 dated WHY.
+  S6 the httpcore direct-wheel URL pin still meets its audited 1.0.9 floor.
+     The old requirements-only audit skipped URLs; the installed-package
+     audit now includes the resolved httpcore distribution with all others.
+  S7 the requirements.txt header carries the v1.1.5 dated WHY.
   G1 GOLDEN NEGATIVE: set TFB_SECPIN_BASE=<copy of the pre-change
      requirements.txt (v1.1.3)> and the S1 floors are evaluated against that
      file -- this test then FAILS (12 pins below their fixed versions). It
@@ -45,7 +53,7 @@ import unittest
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = Path(os.environ.get("TFB_SECPIN_REQ", str(ROOT / "requirements.txt")))
@@ -59,18 +67,20 @@ SECURITY_FLOORS: Dict[str, str] = {
     "aiohttp": "3.14.3",
     "anyio": "4.14.2",
     "cryptography": "50.0.0",
+    "fastapi": "0.133.0",
     "h2": "4.4.1",
     "lxml": "6.1.0",
-    "nltk": "3.10.3",
     "protobuf": "5.29.6",
     "pydantic-settings": "2.14.2",
     "pyjwt": "2.15.0",
     "pyopenssl": "26.0.0",
     "python-dotenv": "1.2.2",
     "python-multipart": "0.0.31",
+    "starlette": "1.3.1",
 }
 
-# Version audited on its own because pip-audit skips URL requirements.
+# Audited version floor; the installed-package audit includes this URL pin's
+# resolved distribution. The historical requirements-only audit skipped it.
 HTTPCORE_AUDITED = "1.0.9"
 
 
@@ -131,6 +141,8 @@ def _floor_violations(reqs: Dict[str, List[Tuple[str, str]]]) -> List[str]:
             continue
         if _vtuple(ver) < _vtuple(floor):
             bad.append("%s==%s is below its fixed version %s" % (name, ver, floor))
+    if "nltk" in reqs:
+        bad.append("nltk must remain absent: unused and no patched release for GHSA-8mgp-746c-j5xp")
     return bad
 
 
@@ -180,12 +192,12 @@ def test_s3_pyopenssl_and_cryptography_are_a_compatible_pair() -> None:
     assert lo <= crypto < hi, "cryptography %r outside pyOpenSSL %r window %r..%r" % (crypto, ossl, lo, hi)
 
 
-def test_s4_starlette_exclusion_matches_fastapi_bound() -> None:
+def test_s4_fixed_framework_and_nltk_policy_rejects_regressions() -> None:
     reqs = _parse_requirements(REQUIREMENTS)
-    fastapi = _vtuple(_exact(reqs, "fastapi"))
-    starlette = _vtuple(_exact(reqs, "starlette"))
-    if fastapi[:2] == (0, 115):
-        assert starlette < (0, 47, 0), "fastapi 0.115.x requires starlette<0.47.0, got %r" % (starlette,)
+    for name, version in (("fastapi", "0.132.1"), ("starlette", "1.3.0"), ("nltk", "3.10.3")):
+        mutated = {**reqs, name: [("==", version)]}
+        bad = _floor_violations(mutated)
+        assert any(name in error for error in bad), (name, version, bad)
 
 
 def test_s5_contract_job_pins_follow_requirements() -> None:
@@ -202,7 +214,7 @@ def test_s5_contract_job_pins_follow_requirements() -> None:
     assert not drift, "\n".join(drift)
 
 
-def test_s6_httpcore_url_pin_is_the_separately_audited_version() -> None:
+def test_s6_httpcore_url_pin_meets_the_audited_floor() -> None:
     entries = _parse_requirements(REQUIREMENTS).get("httpcore", [])
     assert len(entries) == 1, entries
     op, value = entries[0]
@@ -219,8 +231,8 @@ def test_s6_httpcore_url_pin_is_the_separately_audited_version() -> None:
 def test_s7_requirements_header_records_dated_why() -> None:
     head = "\n".join(REQUIREMENTS.read_text(encoding="utf-8").splitlines()[:12])
     m = re.search(r"requirements\.txt \(v(\d+\.\d+\.\d+)\)", head)
-    assert m and _vtuple(m.group(1)) >= (1, 1, 4), head
-    assert "WHY v1.1.4 (2026-10-13)" in REQUIREMENTS.read_text(encoding="utf-8")
+    assert m and _vtuple(m.group(1)) >= (1, 1, 5), head
+    assert "WHY v1.1.5 (2026-10-19)" in REQUIREMENTS.read_text(encoding="utf-8")
 
 
 def test_g1_golden_negative_base_requirements_fail_the_floors() -> None:

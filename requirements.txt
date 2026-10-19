@@ -1,6 +1,16 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.4)
+# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.5)
 # ============================================================================
+# WHY v1.1.5 (2026-10-19):
+# - SECURITY: close the remaining seven Starlette advisories with 1.3.1.
+#   FastAPI 0.133.0 is the first release supporting Starlette 1.x;
+#   0.132.1 still requires starlette<1.0.0. Keep the compatible pair exact.
+# - Remove unused NLTK: GHSA-8mgp-746c-j5xp has no patched release.
+#   Production only probes its availability for the news health report;
+#   tokenization uses the existing stdlib implementation without NLTK.
+# - Preserve every other pin, including the httpcore 1.0.9 wheel URL.
+#   Audit the resolved installed distributions so that URL is included.
+#
 # WHY v1.1.4 (2026-10-13):
 # - SECURITY: the advisory dependency audit (dependency_typing_review.yml,
 #   "pip-audit==2.9.0 --requirement requirements.txt --no-deps
@@ -73,10 +83,9 @@
 # ----------------------------------------------------------------------------
 # Web framework (FastAPI core)
 # ----------------------------------------------------------------------------
-fastapi==0.115.14
-# v1.1.4: starlette HELD at 0.41.3 -- fastapi 0.115.14 requires
-# starlette<0.47.0 and every published fix is >=0.47.2 (see header).
-starlette==0.41.3
+fastapi==0.133.0
+# v1.1.5: minimal fixed Starlette and its first compatible FastAPI release.
+starlette==1.3.1
 uvicorn[standard]==0.32.1
 gunicorn==23.0.0
 anyio==4.14.2
@@ -215,7 +224,7 @@ sentry-sdk==2.58.0
 beautifulsoup4==4.14.3
 lxml==6.1.0
 feedparser==6.0.12
-nltk==3.10.3
+# v1.1.5: NLTK removed; the optional news capability probe remains false.
 
 # --- Async file / cache IO ---------------------------------------------------
 aiofiles==24.1.0

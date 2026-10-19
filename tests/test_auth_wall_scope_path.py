@@ -1,5 +1,14 @@
 """tests/test_auth_wall_scope_path.py - global auth wall routed-path harness.
 
+HARNESS_VERSION 1.2.0 (2026-10-19): W8/W15 use an explicit Starlette 0.41.3
+URL reference for historical parity and require the actual helper to return
+the literal ASGI scope path. Starlette 1.3.1 rejects more Host spellings and
+falls back to a relative URL when scope.server is absent, so its current
+url.path is no longer a stable reference for those synthetic scopes. Keep
+the complete corpus, add //x/health with no server, and prove that replacing
+the real global scope helper with request.url.path fails the existing
+security checks (W20). No production auth behavior changes.
+
 HARNESS_VERSION 1.0.0 (2026-10-13) for main.py v8.14.5.
 HARNESS_VERSION 1.1.1 (2026-10-13, CI fix on PR #769): W19 skips, with its
 reason, when orjson is not importable. The contract job installs only
@@ -60,8 +69,9 @@ Cases:
   W8 (7a) decision identity, always on: for a corpus of valid Host values
      (with and without port, IPv6 literals, uppercase, sub-delims, empty,
      absent) and plain paths, the v8.14.4 expression
-     str(request.url.path) in _GLOBAL_AUTH_EXEMPT_PATHS equals the new
-     decision, and request.url.path equals the echoed scope path;
+     str(request.url.path) in _GLOBAL_AUTH_EXEMPT_PATHS, reconstructed with
+     a frozen 0.41.3 reference, equals the new decision; the helper returns
+     the literal scope path, including //x/health with no server;
      _scope_route_path equals Starlette's own get_route_path
   W9 (7b) [needs TFB_AUTH_WALL_BASE] dual tree: the same corpus through the
      pre-change wall and the new wall gives byte-identical status and body
@@ -86,8 +96,8 @@ Cases:
      knows; a valid token passes with a normal or a crafted Host; a wrong
      token is refused
   W15 route-layer identity, always on: each module's _request_scope_path
-     equals request.url.path for the valid-Host corpus (the path is the only
-     input that changed, so every decision is unchanged) and returns "" for
+     equals both the literal scope path and the frozen 0.41.3 URL reference
+     for the full valid-Host corpus, and returns "" for
      a request object without a scope; the six auth functions read no
      request.url (AST); versions bumped; verify_deployment pins
      advanced_analysis and analysis_sheet_rows
@@ -104,6 +114,9 @@ Cases:
      app answers GET /v1/config/settings (masked settings; no engine, no
      provider) with the route's own 401 for a normal Host and for crafted
      Hosts, 401 for a wrong token and 200 for a valid one
+  W20 a deliberate request.url.path mutation of the real global scope
+     helper is rejected by W3; W8 also rejects it when the installed
+     framework's URL reconstruction differs from the literal scope path
 
 Env (optional):
   TFB_AUTH_WALL_BASE=<file or dir>  the pre-change main.py (or a directory
@@ -134,7 +147,7 @@ except ImportError:  # pragma: no cover - script mode without pytest
     pytest = None
 
 
-HARNESS_VERSION = "1.1.1"
+HARNESS_VERSION = "1.2.0"
 ROOT = Path(__file__).resolve().parents[1]
 DELIVERED = ROOT / "main.py"
 ENV_BASE = "TFB_AUTH_WALL_BASE"
@@ -157,7 +170,7 @@ VALID_HOSTS = [
     "Tadawul-Fast-Bridge.OnRender.com", "a.b-c.example:65535", "xn--mgbh0fb.example",
     "sub.delims!$&'()*+,;=", "pct%20enc.example", "h:", "",
 ]
-NEAR_MISS = ["/health/", "/HEALTH", "//health", "/health/x", "/v1/health/", "/healthz/",
+NEAR_MISS = ["/health/", "/HEALTH", "//health", "//x/health", "/health/x", "/v1/health/", "/healthz/",
              "/docs/oauth2-redirect", "/openapi.json/", "/_debug/routes/", "/health;x",
              "/health%20", "/health.json", "/v1", "/v1/", "/static/x"]
 
@@ -171,7 +184,32 @@ PATH_SHAPES = ["/health%3F", "/%3F", "/livez%23x", "/health%09", "/v1/health%0A"
                "/readyz%3F/v1/advanced/sheet-rows"]
 
 
-RUNNER = r'''
+# Test-only historical reference, independent of the installed Starlette.
+# Equivalent to 0.41.3 URL(scope=...).path, whose behavior W8/W15 originally
+# compared with the scope-based repair. The new library must not redefine
+# that historical oracle or the actual ASGI path expected from the helper.
+_LEGACY_URL_REFERENCE = r'''
+def _starlette_0413_url_path(scope):
+    from urllib.parse import urlsplit
+    scheme = scope.get("scheme", "http")
+    authority = next((value.decode("latin-1") for key, value in scope["headers"]
+                      if key == b"host"), None)
+    server = scope.get("server")
+    if authority is None and server is not None:
+        host, port = server
+        default = {"http": 80, "https": 443, "ws": 80, "wss": 443}[scheme]
+        authority = str(host) if port == default else f"{host}:{port}"
+    raw = scope["path"]
+    if authority is not None:
+        raw = f"{scheme}://{authority}{raw}"
+    query = scope.get("query_string", b"")
+    if query:
+        raw += "?" + query.decode()
+    return urlsplit(raw).path
+'''
+
+
+RUNNER = _LEGACY_URL_REFERENCE + r'''
 import importlib.util, json, os, socket, sys
 ROOT, MAIN, MODE = sys.argv[1], sys.argv[2], sys.argv[3]
 SPEC = json.loads(sys.stdin.read())
@@ -188,6 +226,11 @@ sp = importlib.util.spec_from_file_location("main", MAIN)
 m = importlib.util.module_from_spec(sp)
 sys.modules["main"] = m
 sp.loader.exec_module(m)
+
+if SPEC.get("mutate_scope_helper_to_url"):
+    # Negative control confined to this child process: replace the actual
+    # helper used by the real middleware, not a copied implementation.
+    m._request_scope_path = lambda request: str(request.url.path or "")
 
 from starlette.testclient import TestClient
 from starlette.requests import Request
@@ -263,7 +306,7 @@ if hasattr(m, "_global_auth_exempt_request"):
     for _ in range(600):
         paths.append("/" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14))))
     hosts = list(SPEC["valid_hosts"]) + [None]
-    n = mism = echo = 0
+    n = mism = echo = url_drift = 0
     examples = []
     for host in hosts:
         for path in paths:
@@ -277,16 +320,21 @@ if hasattr(m, "_global_auth_exempt_request"):
                 headers = [] if host is None else [(b"host", host.encode("latin-1"))]
                 scope = {"type": "http", "method": "GET", "scheme": scheme, "path": path, "root_path": "",
                          "query_string": b"x=/health", "headers": headers, "server": server}
-                old = str(Request(scope).url.path or "") in m._GLOBAL_AUTH_EXEMPT_PATHS
+                historical_path = _starlette_0413_url_path(scope)
+                old = historical_path in m._GLOBAL_AUTH_EXEMPT_PATHS
                 new = m._global_auth_exempt_request(Request(scope))
                 n += 1
                 if old != new:
                     mism += 1
                     if len(examples) < 5:
                         examples.append([host, path, old, new])
-                if Request(scope).url.path != m._request_scope_path(Request(scope)):
+                actual_path = m._request_scope_path(Request(scope))
+                if actual_path != scope["path"] or actual_path != historical_path:
                     echo += 1
-    out["identity"] = {"n": n, "mismatch": mism, "echo_mismatch": echo, "examples": examples}
+                if Request(scope).url.path != scope["path"]:
+                    url_drift += 1
+    out["identity"] = {"n": n, "mismatch": mism, "echo_mismatch": echo,
+                       "current_url_drift": url_drift, "examples": examples}
     try:
         from starlette._utils import get_route_path
         roots = ["", "/", "/api", "/v1", "/health", "/_debug", "/v1/health", "/a/b"]
@@ -411,8 +459,8 @@ def _exempt_paths() -> set:
 _CACHE: dict = {}
 
 
-def _run(main_path: Path, mode: str) -> dict:
-    key = (str(main_path), mode)
+def _run(main_path: Path, mode: str, *, mutate_scope_helper_to_url: bool = False) -> dict:
+    key = (str(main_path), mode, mutate_scope_helper_to_url)
     if key in _CACHE:
         return _CACHE[key]
     env = dict(os.environ)
@@ -420,8 +468,9 @@ def _run(main_path: Path, mode: str) -> dict:
         env.pop(name, None)
     env.update(_BASE_ENV)
     env.update(_MODES[mode])
+    spec = {**_spec(), "mutate_scope_helper_to_url": mutate_scope_helper_to_url}
     proc = subprocess.run([sys.executable, "-c", RUNNER, str(ROOT), str(main_path), mode],
-                          input=json.dumps(_spec()), cwd=str(ROOT), env=env,
+                          input=json.dumps(spec), cwd=str(ROOT), env=env,
                           capture_output=True, text=True, timeout=600)
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("@@JSON@@")]
     if proc.returncode != 0 or not lines:
@@ -488,7 +537,7 @@ ROUTE_TOKEN_HOSTS = ["testserver", "testserver/health?x=", "h/static?", "h/v1/ad
 FULL_STACK_HOSTS = ["testserver/health?x=", "h/livez#", "h/static?", "h/v1/advanced/health?",
                     "testserver/?x=", "u@h/readyz?"]
 
-ROUTE_RUNNER = r"""
+ROUTE_RUNNER = _LEGACY_URL_REFERENCE + r"""
 import importlib.util, json, os, random, socket, sys
 TREE = sys.argv[1]
 SPEC = json.loads(sys.stdin.read())
@@ -599,10 +648,12 @@ for name, mod in MODS.items():
             for server in servers:
                 r = req(p, host, server=server)
                 n += 1
-                if fn(r) != r.url.path:
+                actual_path = fn(r)
+                historical_path = _starlette_0413_url_path(r.scope)
+                if actual_path != p or actual_path != historical_path:
                     mism += 1
                     if len(examples) < 4:
-                        examples.append([host, p, fn(r), r.url.path])
+                        examples.append([host, p, actual_path, historical_path])
     helpers[name] = {"n": n, "mismatch": mism, "examples": examples, "duck": fn(_Duck()),
                      "none": fn(None)}
 out["helpers"] = helpers
@@ -851,8 +902,9 @@ def case_w8(res=None):
         problems.append(f"_scope_route_path differs from get_route_path in {par['mismatch']}/{par['n']}")
     if problems:
         return "FAIL", "; ".join(problems)
-    return "PASS", (f"{ident['n']} valid-Host requests: old and new decisions identical, "
-                    f"url.path == scope path; {parity}")
+    return "PASS", (f"{ident['n']} valid-Host requests: frozen 0.41.3 and new decisions identical, "
+                    f"helper == literal scope path == historical URL path; {parity}; "
+                    f"current-library URL formatting differs in {ident['current_url_drift']} synthetic cases")
 
 
 def _dual(base: Path):
@@ -1047,12 +1099,13 @@ def case_w15(res=None):
             continue
         total += h["n"]
         if h["mismatch"]:
-            problems.append(f"{rel}: {h['mismatch']}/{h['n']} differ from url.path {h['examples']}")
+            problems.append(f"{rel}: {h['mismatch']}/{h['n']} differ from scope/historical path {h['examples']}")
         if h["duck"] != "" or h["none"] != "":
             problems.append(f"{rel}: no-scope request gave {h['duck']!r} / {h['none']!r}, not ''")
     if problems:
         return "FAIL", "; ".join(problems[:6])
-    return "PASS", (f"{total} valid-Host requests over {len(res['helpers'])} modules: scope path == url.path; "
+    return "PASS", (f"{total} valid-Host requests over {len(res['helpers'])} modules: helper == literal scope "
+                    "path == historical URL path; "
                     "no-scope objects give ''; no request.url read in the six auth functions; versions and "
                     "verify_deployment pins match")
 
@@ -1169,6 +1222,20 @@ def case_w19(res=None):
                     f"{len(FULL_STACK_HOSTS)} crafted Hosts, 401 to a wrong token, 200 to a valid one")
 
 
+def case_w20():
+    actual = _run(DELIVERED, "armed")
+    mutant = _run(DELIVERED, "armed", mutate_scope_helper_to_url=True)
+    status, detail = case_w3(mutant)
+    if status != "FAIL":
+        return "FAIL", "W3 accepted the deliberate URL-based helper mutation: " + detail
+    identity_status, identity_detail = case_w8(mutant)
+    if actual["identity"]["current_url_drift"] and identity_status != "FAIL":
+        return "FAIL", "W8 accepted URL formatting as the scope path: " + identity_detail
+    return "PASS", ("real helper changed to request.url.path in an isolated child: W3 rejects it; "
+                    f"W8={identity_status}, echo mismatches={mutant['identity']['echo_mismatch']}, "
+                    f"decision mismatches={mutant['identity']['mismatch']}")
+
+
 CASES = (
     ("W1 v8.14.5, helpers present, no request.url reads", case_w1),
     ("W2 anonymous protected requests get 401", case_w2),
@@ -1189,6 +1256,7 @@ CASES = (
     ("W17 route-layer golden negative on the base", case_w17),
     ("W18 route-layer zero removals against the base", case_w18),
     ("W19 full stack with the wall dropped", case_w19),
+    ("W20 URL-based helper mutation fails the auth guards", case_w20),
 )
 
 
