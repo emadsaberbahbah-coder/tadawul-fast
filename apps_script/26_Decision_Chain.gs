@@ -1,8 +1,27 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.0 (2026-10-16)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.1 (2026-10-19)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.1 (2026-10-19) -- RE-RENDER TOP_10 AFTER A RELEASE. The P0-1 release
+ * (release_decision_feed.yml) promotes 'TFB Decision Feed' to EXECUTABLE
+ * only AFTER the cockpits consumed the cohort, and the board shows the
+ * promotion only on a render AFTER it (P0-1 commit sheet, prerequisite 3).
+ * Until now that second render waited for the 4-hourly wrapper, inside the
+ * release's 480-minute clock. Now, when the feed reads EXECUTABLE with
+ * run=N for the cohort this chain already refreshed (state.t10 == N) and an
+ * issued= stamp the chain has not rendered yet (state.t10rel), one more
+ * Top_10 refresh is planned (same skips: in flight, cockpit running, quiet,
+ * manual priority; TFB_DC_MAX_ATTEMPTS per issued= stamp). A NOT_ACTIONABLE
+ * feed, a feed for another run, or an issued= already rendered plans
+ * nothing. When the normal post-audit refresh already happens under an
+ * EXECUTABLE feed, that render counts (state.t10rel is set with it), so a
+ * release never causes two renders. Functions added: 1 (tfbDcReleaseOf_,
+ * PURE). Changed: tfbDcStateOf_ (t10rel), tfbDcPlanCore_ (release branch),
+ * tfbDcReadInputs_ (release fields), tfbDecisionChainTick (t10rel state,
+ * attempts key, prune). Removed: 0. Default (TFB_DECISION_CHAIN unset/off)
+ * still returns before any read. Rollback: v1.0.0, or off.
  *
  * WHY (GitHub Actions + _Run_Log evidence, 14-16 Oct 2026): the sync
  * publishes My_Portfolio ~2 min into a run and the market pages by the end of
@@ -48,7 +67,7 @@
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.0';
+var TFB_DC_VERSION = '1.0.1';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -110,14 +129,32 @@ function tfbDcRunOf_(raw) {
   return first && !re.exec(s) ? first[1] : '';
 }
 
+/** v1.0.1 PURE: an EXECUTABLE release value -> {run, issued}; anything else
+ * -> {run: '', issued: ''}. The head token must be exactly EXECUTABLE (the
+ * cockpit's own rule) and the value must carry exactly one run= and exactly
+ * one issued= token (the release grammar). */
+function tfbDcReleaseOf_(raw) {
+  var s = String(raw === null || raw === undefined ? '' : raw);
+  var out = {run: '', issued: ''};
+  if (s.split('|')[0].replace(/^\s+|\s+$/g, '') !== 'EXECUTABLE') return out;
+  var run = tfbDcRunOf_(s);
+  var re = /(?:^|[\s|])issued=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})/g;
+  var first = re.exec(s);
+  if (!run || !first || re.exec(s)) return out;
+  out.run = run;
+  out.issued = first[1];
+  return out;
+}
+
 /** Parse the chain's own state JSON; anything malformed -> empty state. */
 function tfbDcStateOf_(raw) {
-  var st = {pd: '', t10: '', claim: null, attempts: {}, observed: {}};
+  var st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {}, observed: {}};
   try {
     var o = JSON.parse(String(raw || ''));
     if (o && typeof o === 'object') {
       st.pd = String(o.pd || '');
       st.t10 = String(o.t10 || '');
+      st.t10rel = String(o.t10rel || '');   /* v1.0.1: issued= last rendered */
       st.claim = (o.claim && typeof o.claim === 'object') ? o.claim : null;
       st.attempts = (o.attempts && typeof o.attempts === 'object') ? o.attempts : {};
       st.observed = (o.observed && typeof o.observed === 'object') ? o.observed : {};
@@ -152,7 +189,22 @@ function tfbDcPlanCore_(s) {
   var run = String(t.gmRun || '');
   if (!t.available) return none('nothing new (Top_10 refresh unavailable)');
   if (!/^[1-9]\d*$/.test(run)) return none('Global_Markets feed run unreadable');
-  if (run === st.t10) return none('Top_10 already refreshed for run ' + run);
+  /* v1.0.1: the issued= stamp of an EXECUTABLE feed for THIS cohort, or '' */
+  var issued = (String(t.releaseRun || '') === run) ? String(t.releaseIssued || '') : '';
+  if (run === st.t10) {
+    /* v1.0.1: the board shows a release only on a render AFTER it (P0-1
+     * prerequisite 3): one more Top_10 refresh per issued= stamp. */
+    if (!issued || issued === String(st.t10rel || '')) {
+      return none('Top_10 already refreshed for run ' + run);
+    }
+    if ((att['t10rel:' + issued] || 0) >= TFB_DC_MAX_ATTEMPTS) {
+      return none('Top_10 release re-render gave up after ' + TFB_DC_MAX_ATTEMPTS + ' attempts');
+    }
+    if (s.cockpitRunning) return none('cockpit refresh in progress');
+    if (s.quiet) return none('quiet window (S-1 board slot)');
+    return {action: 't10', run: run, release: issued,
+            reason: 'release issued ' + issued + ' for run ' + run};
+  }
   if (String(t.decisionRun || '') !== run) {
     return none('run ' + run + ' final audit not finished');
   }
@@ -161,7 +213,10 @@ function tfbDcPlanCore_(s) {
   }
   if (s.cockpitRunning) return none('cockpit refresh in progress');
   if (s.quiet) return none('quiet window (S-1 board slot)');
-  return {action: 't10', run: run, reason: 'run ' + run + ' final audit done'};
+  /* v1.0.1: a post-audit render under an already EXECUTABLE feed counts as
+   * the release render too (release: issued), so a release never costs two. */
+  return {action: 't10', run: run, release: issued,
+          reason: 'run ' + run + ' final audit done'};
 }
 
 /* -------------------------------------------------------------------- I/O --- */
@@ -197,7 +252,7 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
                            typeof pdSrcReadiness_ === 'function',
                 ready: false, cohort: '', reason: ''},
            t10: {available: typeof refreshDecisionTop10 === 'function',
-                 gmRun: '', decisionRun: ''},
+                 gmRun: '', decisionRun: '', releaseRun: '', releaseIssued: ''},
            inflight: false, cockpitRunning: false, quiet: false,
            automationAllowed: true};
   try {
@@ -211,7 +266,11 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
     var gm = tfbDcStatusValue_(ss, TFB_DC_GM_FEED_KEY);
     var ml = tfbDcStatusValue_(ss, TFB_DC_ML_FEED_KEY);
     s.t10.gmRun = tfbDcRunOf_(gm);
-    s.t10.decisionRun = tfbDcRunOf_(tfbDcStatusValue_(ss, TFB_DC_DECISION_FEED_KEY));
+    var feedRaw = tfbDcStatusValue_(ss, TFB_DC_DECISION_FEED_KEY);
+    s.t10.decisionRun = tfbDcRunOf_(feedRaw);
+    var rel = tfbDcReleaseOf_(feedRaw);          /* v1.0.1 */
+    s.t10.releaseRun = rel.run;
+    s.t10.releaseIssued = rel.issued;
     if (typeof dt10SyncInflightCore_ === 'function') {
       s.inflight = !!dt10SyncInflightCore_(ml, gm, nowMs, TFB_DC_INFLIGHT_MAX_MIN).active;
     }
@@ -272,14 +331,20 @@ function tfbDecisionChainTick() {
     /* observe walks both steps: what it already reported counts as done */
     var view = mode === 'observe'
         ? {pd: state.observed.pd || state.pd, t10: state.observed.t10 || state.t10,
+           t10rel: state.observed.t10rel || state.t10rel,
            claim: null, attempts: {}, observed: state.observed}
         : state;
     var plan = tfbDcPlanCore_(tfbDcReadInputs_(ss, mode, view, nowMs));
     if (plan.action === 'none') return {plan: plan};
-    var key = plan.action + ':' + plan.run;
+    /* v1.0.1: a release re-render is keyed by its issued= stamp */
+    var rerender = plan.action === 't10' && plan.release && plan.run === String(state.t10 || '');
+    var key = rerender ? 't10rel:' + plan.release : plan.action + ':' + plan.run;
     if (mode === 'observe') {
-      if (state.observed[plan.action] !== plan.run) {   /* always true via view */
-        state.observed[plan.action] = plan.run;
+      var seenKey = rerender ? 't10rel' : plan.action;
+      var seenVal = rerender ? plan.release : plan.run;
+      if (state.observed[seenKey] !== seenVal) {   /* always true via view */
+        state.observed[seenKey] = seenVal;
+        if (plan.release && !rerender) state.observed.t10rel = plan.release;
         props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
         tfbDcLog_('INFO', plan.action === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments',
                   'OBSERVE', '[DECISION-CHAIN v' + TFB_DC_VERSION + '] would refresh ' +
@@ -316,13 +381,15 @@ function tfbDecisionChainTick() {
     var state = tfbDcStateOf_(props.getProperty(TFB_DC_STATE_PROP));
     if (ok) {
       state[p.plan.action] = p.plan.run;
+      if (p.plan.action === 't10') state.t10rel = String(p.plan.release || '');   /* v1.0.1 */
       delete state.attempts[p.key];
     }
     state.claim = null;
-    var keep = {};   // prune attempts to the cohort being worked on
+    var keep = {};   // prune attempts to the cohort (or release stamp) being worked on
     for (var k in state.attempts) {
-      if (state.attempts.hasOwnProperty(k) &&
-          String(k).split(':')[1] === p.plan.run) keep[k] = state.attempts[k];
+      if (!state.attempts.hasOwnProperty(k)) continue;
+      var tail = String(k).slice(String(k).indexOf(':') + 1);
+      if (tail === p.plan.run || (p.plan.release && tail === p.plan.release)) keep[k] = state.attempts[k];
     }
     state.attempts = keep;
     props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
@@ -379,6 +446,7 @@ function tfbDecisionChainStatus() {
       mode === 'off' ? 'observe' : mode, state, Date.now()));
   var msg = '[DECISION-CHAIN v' + TFB_DC_VERSION + '] mode=' + mode +
       ' last_pd=' + (state.pd || '-') + ' last_t10=' + (state.t10 || '-') +
+      ' last_release_render=' + (state.t10rel || '-') +
       ' next=' + plan.action + (plan.run ? ' run ' + plan.run : '') + ' (' + plan.reason + ')';
   Logger.log(msg);
   return msg;

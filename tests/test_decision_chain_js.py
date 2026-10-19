@@ -27,4 +27,4 @@ def test_decision_chain_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "RESULT 15/15 PASS" in result.stdout
+    assert "RESULT 17/17 PASS" in result.stdout

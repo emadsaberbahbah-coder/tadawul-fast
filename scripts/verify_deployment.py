@@ -226,7 +226,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.1", "final decision-publication acceptance"),
-    ("release_decision_feed", "1.1.0", "gated audited decision-feed release (P0-1)"),
+    ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),

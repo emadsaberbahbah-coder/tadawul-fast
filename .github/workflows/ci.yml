@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.22 (2026-10-19) -- SCHEDULED DECISION-FEED RELEASE ATTEMPTS
+#
+# v1.1.22: run tests/test_release_auto_source.py (release_decision_feed
+# v1.2.0: --source-run-id auto discovers the cohort from the bounded _Status
+# block; release_decision_feed.yml v1.1.0 runs on a schedule after the cockpit
+# render slots) in the blocking lean lane, next to the existing P0-1 harness.
+#
 # VERSION 1.1.21 (2026-10-19) -- BACKUP RESUME + VENUE CALENDAR COVERAGE
 #
 # v1.1.21: run tests/test_backup_upload_resume.py (backup_workbook v1.5.1:
@@ -666,7 +673,8 @@ jobs:
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py \
-            tests/test_backup_upload_resume.py $EXTRA
+            tests/test_backup_upload_resume.py \
+            tests/test_release_auto_source.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions

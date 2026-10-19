@@ -243,5 +243,59 @@ check('C15 installer replaces its own trigger only; remover leaves others', () =
   assert.deepEqual(w.triggers.map(t => t.getHandlerFunction()), ['pdIbkrCaptureWatch']);
 });
 
-console.log('RESULT ' + passed + '/15 PASS');
-assert.equal(passed, 15);
+const RELEASED = (run, issued) => 'EXECUTABLE | run=' + run + ' | 2026-10-16 03:53:00+03:00 | issued=' + issued +
+  ' | expires=2026-10-16T11:53:00+03:00 | ttl_min=480 | release=777001 | attempt=1 | receipts=T10:' + run +
+  ',PF:' + run + ' | t10_at=2026-10-16T03:58:00+03:00 | pf_at=2026-10-16T03:55:00+03:00 | mp_at=2026-10-16T03:53:00+03:00 | audits=0,0';
+
+check('C16 v1.0.1: an EXECUTABLE release for the refreshed cohort triggers ONE more Top_10 render per issued= stamp', () => {
+  const kv = readyKv(RUN, RUN);
+  const w = world({now: T0, status: readyStatus(RUN), kv,
+                   props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(w.calls.t10, 1);
+  let st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual([st.t10, st.t10rel, st.claim], [RUN, '2026-10-16T04:10:00+03:00', null]);
+  assert.match(w.runLog[0][5], /release issued 2026-10-16T04:10:00\+03:00 for run/);
+  // a second release (new issued=) renders once more; the same stamp never again
+  kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T06:40:00+03:00');
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(w.calls.t10, 2);
+  // a release for ANOTHER run, or a NOT_ACTIONABLE feed, plans nothing
+  kv['TFB Decision Feed'] = RELEASED(OLD, '2026-10-16T07:00:00+03:00');
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  kv['TFB Decision Feed'] = feed('NOT_ACTIONABLE(final_publication)', RUN, T0);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(w.calls.t10, 2);
+});
+
+check('C17 v1.0.1: a post-audit render under an already EXECUTABLE feed counts as the release render', () => {
+  const kv = readyKv(RUN, RUN);
+  kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
+  const w = world({now: T0, status: readyStatus(OLD), kv,
+                   props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(w.calls.t10, 1);
+  assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10rel, '2026-10-16T04:10:00+03:00');
+  // observe mode reports the re-render once and never refreshes
+  const o = world({now: T0, status: readyStatus(RUN), kv: Object.assign(readyKv(RUN, RUN),
+                   {'TFB Decision Feed': RELEASED(RUN, '2026-10-16T04:10:00+03:00')}),
+                   props: {TFB_DECISION_CHAIN: 'observe', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
+  assert.equal(o.ctx.tfbDecisionChainTick(), 'observed t10 run ' + RUN);
+  assert.equal(o.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(o.calls.t10, 0);
+  assert.equal(o.runLog.length, 1);
+  // pure helper
+  const rel = (v) => JSON.parse(JSON.stringify(w.ctx.tfbDcReleaseOf_(v)));   // vm realm -> plain object
+  assert.deepEqual(rel(RELEASED(RUN, '2026-10-16T04:10:00+03:00')), {run: RUN, issued: '2026-10-16T04:10:00+03:00'});
+  assert.deepEqual(rel('executable | run=1 | issued=2026-10-16T04:10:00+03:00'), {run: '', issued: ''});
+  assert.deepEqual(rel(feed('NOT_ACTIONABLE(final_publication)', RUN, T0)), {run: '', issued: ''});
+  assert.deepEqual(rel('EXECUTABLE | run=1 | run=2 | issued=2026-10-16T04:10:00+03:00'), {run: '', issued: ''});
+});
+
+console.log('RESULT ' + passed + '/17 PASS');
+assert.equal(passed, 17);
