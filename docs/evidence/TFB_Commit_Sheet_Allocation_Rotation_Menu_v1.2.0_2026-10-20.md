@@ -2,13 +2,13 @@
 
 <p class="meta">20 Oct 2026 (Riyadh) · One-Pass delivery · three lanes: Apps Script (paste), GitHub (PR, this branch), Render (ENV + manual deploy, owner) · base pins: 27_Decision_Pages_v2 v1.1.0 (sha f6248cb06537), 01_Menu v2.20.2 (sha b391ee1bd756), opportunity_builder 1.27.0 (main f24e9ff, live on Render since 00:11 today)</p>
 
-<div class="verdict"><strong>Bottom line.</strong> Two of your three requirements already exist in the backend but are switched off or invisible: <strong>conviction-weighted sizing</strong> (OB v1.27.0, merged yesterday, default <code>cap</code>) and the <strong>rotation funding plan</strong> (sell the weakest holding to fund a better seat; v1.18.0, on by default but only visible when the feed is released and only on the engine's 12-month basis). What was missing: the menu-bar entry, a research view that shows the allocation and the switch <em>today</em> while the feed is still withheld, and a 3-month basis for the rotation (your "20% vs 14% over 3 months" case). This delivery adds all three: <strong>27_Decision_Pages_v2 v1.2.0</strong> + <strong>01_Menu v2.20.3</strong> (paste), <strong>opportunity_builder v1.27.1</strong> (PR, default off), and the exact Render ENV values to arm the production behaviour.</div>
+<div class="verdict"><strong>Bottom line.</strong> Two of your three requirements already exist in the backend but are switched off or invisible: <strong>conviction-weighted sizing</strong> (OB v1.27.0, merged yesterday, default <code>cap</code>) and the <strong>rotation funding plan</strong> (sell the weakest holding to fund a better seat; v1.18.0, on by default but only visible when the feed is released and only on the engine's 12-month basis). What was missing: the menu-bar entry, a research view that shows the allocation and the switch <em>today</em> while the feed is still withheld, and a 3-month basis for the rotation (your "20% vs 14% over 3 months" case). This delivery adds all three: <strong>27_Decision_Pages_v2 v1.2.1</strong> + <strong>01_Menu v2.20.3</strong> (paste), <strong>opportunity_builder v1.27.1</strong> (PR, default off), and the exact Render ENV values to arm the production behaviour.</div>
 
 ## 1. Your requirements → where each one lives now
 
 | # | Requirement (your words) | Status before | What this delivery does |
 |---|---|---|---|
-| 1 | The two v2 sheets in the menu bar for manual refresh | Items existed only inside 🧭 Today (v2.20.2 hook) | New top-level menu **📊 Decision v2**: Refresh both / Refresh Portfolio_Decision_v2 / Refresh Top_10_Investments_v2 / Open each tab / Dynamic-exit status, test alert, on-off / Install-remove hourly refresh / Seed IBKR / Self-test. One guarded line in 01_Menu onOpen (v2.20.3); the function lives in 27_Decision_Pages_v2 v1.2.0. |
+| 1 | The two v2 sheets in the menu bar for manual refresh | Items existed only inside 🧭 Today (v2.20.2 hook) | New top-level menu **📊 Decision v2**: Refresh both / Refresh Portfolio_Decision_v2 / Refresh Top_10_Investments_v2 / Open each tab / Dynamic-exit status, test alert, on-off / Install-remove hourly refresh / Seed IBKR / Self-test. One guarded line in 01_Menu onOpen (v2.20.3); the function lives in 27_Decision_Pages_v2 v1.2.1. |
 | 2 | Ticket ≈ 4K SAR is not an investment decision; size by opportunity, risk and the cash in the box | The v2 page showed a flat 5 %-of-NAV *reference*; the engine's real sizing (`TFB_OPP_SIZING_MODE=conviction`, OB v1.27.0) is default **off** and sizes only when the feed is released | Top_10_Investments_v2 now runs a **research allocation that mirrors the engine's conviction sizing**: weight = plan ROI × risk multiplier (Low 1.0 / Medium 0.7 / High 0.4) × reliability (0.5–1.0), water-filled against the **deployable cash** (cash − 10 % NAV floor) with a **per-seat cap of 15 % of (portfolio + deployable)** and a 2,000 SAR minimum ticket; only FAST-TRACK plans are sized. New ALLOCATION block: deployable, allocated, cash after, expected 3-month gain, risk if every initial stop is hit, reward per riyal at risk. **Production:** arm the same rule in the engine with the ENV in §3. |
 | 3 | No cash → compare holdings with the best opportunity and tell me to sell X and buy Y when the expected ROI is better | Engine rotation plan exists (one rotation per run, 8 pp hurdle on the **12-month** forecast after 1.1 % cost) but is invisible while the feed is withheld, and the 3-month basis you reason on did not exist | Both v2 pages now carry **FUNDING PLANS & ROTATION**: for each unfunded plan, FUNDABLE NOW / FUNDABLE BY ROTATION (trim or exit the held name with the lowest forward ROI that trails the seat by ≥ 8 pp on the 12M basis — and, as a second line, ≥ 5 pp on the 3M basis) / CAPITAL CALL. Portfolio_Decision_v2 adds a **SWITCH** action, a limits row and a 'SWITCH candidate' tag in the advisory e-mail. **Production:** OB v1.27.1 adds `TFB_OPP_ROTATION_BASIS=plan3m` (default `12m`, byte-identical) so the engine's own funding plan can use the 3-month plan ROI with its own hurdle `TFB_OPP_ROTATION_EDGE_PP_3M` (default 5). |
 
@@ -48,28 +48,30 @@ Render: Dashboard ▸ tadawul-fast-bridge ▸ Environment ▸ add/edit ▸ Save,
 
 | Step | Action | Expect |
 |---|---|---|
-| 1 | `27_Decision_Pages_v2.gs` → select all → paste the attached v1.2.0 (2,040 lines, sha `3ef2837b0019`) → Ctrl+S | Header `Version: 1.2.0` |
+| 1 | `27_Decision_Pages_v2.gs` → select all → paste the attached **v1.2.1** (2,064 lines, sha `255a02324aff`) → Ctrl+S | Header `Version: 1.2.1` |
 | 2 | `01_Menu.gs` → select all → paste the attached v2.20.3 (2,078 lines, sha `38bede3442cd`) → Ctrl+S | `var SCRIPT_MENU_VERSION = '2.20.3'` |
 | 3 | Reload the spreadsheet (F5) | A third menu **📊 Decision v2** appears next to **⏸️ TFB Sync Hold**; 🧭 Today keeps its v2 items |
-| 4 | 📊 Decision v2 ▸ 🧪 Self-Test | PASS lines incl. `research allocation: water-fill {"A":45,"B":27.5,"C":27.5} · rotation pick CWBC.US +18.2pp · no pick when the holding is better` |
+| 4 | 📊 Decision v2 ▸ 🧪 Self-Test | PASS lines incl. `research allocation: water-fill {"A":45,"B":27.5,"C":27.5} · rotation pick CWBC.US +18.2pp · no pick when the holding is better`. The `IBKR tabs (…)` row now shows the snapshot age and reads FAIL when the `_IBKR_*` read is older than 30 h or missing — that is a prompt to paste a fresh connector read, not a code fault |
 | 5 | 📊 Decision v2 ▸ 🔄 Refresh both v2 pages | Top_10_Investments_v2: SEATS with **Alloc SAR / Buy qty**, the ALLOCATION block and FUNDING PLANS & ROTATION; Portfolio_Decision_v2: Rotation candidate row in LIMITS, SWITCH action when applicable |
 | 6 | Tests ▸ 🧪 Self-Check: Menu Wiring | `27_Decision_Pages_v2 menu bar (dp2_addTopMenu)` present |
 | rollback | paste v1.1.0 / v2.20.2 back | — |
 
+**v1.2.1 (same day, Codex review on PR #803).** A refresh of either v2 page no longer creates or seeds the `_IBKR_Account / _IBKR_Orders / _IBKR_Trades / _IBKR_NAV_History` tabs. In v1.2.0 a refresh on a workbook without those tabs silently wrote the 17-Oct demo snapshot and then rendered the fixture orders as real broker brackets (and "NO WORKING STOP" advisories against them). Now: seeding happens only through 📊 Decision v2 ▸ 🌱 Seed IBKR Tabs; when `_IBKR_Orders` is absent or empty the page says **HOLD — broker orders unknown · rule stop X** instead of "no stop", the Order-status column explains how to supply the read, and the evidence row shows the snapshot's `as_of`, its age in hours and **STALE** past 30 h (`DP2.IBKR_TABS_STALE_H`). Price-based signals (STOP HIT, SELL NOW, STOP NEAR, TP WATCH) are unaffected. Verified on your 19-Oct export both with the tabs (RAISE STOP / NO WORKING STOP as before, `56 h old · STALE`) and without them (HOLD — broker orders unknown, no stop advisories).
+
 PR #801 (another session, open) proposes a 550-line generic menu block with a set-up dialog that asks you to pick the renderer functions by number. It was written without access to this renderer; the native hook above does the same job in 3 lines with the real function names, so my recommendation is to install this version and not the block (the PR's second part, repair_stores v1.0.2, is independent and fine).
 
-## 5. GitHub — PR contents (branch `claude/rotation-basis-plan3m-20261020`)
+## 5. GitHub — PR #803 (branch `claude/rotation-basis-plan3m-20261020`)
 
 | File | Change |
 |---|---|
 | `core/analysis/opportunity_builder.py` | v1.27.1: `_env_rotation_basis`, `_rotation_basis_label`; basis-aware `_env_rotation_edge_pp`, `_holding_roi_map`, ordered needs; label in `_funding_plan_text`, the `rotation_proposal` alert and additive `kpis.rotation_basis`. Default `12m` = v1.27.0 byte-identical. On `plan3m` both sides use the plan-TP1 ROI `_tp1_plan_roi(cand)` = (TP1 − price)/price — the "ROI % (TP1)" column — never `cand["roi_pct"]`, which is the valuation/TP2 upside (Codex P1 finding on the first push, fixed in the second). |
 | `scripts/verify_deployment.py` | pin 1.27.0 → 1.27.1 |
 | `tests/test_opp_rotation_basis_v1271.py` | T1–T6: default/invalid → 12m; plan3m map/hurdle/label on normalized-candidate shapes whose valuation `roi_pct` deliberately differs from the TP1 figure; a held name without a TP1 ladder never rotates on 3M; the owner's 20-vs-14 case (no rotation at 5 pp, rotates at 4); the live XIOR/CWBC pair on both bases (+18.2 pp 12M, +9.8 pp 3M); degraded-forecast guard; text/alert labels; manifest pin. 138 tests pass across the builder/funding/venue suites. |
-| `apps_script/27_Decision_Pages_v2.gs` | first repository mirror of the v2 renderer (v1.2.0) |
+| `apps_script/27_Decision_Pages_v2.gs` | first repository mirror of the v2 renderer — v1.2.1 (v1.2.0 + no seeding on refresh, broker-unknown state, snapshot age/STALE; Codex P1 #2) |
 | `apps_script/01_Menu.gs` | first repository mirror of the live menu (v2.20.3) |
 | `docs/evidence/…_2026-10-20.md` | this sheet |
 
-Harness evidence: `node --check` on both .gs files; ES5 scan clean; 20 unit checks (exit rule, water-fill, rotation pick, signal precedence, keys, menus); end-to-end mock build of both pages over your 19-Oct workbook export (current cash → all plans funded, no rotation; 3,000 SAR scenario → TRIM CWBC → XIOR on both bases; cooldown and cache paths re-verified).
+Harness evidence: `node --check` on both .gs files; ES5 scan clean; 22 unit checks (exit rule, water-fill, rotation pick, signal precedence incl. the broker-unknown state, no-seed-on-refresh, keys, menus); end-to-end mock build of both pages over your 19-Oct workbook export (current cash → all plans funded, no rotation; 3,000 SAR scenario → TRIM CWBC → XIOR on both bases; with and without the `_IBKR_*` tabs; cooldown and cache paths re-verified).
 
 ## 6. Principles worth adding — what is in, what I propose next
 
@@ -93,7 +95,7 @@ Proposed next (each is a small, default-off PR — say which you want):
 
 | File | Purpose |
 |---|---|
-| `27_Decision_Pages_v2.gs` v1.2.0 (sha `3ef2837b0019`) | paste |
+| `27_Decision_Pages_v2.gs` **v1.2.1** (sha `255a02324aff`; supersedes v1.2.0 `3ef2837b0019`) | paste |
 | `01_Menu.gs` v2.20.3 (sha `38bede3442cd`) | paste |
-| PR `claude/rotation-basis-plan3m-20261020` | merge, then Render manual deploy |
+| PR **#803** (`claude/rotation-basis-plan3m-20261020`) | merge, then Render manual deploy |
 | this sheet (.md in the repo and the project, .pdf) | guide |

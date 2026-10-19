@@ -1,7 +1,12 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.0 (2026-10-20)
+ * Version: 1.2.1 (2026-10-20)
+ *   1.2.1: NO SEEDING ON REFRESH (review finding). buildDecisionPagesV2 / buildPortfolioDecisionV2 no longer call
+ *          dp2EnsureIbkrTabs_; the 17 Oct connector sample is written only by the explicit menu action Seed IBKR
+ *          Tabs. Missing or empty _IBKR_Orders = broker orders UNKNOWN ('HOLD — broker orders unknown'), never
+ *          'NO WORKING STOP'; the pages label the _IBKR_* snapshot's age and STALE (> 30 h) and say so when the
+ *          tabs are missing (cash then comes from _Cash_Snapshot). Readers unchanged otherwise.
  *   1.2.0: MENU BAR + RESEARCH ALLOCATION + ROTATION. (a) dp2_addTopMenu(ui): a top-level '📊 Decision v2' menu
  *          (refresh either page or both, open the tabs, dynamic-exit controls, hourly trigger, self-test) — one
  *          guarded line in 01_Menu.gs onOpen (v2.20.3). (b) Top_10_Investments_v2 SEATS: the flat 5%-NAV reference
@@ -67,8 +72,8 @@
  *
  * ENTRY POINTS
  *   buildDecisionPagesV2()   both pages        buildPortfolioDecisionV2()
- *   buildTop10V2()           dp2SeedIbkrTabs() (first run: seeds the four
- *   IBKR tabs with the 17 Oct 2026 connector read; idempotent — empty tabs only)
+ *   buildTop10V2()           dp2SeedIbkrTabs() (explicit menu action only: seeds the four
+ *   IBKR tabs with the 17 Oct 2026 connector read when they are empty; a refresh never seeds)
  *   dp2InstallTrigger() / dp2RemoveTrigger()  hourly rebuild (+ exit alerts)
  *   dp2ExitStatus() / dp2ExitTestAlert() / dp2ExitAlertsToggle()
  *   dp2SelfTest()            dp2_addMenuItems(menu) (Today submenu, 01_Menu v2.20.2)
@@ -83,7 +88,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.0';
+var DP2_VERSION = '1.2.1';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -111,6 +116,7 @@ var DP2 = {
   CASH_FLOOR_PCT: 0.10,
   REF_SIZE_PCT: 0.05,
   EVIDENCE_LIMIT_MIN: 14,
+  IBKR_TABS_STALE_H: 30,   // _IBKR_* snapshot older than this is labelled STALE on the page (it is a manual read, not the Flex capture)
   TZ: 'Asia/Riyadh'
 };
 var DP2C = {
@@ -186,7 +192,7 @@ function buildDecisionPagesV2() {
   var t0 = Date.now();
   var ss = SpreadsheetApp.getActive();
   DP2X_MEMO_ = {};
-  dp2EnsureIbkrTabs_(ss);
+  // v1.2.1: a refresh never seeds the _IBKR_* tabs — missing broker inputs are reported as unknown (menu: Seed IBKR Tabs)
   var pd = buildPortfolioDecisionV2();
   var t10 = buildTop10V2();
   var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's — ' + DP2.SHEET_PD + ' (' + pd.rows + ' rows) · ' + DP2.SHEET_T10 + ' (' + t10.rows + ' rows)';
@@ -757,9 +763,25 @@ function dp2EnsureIbkrTabs_(ss) {
   }
   return seeded;
 }
+function dp2IbkrAgeHours_(asOf) {
+  // '2026-10-17 18:15 Riyadh' | '2026-10-17 18:15' | Date → hours since, or null
+  if (asOf === null || asOf === undefined || asOf === '') return null;
+  var ms = null;
+  if (asOf instanceof Date) ms = asOf.getTime();
+  else {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(dp2Str_(asOf).trim());
+    if (m) ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5]);   // Riyadh = UTC+3
+  }
+  return ms === null || isNaN(ms) ? null : Math.max(0, (Date.now() - ms) / 3600000);
+}
 function dp2ReadIbkr_() {
-  var out = { account: {}, orders: [], trades: [], nav: [] };
+  var out = { account: {}, orders: [], trades: [], nav: [], tabs: {}, ordersKnown: false, ageH: null, stale: false };
   var a = dp2Sheet_(DP2.IB_ACCOUNT, false);
+  out.tabs.account = !!(a && a.getLastRow() > 1);
+  out.tabs.orders = !!(dp2Sheet_(DP2.IB_ORDERS, false) && dp2Sheet_(DP2.IB_ORDERS, false).getLastRow() > 1);
+  out.tabs.trades = !!(dp2Sheet_(DP2.IB_TRADES, false) && dp2Sheet_(DP2.IB_TRADES, false).getLastRow() > 1);
+  out.tabs.nav = !!(dp2Sheet_(DP2.IB_NAV, false) && dp2Sheet_(DP2.IB_NAV, false).getLastRow() > 1);
+  out.ordersKnown = out.tabs.orders;   // an absent or empty orders tab = broker orders UNKNOWN, never 'no stop'
   if (a && a.getLastRow() > 1) { var av = a.getRange(2, 1, a.getLastRow() - 1, 2).getValues(); for (var i = 0; i < av.length; i++) { var k = dp2Str_(av[i][0]).trim(); if (k) out.account[k] = av[i][1]; } }
   var o = dp2Sheet_(DP2.IB_ORDERS, false);
   if (o && o.getLastRow() > 1) { var ov = o.getRange(2, 1, o.getLastRow() - 1, 7).getValues(); for (i = 0; i < ov.length; i++) { if (!dp2Str_(ov[i][0])) continue; out.orders.push({ symbol: dp2Str_(ov[i][0]).trim().toUpperCase(), side: dp2Str_(ov[i][1]), type: dp2Str_(ov[i][2]).toUpperCase(), qty: dp2Num_(ov[i][3]), price: dp2Num_(ov[i][4]), status: dp2Str_(ov[i][5]).toUpperCase(), placed: dp2Str_(ov[i][6]) }); } }
@@ -767,6 +789,8 @@ function dp2ReadIbkr_() {
   if (t && t.getLastRow() > 1) { var tv = t.getRange(2, 1, t.getLastRow() - 1, 6).getValues(); for (i = 0; i < tv.length; i++) { if (!dp2Str_(tv[i][0])) continue; out.trades.push({ symbol: dp2Str_(tv[i][0]), name: dp2Str_(tv[i][1]), ccy: dp2Str_(tv[i][2]), exit: dp2Str_(tv[i][3]), span: dp2Str_(tv[i][4]), pnl: dp2Num_(tv[i][5]) }); } }
   var n = dp2Sheet_(DP2.IB_NAV, false);
   if (n && n.getLastRow() > 1) { var nv = n.getRange(2, 1, n.getLastRow() - 1, 2).getValues(); for (i = 0; i < nv.length; i++) { var d = nv[i][0]; var c = dp2Num_(nv[i][1]); if (d && c !== null) out.nav.push({ date: (d instanceof Date) ? Utilities.formatDate(d, DP2.TZ, 'yyyy-MM-dd') : dp2Str_(d), cps: c }); } }
+  out.ageH = dp2IbkrAgeHours_(out.account['as_of']);
+  out.stale = out.ageH === null ? out.tabs.account : out.ageH > DP2.IBKR_TABS_STALE_H;
   return out;
 }
 function dp2BracketFor_(orders, symbolKey) {
@@ -1007,6 +1031,7 @@ function dp2ExitSignal_(x, br, fallbackLast) {
   else if (out.dist !== null && out.dist <= DP2X.NEAR_STOP_PCT) { out.code = 'STOP_NEAR'; out.kind = 'amber'; out.text = 'STOP NEAR — ' + dp2PctPlain_(out.dist, 1) + ' above ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
   else if (tpDist !== null && tpDist <= DP2X.TP_WATCH_PCT) { out.code = 'TP_WATCH'; out.kind = 'amber'; out.text = 'TP WATCH — broker TP ' + dp2Fmt_(br.tp, 2) + ' ' + dp2Pct_(tpDist, 1); }
   else if (br && br.stop && x.stop >= br.stop * (1 + DP2X.RAISE_MIN_PCT / 100)) { out.code = 'RAISE_STOP'; out.kind = 'amber'; out.text = 'RAISE STOP ' + dp2Fmt_(br.stop, 2) + ' → ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
+  else if (br && br.known === false) { out.code = 'HOLD_BROKER_UNKNOWN'; out.kind = 'navy'; out.text = 'HOLD — broker orders unknown · rule stop ' + dp2Fmt_(x.stop, 2); }
   else if (!br || !br.stop) { out.code = 'NO_BROKER_STOP'; out.kind = 'amber'; out.text = 'NO WORKING STOP — place ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
   else if (x.beLocked) { out.code = 'HOLD_BE'; out.kind = 'green'; out.text = 'HOLD — breakeven locked'; }
   return out;
@@ -1396,7 +1421,6 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
 /* ========================================================= PORTFOLIO_DECISION_v2 */
 function buildPortfolioDecisionV2() {
   var ss = dp2Ss_();
-  dp2EnsureIbkrTabs_(ss);
   var kv = dp2ReadStatusKV_();
   var feed = dp2ParseFeed_(kv);
   var pd = dp2ReadPortfolioDecision_();
@@ -1479,7 +1503,7 @@ function buildPortfolioDecisionV2() {
   dp2Header_(sh, row, 'PORTFOLIO DECISION — v2', stateChip[0], stateChip[1], 'built ' + dp2Today_() + ' · PD run ' + (pd.lastRun || 'n/a') + ' · FX ' + fx);
   row++;
   dp2Line_(sh, row, reason, { color: DP2C.ink, size: 9.5, bg: DP2C.surface, height: 30 }); row++;
-  dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + dp2Str_(ib.account['as_of'] || 'n/a') + ') · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
+  dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + (ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ', ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' — STALE manual snapshot' : '') : 'MISSING — no broker snapshot; cash from ' + cashSource) + ') · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
 
@@ -1546,7 +1570,7 @@ function buildPortfolioDecisionV2() {
     var brokerWorking = (br.state === 'working' || br.state === 'partial');
     var brokerStop = brokerWorking ? br.stop : null;
     var brokerTp = brokerWorking ? br.tp : null;
-    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop }, l.price);
+    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price);
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
     var stopEff = x ? x.stop : (brokerStop || br.stop);
@@ -1559,7 +1583,7 @@ function buildPortfolioDecisionV2() {
     var ostat;
     if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
     else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.tp, 2) + ' / ' + dp2Fmt_(br.stop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
-    else if (br.state === 'none') { ostat = 'no orders in _IBKR_Orders'; }
+    else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — _IBKR_Orders tab missing or empty (🌱 Seed IBKR Tabs, or paste the connector read)'; }
     else { ostat = 'partial — ' + br.n + ' order(s), check'; }
     // actions from the exit signal
     var item = { symbol: l.symbol, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
@@ -1690,7 +1714,7 @@ function buildPortfolioDecisionV2() {
   row = dp2Section_(sh, row, 1, 8, 'EVIDENCE TRAIL', null);
   dp2Section_(sh, row - 1, 9, 16, 'LEDGER AND RECONCILIATION', null);
   var evRows = [
-    ['IBKR tabs (_IBKR_Account/Orders/Trades/NAV)', dp2Str_(ib.account['as_of'] || 'n/a')],
+    ['IBKR tabs (_IBKR_Account/Orders/Trades/NAV)', ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ' · ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' · STALE' : '') : 'missing — not seeded (manual snapshot; refresh never seeds it)', ib.tabs.account && !ib.stale ? DP2C.ink : DP2C.amber],
     ['TFB Flex capture (PD_IBKR_EVIDENCE)', evState + (pd.evidence && pd.evidence.capture ? ' · ' + pd.evidence.capture + ' (' + pd.evidence.age + ')' : ''), evFresh ? DP2C.green : DP2C.red],
     ['Source receipt (daily_sync)', pd.receiptRun ? 'run ' + pd.receiptRun : 'n/a'],
     ['Latest sync run (TFB Decision Feed)', feed.run ? 'run ' + feed.run + ' · ' + feed.at : 'n/a'],
@@ -2008,7 +2032,7 @@ function dp2SelfTest() {
   var gm = dp2ReadGmInvestability_(); checks.push({ name: 'Global_Markets Investability Status (' + gm.total + ' rows)', ok: gm.total > 0 });
   var hit = dp2ReadHitRates_(); checks.push({ name: 'Performance_Log matured hit rates', ok: hit.ok && hit.labels.length > 0 && hit.labels[3].n > 0 });
   var kv = dp2ReadStatusKV_(); checks.push({ name: '_Status Decision Feed key', ok: !!kv['TFB Decision Feed'] });
-  var ib = dp2ReadIbkr_(); checks.push({ name: 'IBKR tabs (orders ' + ib.orders.length + ', trades ' + ib.trades.length + ', nav ' + ib.nav.length + ')', ok: ib.orders.length > 0 || ib.trades.length > 0 });
+  var ib = dp2ReadIbkr_(); checks.push({ name: 'IBKR tabs (orders ' + ib.orders.length + ', trades ' + ib.trades.length + ', nav ' + ib.nav.length + (ib.ageH !== null ? ', snapshot ' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ' STALE' : '') : '') + ')' + (ib.ordersKnown ? '' : ' — _IBKR_Orders missing/empty: refresh renders "broker orders unknown" (🌱 Seed IBKR Tabs or paste the connector read)'), ok: ib.ordersKnown && !ib.stale });
   // dynamic exits: the rule replayed on the embedded YUM fixture (24 sh @ 144.61, 12 Aug 2026; fixed stop 136.01 filled 1 Oct)
   var yb = dp2FixtureBars_(DP2_FIXTURE_YUM_);
   var yx = dp2ExitCompute_(yb, 144.61, '2026-08-12', null);
