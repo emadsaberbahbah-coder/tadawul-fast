@@ -167,9 +167,9 @@ def test_t6_extension_never_shadows_base():
 
 
 def test_t7_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.0"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.1"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.27.0", "opportunity builder"' in src
+    assert '"1.27.1", "opportunity builder"' in src
 
 
 if __name__ == "__main__":   # pragma: no cover
