@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.23 (2026-10-19) -- CONVICTION-WEIGHTED SEAT SIZING
+#
+# v1.1.23: run tests/test_ob_conviction_sizing.py (opportunity_builder
+# v1.27.0: TFB_OPP_SIZING_MODE=conviction, default cap byte-identical; the
+# explicit absolute cash floor binds the sizing budget) in the blocking lean
+# lane next to the other builder suites.
+#
 # VERSION 1.1.22 (2026-10-19) -- SCHEDULED DECISION-FEED RELEASE ATTEMPTS
 #
 # v1.1.22: run tests/test_release_auto_source.py (release_decision_feed
@@ -674,7 +681,8 @@ jobs:
             tests/test_ycp_singleflight_cancellation.py \
             tests/test_ycp_loopguard_b6.py \
             tests/test_backup_upload_resume.py \
-            tests/test_release_auto_source.py $EXTRA
+            tests/test_release_auto_source.py \
+            tests/test_ob_conviction_sizing.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions

@@ -218,11 +218,16 @@ as a manual dispatch and was never dispatched. Delivered in the follow-up PR (co
 automatic cohort discovery, and the decision chain (#788, ported) extended to re-render Top_10 after a release.
 Nothing is armed by that PR; the arming list is in the sheet.
 
-### Allocation (owner request, next PR)
+### Allocation (owner request, same PR, second commit)
 
 The export shows every sized seat at the per-seat cap (`min(15% x budget, remaining)`), so seats read as
 equal; the owner wants weights by expected ROI and risk, a small absolute cash buffer (USD 500 to 1,000) instead
 of a 10% target, and sell-to-fund rotation when cash is short. The rotation rule already exists
-(`FUNDABLE_BY_ROTATION`, engine-ROI edge >= 8 pp after 1.1% cost, one per run, sukuk excluded) and the absolute
-buffer already exists (`TFB_OPP_CASH_FLOOR_SAR`, `TFB_OPP_CASH_FLOOR_MODE=enforce`). Conviction-weighted sizing
-does not exist and is the next build (default off).
+(`FUNDABLE_BY_ROTATION`, engine-ROI edge >= 8 pp after 1.1% cost, one per run, sukuk excluded). Delivered as
+opportunity_builder v1.27.0 (commit sheet `docs/evidence/TFB_Commit_Sheet_opportunity_builder_v1.27.0_2026-10-19.md`):
+`TFB_OPP_SIZING_MODE=conviction` (default `cap`, byte-identical) water-fills the post-floor budget by plan ROI x
+risk x reliability under the per-seat cap and tops up the rounding remainder; and the absolute cash buffer
+(`TFB_OPP_CASH_FLOOR_SAR` with an explicit `TFB_OPP_CASH_FLOOR_MODE=enforce`) now binds the sizing budget, which
+on v1.16.0 to v1.26.2 it did not (label-only without a percent floor). Render ENV set this session:
+`TFB_OPP_CASH_FLOOR_SAR=3750`, `TFB_OPP_CASH_FLOOR_MODE=enforce`, `TFB_OPP_CASH_FLOOR_PCT=` (off); the sizing mode
+is armed only after the 1.27.0 deploy.
