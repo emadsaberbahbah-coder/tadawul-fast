@@ -2,7 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
+# VERSION 1.1.26 (2026-10-20) -- VERIFIED NAME LABEL RENEWAL
+#
+# v1.1.26: run tests/test_renew_verified_name_labels.py (new
+# scripts/renew_verified_name_labels.py v1.0.0: re-captures each reviewed
+# caption's public sources, re-checks it and re-stamps the seven-day review;
+# held bindings stay byte-identical) in the blocking lean lane next to
+# tests/test_verified_name_labels.py. Offline, urllib only.
+#
+# v1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
 #
 # v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
 # the identity checks accept the HKD-price / CNY-or-USD-EPS convention on .HK
@@ -681,6 +689,7 @@ jobs:
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
             tests/test_verified_name_labels.py \
+            tests/test_renew_verified_name_labels.py \
             tests/test_sheet_payload_digest.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
