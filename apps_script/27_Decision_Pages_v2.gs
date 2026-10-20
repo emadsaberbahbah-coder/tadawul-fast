@@ -1,7 +1,10 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.9 (2026-10-20)
+ * Version: 1.2.10 (2026-10-20)
+ *   1.2.10: TWO REVIEW FINDINGS. (a) A stale-bar item in the advisory e-mail carries a VERIFY-ONLY action (never
+ *          'Sell now') and a 'stale bars — verify' subject label. (b) dp2ExitLine_ is null-safe when a lot has no
+ *          price history (ENGINE_NA rotation candidate) — one such item can no longer abort the whole e-mail.
  *   1.2.9: THREE REVIEW FINDINGS. (a) STALE bars never produce an actionable alert: the engine runs on the cockpit
  *          quote, a sell signal is downgraded to a flagged advisory ('STALE BARS … verify the quote'). (b) The
  *          allocation and the top-up honour the engine's post-action PORTFOLIO sector cap (PF: Max Sector %, held
@@ -138,7 +141,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.9';
+var DP2_VERSION = '1.2.10';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1257,7 +1260,10 @@ function dp2ExitAlertsLocked_(items, fx) {
 }
 function dp2ExitLine_(it, fx) {
   var x = it.x, s = it.sig;
-  var pnl = (x && it.qty && it.entry) ? (x.last - it.entry) * it.qty * (it.fx || fx) : null;
+  // v1.2.10 (review finding): x is null when the lot has no usable price history (ENGINE_NA); every reference below
+  // must survive that, or one rotation candidate without bars would abort the whole e-mail.
+  var lastPx = x ? x.last : (s.last !== null && s.last !== undefined ? s.last : null);
+  var pnl = (lastPx !== null && it.qty && it.entry) ? (lastPx - it.entry) * it.qty * (it.fx || fx) : null;
   var why = '';
   if (s.code === 'STOP_HIT') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + x.trailMult + ' × ATR ' + dp2Fmt_(x.atr, 2) + ' under it' + (x.beLocked ? ', breakeven locked' : '') + ').';
   else if (s.code === 'SELL_NOW') why = 'in profit, close ' + dp2Fmt_(x.last, 2) + ' is below the 10-day average ' + dp2Fmt_(x.sma, 2) + ' after giving back ' + dp2Fmt_((x.hi - x.last) / x.atr, 1) + ' ATR from the high ' + dp2Fmt_(x.hi, 2) + ' (the move at the high was ' + dp2RFmt_(x.gainR) + ').';
@@ -1277,23 +1283,26 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'RAISE_STOP') action = 'Raise the IBKR stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) + trailTxt;
   else if (s.code === 'NO_BROKER_STOP') action = 'Place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop is listed)' + trailTxt;
   else if (s.code === 'TP_WATCH') action = 'No stop change. The broker take-profit ' + dp2Fmt_(it.brokerTp, 2) + ' is close: keep it to bank the gain, or cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.';
-  else if (s.code === 'HOLD_BROKER_UNKNOWN') action = 'No stop change from this page — the broker orders are unknown here; confirm at the broker that a stop at or above ' + dp2Fmt_(x.stop, 2) + ' is working.';
-  else if (s.code === 'HOLD' || s.code === 'HOLD_BE') action = 'No stop change — the working broker stop ' + (it.brokerStop ? dp2Fmt_(it.brokerStop, 2) + ' is at or above the rule\'s ' + dp2Fmt_(x.stop, 2) : 'is where the rule puts it') + '; keep it. Never lower a stop.';
+  else if (s.code === 'HOLD_BROKER_UNKNOWN') action = 'No stop change from this page — the broker orders are unknown here; confirm at the broker that a stop at or above ' + (x ? dp2Fmt_(x.stop, 2) : 'the rule\'s level') + ' is working.';
+  else if (s.code === 'HOLD' || s.code === 'HOLD_BE') action = 'No stop change — the working broker stop ' + (it.brokerStop && x ? dp2Fmt_(it.brokerStop, 2) + ' is at or above the rule\'s ' + dp2Fmt_(x.stop, 2) : 'is where the rule puts it') + '; keep it. Never lower a stop.';
   else action = s.text + ' — no stop change.';
+  // v1.2.10 (review finding): on STALE bars no liquidation instruction leaves this page — verification wording only.
+  if (s.staleBars) action = 'VERIFY ONLY — the price history is stale (fetch failed; cached bars to ' + (x ? x.lastDate : 'n/a') + '), so this signal was computed on the cockpit quote ' + dp2Fmt_(lastPx, 2) + '. Check the live price and the working stop at the broker; no sale or stop change is instructed by this message. The next successful fetch re-evaluates the rule.';
   if (it.rotation && it.rotation.plan) {
     var rp = it.rotation.plan, rr = rp.rotation;
     var rtxt = ' SWITCH (research): ' + rr.action.toLowerCase() + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' — ' + (rp.basis === '3m' ? 'plan 3M' : 'engine 12M') + ' ' + dp2PctPlain_(rp.oppRoi, 1) + ' vs this holding ' + dp2PctPlain_(rr.roi, 1) + ' (edge +' + dp2Fmt_(rr.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost).';
     why += rtxt;
     var switchAct = 'SWITCH (research): ' + rr.action.toLowerCase() + ' ' + it.symbol + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' when the feed is released — the engine will carry the same plan. Research only; no order is placed by this page.';
-    if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
+    if (s.staleBars) action += ' ' + switchAct;
+    else if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
     else action = switchAct + ' Stop: ' + action;
   }
-  return { head: it.symbol + ' — ' + (it.name || '') + ' · ' + dp2Fmt_(it.qty) + ' × ' + dp2Fmt_(it.entry, 2) + ' → last ' + dp2Fmt_(x.last, 2) + (pnl !== null ? ' (' + dp2Signed_(pnl) + ' SAR unrealized)' : ''), signal: s.text + (it.rotation ? ' · SWITCH candidate' : ''), why: why, action: action };
+  return { head: it.symbol + ' — ' + (it.name || '') + ' · ' + dp2Fmt_(it.qty) + ' × ' + dp2Fmt_(it.entry, 2) + ' → last ' + dp2Fmt_(lastPx, 2) + (pnl !== null ? ' (' + dp2Signed_(pnl) + ' SAR unrealized)' : '') + (x ? '' : ' · no price history'), signal: s.text + (it.rotation ? ' · SWITCH candidate' : ''), why: why, action: action };
 }
 function dp2ExitSendMail_(items, fx, to) {
   if (!to) throw new Error('no recipient — set Script Property ' + DP2X.PROP_ALERT_TO);
   var sells = items.filter(function (it) { return it.sig.alert; });
-  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : (it.sig.code === 'EXIT_LATCHED' ? 'RULE EXIT ' + it.sig.latched.date + ' not acted' : 'SELL NOW')); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : 'raise stop'))); }).join(', ')) + ' · ' + dp2Today_();
+  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : (it.sig.code === 'EXIT_LATCHED' ? 'RULE EXIT ' + it.sig.latched.date + ' not acted' : 'SELL NOW')); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.sig.staleBars ? 'stale bars — verify' : (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : (it.sig.code === 'RAISE_STOP' ? 'raise stop' : 'advisory'))))); }).join(', ')) + ' · ' + dp2Today_();
   var text = [], html = ['<div style="font-family:Arial,sans-serif;font-size:13px;color:#14202b">', '<p><b>Decision Pages v2 ' + DP2_VERSION + '</b> · dynamic exit signals · ' + dp2Today_() + ' Riyadh</p>'];
   for (var i = 0; i < items.length; i++) {
     var L = dp2ExitLine_(items[i], fx);
