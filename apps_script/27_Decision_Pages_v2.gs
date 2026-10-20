@@ -1,7 +1,11 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.11 (2026-10-20)
+ * Version: 1.2.12 (2026-10-20)
+ *   1.2.12: THREE REVIEW FINDINGS (several lots per symbol). (a) Stop coverage is judged on the POSITION — the sum of
+ *          the symbol's active lots — against the active stop quantity. (b) The exit-alert state is keyed per LOT
+ *          (symbol@entry#n, state column 23) so two lots of one symbol never overwrite each other's alert state.
+ *          (c) On stale bars the rendered page carries the verify-only action, never a priority-0 SELL.
  *   1.2.11: THREE REVIEW FINDINGS. (a) Stop QUANTITY coverage: an active stop covering part of the lot is
  *          STOP_PARTIAL (advisory: place a stop for the uncovered shares), never full protection; dp2BracketFor_
  *          returns stopQty / tpQty. (b) The history must REACH THE ENTRY: dp2LoadBars_(symbols, sinceDate) widens
@@ -148,7 +152,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.11';
+var DP2_VERSION = '1.2.12';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1213,7 +1217,7 @@ function dp2EngineNaWhy_(xb, entryDate) {
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
 /* ========================================================= dynamic exits (v1.1.0): state + alerts */
-var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)', 'Latched exit'];   // v1.2.7: col 22 = the latched rule-exit date
+var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)', 'Latched exit', 'Lot'];   // v1.2.7: col 22 = the latched rule-exit date · v1.2.12: col 23 = lot key (symbol@entry#n)
 function dp2ExitStateRead_() {
   var sh = dp2Sheet_(DP2X.SHEET_STATE, false);
   var out = {};
@@ -1221,7 +1225,8 @@ function dp2ExitStateRead_() {
   var vals = sh.getRange(2, 1, sh.getLastRow() - 1, DP2X_STATE_HDR_.length).getValues();
   for (var i = 0; i < vals.length; i++) {
     var sym = dp2Str_(vals[i][0]).trim(); if (!sym) continue;
-    out[sym] = { signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]) };
+    var lotKey = dp2Str_(vals[i][22]).trim() || sym;   // v1.2.12: one state row per LOT; legacy rows (no lot column) key by symbol
+    out[lotKey] = { symbol: sym, signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]) };
   }
   return out;
 }
@@ -1234,7 +1239,7 @@ function dp2ExitStateWrite_(rows) {
   if (rows.length) {
     sh.getRange(2, 5, rows.length, 1).setNumberFormat('@');
     sh.getRange(2, 15, rows.length, 1).setNumberFormat('@');
-    sh.getRange(2, 19, rows.length, 4).setNumberFormat('@');
+    sh.getRange(2, 19, rows.length, 5).setNumberFormat('@');
     sh.getRange(2, 1, rows.length, DP2X_STATE_HDR_.length).setValues(rows);
   }
   sh.setFrozenRows(1);
@@ -1264,13 +1269,13 @@ function dp2ExitAlertsLocked_(items, fx) {
   var cooldown = DP2X.COOLDOWN_H * 3600000;
   var send = [], rows = [], states = {};
   for (var i = 0; i < items.length; i++) {
-    var it = items[i], p = prev[it.symbol] || {};
+    var it = items[i], k0 = it.lotKey || it.symbol, p = prev[k0] || prev[it.symbol] || {};
     var since = (p.signal === it.sig.code && p.since) ? p.since : nowStr;
     var st = { signal: it.sig.code, since: since, lastAlertSignal: p.lastAlertSignal || '', lastAlertAt: p.lastAlertAt || 0, lastRaiseAt: p.lastRaiseAt || 0, sendKind: '' };
     if (it.sig.alert && (st.lastAlertSignal !== it.sig.code || !st.lastAlertAt || now - st.lastAlertAt >= cooldown)) st.sendKind = 'sell';
     else if (DP2X.ALERT_RAISE && it.sig.advisory && (!st.lastRaiseAt || now - st.lastRaiseAt >= cooldown)) st.sendKind = 'advisory';
     if (st.sendKind) send.push(it);
-    states[it.symbol] = st;
+    states[k0] = st;
   }
   var result = { enabled: dp2ExitAlertsEnabled_(), to: dp2ExitAlertTo_(), due: send.length, sent: 0, signals: 0, error: '' };
   if (send.length && result.enabled) {
@@ -1278,14 +1283,14 @@ function dp2ExitAlertsLocked_(items, fx) {
       dp2ExitSendMail_(send, fx, result.to);
       result.sent = 1; result.signals = send.length;
       for (i = 0; i < send.length; i++) {
-        var s2 = states[send[i].symbol];
+        var s2 = states[send[i].lotKey || send[i].symbol];
         if (s2.sendKind === 'sell') { s2.lastAlertSignal = send[i].sig.code; s2.lastAlertAt = now; } else { s2.lastRaiseAt = now; }
       }
     } catch (e) { result.error = String(e && e.message || e); }
   }
   for (i = 0; i < items.length; i++) {
-    var it2 = items[i], x = it2.x, s3 = states[it2.symbol];
-    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr, (it2.sig.latched && !it2.sig.latchedAck) ? it2.sig.latched.date : '']);
+    var it2 = items[i], x = it2.x, s3 = states[it2.lotKey || it2.symbol];
+    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr, (it2.sig.latched && !it2.sig.latchedAck) ? it2.sig.latched.date : '', it2.lotKey || it2.symbol]);
   }
   try { dp2ExitStateWrite_(rows); } catch (e4) { result.error = (result.error ? result.error + ' · ' : '') + 'state: ' + String(e4 && e4.message || e4); }
   return result;
@@ -1397,7 +1402,7 @@ function dp2ExitAckSet_(symbol, date) {
 function dp2ExitAckLatched() {
   var ui = null; try { ui = SpreadsheetApp.getUi(); } catch (e) {}
   var st = dp2ExitStateRead_(), latched = [], k;
-  for (k in st) { if (st.hasOwnProperty(k) && st[k].signal === 'EXIT_LATCHED') { var dm = /rule exit (\d{4}-\d{2}-\d{2})/.exec(st[k].text || ''); latched.push({ symbol: k, date: st[k].latched || (dm ? dm[1] : '') }); } }
+  for (k in st) { if (st.hasOwnProperty(k) && st[k].signal === 'EXIT_LATCHED') { var dm = /rule exit (\d{4}-\d{2}-\d{2})/.exec(st[k].text || ''); latched.push({ symbol: st[k].symbol || k, date: st[k].latched || (dm ? dm[1] : '') }); } }
   var ack = dp2ExitAckMap_();
   var cur = Object.keys(ack).map(function (s2) { return s2 + ' (' + ack[s2] + ')'; }).join(', ') || 'none';
   if (!latched.length) {
@@ -1876,6 +1881,10 @@ function buildPortfolioDecisionV2() {
   var limitsRows = [];
   var workingBrackets = 0, xFresh = 0, xTotal = 0, xSources = {}, xBarsAsOf = '';
   var exitAck = dp2ExitAckMap_();   // v1.2.5: acknowledged rule exits { symbol: 'yyyy-MM-dd' }
+  // v1.2.12: the ledger may hold several lots per symbol — stop coverage is judged on the POSITION (sum of the lots'
+  // shares) and the alert state is keyed per lot (symbol@entry#n)
+  var sharesBySym = {}, lotSeq = {};
+  for (var sb = 0; sb < eq.length; sb++) sharesBySym[eq[sb].symbol] = (sharesBySym[eq[sb].symbol] || 0) + (eq[sb].shares || 0);
   for (i = 0; i < eq.length; i++) {
     var l = eq[i], m2 = l.mp || {};
     var key = dp2YahooKey_(l.symbol);
@@ -1897,7 +1906,9 @@ function buildPortfolioDecisionV2() {
     var brokerStop = ib.ordersKnown ? br.stop : null;   // active-status orders only (v1.2.2), from a fresh dated snapshot only (v1.2.5)
     var brokerTp = ib.ordersKnown ? br.tp : null;
     var ackDate = exitAck[l.symbol] || null;
-    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown, stopQty: ib.ordersKnown ? br.stopQty : null, shares: l.shares }, l.price, ackDate);
+    var posShares = sharesBySym[l.symbol] || l.shares;
+    var lotKeyBase = l.symbol + '@' + (entryDate || 'na'); lotSeq[lotKeyBase] = (lotSeq[lotKeyBase] || 0) + 1; var lotKey = lotKeyBase + (lotSeq[lotKeyBase] > 1 ? '#' + lotSeq[lotKeyBase] : '');
+    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown, stopQty: ib.ordersKnown ? br.stopQty : null, shares: posShares }, l.price, ackDate);
     if (xb && xb.stale && x) { sig.staleBars = true; if (sig.alert) { sig.alert = false; sig.advisory = true; sig.kind = 'amber'; sig.text += ' · STALE BARS (' + dp2Str_(xb.fetched) + ') — verify the quote before acting'; } }
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
@@ -1911,23 +1922,26 @@ function buildPortfolioDecisionV2() {
     if (x && x.atrApprox) engTxt += ' · entry ATR approximated (' + x.barsBeforeEntry + ' bars before the entry)';
     var ostat;
     if (!ib.ordersKnown && br.n > 0) { ostat = 'UNVERIFIED — ' + ib.unknownWhy + ' · last listed: ' + br.statuses.join(', ') + ' → paste a fresh connector read'; }
-    else if (br.state === 'working' && l.shares && br.stopQty > 0 && br.stopQty < l.shares - 1e-9) { ostat = 'working since ' + br.placed + ' — stop covers ' + dp2Fmt_(br.stopQty) + ' of ' + dp2Fmt_(l.shares) + ' sh (partial)'; }   // v1.2.11
+    else if (br.state === 'working' && posShares && br.stopQty > 0 && br.stopQty < posShares - 1e-9) { ostat = 'working since ' + br.placed + ' — stop covers ' + dp2Fmt_(br.stopQty) + ' of the position\'s ' + dp2Fmt_(posShares) + ' sh (partial' + (posShares !== l.shares ? ', ' + dp2Fmt_(l.shares) + ' sh in this lot' : '') + ')'; }   // v1.2.11/12
     else if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
     else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.lastTp, 2) + ' / ' + dp2Fmt_(br.lastStop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
     else if (br.state === 'inactive') { ostat = 'no active sell order — ' + br.n + ' listed (' + br.statuses.join(', ') + ') → verify at the broker'; actions.push({ p: 1, t: l.symbol + ': every sell order in _IBKR_Orders is ' + br.statuses.join(' / ') + ' — nothing active protects ' + dp2Fmt_(l.mvSar) + ' SAR' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '. Verify at the broker.' }); }
     else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — ' + ib.unknownWhy + ' (🌱 Seed IBKR Tabs, or paste the connector read)'; }
     else { ostat = 'partial — ' + (brokerStop ? 'stop working, no take-profit' : 'take-profit working, NO STOP') + ' (' + br.active + ' active of ' + br.n + ')'; }
     // actions from the exit signal
-    var item = { symbol: l.symbol, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
+    var item = { symbol: l.symbol, lotKey: lotKey, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
     exitItems.push(item);
-    if (sig.code === 'EXIT_LATCHED') {
+    if (sig.staleBars && (sig.code === 'STOP_HIT' || sig.code === 'SELL_NOW' || sig.code === 'EXIT_LATCHED')) {
+      // v1.2.12 (review finding): on stale bars the PAGE carries the same verify-only wording as the mail — never a SELL
+      actions.push({ p: 1, t: 'VERIFY ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): the rule reads "' + sig.text.replace(/ · STALE BARS.*$/, '') + '" on CACHED bars (' + dp2Str_(xb && xb.fetched) + '; fetch failed: ' + dp2Str_(xb && xb.error).slice(0, 80) + ') and the cockpit quote ' + dp2Fmt_(last, 2) + '. Confirm the live price and the working stop at the broker — no sale is instructed while the history is stale; the next successful fetch re-evaluates.' });
+    } else if (sig.code === 'EXIT_LATCHED') {
       actions.push({ p: 0, t: 'SELL ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh) — rule exit ' + sig.latched.text + ' was never acted on; the lot is outside the rule. Unrealized ' + dp2Signed_((last - cost) * l.shares * lfx) + ' SAR now. Sell, or acknowledge the exit (📊 Decision v2 ▸ ✅ Acknowledge rule exit) to hold by decision under the trailing stop ' + (x ? dp2Fmt_(x.stop, 2) : '—') + '. No order was placed by this page — act at the broker.' });
     } else if (sig.code === 'STOP_HIT' || sig.code === 'SELL_NOW') {
       actions.push({ p: 0, t: 'SELL NOW ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitLine_(item, fx).why + ' Unrealized ' + dp2Signed_((last - cost) * l.shares * lfx) + ' SAR now' + (brokerStop ? ' vs ' + dp2Signed_((brokerStop - cost) * l.shares * lfx) + ' SAR if the fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is left to fill' : '') + '. No order was placed by this page — act at the broker.' });
     } else if (sig.code === 'STOP_NEAR') {
       actions.push({ p: 1, t: l.symbol + ' is ' + dp2PctPlain_(sig.dist, 1) + ' above its dynamic stop ' + dp2Fmt_(x.stop, 2) + ' — a print at or below it is a SELL NOW; decide now whether to pre-empt at ' + dp2Fmt_(last, 2) + (brokerStop ? ' (fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is ' + dp2Pct_((brokerStop / last - 1) * 100, 1) + ' away)' : '') + '.' });
     } else if (sig.code === 'STOP_PARTIAL') {
-      actions.push({ p: 2, t: l.symbol + ': the active stop covers ' + dp2Fmt_(br.stopQty) + ' of ' + dp2Fmt_(l.shares) + ' sh — place a stop for the uncovered ' + dp2Fmt_(sig.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (brokerStop && x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' and raise the existing stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + '.' });
+      actions.push({ p: 2, t: l.symbol + ': the active stop covers ' + dp2Fmt_(br.stopQty) + ' of the position\'s ' + dp2Fmt_(posShares) + ' sh — place a stop for the uncovered ' + dp2Fmt_(sig.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (brokerStop && x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' and raise the existing stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + '.' });
     } else if (sig.code === 'RAISE_STOP' || sig.code === 'NO_BROKER_STOP') {
       actions.push({ p: 2, t: l.symbol + ': ' + (sig.code === 'RAISE_STOP' ? 'raise the IBKR stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : 'place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop listed)') + ' — or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.' });
     } else if (sig.code === 'TP_WATCH') {
@@ -2020,6 +2034,8 @@ function buildPortfolioDecisionV2() {
   if (!evFresh) actions.push({ p: 0, t: 'Refresh the IBKR Flex capture before the next cockpit run so Portfolio_Decision certifies; the figures above come from the ledger and the _IBKR_* tabs (' + dp2Str_(ib.account['as_of'] || 'n/a') + ').' });
   if (s1.verdict !== 'PASS') actions.push({ p: 4, t: 'No board-originated capital: S-1 gate ' + (s1.verdict || 'n/a') + (s1.criteria.length ? ' (' + s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' ' + c.status; }).join(', ') + ')' : '') + '; deployable ' + dp2Fmt_(deploySar) + ' SAR stays Tranche 0.' });
   for (i = 0; i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory (Shadow_Board, research only): sell ' + switches[i].sell + ' → buy ' + switches[i].buy + ' Δ ' + dp2Pct_(switches[i].delta, 1) + ' vs hurdle ' + dp2PctPlain_(switches[i].hurdle, 1) + '; not executable while the feed is ' + (feed.state || 'n/a') + '.' });
+  // v1.2.12: two lots of one symbol can raise the identical position-level action — show it once
+  (function () { var seen = {}, u = []; for (var ai = 0; ai < actions.length; ai++) { if (!seen[actions[ai].t]) { seen[actions[ai].t] = true; u.push(actions[ai]); } } actions = u; })();
   actions.sort(function (a, b) { return a.p - b.p; });
   row = dp2Section_(sh, row, 1, 9, 'ACTIONS TODAY — what is actually asked of the operator', 'Generated from the rules on this page; at most five.');
   dp2Section_(sh, row - 2, 10, 16, 'LIMITS AND GATES', 'Pass / fail against the panel caps and the chain.');
