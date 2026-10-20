@@ -1,6 +1,14 @@
 # =============================================================================
 # 📏 TFB Acceptance (Day-10 definition of done, measured) — acceptance_check.yml
 # =============================================================================
+# VERSION 1.0.1 (2026-10-20) -- LIVE READ WINDOW VARIABLE (default off)
+# WHY: scripts/tfb_acceptance.py v1.0.10 adds TFB_ACCEPTANCE_LIVE_WINDOW. On
+# the live workbook A1, A2a and A3 have always printed NA ('section not
+# found' / 'Symbol/Name columns not found') because the live reader's window
+# is narrower than the layout they parse. Mapped at JOB level from the
+# repository Variable with default '0' (unset -> '0' -> the v1.0.9 reads,
+# byte-identical). Set the Variable to 1 to let A1/A2a/A3 measure. Rollback:
+# unset the Variable. Nothing else in this workflow changes.
 # WHY: "done" is a printed table of measurements, not an opinion. This runs
 # scripts/tfb_acceptance.py v1.0.0 READ-ONLY against the live workbook every
 # morning after the sync legs (and on demand), publishes the table to the job
@@ -32,6 +40,9 @@ jobs:
     name: 📏 Measure the definition of done
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      # v1.0.1 (2026-10-20): tfb_acceptance v1.0.10 live read window for A1/A2a/A3.
+      TFB_ACCEPTANCE_LIVE_WINDOW: ${{ vars.TFB_ACCEPTANCE_LIVE_WINDOW || '0' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
