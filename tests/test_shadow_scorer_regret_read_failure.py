@@ -310,8 +310,10 @@ def test_missing_cumulative_base_cannot_turn_known_failed_gate_into_pass(
     assert "PASS" not in output
 
 
+# run_shadow_scorer v1.9.4: a seeded basket is a buy-only day and pays ONE
+# side (rt/2 = 0.05% for a US name), not a full round trip (was 99.9).
 @pytest.mark.parametrize("stored_base,expected_index,expected_gate", [
-    (None, 99.9, "NOT_DECIDABLE"), (0.0, 0.0, "FAIL"), (110.0, 111.1, "PASS"),
+    (None, 99.95, "NOT_DECIDABLE"), (0.0, 0.0, "FAIL"), (110.0, 111.1, "PASS"),
 ])
 def test_actual_runner_preserves_zero_and_only_seeds_a_genuinely_missing_base(
     scorer, runner, stored_base, expected_index, expected_gate

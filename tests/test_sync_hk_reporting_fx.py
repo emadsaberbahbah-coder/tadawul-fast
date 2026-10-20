@@ -202,9 +202,9 @@ def test_h10_identity_selftest_still_passes():
 
 
 def test_h11_version_and_manifest_pin():
-    assert sync.SCRIPT_VERSION == "6.70.0"
+    assert sync.SCRIPT_VERSION == "6.70.1"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.70.0", "dashboard sync")' in src
+    assert '("run_dashboard_sync", "6.70.1", "dashboard sync")' in src
     ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "tests/test_sync_hk_reporting_fx.py" in ci
 

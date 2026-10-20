@@ -2,8 +2,21 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.154.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.155.0
 ================================================================================
+
+WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
+- _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
+  holding (suffix map currency "GBp", pence) took the GBP (pounds) rate: its
+  SAR value and Actual Weight % were 100x too large (1000 VOD.L @ 70p beside
+  25,000 SAR of 2222.SR read 93.07% instead of 11.85%) and drove REDUCE/ADD.
+  The subunit token is now resolved case-sensitively first (GBX/GBp -> GBP,
+  ZAC/ZAc -> ZAR, ILA/ILa -> ILS, each / 100; USX only behind
+  TFB_OPP_FX_USX_SUBUNIT). A subunit whose major currency has no rate stays
+  unresolved, so the existing whole-book PORTFOLIO_FX_INCOMPLETE fail-closed
+  path applies.
+- portfolio_fx_status names the built-in INDICATIVE rates used
+  ("OK:SAR INDICATIVE:GBP") instead of a bare "OK:SAR".
 
 WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
 - Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
@@ -4154,7 +4167,7 @@ from core.financial_units import (
 # v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
 # non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
 # never ranked, never funded.
-__version__ = "5.154.0"
+__version__ = "5.155.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -11212,6 +11225,29 @@ def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     return out
 
 
+# v5.155.0 PF-SUBUNIT: subunit price currency -> (major currency, divisor).
+# Matched case-sensitively, exactly like _SUBUNIT_PRICE_CURRENCIES: "GBp"/"GBX"
+# are pence while "GBP" is pounds. USX folds only behind TFB_OPP_FX_USX_SUBUNIT,
+# mirroring _normalize_subunit_market_cap.
+_PF_SUBUNIT_MAJOR: Dict[str, str] = {
+    "GBX": "GBP", "GBp": "GBP",
+    "ZAC": "ZAR", "ZAc": "ZAR",
+    "ILA": "ILS", "ILa": "ILS",
+}
+
+
+def _pf_subunit_major(raw_ccy: str) -> Tuple[str, float]:
+    """Return (major currency, divisor) for a position currency. A major-unit
+    currency returns itself with divisor 1.0."""
+    tok = (raw_ccy or "").strip()
+    if tok in _PF_SUBUNIT_MAJOR:
+        return _PF_SUBUNIT_MAJOR[tok], _SUBUNIT_PRICE_CURRENCY_FACTOR
+    if tok.upper() == "USX" and (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        return "USD", _SUBUNIT_PRICE_CURRENCY_FACTOR
+    return tok, 1.0
+
+
 def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                               fx_rates: Optional[Dict[str, Any]] = None) -> None:
     """v5.80.0: cross-sectional My_Portfolio pass. v5.85.4 (Fix AF): the per-row
@@ -11266,15 +11302,21 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     continue
                 if _as_float(r.get("position_value")) is None:
                     continue
-                ccy = (_safe_str(r.get("currency")) or "").upper()
+                # v5.155.0 PF-SUBUNIT: resolve the subunit token on the RAW
+                # (case-preserved) currency BEFORE upper-casing. The suffix map
+                # emits "GBp" for .L, which .upper() turned into "GBP" -- the
+                # pounds rate applied to a pence value (100x the weight).
+                _raw_ccy = _safe_str(r.get("currency")) or ""
+                _major, _div = _pf_subunit_major(_raw_ccy)
+                ccy = _major.upper()
                 if not ccy:
                     _unresolved.add("(blank)")
                     continue
                 f = _fx.get(ccy)
                 if f is None or f <= 0.0:
-                    _unresolved.add(ccy)
+                    _unresolved.add(_raw_ccy if _div != 1.0 else ccy)
                 else:
-                    _factor[id(r)] = f
+                    _factor[id(r)] = f / _div
                     if ccy in _PF_INDICATIVE_FX_TO_SAR and ccy not in _operator_set:
                         _indicative_used.add(ccy)
             if _indicative_used:
@@ -11317,9 +11359,14 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     _f7_settle_holdback(r)
                     _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
                 return
+            # v5.155.0: a book converted with a built-in INDICATIVE (floating)
+            # rate is disclosed on every row, not only in a log line.
+            _fx_status = "OK:" + _base_ccy
+            if _indicative_used:
+                _fx_status += " INDICATIVE:" + ",".join(sorted(_indicative_used))
             for r in rows:
                 if isinstance(r, dict):
-                    r["portfolio_fx_status"] = "OK:" + _base_ccy
+                    r["portfolio_fx_status"] = _fx_status
 
         total_mv = 0.0
         for r in rows:
