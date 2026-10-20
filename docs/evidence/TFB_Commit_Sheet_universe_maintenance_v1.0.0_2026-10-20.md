@@ -2,7 +2,7 @@
 
 Date: 2026-10-20 (Tuesday, Riyadh). Base: `origin/main` aa1f440 (#802).
 Delivered: `scripts/universe_maintenance.py` 1.0.0 (new), `.github/workflows/universe_maintenance.yml` 1.0.0 (new),
-`config/universe_exclusions.json` 1.0.0 (new), `tests/test_universe_maintenance.py` (48 cases, new),
+`config/universe_exclusions.json` 1.0.0 (new), `tests/test_universe_maintenance.py` (63 cases, new),
 `ci.yml` 1.1.26 -> 1.1.27 (enrols the suite in the blocking lean lane), this sheet.
 Not edited: `run_dashboard_sync.py` (its v6.64.0 retirement seam is used as is), `daily_sync.yml`, every gate, floor,
 threshold, ticket, trigger and `_Lists_Config`. No Render or Apps Script change.
@@ -26,11 +26,13 @@ nothing).
 2. **Retire (every run).** A `.US` row red for 10+ trading days that is **absent from EODHD's active US exchange
    list** is appended to `_Retired_Symbols` (Page = Global_Markets, Reason prefixed `universe_maintenance v1.0.0`).
    The sync's existing seam removes it when `TFB_SYNC_RETIRE_TAB=enforce`. Never retired: a My_Portfolio holding
-   (also as a bare ticker); a symbol still on the active list (a data problem, reported); a non-US line (no
-   confirmable list in v1.0.0, reported); more than 25 per run; anything that would take the page below 6,512 rows
-   (the publication floor).
+   (also as a bare ticker), and nothing at all when My_Portfolio cannot be found; a symbol still on the active
+   list (a data problem, reported); a non-US line (no confirmable list in v1.0.0, reported); more than 25 per run;
+   anything that would take the page below 6,512 rows (the publication floor) once the rows `_Retired_Symbols`
+   already lists for the page are counted as gone.
 3. **Add (once a week, from Sunday Riyadh).** The EODHD screener's top 1,000 US names by market cap, missing from
-   the page, appended to column A: at most 25 per week and never above 6,750 rows (the name-identity roster bound).
+   the page, appended to column A: at most 25 per week and never above 6,750 rows on the page now (the
+   name-identity roster bound; a planned retirement frees no seat until the sync removes it).
    Not added, each with its reason in the report: already on the page (also bare) or retired; the same company
    under another line, ADR or share class (normalised name against all rows); not a Common Stock on NYSE / Nasdaq /
    NYSE American / Arca / Cboe BZX (no OTC); a foreign issuer unless `TFB_UNIVERSE_ADD_FOREIGN=1`;
@@ -42,9 +44,12 @@ status OBSERVE). **enforce** also writes Global_Markets column A and `_Retired_S
 the pure self-test fails. A manual run can choose observe or off; enforce comes only from the Variable.
 
 Safety: the run is skipped while a scheduled or dispatched Daily Sync is queued or running (fail-closed if the
-Actions API cannot be read). A Global_Markets read below the floor writes nothing. Tabs are overwritten from A1 and
-padded, never cleared first. The EODHD key never reaches a log line. Additions run at most once per week (a switch
-from observe to enforce runs them on the next run). Budget per week: about 10 screener calls and at most 120
+Actions API cannot be read), and enforce repeats the check right before its writes (deferred to the next run if a
+sync appeared or its state is unknown). The weekly marker is written before the page append, so additions stay at
+most once per week even if a later write fails (a switch from observe to enforce runs them on the next run). Every
+read precedes the first write: an unreadable tab stops the run with nothing written. A Global_Markets read below the
+floor writes nothing. Tabs are overwritten from A1 and padded, never cleared first. The EODHD key never reaches a log
+line. Budget per week: about 10 screener calls and at most 120
 fundamentals calls; the US list once per run.
 
 ## 20 Oct export, offline dry run of the watch
@@ -58,7 +63,7 @@ job removes only confirmed delistings. The identity backlog remains a separate i
 
 | Battery | Result |
 | --- | --- |
-| `tests/test_universe_maintenance.py` (U1-U12: modes, red rule = the GAS regex, streaks, retirement rules, policy, addition filters, cadence, observe/enforce end-to-end, fail-safes, key masking, workflow contract) | 48 passed |
+| `tests/test_universe_maintenance.py` (U1-U13: modes, red rule = the GAS regex, streaks, retirement rules, policy, addition filters, cadence, observe/enforce end-to-end, fail-safes, key masking, workflow contract, review round 1) | 63 passed |
 | `test_runner_pin_ubuntu2404`, `test_workflow_flag_mappings`, `test_ci_required_verdict`, `test_security_pins_20261013` | 40 passed, 4 skipped |
 | `test_workflow_activation_observe`, `test_approved_universe_workflow`, `test_release_decision_feed` | 140 passed, 10 skipped |
 | `test_flag_registry`, `test_repository_workflow_audit`, `test_verify_optional_rollout_flags`, `test_render_env_contract` | 28 passed, 1 skipped |
@@ -79,6 +84,16 @@ Optional Variables (empty = default): `TFB_UNIVERSE_ADD_MAX` (25), `TFB_UNIVERSE
 
 Rollback: `TFB_UNIVERSE_MAINT=off`. An added row is an ordinary row (delete it or list it on `_Retired_Symbols`); a
 retired row returns by deleting its `_Retired_Symbols` line and pasting the symbol back into column A.
+
+## Review round 1 (Codex, 6c0f8dd)
+
+| Finding | Disposition |
+| --- | --- |
+| P1 share the `tadawul-production-write-<ref>` concurrency group | Declined: GitHub keeps one pending run per group and a newly queued member cancels it, so this job could evict a queued Daily Sync (recorded in `track_performance.yml`, 2026-10-06). The race is narrowed instead: enforce re-checks the Actions API right before its writes and defers them when a sync is queued or running, or when the state is unknown. |
+| P1 fail closed when My_Portfolio cannot be opened | Fixed: only "worksheet not found" reads as absent; any other error propagates before the first write. A missing My_Portfolio retires nothing. |
+| P1 additions idempotent across report failures | Fixed: the weekly marker is written before the page append (at most once per week). |
+| P1 existing retirements in the floor calculation | Fixed: rows already listed for Global_Markets (or for every page) count against the 6,512 floor first. |
+| P2 pending retirements are not free seats | Fixed: the 6,750 cap counts the rows on the page now. |
 
 ## Known limits
 

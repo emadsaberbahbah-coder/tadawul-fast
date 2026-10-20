@@ -18,14 +18,16 @@ WHAT (one run = three parts; no other tab of the workbook changes):
      ABSENT from EODHD's active US exchange list (delisted, merged or renamed) is appended to
      `_Retired_Symbols` with Page = Global_Markets. The sync's own retirement seam
      (run_dashboard_sync v6.64.0) removes it on its next write when TFB_SYNC_RETIRE_TAB=enforce.
-     Never: a symbol held on My_Portfolio, a symbol still on the active list (a data problem, not a
-     delisting), a non-US row (no confirmable list in v1.0.0 -- reported for a manual check), more
-     than TFB_UNIVERSE_RETIRE_MAX (25) per run, or below TFB_UNIVERSE_MIN_ROWS (6,512 = the
-     publication floor of finalize_decision_publication.py).
+     Never: a symbol held on My_Portfolio (and nothing at all when My_Portfolio cannot be found), a
+     symbol still on the active list (a data problem, not a delisting), a non-US row (no confirmable
+     list in v1.0.0 -- reported for a manual check), more than TFB_UNIVERSE_RETIRE_MAX (25) per run, or
+     below TFB_UNIVERSE_MIN_ROWS (6,512 = the publication floor of finalize_decision_publication.py)
+     once the rows `_Retired_Symbols` already lists for the page are counted as gone.
   3. ADD (once a week, from TFB_UNIVERSE_ADD_WEEKDAY = SUN, Riyadh). The largest US common stocks by
      market cap (EODHD screener, top TFB_UNIVERSE_SCREEN_N = 1,000) that are missing from the page
      are appended to its column A, at most TFB_UNIVERSE_ADD_MAX (25) per week and never above
-     TFB_UNIVERSE_MAX_ROWS (6,750 = the name-identity roster bound). Not added: a symbol already on
+     TFB_UNIVERSE_MAX_ROWS (6,750 = the name-identity roster bound) counting the rows on the page now
+     (a planned retirement frees no seat until the sync removes it). Not added: a symbol already on
      the page (also as a bare ticker) or on `_Retired_Symbols`; the same company under another line,
      ADR or share class (normalised-name match against every row); anything that is not a Common
      Stock on NYSE / Nasdaq / NYSE American / Arca / Cboe BZX (no OTC); a foreign issuer
@@ -39,8 +41,11 @@ MODES -- TFB_UNIVERSE_MAINT = off (DEFAULT: nothing is read or written) | observ
            lists what enforce would add and retire.
   enforce  also appends the additions to Global_Markets column A and the retirements to
            `_Retired_Symbols`. Degrades to observe when the pure self-test fails.
-The workflow skips a run while a Daily Sync is queued or in progress, so the sync never rewrites the
-page under this job. Rollback: TFB_UNIVERSE_MAINT=off. Appended rows are ordinary rows (delete them,
+The workflow skips a run while a Daily Sync is queued or in progress, and enforce repeats that check
+right before its writes (a sync in flight or an unknown state defers them to the next run). The
+weekly marker is written before the page append, so a failure later in the run can never add a
+second batch in the same week. Every read precedes the first write; an unreadable tab stops the run
+with nothing written. Rollback: TFB_UNIVERSE_MAINT=off. Appended rows are ordinary rows (delete them,
 or list them on `_Retired_Symbols`); retired rows come back by deleting their `_Retired_Symbols` line
 and pasting the symbol into Global_Markets column A.
 """
@@ -189,12 +194,15 @@ def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]]
     return out, len(out)
 
 
-def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Iterable[str],
+def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Optional[Iterable[str]],
                 retired: Iterable[str], us_active: Optional[set], red_days: int, min_rows: int,
-                retire_max: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """(retire, kept). Kept = red long enough but not retired, each with the reason."""
-    held_k, retired_k = key_set(held), key_set(retired)
-    room = max(0, min(retire_max, rows_on_page - min_rows))
+                retire_max: int, pending: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(retire, kept). Kept = red long enough but not retired, each with the reason.
+    held None = My_Portfolio could not be found: holdings unknown, so nothing is retired (fail closed).
+    pending = rows still on the page that _Retired_Symbols already lists for it; the sync removes them
+    together with this run's lines once its seam is armed, so they count against the floor first."""
+    held_k, retired_k = key_set(held or []), key_set(retired)
+    room = max(0, min(retire_max, rows_on_page - pending - min_rows))
     retire: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
     for sym, w in sorted(watch.items(), key=lambda kv: (-int(kv[1].get("days") or 0), kv[0])):
@@ -205,7 +213,9 @@ def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Itera
         item = {"symbol": sym, "name": w.get("name", ""), "days": days, "reason": w.get("reason", "")}
         if su in retired_k:
             continue
-        if sym_keys(su) & held_k:
+        if held is None:
+            kept.append(dict(item, why="My_Portfolio not found - holdings unknown, nothing retired"))
+        elif sym_keys(su) & held_k:
             kept.append(dict(item, why="held on My_Portfolio - never retired"))
         elif not su.endswith(".US"):
             kept.append(dict(item, why="non-US line - no confirmable exchange list in v1.0.0; check by hand"))
@@ -214,7 +224,8 @@ def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Itera
         elif su[:-3] in us_active:
             kept.append(dict(item, why="still on the active US list - a data problem, not a delisting"))
         elif len(retire) >= room:
-            kept.append(dict(item, why=f"cap reached ({retire_max} per run, floor {min_rows} rows) - next run"))
+            kept.append(dict(item, why=f"cap reached ({retire_max} per run; floor {min_rows} rows after "
+                                       f"{pending} already-listed rows) - next run"))
         else:
             retire.append(dict(item, why="delisted: absent from the active US exchange list"))
     return retire, kept
@@ -315,8 +326,20 @@ def plan_add(candidates: Sequence[Dict[str, Any]], page_symbols: Iterable[str], 
     return add, skipped, notes
 
 
-def add_room(rows_on_page: int, retiring: int, max_rows: int, add_max: int) -> int:
-    return max(0, min(add_max, max_rows - (rows_on_page - retiring)))
+def add_room(rows_on_page: int, max_rows: int, add_max: int) -> int:
+    """Seats under the cap, from the rows physically on the page now. Planned retirements free no seat:
+    this job only lists them; the page shrinks on a later sync."""
+    return max(0, min(add_max, max_rows - rows_on_page))
+
+
+def norm_page(page: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(page or "").lower())
+
+
+def pending_on_page(rows: Sequence[Dict[str, Any]], retired_rows: Sequence[Tuple[str, str]]) -> int:
+    """Page rows already listed on _Retired_Symbols for this page (blank Page = every ranked page)."""
+    scoped = key_set(s for s, p in retired_rows if p in ("", norm_page(PAGE)))
+    return sum(1 for r in rows if sym_keys(r["symbol"]) & scoped)
 
 
 def week_start(today_riyadh: dt.date, weekday: str) -> dt.date:
@@ -442,10 +465,14 @@ def _col_letter(n: int) -> str:
 
 
 def _worksheet(sh, name: str):
+    """The tab, or None when it does not exist. Any other error (quota, transport) propagates: every
+    read happens before the first write, so an unreadable tab stops the run with nothing written."""
     try:
         return sh.worksheet(name)
-    except Exception:  # noqa: BLE001 (gspread.WorksheetNotFound and transport errors alike)
-        return None
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ == "WorksheetNotFound":     # gspread.exceptions.WorksheetNotFound
+            return None
+        raise
 
 
 def read_page(ws) -> Tuple[List[Dict[str, Any]], int]:
@@ -477,16 +504,31 @@ def _header_row(values: List[List[Any]], label: str = "symbol") -> int:
     return -1
 
 
-def read_symbols(sh, tab: str) -> List[str]:
+def read_symbols(sh, tab: str) -> Optional[List[str]]:
+    """Symbols under the tab's Symbol header; None when the tab does not exist."""
+    rows = read_retired(sh, tab)
+    return None if rows is None else [s for s, _ in rows]
+
+
+def read_retired(sh, tab: str) -> Optional[List[Tuple[str, str]]]:
+    """(symbol, normalised Page) per row under the Symbol header (blank Page = every ranked page, the
+    sync's own reading); None when the tab does not exist, [] when it has no header row."""
     ws = _worksheet(sh, tab)
     if ws is None:
-        return []
+        return None
     values = ws.get_all_values()
     h = _header_row(values)
     if h < 0:
         return []
-    col = [str(c).strip().lower() for c in values[h]].index("symbol")
-    return [str(r[col]).strip() for r in values[h + 1:] if col < len(r) and str(r[col]).strip()]
+    header = [str(c).strip().lower() for c in values[h]]
+    col = header.index("symbol")
+    pcol = next((header.index(a) for a in ("page", "sheet", "tab") if a in header), -1)
+    out = []
+    for r in values[h + 1:]:
+        sym = str(r[col]).strip() if col < len(r) else ""
+        if sym:
+            out.append((sym, norm_page(r[pcol]) if 0 <= pcol < len(r) else ""))
+    return out
 
 
 def read_watch(sh) -> Tuple[Dict[str, Dict[str, Any]], Tuple[int, int]]:
@@ -536,6 +578,42 @@ def _write_rect(sh, name: str, body: List[List[Any]], prev: Tuple[int, int]) -> 
     if ws.col_count < width:
         ws.add_cols(width - ws.col_count)
     ws.update(values=rect, range_name="A1", value_input_option="RAW")
+
+
+def write_state(sh, state: Dict[str, Any]) -> None:
+    """The weekly marker, written BEFORE the page append so additions stay at most once per week even
+    if a later write of this run fails (row 2 of the report, where read_state finds it)."""
+    ws = _worksheet(sh, REPORT_TAB)
+    if ws is None:
+        ws = sh.add_worksheet(title=REPORT_TAB, rows=300, cols=8)
+    ws.update(values=[[STATE_LABEL, state.get("date", ""), state.get("n", ""), state.get("mode", "")]],
+              range_name="A2:D2", value_input_option="RAW")
+
+
+def sync_in_flight() -> Optional[bool]:
+    """Is a scheduled or dispatched Daily Sync queued or running? None when it cannot be known.
+    Re-checked right before the enforce writes: the workflow's own check runs minutes earlier, and a
+    shared concurrency group is not an option (a newly queued member cancels the PENDING sync - see
+    track_performance.yml, 2026-10-06)."""
+    token = (os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+    repo = (os.getenv("GITHUB_REPOSITORY") or "").strip()
+    if not token or not repo:
+        return None
+    api = (os.getenv("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+    req = urllib.request.Request(f"{api}/repos/{repo}/actions/workflows/daily_sync.yml/runs?per_page=30",
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                          "User-Agent": f"TFB-universe-maintenance/{SCRIPT_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:  # noqa: S310 (fixed https API)
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    runs = data.get("workflow_runs") if isinstance(data, dict) else None
+    if not isinstance(runs, list):
+        return None
+    live = ("in_progress", "queued", "waiting", "pending", "requested")
+    return any(isinstance(r, dict) and r.get("event") in ("schedule", "workflow_dispatch") and r.get("status") in live
+               for r in runs)
 
 
 def write_watch(sh, watch: Dict[str, Dict[str, Any]], prev: Tuple[int, int]) -> None:
@@ -589,11 +667,13 @@ def runlog(sh, now_utc: dt.datetime, status: str, msg: str, details: Dict[str, A
 # --------------------------------------------------------------------------- #
 # run                                                                         #
 # --------------------------------------------------------------------------- #
-def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = False) -> Dict[str, Any]:
+def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = False,
+        sync_check: Callable[[], Optional[bool]] = sync_in_flight) -> Dict[str, Any]:
     today, today_r = now_utc.date(), (now_utc + RIYADH).date()
     out: Dict[str, Any] = {"version": SCRIPT_VERSION, "mode": cfg["mode"], "today_utc": today.isoformat(),
                            "rows": 0, "red_today": 0, "added": [], "retired": [], "skipped_add": [],
-                           "kept_red": [], "notes": [], "additions_ran": False, "wrote": False}
+                           "kept_red": [], "notes": [], "additions_ran": False, "deferred": False, "wrote": False}
+    # ---- reads (all before the first write: an unreadable tab stops the run with nothing written)
     ws = sh.worksheet(PAGE)
     rows, last_row = read_page(ws)
     out["rows"] = n_rows = len(rows)
@@ -601,8 +681,13 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
         out["notes"].append(f"{PAGE} read {n_rows} rows (< floor {cfg['min_rows']}): partial read suspected - nothing written")
         return out
     held = read_symbols(sh, HELD_TAB)
-    retired = read_symbols(sh, cfg["retire_tab"])
+    if held is None:
+        out["notes"].append("My_Portfolio not found: holdings unknown, so nothing is retired this run")
+    retired_rows = read_retired(sh, cfg["retire_tab"]) or []
+    retired = [s for s, _ in retired_rows]
+    out["pending_retired"] = pending = pending_on_page(rows, retired_rows)
     prev_watch, watch_extent = read_watch(sh)
+    last_add, last_mode, report_extent = read_state(sh)
     watch, out["red_today"] = update_watch(prev_watch, rows, today, cfg["stale_days"])
     us_list: Optional[Dict[str, Dict[str, Any]]] = None
     try:
@@ -613,14 +698,14 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
     except Exception as e:  # noqa: BLE001
         out["notes"].append(f"active US list unavailable ({type(e).__name__}) - no retirement or addition this run")
     retire, kept = plan_retire(watch, n_rows, held, retired, set(us_list) if us_list is not None else None,
-                               cfg["red_days"], cfg["min_rows"], cfg["retire_max"])
+                               cfg["red_days"], cfg["min_rows"], cfg["retire_max"], pending)
     out["retired"], out["kept_red"] = retire, kept
 
-    last_add, last_mode, report_extent = read_state(sh)
-    state = {"date": last_add.isoformat() if last_add else "", "n": "", "mode": last_mode}
+    # ---- weekly additions (planned here; written below)
+    prev_state = {"date": last_add.isoformat() if last_add else "", "n": "", "mode": last_mode}
+    state = dict(prev_state)
     due = force_add or additions_due(today_r, cfg["add_weekday"], last_add, last_mode, cfg["mode"])
-    retiring = len(retire) if cfg["retire_mode"] == "enforce" else 0
-    room = add_room(n_rows, retiring, cfg["max_rows"], cfg["add_max"])
+    room = add_room(n_rows, cfg["max_rows"], cfg["add_max"])
     if not due:
         out["notes"].append(f"additions already ran this week ({state['date']}, {last_mode}); next week starts "
                             f"{(week_start(today_r, cfg['add_weekday']) + dt.timedelta(days=7)).isoformat()} (Riyadh)")
@@ -646,39 +731,60 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
             state = {"date": today_r.isoformat(), "n": len(adds), "mode": cfg["mode"]}
             out["additions_ran"] = True
 
-    if cfg["mode"] == "enforce":
-        if retire:
-            append_retired(sh, cfg["retire_tab"], retire, today.isoformat())
-            for it in retire:
-                watch.pop(it["symbol"], None)
-            if cfg["retire_mode"] != "enforce":
-                out["notes"].append(f"TFB_SYNC_RETIRE_TAB={cfg['retire_mode']}: the sync removes listed rows only under enforce")
-        if out["added"]:
-            append_page_symbols(ws, last_row, [a["symbol"] for a in out["added"]])
+    # ---- enforce writes: re-check the sync, marker first, then the page and the retirement list
+    if cfg["mode"] == "enforce" and (out["added"] or retire or state != prev_state):
+        busy = sync_check()
+        if busy is not False:
+            out["deferred"] = True
+            state = prev_state
+            out["additions_ran"] = False
+            out["notes"].append("Daily Sync queued or running at write time (or its state unknown) - additions and "
+                                "retirements deferred to the next run")
+        else:
+            if state != prev_state:
+                write_state(sh, state)
+            if out["added"]:
+                append_page_symbols(ws, last_row, [a["symbol"] for a in out["added"]])
+            if retire:
+                append_retired(sh, cfg["retire_tab"], retire, today.isoformat())
+                for it in retire:
+                    watch.pop(it["symbol"], None)
+                if cfg["retire_mode"] != "enforce":
+                    out["notes"].append(f"TFB_SYNC_RETIRE_TAB={cfg['retire_mode']}: the sync removes listed rows only under enforce")
     write_watch(sh, watch, watch_extent)
     _write_rect(sh, REPORT_TAB, report_lines(out, cfg, state), report_extent)
     out["wrote"] = True
     enf = cfg["mode"] == "enforce"
-    runlog(sh, now_utc, "OK" if enf else "OBSERVE",
+    status = "DEFERRED" if out["deferred"] else ("OK" if enf else "OBSERVE")
+    applied = enf and not out["deferred"]
+    runlog(sh, now_utc, status,
            f"[UNIVERSE-MAINT v{SCRIPT_VERSION}] mode={cfg['mode']} rows={n_rows} red={out['red_today']} "
-           f"{'added' if enf else 'would_add'}={len(out['added'])} {'retired' if enf else 'would_retire'}={len(retire)}",
+           f"{'added' if applied else 'would_add'}={len(out['added'])} "
+           f"{'retired' if applied else 'would_retire'}={len(retire)}",
            {"added": [a["symbol"] for a in out["added"]], "retired": [r["symbol"] for r in retire],
-            "kept_red": len(kept), "skipped_add": len(out["skipped_add"]), "notes": out["notes"]})
+            "kept_red": len(kept), "skipped_add": len(out["skipped_add"]), "pending_retired": pending,
+            "notes": out["notes"]})
     return out
 
 
 def report_lines(out: Dict[str, Any], cfg: Dict[str, Any], state: Dict[str, Any]) -> List[List[Any]]:
-    enf = out["mode"] == "enforce"
+    enf, deferred = out["mode"] == "enforce", bool(out.get("deferred"))
+    if not enf:
+        verb_add, verb_ret, banner = "WOULD ADD (observe)", "WOULD RETIRE (observe)", "observe writes only this tab and _Universe_Watch"
+    elif deferred:
+        verb_add, verb_ret, banner = "DEFERRED ADD", "DEFERRED RETIRE", "enforce: deferred - a Daily Sync was in flight at write time"
+    else:
+        verb_add, verb_ret, banner = "ADDED", "RETIRED", "enforce: additions and retirements applied"
     L: List[List[Any]] = [
-        [f"UNIVERSE MAINTENANCE v{SCRIPT_VERSION} - {PAGE}", f"mode {out['mode']}", f"run {out['today_utc']} (UTC)",
-         "observe writes only this tab and _Universe_Watch" if not enf else "enforce: additions and retirements applied"],
+        [f"UNIVERSE MAINTENANCE v{SCRIPT_VERSION} - {PAGE}", f"mode {out['mode']}", f"run {out['today_utc']} (UTC)", banner],
         [STATE_LABEL, state.get("date", ""), state.get("n", ""), state.get("mode", "")],
-        ["rows", out["rows"], "red today", out["red_today"], "floor / cap", f"{cfg['min_rows']} / {cfg['max_rows']}"],
+        ["rows", out["rows"], "red today", out["red_today"], "floor / cap", f"{cfg['min_rows']} / {cfg['max_rows']}",
+         "already listed on _Retired_Symbols", out.get("pending_retired", 0)],
         [],
-        ["ADDED" if enf else "WOULD ADD (observe)", "Name", "US rank by market cap", "Market cap", "Why"],
+        [verb_add, "Name", "US rank by market cap", "Market cap", "Why"],
     ]
     L += [[a["symbol"], a["name"], a["rank"], a.get("market_cap") or "", a["why"]] for a in out["added"]] or [["(none)"]]
-    L += [[], ["RETIRED" if enf else "WOULD RETIRE (observe)", "Name", "Red trading days", "Last red reason", "Why"]]
+    L += [[], [verb_ret, "Name", "Red trading days", "Last red reason", "Why"]]
     L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]] for r in out["retired"]] or [["(none)"]]
     L += [[], [f"RED {cfg['red_days']}+ TRADING DAYS, KEPT", "Name", "Red trading days", "Last red reason", "Why"]]
     L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]] for r in out["kept_red"][:150]] or [["(none)"]]

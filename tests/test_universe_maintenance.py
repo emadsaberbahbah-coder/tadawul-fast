@@ -113,14 +113,21 @@ class FakeWS:
         raise AssertionError("clear() called")
 
 
+class WorksheetNotFound(Exception):                # same class name as gspread.exceptions.WorksheetNotFound
+    pass
+
+
 class FakeSheet:
-    def __init__(self, *tabs):
+    def __init__(self, *tabs, broken=()):
         self.tabs = {t.title: t for t in tabs}
         self.created = []
+        self.broken = set(broken)
 
     def worksheet(self, name):
+        if name in self.broken:
+            raise RuntimeError("APIError: [503] The service is currently unavailable.")
         if name not in self.tabs:
-            raise KeyError(name)                   # stands in for gspread.WorksheetNotFound
+            raise WorksheetNotFound(name)
         return self.tabs[name]
 
     def add_worksheet(self, title, rows, cols):
@@ -240,6 +247,11 @@ def _book(gm=None, retired_rows="default", portfolio=("Symbol", "HELD", "5023.SR
 
 def _eod(**kw):
     return FakeEod(_us_list(CAND_LIST), CANDIDATES, CAND_FUND, **kw)
+
+
+def _run(sh, eod, cfg, now, **kw):
+    kw.setdefault("sync_check", lambda: False)
+    return um.run(sh, eod, cfg, now, **kw)
 
 
 def _weekdays_from(start: dt.datetime, n: int):
@@ -478,8 +490,8 @@ def test_u7_weekly_cadence_and_mode_switch():
     assert um.additions_due(dt.date(2026, 10, 25), "SUN", sat, "observe", "observe")
     assert um.additions_due(tue, "SUN", sun, "observe", "enforce")          # observe -> enforce switch
     assert not um.additions_due(tue, "SUN", sun, "enforce", "enforce")
-    assert um.add_room(6740, 0, 6750, 25) == 10 and um.add_room(6750, 5, 6750, 25) == 5
-    assert um.add_room(6800, 0, 6750, 25) == 0
+    assert um.add_room(6740, 6750, 25) == 10 and um.add_room(6700, 6750, 25) == 25
+    assert um.add_room(6750, 6750, 25) == 0 and um.add_room(6800, 6750, 25) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -488,7 +500,7 @@ def test_u7_weekly_cadence_and_mode_switch():
 def test_u8_observe_writes_only_its_own_tabs():
     sh, eod = _book(), _eod()
     gm_before = json.dumps(sh.tabs["Global_Markets"].values)
-    out = um.run(sh, eod, _cfg(mode="observe"), TUE)
+    out = _run(sh, eod, _cfg(mode="observe"), TUE)
     assert json.dumps(sh.tabs["Global_Markets"].values) == gm_before
     assert sh.tabs["Global_Markets"].calls == []
     assert sh.tabs["_Retired_Symbols"].calls == [] and sh.tabs["_Retired_Symbols"].values == RETIRED_DEFAULT
@@ -502,7 +514,7 @@ def test_u8_observe_writes_only_its_own_tabs():
     log = sh.tabs["_Run_Log"].values[-1]
     assert log[2] == "universe_maintenance" and log[4] == "OBSERVE" and "would_add=3" in log[5]
     # a second run the same week: no new screener call, the streak does not double count
-    um.run(sh, eod, _cfg(mode="observe"), TUE + dt.timedelta(hours=11))
+    _run(sh, eod, _cfg(mode="observe"), TUE + dt.timedelta(hours=11))
     assert eod.calls["screener"] == 1
     assert {r[0]: r[3] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:] if r[0]}["DEAD.US"] == "1"
 
@@ -510,7 +522,7 @@ def test_u8_observe_writes_only_its_own_tabs():
 def test_u8_ten_red_weekdays_reach_the_retirement_list_in_observe():
     sh, eod = _book(), _eod()
     for day in _weekdays_from(TUE, 10):
-        out = um.run(sh, eod, _cfg(mode="observe"), day)
+        out = _run(sh, eod, _cfg(mode="observe"), day)
     assert [r["symbol"] for r in out["retired"]] == ["DEAD.US"]
     kept = {k["symbol"]: k["why"] for k in out["kept_red"]}
     assert set(kept) == {"LIVEQ.US", "HELD", "GONE.L"}
@@ -535,7 +547,7 @@ def test_u9_enforce_appends_retirements_and_additions():
     sh = _book(gm=gm, retired_rows=retired_rows)
     _seed_watch(sh)
     eod = _eod()
-    out = um.run(sh, eod, _cfg(mode="enforce"), TUE)
+    out = _run(sh, eod, _cfg(mode="enforce"), TUE)
     assert [r["symbol"] for r in out["retired"]] == ["DEAD.US"]
     tail = sh.tabs["_Retired_Symbols"].values[-1]
     assert tail[0] == "Global_Markets" and tail[1] == "DEAD.US" and tail[3] == "2026-10-20"
@@ -547,7 +559,7 @@ def test_u9_enforce_appends_retirements_and_additions():
     assert sh.tabs["_Run_Log"].values[-1][4] == "OK"
     # same week again: nothing new added, DEAD.US never appended twice
     n_ret = len(sh.tabs["_Retired_Symbols"].values)
-    out2 = um.run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=1))
+    out2 = _run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=1))
     assert out2["added"] == [] and eod.calls["screener"] == 1
     assert len(sh.tabs["_Retired_Symbols"].values) == n_ret and len(gm.values) == last_row + 3
 
@@ -555,30 +567,28 @@ def test_u9_enforce_appends_retirements_and_additions():
 def test_u9_enforce_creates_the_retirement_tab_with_the_sync_header():
     sh = _book(retired_rows=None)
     _seed_watch(sh)
-    um.run(sh, _eod(), _cfg(mode="enforce", retire_mode="off"), TUE)
+    _run(sh, _eod(), _cfg(mode="enforce", retire_mode="off"), TUE)
     tab = sh.tabs["_Retired_Symbols"].values
     assert tab[0] == um.RETIRE_HEADER and tab[1][0] == "DEAD.US" and tab[1][4] == "Global_Markets"
 
 
 def test_u9_observe_then_enforce_runs_the_additions_the_same_week():
     sh, eod = _book(), _eod()
-    um.run(sh, eod, _cfg(mode="observe"), TUE)
-    out = um.run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=1))
+    _run(sh, eod, _cfg(mode="observe"), TUE)
+    out = _run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=1))
     assert [a["symbol"] for a in out["added"]] == ["NEWA.US", "NEWB.US", "NEWC.US"] and eod.calls["screener"] == 2
-    out3 = um.run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=2))
+    out3 = _run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(days=2))
     assert out3["added"] == [] and eod.calls["screener"] == 2
 
 
-def test_u9_room_respects_the_cap_and_counts_retirements_only_when_the_sync_enforces():
+@pytest.mark.parametrize("retire_mode", ["off", "enforce"])
+def test_u9_room_counts_the_rows_physically_on_the_page(retire_mode):
     gm = _gm(n_plain=6744)                                            # 6,749 rows: one seat left
     sh = _book(gm=gm)
     _seed_watch(sh)
-    out = um.run(sh, _eod(), _cfg(mode="observe", retire_mode="off"), TUE)
-    assert len(out["added"]) == 1
-    sh2 = _book(gm=_gm(n_plain=6744))
-    _seed_watch(sh2)
-    out2 = um.run(sh2, _eod(), _cfg(mode="observe", retire_mode="enforce"), TUE)
-    assert len(out2["added"]) == 2                                    # DEAD.US frees a seat
+    out = _run(sh, _eod(), _cfg(mode="enforce", retire_mode=retire_mode), TUE)
+    assert [r["symbol"] for r in out["retired"]] == ["DEAD.US"]       # listed, but still on the page
+    assert len(out["added"]) == 1 and len(gm.values) - 1 == 6750      # never above the cap, even briefly
 
 
 # --------------------------------------------------------------------------- #
@@ -586,7 +596,7 @@ def test_u9_room_respects_the_cap_and_counts_retirements_only_when_the_sync_enfo
 # --------------------------------------------------------------------------- #
 def test_u10_partial_page_read_writes_nothing():
     sh = _book(gm=_gm(n_plain=6000))
-    out = um.run(sh, _eod(), _cfg(mode="enforce"), TUE)
+    out = _run(sh, _eod(), _cfg(mode="enforce"), TUE)
     assert out["wrote"] is False and sh.created == [] and len(sh.tabs["_Run_Log"].values) == 1
     assert "partial read" in out["notes"][0]
 
@@ -595,7 +605,7 @@ def test_u10_us_list_failure_blocks_retirement_and_additions_but_keeps_the_watch
     sh = _book()
     _seed_watch(sh)
     eod = _eod(fail_list=True)
-    out = um.run(sh, eod, _cfg(mode="enforce"), TUE)
+    out = _run(sh, eod, _cfg(mode="enforce"), TUE)
     assert out["retired"] == [] and out["added"] == [] and eod.calls["screener"] == 0
     assert any("unavailable" in k["why"] for k in out["kept_red"])
     assert sh.tabs["_Retired_Symbols"].calls == []
@@ -606,15 +616,15 @@ def test_u10_us_list_failure_blocks_retirement_and_additions_but_keeps_the_watch
 def test_u10_short_us_list_is_treated_as_unavailable():
     sh = _book()
     eod = FakeEod({"AAPL": {"Type": "Common Stock", "Exchange": "NASDAQ"}}, CANDIDATES)
-    out = um.run(sh, eod, _cfg(), TUE)
+    out = _run(sh, eod, _cfg(), TUE)
     assert any("only 1 codes" in n for n in out["notes"]) and eod.calls["screener"] == 0
 
 
 def test_u10_screener_failure_retries_next_run():
     sh = _book()
-    out = um.run(sh, _eod(fail_screener=True), _cfg(), TUE)
+    out = _run(sh, _eod(fail_screener=True), _cfg(), TUE)
     assert out["added"] == [] and any("screener unavailable" in n for n in out["notes"])
-    out2 = um.run(sh, _eod(), _cfg(), TUE + dt.timedelta(hours=11))
+    out2 = _run(sh, _eod(), _cfg(), TUE + dt.timedelta(hours=11))
     assert len(out2["added"]) == 3
 
 
@@ -622,13 +632,14 @@ def test_u10_header_found_below_title_rows_and_held_bare_symbol():
     ws = FakeWS("X", [["Title"], ["note"], ["#", "symbol", "Page"], ["1", "AAA.US", ""], ["2", "", ""], ["3", "BBB", "x"]])
     assert um.read_symbols(FakeSheet(ws), "X") == ["AAA.US", "BBB"]
     assert um.read_symbols(FakeSheet(FakeWS("Y", [["no header here"]])), "Y") == []
-    assert um.read_symbols(FakeSheet(), "missing") == []
+    assert um.read_symbols(FakeSheet(), "missing") is None                     # absent tab != empty tab
+    assert um.read_retired(FakeSheet(ws), "X") == [("AAA.US", ""), ("BBB", "x")]
 
 
 def test_u10_report_rewrite_never_clears_and_pads_the_old_extent():
     sh = _book()
     sh.tabs["_Universe_Report"] = FakeWS("_Universe_Report", [["x"] * 9 for _ in range(400)], rows=400, cols=9)
-    um.run(sh, _eod(), _cfg(), TUE)
+    _run(sh, _eod(), _cfg(), TUE)
     vals = sh.tabs["_Universe_Report"].get_all_values()
     assert len(vals) == 400 and all(c == "" for c in vals[-1])         # stale rows blanked, not cleared
 
@@ -731,3 +742,152 @@ def test_u12_workflow_audit_has_no_findings():
     sys.modules["audit_wf"] = audit
     spec.loader.exec_module(audit)
     assert audit.audit_workflow_text(str(WORKFLOW), WORKFLOW.read_text(encoding="utf-8")) == []
+
+
+# --------------------------------------------------------------------------- #
+# U13 review round 1 (#806): fail-closed holdings, existing retirements vs.   #
+#     the floor, marker-first additions, write-time sync re-check             #
+# --------------------------------------------------------------------------- #
+def test_u13_portfolio_transport_error_stops_before_any_write():
+    sh = _book()
+    sh.broken.add("My_Portfolio")
+    _seed_watch(sh)
+    with pytest.raises(RuntimeError):
+        _run(sh, _eod(), _cfg(mode="enforce"), TUE)
+    assert sh.tabs["Global_Markets"].calls == [] and sh.tabs["_Retired_Symbols"].calls == []
+    assert sh.created == [] and len(sh.tabs["_Run_Log"].values) == 1
+
+
+def test_u13_missing_portfolio_retires_nothing():
+    sh = _book()
+    del sh.tabs["My_Portfolio"]
+    _seed_watch(sh)
+    out = _run(sh, _eod(), _cfg(mode="enforce"), TUE)
+    assert out["retired"] == [] and "holdings unknown" in out["kept_red"][0]["why"]
+    assert sh.tabs["_Retired_Symbols"].values == RETIRED_DEFAULT
+    assert any("My_Portfolio not found" in n for n in out["notes"])
+
+
+def test_u13_existing_retirements_on_the_page_count_against_the_floor():
+    watch = {"DEAD.US": _w(12)}
+    assert um.plan_retire(watch, 6600, [], [], set(), 10, 6512, 25, pending=88)[0] == []
+    assert len(um.plan_retire(watch, 6600, [], [], set(), 10, 6512, 25, pending=87)[0]) == 1
+    rows = [{"symbol": "A.US"}, {"symbol": "B.US"}, {"symbol": "C"}, {"symbol": "D.US"}, {"symbol": "D.US"}]
+    listed = [("A.US", "globalmarkets"), ("C.US", ""), ("D.US", "marketleaders"), ("Z.US", "")]
+    assert um.pending_on_page(rows, listed) == 2                     # A (scoped) + C (blank page, twin spelling)
+    assert um.norm_page("Global_Markets") == "globalmarkets" == um.norm_page(" global markets ")
+
+
+def test_u13_run_counts_listed_rows_still_on_the_page():
+    gm = _gm(n_plain=6600)                                            # 6,605 rows
+    listed = [list(um.RETIRE_HEADER)] + [[f"P{i:04d}.US", "2026-10-18", "", "", "Global_Markets"] for i in range(93)]
+    listed += [[f"P{i:04d}.US", "2026-10-18", "", "", "Market_Leaders"] for i in range(93, 150)]
+    sh = _book(gm=gm, retired_rows=listed)
+    _seed_watch(sh)
+    out = _run(sh, _eod(), _cfg(mode="enforce"), TUE)
+    assert out["pending_retired"] == 93 and out["retired"] == []      # 6,605 - 93 = 6,512: no room
+    assert "already-listed" in out["kept_red"][0]["why"]
+    listed.pop()                                                      # Market_Leaders scope never counted
+    del listed[1]                                                     # 92 Global_Markets lines left
+    sh2 = _book(gm=_gm(n_plain=6600), retired_rows=listed)
+    _seed_watch(sh2)
+    assert [r["symbol"] for r in _run(sh2, _eod(), _cfg(mode="enforce"), TUE)["retired"]] == ["DEAD.US"]
+
+
+class _FailingReport(FakeWS):
+    def update(self, values, range_name, value_input_option=None):
+        if range_name == "A1":
+            raise RuntimeError("APIError: [500] internal error")
+        return super().update(values, range_name, value_input_option)
+
+
+def test_u13_marker_is_written_before_the_page_append():
+    gm = _gm()
+    last_row = len(gm.values)
+    sh = _book(gm=gm)
+    sh.tabs["_Universe_Report"] = _FailingReport("_Universe_Report", [], rows=300, cols=8)
+    eod = _eod()
+    with pytest.raises(RuntimeError):
+        _run(sh, eod, _cfg(mode="enforce"), TUE)                      # page appended, report rewrite fails
+    assert [r[0] for r in gm.values[last_row:]] == ["NEWA.US", "NEWB.US", "NEWC.US"]
+    assert sh.tabs["_Universe_Report"].values[1][:4] == [um.STATE_LABEL, "2026-10-20", 3, "enforce"]
+    sh.tabs["_Universe_Report"].__class__ = FakeWS                    # the sheet recovers
+    out = _run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(hours=11))
+    assert out["added"] == [] and eod.calls["screener"] == 1 and len(gm.values) == last_row + 3
+
+
+@pytest.mark.parametrize("busy", [True, None])
+def test_u13_sync_in_flight_at_write_time_defers_every_enforce_write(busy):
+    sh = _book()
+    _seed_watch(sh)
+    gm_before = json.dumps(sh.tabs["Global_Markets"].values)
+    eod = _eod()
+    out = _run(sh, eod, _cfg(mode="enforce"), TUE, sync_check=lambda: busy)
+    assert out["deferred"] is True and json.dumps(sh.tabs["Global_Markets"].values) == gm_before
+    assert sh.tabs["_Retired_Symbols"].values == RETIRED_DEFAULT
+    report = sh.tabs["_Universe_Report"].get_all_values()
+    assert report[1][1] == "" and any(r[0] == "DEFERRED ADD" for r in report)
+    assert sh.tabs["_Run_Log"].values[-1][4] == "DEFERRED"
+    assert {r[0]: r[3] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:] if r[0]}["DEAD.US"] == "10"
+    out2 = _run(sh, eod, _cfg(mode="enforce"), TUE + dt.timedelta(hours=11))
+    assert [a["symbol"] for a in out2["added"]] == ["NEWA.US", "NEWB.US", "NEWC.US"]
+    assert [r["symbol"] for r in out2["retired"]] == ["DEAD.US"] and eod.calls["screener"] == 2
+
+
+def test_u13_observe_never_consults_the_write_time_check():
+    sh = _book()
+    _run(sh, _eod(), _cfg(mode="observe"), TUE, sync_check=lambda: pytest.fail("observe has no writes to guard"))
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize("runs,expected", [
+    ([{"event": "schedule", "status": "in_progress"}], True),
+    ([{"event": "workflow_dispatch", "status": "queued"}], True),
+    ([{"event": "pull_request", "status": "in_progress"}, {"event": "push", "status": "queued"},
+      {"event": "schedule", "status": "completed"}], False),
+    ([], False),
+])
+def test_u13_sync_in_flight_reads_only_workbook_writer_runs(monkeypatch, runs, expected):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    seen = {}
+
+    def fake_urlopen(req, timeout=0):
+        seen["url"] = req.full_url
+        return _Resp({"workflow_runs": runs})
+
+    monkeypatch.setattr(um.urllib.request, "urlopen", fake_urlopen)
+    assert um.sync_in_flight() is expected
+    assert seen["url"].endswith("/repos/owner/repo/actions/workflows/daily_sync.yml/runs?per_page=30")
+
+
+def test_u13_sync_in_flight_unknown_without_token_or_on_error(monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    assert um.sync_in_flight() is None
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(um.urllib.request, "urlopen", lambda req, timeout=0: (_ for _ in ()).throw(OSError("down")))
+    assert um.sync_in_flight() is None
+    monkeypatch.setattr(um.urllib.request, "urlopen", lambda req, timeout=0: _Resp({"message": "Not Found"}))
+    assert um.sync_in_flight() is None
+
+
+def test_u13_workflow_passes_the_token_and_keeps_its_private_group():
+    wf = _wf()
+    step = next(s for s in wf["jobs"]["universe-maintenance"]["steps"] if "--json-out" in s.get("run", ""))
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "tadawul-production-write" not in json.dumps(wf["concurrency"])

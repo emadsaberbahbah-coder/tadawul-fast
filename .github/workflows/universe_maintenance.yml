@@ -130,6 +130,11 @@ jobs:
           # daily_sync.yml write the workbook (push and pull_request runs are
           # its CI jobs). Fail-CLOSED: if the Actions API cannot be read, skip;
           # a skipped run costs one watch day at most and the next slot retries.
+          # The script repeats this check right before its enforce writes.
+          # NOT the shared 'tadawul-production-write-<ref>' group on purpose:
+          # GitHub keeps one PENDING run per group and a newly queued member
+          # cancels it, so this job could evict a queued Daily Sync (the hazard
+          # recorded in track_performance.yml, 2026-10-06).
           RUNNING="$(curl -sS --max-time 25 \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -178,6 +183,8 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           TFB_UNIVERSE_MAINT: ${{ steps.mode.outputs.mode }}
+          # enforce re-checks the Daily Sync state right before its writes (Actions API, read-only)
+          GH_TOKEN: ${{ github.token }}
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           EODHD_BASE_URL: ${{ vars.EODHD_BASE_URL }}
