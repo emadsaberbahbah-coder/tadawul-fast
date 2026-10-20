@@ -1,7 +1,12 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.13 (2026-10-20)
+ * Version: 1.2.14 (2026-10-20)
+ *   1.2.14: THREE REVIEW FINDINGS. (a) The PRODUCTION rotation basis (Top_10 KPI 'Rotation Basis' → Script Property
+ *          DP2_ROTATION_BASIS → '12m') gates the SWITCH actions and advisories; the other basis is a research note.
+ *          (b) A rotation's surplus is recorded, never recycled to later needs in the same run (engine semantics).
+ *          (c) Lots of one symbol are aggregated into one rotation holding (value summed, oldest entry), as the engine
+ *          evaluates the My_Portfolio position.
  *   1.2.13: THREE REVIEW FINDINGS (several lots / several stop levels). (a) dp2BracketFor_ keeps every active stop
  *          level (stops[]) and reports the LOWEST as `stop`; a RAISE names the shares resting below the rule. (b) Rule-exit
  *          acknowledgements are keyed by LOT (symbol@entry); a bare symbol is honoured only for a single-lot symbol.
@@ -158,7 +163,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.13';
+var DP2_VERSION = '1.2.14';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -225,7 +230,8 @@ var DP2X = {
   PROP_ALERT_TO: 'DP2_EXIT_ALERT_TO',
   PROP_HISTORY_URL: 'DP2_HISTORY_URL',
   PROP_HISTORY_KEY: 'DP2_HISTORY_KEY',
-  PROP_EXIT_ACK: 'DP2_EXIT_ACK'      // v1.2.5: JSON { symbol: 'yyyy-MM-dd' } — rule exits acknowledged (hold by decision)
+  PROP_EXIT_ACK: 'DP2_EXIT_ACK',     // v1.2.5: JSON { symbol: 'yyyy-MM-dd' } — rule exits acknowledged (hold by decision)
+  PROP_ROT_BASIS: 'DP2_ROTATION_BASIS'   // v1.2.14: '12m' (default, = TFB_OPP_ROTATION_BASIS unset) | 'plan3m' — the PRODUCTION basis; only its plan drives SWITCH actions
 };
 /* Research allocation + rotation (v1.2.0) — a faithful mirror of the backend's conviction-weighted seat sizing
  * (opportunity_builder v1.27.0, TFB_OPP_SIZING_MODE=conviction) and its rotation funding plans (v1.18.0+):
@@ -1344,7 +1350,7 @@ function dp2ExitLine_(it, fx) {
     why += rtxt;
     var switchAct = 'SWITCH (research): ' + rr.action.toLowerCase() + ' ' + it.symbol + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' when the feed is released — the engine will carry the same plan. Research only; no order is placed by this page.';
     if (s.staleBars) action += ' ' + switchAct;
-    else if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'STOP_PARTIAL' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
+    else if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'EXIT_LATCHED' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'STOP_PARTIAL' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;   // v1.2.14: a latched exit's sell instruction leads, the switch follows
     else action = switchAct + ' Stop: ' + action;
   }
   return { head: it.symbol + ' — ' + (it.name || '') + ' · ' + dp2Fmt_(it.qty) + ' × ' + dp2Fmt_(it.entry, 2) + ' → last ' + dp2Fmt_(lastPx, 2) + (pnl !== null ? ' (' + dp2Signed_(pnl) + ' SAR unrealized)' : '') + (x ? '' : ' · no price history'), signal: s.text + (it.rotation ? ' · SWITCH candidate' : ''), why: why, action: action };
@@ -1666,7 +1672,7 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
       rot.proceeds = proceeds;
       plan.ticket = Math.min(need, proceeds + cashUsed);
       rot.surplus = Math.max(0, proceeds + cashUsed - plan.ticket);
-      avail = avail + rot.surplus;
+      // v1.2.14 (review finding): the engine records the surplus but does not recycle it to later needs in the same run
       plan.rotation = rot; plan.short = Math.max(0, need - plan.ticket); plan.state = 'FUNDABLE_BY_ROTATION';
     } else {
       plan.state = 'CAPITAL_CALL';
@@ -1699,8 +1705,19 @@ function dp2PlanText_(pl) {
 /* Holdings for the rotation rule, from the ledger lots + My_Portfolio forward ROI + the working broker TP. */
 function dp2RotationHoldings_(eq, fi, ib, qmap, seatMap) {
   var out = [], i;
+  // v1.2.14 (review finding): one rotation holding per SYMBOL — the engine evaluates the My_Portfolio position; lots of
+  // one symbol are aggregated (value summed, the oldest entry for the min-held-days rule, the lot count kept for the text)
+  var bySym = {}, order = [];
   for (i = 0; i < eq.length; i++) {
-    var l = eq[i], m = l.mp || {};
+    var e0 = eq[i], k0 = e0.symbol;
+    if (!bySym[k0]) { bySym[k0] = { symbol: k0, name: e0.name, mp: e0.mp, fx: e0.fx, price: e0.price, mvSar: 0, holdingDays: null, lots: 0, buyDate: null }; order.push(k0); }
+    var agg = bySym[k0]; agg.mvSar += (e0.mvSar || 0); agg.lots++;
+    if (e0.holdingDays !== null && e0.holdingDays !== undefined && (agg.holdingDays === null || e0.holdingDays > agg.holdingDays)) agg.holdingDays = e0.holdingDays;
+    if (!agg.price && e0.price) agg.price = e0.price; if (!agg.fx && e0.fx) agg.fx = e0.fx; if (!agg.mp && e0.mp) agg.mp = e0.mp;
+  }
+  var eqAgg = []; for (i = 0; i < order.length; i++) eqAgg.push(bySym[order[i]]);
+  for (i = 0; i < eqAgg.length; i++) {
+    var l = eqAgg[i], m = l.mp || {};
     var br = dp2BracketFor_(ib.orders, dp2YahooKey_(l.symbol));
     var tp1 = ib.ordersKnown ? br.tp : null;
     // v1.2.5 (review finding): the 3M figure is the PLAN-TP1 ROI, as _tp1_plan_roi on both sides of the engine's plan3m
@@ -1714,11 +1731,22 @@ function dp2RotationHoldings_(eq, fi, ib, qmap, seatMap) {
     if (row) { var tp1Sar = dp2Num_(row['TP1 SAR']); var lfx1 = l.fx || null; if (tp1Sar !== null && lfx1) planTp1 = tp1Sar / lfx1; else if (roi3 !== null && l.price) planTp1 = l.price * (1 + roi3 / 100); }
     if (planTp1 === null) planTp1 = tp1;
     if (roi3 === null && tp1 && l.price) { roi3 = (tp1 / l.price - 1) * 100; roi3Src = 'broker TP1'; }
-    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: roi3, roi3Src: roi3Src, roi3Model: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: planTp1, brokerTp1: tp1, price: l.price, isFI: false });
+    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, lots: l.lots || 1, roi12: dp2PctNum_(m.roi12m), roi3: roi3, roi3Src: roi3Src, roi3Model: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: planTp1, brokerTp1: tp1, price: l.price, isFI: false });
   }
   for (i = 0; i < fi.length; i++) out.push({ symbol: fi[i].symbol, valueSar: fi[i].mvSar || 0, roi12: null, roi3: null, holdingDays: fi[i].holdingDays, tp1: null, price: fi[i].price, isFI: true });
   return out;
 }
+/* v1.2.14 (review finding): the PRODUCTION rotation basis. Read from the Top_10 KPI row when the cockpit publishes
+ * it ('Rotation Basis' = 'engine 12M' | 'plan 3M'), else Script Property DP2_ROTATION_BASIS ('12m' | 'plan3m'), else
+ * '12m' — the engine's default when TFB_OPP_ROTATION_BASIS is unset. Set the property together with the Render ENV. */
+function dp2RotationBasis_(t) {
+  var k = (t && t.kpi) || {}, v = '';
+  for (var kk in k) { if (k.hasOwnProperty(kk) && /^rotation basis/i.test(kk)) v = dp2Str_(k[kk]); }
+  if (!v) v = dp2Str_(dp2Prop_(DP2X.PROP_ROT_BASIS));
+  v = v.trim().toLowerCase();
+  return (/3m|plan3m|plan 3m/.test(v)) ? 'plan3m' : '12m';
+}
+function dp2RotationBasisLabel_(b) { return b === 'plan3m' ? 'plan 3M' : 'engine 12M'; }
 /* One shared research allocation per execution: plans → allocation → funding plans on both bases. */
 var DP2A_MEMO_ = null;   // { key: '<cash>|<fx>', alloc } — v1.2.2: a different cash figure or fx recomputes instead of returning the memo
 function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
@@ -1748,6 +1776,11 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   alloc.rotation12 = null; alloc.rotation3 = null;
   for (i = 0; i < alloc.plans12.length; i++) if (alloc.plans12[i].rotation) { alloc.rotation12 = alloc.plans12[i]; break; }
   for (i = 0; i < alloc.plans3.length; i++) if (alloc.plans3[i].rotation) { alloc.rotation3 = alloc.plans3[i]; break; }
+  // v1.2.14: the production basis decides which plan list is executable; the other is shown as research only
+  alloc.basis = dp2RotationBasis_(t);
+  alloc.rotationProd = alloc.basis === 'plan3m' ? alloc.rotation3 : alloc.rotation12;
+  alloc.rotationOther = alloc.basis === 'plan3m' ? alloc.rotation12 : alloc.rotation3;
+  alloc.plansProd = alloc.basis === 'plan3m' ? alloc.plans3 : alloc.plans12;
   alloc.cashKey = memoKey;
   DP2A_MEMO_ = { key: memoKey, alloc: alloc };
   return alloc;
@@ -1979,17 +2012,21 @@ function buildPortfolioDecisionV2() {
     }
     if (xb && xb.stale && x) actions.push({ p: 3, t: l.symbol + ' exit engine is running on cached bars (' + dp2Str_(xb.fetched) + '): ' + dp2Str_(xb.error || 'fetch failed').slice(0, 120) + '.' });
     // rotation (switch) advisory — research mirror of the engine's funding plans
-    var rot12 = (alloc && alloc.rotation12 && alloc.rotation12.rotation.symbol === l.symbol) ? alloc.rotation12 : null;
-    var rot3 = (alloc && alloc.rotation3 && alloc.rotation3.rotation.symbol === l.symbol) ? alloc.rotation3 : null;
-    if (rot12 || rot3) {
-      var rr0 = rot12 || rot3;
-      item.rotation = { plan: rr0, alt: rot12 && rot3 ? rot3 : null };
+    // v1.2.14 (review finding): only the PRODUCTION basis (dp2RotationBasis_) raises a SWITCH action / advisory; the
+    // other basis is a research note on the row, never an instruction
+    var rotP = (alloc && alloc.rotationProd && alloc.rotationProd.rotation.symbol === l.symbol) ? alloc.rotationProd : null;
+    var rotO = (alloc && alloc.rotationOther && alloc.rotationOther.rotation.symbol === l.symbol) ? alloc.rotationOther : null;
+    var bLbl = alloc ? dp2RotationBasisLabel_(alloc.basis) : 'engine 12M', oLbl = alloc && alloc.basis === 'plan3m' ? 'engine 12M' : 'plan 3M';
+    if (rotP) {
+      item.rotation = { plan: rotP, alt: rotO };
       if (!sig.alert) sig.advisory = true;
-      engTxt += '\n↻ rotation candidate → ' + rr0.sym + ' (' + (rot12 ? 'engine 12M edge +' + dp2Fmt_(rot12.rotation.edge, 1) : 'plan 3M edge +' + dp2Fmt_(rot3.rotation.edge, 1)) + ' pp after cost)';
-      actions.push({ p: 2, t: 'SWITCH (research): ' + rr0.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rr0.rotation.proceeds) + ' SAR to fund ' + rr0.sym + ' (' + (rot12 ? 'engine 12M ' : 'plan 3M ') + dp2PctPlain_(rr0.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rr0.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rr0.rotation.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% round-trip cost)' + (rot12 && rot3 ? '; the 3M basis agrees (edge +' + dp2Fmt_(rot3.rotation.edge, 1) + ' pp)' : (rot12 && !rot3 ? '; the 3M basis does not reach its ' + DP2A.ROT_EDGE_PP_3M + ' pp hurdle' : '')) + '. Research only — the engine issues the executable plan when the feed is released.' });
+      engTxt += '\n↻ rotation candidate → ' + rotP.sym + ' (' + bLbl + ' edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after cost' + (rotO ? '; ' + oLbl + ' agrees' : '; ' + oLbl + ' does not reach its hurdle') + ')';
+      actions.push({ p: 2, t: 'SWITCH (research, ' + bLbl + ' = production basis): ' + rotP.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rotP.rotation.proceeds) + ' SAR to fund ' + rotP.sym + ' (' + dp2PctPlain_(rotP.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rotP.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% round-trip cost)' + (rotO ? '; the ' + oLbl + ' basis agrees (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp)' : '; the ' + oLbl + ' basis does not reach its hurdle') + '. Research only — the engine issues the executable plan when the feed is released.' });
+    } else if (rotO) {
+      engTxt += '\n↻ ' + oLbl + ' basis would rotate → ' + rotO.sym + ' (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp) — not the production basis (' + bLbl + '), no action';
     } else if (alloc && alloc.needs.length && i === 0) {
-      var anyRot = alloc.rotation12 || alloc.rotation3;
-      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle (' + DP2A.ROT_EDGE_PP_12M + ' pp engine 12M / ' + DP2A.ROT_EDGE_PP_3M + ' pp plan 3M after cost) → capital call ' + dp2Fmt_((alloc.plans12 || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
+      var anyRot = alloc.rotationProd;
+      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle on the production basis (' + dp2RotationBasisLabel_(alloc.basis) + ', ' + (alloc.basis === 'plan3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M) + ' pp after cost) → capital call ' + dp2Fmt_((alloc.plansProd || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
     }
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
@@ -2083,7 +2120,7 @@ function buildPortfolioDecisionV2() {
     ['Dynamic exit engine on fresh bars', xFresh + ' of ' + xTotal + ' lots · ' + srcList, (xTotal > 0 && xFresh === xTotal) ? DP2C.green : DP2C.amber],
     ['Broker stop ≥ dynamic stop on every lot, full quantity', (function () { var n = 0; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') n++; return n ? n + ' lot(s) to raise / place / complete' : 'pass'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') return DP2C.amber; return DP2C.green; })()],
     ['SELL NOW signals open', (function () { var n = []; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) n.push(exitItems[k].symbol); return n.length ? n.join(', ') : 'none'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) return DP2C.red; return DP2C.green; })()],
-    ['Rotation candidate (research)', alloc && alloc.rotation12 ? alloc.rotation12.rotation.action + ' ' + alloc.rotation12.rotation.symbol + ' → ' + alloc.rotation12.sym + ' (+' + dp2Fmt_(alloc.rotation12.rotation.edge, 1) + ' pp 12M)' : (alloc && alloc.rotation3 ? alloc.rotation3.rotation.action + ' ' + alloc.rotation3.rotation.symbol + ' → ' + alloc.rotation3.sym + ' (+' + dp2Fmt_(alloc.rotation3.rotation.edge, 1) + ' pp 3M only)' : (alloc && alloc.needs.length ? 'none — capital call' : 'none needed')), alloc && (alloc.rotation12 || alloc.rotation3) ? DP2C.amber : DP2C.ink],
+    ['Rotation candidate (research, ' + (alloc ? dp2RotationBasisLabel_(alloc.basis) : 'engine 12M') + ' = production basis)', alloc && alloc.rotationProd ? alloc.rotationProd.rotation.action + ' ' + alloc.rotationProd.rotation.symbol + ' → ' + alloc.rotationProd.sym + ' (+' + dp2Fmt_(alloc.rotationProd.rotation.edge, 1) + ' pp)' + (alloc.rotationOther ? '' : ' · other basis: none') : (alloc && alloc.rotationOther ? 'none on the production basis · ' + (alloc.basis === 'plan3m' ? 'engine 12M' : 'plan 3M') + ' would rotate ' + alloc.rotationOther.rotation.symbol + ' → ' + alloc.rotationOther.sym + ' (research only)' : (alloc && alloc.needs.length ? 'none — capital call' : 'none needed')), alloc && alloc.rotationProd ? DP2C.amber : DP2C.ink],
     ['IBKR evidence freshness ≤ ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' · ' + pd.evidence.age : ''), evFresh ? DP2C.green : DP2C.red],
     ['Source receipt = sync run', (pd.receiptRun || 'n/a') + (feed.run ? ' vs ' + feed.run : '') + ' · ' + (feed.run && pd.receiptRun === feed.run ? 'pass' : 'fail'), feed.run && pd.receiptRun === feed.run ? DP2C.green : DP2C.red],
     ['Decision feed', (feed.state || 'n/a') + (feed.blocker ? ' (' + feed.blocker + ')' : ''), /^ACTIONABLE|^OK/.test(feed.state) ? DP2C.green : DP2C.red],
@@ -2305,8 +2342,9 @@ function buildTop10V2() {
     ];
     var a1 = dp2KV_(sh, aTop, 1, 8, aRows);
     var pLines = [];
-    for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis: ' + dp2PlanText_(alloc.plans12[i]));
-    for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis: ' + dp2PlanText_(alloc.plans3[i]));
+    pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + (alloc.basis === 'plan3m' ? 'TFB_OPP_ROTATION_BASIS=plan3m' : 'TFB_OPP_ROTATION_BASIS unset / 12m') + '; Script Property DP2_ROTATION_BASIS mirrors it) — only its plans drive SWITCH actions; the other basis is research.');
+    for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis' + (alloc.basis === '12m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans12[i]));
+    for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis' + (alloc.basis === 'plan3m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans3[i]));
     if (!alloc.needs.length) pLines.push('All plans fundable from cash — no rotation needed today.' + (alloc.rotation12 || alloc.rotation3 ? '' : ''));
     var holdTxt = alloc.holdings.filter(function (h) { return !h.isFI; }).map(function (h) { return h.symbol + ' fwd 12M ' + dp2PctPlain_(h.roi12, 1) + ' · 3M plan ' + (h.roi3 !== null ? dp2PctPlain_(h.roi3, 1) + ' (' + h.roi3Src + ')' : 'n/a — no TP1 ladder, never rotates on 3M') + (h.roi3Model !== null ? ' · model 3M ' + dp2PctPlain_(h.roi3Model, 1) : '') + ' · ' + dp2Fmt_(h.valueSar) + ' SAR · ' + (h.holdingDays !== null ? h.holdingDays + ' d' : '—'); }).join('\n');
     pLines.push('Holdings (12M = My_Portfolio engine forecast · 3M = plan-TP1 ROI, as the engine; the model 3M is shown, not used):\n' + (holdTxt || 'none'));
