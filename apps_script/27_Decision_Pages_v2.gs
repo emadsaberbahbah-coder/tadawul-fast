@@ -1,7 +1,13 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.6 (2026-10-20)
+ * Version: 1.2.7 (2026-10-20)
+ *   1.2.7: FOUR REVIEW FINDINGS. (a) The replay records every rule-exit EPISODE (hits / moms); an acknowledgement
+ *          covers the episodes up to its date and the earliest later episode latches again. (b) _DP2_Exit_State gains
+ *          column 22 'Latched exit' and the reader returns the signal text, so Acknowledge rule exit records the real
+ *          exit date (never today). (c) dp2Allocate_ runs the engine's lot-rounding top-up pass (conviction order,
+ *          within the per-seat cap) before totals and funding plans. (d) The capital-call action sums the SEQUENTIAL
+ *          shortfalls of the plan list (cash left counted once), not the independent per-need shorts.
  *   1.2.6: THREE REVIEW FINDINGS — the engine's funding-need semantics exactly. (a) A need is the MINIMUM TICKET and
  *          arises only for a capital-exhausted seat (whole cohort unfunded, or a sub-floor ticket from the cash left);
  *          a seat released while other seats kept a target is a deferral (RELEASED), never a rotation target.
@@ -122,7 +128,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.6';
+var DP2_VERSION = '1.2.7';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1082,10 +1088,14 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
   if (a0 === null || !(a0 > 0)) return null;
   var s0 = entry - DP2X.ATR_MULT_STOP * a0, R = entry - s0;
   var stop = s0, hi = bars[e].c, a = a0, gainR = 0, trailMult = DP2X.ATR_MULT_STOP, beLocked = false, mom = false, sma = null;
-  var firstHit = null, firstMom = null;
+  var firstHit = null, firstMom = null, hits = [], moms = [], prevHit = false, prevMom = false;
   for (i = e; i < bars.length; i++) {
     a = atr[i] !== null ? atr[i] : a0;
-    if (i > e && firstHit === null && bars[i].l <= stop) firstHit = { date: bars[i].date, stop: stop };
+    // v1.2.7: every trigger EPISODE is recorded (a bar where the condition holds after a bar where it did not), so an
+    // exit that re-arms after an acknowledged one can latch again; firstHit / firstMom stay the first episodes.
+    var hitNow = (i > e && bars[i].l <= stop);
+    if (hitNow && !prevHit) hits.push({ date: bars[i].date, stop: stop });
+    prevHit = hitNow;
     if (bars[i].c > hi) hi = bars[i].c;
     gainR = R > 0 ? (hi - entry) / R : 0;
     trailMult = gainR >= DP2X.TIGHTEN_R ? DP2X.TRAIL_MULT_TIGHT : DP2X.ATR_MULT_STOP;
@@ -1094,13 +1104,15 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
     if (beLocked) stop = Math.max(stop, entry + DP2X.BREAKEVEN_ATR * a);
     sma = dp2Sma_(bars, i, DP2X.MOMENTUM_SMA);
     mom = bars[i].c > entry && sma !== null && bars[i].c < sma && (hi - bars[i].c) >= DP2X.MOM_GIVEBACK_ATR * a && gainR >= DP2X.MOM_MIN_R;
-    if (mom && firstMom === null) firstMom = { date: bars[i].date, price: bars[i].c };
+    if (mom && !prevMom) moms.push({ date: bars[i].date, price: bars[i].c });
+    prevMom = mom;
   }
+  firstHit = hits.length ? hits[0] : null; firstMom = moms.length ? moms[0] : null;
   var lastBar = bars[bars.length - 1];
   var last = (lastOverride !== null && lastOverride !== undefined && lastOverride > 0) ? lastOverride : lastBar.c;
   return { entry: entry, entryBar: bars[e].date, atrEntry: a0, s0: s0, R: R, hi: hi, gainR: gainR, atr: a, sma: sma, stop: stop, trailMult: trailMult,
            beLocked: beLocked, momentum: mom, last: last, lastDate: lastBar.date, barsSinceEntry: bars.length - e, firstHit: firstHit, firstMom: firstMom,
-           lastR: R > 0 ? (last - entry) / R : null };
+           hits: hits, moms: moms, lastR: R > 0 ? (last - entry) / R : null };
 }
 /* Signal for a held lot. x = dp2ExitCompute_ result (or null), br = { tp, stop } working broker levels (null when none), fallbackLast.
  * alert = immediate e-mail (SELL NOW); advisory = at most one e-mail per cooldown (stop near / raise / missing broker stop). */
@@ -1126,21 +1138,32 @@ function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
   // v1.2.5 (review finding): a rule exit recorded by the replay (first stop touch / first profit-protection close since
   // entry) stays LATCHED while the lot is open — a recovery before the next build never silently reverts it to HOLD.
   // The owner can acknowledge a dated exit (menu: Acknowledge rule exit) to hold by decision; it is then shown, not alerted.
-  var trig = null;
-  if (x.firstMom && x.firstHit) trig = x.firstMom.date <= x.firstHit.date ? x.firstMom : x.firstHit; else trig = x.firstMom || x.firstHit || null;
-  if (trig && out.code !== 'STOP_HIT' && out.code !== 'SELL_NOW') {
-    var isMom = (trig.price !== undefined);
-    var trigTxt = trig.date + ' (' + (isMom ? 'profit protection, close ' + dp2Fmt_(trig.price, 2) : 'stop ' + dp2Fmt_(trig.stop, 2) + ' touched') + ')';
-    out.latched = { date: trig.date, kind: isMom ? 'momentum' : 'stop', price: isMom ? trig.price : trig.stop, text: trigTxt };
-    if (ackDate && String(ackDate) >= trig.date) { out.latchedAck = true; out.text += ' · rule exit ' + trig.date + ' acknowledged'; }
-    else { out.code = 'EXIT_LATCHED'; out.kind = 'red'; out.alert = true; out.advisory = false; out.text = 'SELL — rule exit ' + trigTxt + ' not acted · last ' + dp2Fmt_(last, 2); }
+  var episodes = [], ei;
+  var hitsArr = x.hits || (x.firstHit ? [x.firstHit] : []), momsArr = x.moms || (x.firstMom ? [x.firstMom] : []);
+  for (ei = 0; ei < hitsArr.length; ei++) episodes.push({ date: hitsArr[ei].date, kind: 'stop', price: hitsArr[ei].stop });
+  for (ei = 0; ei < momsArr.length; ei++) episodes.push({ date: momsArr[ei].date, kind: 'momentum', price: momsArr[ei].price });
+  episodes.sort(function (p1, p2) { return p1.date < p2.date ? -1 : (p1.date > p2.date ? 1 : (p1.kind < p2.kind ? -1 : 1)); });
+  if (episodes.length && out.code !== 'STOP_HIT' && out.code !== 'SELL_NOW') {
+    // v1.2.7: the acknowledgement covers every episode up to its date; the earliest episode AFTER it latches again
+    var ack = ackDate ? String(ackDate) : '';
+    var trig = null, covered = null;
+    for (ei = 0; ei < episodes.length; ei++) { if (ack && episodes[ei].date <= ack) covered = episodes[ei]; else if (!trig) trig = episodes[ei]; }
+    var fmtEp = function (ep) { return ep.date + ' (' + (ep.kind === 'momentum' ? 'profit protection, close ' + dp2Fmt_(ep.price, 2) : 'stop ' + dp2Fmt_(ep.price, 2) + ' touched') + ')'; };
+    if (trig) {
+      out.latched = { date: trig.date, kind: trig.kind, price: trig.price, text: fmtEp(trig), episodes: episodes.length };
+      out.code = 'EXIT_LATCHED'; out.kind = 'red'; out.alert = true; out.advisory = false;
+      out.text = 'SELL — rule exit ' + fmtEp(trig) + ' not acted' + (covered ? ' (after the acknowledged ' + covered.date + ' exit)' : '') + ' · last ' + dp2Fmt_(last, 2);
+    } else if (covered) {
+      out.latched = { date: covered.date, kind: covered.kind, price: covered.price, text: fmtEp(covered), episodes: episodes.length };
+      out.latchedAck = true; out.text += ' · rule exit ' + covered.date + ' acknowledged';
+    }
   }
   return out;
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
 /* ========================================================= dynamic exits (v1.1.0): state + alerts */
-var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)'];
+var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)', 'Latched exit'];   // v1.2.7: col 22 = the latched rule-exit date
 function dp2ExitStateRead_() {
   var sh = dp2Sheet_(DP2X.SHEET_STATE, false);
   var out = {};
@@ -1148,7 +1171,7 @@ function dp2ExitStateRead_() {
   var vals = sh.getRange(2, 1, sh.getLastRow() - 1, DP2X_STATE_HDR_.length).getValues();
   for (var i = 0; i < vals.length; i++) {
     var sym = dp2Str_(vals[i][0]).trim(); if (!sym) continue;
-    out[sym] = { signal: dp2Str_(vals[i][12]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0 };
+    out[sym] = { signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]) };
   }
   return out;
 }
@@ -1161,7 +1184,7 @@ function dp2ExitStateWrite_(rows) {
   if (rows.length) {
     sh.getRange(2, 5, rows.length, 1).setNumberFormat('@');
     sh.getRange(2, 15, rows.length, 1).setNumberFormat('@');
-    sh.getRange(2, 19, rows.length, 3).setNumberFormat('@');
+    sh.getRange(2, 19, rows.length, 4).setNumberFormat('@');
     sh.getRange(2, 1, rows.length, DP2X_STATE_HDR_.length).setValues(rows);
   }
   sh.setFrozenRows(1);
@@ -1204,7 +1227,7 @@ function dp2ExitAlerts_(items, fx) {
   }
   for (i = 0; i < items.length; i++) {
     var it2 = items[i], x = it2.x, s3 = states[it2.symbol];
-    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr]);
+    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr, (it2.sig.latched && !it2.sig.latchedAck) ? it2.sig.latched.date : '']);
   }
   try { dp2ExitStateWrite_(rows); } catch (e4) { result.error = (result.error ? result.error + ' · ' : '') + 'state: ' + String(e4 && e4.message || e4); }
   return result;
@@ -1307,7 +1330,7 @@ function dp2ExitAckSet_(symbol, date) {
 function dp2ExitAckLatched() {
   var ui = null; try { ui = SpreadsheetApp.getUi(); } catch (e) {}
   var st = dp2ExitStateRead_(), latched = [], k;
-  for (k in st) { if (st.hasOwnProperty(k) && st[k].signal === 'EXIT_LATCHED') { var dm = /rule exit (\d{4}-\d{2}-\d{2})/.exec(st[k].text || ''); latched.push({ symbol: k, date: dm ? dm[1] : '' }); } }
+  for (k in st) { if (st.hasOwnProperty(k) && st[k].signal === 'EXIT_LATCHED') { var dm = /rule exit (\d{4}-\d{2}-\d{2})/.exec(st[k].text || ''); latched.push({ symbol: k, date: st[k].latched || (dm ? dm[1] : '') }); } }
   var ack = dp2ExitAckMap_();
   var cur = Object.keys(ack).map(function (s2) { return s2 + ' (' + ack[s2] + ')'; }).join(', ') || 'none';
   if (!latched.length) {
@@ -1327,7 +1350,8 @@ function dp2ExitAckLatched() {
   var sym = dp2Str_(r.getResponseText()).trim().toUpperCase(); if (!sym) return null;
   var hit = null; for (var i = 0; i < latched.length; i++) if (latched[i].symbol.toUpperCase() === sym) hit = latched[i];
   if (!hit) { ui.alert('Decision Pages v2', sym + ' is not a latched exit on the last build.', ui.ButtonSet.OK); return null; }
-  dp2ExitAckSet_(hit.symbol, hit.date || dp2Today_());
+  if (!hit.date) { ui.alert('Decision Pages v2', hit.symbol + ': the latched exit has no date in _DP2_Exit_State — refresh Portfolio_Decision_v2 first, then acknowledge.', ui.ButtonSet.OK); return null; }
+  dp2ExitAckSet_(hit.symbol, hit.date);
   ui.alert('Decision Pages v2', hit.symbol + ': rule exit ' + (hit.date || '') + ' acknowledged — refresh Portfolio_Decision_v2 to see the advisory state.', ui.ButtonSet.OK);
   return hit.symbol;
 }
@@ -1464,16 +1488,31 @@ function dp2Allocate_(plans, cashSar, pvSar) {
       needs.push({ sym: p.sym, need: needSar, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
       rows.push(r); continue;
     }
-    r.qty = qty; r.alloc = qty * p.priceSar; r.state = 'FUNDED';
-    r.gain3 = p.roi3 !== null ? r.alloc * p.roi3 / 100 : null;
-    r.riskSar = p.stop0 !== null ? qty * (p.price - p.stop0) * p.fxUse : null;
-    allocated += r.alloc; if (r.gain3 !== null) gain3 += r.gain3; if (r.riskSar !== null) { riskSum += r.riskSar; riskKnown++; }
+    r.qty = qty; r.alloc = qty * p.priceSar; r.state = 'FUNDED'; r.plan = p;
     remaining -= r.alloc;
     rows.push(r);
   }
+  // v1.2.7 (review finding): the engine's lot-rounding TOP-UP pass — the cash left after whole-share rounding is spent
+  // on the funded seats in conviction order (weight desc, symbol tie-break), each within the per-seat cap.
+  var topup = 0;
+  if (remaining > 0) {
+    var funded = rows.filter(function (r0) { return r0.state === 'FUNDED'; }).sort(function (a1, b1) { return (b1.weight - a1.weight) || (a1.sym < b1.sym ? -1 : 1); });
+    for (i = 0; i < funded.length && remaining > 0; i++) {
+      var fr = funded[i], room = cap - fr.alloc; if (room <= 0) continue;
+      var addQty = Math.floor(Math.min(remaining, room) / fr.plan.priceSar); if (addQty <= 0) continue;
+      var addSar = addQty * fr.plan.priceSar;
+      fr.qty += addQty; fr.alloc += addSar; fr.topup = (fr.topup || 0) + addSar; remaining -= addSar; topup += addSar;
+    }
+  }
+  for (i = 0; i < rows.length; i++) {
+    var rr = rows[i]; if (rr.state !== 'FUNDED') continue;
+    rr.gain3 = rr.plan.roi3 !== null ? rr.alloc * rr.plan.roi3 / 100 : null;
+    rr.riskSar = rr.plan.stop0 !== null ? rr.qty * (rr.plan.price - rr.plan.stop0) * rr.plan.fxUse : null;
+    allocated += rr.alloc; if (rr.gain3 !== null) gain3 += rr.gain3; if (rr.riskSar !== null) { riskSum += rr.riskSar; riskKnown++; }
+  }
   var byRow = {}; for (i = 0; i < rows.length; i++) byRow[rows[i].sym] = rows[i];
   return { cash: cash, pv: pv, nav: nav, floorSar: floorSar, deployable: deployable, cap: cap, weights: weights, targets: targets, rows: rows, byRow: byRow,
-           allocated: allocated, cashAfter: cash - allocated, gain3: gain3, riskSar: riskKnown ? riskSum : null, riskKnown: riskKnown, needs: needs, plans: plans };
+           allocated: allocated, cashAfter: cash - allocated, gain3: gain3, riskSar: riskKnown ? riskSum : null, riskKnown: riskKnown, needs: needs, plans: plans, topup: topup, remaining: remaining };
 }
 /* Rotation candidates — mirror of _rotation_pick / _funding_plans. holdings: [{symbol, valueSar, roi12, roi3, holdingDays, tp1, price, isFI}].
  * basis '12m' uses engine 12M forecasts (production rule); '3m' uses the plan / expected 3M ROI (proposed TFB_OPP_ROTATION_BASIS=plan3m). */
@@ -1807,7 +1846,7 @@ function buildPortfolioDecisionV2() {
       actions.push({ p: 2, t: 'SWITCH (research): ' + rr0.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rr0.rotation.proceeds) + ' SAR to fund ' + rr0.sym + ' (' + (rot12 ? 'engine 12M ' : 'plan 3M ') + dp2PctPlain_(rr0.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rr0.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rr0.rotation.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% round-trip cost)' + (rot12 && rot3 ? '; the 3M basis agrees (edge +' + dp2Fmt_(rot3.rotation.edge, 1) + ' pp)' : (rot12 && !rot3 ? '; the 3M basis does not reach its ' + DP2A.ROT_EDGE_PP_3M + ' pp hurdle' : '')) + '. Research only — the engine issues the executable plan when the feed is released.' });
     } else if (alloc && alloc.needs.length && i === 0) {
       var anyRot = alloc.rotation12 || alloc.rotation3;
-      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle (' + DP2A.ROT_EDGE_PP_12M + ' pp engine 12M / ' + DP2A.ROT_EDGE_PP_3M + ' pp plan 3M after cost) → capital call ' + dp2Fmt_(alloc.needs.reduce(function (a, n) { return a + n.short; }, 0)) + ' SAR, or wait for cash.' });
+      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle (' + DP2A.ROT_EDGE_PP_12M + ' pp engine 12M / ' + DP2A.ROT_EDGE_PP_3M + ' pp plan 3M after cost) → capital call ' + dp2Fmt_((alloc.plans12 || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
     }
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
@@ -2111,7 +2150,7 @@ function buildTop10V2() {
       ['Deployable', dp2Fmt_(alloc.deployable) + ' SAR', DP2C.green],
       ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + deployable)', dp2Fmt_(alloc.cap) + ' SAR'],
       ['Plans in the sizing cohort', alloc.plans.length + ' · ' + alloc.plans.map(function (p) { return p.sym + ' (' + (p.roiVal !== null ? dp2PctPlain_(p.roiVal, 1) + ' val' + (p.roiValSource === 'tp1x2' ? '≈' : '') : 'ROI n/a → ' + DP2A.REQUIRED_ROI_PCT + '%') + ')'; }).join(', ') + ' · weight = valuation ROI × risk × reliability (engine roi_pct) · caps ' + (function () { var c = dp2CohortCaps_(t); return c.maxSelected + ' seats / ' + c.maxPerSector + ' per sector / ' + c.maxPerMarket + ' per market (' + (c.fromPanel ? 'Top_10 panel' : 'defaults') + ')'; })()],
-      ['Allocated · cash after', dp2Fmt_(alloc.allocated) + ' SAR · ' + dp2Fmt_(alloc.cashAfter) + ' SAR left', alloc.allocated > 0 ? DP2C.green : DP2C.amber],
+      ['Allocated · cash after', dp2Fmt_(alloc.allocated) + ' SAR · ' + dp2Fmt_(alloc.cashAfter) + ' SAR left' + (alloc.topup ? ' · incl. lot-rounding top-up ' + dp2Fmt_(alloc.topup) + ' SAR (engine pass)' : ''), alloc.allocated > 0 ? DP2C.green : DP2C.amber],
       ['Expected gain, 3-month plan', dp2Signed_(alloc.gain3) + ' SAR', alloc.gain3 > 0 ? DP2C.green : DP2C.ink],
       ['Risk if every initial stop is hit', alloc.riskSar !== null ? dp2Signed_(-alloc.riskSar) + ' SAR' + (alloc.nav ? ' (' + dp2PctPlain_(alloc.riskSar / alloc.nav * 100, 2) + ' NAV)' : '') + (alloc.riskKnown < alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length ? ' · ' + alloc.riskKnown + ' of the funded seats have ATR' : '') : 'n/a — no price history for the seats yet', alloc.riskSar !== null ? DP2C.red : DP2C.ink2],
       ['Reward per riyal at risk (EV / risk)', evr !== null ? dp2Fmt_(evr, 2) + 'x' : 'n/a', evr !== null && evr >= 1.5 ? DP2C.green : DP2C.amber],
