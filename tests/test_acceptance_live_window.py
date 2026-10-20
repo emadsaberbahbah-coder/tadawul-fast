@@ -2,7 +2,9 @@
 """tests/test_acceptance_live_window.py
 scripts/tfb_acceptance.py v1.0.10: TFB_ACCEPTANCE_LIVE_WINDOW lets the LIVE
 reader give the decision-integrity checks A1, A2a and A3 the rows and columns
-they parse (default off = the v1.0.9 reads).
+they parse (default off = the v1.0.9 reads). v1.0.11 (Codex P2 on #808): with
+the gate on, A2a also reads the committed hidden _T10_Candidates grid when
+DT10_CAND_TAB=enforce has moved the audit there (W7).
 
 The defect (run 39420446126, 2026-10-20 12:12Z): A1 'Top_10 board section not
 found', A2a 'Top_10 audit section not found', A3-<page> 'Symbol/Name columns
@@ -23,6 +25,11 @@ trailing empty cells and rows. Fixtures are synthetic.
   W5 on: a failed window read is recorded in .errors (fail-closed)
   W6 the export / in-memory sources ignore the gate, and the live window
      measures exactly what the export path measures on the same grid
+  W7 v1.0.11, on, DT10_CAND_TAB=enforce layout (Codex P2 on #808): the cockpit audit is
+     one pointer line and the grid sits in the hidden _T10_Candidates (row 1
+     stamp + receipt, row 2 headers, rows 3..). A COMMITTED receipt with the
+     same row count is read; PENDING, a row-count mismatch or a missing tab
+     stay NA (a missing tab is recorded); the export path agrees
   N1 [needs TFB_TEST_ACC_BASE] off (unset and 8 non-truthy spellings): every
      check row and the worksheet call log equal the v1.0.9 base copy's
   N2 [needs TFB_TEST_ACC_BASE] golden negative: the base copy leaves A1, A2a
@@ -37,7 +44,8 @@ Offline: no network, no credentials, no live Sheet.
 
 Run: pytest -q tests/test_acceptance_live_window.py
   or python3 tests/test_acceptance_live_window.py   (PASS k/k + digest)
-  TFB_TEST_ACC_BASE=<git show aa1f440c:scripts/tfb_acceptance.py> for N1/N2."""
+  TFB_TEST_ACC_BASE=<git show aa1f440c:scripts/tfb_acceptance.py> (v1.0.9) for N1/N2;
+  TFB_TEST_ACC_DELIVERED=<git show 97fa9915:...> (v1.0.10) fails W7 only."""
 from __future__ import annotations
 
 import contextlib
@@ -210,7 +218,22 @@ def _pad(row, n):
     return list(row) + [""] * (n - len(row))
 
 
-def top10_grid(seats, usd_fx, n_audit=400):
+def _audit_rows(usd_fx, n_audit):
+    out = []
+    for i in range(n_audit):
+        if i % 5 == 0:
+            out.append([f"{2000 + i}.SR", f"Saudi {i}", "TADAWUL", "Fin", "SAR", "20.00", "20.00", "8.0"])
+        else:
+            px = 5.0 + i * 0.37
+            out.append([f"S{i}.US", f"US Co {i}", "NYSE", "Tech", "USD", f"{px:.2f}", f"{px * usd_fx:.2f}", "9.0"])
+    return out
+
+
+POINTER = ("Full audit (400 rows) written to hidden tab _T10_Candidates " + EM +
+           " route v4.16.0 | builder v1.27.0 " + EM + " View \u25b8 Hidden sheets to open")
+
+
+def top10_grid(seats, usd_fx, n_audit=400, relocated=False):
     W = len(BOARD_HDR)
     g = [[""] * W for _ in range(60 + 2 + n_audit + 40)]
 
@@ -241,14 +264,30 @@ def top10_grid(seats, usd_fx, n_audit=400):
     put(34, ["MSFT.US", "rel", "60", "65", "NEAR", "raise rel"])
     put(60, ["CANDIDATES " + EM + " FULL AUDIT " + EM + " top 500 rows written"])
     put(61, AUDIT_HDR)
-    for i in range(n_audit):
-        if i % 5 == 0:
-            row = [f"{2000 + i}.SR", f"Saudi {i}", "TADAWUL", "Fin", "SAR", "20.00", "20.00", "8.0"]
-        else:
-            px = 5.0 + i * 0.37
-            row = [f"S{i}.US", f"US Co {i}", "NYSE", "Tech", "USD", f"{px:.2f}", f"{px * usd_fx:.2f}", "9.0"]
+    if relocated:                      # DT10_CAND_TAB=enforce: header + one pointer line
+        put(62, [POINTER])
+        put(64, ["route v4.16.0 | builder v1.27.0"])
+        return g
+    for i, row in enumerate(_audit_rows(usd_fx, n_audit)):
         put(62 + i, row)
     return g
+
+
+def cand_tab_grid(usd_fx, n_audit=400, state="COMMITTED", rows=None):
+    W = len(AUDIT_HDR)
+    receipt = json.dumps({"state": state, "run_id": "req-1", "rows": n_audit if rows is None else rows,
+                          "cols": W, "checksum": "x"})
+    g = [_pad(["run 2026-10-20T11:50:00.000Z | route v4.16.0 | rows %d | DT10 v1.13.10" % n_audit, receipt], W),
+         list(AUDIT_HDR)]
+    return g + [_pad(r, W) for r in _audit_rows(usd_fx, n_audit)]
+
+
+def tabs_relocated(**kw):
+    t = tabs_good()
+    t["Top_10_Investments"] = top10_grid([("1120.SR", "SAR"), ("AAPL.US", "USD"), ("7203.T", "JPY"),
+                                          ("SAP.DE", "EUR")], 3.7505, relocated=True)
+    t["_T10_Candidates"] = cand_tab_grid(3.7505, **kw)
+    return t
 
 
 def page_grid(rows):
@@ -368,11 +407,12 @@ def test_w5_on_a_failed_window_read_is_recorded():
 
 
 def _write_export(tabs, d):
+    """Browser TSV exports write cell text raw (no quoting, no escaping)."""
     for name, grid in tabs.items():
         with open(os.path.join(d, f"TFB_-_{name}.tsv"), "w", encoding="utf-8", newline="") as fh:
-            w = csv.writer(fh, delimiter="\t", quoting=csv.QUOTE_NONE, escapechar="\\", lineterminator="\n")
             for r in grid:
-                w.writerow(r)
+                assert not any(("\t" in str(c)) or ("\n" in str(c)) for c in r)
+                fh.write("\t".join(str(c) for c in r) + "\n")
 
 
 def test_w6_export_and_memory_sources_ignore_the_gate_and_match_the_live_window(tmp_path):
@@ -393,12 +433,38 @@ def test_w6_export_and_memory_sources_ignore_the_gate_and_match_the_live_window(
             assert lv[k] == e_on[k] == mem[k], (k, lv[k], e_on[k], mem[k])
 
 
+def test_w7_on_reads_the_committed_relocated_audit(tmp_path):
+    mod = m()
+    on, src = run_live(mod, tabs_relocated(), "1")
+    assert on["A2a"][0] == "PASS" and abs(on["A2a"][1] - 3.75) < 0.002 and "n=320" in on["A2a"][2], on["A2a"]
+    assert ("worksheet", "_T10_Candidates") in src.book.log
+    assert not [e for e in src.errors if "_T10_Candidates" in e], src.errors
+    off, osrc = run_live(mod, tabs_relocated(), None)
+    assert off["A2a"][0] == "NA" and "audit section not found" in off["A2a"][2], off["A2a"]   # v1.0.9
+    assert ("worksheet", "_T10_Candidates") not in osrc.book.log
+    for kw in ({"state": "PENDING"}, {"rows": 399}):
+        r, _s = run_live(mod, tabs_relocated(**kw), "1")
+        assert r["A2a"][0] == "NA" and "USD rows with both prices: 0" in r["A2a"][2], (kw, r["A2a"])
+    gone = tabs_relocated()
+    del gone["_T10_Candidates"]
+    r, gsrc = run_live(mod, gone, "1")
+    assert r["A2a"][0] == "NA" and any("_T10_Candidates unreadable" in e for e in gsrc.errors), gsrc.errors
+    assert {k: on[k] for k in on if k not in A_IDS} == {k: off[k] for k in off if k not in A_IDS}
+    _write_export(tabs_relocated(), str(tmp_path))
+    with gate("1"):
+        e_on = rows_of(mod, mod.ExportSource(str(tmp_path)))
+    with gate(None):
+        e_off = rows_of(mod, mod.ExportSource(str(tmp_path)))
+    assert e_on["A2a"] == on["A2a"], (e_on["A2a"], on["A2a"])
+    assert e_off["A2a"][0] == "NA" and "USD rows with both prices: 0" in e_off["A2a"][2], e_off["A2a"]
+
+
 OFF_SPELLINGS = (None, "", "0", "off", "false", "no", "2", "enabled")
 
 
 def test_n1_off_is_byte_identical_to_v1_0_9():
     _need_base()
-    for tabs in (tabs_good(), tabs_bad()):
+    for tabs in (tabs_good(), tabs_bad(), tabs_relocated()):
         b_rows, b_src = run_live(b(), tabs, None)
         for v in OFF_SPELLINGS:
             d_rows, d_src = run_live(m(), tabs, v)
@@ -416,6 +482,8 @@ def test_n2_golden_negative_base_never_measures_the_live_window():
     assert "Symbol/Name columns not found" in res["A3-Global_Markets"][2]
     with pytest.raises(AssertionError):
         _assert_w1(res)
+    rel, _r = run_live(b(), tabs_relocated(), "1")
+    assert rel["A2a"][0] == "NA", rel["A2a"]
 
 
 def test_n3_spellings_version_and_workflow_mapping():
@@ -450,7 +518,8 @@ def test_n5_added_lines_are_ascii():
         added = [ln for ln in lines if ln not in base]
         assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()]
     else:
-        marks = ("v1.0.10", "LIVE_WINDOW", "integrity_tab", "integrity window", "_T10_WIDE_COLS", "_A3_COLS")
+        marks = ("v1.0.10", "LIVE_WINDOW", "integrity_tab", "integrity window", "_T10_WIDE_COLS", "_A3_COLS",
+                 "_cand_tab", "_CAND_TAB")
         picked = [ln for ln in lines if any(k in ln for k in marks)]
         assert len(picked) >= 10 and all(ln.isascii() for ln in picked), [ln for ln in picked if not ln.isascii()]
 
@@ -486,7 +555,7 @@ def test_g1_real_export_grid_live_window_equals_the_export_path():
 
 def _digest():
     parts = []
-    for tabs in (tabs_good(), tabs_bad()):
+    for tabs in (tabs_good(), tabs_bad(), tabs_relocated()):
         for v in (None, "1"):
             res, src = run_live(m(), tabs, v)
             keep = {k: res[k] for k in res if not k.startswith(("G1-", "D10-2b"))}   # clock-bound evidence
