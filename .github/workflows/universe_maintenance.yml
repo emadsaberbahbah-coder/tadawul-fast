@@ -1,0 +1,223 @@
+# =============================================================================
+# Universe Maintenance - .github/workflows/universe_maintenance.yml
+# =============================================================================
+# VERSION 1.0.0 (2026-10-20) -- NEW WORKFLOW
+#
+# WHY: owner request of 20 Oct 2026. Global_Markets was maintained by hand (the
+# 18 Oct Top-200 additions and 196-row retirement lists): dead tickers stayed on
+# the page and new important companies arrived only when someone remembered.
+# The owner asked for automatic additions with the US market first, and for
+# unread rows to be flagged red (27_Decision_Pages_v2 v1.2.24) and removed once
+# confirmed dead.
+# WHAT: scripts/universe_maintenance.py v1.0.0 (rules in its docstring), twice a
+# day. The second slot is a backstop: the scheduler fires this repository's
+# crons 3-7 h late, and a run is skipped while a Daily Sync is queued or in
+# progress. The watch counts at most one red day per weekday; additions run
+# once per week (from Sunday, Riyadh), at most 25.
+# ARMING - repository Variable TFB_UNIVERSE_MAINT:
+#   unset / off  the job stops in its first step; nothing is read or written.
+#   observe      writes only _Universe_Watch, _Universe_Report and one _Run_Log
+#                row; the report lists what enforce would add and retire.
+#   enforce      also appends the additions to Global_Markets column A and the
+#                retirements to _Retired_Symbols. Retired rows leave the page
+#                only when the sync's TFB_SYNC_RETIRE_TAB is enforce.
+# A manual run can choose observe or off for that run; enforce comes only from
+# the Variable.
+# ROLLBACK: set TFB_UNIVERSE_MAINT to off (or delete it).
+# SECRETS: GOOGLE_SHEETS_CREDENTIALS (or _B64) and EODHD_API_KEY, the same
+# repository secrets Calendar Sync uses. Workflow file only: no Render, Apps
+# Script or gate change.
+# =============================================================================
+name: 🧭 Universe Maintenance
+
+on:
+  schedule:
+    - cron: "41 6 * * *"    # 09:41 Riyadh
+    - cron: "41 17 * * *"   # 20:41 Riyadh - backstop
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "inherit = the repository Variable; observe or off = this run only (enforce only via the Variable)"
+        required: false
+        default: "inherit"
+        type: choice
+        options: ["inherit", "observe", "off"]
+      force_add:
+        description: "Run the weekly additions on this run"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: tfb-universe-maintenance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # the in-flight Daily Sync check reads the Actions API
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  universe-maintenance:
+    name: 🧭 Watch · retire · add (Global_Markets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+      VAR_MODE: ${{ vars.TFB_UNIVERSE_MAINT || 'off' }}
+      INPUT_MODE: ${{ inputs.mode }}
+      INPUT_FORCE_ADD: ${{ inputs.force_add }}
+    steps:
+      - name: 🔎 Resolve mode
+        id: mode
+        run: |
+          set -euo pipefail
+          mode="$(printf '%s' "${VAR_MODE:-off}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$mode" in
+            off|observe|enforce) ;;
+            *) echo "::warning::TFB_UNIVERSE_MAINT is not off, observe or enforce - treated as off."; mode="off" ;;
+          esac
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            case "${INPUT_MODE:-inherit}" in
+              inherit|"") ;;
+              observe) mode="observe" ;;
+              off) mode="off" ;;
+              *) echo "::error::Unsupported mode input."; exit 1 ;;
+            esac
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [[ "$mode" == "off" ]]; then
+            echo "::notice::Universe maintenance is off (repository Variable TFB_UNIVERSE_MAINT unset or off) - nothing read or written."
+          else
+            echo "Universe maintenance mode: $mode"
+          fi
+
+      - name: 📥 Checkout
+        if: steps.mode.outputs.mode != 'off'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🐍 Set up Python
+        if: steps.mode.outputs.mode != 'off'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # Pinned - keep in step with requirements.txt on main.
+      - name: 📦 Install dependencies
+        if: steps.mode.outputs.mode != 'off'
+        run: pip install --quiet "gspread==6.2.1" "google-auth==2.49.2"
+
+      - name: 🧪 Self-test
+        if: steps.mode.outputs.mode != 'off'
+        run: python scripts/universe_maintenance.py --selftest
+
+      - name: 🚦 Skip while a Daily Sync is in flight
+        id: overlap
+        if: steps.mode.outputs.mode != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The sync rewrites Global_Markets; this job reads it and, under
+          # enforce, appends to it. Only schedule / workflow_dispatch runs of
+          # daily_sync.yml write the workbook (push and pull_request runs are
+          # its CI jobs). Fail-CLOSED: if the Actions API cannot be read, skip;
+          # a skipped run costs one watch day at most and the next slot retries.
+          # The script repeats this check right before its enforce writes.
+          # NOT the shared 'tadawul-production-write-<ref>' group on purpose:
+          # GitHub keeps one PENDING run per group and a newly queued member
+          # cancels it, so this job could evict a queued Daily Sync (the hazard
+          # recorded in track_performance.yml, 2026-10-06).
+          RUNNING="$(curl -sS --max-time 25 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?per_page=30" \
+            | jq -r '[.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | select(.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "pending" or .status == "requested")] | length' 2>/dev/null || echo "ERR")"
+          if [[ ! "${RUNNING:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Could not read the Daily Sync state - skipping this run (fail-closed); the next slot retries."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$RUNNING" -gt 0 ]]; then
+            echo "::notice::${RUNNING} Daily Sync run(s) queued or in progress - skipping this run; the next slot retries."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "No Daily Sync in flight."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: 🔐 Materialize Google credentials
+        if: steps.mode.outputs.mode != 'off' && steps.overlap.outputs.skip == 'false'
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          # The JSON secret may hold the JSON itself or base64(JSON); never echoed.
+          trimmed="${SECRET_CREDS:-}"
+          trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+          if [[ -n "$trimmed" && "${trimmed:0:1}" == "{" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "$trimmed" ]]; then
+            printf '%s' "$SECRET_CREDS" | base64 -d > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present (GOOGLE_SHEETS_CREDENTIALS or GOOGLE_SHEETS_CREDENTIALS_B64)."
+            exit 1
+          fi
+          chmod 600 "$CREDS_PATH"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: 🧭 Run universe maintenance
+        if: steps.mode.outputs.mode != 'off' && steps.overlap.outputs.skip == 'false'
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          TFB_UNIVERSE_MAINT: ${{ steps.mode.outputs.mode }}
+          # enforce re-checks the Daily Sync state right before its writes (Actions API, read-only)
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          EODHD_BASE_URL: ${{ vars.EODHD_BASE_URL }}
+          # Same tab and mode the sync's retirement seam reads (daily_sync.yml).
+          TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
+          TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
+          # Optional tuning; empty = the script defaults (25 / SUN / 0 / 10 / 25).
+          TFB_UNIVERSE_ADD_MAX: ${{ vars.TFB_UNIVERSE_ADD_MAX }}
+          TFB_UNIVERSE_ADD_WEEKDAY: ${{ vars.TFB_UNIVERSE_ADD_WEEKDAY }}
+          TFB_UNIVERSE_ADD_FOREIGN: ${{ vars.TFB_UNIVERSE_ADD_FOREIGN }}
+          TFB_UNIVERSE_RED_DAYS: ${{ vars.TFB_UNIVERSE_RED_DAYS }}
+          TFB_UNIVERSE_RETIRE_MAX: ${{ vars.TFB_UNIVERSE_RETIRE_MAX }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEFAULT_SPREADSHEET_ID:-}" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          if [[ -z "${EODHD_API_KEY:-}" ]]; then
+            echo "::error::EODHD_API_KEY secret not set."
+            exit 1
+          fi
+          args=(--json-out universe_maintenance.json)
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${INPUT_FORCE_ADD:-false}" == "true" ]]; then
+            args+=(--force-add)
+          fi
+          python scripts/universe_maintenance.py "${args[@]}"
+
+      - name: 📦 Upload run report
+        if: always() && steps.mode.outputs.mode != 'off' && steps.overlap.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: universe-maintenance-${{ github.run_id }}
+          path: universe_maintenance.json
+          retention-days: 14
+          if-no-files-found: warn
