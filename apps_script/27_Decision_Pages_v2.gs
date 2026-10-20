@@ -1,7 +1,15 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.5 (2026-10-20)
+ * Version: 1.2.6 (2026-10-20)
+ *   1.2.6: THREE REVIEW FINDINGS — the engine's funding-need semantics exactly. (a) A need is the MINIMUM TICKET and
+ *          arises only for a capital-exhausted seat (whole cohort unfunded, or a sub-floor ticket from the cash left);
+ *          a seat released while other seats kept a target is a deferral (RELEASED), never a rotation target.
+ *          (Backend v1.27.2 in the same PR makes conviction mode treat a whole-cohort release as capital exhaustion
+ *          too — before it recorded no need at all with zero cash.) (b) FUNDABLE NOW only when the cash left covers
+ *          the whole need; a partial amount is a shortfall for the rotation / capital-call path. (c) The holding's
+ *          plan TP1 for the 3% proximity guard comes from the cockpit row (TP1 SAR, else price × (1 + ROI % (TP1))),
+ *          independent of broker-order freshness; the broker TP1 is the fallback.
  *   1.2.5: THREE REVIEW FINDINGS. (a) Rule exits LATCH: the first stop touch / profit-protection close since entry
  *          recorded by the replay keeps the lot on 'SELL — rule exit <date> not acted' (EXIT_LATCHED, alerting) until
  *          it is sold or the owner acknowledges it (menu: Acknowledge rule exit → Script Property DP2_EXIT_ACK); a
@@ -114,7 +122,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.5';
+var DP2_VERSION = '1.2.6';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1429,23 +1437,31 @@ function dp2Allocate_(plans, cashSar, pvSar) {
   for (i = 0; i < plans.length; i++) { p = plans[i]; if (p.priceSar) weights[p.sym] = dp2ConvWeight_(p.roiVal, p.risk, p.rel); }   // v1.2.4: valuation ROI, as the engine
   var targets = dp2WaterFill_(weights, deployable, cap, DP2A.MIN_TICKET_SAR);
   var rows = [], allocated = 0, gain3 = 0, riskSum = 0, riskKnown = 0, remaining = deployable, needs = [];
-  // rank order: cash covers targets top-down (the engine's greedy ledger); the rest become funding needs
+  var anyTarget = false; for (var tk in targets) if (targets.hasOwnProperty(tk)) anyTarget = true;
+  // rank order: cash covers targets top-down (the engine's greedy ledger). v1.2.6 — the engine's NEED semantics
+  // (_select_and_size / _LAST_FUNDING_NEEDS): a need is the MINIMUM TICKET (not a full seat) and arises only for a
+  // capital-exhausted seat — the whole cohort unfunded (no target anywhere) or the rank-ordered cash leaving a
+  // sub-floor ticket; a seat released while OTHER seats kept a target is a deferral (budget re-spread), never a need.
+  var needSar = DP2A.MIN_TICKET_SAR;
   for (i = 0; i < plans.length; i++) {
     p = plans[i];
     var target = targets.hasOwnProperty(p.sym) ? targets[p.sym] : 0;
     var r = { sym: p.sym, weight: weights[p.sym] || 0, target: target, qty: 0, alloc: 0, gain3: null, riskSar: null, state: '', note: '' };
     if (!p.priceSar) { r.state = 'NO_FX'; r.note = 'no FX→SAR for ' + p.ccy; rows.push(r); continue; }
     if (target <= 0) {
-      // released by the water-fill (its share fell below the minimum ticket) or no deployable cash at all → a need
-      r.state = 'NEED'; r.need = cap; r.short = Math.max(0, cap - remaining); r.note = deployable < DP2A.MIN_TICKET_SAR ? 'no deployable cash' : 'share below the minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR';
-      needs.push({ sym: p.sym, need: cap, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
+      if (anyTarget) {
+        r.state = 'RELEASED'; r.note = 'conviction sizing: weighted share below the minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR — budget released to higher-conviction seats (deferred, no funding need — as the engine)';
+        rows.push(r); continue;
+      }
+      r.state = 'NEED'; r.need = needSar; r.short = Math.max(0, needSar - remaining); r.note = 'capital exhausted — deployable ' + dp2Fmt_(deployable) + ' SAR below one minimum ticket';
+      needs.push({ sym: p.sym, need: needSar, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
       rows.push(r); continue;
     }
     var fundable = Math.min(target, remaining);
     var qty = Math.floor(fundable / p.priceSar);
     if (qty * p.priceSar < DP2A.MIN_TICKET_SAR - 1e-9) {
-      r.state = 'NEED'; r.need = cap; r.short = Math.max(0, cap - remaining); r.note = 'cash left ' + dp2Fmt_(remaining) + ' SAR below the minimum ticket';
-      needs.push({ sym: p.sym, need: cap, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
+      r.state = 'NEED'; r.need = needSar; r.short = Math.max(0, needSar - remaining); r.note = 'cash left ' + dp2Fmt_(remaining) + ' SAR below the minimum ticket';
+      needs.push({ sym: p.sym, need: needSar, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
       rows.push(r); continue;
     }
     r.qty = qty; r.alloc = qty * p.priceSar; r.state = 'FUNDED';
@@ -1490,11 +1506,12 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
     var n = needs[i], need = n.need || 0; if (need <= 0) continue;
     var opp = basis === '3m' ? n.roi3 : n.roi12;
     var plan = { sym: n.sym, need: need, short: 0, state: 'FUNDABLE_NOW', rotation: null, basis: basis, oppRoi: opp, why: n.why || '' };
-    if (avail >= Math.max(DP2A.MIN_TICKET_SAR, Math.min(need, avail))) {
-      // cash left covers at least a minimum ticket: fund from cash (ticket = min(need, cash left))
-      plan.ticket = Math.min(need, avail); avail -= plan.ticket; plans.push(plan); continue;
-    }
+    // v1.2.6 (review finding): FUNDABLE_NOW only when the cash left covers the WHOLE need (engine: short = need − avail;
+    // avail −= need); a partial amount is a shortfall that goes to the rotation / capital-call path, never a smaller ticket.
     var short = Math.max(0, need - avail);
+    var cashUsed = Math.min(avail, need);
+    avail = Math.max(0, avail - need);
+    if (short <= 0) { plan.ticket = need; plans.push(plan); continue; }
     plan.short = short;
     // v1.2.3 (review finding): the holding must cover the shortfall (the engine's floor guard passes the shortfall as
     // min_value_sar); a smaller eligible holding is reported as rotation-insufficient and the seat stays a capital call.
@@ -1505,13 +1522,14 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
       rot.action = proceeds >= rot.valueSar - 0.5 ? 'EXIT' : 'TRIM';
       if (rot.action === 'TRIM' && (rot.valueSar - proceeds) < DP2A.MIN_TICKET_SAR - 0.5) { rot.action = 'EXIT'; proceeds = rot.valueSar; rot.remnantExit = true; }
       rot.proceeds = proceeds;
-      plan.ticket = Math.min(need, proceeds + avail);
-      rot.surplus = Math.max(0, proceeds + avail - plan.ticket);
-      avail = Math.max(0, proceeds + avail - plan.ticket);
+      plan.ticket = Math.min(need, proceeds + cashUsed);
+      rot.surplus = Math.max(0, proceeds + cashUsed - plan.ticket);
+      avail = avail + rot.surplus;
       plan.rotation = rot; plan.short = Math.max(0, need - plan.ticket); plan.state = 'FUNDABLE_BY_ROTATION';
     } else {
       plan.state = 'CAPITAL_CALL';
       plan.ticket = 0;
+      plan.cashHeld = cashUsed;   // the cash left that this seat would have used stays reserved for it (engine: avail −= need)
       plan.rotationTaken = used;
       var ins = null;
       if (!used) { for (var k = 0; k < holdings.length; k++) { var h = holdings[k]; if (h.isFI || !h.valueSar) continue; var rr = basis === '3m' ? h.roi3 : h.roi12; if (rr === null || rr === undefined || opp === null) continue; var e = opp - rr - DP2A.ROT_COST_PCT; if (ins === null || e > ins.edge) ins = { symbol: h.symbol, edge: Math.round(e * 10) / 10, roi: rr }; } }
@@ -1527,10 +1545,10 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
 function dp2PlanText_(pl) {
   var b = pl.basis === '3m' ? 'plan 3M' : 'engine 12M';
   var hurdle = pl.basis === '3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M;
-  if (pl.state === 'FUNDABLE_NOW') return pl.sym + ' — FUNDABLE NOW from the cash left: ticket ' + dp2Fmt_(pl.ticket) + ' SAR' + (pl.why ? ' (' + pl.why + ')' : '');
+  if (pl.state === 'FUNDABLE_NOW') return pl.sym + ' — FUNDABLE NOW from the cash left: ticket ' + dp2Fmt_(pl.ticket) + ' SAR (the minimum ticket, as the engine)' + (pl.why ? ' (' + pl.why + ')' : '');
   if (pl.state === 'FUNDABLE_BY_ROTATION') {
     var r = pl.rotation;
-    return pl.sym + ' — FUNDABLE BY ROTATION: ' + r.action.toLowerCase() + ' ' + r.symbol + ' (' + dp2Fmt_(r.proceeds) + ' SAR) → ticket ' + dp2Fmt_(pl.ticket) + ' SAR · ' + b + ': ' + pl.sym + ' ' + dp2PctPlain_(pl.oppRoi, 1) + ' vs ' + r.symbol + ' ' + dp2PctPlain_(r.roi, 1) + ' → edge +' + dp2Fmt_(r.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost (hurdle ' + hurdle + ')' +
+    return pl.sym + ' — FUNDABLE BY ROTATION: ' + r.action.toLowerCase() + ' ' + r.symbol + ' (' + dp2Fmt_(r.proceeds) + ' SAR' + (pl.cashHeld || (pl.ticket - r.proceeds) > 0.5 ? ' + ' + dp2Fmt_(pl.ticket - r.proceeds) + ' SAR cash left' : '') + ') → ticket ' + dp2Fmt_(pl.ticket) + ' SAR (minimum ticket) · ' + b + ': ' + pl.sym + ' ' + dp2PctPlain_(pl.oppRoi, 1) + ' vs ' + r.symbol + ' ' + dp2PctPlain_(r.roi, 1) + ' → edge +' + dp2Fmt_(r.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost (hurdle ' + hurdle + ')' +
       (pl.short > 0 ? '; a full seat would need ' + dp2Fmt_(pl.short) + ' SAR more' : '') + (r.remnantExit ? ' (a trim would leave a sub-floor remnant → full exit' + (r.surplus ? ', surplus ' + dp2Fmt_(r.surplus) + ' SAR to cash' : '') + ')' : '');
   }
   if (pl.state === 'CAPITAL_CALL') return pl.sym + ' — CAPITAL CALL: ' + (pl.rotationTaken ? 'no cash left and this run\'s single rotation is already assigned (one switch per run, as in the engine)' : (pl.rotationInsufficient ? pl.rotationInsufficient.symbol + ' clears the hurdle (edge +' + dp2Fmt_(pl.rotationInsufficient.edge, 1) + ' pp, ' + b + ') but is worth ' + dp2Fmt_(pl.rotationInsufficient.covers) + ' SAR against a ' + dp2Fmt_(pl.rotationInsufficient.short) + ' SAR shortfall — rotation insufficient (floor guard), no sale advised' : 'no cash and no holding trails it by ≥ ' + hurdle + ' pp (' + b + ') after cost' + (pl.bestHolding ? ' — closest: ' + pl.bestHolding.symbol + ' ' + dp2PctPlain_(pl.bestHolding.roi, 1) + ' (edge ' + (pl.bestHolding.edge >= 0 ? '+' : '') + dp2Fmt_(pl.bestHolding.edge, 1) + ' pp)' : ''))) + '; a seat needs ' + dp2Fmt_(pl.need) + ' SAR';
@@ -1548,8 +1566,13 @@ function dp2RotationHoldings_(eq, fi, ib, qmap, seatMap) {
     // neither has no 3M figure and never rotates on that basis. The My_Portfolio model forecast is display-only.
     var row = (qmap && qmap[l.symbol]) || (seatMap && seatMap[l.symbol]) || null;
     var roi3 = row ? dp2Num_(row['ROI % (TP1)']) : null, roi3Src = roi3 !== null ? 'cockpit TP1' : '';
+    // v1.2.6 (review finding): the plan TP1 for the proximity guard comes from the cockpit row (TP1 SAR via the lot's
+    // FX, else price × (1 + ROI % (TP1))) independently of broker-order freshness; the working broker TP1 is the fallback.
+    var planTp1 = null;
+    if (row) { var tp1Sar = dp2Num_(row['TP1 SAR']); var lfx1 = l.fx || null; if (tp1Sar !== null && lfx1) planTp1 = tp1Sar / lfx1; else if (roi3 !== null && l.price) planTp1 = l.price * (1 + roi3 / 100); }
+    if (planTp1 === null) planTp1 = tp1;
     if (roi3 === null && tp1 && l.price) { roi3 = (tp1 / l.price - 1) * 100; roi3Src = 'broker TP1'; }
-    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: roi3, roi3Src: roi3Src, roi3Model: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: tp1, price: l.price, isFI: false });
+    out.push({ symbol: l.symbol, valueSar: l.mvSar || 0, roi12: dp2PctNum_(m.roi12m), roi3: roi3, roi3Src: roi3Src, roi3Model: dp2PctNum_(m.roi3m), holdingDays: l.holdingDays, tp1: planTp1, brokerTp1: tp1, price: l.price, isFI: false });
   }
   for (i = 0; i < fi.length; i++) out.push({ symbol: fi[i].symbol, valueSar: fi[i].mvSar || 0, roi12: null, roi3: null, holdingDays: fi[i].holdingDays, tp1: null, price: fi[i].price, isFI: true });
   return out;
@@ -2092,7 +2115,7 @@ function buildTop10V2() {
       ['Expected gain, 3-month plan', dp2Signed_(alloc.gain3) + ' SAR', alloc.gain3 > 0 ? DP2C.green : DP2C.ink],
       ['Risk if every initial stop is hit', alloc.riskSar !== null ? dp2Signed_(-alloc.riskSar) + ' SAR' + (alloc.nav ? ' (' + dp2PctPlain_(alloc.riskSar / alloc.nav * 100, 2) + ' NAV)' : '') + (alloc.riskKnown < alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length ? ' · ' + alloc.riskKnown + ' of the funded seats have ATR' : '') : 'n/a — no price history for the seats yet', alloc.riskSar !== null ? DP2C.red : DP2C.ink2],
       ['Reward per riyal at risk (EV / risk)', evr !== null ? dp2Fmt_(evr, 2) + 'x' : 'n/a', evr !== null && evr >= 1.5 ? DP2C.green : DP2C.amber],
-      ['Unfunded plans (needs)', alloc.needs.length ? alloc.needs.map(function (n) { return n.sym + ' ' + dp2Fmt_(n.need); }).join(' · ') : 'none']
+      ['Unfunded plans (needs = minimum ticket, as the engine)', alloc.needs.length ? alloc.needs.map(function (n) { return n.sym + ' ' + dp2Fmt_(n.need); }).join(' · ') + ' · a rotation funds the minimum executable ticket (raise TFB_OPP_MIN_TICKET_SAR for a larger switch)' : (alloc.rows.some(function (r) { return r.state === 'RELEASED'; }) ? 'none — ' + alloc.rows.filter(function (r) { return r.state === 'RELEASED'; }).map(function (r) { return r.sym; }).join(', ') + ' released by the floor rule (deferred, no need)' : 'none')]
     ];
     var a1 = dp2KV_(sh, aTop, 1, 8, aRows);
     var pLines = [];

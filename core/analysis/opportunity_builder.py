@@ -1558,7 +1558,29 @@ from typing import Optional
 #   the rotation_proposal alert (label). Removed: 0.
 #   Rollback: unset TFB_OPP_ROTATION_BASIS, or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.1"
+# -----------------------------------------------------------------------------
+# v1.27.2 (2026-10-20) — CONVICTION SIZING: AN EXHAUSTED BUDGET IS NOT A RELEASE
+# WHY: under TFB_OPP_SIZING_MODE=conviction, _conviction_targets returns {}
+#   when the deployable budget is zero (or below one minimum ticket), and
+#   _select_and_size then deferred EVERY cohort seat as "weighted share below
+#   the minimum ticket floor — budget released to higher-conviction seats" —
+#   a release that never happened. Those seats never reached `picked`, so the
+#   funding layer (v1.18.0) recorded no need: with no cash, conviction mode
+#   produced no capital call and never proposed a rotation, while cap mode
+#   produced three capital calls and the rotation. Found while mirroring the
+#   allocation on the Decision Pages v2 sheet (review of PR #803).
+# WHAT: when the cohort seat is not in the targets AND the targets are empty,
+#   the seat falls through as a 0-SAR pick (suggested 0, capital exhausted),
+#   exactly as cap mode does; the unfunded-pick path then records the need
+#   (minimum ticket) and _funding_plans can propose the rotation or report
+#   the capital call. A seat released while OTHER seats kept a target (the
+#   budget really was re-spread) is the same deferral as v1.27.0.
+# NOT CHANGED: cap mode (byte-identical), weights, water-filling, the cap,
+#   top-up, the research stage, gates, tickets, the rotation rule.
+#   Functions added: 0. Changed: _select_and_size (one branch). Removed: 0.
+#   Rollback: TFB_OPP_SIZING_MODE=cap (default), or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -6250,12 +6272,22 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             # v1.27.0: the seat's conviction target bounds its allocation;
             # a cohort seat released by the floor rule is a countable deferral.
             if cand["symbol"] in _sz_cohort and cand["symbol"] not in _sz_targets:
-                deferrals[cand["symbol"]] = (
-                    "Conviction sizing: weighted share below the minimum ticket floor "
-                    "\u2014 budget released to higher-conviction seats")
-                continue
-            suggested, shares = _size_one(cand, criteria, budget_base,
-                                          min(remaining, _sz_targets.get(cand["symbol"], 0.0)))
+                if _sz_targets:
+                    deferrals[cand["symbol"]] = (
+                        "Conviction sizing: weighted share below the minimum ticket floor "
+                        "\u2014 budget released to higher-conviction seats")
+                    continue
+                # v1.27.2: the WHOLE cohort came back unfunded — the budget is
+                # exhausted (or below one minimum ticket), not re-spread to a
+                # higher-conviction seat. That is capital exhaustion: fall
+                # through as a 0-SAR pick exactly as cap mode does, so the
+                # funding layer records the need (minimum ticket) and can
+                # propose a rotation or a capital call instead of a deferral
+                # that names a release which never happened.
+                suggested, shares = 0.0, 0
+            else:
+                suggested, shares = _size_one(cand, criteria, budget_base,
+                                              min(remaining, _sz_targets.get(cand["symbol"], 0.0)))
         else:
             suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the

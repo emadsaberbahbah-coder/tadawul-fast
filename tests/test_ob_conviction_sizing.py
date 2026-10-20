@@ -296,7 +296,7 @@ def test_s9_env_reads_are_in_the_fingerprinted_family():
                 names.add(str(node.args[0].value))
     assert {"TFB_OPP_SIZING_MODE", "TFB_OPP_SIZING_TILT"} <= names
     assert all(n.startswith(ob._BOARD_FUNDING_POLICY_PREFIXES) for n in ("TFB_OPP_SIZING_MODE", "TFB_OPP_SIZING_TILT"))
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.1"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
 
 
 if __name__ == "__main__":   # pragma: no cover
