@@ -89,6 +89,21 @@ def test_z3_budget_below_one_ticket_is_exhaustion(monkeypatch):
     assert p["kpis"]["capital_call"] == 3
 
 
+def test_z3b_cap_below_the_floor_with_cash_is_infeasible_not_exhaustion(monkeypatch):
+    """v1.27.3: 5,000 SAR cash, 15% cap (750 SAR), 2,000 SAR floor -> every target disappears, but cash is plentiful:
+    the seats are deferred as infeasible under the cap and NO need is recorded (no capital call, no rotation)."""
+    monkeypatch.setenv("TFB_OPP_SIZING_MODE", "conviction")
+    p = _build(5_000.0, max_weight_pct=15.0, min_ticket_sar=2_000.0)
+    assert p["selected"] == []
+    rows = _funding_rows(p)
+    assert set(rows) == {"ALPHA.SR", "BRAVO.SR", "CHARLIE.SR"}
+    assert all("infeasible under the cap" in t and "capital exhausted" not in t and RELEASED not in t for t in rows.values()), rows
+    assert p["kpis"]["capital_call"] == 0
+    # the same cash with a feasible cap funds normally
+    ok = _build(5_000.0, max_weight_pct=100.0, min_ticket_sar=2_000.0)
+    assert {t["symbol"] for t in ok["selected"]} and ok["kpis"]["capital_call"] == 0
+
+
 def test_z4_cap_mode_unchanged_on_zero_cash(monkeypatch):
     monkeypatch.setenv("TFB_OPP_SIZING_MODE", "cap")
     p = _build(0.0)
@@ -100,8 +115,8 @@ def test_z4_cap_mode_unchanged_on_zero_cash(monkeypatch):
 
 
 def test_z5_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
     tree = ast.parse((_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8"))
     pins = [n for n in ast.walk(tree) if isinstance(n, ast.Tuple) and len(n.elts) == 4
             and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "core.analysis.opportunity_builder"]
-    assert pins and pins[0].elts[2].value == "1.27.2"
+    assert pins and pins[0].elts[2].value == "1.27.3"

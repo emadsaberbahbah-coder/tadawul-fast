@@ -1580,7 +1580,21 @@ from typing import Optional
 #   Functions added: 0. Changed: _select_and_size (one branch). Removed: 0.
 #   Rollback: TFB_OPP_SIZING_MODE=cap (default), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.2"
+# -----------------------------------------------------------------------------
+# v1.27.3 (2026-10-20) — CONVICTION SIZING: CAP INFEASIBILITY IS NOT EXHAUSTION
+# WHY: v1.27.2 read EVERY all-empty water-fill as capital exhaustion. The
+#   targets are also empty when the per-seat cap (Max Weight % x budget) is
+#   below the minimum ticket while cash is plentiful (5,000 SAR cash, 15%
+#   cap = 750 SAR, 2,000 SAR floor); treating that as exhaustion would
+#   record needs for tickets the cap forbids (review of PR #803).
+# WHAT: when the cohort is empty, remaining > 0, remaining >= floor and
+#   cap < floor, every cohort seat is deferred "per-seat cap X below the
+#   minimum ticket floor Y — infeasible under the cap" and no need is
+#   recorded. Exhaustion (remaining == 0 or below one ticket) is unchanged
+#   from v1.27.2; cap mode is unchanged.
+#   Functions added: 0. Changed: _select_and_size (one guard). Removed: 0.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.3"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -6272,10 +6286,22 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             # v1.27.0: the seat's conviction target bounds its allocation;
             # a cohort seat released by the floor rule is a countable deferral.
             if cand["symbol"] in _sz_cohort and cand["symbol"] not in _sz_targets:
+                _sz_floor = float(criteria.get("min_ticket_sar", 0.0) or 0.0)
                 if _sz_targets:
                     deferrals[cand["symbol"]] = (
                         "Conviction sizing: weighted share below the minimum ticket floor "
                         "\u2014 budget released to higher-conviction seats")
+                    continue
+                if remaining > 0.0 and remaining >= _sz_floor and _sz_cap < _sz_floor:
+                    # v1.27.3: the whole cohort is empty because the per-seat
+                    # cap itself is below the minimum ticket while cash is
+                    # available — infeasible under the cap, NOT exhaustion;
+                    # no need is recorded (a 2,000 SAR ticket under a 750 SAR
+                    # cap is not something a rotation may fund).
+                    deferrals[cand["symbol"]] = (
+                        "Conviction sizing: per-seat cap " + _fmt_sar(_sz_cap) +
+                        " below the minimum ticket floor " + _fmt_sar(_sz_floor) +
+                        " \u2014 infeasible under the cap (raise Max Weight % or the cash)")
                     continue
                 # v1.27.2: the WHOLE cohort came back unfunded — the budget is
                 # exhausted (or below one minimum ticket), not re-spread to a

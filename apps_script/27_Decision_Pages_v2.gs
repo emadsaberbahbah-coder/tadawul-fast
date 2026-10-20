@@ -1,7 +1,11 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.7 (2026-10-20)
+ * Version: 1.2.8 (2026-10-20)
+ *   1.2.8: TWO REVIEW FINDINGS. (a) An empty cohort with cash available and a per-seat cap below the minimum ticket
+ *          is CAP_INFEASIBLE (deferred, no need) — never capital exhaustion (engine v1.27.3 does the same).
+ *          (b) dp2RotationPick_ no longer drops a holding smaller than the minimum ticket outright: eligibility
+ *          depends on the shortfall (R1) and a small holding exits in full under the remnant rule (R2), as the engine.
  *   1.2.7: FOUR REVIEW FINDINGS. (a) The replay records every rule-exit EPISODE (hits / moms); an acknowledgement
  *          covers the episodes up to its date and the earliest later episode latches again. (b) _DP2_Exit_State gains
  *          column 22 'Latched exit' and the reader returns the signal text, so Acknowledge rule exit records the real
@@ -128,7 +132,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.7';
+var DP2_VERSION = '1.2.8';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1477,6 +1481,12 @@ function dp2Allocate_(plans, cashSar, pvSar) {
         r.state = 'RELEASED'; r.note = 'conviction sizing: weighted share below the minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR — budget released to higher-conviction seats (deferred, no funding need — as the engine)';
         rows.push(r); continue;
       }
+      if (deployable > 0 && deployable >= DP2A.MIN_TICKET_SAR && cap < DP2A.MIN_TICKET_SAR) {
+        // v1.2.8 (review finding; engine v1.27.3): the cohort is empty because the per-seat cap itself is below the
+        // minimum ticket while cash is available — infeasible under the cap, not exhaustion; no need, no rotation.
+        r.state = 'CAP_INFEASIBLE'; r.note = 'per-seat cap ' + dp2Fmt_(cap) + ' SAR below the minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR — infeasible under the cap (raise Max Weight % or the cash); deferred, no funding need';
+        rows.push(r); continue;
+      }
       r.state = 'NEED'; r.need = needSar; r.short = Math.max(0, needSar - remaining); r.note = 'capital exhausted — deployable ' + dp2Fmt_(deployable) + ' SAR below one minimum ticket';
       needs.push({ sym: p.sym, need: needSar, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
       rows.push(r); continue;
@@ -1526,8 +1536,7 @@ function dp2RotationPick_(oppRoi, holdings, basis, minValue) {
     if (DP2A.ROT_EXCLUDE.indexOf(h.symbol) >= 0) continue;
     if (h.holdingDays !== null && h.holdingDays !== undefined && h.holdingDays < DP2A.ROT_MIN_HELD_DAYS) continue;
     if (h.tp1 && h.price && h.tp1 > 0) { var gap = (h.tp1 - h.price) / h.tp1 * 100; if (gap >= 0 && gap <= DP2A.ROT_TP1_PROX_PCT) continue; }
-    if (minValue && h.valueSar < minValue - 0.5) continue;
-    if (h.valueSar < DP2A.MIN_TICKET_SAR - 0.5) continue;
+    if (minValue && h.valueSar < minValue - 0.5) continue;   // v1.2.8: eligibility depends on the shortfall only (engine R1); the remnant rule (R2) handles a small holding
     var r = basis === '3m' ? h.roi3 : h.roi12;
     if (r === null || r === undefined) continue;
     var edge = oppRoi - r - DP2A.ROT_COST_PCT;
@@ -2107,6 +2116,7 @@ function buildTop10V2() {
     var flags = [];
     if (ar && ar.state === 'NEED') flags.push('UNFUNDED — need ' + dp2Fmt_(ar.need) + ' SAR, short ' + dp2Fmt_(ar.short) + ' → see FUNDING PLANS');
     if (ar && ar.state === 'RELEASED') flags.push('released: ' + ar.note);
+    if (ar && ar.state === 'CAP_INFEASIBLE') flags.push('cap-infeasible: ' + ar.note);
     if (ar && ar.state === 'NO_FX') flags.push(ar.note);
     if (!isPlan) flags.push('grace-held · not sized');
     var mearn = /earnings ≤\s?(\d+)d/.exec(note); if (mearn) flags.push('earnings ≤ ' + mearn[1] + ' d');
