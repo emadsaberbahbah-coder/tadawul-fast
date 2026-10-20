@@ -1,7 +1,14 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.22 (2026-10-20)
+ * Version: 1.2.23 (2026-10-20)
+ *   1.2.23: NO TIMEOUTS. (a) Every notice is non-blocking (dp2Notify_: a modeless dialog, a toast without a UI, always the
+ *          log) — Ui.alert waited for OK in the spreadsheet tab when a function ran from the script editor, until
+ *          'Exceeded maximum execution time'. (b) One run clock per execution: price-history downloads stop after
+ *          DP2X.FETCH_BUDGET_MS (2 min; every provider call is checked) and use the cached bars; 'Refresh both' skips
+ *          Top_10_v2 when Portfolio_Decision_v2 alone used DP2X.RUN_SOFT_LIMIT_MS (4.5 min). (c) Owner setup from the
+ *          📊 Decision v2 menu without dialogs: install the Decision Chain + IBKR capture watcher triggers (the files' own
+ *          helpers) and a read-only status checklist.
  *   1.2.22: FULL-WORKBOOK REVIEW (20 Oct export). (a) Cash: the cockpit's 'Entered cash (SAR)' KPI is the engine's
  *          kpis.deployable_sar (cash + proceeds less the absolute reserve), so it is no longer read as the cash — the
  *          cash is the panel input 'Cash Available (SAR)' (the per-seat cap's budget base and NAV move with it), and
@@ -219,7 +226,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.22';
+var DP2_VERSION = '1.2.23';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -282,6 +289,8 @@ var DP2X = {
   KEEP_BARS_MAX: 1300,
   ATR_WARMUP_BARS: 14,     // bars wanted BEFORE the entry so the initial ATR is the entry-date ATR
   FETCH_SLEEP_MS: 200,
+  FETCH_BUDGET_MS: 120000,   // v1.2.23: price-history downloads stop after 2 min per execution; the rest use the cached bars
+  RUN_SOFT_LIMIT_MS: 270000, // v1.2.23: 'Refresh both' skips Top_10_v2 when Portfolio_Decision_v2 alone took 4.5 min (limit 6 min)
   PROP_ALERTS: 'DP2_EXIT_ALERTS',
   PROP_ALERT_TO: 'DP2_EXIT_ALERT_TO',
   PROP_HISTORY_URL: 'DP2_HISTORY_URL',
@@ -313,6 +322,29 @@ var DP2A = {
 /* GOOGLEFINANCE exchange prefixes by TFB venue suffix (sparklines only). Unknown venues fall back to the bare ticker inside IFERROR. */
 var DP2_GF_EXCH_ = { L: 'LON', SR: 'TADAWUL', HK: 'HKG', T: 'TYO', PA: 'EPA', AS: 'AMS', BR: 'EBR', DE: 'ETR', MI: 'BIT', MC: 'BME', LS: 'ELI', VI: 'VIE', SW: 'SWX', TO: 'TSE', AX: 'ASX', SI: 'SGX', MX: 'BMV' };
 var DP2X_MEMO_ = {};
+/* v1.2.23: ONE run clock per execution (Apps Script stops an execution at 6 minutes). Every entry point starts it;
+ * the price-history fetch stops at DP2X.FETCH_BUDGET_MS and 'Refresh both' skips the second page past
+ * DP2X.RUN_SOFT_LIMIT_MS, so a slow provider ends in cached bars instead of 'Exceeded maximum execution time'. */
+var DP2_RUN_T0_ = 0;
+function dp2RunStart_() { if (!DP2_RUN_T0_) DP2_RUN_T0_ = new Date().getTime(); return DP2_RUN_T0_; }
+function dp2RunElapsed_() { return DP2_RUN_T0_ ? new Date().getTime() - DP2_RUN_T0_ : 0; }
+/* v1.2.23: NON-BLOCKING notices. Ui.alert waits for OK — run from the script editor, the box opens in the spreadsheet
+ * tab and the execution sits there until the 6-minute limit. A modeless dialog returns at once; without a UI (time
+ * trigger) the notice goes to a toast, and always to the execution log. */
+function dp2Esc_(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function dp2Notify_(msg, title) {
+  title = title || 'Decision Pages v2';
+  try { Logger.log(title + ': ' + msg); } catch (eL) {}
+  try {
+    var lines = String(msg).split('\n').length;
+    var html = HtmlService.createHtmlOutput('<div style="font:13px/1.45 Arial,sans-serif;white-space:pre-wrap;color:#1a1a1a">' + dp2Esc_(msg) + '</div>')
+      .setWidth(620).setHeight(Math.min(560, 90 + lines * 20));
+    SpreadsheetApp.getUi().showModelessDialog(html, title);
+    return 'dialog';
+  } catch (eD) {}
+  try { SpreadsheetApp.getActive().toast(String(msg).slice(0, 250), title, 15); return 'toast'; } catch (eT) {}
+  return 'log';
+}
 
 /* ========================================================= seeds (17 Oct 2026) */
 var DP2_SEED_ACCOUNT_ = [["as_of", "2026-10-17 18:15 Riyadh"], ["source", "IBKR read-only connector (manual read) — replace by Flex capture parsing (B2)"], ["nav_usd", 22187.54], ["cash_usd", 14338.47], ["stock_mv_usd", 7847.29], ["unrealized_usd", 423.5], ["leverage", 0.35], ["fx_usd_sar", 3.75], ["twr_inception_pct", 0.99], ["twr_mtd_pct", 1.33]];
@@ -325,14 +357,15 @@ var DP2_FIXTURE_YUM_ = {"t":["2026-04-20","2026-04-21","2026-04-22","2026-04-23"
 
 /* ========================================================= entry points */
 function buildDecisionPagesV2() {
-  var t0 = Date.now();
+  var t0 = dp2RunStart_();
   var ss = SpreadsheetApp.getActive();
   DP2X_MEMO_ = {};
   // v1.2.1: a refresh never seeds the _IBKR_* tabs — missing broker inputs are reported as unknown (menu: Seed IBKR Tabs)
   var pd = buildPortfolioDecisionV2();
-  var t10 = buildTop10V2();
-  var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's — ' + DP2.SHEET_PD + ' (' + pd.rows + ' rows) · ' + DP2.SHEET_T10 + ' (' + t10.rows + ' rows)';
-  try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, 8); } catch (e) {}
+  // v1.2.23: never start the second page this close to the 6-minute limit — it is refreshed on its own instead
+  var t10 = dp2RunElapsed_() > DP2X.RUN_SOFT_LIMIT_MS ? { rows: 0, skipped: true } : buildTop10V2();
+  var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's — ' + DP2.SHEET_PD + ' (' + pd.rows + ' rows) · ' + (t10.skipped ? DP2.SHEET_T10 + ' NOT rebuilt (the first page used ' + Math.round(dp2RunElapsed_() / 1000) + ' s of the 6-minute limit — refresh it on its own)' : DP2.SHEET_T10 + ' (' + t10.rows + ' rows)');
+  try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, t10.skipped ? 20 : 8); } catch (e) {}
   return { ok: true, pd: pd, t10: t10, ms: Date.now() - t0 };
 }
 
@@ -340,7 +373,7 @@ function dp2SeedIbkrTabs() {
   var ss = SpreadsheetApp.getActive();
   var seeded = dp2EnsureIbkrTabs_(ss);
   var msg = 'IBKR tabs: ' + seeded.join(', ');
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(msg); }
+  dp2Notify_(msg);
   return seeded;
 }
 
@@ -348,7 +381,7 @@ function dp2InstallTrigger() {
   dp2RemoveTrigger();
   ScriptApp.newTrigger('buildDecisionPagesV2').timeBased().everyHours(1).create();
   var msg = 'Hourly trigger installed: buildDecisionPagesV2 rebuilds both v2 pages every hour and sends the dynamic-exit alerts (' + (dp2ExitAlertsEnabled_() ? 'alerts ON → ' + (dp2ExitAlertTo_() || 'no recipient') : 'alerts OFF') + ').';
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(msg); }
+  dp2Notify_(msg);
   return true;
 }
 function dp2RemoveTrigger() {
@@ -366,7 +399,7 @@ function dp2_addMenuItems(menu) {
   if (!menu || typeof menu.addItem !== 'function') {
     var hint = 'dp2_addMenuItems(menu) is the hook 01_Menu.gs (v2.20.2 or later) calls while it builds the Today submenu; it is not meant to be run on its own.\n\n' +
       'To build the pages run buildDecisionPagesV2 (both), buildPortfolioDecisionV2 or buildTop10V2 — or, after pasting 01_Menu v2.20.2 and reloading the spreadsheet, use Today ▸ 📊 Build Decision Pages v2.';
-    try { SpreadsheetApp.getUi().alert('Decision Pages v2', hint, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(hint); }
+    dp2Notify_(hint);
     return null;
   }
   return menu
@@ -402,14 +435,17 @@ function dp2_addTopMenu(ui) {
     .addItem('⏱ Install hourly refresh + alerts', 'dp2InstallTrigger')
     .addItem('⏹ Remove hourly refresh', 'dp2RemoveTriggerUi')
     .addItem('🌱 Seed IBKR Tabs (first run)', 'dp2SeedIbkrTabs')
-    .addItem('🧪 Self-Test: Decision Pages v2', 'dp2SelfTest');
+    .addItem('🧪 Self-Test: Decision Pages v2', 'dp2SelfTest')
+    .addSeparator()
+    .addItem('🧰 Owner setup — status', 'dp2OwnerSetupStatus')
+    .addItem('🧰 Owner setup — install Decision Chain + IBKR capture watcher', 'dp2InstallOwnerTriggers');
   m.addToUi();
   return m;
 }
 function dp2OpenSheet_(name) {
   var ss = dp2Ss_();
   var sh = ss.getSheetByName(name);
-  if (!sh) { try { SpreadsheetApp.getUi().alert('Decision Pages v2', name + ' does not exist yet — run 📊 Decision v2 ▸ Refresh first.', SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) {} return false; }
+  if (!sh) { dp2Notify_(name + ' does not exist yet — run 📊 Decision v2 ▸ Refresh first.'); return false; }
   ss.setActiveSheet(sh);
   return true;
 }
@@ -418,8 +454,57 @@ function dp2OpenT10() { return dp2OpenSheet_(DP2.SHEET_T10); }
 function dp2RemoveTriggerUi() {
   var n = dp2RemoveTrigger();
   var msg = n ? 'Removed ' + n + ' hourly trigger(s) for buildDecisionPagesV2. The pages stay; nothing refreshes or alerts until you install it again.' : 'No hourly trigger was installed.';
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(msg); }
+  dp2Notify_(msg);
   return n;
+}
+
+/* v1.2.23: owner setup without blocking dialogs. tfbInstallDecisionChain (26_Decision_Chain) and pdInstallCaptureWatcher
+ * (10_My_Portfolio) end in Ui.alert — run from the script editor that box waits in the spreadsheet tab until the 6-minute
+ * limit (the trigger itself is already created by then). These wrappers call the files' OWN remove helpers and handler
+ * constants, create the same time triggers and report with a non-blocking notice. Nothing else is changed: modes stay in
+ * the Script Properties the owner sets (TFB_DECISION_CHAIN, PD_IBKR_EVIDENCE). */
+function dp2InstallOwnerTriggers() {
+  var out = [];
+  try {
+    if (typeof tfbDcRemove_ === 'function' && typeof TFB_DC_HANDLER !== 'undefined') {
+      var every1 = (typeof TFB_DC_EVERY_MIN !== 'undefined' && TFB_DC_EVERY_MIN) ? TFB_DC_EVERY_MIN : 5;
+      var r1 = tfbDcRemove_();
+      ScriptApp.newTrigger(TFB_DC_HANDLER).timeBased().everyMinutes(every1).create();
+      out.push('✓ Decision Chain: ' + TFB_DC_HANDLER + ' every ' + every1 + ' min' + (r1 ? ' (replaced ' + r1 + ')' : '') + ' · mode ' + (typeof tfbDcMode_ === 'function' ? tfbDcMode_() : '?') + ' (Script Property TFB_DECISION_CHAIN: observe → on after one sync)');
+    } else out.push('✗ Decision Chain: 26_Decision_Chain.gs is not in this project — paste it from GitHub main, then run this again');
+  } catch (e1) { out.push('✗ Decision Chain: ' + dp2Str_(e1 && e1.message || e1)); }
+  try {
+    if (typeof pdRemoveCaptureWatcher_ === 'function' && typeof PD_IBKR_WATCH_HANDLER !== 'undefined') {
+      var every2 = (typeof PD_IBKR_WATCH_EVERY_MIN !== 'undefined' && PD_IBKR_WATCH_EVERY_MIN) ? PD_IBKR_WATCH_EVERY_MIN : 5;
+      var r2 = pdRemoveCaptureWatcher_();
+      ScriptApp.newTrigger(PD_IBKR_WATCH_HANDLER).timeBased().everyMinutes(every2).create();
+      out.push('✓ IBKR capture watcher: ' + PD_IBKR_WATCH_HANDLER + ' every ' + every2 + ' min' + (r2 ? ' (replaced ' + r2 + ')' : '') + ' · mode ' + (typeof pdIbkrMode_ === 'function' ? pdIbkrMode_() : '?') + ' (Script Property PD_IBKR_EVIDENCE: observe or enforce)');
+    } else out.push('✗ IBKR capture watcher: needs 10_My_Portfolio v1.5.12 or later');
+  } catch (e2) { out.push('✗ IBKR capture watcher: ' + dp2Str_(e2 && e2.message || e2)); }
+  var msg = out.join('\n');
+  dp2Notify_(msg, 'Decision Pages v2 — owner setup');
+  return msg;
+}
+/* v1.2.23: read-only checklist of the owner steps (triggers, Script Properties, files) — nothing is changed. */
+function dp2OwnerSetupStatus() {
+  var props = {}, trig = {}, lines = [];
+  try { props = PropertiesService.getScriptProperties().getProperties() || {}; } catch (eP) { props = {}; }
+  try { ScriptApp.getProjectTriggers().forEach(function (tr) { var h = tr.getHandlerFunction(); trig[h] = (trig[h] || 0) + 1; }); } catch (eT) {}
+  var has = function (k) { return props.hasOwnProperty(k) && dp2Str_(props[k]).trim() !== ''; };
+  var val = function (k) { return has(k) ? dp2Str_(props[k]).trim() : '(not set)'; };
+  var envL = has('DP2_ENGINE_ENV') ? dp2EngineEnv_() : null;
+  lines.push((envL && envL.present ? '✓' : '✗') + ' DP2_ENGINE_ENV: ' + (envL && envL.present ? envL.keys.length + ' TFB settings pasted' : 'not set — paste the Render TFB_OPP_* / TFB_T10_* lines'));
+  lines.push((typeof tfbDecisionChainTick === 'function' ? '✓' : '✗') + ' 26_Decision_Chain.gs ' + (typeof TFB_DC_VERSION !== 'undefined' ? 'v' + TFB_DC_VERSION : 'not found'));
+  var dcH = (typeof TFB_DC_HANDLER !== 'undefined') ? TFB_DC_HANDLER : 'tfbDecisionChainTick';
+  lines.push((trig[dcH] ? '✓' : '✗') + ' Decision Chain trigger (' + dcH + '): ' + (trig[dcH] || 0) + ' · TFB_DECISION_CHAIN = ' + val('TFB_DECISION_CHAIN'));
+  lines.push((val('DT10_FEED_COHORT_BIND').toLowerCase() === 'on' ? '✓' : '✗') + ' DT10_FEED_COHORT_BIND = ' + val('DT10_FEED_COHORT_BIND'));
+  var pwH = (typeof PD_IBKR_WATCH_HANDLER !== 'undefined') ? PD_IBKR_WATCH_HANDLER : 'pdIbkrCaptureWatch';
+  lines.push((trig[pwH] ? '✓' : '✗') + ' IBKR capture watcher trigger (' + pwH + '): ' + (trig[pwH] || 0) + ' · PD_IBKR_EVIDENCE = ' + val('PD_IBKR_EVIDENCE'));
+  lines.push((trig.buildDecisionPagesV2 ? '✓' : '·') + ' Hourly v2 refresh trigger (buildDecisionPagesV2): ' + (trig.buildDecisionPagesV2 || 0) + ' (optional)');
+  lines.push('· Decision Pages v2 ' + DP2_VERSION + (typeof DP2_MENU_VERSION !== 'undefined' ? '' : ''));
+  var msg = lines.join('\n');
+  dp2Notify_(msg, 'Decision Pages v2 — owner setup status');
+  return msg;
 }
 
 /* ========================================================= generic helpers */
@@ -1249,9 +1334,12 @@ function dp2LoadBars_(symbols, sinceDate) {
     if (!sym || out[sym]) continue;
     if (DP2X_MEMO_[sym] && (DP2X_MEMO_[sym].keep || DP2X.KEEP_BARS) >= rg.keep) { out[sym] = DP2X_MEMO_[sym]; continue; }
     var key = dp2YahooKey_(sym), res = null, err = [];
-    try { res = dp2FetchBackend_(sym, rg.range); } catch (e0) { err.push(String(e0 && e0.message || e0)); }
-    if (!res) { try { res = dp2FetchYahoo_(key, rg.range); } catch (e1) { err.push(String(e1 && e1.message || e1)); } }
-    if (!res && dp2IsUs_(sym)) { try { res = dp2FetchStooq_(key, rg.keep); } catch (e2) { err.push(String(e2 && e2.message || e2)); } }
+    // v1.2.23: each provider call is skipped once the run's download budget is spent → the cached bars below
+    var over = function () { return DP2X.FETCH_BUDGET_MS > 0 && dp2RunElapsed_() > DP2X.FETCH_BUDGET_MS; };
+    if (over()) err.push('download time budget used (' + Math.round(DP2X.FETCH_BUDGET_MS / 1000) + ' s) — cached bars');
+    else { try { res = dp2FetchBackend_(sym, rg.range); } catch (e0) { err.push(String(e0 && e0.message || e0)); } }
+    if (!res && !over()) { try { res = dp2FetchYahoo_(key, rg.range); } catch (e1) { err.push(String(e1 && e1.message || e1)); } }
+    if (!res && !over() && dp2IsUs_(sym)) { try { res = dp2FetchStooq_(key, rg.keep); } catch (e2) { err.push(String(e2 && e2.message || e2)); } }
     if (res && res.bars && res.bars.length) {
       res.bars = dp2DedupeBars_(res.bars).slice(-rg.keep);
       res.key = key; res.fetched = dp2Today_(); res.stale = false; res.error = ''; res.range = rg.range; res.keep = rg.keep;
@@ -1264,7 +1352,7 @@ function dp2LoadBars_(symbols, sinceDate) {
     }
     DP2X_MEMO_[sym] = res;
     out[sym] = res;
-    if (i < symbols.length - 1 && DP2X.FETCH_SLEEP_MS) Utilities.sleep(DP2X.FETCH_SLEEP_MS);
+    if (i < symbols.length - 1 && DP2X.FETCH_SLEEP_MS && !over()) Utilities.sleep(DP2X.FETCH_SLEEP_MS);
   }
   if (changed) {
     if (cache === null) cache = dp2BarsCacheRead_();
@@ -1598,7 +1686,7 @@ function dp2ExitStatus() {
     lines.push('', 'Updated ' + dp2Str_(vals[0][20]));
   }
   var msg = lines.join('\n');
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(msg); }
+  dp2Notify_(msg);
   return msg;
 }
 function dp2ExitTestAlert() {
@@ -1609,14 +1697,14 @@ function dp2ExitTestAlert() {
     MailApp.sendEmail({ to: to, subject: 'TFB exit alert — TEST · ' + dp2Today_(), body: 'This is a test of the Decision Pages v2 ' + DP2_VERSION + ' exit alerts. Alerts are ' + (dp2ExitAlertsEnabled_() ? 'ON' : 'OFF') + '. Real alerts go out from Build Portfolio_Decision_v2 / the hourly trigger when a holding shows SELL NOW, and at most once a day for advisories (stop near, raise the broker stop, no working stop).' });
     msg = 'Test alert sent to ' + to + ' (remaining daily quota ' + MailApp.getRemainingDailyQuota() + ').';
   } catch (e) { msg = 'Test alert FAILED: ' + String(e && e.message || e); }
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e2) { Logger.log(msg); }
+  dp2Notify_(msg);
   return msg;
 }
 function dp2ExitAlertsToggle() {
   var on = dp2ExitAlertsEnabled_();
   try { PropertiesService.getScriptProperties().setProperty(DP2X.PROP_ALERTS, on ? 'off' : 'on'); } catch (e) {}
   var msg = 'Dynamic exit e-mail alerts are now ' + (on ? 'OFF' : 'ON') + ' (Script Property ' + DP2X.PROP_ALERTS + '). The Exit signal chips on Portfolio_Decision_v2 keep updating either way.';
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e2) { Logger.log(msg); }
+  dp2Notify_(msg);
   return !on;
 }
 /* v1.2.5: acknowledged rule exits — Script Property DP2_EXIT_ACK = JSON { '<lot key>': 'yyyy-MM-dd' }; v1.2.13: keyed by LOT
@@ -2339,6 +2427,7 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
 
 /* ========================================================= PORTFOLIO_DECISION_v2 */
 function buildPortfolioDecisionV2() {
+  dp2RunStart_();   // v1.2.23
   var ss = dp2Ss_();
   var kv = dp2ReadStatusKV_();
   var feed = dp2ParseFeed_(kv);
@@ -2712,6 +2801,7 @@ function buildPortfolioDecisionV2() {
 
 /* ========================================================= TOP_10_INVESTMENTS_v2 */
 function buildTop10V2() {
+  dp2RunStart_();   // v1.2.23
   var kv = dp2ReadStatusKV_();
   var feed = dp2ParseFeed_(kv);
   var t = dp2ReadTop10_();
@@ -3003,6 +3093,7 @@ function buildTop10V2() {
 
 /* ========================================================= self-test */
 function dp2SelfTest() {
+  dp2RunStart_();   // v1.2.23
   var checks = [];
   var ss = dp2Ss_();
   var need = [DP2.SRC_T10, DP2.SRC_PD, DP2.SRC_MP, DP2.SRC_LEDGER, DP2.SRC_STATUS, DP2.SRC_GM, DP2.SRC_PERF, DP2.SRC_S1];
@@ -3042,6 +3133,6 @@ function dp2SelfTest() {
   var ok = checks.every(function (c) { return c.ok; });
   var lines = checks.map(function (c) { return (c.ok ? 'PASS' : 'FAIL') + ' — ' + c.name; });
   var msg = 'Decision Pages v2 ' + DP2_VERSION + ' self-test: ' + (ok ? 'PASS' : 'FAIL') + '\n\n' + lines.join('\n');
-  try { SpreadsheetApp.getUi().alert('Decision Pages v2', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { Logger.log(msg); }
+  dp2Notify_(msg);
   return { ok: ok, checks: checks };
 }
