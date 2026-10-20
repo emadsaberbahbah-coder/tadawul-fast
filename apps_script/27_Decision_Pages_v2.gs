@@ -1,7 +1,19 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.21 (2026-10-20)
+ * Version: 1.2.22 (2026-10-20)
+ *   1.2.22: FULL-WORKBOOK REVIEW (20 Oct export). (a) Cash: the cockpit's 'Entered cash (SAR)' KPI is the engine's
+ *          kpis.deployable_sar (cash + proceeds less the absolute reserve), so it is no longer read as the cash — the
+ *          cash is the panel input 'Cash Available (SAR)' (the per-seat cap's budget base and NAV move with it), and
+ *          without a paste or an alert the reserve the last build took is read from the difference (treated as
+ *          binding). With DP2_ENGINE_ENV pasted the reserve is no longer taken twice. (b) IBKR: the daily read-only
+ *          capture (10_My_Portfolio pdIbkrLatestCapture_) supersedes older _IBKR_Account / _IBKR_Orders tabs — cash,
+ *          NAV, stock value, leverage and the working orders — so brackets and the cash cross-check use the morning
+ *          read instead of a manual snapshot. (c) The coverage blocker names the failing page from a recount of blank
+ *          Names (it said Global_Markets for every coverage failure; on 20 Oct it is Mutual_Funds 97.98 %), and the
+ *          path to the first executable board names the owner steps (chain, cohort bind, capture watcher, S-1 c4).
+ *          (d) A cockpit run still in progress ('status: running…') no longer hides the engine version: the last
+ *          completed run's line on _Status is read instead.
  *   1.2.21: TWO REVIEW FINDINGS. (a) With DP2_ENGINE_ENV present, the cash floor comes from it (the current production
  *          configuration) — a last-sync cash_floor alert may predate an ENV change and is only compared (noted when it
  *          differs). (b) The capital call is the engine's: the first TFB_OPP_CAPITAL_CALL_TOPN funding plans (any state),
@@ -207,7 +219,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.21';
+var DP2_VERSION = '1.2.22';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -677,9 +689,14 @@ function dp2ReadTop10_() {
   // KPI row: the label row that holds 'Entered cash' in any column; values sit in the next row
   var kr = dp2FindRow_(vals, function (row) { for (var c = 0; c < row.length; c++) { var cl = dp2Str_(row[c]).trim(); if (/^entered cash/i.test(cl) || /^deployable \(sar\)$/i.test(cl)) return true; } return false; });   // v1.2.15: current layout heads the KPI row with 'Deployable (SAR)'
   if (kr >= 0 && kr + 1 < vals.length) { for (var i = 0; i < vals[kr].length; i++) { var k = dp2Str_(vals[kr][i]).trim(); if (k) out.kpi[k] = vals[kr + 1][i]; } }
-  out.enteredCash = null;
-  for (var kk in out.kpi) { if (out.kpi.hasOwnProperty(kk) && /^entered cash/i.test(kk)) { out.enteredCash = dp2Num_(out.kpi[kk]); } }
-  if (out.enteredCash === null) { for (kk in out.panel) { if (out.panel.hasOwnProperty(kk) && /^cash available/i.test(kk)) out.enteredCash = dp2Num_(out.panel[kk]); } }
+  // v1.2.22: the cockpit's first KPI slot ('Entered cash (SAR)', formerly 'Deployable (SAR)') carries the engine's
+  // kpis.deployable_sar = cash + pending proceeds LESS the absolute reserve (_select_and_size). The operator's cash is
+  // the panel input 'Cash Available (SAR)'; the KPI is kept as the engine's deployable (dp2CashReserve_ reads the
+  // reserve the last build took from the difference).
+  out.enteredCash = null; out.kpiDeployable = null; out.panelCash = null; out.panelProceeds = null;
+  for (var kk in out.kpi) { if (out.kpi.hasOwnProperty(kk) && (/^entered cash/i.test(kk) || /^deployable \(sar\)$/i.test(kk))) { out.kpiDeployable = dp2Num_(out.kpi[kk]); } }
+  for (kk in out.panel) { if (out.panel.hasOwnProperty(kk)) { if (/^cash available/i.test(kk)) out.panelCash = dp2Num_(out.panel[kk]); else if (/^pending proceeds/i.test(kk)) out.panelProceeds = dp2Num_(out.panel[kk]); } }
+  out.enteredCash = out.panelCash !== null ? out.panelCash : out.kpiDeployable;
   // banner
   var br = dp2FindRow_(vals, function (row) { var s = dp2Str_(row[0]); return /FEED|SELECTED|EXECUTABLE/.test(s) && s.length > 20 && !/^Status/.test(s); }, kr >= 0 ? kr : 0);
   if (br >= 0) out.banner = dp2Str_(vals[br][0]);
@@ -812,9 +829,11 @@ function dp2ReadCash_() {
   for (var r = vals.length - 1; r >= 1; r--) { var b = dp2Num_(vals[r][bc]); if (b !== null) return { balance: b, date: vals[r][dc] }; }
   return null;
 }
-/* v1.2.2 — ONE cash basis for both pages and the shared allocation memo (Codex P1): Top_10 panel 'Entered cash'
-   (the owner-declared deployable cash) → _IBKR_Account cash_usd × fx (STALE-flagged past DP2.IBKR_TABS_STALE_H)
-   → _Cash_Snapshot → none. The balances not chosen are kept so the pages can disclose a discrepancy. */
+/* v1.2.2 — ONE cash basis for both pages and the shared allocation memo (Codex P1): the Top_10 panel cash
+   (v1.2.22: the panel input 'Cash Available (SAR)'; the KPI slot is the engine's deployable after its reserve and is
+   used only when no panel cash is found) → the IBKR cash (v1.2.22: the daily read-only capture when it is newer than
+   the _IBKR_* tabs) × fx (STALE-flagged past DP2.IBKR_TABS_STALE_H) → _Cash_Snapshot → none. The balances not chosen
+   are kept so the pages can disclose a discrepancy. */
 function dp2CashBasis_(t, ib, fx) {
   var out = { sar: null, source: 'n/a', basis: 'none', entered: null, ibkrSar: null, snapSar: null, snapDate: '', other: null, otherLabel: '', diffPct: null, warn: false };
   var cashUsd = dp2Num_(ib && ib.account ? ib.account['cash_usd'] : null);
@@ -822,7 +841,8 @@ function dp2CashBasis_(t, ib, fx) {
   var snap = null; try { snap = dp2ReadCash_(); } catch (eC) { snap = null; }
   if (snap) { out.snapSar = dp2Num_(snap.balance); out.snapDate = dp2DateStr_(snap.date) || dp2Str_(snap.date); }
   out.entered = (t && t.enteredCash !== null && t.enteredCash !== undefined) ? dp2Num_(t.enteredCash) : null;
-  if (out.entered !== null) { out.sar = out.entered; out.basis = 'top10'; out.source = 'Top_10 panel (entered cash)'; }
+  out.kpiDeployable = (t && t.kpiDeployable !== undefined) ? t.kpiDeployable : null;   // v1.2.22
+  if (out.entered !== null) { out.sar = out.entered; out.basis = 'top10'; out.source = (t && t.panelCash !== null && t.panelCash !== undefined) ? 'Top_10 panel (Cash Available)' : 'Top_10 KPI (the engine\'s deployable; no panel cash found)'; }
   else if (out.ibkrSar !== null) { out.sar = out.ibkrSar; out.basis = 'ibkr'; out.source = 'IBKR ' + dp2Str_(ib.account['as_of']) + (ib.stale ? ' — STALE snapshot' : ''); }
   else if (out.snapSar !== null) { out.sar = out.snapSar; out.basis = 'snapshot'; out.source = '_Cash_Snapshot ' + out.snapDate; }
   if (out.basis !== 'ibkr' && out.ibkrSar !== null) { out.other = out.ibkrSar; out.otherLabel = 'IBKR snapshot ' + dp2Str_(ib.account['as_of']) + (ib.ageH !== null ? ' (' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ', STALE' : '') + ')' : ''); }
@@ -836,6 +856,37 @@ function dp2CashBasisText_(cb) {
   var t = dp2Fmt_(cb.sar) + ' SAR from ' + cb.source;
   if (cb.other !== null) t += ' · ' + cb.otherLabel + ' reads ' + dp2Fmt_(cb.other) + ' SAR (' + (cb.diffPct >= 0 ? '+' : '') + dp2Fmt_(cb.diffPct, 1) + '%)' + (cb.warn ? ' — RECONCILE before placing orders' : '');
   return t;
+}
+/* v1.2.22: the coverage blocker names the page that fails. The sync's Name floor (final publication D3) allows at
+ * most 1 % blank Names per market page (Mutual_Funds 2,474 rows → 24); recounted here from the four source sheets
+ * (Symbol and Name columns only). A blank Name is filled by the sync from the reviewed captions in
+ * data/verified_name_labels.json, which expire after seven days unless the Verified Name Label Renewal workflow
+ * renews them. */
+var DP2_NAME_PAGES_ = ['Market_Leaders', 'Global_Markets', 'Commodities_FX', 'Mutual_Funds'];
+var DP2_NAME_COV_MEMO_ = null;
+function dp2NameCoverage_() {
+  if (DP2_NAME_COV_MEMO_) return DP2_NAME_COV_MEMO_;
+  var res = [];
+  for (var p = 0; p < DP2_NAME_PAGES_.length; p++) {
+    var sh = dp2Sheet_(DP2_NAME_PAGES_[p], false);
+    if (!sh || sh.getLastRow() < 2) continue;
+    var hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0], si = -1, ni = -1;
+    for (var c = 0; c < hdr.length; c++) { var h = dp2Str_(hdr[c]).trim(); if (h === 'Symbol' && si < 0) si = c; else if (h === 'Name' && ni < 0) ni = c; }
+    if (si < 0 || ni < 0) continue;
+    var n = sh.getLastRow() - 1, sv = sh.getRange(2, si + 1, n, 1).getValues(), nv = sh.getRange(2, ni + 1, n, 1).getValues(), rows = 0, blank = 0;
+    for (var r = 0; r < n; r++) { if (!dp2Str_(sv[r][0]).trim()) continue; rows++; if (!dp2Str_(nv[r][0]).trim()) blank++; }
+    var allowed = Math.floor(rows * 0.01 + 1e-9);
+    res.push({ page: DP2_NAME_PAGES_[p], rows: rows, blank: blank, allowed: allowed, pct: rows ? (rows - blank) / rows * 100 : null, fail: blank > allowed });
+  }
+  DP2_NAME_COV_MEMO_ = res;
+  return res;
+}
+function dp2CoverageNote_() {
+  var nc = [];
+  try { nc = dp2NameCoverage_(); } catch (eN) { nc = []; }
+  var bad = nc.filter(function (x) { return x.fail; });
+  if (!bad.length) return 'a market page is below its coverage floor — see the sync\'s final publication';
+  return bad.map(function (x) { return x.page + ' Name coverage ' + dp2Fmt_(x.pct, 2) + '% (' + x.blank + ' blank Names, ' + x.allowed + ' allowed)'; }).join('; ') + ' — below the 99% floor; renew the reviewed Name captions (workflow Verified Name Label Renewal)';
 }
 function dp2ReadGmInvestability_() {
   var sh = dp2Sheet_(DP2.SRC_GM, false);
@@ -952,6 +1003,7 @@ function dp2ReadIbkr_() {
   if (t && t.getLastRow() > 1) { var tv = t.getRange(2, 1, t.getLastRow() - 1, 6).getValues(); for (i = 0; i < tv.length; i++) { if (!dp2Str_(tv[i][0])) continue; out.trades.push({ symbol: dp2Str_(tv[i][0]), name: dp2Str_(tv[i][1]), ccy: dp2Str_(tv[i][2]), exit: dp2Str_(tv[i][3]), span: dp2Str_(tv[i][4]), pnl: dp2Num_(tv[i][5]) }); } }
   var n = dp2Sheet_(DP2.IB_NAV, false);
   if (n && n.getLastRow() > 1) { var nv = n.getRange(2, 1, n.getLastRow() - 1, 2).getValues(); for (i = 0; i < nv.length; i++) { var d = nv[i][0]; var c = dp2Num_(nv[i][1]); if (d && c !== null) out.nav.push({ date: (d instanceof Date) ? Utilities.formatDate(d, DP2.TZ, 'yyyy-MM-dd') : dp2Str_(d), cps: c }); } }
+  try { dp2IbkrOverlayCapture_(out); } catch (eCap) { out.captureNote = 'capture not read (' + dp2Str_(eCap && eCap.message || eCap).slice(0, 80) + ')'; }   // v1.2.22
   out.ageH = dp2IbkrAgeHours_(out.account['as_of']);
   out.stale = out.ageH === null ? out.tabs.account : out.ageH > DP2.IBKR_TABS_STALE_H;
   // v1.2.5 (review finding): broker orders are KNOWN only from a dated, fresh snapshot. An absent/empty orders tab, a
@@ -960,6 +1012,55 @@ function dp2ReadIbkr_() {
   out.ordersKnown = !!(out.tabs.orders && out.tabs.account && out.ageH !== null && !out.stale);
   out.unknownWhy = !out.tabs.orders ? '_IBKR_Orders tab missing or empty' : (!out.tabs.account || out.ageH === null ? '_IBKR_Account has no as_of for the orders snapshot' : (out.stale ? 'snapshot ' + dp2Fmt_(out.ageH, 0) + ' h old (limit ' + DP2.IBKR_TABS_STALE_H + ' h) — order statuses unverified' : ''));
   return out;
+}
+/* v1.2.22: the daily READ-ONLY IBKR capture (the scheduled task writes 'TFB_IBKR_Capture_*.json', schema
+ * tfb.ibkr-capture/v1, to Drive; read through 10_My_Portfolio pdIbkrLatestCapture_, the same reader Portfolio_Decision
+ * uses) supersedes _IBKR_Account / _IBKR_Orders when it is newer: cash (settled), NAV, stock value and unrealized from
+ * the USD (else BASE) balance, gross leverage = stock value / NAV, and the WORKING orders as captured. Trades, the NAV
+ * history and the TWR stay on the tabs. Read-only: nothing is written; without the reader or a capture the tabs are
+ * used exactly as before. */
+function dp2IbkrOverlayCapture_(out) {
+  if (typeof pdIbkrLatestCapture_ !== 'function') { out.captureNote = 'capture reader not installed (10_My_Portfolio v1.5.12+)'; return false; }
+  var cap = pdIbkrLatestCapture_(new Date().getTime());
+  if (!cap || !cap.ok || !cap.json) { out.captureNote = 'no capture (' + dp2Str_(cap && cap.reason || 'unknown') + ')'; return false; }
+  var j = cap.json;
+  if (dp2Str_(j.schema) !== 'tfb.ibkr-capture/v1') { out.captureNote = 'capture schema not recognised'; return false; }
+  var capMs = Date.parse(dp2Str_(j.captured_at));
+  if (isNaN(capMs)) { out.captureNote = 'capture time unreadable'; return false; }
+  var tabAge = dp2IbkrAgeHours_(out.account['as_of']);
+  var tabMs = tabAge === null ? null : new Date().getTime() - tabAge * 3600000;
+  if (tabMs !== null && tabMs >= capMs) { out.captureNote = 'the _IBKR_* tabs are newer than the capture'; return false; }
+  var bals = (j.balances && j.balances.balances) || [], usd = null, base = null, i;
+  for (i = 0; i < bals.length; i++) { var cc = dp2Str_(bals[i] && bals[i].currency).toUpperCase(); if (cc === 'USD') usd = bals[i]; else if (cc === 'BASE') base = bals[i]; }
+  var b = usd || base;
+  if (!b) { out.captureNote = 'capture has no USD balance'; return false; }
+  var acct = {}, k;
+  for (k in out.account) if (out.account.hasOwnProperty(k)) acct[k] = out.account[k];
+  var nav = dp2Num_(b.net_liquidation_value), stk = dp2Num_(b.stock_market_value), settled = dp2Num_(b.settled_cash), cashB = dp2Num_(b.cash_balance);
+  if (settled === null && cashB === null) { out.captureNote = 'capture balance has no cash'; return false; }
+  acct['as_of'] = Utilities.formatDate(new Date(capMs), DP2.TZ, 'yyyy-MM-dd HH:mm') + ' Riyadh';
+  acct['source'] = 'IBKR read-only capture ' + dp2Str_(cap.name);
+  acct['cash_usd'] = settled !== null ? settled : cashB;
+  if (nav !== null) acct['nav_usd'] = nav;
+  if (stk !== null) acct['stock_mv_usd'] = stk;
+  if (dp2Num_(b.unrealized_pnl) !== null) acct['unrealized_usd'] = dp2Num_(b.unrealized_pnl);
+  if (nav && stk !== null) acct['leverage'] = Math.round(stk / nav * 100) / 100;
+  var ords = (j.orders && j.orders.orders) || [], mapped = [];
+  for (i = 0; i < ords.length; i++) {
+    var o = ords[i] || {}, pdsc = dp2Str_(o.primary_description), sdsc = dp2Str_(o.secondary_description);
+    var mo = /^(buy|sell)\s+[\d,\.]+\s+(\S+)/i.exec(pdsc);
+    var typ = dp2Str_(o.order_type).toUpperCase().replace(/\s+/g, '_');
+    if (typ === 'STP') typ = 'STOP'; else if (typ === 'LMT') typ = 'LIMIT'; else if (typ === 'STP_LMT') typ = 'STOP_LIMIT';
+    var px = null;
+    if (/STOP/.test(typ)) { var mstp = /STP\s+(?:LMT\s+)?([\d,]*\.?\d+)/i.exec(sdsc); px = mstp ? dp2Num_(mstp[1].replace(/,/g, '')) : null; }
+    else px = dp2Num_(o.limit_price);
+    mapped.push({ symbol: mo ? mo[2].toUpperCase() : '', side: dp2Str_(o.side).toUpperCase() || (mo ? mo[1].toUpperCase() : ''), type: typ, qty: dp2Num_(o.total_shares_qty), price: px, status: dp2Str_(o.order_status).toUpperCase(), placed: dp2Str_(o.order_time) });
+  }
+  out.account = acct; out.orders = mapped;
+  out.tabs.account = true; out.tabs.orders = true;
+  out.capture = { name: dp2Str_(cap.name), ms: capMs, positions: ((j.positions && j.positions.positions) || []).length, orders: mapped.length };
+  out.captureNote = 'IBKR read-only capture ' + Utilities.formatDate(new Date(capMs), DP2.TZ, 'yyyy-MM-dd HH:mm') + ' Riyadh';
+  return true;
 }
 /* v1.2.2 (Codex P1): broker TP / stop levels come ONLY from orders in an active status. Historical REPLACED,
    CANCELLED, FILLED or unknown-status rows never supply a level, so a replaced stop can no longer make an
@@ -1643,6 +1744,15 @@ function dp2PanelCriteria_(t) {
   }
   return out;
 }
+/* v1.2.22: the last completed cockpit run's status line as _Status records it (row 'Top_10_Investments', Message). */
+var DP2_T10_STATUS_MEMO_ = null;
+function dp2T10StatusMsg_() {
+  if (DP2_T10_STATUS_MEMO_ !== null) return DP2_T10_STATUS_MEMO_;
+  var msg = '';
+  try { var sh = dp2Sheet_(DP2.SRC_STATUS, false); if (sh && sh.getLastRow() > 1) { var v = sh.getRange(1, 1, Math.min(sh.getLastRow(), 40), 4).getValues(); for (var i = 0; i < v.length; i++) { if (dp2Str_(v[i][0]).trim() === 'Top_10_Investments') { msg = dp2Str_(v[i][3]); break; } } } } catch (eS) { msg = ''; }
+  DP2_T10_STATUS_MEMO_ = msg;
+  return msg;
+}
 function dp2ProdConfig_(t) {
   var env = dp2EngineEnv_(), M = env.map;
   var raw = function (k) { return M.hasOwnProperty(k) ? dp2Str_(M[k]).trim() : ''; };
@@ -1689,7 +1799,9 @@ function dp2ProdConfig_(t) {
   // what the page does not model
   for (var u = 0; u < DP2_ENV_UNMODELLED_.length; u++) { var U = DP2_ENV_UNMODELLED_[u], uv = low(U.k); if (uv !== '' && !U.isDef(uv)) c.unmodelled.push(U.k + '=' + raw(U.k) + ' (engine default ' + U.def + ')'); }
   // the production engine's version (Top_10 status line) against the rules in use
-  var mv = /builder v(\d+\.\d+\.\d+)/.exec(dp2Str_(t && t.status)); c.engineVersion = mv ? mv[1] : '';
+  // v1.2.22: a cockpit run still in progress shows 'status: running…' without the builder version — fall back to the
+  // last completed run's line on _Status (row Top_10_Investments, Message)
+  var mv = /builder v(\d+\.\d+\.\d+)/.exec(dp2Str_(t && t.status)) || /builder v(\d+\.\d+\.\d+)/.exec(dp2T10StatusMsg_()); c.engineVersion = mv ? mv[1] : '';
   var need = DP2_ENGINE_NEED_.base, why = 'the funding rules this page mirrors';
   if (c.sizingMode === 'conviction' && dp2VerCmp_(DP2_ENGINE_NEED_.conviction, need) > 0) { need = DP2_ENGINE_NEED_.conviction; why = 'conviction sizing (capital exhaustion and cap infeasibility, PR #803)'; }
   if (c.rotBasis === 'plan3m' && dp2VerCmp_(DP2_ENGINE_NEED_.plan3m, need) > 0) { need = DP2_ENGINE_NEED_.plan3m; why = 'the plan3m rotation basis'; }
@@ -2150,6 +2262,12 @@ function dp2CashReserve_(t, cashSar, navSar, cfg) {
     }
   } else if (al) {
     abs = al.abs; pct = al.pct; mode = al.mode; src = 'engine cash_floor alert (last sync)';
+  } else if (t && t.kpiDeployable !== null && t.kpiDeployable !== undefined && t.panelCash !== null && t.panelCash !== undefined) {
+    // v1.2.22: no paste and no alert — the last build's own deployable KPI shows the reserve it took (deployable =
+    // cash + proceeds − reserve). The build does not show whether that reserve binds sizing, so it is treated as
+    // binding (conservative: research never spends cash production may keep).
+    var obs = Math.max(0, (t.panelCash || 0) + Math.max(0, t.panelProceeds || 0) - t.kpiDeployable);
+    if (obs > 0.5) { abs = Math.round(obs); mode = 'enforce'; out.observed = true; src = 'the last build\'s deployable KPI (panel cash ' + dp2Fmt_(t.panelCash) + (t.panelProceeds ? ' + proceeds ' + dp2Fmt_(t.panelProceeds) : '') + ' − deployable ' + dp2Fmt_(t.kpiDeployable) + '; its mode is not shown — treated as binding)'; }
   }
   out.absUnstated = !!(!env.present && cf && pct !== null && abs === null);
   out.abs = abs; out.pct = pct; out.mode = mode || 'off';
@@ -2310,7 +2428,7 @@ function buildPortfolioDecisionV2() {
   dp2Header_(sh, row, 'PORTFOLIO DECISION — v2', stateChip[0], stateChip[1], 'built ' + dp2Today_() + ' · PD run ' + (pd.lastRun || 'n/a') + ' · FX ' + fx);
   row++;
   dp2Line_(sh, row, reason, { color: DP2C.ink, size: 9.5, bg: DP2C.surface, height: 30 }); row++;
-  dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + (ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ', ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' — STALE manual snapshot' : '') : 'MISSING — no broker snapshot; cash from ' + cashSource) + ') · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
+  dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + (ib.capture ? ' · IBKR cash and working orders from the read-only capture ' + dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ' (' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ', STALE' : '') + ')' : '') + '; trades and TWR from the _IBKR_* tabs' : ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + (ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ', ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' — STALE manual snapshot' : '') : 'MISSING — no broker snapshot; cash from ' + cashSource) + ')' + (ib.captureNote ? ' — capture: ' + ib.captureNote : '')) + ' · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
 
@@ -2531,7 +2649,7 @@ function buildPortfolioDecisionV2() {
   row = tradeTop + tradeRowsNeeded + 1;
 
   // actions + limits
-  if (!evFresh) actions.push({ p: 0, t: 'Refresh the IBKR Flex capture before the next cockpit run so Portfolio_Decision certifies; the figures above come from the ledger and the _IBKR_* tabs (' + dp2Str_(ib.account['as_of'] || 'n/a') + ').' });
+  if (!evFresh) actions.push({ p: 0, t: 'Portfolio_Decision carries no fresh IBKR evidence (' + evState + (pd.evidence && pd.evidence.age ? ', ' + pd.evidence.age : '') + '): it certifies only when it runs within 14 min of the morning capture — install the capture watcher once (Apps Script editor: run pdInstallCaptureWatcher; Script Property PD_IBKR_EVIDENCE = observe or enforce), or refresh Portfolio_Decision right after the 08:40 capture. The figures above come from the ledger and ' + (ib.capture ? 'the IBKR capture ' : 'the _IBKR_* tabs ') + '(' + dp2Str_(ib.account['as_of'] || 'n/a') + ').' });   // v1.2.22
   if (s1.verdict !== 'PASS') actions.push({ p: 4, t: 'No board-originated capital: S-1 gate ' + (s1.verdict || 'n/a') + (s1.criteria.length ? ' (' + s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' ' + c.status; }).join(', ') + ')' : '') + '; deployable ' + dp2Fmt_(deploySar) + ' SAR stays Tranche 0.' });
   for (i = 0; i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory (Shadow_Board, research only): sell ' + switches[i].sell + ' → buy ' + switches[i].buy + ' Δ ' + dp2Pct_(switches[i].delta, 1) + ' vs hurdle ' + dp2PctPlain_(switches[i].hurdle, 1) + '; not executable while the feed is ' + (feed.state || 'n/a') + '.' });
   // v1.2.12: two lots of one symbol can raise the identical position-level action — show it once
@@ -2638,7 +2756,7 @@ function buildTop10V2() {
   var row = 1;
   dp2Header_(sh, row, 'TOP 10 INVESTMENTS — DECISION v2', state, chipKind, 'run ' + (feed.run || 'n/a') + ' · epoch ' + (t.epoch || 'n/a') + ' · cockpit ' + (t.lastRun || 'n/a'));
   row++;
-  dp2Line_(sh, row, 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (Global_Markets name coverage below the 99% gate)' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
+  dp2Line_(sh, row, 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
   dp2Line_(sh, row, 'Status: ' + t.status, { size: 8, bg: DP2C.surface, height: 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
@@ -2842,7 +2960,8 @@ function buildTop10V2() {
   if (kv['TFB Feed Global_Markets']) alerts.push('GM feed ' + kv['TFB Feed Global_Markets'].split('|').slice(0, 2).join(' ·').trim());
   if (kv['TFB Grid Capacity']) alerts.push('grid ' + kv['TFB Grid Capacity'].split('|')[1].trim());
   var pendingS1 = s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' (' + c.detail.split('·')[0].trim() + ')'; }).join('; ');
-  var next = 'Path to the first executable board: (1) Global_Markets name coverage ≥ 99% (D3); (2) run the decision pages after the sync lands so receipt = sync run (chain order); (3) a fresh Flex capture the same morning. Then the stability rule (3 confirmed days) and the S-1 gate (' + (s1.verdict || 'n/a') + (pendingS1 ? ' — pending ' + pendingS1 : '') + ') decide whether capital moves.';
+  var covBad = []; try { covBad = dp2NameCoverage_().filter(function (x) { return x.fail; }); } catch (eNc) { covBad = []; }
+  var next = 'Path to the first executable board: (1) Name coverage ≥ 99% on every market page (D3' + (covBad.length ? ': ' + dp2CoverageNote_() : '') + '); (2) the decision pages refreshed after the sync lands so receipt = sync run (26_Decision_Chain, TFB_DECISION_CHAIN=on; DT10_FEED_COHORT_BIND=on); (3) Portfolio_Decision refreshed within 14 min of the morning IBKR capture (pdInstallCaptureWatcher). Then the stability rule (3 confirmed days) and the S-1 gate (' + (s1.verdict || 'n/a') + (pendingS1 ? ' — pending ' + pendingS1 : '') + ') decide whether capital moves' + (s1.criteria.some(function (c) { return String(c.n) === '4' && c.status !== 'PASS'; }) ? '; S-1 criterion 4 is refreshed only by an audited Performance Clock run (scheduled runs are record-only since 12 Oct)' : '') + '.';
   var alertRng = dp2Range_(sh, chartRow, 9, 16, 4).merge();
   alertRng.setValue(alerts.join('\n')).setWrap(true).setVerticalAlignment('top').setFontSize(9).setBackground(DP2C.surface).setBorder(true, true, true, true, false, false, DP2C.border, SpreadsheetApp.BorderStyle.SOLID);
   var nextRng = dp2Range_(sh, chartRow + 4, 9, 16, 5).merge();
