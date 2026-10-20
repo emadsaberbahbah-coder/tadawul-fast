@@ -1,7 +1,14 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.14 (2026-10-20)
+ * Version: 1.2.15 (2026-10-20)
+ *   1.2.15: TWO REVIEW FINDINGS. (a) The cash reserve taken before sizing is the ENGINE's (dp2CashReserve_), never a
+ *          hard-coded 10 %: inputs are the engine's cash_floor alert on the Top_10 sheet (ENFORCED → the floor, a percent
+ *          re-applied to the current NAV; observe → none) → Script Properties DP2_CASH_FLOOR_SAR/_PCT/_MODE (bind only
+ *          with MODE=enforce, as the engine) → none. The PF 10 % floor stays a LIMITS check. The Top_10 reader also
+ *          finds the KPI row by its current 'Deployable (SAR)' heading and parses the ALERTS table.
+ *          (b) STOP_HIT / SELL_NOW / EXIT_LATCHED form one SELL alert family keyed to the exit episode (state col 24):
+ *          a code change about the same episode never resets the cooldown; a new episode alerts at once.
  *   1.2.14: THREE REVIEW FINDINGS. (a) The PRODUCTION rotation basis (Top_10 KPI 'Rotation Basis' → Script Property
  *          DP2_ROTATION_BASIS → '12m') gates the SWITCH actions and advisories; the other basis is a research note.
  *          (b) A rotation's surplus is recorded, never recycled to later needs in the same run (engine semantics).
@@ -163,7 +170,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.14';
+var DP2_VERSION = '1.2.15';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -231,7 +238,10 @@ var DP2X = {
   PROP_HISTORY_URL: 'DP2_HISTORY_URL',
   PROP_HISTORY_KEY: 'DP2_HISTORY_KEY',
   PROP_EXIT_ACK: 'DP2_EXIT_ACK',     // v1.2.5: JSON { symbol: 'yyyy-MM-dd' } — rule exits acknowledged (hold by decision)
-  PROP_ROT_BASIS: 'DP2_ROTATION_BASIS'   // v1.2.14: '12m' (default, = TFB_OPP_ROTATION_BASIS unset) | 'plan3m' — the PRODUCTION basis; only its plan drives SWITCH actions
+  PROP_ROT_BASIS: 'DP2_ROTATION_BASIS',  // v1.2.14: '12m' (default, = TFB_OPP_ROTATION_BASIS unset) | 'plan3m' — the PRODUCTION basis; only its plan drives SWITCH actions
+  PROP_CF_SAR: 'DP2_CASH_FLOOR_SAR',     // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_SAR (absolute reserve) — read only when the Top_10 sheet carries no cash_floor alert
+  PROP_CF_PCT: 'DP2_CASH_FLOOR_PCT',     // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_PCT (percent of NAV)
+  PROP_CF_MODE: 'DP2_CASH_FLOOR_MODE'    // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_MODE ('observe' default = no reserve taken · 'enforce')
 };
 /* Research allocation + rotation (v1.2.0) — a faithful mirror of the backend's conviction-weighted seat sizing
  * (opportunity_builder v1.27.0, TFB_OPP_SIZING_MODE=conviction) and its rotation funding plans (v1.18.0+):
@@ -605,10 +615,23 @@ function dp2ParseFeed_(kv) {
 }
 function dp2ReadTop10_() {
   var sh = dp2Sheet_(DP2.SRC_T10, false);
-  var out = { ok: false, status: '', kpi: {}, panel: {}, seats: [], qualified: [], gaps: [], banner: '' };
+  var out = { ok: false, status: '', kpi: {}, panel: {}, seats: [], qualified: [], gaps: [], banner: '', alerts: {} };
   if (!sh) return out;
   var vals = sh.getDataRange().getValues();
   out.ok = true;
+  // v1.2.15: the engine's ALERTS table (type · count · required action) — the cash_floor row states the reserve the engine took
+  (function () {
+    var inA = false;
+    for (var ra = 0; ra < vals.length; ra++) {
+      var c0 = dp2Str_(vals[ra][0]).trim();
+      if (/^ALERTS/.test(c0)) { inA = true; continue; }
+      if (!inA) continue;
+      if (!c0) { if (Object.keys(out.alerts).length) break; else continue; }
+      if (c0 === 'Type') continue;
+      if (/^[a-z][a-z0-9_]*$/.test(c0)) out.alerts[c0] = { count: dp2Num_(vals[ra][1]), text: dp2Str_(vals[ra][2]) };
+      else if (Object.keys(out.alerts).length) break;
+    }
+  })();
   out.status = dp2Str_(vals.length > 1 ? vals[1][1] : '');
   // control panel: scan the first 16 rows for label/value pairs
   for (var r = 0; r < Math.min(16, vals.length); r++) {
@@ -618,7 +641,7 @@ function dp2ReadTop10_() {
     }
   }
   // KPI row: the label row that holds 'Entered cash' in any column; values sit in the next row
-  var kr = dp2FindRow_(vals, function (row) { for (var c = 0; c < row.length; c++) { if (/^entered cash/i.test(dp2Str_(row[c]).trim())) return true; } return false; });
+  var kr = dp2FindRow_(vals, function (row) { for (var c = 0; c < row.length; c++) { var cl = dp2Str_(row[c]).trim(); if (/^entered cash/i.test(cl) || /^deployable \(sar\)$/i.test(cl)) return true; } return false; });   // v1.2.15: current layout heads the KPI row with 'Deployable (SAR)'
   if (kr >= 0 && kr + 1 < vals.length) { for (var i = 0; i < vals[kr].length; i++) { var k = dp2Str_(vals[kr][i]).trim(); if (k) out.kpi[k] = vals[kr + 1][i]; } }
   out.enteredCash = null;
   for (var kk in out.kpi) { if (out.kpi.hasOwnProperty(kk) && /^entered cash/i.test(kk)) { out.enteredCash = dp2Num_(out.kpi[kk]); } }
@@ -1165,11 +1188,12 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
     prevMom = mom;
   }
   firstHit = hits.length ? hits[0] : null; firstMom = moms.length ? moms[0] : null;
+  var hitNow = prevHit, momNow = prevMom;   // v1.2.15: is the last bar inside the latest episode?
   var lastBar = bars[bars.length - 1];
   var last = (lastOverride !== null && lastOverride !== undefined && lastOverride > 0) ? lastOverride : lastBar.c;
   return { entry: entry, entryBar: bars[e].date, atrEntry: a0, s0: s0, R: R, hi: hi, gainR: gainR, atr: a, sma: sma, stop: stop, trailMult: trailMult,
            beLocked: beLocked, momentum: mom, last: last, lastDate: lastBar.date, barsSinceEntry: bars.length - e, firstHit: firstHit, firstMom: firstMom,
-           hits: hits, moms: moms, atrApprox: atrApprox, barsBeforeEntry: e, lastR: R > 0 ? (last - entry) / R : null };
+           hits: hits, moms: moms, hitNow: hitNow, momNow: momNow, atrApprox: atrApprox, barsBeforeEntry: e, lastR: R > 0 ? (last - entry) / R : null };
 }
 /* Signal for a held lot. x = dp2ExitCompute_ result (or null), br = { tp, stop } working broker levels (null when none), fallbackLast.
  * alert = immediate e-mail (SELL NOW); advisory = at most one e-mail per cooldown (stop near / raise / missing broker stop). */
@@ -1234,7 +1258,7 @@ function dp2EngineNaWhy_(xb, entryDate) {
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
 /* ========================================================= dynamic exits (v1.1.0): state + alerts */
-var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)', 'Latched exit', 'Lot'];   // v1.2.7: col 22 = the latched rule-exit date · v1.2.12: col 23 = lot key (symbol@entry#n)
+var DP2X_STATE_HDR_ = ['Symbol', 'Name', 'Qty', 'Entry', 'Entry date', 'Initial stop', 'R', 'Highest close', 'ATR14', 'SMA10', 'Last', 'Dyn stop', 'Signal', 'Signal text', 'Signal since', 'Last alert signal', 'Last alert at (ms)', 'Last raise alert (ms)', 'Bars as of', 'Source', 'Updated (Riyadh)', 'Latched exit', 'Lot', 'Last alert episode'];   // v1.2.7: col 22 = the latched rule-exit date · v1.2.12: col 23 = lot key (symbol@entry#n) · v1.2.15: col 24 = episode date of the last sell alert
 function dp2ExitStateRead_() {
   var sh = dp2Sheet_(DP2X.SHEET_STATE, false);
   var out = {};
@@ -1243,7 +1267,7 @@ function dp2ExitStateRead_() {
   for (var i = 0; i < vals.length; i++) {
     var sym = dp2Str_(vals[i][0]).trim(); if (!sym) continue;
     var lotKey = dp2Str_(vals[i][22]).trim() || sym;   // v1.2.12: one state row per LOT; legacy rows (no lot column) key by symbol
-    out[lotKey] = { symbol: sym, signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]) };
+    out[lotKey] = { symbol: sym, signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]), lastAlertEpisode: dp2DateStr_(vals[i][23]) || dp2Str_(vals[i][23]) };
   }
   return out;
 }
@@ -1256,7 +1280,7 @@ function dp2ExitStateWrite_(rows) {
   if (rows.length) {
     sh.getRange(2, 5, rows.length, 1).setNumberFormat('@');
     sh.getRange(2, 15, rows.length, 1).setNumberFormat('@');
-    sh.getRange(2, 19, rows.length, 5).setNumberFormat('@');
+    sh.getRange(2, 19, rows.length, 6).setNumberFormat('@');
     sh.getRange(2, 1, rows.length, DP2X_STATE_HDR_.length).setValues(rows);
   }
   sh.setFrozenRows(1);
@@ -1288,8 +1312,12 @@ function dp2ExitAlertsLocked_(items, fx) {
   for (var i = 0; i < items.length; i++) {
     var it = items[i], k0 = it.lotKey || it.symbol, p = prev[k0] || prev[it.symbol] || {};
     var since = (p.signal === it.sig.code && p.since) ? p.since : nowStr;
-    var st = { signal: it.sig.code, since: since, lastAlertSignal: p.lastAlertSignal || '', lastAlertAt: p.lastAlertAt || 0, lastRaiseAt: p.lastRaiseAt || 0, sendKind: '' };
-    if (it.sig.alert && (st.lastAlertSignal !== it.sig.code || !st.lastAlertAt || now - st.lastAlertAt >= cooldown)) st.sendKind = 'sell';
+    var st = { signal: it.sig.code, since: since, lastAlertSignal: p.lastAlertSignal || '', lastAlertAt: p.lastAlertAt || 0, lastRaiseAt: p.lastRaiseAt || 0, lastAlertEpisode: p.lastAlertEpisode || '', sendKind: '' };
+    // v1.2.15 (review finding): STOP_HIT / SELL_NOW / EXIT_LATCHED are one SELL family keyed to the exit EPISODE — a
+    // presentation change between them never resets the cooldown; a genuinely new episode alerts at once.
+    var episode = dp2ExitEpisode_(it);
+    var prevSell = /^(STOP_HIT|SELL_NOW|EXIT_LATCHED)$/.test(st.lastAlertSignal);
+    if (it.sig.alert && (!prevSell || !st.lastAlertAt || (episode && st.lastAlertEpisode && episode !== st.lastAlertEpisode && episode > st.lastAlertEpisode) || now - st.lastAlertAt >= cooldown)) { st.sendKind = 'sell'; st.episode = episode; }
     else if (DP2X.ALERT_RAISE && it.sig.advisory && (!st.lastRaiseAt || now - st.lastRaiseAt >= cooldown)) st.sendKind = 'advisory';
     if (st.sendKind) send.push(it);
     states[k0] = st;
@@ -1301,16 +1329,30 @@ function dp2ExitAlertsLocked_(items, fx) {
       result.sent = 1; result.signals = send.length;
       for (i = 0; i < send.length; i++) {
         var s2 = states[send[i].lotKey || send[i].symbol];
-        if (s2.sendKind === 'sell') { s2.lastAlertSignal = send[i].sig.code; s2.lastAlertAt = now; } else { s2.lastRaiseAt = now; }
+        if (s2.sendKind === 'sell') { s2.lastAlertSignal = send[i].sig.code; s2.lastAlertAt = now; s2.lastAlertEpisode = s2.episode || s2.lastAlertEpisode || ''; } else { s2.lastRaiseAt = now; }
       }
     } catch (e) { result.error = String(e && e.message || e); }
   }
   for (i = 0; i < items.length; i++) {
     var it2 = items[i], x = it2.x, s3 = states[it2.lotKey || it2.symbol];
-    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr, (it2.sig.latched && !it2.sig.latchedAck) ? it2.sig.latched.date : '', it2.lotKey || it2.symbol]);
+    rows.push([it2.symbol, it2.name || '', it2.qty, it2.entry, it2.entryDate || '', x ? x.s0 : '', x ? x.R : '', x ? x.hi : '', x ? x.atr : '', x ? (x.sma === null ? '' : x.sma) : '', it2.sig.last, x ? x.stop : '', it2.sig.code, it2.sig.text, s3.since, s3.lastAlertSignal, s3.lastAlertAt || '', s3.lastRaiseAt || '', it2.barsAsOf || '', it2.source || '', nowStr, (it2.sig.latched && !it2.sig.latchedAck) ? it2.sig.latched.date : '', it2.lotKey || it2.symbol, s3.lastAlertEpisode || '']);
   }
   try { dp2ExitStateWrite_(rows); } catch (e4) { result.error = (result.error ? result.error + ' · ' : '') + 'state: ' + String(e4 && e4.message || e4); }
   return result;
+}
+/* v1.2.15: the exit EPISODE a sell signal belongs to — the latched date, else the start of the current stop / momentum
+ * episode from the replay, else the bar date. Two sell codes about the same episode are the same alert. */
+function dp2ExitEpisode_(it) {
+  var s = it.sig, x = it.x;
+  if (s.code === 'EXIT_LATCHED' && s.latched && s.latched.date) return s.latched.date;
+  if (!x) return '';
+  if (s.code === 'SELL_NOW') { var mm = x.moms || []; return mm.length ? mm[mm.length - 1].date : (x.lastDate || ''); }
+  if (s.code === 'STOP_HIT') {
+    // the live quote may break the stop before the bar shows it: that is a NEW episode dated by the last bar + ' live'
+    var hh = x.hits || [];
+    return (x.hitNow && hh.length) ? hh[hh.length - 1].date : ((x.lastDate || '') + ' live');
+  }
+  return x.lastDate || '';
 }
 function dp2ExitLine_(it, fx) {
   var x = it.x, s = it.sig;
@@ -1544,14 +1586,15 @@ function dp2PlanSeats_(t, fx, xbars, qmap) {
   return out;
 }
 /* Allocation of the deployable cash across the plan seats (research). pvSar = holdings value; cashSar = cash; navSar = pv + cash. */
-function dp2Allocate_(plans, cashSar, pvSar, secCtx) {
+function dp2Allocate_(plans, cashSar, pvSar, secCtx, reserveSar) {
   var cash = Math.max(0, cashSar || 0), pv = Math.max(0, pvSar || 0), nav = cash + pv;
   // v1.2.9 (review finding): the engine's post-action PORTFOLIO sector cap (pf_max_sector_pct, 'budget' basis =
   // portfolio + deployable) — a seat whose sector would exceed it is deferred (SECTOR_CAP), and a top-up that would is skipped.
   var secSar = (secCtx && secCtx.sectors) ? secCtx.sectors : null, secMax = (secCtx && secCtx.maxPct) ? secCtx.maxPct : null;
   var secTotal = function () { return pv + cash; };   // v1.2.11: the engine's budget_base (pre-reserve NAV; the reserve shrinks the budget, not NAV)
   var secOk = function (sec, addSar) { if (!secSar || !secMax) return true; var tot = secTotal(); if (tot <= 0) return true; return ((secSar[sec] || 0) + addSar) / tot * 100 <= secMax + 1e-9; };
-  var floorSar = nav * DP2.CASH_FLOOR_PCT;
+  // v1.2.15: the reserve is the ENGINE's (dp2CashReserve_), passed in by dp2ResearchAllocation_; the PF 10 % figure is kept only when no reserve is given (legacy callers)
+  var floorSar = (reserveSar !== undefined && reserveSar !== null) ? Math.max(0, reserveSar) : nav * DP2.CASH_FLOOR_PCT;
   var deployable = Math.max(0, cash - floorSar);
   var cap = DP2A.MAX_WEIGHT_PCT / 100 * (pv + cash);   // v1.2.11 (review finding): cap on budget_base = portfolio + cash BEFORE the reserve, as _select_and_size
   var weights = {}, i, p;
@@ -1747,6 +1790,48 @@ function dp2RotationBasis_(t) {
   return (/3m|plan3m|plan 3m/.test(v)) ? 'plan3m' : '12m';
 }
 function dp2RotationBasisLabel_(b) { return b === 'plan3m' ? 'plan 3M' : 'engine 12M'; }
+/* v1.2.15 (review finding): the CASH RESERVE the engine takes from the SIZING budget — never a hard-coded 10 %.
+ * Engine rule (_select_and_size / _cash_floor_pct_ctx): the reserve binds sizing only in ENFORCE mode —
+ *   pct set   → floor = max(TFB_OPP_CASH_FLOOR_SAR, pct × NAV), NAV = holdings + cash; reserve = min(cash, floor)
+ *   pct unset → an absolute TFB_OPP_CASH_FLOOR_SAR binds only with an explicit TFB_OPP_CASH_FLOOR_MODE=enforce
+ *   observe / off → nothing is taken from sizing (an absolute reserve then only relabels funding).
+ * Inputs, in order: the engine's own cash_floor alert on the Top_10 sheet (mode, pct, absolute floor — emitted on
+ * every build that has a floor in observe/enforce) → Script Properties DP2_CASH_FLOOR_SAR / _PCT / _MODE mirroring
+ * the Render ENV → none. The rule is re-applied to the CURRENT cash and NAV. The PF page's 10 % floor stays a
+ * LIMITS check on Portfolio_Decision_v2, not a sizing input. */
+function dp2CashReserve_(t, cashSar, navSar) {
+  var cash = Math.max(0, cashSar || 0), nav = Math.max(0, navSar || 0);
+  var out = { sar: 0, floor: 0, mode: 'off', abs: null, pct: null, source: '', pfFloor: nav * DP2.CASH_FLOOR_PCT };
+  var num = function (v) { var n = dp2Num_(dp2Str_(v).replace(/,/g, '')); return n; };
+  var cf = (t && t.alerts && t.alerts.cash_floor) ? dp2Str_(t.alerts.cash_floor.text) : '';
+  var abs = null, pct = null, mode = null, src = '';
+  if (cf) {
+    mode = /ENFORCED/i.test(cf) ? 'enforce' : (/\(observe\)/i.test(cf) ? 'observe' : null);
+    var mAbs = /^Cash floor\s+([\d,\.]+)\s*SAR\s*\(absolute reserve/i.exec(cf);
+    var mPct = /^Cash floor\s+([\d\.]+)%\s+of NAV\s+([\d,\.]+)\s*SAR\s*=\s*([\d,\.]+)\s*SAR/i.exec(cf);
+    if (mAbs) abs = num(mAbs[1]);
+    else if (mPct) { pct = num(mPct[1]); if (/absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter/i.test(cf)) abs = num(mPct[3]); }
+    src = 'engine cash_floor alert (last sync)';
+  }
+  var pa = num(dp2Prop_(DP2X.PROP_CF_SAR)), pp = num(dp2Prop_(DP2X.PROP_CF_PCT)), pm = dp2Str_(dp2Prop_(DP2X.PROP_CF_MODE)).trim().toLowerCase();
+  if (!cf) {
+    if (pm || pa !== null || pp !== null) {
+      abs = pa; pct = pp; src = 'Script Properties DP2_CASH_FLOOR_* (mirror of the Render ENV)';
+      mode = pm === 'enforce' ? 'enforce' : (pp !== null || pm === 'observe' ? 'observe' : null);
+    }
+  } else if (abs === null && pa !== null) abs = pa;   // the alert does not state an absolute reserve below the pct floor
+  out.abs = abs; out.pct = pct; out.mode = mode || 'off';
+  if (mode === 'enforce') {
+    out.floor = pct !== null ? Math.max(abs || 0, pct / 100 * nav) : (abs || 0);
+    out.sar = Math.min(cash, out.floor);
+    out.source = src + ': ' + (pct !== null ? pct + '% of NAV ' + dp2Fmt_(nav) + (abs ? ' or the absolute ' + dp2Fmt_(abs) + ', the stricter' : '') : 'absolute reserve ' + dp2Fmt_(abs || 0)) + ' ENFORCED → ' + dp2Fmt_(out.sar) + ' SAR kept out of sizing';
+  } else if (mode === 'observe') {
+    out.source = src + ': floor in OBSERVE mode — nothing taken from the sizing budget';
+  } else {
+    out.source = src ? src + ': no binding reserve' : 'no cash_floor alert on the Top_10 sheet and no DP2_CASH_FLOOR_* property — the engine takes no reserve';
+  }
+  return out;
+}
 /* One shared research allocation per execution: plans → allocation → funding plans on both bases. */
 var DP2A_MEMO_ = null;   // { key: '<cash>|<fx>', alloc } — v1.2.2: a different cash figure or fx recomputes instead of returning the memo
 function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
@@ -1767,8 +1852,9 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   var secCtx = { sectors: {}, maxPct: null };
   for (i = 0; i < eq.length; i++) { var sName = (eq[i].mp && eq[i].mp.sector) || 'Other'; secCtx.sectors[sName] = (secCtx.sectors[sName] || 0) + (eq[i].mvSar || 0); }
   try { var pdp = dp2ReadPortfolioDecision_(); secCtx.maxPct = dp2Num_(pdp.panel['PF: Max Sector %']) || null; } catch (eSC) { secCtx.maxPct = null; }
-  var alloc = dp2Allocate_(plans, cashSar, pv, secCtx);
-  alloc.secCtx = secCtx;
+  var reserve = dp2CashReserve_(t, cashSar, (cashSar || 0) + pv);   // v1.2.15: the engine's reserve, not a hard-coded 10 %
+  var alloc = dp2Allocate_(plans, cashSar, pv, secCtx, reserve.sar);
+  alloc.secCtx = secCtx; alloc.reserve = reserve;
   var holdings = dp2RotationHoldings_(eq, fi, ib, qmap, seatMap);
   alloc.holdings = holdings;
   alloc.plans12 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '12m');
@@ -1887,7 +1973,7 @@ function buildPortfolioDecisionV2() {
     { label: 'Equities', value: dp2Fmt_(eqSar) + ' SAR', sub: dp2PctPlain_(navSar ? eqSar / navSar * 100 : null) + ' · ' + eq.length + ' lots · unrealized ' + dp2Signed_(unrealEqSar) + ' SAR' },
     { label: 'Sukuk', value: dp2Fmt_(fiSar) + ' SAR', sub: dp2PctPlain_(navSar ? fiSar / navSar * 100 : null) + ' · ' + (fi.length ? fi.map(function (l) { return l.symbol + (pd.excluded && pd.excluded.indexOf(l.symbol) >= 0 ? ' (outside execution scope)' : ''); }).join(', ') : 'none') },
     { label: 'Cash', value: dp2Fmt_(cashSar) + ' SAR', sub: dp2PctPlain_(navSar ? (cashSar || 0) / navSar * 100 : null) + ' · floor 10% = ' + dp2Fmt_(floorSar) },
-    { label: 'Deployable', value: dp2Fmt_(deploySar) + ' SAR', sub: 'Tranche 0 · board-originated 0 (S-1 ' + (s1.verdict || 'n/a') + ')' },
+    { label: 'Deployable', value: dp2Fmt_(alloc ? alloc.deployable : deploySar) + ' SAR', sub: (alloc && alloc.reserve ? 'engine reserve ' + dp2Fmt_(alloc.floorSar) + ' SAR (' + alloc.reserve.mode + ') · PF 10% policy floor ' + dp2Fmt_(floorSar) : 'after PF 10% floor ' + dp2Fmt_(floorSar)) + ' · Tranche 0 (S-1 ' + (s1.verdict || 'n/a') + ')' },
     { label: 'Unrealized', value: dp2Signed_(unrealEqSar) + ' SAR', sub: 'equity lots, ledger · active lots total ' + dp2Signed_(activeTotal) + ' SAR', color: unrealEqSar >= 0 ? DP2C.green : DP2C.red },
     { label: 'Return (TWR)', value: twr === null ? 'n/a' : dp2Pct_(twr * 100, 1), sub: twr === null ? 'add rows to _IBKR_NAV_History' : 'since ' + (twrRows[0][0]) + ' · inception ' + dp2Pct_(twrInception, 1) + ' · max DD ' + (twrMaxDD === null ? 'n/a' : dp2Pct_(twrMaxDD * 100, 1) + ' (to ' + (dp2DateStr_(twrMaxDDDate) || dp2Str_(twrMaxDDDate)) + ')'), color: (twr !== null && twr >= 0) ? DP2C.green : DP2C.red },
     { label: 'Feed / S-1', value: (feed.state || 'n/a').replace('NOT_ACTIONABLE', 'NOT ACTIONABLE'), sub: 'S-1 ' + (s1.verdict || 'n/a') + ' · calibration ' + (/as_of=([0-9-]+)/.exec(kv['TFB Calibration'] || '') || ['', 'n/a'])[1], color: /^ACTIONABLE/.test(feed.state) ? DP2C.green : DP2C.red }
@@ -2216,7 +2302,7 @@ function buildTop10V2() {
     { label: 'Merit-qualified', value: dp2Fmt_(qCount), sub: (t.gapsTotal ? 'of ' + t.gapsTotal + ' audited · ' : '') + (function () { var f = 0; for (var i = 0; i < qualified.length; i++) if (dp2Str_(qualified[i]['Sector']) === 'Financials') f++; return f + ' Financials'; })() },
     { label: 'Held seats', value: dp2Fmt_(seats.length), sub: fast.length + ' fast-track · ' + grace.length + ' grace-held' },
     { label: 'Executable', value: dp2Fmt_(executable), sub: 'of ' + seats.length + ' · ' + (t.output || ''), color: executable > 0 ? DP2C.green : DP2C.red },
-    { label: 'Entered cash', value: dp2Fmt_(cashSar) + ' SAR', sub: cashSource + ' · deployable after 10% floor ' + dp2Fmt_(deploy) },
+    { label: 'Entered cash', value: dp2Fmt_(cashSar) + ' SAR', sub: cashSource + ' · deployable after the engine\'s reserve ' + dp2Fmt_(alloc ? alloc.deployable : deploy) + (alloc && alloc.reserve ? ' (' + (alloc.floorSar > 0 ? 'reserve ' + dp2Fmt_(alloc.floorSar) : 'no reserve') + ')' : '') },
     { label: 'Allocated (research)', value: alloc ? dp2Fmt_(alloc.allocated) + ' SAR' : 'n/a', sub: alloc ? ('of deployable ' + dp2Fmt_(alloc.deployable) + ' · ' + alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length + ' of ' + alloc.plans.length + ' plans funded · cap ' + dp2Fmt_(alloc.cap) + '/seat') : 'allocation unavailable', color: alloc && alloc.allocated > 0 ? DP2C.green : DP2C.ink },
     { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records', color: DP2C.amber }
   ];
@@ -2246,7 +2332,7 @@ function buildTop10V2() {
   row++;
 
   // seats table — 3-month close, research allocation (conviction mirror), initial dynamic stop
-  row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR, cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% NAV). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
+  row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR, the engine\'s own cash reserve). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
   var sHdr = ['#', 'Symbol · name', '3-month close', 'Seat status', 'Price', 'Alloc SAR', 'Buy qty', 'Dyn. stop (2×ATR)', 'Risk SAR', 'Exp. gain 3M', 'ROI 3M plan', 'ROI 12M eng.', 'Rel · DQ · score', 'Flags'];
   var sSp = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2];
   var sRows = [], sRisk = [], sState = [];
@@ -2330,7 +2416,7 @@ function buildTop10V2() {
     var aRows = [
       ['Cash available (' + cashSource + ')', dp2Fmt_(alloc.cash) + ' SAR'],
       ['Cash check (other reading)', cb.other !== null ? cb.otherLabel + ': ' + dp2Fmt_(cb.other) + ' SAR (' + (cb.diffPct >= 0 ? '+' : '') + dp2Fmt_(cb.diffPct, 1) + '%)' + (cb.warn ? ' — RECONCILE before placing orders' : ' · consistent') : 'no second reading', cb.warn ? DP2C.amber : DP2C.ink2],
-      ['Cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% of NAV ' + dp2Fmt_(alloc.nav), dp2Fmt_(alloc.floorSar) + ' SAR'],
+      ['Cash reserve taken before sizing (engine)', dp2Fmt_(alloc.floorSar) + ' SAR — ' + (alloc.reserve ? alloc.reserve.source : 'n/a') + ' · PF policy floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% of NAV ' + dp2Fmt_(alloc.nav) + ' = ' + dp2Fmt_(alloc.reserve ? alloc.reserve.pfFloor : alloc.nav * DP2.CASH_FLOOR_PCT) + ' SAR is a LIMITS check, not a sizing input', alloc.floorSar > 0 ? DP2C.ink : DP2C.ink2],
       ['Deployable', dp2Fmt_(alloc.deployable) + ' SAR', DP2C.green],
       ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + cash ' + dp2Fmt_(alloc.cash) + ', pre-reserve — the engine\'s budget_base)', dp2Fmt_(alloc.cap) + ' SAR'],
       ['Plans in the sizing cohort', alloc.plans.length + ' · ' + alloc.plans.map(function (p) { return p.sym + ' (' + (p.roiVal !== null ? dp2PctPlain_(p.roiVal, 1) + ' val' + (p.roiValSource === 'tp1x2' ? '≈' : '') : 'ROI n/a → ' + DP2A.REQUIRED_ROI_PCT + '%') + ')'; }).join(', ') + ' · weight = valuation ROI × risk × reliability (engine roi_pct) · caps ' + (function () { var c = dp2CohortCaps_(t); return c.maxSelected + ' seats / ' + c.maxPerSector + ' per sector / ' + c.maxPerMarket + ' per market (' + (c.fromPanel ? 'Top_10 panel' : 'defaults') + ')'; })()],
