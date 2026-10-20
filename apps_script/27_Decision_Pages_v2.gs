@@ -1,7 +1,11 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.23 (2026-10-20)
+ * Version: 1.2.24 (2026-10-20)
+ *   1.2.24: RED ROWS FOR UNREAD DATA (owner request): a conditional-format rule on Market_Leaders, Global_Markets,
+ *          Commodities_FX and Mutual_Funds paints the whole row red when the sync could not read it (no price, kept
+ *          last good / identity not verified, or no successful update for 2 days) and clears by itself on the next good
+ *          read. Re-applied on every v2 build and from the menu; other rules on the pages are kept.
  *   1.2.23: NO TIMEOUTS. (a) Every notice is non-blocking (dp2Notify_: a modeless dialog, a toast without a UI, always the
  *          log) — Ui.alert waited for OK in the spreadsheet tab when a function ran from the script editor, until
  *          'Exceeded maximum execution time'. (b) One run clock per execution: price-history downloads stop after
@@ -226,7 +230,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.23';
+var DP2_VERSION = '1.2.24';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -241,6 +245,9 @@ var DP2 = {
   SRC_STATUS: '_Status',
   SRC_PERF: 'Performance_Log',
   SRC_GM: 'Global_Markets',
+  FLAG_STALE_DAYS: 2,        // v1.2.24: a market row not refreshed for this many days turns red (see dp2EnsureStaleFlags_)
+  FLAG_BG: '#f4c7c3',        // v1.2.24: red row fill
+  FLAG_FG: '#7f0000',        // v1.2.24: dark red text
   SRC_S1: 'S1_Gate',
   SRC_SHADOW: 'Shadow_Board',
   IB_ACCOUNT: '_IBKR_Account',
@@ -365,6 +372,7 @@ function buildDecisionPagesV2() {
   // v1.2.23: never start the second page this close to the 6-minute limit — it is refreshed on its own instead
   var t10 = dp2RunElapsed_() > DP2X.RUN_SOFT_LIMIT_MS ? { rows: 0, skipped: true } : buildTop10V2();
   var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's — ' + DP2.SHEET_PD + ' (' + pd.rows + ' rows) · ' + (t10.skipped ? DP2.SHEET_T10 + ' NOT rebuilt (the first page used ' + Math.round(dp2RunElapsed_() / 1000) + ' s of the 6-minute limit — refresh it on its own)' : DP2.SHEET_T10 + ' (' + t10.rows + ' rows)');
+  try { dp2EnsureStaleFlags_(); } catch (eF) { Logger.log('stale-row flags skipped: ' + eF); }   // v1.2.24
   try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, t10.skipped ? 20 : 8); } catch (e) {}
   return { ok: true, pd: pd, t10: t10, ms: Date.now() - t0 };
 }
@@ -437,6 +445,7 @@ function dp2_addTopMenu(ui) {
     .addItem('🌱 Seed IBKR Tabs (first run)', 'dp2SeedIbkrTabs')
     .addItem('🧪 Self-Test: Decision Pages v2', 'dp2SelfTest')
     .addSeparator()
+    .addItem('🔴 Market pages — flag unread rows red', 'dp2FlagUnreadRows')
     .addItem('🧰 Owner setup — status', 'dp2OwnerSetupStatus')
     .addItem('🧰 Owner setup — install Decision Chain + IBKR capture watcher', 'dp2InstallOwnerTriggers');
   m.addToUi();
@@ -505,6 +514,74 @@ function dp2OwnerSetupStatus() {
   var msg = lines.join('\n');
   dp2Notify_(msg, 'Decision Pages v2 — owner setup status');
   return msg;
+}
+
+/* v1.2.24: RED ROWS FOR UNREAD DATA, CLEARED BY THE NEXT GOOD READ. A conditional-format rule on the four market pages
+ * paints the WHOLE row red when the sync could not read it: no price (acquisition_status:unavailable,
+ * quote_current_price_missing), a kept-last-good row (acquisition_status:preserved, identity_quarantined), or no
+ * successful update for DP2.FLAG_STALE_DAYS days (Last Updated (UTC)). It is a live rule, not a fill: the moment a
+ * sync writes a good row the red disappears by itself. One rule per page, marked TFB-STALE-v1 and placed first so it
+ * wins; every other rule on the page is kept. Re-applied on every v2 build and from the menu (idempotent). */
+var DP2_FLAG_PAGES_ = ['Market_Leaders', 'Global_Markets', 'Commodities_FX', 'Mutual_Funds'];
+var DP2_FLAG_MARK_ = 'TFB-STALE-v1';
+var DP2_FLAG_RE_ = 'acquisition_status:(unavailable|preserved)|identity_quarantined|quote_current_price_missing';
+function dp2ColLetter_(n) { var t = ''; while (n > 0) { var m = (n - 1) % 26; t = String.fromCharCode(65 + m) + t; n = Math.floor((n - 1) / 26); } return t; }
+function dp2StaleFlagFormula_(wCol, uCol) {
+  return '=AND(N("' + DP2_FLAG_MARK_ + '")=0,$A2<>"",OR(REGEXMATCH($' + wCol + '2,"' + DP2_FLAG_RE_ + '"),IFERROR(DATEVALUE(LEFT($' + uCol + '2,10))<TODAY()-' + DP2.FLAG_STALE_DAYS + ',TRUE)))';
+}
+/* The same predicate in script (for the counts in the notice and the harness): warnings text, Last Updated (UTC) text,
+ * today as yyyy-MM-dd. A blank or unreadable timestamp counts as unread, as IFERROR(…, TRUE) does in the rule. */
+function dp2StaleRow_(warnings, lastUtc, today) {
+  if (new RegExp(DP2_FLAG_RE_).test(dp2Str_(warnings))) return true;
+  var d = /^(\d{4})-(\d{2})-(\d{2})/.exec(dp2Str_(lastUtc).trim());
+  if (!d) return true;
+  var t = /^(\d{4})-(\d{2})-(\d{2})/.exec(dp2Str_(today));
+  if (!t) return false;
+  var days = (Date.UTC(+t[1], +t[2] - 1, +t[3]) - Date.UTC(+d[1], +d[2] - 1, +d[3])) / 86400000;
+  return days > DP2.FLAG_STALE_DAYS;
+}
+function dp2EnsureStaleFlags_() {
+  var ss = dp2Ss_(), out = [];
+  for (var p = 0; p < DP2_FLAG_PAGES_.length; p++) {
+    var page = DP2_FLAG_PAGES_[p], sh = ss.getSheetByName(page);
+    if (!sh) continue;
+    var lc = sh.getLastColumn(), lr = sh.getLastRow();
+    if (lc < 2 || lr < 2) { out.push({ page: page, note: 'empty' }); continue; }
+    var hdr = sh.getRange(1, 1, 1, lc).getValues()[0], w = -1, u = -1;
+    for (var c = 0; c < hdr.length; c++) { var h = dp2Str_(hdr[c]).trim(); if (h === 'Warnings' && w < 0) w = c + 1; else if (h === 'Last Updated (UTC)' && u < 0) u = c + 1; }
+    if (w < 0 || u < 0) { out.push({ page: page, note: 'Warnings / Last Updated (UTC) header not found — not flagged' }); continue; }
+    var formula = dp2StaleFlagFormula_(dp2ColLetter_(w), dp2ColLetter_(u));
+    var rng = sh.getRange(2, 1, Math.max(1, sh.getMaxRows() - 1), sh.getMaxColumns());
+    var rules = sh.getConditionalFormatRules() || [], keep = [], same = false;
+    for (var i = 0; i < rules.length; i++) {
+      var bc = null; try { bc = rules[i].getBooleanCondition(); } catch (eB) { bc = null; }
+      var vals = bc ? bc.getCriteriaValues() : [], f = (vals && vals.length) ? String(vals[0]) : '';
+      if (f.indexOf(DP2_FLAG_MARK_) >= 0) {
+        var rs = rules[i].getRanges() || [];
+        if (i === 0 && f === formula && rs.length === 1 && rs[0].getA1Notation() === rng.getA1Notation()) same = true;
+        continue;
+      }
+      keep.push(rules[i]);
+    }
+    if (!same) {
+      var rule = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(formula).setBackground(DP2.FLAG_BG).setFontColor(DP2.FLAG_FG).setRanges([rng]).build();
+      sh.setConditionalFormatRules([rule].concat(keep));
+    }
+    // count today's red rows with the same predicate (Symbol, Warnings, Last Updated (UTC) only)
+    var n = lr - 1, sv = sh.getRange(2, 1, n, 1).getValues(), wv = sh.getRange(2, w, n, 1).getValues(), uv = sh.getRange(2, u, n, 1).getValues(), red = 0, rows = 0, today = dp2Today_();
+    for (var r = 0; r < n; r++) { if (!dp2Str_(sv[r][0]).trim()) continue; rows++; if (dp2StaleRow_(wv[r][0], uv[r][0], today)) red++; }
+    out.push({ page: page, rows: rows, red: red, note: same ? 'rule in place' : 'rule set' });
+  }
+  return out;
+}
+function dp2FlagUnreadRows() {
+  var res = [];
+  try { res = dp2EnsureStaleFlags_(); } catch (e) { dp2Notify_('Flagging failed: ' + dp2Str_(e && e.message || e)); return null; }
+  var msg = 'Rows the sync could not read are now red on the market pages (whole row). The red clears by itself on the next good read.\n\n' +
+    res.map(function (x) { return x.page + ': ' + (x.rows !== undefined ? x.red + ' red of ' + x.rows + ' rows · ' : '') + x.note; }).join('\n') +
+    '\n\nRed = no price, identity not verified (kept last good), or no successful update for ' + DP2.FLAG_STALE_DAYS + ' days.';
+  dp2Notify_(msg, 'Decision Pages v2 — unread rows');
+  return res;
 }
 
 /* ========================================================= generic helpers */
