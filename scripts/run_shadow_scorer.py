@@ -1,6 +1,21 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.4 (2026-10-20) — TURNOVER / COST DRAG COUNT BUYS AND SELLS
+turnover_pct counted EXITS only (len(prev - cur) / len(prev)), so an add-only
+day {2222.SR} -> {2222.SR, 1120.SR} read turnover 0 and cost_drag_pct 0 even
+though half of 2222.SR is sold and 1120.SR bought. FIX (metric definition, no
+env): equal-weight baskets, one-way turnover = sum|dw| / 2 over the union;
+drag = sum |dw_i| x rt_cost_i / 2 (each side pays half a round trip). That
+add-only day now reads turnover 50% and a drag of
+0.5 x (rt(2222.SR) + rt(1120.SR)) / 2. A full 1-name swap and a half-replaced
+basket keep their old values; a seeded basket now reads 50% one-way turnover
+and is charged one side (rt/2) instead of a full round trip. S-1 NOTE: this
+moves CHAMPION/CHALLENGER/EQW cost drag (and so the chained index) from the
+deploy day on; historical Shadow_History rows are not rewritten. It is an
+S-1 evidence-lane methodology change and needs the Register §5 boundary note.
+Units unchanged (percent of basket value, subtracted by chain_index).
+
 VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
 Lookup/read failures previously became empty regret or shadow history. A failed
 regret read could append an existing fork again, replace its summary and publish
@@ -461,7 +476,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+SCRIPT_VERSION = "1.9.4"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -887,33 +902,46 @@ def basket_return(prev_prices: Dict[str, float],
     return sum(rets) / len(rets), len(rets)
 
 
+def _weight_changes(prev_symbols: Sequence[str],
+                    cur_symbols: Sequence[str]) -> Dict[str, float]:
+    """v1.9.4: |delta weight| per name over the UNION of two EQUAL-WEIGHT
+    baskets (1/n each, the basket_return convention). Zero moves omitted."""
+    prev, cur = set(prev_symbols or []), set(cur_symbols or [])
+    wp = 1.0 / len(prev) if prev else 0.0
+    wc = 1.0 / len(cur) if cur else 0.0
+    out: Dict[str, float] = {}
+    for s in prev | cur:
+        d = abs((wc if s in cur else 0.0) - (wp if s in prev else 0.0))
+        if d > 1e-12:
+            out[s] = d
+    return out
+
+
 def turnover_pct(prev_symbols: Sequence[str],
                  cur_symbols: Sequence[str]) -> float:
-    """Fraction of the basket replaced, 0-100. Empty previous = 100 (initial
-    build is a full purchase)."""
-    prev, cur = set(prev_symbols or []), set(cur_symbols or [])
-    if not prev:
-        return 100.0 if cur else 0.0
-    if not cur:
-        return 100.0
-    return len(prev - cur) / float(len(prev)) * 100.0
+    """v1.9.4: ONE-WAY turnover, 0-100 = sum|dw| / 2 over the union of the
+    two equal-weight baskets (buys and sells both count). A full swap = 100,
+    {A,B}->{A,C} = 50, {A}->{A,B} = 50 (sell half of A, buy B), seed or
+    full liquidation = 50 (one side only). Before v1.9.4 only EXITS counted,
+    so an add-only day read 0 (and was charged no cost)."""
+    return round(sum(_weight_changes(prev_symbols, cur_symbols).values())
+                 / 2.0 * 100.0, 10)
 
 
 def cost_drag_pct(prev_symbols: Sequence[str], cur_symbols: Sequence[str],
                   ticket_sar: float = 15000.0) -> float:
-    """Cost charged for today's turnover: mean round-trip % of the names that
-    actually changed, scaled by turnover fraction. Unknown venues are skipped
-    (never invented)."""
-    prev, cur = set(prev_symbols or []), set(cur_symbols or [])
-    changed = (prev - cur) | (cur - prev)
-    if not changed:
-        return 0.0
-    costs = [c for c in (ob.rt_cost_pct(s, ticket_sar) for s in changed)
-             if c is not None]
-    if not costs:
-        return 0.0
-    tp = turnover_pct(prev_symbols, cur_symbols) / 100.0
-    return (sum(costs) / len(costs)) * tp
+    """v1.9.4: cost charged for today's trades, % of basket value: every buy
+    AND sell of weight |dw| pays half the name's round-trip cost
+    (ob.rt_cost_pct is two sides + spread): sum |dw_i| * rt_i / 2. A full
+    1-name swap therefore still costs (rt_old + rt_new) / 2, as before;
+    add-only and rebalance days now pay too. Unknown venues contribute
+    nothing (never invented)."""
+    total = 0.0
+    for s, dw in _weight_changes(prev_symbols, cur_symbols).items():
+        c = ob.rt_cost_pct(s, ticket_sar)
+        if c is not None:
+            total += dw * c / 2.0
+    return total
 
 
 def chain_index(prev_index: Optional[float], daily_return_pct: Optional[float],
@@ -2356,8 +2384,10 @@ def _selftest() -> int:
                    == (None, 0)))
     checks.append(("turnover: half replaced",
                    turnover_pct(["A", "B"], ["A", "C"]) == 50.0))
-    checks.append(("turnover: seeded basket = 100%",
-                   turnover_pct([], ["A"]) == 100.0))
+    # v1.9.4: one-way turnover = sum|dw|/2; a seed is a buy-only day (50%;
+    # was pinned 100% under the exits-only definition).
+    checks.append(("turnover: seeded basket = 50% one-way",
+                   turnover_pct([], ["A"]) == 50.0))
     checks.append(("turnover: unchanged = 0%",
                    turnover_pct(["A", "B"], ["B", "A"]) == 0.0))
     d = cost_drag_pct(["STNG.US"], ["TRMD.US"])
