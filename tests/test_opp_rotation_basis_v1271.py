@@ -150,8 +150,8 @@ def test_t5_text_and_alert_name_the_basis(monkeypatch):
 
 
 def test_t6_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.4"
     tree = ast.parse((ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8"))
     pins = [n for n in ast.walk(tree) if isinstance(n, ast.Tuple) and len(n.elts) == 4
             and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "core.analysis.opportunity_builder"]
-    assert pins and pins[0].elts[2].value == "1.27.3"
+    assert pins and pins[0].elts[2].value == "1.27.4"

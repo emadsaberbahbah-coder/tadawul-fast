@@ -1,7 +1,12 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.16 (2026-10-20)
+ * Version: 1.2.17 (2026-10-20)
+ *   1.2.17: TWO REVIEW FINDINGS. (a) The rotation test uses PRODUCTION's parameters: hurdles, cost, minimum holding
+ *          days, TP1 proximity and the exclude list come from Script Properties DP2_ROTATION_* mirroring the Render ENV
+ *          (dp2RotParams_; engine defaults otherwise) and are carried on every plan and printed with their source.
+ *          (b) A percent cash-floor alert that names a lower absolute reserve (engine v1.27.4) keeps max(absolute,
+ *          pct × NAV) when the rule is re-applied to the current NAV; an older alert falls back to DP2_CASH_FLOOR_SAR.
  *   1.2.16: REVIEW FINDING. The episode of the last sell alert is read back as RAW TEXT (dp2EpisodeStr_) — a live key
  *          '<last bar> live' was cut to its date and re-sent the same alert on every build. dp2SellAlertDue_ /
  *          dp2EpisodeIsLater_ also treat that live break and the stop touch the next bar records as ONE episode.
@@ -173,7 +178,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.16';
+var DP2_VERSION = '1.2.17';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -244,7 +249,13 @@ var DP2X = {
   PROP_ROT_BASIS: 'DP2_ROTATION_BASIS',  // v1.2.14: '12m' (default, = TFB_OPP_ROTATION_BASIS unset) | 'plan3m' — the PRODUCTION basis; only its plan drives SWITCH actions
   PROP_CF_SAR: 'DP2_CASH_FLOOR_SAR',     // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_SAR (absolute reserve) — read only when the Top_10 sheet carries no cash_floor alert
   PROP_CF_PCT: 'DP2_CASH_FLOOR_PCT',     // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_PCT (percent of NAV)
-  PROP_CF_MODE: 'DP2_CASH_FLOOR_MODE'    // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_MODE ('observe' default = no reserve taken · 'enforce')
+  PROP_CF_MODE: 'DP2_CASH_FLOOR_MODE',   // v1.2.15: mirrors TFB_OPP_CASH_FLOOR_MODE ('observe' default = no reserve taken · 'enforce')
+  PROP_ROT_EDGE: 'DP2_ROTATION_EDGE_PP',          // v1.2.17: mirrors TFB_OPP_ROTATION_EDGE_PP (engine 12M hurdle, default 8)
+  PROP_ROT_EDGE3: 'DP2_ROTATION_EDGE_PP_3M',      // v1.2.17: mirrors TFB_OPP_ROTATION_EDGE_PP_3M (plan 3M hurdle, default 5)
+  PROP_ROT_COST: 'DP2_ROTATION_COST_PCT',         // v1.2.17: mirrors TFB_OPP_ROTATION_COST_PCT (round-trip cost, default 1.1)
+  PROP_ROT_HELD: 'DP2_ROTATION_MIN_HELD_DAYS',    // v1.2.17: mirrors TFB_OPP_ROTATION_MIN_HELD_DAYS (default 7)
+  PROP_ROT_TP1: 'DP2_ROTATION_TP1_PROXIMITY_PCT', // v1.2.17: mirrors TFB_OPP_ROTATION_TP1_PROXIMITY_PCT (default 3)
+  PROP_ROT_EXCL: 'DP2_ROTATION_EXCLUDE'           // v1.2.17: mirrors TFB_OPP_ROTATION_EXCLUDE (default 5023.SR)
 };
 /* Research allocation + rotation (v1.2.0) — a faithful mirror of the backend's conviction-weighted seat sizing
  * (opportunity_builder v1.27.0, TFB_OPP_SIZING_MODE=conviction) and its rotation funding plans (v1.18.0+):
@@ -260,7 +271,7 @@ var DP2A = {
   RISK_MULT: { Low: 1.0, Medium: 0.7, High: 0.4 }, RISK_DEFAULT: 0.7, REL_MIN: 0.5,
   REQUIRED_ROI_PCT: 12,          // T10: Required ROI % — fallback weight when a plan ROI is missing
   MAX_SELECTED: 10, MAX_PER_SECTOR: 2, MAX_PER_MARKET: 10,   // fallbacks only — v1.2.4 reads T10: Max Selected / Max Per Sector / Max Per Market from the Top_10 panel
-  ROT_EDGE_PP_12M: 8,            // TFB_OPP_ROTATION_EDGE_PP (engine 12M basis — production)
+  ROT_EDGE_PP_12M: 8,            // TFB_OPP_ROTATION_EDGE_PP (engine 12M basis — production) · v1.2.17: the ROT_* values are the engine DEFAULTS; dp2RotParams_ reads the production values
   ROT_EDGE_PP_3M: 5,             // TFB_OPP_ROTATION_EDGE_PP_3M (plan 3M basis — proposed, PR)
   ROT_COST_PCT: 1.1,             // TFB_OPP_ROTATION_COST_PCT — round-trip cost
   ROT_MIN_HELD_DAYS: 7,          // TFB_OPP_ROTATION_MIN_HELD_DAYS
@@ -1423,7 +1434,7 @@ function dp2ExitLine_(it, fx) {
   if (s.staleBars) action = 'VERIFY ONLY — the price history is stale (fetch failed; cached bars to ' + (x ? x.lastDate : 'n/a') + '), so this signal was computed on the cockpit quote ' + dp2Fmt_(lastPx, 2) + '. Check the live price and the working stop at the broker; no sale or stop change is instructed by this message. The next successful fetch re-evaluates the rule.';
   if (it.rotation && it.rotation.plan) {
     var rp = it.rotation.plan, rr = rp.rotation;
-    var rtxt = ' SWITCH (research): ' + rr.action.toLowerCase() + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' — ' + (rp.basis === '3m' ? 'plan 3M' : 'engine 12M') + ' ' + dp2PctPlain_(rp.oppRoi, 1) + ' vs this holding ' + dp2PctPlain_(rr.roi, 1) + ' (edge +' + dp2Fmt_(rr.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost).';
+    var rtxt = ' SWITCH (research): ' + rr.action.toLowerCase() + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' — ' + (rp.basis === '3m' ? 'plan 3M' : 'engine 12M') + ' ' + dp2PctPlain_(rp.oppRoi, 1) + ' vs this holding ' + dp2PctPlain_(rr.roi, 1) + ' (edge +' + dp2Fmt_(rr.edge, 1) + ' pp after ' + (rp.cost !== undefined ? rp.cost : DP2A.ROT_COST_PCT) + '% cost).';
     why += rtxt;
     var switchAct = 'SWITCH (research): ' + rr.action.toLowerCase() + ' ' + it.symbol + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' when the feed is released — the engine will carry the same plan. Research only; no order is placed by this page.';
     if (s.staleBars) action += ' ' + switchAct;
@@ -1704,20 +1715,51 @@ function dp2Allocate_(plans, cashSar, pvSar, secCtx, reserveSar) {
 }
 /* Rotation candidates — mirror of _rotation_pick / _funding_plans. holdings: [{symbol, valueSar, roi12, roi3, holdingDays, tp1, price, isFI}].
  * basis '12m' uses engine 12M forecasts (production rule); '3m' uses the plan / expected 3M ROI (proposed TFB_OPP_ROTATION_BASIS=plan3m). */
-function dp2RotationPick_(oppRoi, holdings, basis, minValue) {
+/* v1.2.17 (review finding): the rotation test uses PRODUCTION's parameters, not hard-coded defaults. The cockpit
+ * publishes none of them, so Script Properties mirror the Render ENV: DP2_ROTATION_EDGE_PP (TFB_OPP_ROTATION_EDGE_PP,
+ * 12M hurdle), DP2_ROTATION_EDGE_PP_3M (TFB_OPP_ROTATION_EDGE_PP_3M), DP2_ROTATION_COST_PCT, DP2_ROTATION_MIN_HELD_DAYS,
+ * DP2_ROTATION_TP1_PROXIMITY_PCT, DP2_ROTATION_EXCLUDE — parsed as the engine parses its ENV (_env_rotation_*): blank =
+ * the engine default; a number >= 0, anything else = the default; the exclude list is comma/semicolon separated. */
+function dp2RotParamsDefault_() {
+  var p = { edge12: DP2A.ROT_EDGE_PP_12M, edge3: DP2A.ROT_EDGE_PP_3M, cost: DP2A.ROT_COST_PCT, minHeld: DP2A.ROT_MIN_HELD_DAYS, tp1Prox: DP2A.ROT_TP1_PROX_PCT, exclude: DP2A.ROT_EXCLUDE.slice(), set: [], source: 'engine defaults' };
+  p.hurdle = function (basis) { return (basis === '3m' || basis === 'plan3m') ? p.edge3 : p.edge12; };
+  return p;
+}
+function dp2RotParams_() {
+  var p = dp2RotParamsDefault_();
+  var num = function (prop, key, label) {
+    var raw = dp2Str_(dp2Prop_(prop)).trim();
+    if (raw === '') return;
+    var v = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw) ? Number(raw) : NaN;
+    if (isNaN(v) || v < 0) { p.set.push(label + ' "' + raw + '" invalid → default ' + p[key]); return; }
+    p[key] = v; p.set.push(label + ' ' + v);
+  };
+  num(DP2X.PROP_ROT_EDGE, 'edge12', '12M hurdle');
+  num(DP2X.PROP_ROT_EDGE3, 'edge3', '3M hurdle');
+  num(DP2X.PROP_ROT_COST, 'cost', 'cost %');
+  num(DP2X.PROP_ROT_HELD, 'minHeld', 'min held days');
+  num(DP2X.PROP_ROT_TP1, 'tp1Prox', 'TP1 proximity %');
+  var ex = dp2Str_(dp2Prop_(DP2X.PROP_ROT_EXCL)).trim();
+  if (ex) { p.exclude = ex.toUpperCase().replace(/;/g, ',').split(',').map(function (x) { return x.trim(); }).filter(function (x) { return !!x; }); p.set.push('exclude ' + p.exclude.join(',')); }
+  p.source = p.set.length ? 'Script Properties DP2_ROTATION_* (mirror of the Render ENV): ' + p.set.join(' · ')
+    : 'engine defaults (12M hurdle ' + p.edge12 + ' pp, 3M hurdle ' + p.edge3 + ' pp, cost ' + p.cost + '%) — no DP2_ROTATION_* property set; mirror TFB_OPP_ROTATION_EDGE_PP / _EDGE_PP_3M / _COST_PCT here when you change them on Render';
+  return p;
+}
+function dp2RotationPick_(oppRoi, holdings, basis, minValue, P) {
   if (oppRoi === null || oppRoi === undefined) return null;
-  var edgeMin = basis === '3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M;
+  P = P || dp2RotParams_();   // v1.2.17: production parameters (Script Properties mirroring the ENV), engine defaults otherwise
+  var edgeMin = P.hurdle(basis);
   var best = null;
   for (var i = 0; i < holdings.length; i++) {
     var h = holdings[i];
     if (h.isFI || !h.valueSar || h.valueSar <= 0) continue;
-    if (DP2A.ROT_EXCLUDE.indexOf(h.symbol) >= 0) continue;
-    if (h.holdingDays !== null && h.holdingDays !== undefined && h.holdingDays < DP2A.ROT_MIN_HELD_DAYS) continue;
-    if (h.tp1 && h.price && h.tp1 > 0) { var gap = (h.tp1 - h.price) / h.tp1 * 100; if (gap >= 0 && gap <= DP2A.ROT_TP1_PROX_PCT) continue; }
+    if (P.exclude.indexOf(dp2Str_(h.symbol).trim().toUpperCase()) >= 0) continue;
+    if (h.holdingDays !== null && h.holdingDays !== undefined && h.holdingDays < P.minHeld) continue;
+    if (h.tp1 && h.price && h.tp1 > 0) { var gap = (h.tp1 - h.price) / h.tp1 * 100; if (gap >= 0 && gap <= P.tp1Prox) continue; }
     if (minValue && h.valueSar < minValue - 0.5) continue;   // v1.2.8: eligibility depends on the shortfall only (engine R1); the remnant rule (R2) handles a small holding
     var r = basis === '3m' ? h.roi3 : h.roi12;
     if (r === null || r === undefined) continue;
-    var edge = oppRoi - r - DP2A.ROT_COST_PCT;
+    var edge = oppRoi - r - P.cost;
     if (edge < edgeMin) continue;
     if (best === null || r < best.roi) best = { symbol: h.symbol, valueSar: h.valueSar, roi: r, edge: Math.round(edge * 10) / 10, basis: basis };
   }
@@ -1726,12 +1768,13 @@ function dp2RotationPick_(oppRoi, holdings, basis, minValue) {
 /* Funding plans for the unfunded plan seats (rank order). need = a full seat (per-seat cap). Cash left after the
  * allocation covers needs first; then ONE rotation per run with swap semantics: the proceeds of the exited (or, above
  * the cap, trimmed) holding plus the cash left form the ticket; the rest are capital calls. */
-function dp2FundingPlans_(needs, remaining, holdings, basis) {
+function dp2FundingPlans_(needs, remaining, holdings, basis, P) {
+  P = P || dp2RotParams_();   // v1.2.17
   var plans = [], avail = Math.max(0, remaining || 0), used = false;
   for (var i = 0; i < needs.length; i++) {
     var n = needs[i], need = n.need || 0; if (need <= 0) continue;
     var opp = basis === '3m' ? n.roi3 : n.roi12;
-    var plan = { sym: n.sym, need: need, short: 0, state: 'FUNDABLE_NOW', rotation: null, basis: basis, oppRoi: opp, why: n.why || '' };
+    var plan = { sym: n.sym, need: need, short: 0, state: 'FUNDABLE_NOW', rotation: null, basis: basis, oppRoi: opp, why: n.why || '', hurdle: P.hurdle(basis), cost: P.cost };
     // v1.2.6 (review finding): FUNDABLE_NOW only when the cash left covers the WHOLE need (engine: short = need − avail;
     // avail −= need); a partial amount is a shortfall that goes to the rotation / capital-call path, never a smaller ticket.
     var short = Math.max(0, need - avail);
@@ -1741,7 +1784,7 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
     plan.short = short;
     // v1.2.3 (review finding): the holding must cover the shortfall (the engine's floor guard passes the shortfall as
     // min_value_sar); a smaller eligible holding is reported as rotation-insufficient and the seat stays a capital call.
-    var rot = used ? null : dp2RotationPick_(opp, holdings, basis, short);
+    var rot = used ? null : dp2RotationPick_(opp, holdings, basis, short, P);
     if (rot) {
       used = true;
       var proceeds = Math.min(rot.valueSar, short);   // v1.2.4: sell only the shortfall — the cash left funds the rest (engine semantics)
@@ -1758,10 +1801,10 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
       plan.cashHeld = cashUsed;   // the cash left that this seat would have used stays reserved for it (engine: avail −= need)
       plan.rotationTaken = used;
       var ins = null;
-      if (!used) { for (var k = 0; k < holdings.length; k++) { var h = holdings[k]; if (h.isFI || !h.valueSar) continue; var rr = basis === '3m' ? h.roi3 : h.roi12; if (rr === null || rr === undefined || opp === null) continue; var e = opp - rr - DP2A.ROT_COST_PCT; if (ins === null || e > ins.edge) ins = { symbol: h.symbol, edge: Math.round(e * 10) / 10, roi: rr }; } }
+      if (!used) { for (var k = 0; k < holdings.length; k++) { var h = holdings[k]; if (h.isFI || !h.valueSar) continue; var rr = basis === '3m' ? h.roi3 : h.roi12; if (rr === null || rr === undefined || opp === null) continue; var e = opp - rr - P.cost; if (ins === null || e > ins.edge) ins = { symbol: h.symbol, edge: Math.round(e * 10) / 10, roi: rr }; } }
       if (ins) plan.bestHolding = ins;
       // an eligible holding that clears the hurdle but is worth less than the shortfall (engine: rotation_insufficient)
-      var small = used ? null : dp2RotationPick_(opp, holdings, basis, 0);
+      var small = used ? null : dp2RotationPick_(opp, holdings, basis, 0, P);
       if (small && small.valueSar < short - 0.5) plan.rotationInsufficient = { symbol: small.symbol, covers: small.valueSar, short: short, edge: small.edge, roi: small.roi };
     }
     plans.push(plan);
@@ -1770,11 +1813,12 @@ function dp2FundingPlans_(needs, remaining, holdings, basis) {
 }
 function dp2PlanText_(pl) {
   var b = pl.basis === '3m' ? 'plan 3M' : 'engine 12M';
-  var hurdle = pl.basis === '3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M;
+  var hurdle = pl.hurdle !== undefined ? pl.hurdle : (pl.basis === '3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M);
+  var costP = pl.cost !== undefined ? pl.cost : DP2A.ROT_COST_PCT;   // v1.2.17: the production parameters the plan was built with
   if (pl.state === 'FUNDABLE_NOW') return pl.sym + ' — FUNDABLE NOW from the cash left: ticket ' + dp2Fmt_(pl.ticket) + ' SAR (the minimum ticket, as the engine)' + (pl.why ? ' (' + pl.why + ')' : '');
   if (pl.state === 'FUNDABLE_BY_ROTATION') {
     var r = pl.rotation;
-    return pl.sym + ' — FUNDABLE BY ROTATION: ' + r.action.toLowerCase() + ' ' + r.symbol + ' (' + dp2Fmt_(r.proceeds) + ' SAR' + (pl.cashHeld || (pl.ticket - r.proceeds) > 0.5 ? ' + ' + dp2Fmt_(pl.ticket - r.proceeds) + ' SAR cash left' : '') + ') → ticket ' + dp2Fmt_(pl.ticket) + ' SAR (minimum ticket) · ' + b + ': ' + pl.sym + ' ' + dp2PctPlain_(pl.oppRoi, 1) + ' vs ' + r.symbol + ' ' + dp2PctPlain_(r.roi, 1) + ' → edge +' + dp2Fmt_(r.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% cost (hurdle ' + hurdle + ')' +
+    return pl.sym + ' — FUNDABLE BY ROTATION: ' + r.action.toLowerCase() + ' ' + r.symbol + ' (' + dp2Fmt_(r.proceeds) + ' SAR' + (pl.cashHeld || (pl.ticket - r.proceeds) > 0.5 ? ' + ' + dp2Fmt_(pl.ticket - r.proceeds) + ' SAR cash left' : '') + ') → ticket ' + dp2Fmt_(pl.ticket) + ' SAR (minimum ticket) · ' + b + ': ' + pl.sym + ' ' + dp2PctPlain_(pl.oppRoi, 1) + ' vs ' + r.symbol + ' ' + dp2PctPlain_(r.roi, 1) + ' → edge +' + dp2Fmt_(r.edge, 1) + ' pp after ' + costP + '% cost (hurdle ' + hurdle + ')' +
       (pl.short > 0 ? '; a full seat would need ' + dp2Fmt_(pl.short) + ' SAR more' : '') + (r.remnantExit ? ' (a trim would leave a sub-floor remnant → full exit' + (r.surplus ? ', surplus ' + dp2Fmt_(r.surplus) + ' SAR to cash' : '') + ')' : '');
   }
   if (pl.state === 'CAPITAL_CALL') return pl.sym + ' — CAPITAL CALL: ' + (pl.rotationTaken ? 'no cash left and this run\'s single rotation is already assigned (one switch per run, as in the engine)' : (pl.rotationInsufficient ? pl.rotationInsufficient.symbol + ' clears the hurdle (edge +' + dp2Fmt_(pl.rotationInsufficient.edge, 1) + ' pp, ' + b + ') but is worth ' + dp2Fmt_(pl.rotationInsufficient.covers) + ' SAR against a ' + dp2Fmt_(pl.rotationInsufficient.short) + ' SAR shortfall — rotation insufficient (floor guard), no sale advised' : 'no cash and no holding trails it by ≥ ' + hurdle + ' pp (' + b + ') after cost' + (pl.bestHolding ? ' — closest: ' + pl.bestHolding.symbol + ' ' + dp2PctPlain_(pl.bestHolding.roi, 1) + ' (edge ' + (pl.bestHolding.edge >= 0 ? '+' : '') + dp2Fmt_(pl.bestHolding.edge, 1) + ' pp)' : ''))) + '; a seat needs ' + dp2Fmt_(pl.need) + ' SAR';
@@ -1845,7 +1889,11 @@ function dp2CashReserve_(t, cashSar, navSar) {
     var mAbs = /^Cash floor\s+([\d,\.]+)\s*SAR\s*\(absolute reserve/i.exec(cf);
     var mPct = /^Cash floor\s+([\d\.]+)%\s+of NAV\s+([\d,\.]+)\s*SAR\s*=\s*([\d,\.]+)\s*SAR/i.exec(cf);
     if (mAbs) abs = num(mAbs[1]);
-    else if (mPct) { pct = num(mPct[1]); if (/absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter/i.test(cf)) abs = num(mPct[3]); }
+    else if (mPct) {
+      pct = num(mPct[1]);
+      if (/absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter/i.test(cf)) abs = num(mPct[3]);
+      else { var mLo = /absolute reserve TFB_OPP_CASH_FLOOR_SAR\s+([\d,\.]+)\s*SAR\s+is lower/i.exec(cf); if (mLo) abs = num(mLo[1]); }   // v1.2.17: engine v1.27.4 names a lower absolute reserve
+    }
     src = 'engine cash_floor alert (last sync)';
   }
   var pa = num(dp2Prop_(DP2X.PROP_CF_SAR)), pp = num(dp2Prop_(DP2X.PROP_CF_PCT)), pm = dp2Str_(dp2Prop_(DP2X.PROP_CF_MODE)).trim().toLowerCase();
@@ -1854,12 +1902,13 @@ function dp2CashReserve_(t, cashSar, navSar) {
       abs = pa; pct = pp; src = 'Script Properties DP2_CASH_FLOOR_* (mirror of the Render ENV)';
       mode = pm === 'enforce' ? 'enforce' : (pp !== null || pm === 'observe' ? 'observe' : null);
     }
-  } else if (abs === null && pa !== null) abs = pa;   // the alert does not state an absolute reserve below the pct floor
+  } else if (abs === null && pa !== null) abs = pa;   // an older engine (< 1.27.4) does not state an absolute reserve below the pct floor
+  out.absUnstated = !!(cf && pct !== null && abs === null);
   out.abs = abs; out.pct = pct; out.mode = mode || 'off';
   if (mode === 'enforce') {
     out.floor = pct !== null ? Math.max(abs || 0, pct / 100 * nav) : (abs || 0);
     out.sar = Math.min(cash, out.floor);
-    out.source = src + ': ' + (pct !== null ? pct + '% of NAV ' + dp2Fmt_(nav) + (abs ? ' or the absolute ' + dp2Fmt_(abs) + ', the stricter' : '') : 'absolute reserve ' + dp2Fmt_(abs || 0)) + ' ENFORCED → ' + dp2Fmt_(out.sar) + ' SAR kept out of sizing';
+    out.source = src + ': ' + (pct !== null ? pct + '% of NAV ' + dp2Fmt_(nav) + (abs ? ' or the absolute ' + dp2Fmt_(abs) + ', the stricter' : '') : 'absolute reserve ' + dp2Fmt_(abs || 0)) + ' ENFORCED → ' + dp2Fmt_(out.sar) + ' SAR kept out of sizing' + (out.absUnstated ? ' (the alert names no absolute reserve; an engine before 1.27.4 omits a lower one — if TFB_OPP_CASH_FLOOR_SAR is also set, mirror it in DP2_CASH_FLOOR_SAR)' : '');
   } else if (mode === 'observe') {
     out.source = src + ': floor in OBSERVE mode — nothing taken from the sizing budget';
   } else {
@@ -1892,8 +1941,10 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   alloc.secCtx = secCtx; alloc.reserve = reserve;
   var holdings = dp2RotationHoldings_(eq, fi, ib, qmap, seatMap);
   alloc.holdings = holdings;
-  alloc.plans12 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '12m');
-  alloc.plans3 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '3m');
+  var rotParams = dp2RotParams_();   // v1.2.17: production rotation parameters (one read per build)
+  alloc.rotParams = rotParams;
+  alloc.plans12 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '12m', rotParams);
+  alloc.plans3 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '3m', rotParams);
   alloc.rotation12 = null; alloc.rotation3 = null;
   for (i = 0; i < alloc.plans12.length; i++) if (alloc.plans12[i].rotation) { alloc.rotation12 = alloc.plans12[i]; break; }
   for (i = 0; i < alloc.plans3.length; i++) if (alloc.plans3[i].rotation) { alloc.rotation3 = alloc.plans3[i]; break; }
@@ -2142,12 +2193,12 @@ function buildPortfolioDecisionV2() {
       item.rotation = { plan: rotP, alt: rotO };
       if (!sig.alert) sig.advisory = true;
       engTxt += '\n↻ rotation candidate → ' + rotP.sym + ' (' + bLbl + ' edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after cost' + (rotO ? '; ' + oLbl + ' agrees' : '; ' + oLbl + ' does not reach its hurdle') + ')';
-      actions.push({ p: 2, t: 'SWITCH (research, ' + bLbl + ' = production basis): ' + rotP.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rotP.rotation.proceeds) + ' SAR to fund ' + rotP.sym + ' (' + dp2PctPlain_(rotP.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rotP.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after ' + DP2A.ROT_COST_PCT + '% round-trip cost)' + (rotO ? '; the ' + oLbl + ' basis agrees (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp)' : '; the ' + oLbl + ' basis does not reach its hurdle') + '. Research only — the engine issues the executable plan when the feed is released.' });
+      actions.push({ p: 2, t: 'SWITCH (research, ' + bLbl + ' = production basis): ' + rotP.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rotP.rotation.proceeds) + ' SAR to fund ' + rotP.sym + ' (' + dp2PctPlain_(rotP.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rotP.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after ' + (rotP.cost !== undefined ? rotP.cost : DP2A.ROT_COST_PCT) + '% round-trip cost)' + (rotO ? '; the ' + oLbl + ' basis agrees (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp)' : '; the ' + oLbl + ' basis does not reach its hurdle') + '. Research only — the engine issues the executable plan when the feed is released.' });
     } else if (rotO) {
       engTxt += '\n↻ ' + oLbl + ' basis would rotate → ' + rotO.sym + ' (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp) — not the production basis (' + bLbl + '), no action';
     } else if (alloc && alloc.needs.length && i === 0) {
       var anyRot = alloc.rotationProd;
-      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle on the production basis (' + dp2RotationBasisLabel_(alloc.basis) + ', ' + (alloc.basis === 'plan3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M) + ' pp after cost) → capital call ' + dp2Fmt_((alloc.plansProd || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
+      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + alloc.needs.map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle on the production basis (' + dp2RotationBasisLabel_(alloc.basis) + ', ' + (alloc.rotParams ? alloc.rotParams.hurdle(alloc.basis) : (alloc.basis === 'plan3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M)) + ' pp after cost) → capital call ' + dp2Fmt_((alloc.plansProd || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
     }
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
@@ -2444,7 +2495,8 @@ function buildTop10V2() {
 
   // allocation + funding plans / rotation
   row = dp2Section_(sh, row, 1, 8, 'ALLOCATION — research mirror of the engine\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');
-  dp2Section_(sh, row - 2, 9, 16, 'FUNDING PLANS & ROTATION — when cash does not cover the plans', 'One rotation per run: the held equity with the lowest forward ROI that trails the opportunity by ≥ ' + DP2A.ROT_EDGE_PP_12M + ' pp (engine 12M, production rule) after ' + DP2A.ROT_COST_PCT + '% cost; the 3M-basis line (≥ ' + DP2A.ROT_EDGE_PP_3M + ' pp) is the proposed TFB_OPP_ROTATION_BASIS=plan3m.');
+  var rpH = (alloc && alloc.rotParams) || dp2RotParams_();   // v1.2.17: the production parameters in use
+  dp2Section_(sh, row - 2, 9, 16, 'FUNDING PLANS & ROTATION — when cash does not cover the plans', 'One rotation per run: the held equity with the lowest forward ROI that trails the opportunity by ≥ ' + rpH.edge12 + ' pp (engine 12M) or ≥ ' + rpH.edge3 + ' pp (plan 3M) after ' + rpH.cost + '% cost, on the production basis (TFB_OPP_ROTATION_BASIS).');
   var aTop = row;
   if (alloc) {
     var evr = (alloc.riskSar !== null && alloc.riskSar > 0) ? alloc.gain3 / alloc.riskSar : null;
@@ -2463,7 +2515,7 @@ function buildTop10V2() {
     ];
     var a1 = dp2KV_(sh, aTop, 1, 8, aRows);
     var pLines = [];
-    pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + (alloc.basis === 'plan3m' ? 'TFB_OPP_ROTATION_BASIS=plan3m' : 'TFB_OPP_ROTATION_BASIS unset / 12m') + '; Script Property DP2_ROTATION_BASIS mirrors it) — only its plans drive SWITCH actions; the other basis is research.');
+    pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + (alloc.basis === 'plan3m' ? 'TFB_OPP_ROTATION_BASIS=plan3m' : 'TFB_OPP_ROTATION_BASIS unset / 12m') + '; Script Property DP2_ROTATION_BASIS mirrors it) — only its plans drive SWITCH actions; the other basis is research.' + (alloc.rotParams ? ' Rotation parameters: ' + alloc.rotParams.source + '.' : ''));
     for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis' + (alloc.basis === '12m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans12[i]));
     for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis' + (alloc.basis === 'plan3m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans3[i]));
     if (!alloc.needs.length) pLines.push('All plans fundable from cash — no rotation needed today.' + (alloc.rotation12 || alloc.rotation3 ? '' : ''));
@@ -2588,10 +2640,12 @@ function dp2SelfTest() {
   var wf2 = dp2WaterFill_({ A: 10, B: 1 }, 100, 60, 20);   // A capped at 60, the surplus re-spread → B 40 (above the floor)
   var wf3 = dp2WaterFill_({ A: 10, B: 1 }, 100, 95, 20);   // A 90.9, B 9.1 < floor → B released → A capped at 95
   wfOk = wfOk && Math.abs(wf2.A - 60) < 0.01 && Math.abs(wf2.B - 40) < 0.01 && Math.abs(wf3.A - 95) < 0.01 && wf3.B === undefined;
-  var rot = dp2RotationPick_(34.6, [{ symbol: 'CWBC.US', valueSar: 9664, roi12: 15.3, roi3: 5.4, holdingDays: 37, tp1: 29.6, price: 25.75, isFI: false }, { symbol: 'DDI.US', valueSar: 11860, roi12: 30.7, roi3: 12.9, holdingDays: 39, tp1: 15.03, price: 13.8, isFI: false }, { symbol: '5023.SR', valueSar: 9850, roi12: null, roi3: null, holdingDays: 328, tp1: null, price: 98.5, isFI: true }], '12m', 5600);
+  var rot = dp2RotationPick_(34.6, [{ symbol: 'CWBC.US', valueSar: 9664, roi12: 15.3, roi3: 5.4, holdingDays: 37, tp1: 29.6, price: 25.75, isFI: false }, { symbol: 'DDI.US', valueSar: 11860, roi12: 30.7, roi3: 12.9, holdingDays: 39, tp1: 15.03, price: 13.8, isFI: false }, { symbol: '5023.SR', valueSar: 9850, roi12: null, roi3: null, holdingDays: 328, tp1: null, price: 98.5, isFI: true }], '12m', 5600, dp2RotParamsDefault_());   // v1.2.17: engine defaults, whatever the properties say
   var rotOk = !!(rot && rot.symbol === 'CWBC.US' && Math.abs(rot.edge - 18.2) < 0.05);
-  var rotNone = dp2RotationPick_(20, [{ symbol: 'DDI.US', valueSar: 11860, roi12: 30.7, roi3: 12.9, holdingDays: 39, tp1: null, price: 13.8, isFI: false }], '12m', 0);
+  var rotNone = dp2RotationPick_(20, [{ symbol: 'DDI.US', valueSar: 11860, roi12: 30.7, roi3: 12.9, holdingDays: 39, tp1: null, price: 13.8, isFI: false }], '12m', 0, dp2RotParamsDefault_());
   checks.push({ name: 'research allocation: water-fill ' + JSON.stringify(wf) + ' · rotation pick ' + (rot ? rot.symbol + ' +' + rot.edge + 'pp' : 'none') + ' · no pick when the holding is better', ok: wfOk && rotOk && rotNone === null });
+  var rpS = dp2RotParams_();   // v1.2.17: the production rotation parameters this workbook uses
+  checks.push({ name: 'rotation parameters: ' + rpS.source, ok: true });
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
   var probe = null;

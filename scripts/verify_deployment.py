@@ -180,7 +180,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("integrations.google_sheets_service", "SERVICE_VERSION", "6.2.2", "Sheets publication writer"),
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.27.3", "opportunity builder"),
+     "1.27.4", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
      "1.16.0", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",

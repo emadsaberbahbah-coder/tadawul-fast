@@ -1594,7 +1594,21 @@ from typing import Optional
 #   from v1.27.2; cap mode is unchanged.
 #   Functions added: 0. Changed: _select_and_size (one guard). Removed: 0.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.3"
+# -----------------------------------------------------------------------------
+# v1.27.4 (2026-10-20) — CASH-FLOOR ALERT NAMES A LOWER ABSOLUTE RESERVE
+# WHY: with both TFB_OPP_CASH_FLOOR_PCT and TFB_OPP_CASH_FLOOR_SAR set and the
+#   percent floor the stricter, the cash_floor alert stated only the percent
+#   figure, so a reader re-applying the rule to a later NAV (Decision Pages v2
+#   mirrors the reserve from this alert) could not keep max(absolute,
+#   pct x NAV) once a falling NAV made the absolute reserve the stricter
+#   (review of PR #803).
+# WHAT: in that case the alert head adds "(absolute reserve
+#   TFB_OPP_CASH_FLOOR_SAR <amount> is lower)". Text only: the floor, the
+#   reserve, sizing, funding, KPIs and meta are unchanged; the other alert
+#   forms (percent only, absolute stricter, absolute alone) are byte-identical.
+#   Functions added: 0. Changed: _cash_floor_alert_text (one branch). Removed: 0.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.4"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -5546,6 +5560,11 @@ def _cash_floor_alert_text(ctx):
             _fmt_sar(ctx.get("floor_sar"))))
         if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
             head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
+        elif ctx.get("abs_floor_sar"):
+            # v1.27.4: name the lower absolute reserve too, so the rule can be
+            # re-applied to a later NAV as max(absolute, pct x NAV)
+            head += (" (absolute reserve TFB_OPP_CASH_FLOOR_SAR %s is lower)"
+                     % _fmt_sar(ctx["abs_floor_sar"]))
     if ctx.get("mode") == "enforce":
         return (head + " ENFORCED: deployable %s (reserve kept out of sizing "
                 "and funding)." % _fmt_sar(ctx.get("deployable_post_sar")))
