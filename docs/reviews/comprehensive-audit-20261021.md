@@ -1,8 +1,9 @@
 # TFB comprehensive audit, repair and handover (21 October 2026)
 
-Window: 2026-10-20 21:20 to 2026-10-21 ~23:30 UTC (00:20 to ~02:30 Riyadh, 21 Oct).
+Window: 2026-10-20 21:20 to 22:30 UTC (00:20 to 01:30 Riyadh, 21 Oct).
 Base: `97fa991` (HEAD of `main`, also the live Render deploy `dep-dbbn3au7bikc73949a6g`, app 8.14.5).
-Branch / PR: `claude/vibrant-bell-3ic3vs` (draft PR; link in the implementation register).
+Branch / PR: `claude/vibrant-bell-3ic3vs`, draft PR https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/809 (commit `ae95309`).
+PDF copy: `docs/reviews/TFB_Comprehensive_Audit_2026-10-21.pdf`.
 No workbook cell, Render setting, environment variable, deploy, provider or order was touched. IBKR was not used
 (per the assignment); broker reconciliation is therefore **not verified** in this report.
 
