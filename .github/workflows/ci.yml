@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.27 (2026-10-14, renumbered 2026-10-19) -- DT10 v1.13.10 HELD-SEAT HARNESS
+# VERSION 1.1.28 (2026-10-14, renumbered 2026-10-19 and 2026-10-20) -- DT10 v1.13.10 HELD-SEAT HARNESS
 #
-# v1.1.27 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.25 first): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# v1.1.28 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.26 first): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
 # native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.10
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
@@ -13,15 +13,23 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.26 (2026-10-14, renumbered 2026-10-19) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.27 (2026-10-14, renumbered 2026-10-19 and 2026-10-20) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.26 (authored as v1.1.21 in #773/#778): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.27 (authored as v1.1.21 in #773/#778; main took 1.1.26 for #802): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.0, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
-# VERSION 1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
+# VERSION 1.1.26 (2026-10-20) -- VERIFIED NAME LABEL RENEWAL
+#
+# v1.1.26: run tests/test_renew_verified_name_labels.py (new
+# scripts/renew_verified_name_labels.py v1.0.0: re-captures each reviewed
+# caption's public sources, re-checks it and re-stamps the seven-day review;
+# held bindings stay byte-identical) in the blocking lean lane next to
+# tests/test_verified_name_labels.py. Offline, urllib only.
+#
+# v1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
 #
 # v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
 # the identity checks accept the HKD-price / CNY-or-USD-EPS convention on .HK
@@ -701,6 +709,7 @@ jobs:
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
             tests/test_verified_name_labels.py \
+            tests/test_renew_verified_name_labels.py \
             tests/test_sheet_payload_digest.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
