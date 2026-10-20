@@ -1,7 +1,16 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.20 (2026-10-20)
+ * Version: 1.2.21 (2026-10-20)
+ *   1.2.21: TWO REVIEW FINDINGS. (a) With DP2_ENGINE_ENV present, the cash floor comes from it (the current production
+ *          configuration) — a last-sync cash_floor alert may predate an ENV change and is only compared (noted when it
+ *          differs). (b) The capital call is the engine's: the first TFB_OPP_CAPITAL_CALL_TOPN funding plans (any state),
+ *          their shortfalls summed, the names with a shortfall listed (dp2CapitalCall_); rotation_insufficient is noted
+ *          once per run. (c) The Portfolio page's "Unfunded plans / capital call" action is computed once after the lot
+ *          loop — it was chained after lot 0's rotation branch and never shown when lot 0 was a rotation candidate; it
+ *          names an eligible holding that is too small (rotation insufficient) instead of saying none trails the plans.
+ *          (d) The rotation basis follows the same rule as the cash floor: with DP2_ENGINE_ENV present the pasted
+ *          TFB_OPP_ROTATION_BASIS decides and the last sync's Rotation Basis KPI is only compared (noted when it differs).
  *   1.2.20: TWO REVIEW FINDINGS (tilt parity, sector-cap denominator) and the class behind them. The production
  *          configuration comes from ONE Script Property, DP2_ENGINE_ENV — the TFB_OPP_* / TFB_T10_* variables of the
  *          Render service as KEY=VALUE lines (absent = unset = engine default; other lines ignored). dp2ProdConfig_
@@ -198,7 +207,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.20';
+var DP2_VERSION = '1.2.21';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1674,6 +1683,7 @@ function dp2ProdConfig_(t) {
   var syn = raw('TFB_T10_SYNTHETIC_SOURCES').replace(/;/g, ',').split(',').map(dp2NormToken_).filter(function (x) { return !!x; });
   rot.synthetic = syn.length ? syn : DP2_DEFAULT_SYNTHETIC_.slice();
   rot.remnantFloor = c.opFloor;   // _funding_plans(floor_sar=_min_floor): the operator floor
+  var tnr = raw('TFB_OPP_CAPITAL_CALL_TOPN'), tnv = (tnr !== '' && DP2_NUM_RE_.test(tnr)) ? dp2Int_(Number(tnr)) : 3; c.capitalCallTopN = tnv > 0 ? tnv : 3;   // _env_capital_call_topn
   rot.source = env.present ? 'DP2_ENGINE_ENV' : 'engine defaults';
   c.rot = rot;
   // what the page does not model
@@ -1949,7 +1959,7 @@ function dp2RotationPick_(oppRoi, holdings, basis, minValue, P) {
  * the cap, trimmed) holding plus the cash left form the ticket; the rest are capital calls. */
 function dp2FundingPlans_(needs, remaining, holdings, basis, P) {
   P = P || dp2RotParams_();   // v1.2.17 / v1.2.20
-  var plans = [], avail = Math.max(0, remaining || 0), used = false;
+  var plans = [], avail = Math.max(0, remaining || 0), used = false, insNoted = false;   // v1.2.21: rotation_insufficient is noted once per run, as the engine
   for (var i = 0; i < needs.length; i++) {
     var n = needs[i], need = n.need || 0; if (need <= 0) continue;
     var opp = basis === '3m' ? n.roi3 : n.roi12;
@@ -1984,12 +1994,40 @@ function dp2FundingPlans_(needs, remaining, holdings, basis, P) {
       if (!used) { for (var k = 0; k < holdings.length; k++) { var h = holdings[k]; if (h.isFI || !h.valueSar || h.degraded) continue; var rr = basis === '3m' ? h.roi3 : h.roi12; if (rr === null || rr === undefined || opp === null) continue; var e = opp - rr - P.cost; if (ins === null || e > ins.edge) ins = { symbol: h.symbol, edge: Math.round(e * 10) / 10, roi: rr }; } }
       if (ins) plan.bestHolding = ins;
       // an eligible holding that clears the hurdle but is worth less than the shortfall (engine: rotation_insufficient)
-      var small = used ? null : dp2RotationPick_(opp, holdings, basis, 0, P);
-      if (small && small.valueSar < short - 0.5) plan.rotationInsufficient = { symbol: small.symbol, covers: small.valueSar, short: short, edge: small.edge, roi: small.roi };
+      var small = (used || insNoted) ? null : dp2RotationPick_(opp, holdings, basis, 0, P);
+      if (small && small.valueSar < short - 0.5) { plan.rotationInsufficient = { symbol: small.symbol, covers: small.valueSar, short: short, edge: small.edge, roi: small.roi }; insNoted = true; }
     }
     plans.push(plan);
   }
   return plans;
+}
+/* v1.2.21 (review finding): the engine's capital call — the KPI capital_call_topn_sar and the capital_call alert take the
+ * FIRST TFB_OPP_CAPITAL_CALL_TOPN plans of the rank-ordered funding plans (any state) and sum their shortfalls; the alert
+ * names those with a shortfall. */
+function dp2CapitalCall_(plans, topN) {
+  var n = topN > 0 ? topN : 3, first = (plans || []).slice(0, n), sum = 0, syms = [];
+  for (var i = 0; i < first.length; i++) { var sh = Math.round(Math.max(0, first[i].short || 0)); sum += sh; if (sh > 0) syms.push(first[i].sym); }
+  return { sum: sum, syms: syms, topN: n };
+}
+/* v1.2.21 (review finding on 736ccd6): the Portfolio page's unfunded-plans / capital-call action, computed ONCE per page —
+ * it used to hang off lot 0's rotation branch and was skipped whenever lot 0 was itself a rotation candidate. Production
+ * basis only; the capital call is the engine's top-N (dp2CapitalCall_); an eligible holding that clears the hurdle but
+ * cannot cover the shortfall is named (rotation insufficient); no action when the cash left covers every need. */
+function dp2UnfundedAction_(alloc) {
+  var needs = alloc ? (alloc.needsProd || alloc.needs || []) : [];
+  if (!needs.length) return null;
+  var needSyms = needs.map(function (n) { return n.sym; }).join(', ');
+  if (alloc.fundingWithheld) return { p: 4, t: 'Unfunded plans ' + needSyms + ': ' + alloc.fundingWithheld + '.' };   // v1.2.18
+  var plans = alloc.plansProd || [];
+  var anyShort = plans.some(function (pl) { return (pl.short || 0) > 0.5; });
+  if (!anyShort) return null;   // the cash left covers every need (FUNDABLE_NOW) — nothing is asked of the operator
+  var ccA = dp2CapitalCall_(plans, alloc.cfg ? alloc.cfg.capitalCallTopN : 3);   // top-N, as the engine's KPI and alert
+  var ccTxt = ccA.sum > 0 ? 'capital call (top-' + ccA.topN + ', as the engine): deposit ≥ ' + dp2Fmt_(ccA.sum) + ' SAR to take ' + ccA.syms.join(', ') : '';
+  if (alloc.rotationProd) return ccTxt ? { p: 4, t: 'Unfunded plans beyond this run\'s single rotation: ' + ccTxt + ', or wait for cash.' } : null;
+  var insP = null; plans.forEach(function (pl) { if (!insP && pl.rotationInsufficient) insP = pl.rotationInsufficient; });
+  var hurdleTxt = dp2RotationBasisLabel_(alloc.basis) + ', ' + (alloc.rotParams ? alloc.rotParams.hurdle(alloc.basis) : (alloc.basis === 'plan3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M)) + ' pp after cost';
+  if (insP) return { p: 4, t: 'Unfunded plans ' + needSyms + ': ' + insP.symbol + ' clears the rotation hurdle (edge +' + dp2Fmt_(insP.edge, 1) + ' pp, ' + hurdleTxt + ') but is worth ' + dp2Fmt_(insP.covers) + ' SAR against a ' + dp2Fmt_(insP.short) + ' SAR shortfall — rotation insufficient, no sale advised' + (ccTxt ? ' → ' + ccTxt : '') + ', or wait for cash.' };
+  return { p: 4, t: 'Unfunded plans ' + needSyms + ': no holding trails them by the rotation hurdle on the production basis (' + hurdleTxt + ')' + (ccTxt ? ' → ' + ccTxt : '') + ', or wait for cash.' };
 }
 function dp2PlanText_(pl) {
   var b = pl.basis === '3m' ? 'plan 3M' : 'engine 12M';
@@ -2045,12 +2083,25 @@ function dp2RotationHoldings_(eq, fi, ib, qmap, seatMap, cfg) {
 /* v1.2.14 (review finding): the PRODUCTION rotation basis. Read from the Top_10 KPI row when the cockpit publishes
  * it ('Rotation Basis' = 'engine 12M' | 'plan 3M'), else TFB_OPP_ROTATION_BASIS from DP2_ENGINE_ENV (v1.2.20), else
  * '12m' — the engine's default when TFB_OPP_ROTATION_BASIS is unset. Set the property together with the Render ENV. */
-function dp2RotationBasis_(t, cfg) {
+/* v1.2.21: the production rotation basis. With DP2_ENGINE_ENV present the CURRENT configuration decides
+ * (TFB_OPP_ROTATION_BASIS, unset = 12m) — the last sync's "Rotation Basis" KPI may predate an ENV change and is only
+ * compared, as the cash floor (dp2CashReserve_); without the paste the KPI is used, else the engine default. */
+function dp2RotationBasisInfo_(t, cfg) {
+  cfg = cfg || dp2ProdConfig_(t);
   var k = (t && t.kpi) || {}, v = '';
   for (var kk in k) { if (k.hasOwnProperty(kk) && /^rotation basis/i.test(kk)) v = dp2Str_(k[kk]); }
-  if (!v) return (cfg || dp2ProdConfig_(t)).rotBasis;   // v1.2.20: TFB_OPP_ROTATION_BASIS from DP2_ENGINE_ENV (unset = 12m)
-  v = v.trim().toLowerCase();
-  return (/3m|plan3m|plan 3m/.test(v)) ? 'plan3m' : '12m';
+  var kb = v ? ((/3m|plan3m|plan 3m/.test(v.trim().toLowerCase())) ? 'plan3m' : '12m') : '';
+  if (cfg.envPresent) return { basis: cfg.rotBasis, src: 'env', kpi: kb, differs: !!kb && kb !== cfg.rotBasis };
+  if (kb) return { basis: kb, src: 'kpi', kpi: kb, differs: false };
+  return { basis: cfg.rotBasis, src: 'default', kpi: '', differs: false };
+}
+function dp2RotationBasis_(t, cfg) { return dp2RotationBasisInfo_(t, cfg).basis; }
+function dp2RotationBasisSrcTxt_(bi) {
+  if (!bi) return 'engine default';
+  var kv = bi.basis === 'plan3m' ? 'TFB_OPP_ROTATION_BASIS=plan3m' : 'TFB_OPP_ROTATION_BASIS unset / 12m';
+  if (bi.src === 'env') return kv + ', from DP2_ENGINE_ENV' + (bi.differs ? ' — the last sync\'s Rotation Basis KPI reports ' + dp2RotationBasisLabel_(bi.kpi) + '; the next sync will match' : '');
+  if (bi.src === 'kpi') return 'the last sync\'s Rotation Basis KPI — DP2_ENGINE_ENV not set';
+  return 'engine default — DP2_ENGINE_ENV not set';
 }
 function dp2RotationBasisLabel_(b) { return b === 'plan3m' ? 'plan 3M' : 'engine 12M'; }
 /* v1.2.15 (review finding): the CASH RESERVE the engine takes from the SIZING budget — never a hard-coded 10 %.
@@ -2067,38 +2118,49 @@ function dp2CashReserve_(t, cashSar, navSar, cfg) {
   var out = { sar: 0, floor: 0, mode: 'off', abs: null, pct: null, source: '', pfFloor: nav * DP2.CASH_FLOOR_PCT };
   var num = function (v) { var n = dp2Num_(dp2Str_(v).replace(/,/g, '')); return n; };
   var cf = (t && t.alerts && t.alerts.cash_floor) ? dp2Str_(t.alerts.cash_floor.text) : '';
-  var abs = null, pct = null, mode = null, src = '';
+  // the last sync's alert (mode, pct, absolute floor)
+  var al = null;
   if (cf) {
-    mode = /ENFORCED/i.test(cf) ? 'enforce' : (/\(observe\)/i.test(cf) ? 'observe' : null);
+    al = { mode: /ENFORCED/i.test(cf) ? 'enforce' : (/\(observe\)/i.test(cf) ? 'observe' : null), abs: null, pct: null };
     var mAbs = /^Cash floor\s+([\d,\.]+)\s*SAR\s*\(absolute reserve/i.exec(cf);
     var mPct = /^Cash floor\s+([\d\.]+)%\s+of NAV\s+([\d,\.]+)\s*SAR\s*=\s*([\d,\.]+)\s*SAR/i.exec(cf);
-    if (mAbs) abs = num(mAbs[1]);
+    if (mAbs) al.abs = num(mAbs[1]);
     else if (mPct) {
-      pct = num(mPct[1]);
-      if (/absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter/i.test(cf)) abs = num(mPct[3]);
-      else { var mLo = /absolute reserve TFB_OPP_CASH_FLOOR_SAR\s+([\d,\.]+)\s*SAR\s+is lower/i.exec(cf); if (mLo) abs = num(mLo[1]); }   // v1.2.17: engine v1.27.4 names a lower absolute reserve
+      al.pct = num(mPct[1]);
+      if (/absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter/i.test(cf)) al.abs = num(mPct[3]);
+      else { var mLo = /absolute reserve TFB_OPP_CASH_FLOOR_SAR\s+([\d,\.]+)\s*SAR\s+is lower/i.exec(cf); if (mLo) al.abs = num(mLo[1]); }   // v1.2.17: engine v1.27.4 names a lower absolute reserve
     }
-    src = 'engine cash_floor alert (last sync)';
   }
-  // v1.2.20: the fallback is the production configuration (DP2_ENGINE_ENV), parsed as _cash_floor_sar / _env_cash_floor_pct / _mode
-  var envM = dp2EngineEnv_().map, ev = function (k) { return envM.hasOwnProperty(k) ? dp2Str_(envM[k]).trim() : ''; };
-  var pa = num(ev('TFB_OPP_CASH_FLOOR_SAR')), pp = num(ev('TFB_OPP_CASH_FLOOR_PCT').replace(/%$/, '')), pm = ev('TFB_OPP_CASH_FLOOR_MODE').toLowerCase();
-  if (pa !== null && !(pa > 0)) pa = null;
-  if (pp !== null && !(pp > 0 && pp < 100)) pp = null;
-  if (!cf) {
-    if (pp !== null) { abs = pa; pct = pp; mode = pm === 'enforce' ? 'enforce' : 'observe'; src = 'DP2_ENGINE_ENV (no cash_floor alert on the sheet)'; }
-    else if (pa !== null && pm === 'enforce') { abs = pa; mode = 'enforce'; src = 'DP2_ENGINE_ENV (no cash_floor alert on the sheet)'; }
-  } else if (abs === null && pa !== null) abs = pa;   // an older engine (< 1.27.4) does not state an absolute reserve below the pct floor
-  out.absUnstated = !!(cf && pct !== null && abs === null);
+  // v1.2.21 (review finding): with DP2_ENGINE_ENV present, the CURRENT production configuration decides — a last-sync
+  // alert may predate an ENV change. Parsed as _cash_floor_sar / _env_cash_floor_pct / _env_cash_floor_mode /
+  // _cash_floor_pct_ctx: a percent floor follows its mode (observe by default); an absolute floor alone binds only with
+  // an explicit enforce; floor = max(absolute, pct × NAV). Without the paste, the alert is used as before.
+  var env = dp2EngineEnv_(), abs = null, pct = null, mode = null, src = '';
+  if (env.present) {
+    var ev = function (k) { return env.map.hasOwnProperty(k) ? dp2Str_(env.map[k]).trim() : ''; };
+    var ra = ev('TFB_OPP_CASH_FLOOR_SAR'), rp = ev('TFB_OPP_CASH_FLOOR_PCT').replace(/,/g, '').replace(/%$/, ''), rm = ev('TFB_OPP_CASH_FLOOR_MODE').toLowerCase();
+    var av = ra === '' ? 0 : num(ra); abs = (av !== null && av > 0) ? av : null;
+    var pv0 = (rp !== '' && DP2_NUM_RE_.test(rp)) ? Number(rp) : null; pct = (pv0 !== null && pv0 > 0 && pv0 < 100) ? pv0 : null;
+    var em = rm === 'enforce' ? 'enforce' : 'observe';
+    mode = pct !== null ? em : ((abs !== null && em === 'enforce') ? 'enforce' : null);
+    src = 'DP2_ENGINE_ENV (current production configuration)';
+    if (al) {
+      var same = (al.mode || null) === mode && ((al.pct === null && pct === null) || al.pct === pct) && (mode === null || al.pct !== null || (al.abs || 0) === (abs || 0));
+      if (!same) { out.alertDiffers = true; src += ' — the last sync\'s cash_floor alert describes a different floor; the next sync will match'; }
+    }
+  } else if (al) {
+    abs = al.abs; pct = al.pct; mode = al.mode; src = 'engine cash_floor alert (last sync)';
+  }
+  out.absUnstated = !!(!env.present && cf && pct !== null && abs === null);
   out.abs = abs; out.pct = pct; out.mode = mode || 'off';
   if (mode === 'enforce') {
     out.floor = pct !== null ? Math.max(abs || 0, pct / 100 * nav) : (abs || 0);
     out.sar = Math.min(cash, out.floor);
-    out.source = src + ': ' + (pct !== null ? pct + '% of NAV ' + dp2Fmt_(nav) + (abs ? ' or the absolute ' + dp2Fmt_(abs) + ', the stricter' : '') : 'absolute reserve ' + dp2Fmt_(abs || 0)) + ' ENFORCED → ' + dp2Fmt_(out.sar) + ' SAR kept out of sizing' + (out.absUnstated ? ' (the alert names no absolute reserve; an engine before 1.27.4 omits a lower one — include TFB_OPP_CASH_FLOOR_SAR in DP2_ENGINE_ENV if it is set)' : '');
+    out.source = src + ': ' + (pct !== null ? pct + '% of NAV ' + dp2Fmt_(nav) + (abs ? ' or the absolute ' + dp2Fmt_(abs) + ', the stricter' : '') : 'absolute reserve ' + dp2Fmt_(abs || 0)) + ' ENFORCED → ' + dp2Fmt_(out.sar) + ' SAR kept out of sizing' + (out.absUnstated ? ' (the alert names no absolute reserve; an engine before 1.27.4 omits a lower one — paste DP2_ENGINE_ENV to use the configured value)' : '');
   } else if (mode === 'observe') {
     out.source = src + ': floor in OBSERVE mode — nothing taken from the sizing budget';
   } else {
-    out.source = src ? src + ': no binding reserve' : 'no cash_floor alert on the Top_10 sheet and no floor in DP2_ENGINE_ENV — the engine takes no reserve';
+    out.source = src ? src + ': no binding reserve' : 'no cash_floor alert on the Top_10 sheet and no DP2_ENGINE_ENV — the engine takes no reserve';
   }
   return out;
 }
@@ -2147,7 +2209,8 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   for (i = 0; i < alloc.plans12.length; i++) if (alloc.plans12[i].rotation) { alloc.rotation12 = alloc.plans12[i]; break; }
   for (i = 0; i < alloc.plans3.length; i++) if (alloc.plans3[i].rotation) { alloc.rotation3 = alloc.plans3[i]; break; }
   // v1.2.14: the production basis decides which plan list is executable; the other is shown as research only
-  alloc.basis = dp2RotationBasis_(t, cfg);
+  alloc.basisInfo = dp2RotationBasisInfo_(t, cfg);   // v1.2.21: the current configuration decides when pasted
+  alloc.basis = alloc.basisInfo.basis;
   alloc.rotationProd = alloc.basis === 'plan3m' ? alloc.rotation3 : alloc.rotation12;
   alloc.rotationOther = alloc.basis === 'plan3m' ? alloc.rotation12 : alloc.rotation3;
   alloc.plansProd = alloc.basis === 'plan3m' ? alloc.plans3 : alloc.plans12;
@@ -2394,17 +2457,15 @@ function buildPortfolioDecisionV2() {
       actions.push({ p: 2, t: 'SWITCH (research, ' + bLbl + ' = production basis): ' + rotP.rotation.action.toLowerCase() + ' ' + l.symbol + ' ' + dp2Fmt_(rotP.rotation.proceeds) + ' SAR to fund ' + rotP.sym + ' (' + dp2PctPlain_(rotP.oppRoi, 1) + ' vs ' + l.symbol + ' forward ' + dp2PctPlain_(rotP.rotation.roi, 1) + ' → edge +' + dp2Fmt_(rotP.rotation.edge, 1) + ' pp after ' + (rotP.cost !== undefined ? rotP.cost : DP2A.ROT_COST_PCT) + '% round-trip cost)' + (rotO ? '; the ' + oLbl + ' basis agrees (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp)' : '; the ' + oLbl + ' basis does not reach its hurdle') + '. Research only — the engine issues the executable plan when the feed is released.' });
     } else if (rotO) {
       engTxt += '\n↻ ' + oLbl + ' basis would rotate → ' + rotO.sym + ' (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp) — not the production basis (' + bLbl + '), no action';
-    } else if (alloc && (alloc.needsProd || alloc.needs).length && i === 0 && alloc.fundingWithheld) {
-      actions.push({ p: 4, t: 'Unfunded plans ' + (alloc.needsProd || alloc.needs).map(function (n) { return n.sym; }).join(', ') + ': ' + alloc.fundingWithheld + '.' });   // v1.2.18
-    } else if (alloc && (alloc.needsProd || alloc.needs).length && i === 0) {
-      var anyRot = alloc.rotationProd;
-      if (!anyRot) actions.push({ p: 4, t: 'Unfunded plans ' + (alloc.needsProd || alloc.needs).map(function (n) { return n.sym; }).join(', ') + ': no holding trails them by the rotation hurdle on the production basis (' + dp2RotationBasisLabel_(alloc.basis) + ', ' + (alloc.rotParams ? alloc.rotParams.hurdle(alloc.basis) : (alloc.basis === 'plan3m' ? DP2A.ROT_EDGE_PP_3M : DP2A.ROT_EDGE_PP_12M)) + ' pp after cost) → capital call ' + dp2Fmt_((alloc.plansProd || []).reduce(function (a, pl) { return a + (pl.state === 'CAPITAL_CALL' ? pl.short : 0); }, 0)) + ' SAR (sequential: the cash left is counted once), or wait for cash.' });
     }
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
     sigKinds.push(sig.kind);
     trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
+  // v1.2.21 (review finding on 736ccd6): the unfunded-plans / capital-call action is computed once per page (dp2UnfundedAction_)
+  var unfundedAct = dp2UnfundedAction_(alloc);
+  if (unfundedAct) actions.push(unfundedAct);
   for (i = 0; i < fi.length; i++) {
     var f = fi[i];
     sigKinds.push('grey');
@@ -2717,10 +2778,11 @@ function buildTop10V2() {
     ];
     var a1 = dp2KV_(sh, aTop, 1, 8, aRows);
     var pLines = [];
-    pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + (alloc.basis === 'plan3m' ? 'TFB_OPP_ROTATION_BASIS=plan3m' : 'TFB_OPP_ROTATION_BASIS unset / 12m') + ', from DP2_ENGINE_ENV) — only its plans drive SWITCH actions; the other basis is research.' + (alloc.rotParams ? ' Rotation rule: hurdle ' + alloc.rotParams.edge12 + ' pp (12M) / ' + alloc.rotParams.edge3 + ' pp (3M) after ' + alloc.rotParams.cost + '% cost, held ≥ ' + alloc.rotParams.minHeld + ' d, not within ' + alloc.rotParams.tp1Prox + '% of TP1, excluded ' + (alloc.rotParams.exclude.join(', ') || 'none') + ' (' + alloc.rotParams.source + ').' : '') + (alloc.prod && alloc.prod !== alloc ? ' Needs come from production\'s ' + alloc.prod.mode + '-mode sizing; the ALLOCATION block shows the conviction rule.' : ''));
+    pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + dp2RotationBasisSrcTxt_(alloc.basisInfo) + ') — only its plans drive SWITCH actions; the other basis is research.' + (alloc.rotParams ? ' Rotation rule: hurdle ' + alloc.rotParams.edge12 + ' pp (12M) / ' + alloc.rotParams.edge3 + ' pp (3M) after ' + alloc.rotParams.cost + '% cost, held ≥ ' + alloc.rotParams.minHeld + ' d, not within ' + alloc.rotParams.tp1Prox + '% of TP1, excluded ' + (alloc.rotParams.exclude.join(', ') || 'none') + ' (' + alloc.rotParams.source + ').' : '') + (alloc.prod && alloc.prod !== alloc ? ' Needs come from production\'s ' + alloc.prod.mode + '-mode sizing; the ALLOCATION block shows the conviction rule.' : ''));
     if (alloc.fundingWithheld) pLines.push('ROTATION PLANS WITHHELD — ' + alloc.fundingWithheld + '.');
     for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis' + (alloc.basis === '12m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans12[i]));
     for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis' + (alloc.basis === 'plan3m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans3[i]));
+    if (!alloc.fundingWithheld) { var ccP = dp2CapitalCall_(alloc.plansProd, alloc.cfg ? alloc.cfg.capitalCallTopN : 3); if (ccP.sum > 0) pLines.push('Capital call on the production basis (top-' + ccP.topN + ' plans, TFB_OPP_CAPITAL_CALL_TOPN — as the engine\'s KPI and alert): deposit ≥ ' + dp2Fmt_(ccP.sum) + ' SAR to take ' + ccP.syms.join(', ') + '.'); }
     if (!(alloc.needsProd || alloc.needs).length && !alloc.fundingWithheld) pLines.push('No funding need on the production rule — no rotation today' + (alloc.rows.some(function (r) { return r.state === 'RELEASED' || r.state === 'UNFUNDED'; }) ? ' (released / unfunded seats are deferrals, not needs — as the engine).' : '.'));
     var holdTxt = alloc.holdings.filter(function (h) { return !h.isFI; }).map(function (h) { return h.symbol + ' fwd 12M ' + dp2PctPlain_(h.roi12, 1) + ' · 3M plan ' + (h.roi3 !== null ? dp2PctPlain_(h.roi3, 1) + ' (' + h.roi3Src + ')' : 'n/a — no TP1 ladder, never rotates on 3M') + (h.roi3Model !== null ? ' · model 3M ' + dp2PctPlain_(h.roi3Model, 1) : '') + ' · ' + dp2Fmt_(h.valueSar) + ' SAR · ' + (h.holdingDays !== null ? h.holdingDays + ' d' : '—'); }).join('\n');
     pLines.push('Holdings (12M = My_Portfolio engine forecast · 3M = plan-TP1 ROI, as the engine; the model 3M is shown, not used):\n' + (holdTxt || 'none'));
