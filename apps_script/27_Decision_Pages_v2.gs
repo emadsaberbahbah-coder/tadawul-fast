@@ -1,7 +1,14 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.10 (2026-10-20)
+ * Version: 1.2.11 (2026-10-20)
+ *   1.2.11: THREE REVIEW FINDINGS. (a) Stop QUANTITY coverage: an active stop covering part of the lot is
+ *          STOP_PARTIAL (advisory: place a stop for the uncovered shares), never full protection; dp2BracketFor_
+ *          returns stopQty / tpQty. (b) The history must REACH THE ENTRY: dp2LoadBars_(symbols, sinceDate) widens
+ *          the fetch range (6mo / 1y / 2y / 5y) and the bars kept to the oldest equity entry; dp2ExitCompute_ returns
+ *          null when the first bar is after the entry (engine n/a with the reason); an approximated entry ATR is
+ *          flagged. (c) Per-seat cap and the sector denominator use the engine's budget_base = portfolio + cash
+ *          BEFORE the reserve (the reserve shrinks the sizing budget, not NAV).
  *   1.2.10: TWO REVIEW FINDINGS. (a) A stale-bar item in the advisory e-mail carries a VERIFY-ONLY action (never
  *          'Sell now') and a 'stale bars — verify' subject label. (b) dp2ExitLine_ is null-safe when a lot has no
  *          price history (ENGINE_NA rotation candidate) — one such item can no longer abort the whole e-mail.
@@ -141,7 +148,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.10';
+var DP2_VERSION = '1.2.11';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -199,8 +206,10 @@ var DP2X = {
   RISK_WARN_PCT_NAV: 1.0,    // Top 10: SAR at risk on the initial stop above 1% NAV is flagged
   COOLDOWN_H: 20,            // e-mail cooldown per symbol + signal
   ALERT_RAISE: true,         // daily e-mail when the broker stop should be raised / is missing
-  RANGE: '6mo',
-  KEEP_BARS: 130,
+  RANGE: '6mo',            // default fetch range; v1.2.11: dp2LoadBars_(symbols, sinceDate) widens it (1y / 2y / 5y) so the history reaches the oldest entry
+  KEEP_BARS: 130,          // bars kept per symbol at the default range; widened ranges keep up to KEEP_BARS_MAX
+  KEEP_BARS_MAX: 1300,
+  ATR_WARMUP_BARS: 14,     // bars wanted BEFORE the entry so the initial ATR is the entry-date ATR
   FETCH_SLEEP_MS: 200,
   PROP_ALERTS: 'DP2_EXIT_ALERTS',
   PROP_ALERT_TO: 'DP2_EXIT_ALERT_TO',
@@ -888,7 +897,7 @@ function dp2OrderActive_(status) {
   return /NEW|SUBMITTED|PRESUBMITTED|PENDING_SUBMIT|WORKING|PARTIALLY/.test(st);
 }
 function dp2BracketFor_(orders, symbolKey) {
-  var tp = null, stop = null, lastTp = null, lastStop = null, statuses = [], placed = '', active = 0, replaced = 0;
+  var tp = null, stop = null, lastTp = null, lastStop = null, statuses = [], placed = '', active = 0, replaced = 0, stopQty = 0, tpQty = 0;
   for (var i = 0; i < orders.length; i++) {
     var o = orders[i];
     if (o.symbol !== symbolKey || o.side.toUpperCase() !== 'SELL') continue;
@@ -899,8 +908,8 @@ function dp2BracketFor_(orders, symbolKey) {
     if (/REPLACED/.test(dp2Str_(o.status).toUpperCase())) replaced++;
     if (!dp2OrderActive_(o.status)) continue;
     active++;
-    if (isTp) tp = o.price;
-    if (isStop) stop = o.price;
+    if (isTp) { tp = o.price; tpQty += (o.qty || 0); }
+    if (isStop) { stop = o.price; stopQty += (o.qty || 0); }   // v1.2.11: active quantities, for the coverage check
     placed = o.placed || placed;
   }
   var state;
@@ -909,7 +918,7 @@ function dp2BracketFor_(orders, symbolKey) {
   else if (tp !== null || stop !== null) state = 'partial';
   else if (replaced > 0) state = 'replaced';
   else state = 'inactive';
-  return { tp: tp, stop: stop, lastTp: lastTp, lastStop: lastStop, state: state, placed: placed, n: statuses.length, active: active, statuses: statuses };
+  return { tp: tp, stop: stop, lastTp: lastTp, lastStop: lastStop, state: state, placed: placed, n: statuses.length, active: active, statuses: statuses, stopQty: stopQty, tpQty: tpQty };
 }
 
 /* ========================================================= dynamic exits (v1.1.0): price history */
@@ -942,10 +951,10 @@ function dp2DedupeBars_(bars) {
 }
 function dp2Prop_(name) { try { return PropertiesService.getScriptProperties().getProperty(name) || ''; } catch (e) { return ''; } }
 /* Optional TFB-native route: DP2_HISTORY_URL template → JSON {bars:[{date,o,h,l,c}], last} or [[date,o,h,l,c],…] */
-function dp2FetchBackend_(symbol) {
+function dp2FetchBackend_(symbol, range) {
   var tpl = dp2Prop_(DP2X.PROP_HISTORY_URL);
   if (!tpl) return null;
-  var url = tpl.replace('{symbol}', encodeURIComponent(symbol));
+  var url = tpl.replace('{symbol}', encodeURIComponent(symbol)).replace('{range}', encodeURIComponent(range || DP2X.RANGE));
   var opts = { muteHttpExceptions: true, followRedirects: true, headers: {} };
   var key = dp2Prop_(DP2X.PROP_HISTORY_KEY); if (key) opts.headers['X-API-Key'] = key;
   var resp = UrlFetchApp.fetch(url, opts);
@@ -964,8 +973,18 @@ function dp2FetchBackend_(symbol) {
   if (!bars.length) throw new Error('backend: no bars');
   return { bars: bars, last: j && j.last !== undefined ? dp2Num_(j.last) : null, ccy: (j && j.currency) || '', marketState: '', source: 'backend' };
 }
-function dp2FetchYahoo_(key) {
-  var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(key) + '?interval=1d&range=' + DP2X.RANGE + '&includePrePost=false';
+/* v1.2.11: fetch range / bars-to-keep from the oldest entry date the caller needs (plus the ATR warm-up). */
+function dp2RangeFor_(sinceDate) {
+  var d = dp2DateStr_(sinceDate);
+  if (!d) return { range: DP2X.RANGE, keep: DP2X.KEEP_BARS, days: null };
+  var days = Math.round((Date.now() - new Date(d + 'T00:00:00Z').getTime()) / 86400000) + Math.round(DP2X.ATR_WARMUP_BARS * 1.5);
+  if (days <= 150) return { range: '6mo', keep: DP2X.KEEP_BARS, days: days };
+  if (days <= 330) return { range: '1y', keep: 270, days: days };
+  if (days <= 700) return { range: '2y', keep: 530, days: days };
+  return { range: '5y', keep: DP2X.KEEP_BARS_MAX, days: days };
+}
+function dp2FetchYahoo_(key, range) {
+  var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(key) + '?interval=1d&range=' + (range || DP2X.RANGE) + '&includePrePost=false';
   var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TFB-DecisionPages/' + DP2_VERSION + ')', 'Accept': 'application/json' } });
   var code = resp.getResponseCode();
   if (code !== 200) throw new Error('yahoo HTTP ' + code);
@@ -983,7 +1002,7 @@ function dp2FetchYahoo_(key) {
   if (!bars.length) throw new Error('yahoo: empty series');
   return { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };
 }
-function dp2FetchStooq_(key) {
+function dp2FetchStooq_(key, keep) {
   var url = 'https://stooq.com/q/d/l/?s=' + encodeURIComponent(key.toLowerCase() + '.us') + '&i=d';
   var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
   if (resp.getResponseCode() !== 200) throw new Error('stooq HTTP ' + resp.getResponseCode());
@@ -998,7 +1017,7 @@ function dp2FetchStooq_(key) {
     bars.push({ date: p[0], o: isNaN(o) ? c : o, h: h, l: l, c: c });
   }
   if (!bars.length) throw new Error('stooq: empty series');
-  bars = bars.slice(-DP2X.KEEP_BARS);
+  bars = bars.slice(-(keep || DP2X.KEEP_BARS));
   return { bars: bars, last: bars[bars.length - 1].c, ccy: 'USD', marketState: '', source: 'stooq' };
 }
 function dp2BarsCacheRead_() {
@@ -1030,7 +1049,7 @@ function dp2BarsCacheWriteLocked_(map) {
   var syms = Object.keys(map).sort();
   for (var i = 0; i < syms.length; i++) {
     var e = map[syms[i]]; if (!e || !e.bars || !e.bars.length) continue;
-    var bars = e.bars.slice(-DP2X.KEEP_BARS);
+    var bars = e.bars.slice(-Math.min(DP2X.KEEP_BARS_MAX, Math.max(DP2X.KEEP_BARS, e.keep || 0)));
     for (var j = 0; j < bars.length; j++) rows.push([syms[i], e.key || '', bars[j].date, bars[j].o, bars[j].h, bars[j].l, bars[j].c, e.source || '', e.fetched || '']);
   }
   sh.clear();
@@ -1047,19 +1066,20 @@ function dp2BarsCacheWriteLocked_(map) {
   return rows.length;
 }
 /* Loads daily bars for a list of TFB symbols: backend route (if configured) → Yahoo → Stooq (US) → cached rows (stale). */
-function dp2LoadBars_(symbols) {
+function dp2LoadBars_(symbols, sinceDate) {
   var cache = null, out = {}, changed = false;
+  var rg = dp2RangeFor_(sinceDate);   // v1.2.11: the history must reach the oldest entry the caller replays
   for (var i = 0; i < symbols.length; i++) {
     var sym = dp2Str_(symbols[i]).trim();
     if (!sym || out[sym]) continue;
-    if (DP2X_MEMO_[sym]) { out[sym] = DP2X_MEMO_[sym]; continue; }
+    if (DP2X_MEMO_[sym] && (DP2X_MEMO_[sym].keep || DP2X.KEEP_BARS) >= rg.keep) { out[sym] = DP2X_MEMO_[sym]; continue; }
     var key = dp2YahooKey_(sym), res = null, err = [];
-    try { res = dp2FetchBackend_(sym); } catch (e0) { err.push(String(e0 && e0.message || e0)); }
-    if (!res) { try { res = dp2FetchYahoo_(key); } catch (e1) { err.push(String(e1 && e1.message || e1)); } }
-    if (!res && dp2IsUs_(sym)) { try { res = dp2FetchStooq_(key); } catch (e2) { err.push(String(e2 && e2.message || e2)); } }
+    try { res = dp2FetchBackend_(sym, rg.range); } catch (e0) { err.push(String(e0 && e0.message || e0)); }
+    if (!res) { try { res = dp2FetchYahoo_(key, rg.range); } catch (e1) { err.push(String(e1 && e1.message || e1)); } }
+    if (!res && dp2IsUs_(sym)) { try { res = dp2FetchStooq_(key, rg.keep); } catch (e2) { err.push(String(e2 && e2.message || e2)); } }
     if (res && res.bars && res.bars.length) {
-      res.bars = dp2DedupeBars_(res.bars).slice(-DP2X.KEEP_BARS);
-      res.key = key; res.fetched = dp2Today_(); res.stale = false; res.error = '';
+      res.bars = dp2DedupeBars_(res.bars).slice(-rg.keep);
+      res.key = key; res.fetched = dp2Today_(); res.stale = false; res.error = ''; res.range = rg.range; res.keep = rg.keep;
       changed = true;
     } else {
       if (cache === null) cache = dp2BarsCacheRead_();
@@ -1097,12 +1117,15 @@ function dp2Sma_(bars, i, n) { if (i + 1 < n) return null; var s = 0; for (var k
 /* Replays the rule from the entry bar to the last bar. entryDate 'yyyy-MM-dd' (or '' → last bar). lastOverride = live price if known. */
 function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
   if (!bars || bars.length < DP2X.ATR_N + 1 || !entry) return null;
+  // v1.2.11 (review finding): the replay is only valid when the history reaches the entry — a series that starts
+  // after the entry would rebuild the trade from the wrong bar (highs, episodes and the entry ATR all lost).
+  if (entryDate && bars[0].date > entryDate) return null;
   var atr = dp2Atr_(bars, DP2X.ATR_N);
   var e = -1, i;
   if (entryDate) { for (i = 0; i < bars.length; i++) { if (bars[i].date >= entryDate) { e = i; break; } } }
   if (e < 0) e = bars.length - 1;
-  var a0 = atr[e];
-  if (a0 === null) { for (i = 0; i < atr.length; i++) { if (atr[i] !== null) { a0 = atr[i]; break; } } }
+  var a0 = atr[e], atrApprox = false;
+  if (a0 === null) { atrApprox = true; for (i = 0; i < atr.length; i++) { if (atr[i] !== null) { a0 = atr[i]; break; } } }
   if (a0 === null || !(a0 > 0)) return null;
   var s0 = entry - DP2X.ATR_MULT_STOP * a0, R = entry - s0;
   var stop = s0, hi = bars[e].c, a = a0, gainR = 0, trailMult = DP2X.ATR_MULT_STOP, beLocked = false, mom = false, sma = null;
@@ -1130,7 +1153,7 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
   var last = (lastOverride !== null && lastOverride !== undefined && lastOverride > 0) ? lastOverride : lastBar.c;
   return { entry: entry, entryBar: bars[e].date, atrEntry: a0, s0: s0, R: R, hi: hi, gainR: gainR, atr: a, sma: sma, stop: stop, trailMult: trailMult,
            beLocked: beLocked, momentum: mom, last: last, lastDate: lastBar.date, barsSinceEntry: bars.length - e, firstHit: firstHit, firstMom: firstMom,
-           hits: hits, moms: moms, lastR: R > 0 ? (last - entry) / R : null };
+           hits: hits, moms: moms, atrApprox: atrApprox, barsBeforeEntry: e, lastR: R > 0 ? (last - entry) / R : null };
 }
 /* Signal for a held lot. x = dp2ExitCompute_ result (or null), br = { tp, stop } working broker levels (null when none), fallbackLast.
  * alert = immediate e-mail (SELL NOW); advisory = at most one e-mail per cooldown (stop near / raise / missing broker stop). */
@@ -1145,6 +1168,8 @@ function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
   else if (out.dist !== null && out.dist <= DP2X.NEAR_STOP_PCT) { out.code = 'STOP_NEAR'; out.kind = 'amber'; out.text = 'STOP NEAR — ' + dp2PctPlain_(out.dist, 1) + ' above ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
   // v1.2.4 (review finding): a missing or low broker stop outranks the take-profit watch — an unprotected lot near its
   // target is still unprotected; the TP proximity is carried alongside (out.tpWatch, text suffix).
+  // v1.2.11 (review finding): an active stop that covers only part of the lot is not full protection
+  else if (br && br.stop && br.shares && br.stopQty !== undefined && br.stopQty !== null && br.stopQty > 0 && br.stopQty < br.shares - 1e-9) { out.code = 'STOP_PARTIAL'; out.kind = 'amber'; out.advisory = true; out.uncovered = br.shares - br.stopQty; out.text = 'STOP COVERS ' + dp2Fmt_(br.stopQty) + ' of ' + dp2Fmt_(br.shares) + ' sh at ' + dp2Fmt_(br.stop, 2) + ' — place a stop for ' + dp2Fmt_(out.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (x.stop >= br.stop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' · raise the existing one to ' + dp2Fmt_(x.stop, 2) : ''); }
   else if (br && br.stop && x.stop >= br.stop * (1 + DP2X.RAISE_MIN_PCT / 100)) { out.code = 'RAISE_STOP'; out.kind = 'amber'; out.text = 'RAISE STOP ' + dp2Fmt_(br.stop, 2) + ' → ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
   else if (br && br.known === false) { out.code = 'HOLD_BROKER_UNKNOWN'; out.kind = 'navy'; out.text = 'HOLD — broker orders unknown · rule stop ' + dp2Fmt_(x.stop, 2); }
   else if (!br || !br.stop) { out.code = 'NO_BROKER_STOP'; out.kind = 'amber'; out.text = 'NO WORKING STOP — place ' + dp2Fmt_(x.stop, 2); out.advisory = true; }
@@ -1177,6 +1202,13 @@ function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
     }
   }
   return out;
+}
+/* v1.2.11: one line explaining why the exit engine is unavailable for a lot. */
+function dp2EngineNaWhy_(xb, entryDate) {
+  if (!xb || !xb.bars || !xb.bars.length) return 'no price history' + (xb && xb.error ? ' — ' + dp2Str_(xb.error).slice(0, 90) : '');
+  if (entryDate && xb.bars[0].date > entryDate) return 'exit engine n/a — history starts ' + xb.bars[0].date + ', after the entry ' + entryDate + ' (fetched ' + (xb.range || DP2X.RANGE) + '); widen the range or check the entry date';
+  if (xb.bars.length < DP2X.ATR_N + 1) return 'exit engine n/a — only ' + xb.bars.length + ' bars';
+  return 'exit engine n/a';
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
@@ -1270,6 +1302,7 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'STOP_NEAR') why = 'last ' + dp2Fmt_(x.last, 2) + ' is only ' + dp2PctPlain_(s.dist, 1) + ' above the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ATR ' + dp2Fmt_(x.atr, 2) + ')' + (it.brokerStop ? '; the fixed broker stop ' + dp2Fmt_(it.brokerStop, 2) + ' is ' + dp2Pct_((it.brokerStop / x.last - 1) * 100, 1) + ' away.' : '; no working broker stop is listed.');
   else if (s.code === 'RAISE_STOP') why = 'the trailing rule puts the stop at ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + dp2RFmt_(x.gainR) + ' at the high); the working broker stop is ' + dp2Fmt_(it.brokerStop, 2) + '.';
   else if (s.code === 'NO_BROKER_STOP') why = 'no working stop order is listed in _IBKR_Orders; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
+  else if (s.code === 'STOP_PARTIAL') why = 'the active stop covers only part of the lot (' + dp2Fmt_(s.uncovered) + ' sh unprotected); the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
   else if (s.code === 'EXIT_LATCHED') why = 'the rule exited this lot on ' + s.latched.text + ' and the position is still open; the alert for that day was never acted on, and a later recovery does not reinstate the trade. Today: last ' + dp2Fmt_(x.last, 2) + ', trailing stop ' + dp2Fmt_(x.stop, 2) + '.';
   else why = s.text;
   if (s.staleBars) why += ' PRICE HISTORY IS STALE (fetch failed; cached bars) — the engine ran on the cockpit quote; confirm the live price before any order.';
@@ -1282,6 +1315,7 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'STOP_NEAR') action = 'Decide now: pre-empt at ' + dp2Fmt_(x.last, 2) + ', or let the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' decide — and make sure a broker stop at least that high is working.';
   else if (s.code === 'RAISE_STOP') action = 'Raise the IBKR stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) + trailTxt;
   else if (s.code === 'NO_BROKER_STOP') action = 'Place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop is listed)' + trailTxt;
+  else if (s.code === 'STOP_PARTIAL') action = 'Place a stop for the uncovered ' + dp2Fmt_(s.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (it.brokerStop && x.stop >= it.brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ', and raise the existing stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + trailTxt;
   else if (s.code === 'TP_WATCH') action = 'No stop change. The broker take-profit ' + dp2Fmt_(it.brokerTp, 2) + ' is close: keep it to bank the gain, or cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.';
   else if (s.code === 'HOLD_BROKER_UNKNOWN') action = 'No stop change from this page — the broker orders are unknown here; confirm at the broker that a stop at or above ' + (x ? dp2Fmt_(x.stop, 2) : 'the rule\'s level') + ' is working.';
   else if (s.code === 'HOLD' || s.code === 'HOLD_BE') action = 'No stop change — the working broker stop ' + (it.brokerStop && x ? dp2Fmt_(it.brokerStop, 2) + ' is at or above the rule\'s ' + dp2Fmt_(x.stop, 2) : 'is where the rule puts it') + '; keep it. Never lower a stop.';
@@ -1294,7 +1328,7 @@ function dp2ExitLine_(it, fx) {
     why += rtxt;
     var switchAct = 'SWITCH (research): ' + rr.action.toLowerCase() + ' ' + it.symbol + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' when the feed is released — the engine will carry the same plan. Research only; no order is placed by this page.';
     if (s.staleBars) action += ' ' + switchAct;
-    else if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
+    else if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW' || s.code === 'STOP_NEAR' || s.code === 'RAISE_STOP' || s.code === 'NO_BROKER_STOP' || s.code === 'STOP_PARTIAL' || s.code === 'TP_WATCH') action += ' Then: ' + switchAct;
     else action = switchAct + ' Stop: ' + action;
   }
   return { head: it.symbol + ' — ' + (it.name || '') + ' · ' + dp2Fmt_(it.qty) + ' × ' + dp2Fmt_(it.entry, 2) + ' → last ' + dp2Fmt_(lastPx, 2) + (pnl !== null ? ' (' + dp2Signed_(pnl) + ' SAR unrealized)' : '') + (x ? '' : ' · no price history'), signal: s.text + (it.rotation ? ' · SWITCH candidate' : ''), why: why, action: action };
@@ -1302,7 +1336,7 @@ function dp2ExitLine_(it, fx) {
 function dp2ExitSendMail_(items, fx, to) {
   if (!to) throw new Error('no recipient — set Script Property ' + DP2X.PROP_ALERT_TO);
   var sells = items.filter(function (it) { return it.sig.alert; });
-  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : (it.sig.code === 'EXIT_LATCHED' ? 'RULE EXIT ' + it.sig.latched.date + ' not acted' : 'SELL NOW')); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.sig.staleBars ? 'stale bars — verify' : (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : (it.sig.code === 'RAISE_STOP' ? 'raise stop' : 'advisory'))))); }).join(', ')) + ' · ' + dp2Today_();
+  var subject = 'TFB exit alert — ' + (sells.length ? sells.map(function (it) { return it.symbol + ' ' + (it.sig.code === 'STOP_HIT' ? 'STOP HIT' : (it.sig.code === 'EXIT_LATCHED' ? 'RULE EXIT ' + it.sig.latched.date + ' not acted' : 'SELL NOW')); }).join(', ') : items.map(function (it) { return it.symbol + ' ' + (it.sig.staleBars ? 'stale bars — verify' : (it.rotation ? 'switch candidate' : (it.sig.code === 'STOP_NEAR' ? 'stop near' : (it.sig.code === 'NO_BROKER_STOP' ? 'no broker stop' : (it.sig.code === 'STOP_PARTIAL' ? 'stop covers part of the lot' : (it.sig.code === 'RAISE_STOP' ? 'raise stop' : 'advisory')))))); }).join(', ')) + ' · ' + dp2Today_();
   var text = [], html = ['<div style="font-family:Arial,sans-serif;font-size:13px;color:#14202b">', '<p><b>Decision Pages v2 ' + DP2_VERSION + '</b> · dynamic exit signals · ' + dp2Today_() + ' Riyadh</p>'];
   for (var i = 0; i < items.length; i++) {
     var L = dp2ExitLine_(items[i], fx);
@@ -1490,11 +1524,11 @@ function dp2Allocate_(plans, cashSar, pvSar, secCtx) {
   // v1.2.9 (review finding): the engine's post-action PORTFOLIO sector cap (pf_max_sector_pct, 'budget' basis =
   // portfolio + deployable) — a seat whose sector would exceed it is deferred (SECTOR_CAP), and a top-up that would is skipped.
   var secSar = (secCtx && secCtx.sectors) ? secCtx.sectors : null, secMax = (secCtx && secCtx.maxPct) ? secCtx.maxPct : null;
-  var secTotal = function () { return pv + Math.max(0, cash - nav * DP2.CASH_FLOOR_PCT); };
+  var secTotal = function () { return pv + cash; };   // v1.2.11: the engine's budget_base (pre-reserve NAV; the reserve shrinks the budget, not NAV)
   var secOk = function (sec, addSar) { if (!secSar || !secMax) return true; var tot = secTotal(); if (tot <= 0) return true; return ((secSar[sec] || 0) + addSar) / tot * 100 <= secMax + 1e-9; };
   var floorSar = nav * DP2.CASH_FLOOR_PCT;
   var deployable = Math.max(0, cash - floorSar);
-  var cap = DP2A.MAX_WEIGHT_PCT / 100 * (pv + deployable);
+  var cap = DP2A.MAX_WEIGHT_PCT / 100 * (pv + cash);   // v1.2.11 (review finding): cap on budget_base = portfolio + cash BEFORE the reserve, as _select_and_size
   var weights = {}, i, p;
   for (i = 0; i < plans.length; i++) { p = plans[i]; if (p.priceSar) weights[p.sym] = dp2ConvWeight_(p.roiVal, p.risk, p.rel); }   // v1.2.4: valuation ROI, as the engine
   var targets = dp2WaterFill_(weights, deployable, cap, DP2A.MIN_TICKET_SAR);
@@ -1730,7 +1764,9 @@ function buildPortfolioDecisionV2() {
   }
   // price history for the dynamic exits (backend route → Yahoo → Stooq → cache); never fatal for the page
   var xbars = {};
-  try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; })); } catch (eX) { xbars = {}; }
+  var oldestEntry = '';
+  for (var oe = 0; oe < eq.length; oe++) { var od = dp2DateStr_(eq[oe].buyDate); if (od && (!oldestEntry || od < oldestEntry)) oldestEntry = od; }
+  try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; }), oldestEntry); } catch (eX) { xbars = {}; }   // v1.2.11: history back to the oldest entry
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
   var alloc = null;
   try {
@@ -1861,7 +1897,7 @@ function buildPortfolioDecisionV2() {
     var brokerStop = ib.ordersKnown ? br.stop : null;   // active-status orders only (v1.2.2), from a fresh dated snapshot only (v1.2.5)
     var brokerTp = ib.ordersKnown ? br.tp : null;
     var ackDate = exitAck[l.symbol] || null;
-    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price, ackDate);
+    var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown, stopQty: ib.ordersKnown ? br.stopQty : null, shares: l.shares }, l.price, ackDate);
     if (xb && xb.stale && x) { sig.staleBars = true; if (sig.alert) { sig.alert = false; sig.advisory = true; sig.kind = 'amber'; sig.text += ' · STALE BARS (' + dp2Str_(xb.fetched) + ') — verify the quote before acting'; } }
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
@@ -1871,9 +1907,11 @@ function buildPortfolioDecisionV2() {
     var dynTxt = x ? (dp2Fmt_(x.stop, 2) + ' (' + dp2Pct_(stopPct, 1) + ')\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) + (x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' ↑ raise' : '') : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')))
                    : ('—\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')));
     var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
-                   : ('no price history' + (xb && xb.error ? ' — ' + dp2Str_(xb.error).slice(0, 90) : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
+                   : (dp2EngineNaWhy_(xb, entryDate) + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
+    if (x && x.atrApprox) engTxt += ' · entry ATR approximated (' + x.barsBeforeEntry + ' bars before the entry)';
     var ostat;
     if (!ib.ordersKnown && br.n > 0) { ostat = 'UNVERIFIED — ' + ib.unknownWhy + ' · last listed: ' + br.statuses.join(', ') + ' → paste a fresh connector read'; }
+    else if (br.state === 'working' && l.shares && br.stopQty > 0 && br.stopQty < l.shares - 1e-9) { ostat = 'working since ' + br.placed + ' — stop covers ' + dp2Fmt_(br.stopQty) + ' of ' + dp2Fmt_(l.shares) + ' sh (partial)'; }   // v1.2.11
     else if (br.state === 'working') { ostat = 'working since ' + br.placed; workingBrackets++; }
     else if (br.state === 'replaced') { ostat = 'REPLACED — no working successor listed → verify at the broker'; actions.push({ p: 1, t: l.symbol + ' bracket: IBKR lists the ' + dp2Fmt_(br.lastTp, 2) + ' / ' + dp2Fmt_(br.lastStop, 2) + ' pair as REPLACED with no working successor. If nothing is working, ' + dp2Fmt_(l.mvSar) + ' SAR is unprotected — verify before the next US open' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '.' }); }
     else if (br.state === 'inactive') { ostat = 'no active sell order — ' + br.n + ' listed (' + br.statuses.join(', ') + ') → verify at the broker'; actions.push({ p: 1, t: l.symbol + ': every sell order in _IBKR_Orders is ' + br.statuses.join(' / ') + ' — nothing active protects ' + dp2Fmt_(l.mvSar) + ' SAR' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '. Verify at the broker.' }); }
@@ -1888,6 +1926,8 @@ function buildPortfolioDecisionV2() {
       actions.push({ p: 0, t: 'SELL NOW ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitLine_(item, fx).why + ' Unrealized ' + dp2Signed_((last - cost) * l.shares * lfx) + ' SAR now' + (brokerStop ? ' vs ' + dp2Signed_((brokerStop - cost) * l.shares * lfx) + ' SAR if the fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is left to fill' : '') + '. No order was placed by this page — act at the broker.' });
     } else if (sig.code === 'STOP_NEAR') {
       actions.push({ p: 1, t: l.symbol + ' is ' + dp2PctPlain_(sig.dist, 1) + ' above its dynamic stop ' + dp2Fmt_(x.stop, 2) + ' — a print at or below it is a SELL NOW; decide now whether to pre-empt at ' + dp2Fmt_(last, 2) + (brokerStop ? ' (fixed broker stop ' + dp2Fmt_(brokerStop, 2) + ' is ' + dp2Pct_((brokerStop / last - 1) * 100, 1) + ' away)' : '') + '.' });
+    } else if (sig.code === 'STOP_PARTIAL') {
+      actions.push({ p: 2, t: l.symbol + ': the active stop covers ' + dp2Fmt_(br.stopQty) + ' of ' + dp2Fmt_(l.shares) + ' sh — place a stop for the uncovered ' + dp2Fmt_(sig.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (brokerStop && x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' and raise the existing stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + '.' });
     } else if (sig.code === 'RAISE_STOP' || sig.code === 'NO_BROKER_STOP') {
       actions.push({ p: 2, t: l.symbol + ': ' + (sig.code === 'RAISE_STOP' ? 'raise the IBKR stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : 'place a stop at ' + dp2Fmt_(x.stop, 2) + ' (no working stop listed)') + ' — or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.' });
     } else if (sig.code === 'TP_WATCH') {
@@ -1995,7 +2035,7 @@ function buildPortfolioDecisionV2() {
     ['Cash basis (shared with Top_10_v2)', dp2CashBasisText_(cb), cb.sar === null ? DP2C.red : (cb.warn ? DP2C.amber : DP2C.green)],
     ['Brackets working on every equity lot', workingBrackets + ' of ' + eq.length + (workingBrackets < eq.length ? ' · verify' : ' · pass'), workingBrackets === eq.length ? DP2C.green : DP2C.amber],
     ['Dynamic exit engine on fresh bars', xFresh + ' of ' + xTotal + ' lots · ' + srcList, (xTotal > 0 && xFresh === xTotal) ? DP2C.green : DP2C.amber],
-    ['Broker stop ≥ dynamic stop on every lot', (function () { var n = 0; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP') n++; return n ? n + ' lot(s) to raise / place' : 'pass'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP') return DP2C.amber; return DP2C.green; })()],
+    ['Broker stop ≥ dynamic stop on every lot, full quantity', (function () { var n = 0; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') n++; return n ? n + ' lot(s) to raise / place / complete' : 'pass'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') return DP2C.amber; return DP2C.green; })()],
     ['SELL NOW signals open', (function () { var n = []; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) n.push(exitItems[k].symbol); return n.length ? n.join(', ') : 'none'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) return DP2C.red; return DP2C.green; })()],
     ['Rotation candidate (research)', alloc && alloc.rotation12 ? alloc.rotation12.rotation.action + ' ' + alloc.rotation12.rotation.symbol + ' → ' + alloc.rotation12.sym + ' (+' + dp2Fmt_(alloc.rotation12.rotation.edge, 1) + ' pp 12M)' : (alloc && alloc.rotation3 ? alloc.rotation3.rotation.action + ' ' + alloc.rotation3.rotation.symbol + ' → ' + alloc.rotation3.sym + ' (+' + dp2Fmt_(alloc.rotation3.rotation.edge, 1) + ' pp 3M only)' : (alloc && alloc.needs.length ? 'none — capital call' : 'none needed')), alloc && (alloc.rotation12 || alloc.rotation3) ? DP2C.amber : DP2C.ink],
     ['IBKR evidence freshness ≤ ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' · ' + pd.evidence.age : ''), evFresh ? DP2C.green : DP2C.red],
@@ -2123,7 +2163,7 @@ function buildTop10V2() {
   row++;
 
   // seats table — 3-month close, research allocation (conviction mirror), initial dynamic stop
-  row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% of portfolio + deployable, minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR, cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% NAV). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
+  row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR, cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% NAV). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
   var sHdr = ['#', 'Symbol · name', '3-month close', 'Seat status', 'Price', 'Alloc SAR', 'Buy qty', 'Dyn. stop (2×ATR)', 'Risk SAR', 'Exp. gain 3M', 'ROI 3M plan', 'ROI 12M eng.', 'Rel · DQ · score', 'Flags'];
   var sSp = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2];
   var sRows = [], sRisk = [], sState = [];
@@ -2209,7 +2249,7 @@ function buildTop10V2() {
       ['Cash check (other reading)', cb.other !== null ? cb.otherLabel + ': ' + dp2Fmt_(cb.other) + ' SAR (' + (cb.diffPct >= 0 ? '+' : '') + dp2Fmt_(cb.diffPct, 1) + '%)' + (cb.warn ? ' — RECONCILE before placing orders' : ' · consistent') : 'no second reading', cb.warn ? DP2C.amber : DP2C.ink2],
       ['Cash floor ' + Math.round(DP2.CASH_FLOOR_PCT * 100) + '% of NAV ' + dp2Fmt_(alloc.nav), dp2Fmt_(alloc.floorSar) + ' SAR'],
       ['Deployable', dp2Fmt_(alloc.deployable) + ' SAR', DP2C.green],
-      ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + deployable)', dp2Fmt_(alloc.cap) + ' SAR'],
+      ['Per-seat cap ' + DP2A.MAX_WEIGHT_PCT + '% × (portfolio ' + dp2Fmt_(alloc.pv) + ' + cash ' + dp2Fmt_(alloc.cash) + ', pre-reserve — the engine\'s budget_base)', dp2Fmt_(alloc.cap) + ' SAR'],
       ['Plans in the sizing cohort', alloc.plans.length + ' · ' + alloc.plans.map(function (p) { return p.sym + ' (' + (p.roiVal !== null ? dp2PctPlain_(p.roiVal, 1) + ' val' + (p.roiValSource === 'tp1x2' ? '≈' : '') : 'ROI n/a → ' + DP2A.REQUIRED_ROI_PCT + '%') + ')'; }).join(', ') + ' · weight = valuation ROI × risk × reliability (engine roi_pct) · caps ' + (function () { var c = dp2CohortCaps_(t); return c.maxSelected + ' seats / ' + c.maxPerSector + ' per sector / ' + c.maxPerMarket + ' per market (' + (c.fromPanel ? 'Top_10 panel' : 'defaults') + ')'; })()],
       ['Allocated · cash after', dp2Fmt_(alloc.allocated) + ' SAR · ' + dp2Fmt_(alloc.cashAfter) + ' SAR left' + (alloc.topup ? ' · incl. lot-rounding top-up ' + dp2Fmt_(alloc.topup) + ' SAR (engine pass)' : ''), alloc.allocated > 0 ? DP2C.green : DP2C.amber],
       ['Expected gain, 3-month plan', dp2Signed_(alloc.gain3) + ' SAR', alloc.gain3 > 0 ? DP2C.green : DP2C.ink],
