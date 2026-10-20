@@ -1,7 +1,10 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.15 (2026-10-20)
+ * Version: 1.2.16 (2026-10-20)
+ *   1.2.16: REVIEW FINDING. The episode of the last sell alert is read back as RAW TEXT (dp2EpisodeStr_) — a live key
+ *          '<last bar> live' was cut to its date and re-sent the same alert on every build. dp2SellAlertDue_ /
+ *          dp2EpisodeIsLater_ also treat that live break and the stop touch the next bar records as ONE episode.
  *   1.2.15: TWO REVIEW FINDINGS. (a) The cash reserve taken before sizing is the ENGINE's (dp2CashReserve_), never a
  *          hard-coded 10 %: inputs are the engine's cash_floor alert on the Top_10 sheet (ENFORCED → the floor, a percent
  *          re-applied to the current NAV; observe → none) → Script Properties DP2_CASH_FLOOR_SAR/_PCT/_MODE (bind only
@@ -170,7 +173,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.15';
+var DP2_VERSION = '1.2.16';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1267,7 +1270,7 @@ function dp2ExitStateRead_() {
   for (var i = 0; i < vals.length; i++) {
     var sym = dp2Str_(vals[i][0]).trim(); if (!sym) continue;
     var lotKey = dp2Str_(vals[i][22]).trim() || sym;   // v1.2.12: one state row per LOT; legacy rows (no lot column) key by symbol
-    out[lotKey] = { symbol: sym, signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]), lastAlertEpisode: dp2DateStr_(vals[i][23]) || dp2Str_(vals[i][23]) };
+    out[lotKey] = { symbol: sym, signal: dp2Str_(vals[i][12]), text: dp2Str_(vals[i][13]), since: dp2Str_(vals[i][14]), lastAlertSignal: dp2Str_(vals[i][15]), lastAlertAt: dp2Num_(vals[i][16]) || 0, lastRaiseAt: dp2Num_(vals[i][17]) || 0, latched: dp2DateStr_(vals[i][21]) || dp2Str_(vals[i][21]), lastAlertEpisode: dp2EpisodeStr_(vals[i][23]) };   // v1.2.16: raw text, so a '<date> live' key survives
   }
   return out;
 }
@@ -1315,9 +1318,10 @@ function dp2ExitAlertsLocked_(items, fx) {
     var st = { signal: it.sig.code, since: since, lastAlertSignal: p.lastAlertSignal || '', lastAlertAt: p.lastAlertAt || 0, lastRaiseAt: p.lastRaiseAt || 0, lastAlertEpisode: p.lastAlertEpisode || '', sendKind: '' };
     // v1.2.15 (review finding): STOP_HIT / SELL_NOW / EXIT_LATCHED are one SELL family keyed to the exit EPISODE — a
     // presentation change between them never resets the cooldown; a genuinely new episode alerts at once.
+    // v1.2.16 (review finding): the decision is dp2SellAlertDue_ — a live break keyed '<last bar> live' is the same
+    // episode as the stop touch the next bar records (no second e-mail when the bars catch up).
     var episode = dp2ExitEpisode_(it);
-    var prevSell = /^(STOP_HIT|SELL_NOW|EXIT_LATCHED)$/.test(st.lastAlertSignal);
-    if (it.sig.alert && (!prevSell || !st.lastAlertAt || (episode && st.lastAlertEpisode && episode !== st.lastAlertEpisode && episode > st.lastAlertEpisode) || now - st.lastAlertAt >= cooldown)) { st.sendKind = 'sell'; st.episode = episode; }
+    if (dp2SellAlertDue_(st, it, now, cooldown)) { st.sendKind = 'sell'; st.episode = episode; }
     else if (DP2X.ALERT_RAISE && it.sig.advisory && (!st.lastRaiseAt || now - st.lastRaiseAt >= cooldown)) st.sendKind = 'advisory';
     if (st.sendKind) send.push(it);
     states[k0] = st;
@@ -1339,6 +1343,37 @@ function dp2ExitAlertsLocked_(items, fx) {
   }
   try { dp2ExitStateWrite_(rows); } catch (e4) { result.error = (result.error ? result.error + ' · ' : '') + 'state: ' + String(e4 && e4.message || e4); }
   return result;
+}
+/* v1.2.16 (review finding): the stored episode key is read as RAW TEXT — dp2DateStr_ would cut '2026-10-20 live' to
+ * '2026-10-20', and the next build's live key would then compare as a later episode and re-send on every run. A Date
+ * (a legacy row, or a sheet that converted a date-like cell) is formatted back to yyyy-MM-dd. */
+function dp2EpisodeStr_(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date) return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, DP2.TZ, 'yyyy-MM-dd');
+  return dp2Str_(v).trim();
+}
+/* v1.2.16: is exit episode `ep` LATER than the episode `prev` the last sell alert named (keys from dp2ExitEpisode_)?
+ * A dated key is the start of a replay episode; 'D live' is a stop break the live quote shows after the bar D that the
+ * bars do not record yet — it is the FIRST stop episode the replay records after D, so when the bars catch up and the
+ * key becomes that episode's date it is the same episode, not a later one. */
+function dp2EpisodeIsLater_(ep, prev, x) {
+  if (!ep || !prev || ep === prev) return false;
+  var re = /^(\d{4}-\d{2}-\d{2}) live$/, mp = re.exec(prev), me = re.exec(ep);
+  var pd = mp ? mp[1] : prev, ed = me ? me[1] : ep;
+  if (!(ed > pd)) return false;
+  if (mp && !me) {
+    var hh = (x && x.hits) || [];
+    for (var i = 0; i < hh.length; i++) { if (hh[i].date > pd) return hh[i].date !== ed; }
+  }
+  return true;
+}
+/* v1.2.16: the SELL alert decision for one lot — st = its state (last alert signal / time / episode), it = the item.
+ * Sent when the signal alerts and: no earlier sell alert, the cooldown has passed, or the episode is a later one. */
+function dp2SellAlertDue_(st, it, now, cooldown) {
+  if (!it || !it.sig || !it.sig.alert) return false;
+  var prevSell = /^(STOP_HIT|SELL_NOW|EXIT_LATCHED)$/.test(dp2Str_(st && st.lastAlertSignal));
+  if (!prevSell || !st.lastAlertAt || now - st.lastAlertAt >= cooldown) return true;
+  return dp2EpisodeIsLater_(dp2ExitEpisode_(it), st.lastAlertEpisode || '', it.x);
 }
 /* v1.2.15: the exit EPISODE a sell signal belongs to — the latched date, else the start of the current stop / momentum
  * episode from the replay, else the bar date. Two sell codes about the same episode are the same alert. */
