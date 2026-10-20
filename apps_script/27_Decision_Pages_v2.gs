@@ -1,7 +1,13 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.8 (2026-10-20)
+ * Version: 1.2.9 (2026-10-20)
+ *   1.2.9: THREE REVIEW FINDINGS. (a) STALE bars never produce an actionable alert: the engine runs on the cockpit
+ *          quote, a sell signal is downgraded to a flagged advisory ('STALE BARS … verify the quote'). (b) The
+ *          allocation and the top-up honour the engine's post-action PORTFOLIO sector cap (PF: Max Sector %, held
+ *          SAR per sector from the ledger) — a breaching seat is SECTOR_CAP (deferred, no need). (c) A script lock
+ *          serialises the alert read → send → write transition and the bars-cache write (manual refresh vs hourly
+ *          trigger): the loser skips alerts/state for that run, so no duplicate e-mail and no competing writes.
  *   1.2.8: TWO REVIEW FINDINGS. (a) An empty cohort with cash available and a per-seat cap below the minimum ticket
  *          is CAP_INFEASIBLE (deferred, no need) — never capital exhaustion (engine v1.27.3 does the same).
  *          (b) dp2RotationPick_ no longer drops a holding smaller than the minimum ticket outright: eligibility
@@ -132,7 +138,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.8';
+var DP2_VERSION = '1.2.9';
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1011,6 +1017,11 @@ function dp2BarsCacheRead_() {
   return out;
 }
 function dp2BarsCacheWrite_(map) {
+  var lock = dp2Lock_(10000);   // v1.2.9: never two writers on the cache sheet
+  if (!lock) return false;
+  try { return dp2BarsCacheWriteLocked_(map); } finally { dp2Unlock_(lock); }
+}
+function dp2BarsCacheWriteLocked_(map) {
   var sh = dp2Sheet_(DP2X.SHEET_BARS, true);
   var rows = [];
   var syms = Object.keys(map).sort();
@@ -1204,7 +1215,15 @@ function dp2ExitAlertTo_() {
   return u || '';
 }
 /* items: [{ symbol, name, qty, entry, entryDate, x, sig, brokerStop, brokerTp, fx, mvSar, source, barsAsOf }] */
+/* v1.2.9: a script lock serialises the read → send → write transition (a manual refresh may overlap the hourly trigger). */
+function dp2Lock_(ms) { try { var lk = LockService.getScriptLock(); return lk.tryLock(ms) ? lk : null; } catch (e) { return null; } }
+function dp2Unlock_(lk) { try { if (lk) lk.releaseLock(); } catch (e) {} }
 function dp2ExitAlerts_(items, fx) {
+  var lock = dp2Lock_(20000);
+  if (!lock) return { enabled: dp2ExitAlertsEnabled_(), to: dp2ExitAlertTo_(), due: 0, sent: 0, signals: 0, error: 'another build holds the alert lock — alerts and state skipped this run (no duplicate e-mail)', skipped: true };
+  try { return dp2ExitAlertsLocked_(items, fx); } finally { dp2Unlock_(lock); }
+}
+function dp2ExitAlertsLocked_(items, fx) {
   var prev = dp2ExitStateRead_();
   var now = Date.now(), nowStr = dp2Today_();
   var cooldown = DP2X.COOLDOWN_H * 3600000;
@@ -1247,6 +1266,7 @@ function dp2ExitLine_(it, fx) {
   else if (s.code === 'NO_BROKER_STOP') why = 'no working stop order is listed in _IBKR_Orders; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
   else if (s.code === 'EXIT_LATCHED') why = 'the rule exited this lot on ' + s.latched.text + ' and the position is still open; the alert for that day was never acted on, and a later recovery does not reinstate the trade. Today: last ' + dp2Fmt_(x.last, 2) + ', trailing stop ' + dp2Fmt_(x.stop, 2) + '.';
   else why = s.text;
+  if (s.staleBars) why += ' PRICE HISTORY IS STALE (fetch failed; cached bars) — the engine ran on the cockpit quote; confirm the live price before any order.';
   // v1.2.3 (review finding): the action is specific to the signal code — a stop instruction only for RAISE_STOP /
   // NO_BROKER_STOP; HOLD-type codes never say "raise" to a lower level; a rotation-only mail carries the switch action.
   var action = null;
@@ -1456,8 +1476,13 @@ function dp2PlanSeats_(t, fx, xbars, qmap) {
   return out;
 }
 /* Allocation of the deployable cash across the plan seats (research). pvSar = holdings value; cashSar = cash; navSar = pv + cash. */
-function dp2Allocate_(plans, cashSar, pvSar) {
+function dp2Allocate_(plans, cashSar, pvSar, secCtx) {
   var cash = Math.max(0, cashSar || 0), pv = Math.max(0, pvSar || 0), nav = cash + pv;
+  // v1.2.9 (review finding): the engine's post-action PORTFOLIO sector cap (pf_max_sector_pct, 'budget' basis =
+  // portfolio + deployable) — a seat whose sector would exceed it is deferred (SECTOR_CAP), and a top-up that would is skipped.
+  var secSar = (secCtx && secCtx.sectors) ? secCtx.sectors : null, secMax = (secCtx && secCtx.maxPct) ? secCtx.maxPct : null;
+  var secTotal = function () { return pv + Math.max(0, cash - nav * DP2.CASH_FLOOR_PCT); };
+  var secOk = function (sec, addSar) { if (!secSar || !secMax) return true; var tot = secTotal(); if (tot <= 0) return true; return ((secSar[sec] || 0) + addSar) / tot * 100 <= secMax + 1e-9; };
   var floorSar = nav * DP2.CASH_FLOOR_PCT;
   var deployable = Math.max(0, cash - floorSar);
   var cap = DP2A.MAX_WEIGHT_PCT / 100 * (pv + deployable);
@@ -1498,7 +1523,12 @@ function dp2Allocate_(plans, cashSar, pvSar) {
       needs.push({ sym: p.sym, need: needSar, short: r.short, roi12: p.roi12, roi3: p.roi3, plan: p, why: r.note });
       rows.push(r); continue;
     }
+    if (!secOk(p.sector, qty * p.priceSar)) {
+      r.state = 'SECTOR_CAP'; r.note = 'post-action sector weight ' + dp2PctPlain_(((secSar[p.sector] || 0) + qty * p.priceSar) / secTotal() * 100, 1) + ' would exceed PF: Max Sector ' + secMax + '% (' + p.sector + ') — deferred, as the engine; no funding need';
+      rows.push(r); continue;
+    }
     r.qty = qty; r.alloc = qty * p.priceSar; r.state = 'FUNDED'; r.plan = p;
+    if (secSar) secSar[p.sector] = (secSar[p.sector] || 0) + r.alloc;
     remaining -= r.alloc;
     rows.push(r);
   }
@@ -1511,7 +1541,9 @@ function dp2Allocate_(plans, cashSar, pvSar) {
       var fr = funded[i], room = cap - fr.alloc; if (room <= 0) continue;
       var addQty = Math.floor(Math.min(remaining, room) / fr.plan.priceSar); if (addQty <= 0) continue;
       var addSar = addQty * fr.plan.priceSar;
+      if (!secOk(fr.plan.sector, addSar)) continue;   // v1.2.9: the top-up honours the portfolio sector cap too
       fr.qty += addQty; fr.alloc += addSar; fr.topup = (fr.topup || 0) + addSar; remaining -= addSar; topup += addSar;
+      if (secSar) secSar[fr.plan.sector] = (secSar[fr.plan.sector] || 0) + addSar;
     }
   }
   for (i = 0; i < rows.length; i++) {
@@ -1641,7 +1673,12 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   var qmap = {}; for (i = 0; i < t.qualified.length; i++) qmap[dp2Str_(t.qualified[i]['Symbol']).trim()] = t.qualified[i];
   var seatMap = {}; for (i = 0; i < t.seats.length; i++) seatMap[dp2Str_(t.seats[i]['Symbol']).trim()] = t.seats[i];
   var plans = dp2PlanSeats_(t, fx, xbars, qmap);
-  var alloc = dp2Allocate_(plans, cashSar, pv);
+  // v1.2.9: portfolio sector context for the engine's post-action sector cap (held SAR per sector + PF: Max Sector %)
+  var secCtx = { sectors: {}, maxPct: null };
+  for (i = 0; i < eq.length; i++) { var sName = (eq[i].mp && eq[i].mp.sector) || 'Other'; secCtx.sectors[sName] = (secCtx.sectors[sName] || 0) + (eq[i].mvSar || 0); }
+  try { var pdp = dp2ReadPortfolioDecision_(); secCtx.maxPct = dp2Num_(pdp.panel['PF: Max Sector %']) || null; } catch (eSC) { secCtx.maxPct = null; }
+  var alloc = dp2Allocate_(plans, cashSar, pv, secCtx);
+  alloc.secCtx = secCtx;
   var holdings = dp2RotationHoldings_(eq, fi, ib, qmap, seatMap);
   alloc.holdings = holdings;
   alloc.plans12 = dp2FundingPlans_(alloc.needs, alloc.deployable - alloc.allocated, holdings, '12m');
@@ -1803,7 +1840,10 @@ function buildPortfolioDecisionV2() {
     var lfx = l.fx || fx;
     var xb = xbars[l.symbol] || null;
     var entryDate = dp2DateStr_(l.buyDate);
-    var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, (xb.last !== null && !xb.stale) ? xb.last : null) : null;
+    // v1.2.9 (review finding): on STALE bars the live last is the cockpit quote (never the cached close), and no
+    // actionable alert is issued — the signal is shown and flagged, mailed at most as an advisory.
+    var lastOv = (xb && xb.last !== null && !xb.stale) ? xb.last : ((xb && xb.stale && l.price) ? l.price : null);
+    var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, lastOv) : null;
     xTotal++;
     if (xb && !xb.stale && x) xFresh++;
     if (xb && xb.source) xSources[xb.source] = true;
@@ -1813,6 +1853,7 @@ function buildPortfolioDecisionV2() {
     var brokerTp = ib.ordersKnown ? br.tp : null;
     var ackDate = exitAck[l.symbol] || null;
     var sig = dp2ExitSignal_(x, { tp: brokerTp, stop: brokerStop, known: ib.ordersKnown }, l.price, ackDate);
+    if (xb && xb.stale && x) { sig.staleBars = true; if (sig.alert) { sig.alert = false; sig.advisory = true; sig.kind = 'amber'; sig.text += ' · STALE BARS (' + dp2Str_(xb.fetched) + ') — verify the quote before acting'; } }
     var last = (x && x.last) ? x.last : l.price;
     var tpPct = (br.tp && last) ? (br.tp / last - 1) * 100 : null;
     var stopEff = x ? x.stop : brokerStop;
@@ -2117,6 +2158,7 @@ function buildTop10V2() {
     if (ar && ar.state === 'NEED') flags.push('UNFUNDED — need ' + dp2Fmt_(ar.need) + ' SAR, short ' + dp2Fmt_(ar.short) + ' → see FUNDING PLANS');
     if (ar && ar.state === 'RELEASED') flags.push('released: ' + ar.note);
     if (ar && ar.state === 'CAP_INFEASIBLE') flags.push('cap-infeasible: ' + ar.note);
+    if (ar && ar.state === 'SECTOR_CAP') flags.push('sector cap: ' + ar.note);
     if (ar && ar.state === 'NO_FX') flags.push(ar.note);
     if (!isPlan) flags.push('grace-held · not sized');
     var mearn = /earnings ≤\s?(\d+)d/.exec(note); if (mearn) flags.push('earnings ≤ ' + mearn[1] + ' d');
