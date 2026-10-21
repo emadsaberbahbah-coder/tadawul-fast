@@ -98,7 +98,7 @@ pytest tracker unit suites (test_tp_*, test_track*, test_tracker*)        93 pas
 python3 scripts/test_maturation.py                                        14/14
 embedded self-test _track_selftest_                                       PASS 22/22 (unchanged)
 compileall main.py core routes scripts tests                             ok
-ci.yml lean list (every step)                                             all steps OK, LEAN FAILS: 0
+ci.yml lean list (every step)                                             LEAN FAILS: 0 (decision-layer suites 3772 passed, 19 skipped)
 ```
 
 **Mutations (`-x` per mutation):**
