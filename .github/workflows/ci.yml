@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.29 (2026-10-21) -- SYNC TRUTH AND SHEETS TRANSPORT
+#
+# v1.1.29 (1.1.28 is PR #809): run in the blocking lean lane
+# tests/test_sync_status_stamp_retry.py (run_dashboard_sync v6.70.2
+# STAMP-RETRY), tests/test_validate_dashboard_decision_surface.py
+# (validate_dashboard v1.3.1 in-progress cockpit re-read) and
+# tests/test_symbols_reader_thread_local.py (core/symbols_reader v8.7.0
+# per-thread Sheets service); and in the blocking contract lane
+# tests/test_auth_wall_downstream_errors.py (main.py v8.14.6: the auth wall
+# answers 401 only for requests it refuses). Offline fakes only.
+#
 # VERSION 1.1.27 (2026-10-20) -- UNIVERSE MAINTENANCE
 #
 # v1.1.27: run tests/test_universe_maintenance.py (new
@@ -650,6 +661,9 @@ jobs:
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
             tests/test_sync_hk_reporting_fx.py \
+            tests/test_sync_status_stamp_retry.py \
+            tests/test_validate_dashboard_decision_surface.py \
+            tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
@@ -825,6 +839,7 @@ jobs:
             tests/test_analysis_fallback_publication.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \
             tests/test_auth_wall_scope_path.py \
+            tests/test_auth_wall_downstream_errors.py \
             tests/test_route_mount_compat.py
           echo "::endgroup::"
 

@@ -2,12 +2,26 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.1)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.1 (2026-10-21) — DECISION SURFACE: IN-PROGRESS RENDER + COCKPIT STATUS
+--------------------------------------------------------------------------------
+WHY: sync run 39513589733 failed all three legs on "cockpit data-grid header
+(Rank|Symbol) not found in first 16 rows" because the Top_10 cockpit run that
+began ~16:20 UTC was still at "status: running…" (it writes that line first,
+then the board), and the FAIL gave no hint why the grid was absent.
+WHAT: (1) while the header is absent AND the cockpit's own status line reads
+running, the decision surface is re-read VALIDATE_T10_INPROGRESS_READS times
+(default 3; 0 = v1.3.0) after VALIDATE_T10_INPROGRESS_WAIT_S (default 30);
+(2) a header FAIL now quotes the cockpit status line ("Last run ... | status:
+...") and the number of in-progress re-reads. The checks themselves, their
+statuses and the exit-code contract are unchanged: a board that never appears
+still FAILs, and nothing is skipped or downgraded.
+
 v1.3.0 (2026-08-23) — W1A-1: ROUTE-AWARE SCOPE, OPEN VALIDATION, HONEST SAMPLING
 --------------------------------------------------------------------------------
 WHY (external audits 2026-08-22/23, adjudicated): (a) P1-1 — this validator
@@ -270,7 +284,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -1000,15 +1014,43 @@ def _find_feed_banner(grid: List[List[Any]], upto: int) -> str:
     return ""
 
 
+def _cockpit_status_line(grid: List[List[Any]]) -> str:
+    """v1.3.1: the cockpit's own run line ('Last run <stamp> | status: <s>
+    ...', 16_Decision_Top10.gs dt10StatusLine_) from the scanned rows, or ''.
+    Read-only; used to explain a missing grid and to detect a render in
+    progress."""
+    for row in grid or []:
+        if not isinstance(row, list):
+            continue
+        for c in row:
+            txt = _safe_str(c).strip()
+            if "| status:" in txt and txt.lower().startswith("last run"):
+                return txt
+    return ""
+
+
+def _cockpit_render_in_progress(grid: List[List[Any]]) -> bool:
+    """v1.3.1: True while the cockpit says 'status: running' (it writes that
+    line first, then the board). A grid read in that window is an
+    in-progress table, not a published one."""
+    line = _cockpit_status_line(grid).lower()
+    return "| status: running" in line
+
+
 def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
     """Decision-surface checks for the Top_10 cockpit — the backend-side
     P0-5 tripwire. FAIL here exits 2 and daily_sync goes RED by design."""
     out: List[CheckResult] = []
     hr = _find_decision_header(grid)
     if hr < 0:
+        # v1.3.1: name the cockpit's own status line, so a FAIL says whether
+        # the board is mid-render, failed, or genuinely missing.
+        status_line = _cockpit_status_line(grid)
         out.append(CheckResult(page, "decision.header_found", "FAIL",
                                detail=f"cockpit data-grid header (Rank|Symbol) "
-                                      f"not found in first {len(grid)} rows"))
+                                      f"not found in first {len(grid)} rows"
+                                      + (f"; cockpit says: {status_line[:160]}"
+                                         if status_line else "")))
         return out
     out.append(CheckResult(page, "decision.header_found", "PASS"))
 
@@ -1077,16 +1119,42 @@ async def _run_decision_surface(page: str, sid: str,
                                    "read_range reader")]
     depth = _env_int("VALIDATE_T10_HEADER_SCAN", 60, lo=20) + 60
     rng = f"{page}!A1:AZ{depth}"
-    try:
-        loop = asyncio.get_running_loop()
-        grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
-        grid = await _maybe_await(grid)
-    except Exception as e:
-        return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
-    if not isinstance(grid, list) or not grid:
-        return [CheckResult(page, "decision.read", "FAIL",
-                            detail="read_range returned no grid")]
-    return check_top10_surface(page, grid)
+    # v1.3.1 (2026-10-21): the cockpit writes "status: running…" before it
+    # draws the board, so a read in that window sees banner rows and no grid
+    # (sync run 39513589733: "header not found in first 16 rows" on all three
+    # legs while the cockpit run begun ~16:20 UTC had not finished). While the
+    # status line says running and the header is absent, re-read up to
+    # VALIDATE_T10_INPROGRESS_READS more times (default 3), waiting
+    # VALIDATE_T10_INPROGRESS_WAIT_S (default 30) before each. A board that is
+    # still absent afterwards FAILs exactly as before, now with the cockpit's
+    # status line. 0 re-reads = v1.3.0 behaviour.
+    rereads = _env_int("VALIDATE_T10_INPROGRESS_READS", 3, lo=0)
+    wait_s = _env_int("VALIDATE_T10_INPROGRESS_WAIT_S", 30, lo=0)
+    attempt = 0
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
+            grid = await _maybe_await(grid)
+        except Exception as e:
+            return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
+        if not isinstance(grid, list) or not grid:
+            return [CheckResult(page, "decision.read", "FAIL",
+                                detail="read_range returned no grid")]
+        if (_find_decision_header(grid) >= 0 or attempt >= rereads
+                or not _cockpit_render_in_progress(grid)):
+            break
+        attempt += 1
+        logger.info("v1.3.1 %s: cockpit render in progress (%s); re-read %d/%d in %ds",
+                    page, _cockpit_status_line(grid)[:80], attempt, rereads, wait_s)
+        await asyncio.sleep(wait_s)
+    results = check_top10_surface(page, grid)
+    if attempt:
+        for r in results:
+            if r.name == "decision.header_found":
+                r.detail = ((r.detail + "; " if r.detail else "")
+                            + f"after {attempt} in-progress re-read(s)")
+    return results
 
 
 _DEFAULT_PAGES = [
