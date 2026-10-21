@@ -1661,7 +1661,10 @@ from urllib.error import HTTPError, URLError
 #   _hist_close_budget, _hist_close_time_sec, _hist_close_pull,
 #   _hist_close_bars, _hist_target_close, _hist_close_evidence,
 #   _hist_close_judge (+ the _HIST_CLOSE_CACHE / _HIST_CLOSE_BUDGET /
-#   _LAST_HIST_CLOSE dicts and _HIST_CLOSE_BREAKER_AFTER).
+#   _LAST_HIST_CLOSE dicts, _HIST_CLOSE_BREAKER_AFTER and
+#   _HIST_CLOSE_EMPTY_ERRORS). The pull passes raise_errors=True: with the
+#   default, yfinance 0.2.66 turns every failure but a 429 into an empty
+#   frame, so an outage would read as "no bars" and never trip the breaker.
 # ROLLBACK: unset TRACK_HIST_TARGET_CLOSE (or set off). Records already matured
 #   under enforce keep their receipts (hist_bar_date marks them).
 SCRIPT_VERSION = "6.47.0"
@@ -3633,6 +3636,9 @@ _HIST_CLOSE_KIND = "historical_daily_close"
 _HIST_CLOSE_CACHE: Dict[str, Any] = {}       # per-run yahoo symbol -> bars
 _HIST_CLOSE_BUDGET: Dict[str, Any] = {"pulls": 0, "t0": 0.0, "deferred": 0}
 _HIST_CLOSE_BREAKER_AFTER = 3                # consecutive failed pulls
+# yfinance errors that mean "Yahoo answered, with no rows" (unknown or delisted
+# symbol, empty range, a Yahoo error body): an empty answer, not a failed pull.
+_HIST_CLOSE_EMPTY_ERRORS = frozenset({"YFPricesMissingError"})
 _LAST_HIST_CLOSE: Dict[str, Any] = {}        # read-back of the last audit pass
 
 
@@ -3666,11 +3672,19 @@ def _hist_close_pull(symbol: str) -> List[Dict[str, Any]]:
     back-adjusted, NOT dividend-adjusted, so a price ROI against a raw entry
     print stays a price ROI) and 'split' is the Stock Splits ratio (0 = no
     event). Returns [] when Yahoo answers with no rows. A FAILED call (rate
-    limit, network, missing yfinance) RAISES, so _hist_close_bars can count
-    it apart from an empty answer; either way the record stays ACTIVE."""
+    limit, network, timeout, an outage page, missing yfinance) RAISES, so
+    _hist_close_bars can count it apart from an empty answer; either way the
+    record stays ACTIVE. raise_errors=True is what makes it raise: with the
+    default, yfinance 0.2.66 logs every failure except a 429 and returns an
+    empty frame, which would read as "Yahoo has no bars"."""
     import yfinance as yf  # type: ignore
-    df = yf.Ticker(_yf_ticker(symbol)).history(period="1y", interval="1d",
-                                              auto_adjust=False, actions=True)
+    try:
+        df = yf.Ticker(_yf_ticker(symbol)).history(period="1y", interval="1d", auto_adjust=False,
+                                                  actions=True, raise_errors=True)
+    except Exception as exc:
+        if type(exc).__name__ in _HIST_CLOSE_EMPTY_ERRORS:
+            return []
+        raise
     if df is None or getattr(df, "empty", True):
         return []
     rows: List[Dict[str, Any]] = []

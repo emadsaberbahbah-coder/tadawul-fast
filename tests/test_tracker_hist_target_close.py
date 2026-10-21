@@ -34,6 +34,8 @@ Cases
   H11 a substituted record the CA-GUARD leaves pending keeps its live mark
   H12 the REAL _hist_close_pull over a fake yfinance frame, including an
       event yfinance merged onto the target-session bar
+  H13 the REAL yfinance 0.2.66 stack over a stubbed transport: an outage is a
+      failed pull and opens the breaker; a delisted answer is an empty answer
   N1  off == the v6.45.0 base copy on a mixed fixture (records, Notes, stats,
       log lines); observe == off on records, stats and logs bar one line
   N2  golden negative: the base copy leaves the H1 record ACTIVE under enforce
@@ -173,7 +175,7 @@ class Run:
 
 
 @contextlib.contextmanager
-def harness(mod, env=None, bar_map=None, ca_guard=False, patches=None):
+def harness(mod, env=None, bar_map=None, ca_guard=False, patches=None, now=NOW):
     """Swap module attributes and gate ENVs; restore everything afterwards."""
     run = Run()
     saved_env = {k: os.environ.get(k) for k in GATES}
@@ -187,7 +189,7 @@ def harness(mod, env=None, bar_map=None, ca_guard=False, patches=None):
         src = (bar_map or {}).get(symbol, [])
         return [dict(b) for b in src]
 
-    swaps = {"_utc_now": lambda: NOW,
+    swaps = {"_utc_now": lambda: now,
              "_outcome_calendar_schedule": calendar_fixture,
              "_price_fallback_enabled": lambda: False,
              "_ca_guard_enabled": lambda: ca_guard,
@@ -207,7 +209,7 @@ def harness(mod, env=None, bar_map=None, ca_guard=False, patches=None):
     try:
         for k, v in swaps.items():
             setattr(mod, k, v)
-        mod.RiyadhTime.now = staticmethod(lambda: NOW)
+        mod.RiyadhTime.now = staticmethod(lambda: now)
         yield run
     finally:
         mod.logger.setLevel(saved_level)
@@ -406,12 +408,12 @@ def test_h5_only_quote_outside_target_session_triggers():
 def test_h5b_target_session_not_complete_never_pulls():
     before = CLOSE - timedelta(minutes=1)
     rec = record(tp, target=CLOSE - timedelta(hours=4))
-    run = audit(tp, [rec], [row(acquired=before)], env={"TRACK_HIST_TARGET_CLOSE": "enforce"},
-                bar_map={"SYNTH.US": bars()},
-                patches={"_utc_now": lambda: before})
-    # RiyadhTime.now stays NOW in the harness; the quote is today's, target today:
-    assert run.pulls == []
-    assert receipt(tp, rec)["reason"] != "quote_outside_target_session"
+    run = audit(tp, [rec], [row(quote=before - timedelta(minutes=1), acquired=before)],
+                env={"TRACK_HIST_TARGET_CLOSE": "enforce"}, bar_map={"SYNTH.US": bars()}, now=before)
+    proof = receipt(tp, rec)
+    assert proof["reason"] == "target_session_not_complete" and proof["state"] == "PENDING"
+    assert rec.status == tp.PerformanceStatus.ACTIVE
+    assert run.pulls == [] and tp._LAST_HIST_CLOSE["candidates"] == 0
 
 
 # ---------------------------------------------------------------- H6 -----
@@ -441,6 +443,28 @@ def test_h6b_spent_budget_defers_never_expires():
     assert b.status == tp.PerformanceStatus.ACTIVE and b.outcome is None
     assert receipt(tp, b)["hist_close_reason"] == "hist_close_budget_exhausted"
     assert tp._LAST_HIST_CLOSE["deferred"] == 1 and tp._LAST_HIST_CLOSE["pulls"] == 1
+
+
+def test_h6c_wall_clock_budget_defers():
+    clock = FakeClock()
+
+    def slow_pull(symbol):
+        clock.t += 150.0
+        return bars()
+    a, b = record(tp, symbol="AAA.US"), record(tp, symbol="BBB.US")
+    pulled = []
+
+    def counting(symbol):
+        pulled.append(symbol)
+        return slow_pull(symbol)
+    audit(tp, [a, b], [row(symbol="AAA.US"), row(symbol="BBB.US")],
+          env={"TRACK_HIST_TARGET_CLOSE": "enforce", "TRACK_HIST_CLOSE_TIME_SEC": "100"},
+          patches={"time": _clock_module(clock), "_hist_close_pull": counting})
+    assert pulled == ["AAA.US"]
+    assert a.status == tp.PerformanceStatus.MATURED
+    assert b.status == tp.PerformanceStatus.ACTIVE
+    assert receipt(tp, b)["hist_close_reason"] == "hist_close_budget_exhausted"
+    assert tp._LAST_HIST_CLOSE["deferred"] == 1
 
 
 # ---------------------------------------------------------------- H7 -----
@@ -487,6 +511,9 @@ def test_h8_pure_helper_table():
     for raw, want in (("", 60), ("5", 5), ("-3", 0), ("x", 60)):
         with harness(tp, env={"TRACK_HIST_CLOSE_BUDGET": raw}):
             assert tp._hist_close_budget() == want, raw
+    for raw, want in (("", 240.0), ("0", 0.0), ("-5", 0.0), ("x", 240.0), ("30.5", 30.5)):
+        with harness(tp, env={"TRACK_HIST_CLOSE_TIME_SEC": raw}):
+            assert tp._hist_close_time_sec() == want, raw
 
 
 # ---------------------------------------------------------------- H9 -----
@@ -671,13 +698,19 @@ def test_h12_real_pull_parser_over_a_yfinance_frame():
     with _yf_installed(_fake_yfinance(_frame(pd), seen)):
         rows = real_pull("SYNTH.US")
     assert seen[0] == ("ticker", "SYNTH")
-    assert seen[1] == ("history", {"period": "1y", "interval": "1d", "auto_adjust": False, "actions": True})
+    assert seen[1] == ("history", {"period": "1y", "interval": "1d", "auto_adjust": False, "actions": True,
+                                   "raise_errors": True})
     assert rows == [{"date": b["date"], "close": b["close"], "split": 0.0} for b in bars()]
     with _yf_installed(_fake_yfinance(pd.DataFrame(), [])):
         assert real_pull("SYNTH.US") == []
     with _yf_installed(_fake_yfinance(None, [], fail=RuntimeError("429"))):
         with pytest.raises(RuntimeError):
             real_pull("SYNTH.US")
+
+    class YFPricesMissingError(Exception):
+        pass
+    with _yf_installed(_fake_yfinance(None, [], fail=YFPricesMissingError("possibly delisted"))):
+        assert real_pull("SYNTH.US") == []                    # Yahoo answered: no rows
     rec = record(tp)
     with _yf_installed(_fake_yfinance(_frame(pd, merged_split=True), [])):
         audit(tp, [rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "enforce"},
@@ -689,6 +722,68 @@ def test_h12_real_pull_parser_over_a_yfinance_frame():
         audit(tp, [rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "enforce"},
               patches={"_hist_close_pull": real_pull})
     assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------- H13 ----
+def test_h13_real_yfinance_outage_is_a_failed_pull():
+    """The REAL yfinance 0.2.66 stack under a stubbed transport: an outage
+    must count as failed and open the breaker, while a delisted answer is an
+    empty answer. With yfinance's default raise_errors=False an outage would
+    come back as an empty frame (read as 'no bars') and never trip it."""
+    yf = pytest.importorskip("yfinance")
+    if getattr(yf, "__version__", "") != "0.2.66":
+        pytest.skip("transport stub written against yfinance 0.2.66")
+    cr = pytest.importorskip("curl_cffi.requests")
+    import yfinance.base as yb
+    import yfinance.data as yd
+    from curl_cffi.requests import exceptions as cx
+
+    class Resp:
+        def __init__(self, code, text):
+            self.status_code, self.text, self.url = code, text, "https://query2.finance.yahoo.com/x"
+
+        def json(self):
+            return json.loads(self.text)
+    delisted = json.dumps({"chart": {"result": None, "error": {
+        "code": "Not Found", "description": "No data found, symbol may be delisted"}}})
+    modes = {"conn": lambda: (_ for _ in ()).throw(cx.ConnectionError("offline stub")),
+             "timeout": lambda: (_ for _ in ()).throw(cx.Timeout("offline stub")),
+             "down": lambda: Resp(200, "<html>Will be right back</html>"),
+             "delisted": lambda: Resp(404, delisted)}
+    syms = ["AAA.US", "BBB.US", "CCC.US", "DDD.US", "EEE.US"]
+    saved = (cr.Session.request, yd.YfData.get, yb._tz_info_fetch_ctr)
+    yf.set_tz_cache_location(tempfile.mkdtemp(prefix="tfb_yf_tz_"))
+
+    def no_net(self, method, url, *a, **k):
+        raise AssertionError("network touched: " + url)
+    out = {}
+    try:
+        cr.Session.request = no_net
+        cache = yf.cache.get_tz_cache()
+        for sym in syms:
+            cache.store(tp._yf_ticker(sym), "America/New_York")
+        for mode, make in modes.items():
+            yd.YfData.get = lambda self, url, params=None, timeout=30, make=make: make()
+            try:
+                yd.YfData.cache_get.cache_clear()
+            except Exception:
+                pass
+            yb._tz_info_fetch_ctr = 2
+            tp._HIST_CLOSE_CACHE.clear()
+            tp._HIST_CLOSE_BUDGET.clear()
+            tp._HIST_CLOSE_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0, "ok": 0, "failed": 0,
+                                          "consecutive": 0, "breaker": False, "first_error": ""})
+            reasons = [tp._hist_close_bars(sym)[1] for sym in syms]
+            b = tp._HIST_CLOSE_BUDGET
+            out[mode] = (reasons, b["ok"], b["failed"], b["breaker"], b["first_error"], b["deferred"])
+    finally:
+        cr.Session.request, yd.YfData.get, yb._tz_info_fetch_ctr = saved
+        tp._HIST_CLOSE_CACHE.clear()
+    outage = ["hist_close_pull_error"] * 3 + ["hist_close_breaker_open"] * 2
+    assert out["conn"] == (outage, 0, 3, True, "ConnectionError", 2), out["conn"]
+    assert out["timeout"] == (outage, 0, 3, True, "Timeout", 2), out["timeout"]
+    assert out["down"] == (outage, 0, 3, True, "RuntimeError", 2), out["down"]
+    assert out["delisted"] == ([""] * 5, 5, 0, False, "", 0), out["delisted"]
 
 
 # ---------------------------------------------------------------- N1 -----

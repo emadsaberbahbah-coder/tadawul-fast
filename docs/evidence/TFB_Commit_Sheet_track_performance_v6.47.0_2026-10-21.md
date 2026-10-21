@@ -2,7 +2,7 @@
 
 Date: 2026-10-21 (daily improvement, one item, priority (a): a published outcome number is missing, for good).
 
-- **Base:** main `55b47f24`. `scripts/track_performance.py` 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines). Result: 6.47.0 (sha256 `198d5eed8e3539d5...`, 11306 lines).
+- **Base:** main `55b47f24`. `scripts/track_performance.py` 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines). Result: 6.47.0 (sha256 `9d10a1c9d4f4deb0...`, 11320 lines).
 - **Why 6.47.0:** 6.45.1, 6.45.2 and 6.46.0 are claimed by open #785, #795 and #809. Whichever of these lands second re-numbers.
 - **Lane:** GitHub Actions (`track_performance.yml`, the Performance Clock). Nothing in Render, the backend or Apps Script changes.
 - **Gate:** repository Variable `TRACK_HIST_TARGET_CLOSE`, mapped in the 'Run performance clock' step with default `'off'`. The words `observe` and `enforce` are read case- and space-insensitively; any other value, `1` included, is off.
@@ -42,9 +42,17 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
 2. reads daily bars through `_hist_close_bars` (its own per-run cache and budget);
 3. takes the close of exactly that session via `_hist_target_close`.
 
-**`_hist_close_pull`** (new) makes ONE yfinance call: `history(period="1y", interval="1d", auto_adjust=False, actions=True)`, returning `{date, close, split}` per bar.
+**`_hist_close_pull`** (new) makes ONE yfinance call: `history(period="1y", interval="1d", auto_adjust=False, actions=True, raise_errors=True)`, returning `{date, close, split}` per bar.
 - `close` is Yahoo's Close. It is split back-adjusted but not dividend-adjusted, so a ROI against the raw entry print stays a price ROI.
-- An empty answer returns `[]`. A failed call (rate limit, network, missing yfinance) raises, so the caller can count it separately.
+- An empty answer returns `[]`. This covers Yahoo answering with no rows: `YFPricesMissingError` for an unknown or delisted symbol, an empty range, or a Yahoo error body.
+- A failed call raises, so the caller can count it separately: a rate limit, a network error, a timeout, an outage page, or missing yfinance.
+- `raise_errors=True` is what makes the failure raise. With the default, yfinance 0.2.66 logs every failure except a 429 and returns an empty frame, so an outage would read as "no bars" and never trip the breaker. Offline probe over the real library (stubbed transport, 0 requests sent), 7 symbols:
+
+  | Mode | Before (default) | After |
+  | --- | --- | --- |
+  | connection error, timeout, 503, outage page | `ok=7 failed=0 breaker=closed` | `failed=3 breaker=open deferred=4` |
+  | 429 | breaker open after 1 | breaker open after 1 |
+  | delisted or a Yahoo status body | `ok=7` (empty) | `ok=7` (empty) |
 
 **`_hist_close_bars`** (new) wraps the pull with its own per-run cache and budget.
 - It counts `ok` and `failed` separately and keeps `first_error` (the exception class).
@@ -80,7 +88,7 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
   - `TRACK_HIST_CLOSE_BUDGET`: distinct symbol pulls per pass, default 60, `0` = unlimited.
   - `TRACK_HIST_CLOSE_TIME_SEC`: default 240, `0` = unlimited.
 - **No new EXPIRE path.**
-- **Totals:** functions 0 removed, 8 added (`_hist_target_close_mode`, `_hist_close_budget`, `_hist_close_time_sec`, `_hist_close_pull`, `_hist_close_bars`, `_hist_target_close`, `_hist_close_evidence`, `_hist_close_judge`), plus 3 module dicts and one constant. Added lines are ASCII; the only exception is the docstring title, which keeps its existing en dash and changes only its version.
+- **Totals:** functions 0 removed, 8 added (`_hist_target_close_mode`, `_hist_close_budget`, `_hist_close_time_sec`, `_hist_close_pull`, `_hist_close_bars`, `_hist_target_close`, `_hist_close_evidence`, `_hist_close_judge`), plus 3 module dicts and two constants (`_HIST_CLOSE_BREAKER_AFTER`, `_HIST_CLOSE_EMPTY_ERRORS`). Added lines are ASCII; the only exception is the docstring title, which keeps its existing en dash and changes only its version.
 - **Embedded self-test:** unchanged at 22 cases, PASS 22/22.
 
 `.github/workflows/track_performance.yml` 1.0.4:
@@ -97,20 +105,20 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
 ## Measured results
 
 ```
-pytest tests/test_tracker_hist_target_close.py (repo checkout, base via git show)   20 passed
-python3 tests/test_tracker_hist_target_close.py   (x2)                    PASS 20/20 digest aaf5004ea4e77d19
-golden negative: TFB_TEST_TP_DELIVERED=<main 55b47f24 copy>             17 failed, 2 passed, 1 skipped
-   (passing on base, as they should: N1 off == base, H5b no pull before the target close;
-    N4 skips by design, since its exact diff checks apply to 6.47.0 only)
-mutations: 22 of 22 caught (list below)
-pytest test_outcome_price_evidence + tracker/workflow/manifest + tracker unit suites   310 passed
+pytest tests/test_tracker_hist_target_close.py (repo checkout, base via git show)   22 passed
+python3 tests/test_tracker_hist_target_close.py   (x2)                    PASS 22/22 digest 8b7bffffaf62c6da
+golden negative: TFB_TEST_TP_DELIVERED=<main 55b47f24 copy>             20 failed, 1 passed, 1 skipped
+   (N1 off == base passes on base, as it should; N4 skips by design, its exact
+    diff checks apply to 6.47.0 only)
+mutations: 26 of 26 caught (list below)
+pytest test_outcome_price_evidence + tracker/workflow/manifest + tracker unit suites   312 passed
 python3 scripts/test_maturation.py                                        14/14
 embedded self-test _track_selftest_                                       PASS 22/22 (unchanged)
 compileall main.py core routes scripts tests                             ok
-ci.yml lean list (every step)                                             LEAN FAILS: 0 (decision-layer suites 3772 passed, 19 skipped), on the fixed tree
+ci.yml lean list (every step)                                             re-run on the final tree in progress (previous tree: LEAN FAILS 0, 3772 passed, 19 skipped)
 ```
 
-**Mutations (`-x` per mutation), all 22 caught:**
+**Mutations (`-x` per mutation), all 26 caught:**
 1. the gate ignored;
 2. ROI not recomputed (matures on today's price);
 3. the post-target split check removed;
@@ -132,7 +140,11 @@ ci.yml lean list (every step)                                             LEAN F
 19. the refusal reason dropped from the receipt;
 20. `auto_adjust=True` in the pull;
 21. observe bumping the CA deferred count;
-22. an extra log line when off.
+22. an extra log line when off;
+23. `raise_errors` dropped;
+24. the empty-answer mapping dropped;
+25. the wall-clock budget leg disabled;
+26. a trigger widened to `target_session_not_complete`.
 
 Mutations 21 and 22 were survivors of the first harness and were found by the review below. A trigger that also fires on `quote_session_stale` is an equivalent mutation: that reason never comes with evidence, so the branch cannot be reached.
 
@@ -149,7 +161,20 @@ A three-angle review (maturity semantics, byte identity, ops and CI) ran with an
 | F4 | Failed pulls were silent, counted as pulls, and nothing stopped a throttled runner. | `ok`/`failed`/`first_error` are counted; a breaker opens after 3 failures or a rate-limit error; the read-back line carries them. | H10 |
 | F5 | N3/N4 pinned 6.47.0 exactly, so the next tracker bump would break them. | Floors: a regex for the version line; N4 runs only on 6.47.0. | N3, N4 |
 
-Four further claims were refuted:
+A second review, of the fixes themselves, ran the same way and confirmed four more items. All are fixed:
+
+| # | Finding | Fix | Case |
+| --- | --- | --- | --- |
+| R1 | F4 was incomplete. With yfinance's default `raise_errors=False`, an outage (connection error, timeout, 5xx, outage page) comes back as an empty frame, counts as `ok`, and never trips the breaker. | `raise_errors=True`, with `YFPricesMissingError` mapped to an empty answer. | H13 (the real yfinance 0.2.66 stack over a stubbed transport), H12 |
+| R2 | H5b never reached `target_session_not_complete`: its record matured on the live quote, so it passed trivially. | The harness takes a clock override; H5b asserts the reason, PENDING and `candidates == 0`. | H5b, mutation 26 |
+| R3 | The `TRACK_HIST_CLOSE_TIME_SEC` leg was untested. | H6c added (a 150 s pull against a 100 s window), plus reader rows in H8. | H6c, mutation 25 |
+
+It refuted three further claims:
+- the CA-GUARD's pulls spending the hist window under enforce (only deferral, by design);
+- the restore writing today's mark into an EXPIRED CORP_ACTION_SUSPECT row (the existing live-maturity behaviour);
+- permanent refusals starving the budget (needs 60 or more of them).
+
+The first review's four refuted claims:
 - an EXPIRE path for entries over a year old (no such record exists for about 8 months);
 - budget starvation by symbols refused on every pass (needs 60 or more such symbols);
 - load->save window growth (save_records does not drop concurrent appends);
@@ -163,14 +188,15 @@ Four further claims were refuted:
 - **H2:** off and 7 non-word spellings: no pull, no log line, no receipt key, read-back untouched.
 - **H3:** observe gives the same record state as off, with one pull and one log line. H3b: observe on every refusal fixture equals off in record state, stats and log lines (bar its one line).
 - **H4:** 13 refusal fixtures, including an event merged onto the target bar, each also at grace 0. The record stays ACTIVE with its v6.45.0 reason plus `hist_close_reason`, and is never EXPIRED. H4b: a confirmed ledger action after the target session refuses.
-- **H5:** `price_unavailable`, `quote_session_stale` and `quote_before_target_close` never pull and equal off. H5b: a session that has not completed never pulls.
-- **H6:** three horizons of one symbol take one pull; `_CA_BARS_CACHE` is untouched. H6b: a spent budget defers the second symbol and never expires it.
+- **H5:** `price_unavailable`, `quote_session_stale` and `quote_before_target_close` never pull and equal off. H5b: with the clock 1 minute before the close, a session that has not completed is PENDING `target_session_not_complete`, with no candidate and no pull.
+- **H6:** three horizons of one symbol take one pull; `_CA_BARS_CACHE` is untouched. H6b: a spent count budget defers the second symbol and never expires it. H6c: a spent wall-clock budget does the same.
 - **H7:** a 2:1 split between entry and target (print -48%) goes through the unchanged CA-GUARD. `_ca_adjusted_roi` is called with the target session, and the record matures on the adjusted +4.0 with a CA-ADJUST note.
 - **H8:** the pure helper table and the mode and budget readers.
 - **H9:** a 300 s hist pull between two CA-verified records. Observe equals off (records and stats), with the pull after all CA work. Enforce matures all three with `ca_deferred=0`.
 - **H10:** 3 failures open the breaker, and the 4th record is deferred. A rate-limit error opens it at once. A failed symbol is not retried, and one failure does not stop the next symbol.
 - **H11:** a CA-deferred substitution, and a CORP_ACTION_SUSPECT one, both keep the live 150 mark instead of the 130 close.
-- **H12:** the REAL `_hist_close_pull` over a fake yfinance frame (pandas): the exact call kwargs, the bare US ticker, parsing, an empty frame, a raised error, and end to end both an event merged onto the target bar (refused) and a clean frame (matures +4.0).
+- **H12:** the REAL `_hist_close_pull` over a fake yfinance frame (pandas): the exact call kwargs (`raise_errors=True`), the bare US ticker, parsing, an empty frame, a raised error, a `YFPricesMissingError` read as an empty answer, and end to end both an event merged onto the target bar (refused) and a clean frame (matures +4.0).
+- **H13:** the REAL yfinance 0.2.66 stack over a stubbed transport, with no network. A connection error, a timeout and the outage page each give 3 failed pulls, then an open breaker that defers the rest; a delisted answer gives 5 empty answers.
 - **N1:** off (5 spellings) equals the v6.45.0 base copy on a mixed fixture: record states, receipts, `_last_audit_stats` and INFO log lines. Observe equals it too, on witnessed and on missing-bar fixtures.
 - **N2:** golden negative. The base copy under `TRACK_HIST_TARGET_CLOSE=enforce` leaves the H1 record ACTIVE with `quote_outside_target_session`, including past grace.
 - **N3:** the workflow mapping (step-scoped, defaults equal to the script's), no mapping in daily_sync, the version floor (>= 6.47.0), the docstring version, the verifier pin, and the WHY block order (floors, no exact pin).
