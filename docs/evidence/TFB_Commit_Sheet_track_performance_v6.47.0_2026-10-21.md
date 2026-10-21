@@ -2,7 +2,7 @@
 
 Date: 2026-10-21 (daily improvement, one item, priority (a): a published outcome number is missing, for good).
 
-- **Base:** main `55b47f24`. `scripts/track_performance.py` 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines). Result: 6.47.0 (sha256 `9d10a1c9d4f4deb0...`, 11320 lines).
+- **Base:** main `55b47f24`. `scripts/track_performance.py` 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines). Result: 6.47.0 (sha256 `799e0aa74d2a34ee...`, 11376 lines).
 - **Why 6.47.0:** 6.45.1, 6.45.2 and 6.46.0 are claimed by open #785, #795 and #809. Whichever of these lands second re-numbers.
 - **Lane:** GitHub Actions (`track_performance.yml`, the Performance Clock). Nothing in Render, the backend or Apps Script changes.
 - **Gate:** repository Variable `TRACK_HIST_TARGET_CLOSE`, mapped in the 'Run performance clock' step with default `'off'`. The words `observe` and `enforce` are read case- and space-insensitively; any other value, `1` included, is off.
@@ -85,10 +85,10 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
   - A refused record keeps its v6.45.0 reason and adds `hist_close_reason`.
   - A substituted record that the unchanged path then leaves unmatured (CA verification deferred, a CA refusal, or CORP_ACTION_SUSPECT) gets its live Current Price and Unrealized ROI back after the loop. The sheet never shows the old close as the live mark.
 - **Budgets:**
-  - `TRACK_HIST_CLOSE_BUDGET`: distinct symbol pulls per pass, default 60, `0` = unlimited.
+  - `TRACK_HIST_CLOSE_BUDGET`: distinct symbol pulls per pass, default 60, `0` = unlimited. The 60 are a rotating daily window (`_hist_close_admit`) over the pass's candidate symbols in a stable hash order: window start = (day ordinal x budget) mod N. Every candidate symbol is reached within ceil(N / budget) days, even when some are refused on every pass. A fixed sheet order would spend the budget on the same first symbols for good (Codex P2 on this PR). Enforce finds its candidates with a pure pre-pass (`_hist_close_candidate`, the loop's own tests in the loop's order); observe uses the list it collects in the loop.
   - `TRACK_HIST_CLOSE_TIME_SEC`: default 240, `0` = unlimited.
 - **No new EXPIRE path.**
-- **Totals:** functions 0 removed, 8 added (`_hist_target_close_mode`, `_hist_close_budget`, `_hist_close_time_sec`, `_hist_close_pull`, `_hist_close_bars`, `_hist_target_close`, `_hist_close_evidence`, `_hist_close_judge`), plus 3 module dicts and two constants (`_HIST_CLOSE_BREAKER_AFTER`, `_HIST_CLOSE_EMPTY_ERRORS`). Added lines are ASCII; the only exception is the docstring title, which keeps its existing en dash and changes only its version.
+- **Totals:** functions 0 removed, 10 added (`_hist_target_close_mode`, `_hist_close_budget`, `_hist_close_time_sec`, `_hist_close_pull`, `_hist_close_bars`, `_hist_target_close`, `_hist_close_evidence`, `_hist_close_judge`, `_hist_close_admit`, `_hist_close_candidate`), plus 3 module dicts and two constants (`_HIST_CLOSE_BREAKER_AFTER`, `_HIST_CLOSE_EMPTY_ERRORS`). Added lines are ASCII; the only exception is the docstring title, which keeps its existing en dash and changes only its version.
 - **Embedded self-test:** unchanged at 22 cases, PASS 22/22.
 
 `.github/workflows/track_performance.yml` 1.0.4:
@@ -105,20 +105,20 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
 ## Measured results
 
 ```
-pytest tests/test_tracker_hist_target_close.py (repo checkout, base via git show)   22 passed
-python3 tests/test_tracker_hist_target_close.py   (x2)                    PASS 22/22 digest 8b7bffffaf62c6da
-golden negative: TFB_TEST_TP_DELIVERED=<main 55b47f24 copy>             20 failed, 1 passed, 1 skipped
+pytest tests/test_tracker_hist_target_close.py (repo checkout, base via git show)   25 passed
+python3 tests/test_tracker_hist_target_close.py   (x2)                    PASS 25/25 digest a67bec95d2b71769
+golden negative: TFB_TEST_TP_DELIVERED=<main 55b47f24 copy>             23 failed, 1 passed, 1 skipped
    (N1 off == base passes on base, as it should; N4 skips by design, its exact
     diff checks apply to 6.47.0 only)
-mutations: 26 of 26 caught (list below)
-pytest test_outcome_price_evidence + tracker/workflow/manifest + tracker unit suites   312 passed
+mutations: 29 of 30 caught; the miss is equivalent (list below)
+pytest test_outcome_price_evidence + tracker/workflow/manifest + tracker unit suites   315 passed
 python3 scripts/test_maturation.py                                        14/14
 embedded self-test _track_selftest_                                       PASS 22/22 (unchanged)
 compileall main.py core routes scripts tests                             ok
-ci.yml lean list (every step)                                             LEAN FAILS: 0 (decision-layer suites 3772 passed, 19 skipped), on the final tree
+ci.yml lean list (every step)                                             @@LEAN4@@
 ```
 
-**Mutations (`-x` per mutation), all 26 caught:**
+**Mutations (`-x` per mutation), 29 of 30 caught:**
 1. the gate ignored;
 2. ROI not recomputed (matures on today's price);
 3. the post-target split check removed;
@@ -144,7 +144,12 @@ ci.yml lean list (every step)                                             LEAN F
 23. `raise_errors` dropped;
 24. the empty-answer mapping dropped;
 25. the wall-clock budget leg disabled;
-26. a trigger widened to `target_session_not_complete`.
+26. a trigger widened to `target_session_not_complete`;
+27. the admission window ignored;
+28. a window that never rotates;
+29. a pre-pass that admits every active record.
+
+Missed, and equivalent: the pre-pass without its target-time test. A future target can never yield `quote_outside_target_session`, because `_outcome_target_session` returns `target_session_not_complete` first. The test is kept so the pre-pass mirrors the loop's order. Also equivalent inside the loop: the count leg of `_hist_close_bars`, because the window is never larger than the budget. H14b pins that leg on a direct call.
 
 Mutations 21 and 22 were survivors of the first harness and were found by the review below. A trigger that also fires on `quote_session_stale` is an equivalent mutation: that reason never comes with evidence, so the branch cannot be reached.
 
@@ -174,6 +179,8 @@ It refuted three further claims:
 - the restore writing today's mark into an EXPIRED CORP_ACTION_SUSPECT row (the existing live-maturity behaviour);
 - permanent refusals starving the budget (needs 60 or more of them).
 
+After the PR opened, Codex (P2) reported that a fixed sheet order lets symbols refused on every pass take the whole budget, and that observe re-pulls the same first 60 symbols every pass. I traced it: a whole venue refused for one reason (no Yahoo bars, a unit mismatch) can exceed 60 symbols. It is fixed with the rotating daily window above, and covered by H14, H14b and H15 and by mutations 27-29.
+
 The first review's four refuted claims:
 - an EXPIRE path for entries over a year old (no such record exists for about 8 months);
 - budget starvation by symbols refused on every pass (needs 60 or more such symbols);
@@ -196,11 +203,13 @@ The first review's four refuted claims:
 - **H10:** 3 failures open the breaker, and the 4th record is deferred. A rate-limit error opens it at once. A failed symbol is not retried, and one failure does not stop the next symbol.
 - **H11:** a CA-deferred substitution, and a CORP_ACTION_SUSPECT one, both keep the live 150 mark instead of the 130 close.
 - **H12:** the REAL `_hist_close_pull` over a fake yfinance frame (pandas): the exact call kwargs (`raise_errors=True`), the bare US ticker, parsing, an empty frame, a raised error, a `YFPricesMissingError` read as an empty answer, and end to end both an event merged onto the target bar (refused) and a clean frame (matures +4.0).
+- **H14:** three symbols refused on every pass, budget 1. Across Thu, Fri and Tue the window moves, so each symbol is pulled exactly once, in observe and in enforce. The pure window table is checked too. H14b: a non-candidate beside a candidate never takes the window (two consecutive days), and the count leg still defers on a direct call.
+- **H15:** the enforce pre-pass picks exactly the records the loop marks `quote_outside_target_session` on the mixed fixture plus a not-yet-due record.
 - **H13:** the REAL yfinance 0.2.66 stack over a stubbed transport, with no network. A connection error, a timeout and the outage page each give 3 failed pulls, then an open breaker that defers the rest; a delisted answer gives 5 empty answers.
 - **N1:** off (5 spellings) equals the v6.45.0 base copy on a mixed fixture: record states, receipts, `_last_audit_stats` and INFO log lines. Observe equals it too, on witnessed and on missing-bar fixtures.
 - **N2:** golden negative. The base copy under `TRACK_HIST_TARGET_CLOSE=enforce` leaves the H1 record ACTIVE with `quote_outside_target_session`, including past grace.
 - **N3:** the workflow mapping (step-scoped, defaults equal to the script's), no mapping in daily_sync, the version floor (>= 6.47.0), the docstring version, the verifier pin, and the WHY block order (floors, no exact pin).
-- **N4:** on 6.47.0 only, the added lines are ASCII, the only removals are the two version lines, and the function inventory is +8 / -0.
+- **N4:** on 6.47.0 only, the added lines are ASCII, the only removals are the two version lines, and the function inventory is +10 / -0.
 
 ## Operator steps (owner) - nothing is armed by this PR
 

@@ -36,6 +36,8 @@ Cases
       event yfinance merged onto the target-session bar
   H13 the REAL yfinance 0.2.66 stack over a stubbed transport: an outage is a
       failed pull and opens the breaker; a delisted answer is an empty answer
+  H14 the rotating daily window reaches every symbol refused on every pass
+  H15 the enforce pre-pass picks exactly the loop's candidates
   N1  off == the v6.45.0 base copy on a mixed fixture (records, Notes, stats,
       log lines); observe == off on records, stats and logs bar one line
   N2  golden negative: the base copy leaves the H1 record ACTIVE under enforce
@@ -438,10 +440,12 @@ def test_h6b_spent_budget_defers_never_expires():
                 env={"TRACK_HIST_TARGET_CLOSE": "enforce", "TRACK_HIST_CLOSE_BUDGET": "1"},
                 bar_map={"AAA.US": bars(), "BBB.US": bars()},
                 patches={"_mature_grace_days": lambda: 0})
-    assert run.pulls == ["AAA.US"]
-    assert a.status == tp.PerformanceStatus.MATURED
-    assert b.status == tp.PerformanceStatus.ACTIVE and b.outcome is None
-    assert receipt(tp, b)["hist_close_reason"] == "hist_close_budget_exhausted"
+    admitted = tp._hist_close_admit(["AAA.US", "BBB.US"], NOW.date().toordinal(), 1)
+    won, lost = (a, b) if admitted == {"AAA"} else (b, a)
+    assert len(admitted) == 1 and run.pulls == [won.symbol]
+    assert won.status == tp.PerformanceStatus.MATURED
+    assert lost.status == tp.PerformanceStatus.ACTIVE and lost.outcome is None
+    assert receipt(tp, lost)["hist_close_reason"] == "hist_close_budget_exhausted"
     assert tp._LAST_HIST_CLOSE["deferred"] == 1 and tp._LAST_HIST_CLOSE["pulls"] == 1
 
 
@@ -786,6 +790,77 @@ def test_h13_real_yfinance_outage_is_a_failed_pull():
     assert out["delisted"] == ([""] * 5, 5, 0, False, "", 0), out["delisted"]
 
 
+# ---------------------------------------------------------------- H14 ----
+def test_h14_rotating_window_reaches_every_refused_symbol():
+    """Codex P2 on #814: with a fixed sheet order, symbols refused on every
+    pass would take the whole budget for good. Three symbols whose target
+    bar Yahoo never has, budget 1: across three trading days the window
+    moves, so each symbol is pulled once, in observe and in enforce."""
+    syms = ["P1.US", "P2.US", "P3.US"]
+    keys = sorted([s[:-3] for s in syms], key=lambda k: hashlib.sha256(k.encode("utf-8")).hexdigest())
+    for mode in ("observe", "enforce"):
+        seen = []
+        for offset in (0, 1, 5):                      # Thu, Fri, Tue: ordinals k, k+1, k+5
+            now = NOW + timedelta(days=offset)
+            recs = [record(tp, symbol=s) for s in syms]
+            run = audit(tp, recs, [row(symbol=s, quote=CLOSE + timedelta(days=offset), acquired=now)
+                                   for s in syms],
+                        env={"TRACK_HIST_TARGET_CLOSE": mode, "TRACK_HIST_CLOSE_BUDGET": "1"},
+                        bar_map={s: bars(drop_target=True) for s in syms}, now=now)
+            assert len(run.pulls) == 1, (mode, offset, run.pulls)
+            assert all(r.status == tp.PerformanceStatus.ACTIVE for r in recs)
+            assert tp._LAST_HIST_CLOSE["refused"] == {"hist_close_bar_missing": 1,
+                                                      "hist_close_budget_exhausted": 2}, (mode, offset)
+            ordinal = now.date().toordinal()
+            assert run.pulls[0][:-3] == keys[ordinal % 3], (mode, offset)
+            seen.append(run.pulls[0])
+        assert sorted(seen) == syms, (mode, seen)
+    assert tp._hist_close_admit(syms, 7, 0) == {"P1", "P2", "P3"}
+    assert tp._hist_close_admit(syms + ["P1.US"], 7, 5) == {"P1", "P2", "P3"}
+    assert tp._hist_close_admit([], 7, 1) == set()
+    windows = [tp._hist_close_admit(syms, d, 2) for d in range(3)]
+    assert all(len(w) == 2 for w in windows) and set().union(*windows) == {"P1", "P2", "P3"}
+
+
+def test_h14b_window_holds_only_candidates_and_count_leg_guards_direct_calls():
+    """A non-candidate (no witnessed price) beside a candidate, budget 1: on
+    both of two consecutive days the candidate is the one pulled, so a
+    non-candidate never takes the window. Called directly (no window), the
+    count leg still defers past the budget."""
+    for offset in (0, 1):
+        now = NOW + timedelta(days=offset)
+        recs = [record(tp, symbol="GONE.US"), record(tp)]
+        run = audit(tp, recs, [row(quote=CLOSE + timedelta(days=offset), acquired=now)],
+                    env={"TRACK_HIST_TARGET_CLOSE": "enforce", "TRACK_HIST_CLOSE_BUDGET": "1"},
+                    bar_map={"SYNTH.US": bars()}, now=now)
+        assert run.pulls == ["SYNTH.US"], offset
+    with harness(tp, env={"TRACK_HIST_CLOSE_BUDGET": "1"}, bar_map={"A.US": bars(), "B.US": bars()}):
+        tp._HIST_CLOSE_CACHE.clear()
+        tp._HIST_CLOSE_BUDGET.clear()
+        tp._HIST_CLOSE_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0, "ok": 0, "failed": 0,
+                                      "consecutive": 0, "breaker": False, "first_error": ""})
+        assert tp._hist_close_bars("A.US")[1] == ""
+        assert tp._hist_close_bars("B.US") == (None, "hist_close_budget_exhausted")
+        tp._HIST_CLOSE_CACHE.clear()
+
+
+# ---------------------------------------------------------------- H15 ----
+def test_h15_enforce_pre_pass_matches_the_loop_candidates():
+    recs, rows = _mixed(tp)
+    recs.append(record(tp, symbol="LATER.US", target=NOW + timedelta(days=3)))
+    rows.append(row(symbol="LATER.US"))
+    with harness(tp):
+        client = tp.BackendClient("https://transport.invalid")
+        client.post_json = AsyncMock(return_value=({"rows": rows}, None, 200))
+        prices = asyncio.run(client.fetch_prices([r.symbol for r in recs]))
+        picked = [r.symbol for r in recs if tp._hist_close_candidate(r, prices, NOW)]
+    audit(tp, recs, rows)
+    in_loop = [r.symbol for r in recs if tp._OUTCOME_RECEIPT in (r.notes or "")
+               and receipt(tp, r)["reason"] == "quote_outside_target_session"]
+    assert tp._OUTCOME_RECEIPT not in (recs[-1].notes or "")      # not yet due: no receipt at all
+    assert picked == in_loop == ["SYNTH.US"]
+
+
 # ---------------------------------------------------------------- N1 -----
 def _mixed(mod):
     """quote_outside / matured-now / price_unavailable / stale / bad entry."""
@@ -898,7 +973,8 @@ def test_n4_added_lines_are_ascii_and_nothing_removed():
     assert not gone, gone
     assert fns("\n".join(new)) - fns("\n".join(old)) == {
         "_hist_target_close_mode", "_hist_close_budget", "_hist_close_time_sec", "_hist_close_pull",
-        "_hist_close_bars", "_hist_target_close", "_hist_close_evidence", "_hist_close_judge"}
+        "_hist_close_bars", "_hist_target_close", "_hist_close_evidence", "_hist_close_judge",
+        "_hist_close_admit", "_hist_close_candidate"}
 
 
 def _digest():

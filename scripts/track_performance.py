@@ -1643,7 +1643,12 @@ from urllib.error import HTTPError, URLError
 #   quote (currency subunit or wrong instrument), a failed pull, an open
 #   breaker (3 failed pulls in a row or any rate-limit error stops pulling for
 #   the pass), or the pull budget spent (TRACK_HIST_CLOSE_BUDGET distinct
-#   symbols, default 60; TRACK_HIST_CLOSE_TIME_SEC, default 240). The pull has
+#   symbols, default 60; TRACK_HIST_CLOSE_TIME_SEC, default 240). The 60 are
+#   a rotating daily window over the candidate symbols in a stable hash order
+#   (_hist_close_admit), so symbols refused on every pass cannot starve the
+#   rest: each candidate symbol is reached within ceil(N / budget) days
+#   (Codex P2 on #814). Enforce finds its candidates with a pure pre-pass
+#   (_hist_close_candidate); observe uses its own list. The pull has
 #   its own cache and budget; _CA_BARS_CACHE (ADJUSTED bars) is never touched,
 #   and each pull's wall-clock time is credited back to the CA-GUARD's window
 #   (_CA_BUDGET['t0']) so these pulls never spend its 240 s.
@@ -1660,7 +1665,8 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _hist_target_close_mode,
 #   _hist_close_budget, _hist_close_time_sec, _hist_close_pull,
 #   _hist_close_bars, _hist_target_close, _hist_close_evidence,
-#   _hist_close_judge (+ the _HIST_CLOSE_CACHE / _HIST_CLOSE_BUDGET /
+#   _hist_close_judge, _hist_close_admit, _hist_close_candidate (+ the
+#   _HIST_CLOSE_CACHE / _HIST_CLOSE_BUDGET /
 #   _LAST_HIST_CLOSE dicts, _HIST_CLOSE_BREAKER_AFTER and
 #   _HIST_CLOSE_EMPTY_ERRORS). The pull passes raise_errors=True: with the
 #   default, yfinance 0.2.66 turns every failure but a 429 into an empty
@@ -3705,8 +3711,10 @@ def _hist_close_bars(symbol: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     from an answered one ('ok' vs 'failed', first_error = its class name)
     and is not retried this pass; after _HIST_CLOSE_BREAKER_AFTER failures
     in a row, or any rate-limit error, the breaker opens and no further
-    pull is made this pass. Each pull's wall-clock time is credited back to
-    the CA-GUARD's window (_CA_BUDGET['t0']) when that window is open."""
+    pull is made this pass. When the pass set an admission window
+    (_hist_close_admit), a symbol outside it is deferred without a pull.
+    Each pull's wall-clock time is credited back to the CA-GUARD's window
+    (_CA_BUDGET['t0']) when that window is open."""
     key = _yahoo_symbol(symbol)
     if not key:
         return None, "hist_close_unavailable"
@@ -3716,6 +3724,10 @@ def _hist_close_bars(symbol: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     if _HIST_CLOSE_BUDGET.get("breaker"):
         _HIST_CLOSE_BUDGET["deferred"] += 1
         return None, "hist_close_breaker_open"
+    admit = _HIST_CLOSE_BUDGET.get("admit")
+    if admit is not None and key not in admit:
+        _HIST_CLOSE_BUDGET["deferred"] += 1
+        return None, "hist_close_budget_exhausted"
     if _HIST_CLOSE_BUDGET["t0"] == 0.0:
         _HIST_CLOSE_BUDGET["t0"] = time.time()
     b = _hist_close_budget()
@@ -3831,6 +3843,40 @@ def _hist_close_evidence(record: Any, context: Dict[str, Any], current: OutcomeP
                             _utc_now(), close_at, _HIST_CLOSE_KIND), ""
     except Exception:
         return None, "hist_close_unavailable"
+
+
+def _hist_close_admit(symbols: List[str], day_ordinal: int, budget: int) -> set:
+    """v6.47.0 PURE: which candidate symbols this pass may pull. The distinct
+    Yahoo symbols are put in a stable hash order and a window of `budget`
+    starting at (day_ordinal * budget) is taken, wrapping. Every candidate
+    symbol is therefore reached within ceil(N / budget) days, even when some
+    symbols are refused on every pass (a fixed sheet order would spend the
+    whole budget on the same first symbols for good). budget 0 = all."""
+    keys = sorted({_yahoo_symbol(s) for s in symbols if _yahoo_symbol(s)},
+                  key=lambda k: hashlib.sha256(k.encode("utf-8")).hexdigest())
+    if not budget or len(keys) <= budget:
+        return set(keys)
+    start = (int(day_ordinal) * int(budget)) % len(keys)
+    return set((keys + keys)[start:start + budget])
+
+
+def _hist_close_candidate(record: Any, prices: Any, now: datetime) -> bool:
+    """v6.47.0 PURE pre-pass for enforce: True when audit_active_records
+    will reach the 'quote_outside_target_session' branch for this record,
+    by the same tests in the same order (evidence, target passed, entry
+    price, finite ROI, target session). Never raises."""
+    try:
+        evidence, _reason = _outcome_map_evidence(prices, record.symbol, now)
+        target = _outcome_timestamp(record.target_date)
+        if evidence is None or target is None or now < target:
+            return False
+        if not math.isfinite(record.entry_price) or record.entry_price <= 0:
+            return False
+        if not math.isfinite((evidence.price / record.entry_price - 1.0) * 100.0):
+            return False
+        return _outcome_target_session(record, evidence, now)[1] == "quote_outside_target_session"
+    except Exception:
+        return False
 
 
 def _hist_close_judge(record: Any, context: Dict[str, Any], current: OutcomePrice, now: datetime,
@@ -9616,6 +9662,13 @@ class PerformanceTrackerApp:
                                        "consecutive": 0, "breaker": False, "first_error": ""})
             _hist_stats = {"mode": _hist_mode, "candidates": 0, "witnessed": 0,
                            "by_horizon": {}, "refused": {}}
+            _hist_day = now_r.astimezone(timezone.utc).date().toordinal()
+            if _hist_mode == "enforce":
+                # Rotating admission window (see _hist_close_admit); observe
+                # sets its window after the loop from its own candidate list.
+                _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
+                    [r.symbol for r in active if _hist_close_candidate(r, price_map, now_r)],
+                    _hist_day, _hist_close_budget())
 
         for r in active:
             _loop_i += 1
@@ -9819,6 +9872,9 @@ class PerformanceTrackerApp:
             # v6.47.0 [HIST-CLOSE]: observe judges its candidates only now;
             # enforce restores the live mark on every substituted record the
             # unchanged path left unmatured (pending, deferred or expired).
+            if _hist_mode == "observe":
+                _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
+                    [_r.symbol for _r, _ctx, _ev in _hist_observe], _hist_day, _hist_close_budget())
             for _r, _ctx, _ev in _hist_observe:
                 _hist_close_judge(_r, _ctx, _ev, now_r, _hist_stats)
             for _r, _px0, _roi0 in _hist_used:
