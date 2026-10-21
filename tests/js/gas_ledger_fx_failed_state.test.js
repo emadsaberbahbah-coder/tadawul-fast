@@ -7,7 +7,8 @@
  *       parent / 100); a missing rate sends value_sar null and marks the
  *       holdings input incomplete instead of a native amount labelled SAR.
  *   R*  refreshDecisionTop10: a throw ends in a terminal 'status: FAILED'
- *       banner with failed_at_utc, _Status ERROR, marker cleared, rethrown.
+ *       banner with failed_at_utc, _Status ERROR, rethrown; the P-195 marker
+ *       is cleared only when this run stored it (R1 vs R5).
  *
  *   node tests/js/gas_ledger_fx_failed_state.test.js
  *   GAS_FIX_DUMP=<file>  write the produced status lines as JSON (the Python
@@ -175,15 +176,27 @@ function refreshHarness(opts) {
     }}
   });
   ctx.dt10Tokens_ = () => ({});
-  ctx.dt10RunMarkerCheck_ = () => null;
+  const checked = [];
+  ctx.dt10RunMarkerCheck_ = (entry) => { checked.push(entry); return null; };
   ctx.dt10RunMarkerClear_ = () => { cleared.push(true); };
   ctx.dt10WritePageStatus_ = (...args) => { pageStatuses.push(args); };
   if (opts.layoutThrows) ctx.buildDecisionTop10Layout = () => { throw new Error('synthetic layout failure'); };
   else ctx.buildDecisionTop10Layout = () => sheet;
-  ctx.dt10ReadPanel_ = () => { throw new Error(opts.message || 'synthetic panel read failure'); };
+  if (opts.afterMarkerThrows) {
+    // the panel and the input-truth setup succeed; the first step after the
+    // P-195 marker check throws
+    ctx.dt10ReadPanel_ = () => ({});
+    ctx.dt10InputTruthMode_ = () => 'off';
+    ctx.dt10CandTabMode_ = () => 'off';
+    ctx.dt10VintageColsMode_ = () => 'off';
+    ctx.dt10InputTruthKpiState_ = () => null;
+    ctx.dt10SyncInflight_ = () => { throw new Error('synthetic post-marker failure'); };
+  } else {
+    ctx.dt10ReadPanel_ = () => { throw new Error(opts.message || 'synthetic panel read failure'); };
+  }
   let threw = null;
   try { ctx.refreshDecisionTop10(); } catch (e) { threw = e; }
-  return {ctx, writes, pageStatuses, cleared, flushed, threw, cells};
+  return {ctx, writes, pageStatuses, cleared, checked, flushed, threw, cells};
 }
 const LAYOUT_OK = (r, c, ctx) => (c === 1 && r === ctx.DT10_ROW_KPI_HEAD ? 'KPIs' : 'x');
 
@@ -204,7 +217,10 @@ check('R1 a throw after running... ends in a terminal FAILED banner and is rethr
   assert.equal(h.pageStatuses.length, 1);
   assert.equal(h.pageStatuses[0][0], 'ERROR');
   assert(h.pageStatuses[0][1].startsWith('Decision cockpit: FAILED at '));
-  assert.equal(h.cleared.length, 1, 'a reported failure clears the P-195 marker');
+  // the throw came before the P-195 check: a previous run's marker must stay
+  // for the next check to report ABORTED_PREV (review fix on PR #810)
+  assert.equal(h.checked.length, 0);
+  assert.equal(h.cleared.length, 0, 'a throw before the marker check leaves the previous marker');
   assert(h.flushed >= 2);
   dump.running = lines[0];
   dump.failed = failed;
@@ -223,6 +239,14 @@ check('R3 no sheet at all: nothing written, _Status ERROR, error still rethrown'
   assert(h.threw);
   assert.equal(h.writes.length, 0);
   assert.equal(h.pageStatuses[0][0], 'ERROR');
+});
+check('R5 a throw after the P-195 check clears the marker this run stored', () => {
+  const h = refreshHarness({cellValue: LAYOUT_OK, afterMarkerThrows: true});
+  assert(h.threw && /synthetic post-marker failure/.test(String(h.threw)), 'error rethrown');
+  assert.deepEqual(h.checked, ['refreshDecisionTop10']);
+  assert.equal(h.cleared.length, 1, 'a reported failure clears its own marker');
+  const failed = h.writes.filter(w => w.r === h.ctx.DT10_ROW_STATUS && w.c === 2).pop().v;
+  assert(/\| status: FAILED \| failed_at_utc=/.test(failed), failed);
 });
 check('R4 long multi-line error is collapsed and bounded in the banner', () => {
   const h = refreshHarness({cellValue: LAYOUT_OK, message: 'line one\n\tline two ' + 'x'.repeat(500)});

@@ -11312,6 +11312,17 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                 if not ccy:
                     _unresolved.add("(blank)")
                     continue
+                # v5.155.0 (review fix, same unreleased version): a rate keyed
+                # on the SUBUNIT code itself (TFB_PF_FX_RATES=GBX:0.048 or
+                # fx_rates={"GBX": ...}) is SAR per pence and wins, exactly as
+                # before 5.155.0 read it. Only distinct upper-case codes can be
+                # such keys (GBX/ZAC/ILA): the table upper-cases its keys, so
+                # "GBp" can never be told apart from GBP there.
+                _direct = _raw_ccy.strip().upper()
+                _fd = _fx.get(_direct) if (_div != 1.0 and _direct != ccy) else None
+                if _fd is not None and _fd > 0.0:
+                    _factor[id(r)] = _fd
+                    continue
                 f = _fx.get(ccy)
                 if f is None or f <= 0.0:
                     _unresolved.add(_raw_ccy if _div != 1.0 else ccy)

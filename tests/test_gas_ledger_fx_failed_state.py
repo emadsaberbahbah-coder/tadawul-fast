@@ -42,7 +42,7 @@ def dump(tmp_path_factory):
     proc = subprocess.run([node, str(HARNESS)], cwd=ROOT, env=env, capture_output=True,
                           text=True, timeout=180)
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
-    assert "RESULT 10/10 PASS" in proc.stdout, proc.stdout[-2000:]
+    assert "RESULT 11/11 PASS" in proc.stdout, proc.stdout[-2000:]
     return json.loads(out.read_text(encoding="utf-8"))
 
 

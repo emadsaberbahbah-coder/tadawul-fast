@@ -62,3 +62,29 @@ def test_subunit_helper():
     assert de._pf_subunit_major("GBP") == ("GBP", 1.0)
     assert de._pf_subunit_major("ZAc") == ("ZAR", 100.0)
     assert de._pf_subunit_major("USX") == ("USX", 1.0)
+
+
+@pytest.mark.parametrize("tok,key", [("GBX", "GBX"), ("ZAc", "ZAC")])
+def test_direct_subunit_operator_rate_wins(monkeypatch, tok, key):
+    # Review fix: an operator rate keyed on the subunit code is SAR per subunit
+    # and is used as given (before 5.155.0 the upper-cased lookup used it too).
+    monkeypatch.setenv("TFB_PF_FX_RATES", "GBP:9.9,ZAR:9.9," + key + ":0.048")
+    rows = _rows(tok)
+    de._compute_portfolio_fields(rows)
+    # 70,000 subunits * 0.048 = 3,360 SAR vs 25,000 SAR -> 11.85%
+    assert _weight(rows, "VOD.L") == pytest.approx(11.8483, abs=1e-3)
+
+
+def test_direct_subunit_rate_from_fx_rates_argument():
+    rows = _rows("GBX")
+    de._compute_portfolio_fields(rows, fx_rates={"GBX": 0.048})
+    assert _weight(rows, "VOD.L") == pytest.approx(11.8483, abs=1e-3)
+    assert rows[0]["portfolio_fx_status"] == "OK:SAR"
+
+
+def test_gbp_lower_case_p_never_reads_a_pounds_key_as_pence(monkeypatch):
+    # "GBp" upper-cases to the GBP pounds key, so it must still divide by 100.
+    monkeypatch.setenv("TFB_PF_FX_RATES", "GBP:4.8")
+    rows = _rows("GBp")
+    de._compute_portfolio_fields(rows)
+    assert _weight(rows, "VOD.L") == pytest.approx(11.8483, abs=1e-3)

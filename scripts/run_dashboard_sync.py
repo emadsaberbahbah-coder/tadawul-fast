@@ -9036,12 +9036,14 @@ def _status_stamp_attempts() -> int:
 
 
 def _status_stamp_deadline_s() -> float:
-    """v6.70.2 STAMP-RETRY: wall-clock budget for one stamp, default 90 s
-    (TFB_SYNC_STATUS_STAMP_DEADLINE_S, clamped 10..600). A retry whose
-    backoff would end past the budget is not attempted. Each Sheets call can
-    itself block up to the client's 60 s socket timeout, and the stamp runs in
-    the page task's finally, so the budget bounds how long a failing stamp can
-    hold the event loop."""
+    """v6.70.2 STAMP-RETRY: RETRY budget for one stamp, default 90 s
+    (TFB_SYNC_STATUS_STAMP_DEADLINE_S, clamped 10..600). No further attempt
+    starts once the elapsed time plus the next backoff would pass it. It is
+    not a hard wall-clock cap: the Sheets calls inside an attempt are bounded
+    only by the client's socket timeout (60 s each), so a stamp can overrun
+    the budget by at most the attempt already in flight. The stamp runs in
+    the page task's finally, so the budget limits how many slow attempts a
+    failing stamp can stack on the event loop."""
     try:
         v = float((os.getenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S") or "90").strip())
     except Exception:
@@ -9067,8 +9069,9 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
 
     v6.70.2 STAMP-RETRY: the key-column read and the row write form one unit
     that is retried on TRANSIENT failures (_is_transient_write_error: timeout,
-    SSL, reset, 429/5xx), up to _status_stamp_attempts() with backoff and
-    inside _status_stamp_deadline_s(). Every attempt re-reads column A first,
+    SSL, reset, 429/5xx), up to _status_stamp_attempts() with backoff; no new
+    attempt starts past the _status_stamp_deadline_s() retry budget (calls in
+    flight keep their 60 s socket timeout). Every attempt re-reads column A first,
     so an append whose response was lost but which the API had applied by the
     next read is found and updated in place rather than appended again (an
     append applied only after that read could still duplicate; the append

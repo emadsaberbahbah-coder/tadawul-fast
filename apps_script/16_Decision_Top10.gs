@@ -20,10 +20,12 @@
  * (20 Oct: cockpit stuck RUNNING, no grid, validation failed). The body is
  * now dt10RefreshDecisionTop10Run_; on a throw dt10RefreshFailed_ writes
  * 'status: FAILED | failed_at_utc=<ISO Z> | <error>', upserts _Status ERROR,
- * clears the P-195 marker, then the error is rethrown. The freshness audit
- * reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script hard timeout
- * (6 min) kills the script without running catch; that case still shows
- * RUNNING and is reported by the next run's P-195 ABORTED_PREV row.
+ * clears the P-195 marker this run stored (a throw before the marker check
+ * leaves a previous run's marker for ABORTED_PREV) and rethrows. The
+ * freshness audit reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script
+ * hard timeout (6 min) kills the script without running catch; that case
+ * still shows RUNNING and is reported by the next run's P-195 ABORTED_PREV
+ * row.
  *
  * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
  * The cash KPI echoes an entered amount and cannot certify custody or
@@ -6971,7 +6973,7 @@ function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
 // ---------------------------------------------------------------------------
 function refreshDecisionTop10() {
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
-  var run = { statusCell: null };   // v1.13.10: a throw ends in FAILED
+  var run = { statusCell: null, markerOwned: false };   // v1.13.10: a throw ends in FAILED
   try {
     dt10RefreshDecisionTop10Run_(run);
   } catch (eRun) {
@@ -6983,9 +6985,11 @@ function refreshDecisionTop10() {
  * (live 20 Oct: cockpit stuck RUNNING with no grid). Writes a terminal
  * 'status: FAILED' line (the Riyadh 'Last run' stamp the audit parses, plus
  * failed_at_utc and a short error), upserts cockpit _Status ERROR and clears
- * the P-195 marker (a reported failure is not an abort). Never throws; the
- * caller rethrows. A hard Apps Script timeout cannot be caught: that case
- * still leaves RUNNING and is reported by the next run's P-195 check. */
+ * the P-195 marker THIS run stored (a reported failure is not an abort); a
+ * throw before the marker check leaves a previous run's stale marker for the
+ * next check to report as ABORTED_PREV. Never throws; the caller rethrows. A
+ * hard Apps Script timeout cannot be caught: that case still leaves RUNNING
+ * and is reported by the next run's P-195 check. */
 function dt10RefreshFailed_(run, err) {
   var msg = String(err && err.message ? err.message : err)
       .replace(/\s+/g, ' ').slice(0, 200);
@@ -7006,7 +7010,9 @@ function dt10RefreshFailed_(run, err) {
     dt10WritePageStatus_('ERROR', 'Decision cockpit: FAILED at ' + utc + ' \u2014 ' + msg,
         '', '', '', []);
   } catch (eSt) {}
-  try { dt10RunMarkerClear_(); } catch (eMk) {}
+  if (run && run.markerOwned) {   // only the marker this run stored
+    try { dt10RunMarkerClear_(); } catch (eMk) {}
+  }
   try { SpreadsheetApp.flush(); } catch (eFl) {}
 }
 function dt10RefreshDecisionTop10Run_(run) {
@@ -7040,6 +7046,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   }
   // v1.11.12 [P-195]: judge the previous run's marker, then store ours.
   dt10RunMarkerCheck_('refreshDecisionTop10');
+  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker
   // v1.11.12 [SYNC-INFLIGHT]: observe => token only; enforce => HELD.
   var inflight = dt10SyncInflight_(ss);
   var inflightNote = '';
