@@ -17,6 +17,16 @@ BINDINGS = DATA["bindings"]
 NOW = max(datetime.fromisoformat(item["reviewed_at_utc"]) for item in BINDINGS) + timedelta(minutes=1)
 
 
+# Renewal-proof clock (2026-10-21). A weekly renewal (name_label_renewal.yml)
+# re-reviews most bindings and keeps the rest unchanged, so one committed
+# registry holds several review windows: run 39584281713 renewed 118 and held 4
+# that still expire on 19 Oct. A test that applies a specific binding therefore
+# evaluates it one minute into THAT binding's own review window: still the
+# actual publication clock, never a fabricated authority timestamp.
+def clock_for(item):
+    return datetime.fromisoformat(item["reviewed_at_utc"]) + timedelta(minutes=1)
+
+
 def binding(symbol="HWAY.US"):
     return copy.deepcopy(next(x for x in BINDINGS if x["symbol"] == symbol))
 
@@ -40,7 +50,7 @@ def row_for(item, *, headers=None):
 
 def apply(item, rows, *, headers=None, **kwargs):
     return labels.apply_verified_name_labels(item["page"], headers or get_sheet_headers(item["page"]),
-                                             rows, now=NOW, **kwargs)
+                                             rows, now=clock_for(item), **kwargs)
 
 
 def registry_file(tmp_path, transform):
@@ -262,7 +272,8 @@ def test_final_primary_and_repeat_recovery_writer_retains_caption_and_truthful_r
     monkeypatch.setenv("TFB_RANK_OVERALL_PAGE", "enforce")
     # Stable tests use the actual reviewed window, not a fabricated authority timestamp.
     original = labels.apply_verified_name_labels
-    monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: original(p, h, r, now=NOW))
+    now = clock_for(item)
+    monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: original(p, h, r, now=now))
     api = FakeSheetsAPI()
     writer = sync.SheetsWriter()
     monkeypatch.setattr(writer, "_get_service", lambda: api)
@@ -270,7 +281,7 @@ def test_final_primary_and_repeat_recovery_writer_retains_caption_and_truthful_r
     monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: (r, None))
     writer.write_table("test-sheet", item["page"], "A1", headers, rows)
     baseline = api.requests[-1]["body"]["values"]
-    monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: original(p, h, r, now=NOW))
+    monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: original(p, h, r, now=now))
     for _ in range(2):
         writer.write_table("test-sheet", item["page"], "A1", headers, rows)
         expected = copy.deepcopy(baseline)
@@ -297,11 +308,17 @@ def test_committed_registry_is_only_public_authority_identity_data():
     assert binding("SMAR.US")["identifiers"]["security_class"].startswith("Class A")
     assert binding("SVA.US")["identifiers"]["security_class"] == "caption only; security class not certified"
     assert binding("RYOJ.US")["identifiers"]["security_class"].startswith("Common Shares")
-    assert nvei["reviewed_at_utc"] == "2026-10-12T12:24:43.455134+00:00"
     stm = binding("STM.PA")
     assert stm["name"] == "STMicroelectronics N.V."
-    assert stm["reviewed_at_utc"] == "2026-10-12T13:21:08.737969+00:00"
-    assert stm["review_receipt_sha256"] == "f6ca297854c26856996b8d08657f0f55817827dc166278510846487b0e217b0f"
+    # Review metadata is renewed weekly; identity stays pinned (above and below).
+    # The first reviews are lower bounds (a renewal only takes a NEWER review),
+    # the window stays within 7 days and the receipt is the binding's own digest.
+    for item, first_review in ((nvei, "2026-10-12T12:24:43.455134+00:00"),
+                               (stm, "2026-10-12T13:21:08.737969+00:00")):
+        reviewed = datetime.fromisoformat(item["reviewed_at_utc"])
+        assert reviewed >= datetime.fromisoformat(first_review)
+        assert timedelta(0) < datetime.fromisoformat(item["expires_at_utc"]) - reviewed <= timedelta(days=7)
+        assert item["review_receipt_sha256"] == labels._binding_digest(item)
     assert stm["identifiers"]["namespace_bridge_receipt_source"] == "https://eodhd.com/api/exchange-symbol-list/PA"
     public_without_approved_bridge = copy.deepcopy(DATA)
     approved = next(item for item in public_without_approved_bridge["bindings"] if item["symbol"] == "STM.PA")
@@ -312,15 +329,20 @@ def test_committed_registry_is_only_public_authority_identity_data():
 
 
 def test_new_us_authority_captions_keep_the_entire_identity_quarantine():
+    # The 14 Oct US-authority cohort, selected by its identity marker: its
+    # review date moves with every renewal, its exact authority ticker does not.
     reviewed = [item for item in BINDINGS
-                if item["reviewed_at_utc"].startswith("2026-10-14")]
+                if "exact_authority_ticker" in item["identifiers"]]
     assert len(reviewed) == 67
     headers = get_sheet_headers("Global_Markets")
     rows = [row_for(item) for item in reviewed]
     original = copy.deepcopy(rows)
-    output, receipt = labels.apply_verified_name_labels(
-        "Global_Markets", headers, rows, now=NOW)
-    assert receipt["applied"] == 67 and receipt["held"] == 0
+    output = []
+    for item, row in zip(reviewed, rows):
+        out, receipt = labels.apply_verified_name_labels(
+            "Global_Markets", headers, [row], now=clock_for(item))
+        assert receipt["applied"] == 1 and receipt["held"] == 0, item["symbol"]
+        output.extend(out)
     name_i = headers.index("Name")
     for item, before, after in zip(reviewed, original, output):
         assert item["requires_quarantine"] is True

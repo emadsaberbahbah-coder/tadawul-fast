@@ -2,23 +2,24 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.156.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
 ================================================================================
 
-WHY v5.156.0 (2026-10-15) - SUFFIX LOCALE FALLBACK DEFAULT ON (owner decision)
+WHY v5.157.0 (2026-10-15, renumbered 2026-10-21) - SUFFIX LOCALE FALLBACK DEFAULT ON (owner decision)
 - EVIDENCE: the Top_10_Investments export of 2026-10-15 00:56 Riyadh still
   publishes VND prices labelled NASDAQ/NYSE USD: VNM.VN 216,308.99 SAR,
   PLX.VN 136,035.15 and BID.VN 124,620.92; 26 Global_Markets .VN rows carry
-  the same wrong label. The owner chose on 2026-10-15 to arm the v5.155.0
-  fallback by default.
+  the same wrong label. The owner chose on 2026-10-15 to arm the v5.156.0
+  fallback (authored as v5.155.0) by default.
 - CHANGE: _suffix_locale_fallback_enabled reads TFB_ENGINE_SUFFIX_LOCALE_
   FALLBACK with default "1". The fallback itself is unchanged (dotted suffix
   absent from the local table, normalize gives a complete non-US answer).
 - OFF: TFB_ENGINE_SUFFIX_LOCALE_FALLBACK=0 (or false/off/no) restores
-  v5.155.0 with the gate unset, i.e. v5.154.0 values.
+  v5.156.0 with the gate unset, i.e. main's v5.155.0 values.
 - ROLLBACK: set it to 0 on Render (no redeploy needed); or revert.
 
-WHY v5.155.0 (2026-10-14) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
+WHY v5.156.0 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
+5.155.0) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
 TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identical)
 - EVIDENCE: the Top_10_Investments export of 2026-10-13 20:37 Riyadh (route
   v4.18.1, builder v1.26.1, pool 9,786 rows) publishes MWG.VN as Market
@@ -61,9 +62,21 @@ TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identica
   _canonicalize_provider_row, _infer_country_from_symbol, surface_gate_states
   (no new health key), every provider, identity_guard and the builder.
   Suffixes no table knows (.PH .MA .ETR .LG) still fall back to USD.
-- OFF (unset or any other value): both inferrers return exactly what v5.154.0
+- OFF (unset or any other value): both inferrers return exactly what v5.155.0
   returned; no log line, tag or payload field is added.
 - ROLLBACK: unset TFB_ENGINE_SUFFIX_LOCALE_FALLBACK (no redeploy needed).
+WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
+- _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
+  holding (suffix map currency "GBp", pence) took the GBP (pounds) rate: its
+  SAR value and Actual Weight % were 100x too large (1000 VOD.L @ 70p beside
+  25,000 SAR of 2222.SR read 93.07% instead of 11.85%) and drove REDUCE/ADD.
+  The subunit token is now resolved case-sensitively first (GBX/GBp -> GBP,
+  ZAC/ZAc -> ZAR, ILA/ILa -> ILS, each / 100; USX only behind
+  TFB_OPP_FX_USX_SUBUNIT). A subunit whose major currency has no rate stays
+  unresolved, so the existing whole-book PORTFOLIO_FX_INCOMPLETE fail-closed
+  path applies.
+- portfolio_fx_status names the built-in INDICATIVE rates used
+  ("OK:SAR INDICATIVE:GBP") instead of a bare "OK:SAR".
 
 WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
 - Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
@@ -4214,11 +4227,11 @@ from core.financial_units import (
 # v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
 # non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
 # never ranked, never funded.
-# v5.155.0 (2026-10-14): suffix locale fallback (gated, default off); a dotted
+# v5.156.0 (2026-10-14): suffix locale fallback (gated, default off); a dotted
 # suffix the local table lacks asks core.symbols.normalize for exchange and
 # currency before the NASDAQ/NYSE and USD fallbacks (MWG.VN -> HOSE / VND).
-# v5.156.0 (2026-10-15): that fallback defaults ON (owner decision); =0 disarms.
-__version__ = "5.156.0"
+# v5.157.0 (2026-10-15): that fallback defaults ON (owner decision); =0 disarms.
+__version__ = "5.157.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -11276,6 +11289,29 @@ def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     return out
 
 
+# v5.155.0 PF-SUBUNIT: subunit price currency -> (major currency, divisor).
+# Matched case-sensitively, exactly like _SUBUNIT_PRICE_CURRENCIES: "GBp"/"GBX"
+# are pence while "GBP" is pounds. USX folds only behind TFB_OPP_FX_USX_SUBUNIT,
+# mirroring _normalize_subunit_market_cap.
+_PF_SUBUNIT_MAJOR: Dict[str, str] = {
+    "GBX": "GBP", "GBp": "GBP",
+    "ZAC": "ZAR", "ZAc": "ZAR",
+    "ILA": "ILS", "ILa": "ILS",
+}
+
+
+def _pf_subunit_major(raw_ccy: str) -> Tuple[str, float]:
+    """Return (major currency, divisor) for a position currency. A major-unit
+    currency returns itself with divisor 1.0."""
+    tok = (raw_ccy or "").strip()
+    if tok in _PF_SUBUNIT_MAJOR:
+        return _PF_SUBUNIT_MAJOR[tok], _SUBUNIT_PRICE_CURRENCY_FACTOR
+    if tok.upper() == "USX" and (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        return "USD", _SUBUNIT_PRICE_CURRENCY_FACTOR
+    return tok, 1.0
+
+
 def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                               fx_rates: Optional[Dict[str, Any]] = None) -> None:
     """v5.80.0: cross-sectional My_Portfolio pass. v5.85.4 (Fix AF): the per-row
@@ -11330,15 +11366,32 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     continue
                 if _as_float(r.get("position_value")) is None:
                     continue
-                ccy = (_safe_str(r.get("currency")) or "").upper()
+                # v5.155.0 PF-SUBUNIT: resolve the subunit token on the RAW
+                # (case-preserved) currency BEFORE upper-casing. The suffix map
+                # emits "GBp" for .L, which .upper() turned into "GBP" -- the
+                # pounds rate applied to a pence value (100x the weight).
+                _raw_ccy = _safe_str(r.get("currency")) or ""
+                _major, _div = _pf_subunit_major(_raw_ccy)
+                ccy = _major.upper()
                 if not ccy:
                     _unresolved.add("(blank)")
                     continue
+                # v5.155.0 (review fix, same unreleased version): a rate keyed
+                # on the SUBUNIT code itself (TFB_PF_FX_RATES=GBX:0.048 or
+                # fx_rates={"GBX": ...}) is SAR per pence and wins, exactly as
+                # before 5.155.0 read it. Only distinct upper-case codes can be
+                # such keys (GBX/ZAC/ILA): the table upper-cases its keys, so
+                # "GBp" can never be told apart from GBP there.
+                _direct = _raw_ccy.strip().upper()
+                _fd = _fx.get(_direct) if (_div != 1.0 and _direct != ccy) else None
+                if _fd is not None and _fd > 0.0:
+                    _factor[id(r)] = _fd
+                    continue
                 f = _fx.get(ccy)
                 if f is None or f <= 0.0:
-                    _unresolved.add(ccy)
+                    _unresolved.add(_raw_ccy if _div != 1.0 else ccy)
                 else:
-                    _factor[id(r)] = f
+                    _factor[id(r)] = f / _div
                     if ccy in _PF_INDICATIVE_FX_TO_SAR and ccy not in _operator_set:
                         _indicative_used.add(ccy)
             if _indicative_used:
@@ -11381,9 +11434,14 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     _f7_settle_holdback(r)
                     _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
                 return
+            # v5.155.0: a book converted with a built-in INDICATIVE (floating)
+            # rate is disclosed on every row, not only in a log line.
+            _fx_status = "OK:" + _base_ccy
+            if _indicative_used:
+                _fx_status += " INDICATIVE:" + ",".join(sorted(_indicative_used))
             for r in rows:
                 if isinstance(r, dict):
-                    r["portfolio_fx_status"] = "OK:" + _base_ccy
+                    r["portfolio_fx_status"] = _fx_status
 
         total_mv = 0.0
         for r in rows:
@@ -15260,7 +15318,7 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
 
 
 # =============================================================================
-# v5.155.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
+# v5.156.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
 # -----------------------------------------------------------------------------
 # A dotted suffix absent from _SUFFIX_TO_LOCALE (.VN, .SET, .PS, .AU, .KO, ...)
 # fell through to NASDAQ/NYSE + USD while _infer_country_from_symbol already
@@ -15277,7 +15335,7 @@ _SUFFIX_LOCALE_FALLBACK_ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 
 
 def _suffix_locale_fallback_enabled() -> bool:
-    return os.getenv(_SUFFIX_LOCALE_FALLBACK_ENV, "1").strip().lower() in ("1", "true", "yes", "on")  # v5.156.0 default on
+    return os.getenv(_SUFFIX_LOCALE_FALLBACK_ENV, "1").strip().lower() in ("1", "true", "yes", "on")  # v5.157.0 default on
 
 
 def _suffix_locale_nz_for(symbol: str) -> Optional[Tuple[str, str, str]]:
@@ -15321,7 +15379,7 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "Futures"
-    _nzl = _suffix_locale_nz_for(s)  # v5.155.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.156.0: off -> None
     if _nzl is not None:
         return _nzl[0]
     return "NASDAQ/NYSE"
@@ -15348,7 +15406,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
-    _nzl = _suffix_locale_nz_for(s)  # v5.155.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.156.0: off -> None
     if _nzl is not None:
         return _nzl[1]
     return "USD"

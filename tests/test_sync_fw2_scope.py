@@ -9,9 +9,9 @@ RECORDER. Fixture rows are real Global_Markets rows copied verbatim from the
 in a stated, deterministic way (EPS vintage drift, the HKD price / CNY EPS
 currency gap, an enrichment block transposed from another issuer).
 
-Base parity: TFB_TEST_SYNC_BASE = the v6.70.0 file (git show
-f24e9ff3:scripts/run_dashboard_sync.py; authored against the v6.69.0 file
-15812b6, renumbered 2026-10-19 after main's #799 HK-FX took v6.70.0)
+Base parity: TFB_TEST_SYNC_BASE = main's file before this build (v6.70.2 since
+2026-10-21: git show 55b47f24:scripts/run_dashboard_sync.py; authored against
+the v6.69.0 file 15812b6, then v6.70.0 f24e9ff3 after main's #799 HK-FX)
 -> off output == base output, value
 for value, and observe output == base output. Without the variable the base
 cases skip. Offline: no network, no credentials, no live Sheet.
@@ -328,7 +328,7 @@ def test_t10_runlog_default_equals_base_and_census_suffix():
     assert " | fw2=" not in row[5] and "fw2" not in json.loads(row[9])
     if b() is not None:
         brow = _runlog(b())
-        norm = lambda r: [re.sub(r"6\.(69|70|71)\.0", "X", str(c)) for c in r[1:]]
+        norm = lambda r: [re.sub(r"6\.(69|70|71)\.[0-9]+", "X", str(c)) for c in r[1:]]
         assert norm(row) == norm(brow)
     census = {"mode": "enforce", "drift": 4, "gross": 1, "fielded": 4,
               "rows": [{"symbol": "JNJ", "tier": "drift", "action": "fielded"}]}

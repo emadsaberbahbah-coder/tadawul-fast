@@ -16,9 +16,10 @@ from scripts import verify_core_repair_readback as probe
 COMMIT = "a" * 40
 WORKFLOW_COMMIT = COMMIT
 OTHER_COMMIT = "f" * 40
-# 2026-10-15: data_engine_v2 5.156.0 (suffix locale fallback default on);
-# the CLI compares this with the source constant, so the pin moves in place.
-ENGINE = "5.156.0"
+# 2026-10-21: data_engine_v2 5.157.0 (suffix locale fallback default on; main's #810
+# took 5.155.0 and the bundle's fallback is 5.156.0); the CLI compares this with
+# the source constant, so the pin moves in place.
+ENGINE = "5.157.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

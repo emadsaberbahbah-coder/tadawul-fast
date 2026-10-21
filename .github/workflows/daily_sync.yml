@@ -1,6 +1,6 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
-# VERSION 1.0.5 (2026-10-15) -- FW-2 SCOPE DEFAULTS TO ENFORCE (owner decision)
+# VERSION 1.0.6 (2026-10-15, renumbered 2026-10-21 after #810 took 1.0.4) -- FW-2 SCOPE DEFAULTS TO ENFORCE (owner decision)
 # WHY (2026-10-15): on the 15 Oct export (run 38605679960) the FW-2 firewall
 # left 167 symbol-only Global_Markets stubs (AMAT, MRVL, SMCI, UAL, SOFI ...),
 # holding GM names at 96.05% (< 99%) and acquisition at 93.71% (< 95%), so
@@ -9,15 +9,22 @@ name: 🏦 Tadawul Dashboard Advanced Sync
 # timestamps with P/E, EPS and PEG cleared, BLOCKED / DO_NOT_INVEST; gross
 # rows are still stripped. Both writer jobs move together. A repository
 # Variable still overrides. Rollback: set Variable TFB_SYNC_FW2_SCOPE=off.
-# VERSION 1.0.4 (2026-10-14) -- FW-2 SCOPE VARIABLE IN BOTH WRITER JOBS
+# VERSION 1.0.5 (2026-10-14, renumbered 2026-10-21 after #810 took 1.0.4) -- FW-2 SCOPE VARIABLE IN BOTH WRITER JOBS
 # WHY (2026-10-14): run_dashboard_sync v6.71.0 (authored as v6.70.0; renumbered
 # 2026-10-19 after main's #799 HK-FX took v6.70.0) adds TFB_SYNC_FW2_SCOPE
-# (off | observe | enforce, default off = v6.70.0 byte-identical). The FW-2
+# (off | observe | enforce, default off = v6.70.2 byte-identical). The FW-2
 # row firewall turned 76 healthy Global_Markets rows (JNJ, AMAT, Samsung,
 # Tokyo Electron, Givaudan) into symbol-only stubs on run 38486122061, which
 # alone fails the 99% name gate. Mapped in sync-dashboard AND
 # recover-missing-market-pages so recovery cannot undo the primary leg.
 # Unset Variable -> 'off' -> nothing moves. Rollback: unset the Variable.
+# VERSION 1.0.4 (2026-10-21) -- TRUTHFUL BACKEND 401/403 SUMMARY
+# WHY (run 39513589733, #4998): the leg warned "batches recovered, SYNC DONE
+# failed=0" because ONE of its two SYNC DONE lines said failed=0 while the
+# other said failed=2. Recovery is now claimed only when every SYNC DONE line
+# reports failed=0, the real failed= counts are printed in both messages, and
+# a higher exit code is never lowered to 1. Messages name main.py 8.14.6 (the
+# auth wall no longer answers 401 for downstream errors). Text-only otherwise.
 # VERSION 1.0.3 (2026-10-13) -- SUPERSEDE A RELEASED DECISION FEED AT WRITER START (P0-1)
 # WHY (2026-10-13, Codex P1 on PR #763): with TFB_DECISION_RELEASE armed, a
 # release of run N stayed EXECUTABLE while this workflow re-stamped every page
@@ -1245,11 +1252,21 @@ jobs:
           fi
           BK401=$(grep -ciE "httpx.*(401 Unauthorized|403 Forbidden)" "$LOG_FILE" || true)
           if [ "${BK401:-0}" -gt 0 ]; then
-            if grep -qE "SYNC DONE \| .*failed=0" "$LOG_FILE"; then
-              echo "::warning::Backend returned ${BK401} 401/403 response(s) during this leg (transient; batches recovered, SYNC DONE failed=0). If this repeats outside a Render deploy, check TFB_TOKEN on both sides."
+            # 1.0.4 (2026-10-21): recovery is claimed only when EVERY
+            # "SYNC DONE |" summary of this leg reports failed=0 (the portfolio
+            # group and the default group each print one). The 1.0.3 test
+            # matched ANY line, so run 39513589733 printed "failed=0" while the
+            # other summary said failed=2. The real counts are printed, and an
+            # exit code already above 1 is never lowered.
+            DONE_LINES=$(grep -E "SYNC DONE \|" "$LOG_FILE" || true)
+            DONE_N=$(printf '%s\n' "$DONE_LINES" | grep -c "SYNC DONE" || true)
+            DONE_BAD=$(printf '%s\n' "$DONE_LINES" | grep -cE "failed=[1-9][0-9]*" || true)
+            DONE_FAILED=$(printf '%s\n' "$DONE_LINES" | grep -oE "failed=[0-9]+" | tr '\n' ' ' | sed 's/ *$//' || true)
+            if [ "${DONE_N:-0}" -gt 0 ] && [ "${DONE_BAD:-0}" -eq 0 ]; then
+              echo "::warning::Backend returned ${BK401} 401/403 response(s) during this leg; batches recovered (all ${DONE_N} SYNC DONE summaries: ${DONE_FAILED}). Before main.py 8.14.6 the auth wall also answered 401 when a request failed downstream (timeout, dropped response); if this repeats on 8.14.6+, check TFB_TOKEN on both sides."
             else
-              echo "::error::Backend auth failure: ${BK401} 401/403 response(s) and the sync did not complete cleanly. Check TFB_TOKEN (GitHub secret vs Render env)."
-              EXIT_CODE=1
+              echo "::error::Backend returned ${BK401} 401/403 response(s) and the sync did not complete cleanly (SYNC DONE summaries: ${DONE_FAILED:-none}). On main.py 8.14.6+ a 401 is a real auth refusal: check TFB_TOKEN (GitHub secret vs Render env)."
+              if [ "$EXIT_CODE" -lt 1 ]; then EXIT_CODE=1; fi
             fi
           fi
 
