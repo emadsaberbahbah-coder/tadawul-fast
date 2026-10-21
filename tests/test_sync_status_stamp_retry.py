@@ -20,7 +20,8 @@ Pinned here:
      attempt re-reads column A, finds the row and updates it
   S5 TFB_SYNC_STATUS_STAMP_RETRIES=1 restores the v6.70.0 single attempt
   S6 a transient write failure is retried and the payload is unchanged
-  S7 attempts are clamped to 1..6; garbage falls back to 4
+  S7 attempts are clamped to 1..6; garbage falls back to 4; the 90 s stamp
+     budget (TFB_SYNC_STATUS_STAMP_DEADLINE_S, 10..600) stops further retries
   S8 the gate (TFB_SYNC_STATUS_STAMP) still means zero API calls when off
 
 Run: pytest -q tests/test_sync_status_stamp_retry.py
@@ -108,6 +109,7 @@ def armed(monkeypatch):
     monkeypatch.setenv("TFB_SYNC_STATUS_STAMP", "1")
     monkeypatch.setenv("TFB_SYNC_STATUS_STAMP_PAGES", "")
     monkeypatch.delenv("TFB_SYNC_STATUS_STAMP_RETRIES", raising=False)
+    monkeypatch.delenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S", raising=False)
     monkeypatch.setattr(sync, "_status_stamp_row", lambda page, res, n: list(PAYLOAD))
     sleeps = []
     monkeypatch.setattr(sync.time, "sleep", lambda s: sleeps.append(s))
@@ -188,6 +190,22 @@ def test_s6_transient_write_failure_retried(armed, capsys):
 def test_s7_attempts_clamped(monkeypatch, raw, want):
     monkeypatch.setenv("TFB_SYNC_STATUS_STAMP_RETRIES", raw)
     assert sync._status_stamp_attempts() == want
+
+
+def test_s7b_deadline_stops_retries(armed, monkeypatch, capsys):
+    # backoff 3 s, 8 s, 15 s; a 10 s budget allows the first two waits only
+    monkeypatch.setenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S", "10")
+    api = FakeSheets(GRID, read_errors=[_timeout() for _ in range(4)])
+    sync._stamp_page_status(api, "sid", "Global_Markets", RES, 122)
+    assert [c[0] for c in api.calls] == ["get"] * 3 and armed == [3.0, 8.0]
+    out = capsys.readouterr().out
+    assert "after 3 attempt(s) (10 s stamp budget reached)" in out
+
+
+@pytest.mark.parametrize("raw,want", [("", 90.0), ("5", 10.0), ("45", 45.0), ("9999", 600.0), ("x", 90.0)])
+def test_s7c_deadline_clamped(monkeypatch, raw, want):
+    monkeypatch.setenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S", raw)
+    assert sync._status_stamp_deadline_s() == want
 
 
 def test_s8_gate_off_means_no_calls(monkeypatch):

@@ -24,8 +24,12 @@ harness route that raises):
   D4 valid token + healthy downstream        -> 200 REACHED (unchanged)
   D5 real app: a protected route that raises -> 500 from the app's own
      exception handler with a token, the wall's 401 without one
+  D7 real app, the incident path: a protected route that leaks
+     asyncio.CancelledError -> NoResponseGuard logs "Caught downstream
+     no-response runtime error" and the request is a 500 with a token (the
+     Render signature of 20 Oct 23:16:14Z was this log line + the wall's 401)
   D6 [needs TFB_AUTH_WALL_BASE=<pre-change main.py>] golden negative: the
-     base answers 401 in D1/D2/D5 (bug reproduced)
+     base answers 401 in D1/D2/D5/D7 (bug reproduced)
 
 Run:  python -m pytest -q tests/test_auth_wall_downstream_errors.py
 """
@@ -45,9 +49,10 @@ ENV_BASE = "TFB_AUTH_WALL_BASE"
 TOKEN = "harness-downstream-token-5k1"
 PATH = "/v1/analysis/sheet-rows"
 REAL_PATH = "/v1/__harness_downstream_raise"
+CANCEL_PATH = "/v1/__harness_downstream_cancel"
 
 RUNNER = r'''
-import importlib.util, json, socket, sys
+import asyncio, importlib.util, json, socket, sys
 ROOT, MAIN = sys.argv[1], sys.argv[2]
 SPEC = json.loads(sys.stdin.read())
 sys.path.insert(0, ROOT)
@@ -102,10 +107,19 @@ for name, app in (("ok", ok), ("boom", boom), ("silent", silent)):
 def _harness_raise():
     raise RuntimeError("synthetic route failure")
 
+async def _harness_cancel():
+    raise asyncio.CancelledError()
+
 m.app.add_api_route(SPEC["real_path"], _harness_raise, methods=["GET"])
+m.app.add_api_route(SPEC["cancel_path"], _harness_cancel, methods=["GET"])
 real = TestClient(m.app, raise_server_exceptions=False)
 out["real|token"] = rec(real, SPEC["real_path"], TOKEN, "GET")
 out["real|anon"] = rec(real, SPEC["real_path"], None, "GET")
+try:
+    out["cancel|token"] = rec(real, SPEC["cancel_path"], TOKEN, "GET")
+except BaseException as exc:  # a leaked CancelledError must not kill the runner
+    out["cancel|token"] = ["raised", type(exc).__name__]
+out["cancel|anon"] = rec(real, SPEC["cancel_path"], None, "GET")
 print("@@JSON@@" + json.dumps(out, sort_keys=True, default=str))
 '''
 
@@ -143,7 +157,7 @@ def _run(main_path: Path) -> dict:
     for name in _DROP_ENV:
         env.pop(name, None)
     env.update(_BASE_ENV)
-    spec = {"token": TOKEN, "path": PATH, "real_path": REAL_PATH}
+    spec = {"token": TOKEN, "path": PATH, "real_path": REAL_PATH, "cancel_path": CANCEL_PATH}
     proc = subprocess.run([sys.executable, "-c", RUNNER, str(ROOT), str(main_path)],
                           input=json.dumps(spec), cwd=str(ROOT), env=env,
                           capture_output=True, text=True, timeout=600)
@@ -195,6 +209,12 @@ def test_d5_real_app_route_error_is_500_not_401(res):
     assert _walled(res["real|anon"], REAL_PATH), res["real|anon"]
 
 
+def test_d7_leaked_cancellation_is_500_not_401(res):
+    status, _body = res["cancel|token"]
+    assert status == 500 and not _walled(res["cancel|token"]), res["cancel|token"]
+    assert _walled(res["cancel|anon"], CANCEL_PATH), res["cancel|anon"]
+
+
 def test_d5b_version(res):
     assert res["version"] == "8.14.6"
 
@@ -211,3 +231,4 @@ def test_d6_golden_negative_on_base():
     assert _walled(old["boom|token"], PATH), old["boom|token"]
     assert _walled(old["silent|token"], PATH), old["silent|token"]
     assert _walled(old["real|token"], REAL_PATH), old["real|token"]
+    assert _walled(old["cancel|token"], CANCEL_PATH), old["cancel|token"]

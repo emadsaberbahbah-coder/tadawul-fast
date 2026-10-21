@@ -314,6 +314,8 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_PA_PROTECT_SUKUK", "1", "sukuk never a SELL leg (D-9)", True),
     ("TFB_TRACK_CA_LEDGER", "1", "confirmed CA forces verification", True),
     ("TFB_SR_TRANSIENT_RETRY", "1", "sheets reads retry transient transport errors", True),
+    # 2026-10-21: core/symbols_reader 8.7.0 - protective, default on, Render-scoped.
+    ("TFB_SR_THREAD_LOCAL_SERVICE", "1", "sheets reader builds one Google service per thread", True),
     ("TRACK_HORIZONS", "1M,3M", "7D/14D checkpoints recorded", False),
     ("TFB_BACKTEST_KSA_YF", "0", "deep history unblocks hypothesis backtest", False),
     ("TFB_BACKTEST_NONOVERLAP", "0", "non-overlapping windows (honest t-stat)", False),

@@ -16,10 +16,12 @@ up. Global_Markets kept run 39464797610 while the other pages carried
 39513589733, so the Top_10 cockpit withheld ("source run differs from
 cohort") and could not build the pool receipt that explains the Mutual_Funds
 pool (2,469 unique of 2,474 physical). The read and the row write are now one
-unit retried on transient errors (default 4 attempts, 3/8/15 s); each attempt
-re-reads column A, so a lost append response cannot duplicate the row. A stamp
-that still fails is an ::error:: naming the cohort consequence. Gate
-TFB_SYNC_STATUS_STAMP_RETRIES (1 = v6.70.0). (6.70.1 is PR #809's KLG-READ.)
+unit retried on transient errors (default 4 attempts, 3/8/15 s, inside a 90 s
+budget); each attempt re-reads column A first, so an append the API applied
+before the next read is updated in place, not duplicated. A stamp that still
+fails is an ::error:: naming the cohort consequence. Gates
+TFB_SYNC_STATUS_STAMP_RETRIES (1 = a single attempt, as in v6.70.0) and
+TFB_SYNC_STATUS_STAMP_DEADLINE_S. (6.70.1 is PR #809's KLG-READ.)
 
 v6.70.0 - Hong Kong reporting-currency band in the identity checks (2026-10-19)
 ================================================================================
@@ -2131,9 +2133,11 @@ SCRIPT_VERSION = "6.70.2"
 #   after one read timed out (no retry); the cockpit's cohort check then
 #   withheld the Top_10 board. FIX: _stamp_page_status retries read+write as
 #   one unit on _is_transient_write_error, re-reading column A each attempt
-#   (append-safe). Exhausted -> ::error:: with the cohort consequence; the
-#   function stays fail-open and the sync exit code is unchanged.
-#   GATE: TFB_SYNC_STATUS_STAMP_RETRIES (default 4; 1 = v6.70.0 behaviour).
+#   (append-safe once the API has applied the append). Exhausted, or the
+#   TFB_SYNC_STATUS_STAMP_DEADLINE_S budget (default 90 s) reached -> ::error::
+#   with the cohort consequence; the function stays fail-open and the sync
+#   exit code is unchanged. GATE: TFB_SYNC_STATUS_STAMP_RETRIES (default 4;
+#   1 = a single attempt as in v6.70.0, annotated ::error:: not ::warning::).
 # v6.70.0 (2026-10-19) - HK-FX [identity check, Hong Kong reporting currency]:
 #   WHY: FW-2 (_row_identity_firewall), FW-1 (_klg_old_row_identity_ok) and the
 #   L3b tripwire (_coherence_scan) test Price/EPS against the stated P/E with
@@ -9002,7 +9006,9 @@ def _status_stamp_should_skip(res: Any) -> str:
 def _status_stamp_attempts() -> int:
     """v6.70.2 STAMP-RETRY: total attempts for one `_Status` stamp (read the
     key column + write the row), default 4, clamped 1..6.
-    TFB_SYNC_STATUS_STAMP_RETRIES=1 restores the v6.70.0 single attempt."""
+    TFB_SYNC_STATUS_STAMP_RETRIES=1 makes a single attempt, as v6.70.0 did
+    (its final failure is annotated ::error:: where v6.70.0 printed
+    ::warning::; exit codes are identical)."""
     try:
         n = int((os.getenv("TFB_SYNC_STATUS_STAMP_RETRIES") or "4").strip())
     except Exception:
@@ -9010,9 +9016,23 @@ def _status_stamp_attempts() -> int:
     return max(1, min(6, n))
 
 
+def _status_stamp_deadline_s() -> float:
+    """v6.70.2 STAMP-RETRY: wall-clock budget for one stamp, default 90 s
+    (TFB_SYNC_STATUS_STAMP_DEADLINE_S, clamped 10..600). A retry whose
+    backoff would end past the budget is not attempted. Each Sheets call can
+    itself block up to the client's 60 s socket timeout, and the stamp runs in
+    the page task's finally, so the budget bounds how long a failing stamp can
+    hold the event loop."""
+    try:
+        v = float((os.getenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S") or "90").strip())
+    except Exception:
+        v = 90.0
+    return max(10.0, min(600.0, v))
+
+
 # v6.70.2 STAMP-RETRY: seconds to wait before attempts 2, 3, 4 ... (the last
-# value repeats). Worst case for the default 4 attempts: 26 s, paid only by a
-# stamp that is failing.
+# value repeats); 26 s of backoff for the default 4 attempts, paid only by a
+# stamp that is failing, and always inside _status_stamp_deadline_s().
 _STATUS_STAMP_BACKOFF_SEC = (3.0, 8.0, 15.0)
 
 
@@ -9028,13 +9048,15 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
 
     v6.70.2 STAMP-RETRY: the key-column read and the row write form one unit
     that is retried on TRANSIENT failures (_is_transient_write_error: timeout,
-    SSL, reset, 429/5xx), up to _status_stamp_attempts() with backoff. Every
-    attempt re-reads column A first, so an append whose response was lost is
-    found on the next attempt and updated in place instead of appended twice.
-    A non-transient error stops at once. When every attempt fails the
-    annotation is an ::error:: naming the consequence (the page keeps the
-    previous run ID, so the cockpit will see a cohort mismatch); the sync's
-    exit code is unchanged."""
+    SSL, reset, 429/5xx), up to _status_stamp_attempts() with backoff and
+    inside _status_stamp_deadline_s(). Every attempt re-reads column A first,
+    so an append whose response was lost but which the API had applied by the
+    next read is found and updated in place rather than appended again (an
+    append applied only after that read could still duplicate; the append
+    path runs only for a page's first-ever stamp). A non-transient error stops
+    at once. When the stamp still fails the annotation is an ::error:: naming
+    the consequence (the page keeps the previous run ID, so the cockpit will
+    see a cohort mismatch); the sync's exit code is unchanged."""
     if not _status_stamp_enabled() or sheets is None:
         return
     allow = _status_stamp_pages()
@@ -9051,6 +9073,8 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
             return
         payload = _status_stamp_row(page, res, n_cols)
         attempts = _status_stamp_attempts()
+        deadline = _status_stamp_deadline_s()
+        _t0 = time.monotonic()
         _where = ""
         for attempt in range(attempts):
             stage = "read"
@@ -9083,17 +9107,21 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
             except Exception as _se:
                 _what = ("could not read %s key column" % _STATUS_SHEET_NAME
                          if stage == "read" else "could not write the %s row" % _STATUS_SHEET_NAME)
-                if attempt + 1 >= attempts or not _is_transient_write_error(_se):
-                    print("::error::%s %s for %s after %d attempt(s) — %s: %s. "
+                _delay = _STATUS_STAMP_BACKOFF_SEC[min(attempt, len(_STATUS_STAMP_BACKOFF_SEC) - 1)]
+                _over = (time.monotonic() - _t0) + _delay > deadline
+                if attempt + 1 >= attempts or not _is_transient_write_error(_se) or _over:
+                    print("::error::%s %s for %s after %d attempt(s)%s — %s: %s. "
                           "The stamp was NOT written: %s keeps this page's previous "
                           "run ID, so the decision cockpit will see a cohort mismatch "
                           "until a later stamp succeeds."
                           % (_STATUS_STAMP_TAG, _what, page, attempt + 1,
+                             (" (%.0f s stamp budget reached)" % deadline)
+                             if (_over and attempt + 1 < attempts
+                                 and _is_transient_write_error(_se)) else "",
                              type(_se).__name__, _se, _STATUS_SHEET_NAME))
                     logger.warning("%s stamp NOT written for %s after %d attempt(s): %s",
                                    _STATUS_STAMP_TAG, page, attempt + 1, _se)
                     return
-                _delay = _STATUS_STAMP_BACKOFF_SEC[min(attempt, len(_STATUS_STAMP_BACKOFF_SEC) - 1)]
                 print("::warning::%s %s for %s (attempt %d/%d) — %s: %s; retrying in %.0fs"
                       % (_STATUS_STAMP_TAG, _what, page, attempt + 1, attempts,
                          type(_se).__name__, _se, _delay))

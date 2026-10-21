@@ -20,7 +20,9 @@ a caller holding a valid token. Render log 2026-10-20 23:16:14Z shows each
 401s and told the operator to check TFB_TOKEN. The decision now runs alone
 inside the try (still fail-closed: an error while deciding is a 401), and an
 allowed request is handed downstream outside it, so its errors reach the
-app's own handling (500), exactly as with the wall disarmed. Every denial
+app's own handling (500), as they did before v8.13.0 added the wall (from
+8.13.0 to 8.14.5 even the disarmed branch called downstream inside the try,
+so the masking applied with the wall armed or not). Every denial
 (status, headers, body) is byte-identical; no exemption, token source or
 kill-switch changed. Harness: tests/test_auth_wall_downstream_errors.py.
 
@@ -1504,7 +1506,8 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
         # backend 401s and told the operator to check TFB_TOKEN. The
         # decision, its fail-closed rule and every denial response are
         # unchanged; an allowed request's errors now reach the app's own
-        # error handling (500), as they do with the wall disarmed.
+        # error handling (500), as before v8.13.0 (8.13.0-8.14.5 masked them
+        # whether the wall was armed or not).
         allowed = False
         platform_denied = False
         try:
