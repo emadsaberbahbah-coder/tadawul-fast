@@ -1,4 +1,4 @@
-"""data_engine_v2 v5.155.0 -- SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK).
+"""data_engine_v2 v5.156.0 (authored as 5.155.0) -- SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK).
 
 The 2026-10-13 20:37 Riyadh Top_10 export published MWG.VN as Market
 NASDAQ/NYSE, Ccy USD, Price 74,700, Price SAR 280,653.13 (true ~11.06 SAR).
@@ -15,9 +15,10 @@ WORKS   W1-W7   armed: inferrers, provider-row canonicalization, the full
 NEVER   N1-N6   off spellings; shapes that must never reach normalize; a
                 raising/None/US/malformed normalize answer; never raises;
                 no new health key; ASCII added lines.
-GOLD    G1-G3   against an untouched base copy of v5.154.0
-                (TFB_TEST_DE_BASE = path to
-                `git show 030e22eb:core/data_engine_v2.py`): OFF census and
+GOLD    G1-G3   against an untouched base copy of main's engine, v5.155.0
+                since 2026-10-21 (TFB_TEST_DE_BASE = path to
+                `git show 55b47f24:core/data_engine_v2.py`; authored against
+                v5.154.0 at 030e22eb): OFF census and
                 canonicalization byte-identical; GOLDEN NEGATIVE - the W1
                 check fails on the base with the gate armed; zero
                 function/class removals.
@@ -52,7 +53,7 @@ nz = importlib.import_module("core.symbols.normalize")
 
 ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 DE_BASE = os.environ.get("TFB_TEST_DE_BASE", "")
-BASE_VERSION = "5.154.0"
+BASE_VERSION = "5.155.0"   # merge note 2026-10-21 (#778): main #810 is the new base
 ARMED = ("1", "true", "yes", "on", " ON ", "True")
 OFF = (None, "", "0", "false", "off", "no", "observe", "enforce", "2")
 
@@ -334,14 +335,14 @@ def case_n5_no_new_health_key(mp, _tmp):
 
 def case_n6_ascii_added_lines(_mp, _tmp):
     src = (ROOT / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
-    start = src.index("WHY v5.155.0 (2026-10-14)")
+    start = src.index("WHY v5.156.0 (2026-10-14")
     block = src[start:src.index("WHY v5.154.0 - INTEGRATED")]
-    helper = src[src.index("# v5.155.0 - SUFFIX LOCALE FALLBACK"):
+    helper = src[src.index("# v5.156.0 - SUFFIX LOCALE FALLBACK"):
                  src.index("def _infer_exchange_from_symbol")]
     for text in (block, helper):
         assert all(ord(ch) < 128 for ch in text)
-    assert src.count("_nzl = _suffix_locale_nz_for(s)  # v5.155.0: off -> None") == 2
-    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 155, 0)
+    assert src.count("_nzl = _suffix_locale_nz_for(s)  # v5.156.0: off -> None") == 2
+    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 156, 0)
     if (ROOT / ".git").exists():
         try:
             diff = subprocess.run(

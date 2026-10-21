@@ -202,6 +202,7 @@ def test_h10_identity_selftest_still_passes():
 
 
 def test_h11_version_and_manifest_pin():
+    # 6.70.2 (2026-10-21): STAMP-RETRY; the HK-FX contract itself is unchanged.
     # merge note (2026-10-19, #778): FW-2 SCOPE moved the file to 6.71.0, so this
     # is a version floor and the manifest pin is read from the source constant.
     assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 70, 0)

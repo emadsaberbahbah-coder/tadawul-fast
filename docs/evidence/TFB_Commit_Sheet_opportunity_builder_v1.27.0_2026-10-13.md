@@ -139,6 +139,8 @@ exchange_calendars or pandas. Enrolling it in the lean list is a follow-up once 
 
 ## Cockpit half: 16_Decision_Top10.gs v1.13.9 -> v1.13.10
 
+Renumbered 2026-10-21: main shipped a different 16_Decision_Top10 v1.13.10 first (#810: holding subunit FX, no native-as-SAR, FAILED state). The held-seat change is now **v1.13.11** on top of it. Its header block sits above main's v1.13.10, and off is byte-identical to v1.13.10 (`tests/js/dt10_audit_keep.test.js` D1-D2 pass with `DT10_BASE=<git show 55b47f24:apps_script/16_Decision_Top10.gs>`). `tests/js/dt10_audit_keep_regions.js` now maps v1.13.11 to v1.13.10, and main's history helper then reverses v1.13.10 and v1.13.9 to the pinned v1.13.8 digest. The text below describes the v1.13.10 numbering as built on 2026-10-14.
+
 Built 2026-10-13 as an unreleased v1.13.9 draft; #774 then shipped a different v1.13.9 (entered-cash label
 and holding UTC provenance), so this change was re-applied on top of it as v1.13.10 on 2026-10-14. The
 designed regions are byte-identical apart from the version words.

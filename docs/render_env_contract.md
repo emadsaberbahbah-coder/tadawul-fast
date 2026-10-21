@@ -159,6 +159,7 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_PA_PROTECT_SUKUK` | `1` | sukuk never a SELL leg (D-9) | yes; armed when unset | toggle | no | not recorded |
 | `TFB_TRACK_CA_LEDGER` | `1` | confirmed CA forces verification | yes; armed when unset | toggle | no | not recorded |
 | `TFB_SR_TRANSIENT_RETRY` | `1` | sheets reads retry transient transport errors | yes; armed when unset | toggle | no | not recorded |
+| `TFB_SR_THREAD_LOCAL_SERVICE` | `1` | sheets reader builds one Google service per thread | yes; armed when unset | toggle | no | not recorded |
 | `TFB_BACKTEST_KSA_YF` | `0` | deep history unblocks hypothesis backtest | no | toggle | no | not recorded |
 | `TFB_BACKTEST_NONOVERLAP` | `0` | non-overlapping windows (honest t-stat) | no | toggle | no | not recorded |
 | `TFB_BACKTEST_DSR_GATE` | `0` | deflated-Sharpe penalty on acceptance | no | toggle | no | not recorded |

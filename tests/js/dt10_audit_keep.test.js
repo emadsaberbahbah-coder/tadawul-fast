@@ -1,7 +1,9 @@
 /* tests/js/dt10_audit_keep.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.13.10 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 16_Decision_Top10.gs v1.13.11 HELD SEATS KEPT IN THE WRITTEN AUDIT.
  * VERSION 1.1.0 (2026-10-14): renumbered with the cockpit (v1.13.9 draft ->
  * v1.13.10 over #774's v1.13.9); base copies are now v1.13.9. No case changed.
+ * 2026-10-21: renumbered v1.13.11 over #810's v1.13.10; base copies are now
+ * main's v1.13.10 (git show 55b47f24:apps_script/16_Decision_Top10.gs).
  * VERSION 1.0.0 (2026-10-13).
  *
  * WHY: the 2026-10-13 20:37 Riyadh Top_10 export rendered six grace-held
@@ -232,7 +234,7 @@ test('K1 reader: exact on (trimmed, any case) arms; every other word, empty or a
   assert.equal(load(source, {}).DT10_AUDIT_KEEP_PROP, KEEP);
   assert.equal(load(source, {}).DT10_AUDIT_KEEP_MAX, 60);
 });
-test('K1 property failure reads as off (fail-open to the v1.13.9 body); one memoized read', () => {
+test('K1 property failure reads as off (fail-open to the base body); one memoized read', () => {
   assert.equal(load(source, {}, {propsThrow: true}).dt10AuditKeepOn_(), false);
   const props = {[KEEP]: 'on'}, ctx = load(source, props);
   for (let i = 0; i < 3; i++) assert.equal(ctx.dt10AuditKeepOn_(), true);
@@ -286,14 +288,14 @@ test('K5 REAL refresh, on with no members or an unparsable state: body as off', 
 const {HEADER_REGION, FN_REGION, CALL_REGION, stripDesigned} = require('./dt10_audit_keep_regions.js');
 
 if (baseSource) {
-  test('D1 off: POST bodies equal the v1.13.9 base (with and without a stability state)', () => {
+  test('D1 off: POST bodies equal the base copy (with and without a stability state)', () => {
     for (const props of [{}, {[STAB]: stabState()}, {[STAB]: stabState(), [KEEP]: 'off'}]) {
       const a = refresh(source, Object.assign({}, props)), b = refresh(baseSource, Object.assign({}, props));
       assert.deepEqual(a.calls, b.calls);
       assert.deepEqual(a.tables, b.tables);
     }
   });
-  test('D2 every changed line lies inside a designed v1.13.10 region; regions are exact text', () => {
+  test('D2 every changed line lies inside a designed v1.13.11 region; regions are exact text', () => {
     assert.equal(stripDesigned(source), baseSource);
     assert.equal((FN_REGION.match(/^function /mg) || []).length, 2, 'two top-level functions');
     assert.ok(/^[\x00-\x7f]*$/.test(HEADER_REGION + FN_REGION + CALL_REGION), 'designed regions are ASCII');

@@ -1,5 +1,19 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.3 (2026-10-20) -- OWNER OPT-IN SCHEDULED MATURITY AUDIT
+# WHY (2026-10-20 export): a record matures only on a quote from its exact
+# target session (track_performance _outcome_target_session: "never use a later
+# session"), so a target session this clock does not audit within about a day is
+# never measured. Since 1.0.1 schedules record only: no record has matured since
+# 2026-10-10, 3,208 ACTIVE records are past their target date, and the S-1
+# criterion-4 row (written only under --audit) has been stale since 11 Oct, so
+# S-1 cannot pass. WHAT: repository Variable TRACK_SCHEDULED_AUDIT (default '0'
+# = 1.0.2 behaviour). '1' makes a SCHEDULED run pass --audit, and only while the
+# matured-duplicate guard measures or enforces (TRACK_DEDUP_MATURED observe |
+# enforce), the guard 1.0.1 waited for; otherwise the run stays record-only and
+# warns. Manual dispatch is unchanged (run_audit=true still required). Only this
+# lane audits on schedule; daily_sync's tracker step stays record-only.
+# Rollback: unset TRACK_SCHEDULED_AUDIT (or set 0).
 # VERSION 1.0.2 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
 # WHY (2026-10-13): pinned before ubuntu-latest moves on 19 Oct 2026; labels only (ci.yml v1.1.13).
 # VERSION 1.0.1 (2026-10-12) -- SCHEDULED RECORDING WITHOUT HISTORICAL AUDIT
@@ -275,6 +289,8 @@ jobs:
           TFB_CHECKOUT_SHA: ${{ steps.source_checkout.outputs.commit }}
           INPUT_SIGNAL_HISTORY_MODE: ${{ github.event.inputs.signal_history_mode }}
           INPUT_RUN_AUDIT: ${{ github.event.inputs.run_audit }}
+          # (2026-10-20) 1.0.3: owner opt-in scheduled maturity audit; '0' = record-only schedules (1.0.2).
+          TRACK_SCHEDULED_AUDIT: ${{ vars.TRACK_SCHEDULED_AUDIT || '0' }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
@@ -399,7 +415,15 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "${INPUT_RUN_AUDIT:-}" == "true" ]]; then
             AUDIT_FLAG="--audit"
             AUDIT_ENABLED=true
+          elif [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "${TRACK_SCHEDULED_AUDIT:-0}" == "1" && ( "${TRACK_DEDUP_MATURED:-off}" == "observe" || "${TRACK_DEDUP_MATURED:-off}" == "enforce" ) ]]; then
+            # 1.0.3: owner opt-in scheduled maturity audit (see the header).
+            AUDIT_FLAG="--audit"
+            AUDIT_ENABLED=true
+            echo "::notice::Scheduled maturity audit: TRACK_SCHEDULED_AUDIT=1, TRACK_DEDUP_MATURED=${TRACK_DEDUP_MATURED}."
           else
+            if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" && "${TRACK_SCHEDULED_AUDIT:-0}" == "1" ]]; then
+              echo "::warning::TRACK_SCHEDULED_AUDIT=1 ignored: set TRACK_DEDUP_MATURED to observe (or enforce) first."
+            fi
             # Schedules and absent/false inputs record prospectively. Override
             # inherited app defaults so --analyze cannot publish old outcomes.
             export TRACK_AUDIT=0
