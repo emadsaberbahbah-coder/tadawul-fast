@@ -2,8 +2,16 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.154.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.155.0
 ================================================================================
+
+WHY v5.155.0 - P-180 SUFFIX LOCALE COMPLETION (.VN / .PH)
+- _SUFFIX_TO_LOCALE gains .VN (HOSE/VND) and .PH (PSE/PHP): the identity guard
+  already expected those currencies, so every EODHD-priced .VN row was stamped
+  NASDAQ/NYSE + USD by the fallback and quarantined as "Identity unverified"
+  (26/27 Vietnam rows BLOCKED in the 2026-10-17 and 10-18 exports). Table
+  entries only - no flag, no gate, no scoring change; every other suffix is
+  byte-identical.
 
 WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
 - Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
@@ -4154,7 +4162,8 @@ from core.financial_units import (
 # v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
 # non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
 # never ranked, never funded.
-__version__ = "5.154.0"
+# v5.155.0 (P-180): .VN / .PH added to _SUFFIX_TO_LOCALE (identity-guard parity).
+__version__ = "5.155.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -15012,6 +15021,15 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     ".LM":    ("Lima", "PEN", "Peru"),
     ".PR":    ("PSE", "CZK", "Czech Republic"),
     ".SN":    ("Santiago", "CLP", "Chile"),
+    # v5.155.0 (P-180): the identity guard (core/analysis/identity_guard.py
+    # SUFFIX_CURRENCY) already expects VND for .VN and PHP for .PH, but this
+    # table had neither, so _infer_exchange/_infer_currency stamped
+    # NASDAQ/NYSE + USD on every EODHD-priced .VN row and the guard then
+    # quarantined the row (live 2026-10-17/18 Global_Markets: 26/27 .VN rows
+    # BLOCKED "Identity unverified"). Entries only; no behaviour change for
+    # any other suffix. Exchange labels follow the sheet's own convention.
+    ".VN":    ("HOSE", "VND", "Vietnam"),
+    ".PH":    ("PSE Philippines", "PHP", "Philippines"),
 }
 
 _US_COUNTRY_TOKENS: Set[str] = {
