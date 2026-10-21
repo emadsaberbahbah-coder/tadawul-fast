@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.45.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.47.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1584,7 +1584,75 @@ from urllib.error import HTTPError, URLError
 # TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
 # identities, preserving successive states and refusing writes without a
 # readable identity index. Legacy and WP-7 measurement modes stay available.
-SCRIPT_VERSION = "6.45.0"
+# -----------------------------------------------------------------------------
+# v6.47.0 (2026-10-21) - HISTORICAL TARGET-SESSION CLOSE (TRACK_HIST_TARGET_CLOSE,
+# DEFAULT OFF = v6.45.0 byte-identical apart from the version string). 6.45.1,
+# 6.45.2 and 6.46.0 are claimed by open PRs #785, #795 and #809, so this build
+# takes 6.47.0; whichever lands second re-numbers.
+# -----------------------------------------------------------------------------
+# EVIDENCE. Since v6.43.0 a record matures only on a quote from its exact
+# target session (_outcome_target_session: "never use a later session"). Once
+# that session has passed, every later audit holds a later session's quote,
+# the reason is 'quote_outside_target_session', and the record stays ACTIVE
+# with no realized ROI for good: only 'price_unavailable' can EXPIRE, and
+# _outcome_quote_session refuses any older quote as 'quote_session_stale'.
+# Live: TFB Acceptance job 119219926330 (2026-10-21) prints 'D10-3b ... FAIL
+# 3208 records=23529 active=11606 matured=11791'; matured has been 11,791 since
+# about 10 Oct (Performance Clock job 118841772740). Arming #805
+# (TRACK_SCHEDULED_AUDIT=1) stops new losses only when a run lands inside the
+# target session's window; its own commit sheet says the 12-20 Oct target
+# sessions "stay unmeasured". The run start times (14:26-20:49Z) also miss the
+# US close on some weekdays, so the matured cohort is skewed by market.
+# docs/reviews/witnessed-outcomes-20261009.md names the follow-up: a separately
+# witnessed historical target-close price path, with corporate-action
+# endpoints bound to that same time.
+# WHAT CHANGED (gate TRACK_HIST_TARGET_CLOSE = off (DEFAULT) | observe |
+# enforce; exact words, anything else -> off):
+#   off     -> nothing new runs: no pull, no log line, no receipt key.
+#   observe -> for each ACTIVE record whose reason is exactly
+#              'quote_outside_target_session' (a current witnessed quote exists,
+#              so the target session and its close are known), fetch that
+#              session's daily close and LOG ONLY one line
+#              '[HIST-CLOSE v6.47.0] mode=observe candidates=N witnessed=K
+#              (by horizon) refused=M (reasons) pulls=P deferred=D'. Records,
+#              Notes and every sheet are unchanged.
+#   enforce -> the same evidence becomes an OutcomePrice (quote_kind
+#              'historical_daily_close', provider 'yfinance-history', quote_asof
+#              = the target session's close) and the record continues down the
+#              UNCHANGED maturation path: CA-GUARD (ledger factor and adjusted
+#              series both bound to the same target session), WIN/LOSS and the
+#              [OUTCOME-WITNESS v1] receipt, which also carries hist_bar_date,
+#              hist_provider and the current quote it replaced. The ROI is
+#              recomputed from the bar close BEFORE the CA-GUARD reads it, so
+#              no record matures on today's price. A refused record stays
+#              ACTIVE with its v6.45.0 reason and a hist_close_reason in the
+#              receipt.
+#   REFUSALS (the record stays ACTIVE, never EXPIRED): no bars, no bar dated the
+#   target session, conflicting closes that day, a close that is not finite or
+#   not positive, a Stock Splits event (or an unreadable split cell) dated after
+#   the target session (Yahoo back-adjusts Close for splits), a confirmed
+#   _Corporate_Actions entry dated after it, a close 10x or more away from the
+#   current witnessed quote (currency subunit or wrong instrument), or the pull
+#   budget spent (TRACK_HIST_CLOSE_BUDGET distinct symbols, default 60;
+#   TRACK_HIST_CLOSE_TIME_SEC, default 240). The pull has its own cache and
+#   budget; _CA_BARS_CACHE (ADJUSTED bars) and _CA_BUDGET are never touched.
+#   No new EXPIRE path. Only 'quote_outside_target_session' triggers it:
+#   'quote_session_stale' carries no target-session context.
+# ENV LANE: GitHub Actions, .github/workflows/track_performance.yml 'Run
+#   performance clock' only (${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}).
+#   daily_sync.yml audits only on manual dispatch and is not changed; a maturity
+#   written by this lane is not undone by the other lane's record-only save.
+# KNOWN LIMITS: a record whose symbol has no current witnessed quote is not a
+#   candidate. maturity_date is the audit time, as for every maturity. The
+#   embedded self-test is unchanged (22 cases); tests/
+#   test_tracker_hist_target_close.py carries the coverage.
+# ZERO functions removed. Additions: _hist_target_close_mode,
+#   _hist_close_budget, _hist_close_time_sec, _hist_close_pull,
+#   _hist_close_bars, _hist_target_close, _hist_close_evidence (+ the
+#   _HIST_CLOSE_CACHE / _HIST_CLOSE_BUDGET / _LAST_HIST_CLOSE dicts).
+# ROLLBACK: unset TRACK_HIST_TARGET_CLOSE (or set off). Records already matured
+#   under enforce keep their receipts (hist_bar_date marks them).
+SCRIPT_VERSION = "6.47.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3536,6 +3604,178 @@ def _ca_adjusted_roi(symbol: str, entry_date: Any, target_session: Optional[str]
     except Exception:
         return None
 
+
+# v6.47.0 - HISTORICAL TARGET-SESSION CLOSE (TRACK_HIST_TARGET_CLOSE)
+# =============================================================================
+# A record whose target session closed before any audit priced it stays
+# ACTIVE for good: every later audit holds a LATER session's quote, which
+# _outcome_target_session refuses as 'quote_outside_target_session'. These
+# helpers fetch the close of EXACTLY that target session from a separate
+# daily-bar pull. They use their own cache and budget; _CA_BARS_CACHE and
+# _CA_BUDGET hold ADJUSTED bars for the CA-GUARD and are never touched here.
+_HIST_CLOSE_TAG = "[HIST-CLOSE v6.47.0]"
+_HIST_CLOSE_PROVIDER = "yfinance-history"
+_HIST_CLOSE_KIND = "historical_daily_close"
+_HIST_CLOSE_CACHE: Dict[str, Any] = {}       # per-run yahoo symbol -> bars
+_HIST_CLOSE_BUDGET: Dict[str, Any] = {"pulls": 0, "t0": 0.0, "deferred": 0}
+_LAST_HIST_CLOSE: Dict[str, Any] = {}        # read-back of the last audit pass
+
+
+def _hist_target_close_mode() -> str:
+    """v6.47.0: TRACK_HIST_TARGET_CLOSE off (DEFAULT) | observe | enforce.
+    Exact words, case/space-insensitive; anything else (including '1') is
+    off, so an unset or mistyped Variable can never mature a record."""
+    v = (os.getenv("TRACK_HIST_TARGET_CLOSE") or "off").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _hist_close_budget() -> int:
+    """v6.47.0: max distinct symbol pulls per audit pass (0 = unlimited)."""
+    try:
+        return max(0, int(float(os.getenv("TRACK_HIST_CLOSE_BUDGET") or "60")))
+    except Exception:
+        return 60
+
+
+def _hist_close_time_sec() -> float:
+    """v6.47.0: wall-clock budget for historical-close pulls (0 = unlimited)."""
+    try:
+        return max(0.0, float(os.getenv("TRACK_HIST_CLOSE_TIME_SEC") or "240"))
+    except Exception:
+        return 240.0
+
+
+def _hist_close_pull(symbol: str) -> List[Dict[str, Any]]:
+    """v6.47.0: ONE yfinance daily pull, auto_adjust=False, with split events.
+    Each bar is {"date", "close", "split"}; 'close' is Yahoo's Close (split
+    back-adjusted, NOT dividend-adjusted, so a price ROI against a raw entry
+    print stays a price ROI) and 'split' is the Stock Splits ratio (0 = no
+    event). Returns [] on any failure (fail-soft: the record stays ACTIVE)."""
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return []
+    try:
+        df = yf.Ticker(_yf_ticker(symbol)).history(period="1y", interval="1d",
+                                                  auto_adjust=False, actions=True)
+    except Exception:
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for idx, r in df.iterrows():
+        try:
+            split = r.get("Stock Splits", 0.0)
+            rows.append({"date": idx.strftime("%Y-%m-%d"), "close": float(r["Close"]),
+                         "split": float(0.0 if split is None else split)})
+        except Exception:
+            continue
+    return rows
+
+
+def _hist_close_bars(symbol: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """v6.47.0: per-run cached bars, or (None, reason) when the budget defers
+    the pull. An exhausted budget DEFERS (the record stays ACTIVE and is
+    retried next pass); it never manufactures a refusal or an expiry."""
+    key = _yahoo_symbol(symbol)
+    if not key:
+        return None, "hist_close_unavailable"
+    if key in _HIST_CLOSE_CACHE:
+        return _HIST_CLOSE_CACHE[key], ""
+    if _HIST_CLOSE_BUDGET["t0"] == 0.0:
+        _HIST_CLOSE_BUDGET["t0"] = time.time()
+    b = _hist_close_budget()
+    t = _hist_close_time_sec()
+    if (b and _HIST_CLOSE_BUDGET["pulls"] >= b) or (
+            t and (time.time() - _HIST_CLOSE_BUDGET["t0"]) > t):
+        _HIST_CLOSE_BUDGET["deferred"] += 1
+        return None, "hist_close_budget_exhausted"
+    bars = _hist_close_pull(symbol)
+    _HIST_CLOSE_BUDGET["pulls"] += 1
+    _HIST_CLOSE_CACHE[key] = bars or []
+    return _HIST_CLOSE_CACHE[key], ""
+
+
+def _hist_target_close(bars: Any, target_session: str,
+                       reference_price: Optional[float] = None) -> Tuple[Optional[float], str]:
+    """v6.47.0 PURE (no I/O, never raises): the close of EXACTLY the target
+    session, or (None, reason). Refuses, so the record stays ACTIVE, on:
+      no bars at all              hist_close_unavailable
+      no bar dated target_session hist_close_bar_missing
+      >1 distinct close that day  hist_close_bar_conflict
+      close not finite or <= 0    hist_close_invalid
+      a split/bonus event (or an unreadable split cell) dated after the
+      target session - Yahoo back-adjusts Close for splits, so that close
+      would no longer be in the entry print's share units
+                                  hist_close_post_target_split
+      close vs the current witnessed quote off by 10x or more (a currency
+      subunit such as GBp/ZAc/ILA, or a wrong instrument)
+                                  hist_close_scale_mismatch"""
+    try:
+        datetime.strptime(target_session, "%Y-%m-%d")
+        usable = [bar for bar in bars or [] if isinstance(bar, dict)]
+        if not usable:
+            return None, "hist_close_unavailable"
+        endings = [bar for bar in usable if _safe_str(bar.get("date"))[:10] == target_session]
+        if not endings:
+            return None, "hist_close_bar_missing"
+        closes = set()
+        for bar in endings:
+            raw = bar.get("close")
+            if isinstance(raw, bool) or raw is None:
+                return None, "hist_close_invalid"
+            closes.add(float(raw))
+        if len(closes) != 1:
+            return None, "hist_close_bar_conflict"
+        close = next(iter(closes))
+        if not math.isfinite(close) or close <= 0:
+            return None, "hist_close_invalid"
+        for bar in usable:
+            if _safe_str(bar.get("date"))[:10] > target_session:
+                split = bar.get("split", 0.0)
+                try:
+                    split = float(0.0 if split is None else split)
+                except (TypeError, ValueError):
+                    split = float("nan")
+                if not math.isfinite(split) or split not in (0.0, 1.0):
+                    return None, "hist_close_post_target_split"
+        if reference_price is not None:
+            ref = float(reference_price)
+            if math.isfinite(ref) and ref > 0 and max(close / ref, ref / close) >= 10.0:
+                return None, "hist_close_scale_mismatch"
+        return close, ""
+    except Exception:
+        return None, "hist_close_invalid"
+
+
+def _hist_close_evidence(record: Any, context: Dict[str, Any], current: OutcomePrice,
+                         now: datetime) -> Tuple[Optional[OutcomePrice], str]:
+    """v6.47.0: value-bound evidence for the target-session close of a record
+    the current quote can no longer mature. Only called for
+    'quote_outside_target_session', whose context already names the witnessed
+    target session and its close. A confirmed _Corporate_Actions entry dated
+    after the target session refuses too (the ledger and the bars must agree
+    on the share units of that close). Never raises."""
+    try:
+        session = _safe_str(context.get("target_session"))
+        quote_session = _safe_str(context.get("quote_session"))
+        close_at = _outcome_timestamp(context.get("target_session_close"))
+        if not session or close_at is None or not quote_session or quote_session <= session:
+            return None, "hist_close_context_unknown"
+        if close_at > now:
+            return None, "hist_close_context_unknown"
+        if _ca_ledger_factor(record.symbol, session) is not None:
+            return None, "hist_close_post_target_action"
+        bars, reason = _hist_close_bars(record.symbol)
+        if reason:
+            return None, reason
+        close, reason = _hist_target_close(bars, session, current.price)
+        if reason:
+            return None, reason
+        return OutcomePrice(record.symbol, float(close), _HIST_CLOSE_PROVIDER,
+                            _utc_now(), close_at, _HIST_CLOSE_KIND), ""
+    except Exception:
+        return None, "hist_close_unavailable"
 
 
 # v6.22.0 — CA-GUARD ledger layer (confirmed `_Corporate_Actions` truth)
@@ -9287,6 +9527,15 @@ class PerformanceTrackerApp:
         _CA_BARS_CACHE.clear()   # v6.37.0: per-run cache + budget reset
         _CA_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
         _loop_i = 0
+        # v6.47.0 [HIST-CLOSE]: 'off' (DEFAULT) runs nothing new below.
+        _hist_mode = _hist_target_close_mode()
+        _hist_stats: Dict[str, Any] = {}
+        _hist_used: List[Any] = []
+        if _hist_mode != "off":
+            _HIST_CLOSE_CACHE.clear()
+            _HIST_CLOSE_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
+            _hist_stats = {"mode": _hist_mode, "candidates": 0, "witnessed": 0,
+                           "by_horizon": {}, "refused": {}}
 
         for r in active:
             _loop_i += 1
@@ -9320,6 +9569,42 @@ class PerformanceTrackerApp:
                     _outcome_reason = "entry_price_invalid"
                 elif _roi_nonfinite:
                     _outcome_reason = "outcome_roi_nonfinite"
+                if (_hist_mode != "off" and _evidence is not None
+                        and _outcome_reason == "quote_outside_target_session"):
+                    # v6.47.0 [HIST-CLOSE]: the target session closed before
+                    # any audit priced it. Only THAT session's own close may
+                    # stand in; observe counts, enforce matures on it.
+                    _hist_stats["candidates"] += 1
+                    _hist_ev, _hist_reason = _hist_close_evidence(r, _context, _evidence, now_r)
+                    _hist_roi = (float("nan") if _hist_ev is None
+                                 else (_hist_ev.price / r.entry_price - 1.0) * 100.0)
+                    if _hist_ev is not None and not math.isfinite(_hist_roi):
+                        _hist_ev, _hist_reason = None, "hist_close_invalid"
+                    if _hist_ev is None:
+                        _hist_stats["refused"][_hist_reason] = _hist_stats["refused"].get(_hist_reason, 0) + 1
+                        if _hist_mode == "enforce":
+                            _context = dict(_context, hist_close_reason=_hist_reason)
+                    else:
+                        _hist_stats["witnessed"] += 1
+                        _hk = r.horizon.value
+                        _hist_stats["by_horizon"][_hk] = _hist_stats["by_horizon"].get(_hk, 0) + 1
+                        if _hist_mode == "enforce":
+                            _entry_at = _outcome_timestamp(r.date_recorded)
+                            _context = dict(
+                                _context, quote_session=_context["target_session"],
+                                current_quote_session=_context.get("quote_session"),
+                                current_quote_price=_evidence.price,
+                                current_quote_asof=_evidence.quote_asof.isoformat(),
+                                hist_bar_date=_context["target_session"],
+                                hist_provider=_hist_ev.provider,
+                                actual_horizon_days=((_hist_ev.quote_asof - _entry_at).total_seconds() / 86400.0
+                                                     if _entry_at is not None else None))
+                            _evidence = _hist_ev
+                            px = _hist_ev.price
+                            r.current_price = px
+                            r.unrealized_roi = _hist_roi
+                            _outcome_reason = ""
+                            _hist_used.append(r)
                 if _outcome_reason:
                     # Known price with an unknown/wrong target basis remains
                     # ACTIVE even beyond grace. Never invent a target close.
@@ -9451,6 +9736,21 @@ class PerformanceTrackerApp:
                 len(_expired_syms),
                 f" ({', '.join(_expired_syms[:8])}{'…' if len(_expired_syms) > 8 else ''})" if _expired_syms else "",
             )
+
+        if _hist_mode != "off":
+            # v6.47.0 [HIST-CLOSE]: one read-back line per audit pass.
+            _hist_stats.update(
+                matured=sum(1 for _r in _hist_used if _r.status == PerformanceStatus.MATURED),
+                pulls=int(_HIST_CLOSE_BUDGET["pulls"]), deferred=int(_HIST_CLOSE_BUDGET["deferred"]))
+            logger.warning(
+                "%s mode=%s candidates=%d witnessed=%d (%s) matured=%d refused=%d (%s) pulls=%d deferred=%d",
+                _HIST_CLOSE_TAG, _hist_mode, _hist_stats["candidates"], _hist_stats["witnessed"],
+                " ".join("%s:%d" % kv for kv in sorted(_hist_stats["by_horizon"].items())) or "-",
+                _hist_stats["matured"], sum(_hist_stats["refused"].values()),
+                " ".join("%s:%d" % kv for kv in sorted(_hist_stats["refused"].items())) or "-",
+                _hist_stats["pulls"], _hist_stats["deferred"])
+            _LAST_HIST_CLOSE.clear()
+            _LAST_HIST_CLOSE.update(_hist_stats)
 
         # v6.20.0 (VT-1): stash this pass's feed stats for the verdict line.
         try:
