@@ -2,6 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.30 (2026-10-22) -- DT10 BULK RENDER FORMATTING
+#
+# v1.1.30: run tests/js/dt10_bulk_format.test.js in the blocking lean lane's
+# native Apps Script step. WHY (21 Oct): the Top-10 refresh after the first
+# decision-feed release hit the Apps Script 6-minute limit while painting
+# formats cell by cell; B2 stayed 'running' and the next scheduled release
+# check withdrew the release. 16_Decision_Top10.gs v1.13.11 writes the same
+# formats in bulk. The harness runs the reviewed v1.13.10 file (rebuilt
+# from the delivered one by reversing only the enumerated v1.13.11 edits,
+# SHA-256 pinned) as its oracle against a cell-model sheet and requires an
+# identical painted cockpit with bounded call counts. Offline fakes only.
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.29 (2026-10-21) -- SYNC TRUTH AND SHEETS TRANSPORT
 #
 # v1.1.29 (1.1.28 is PR #809): run in the blocking lean lane
@@ -784,6 +797,7 @@ jobs:
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js
+          node tests/js/dt10_bulk_format.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py

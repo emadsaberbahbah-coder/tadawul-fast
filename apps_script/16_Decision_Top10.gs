@@ -1,11 +1,36 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.10 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)
+ * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10
+ * refresh that followed the first decision-feed release logged 'upstream
+ * verdict: EXECUTABLE; final board: HELD' at 23:48:42 Riyadh and was
+ * killed at 23:50:59 ('Exceeded maximum execution time') before it wrote
+ * its status line. B2 stayed 'running', the next scheduled release check
+ * read T10_STATUS_NOT_OK and withdrew the release (decision_failed). The
+ * 19:40 run was killed the same way; completed runs took 127-232 s. The
+ * render painted formats cell by cell: one setBackground per zebra row in
+ * dt10WriteTable_, and setBackground + setFontColor + setFontWeight per
+ * coloured cell in dt10ColorVerdicts_, dt10ColorQualified_ and
+ * dt10ColorStability_ -- about 1,750 range calls for the 500-row CANDIDATES
+ * grid alone, each one slower while other scripts write the workbook.
+ * WHAT: the same formats are written in bulk. dt10WriteTable_ reads the
+ * body backgrounds once, sets the zebra rows and writes them back once.
+ * The three colourers build one token per row and call the new
+ * dt10BulkPaint_, which reads backgrounds, font colours and font weights
+ * once, sets tok.bg / tok.fg / bold on the token rows and writes each
+ * attribute once (nothing is read or written when no row has a token).
+ * Rows the old loops left alone keep their current format (read back and
+ * written unchanged), so the painted board is the same. Values, verdicts,
+ * withholding, funding, stability, receipts and the status line are
+ * unchanged. Harness: tests/js/dt10_bulk_format.test.js (cell-model
+ * equivalence against the v1.13.10 code, bounded call counts).
  *
  * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE
  * (1) dt10HoldingFromRow_ upper-cased the currency before the FX lookup, so
@@ -1777,7 +1802,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.10';
+var DT10_VERSION = '1.13.11';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -6874,11 +6899,15 @@ function dt10WriteTable_(sheet, row, headers, dataRows, emptyText) {
   }
   sheet.getRange(row, 1, dataRows.length, headers.length).setValues(dataRows);
   // Body text in proposal ink; alternate rows in the proposal zebra tint.
-  sheet.getRange(row, 1, dataRows.length, headers.length)
-      .setFontColor(DT10_INK);
+  var body = sheet.getRange(row, 1, dataRows.length, headers.length);
+  body.setFontColor(DT10_INK);
+  // v1.13.11: one read + one write instead of one call per zebra row; the
+  // other rows keep the background they already had.
+  var zebra = body.getBackgrounds();
   for (var i = 0; i < dataRows.length; i += 2) {
-    sheet.getRange(row + i, 1, 1, headers.length).setBackground(DT10_ZEBRA);
+    for (var zc = 0; zc < headers.length; zc++) zebra[i][zc] = DT10_ZEBRA;
   }
+  body.setBackgrounds(zebra);
   sheet.getRange(row - 1, 1, dataRows.length + 1, headers.length)
       .setBorder(true, true, true, true, true, true, DT10_BORDER,
                  SpreadsheetApp.BorderStyle.SOLID);
@@ -6904,7 +6933,8 @@ function dt10TintGraceRows_(sheet, firstDataRow, count, selected, tokens) {
  *  ACTIVE/NEW -> positive green; GRACE/FAST-TRACK -> watch amber. */
 function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
-  var vals = sheet.getRange(firstDataRow, col, count, 1).getValues();
+  var rng = sheet.getRange(firstDataRow, col, count, 1);
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6913,17 +6943,40 @@ function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
     } else if (v.indexOf('GRACE') === 0 || v.indexOf('FAST-TRACK') === 0) {
       tok = tokens.VERDICT_WATCH;
     }
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
+}
+/** v1.13.11: paint a one-column range from per-row tokens in bulk. toks[i]
+ * is a {bg, fg} token or null. A token row gets tok.bg, tok.fg and bold,
+ * exactly what the per-cell setBackground/setFontColor/setFontWeight calls
+ * wrote; a null row keeps its current background, font colour and weight
+ * (read back and written unchanged). One read and one write per attribute;
+ * nothing is read or written when no row has a token. */
+function dt10BulkPaint_(rng, toks) {
+  var any = false;
+  for (var a = 0; a < toks.length; a++) {
+    if (toks[a]) { any = true; break; }
+  }
+  if (!any) return;
+  var bg = rng.getBackgrounds(), fg = rng.getFontColors(),
+      fw = rng.getFontWeights();
+  for (var i = 0; i < toks.length; i++) {
+    var tok = toks[i];
+    if (!tok) continue;
+    bg[i][0] = tok.bg === undefined ? null : tok.bg;
+    fg[i][0] = tok.fg === undefined ? null : tok.fg;
+    fw[i][0] = 'bold';
+  }
+  rng.setBackgrounds(bg);
+  rng.setFontColors(fg);
+  rng.setFontWeights(fw);
 }
 /** Verdict/conf cell coloring via §3.4 tokens on a written table column. */
 function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
   var rng = sheet.getRange(firstDataRow, col, count, 1);
-  var vals = rng.getValues();
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6931,11 +6984,9 @@ function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
     else if (v === 'WATCH') tok = tokens.VERDICT_WATCH;
     else if (v === 'DO_NOT_INVEST') tok = tokens.VERDICT_NEGATIVE;
     else if (v) tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
 }
 function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
   if (firstDataRow < 0 || !count) return;
@@ -6956,17 +7007,16 @@ function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
                              tokens) {
   if (firstDataRow < 0 || !count) return;
+  var toks = [];
   for (var i = 0; i < count; i++) {
     var c = qualified[i] || {};
     var tok;
     if (c.selected === true) tok = tokens.VERDICT_POSITIVE;
     else if (dt10HasValue_(c.deferral)) tok = tokens.VERDICT_WATCH;
     else tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(sheet.getRange(firstDataRow, col, count, 1), toks);   // v1.13.11
 }
 // ---------------------------------------------------------------------------
 // Main refresh
