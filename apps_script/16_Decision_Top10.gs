@@ -1,11 +1,29 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.9 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.10 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE
+ * (1) dt10HoldingFromRow_ upper-cased the currency before the FX lookup, so
+ * a GBp (pence) holding converted at the GBP rate (100x too large). The new
+ * dt10HoldingFxRate_ mirrors opportunity_builder._resolve_fx (USX gate off):
+ * GBX/GBp, ZAC/ZAc, ILA/ILa are detected on the RAW token and use an exact
+ * raw FX key, else parent / 100. USX keeps needing its own 'USX' FX row.
+ * (2) A currency with no FX rate kept its NATIVE value labelled value_sar.
+ * It now sends value_sar null and marks holdings_input_incomplete, so
+ * funding stays withheld; the builder never sums a native amount as SAR.
+ * (3) refreshDecisionTop10 wrote 'running...' and a throw left it there
+ * (20 Oct: cockpit stuck RUNNING, no grid, validation failed). The body is
+ * now dt10RefreshDecisionTop10Run_; on a throw dt10RefreshFailed_ writes
+ * 'status: FAILED | failed_at_utc=<ISO Z> | <error>', upserts _Status ERROR,
+ * clears the P-195 marker, then the error is rethrown. The freshness audit
+ * reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script hard timeout
+ * (6 min) kills the script without running catch; that case still shows
+ * RUNNING and is reported by the next run's P-195 ABORTED_PREV row.
  *
  * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
  * The cash KPI echoes an entered amount and cannot certify custody or
@@ -1757,7 +1775,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.9';
+var DT10_VERSION = '1.13.10';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3054,6 +3072,31 @@ function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
 function dt10NormSym_(v) {
   return String(v === null || v === undefined ? '' : v).trim().toUpperCase();
 }
+/** v1.13.10 PURE: SAR per unit of a holding's native currency cell, mirroring
+ * opportunity_builder._resolve_fx with TFB_OPP_FX_USX_SUBUNIT off (default).
+ * Subunits are detected on the RAW token BEFORE case folding ('GBp' would
+ * otherwise fold into pounds): GBX/GBp, ZAC/ZAc, ILA/ILa (and gbx/zac/ila
+ * spellings) are 1/100 of GBP/ZAR/ILS. An exact raw key in the map wins
+ * (already per subunit); otherwise the parent rate / 100. USX is not folded
+ * here (its gate is backend-only and DEFAULT OFF): it needs its own 'USX'
+ * row, as before. Returns null for SAR/blank (no conversion), NaN when no
+ * rate exists, else the positive rate. */
+var DT10_FX_SUBUNIT_PARENT = { GBp: 'GBP', GBX: 'GBP', ZAC: 'ZAR', ZAc: 'ZAR',
+                               ILA: 'ILS', ILa: 'ILS' };
+function dt10HoldingFxRate_(cell, fx) {
+  var raw = String(cell === null || cell === undefined ? '' : cell).trim();
+  var up = raw.toUpperCase();
+  if (!raw || up === 'SAR') return null;
+  fx = fx || {};
+  var exact = Number(fx[raw]);
+  if (isFinite(exact) && exact > 0) return exact;
+  var parent = Object.prototype.hasOwnProperty.call(DT10_FX_SUBUNIT_PARENT, raw) ?
+      DT10_FX_SUBUNIT_PARENT[raw] :
+      (up === 'GBX' || up === 'ZAC' || up === 'ILA') ? DT10_FX_SUBUNIT_PARENT[up] : '';
+  var rate = Number(fx[parent || up]);
+  if (!(isFinite(rate) && rate > 0)) return NaN;
+  return parent ? rate / 100 : rate;
+}
 /** v1.5.0 (Fix H1) PURE: one My_Portfolio sheet row -> holdings entry for
  * the builder's Portfolio gate, or null. Exclusion needs symbol only;
  * sector/value are best-effort context for the builder's sector-cap math.
@@ -3075,19 +3118,20 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
   }
   extra = extra || {};
   // v1.11.4 [P-78]: a NATIVE value converts to SAR when the caller supplies a
-  // currency column and an FX map (SAR per unit). SAR rows, rows without a
-  // currency and currencies missing from the map keep the native value.
+  // currency column and an FX map (SAR per unit). SAR rows and rows without a
+  // currency keep the native value. v1.13.10: subunits resolve on the RAW
+  // token and a currency missing from the map sends value_sar null and
+  // marks the row _input_incomplete instead of a native amount labelled SAR.
   if (DT10_V1114_HOLDINGS_FX && val > 0 && extra.fx && extra.iCcy >= 0) {
-    var ccy = String(row[extra.iCcy] === null || row[extra.iCcy] === undefined ?
-                     '' : row[extra.iCcy]).trim().toUpperCase();
-    if (ccy && ccy !== 'SAR') {
-      var rate = Number(extra.fx[ccy]);
-      if (isFinite(rate) && rate > 0) {
-        val = val * rate;
-        extra._converted = (extra._converted || 0) + 1;
-      } else {
-        extra._unconverted = (extra._unconverted || 0) + 1;
-      }
+    var rate = dt10HoldingFxRate_(row[extra.iCcy], extra.fx);
+    if (rate === null) {
+      // SAR or blank currency: the value is already SAR (unchanged).
+    } else if (isFinite(rate) && rate > 0) {
+      val = val * rate;
+      extra._converted = (extra._converted || 0) + 1;
+    } else {
+      val = null;
+      extra._unconverted = (extra._unconverted || 0) + 1;
     }
   }
   var h = { symbol: sym, sector: sector || 'Unknown', value_sar: val };
@@ -3218,6 +3262,7 @@ function dt10CollectHoldings_(ss) {
     for (var r = hIdx + 1; r < values.length; r++) {
       var h = dt10HoldingFromRow_(values[r], iSym, iSec, useVal, extra);
       if (!h) continue;
+      if (h.value_sar === null) out._input_incomplete = true;   // v1.13.10: no FX
       if (seen[h.symbol]) { out._input_incomplete = true; continue; }
       if (out.length >= 500) { out._input_incomplete = true; continue; }
       seen[h.symbol] = true;
@@ -6925,8 +6970,47 @@ function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
 // Main refresh
 // ---------------------------------------------------------------------------
 function refreshDecisionTop10() {
-  var t0 = new Date().getTime();
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
+  var run = { statusCell: null };   // v1.13.10: a throw ends in FAILED
+  try {
+    dt10RefreshDecisionTop10Run_(run);
+  } catch (eRun) {
+    dt10RefreshFailed_(run, eRun);
+    throw eRun;
+  }
+}
+/** v1.13.10: a refresh that THROWS must not leave the banner at 'running...'
+ * (live 20 Oct: cockpit stuck RUNNING with no grid). Writes a terminal
+ * 'status: FAILED' line (the Riyadh 'Last run' stamp the audit parses, plus
+ * failed_at_utc and a short error), upserts cockpit _Status ERROR and clears
+ * the P-195 marker (a reported failure is not an abort). Never throws; the
+ * caller rethrows. A hard Apps Script timeout cannot be caught: that case
+ * still leaves RUNNING and is reported by the next run's P-195 check. */
+function dt10RefreshFailed_(run, err) {
+  var msg = String(err && err.message ? err.message : err)
+      .replace(/\s+/g, ' ').slice(0, 200);
+  var utc = '';
+  try { utc = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'); } catch (eIso) {}
+  try {
+    var cell = run && run.statusCell;
+    if (!cell) {
+      var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DT10_SHEET);
+      cell = sh ? sh.getRange(DT10_ROW_STATUS, 2) : null;
+    }
+    if (cell) {
+      cell.setValue(dt10StatusLine_('FAILED',
+          'failed_at_utc=' + utc + ' | ' + msg + dt10StaleNote_()));
+    }
+  } catch (eCell) {}
+  try {
+    dt10WritePageStatus_('ERROR', 'Decision cockpit: FAILED at ' + utc + ' \u2014 ' + msg,
+        '', '', '', []);
+  } catch (eSt) {}
+  try { dt10RunMarkerClear_(); } catch (eMk) {}
+  try { SpreadsheetApp.flush(); } catch (eFl) {}
+}
+function dt10RefreshDecisionTop10Run_(run) {
+  var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
   // v1.3.0 layout guard: the panel grew a row (KPI head moved 13 -> 14), so a
@@ -6938,6 +7022,7 @@ function refreshDecisionTop10() {
   }
   var tokens = dt10Tokens_(ss);
   var statusCell = sheet.getRange(DT10_ROW_STATUS, 2);
+  run.statusCell = statusCell;                              // v1.13.10
   statusCell.setValue(dt10StatusLine_('running\u2026', ''));
   SpreadsheetApp.flush();
   var panel = dt10ReadPanel_(sheet, ss);
@@ -7999,10 +8084,15 @@ function dt10SelfTest() {
                                 { iCcy: 3, fx: { USD: 3.7528 } });
   var hxD = dt10HoldingFromRow_(['PFS', 'Financials', 445.08, 'USD'], 0, 1, 2,
                                 { iCcy: 3, fx: null });
-  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; SAR/unknown/SAR-column untouched): ' +
+  var hxE = dt10HoldingFromRow_(['VOD.L', 'Telecom', 1000, 'GBp'], 0, 1, 2,
+                                { iCcy: 3, fx: { GBP: 5 } });   // v1.13.10
+  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; GBp 1000 -> 50; ' +
+      'SAR/SAR-column untouched; unknown -> null): ' +
       ((Math.abs(hxA.value_sar - 445.08) < 0.01 && hxB.value_sar === 10250 &&
-        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :
-       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));
+        hxC.value_sar === null && hxD.value_sar === 445.08 &&
+        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :
+       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +
+       hxD.value_sar + '/' + hxE.value_sar + ']'));
   var gcS = dt10StabParseState_({ v: 1, date: '2026-09-05', symbols: {
       'GHOST.US': { ci: 0, co: 1, member: true, since: '2026-09-05', ls: '', hist: [70], ft: true } } });
   var gcR = dt10StabCore_([], [], gcS, ftKnobs, 10, '2026-09-05');

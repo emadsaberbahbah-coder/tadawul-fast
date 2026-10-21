@@ -21,7 +21,17 @@ budget); each attempt re-reads column A first, so an append the API applied
 before the next read is updated in place, not duplicated. A stamp that still
 fails is an ::error:: naming the cohort consequence. Gates
 TFB_SYNC_STATUS_STAMP_RETRIES (1 = a single attempt, as in v6.70.0) and
-TFB_SYNC_STATUS_STAMP_DEADLINE_S. (6.70.1 is PR #809's KLG-READ.)
+TFB_SYNC_STATUS_STAMP_DEADLINE_S.
+
+v6.70.1 - last-good read failure is retried once and named (2026-10-21)
+================================================================================
+(Carried from PR #809, commit 7d7b429, independently reviewed.)
+SheetsWriter.read_values returns None on any API error. _keep_last_good_rows
+treated that like an empty sheet, so on 20 Oct (18:2x UTC) FW-KEEP restored
+0/149 quarantined Global_Markets rows and reported "had no last-good"; 149
+blank Names dropped the page below its 99% Name floor. The read is retried
+once (3 s); a second failure is logged as KLG-READ and FW-KEEP says "last-good
+READ FAILED". Substitution rules are unchanged.
 
 v6.70.0 - Hong Kong reporting-currency band in the identity checks (2026-10-19)
 ================================================================================
@@ -2138,6 +2148,10 @@ SCRIPT_VERSION = "6.70.2"
 #   with the cohort consequence; the function stays fail-open and the sync
 #   exit code is unchanged. GATE: TFB_SYNC_STATUS_STAMP_RETRIES (default 4;
 #   1 = a single attempt as in v6.70.0, annotated ::error:: not ::warning::).
+# v6.70.1 (2026-10-21) - KLG-READ [last-good read failure, from PR #809]:
+#   _keep_last_good_rows retries a None read_values once (3 s) and records
+#   the sheet in _LAST_KLG_READ_FAILED, so FW-KEEP reports "last-good READ
+#   FAILED" instead of "had no last-good". No substitution rule changed.
 # v6.70.0 (2026-10-19) - HK-FX [identity check, Hong Kong reporting currency]:
 #   WHY: FW-2 (_row_identity_firewall), FW-1 (_klg_old_row_identity_ok) and the
 #   L3b tripwire (_coherence_scan) test Price/EPS against the stated P/E with
@@ -5821,6 +5835,10 @@ _LAST_KLG_ID_SUSPECTS: list = []
 # no certifiable predecessor. The single-threaded call site uses this only for
 # exact freshness lineage; substitution/output behavior remains unchanged.
 _LAST_KLG_STUB_CANDIDATES: list = []
+# v6.70.1 KLG-READ: sheets whose last-good read failed after one retry
+# (read by the FW-KEEP report line; cleared by the caller before each swap).
+_LAST_KLG_READ_FAILED: list = []
+_KLG_READ_RETRY_SLEEP_SEC: float = 3.0
 # v6.29.0 B-4: per-page list of forced symbols whose old-row substitution
 # was blocked this pass (read by the call site for the report line).
 _LAST_KLG_FORCED: list = []
@@ -10491,6 +10509,22 @@ def _keep_last_good_rows(
     # v6.24.3: last-good rows past the read bound were invisible to the swap.
     _klg_block = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
     grid = sheets.read_values(spreadsheet_id, sheet_name, _klg_block) if sheets is not None else None
+    if grid is None and sheets is not None:
+        # v6.70.1 KLG-READ: read_values returns None on ANY API failure (it
+        # swallows the exception). One retry, then record the failure so the
+        # caller can tell "last-good read failed" from "no last-good row"
+        # (20 Oct 18:2x UTC: FW-KEEP restored 0/149 Global_Markets rows and
+        # the log blamed missing last-good rows).
+        time.sleep(_KLG_READ_RETRY_SLEEP_SEC)
+        grid = sheets.read_values(spreadsheet_id, sheet_name, _klg_block)
+        if grid is None:
+            _LAST_KLG_READ_FAILED.append(sheet_name)
+            logger.warning(
+                "[v%s KLG-READ] last-good read of '%s'!%s FAILED twice; "
+                "%d stub row(s) keep the fetched (empty) values.",
+                SCRIPT_VERSION, sheet_name, _klg_block,
+                len(stub_rows) + len(ff_rows),
+            )
     if not grid or not isinstance(grid, list):
         return rows_matrix, swapped
 
@@ -14177,6 +14211,7 @@ async def _run_one_task(
                     # symbols with no last-good remain stubs (correct).
                     if _fw_keep_last_good_enabled() and sheets is not None:
                         _fwk_restored: List[str] = []
+                        _LAST_KLG_READ_FAILED.clear()
                         try:
                             rows_matrix, _fwk_restored = _keep_last_good_rows(
                                 sheets, spreadsheet_id, task.sheet_name,
@@ -14208,11 +14243,14 @@ async def _run_one_task(
                                 f": {', '.join(_unrest_syms[:15])}"
                                 f"{'…' if len(_unrest_syms) > 15 else ''}"
                             ) if _unrest_syms else ""
+                            _why = ("last-good READ FAILED, left as stub"
+                                    if task.sheet_name in _LAST_KLG_READ_FAILED
+                                    else "had no last-good (left as stub)")
                             _kw = (
                                 f"[v6.25.1 FW-KEEP] '{task.sheet_name}': restored "
                                 f"{len(_fwk_set)}/{len(_idfw_stripped)} quarantined "
                                 f"row(s) from last-good"
-                                f"{f'; {_unrest} had no last-good (left as stub){_unrest_txt}' if _unrest else ''}."
+                                f"{f'; {_unrest} {_why}{_unrest_txt}' if _unrest else ''}."
                             )
                             res.warnings.append(_kw)
                             logger.warning(_kw)
