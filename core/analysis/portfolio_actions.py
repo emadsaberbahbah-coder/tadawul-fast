@@ -822,7 +822,13 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.16.0"
+# v1.16.1 (2026-10-22) [FRAC-QTY]: _sell_side_deltas floors a fractional
+#   holding to whole shares (round() could sell 11 of 10.6 held) and prices a
+#   share at market_value / true quantity, so the 0.6 left after an EXIT shows
+#   in post_trade_weight_pct. The delta stays a signed INTEGER (the
+#   10_My_Portfolio contract); a holding under one share stays blank.
+#   Tests: tests/test_pf_weight_value_complete.py.
+PORTFOLIO_ACTIONS_VERSION = "1.16.1"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3233,11 +3239,16 @@ def _sell_side_deltas(entries, ctl, total_value):
                 continue
             cand = e.get("cand") or {}
             qraw = cand.get("quantity")
-            q = int(round(float(qraw))) if qraw not in (None, "") else 0
+            # v1.16.1 [FRAC-QTY]: whole shares never exceed the holding
+            # (floor, not round: 10.6 held sold -11) and the per-share value
+            # uses the TRUE quantity, so a fractional remainder stays in the
+            # post-trade weight instead of reading 0%.
+            qf = float(qraw) if qraw not in (None, "") else 0.0
+            q = int(math.floor(qf)) if math.isfinite(qf) else 0
             if q <= 0:
                 continue
             mv = float(cand.get("market_value_sar") or 0.0)
-            px = (mv / q) if mv > 0 else float(
+            px = (mv / qf) if mv > 0 else float(
                 (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0))
             if act == ACTION_EXIT:
                 n = q

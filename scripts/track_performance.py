@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.45.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.46.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1584,7 +1584,44 @@ from urllib.error import HTTPError, URLError
 # TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
 # identities, preserving successive states and refusing writes without a
 # readable identity index. Legacy and WP-7 measurement modes stay available.
-SCRIPT_VERSION = "6.45.0"
+# v6.46.0 (2026-10-20): LEARNING-METRIC DEFINITION FIXES (report/aggregate
+# math only; no env, no Performance_Log cell changes).
+#   [DIR-OUTCOME] PerformanceAnalyzer / AttributionAnalyzer /
+#     ReliabilityCalibrator (buckets, Brier, decided count) and the report
+#     CI / cumulative win-rate plot scored every record by the SIGN OF THE
+#     PRICE CHANGE, so two SELL calls that rose +5% / +3% read 2 wins (100%).
+#     They now score the CALL (_record_outcome): BUY-family wins when price
+#     rose, sell-family (REDUCE / SELL / STRONG SELL / AVOID; EXIT and TRIM
+#     classify into these at entry) wins when it FELL, HOLD is neutral -
+#     excluded from every directional rate and counted in
+#     PerformanceSummary.neutral_records. The demo above now reads 0 W / 2 L.
+#     DELIBERATELY UNCHANGED: Realized ROI % (the price return) and the
+#     persisted Outcome column written at maturation, which stays the PRICE
+#     direction label - scripts/calibration_report.py audits Outcome ==
+#     sign(ROI) ('outcome_label_disagrees_with_roi') and tfb_backtest /
+#     tfb_workbook_dq_audit read it; relabelling ~11k historical rows is a
+#     published-value change that needs its own gate. Avg/median/best/worst
+#     ROI and regret / IC stay price-return aggregates.
+#   [HIT-DECIDED] hit_rate_by_horizon divided by ALL matured records while
+#     win_rate is decided-only: [2,-1,0,0] read win_rate 50 / hit_rate 25.
+#     Now w / (w + l) for both (50 / 50).
+#   [RISK-HORIZON] RiskCalculator treated per-record percent ROIs over 7-90
+#     day horizons as DAILY FRACTIONS (rfr/252, sqrt(252)): 1M ROIs
+#     [2,-1,3,1]% read Sharpe 13.42. Now percent -> fraction, rfr scaled to
+#     the horizon's trading days (1W=5 2W=10 1M=21 3M=63), annualised by
+#     sqrt(252/period), computed PER HORIZON (sharpe_by_horizon /
+#     sortino_by_horizon; the scalar is set only when one horizon is present,
+#     the panel prints '1M x | 3M y' otherwise). Same input -> 2.54. Sortino
+#     uses the standard downside deviation over all observations. Overlapping
+#     daily-opened windows still overstate significance (documented only).
+#   [CLAIMED-DECIDED] ReliabilityCalibrator buckets compared wins/decided
+#     with a claimed rate averaged over ALL records (HOLD and breakeven
+#     included), so a bucket with neutral records read as under-confident.
+#     claimed_win_rate (and the advisory factor) now average the stated
+#     reliability of the same decided records; mean_claimed_reliability
+#     keeps the all-n average.
+# Embedded self-test count unchanged (22). Tests: tests/test_learning_metric_fixes.py.
+SCRIPT_VERSION = "6.46.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -4959,6 +4996,11 @@ class PerformanceSummary:
     win_rate: float = 0.0
     hit_rate_by_horizon: Dict[str, float] = field(default_factory=dict)
     performance_by_sector: Dict[str, Any] = field(default_factory=dict)
+    # v6.46.0: matured HOLD (no directional claim) records, outside W/L/BE;
+    # Sharpe/Sortino per horizon (never pooled; see RiskCalculator).
+    neutral_records: int = 0
+    sharpe_by_horizon: Dict[str, float] = field(default_factory=dict)
+    sortino_by_horizon: Dict[str, float] = field(default_factory=dict)
     # v6.6.0: win-rate / ROI segmented by the ENTRY investability verdict.
     # hit_rate_by_investability maps bucket -> win-rate %; the richer
     # performance_by_investability maps bucket -> {win_rate, avg_roi, wins,
@@ -6189,8 +6231,8 @@ class PerformanceStore:
             ["Median ROI", f"{summary.median_roi:.2f}%", "", "", ""],
             ["Best ROI", f"{summary.best_roi:.2f}%", "", "", ""],
             ["Worst ROI", f"{summary.worst_roi:.2f}%", "", "", ""],
-            ["Sharpe Ratio", f"{summary.sharpe_ratio:.2f}", "", "", ""],
-            ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
+            ["Sharpe Ratio", _fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio), "", "", ""],
+            ["Sortino Ratio", _fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio), "", "", ""],
         ]
         # v6.20.0 (VT-1 hygiene): clear every historical panel footprint
         # first (A1:E4 legacy top-left stub, AG1:AK13 side block) so a
@@ -6767,36 +6809,140 @@ class SignalTrendStore:
 # =============================================================================
 # Analytics
 # =============================================================================
+# v6.46.0 [DIR-OUTCOME]: the CALL's direction, mirroring the engine's
+# canonical capital-action map (core/data_engine_v2._RECO_DIRECTION: ADD /
+# HOLD / TRIM). +1 = long call (wins when price rose), -1 = sell-family call
+# (wins when price FELL), 0 = neutral HOLD (no directional claim, so it is
+# excluded from every directional hit rate and counted as neutral instead).
+# EXIT / TRIM / UNDERWEIGHT etc. already classify to SELL / REDUCE at entry
+# (_classify_recommendation); the raw aliases below only protect a caller
+# that passes an unparsed string.
+_RECO_TRADE_SIGN: Dict[str, int] = {
+    RecommendationType.STRONG_BUY.value: 1,
+    RecommendationType.BUY.value: 1,
+    RecommendationType.ACCUMULATE.value: 1,
+    RecommendationType.HOLD.value: 0,
+    RecommendationType.REDUCE.value: -1,
+    RecommendationType.SELL.value: -1,
+    RecommendationType.STRONG_SELL.value: -1,
+    RecommendationType.AVOID.value: -1,
+}
+_RECO_TRADE_SIGN_ALIASES: Dict[str, int] = {"EXIT": -1, "TRIM": -1}
+
+
+def _reco_trade_sign(rec: Any) -> int:
+    """v6.46.0 PURE: +1 long / -1 sell-family / 0 neutral-or-unknown."""
+    m = rec if isinstance(rec, RecommendationType) else _parse_enum_value(
+        RecommendationType, rec, None)
+    if m is None:
+        return _RECO_TRADE_SIGN_ALIASES.get(_safe_str(rec).upper().strip(), 0)
+    return _RECO_TRADE_SIGN.get(m.value, 0)
+
+
+def _directional_outcome(rec: Any, roi: Any) -> Optional[str]:
+    """v6.46.0 PURE: WIN / LOSS / BREAKEVEN of the CALL, not of the price.
+    roi is the PRICE return in percent points (the stored Realized ROI %,
+    never altered here). A sell-family call wins when the price fell; a HOLD
+    (or unknown) call returns None = neutral, never a directional outcome;
+    a missing / non-finite roi returns None."""
+    if roi is None:
+        return None
+    try:
+        v = float(roi)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    sign = _reco_trade_sign(rec)
+    if sign == 0:
+        return None
+    edge = v * sign
+    return "WIN" if edge > 0 else ("LOSS" if edge < 0 else "BREAKEVEN")
+
+
+def _record_outcome(r: Any) -> Optional[str]:
+    """v6.46.0: _directional_outcome of a PerformanceRecord's entry call."""
+    return _directional_outcome(getattr(r, "entry_recommendation", None),
+                                getattr(r, "realized_roi", None))
+
+
+# v6.46.0 [RISK-HORIZON]: approximate TRADING days spanned by one record of
+# each horizon. HorizonType.days are CALENDAR days (target_date =
+# date_recorded + days); 5 trading days per 7 calendar days -> 1W=5, 2W=10,
+# 1M=21, 3M=63 (252/yr convention).
+_HORIZON_TRADING_DAYS: Dict[str, int] = {
+    "1W": 5, "2W": 10, "1M": 21, "3M": 63, "6M": 126,
+    "1Y": 252, "3Y": 756, "5Y": 1260,
+}
+
+
+def _fmt_ratio_by_horizon(by_h: Dict[str, float], scalar: float) -> str:
+    """v6.46.0: summary-panel cell. One horizon -> '0.53' (as before);
+    several -> '1M 0.53 | 3M 0.21' (never a pooled number)."""
+    if len(by_h or {}) > 1:
+        order = {h: i for i, h in enumerate(_HORIZON_TRADING_DAYS)}
+        return " | ".join(f"{h} {by_h[h]:.2f}"
+                          for h in sorted(by_h, key=lambda k: order.get(k, 99)))
+    return f"{scalar:.2f}"
+
+
 class RiskCalculator:
+    """v6.46.0: Sharpe / Sortino over PER-RECORD horizon returns.
+
+    Inputs are PERCENT-POINT returns of records that all share ONE horizon
+    spanning `period_days` trading days. Each is converted to a fraction, the
+    annual risk-free rate is scaled to the period (rfr * period_days / 252)
+    and the ratio is annualised by sqrt(252 / period_days). Callers must
+    never pool horizons (PerformanceAnalyzer groups by horizon).
+
+    Before v6.46.0 the percent ROIs of 7-90 day horizons were treated as
+    DAILY FRACTIONAL returns (rfr/252 subtracted, sqrt(252) applied): 1M
+    ROIs [2,-1,3,1]% read Sharpe 13.42 instead of ~2.54.
+
+    CAVEAT (documented, not solved): records are opened daily on the same
+    symbols, so their horizon windows OVERLAP; the observations are not
+    independent and the annualised ratio overstates significance. Read it as
+    descriptive, never as a test statistic. Population std (ddof=0) is kept
+    from the prior implementation.
+    """
     def __init__(self, risk_free_rate: float = 0.02):
         self.rfr = float(risk_free_rate)
 
-    def sharpe_ratio(self, returns: List[float]) -> float:
-        if not returns:
+    def _excess(self, returns_pct: List[float], period_days: float):
+        arr = np.asarray(returns_pct, dtype=float) / 100.0
+        pd_ = max(1.0, float(period_days))
+        return arr, arr - self.rfr * pd_ / 252.0, math.sqrt(252.0 / pd_)
+
+    def sharpe_ratio(self, returns_pct: List[float], period_days: float = 1.0) -> float:
+        if not returns_pct:
             return 0.0
         if not NUMPY_AVAILABLE or np is None:
             return 0.0
-        arr = np.asarray(returns, dtype=float)
+        arr, excess, ann = self._excess(returns_pct, period_days)
         if arr.size < 2:
             return 0.0
         if float(np.std(arr)) == 0.0:
             return 0.0
-        excess = arr - (self.rfr / 252.0)
-        return float(np.mean(excess) / np.std(arr) * math.sqrt(252))
+        return float(np.mean(excess) / np.std(arr) * ann)
 
-    def sortino_ratio(self, returns: List[float]) -> float:
-        if not returns:
+    def sortino_ratio(self, returns_pct: List[float], period_days: float = 1.0) -> float:
+        """Downside deviation = sqrt(mean(min(excess, 0)^2)) over ALL
+        observations (target = the period risk-free rate). 0.0 when there is
+        no downside observation (ratio undefined)."""
+        if not returns_pct:
             return 0.0
         if not NUMPY_AVAILABLE or np is None:
             return 0.0
-        arr = np.asarray(returns, dtype=float)
-        excess = arr - (self.rfr / 252.0)
-        downside = arr[arr < 0]
-        if downside.size < 2:
+        arr, excess, ann = self._excess(returns_pct, period_days)
+        if arr.size < 2:
             return 0.0
-        if float(np.std(downside)) == 0.0:
+        downside = np.minimum(excess, 0.0)
+        if not bool(np.any(downside < 0.0)):
             return 0.0
-        return float(np.mean(excess) / np.std(downside) * math.sqrt(252))
+        dd = float(np.sqrt(np.mean(downside ** 2)))
+        if dd == 0.0:
+            return 0.0
+        return float(np.mean(excess) / dd * ann)
 
 
 class MonteCarloSimulator:
@@ -6847,9 +6993,10 @@ class AttributionAnalyzer:
                 bucket[sec] = {"wins": 0.0, "losses": 0.0, "total_roi": 0.0, "count": 0.0}
             bucket[sec]["count"] += 1.0
             bucket[sec]["total_roi"] += float(r.realized_roi)
-            if (r.realized_roi or 0.0) > 0:
+            _oc = _record_outcome(r)   # v6.46.0: direction-aware
+            if _oc == "WIN":
                 bucket[sec]["wins"] += 1.0
-            elif (r.realized_roi or 0.0) < 0:
+            elif _oc == "LOSS":
                 bucket[sec]["losses"] += 1.0
         out: Dict[str, Dict[str, float]] = {}
         for sec, d in bucket.items():
@@ -6886,9 +7033,14 @@ class PerformanceAnalyzer:
 
         if matured:
             rois = [float(r.realized_roi or 0.0) for r in matured]
-            wins = sum(1 for r in matured if (r.realized_roi or 0.0) > 0)
-            losses = sum(1 for r in matured if (r.realized_roi or 0.0) < 0)
-            breakeven = len(matured) - wins - losses
+            # v6.46.0 [DIR-OUTCOME]: WIN/LOSS of the CALL (a SELL that fell
+            # wins); HOLD records are neutral and excluded from every
+            # directional rate. ROI aggregates below stay PRICE returns.
+            outcomes = [_record_outcome(r) for r in matured]
+            wins = outcomes.count("WIN")
+            losses = outcomes.count("LOSS")
+            breakeven = outcomes.count("BREAKEVEN")
+            s.neutral_records = outcomes.count(None)
             s.wins, s.losses, s.breakeven = wins, losses, breakeven
             total_outcomes = wins + losses
             s.win_rate = (wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
@@ -6907,17 +7059,29 @@ class PerformanceAnalyzer:
                 s.best_roi = max(rois_sorted)
                 s.worst_roi = min(rois_sorted)
 
-            if len(rois) > 2:
-                s.sharpe_ratio = self.risk.sharpe_ratio(rois)
-                s.sortino_ratio = self.risk.sortino_ratio(rois)
-
             groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
             for r in matured:
                 groups[r.horizon.value].append(r)
             for h, grp in groups.items():
-                w = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
-                t = len(grp)
-                s.hit_rate_by_horizon[h] = (w / t * 100.0) if t else 0.0
+                # v6.46.0: decided-only (w / (w + l)), the same definition as
+                # win_rate (breakevens were in the denominator before).
+                _go = [_record_outcome(r) for r in grp]
+                w, l = _go.count("WIN"), _go.count("LOSS")
+                s.hit_rate_by_horizon[h] = (w / (w + l) * 100.0) if (w + l) else 0.0
+                # v6.46.0 [RISK-HORIZON]: Sharpe/Sortino per horizon, never
+                # pooled across horizons (see RiskCalculator).
+                _hr = [float(r.realized_roi or 0.0) for r in grp]
+                if len(_hr) > 2:
+                    _pd = _HORIZON_TRADING_DAYS.get(h, max(1, round(grp[0].horizon.days * 5 / 7)))
+                    s.sharpe_by_horizon[h] = self.risk.sharpe_ratio(_hr, _pd)
+                    s.sortino_by_horizon[h] = self.risk.sortino_ratio(_hr, _pd)
+            # The scalar fields carry a value only when every matured record
+            # shares ONE horizon; mixed horizons leave them 0.0 and the
+            # per-horizon dicts are authoritative (no pooling).
+            if len(groups) == 1:
+                (_h,) = groups.keys()
+                s.sharpe_ratio = s.sharpe_by_horizon.get(_h, 0.0)
+                s.sortino_ratio = s.sortino_by_horizon.get(_h, 0.0)
 
             s.performance_by_sector = self.attr.by_sector(matured)
 
@@ -6934,8 +7098,9 @@ class PerformanceAnalyzer:
                 bucket = (r.entry_investability_status or "UNSPECIFIED").upper()
                 inv_groups[bucket].append(r)
             for bucket, grp in inv_groups.items():
-                gw = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
-                gl = sum(1 for r in grp if (r.realized_roi or 0.0) < 0)
+                _io = [_record_outcome(r) for r in grp]   # v6.46.0
+                gw = _io.count("WIN")
+                gl = _io.count("LOSS")
                 decided = gw + gl
                 grp_rois = [float(r.realized_roi or 0.0) for r in grp]
                 wr = (gw / decided * 100.0) if decided else 0.0
@@ -7177,16 +7342,25 @@ class ReliabilityCalibrator:
             _safe_float(r.realized_roi, default=0.0)
             for r in recs if r.realized_roi is not None
         ]
-        wins = sum(1 for v in rois if v > 0.0)
-        losses = sum(1 for v in rois if v < 0.0)
-        breakeven = len(rois) - wins - losses
+        # v6.46.0 [DIR-OUTCOME]: outcome of the CALL; HOLD records are
+        # neutral (in n, never in wins/losses/breakeven/decided).
+        _oc = [_record_outcome(r) for r in recs if r.realized_roi is not None]
+        wins = _oc.count("WIN")
+        losses = _oc.count("LOSS")
+        breakeven = _oc.count("BREAKEVEN")
         decided = wins + losses
         wr = (wins / decided * 100.0) if decided else 0.0
         lo, hi = wilson_interval(wins, decided)
         mean_roi = (sum(rois) / len(rois)) if rois else 0.0
         rels = [_safe_float(r.entry_forecast_reliability, default=0.0) for r in recs]
         mean_rel = (sum(rels) / len(rels)) if rels else 0.0
-        claimed_wr = mean_rel  # stated reliability is already on a 0..100 scale
+        # v6.46.0 [CLAIMED-DECIDED]: the claimed rate is compared with
+        # wins/decided, so it averages the stated reliability of the SAME
+        # decided (WIN/LOSS) records; HOLD and breakeven records stay in
+        # mean_claimed_reliability (all n, descriptive) only.
+        _drels = [_safe_float(r.entry_forecast_reliability, default=0.0)
+                  for r in recs if _record_outcome(r) in ("WIN", "LOSS")]
+        claimed_wr = (sum(_drels) / len(_drels)) if _drels else 0.0  # 0..100 scale
 
         if decided >= 1 and claimed_wr > 0.0:
             raw = max(0.1, min(2.0, wr / claimed_wr))
@@ -7210,11 +7384,11 @@ class ReliabilityCalibrator:
     def _brier(self, matured: List[PerformanceRecord]) -> Optional[float]:
         pts: List[float] = []
         for r in matured:
-            v = r.realized_roi
-            if v is None or v == 0.0:
-                continue  # decided-only
+            oc = _record_outcome(r)   # v6.46.0: direction-aware
+            if oc not in ("WIN", "LOSS"):
+                continue  # decided-only (HOLD neutral excluded)
             p = max(0.0, min(1.0, _safe_float(r.entry_forecast_reliability, 0.0) / 100.0))
-            o = 1.0 if v > 0.0 else 0.0
+            o = 1.0 if oc == "WIN" else 0.0
             pts.append((p - o) ** 2)
         return round(sum(pts) / len(pts), 4) if pts else None
 
@@ -7251,7 +7425,8 @@ class ReliabilityCalibrator:
             if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
         ]
         total = len(records)
-        decided_total = sum(1 for r in matured if (r.realized_roi or 0.0) != 0.0)
+        decided_total = sum(1 for r in matured
+                            if _record_outcome(r) in ("WIN", "LOSS"))   # v6.46.0
         global_sufficient = decided_total >= self.min_sample
 
         inv_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
@@ -7508,7 +7683,8 @@ class ReportGenerator:
             for r in records
             if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
         ]
-        outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+        outcomes = [o == "WIN" for o in map(_record_outcome, matured)
+                    if o in ("WIN", "LOSS")]   # v6.46.0: decided, direction-aware
         ci = (
             self.analyzer.sim.simulate_win_rate(
                 outcomes, iterations=10000, confidence=0.95
@@ -7568,11 +7744,13 @@ class ReportGenerator:
                         (r.maturity_date or r.date_recorded).astimezone(_RIYADH_TZ)
                         for r in matured
                     ]
-                    wins = np.cumsum(
-                        [1 if (r.realized_roi or 0.0) > 0 else 0 for r in matured]
-                    )
-                    denom = np.arange(1, len(matured) + 1, dtype=float)
-                    win_rate = (wins / denom) * 100.0
+                    # v6.46.0: direction-aware, decided-only cumulative rate
+                    # (matches summary.win_rate).
+                    _po = [_record_outcome(r) for r in matured]
+                    wins = np.cumsum([1 if o == "WIN" else 0 for o in _po])
+                    denom = np.cumsum([1 if o in ("WIN", "LOSS") else 0 for o in _po]).astype(float)
+                    win_rate = np.divide(wins * 100.0, denom,
+                                         out=np.zeros_like(denom), where=denom > 0)
                     ax1.plot(dates, win_rate, linewidth=2)
                     ax1.set_title("Cumulative Win Rate (%)")
                     ax1.set_xlabel("Date")
@@ -7623,7 +7801,7 @@ class ReportGenerator:
     <div class="card"><div>Total Records</div><div style="font-size:22px;font-weight:bold;">{summary.total_records}</div></div>
     <div class="card"><div>Win Rate</div><div style="font-size:22px;font-weight:bold;">{summary.win_rate:.1f}%</div></div>
     <div class="card"><div>Avg ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div></div>
-    <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{summary.sharpe_ratio:.2f}</div></div>
+    <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)}</div></div>
   </div>
 
   {"<div class='plot'><img style='max-width:100%;' src='data:image/png;base64," + plots.get("win_rate","") + "'/></div>" if plots.get("win_rate") else ""}
@@ -10291,12 +10469,13 @@ class PerformanceTrackerApp:
             )
             _out(
                 f"Wins: {summary.wins} | Losses: {summary.losses} "
-                f"| WinRate: {summary.win_rate:.1f}%"
+                f"| WinRate: {summary.win_rate:.1f}% "
+                f"| Neutral(HOLD): {summary.neutral_records}"
             )
             _out(
                 f"Avg ROI: {summary.avg_roi:.2f}% "
-                f"| Sharpe: {summary.sharpe_ratio:.2f} "
-                f"| Sortino: {summary.sortino_ratio:.2f}"
+                f"| Sharpe: {_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)} "
+                f"| Sortino: {_fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio)}"
             )
             # v6.6.0: surface the investability segmentation -- the gate KPI
             # that the whole "95%" question reduces to. Decided-only win-rate
@@ -10356,7 +10535,8 @@ class PerformanceTrackerApp:
                 if r.status == PerformanceStatus.MATURED
                 and r.realized_roi is not None
             ]
-            outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+            outcomes = [o == "WIN" for o in map(_record_outcome, matured)
+                        if o in ("WIN", "LOSS")]   # v6.46.0
             if outcomes:
                 ci = self.analyzer.sim.simulate_win_rate(
                     outcomes,

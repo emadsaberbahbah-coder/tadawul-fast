@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.30 (2026-10-22) -- LEARNING-METRIC DEFINITIONS
+#
+# v1.1.30: run tests/test_learning_metric_fixes.py (track_performance v6.46.0:
+# direction-aware win/loss, decided-only hit rate and claimed rate,
+# per-horizon Sharpe/Sortino; carried from PR #809) in the blocking lean lane
+# next to the other tracker suites; and in the model lane
+# tests/test_pf_weight_value_complete.py (data_engine_v2 v5.156.0: unpriced
+# holdings blank the book's weights, GBp/ZAc/ILa FX keys never overwrite the
+# major rate; portfolio_actions v1.16.1: EXIT never sells more whole shares
+# than held). Offline fakes only.
+#
 # VERSION 1.1.29 (2026-10-21) -- SYNC TRUTH AND SHEETS TRANSPORT
 #
 # v1.1.29 (1.1.28 is PR #809): run in the blocking lean lane
@@ -730,6 +741,7 @@ jobs:
             tests/test_track_flags_mapped.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
+            tests/test_learning_metric_fixes.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
@@ -755,7 +767,8 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_intrinsic_display_basis.py \
-            tests/test_pf_weight_subunit_fx.py
+            tests/test_pf_weight_subunit_fx.py \
+            tests/test_pf_weight_value_complete.py
 
       - name: 🛡️ Run isolated protective legacy harnesses
         run: |

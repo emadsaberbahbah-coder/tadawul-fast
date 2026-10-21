@@ -188,7 +188,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
      "1.27.2", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.16.0", "portfolio actions"),
+     "1.16.1", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
@@ -208,7 +208,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.155.0", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.156.0", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -237,7 +237,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
-    ("track_performance", "6.45.0", "track performance"),
+    ("track_performance", "6.46.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
