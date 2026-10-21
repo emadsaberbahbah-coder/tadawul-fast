@@ -10,9 +10,12 @@
 # the Mutual_Funds Name floor below 99% (a decision-feed release blocker),
 # and 67 Global_Markets captions expired on 21 Oct 07:44 UTC.
 # WHAT: a second job, publish-renewal, runs only on a renew dispatch with
-# publish_branch=true (the default). It takes the renewed registry from the
-# artifact, validates it again with the production loader, and when it
-# differs from the checked-out registry commits it to a NEW branch
+# publish_branch=true (the default). It merges the renewed registry from the
+# artifact into the DEFAULT-BRANCH registry binding by binding
+# (renew_verified_name_labels 1.1.0 --apply-renewal: only an unchanged caption
+# with a newer review takes the renewed copy, so an artifact built from another
+# revision cannot revert or add a binding), validates the result with the
+# production loader, and when it differs commits it to a NEW branch
 # name-label-renewal/<run_id> and opens a DRAFT pull request against main.
 # It never pushes to main: the renewed file still reaches main only through
 # a reviewed PR. Write permissions (contents, pull-requests) are granted to
@@ -164,7 +167,7 @@ jobs:
           name: name-label-renewal-${{ github.run_id }}
           path: renewal_out
 
-      - name: Validate, commit to a review branch, open a draft PR
+      - name: Merge the renewal into the default branch, commit to a review branch, open a draft PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -175,46 +178,55 @@ jobs:
             echo "::warning::No renewed registry in the artifact; nothing to publish."
             exit 0
           fi
-          # The production loader must accept the file (it raises ValueError).
-          python -c "import sys; from pathlib import Path; from core import verified_name_labels as l; l._load_registry(Path(sys.argv[1]))" "$NEW"
-          COUNTS=$(python - <<'PY'
-          import json
-          r = json.load(open("renewal_out/renewal_report.json"))
-          n = lambda v: len(v) if isinstance(v, (list, dict)) else int(v or 0)
-          print("%d %d" % (n(r.get("renewed")), n(r.get("held"))))
-          PY
-          )
-          read -r RENEWED HELD <<< "$COUNTS"
-          if [[ "${RENEWED:-0}" -eq 0 ]]; then
-            echo "::warning::0 bindings renewed (${HELD} held); nothing to publish."
+          # renew_verified_name_labels 1.1.0 --apply-renewal: a binding takes its
+          # renewed copy only when its caption is unchanged on this default-branch
+          # revision and the review is newer, so an artifact built from another
+          # revision can never revert or add a binding. The merged file passes the
+          # production loader before it is written.
+          code=0
+          python scripts/renew_verified_name_labels.py --registry "$REG" \
+            --apply-renewal "$NEW" --report apply_report.json || code=$?
+          if [[ "$code" -eq 3 ]]; then
+            echo "::warning::No binding of the default branch was renewed; nothing to publish."
             exit 0
           fi
-          if cmp -s "$NEW" "$REG"; then
-            echo "::notice::The renewed registry is identical to the checked-out one; nothing to publish."
+          if [[ "$code" -ne 0 ]]; then
+            exit "$code"
+          fi
+          COUNTS=$(python - <<'PY'
+          import json
+          r = json.load(open("apply_report.json"))
+          n = lambda v: len(v) if isinstance(v, (list, dict)) else int(v or 0)
+          print("%d %d" % (n(r.get("applied")), n(r.get("kept"))))
+          PY
+          )
+          read -r APPLIED KEPT <<< "$COUNTS"
+          if git diff --quiet -- "$REG"; then
+            echo "::notice::The merged registry is identical to the default branch; nothing to publish."
             exit 0
           fi
           BR="name-label-renewal/${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BR"
-          cp "$NEW" "$REG"
           git add "$REG"
-          git commit -q -m "Renew verified name captions: ${RENEWED} renewed, ${HELD} held (run ${GITHUB_RUN_ID})"
+          git commit -q -m "Renew verified name captions: ${APPLIED} renewed, ${KEPT} kept (run ${GITHUB_RUN_ID})"
           git push -q origin "$BR"
-          echo "::notice::Pushed ${BR} (${RENEWED} renewed, ${HELD} held)."
+          echo "::notice::Pushed ${BR} (${APPLIED} renewed, ${KEPT} kept)."
           {
             echo "Renewal run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
-            echo "- renewed: ${RENEWED}"
-            echo "- held (unchanged, still expired or expiring): ${HELD}"
+            echo "- renewed: ${APPLIED}"
+            echo "- kept unchanged (held, caption changed upstream, or not newer): ${KEPT}"
             echo
             echo "Every renewed binding was re-captured from its own public sources and re-checked by"
-            echo "scripts/renew_verified_name_labels.py; the file passed the production loader twice."
-            echo "Only reviewed_at_utc, expires_at_utc, source receipts, directory_creation_time and the"
-            echo "review digest change. Review, then merge; the next sync fills the blank Names again."
+            echo "scripts/renew_verified_name_labels.py, then merged binding by binding into this default"
+            echo "branch revision (--apply-renewal): only reviewed_at_utc, expires_at_utc, source receipts,"
+            echo "directory_creation_time and the review digest change. The file passed the production"
+            echo "loader. Review, then merge; the next sync fills the blank Names again."
           } > pr_body.md
-          if gh pr create --draft --base main --head "$BR" \
-               --title "Renew verified name captions (${RENEWED} renewed, ${HELD} held)" \
+          if gh pr create --draft --base "${{ github.event.repository.default_branch }}" --head "$BR" \
+               --title "Renew verified name captions (${APPLIED} renewed, ${KEPT} kept)" \
                --body-file pr_body.md; then
             echo "::notice::Draft PR opened from ${BR}."
           else
