@@ -81,6 +81,16 @@ on:
         required: false
         default: false
         type: boolean
+      # (2026-10-15 P-170c) Sent "true" by apps_script/24_Sync_Dispatch.gs so the
+      # dispatched 06:15 Riyadh full_sync records Performance_Log/Signal_History
+      # like the 04:17Z scheduled run it replaced. Record-only: --audit stays
+      # behind run_tracker == "true". Renaming or removing it makes every
+      # dispatch fail with HTTP 422 (the dispatcher then fails its trigger).
+      record_tracker:
+        description: "Record-only Track Performance after a dispatched full_sync (no historical audit)"
+        required: false
+        default: false
+        type: boolean
       # (2026-07-26 PY-5) google_creds_json input REMOVED. workflow_dispatch
       # inputs are recorded in run metadata — on a PUBLIC repo, a service-
       # account key pasted there is published. Secrets are the only creds
@@ -1301,7 +1311,7 @@ jobs:
         # Exactly ONE leg records after a full sync that includes GM.
         # A no-key GM leg, single-page refresh or health probe must not record
         # unrelated page cohorts or rewrite Performance_Log.
-        if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_tracker != 'false') }}
+        if: ${{ success() && matrix.group == 'global-markets' && steps.scope_keys.outputs.has_keys == 'true' && env.RUN_MODE == 'full_sync' && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_tracker != 'false' || github.event.inputs.record_tracker == 'true') }}
         continue-on-error: true
         env:
           INPUT_RUN_TRACKER: ${{ github.event.inputs.run_tracker }}

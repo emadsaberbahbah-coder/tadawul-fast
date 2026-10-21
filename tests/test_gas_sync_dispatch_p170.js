@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* tests/test_gas_sync_dispatch_p170.js
- * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 surface, re-pinned on v1.1.0 [P-170 DISPATCH-FROM-GAS].
+ * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 surface, re-pinned on v1.2.0 [P-170 DISPATCH-FROM-GAS].
  * Loads the REAL .gs source into a vm context whose only additions are stubs of
  * the Apps Script services it touches (PropertiesService, UrlFetchApp,
  * SpreadsheetApp, ScriptApp, Logger). Every test calls the real functions.
@@ -76,6 +76,11 @@ function T(name, cond, detail) {
   out.push(line);
   if (!cond) { fails++; }
 }
+// v1.2.0: trigger handlers throw on FAILED; returns the error text, or
+// 'NO-THROW:<result>' so a handler that stopped throwing fails its test.
+function raises(fn) {
+  try { return 'NO-THROW:' + fn(); } catch (e) { return String(e && e.message); }
+}
 function noTokenLeak(world, label) {
   const hay = JSON.stringify(world.logRows) + JSON.stringify(world.logger) + JSON.stringify(world.props[ 'TFB_SYNC_DISPATCH_LAST_EVENT'] || '');
   T(label + ' token never leaks', hay.indexOf(TOKEN) === -1);
@@ -87,7 +92,7 @@ function run() {
     const w = makeWorld({});
     const v = w.ctx.tfbSyncDispatchSelfTest();
     T('T1 selftest', v.indexOf('sync dispatch core: ok') === 0, v);
-    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.1.0');
+    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.2.0');
   }
   // T2 happy path: token, stale GM (3 h), expired hold -> dispatch 204
   {
@@ -101,6 +106,8 @@ function run() {
     const f = w.fetches[0];
     T('T2 url', f.url === 'https://api.github.com/repos/emadsaberbahbah-coder/tadawul-fast/actions/workflows/daily_sync.yml/dispatches', f.url);
     T('T2 payload', JSON.parse(f.options.payload).inputs.run_mode === 'full_sync' && JSON.parse(f.options.payload).ref === 'main');
+    const inp = JSON.parse(f.options.payload).inputs;
+    T('T2 payload v1.2.0 portfolio + record-only tracker', inp.include_portfolio === 'true' && inp.record_tracker === 'true' && inp.run_tracker === undefined && Object.keys(inp).length === 3, JSON.stringify(inp));
     T('T2 bearer', f.options.headers.Authorization === 'Bearer ' + TOKEN);
     T('T2 log row', w.logRows.length === 1 && w.logRows[0][2] === 'tfbDispatchDailySync' && w.logRows[0][4] === 'OK' && w.logRows[0][7] === 204 && w.logRows[0][3] === 'daily_sync.yml', JSON.stringify(w.logRows[0] && w.logRows[0].slice(1, 8)));
     T('T2 details reason ok', /"reason":"ok"/.test(String(w.logRows[0][9])) && /"gm_stamp_age_min":18[0-9]/.test(String(w.logRows[0][9])), String(w.logRows[0][9]).slice(0, 120));
@@ -135,26 +142,28 @@ function run() {
     const r4 = w4.ctx.tfbDispatchDailySync();
     T('T4 fresh window prop (5 min) lets a 10-min stamp through', r4 === 'OK:204', r4);
   }
-  // T5 no token -> FAILED:no_token, zero network, ERROR row
+  // T5 no token -> trigger handler THROWS (v1.2.0) after the ERROR row; zero network
   {
     const w = makeWorld({ props: {} });
-    const r = w.ctx.tfbDispatchDailySync();
-    T('T5 no token', r === 'FAILED:no_token' && w.fetches.length === 0, r);
+    const r = raises(() => w.ctx.tfbDispatchDailySync());
+    T('T5 no token throws', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchDailySync FAILED:no_token - nothing was dispatched/.test(r) && w.fetches.length === 0, r);
     T('T5 error row', w.logRows.length === 1 && w.logRows[0][1] === 'ERROR' && w.logRows[0][4] === 'FAILED');
+    const rn = w.ctx.tfbDispatchDailySyncNow();
+    T('T5 manual Now still returns', rn === 'FAILED:no_token', rn);
     const p = w.ctx.tfbSyncDispatchProbe();
     T('T5 probe no token', p === 'FAILED:no_token' && w.fetches.length === 0, p);
   }
   // T6 GitHub 401 -> FAILED:401, LAST_OK untouched, token redacted in the body echo
   {
     const w = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, fetchCode: 401, fetchBody: '{"message":"Bad credentials ' + TOKEN + '"}' });
-    const r = w.ctx.tfbDispatchDailySync();
-    T('T6 401 result', r === 'FAILED:401', r);
+    const r = raises(() => w.ctx.tfbDispatchDailySync());
+    T('T6 401 throws', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchDailySync FAILED:401 - nothing was dispatched/.test(r) && r.indexOf(TOKEN) === -1, r);
     T('T6 LAST_OK not set', !w.props.TFB_SYNC_DISPATCH_LAST_OK_MS);
     T('T6 row FAILED 401', w.logRows[0][4] === 'FAILED' && w.logRows[0][7] === 401 && w.logRows[0][1] === 'ERROR');
     noTokenLeak(w, 'T6');
     const w2 = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, fetchThrow: 'DNS error ' + TOKEN });
-    const r2 = w2.ctx.tfbDispatchDailySync();
-    T('T6 fetch throws -> FAILED:-1', r2 === 'FAILED:-1', r2);
+    const r2 = raises(() => w2.ctx.tfbDispatchDailySync());
+    T('T6 fetch throws -> FAILED:-1 raised, not confirmed', /^\[SYNC-DISPATCH v1\.2\.0\] tfbDispatchDailySync FAILED:-1 - dispatch NOT CONFIRMED/.test(r2) && r2.indexOf(TOKEN) === -1, r2);
     noTokenLeak(w2, 'T6b');
   }
   // T7 sheets missing entirely -> guards fail open, dispatch proceeds
