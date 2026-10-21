@@ -1,6 +1,26 @@
 # =============================================================================
 # Verified Name Label Renewal - .github/workflows/name_label_renewal.yml
 # =============================================================================
+# VERSION 1.1.0 (2026-10-21) -- RENEW PUBLISHES A REVIEW BRANCH
+#
+# WHY (2026-10-21): 1.0.0 left the renewed registry only in the run's
+# artifact, so turning a renewal into a reviewed PR needed someone to
+# download the artifact by hand. Nothing did: the 39 Mutual_Funds captions
+# that expired on 19 Oct 12:31 UTC were still expired on 21 Oct, keeping
+# the Mutual_Funds Name floor below 99% (a decision-feed release blocker),
+# and 67 Global_Markets captions expired on 21 Oct 07:44 UTC.
+# WHAT: a second job, publish-renewal, runs only on a renew dispatch with
+# publish_branch=true (the default). It takes the renewed registry from the
+# artifact, validates it again with the production loader, and when it
+# differs from the checked-out registry commits it to a NEW branch
+# name-label-renewal/<run_id> and opens a DRAFT pull request against main.
+# It never pushes to main: the renewed file still reaches main only through
+# a reviewed PR. Write permissions (contents, pull-requests) are granted to
+# that job alone; the scheduled check and the renew job stay read-only.
+# If the repository forbids Actions-created PRs, the branch is still pushed
+# and the run says so (open the PR from the branch).
+# Rollback: dispatch with publish_branch=false (1.0.0 behaviour).
+#
 # VERSION 1.0.0 (2026-10-20) -- NEW WORKFLOW
 #
 # WHY: data/verified_name_labels.json captions expire seven days after review.
@@ -31,6 +51,11 @@ on:
         default: "renew"
         type: choice
         options: [check, renew]
+      publish_branch:
+        description: "renew only: commit the renewed registry to a review branch and open a draft PR (never main)"
+        required: false
+        default: true
+        type: boolean
   schedule:
     - cron: "15 4 * * *"   # 07:15 Riyadh, daily expiry check
 
@@ -103,3 +128,91 @@ jobs:
             renewed_verified_name_labels.json
           retention-days: 14
           if-no-files-found: warn
+
+  # 1.1.0: the only job with write permissions; renew dispatches only.
+  publish-renewal:
+    name: Publish renewed registry to a review branch
+    needs: name-label-renewal
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'renew' && inputs.publish_branch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      # The review branch is always cut from the default branch, so its PR
+      # carries the registry change only, whichever ref was dispatched.
+      - name: Checkout the default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download the renewed registry
+        uses: actions/download-artifact@v8
+        with:
+          name: name-label-renewal-${{ github.run_id }}
+          path: renewal_out
+
+      - name: Validate, commit to a review branch, open a draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NEW=renewal_out/renewed_verified_name_labels.json
+          REG=data/verified_name_labels.json
+          if [[ ! -s "$NEW" ]]; then
+            echo "::warning::No renewed registry in the artifact; nothing to publish."
+            exit 0
+          fi
+          # The production loader must accept the file (it raises ValueError).
+          python -c "import sys; from pathlib import Path; from core import verified_name_labels as l; l._load_registry(Path(sys.argv[1]))" "$NEW"
+          COUNTS=$(python - <<'PY'
+          import json
+          r = json.load(open("renewal_out/renewal_report.json"))
+          n = lambda v: len(v) if isinstance(v, (list, dict)) else int(v or 0)
+          print("%d %d" % (n(r.get("renewed")), n(r.get("held"))))
+          PY
+          )
+          read -r RENEWED HELD <<< "$COUNTS"
+          if [[ "${RENEWED:-0}" -eq 0 ]]; then
+            echo "::warning::0 bindings renewed (${HELD} held); nothing to publish."
+            exit 0
+          fi
+          if cmp -s "$NEW" "$REG"; then
+            echo "::notice::The renewed registry is identical to the checked-out one; nothing to publish."
+            exit 0
+          fi
+          BR="name-label-renewal/${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BR"
+          cp "$NEW" "$REG"
+          git add "$REG"
+          git commit -q -m "Renew verified name captions: ${RENEWED} renewed, ${HELD} held (run ${GITHUB_RUN_ID})"
+          git push -q origin "$BR"
+          echo "::notice::Pushed ${BR} (${RENEWED} renewed, ${HELD} held)."
+          {
+            echo "Renewal run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "- renewed: ${RENEWED}"
+            echo "- held (unchanged, still expired or expiring): ${HELD}"
+            echo
+            echo "Every renewed binding was re-captured from its own public sources and re-checked by"
+            echo "scripts/renew_verified_name_labels.py; the file passed the production loader twice."
+            echo "Only reviewed_at_utc, expires_at_utc, source receipts, directory_creation_time and the"
+            echo "review digest change. Review, then merge; the next sync fills the blank Names again."
+          } > pr_body.md
+          if gh pr create --draft --base main --head "$BR" \
+               --title "Renew verified name captions (${RENEWED} renewed, ${HELD} held)" \
+               --body-file pr_body.md; then
+            echo "::notice::Draft PR opened from ${BR}."
+          else
+            echo "::warning::Branch ${BR} is pushed but the PR could not be opened (the repository may forbid Actions-created PRs); open it from the branch."
+          fi
