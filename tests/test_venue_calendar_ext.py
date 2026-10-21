@@ -22,6 +22,11 @@ Properties pinned here:
       stale), exercised through the real _quote_freshness_assessment
   T6  no extension key shadows a base key (the base map always wins)
   T7  version and manifest pin
+  T8  v1.27.2: Athens ('.AT' -> ASEX, present in 4.13.2) and NSE India ('.NS'
+      -> XBOM, the same Mumbai session and holiday list as BSE) resolve, skip
+      their own holidays (Athens 28 Oct Ochi Day; Mumbai 2 Oct Gandhi
+      Jayanti), follow the same three freshness verdicts, and drop out under
+      the kill switch. '.VN' '.AE' '.QA' '.BH' stay uncertified (T4b).
 
 Run: pytest -q tests/test_venue_calendar_ext.py
 """
@@ -45,8 +50,9 @@ xc = pytest.importorskip("exchange_calendars")
 
 # Suffixes the Render log named on 2026-10-18/19 that have NO calendar in
 # exchange_calendars 4.13.2: they must stay uncertified (None), not be
-# guessed onto a neighbouring venue.
-KNOWN_ABSENT = ("AT", "NS", "VN", "AE", "QA", "BH")
+# guessed onto a neighbouring venue. v1.27.2: '.AT' (ASEX exists in 4.13.2)
+# and '.NS' (same session as XBOM, an alias like KOSDAQ->XKRX) left this list.
+KNOWN_ABSENT = ("VN", "AE", "QA", "BH")
 
 
 @pytest.fixture(autouse=True)
@@ -163,13 +169,58 @@ def test_t5b_kill_switch_restores_calendar_unavailable_verdict(monkeypatch):
 
 def test_t6_extension_never_shadows_base():
     assert not (set(ob._VENUE_CAL_EXT_MAP) & set(ob._VENUE_CAL_MAP))
-    assert len(ob._VENUE_CAL_EXT_MAP) == 39
+    assert len(ob._VENUE_CAL_EXT_MAP) == 41          # v1.27.2: 39 + AT + NS
 
 
 def test_t7_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.0"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.27.0", "opportunity builder"' in src
+    assert '"1.27.2", "opportunity builder"' in src
+
+
+def test_t8_athens_and_nse_resolve_and_obey_the_kill_switch(monkeypatch):
+    assert "AT" not in ob._VENUE_CAL_MAP and "NS" not in ob._VENUE_CAL_MAP
+    assert ob._venue_cal_code("AT") == "ASEX"
+    assert ob._venue_cal_code("NS") == "XBOM" == ob._venue_cal_code("BO")
+    monkeypatch.setenv("TFB_TICKET_VENUE_CAL_EXT", "0")
+    assert ob._venue_cal_code("AT") is None and ob._venue_cal_code("NS") is None
+    assert ob._venue_state("OTE.AT", datetime.now(timezone.utc)) is None
+
+
+@pytest.mark.parametrize("symbol,now,closed_day,prev_day", [
+    # Athens is shut on 28 Oct (Ochi Day): before the 29 Oct open the previous
+    # close is 27 Oct, not 28 Oct.
+    ("OTE.AT", datetime(2026, 10, 29, 6, 0, tzinfo=timezone.utc), "2026-10-28", "2026-10-27"),
+    # Mumbai is shut on 2 Oct (Gandhi Jayanti, a Friday): during that day the
+    # previous close is 1 Oct.
+    ("RELIANCE.NS", datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc), "2026-10-02", "2026-10-01"),
+])
+def test_t8b_new_venues_skip_their_own_holidays(symbol, now, closed_day, prev_day):
+    vs = ob._venue_state(symbol, now)
+    assert vs is not None, symbol
+    is_open, prev_close = vs
+    assert is_open is False
+    assert prev_close.strftime("%Y-%m-%d") == prev_day, (symbol, prev_close)
+    assert prev_close.strftime("%Y-%m-%d") != closed_day
+
+
+@pytest.mark.parametrize("symbol", ["OTE.AT", "RELIANCE.NS"])
+def test_t8c_new_venues_follow_the_same_three_verdicts(symbol):
+    """Same contract as T5, through the real assessment and the real ASEX /
+    XBOM calendars."""
+    now = datetime.now(timezone.utc)
+    is_open, prev_close = ob._venue_state(symbol, now)
+    if is_open:
+        passed, why, detail = _assess(symbol, now - timedelta(hours=2))
+        assert not passed and detail["mode"] == "session_open"
+        assert why.startswith("STALE_PRICE intraday")
+        return
+    passed, why, detail = _assess(symbol, prev_close - timedelta(seconds=30))
+    assert passed and detail["mode"] == "session_closed", (why, detail)
+    assert why.startswith("last close")
+    passed, why, detail = _assess(symbol, prev_close - timedelta(hours=3))
+    assert not passed and detail["mode"] == "session_closed"
+    assert why.startswith("STALE_PRICE pre-close")
 
 
 if __name__ == "__main__":   # pragma: no cover

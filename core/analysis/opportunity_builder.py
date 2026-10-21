@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.27.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.27.2  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.27.2 (2026-10-21): Athens ('.AT' -> ASEX) and NSE India ('.NS' -> XBOM,
+the same Mumbai session and holiday list as BSE) join the venue-calendar
+extension, so an old quote there is certified as the last session close or
+rejected as stale by the same rule as every other mapped venue. '.VN', '.AE',
+'.QA' and '.BH' still have no calendar and stay uncertified. (1.27.1 is
+claimed by open PR #803.)
 
 v1.27.0 (2026-10-19): conviction-weighted seat sizing, TFB_OPP_SIZING_MODE
 = cap (default, byte-identical) | conviction. Under conviction the deployable
@@ -1529,7 +1536,31 @@ from typing import Optional
 #   _conviction_weight, _conviction_targets, _sizing_cohort). Removed: 0.
 #   Rollback: unset TFB_OPP_SIZING_MODE, or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.0"
+# v1.27.2 (2026-10-21) — ATHENS AND NSE INDIA GET THEIR VENUE CALENDARS
+# WHY: after the 21 Oct 13:26 UTC boot Render logged
+#   [FRESHNESS v1.27.0] venue calendar unavailable for '.NS' / '.AT' / '.VN' /
+#   '.AE' / '.QA' / '.BH'. v1.26.2 kept these six suffixes out of the extension
+#   map as having "no calendar in exchange_calendars 4.13.2". That holds for four
+#   of them and not for two:
+#   - Athens: ASEX is in the pinned 4.13.2 (verified by instantiation: 10:00-17:20
+#     Europe/Athens; closed 28 Oct (Ochi Day), 25 Dec, and Orthodox Good Friday
+#     and Easter Monday, 10 and 13 Apr 2026).
+#   - NSE India: there is no XNSE calendar, but NSE and BSE trade the same Mumbai
+#     session (09:15-15:30 IST) on the same exchange holiday list, and XBOM is
+#     already the '.BO' calendar. '.NS' is aliased to it exactly as KOSDAQ->XKRX
+#     and TSX-V->XTSX are (checked: XBOM closed 26 Jan, 2 Oct and 24 Nov 2026).
+#   Until now an old quote on either venue could only stay UNVERIFIED_PRICE.
+# WHAT: two entries appended to _VENUE_CAL_EXT_MAP: "AT": "ASEX", "NS": "XBOM".
+#   '.VN', '.AE', '.QA' and '.BH' still have no calendar in 4.13.2 and keep the
+#   "calendar unavailable" verdict and its log line.
+# NOT CHANGED: the base map, every other suffix, the freshness rule itself,
+#   gates, ranking, sizing, funding. The kill switch TFB_TICKET_VENUE_CAL_EXT=0
+#   still restores the 16-venue base map (which never held '.AT' or '.NS').
+#   Functions added 0. Removed 0. Rollback: git revert.
+#   Version note: 1.27.1 is claimed by open PR #803; whichever lands second
+#   re-bumps.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4541,9 +4572,11 @@ _VENUE_CAL_MAP = {
 # exchange_calendars==4.13.2 (verified by instantiation). Venues that share a
 # session with a listed one are aliased to it (KOSDAQ->XKRX, TPEx->XTAI,
 # CSE/NEO->XTSE, TSX-V->XTSX). Suffixes with NO calendar in 4.13.2 are
-# deliberately absent (.AT Athens, .NS NSE India, .VN, .AE, .QA, .BH): they
-# keep the v1.26.1 "calendar unavailable" verdict and keep logging, which is
-# the honest answer. Kill switch: TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
+# deliberately absent (.VN, .AE, .QA, .BH): they keep the v1.26.1 "calendar
+# unavailable" verdict and keep logging, which is the honest answer.
+# v1.27.2: '.AT' (ASEX is in 4.13.2) and '.NS' (NSE shares XBOM's Mumbai
+# session and holiday list) were wrongly listed absent; both are now mapped.
+# Kill switch: TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
 # map exactly (the extended entries are consulted only when the base map
 # misses, so every v1.26.1 venue is byte-identical either way).
 _VENUE_CAL_EXT_MAP = {
@@ -4555,6 +4588,7 @@ _VENUE_CAL_EXT_MAP = {
     "CN": "XTSE", "NE": "XTSE", "SS": "XSHG", "IC": "XICE", "PR": "XPRA",
     "BD": "XBUD", "LM": "XLIM", "PH": "XPHS", "TL": "XTAL", "RG": "XRIS",
     "VS": "XLIT", "CR": "XZAG", "RO": "XBSE", "PK": "XKAR",
+    "AT": "ASEX", "NS": "XBOM",   # v1.27.2
 }
 _VENUE_CAL_CACHE = {}
 
