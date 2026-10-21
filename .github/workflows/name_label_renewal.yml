@@ -19,6 +19,8 @@
 # that job alone; the scheduled check and the renew job stay read-only.
 # If the repository forbids Actions-created PRs, the branch is still pushed
 # and the run says so (open the PR from the branch).
+# The sec.gov contact is read from the repository SECRET TFB_SEC_USER_AGENT
+# first (masked in logs; this repository is public), then the 1.0.0 Variable.
 # Rollback: dispatch with publish_branch=false (1.0.0 behaviour).
 #
 # VERSION 1.0.0 (2026-10-20) -- NEW WORKFLOW
@@ -78,7 +80,9 @@ jobs:
     env:
       PYTHONPATH: ${{ github.workspace }}
       MODE: ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
-      TFB_SEC_USER_AGENT: ${{ vars.TFB_SEC_USER_AGENT }}
+      # 1.1.0: a repository SECRET is preferred (this repository is public and a
+      # secret is masked in logs); the 1.0.0 repository Variable still works.
+      TFB_SEC_USER_AGENT: ${{ secrets.TFB_SEC_USER_AGENT || vars.TFB_SEC_USER_AGENT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -98,7 +102,7 @@ jobs:
             python scripts/renew_verified_name_labels.py --check --report renewal_report.json || code=$?
           else
             if [[ -z "${TFB_SEC_USER_AGENT// }" ]]; then
-              echo "::warning::vars.TFB_SEC_USER_AGENT is not set; bindings citing sec.gov will be held."
+              echo "::warning::TFB_SEC_USER_AGENT (repository secret or variable) is not set; bindings citing sec.gov will be held."
             fi
             python scripts/renew_verified_name_labels.py \
               --out renewed_verified_name_labels.json \
