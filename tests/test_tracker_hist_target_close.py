@@ -28,7 +28,14 @@ Cases
       a spent budget DEFERS
   H7  a split between entry and target is left to the unchanged CA-GUARD
   H8  pure helper table (_hist_target_close)
-  N1  off == the v6.45.0 base copy on a mixed fixture (records, Notes, stats)
+  H9  the CA-GUARD's 240 s window is not spent by these pulls (observe == off,
+      enforce keeps a later CA-verified record maturing)
+  H10 failed pulls are counted apart; the breaker stops pulling for the pass
+  H11 a substituted record the CA-GUARD leaves pending keeps its live mark
+  H12 the REAL _hist_close_pull over a fake yfinance frame, including an
+      event yfinance merged onto the target-session bar
+  N1  off == the v6.45.0 base copy on a mixed fixture (records, Notes, stats,
+      log lines); observe == off on records, stats and logs bar one line
   N2  golden negative: the base copy leaves the H1 record ACTIVE under enforce
   N3  workflow mapping, version floor and verifier pin
   N4  added lines are ASCII
@@ -195,12 +202,15 @@ def harness(mod, env=None, bar_map=None, ca_guard=False, patches=None):
     handler = logging.Handler()
     handler.emit = lambda rec: run.logs.append(rec.getMessage())
     mod.logger.addHandler(handler)
+    saved_level = mod.logger.level
+    mod.logger.setLevel(logging.INFO)    # pytest leaves the root at WARNING
     try:
         for k, v in swaps.items():
             setattr(mod, k, v)
         mod.RiyadhTime.now = staticmethod(lambda: NOW)
         yield run
     finally:
+        mod.logger.setLevel(saved_level)
         mod.logger.removeHandler(handler)
         mod.RiyadhTime.now = saved_now
         for k, v in saved.items():
@@ -269,9 +279,11 @@ def _h1_case(close, outcome):
     assert run.stats["matured"] == 1 and run.stats["outcome_skipped_reasons"] == {}
     assert tp._LAST_HIST_CLOSE == {"mode": "enforce", "candidates": 1, "witnessed": 1,
                                    "by_horizon": {"1W": 1}, "refused": {}, "matured": 1,
-                                   "pulls": 1, "deferred": 0}
+                                   "pulls": 1, "ok": 1, "failed": 0, "breaker": False,
+                                   "first_error": "", "deferred": 0}
     assert hist_lines(run) == ["[HIST-CLOSE v6.47.0] mode=enforce candidates=1 witnessed=1 "
-                               "(1W:1) matured=1 refused=0 (-) pulls=1 deferred=0"]
+                               "(1W:1) matured=1 refused=0 (-) pulls=1 ok=1 failed=0 "
+                               "breaker=closed deferred=0"]
 
 
 # ---------------------------------------------------------------- H2 -----
@@ -302,8 +314,22 @@ def test_h3_observe_measures_only():
     assert obs_rec.status == tp.PerformanceStatus.ACTIVE
     assert run.pulls == ["SYNTH.US"]
     assert hist_lines(run) == ["[HIST-CLOSE v6.47.0] mode=observe candidates=1 witnessed=1 "
-                               "(1W:1) matured=0 refused=0 (-) pulls=1 deferred=0"]
+                               "(1W:1) matured=0 refused=0 (-) pulls=1 ok=1 failed=0 "
+                               "breaker=closed deferred=0"]
     assert tp._LAST_HIST_CLOSE["witnessed"] == 1 and tp._LAST_HIST_CLOSE["matured"] == 0
+
+
+def test_h3b_observe_on_the_refusal_path_equals_off():
+    for label, bar_list, reason in REFUSALS:
+        off_rec, obs_rec = record(tp), record(tp)
+        off = audit(tp, [off_rec], [row()], bar_map={"SYNTH.US": bar_list})
+        obs = audit(tp, [obs_rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "observe"},
+                    bar_map={"SYNTH.US": bar_list})
+        assert state(obs_rec) == state(off_rec), label
+        assert "hist_close_reason" not in receipt(tp, obs_rec), label
+        assert obs.stats == off.stats, label
+        assert [m for m in obs.logs if not m.startswith("[HIST-CLOSE v")] == off.logs, label
+        assert tp._LAST_HIST_CLOSE["refused"] == {reason: 1}, label
 
 
 # ---------------------------------------------------------------- H4 -----
@@ -323,6 +349,9 @@ REFUSALS = [
     ("unreadable split", bars(extra=[{"date": "2026-10-07", "close": 104.0, "split": float("nan")}]),
      "hist_close_post_target_split"),
     ("subunit x100", bars(10400.0), "hist_close_scale_mismatch"),
+    ("event merged onto the target bar",
+     [b if b["date"] != SESSION else dict(b, close=94.5454, split=1.1) for b in bars()],
+     "hist_close_post_target_split"),
 ]
 
 
@@ -460,6 +489,208 @@ def test_h8_pure_helper_table():
             assert tp._hist_close_budget() == want, raw
 
 
+# ---------------------------------------------------------------- H9 -----
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def time(self):
+        return self.t
+
+
+def _clock_module(clock):
+    import time as _time
+    import types
+    ns = types.SimpleNamespace(**{k: getattr(_time, k) for k in dir(_time) if not k.startswith("_")})
+    ns.time = clock.time
+    return ns
+
+
+def test_h9_ca_guard_window_is_not_spent_by_hist_pulls():
+    """A hist pull slower than the whole CA window (300 s > 240 s) sits
+    between two in-session +20% records that need CA verification."""
+    in_session = CLOSE - timedelta(hours=4)
+    rows = [row(symbol="AAA.US", price=120.0), row(), row(symbol="CCC.US", price=120.0)]
+    out = {}
+    for mode in (None, "observe", "enforce"):
+        clock = FakeClock()
+
+        order = []
+
+        def slow_pull(symbol, clock=clock, order=order):
+            order.append("hist")
+            clock.t += 300.0
+            return bars()
+
+        def adjusted(symbol, entry_date, target_session=None, clock=clock, order=order):
+            order.append("ca")
+            clock.t += 1.0
+            return 20.0
+        recs = [record(tp, symbol="AAA.US", target=in_session), record(tp),
+                record(tp, symbol="CCC.US", target=in_session)]
+        env = {} if mode is None else {"TRACK_HIST_TARGET_CLOSE": mode}
+        run = audit(tp, recs, rows, env=env, ca_guard=True,
+                    patches={"time": _clock_module(clock), "_hist_close_pull": slow_pull,
+                             "_ca_adjusted_roi": adjusted, "_ca_ledger_factor": lambda *a, **k: None})
+        run.order = order
+        out[mode] = (recs, run)
+    off_recs, off_run = out[None]
+    assert [r.status for r in off_recs] == [tp.PerformanceStatus.MATURED, tp.PerformanceStatus.ACTIVE,
+                                           tp.PerformanceStatus.MATURED]
+    obs_recs, obs_run = out["observe"]
+    assert [state(r) for r in obs_recs] == [state(r) for r in off_recs]
+    assert obs_run.stats == off_run.stats
+    assert obs_run.order == ["ca", "ca", "hist"]          # observe never interleaves with CA work
+    assert out["enforce"][1].order == ["ca", "hist", "ca"]
+    enf_recs, enf_run = out["enforce"]
+    assert all(r.status == tp.PerformanceStatus.MATURED for r in enf_recs)
+    assert enf_run.stats["ca_deferred"] == 0
+    assert enf_recs[2].realized_roi == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------- H10 ----
+def test_h10_failed_pulls_are_counted_and_the_breaker_opens():
+    enforce = {"TRACK_HIST_TARGET_CLOSE": "enforce"}
+    syms = ["E1.US", "E2.US", "E3.US", "E4.US"]
+
+    def failing(symbol):
+        raise RuntimeError("boom")
+    recs = [record(tp, symbol=s) for s in syms]
+    run = audit(tp, recs, [row(symbol=s) for s in syms], env=enforce,
+                patches={"_hist_close_pull": failing, "_mature_grace_days": lambda: 0})
+    assert all(r.status == tp.PerformanceStatus.ACTIVE for r in recs)
+    assert [receipt(tp, r)["hist_close_reason"] for r in recs] == [
+        "hist_close_pull_error"] * 3 + ["hist_close_breaker_open"]
+    st = tp._LAST_HIST_CLOSE
+    assert (st["pulls"], st["ok"], st["failed"], st["breaker"], st["first_error"], st["deferred"]) == \
+        (3, 0, 3, True, "RuntimeError", 1)
+    assert hist_lines(run)[0].endswith("pulls=3 ok=0 failed=3 first_error=RuntimeError breaker=open deferred=1")
+
+    class YFRateLimitError(Exception):
+        pass
+
+    def limited(symbol):
+        raise YFRateLimitError("429")
+    recs = [record(tp, symbol=s) for s in syms[:2]]
+    audit(tp, recs, [row(symbol=s) for s in syms[:2]], env=enforce, patches={"_hist_close_pull": limited})
+    assert [receipt(tp, r)["hist_close_reason"] for r in recs] == [
+        "hist_close_pull_error", "hist_close_breaker_open"]
+    assert tp._LAST_HIST_CLOSE["failed"] == 1 and tp._LAST_HIST_CLOSE["breaker"] is True
+    assert tp._LAST_HIST_CLOSE["first_error"] == "YFRateLimitError"
+
+    calls = []
+
+    def flaky(symbol):
+        calls.append(symbol)
+        if symbol == "E1.US":
+            raise RuntimeError("once")
+        return bars()
+    recs = [record(tp, symbol="E1.US"), record(tp, symbol="E1.US", horizon="WEEK_2"),
+            record(tp, symbol="E2.US")]
+    audit(tp, recs, [row(symbol="E1.US"), row(symbol="E2.US")], env=enforce,
+          patches={"_hist_close_pull": flaky})
+    assert calls == ["E1.US", "E2.US"]                        # a failed symbol is not retried
+    assert [r.status for r in recs] == [tp.PerformanceStatus.ACTIVE, tp.PerformanceStatus.ACTIVE,
+                                        tp.PerformanceStatus.MATURED]
+    st = tp._LAST_HIST_CLOSE
+    assert (st["ok"], st["failed"], st["breaker"]) == (1, 1, False)
+
+
+# ---------------------------------------------------------------- H11 ----
+def test_h11_unmatured_substitution_keeps_the_live_mark():
+    enforce = {"TRACK_HIST_TARGET_CLOSE": "enforce"}
+    rec = record(tp)
+    audit(tp, [rec], [row(price=150.0)], env=enforce, bar_map={"SYNTH.US": bars(130.0)}, ca_guard=True,
+          patches={"_ca_budget_state": lambda s: "exhausted", "_ca_ledger_factor": lambda *a, **k: None})
+    assert rec.status == tp.PerformanceStatus.ACTIVE and rec.outcome is None
+    assert rec.current_price == 150.0 and rec.unrealized_roi == pytest.approx(50.0)
+    proof = receipt(tp, rec)
+    assert proof["reason"] == "corporate_action_verification_pending"
+    assert proof["quote_kind"] == "historical_daily_close" and proof["price"] == 130.0
+    assert tp._LAST_HIST_CLOSE["witnessed"] == 1 and tp._LAST_HIST_CLOSE["matured"] == 0
+
+    def adjusted_none(symbol, entry_date, target_session=None):
+        tp._CA_BARS_CACHE["SYNTH"] = [{"date": SESSION, "close": 130.0}]
+        return None
+    rec = record(tp)
+    audit(tp, [rec], [row(price=150.0)], env=enforce, bar_map={"SYNTH.US": bars(130.0)}, ca_guard=True,
+          patches={"_ca_adjusted_roi": adjusted_none, "_ca_ledger_factor": lambda *a, **k: None})
+    tp._CA_BARS_CACHE.clear()
+    assert rec.status == tp.PerformanceStatus.EXPIRED and rec.outcome == "CORP_ACTION_SUSPECT"
+    assert rec.current_price == 150.0 and rec.unrealized_roi == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------- H12 ----
+def _fake_yfinance(frame, seen, fail=None):
+    import types
+    mod = types.ModuleType("yfinance")
+
+    class Ticker:
+        def __init__(self, sym):
+            seen.append(("ticker", sym))
+
+        def history(self, **kw):
+            seen.append(("history", kw))
+            if fail is not None:
+                raise fail
+            return frame
+    mod.Ticker = Ticker
+    return mod
+
+
+@contextlib.contextmanager
+def _yf_installed(module):
+    saved = sys.modules.get("yfinance")
+    sys.modules["yfinance"] = module
+    try:
+        yield
+    finally:
+        if saved is None:
+            sys.modules.pop("yfinance", None)
+        else:
+            sys.modules["yfinance"] = saved
+
+
+def _frame(pd, merged_split=False):
+    days = [b["date"] for b in bars()]
+    closes = [b["close"] for b in bars()]
+    splits = [0.0] * len(days)
+    if merged_split:
+        i = days.index(SESSION)
+        closes[i], splits[i] = 94.5454, 1.1      # an event dated on a no-bar day, merged back
+    idx = pd.DatetimeIndex(days).tz_localize("America/New_York")
+    return pd.DataFrame({"Open": closes, "High": closes, "Low": closes, "Close": closes,
+                         "Adj Close": closes, "Volume": [1000.0] * len(days),
+                         "Dividends": [0.0] * len(days), "Stock Splits": splits}, index=idx)
+
+
+def test_h12_real_pull_parser_over_a_yfinance_frame():
+    pd = pytest.importorskip("pandas")
+    real_pull = tp._hist_close_pull
+    seen = []
+    with _yf_installed(_fake_yfinance(_frame(pd), seen)):
+        rows = real_pull("SYNTH.US")
+    assert seen[0] == ("ticker", "SYNTH")
+    assert seen[1] == ("history", {"period": "1y", "interval": "1d", "auto_adjust": False, "actions": True})
+    assert rows == [{"date": b["date"], "close": b["close"], "split": 0.0} for b in bars()]
+    with _yf_installed(_fake_yfinance(pd.DataFrame(), [])):
+        assert real_pull("SYNTH.US") == []
+    with _yf_installed(_fake_yfinance(None, [], fail=RuntimeError("429"))):
+        with pytest.raises(RuntimeError):
+            real_pull("SYNTH.US")
+    rec = record(tp)
+    with _yf_installed(_fake_yfinance(_frame(pd, merged_split=True), [])):
+        audit(tp, [rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "enforce"},
+              patches={"_hist_close_pull": real_pull})
+    assert rec.status == tp.PerformanceStatus.ACTIVE and rec.outcome is None
+    assert receipt(tp, rec)["hist_close_reason"] == "hist_close_post_target_split"
+    rec = record(tp)
+    with _yf_installed(_fake_yfinance(_frame(pd), [])):
+        audit(tp, [rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "enforce"},
+              patches={"_hist_close_pull": real_pull})
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi == pytest.approx(4.0)
+
+
 # ---------------------------------------------------------------- N1 -----
 def _mixed(mod):
     """quote_outside / matured-now / price_unavailable / stale / bad entry."""
@@ -472,6 +703,10 @@ def _mixed(mod):
              row(symbol="OLD.US", quote=CLOSE - timedelta(days=1)), row(symbol="BAD.US")])
 
 
+def _norm_logs(mod, logs):
+    return [m.replace(mod.SCRIPT_VERSION, "X") for m in logs]
+
+
 def test_n1_off_is_byte_identical_to_v6_45_0():
     b = base()
     want_recs, rows = _mixed(b)
@@ -482,10 +717,16 @@ def test_n1_off_is_byte_identical_to_v6_45_0():
         got = audit(tp, got_recs, rows, env=env, bar_map={"SYNTH.US": bars()})
         assert [state(r) for r in got_recs] == [state(r) for r in want_recs], spelling
         assert got.stats == want.stats, spelling
+        assert _norm_logs(tp, got.logs) == _norm_logs(b, want.logs), spelling
         assert got.pulls == [], spelling
-    obs_recs, rows = _mixed(tp)
-    audit(tp, obs_recs, rows, env={"TRACK_HIST_TARGET_CLOSE": "observe"}, bar_map={"SYNTH.US": bars()})
-    assert [state(r) for r in obs_recs] == [state(r) for r in want_recs]
+    for bar_list in (bars(), bars(drop_target=True)):
+        obs_recs, rows = _mixed(tp)
+        obs = audit(tp, obs_recs, rows, env={"TRACK_HIST_TARGET_CLOSE": "observe"},
+                    bar_map={"SYNTH.US": bar_list})
+        assert [state(r) for r in obs_recs] == [state(r) for r in want_recs]
+        assert obs.stats == want.stats
+        assert _norm_logs(tp, [m for m in obs.logs if not m.startswith("[HIST-CLOSE v")]) == \
+            _norm_logs(b, want.logs)
 
 
 # ---------------------------------------------------------------- N2 -----
@@ -529,16 +770,20 @@ def test_n3_workflow_mapping_version_and_pin():
     src = DELIVERED.read_text(encoding="utf-8")
     assert re.search(r'os\.getenv\("TRACK_HIST_TARGET_CLOSE"\)\s*or\s*"off"', src)
     assert tuple(int(x) for x in tp.SCRIPT_VERSION.split(".")) >= (6, 47, 0)
-    assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]
+    assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]   # docstring follows the constant
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '("track_performance", "%s", "track performance")' % tp.SCRIPT_VERSION in vd
-    assert src.index("# v6.47.0 (2026-10-21)") < src.index('SCRIPT_VERSION = "6.47.0"')
+    version_line = re.search(r'^SCRIPT_VERSION = "[0-9.]+"', src, re.M)
+    assert version_line, "SCRIPT_VERSION line missing"
+    assert src.index("# v6.47.0 (2026-10-21)") < version_line.start()
     assert src.index("# v6.45.0 (2026-10-11): integrate") < src.index("# v6.47.0 (2026-10-21)")
 
 
 # ---------------------------------------------------------------- N4 -----
 def test_n4_added_lines_are_ascii_and_nothing_removed():
     b = base()
+    if tp.SCRIPT_VERSION != "6.47.0":
+        pytest.skip("exact 55b47f24 -> 6.47.0 diff checks apply to 6.47.0 only")
     import difflib
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
     new = DELIVERED.read_text(encoding="utf-8").splitlines()
@@ -558,7 +803,7 @@ def test_n4_added_lines_are_ascii_and_nothing_removed():
     assert not gone, gone
     assert fns("\n".join(new)) - fns("\n".join(old)) == {
         "_hist_target_close_mode", "_hist_close_budget", "_hist_close_time_sec", "_hist_close_pull",
-        "_hist_close_bars", "_hist_target_close", "_hist_close_evidence"}
+        "_hist_close_bars", "_hist_target_close", "_hist_close_evidence", "_hist_close_judge"}
 
 
 def _digest():
