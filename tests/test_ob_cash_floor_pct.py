@@ -197,6 +197,15 @@ def test_t5_stricter_of():
     lo = _build(pct="10", mode="enforce", abs_sar=5000)
     assert lo["meta"]["cash_floor"]["floor_sar"] == 9000.0
     assert lo["kpis"]["deployable_sar"] == 21000
+    # v1.27.4: a LOWER absolute reserve is named in the alert (a reader can re-apply max(abs, pct x NAV) to a later
+    # NAV); the stricter form above and the percent-only form are unchanged
+    ra = _alert(lo)["required_action"]
+    assert "(absolute reserve TFB_OPP_CASH_FLOOR_SAR 5,000 SAR is lower)" in ra and "is the stricter" not in ra
+    assert ra.startswith("Cash floor 10% of NAV 90,000 SAR = 9,000 SAR (absolute reserve") and "ENFORCED: deployable 21,000 SAR" in ra
+    only = _alert(_build(pct="10", mode="enforce"))["required_action"]
+    assert "absolute reserve" not in only and only.startswith("Cash floor 10% of NAV 90,000 SAR = 9,000 SAR ENFORCED")
+    obs_lo = _alert(_build(pct="10", abs_sar=5000))["required_action"]
+    assert "(absolute reserve TFB_OPP_CASH_FLOOR_SAR 5,000 SAR is lower) (observe)" in obs_lo
 
 
 # ---- T6 NAV basis ----------------------------------------------------------------

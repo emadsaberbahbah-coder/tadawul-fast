@@ -1529,7 +1529,86 @@ from typing import Optional
 #   _conviction_weight, _conviction_targets, _sizing_cohort). Removed: 0.
 #   Rollback: unset TFB_OPP_SIZING_MODE, or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.0"
+# -----------------------------------------------------------------------------
+# v1.27.1 (2026-10-20) — ROTATION ROI BASIS (owner request)
+# WHY: the rotation funding plan (v1.18.0) compares an unfunded seat with the
+#   held names on the engine's 12-MONTH forecast (engine_roi_12m_pct) with an
+#   8 pp hurdle. The owner reasons on the 3-month plan ("an opportunity with
+#   20% over the next 3 months while a holding is expected to make 14%"):
+#   on the 12M basis that pair never rotates (6 pp − 1.1% cost < 8 pp), and the
+#   cockpit cannot show the 3M view at all.
+# WHAT: gate TFB_OPP_ROTATION_BASIS = 12m (DEFAULT) | plan3m, read per call.
+#   12m    -> v1.27.0 byte-identical (same map, same hurdle, same text).
+#   plan3m -> _holding_roi_map reads the pool row's plan-TP1 ROI
+#             (_tp1_plan_roi: (TP1 − price) / price from the CURRENT price —
+#             the "ROI % (TP1)" column, i.e. the holding's remaining upside to
+#             its first target; NOT cand["roi_pct"], which is the valuation /
+#             TP2 upside) for the held names, the ordered needs carry the
+#             seat's plan-TP1 ROI, and the hurdle is TFB_OPP_ROTATION_EDGE_PP_3M
+#             (default 5 pp; TFB_OPP_ROTATION_EDGE_PP stays the 12m hurdle).
+#             The deferral text, the rotation_proposal alert and the new
+#             additive kpis.rotation_basis name the basis in use ("engine 12M"
+#             / "plan 3M"), so a reader can never mistake one for the other.
+# NOT CHANGED: eligibility (min held days, TP1 proximity, exclusions, the
+#   degraded-forecast guard), the one-rotation-per-run rule, R1/R2 floor
+#   guards, TRIM/EXIT semantics, capital calls, sizing, gates, tickets.
+#   Functions added: 2 (_env_rotation_basis, _rotation_basis_label).
+#   Changed: _env_rotation_edge_pp (basis-aware hurdle), _holding_roi_map
+#   (basis-aware map), _funding_plan_text (label), the ordered-needs tuple and
+#   the rotation_proposal alert (label). Removed: 0.
+#   Rollback: unset TFB_OPP_ROTATION_BASIS, or git revert.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.27.2 (2026-10-20) — CONVICTION SIZING: AN EXHAUSTED BUDGET IS NOT A RELEASE
+# WHY: under TFB_OPP_SIZING_MODE=conviction, _conviction_targets returns {}
+#   when the deployable budget is zero (or below one minimum ticket), and
+#   _select_and_size then deferred EVERY cohort seat as "weighted share below
+#   the minimum ticket floor — budget released to higher-conviction seats" —
+#   a release that never happened. Those seats never reached `picked`, so the
+#   funding layer (v1.18.0) recorded no need: with no cash, conviction mode
+#   produced no capital call and never proposed a rotation, while cap mode
+#   produced three capital calls and the rotation. Found while mirroring the
+#   allocation on the Decision Pages v2 sheet (review of PR #803).
+# WHAT: when the cohort seat is not in the targets AND the targets are empty,
+#   the seat falls through as a 0-SAR pick (suggested 0, capital exhausted),
+#   exactly as cap mode does; the unfunded-pick path then records the need
+#   (minimum ticket) and _funding_plans can propose the rotation or report
+#   the capital call. A seat released while OTHER seats kept a target (the
+#   budget really was re-spread) is the same deferral as v1.27.0.
+# NOT CHANGED: cap mode (byte-identical), weights, water-filling, the cap,
+#   top-up, the research stage, gates, tickets, the rotation rule.
+#   Functions added: 0. Changed: _select_and_size (one branch). Removed: 0.
+#   Rollback: TFB_OPP_SIZING_MODE=cap (default), or git revert.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.27.3 (2026-10-20) — CONVICTION SIZING: CAP INFEASIBILITY IS NOT EXHAUSTION
+# WHY: v1.27.2 read EVERY all-empty water-fill as capital exhaustion. The
+#   targets are also empty when the per-seat cap (Max Weight % x budget) is
+#   below the minimum ticket while cash is plentiful (5,000 SAR cash, 15%
+#   cap = 750 SAR, 2,000 SAR floor); treating that as exhaustion would
+#   record needs for tickets the cap forbids (review of PR #803).
+# WHAT: when the cohort is empty, remaining > 0, remaining >= floor and
+#   cap < floor, every cohort seat is deferred "per-seat cap X below the
+#   minimum ticket floor Y — infeasible under the cap" and no need is
+#   recorded. Exhaustion (remaining == 0 or below one ticket) is unchanged
+#   from v1.27.2; cap mode is unchanged.
+#   Functions added: 0. Changed: _select_and_size (one guard). Removed: 0.
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# v1.27.4 (2026-10-20) — CASH-FLOOR ALERT NAMES A LOWER ABSOLUTE RESERVE
+# WHY: with both TFB_OPP_CASH_FLOOR_PCT and TFB_OPP_CASH_FLOOR_SAR set and the
+#   percent floor the stricter, the cash_floor alert stated only the percent
+#   figure, so a reader re-applying the rule to a later NAV (Decision Pages v2
+#   mirrors the reserve from this alert) could not keep max(absolute,
+#   pct x NAV) once a falling NAV made the absolute reserve the stricter
+#   (review of PR #803).
+# WHAT: in that case the alert head adds "(absolute reserve
+#   TFB_OPP_CASH_FLOOR_SAR <amount> is lower)". Text only: the floor, the
+#   reserve, sizing, funding, KPIs and meta are unchanged; the other alert
+#   forms (percent only, absolute stricter, absolute alone) are byte-identical.
+#   Functions added: 0. Changed: _cash_floor_alert_text (one branch). Removed: 0.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.27.4"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -5481,6 +5560,11 @@ def _cash_floor_alert_text(ctx):
             _fmt_sar(ctx.get("floor_sar"))))
         if ctx.get("abs_floor_sar") and ctx["abs_floor_sar"] >= ctx.get("pct_floor_sar", 0.0):
             head += " (absolute reserve TFB_OPP_CASH_FLOOR_SAR is the stricter)"
+        elif ctx.get("abs_floor_sar"):
+            # v1.27.4: name the lower absolute reserve too, so the rule can be
+            # re-applied to a later NAV as max(absolute, pct x NAV)
+            head += (" (absolute reserve TFB_OPP_CASH_FLOOR_SAR %s is lower)"
+                     % _fmt_sar(ctx["abs_floor_sar"]))
     if ctx.get("mode") == "enforce":
         return (head + " ENFORCED: deployable %s (reserve kept out of sizing "
                 "and funding)." % _fmt_sar(ctx.get("deployable_post_sar")))
@@ -5682,7 +5766,29 @@ def _env_funding_plan():
         not in ("0", "false", "off", "no")
 
 
+def _env_rotation_basis():
+    """v1.27.1: TFB_OPP_ROTATION_BASIS = 12m (default; v1.27.0 byte-identical)
+    | plan3m (the pool row's plan-TP1 ROI, _tp1_plan_roi, for the held names
+    and the unfunded seats alike). Any other value -> 12m."""
+    v = str(_env_str("TFB_OPP_ROTATION_BASIS", "12m") or "12m").strip().lower()
+    return "plan3m" if v == "plan3m" else "12m"
+
+
+def _rotation_basis_label():
+    """v1.27.1 PURE text: the basis named in deferral text and alerts."""
+    return "plan 3M" if _env_rotation_basis() == "plan3m" else "engine 12M"
+
+
 def _env_rotation_edge_pp():
+    """Rotation hurdle in percentage points after cost. 12m basis:
+    TFB_OPP_ROTATION_EDGE_PP (default 8). plan3m basis (v1.27.1):
+    TFB_OPP_ROTATION_EDGE_PP_3M (default 5)."""
+    if _env_rotation_basis() == "plan3m":
+        try:
+            v3 = float(_env_str("TFB_OPP_ROTATION_EDGE_PP_3M", "5") or 5.0)
+            return v3 if v3 >= 0 else 5.0
+        except (TypeError, ValueError):
+            return 5.0
     try:
         v = float(_env_str("TFB_OPP_ROTATION_EDGE_PP", "8") or 8.0)
         return v if v >= 0 else 8.0
@@ -5744,6 +5850,7 @@ def _holding_roi_map(audit_rows, holdings):
     forecast in the map and never rotates."""
     pool = {}
     _guard = _env_rotation_floor_guard()   # v1.19.4
+    _plan3m = _env_rotation_basis() == "plan3m"   # v1.27.1
     for a in (audit_rows or []):
         c = a.get("_cand") if isinstance(a, dict) else None
         if not isinstance(c, dict):
@@ -5752,6 +5859,9 @@ def _holding_roi_map(audit_rows, holdings):
         if not s:
             continue
         if _guard and _holding_forecast_degraded(c):   # v1.19.4 [R3]
+            continue
+        if _plan3m:   # v1.27.1: the held name's remaining upside to its plan TP1 from the current price
+            pool[s] = _tp1_plan_roi(c)   # (tp1 - price) / price; None without a ladder -> never rotates
             continue
         pool[s] = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
     out = {}
@@ -5905,7 +6015,8 @@ def _funding_plan_text(plan, remaining):
         r = plan["rotation"]
         txt = (" | FUNDABLE_BY_ROTATION: " + r["action"].lower() + " " +
                r["symbol"] + " " + _fmt_sar(r["proceeds_sar"]) +
-               " (engine 12M edge +" + _fmt_num(r["edge_pp"]) + "pp after cost)"
+               " (" + _rotation_basis_label() + " edge +" + _fmt_num(r["edge_pp"]) +
+               "pp after cost)"
                " \u2192 ticket " + _fmt_sar(plan["need_sar"]))
         if (plan.get("shortfall_sar") or 0) > 0:
             txt += "; residual CAPITAL_CALL " + _fmt_sar(plan["shortfall_sar"])
@@ -5921,8 +6032,8 @@ def _funding_plan_text(plan, remaining):
         if _ins:
             txt += (" \u2014 ROTATION_INSUFFICIENT: exit " + _ins["symbol"] +
                     " covers " + _fmt_sar(_ins["covers_sar"]) + " of " +
-                    _fmt_sar(_ins["short_sar"]) + " (engine 12M edge +" +
-                    _fmt_num(_ins["edge_pp"]) + "pp after cost); no exit proposed")
+                    _fmt_sar(_ins["short_sar"]) + " (" + _rotation_basis_label() +
+                    " edge +" + _fmt_num(_ins["edge_pp"]) + "pp after cost); no exit proposed")
         return txt
     return ""
 
@@ -6194,12 +6305,34 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             # v1.27.0: the seat's conviction target bounds its allocation;
             # a cohort seat released by the floor rule is a countable deferral.
             if cand["symbol"] in _sz_cohort and cand["symbol"] not in _sz_targets:
-                deferrals[cand["symbol"]] = (
-                    "Conviction sizing: weighted share below the minimum ticket floor "
-                    "\u2014 budget released to higher-conviction seats")
-                continue
-            suggested, shares = _size_one(cand, criteria, budget_base,
-                                          min(remaining, _sz_targets.get(cand["symbol"], 0.0)))
+                _sz_floor = float(criteria.get("min_ticket_sar", 0.0) or 0.0)
+                if _sz_targets:
+                    deferrals[cand["symbol"]] = (
+                        "Conviction sizing: weighted share below the minimum ticket floor "
+                        "\u2014 budget released to higher-conviction seats")
+                    continue
+                if remaining > 0.0 and remaining >= _sz_floor and _sz_cap < _sz_floor:
+                    # v1.27.3: the whole cohort is empty because the per-seat
+                    # cap itself is below the minimum ticket while cash is
+                    # available — infeasible under the cap, NOT exhaustion;
+                    # no need is recorded (a 2,000 SAR ticket under a 750 SAR
+                    # cap is not something a rotation may fund).
+                    deferrals[cand["symbol"]] = (
+                        "Conviction sizing: per-seat cap " + _fmt_sar(_sz_cap) +
+                        " below the minimum ticket floor " + _fmt_sar(_sz_floor) +
+                        " \u2014 infeasible under the cap (raise Max Weight % or the cash)")
+                    continue
+                # v1.27.2: the WHOLE cohort came back unfunded — the budget is
+                # exhausted (or below one minimum ticket), not re-spread to a
+                # higher-conviction seat. That is capital exhaustion: fall
+                # through as a 0-SAR pick exactly as cap mode does, so the
+                # funding layer records the need (minimum ticket) and can
+                # propose a rotation or a capital call instead of a deferral
+                # that names a release which never happened.
+                suggested, shares = 0.0, 0
+            else:
+                suggested, shares = _size_one(cand, criteria, budget_base,
+                                              min(remaining, _sz_targets.get(cand["symbol"], 0.0)))
         else:
             suggested, shares = _size_one(cand, criteria, budget_base, remaining)
         # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
@@ -7175,12 +7308,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     _needs[_s] = {"need_sar": _nf, "sized_sar": 0.0,
                                   "remaining_sar": float(remaining)}
             _ordered = []
+            _plan3m_basis = _env_rotation_basis() == "plan3m"   # v1.27.1
             for _a in invest:  # rank order, only final eligible seats have needs
                 _s = _a["symbol"]
                 if _s in _needs:
-                    _ordered.append((
-                        _s, _needs[_s]["need_sar"],
-                        _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))))
+                    if _plan3m_basis:
+                        _opp_roi = _tp1_plan_roi(_a["_cand"])   # v1.27.1: the seat's plan-TP1 ROI
+                    else:
+                        _opp_roi = _engine_roi_to_pct(_a["_cand"].get("engine_roi_12m_pct"))
+                    _ordered.append((_s, _needs[_s]["need_sar"], _opp_roi))
             if _ordered:
                 _hold_roi = _holding_roi_map(audit, pf["holdings"])
                 _fp_plans = _funding_plans(
@@ -7285,6 +7421,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             1 for pl in _fp_plans if pl["state"] == "CAPITAL_CALL")
         kpis["capital_call_topn_sar"] = round(sum(
             (pl.get("shortfall_sar") or 0.0) for pl in _fp_plans[:_topn]), 0)
+        kpis["rotation_basis"] = _rotation_basis_label()   # v1.27.1 additive
         if _env_rotation_floor_guard():   # v1.19.4 additive key
             kpis["rotation_insufficient"] = sum(
                 1 for pl in _fp_plans if pl.get("rotation_insufficient"))
@@ -7341,7 +7478,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 "required_action": (
                     _rot[0]["symbol"] + " is fundable by " + _r["action"].lower() +
                     " of " + _r["symbol"] + " " + _fmt_sar(_r["proceeds_sar"]) +
-                    " (engine 12M edge +" + _fmt_num(_r["edge_pp"]) +
+                    " (" + _rotation_basis_label() + " edge +" + _fmt_num(_r["edge_pp"]) +
                     "pp after cost). A rotation is a ticket, not an order: "
                     "written GO with a live quote required."),
             })
