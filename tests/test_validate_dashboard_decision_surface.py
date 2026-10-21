@@ -47,7 +47,10 @@ def _riyadh_stamp(minutes_ago: float) -> str:
     return t.strftime("%Y-%m-%d %H:%M:%S")
 
 
-RUNNING = [["TOP 10 INVESTMENTS"], ["", "Last run " + _riyadh_stamp(1) + " | status: running…"]]
+def _running():
+    """A fresh running stamp, built when the test runs (a module-level stamp
+    ages past the 8-minute window in a long whole-suite run)."""
+    return [["TOP 10 INVESTMENTS"], ["", "Last run " + _riyadh_stamp(1) + " | status: running…"]]
 STUCK = [["TOP 10 INVESTMENTS"], ["", "Last run 2026-10-20 19:20:00 | status: running…"]]
 NOSTAMP = [["TOP 10 INVESTMENTS"], ["", "Last run (clock unavailable) | status: running…"]]
 FAILED = [["TOP 10 INVESTMENTS"],
@@ -85,14 +88,14 @@ def _run(script, monkeypatch, reads=None):
 
 
 def test_v1_running_then_board(monkeypatch):
-    res, calls, slept = _run([RUNNING, BOARD], monkeypatch)
+    res, calls, slept = _run([_running(), BOARD], monkeypatch)
     assert res["decision.header_found"].status == "PASS"
     assert len(calls) == 2 and len(slept) == 1
     assert res["decision.feed_banner_present"].status == "PASS"
 
 
 def test_v2_running_throughout_fails_with_reason(monkeypatch):
-    res, calls, slept = _run([RUNNING], monkeypatch)
+    res, calls, slept = _run([_running()], monkeypatch)
     r = res["decision.header_found"]
     assert r.status == "FAIL" and len(calls) == 4 and len(slept) == 3
     assert "status: running" in r.detail and "after 3 in-progress re-read(s)" in r.detail
@@ -120,7 +123,7 @@ def test_v3_failed_status_fails_at_once(monkeypatch):
 
 
 def test_v4_zero_rereads_is_v130(monkeypatch):
-    res, calls, slept = _run([RUNNING, BOARD], monkeypatch, reads=0)
+    res, calls, slept = _run([_running(), BOARD], monkeypatch, reads=0)
     assert res["decision.header_found"].status == "FAIL" and len(calls) == 1 and slept == []
 
 

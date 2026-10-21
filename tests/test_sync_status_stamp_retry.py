@@ -14,7 +14,8 @@ as one unit on transient errors and re-reads column A on every attempt.
 Pinned here:
   S1 a read timeout heals on a later attempt; the row is updated in place
   S2 a read that times out on every attempt gives up after the configured
-     attempts with an ::error:: naming the cohort consequence; nothing written
+     attempts with the v6.70.0 '::warning:: ... stamp FAILED' annotation, now
+     naming the attempts and the cohort consequence; nothing written
   S3 a non-transient error is not retried (one attempt, no sleep)
   S4 an append whose response was lost is NOT appended twice: the next
      attempt re-reads column A, finds the row and updates it
@@ -132,7 +133,7 @@ def test_s1_read_timeout_heals_on_retry(armed, capsys):
     assert api.grid[2] == PAYLOAD
     assert armed == [3.0, 8.0]
     out = capsys.readouterr().out
-    assert out.count("::warning::") == 2 and "::error::" not in out
+    assert out.count("::warning::") == 2 and "stamp FAILED" not in out
     assert "attempt 1/4" in out and "attempt 2/4" in out
 
 
@@ -143,9 +144,9 @@ def test_s2_exhausted_reports_error_with_consequence(armed, capsys):
     assert api.grid[2] == ["Global_Markets"]          # untouched
     assert armed == [3.0, 8.0, 15.0]
     out = capsys.readouterr().out
-    assert out.count("::error::") == 1
-    assert "after 4 attempt(s)" in out and "cohort mismatch" in out
-    assert "could not read _Status key column for Global_Markets" in out
+    assert out.count("stamp FAILED") == 1 and "::error::" not in out
+    assert "::warning::[STATUS-STAMP v6.70.2] stamp FAILED for Global_Markets after 4 attempt(s)" in out
+    assert "cohort mismatch" in out and "could not read _Status key column" in out
 
 
 def test_s3_non_transient_is_not_retried(armed, capsys):
@@ -154,7 +155,7 @@ def test_s3_non_transient_is_not_retried(armed, capsys):
     assert [c[0] for c in api.calls] == ["get"]
     assert armed == []
     out = capsys.readouterr().out
-    assert "::error::" in out and "after 1 attempt(s)" in out
+    assert "stamp FAILED for Global_Markets after 1 attempt(s)" in out
 
 
 def test_s4_lost_append_response_is_not_duplicated(armed):
@@ -182,7 +183,7 @@ def test_s6_transient_write_failure_retried(armed, capsys):
     assert api.grid[2] == PAYLOAD and armed == [3.0]
     out = capsys.readouterr().out
     assert "could not write the _Status row for Global_Markets (attempt 1/4)" in out
-    assert "::error::" not in out
+    assert "stamp FAILED" not in out
 
 
 @pytest.mark.parametrize("raw,want", [("", 4), ("0", 1), ("1", 1), ("3", 3), ("6", 6),
