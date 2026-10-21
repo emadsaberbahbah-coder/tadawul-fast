@@ -211,9 +211,13 @@ def test_t8b_new_venue_skips_its_own_holiday(symbol, now, closed_day, prev_day):
 
 
 @pytest.mark.parametrize("symbol", ["OTE.AT"])
-def test_t8c_new_venue_follows_the_same_three_verdicts(symbol):
+def test_t8c_new_venue_follows_the_same_three_verdicts(symbol, monkeypatch):
     """Same contract as T5, through the real assessment and the real ASEX
-    calendar."""
+    calendar. The live window is narrowed to 0.6 s so the calendar branch is
+    exercised whatever the wall clock: CI run 39615679706 ran 6 min after the
+    Athens close, the close-minus-30s quote was inside the default 15-min live
+    window, and the builder (correctly) answered 'live' instead."""
+    monkeypatch.setenv("TFB_TICKET_MAX_QUOTE_AGE_MIN", "0.01")
     now = datetime.now(timezone.utc)
     is_open, prev_close = ob._venue_state(symbol, now)
     if is_open:
