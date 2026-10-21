@@ -2,12 +2,28 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.1)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.1 (2026-10-21) — DECISION SURFACE: IN-PROGRESS RENDER + COCKPIT STATUS
+--------------------------------------------------------------------------------
+WHY: in sync run 39513589733 the global-markets and mutual-funds legs failed
+on "cockpit data-grid header (Rank|Symbol) not found in first 16 rows". The
+Top_10 cockpit run begun ~16:20 UTC had died hours earlier while its status
+line still read "status: running…" (it writes that line first, then the
+board), and the FAIL gave no hint why the grid was absent.
+WHAT: (1) a header FAIL quotes the cockpit status line ("Last run ... |
+status: ..."); (2) a running stamp older than VALIDATE_T10_INPROGRESS_MAX_AGE_MIN
+(default 8; Apps Script stops runs at 6 minutes) FAILs at once as a stuck
+cockpit run that must be re-run; (3) a RECENT running stamp (a render really
+in progress) is re-read VALIDATE_T10_INPROGRESS_READS times (default 3; 0 =
+v1.3.0) after VALIDATE_T10_INPROGRESS_WAIT_S (default 30). The checks, their
+statuses and the exit-code contract are unchanged: a board that never appears
+still FAILs, and nothing is skipped or downgraded.
+
 v1.3.0 (2026-08-23) — W1A-1: ROUTE-AWARE SCOPE, OPEN VALIDATION, HONEST SAMPLING
 --------------------------------------------------------------------------------
 WHY (external audits 2026-08-22/23, adjudicated): (a) P1-1 — this validator
@@ -270,7 +286,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -1000,15 +1016,61 @@ def _find_feed_banner(grid: List[List[Any]], upto: int) -> str:
     return ""
 
 
+def _cockpit_status_line(grid: List[List[Any]]) -> str:
+    """v1.3.1: the cockpit's own run line ('Last run <stamp> | status: <s>
+    ...', 16_Decision_Top10.gs dt10StatusLine_) from the scanned rows, or ''.
+    Read-only; used to explain a missing grid and to detect a render in
+    progress."""
+    for row in grid or []:
+        if not isinstance(row, list):
+            continue
+        for c in row:
+            txt = _safe_str(c).strip()
+            if "| status:" in txt and txt.lower().startswith("last run"):
+                return txt
+    return ""
+
+
+def _cockpit_render_in_progress(grid: List[List[Any]]) -> bool:
+    """v1.3.1: True while the cockpit says 'status: running' (it writes that
+    line first, then the board). A grid read in that window is an
+    in-progress table, not a published one."""
+    line = _cockpit_status_line(grid).lower()
+    return "| status: running" in line
+
+
+def _cockpit_status_age_min(line: str, now_utc: Optional[datetime] = None) -> Optional[float]:
+    """v1.3.1: minutes since the cockpit's 'Last run yyyy-MM-dd HH:mm:ss'
+    stamp, or None when it cannot be read. dt10StatusLine_ formats the stamp
+    in the Apps Script project time zone (Riyadh, UTC+3);
+    VALIDATE_T10_COCKPIT_UTC_OFFSET_MIN overrides the 180-minute offset."""
+    txt = _safe_str(line).strip()
+    if not txt.lower().startswith("last run "):
+        return None
+    try:
+        stamp = datetime.strptime(txt[9:28], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+    offset = _env_int("VALIDATE_T10_COCKPIT_UTC_OFFSET_MIN", 180)
+    stamp_utc = (stamp - timedelta(minutes=offset)).replace(tzinfo=timezone.utc)
+    now = now_utc or datetime.now(timezone.utc)
+    return (now - stamp_utc).total_seconds() / 60.0
+
+
 def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
     """Decision-surface checks for the Top_10 cockpit — the backend-side
     P0-5 tripwire. FAIL here exits 2 and daily_sync goes RED by design."""
     out: List[CheckResult] = []
     hr = _find_decision_header(grid)
     if hr < 0:
+        # v1.3.1: name the cockpit's own status line, so a FAIL says whether
+        # the board is mid-render, failed, or genuinely missing.
+        status_line = _cockpit_status_line(grid)
         out.append(CheckResult(page, "decision.header_found", "FAIL",
                                detail=f"cockpit data-grid header (Rank|Symbol) "
-                                      f"not found in first {len(grid)} rows"))
+                                      f"not found in first {len(grid)} rows"
+                                      + (f"; cockpit says: {status_line[:160]}"
+                                         if status_line else "")))
         return out
     out.append(CheckResult(page, "decision.header_found", "PASS"))
 
@@ -1077,16 +1139,57 @@ async def _run_decision_surface(page: str, sid: str,
                                    "read_range reader")]
     depth = _env_int("VALIDATE_T10_HEADER_SCAN", 60, lo=20) + 60
     rng = f"{page}!A1:AZ{depth}"
-    try:
-        loop = asyncio.get_running_loop()
-        grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
-        grid = await _maybe_await(grid)
-    except Exception as e:
-        return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
-    if not isinstance(grid, list) or not grid:
-        return [CheckResult(page, "decision.read", "FAIL",
-                            detail="read_range returned no grid")]
-    return check_top10_surface(page, grid)
+    # v1.3.1 (2026-10-21): the cockpit writes "status: running…" before it
+    # draws the board, so a read in that short window sees banner rows and no
+    # grid. A RECENT running stamp (<= VALIDATE_T10_INPROGRESS_MAX_AGE_MIN,
+    # default 8: Apps Script stops any run at 6 minutes) is re-read up to
+    # VALIDATE_T10_INPROGRESS_READS times (default 3), waiting
+    # VALIDATE_T10_INPROGRESS_WAIT_S (default 30) before each. An OLDER
+    # running stamp is a run that died without finishing (sync run
+    # 39513589733: the cockpit run begun ~16:20 UTC still said running hours
+    # later and the validator found "no header in first 16 rows"): no re-read,
+    # and the FAIL says the cockpit is stuck. An unreadable stamp keeps the
+    # bounded re-read. Statuses are unchanged: a missing board still FAILs.
+    # VALIDATE_T10_INPROGRESS_READS=0 = v1.3.0 behaviour.
+    rereads = _env_int("VALIDATE_T10_INPROGRESS_READS", 3, lo=0)
+    wait_s = _env_int("VALIDATE_T10_INPROGRESS_WAIT_S", 30, lo=0)
+    max_age = _env_int("VALIDATE_T10_INPROGRESS_MAX_AGE_MIN", 8, lo=0)
+    attempt = 0
+    stuck_note = ""
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
+            grid = await _maybe_await(grid)
+        except Exception as e:
+            return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
+        if not isinstance(grid, list) or not grid:
+            return [CheckResult(page, "decision.read", "FAIL",
+                                detail="read_range returned no grid")]
+        if (_find_decision_header(grid) >= 0 or attempt >= rereads
+                or not _cockpit_render_in_progress(grid)):
+            break
+        age = _cockpit_status_age_min(_cockpit_status_line(grid))
+        if age is not None and age > max_age:
+            stuck_note = (f"cockpit still 'running' {age:.0f} min after its Last run stamp "
+                          f"(> {max_age} min): that run ended without finishing; "
+                          f"re-run refreshDecisionTop10")
+            break
+        attempt += 1
+        logger.info("v1.3.1 %s: cockpit render in progress (%s); re-read %d/%d in %ds",
+                    page, _cockpit_status_line(grid)[:80], attempt, rereads, wait_s)
+        await asyncio.sleep(wait_s)
+    results = check_top10_surface(page, grid)
+    for r in results:
+        if r.name == "decision.header_found" and r.status != "PASS":
+            notes = []
+            if attempt:
+                notes.append(f"after {attempt} in-progress re-read(s)")
+            if stuck_note:
+                notes.append(stuck_note)
+            if notes:
+                r.detail = "; ".join(([r.detail] if r.detail else []) + notes)
+    return results
 
 
 _DEFAULT_PAGES = [
