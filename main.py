@@ -2,12 +2,29 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.5)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.6)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.6 (2026-10-21, OBSERVABILITY / SYNC TRUTH): the global auth wall no
+longer answers 401 for a request it ALLOWED. Its fail-closed try/except
+wrapped `await call_next(request)` as well as the auth decision, so any
+exception raised downstream (a route timeout; Starlette's "No response
+returned" after a dropped request) became the wall's 401 "unauthorized" for
+a caller holding a valid token. Render log 2026-10-20 23:16:14Z shows each
+"Caught downstream no-response runtime error" followed by
+"POST /v1/analysis/sheet-rows 401"; run 39513589733 then reported 60 backend
+401s and told the operator to check TFB_TOKEN. The decision now runs alone
+inside the try (still fail-closed: an error while deciding is a 401), and an
+allowed request is handed downstream outside it, so its errors reach the
+app's own handling (500), as they did before v8.13.0 added the wall (from
+8.13.0 to 8.14.5 even the disarmed branch called downstream inside the try,
+so the masking applied with the wall armed or not). Every denial
+(status, headers, body) is byte-identical; no exemption, token source or
+kill-switch changed. Harness: tests/test_auth_wall_downstream_errors.py.
 
 v8.14.5 (2026-10-13, SECURITY): the global auth wall decides its probe/meta
 exemption on the ROUTED path (the ASGI scope path), not request.url.path.
@@ -292,6 +309,10 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from core.platform_source_auth import (
+    platform_source_authorized,
+    platform_source_boundary_required,
+)
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -441,7 +462,9 @@ class _StrictJSONResponse(JSONResponse):
 # v8.14.5 (2026-10-13, SECURITY): the global auth wall exempts on the ASGI
 # scope path the router matches, not on the Host-derived request.url.path.
 # See the module docstring for the WHY and the valid-Host identity proof.
-APP_ENTRY_VERSION = "8.14.5"
+# v8.14.6 (2026-10-21): the wall decides inside its fail-closed try and calls
+# downstream outside it, so a downstream error is a 500, not the wall's 401.
+APP_ENTRY_VERSION = "8.14.6"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -512,6 +535,7 @@ _BUILTIN_META_PATHS = {
 }
 
 _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
+    "/v1/platform",
     "/v1/advisor",
     "/v1/investment_advisor",
     "/v1/investment-advisor",
@@ -529,6 +553,7 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
 
 # Canonical owners are the route-family keys used in the controlled plan.
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
+    "/v1/platform/source-read": "platform_source",
     "/v1/advisor": "advisor",
     "/v1/advisor/sheet-rows": "advisor",
     "/v1/investment_advisor": "investment_advisor",
@@ -573,6 +598,7 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
 # in the repo but is no longer mounted; investment_advisor handles every
 # /v1/advanced/* path.
 _CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
+    ("platform_source", "routes.platform_source"),
     ("config", "routes.config"),
     ("advanced_analysis", "routes.advanced_analysis"),
     ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
@@ -1468,20 +1494,52 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
     kill-switch, the exempt list and OPTIONS handling are unchanged."""
 
     async def dispatch(self, request: Request, call_next):
+        # v8.14.6 (2026-10-21): DECIDE inside the fail-closed try, CALL
+        # DOWNSTREAM outside it. Up to v8.14.5 every `return await
+        # call_next(request)` sat inside this try, so ANY exception raised by
+        # the route or an inner middleware (a timeout, "No response returned"
+        # after a dropped request) was swallowed by the except below and
+        # answered with the wall's 401 "unauthorized" — for a caller that had
+        # presented a VALID token. Render log 2026-10-20 23:16:14Z: each
+        # "Caught downstream no-response runtime error" is followed by
+        # "POST /v1/analysis/sheet-rows 401", and daily_sync then reported
+        # backend 401s and told the operator to check TFB_TOKEN. The
+        # decision, its fail-closed rule and every denial response are
+        # unchanged; an allowed request's errors now reach the app's own
+        # error handling (500), as before v8.13.0 (8.13.0-8.14.5 masked them
+        # whether the wall was armed or not).
+        allowed = False
+        platform_denied = False
         try:
-            if not _global_auth_enforcement_active():
-                return await call_next(request)
-            if str(request.method or "").upper() == "OPTIONS":
-                return await call_next(request)
+            # This new key only reads the fixed Site source. It must never
+            # become a general APP_TOKEN, and OPEN_MODE cannot open its route.
+            if platform_source_boundary_required(request):
+                if platform_source_authorized(request):
+                    allowed = True
+                else:
+                    platform_denied = True
+            elif not _global_auth_enforcement_active():
+                allowed = True
+            elif str(request.method or "").upper() == "OPTIONS":
+                allowed = True
             # v8.14.5: exempt on the ROUTED (scope) path, never on the
             # Host-derived request.url.path (see _global_auth_exempt_request).
-            if _global_auth_exempt_request(request):
-                return await call_next(request)
-            if _auth_ok(request):
-                return await call_next(request)
+            elif _global_auth_exempt_request(request):
+                allowed = True
+            elif _auth_ok(request):
+                allowed = True
         except Exception:
             # Fail-closed: an error while deciding must never open the wall.
-            pass
+            allowed = False
+            platform_denied = False
+        if allowed:
+            return await call_next(request)
+        if platform_denied:
+            return _StrictJSONResponse(
+                status_code=401,
+                headers={"Cache-Control": "no-store, private"},
+                content={"status": "error", "error": "unauthorized"},
+            )
         request_id = _request_id_from_request(request)
         return _StrictJSONResponse(
             status_code=401,
@@ -1847,6 +1905,7 @@ def _normalize_routes_snapshot(
 # =============================================================================
 def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
+        "platform_source": ("/v1/platform",),
         "config": ("/v1/config",),
         "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows"),
         "advanced_sheet_rows": ("/v1/advanced",),
@@ -2912,3 +2971,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "10000")),
         reload=False,
     )
+

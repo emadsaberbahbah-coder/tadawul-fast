@@ -970,10 +970,16 @@ def case_n16_workflow_contract_and_env_parity(mp, tmp_path):
     text = RELEASE_YML.read_text(encoding="utf-8")
     assert all(ord(ch) < 128 for ch in text)
     rel, daily = workflow(RELEASE_YML), workflow(DAILY_YML)
-    assert list(rel["on"]) == ["workflow_dispatch"]
+    # v1.1.0 (2026-10-19): scheduled attempts with source discovery. The
+    # dispatch input is optional and defaults to 'auto'; the schedule is
+    # mode=release / source=auto only (validated in the shell step).
+    assert list(rel["on"]) == ["workflow_dispatch", "schedule"]
     inputs = rel["on"]["workflow_dispatch"]["inputs"]
-    assert inputs["source_run_id"]["required"] is True and "default" not in inputs["source_run_id"]
+    assert inputs["source_run_id"]["required"] is False and inputs["source_run_id"]["default"] == "auto"
     assert inputs["mode"]["options"] == ["release", "sweep", "kill"]
+    assert inputs["mode"]["default"] == "release"
+    crons = [item["cron"] for item in rel["on"]["schedule"]]
+    assert crons == ["45 0,10,17,20 * * *", "30 5 * * *", "45 12 * * *"]
     assert rel["concurrency"] == {"group": "tfb-decision-release", "cancel-in-progress": False}
     assert "production-write" not in json.dumps(rel["concurrency"])
     assert rel["permissions"] == {"contents": "read", "actions": "read"}
@@ -1001,9 +1007,18 @@ def case_n16_workflow_contract_and_env_parity(mp, tmp_path):
     for step in job["steps"]:
         assert "${{" not in step.get("run", ""), step["name"]   # inputs reach the shell via env only
     run = steps["Release or retract the decision feed"]
-    assert run["env"]["SOURCE_RUN_ID"] == "${{ inputs.source_run_id }}"
+    assert run["env"]["SOURCE_RUN_ID"] == "${{ inputs.source_run_id || 'auto' }}"
+    assert run["env"]["RELEASE_MODE"] == "${{ inputs.mode || 'release' }}"
+    assert run["env"]["EVENT_NAME"] == "${{ github.event_name }}"
     assert run["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
     assert '--source-run-id "$SOURCE_RUN_ID"' in run["run"] and "GITHUB_RUN_ID" not in run["run"]
+    # schedule: exits 1 and 2 end green with a warning; 3 and dispatch stay red
+    assert '"$EVENT_NAME" == "schedule" && ( "$code" -eq 1 || "$code" -eq 2 )' in run["run"]
+    assert 'exit "$code"' in run["run"]
+    validate = steps["Validate dispatch inputs"]
+    assert validate["env"]["SOURCE_RUN_ID"] == "${{ inputs.source_run_id || 'auto' }}"
+    assert "^(auto|[1-9][0-9]*)$" in validate["run"]
+    assert 'a scheduled run is always mode=release with source_run_id=auto' in validate["run"]
     assert "github.run_id" not in json.dumps(job["env"]) and "github.run_id" not in json.dumps(run["env"])
     checkout = steps["Checkout this workflow's ref"]["with"]
     assert checkout == {"ref": "${{ github.sha }}", "fetch-depth": 1, "persist-credentials": False}

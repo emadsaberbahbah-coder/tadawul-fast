@@ -1,12 +1,14 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.14
+ * Version: 1.5.15
  *
- * v1.5.14 MAIN CHANGES  (THE LAYOUT BUILDER KEEPS OPERATOR INPUTS -- P-76
+ * v1.5.15 MAIN CHANGES  (THE LAYOUT BUILDER KEEPS OPERATOR INPUTS -- P-76
  *                        port from 16_Decision_Top10 v1.11.3; Script
  *                        Property PD_PANEL_PRESERVE, default OFF; ALL
- *                        v1.5.13 logic carried verbatim)
+ *                        v1.5.14 logic carried verbatim; authored as
+ *                        v1.5.14 in PR #780, renumbered 2026-10-21 after
+ *                        #810 shipped a different v1.5.14)
  * ---------------------------------------------------------------
  * WHY (2026-10-15 export vs _Portfolio_Action_Log): the panel snapshot the
  * action log wrote at 2026-10-14 04:45:58 Riyadh carried 'PF: Cash
@@ -24,7 +26,7 @@
  * reset reaches Top_10 too.
  * WHAT (Script Property PD_PANEL_PRESERVE = off (default) | observe |
  * enforce; anything else reads off):
- *  off      reads nothing extra; every sheet write is v1.5.13's.
+ *  off      reads nothing extra; every sheet write is v1.5.14's.
  *  observe  snapshots the non-blank panel inputs before the clear, seeds
  *           the defaults exactly as off, and logs which inputs the rebuild
  *           reset ('layout: observe -- N operator input(s) reset to
@@ -49,7 +51,20 @@
  * ES5. Functions added: 3 (pdPanelPreserveMode_, pdPanelPreserve_(sheet,
  * faults), pdPanelSeedValue_). Changed: buildPortfolioDecisionLayout.
  * Removed: 0.
- * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.13.
+ * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.14.
+ *
+ * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
+ * ---------------------------------------------------------------
+ * WHY: _myPortfolioLedgerMap_ skipped only Status 'inactive', so Sold and
+ * Closed lots in _Portfolio_CostBasis were aggregated as active. Active 10
+ * @ 100 (fee 5) + Sold 10 @ 80 read as qty 20 / cost 90.5 instead of qty
+ * 10 / cost 100.5. The Python ledger readers (run_dashboard_sync
+ * _read_cost_basis, audit_full_refresh_coverage ledger_symbols) exclude
+ * {inactive, closed, sold}.
+ * WHAT: the same set is excluded here (trimmed, case-insensitive). Blank or
+ * absent Status still counts as active, exactly as ledger_symbols and the
+ * 21 dropdown default treat it. Functions changed: 1
+ * (_myPortfolioLedgerMap_). Added/removed: 0. Rollback: v1.5.13.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
  *                        only when PD_SOURCE_RECEIPT is observe/enforce;
@@ -2096,8 +2111,9 @@ function _myPortfolioCostBasisSymbols_() {
  *              14 v2.5.0's pfReadCostBasisV2_, so the feeders can never
  *              oscillate the Avg Cost cell between runs;
  *   buyDate  = earliest lot date.
- * A lot is INACTIVE only when Status trims to 'inactive' (case-
- * insensitive); blank status counts as active, matching the 21 dropdown
+ * A lot is EXCLUDED when Status trims to 'inactive', 'closed' or 'sold'
+ * (case-insensitive; v1.5.14 added closed/sold to mirror the Python
+ * ledger readers); blank status counts as active, matching the 21 dropdown
  * default and the diagnostics lot counting. Returns the {SYM: {qty,
  * buyPrice, buyDate, lots}} map (possibly empty — v2 with zero active
  * lots), keyed by trimmed upper-cased symbol, the same {qty, buyPrice}
@@ -2147,7 +2163,8 @@ function _myPortfolioLedgerMap_() {
           ? String(row[col.status - 1] == null ? '' : row[col.status - 1])
               .replace(/^\s+|\s+$/g, '').toLowerCase()
           : '';
-      if (status === 'inactive') { continue; }
+      if (status === 'inactive' || status === 'closed' ||
+          status === 'sold') { continue; }        // v1.5.14
       if (!Object.prototype.hasOwnProperty.call(map, sym)) {
         map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0 };
         wSum[sym] = 0;
@@ -2600,7 +2617,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.14';
+var PD_VERSION = '1.5.15';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3828,7 +3845,7 @@ function pdReadPanel_(sheet, ss) {
   return out;
 }
 
-/* ----- v1.5.14 operator inputs survive a layout rebuild (P-76 port) ------- */
+/* ----- v1.5.15 operator inputs survive a layout rebuild (P-76 port) ------- */
 
 var PD_PANEL_PRESERVE_PROP = 'PD_PANEL_PRESERVE';  /* off (default) | observe | enforce */
 
@@ -3844,7 +3861,7 @@ function pdPanelPreserveMode_() {
   }
 }
 
-/** v1.5.14: snapshot of the panel's NON-BLANK operator values, read raw (no
+/** v1.5.15: snapshot of the panel's NON-BLANK operator values, read raw (no
  * defaults) BEFORE a layout rebuild clears the sheet. A value is kept only
  * when its label cell still holds the exact PD_PANEL label (a moved layout
  * keeps nothing). A sheet without a panel yet returns {}. Never throws: a
@@ -3869,7 +3886,7 @@ function pdPanelPreserve_(sheet, faults) {
   return out;
 }
 
-/** v1.5.14 PURE: the value a rebuilt panel cell receives -- preserved
+/** v1.5.15 PURE: the value a rebuilt panel cell receives -- preserved
  * operator input > _Lists_Config default > built-in default. With no
  * preserved map this is exactly the v1.5.13 seed expression. */
 function pdPanelSeedValue_(item, defaults, preserved) {
@@ -4009,7 +4026,7 @@ function buildPortfolioDecisionLayout() {
   var tokens = pdTokens_(ss);
   var header = tokens.HEADER || PD_FALLBACK_TOKENS.HEADER;
   var op = tokens.OPERATOR_INPUT || PD_FALLBACK_TOKENS.OPERATOR_INPUT;
-  /* v1.5.14: snapshot operator inputs BEFORE the clear (off reads nothing).
+  /* v1.5.15: snapshot operator inputs BEFORE the clear (off reads nothing).
    * Enforce aborts on a snapshot read fault, before anything is cleared:
    * a failed read must not turn into the reset this mode exists to stop. */
   var preserveMode = pdPanelPreserveMode_();
