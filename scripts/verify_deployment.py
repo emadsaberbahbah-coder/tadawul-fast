@@ -236,7 +236,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
-    ("run_shadow_scorer", "1.9.3", "shadow scorer"),
+    ("run_shadow_scorer", "1.9.4", "shadow scorer"),
     ("track_performance", "6.45.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe

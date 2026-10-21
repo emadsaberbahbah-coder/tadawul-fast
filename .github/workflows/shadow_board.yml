@@ -93,6 +93,19 @@ jobs:
       # the S-1 window boundary annotation on the flip date.
       # Rollback: set off (or delete the line).
       TFB_BOARD_ENGINE_ROI: "enforce"
+      # P-175 NON-TRADING FREEZE (run_shadow_board >= 1.5.0): INERT WIRING,
+      # default off = byte-identical. Unmapped until now, so arming needed a
+      # code commit; Mondays 10-05 and 10-12 were excluded because a
+      # weekend rotation left the next session with no stored base price.
+      # Arming is a repo-Variable flip at a Saturday sitting: observe first
+      # (read-back on the next Saturday/Sunday board log:
+      # `[SHADOW-BOARD-FREEZE v1.5.0] would freeze (observe): weekend:Sat`),
+      # then enforce (`frozen: ... - board kept, nothing written`; the Friday
+      # board, with its stored prices, stays the Monday base). HOLIDAYS =
+      # comma ISO dates the venue is closed on a weekday. Rollback: delete
+      # the Variable.
+      TFB_BOARD_FREEZE_NONTRADING: ${{ vars.TFB_BOARD_FREEZE_NONTRADING || 'off' }}
+      TFB_BOARD_FREEZE_HOLIDAYS: ${{ vars.TFB_BOARD_FREEZE_HOLIDAYS || '' }}
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
