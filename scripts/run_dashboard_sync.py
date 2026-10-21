@@ -3,9 +3,36 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.70.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.70.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.70.2 - the _Status stamp survives a transient Sheets timeout (2026-10-21)
+================================================================================
+Run 39513589733 (#4998, 20 Oct 23:13 UTC) wrote Global_Markets but annotated
+"[STATUS-STAMP v6.70.0] could not read _Status key column for Global_Markets —
+TimeoutError: The read operation timed out": the stamp made ONE read and gave
+up. Global_Markets kept run 39464797610 while the other pages carried
+39513589733, so the Top_10 cockpit withheld ("source run differs from
+cohort") and could not build the pool receipt that explains the Mutual_Funds
+pool (2,469 unique of 2,474 physical). The read and the row write are now one
+unit retried on transient errors (default 4 attempts, 3/8/15 s, inside a 90 s
+budget); each attempt re-reads column A first, so an append the API applied
+before the next read is updated in place, not duplicated. A stamp that still
+fails keeps the v6.70.0 "::warning:: ... stamp FAILED" annotation, now naming
+the attempts and the cohort consequence. Gates
+TFB_SYNC_STATUS_STAMP_RETRIES (1 = a single attempt, as in v6.70.0) and
+TFB_SYNC_STATUS_STAMP_DEADLINE_S.
+
+v6.70.1 - last-good read failure is retried once and named (2026-10-21)
+================================================================================
+(Carried from PR #809, commit 7d7b429, independently reviewed.)
+SheetsWriter.read_values returns None on any API error. _keep_last_good_rows
+treated that like an empty sheet, so on 20 Oct (18:2x UTC) FW-KEEP restored
+0/149 quarantined Global_Markets rows and reported "had no last-good"; 149
+blank Names dropped the page below its 99% Name floor. The read is retried
+once (3 s); a second failure is logged as KLG-READ and FW-KEEP says "last-good
+READ FAILED". Substitution rules are unchanged.
 
 v6.70.0 - Hong Kong reporting-currency band in the identity checks (2026-10-19)
 ================================================================================
@@ -2111,7 +2138,21 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.70.0"
+SCRIPT_VERSION = "6.70.2"
+# v6.70.2 (2026-10-21) - STAMP-RETRY [_Status stamp, transient Sheets errors]:
+#   WHY: run 39513589733 left Global_Markets' _Status row on the previous run
+#   after one read timed out (no retry); the cockpit's cohort check then
+#   withheld the Top_10 board. FIX: _stamp_page_status retries read+write as
+#   one unit on _is_transient_write_error, re-reading column A each attempt
+#   (append-safe once the API has applied the append). Exhausted, or the
+#   TFB_SYNC_STATUS_STAMP_DEADLINE_S budget (default 90 s) reached -> the
+#   v6.70.0 "::warning:: ... stamp FAILED" annotation, now with the attempt
+#   count and the cohort consequence; fail-open, sync exit code unchanged.
+#   GATE: TFB_SYNC_STATUS_STAMP_RETRIES (default 4; 1 = a single attempt).
+# v6.70.1 (2026-10-21) - KLG-READ [last-good read failure, from PR #809]:
+#   _keep_last_good_rows retries a None read_values once (3 s) and records
+#   the sheet in _LAST_KLG_READ_FAILED, so FW-KEEP reports "last-good READ
+#   FAILED" instead of "had no last-good". No substitution rule changed.
 # v6.70.0 (2026-10-19) - HK-FX [identity check, Hong Kong reporting currency]:
 #   WHY: FW-2 (_row_identity_firewall), FW-1 (_klg_old_row_identity_ok) and the
 #   L3b tripwire (_coherence_scan) test Price/EPS against the stated P/E with
@@ -5795,6 +5836,10 @@ _LAST_KLG_ID_SUSPECTS: list = []
 # no certifiable predecessor. The single-threaded call site uses this only for
 # exact freshness lineage; substitution/output behavior remains unchanged.
 _LAST_KLG_STUB_CANDIDATES: list = []
+# v6.70.1 KLG-READ: sheets whose last-good read failed after one retry
+# (read by the FW-KEEP report line; cleared by the caller before each swap).
+_LAST_KLG_READ_FAILED: list = []
+_KLG_READ_RETRY_SLEEP_SEC: float = 3.0
 # v6.29.0 B-4: per-page list of forced symbols whose old-row substitution
 # was blocked this pass (read by the call site for the report line).
 _LAST_KLG_FORCED: list = []
@@ -8977,6 +9022,41 @@ def _status_stamp_should_skip(res: Any) -> str:
     return ""
 
 
+def _status_stamp_attempts() -> int:
+    """v6.70.2 STAMP-RETRY: total attempts for one `_Status` stamp (read the
+    key column + write the row), default 4, clamped 1..6.
+    TFB_SYNC_STATUS_STAMP_RETRIES=1 makes a single attempt, as v6.70.0 did
+    (same ::warning:: level; the message adds the attempt count and the
+    cohort consequence)."""
+    try:
+        n = int((os.getenv("TFB_SYNC_STATUS_STAMP_RETRIES") or "4").strip())
+    except Exception:
+        n = 4
+    return max(1, min(6, n))
+
+
+def _status_stamp_deadline_s() -> float:
+    """v6.70.2 STAMP-RETRY: RETRY budget for one stamp, default 90 s
+    (TFB_SYNC_STATUS_STAMP_DEADLINE_S, clamped 10..600). No further attempt
+    starts once the elapsed time plus the next backoff would pass it. It is
+    not a hard wall-clock cap: the Sheets calls inside an attempt are bounded
+    only by the client's socket timeout (60 s each), so a stamp can overrun
+    the budget by at most the attempt already in flight. The stamp runs in
+    the page task's finally, so the budget limits how many slow attempts a
+    failing stamp can stack on the event loop."""
+    try:
+        v = float((os.getenv("TFB_SYNC_STATUS_STAMP_DEADLINE_S") or "90").strip())
+    except Exception:
+        v = 90.0
+    return max(10.0, min(600.0, v))
+
+
+# v6.70.2 STAMP-RETRY: seconds to wait before attempts 2, 3, 4 ... (the last
+# value repeats); 26 s of backoff for the default 4 attempts, paid only by a
+# stamp that is failing, and always inside _status_stamp_deadline_s().
+_STATUS_STAMP_BACKOFF_SEC = (3.0, 8.0, 15.0)
+
+
 def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
                        res: Any, n_cols: int) -> None:
     """v6.39.0 W1A-4b: write the page's own `_Status` row after the page
@@ -8985,7 +9065,21 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
     Bounded to columns A..J of exactly one row, so the L/M global key-value
     block and every other page's row are untouched by construction. Appends
     a row only when the page has none. FAIL-OPEN: any error is annotated and
-    swallowed — the stamp must never break the write path it reports on."""
+    swallowed — the stamp must never break the write path it reports on.
+
+    v6.70.2 STAMP-RETRY: the key-column read and the row write form one unit
+    that is retried on TRANSIENT failures (_is_transient_write_error: timeout,
+    SSL, reset, 429/5xx), up to _status_stamp_attempts() with backoff; no new
+    attempt starts past the _status_stamp_deadline_s() retry budget (calls in
+    flight keep their 60 s socket timeout). Every attempt re-reads column A first,
+    so an append whose response was lost but which the API had applied by the
+    next read is found and updated in place rather than appended again (an
+    append applied only after that read could still duplicate; the append
+    path runs only for a page's first-ever stamp). A non-transient error stops
+    at once. When the stamp still fails it is annotated as before (::warning::
+    "stamp FAILED") with the attempt count and the consequence (the page keeps
+    the previous run ID, so the cockpit will see a cohort mismatch); the
+    sync's exit code is unchanged."""
     if not _status_stamp_enabled() or sheets is None:
         return
     allow = _status_stamp_pages()
@@ -9001,38 +9095,66 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
         if not svc:
             return
         payload = _status_stamp_row(page, res, n_cols)
-        grid = []
-        try:
-            _resp = svc.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{_STATUS_SHEET_NAME}'!A:A",
-            ).execute()
-            grid = _resp.get("values", []) or []
-        except Exception as _re:
-            print("::warning::%s could not read %s key column for %s — %s: %s"
-                  % (_STATUS_STAMP_TAG, _STATUS_SHEET_NAME, page,
-                     type(_re).__name__, _re))
-            return
-        row_i = _status_find_page_row(grid, page)
-        if row_i > 0:
-            svc.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{_STATUS_SHEET_NAME}'!A{row_i}:J{row_i}",
-                valueInputOption="RAW",
-                body={"values": [payload]},
-            ).execute()
-            _where = f"row {row_i}"
-        else:
-            svc.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{_STATUS_SHEET_NAME}'!A1:J1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [payload]},
-            ).execute()
-            _where = "appended"
-        logger.info("%s %s %s | status=%s rows_written=%s", _STATUS_STAMP_TAG,
-                    page, _where, payload[2], payload[6])
+        attempts = _status_stamp_attempts()
+        deadline = _status_stamp_deadline_s()
+        _t0 = time.monotonic()
+        _where = ""
+        for attempt in range(attempts):
+            stage = "read"
+            try:
+                _resp = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{_STATUS_SHEET_NAME}'!A:A",
+                ).execute()
+                grid = _resp.get("values", []) or []
+                row_i = _status_find_page_row(grid, page)
+                stage = "write"
+                if row_i > 0:
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!A{row_i}:J{row_i}",
+                        valueInputOption="RAW",
+                        body={"values": [payload]},
+                    ).execute()
+                    _where = f"row {row_i}"
+                else:
+                    svc.spreadsheets().values().append(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!A1:J1",
+                        valueInputOption="RAW",
+                        insertDataOption="INSERT_ROWS",
+                        body={"values": [payload]},
+                    ).execute()
+                    _where = "appended"
+                break
+            except Exception as _se:
+                _what = ("could not read %s key column" % _STATUS_SHEET_NAME
+                         if stage == "read" else "could not write the %s row" % _STATUS_SHEET_NAME)
+                _delay = _STATUS_STAMP_BACKOFF_SEC[min(attempt, len(_STATUS_STAMP_BACKOFF_SEC) - 1)]
+                _over = (time.monotonic() - _t0) + _delay > deadline
+                if attempt + 1 >= attempts or not _is_transient_write_error(_se) or _over:
+                    # Same annotation level and "stamp FAILED" wording as
+                    # v6.70.0 (harness_w1a6 S7.14/S7.15 contract), plus the
+                    # attempt count and the cohort consequence.
+                    print("::warning::%s stamp FAILED for %s after %d attempt(s)%s "
+                          "(%s — %s: %s). The stamp was NOT written: %s keeps this "
+                          "page's previous run ID, so the decision cockpit will see a "
+                          "cohort mismatch until a later stamp succeeds."
+                          % (_STATUS_STAMP_TAG, page, attempt + 1,
+                             (" (%.0f s stamp budget reached)" % deadline)
+                             if (_over and attempt + 1 < attempts
+                                 and _is_transient_write_error(_se)) else "",
+                             _what, type(_se).__name__, _se, _STATUS_SHEET_NAME))
+                    logger.warning("%s stamp NOT written for %s after %d attempt(s): %s",
+                                   _STATUS_STAMP_TAG, page, attempt + 1, _se)
+                    return
+                print("::warning::%s %s for %s (attempt %d/%d) — %s: %s; retrying in %.0fs"
+                      % (_STATUS_STAMP_TAG, _what, page, attempt + 1, attempts,
+                         type(_se).__name__, _se, _delay))
+                time.sleep(_delay)
+        logger.info("%s %s %s | status=%s rows_written=%s%s", _STATUS_STAMP_TAG,
+                    page, _where, payload[2], payload[6],
+                    f" | attempts={attempt + 1}" if attempt else "")
     except Exception as _e:
         print("::warning::%s stamp FAILED for %s — %s: %s"
               % (_STATUS_STAMP_TAG, page, type(_e).__name__, _e))
@@ -10395,6 +10517,22 @@ def _keep_last_good_rows(
     # v6.24.3: last-good rows past the read bound were invisible to the swap.
     _klg_block = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
     grid = sheets.read_values(spreadsheet_id, sheet_name, _klg_block) if sheets is not None else None
+    if grid is None and sheets is not None:
+        # v6.70.1 KLG-READ: read_values returns None on ANY API failure (it
+        # swallows the exception). One retry, then record the failure so the
+        # caller can tell "last-good read failed" from "no last-good row"
+        # (20 Oct 18:2x UTC: FW-KEEP restored 0/149 Global_Markets rows and
+        # the log blamed missing last-good rows).
+        time.sleep(_KLG_READ_RETRY_SLEEP_SEC)
+        grid = sheets.read_values(spreadsheet_id, sheet_name, _klg_block)
+        if grid is None:
+            _LAST_KLG_READ_FAILED.append(sheet_name)
+            logger.warning(
+                "[v%s KLG-READ] last-good read of '%s'!%s FAILED twice; "
+                "%d stub row(s) keep the fetched (empty) values.",
+                SCRIPT_VERSION, sheet_name, _klg_block,
+                len(stub_rows) + len(ff_rows),
+            )
     if not grid or not isinstance(grid, list):
         return rows_matrix, swapped
 
@@ -14081,6 +14219,7 @@ async def _run_one_task(
                     # symbols with no last-good remain stubs (correct).
                     if _fw_keep_last_good_enabled() and sheets is not None:
                         _fwk_restored: List[str] = []
+                        _LAST_KLG_READ_FAILED.clear()
                         try:
                             rows_matrix, _fwk_restored = _keep_last_good_rows(
                                 sheets, spreadsheet_id, task.sheet_name,
@@ -14112,11 +14251,14 @@ async def _run_one_task(
                                 f": {', '.join(_unrest_syms[:15])}"
                                 f"{'…' if len(_unrest_syms) > 15 else ''}"
                             ) if _unrest_syms else ""
+                            _why = ("last-good READ FAILED, left as stub"
+                                    if task.sheet_name in _LAST_KLG_READ_FAILED
+                                    else "had no last-good (left as stub)")
                             _kw = (
                                 f"[v6.25.1 FW-KEEP] '{task.sheet_name}': restored "
                                 f"{len(_fwk_set)}/{len(_idfw_stripped)} quarantined "
                                 f"row(s) from last-good"
-                                f"{f'; {_unrest} had no last-good (left as stub){_unrest_txt}' if _unrest else ''}."
+                                f"{f'; {_unrest} {_why}{_unrest_txt}' if _unrest else ''}."
                             )
                             res.warnings.append(_kw)
                             logger.warning(_kw)
