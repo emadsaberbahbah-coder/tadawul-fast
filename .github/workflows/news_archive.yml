@@ -45,7 +45,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: news-archive-${{ github.ref }}
+  # The archive is one shared writer target even for manual branch runs.
+  group: news-archive
   cancel-in-progress: false
 
 defaults:

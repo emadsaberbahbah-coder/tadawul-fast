@@ -333,6 +333,7 @@ def test_adoption_verification_is_main_only_path_scoped_and_uses_existing_writer
                                         ".github/workflows/news_archive.yml"]}
     assert list(workflow["jobs"]) == ["collect"]
     assert workflow["concurrency"]["cancel-in-progress"] == "false"
+    assert workflow["concurrency"]["group"] == "news-archive"
     assert workflow["on"]["schedule"] == [{"cron": "0 14,20 * * *"}]
     step = next(step for step in workflow["jobs"]["collect"]["steps"] if step.get("name") == "Collect news archive")
     assert "--max-symbols 60" in step["run"]
@@ -375,3 +376,173 @@ def test_discovery_failure_stays_visible_even_when_selected_news_succeeds(monkey
     assert len(batches[0]) == 6 and not report["complete"]
     assert not report["selection"]["discovery_complete"]
     assert not any("holding" in key or "quantity" in key or "cash" in key for key in report["selection"])
+
+
+def test_allocated_spare_grid_rows_do_not_imply_identity_read_truncation():
+    store, pages = store_with_sources()
+    pages["Global_Markets"].row_count = 50000
+    result = store.load_news_source_context()
+    entry = next(item for item in result["sources"] if item["page"] == "Global_Markets")
+    assert result["complete"] and entry["status"] == "OK"
+    assert not entry["read_cap_reached"]
+    assert pages["Global_Markets"].calls == [("A1:B10001", {})]
+
+
+def test_populated_capped_boundary_keeps_identity_discovery_incomplete():
+    store, pages = store_with_sources()
+    pages["Global_Markets"].values = [["Symbol", "Name"]] + [[] for _ in range(9999)] + [
+        ["BOUNDARY.US", "Boundary Corporation"]]
+    pages["Global_Markets"].row_count = 50000
+    result = store.load_news_source_context()
+    entry = next(item for item in result["sources"] if item["page"] == "Global_Markets")
+    assert not result["complete"] and entry["status"] == "INCOMPLETE"
+    assert entry["read_cap_reached"]
+
+
+def test_unknown_portfolio_identity_survives_as_unattributed_public_diagnostic(monkeypatch):
+    store, pages = store_with_sources()
+    pages["My_Portfolio"].values.append(["MISSING.US", ""])
+    pages["My_Portfolio"].row_count += 1
+    result = store.load_news_source_context()
+    entry = next(item for item in result["sources"] if item["page"] == "My_Portfolio")
+    assert result["unknown_identity_symbols"] == ["MISSING.US"]
+    assert not result["identity_coverage_complete"]
+    assert "unknown_identity_symbols" not in entry
+    monkeypatch.setenv("NEWS_ARCHIVE_UNIVERSE", "P0.US")
+    _, _, evidence = archive._select_news_universe(args(), result, "2026-10-23")
+    assert evidence["unknown_identity_symbols"] == ["MISSING.US"]
+    assert not any(key in evidence for key in ("portfolio_membership", "quantity", "cash", "orders"))
+
+
+class ArchiveWorksheet:
+    def __init__(self):
+        self.values = [[] for _ in range(4)] + [list(archive.NewsArchiveStore.HEADERS)]
+        self.read_error = False
+        self.append_error = None
+        self.append_calls = 0
+        self.read_calls = 0
+
+    def get_all_values(self):
+        self.read_calls += 1
+        if self.read_error:
+            raise RuntimeError("private transport details")
+        return copy.deepcopy(self.values)
+
+    def append_rows(self, rows, **_kwargs):
+        self.append_calls += 1
+        error, self.append_error = self.append_error, None
+        if error == "before":
+            raise TimeoutError("private pre-commit failure")
+        self.values.extend(copy.deepcopy(rows))
+        if error == "after":
+            raise TimeoutError("private post-commit failure")
+
+
+def install_archive_writer(monkeypatch, worksheet):
+    real_store = archive.NewsArchiveStore
+    store = object.__new__(real_store)
+    store.ws, store.sheet_name = worksheet, "News_Archive"
+    store.backoff = archive._Backoff(base=0, cap=0, tries=3)
+    monkeypatch.setattr(archive, "NewsArchiveStore", lambda *_args, **_kwargs: store)
+    async def batch(items, include_articles=False):
+        return SimpleNamespace(items=[{"symbol": item["symbol"], "articles_analyzed": 0,
+                                       "collection_evidence": {"status": "EMPTY"}}
+                                      for item in items], meta={"status": "success", "errors": 0})
+    monkeypatch.setattr(archive, "_import_news_module", lambda: SimpleNamespace(batch_news_intelligence=batch))
+    return store
+
+
+def test_archive_key_read_failure_withholds_append_and_preserves_acquisition(monkeypatch, tmp_path, capsys):
+    worksheet = ArchiveWorksheet()
+    worksheet.read_error = True
+    install_archive_writer(monkeypatch, worksheet)
+    path = tmp_path / "read-failed.json"
+    assert asyncio.run(archive.collect(args(universe=["NEW.US"], dry_run=False,
+                                           evidence_json=str(path)))) == 1
+    assert worksheet.append_calls == 0 and worksheet.read_calls == 3
+    report = json.loads(path.read_text())
+    assert report["selected_acquisition_complete"] and not report["complete"]
+    assert report["archive_write"]["status"] == "WITHHELD"
+    assert report["archive_write"]["error_code"] == "archive_key_read_failed"
+    assert report["status_counts"] == {"EMPTY": 1}
+    assert "private transport" not in capsys.readouterr().out + path.read_text()
+
+
+@pytest.mark.parametrize("values", [[], [[] for _ in range(5)],
+                                    [[] for _ in range(4)] + [["Date", "Wrong symbol column"]]])
+def test_unverified_archive_header_never_masquerades_as_empty(monkeypatch, tmp_path, values):
+    worksheet = ArchiveWorksheet()
+    worksheet.values = values
+    install_archive_writer(monkeypatch, worksheet)
+    path = tmp_path / "header-failed.json"
+    assert asyncio.run(archive.collect(args(universe=["NEW.US"], dry_run=False,
+                                           evidence_json=str(path)))) == 1
+    assert worksheet.append_calls == 0
+    assert json.loads(path.read_text())["archive_write"]["error_code"] == "archive_header_unverified"
+
+
+def test_valid_empty_archive_accepts_once_then_skips_existing_key(monkeypatch, tmp_path):
+    worksheet = ArchiveWorksheet()
+    install_archive_writer(monkeypatch, worksheet)
+    path = tmp_path / "accepted.json"
+    options = args(universe=["NEW.US"], dry_run=False, evidence_json=str(path))
+    assert asyncio.run(archive.collect(options)) == 0
+    first = json.loads(path.read_text())["archive_write"]
+    assert first == {"status": "APPEND_ACCEPTED", "attempted_rows": 1,
+                     "accepted_rows": 1, "skipped_rows": 0}
+    assert asyncio.run(archive.collect(options)) == 0
+    second = json.loads(path.read_text())["archive_write"]
+    assert second["status"] == "SKIPPED_EXISTING" and second["skipped_rows"] == 1
+    assert worksheet.append_calls == 1 and len(worksheet.values) == 6
+
+
+@pytest.mark.parametrize("tail,accepted", [(["", "  "], True), (["Unexpected column"], False)])
+def test_archive_header_padding_is_distinct_from_schema_drift(monkeypatch, tmp_path, tail, accepted):
+    worksheet = ArchiveWorksheet()
+    worksheet.values[4] += tail
+    install_archive_writer(monkeypatch, worksheet)
+    path = tmp_path / "header-padding.json"
+    outcome = asyncio.run(archive.collect(args(universe=["NEW.US"], dry_run=False,
+                                               evidence_json=str(path))))
+    assert outcome == (0 if accepted else 1)
+    assert worksheet.append_calls == (1 if accepted else 0)
+    report = json.loads(path.read_text())
+    assert report["archive_write"]["status"] == ("APPEND_ACCEPTED" if accepted else "WITHHELD")
+
+
+@pytest.mark.parametrize("error", ["before", "after"])
+def test_ambiguous_append_is_not_retried_and_next_invocation_recovers(monkeypatch, tmp_path, error):
+    worksheet = ArchiveWorksheet()
+    worksheet.append_error = error
+    install_archive_writer(monkeypatch, worksheet)
+    path = tmp_path / "ambiguous.json"
+    options = args(universe=["NEW.US"], dry_run=False, evidence_json=str(path))
+    assert asyncio.run(archive.collect(options)) == 1
+    assert worksheet.append_calls == 1  # no blind non-idempotent retry
+    report = json.loads(path.read_text())
+    assert report["archive_write"]["status"] == "UNKNOWN" and not report["complete"]
+    assert report["archive_write"]["error_code"] == "archive_append_outcome_unknown"
+    assert len(worksheet.values) == (6 if error == "after" else 5)
+    assert asyncio.run(archive.collect(options)) == 0
+    assert len(worksheet.values) == 6  # one daily row after either recovery path
+    assert worksheet.append_calls == (1 if error == "after" else 2)
+
+
+def test_safe_stdout_summary_keeps_source_evidence_and_omits_identities(tmp_path, capsys):
+    path = tmp_path / "summary.json"
+    source_evidence = [{"page": "SOURCE_IDENTITY", "read_started_utc": NOW.isoformat()}]
+    report = {"selection": {"mode": "adaptive", "analysis_cap": 60, "selected_count": 4,
+                            "queried_count": 3, "rotation_count": 1, "sources": source_evidence,
+                            "missing_identity_symbols": ["DO_NOT_PRINT.US"], "discovery_complete": False},
+              "selected_acquisition_complete": False, "complete": False,
+              "status_counts": {"OK": 2, "EMPTY": 1, "UNKNOWN": 1}}
+    archive._finish_collection_report(args(evidence_json=str(path)), report, "DRY_RUN")
+    output = capsys.readouterr().out
+    summary = json.loads(output.split("evidence ", 1)[1])
+    assert summary["selection"]["analysis_cap"] == 60
+    assert summary["status_counts"] == report["status_counts"]
+    assert summary["archive_write"]["status"] == "DRY_RUN" and len(output) < 1500
+    assert "DO_NOT_PRINT.US" not in output and "SOURCE_IDENTITY" not in output
+    saved = json.loads(path.read_text())
+    assert saved["selection"]["sources"] == source_evidence
+    assert saved["selection"]["missing_identity_symbols"] == ["DO_NOT_PRINT.US"]

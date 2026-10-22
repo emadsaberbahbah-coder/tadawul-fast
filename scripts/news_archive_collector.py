@@ -387,6 +387,7 @@ class NewsArchiveStore:
         eligible: List[str] = []
         complete = True
         invalid_identity_rows = 0
+        unknown_identities: List[str] = []
 
         def publication() -> Dict[str, Any]:
             if self.sheet is None:
@@ -442,12 +443,22 @@ class NewsArchiveStore:
                 pairs, header_ok, block_complete = _identity_pairs(
                     grid, research=page == "Top_10_Investments", diagnostics=diagnostics)
                 source_ok = header_ok and block_complete
-                if page != "Top_10_Investments" and int(ws.row_count) > limit:
+                # row_count is allocated capacity, not populated extent. With
+                # the canonical contiguous writer, only a populated capped
+                # boundary leaves a possible unread tail. Spare grid rows do
+                # not make an otherwise complete identity read incomplete.
+                boundary_populated = (len(grid) >= row_limit and bool(grid) and
+                                      any(str(value or "").strip() for value in grid[-1]))
+                capped = (page != "Top_10_Investments" and
+                          int(ws.row_count) > limit and boundary_populated)
+                if capped:
                     source_ok = False
                 entry.update({"range": source_range, "header_verified": header_ok,
                               "status": "OK" if source_ok else "INCOMPLETE",
-                              "named_rows": len(pairs), **diagnostics})
+                              "named_rows": len(pairs), "read_cap_reached": capped,
+                              **diagnostics})
                 invalid_identity_rows += diagnostics.get("invalid_identity_rows", 0)
+                unknown_identities.extend(diagnostics.get("unknown_identity_symbols") or [])
                 complete = complete and source_ok
                 conflicts = []
                 for symbol, name in pairs:
@@ -496,23 +507,34 @@ class NewsArchiveStore:
             identities.pop(symbol, None)
         identity_complete = invalid_identity_rows == 0 and not ambiguous
         return {"identities": identities, "ambiguous_symbols": sorted(ambiguous),
+                # Public identity diagnostics are global, never attributed to
+                # a portfolio role or accompanied by positions/cash/orders.
+                "unknown_identity_symbols": _unique_symbols(unknown_identities + sorted(ambiguous))[:20],
                 "pool": _unique_symbols(pools), "portfolio_membership": _unique_symbols(portfolio),
                 "research": _unique_symbols(candidates), "eligible": _unique_symbols(eligible),
                 "source_read_complete": bool(complete), "identity_coverage_complete": identity_complete,
                 "complete": bool(complete and identity_complete),
+                "read_scope": "Bounded identity windows under the contiguous canonical writer contract; not a full allocated-grid or sparse late-row audit.",
                 "sources": list(observed.values())}
 
     def is_available(self) -> bool:
         return self.ws is not None
 
     def existing_keys_for_date(self, date_str: str) -> set:
-        """Return {symbol} already archived for date_str (idempotency guard)."""
+        """Read proven daily keys; unavailable reads are not an empty archive."""
         if not self.ws:
-            return set()
+            raise RuntimeError("archive_key_read_failed")
         try:
-            rows = self.ws.get_all_values()
+            rows = self.backoff.run(lambda: self.ws.get_all_values())
         except Exception:
-            return set()
+            raise RuntimeError("archive_key_read_failed") from None
+        header_row = self.DATA_ROW0 - 2
+        header = ([str(v).strip().casefold() for v in rows[header_row]]
+                  if len(rows) > header_row else [])
+        while header and not header[-1]:
+            header.pop()
+        if header != [v.casefold() for v in self.HEADERS]:
+            raise RuntimeError("archive_header_unverified")
         out: set = set()
         for row in rows[self.DATA_ROW0 - 1:]:
             if len(row) >= 2 and str(row[0]).strip() == date_str:
@@ -523,10 +545,12 @@ class NewsArchiveStore:
         if not self.ws or not rows:
             return False
         try:
-            self.backoff.run(lambda: self.ws.append_rows(rows, value_input_option="RAW"))
+            # Append is not idempotent: a timeout may follow a committed write.
+            # Do not blindly retry it. The next invocation must re-read keys.
+            self.ws.append_rows(rows, value_input_option="RAW")
             return True
-        except Exception as e:
-            logger.error("News_Archive append failed: %s", e)
+        except Exception:
+            logger.error("News_Archive append outcome unknown; re-read keys before retry")
             return False
 
 
@@ -668,6 +692,7 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
                 "scope": "bounded selected set; not full-market news coverage",
                 "selected_count": len(universe), "queried_count": len(items),
                 "missing_identity_symbols": missing, "omitted_priority_count": max(0, total_requested - budget),
+                "unknown_identity_symbols": (context or {}).get("unknown_identity_symbols", []) if adaptive else [],
                 "rotation_count": rotation_count, "pool_identity_count": len(pool),
                 "eligible_pool_identity_count": len(eligible),
                 "eligible_rotation_count": eligible_rotation_count,
@@ -676,6 +701,7 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
                 "discovery_complete": bool(complete),
                 "source_read_complete": (context or {}).get("source_read_complete") if adaptive else None,
                 "discovery_identity_coverage_complete": (context or {}).get("identity_coverage_complete") if adaptive else None,
+                "identity_read_scope": (context or {}).get("read_scope") if adaptive else None,
                 "cohort_sha256": hashlib.sha256("\n".join(universe).encode()).hexdigest(),
                 "sources": (context or {}).get("sources", []) if adaptive else []}
     return universe, items, evidence
@@ -777,6 +803,32 @@ def _write_collection_report(path: Optional[str], report: Dict[str, Any]) -> Non
         target.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
+                              status: str, *, error_code: Optional[str] = None,
+                              attempted_rows: int = 0, accepted_rows: int = 0,
+                              skipped_rows: int = 0) -> None:
+    """Keep acquisition evidence and emit bounded nonfinancial adoption counts."""
+    write = {"status": status, "attempted_rows": attempted_rows,
+             "accepted_rows": accepted_rows, "skipped_rows": skipped_rows}
+    if error_code:
+        write["error_code"] = error_code
+        report["complete"] = False
+    report["archive_write"] = write
+    _write_collection_report(getattr(args, "evidence_json", None), report)
+    selection = report.get("selection") or {}
+    counts = {key: int(value) for key, value in (report.get("status_counts") or {}).items()
+              if key in {"OK", "EMPTY", "PARTIAL", "ERROR", "UNAVAILABLE", "UNKNOWN"}}
+    summary = {"schema": "tfb.news-acquisition-summary.v1",
+               "selection": {key: selection.get(key) for key in (
+                   "mode", "analysis_cap", "selected_count", "queried_count",
+                   "rotation_count", "source_read_complete",
+                   "discovery_identity_coverage_complete", "discovery_complete")},
+               "selected_acquisition_complete": bool(report.get("selected_acquisition_complete")),
+               "complete": bool(report.get("complete")), "status_counts": counts,
+               "archive_write": write}
+    print("[news_archive] evidence " + json.dumps(summary, sort_keys=True))
+
+
 # -----------------------------------------------------------------------------
 # Collect
 # -----------------------------------------------------------------------------
@@ -806,7 +858,7 @@ async def collect(args: argparse.Namespace) -> int:
         failed = _collection_report(universe, [], date_str)
         failed.update({"selection": selection, "selected_acquisition_complete": False,
                        "complete": False, "error_code": code})
-        _write_collection_report(getattr(args, "evidence_json", None), failed)
+        _finish_collection_report(args, failed, "NOT_ATTEMPTED", error_code=code)
         logger.error("batch_news_intelligence failed (%s)", code)
         return 1
 
@@ -844,19 +896,29 @@ async def collect(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print("[news_archive] DRY RUN -- %d rows NOT written" % len(rows))
+        _finish_collection_report(args, report, "DRY_RUN")
         return 1 if incomplete else 0
 
     if not sheet_id:
         logger.error("no spreadsheet id (use --sheet-id or DEFAULT_SPREADSHEET_ID)")
+        _finish_collection_report(args, report, "WITHHELD", error_code="archive_target_missing")
         return 1
 
     store = NewsArchiveStore(sheet_id, os.getenv("NEWS_ARCHIVE_SHEET", "News_Archive"))
     if not store.is_available():
         logger.error("News_Archive sheet unavailable (gspread/creds?) -- nothing written")
+        _finish_collection_report(args, report, "WITHHELD", error_code="archive_unavailable")
         return 1
 
     # idempotency: skip symbols already archived for today
-    already = store.existing_keys_for_date(date_str)
+    try:
+        already = store.existing_keys_for_date(date_str)
+    except Exception as exc:
+        code = (str(exc) if str(exc) in {"archive_key_read_failed", "archive_header_unverified"}
+                else "archive_key_read_failed")
+        logger.error("News_Archive verification withheld (%s)", code)
+        _finish_collection_report(args, report, "WITHHELD", error_code=code)
+        return 1
     fresh = [row for row in rows if str(row[1]).strip().upper() not in already]
     skipped = len(rows) - len(fresh)
     if skipped:
@@ -864,6 +926,9 @@ async def collect(args: argparse.Namespace) -> int:
 
     if not fresh:
         print("[news_archive] nothing new to write for %s" % date_str)
+        _finish_collection_report(args, report,
+                                  "SKIPPED_EXISTING" if rows else "NO_ELIGIBLE_ROWS",
+                                  skipped_rows=skipped)
         return 1 if incomplete else 0
 
     # v1.1.0 [SECTOR JOIN] -- env-gated, fail-open; see header WHY.
@@ -886,7 +951,11 @@ async def collect(args: argparse.Namespace) -> int:
             print("[news_archive] sector join armed but map empty -- Sector left blank (fail-open)")
 
     ok = store.append(fresh)
-    print("[news_archive] %s %d rows to %s" % ("wrote" if ok else "FAILED writing", len(fresh), store.sheet_name))
+    _finish_collection_report(args, report, "APPEND_ACCEPTED" if ok else "UNKNOWN",
+                              error_code=None if ok else "archive_append_outcome_unknown",
+                              attempted_rows=len(fresh), accepted_rows=len(fresh) if ok else 0,
+                              skipped_rows=skipped)
+    print("[news_archive] %s %d rows to %s" % ("wrote" if ok else "UNKNOWN write outcome for", len(fresh), store.sheet_name))
     return 0 if ok and not incomplete else 1
 
 
