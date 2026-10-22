@@ -415,6 +415,43 @@ ALIAS_ROWS = (
 )
 
 
+# Sparse priced rows: core.scoring derives no confidence (no data-quality
+# label, completeness < 0.40, no provider list), Phase-II then writes a
+# synthetic one (Codex review on #819).
+SPARSE = {"symbol": "SPARSE.US", "name": "Sparse Co", "currency": "USD", "exchange": "NASDAQ",
+          "current_price": 50.0, "rsi_14": 55.0}
+SPARSE_ROWS = ({"previous_close": 49.0}, {"previous_close": 49.0, "volatility_30d": 0.3},
+               {"day_high": 51.0, "day_low": 49.0})
+
+
+def _sparse_fx(extra):
+    return {"cohort": "synth", "lkg": None, "row": dict(SPARSE, **extra)}
+
+
+def case_sparse_rows_keep_phase_ii_confidence_out_of_completeness(de):
+    """A derived confidence that came out EMPTY still marks the row: Phase-II
+    then writes an engine-made confidence (the marker turns synthetic), and
+    the v2 settle keeps it out of completeness - the settled quality equals
+    the quality scored with the confidence absent (v1 counted it: +2.04) -
+    while observe publishes the pass-1 row as v5.157.0."""
+    with _engine(de):
+        for extra in SPARSE_ROWS:
+            fx = _sparse_fx(extra)
+            _set("enforce")
+            raw = de._apply_phase_bb_sanity(dict(fx["row"]))
+            assert _SCORING.compute_confidence_score(raw) == (None, None), extra
+            p1 = f7._prep(fx)
+            assert p1.get(SYNTH) is True and MARKER not in p1, (extra, {k: p1.get(k) for k in TRANSIENT})
+            assert p1["forecast_source"] == "phase_ii_synthetic" and p1["forecast_confidence"] is not None
+            v1 = de._f7_settle_result(copy.deepcopy(p1), v2=False)
+            _, enforced, _ = _settle(de, fx, "enforce")
+            assert enforced["quality_score"] == _quality_without_confidence(enforced), extra
+            assert v1.row["quality_score"] > _quality_without_confidence(v1.row), extra   # what v2 removes
+            p1_obs, observed, row = _settle(de, fx, "observe")
+            assert observed is row and _untagged(observed) == _untagged(_strip(p1_obs))
+            assert not any(k in enforced or k in observed for k in TRANSIENT)
+
+
 def case_marking_follows_the_scorers_alias_precedence(de):
     """The marker is set exactly when core.scoring DERIVES the confidence: the
     first alias that is not None must parse as a number to be reused, so a
@@ -468,6 +505,8 @@ GATE_CASES = (
     ("rows enforce would hold back carry an stx shadow tag", case_rows_enforce_would_hold_back_carry_an_stx_shadow_tag),
     ("markers made only while armed and never published", case_markers_made_only_while_armed_and_never_published),
     ("marking follows the scorer's alias precedence", case_marking_follows_the_scorers_alias_precedence),
+    ("sparse rows keep Phase-II confidence out of completeness",
+     case_sparse_rows_keep_phase_ii_confidence_out_of_completeness),
 )
 
 
@@ -478,14 +517,16 @@ def case_identity_with_5157(de, base):
     """off: byte-identical (scorer labels, frozen timestamps). observe, observe
     in / out of scope and enforce out of scope: every published field equals
     v5.157.0 observe except the f7_settle tags, at MAX_PASSES 3, 4 and 5 on
-    102 fixture variants plus the six fixtures with every ALIAS_ROWS input -
+    102 fixture variants plus the six fixtures with every ALIAS_ROWS input and
+    the SPARSE_ROWS -
     including variants whose v2 status differs from v1 - and on the error /
     oscillation / pass_limit paths under every TFB_SETTLE_UNRESOLVED mode.
     The v1 trajectory equals v5.157.0's."""
     v1_v2_status_differs = 0
     alias_cases = [dict(fx, row=dict(fx["row"], **extra)) for fx in f7.FIXTURES for extra, _ in ALIAS_ROWS]
+    sparse_cases = [_sparse_fx(extra) for extra in SPARSE_ROWS]
     for max_passes in (3, 4, 5):
-        for fx in v2s._trajectory_cases() + alias_cases:
+        for fx in v2s._trajectory_cases() + alias_cases + sparse_cases:
             with _engine(base):
                 _set("off", max_passes=max_passes)
                 b_off = base._f7_settle_pass(f7._prep(fx), fx["row"]["symbol"], GM)
@@ -577,6 +618,8 @@ test_enforce_is_the_v2_trajectory = _wrap(case_enforce_is_the_v2_trajectory)
 test_rows_enforce_would_hold_back_carry_an_stx_shadow_tag = _wrap(case_rows_enforce_would_hold_back_carry_an_stx_shadow_tag)
 test_markers_made_only_while_armed_and_never_published = _wrap(case_markers_made_only_while_armed_and_never_published)
 test_marking_follows_the_scorers_alias_precedence = _wrap(case_marking_follows_the_scorers_alias_precedence)
+test_sparse_rows_keep_phase_ii_confidence_out_of_completeness = _wrap(
+    case_sparse_rows_keep_phase_ii_confidence_out_of_completeness)
 
 
 @_isolated
@@ -689,7 +732,8 @@ TESTS = [test_c1_cold_twin_settles_to_warm_under_enforce, test_c1_observe_shows_
          test_fix1p_synthetic_rows_keep_phase_ii_confidence_without_completeness_gap,
          test_enforce_is_the_v2_trajectory, test_rows_enforce_would_hold_back_carry_an_stx_shadow_tag,
          test_markers_made_only_while_armed_and_never_published, test_marking_follows_the_scorers_alias_precedence,
-         test_marking_predicate_is_the_scorers_own_decision, test_off_is_byte_identical_and_unmarked,
+         test_marking_predicate_is_the_scorers_own_decision,
+         test_sparse_rows_keep_phase_ii_confidence_out_of_completeness, test_off_is_byte_identical_and_unmarked,
          test_identity_with_5157, test_scoring_module_is_5157s, test_golden_negative_gate_cases_fail_on_5157,
          test_evidence_is_deterministic, test_wiring_and_version]
 

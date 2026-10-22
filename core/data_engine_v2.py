@@ -24,9 +24,11 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
 - [F7-CONF-RECOMPUTE] provenance markers, never published: on a
   non-settlement call while TFB_SCORING_SETTLE != off,
   _compute_scores_canonical_first marks a row whose confidence core.scoring
-  DERIVED (the canonical patch supplied one): _f7_conf_derived. "Derived" is
-  decided exactly as compute_confidence_score decides it, with core.scoring's
-  own _get / _safe_float - the first of forecast_confidence / ai_confidence /
+  DERIVED: _f7_conf_derived - also when the derivation produced no value (a
+  sparse priced row: Phase-II then writes an engine-made synthetic
+  confidence; Codex review on #819). "Derived" is decided exactly as
+  compute_confidence_score decides it, with core.scoring's own _get /
+  _safe_float - the first of forecast_confidence / ai_confidence /
   confidence_score / confidence that is not None must parse as a number to be
   reused, so a blank or invalid earlier alias means derived even when a later
   one is populated (Codex review on #818). Phase-II's synthetic writer, which
@@ -74,7 +76,11 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
   (pass counts move: provider 140 st3 -> st2; synthetic 25 st3 -> st2, 14
   st3 -> st4, 8 st4 -> st3). v2 enforce moves the recommendation vs pass 1 on
   317 of 1,736 (v5.157.0 enforce: 316) and differs from v5.157.0 enforce on
-  36.
+  36. Review-driven variants (124 blank-alias inputs, 93 sparse priced rows
+  whose confidence the scorer cannot derive and Phase-II then writes): the
+  same observe identity on all of them; at MAX_PASSES 4 one sparse row v1
+  settles does not converge under v2 (enforce would hold it back, observe
+  tags it stx).
 - ENFORCE vs v5.157.0 enforce: cold provider twins settle to the warm
   confidence and reliability (recalibrated gate; SUBC.OL 74.3 -> 76.5 with
   its real target, 69.3 -> 71.5 soft-capped; FCN.US 73.1 -> 75.4, 68.1 ->
@@ -12212,7 +12218,10 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 }
                 row.update(safe_patch)
                 _preserve_scoring_provenance(row, patch)
-                if _conf_derives and _as_float(patch.get("forecast_confidence")) is not None:
+                # Marked even when the derivation produced no value: Phase-II may
+                # then write a synthetic confidence that is engine-made, not data
+                # (Codex review on #819: sparse priced rows).
+                if _conf_derives:
                     row[_F7_CONF_DERIVED_KEY] = True
                 return
             if row.get("_f7_settlement_active"):
