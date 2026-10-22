@@ -2,11 +2,12 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.0
 ================================================================================
 
-WHY v5.157.0 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
-5.155.0, and 2026-10-22 after #816 shipped a different 5.156.0) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
+WHY v5.159.0 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
+5.155.0, 2026-10-22 after #816 shipped a different 5.156.0, and again 2026-10-22
+after #817 shipped a different 5.157.0 while open #818 claims 5.158.0) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
 TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identical)
 - EVIDENCE: the Top_10_Investments export of 2026-10-13 20:37 Riyadh (route
   v4.18.1, builder v1.26.1, pool 9,786 rows) publishes MWG.VN as Market
@@ -49,9 +50,100 @@ TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identica
   _canonicalize_provider_row, _infer_country_from_symbol, surface_gate_states
   (no new health key), every provider, identity_guard and the builder.
   Suffixes no table knows (.PH .MA .ETR .LG) still fall back to USD.
-- OFF (unset or any other value): both inferrers return exactly what v5.155.0
-  returned; no log line, tag or payload field is added.
+- OFF (unset or any other value): both inferrers return exactly what v5.157.0
+  (main #817; was v5.155.0 when authored) returned; no log line, tag or payload
+  field is added.
 - ROLLBACK: unset TFB_ENGINE_SUFFIX_LOCALE_FALLBACK (no redeploy needed).
+WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
+(TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
+untouched at 5.11.4. The settle trajectory - passes, convergence status,
+held-back rows and every published value - is v5.156.0's in every mode: only
+the f7_settle tag's field disclosures change, and enforce = v5.156.0 enforce
++ scope. With TFB_SCORING_SETTLE off every row is byte-identical to v5.156.0.)
+- EVIDENCE (21/22 Oct exports, independent review): three gaps block arming
+  enforce. G1: core.scoring.compute_confidence_score REUSES any existing
+  forecast_confidence / ai_confidence / confidence_score / confidence. A cold
+  pass 1 lacks the 3M forecast fields (expected_roi_3m, forecast_price_3m are
+  in scoring._completeness_factor), so the scorer derives a lower confidence
+  (0.6323 vs 0.6641 warm) and every settle pass reuses it: reliability 69.3
+  instead of 71.5 on soft-capped rows, just under the board's Min Reliability
+  70 (~536 Global_Markets rows on 22 Oct). G2: the observe tag disclosed pass
+  1 -> pass 2 (first_diff), not what enforce publishes for rows that settle at
+  pass 3/4 (41% of GM rows), and at most 6 fields, sometimes hiding os=. G3:
+  Market_Leaders churns more day to day under settlement (input churn, not
+  pass order), so enforce must be scopable.
+- [F7-CONF-RECOMPUTE] (G1) DEFERRED. Re-deriving the scorer's own confidence
+  on the settle passes changes the settle TRAJECTORY (the pass a row settles
+  at, and whether it converges within TFB_SCORING_SETTLE_MAX_PASSES), so it
+  can change which rows observe holds back: the review found rows v5.156.0
+  publishes (e.g. a Commodities_FX ALGO-USD variant, overall 42.85, tag
+  st4:p3) turning non_converged and withheld. A dual-trajectory observe design
+  (publish and hold back on the v5.156.0 trajectory, measure the re-derived
+  one beside it) is planned instead.
+- KNOWN RESIDUALS under enforce (exactly v5.156.0 enforce): (1) the cold vs
+  warm confidence 0.6323 / 0.6641 is reused, so a soft-capped cold row can
+  publish forecast reliability 69.3 where its warm twin publishes 71.5 (the
+  board floor is 70); (2) from pass 2 on every row counts its own pass-1
+  confidence as a completeness field: quality_score +1.02 vs pass 1 (0.45 x
+  1/22 x 0.5 x 100), symmetric for provider-target and synthetic rows.
+- [F7-FINAL-TAG] (G2) F7SettlementResult.final_diff (frozen pass-1 row ->
+  settled row; stable results only; disclosure, never a verdict). The
+  f7_settle:<mode>:st<k>:p<n> tag now discloses pass 1 -> FINAL, i.e. the
+  values enforce publishes, for up to 8 fields in the order ov op os rc va
+  fcf r12 fs; the substring-safety degrade (:chg<n>) is unchanged. WHICH rows
+  carry a tag is unchanged (pass 2 differs from pass 1); because tolerances
+  are not transitive, pass 1 -> final can net inside them, and the tag then
+  carries no field (f7_settle:<mode>:st<k>:p<n>) - expected. first_diff /
+  last_diff stay in the result and in the scoring_settlement JSON of
+  held-back rows (unchanged). Readers of ov= / rc= deltas
+  (scripts/tfb_workbook_dq_audit.py DQ-37) now count pass 1 -> final instead
+  of pass 1 -> pass 2.
+- [F7-PAGE-SCOPE] (G3) TFB_SCORING_SETTLE_PAGES: comma-separated MARKET page
+  names, each canonicalized with _canonicalize_sheet_name ("Global Markets",
+  "global-markets", "GLOBAL_MARKETS" -> Global_Markets). Unset, empty, "*" or
+  "all" = every row (v5.156.0). The only valid entries are Global_Markets,
+  Market_Leaders, Commodities_FX and Mutual_Funds; any other name -
+  My_Portfolio, Top_10_Investments, another sheet, a typo - is ignored and
+  logged once at WARNING, and a list of only such names scopes enforce to NO
+  row ("none", fail-safe). The scope key of EVERY row is its symbol's
+  INFERRED market page, whatever page requested it (its market page,
+  My_Portfolio, Top_10_Investments or none): the orchestrator passes
+  scope_page=self._f7_scope_page(sym), i.e. _resolve_quote_page_context(sym,
+  "")[0], exactly as a page-less fetch resolves it: =X / =F ->
+  Commodities_FX; an _ETF_SYMBOL_HINTS symbol (SPY QQQ VTI VOO IWM DIA IVV
+  EFA EEM ARKK) -> Mutual_Funds; .SR or a 4-digit code -> Market_Leaders;
+  everything else -> Global_Markets. So FUNDS AND CRYPTO PAIRS WITHOUT AN ETF
+  HINT COUNT AS GLOBAL_MARKETS (SPLG, CZAR.US, SUI-USD, ALGO-USD, even on the
+  Mutual_Funds / Commodities_FX pages; of the ten 2026-10-05 Commodities_FX
+  rows only QG=F infers to Commodities_FX), and one symbol is settled, or
+  not, identically on every surface. Realistic settings: unset / "all", or
+  "Global_Markets,Commodities_FX,Mutual_Funds" (every row except .SR /
+  4-digit symbols). Under enforce an out-of-scope row is handled exactly as
+  observe (pass-1 row published, observe tag); error / non_converged rows are
+  held back in and out of scope. Disclosed as scoring_settle_pages in /health
+  engine_gates and the [GUARDS] boot line: "all", "none" or the canonical
+  list.
+- MEASURED vs v5.156.0 (the review's offline harness, 1,736 cases: the six
+  F-7 fixtures and 25 priced DT10 2026-10-05 rows, each x 14 target multiples
+  at ingestion / restored in Phase-II, x 25 price x RSI synthetic variants
+  and x 3 input-confidence variants; TFB_SCORING_SETTLE_MAX_PASSES 4 and 3):
+  settle status, settled_at, pass count, reason and first / last diff
+  identical on every case (MAX_PASSES 4: 1,003 stable at pass 3, 733 at pass
+  4; MAX_PASSES 3: 1,003 stable, 733 non_converged pass_limit, held back
+  identically); published rows identical except the tag's field disclosures
+  in observe, enforce, enforce in scope (= v5.156.0 enforce), enforce out of
+  scope (= v5.156.0 observe) and scoped observe; tag presence and st / p
+  prefix identical; off byte-identical including the scorer labels. The
+  disclosure text differs on 1,335 cases at MAX_PASSES 4 and 602 at 3.
+- Functions added 4 (_f7_settle_pages, _f7_settle_pages_label,
+  _f7_settle_page_in_scope, DataEngineV5._f7_scope_page); changed:
+  _f7_settle_tag, _f7_settle_result (final_diff only), _f7_settle_pass (+
+  scope_page), surface_gate_states, the orchestrator call site and the
+  [GUARDS] boot line (DataEngineV5); F7SettlementResult gains final_diff;
+  constants added 5; removed 0. Tests: tests/test_de_f7_settle_v2.py.
+  Rollback: unset TFB_SCORING_SETTLE_PAGES and keep TFB_SCORING_SETTLE at
+  observe (or off), or git revert. Enforce is NOT armed by this change.
+
 WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
 - _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
   holding (suffix map currency "GBp", pence) took the GBP (pounds) rate: its
@@ -4232,11 +4324,19 @@ from core.financial_units import (
 #     file under their distinct codes (GBX / ZAC / ILA), which the per-row
 #     lookup already reads as SAR per subunit.
 # Tests: tests/test_pf_weight_value_complete.py.
-# v5.157.0 (2026-10-14; renumbered 2026-10-21 and 2026-10-22 after #810 and #816
-# took 5.155.0 and 5.156.0): suffix locale fallback (gated, default off); a dotted
+# v5.157.0 (2026-10-22): F-7 v2 (see WHY v5.157.0). [F7-FINAL-TAG] the
+#   f7_settle tag discloses pass 1 -> final (up to 8 fields, ov op os rc va fcf
+#   r12 fs); [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES (market pages only,
+#   canonicalized) limits where enforce publishes, decided by the symbol's
+#   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
+#   settle trajectory, status and published values are v5.156.0's; off is
+#   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
+# v5.159.0 (2026-10-14; renumbered 2026-10-21 and twice 2026-10-22 after #810, #816
+# and #817 took 5.155.0-5.157.0; open #818 claims 5.158.0): suffix locale fallback
+# (gated, default off); a dotted
 # suffix the local table lacks asks core.symbols.normalize for exchange and
 # currency before the NASDAQ/NYSE and USD fallbacks (MWG.VN -> HOSE / VND).
-__version__ = "5.157.0"
+__version__ = "5.159.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -6138,6 +6238,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
+            "scoring_settle_pages": _f7_settle_pages_label(),          # v5.157.0 (F-7 v2)
             "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
             "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
@@ -9695,6 +9796,17 @@ _F7_SETTLE_DEPENDENT_FIELDS: Tuple[str, ...] = (
     "momentum_score", "growth_score", "technical_score", "conviction_score",
     "sector_relative_score", "rank_overall", "top10_rank", "top_factors",
 )
+# v5.157.0 (F-7 v2) [F7-PAGE-SCOPE] (see WHY v5.157.0): the markets on which
+# TFB_SCORING_SETTLE=enforce may publish a settled row.
+_F7_SETTLE_PAGES_ENV: str = "TFB_SCORING_SETTLE_PAGES"
+# Ignored names already reported (one WARNING per distinct set per process).
+_F7_SETTLE_PAGES_WARNED: Set[Tuple[str, ...]] = set()
+# The only valid scope entries: the market pages a symbol is inferred to
+# (DataEngineV5._f7_scope_page). Any other name is ignored.
+_F7_MARKET_PAGES: Tuple[str, ...] = ("Global_Markets", "Market_Leaders", "Commodities_FX", "Mutual_Funds")
+# v5.157.0 [F7-FINAL-TAG]: tag disclosure order (codes of _F7_SETTLE_FIELDS) and limit.
+_F7_SETTLE_TAG_ORDER: Tuple[str, ...] = ("ov", "op", "os", "rc", "va", "fcf", "r12", "fs")
+_F7_SETTLE_TAG_MAX: int = 8
 
 
 @dataclass(frozen=True)
@@ -9708,6 +9820,8 @@ class F7SettlementResult:
     last_diff: Tuple[Tuple[str, str, str], ...] = ()
     reason: str = ""
     error_type: str = ""
+    # v5.157.0 [F7-FINAL-TAG]: frozen pass-1 row -> settled row (stable only).
+    final_diff: Tuple[Tuple[str, str, str], ...] = ()
 
 
 def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
@@ -9964,6 +10078,61 @@ def _f7_settle_max_passes() -> int:
     return max(2, min(_F7_SETTLE_MAX_CAP, n))
 
 
+def _f7_settle_pages() -> Optional[Tuple[str, ...]]:
+    """v5.157.0 [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated
+    MARKET page names, each canonicalized with _canonicalize_sheet_name
+    ("Global Markets", "global-markets", "GLOBAL_MARKETS" -> Global_Markets).
+    None = every market (unset, empty, "*" or "all": the v5.156.0 behaviour).
+    Otherwise the listed names that canonicalize to one of _F7_MARKET_PAGES
+    (Global_Markets, Market_Leaders, Commodities_FX, Mutual_Funds), in order,
+    de-duplicated. Any other name (My_Portfolio, Top_10_Investments, a typo)
+    is ignored and logged once at WARNING, so a list of only such names scopes
+    enforce to NO row (fail-safe, disclosed as "none"). Read at call time."""
+    names = [p.strip() for p in (os.getenv(_F7_SETTLE_PAGES_ENV) or "").split(",") if p.strip()]
+    if not names or any(name.lower() in ("*", "all") for name in names):
+        return None
+    pages: List[str] = []
+    ignored: List[str] = []
+    for name in names:
+        canon = _canonicalize_sheet_name(name)
+        if canon in _F7_MARKET_PAGES:
+            if canon not in pages:
+                pages.append(canon)
+        else:
+            ignored.append(name)
+    if ignored and tuple(ignored) not in _F7_SETTLE_PAGES_WARNED:
+        _F7_SETTLE_PAGES_WARNED.add(tuple(ignored))
+        logger.warning(
+            "[engine_v2 v%s F-7] %s: ignoring %s (valid: %s); enforce scope = %s",
+            __version__, _F7_SETTLE_PAGES_ENV, ", ".join(ignored), ", ".join(_F7_MARKET_PAGES),
+            ",".join(pages) or "none",
+        )
+    return tuple(pages)
+
+
+def _f7_settle_pages_label() -> str:
+    """v5.157.0: the scope as disclosed in /health engine_gates and the
+    [GUARDS] boot line: "all" = every market, "none" = no valid market page
+    listed, else the canonical market page names."""
+    pages = _f7_settle_pages()
+    if pages is None:
+        return "all"
+    return ",".join(pages) if pages else "none"
+
+
+def _f7_settle_page_in_scope(page: Any) -> bool:
+    """v5.157.0: may TFB_SCORING_SETTLE=enforce publish a settled row whose
+    scope page (canonicalized) is this? True with no scope configured;
+    otherwise only for a listed market page (a blank page is never listed).
+    Out of scope, enforce is handled as observe. The orchestrator passes the
+    symbol's INFERRED market page (DataEngineV5._f7_scope_page), whatever the
+    requesting page."""
+    pages = _f7_settle_pages()
+    if pages is None:
+        return True
+    return _canonicalize_sheet_name(_safe_str(page).strip()) in pages
+
+
 def _f7_settle_token(value: Any) -> str:
     """Rewrite a source/label token so it stays readable but can never carry
     one of the gate's forbidden substrings (longest rewrites first, then the
@@ -10019,18 +10188,22 @@ def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any], *, strict:
 
 
 def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
-                   first_diff: List[Tuple[str, str, str]]) -> str:
+                   diff: List[Tuple[str, str, str]]) -> str:
     """ONE substring-safe tag: f7_settle:<mode>:st<k|x>:p<n>:code=before>after
-    (at most 6 field disclosures; st = pass at which the row stopped changing,
-    x = still moving at the cap; p = re-passes executed). If a disclosure ever
+    (st = pass at which the row stopped changing, x = still moving at the cap;
+    p = re-passes executed). v5.157.0 [F7-FINAL-TAG]: the caller passes the
+    pass-1 -> FINAL settled diff, disclosed for at most _F7_SETTLE_TAG_MAX (8)
+    fields in the order ov op os rc va fcf r12 fs. If a disclosure ever
     contained a forbidden substring the tag degrades to a count-only form."""
     parts = [_F7_SETTLE_TAG, mode, "st%s" % (settled_at if settled_at else "x"), "p%d" % int(passes_run)]
-    for code, a, b in list(first_diff)[:6]:
+    order = {code: i for i, code in enumerate(_F7_SETTLE_TAG_ORDER)}
+    ranked = sorted(list(diff), key=lambda d: order.get(d[0], len(order)))
+    for code, a, b in ranked[:_F7_SETTLE_TAG_MAX]:
         parts.append("%s=%s>%s" % (code, a, b))
     tag = ":".join(parts)
     low = tag.lower()
     if any(f in low for f in _REL_PATH_FORBIDDEN):
-        tag = ":".join(parts[:4]) + ":chg%d" % len(first_diff)
+        tag = ":".join(parts[:4]) + ":chg%d" % len(diff)
     return tag
 
 
@@ -10083,9 +10256,13 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 first_diff = last_diff
             if not last_diff:
                 stable_row = row if k == 2 else cand
+                final_diff: Tuple[Tuple[str, str, str], ...] = ()
                 if stable_row is not row:
                     _cap_intrinsic_display(stable_row)
-                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff)
+                    # v5.157.0 [F7-FINAL-TAG]: disclosure only, never a verdict.
+                    final_diff = tuple(_f7_settle_diff(frozen_input, stable_row))
+                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff,
+                                          final_diff=final_diff)
             if any(not _f7_settle_diff(prior, cand, strict=True) for prior in history):
                 return F7SettlementResult("non_converged", passes_run=passes_run,
                                           first_diff=first_diff, last_diff=last_diff, reason="oscillation")
@@ -10098,12 +10275,17 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                   last_diff=last_diff, reason="scorer_exception", error_type=type(exc).__name__)
 
 
-def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
+def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
+                    scope_page: Optional[str] = None) -> Dict[str, Any]:
     """Keep stable mode semantics; detected failures always withhold execution.
 
     Off leaves unmarked rows unchanged. Observe keeps successful pass-1 values
     and Enforce publishes a proved stable row. Neither mode nor a later switch
     to Off can turn a known error/non-convergence into valid scores or funding.
+    v5.157.0 (F-7 v2): Enforce runs as Observe when scope_page (default None =
+    page) is not in TFB_SCORING_SETTLE_PAGES; the orchestrator passes the
+    symbol's inferred market page. The tag discloses pass 1 -> FINAL. The
+    settle trajectory (passes, status, values) is v5.156.0's.
     """
     if not isinstance(row, dict):
         return row
@@ -10113,6 +10295,9 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
     mode = _f7_settle_mode()
     if mode == "off":
         return row
+    # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe.
+    if mode == "enforce" and not _f7_settle_page_in_scope(page if scope_page is None else scope_page):
+        mode = "observe"
     result = _f7_settle_result(row)
     if result.status != "stable":
         # v5.153.0 (WP-2b): only a non_converged result consults
@@ -10148,7 +10333,11 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
         _f7_unresolved_strip(result.row)
     if not result.first_diff:
         return row
-    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
+    # v5.157.0 [F7-FINAL-TAG]: pass 1 -> FINAL (what enforce publishes), not
+    # pass 1 -> pass 2; a row is tagged when pass 2 differed from pass 1
+    # (first_diff), and the disclosure may be empty when pass 1 -> final nets
+    # inside the non-transitive tolerances.
+    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.final_diff))
     out = row if mode == "observe" else result.row
     _v573_append_warning(out, tag)
     return out
@@ -15371,7 +15560,7 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
 
 
 # =============================================================================
-# v5.157.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
+# v5.159.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
 # -----------------------------------------------------------------------------
 # A dotted suffix absent from _SUFFIX_TO_LOCALE (.VN, .SET, .PS, .AU, .KO, ...)
 # fell through to NASDAQ/NYSE + USD while _infer_country_from_symbol already
@@ -15432,7 +15621,7 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "Futures"
-    _nzl = _suffix_locale_nz_for(s)  # v5.157.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
     if _nzl is not None:
         return _nzl[0]
     return "NASDAQ/NYSE"
@@ -15459,7 +15648,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
-    _nzl = _suffix_locale_nz_for(s)  # v5.157.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
     if _nzl is not None:
         return _nzl[1]
     return "USD"
@@ -18042,7 +18231,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s scoring_settle_pages=%s fc_tuple=%s "
                 "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
                 "settle_unresolved=%s price_precision=%s",
                 __version__,
@@ -18060,6 +18249,7 @@ class DataEngineV5:
                 _g(_fund_lkg_enabled),
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
+                _f7_settle_pages_label(),   # v5.157.0 (F-7 v2): enforce page scope provable at boot
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
@@ -18118,6 +18308,21 @@ class DataEngineV5:
                 p = "Global_Markets"
         routed = self._providers_for_instrument(p, symbol)
         return p, (routed[0] if routed else "")
+
+    def _f7_scope_page(self, symbol: str) -> str:
+        """v5.157.0 [F7-PAGE-SCOPE]: the page that decides the F-7 enforce
+        scope for this symbol, WHATEVER page requested it (a market page,
+        My_Portfolio, Top_10_Investments or none): its inferred market page,
+        exactly as a page-less fetch resolves it. =X / =F -> Commodities_FX;
+        an _ETF_SYMBOL_HINTS symbol (SPY, QQQ, ...) -> Mutual_Funds; .SR or a
+        4-digit code -> Market_Leaders; everything else -> Global_Markets,
+        including funds and crypto pairs without an ETF hint (SPLG, SUI-USD).
+        One symbol is therefore settled, or not, identically on every surface.
+        Fail-safe: "" is never in a configured scope (enforce -> observe)."""
+        try:
+            return self._resolve_quote_page_context(symbol, "")[0]
+        except Exception:
+            return ""
 
     def _providers_for(self, page: str) -> List[str]:
         p = _canonicalize_sheet_name(page)
@@ -19547,7 +19752,11 @@ class DataEngineV5:
                 # v5.147.0 (F-7): settle the pass-dependent scores. off ->
                 # returns merged untouched (byte-identical); observe -> tag
                 # only; enforce -> the settled row replaces the pass-1 row.
-                merged = _f7_settle_pass(merged, sym, page_ctx)
+                # v5.157.0 [F7-PAGE-SCOPE]: the enforce scope is decided by the
+                # symbol's INFERRED market page whatever page requested it, so
+                # its market page, My_Portfolio, Top_10 and a page-less fetch
+                # settle it identically.
+                merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))
                 _fct_scored = _as_float(merged.get("overall_score")) is not None
             else:
                 _mark_row_as_empty(merged)
