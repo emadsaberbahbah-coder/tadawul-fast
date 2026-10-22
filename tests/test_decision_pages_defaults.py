@@ -5,7 +5,7 @@ The owner chose on 2026-10-15 to arm five default-off gates in code:
   opportunity_builder 1.28.0  TFB_OPP_VENUE_CAL_EXT, TFB_OPP_FRESHNESS_ALERT,
                               TFB_OPP_RESEARCH_DIVERSIFY  -> ON when unset
   portfolio_actions 1.17.0    TFB_PF_RESEARCH_VIEW        -> enforce when unset
-  data_engine_v2 5.157.0      TFB_ENGINE_SUFFIX_LOCALE_FALLBACK -> ON when unset
+  data_engine_v2 5.158.0      TFB_ENGINE_SUFFIX_LOCALE_FALLBACK -> ON when unset
   daily_sync.yml 1.0.5        TFB_SYNC_FW2_SCOPE fallback -> enforce (both writers)
   core_repair_readback        declared research view    -> enforce (lockstep)
 
@@ -110,7 +110,7 @@ def case_d4_readback_declares_enforce(_mp, _tmp):
 def case_d5_versions_and_verifier(_mp, _tmp):
     assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 28, 0)
     assert _vt(pa.PORTFOLIO_ACTIONS_VERSION) >= (1, 17, 0)
-    assert _vt(de.__version__) >= (5, 157, 0)
+    assert _vt(de.__version__) >= (5, 158, 0)
     text = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     for name in ("TFB_OPP_VENUE_CAL_EXT", "TFB_OPP_FRESHNESS_ALERT"):
         assert re.search(r"\('%s', '1'," % name, text), name
@@ -155,7 +155,7 @@ def case_k4_ascii_added_lines(_mp, _tmp):
     for rel, start, end in (
             ("core/analysis/opportunity_builder.py", "# v1.28.0 (2026-10-15)", 'OPPORTUNITY_BUILDER_VERSION = "'),
             ("core/analysis/portfolio_actions.py", "# v1.17.0 (2026-10-15)", 'PORTFOLIO_ACTIONS_VERSION = "'),
-            ("core/data_engine_v2.py", "WHY v5.157.0 (2026-10-15", "WHY v5.156.0 (2026-10-14"),
+            ("core/data_engine_v2.py", "WHY v5.158.0 (2026-10-15", "WHY v5.157.0 (2026-10-14"),
             (".github/workflows/daily_sync.yml", "# VERSION 1.0.6 (2026-10-15", "# VERSION 1.0.5 (2026-10-14"),
             ("scripts/verify_core_repair_readback.py", "# v1.2.2 (2026-10-15)", "# v1.2.1 (2026-10-13)")):
         text = (ROOT / rel).read_text(encoding="utf-8")
@@ -183,9 +183,11 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     bde = _load(base / "data_engine_v2.py", "de_launch_base")
     # merge note 2026-10-21: the pre-flip copies are the #778 bundle head (git show
     # 39e708b3:<path>): builder 1.27.1, actions 1.16.0, engine 5.156.0 (renumbered).
-    assert bob.OPPORTUNITY_BUILDER_VERSION == "1.27.1"
-    assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.16.0"
-    assert bde.__version__ == "5.156.0"
+    # merge note 2026-10-22: the bundle head is now c5133148 (main #813/#815/#816
+    # merged): builder 1.27.3, actions 1.16.1 (#816), engine 5.157.0.
+    assert bob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
+    assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.16.1"
+    assert bde.__version__ == "5.157.0"
     _clean(mp)
     got = _armed(bob, bpa, bde)
     assert got == {"venue_cal_ext": False, "freshness_alert": False,

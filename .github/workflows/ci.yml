@@ -2,25 +2,50 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.31 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20 and 2026-10-21) -- DT10 v1.13.11 HELD-SEAT HARNESS
+# VERSION 1.1.33 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21 and 2026-10-22) -- DT10 v1.13.12 HELD-SEAT HARNESS
 #
-# v1.1.31 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.29 first): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
-# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.11
+# v1.1.33 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.31 first, 1.1.30-1.1.31 for #815 and #816): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.12
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
-# 1.27.1 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
+# 1.27.3 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
 # harness runs the full .gs in a node vm (K1-K5: reader, pure list, REAL
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.30 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20 and 2026-10-21) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.32 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21 and 2026-10-22) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.30 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.29 for #802, #806, #809 and #810): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.32 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.31 for #802, #806, #809, #810, #815 and #816): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+#
+# VERSION 1.1.31 (2026-10-22) -- LEARNING-METRIC DEFINITIONS
+#
+# v1.1.31: run tests/test_learning_metric_fixes.py (track_performance v6.46.0:
+# direction-aware win/loss, decided-only hit rate and claimed rate,
+# per-horizon Sharpe/Sortino; carried from PR #809) in the blocking lean lane
+# next to the other tracker suites; and in the model lane
+# tests/test_pf_weight_value_complete.py (data_engine_v2 v5.156.0: unpriced
+# holdings blank the book's weights, GBp/ZAc/ILa FX keys never overwrite the
+# major rate; portfolio_actions v1.16.1: EXIT never sells more whole shares
+# than held). Offline fakes only.
+#
+# VERSION 1.1.30 (2026-10-22) -- DT10 BULK RENDER FORMATTING
+#
+# v1.1.30: run tests/js/dt10_bulk_format.test.js in the blocking lean lane's
+# native Apps Script step. WHY (21 Oct): the Top-10 refresh after the first
+# decision-feed release hit the Apps Script 6-minute limit while painting
+# formats cell by cell; B2 stayed 'running' and the next scheduled release
+# check withdrew the release. 16_Decision_Top10.gs v1.13.11 writes the same
+# formats in bulk. The harness runs the reviewed v1.13.10 file (rebuilt
+# from the delivered one by reversing only the enumerated v1.13.11 edits,
+# SHA-256 pinned) as its oracle against a cell-model sheet and requires an
+# identical painted cockpit with bounded call counts. Offline fakes only.
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.29 (2026-10-21) -- SYNC TRUTH AND SHEETS TRANSPORT
 #
 # v1.1.29 (1.1.28 is PR #809): run in the blocking lean lane
@@ -750,6 +775,7 @@ jobs:
             tests/test_track_flags_mapped.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
+            tests/test_learning_metric_fixes.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
@@ -775,7 +801,8 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_intrinsic_display_basis.py \
-            tests/test_pf_weight_subunit_fx.py
+            tests/test_pf_weight_subunit_fx.py \
+            tests/test_pf_weight_value_complete.py
 
       - name: 🛡️ Run isolated protective legacy harnesses
         run: |
@@ -805,6 +832,7 @@ jobs:
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_audit_keep.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js
+          node tests/js/dt10_bulk_format.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py

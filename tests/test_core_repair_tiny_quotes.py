@@ -19,7 +19,9 @@ OTHER_COMMIT = "f" * 40
 # 2026-10-21: data_engine_v2 5.157.0 (suffix locale fallback default on; main's #810
 # took 5.155.0 and the bundle's fallback is 5.156.0); the CLI compares this with
 # the source constant, so the pin moves in place.
-ENGINE = "5.157.0"
+# 2026-10-22: 5.158.0 after main's #816 took 5.156.0 and the bundle's fallback
+# moved to 5.157.0; still an in-place pin, compared with the source constant.
+ENGINE = "5.158.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

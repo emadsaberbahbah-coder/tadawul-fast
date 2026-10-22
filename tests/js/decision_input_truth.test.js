@@ -5,6 +5,10 @@
  *  DT10_AUDIT_KEEP_MAX. The hand-off is proved by tests/js/dt10_audit_keep.test.js;
  *  historySource strips the v1.13.10 regions before the v1.13.9 history helper.)
  * (2026-10-14, v1.13.9: cash-label and UTC adapter pins; no census change.)
+ * (2026-10-22, v1.13.11: version pins; census +1 function dt10BulkPaint_;
+ *  the range stub gains the bulk format reads getBackgrounds/getFontColors/
+ *  getFontWeights; T6 checks the hidden-tab verdict colouring as one bulk
+ *  write. Equivalence is proved by tests/js/dt10_bulk_format.test.js.)
  * (2026-10-20, v1.13.10: version pins; census +3 functions +1 var for the
  *  holding subunit FX and terminal FAILED refresh state.)
  * (2026-10-13, v1.13.8: pins moved 1.13.7 -> 1.13.8; census +2 functions
@@ -162,6 +166,11 @@ function mkRange(sheet, r, c, nr, nc, a1) {
     getNumRows() { return nr || 1; }, getNumColumns() { return nc || 1; },
     getRow() { return r; }, getColumn() { return c; }
   };
+  // v1.13.11: bulk format reads (formats are not modelled: GAS defaults).
+  const grid = def => Array.from({length: nr || 1}, () => Array.from({length: nc || 1}, () => def));
+  self.getBackgrounds = () => grid('#ffffff');
+  self.getFontColors = () => grid('#000000');
+  self.getFontWeights = () => grid('normal');
   for (const m of ['setNumberFormat', 'setNumberFormats', 'setWrap', 'setFontSize', 'setBackground', 'setBackgrounds',
     'setFontColor', 'setFontColors', 'setFontWeight', 'setFontWeights', 'setFontStyle', 'setHorizontalAlignment',
     'setBorder', 'clear', 'clearContent', 'clearFormat', 'merge', 'breakApart', 'setNote']) {
@@ -385,7 +394,10 @@ check('T4 delivered OFF render is deterministic (idempotent write log + payload)
   const a = render(loadTree(source), {}); const b = render(loadTree(source), {});
   deq(a.calls, b.calls); assert.equal(JSON.stringify(a.p), JSON.stringify(b.p));
   assert(!Object.keys(a.p).some(k => /^_dt10_(it|cand|vint|cal)/.test(k)), 'off => no private input-truth keys');
-  assert(a.calls.length > 1000, 'the real render wrote the whole cockpit: ' + a.calls.length + ' calls');
+  // v1.13.11: bulk formatting paints the same cockpit in far fewer calls (the
+  // v1.13.10 render logged > 1000); the footer and grid header below prove
+  // the render completed. Equivalence: tests/js/dt10_bulk_format.test.js.
+  assert(a.calls.length > 100 && a.calls.length < 400, 'the real render wrote the whole cockpit in bulk: ' + a.calls.length + ' calls');
   assert.equal(lastWrittenRow(a.calls, 'Top_10_Investments'), FIX.shape.footer_row, 'footer at the exported row 578');
   deq(setValuesAt(a.calls, 'Top_10_Investments', FIX.shape.cand_header_row, 1, 1, 25)[0][0], a.env.ctx.DT10_CAND_HEADERS);
   assert.equal(setValuesAt(a.calls, 'Top_10_Investments', FIX.shape.cand_first_data_row, 1, 500, 25).length, 1);
@@ -446,13 +458,20 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   const tabGrid = setValuesAt(C, '_T10_Candidates', 1, 1, 502, 25)[0];
   const stamp = tabGrid[0][0];
   assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v\d+\.\d+\.\d+$/);
-  assert(stamp.endsWith(' | DT10 v' + ctx.DT10_VERSION) && dt10AtLeast(ctx.DT10_VERSION, [1, 13, 10]), stamp);   // merge note 2026-10-21 (#778): held seats are v1.13.11 over #810's v1.13.10
+  assert(stamp.endsWith(' | DT10 v' + ctx.DT10_VERSION) && dt10AtLeast(ctx.DT10_VERSION, [1, 13, 11]), stamp);   // merge note 2026-10-22 (#778): held seats are v1.13.12 over #815's v1.13.11
   deq(tabGrid[1], ctx.DT10_CAND_HEADERS);
   deq(tabGrid.slice(2), setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
   assert.equal(find(C, x => x[0] === 'hideSheet' && x[1] === '_T10_Candidates').length, 1);
   deq(find(C, x => x[0] === 'setFrozenRows' && x[1] === '_T10_Candidates').map(x => x[2]), [2]);
   deq(find(C, x => x[0] === 'setActiveSheet').map(x => x[1]), ['Top_10_Investments']);
-  assert(find(C, x => x[0] === 'setBackground' && x[1] === '_T10_Candidates').length >= 500, 'verdict colouring kept on the hidden tab');
+  // v1.13.11: the verdict colouring is ONE bulk write of the 500-row verdict
+  // column (col 18 from row 3), each verdict row carrying its token colour.
+  const tabPaint = find(C, x => x[0] === 'setBackgrounds' && x[1] === '_T10_Candidates' && x[2] === 3 && x[3] === 18 && x[4] === 500 && x[5] === 1);
+  assert.equal(tabPaint.length, 1, 'verdict colouring kept on the hidden tab (one bulk write)');
+  const painted = JSON.parse(tabPaint[0][6])[0].filter(r => r[0] !== '#ffffff').length;
+  const verdictRows = tabGrid.slice(2).filter(r => String(r[17] || '') !== '').length;
+  assert.equal(painted, verdictRows, 'every verdict row painted, no other row');
+  assert.equal(find(C, x => x[0] === 'setBackground' && x[1] === '_T10_Candidates').length, 0, 'no per-cell colouring left');
   assert.equal(setValuesAt(C, 'Top_10_Investments', 77, 1, 500, 25).length, 0, 'no grid in the cockpit');
   // cockpit: section 75, header 76, pointer 77, footer 79
   deq(setValuesAt(C, 'Top_10_Investments', 76, 1, 1, 25)[0][0], ctx.DT10_CAND_HEADERS);
@@ -556,16 +575,16 @@ const DESIGNED_FUNCTIONS = ['dt10AuditKeepOn_', 'dt10AuditKeepSymbols_', 'dt10Fe
 const DESIGNED_VARS = ['DT10_AUDIT_KEEP_PROP', 'DT10_AUDIT_KEEP_MAX', 'DT10_FEED_COHORT_BIND_PROP', 'DT10_SOURCE_APPROVED_SCOPE', 'DT10_CANDTAB_STAGE_SHEET', 'DT10_VINT_PUBLISHED_RE', 'DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
   'DT10_CANDTAB_SHEET', 'DT10_CANDTAB_COCKPIT_TARGET_ROWS', 'DT10_VINTAGE_PROP', 'DT10_VINTAGE_HEADERS', 'DT10_VINT_ASOF_RE', 'DT10_VINT_LKG_RE'].sort();
 function census(src, re) { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; }
-check('T9 static: DT10_VERSION >= 1.13.10 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
+check('T9 static: DT10_VERSION >= 1.13.11 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
   const { ctx } = loadTree(source);
-  assert(dt10AtLeast(ctx.DT10_VERSION, [1, 13, 10]), ctx.DT10_VERSION);   // merge note 2026-10-21 (#778): held seats are v1.13.11 over #810's v1.13.10
+  assert(dt10AtLeast(ctx.DT10_VERSION, [1, 13, 11]), ctx.DT10_VERSION);   // merge note 2026-10-22 (#778): held seats are v1.13.12 over #815's v1.13.11
   assert(source.split('\n')[3].startsWith(' * Version: ' + ctx.DT10_VERSION + ' '));
   assert(source.includes("var DT10_VERSION = '" + ctx.DT10_VERSION + "';"));
   assert.doesNotThrow(() => new vm.Script(source, { filename: '16_Decision_Top10.gs' }), 'syntax (node --check equivalent)');
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
   const fns = census(source, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), vars = census(source, /^var\s+([A-Za-z_$][\w$]*)/mg);
-  assert.equal(fns.size,196,'full v1.13.11 function census (v1.13.10 194 + dt10AuditKeepOn_, dt10AuditKeepSymbols_)'); assert.equal(vars.size,106,'full v1.13.11 variable census (v1.13.10 104 + DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX)');
+  assert.equal(fns.size,197,'full v1.13.12 function census (#815 v1.13.11 195 + dt10AuditKeepOn_, dt10AuditKeepSymbols_)'); assert.equal(vars.size,106,'full v1.13.12 variable census (v1.13.11 104 + DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX)');
   for (const f of DESIGNED_FUNCTIONS) assert(fns.has(f), 'missing ' + f);
   for (const v of DESIGNED_VARS) assert(vars.has(v), 'missing ' + v);
   for (const f of DESIGNED_FUNCTIONS) assert.equal(typeof ctx[f], 'function', f);

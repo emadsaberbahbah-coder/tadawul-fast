@@ -2,6 +2,8 @@
 
 Renumbered 2026-10-19: main shipped a different 1.27.0 first (#797, conviction sizing). This build is now **v1.27.1**. Main's default venue-calendar map (v1.26.2, kill switch `TFB_TICKET_VENUE_CAL_EXT`) already covers most suffixes, so `TFB_OPP_VENUE_CAL_EXT` now adds only .NS, .AT and .SZ. The figures below are as measured on 2026-10-13 against 1.26.1.
 
+Renumbered again 2026-10-22: main shipped v1.27.2 first (#813, Athens `.AT -> ASEX` in the default-on map, `.NS` deliberately fail-closed because XBOM 4.13.2 does not model NSE's special sessions). 1.27.1 stays claimed by open #803, so this build is **v1.27.3**. One behaviour change, made on purpose: `_VENUE_CAL_MAP_EXT` drops `.NS` (main's safety call: arming `TFB_OPP_VENUE_CAL_EXT` must not certify a stale NSE quote during a Muhurat or weekend session) and `.AT` (now always resolved by v1.27.2's map first, so the entry was dead). It keeps `.SZ -> XSHG`. `tests/test_ob_top10_data_quality.py` moves its flag example from RELIANCE.NS to 000001.SZ (SZSE close 07:00 UTC) and its golden base to main's v1.27.2; G1-G2 pass against `git show df99bcf3:core/analysis/opportunity_builder.py`. Off (all three gates unset) is byte-identical to v1.27.2 except the version stamp.
+
 Date: 2026-10-13. Base: main 278f148 (builder 1.26.1). Gates: three, all default OFF.
 
 ## Why this item
@@ -140,6 +142,8 @@ exchange_calendars or pandas. Enrolling it in the lean list is a follow-up once 
 ## Cockpit half: 16_Decision_Top10.gs v1.13.9 -> v1.13.10
 
 Renumbered 2026-10-21: main shipped a different 16_Decision_Top10 v1.13.10 first (#810: holding subunit FX, no native-as-SAR, FAILED state). The held-seat change is now **v1.13.11** on top of it. Its header block sits above main's v1.13.10, and off is byte-identical to v1.13.10 (`tests/js/dt10_audit_keep.test.js` D1-D2 pass with `DT10_BASE=<git show 55b47f24:apps_script/16_Decision_Top10.gs>`). `tests/js/dt10_audit_keep_regions.js` now maps v1.13.11 to v1.13.10, and main's history helper then reverses v1.13.10 and v1.13.9 to the pinned v1.13.8 digest. The text below describes the v1.13.10 numbering as built on 2026-10-14.
+
+Renumbered again 2026-10-22: main shipped a different 16_Decision_Top10 v1.13.11 first (#815, bulk render formatting under the 6-minute limit). The held-seat change is now **v1.13.12**. Its header block sits above #815's v1.13.11 block. `tests/js/dt10_audit_keep_regions.js` `stripDesigned` now rebuilds main's v1.13.11 text, which feeds both history helpers (`feedHistorySource` and #815's `v11310Source`). Main's `tests/js/dt10_bulk_format.test.js` takes its oracle from `v11310Source(stripDesigned(source))` and reads the version as a floor. Census 197 functions / 106 vars (#815's 195 / 104 plus this change's 2 / 2). `dt10_audit_keep.test.js` PASS 8/8 with `DT10_BASE` = main v1.13.11 (D1 off bodies equal, D2 designed regions only); `dt10_bulk_format` 9/9, `decision_input_truth` 20 passed, `dt10_feed_cohort_binding` 21/21, `decision_source_readiness` 73, `gas_ledger_fx_failed_state` 11/11. Two stale labels inside the designed regions were corrected while renumbering (`v1.13.10 PURE` and the 'v1.13.9 request/body' notes now read v1.13.12 / unarmed); no code changed. Paste item for the owner: the full v1.13.12 file replaces v1.13.11.
 
 Built 2026-10-13 as an unreleased v1.13.9 draft; #774 then shipped a different v1.13.9 (entered-cash label
 and holding UTC provenance), so this change was re-applied on top of it as v1.13.10 on 2026-10-14. The

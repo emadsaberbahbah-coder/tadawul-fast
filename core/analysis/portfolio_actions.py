@@ -822,6 +822,13 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _env_add_stop_prox_pct, _add_loser_eval, _apply_add_loser_veto).
 #   Removed: 0. Rollback: env unset (= v1.13.1) or revert.
 # ---------------------------------------------------------------------------
+# v1.16.1 (2026-10-22) [FRAC-QTY]: _sell_side_deltas floors a fractional
+#   holding to whole shares (round() could sell 11 of 10.6 held) and prices a
+#   share at market_value / true quantity, so the 0.6 left after an EXIT shows
+#   in post_trade_weight_pct. The delta stays a signed INTEGER (the
+#   10_My_Portfolio contract); a holding under one share stays blank.
+#   Tests: tests/test_pf_weight_value_complete.py.
+# ---------------------------------------------------------------------------
 # v1.17.0 (2026-10-15) [DECISION-PAGES LAUNCH] - the P0-6 research view is
 #   DEFAULT ENFORCE (owner decision 2026-10-15).
 # EVIDENCE (Portfolio_Decision export of 2026-10-15 01:00 Riyadh, actions
@@ -839,7 +846,9 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   sizes, funds or unblocks a row. core_repair_readback.yml and
 #   scripts/verify_core_repair_readback.py move their declared default to
 #   enforce in the same change (lockstep).
-# OFF: TFB_PF_RESEARCH_VIEW=off restores v1.16.0 exactly.
+# OFF: TFB_PF_RESEARCH_VIEW=off restores v1.16.0 exactly (since the
+#   2026-10-22 merge: v1.16.1, i.e. v1.16.0 plus #816's FRAC-QTY fix above,
+#   which this build carries unchanged).
 #   SUPERSEDES the v1.16.0 block's "off (default)", "blank included, is off"
 #   and "Rollback: unset TFB_PF_RESEARCH_VIEW" lines (kept verbatim below as
 #   history): unset or blank now arms enforce; roll back with the explicit
@@ -3257,11 +3266,16 @@ def _sell_side_deltas(entries, ctl, total_value):
                 continue
             cand = e.get("cand") or {}
             qraw = cand.get("quantity")
-            q = int(round(float(qraw))) if qraw not in (None, "") else 0
+            # v1.16.1 [FRAC-QTY]: whole shares never exceed the holding
+            # (floor, not round: 10.6 held sold -11) and the per-share value
+            # uses the TRUE quantity, so a fractional remainder stays in the
+            # post-trade weight instead of reading 0%.
+            qf = float(qraw) if qraw not in (None, "") else 0.0
+            q = int(math.floor(qf)) if math.isfinite(qf) else 0
             if q <= 0:
                 continue
             mv = float(cand.get("market_value_sar") or 0.0)
-            px = (mv / q) if mv > 0 else float(
+            px = (mv / qf) if mv > 0 else float(
                 (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0))
             if act == ACTION_EXIT:
                 n = q

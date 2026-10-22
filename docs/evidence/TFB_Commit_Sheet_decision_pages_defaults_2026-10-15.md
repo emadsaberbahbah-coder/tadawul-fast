@@ -2,6 +2,8 @@
 
 opportunity_builder 1.27.0 -> 1.28.0 - portfolio_actions 1.16.0 -> 1.17.0 - data_engine_v2 5.155.0 -> 5.156.0 - daily_sync.yml 1.0.4 -> 1.0.5 - core_repair_readback.yml + verify_core_repair_readback 1.2.1 -> 1.2.2 - verify_deployment 1.0.64 -> 1.0.65 - tests/conftest.py - tests/test_decision_pages_defaults.py (NEW)
 
+Renumbered 2026-10-22 (merge of the re-merged #778 bundle, which now carries main #813/#815/#816): the engine half is **data_engine_v2 5.158.0** (5.157.0 is now the bundle's fallback, renumbered over #816's 5.156.0); portfolio_actions stays 1.17.0 and now sits on #816's 1.16.1 FRAC-QTY fix, so `TFB_PF_RESEARCH_VIEW=off` restores 1.16.1; opportunity_builder stays 1.28.0 on the bundle's 1.27.3. Arming `TFB_OPP_VENUE_CAL_EXT` by default now adds exactly one venue, .SZ (XSHG): #813 put .AT in the default-on map and keeps .NS fail-closed, and the bundle dropped both from its extension. Pins: verify_deployment 1.0.65 (builder 1.28.0, actions 1.17.0, engine 5.158.0), tiny-quotes ENGINE 5.158.0. `tests/test_decision_pages_defaults.py` G1 now loads the pre-flip copies from the bundle head c5133148 (builder 1.27.3, actions 1.16.1, engine 5.157.0). No default changed in the renumbering.
+
 ## S0 - Decision and base
 | Item | Value |
 |---|---|
