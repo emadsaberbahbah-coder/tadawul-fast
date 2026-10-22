@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.33 (2026-10-22) -- F-7 v2b SETTLE SHADOW
+#
+# v1.1.33: run tests/test_de_f7_settle_shadow.py (data_engine_v2 v5.158.0:
+# enforce settles on the v2 trajectory - the scorer's own confidence is
+# re-derived; observe publishes exactly v5.157.0 and its tag shows the v2
+# result) next to tests/test_de_f7_settle_v2.py in the lean model lane and the
+# heavy scoring-settle step. Offline; real engine module, fixtures and
+# orchestrator. Its identity comparisons with v5.157.0 and golden negative
+# need TFB_F7V2B_BASE and skip in CI.
+#
 # VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
 #
 # v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
@@ -790,6 +800,7 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_settle_v2.py \
+            tests/test_de_f7_settle_shadow.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_pf_weight_subunit_fx.py \
             tests/test_pf_weight_value_complete.py
@@ -925,6 +936,7 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_settle_v2.py \
+            tests/test_de_f7_settle_shadow.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
 
