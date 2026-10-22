@@ -1,4 +1,4 @@
-/* 26_Decision_Chain v1.0.0: refresh Portfolio_Decision and Top_10 when the
+/* 26_Decision_Chain v1.0.2: refresh Portfolio_Decision and Top_10 when the
  * sync's data lands. Runs the REAL 10_My_Portfolio, 11_Manual_Refresh_
  * Coordinator, 16_Decision_Top10 and 26_Decision_Chain sources in one vm (the
  * shared Apps Script namespace) with service stubs; only the two refresh
@@ -40,9 +40,10 @@ function world(o) {
   const props = Object.assign({}, o.props || {});
   const runLog = [];
   const triggers = (o.triggers || []).slice();
-  const calls = {pd: 0, t10: 0, sheetReads: 0};
+  const calls = {pd: 0, t10: 0, sheetReads: 0, receiptReads: 0};
   const grid = [STATUS_HEADER].concat(o.status || []);
   const kv = o.kv || {};
+  const boards = {pd: o.pdInitial || '', t10: o.t10Initial || ''};
   const status = {
     getLastRow() { return grid.length; }, getLastColumn() { return 13; },
     getRange(a, b, c, d) {
@@ -57,6 +58,19 @@ function world(o) {
   const ss = {getSheetByName(name) {
     if (name === '_Status') return status;
     if (name === '_Run_Log') return {appendRow(r) { runLog.push(r); }};
+    if (name === 'Portfolio_Decision' || name === 'Top_10_Investments') {
+      const action = name === 'Portfolio_Decision' ? 'pd' : 't10';
+      return {getRange(row, col) {
+        assert.deepEqual([row, col], [2, 2]);
+        return {getValue() {
+          calls.receiptReads++;
+          if (o.receiptReadThrows || (o.receiptReadFailureAt || []).includes(calls.receiptReads)) {
+            throw new Error('synthetic receipt read failure');
+          }
+          return boards[action];
+        }};
+      }};
+    }
     return null;
   }};
   class FixedDate extends Date {
@@ -84,9 +98,25 @@ function world(o) {
   };
   vm.createContext(ctx);
   for (const f of FILES) vm.runInContext(fs.readFileSync(path.join(DIR, f), 'utf8'), ctx, {filename: f});
-  ctx.refreshPortfolioDecision = function () { calls.pd++; return o.pdOutcome ? o.pdOutcome(calls.pd) : 'ok'; };
-  ctx.refreshDecisionTop10 = function () { calls.t10++; if (o.t10Throws) throw new Error('synthetic cockpit failure'); };
-  return {ctx, props, runLog, calls, triggers, setNow(ms) { world.clock.now = ms; }};
+  function renderedStatus(action, count) {
+    const source = action === 'pd' ? String(grid[1] && grid[1][3]) : String(kv['TFB Feed Global_Markets']);
+    const run = (source.match(/(?:^|[\s|])run=(\d+)/) || [])[1];
+    return 'Last run ' + riyadh(world.clock.now).slice(0, 19) + ' | status: ok | ' +
+      (action === 't10' ? 'output: WITHHELD | ' : '') +
+      'source readiness VERIFIED (run ' + run + ') | req=synthetic-' + count;
+  }
+  ctx.refreshPortfolioDecision = function () {
+    calls.pd++;
+    const outcome = o.pdOutcome ? o.pdOutcome(calls.pd) : 'ok';
+    if (!o.keepPdStatus) boards.pd = o.pdStatus ? o.pdStatus(calls.pd) : renderedStatus('pd', calls.pd);
+    return outcome;
+  };
+  ctx.refreshDecisionTop10 = function () {
+    calls.t10++;
+    if (o.t10Throws) throw new Error('synthetic cockpit failure');
+    if (!o.keepT10Status) boards.t10 = o.t10Status ? o.t10Status(calls.t10) : renderedStatus('t10', calls.t10);
+  };
+  return {ctx, props, runLog, calls, triggers, boards, setNow(ms) { world.clock.now = ms; }};
 }
 
 const T0 = Date.parse('2026-10-16T00:58:00Z');          // 03:58 Riyadh, after the 10-16 final job
@@ -297,5 +327,111 @@ check('C17 v1.0.1: a post-audit render under an already EXECUTABLE feed counts a
   assert.deepEqual(rel('EXECUTABLE | run=1 | run=2 | issued=2026-10-16T04:10:00+03:00'), {run: '', issued: ''});
 });
 
-console.log('RESULT ' + passed + '/17 PASS');
-assert.equal(passed, 17);
+check('C18 v1.0.2: HTTP-ok Portfolio_Decision with WITHHELD source receipt remains retryable', () => {
+  const o = {now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN),
+    props: {TFB_DECISION_CHAIN: 'on'},
+    pdStatus: () => 'Last run ' + riyadh(T0).slice(0, 19) +
+      ' | status: ok | source readiness WITHHELD: consumed 1 holdings vs 2 published rows'};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + RUN);
+  let st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.pd, '');
+  assert.equal(st.attempts['pd:' + RUN], 1);
+  assert.match(w.runLog[0][5], /native source receipt/);
+  // Source repaired: a subsequent genuine render may complete the same cohort.
+  o.pdStatus = null;
+  w.setNow(T0 + 5 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
+  st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.pd, RUN);
+  assert.equal(st.attempts['pd:' + RUN], undefined);
+});
+
+check('C19 v1.0.2: Top_10 returning early never completes a cohort from an unchanged board', () => {
+  const old = 'Last run ' + riyadh(T0).slice(0, 19) +
+    ' | status: ok | source readiness VERIFIED (run ' + RUN + ')';
+  const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    t10Initial: old, keepT10Status: true,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.t10, '');
+  assert.equal(st.attempts['t10:' + RUN], 1);
+  assert.match(w.runLog[0][5], /native status was not updated/);
+});
+
+check('C20 v1.0.2: wrong, duplicate, observe-only and missing receipts do not complete a render', () => {
+  const prefix = 'Last run ' + riyadh(T0).slice(0, 19) + ' | status: ok | ';
+  for (const receipt of [
+    'source readiness VERIFIED (run ' + OLD + ')',
+    'source readiness VERIFIED (run ' + RUN + ') | source readiness VERIFIED (run ' + RUN + ')',
+    '[receipt-observe] would publish VERIFIED (run ' + RUN + ')',
+    'source readiness WITHHELD: publication changed',
+    'no source receipt',
+  ]) {
+    const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      t10Status: () => prefix + receipt,
+      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN, receipt);
+    assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
+  }
+});
+
+check('C21 v1.0.2: changed board needs a valid ok timestamp within this attempt', () => {
+  const receipt = ' | source readiness VERIFIED (run ' + RUN + ')';
+  for (const status of [
+    'Last run ' + riyadh(T0 - 1000).slice(0, 19) + ' | status: ok',
+    'Last run ' + riyadh(T0 + 1000).slice(0, 19) + ' | status: ok',
+    'Last run 2026-02-30 03:58:00 | status: ok',
+    'Last run ' + riyadh(T0).slice(0, 19) + ' | status: running',
+    'Last run ' + riyadh(T0).slice(0, 19) + ' | status: error',
+  ]) {
+    const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      t10Status: () => status + receipt,
+      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN, status);
+    assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
+  }
+});
+
+check('C22 v1.0.2: receipt read failure retains the bounded retry path and never marks release rendered', () => {
+  const kv = readyKv(RUN, RUN);
+  kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
+  const w = world({now: T0, status: readyStatus(RUN), kv, receiptReadThrows: true,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
+  for (let i = 0; i < 3; i++) assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 release re-render gave up after 3 attempts');
+  const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.t10rel, '');
+  assert.equal(st.claim, null);
+  assert.equal(st.attempts['t10rel:2026-10-16T04:10:00+03:00'], 3);
+});
+
+check('C23 v1.0.2: producer seconds precision accepts a fresh verified WITHHELD render', () => {
+  const w = world({now: T0 + 567, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.match(w.boards.t10, /output: WITHHELD/);
+  assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, RUN);
+});
+
+check('C24 v1.0.2: failed pre-read cannot establish a changed board even when the post-read works', () => {
+  const existing = 'Last run ' + riyadh(T0).slice(0, 19) +
+    ' | status: ok | source readiness VERIFIED (run ' + RUN + ')';
+  for (const noOp of [true, false]) {
+    const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      t10Initial: existing, keepT10Status: noOp, receiptReadFailureAt: [1],
+      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+    assert.equal(w.calls.receiptReads, 2);  // pre-read failed, post-read succeeded
+    assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
+    assert.match(w.runLog[0][5], /before the refresh was unavailable/);
+    // A subsequent attempt with a readable baseline may complete only a real render.
+    w.setNow(T0 + 5 * 60000);
+    assert.equal(w.ctx.tfbDecisionChainTick(), (noOp ? 'failed ' : 'refreshed ') + 't10 run ' + RUN);
+    assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, noOp ? '' : RUN);
+  }
+});
+
+console.log('RESULT ' + passed + '/24 PASS');
+assert.equal(passed, 24);

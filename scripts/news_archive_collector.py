@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.1.0)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.2.0)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -43,7 +43,7 @@
 # backtest wants the label AS OF the observation date, which only write time
 # can capture.
 # WHAT: after the idempotency filter and before the append, when
-# TFB_NEWS_ARCHIVE_SECTOR_JOIN=1 the collector reads Symbol+Sector (cols A+C)
+# TFB_NEWS_ARCHIVE_SECTOR_JOIN=1 the collector reads Symbol+Sector by header
 # from the four pool pages of the SAME workbook it is writing to and fills
 # each fresh row's Sector cell from that map. FAIL-OPEN at every step: page
 # read errors, an empty map, or an unknown symbol leave Sector blank exactly
@@ -69,7 +69,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -95,7 +95,8 @@ logger = logging.getLogger("NewsArchive")
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 # v1.1.0: the four pool pages whose Symbol+Sector columns feed the write-time
-# sector join (canonical layout: Symbol = col A, Sector = col C).
+# sector join. Resolve columns by their headers: canonical Sector is col G,
+# while col C is Asset Class and must never be archived as a sector.
 _SECTOR_JOIN_PAGES = ("Market_Leaders", "Global_Markets",
                       "Commodities_FX", "Mutual_Funds")
 
@@ -108,18 +109,24 @@ def _env_sector_join_enabled() -> bool:
 
 
 def _sector_map_from_values(values_by_page: Dict[str, List[List[Any]]]) -> Dict[str, str]:
-    """v1.1.0 PURE: {UPPER(symbol): sector} from per-page A2:C value grids.
+    """{UPPER(symbol): sector} from per-page header-bearing A1:H grids.
     First page wins on duplicates (Market_Leaders is authoritative for .SR).
     Blank symbols/sectors are skipped; never raises."""
     out: Dict[str, str] = {}
     for page in _SECTOR_JOIN_PAGES:
         try:
             grid = values_by_page.get(page) or []
-            for row in grid:
+            if not grid:
+                continue
+            headers = [str(value or "").strip().lower() for value in grid[0]]
+            if headers.count("symbol") != 1 or headers.count("sector") != 1:
+                continue
+            symbol_col, sector_col = headers.index("symbol"), headers.index("sector")
+            for row in grid[1:]:
                 if not row:
                     continue
-                sym = str(row[0] or "").strip().upper()
-                sec = str(row[2] or "").strip() if len(row) > 2 else ""
+                sym = str(row[symbol_col] or "").strip().upper() if len(row) > symbol_col else ""
+                sec = str(row[sector_col] or "").strip() if len(row) > sector_col else ""
                 if sym and sec and sym not in out:
                     out[sym] = sec
         except Exception:
@@ -336,7 +343,7 @@ class NewsArchiveStore:
             try:
                 ws = self.sheet.worksheet(page)
                 values_by_page[page] = self.backoff.run(
-                    lambda w=ws: w.get_values("A2:C")) or []
+                    lambda w=ws: w.get_values("A1:H")) or []
             except Exception as e:
                 logger.warning("sector join: page %s unreadable (%s)", page, e)
         return _sector_map_from_values(values_by_page)
@@ -422,6 +429,52 @@ def _row_from_result(r: Dict[str, Any], date_str: str) -> Optional[List[Any]]:
     ]
 
 
+def _collection_status(result: Dict[str, Any]) -> str:
+    return str((result.get("collection_evidence") or {}).get("status") or "UNKNOWN").upper()
+
+
+def _collection_report(universe: List[str], results: List[Dict[str, Any]],
+                       date_str: str) -> Dict[str, Any]:
+    """Bounded acquisition evidence, separate from the unchanged archive schema.
+
+    Preserve public article metadata only, never snippets, feed URLs or raw
+    exceptions. Missing acquisition evidence must remain UNKNOWN, not neutral.
+    """
+    by_symbol = {str(r.get("symbol") or "").strip().upper(): r for r in results}
+    observations = []
+    for symbol in universe:
+        result = by_symbol.get(symbol, {})
+        provenance = []
+        for article in (result.get("articles") or [])[:5]:
+            provenance.append({k: article.get(k) for k in (
+                "title", "url", "source_domain", "transport_domain",
+                "publisher_url", "published_utc", "crawled_utc") if article.get(k)})
+        observations.append({
+            "symbol": symbol, "status": _collection_status(result),
+            "articles_analyzed": result.get("articles_analyzed", 0),
+            "cached": bool(result.get("cached", False)),
+            "collection_evidence": result.get("collection_evidence") or {},
+            "article_provenance": provenance,
+        })
+    counts: Dict[str, int] = {}
+    for observation in observations:
+        status = observation["status"]
+        counts[status] = counts.get(status, 0) + 1
+    complete = all(o["status"] in {"OK", "EMPTY"} for o in observations)
+    return {"schema": "tfb.news-acquisition.v1", "collector_version": SCRIPT_VERSION,
+            "date_riyadh": date_str, "generated_utc": _utc_now().isoformat(),
+            "requested": len(universe), "returned": len(results),
+            "complete": complete, "status_counts": counts, "symbols": observations,
+            "interpretation": "News context only; collection success is not prediction accuracy."}
+
+
+def _write_collection_report(path: Optional[str], report: Dict[str, Any]) -> None:
+    if path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 # -----------------------------------------------------------------------------
 # Collect
 # -----------------------------------------------------------------------------
@@ -437,12 +490,15 @@ async def collect(args: argparse.Namespace) -> int:
 
     items = [{"symbol": s} for s in universe]
     try:
-        batch = await news.batch_news_intelligence(items, include_articles=False)
+        batch = await news.batch_news_intelligence(items, include_articles=True)
     except Exception as e:
         logger.error("batch_news_intelligence failed: %s", e)
         return 1
 
     results = list(getattr(batch, "items", None) or [])
+    report = _collection_report(universe, results, date_str)
+    _write_collection_report(getattr(args, "evidence_json", None), report)
+    incomplete = not report["complete"]
     meta = getattr(batch, "meta", {}) or {}
     print(
         "[news_archive] fetched %d/%d (status=%s, errors=%s)"
@@ -451,6 +507,10 @@ async def collect(args: argparse.Namespace) -> int:
 
     rows: List[List[Any]] = []
     for r in results:
+        if _collection_status(r) not in {"OK", "EMPTY"}:
+            # Do not lock in a failed fetch as a neutral daily sample. Its key
+            # stays unarchived, so a subsequent run can recover that symbol.
+            continue
         row = _row_from_result(r, date_str)
         if row:
             rows.append(row)
@@ -466,7 +526,7 @@ async def collect(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print("[news_archive] DRY RUN -- %d rows NOT written" % len(rows))
-        return 0
+        return 1 if incomplete else 0
 
     sheet_id = args.sheet_id or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("TRACK_SHEET_ID")
     if not sheet_id:
@@ -487,7 +547,7 @@ async def collect(args: argparse.Namespace) -> int:
 
     if not fresh:
         print("[news_archive] nothing new to write for %s" % date_str)
-        return 0
+        return 1 if incomplete else 0
 
     # v1.1.0 [SECTOR JOIN] -- env-gated, fail-open; see header WHY.
     if _env_sector_join_enabled():
@@ -510,7 +570,7 @@ async def collect(args: argparse.Namespace) -> int:
 
     ok = store.append(fresh)
     print("[news_archive] %s %d rows to %s" % ("wrote" if ok else "FAILED writing", len(fresh), store.sheet_name))
-    return 0 if ok else 1
+    return 0 if ok and not incomplete else 1
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -523,6 +583,8 @@ def create_parser() -> argparse.ArgumentParser:
                    help="Fetch + print sentiment but DO NOT write the sheet.")
     p.add_argument("--verbose", "-v", action="store_true", default=_env_bool("NEWS_ARCHIVE_VERBOSE", False),
                    help="Verbose logs.")
+    p.add_argument("--evidence-json", default=None,
+                   help="Write per-symbol acquisition status and bounded public article provenance JSON.")
     return p
 
 

@@ -1,8 +1,17 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.1 (2026-10-19)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.2 (2026-10-23)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.2 -- require native receipt readback before completing a cohort.
+ * A successful HTTP response / nonthrowing refresh may render WITHHELD,
+ * return early, or leave an older board in place. Only a changed status
+ * line, stamped during this attempt and carrying exactly one VERIFIED
+ * source receipt for the planned run, completes the chain step. A rendered
+ * Top_10 may still be WITHHELD pending release; execution gates are separate.
+ * Unproven renders retain the existing bounded retry path. Default off and
+ * observe behavior are unchanged; no receipt or release verdict is written.
  *
  * v1.0.1 (2026-10-19) -- RE-RENDER TOP_10 AFTER A RELEASE. The P0-1 release
  * (release_decision_feed.yml) promotes 'TFB Decision Feed' to EXECUTABLE
@@ -67,7 +76,7 @@
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.1';
+var TFB_DC_VERSION = '1.0.2';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -163,6 +172,36 @@ function tfbDcStateOf_(raw) {
   return st;
 }
 
+/** PURE: completion means this attempt rendered and consumed its planned
+ * source cohort, not merely that a refresh returned without throwing.
+ * Last run is a second-precision Riyadh wall clock, as in both producers.
+ * Execution eligibility (e.g. output: WITHHELD) is deliberately not tested:
+ * the release audit needs these receipts before it can release the feed. */
+function tfbDcReceiptCore_(before, after, run, startedMs, nowMs) {
+  function fail(reason) { return {ok: false, reason: reason}; }
+  if (typeof before !== 'string') {
+    return fail('native status before the refresh was unavailable');
+  }
+  if (typeof after !== 'string' || !after || after === before) {
+    return fail('native status was not updated');
+  }
+  if (!/^[1-9]\d*$/.test(String(run || ''))) return fail('planned run invalid');
+  var occurrences = after.match(/source\s+readiness/gi) || [];
+  var receipt = after.match(/(?:^|\|)\s*source readiness VERIFIED \(run ([1-9]\d*)\)(?=\s*(?:\||$))/);
+  if (occurrences.length !== 1 || !receipt || receipt[1] !== String(run)) {
+    return fail('native source receipt does not verify the planned run');
+  }
+  var status = after.match(/^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*status:\s*ok(?=\s*(?:\||$))/i);
+  var stamp = status && typeof pdSrcStampMs_ === 'function'
+      ? pdSrcStampMs_(status[1]) : null;
+  if (typeof startedMs !== 'number' || !isFinite(startedMs) ||
+      typeof nowMs !== 'number' || !isFinite(nowMs) || nowMs < startedMs ||
+      stamp === null || stamp < Math.floor(startedMs / 1000) * 1000 || stamp > nowMs) {
+    return fail('native render timestamp is outside this attempt');
+  }
+  return {ok: true, reason: ''};
+}
+
 /** PURE plan. s = {mode, nowMs, state, pd: {available, ready, cohort, reason},
  * t10: {available, gmRun, decisionRun}, inflight, cockpitRunning, quiet,
  * automationAllowed}. -> {action: 'none'|'pd'|'t10', run, reason}. */
@@ -243,6 +282,17 @@ function tfbDcStatusValue_(ss, key) {
     }
   } catch (e) {}
   return '';
+}
+
+/** The producer-owned B2 status line. Missing/unreadable is not evidence. */
+function tfbDcReadReceipt_(ss, action) {
+  try {
+    var name = action === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments';
+    var sh = ss.getSheetByName(name);
+    if (!sh) return null;
+    var value = sh.getRange(2, 2).getValue();
+    return typeof value === 'string' ? value : null;
+  } catch (e) { return null; }
 }
 
 /** Everything the plan needs, read once. Never throws. */
@@ -363,14 +413,20 @@ function tfbDecisionChainTick() {
   if (!p.key) return p.observed ? 'observed ' + p.plan.action + ' run ' + p.plan.run
                                 : p.plan.reason;
   var t0 = Date.now(), ok = false, outcome = '';
+  var previous = tfbDcReadReceipt_(ss, p.plan.action);
   try {
     if (p.plan.action === 'pd') {
       outcome = String(refreshPortfolioDecision() || '');
-      ok = !/^(NETWORK ERROR|HTTP )/.test(outcome);
     } else {
       refreshDecisionTop10();
       outcome = 'rendered';
-      ok = true;
+    }
+    if (p.plan.action !== 'pd' || outcome.toLowerCase() === 'ok') {
+      SpreadsheetApp.flush();
+      var verified = tfbDcReceiptCore_(previous,
+          tfbDcReadReceipt_(ss, p.plan.action), p.plan.run, t0, Date.now());
+      ok = verified.ok;
+      if (!ok) outcome += ' | ' + verified.reason;
     }
   } catch (eRun) {
     outcome = 'error: ' + String(eRun && eRun.message ? eRun.message : eRun).slice(0, 200);

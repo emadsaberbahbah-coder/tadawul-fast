@@ -2,8 +2,13 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.1
 ================================================================================
+
+WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
+Sweep expired entries during cache traffic under the existing async lock.
+Live-entry TTLs, values, scoring and publication gates are unchanged.
+Tests: tests/test_engine_cache_expiry.py.
 
 WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
 (TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
@@ -4282,7 +4287,7 @@ from core.financial_units import (
 #   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
 #   settle trajectory, status and published values are v5.156.0's; off is
 #   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
-__version__ = "5.157.0"
+__version__ = "5.157.1"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -17799,6 +17804,11 @@ class MultiLevelCache:
     `OrderedDict` so we can evict the oldest entries when the map exceeds
     `max_entries`. Previous versions silently grew without bound under
     sustained heavy load.
+
+    Expired entries are swept during normal traffic, at most once per TTL
+    (or 30 seconds for longer TTLs). Without the sweep, short-lived quote
+    and page payloads that were never requested again remained resident
+    until the entry-count limit was reached.
     """
 
     def __init__(self, ttl_seconds: int = 30, max_entries: int = 50_000) -> None:
@@ -17806,16 +17816,33 @@ class MultiLevelCache:
         self._max = max(1000, int(max_entries))
         self._data: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._sweep_interval = min(self._ttl, 30)
+        self._next_expiry_sweep = 0.0
+
+    def _prune_expired(self, now: float) -> None:
+        """Reclaim expired payloads under _lock without changing live TTLs.
+
+        Accesses move entries in LRU order, so timestamps are not ordered.
+        Scan the bounded map rather than stopping at the first live entry.
+        The sweep deadline amortizes this work across normal cache traffic.
+        """
+        if now < self._next_expiry_sweep:
+            return
+        cutoff = now - self._ttl
+        for key in [k for k, (ts, _) in self._data.items() if ts < cutoff]:
+            self._data.pop(key, None)
+        self._next_expiry_sweep = now + self._sweep_interval
 
     async def get(self, key: str) -> Any:
         if not key:
             return None
         async with self._lock:
+            now = time.time()
+            self._prune_expired(now)
             entry = self._data.get(key)
             if entry is None:
                 return None
             ts, value = entry
-            now = time.time()
             if now - ts > self._ttl:
                 self._data.pop(key, None)
                 return None
@@ -17826,7 +17853,9 @@ class MultiLevelCache:
         if not key:
             return
         async with self._lock:
-            self._data[key] = (time.time(), value)
+            now = time.time()
+            self._prune_expired(now)
+            self._data[key] = (now, value)
             self._data.move_to_end(key)
             while len(self._data) > self._max:
                 self._data.popitem(last=False)

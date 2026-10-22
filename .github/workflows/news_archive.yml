@@ -110,7 +110,7 @@ jobs:
           NEWS_ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
-          CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --verbose)
+          CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --evidence-json artifacts/news-acquisition.json --verbose)
           # Per-run universe override (workflow_dispatch only). Accepts space-
           # OR comma-separated symbols; normalized to the --universe flag, which
           # takes precedence over NEWS_ARCHIVE_UNIVERSE. Scheduled runs leave
@@ -122,3 +122,12 @@ jobs:
             echo "Universe override (${#UNI_TOKENS[@]} symbols): ${UNI_TOKENS[*]}"
           fi
           "${CMD[@]}"
+
+      - name: Preserve news acquisition evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: news-acquisition-${{ github.run_id }}
+          path: artifacts/news-acquisition.json
+          if-no-files-found: warn
+          retention-days: 30

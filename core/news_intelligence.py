@@ -2,9 +2,15 @@
 """
 core/news_intelligence.py
 ================================================================================
-Advanced News Intelligence Engine -- v5.2.1
+Advanced News Intelligence Engine -- v5.2.2
 ================================================================================
 RENDER-SAFE • IMPORT-SAFE • LAZY-ML • RSS/GOOGLE SAFE • CACHE-BACKED • ASYNC-SAFE
+
+v5.2.2 — acquisition evidence
+-----------------------------
+Distinguish successful empty RSS feeds from failed or unsupported responses.
+Expose safe source-status metadata without changing sentiment or boost rules.
+Failed and partial acquisition results are not cached as completed news reads.
 
 v5.2.1 — repairs to the existing RSS-to-brief contract
 ---------------------------------------------------
@@ -160,7 +166,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.1"
+__version__ = "5.2.2"
 NEWS_VERSION = __version__
 
 # =============================================================================
@@ -515,6 +521,7 @@ class NewsResult:
     cached: bool = False
     cache_key: Optional[str] = None
     version: str = NEWS_VERSION
+    collection_evidence: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -547,6 +554,7 @@ class NewsResult:
             cached=bool(data.get("cached", False)),
             cache_key=data.get("cache_key"),
             version=data.get("version", NEWS_VERSION),
+            collection_evidence=dict(data.get("collection_evidence") or {}),
         )
 
 
@@ -1487,11 +1495,20 @@ def _cache_key(symbol: str, company_name: str, include_articles: bool, max_artic
 
 async def _fetch_source_articles(symbol: str, company_name: str, source_url: str) -> List[NewsArticle]:
     """Fetch articles from a single source."""
+    # A transport failure must not become a successful, neutral news sample.
+    # The collection boundary records a safe failure code and preserves the
+    # tolerant public API. A valid feed with no matching items is still EMPTY.
+    xml_text = await _BACKOFF.execute_async(_fetch_text, source_url)
+    if not xml_text.strip():
+        raise ValueError("news_response_empty")
     try:
-        xml_text = await _BACKOFF.execute_async(_fetch_text, source_url)
-    except Exception as e:
-        logger.debug("News source fetch failed for %s: %s", source_url, e)
-        return []
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError("news_feed_invalid") from exc
+    # The parser below supports RSS 2.0 items. Do not certify an Atom/RDF
+    # document as EMPTY merely because its namespaced entries were ignored.
+    if root.tag != "rss" or root.find("channel") is None:
+        raise ValueError("news_feed_unsupported")
 
     source_hint = _extract_domain(source_url)
     articles = _parse_rss(xml_text, source_hint)
@@ -1507,10 +1524,12 @@ async def _fetch_source_articles(symbol: str, company_name: str, source_url: str
     return result
 
 
-async def _collect_articles(symbol: str, company_name: str, max_articles: int) -> Tuple[List[NewsArticle], List[str]]:
+async def _collect_articles(symbol: str, company_name: str, max_articles: int,
+                            evidence: Optional[Dict[str, Any]] = None) -> Tuple[List[NewsArticle], List[str]]:
     """Collect articles from all sources."""
     sources_used: List[str] = []
     articles: List[NewsArticle] = []
+    observations: List[Dict[str, Any]] = []
 
     urls: List[Tuple[str, str]] = []
 
@@ -1530,11 +1549,16 @@ async def _collect_articles(symbol: str, company_name: str, max_articles: int) -
         async with semaphore:
             try:
                 found = await _fetch_source_articles(symbol, company_name, url)
+                observations.append({"source": label, "status": "OK" if found else "EMPTY",
+                                     "articles_found": len(found)})
                 if found:
                     sources_used.append(label)
                     articles.extend(found)
             except Exception as e:
-                logger.debug("News collection failed for %s: %s", label, e)
+                code = str(e) if str(e) in {"news_response_empty", "news_feed_invalid", "news_feed_unsupported"} else "news_fetch_failed"
+                observations.append({"source": label, "status": "ERROR", "error_code": code,
+                                     "articles_found": 0})
+                logger.debug("News collection failed for %s (%s)", label, code)
 
     await asyncio.gather(*[_fetch_one(label, url) for label, url in urls], return_exceptions=True)
 
@@ -1544,6 +1568,16 @@ async def _collect_articles(symbol: str, company_name: str, max_articles: int) -
         key=lambda a: _parse_datetime(a.published_utc) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
+
+    if evidence is not None:
+        succeeded = sum(o["status"] != "ERROR" for o in observations)
+        failed = len(observations) - succeeded
+        status = ("UNAVAILABLE" if not observations else "ERROR" if not succeeded else
+                  "PARTIAL" if failed else "OK" if deduped else "EMPTY")
+        evidence.update({"status": status, "collected_utc": _utc_iso(),
+                         "attempted": len(observations), "succeeded": succeeded,
+                         "failed": failed,
+                         "sources": sorted(observations, key=lambda o: o["source"])})
 
     return deduped[:max_articles], list(dict.fromkeys(sources_used))
 
@@ -1675,7 +1709,9 @@ async def _compute_news_result(
                 pass
 
     # Collect and score articles
-    articles, sources_used = await _collect_articles(symbol, company_name, max_articles=max_articles)
+    collection_evidence: Dict[str, Any] = {}
+    articles, sources_used = await _collect_articles(symbol, company_name, max_articles=max_articles,
+                                                   evidence=collection_evidence)
     scored_articles, breakdown, trend = await _score_articles(symbol, company_name, articles)
 
     # Compute final metrics
@@ -1720,10 +1756,11 @@ async def _compute_news_result(
         processing_time_ms=(time.perf_counter() - started) * 1000.0,
         cached=False,
         cache_key=cache_key,
+        collection_evidence=collection_evidence,
     )
 
     # Cache result
-    if _CONFIG.enable_cache:
+    if _CONFIG.enable_cache and collection_evidence.get("status") in {"OK", "EMPTY"}:
         try:
             await _CACHE.set(cache_key, result.to_dict())
         except Exception:
@@ -1792,6 +1829,8 @@ async def get_news_intelligence(
             confidence=0.0,
             news_boost=0.0,
             processing_time_ms=(time.perf_counter() - started) * 1000.0,
+            collection_evidence={"status": "ERROR", "collected_utc": _utc_iso(),
+                                 "error_code": "news_analysis_failed"},
         )
         return fallback.to_dict()
 
@@ -1824,13 +1863,18 @@ async def batch_news_intelligence(
             try:
                 result = await get_news_intelligence(item, include_articles=include_articles)
                 valid_results.append(result)
+                status = (result.get("collection_evidence") or {}).get("status", "UNKNOWN")
+                if status in {"ERROR", "UNAVAILABLE", "PARTIAL", "UNKNOWN"}:
+                    errors.append({"symbol": symbol, "error": "news_collection_" + status.lower()})
             except Exception as e:
                 errors.append({"symbol": symbol, "error": str(e)})
 
     await asyncio.gather(*[_process_one(item) for item in items], return_exceptions=True)
 
+    usable_results = sum((r.get("collection_evidence") or {}).get("status")
+                         in {"OK", "EMPTY", "PARTIAL"} for r in valid_results)
     meta = {
-        "status": "success" if not errors else ("partial" if valid_results else "error"),
+        "status": "success" if not errors else ("partial" if usable_results else "error"),
         "version": NEWS_VERSION,
         "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
         "requested": len(items),
@@ -1884,6 +1928,7 @@ def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
     except Exception:
         days = 7
     symbol = str(d.get("symbol") or "").strip().upper()
+    collection_status = str((d.get("collection_evidence") or {}).get("status") or "UNKNOWN").upper()
     sentiment = float(d.get("sentiment") or 0.0)
     confidence = float(d.get("confidence") or 0.0)
     total = int(d.get("articles_analyzed") or 0)
@@ -1915,7 +1960,10 @@ def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
             latest_line = (title[:70] + (" — " + src_d if src_d else "") +
                            (" (" + ts.strftime("%m-%d") + ")"))
 
-    if total <= 0:
+    if collection_status in {"ERROR", "UNAVAILABLE"}:
+        label = "Unavailable"
+        line = "News collection unavailable — no inference about the absence of news."
+    elif total <= 0:
         line = ("No recent headlines found (%dd) — absence of news is not "
                 "a signal." % days)
     else:
@@ -1925,9 +1973,12 @@ def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
         if latest_line:
             line += "; latest: " + latest_line
         line += ". Context only — not a signal."
+    if collection_status == "PARTIAL":
+        line = "News collection incomplete. " + line
 
     return {
         "symbol": symbol,
+        "collection_status": collection_status,
         "window_days": days,
         "headline_count": total,
         "recent_count": recent,

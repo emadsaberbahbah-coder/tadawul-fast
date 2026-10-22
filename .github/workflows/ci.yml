@@ -2,6 +2,8 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# Revision 1 (2026-10-23): block regressions in expired-cache reclamation,
+# news acquisition evidence and native decision-chain receipt completion.
 # VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
 #
 # v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
@@ -678,6 +680,8 @@ jobs:
             tests/test_pf_minor_unit_ccy_guard.py \
             tests/test_scheduled_portfolio_refresh.py \
             tests/test_news_intelligence_contracts.py \
+            tests/test_news_acquisition_evidence.py \
+            tests/test_engine_cache_expiry.py \
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
@@ -822,6 +826,7 @@ jobs:
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js
           node tests/js/dt10_bulk_format.test.js
+          node tests/js/decision_chain.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
