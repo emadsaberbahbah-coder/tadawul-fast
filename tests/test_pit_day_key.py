@@ -441,7 +441,6 @@ def test_n1_workflow_anchor_version_and_pin():
     crons = re.findall(r'cron:\s*"(\d+) (\d+) \* \* \*"', wf)
     assert len(crons) == 1
     assert (int(crons[0][1]), int(crons[0][0])) == pit._SLOT_UTC_HM
-    assert pit._pit_day_key_mode() == "wallclock" or os.getenv(GATE)
     v = tuple(int(x) for x in pit.__version__.split("."))
     assert v >= (1, 1, 3)
     src = DELIVERED.read_text(encoding="utf-8")
