@@ -57,6 +57,11 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
   not stable; on a row the v1 result holds back or publishes unresolved the
   shadow tag follows that handling. Codes, order (ov op os rc va fcf r12 fs)
   and the 8-field limit unchanged. An unmarked row's shadow is its v1 result.
+- SHADOW FAULT: if only the v2 shadow run raises (the v1 result did not),
+  the published row is still v5.157.0's and the tag is
+  f7_settle:observe:sterr:p<n> (no disclosures) with one WARNING naming the
+  symbol and exception class - never stx, so stx counts only rows enforce
+  would hold back.
 - OBSERVE TAGS NOW SHOW v2 ENFORCE: pass 1 -> what enforce would publish,
   including stx tags for rows enforce would hold back (f7_settle:observe:stx
   can now follow an f7_settle_failed receipt). DQ-37 ov= / rc= deltas and tag
@@ -92,8 +97,9 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
 - RESIDUAL (as v5.157.0): a snapshot-served or re-settled row brings its
   prior confidence as input, so no marker is made and it settles on the v1
   trajectory, counting that confidence as data.
-- Functions added 5 (_f7_conf_scorer_derives, _f7_conf_marked,
-  _f7_conf_marker_strip, _f7_conf_v2_iterate, _f7_shadow_tag); changed:
+- Functions added 6 (_f7_conf_scorer_derives, _f7_conf_marked,
+  _f7_conf_marker_strip, _f7_conf_v2_iterate, _f7_shadow_raised,
+  _f7_shadow_tag); changed:
   _f7_settle_result (+ v2), _f7_settle_pass, _compute_scores_canonical_first,
   _compute_scores_fallback, _phase_ii_quality_forecast; constants added 6;
   core.scoring's _get / _safe_float imported (read-only); removed 0. Tests:
@@ -10426,16 +10432,32 @@ def _f7_settle_result(row: Dict[str, Any], v2: bool = True) -> F7SettlementResul
                                   last_diff=last_diff, reason="scorer_exception", error_type=type(exc).__name__)
 
 
-def _f7_shadow_tag(mode: str, shadow: Optional[F7SettlementResult], base_tagged: bool) -> str:
+def _f7_shadow_raised(pub: Optional[F7SettlementResult], shadow: Optional[F7SettlementResult]) -> bool:
+    """v5.158.0: the separate v2 shadow run raised (scorer_exception) while
+    the published v1 result did not - an engine fault of the shadow, never a
+    statement about what enforce would publish."""
+    return (pub is not None and shadow is not None and shadow is not pub
+            and shadow.status == "error" and shadow.reason == "scorer_exception"
+            and not (pub.status == "error" and pub.reason == "scorer_exception"))
+
+
+def _f7_shadow_tag(mode: str, shadow: Optional[F7SettlementResult], base_tagged: bool,
+                   pub: Optional[F7SettlementResult] = None) -> str:
     """v5.158.0 [F7-CONF-RECOMPUTE]: the observe tag, composed from the v2
     SHADOW result (what enforce would do with this row). Stable shadow:
     st<k>:p<n> plus its pass-1 -> final diff; non_converged / error shadow:
     stx:p<n> plus its pass-1 -> pass-2 diff. Emitted when v5.157.0 would tag
     the row (base_tagged: the published v1 result's pass 2 moved), when the
     shadow's final diff is non-empty, or when the shadow is not stable.
-    Codes, order and the 8-field limit are _f7_settle_tag's."""
+    Codes, order and the 8-field limit are _f7_settle_tag's. A shadow that
+    RAISED while the published v1 result did not (_f7_shadow_raised) is not a
+    v2 verdict: it gets f7_settle:<mode>:sterr:p<n> (no field disclosures), so
+    it never counts as an stx (enforce-would-hold-back) row; the caller logs
+    it at WARNING."""
     if shadow is None:
         return ""
+    if _f7_shadow_raised(pub, shadow):
+        return ":".join((_F7_SETTLE_TAG, mode, "sterr", "p%d" % int(shadow.passes_run)))
     if shadow.status == "stable":
         if not (base_tagged or shadow.final_diff):
             return ""
@@ -10483,6 +10505,13 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
     shadow: Optional[F7SettlementResult] = None
     if mode == "observe":
         shadow = _f7_settle_result(row, v2=True) if _f7_conf_marked(row) else result
+    if _f7_shadow_raised(result, shadow):
+        logger.warning(
+            "[engine_v2 v%s F-7 v2b] shadow (v2) settle raised for %s (page=%s): %s; "
+            "published values are the v1 result's, tagged sterr",
+            __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+            shadow.error_type or "?",
+        )
     _f7_conf_marker_strip(row)
     for _res in (result, shadow):
         if _res is not None and _res.row is not None and _res.row is not row:
@@ -10500,7 +10529,7 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
                 result.reason,
             )
             # v5.158.0: observe -> the shadow tag after the unresolved receipt.
-            _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False))
+            _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False, result))
             return row
         # observe: compose the receipt from the still-intact pass-1 row BEFORE
         # the holdback blanks it; the values below are exactly today's.
@@ -10515,7 +10544,7 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
             result.status, result.reason,
         )
         # v5.158.0: observe -> the shadow tag after the holdback.
-        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False))
+        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False, result))
         return row
     # v5.153.0 (WP-2b): a fresh STABLE settlement retires a stale
     # settle_unresolved receipt (L2 / KLG carried warnings) so the row is no
@@ -10527,7 +10556,7 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
         # v5.158.0: the pass-1 row is published as v5.157.0 observe did; the
         # tag (presence widened, text from the shadow) shows what v2 enforce
         # would publish.
-        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, bool(result.first_diff)))
+        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, bool(result.first_diff), result))
         return row
     if not result.first_diff:
         return row

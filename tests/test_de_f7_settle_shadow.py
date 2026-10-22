@@ -415,6 +415,39 @@ ALIAS_ROWS = (
 )
 
 
+def case_shadow_only_fault_is_sterr_not_stx(de):
+    """Only the v2 shadow run raises (its iterate preparation is broken): the
+    published row is exactly the v1 / v5.157.0 observe row, the tag is
+    f7_settle:observe:sterr:p<n> - never stx - and ONE WARNING names the
+    symbol and the exception class; held-back rows likewise. Enforce (the v2
+    result) holds the row back as an error."""
+    def broken(cand):
+        raise RuntimeError("shadow boom")
+
+    with _engine(de):
+        for fx in f7.FIXTURES:
+            for max_passes in (2, 4):
+                _, plain, _ = _settle(de, fx, "observe", max_passes=max_passes)
+                with patch.object(de, "_f7_conf_v2_iterate", broken), patch.object(de.logger, "warning") as warn:
+                    _, observed, row = _settle(de, fx, "observe", max_passes=max_passes)
+                assert observed is row and _untagged(observed) == _untagged(plain), (fx["row"]["symbol"], max_passes)
+                assert f7._tags(observed) == ["f7_settle:observe:sterr:p1"], f7._tags(observed)
+                assert warn.call_count == 1, warn.call_args_list
+                text = str(warn.call_args)
+                assert fx["row"]["symbol"] in text and "RuntimeError" in text and "shadow" in text
+                with patch.object(de, "_f7_conf_v2_iterate", broken):
+                    _, enforced, _ = _settle(de, fx, "enforce", max_passes=max_passes)
+                assert de._f7_settle_failed(enforced)
+        # the same fault in BOTH runs is a real error: stx as before, no WARNING
+        _set("observe")
+        row = f7._prep(_fx("BNY.US"))
+        with patch.object(de, "_compute_scores_canonical_first", _boom), \
+                patch.object(de, "_apply_phase_dd_enhancements", lambda r: r), \
+                patch.object(de.logger, "warning") as warn:
+            out = de._f7_settle_pass(row, row["symbol"], GM)
+        assert f7._tags(out) == ["f7_settle:observe:stx:p1"] and warn.call_count == 0
+
+
 # Sparse priced rows: core.scoring derives no confidence (no data-quality
 # label, completeness < 0.40, no provider list), Phase-II then writes a
 # synthetic one (Codex review on #819).
@@ -507,6 +540,7 @@ GATE_CASES = (
     ("marking follows the scorer's alias precedence", case_marking_follows_the_scorers_alias_precedence),
     ("sparse rows keep Phase-II confidence out of completeness",
      case_sparse_rows_keep_phase_ii_confidence_out_of_completeness),
+    ("a shadow-only fault is sterr, not stx", case_shadow_only_fault_is_sterr_not_stx),
 )
 
 
@@ -620,6 +654,7 @@ test_markers_made_only_while_armed_and_never_published = _wrap(case_markers_made
 test_marking_follows_the_scorers_alias_precedence = _wrap(case_marking_follows_the_scorers_alias_precedence)
 test_sparse_rows_keep_phase_ii_confidence_out_of_completeness = _wrap(
     case_sparse_rows_keep_phase_ii_confidence_out_of_completeness)
+test_shadow_only_fault_is_sterr_not_stx = _wrap(case_shadow_only_fault_is_sterr_not_stx)
 
 
 @_isolated
@@ -733,7 +768,8 @@ TESTS = [test_c1_cold_twin_settles_to_warm_under_enforce, test_c1_observe_shows_
          test_enforce_is_the_v2_trajectory, test_rows_enforce_would_hold_back_carry_an_stx_shadow_tag,
          test_markers_made_only_while_armed_and_never_published, test_marking_follows_the_scorers_alias_precedence,
          test_marking_predicate_is_the_scorers_own_decision,
-         test_sparse_rows_keep_phase_ii_confidence_out_of_completeness, test_off_is_byte_identical_and_unmarked,
+         test_sparse_rows_keep_phase_ii_confidence_out_of_completeness, test_shadow_only_fault_is_sterr_not_stx,
+         test_off_is_byte_identical_and_unmarked,
          test_identity_with_5157, test_scoring_module_is_5157s, test_golden_negative_gate_cases_fail_on_5157,
          test_evidence_is_deterministic, test_wiring_and_version]
 
