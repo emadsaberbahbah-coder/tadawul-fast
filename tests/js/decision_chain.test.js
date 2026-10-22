@@ -22,6 +22,23 @@ let passed = 0;
 function check(label, fn) { fn(); passed++; console.log('PASS ' + label); }
 
 const riyadh = (ms) => new Date(ms + 3 * 3600000).toISOString().slice(0, 19).replace('T', ' ') + '+03:00';
+// GAS formatDate's two patterns used by the production receipt parser.
+// Intl supplies real IANA/DST offsets; no test assumes Riyadh for B2 stamps.
+function gasFormatDate(date, zone, pattern) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).map(p => [p.type, p.value]));
+  if (pattern === 'yyyy-MM-dd HH:mm:ss') {
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+  }
+  assert.equal(pattern, 'Z');
+  const localAsUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day,
+    +parts.hour, +parts.minute, +parts.second);
+  const minutes = Math.round((localAsUtc - date.getTime()) / 60000);
+  return (minutes < 0 ? '-' : '+') + String(Math.floor(Math.abs(minutes) / 60)).padStart(2, '0') +
+    String(Math.abs(minutes) % 60).padStart(2, '0');
+}
 const STATUS_HEADER = ['Page', 'Last Updated', 'Status', 'Message', 'Endpoint',
   'HTTP Code', 'Rows', 'Columns', 'Duration ms', 'Warnings'];
 
@@ -93,15 +110,16 @@ function world(o) {
                 deleteTrigger(t) { triggers.splice(triggers.indexOf(t), 1); },
                 newTrigger(h) { return {timeBased() { return {everyMinutes(n) { return {create() {
                   const t = {getHandlerFunction() { return h; }, every: n}; triggers.push(t); return t; }}; }}; }}; }},
-    Utilities: {getUuid() { return 'uuid-synthetic'; }},
-    Session: {getScriptTimeZone() { return 'Asia/Riyadh'; }},
+    Utilities: {getUuid() { return 'uuid-synthetic'; }, formatDate: gasFormatDate},
+    Session: {getScriptTimeZone() { return o.scriptTimeZone || 'Asia/Riyadh'; }},
   };
   vm.createContext(ctx);
   for (const f of FILES) vm.runInContext(fs.readFileSync(path.join(DIR, f), 'utf8'), ctx, {filename: f});
   function renderedStatus(action, count) {
     const source = action === 'pd' ? String(grid[1] && grid[1][3]) : String(kv['TFB Feed Global_Markets']);
     const run = (source.match(/(?:^|[\s|])run=(\d+)/) || [])[1];
-    return 'Last run ' + riyadh(world.clock.now).slice(0, 19) + ' | status: ok | ' +
+    return 'Last run ' + gasFormatDate(new Date(world.clock.now),
+      o.scriptTimeZone || 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss') + ' | status: ok | ' +
       (action === 't10' ? 'output: WITHHELD | ' : '') +
       'source readiness VERIFIED (run ' + run + ') | req=synthetic-' + count;
   }
@@ -433,5 +451,59 @@ check('C24 v1.0.2: failed pre-read cannot establish a changed board even when th
   }
 });
 
-console.log('RESULT ' + passed + '/24 PASS');
-assert.equal(passed, 24);
+check('C25 v1.0.2: native UTC and non-Riyadh script clocks verify the actual render', () => {
+  for (const [zone, at] of [
+    ['UTC', T0], ['Asia/Kathmandu', T0],
+    ['America/New_York', Date.parse('2026-01-15T12:00:00Z')],
+    ['America/New_York', Date.parse('2026-07-15T12:00:00Z')],
+    ['Europe/Berlin', Date.parse('2026-07-15T12:00:00Z')],
+  ]) {
+    const w = world({now: at, scriptTimeZone: zone, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN, zone);
+    assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, RUN);
+  }
+});
+
+check('C26 v1.0.2: both occurrences of a repeated DST hour use the attempt offset', () => {
+  const texts = [];
+  for (const at of [Date.parse('2026-11-01T05:30:00Z'), Date.parse('2026-11-01T06:30:00Z')]) {
+    const w = world({now: at, scriptTimeZone: 'America/New_York',
+      status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+    texts.push(w.boards.t10);
+  }
+  assert.equal(texts[0], texts[1]);  // same native wall clock, distinct correct instants
+});
+
+check('C27 v1.0.2: a render crossing the spring DST transition uses its end offset', () => {
+  const start = Date.parse('2026-03-08T06:59:59Z');
+  const end = Date.parse('2026-03-08T07:00:03Z');
+  let w;
+  w = world({now: start, scriptTimeZone: 'America/New_York',
+    status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    t10Status: () => {
+      w.setNow(end);
+      return 'Last run ' + gasFormatDate(new Date(end), 'America/New_York', 'yyyy-MM-dd HH:mm:ss') +
+        ' | status: ok | source readiness VERIFIED (run ' + RUN + ')';
+    },
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.match(w.boards.t10, /03:00:03/);
+});
+
+check('C28 v1.0.2: invalid timezone and non-roundtripping native stamps fail closed', () => {
+  const w = world({now: T0});
+  const text = gasFormatDate(new Date(T0), 'UTC', 'yyyy-MM-dd HH:mm:ss');
+  w.ctx.Session.getScriptTimeZone = () => 'not/an/IANA-zone';
+  assert.equal(w.ctx.tfbDcScriptStampMs_(text, T0, T0), null);
+  w.ctx.Session.getScriptTimeZone = () => 'UTC';
+  assert.equal(w.ctx.tfbDcScriptStampMs_('2026-02-30 00:00:00', T0, T0), null);
+  assert.equal(w.ctx.tfbDcScriptStampMs_(text, T0 + 1000, T0), null);
+  w.ctx.Utilities.formatDate = () => '+0100';
+  assert.equal(w.ctx.tfbDcScriptStampMs_(text, T0, T0), null);
+});
+
+console.log('RESULT ' + passed + '/28 PASS');
+assert.equal(passed, 28);

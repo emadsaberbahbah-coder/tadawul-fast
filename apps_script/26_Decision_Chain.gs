@@ -174,10 +174,11 @@ function tfbDcStateOf_(raw) {
 
 /** PURE: completion means this attempt rendered and consumed its planned
  * source cohort, not merely that a refresh returned without throwing.
- * Last run is a second-precision Riyadh wall clock, as in both producers.
+ * Last run is a second-precision script-timezone wall clock in both producers.
+ * Inject its parser so this decision stays independent of the GAS services.
  * Execution eligibility (e.g. output: WITHHELD) is deliberately not tested:
  * the release audit needs these receipts before it can release the feed. */
-function tfbDcReceiptCore_(before, after, run, startedMs, nowMs) {
+function tfbDcReceiptCore_(before, after, run, startedMs, nowMs, parseStamp) {
   function fail(reason) { return {ok: false, reason: reason}; }
   if (typeof before !== 'string') {
     return fail('native status before the refresh was unavailable');
@@ -192,11 +193,12 @@ function tfbDcReceiptCore_(before, after, run, startedMs, nowMs) {
     return fail('native source receipt does not verify the planned run');
   }
   var status = after.match(/^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*status:\s*ok(?=\s*(?:\||$))/i);
-  var stamp = status && typeof pdSrcStampMs_ === 'function'
-      ? pdSrcStampMs_(status[1]) : null;
+  var stamp = status && typeof parseStamp === 'function'
+      ? parseStamp(status[1], startedMs, nowMs) : null;
   if (typeof startedMs !== 'number' || !isFinite(startedMs) ||
       typeof nowMs !== 'number' || !isFinite(nowMs) || nowMs < startedMs ||
-      stamp === null || stamp < Math.floor(startedMs / 1000) * 1000 || stamp > nowMs) {
+      typeof stamp !== 'number' || !isFinite(stamp) ||
+      stamp < Math.floor(startedMs / 1000) * 1000 || stamp > nowMs) {
     return fail('native render timestamp is outside this attempt');
   }
   return {ok: true, reason: ''};
@@ -293,6 +295,31 @@ function tfbDcReadReceipt_(ss, action) {
     var value = sh.getRange(2, 2).getValue();
     return typeof value === 'string' ? value : null;
   } catch (e) { return null; }
+}
+
+/** Both native producers format Last run with Session.getScriptTimeZone().
+ * Resolve that wall clock using the actual offset(s) during this attempt,
+ * then round-trip it in the same zone. This also disambiguates a DST fold:
+ * parsing a bare repeated hour could otherwise choose the other occurrence.
+ * A missing/invalid timezone or utility never falls back to another clock. */
+function tfbDcScriptStampMs_(text, startedMs, nowMs) {
+  if (typeof startedMs !== 'number' || !isFinite(startedMs) ||
+      typeof nowMs !== 'number' || !isFinite(nowMs) || nowMs < startedMs) return null;
+  try {
+    var zone = Session.getScriptTimeZone();
+    if (typeof zone !== 'string' || !zone || typeof pdSrcStampMs_ !== 'function') return null;
+    var clocks = [startedMs, nowMs];
+    for (var i = 0; i < clocks.length; i++) {
+      var offset = Utilities.formatDate(new Date(clocks[i]), zone, 'Z');
+      if (!/^[+-]\d{4}$/.test(offset)) continue;
+      var stamp = pdSrcStampMs_(text + offset);
+      if (stamp !== null && stamp >= Math.floor(startedMs / 1000) * 1000 && stamp <= nowMs &&
+          Utilities.formatDate(new Date(stamp), zone, 'yyyy-MM-dd HH:mm:ss') === text) {
+        return stamp;
+      }
+    }
+  } catch (e) {}
+  return null;
 }
 
 /** Everything the plan needs, read once. Never throws. */
@@ -424,7 +451,7 @@ function tfbDecisionChainTick() {
     if (p.plan.action !== 'pd' || outcome.toLowerCase() === 'ok') {
       SpreadsheetApp.flush();
       var verified = tfbDcReceiptCore_(previous,
-          tfbDcReadReceipt_(ss, p.plan.action), p.plan.run, t0, Date.now());
+          tfbDcReadReceipt_(ss, p.plan.action), p.plan.run, t0, Date.now(), tfbDcScriptStampMs_);
       ok = verified.ok;
       if (!ok) outcome += ' | ' + verified.reason;
     }
