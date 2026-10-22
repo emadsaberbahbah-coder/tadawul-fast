@@ -16,7 +16,7 @@ from scripts import verify_core_repair_readback as probe
 COMMIT = "a" * 40
 WORKFLOW_COMMIT = COMMIT
 OTHER_COMMIT = "f" * 40
-ENGINE = "5.157.0"
+ENGINE = "5.157.1"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"
