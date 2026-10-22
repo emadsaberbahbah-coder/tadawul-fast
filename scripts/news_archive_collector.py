@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.2.0)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.0)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
-#   article_velocity / emerging_topics in REAL TIME and then throws it away. You
+#   article_velocity / emerging_topics on request. You
 #   cannot backtest "negative sector news precedes sector underperformance" or
 #   "an emerging theme precedes rotation" without a HISTORICAL series of those
-#   signals. None exists, because nothing is persisted.
+#   signals. This collector preserves forward observations for that testing.
 #
 #   This collector is the forward-collection CLOCK that fixes that -- exactly the
-#   same idea as Performance_Log. It runs daily, snapshots the news signal for a
-#   stable universe, and APPENDS one row per symbol per day to a new
-#   `News_Archive` tab. After it has accumulated, (b)/(c) become registered
-#   hypotheses that run through the SAME run_backtest gate already deployed in
-#   track_performance.py -- and only influence a recommendation if they pass.
+#   same idea as Performance_Log. It retains a stable baseline and can add
+#   bounded, source-validated portfolio/research identities plus rotating
+#   eligible/market samples. It APPENDS at most one row per symbol per Riyadh
+#   day to `News_Archive`; repeat collections retain fresh evidence artifacts
+#   without replacing that day's earlier row. Archived context supports later
+#   hypothesis tests; collection alone does not promote a recommendation.
 #
 # WHAT IT IS NOT:
 #   - It does NOT modify news_intelligence (that is request-path; archiving
@@ -28,10 +29,26 @@
 #   - Headers at row 5, data from row 6 (matches Performance_Log convention).
 #   - Idempotent per day: re-running on the same date skips symbols already
 #     archived for that Riyadh date (no duplicate rows).
-#   - Stable universe (env NEWS_ARCHIVE_UNIVERSE) so each symbol has a
-#     continuous series -- better for backtesting than a rotating Top_10.
-#   - news_intelligence uses Google-News RSS: NO provider API key required;
+#   - Explicit CLI universe is absolute. With adaptive mode off, the env/default
+#     universe is unchanged. Adaptive mode retains that stable baseline, gives
+#     source-validated portfolio/research identities priority, and rotates a
+#     bounded eligible sample with a broader-market sample when room remains.
+#   - At most 60 symbol analyses per batch, not 60 provider HTTP requests:
+#     configured sources/retries can add requests. The news batch has a
+#     600-second timeout; the workflow has a separate 20-minute outer limit.
+#   - Scheduled collection slots are 17:00/23:00 Riyadh. They do not change
+#     the one-row-per-symbol-per-day archive grain or promise full-market news.
+#   - Complete OK/EMPTY acquisitions alone enter the archive. PARTIAL, ERROR,
+#     UNAVAILABLE and UNKNOWN remain explicit and retryable in evidence.
+#   - Source publication recency (72 hours) validates identity discovery metadata;
+#     it is not quote freshness, article recency or investment eligibility.
+#   - news_intelligence uses Google-News RSS and configured feeds: no provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
+# =============================================================================
+# v1.3.0 (2026-10-23) -- BOUNDED ADAPTIVE NEWS SELECTION
+#   Add exact-symbol/company-name discovery, portfolio/research priority,
+#   eligible and broader rotation, explicit acquisition/selection evidence,
+#   and read-only dry-run discovery. No scoring weights or gates are changed.
 # =============================================================================
 # v1.1.0 (2026-08-11) -- WRITE-TIME SECTOR JOIN (ENV-GATED, DEFAULT OFF)
 # -----------------------------------------------------------------------------
@@ -60,16 +77,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -274,9 +293,10 @@ class NewsArchiveStore:
         "Engine Version",
     ]
 
-    def __init__(self, spreadsheet_id: str, sheet_name: str = ""):
+    def __init__(self, spreadsheet_id: str, sheet_name: str = "", *, read_only: bool = False):
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name or self.SHEET_DEFAULT
+        self.read_only = read_only
         self.backoff = _Backoff()
         self.gc = None
         self.sheet = None
@@ -312,6 +332,8 @@ class NewsArchiveStore:
             creds = self._load_creds()
             self.gc = gspread.authorize(creds) if creds else gspread.service_account()
             self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            if self.read_only:
+                return
             try:
                 self.ws = self.sheet.worksheet(self.sheet_name)
             except Exception:
@@ -348,6 +370,138 @@ class NewsArchiveStore:
                 logger.warning("sector join: page %s unreadable (%s)", page, e)
         return _sector_map_from_values(values_by_page)
 
+    def load_news_source_context(self) -> Dict[str, Any]:
+        """Read bounded identity columns only; no quantities, cash or orders.
+
+        Publication metadata and read timestamps are separate evidence. These
+        are source-validated names, not an independent market identity audit.
+        A failed source read is retained as incomplete discovery.
+        """
+        pages = (*_SECTOR_JOIN_PAGES, "My_Portfolio", "Top_10_Investments", "Investable Symbol")
+        observed: Dict[str, Any] = {}
+        identities: Dict[str, str] = {}
+        ambiguous: set = set()
+        pools: List[str] = []
+        portfolio: List[str] = []
+        candidates: List[str] = []
+        eligible: List[str] = []
+        complete = True
+        invalid_identity_rows = 0
+
+        def publication() -> Dict[str, Any]:
+            if self.sheet is None:
+                raise RuntimeError("source_unavailable")
+            grid = self.backoff.run(lambda: self.sheet.worksheet("_Status").get_values(
+                "A1:D20", value_render_option="UNFORMATTED_VALUE"))
+            if not grid or [str(v).strip().lower() for v in grid[0][:3]] != ["page", "last updated", "status"]:
+                raise RuntimeError("status_header_unknown")
+            result = {}
+            for row in grid[1:]:
+                if row and str(row[0]) in pages:
+                    page = str(row[0])
+                    if page in result:
+                        raise RuntimeError("status_page_ambiguous")
+                    stamp = _source_publication_time(row[1] if len(row) > 1 else None)
+                    status = str(row[2] if len(row) > 2 else "").strip().upper()
+                    result[page] = {"published_utc": stamp, "status": status,
+                                    "run": _source_run(row[3] if len(row) > 3 else "",
+                                                       research=page == "Top_10_Investments")}
+            return result
+
+        try:
+            before = publication()
+        except Exception:
+            before = {}
+            complete = False
+        for page in pages:
+            started = _utc_now().isoformat()
+            entry: Dict[str, Any] = {"page": page, "read_started_utc": started}
+            try:
+                if self.sheet is None:
+                    raise RuntimeError("source_unavailable")
+                ws = self.sheet.worksheet(page)
+                limit = 120 if page == "Top_10_Investments" else 10001
+                row_limit = min(max(1, int(ws.row_count)), limit)
+                if page == "Top_10_Investments":
+                    # The decision cockpit keeps monetary KPIs above row 18.
+                    # Discover the Rank header below that control panel, then
+                    # read only its bounded Rank/Symbol/Name block.
+                    discovery_range = f"A18:A{min(80, int(ws.row_count))}"
+                    labels = self.backoff.run(lambda: ws.get_values(discovery_range)) or []
+                    header_offset = next((i for i, row in enumerate(labels)
+                                          if row and str(row[0]).strip().lower() == "rank"), None)
+                    if header_offset is None:
+                        raise RuntimeError("research_identity_header_unknown")
+                    header_row = 18 + header_offset
+                    source_range = f"A{header_row}:C{min(header_row + 22, int(ws.row_count))}"
+                    entry["header_discovery_range"] = discovery_range
+                else:
+                    source_range = f"A1:B{row_limit}"
+                grid = self.backoff.run(lambda w=ws, r=source_range: w.get_values(r)) or []
+                diagnostics: Dict[str, Any] = {}
+                pairs, header_ok, block_complete = _identity_pairs(
+                    grid, research=page == "Top_10_Investments", diagnostics=diagnostics)
+                source_ok = header_ok and block_complete
+                if page != "Top_10_Investments" and int(ws.row_count) > limit:
+                    source_ok = False
+                entry.update({"range": source_range, "header_verified": header_ok,
+                              "status": "OK" if source_ok else "INCOMPLETE",
+                              "named_rows": len(pairs), **diagnostics})
+                invalid_identity_rows += diagnostics.get("invalid_identity_rows", 0)
+                complete = complete and source_ok
+                conflicts = []
+                for symbol, name in pairs:
+                    previous = identities.get(symbol)
+                    if previous and " ".join(previous.casefold().split()) != " ".join(name.casefold().split()):
+                        ambiguous.add(symbol)
+                        conflicts.append(symbol)
+                    else:
+                        identities[symbol] = name
+                    if page in _SECTOR_JOIN_PAGES:
+                        pools.append(symbol)
+                    elif page == "My_Portfolio":
+                        portfolio.append(symbol)
+                    elif page == "Investable Symbol":
+                        eligible.append(symbol)
+                    else:
+                        candidates.append(symbol)
+                entry["conflicting_identity_rows"] = len(conflicts)
+                if page != "My_Portfolio":
+                    entry["conflicting_identity_symbols"] = sorted(set(conflicts))[:20]
+                else:
+                    entry.pop("unknown_identity_symbols", None)
+            except Exception:
+                entry.update({"status": "UNAVAILABLE", "error_code": "identity_source_read_failed"})
+                complete = False
+            entry["read_finished_utc"] = _utc_now().isoformat()
+            observed[page] = entry
+        try:
+            after = publication()
+        except Exception:
+            after = {}
+            complete = False
+        for page in pages:
+            publication_page = "Global_Markets" if page == "Investable Symbol" else page
+            meta = after.get(publication_page) or {}
+            stable = bool(before.get(publication_page)) and before.get(publication_page) == meta
+            stamp = meta.get("published_utc")
+            fresh = bool(stamp) and 0 <= (_utc_now() - datetime.fromisoformat(stamp)).total_seconds() <= 72 * 3600
+            usable = meta.get("status") in {"OK", "SUCCESS"}
+            observed[page].update({"publication": meta, "publication_stable": stable,
+                                   "publication_recent": fresh})
+            if page == "Investable Symbol":
+                observed[page]["publication_source"] = "Global_Markets (derived identity list)"
+            complete = complete and stable and fresh and usable and bool(meta.get("run"))
+        for symbol in ambiguous:
+            identities.pop(symbol, None)
+        identity_complete = invalid_identity_rows == 0 and not ambiguous
+        return {"identities": identities, "ambiguous_symbols": sorted(ambiguous),
+                "pool": _unique_symbols(pools), "portfolio_membership": _unique_symbols(portfolio),
+                "research": _unique_symbols(candidates), "eligible": _unique_symbols(eligible),
+                "source_read_complete": bool(complete), "identity_coverage_complete": identity_complete,
+                "complete": bool(complete and identity_complete),
+                "sources": list(observed.values())}
+
     def is_available(self) -> bool:
         return self.ws is not None
 
@@ -379,6 +533,154 @@ class NewsArchiveStore:
 # -----------------------------------------------------------------------------
 # Universe
 # -----------------------------------------------------------------------------
+def _unique_symbols(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    for value in values:
+        for token in re.split(r"[\s,;]+", str(value or "").strip().upper()):
+            if token and token not in out:
+                out.append(token)
+    return out
+
+
+def _source_publication_time(value: Any) -> Optional[str]:
+    """Normalize source publication metadata without confusing it with read time."""
+    try:
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d{5}(?:\.\d+)?", text):
+            stamp = datetime(1899, 12, 30, tzinfo=_RIYADH_TZ) + timedelta(days=float(text))
+        else:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=_RIYADH_TZ)
+        return stamp.astimezone(timezone.utc).isoformat()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _source_run(message: Any, *, research: bool = False) -> Optional[str]:
+    """Accept one explicit source-run receipt, not 'Last run YYYY-MM-DD'."""
+    text = str(message or "")
+    tokens = (re.findall(r"\bsource readiness VERIFIED\s*\(\s*run\s+([^)]+)\)", text)
+              if research else re.findall(r"\brun=([^\s,;|)]+)", text))
+    if len(tokens) != 1 or not re.fullmatch(r"[1-9]\d*", tokens[0].strip()):
+        return None
+    return tokens[0].strip()
+
+
+def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
+                    diagnostics: Optional[Dict[str, Any]] = None):
+    """Read canonical identity columns or the first research-selected block.
+
+    A portfolio row proves membership only, not a positive holding. Research
+    membership includes grace rows and does not assert executable eligibility.
+    """
+    start = 0
+    if research:
+        start = next((i for i, row in enumerate(grid)
+                      if [str(v).strip().lower() for v in row[:3]] == ["rank", "symbol", "name"]), -1)
+        if start < 0:
+            return [], False, False
+        symbol_col, name_col = 1, 2
+    else:
+        if not grid or [str(v).strip().lower() for v in grid[0][:2]] != ["symbol", "name"]:
+            return [], False, False
+        symbol_col, name_col = 0, 1
+    pairs = []
+    ended = not research
+    invalid = 0
+    unknown = []
+    for row in grid[start + 1:]:
+        symbol = str(row[symbol_col] or "").strip().upper() if len(row) > symbol_col else ""
+        name = str(row[name_col] or "").strip() if len(row) > name_col else ""
+        if research and ((not symbol and not name) or symbol == "SYMBOL"):
+            ended = True
+            break
+        if not symbol and not name:
+            continue
+        valid = (symbol not in {"SYMBOL", "TICKER", "NAME", "RANK"}
+                 and bool(re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=_-]{0,40}", symbol)))
+        if (valid and name and len(name) <= 300 and any(char.isalpha() for char in name)
+                and not re.search(r"[\x00-\x1f]", name)
+                and name.casefold() not in {symbol.casefold(), "unknown", "n/a", "none", "—"}):
+            pairs.append((symbol, name))
+        else:
+            invalid += 1
+            if valid:
+                unknown.append(symbol)
+    if diagnostics is not None:
+        diagnostics["invalid_identity_rows"] = invalid
+        diagnostics["unknown_identity_symbols"] = _unique_symbols(unknown)[:20]
+    return pairs, True, ended
+
+
+def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, Any]],
+                          date_str: str):
+    """Bound provider work while preserving exact-symbol identities and overrides.
+
+    CLI is absolute. With adaptive mode off, env remains the historical
+    override. In explicitly enabled adaptive mode, env is the stable baseline
+    augmented by current source identities and a repeatable daily pool slice.
+    """
+    cli = _unique_symbols(args.universe or [])
+    adaptive = bool(getattr(args, "adaptive", False)) and not cli
+    budget = max(1, min(60, int(getattr(args, "max_symbols", 60))))
+    baseline = _unique_symbols(resolve_universe(None))
+    known = (context or {}).get("identities") or {}
+    pool = sorted(_unique_symbols((context or {}).get("pool") or []))
+    eligible = sorted(_unique_symbols((context or {}).get("eligible") or []))
+    slot = 0 if _utc_now().astimezone(_RIYADH_TZ).hour < 23 else 1
+    slot_ordinal = datetime.fromisoformat(date_str).date().toordinal() * 2 + slot
+    total_requested = 0
+    rotation_count = 0
+    eligible_rotation_count = 0
+    broad_rotation_count = 0
+    if cli:
+        mode, proposed = "cli", cli
+    elif adaptive:
+        mode = "adaptive"
+        priority = _unique_symbols((context or {}).get("portfolio_membership", []) +
+                                   (context or {}).get("research", []) + baseline)
+        eligible_remaining = [symbol for symbol in eligible if symbol not in priority and symbol in known]
+        room = max(0, budget - len(priority))
+        start = slot_ordinal * max(1, room) % max(1, len(eligible_remaining))
+        rotation = (eligible_remaining[start:] + eligible_remaining[:start])[:room]
+        eligible_rotation_count = len(rotation)
+        spare = room - len(rotation)
+        remaining = [symbol for symbol in pool if symbol not in priority and symbol not in rotation and symbol in known]
+        broad_start = slot_ordinal * max(1, spare) % max(1, len(remaining))
+        broad = (remaining[broad_start:] + remaining[:broad_start])[:spare]
+        rotation += broad
+        broad_rotation_count = len(broad)
+        rotation_count = len(rotation)
+        proposed = priority + rotation
+    else:
+        mode, proposed = ("env" if _env_csv("NEWS_ARCHIVE_UNIVERSE") else "static"), baseline
+    total_requested = len(proposed)
+    universe = proposed[:budget]
+    missing = [symbol for symbol in universe if adaptive and symbol not in known]
+    items = [{"symbol": symbol, **({"company_name": known[symbol]} if adaptive else {})}
+             for symbol in universe if symbol not in missing]
+    complete = bool(universe) and not missing and total_requested <= budget
+    if adaptive:
+        complete = complete and bool((context or {}).get("complete"))
+    evidence = {"mode": mode, "adaptive_enabled": adaptive, "analysis_cap": budget,
+                "budget_note": "Cap applies to symbol analyses, not provider HTTP requests; sources and retries add requests.",
+                "scope": "bounded selected set; not full-market news coverage",
+                "selected_count": len(universe), "queried_count": len(items),
+                "missing_identity_symbols": missing, "omitted_priority_count": max(0, total_requested - budget),
+                "rotation_count": rotation_count, "pool_identity_count": len(pool),
+                "eligible_pool_identity_count": len(eligible),
+                "eligible_rotation_count": eligible_rotation_count,
+                "broader_rotation_count": broad_rotation_count,
+                "rotation_slot": f"{date_str}/{'17:00' if slot == 0 else '23:00'} Asia/Riyadh",
+                "discovery_complete": bool(complete),
+                "source_read_complete": (context or {}).get("source_read_complete") if adaptive else None,
+                "discovery_identity_coverage_complete": (context or {}).get("identity_coverage_complete") if adaptive else None,
+                "cohort_sha256": hashlib.sha256("\n".join(universe).encode()).hexdigest(),
+                "sources": (context or {}).get("sources", []) if adaptive else []}
+    return universe, items, evidence
+
+
 def resolve_universe(cli_universe: Optional[List[str]]) -> List[str]:
     """Stable universe to archive. CLI > env NEWS_ARCHIVE_UNIVERSE > default.
     A STABLE list (not the rotating Top_10) gives each symbol a continuous
@@ -484,19 +786,35 @@ async def collect(args: argparse.Namespace) -> int:
         logger.error("news_intelligence not importable -- cannot collect")
         return 1
 
-    universe = resolve_universe(args.universe)
     date_str = _riyadh_date()
+    adaptive = bool(getattr(args, "adaptive", False)) and not _unique_symbols(args.universe or [])
+    context = None
+    sheet_id = args.sheet_id or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("TRACK_SHEET_ID")
+    if adaptive:
+        context = {"complete": False, "identities": {}, "sources": []}
+        if sheet_id:
+            source_store = NewsArchiveStore(sheet_id, os.getenv("NEWS_ARCHIVE_SHEET", "News_Archive"), read_only=True)
+            context = source_store.load_news_source_context()
+    universe, items, selection = _select_news_universe(args, context, date_str)
     logger.info("collecting news sentiment for %d symbols (date %s)", len(universe), date_str)
 
-    items = [{"symbol": s} for s in universe]
     try:
-        batch = await news.batch_news_intelligence(items, include_articles=True)
+        timeout = max(30, min(600, int(getattr(args, "timeout_seconds", 600))))
+        batch = await asyncio.wait_for(news.batch_news_intelligence(items, include_articles=True), timeout=timeout)
     except Exception as e:
-        logger.error("batch_news_intelligence failed: %s", e)
+        code = "news_batch_timeout" if isinstance(e, (TimeoutError, asyncio.TimeoutError)) else "news_batch_failed"
+        failed = _collection_report(universe, [], date_str)
+        failed.update({"selection": selection, "selected_acquisition_complete": False,
+                       "complete": False, "error_code": code})
+        _write_collection_report(getattr(args, "evidence_json", None), failed)
+        logger.error("batch_news_intelligence failed (%s)", code)
         return 1
 
     results = list(getattr(batch, "items", None) or [])
     report = _collection_report(universe, results, date_str)
+    report["selection"] = selection
+    report["selected_acquisition_complete"] = report["complete"]
+    report["complete"] = report["complete"] and selection["discovery_complete"]
     _write_collection_report(getattr(args, "evidence_json", None), report)
     incomplete = not report["complete"]
     meta = getattr(batch, "meta", {}) or {}
@@ -528,7 +846,6 @@ async def collect(args: argparse.Namespace) -> int:
         print("[news_archive] DRY RUN -- %d rows NOT written" % len(rows))
         return 1 if incomplete else 0
 
-    sheet_id = args.sheet_id or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("TRACK_SHEET_ID")
     if not sheet_id:
         logger.error("no spreadsheet id (use --sheet-id or DEFAULT_SPREADSHEET_ID)")
         return 1
@@ -585,6 +902,12 @@ def create_parser() -> argparse.ArgumentParser:
                    help="Verbose logs.")
     p.add_argument("--evidence-json", default=None,
                    help="Write per-symbol acquisition status and bounded public article provenance JSON.")
+    p.add_argument("--adaptive", action="store_true", default=_env_bool("TFB_NEWS_ARCHIVE_ADAPTIVE", False),
+                   help="Augment the env/default baseline with source-validated portfolio/research names and a rotating pool; CLI --universe remains absolute.")
+    p.add_argument("--max-symbols", type=int, default=60,
+                   help="Maximum unique news analyses per run (clamped to 1..60); omitted or unknown identities are reported.")
+    p.add_argument("--timeout-seconds", type=int, default=600,
+                   help="Whole news batch time budget (clamped to 30..600 seconds, independent of source retries).")
     return p
 
 
