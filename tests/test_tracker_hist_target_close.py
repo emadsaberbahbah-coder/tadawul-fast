@@ -38,16 +38,18 @@ Cases
       failed pull and opens the breaker; a delisted answer is an empty answer
   H14 the rotating daily window reaches every symbol refused on every pass
   H15 the enforce pre-pass picks exactly the loop's candidates
-  N1  off == the v6.45.0 base copy on a mixed fixture (records, Notes, stats,
+  N1  off == the v6.46.0 base copy on a mixed fixture (records, Notes, stats,
       log lines); observe == off on records, stats and logs bar one line
   N2  golden negative: the base copy leaves the H1 record ACTIVE under enforce
   N3  workflow mapping, version floor and verifier pin
   N4  added lines are ASCII
 
 Golden negative: TFB_TEST_TP_DELIVERED=<base copy> runs every case against
-v6.45.0 as the delivered module (all but N1/N2 fail).
-Base copy: TFB_TEST_TP_BASE=<path to main 55b47f24 scripts/track_performance.py>,
-else `git show 55b47f24:scripts/track_performance.py`; N1/N2/N4 skip without it.
+v6.46.0 as the delivered module (all but N1/N2 fail).
+Base copy: TFB_TEST_TP_BASE=<path to main df99bcf3 scripts/track_performance.py>,
+else `git show df99bcf3:scripts/track_performance.py`; N1/N2/N4 skip without it.
+(2026-10-22: the base moved from main 55b47f24 / v6.45.0 to main df99bcf3 /
+v6.46.0 (#816) when this branch merged main; every N case is unchanged.)
 
 Run:  python3 -m pytest -q tests/test_tracker_hist_target_close.py
   or  python3 tests/test_tracker_hist_target_close.py   (PASS k/k + digest)
@@ -78,7 +80,7 @@ sys.path.insert(0, str(ROOT))
 TRACKER = ROOT / "scripts/track_performance.py"
 # Golden-negative / mutation runs only: load another copy as the delivered module.
 DELIVERED = Path(os.getenv("TFB_TEST_TP_DELIVERED", "").strip() or TRACKER)
-BASE_SHA = "55b47f24"
+BASE_SHA = "df99bcf3"   # main after #816 (6.46.0); was 55b47f24 (6.45.0) before the merge
 GATES = ("TRACK_HIST_TARGET_CLOSE", "TRACK_HIST_CLOSE_BUDGET", "TRACK_HIST_CLOSE_TIME_SEC")
 
 UTC = timezone.utc
@@ -101,7 +103,7 @@ _BASE = {}
 
 
 def base():
-    """The v6.45.0 copy (main 55b47f24), or skip."""
+    """The v6.46.0 copy (main df99bcf3), or skip."""
     if "mod" not in _BASE:
         path = os.getenv("TFB_TEST_TP_BASE", "").strip()
         if not path:
@@ -111,7 +113,7 @@ def base():
             except Exception:
                 text = ""
             if text:
-                tmp = Path(tempfile.mkdtemp()) / "tp_v6450_base.py"
+                tmp = Path(tempfile.mkdtemp()) / "tp_v6460_base.py"
                 tmp.write_text(text, encoding="utf-8")
                 path = str(tmp)
         _BASE["mod"] = _load("tp_hist_close_base", path) if path else None
@@ -242,7 +244,7 @@ def receipt(mod, rec):
 
 def state(rec):
     """Every record field, with the tracker_version inside Notes normalised so
-    a v6.45.0 and a v6.47.0 receipt compare equal when nothing else differs."""
+    a v6.46.0 and a v6.47.0 receipt compare equal when nothing else differs."""
     d = dataclasses.asdict(rec)
     d["notes"] = re.sub(r'"tracker_version":"[0-9.]+"', '"tracker_version":"X"', d["notes"] or "")
     return json.loads(json.dumps(d, default=str, sort_keys=True))
@@ -877,7 +879,7 @@ def _norm_logs(mod, logs):
     return [m.replace(mod.SCRIPT_VERSION, "X") for m in logs]
 
 
-def test_n1_off_is_byte_identical_to_v6_45_0():
+def test_n1_off_is_byte_identical_to_v6_46_0():
     b = base()
     want_recs, rows = _mixed(b)
     want = audit(b, want_recs, rows, bar_map={})
@@ -902,7 +904,7 @@ def test_n1_off_is_byte_identical_to_v6_45_0():
 # ---------------------------------------------------------------- N2 -----
 def test_n2_golden_negative_base_leaves_the_record_active():
     b = base()
-    assert b.SCRIPT_VERSION == "6.45.0" and not hasattr(b, "_hist_target_close")
+    assert b.SCRIPT_VERSION == "6.46.0" and not hasattr(b, "_hist_target_close")
     rec = record(b)
     audit(b, [rec], [row()], env={"TRACK_HIST_TARGET_CLOSE": "enforce"})
     assert rec.status == b.PerformanceStatus.ACTIVE and rec.realized_roi is None
@@ -953,7 +955,7 @@ def test_n3_workflow_mapping_version_and_pin():
 def test_n4_added_lines_are_ascii_and_nothing_removed():
     b = base()
     if tp.SCRIPT_VERSION != "6.47.0":
-        pytest.skip("exact 55b47f24 -> 6.47.0 diff checks apply to 6.47.0 only")
+        pytest.skip("exact df99bcf3 -> 6.47.0 diff checks apply to 6.47.0 only")
     import difflib
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
     new = DELIVERED.read_text(encoding="utf-8").splitlines()
@@ -961,7 +963,7 @@ def test_n4_added_lines_are_ascii_and_nothing_removed():
     added = [ln[1:] for ln in diff if ln.startswith("+") and not ln.startswith("+++")]
     removed = [ln[1:] for ln in diff if ln.startswith("-") and not ln.startswith("---")]
     title = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
-    assert removed == [title % "6.45.0", 'SCRIPT_VERSION = "6.45.0"'], removed
+    assert removed == [title % "6.46.0", 'SCRIPT_VERSION = "6.46.0"'], removed
     # The docstring title keeps its pre-existing en dash; only its version moves.
     assert added.count(title % "6.47.0") == 1
     fresh = [ln for ln in added if ln != title % "6.47.0"]

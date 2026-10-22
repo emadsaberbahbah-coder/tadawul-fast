@@ -2,11 +2,11 @@
 
 Date: 2026-10-21 (daily improvement, one item, priority (a): a published outcome number is missing, for good).
 
-- **Base:** main `55b47f24`. `scripts/track_performance.py` 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines). Result: 6.47.0 (sha256 `799e0aa74d2a34ee...`, 11376 lines).
-- **Why 6.47.0:** 6.45.1, 6.45.2 and 6.46.0 are claimed by open #785, #795 and #809. Whichever of these lands second re-numbers.
+- **Base:** main `df99bcf3` since this branch merged main on 2026-10-22 (see 'Merge of main' below). `scripts/track_performance.py` 6.46.0 (sha256 `f1f48ea3d0ff153c...`, 11,109 lines). Result: 6.47.0 (sha256 `3280d929c8d6a7c3...`, 11,560 lines). When the PR opened, the base was main `55b47f24` with 6.45.0 (sha256 `f58f2dafb2759b5d...`, 10,929 lines), and the result was sha256 `799e0aa74d2a34ee...`, 11376 lines.
+- **Why 6.47.0:** when this PR opened, 6.45.1, 6.45.2 and 6.46.0 were claimed by open #785, #795 and #809. 6.46.0 has since landed on main through #816, which carries #809's learning-metric fixes. This branch merged it, so 6.47.0 now follows main directly. #785, #795 and #809 are still open; whichever of them lands after this PR re-numbers.
 - **Lane:** GitHub Actions (`track_performance.yml`, the Performance Clock). Nothing in Render, the backend or Apps Script changes.
 - **Gate:** repository Variable `TRACK_HIST_TARGET_CLOSE`, mapped in the 'Run performance clock' step with default `'off'`. The words `observe` and `enforce` are read case- and space-insensitively; any other value, `1` included, is off.
-- **Off:** maturation is v6.45.0 byte-identical apart from the version string. This is proven against the base copy: every record field, the Notes receipt (with `tracker_version` normalised), `_last_audit_stats` and the absence of any pull.
+- **Off:** maturation is v6.46.0 (main `df99bcf3`) byte-identical apart from the version string; before the merge it was v6.45.0, proven the same way. This is proven against the base copy: every record field, the Notes receipt (with `tracker_version` normalised), `_last_audit_stats` and the absence of any pull.
 
 ## Why
 
@@ -28,7 +28,7 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
 
 ## What changed
 
-`scripts/track_performance.py` 6.45.0 -> 6.47.0. A dated WHY block is added above `SCRIPT_VERSION`, and every prior block is kept verbatim.
+`scripts/track_performance.py` 6.45.0 -> 6.47.0 (6.46.0 -> 6.47.0 against main since the merge). A dated WHY block is added above `SCRIPT_VERSION`, and every prior block is kept verbatim. Since the merge it sits above #816's 6.46.0 block, newest first.
 
 **Trigger.** In `audit_active_records`, the path runs only when all of these hold:
 - the gate is observe or enforce;
@@ -100,9 +100,39 @@ Performance Clock job 118841772740              Matured: 11791   (flat since abo
 - a maturity written by the clock lane is not undone by its record-only save;
 - the parity tests cover only keys both lanes map (`TRACK_SCHEDULED_AUDIT` is already clock-only).
 
-`scripts/verify_deployment.py`: the manifest pin `track_performance` goes 6.45.0 -> 6.47.0. This is a pin only: `SCRIPT_VERSION` stays 1.0.61, following main's own 2026-10-21 note, which keeps it clear of the open verifier bumps in #778, #779, #785, #795 and #809.
+`scripts/verify_deployment.py`: the manifest pin `track_performance` goes 6.45.0 -> 6.47.0 (6.46.0 -> 6.47.0 against main, replacing #816's pin; #816's other pins are kept). This is a pin only: `SCRIPT_VERSION` stays 1.0.61, following main's own 2026-10-21 note, which keeps it clear of the open verifier bumps in #778, #779, #785, #795 and #809.
 
-## Measured results
+## Merge of main (2026-10-22)
+
+main moved after this PR opened: #813, #815 and #816 (merged 2026-10-21 22:23Z, main `df99bcf3`). #816 shipped `track_performance` 6.46.0 (the direction-aware learning metrics carried from #809), its `verify_deployment.py` pins and `ci.yml` 1.1.31. This branch merged `origin/main` with a normal merge commit (no rebase, no force-push).
+
+| File | Conflict | Resolution |
+| --- | --- | --- |
+| `scripts/track_performance.py` | docstring title (v6.47.0 vs v6.46.0) | v6.47.0 |
+| `scripts/track_performance.py` | WHY blocks and `SCRIPT_VERSION` | both blocks kept, newest first: the 6.47.0 block (plus a 3-line MERGED note), a separator, #816's 6.46.0 block verbatim, then `SCRIPT_VERSION = "6.47.0"` |
+| `scripts/verify_deployment.py` | `track_performance` pin (6.47.0 vs 6.46.0) | 6.47.0, plus one comment line; #816's other pins kept |
+
+Merged without conflict: `ci.yml` is main's 1.1.31 (this PR never edited it, so there was no enrolment to carry), and `.github/workflows/track_performance.yml` keeps this PR's 1.0.4. The branch's diff against main is still exactly this PR's five files.
+
+`tests/test_tracker_hist_target_close.py` is re-anchored on the new base: `BASE_SHA` 55b47f24 -> df99bcf3, the base version that N2 and N4 expect 6.45.0 -> 6.46.0, and N1 renamed `test_n1_off_is_byte_identical_to_v6_46_0`. No assertion is loosened. Before the re-anchor, N4 failed on the merged tree because its exact diff against 55b47f24 also saw the 50 lines #816 replaced. Against df99bcf3 its removals are exactly the two version lines again.
+
+```
+AST function names                     base 269 | main 274 | PR 279 | merged 284 (= 269 + 5 + 10); missing vs main 0, vs PR 0
+3-way body check                       every def equals the side that changed it; none changed on both sides
+lines of main not in the merged file   2 (the 6.46.0 title and SCRIPT_VERSION lines)
+default off, static                    audit_active_records minus the _hist_* inits and the `_hist_mode != 'off'` blocks is AST-identical to main's
+N1, off == main df99bcf3               PASS (also PASS with the unmodified test and TFB_TEST_TP_BASE=<main copy>)
+pytest tests/test_tracker_hist_target_close.py   25 passed (requirements.txt env); numpy+pytest env 23 passed, 2 skipped (pandas, yfinance absent)
+python3 tests/test_tracker_hist_target_close.py (x2)   PASS 25/25 digest 04e8597958ee9c30 (the N1 rename moves the digest)
+golden negative: TFB_TEST_TP_DELIVERED=<main df99bcf3 copy>   23 failed, 1 passed (N1), 1 skipped (N4)
+tracker-related suites (19 files)      merged 456 passed, 1 skipped | main 431 passed, 1 skipped (+25 = this suite)
+embedded self-test _track_selftest_    PASS 22/22 (main PASS 22/22)
+verify_deployment.py --selftests       track_performance 6.47.0 == pin, OK; every other module, script, selftest and flag identical to main
+whole suite, pytest -q tests (requirements.txt env)   merged 5507 passed, 37 skipped, 0 failed | main 5482 passed, 37 skipped, 0 failed (+25 = this suite)
+ci.yml lean-unit pytest steps (numpy + pytest)   LEAN FAILS: 0 (decision-layer suites 3795 passed, 26 skipped; main identical)
+```
+
+## Measured results (pre-merge tree, base 55b47f24)
 
 ```
 pytest tests/test_tracker_hist_target_close.py (repo checkout, base via git show)   25 passed
@@ -115,7 +145,7 @@ pytest test_outcome_price_evidence + tracker/workflow/manifest + tracker unit su
 python3 scripts/test_maturation.py                                        14/14
 embedded self-test _track_selftest_                                       PASS 22/22 (unchanged)
 compileall main.py core routes scripts tests                             ok
-ci.yml lean list (every step)                                             LEAN FAILS: 0 (decision-layer suites 3772 passed, 19 skipped), on the final tree
+ci.yml lean list (every step)                                             LEAN FAILS: 0 (decision-layer suites 3772 passed, 19 skipped), on the final pre-merge tree
 ```
 
 **Mutations (`-x` per mutation), 29 of 30 caught:**
@@ -206,7 +236,7 @@ The first review's four refuted claims:
 - **H14:** three symbols refused on every pass, budget 1. Across Thu, Fri and Tue the window moves, so each symbol is pulled exactly once, in observe and in enforce. The pure window table is checked too. H14b: a non-candidate beside a candidate never takes the window (two consecutive days), and the count leg still defers on a direct call.
 - **H15:** the enforce pre-pass picks exactly the records the loop marks `quote_outside_target_session` on the mixed fixture plus a not-yet-due record.
 - **H13:** the REAL yfinance 0.2.66 stack over a stubbed transport, with no network. A connection error, a timeout and the outage page each give 3 failed pulls, then an open breaker that defers the rest; a delisted answer gives 5 empty answers.
-- **N1:** off (5 spellings) equals the v6.45.0 base copy on a mixed fixture: record states, receipts, `_last_audit_stats` and INFO log lines. Observe equals it too, on witnessed and on missing-bar fixtures.
+- **N1:** off (5 spellings) equals the v6.46.0 base copy (main `df99bcf3`; v6.45.0 before the merge) on a mixed fixture: record states, receipts, `_last_audit_stats` and INFO log lines. Observe equals it too, on witnessed and on missing-bar fixtures.
 - **N2:** golden negative. The base copy under `TRACK_HIST_TARGET_CLOSE=enforce` leaves the H1 record ACTIVE with `quote_outside_target_session`, including past grace.
 - **N3:** the workflow mapping (step-scoped, defaults equal to the script's), no mapping in daily_sync, the version floor (>= 6.47.0), the docstring version, the verifier pin, and the WHY block order (floors, no exact pin).
 - **N4:** on 6.47.0 only, the added lines are ASCII, the only removals are the two version lines, and the function inventory is +10 / -0.
@@ -234,4 +264,4 @@ The first review's four refuted claims:
 - **Yahoo data error:** if Yahoo back-adjusts a Close but leaves the split out of its event list, only a confirmed `_Corporate_Actions` row (or, for a move of 15pp or more, the CA-GUARD) catches it. That is a provider data error and outside this code's reach; observe's refusal counts are the place to watch for it.
 - **`maturity_date`** is the audit time, as for every maturity. This only affects plot ordering.
 - **Provider:** the close comes from Yahoo through yfinance. It is a different provider from the current-quote witness but is the exact session's close. Observe is the step that shows whether the runner can reach it.
-- **CI coverage:** the harness is not enrolled in the blocking lean list. `ci.yml` is edited by open #778, so enrolling here would collide with its version lines; enrolling is proposed once #778 lands. The advisory whole-suite job collects it. N1, N2 and N4 need the base copy (`git show 55b47f24`, or `TFB_TEST_TP_BASE`) and skip in a shallow checkout. They were run locally, as recorded above.
+- **CI coverage:** the harness is not enrolled in the blocking lean list. `ci.yml` is edited by open #778, so enrolling here would collide with its version lines; enrolling is proposed once #778 lands. The advisory whole-suite job collects it. N1, N2 and N4 need the base copy (`git show df99bcf3` since the merge, `55b47f24` before it, or `TFB_TEST_TP_BASE`) and skip in a shallow checkout. They were run locally, as recorded above.
