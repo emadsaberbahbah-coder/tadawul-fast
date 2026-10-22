@@ -38,8 +38,8 @@ name: "🗄️ TFB PIT Snapshot"
 # run by its scheduled slot so a late run and the next on-time run can no longer
 # share a Snapshot Date (2026-08-07 lost 36 captures). See pit_snapshot.py v1.1.3.
 # ROLLBACK: delete the variable or set it to wallclock (observe is also a disarm).
-# Disarming right after an on-time slot run (fired 20:10-20:59 UTC) costs the next
-# on-time run once (same label, skipped_dup); disarm after a run fired >= 21:00 UTC.
+# After a disarm, if the next slot's run fires on time (20:10-20:59 UTC) it gets the
+# last slot run's label and its captures are skipped once; a late fire is unaffected.
 # ============================================================================
 
 on:

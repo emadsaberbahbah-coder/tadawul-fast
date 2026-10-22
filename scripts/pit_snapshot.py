@@ -242,10 +242,10 @@ def _today_riyadh() -> str:
 #     after it is classified by its capture, on the same clock as the ledger.
 # ROLLBACK
 #   Unset TFB_PIT_DAY_KEY (or set wallclock). observe is also a disarm (it
-#   keeps the wall-clock label). Disarming after an on-time slot run (fired
-#   in [20:10, 21:00) UTC) reproduces the old collision once: the next
-#   on-time run gets the same label and is skipped. Disarm after a run that
-#   fired at or after 21:00 UTC, or expect one skipped_dup run.
+#   keeps the wall-clock label). After a disarm the first wall-clock run is
+#   exposed once: if it is the next slot's run and fires on time (20:10-20:59
+#   UTC), its label equals the last slot run's label, whenever that run
+#   fired, and its captures are skipped. A late first run is unaffected.
 _DAY_KEY_MODES = ("observe", "slot")
 _SLOT_UTC_HM = (20, 10)   # .github/workflows/pit_snapshot.yml cron "10 20 * * *"
 

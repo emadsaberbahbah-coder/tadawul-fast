@@ -90,22 +90,26 @@ A D-labelled slot key was considered and rejected:
 
 ## Measured results (offline, venv Python 3.11)
 
-**Harness** `tests/test_pit_day_key.py`: `PASS 13/13` as a script and `13 passed` under pytest.
+**Harness** `tests/test_pit_day_key.py`: `PASS 14/14` as a script and `14 passed` under pytest. With no git history (`GIT_DIR=/nonexistent`, as on CI's depth-1 checkout) the result is 13 passed, 1 skipped: N2 skips, and P2 runs against the recorded digests.
 
 **Golden negative.** The base copy is `git show 57391476:scripts/pit_snapshot.py`, run as the delivered module with `TFB_TEST_PIT_DELIVERED=<copy>`:
 
-- Result: 11 failed, 1 passed (P2, off identity), 1 skipped (N2, exact-diff checks apply to 1.1.3 only).
+- Result: 12 failed, 1 passed (P2, off identity), 1 skipped (N2, exact-diff checks apply to 1.1.3 only).
 - P1 on base gives `[3, 3, 0, 3]` rows for the four real August fire times, which reproduces the production loss. Delivered `slot` gives `[3, 3, 3, 3]`.
 
 **Off identity (P2).** Compared with the base on rows, `_Run_Log` rows, stderr (version string normalised) and exit codes:
 
 - gate values: 9 (unset, `wallclock`, empty, `WallClock`, `on`, `1`, `true`, `enforce`, `next`);
-- ledger states: 3 (current header, legacy 16-column header, absent tab);
+- ledger states: 4 (current header, legacy 16-column header, an existing empty tab, and an absent tab that `main()` creates);
 - fire times: 10 per sequence (6 grid times + the 4 August times).
 
-Every comparison is equal.
+Every comparison is equal, and every run exits 0, so a crash on both sides cannot pass.
 
-**Mutations** (`-x` per mutation): 18 of 18 caught. The mutations were:
+The base's outputs per ledger state are also recorded as `OFF_GOLDEN` (sha256[:16]). Wherever the base copy is available, P2 first proves those digests against it, and then checks every delivered run against them. The digests are what keep the check alive on CI's shallow checkout.
+
+The empty-tab case keeps a v1.1.1 quirk byte for byte. v1.1.1 writes no header on an existing empty tab, so its first data row is later read as the header. #785 fixes that.
+
+**Mutations** (`-x` per mutation): 19 of 19 caught. The mutations were:
 
 - slot without +1;
 - anchor 20:00;
@@ -123,11 +127,12 @@ Every comparison is equal.
 - the wall-clock path not via `_today_riyadh`;
 - no lower-casing;
 - no calendar-end guard;
-- slot read at run start instead of after the ledger read (the pre-review build, which P11 also fails when run as the delivered module).
+- slot read at run start instead of after the ledger read (the pre-review build, which P11 also fails when run as the delivered module);
+- the duplicate key built from the wall-clock date in slot mode (P6's on-time pair).
 
 **Compatibility with open #785.** A trial merge of this branch into `pr785` has one conflict, on the docstring title and the version lines. With both WHY blocks kept and 1.1.3 chosen, #785's `tests/test_pit_snapshot_schema.py` passes 17/17 on the merged file (it pins the label through `_today_riyadh`).
 
-On that merged tree this harness's P2/N2 fail as expected, because their base must then move to the post-#785 main. That is a one-line `BASE_SHA` change at merge time.
+On that merged tree this harness's P2/N2 fail as expected, because their base must then move to the post-#785 main. At merge time, move `BASE_SHA` and regenerate `OFF_GOLDEN` from that base; P2 prints the digest it computed when they disagree.
 
 **Repo checks:**
 
@@ -141,20 +146,38 @@ On that merged tree this harness's P2/N2 fail as expected, because their base mu
 | Case | Proves |
 | --- | --- |
 | P1 | slot: the real Aug fire times write every capture (labels 08-06..08-09, 12 unique keys) |
-| P2 | off (9 spellings x 3 ledger states x 10 fires) == the v1.1.1 base on every surface; the base drops the 7 Aug captures |
+| P2 | off (9 spellings x 4 ledger states x 10 fires) == the v1.1.1 base on every surface, all exit 0; `OFF_GOLDEN` digests proven against the base and checked everywhere; the base drops the 7 Aug captures |
 | P3 | observe: rows, labels and exit codes equal off; exactly one extra stderr line; `cross_slot_dups` is 0,0,3,0 over the Aug sequence |
 | P4 | `slot_day_key` table, incl. year and leap-day roll and Riyadh-aware input; differs from wall-clock exactly on [20:10, 21:00) UTC, never earlier (every minute over 72 h) |
 | P5 | arming after wall-clock runs: no lost and no doubled (label, symbol) |
-| P6 | slot keeps the guard: re-runs inside one slot write nothing; the next slot writes |
+| P6 | slot keeps the guard: re-runs inside one slot write nothing, including an on-time pair (20:15 and 20:45 UTC) where only the slot label can key the guard; the next slot writes |
 | P7 | `cross_slot_dups` pure table: 24-wide, legacy 16-wide, ISO `T`, unparseable, other label, other symbol, lower-case input; 9999-12-31 / 0001-01-01 captures are skipped, and an observe or slot run over such a row still exits 0 and writes |
 | P8 | `_Run_Log` details: off has exactly v1.1.1's keys; slot adds `day_key` |
 | P9 | wallclock and observe read the module-global `_today_riyadh` (the #785/#795 tests pin it) |
 | P10 | slot dry-run prints the slot label and writes nothing |
 | P11 | the slot is read on the capture clock: the clock moves when the ledger is read (start 20:09:50, capture 20:10:20). The slot label equals `slot_day_key(Captured At)` for every row, and observe's count agrees with what slot does on the next run |
+| P12 | the documented ROLLBACK limit: after a disarm (unset or observe), the next slot's on-time run is skipped once, whether the last slot run fired on time or late; a late first run writes |
 | N1 | workflow mapping; the slot anchor equals the cron; version floor `>= (1, 1, 3)`; docstring title; verifier pin; WHY order |
 | N2 | added lines ASCII (the pre-existing em dash in the title excepted); removed lines exactly the title, the version line and the 3-line OK `_Run_Log` call; no function removed; exactly four added |
 
-**CI:** the harness runs in the advisory whole-suite job (`pytest -q tests`). P2 and N2 need the base copy and skip on a shallow checkout. It is not enrolled in the blocking lean list, because ci.yml versions 1.1.33-1.1.35 are claimed by open #818 and #778. Enrolment is proposed below.
+**CI:** the harness runs in the advisory whole-suite job (`pytest -q tests`). Every checkout there is depth 1, so N2 skips and P2 checks against `OFF_GOLDEN`. It is not enrolled in the blocking lean list, because ci.yml versions 1.1.33-1.1.35 are claimed by open #818 and #778. Enrolment is proposed below; it needs no `fetch-depth` change because of the digests.
+
+## Adversarial review (before the PR)
+
+A four-lens review workflow ran: semantics, byte-identity, harness, and evidence against the Actions API. Each non-nit finding went to an independent refuter. All 8 findings were confirmed and all are addressed in this PR.
+
+| Finding | Severity | Disposition |
+| --- | --- | --- |
+| observe under-counted when a run started just before 20:10 UTC and captured after it (slot taken at start, Captured At later) | nit | Fixed. The slot is read after the page and ledger reads, on the capture clock (P11) |
+| ROLLBACK caveat missing from the workflow header, and observe not named as a disarm | nit | Fixed in both places |
+| A 9999-12-31 / 0001-01-01 Captured At under the run's label raised OverflowError, failing an observe or slot run | minor | Fixed. `cross_slot_dups` skips such rows (P7) |
+| "7 Aug close" wording: 7 Aug was a Friday | nit | Reworded to captures. The reviewer confirmed every figure exactly |
+| The revised disarm advice tied the collision to the wrong run's fire time | minor | Fixed in all three places, and pinned by P12 |
+| P2 and N2 never ran in CI (depth-1 checkouts) | minor | P2 now uses `OFF_GOLDEN` digests proven against the base. N2 stays local |
+| P2's "absent" start was an existing empty tab, and the fake `WS.update` crashed on an empty sheet | minor | The fake was fixed. There are now real `empty` and `absent` starts, and all P2 runs must exit 0 |
+| P6 lacked an on-time re-run where only the slot label keys the guard | nit | Added, plus the matching mutation |
+
+The byte-identity lens also ran its own independent probe and found zero differences. It covered 71,496 off-mode runs, 13,986 observe runs and 13,986 slot runs, over 130 fire times, 10 ledger shapes and 3 argv forms. That figure was measured on the pre-review build; the review changes touch only the observe/slot paths.
 
 ## Operator steps (owner) - nothing is armed by this PR
 
@@ -164,7 +187,7 @@ On that merged tree this harness's P2/N2 fail as expected, because their base mu
 
 ## Known limits
 
-- **Disarming** (slot -> wallclock, or slot -> observe, since observe keeps the wall-clock label) right after an on-time slot run (fired in [20:10, 21:00) UTC) reproduces the old collision once: the next on-time run gets the same label and is skipped. Disarm after a run that fired at or after 21:00 UTC. This is stated in the code ROLLBACK and in the workflow header.
+- **Disarming** (slot -> wallclock, or slot -> observe, since observe keeps the wall-clock label) exposes the first wall-clock run once. If it is the next slot's run and fires on time (20:10-20:59 UTC), its label equals the last slot run's label, whatever time that run fired, and its captures are skipped. A late first run is unaffected. This is stated in the code ROLLBACK and in the workflow header (the adversarial review corrected an earlier wording that tied it to the last armed run's fire time).
 - **Residual clock race:** the slot is read milliseconds before `build_rows` stamps `Captured At`, with no I/O in between. A run whose two reads straddle 20:10:00.000 UTC would get a label one slot below `slot_day_key(Captured At)`.
 - **A manual dispatch before 20:10 UTC** belongs to the previous slot, so it dedups against that slot's capture. This is the same as wall-clock behaviour for fires after 21:00 UTC the day before. The `[PIT-DAYKEY]` line shows both labels.
 - **The slot anchor** (`_SLOT_UTC_HM = (20, 10)`) must move with the cron. N1 fails if they diverge. The post-1 Nov US standard-time issue (the 20:10 UTC fire is before the 21:00 UTC close) is unchanged and still registered in the workflow header.

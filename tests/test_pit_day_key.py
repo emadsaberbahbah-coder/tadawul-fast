@@ -21,13 +21,17 @@ network, no workbook, no provider.
 Cases
   P1  slot: the real Aug fire times write every capture (labels 08-06..08-09)
   P2  off (unset, wallclock and 6 non-words) == the v1.1.1 base copy on rows,
-      _Run_Log, stderr and exit code, over a fire-time grid and a legacy tab
+      _Run_Log, stderr and exit code, over a fire-time grid, for a current,
+      legacy, empty and absent tab; every run exits 0. Where the base copy is
+      missing (CI's shallow checkout) the outputs are checked against
+      OFF_GOLDEN, digests of the base's outputs that P2 proves locally
   P3  observe: rows and labels equal off; one [PIT-DAYKEY] line and a day_key
       entry count the 3 captures the 7 Aug pair drops
   P4  slot_day_key table; it differs from the wall-clock label exactly on
       fires in [20:10, 21:00) UTC (every minute over 72 hours)
   P5  arming after wall-clock runs: no lost and no doubled (label, symbol)
-  P6  slot keeps the guard: a re-run inside one slot writes nothing
+  P6  slot keeps the guard: a re-run inside one slot writes nothing, also
+      for an on-time pair (20:15 and 20:45 UTC) keyed by the slot label
   P7  cross_slot_dups pure table (24-wide, legacy 16-wide, unparseable)
   P8  _Run_Log details: off carries exactly v1.1.1's keys; slot adds day_key
   P9  wallclock and observe still read the module-global _today_riyadh
@@ -35,14 +39,18 @@ Cases
   P10 slot dry-run prints the slot label and writes nothing
   P11 the slot is read on the capture clock (a run starting at 20:09:50 and
       capturing at 20:10:20 is labelled by its capture)
+  P12 the ROLLBACK limit as documented: after a disarm (unset or observe) the
+      next slot's on-time run is skipped once; a late one is not
   N1  workflow mapping, slot anchor == the cron, version floor, verifier pin
   N2  added lines are ASCII; no function removed; exactly four added
 
 Golden negative: TFB_TEST_PIT_DELIVERED=<base copy> runs every case against
 v1.1.1 as the delivered module (all but P2 fail; N2 skips).
 Base copy: TFB_TEST_PIT_BASE=<path>, else `git show 57391476:scripts/
-pit_snapshot.py` (main after #817; the file is unchanged since v1.1.1);
-P2/N2 skip without it.
+pit_snapshot.py` (main after #817; the file is unchanged since v1.1.1).
+Without it P2 uses OFF_GOLDEN and N2 skips. After another PIT change lands on
+main, move BASE_SHA and regenerate OFF_GOLDEN from that base (P2 prints the
+digest it computed when they disagree).
 
 Run:  python3 -m pytest -q tests/test_pit_day_key.py
   or  python3 tests/test_pit_day_key.py   (PASS k/k + digest)
@@ -86,8 +94,8 @@ pit = _load("pit_day_key_delivered", DELIVERED)
 _BASE = {}
 
 
-def base():
-    """The v1.1.1 copy (main 57391476), or skip."""
+def _base_or_none():
+    """The v1.1.1 copy (main 57391476), or None on a shallow checkout."""
     if "mod" not in _BASE:
         path = os.getenv("TFB_TEST_PIT_BASE", "").strip()
         if not path:
@@ -102,7 +110,12 @@ def base():
                 tmp.write_text(text, encoding="utf-8")
                 path = str(tmp)
         _BASE["mod"] = _load("pit_day_key_base", path) if path else None
-    if _BASE["mod"] is None:
+    return _BASE["mod"]
+
+
+def base():
+    """The v1.1.1 copy, or skip."""
+    if _base_or_none() is None:
         pytest.skip("base copy unavailable (set TFB_TEST_PIT_BASE)")
     return _BASE["mod"]
 
@@ -142,14 +155,18 @@ class WS:
         self.vals.append(list(row))
 
     def update(self, values=None, range_name=None):
-        self.vals[0] = list(values[0])
+        if self.vals:
+            self.vals[0] = list(values[0])
+        else:   # A1 of an empty sheet
+            self.vals.append(list(values[0]))
 
     def freeze(self, rows=None):
         return None
 
 
 class Book:
-    def __init__(self, ledger, run_log, syms):
+    def __init__(self, ledger, run_log, syms, on_create=None):
+        self.on_create = on_create
         self.w = {"Src": WS([["Symbol", "Current Price", "P/E Ratio"]]
                             + [[s, "1.5", "9"] for s in syms]),
                   "Dec": WS([["Rank", "Symbol"]]
@@ -164,18 +181,21 @@ class Book:
         return self.w[name]
 
     def add_worksheet(self, title, rows, cols):
-        self.w[title] = WS([[]])
+        self.w[title] = WS([])
+        if self.on_create is not None:
+            self.on_create(self.w[title])
         return self.w[title]
 
 
 class Rig:
     """One ledger driven through main() by successive frozen fire times."""
 
-    def __init__(self, mod, ledger_rows=None, syms=SYMS):
+    def __init__(self, mod, ledger_rows=None, syms=SYMS, absent=False):
         self.mod = mod
-        self.ledger = WS([list(r) for r in (ledger_rows if ledger_rows
-                                            is not None
-                                            else [mod.HEADERS])])
+        # absent: no _PIT_Fundamentals tab; main() creates it on --write
+        self.ledger = None if absent else WS(
+            [list(r) for r in (ledger_rows if ledger_rows is not None
+                               else [mod.HEADERS])])
         self.run_log = WS([["ts"]])
         self.syms = list(syms)
         self.runs = []
@@ -200,18 +220,22 @@ class Rig:
             after = real_dt.datetime.fromisoformat(later).replace(
                 tzinfo=real_dt.timezone.utc)
             self.ledger.on_get = lambda: setattr(FrozenDT, "now_utc", after)
-        book = Book(self.ledger, self.run_log, self.syms)
+        had_ledger = self.ledger is not None
+        book = Book(self.ledger, self.run_log, self.syms,
+                    on_create=lambda ws: setattr(self, "ledger", ws))
         mod._dt = DTShim
         mod._open_book = lambda: book
         if today is not None:
             mod._today_riyadh = lambda: today
         err = io.StringIO()
-        n_ledger, n_log = len(self.ledger.vals), len(self.run_log.vals)
+        n_ledger = len(self.ledger.vals) if had_ledger else 0
+        n_log = len(self.run_log.vals)
         try:
             with contextlib.redirect_stderr(err):
                 rc = mod.main(list(argv))
         finally:
-            self.ledger.on_get = None
+            if self.ledger is not None:
+                self.ledger.on_get = None
             for k, v in saved.items():
                 setattr(mod, k, v)
             for k, v in saved_env.items():
@@ -219,8 +243,13 @@ class Rig:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        run = {"rc": rc, "stderr": err.getvalue(),
-               "rows": self.ledger.vals[n_ledger:],
+        if self.ledger is None:
+            rows = []
+        elif had_ledger:
+            rows = self.ledger.vals[n_ledger:]
+        else:   # created by this run: row 0 is the header it wrote
+            rows = self.ledger.vals[1:]
+        run = {"rc": rc, "stderr": err.getvalue(), "rows": rows,
                "log": self.run_log.vals[n_log:]}
         self.runs.append(run)
         return run
@@ -262,6 +291,15 @@ GRID = ["2026-10-20T20:10:00", "2026-10-20T20:59:59", "2026-10-20T21:01:00",
         "2026-10-20T23:13:00", "2026-10-21T04:20:00", "2026-10-21T20:30:00"]
 
 
+STARTS = ("current", "legacy", "empty", "absent")
+# v1.1.1 (main 57391476) off-mode outputs over GRID + AUG per ledger start:
+# sha256[:16] of _off_outputs(); P2 proves them against the base copy when it
+# is available and checks the delivered module against them everywhere (CI
+# checkouts are shallow, so the base copy is not there).
+OFF_GOLDEN = {"current": "4458e4d3676061cf", "legacy": "835d18e8fd66e3bb",
+              "empty": "e1c6167639b7a16b", "absent": "4458e4d3676061cf"}
+
+
 def _legacy_ledger(mod):
     rows = [list(mod.LEGACY_HEADERS_16)]
     rows.append(["2026-07-25", "A.US", "Src"] + [""] * 11
@@ -269,30 +307,47 @@ def _legacy_ledger(mod):
     return rows
 
 
+def _off_outputs(mod, start, word):
+    if start == "current":
+        rig = Rig(mod)
+    elif start == "legacy":
+        rig = Rig(mod, _legacy_ledger(mod))
+    elif start == "empty":
+        rig = Rig(mod, [])
+    else:
+        rig = Rig(mod, absent=True)
+    runs = [rig.fire(ts, mode=word) for ts in GRID + AUG]
+    return {"rc": [r["rc"] for r in runs],
+            "stderr": [_norm(r["stderr"], mod) for r in runs],
+            "log": [[_norm(str(c), mod) for c in row]
+                    for r in runs for row in r["log"]],
+            "ledger": rig.ledger.vals}
+
+
+def _out_digest(out):
+    return hashlib.sha256(json.dumps(out, sort_keys=True).encode(
+        "utf-8")).hexdigest()[:16]
+
+
 def test_p2_off_is_byte_identical_to_the_v111_base():
-    b = base()
-    for word in OFF_WORDS:
-        for start in ("current", "legacy", "absent"):
-            got = {}
-            for name, mod in (("new", pit), ("base", b)):
-                if start == "current":
-                    rig = Rig(mod)
-                elif start == "legacy":
-                    rig = Rig(mod, _legacy_ledger(mod))
-                else:
-                    rig = Rig(mod, [])
-                runs = [rig.fire(ts, mode=word) for ts in GRID + AUG]
-                got[name] = {
-                    "rc": [r["rc"] for r in runs],
-                    "stderr": [_norm(r["stderr"], mod) for r in runs],
-                    "log": [[_norm(str(c), mod) for c in row]
-                            for r in runs for row in r["log"]],
-                    "ledger": rig.ledger.vals}
-            assert got["new"] == got["base"], (word, start)
-    # the base really does drop the 7 Aug captures (the defect P1 fixes)
-    rig = Rig(b)
-    runs = [rig.fire(ts, mode="slot") for ts in AUG]
-    assert [len(r["rows"]) for r in runs] == [3, 3, 0, 3]
+    b = _base_or_none()
+    for start in STARTS:
+        ref = None
+        if b is not None:
+            ref = _off_outputs(b, start, None)
+            assert _out_digest(ref) == OFF_GOLDEN[start], (
+                start, _out_digest(ref))
+        for word in OFF_WORDS:
+            got = _off_outputs(pit, start, word)
+            assert got["rc"] == [0] * len(GRID + AUG), (word, start)
+            if ref is not None:
+                assert got == ref, (word, start)
+            assert _out_digest(got) == OFF_GOLDEN[start], (word, start)
+    if b is not None:
+        # the base really does drop the 7 Aug captures (the defect P1 fixes)
+        rig = Rig(b)
+        runs = [rig.fire(ts, mode="slot") for ts in AUG]
+        assert [len(r["rows"]) for r in runs] == [3, 3, 0, 3]
 
 
 # ---------------------------------------------------------------- P3 -----
@@ -381,6 +436,12 @@ def test_p6_slot_keeps_the_guard_for_a_rerun_in_the_same_slot():
     assert details(again)["day_key"]["cross_slot_dups"] == 0
     nxt = rig.fire("2026-10-23T20:10:00", mode="slot")
     assert labels(nxt) == ["2026-10-24"] and len(nxt["rows"]) == 3
+    # an on-time re-run, where the slot label (not the wall clock) is the key
+    rig = Rig(pit)
+    on_time = rig.fire("2026-10-22T20:15:00", mode="slot")
+    rerun = rig.fire("2026-10-22T20:45:00", mode="slot")
+    assert labels(on_time) == ["2026-10-23"] and len(on_time["rows"]) == 3
+    assert rerun["rows"] == [] and "skipped_dup=3" in rerun["stderr"]
 
 
 # ---------------------------------------------------------------- P7 -----
@@ -477,6 +538,25 @@ def test_p11_slot_is_read_on_the_capture_clock():
                 assert row[0] == pit.slot_day_key(cap), row[:2]
         else:
             assert labels(first) == ["2026-10-21"]   # wall-clock at start
+
+
+# --------------------------------------------------------------- P12 -----
+def test_p12_disarm_exposes_the_next_on_time_run_once():
+    """The documented ROLLBACK limit: after a disarm, the next slot's run
+    fired on time takes the last slot label, whenever that slot run fired;
+    a late first run is unaffected."""
+    for last in ("2026-10-22T20:30:00", "2026-10-22T22:00:00"):
+        for disarm in (None, "observe"):
+            rig = Rig(pit)
+            armed = rig.fire(last, mode="slot")
+            on_time = rig.fire("2026-10-23T20:30:00", mode=disarm)
+            assert labels(armed) == ["2026-10-23"]
+            assert on_time["rows"] == [], (last, disarm)
+            assert "skipped_dup=3" in on_time["stderr"]
+            rig = Rig(pit)
+            rig.fire(last, mode="slot")
+            late = rig.fire("2026-10-23T21:30:00", mode=disarm)
+            assert labels(late) == ["2026-10-24"] and len(late["rows"]) == 3
 
 
 # ---------------------------------------------------------------- N1 -----
