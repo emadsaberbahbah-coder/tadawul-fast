@@ -111,7 +111,7 @@ ENV names are derived statically from each entry's expression and the functions 
 | `rel_path_tag` | `TFB_REL_PATH_TAG` | '' | 'off' | not recorded |
 | `crypto_pair_class` | `TFB_SYM_CRYPTO_PAIR_CLASS` | '' | 'off' | not recorded |
 | `scoring_settle` | `TFB_SCORING_SETTLE` | '' | 'off' | not recorded |
-| `scoring_settle_pages` | `TFB_SCORING_SETTLE_PAGES` | '' | - | not recorded |
+| `scoring_settle_pages` | `TFB_SCORING_SETTLE_PAGES` | '' | 'all' | not recorded |
 | `fc_tuple_coherent` | `TFB_FC_TUPLE_COHERENT` | '' | 'off' | not recorded |
 | `w52_ceiling_scrub` | `TFB_ENGINE_52W_CEILING_SCRUB` | '1' | 'on' | not recorded |
 | `eodhd_fund_cache` | `TFB_EODHD_FUND_CACHE` | '' | 'off' | not recorded |

@@ -41,9 +41,15 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import core.data_engine_v2 as de  # noqa: E402
+import core.scoring as _scoring  # noqa: E402
 
 ENV = "TFB_SCORING_SETTLE"
 MAX_ENV = "TFB_SCORING_SETTLE_MAX_PASSES"
+# v5.157.0 (F-7 v2): transient keys that never leave _f7_settle_pass, the
+# confidence keys core.scoring reuses, and its completeness-only flag.
+CONF_NOT_DATA = "_scoring_conf_not_data"
+TRANSIENT = ("_f7_conf_derived", "_f7_conf_synthetic", CONF_NOT_DATA)
+CONF_READ_KEYS = ("forecast_confidence", "ai_confidence", "confidence_score", "confidence")
 
 # 2026-10-11 (whole-tree order hygiene): _env() and _prep() set TFB_SCORING_SETTLE,
 # TFB_SCORING_SETTLE_MAX_PASSES and TFB_ENGINE_TARGET_KLG=1 and seed
@@ -421,10 +427,11 @@ def _norm(row):
     r = dict(row)
     for k in VOLATILE:
         r.pop(k, None)
-    # v5.157.0 (F-7 v2): the transient _f7_conf_derived marker lives between
-    # pass-1 scoring and _f7_settle_pass (which strips it on every return), so
-    # a pass-1 snapshot may carry it while no published row ever does.
-    r.pop("_f7_conf_derived", None)
+    # v5.157.0 (F-7 v2): the transient provenance markers live between pass-1
+    # scoring and _f7_settle_pass (which strips them on every return), so a
+    # pass-1 snapshot may carry one while no published row ever does.
+    for k in TRANSIENT:
+        r.pop(k, None)
     w = r.get("warnings")
     if w in (None, ""):
         r["warnings"] = ""
@@ -452,18 +459,41 @@ def _differs(a, b):
     return False
 
 
-def _golden(row, max_passes):
-    """Independent settle loop: same fields, same tolerances, same return rule."""
+def _conf_blank(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _scorer_derives_confidence(source):
+    """v5.157.0 (F-7 v2): decided from the fixture INPUT, never from the
+    engine's marker - every confidence key the scorer could reuse is absent /
+    None / blank, and core.scoring supplies a confidence for the input."""
+    if any(not _conf_blank(source.get(k)) for k in CONF_READ_KEYS):
+        return False
+    patch = _scoring.compute_scores(de._apply_phase_bb_sanity(copy.deepcopy(source)))
+    return de._as_float(patch.get("forecast_confidence")) is not None
+
+
+def _golden(row, max_passes, source=None):
+    """Independent settle loop: same fields, same tolerances, same return rule.
+    v5.157.0 (F-7 v2): `source` is the fixture input. When it carried no
+    confidence and the scorer derives one, every settle pass re-derives it: on
+    a provider-target row the scorer's confidence keys are cleared before the
+    re-score; on a phase_ii_synthetic row Phase-II's confidence is kept and
+    scored as no data (core.scoring _scoring_conf_not_data, scoring only).
+    Without `source` the v5.156.0 loop runs."""
+    derived = source is not None and _scorer_derives_confidence(source)
     prev, last, first = row, row, None
     for k in range(2, max_passes + 1):
         cand = copy.deepcopy(prev)
-        # v5.157.0 (F-7 v2) [F7-CONF-RECOMPUTE]: a confidence the scorer derived
-        # on pass 1 (marker set) is re-derived on every settle pass, not reused.
-        if cand.get("_f7_conf_derived"):
+        if derived and de._safe_str(prev.get("forecast_source")).strip().lower() == "phase_ii_synthetic":
+            cand[CONF_NOT_DATA] = True
+        elif derived:
             for key in ("forecast_confidence", "confidence_score", "confidence_bucket"):
                 if key in cand:
                     cand[key] = None
-        _pair(cand)
+        de._compute_scores_canonical_first(cand)
+        cand.pop(CONF_NOT_DATA, None)
+        de._apply_phase_dd_enhancements(cand)
         d = _differs(prev, cand)
         if first is None:
             first = d
@@ -534,7 +564,7 @@ def test_t5_enforce_equals_independent_golden():
     for fx in FIXTURES:
         row = _prep(fx)
         base = copy.deepcopy(row)
-        golden = _golden(copy.deepcopy(base), 4)
+        golden = _golden(copy.deepcopy(base), 4, fx["row"])
         out = de._f7_settle_pass(row, row["symbol"], "Global_Markets")
         assert _norm(out) == _norm(golden), fx["row"]["symbol"]
         tags = _tags(out)
@@ -725,7 +755,7 @@ def test_t6h_stable_results_preserve_independent_golden_scores():
     for fx in FIXTURES:
         row = _prep(fx)
         before = copy.deepcopy(row)
-        golden = _golden(copy.deepcopy(row), 4)
+        golden = _golden(copy.deepcopy(row), 4, fx["row"])
         result = de._f7_settle_result(row)
         assert result.status == "stable" and result.settled_at is not None
         assert _norm(result.row) == _norm(golden)
@@ -858,7 +888,8 @@ def test_t7_tag_composer_degrades_on_forbidden_substring():
 
 def test_t8_wiring_and_version():
     src = inspect.getsource(de)
-    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx)") == 1
+    # v5.157.0 (F-7 v2) FIX-3: the call site passes the market scope page
+    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym, page_ctx))") == 1
     assert src.count('"scoring_settle": _f7_settle_mode(),') == 1
     # v5.148.0: the boot-line literal grows a leg per gate; check the leg, not the line
     assert src.count("scoring_settle=%s") == 1

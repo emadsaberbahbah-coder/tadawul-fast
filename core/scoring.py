@@ -2,11 +2,24 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.11.4
+Scoring Module — v5.11.5
 FULL REVISED VERSION / CONFIDENCE-PENALTY-NEUTRAL-POINT
 ================================================================================
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
 (Top changelog condensed for working copy; code + inline comments verbatim.)
+
+WHY v5.11.5 (data_engine_v2 v5.157.0, F-7 v2 FIX-1): _completeness_factor
+counts forecast_confidence as a present core field. On a row whose input
+carried no confidence, the engine's settle passes saw the engine's OWN
+confidence as data (+1/22 completeness, +1.02 quality, about +0.2 overall)
+- on phase_ii_synthetic rows only, because the scorer-derived confidence on
+provider-target rows is already re-derived from scratch there. One flag,
+_CONF_NOT_DATA_FLAG ("_scoring_conf_not_data"), set by the engine on one
+settle iterate at a time and removed right after scoring, makes
+_completeness_factor treat forecast_confidence as ABSENT (same 22-field
+denominator). Nothing else reads it. Flag absent -> every value is
+byte-identical to v5.11.4 except the version labels this module stamps
+(scoring_schema_version, recommendation_source "scoring.py v5.11.5").
 
 WHY v5.11.4 (WP-03): the 2026-10-10 workbook publishes zero forecast
 prices for SHIB-USD (5.47e-6) and COMP-USD through fixed four-decimal
@@ -307,7 +320,13 @@ logger.addHandler(logging.NullHandler())
 # v5.11.3: value-bound margin receipts determine the economic unit for quality
 # scoring. Absent receipts keep the legacy parser; explicit invalid receipts
 # contribute no margin. Source values and all score thresholds stay unchanged.
-__version__ = "5.11.4"
+# v5.11.5 (2026-10-22, data_engine_v2 v5.157.0 F-7 v2): _completeness_factor
+# counts forecast_confidence as absent when the row carries the transient
+# _CONF_NOT_DATA_FLAG (see WHY v5.11.5). No other reader; flag absent ->
+# every score byte-identical to v5.11.4. Functions added 0, removed 0.
+__version__ = "5.11.5"
+# The one scoring-visible F-7 settle flag; read only by _completeness_factor.
+_CONF_NOT_DATA_FLAG = "_scoring_conf_not_data"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -1663,7 +1682,13 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
         "volatility_30d", "volatility_90d", "expected_roi_3m", "forecast_price_3m",
         "forecast_confidence",
     ]
-    present = sum(1 for k in core_fields if row.get(k) not in (None, "", [], {}))
+    # v5.11.5 (F-7 v2): an engine-made confidence on a row whose input had none
+    # is not data. The flag is set by data_engine_v2's settle loop on one
+    # iterate only; flag absent -> the v5.11.4 count exactly. Same denominator.
+    conf_not_data = bool(row.get(_CONF_NOT_DATA_FLAG))
+    present = sum(1 for k in core_fields
+                  if row.get(k) not in (None, "", [], {})
+                  and not (conf_not_data and k == "forecast_confidence"))
     return present / max(1, len(core_fields))
 
 
