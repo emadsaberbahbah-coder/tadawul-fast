@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
+#
+# v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
+# f7_settle tag discloses pass 1 -> final; TFB_SCORING_SETTLE_PAGES scopes
+# enforce by the symbol's inferred market page; the settle trajectory is
+# v5.156.0's) next to tests/test_de_f7_scoring_settle.py in the lean model
+# lane and the heavy scoring-settle step. Offline; real engine module,
+# fixtures and orchestrator. Its base identity comparisons and golden
+# negative need TFB_F7V2_BASE and skip in CI.
+#
 # VERSION 1.1.31 (2026-10-22) -- LEARNING-METRIC DEFINITIONS
 #
 # v1.1.31: run tests/test_learning_metric_fixes.py (track_performance v6.46.0:
@@ -779,6 +789,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
+            tests/test_de_f7_settle_v2.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_pf_weight_subunit_fx.py \
             tests/test_pf_weight_value_complete.py
@@ -913,6 +924,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
+            tests/test_de_f7_settle_v2.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
 
