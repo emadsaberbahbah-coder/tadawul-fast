@@ -4,12 +4,13 @@
 # ============================================================================
 # VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
 #
-# v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: settle
-# passes re-derive a scorer-derived confidence, the f7_settle tag discloses
-# pass 1 -> final, TFB_SCORING_SETTLE_PAGES scopes enforce) next to
-# tests/test_de_f7_scoring_settle.py in the lean model lane and the heavy
-# scoring-settle step. Offline; real engine module and fixtures. Its base
-# comparisons and golden negative need TFB_F7V2_BASE and skip in CI.
+# v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
+# f7_settle tag discloses pass 1 -> final; TFB_SCORING_SETTLE_PAGES scopes
+# enforce by the symbol's inferred market page; the settle trajectory is
+# v5.156.0's) next to tests/test_de_f7_scoring_settle.py in the lean model
+# lane and the heavy scoring-settle step. Offline; real engine module,
+# fixtures and orchestrator. Its base identity comparisons and golden
+# negative need TFB_F7V2_BASE and skip in CI.
 #
 # VERSION 1.1.31 (2026-10-22) -- LEARNING-METRIC DEFINITIONS
 #

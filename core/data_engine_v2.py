@@ -5,11 +5,12 @@
 Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
 ================================================================================
 
-WHY v5.157.0 - F-7 v2: SETTLE RE-DERIVES ENGINE-MADE CONFIDENCE, FINAL-PASS TAG,
-PAGE SCOPE BY MARKET (core.scoring 5.11.5; TFB_SCORING_SETTLE unchanged, new
-TFB_SCORING_SETTLE_PAGES; with TFB_SCORING_SETTLE off every row is identical
-to v5.156.0 except the scorer's own version labels, scoring_schema_version
-and recommendation_source, 5.11.4 -> 5.11.5)
+WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
+(TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
+untouched at 5.11.4. The settle trajectory - passes, convergence status,
+held-back rows and every published value - is v5.156.0's in every mode: only
+the f7_settle tag's field disclosures change, and enforce = v5.156.0 enforce
++ scope. With TFB_SCORING_SETTLE off every row is byte-identical to v5.156.0.)
 - EVIDENCE (21/22 Oct exports, independent review): three gaps block arming
   enforce. G1: core.scoring.compute_confidence_score REUSES any existing
   forecast_confidence / ai_confidence / confidence_score / confidence. A cold
@@ -21,101 +22,78 @@ and recommendation_source, 5.11.4 -> 5.11.5)
   1 -> pass 2 (first_diff), not what enforce publishes for rows that settle at
   pass 3/4 (41% of GM rows), and at most 6 fields, sometimes hiding os=. G3:
   Market_Leaders churns more day to day under settlement (input churn, not
-  pass order), so enforce must be scopable by page.
-- [F7-CONF-RECOMPUTE] RULE: an engine-made confidence is never a completeness
-  field when the input had none. Transient marker _f7_conf_derived, created
-  only while TFB_SCORING_SETTLE != off: on a non-settlement call
-  _compute_scores_canonical_first marks a row that carried no confidence (all
-  four keys absent, None or blank, so the scorer certainly derived it) when
-  the canonical patch supplied forecast_confidence. Provider-target iterates:
-  _f7_settle_result clears forecast_confidence, confidence_score and
-  confidence_bucket before each re-score (None in place: core.scoring reads
-  None as absent; the keys keep their position) and the scorer re-derives
-  them from the completed fields. Synthetic iterates (FIX-1): the Phase-II
-  writer, which OWNS confidence on phase_ii_synthetic rows, turns the marker
-  into _f7_conf_synthetic; the settle passes KEEP Phase-II's value but set
-  core.scoring's _scoring_conf_not_data around that iterate's re-score only,
-  so _completeness_factor counts it as absent (same 22-field denominator; no
-  other scoring reader). A confidence the INPUT carried creates no marker and
-  settles exactly as v5.156.0, synthetic rows included. Twins from the
-  2026-09-22 export rows (cold = target restored inside Phase-II, warm = the
-  same target at ingestion): SUBC.OL settled confidence 0.6323 -> 0.6641 =
-  warm; published reliability (recalibrated gate) 74.3 -> 76.5 = warm with
-  the real in-band target, 69.3 -> 71.5 = warm with a +40% (soft-capped)
-  target; FCN.US 0.6164 -> 0.6482, soft-capped 68.1 -> 70.4 (across the 70
-  floor). Synthetic and provider twins of the same data (BRK-B.US, SKG.L) now
-  settle to the same quality_score.
-- ENFORCE IMPACT vs 5.156.0 enforce: quality_score -1.02 (0.45 x 1/22 x 0.5 x
-  100) on every marked row is an ALIGNMENT with the pass-1 / observe basis
-  (the settled quality now equals the quality scored with the engine's own
-  confidence absent), not a loss. Six F-7 fixtures: BNY.US quality 60.02 ->
-  59.00, overall 47.72 -> 47.52; 3328.HK 89.00 -> 87.98, 69.51 -> 69.30;
-  SUBC.OL 64.31 -> 63.29, 51.59 -> 51.39; FCN.US 50.33 -> 49.30, 48.73 ->
-  48.54; BRK-B.US 68.56 -> 67.53, 58.96 -> 58.75; SKG.L 50.29 -> 49.27,
-  65.28 -> 65.08; no recommendation change on these six. Offline sweep (893
-  cases: the six fixtures and the 2026-10-05 DT10 page rows x 14 target
-  multiples x target at ingestion / restored in Phase-II, plus 25 DT10 rows as
-  exported; 840 provider-marked, 53 synthetic-marked): convergence status
-  unchanged on all 893 at TFB_SCORING_SETTLE_MAX_PASSES 4; recommendations
-  differ from 5.156.0 enforce on 27 (all provider-marked, e.g. REDUCE ->
-  SELL, HOLD -> ACCUMULATE / BUY); vs pass 1 (what observe publishes today)
-  enforce moves the recommendation on 181 (5.156.0: 177). At MAX_PASSES 3 one
-  synthetic row (4050.SR) settles at pass 3 where 5.156.0 hit pass_limit.
-- SETTLED AT PASS 2: a row whose only pass-2 movement was the scorer counting
-  its own pass-1 confidence now settles at pass 2 and carries NO tag; under
-  enforce it publishes the pass-1 row (today's observe values). Sweep: 140 of
-  893 (observe-tagged 893 -> 753); FIX-1 applies the same to synthetic rows.
-- HELD-BACK ROWS (error / non_converged): the scoring_settlement JSON
-  first_diff / last_diff text can change (an fcf entry, other ov values);
-  status and reason - what the parsers read - are unaffected.
-- The transient keys are never published: _f7_settle_pass strips the markers
-  and the scoring flag on every return path (failed-row early return, off,
-  error / non_converged holdback, unresolved observe / enforce, stable at
-  pass 2, the settled iterate), _f7_settle_result strips them from a settled
-  iterate, and the only scoring call not followed by _f7_settle_pass, the
-  test-only delegator _compute_scores_fallback, strips them too. A PUBLISHED
-  row carries no provenance, so if it were settled again its confidence would
-  count as input data; production never does that (only fresh factory rows
-  reach _f7_settle_pass; a snapshot-fallback row brings its confidence as
-  input and settles as v5.156.0).
-- [F7-FINAL-TAG] F7SettlementResult.final_diff (frozen pass-1 row -> settled
-  row). The f7_settle:<mode>:st<k>:p<n> tag now discloses pass 1 -> FINAL,
-  i.e. the values enforce publishes, for up to 8 fields in the order ov op os
-  rc va fcf r12 fs; the substring-safety degrade (:chg<n>) is unchanged. A
-  row is tagged when pass 2 differs from pass 1; because tolerances are not
-  transitive, pass 1 -> final can net inside them, and the tag then carries
-  no field (f7_settle:<mode>:st<k>:p<n>) - expected. first_diff / last_diff
-  stay in the result and in the scoring_settlement JSON. Readers of ov= /
-  rc= deltas (scripts/tfb_workbook_dq_audit.py DQ-37) now count pass 1 ->
-  final instead of pass 1 -> pass 2.
-- [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated page names, each
-  canonicalized with _canonicalize_sheet_name ("Global Markets",
-  "global-markets", "GLOBAL_MARKETS" -> Global_Markets; FIX-2). Unset, empty,
-  "*" or "all" = every page (byte-identical). A name that is not a key of
-  STATIC_CANONICAL_SHEET_CONTRACTS is ignored and logged once at WARNING; a
-  list of only such names scopes enforce to NO page (fail-safe). Under
-  enforce a row whose scope page is not listed is handled exactly as observe
-  (pass-1 row published, observe tag). The scope page is the symbol's MARKET
-  page (FIX-3): the orchestrator passes scope_page=self._f7_scope_page(sym,
-  page_ctx) - a market page (Global_Markets / Market_Leaders /
-  Commodities_FX / Mutual_Funds) passes through, any other context
-  (My_Portfolio, Top_10_Investments, ...) resolves the market page as a
-  page-less fetch does (_resolve_quote_page_context(sym, "")), so a symbol is
-  never settled on one surface and pass-1 on another; only the four market
-  page names are effective there. Disclosed as scoring_settle_pages in
-  /health engine_gates and the [GUARDS] boot line: "all", "none" or the
-  canonical list.
-- Functions added 6 (_f7_settle_pages, _f7_settle_pages_label,
-  _f7_settle_page_in_scope, _f7_conf_unset, _f7_conf_marker_strip,
-  DataEngineV5._f7_scope_page); changed: _f7_settle_tag, _f7_settle_result,
-  _f7_settle_pass (+ scope_page), _compute_scores_canonical_first,
-  _compute_scores_fallback, _phase_ii_quality_forecast, surface_gate_states,
-  the orchestrator call site and the [GUARDS] boot line (DataEngineV5);
-  F7SettlementResult gains final_diff; constants added 11; removed 0.
-  core.scoring 5.11.5: _completeness_factor reads _CONF_NOT_DATA_FLAG; added
-  0, removed 0. Tests: tests/test_de_f7_settle_v2.py. Rollback: unset
-  TFB_SCORING_SETTLE_PAGES and keep TFB_SCORING_SETTLE at observe (or off), or
-  git revert. Enforce is NOT armed by this change.
+  pass order), so enforce must be scopable.
+- [F7-CONF-RECOMPUTE] (G1) DEFERRED. Re-deriving the scorer's own confidence
+  on the settle passes changes the settle TRAJECTORY (the pass a row settles
+  at, and whether it converges within TFB_SCORING_SETTLE_MAX_PASSES), so it
+  can change which rows observe holds back: the review found rows v5.156.0
+  publishes (e.g. a Commodities_FX ALGO-USD variant, overall 42.85, tag
+  st4:p3) turning non_converged and withheld. A dual-trajectory observe design
+  (publish and hold back on the v5.156.0 trajectory, measure the re-derived
+  one beside it) is planned instead.
+- KNOWN RESIDUALS under enforce (exactly v5.156.0 enforce): (1) the cold vs
+  warm confidence 0.6323 / 0.6641 is reused, so a soft-capped cold row can
+  publish forecast reliability 69.3 where its warm twin publishes 71.5 (the
+  board floor is 70); (2) from pass 2 on every row counts its own pass-1
+  confidence as a completeness field: quality_score +1.02 vs pass 1 (0.45 x
+  1/22 x 0.5 x 100), symmetric for provider-target and synthetic rows.
+- [F7-FINAL-TAG] (G2) F7SettlementResult.final_diff (frozen pass-1 row ->
+  settled row; stable results only; disclosure, never a verdict). The
+  f7_settle:<mode>:st<k>:p<n> tag now discloses pass 1 -> FINAL, i.e. the
+  values enforce publishes, for up to 8 fields in the order ov op os rc va
+  fcf r12 fs; the substring-safety degrade (:chg<n>) is unchanged. WHICH rows
+  carry a tag is unchanged (pass 2 differs from pass 1); because tolerances
+  are not transitive, pass 1 -> final can net inside them, and the tag then
+  carries no field (f7_settle:<mode>:st<k>:p<n>) - expected. first_diff /
+  last_diff stay in the result and in the scoring_settlement JSON of
+  held-back rows (unchanged). Readers of ov= / rc= deltas
+  (scripts/tfb_workbook_dq_audit.py DQ-37) now count pass 1 -> final instead
+  of pass 1 -> pass 2.
+- [F7-PAGE-SCOPE] (G3) TFB_SCORING_SETTLE_PAGES: comma-separated MARKET page
+  names, each canonicalized with _canonicalize_sheet_name ("Global Markets",
+  "global-markets", "GLOBAL_MARKETS" -> Global_Markets). Unset, empty, "*" or
+  "all" = every row (v5.156.0). The only valid entries are Global_Markets,
+  Market_Leaders, Commodities_FX and Mutual_Funds; any other name -
+  My_Portfolio, Top_10_Investments, another sheet, a typo - is ignored and
+  logged once at WARNING, and a list of only such names scopes enforce to NO
+  row ("none", fail-safe). The scope key of EVERY row is its symbol's
+  INFERRED market page, whatever page requested it (its market page,
+  My_Portfolio, Top_10_Investments or none): the orchestrator passes
+  scope_page=self._f7_scope_page(sym), i.e. _resolve_quote_page_context(sym,
+  "")[0], exactly as a page-less fetch resolves it: =X / =F ->
+  Commodities_FX; an _ETF_SYMBOL_HINTS symbol (SPY QQQ VTI VOO IWM DIA IVV
+  EFA EEM ARKK) -> Mutual_Funds; .SR or a 4-digit code -> Market_Leaders;
+  everything else -> Global_Markets. So FUNDS AND CRYPTO PAIRS WITHOUT AN ETF
+  HINT COUNT AS GLOBAL_MARKETS (SPLG, CZAR.US, SUI-USD, ALGO-USD, even on the
+  Mutual_Funds / Commodities_FX pages; of the ten 2026-10-05 Commodities_FX
+  rows only QG=F infers to Commodities_FX), and one symbol is settled, or
+  not, identically on every surface. Realistic settings: unset / "all", or
+  "Global_Markets,Commodities_FX,Mutual_Funds" (every row except .SR /
+  4-digit symbols). Under enforce an out-of-scope row is handled exactly as
+  observe (pass-1 row published, observe tag); error / non_converged rows are
+  held back in and out of scope. Disclosed as scoring_settle_pages in /health
+  engine_gates and the [GUARDS] boot line: "all", "none" or the canonical
+  list.
+- MEASURED vs v5.156.0 (the review's offline harness, 1,736 cases: the six
+  F-7 fixtures and 25 priced DT10 2026-10-05 rows, each x 14 target multiples
+  at ingestion / restored in Phase-II, x 25 price x RSI synthetic variants
+  and x 3 input-confidence variants; TFB_SCORING_SETTLE_MAX_PASSES 4 and 3):
+  settle status, settled_at, pass count, reason and first / last diff
+  identical on every case (MAX_PASSES 4: 1,003 stable at pass 3, 733 at pass
+  4; MAX_PASSES 3: 1,003 stable, 733 non_converged pass_limit, held back
+  identically); published rows identical except the tag's field disclosures
+  in observe, enforce, enforce in scope (= v5.156.0 enforce), enforce out of
+  scope (= v5.156.0 observe) and scoped observe; tag presence and st / p
+  prefix identical; off byte-identical including the scorer labels. The
+  disclosure text differs on 1,335 cases at MAX_PASSES 4 and 602 at 3.
+- Functions added 4 (_f7_settle_pages, _f7_settle_pages_label,
+  _f7_settle_page_in_scope, DataEngineV5._f7_scope_page); changed:
+  _f7_settle_tag, _f7_settle_result (final_diff only), _f7_settle_pass (+
+  scope_page), surface_gate_states, the orchestrator call site and the
+  [GUARDS] boot line (DataEngineV5); F7SettlementResult gains final_diff;
+  constants added 5; removed 0. Tests: tests/test_de_f7_settle_v2.py.
+  Rollback: unset TFB_SCORING_SETTLE_PAGES and keep TFB_SCORING_SETTLE at
+  observe (or off), or git revert. Enforce is NOT armed by this change.
 
 WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
 - _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
@@ -4297,15 +4275,13 @@ from core.financial_units import (
 #     file under their distinct codes (GBX / ZAC / ILA), which the per-row
 #     lookup already reads as SAR per subunit.
 # Tests: tests/test_pf_weight_value_complete.py.
-# v5.157.0 (2026-10-22): F-7 v2 (see WHY v5.157.0). [F7-CONF-RECOMPUTE] an
-#   engine-made confidence is never a completeness field when the input had
-#   none: settle passes re-derive the scorer's (provider-target rows) or keep
-#   Phase-II's but score it as absent (synthetic rows, core.scoring 5.11.5);
-#   [F7-FINAL-TAG] the f7_settle tag discloses pass 1 -> final (8 fields, ov op
-#   os rc va fcf r12 fs; rows settled at pass 2 carry none); [F7-PAGE-SCOPE]
-#   TFB_SCORING_SETTLE_PAGES (canonical page names) limits where enforce
-#   publishes, decided by the symbol's market page. Off: rows identical
-#   except the scorer's version labels. Tests: tests/test_de_f7_settle_v2.py.
+# v5.157.0 (2026-10-22): F-7 v2 (see WHY v5.157.0). [F7-FINAL-TAG] the
+#   f7_settle tag discloses pass 1 -> final (up to 8 fields, ov op os rc va fcf
+#   r12 fs); [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES (market pages only,
+#   canonicalized) limits where enforce publishes, decided by the symbol's
+#   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
+#   settle trajectory, status and published values are v5.156.0's; off is
+#   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
 __version__ = "5.157.0"
 
 from core.sheet_presentation import present_instrument_row
@@ -9766,28 +9742,13 @@ _F7_SETTLE_DEPENDENT_FIELDS: Tuple[str, ...] = (
     "momentum_score", "growth_score", "technical_score", "conviction_score",
     "sector_relative_score", "rank_overall", "top10_rank", "top_factors",
 )
-# v5.157.0 (F-7 v2) [F7-CONF-RECOMPUTE] (see WHY v5.157.0): transient
-# provenance marker for a confidence the canonical scorer DERIVED on pass 1.
-# Created only while TFB_SCORING_SETTLE != off and never published.
-_F7_CONF_DERIVED_KEY: str = "_f7_conf_derived"
-# The keys core.scoring.compute_confidence_score reuses when one carries a value.
-_F7_CONF_READ_KEYS: Tuple[str, ...] = ("forecast_confidence", "ai_confidence", "confidence_score", "confidence")
-# The confidence keys the canonical scorer writes; cleared on a marked iterate.
-_F7_CONF_SCORER_KEYS: Tuple[str, ...] = ("forecast_confidence", "confidence_score", "confidence_bucket")
-# v5.157.0 FIX-1: the derived marker becomes this one when the Phase-II
-# synthetic writer replaces the scorer's confidence with its own (input had none).
-_F7_CONF_SYNTH_KEY: str = "_f7_conf_synthetic"
-# v5.157.0 FIX-1: core.scoring (5.11.5) _CONF_NOT_DATA_FLAG - set on ONE settle
-# iterate around its re-score only; _completeness_factor then counts
-# forecast_confidence as absent (the pass-1 / observe basis).
-_F7_SCORING_CONF_NOT_DATA: str = "_scoring_conf_not_data"
-# Every transient F-7 v2 key; none is ever published.
-_F7_CONF_TRANSIENT_KEYS: Tuple[str, ...] = (_F7_CONF_DERIVED_KEY, _F7_CONF_SYNTH_KEY, _F7_SCORING_CONF_NOT_DATA)
-# v5.157.0 [F7-PAGE-SCOPE]: pages on which TFB_SCORING_SETTLE=enforce may publish.
+# v5.157.0 (F-7 v2) [F7-PAGE-SCOPE] (see WHY v5.157.0): the markets on which
+# TFB_SCORING_SETTLE=enforce may publish a settled row.
 _F7_SETTLE_PAGES_ENV: str = "TFB_SCORING_SETTLE_PAGES"
-# FIX-2: unknown names already reported (one WARNING per distinct set per process).
+# Ignored names already reported (one WARNING per distinct set per process).
 _F7_SETTLE_PAGES_WARNED: Set[Tuple[str, ...]] = set()
-# FIX-3: the market pages; any other context is scoped by the symbol's market page.
+# The only valid scope entries: the market pages a symbol is inferred to
+# (DataEngineV5._f7_scope_page). Any other name is ignored.
 _F7_MARKET_PAGES: Tuple[str, ...] = ("Global_Markets", "Market_Leaders", "Commodities_FX", "Mutual_Funds")
 # v5.157.0 [F7-FINAL-TAG]: tag disclosure order (codes of _F7_SETTLE_FIELDS) and limit.
 _F7_SETTLE_TAG_ORDER: Tuple[str, ...] = ("ov", "op", "os", "rc", "va", "fcf", "r12", "fs")
@@ -10064,39 +10025,41 @@ def _f7_settle_max_passes() -> int:
 
 
 def _f7_settle_pages() -> Optional[Tuple[str, ...]]:
-    """v5.157.0 [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated page
-    names, each canonicalized with _canonicalize_sheet_name ("Global Markets",
-    "global-markets", "GLOBAL_MARKETS" -> Global_Markets). None = every page
-    (unset, empty, "*" or "all": the v5.156.0 behaviour). Otherwise the
-    canonical names that are keys of STATIC_CANONICAL_SHEET_CONTRACTS, in order,
-    de-duplicated; an unknown name is ignored and logged once at WARNING, so a
-    list of only unknown names scopes enforce to NO page (fail-safe, disclosed
-    as "none"). Read at call time (no restart needed)."""
+    """v5.157.0 [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated
+    MARKET page names, each canonicalized with _canonicalize_sheet_name
+    ("Global Markets", "global-markets", "GLOBAL_MARKETS" -> Global_Markets).
+    None = every market (unset, empty, "*" or "all": the v5.156.0 behaviour).
+    Otherwise the listed names that canonicalize to one of _F7_MARKET_PAGES
+    (Global_Markets, Market_Leaders, Commodities_FX, Mutual_Funds), in order,
+    de-duplicated. Any other name (My_Portfolio, Top_10_Investments, a typo)
+    is ignored and logged once at WARNING, so a list of only such names scopes
+    enforce to NO row (fail-safe, disclosed as "none"). Read at call time."""
     names = [p.strip() for p in (os.getenv(_F7_SETTLE_PAGES_ENV) or "").split(",") if p.strip()]
     if not names or any(name.lower() in ("*", "all") for name in names):
         return None
     pages: List[str] = []
-    unknown: List[str] = []
+    ignored: List[str] = []
     for name in names:
         canon = _canonicalize_sheet_name(name)
-        if canon in STATIC_CANONICAL_SHEET_CONTRACTS:
+        if canon in _F7_MARKET_PAGES:
             if canon not in pages:
                 pages.append(canon)
         else:
-            unknown.append(name)
-    if unknown and tuple(unknown) not in _F7_SETTLE_PAGES_WARNED:
-        _F7_SETTLE_PAGES_WARNED.add(tuple(unknown))
+            ignored.append(name)
+    if ignored and tuple(ignored) not in _F7_SETTLE_PAGES_WARNED:
+        _F7_SETTLE_PAGES_WARNED.add(tuple(ignored))
         logger.warning(
-            "[engine_v2 v%s F-7] %s: ignoring unknown page name(s) %s; enforce scope = %s",
-            __version__, _F7_SETTLE_PAGES_ENV, ", ".join(unknown), ",".join(pages) or "none",
+            "[engine_v2 v%s F-7] %s: ignoring %s (valid: %s); enforce scope = %s",
+            __version__, _F7_SETTLE_PAGES_ENV, ", ".join(ignored), ", ".join(_F7_MARKET_PAGES),
+            ",".join(pages) or "none",
         )
     return tuple(pages)
 
 
 def _f7_settle_pages_label() -> str:
     """v5.157.0: the scope as disclosed in /health engine_gates and the
-    [GUARDS] boot line: "all" = every page, "none" = no valid page listed,
-    else the canonical page names."""
+    [GUARDS] boot line: "all" = every market, "none" = no valid market page
+    listed, else the canonical market page names."""
     pages = _f7_settle_pages()
     if pages is None:
         return "all"
@@ -10104,38 +10067,16 @@ def _f7_settle_pages_label() -> str:
 
 
 def _f7_settle_page_in_scope(page: Any) -> bool:
-    """v5.157.0: may TFB_SCORING_SETTLE=enforce publish a settled row for this
-    (canonicalized) page? True with no scope configured; otherwise only for a
-    listed page (a blank page is never listed). Out of scope, enforce is
-    handled as observe. The orchestrator passes the symbol's MARKET page (see
-    DataEngineV5._f7_scope_page)."""
+    """v5.157.0: may TFB_SCORING_SETTLE=enforce publish a settled row whose
+    scope page (canonicalized) is this? True with no scope configured;
+    otherwise only for a listed market page (a blank page is never listed).
+    Out of scope, enforce is handled as observe. The orchestrator passes the
+    symbol's INFERRED market page (DataEngineV5._f7_scope_page), whatever the
+    requesting page."""
     pages = _f7_settle_pages()
     if pages is None:
         return True
     return _canonicalize_sheet_name(_safe_str(page).strip()) in pages
-
-
-def _f7_conf_unset(row: Mapping[str, Any]) -> bool:
-    """v5.157.0 [F7-CONF-RECOMPUTE]: True when none of the confidence keys
-    core.scoring.compute_confidence_score could reuse carries a value (each is
-    absent, None or blank), so the scorer certainly DERIVES the confidence from
-    data completeness. Conservative: any non-blank value reads as set, so a
-    reused confidence is never marked."""
-    for key in _F7_CONF_READ_KEYS:
-        value = row.get(key)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        return False
-    return True
-
-
-def _f7_conf_marker_strip(row: Any) -> None:
-    """v5.157.0 [F7-CONF-RECOMPUTE]: the provenance markers (derived /
-    synthetic) and the scoring flag never leave _f7_settle_pass. A row
-    without them is untouched (pop of a missing key changes nothing)."""
-    if isinstance(row, dict):
-        for key in _F7_CONF_TRANSIENT_KEYS:
-            row.pop(key, None)
 
 
 def _f7_settle_token(value: Any) -> str:
@@ -10240,22 +10181,7 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                           reason="intrinsic_model_basis_unproven")
             if model_values is not None:
                 cand["intrinsic_value"], cand["upside_pct"] = model_values
-            # v5.157.0 [F7-CONF-RECOMPUTE]: a confidence the scorer DERIVED on
-            # a cold pass 1 is re-derived from the completed fields instead of
-            # reused. None reads as absent to core.scoring; keys keep position.
-            if cand.get(_F7_CONF_DERIVED_KEY):
-                for key in _F7_CONF_SCORER_KEYS:
-                    if key in cand:
-                        cand[key] = None
-            # v5.157.0 FIX-1: Phase-II's confidence on a synthetic row whose
-            # input had none is kept, but core.scoring's _completeness_factor
-            # counts it as absent on this re-score only (the pass-1 basis).
-            if cand.get(_F7_CONF_SYNTH_KEY):
-                cand[_F7_SCORING_CONF_NOT_DATA] = True
-            try:
-                _compute_scores_canonical_first(cand)
-            finally:
-                cand.pop(_F7_SCORING_CONF_NOT_DATA, None)
+            _compute_scores_canonical_first(cand)
             if model_values is not None:
                 # The canonical patch rounds its display upside independently;
                 # Phase-II must consume the same witnessed raw tuple as scoring.
@@ -10279,7 +10205,6 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 final_diff: Tuple[Tuple[str, str, str], ...] = ()
                 if stable_row is not row:
                     _cap_intrinsic_display(stable_row)
-                    _f7_conf_marker_strip(stable_row)
                     # v5.157.0 [F7-FINAL-TAG]: disclosure only, never a verdict.
                     final_diff = tuple(_f7_settle_diff(frozen_input, stable_row))
                 return F7SettlementResult("stable", stable_row, k, passes_run, first_diff,
@@ -10303,29 +10228,23 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
     Off leaves unmarked rows unchanged. Observe keeps successful pass-1 values
     and Enforce publishes a proved stable row. Neither mode nor a later switch
     to Off can turn a known error/non-convergence into valid scores or funding.
-    v5.157.0 (F-7 v2): the transient F-7 keys are stripped on every return
-    path; Enforce runs as Observe when scope_page (default None = page) is not
-    in TFB_SCORING_SETTLE_PAGES; the tag discloses pass 1 -> FINAL.
+    v5.157.0 (F-7 v2): Enforce runs as Observe when scope_page (default None =
+    page) is not in TFB_SCORING_SETTLE_PAGES; the orchestrator passes the
+    symbol's inferred market page. The tag discloses pass 1 -> FINAL. The
+    settle trajectory (passes, status, values) is v5.156.0's.
     """
     if not isinstance(row, dict):
         return row
     if _f7_settle_failed(row):
-        _f7_conf_marker_strip(row)
         _f7_settle_holdback(row)
         return row
     mode = _f7_settle_mode()
     if mode == "off":
-        _f7_conf_marker_strip(row)  # no-op unless the mode flipped after pass 1
         return row
-    # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe;
-    # the orchestrator scopes by the symbol's market page (FIX-3).
+    # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe.
     if mode == "enforce" and not _f7_settle_page_in_scope(page if scope_page is None else scope_page):
         mode = "observe"
     result = _f7_settle_result(row)
-    # v5.157.0 [F7-CONF-RECOMPUTE]: the iterates were copies; the marker is done.
-    _f7_conf_marker_strip(row)
-    if result.row is not None and result.row is not row:
-        _f7_conf_marker_strip(result.row)
     if result.status != "stable":
         # v5.153.0 (WP-2b): only a non_converged result consults
         # TFB_SETTLE_UNRESOLVED; status error stays fail-closed in every mode.
@@ -10801,14 +10720,6 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
         row["confidence_bucket"] = "MODERATE"
     else:
         row["confidence_bucket"] = "LOW"
-    # v5.157.0 [F7-CONF-RECOMPUTE] / FIX-1: Phase-II OWNS a synthetic row's
-    # confidence, so it is no longer scorer-derived. When the input had none
-    # (derived marker present - only while TFB_SCORING_SETTLE != off) it is
-    # still engine-made, not data: the marker becomes _f7_conf_synthetic and
-    # the settle passes keep this value but score it as absent. No derived
-    # marker -> nothing is created (an input confidence settles as v5.156.0).
-    if row.pop(_F7_CONF_DERIVED_KEY, None):
-        row[_F7_CONF_SYNTH_KEY] = True
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
@@ -12022,10 +11933,6 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 
     if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
         try:
-            # v5.157.0 [F7-CONF-RECOMPUTE]: provenance is read BEFORE scoring;
-            # off -> False, nothing is marked (byte-identical v5.156.0).
-            _conf_derives = (not row.get("_f7_settlement_active")
-                             and _f7_settle_mode() != "off" and _f7_conf_unset(row))
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
                 _f7_reject_scoring_patch_failures(row, patch)
@@ -12047,8 +11954,6 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 }
                 row.update(safe_patch)
                 _preserve_scoring_provenance(row, patch)
-                if _conf_derives and _as_float(patch.get("forecast_confidence")) is not None:
-                    row[_F7_CONF_DERIVED_KEY] = True
                 return
             if row.get("_f7_settlement_active"):
                 raise RuntimeError("canonical scoring returned no score patch")
@@ -12076,9 +11981,6 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """Backward-compatible v5.74.0 delegator."""
     _compute_scores_canonical_first(row)
-    # v5.157.0 [F7-CONF-RECOMPUTE]: no _f7_settle_pass follows this delegator,
-    # so the transient confidence marker never outlives the call.
-    _f7_conf_marker_strip(row)
 
 
 def _empty_row_fundamentals_exempt(row: Mapping[str, Any]) -> bool:
@@ -18300,20 +18202,20 @@ class DataEngineV5:
         routed = self._providers_for_instrument(p, symbol)
         return p, (routed[0] if routed else "")
 
-    def _f7_scope_page(self, symbol: str, page_ctx: str) -> str:
-        """v5.157.0 FIX-3 [F7-PAGE-SCOPE]: the page that decides the F-7
-        enforce scope for this symbol - its MARKET page. A market page
-        (_F7_MARKET_PAGES) passes through; any other context (My_Portfolio,
-        Top_10_Investments, ...) resolves the market page exactly as a
-        page-less fetch does (_resolve_quote_page_context(symbol, "")), so one
-        symbol is never settled on one surface and pass-1 on another. Fail-safe
-        to page_ctx (a non-market page is never in a market-page scope)."""
-        if page_ctx in _F7_MARKET_PAGES:
-            return page_ctx
+    def _f7_scope_page(self, symbol: str) -> str:
+        """v5.157.0 [F7-PAGE-SCOPE]: the page that decides the F-7 enforce
+        scope for this symbol, WHATEVER page requested it (a market page,
+        My_Portfolio, Top_10_Investments or none): its inferred market page,
+        exactly as a page-less fetch resolves it. =X / =F -> Commodities_FX;
+        an _ETF_SYMBOL_HINTS symbol (SPY, QQQ, ...) -> Mutual_Funds; .SR or a
+        4-digit code -> Market_Leaders; everything else -> Global_Markets,
+        including funds and crypto pairs without an ETF hint (SPLG, SUI-USD).
+        One symbol is therefore settled, or not, identically on every surface.
+        Fail-safe: "" is never in a configured scope (enforce -> observe)."""
         try:
-            return self._resolve_quote_page_context(symbol, "")[0] or page_ctx
+            return self._resolve_quote_page_context(symbol, "")[0]
         except Exception:
-            return page_ctx
+            return ""
 
     def _providers_for(self, page: str) -> List[str]:
         p = _canonicalize_sheet_name(page)
@@ -19743,10 +19645,11 @@ class DataEngineV5:
                 # v5.147.0 (F-7): settle the pass-dependent scores. off ->
                 # returns merged untouched (byte-identical); observe -> tag
                 # only; enforce -> the settled row replaces the pass-1 row.
-                # v5.157.0 FIX-3: the enforce page scope is decided by the
-                # symbol's MARKET page, so My_Portfolio / Top_10 contexts settle
-                # exactly as the symbol's market page does.
-                merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym, page_ctx))
+                # v5.157.0 [F7-PAGE-SCOPE]: the enforce scope is decided by the
+                # symbol's INFERRED market page whatever page requested it, so
+                # its market page, My_Portfolio, Top_10 and a page-less fetch
+                # settle it identically.
+                merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))
                 _fct_scored = _as_float(merged.get("overall_score")) is not None
             else:
                 _mark_row_as_empty(merged)

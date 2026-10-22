@@ -177,7 +177,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.risk_limits", "__version__", "1.0.0", "risk limits"),
     ("core.validation", "__version__", '1.0.1', "validation harness"),
     ("core.regret", "__version__", "1.0.0", "regret ledger"),
-    ("core.scoring", "__version__", '5.11.5', "scoring"),
+    ("core.scoring", "__version__", '5.11.4', "scoring"),
     ("core.financial_units", "__version__", "1.0.0", "financial unit contract"),
     ("core.execution_accounting", "__version__", "1.0.1", "offline execution accounting"),
     ("core.portfolio_reconciliation", "__version__", '1.0.1', "portfolio input reconciliation"),
