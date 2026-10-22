@@ -94,6 +94,7 @@ SCRIPT_NAME = "news_archive_collector"
 # --- optional gspread (sheet write); script still runs in --dry-run without it
 try:
     import gspread  # type: ignore
+    from gspread.exceptions import WorksheetNotFound as _WorksheetNotFound  # type: ignore
     from google.oauth2 import service_account  # type: ignore
 
     GSPREAD_AVAILABLE = True
@@ -101,6 +102,8 @@ except Exception:  # pragma: no cover
     gspread = None  # type: ignore
     service_account = None  # type: ignore
     GSPREAD_AVAILABLE = False
+    class _WorksheetNotFound(Exception):
+        """Unavailable-client placeholder; never inferred from other errors."""
 
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -301,6 +304,7 @@ class NewsArchiveStore:
         self.gc = None
         self.sheet = None
         self.ws = None
+        self.init_error_code = None
         self._init_sheet()
 
     def _load_creds(self) -> Optional[Any]:
@@ -327,6 +331,7 @@ class NewsArchiveStore:
 
     def _init_sheet(self) -> None:
         if not GSPREAD_AVAILABLE or gspread is None:
+            self.init_error_code = "archive_client_unavailable"
             return
         try:
             creds = self._load_creds()
@@ -334,25 +339,42 @@ class NewsArchiveStore:
             self.sheet = self.gc.open_by_key(self.spreadsheet_id)
             if self.read_only:
                 return
+            created = False
             try:
                 self.ws = self.sheet.worksheet(self.sheet_name)
-            except Exception:
+            except _WorksheetNotFound:
                 self.ws = self.sheet.add_worksheet(title=self.sheet_name, rows=20000, cols=30)
-            self.backoff.run(self._ensure_headers)
+                created = True
+            except Exception:
+                raise RuntimeError("archive_lookup_failed") from None
+            self._ensure_headers(created=created)
         except Exception as e:
-            logger.error("NewsArchiveStore init failed: %s", e)
+            self.init_error_code = (str(e) if str(e) in {
+                "archive_lookup_failed", "archive_header_read_failed", "archive_header_unverified"}
+                else "archive_init_failed")
+            logger.error("NewsArchiveStore initialization withheld (%s)", self.init_error_code)
             self.gc = self.sheet = self.ws = None
 
-    def _ensure_headers(self) -> None:
+    def _header_matches(self, values: List[Any]) -> bool:
+        header = [str(value).strip().casefold() for value in values]
+        while header and not header[-1]:
+            header.pop()
+        return header == [value.casefold() for value in self.HEADERS]
+
+    def _ensure_headers(self, *, created: bool = False) -> None:
+        """Initialize a proven new sheet; verify existing sheets without writes."""
         if not self.ws:
-            return
-        try:
-            existing = self.ws.row_values(self.START_ROW)
-        except Exception:
-            existing = []
-        if [str(x).strip() for x in existing[: len(self.HEADERS)]] != self.HEADERS:
+            raise RuntimeError("archive_header_unverified")
+        if created:
             rng = _a1_range(1, self.START_ROW, len(self.HEADERS), self.START_ROW)
+            # Fixed-range initialization is idempotent, unlike row append.
             self.backoff.run(lambda: self.ws.update(values=[self.HEADERS], range_name=rng))
+        try:
+            existing = self.backoff.run(lambda: self.ws.row_values(self.START_ROW))
+        except Exception:
+            raise RuntimeError("archive_header_read_failed") from None
+        if not self._header_matches(existing):
+            raise RuntimeError("archive_header_unverified")
 
     def load_symbol_sector_map(self) -> Dict[str, str]:
         """v1.1.0: Symbol->Sector from the pool pages of THIS workbook.
@@ -529,11 +551,7 @@ class NewsArchiveStore:
         except Exception:
             raise RuntimeError("archive_key_read_failed") from None
         header_row = self.DATA_ROW0 - 2
-        header = ([str(v).strip().casefold() for v in rows[header_row]]
-                  if len(rows) > header_row else [])
-        while header and not header[-1]:
-            header.pop()
-        if header != [v.casefold() for v in self.HEADERS]:
+        if not self._header_matches(rows[header_row] if len(rows) > header_row else []):
             raise RuntimeError("archive_header_unverified")
         out: set = set()
         for row in rows[self.DATA_ROW0 - 1:]:
@@ -907,7 +925,11 @@ async def collect(args: argparse.Namespace) -> int:
     store = NewsArchiveStore(sheet_id, os.getenv("NEWS_ARCHIVE_SHEET", "News_Archive"))
     if not store.is_available():
         logger.error("News_Archive sheet unavailable (gspread/creds?) -- nothing written")
-        _finish_collection_report(args, report, "WITHHELD", error_code="archive_unavailable")
+        init_code = getattr(store, "init_error_code", None)
+        code = init_code if init_code in {
+            "archive_client_unavailable", "archive_lookup_failed", "archive_header_read_failed",
+            "archive_header_unverified", "archive_init_failed"} else "archive_unavailable"
+        _finish_collection_report(args, report, "WITHHELD", error_code=code)
         return 1
 
     # idempotency: skip symbols already archived for today

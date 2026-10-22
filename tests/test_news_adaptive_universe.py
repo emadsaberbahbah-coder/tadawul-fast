@@ -546,3 +546,86 @@ def test_safe_stdout_summary_keeps_source_evidence_and_omits_identities(tmp_path
     saved = json.loads(path.read_text())
     assert saved["selection"]["sources"] == source_evidence
     assert saved["selection"]["missing_identity_symbols"] == ["DO_NOT_PRINT.US"]
+
+
+class HeaderWorksheet:
+    def __init__(self, header=None, *, read_error=False):
+        self.header = list(header or [])
+        self.read_error = read_error
+        self.updates = []
+
+    def row_values(self, row):
+        assert row == 5
+        if self.read_error:
+            raise RuntimeError("private header transport details")
+        return list(self.header)
+
+    def update(self, *, values, range_name):
+        self.updates.append((copy.deepcopy(values), range_name))
+        self.header = list(values[0])
+
+
+def initialize_real_store(monkeypatch, worksheet, *, lookup_error=None):
+    created = []
+    class Book:
+        def worksheet(self, name):
+            assert name == "News_Archive"
+            if lookup_error:
+                raise lookup_error
+            return worksheet
+        def add_worksheet(self, **kwargs):
+            created.append(kwargs)
+            return worksheet
+    class Client:
+        def open_by_key(self, sheet_id):
+            assert sheet_id == "exact-id"
+            return Book()
+    monkeypatch.setattr(archive, "GSPREAD_AVAILABLE", True)
+    monkeypatch.setattr(archive, "gspread", SimpleNamespace(service_account=lambda: Client()))
+    monkeypatch.setattr(archive.NewsArchiveStore, "_load_creds", lambda _self: None)
+    monkeypatch.setattr(archive, "_Backoff", lambda: SimpleNamespace(run=lambda call: call()))
+    return archive.NewsArchiveStore("exact-id"), created
+
+
+def test_existing_archive_header_read_failure_never_relabels_it(monkeypatch, caplog):
+    worksheet = HeaderWorksheet(read_error=True)
+    store, created = initialize_real_store(monkeypatch, worksheet)
+    assert not store.is_available() and store.init_error_code == "archive_header_read_failed"
+    assert worksheet.updates == [] and created == []
+    assert "private header" not in caplog.text
+
+
+@pytest.mark.parametrize("header", [[], ["Date", "Wrong symbol column"]])
+def test_existing_archive_header_drift_is_withheld_without_writes(monkeypatch, header):
+    worksheet = HeaderWorksheet(header)
+    store, created = initialize_real_store(monkeypatch, worksheet)
+    assert not store.is_available() and store.init_error_code == "archive_header_unverified"
+    assert worksheet.updates == [] and created == []
+
+
+def test_worksheet_lookup_transport_failure_does_not_create_archive(monkeypatch, caplog):
+    worksheet = HeaderWorksheet()
+    store, created = initialize_real_store(
+        monkeypatch, worksheet, lookup_error=RuntimeError("private lookup transport details"))
+    assert not store.is_available() and store.init_error_code == "archive_lookup_failed"
+    assert created == [] and worksheet.updates == []
+    assert "private lookup" not in caplog.text
+
+
+def test_only_confirmed_missing_worksheet_initializes_new_headers_once(monkeypatch):
+    worksheet = HeaderWorksheet()
+    store, created = initialize_real_store(
+        monkeypatch, worksheet, lookup_error=archive._WorksheetNotFound("News_Archive"))
+    assert store.is_available() and store.init_error_code is None
+    assert created == [{"title": "News_Archive", "rows": 20000, "cols": 30}]
+    assert worksheet.updates == [([store.HEADERS], "A5:L5")]
+    assert worksheet.header == store.HEADERS
+
+
+def test_existing_valid_header_with_case_and_padding_needs_no_write(monkeypatch):
+    header = [value.lower() for value in archive.NewsArchiveStore.HEADERS] + ["", "  "]
+    worksheet = HeaderWorksheet(header)
+    store, created = initialize_real_store(monkeypatch, worksheet)
+    assert store.is_available() and store.init_error_code is None
+    assert created == [] and worksheet.updates == []
+    assert worksheet.header == header
