@@ -1,9 +1,11 @@
 /* tests/js/dt10_audit_keep.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.13.11 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 16_Decision_Top10.gs v1.13.12 HELD SEATS KEPT IN THE WRITTEN AUDIT.
  * VERSION 1.1.0 (2026-10-14): renumbered with the cockpit (v1.13.9 draft ->
  * v1.13.10 over #774's v1.13.9); base copies are now v1.13.9. No case changed.
  * 2026-10-21: renumbered v1.13.11 over #810's v1.13.10; base copies are now
  * main's v1.13.10 (git show 55b47f24:apps_script/16_Decision_Top10.gs).
+ * 2026-10-22: renumbered v1.13.12 over #815's v1.13.11; base copies are now
+ * main's v1.13.11 (git show df99bcf3:apps_script/16_Decision_Top10.gs).
  * VERSION 1.0.0 (2026-10-13).
  *
  * WHY: the 2026-10-13 20:37 Riyadh Top_10 export rendered six grace-held
@@ -295,7 +297,7 @@ if (baseSource) {
       assert.deepEqual(a.tables, b.tables);
     }
   });
-  test('D2 every changed line lies inside a designed v1.13.11 region; regions are exact text', () => {
+  test('D2 every changed line lies inside a designed v1.13.12 region; regions are exact text', () => {
     assert.equal(stripDesigned(source), baseSource);
     assert.equal((FN_REGION.match(/^function /mg) || []).length, 2, 'two top-level functions');
     assert.ok(/^[\x00-\x7f]*$/.test(HEADER_REGION + FN_REGION + CALL_REGION), 'designed regions are ASCII');

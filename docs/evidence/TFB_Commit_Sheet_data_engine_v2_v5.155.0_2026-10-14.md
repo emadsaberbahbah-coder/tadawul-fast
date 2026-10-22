@@ -2,6 +2,8 @@
 
 Renumbered 2026-10-21: main shipped a different data_engine_v2 5.155.0 first (#810, PF-SUBUNIT: My_Portfolio SAR weights for subunit-quoted holdings). This build is now **v5.156.0** on top of it: its WHY block sits above main's, off is byte-identical to main's 5.155.0 (the harness's G1-G3 golden cases pass with `TFB_TEST_DE_BASE=<git show 55b47f24:core/data_engine_v2.py>`), and the verifier and the tiny-quote harness pin 5.156.0. The figures below are as measured on 2026-10-14 against 5.154.0.
 
+Renumbered again 2026-10-22: main shipped a different data_engine_v2 5.156.0 first (#816, PF weight fail-closed fixes: PORTFOLIO_VALUE_INCOMPLETE and case-sensitive subunit FX keys). This build is now **v5.157.0** on top of it. Its docstring WHY block keeps its place and #816's comment block sits above this build's one-line note beside `__version__`. Off is byte-identical to main's 5.156.0: `tests/test_de_suffix_locale_fallback.py` G1-G3 now take `BASE_VERSION = "5.156.0"` (`TFB_TEST_DE_BASE` = `git show df99bcf3:core/data_engine_v2.py`) and pass, as does the rest of the suite. Pins moved in place: `scripts/verify_deployment.py` and `tests/test_core_repair_tiny_quotes.py` read 5.157.0. No behaviour changed in the renumbering.
+
 Date: 2026-10-14 (Wednesday) - Lane: Render / Python (engine; backend ENV, read at call time) - Build: daily improvement 2026-10-14, priority (a) "a defect making a published recommendation or outcome number wrong" - File status: engine **REVISED** 5.154.0 -> 5.155.0 - harness **NEW** - verifier pin **REVISED** 1.0.61 -> 1.0.64 - tiny-quote harness pin **REVISED** - this sheet **NEW**
 
 ## S0 - Base pin
