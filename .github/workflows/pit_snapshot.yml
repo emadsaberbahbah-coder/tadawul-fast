@@ -37,7 +37,9 @@ name: "🗄️ TFB PIT Snapshot"
 # observe logs the slot label and the cross-slot duplicate count; slot labels each
 # run by its scheduled slot so a late run and the next on-time run can no longer
 # share a Snapshot Date (2026-08-07 lost 36 captures). See pit_snapshot.py v1.1.3.
-# ROLLBACK: delete the variable or set it to wallclock.
+# ROLLBACK: delete the variable or set it to wallclock (observe is also a disarm).
+# Disarming right after an on-time slot run (fired 20:10-20:59 UTC) costs the next
+# on-time run once (same label, skipped_dup); disarm after a run fired >= 21:00 UTC.
 # ============================================================================
 
 on:

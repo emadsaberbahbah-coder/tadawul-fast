@@ -9,7 +9,8 @@ The label is the Riyadh wall-clock date at run time and the duplicate guard
 is keyed (label, symbol). Run 31136275420 (6 Aug slot, fired 2026-08-07
 00:54 UTC) wrote 53 rows labelled 2026-08-07; the on-time run 31217800255
 (7 Aug slot, 20:53 UTC) got the same label and logged skipped_dup=36, so 36
-symbols' 7 Aug close was never archived while _Run_Log said OK. v1.1.3 adds a
+symbols' 7 Aug (Fri) captures were never archived while _Run_Log said OK.
+v1.1.3 adds a
 default-off gate: observe counts the captures the guard would drop; slot
 labels each run by the date its slot ends (20:10 UTC on D -> D+1).
 
@@ -32,6 +33,8 @@ Cases
   P9  wallclock and observe still read the module-global _today_riyadh
       (open PRs #785/#795 pin the label through it)
   P10 slot dry-run prints the slot label and writes nothing
+  P11 the slot is read on the capture clock (a run starting at 20:09:50 and
+      capturing at 20:10:20 is labelled by its capture)
   N1  workflow mapping, slot anchor == the cron, version floor, verifier pin
   N2  added lines are ASCII; no function removed; exactly four added
 
@@ -125,8 +128,11 @@ class DTShim:
 class WS:
     def __init__(self, vals):
         self.vals = vals
+        self.on_get = None   # P11: advances the clock when the ledger is read
 
     def get(self, _rng):
+        if self.on_get is not None:
+            self.on_get()
         return [list(r) for r in self.vals]
 
     def append_rows(self, rows, value_input_option=None):
@@ -174,7 +180,7 @@ class Rig:
         self.syms = list(syms)
         self.runs = []
 
-    def fire(self, ts, mode=None, argv=("--write",), today=None):
+    def fire(self, ts, mode=None, argv=("--write",), today=None, later=None):
         mod = self.mod
         saved_env = {k: os.environ.get(k) for k in (
             GATE, "TFB_PIT_SOURCE_PAGES", "TFB_PIT_SYMBOL_PAGES",
@@ -190,6 +196,10 @@ class Rig:
             os.environ[GATE] = mode
         FrozenDT.now_utc = real_dt.datetime.fromisoformat(ts).replace(
             tzinfo=real_dt.timezone.utc)
+        if later is not None:
+            after = real_dt.datetime.fromisoformat(later).replace(
+                tzinfo=real_dt.timezone.utc)
+            self.ledger.on_get = lambda: setattr(FrozenDT, "now_utc", after)
         book = Book(self.ledger, self.run_log, self.syms)
         mod._dt = DTShim
         mod._open_book = lambda: book
@@ -201,6 +211,7 @@ class Rig:
             with contextlib.redirect_stderr(err):
                 rc = mod.main(list(argv))
         finally:
+            self.ledger.on_get = None
             for k, v in saved.items():
                 setattr(mod, k, v)
             for k, v in saved_env.items():
@@ -397,6 +408,17 @@ def test_p7_cross_slot_dups_table():
     assert pit.cross_slot_dups([], "2026-08-07", "2026-08-08", syms) == 0
     assert pit.cross_slot_dups(iso, "2026-08-07", "2026-08-08", ["a.us"]) == 1
     assert pit._captured_at(["x"] * 5) is None
+    # sentinel captures at the calendar ends are skipped, never raised
+    ends = [row24("2026-08-07", "A.US", "9999-12-31 23:59:59"),
+            row24("2026-08-07", "B.US", "0001-01-01 00:00:00")]
+    assert pit.cross_slot_dups(ends, "2026-08-07", "2026-08-08", syms) == 0
+    for mode in ("observe", "slot"):
+        label = "2026-08-07" if mode == "observe" else "2026-08-08"
+        rig = Rig(pit, [pit.HEADERS]
+                  + [row24(label, "A.US", "9999-12-31 23:59:59")])
+        run = rig.fire("2026-08-07T20:53:35", mode=mode)
+        assert run["rc"] == 0 and len(run["rows"]) == 2, mode
+        assert details(run)["day_key"]["cross_slot_dups"] == 0
 
 
 # ---------------------------------------------------------------- P8 -----
@@ -430,6 +452,31 @@ def test_p10_slot_dry_run_prints_the_label_and_writes_nothing():
     assert run["rc"] == 0 and run["rows"] == [] and run["log"] == []
     assert "date=2026-10-23 symbols=3 to_write=3" in run["stderr"]
     assert len(daykey_lines(run)) == 1 and rig.ledger.vals == [pit.HEADERS]
+
+
+# --------------------------------------------------------------- P11 -----
+def test_p11_slot_is_read_on_the_capture_clock():
+    """A run that starts at 20:09:50 UTC and captures at 20:10:20 (the clock
+    moves when the ledger is read) belongs to the slot it captured in: its
+    slot label equals slot_day_key(Captured At), and observe's count agrees
+    with what slot does on the next run."""
+    for mode in ("slot", "observe"):
+        rig = Rig(pit)
+        first = rig.fire("2026-10-21T20:09:50", mode=mode,
+                         later="2026-10-21T20:10:20")
+        second = rig.fire("2026-10-21T20:40:00", mode=mode)
+        assert len(first["rows"]) == 3
+        assert {r[-1] for r in first["rows"]} == {"2026-10-21 20:10:20"}
+        assert details(first)["day_key"]["slot"] == "2026-10-22"
+        assert second["rows"] == [] and "skipped_dup=3" in second["stderr"]
+        assert details(second)["day_key"]["cross_slot_dups"] == 0
+        if mode == "slot":
+            assert labels(first) == ["2026-10-22"]
+            for row in rig.ledger.vals[1:]:
+                cap = pit._captured_at(row)
+                assert row[0] == pit.slot_day_key(cap), row[:2]
+        else:
+            assert labels(first) == ["2026-10-21"]   # wall-clock at start
 
 
 # ---------------------------------------------------------------- N1 -----
@@ -467,7 +514,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
              if ln.startswith("+") and not ln.startswith("+++")]
     removed = [ln[1:] for ln in diff
                if ln.startswith("-") and not ln.startswith("---")]
-    title = ("PIT Snapshot — v%s (W-6, Execution Plan v2.1; "
+    title = ("PIT Snapshot \u2014 v%s (W-6, Execution Plan v2.1; "
              "the evidence-preservation stopgap)")
     assert removed == [title % "1.1.1", '__version__ = "1.1.1"',
                        '        append_run_log(book, "OK", msg,',

@@ -208,7 +208,8 @@ def _today_riyadh() -> str:
 #     "date=2026-08-07 symbols=53 to_write=53 skipped_dup=0".
 #   - run 31217800255 (the 7 Aug slot, fired on time, 2026-08-07 20:53 UTC):
 #     "date=2026-08-07 symbols=129 to_write=93 skipped_dup=36". The 7 Aug
-#     close of 36 symbols was never archived; _Run_Log said OK.
+#     (Fri) captures of 36 symbols were never archived (for the non-Tadawul
+#     listings among them that includes their 7 Aug close); _Run_Log said OK.
 #   - the 26 Aug slot fired at 23:25 UTC and was labelled 2026-08-27, so
 #     2026-08-26 has no rows. 74 of the 93 runs from 21 Jul to 21 Oct fired
 #     after 21:00 UTC and carry the D+1 label (all of the last 57); only the
@@ -235,11 +236,16 @@ def _today_riyadh() -> str:
 #     logs exactly what v1.1.1 did. observe keeps the wall-clock label and
 #     rows and adds one "[PIT-DAYKEY v1.1.3] ..." line plus a day_key entry
 #     in the OK _Run_Log details. slot uses slot_day_key() as the label and
-#     the duplicate key and logs the same line and entry.
+#     the duplicate key and logs the same line and entry. Both read the slot
+#     clock after the page and ledger reads, right before build_rows stamps
+#     Captured At, so a run that starts just before 20:10 UTC and captures
+#     after it is classified by its capture, on the same clock as the ledger.
 # ROLLBACK
-#   Unset TFB_PIT_DAY_KEY (or set wallclock). Disarming after slot runs can
-#   reproduce the old collision once, on the first on-time run, because the
-#   wall-clock label of that run equals the previous slot's label.
+#   Unset TFB_PIT_DAY_KEY (or set wallclock). observe is also a disarm (it
+#   keeps the wall-clock label). Disarming after an on-time slot run (fired
+#   in [20:10, 21:00) UTC) reproduces the old collision once: the next
+#   on-time run gets the same label and is skipped. Disarm after a run that
+#   fired at or after 21:00 UTC, or expect one skipped_dup run.
 _DAY_KEY_MODES = ("observe", "slot")
 _SLOT_UTC_HM = (20, 10)   # .github/workflows/pit_snapshot.yml cron "10 20 * * *"
 
@@ -279,7 +285,9 @@ def cross_slot_dups(values: List[List[Any]], date_str: str, slot: str,
                     symbols: List[str]) -> int:
     """How many of `symbols` already hold a row labelled date_str whose
     capture belongs to a slot other than `slot` (captures the duplicate
-    guard would drop). Rows without a parseable capture are not counted."""
+    guard would drop). Rows without a parseable capture, or with one too
+    near the calendar ends to place in a slot, are not counted: this
+    diagnostic never fails a run."""
     want = {str(s).strip().upper() for s in symbols}
     hit: set = set()
     for row in values or []:
@@ -291,7 +299,13 @@ def cross_slot_dups(values: List[List[Any]], date_str: str, slot: str,
         if sym not in want:
             continue
         cap = _captured_at(row)
-        if cap is not None and slot_day_key(cap) != slot:
+        if cap is None:
+            continue
+        try:
+            cap_slot = slot_day_key(cap)
+        except (OverflowError, ValueError):
+            continue
+        if cap_slot != slot:
             hit.add(sym)
     return len(hit)
 
@@ -477,14 +491,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "Market_Leaders,Global_Markets,Mutual_Funds").split(",") if p.strip()]
     tab = _env("TFB_PIT_SHEET", "_PIT_Fundamentals")
     today = _today_riyadh()
-    # v1.1.3: TFB_PIT_DAY_KEY. wallclock (default) leaves `today` untouched.
+    # v1.1.3: TFB_PIT_DAY_KEY. wallclock (default) leaves `today` untouched;
+    # observe/slot read the slot after the ledger read, below.
     day_mode = _pit_day_key_mode()
     wallclock = today
     day_slot = ""
-    if day_mode != "wallclock":
-        day_slot = slot_day_key(_dt.datetime.now(_dt.timezone.utc))
-        if day_mode == "slot":
-            today = day_slot
 
     try:
         book = _open_book()
@@ -532,6 +543,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:
         ws = None
         existing = []
+    if day_mode != "wallclock":
+        # v1.1.3: the slot is read after every page and ledger read, so it
+        # matches the Captured At stamp build_rows takes a moment later and
+        # cross_slot_dups classifies this run and the ledger on one clock.
+        day_slot = slot_day_key(_dt.datetime.now(_dt.timezone.utc))
+        if day_mode == "slot":
+            today = day_slot
     keys = existing_keys_for(existing[1:] if existing else [], today)
     day_info: Dict[str, Any] = {}
     if day_mode != "wallclock":
