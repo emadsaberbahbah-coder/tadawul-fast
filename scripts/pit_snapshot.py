@@ -236,10 +236,12 @@ def _today_riyadh() -> str:
 #     logs exactly what v1.1.1 did. observe keeps the wall-clock label and
 #     rows and adds one "[PIT-DAYKEY v1.1.3] ..." line plus a day_key entry
 #     in the OK _Run_Log details. slot uses slot_day_key() as the label and
-#     the duplicate key and logs the same line and entry. Both read the slot
-#     clock after the page and ledger reads, right before build_rows stamps
-#     Captured At, so a run that starts just before 20:10 UTC and captures
-#     after it is classified by its capture, on the same clock as the ledger.
+#     the duplicate key and logs the same line and entry. Both take ONE
+#     clock read after the page and ledger reads and use it for the slot and
+#     for this run's Captured At (build_rows' new optional captured_at;
+#     wallclock passes None and keeps v1.1.1's own clock read), so a run
+#     that starts just before 20:10 UTC is classified by its capture, and a
+#     label and its stamp can never fall in different slots.
 # ROLLBACK
 #   Unset TFB_PIT_DAY_KEY (or set wallclock). observe is also a disarm (it
 #   keeps the wall-clock label). After a disarm the first wall-clock run is
@@ -382,11 +384,15 @@ def index_page(values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
 
 def build_rows(date_str: str, symbols: List[str],
                pages: List[Tuple[str, Dict[str, Dict[str, Any]]]],
-               existing_keys: set) -> Tuple[List[List[Any]], int, int]:
+               existing_keys: set,
+               captured_at: Optional[str] = None
+               ) -> Tuple[List[List[Any]], int, int]:
     """(rows_to_append, skipped_dup, missing). First page holding the symbol
     wins (page order = precedence). A symbol on no page still gets a row —
     the ABSENCE at t is itself point-in-time evidence — with Source '-'."""
     captured = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if captured_at is not None:   # v1.1.3: the armed day key's one clock read
+        captured = captured_at
     rows: List[List[Any]] = []
     skipped = missing = 0
     for s in symbols:
@@ -544,10 +550,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         ws = None
         existing = []
     if day_mode != "wallclock":
-        # v1.1.3: the slot is read after every page and ledger read, so it
-        # matches the Captured At stamp build_rows takes a moment later and
+        # v1.1.3: ONE clock read, after every page and ledger read, gives
+        # both the slot and this run's Captured At (passed to build_rows), so
+        # the label and the stamp can never fall in different slots and
         # cross_slot_dups classifies this run and the ledger on one clock.
-        day_slot = slot_day_key(_dt.datetime.now(_dt.timezone.utc))
+        day_now = _dt.datetime.now(_dt.timezone.utc)
+        day_slot = slot_day_key(day_now)
         if day_mode == "slot":
             today = day_slot
     keys = existing_keys_for(existing[1:] if existing else [], today)
@@ -562,7 +570,10 @@ def main(argv: Optional[List[str]] = None) -> int:
              f"wallclock={wallclock} slot={day_slot} "
              f"cross_slot_dups={day_info['cross_slot_dups']}")
 
-    rows, skipped, missing = build_rows(today, symbols, indexed, keys)
+    rows, skipped, missing = build_rows(
+        today, symbols, indexed, keys,
+        captured_at=(None if day_mode == "wallclock"
+                     else day_now.strftime("%Y-%m-%d %H:%M:%S")))
     _out(f"date={today} symbols={len(symbols)} to_write={len(rows)} "
          f"skipped_dup={skipped} missing_on_pages={missing}")
 

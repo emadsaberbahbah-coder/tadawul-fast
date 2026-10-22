@@ -41,8 +41,12 @@ Cases
       capturing at 20:10:20 is labelled by its capture)
   P12 the ROLLBACK limit as documented: after a disarm (unset or observe) the
       next slot's on-time run is skipped once; a late one is not
+  P13 one clock read gives the slot and Captured At in the armed modes, even
+      when the reads straddle 20:10:00 UTC (a clock that ticks 1 s per read)
   N1  workflow mapping, slot anchor == the cron, version floor, verifier pin
-  N2  added lines are ASCII; no function removed; exactly four added
+  N2  added lines are ASCII; no function removed; exactly four added; removed
+      lines are exactly the title, version, build_rows signature and call, and
+      the OK _Run_Log call
 
 Golden negative: TFB_TEST_PIT_DELIVERED=<base copy> runs every case against
 v1.1.1 as the delivered module (all but P2 fail; N2 skips).
@@ -123,10 +127,13 @@ def base():
 # ------------------------------------------------------------ fixtures -----
 class FrozenDT(real_dt.datetime):
     now_utc = None
+    tick = None   # P13: every clock read advances the clock by this much
 
     @classmethod
     def now(cls, tz=None):
         n = cls.now_utc
+        if cls.tick is not None:
+            cls.now_utc = n + cls.tick
         return n.astimezone(tz) if tz else n.replace(tzinfo=None)
 
 
@@ -200,7 +207,8 @@ class Rig:
         self.syms = list(syms)
         self.runs = []
 
-    def fire(self, ts, mode=None, argv=("--write",), today=None, later=None):
+    def fire(self, ts, mode=None, argv=("--write",), today=None, later=None,
+             tick=None):
         mod = self.mod
         saved_env = {k: os.environ.get(k) for k in (
             GATE, "TFB_PIT_SOURCE_PAGES", "TFB_PIT_SYMBOL_PAGES",
@@ -216,6 +224,8 @@ class Rig:
             os.environ[GATE] = mode
         FrozenDT.now_utc = real_dt.datetime.fromisoformat(ts).replace(
             tzinfo=real_dt.timezone.utc)
+        FrozenDT.tick = (None if tick is None
+                         else real_dt.timedelta(seconds=tick))
         if later is not None:
             after = real_dt.datetime.fromisoformat(later).replace(
                 tzinfo=real_dt.timezone.utc)
@@ -234,6 +244,7 @@ class Rig:
             with contextlib.redirect_stderr(err):
                 rc = mod.main(list(argv))
         finally:
+            FrozenDT.tick = None
             if self.ledger is not None:
                 self.ledger.on_get = None
             for k, v in saved.items():
@@ -559,6 +570,27 @@ def test_p12_disarm_exposes_the_next_on_time_run_once():
             assert labels(late) == ["2026-10-24"] and len(late["rows"]) == 3
 
 
+# --------------------------------------------------------------- P13 -----
+def test_p13_one_clock_read_for_the_label_and_the_stamp():
+    """Every clock read advances 1 s, so the slot read and the next read
+    straddle 20:10:00 UTC. The armed modes stamp Captured At from the same
+    read as the slot, so label and stamp stay in one slot; off keeps
+    v1.1.1's own read in build_rows (P2 pins its bytes)."""
+    seen = set()
+    for start in ("2026-10-21T20:09:57", "2026-10-21T20:09:58",
+                  "2026-10-21T20:09:59"):
+        rig = Rig(pit)
+        run = rig.fire(start, mode="slot", tick=1)
+        assert run["rc"] == 0 and len(run["rows"]) == 3
+        for row in run["rows"]:
+            assert row[0] == pit.slot_day_key(pit._captured_at(row)), row
+            seen.add(row[0])
+        obs = Rig(pit).fire(start, mode="observe", tick=1)
+        caps = {pit.slot_day_key(pit._captured_at(r)) for r in obs["rows"]}
+        assert caps == {details(obs)["day_key"]["slot"]}
+    assert seen == {"2026-10-21", "2026-10-22"}   # the boundary was crossed
+
+
 # ---------------------------------------------------------------- N1 -----
 def test_n1_workflow_anchor_version_and_pin():
     wf = (ROOT / ".github/workflows/pit_snapshot.yml").read_text(
@@ -592,11 +624,18 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
     diff = list(difflib.unified_diff(old, new, lineterm="", n=0))
     added = [ln[1:] for ln in diff
              if ln.startswith("+") and not ln.startswith("+++")]
+    # blank lines are skipped: difflib may pair them differently around
+    # inserted blocks, which is alignment, not a removal
     removed = [ln[1:] for ln in diff
-               if ln.startswith("-") and not ln.startswith("---")]
+               if ln.startswith("-") and not ln.startswith("---")
+               and ln[1:].strip()]
     title = ("PIT Snapshot \u2014 v%s (W-6, Execution Plan v2.1; "
              "the evidence-preservation stopgap)")
     assert removed == [title % "1.1.1", '__version__ = "1.1.1"',
+                       '               existing_keys: set) -> Tuple[List['
+                       'List[Any]], int, int]:',
+                       '    rows, skipped, missing = build_rows(today, '
+                       'symbols, indexed, keys)',
                        '        append_run_log(book, "OK", msg,',
                        '                       {"written": len(rows), '
                        '"skipped": skipped,',

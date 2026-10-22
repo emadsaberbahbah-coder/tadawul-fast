@@ -61,7 +61,8 @@ This is evidence integrity (priority b/c of the routine), not a published number
 | `slot_day_key(now_utc)` (new, pure) | One label per scheduled slot: the slot that starts at 20:10 UTC on D, and runs to 20:10 UTC on D+1, is labelled D+1, the date it ends on. The input is converted to UTC first |
 | `_captured_at(row)` (new, pure) | Reads `Captured At (UTC)`: column 24, or column 16 of a legacy 16-column row. Returns None when the value is absent or unparseable |
 | `cross_slot_dups(values, label, slot, symbols)` (new, pure) | Counts the run's symbols that already have a row under `label` captured in a DIFFERENT slot. These are the captures the guard drops. A capture it cannot parse or place in a slot (for example a 9999-12-31 sentinel) is skipped, never raised |
-| `main()` | `today = _today_riyadh()` is unchanged. Then:<br>- **wallclock:** nothing else happens.<br>- **observe:** keeps the wall-clock label, rows and guard, and adds one `[PIT-DAYKEY v1.1.3] mode=... key=... wallclock=... slot=... cross_slot_dups=N` line plus a `day_key` object in the OK `_Run_Log` details.<br>- **slot:** uses `slot_day_key` as the label and the duplicate key, and logs the same line and object.<br><br>Both armed modes read the slot clock AFTER the page and ledger reads, right before `build_rows` stamps `Captured At`. A run that starts at 20:09:50 UTC and captures at 20:10:20 is therefore labelled by its capture, on the same clock `cross_slot_dups` uses for the ledger |
+| `main()` | `today = _today_riyadh()` is unchanged. Then:<br>- **wallclock:** nothing else happens.<br>- **observe:** keeps the wall-clock label, rows and guard, and adds one `[PIT-DAYKEY v1.1.3] mode=... key=... wallclock=... slot=... cross_slot_dups=N` line plus a `day_key` object in the OK `_Run_Log` details.<br>- **slot:** uses `slot_day_key` as the label and the duplicate key, and logs the same line and object.<br><br>Both armed modes take ONE clock read after the page and ledger reads. It gives the slot and also this run's `Captured At`, through `build_rows`' new optional `captured_at`. A run that starts at 20:09:50 UTC and captures at 20:10:20 is therefore labelled by its capture, and a label and its stamp can never fall in different slots |
+| `build_rows(..., captured_at=None)` | New optional keyword. `None` (the wallclock call) keeps v1.1.1's own clock read byte for byte; the armed modes pass the day key's stamp |
 | Docstring | Title v1.1.3; ENV lists `TFB_PIT_DAY_KEY` |
 | Version chain | One pointer line `# v1.1.3 WHY (2026-10-22)` above `__version__`. The full WHY block (evidence, per-site change, rollback) sits above `_pit_day_key_mode()`. Every prior WHY block is verbatim |
 
@@ -90,11 +91,11 @@ A D-labelled slot key was considered and rejected:
 
 ## Measured results (offline, venv Python 3.11)
 
-**Harness** `tests/test_pit_day_key.py`: `PASS 14/14` as a script and `14 passed` under pytest. With no git history (`GIT_DIR=/nonexistent`, as on CI's depth-1 checkout) the result is 13 passed, 1 skipped: N2 skips, and P2 runs against the recorded digests.
+**Harness** `tests/test_pit_day_key.py`: `PASS 15/15` as a script and `15 passed` under pytest. With no git history (`GIT_DIR=/nonexistent`, as on CI's depth-1 checkout) the result is 14 passed, 1 skipped: N2 skips, and P2 runs against the recorded digests.
 
 **Golden negative.** The base copy is `git show 57391476:scripts/pit_snapshot.py`, run as the delivered module with `TFB_TEST_PIT_DELIVERED=<copy>`:
 
-- Result: 12 failed, 1 passed (P2, off identity), 1 skipped (N2, exact-diff checks apply to 1.1.3 only).
+- Result: 13 failed, 1 passed (P2, off identity), 1 skipped (N2, exact-diff checks apply to 1.1.3 only).
 - P1 on base gives `[3, 3, 0, 3]` rows for the four real August fire times, which reproduces the production loss. Delivered `slot` gives `[3, 3, 3, 3]`.
 
 **Off identity (P2).** Compared with the base on rows, `_Run_Log` rows, stderr (version string normalised) and exit codes:
@@ -109,7 +110,7 @@ The base's outputs per ledger state are also recorded as `OFF_GOLDEN` (sha256[:1
 
 The empty-tab case keeps a v1.1.1 quirk byte for byte. v1.1.1 writes no header on an existing empty tab, so its first data row is later read as the header. #785 fixes that.
 
-**Mutations** (`-x` per mutation): 19 of 19 caught. The mutations were:
+**Mutations** (`-x` per mutation): 20 of 20 caught. The mutations were:
 
 - slot without +1;
 - anchor 20:00;
@@ -128,7 +129,8 @@ The empty-tab case keeps a v1.1.1 quirk byte for byte. v1.1.1 writes no header o
 - no lower-casing;
 - no calendar-end guard;
 - slot read at run start instead of after the ledger read (the pre-review build, which P11 also fails when run as the delivered module);
-- the duplicate key built from the wall-clock date in slot mode (P6's on-time pair).
+- the duplicate key built from the wall-clock date in slot mode (P6's on-time pair);
+- two clock reads for the label and the stamp (P13; the build before the Codex fix also fails P13).
 
 **Compatibility with open #785.** A trial merge of this branch into `pr785` has one conflict, on the docstring title and the version lines. With both WHY blocks kept and 1.1.3 chosen, #785's `tests/test_pit_snapshot_schema.py` passes 17/17 on the merged file (it pins the label through `_today_riyadh`).
 
@@ -157,8 +159,9 @@ On that merged tree this harness's P2/N2 fail as expected, because their base mu
 | P10 | slot dry-run prints the slot label and writes nothing |
 | P11 | the slot is read on the capture clock: the clock moves when the ledger is read (start 20:09:50, capture 20:10:20). The slot label equals `slot_day_key(Captured At)` for every row, and observe's count agrees with what slot does on the next run |
 | P12 | the documented ROLLBACK limit: after a disarm (unset or observe), the next slot's on-time run is skipped once, whether the last slot run fired on time or late; a late first run writes |
+| P13 | one clock read for the label and the stamp: a clock that ticks 1 s per read makes the reads straddle 20:10:00 UTC. Every slot row's label equals `slot_day_key(Captured At)`, and observe's stamps match its logged slot |
 | N1 | workflow mapping; the slot anchor equals the cron; version floor `>= (1, 1, 3)`; docstring title; verifier pin; WHY order |
-| N2 | added lines ASCII (the pre-existing em dash in the title excepted); removed lines exactly the title, the version line and the 3-line OK `_Run_Log` call; no function removed; exactly four added |
+| N2 | added lines ASCII (the pre-existing em dash in the title excepted); removed non-blank lines are exactly the title, the version line, the `build_rows` signature and call lines, and the 3-line OK `_Run_Log` call; no function removed; exactly four added |
 
 **CI:** the harness runs in the advisory whole-suite job (`pytest -q tests`). Every checkout there is depth 1, so N2 skips and P2 checks against `OFF_GOLDEN`. It is not enrolled in the blocking lean list, because ci.yml versions 1.1.33-1.1.35 are claimed by open #818 and #778. Enrolment is proposed below; it needs no `fetch-depth` change because of the digests.
 
@@ -176,6 +179,7 @@ A four-lens review workflow ran: semantics, byte-identity, harness, and evidence
 | P2 and N2 never ran in CI (depth-1 checkouts) | minor | P2 now uses `OFF_GOLDEN` digests proven against the base. N2 stays local |
 | P2's "absent" start was an existing empty tab, and the fake `WS.update` crashed on an empty sheet | minor | The fake was fixed. There are now real `empty` and `absent` starts, and all P2 runs must exit 0 |
 | P6 lacked an on-time re-run where only the slot label keys the guard | nit | Added, plus the matching mutation |
+| (Codex on #820, P2) the slot label and `Captured At` came from two clock reads, so they could straddle 20:10:00 UTC | P2 | Fixed. One read feeds both, through `build_rows(captured_at=...)`; the wallclock path is unchanged (P13) |
 
 The byte-identity lens also ran its own independent probe and found zero differences. It covered 71,496 off-mode runs, 13,986 observe runs and 13,986 slot runs, over 130 fire times, 10 ledger shapes and 3 argv forms. That figure was measured on the pre-review build; the review changes touch only the observe/slot paths.
 
@@ -188,7 +192,7 @@ The byte-identity lens also ran its own independent probe and found zero differe
 ## Known limits
 
 - **Disarming** (slot -> wallclock, or slot -> observe, since observe keeps the wall-clock label) exposes the first wall-clock run once. If it is the next slot's run and fires on time (20:10-20:59 UTC), its label equals the last slot run's label, whatever time that run fired, and its captures are skipped. A late first run is unaffected. This is stated in the code ROLLBACK and in the workflow header (the adversarial review corrected an earlier wording that tied it to the last armed run's fire time).
-- **Residual clock race:** the slot is read milliseconds before `build_rows` stamps `Captured At`, with no I/O in between. A run whose two reads straddle 20:10:00.000 UTC would get a label one slot below `slot_day_key(Captured At)`.
+- **No residual clock race:** the Codex review on #820 flagged that the slot and `Captured At` came from two clock reads milliseconds apart. Both now come from one read in the armed modes (P13).
 - **A manual dispatch before 20:10 UTC** belongs to the previous slot, so it dedups against that slot's capture. This is the same as wall-clock behaviour for fires after 21:00 UTC the day before. The `[PIT-DAYKEY]` line shows both labels.
 - **The slot anchor** (`_SLOT_UTC_HM = (20, 10)`) must move with the cron. N1 fails if they diverge. The post-1 Nov US standard-time issue (the 20:10 UTC fire is before the 21:00 UTC close) is unchanged and still registered in the workflow header.
 - **Historical labels are not rewritten.** The 2026-08-07 loss is permanent. The 2026-08-26 gap is a label shift, not a loss: those captures sit under 08-27, and `Captured At (UTC)` distinguishes them.
