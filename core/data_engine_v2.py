@@ -23,19 +23,26 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
   which rows observe holds back, so observe now stays on the v1 trajectory.
 - [F7-CONF-RECOMPUTE] provenance markers, never published: on a
   non-settlement call while TFB_SCORING_SETTLE != off,
-  _compute_scores_canonical_first marks a row that carried no confidence
-  (forecast_confidence / ai_confidence / confidence_score / confidence all
-  absent, None or blank) when the canonical patch supplied one:
-  _f7_conf_derived. Phase-II's synthetic writer, which then OWNS the
-  confidence it writes, turns that marker into _f7_conf_synthetic. An input
-  confidence makes no marker. _f7_settle_result(row, v2=True) prepares each
-  marked iterate before its re-score (_f7_conf_v2_iterate): derived ->
-  forecast_confidence, confidence_score and confidence_bucket set to None
-  (the scorer re-derives the confidence from the completed row = warm);
-  synthetic -> ONLY forecast_confidence set to None (the scorer reuses
-  Phase-II's confidence_score - equal to Phase-II's confidence at 4 dp on all
-  15,505 synthetic iterates of the sweep - and _completeness_factor no longer
-  counts an engine-made confidence as data). v2=False is exactly the v5.157.0
+  _compute_scores_canonical_first marks a row whose confidence core.scoring
+  DERIVED (the canonical patch supplied one): _f7_conf_derived. "Derived" is
+  decided exactly as compute_confidence_score decides it, with core.scoring's
+  own _get / _safe_float - the first of forecast_confidence / ai_confidence /
+  confidence_score / confidence that is not None must parse as a number to be
+  reused, so a blank or invalid earlier alias means derived even when a later
+  one is populated (Codex review on #818). Phase-II's synthetic writer, which
+  then OWNS the confidence it writes, turns that marker into
+  _f7_conf_synthetic. A reused (input) confidence makes no marker.
+  _f7_settle_result(row, v2=True) prepares each marked iterate before its
+  re-score (_f7_conf_v2_iterate): derived -> forecast_confidence,
+  confidence_score and confidence_bucket set to None (the scorer re-derives
+  the confidence from the completed row = warm); synthetic -> ONLY
+  forecast_confidence set to None (the scorer reuses Phase-II's
+  confidence_score - equal to Phase-II's confidence at 4 dp on all 15,505
+  synthetic iterates of the sweep - and _completeness_factor no longer counts
+  an engine-made confidence as data). An input alias the scorer never writes
+  (ai_confidence, confidence) that would otherwise be reused on that re-score
+  (only possible when an earlier alias blocked it on pass 1) is hidden for the
+  re-score and restored right after it. v2=False is exactly the v5.157.0
   trajectory, and an unmarked row's v2 trajectory is its v1 trajectory.
 - _f7_settle_pass: off unchanged. Enforce (in scope): ONE v2 result, published
   exactly as v5.157.0 enforce publishes its result. Observe and enforce out
@@ -79,10 +86,11 @@ except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
 - RESIDUAL (as v5.157.0): a snapshot-served or re-settled row brings its
   prior confidence as input, so no marker is made and it settles on the v1
   trajectory, counting that confidence as data.
-- Functions added 5 (_f7_conf_unset, _f7_conf_marked, _f7_conf_marker_strip,
-  _f7_conf_v2_iterate, _f7_shadow_tag); changed: _f7_settle_result (+ v2),
-  _f7_settle_pass, _compute_scores_canonical_first, _compute_scores_fallback,
-  _phase_ii_quality_forecast; constants added 5; removed 0. Tests:
+- Functions added 5 (_f7_conf_scorer_derives, _f7_conf_marked,
+  _f7_conf_marker_strip, _f7_conf_v2_iterate, _f7_shadow_tag); changed:
+  _f7_settle_result (+ v2), _f7_settle_pass, _compute_scores_canonical_first,
+  _compute_scores_fallback, _phase_ii_quality_forecast; constants added 6;
+  core.scoring's _get / _safe_float imported (read-only); removed 0. Tests:
   tests/test_de_f7_settle_shadow.py. Rollback: keep TFB_SCORING_SETTLE at
   observe (published values = v5.157.0) or off, or git revert. Enforce is
   NOT armed by this change.
@@ -4611,6 +4619,17 @@ except Exception:  # pragma: no cover
         "REDUCE", "SELL", "STRONG_SELL", "AVOID",
     )
     _CORE_SCORING_AVAILABLE = False
+
+# v5.158.0 [F7-CONF-RECOMPUTE] (Codex review on #818): the confidence-provenance
+# predicate uses core.scoring's OWN alias precedence (_get: the first key whose
+# value is not None) and numeric parser (_safe_float), so it can never disagree
+# with compute_confidence_score. Unavailable -> no canonical scorer, nothing is
+# marked.
+try:
+    from core.scoring import _get as _scoring_conf_get, _safe_float as _scoring_conf_float
+except Exception:  # pragma: no cover
+    _scoring_conf_get = None  # type: ignore
+    _scoring_conf_float = None  # type: ignore
 
 # v5.76.0: 8-tier canonical recommendation vocabulary. Mirror of the
 # RECOMMENDATION_ENUM tuple exported by core.scoring v5.7.0+ and the
@@ -9856,6 +9875,9 @@ _F7_CONF_READ_KEYS: Tuple[str, ...] = ("forecast_confidence", "ai_confidence", "
 # The confidence keys the canonical scorer writes; cleared on a derived-marked
 # (provider) v2 iterate so the scorer re-derives them from the completed row.
 _F7_CONF_SCORER_KEYS: Tuple[str, ...] = ("forecast_confidence", "confidence_score", "confidence_bucket")
+# Read keys the scorer never writes (input aliases): hidden from a v2 iterate's
+# re-score only when they would otherwise be reused, restored right after it.
+_F7_CONF_INPUT_ALIASES: Tuple[str, ...] = ("ai_confidence", "confidence")
 
 
 @dataclass(frozen=True)
@@ -10182,18 +10204,22 @@ def _f7_settle_page_in_scope(page: Any) -> bool:
     return _canonicalize_sheet_name(_safe_str(page).strip()) in pages
 
 
-def _f7_conf_unset(row: Mapping[str, Any]) -> bool:
-    """v5.158.0 [F7-CONF-RECOMPUTE]: True when none of the confidence keys
-    core.scoring.compute_confidence_score could reuse carries a value (each is
-    absent, None or blank), so the scorer certainly DERIVES the confidence from
-    data completeness. Conservative: any non-blank value reads as set, so a
-    reused (input) confidence is never marked."""
-    for key in _F7_CONF_READ_KEYS:
-        value = row.get(key)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
+def _f7_conf_scorer_derives(row: Mapping[str, Any]) -> bool:
+    """v5.158.0 [F7-CONF-RECOMPUTE]: True when core.scoring.compute_confidence_score
+    DERIVES the confidence for this row instead of reusing one. It reads the
+    FIRST of forecast_confidence / ai_confidence / confidence_score / confidence
+    whose value is not None and reuses it only when its own parser gives a
+    number; so no such key, or a first non-None value that does not parse ("",
+    "  ", "abc", "nan", a bool), means derived - even when a LATER alias is
+    populated (forecast_confidence="" with confidence_score=66.41: Codex review
+    on #818). Decided with core.scoring's own _get / _safe_float (compute_scores
+    hands compute_confidence_score these keys unchanged)."""
+    if _scoring_conf_get is None or _scoring_conf_float is None:
         return False
-    return True
+    try:
+        return _scoring_conf_float(_scoring_conf_get(row, *_F7_CONF_READ_KEYS)) is None
+    except Exception:
+        return False
 
 
 def _f7_conf_marked(row: Mapping[str, Any]) -> bool:
@@ -10211,23 +10237,37 @@ def _f7_conf_marker_strip(row: Any) -> None:
             row.pop(key, None)
 
 
-def _f7_conf_v2_iterate(cand: Dict[str, Any]) -> None:
+def _f7_conf_v2_iterate(cand: Dict[str, Any]) -> Dict[str, Any]:
     """v5.158.0 [F7-CONF-RECOMPUTE]: prepare ONE v2 settle iterate before its
-    re-score. Derived marker (the scorer's own pass-1 confidence; provider
+    re-score. Derived marker (the scorer derived the pass-1 confidence; provider
     rows): forecast_confidence, confidence_score and confidence_bucket are set
     to None in place, so core.scoring re-derives the confidence from the
     completed row (None reads as absent; the keys keep their position).
-    Synthetic marker (Phase-II's confidence; the input had none): ONLY
-    forecast_confidence is set to None - the scorer reuses confidence_score
-    (Phase-II's value; equal at 4 dp) and _completeness_factor no longer
-    counts an engine-made confidence as data. core.scoring is unchanged."""
+    Synthetic marker (Phase-II's confidence; the scorer had derived the one it
+    replaced): ONLY forecast_confidence is set to None - the scorer reuses
+    confidence_score (Phase-II's value; equal at 4 dp) and _completeness_factor
+    no longer counts an engine-made confidence as data. core.scoring is
+    unchanged. An input alias the scorer never writes (ai_confidence,
+    confidence) that would otherwise be reused instead - possible only when an
+    earlier alias blocked it on pass 1 - is hidden (None) for this re-score;
+    the caller restores the returned values right after it."""
+    hidden: Dict[str, Any] = {}
     if cand.get(_F7_CONF_DERIVED_KEY):
         for key in _F7_CONF_SCORER_KEYS:
             if key in cand:
                 cand[key] = None
+        aliases = _F7_CONF_INPUT_ALIASES
     elif cand.get(_F7_CONF_SYNTH_KEY):
         if "forecast_confidence" in cand:
             cand["forecast_confidence"] = None
+        aliases = ("ai_confidence",)  # the one alias read before confidence_score
+    else:
+        return hidden
+    for key in aliases:
+        if cand.get(key) is not None:
+            hidden[key] = cand[key]
+            cand[key] = None
+    return hidden
 
 
 def _f7_settle_token(value: Any) -> str:
@@ -10336,9 +10376,10 @@ def _f7_settle_result(row: Dict[str, Any], v2: bool = True) -> F7SettlementResul
                                           reason="intrinsic_model_basis_unproven")
             if model_values is not None:
                 cand["intrinsic_value"], cand["upside_pct"] = model_values
-            if v2:
-                _f7_conf_v2_iterate(cand)
+            _hidden_aliases = _f7_conf_v2_iterate(cand) if v2 else {}
             _compute_scores_canonical_first(cand)
+            if _hidden_aliases:
+                cand.update(_hidden_aliases)  # input data: only that re-score skipped them
             if model_values is not None:
                 # The canonical patch rounds its display upside independently;
                 # Phase-II must consume the same witnessed raw tuple as scoring.
@@ -12149,7 +12190,7 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
             # v5.158.0 [F7-CONF-RECOMPUTE]: provenance is read BEFORE scoring;
             # off or a settlement iterate -> False, nothing is marked.
             _conf_derives = (not row.get("_f7_settlement_active")
-                             and _f7_settle_mode() != "off" and _f7_conf_unset(row))
+                             and _f7_settle_mode() != "off" and _f7_conf_scorer_derives(row))
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
                 _f7_reject_scoring_patch_failures(row, patch)

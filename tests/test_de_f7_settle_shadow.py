@@ -396,6 +396,69 @@ def _strip(row):
     return {key: value for key, value in row.items() if key not in TRANSIENT}
 
 
+# Confidence aliases in core.scoring's read order and the table the marking
+# predicate is pinned on (Codex review on #818).
+READ_KEYS = ("forecast_confidence", "ai_confidence", "confidence_score", "confidence")
+ALIAS_VALUES = (None, "", "  ", "abc", "nan", "0", 0, "66.41", 0.6641, 1.5, 150)
+# (input aliases, the confidence core.scoring REUSES on pass 1 - None = it
+# derives one) on the SUBC.OL cold twin
+ALIAS_ROWS = (
+    ({"forecast_confidence": "", "confidence_score": 66.41}, None),
+    ({"forecast_confidence": "  ", "confidence_score": "66.41"}, None),
+    ({"forecast_confidence": "abc", "ai_confidence": 0.65}, None),
+    ({"forecast_confidence": "", "confidence": 70.0}, None),
+    ({"forecast_confidence": None, "ai_confidence": "nan", "confidence": 70.0}, None),
+    ({"forecast_confidence": 0.7, "confidence_score": ""}, 0.7),
+    ({"forecast_confidence": 0.7, "ai_confidence": "  "}, 0.7),
+    ({"forecast_confidence": 0.7, "confidence": "abc"}, 0.7),
+    ({"forecast_confidence": None, "confidence_score": 66.41}, 0.6641),
+)
+
+
+def case_marking_follows_the_scorers_alias_precedence(de):
+    """The marker is set exactly when core.scoring DERIVES the confidence: the
+    first alias that is not None must parse as a number to be reused, so a
+    blank / invalid earlier alias means derived even when a later alias is
+    populated (forecast_confidence="" with confidence_score=66.41). Such a
+    cold row is re-derived warm under enforce (SUBC.OL 0.6323 -> 0.6641, as
+    its warm twin), an input alias the scorer never writes is not reused on
+    the v2 re-score and is published unchanged, and a reused confidence
+    (forecast_confidence=0.7 with a blank later alias) makes no marker."""
+    with _engine(de):
+        _, warm_fx = _twins("SUBC.OL")
+        _, warm, _ = _settle(de, warm_fx, "enforce")
+        assert warm["forecast_confidence"] == 0.6641
+        for extra, reused in ALIAS_ROWS:
+            cold_fx, _ = _twins("SUBC.OL")
+            cold_fx = dict(cold_fx, row=dict(cold_fx["row"], **extra))
+            _set("enforce")
+            p1 = f7._prep(cold_fx)
+            assert bool(p1.get(MARKER)) is (reused is None), (extra, p1.get(MARKER))
+            p1_fc = p1["forecast_confidence"]
+            _, enforced, _ = _settle(de, cold_fx, "enforce")
+            if reused is None:
+                # derived cold on pass 1 ("  " still counts in completeness: 0.6482)
+                assert p1_fc in (0.6323, 0.6482), (extra, p1_fc)
+                assert enforced["forecast_confidence"] == warm["forecast_confidence"], (extra, enforced["forecast_confidence"])
+            else:
+                assert p1_fc == enforced["forecast_confidence"] == reused, (extra, p1_fc)   # reused as given
+            for key in ("ai_confidence", "confidence"):
+                if key in extra:
+                    assert enforced.get(key) == extra[key], (extra, key, enforced.get(key))
+            assert not any(k in enforced for k in TRANSIENT)
+        # a synthetic row: Phase-II's confidence_score is reused even when an
+        # input ai_confidence (read before it) is populated behind a blank alias
+        syn_fx = _fx("BRK-B.US", forecast_confidence="", ai_confidence=0.5)
+        _set("enforce")
+        p1 = f7._prep(syn_fx)
+        assert p1.get(SYNTH) is True and MARKER not in p1
+        _, syn, _ = _settle(de, syn_fx, "enforce")
+        plain = _settle(de, _fx("BRK-B.US"), "enforce")[1]
+        assert syn["ai_confidence"] == 0.5 and syn["forecast_source"] == "phase_ii_synthetic"
+        assert {k: syn[k] for k in v2s.CODE_KEY.values()} == {k: plain[k] for k in v2s.CODE_KEY.values()}
+        assert syn["quality_score"] == plain["quality_score"] == _quality_without_confidence(syn)
+
+
 GATE_CASES = (
     ("C1 cold twin settles to warm under enforce", case_c1_cold_twin_settles_to_warm_under_enforce),
     ("C1 observe shows what enforce publishes", case_c1_observe_shows_what_enforce_publishes),
@@ -404,6 +467,7 @@ GATE_CASES = (
     ("enforce is the v2 trajectory", case_enforce_is_the_v2_trajectory),
     ("rows enforce would hold back carry an stx shadow tag", case_rows_enforce_would_hold_back_carry_an_stx_shadow_tag),
     ("markers made only while armed and never published", case_markers_made_only_while_armed_and_never_published),
+    ("marking follows the scorer's alias precedence", case_marking_follows_the_scorers_alias_precedence),
 )
 
 
@@ -414,12 +478,14 @@ def case_identity_with_5157(de, base):
     """off: byte-identical (scorer labels, frozen timestamps). observe, observe
     in / out of scope and enforce out of scope: every published field equals
     v5.157.0 observe except the f7_settle tags, at MAX_PASSES 3, 4 and 5 on
-    102 fixture variants - including variants whose v2 status differs from
-    v1 - and on the error / oscillation / pass_limit paths under every
-    TFB_SETTLE_UNRESOLVED mode. The v1 trajectory equals v5.157.0's."""
+    102 fixture variants plus the six fixtures with every ALIAS_ROWS input -
+    including variants whose v2 status differs from v1 - and on the error /
+    oscillation / pass_limit paths under every TFB_SETTLE_UNRESOLVED mode.
+    The v1 trajectory equals v5.157.0's."""
     v1_v2_status_differs = 0
+    alias_cases = [dict(fx, row=dict(fx["row"], **extra)) for fx in f7.FIXTURES for extra, _ in ALIAS_ROWS]
     for max_passes in (3, 4, 5):
-        for fx in v2s._trajectory_cases():
+        for fx in v2s._trajectory_cases() + alias_cases:
             with _engine(base):
                 _set("off", max_passes=max_passes)
                 b_off = base._f7_settle_pass(f7._prep(fx), fx["row"]["symbol"], GM)
@@ -510,6 +576,33 @@ test_fix1p_synthetic_rows_keep_phase_ii_confidence_without_completeness_gap = _w
 test_enforce_is_the_v2_trajectory = _wrap(case_enforce_is_the_v2_trajectory)
 test_rows_enforce_would_hold_back_carry_an_stx_shadow_tag = _wrap(case_rows_enforce_would_hold_back_carry_an_stx_shadow_tag)
 test_markers_made_only_while_armed_and_never_published = _wrap(case_markers_made_only_while_armed_and_never_published)
+test_marking_follows_the_scorers_alias_precedence = _wrap(case_marking_follows_the_scorers_alias_precedence)
+
+
+@_isolated
+def test_marking_predicate_is_the_scorers_own_decision():
+    """_f7_conf_scorer_derives uses core.scoring's own _get / _safe_float and
+    equals compute_confidence_score's reuse-or-derive decision on the table
+    None, "", "  ", "abc", "nan", "0", 0, "66.41", 0.6641, 1.5, 150 in every
+    alias position, alone and ahead of a populated later alias."""
+    assert DE._scoring_conf_get is _SCORING._get and DE._scoring_conf_float is _SCORING._safe_float
+    assert DE._F7_CONF_READ_KEYS == READ_KEYS
+    base = dict(DE._apply_phase_bb_sanity(dict(_fx("SUBC.OL")["row"])), data_quality="GOOD")
+    rows = []
+    for i, key in enumerate(READ_KEYS):
+        for value in ALIAS_VALUES:
+            rows.append(dict(base, **{key: value}))
+            for later in READ_KEYS[i + 1:]:
+                rows.append(dict(base, **{key: value, later: 66.41}))
+    seen = set()
+    for row in rows:
+        # behavioural oracle: a DERIVED confidence moves with data quality, a
+        # reused one does not
+        scorer_derives = (_SCORING.compute_confidence_score(row)
+                          != _SCORING.compute_confidence_score(dict(row, data_quality="POOR")))
+        assert DE._f7_conf_scorer_derives(row) is scorer_derives, {k: row.get(k) for k in READ_KEYS}
+        seen.add(scorer_derives)
+    assert seen == {True, False} and len(rows) == 4 * 11 + 6 * 11
 
 
 @_isolated
@@ -595,7 +688,8 @@ def test_wiring_and_version():
 TESTS = [test_c1_cold_twin_settles_to_warm_under_enforce, test_c1_observe_shows_what_enforce_publishes,
          test_fix1p_synthetic_rows_keep_phase_ii_confidence_without_completeness_gap,
          test_enforce_is_the_v2_trajectory, test_rows_enforce_would_hold_back_carry_an_stx_shadow_tag,
-         test_markers_made_only_while_armed_and_never_published, test_off_is_byte_identical_and_unmarked,
+         test_markers_made_only_while_armed_and_never_published, test_marking_follows_the_scorers_alias_precedence,
+         test_marking_predicate_is_the_scorers_own_decision, test_off_is_byte_identical_and_unmarked,
          test_identity_with_5157, test_scoring_module_is_5157s, test_golden_negative_gate_cases_fail_on_5157,
          test_evidence_is_deterministic, test_wiring_and_version]
 
