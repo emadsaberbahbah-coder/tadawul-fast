@@ -421,6 +421,10 @@ def _norm(row):
     r = dict(row)
     for k in VOLATILE:
         r.pop(k, None)
+    # v5.157.0 (F-7 v2): the transient _f7_conf_derived marker lives between
+    # pass-1 scoring and _f7_settle_pass (which strips it on every return), so
+    # a pass-1 snapshot may carry it while no published row ever does.
+    r.pop("_f7_conf_derived", None)
     w = r.get("warnings")
     if w in (None, ""):
         r["warnings"] = ""
@@ -453,6 +457,12 @@ def _golden(row, max_passes):
     prev, last, first = row, row, None
     for k in range(2, max_passes + 1):
         cand = copy.deepcopy(prev)
+        # v5.157.0 (F-7 v2) [F7-CONF-RECOMPUTE]: a confidence the scorer derived
+        # on pass 1 (marker set) is re-derived on every settle pass, not reused.
+        if cand.get("_f7_conf_derived"):
+            for key in ("forecast_confidence", "confidence_score", "confidence_bucket"):
+                if key in cand:
+                    cand[key] = None
         _pair(cand)
         d = _differs(prev, cand)
         if first is None:

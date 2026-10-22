@@ -2,8 +2,76 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.156.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
 ================================================================================
+
+WHY v5.157.0 - F-7 v2: SETTLE RE-DERIVES SCORER CONFIDENCE, FINAL-PASS TAG, PAGE
+SCOPE (TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; with
+TFB_SCORING_SETTLE off every row is byte-identical to v5.156.0)
+- EVIDENCE (21/22 Oct exports, independent review): three gaps block arming
+  enforce. G1: core.scoring.compute_confidence_score REUSES any existing
+  forecast_confidence / ai_confidence / confidence_score / confidence. A cold
+  pass 1 lacks the 3M forecast fields (expected_roi_3m, forecast_price_3m are
+  in scoring._completeness_factor), so the scorer derives a lower confidence
+  (0.6323 vs 0.6641 warm) and every settle pass reuses it: reliability 69.3
+  instead of 71.5 on soft-capped rows, just under the board's Min Reliability
+  70 (~536 Global_Markets rows on 22 Oct). G2: the observe tag disclosed pass
+  1 -> pass 2 (first_diff), not what enforce publishes for rows that settle at
+  pass 3/4 (41% of GM rows), and at most 6 fields, sometimes hiding os=. G3:
+  Market_Leaders churns more day to day under settlement (input churn, not
+  pass order), so enforce must be scopable by page.
+- [F7-CONF-RECOMPUTE] transient marker _f7_conf_derived, created only while
+  TFB_SCORING_SETTLE != off: on a non-settlement call
+  _compute_scores_canonical_first marks a row that carried no confidence (all
+  four keys absent, None or blank, so the scorer certainly derived it) when
+  the canonical patch supplied forecast_confidence. The Phase-II synthetic
+  writer, which OWNS confidence on phase_ii_synthetic rows, clears it, so those
+  rows settle exactly as v5.156.0. _f7_settle_result clears forecast_confidence,
+  confidence_score and confidence_bucket on every marked iterate before it is
+  re-scored (set to None in place: core.scoring reads None as absent and the
+  keys keep their position), so the scorer re-derives them from the completed
+  fields. Real-engine twins built from the 2026-09-22 export rows SUBC.OL and
+  FCN.US (cold = target restored inside Phase-II, warm = the same target
+  present at ingestion): SUBC.OL settled confidence 0.6323 -> 0.6641 = warm;
+  published reliability (recalibrated gate) 74.3 -> 76.5 = warm with the real
+  in-band target, 69.3 -> 71.5 = warm with a +40% (soft-capped) target;
+  FCN.US 0.6164 -> 0.6482, soft-capped 68.1 -> 70.4 (across the 70 floor).
+  DISCLOSED SIDE EFFECT: _completeness_factor counts forecast_confidence
+  itself, so a marked iterate is scored with it absent, exactly as pass 1
+  was; quality_score no longer gains +1.02 (0.45 x 1/22 x 0.5 x 100) from the
+  scorer's own pass-1 output. On the six F-7 fixtures under enforce: BNY.US
+  quality 60.02 -> 59.00, overall 47.72 -> 47.52; 3328.HK 89.00 -> 87.98,
+  69.51 -> 69.30; SUBC.OL overall 51.59 -> 51.39; FCN.US 48.73 -> 48.54; no
+  recommendation changes; the two synthetic rows are unchanged. The marker is
+  never published: _f7_settle_pass strips it on every return path (failed-row
+  early return, off, error / non_converged holdback, unresolved observe /
+  enforce, stable at pass 2, the settled iterate) and _f7_settle_result strips
+  it from a settled iterate. The only scoring call not followed by
+  _f7_settle_pass is the backward-compatible delegator _compute_scores_fallback
+  (no production caller), which strips it as well; the projectors keep
+  canonical keys only.
+- [F7-FINAL-TAG] F7SettlementResult.final_diff (frozen pass-1 row -> settled
+  row). The f7_settle:<mode>:st<k>:p<n> tag now discloses pass 1 -> FINAL,
+  i.e. the values enforce publishes, for up to 8 fields in the order ov op os
+  rc va fcf r12 fs; the substring-safety degrade (:chg<n>) is unchanged. The
+  tagging rule is unchanged (a row is tagged when pass 2 differs from pass 1),
+  and first_diff / last_diff stay in the result and in the scoring_settlement
+  JSON. Readers of ov= / rc= deltas (scripts/tfb_workbook_dq_audit.py DQ-37)
+  now count pass 1 -> final instead of pass 1 -> pass 2.
+- [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated page names,
+  case-insensitive; unset, empty, "*" or "all" = every page (byte-identical).
+  Under enforce a row whose page is not listed is handled exactly as observe
+  (pass-1 row published, observe tag). Disclosed as scoring_settle_pages in
+  /health engine_gates and the [GUARDS] boot line ("all" = every page).
+- Functions added 5 (_f7_settle_pages, _f7_settle_pages_label,
+  _f7_settle_page_in_scope, _f7_conf_unset, _f7_conf_marker_strip); changed:
+  _f7_settle_tag, _f7_settle_result, _f7_settle_pass,
+  _compute_scores_canonical_first, _compute_scores_fallback,
+  _phase_ii_quality_forecast, surface_gate_states, the [GUARDS] boot line
+  (DataEngineV5.__init__); F7SettlementResult gains final_diff; constants
+  added 6; removed 0. Tests: tests/test_de_f7_settle_v2.py. Rollback: unset
+  TFB_SCORING_SETTLE_PAGES and keep TFB_SCORING_SETTLE at observe (or off), or
+  git revert. Enforce is NOT armed by this change.
 
 WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
 - _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
@@ -4185,7 +4253,13 @@ from core.financial_units import (
 #     file under their distinct codes (GBX / ZAC / ILA), which the per-row
 #     lookup already reads as SAR per subunit.
 # Tests: tests/test_pf_weight_value_complete.py.
-__version__ = "5.156.0"
+# v5.157.0 (2026-10-22): F-7 v2 (see WHY v5.157.0). [F7-CONF-RECOMPUTE] settle
+#   passes re-derive a scorer-derived confidence instead of reusing the cold
+#   pass-1 value; [F7-FINAL-TAG] the f7_settle tag discloses pass 1 -> final
+#   (8 fields, ov op os rc va fcf r12 fs); [F7-PAGE-SCOPE]
+#   TFB_SCORING_SETTLE_PAGES limits where enforce publishes. Off is
+#   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
+__version__ = "5.157.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.price_precision import (
@@ -6087,6 +6161,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
+            "scoring_settle_pages": _f7_settle_pages_label(),          # v5.157.0 (F-7 v2)
             "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
             "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
@@ -9644,6 +9719,19 @@ _F7_SETTLE_DEPENDENT_FIELDS: Tuple[str, ...] = (
     "momentum_score", "growth_score", "technical_score", "conviction_score",
     "sector_relative_score", "rank_overall", "top10_rank", "top_factors",
 )
+# v5.157.0 (F-7 v2) [F7-CONF-RECOMPUTE] (see WHY v5.157.0): transient
+# provenance marker for a confidence the canonical scorer DERIVED on pass 1.
+# Created only while TFB_SCORING_SETTLE != off and never published.
+_F7_CONF_DERIVED_KEY: str = "_f7_conf_derived"
+# The keys core.scoring.compute_confidence_score reuses when one carries a value.
+_F7_CONF_READ_KEYS: Tuple[str, ...] = ("forecast_confidence", "ai_confidence", "confidence_score", "confidence")
+# The confidence keys the canonical scorer writes; cleared on a marked iterate.
+_F7_CONF_SCORER_KEYS: Tuple[str, ...] = ("forecast_confidence", "confidence_score", "confidence_bucket")
+# v5.157.0 [F7-PAGE-SCOPE]: pages on which TFB_SCORING_SETTLE=enforce may publish.
+_F7_SETTLE_PAGES_ENV: str = "TFB_SCORING_SETTLE_PAGES"
+# v5.157.0 [F7-FINAL-TAG]: tag disclosure order (codes of _F7_SETTLE_FIELDS) and limit.
+_F7_SETTLE_TAG_ORDER: Tuple[str, ...] = ("ov", "op", "os", "rc", "va", "fcf", "r12", "fs")
+_F7_SETTLE_TAG_MAX: int = 8
 
 
 @dataclass(frozen=True)
@@ -9657,6 +9745,8 @@ class F7SettlementResult:
     last_diff: Tuple[Tuple[str, str, str], ...] = ()
     reason: str = ""
     error_type: str = ""
+    # v5.157.0 [F7-FINAL-TAG]: frozen pass-1 row -> settled row (stable only).
+    final_diff: Tuple[Tuple[str, str, str], ...] = ()
 
 
 def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
@@ -9913,6 +10003,54 @@ def _f7_settle_max_passes() -> int:
     return max(2, min(_F7_SETTLE_MAX_CAP, n))
 
 
+def _f7_settle_pages() -> Tuple[str, ...]:
+    """v5.157.0 [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated page
+    names, case-insensitive (lower-cased, de-duplicated, order kept). Unset,
+    empty, "*" or "all" -> () = every page (the v5.156.0 behaviour). Read at
+    call time (no restart needed)."""
+    raw = os.getenv(_F7_SETTLE_PAGES_ENV) or ""
+    pages = tuple(dict.fromkeys(p.strip().lower() for p in raw.split(",") if p.strip()))
+    return () if any(p in ("*", "all") for p in pages) else pages
+
+
+def _f7_settle_pages_label() -> str:
+    """v5.157.0: the scope as disclosed in /health engine_gates and the
+    [GUARDS] boot line ("all" = every page)."""
+    pages = _f7_settle_pages()
+    return ",".join(pages) if pages else "all"
+
+
+def _f7_settle_page_in_scope(page: Any) -> bool:
+    """v5.157.0: may TFB_SCORING_SETTLE=enforce publish a settled row for this
+    page? True with no scope configured; otherwise only for a listed page (a
+    blank page is never listed). Out of scope, enforce is handled as observe."""
+    pages = _f7_settle_pages()
+    if not pages:
+        return True
+    return _safe_str(page).strip().lower() in pages
+
+
+def _f7_conf_unset(row: Mapping[str, Any]) -> bool:
+    """v5.157.0 [F7-CONF-RECOMPUTE]: True when none of the confidence keys
+    core.scoring.compute_confidence_score could reuse carries a value (each is
+    absent, None or blank), so the scorer certainly DERIVES the confidence from
+    data completeness. Conservative: any non-blank value reads as set, so a
+    reused confidence is never marked."""
+    for key in _F7_CONF_READ_KEYS:
+        value = row.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        return False
+    return True
+
+
+def _f7_conf_marker_strip(row: Any) -> None:
+    """v5.157.0 [F7-CONF-RECOMPUTE]: the provenance marker never leaves
+    _f7_settle_pass. A row without it is untouched (pop of a missing key)."""
+    if isinstance(row, dict):
+        row.pop(_F7_CONF_DERIVED_KEY, None)
+
+
 def _f7_settle_token(value: Any) -> str:
     """Rewrite a source/label token so it stays readable but can never carry
     one of the gate's forbidden substrings (longest rewrites first, then the
@@ -9968,18 +10106,22 @@ def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any], *, strict:
 
 
 def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
-                   first_diff: List[Tuple[str, str, str]]) -> str:
+                   diff: List[Tuple[str, str, str]]) -> str:
     """ONE substring-safe tag: f7_settle:<mode>:st<k|x>:p<n>:code=before>after
-    (at most 6 field disclosures; st = pass at which the row stopped changing,
-    x = still moving at the cap; p = re-passes executed). If a disclosure ever
+    (st = pass at which the row stopped changing, x = still moving at the cap;
+    p = re-passes executed). v5.157.0 [F7-FINAL-TAG]: the caller passes the
+    pass-1 -> FINAL settled diff, disclosed for at most _F7_SETTLE_TAG_MAX (8)
+    fields in the order ov op os rc va fcf r12 fs. If a disclosure ever
     contained a forbidden substring the tag degrades to a count-only form."""
     parts = [_F7_SETTLE_TAG, mode, "st%s" % (settled_at if settled_at else "x"), "p%d" % int(passes_run)]
-    for code, a, b in list(first_diff)[:6]:
+    order = {code: i for i, code in enumerate(_F7_SETTLE_TAG_ORDER)}
+    ranked = sorted(list(diff), key=lambda d: order.get(d[0], len(order)))
+    for code, a, b in ranked[:_F7_SETTLE_TAG_MAX]:
         parts.append("%s=%s>%s" % (code, a, b))
     tag = ":".join(parts)
     low = tag.lower()
     if any(f in low for f in _REL_PATH_FORBIDDEN):
-        tag = ":".join(parts[:4]) + ":chg%d" % len(first_diff)
+        tag = ":".join(parts[:4]) + ":chg%d" % len(diff)
     return tag
 
 
@@ -10011,6 +10153,13 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                           reason="intrinsic_model_basis_unproven")
             if model_values is not None:
                 cand["intrinsic_value"], cand["upside_pct"] = model_values
+            # v5.157.0 [F7-CONF-RECOMPUTE]: a confidence the scorer DERIVED on
+            # a cold pass 1 is re-derived from the completed fields instead of
+            # reused. None reads as absent to core.scoring; keys keep position.
+            if cand.get(_F7_CONF_DERIVED_KEY):
+                for key in _F7_CONF_SCORER_KEYS:
+                    if key in cand:
+                        cand[key] = None
             _compute_scores_canonical_first(cand)
             if model_values is not None:
                 # The canonical patch rounds its display upside independently;
@@ -10032,9 +10181,14 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 first_diff = last_diff
             if not last_diff:
                 stable_row = row if k == 2 else cand
+                final_diff: Tuple[Tuple[str, str, str], ...] = ()
                 if stable_row is not row:
                     _cap_intrinsic_display(stable_row)
-                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff)
+                    _f7_conf_marker_strip(stable_row)
+                    # v5.157.0 [F7-FINAL-TAG]: disclosure only, never a verdict.
+                    final_diff = tuple(_f7_settle_diff(frozen_input, stable_row))
+                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff,
+                                          final_diff=final_diff)
             if any(not _f7_settle_diff(prior, cand, strict=True) for prior in history):
                 return F7SettlementResult("non_converged", passes_run=passes_run,
                                           first_diff=first_diff, last_diff=last_diff, reason="oscillation")
@@ -10053,16 +10207,28 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
     Off leaves unmarked rows unchanged. Observe keeps successful pass-1 values
     and Enforce publishes a proved stable row. Neither mode nor a later switch
     to Off can turn a known error/non-convergence into valid scores or funding.
+    v5.157.0 (F-7 v2): the _f7_conf_derived marker is stripped on every return
+    path; Enforce on a page outside TFB_SCORING_SETTLE_PAGES runs as Observe;
+    the tag discloses pass 1 -> FINAL.
     """
     if not isinstance(row, dict):
         return row
     if _f7_settle_failed(row):
+        _f7_conf_marker_strip(row)
         _f7_settle_holdback(row)
         return row
     mode = _f7_settle_mode()
     if mode == "off":
+        _f7_conf_marker_strip(row)  # no-op unless the mode flipped after pass 1
         return row
+    # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe.
+    if mode == "enforce" and not _f7_settle_page_in_scope(page):
+        mode = "observe"
     result = _f7_settle_result(row)
+    # v5.157.0 [F7-CONF-RECOMPUTE]: the iterates were copies; the marker is done.
+    _f7_conf_marker_strip(row)
+    if result.row is not None and result.row is not row:
+        _f7_conf_marker_strip(result.row)
     if result.status != "stable":
         # v5.153.0 (WP-2b): only a non_converged result consults
         # TFB_SETTLE_UNRESOLVED; status error stays fail-closed in every mode.
@@ -10097,7 +10263,9 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
         _f7_unresolved_strip(result.row)
     if not result.first_diff:
         return row
-    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
+    # v5.157.0 [F7-FINAL-TAG]: pass 1 -> FINAL (what enforce publishes), not
+    # pass 1 -> pass 2; which rows carry a tag is unchanged (first_diff).
+    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.final_diff))
     out = row if mode == "observe" else result.row
     _v573_append_warning(out, tag)
     return out
@@ -10534,6 +10702,9 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
         row["confidence_bucket"] = "MODERATE"
     else:
         row["confidence_bucket"] = "LOW"
+    # v5.157.0 [F7-CONF-RECOMPUTE]: Phase-II OWNS a synthetic row's confidence,
+    # so it is no longer scorer-derived; no marker -> F-7 settles as v5.156.0.
+    _f7_conf_marker_strip(row)
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
@@ -11747,6 +11918,10 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 
     if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
         try:
+            # v5.157.0 [F7-CONF-RECOMPUTE]: provenance is read BEFORE scoring;
+            # off -> False, nothing is marked (byte-identical v5.156.0).
+            _conf_derives = (not row.get("_f7_settlement_active")
+                             and _f7_settle_mode() != "off" and _f7_conf_unset(row))
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
                 _f7_reject_scoring_patch_failures(row, patch)
@@ -11768,6 +11943,8 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 }
                 row.update(safe_patch)
                 _preserve_scoring_provenance(row, patch)
+                if _conf_derives and _as_float(patch.get("forecast_confidence")) is not None:
+                    row[_F7_CONF_DERIVED_KEY] = True
                 return
             if row.get("_f7_settlement_active"):
                 raise RuntimeError("canonical scoring returned no score patch")
@@ -11795,6 +11972,9 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """Backward-compatible v5.74.0 delegator."""
     _compute_scores_canonical_first(row)
+    # v5.157.0 [F7-CONF-RECOMPUTE]: no _f7_settle_pass follows this delegator,
+    # so the transient confidence marker never outlives the call.
+    _f7_conf_marker_strip(row)
 
 
 def _empty_row_fundamentals_exempt(row: Mapping[str, Any]) -> bool:
@@ -17938,7 +18118,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s scoring_settle_pages=%s fc_tuple=%s "
                 "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
                 "settle_unresolved=%s price_precision=%s",
                 __version__,
@@ -17956,6 +18136,7 @@ class DataEngineV5:
                 _g(_fund_lkg_enabled),
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
+                _f7_settle_pages_label(),   # v5.157.0 (F-7 v2): enforce page scope provable at boot
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
