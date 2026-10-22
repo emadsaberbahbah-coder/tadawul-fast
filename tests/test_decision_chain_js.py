@@ -1,4 +1,4 @@
-"""26_Decision_Chain v1.0.0: run the native harness (the REAL Apps Script
+"""26_Decision_Chain v1.0.2: run the native harness (the REAL Apps Script
 sources in a vm) so the whole-suite CI job collects it."""
 from __future__ import annotations
 
@@ -27,4 +27,4 @@ def test_decision_chain_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "RESULT 17/17 PASS" in result.stdout
+    assert "RESULT 28/28 PASS" in result.stdout
