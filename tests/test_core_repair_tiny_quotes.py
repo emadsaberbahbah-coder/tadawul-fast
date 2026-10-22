@@ -21,7 +21,9 @@ OTHER_COMMIT = "f" * 40
 # the source constant, so the pin moves in place.
 # 2026-10-22: 5.158.0 after main's #816 took 5.156.0 and the bundle's fallback
 # moved to 5.157.0; still an in-place pin, compared with the source constant.
-ENGINE = "5.158.0"
+# 2026-10-22 (second merge): 5.160.0 after main's #817 took 5.157.0, the bundle's
+# fallback moved to 5.159.0 and open #818 claims 5.158.0; an in-place pin.
+ENGINE = "5.160.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

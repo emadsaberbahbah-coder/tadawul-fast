@@ -1,5 +1,19 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.4 (2026-10-21) -- HISTORICAL TARGET-SESSION CLOSE (OWNER OPT-IN)
+# WHY (2026-10-21): 1.0.3 stops new losses only when a run lands inside a
+# record's target session; records whose session already passed stay ACTIVE for
+# good (acceptance D10-3b: 3,208 overdue, matured flat at 11,791 since ~10 Oct).
+# WHAT: the 'Run performance clock' step maps repository Variable
+# TRACK_HIST_TARGET_CLOSE (default 'off' = 1.0.3 behaviour) to track_performance
+# v6.47.0: 'observe' logs one [HIST-CLOSE v6.47.0] line counting the overdue
+# records whose exact target-session close was witnessed; 'enforce' matures them
+# on that close through the unchanged CA-GUARD path. TRACK_HIST_CLOSE_BUDGET
+# (default '60' symbols) and TRACK_HIST_CLOSE_TIME_SEC (default '240') bound the
+# daily-bar pulls per audit pass; both defaults equal the script's own. It only
+# acts in an audit pass (run_audit=true, or TRACK_SCHEDULED_AUDIT=1 from 1.0.3).
+# Only this lane is mapped; daily_sync's tracker step is unchanged.
+# Rollback: unset TRACK_HIST_TARGET_CLOSE (or set off).
 # VERSION 1.0.3 (2026-10-20) -- OWNER OPT-IN SCHEDULED MATURITY AUDIT
 # WHY (2026-10-20 export): a record matures only on a quote from its exact
 # target session (track_performance _outcome_target_session: "never use a later
@@ -291,6 +305,10 @@ jobs:
           INPUT_RUN_AUDIT: ${{ github.event.inputs.run_audit }}
           # (2026-10-20) 1.0.3: owner opt-in scheduled maturity audit; '0' = record-only schedules (1.0.2).
           TRACK_SCHEDULED_AUDIT: ${{ vars.TRACK_SCHEDULED_AUDIT || '0' }}
+          # (2026-10-21) 1.0.4: v6.47.0 historical target-session close; 'off' = v6.45.0 maturation.
+          TRACK_HIST_TARGET_CLOSE: ${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}
+          TRACK_HIST_CLOSE_BUDGET: ${{ vars.TRACK_HIST_CLOSE_BUDGET || '60' }}
+          TRACK_HIST_CLOSE_TIME_SEC: ${{ vars.TRACK_HIST_CLOSE_TIME_SEC || '240' }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's

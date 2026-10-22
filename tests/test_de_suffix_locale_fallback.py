@@ -1,4 +1,4 @@
-"""data_engine_v2 v5.157.0 (authored as 5.155.0; renumbered past #810 and #816) -- SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK).
+"""data_engine_v2 v5.159.0 (authored as 5.155.0; renumbered past #810, #816 and #817, and past open #818's 5.158.0) -- SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK).
 
 The 2026-10-13 20:37 Riyadh Top_10 export published MWG.VN as Market
 NASDAQ/NYSE, Ccy USD, Price 74,700, Price SAR 280,653.13 (true ~11.06 SAR).
@@ -53,8 +53,8 @@ nz = importlib.import_module("core.symbols.normalize")
 
 ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 DE_BASE = os.environ.get("TFB_TEST_DE_BASE", "")
-BASE_VERSION = "5.156.0"   # merge note 2026-10-22 (#778): main #816 is the new base (was 5.155.0, #810)
-# 2026-10-15 (v5.158.0 since 2026-10-22): default armed in code, so unset (None) now arms;
+BASE_VERSION = "5.157.0"   # merge note 2026-10-22 (#778, second): main #817 is the new base (was 5.156.0, #816; 5.155.0, #810)
+# 2026-10-15 (v5.160.0 since the second 2026-10-22 merge): default armed in code, so unset (None) now arms;
 # an explicit blank still reads off in the engine and stays in OFF.
 ARMED = (None, "1", "true", "yes", "on", " ON ", "True")
 OFF = ("", "0", "false", "off", "no", "observe", "enforce", "2")
@@ -338,14 +338,14 @@ def case_n5_no_new_health_key(mp, _tmp):
 
 def case_n6_ascii_added_lines(_mp, _tmp):
     src = (ROOT / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
-    start = src.index("WHY v5.157.0 (2026-10-14")
+    start = src.index("WHY v5.159.0 (2026-10-14")
     block = src[start:src.index("WHY v5.154.0 - INTEGRATED")]
-    helper = src[src.index("# v5.157.0 - SUFFIX LOCALE FALLBACK"):
+    helper = src[src.index("# v5.159.0 - SUFFIX LOCALE FALLBACK"):
                  src.index("def _infer_exchange_from_symbol")]
     for text in (block, helper):
         assert all(ord(ch) < 128 for ch in text)
-    assert src.count("_nzl = _suffix_locale_nz_for(s)  # v5.157.0: off -> None") == 2
-    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 157, 0)
+    assert src.count("_nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None") == 2
+    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 159, 0)
     if (ROOT / ".git").exists():
         try:
             diff = subprocess.run(

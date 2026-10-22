@@ -96,7 +96,8 @@ os.environ.setdefault("TFB_TEST_SCORE_BUDGET_MS", "200")
 
 # 2026-10-15 (decision-pages launch): the owner armed five defaults in code
 # (opportunity_builder 1.28.0, portfolio_actions 1.17.0, data_engine_v2
-# 5.157.0 since 2026-10-21, 5.158.0 since 2026-10-22, daily_sync.yml FW-2 enforce). The batteries written while these
+# 5.157.0 since 2026-10-21, 5.158.0 since 2026-10-22, 5.160.0 since the second 2026-10-22
+# merge, daily_sync.yml FW-2 enforce). The batteries written while these
 # were default-off assert that legacy behaviour without naming the variable,
 # so the test process pins the legacy value here, exactly like the auth
 # defaults above. A test that deletes or sets the name still controls it, and
