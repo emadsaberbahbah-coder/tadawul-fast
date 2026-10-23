@@ -335,7 +335,8 @@ def test_u8_wiring_and_version():
     assert src.count("if _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never seats a board row") == 1
     # prior contracts intact
     assert src.count("scoring_settle=%s") == 1 and src.count("tuple_noise=%s") == 1
-    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx)") == 1
+    # v5.157.0 (F-7 v2): the call site passes the inferred market scope page
+    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))") == 1
     assert de._F7_UNRESOLVED_RANK_TAG == "rank_skipped_settle_unresolved"
     assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 153, 0)
     assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v" + de.__version__ in src

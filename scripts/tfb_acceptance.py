@@ -90,7 +90,40 @@ from typing import Any, Dict, List, Optional, Tuple
 # entered cash as deployable evidence. Ambiguous KPI strips stay unknown;
 # qualified/funded counts require finite nonnegative whole values. Unknown
 # counts are NA while independent SEAT-CHECK execution/parity is checked.
-VERSION = "1.0.9"
+# v1.0.10 (2026-10-20) -- LIVE READ WINDOW FOR THE DECISION-INTEGRITY CHECKS.
+# WHY: on the live workbook A1, A2a, A3-Global_Markets and A3-Market_Leaders
+# have never measured anything. Run 39420446126 (20 Oct 12:12Z) prints
+# 'A1 ... NA Top_10 board section not found', 'A2a ... NA Top_10 audit section
+# not found' and 'A3-<page> ... NA Symbol/Name columns not found' (4 of its 6
+# hard NAs; a hard NA alone makes the overall verdict FAIL every day, so a
+# real collision, untradable seat or FX error could not change the verdict).
+# The checks are right; the live reader starves them: LiveSource reads
+# Top_10_Investments as rows 1-60 x columns 1-12, while the board header is
+# 30 columns wide with Stability in column 25 (row 19) and the audit header
+# sits at about row 61 with up to 500 rows under it (14 Oct export); and it
+# batch-reads 11 page columns that do not include Name. The export path
+# reads whole tabs, so --selftest and --export-dir always passed. Measured
+# on the 14 Oct export with this file's export path: A1 PASS (4 seats), A2a
+# WARN (median 3.7424, 7 of 388 USD rows outside [3.74, 3.77]), A3 PASS on
+# both pages (6,028 and 255 equity rows).
+# CHANGE (gate TFB_ACCEPTANCE_LIVE_WINDOW, default off; 1/true/yes/on = on):
+# Source.integrity_tab(name) is what A1/A2a (_top10_sections) and A3 now
+# read. The base method returns tab(name), so the export, xlsx and selftest
+# sources are unchanged. LiveSource.integrity_tab returns tab(name) when the
+# gate is off (the v1.0.9 reads, same calls, same order); when it is on it
+# reads Top_10_Investments rows 1..row_count x 40 columns, and the equity
+# pages' Symbol + Name columns (one header read + one batch_get each), each
+# cached under its own key. Every other check keeps its v1.0.9 read, so only
+# A1, A2a and A3 can change. A failed window read is recorded in .errors
+# (fail-closed, like tab()). _page_columns takes an optional column tuple;
+# without it, it is the v1.0.9 function. Read-only as before; no thresholds,
+# bands or check logic change. ROLLBACK: unset the repository Variable
+# TFB_ACCEPTANCE_LIVE_WINDOW (acceptance_check.yml maps it with default 0).
+# Functions added: 3 (_live_window_enabled, Source.integrity_tab,
+# LiveSource.integrity_tab). Changed: 3 (_page_columns optional argument,
+# _top10_sections and check_decision_integrity A3 read integrity_tab).
+# Removed: 0.
+VERSION = "1.0.10"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -218,6 +251,12 @@ class Check:
 # --------------------------------------------------------------------------- #
 # data sources                                                                #
 # --------------------------------------------------------------------------- #
+def _live_window_enabled() -> bool:
+    """v1.0.10: TFB_ACCEPTANCE_LIVE_WINDOW=1 lets the live reader give A1, A2a
+    and A3 the rows and columns they parse. Default off = the v1.0.9 reads."""
+    return _s(os.getenv("TFB_ACCEPTANCE_LIVE_WINDOW")).lower() in ("1", "true", "yes", "on")
+
+
 class Source:
     """Uniform access: tab(name) -> list of rows (list of str). Missing -> [].
     v1.0.2: every read problem is RECORDED in .errors (fail-closed: a check on
@@ -227,6 +266,11 @@ class Source:
 
     def tab(self, name: str) -> List[List[str]]:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def integrity_tab(self, name: str) -> List[List[str]]:
+        """v1.0.10: the rows the decision-integrity checks (A1, A2a, A3) parse.
+        Every source but the live one already returns whole tabs."""
+        return self.tab(name)
 
     def runlog_tail(self, n: int = 400) -> List[List[str]]:
         rows = self.tab("_Run_Log")
@@ -351,18 +395,20 @@ class LiveSource(Source):
         r1 = max(r0, min(r1, rc))
         return f"A{r0}:{self._col_letter(max(1, min(cols, cc)))}{r1}"
 
-    def _page_columns(self, ws) -> List[List[str]]:
+    def _page_columns(self, ws, cols: Optional[Tuple[str, ...]] = None) -> List[List[str]]:
         """v1.0.1: read only the columns the checks need (header-driven), via
         one batch_get — a 6,609 x 115 page is ~8 MB as a single values.get."""
+        # v1.0.10: cols (default _PAGE_COLS) names the columns to read.
+        cols = self._PAGE_COLS if cols is None else cols
         hdr = (ws.get(self._rng(ws, 1, 1, 200)) or [[]])[0]
         idx = {}
         for i, h in enumerate(hdr):
-            if _s(h) in self._PAGE_COLS and _s(h) not in idx:
+            if _s(h) in cols and _s(h) not in idx:
                 idx[_s(h)] = i + 1
         if "Symbol" not in idx:
             return []
         rc = int(getattr(ws, "row_count", 0) or 0) or 2
-        names = [n for n in self._PAGE_COLS if n in idx]
+        names = [n for n in cols if n in idx]
         ranges = [f"{self._col_letter(idx[n])}2:{self._col_letter(idx[n])}{rc}" for n in names]
         blocks = ws.batch_get(ranges) or []
         n_rows = max((len(b) for b in blocks), default=0)
@@ -402,6 +448,34 @@ class LiveSource(Source):
             rows = []
         self._cache[name] = [[_s(c) for c in r] for r in rows]
         return self._cache[name]
+
+    # v1.0.10: the board header is 30 columns wide (Stability = column 25) and
+    # the audit runs to ~row 560 on the 14 Oct export; 40 columns leave room.
+    _T10_WIDE_COLS = 40
+    _A3_COLS = ("Symbol", "Name")
+
+    def integrity_tab(self, name: str) -> List[List[str]]:
+        """v1.0.10: off -> tab(name) (the v1.0.9 reads). On -> Top_10_Investments
+        rows 1..row_count x 40 columns, and Symbol + Name of an equity page, each
+        cached under its own key. A failed read is recorded, never silent."""
+        if not _live_window_enabled() or (name != "Top_10_Investments" and name not in PAGES):
+            return self.tab(name)
+        key = "integrity:" + name
+        if key in self._cache:
+            return self._cache[key]
+        try:
+            ws = self.book.worksheet(name)
+            if name == "Top_10_Investments":
+                rc = int(getattr(ws, "row_count", 0) or 0)
+                rows = ws.get(self._rng(ws, 1, rc or 1000, self._T10_WIDE_COLS)) or []
+            else:
+                rows = self._page_columns(ws, self._A3_COLS)
+        except Exception as exc:  # recorded, never silent: the check reports NA
+            self.errors.append(f"live tab {name} (integrity window) unreadable: {exc}")
+            print(f"[acceptance] tab {name} (integrity window) unreadable: {exc}", file=sys.stderr)
+            rows = []
+        self._cache[key] = [[_s(c) for c in r] for r in rows]
+        return self._cache[key]
 
 
 # --------------------------------------------------------------------------- #
@@ -830,8 +904,9 @@ def _top10_sections(src: Source) -> Dict[str, Tuple[List[str], List[List[str]]]]
     """v1.0.6: named sections of the Top_10 export -> (header, body rows).
     board    = the header row that carries both Symbol and Stability
     qualified= header after a row starting with ALL QUALIFIED
-    audit    = header after a row starting with CANDIDATES"""
-    rows = [[_s(c) for c in r] for r in src.tab("Top_10_Investments")]
+    audit    = header after a row starting with CANDIDATES
+    v1.0.10: reads integrity_tab (the live window when TFB_ACCEPTANCE_LIVE_WINDOW is on)."""
+    rows = [[_s(c) for c in r] for r in src.integrity_tab("Top_10_Investments")]
     out: Dict[str, Tuple[List[str], List[List[str]]]] = {}
 
     def body(i: int) -> List[List[str]]:
@@ -946,7 +1021,7 @@ def check_decision_integrity(src: Source) -> List[Check]:
                              f"sell_rows={len(sells)} blank_delta_shares={' '.join(blank) or 'none'}"))
     # A3 — equity identity collisions on the equity pages
     for p in ("Global_Markets", "Market_Leaders"):
-        rows = src.tab(p)
+        rows = src.integrity_tab(p)   # v1.0.10: Symbol + Name on the live window
         if not rows:
             out.append(Check(f"A3-{p}", f"{p} equity identity collisions (futures / crypto / contract-month names)",
                              "NA", None, "tab unreadable"))

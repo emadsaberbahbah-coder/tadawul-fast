@@ -1,6 +1,32 @@
 # =============================================================================
 # Release Decision Feed (P0-1) - .github/workflows/release_decision_feed.yml
 # =============================================================================
+# VERSION 1.1.0 (2026-10-19) -- SCHEDULED ATTEMPTS WITH SOURCE DISCOVERY
+#
+# WHY: the board has read 'FEED NOT ACTIONABLE ... 0 EXECUTABLE' on every
+# cockpit run since 15 Oct while 11-12 names qualified on merit. The feed is
+# downgrade-only and the ONLY promotion path was this workflow, dispatched by
+# hand with the sync run id, after the cockpits re-render and before the
+# 480-minute clock, several times a day. Nobody did, so nothing was ever
+# released (procedural stopper, not an audit failure).
+# WHAT: (1) 'schedule' triggers after the cockpit render slots (Riyadh 03:45,
+# 08:30, 13:45, 15:45, 20:45, 23:45) with source_run_id=auto and mode=release;
+# (2) source_run_id is optional on dispatch and defaults to 'auto'
+# (release_decision_feed.py v1.2.0 reads the cohort from the same bounded
+# _Status L:M block: the run= token of 'TFB Feed Global_Markets'); (3) on a
+# SCHEDULED run exit 1 (deferred: sync in flight) and exit 2 (audits not
+# accepted: cockpits have not consumed the cohort yet) end the job GREEN with
+# a warning annotation, because they are the expected answers between a sync
+# and its cockpit renders; exit 3 (refused, layout, write/readback fault) and
+# every non-zero exit of a DISPATCHED run stay RED. The artifact and the job
+# summary carry the exact outcome either way.
+# UNCHANGED: the gates (vars.TFB_DECISION_RELEASE off => dry-run, zero writes;
+# KILL sticky), the private concurrency group, the environment, the checkout
+# of this workflow's ref, the env block copied from the final job, the
+# supersede wiring, every acceptance rule in the script. Until the owner arms
+# TFB_DECISION_RELEASE the scheduled runs are the P0-1 commit sheet's
+# "zero-code observe experiment" performed automatically.
+#
 # VERSION 1.0.0 (2026-10-13) -- NEW WORKFLOW: review blocker 1 / P0-1 / D1
 #
 # WHY: since #751 the 'TFB Decision Feed' cell is downgrade-only. The sync and
@@ -8,9 +34,10 @@
 # after every strict audit passes. scripts/release_decision_feed.py v1.0.0 is
 # the explicit audited release; this workflow is its only production entry.
 #
-# MANUAL DISPATCH ONLY. Inputs reach the shell through env, never inline.
+# DISPATCH or SCHEDULE (v1.1.0). Inputs reach the shell through env, never inline.
 #   source_run_id  the COMPLETED Advanced Sync (daily_sync.yml) run whose
-#                  cohort both cockpits consumed. Never this run's own id.
+#                  cohort both cockpits consumed, or 'auto' (default; the
+#                  schedule always uses it). Never this run's own id.
 #   mode           release = re-run the strict audits bound to source_run_id
 #                  and promote (DRY-RUN report unless vars.TFB_DECISION_RELEASE
 #                  is armed); sweep = retract an expired/malformed EXECUTABLE;
@@ -59,8 +86,9 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "Completed Advanced Sync (daily_sync.yml) run ID to release (never this run)"
-        required: true
+        description: "Completed Advanced Sync (daily_sync.yml) run ID to release, or auto = the cohort in the Global_Markets feed (never this run)"
+        required: false
+        default: "auto"
         type: string
       mode:
         description: "release (dry-run unless armed) | sweep (retract expired) | kill (retract now)"
@@ -68,6 +96,13 @@ on:
         default: "release"
         type: choice
         options: [release, sweep, kill]
+  schedule:
+    # v1.1.0: after the cockpit render slots (UTC; Riyadh = UTC+3). Each run
+    # is source=auto / mode=release; deferred or not-yet-consumed cohorts end
+    # green with a warning, see the header. ~2 runner-minutes per slot.
+    - cron: "45 0,10,17,20 * * *"   # 03:45, 13:45, 20:45, 23:45 Riyadh
+    - cron: "30 5 * * *"            # 08:30 Riyadh, after the 08:07 morning render
+    - cron: "45 12 * * *"           # 15:45 Riyadh, after the 15:29 render
 
 concurrency:
   group: tfb-decision-release
@@ -106,16 +141,17 @@ jobs:
     steps:
       - name: Validate dispatch inputs
         env:
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          RELEASE_MODE: ${{ inputs.mode }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id || 'auto' }}
+          RELEASE_MODE: ${{ inputs.mode || 'release' }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
             echo "::error::The decision-feed release runs only from refs/heads/main (got $GITHUB_REF)."
             exit 3
           fi
-          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::source_run_id must be one positive run ID."
+          if [[ ! "$SOURCE_RUN_ID" =~ ^(auto|[1-9][0-9]*)$ ]]; then
+            echo "::error::source_run_id must be one positive run ID or auto."
             exit 3
           fi
           if [[ "$SOURCE_RUN_ID" == "$GITHUB_RUN_ID" ]]; then
@@ -126,6 +162,10 @@ jobs:
             release|sweep|kill) ;;
             *) echo "::error::mode must be release, sweep or kill."; exit 3 ;;
           esac
+          if [[ "$EVENT_NAME" == "schedule" && ( "$RELEASE_MODE" != "release" || "$SOURCE_RUN_ID" != "auto" ) ]]; then
+            echo "::error::a scheduled run is always mode=release with source_run_id=auto."
+            exit 3
+          fi
 
       - name: Checkout this workflow's ref
         uses: actions/checkout@v6
@@ -191,8 +231,9 @@ jobs:
       - name: Release or retract the decision feed
         id: release
         env:
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          RELEASE_MODE: ${{ inputs.mode }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id || 'auto' }}
+          RELEASE_MODE: ${{ inputs.mode || 'release' }}
+          EVENT_NAME: ${{ github.event_name }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -204,6 +245,16 @@ jobs:
             --json-out release_decision_feed.json || code=$?
           echo "release_exit=$code" >> "$GITHUB_OUTPUT"
           if [[ "$code" -ne 0 ]]; then
+            # v1.1.0: on the SCHEDULE, a deferral (1: a production writer is
+            # in flight) or a not-accepted audit (2: the cockpits have not
+            # consumed this cohort yet, or the render is older than the
+            # window) is the expected answer between a sync and its cockpit
+            # renders; the next slot retries. Refusals and faults (3) and
+            # every dispatched non-zero exit stay red.
+            if [[ "$EVENT_NAME" == "schedule" && ( "$code" -eq 1 || "$code" -eq 2 ) ]]; then
+              echo "::warning::Scheduled decision feed attempt: no release this slot (exit $code); see the artifact and the summary."
+              exit 0
+            fi
             echo "::error::Decision feed release did not complete (exit $code); see the artifact."
             exit "$code"
           fi
@@ -225,7 +276,7 @@ jobs:
               else:
                   result = json.loads(path.read_text())
                   handle.write('| Check | Result |\n|---|---|\n')
-                  for key in ('mode', 'exit_code', 'outcome', 'source_run_id', 'prior_class',
+                  for key in ('mode', 'exit_code', 'outcome', 'source_mode', 'source_run_id', 'prior_class',
                               'accepted', 'reasons', 'audit_exit_codes', 'blockers',
                               'deferred', 'released', 'expires', 'downgrade', 'would_downgrade',
                               'display_pending_cockpit_refresh'):

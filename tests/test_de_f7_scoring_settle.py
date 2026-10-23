@@ -848,7 +848,8 @@ def test_t7_tag_composer_degrades_on_forbidden_substring():
 
 def test_t8_wiring_and_version():
     src = inspect.getsource(de)
-    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx)") == 1
+    # v5.157.0 (F-7 v2): the call site passes the inferred market scope page
+    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))") == 1
     assert src.count('"scoring_settle": _f7_settle_mode(),') == 1
     # v5.148.0: the boot-line literal grows a leg per gate; check the leg, not the line
     assert src.count("scoring_settle=%s") == 1

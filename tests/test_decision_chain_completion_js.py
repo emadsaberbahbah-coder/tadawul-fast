@@ -16,4 +16,4 @@ def test_decision_chain_completion():
         cwd=root, capture_output=True, text=True, timeout=60, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS 141/141 decision-chain completion checks" in result.stdout
+    assert "PASS 147/147 decision-chain completion checks" in result.stdout

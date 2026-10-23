@@ -208,3 +208,61 @@ def test_large_price_rounding_contract_is_unchanged(monkeypatch, value):
 def test_portfolio_price_formatter_preserves_null_and_nonfinite_behavior(monkeypatch, value):
     monkeypatch.setenv("TFB_PRICE_PRECISION", "on")
     assert pa._round_price(value) is None
+
+
+def test_precision_integration_keeps_conviction_targets_and_absolute_cash_reserve(monkeypatch):
+    """The new main allocator and the older optional display path compose."""
+    monkeypatch.setenv("TFB_OPP_SIZING_MODE", "conviction")
+    monkeypatch.setenv("TFB_OPP_CASH_FLOOR_SAR", "500")
+    monkeypatch.setenv("TFB_OPP_CASH_FLOOR_MODE", "enforce")
+    rows = [holding(5.47e-6), {**holding(.004321987), "Symbol": "SYNTHETIC2.SR",
+                             "Sector": "Other synthetic"}]
+    criteria = {"max_selected": 10, "max_per_sector": 10, "max_per_market": 10,
+                "max_weight_pct": 100.0, "pf_max_sector_pct": 100.0,
+                "min_ticket_sar": 1000.0, "trust_gate_enabled": False}
+    def allocated():
+        return build_with_observed_inputs(ob, rows, criteria=criteria,
+            portfolio={"cash_available_sar": 10000}, fx_rates={"SAR": 1})
+    off = allocated()
+    monkeypatch.setenv("TFB_PRICE_PRECISION", "on")
+    on = allocated()
+    assert on["meta"]["sizing"] == off["meta"]["sizing"]
+    assert on["meta"]["sizing"]["mode"] == "conviction"
+    assert on["meta"]["sizing"]["budget_sar"] <= 9500
+    assert on["kpis"] == off["kpis"]
+    assert len(on["selected"]) == len(off["selected"]) == 2
+    assert [(t["symbol"], t["suggested_shares"], t["suggested_sar"])
+            for t in on["selected"]] == [
+           (t["symbol"], t["suggested_shares"], t["suggested_sar"])
+            for t in off["selected"]]
+    assert sum(t["suggested_sar"] for t in on["selected"]) <= 9500 + 1e-6
+    assert all(t["price"] > 0 for t in on["selected"])
+    assert off["selected"][0]["price"] == 0
+
+
+@pytest.mark.parametrize("quantity", [0.4, 1.6, 10.6])
+def test_precision_integration_keeps_main_whole_share_exit_and_actual_residual(monkeypatch, quantity):
+    row = {**holding(.4321987), "Quantity": quantity,
+           "Intrinsic Value": .2, "Recommendation": "SELL"}
+    def action():
+        result = build_certified_portfolio_actions(pa, [row], controls={
+            "cash_available_sar": 0, "target_cash_pct": 0,
+            "max_position_pct": 100, "max_sector_pct": 100}, fx_rates={"SAR": 1})
+        assert result["meta"]["execution_ready"] is True
+        return result["actions"][0]
+    off = action()
+    monkeypatch.setenv("TFB_PRICE_PRECISION", "on")
+    on = action()
+    assert on["action"] == off["action"] == "EXIT"
+    assert on["quantity"] == off["quantity"] == quantity
+    for key in ("suggested_delta_shares", "proceeds_sar", "post_trade_weight_pct"):
+        assert on[key] == off[key]
+    if quantity < 1:
+        assert on["suggested_delta_shares"] is None
+        assert on["post_trade_weight_pct"] is None
+        assert on["proceeds_sar"] == 0
+    else:
+        sold = int(quantity)
+        assert on["suggested_delta_shares"] == -sold
+        assert on["post_trade_weight_pct"] == round((quantity - sold) / quantity * 100, 1)
+    assert on["price"] == .4321987 and off["price"] == .43

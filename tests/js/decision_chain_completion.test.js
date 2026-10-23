@@ -23,13 +23,31 @@ function receipt(action='t10', fields={}) {
 }
 function world() {
   const w = load('valid');
+  w.ctx.SHEET_NAMES = {MY_PORTFOLIO:'My_Portfolio'};
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../apps_script/10_My_Portfolio.gs'), 'utf8'),w.ctx,{filename:'10_My_Portfolio.gs'});
+  w.ctx.refreshPortfolioDecision = undefined; // Focus this harness on Top-10 unless explicitly installed below.
   vm.runInContext(coordinatorSource,w.ctx,{filename:'11_Manual_Refresh_Coordinator.gs'});
   vm.runInContext(source,w.ctx,{filename:'26_Decision_Chain.gs'});
-  w.now = NOW; w.ctx.Date.now = () => w.now;
+  w.now = NOW;
+  w.ctx.Date = class FixedDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [w.now])); }
+    static now() { return w.now; }
+  };
   w.calls = 0; w.uuid = 0; w.lockDepth = 0;
   w.io = {books:0,locks:0,sets:0,deletes:0,triggerWrites:0,guardCalls:0};
   w.lockResults = []; w.finishError = false;
   w.ctx.Utilities.getUuid = () => 'synthetic-owner-' + (++w.uuid);
+  const originalDateFormat = w.ctx.Utilities.formatDate;
+  w.ctx.Utilities.formatDate = (date, zone, pattern) => pattern === 'Z' ? '+0300' : originalDateFormat(date, zone, pattern);
+  w.nativeReceipts = 0;
+  w.publishReceipt = (action, result) => {
+    if (!result || result.state !== 'completed' || result.contract !== 'tfb_native_refresh_v1') return;
+    const name = action === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments';
+    const sheet = w.book.getSheetByName(name);
+    if (!sheet) return;
+    sheet.getRange(2,2).setValue('Last run ' + w.ctx.Utilities.formatDate(new Date(w.now), 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss') +
+      ' | status: ok | source readiness VERIFIED (run ' + result.source_run + ') | synthetic=' + (++w.nativeReceipts));
+  };
   const getBook = w.ctx.SpreadsheetApp.getActiveSpreadsheet;
   w.ctx.SpreadsheetApp.getActiveSpreadsheet = () => {w.io.books++;return getBook();};
   const props = {
@@ -52,7 +70,13 @@ function world() {
   }};
   w.ctx.ScriptApp = {getProjectTriggers(){return [];},deleteTrigger(){w.io.triggerWrites++;},
     newTrigger(){w.io.triggerWrites++;throw Error('no trigger mutation expected');}};
-  const getSheet = w.book.getSheetByName.bind(w.book);
+  w.pfStatus = '';
+  const pfSheet = {getRange(row,col) {
+    assert.deepEqual([row,col],[2,2]);
+    return {getValue(){return w.pfStatus;},setValue(value){w.pfStatus=value;return this;}};
+  }};
+  const originalGetSheet = w.book.getSheetByName.bind(w.book);
+  const getSheet = name => name === 'Portfolio_Decision' ? pfSheet : originalGetSheet(name);
   const status = getSheet('_Status');
   let feedReads = 0, gridReads = 0;
   w.statusTransform = (values) => values;
@@ -73,7 +97,7 @@ function world() {
     w.ctx.refreshDecisionTop10 = options => {
       w.calls++;assert.equal(w.lockDepth,1,'native uses existing coordinator writer lock');
       assert.equal(w.lockKind,'writer','native execution outside short transaction lock');
-      assert.equal(options.completionContract,true);return fn();
+      assert.equal(options.completionContract,true);const result=fn();w.publishReceipt('t10',result);return result;
     };
   };
   w.tick = () => w.ctx.tfbDecisionChainTick();
@@ -99,7 +123,7 @@ function unverified(w,action='t10') {
 }
 
 test('delivered chain version uses its separate runtime source',()=>{
-  const w=world(); assert.equal(w.ctx.TFB_DC_VERSION,'1.0.1');
+  const w=world(); assert.equal(w.ctx.TFB_DC_VERSION,'1.0.3');
   assert(source.includes('native\n *   function OUTSIDE'));
 });
 for (const mode of [undefined,'off','invalid']) test('default/off mode has no service writes or native work: '+mode,()=>{
@@ -173,7 +197,7 @@ test('PF uses opt-in API, rejects its legacy normal-return string',()=>{
 });
 test('PF valid typed empty result acknowledges only PF',()=>{
   const w=world();w.ctx.pdSrcReadiness_=()=>({ready:true,cohort:RUN,stamp_ms:SOURCE_MS});
-  w.ctx.refreshPortfolioDecision=opts=>{w.calls++;assert.equal(opts.completionContract,true);return receipt('pd',{output_state:'EMPTY'});};
+  w.ctx.refreshPortfolioDecision=opts=>{w.calls++;assert.equal(opts.completionContract,true);const r=receipt('pd',{output_state:'EMPTY'});w.publishReceipt('pd',r);return r;};
   assert.equal(w.tick(),'refreshed pd run '+RUN);assert.equal(w.state().pd,RUN);assert(!w.state().t10);
 });
 test('owned deferred result refunds each attempt with no immediate retry',()=>{
@@ -419,13 +443,14 @@ test('real native same-run later final witness refreshes again, exact identity s
     if(kind==='feeds')rows.forEach(r=>{r[1]=r[1].replace('12:00:00',r[0]==='TFB Decision Feed'?'12:20:00':'12:10:00');});
     return rows;
   };
+  w.now += 60000; // Distinct real attempt clock must be reflected in B2 readback.
   assert.equal(w.tick(),'refreshed t10 run '+RUN);assert.equal(w.fetches.length,2);
   assert.equal(w.state().t10_ms,SOURCE_MS+20*60000);assert.match(w.tick(),/already refreshed/);
 });
 test('PF same-run later publication refreshes again and binds returned stamp',()=>{
   const w=world();let stamp=SOURCE_MS;w.ctx.refreshDecisionTop10=undefined;
   w.ctx.pdSrcReadiness_=()=>({ready:true,cohort:RUN,stamp_ms:stamp});
-  w.ctx.refreshPortfolioDecision=()=>{w.calls++;return receipt('pd',{source_stamp_ms:stamp});};
+  w.ctx.refreshPortfolioDecision=()=>{w.calls++;const r=receipt('pd',{source_stamp_ms:stamp});w.publishReceipt('pd',r);return r;};
   assert.equal(w.tick(),'refreshed pd run '+RUN);assert.equal(w.state().pd_ms,stamp);
   w.tick();assert.equal(w.calls,1);stamp+=60000;
   assert.equal(w.tick(),'refreshed pd run '+RUN);assert.equal(w.state().pd_ms,stamp);assert.equal(w.calls,2);
@@ -501,4 +526,39 @@ for(const raw of ['   ','{"unknown":1}','{"pd_ms":1}','{"t10":"90001","t10_ms":0
     assert.equal(w.calls,0);assert.equal(w.props[KEY],raw);assert.equal(w.io.sets,0);
   });
 }
+
+test('typed completed receipt cannot acknowledge an unchanged B2 native board',()=>{
+  const w=world();w.publishReceipt=()=>{};w.stub(()=>receipt());
+  assert.match(w.tick(),/native status was not updated/);unverified(w);
+});
+test('known main release-attempt budget remains a conservative bound',()=>{
+  const w=world(), issued='2026-10-12T12:01:00+03:00';
+  w.props[KEY]=JSON.stringify({t10:RUN,t10_ms:SOURCE_MS,t10rel:'',attempts:{['t10rel:'+issued]:3}});
+  decisionValue(w,releaseValue);w.stub(()=>receipt());
+  assert.match(w.tick(),/gave up after 3 attempts/);assert.equal(w.calls,0);
+  assert.equal(w.state().attempts['t10rel:'+issued],3);
+});
+test('release identity completes exactly once when the prior final witness shares its second',()=>{
+  const w=world(), issued='2026-10-12T12:01:00+03:00', ms=Date.parse(issued);
+  w.props[KEY]=JSON.stringify({t10:RUN,t10_ms:ms,t10rel:''});
+  decisionValue(w,releaseValue);w.stub(()=>receipt());
+  assert.equal(w.tick(),'refreshed t10 run '+RUN);assert.equal(w.state().t10rel,issued);
+  assert.match(w.tick(),/already refreshed/);assert.equal(w.calls,1);
+});
+test('observe records a same-second release identity once without native writes',()=>{
+  const w=world(), issued='2026-10-12T12:01:00+03:00', ms=Date.parse(issued);
+  w.props.TFB_DECISION_CHAIN='observe';
+  w.props[KEY]=JSON.stringify({observed:{t10:RUN,t10_ms:ms,t10rel:''}});
+  decisionValue(w,releaseValue);w.stub(()=>receipt());
+  assert.equal(w.tick(),'observed t10 run '+RUN);assert.equal(w.state().observed.t10rel,issued);
+  assert.match(w.tick(),/already refreshed/);assert.equal(w.calls,0);
+  assert.equal(w.chainLogs().filter(x=>x.row[4]==='OBSERVE').length,1);
+});
+for (const status of ['no_candidates','disabled']) test('legitimate native '+status+' is rendered evidence, not executable proof',()=>{
+  const w=world();const stamp=w.ctx.Utilities.formatDate(new Date(NOW),'Asia/Riyadh','yyyy-MM-dd HH:mm:ss');
+  const after='Last run '+stamp+' | status: '+status+' | source readiness VERIFIED (run '+RUN+')';
+  const result=w.ctx.tfbDcReceiptCore_('',after,RUN,NOW,NOW,w.ctx.tfbDcScriptStampMs_);
+  assert.equal(result.ok,true);assert.equal(w.calls,0);assert(!w.state().t10);
+});
+
 console.log('PASS '+passed+'/'+passed+' decision-chain completion checks');

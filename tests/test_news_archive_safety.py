@@ -53,12 +53,18 @@ def grid(*data, header=None):
 
 def observation(symbol=OBSERVATION, *, articles=0):
     return {"symbol": symbol, "sentiment": 0, "confidence": 0, "news_boost": 0,
-            "article_velocity": 0, "articles_analyzed": articles, "version": "offline"}
+            "article_velocity": 0, "articles_analyzed": articles, "version": "offline",
+            "collection_evidence": {"status": "OK" if articles else "EMPTY"}}
 
 
 def install(monkeypatch, worksheet, *, items=None, status="success", errors=0,
-            batch_errors=None, dry_run=False):
-    book = SimpleNamespace(worksheet=lambda _: worksheet)
+            batch_errors=None, dry_run=False, lookup_missing=False):
+    def lookup(_name):
+        if lookup_missing:
+            raise archive._WorksheetNotFound("News_Archive")
+        return worksheet
+
+    book = SimpleNamespace(worksheet=lookup, add_worksheet=lambda **_: worksheet)
     client = SimpleNamespace(open_by_key=lambda _: book)
     monkeypatch.setattr(archive, "GSPREAD_AVAILABLE", True)
     monkeypatch.setattr(archive, "gspread", SimpleNamespace(authorize=lambda _: client))
@@ -164,9 +170,11 @@ def test_valid_observation_with_no_articles_is_still_archived(monkeypatch, statu
 
 
 @pytest.mark.parametrize("values", [[], [[], [], [], [], []]])
-def test_confirmed_empty_archive_can_receive_its_first_header_and_observation(monkeypatch, values):
+def test_confirmed_new_archive_can_receive_its_first_header_and_observation(monkeypatch, values):
+    # Main now permits header initialization only for a confirmed missing/new
+    # worksheet. Existing blank worksheets remain unverified and untouched.
     worksheet = FakeWorksheet(values)
-    args, _ = install(monkeypatch, worksheet)
+    args, _ = install(monkeypatch, worksheet, lookup_missing=True)
 
     assert asyncio.run(archive.collect(args)) == 0
     assert worksheet.header_writes == [([archive.NewsArchiveStore.HEADERS], "A5:L5")]
@@ -174,11 +182,13 @@ def test_confirmed_empty_archive_can_receive_its_first_header_and_observation(mo
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_explicitly_successful_empty_fetch_remains_successful(monkeypatch, dry_run):
+def test_empty_batch_metadata_cannot_confirm_a_requested_symbols_acquisition(monkeypatch, dry_run):
     worksheet = FakeWorksheet(grid())
     args, _ = install(monkeypatch, worksheet, items=[], dry_run=dry_run)
 
-    assert asyncio.run(archive.collect(args)) == 0
+    # The newer per-symbol contract requires an explicit EMPTY observation;
+    # success metadata plus an omitted requested symbol remains UNKNOWN.
+    assert asyncio.run(archive.collect(args)) != 0
     assert worksheet.header_writes == []
     assert worksheet.appends == []
 
@@ -209,7 +219,7 @@ def test_blank_header_cannot_be_initialized_from_an_unconfirmed_empty_read(monke
 
 def test_unacknowledged_header_initialization_cannot_authorize_an_append(monkeypatch):
     worksheet = FakeWorksheet([])
-    args, _ = install(monkeypatch, worksheet)
+    args, _ = install(monkeypatch, worksheet, lookup_missing=True)
     # A transport returning without persistence must fail the subsequent read.
     monkeypatch.setattr(worksheet, "update", lambda **_: {})
 

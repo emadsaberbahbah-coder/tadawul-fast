@@ -358,8 +358,8 @@ check('W6 the mode tolerates case and surrounding blanks like the other PD prope
   for (const raw of ['ENFORCE', ' enforce ', 'Enforce\t']) {
     assert.deepEqual(build({props: {PD_PANEL_PRESERVE: raw}}).panel, OPERATOR, JSON.stringify(raw));
   }
-  assert.equal(ctx0.PD_VERSION, '1.5.16');
-  assert.ok(/\n \* Version: 1\.5\.16\n/.test(SOURCE));
+  assert.equal(ctx0.PD_VERSION, '1.5.18');
+  assert.ok(/\n \* Version: 1\.5\.18\n/.test(SOURCE));
 });
 
 check('W7 observe: a snapshot read fault is logged and the build carries on as v1.5.13', () => {

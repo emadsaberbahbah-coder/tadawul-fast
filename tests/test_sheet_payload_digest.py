@@ -10,7 +10,8 @@ import pytest
 from core import sheet_payload_digest as digest
 from core.sheets.schema_registry import get_sheet_headers
 from scripts import run_dashboard_sync as sync
-from tests.test_verified_name_labels import FakeSheetsAPI, binding, row_for
+from core import verified_name_labels as labels
+from tests.test_verified_name_labels import FakeSheetsAPI, binding, clock_for, row_for
 
 
 def test_independent_binary64_golden_vector_and_framed_utf8_bytes():
@@ -140,7 +141,16 @@ def test_receipt_binds_the_actual_nondefault_runtime_physical_start(writer):
 def test_receipt_captures_the_actual_post_name_rank_and_presentation_submission(writer, monkeypatch):
     actual, api = writer
     monkeypatch.setenv("TFB_RANK_OVERALL_PAGE", "enforce")
+    # Stable test: read the registry inside its actual reviewed window, exactly as
+    # tests/test_verified_name_labels.py does. Without this pin the test read the
+    # wall clock and started failing once the committed bindings' seven-day
+    # review window ended (2026-10-19 11:11 / 12:29 UTC), on main and every PR.
+    # 2026-10-21: the clock is this binding's own window (clock_for), because a
+    # weekly renewal can hold PE&OLES.MX while renewing others (run 39584281713).
     item = binding("PE&OLES.MX")
+    real_apply = labels.apply_verified_name_labels
+    now = clock_for(item)
+    monkeypatch.setattr(labels, "apply_verified_name_labels", lambda p, h, r: real_apply(p, h, r, now=now))
     headers = get_sheet_headers("Global_Markets")
     row = row_for(item)
     row[headers.index("Warnings")] = "critical:raw_witness; " + row[headers.index("Warnings")]

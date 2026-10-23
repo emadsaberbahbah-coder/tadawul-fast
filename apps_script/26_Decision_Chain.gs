@@ -1,8 +1,20 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.1 (2026-10-17)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.3 (2026-10-24)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.3 WHY: stack #804 and newer main independently repaired this chain.
+ * Preserve typed completion, source-publication identity, owned claims and HELD
+ * deferrals, and also require main's changed B2 receipt readback stamped during
+ * this attempt. EXECUTABLE release-issued renders remain tracked and bounded;
+ * a completed render under a release consumes that release exactly once.
+ * Legacy unknown publication identities still need reconciliation. No source,
+ * financial, trigger, retry-budget, eligibility or release policy is changed.
+ *
+ * v1.0.2 (main, 2026-10-23): require changed native source receipt readback,
+ * including script-timezone and DST-safe render timestamp verification.
+ * v1.0.1 (main, 2026-10-19): re-render Top_10 after each EXECUTABLE issued=.
  *
  * v1.0.1 WHY: a normal return did not prove that a native decision refreshed
  * the planned source cohort. HELD, legacy strings and an advanced/unverified
@@ -64,12 +76,12 @@
  *   the budget is exhausted; an unknown commit is never blindly re-executed.
  * UNTOUCHED: refreshPortfolioDecision, refreshDecisionTop10, every gate,
  * receipt, verdict and release path. The release (release_decision_feed.yml)
- * stays manual. No HTTP call is made by this file. ES5 only.
+ * keeps its existing scheduled/manual workflow. No HTTP call is made by this file. ES5 only.
  * Kill: TFB_DECISION_CHAIN=off (or tfbRemoveDecisionChain()).
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.1';
+var TFB_DC_VERSION = '1.0.3';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -138,6 +150,20 @@ function tfbDcRunOf_(raw) {
   return first && !re.exec(s) && /^[1-9]\d{0,31}$/.test(first[2]) ? first[2] : '';
 }
 
+function tfbDcReleaseOf_(raw) {
+  var s = String(raw === null || raw === undefined ? '' : raw);
+  var out = {run: '', issued: ''};
+  if (s.split('|')[0].replace(/^\s+|\s+$/g, '') !== 'EXECUTABLE') return out;
+  var run = tfbDcRunOf_(s);
+  var re = /(?:^|[\s|])issued=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})/g;
+  var first = re.exec(s);
+  if (!run || !first || re.exec(s)) return out;
+  out.run = run;
+  out.issued = first[1];
+  return out;
+}
+
+
 /** Parse bounded persisted state. Nonempty invalid state is unknown, never reset. */
 function tfbDcEpoch_(v) {
   return typeof v === 'number' && isFinite(v) && v > 0 &&
@@ -154,17 +180,25 @@ function tfbDcStateJson_(state) {
   } catch (e) { return null; }
 }
 function tfbDcStateOf_(raw) {
-  var st = {pd: '', t10: '', claim: null, attempts: {}, observed: {}};
+  var st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {}, observed: {}};
   function object(v) { return !!v && Object.prototype.toString.call(v) === '[object Object]'; }
   function run(v) { return typeof v === 'string' && /^[1-9]\d{0,31}$/.test(v); }
   function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+  function issued(v) {
+    return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+03:00$/.test(v) &&
+        tfbDcEpoch_(Date.parse(v)) && new Date(Date.parse(v) + 3 * 3600000).toISOString().slice(0, 19) === v.slice(0, 19);
+  }
   if (raw === null || raw === undefined || raw === '') return st;
   if (!tfbDcTextFits_(String(raw))) return null;
   try {
     var o = JSON.parse(String(raw));
     if (!object(o)) return null;
     for (var field in o) if (has(o, field) &&
-        !/^(?:pd|t10|pd_ms|t10_ms|claim|attempts|observed)$/.test(field)) return null;
+        !/^(?:pd|t10|t10rel|pd_ms|t10_ms|claim|attempts|observed)$/.test(field)) return null;
+    if (has(o, 't10rel')) {
+      if (o.t10rel !== '' && !issued(o.t10rel)) return null;
+      st.t10rel = o.t10rel;
+    }
     var names = ['pd', 't10'];
     for (var i = 0; i < names.length; i++) {
       var n = names[i];
@@ -181,8 +215,9 @@ function tfbDcStateOf_(raw) {
       for (var k in o.attempts) if (has(o.attempts, k)) {
         var count = o.attempts[k];
         var key = /^(?:pd|t10):[1-9]\d{0,31}(?::([1-9]\d{0,15}))?$/.exec(k);
-        if (++attemptKeys > TFB_DC_ATTEMPT_KEYS_MAX || !key ||
-            (key[1] && !tfbDcEpoch_(Number(key[1]))) || typeof count !== 'number' ||
+        var legacyRelease = k.indexOf('t10rel:') === 0 && issued(k.slice(7));
+        if (++attemptKeys > TFB_DC_ATTEMPT_KEYS_MAX || (!key && !legacyRelease) ||
+            (key && key[1] && !tfbDcEpoch_(Number(key[1]))) || typeof count !== 'number' ||
             !isFinite(count) || count < 0 || Math.floor(count) !== count ||
             count > TFB_DC_MAX_ATTEMPTS) return null;
         st.attempts[k] = count;
@@ -191,7 +226,9 @@ function tfbDcStateOf_(raw) {
     if (has(o, 'observed')) {
       if (!object(o.observed)) return null;
       for (var j in o.observed) if (has(o.observed, j)) {
-        if (j === 'pd_ms' || j === 't10_ms') {
+        if (j === 't10rel') {
+          if (o.observed[j] !== '' && !issued(o.observed[j])) return null;
+        } else if (j === 'pd_ms' || j === 't10_ms') {
           if (!run(o.observed[j.slice(0, -3)]) || !tfbDcEpoch_(o.observed[j])) return null;
         } else if ((j !== 'pd' && j !== 't10') || (o.observed[j] !== '' && !run(o.observed[j]))) return null;
         st.observed[j] = o.observed[j];
@@ -254,6 +291,7 @@ function tfbDcPlanCore_(s) {
   }
   var t = s.t10 || {};
   var run = String(t.gmRun || '');
+  var issued = String(t.releaseRun || '') === run ? String(t.releaseIssued || '') : '';
   if (!t.available) return none('nothing new (Top_10 refresh unavailable)');
   if (!/^[1-9]\d*$/.test(run)) return none('Global_Markets feed run unreadable');
   if (String(t.decisionRun || '') !== run) {
@@ -268,15 +306,47 @@ function tfbDcPlanCore_(s) {
   if (run === st.t10 && t.finalized_ms < st.t10_ms) {
     return none('Top_10 publication identity moved backward; manual reconciliation required', true);
   }
-  if (run === st.t10 && t.finalized_ms === st.t10_ms) return none('Top_10 already refreshed for run ' + run);
-  if (budget('t10', run, t.finalized_ms) >= TFB_DC_MAX_ATTEMPTS) {
+  if (run === st.t10 && t.finalized_ms === st.t10_ms && (!issued || issued === st.t10rel)) {
+    return none('Top_10 already refreshed for run ' + run);
+  }
+  if (budget('t10', run, t.finalized_ms) + (issued ? att['t10rel:' + issued] || 0 : 0) >= TFB_DC_MAX_ATTEMPTS) {
     return none('Top_10 run ' + run + ' gave up after ' + TFB_DC_MAX_ATTEMPTS + ' attempts');
   }
   if (s.cockpitRunning !== false) return none('cockpit refresh in progress or unknown', true);
   if (s.quiet) return none('quiet window (S-1 board slot)', true);
   return {action: 't10', run: run, finalized_ms: t.finalized_ms, identity_ms: t.finalized_ms,
-          reason: 'run ' + run + ' final audit done'};
+          release: issued, reason: issued && run === st.t10 ?
+              'release issued ' + issued + ' for run ' + run : 'run ' + run + ' final audit done'};
 }
+
+/** A typed completed result still needs independent B2 readback. Native empty
+ * and disabled skeletons are valid rendered outcomes, never executable proof. */
+function tfbDcReceiptCore_(before, after, run, startedMs, nowMs, parseStamp) {
+  function fail(reason) { return {ok: false, reason: reason}; }
+  if (typeof before !== 'string') {
+    return fail('native status before the refresh was unavailable');
+  }
+  if (typeof after !== 'string' || !after || after === before) {
+    return fail('native status was not updated');
+  }
+  if (!/^[1-9]\d*$/.test(String(run || ''))) return fail('planned run invalid');
+  var occurrences = after.match(/source\s+readiness/gi) || [];
+  var receipt = after.match(/(?:^|\|)\s*source readiness VERIFIED \(run ([1-9]\d*)\)(?=\s*(?:\||$))/);
+  if (occurrences.length !== 1 || !receipt || receipt[1] !== String(run)) {
+    return fail('native source receipt does not verify the planned run');
+  }
+  var status = after.match(/^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*status:\s*(?:ok|no_candidates|disabled)(?=\s*(?:\||$))/i);
+  var stamp = status && typeof parseStamp === 'function'
+      ? parseStamp(status[1], startedMs, nowMs) : null;
+  if (typeof startedMs !== 'number' || !isFinite(startedMs) ||
+      typeof nowMs !== 'number' || !isFinite(nowMs) || nowMs < startedMs ||
+      typeof stamp !== 'number' || !isFinite(stamp) ||
+      stamp < Math.floor(startedMs / 1000) * 1000 || stamp > nowMs) {
+    return fail('native render timestamp is outside this attempt');
+  }
+  return {ok: true, reason: ''};
+}
+
 
 /* -------------------------------------------------------------------- I/O --- */
 
@@ -286,6 +356,25 @@ function tfbDcMode_() {
   try { return tfbDcModeOf_(tfbDcProps_().getProperty(TFB_DC_MODE_PROP)); }
   catch (e) { return 'off'; }
 }
+
+/** Compatibility reader retained for existing callers. Planning uses the
+ * ambiguity-rejecting tfbDcStatusFeeds_ below. */
+function tfbDcStatusValue_(ss, key) {
+  if (typeof dt10UvReadKeyed_ === 'function') return dt10UvReadKeyed_(ss, key);
+  try {
+    var sh = ss.getSheetByName('_Status');
+    if (!sh) return '';
+    var vals = sh.getRange('L1:M60').getValues();
+    var want = String(key).toLowerCase();
+    for (var i = 0; i < vals.length; i++) {
+      if (String(vals[i][0] || '').replace(/^\s+|\s+$/g, '').toLowerCase() === want) {
+        return String(vals[i][1] || '');
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
 
 /** Exact existing producer grammar proves final work, never promotes a feed.
  * Healthy final audits currently emit no marker; that case needs an explicit
@@ -376,6 +465,38 @@ function tfbDcStatusFeeds_(ss) {
   }
 }
 
+function tfbDcReadReceipt_(ss, action) {
+  try {
+    var name = action === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments';
+    var sh = ss.getSheetByName(name);
+    if (!sh) return null;
+    var value = sh.getRange(2, 2).getValue();
+    return typeof value === 'string' ? value : null;
+  } catch (e) { return null; }
+}
+
+
+function tfbDcScriptStampMs_(text, startedMs, nowMs) {
+  if (typeof startedMs !== 'number' || !isFinite(startedMs) ||
+      typeof nowMs !== 'number' || !isFinite(nowMs) || nowMs < startedMs) return null;
+  try {
+    var zone = Session.getScriptTimeZone();
+    if (typeof zone !== 'string' || !zone || typeof pdSrcStampMs_ !== 'function') return null;
+    var clocks = [startedMs, nowMs];
+    for (var i = 0; i < clocks.length; i++) {
+      var offset = Utilities.formatDate(new Date(clocks[i]), zone, 'Z');
+      if (!/^[+-]\d{4}$/.test(offset)) continue;
+      var stamp = pdSrcStampMs_(text + offset);
+      if (stamp !== null && stamp >= Math.floor(startedMs / 1000) * 1000 && stamp <= nowMs &&
+          Utilities.formatDate(new Date(stamp), zone, 'yyyy-MM-dd HH:mm:ss') === text) {
+        return stamp;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+
 /** Everything the plan needs, read once. Never throws. */
 function tfbDcReadInputs_(ss, mode, state, nowMs, readOnly) {
   var s = {mode: mode, nowMs: nowMs, state: state,
@@ -383,7 +504,7 @@ function tfbDcReadInputs_(ss, mode, state, nowMs, readOnly) {
                            typeof pdSrcReadiness_ === 'function',
                 ready: false, cohort: '', reason: ''},
            t10: {available: typeof refreshDecisionTop10 === 'function',
-                 gmRun: '', decisionRun: '', finalized_ms: null},
+                 gmRun: '', decisionRun: '', finalized_ms: null, releaseRun: '', releaseIssued: ''},
            inputsKnown: false, inputReason: 'source status unavailable',
            inflight: null, cockpitRunning: null, quiet: true,
            writerAvailable: typeof tfbRunAutomaticRefresh_ === 'function',
@@ -404,6 +525,9 @@ function tfbDcReadInputs_(ss, mode, state, nowMs, readOnly) {
     s.t10.gmRun = tfbDcRunOf_(gm);
     s.t10.decisionRun = tfbDcRunOf_(feeds.values[TFB_DC_DECISION_FEED_KEY]);
     s.t10.finalized_ms = feeds.finalized_ms;
+    var rel = tfbDcReleaseOf_(feeds.values[TFB_DC_DECISION_FEED_KEY]);
+    s.t10.releaseRun = rel.run;
+    s.t10.releaseIssued = rel.issued;
     if (typeof dt10SyncInflightCore_ === 'function') {
       var flight = dt10SyncInflightCore_(ml, gm, nowMs, TFB_DC_INFLIGHT_MAX_MIN);
       if (flight && typeof flight.active === 'boolean' &&
@@ -529,15 +653,18 @@ function tfbDecisionChainTick() {
         ? {pd: state.observed.pd || state.pd, t10: state.observed.t10 || state.t10,
            pd_ms: state.observed.pd ? state.observed.pd_ms : state.pd_ms,
            t10_ms: state.observed.t10 ? state.observed.t10_ms : state.t10_ms,
+           t10rel: state.observed.t10 ? state.observed.t10rel || '' : state.t10rel,
            claim: null, attempts: {}, observed: state.observed}
         : state;
     var plan = tfbDcPlanCore_(tfbDcReadInputs_(ss, mode, view, nowMs));
     if (plan.action === 'none') return {plan: plan};
     var key = plan.action + ':' + plan.run + ':' + plan.identity_ms;
     if (mode === 'observe') {
-      if (state.observed[plan.action] !== plan.run || state.observed[plan.action + '_ms'] !== plan.identity_ms) {
+      if (state.observed[plan.action] !== plan.run || state.observed[plan.action + '_ms'] !== plan.identity_ms ||
+          (plan.action === 't10' && String(state.observed.t10rel || '') !== String(plan.release || ''))) {
         state.observed[plan.action] = plan.run;
         state.observed[plan.action + '_ms'] = plan.identity_ms;
+        if (plan.action === 't10') state.observed.t10rel = String(plan.release || '');
         var observedJson = tfbDcStateJson_(state);
         if (!observedJson) return {plan: {action: 'none', run: '', reason: 'persisted state bound reached', deferred: true}};
         props.setProperty(TFB_DC_STATE_PROP, observedJson);
@@ -570,6 +697,7 @@ function tfbDecisionChainTick() {
     return p.observed ? 'observed ' + p.plan.action + ' run ' + p.plan.run : p.plan.reason;
   }
   var t0 = Date.now(), completion = {state: 'failed', reason: 'native refresh threw'};
+  var previous = tfbDcReadReceipt_(ss, p.plan.action);
   try {
     if (typeof tfbRunAutomaticRefresh_ !== 'function') {
       completion = {state: 'deferred', reason: 'automatic refresh coordinator unavailable'};
@@ -581,6 +709,12 @@ function tfbDecisionChainTick() {
       completion = result && (result.status === 'skipped_manual_priority' || result.status === 'skipped_lock_busy') ?
           {state: 'deferred', reason: 'automatic refresh coordinator deferred'} :
           tfbDcCompletionOf_(result, p.plan);
+      if (completion.state === 'completed') {
+        SpreadsheetApp.flush();
+        var readback = tfbDcReceiptCore_(previous, tfbDcReadReceipt_(ss, p.plan.action),
+            p.plan.run, t0, Date.now(), tfbDcScriptStampMs_);
+        if (!readback.ok) completion = {state: 'unverified', reason: readback.reason};
+      }
     }
   } catch (eRun) { /* Failed native work retains its owned attempt; never expose payload text. */ }
   var ms = Date.now() - t0;
@@ -593,6 +727,10 @@ function tfbDecisionChainTick() {
     if (completion.state === 'completed') {
       state[p.plan.action] = p.plan.run;
       state[p.plan.action + '_ms'] = p.plan.identity_ms;
+      if (p.plan.action === 't10') {
+        state.t10rel = String(p.plan.release || '');
+        if (p.plan.release) delete state.attempts['t10rel:' + p.plan.release];
+      }
       delete state.attempts[p.key];
     } else if (completion.state === 'deferred') {
       var attempts = Math.max(0, (state.attempts[p.key] || 1) - 1);
@@ -673,6 +811,7 @@ function tfbDecisionChainStatus() {
   state = state || {};
   var msg = '[DECISION-CHAIN v' + TFB_DC_VERSION + '] mode=' + mode +
       ' last_pd=' + (state.pd || '-') + ' last_t10=' + (state.t10 || '-') +
+      ' last_release_render=' + (state.t10rel || '-') +
       ' next=' + plan.action + (plan.run ? ' run ' + plan.run : '') + ' (' + plan.reason + ')';
   Logger.log(msg);
   return msg;

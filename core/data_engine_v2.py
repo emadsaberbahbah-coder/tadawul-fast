@@ -2,8 +2,116 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.154.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.2
 ================================================================================
+
+WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
+Sweep expired entries during cache traffic under the existing async lock.
+Live-entry TTLs, values, scoring and publication gates are unchanged.
+Tests: tests/test_engine_cache_expiry.py.
+
+WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
+(TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
+untouched at 5.11.4. The settle trajectory - passes, convergence status,
+held-back rows and every published value - is v5.156.0's in every mode: only
+the f7_settle tag's field disclosures change, and enforce = v5.156.0 enforce
++ scope. With TFB_SCORING_SETTLE off every row is byte-identical to v5.156.0.)
+- EVIDENCE (21/22 Oct exports, independent review): three gaps block arming
+  enforce. G1: core.scoring.compute_confidence_score REUSES any existing
+  forecast_confidence / ai_confidence / confidence_score / confidence. A cold
+  pass 1 lacks the 3M forecast fields (expected_roi_3m, forecast_price_3m are
+  in scoring._completeness_factor), so the scorer derives a lower confidence
+  (0.6323 vs 0.6641 warm) and every settle pass reuses it: reliability 69.3
+  instead of 71.5 on soft-capped rows, just under the board's Min Reliability
+  70 (~536 Global_Markets rows on 22 Oct). G2: the observe tag disclosed pass
+  1 -> pass 2 (first_diff), not what enforce publishes for rows that settle at
+  pass 3/4 (41% of GM rows), and at most 6 fields, sometimes hiding os=. G3:
+  Market_Leaders churns more day to day under settlement (input churn, not
+  pass order), so enforce must be scopable.
+- [F7-CONF-RECOMPUTE] (G1) DEFERRED. Re-deriving the scorer's own confidence
+  on the settle passes changes the settle TRAJECTORY (the pass a row settles
+  at, and whether it converges within TFB_SCORING_SETTLE_MAX_PASSES), so it
+  can change which rows observe holds back: the review found rows v5.156.0
+  publishes (e.g. a Commodities_FX ALGO-USD variant, overall 42.85, tag
+  st4:p3) turning non_converged and withheld. A dual-trajectory observe design
+  (publish and hold back on the v5.156.0 trajectory, measure the re-derived
+  one beside it) is planned instead.
+- KNOWN RESIDUALS under enforce (exactly v5.156.0 enforce): (1) the cold vs
+  warm confidence 0.6323 / 0.6641 is reused, so a soft-capped cold row can
+  publish forecast reliability 69.3 where its warm twin publishes 71.5 (the
+  board floor is 70); (2) from pass 2 on every row counts its own pass-1
+  confidence as a completeness field: quality_score +1.02 vs pass 1 (0.45 x
+  1/22 x 0.5 x 100), symmetric for provider-target and synthetic rows.
+- [F7-FINAL-TAG] (G2) F7SettlementResult.final_diff (frozen pass-1 row ->
+  settled row; stable results only; disclosure, never a verdict). The
+  f7_settle:<mode>:st<k>:p<n> tag now discloses pass 1 -> FINAL, i.e. the
+  values enforce publishes, for up to 8 fields in the order ov op os rc va
+  fcf r12 fs; the substring-safety degrade (:chg<n>) is unchanged. WHICH rows
+  carry a tag is unchanged (pass 2 differs from pass 1); because tolerances
+  are not transitive, pass 1 -> final can net inside them, and the tag then
+  carries no field (f7_settle:<mode>:st<k>:p<n>) - expected. first_diff /
+  last_diff stay in the result and in the scoring_settlement JSON of
+  held-back rows (unchanged). Readers of ov= / rc= deltas
+  (scripts/tfb_workbook_dq_audit.py DQ-37) now count pass 1 -> final instead
+  of pass 1 -> pass 2.
+- [F7-PAGE-SCOPE] (G3) TFB_SCORING_SETTLE_PAGES: comma-separated MARKET page
+  names, each canonicalized with _canonicalize_sheet_name ("Global Markets",
+  "global-markets", "GLOBAL_MARKETS" -> Global_Markets). Unset, empty, "*" or
+  "all" = every row (v5.156.0). The only valid entries are Global_Markets,
+  Market_Leaders, Commodities_FX and Mutual_Funds; any other name -
+  My_Portfolio, Top_10_Investments, another sheet, a typo - is ignored and
+  logged once at WARNING, and a list of only such names scopes enforce to NO
+  row ("none", fail-safe). The scope key of EVERY row is its symbol's
+  INFERRED market page, whatever page requested it (its market page,
+  My_Portfolio, Top_10_Investments or none): the orchestrator passes
+  scope_page=self._f7_scope_page(sym), i.e. _resolve_quote_page_context(sym,
+  "")[0], exactly as a page-less fetch resolves it: =X / =F ->
+  Commodities_FX; an _ETF_SYMBOL_HINTS symbol (SPY QQQ VTI VOO IWM DIA IVV
+  EFA EEM ARKK) -> Mutual_Funds; .SR or a 4-digit code -> Market_Leaders;
+  everything else -> Global_Markets. So FUNDS AND CRYPTO PAIRS WITHOUT AN ETF
+  HINT COUNT AS GLOBAL_MARKETS (SPLG, CZAR.US, SUI-USD, ALGO-USD, even on the
+  Mutual_Funds / Commodities_FX pages; of the ten 2026-10-05 Commodities_FX
+  rows only QG=F infers to Commodities_FX), and one symbol is settled, or
+  not, identically on every surface. Realistic settings: unset / "all", or
+  "Global_Markets,Commodities_FX,Mutual_Funds" (every row except .SR /
+  4-digit symbols). Under enforce an out-of-scope row is handled exactly as
+  observe (pass-1 row published, observe tag); error / non_converged rows are
+  held back in and out of scope. Disclosed as scoring_settle_pages in /health
+  engine_gates and the [GUARDS] boot line: "all", "none" or the canonical
+  list.
+- MEASURED vs v5.156.0 (the review's offline harness, 1,736 cases: the six
+  F-7 fixtures and 25 priced DT10 2026-10-05 rows, each x 14 target multiples
+  at ingestion / restored in Phase-II, x 25 price x RSI synthetic variants
+  and x 3 input-confidence variants; TFB_SCORING_SETTLE_MAX_PASSES 4 and 3):
+  settle status, settled_at, pass count, reason and first / last diff
+  identical on every case (MAX_PASSES 4: 1,003 stable at pass 3, 733 at pass
+  4; MAX_PASSES 3: 1,003 stable, 733 non_converged pass_limit, held back
+  identically); published rows identical except the tag's field disclosures
+  in observe, enforce, enforce in scope (= v5.156.0 enforce), enforce out of
+  scope (= v5.156.0 observe) and scoped observe; tag presence and st / p
+  prefix identical; off byte-identical including the scorer labels. The
+  disclosure text differs on 1,335 cases at MAX_PASSES 4 and 602 at 3.
+- Functions added 4 (_f7_settle_pages, _f7_settle_pages_label,
+  _f7_settle_page_in_scope, DataEngineV5._f7_scope_page); changed:
+  _f7_settle_tag, _f7_settle_result (final_diff only), _f7_settle_pass (+
+  scope_page), surface_gate_states, the orchestrator call site and the
+  [GUARDS] boot line (DataEngineV5); F7SettlementResult gains final_diff;
+  constants added 5; removed 0. Tests: tests/test_de_f7_settle_v2.py.
+  Rollback: unset TFB_SCORING_SETTLE_PAGES and keep TFB_SCORING_SETTLE at
+  observe (or off), or git revert. Enforce is NOT armed by this change.
+
+WHY v5.155.0 - MY_PORTFOLIO WEIGHTS IN SAR FOR SUBUNIT-QUOTED HOLDINGS
+- _compute_portfolio_fields resolved the FX factor after .upper(), so a .L
+  holding (suffix map currency "GBp", pence) took the GBP (pounds) rate: its
+  SAR value and Actual Weight % were 100x too large (1000 VOD.L @ 70p beside
+  25,000 SAR of 2222.SR read 93.07% instead of 11.85%) and drove REDUCE/ADD.
+  The subunit token is now resolved case-sensitively first (GBX/GBp -> GBP,
+  ZAC/ZAc -> ZAR, ILA/ILa -> ILS, each / 100; USX only behind
+  TFB_OPP_FX_USX_SUBUNIT). A subunit whose major currency has no rate stays
+  unresolved, so the existing whole-book PORTFOLIO_FX_INCOMPLETE fail-closed
+  path applies.
+- portfolio_fx_status names the built-in INDICATIVE rates used
+  ("OK:SAR INDICATIVE:GBP") instead of a bare "OK:SAR".
 
 WHY v5.154.0 - INTEGRATED FORECAST PRECISION AND SETTLEMENT GUARDS
 - Preserve WP-2b unresolved-score funding exclusions and WP-3ab publication
@@ -4154,9 +4262,35 @@ from core.financial_units import (
 # v5.153.0 (WP-2b): settle_unresolved publication rule (gated, default off);
 # non-converged rows may publish pass-1 scores as WATCHLIST, never INVESTABLE,
 # never ranked, never funded.
-__version__ = "5.154.0"
+# v5.156.0 (2026-10-22): two My_Portfolio weight fail-closed fixes.
+#   [PF-VALUE-COMPLETE] a held row (position_qty > 0) whose position_value
+#     could not be computed (no price) was left out of total_mv, so every
+#     other holding's actual_weight was inflated and a drift REDUCE could be
+#     emitted: 2222.SR 100@25 + 1120.SR 100@None read 100% / gap -50 /
+#     REDUCE with portfolio_fx_status OK:SAR. The book cannot be summed, so
+#     actual_weight / weight_gap are now BLANKED for the whole book with
+#     portfolio_fx_status "PORTFOLIO_VALUE_INCOMPLETE: <symbols>" and no
+#     drift ADD/REDUCE -- the same contract as PORTFOLIO_FX_INCOMPLETE
+#     (v5.121.0). Signal-driven verdicts are unaffected. A carried
+#     position_value still counts (the price-holdback contract).
+#   [PF-FX-SUBUNIT-KEY] _pf_fx_table upper-cased every key, so
+#     TFB_PF_FX_RATES="GBP:4.8,GBp:0.048" overwrote the POUNDS rate with the
+#     pence rate (a pounds holding valued 100x too low, a pence holding
+#     10,000x too low). Case-sensitive subunit keys (GBp / ZAc / ILa) now
+#     file under their distinct codes (GBX / ZAC / ILA), which the per-row
+#     lookup already reads as SAR per subunit.
+# Tests: tests/test_pf_weight_value_complete.py.
+# v5.157.0 (2026-10-22): F-7 v2 (see WHY v5.157.0). [F7-FINAL-TAG] the
+#   f7_settle tag discloses pass 1 -> final (up to 8 fields, ov op os rc va fcf
+#   r12 fs); [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES (market pages only,
+#   canonicalized) limits where enforce publishes, decided by the symbol's
+#   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
+#   settle trajectory, status and published values are v5.156.0's; off is
+#   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
+__version__ = "5.157.2"
 
 from core.sheet_presentation import present_instrument_row
+from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
 from core.price_precision import (
     price_precision_enabled as _price_precision_enabled,
     price_round_half_quantum as _price_round_half_quantum,
@@ -6056,6 +6190,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "rel_path_tag": _rel_path_tag_mode(),                      # v5.144.0
             "crypto_pair_class": _crypto_pair_class_mode(),            # v5.145.0
             "scoring_settle": _f7_settle_mode(),                       # v5.147.0 (F-7)
+            "scoring_settle_pages": _f7_settle_pages_label(),          # v5.157.0 (F-7 v2)
             "fc_tuple_coherent": _fc_tuple_mode(),                     # v5.148.0 (P-102)
             "w52_ceiling_scrub": _w52_ceiling_scrub_mode(),            # v5.149.0 (P-164)
             "eodhd_fund_cache": _fund_cache_mode(),                    # v5.150.0 (P-154c)
@@ -6088,7 +6223,6 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
             logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
                            "row_sanity=%d errors=%d",
                            _tag, sheet, _n1, _n2, _n3, _n4, _err)
-        return rows
     except Exception as _exc:
         # v5.129.1: keep the probe's finer "incompatible" verdict — the
         # generic error label only for genuine import/apply failures.
@@ -6101,7 +6235,10 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
         else:
             logger.warning("[SURFACE-INV] pass skipped on %s: %s",
                            sheet, _exc)
-        return rows
+    # Mandatory exact-security protection is independent of the optional
+    # surface invariant's fail-open policy. All three final surfaces pass here.
+    from core.reviewed_instrument_classes import apply_reviewed_instrument_rows
+    return apply_reviewed_instrument_rows(_canonicalize_sheet_name(sheet), rows)[0]
 
 
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
@@ -9613,6 +9750,17 @@ _F7_SETTLE_DEPENDENT_FIELDS: Tuple[str, ...] = (
     "momentum_score", "growth_score", "technical_score", "conviction_score",
     "sector_relative_score", "rank_overall", "top10_rank", "top_factors",
 )
+# v5.157.0 (F-7 v2) [F7-PAGE-SCOPE] (see WHY v5.157.0): the markets on which
+# TFB_SCORING_SETTLE=enforce may publish a settled row.
+_F7_SETTLE_PAGES_ENV: str = "TFB_SCORING_SETTLE_PAGES"
+# Ignored names already reported (one WARNING per distinct set per process).
+_F7_SETTLE_PAGES_WARNED: Set[Tuple[str, ...]] = set()
+# The only valid scope entries: the market pages a symbol is inferred to
+# (DataEngineV5._f7_scope_page). Any other name is ignored.
+_F7_MARKET_PAGES: Tuple[str, ...] = ("Global_Markets", "Market_Leaders", "Commodities_FX", "Mutual_Funds")
+# v5.157.0 [F7-FINAL-TAG]: tag disclosure order (codes of _F7_SETTLE_FIELDS) and limit.
+_F7_SETTLE_TAG_ORDER: Tuple[str, ...] = ("ov", "op", "os", "rc", "va", "fcf", "r12", "fs")
+_F7_SETTLE_TAG_MAX: int = 8
 
 
 @dataclass(frozen=True)
@@ -9626,6 +9774,8 @@ class F7SettlementResult:
     last_diff: Tuple[Tuple[str, str, str], ...] = ()
     reason: str = ""
     error_type: str = ""
+    # v5.157.0 [F7-FINAL-TAG]: frozen pass-1 row -> settled row (stable only).
+    final_diff: Tuple[Tuple[str, str, str], ...] = ()
 
 
 def _f7_settle_failure_parts(row: Mapping[str, Any]) -> List[str]:
@@ -9882,6 +10032,61 @@ def _f7_settle_max_passes() -> int:
     return max(2, min(_F7_SETTLE_MAX_CAP, n))
 
 
+def _f7_settle_pages() -> Optional[Tuple[str, ...]]:
+    """v5.157.0 [F7-PAGE-SCOPE] TFB_SCORING_SETTLE_PAGES: comma-separated
+    MARKET page names, each canonicalized with _canonicalize_sheet_name
+    ("Global Markets", "global-markets", "GLOBAL_MARKETS" -> Global_Markets).
+    None = every market (unset, empty, "*" or "all": the v5.156.0 behaviour).
+    Otherwise the listed names that canonicalize to one of _F7_MARKET_PAGES
+    (Global_Markets, Market_Leaders, Commodities_FX, Mutual_Funds), in order,
+    de-duplicated. Any other name (My_Portfolio, Top_10_Investments, a typo)
+    is ignored and logged once at WARNING, so a list of only such names scopes
+    enforce to NO row (fail-safe, disclosed as "none"). Read at call time."""
+    names = [p.strip() for p in (os.getenv(_F7_SETTLE_PAGES_ENV) or "").split(",") if p.strip()]
+    if not names or any(name.lower() in ("*", "all") for name in names):
+        return None
+    pages: List[str] = []
+    ignored: List[str] = []
+    for name in names:
+        canon = _canonicalize_sheet_name(name)
+        if canon in _F7_MARKET_PAGES:
+            if canon not in pages:
+                pages.append(canon)
+        else:
+            ignored.append(name)
+    if ignored and tuple(ignored) not in _F7_SETTLE_PAGES_WARNED:
+        _F7_SETTLE_PAGES_WARNED.add(tuple(ignored))
+        logger.warning(
+            "[engine_v2 v%s F-7] %s: ignoring %s (valid: %s); enforce scope = %s",
+            __version__, _F7_SETTLE_PAGES_ENV, ", ".join(ignored), ", ".join(_F7_MARKET_PAGES),
+            ",".join(pages) or "none",
+        )
+    return tuple(pages)
+
+
+def _f7_settle_pages_label() -> str:
+    """v5.157.0: the scope as disclosed in /health engine_gates and the
+    [GUARDS] boot line: "all" = every market, "none" = no valid market page
+    listed, else the canonical market page names."""
+    pages = _f7_settle_pages()
+    if pages is None:
+        return "all"
+    return ",".join(pages) if pages else "none"
+
+
+def _f7_settle_page_in_scope(page: Any) -> bool:
+    """v5.157.0: may TFB_SCORING_SETTLE=enforce publish a settled row whose
+    scope page (canonicalized) is this? True with no scope configured;
+    otherwise only for a listed market page (a blank page is never listed).
+    Out of scope, enforce is handled as observe. The orchestrator passes the
+    symbol's INFERRED market page (DataEngineV5._f7_scope_page), whatever the
+    requesting page."""
+    pages = _f7_settle_pages()
+    if pages is None:
+        return True
+    return _canonicalize_sheet_name(_safe_str(page).strip()) in pages
+
+
 def _f7_settle_token(value: Any) -> str:
     """Rewrite a source/label token so it stays readable but can never carry
     one of the gate's forbidden substrings (longest rewrites first, then the
@@ -9937,18 +10142,22 @@ def _f7_settle_diff(prev: Mapping[str, Any], cand: Mapping[str, Any], *, strict:
 
 
 def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
-                   first_diff: List[Tuple[str, str, str]]) -> str:
+                   diff: List[Tuple[str, str, str]]) -> str:
     """ONE substring-safe tag: f7_settle:<mode>:st<k|x>:p<n>:code=before>after
-    (at most 6 field disclosures; st = pass at which the row stopped changing,
-    x = still moving at the cap; p = re-passes executed). If a disclosure ever
+    (st = pass at which the row stopped changing, x = still moving at the cap;
+    p = re-passes executed). v5.157.0 [F7-FINAL-TAG]: the caller passes the
+    pass-1 -> FINAL settled diff, disclosed for at most _F7_SETTLE_TAG_MAX (8)
+    fields in the order ov op os rc va fcf r12 fs. If a disclosure ever
     contained a forbidden substring the tag degrades to a count-only form."""
     parts = [_F7_SETTLE_TAG, mode, "st%s" % (settled_at if settled_at else "x"), "p%d" % int(passes_run)]
-    for code, a, b in list(first_diff)[:6]:
+    order = {code: i for i, code in enumerate(_F7_SETTLE_TAG_ORDER)}
+    ranked = sorted(list(diff), key=lambda d: order.get(d[0], len(order)))
+    for code, a, b in ranked[:_F7_SETTLE_TAG_MAX]:
         parts.append("%s=%s>%s" % (code, a, b))
     tag = ":".join(parts)
     low = tag.lower()
     if any(f in low for f in _REL_PATH_FORBIDDEN):
-        tag = ":".join(parts[:4]) + ":chg%d" % len(first_diff)
+        tag = ":".join(parts[:4]) + ":chg%d" % len(diff)
     return tag
 
 
@@ -10001,9 +10210,13 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 first_diff = last_diff
             if not last_diff:
                 stable_row = row if k == 2 else cand
+                final_diff: Tuple[Tuple[str, str, str], ...] = ()
                 if stable_row is not row:
                     _cap_intrinsic_display(stable_row)
-                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff)
+                    # v5.157.0 [F7-FINAL-TAG]: disclosure only, never a verdict.
+                    final_diff = tuple(_f7_settle_diff(frozen_input, stable_row))
+                return F7SettlementResult("stable", stable_row, k, passes_run, first_diff,
+                                          final_diff=final_diff)
             if any(not _f7_settle_diff(prior, cand, strict=True) for prior in history):
                 return F7SettlementResult("non_converged", passes_run=passes_run,
                                           first_diff=first_diff, last_diff=last_diff, reason="oscillation")
@@ -10016,12 +10229,17 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                   last_diff=last_diff, reason="scorer_exception", error_type=type(exc).__name__)
 
 
-def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[str, Any]:
+def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
+                    scope_page: Optional[str] = None) -> Dict[str, Any]:
     """Keep stable mode semantics; detected failures always withhold execution.
 
     Off leaves unmarked rows unchanged. Observe keeps successful pass-1 values
     and Enforce publishes a proved stable row. Neither mode nor a later switch
     to Off can turn a known error/non-convergence into valid scores or funding.
+    v5.157.0 (F-7 v2): Enforce runs as Observe when scope_page (default None =
+    page) is not in TFB_SCORING_SETTLE_PAGES; the orchestrator passes the
+    symbol's inferred market page. The tag discloses pass 1 -> FINAL. The
+    settle trajectory (passes, status, values) is v5.156.0's.
     """
     if not isinstance(row, dict):
         return row
@@ -10031,6 +10249,9 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
     mode = _f7_settle_mode()
     if mode == "off":
         return row
+    # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe.
+    if mode == "enforce" and not _f7_settle_page_in_scope(page if scope_page is None else scope_page):
+        mode = "observe"
     result = _f7_settle_result(row)
     if result.status != "stable":
         # v5.153.0 (WP-2b): only a non_converged result consults
@@ -10066,7 +10287,11 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "") -> Dict[
         _f7_unresolved_strip(result.row)
     if not result.first_diff:
         return row
-    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.first_diff))
+    # v5.157.0 [F7-FINAL-TAG]: pass 1 -> FINAL (what enforce publishes), not
+    # pass 1 -> pass 2; a row is tagged when pass 2 differed from pass 1
+    # (first_diff), and the disclosure may be empty when pass 1 -> final nets
+    # inside the non-transitive tolerances.
+    tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.final_diff))
     out = row if mode == "observe" else result.row
     _v573_append_warning(out, tag)
     return out
@@ -11200,16 +11425,69 @@ def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
             except Exception:
                 continue
             if rate > 0.0:
-                out[k.strip().upper()] = rate
+                out[_pf_fx_key(k)] = rate
     for k, v in (fx_rates or {}).items():
         try:
             rate = float(v)
         except Exception:
             continue
         if rate > 0.0:
-            out[_safe_str(k).upper()] = rate
+            out[_pf_fx_key(k)] = rate
     out[base] = 1.0
     return out
+
+
+# v5.156.0 PF-FX-SUBUNIT-KEY: case-sensitive subunit tokens -> their distinct
+# upper-case codes, so "GBp" never collides with the pounds key "GBP".
+_PF_SUBUNIT_KEY: Dict[str, str] = {"GBp": "GBX", "ZAc": "ZAC", "ILa": "ILA"}
+
+
+def _pf_fx_key(raw: Any) -> str:
+    """Upper-case FX table key; a case-sensitive subunit token (GBp / ZAc /
+    ILa) maps to its distinct code (GBX / ZAC / ILA) first."""
+    k = _safe_str(raw).strip()
+    return _PF_SUBUNIT_KEY.get(k, k.upper())
+
+
+# v5.155.0 PF-SUBUNIT: subunit price currency -> (major currency, divisor).
+# Matched case-sensitively, exactly like _SUBUNIT_PRICE_CURRENCIES: "GBp"/"GBX"
+# are pence while "GBP" is pounds. USX folds only behind TFB_OPP_FX_USX_SUBUNIT,
+# mirroring _normalize_subunit_market_cap.
+_PF_SUBUNIT_MAJOR: Dict[str, str] = {
+    "GBX": "GBP", "GBp": "GBP",
+    "ZAC": "ZAR", "ZAc": "ZAR",
+    "ILA": "ILS", "ILa": "ILS",
+}
+
+
+def _pf_subunit_major(raw_ccy: str) -> Tuple[str, float]:
+    """Return (major currency, divisor) for a position currency. A major-unit
+    currency returns itself with divisor 1.0."""
+    tok = (raw_ccy or "").strip()
+    if tok in _PF_SUBUNIT_MAJOR:
+        return _PF_SUBUNIT_MAJOR[tok], _SUBUNIT_PRICE_CURRENCY_FACTOR
+    if tok.upper() == "USX" and (os.getenv("TFB_OPP_FX_USX_SUBUNIT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        return "USD", _SUBUNIT_PRICE_CURRENCY_FACTOR
+    return tok, 1.0
+
+
+def _pf_blank_book(rows: List[Dict[str, Any]], msg: str, band: Any, weak: Any) -> None:
+    """v5.156.0: the whole-book fail-closed write shared by
+    PORTFOLIO_FX_INCOMPLETE (v5.121.0) and PORTFOLIO_VALUE_INCOMPLETE: no
+    row's share of the book is known, so weight and gap are blank, the status
+    names the cause, and no drift-based ADD/REDUCE is emitted."""
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        r["actual_weight"] = None
+        r["weight_gap"] = None
+        r["portfolio_fx_status"] = msg
+        r["action_flag"] = _portfolio_rebalance_action(None, band)
+        r["decision"] = _portfolio_decision(r, None, band, weak)
+        _portfolio_missing_price_holdback(r)
+        _f7_settle_holdback(r)
+        _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
 
 
 def _compute_portfolio_fields(rows: List[Dict[str, Any]],
@@ -11266,15 +11544,32 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     continue
                 if _as_float(r.get("position_value")) is None:
                     continue
-                ccy = (_safe_str(r.get("currency")) or "").upper()
+                # v5.155.0 PF-SUBUNIT: resolve the subunit token on the RAW
+                # (case-preserved) currency BEFORE upper-casing. The suffix map
+                # emits "GBp" for .L, which .upper() turned into "GBP" -- the
+                # pounds rate applied to a pence value (100x the weight).
+                _raw_ccy = _safe_str(r.get("currency")) or ""
+                _major, _div = _pf_subunit_major(_raw_ccy)
+                ccy = _major.upper()
                 if not ccy:
                     _unresolved.add("(blank)")
                     continue
+                # v5.155.0 (review fix, same unreleased version): a rate keyed
+                # on the SUBUNIT code itself (TFB_PF_FX_RATES=GBX:0.048 or
+                # fx_rates={"GBX": ...}) is SAR per pence and wins, exactly as
+                # before 5.155.0 read it. Only distinct upper-case codes can be
+                # such keys (GBX/ZAC/ILA): the table upper-cases its keys, so
+                # "GBp" can never be told apart from GBP there.
+                _direct = _pf_fx_key(_raw_ccy)   # v5.156.0: GBp -> GBX
+                _fd = _fx.get(_direct) if (_div != 1.0 and _direct != ccy) else None
+                if _fd is not None and _fd > 0.0:
+                    _factor[id(r)] = _fd
+                    continue
                 f = _fx.get(ccy)
                 if f is None or f <= 0.0:
-                    _unresolved.add(ccy)
+                    _unresolved.add(_raw_ccy if _div != 1.0 else ccy)
                 else:
-                    _factor[id(r)] = f
+                    _factor[id(r)] = f / _div
                     if ccy in _PF_INDICATIVE_FX_TO_SAR and ccy not in _operator_set:
                         _indicative_used.add(ccy)
             if _indicative_used:
@@ -11305,21 +11600,44 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
                     "ADD/REDUCE emitted. Signal-driven verdicts are unaffected. "
                     "Set TFB_PF_FX_RATES.", __version__, _msg,
                 )
-                for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    r["actual_weight"] = None
-                    r["weight_gap"] = None
-                    r["portfolio_fx_status"] = _msg
-                    r["action_flag"] = _portfolio_rebalance_action(None, band)
-                    r["decision"] = _portfolio_decision(r, None, band, weak)
-                    _portfolio_missing_price_holdback(r)
-                    _f7_settle_holdback(r)
-                    _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
+                _pf_blank_book(rows, _msg, band, weak)
                 return
+            # v5.155.0: a book converted with a built-in INDICATIVE (floating)
+            # rate is disclosed on every row, not only in a log line.
+            _fx_status = "OK:" + _base_ccy
+            if _indicative_used:
+                _fx_status += " INDICATIVE:" + ",".join(sorted(_indicative_used))
             for r in rows:
                 if isinstance(r, dict):
-                    r["portfolio_fx_status"] = "OK:" + _base_ccy
+                    r["portfolio_fx_status"] = _fx_status
+
+        # v5.156.0 [PF-VALUE-COMPLETE]: a held row with no position_value
+        # (no usable price) cannot be summed, so no row's share of the book
+        # is known. Blank the whole book exactly like PORTFOLIO_FX_INCOMPLETE
+        # instead of publishing weights inflated by the missing holding.
+        _unvalued = sorted(
+            normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol"))) or "(blank)"
+            for r in rows
+            if isinstance(r, dict)
+            and (_as_float(r.get("position_qty")) or 0.0) > 0.0
+            and _as_float(r.get("position_value")) is None
+        )
+        if _unvalued:
+            _msg = "PORTFOLIO_VALUE_INCOMPLETE: " + ",".join(_unvalued)
+            logger.error(
+                "[engine_v2 v%s PF-WEIGHT] %s -- held rows without a position "
+                "value; actual_weight and weight_gap BLANKED for the whole book "
+                "and no drift-based ADD/REDUCE emitted. Signal-driven verdicts "
+                "are unaffected.", __version__, _msg,
+            )
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                sym = normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol")))
+                if _as_float(r.get("target_weight")) is None and sym in targets:
+                    r["target_weight"] = round(targets[sym], 4)
+            _pf_blank_book(rows, _msg, band, weak)
+            return
 
         total_mv = 0.0
         for r in rows:
@@ -12730,6 +13048,7 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
         return None
     merged["eps_ttm"] = None
     merged["pe_ttm"] = None
+    _copy_eps_basis(merged, {}, ())
     return "pe_incoherent_cleared:engine"
 
 
@@ -13228,6 +13547,9 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         witnessed_fields = dict(fields)
         witnessed_fields[_MPC_UNIT_KEY] = _margin_cache_units(entry, fields)
         _margin_unit_copy(row, witnessed_fields, filtered)
+        # LKG currently persists no EPS source proof; a restored value cannot
+        # inherit the degraded row's old receipt.
+        _copy_eps_basis(row, {}, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
@@ -13239,7 +13561,10 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
 # raises. A mirror of the v5.136.0 target-LKG layer with the {ts,name,fields}
 # schema; admissibility (TTL / min-fields / fill-only) stays in the callers.
 # ---------------------------------------------------------------------------
-_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v1:"
+# EPS estimates could previously seed eps_ttm through two ingestion paths.
+# Do not restore unversioned old semantics after the adapter/alias correction.
+# Existing v1 keys expire naturally; no historical records are rewritten.
+_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v2:"
 _FUND_LKG_REDIS_BREAKER_ERRORS: int = 3
 _FUND_LKG_REDIS_BREAKER_SECONDS: float = 300.0
 _FUND_LKG_REDIS_TIMEOUT_S: float = 0.25
@@ -14788,7 +15113,9 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
     "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths", "epsCurrentYear"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths"),
+    "eps_estimate_current_year": ("eps_estimate_current_year", "epsCurrentYear", "EPSEstimateCurrentYear"),
+    "eps_net_income_current_shares": ("eps_net_income_current_shares",),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
     "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
     "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
@@ -15890,6 +16217,9 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    # Diagnostic provenance only; this receipt grants no eligibility or unit
+    # conversion. Estimates have no alias to the trailing scoring field.
+    _copy_eps_basis(out, src, _EPS_FIELDS)
     if _MPC_UNIT_KEY in src:
         source_basis = src.get(_MPC_UNIT_KEY)
         explicit_fields = [field for field in _MPC_FIELDS
@@ -16521,6 +16851,10 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _f7_settle_holdback(row)
     _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
+    # Route fallbacks call this boundary after fetching a guarded cached quote.
+    # Re-assert the mandatory debt quarantine after generic gate recomputation.
+    from core.reviewed_instrument_classes import reviewed_quote_rows
+    displayed = reviewed_quote_rows("My_Portfolio" if "position_qty" in keys else "Global_Markets", [displayed])[0]
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
 
@@ -16591,14 +16925,18 @@ def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[
     if not isinstance(template_row, dict):
         return out
     filled_margin_fields: List[str] = []
+    filled_eps_fields: List[str] = []
     for k, v in template_row.items():
-        if k == _MPC_UNIT_KEY:
+        if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
             continue  # Only the per-field landed-value copy can carry proof.
         if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
             out[k] = _json_safe(v)
             if k in _MPC_FIELDS:
                 filled_margin_fields.append(k)
+            if k in _EPS_FIELDS:
+                filled_eps_fields.append(k)
     _margin_unit_copy(out, template_row, filled_margin_fields)
+    _copy_eps_basis(out, template_row, filled_eps_fields)
     return out
 
 
@@ -16798,6 +17136,7 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     # identical to v5.99.1 (every blank live value is skipped).
     clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
     replaced_margin_fields: List[str] = []
+    replaced_eps_fields: List[str] = []
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
@@ -16808,7 +17147,10 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
         out[k] = _json_safe(v)
         if k in _MPC_FIELDS:
             replaced_margin_fields.append(k)
+        if k in _EPS_FIELDS:
+            replaced_eps_fields.append(k)
     _margin_unit_copy(out, live_row, replaced_margin_fields)
+    _copy_eps_basis(out, live_row, replaced_eps_fields)
     return out
 
 
@@ -17489,6 +17831,11 @@ class MultiLevelCache:
     `OrderedDict` so we can evict the oldest entries when the map exceeds
     `max_entries`. Previous versions silently grew without bound under
     sustained heavy load.
+
+    Expired entries are swept during normal traffic, at most once per TTL
+    (or 30 seconds for longer TTLs). Without the sweep, short-lived quote
+    and page payloads that were never requested again remained resident
+    until the entry-count limit was reached.
     """
 
     def __init__(self, ttl_seconds: int = 30, max_entries: int = 50_000) -> None:
@@ -17496,16 +17843,33 @@ class MultiLevelCache:
         self._max = max(1000, int(max_entries))
         self._data: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._sweep_interval = min(self._ttl, 30)
+        self._next_expiry_sweep = 0.0
+
+    def _prune_expired(self, now: float) -> None:
+        """Reclaim expired payloads under _lock without changing live TTLs.
+
+        Accesses move entries in LRU order, so timestamps are not ordered.
+        Scan the bounded map rather than stopping at the first live entry.
+        The sweep deadline amortizes this work across normal cache traffic.
+        """
+        if now < self._next_expiry_sweep:
+            return
+        cutoff = now - self._ttl
+        for key in [k for k, (ts, _) in self._data.items() if ts < cutoff]:
+            self._data.pop(key, None)
+        self._next_expiry_sweep = now + self._sweep_interval
 
     async def get(self, key: str) -> Any:
         if not key:
             return None
         async with self._lock:
+            now = time.time()
+            self._prune_expired(now)
             entry = self._data.get(key)
             if entry is None:
                 return None
             ts, value = entry
-            now = time.time()
             if now - ts > self._ttl:
                 self._data.pop(key, None)
                 return None
@@ -17516,7 +17880,9 @@ class MultiLevelCache:
         if not key:
             return
         async with self._lock:
-            self._data[key] = (time.time(), value)
+            now = time.time()
+            self._prune_expired(now)
+            self._data[key] = (now, value)
             self._data.move_to_end(key)
             while len(self._data) > self._max:
                 self._data.popitem(last=False)
@@ -17814,7 +18180,7 @@ class DataEngineV5:
                 "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
-                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s fc_tuple=%s "
+                "fund_lkg=%s fund_unit_sentry=%s scoring_settle=%s scoring_settle_pages=%s fc_tuple=%s "
                 "w52_ceiling=%s fund_cache=%s margin_publish=%s r12_ceiling=%s tuple_noise=%s "
                 "settle_unresolved=%s price_precision=%s",
                 __version__,
@@ -17832,6 +18198,7 @@ class DataEngineV5:
                 _g(_fund_lkg_enabled),
                 _fund_unit_sentry_mode(),   # v5.143.0 (P-146): arming provable at boot
                 _f7_settle_mode(),          # v5.147.0 (F-7): settle mode provable at boot
+                _f7_settle_pages_label(),   # v5.157.0 (F-7 v2): enforce page scope provable at boot
                 _fc_tuple_mode(),           # v5.148.0 (P-102): coherence mode provable at boot
                 _w52_ceiling_scrub_mode(),  # v5.149.0 (P-164): ceiling scrub provable at boot
                 _fund_cache_mode(),         # v5.150.0 (P-154c): cache mode provable at boot
@@ -17890,6 +18257,21 @@ class DataEngineV5:
                 p = "Global_Markets"
         routed = self._providers_for_instrument(p, symbol)
         return p, (routed[0] if routed else "")
+
+    def _f7_scope_page(self, symbol: str) -> str:
+        """v5.157.0 [F7-PAGE-SCOPE]: the page that decides the F-7 enforce
+        scope for this symbol, WHATEVER page requested it (a market page,
+        My_Portfolio, Top_10_Investments or none): its inferred market page,
+        exactly as a page-less fetch resolves it. =X / =F -> Commodities_FX;
+        an _ETF_SYMBOL_HINTS symbol (SPY, QQQ, ...) -> Mutual_Funds; .SR or a
+        4-digit code -> Market_Leaders; everything else -> Global_Markets,
+        including funds and crypto pairs without an ETF hint (SPLG, SUI-USD).
+        One symbol is therefore settled, or not, identically on every surface.
+        Fail-safe: "" is never in a configured scope (enforce -> observe)."""
+        try:
+            return self._resolve_quote_page_context(symbol, "")[0]
+        except Exception:
+            return ""
 
     def _providers_for(self, page: str) -> List[str]:
         p = _canonicalize_sheet_name(page)
@@ -18492,8 +18874,9 @@ class DataEngineV5:
     def _merge(self, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base or {})
         landed_margins: List[str] = []
+        landed_eps: List[str] = []
         for k, v in (patch or {}).items():
-            if k == _MPC_UNIT_KEY:
+            if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
                 continue
             if v is None or v == "":
                 continue
@@ -18501,7 +18884,10 @@ class DataEngineV5:
                 out[k] = v
                 if k in _MPC_FIELDS:
                     landed_margins.append(k)
+                if k in _EPS_FIELDS:
+                    landed_eps.append(k)
         _margin_unit_copy(out, patch or {}, landed_margins)
+        _copy_eps_basis(out, patch or {}, landed_eps)
         return out
 
     def _data_quality(self, row: Dict[str, Any]) -> QuoteQuality:
@@ -18956,6 +19342,11 @@ class DataEngineV5:
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
+        # Research diagnostics are not core-fundamental completeness inputs.
+        # Carry them separately without changing the gap/negative-cache policy.
+        eps_diagnostics, _ = _filter_patch_to_missing_fields(
+            row, canon_patch, ("eps_estimate_current_year", "eps_net_income_current_shares"),
+        )
         # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
         # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
         # declared identity fields -> no judgement"), so identity must simply
@@ -18988,6 +19379,7 @@ class DataEngineV5:
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
+            _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
@@ -18998,6 +19390,9 @@ class DataEngineV5:
                         _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
                         + ("" if _fus_mode == "enforce" else ":observe"),
                     )
+        if eps_diagnostics:
+            row = self._merge(row, eps_diagnostics)
+            _copy_eps_basis(row, canon_patch, eps_diagnostics)
         return row
 
     # =========================================================================
@@ -19319,7 +19714,11 @@ class DataEngineV5:
                 # v5.147.0 (F-7): settle the pass-dependent scores. off ->
                 # returns merged untouched (byte-identical); observe -> tag
                 # only; enforce -> the settled row replaces the pass-1 row.
-                merged = _f7_settle_pass(merged, sym, page_ctx)
+                # v5.157.0 [F7-PAGE-SCOPE]: the enforce scope is decided by the
+                # symbol's INFERRED market page whatever page requested it, so
+                # its market page, My_Portfolio, Top_10 and a page-less fetch
+                # settle it identically.
+                merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))
                 _fct_scored = _as_float(merged.get("overall_score")) is not None
             else:
                 _mark_row_as_empty(merged)
@@ -19431,10 +19830,14 @@ class DataEngineV5:
 
     async def get_enriched_quote(self, symbol: str, page: str = "") -> UnifiedQuote:
         row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        row = reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
         return UnifiedQuote(**row) if row else UnifiedQuote()
 
     async def get_enriched_quote_dict(self, symbol: str, page: str = "") -> Dict[str, Any]:
-        return await self._get_enriched_quote_impl(symbol, page)
+        row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
 
     async def get_enriched_quotes(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         # v5.77.7: per-symbol failure isolation. v5.77.6 used
@@ -19533,7 +19936,8 @@ class DataEngineV5:
                     )
             except Exception:
                 pass
-        return out
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), out)
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         return await self.get_enriched_quotes(symbols, page)
