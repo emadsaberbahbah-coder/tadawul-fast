@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.0)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.1)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -29,8 +29,8 @@
 #   - Headers at row 5, data from row 6 (matches Performance_Log convention).
 #   - Idempotent per day: re-running on the same date skips symbols already
 #     archived for that Riyadh date (no duplicate rows).
-#   - Explicit CLI universe is absolute. With adaptive mode off, the env/default
-#     universe is unchanged. Adaptive mode retains that stable baseline, gives
+#   - CLI/env selections are subject to explicit reviewed legacy-symbol exclusions.
+#     No successor is automatically selected. Adaptive mode retains the baseline, gives
 #     source-validated portfolio/research identities priority, and rotates a
 #     bounded eligible sample with a broader-market sample when room remains.
 #   - At most 60 symbol analyses per batch, not 60 provider HTTP requests:
@@ -88,7 +88,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -410,6 +410,9 @@ class NewsArchiveStore:
         complete = True
         invalid_identity_rows = 0
         unknown_identities: List[str] = []
+        from core.news_identity_lifecycle import load_news_lifecycle
+        lifecycle, lifecycle_registry = load_news_lifecycle(now=_utc_now())
+        lifecycle_exclusions: Dict[str, Any] = {}
 
         def publication() -> Dict[str, Any]:
             if self.sheet is None:
@@ -463,7 +466,13 @@ class NewsArchiveStore:
                 grid = self.backoff.run(lambda w=ws, r=source_range: w.get_values(r)) or []
                 diagnostics: Dict[str, Any] = {}
                 pairs, header_ok, block_complete = _identity_pairs(
-                    grid, research=page == "Top_10_Investments", diagnostics=diagnostics)
+                    grid, research=page == "Top_10_Investments", diagnostics=diagnostics,
+                    lifecycle=lifecycle)
+                for excluded in diagnostics.get("lifecycle_exclusions", []):
+                    previous = lifecycle_exclusions.get(excluded["symbol"])
+                    if previous is None or (previous["status"] == "VERIFIED_LEGACY"
+                                            and excluded["status"] != "VERIFIED_LEGACY"):
+                        lifecycle_exclusions[excluded["symbol"]] = excluded
                 source_ok = header_ok and block_complete
                 # row_count is allocated capacity, not populated extent. With
                 # the canonical contiguous writer, only a populated capped
@@ -503,6 +512,7 @@ class NewsArchiveStore:
                     entry["conflicting_identity_symbols"] = sorted(set(conflicts))[:20]
                 else:
                     entry.pop("unknown_identity_symbols", None)
+                    entry.pop("lifecycle_exclusions", None)
             except Exception:
                 entry.update({"status": "UNAVAILABLE", "error_code": "identity_source_read_failed"})
                 complete = False
@@ -527,7 +537,7 @@ class NewsArchiveStore:
             complete = complete and stable and fresh and usable and bool(meta.get("run"))
         for symbol in ambiguous:
             identities.pop(symbol, None)
-        identity_complete = invalid_identity_rows == 0 and not ambiguous
+        identity_complete = invalid_identity_rows == 0 and not ambiguous and lifecycle_registry["status"] == "VALID"
         return {"identities": identities, "ambiguous_symbols": sorted(ambiguous),
                 # Public identity diagnostics are global, never attributed to
                 # a portfolio role or accompanied by positions/cash/orders.
@@ -536,6 +546,8 @@ class NewsArchiveStore:
                 "research": _unique_symbols(candidates), "eligible": _unique_symbols(eligible),
                 "source_read_complete": bool(complete), "identity_coverage_complete": identity_complete,
                 "complete": bool(complete and identity_complete),
+                "lifecycle_registry": lifecycle_registry,
+                "lifecycle_exclusions": list(lifecycle_exclusions.values()),
                 "read_scope": "Bounded identity windows under the contiguous canonical writer contract; not a full allocated-grid or sparse late-row audit.",
                 "sources": list(observed.values())}
 
@@ -610,7 +622,8 @@ def _source_run(message: Any, *, research: bool = False) -> Optional[str]:
 
 
 def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
-                    diagnostics: Optional[Dict[str, Any]] = None):
+                    diagnostics: Optional[Dict[str, Any]] = None,
+                    lifecycle: Optional[Dict[str, Any]] = None):
     """Read canonical identity columns or the first research-selected block.
 
     A portfolio row proves membership only, not a positive holding. Research
@@ -631,6 +644,7 @@ def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
     ended = not research
     invalid = 0
     unknown = []
+    excluded = []
     for row in grid[start + 1:]:
         symbol = str(row[symbol_col] or "").strip().upper() if len(row) > symbol_col else ""
         name = str(row[name_col] or "").strip() if len(row) > name_col else ""
@@ -641,6 +655,15 @@ def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
             continue
         valid = (symbol not in {"SYMBOL", "TICKER", "NAME", "RANK"}
                  and bool(re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=_-]{0,40}", symbol)))
+        if valid and symbol in (lifecycle or {}):
+            record = dict(lifecycle[symbol])
+            if name and " ".join(name.casefold().split()) != " ".join(record["historical_name"].casefold().split()):
+                record.update(status="UNKNOWN", reason="current_caption_conflict")
+            excluded.append(record)
+            if record["status"] != "VERIFIED_LEGACY":
+                invalid += 1
+                unknown.append(symbol)
+            continue
         if (valid and name and len(name) <= 300 and any(char.isalpha() for char in name)
                 and not re.search(r"[\x00-\x1f]", name)
                 and name.casefold() not in {symbol.casefold(), "unknown", "n/a", "none", "—"}):
@@ -652,6 +675,9 @@ def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
     if diagnostics is not None:
         diagnostics["invalid_identity_rows"] = invalid
         diagnostics["unknown_identity_symbols"] = _unique_symbols(unknown)[:20]
+        if excluded:
+            diagnostics["lifecycle_excluded_rows"] = len(excluded)
+            diagnostics["lifecycle_exclusions"] = excluded
     return pairs, True, ended
 
 
@@ -659,11 +685,13 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
                           date_str: str):
     """Bound provider work while preserving exact-symbol identities and overrides.
 
-    CLI is absolute. With adaptive mode off, env remains the historical
+    CLI determines the requested set, subject to lifecycle exclusions. With adaptive mode off, env remains the historical
     override. In explicitly enabled adaptive mode, env is the stable baseline
     augmented by current source identities and a repeatable daily pool slice.
     """
     cli = _unique_symbols(args.universe or [])
+    from core.news_identity_lifecycle import load_news_lifecycle
+    lifecycle, lifecycle_registry = load_news_lifecycle(now=_utc_now())
     adaptive = bool(getattr(args, "adaptive", False)) and not cli
     budget = max(1, min(60, int(getattr(args, "max_symbols", 60))))
     baseline = _unique_symbols(resolve_universe(None))
@@ -676,19 +704,24 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
     rotation_count = 0
     eligible_rotation_count = 0
     broad_rotation_count = 0
+    legacy_priority = []
     if cli:
         mode, proposed = "cli", cli
     elif adaptive:
         mode = "adaptive"
         priority = _unique_symbols((context or {}).get("portfolio_membership", []) +
                                    (context or {}).get("research", []) + baseline)
-        eligible_remaining = [symbol for symbol in eligible if symbol not in priority and symbol in known]
+        legacy_priority = [symbol for symbol in priority if symbol in lifecycle]
+        priority = [symbol for symbol in priority if symbol not in lifecycle]
+        eligible_remaining = [symbol for symbol in eligible
+                              if symbol not in priority and symbol in known and symbol not in lifecycle]
         room = max(0, budget - len(priority))
         start = slot_ordinal * max(1, room) % max(1, len(eligible_remaining))
         rotation = (eligible_remaining[start:] + eligible_remaining[:start])[:room]
         eligible_rotation_count = len(rotation)
         spare = room - len(rotation)
-        remaining = [symbol for symbol in pool if symbol not in priority and symbol not in rotation and symbol in known]
+        remaining = [symbol for symbol in pool if symbol not in priority and symbol not in rotation
+                     and symbol in known and symbol not in lifecycle]
         broad_start = slot_ordinal * max(1, spare) % max(1, len(remaining))
         broad = (remaining[broad_start:] + remaining[:broad_start])[:spare]
         rotation += broad
@@ -697,12 +730,23 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
         proposed = priority + rotation
     else:
         mode, proposed = ("env" if _env_csv("NEWS_ARCHIVE_UNIVERSE") else "static"), baseline
+    requested_before_lifecycle = len(proposed) + len(legacy_priority)
+    excluded = {record["symbol"]: record for record in
+                (context or {}).get("lifecycle_exclusions", [])}
+    for symbol in proposed + legacy_priority:
+        if symbol in lifecycle and symbol not in excluded:
+            excluded[symbol] = lifecycle[symbol]
+    proposed = [symbol for symbol in proposed if symbol not in lifecycle]
     total_requested = len(proposed)
     universe = proposed[:budget]
     missing = [symbol for symbol in universe if adaptive and symbol not in known]
     items = [{"symbol": symbol, **({"company_name": known[symbol]} if adaptive else {})}
              for symbol in universe if symbol not in missing]
+    if lifecycle_registry["status"] != "VALID":
+        items = []
     complete = bool(universe) and not missing and total_requested <= budget
+    complete = (complete and lifecycle_registry["status"] == "VALID"
+                and all(record["status"] == "VERIFIED_LEGACY" for record in excluded.values()))
     if adaptive:
         complete = complete and bool((context or {}).get("complete"))
     evidence = {"mode": mode, "adaptive_enabled": adaptive, "analysis_cap": budget,
@@ -722,6 +766,11 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
                 "identity_read_scope": (context or {}).get("read_scope") if adaptive else None,
                 "cohort_sha256": hashlib.sha256("\n".join(universe).encode()).hexdigest(),
                 "sources": (context or {}).get("sources", []) if adaptive else []}
+    evidence.update(lifecycle_registry=lifecycle_registry,
+                    requested_before_lifecycle=requested_before_lifecycle,
+                    lifecycle_exclusions=list(excluded.values()),
+                    lifecycle_excluded_count=len(excluded),
+                    interpretation="Legacy symbols are excluded from current-symbol news only; source rows/history remain. Successors require separate identity validation; no automatic remapping.")
     return universe, items, evidence
 
 
@@ -821,6 +870,31 @@ def _write_collection_report(path: Optional[str], report: Dict[str, Any]) -> Non
         target.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _validated_news_results(raw, items):
+    """Only exact, uniquely returned queried symbols may reach the archive."""
+    from collections import Counter
+    requested = {item["symbol"] for item in items}
+    counts = Counter()
+    matched = []
+    unexpected = malformed = 0
+    for result in raw:
+        if not isinstance(result, dict) or not isinstance(result.get("symbol"), str):
+            malformed += 1
+            continue
+        symbol = result["symbol"].strip().upper()
+        if symbol not in requested:
+            unexpected += 1
+            continue
+        counts[symbol] += 1
+        matched.append({**result, "symbol": symbol})
+    duplicates = sum(count > 1 for count in counts.values())
+    accepted = [result for result in matched if counts[result["symbol"]] == 1]
+    return accepted, {"raw_returned": len(raw), "accepted_returned": len(accepted),
+                      "unexpected_count": unexpected, "malformed_count": malformed,
+                      "duplicate_symbol_count": duplicates,
+                      "complete": not (unexpected or malformed or duplicates)}
+
+
 def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
                               status: str, *, error_code: Optional[str] = None,
                               attempted_rows: int = 0, accepted_rows: int = 0,
@@ -880,8 +954,10 @@ async def collect(args: argparse.Namespace) -> int:
         logger.error("batch_news_intelligence failed (%s)", code)
         return 1
 
-    results = list(getattr(batch, "items", None) or [])
+    results, response_validation = _validated_news_results(list(getattr(batch, "items", None) or []), items)
     report = _collection_report(universe, results, date_str)
+    report["response_validation"] = response_validation
+    report["complete"] = report["complete"] and response_validation["complete"]
     report["selection"] = selection
     report["selected_acquisition_complete"] = report["complete"]
     report["complete"] = report["complete"] and selection["discovery_complete"]

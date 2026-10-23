@@ -14,6 +14,8 @@ on:
     branches: [main]
     paths:
       - "core/news_intelligence.py"
+      - "core/news_identity_lifecycle.py"
+      - "data/verified_name_labels.json"
       - "scripts/news_archive_collector.py"
       - ".github/workflows/news_archive.yml"
   schedule:
