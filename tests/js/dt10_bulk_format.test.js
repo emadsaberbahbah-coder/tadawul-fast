@@ -9,7 +9,8 @@
  * cell: ~1,750 range calls for the 500-row CANDIDATES grid alone.
  *
  * The ORACLE is the reviewed v1.13.10 file itself, rebuilt from the delivered
- * source by reversing exactly the enumerated v1.13.11 edits and checked
+ * source by reversing the enumerated v1.13.13 integrity integration and
+ * v1.13.11 bulk edits, then checked
  * against its SHA-256 (tests/js/dt10_cash_utc_history.js v11310Source). Both
  * sources run in separate vm contexts against the same cell-model sheet, so
  * every difference comes from the four changed helpers.
@@ -349,8 +350,8 @@ for (const state of ['EXECUTABLE', 'NOT_ACTIONABLE']) {
     for (const k of keys) assert.deepEqual(r.now.snap.cells[k], r.old.snap.cells[k], 'cell ' + k);
     assert(keys.length > 12000, 'the render painted the whole cockpit: ' + keys.length + ' cells');
     assert(r.old.calls > 2000, 'v1.13.10 render calls: ' + r.old.calls);
-    assert(r.now.calls * 5 < r.old.calls, 'v1.13.11 render calls ' + r.now.calls + ' vs v1.13.10 ' + r.old.calls);
-    console.log('  render calls ' + state + ': v1.13.10 ' + r.old.calls + ' -> v1.13.11 ' + r.now.calls +
+    assert(r.now.calls * 5 < r.old.calls, 'v1.13.13 render calls ' + r.now.calls + ' vs v1.13.10 ' + r.old.calls);
+    console.log('  render calls ' + state + ': v1.13.10 ' + r.old.calls + ' -> v1.13.13 ' + r.now.calls +
       ' (setBackground ' + (r.old.counts.setBackground || 0) + ' -> ' + (r.now.counts.setBackground || 0) + ')');
   });
 }
@@ -374,9 +375,9 @@ test('B7 dt10BulkPaint_: token rows get bg/fg/bold, undefined fields reset, null
 
 /* ================================================================== B8 */
 test('B8 version lockstep, WHY block, oracle integrity, ES5 shape and ASCII of the change', () => {
-  assert.equal(NEW.DT10_VERSION, '1.13.11');
+  assert.equal(NEW.DT10_VERSION, '1.13.13');
   assert.equal(OLD.DT10_VERSION, '1.13.10');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.11 /);
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.13 /);
   assert(source.includes(' * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n'));
   assert(source.includes(' * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE\n'), 'prior WHY kept');
   const why = source.slice(source.indexOf(' * v1.13.11 (2026-10-22)'), source.indexOf(' * v1.13.10 (2026-10-20)'));

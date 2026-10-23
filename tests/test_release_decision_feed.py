@@ -1647,8 +1647,8 @@ def _gas_changed_only_by_feed_cohort_binding(base):
     difference only through the binding harness run against this base copy.
     v1.1.2 (2026-10-13): also require the harness's D5, which proves that the
     historical v1.13.8 file minus its designed regions equals this base copy.
-    v1.13.9: the harness reverses only its enumerated cash-label/UTC adapter
-    edits, pins the complete historical SHA256, and mutation-tests that boundary
+    v1.13.9/v1.13.11: the harness reverses only its enumerated cash-label/UTC
+    adapter and refresh-completion edits, pins the historical SHA256, and mutation-tests that boundary
     before running the unchanged historical D5 guard. Current feed tests still
     execute the delivered file."""
     node = node_binary()
@@ -1663,7 +1663,7 @@ def _gas_changed_only_by_feed_cohort_binding(base):
     assert proc.returncode == 0 and lines and lines[-1].startswith("PASS ") \
         and "SKIP " not in proc.stdout, proc.stdout[-3000:] + proc.stderr[-2000:]
     assert "\nPASS D5 " in "\n" + proc.stdout, "harness D5 (designed regions only) did not run"   # v1.1.2
-    print("G4 16_Decision_Top10.gs: v1.13.9 cash-label/UTC edits match the pinned "
+    print("G4 16_Decision_Top10.gs: enumerated v1.13.9/v1.13.11 edits match the pinned "
           "v1.13.8 fixture; historical feed binding regions pass harness D5; %s" % lines[-1])
 
 

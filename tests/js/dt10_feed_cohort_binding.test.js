@@ -535,8 +535,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.11');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.11 /);
+  assert.equal(ctx.DT10_VERSION, '1.13.13');
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.13 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
@@ -664,9 +664,9 @@ function firstDifference(a, b) {
   return '';
 }
 
-/* v1.13.9's approved extension is separate from the historical default-off
+/* v1.13.9/v1.13.11's approved extensions are separate from the historical default-off
  * gate. A full-source digest prevents an unrelated change being hidden by
- * reversing this release's cosmetic/input-adapter edits. */
+ * reversing the enumerated cash/UTC and refresh-completion edits. */
 test('H1 immutable v1.13.8 fixture digest and current edit mutation guard', () => {
   assert.equal(crypto.createHash('sha256').update(historySource).digest('hex'), HISTORY_SHA256);
   assert.equal(count(source, 'function dt10SourceCount_(value) {\n'), 1);
@@ -676,6 +676,17 @@ test('H1 immutable v1.13.8 fixture digest and current edit mutation guard', () =
   const timestampMutation = source.replace("extra.updatedKey = t === 'lastupdatedutc' ? 'last_updated_utc' : 'last_updated';",
     "extra.updatedKey = 'last_updated';");
   assert.throws(() => feedHistorySource(timestampMutation), assert.AssertionError);
+  const completionMutation = source.replace(
+    "throw new Error('DT10_REFRESH_FAILED: network request unavailable');",
+    "return 'unreported failure';");
+  assert.notEqual(completionMutation, source, 'refresh failure mutation anchor exists');
+  assert.throws(() => feedHistorySource(completionMutation), assert.AssertionError);
+  const envelopeMutation = source.replace(
+    "  if (!object(payload.kpis)) return 'malformed kpis';",
+    "  if (!object(payload.kpis)) return '';"
+  );
+  assert.notEqual(envelopeMutation, source, 'response envelope mutation anchor exists');
+  assert.throws(() => feedHistorySource(envelopeMutation), assert.AssertionError);
 });
 
 /* ============================================================ D1-D5, G1: immutable v1.13.8 */

@@ -2,6 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.34 (2026-10-24) -- DECISION STACK INTEGRATION
+# WHY: preserve decision output regressions alongside current main and root gates.
+#
 # VERSION 1.1.33 (2026-10-24) -- STACK #804 INTEGRATION
 # WHY: preserve both pending reliability gates and all newer main regressions.
 # Both historical version lines are retained below; no required lane removed.
@@ -116,6 +119,12 @@
 # pinned exchange_calendars and pandas it needs.
 #
 # Pending branch history (version numbers preceded parallel main changes):
+# VERSION 1.1.25 (2026-10-17) -- DECISION PAGE OUTPUT INTEGRITY
+# WHY: native refresh failures must not acknowledge a completed decision;
+# unknown costs/prices and fractional custody must remain truthful. Register
+# the synthetic output and ambiguous-source regressions in the blocking lean
+# lane. Versions 1.1.21-24 belong to the separate reliability PR #785.
+#
 # VERSION 1.1.24 (2026-10-17) -- GREEN-RUN OUTPUT INTEGRITY
 # WHY: failed receipt/header reads, invalid backup bytes and partial SMTP
 # acceptance must not masquerade as completed output. Run the offline I/O
@@ -754,6 +763,9 @@ jobs:
             tests/test_name_identity_evidence.py \
             tests/test_name_identity_workflow.py \
             tests/test_decision_surface_freshness.py \
+            tests/test_decision_pool_counter_ambiguity.py \
+            tests/test_decision_refresh_completion_js.py \
+            tests/test_pf_native_integrity_js.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
             tests/test_release_decision_feed.py \
@@ -767,6 +779,7 @@ jobs:
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
+            tests/test_portfolio_action_output_integrity.py \
             tests/test_pf_confirm_calendar_failclosed.py \
             tests/test_pf_confirm_session_p168b.py \
             tests/test_scoring_engine_contract.py \

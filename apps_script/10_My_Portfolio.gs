@@ -1,7 +1,32 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.14
+ * Version: 1.5.17
+ *
+ * v1.5.17 INTEGRATION (2026-10-24) -- PRESERVE BOTH REPAIR HISTORIES
+ * WHY: reconcile the stacked response/cost-proof changes with main's
+ * closed/sold ledger exclusion. Excluded lots cannot contaminate active
+ * quantity or cost; contributing active lots must still prove both.
+ * Operational response validation, prior-board preservation and fractional
+ * quantity rendering remain intact. Version 1.5.16 belongs to the stacked
+ * panel-preservation/price-precision follow-up and is not overwritten.
+ *
+ * v1.5.15 MAIN CHANGES (2026-10-17) -- OPERATIONAL RESPONSE AND COST PROOF
+ * WHY: a truthy HTTP-200 failure envelope cleared the prior decision board,
+ * and the capture watcher then acknowledged that unsuccessful build. Refuse
+ * explicit operational failures and malformed renderer inputs before any
+ * render/action log; throw a bounded RESPONSE ERROR so orchestration cannot
+ * acknowledge it. Successful empty and policy-controlled results still render.
+ * The native ledger also applied a priced subset's average to all shares.
+ * Keep known quantity, but withhold cost unless every contributing lot proves
+ * its price and fee. A blank fee needs the same exact native Cost Basis
+ * zero-delta witness as the Python reader; malformed fees are never zero.
+ * Unknown ledger quantity/cost removes stale display aliases from the request.
+ * Zero or invalid active quantities do not establish a closed custody position.
+ * Fractional holding/exit quantities retain their numeric values and display
+ * decimals in quantity columns; whole-share action calculations are untouched.
+ * No action, funding, custody, arming, freeze or panel-preservation policy changes.
+ * Version 1.5.14 is reserved for the separate pending panel-preservation PR.
  *
  * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
  * ---------------------------------------------------------------
@@ -2054,12 +2079,12 @@ function _myPortfolioCostBasisSymbols_() {
  * HEADER NAME on row 4 ('Quantity' accepted as a defensive Shares alias),
  * and aggregates ACTIVE lots per symbol:
  *   qty      = sum of Shares across active lots;
- *   buyPrice = shares-weighted average cost INCLUDING Buy Fees, computed
- *              only over lots that carry BOTH shares and price (nothing is
- *              fabricated when either is missing), deliberately UNROUNDED
- *              — numerically identical to 21's syncLedgerToPortfolio and
- *              14 v2.5.0's pfReadCostBasisV2_, so the feeders can never
- *              oscillate the Avg Cost cell between runs;
+ *   buyPrice = shares-weighted average cost INCLUDING proven Buy Fees,
+ *              deliberately UNROUNDED; withheld if any contributing lot's
+ *              price/fee is unknown. An exact native Cost Basis equal to
+ *              Shares * Buy Price can establish a blank fee's zero component;
+ *   qtyIncomplete/costIncomplete = true when a contributing lot cannot
+ *              establish that aggregate; stale display aliases are not reused;
  *   buyDate  = earliest lot date.
  * A lot is EXCLUDED when Status trims to 'inactive', 'closed' or 'sold'
  * (case-insensitive; v1.5.14 added closed/sold to mirror the Python
@@ -2072,6 +2097,14 @@ function _myPortfolioCostBasisSymbols_() {
  * through to the legacy chain and a transient ledger problem can never
  * blank the page (v1.5.1 wipe-guard preserved). Never throws.
  */
+function _myPortfolioLedgerNumber_(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  var text = String(value).replace(/,/g, '').trim();
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return null;
+  var number = Number(text);
+  return isFinite(number) ? number : null;
+}
+
 function _myPortfolioLedgerMap_() {
   try {
     var sh = SpreadsheetApp.getActive().getSheetByName('_Portfolio_CostBasis');
@@ -2104,6 +2137,14 @@ function _myPortfolioLedgerMap_() {
     var vals = sh.getRange(5, 1, lastRow - 4, lastCol).getValues();
     var wSum = {};
     var wQty = {};
+    var headerCounts = {}, nativeCostColumns = [], feeHeaders = [];
+    for (var hi = 0; hi < hdr.length; hi++) {
+      var hn = String(hdr[hi] == null ? '' : hdr[hi]).toLowerCase()
+          .replace(/[^a-z0-9]/g, '');
+      headerCounts[hn] = (headerCounts[hn] || 0) + 1;
+      if (hn === 'costbasis') nativeCostColumns.push(hi);
+      if (hn.indexOf('buyfees') === 0) feeHeaders.push(hn);
+    }
     for (var r = 0; r < vals.length; r++) {
       var row = vals[r];
       var sym = String(row[col.symbol - 1] == null ? '' : row[col.symbol - 1])
@@ -2116,24 +2157,41 @@ function _myPortfolioLedgerMap_() {
       if (status === 'inactive' || status === 'closed' ||
           status === 'sold') { continue; }        // v1.5.14
       if (!Object.prototype.hasOwnProperty.call(map, sym)) {
-        map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0 };
+        map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0,
+                     qtyIncomplete: false, costIncomplete: false };
         wSum[sym] = 0;
         wQty[sym] = 0;
       }
       var agg = map[sym];
       agg.lots = agg.lots + 1;
-      var qty = col.shares ? myPortfolioNumber_(row[col.shares - 1], null) : null;
+      var qty = col.shares ? _myPortfolioLedgerNumber_(row[col.shares - 1]) : null;
       var price = col.buyPrice
-          ? myPortfolioNumber_(row[col.buyPrice - 1], null) : null;
-      var fees = col.buyFees
-          ? myPortfolioNumber_(row[col.buyFees - 1], null) : null;
+          ? _myPortfolioLedgerNumber_(row[col.buyPrice - 1]) : null;
+      var feeRaw = col.buyFees ? row[col.buyFees - 1] : null;
+      var fees = col.buyFees ? _myPortfolioLedgerNumber_(feeRaw) : 0;
       if (qty !== null && qty > 0) {
         agg.qty = (agg.qty === null ? 0 : agg.qty) + qty;
-        if (price !== null && price > 0) {
-          wSum[sym] = wSum[sym] + qty * price +
-              (fees !== null && fees > 0 ? fees : 0);
-          wQty[sym] = wQty[sym] + qty;
+        if (col.buyFees && fees === null &&
+            (feeRaw === null || feeRaw === undefined ||
+             (typeof feeRaw === 'string' && feeRaw.trim() === '')) &&
+            headerCounts.buyprice === 1 && headerCounts.shares === 1 &&
+            !headerCounts.quantity && String(hdr[col.shares - 1]).trim() === 'Shares' &&
+            nativeCostColumns.length === 1) {
+          var witness = _myPortfolioLedgerNumber_(row[nativeCostColumns[0]]);
+          if (witness !== null && witness > 0 && witness === qty * price) fees = 0;
         }
+        var lotCost = price !== null && price > 0 && fees !== null && fees >= 0
+            ? qty * price + fees : null;
+        if (feeHeaders.length && (!col.buyFees || feeHeaders.length !== 1 || feeHeaders[0] !== 'buyfees')) {
+          lotCost = null;
+        }
+        if (lotCost !== null && isFinite(lotCost) && lotCost > 0) {
+          wSum[sym] = wSum[sym] + lotCost;
+          wQty[sym] = wQty[sym] + qty;
+        } else agg.costIncomplete = true;
+      } else {
+        agg.qtyIncomplete = true;
+        agg.costIncomplete = true;
       }
       var d = col.buyDate ? row[col.buyDate - 1] : null;
       if (d instanceof Date && !isNaN(d.getTime())) {
@@ -2144,8 +2202,17 @@ function _myPortfolioLedgerMap_() {
       }
     }
     for (var k in map) {
+      if (Object.prototype.hasOwnProperty.call(map, k) &&
+          (map[k].qtyIncomplete || !isFinite(map[k].qty))) {
+        map[k].qty = null;
+        map[k].qtyIncomplete = true;
+        map[k].costIncomplete = true;
+      }
       if (Object.prototype.hasOwnProperty.call(map, k) && wQty[k] > 0) {
-        map[k].buyPrice = wSum[k] / wQty[k];
+        var average = wSum[k] / wQty[k];
+        if (!map[k].costIncomplete && isFinite(average) && average > 0) {
+          map[k].buyPrice = average;
+        } else map[k].costIncomplete = true;
       }
     }
     return map;
@@ -2567,7 +2634,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.14';
+var PD_VERSION = '1.5.17';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2611,6 +2678,7 @@ var PD_FMT_SAR = '#,##0 "SAR"';
 var PD_FMT_PRICE = '#,##0.00';
 var PD_FMT_PCT = '0.0"%"';
 var PD_FMT_INT = '#,##0';
+var PD_FMT_QTY = '#,##0.########';
 
 /* §3.2 PF panel — labels verbatim (TFB_PANEL_DEFAULTS / route alias map). */
 var PD_PANEL = [
@@ -3868,11 +3936,18 @@ function pdCollectHoldings_(extraFields, wantStamps) {
     var cbInfo = cb[String(sym).replace(/^\s+|\s+$/g, '').toUpperCase()];
     if (cbInfo) {
       var usedCb = false;
-      if (cbInfo.qty !== null && cbInfo.qty !== undefined) {
+      if (cbInfo.qtyIncomplete === true) {
+        delete obj['Quantity'];
+        usedCb = true;
+      } else if (cbInfo.qty !== null && cbInfo.qty !== undefined) {
         obj['Quantity'] = cbInfo.qty;
         usedCb = true;
       }
-      if (cbInfo.buyPrice !== null && cbInfo.buyPrice !== undefined) {
+      if (cbInfo.costIncomplete === true) {
+        delete obj['Buy Price'];
+        delete obj['Avg Cost'];
+        usedCb = true;
+      } else if (cbInfo.buyPrice !== null && cbInfo.buyPrice !== undefined) {
         obj['Buy Price'] = cbInfo.buyPrice;
         obj['Avg Cost'] = cbInfo.buyPrice;
         usedCb = true;
@@ -3911,6 +3986,57 @@ function pdPost_(body) {
     json = JSON.parse(text);
   } catch (e) {}
   return { code: resp.getResponseCode(), json: json, text: text, url: url };
+}
+
+/** Pure operational envelope check; no action/funding/eligibility decisions.
+ * Unknown policy statuses remain supported when their renderer inputs are valid. */
+function pdResponseProblem_(payload) {
+  var object = function (value) {
+    return Object.prototype.toString.call(value) === '[object Object]';
+  };
+  var cells = function (values) {
+    for (var c = 0; c < values.length; c++) {
+      var value = values[c];
+      if (typeof value !== 'string' && typeof value !== 'boolean' &&
+          !(typeof value === 'number' && isFinite(value))) return false;
+    }
+    return true;
+  };
+  if (!object(payload)) return 'malformed response object';
+  if (typeof payload.status !== 'string' || !payload.status.trim()) {
+    return 'missing response status';
+  }
+  var state = payload.status.trim().toLowerCase();
+  if (/^(unavailable|degraded|failed|error)$/.test(state)) {
+    return 'backend status ' + state;
+  }
+  if (!object(payload.kpis)) return 'malformed kpis';
+  if (!cells(pdKpiValues_(payload.kpis))) return 'malformed kpi cell';
+  if (payload.kpis.action_counts !== null && payload.kpis.action_counts !== undefined) {
+    if (!object(payload.kpis.action_counts)) return 'malformed action counts';
+    var counts = payload.kpis.action_counts;
+    if (!cells(['ADD', 'HOLD', 'TRIM', 'EXIT', 'BLOCK'].map(function (action) {
+      return pdCell_(counts[action]);
+    }))) return 'malformed action counts';
+  }
+  var tables = ['actions', 'sector_summary', 'alerts'];
+  var mappers = [pdActionToRow_, pdSectorToRow_, pdAlertToRow_];
+  for (var t = 0; t < tables.length; t++) {
+    var rows = payload[tables[t]];
+    if (!Array.isArray(rows)) return 'malformed ' + tables[t];
+    for (var r = 0; r < rows.length; r++) {
+      if (!object(rows[r])) return 'malformed ' + tables[t] + ' entry';
+      if (t === 0 && (typeof rows[r].action !== 'string' || !rows[r].action.trim() ||
+          typeof rows[r].symbol !== 'string' || !rows[r].symbol.trim())) {
+        return 'malformed action identity';
+      }
+      if (!cells(mappers[t](rows[r]))) return 'malformed ' + tables[t] + ' cell';
+    }
+  }
+  if (payload.meta !== null && payload.meta !== undefined && !object(payload.meta)) {
+    return 'malformed meta';
+  }
+  return '';
 }
 
 /* ----- layout builder -------------------------------------------------------- */
@@ -4108,6 +4234,13 @@ function refreshPortfolioDecision() {
     return 'HTTP ' + resp.code;
   }
   var payload = resp.json;
+  var responseProblem = pdResponseProblem_(payload);
+  if (responseProblem) {
+    statusCell.setValue(pdStatusLine_('RESPONSE ERROR', responseProblem));
+    /* Throw: legacy coordinators acknowledge every non-HTTP/non-network return.
+     * The watcher catches this without retiring the still-fresh capture. */
+    throw new Error('RESPONSE ERROR: ' + responseProblem);
+  }
   pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null);
 
   /* v1.5.9: append the just-rendered board to _Portfolio_Action_Log from
@@ -4169,9 +4302,9 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
       'No holdings \u2014 refresh My_Portfolio first, or the portfolio is ' +
       'empty (an honest result, L13).');
   pdApplyColFormats_(sheet, aT.firstDataRow, aT.count, {
-    6: PD_FMT_INT, 7: PD_FMT_PRICE, 8: PD_FMT_PRICE, 9: PD_FMT_PRICE,
+    6: PD_FMT_QTY, 7: PD_FMT_PRICE, 8: PD_FMT_PRICE, 9: PD_FMT_PRICE,
     10: PD_FMT_SAR, 11: PD_FMT_SAR, 12: PD_FMT_SAR, 13: PD_FMT_PCT,
-    14: PD_FMT_PCT, 15: PD_FMT_SAR, 16: PD_FMT_INT, 18: PD_FMT_PRICE,
+    14: PD_FMT_PCT, 15: PD_FMT_SAR, 16: PD_FMT_QTY, 18: PD_FMT_PRICE,
     19: PD_FMT_PRICE, 20: PD_FMT_PRICE, 21: PD_FMT_PCT, 22: PD_FMT_PCT,
     23: '0.0', 24: '0.0'
   });
@@ -4216,7 +4349,7 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
     }
     var oT = pdWriteTable_(sheet, row, PD_SCOPE_HEADERS, oRows, '');
     pdApplyColFormats_(sheet, oT.firstDataRow, oT.count, {
-      4: PD_FMT_INT, 5: PD_FMT_PRICE, 6: PD_FMT_PRICE
+      4: PD_FMT_QTY, 5: PD_FMT_PRICE, 6: PD_FMT_PRICE
     });
     row = oT.next + 1;
   }

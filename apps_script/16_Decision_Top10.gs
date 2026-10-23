@@ -1,11 +1,31 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.13 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.13 (2026-10-24) -- STACK INTEGRATION, REFRESH AND BULK RENDER
+ * WHY: merge the pending failed-refresh/projection validation with main's
+ * bulk formatting and terminal FAILED banner/receipt handling. Retain both
+ * historical v1.13.11 WHY blocks and the raw subunit FX preservation. A
+ * malformed response is still refused before stability or board mutation;
+ * honest empty/WITHHELD results and the existing gate policies are unchanged.
+ * Version 1.13.12 is reserved for the pending completion-receipt work.
+ *
+ * v1.13.11 (2026-10-17) -- FAILED REFRESHES CANNOT ACKNOWLEDGE COMPLETION
+ * WHY: network, HTTP and degraded-response paths preserved the previous
+ * board but returned normally. The morning wrapper then logged OK, and the
+ * proposed decision-chain caller marked that cohort refreshed and stopped
+ * retrying. After the existing failure status and marker cleanup, these
+ * paths now throw a bounded operational error. Both callers already catch
+ * exceptions. Malformed HTTP-200 renderer inputs are refused before any
+ * stability/render work; a missing result is not a verified empty board.
+ * Successful empty, WITHHELD and NO_TRADE renders are unchanged;
+ * no source, funding, stability or financial gate changes. Version 1.13.10
+ * remains reserved for the separate pending audit-keep change in PR #778.
  *
  * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)
  * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10
@@ -1802,7 +1822,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.11';
+var DT10_VERSION = '1.13.13';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -5253,11 +5273,65 @@ function dt10FunnelNote_(payload) {
 /**
  * v1.6.3 — is this 200 actually a refresh? Returns '' when the payload is a
  * real result (including the honest empty "no_candidates"), else a short
- * reason token. Unknown/absent status is treated as GOOD (proven-degraded
- * only) so a future status word cannot freeze the board silently.
+ * reason token. Nonempty future status words remain supported when the
+ * renderer containers are valid; absent inputs cannot certify an empty board.
  */
+function dt10ResponseProblem_(payload) {
+  var object = function (value) {
+    return Object.prototype.toString.call(value) === '[object Object]';
+  };
+  var scalar = function (value) {
+    return value === null || value === undefined || typeof value === 'string' ||
+        typeof value === 'boolean' || (typeof value === 'number' && isFinite(value));
+  };
+  var cells = function (row) {
+    for (var i = 0; i < row.length; i++) if (!scalar(row[i])) return false;
+    return true;
+  };
+  if (!object(payload)) return 'malformed response object';
+  if (typeof payload.status !== 'string' || !payload.status.trim()) {
+    return 'missing response status';
+  }
+  if (!object(payload.kpis)) return 'malformed kpis';
+  if (!cells(dt10KpiValues_(payload.kpis)) || !scalar(payload.kpis.selected_count) ||
+      !scalar(payload.kpis.max_selected)) return 'malformed kpi cells';
+  var tables = ['selected', 'candidates_rows', 'near_miss', 'alerts'];
+  if (payload.qualified !== undefined) tables.push('qualified');
+  // These are only fields projected by the candidate/qualified row mappers.
+  // Do not invoke their property-reading display fallback during validation.
+  var candidateFields = ['symbol', 'name', 'market', 'sector', 'currency', 'price',
+      'price_sar', 'roi_pct', 'engine_roi_pct', 'ann_roi_pct', 'rr', 'reliability',
+      'dq', 'risk_level', 'news_trend', 'sector_trend', 'verdict', 'confidence_band',
+      'opportunity_score', 'failure_reason', 'deferral', '_dt10_held_seat_reason'];
+  for (var t = 0; t < tables.length; t++) {
+    var rows = payload[tables[t]];
+    if (!Array.isArray(rows)) return 'malformed ' + tables[t];
+    for (var r = 0; r < rows.length; r++) {
+      var item = rows[r];
+      if (!object(item)) return 'malformed ' + tables[t] + ' entry';
+      if (tables[t] !== 'alerts' &&
+          (typeof item.symbol !== 'string' || !item.symbol.trim())) {
+        return 'missing ' + tables[t] + ' identity';
+      }
+      var projected;
+      if (tables[t] === 'selected') projected = dt10TicketToRow_(item);
+      else if (tables[t] === 'near_miss') projected = dt10NearMissToRow_(item);
+      else if (tables[t] === 'alerts') projected = dt10AlertToRow_(item);
+      else {
+        projected = candidateFields.map(function (field) { return item[field]; });
+        projected.push(item.first_fail ? item.first_fail.gate : null);
+      }
+      if (!cells(projected)) return 'malformed ' + tables[t] + ' cells';
+    }
+  }
+  if (payload.meta !== null && payload.meta !== undefined && !object(payload.meta)) {
+    return 'malformed meta';
+  }
+  return '';
+}
 function dt10PayloadDegraded_(payload) {
-  if (!payload) { return 'empty response'; }
+  var malformed = dt10ResponseProblem_(payload);
+  if (malformed) return malformed;
   var st = String(payload.status || '').toLowerCase();
   if (st === 'degraded' || st === 'error' || st === 'unavailable' ||
       st === 'failed') {
@@ -7196,7 +7270,7 @@ function dt10RefreshDecisionTop10Run_(run) {
         'Decision cockpit: NETWORK ERROR — ' + String(eNet).slice(0, 300),
         '', '', '', []);
     dt10RunMarkerClear_();   // v1.11.12 [P-195]
-    return;
+    throw new Error('DT10_REFRESH_FAILED: network request unavailable');
   }
   if (resp.code !== 200 || !resp.json) {
     statusCell.setValue(dt10StatusLine_('HTTP ' + resp.code,
@@ -7207,7 +7281,7 @@ function dt10RefreshDecisionTop10Run_(run) {
         (resp.text || '').slice(0, 180),
         resp.code, '', '', []);
     dt10RunMarkerClear_();   // v1.11.12 [P-195]
-    return;
+    throw new Error('DT10_REFRESH_FAILED: HTTP response unavailable');
   }
   var payload = resp.json;
   // v1.6.3: a fail-soft 200 is NOT a refresh — never let it erase a good board.
@@ -7219,7 +7293,7 @@ function dt10RefreshDecisionTop10Run_(run) {
         'Decision cockpit: degraded payload (' + degraded +
         ') — board preserved, not refreshed', resp.code, '', '', []);
     dt10RunMarkerClear_();   // v1.11.12 [P-195]
-    return;
+    throw new Error('DT10_REFRESH_FAILED: backend result incomplete');
   }
   // v1.3.0: membership hysteresis between response and render. The audit
   // grid / qualified / near-miss zones keep the backend's RAW truth; only
