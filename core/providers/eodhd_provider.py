@@ -1152,7 +1152,9 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
-PROVIDER_VERSION = "4.18.3"
+# v4.18.5: current-year EPS estimates are not reported trailing earnings.
+# Version the fundamentals cache so an old estimated eps_ttm cannot survive.
+PROVIDER_VERSION = "4.18.5"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -2633,7 +2635,7 @@ class EODHDClient:
 
         margin_unit_aware = _eodhd_unit_aware_enabled()
         margin_version = _MARGIN_FRACTION_VERSION if margin_unit_aware else _MARGIN_LEGACY_VERSION
-        ck = f"f:{margin_version}:{sym}"
+        ck = f"f:eps_basis_v1:{margin_version}:{sym}"
         cached = await self.fund_cache.get(ck)
         if cached:
             return cached, None
@@ -2775,7 +2777,10 @@ class EODHDClient:
             roe = _pct_merge(highlights.get("ROE"), _safe_div(net_income_ttm, total_equity))
             roa = _pct_merge(highlights.get("ROA"), _safe_div(net_income_ttm, total_assets))
 
-            shares_outstanding = safe_float(_first_present(shares.get("SharesOutstanding"), highlights.get("SharesOutstanding")))
+            shares_raw = _first_present(shares.get("SharesOutstanding"), highlights.get("SharesOutstanding"))
+            shares_outstanding = safe_float(shares_raw)
+            shares_source = "SharesStats.SharesOutstanding" if _first_present(shares.get("SharesOutstanding")) is not None \
+                else "Highlights.SharesOutstanding"
             float_shares = safe_float(_first_present(shares.get("SharesFloat"), shares.get("FloatShares"), highlights.get("SharesFloat")))
             market_cap = safe_float(_first_present(highlights.get("MarketCapitalization"), general.get("MarketCapitalization")))
 
@@ -2817,23 +2822,35 @@ class EODHDClient:
             )
             payout_ratio = _pct_merge(_first_present(splits.get("PayoutRatio"), highlights.get("PayoutRatio")))
 
-            # ---- eps_ttm with v4.7.1 FIX-B fallback + v4.7.2 YD sanity bound ----
+            # ---- Separate reported TTM, analyst estimates and derived proxies ----
             _EPS_FALLBACK_CEILING = 500.0
             _EPS_FALLBACK_FLOOR = -200.0
 
-            eps_ttm_final = safe_float(
-                _first_present(
-                    highlights.get("EarningsShare"),
-                    highlights.get("DilutedEpsTTM"),
-                    highlights.get("EPSEstimateCurrentYear"),
-                )
-            )
+            # Provider glossary: EarningsShare / DilutedEpsTTM are reported
+            # diluted TTM; EPSEstimateCurrentYear is an analyst estimate for a
+            # different period. Missing actuals must not select that estimate.
+            eps_source = None
+            eps_ttm_final = None
+            for field in ("EarningsShare", "DilutedEpsTTM"):
+                value = safe_float(highlights.get(field))
+                if value is not None:
+                    eps_ttm_final, eps_source = value, f"Highlights.{field}"
+                    break
+            eps_estimate = safe_float(highlights.get("EPSEstimateCurrentYear"))
+            eps_basis = "reported_diluted_ttm"
+            eps_proxy = None
+            if eps_ttm_final is None and eps_estimate is not None:
+                warnings_list.append("eps_ttm_estimate_excluded")
             if eps_ttm_final is None:
-                if net_income_ttm is not None and shares_outstanding not in (None, 0.0):
+                if net_income_ttm is not None and shares_outstanding is not None and shares_outstanding > 0:
                     candidate = net_income_ttm / shares_outstanding
                     if _EPS_FALLBACK_FLOOR <= candidate <= _EPS_FALLBACK_CEILING:
-                        eps_ttm_final = candidate
-                        warnings_list.append("eps_ttm_fallback_used")
+                        # The sum can contain fewer than four quarters; current
+                        # shares are not period-weighted diluted shares either.
+                        # Retain the proxy as diagnostics, never a TTM/scoring
+                        # input even when four quarterly records are available.
+                        eps_proxy = candidate
+                        warnings_list.append("eps_ttm_proxy_excluded")
                     else:
                         logger.debug(
                             "[eodhd v4.9.1] eps_ttm fallback rejected for %s: "
@@ -2841,9 +2858,28 @@ class EODHDClient:
                             sym, candidate, _EPS_FALLBACK_FLOOR, _EPS_FALLBACK_CEILING,
                         )
                         warnings_list.append("eps_ttm_fallback_rejected")
-                else:
-                    warnings_list.append("eps_ttm_unavailable")
+                warnings_list.append("eps_ttm_unavailable")
 
+            collected_at = _utc_iso()
+            eps_evidence = {}
+            for field, value, basis, source in (
+                ("eps_ttm", eps_ttm_final, eps_basis, eps_source),
+                ("eps_estimate_current_year", eps_estimate, "current_fiscal_year_estimate",
+                 "Highlights.EPSEstimateCurrentYear"),
+                ("eps_net_income_current_shares", eps_proxy, "derived_net_income_over_current_shares",
+                 f"Financials.Income_Statement.quarterly.netIncome/{shares_source}"),
+            ):
+                if value is not None:
+                    eps_evidence[field] = {
+                        "value": value, "basis": basis, "source_field": source,
+                        "provider": PROVIDER_NAME,
+                        # Keep source date and collection clock distinct. These
+                        # are not a quote/session freshness certification.
+                        "provider_updated_at": safe_str(general.get("UpdatedAt")),
+                        "period_end": safe_str(highlights.get("MostRecentQuarter"))
+                        if basis == "reported_diluted_ttm" else None,
+                        "collected_at_utc": collected_at,
+                    }
             patch = _clean_patch(
                 {
                     "symbol": sym_raw,
@@ -2864,6 +2900,9 @@ class EODHDClient:
                     "float_shares": float_shares,
                     "shares_float": float_shares,
                     "eps_ttm": eps_ttm_final,
+                    "eps_estimate_current_year": eps_estimate,
+                    "eps_net_income_current_shares": eps_proxy,
+                    "_eps_basis": eps_evidence or None,
                     "pe_ttm": safe_float(_first_present(valuation.get("TrailingPE"), highlights.get("PERatio"))),
                     "forward_pe": safe_float(_first_present(valuation.get("ForwardPE"), highlights.get("ForwardPE"))),
                     "pb_ratio": safe_float(_first_present(valuation.get("PriceBookMRQ"), valuation.get("PriceBook"))),
@@ -2901,7 +2940,7 @@ class EODHDClient:
                     "debt_to_equity": debt_to_equity,
                     "d_e_ratio": debt_to_equity,
                     "warnings": warnings_list if warnings_list else None,
-                    "last_updated_utc": _utc_iso(),
+                    "last_updated_utc": collected_at,
                     "last_updated_riyadh": _riyadh_iso(),
                 }
             )

@@ -1,11 +1,19 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.13 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.13 (2026-10-24) -- STACK INTEGRATION, REFRESH AND BULK RENDER
+ * WHY: merge the pending failed-refresh/projection validation with main's
+ * bulk formatting and terminal FAILED banner/receipt handling. Retain both
+ * historical v1.13.11 WHY blocks and the raw subunit FX preservation. A
+ * malformed response is still refused before stability or board mutation;
+ * honest empty/WITHHELD results and the existing gate policies are unchanged.
+ * Version 1.13.12 is reserved for the pending completion-receipt work.
  *
  * v1.13.11 (2026-10-17) -- FAILED REFRESHES CANNOT ACKNOWLEDGE COMPLETION
  * WHY: network, HTTP and degraded-response paths preserved the previous
@@ -18,6 +26,51 @@
  * Successful empty, WITHHELD and NO_TRADE renders are unchanged;
  * no source, funding, stability or financial gate changes. Version 1.13.10
  * remains reserved for the separate pending audit-keep change in PR #778.
+ *
+ * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)
+ * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10
+ * refresh that followed the first decision-feed release logged 'upstream
+ * verdict: EXECUTABLE; final board: HELD' at 23:48:42 Riyadh and was
+ * killed at 23:50:59 ('Exceeded maximum execution time') before it wrote
+ * its status line. B2 stayed 'running', the next scheduled release check
+ * read T10_STATUS_NOT_OK and withdrew the release (decision_failed). The
+ * 19:40 run was killed the same way; completed runs took 127-232 s. The
+ * render painted formats cell by cell: one setBackground per zebra row in
+ * dt10WriteTable_, and setBackground + setFontColor + setFontWeight per
+ * coloured cell in dt10ColorVerdicts_, dt10ColorQualified_ and
+ * dt10ColorStability_ -- about 1,750 range calls for the 500-row CANDIDATES
+ * grid alone, each one slower while other scripts write the workbook.
+ * WHAT: the same formats are written in bulk. dt10WriteTable_ reads the
+ * body backgrounds once, sets the zebra rows and writes them back once.
+ * The three colourers build one token per row and call the new
+ * dt10BulkPaint_, which reads backgrounds, font colours and font weights
+ * once, sets tok.bg / tok.fg / bold on the token rows and writes each
+ * attribute once (nothing is read or written when no row has a token).
+ * Rows the old loops left alone keep their current format (read back and
+ * written unchanged), so the painted board is the same. Values, verdicts,
+ * withholding, funding, stability, receipts and the status line are
+ * unchanged. Harness: tests/js/dt10_bulk_format.test.js (cell-model
+ * equivalence against the v1.13.10 code, bounded call counts).
+ *
+ * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE
+ * (1) dt10HoldingFromRow_ upper-cased the currency before the FX lookup, so
+ * a GBp (pence) holding converted at the GBP rate (100x too large). The new
+ * dt10HoldingFxRate_ mirrors opportunity_builder._resolve_fx (USX gate off):
+ * GBX/GBp, ZAC/ZAc, ILA/ILa are detected on the RAW token and use an exact
+ * raw FX key, else parent / 100. USX keeps needing its own 'USX' FX row.
+ * (2) A currency with no FX rate kept its NATIVE value labelled value_sar.
+ * It now sends value_sar null and marks holdings_input_incomplete, so
+ * funding stays withheld; the builder never sums a native amount as SAR.
+ * (3) refreshDecisionTop10 wrote 'running...' and a throw left it there
+ * (20 Oct: cockpit stuck RUNNING, no grid, validation failed). The body is
+ * now dt10RefreshDecisionTop10Run_; on a throw dt10RefreshFailed_ writes
+ * 'status: FAILED | failed_at_utc=<ISO Z> | <error>', upserts _Status ERROR,
+ * clears the P-195 marker this run stored (a throw before the marker check
+ * leaves a previous run's marker for ABORTED_PREV) and rethrows. The
+ * freshness audit reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script
+ * hard timeout (6 min) kills the script without running catch; that case
+ * still shows RUNNING and is reported by the next run's P-195 ABORTED_PREV
+ * row.
  *
  * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
  * The cash KPI echoes an entered amount and cannot certify custody or
@@ -1769,7 +1822,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.11';
+var DT10_VERSION = '1.13.13';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3066,6 +3119,31 @@ function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
 function dt10NormSym_(v) {
   return String(v === null || v === undefined ? '' : v).trim().toUpperCase();
 }
+/** v1.13.10 PURE: SAR per unit of a holding's native currency cell, mirroring
+ * opportunity_builder._resolve_fx with TFB_OPP_FX_USX_SUBUNIT off (default).
+ * Subunits are detected on the RAW token BEFORE case folding ('GBp' would
+ * otherwise fold into pounds): GBX/GBp, ZAC/ZAc, ILA/ILa (and gbx/zac/ila
+ * spellings) are 1/100 of GBP/ZAR/ILS. An exact raw key in the map wins
+ * (already per subunit); otherwise the parent rate / 100. USX is not folded
+ * here (its gate is backend-only and DEFAULT OFF): it needs its own 'USX'
+ * row, as before. Returns null for SAR/blank (no conversion), NaN when no
+ * rate exists, else the positive rate. */
+var DT10_FX_SUBUNIT_PARENT = { GBp: 'GBP', GBX: 'GBP', ZAC: 'ZAR', ZAc: 'ZAR',
+                               ILA: 'ILS', ILa: 'ILS' };
+function dt10HoldingFxRate_(cell, fx) {
+  var raw = String(cell === null || cell === undefined ? '' : cell).trim();
+  var up = raw.toUpperCase();
+  if (!raw || up === 'SAR') return null;
+  fx = fx || {};
+  var exact = Number(fx[raw]);
+  if (isFinite(exact) && exact > 0) return exact;
+  var parent = Object.prototype.hasOwnProperty.call(DT10_FX_SUBUNIT_PARENT, raw) ?
+      DT10_FX_SUBUNIT_PARENT[raw] :
+      (up === 'GBX' || up === 'ZAC' || up === 'ILA') ? DT10_FX_SUBUNIT_PARENT[up] : '';
+  var rate = Number(fx[parent || up]);
+  if (!(isFinite(rate) && rate > 0)) return NaN;
+  return parent ? rate / 100 : rate;
+}
 /** v1.5.0 (Fix H1) PURE: one My_Portfolio sheet row -> holdings entry for
  * the builder's Portfolio gate, or null. Exclusion needs symbol only;
  * sector/value are best-effort context for the builder's sector-cap math.
@@ -3087,19 +3165,20 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
   }
   extra = extra || {};
   // v1.11.4 [P-78]: a NATIVE value converts to SAR when the caller supplies a
-  // currency column and an FX map (SAR per unit). SAR rows, rows without a
-  // currency and currencies missing from the map keep the native value.
+  // currency column and an FX map (SAR per unit). SAR rows and rows without a
+  // currency keep the native value. v1.13.10: subunits resolve on the RAW
+  // token and a currency missing from the map sends value_sar null and
+  // marks the row _input_incomplete instead of a native amount labelled SAR.
   if (DT10_V1114_HOLDINGS_FX && val > 0 && extra.fx && extra.iCcy >= 0) {
-    var ccy = String(row[extra.iCcy] === null || row[extra.iCcy] === undefined ?
-                     '' : row[extra.iCcy]).trim().toUpperCase();
-    if (ccy && ccy !== 'SAR') {
-      var rate = Number(extra.fx[ccy]);
-      if (isFinite(rate) && rate > 0) {
-        val = val * rate;
-        extra._converted = (extra._converted || 0) + 1;
-      } else {
-        extra._unconverted = (extra._unconverted || 0) + 1;
-      }
+    var rate = dt10HoldingFxRate_(row[extra.iCcy], extra.fx);
+    if (rate === null) {
+      // SAR or blank currency: the value is already SAR (unchanged).
+    } else if (isFinite(rate) && rate > 0) {
+      val = val * rate;
+      extra._converted = (extra._converted || 0) + 1;
+    } else {
+      val = null;
+      extra._unconverted = (extra._unconverted || 0) + 1;
     }
   }
   var h = { symbol: sym, sector: sector || 'Unknown', value_sar: val };
@@ -3230,6 +3309,7 @@ function dt10CollectHoldings_(ss) {
     for (var r = hIdx + 1; r < values.length; r++) {
       var h = dt10HoldingFromRow_(values[r], iSym, iSec, useVal, extra);
       if (!h) continue;
+      if (h.value_sar === null) out._input_incomplete = true;   // v1.13.10: no FX
       if (seen[h.symbol]) { out._input_incomplete = true; continue; }
       if (out.length >= 500) { out._input_incomplete = true; continue; }
       seen[h.symbol] = true;
@@ -6893,11 +6973,15 @@ function dt10WriteTable_(sheet, row, headers, dataRows, emptyText) {
   }
   sheet.getRange(row, 1, dataRows.length, headers.length).setValues(dataRows);
   // Body text in proposal ink; alternate rows in the proposal zebra tint.
-  sheet.getRange(row, 1, dataRows.length, headers.length)
-      .setFontColor(DT10_INK);
+  var body = sheet.getRange(row, 1, dataRows.length, headers.length);
+  body.setFontColor(DT10_INK);
+  // v1.13.11: one read + one write instead of one call per zebra row; the
+  // other rows keep the background they already had.
+  var zebra = body.getBackgrounds();
   for (var i = 0; i < dataRows.length; i += 2) {
-    sheet.getRange(row + i, 1, 1, headers.length).setBackground(DT10_ZEBRA);
+    for (var zc = 0; zc < headers.length; zc++) zebra[i][zc] = DT10_ZEBRA;
   }
+  body.setBackgrounds(zebra);
   sheet.getRange(row - 1, 1, dataRows.length + 1, headers.length)
       .setBorder(true, true, true, true, true, true, DT10_BORDER,
                  SpreadsheetApp.BorderStyle.SOLID);
@@ -6923,7 +7007,8 @@ function dt10TintGraceRows_(sheet, firstDataRow, count, selected, tokens) {
  *  ACTIVE/NEW -> positive green; GRACE/FAST-TRACK -> watch amber. */
 function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
-  var vals = sheet.getRange(firstDataRow, col, count, 1).getValues();
+  var rng = sheet.getRange(firstDataRow, col, count, 1);
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6932,17 +7017,40 @@ function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
     } else if (v.indexOf('GRACE') === 0 || v.indexOf('FAST-TRACK') === 0) {
       tok = tokens.VERDICT_WATCH;
     }
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
+}
+/** v1.13.11: paint a one-column range from per-row tokens in bulk. toks[i]
+ * is a {bg, fg} token or null. A token row gets tok.bg, tok.fg and bold,
+ * exactly what the per-cell setBackground/setFontColor/setFontWeight calls
+ * wrote; a null row keeps its current background, font colour and weight
+ * (read back and written unchanged). One read and one write per attribute;
+ * nothing is read or written when no row has a token. */
+function dt10BulkPaint_(rng, toks) {
+  var any = false;
+  for (var a = 0; a < toks.length; a++) {
+    if (toks[a]) { any = true; break; }
+  }
+  if (!any) return;
+  var bg = rng.getBackgrounds(), fg = rng.getFontColors(),
+      fw = rng.getFontWeights();
+  for (var i = 0; i < toks.length; i++) {
+    var tok = toks[i];
+    if (!tok) continue;
+    bg[i][0] = tok.bg === undefined ? null : tok.bg;
+    fg[i][0] = tok.fg === undefined ? null : tok.fg;
+    fw[i][0] = 'bold';
+  }
+  rng.setBackgrounds(bg);
+  rng.setFontColors(fg);
+  rng.setFontWeights(fw);
 }
 /** Verdict/conf cell coloring via §3.4 tokens on a written table column. */
 function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
   var rng = sheet.getRange(firstDataRow, col, count, 1);
-  var vals = rng.getValues();
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6950,11 +7058,9 @@ function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
     else if (v === 'WATCH') tok = tokens.VERDICT_WATCH;
     else if (v === 'DO_NOT_INVEST') tok = tokens.VERDICT_NEGATIVE;
     else if (v) tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
 }
 function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
   if (firstDataRow < 0 || !count) return;
@@ -6975,24 +7081,66 @@ function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
                              tokens) {
   if (firstDataRow < 0 || !count) return;
+  var toks = [];
   for (var i = 0; i < count; i++) {
     var c = qualified[i] || {};
     var tok;
     if (c.selected === true) tok = tokens.VERDICT_POSITIVE;
     else if (dt10HasValue_(c.deferral)) tok = tokens.VERDICT_WATCH;
     else tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(sheet.getRange(firstDataRow, col, count, 1), toks);   // v1.13.11
 }
 // ---------------------------------------------------------------------------
 // Main refresh
 // ---------------------------------------------------------------------------
 function refreshDecisionTop10() {
-  var t0 = new Date().getTime();
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
+  var run = { statusCell: null, markerOwned: false };   // v1.13.10: a throw ends in FAILED
+  try {
+    dt10RefreshDecisionTop10Run_(run);
+  } catch (eRun) {
+    dt10RefreshFailed_(run, eRun);
+    throw eRun;
+  }
+}
+/** v1.13.10: a refresh that THROWS must not leave the banner at 'running...'
+ * (live 20 Oct: cockpit stuck RUNNING with no grid). Writes a terminal
+ * 'status: FAILED' line (the Riyadh 'Last run' stamp the audit parses, plus
+ * failed_at_utc and a short error), upserts cockpit _Status ERROR and clears
+ * the P-195 marker THIS run stored (a reported failure is not an abort); a
+ * throw before the marker check leaves a previous run's stale marker for the
+ * next check to report as ABORTED_PREV. Never throws; the caller rethrows. A
+ * hard Apps Script timeout cannot be caught: that case still leaves RUNNING
+ * and is reported by the next run's P-195 check. */
+function dt10RefreshFailed_(run, err) {
+  var msg = String(err && err.message ? err.message : err)
+      .replace(/\s+/g, ' ').slice(0, 200);
+  var utc = '';
+  try { utc = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'); } catch (eIso) {}
+  try {
+    var cell = run && run.statusCell;
+    if (!cell) {
+      var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DT10_SHEET);
+      cell = sh ? sh.getRange(DT10_ROW_STATUS, 2) : null;
+    }
+    if (cell) {
+      cell.setValue(dt10StatusLine_('FAILED',
+          'failed_at_utc=' + utc + ' | ' + msg + dt10StaleNote_()));
+    }
+  } catch (eCell) {}
+  try {
+    dt10WritePageStatus_('ERROR', 'Decision cockpit: FAILED at ' + utc + ' \u2014 ' + msg,
+        '', '', '', []);
+  } catch (eSt) {}
+  if (run && run.markerOwned) {   // only the marker this run stored
+    try { dt10RunMarkerClear_(); } catch (eMk) {}
+  }
+  try { SpreadsheetApp.flush(); } catch (eFl) {}
+}
+function dt10RefreshDecisionTop10Run_(run) {
+  var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
   // v1.3.0 layout guard: the panel grew a row (KPI head moved 13 -> 14), so a
@@ -7004,6 +7152,7 @@ function refreshDecisionTop10() {
   }
   var tokens = dt10Tokens_(ss);
   var statusCell = sheet.getRange(DT10_ROW_STATUS, 2);
+  run.statusCell = statusCell;                              // v1.13.10
   statusCell.setValue(dt10StatusLine_('running\u2026', ''));
   SpreadsheetApp.flush();
   var panel = dt10ReadPanel_(sheet, ss);
@@ -7021,6 +7170,7 @@ function refreshDecisionTop10() {
   }
   // v1.11.12 [P-195]: judge the previous run's marker, then store ours.
   dt10RunMarkerCheck_('refreshDecisionTop10');
+  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker
   // v1.11.12 [SYNC-INFLIGHT]: observe => token only; enforce => HELD.
   var inflight = dt10SyncInflight_(ss);
   var inflightNote = '';
@@ -8065,10 +8215,15 @@ function dt10SelfTest() {
                                 { iCcy: 3, fx: { USD: 3.7528 } });
   var hxD = dt10HoldingFromRow_(['PFS', 'Financials', 445.08, 'USD'], 0, 1, 2,
                                 { iCcy: 3, fx: null });
-  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; SAR/unknown/SAR-column untouched): ' +
+  var hxE = dt10HoldingFromRow_(['VOD.L', 'Telecom', 1000, 'GBp'], 0, 1, 2,
+                                { iCcy: 3, fx: { GBP: 5 } });   // v1.13.10
+  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; GBp 1000 -> 50; ' +
+      'SAR/SAR-column untouched; unknown -> null): ' +
       ((Math.abs(hxA.value_sar - 445.08) < 0.01 && hxB.value_sar === 10250 &&
-        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :
-       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));
+        hxC.value_sar === null && hxD.value_sar === 445.08 &&
+        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :
+       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +
+       hxD.value_sar + '/' + hxE.value_sar + ']'));
   var gcS = dt10StabParseState_({ v: 1, date: '2026-09-05', symbols: {
       'GHOST.US': { ci: 0, co: 1, member: true, since: '2026-09-05', ls: '', hist: [70], ft: true } } });
   var gcR = dt10StabCore_([], [], gcS, ftKnobs, 10, '2026-09-05');

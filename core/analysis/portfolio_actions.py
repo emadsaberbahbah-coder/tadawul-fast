@@ -833,7 +833,20 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 # more proceeds than the sized sale or the existing policy amount.
 # When the existing fee-funding flag actually debits fees, report unallocated
 # capital from that exact remaining ledger; funded principal stays separate.
-PORTFOLIO_ACTIONS_VERSION = "1.16.1"
+# v1.16.1 (2026-10-22) [FRAC-QTY]: _sell_side_deltas floors a fractional
+#   holding to whole shares (round() could sell 11 of 10.6 held) and prices a
+#   share at market_value / true quantity, so the 0.6 left after an EXIT shows
+#   in post_trade_weight_pct. The delta stays a signed INTEGER (the
+#   10_My_Portfolio contract); a holding under one share stays blank.
+#   Tests: tests/test_pf_weight_value_complete.py.
+# v1.16.2 WHY (2026-10-24): resolve two independent v1.16.1 revisions.
+# Keep main's signed-INTEGER EXIT contract (floor custody, never sell the
+# fractional remainder), true-quantity unit price and post-trade remainder.
+# Preserve the earlier PR's unknown-price display, bounded TRIM, pre-funding
+# sell sizing and exact fee ledger. Bound EXIT proceeds to its sized whole
+# shares too; an unsized sub-one-share EXIT supplies no funding proceeds.
+# No action threshold, execution permission, funding mode or flag is changed.
+PORTFOLIO_ACTIONS_VERSION = "1.16.2"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3236,11 +3249,11 @@ def _apply_reduce_policy(cand, action, reason, proceeds):
 
 
 def _sell_side_deltas(entries, ctl, total_value):
-    """Full-position EXIT / whole-share TRIM deltas and remaining weight.
+    """Whole-share EXIT/TRIM deltas, bounded proceeds and remaining weight.
 
-    Exact observed fractional quantity is retained for EXIT, without asserting
-    broker fractional tradability. TRIM never invents a whole share beyond
-    custody. Missing/non-finite arithmetic inputs stay unsized. Idempotent.
+    Keep main's signed-integer contract: floor custody for either action and
+    retain fractional holdings in the remaining weight. Missing/non-finite
+    arithmetic inputs stay unsized. Idempotent.
     """
     cap = None
     for k in ("max_position_pct", "max_weight_pct", "max_pos_pct"):
@@ -3263,7 +3276,15 @@ def _sell_side_deltas(entries, ctl, total_value):
             if px is None or not math.isfinite(px) or px <= 0:
                 continue
             if act == ACTION_EXIT:
-                n = int(q) if q.is_integer() else q
+                n = math.floor(q)
+                if n <= 0:
+                    # Keep main's blank sizing for a sub-one-share holding;
+                    # its unsold value cannot enter the proceeds ledger.
+                    e["proceeds_sar"] = 0.0
+                    continue
+                proceeds = _pos_float(e.get("proceeds_sar"))
+                if proceeds is not None:
+                    e["proceeds_sar"] = min(proceeds, n * px)
             else:
                 proceeds = _pos_float(e.get("proceeds_sar"))
                 if proceeds is None:

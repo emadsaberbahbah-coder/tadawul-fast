@@ -68,19 +68,28 @@ def certified(rows):
         "trust_gate_enabled": False}, fx_rates={"SAR": 1})
 
 
-@pytest.mark.parametrize("quantity", ["0.4", "0.5", "1.6", "2.4", "2"])
-def test_certified_full_exit_represents_exact_custody_without_rounding_or_oversell(quantity):
+# Main #816 intentionally keeps signed INTEGER sell deltas. The earlier #791
+# fractional-EXIT expectation is superseded during stack integration; exact
+# custody still prices each share and remains visible in the residual weight.
+@pytest.mark.parametrize("quantity,sold", [("0.4", 0), ("0.5", 0), ("1.6", 1), ("2.4", 2), ("2", 2)])
+def test_certified_exit_keeps_main_whole_share_contract_without_hiding_fractional_custody(quantity, sold):
     result = certified([holding(quantity=quantity)])
     assert result["status"] == "ok" and result["meta"]["execution_ready"] is True
     assert result["meta"]["input_certification"]["funding_eligible"] is True
     row = result["actions"][0]
     assert row["action"] == "EXIT"
-    assert Decimal(str(row["suggested_delta_shares"])) == -Decimal(quantity)
-    assert row["suggested_delta_shares"] >= -row["quantity"]
-    assert row["post_trade_weight_pct"] == 0
-    assert row["proceeds_sar"] == float(Decimal(quantity) * 10)
-    if quantity == "2":
+    q = Decimal(quantity)
+    assert row["quantity"] == float(q)
+    if sold:
+        assert row["suggested_delta_shares"] == -sold
         assert type(row["suggested_delta_shares"]) is int
+        assert row["suggested_delta_shares"] >= -row["quantity"]
+        residual_weight = float((q - sold) * 10 / (100 + q * 10) * 100)
+        assert row["post_trade_weight_pct"] == round(residual_weight, 1)
+    else:
+        assert row["suggested_delta_shares"] is None
+        assert row["post_trade_weight_pct"] is None
+    assert row["proceeds_sar"] == sold * 10
 
 
 @pytest.mark.parametrize("quantity,sold", [("0.4", 0), ("1.6", 1), ("2.4", 2), ("10", 5)])
@@ -117,18 +126,23 @@ def test_true_unit_price_fallback_and_repeated_sizing_are_stable():
              "action": pa.ACTION_EXIT, "action_reason": "Synthetic full exit", "proceeds_sar": 16,
              "suggested_delta_shares": None}
     pa._sell_side_deltas([entry], {}, 100)
-    assert entry["suggested_delta_shares"] == -1.6 and entry["post_trade_weight_pct"] == 0
+    assert entry["suggested_delta_shares"] == -1
+    assert entry["post_trade_weight_pct"] == 6.0
+    assert entry["proceeds_sar"] == 10
     first = dict(entry)
     pa._sell_side_deltas([entry], {}, 100)
     assert entry == first
 
 
+@pytest.mark.parametrize("action", [pa.ACTION_TRIM, pa.ACTION_EXIT])
 @pytest.mark.parametrize("quantity,requested,credit", [(0.4, 2, 0), (1.6, 16, 10), (2.4, 24, 20),
                                                      (2, 8, 8), (10, 50, 50)])
-def test_proceeds_including_helper_never_funds_adds_from_unsized_fractional_trim(quantity, requested, credit):
+def test_proceeds_including_helper_never_funds_adds_from_unsold_fractional_custody(
+    action, quantity, requested, credit,
+):
     trim = {"cand": {"quantity": quantity, "market_value_sar": quantity * 10,
                       "price": 10, "fx_to_sar": 1},
-            "action": pa.ACTION_TRIM, "action_reason": "Synthetic trim", "proceeds_sar": requested,
+            "action": action, "action_reason": "Synthetic sell", "proceeds_sar": requested,
             "suggested_delta_shares": None}
     add = {"cand": {"symbol": "SYNTHETIC_ADD.SR", "sector": "Synthetic", "quantity": 1,
                      "market_value_sar": 1, "price": 1, "fx_to_sar": 1},
@@ -139,7 +153,10 @@ def test_proceeds_including_helper_never_funds_adds_from_unsized_fractional_trim
     deployable, included, funded, _floor = pa.fund_adds([trim, add], controls, 0, 100)
     assert trim["proceeds_sar"] == credit and credit <= requested
     assert included == deployable == credit and funded <= credit
-    assert abs(trim["suggested_delta_shares"]) <= quantity
+    if action == pa.ACTION_EXIT and quantity < 1:
+        assert trim["suggested_delta_shares"] is None
+    else:
+        assert abs(trim["suggested_delta_shares"]) <= quantity
     if not credit:
         assert add["suggested_delta_shares"] == 0 and add["funds_from"] is None
 

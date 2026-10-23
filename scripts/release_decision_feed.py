@@ -1,6 +1,41 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.2.0 (2026-10-19) -- SOURCE DISCOVERY FOR SCHEDULED ATTEMPTS.
+Nothing removed; every acceptance rule, gate, write and exit code of v1.1.0
+is unchanged.
+
+WHY (2026-10-19, live Top_10 export 11:29 Riyadh)
+--------------------------------------------------
+The board has rendered 'FEED NOT ACTIONABLE ... 0 EXECUTABLE' on every
+cockpit run since 15 Oct although 11-12 names qualify on merit: the feed is
+downgrade-only (the final job vetoes before the cockpits consume the cohort)
+and the only promotion path is this script, dispatched BY HAND with the
+sync run id. Nobody dispatched it, so the stopper was procedural: the
+release needs an operator at the right minute, after the cockpits re-render
+and before the 480-minute clock, several times a day.
+- --source-run-id auto: the cohort is read from the SAME bounded _Status
+  L:M block the script already reads (one read, no new range): the single
+  run= token of 'TFB Feed Global_Markets', the last page the sync writes.
+  That is exactly the cohort the cockpits' receipts must name, so a wrong
+  guess cannot pass the strict audits. Unresolved (key missing, repeated,
+  or without exactly one run= token) -> refused, source_auto_unresolved
+  family, zero writes. mode=kill with an unresolved cohort still retracts a
+  live EXECUTABLE using the run token of the value it retracts (the sticky
+  kill variable must never be blocked by a cell layout).
+- Everything after discovery is the v1.1.0 code path: classify_prior,
+  provenance of SOURCE from the GitHub API (completed production daily_sync
+  on main, final job executed), the in-flight probe, the REAL strict audits
+  bound to SOURCE, the release window, compare-and-set, exact readback.
+  The gate semantics are untouched: TFB_DECISION_RELEASE off => dry-run
+  report, zero writes; the arming prerequisites in the P0-1 commit sheet
+  still apply before the owner arms it.
+- The workflow (release_decision_feed.yml v1.1.0) now also runs on a
+  schedule after the cockpit render slots with source=auto. Until armed,
+  each scheduled run is the commit sheet's "zero-code observe experiment"
+  performed automatically: its artifact shows accepted/reasons.
+  out["source_mode"] records 'auto' or 'explicit'.
+
 VERSION 1.1.0 (2026-10-13) -- SUPERSEDE AT WRITER START (Codex P1 on PR #763,
 "bind execution permission to the audited cohort"). Nothing removed.
 
@@ -135,8 +170,11 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
+# v1.2.0: --source-run-id auto reads the cohort from this _Status L:M key.
+SOURCE_AUTO = "auto"
+GM_FEED_KEY = "TFB Feed Global_Markets"
 KILL_ENV = "TFB_DECISION_RELEASE_KILL"
 _ARMED = {"1", "true", "yes", "on"}
 MODES = ("release", "sweep", "kill")
@@ -298,6 +336,29 @@ def _run_tokens(value: Any) -> list[str]:
 def _single_run(value: Any) -> Optional[str]:
     tokens = _run_tokens(value)
     return tokens[0] if len(tokens) == 1 and SOURCE_RE.fullmatch(tokens[0]) else None
+
+
+def discover_source(grid: Any) -> tuple[Optional[str], Optional[str]]:
+    """PURE (v1.2.0). The cohort the cockpits are expected to have consumed:
+    the single run= token of the 'TFB Feed Global_Markets' value in the
+    bounded _Status L:M block (the last page the sync writes). Returns
+    (run, None) or (None, reason). Never guesses: a missing or repeated key,
+    or a value without exactly one run= token, is unresolved."""
+    if not isinstance(grid, list):
+        return None, "source_auto_layout_invalid"
+    hits = []
+    for row in grid:
+        pair = _pair(row)
+        if str(pair[0]).strip().casefold() == GM_FEED_KEY.casefold():
+            hits.append(str(pair[1]))
+    if not hits:
+        return None, "source_auto_key_missing"
+    if len(hits) > 1:
+        return None, "source_auto_key_duplicated"
+    run = _single_run(hits[0])
+    if run is None:
+        return None, "source_auto_run_unreadable"
+    return run, None
 
 
 def compose_release_value(source: str, *, anchor: datetime, issued: datetime,
@@ -626,9 +687,13 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     release_numeric = bool(SOURCE_RE.fullmatch(release_id))
     release_token = release_id if release_numeric else "manual"
     source = source_run_id if isinstance(source_run_id, str) else None
+    # v1.2.0: 'auto' defers the cohort to the first (and only) key-block read.
+    auto = source == SOURCE_AUTO
     kill = kill_var or mode == "kill"
     out: dict = {
-        "script_version": SCRIPT_VERSION, "mode": mode, "source_run_id": source,
+        "script_version": SCRIPT_VERSION, "mode": mode,
+        "source_run_id": None if auto else source,
+        "source_mode": "auto" if auto else "explicit",
         "release_run_id": release_id or None,
         "release_run_attempt": (os.getenv("GITHUB_RUN_ATTEMPT") or None),
         "release_enabled": armed, "kill_active": kill, "github_actions": in_actions,
@@ -640,7 +705,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         "display_pending_cockpit_refresh": False, "exit_code": 3, "outcome": None,
     }
     # 0. identity and context, before any I/O
-    if source is None or not SOURCE_RE.fullmatch(source):
+    if not auto and (source is None or not SOURCE_RE.fullmatch(source)):
         out["source_run_id"] = None
         return _finish(out, 3, "refused", "source_run_invalid")
     if mode not in MODES:
@@ -671,6 +736,16 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     pair = _pair(grid[slot - 1] if slot - 1 < len(grid) else [])
     prior = str(pair[1]) if str(pair[0]).strip() else None
     out["slot"], out["prior"] = slot, prior
+    if auto:
+        # v1.2.0: the cohort comes from the same bounded block, never from
+        # GITHUB_RUN_ID. A kill may still retract using the token of the
+        # value it retracts; every other mode refuses an unresolved cohort.
+        source, why = discover_source(grid)
+        if source is None and kill and prior is not None and _single_run(prior):
+            source, why = _single_run(prior), None
+        if source is None:
+            return _finish(out, 3, "refused", why or "source_auto_unresolved")
+        out["source_run_id"] = source
 
     def downgrade(run_token: str, reason: str) -> bool:
         value = downgrade_value(run_token, clock(), reason, release_token)
@@ -906,7 +981,8 @@ def main(argv=None) -> int:
     # v1.1.0: no longer required at the parser (mode=supersede takes
     # --current-run instead); every other mode still exits 3 without it.
     parser.add_argument("--source-run-id", default=None,
-                        help="completed daily_sync run ID; never read from GITHUB_RUN_ID")
+                        help="completed daily_sync run ID, or 'auto' (v1.2.0: the run= token of "
+                             "the _Status 'TFB Feed Global_Markets' value); never GITHUB_RUN_ID")
     parser.add_argument("--mode", default="release")
     parser.add_argument("--current-run", default=None,
                         help="mode=supersede only: this writer's own run ID")

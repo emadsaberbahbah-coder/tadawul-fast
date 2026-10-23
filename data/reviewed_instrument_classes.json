@@ -1,0 +1,37 @@
+{
+  "schema": "tfb.reviewed-instrument-classes/v1",
+  "bindings": [
+    {
+      "symbol": "DCBG.US",
+      "name": "Dime Commercial Bancshares, Inc. 9.000% Fixed-to-Floating Rate Subordinated Notes due 2034",
+      "asset_class": "Bond",
+      "currency": "USD",
+      "country": [
+        "USA",
+        "United States"
+      ],
+      "exchange": [
+        "NYSE",
+        "NYSE/NASDAQ",
+        "NASDAQ/NYSE"
+      ],
+      "reviewed_at_utc": "2026-10-23T09:19:23.664691+00:00",
+      "expires_at_utc": "2026-10-30T09:19:23.664691+00:00",
+      "sources": [
+        {
+          "url": "https://investors.dime.com/node/25311/html",
+          "sha256": "13c79baac8f4a1277822921bd0c34f6f98e7fb0be69b0916aac838488d27fc2d",
+          "captured_at_utc": "2026-10-23T09:17:19.938943+00:00"
+        },
+        {
+          "url": "https://investors.dime.com/news-releases/news-release-details/dime-transfer-new-york-stock-exchange/",
+          "sha256": "6029fe3d1de2770d1287a478569ecbb317e7b16e597a600ce3f66394dee8d6ff",
+          "captured_at_utc": "2026-10-23T09:17:31.708146+00:00"
+        }
+      ],
+      "quote_identity_verified": false,
+      "model_supported": false,
+      "binding_sha256": "fc1ce3c6481137c83c5a8e3647a38d19214420da6922bc7cf4cabcf381e5bd4e"
+    }
+  ]
+}
