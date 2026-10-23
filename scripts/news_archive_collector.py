@@ -469,7 +469,10 @@ class NewsArchiveStore:
                     grid, research=page == "Top_10_Investments", diagnostics=diagnostics,
                     lifecycle=lifecycle)
                 for excluded in diagnostics.get("lifecycle_exclusions", []):
-                    lifecycle_exclusions[excluded["symbol"]] = excluded
+                    previous = lifecycle_exclusions.get(excluded["symbol"])
+                    if previous is None or (previous["status"] == "VERIFIED_LEGACY"
+                                            and excluded["status"] != "VERIFIED_LEGACY"):
+                        lifecycle_exclusions[excluded["symbol"]] = excluded
                 source_ok = header_ok and block_complete
                 # row_count is allocated capacity, not populated extent. With
                 # the canonical contiguous writer, only a populated capped

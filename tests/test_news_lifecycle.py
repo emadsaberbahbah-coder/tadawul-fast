@@ -118,6 +118,21 @@ def test_source_discovery_reports_legacy_without_hiding_unknown(monkeypatch):
     assert [r["symbol"] for r in result["lifecycle_exclusions"]] == ["ROG.SW"]
 
 
+@pytest.mark.parametrize("conflict_page", ["Global_Markets", "Mutual_Funds"])
+def test_cross_page_aggregation_preserves_unknown_conflict(monkeypatch, conflict_page):
+    from tests.test_news_adaptive_universe import store_with_sources
+    monkeypatch.setattr(archive, "_utc_now", lambda: NOW)
+    store, pages = store_with_sources()
+    for page in ["Global_Markets", "Mutual_Funds"]:
+        ws = pages[page]
+        ws.values.extend([["ROG.SW", "Reused Ticker Issuer" if page == conflict_page else "Roche Holding Ltd"]])
+        ws.row_count += 1
+    result = store.load_news_source_context()
+    assert not result["complete"] and "ROG.SW" in result["unknown_identity_symbols"]
+    record = next(r for r in result["lifecycle_exclusions"] if r["symbol"] == "ROG.SW")
+    assert record["status"] == "UNKNOWN" and record["reason"] == "current_caption_conflict"
+
+
 @pytest.mark.parametrize("extra", [
     [{"symbol": "ROG.SW", "collection_evidence": {"status": "OK"}}],
     [{"symbol": "ACTIVE", "collection_evidence": {"status": "OK"}}],
