@@ -1,4 +1,4 @@
-/* 26_Decision_Chain v1.0.2: refresh Portfolio_Decision and Top_10 when the
+/* 26_Decision_Chain v1.0.3: refresh Portfolio_Decision and Top_10 when the
  * sync's data lands. Runs the REAL 10_My_Portfolio, 11_Manual_Refresh_
  * Coordinator, 16_Decision_Top10 and 26_Decision_Chain sources in one vm (the
  * shared Apps Script namespace) with service stubs; only the two refresh
@@ -61,6 +61,13 @@ function world(o) {
   const grid = [STATUS_HEADER].concat(o.status || []);
   const kv = o.kv || {};
   const boards = {pd: o.pdInitial || '', t10: o.t10Initial || ''};
+  // Explicit completed-publication fixtures; production never invents legacy identities.
+  if (props.TFB_DECISION_CHAIN_STATE) {
+    const stored = JSON.parse(props.TFB_DECISION_CHAIN_STATE);
+    if (stored.pd && !stored.pd_ms) stored.pd_ms = grid[1] ? Date.parse(grid[1][1].replace(' ', 'T')) : PUB;
+    if (stored.t10 && !stored.t10_ms) stored.t10_ms = GM_AT + 60000;
+    props.TFB_DECISION_CHAIN_STATE = JSON.stringify(stored);
+  }
   const status = {
     getLastRow() { return grid.length; }, getLastColumn() { return 13; },
     getRange(a, b, c, d) {
@@ -125,7 +132,10 @@ function world(o) {
   }
   ctx.refreshPortfolioDecision = function () {
     calls.pd++;
-    const outcome = o.pdOutcome ? o.pdOutcome(calls.pd) : 'ok';
+    const outcome = o.pdOutcome ? o.pdOutcome(calls.pd) : {
+      contract: 'tfb_native_refresh_v1', page: 'Portfolio_Decision', state: 'completed',
+      source_run: String((String(grid[1] && grid[1][3]).match(/run=(\d+)/) || [])[1] || ''),
+      source_stamp_ms: Date.parse(String(grid[1] && grid[1][1]).replace(' ', 'T')), output_state: 'EMPTY'};
     if (!o.keepPdStatus) boards.pd = o.pdStatus ? o.pdStatus(calls.pd) : renderedStatus('pd', calls.pd);
     return outcome;
   };
@@ -133,6 +143,9 @@ function world(o) {
     calls.t10++;
     if (o.t10Throws) throw new Error('synthetic cockpit failure');
     if (!o.keepT10Status) boards.t10 = o.t10Status ? o.t10Status(calls.t10) : renderedStatus('t10', calls.t10);
+    return {contract: 'tfb_native_refresh_v1', page: 'Top_10_Investments', state: 'completed',
+      source_run: ctx.tfbDcRunOf_(kv['TFB Feed Global_Markets']),
+      source_latest_ms: ctx.dt10FeedStampParse_(kv['TFB Feed Global_Markets']).ms, output_state: 'WITHHELD'};
   };
   return {ctx, props, runLog, calls, triggers, boards, setNow(ms) { world.clock.now = ms; }};
 }
@@ -146,6 +159,14 @@ const readyKv = (gmRun, decisionRun, mlRun) => ({
   'TFB Feed Global_Markets': feed('PARTIAL_FRESH', gmRun, GM_AT),
   'TFB Decision Feed': 'NOT_ACTIONABLE(final_publication) | run=' + decisionRun + ' | ' + riyadh(GM_AT + 60000) +
     ' | coverage_failed,decision_failed'});
+const readyKvAt = (run, now) => ({
+  'TFB Feed Market_Leaders': feed('OK', run, now - 10 * 60000),
+  'TFB Feed Global_Markets': feed('PARTIAL_FRESH', run, now - 5 * 60000),
+  'TFB Decision Feed': 'NOT_ACTIONABLE(final_publication) | run=' + run + ' | ' + riyadh(now - 60000) +
+    ' | coverage_failed,decision_failed'});
+const expectDefer = (message) => 'deferred plan: ' + message;
+const attemptKey = (action, ms) => action + ':' + RUN + ':' + ms;
+
 
 check('C1 off (no property): nothing read, nothing refreshed, nothing logged', () => {
   const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN)});
@@ -190,7 +211,7 @@ check('C5 sync in flight (Market_Leaders newer run than Global_Markets): no refr
   const kv = readyKv(RUN, RUN, NEXT);
   kv['TFB Feed Market_Leaders'] = feed('OK', NEXT, T0 - 2 * 60000);   // newer than GM: run NEXT started
   const w = world({now: T0, status: readyStatus(RUN), kv, props: {TFB_DECISION_CHAIN: 'on'}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'sync in flight');
+  assert.equal(w.ctx.tfbDecisionChainTick(), expectDefer('sync in flight'));
   assert.equal(w.calls.pd + w.calls.t10, 0);
 });
 
@@ -199,7 +220,7 @@ check('C6 quiet window defers Top_10 only (Portfolio_Decision still runs)', () =
   const w = world({now: at0810, status: [myPortfolioRow(at0810 - 3600000, RUN)], kv: readyKv(RUN, RUN),
                    props: {TFB_DECISION_CHAIN: 'on'}});
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'quiet window (S-1 board slot)');
+  assert.equal(w.ctx.tfbDecisionChainTick(), expectDefer('quiet window (S-1 board slot)'));
   w.props.TFB_DECISION_CHAIN_QUIET = 'none';
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
 });
@@ -209,40 +230,41 @@ check('C7 a cockpit run in progress (DT10_RUN_MARKER 2 min old) defers Top_10', 
   const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
                    props: {TFB_DECISION_CHAIN: 'on', DT10_RUN_MARKER: marker,
                            TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'cockpit refresh in progress');
+  assert.equal(w.ctx.tfbDecisionChainTick(), expectDefer('cockpit refresh in progress or unknown'));
   assert.equal(w.calls.t10, 0);
 });
 
-check('C8 failed Portfolio_Decision: ERROR row, retried after the claim expires, gives up after 3', () => {
+check('C8 unsupported Portfolio_Decision return stays UNVERIFIED and is capped at 3', () => {
   const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props: {TFB_DECISION_CHAIN: 'on'},
                    pdOutcome: () => 'HTTP 503'});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + RUN);
-  assert.equal(w.runLog[0][1], 'ERROR');
-  assert.match(w.runLog[0][5], /HTTP 503/);
+  assert.match(w.ctx.tfbDecisionChainTick(), /^unverified pd run /);
+  assert.equal(w.runLog[0][4], 'UNVERIFIED');
+  assert.match(w.runLog[0][5], /completion receipt unsupported/);
   w.setNow(T0 + 8 * 60000);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /^unverified pd run /);
   w.setNow(T0 + 16 * 60000);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /^unverified pd run /);
   w.setNow(T0 + 24 * 60000);
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);   // pd gave up, t10 proceeds
   assert.equal(w.calls.pd, 3);
   assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).pd, '');
 });
 
-check('C9 a fresh claim from a concurrent tick blocks; an expired one does not', () => {
+check('C9 fresh claims defer; expired unknown commits need reconciliation', () => {
   const claim = (ageMin) => JSON.stringify({claim: {act: 'pd', run: RUN, at_ms: T0 - ageMin * 60000}});
   const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN),
                    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: claim(2)}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'claimed pd run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), expectDefer('claimed pd run ' + RUN));
   w.props.TFB_DECISION_CHAIN_STATE = claim(9);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /unfinalized claim expired; manual reconciliation required/);
+  assert.equal(w.calls.pd + w.calls.t10, 0);
 });
 
 check('C10 manual-refresh priority (11_Manual_Refresh_Coordinator) pauses the chain', () => {
   const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN),
                    props: {TFB_DECISION_CHAIN: 'on', TFB_MANUAL_REFRESH_UNTIL_MS: String(T0 + 600000),
                            TFB_MANUAL_REFRESH_REQUEST_ID: 'req-1'}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'automation paused (manual priority or backend hold)');
+  assert.equal(w.ctx.tfbDecisionChainTick(), expectDefer('automation paused (manual priority or backend hold)'));
   assert.equal(w.calls.pd + w.calls.t10, 0);
 });
 
@@ -256,13 +278,13 @@ check('C12 a cockpit exception is logged as FAILED and retried, never thrown', (
   const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN), t10Throws: true,
                    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
   assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
-  assert.match(w.runLog[0][5], /synthetic cockpit failure/);
+  assert.match(w.runLog[0][5], /native refresh threw/);
 });
 
 check('C13 lock busy returns busy without reading', () => {
   const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), lockBusy: true,
                    props: {TFB_DECISION_CHAIN: 'on'}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'busy');
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'deferred plan: planning lock busy');
   assert.equal(w.calls.pd + w.calls.t10, 0);
 });
 
@@ -301,6 +323,7 @@ check('C16 v1.0.1: an EXECUTABLE release for the refreshed cohort triggers ONE m
                    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
   assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
   kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
+  w.setNow(Date.parse('2026-10-16T04:11:00+03:00'));
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
   assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
   assert.equal(w.calls.t10, 1);
@@ -309,28 +332,29 @@ check('C16 v1.0.1: an EXECUTABLE release for the refreshed cohort triggers ONE m
   assert.match(w.runLog[0][5], /release issued 2026-10-16T04:10:00\+03:00 for run/);
   // a second release (new issued=) renders once more; the same stamp never again
   kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T06:40:00+03:00');
+  w.setNow(Date.parse('2026-10-16T06:41:00+03:00'));
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
   assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
   assert.equal(w.calls.t10, 2);
   // a release for ANOTHER run, or a NOT_ACTIONABLE feed, plans nothing
   kv['TFB Decision Feed'] = RELEASED(OLD, '2026-10-16T07:00:00+03:00');
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'run ' + RUN + ' final audit not finished');
   kv['TFB Decision Feed'] = feed('NOT_ACTIONABLE(final_publication)', RUN, T0);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /final publication witness unavailable/);
   assert.equal(w.calls.t10, 2);
 });
 
 check('C17 v1.0.1: a post-audit render under an already EXECUTABLE feed counts as the release render', () => {
   const kv = readyKv(RUN, RUN);
   kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
-  const w = world({now: T0, status: readyStatus(OLD), kv,
+  const w = world({now: T0 + 20 * 60000, status: readyStatus(OLD), kv,
                    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
   assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 already refreshed for run ' + RUN);
   assert.equal(w.calls.t10, 1);
   assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10rel, '2026-10-16T04:10:00+03:00');
   // observe mode reports the re-render once and never refreshes
-  const o = world({now: T0, status: readyStatus(RUN), kv: Object.assign(readyKv(RUN, RUN),
+  const o = world({now: T0 + 20 * 60000, status: readyStatus(RUN), kv: Object.assign(readyKv(RUN, RUN),
                    {'TFB Decision Feed': RELEASED(RUN, '2026-10-16T04:10:00+03:00')}),
                    props: {TFB_DECISION_CHAIN: 'observe', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
   assert.equal(o.ctx.tfbDecisionChainTick(), 'observed t10 run ' + RUN);
@@ -351,10 +375,10 @@ check('C18 v1.0.2: HTTP-ok Portfolio_Decision with WITHHELD source receipt remai
     pdStatus: () => 'Last run ' + riyadh(T0).slice(0, 19) +
       ' | status: ok | source readiness WITHHELD: consumed 1 holdings vs 2 published rows'};
   const w = world(o);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /^unverified pd run /);
   let st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
   assert.equal(st.pd, '');
-  assert.equal(st.attempts['pd:' + RUN], 1);
+  assert.equal(st.attempts[attemptKey('pd', PUB)], 1);
   assert.match(w.runLog[0][5], /native source receipt/);
   // Source repaired: a subsequent genuine render may complete the same cohort.
   o.pdStatus = null;
@@ -362,7 +386,7 @@ check('C18 v1.0.2: HTTP-ok Portfolio_Decision with WITHHELD source receipt remai
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
   st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
   assert.equal(st.pd, RUN);
-  assert.equal(st.attempts['pd:' + RUN], undefined);
+  assert.equal(st.attempts[attemptKey('pd', PUB)], undefined);
 });
 
 check('C19 v1.0.2: Top_10 returning early never completes a cohort from an unchanged board', () => {
@@ -371,10 +395,10 @@ check('C19 v1.0.2: Top_10 returning early never completes a cohort from an uncha
   const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
     t10Initial: old, keepT10Status: true,
     props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.match(w.ctx.tfbDecisionChainTick(), /^unverified t10 run /);
   const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
   assert.equal(st.t10, '');
-  assert.equal(st.attempts['t10:' + RUN], 1);
+  assert.equal(st.attempts[attemptKey('t10', GM_AT + 60000)], 1);
   assert.match(w.runLog[0][5], /native status was not updated/);
 });
 
@@ -390,7 +414,7 @@ check('C20 v1.0.2: wrong, duplicate, observe-only and missing receipts do not co
     const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
       t10Status: () => prefix + receipt,
       props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
-    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN, receipt);
+    assert.match(w.ctx.tfbDecisionChainTick(), /^unverified t10 run /, receipt);
     assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
   }
 });
@@ -407,7 +431,7 @@ check('C21 v1.0.2: changed board needs a valid ok timestamp within this attempt'
     const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
       t10Status: () => status + receipt,
       props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
-    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN, status);
+    assert.match(w.ctx.tfbDecisionChainTick(), /^unverified t10 run /, status);
     assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
   }
 });
@@ -415,14 +439,14 @@ check('C21 v1.0.2: changed board needs a valid ok timestamp within this attempt'
 check('C22 v1.0.2: receipt read failure retains the bounded retry path and never marks release rendered', () => {
   const kv = readyKv(RUN, RUN);
   kv['TFB Decision Feed'] = RELEASED(RUN, '2026-10-16T04:10:00+03:00');
-  const w = world({now: T0, status: readyStatus(RUN), kv, receiptReadThrows: true,
+  const w = world({now: T0 + 20 * 60000, status: readyStatus(RUN), kv, receiptReadThrows: true,
     props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: RUN, t10: RUN})}});
-  for (let i = 0; i < 3; i++) assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
-  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 release re-render gave up after 3 attempts');
+  for (let i = 0; i < 3; i++) assert.match(w.ctx.tfbDecisionChainTick(), /^unverified t10 run /);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' gave up after 3 attempts');
   const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
   assert.equal(st.t10rel, '');
   assert.equal(st.claim, null);
-  assert.equal(st.attempts['t10rel:2026-10-16T04:10:00+03:00'], 3);
+  assert.equal(st.attempts[attemptKey('t10', Date.parse('2026-10-16T04:10:00+03:00'))], 3);
 });
 
 check('C23 v1.0.2: producer seconds precision accepts a fresh verified WITHHELD render', () => {
@@ -440,13 +464,13 @@ check('C24 v1.0.2: failed pre-read cannot establish a changed board even when th
     const w = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
       t10Initial: existing, keepT10Status: noOp, receiptReadFailureAt: [1],
       props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
-    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+    assert.match(w.ctx.tfbDecisionChainTick(), /^unverified t10 run /);
     assert.equal(w.calls.receiptReads, 2);  // pre-read failed, post-read succeeded
     assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, '');
     assert.match(w.runLog[0][5], /before the refresh was unavailable/);
     // A subsequent attempt with a readable baseline may complete only a real render.
     w.setNow(T0 + 5 * 60000);
-    assert.equal(w.ctx.tfbDecisionChainTick(), (noOp ? 'failed ' : 'refreshed ') + 't10 run ' + RUN);
+    assert.match(w.ctx.tfbDecisionChainTick(), new RegExp('^' + (noOp ? 'unverified ' : 'refreshed ') + 't10 run ' + RUN));
     assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, noOp ? '' : RUN);
   }
 });
@@ -458,7 +482,7 @@ check('C25 v1.0.2: native UTC and non-Riyadh script clocks verify the actual ren
     ['America/New_York', Date.parse('2026-07-15T12:00:00Z')],
     ['Europe/Berlin', Date.parse('2026-07-15T12:00:00Z')],
   ]) {
-    const w = world({now: at, scriptTimeZone: zone, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    const w = world({now: at, scriptTimeZone: zone, status: [myPortfolioRow(at - 2 * 3600000, OLD)], kv: readyKvAt(RUN, at),
       props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
     assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN, zone);
     assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).t10, RUN);
@@ -469,7 +493,7 @@ check('C26 v1.0.2: both occurrences of a repeated DST hour use the attempt offse
   const texts = [];
   for (const at of [Date.parse('2026-11-01T05:30:00Z'), Date.parse('2026-11-01T06:30:00Z')]) {
     const w = world({now: at, scriptTimeZone: 'America/New_York',
-      status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+      status: [myPortfolioRow(at - 2 * 3600000, OLD)], kv: readyKvAt(RUN, at),
       props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
     assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
     texts.push(w.boards.t10);
@@ -482,7 +506,7 @@ check('C27 v1.0.2: a render crossing the spring DST transition uses its end offs
   const end = Date.parse('2026-03-08T07:00:03Z');
   let w;
   w = world({now: start, scriptTimeZone: 'America/New_York',
-    status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    status: [myPortfolioRow(start - 2 * 3600000, OLD)], kv: readyKvAt(RUN, start),
     t10Status: () => {
       w.setNow(end);
       return 'Last run ' + gasFormatDate(new Date(end), 'America/New_York', 'yyyy-MM-dd HH:mm:ss') +

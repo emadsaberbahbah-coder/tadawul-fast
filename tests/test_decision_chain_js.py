@@ -1,4 +1,4 @@
-"""26_Decision_Chain v1.0.2: run the native harness (the REAL Apps Script
+"""26_Decision_Chain v1.0.3: run the native harness (the REAL Apps Script
 sources in a vm) so the whole-suite CI job collects it."""
 from __future__ import annotations
 

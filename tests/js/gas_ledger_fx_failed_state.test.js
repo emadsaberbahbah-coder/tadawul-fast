@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.17');
+  assert.equal(ctx.PD_VERSION, '1.5.18');
   return copy(ctx._myPortfolioLedgerMap_());
 }
 
@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.equal(ctx.DT10_VERSION, '1.13.13');
+  assert.equal(ctx.DT10_VERSION, '1.13.14');
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];

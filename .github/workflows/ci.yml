@@ -2,6 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.35 (2026-10-24) -- COMPLETION STACK INTEGRATION
+# WHY: preserve source completion and gated precision with newer native/engine gates.
+#
 # VERSION 1.1.34 (2026-10-24) -- DECISION STACK INTEGRATION
 # WHY: preserve decision output regressions alongside current main and root gates.
 #
@@ -119,6 +122,11 @@
 # pinned exchange_calendars and pandas it needs.
 #
 # Pending branch history (version numbers preceded parallel main changes):
+# VERSION 1.1.26 (2026-10-17) -- DECISION COMPLETION AND PRICE PRECISION
+# WHY: a deferred native refresh cannot acknowledge a completed cohort;
+# armed tiny prices must survive the backend/native output boundary. Keep
+# their synthetic integration regressions in the blocking lean lane.
+#
 # VERSION 1.1.25 (2026-10-17) -- DECISION PAGE OUTPUT INTEGRITY
 # WHY: native refresh failures must not acknowledge a completed decision;
 # unknown costs/prices and fractional custody must remain truthful. Register
@@ -765,7 +773,11 @@ jobs:
             tests/test_decision_surface_freshness.py \
             tests/test_decision_pool_counter_ambiguity.py \
             tests/test_decision_refresh_completion_js.py \
+            tests/test_decision_chain_completion_js.py \
+            tests/test_native_top10_completion_precision_js.py \
             tests/test_pf_native_integrity_js.py \
+            tests/test_pf_completion_precision_js.py \
+            tests/test_pf_panel_preserve.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
             tests/test_release_decision_feed.py \
@@ -780,6 +792,7 @@ jobs:
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
             tests/test_portfolio_action_output_integrity.py \
+            tests/test_decision_price_precision.py \
             tests/test_pf_confirm_calendar_failclosed.py \
             tests/test_pf_confirm_session_p168b.py \
             tests/test_scoring_engine_contract.py \

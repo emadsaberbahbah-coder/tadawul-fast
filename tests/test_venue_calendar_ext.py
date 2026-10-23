@@ -175,9 +175,9 @@ def test_t6_extension_never_shadows_base():
 
 
 def test_t7_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.27.2", "opportunity builder"' in src
+    assert '"1.27.3", "opportunity builder"' in src
 
 
 def test_t8_athens_resolves_and_obeys_the_kill_switch(monkeypatch):

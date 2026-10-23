@@ -1,11 +1,38 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.13 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.13.14 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.13.14 (2026-10-24) -- INTEGRATED COMPLETION RECEIPTS AND BULK RENDER
+ * WHY: preserve typed completed/deferred receipts, the consumed generation
+ * clock, audit-context handoff and gated price display from the pending
+ * completion revision alongside main's bulk painter, raw subunit FX and
+ * terminal FAILED recovery. The wrapper returns its inner typed result and
+ * forwards the caller's completion options; operational errors still rethrow.
+ * No default display, financial/source gate, schedule or property is changed.
+ *
+ * v1.13.12 (2026-10-17) -- TYPED COMPLETION AND PRICE DISPLAY
+ * WHY: a normal SYNC-INFLIGHT HELD return was acknowledged as a completed
+ * cohort by the proposed decision chain. Return completed/deferred facts;
+ * only a finally verified, actually collected Sheets pool proves source_run.
+ * The morning wrapper records deferral without an OK or script-failure claim.
+ * Backend meta.price_precision='on' selects seven-significant-digit price
+ * formats from in-memory rows; absent/off keeps legacy writes. Money, ROI,
+ * quantities and all financial/source gates are unchanged. Base formats reset
+ * an earlier armed render before the bounded per-column precision overrides.
+ * Also integrate PR #770/#778's default-off DT10_AUDIT_KEEP handoff (reserved
+ * v1.13.10): held members are display context only; its backend companion is
+ * still required. No property is armed, source grant invented or retry added.
+ * Candidate publication inherits a caller-owned ScriptLock and releases only
+ * a lock it acquired itself, preserving the coordinator's writer boundary.
+ * A completion-contract caller must use Sheets: a Backend selector cannot
+ * prove its consumed cohort, so that opt-in path defers before any POST.
+ * Typed completion also carries the latest consumed four-page source stamp
+ * from its verified frame, so a prior same-run audit cannot certify a rerun.
  *
  * v1.13.13 (2026-10-24) -- STACK INTEGRATION, REFRESH AND BULK RENDER
  * WHY: merge the pending failed-refresh/projection validation with main's
@@ -1822,7 +1849,34 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.13';
+var DT10_VERSION = '1.13.14';
+
+/** Completion is an operational fact; a withheld render is still a render. */
+function dt10RefreshCompletion_(state, sourceRun, reason, outputState, sourceLatestMs) {
+  var out = {contract: 'tfb_native_refresh_v1', page: DT10_SHEET,
+    state: state, source_run: String(sourceRun || ''),
+    reason: String(reason || ''), output_state: String(outputState || '')};
+  if (state === 'completed' && sourceRun && typeof sourceLatestMs === 'number' &&
+      isFinite(sourceLatestMs) && sourceLatestMs >= 0) out.source_latest_ms = sourceLatestMs;
+  return out;
+}
+/** Pure projection of the exact validated generations; no second source read. */
+function dt10SourceLatestMs_(source) {
+  if (!source || source.ready !== true || !source.generation) return null;
+  var latest = null;
+  try {
+    for (var i = 0; i < DT10_POOL_PAGES.length; i++) {
+      var page = DT10_POOL_PAGES[i];
+      if (!Object.prototype.hasOwnProperty.call(source.generation, page)) return null;
+      var generation = JSON.parse(source.generation[page]);
+      if (!Array.isArray(generation) || generation.length < 4) return null;
+      var stamp = dt10SourceStampMs_(generation[0]);
+      if (typeof stamp !== 'number' || !isFinite(stamp)) return null;
+      latest = latest === null ? stamp : Math.max(latest, stamp);
+    }
+  } catch (eStamp) { return null; }
+  return latest;
+}
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2777,6 +2831,26 @@ var DT10_ZEBRA = '#F5F7FA';       // alternate data rows (was #FAFAFA)
 var DT10_MUTED = '#6B7280';       // status / footer / labels (was #5F6368)
 var DT10_FMT_SAR = '#,##0 "SAR"';
 var DT10_FMT_PRICE = '#,##0.00';
+/** Display only: match the backend's armed seven-significant-digit boundary. */
+function dt10PriceFormat_(value) {
+  if (typeof value !== 'number' || !isFinite(value) || value === 0 || Math.abs(value) >= 10) {
+    return DT10_FMT_PRICE;
+  }
+  var magnitude = Math.abs(value);
+  var exponent = Math.floor(Math.log(magnitude) / Math.LN10);
+  if (magnitude < Math.pow(10, exponent)) exponent--;
+  else if (magnitude >= Math.pow(10, exponent + 1)) exponent++;
+  var digits = Math.max(2, 6 - exponent);
+  return digits > 20 ? '0.000000E+00' : '#,##0.' + new Array(digits + 1).join('0');
+}
+/** Bounded format matrices; no value rereads, per-cell RPC loop or value edits. */
+function dt10ApplyPriceFormats_(sheet, firstRow, rows, columns, mode) {
+  if (mode !== 'on' || firstRow < 1 || !rows || !rows.length) return;
+  columns.forEach(function (column) {
+    var formats = rows.map(function (row) { return [dt10PriceFormat_(row[column - 1])]; });
+    sheet.getRange(firstRow, column, rows.length, 1).setNumberFormats(formats);
+  });
+}
 var DT10_FMT_PCT = '0.0"%"';
 var DT10_FMT_NUM2 = '0.00';
 var DT10_FMT_INT = '#,##0';
@@ -5502,6 +5576,29 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
+/** PR #770/#778 native handoff: display context only, default off. */
+var DT10_AUDIT_KEEP_PROP = 'DT10_AUDIT_KEEP';
+var DT10_AUDIT_KEEP_MAX = 60;
+function dt10AuditKeepOn_() {
+  return dt10PropMemoGet_('audit_keep', function () {
+    try {
+      return String(PropertiesService.getScriptProperties()
+          .getProperty(DT10_AUDIT_KEEP_PROP) || '')
+          .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+    } catch (eProp) { return false; }
+  });
+}
+function dt10AuditKeepSymbols_(state) {
+  var out = [], syms = state && state.symbols;
+  if (!syms || typeof syms !== 'object') return out;
+  for (var key in syms) {
+    if (syms.hasOwnProperty(key) && key && syms[key] && syms[key].member === true) {
+      out.push(String(key));
+    }
+  }
+  out.sort();
+  return out.slice(0, DT10_AUDIT_KEEP_MAX);
+}
 
 /**
  * v1.11.7 [P-134]: cockpit cash source-of-truth mode.
@@ -6472,12 +6569,15 @@ function dt10CandTabRead_(ss, runId) {
  * tab. Invalidate its receipt before mutation; COMMITTED is the final write.
  * A fault falls back to today's cockpit grid and leaves no trusted partial
  * publication. The same protocol commits zero rows, replacing old results. */
-function dt10CandTabWrite_(ss, cRows, stampLine, tokens, runId) {
+function dt10CandTabWrite_(ss, cRows, stampLine, tokens, runId, pricePrecision) {
   var lock = null, locked = false;
   try {
     lock = LockService.getScriptLock();
-    locked = lock.tryLock(5000);
-    if (!locked) throw new Error('candidate publication already running');
+    var inherited = typeof lock.hasLock === 'function' && lock.hasLock();
+    if (!inherited) {
+      locked = lock.tryLock(5000);
+      if (!locked) throw new Error('candidate publication already running');
+    }
     var n = cRows.length, cols = DT10_CAND_HEADERS.length;
     if (!runId) throw new Error('current candidate run ID missing');
     for (var ri = 0; ri < n; ri++) {
@@ -6518,6 +6618,7 @@ function dt10CandTabWrite_(ss, cRows, stampLine, tokens, runId) {
         6: DT10_FMT_PRICE, 7: DT10_FMT_PRICE, 8: DT10_FMT_PCT, 9: DT10_FMT_PCT,
         10: DT10_FMT_PCT, 11: DT10_FMT_NUM2, 12: '0.0', 13: '0.0', 20: '0.0'
       });
+      dt10ApplyPriceFormats_(sh, 3, cRows, [6, 7], pricePrecision);
       if (tokens) dt10ColorVerdicts_(sh, 3, n, 18, tokens);
     }
     sh.setFrozenRows(2);
@@ -7095,11 +7196,11 @@ function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
 // ---------------------------------------------------------------------------
 // Main refresh
 // ---------------------------------------------------------------------------
-function refreshDecisionTop10() {
+function refreshDecisionTop10(options) {
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
   var run = { statusCell: null, markerOwned: false };   // v1.13.10: a throw ends in FAILED
   try {
-    dt10RefreshDecisionTop10Run_(run);
+    return dt10RefreshDecisionTop10Run_(run, options);
   } catch (eRun) {
     dt10RefreshFailed_(run, eRun);
     throw eRun;
@@ -7139,7 +7240,7 @@ function dt10RefreshFailed_(run, err) {
   }
   try { SpreadsheetApp.flush(); } catch (eFl) {}
 }
-function dt10RefreshDecisionTop10Run_(run) {
+function dt10RefreshDecisionTop10Run_(run, options) {
   var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
@@ -7189,7 +7290,7 @@ function dt10RefreshDecisionTop10Run_(run) {
           'SYNC-INFLIGHT: cockpit deferred -- ' + inflight.detail,
           { version: DT10_VERSION, run: inflight.run, mode: inflight.mode });
       dt10RunMarkerClear_();
-      return;
+      return dt10RefreshCompletion_('deferred', '', 'sync_inflight', 'HELD');
     }
   }
   var poolLimit = parseInt(panel['Pool Limit'], 10);
@@ -7197,6 +7298,17 @@ function dt10RefreshDecisionTop10Run_(run) {
   if (!(poolLimit > 0)) poolLimit = DT10_POOL_HARD_CAP;
   var useSheets = String(panel['Pool Source'] || 'Sheets')
       .toLowerCase().indexOf('backend') === -1;
+  if (options && options.completionContract === true && !useSheets) {
+    var sourceHeld = dt10StatusLine_('HELD',
+        'completion contract requires Sheets pool source; board kept from the last render', 'HELD');
+    statusCell.setValue(sourceHeld);
+    dt10WritePageStatus_('HELD', 'Decision cockpit: ' + sourceHeld,
+        '', '', String(new Date().getTime() - t0), []);
+    dt10RunLogRow_('INFO', 'HELD', 'Completion contract deferred: Sheets pool source required',
+        {version: DT10_VERSION});
+    dt10RunMarkerClear_();
+    return dt10RefreshCompletion_('deferred', '', 'sheets_pool_required', 'HELD');
+  }
   var body = {
     criteria: dt10CriteriaFromPanel_(panel),
     fx_rates: dt10FxRates_(ss),
@@ -7252,6 +7364,13 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
+  // PR #770/#778: both this native switch and its backend companion are needed.
+  if (dt10AuditKeepOn_()) {
+    try {
+      var auditKeep = dt10AuditKeepSymbols_(dt10StabLoad_());
+      if (auditKeep.length) body.criteria.audit_keep_symbols = auditKeep;
+    } catch (eAuditKeep) { /* display context unavailable; send nothing */ }
+  }
   var resp;
   try {
     resp = pool && !pool.rows.length ?
@@ -7375,6 +7494,12 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's');
   dt10RunMarkerClear_();   // v1.11.12 [P-195]: normal completion
+  // Fresh _Status alone does not prove which inputs a backend selector used.
+  var consumedRun = finalSource.ready === true && finalSource.pool_reconciliation &&
+      finalSource.pool_reconciliation.ready === true ? finalSource.cohort : '';
+  return dt10RefreshCompletion_('completed', consumedRun,
+      consumedRun ? '' : 'consumed_source_unverified', dt10OutputStatus_(payload),
+      consumedRun ? dt10SourceLatestMs_(finalSource) : null);
 }
 /** v1.11.1: MORNING COCKPIT REFRESH — time-driven entry point (the 08:07
  * Riyadh trigger). UI-free: no getUi()/alert/toast; the render's banner and
@@ -7393,12 +7518,20 @@ function tfbMorningCockpitRefresh() {
     } catch (eUv) { seen = 'verdict read failed'; }
     Logger.log('[DT10 v' + DT10_VERSION + '] morning cockpit refresh ' +
                '(time-driven) | feed: ' + seen);
-    refreshDecisionTop10();
+    var completed = refreshDecisionTop10();
+    if (completed && completed.state === 'deferred') {
+      dt10MorningRunLog_('DEFERRED',
+          'Morning cockpit refresh deferred (' + completed.reason + ') | feed: ' + seen,
+          new Date().getTime() - t0, {version: DT10_VERSION, feed: seen,
+            reason: completed.reason});
+      return completed;
+    }
     // v1.11.2 [P-67]: the morning run leaves a _Run_Log row like the
     // 4-hourly wrapper does (cockpit _Status already carries the payload).
     dt10MorningRunLog_('OK',
         'Morning cockpit refresh (time-driven) completed | feed: ' + seen,
         new Date().getTime() - t0, { version: DT10_VERSION, feed: seen });
+    return completed;
   } catch (eMc) {
     Logger.log('[DT10 v' + DT10_VERSION + '] morning cockpit refresh ' +
                'FAILED: ' + eMc);
@@ -7424,7 +7557,8 @@ function dt10MorningRunLog_(status, message, durationMs, details) {
     if (!sh) return false;
     var dj = '{}';
     try { dj = JSON.stringify(details || {}); } catch (eJ) {}
-    sh.appendRow([new Date(), (status === 'OK' ? 'INFO' : 'ERROR'),
+    sh.appendRow([new Date(), (status === 'OK' ? 'INFO' :
+                  (status === 'DEFERRED' ? 'WARN' : 'ERROR')),
                   'tfbMorningCockpitRefresh', DT10_SHEET, String(status || ''),
                   String(message || '').slice(0, 400), '', '',
                   String(durationMs || ''), dj]);
@@ -7683,6 +7817,8 @@ function dt10RenderPayload_(sheet, payload, tokens) {
     19: DT10_FMT_SAR, 20: '0.0', 21: '0.0',
     26: DT10_FMT_INT, 28: '0.0'  // v1.3.0: Days, Sm Score
   });
+  dt10ApplyPriceFormats_(sheet, selT.firstDataRow, selRows, [8, 9, 13, 14, 15],
+      payload.meta && payload.meta.price_precision);
   if (_vt.mode === 'enforce' && selT.firstDataRow > 0) {   // v1.13.4 [WP-8]
     sheet.getRange(selT.firstDataRow, DT10_SELECTED_HEADERS.length + 1,
                    selT.count, DT10_VINTAGE_HEADERS.length).setNumberFormat('@');
@@ -7810,7 +7946,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   if (_cm === 'enforce') {
     _tab = dt10CandTabWrite_(sheet.getParent(), cRows,
         dt10CandTabStampLine_(payload.meta, cRows.length, new Date()), tokens,
-        dt10CandRunId_(payload.meta));
+        dt10CandRunId_(payload.meta), payload.meta && payload.meta.price_precision);
     payload._dt10_cand_result = _tab;
   }
   var cT;
@@ -7824,6 +7960,8 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       6: DT10_FMT_PRICE, 7: DT10_FMT_PRICE, 8: DT10_FMT_PCT, 9: DT10_FMT_PCT,
       10: DT10_FMT_PCT, 11: DT10_FMT_NUM2, 12: '0.0', 13: '0.0', 20: '0.0'
     });
+    dt10ApplyPriceFormats_(sheet, cT.firstDataRow, cRows, [6, 7],
+        payload.meta && payload.meta.price_precision);
     dt10ColorVerdicts_(sheet, cT.firstDataRow, cT.count, 18, tokens);
   }
   row = cT.next + 1;
