@@ -509,6 +509,7 @@ on:
       - 'config/approved_universe_scope_v1.json'
       - 'config/render_env_expected.json'
       - 'docs/render_env_contract.md'
+      - 'data/reviewed_instrument_classes.json'
       - 'config.py'
       - 'env.py'
       - 'core/**'
@@ -889,6 +890,7 @@ jobs:
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \
+            tests/test_reviewed_instrument_classes.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \
             tests/test_auth_wall_scope_path.py \
             tests/test_auth_wall_downstream_errors.py \
