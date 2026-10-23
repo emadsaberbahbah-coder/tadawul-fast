@@ -6222,7 +6222,6 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
             logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
                            "row_sanity=%d errors=%d",
                            _tag, sheet, _n1, _n2, _n3, _n4, _err)
-        return rows
     except Exception as _exc:
         # v5.129.1: keep the probe's finer "incompatible" verdict — the
         # generic error label only for genuine import/apply failures.
@@ -6235,7 +6234,10 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
         else:
             logger.warning("[SURFACE-INV] pass skipped on %s: %s",
                            sheet, _exc)
-        return rows
+    # Mandatory exact-security protection is independent of the optional
+    # surface invariant's fail-open policy. All three final surfaces pass here.
+    from core.reviewed_instrument_classes import apply_reviewed_instrument_rows
+    return apply_reviewed_instrument_rows(_canonicalize_sheet_name(sheet), rows)[0]
 
 
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
@@ -16836,6 +16838,10 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _f7_settle_holdback(row)
     _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
+    # Route fallbacks call this boundary after fetching a guarded cached quote.
+    # Re-assert the mandatory debt quarantine after generic gate recomputation.
+    from core.reviewed_instrument_classes import reviewed_quote_rows
+    displayed = reviewed_quote_rows("My_Portfolio" if "position_qty" in keys else "Global_Markets", [displayed])[0]
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
 
@@ -19790,10 +19796,14 @@ class DataEngineV5:
 
     async def get_enriched_quote(self, symbol: str, page: str = "") -> UnifiedQuote:
         row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        row = reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
         return UnifiedQuote(**row) if row else UnifiedQuote()
 
     async def get_enriched_quote_dict(self, symbol: str, page: str = "") -> Dict[str, Any]:
-        return await self._get_enriched_quote_impl(symbol, page)
+        row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
 
     async def get_enriched_quotes(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         # v5.77.7: per-symbol failure isolation. v5.77.6 used
@@ -19892,7 +19902,8 @@ class DataEngineV5:
                     )
             except Exception:
                 pass
-        return out
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), out)
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         return await self.get_enriched_quotes(symbols, page)
