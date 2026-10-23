@@ -19342,6 +19342,11 @@ class DataEngineV5:
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
+        # Research diagnostics are not core-fundamental completeness inputs.
+        # Carry them separately without changing the gap/negative-cache policy.
+        eps_diagnostics, _ = _filter_patch_to_missing_fields(
+            row, canon_patch, ("eps_estimate_current_year", "eps_net_income_current_shares"),
+        )
         # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
         # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
         # declared identity fields -> no judgement"), so identity must simply
@@ -19374,6 +19379,7 @@ class DataEngineV5:
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
+            _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
@@ -19384,6 +19390,9 @@ class DataEngineV5:
                         _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
                         + ("" if _fus_mode == "enforce" else ":observe"),
                     )
+        if eps_diagnostics:
+            row = self._merge(row, eps_diagnostics)
+            _copy_eps_basis(row, canon_patch, eps_diagnostics)
         return row
 
     # =========================================================================

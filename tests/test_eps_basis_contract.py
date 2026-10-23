@@ -187,6 +187,36 @@ def test_proxy_receipt_identifies_highlights_denominator(monkeypatch):
     row, _ = asyncio.run(client.fetch_fundamentals("SYNTH.US"))
     assert row.get("eps_ttm") is None
     assert row["_eps_basis"]["eps_net_income_current_shares"]["source_field"].endswith("/Highlights.SharesOutstanding")
+
+
+@pytest.mark.parametrize("existing_eps", [None, 2.0])
+def test_real_fundamentals_fallback_keeps_diagnostics_and_only_landed_proof(monkeypatch, existing_eps):
+    monkeypatch.setenv("TFB_EODHD_FUNDAMENTALS_FALLBACK", "1")
+    monkeypatch.setenv("TFB_EODHD_FUND_CACHE", "off")
+    monkeypatch.setenv("TFB_FUND_UNIT_SENTRY", "off")
+    engine = de.DataEngineV5()
+    patch = {"symbol": "SYNTH.US", "eps_ttm": 3.0,
+             "eps_estimate_current_year": 8.0, "eps_net_income_current_shares": 2.5,
+             "debt_to_equity": 0.3, "free_cash_flow_ttm": 10.0,
+             "_eps_basis": {key: {"value": value, "provider": "eodhd"}
+                            for key, value in (("eps_ttm", 3.0),
+                                ("eps_estimate_current_year", 8.0),
+                                ("eps_net_income_current_shares", 2.5))}}
+
+    async def fetch(symbol, page):
+        return copy.deepcopy(patch)
+
+    monkeypatch.setattr(engine, "_fetch_eodhd_fundamentals_patch", fetch)
+    row = asyncio.run(engine._apply_eodhd_fundamentals_fallback(
+        {"symbol": "SYNTH.US", "eps_ttm": existing_eps}, "SYNTH.US", "Global_Markets"))
+    assert row["eps_ttm"] == (3.0 if existing_eps is None else existing_eps)
+    assert row["eps_estimate_current_year"] == 8.0
+    assert row["eps_net_income_current_shares"] == 2.5
+    assert row["_eps_basis"]["eps_estimate_current_year"]["value"] == 8.0
+    if existing_eps is None:
+        assert row["_eps_basis"]["eps_ttm"]["value"] == 3.0
+    else:
+        assert "eps_ttm" not in row["_eps_basis"]
     row = de.DataEngineV5()._merge({"eps_ttm": None,
         "_eps_basis": {"eps_ttm": {"value": 3.0}}}, {"eps_ttm": 2.0})
     assert row["eps_ttm"] == 2.0 and "_eps_basis" not in row
