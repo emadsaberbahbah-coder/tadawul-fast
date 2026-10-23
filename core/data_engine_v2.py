@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.2
 ================================================================================
 
 WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
@@ -4287,9 +4287,10 @@ from core.financial_units import (
 #   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
 #   settle trajectory, status and published values are v5.156.0's; off is
 #   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
-__version__ = "5.157.1"
+__version__ = "5.157.2"
 
 from core.sheet_presentation import present_instrument_row
+from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
 from core.price_precision import (
     price_precision_enabled as _price_precision_enabled,
     price_round_half_quantum as _price_round_half_quantum,
@@ -13047,6 +13048,7 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
         return None
     merged["eps_ttm"] = None
     merged["pe_ttm"] = None
+    _copy_eps_basis(merged, {}, ())
     return "pe_incoherent_cleared:engine"
 
 
@@ -13545,6 +13547,9 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         witnessed_fields = dict(fields)
         witnessed_fields[_MPC_UNIT_KEY] = _margin_cache_units(entry, fields)
         _margin_unit_copy(row, witnessed_fields, filtered)
+        # LKG currently persists no EPS source proof; a restored value cannot
+        # inherit the degraded row's old receipt.
+        _copy_eps_basis(row, {}, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
@@ -13556,7 +13561,10 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
 # raises. A mirror of the v5.136.0 target-LKG layer with the {ts,name,fields}
 # schema; admissibility (TTL / min-fields / fill-only) stays in the callers.
 # ---------------------------------------------------------------------------
-_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v1:"
+# EPS estimates could previously seed eps_ttm through two ingestion paths.
+# Do not restore unversioned old semantics after the adapter/alias correction.
+# Existing v1 keys expire naturally; no historical records are rewritten.
+_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v2:"
 _FUND_LKG_REDIS_BREAKER_ERRORS: int = 3
 _FUND_LKG_REDIS_BREAKER_SECONDS: float = 300.0
 _FUND_LKG_REDIS_TIMEOUT_S: float = 0.25
@@ -15105,7 +15113,9 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
     "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths", "epsCurrentYear"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths"),
+    "eps_estimate_current_year": ("eps_estimate_current_year", "epsCurrentYear", "EPSEstimateCurrentYear"),
+    "eps_net_income_current_shares": ("eps_net_income_current_shares",),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
     "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
     "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
@@ -16207,6 +16217,9 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    # Diagnostic provenance only; this receipt grants no eligibility or unit
+    # conversion. Estimates have no alias to the trailing scoring field.
+    _copy_eps_basis(out, src, _EPS_FIELDS)
     if _MPC_UNIT_KEY in src:
         source_basis = src.get(_MPC_UNIT_KEY)
         explicit_fields = [field for field in _MPC_FIELDS
@@ -16912,14 +16925,18 @@ def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[
     if not isinstance(template_row, dict):
         return out
     filled_margin_fields: List[str] = []
+    filled_eps_fields: List[str] = []
     for k, v in template_row.items():
-        if k == _MPC_UNIT_KEY:
+        if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
             continue  # Only the per-field landed-value copy can carry proof.
         if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
             out[k] = _json_safe(v)
             if k in _MPC_FIELDS:
                 filled_margin_fields.append(k)
+            if k in _EPS_FIELDS:
+                filled_eps_fields.append(k)
     _margin_unit_copy(out, template_row, filled_margin_fields)
+    _copy_eps_basis(out, template_row, filled_eps_fields)
     return out
 
 
@@ -17119,6 +17136,7 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     # identical to v5.99.1 (every blank live value is skipped).
     clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
     replaced_margin_fields: List[str] = []
+    replaced_eps_fields: List[str] = []
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
@@ -17129,7 +17147,10 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
         out[k] = _json_safe(v)
         if k in _MPC_FIELDS:
             replaced_margin_fields.append(k)
+        if k in _EPS_FIELDS:
+            replaced_eps_fields.append(k)
     _margin_unit_copy(out, live_row, replaced_margin_fields)
+    _copy_eps_basis(out, live_row, replaced_eps_fields)
     return out
 
 
@@ -18853,8 +18874,9 @@ class DataEngineV5:
     def _merge(self, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base or {})
         landed_margins: List[str] = []
+        landed_eps: List[str] = []
         for k, v in (patch or {}).items():
-            if k == _MPC_UNIT_KEY:
+            if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
                 continue
             if v is None or v == "":
                 continue
@@ -18862,7 +18884,10 @@ class DataEngineV5:
                 out[k] = v
                 if k in _MPC_FIELDS:
                     landed_margins.append(k)
+                if k in _EPS_FIELDS:
+                    landed_eps.append(k)
         _margin_unit_copy(out, patch or {}, landed_margins)
+        _copy_eps_basis(out, patch or {}, landed_eps)
         return out
 
     def _data_quality(self, row: Dict[str, Any]) -> QuoteQuality:
@@ -19317,6 +19342,11 @@ class DataEngineV5:
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
+        # Research diagnostics are not core-fundamental completeness inputs.
+        # Carry them separately without changing the gap/negative-cache policy.
+        eps_diagnostics, _ = _filter_patch_to_missing_fields(
+            row, canon_patch, ("eps_estimate_current_year", "eps_net_income_current_shares"),
+        )
         # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
         # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
         # declared identity fields -> no judgement"), so identity must simply
@@ -19349,6 +19379,7 @@ class DataEngineV5:
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
+            _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
@@ -19359,6 +19390,9 @@ class DataEngineV5:
                         _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
                         + ("" if _fus_mode == "enforce" else ":observe"),
                     )
+        if eps_diagnostics:
+            row = self._merge(row, eps_diagnostics)
+            _copy_eps_basis(row, canon_patch, eps_diagnostics)
         return row
 
     # =========================================================================
