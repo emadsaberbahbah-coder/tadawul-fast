@@ -1,0 +1,86 @@
+{
+  "observation_start": "2026-10-16T10:28:42+03:00",
+  "observation_end": "2026-10-17T10:28:42+03:00",
+  "timezone": "Asia/Riyadh",
+  "cadence": "hourly",
+  "scheduled_occurrences": 24,
+  "continuous_execution": false,
+  "source_main_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+  "repair_branch": "codex/daily-workflow-reliability-2026-10-16",
+  "initial_observations": {
+    "sync_run_id": 38821487562,
+    "global_requested": 6609,
+    "global_timestamp_fresh": 6609,
+    "global_successful_acquisitions": 6160,
+    "global_invalid_acquisitions": 449,
+    "global_reason_counts": {
+      "failed_or_quarantined_or_preserved": 341,
+      "price_missing_or_invalid": 108
+    },
+    "global_recovery_pe_quarantines": 252,
+    "global_name_coverage_pct": 98.1389,
+    "minimum_acquisition_pct": 95,
+    "minimum_name_pct": 99,
+    "backend_health": "healthy",
+    "backend_ready": true,
+    "backend_commit_matches_main": true,
+    "provider_reference": "empty historical baseline, explicit bootstrap requires independently healthy full sync"
+  },
+  "unresolved_inputs": [
+    "Same-run failed raw market price/EPS/P-E triples and supplier source/vintage receipts for the quarantined rows.",
+    "Reviewed instrument identities/availability for missing/invalid quotes; never substitute a fabricated price.",
+    "Independent healthy full-sync evidence before any provider-monitor baseline bootstrap.",
+    "Publication authorization before merging/deploying review-branch changes."
+  ],
+  "safety_contract": "Do not lower acquisition/name/identity/funding gates or change financial policy to make failed jobs green; never blindly replay writer or email jobs.",
+  "successful_run_followup_20261017": {
+    "review_starting_head": "ea66084c832d865772bd506e9d0434ff65002026",
+    "review_document": "docs/reviews/successful-run-alignment-20261017.md",
+    "source_main_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+    "publication_authorized": false,
+    "source_defects_reproduced_offline": 7,
+    "recent_production_incidents_proven_by_these_reproductions": false,
+    "revised_scripts": {
+      "run_daily_brief": "1.18.2",
+      "run_shadow_board": "1.5.1",
+      "intraday_quote_refresh": "1.0.4",
+      "backup_workbook": "1.5.2",
+      "pit_snapshot": "1.1.2",
+      "news_archive_collector": "1.1.1",
+      "send_digest": "2.1.3"
+    },
+    "focused_validation": {
+      "six_repair_lean_tests": 252,
+      "six_repair_lean_subtests": 9,
+      "related_pinned_tests": 179,
+      "final_shadow_and_manifest_workflow_verdict_tests": 39,
+      "final_shadow_and_manifest_workflow_verdict_subtests": 9,
+      "existing_shadow_freeze_checks": 31,
+      "strict_workflow_audit_errors": 0,
+      "strict_workflow_audit_warnings": 0,
+      "exact_pushed_head_checks": "See PR #785; earlier checks are not reused."
+    },
+    "latest_completed_sync": {
+      "run_id": 38978392280,
+      "completed_at": "2026-10-17T02:58:50+03:00",
+      "conclusion": "failure",
+      "global_acquired": 6280,
+      "global_requested": 6609,
+      "funds_acquired": 2388,
+      "funds_requested": 2474,
+      "market_leaders_acquired": 253,
+      "market_leaders_requested": 255,
+      "cfx_acquired": 432,
+      "cfx_requested": 453,
+      "required_acquisition_floors_pass": true,
+      "global_name_coverage_pct": 98.0481,
+      "funds_name_coverage_pct": 98.9895,
+      "minimum_name_pct": 99,
+      "decision_audit_failures": 6,
+      "strict_final_decision_failures": 8,
+      "blocker_published": true,
+      "feed_promoted": false
+    },
+    "safety": "No live writer/email dispatch, merge, deployment, policy change or provider baseline bootstrap."
+  }
+}

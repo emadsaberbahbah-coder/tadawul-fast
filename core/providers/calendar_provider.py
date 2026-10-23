@@ -2,9 +2,17 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.2 (FIELD-INDEPENDENT YAHOO FALLBACK)
+Calendar Provider — v1.2.3 (CANONICAL LONDON REQUEST SUFFIX)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.2.3 — canonicalize London's .L alias to .LSE at the EODHD boundary.
+WHY: EODHD's Exchanges API defines London Code=LSE as the request suffix;
+the quote provider already applies this correction, but the calendar sent
+the raw .L alias. Preserve original caller keys and existing batching,
+Saudi exclusions and fallback behavior. This corrects the request contract;
+it does not establish the cause of the observed upstream batch HTTP 404.
+Reference: https://eodhd.com/financial-apis/exchanges-api-list-of-tickers-and-trading-hours
 
 v1.2.2 — retry Yahoo when either earnings or ex-dividend is missing.
 Each event fills independently; existing EODHD dates are never overwritten.
@@ -147,7 +155,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -269,6 +277,10 @@ def _split_symbols(symbols: List[str]) -> Tuple[Dict[str, str], List[str]]:
         except Exception:
             code = ""
         if code:
+            # EODHD's London code is LSE; retain the original symbol as value.
+            # Match the quote provider without importing its heavier runtime.
+            if code.endswith(".L"):
+                code = code[:-2] + ".LSE"
             code_map.setdefault(code, sym)
     return code_map, ksa
 

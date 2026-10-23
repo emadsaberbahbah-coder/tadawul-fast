@@ -235,7 +235,7 @@ def test_p10_workflow_wiring():
 
 def test_p11_backup_local_copy_flag_default():
     from scripts import backup_workbook as bw
-    assert bw.__version__ == "1.5.1"   # v1.5.1: resumable upload resumes (tests/test_backup_upload_resume.py)
+    assert bw.__version__ == "1.5.3"   # merged XLSX validation and resumable-upload recovery
     with tempfile.TemporaryDirectory() as tmp:
         old = os.environ.pop("TFB_BACKUP_LOCAL_COPY", None)
         try:

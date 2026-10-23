@@ -191,8 +191,9 @@ class InlinePageRecoveryTests(unittest.TestCase):
                    "evidence": "successful_RAW_update", "live_readback": False}
         good = {"sheet_name": "Commodities_FX", "version": "6.67.0", "status": "success",
                 "rows_written": 453, "write_receipt": receipt}
+        wrong_page_payload = json.dumps({"results": [dict(good, sheet_name="Global_Markets")]})
         payloads = ["not json", json.dumps({"results": []}), json.dumps({"results": [good, good]}),
-                    json.dumps({"results": [dict(good, sheet_name="Global_Markets")]}),
+                    wrong_page_payload,
                     json.dumps({"results": [dict(good, write_receipt=dict(receipt, live_readback=True))]}),
                     json.dumps({"results": [dict(good, write_receipt=dict(receipt, written_payload_sha8="bad"))]}),
                     json.dumps({"results": [dict(good, write_receipt=dict(receipt, rows=True))]})]
@@ -209,7 +210,10 @@ class InlinePageRecoveryTests(unittest.TestCase):
                         "scripts.run_inline_page_recovery._stream_process", side_effect=fake_stream):
                     code = run_inline_recovery(source_root=source, backend="https://example.test", sheet_id="sheet",
                         evidence_root=root / "evidence", plan_out=root / "plan.json", summary_out=root / "summary.json")
-                self.assertEqual(code, 0)
+                # Optional malformed diagnostics do not negate a good terminal
+                # log. A valid contradictory page declaration is a distinct
+                # provenance conflict and must block the attempt.
+                self.assertEqual(code, 2 if text == wrong_page_payload else 0)
                 item = json.loads((root / "summary.json").read_text())["results"][0]["runner_report"]
                 self.assertEqual(item["status"], "invalid")
                 self.assertFalse(item["live_readback"])

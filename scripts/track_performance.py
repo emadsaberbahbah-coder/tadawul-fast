@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.47.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.47.1)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -842,6 +842,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import base64
 import concurrent.futures
 import csv
@@ -1584,6 +1585,17 @@ from urllib.error import HTTPError, URLError
 # TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
 # identities, preserving successive states and refusing writes without a
 # readable identity index. Legacy and WP-7 measurement modes stay available.
+# v6.45.1 (2026-10-16): a failed HypothesisRegistry.save previously still
+# printed "registered"/"results written" and returned zero. Require its
+# actual acknowledgement before claiming publication or continuing after a
+# failed registration. Backtest math, acceptance policy and in-memory-only
+# operation when the registry is unavailable remain unchanged. Emit fixed
+# stage names, not private provider/worksheet exception payloads.
+# Weekly run 38161414138 also requested 730 days but fetched range=1mo for
+# every symbol: Yahoo's period API rejected days= and the TypeError retry
+# silently used its default. Adapt the declared signature before invocation,
+# request a supported period covering the calendar window, and never retry
+# an internal TypeError with the history-window argument removed.
 # -----------------------------------------------------------------------------
 # v6.47.0 (2026-10-21) - HISTORICAL TARGET-SESSION CLOSE (TRACK_HIST_TARGET_CLOSE,
 # DEFAULT OFF = v6.45.0 byte-identical apart from the version string). 6.45.1,
@@ -1714,7 +1726,12 @@ from urllib.error import HTTPError, URLError
 #     reliability of the same decided records; mean_claimed_reliability
 #     keeps the all-n average.
 # Embedded self-test count unchanged (22). Tests: tests/test_learning_metric_fixes.py.
-SCRIPT_VERSION = "6.47.0"
+# v6.47.1 (2026-10-24): integrate the original v6.45.1 registry-write
+# acknowledgements and explicit backtest history-window adapter with main's
+# v6.46.0 directional reporting and v6.47.0 witnessed target-close path.
+# Preserve the historical-close mode/tag and all existing defaults; no new
+# provider request, retry, maturation condition or investment policy is added.
+SCRIPT_VERSION = "6.47.1"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -8940,7 +8957,7 @@ class HypothesisRegistry:
             self.backoff.execute_sync(_save)
             return True
         except Exception as e:
-            logger.error("Failed to save hypotheses: %s", e)
+            logger.error("Failed to save hypotheses (%s); partial writes possible", type(e).__name__)
             return False
 
     def register_defaults(self, existing: Optional[List["Hypothesis"]] = None) -> List["Hypothesis"]:
@@ -8950,6 +8967,22 @@ class HypothesisRegistry:
             if d.hypothesis_id not in cur:
                 cur[d.hypothesis_id] = d
         return list(cur.values())
+
+
+def _backtest_history_period(days: int) -> str:
+    """Supported Yahoo period covering the requested calendar-day window.
+
+    Conservative minimum calendar lengths avoid truncating a request at a
+    short February or a non-leap year. Returned bars can still be shallow for
+    a new listing; no observations or trigger events are manufactured.
+    """
+    if days < 1:
+        raise ValueError("backtest history days must be positive")
+    for covered, period in ((28, "1mo"), (89, "3mo"), (181, "6mo"),
+                            (365, "1y"), (730, "2y"), (1825, "5y"), (3650, "10y")):
+        if days <= covered:
+            return period
+    return "max"
 
 
 class PerformanceTrackerApp:
@@ -11076,10 +11109,22 @@ class PerformanceTrackerApp:
         )
         existing = registry.load() if registry.is_available() else []
 
+        def publish(hypotheses, stage):
+            failure = "not_acknowledged"
+            try:
+                if registry.save(hypotheses) is True:
+                    return True
+            except Exception as exc:
+                failure = type(exc).__name__
+            logger.error("[backtest] registry %s write failed (%s); partial writes possible",
+                         stage, failure)
+            return False
+
         if getattr(self.args, "register_hypotheses", False):
             merged = registry.register_defaults(existing)
             if registry.is_available():
-                registry.save(merged)
+                if not publish(merged, "registration"):
+                    return 1
             _out("[backtest] registered %d hypotheses (%d new)\n" % (
                 len(merged), max(0, len(merged) - len(existing))))
             existing = merged
@@ -11114,6 +11159,10 @@ class PerformanceTrackerApp:
         history = await self._fetch_backtest_history(universe, days)
         got = sum(1 for v in history.values() if v)
         _out("[backtest] history fetched for %d/%d symbols\n" % (got, len(universe)))
+        if got:
+            depths = [len(rows) for rows in history.values() if rows]
+            _out("[backtest] history depth min=%d max=%d bars; requested=%d calendar days\n"
+                 % (min(depths), max(depths), days))
         if got == 0:
             _out("[backtest] no history -> aborting (EODHD unavailable?)\n")
             return 1
@@ -11134,7 +11183,8 @@ class PerformanceTrackerApp:
             by_id = {h.hypothesis_id: h for h in existing}
             for r in results:
                 by_id[r.hypothesis_id] = r
-            registry.save(list(by_id.values()))
+            if not publish(list(by_id.values()), "results"):
+                return 1
             _out("[backtest] results written to %s\n" % registry.sheet_name)
 
         accepted = [r for r in results if r.status == HypothesisStatus.ACCEPTED]
@@ -11215,13 +11265,26 @@ class PerformanceTrackerApp:
                 if fn is None:
                     continue
                 try:
-                    bars = await fn(sym, days=days)
-                except TypeError:
-                    try:
-                        bars = await fn(sym)
-                    except Exception:
+                    parameters = inspect.signature(fn).parameters
+                    keyword = {name for name, parameter in parameters.items()
+                               if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                                     inspect.Parameter.KEYWORD_ONLY)}
+                    if "days" in keyword:
+                        kwargs = {"days": days}
+                    elif "period" in keyword:
+                        kwargs = {"period": _backtest_history_period(days)}
+                        if "interval" in keyword:
+                            kwargs["interval"] = "1d"
+                    elif any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+                        kwargs = {"days": days}
+                    else:
+                        logger.warning("backtest history lookback unsupported via %s.%s",
+                                       getattr(mod, "__name__", "provider"), _fn_name)
                         continue
-                except Exception:
+                    bars = await fn(sym, **kwargs)
+                except Exception as exc:
+                    logger.warning("backtest history fetch failed via %s.%s (%s)",
+                                   getattr(mod, "__name__", "provider"), _fn_name, type(exc).__name__)
                     continue
                 if isinstance(bars, list) and bars:
                     return bars

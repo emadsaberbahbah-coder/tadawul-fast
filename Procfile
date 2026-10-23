@@ -1,22 +1,24 @@
 # ==============================================================================
 # Procfile -- TADAWUL FAST BRIDGE (Aligned with canonical revisions)
 # ==============================================================================
+# WHY 2026-10-16: align deployment comments with scripts/start_web.sh v2.6.1.
+# This repository has no Render Blueprint; Render configuration is managed in
+# the Dashboard. Process commands below are unchanged.
 #
 # Process types
 # -----------------------------------------------------------------------------
 #
-# web     FastAPI ASGI app via scripts/start_web.sh (v2.6.0)
-#         Launcher handles: uvicorn/gunicorn selection, cgroup-aware worker
-#         calculation, optional DB/Redis health checks, uvloop/httptools probing.
+# web     FastAPI ASGI app via scripts/start_web.sh (v2.6.1)
+#         Launcher starts Gunicorn + UvicornWorker with bounded worker,
+#         timeout and keepalive settings; default worker count is one.
 #         Render provides PORT (default 10000, matching main.py fallback);
 #         WEB_CONCURRENCY controls worker count.
 #         Canonical env group: tfb-server (UVICORN_KEEPALIVE,
 #         UVICORN_GRACEFUL_TIMEOUT, UVICORN_BACKLOG, WEB_CONCURRENCY,
 #         WORKERS_MAX).
-#         Invoked via `./scripts/start_web.sh` to match render.yaml's
-#         canonical `exec ./scripts/start_web.sh` and honor the script's
-#         `#!/usr/bin/env bash` shebang. The launcher MUST be executable
-#         (ensured by render.yaml's pre-step `chmod +x scripts/start_web.sh`).
+#         Invoked via `./scripts/start_web.sh` to honor the script's
+#         `#!/usr/bin/env bash` shebang. The launcher MUST be executable;
+#         the documented Render Dashboard Start Command ensures this.
 #
 # worker  Background job processor (scripts/worker.py v4.3.0)
 #         Connects to Redis (REDIS_URL) and processes tfb_background_jobs queue.
@@ -46,17 +48,17 @@
 #
 # Render deployment note
 # -----------------------------------------------------------------------------
-# render.yaml defines the web service directly via:
-#     startCommand: |
-#       chmod +x scripts/start_web.sh
-#       exec ./scripts/start_web.sh
+# This repository has no render.yaml Blueprint. The documented Render
+# Dashboard Start Command is:
+#     set -euo pipefail
+#     chmod +x scripts/start_web.sh
+#     exec ./scripts/start_web.sh
+# The Dashboard Health Check Path is /readyz.
 # This Procfile is the canonical process declaration for:
 #   Heroku / Railway / Fly.io / local Foreman / local Honcho
 #
-# For Render: to run the worker alongside the web service, add a `workers`
-# or `backgroundWorker` block to render.yaml (render.yaml v6.x supports
-# `type: worker`). This Procfile does NOT affect Render deployments -- Render
-# reads render.yaml, not Procfile.
+# For Render: a worker requires a separately configured background worker
+# service. This Procfile does not configure the Dashboard-managed services.
 #
 # Local usage
 #   pip install honcho          # or: brew install foreman

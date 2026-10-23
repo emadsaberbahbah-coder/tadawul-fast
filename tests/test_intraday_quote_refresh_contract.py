@@ -6,6 +6,8 @@ import json
 import re
 import sys
 import urllib.request
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -366,6 +368,172 @@ def test_failed_batch_never_counts_planned_cells_as_written(monkeypatch):
     assert code == 2 and not book.pages["Market_Leaders"].writes
     log = book.pages["_Run_Log"].appends[-1]
     assert log[4] == "PARTIAL" and "cells=9" in log[5]  # only other successful page's cells
+
+
+def operational_wire(monkeypatch, book, response, *, apply=True):
+    """Exercise main with real fetch/planning and only external IO replaced."""
+    calls = []
+    def get(url, **kwargs):
+        calls.append(url)
+        return response(parse_qs(urlparse(url).query)["page"][0])
+    monkeypatch.setattr(urllib.request, "urlopen", get)
+    monkeypatch.setattr(iqr, "_open_sheet", lambda *_args: book)
+    monkeypatch.setattr(sys, "argv", ["intraday_quote_refresh", "--apply" if apply else "--scan",
+                                      "--backend", "https://synthetic.invalid"])
+    return iqr.main(), calls
+
+
+@pytest.mark.parametrize("apply", [True, False])
+@pytest.mark.parametrize("all_failed", [True, False])
+def test_actual_main_fetch_failure_is_not_a_successful_empty_plan(monkeypatch, capsys, apply, all_failed):
+    book = Book()
+    def response(page):
+        if all_failed or page == "Market_Leaders":
+            raise URLError("private failure payload must not be logged")
+        return Response({"data": [source()]})
+    code, calls = operational_wire(monkeypatch, book, response, apply=apply)
+    assert code == 2 and len(calls) == 2  # no retry or suppression of the other page
+    assert not book.pages["Market_Leaders"].writes
+    assert bool(book.pages["Global_Markets"].writes) == (apply and not all_failed)
+    output = capsys.readouterr().out
+    assert "private failure payload" not in output and "APPLIED cells=" not in output
+    if apply:
+        receipt = book.pages["_Run_Log"].appends[-1]
+        assert receipt[1] == "ERROR" and receipt[4] == "PARTIAL"
+        assert "cells=%d" % (0 if all_failed else 9) in receipt[5]
+        errors = json.loads(receipt[9])["operational_errors"]
+        assert len(errors) == (2 if all_failed else 1)
+        assert all(error.startswith("fetch:") and error.endswith(":URLError") for error in errors)
+    else:
+        assert not book.pages["_Run_Log"].appends and "SCAN FAILED" in output
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"status": "error", "rows": []},
+                                      {"status": "unavailable", "data": []}])
+def test_actual_main_failed_or_malformed_backend_envelope_cannot_claim_applied(monkeypatch, payload):
+    book = Book()
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response(payload))
+    assert code == 2 and len(calls) == 2
+    assert not book.pages["Market_Leaders"].writes and not book.pages["Global_Markets"].writes
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[4] == "PARTIAL" and "cells=0" in receipt[5]
+    assert len(json.loads(receipt[9])["operational_errors"]) == 2
+
+
+def test_backend_error_is_operationally_partial_without_changing_valid_row_eligibility(monkeypatch):
+    book = Book()
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({
+        "status": "error", "data": [source(), source("REJECTED.SR", acquisition_status="failed")]}))
+    assert code == 2 and len(calls) == 2
+    assert all(len(book.pages[page].writes) == 1 for page in ("Market_Leaders", "Global_Markets"))
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[4] == "PARTIAL" and "cells=18" in receipt[5]
+    assert json.loads(receipt[9])["operational_errors"] == [
+        "fetch:Market_Leaders:BackendError", "fetch:Global_Markets:BackendError"]
+
+
+@pytest.mark.parametrize("all_failed", [True, False])
+def test_actual_main_target_read_failure_is_reported_while_other_pages_continue(monkeypatch, capsys, all_failed):
+    book = Book()
+    def fail_read(_reads, _rows):
+        raise TimeoutError("private worksheet payload must not be logged")
+    book.pages["Market_Leaders"].hook = fail_read
+    if all_failed:
+        book.pages["Global_Markets"].hook = fail_read
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({"data": [source()]}))
+    assert code == 2 and len(calls) == (0 if all_failed else 1)
+    assert not book.pages["Market_Leaders"].writes
+    assert bool(book.pages["Global_Markets"].writes) == (not all_failed)
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[1] == "ERROR" and receipt[4] == "PARTIAL"
+    assert "cells=%d" % (0 if all_failed else 9) in receipt[5]
+    errors = json.loads(receipt[9])["operational_errors"]
+    assert len(errors) == (2 if all_failed else 1)
+    assert all(error.startswith("target_read:") and error.endswith(":TimeoutError") for error in errors)
+    assert "private worksheet payload" not in capsys.readouterr().out
+
+
+def test_missing_configured_target_is_an_operational_failure(monkeypatch):
+    book = Book()
+    del book.pages["Global_Markets"]
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({"data": [source()]}))
+    assert code == 2 and len(calls) == 1 and book.pages["Market_Leaders"].writes
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[4] == "PARTIAL"
+    assert json.loads(receipt[9])["operational_errors"] == ["target_read:Global_Markets:KeyError"]
+
+
+@pytest.mark.parametrize("all_failed", [True, False])
+def test_unreadable_source_union_cannot_masquerade_as_no_decision_symbols(monkeypatch, all_failed):
+    book = Book()
+    def fail_read(_reads, _rows):
+        raise TimeoutError("synthetic source read failed")
+    names = ("Top_10_Investments", "My_Portfolio", "Shadow_Board") if all_failed else ("Shadow_Board",)
+    for name in names:
+        book.pages[name].hook = fail_read
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({"data": [source()]}))
+    assert code == 2 and len(calls) == (0 if all_failed else 2)
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[4] == "PARTIAL" and len(json.loads(receipt[9])["operational_errors"]) == len(names)
+
+
+@pytest.mark.parametrize("kind", ["empty_response", "unverified_quote", "not_newer"])
+def test_verified_zero_change_results_stay_successful(monkeypatch, kind):
+    book = Book()
+    payload = {"status": "success", "data": []}
+    if kind == "unverified_quote":
+        payload["data"] = [source(acquisition_status="preserved")]
+    elif kind == "not_newer":
+        payload["data"] = [source()]
+        for name in ("Market_Leaders", "Global_Markets"):
+            book.pages[name].values = [HEADER, target(**{
+                "Last Updated (UTC)": NOW.isoformat(),
+                "Last Updated (Riyadh)": NOW.astimezone(timezone(timedelta(hours=3))).isoformat()})]
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response(payload))
+    assert code == 0 and len(calls) == 2
+    assert not book.pages["Market_Leaders"].writes and not book.pages["Global_Markets"].writes
+    receipt = book.pages["_Run_Log"].appends[-1]
+    assert receipt[1] == "INFO" and receipt[4] == "OK" and "cells=0" in receipt[5]
+    assert json.loads(receipt[9])["operational_errors"] == []
+
+
+@pytest.mark.parametrize("all_absent", [True, False])
+def test_absent_optional_sources_remain_safe_and_do_not_add_requests(monkeypatch, all_absent):
+    class WorksheetNotFound(Exception):
+        pass
+    book = Book()
+    lookup = book.worksheet
+    def worksheet(name):
+        if name in (("Top_10_Investments", "My_Portfolio", "Shadow_Board") if all_absent else ("Shadow_Board",)):
+            raise WorksheetNotFound("optional source absent")
+        return lookup(name)
+    monkeypatch.setattr(book, "worksheet", worksheet)
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({"data": [source()]}))
+    assert code == 0 and len(calls) == (0 if all_absent else 2)
+    if all_absent:
+        assert not book.pages["_Run_Log"].appends
+    else:
+        assert book.pages["_Run_Log"].appends[-1][4] == "OK"
+
+
+def test_readable_empty_decisions_remain_a_no_request_noop(monkeypatch):
+    book = Book()
+    for name in ("Top_10_Investments", "My_Portfolio", "Shadow_Board"):
+        book.pages[name].values = [["Symbol", "Name"]]
+    code, calls = operational_wire(monkeypatch, book, lambda _page: pytest.fail("empty decisions must not fetch"))
+    assert code == 0 and calls == [] and not book.pages["_Run_Log"].appends
+
+
+def test_runlog_append_is_still_best_effort_and_never_leaks_exception_payload(monkeypatch, capsys):
+    book = Book()
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("private logging payload must not be logged")
+    monkeypatch.setattr(book.pages["_Run_Log"], "append_row", fail_append)
+    code, calls = operational_wire(monkeypatch, book, lambda _page: Response({"data": [source()]}))
+    assert code == 0 and len(calls) == 2
+    assert book.pages["Market_Leaders"].writes and book.pages["Global_Markets"].writes
+    output = capsys.readouterr().out
+    assert "[RUNLOG-WARN] append failed: RuntimeError" in output and "private logging payload" not in output
 
 
 def test_scan_and_target_scope_preserve_financial_rows_and_market_membership(monkeypatch):

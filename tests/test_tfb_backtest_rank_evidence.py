@@ -144,7 +144,7 @@ def test_actual_cli_serializes_null_and_prints_undefined_without_live_io(tmp_pat
     report = tmp_path / "report.json"
     assert backtest.main(["--export-dir", str(tmp_path), "--signal", "Signal", "--json", str(report)]) == 0
     payload = json.loads(report.read_text(encoding="utf-8"), parse_constant=lambda token: pytest.fail(token))
-    assert payload["version"] == "1.1.1"
+    assert payload["version"] == backtest.VERSION
     assert payload["results"][0]["spearman_vs_roi"] is None
     assert payload["results"][0]["spearman_status"] == "constant_signal"
     assert "Spearman vs ROI undefined (constant_signal)" in capsys.readouterr().out

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.1)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.2)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -45,6 +45,19 @@
 #   - news_intelligence uses Google-News RSS and configured feeds: no provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
 # =============================================================================
+# v1.3.2 (2026-10-24) -- STACK INTEGRATION: VERIFIED ARCHIVE READ SHAPES
+# WHY: preserve PR #785's unknown/header/schema-state refusal together with
+# main's later identity/acquisition truth, created-only initialization and
+# non-retried append. A malformed daily-key grid is unavailable, never empty;
+# successful batch metadata cannot certify an omitted requested symbol.
+# Existing populated or blank archives are never relabelled. No financial,
+# selection, scoring or acquisition retry policy is changed.
+# =============================================================================
+# v1.1.1 (2026-10-17) -- CONFIRMED ARCHIVE STATE BEFORE APPEND
+# WHY: failed idempotency reads must not become empty archives, and missing or
+# incompatible historical headers must not be overwritten. Preserve canonical
+# grid/row shape checks and unknown-state refusal through the later collector.
+# =============================================================================
 # v1.3.0 (2026-10-23) -- BOUNDED ADAPTIVE NEWS SELECTION
 #   Add exact-symbol/company-name discovery, portfolio/research priority,
 #   eligible and broader rotation, explicit acquisition/selection evidence,
@@ -88,7 +101,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.3.2"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -277,6 +290,10 @@ def _import_news_module() -> Optional[Any]:
 # -----------------------------------------------------------------------------
 # Archive store (append-only)
 # -----------------------------------------------------------------------------
+class NewsArchiveStateError(RuntimeError):
+    """Archive state could not be confirmed safely before an append."""
+
+
 class NewsArchiveStore:
     SHEET_DEFAULT = "News_Archive"
     START_ROW = 5  # headers at row 5
@@ -355,11 +372,34 @@ class NewsArchiveStore:
             logger.error("NewsArchiveStore initialization withheld (%s)", self.init_error_code)
             self.gc = self.sheet = self.ws = None
 
+    @staticmethod
+    def _header_cells(row: Any) -> list[str]:
+        if not isinstance(row, list):
+            raise NewsArchiveStateError("archive_header_unverified")
+        cells = [str(value if value is not None else "").strip() for value in row]
+        while cells and not cells[-1]:
+            cells.pop()
+        return cells
+
     def _header_matches(self, values: List[Any]) -> bool:
-        header = [str(value).strip().casefold() for value in values]
-        while header and not header[-1]:
-            header.pop()
-        return header == [value.casefold() for value in self.HEADERS]
+        # Main's case-insensitive canonical-header compatibility is retained;
+        # malformed response shapes are never interpreted as a blank header.
+        try:
+            header = self._header_cells(values)
+        except NewsArchiveStateError:
+            return False
+        return [value.casefold() for value in header] == [value.casefold() for value in self.HEADERS]
+
+    def _read_archive_values(self) -> list[list[Any]]:
+        if self.ws is None:
+            raise NewsArchiveStateError("archive_key_read_failed")
+        try:
+            rows = self.backoff.run(lambda: self.ws.get_all_values())
+        except Exception:
+            raise NewsArchiveStateError("archive_key_read_failed") from None
+        if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
+            raise NewsArchiveStateError("archive_key_read_failed")
+        return rows
 
     def _ensure_headers(self, *, created: bool = False) -> None:
         """Initialize a proven new sheet; verify existing sheets without writes."""
@@ -556,12 +596,7 @@ class NewsArchiveStore:
 
     def existing_keys_for_date(self, date_str: str) -> set:
         """Read proven daily keys; unavailable reads are not an empty archive."""
-        if not self.ws:
-            raise RuntimeError("archive_key_read_failed")
-        try:
-            rows = self.backoff.run(lambda: self.ws.get_all_values())
-        except Exception:
-            raise RuntimeError("archive_key_read_failed") from None
+        rows = self._read_archive_values()
         header_row = self.DATA_ROW0 - 2
         if not self._header_matches(rows[header_row] if len(rows) > header_row else []):
             raise RuntimeError("archive_header_unverified")

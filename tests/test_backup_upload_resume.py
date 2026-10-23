@@ -307,9 +307,9 @@ def test_parse_range_end_is_total():
 
 
 def test_version_and_manifest_pin():
-    assert bw.__version__ == "1.5.1"
+    assert bw.__version__ == "1.5.3"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("backup_workbook", "1.5.1", "workbook backup")' in src
+    assert '("backup_workbook", "1.5.3", "workbook backup")' in src
 
 
 if __name__ == "__main__":   # pragma: no cover

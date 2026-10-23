@@ -19,12 +19,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
 
-
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.1.3"
+# v1.1.3 (2026-10-16): an empty/truncated later recovery attempt must not
+# reuse an earlier successful verdict. Scope actual attempt logs/receipts to
+# their own artifact/page; absent artifacts and legacy primary logs retain
+# their existing behavior. Conflicting or unavailable recovery scope is a
+# read error, never guessed coverage. No freshness thresholds change.
 # v1.1.2 (2026-10-06): full-fetch mode now rejects partial verdicts and
 # explicit unknown exact coverage, while legacy no-coverage logs remain
 # compatible. Canonical-log preference is local to each artifact directory.
@@ -194,6 +198,13 @@ def _candidate_logs(root: Path) -> list[Path]:
     for path in root.rglob("sync_*.log"):
         if path.is_file():
             by_parent.setdefault(path.parent, []).append(path)
+    # These per-attempt files are emitted only after launching the child, not
+    # for quota skips. Their presence without a log proves missing evidence;
+    # a success claim in JSON cannot substitute for a terminal log verdict.
+    for filename in ("sync_runner_receipt.json", "page-audit.json"):
+        for path in root.rglob(filename):
+            if path.is_file() and path.parent not in by_parent:
+                by_parent[path.parent] = [path.parent / "sync_execution.log"]
 
     selected: list[Path] = []
     for paths in by_parent.values():
@@ -202,7 +213,138 @@ def _candidate_logs(root: Path) -> list[Path]:
     return sorted(selected, key=order_key)
 
 
-def _read_logs(paths: Iterable[Path]) -> tuple[list[PageVerdict], int, dict]:
+_RECOVERY_GROUP_PAGES = {
+    "global-markets": "Global_Markets", "commodities-fx": "Commodities_FX",
+    "mutual-funds": "Mutual_Funds", "market-leaders": "Market_Leaders",
+}
+_RECOVERY_GROUP_PAGES.update({page: page for page in CRITICAL_MARKET_PAGES})
+_RECOVERY_ARTIFACT_RE = re.compile(r"^page-refresh-(\d+)-([A-Za-z0-9_-]+)$")
+_PRIMARY_ARTIFACT_RE = re.compile(r"^tadawul-sync-logs-(\d+)-.+$")
+_CYCLE_DIRECTORY_RE = re.compile(r"^cycle\d+$", re.IGNORECASE)
+_ATTEMPT_RECEIPTS = ("sync_runner_receipt.json", "page-audit.json")
+_MAX_ATTEMPT_RECEIPT_BYTES = 4 * 1024 * 1024
+
+
+def _attempt_family(path: Path, root: Path) -> Path:
+    """The exact logical artifact parent, stripping only cycle directories."""
+    parent = path.parent
+    while parent != root and _CYCLE_DIRECTORY_RE.fullmatch(parent.name):
+        parent = parent.parent
+    return parent
+
+
+def _inside_artifact_root(path: Path, root: Path) -> None:
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise OSError("sync attempt evidence escapes the artifact root")
+
+
+def _attempt_receipt_pages(directory: Path, root: Path) -> set[str]:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate receipt field")
+            result[key] = value
+        return result
+
+    pages: set[str] = set()
+    for filename in _ATTEMPT_RECEIPTS:
+        path = directory / filename
+        if not path.is_file():
+            continue
+        _inside_artifact_root(path, root)
+        try:
+            if path.stat().st_size > _MAX_ATTEMPT_RECEIPT_BYTES:
+                raise ValueError("oversized receipt")
+            raw = path.read_bytes()
+            if len(raw) > _MAX_ATTEMPT_RECEIPT_BYTES:
+                raise ValueError("oversized receipt")
+            payload = json.loads(raw, object_pairs_hook=unique_object)
+            if not isinstance(payload, dict):
+                raise TypeError("invalid receipt")
+            if filename == "sync_runner_receipt.json":
+                results = payload.get("results")
+                if not isinstance(results, list) or not results or any(not isinstance(item, dict) for item in results):
+                    raise ValueError("receipt does not scope one child page")
+                declared = [item.get("sheet_name") for item in results]
+            else:
+                required = payload.get("required_pages")
+                if not isinstance(required, list) or not required:
+                    raise ValueError("receipt does not scope one audited page")
+                declared = required
+            if any(not isinstance(page, str) or page not in CRITICAL_MARKET_PAGES for page in declared):
+                raise ValueError("receipt page is invalid")
+            pages.update(declared)
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            # Optional diagnostics are not a completion criterion. Malformed
+            # JSON supplies no page authority; current path/terminal evidence
+            # may still bind the attempt. Valid contrary claims remain in
+            # `pages` and are rejected by the scope comparison below.
+            continue
+    return pages
+
+
+def _validate_artifact_run_ids(paths: Sequence[Path], root: Path) -> None:
+    primary_ids, recovery_ids = set(), set()
+    for path in paths:
+        for part in (root.name, *path.relative_to(root).parts[:-1]):
+            primary = _PRIMARY_ARTIFACT_RE.fullmatch(part)
+            recovery = _RECOVERY_ARTIFACT_RE.fullmatch(part)
+            if primary:
+                primary_ids.add(primary.group(1))
+            if recovery:
+                recovery_ids.add(recovery.group(1))
+    if len(primary_ids | recovery_ids) > 1:
+        raise OSError("sync artifact source run IDs conflict")
+
+
+def _recovery_attempt_scope(path: Path, matches: Sequence[re.Match],
+                            family_pages: dict[Path, str], required_pages: Sequence[str], root: Path) -> str | None:
+    family = _attempt_family(path, root)
+    artifact = _RECOVERY_ARTIFACT_RE.fullmatch(family.name)
+    group_page = _RECOVERY_GROUP_PAGES.get(family.name)
+    has_receipt = any((directory / name).is_file()
+                      for directory in {family, path.parent} for name in _ATTEMPT_RECEIPTS)
+    scoped_group = group_page and (
+        tuple(required_pages) == (group_page,)
+        or family.parent.name == "inline-recovery-evidence"
+        or family.parent.name == "zz-recovery"
+    )
+    if not (artifact or family.name == "zz-recovery" or scoped_group or has_receipt
+            or _CYCLE_DIRECTORY_RE.fullmatch(root.name)):
+        return None  # An unrelated legacy primary layout is not a recovery.
+    candidates = set()
+    if artifact:
+        mapped_page = _RECOVERY_GROUP_PAGES.get(artifact.group(2))
+        if mapped_page:
+            candidates.add(mapped_page)
+    if scoped_group:
+        candidates.add(group_page)
+    if family in family_pages:
+        candidates.add(family_pages[family])
+    candidates.update(_attempt_receipt_pages(path.parent, root))
+    # A flattened single-artifact download can establish its own scope from
+    # its cycle-one log. No verdict from another artifact is consulted.
+    candidates.update(match.group("page") for match in matches)
+    if not candidates and family != path.parent:
+        # Consult older files only when the current attempt cannot bind
+        # itself, and only within this audit's own artifact root.
+        candidates.update(_attempt_receipt_pages(family, root))
+        base_log = family / "sync_execution.log"
+        if base_log.is_file():
+            _inside_artifact_root(base_log, root)
+            candidates.update(match.group("page") for line in base_log.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+                if (match := _PAGE_VERDICT_RE.search(line)))
+    if len(candidates) != 1 or not candidates <= set(CRITICAL_MARKET_PAGES):
+        raise OSError("recovery attempt page scope is unavailable or conflicting")
+    page = next(iter(candidates))
+    family_pages[family] = page
+    return page
+
+
+def _read_logs(paths: Iterable[Path], *, root: Path, required_pages: Sequence[str] = CRITICAL_MARKET_PAGES
+               ) -> tuple[list[PageVerdict], int, dict]:
     verdicts: list[PageVerdict] = []
     force_lines = 0
     # v1.1.1: completeness evidence follows the same last-attempt-wins
@@ -210,10 +352,15 @@ def _read_logs(paths: Iterable[Path]) -> tuple[list[PageVerdict], int, dict]:
     # a clean recovery verdict must therefore clear an earlier attempt's
     # TIME-BUDGET/FLOOR-MERGE evidence instead of inheriting it.
     fetch_evidence: dict[str, dict] = {}
+    family_pages: dict[Path, str] = {}
     for path in paths:
         pending_evidence: dict[str, dict] = {}
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line_number, line in enumerate(text.splitlines(), start=1):
+        _inside_artifact_root(path, root)
+        text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        lines = text.splitlines()
+        matches = [match for line in lines if (match := _PAGE_VERDICT_RE.search(line))]
+        expected_page = _recovery_attempt_scope(path, matches, family_pages, required_pages, root)
+        for line_number, line in enumerate(lines, start=1):
             if _FORCE_REFETCH_RE.search(line):
                 force_lines += 1
             tb = _TIME_BUDGET_RE.search(line)
@@ -271,6 +418,22 @@ def _read_logs(paths: Iterable[Path]) -> tuple[list[PageVerdict], int, dict]:
                 # the original leg. Absence of these warnings means only
                 # "not demonstrably incomplete", matching the gate's scope.
                 fetch_evidence.pop(page, None)
+        if expected_page is not None and not matches:
+            # Positive attempt evidence without a terminal verdict is unknown,
+            # even if the previous cycle passed or its JSON says success.
+            # This diagnostic replaces prior coverage as well as its verdict.
+            evidence_source = path
+            if not path.is_file():
+                evidence_source = next((path.parent / name for name in _ATTEMPT_RECEIPTS
+                                        if (path.parent / name).is_file()), path)
+            line = max(1, len(text.splitlines()))
+            verdicts.append(PageVerdict(expected_page, "unverified_attempt", 0, str(evidence_source), line))
+            fetch_evidence[expected_page] = {
+                "page": expected_page, "source": str(evidence_source), "verdict_line": line,
+                "coverage_source": "recovery_attempt", "coverage_unknown": True,
+                "attempt_verdict_missing": True,
+                "attempt_log_missing": not path.is_file(),
+            }
     return verdicts, force_lines, fetch_evidence
 
 
@@ -286,7 +449,8 @@ def audit_artifacts(
     if not logs:
         raise OSError(f"no sync log files found below: {root}")
 
-    parsed, force_lines, fetch_evidence = _read_logs(logs)
+    _validate_artifact_run_ids(logs, root)
+    parsed, force_lines, fetch_evidence = _read_logs(logs, root=root, required_pages=required_pages)
     required = tuple(required_pages)
     latest_by_page: dict[str, PageVerdict] = {}
     for verdict in parsed:
@@ -345,7 +509,7 @@ def audit_artifacts(
         missing_pages=missing,
         failed_pages=failed,
         force_refetch_evidence_lines=force_lines,
-        log_files=tuple(str(path) for path in logs),
+        log_files=tuple(str(path) for path in logs if path.is_file()),
         verdicts=tuple(latest_by_page[page] for page in required if page in latest_by_page),
         incomplete_pages=tuple(incomplete),
         fetch_evidence=tuple(fetch_evidence[k] for k in sorted(fetch_evidence)),

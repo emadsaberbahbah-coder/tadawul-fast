@@ -555,7 +555,13 @@ from __future__ import annotations
 # (harness: corpus comparison against the v1.18.0 copy). ZERO functions
 # removed. Added: _feed_release_expiry (a lockstep copy shared verbatim with
 # send_digest and tfb_acceptance) and _feed_veto_label.
-__version__ = "1.18.1"
+# v1.18.2 (2026-10-17) — receipt read failure is not legacy receipt absence.
+# WHY: read_pages_live replaced a failed _Status read with [], erasing any
+# final-feed veto before the brief could render and email an executable plan.
+# A real _Status read exception now stops generation before HTML/PDF/SMTP;
+# the error names only its type. Successful empty/legacy reads keep the same
+# model and veto priorities. No financial math or investment policy changes.
+__version__ = "1.18.2"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -767,6 +773,10 @@ def _page_read_row_bound() -> int:
     return max(1000, min(v, 100000))
 
 
+class DecisionReceiptReadError(RuntimeError):
+    """The final publication receipt could not be read, rather than being absent."""
+
+
 def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[List[Any]]]:
     from integrations.google_sheets_service import read_range  # local import: CI only
 
@@ -775,7 +785,12 @@ def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[Lis
     for p in pages:
         try:
             out[p] = read_range(spreadsheet_id, f"{p}!{_bound}") or []
-        except Exception as exc:  # one bad page must not kill the brief
+        except Exception as exc:
+            if p == PAGE_STATUS:
+                # Never turn an unavailable veto source into a valid legacy
+                # blank. The original exception can contain private API data.
+                raise DecisionReceiptReadError(type(exc).__name__) from None
+            # Optional page reads retain the existing fail-soft behavior.
             sys.stderr.write(f"[brief] WARN could not read {p}: {exc}\n")
             out[p] = []
     return out
@@ -3486,7 +3501,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not sid:
             sys.stderr.write("[brief] ERROR: DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID not set\n")
             return 2
-        pages = read_pages_live(sid, ALL_PAGES)
+        try:
+            pages = read_pages_live(sid, ALL_PAGES)
+        except DecisionReceiptReadError as exc:
+            sys.stderr.write(f"[brief] ERROR: {PAGE_STATUS} final decision receipt "
+                             f"could not be read ({exc}); no brief generated or sent.\n")
+            return 2
 
     when = _dt.datetime.now()
     model = build_model(pages)
