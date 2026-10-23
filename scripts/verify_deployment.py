@@ -199,7 +199,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.3',
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.5',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
@@ -208,7 +208,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.157.1", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.157.2", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
