@@ -181,3 +181,17 @@ def test_collect_excludes_unsolicited_legacy_response_before_row_formation(monke
     assert formed == ["ROP.SW"]
     report = json.loads(path.read_text())
     assert report["response_validation"]["unexpected_count"] == 1 and not report["complete"]
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+def test_legacy_priority_is_removed_before_rotation_capacity_is_sized(monkeypatch, eligible):
+    from tests.test_news_adaptive_universe import context, args
+    monkeypatch.setattr(archive, "_utc_now", lambda: NOW)
+    monkeypatch.setenv("NEWS_ARCHIVE_UNIVERSE", "ROG.SW,BASE.US")
+    source = context()
+    if eligible:
+        source["eligible"] = list(source["pool"])
+    universe, items, evidence = archive._select_news_universe(args(max_symbols=6), source, "2026-10-23")
+    assert len(universe) == len(items) == 6 and "ROG.SW" not in universe
+    assert evidence["rotation_count"] == 3 and evidence["lifecycle_excluded_count"] == 1
+    assert evidence["discovery_complete"]

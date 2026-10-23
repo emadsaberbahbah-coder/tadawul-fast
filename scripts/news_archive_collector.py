@@ -704,19 +704,24 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
     rotation_count = 0
     eligible_rotation_count = 0
     broad_rotation_count = 0
+    legacy_priority = []
     if cli:
         mode, proposed = "cli", cli
     elif adaptive:
         mode = "adaptive"
         priority = _unique_symbols((context or {}).get("portfolio_membership", []) +
                                    (context or {}).get("research", []) + baseline)
-        eligible_remaining = [symbol for symbol in eligible if symbol not in priority and symbol in known]
+        legacy_priority = [symbol for symbol in priority if symbol in lifecycle]
+        priority = [symbol for symbol in priority if symbol not in lifecycle]
+        eligible_remaining = [symbol for symbol in eligible
+                              if symbol not in priority and symbol in known and symbol not in lifecycle]
         room = max(0, budget - len(priority))
         start = slot_ordinal * max(1, room) % max(1, len(eligible_remaining))
         rotation = (eligible_remaining[start:] + eligible_remaining[:start])[:room]
         eligible_rotation_count = len(rotation)
         spare = room - len(rotation)
-        remaining = [symbol for symbol in pool if symbol not in priority and symbol not in rotation and symbol in known]
+        remaining = [symbol for symbol in pool if symbol not in priority and symbol not in rotation
+                     and symbol in known and symbol not in lifecycle]
         broad_start = slot_ordinal * max(1, spare) % max(1, len(remaining))
         broad = (remaining[broad_start:] + remaining[:broad_start])[:spare]
         rotation += broad
@@ -725,10 +730,10 @@ def _select_news_universe(args: argparse.Namespace, context: Optional[Dict[str, 
         proposed = priority + rotation
     else:
         mode, proposed = ("env" if _env_csv("NEWS_ARCHIVE_UNIVERSE") else "static"), baseline
-    requested_before_lifecycle = len(proposed)
+    requested_before_lifecycle = len(proposed) + len(legacy_priority)
     excluded = {record["symbol"]: record for record in
                 (context or {}).get("lifecycle_exclusions", [])}
-    for symbol in proposed:
+    for symbol in proposed + legacy_priority:
         if symbol in lifecycle and symbol not in excluded:
             excluded[symbol] = lifecycle[symbol]
     proposed = [symbol for symbol in proposed if symbol not in lifecycle]
