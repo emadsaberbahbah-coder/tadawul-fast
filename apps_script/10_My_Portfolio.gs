@@ -1,7 +1,20 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.13
+ * Version: 1.5.14
+ *
+ * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
+ * ---------------------------------------------------------------
+ * WHY: _myPortfolioLedgerMap_ skipped only Status 'inactive', so Sold and
+ * Closed lots in _Portfolio_CostBasis were aggregated as active. Active 10
+ * @ 100 (fee 5) + Sold 10 @ 80 read as qty 20 / cost 90.5 instead of qty
+ * 10 / cost 100.5. The Python ledger readers (run_dashboard_sync
+ * _read_cost_basis, audit_full_refresh_coverage ledger_symbols) exclude
+ * {inactive, closed, sold}.
+ * WHAT: the same set is excluded here (trimmed, case-insensitive). Blank or
+ * absent Status still counts as active, exactly as ledger_symbols and the
+ * 21 dropdown default treat it. Functions changed: 1
+ * (_myPortfolioLedgerMap_). Added/removed: 0. Rollback: v1.5.13.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
  *                        only when PD_SOURCE_RECEIPT is observe/enforce;
@@ -2048,8 +2061,9 @@ function _myPortfolioCostBasisSymbols_() {
  *              14 v2.5.0's pfReadCostBasisV2_, so the feeders can never
  *              oscillate the Avg Cost cell between runs;
  *   buyDate  = earliest lot date.
- * A lot is INACTIVE only when Status trims to 'inactive' (case-
- * insensitive); blank status counts as active, matching the 21 dropdown
+ * A lot is EXCLUDED when Status trims to 'inactive', 'closed' or 'sold'
+ * (case-insensitive; v1.5.14 added closed/sold to mirror the Python
+ * ledger readers); blank status counts as active, matching the 21 dropdown
  * default and the diagnostics lot counting. Returns the {SYM: {qty,
  * buyPrice, buyDate, lots}} map (possibly empty — v2 with zero active
  * lots), keyed by trimmed upper-cased symbol, the same {qty, buyPrice}
@@ -2099,7 +2113,8 @@ function _myPortfolioLedgerMap_() {
           ? String(row[col.status - 1] == null ? '' : row[col.status - 1])
               .replace(/^\s+|\s+$/g, '').toLowerCase()
           : '';
-      if (status === 'inactive') { continue; }
+      if (status === 'inactive' || status === 'closed' ||
+          status === 'sold') { continue; }        // v1.5.14
       if (!Object.prototype.hasOwnProperty.call(map, sym)) {
         map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0 };
         wSum[sym] = 0;
@@ -2552,7 +2567,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.13';
+var PD_VERSION = '1.5.14';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';

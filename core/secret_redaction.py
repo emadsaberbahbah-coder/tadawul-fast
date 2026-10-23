@@ -24,6 +24,7 @@ _SCALAR_ENV_NAMES = (
     "X_APP_TOKEN", "AUTH_TOKEN", "TFB_AUTH_TOKEN", "TOKEN", "TFB_TOKEN",
     "TFB_BEARER_TOKEN", "BEARER_TOKEN", "TFB_API_KEY", "X_API_KEY",
     "API_KEY", "API_TOKEN", "ACCESS_TOKEN", "CLIENT_SECRET",
+    "TFB_PLATFORM_SOURCE_READ_KEY",
     "EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN", "EODHD_KEY", "TFB_EODHD_API_KEY",
     "FINNHUB_API_KEY", "FINNHUB_TOKEN", "FMP_API_KEY",
     "ALPHA_VANTAGE_API_KEY", "ALPHAVANTAGE_API_KEY", "TWELVEDATA_API_KEY", "TWELVE_DATA_API_KEY",
@@ -54,7 +55,7 @@ _CREDENTIAL_KEYS = frozenset({
     "credentials", "client_secret", "private_key", "encryption_key",
     "authorization", "proxy_authorization", "bearer", "x_api_key",
     "x_app_token", "x_auth_token", "cookie", "set_cookie",
-    "session_token",
+    "session_token", "x_tfb_source_read_key", "tfb_platform_source_read_key",
 } | {name.lower() for name in _SCALAR_ENV_NAMES} | {
     name.lower() for name in (*_LIST_ENV_NAMES, *_JSON_ENV_NAMES, *_BASE64_JSON_ENV_NAMES)
 })
@@ -340,3 +341,4 @@ def install_redaction_on_handlers(*loggers: logging.Logger | str, secret_values:
                 handler.setFormatter(RedactingFormatter(current, secret_values=explicit))
                 wrapped += 1
     return wrapped
+

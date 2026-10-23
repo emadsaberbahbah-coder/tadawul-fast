@@ -2,6 +2,120 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.33 (2026-10-24) -- STACK #804 INTEGRATION
+# WHY: preserve both pending reliability gates and all newer main regressions.
+# Both historical version lines are retained below; no required lane removed.
+#
+# Revision 1 (2026-10-23): block regressions in expired-cache reclamation,
+# news acquisition evidence and native decision-chain receipt completion.
+# VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
+#
+# v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
+# f7_settle tag discloses pass 1 -> final; TFB_SCORING_SETTLE_PAGES scopes
+# enforce by the symbol's inferred market page; the settle trajectory is
+# v5.156.0's) next to tests/test_de_f7_scoring_settle.py in the lean model
+# lane and the heavy scoring-settle step. Offline; real engine module,
+# fixtures and orchestrator. Its base identity comparisons and golden
+# negative need TFB_F7V2_BASE and skip in CI.
+#
+# VERSION 1.1.31 (2026-10-22) -- LEARNING-METRIC DEFINITIONS
+#
+# v1.1.31: run tests/test_learning_metric_fixes.py (track_performance v6.46.0:
+# direction-aware win/loss, decided-only hit rate and claimed rate,
+# per-horizon Sharpe/Sortino; carried from PR #809) in the blocking lean lane
+# next to the other tracker suites; and in the model lane
+# tests/test_pf_weight_value_complete.py (data_engine_v2 v5.156.0: unpriced
+# holdings blank the book's weights, GBp/ZAc/ILa FX keys never overwrite the
+# major rate; portfolio_actions v1.16.1: EXIT never sells more whole shares
+# than held). Offline fakes only.
+#
+# VERSION 1.1.30 (2026-10-22) -- DT10 BULK RENDER FORMATTING
+#
+# v1.1.30: run tests/js/dt10_bulk_format.test.js in the blocking lean lane's
+# native Apps Script step. WHY (21 Oct): the Top-10 refresh after the first
+# decision-feed release hit the Apps Script 6-minute limit while painting
+# formats cell by cell; B2 stayed 'running' and the next scheduled release
+# check withdrew the release. 16_Decision_Top10.gs v1.13.11 writes the same
+# formats in bulk. The harness runs the reviewed v1.13.10 file (rebuilt
+# from the delivered one by reversing only the enumerated v1.13.11 edits,
+# SHA-256 pinned) as its oracle against a cell-model sheet and requires an
+# identical painted cockpit with bounded call counts. Offline fakes only.
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.29 (2026-10-21) -- SYNC TRUTH AND SHEETS TRANSPORT
+#
+# v1.1.29 (1.1.28 is PR #809): run in the blocking lean lane
+# tests/test_sync_klg_read_retry.py (run_dashboard_sync v6.70.1 KLG-READ, from
+# PR #809), tests/test_sync_status_stamp_retry.py (run_dashboard_sync v6.70.2
+# STAMP-RETRY), tests/test_validate_dashboard_decision_surface.py
+# (validate_dashboard v1.3.1 in-progress cockpit re-read) and
+# tests/test_symbols_reader_thread_local.py (core/symbols_reader v8.7.0
+# per-thread Sheets service); and in the blocking contract lane
+# tests/test_auth_wall_downstream_errors.py (main.py v8.14.6: the auth wall
+# answers 401 only for requests it refuses). Also from PR #809: the model
+# lane runs tests/test_pf_weight_subunit_fx.py (data_engine_v2 v5.155.0) and
+# the Apps Script lane runs tests/js/gas_ledger_fx_failed_state.test.js
+# (10_My_Portfolio v1.5.14, 16_Decision_Top10 v1.13.10). Offline fakes only.
+#
+# VERSION 1.1.27 (2026-10-20) -- UNIVERSE MAINTENANCE
+#
+# v1.1.27: run tests/test_universe_maintenance.py (new
+# scripts/universe_maintenance.py v1.0.0 + universe_maintenance.yml v1.0.0:
+# weekly US-first additions to Global_Markets, red-row watch and confirmed
+# delisting retirements through _Retired_Symbols; default off) in the
+# blocking lean lane next to the renewal suite. Offline fakes only.
+#
+# v1.1.26 (2026-10-20) -- VERIFIED NAME LABEL RENEWAL
+#
+# v1.1.26: run tests/test_renew_verified_name_labels.py (new
+# scripts/renew_verified_name_labels.py v1.0.0: re-captures each reviewed
+# caption's public sources, re-checks it and re-stamps the seven-day review;
+# held bindings stay byte-identical) in the blocking lean lane next to
+# tests/test_verified_name_labels.py. Offline, urllib only.
+#
+# v1.1.25 (2026-10-19) -- HONG KONG REPORTING-CURRENCY IDENTITY BAND
+#
+# v1.1.25: run tests/test_sync_hk_reporting_fx.py (run_dashboard_sync v6.70.0:
+# the identity checks accept the HKD-price / CNY-or-USD-EPS convention on .HK
+# listings, so healthy H-share rows stop being quarantined into blank stubs
+# that make the coverage audit warn and refuse every decision-feed release) in
+# the blocking lean lane next to the other sync suites.
+#
+# VERSION 1.1.24 (2026-10-19) -- ENRICHED BRIDGE BINDING + GATED FALLBACK
+#
+# v1.1.24: run tests/test_enriched_bridge_binding.py (routes/enriched_quote
+# v8.6.0: the bridge binds the analysis implementation's own signature, so
+# /v1/enriched/sheet-rows no longer serves My_Portfolio from the ungated
+# engine-direct path; the fallback itself now crosses the engine publication
+# boundary) in the schema-alignment step, next to the other route suites.
+#
+# VERSION 1.1.23 (2026-10-19) -- CONVICTION-WEIGHTED SEAT SIZING
+#
+# v1.1.23: run tests/test_ob_conviction_sizing.py (opportunity_builder
+# v1.27.0: TFB_OPP_SIZING_MODE=conviction, default cap byte-identical; the
+# explicit absolute cash floor binds the sizing budget) in the blocking lean
+# lane next to the other builder suites.
+#
+# VERSION 1.1.22 (2026-10-19) -- SCHEDULED DECISION-FEED RELEASE ATTEMPTS
+#
+# v1.1.22: run tests/test_release_auto_source.py (release_decision_feed
+# v1.2.0: --source-run-id auto discovers the cohort from the bounded _Status
+# block; release_decision_feed.yml v1.1.0 runs on a schedule after the cockpit
+# render slots) in the blocking lean lane, next to the existing P0-1 harness.
+#
+# VERSION 1.1.21 (2026-10-19) -- BACKUP RESUME + VENUE CALENDAR COVERAGE
+#
+# v1.1.21: run tests/test_backup_upload_resume.py (backup_workbook v1.5.1:
+# the Drive/GCS resumable upload resumes after a transport fault instead of
+# losing the day's backup, as run #102 did) in the blocking lean lane, where
+# it exercises the helper's no-`requests` fallback tuple, and
+# tests/test_venue_calendar_ext.py (opportunity_builder v1.26.2: the
+# venue-calendar lookup behind executable quote freshness covers the live
+# Global_Markets venues; TFB_TICKET_VENUE_CAL_EXT=0 restores the 16-venue
+# lookup) in the blocking data-engine job, the one lane that installs the
+# pinned exchange_calendars and pandas it needs.
+#
+# Pending branch history (version numbers preceded parallel main changes):
 # VERSION 1.1.24 (2026-10-17) -- GREEN-RUN OUTPUT INTEGRITY
 # WHY: failed receipt/header reads, invalid backup bytes and partial SMTP
 # acceptance must not masquerade as completed output. Run the offline I/O
@@ -421,6 +535,7 @@ on:
       - 'config/approved_universe_scope_v1.json'
       - 'config/render_env_expected.json'
       - 'docs/render_env_contract.md'
+      - 'data/reviewed_instrument_classes.json'
       - 'config.py'
       - 'env.py'
       - 'core/**'
@@ -592,6 +707,10 @@ jobs:
             tests/test_pf_minor_unit_ccy_guard.py \
             tests/test_scheduled_portfolio_refresh.py \
             tests/test_news_intelligence_contracts.py \
+            tests/test_news_acquisition_evidence.py \
+            tests/test_news_adaptive_universe.py \
+            tests/test_news_lifecycle.py \
+            tests/test_engine_cache_expiry.py \
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
@@ -613,6 +732,11 @@ jobs:
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \
             tests/test_sync_sheet_presentation.py \
+            tests/test_sync_hk_reporting_fx.py \
+            tests/test_sync_klg_read_retry.py \
+            tests/test_sync_status_stamp_retry.py \
+            tests/test_validate_dashboard_decision_surface.py \
+            tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
@@ -660,6 +784,8 @@ jobs:
             tests/test_de_f7_settle_unresolved.py \
             tests/test_sync_rank_overall_page.py \
             tests/test_verified_name_labels.py \
+            tests/test_renew_verified_name_labels.py \
+            tests/test_universe_maintenance.py \
             tests/test_sheet_payload_digest.py \
             tests/test_ob_settle_unresolved.py \
             tests/test_workflow_flag_mappings.py \
@@ -679,10 +805,15 @@ jobs:
             tests/test_track_flags_mapped.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
+            tests/test_learning_metric_fixes.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
-            tests/test_ycp_loopguard_b6.py $EXTRA
+            tests/test_ycp_loopguard_b6.py \
+            tests/test_backup_upload_resume.py \
+            tests/test_backup_validation_resume_integration.py \
+            tests/test_release_auto_source.py \
+            tests/test_ob_conviction_sizing.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
@@ -710,7 +841,10 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
-            tests/test_de_f7_intrinsic_display_basis.py
+            tests/test_de_f7_settle_v2.py \
+            tests/test_de_f7_intrinsic_display_basis.py \
+            tests/test_pf_weight_subunit_fx.py \
+            tests/test_pf_weight_value_complete.py
 
       - name: 🛡️ Run isolated protective legacy harnesses
         run: |
@@ -738,6 +872,9 @@ jobs:
           node tests/test_dt10_calendar_completeness.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
+          node tests/js/gas_ledger_fx_failed_state.test.js
+          node tests/js/dt10_bulk_format.test.js
+          node tests/js/decision_chain.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
@@ -795,11 +932,14 @@ jobs:
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
+            tests/test_enriched_bridge_binding.py \
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \
+            tests/test_reviewed_instrument_classes.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \
             tests/test_auth_wall_scope_path.py \
+            tests/test_auth_wall_downstream_errors.py \
             tests/test_route_mount_compat.py
           echo "::endgroup::"
 
@@ -839,6 +979,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
+            tests/test_de_f7_settle_v2.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
 
@@ -859,11 +1000,18 @@ jobs:
       - name: ⚙️ Run outcome evidence with production calendars
         run: python -m pytest -q tests/test_outcome_price_evidence.py
 
+      # v1.1.21: opportunity_builder v1.26.2 venue-calendar coverage. Needs the
+      # pinned exchange_calendars + pandas, which only this job installs (the
+      # lean lane would importorskip the whole module and prove nothing).
+      - name: 🗓️ Run venue calendar coverage regressions (OB v1.26.2)
+        run: python -m pytest -q tests/test_venue_calendar_ext.py
+
       - name: 📐 Run supplier and scoring margin unit regressions
         run: |
           python -m pytest -q \
             tests/test_margin_scoring_unit_contract.py \
-            tests/test_margin_producer_unit_receipts.py
+            tests/test_margin_producer_unit_receipts.py \
+            tests/test_eps_basis_contract.py
 
       - name: 🧪 Work-brief publication, policy and workbook regressions
         # Full production dependencies exercise the real engine/provider
