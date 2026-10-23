@@ -682,6 +682,7 @@ jobs:
             tests/test_news_intelligence_contracts.py \
             tests/test_news_acquisition_evidence.py \
             tests/test_news_adaptive_universe.py \
+            tests/test_news_lifecycle.py \
             tests/test_engine_cache_expiry.py \
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \

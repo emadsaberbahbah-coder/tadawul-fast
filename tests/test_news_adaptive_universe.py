@@ -329,7 +329,8 @@ def test_adoption_verification_is_main_only_path_scoped_and_uses_existing_writer
     workflow = yaml.load((Path(__file__).parents[1] / ".github/workflows/news_archive.yml").read_text(),
                          Loader=yaml.BaseLoader)
     assert workflow["on"]["push"] == {
-        "branches": ["main"], "paths": ["core/news_intelligence.py", "scripts/news_archive_collector.py",
+        "branches": ["main"], "paths": ["core/news_intelligence.py", "core/news_identity_lifecycle.py",
+                                        "data/verified_name_labels.json", "scripts/news_archive_collector.py",
                                         ".github/workflows/news_archive.yml"]}
     assert list(workflow["jobs"]) == ["collect"]
     assert workflow["concurrency"]["cancel-in-progress"] == "false"
