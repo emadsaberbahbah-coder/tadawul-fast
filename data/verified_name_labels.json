@@ -2656,6 +2656,44 @@
     },
     {
       "page": "Mutual_Funds",
+      "symbol": "SPLG.US",
+      "name": "SPDR Portfolio S&P 500 ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Legacy SPLG ticker changed to SPYM effective before the open on 2025-10-31; the same SEC series/class is current under SPYM. Historical caption only; do not auto-substitute the successor or splice observations.",
+      "identifiers": {
+        "series_id": "S000006983",
+        "class_id": "C000019036",
+        "exact_exchange_code": "SPLG",
+        "security_class": "historical ticker for SPDR Portfolio S&P 500 ETF",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2025-10-31T00:00:00+00:00",
+        "successor_symbol": "SPYM.US",
+        "lifecycle_time_precision": "date_start_bound_not_observed_event_time"
+      },
+      "reviewed_at_utc": "2026-10-24T05:08:00+00:00",
+      "expires_at_utc": "2026-10-31T05:08:00+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1064642/000119312525245719/d96457d497k.htm",
+          "sha256": "d94a399eb43bf97479dbb8455ccdb18644abe74c1e439be58e19f863ac9110de",
+          "captured_at_utc": "2026-10-24T05:07:14.901863+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1064642/000119312526155136/0001193125-26-155136-index.htm",
+          "sha256": "79da0ed8d1a9e1d75830e3023ec1ca5b55e183dc4fc2b96b918dcb3555c47c5c",
+          "captured_at_utc": "2026-10-24T05:07:20.393907+00:00"
+        }
+      ],
+      "review_receipt_sha256": "1267c87446d9208b1630fc1e33c1e1da61a77ecb7e20bd402872b2366dce438f"
+    },
+    {
+      "page": "Mutual_Funds",
       "symbol": "VFLQ.US",
       "name": "Vanguard U.S. Liquidity Factor ETF",
       "native_metadata": {
@@ -2665,39 +2703,32 @@
         "Country": "USA"
       },
       "requires_quarantine": false,
-      "state": "issuer_confirmed_completely_liquidated_2022-11-28",
+      "state": "Terminated exact symbol: issuer announced delisting in November 2022 and confirms complete liquidation on 2022-11-28. Historical caption only; there is no successor mapping.",
       "identifiers": {
         "cusip": "921935300",
         "series_id": "S000061300",
         "class_id": "C000198464",
         "exact_exchange_code": "VFLQ",
-        "security_class": "ETF shares identified by exact SEC series/class and exchange ticker"
+        "security_class": "historical ETF shares identified by exact SEC series/class and exchange ticker",
+        "news_lifecycle": "TERMINATED",
+        "lifecycle_effective_utc": "2022-11-28T00:00:00+00:00",
+        "lifecycle_time_precision": "date_start_bound_not_observed_event_time"
       },
-      "reviewed_at_utc": "2026-10-12T12:31:23.038937+00:00",
-      "expires_at_utc": "2026-10-19T12:31:23.038937+00:00",
+      "reviewed_at_utc": "2026-10-24T05:08:00+00:00",
+      "expires_at_utc": "2026-10-31T05:08:00+00:00",
       "sources": [
         {
-          "url": "https://personal.vanguard.com/pdf/form-8937-us-liquidity-factor-etf.pdf",
-          "sha256": "f57e7ff1f470488bf1874a14571c5949a1e3bc02f3f3853993bb30dd14998eae",
-          "captured_at_utc": "2026-10-12T12:18:51.078805+00:00"
+          "url": "https://corporate.vanguard.com/content/corporatesite/us/en/corp/who-we-are/pressroom/press-release-vanguard-to-liquidate-US-liquidity-factor-ETF-092622.html",
+          "sha256": "d9b084d6a4b49316c8e7c570887b59b03b84b93c536b66bb2eacd551b8d34b1c",
+          "captured_at_utc": "2026-10-24T05:07:26.133614+00:00"
         },
         {
-          "url": "https://www.sec.gov/Archives/edgar/data/105563/000168386322005251/0001683863-22-005251-index.html",
-          "sha256": "b32e72f65bc2c913d49396884f3b0be9af5f1724b0bd19082b5bea83c0afacbd",
-          "captured_at_utc": "2026-10-12T12:17:34.646512+00:00"
-        },
-        {
-          "url": "https://www.sec.gov/Archives/edgar/data/105563/000110465925016068/0001104659-25-016068-index.htm",
-          "sha256": "4e800ce16cf3d07851c49c6c7a868560b8f80a168fab229a0b68b0144a774748",
-          "captured_at_utc": "2026-10-12T12:17:35.121733+00:00"
-        },
-        {
-          "url": "https://www.sec.gov/files/company_tickers_mf.json",
-          "sha256": "c8dc4873f29fa71907379aebec92d57a823df532e95d62ac76751ed82ce78203",
-          "captured_at_utc": "2026-10-12T12:11:28.765601+00:00"
+          "url": "https://investor.vanguard.com/content/dam/retail/us/en/pdfs/taxes/form8937-us-liquidity-factor-etf-112022.pdf",
+          "sha256": "a3fd5c8ab5462b9403612e8b6989363e47ece2b910fd3f2f4ceca41691db7073",
+          "captured_at_utc": "2026-10-24T05:07:31.625721+00:00"
         }
       ],
-      "review_receipt_sha256": "dc0d3af55bc2c7ed0004154ce807c13a61bd4d3bd227071baa5ce00fb51cc0d6"
+      "review_receipt_sha256": "6ede1959cffb1bbb7b33a12e17710c8b9b3d4882b8bba6c1df27ecdfd8e76ad4"
     },
     {
       "page": "Global_Markets",
@@ -5233,6 +5264,79 @@
         }
       ],
       "review_receipt_sha256": "4f884e0c51b91cececae191e574c484718820298e1d48ac7975629d88695394f"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "ROG.SW",
+      "name": "Roche Holding Ltd",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "SIX Swiss",
+        "Currency": "CHF",
+        "Country": "Switzerland"
+      },
+      "requires_quarantine": false,
+      "state": "Legacy Genussscheine ROG: final trading 2026-03-16; 1:1 exchange for ROP participation certificates 2026-03-17; successor identity/quote must be acquired independently.",
+      "identifiers": {
+        "exact_exchange_code": "ROG",
+        "security_class": "historical issuer caption; not current tradability certification",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2026-03-17T08:00:00+00:00",
+        "successor_symbol": "ROP.SW",
+        "successor_isin": "CH1499059983"
+      },
+      "reviewed_at_utc": "2026-10-23T05:05:45.876495+00:00",
+      "expires_at_utc": "2026-10-30T05:05:45.876495+00:00",
+      "sources": [
+        {
+          "url": "https://www.roche.com/media/releases/med-cor-2025-07-22",
+          "sha256": "4dc28ba54050272e53491342fcb71373122a051a28884fe0c891d06fb6f7879c",
+          "captured_at_utc": "2026-10-23T05:03:56.195869+00:00"
+        },
+        {
+          "url": "https://www.roche.com/investors/updates/inv-update-2026-03-16",
+          "sha256": "7cbe183e96df7c7f984f451856c2770c867c7a79fbdcebe2e6eb9de0954c8401",
+          "captured_at_utc": "2026-10-23T05:02:27.465747+00:00"
+        }
+      ],
+      "review_receipt_sha256": "22011f53f733588d4dc22e674829002250e5bea5323551dff14126fc10622abf"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "GXTG.US",
+      "name": "Global X Thematic Growth ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Legacy GXTG renamed GXDW with investment objective/index change effective 2025-04-01. Do not splice strategy outcomes or auto-substitute the successor.",
+      "identifiers": {
+        "exact_exchange_code": "GXTG",
+        "security_class": "historical issuer caption; not current tradability certification",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2025-04-01T00:00:00+00:00",
+        "successor_symbol": "GXDW.US",
+        "cusip": "37954Y418",
+        "lifecycle_time_precision": "date_start_bound_not_observed_event_time"
+      },
+      "reviewed_at_utc": "2026-10-23T05:05:45.876495+00:00",
+      "expires_at_utc": "2026-10-30T05:05:45.876495+00:00",
+      "sources": [
+        {
+          "url": "https://www.globalxetfs.com/articles/product-research/why-multi-theme-investing-why-gxdw",
+          "sha256": "1bfaae5e33dd8c0c25923eb94d222dd846acd4c6c0350c4359b5d12eb9025caf",
+          "captured_at_utc": "2026-10-23T05:03:52.801546+00:00"
+        },
+        {
+          "url": "https://www.globalxetfs.com/funds/gxdw/",
+          "sha256": "c90165390b9929fd5d20ab4ac7cbfe15e66df3729b6ade8cc96758b0db9e44c6",
+          "captured_at_utc": "2026-10-23T05:02:33.993713+00:00"
+        }
+      ],
+      "review_receipt_sha256": "cfea79927869900b11494e8783315a2a3e3fc7b44daa0e225d5caadc7cc72690"
     }
   ]
 }

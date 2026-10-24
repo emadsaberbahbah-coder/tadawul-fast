@@ -53,7 +53,7 @@ nz = importlib.import_module("core.symbols.normalize")
 
 ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 DE_BASE = os.environ.get("TFB_TEST_DE_BASE", "")
-BASE_VERSION = "5.157.0"   # merge note 2026-10-22 (#778, second): main #817 is the new base (was 5.156.0, #816; 5.155.0, #810)
+BASE_VERSION = "5.157.3"   # merge note 2026-10-24 (#778): main #821-#829 is the new base (was 5.157.0, #817; 5.156.0, #816; 5.155.0, #810)
 ARMED = ("1", "true", "yes", "on", " ON ", "True")
 OFF = (None, "", "0", "false", "off", "no", "observe", "enforce", "2")
 

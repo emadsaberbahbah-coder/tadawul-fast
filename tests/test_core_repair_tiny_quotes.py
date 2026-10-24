@@ -23,6 +23,7 @@ OTHER_COMMIT = "f" * 40
 # fail-closed fixes); still an in-place pin, compared with the source constant.
 # 2026-10-22 (second merge): renumbered 5.159.0 after main's #817 took 5.157.0
 # (F-7 v2) and open #818 claims 5.158.0; an in-place pin as above.
+# 2026-10-24: main moved to 5.157.3 (#821-#829); this branch keeps 5.159.0.
 ENGINE = "5.159.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.

@@ -417,6 +417,17 @@ def t4_enforce_basis_coupling(res, recs, exp):
     """Row 2's zero baseline must be on the SAME basis as row 2's model
     MAE: under enforce both come from the unit-corrected cohort."""
     mod = _mod()
+    # v6.48.0 enforce needs forecast provenance, not just a self-consistent
+    # old target tuple. Keep the legacy fixture unchanged for other tests;
+    # attest this positive-path copy using the prospective schema contract.
+    import copy
+    recs = copy.deepcopy(recs)
+    for record in recs:
+        if record.horizon.value in ("1W", "2W"):
+            record.notes = mod._TARGET_SCHEMA_TAG + json.dumps({
+                "version": 2, "horizon": record.horizon.value,
+                "roi_unit": "percent_points", "basis": "forecast_price",
+                "producer_version": mod.SCRIPT_VERSION}) + "]"
     sv_z, sv_u = os.environ.get(GATE), os.environ.get(UNIT_GATE)
     try:
         _env(GATE, "publish")

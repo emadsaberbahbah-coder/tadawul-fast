@@ -1298,11 +1298,18 @@ jobs:
             export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
           fi
           # Capture exit without tripping the default `-e` shell.
+          # Each leg owns only its scoped acquisition pages. Validating other
+          # writers or the asynchronous native cockpit here raced their writes
+          # and also suppressed the success()-guarded tracker. The final job
+          # retains one full contract + native check under the same write lease.
+          VALIDATE_PAGES="$(python scripts/workflow_validation_scope.py pages)"
+          read -r -a PAGE_ARGS <<< "$VALIDATE_PAGES"
           code=0
           python scripts/validate_dashboard.py \
             --sheet-id "$TARGET_SHEET_ID" \
+            --pages "${PAGE_ARGS[@]}" \
             --json-out validate_dashboard.json \
-            --write-sheet 1 || code=$?
+            --write-sheet 0 || code=$?
           echo "validate_exit=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" -ge 2 ]; then
             echo "::error::Dashboard validation failed (exit $code) — see report above / Dashboard_Audit tab."
@@ -1349,18 +1356,11 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
-          # (2026-09-22) P-158 TARGET-UNIT SENTRY — scripts/track_performance.py
-          # v6.39.0 (deployed 2026-09-21: [PERF-VERDICT v6.39.0] selftest=PASS 14/14).
-          # observe: criterion-4 row untouched, stored rows never rewritten; adds
-          # the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9 and
-          # ONE [PERF-UNIT v6.39.0] _Run_Log line per run (fraction/percent/
-          # unresolved counts). Explicit words only: off|observe|enforce.
-          # KILL-SWITCH: delete this line -> off (v6.39.0 default = legacy).
-          # Hardcoded here, not a repo Variable (S-1 lesson 2026-09-10: a Variable
-          # can be silently unset). This step runs in GitHub Actions, so a Render
-          # env var would never be seen. Enforce = separate sitting with the S-1
-          # criterion-4 boundary note.
-          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # v6.48.0: criterion4 uses canonical forecast provenance and pp.
+          # Unproven, ambiguous or duplicate targets cannot supply a sample.
+          # Historical target cells and S1 thresholds remain unchanged.
+          # Rollback: set both workflow lines to observe; legacy stays diagnostic.
+          TFB_PERF_TARGET_UNIT_SENTRY: "enforce"
           # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
           # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
           # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
@@ -1384,7 +1384,8 @@ jobs:
           # reruns use the same run ID. Canonical targets require price evidence.
           # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
           # Rollback: off/0; historical target values and publications stay.
-          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          # Prospective price-derived percentage points; explicit '0' rolls back.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
@@ -2156,11 +2157,28 @@ jobs:
         id: final_audit
         run: |
           set -euo pipefail
+          # The native cockpit is asynchronous and is not a matrix-leg output.
+          # Inspect its real grid only after all source writers/recovery finish.
+          # A failed or missing structural witness still reaches the finalizer's
+          # one downgrade writer; it must never leave an old executable feed.
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
+          fi
+          rm -f final_dashboard_validation.json
+          structure_code=0
+          python scripts/validate_dashboard.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --pages Market_Leaders Global_Markets Commodities_FX Mutual_Funds My_Portfolio Top_10_Investments \
+            --json-out final_dashboard_validation.json \
+            --write-sheet 1 || structure_code=$?
+          python scripts/workflow_validation_scope.py attest \
+            --report final_dashboard_validation.json --process-exit "$structure_code" || true
           code=0
           python scripts/finalize_decision_publication.py \
             --sheet-id "$TARGET_SHEET_ID" \
             --max-rows 20000 \
             --publish-blockers \
+            --decision-structure-report final_dashboard_validation.json \
             --json-out final_decision_publication.json || code=$?
           echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
           if [[ "$code" -ne 0 ]]; then
@@ -2186,13 +2204,17 @@ jobs:
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nNative installation and refresh are required before executable decisions.\n')
           PY
+          python scripts/render_audit_summary.py \
+            --final-report final_decision_publication.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload final publication evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: final-decision-publication-${{ github.run_id }}
-          path: final_decision_publication.json
+          path: |
+            final_decision_publication.json
+            final_dashboard_validation.json
           retention-days: 30
           if-no-files-found: warn
 

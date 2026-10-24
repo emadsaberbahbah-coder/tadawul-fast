@@ -50,10 +50,23 @@ TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identica
   _canonicalize_provider_row, _infer_country_from_symbol, surface_gate_states
   (no new health key), every provider, identity_guard and the builder.
   Suffixes no table knows (.PH .MA .ETR .LG) still fall back to USD.
-- OFF (unset or any other value): both inferrers return exactly what v5.157.0
-  (main #817; was v5.155.0 when authored) returned; no log line, tag or payload
-  field is added.
+- OFF (unset or any other value): both inferrers return exactly what main's
+  v5.157.3 (#829; was v5.155.0 when authored) returned; no log line, tag or
+  payload field is added.
 - ROLLBACK: unset TFB_ENGINE_SUFFIX_LOCALE_FALLBACK (no redeploy needed).
+
+WHY v5.157.3 - CONFIGURED SUKUK INDUSTRY FALLBACK (2026-10-24)
+The Saudi-listing fallback labelled configured sukuk as Listed Equities even
+after the existing fixed-income classifier set their asset class. Use the
+same fixed-income policy for that generic fallback, preserving any specific
+provider industry, financial values, recommendation and gate behavior.
+Tests: tests/test_sukuk_industry_classification.py.
+
+WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
+Sweep expired entries during cache traffic under the existing async lock.
+Live-entry TTLs, values, scoring and publication gates are unchanged.
+Tests: tests/test_engine_cache_expiry.py.
+
 WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
 (TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
 untouched at 5.11.4. The settle trajectory - passes, convergence status,
@@ -4339,6 +4352,7 @@ from core.financial_units import (
 __version__ = "5.159.0"
 
 from core.sheet_presentation import present_instrument_row
+from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
 from core.price_precision import (
     price_precision_enabled as _price_precision_enabled,
     price_round_half_quantum as _price_round_half_quantum,
@@ -5672,6 +5686,7 @@ def _intrinsic_display_source_signature(row: Mapping[str, Any]) -> str:
         # the start; a later policy change invalidates an old equity receipt.
         if _sukuk_classification_enabled() and _row_is_fixed_income(row):
             values["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+            values["industry"] = _fixed_income_industry(row.get("industry"))
         encoded = json.dumps(values,
                              sort_keys=True, allow_nan=False, separators=(",", ":"))
         return hashlib.sha256(encoded.encode()).hexdigest()
@@ -6085,6 +6100,13 @@ def _sukuk_classification_enabled() -> bool:
 _FIXED_INCOME_ASSET_CLASS = "Fixed Income / Sukuk"
 
 
+def _fixed_income_industry(industry: Any) -> Any:
+    """Replace only our generic equity fallback; retain provider detail."""
+    if not industry or _safe_str(industry).strip().lower() == "listed equities":
+        return _FIXED_INCOME_ASSET_CLASS
+    return industry
+
+
 def _fixed_income_symbols() -> frozenset:
     """Symbols treated as fixed income / sukuk. Read from TFB_FIXED_INCOME_SYMBOLS
     (comma-separated), defaulting to the Cenomi Centers Sukuk (5023.SR) -- the
@@ -6271,7 +6293,6 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
             logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
                            "row_sanity=%d errors=%d",
                            _tag, sheet, _n1, _n2, _n3, _n4, _err)
-        return rows
     except Exception as _exc:
         # v5.129.1: keep the probe's finer "incompatible" verdict — the
         # generic error label only for genuine import/apply failures.
@@ -6284,7 +6305,10 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
         else:
             logger.warning("[SURFACE-INV] pass skipped on %s: %s",
                            sheet, _exc)
-        return rows
+    # Mandatory exact-security protection is independent of the optional
+    # surface invariant's fail-open policy. All three final surfaces pass here.
+    from core.reviewed_instrument_classes import apply_reviewed_instrument_rows
+    return apply_reviewed_instrument_rows(_canonicalize_sheet_name(sheet), rows)[0]
 
 
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
@@ -8766,6 +8790,7 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     # Env-toggleable via TFB_ENGINE_SUKUK_CLASS (default ON).
     if _sukuk_classification_enabled() and _row_is_fixed_income(row):
         row["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+        row["industry"] = _fixed_income_industry(row.get("industry"))
         row["recommendation"] = "HOLD"
         row["recommendation_detailed"] = "HOLD"
         row["recommendation_source"] = "fixed_income_sukuk"
@@ -13094,6 +13119,7 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
         return None
     merged["eps_ttm"] = None
     merged["pe_ttm"] = None
+    _copy_eps_basis(merged, {}, ())
     return "pe_incoherent_cleared:engine"
 
 
@@ -13592,6 +13618,9 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         witnessed_fields = dict(fields)
         witnessed_fields[_MPC_UNIT_KEY] = _margin_cache_units(entry, fields)
         _margin_unit_copy(row, witnessed_fields, filtered)
+        # LKG currently persists no EPS source proof; a restored value cannot
+        # inherit the degraded row's old receipt.
+        _copy_eps_basis(row, {}, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
@@ -13603,7 +13632,10 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
 # raises. A mirror of the v5.136.0 target-LKG layer with the {ts,name,fields}
 # schema; admissibility (TTL / min-fields / fill-only) stays in the callers.
 # ---------------------------------------------------------------------------
-_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v1:"
+# EPS estimates could previously seed eps_ttm through two ingestion paths.
+# Do not restore unversioned old semantics after the adapter/alias correction.
+# Existing v1 keys expire naturally; no historical records are rewritten.
+_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v2:"
 _FUND_LKG_REDIS_BREAKER_ERRORS: int = 3
 _FUND_LKG_REDIS_BREAKER_SECONDS: float = 300.0
 _FUND_LKG_REDIS_TIMEOUT_S: float = 0.25
@@ -15152,7 +15184,9 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
     "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths", "epsCurrentYear"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths"),
+    "eps_estimate_current_year": ("eps_estimate_current_year", "epsCurrentYear", "EPSEstimateCurrentYear"),
+    "eps_net_income_current_shares": ("eps_net_income_current_shares",),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
     "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
     "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
@@ -15832,6 +15866,8 @@ def _infer_sector_from_symbol(symbol: str) -> str:
 
 def _infer_industry_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
+    if _sukuk_classification_enabled() and s in _fixed_income_symbols():
+        return _FIXED_INCOME_ASSET_CLASS
     if s in _COMMODITY_INDUSTRY_HINTS:
         return _COMMODITY_INDUSTRY_HINTS[s]
     if s.endswith("=X"):
@@ -16307,6 +16343,9 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    # Diagnostic provenance only; this receipt grants no eligibility or unit
+    # conversion. Estimates have no alias to the trailing scoring field.
+    _copy_eps_basis(out, src, _EPS_FIELDS)
     if _MPC_UNIT_KEY in src:
         source_basis = src.get(_MPC_UNIT_KEY)
         explicit_fields = [field for field in _MPC_FIELDS
@@ -16938,6 +16977,10 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _f7_settle_holdback(row)
     _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
+    # Route fallbacks call this boundary after fetching a guarded cached quote.
+    # Re-assert the mandatory debt quarantine after generic gate recomputation.
+    from core.reviewed_instrument_classes import reviewed_quote_rows
+    displayed = reviewed_quote_rows("My_Portfolio" if "position_qty" in keys else "Global_Markets", [displayed])[0]
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
 
@@ -17008,14 +17051,18 @@ def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[
     if not isinstance(template_row, dict):
         return out
     filled_margin_fields: List[str] = []
+    filled_eps_fields: List[str] = []
     for k, v in template_row.items():
-        if k == _MPC_UNIT_KEY:
+        if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
             continue  # Only the per-field landed-value copy can carry proof.
         if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
             out[k] = _json_safe(v)
             if k in _MPC_FIELDS:
                 filled_margin_fields.append(k)
+            if k in _EPS_FIELDS:
+                filled_eps_fields.append(k)
     _margin_unit_copy(out, template_row, filled_margin_fields)
+    _copy_eps_basis(out, template_row, filled_eps_fields)
     return out
 
 
@@ -17215,6 +17262,7 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     # identical to v5.99.1 (every blank live value is skipped).
     clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
     replaced_margin_fields: List[str] = []
+    replaced_eps_fields: List[str] = []
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
@@ -17225,7 +17273,10 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
         out[k] = _json_safe(v)
         if k in _MPC_FIELDS:
             replaced_margin_fields.append(k)
+        if k in _EPS_FIELDS:
+            replaced_eps_fields.append(k)
     _margin_unit_copy(out, live_row, replaced_margin_fields)
+    _copy_eps_basis(out, live_row, replaced_eps_fields)
     return out
 
 
@@ -17906,6 +17957,11 @@ class MultiLevelCache:
     `OrderedDict` so we can evict the oldest entries when the map exceeds
     `max_entries`. Previous versions silently grew without bound under
     sustained heavy load.
+
+    Expired entries are swept during normal traffic, at most once per TTL
+    (or 30 seconds for longer TTLs). Without the sweep, short-lived quote
+    and page payloads that were never requested again remained resident
+    until the entry-count limit was reached.
     """
 
     def __init__(self, ttl_seconds: int = 30, max_entries: int = 50_000) -> None:
@@ -17913,16 +17969,33 @@ class MultiLevelCache:
         self._max = max(1000, int(max_entries))
         self._data: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._sweep_interval = min(self._ttl, 30)
+        self._next_expiry_sweep = 0.0
+
+    def _prune_expired(self, now: float) -> None:
+        """Reclaim expired payloads under _lock without changing live TTLs.
+
+        Accesses move entries in LRU order, so timestamps are not ordered.
+        Scan the bounded map rather than stopping at the first live entry.
+        The sweep deadline amortizes this work across normal cache traffic.
+        """
+        if now < self._next_expiry_sweep:
+            return
+        cutoff = now - self._ttl
+        for key in [k for k, (ts, _) in self._data.items() if ts < cutoff]:
+            self._data.pop(key, None)
+        self._next_expiry_sweep = now + self._sweep_interval
 
     async def get(self, key: str) -> Any:
         if not key:
             return None
         async with self._lock:
+            now = time.time()
+            self._prune_expired(now)
             entry = self._data.get(key)
             if entry is None:
                 return None
             ts, value = entry
-            now = time.time()
             if now - ts > self._ttl:
                 self._data.pop(key, None)
                 return None
@@ -17933,7 +18006,9 @@ class MultiLevelCache:
         if not key:
             return
         async with self._lock:
-            self._data[key] = (time.time(), value)
+            now = time.time()
+            self._prune_expired(now)
+            self._data[key] = (now, value)
             self._data.move_to_end(key)
             while len(self._data) > self._max:
                 self._data.popitem(last=False)
@@ -18925,8 +19000,9 @@ class DataEngineV5:
     def _merge(self, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base or {})
         landed_margins: List[str] = []
+        landed_eps: List[str] = []
         for k, v in (patch or {}).items():
-            if k == _MPC_UNIT_KEY:
+            if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
                 continue
             if v is None or v == "":
                 continue
@@ -18934,7 +19010,10 @@ class DataEngineV5:
                 out[k] = v
                 if k in _MPC_FIELDS:
                     landed_margins.append(k)
+                if k in _EPS_FIELDS:
+                    landed_eps.append(k)
         _margin_unit_copy(out, patch or {}, landed_margins)
+        _copy_eps_basis(out, patch or {}, landed_eps)
         return out
 
     def _data_quality(self, row: Dict[str, Any]) -> QuoteQuality:
@@ -19389,6 +19468,11 @@ class DataEngineV5:
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
+        # Research diagnostics are not core-fundamental completeness inputs.
+        # Carry them separately without changing the gap/negative-cache policy.
+        eps_diagnostics, _ = _filter_patch_to_missing_fields(
+            row, canon_patch, ("eps_estimate_current_year", "eps_net_income_current_shares"),
+        )
         # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
         # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
         # declared identity fields -> no judgement"), so identity must simply
@@ -19421,6 +19505,7 @@ class DataEngineV5:
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
+            _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
@@ -19431,6 +19516,9 @@ class DataEngineV5:
                         _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
                         + ("" if _fus_mode == "enforce" else ":observe"),
                     )
+        if eps_diagnostics:
+            row = self._merge(row, eps_diagnostics)
+            _copy_eps_basis(row, canon_patch, eps_diagnostics)
         return row
 
     # =========================================================================
@@ -19868,10 +19956,14 @@ class DataEngineV5:
 
     async def get_enriched_quote(self, symbol: str, page: str = "") -> UnifiedQuote:
         row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        row = reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
         return UnifiedQuote(**row) if row else UnifiedQuote()
 
     async def get_enriched_quote_dict(self, symbol: str, page: str = "") -> Dict[str, Any]:
-        return await self._get_enriched_quote_impl(symbol, page)
+        row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
 
     async def get_enriched_quotes(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         # v5.77.7: per-symbol failure isolation. v5.77.6 used
@@ -19970,7 +20062,8 @@ class DataEngineV5:
                     )
             except Exception:
                 pass
-        return out
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), out)
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         return await self.get_enriched_quotes(symbols, page)

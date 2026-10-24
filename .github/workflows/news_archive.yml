@@ -1,5 +1,7 @@
 name: news-archive
 
+# v1.3.2 collector reports acquisition, discovery and archive-write outcomes
+# separately in the Actions summary. Incomplete discovery still exits nonzero.
 # Daily news/sentiment snapshot -- the forward-collection clock for Strategy
 # items (b) news->sector and (c) theme rotation. Appends one row per symbol per
 # day to the News_Archive tab. SEPARATE from track_performance.yml and
@@ -10,8 +12,16 @@ name: news-archive
 # news engine imports, and requirements.render.txt is the canonical dep set.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "core/news_intelligence.py"
+      - "core/news_identity_lifecycle.py"
+      - "data/verified_name_labels.json"
+      - "scripts/news_archive_collector.py"
+      - ".github/workflows/news_archive.yml"
   schedule:
-    - cron: "0 14 * * *"          # daily 14:00 UTC (17:00 Riyadh, after Tadawul close)
+    - cron: "0 14,20 * * *"       # 17:00 and 23:00 Riyadh; one bounded batch per slot
   workflow_dispatch:
     inputs:
       sheet_id:
@@ -29,12 +39,18 @@ on:
         required: false
         type: boolean
         default: false
+      adaptive:
+        description: "Include current source-validated research/portfolio identities and a rotating market sample (max 60; explicit universe stays absolute)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: news-archive-${{ github.ref }}
+  # The archive is one shared writer target even for manual branch runs.
+  group: news-archive
   cancel-in-progress: false
 
 defaults:
@@ -102,19 +118,21 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          # Universe: scheduled runs use vars.NEWS_ARCHIVE_UNIVERSE; a manual
-          # run may override it per-run via the `universe` input, normalized and
-          # passed as --universe in the run step (CLI > env in resolve_universe).
+          # Adaptive scheduled/adoption runs retain the env list as a stable
+          # baseline, then add bounded current source identities and rotation.
+          # An explicit CLI universe remains absolute. Turning adaptive off
+          # restores the old env/default-only selection.
           NEWS_ARCHIVE_UNIVERSE: ${{ vars.NEWS_ARCHIVE_UNIVERSE }}
           INPUT_UNIVERSE: ${{ github.event.inputs.universe }}
           NEWS_ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          TFB_NEWS_ARCHIVE_ADAPTIVE: ${{ github.event_name != 'workflow_dispatch' && 'true' || github.event.inputs.adaptive }}
         run: |
           set -euo pipefail
-          CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --verbose)
+          CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --max-symbols 60 --evidence-json artifacts/news-acquisition.json --verbose)
           # Per-run universe override (workflow_dispatch only). Accepts space-
           # OR comma-separated symbols; normalized to the --universe flag, which
           # takes precedence over NEWS_ARCHIVE_UNIVERSE. Scheduled runs leave
-          # INPUT_UNIVERSE empty and fall back to the env var.
+          # INPUT_UNIVERSE empty and use the adaptive bounded selection.
           if [[ -n "${INPUT_UNIVERSE:-}" ]]; then
             UNI="${INPUT_UNIVERSE//,/ }"
             read -ra UNI_TOKENS <<< "${UNI}"
@@ -122,3 +140,12 @@ jobs:
             echo "Universe override (${#UNI_TOKENS[@]} symbols): ${UNI_TOKENS[*]}"
           fi
           "${CMD[@]}"
+
+      - name: Preserve news acquisition evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: news-acquisition-${{ github.run_id }}
+          path: artifacts/news-acquisition.json
+          if-no-files-found: warn
+          retention-days: 30

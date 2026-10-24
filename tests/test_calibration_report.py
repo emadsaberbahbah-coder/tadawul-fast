@@ -59,6 +59,8 @@ def test_decided_dedup_probability_populations_and_risk_exclusions(tmp_path):
     assert result["source"]["global_markets_dominant_date"] == "2026-10-06"
     assert result["signals"]["ambiguous_entry_date_matches"] == 4
     assert result["signals"]["entry_date_matches"] == 4  # BBB's next-day snapshot is excluded
+    assert "not direction-aware call correctness" in result["method"]["outcome_metric"]
+    assert "price-positive rate" in report.render_md(result)
 
 
 def test_report_is_deterministic_and_does_not_write_workbook(tmp_path):

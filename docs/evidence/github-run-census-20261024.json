@@ -1,0 +1,3203 @@
+{
+  "schema": "tfb.github-run-census.v1",
+  "repository": "emadsaberbahbah-coder/tadawul-fast",
+  "branch": "main",
+  "since_utc": "2026-10-17T00:00:00Z",
+  "as_of_utc": "2026-10-24T08:05:38Z",
+  "as_of_riyadh": "2026-10-24T11:05:38+03:00",
+  "source_snapshot": {
+    "reported_runs": 850,
+    "retrieved_runs": 850,
+    "failed_runs": 80,
+    "failed_jobs": 89,
+    "failed_job_lists_retrieved": 80,
+    "failed_job_logs_retrieved": 89,
+    "access_gaps": 0
+  },
+  "scope": "All failed latest-attempt run records in this bounded main-branch inventory. Successful/skipped/cancelled records remain separate; earlier attempts of later-successful runs are not retroactively counted as failures.",
+  "interpretation": "Multiple audits often report the same underlying source/consumer defect; 89 failed jobs are not 89 independent root causes. Historical failures are preserved. No rerun, baseline acceptance, secret/configuration change, provider acquisition, email or trade was performed for this census.",
+  "classification_counts_by_failed_job": {
+    "post_merge_live_guards_rejected": 1,
+    "adaptive_discovery_incomplete": 5,
+    "decision_clock_or_consumed_receipt_guard": 22,
+    "decision_publication_guard": 23,
+    "accepted_baseline_missing": 7,
+    "safe_release_refusal": 2,
+    "review_expiry_alert": 3,
+    "native_decision_render_failure": 8,
+    "name_coverage_guard": 11,
+    "timestamp_completeness_warning": 4,
+    "sheet_read_timeout": 1,
+    "backend_authorization_failure": 1,
+    "resumable_upload_transport_failure": 1
+  },
+  "records": [
+    {
+      "run_id": 40076497421,
+      "path": ".github/workflows/workflow_repair_tests.yml",
+      "event": "push",
+      "created_at_utc": "2026-10-24T08:02:42Z",
+      "head_sha": "561db60c74c1d56d866d4b72756f8ef9a9df57d5",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40076497421",
+      "jobs": [
+        {
+          "job_id": 120820970899,
+          "name": "Read-only post-merge audit verification",
+          "failed_steps": [
+            {
+              "name": "Verify live controls and retain genuine failures",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40076497421/job/120820970899",
+          "classification": "post_merge_live_guards_rejected",
+          "reason_codes": [],
+          "observed": {
+            "read_only": true,
+            "audit_exit_codes": {
+              "full_refresh": 2,
+              "decision_surface": 2,
+              "provider_target": 2
+            },
+            "all_reports_present": true
+          },
+          "remediation": "Read retained audit artifacts and repair live source/receipt/baseline conditions; offline regression itself passed."
+        }
+      ]
+    },
+    {
+      "run_id": 40066451707,
+      "path": ".github/workflows/news_archive.yml",
+      "event": "push",
+      "created_at_utc": "2026-10-24T05:29:33Z",
+      "head_sha": "70a88fa1a5dffda60925614c44293d3ecda08bfd",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40066451707",
+      "jobs": [
+        {
+          "job_id": 120790627073,
+          "name": "collect",
+          "failed_steps": [
+            {
+              "name": "Collect news archive",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40066451707/job/120790627073",
+          "classification": "adaptive_discovery_incomplete",
+          "reason_codes": [],
+          "observed": {
+            "selected_acquisition_complete": true,
+            "discovery_complete": false,
+            "discovery_identity_coverage_complete": false,
+            "source_read_complete": true,
+            "archive_write_status": "APPEND_ACCEPTED",
+            "accepted_rows": 27,
+            "complete": false
+          },
+          "remediation": "Resolve adaptive source/identity discovery and keep selected-feed success distinct from whole-discovery completeness."
+        }
+      ]
+    },
+    {
+      "run_id": 40045012373,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-24T00:26:51Z",
+      "head_sha": "d4e8c643901570cd2b97d806a3229e998a721222",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40045012373",
+      "jobs": [
+        {
+          "job_id": 120724630996,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40045012373/job/120724630996",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 40038342135,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T23:12:36Z",
+      "head_sha": "d4e8c643901570cd2b97d806a3229e998a721222",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40038342135",
+      "jobs": [
+        {
+          "job_id": 120724358678,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40038342135/job/120724358678",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 40035277798,
+      "path": ".github/workflows/news_archive.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T22:41:58Z",
+      "head_sha": "d4e8c643901570cd2b97d806a3229e998a721222",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40035277798",
+      "jobs": [
+        {
+          "job_id": 120693100215,
+          "name": "collect",
+          "failed_steps": [
+            {
+              "name": "Collect news archive",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40035277798/job/120693100215",
+          "classification": "adaptive_discovery_incomplete",
+          "reason_codes": [],
+          "observed": {
+            "selected_acquisition_complete": true,
+            "discovery_complete": false,
+            "discovery_identity_coverage_complete": false,
+            "source_read_complete": true,
+            "archive_write_status": "APPEND_ACCEPTED",
+            "accepted_rows": 60,
+            "complete": false
+          },
+          "remediation": "Resolve adaptive source/identity discovery and keep selected-feed success distinct from whole-discovery completeness."
+        }
+      ]
+    },
+    {
+      "run_id": 40001890944,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-23T18:16:04Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40001890944",
+      "jobs": [
+        {
+          "job_id": 120579804858,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/40001890944/job/120579804858",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39999648493,
+      "path": ".github/workflows/news_archive.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T17:59:50Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39999648493",
+      "jobs": [
+        {
+          "job_id": 120572133560,
+          "name": "collect",
+          "failed_steps": [
+            {
+              "name": "Collect news archive",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39999648493/job/120572133560",
+          "classification": "adaptive_discovery_incomplete",
+          "reason_codes": [],
+          "observed": {
+            "selected_acquisition_complete": true,
+            "discovery_complete": false,
+            "discovery_identity_coverage_complete": false,
+            "source_read_complete": false,
+            "archive_write_status": "APPEND_ACCEPTED",
+            "accepted_rows": 31,
+            "complete": false
+          },
+          "remediation": "Resolve adaptive source/identity discovery and keep selected-feed success distinct from whole-discovery completeness."
+        }
+      ]
+    },
+    {
+      "run_id": 39993609706,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T17:15:40Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39993609706",
+      "jobs": [
+        {
+          "job_id": 120579202169,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39993609706/job/120579202169",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39948573365,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T11:47:33Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39948573365",
+      "jobs": [
+        {
+          "job_id": 120397168739,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39948573365/job/120397168739",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39940220403,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-23T10:35:45Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39940220403",
+      "jobs": [
+        {
+          "job_id": 120369525886,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39940220403/job/120369525886",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39938800176,
+      "path": ".github/workflows/release_decision_feed.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T10:23:50Z",
+      "head_sha": "a2600b3b15fc678da337bfc062be7f2d43ed0a17",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39938800176",
+      "jobs": [
+        {
+          "job_id": 120364852465,
+          "name": "Release decision feed",
+          "failed_steps": [
+            {
+              "name": "Release or retract the decision feed",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39938800176/job/120364852465",
+          "classification": "safe_release_refusal",
+          "reason_codes": [
+            "superseded_by_run"
+          ],
+          "observed": {
+            "accepted": false,
+            "released": false,
+            "feed_promoted": false,
+            "outcome": "refused"
+          },
+          "remediation": "Align release timing with completed current-cohort audits; retain the refusal and no promotion."
+        }
+      ]
+    },
+    {
+      "run_id": 39931603565,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T09:24:14Z",
+      "head_sha": "92b0fc062f3ce565dcef74f1072b4bc4d9db9433",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39931603565",
+      "jobs": [
+        {
+          "job_id": 120369010185,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39931603565/job/120369010185",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39931436275,
+      "path": ".github/workflows/name_label_renewal.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-23T09:22:52Z",
+      "head_sha": "92b0fc062f3ce565dcef74f1072b4bc4d9db9433",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39931436275",
+      "jobs": [
+        {
+          "job_id": 120340400880,
+          "name": "Name label check",
+          "failed_steps": [
+            {
+              "name": "Run",
+              "number": 4,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39931436275/job/120340400880",
+          "classification": "review_expiry_alert",
+          "reason_codes": [],
+          "observed": {
+            "mode": "check",
+            "bindings": 124,
+            "expiring_within_h": 48,
+            "expiring": 4
+          },
+          "remediation": "Re-verify primary identity evidence and renew only through the reviewed registry process; check mode does not renew."
+        }
+      ]
+    },
+    {
+      "run_id": 39906549787,
+      "path": ".github/workflows/news_archive.yml",
+      "event": "push",
+      "created_at_utc": "2026-10-23T05:34:55Z",
+      "head_sha": "92b0fc062f3ce565dcef74f1072b4bc4d9db9433",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39906549787",
+      "jobs": [
+        {
+          "job_id": 120259730367,
+          "name": "collect",
+          "failed_steps": [
+            {
+              "name": "Collect news archive",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39906549787/job/120259730367",
+          "classification": "adaptive_discovery_incomplete",
+          "reason_codes": [],
+          "observed": {
+            "selected_acquisition_complete": true,
+            "discovery_complete": false,
+            "discovery_identity_coverage_complete": false,
+            "source_read_complete": true,
+            "archive_write_status": "APPEND_ACCEPTED",
+            "accepted_rows": 21,
+            "complete": false
+          },
+          "remediation": "Resolve adaptive source/identity discovery and keep selected-feed success distinct from whole-discovery completeness."
+        }
+      ]
+    },
+    {
+      "run_id": 39870284821,
+      "path": ".github/workflows/news_archive.yml",
+      "event": "push",
+      "created_at_utc": "2026-10-22T23:12:48Z",
+      "head_sha": "a34eda7efb749485d34fd8e1eb20eb256a8626fa",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39870284821",
+      "jobs": [
+        {
+          "job_id": 120142704965,
+          "name": "collect",
+          "failed_steps": [
+            {
+              "name": "Collect news archive",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39870284821/job/120142704965",
+          "classification": "adaptive_discovery_incomplete",
+          "reason_codes": [],
+          "observed": {
+            "selected_acquisition_complete": true,
+            "discovery_complete": false,
+            "discovery_identity_coverage_complete": false,
+            "source_read_complete": true,
+            "archive_write_status": "APPEND_ACCEPTED",
+            "accepted_rows": 60,
+            "complete": false
+          },
+          "remediation": "Resolve adaptive source/identity discovery and keep selected-feed success distinct from whole-discovery completeness."
+        }
+      ]
+    },
+    {
+      "run_id": 39839203270,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-22T19:20:25Z",
+      "head_sha": "5739147660ea25771d6a885a2236589c6b91523b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39839203270",
+      "jobs": [
+        {
+          "job_id": 120035453429,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39839203270/job/120035453429",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39821354157,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-22T17:17:41Z",
+      "head_sha": "5739147660ea25771d6a885a2236589c6b91523b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39821354157",
+      "jobs": [
+        {
+          "job_id": 120034518092,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39821354157/job/120034518092",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39775139988,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-22T12:02:21Z",
+      "head_sha": "0299fbee1cc730b797374e50e04d9117e108da62",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39775139988",
+      "jobs": [
+        {
+          "job_id": 119812053786,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39775139988/job/119812053786",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39763422491,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-22T10:28:59Z",
+      "head_sha": "0299fbee1cc730b797374e50e04d9117e108da62",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39763422491",
+      "jobs": [
+        {
+          "job_id": 119772925844,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39763422491/job/119772925844",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39763157033,
+      "path": ".github/workflows/release_decision_feed.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-22T10:26:51Z",
+      "head_sha": "0299fbee1cc730b797374e50e04d9117e108da62",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39763157033",
+      "jobs": [
+        {
+          "job_id": 119772040086,
+          "name": "Release decision feed",
+          "failed_steps": [
+            {
+              "name": "Release or retract the decision feed",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39763157033/job/119772040086",
+          "classification": "safe_release_refusal",
+          "reason_codes": [
+            "source_not_completed",
+            "final_job_not_executed"
+          ],
+          "observed": {
+            "accepted": false,
+            "released": false,
+            "feed_promoted": false,
+            "outcome": "refused"
+          },
+          "remediation": "Align release timing with completed current-cohort audits; retain the refusal and no promotion."
+        }
+      ]
+    },
+    {
+      "run_id": 39755653571,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-22T09:28:11Z",
+      "head_sha": "df99bcf3294cd93941fdf8be1153aa88eed34c8b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39755653571",
+      "jobs": [
+        {
+          "job_id": 119772468857,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39755653571/job/119772468857",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39755458529,
+      "path": ".github/workflows/name_label_renewal.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-22T09:26:40Z",
+      "head_sha": "df99bcf3294cd93941fdf8be1153aa88eed34c8b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39755458529",
+      "jobs": [
+        {
+          "job_id": 119746207497,
+          "name": "Name label check",
+          "failed_steps": [
+            {
+              "name": "Run",
+              "number": 4,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39755458529/job/119746207497",
+          "classification": "review_expiry_alert",
+          "reason_codes": [],
+          "observed": {
+            "mode": "check",
+            "bindings": 122,
+            "expiring_within_h": 48,
+            "expiring": 4
+          },
+          "remediation": "Re-verify primary identity evidence and renew only through the reviewed registry process; check mode does not renew."
+        }
+      ]
+    },
+    {
+      "run_id": 39699849334,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-22T00:28:02Z",
+      "head_sha": "df99bcf3294cd93941fdf8be1153aa88eed34c8b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39699849334",
+      "jobs": [
+        {
+          "job_id": 119566162010,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39699849334/job/119566162010",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39693347543,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T23:25:42Z",
+      "head_sha": "df99bcf3294cd93941fdf8be1153aa88eed34c8b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39693347543",
+      "jobs": [
+        {
+          "job_id": 119565715803,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39693347543/job/119565715803",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39653321246,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T18:30:24Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39653321246",
+      "jobs": [
+        {
+          "job_id": 119407024424,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39653321246/job/119407024424",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_COUNT_MISSING",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39642923547,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T17:20:29Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39642923547",
+      "jobs": [
+        {
+          "job_id": 119370919371,
+          "name": "🚀 Data Sync (mutual-funds)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39642923547/job/119370919371",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": true
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 119370919403,
+          "name": "🚀 Data Sync (global-markets)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39642923547/job/119370919403",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": true
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 119370919440,
+          "name": "🚀 Data Sync (core-pages)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39642923547/job/119370919440",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": true
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 119406246318,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39642923547/job/119406246318",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              0,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39619810609,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T14:46:32Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39619810609",
+      "jobs": [
+        {
+          "job_id": 119289938927,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39619810609/job/119289938927",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39619810412,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T14:46:32Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39619810412",
+      "jobs": [
+        {
+          "job_id": 119289937335,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39619810412/job/119289937335",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39610230706,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "workflow_dispatch",
+      "created_at_utc": "2026-10-21T13:41:45Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39610230706",
+      "jobs": [
+        {
+          "job_id": 119289323446,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39610230706/job/119289323446",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39605926822,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T13:12:15Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39605926822",
+      "jobs": [
+        {
+          "job_id": 119241972186,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39605926822/job/119241972186",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39605926618,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T13:12:14Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39605926618",
+      "jobs": [
+        {
+          "job_id": 119241972001,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39605926618/job/119241972001",
+          "classification": "timestamp_completeness_warning",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_code": 1,
+            "audit_failures": 0,
+            "affected_page": "Global_Markets",
+            "invalid_or_missing_timestamps": 2
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39596803636,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "workflow_dispatch",
+      "created_at_utc": "2026-10-21T12:05:06Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39596803636",
+      "jobs": [
+        {
+          "job_id": 119241183289,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39596803636/job/119241183289",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              1,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39596075562,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T11:59:31Z",
+      "head_sha": "55b47f24567669ded61d64cb257376614d30bcbf",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39596075562",
+      "jobs": [
+        {
+          "job_id": 119208595628,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39596075562/job/119208595628",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39585591364,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T10:34:35Z",
+      "head_sha": "64add466c60e1455a230eb1669ba3017e0cf38b1",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39585591364",
+      "jobs": [
+        {
+          "job_id": 119173559173,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39585591364/job/119173559173",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39585591280,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T10:34:35Z",
+      "head_sha": "64add466c60e1455a230eb1669ba3017e0cf38b1",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39585591280",
+      "jobs": [
+        {
+          "job_id": 119173559169,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39585591280/job/119173559169",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39584712312,
+      "path": ".github/workflows/release_decision_feed.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T10:27:24Z",
+      "head_sha": "64add466c60e1455a230eb1669ba3017e0cf38b1",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39584712312",
+      "jobs": [
+        {
+          "job_id": 119170644221,
+          "name": "Release decision feed",
+          "failed_steps": [
+            {
+              "name": "Release or retract the decision feed",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39584712312/job/119170644221",
+          "classification": "sheet_read_timeout",
+          "reason_codes": [
+            "layout_or_read_failed"
+          ],
+          "observed": {
+            "accepted": false,
+            "released": false,
+            "feed_promoted": false,
+            "outcome": "layout_fault"
+          },
+          "remediation": "Bound/retry safe reads without replaying publication writes; do not treat a timeout as a successful read."
+        }
+      ]
+    },
+    {
+      "run_id": 39576807720,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T09:25:12Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39576807720",
+      "jobs": [
+        {
+          "job_id": 119172975386,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39576807720/job/119172975386",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39576601014,
+      "path": ".github/workflows/name_label_renewal.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-21T09:23:38Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39576601014",
+      "jobs": [
+        {
+          "job_id": 119143543851,
+          "name": "Name label check",
+          "failed_steps": [
+            {
+              "name": "Run",
+              "number": 4,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39576601014/job/119143543851",
+          "classification": "review_expiry_alert",
+          "reason_codes": [],
+          "observed": {
+            "mode": "check",
+            "bindings": 122,
+            "expiring_within_h": 48,
+            "expiring": 122
+          },
+          "remediation": "Re-verify primary identity evidence and renew only through the reviewed registry process; check mode does not renew."
+        }
+      ]
+    },
+    {
+      "run_id": 39521288995,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T00:26:03Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39521288995",
+      "jobs": [
+        {
+          "job_id": 118965467259,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39521288995/job/118965467259",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_POOL_COUNT_MISSING",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39521288918,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-21T00:26:03Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39521288918",
+      "jobs": [
+        {
+          "job_id": 118965467049,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39521288918/job/118965467049",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39513589733,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-20T23:13:35Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39513589733",
+      "jobs": [
+        {
+          "job_id": 118940305172,
+          "name": "🚀 Data Sync (core-pages)",
+          "failed_steps": [
+            {
+              "name": "🚀 Execute Dashboard Sync",
+              "number": 11,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39513589733/job/118940305172",
+          "classification": "backend_authorization_failure",
+          "reason_codes": [
+            "HTTP_401"
+          ],
+          "observed": {
+            "failed_pages": [
+              "Commodities_FX",
+              "Market_Leaders"
+            ],
+            "final_source_failed": 2
+          },
+          "remediation": "Verify real authenticated acquisition using current route/auth implementation; retain original failure."
+        },
+        {
+          "job_id": 118940305214,
+          "name": "🚀 Data Sync (global-markets)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39513589733/job/118940305214",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": false
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 118940305237,
+          "name": "🚀 Data Sync (mutual-funds)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39513589733/job/118940305237",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": false
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 118965048987,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39513589733/job/118965048987",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39474537234,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T18:25:05Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39474537234",
+      "jobs": [
+        {
+          "job_id": 118806969472,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39474537234/job/118806969472",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_COUNT_MISSING",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39474536946,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T18:25:05Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39474536946",
+      "jobs": [
+        {
+          "job_id": 118806969179,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39474536946/job/118806969179",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Global_Markets",
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39464797610,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-20T17:17:37Z",
+      "head_sha": "97fa9915acb3702e49014615d08c754f52e5fd97",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39464797610",
+      "jobs": [
+        {
+          "job_id": 118773297061,
+          "name": "🚀 Data Sync (global-markets)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39464797610/job/118773297061",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": false
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 118773297299,
+          "name": "🚀 Data Sync (mutual-funds)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39464797610/job/118773297299",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": false
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 118773297523,
+          "name": "🚀 Data Sync (core-pages)",
+          "failed_steps": [
+            {
+              "name": "✅ Validate Dashboard (contract + gate integrity)",
+              "number": 12,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39464797610/job/118773297523",
+          "classification": "native_decision_render_failure",
+          "reason_codes": [
+            "decision.header_found"
+          ],
+          "observed": {
+            "source_execution_exit": 0,
+            "cockpit_header_missing": true,
+            "stuck_running_reported": false
+          },
+          "remediation": "Verify bound Top10 rendering completion and current bulk-render source parity; source refresh success alone does not certify decision output."
+        },
+        {
+          "job_id": 118806268461,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39464797610/job/118806268461",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39417521964,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-20T11:47:53Z",
+      "head_sha": "aa1f440c02e65c4f28d218ab4b196b3ded787d68",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39417521964",
+      "jobs": [
+        {
+          "job_id": 118610053486,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39417521964/job/118610053486",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39408342264,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T10:29:50Z",
+      "head_sha": "aa1f440c02e65c4f28d218ab4b196b3ded787d68",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39408342264",
+      "jobs": [
+        {
+          "job_id": 118579683000,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39408342264/job/118579683000",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39408342195,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T10:29:50Z",
+      "head_sha": "aa1f440c02e65c4f28d218ab4b196b3ded787d68",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39408342195",
+      "jobs": [
+        {
+          "job_id": 118579682102,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39408342195/job/118579682102",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39401036039,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-20T09:29:25Z",
+      "head_sha": "aa1f440c02e65c4f28d218ab4b196b3ded787d68",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39401036039",
+      "jobs": [
+        {
+          "job_id": 118579116087,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39401036039/job/118579116087",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39349651739,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T00:46:45Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39349651739",
+      "jobs": [
+        {
+          "job_id": 118390563767,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39349651739/job/118390563767",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_STATUS_NOT_OK",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39349651727,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-20T00:46:45Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39349651727",
+      "jobs": [
+        {
+          "job_id": 118390563580,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39349651727/job/118390563580",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39343640938,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-19T23:46:33Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39343640938",
+      "jobs": [
+        {
+          "job_id": 118390203236,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39343640938/job/118390203236",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39314271436,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-19T19:50:11Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39314271436",
+      "jobs": [
+        {
+          "job_id": 118271552627,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39314271436/job/118271552627",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Mutual_Funds"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39314271373,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-19T19:50:11Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39314271373",
+      "jobs": [
+        {
+          "job_id": 118271551879,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39314271373/job/118271551879",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39305103867,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-19T18:44:49Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39305103867",
+      "jobs": [
+        {
+          "job_id": 118270854309,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39305103867/job/118270854309",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39260943758,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-19T13:31:52Z",
+      "head_sha": "f24e9ff300acdfe4d4da8cc5b92d4d5890ac54ab",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39260943758",
+      "jobs": [
+        {
+          "job_id": 118088098336,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39260943758/job/118088098336",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39245386428,
+      "path": ".github/workflows/release_decision_feed.yml",
+      "event": "workflow_dispatch",
+      "created_at_utc": "2026-10-19T11:32:36Z",
+      "head_sha": "6ebe737d94fc2ee1744a6b6671678391d5739255",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39245386428",
+      "jobs": [
+        {
+          "job_id": 118035942396,
+          "name": "Release decision feed",
+          "failed_steps": [
+            {
+              "name": "Release or retract the decision feed",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39245386428/job/118035942396",
+          "classification": "decision_publication_guard",
+          "reason_codes": [
+            "exit_code_nonzero",
+            "audit_exit_codes",
+            "blockers_present",
+            "decision_not_executable",
+            "coverage_summary_not_zero",
+            "decision_summary_not_zero",
+            "decision_findings_present"
+          ],
+          "observed": {
+            "accepted": false,
+            "released": false,
+            "feed_promoted": false,
+            "outcome": "not_accepted"
+          },
+          "remediation": "Resolve current source/decision evidence and rerun acceptance; do not bypass failed audits."
+        }
+      ]
+    },
+    {
+      "run_id": 39241683739,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-19T11:02:01Z",
+      "head_sha": "6ebe737d94fc2ee1744a6b6671678391d5739255",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39241683739",
+      "jobs": [
+        {
+          "job_id": 118023764013,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39241683739/job/118023764013",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39241683680,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-19T11:02:01Z",
+      "head_sha": "6ebe737d94fc2ee1744a6b6671678391d5739255",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39241683680",
+      "jobs": [
+        {
+          "job_id": 118023762559,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39241683680/job/118023762559",
+          "classification": "timestamp_completeness_warning",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_code": 1,
+            "audit_failures": 0,
+            "affected_page": "Global_Markets",
+            "invalid_or_missing_timestamps": 7
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39234358605,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-19T10:01:01Z",
+      "head_sha": "fbd0176deea9bb1b9c541a540ec86abf4c24a694",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39234358605",
+      "jobs": [
+        {
+          "job_id": 118023200290,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39234358605/job/118023200290",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              1,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39185293314,
+      "path": ".github/workflows/workbook_backup.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-19T01:25:33Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39185293314",
+      "jobs": [
+        {
+          "job_id": 117846330450,
+          "name": "backup",
+          "failed_steps": [
+            {
+              "name": "Run backup",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39185293314/job/117846330450",
+          "classification": "resumable_upload_transport_failure",
+          "reason_codes": [
+            "SSLEOFError"
+          ],
+          "observed": {
+            "version": "1.5.0",
+            "stage": "Drive resumable upload"
+          },
+          "remediation": "Current main has 1.5.1 upload-resume handling; later successful backups exist. Verify stored-object integrity, not just workflow color."
+        }
+      ]
+    },
+    {
+      "run_id": 39176964871,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T23:32:41Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39176964871",
+      "jobs": [
+        {
+          "job_id": 117821500828,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39176964871/job/117821500828",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_RECONCILIATION_UNPROVEN"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39176964852,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T23:32:41Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39176964852",
+      "jobs": [
+        {
+          "job_id": 117821500680,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39176964852/job/117821500680",
+          "classification": "timestamp_completeness_warning",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_code": 1,
+            "audit_failures": 0,
+            "affected_page": "Global_Markets",
+            "invalid_or_missing_timestamps": 8
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39172358424,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-18T22:28:14Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39172358424",
+      "jobs": [
+        {
+          "job_id": 117821212405,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39172358424/job/117821212405",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              1,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39147518255,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T16:59:44Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518255",
+      "jobs": [
+        {
+          "job_id": 117734274609,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518255/job/117734274609",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN",
+            "FALSE_FULL_UNIVERSE_CLAIM"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39147518253,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T16:59:44Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518253",
+      "jobs": [
+        {
+          "job_id": 117734274828,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39147518253/job/117734274828",
+          "classification": "timestamp_completeness_warning",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_code": 1,
+            "audit_failures": 0,
+            "affected_page": "Global_Markets",
+            "invalid_or_missing_timestamps": 10
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39142793753,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-18T15:57:18Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39142793753",
+      "jobs": [
+        {
+          "job_id": 117733972610,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39142793753/job/117733972610",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              1,
+              2
+            ],
+            "blockers": [
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39122743513,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-18T11:19:06Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39122743513",
+      "jobs": [
+        {
+          "job_id": 117661484074,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39122743513/job/117661484074",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39117737642,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T10:03:15Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39117737642",
+      "jobs": [
+        {
+          "job_id": 117646845990,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39117737642/job/117646845990",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN",
+            "FALSE_FULL_UNIVERSE_CLAIM"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39117737637,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-18T10:03:15Z",
+      "head_sha": "4c9e2cbf98a22ecb3decc6894398b3dc74157592",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39117737637",
+      "jobs": [
+        {
+          "job_id": 117646846110,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39117737637/job/117646846110",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Global_Markets"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39113252914,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-18T08:54:22Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39113252914",
+      "jobs": [
+        {
+          "job_id": 117646560901,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39113252914/job/117646560901",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39079251972,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T23:30:00Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39079251972",
+      "jobs": [
+        {
+          "job_id": 117532673397,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39079251972/job/117532673397",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Global_Markets"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39079251966,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T23:30:00Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39079251966",
+      "jobs": [
+        {
+          "job_id": 117532673167,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39079251966/job/117532673167",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN",
+            "FALSE_FULL_UNIVERSE_CLAIM"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39074992080,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-17T22:25:12Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39074992080",
+      "jobs": [
+        {
+          "job_id": 117532455230,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39074992080/job/117532455230",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39051172639,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T16:50:39Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39051172639",
+      "jobs": [
+        {
+          "job_id": 117449889262,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39051172639/job/117449889262",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Global_Markets"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39051172610,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T16:50:39Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39051172610",
+      "jobs": [
+        {
+          "job_id": 117449889072,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39051172610/job/117449889072",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_RUN_STALE",
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN",
+            "FALSE_FULL_UNIVERSE_CLAIM"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39046200355,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-17T15:42:04Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39046200355",
+      "jobs": [
+        {
+          "job_id": 117449583823,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39046200355/job/117449583823",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    },
+    {
+      "run_id": 39026626201,
+      "path": ".github/workflows/provider_target_coverage.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-17T10:53:39Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39026626201",
+      "jobs": [
+        {
+          "job_id": 117378772848,
+          "name": "audit",
+          "failed_steps": [
+            {
+              "name": "Audit provider-target coverage",
+              "number": 7,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39026626201/job/117378772848",
+          "classification": "accepted_baseline_missing",
+          "reason_codes": [
+            "CH_BASELINE_EMPTY",
+            "CH_BASELINE_MISSING"
+          ],
+          "observed": {
+            "affected_pages": [
+              "Market_Leaders",
+              "Global_Markets"
+            ],
+            "baseline_accepted": false
+          },
+          "remediation": "Create an explicit accepted baseline only after verified healthy source measurements; keep the no-reference result blocked."
+        }
+      ]
+    },
+    {
+      "run_id": 39021879707,
+      "path": ".github/workflows/full_refresh_coverage.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T09:38:10Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39021879707",
+      "jobs": [
+        {
+          "job_id": 117365157231,
+          "name": "Audit every refreshed row and page",
+          "failed_steps": [
+            {
+              "name": "Scan all rows and pages",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39021879707/job/117365157231",
+          "classification": "name_coverage_guard",
+          "reason_codes": [],
+          "observed": {
+            "affected_pages": [
+              "Global_Markets"
+            ],
+            "name_floor_pct": 99
+          },
+          "remediation": "Repair authoritative names/timestamps; do not lower the 99% floor or convert warning-bearing strict audits to PASS."
+        }
+      ]
+    },
+    {
+      "run_id": 39021879706,
+      "path": ".github/workflows/decision_surface_freshness.yml",
+      "event": "workflow_run",
+      "created_at_utc": "2026-10-17T09:38:10Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39021879706",
+      "jobs": [
+        {
+          "job_id": 117365157276,
+          "name": "Block stale or mixed-snapshot decisions",
+          "failed_steps": [
+            {
+              "name": "Audit decision surfaces",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39021879706/job/117365157276",
+          "classification": "decision_clock_or_consumed_receipt_guard",
+          "reason_codes": [
+            "PF_OLDER_THAN_SOURCE",
+            "T10_OLDER_THAN_SOURCE",
+            "T10_POOL_APPROVED_COUNT",
+            "T10_POOL_RECONCILIATION_UNPROVEN",
+            "FALSE_FULL_UNIVERSE_CLAIM"
+          ],
+          "observed": {},
+          "remediation": "Refresh native consumers after all source pages publish; require same-run pool proof and current clocks."
+        }
+      ]
+    },
+    {
+      "run_id": 39018080003,
+      "path": ".github/workflows/daily_sync.yml",
+      "event": "schedule",
+      "created_at_utc": "2026-10-17T08:37:46Z",
+      "head_sha": "11ef13456e5b8775b74e677a94c3e383618b7d6b",
+      "run_attempt": 1,
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39018080003",
+      "jobs": [
+        {
+          "job_id": 117364917481,
+          "name": "🛡️ Verify final decision publication",
+          "failed_steps": [
+            {
+              "name": "Audit final coverage and decision clocks",
+              "number": 6,
+              "conclusion": "failure"
+            }
+          ],
+          "log_retrieved": true,
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39018080003/job/117364917481",
+          "classification": "decision_publication_guard",
+          "reason_codes": [],
+          "observed": {
+            "audit_exit_codes": [
+              2,
+              2
+            ],
+            "blockers": [
+              "coverage_failed",
+              "decision_failed"
+            ],
+            "feed_promoted": false,
+            "blocker_published": true,
+            "fatal": null,
+            "publication_error": null
+          },
+          "remediation": "Complete native decision refresh on the same acquisition cohort and verify consumed receipts; keep the final veto."
+        }
+      ]
+    }
+  ]
+}

@@ -148,7 +148,7 @@ def test_historical_witness_must_be_unique_and_share_entry(tracker, invalid_kind
         assert rep["unresolved_why"] == {"no_sibling": 0, "mismatch": 1}
 
 
-def test_historical_measurement_corrects_only_in_memory(tracker, monkeypatch):
+def test_historical_measurement_stays_diagnostic_without_forecast_provenance(tracker, monkeypatch):
     records = sum((_historical_pair(tracker, day) for day in range(20)), [])
     snapshot = [r.to_dict() for r in records]
     monkeypatch.setenv("TFB_PERF_TARGET_UNIT_SENTRY", "observe")
@@ -158,8 +158,9 @@ def test_historical_measurement_corrects_only_in_memory(tracker, monkeypatch):
     assert observed["unit_sentry"]["mean_abs_error_pp"] == 6.93
     monkeypatch.setenv("TFB_PERF_TARGET_UNIT_SENTRY", "enforce")
     enforced = tracker.s1_checkpoint_calibration(records)
-    assert enforced["n"] == 20
-    assert enforced["mean_abs_error_pp"] == 6.93
+    assert enforced["n"] == 0 and enforced["state"] == "PENDING"
+    assert enforced["mean_abs_error_pp"] is None
+    assert enforced["unit_sentry"]["unresolved_why"] == {"unproven_forecast_provenance": 20}
     assert enforced["unit_sentry"]["legacy"]["mean_abs_error_pp"] == 0.0
     assert [r.to_dict() for r in records] == snapshot
 
@@ -208,7 +209,7 @@ def test_assembly_exception_cannot_republish_legacy_pass(tracker, monkeypatch):
     records = sum((_historical_pair(tracker, day) for day in range(20)), [])
     out = tracker._s1_checkpoint_calibration_legacy(records)
     # A malformed measurement result tests the actual assembly guard.
-    monkeypatch.setattr(tracker, "_s1_unit_sentry_measure", lambda rows: {
+    monkeypatch.setattr(tracker, "_s1_canonical_checkpoint_measure", lambda rows: {
         "n": 20, "mean_abs_error_pp": None, "mean_signed_error_pp": 0,
     })
     rep = tracker._s1_unit_sentry_apply(out, records, "enforce")
@@ -218,12 +219,19 @@ def test_assembly_exception_cannot_republish_legacy_pass(tracker, monkeypatch):
 
 def test_resolved_nonfinite_realized_value_cannot_be_published(tracker, monkeypatch):
     records = _historical_pair(tracker)
+    # Prove the target unit first so this test reaches realized-evidence
+    # quarantine, independently of the legacy provenance rejection.
+    import json
+    records[0].target_roi = .07
+    records[0].notes = tracker._TARGET_SCHEMA_TAG + json.dumps({
+        "version": 2, "horizon": "1W", "roi_unit": "percent_points",
+        "basis": "forecast_price", "producer_version": tracker.SCRIPT_VERSION}) + "]"
     records[0].realized_roi = float("inf")
     monkeypatch.setenv("TFB_PERF_TARGET_UNIT_SENTRY", "enforce")
     rep = tracker.s1_checkpoint_calibration(records)
     assert rep["state"] == "PENDING" and rep["n"] == 0
     assert rep["mean_abs_error_pp"] is None
-    assert rep["unit_sentry"]["error"] == "unit_sentry_error:ValueError"
+    assert rep["unit_sentry"]["unresolved_why"] == {"invalid_realized_evidence": 1}
 
 
 def test_publisher_writes_pending_and_blank_unknown_metrics(tracker, monkeypatch):

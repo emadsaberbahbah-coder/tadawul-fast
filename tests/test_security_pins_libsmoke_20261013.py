@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # tests/test_security_pins_libsmoke_20261013.py
 """
-Library behaviour smoke for the requirements.txt v1.1.4 security bumps.
+Library behaviour smoke for the requirements.txt security bumps.
+
+VERSION 1.1.0 (2026-10-24)
+Retain every implemented library behavior check. Replace reserved NLTK's
+unused tokenizer with an explicit retirement guard and real RSS-to-result
+parity suite, extend installed-version checks to the framework/OTEL family,
+and exercise actual ASGI spans, OTLP protobuf export and bounded tracestate
+propagation. Required production smoke imports cannot silently skip.
 
 VERSION 1.0.0 (2026-10-13)
 WHY: requirements.txt v1.1.4 moves twelve production pins (aiohttp, anyio,
@@ -83,17 +90,20 @@ import unittest
 from pathlib import Path
 from typing import Dict, List
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements.txt"
 PINS_HARNESS = ROOT / "tests" / "test_security_pins_20261013.py"
 
-# Distribution names of the twelve pins requirements.txt v1.1.4 moved.
+# Distribution names covered by strict installed-version parity.
 BUMPED = (
-    "aiohttp", "anyio", "cryptography", "h2", "lxml", "nltk", "protobuf",
+    "aiohttp", "anyio", "cryptography", "h2", "lxml", "protobuf",
     "pydantic-settings", "pyjwt", "pyopenssl", "python-dotenv",
     "python-multipart",
+    "fastapi", "starlette", "opentelemetry-api", "opentelemetry-sdk",
+    "opentelemetry-instrumentation", "opentelemetry-instrumentation-asgi",
+    "opentelemetry-instrumentation-fastapi", "opentelemetry-exporter-otlp",
 )
 
 
@@ -106,6 +116,8 @@ def _need(*modules: str) -> None:
         try:
             importlib.import_module(name)
         except Exception as exc:  # noqa: BLE001
+            if os.getenv("TFB_LIBSMOKE_REQUIRE_PINNED") == "1":
+                raise AssertionError("required production smoke import failed: " + name) from exc
             raise unittest.SkipTest("%s not importable here (%s: %s)" % (name, type(exc).__name__, exc))
 
 
@@ -310,11 +322,14 @@ def test_l06_lxml_bs4_and_pandas_read_html() -> None:
     print("L6 lxml %s ok: %s" % (_version("lxml"), ", ".join(checked)))
 
 
-def test_l07_nltk_tokenize() -> None:
-    _need("nltk")
-    from nltk.tokenize import wordpunct_tokenize
-    assert wordpunct_tokenize("Hi, there") == ["Hi", ",", "there"]
-    print("L7 nltk %s ok" % _version("nltk"))
+def test_l07_unused_nltk_is_retired_from_production() -> None:
+    reqs = _pins_module()._parse_requirements(REQUIREMENTS)
+    assert "nltk" not in reqs, "unused no-fix NLTK must not return as a production dependency"
+    if os.getenv("TFB_LIBSMOKE_REQUIRE_PINNED") == "1":
+        assert importlib.util.find_spec("nltk") is None, "NLTK was reinstalled into the production stack"
+    # Real RSS-to-scoring parity and active reverse dependencies are exercised
+    # in test_dependency_health_20261024.py; retirement is never a skipped test.
+    print("L7 unused NLTK production pin retired")
 
 
 def test_l08_python_dotenv_values() -> None:
@@ -534,6 +549,98 @@ def test_l15_import_main_app_with_sockets_blocked() -> None:
         assert "failed=0" in mounted.group(1) and "missing=0" in mounted.group(1), mounted.group(0)
     print("L15 main:app %s; %s" % (json.dumps(info, sort_keys=True),
                                    mounted.group(0) if mounted else "no mount line"))
+
+
+def test_l16_otel_asgi_spans_and_otlp_protobuf_export() -> None:
+    _need("fastapi", "opentelemetry.sdk.trace", "opentelemetry.instrumentation.fastapi",
+          "opentelemetry.exporter.otlp.proto.grpc.trace_exporter")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as HTTPSpanExporter
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+    import requests
+
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    memory = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    app = FastAPI()
+
+    @app.get("/telemetry-smoke")
+    def endpoint():
+        return {"ok": True}
+
+    FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
+    captured = []
+
+    class Collector:
+        def Export(self, request, **_kwargs):
+            captured.append(ExportTraceServiceRequest.FromString(request.SerializeToString()))
+
+    class HTTPSession(requests.Session):
+        def post(self, url=None, data=None, **_kwargs):
+            return self.request("POST", url, data=data)
+
+        def request(self, method, url=None, data=None, **_kwargs):
+            assert method.upper() == "POST"
+            captured.append(ExportTraceServiceRequest.FromString(data))
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b""
+            return response
+
+        def send(self, *_args, **_kwargs):
+            raise AssertionError("OTLP smoke must use only its in-memory transport")
+
+    exporter = OTLPSpanExporter(endpoint="localhost:1", insecure=True)
+    exporter._client = Collector()  # Real encoding/export path, local in-memory transport.
+    http_exporter = HTTPSpanExporter(endpoint="http://collector.invalid/v1/traces", session=HTTPSession())
+    try:
+        with TestClient(app) as client:
+            response = client.get("/telemetry-smoke")
+        assert response.status_code == 200 and response.json() == {"ok": True}
+        assert provider.force_flush()
+        spans = memory.get_finished_spans()
+        assert any(span.attributes.get("http.route") == "/telemetry-smoke" for span in spans)
+        assert exporter.export(spans) is SpanExportResult.SUCCESS
+        assert http_exporter.export(spans) is SpanExportResult.SUCCESS
+        assert len(captured) == 2
+        expected_ids = {span.context.span_id.to_bytes(8, "big") for span in spans}
+        assert expected_ids
+        for request in captured:
+            assert {span.span_id for resource in request.resource_spans
+                    for scope in resource.scope_spans for span in scope.spans} == expected_ids
+    finally:
+        exporter.shutdown()
+        http_exporter.shutdown()
+        FastAPIInstrumentor.uninstrument_app(app)
+        provider.shutdown()
+
+
+def test_l17_tracecontext_rejects_oversized_combined_tracestate() -> None:
+    _need("opentelemetry.trace")
+    from opentelemetry.trace import TraceState
+
+    assert list(TraceState.from_header(["a=b"]).items()) == [("a", "b")]
+    members = [f"v{i:02d}=" + "x" * 255 for i in range(32)]
+    assert len(",".join(members)) == 8319
+    from opentelemetry.trace import get_current_span
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+    propagator = TraceContextTextMapPropagator()
+    for headers in (["a=b"], ["a=b" + " " * 8200], [",".join(members)],
+                    [",".join(members[:16]), ",".join(members[16:])]):
+        context = propagator.extract({
+            "traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+            "tracestate": headers,
+        })
+        span = get_current_span(context).get_span_context()
+        assert span.is_valid
+        assert list(span.trace_state.items()) == ([("a", "b")] if headers == ["a=b"] else [])
 
 
 def test_i1_installed_bumped_versions_equal_requirements() -> None:
