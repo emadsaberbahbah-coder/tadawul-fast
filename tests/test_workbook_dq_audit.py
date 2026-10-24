@@ -56,7 +56,7 @@ if REPO not in sys.path:
 SCRIPT = os.path.join(REPO, "scripts", "tfb_workbook_dq_audit.py")
 FIXTURE = os.path.join(HERE, "fixtures", "dq_baseline_2026-10-10.json")
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "workbook_backup.yml")
-EXPECT = "[DQ-SELFTEST v1.0.3] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
+EXPECT = "[DQ-SELFTEST v1.0.4] 97/97 PASS  cases-digest=c1bdd1a2cc1c3927"
 EXPORT_SHA16 = "f5d327afc9fb409c"
 DECISION_CRITICAL = {"DQ-07", "DQ-08", "DQ-09", "DQ-10", "DQ-16", "DQ-22", "DQ-24", "DQ-25", "DQ-30", "DQ-33", "DQ-34",
                      "DQ-38", "DQ-46", "DQ-53", "DQ-62"}
@@ -112,7 +112,7 @@ def test_p4_not_a_copy_of_the_script():
     with open(os.path.abspath(__file__), "rb") as f:
         me = f.read()
     assert hashlib.sha256(script).hexdigest() != hashlib.sha256(me).hexdigest()
-    assert b'SCRIPT_VERSION = "1.0.3"' in script
+    assert b'SCRIPT_VERSION = "1.0.4"' in script
     assert b"def test_" not in script
 
 
@@ -211,7 +211,7 @@ def test_p9_import_is_side_effect_free():
             "assert 'scripts.tfb_export_audit' not in sys.modules; print(m.SCRIPT_VERSION)")
     p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=REPO, timeout=120)
     assert p.returncode == 0, p.stderr
-    assert p.stdout.strip() == "1.0.3"
+    assert p.stdout.strip() == "1.0.4"
 
 
 def test_p10_workflow_wiring():
@@ -265,11 +265,15 @@ def test_p12_golden_run_on_the_real_export():
         out = os.path.join(tmp, "dq_report.json")
         rc, text = _run(export, "--json", out, "--baseline", FIXTURE, "--quiet")
         assert rc == 0, text[-600:]
-        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.3]")][-1]
+        line = [ln for ln in text.splitlines() if ln.startswith("[DQ-AUDIT v1.0.4]")][-1]
         assert "regressions=0 critical_regressions=0" in line, line
         report = json.load(open(out, encoding="utf-8"))
     fx = _fixture()
     assert report["export_sha256"] == fx["export_sha256"]
+    # v1.0.4 adds the full-source denominators to DQ-72. Preserve the frozen
+    # historical fixture and every old value; derive only these new witnesses.
+    for page, count in fx["expect"].items():
+        fx["checks"]["DQ-72"]["values"][f"{page}:source_rows"] = count
     assert dq.reduce_baseline(report)["checks"] == fx["checks"]
     assert report["baseline"]["decision_critical_regressions"] == [] and report["baseline"]["regressions"] == []
     dq._assert_redacted(report)

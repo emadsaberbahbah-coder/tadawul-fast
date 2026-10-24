@@ -187,6 +187,8 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     # merged): builder 1.27.3, actions 1.16.1 (#816), engine 5.157.0.
     # second merge note 2026-10-22: the bundle head is now b08d01cc (main #817
     # merged): builder 1.27.3, actions 1.16.1, engine 5.159.0.
+    # 2026-10-24: the bundle head is 2462215c (main #821-#829 merged); the same
+    # versions, so the assertions below are unchanged.
     assert bob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
     assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.16.1"
     assert bde.__version__ == "5.159.0"

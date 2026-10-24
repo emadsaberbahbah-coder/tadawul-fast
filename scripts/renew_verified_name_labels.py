@@ -60,7 +60,7 @@ if str(ROOT) not in sys.path:
 
 from core import verified_name_labels as labels  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REVIEW_WINDOW = timedelta(days=7)
 MAX_BODY = 40_000_000
 DIRECTORY_FILES = {
@@ -275,6 +275,57 @@ def expiring(registry, *, now, within):
                   if datetime.fromisoformat(b["expires_at_utc"]) <= now + within)
 
 
+def expiry_report(registry, *, now, within):
+    """Separate expired authority evidence from the advance warning window."""
+    due = expiring(registry, now=now, within=within)
+    expired = sorted(b["page"] + "|" + b["symbol"] for b in registry["bindings"]
+                     if datetime.fromisoformat(b["expires_at_utc"]) <= now)
+    expired_keys = set(expired)
+    soon = [key for key in due if key not in expired_keys]
+    return {"version": VERSION, "checked_at_utc": now.isoformat(),
+            "bindings": len(registry["bindings"]), "expiring_within_h": within.total_seconds() / 3600,
+            "expiring": due, "expired": expired, "due_soon": soon,
+            "status": "EXPIRED" if expired else "DUE_SOON" if soon else "CLEAR",
+            "registry_changed": False, "automatic_renewal": False,
+            "next_action": ("Dispatch name_label_renewal.yml with mode=renew and publish_branch=true; "
+                            "re-capture each authority source and review the resulting branch. "
+                            "Held bindings stay unchanged; never extend their expiry by hand.") if due else "none"}
+
+
+def render_step_summary(report):
+    """Make scheduled expiry and partial manual renewals visible in Actions."""
+    if not isinstance(report, dict) or not (
+            isinstance(report.get("expiring"), list) or
+            isinstance(report.get("renewed"), (list, int)) and isinstance(report.get("held"), (dict, int))):
+        return "# Verified name authority check\n\nUNKNOWN: report lacks the expected check or renewal evidence.\n"
+    if "expiring" in report:
+        rows = ["# Verified name authority check", "",
+                "Status: **" + str(report.get("status", "UNKNOWN")) + "**.",
+                "A failed expiry check is an unresolved authority review, not a Python crash.", "",
+                "| Binding | Evidence status |", "|---|---|"]
+        expired = set(report.get("expired") or [])
+        for key in (report.get("expiring") or [])[:150]:
+            rows.append("| " + str(key).replace("|", " / ").replace("\n", " ") + " | "
+                        + ("EXPIRED" if key in expired else "DUE SOON") + " |")
+        rows += ["", str(report.get("next_action", "Review the retained expiry evidence."))]
+    else:
+        renewed, held = report.get("renewed") or [], report.get("held") or {}
+        renewed_n = len(renewed) if isinstance(renewed, list) else renewed
+        held_n = len(held) if isinstance(held, dict) else held
+        rows = ["# Verified name renewal", "",
+                "Status: **" + ("PARTIAL — held bindings remain unverified" if held_n else "RENEWED") + "**.",
+                f"Renewed: {renewed_n}; held unchanged: {held_n}.", "",
+                "| Held binding | Reason |", "|---|---|"]
+        for key, reason in list(held.items())[:150] if isinstance(held, dict) else []:
+            rows.append("| " + str(key).replace("|", " / ").replace("\n", " ") + " | "
+                        + str(reason).replace("|", " / ").replace("\n", " ") + " |")
+        rows += ["", "A published review branch is a candidate, not an accepted authority review. "
+                 "Review and merge verified renewals; investigate each held source separately."]
+    rows += ["", "Registry names, identity fences and expiry policy are unchanged by this summary.",
+             "See `docs/reviews/provider-name-workflow-recovery-20261024.md`."]
+    return "\n".join(rows) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--registry", default=str(labels.REGISTRY_PATH))
@@ -316,10 +367,8 @@ def main(argv=None):
         return 0 if report["applied"] else 3
     soon = expiring(registry, now=now, within=timedelta(hours=args.warn_hours))
     if args.check:
-        report = {"version": VERSION, "checked_at_utc": now.isoformat(),
-                  "bindings": len(registry["bindings"]), "expiring_within_h": args.warn_hours,
-                  "expiring": soon}
-        print(json.dumps({k: (len(v) if k == "expiring" else v) for k, v in report.items()}))
+        report = expiry_report(registry, now=now, within=timedelta(hours=args.warn_hours))
+        print(json.dumps({k: (len(v) if isinstance(v, list) else v) for k, v in report.items()}))
         if args.report:
             Path(args.report).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
         return 1 if soon else 0
