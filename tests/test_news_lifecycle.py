@@ -9,6 +9,7 @@ import pytest
 from scripts import news_archive_collector as archive
 
 NOW = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+REVIEW_NOW = datetime(2026, 10, 24, 6, tzinfo=timezone.utc)
 
 
 def options():
@@ -24,6 +25,29 @@ def test_cli_legacy_is_excluded_without_remapping(monkeypatch):
     assert evidence["lifecycle_excluded_count"] == 2
     assert {r["status"] for r in evidence["lifecycle_exclusions"]} == {"VERIFIED_LEGACY"}
     assert evidence["requested_before_lifecycle"] == 4 and evidence["discovery_complete"]
+
+
+def test_terminated_symbol_is_excluded_without_inventing_a_successor(monkeypatch):
+    monkeypatch.setattr(archive, "_utc_now", lambda: REVIEW_NOW)
+    args = options(); args.universe = ["VFLQ.US", "ACTIVE.US"]
+    universe, items, evidence = archive._select_news_universe(args, None, "2026-10-24")
+    assert universe == ["ACTIVE.US"] and items == [{"symbol": "ACTIVE.US"}]
+    assert evidence["lifecycle_excluded_count"] == 1
+    terminated = evidence["lifecycle_exclusions"][0]
+    assert terminated["symbol"] == "VFLQ.US"
+    assert terminated["lifecycle_kind"] == "TERMINATED"
+    assert "successor_symbol" not in terminated
+    assert terminated["status"] == "VERIFIED_LEGACY"
+
+
+def test_current_legacy_ticker_change_retains_successor_as_evidence_only(monkeypatch):
+    monkeypatch.setattr(archive, "_utc_now", lambda: REVIEW_NOW)
+    args = options(); args.universe = ["SPLG.US"]
+    universe, items, evidence = archive._select_news_universe(args, None, "2026-10-24")
+    assert universe == items == [] and not evidence["discovery_complete"]
+    legacy = evidence["lifecycle_exclusions"][0]
+    assert legacy["symbol"] == "SPLG.US" and legacy["successor_symbol"] == "SPYM.US"
+    assert legacy["lifecycle_kind"] == "LEGACY_SYMBOL"
 
 
 def test_legacy_only_never_auto_adds_successor(monkeypatch):
@@ -96,6 +120,23 @@ def test_invalid_registry_or_declaration_cannot_verify_empty_exclusions(tmp_path
     path = tmp_path / "labels.json"; path.write_text(json.dumps(data))
     entries, status = load_news_lifecycle(now=NOW.replace(tzinfo=None) if bad == "clock" else NOW,
                                         registry_path=path)
+    assert entries == {} and status["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("bad", ["successor", "kind"])
+def test_terminated_declaration_cannot_carry_an_alias_or_unknown_kind(tmp_path, bad):
+    from core import verified_name_labels as labels
+    from core.news_identity_lifecycle import load_news_lifecycle
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    item = next(x for x in data["bindings"] if x["symbol"] == "VFLQ.US")
+    data["bindings"] = [item]
+    if bad == "successor":
+        item["identifiers"]["successor_symbol"] = "VFLQ2.US"
+    else:
+        item["identifiers"]["news_lifecycle"] = "DELISTED_MAYBE"
+    item["review_receipt_sha256"] = labels._binding_digest(item)
+    path = tmp_path / "labels.json"; path.write_text(json.dumps(data))
+    entries, status = load_news_lifecycle(now=REVIEW_NOW, registry_path=path)
     assert entries == {} and status["status"] == "UNKNOWN"
 
 

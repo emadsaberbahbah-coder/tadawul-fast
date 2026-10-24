@@ -32,17 +32,29 @@ def load_news_lifecycle(*, now, registry_path=None):
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]*\.[A-Z]{1,5}", symbol):
                 raise ValueError("ambiguous lifecycle namespace")
             effective = labels._utc(ids["lifecycle_effective_utc"])
-            successor = ids["successor_symbol"]
-            if (ids["news_lifecycle"] != "LEGACY_SYMBOL"
-                    or not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]*\.[A-Z]{1,5}", successor)
-                    or successor == symbol or effective > reviewed):
+            kind = ids["news_lifecycle"]
+            successor = ids.get("successor_symbol")
+            if kind == "LEGACY_SYMBOL":
+                declaration_valid = (bool(re.fullmatch(
+                    r"[A-Z0-9][A-Z0-9_-]*\.[A-Z]{1,5}", successor or ""))
+                    and successor != symbol)
+            elif kind == "TERMINATED":
+                # A liquidated/dissolved instrument has no successor. Requiring
+                # one would either keep a known-dead ticker in acquisition or
+                # invite a fabricated alias merely to satisfy the schema.
+                declaration_valid = successor is None
+            else:
+                declaration_valid = False
+            if not declaration_valid or effective > reviewed:
                 raise ValueError("invalid lifecycle declaration")
             record = {"symbol": symbol, "historical_name": item["name"],
                       "status": "VERIFIED_LEGACY" if reviewed <= now < expires else "UNKNOWN",
-                      "effective_utc": effective.isoformat(), "successor_symbol": successor,
+                      "lifecycle_kind": kind, "effective_utc": effective.isoformat(),
                       "effective_time_precision": ids.get("lifecycle_time_precision", "instant"),
                       "reviewed_at_utc": reviewed.isoformat(), "expires_at_utc": expires.isoformat(),
                       "sources": item["sources"], "review_receipt_sha256": item["review_receipt_sha256"]}
+            if successor is not None:
+                record["successor_symbol"] = successor
             if symbol in entries and entries[symbol] != record:
                 raise ValueError("conflicting lifecycle declarations")
             entries[symbol] = record
