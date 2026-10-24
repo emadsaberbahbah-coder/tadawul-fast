@@ -1,7 +1,7 @@
 {
   "schema": "tfb.dependency-verification.v1",
   "baseline_commit": "561db60c74c1d56d866d4b72756f8ef9a9df57d5",
-  "recorded_utc": "2026-10-24T09:21:21.471792+00:00",
+  "recorded_utc": "2026-10-24T09:58:11.393915+00:00",
   "python": "3.12.14",
   "versions": {
     "pip": "26.2",
@@ -25,9 +25,11 @@
     "tests/test_security_pins_20261013.py": "74b73c08a9ce0441d12be4fac51191c4fe91184593f54f32d09d9622c7fa0e3c",
     "tests/test_security_pins_libsmoke_20261013.py": "6ca89198414f82ced62e4d192a9b77ccafd962c7c63c12edbb6a9bf5582090b6",
     "tests/test_dependency_health_20261024.py": "93266551f2a5f5b3326da66a5de2e89cf3acd64be21faefb82de602e87986a04",
-    "tests/test_framework_security_20261024.py": "a3a41ccb09c007b5f40c4d2b751002865ceb2bae5a404bfbb7505539a9053208",
-    "tests/test_auth_wall_scope_path.py": "7a9996e2a1b7aa6c02d1023fa9c5e7d5b9659f7973681f7acc7e3efa7ade0c15",
-    "tests/test_platform_source_read.py": "f1d232bedf7c7feb1da674aca00a7e006d2e5bff3e7057d492be1afb25e6a623"
+    "tests/test_framework_security_20261024.py": "ba5826a5aafff5f13d8a8631c7c92e23c988e5088061a5bd2bda2de7cb9d9a8e",
+    "tests/test_auth_wall_scope_path.py": "1b5aa4330edae0d0e2a126b2d8314367dfa02d6fbbb75a9e47cb27a6ace211ce",
+    "tests/test_platform_source_read.py": "f1d232bedf7c7feb1da674aca00a7e006d2e5bff3e7057d492be1afb25e6a623",
+    "main.py": "7f980aa4f3f82bb6ccec9141991045b74074299a0b6565f0424fe78b413ffac2",
+    "scripts/verify_deployment.py": "bf6ff7e01e3fa40893ddf9fb90ad1a7bafd687f92823eae7b2270c6bcd537aee"
   },
   "commands": {
     "whole_suite": "env -u ALL_PROXY -u all_proxy TFB_LIBSMOKE_REQUIRE_PINNED=1 python -m pytest -q tests",
@@ -65,13 +67,6 @@
       "passed": 91,
       "skipped": 2
     },
-    "candidate_whole_suite": {
-      "passed": 5813,
-      "skipped": 43,
-      "subtests_passed": 274,
-      "warnings": 3,
-      "duration_seconds": 405.37
-    },
     "independent_final_batch": {
       "passed": 136,
       "skipped": 8,
@@ -87,7 +82,29 @@
     "final_installed_advisories": 0,
     "final_installed_skips": 0,
     "deployment_performed": false,
-    "exact_head_ci": "pending publication"
+    "exact_head_ci": "pending final diagnostic follow-up",
+    "candidate_whole_suite_before_debug_inventory_follow_up": {
+      "passed": 5813,
+      "skipped": 43,
+      "subtests_passed": 274,
+      "warnings": 3,
+      "duration_seconds": 405.37
+    },
+    "debug_inventory_follow_up": {
+      "baseline_commit": "b75a2da9521d42a80809e6e088d87ca7eddbaaf0",
+      "original_candidate_failures": 2,
+      "corrected_candidate_passed": 2,
+      "old_eager_stack_passed": 2,
+      "focused_passed": 80,
+      "focused_skipped": 7,
+      "focused_subtests_passed": 31
+    },
+    "combined_workflow_and_dependency_before_debug_follow_up": {
+      "passed": 474,
+      "skipped": 2,
+      "subtests_passed": 56
+    }
   },
-  "audit_tool_version": "2.9.0"
+  "audit_tool_version": "2.9.0",
+  "initial_verification_utc": "2026-10-24T09:21:21.471792+00:00"
 }

@@ -97,12 +97,32 @@ and uses the existing effective-route traversal. All scopes, token/root-path
 tripwires, HTTP checks and exact route ownership/methods remain required.
 These adapted harnesses pass identically on both stacks: 45 passed, six
 skipped, 31 subtests. The broader candidate contract battery passes 143 tests,
-nine skips and 31 subtests. The final complete candidate suite passes
+nine skips and 31 subtests. The complete candidate suite before the diagnostic follow-up passed
 **5,813 tests and 274 subtests**, with 43 intentional/optional skips and three
 preexisting test-return warnings, in 405.37 seconds. Independent final review
 has no outstanding findings; its combined batch passes 136 tests and 31
 subtests with eight intentional/optional skips. Exact-head CI and any later
 deployment acceptance remain required; this revision has not been deployed.
+
+## Diagnostic follow-up from pull-request review
+
+The upgraded framework's lazy includes exposed one remaining flat inventory
+inside `/_debug/routes`: business endpoints served successfully and appeared
+in signatures/owner maps, but were absent from `route_paths` and alias-presence
+flags. Main 8.14.7 now lists and counts effective routes through the existing
+traversal, matching the other diagnostics. Registration, authentication and
+request handling are unchanged; the deployment manifest pin advances with it.
+
+Two real HTTP-response regressions (one/all three nested aliases) fail against
+the original candidate and pass after the correction, and also pass on the old
+eager stack. They verify direct/health paths, unregistered aliases remaining
+false, exact owners/signatures and counts, and missing/wrong token 401s without
+inventory disclosure. External connections are forbidden. Fresh focused
+validation passes 80 tests and 31 subtests with seven optional skips. The
+combined workflow/dependency revision had already passed 474 tests and 56
+subtests with two optional skips before this follow-up. Final exact-head CI
+must include the diagnostic correction; earlier full-suite counts are retained
+as earlier-stage evidence, not relabelled as a test of the later source.
 
 Primary references: [aiohttp 3.14.4](https://github.com/aio-libs/aiohttp/releases/tag/v3.14.4),
 [OpenTelemetry advisory](https://github.com/open-telemetry/opentelemetry-python/security/advisories/GHSA-xcq7-p3pf-p88h),
