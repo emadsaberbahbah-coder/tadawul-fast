@@ -2,6 +2,20 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.35 (2026-10-24) -- DT10 CONFIRM BASIS
+#
+# v1.1.35: run tests/test_dt10_confirm_basis.js (16_Decision_Top10.gs v1.14.0:
+# Script Property TFB_T10_CONFIRM_BASIS, default 'qualified' -- a day-advance on
+# which a tracked symbol is absent from the backend's sized top-N but INVEST on
+# the audited grid inside 'T10: Stability Rank Buffer' counts as a confirmation
+# day instead of resetting the count; 'raw' is the v1.13.11 clock byte for
+# byte; seating still needs a raw ticket) in the blocking lean lane's native
+# Apps Script step, next to tests/test_dt10_calendar_completeness.js. Offline;
+# the REAL file in a vm context; the v1.13.11 base is rebuilt from the delivered
+# file by reversing the enumerated v1.14.0 edits (SHA-256 pinned in
+# tests/js/dt10_cash_utc_history.js) for the golden negative and the kill
+# identity. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.34 (2026-10-24) -- F-7 v2b SETTLE SHADOW
 #
 # v1.1.34: run tests/test_de_f7_settle_shadow.py (data_engine_v2 v5.158.0:
@@ -853,6 +867,7 @@ jobs:
         run: |
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
+          node tests/test_dt10_confirm_basis.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js

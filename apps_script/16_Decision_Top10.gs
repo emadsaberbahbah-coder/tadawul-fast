@@ -1,11 +1,72 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.14.0 (2026-10-24) [CONFIRM-BASIS] -- QUALIFIED DAYS COUNT TOWARD CONFIRMATION
+ * WHY (owner, 24 Oct 2026): a stock that qualifies on day 1 and day 2 is
+ * pushed out of the backend's raw top-10 on day 3 by a higher-ranked
+ * newcomer. It is still INVEST on the audited grid, only ranked lower, yet
+ * its confirmation count fell to 0 and it had to start over. Live trail:
+ * the 22 Oct board seated XIOR.BR, GBCI.US and PINE.US at FAST-TRACK 1/3;
+ * on the 24 Oct advance none of them was in the raw set and every count
+ * read 0 again (those three had also left INVEST, so the rule below would
+ * not have kept them; it keeps a name that stays INVEST inside the
+ * buffer). Mechanism, pinned on v1.13.11: the dt10StabCore_ counter pass
+ * advances ci only for a symbol present in rawSet (payload.selected, the
+ * sized top-N); any other day-advance sets ci = 0, and for a member only
+ * the exit clock honours the rank buffer (pause). Confirmation was keyed
+ * to the sized list, not to qualification.
+ * WHAT: Script Property TFB_T10_CONFIRM_BASIS, read ONCE in
+ *   dt10ApplyStability_ (dt10StabConfirmBasis_, the dt10HardVerdictStrict_
+ *   pattern: the service read stays outside the pure core) into
+ *   knobs.confirm_basis. 'qualified' (DEFAULT, owner decision 2026-10-24)
+ *   | 'raw' (legacy). Anything else, blank or a service fault reads as
+ *   'qualified'. Under 'raw' every clock, label, note and state byte is
+ *   v1.13.11.
+ * (a) new PURE dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs,
+ *   hardOut): the symbol has an audited row whose verdict is exactly
+ *   INVEST (any case), no structural_block, not hardOut, and its
+ *   opportunity-score rank across the deduped audited grid is <= 'T10:
+ *   Stability Rank Buffer' (> 0) -- the SAME window the exit-clock pause
+ *   has used since v1.3.0 (rank <= buffer, default 15), so the panel knob
+ *   keeps one meaning.
+ * (b) counter pass, day-advance, not outage-paused: when the symbol is NOT
+ *   in rawSet and knobs.confirm_basis === 'qualified' and (a) holds, the
+ *   day counts exactly like a raw sighting: ci + 1, co = 0, score point
+ *   recorded. Otherwise the v1.13.11 branch runs unchanged (ci = 0; a
+ *   member pauses inside the buffer or takes a miss). Members benefit the
+ *   same way: a GRACE or FAST-TRACK seat still INVEST inside the buffer
+ *   has co reset and ci advanced instead of a pause, so a fast-track seat
+ *   can graduate on a qualified day (its label that day stays GRACE, ghost
+ *   path, sizing suspended -- no raw ticket, no sizing).
+ * (c) NOT changed: seating. Entry as 'NEW (confirmed n/n)' still requires
+ *   presence in rawSyms (a sized ticket); fast-track fills only from
+ *   rawSyms; displacement, capacity, hard/soft exit and every label are
+ *   v1.13.11. The rule applies to symbols already tracked in the state
+ *   blob (members and past raw sightings inside the 14-day prune window);
+ *   a symbol never seen in raw is not tracked and accrues nothing.
+ * (d) Read-back: under 'qualified' the stab note gains ', confirm=qualified'
+ *   and, when a non-raw challenger inside the buffer has ci > 0, ', near
+ *   <k> SYM(ci/confirm_days) ...' (up to 3, the 'pending' style). Under
+ *   'raw' no token is added (byte-identical note).
+ * (e) dt10SelfTest gains 'confirm basis (TFB_T10_CONFIRM_BASIS): ...' and
+ *   the pure battery 'confirm basis core: ok' (raw replay identity; day-1/2
+ *   raw, day-3 qualified at rank 12 -> ci 3, day-4 seated NEW 3/3 with the
+ *   raw ticket's sizing; WATCH -> 0; rank buffer + 1 -> 0; buffer 0 ->
+ *   legacy; GRACE member -> co 0, ci advanced).
+ * Functions added (0 removed): dt10StabQualifiedWithin_,
+ * dt10StabConfirmBasis_; var added: DT10_T10_CONFIRM_BASIS_PROP.
+ * Harness: tests/test_dt10_confirm_basis.js (REAL file; golden negative on
+ * the v1.13.11 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * deep-equal; ES5/ASCII lint; inventory). Rollback: Script Property
+ * TFB_T10_CONFIRM_BASIS = raw (no re-paste) or re-paste v1.13.11.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)
  * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10
@@ -1802,7 +1863,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.11';
+var DT10_VERSION = '1.14.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2666,6 +2727,9 @@ var DT10_STAB_DEF_BUFFER = 15;    // audit-grid rank <= buffer pauses exit clock
 var DT10_STAB_DEF_SMOOTH = 5;     // score-history window (days)
 var DT10_STAB_TREND_EPS = 2.0;    // |first-last| below this = 'steady'
 var DT10_STAB_PRUNE_DAYS = 14;    // drop non-member entries unseen this long
+// v1.14.0 [CONFIRM-BASIS]: which days count toward entry confirmation --
+// see the v1.14.0 header block. 'qualified' (default) | 'raw' (v1.13.11).
+var DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';
 // v1.11.10 [P-168]: outage pause -- see the v1.11.10 header block.
 var DT10_P168_MAX_PAUSE_DAYS = 5;         // consecutive paused day-advances
 var DT10_P168_OUTAGE_RE = /fetch_failed/i; // engine tag family on 'Warnings'
@@ -3570,6 +3634,25 @@ function dt10OutageMapFromPool_(rows) {
   }
   return map;
 }
+/** v1.14.0 [CONFIRM-BASIS] PURE: is `sym` INVEST-qualified inside the rank
+ * buffer on this run? True when the deduped audited grid (candBySym) has a
+ * row for it whose verdict is exactly INVEST (any case), structural_block is
+ * not true, hardOut(sym) is false, knobs.rank_buffer > 0 and its
+ * opportunity-score rank (globalRank, 1 = best) is <= knobs.rank_buffer --
+ * the same window the exit-clock pause has used since v1.3.0. Never throws;
+ * a symbol absent from the grid is false (absence is jitter, not a
+ * qualification). hardOut is the caller's closure over candBySym + knobs. */
+function dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut) {
+  var c = candBySym ? candBySym[sym] : null;
+  if (!c || typeof c !== 'object') return false;
+  if (String(c.verdict || '').toUpperCase() !== 'INVEST') return false;
+  if (c.structural_block === true) return false;
+  if (typeof hardOut === 'function' && hardOut(sym)) return false;
+  var buf = knobs ? Number(knobs.rank_buffer) : 0;
+  if (!(buf > 0)) return false;
+  var r = globalRank ? Number(globalRank[sym]) : 0;
+  return r > 0 && r <= buf;
+}
 /**
  * Membership-hysteresis core. Inputs:
  *   rawTickets  payload.selected (backend's memoryless answer, best-first)
@@ -3663,6 +3746,14 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     var v = Number(c.opportunity_score);
     return isFinite(v) ? v : null;
   }
+  // v1.14.0 [CONFIRM-BASIS]: the basis rides as a plain knob (service read in
+  // dt10ApplyStability_). Only the exact string 'qualified' arms the
+  // qualified branch; an absent knob (older callers, the self-test replays)
+  // is the v1.13.11 raw basis.
+  var qualifiedBasis = knobs.confirm_basis === 'qualified';
+  function qualifiedWithin(sym) {
+    return dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut);
+  }
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -3707,6 +3798,13 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
         pausedSyms.push(sym);
       } else {
         if (rawSet[sym]) {
+          st.ci = (st.ci || 0) + 1;
+          st.co = 0;
+        } else if (qualifiedBasis && qualifiedWithin(sym)) {
+          // v1.14.0 [CONFIRM-BASIS]: absent from the sized top-N but INVEST
+          // on the audited grid inside the rank buffer -- the day counts
+          // exactly like a raw sighting (ci + 1, co = 0; the score point
+          // below is recorded as for raw). The 'raw' basis never gets here.
           st.ci = (st.ci || 0) + 1;
           st.co = 0;
         } else {
@@ -3994,6 +4092,32 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   }
   var note = 'stab: ' + (noteBits.length ? noteBits.join(', ') :
                          'steady — no membership change');
+  // v1.14.0 [CONFIRM-BASIS]: read-back tokens under the qualified basis only
+  // ('raw' leaves the note byte-identical to v1.13.11): the armed basis and
+  // the non-raw challengers inside the buffer whose count is alive.
+  if (qualifiedBasis) {
+    var nearSyms = [];
+    for (var nqk in symbols) {
+      if (!symbols.hasOwnProperty(nqk) || symbols[nqk].member || rawSet[nqk]) continue;
+      if ((symbols[nqk].ci || 0) > 0 && qualifiedWithin(nqk)) nearSyms.push(nqk);
+    }
+    nearSyms.sort(function (a, b) {
+      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);
+      if (dci) return dci;
+      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);
+      if (drk) return drk;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+    note += ', confirm=qualified';
+    if (nearSyms.length) {
+      var nqParts = [];
+      for (var nqi = 0; nqi < nearSyms.length && nqParts.length < 3; nqi++) {
+        nqParts.push(nearSyms[nqi] + '(' + (symbols[nearSyms[nqi]].ci || 0) +
+                     '/' + knobs.confirm_days + ')');
+      }
+      note += ', near ' + nearSyms.length + ' ' + nqParts.join(' ');
+    }
+  }
   return {
     tickets: tickets,
     state: state,
@@ -4135,6 +4259,24 @@ function dt10EpochKeyLegacy_() {
         .getProperty('DT10_P144_EPOCH_KEY_LEGACY') || '') === '1';
   } catch (eEk) {}
   return false;
+}
+
+/**
+ * v1.14.0 [CONFIRM-BASIS]: confirmation basis -- Script Property
+ * TFB_T10_CONFIRM_BASIS (DT10_T10_CONFIRM_BASIS_PROP). Exactly 'raw'
+ * (trimmed, any case) selects the v1.13.11 clocks; anything else, a blank
+ * or a PropertiesService fault reads as 'qualified' (the owner's default of
+ * 2026-10-24). Mirrors dt10HardVerdictStrict_ (service read outside the
+ * pure core); never throws.
+ */
+function dt10StabConfirmBasis_() {
+  try {
+    var v = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_CONFIRM_BASIS_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return v === 'raw' ? 'raw' : 'qualified';
+  } catch (eCb) {}
+  return 'qualified';
 }
 
 /** v1.11.11 [P-144] PURE: UTC date key ('yyyy-MM-dd') of a feed-stamp
@@ -6188,6 +6330,9 @@ function dt10ApplyStability_(payload, panel, outage) {
   // v1.8.0 (BE-2): the service read lives HERE so dt10StabCore_ stays
   // pure/node-testable; the core consumes the choice as a plain knob.
   knobs.hard_strict = dt10HardVerdictStrict_();
+  // v1.14.0 [CONFIRM-BASIS]: same pattern -- one service read here, the
+  // core consumes the basis as a plain knob ('qualified' default | 'raw').
+  knobs.confirm_basis = dt10StabConfirmBasis_();
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -8535,6 +8680,115 @@ function dt10SelfTest() {
             'feed run token missing/ambiguous' &&
         dt10FeedCohortCheck_('x | superseded_by_run=7.1', '7').ok === false &&
         dt10FeedCohortCheck_('EXECUTABLE | run=7', '').ok === false) ? 'ok' : 'FAIL'));
+  /* v1.14.0 [CONFIRM-BASIS]: basis line (one property read) + pure battery
+     (no services). Board of 2 seats: A (ACTIVE) and B (GRACE 1/3, INVEST at
+     rank 15 = the buffer boundary); challenger CHAL in raw on days 1-2,
+     displaced from raw by NEWC on day 3 while INVEST at rank 12, back on
+     day 4. Grid ranks: NEWC 97 (1), A 95 (2), F1..F12 94.5..83.5, CHAL 86
+     (12), B 84 (15). */
+  report.push('confirm basis (TFB_T10_CONFIRM_BASIS): ' + dt10StabConfirmBasis_() +
+              ' (default qualified; raw = v1.13.11 clocks)');
+  function cbKnobs(basis, buf) {
+    return { enabled: true, confirm_days: 3, exit_days: 3,
+             rank_buffer: (buf === undefined ? 15 : buf), smooth_days: 5,
+             hard_strict: true, confirm_basis: basis };
+  }
+  function cbCand(sym, sc, verdict) {
+    return { symbol: sym, name: sym, opportunity_score: sc,
+             verdict: (verdict === undefined ? 'INVEST' : verdict), price: 10 };
+  }
+  function cbTk(sym, sc) {
+    return { symbol: sym, name: sym, opportunity_score: sc, suggested_sar: 5000,
+             suggested_shares: 50, entry_zone: '9-11', stop_sar: 8, tp1_sar: 12,
+             tp2_sar: 14, exp_gain_12m_sar: 900, advisor_note: 'INVEST',
+             detail: { funds_from: 'Cash 5,000 SAR' } };
+  }
+  function cbGrid(chalScore, chalVerdict) {
+    var g = [cbCand('NEWC.US', 97), cbCand('A.US', 95)];
+    for (var cf = 1; cf <= 12; cf++) g.push(cbCand('F' + cf + '.US', 95.5 - cf));
+    g.push(cbCand('B.US', 84));
+    g.push(cbCand('CHAL.US', chalScore, chalVerdict));
+    return g;
+  }
+  var cbSeed = { v: 1, date: '2026-10-20', symbols: {
+      'A.US': { ci: 3, co: 0, member: true, since: '2026-10-15',
+                ls: '2026-10-20', hist: [95], ft: false },
+      'B.US': { ci: 3, co: 1, member: true, since: '2026-10-15',
+                ls: '2026-10-20', hist: [84], ft: false } } };
+  var cbRaw = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+               [cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+               [cbTk('A.US', 95), cbTk('NEWC.US', 97)],
+               [cbTk('A.US', 95), cbTk('CHAL.US', 86)]];
+  var cbDays = ['2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'];
+  function cbRun(knobs, day3Score, day3Verdict) {
+    var st = dt10StabParseState_(cbSeed);
+    var outs = [];
+    for (var cd = 0; cd < 4; cd++) {
+      var grid = (cd === 2) ? cbGrid(day3Score, day3Verdict) : cbGrid(86);
+      var o = dt10StabCore_(cbRaw[cd], grid, st, knobs, 2, cbDays[cd]);
+      st = dt10StabParseState_(o.state);
+      outs.push(o);
+    }
+    return outs;
+  }
+  function cbTk4(outs, sym) {
+    for (var ct = 0; ct < outs[3].tickets.length; ct++) {
+      if (outs[3].tickets[ct].symbol === sym) return outs[3].tickets[ct];
+    }
+    return null;
+  }
+  function cbClocks(outs) {   // everything but the armed-basis token
+    var cc = [];
+    for (var ck = 0; ck < outs.length; ck++) {
+      cc.push({ t: outs[ck].tickets, s: outs[ck].state, a: outs[ck].audit,
+                n: outs[ck].note.replace(', confirm=qualified', '') });
+    }
+    return JSON.stringify(cc);
+  }
+  var cbQ = cbRun(cbKnobs('qualified'), 86);
+  var cbR = cbRun(cbKnobs('raw'), 86);
+  var cbN = cbRun(cbKnobs(undefined), 86);               // knob absent
+  var cbW = cbRun(cbKnobs('qualified'), 86, 'WATCH');   // (c)
+  var cbO = cbRun(cbKnobs('qualified'), 83);            // (d) rank 16
+  var cbE = cbRun(cbKnobs('qualified'), 84.2);          // rank 15 boundary
+  var cbZ = cbRun(cbKnobs('qualified', 0), 86);         // (e)
+  var cbZr = cbRun(cbKnobs('raw', 0), 86);
+  var opKraw = { enabled: true, confirm_days: 3, exit_days: 3, rank_buffer: 15,
+                 smooth_days: 5, hard_strict: true, confirm_basis: 'raw' };
+  var opRraw = dt10StabCore_([], [], dt10StabParseState_(opSeed), opKraw, 10,
+                             '2026-09-26', opMap);       // (a) P-168 replay
+  var cbChal4 = cbTk4(cbQ, 'CHAL.US');
+  report.push('confirm basis core: ' +
+      ((JSON.stringify(opRraw) === JSON.stringify(opR) &&
+        JSON.stringify(cbR) === JSON.stringify(cbN) &&
+        cbR[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbR[3].state.symbols['CHAL.US'].ci === 1 &&
+        cbR[3].tickets.length === 2 && cbTk4(cbR, 'CHAL.US') === null &&
+        cbR[2].note.indexOf('confirm=') < 0 && cbR[2].note.indexOf('near') < 0 &&
+        cbR[0].state.symbols['B.US'].co === 1 && cbR[0].state.symbols['B.US'].ci === 0 &&
+        cbQ[1].state.symbols['CHAL.US'].ci === 2 &&
+        cbQ[2].state.symbols['CHAL.US'].ci === 3 &&
+        cbQ[2].state.symbols['CHAL.US'].member === false &&
+        cbQ[2].tickets.length === 2 &&
+        cbQ[2].note.indexOf('pending NEWC.US(1/3)') > 0 &&
+        cbQ[2].note.indexOf('confirm=qualified') > 0 &&
+        cbQ[2].note.indexOf('near 1 CHAL.US(3/3)') > 0 &&
+        cbChal4 !== null && cbChal4._stab_status === 'NEW (confirmed 3/3)' &&
+        cbChal4.suggested_sar === 5000 && cbChal4.suggested_shares === 50 &&
+        cbChal4._grace_hold !== true && cbChal4._ft_suspended !== true &&
+        cbQ[3].audit.entered.length === 1 &&
+        cbQ[3].audit.exited_displaced.length === 1 &&
+        cbQ[3].audit.exited_displaced[0] === 'B.US' &&
+        cbQ[3].note.indexOf('near 1 NEWC.US(2/3)') > 0 &&
+        cbQ[0].state.symbols['B.US'].co === 0 && cbQ[0].state.symbols['B.US'].ci === 4 &&
+        cbQ[0].state.symbols['A.US'].ci === 4 && cbR[0].state.symbols['A.US'].ci === 4 &&
+        cbW[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbO[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbE[2].state.symbols['CHAL.US'].ci === 3 &&
+        cbClocks(cbZ) === cbClocks(cbZr))
+       ? 'ok (raw = v1.13.11 clocks; qualified: day-3 rank 12 -> 3/3, day-4 NEW 3/3 sized, ' +
+         'WATCH -> 0, rank 16 -> 0, rank 15 -> 3, buffer 0 = legacy, GRACE member co 0)'
+       : 'FAIL [' + cbQ[2].note + ' | ' + cbQ[3].note + ' | ' + cbR[3].note + ']'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {
