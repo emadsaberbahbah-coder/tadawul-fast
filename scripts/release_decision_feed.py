@@ -12,18 +12,21 @@ The v1.2.0 commit sheet promised that 'a slot that lands inside a sync
 defers and retries next slot'. It does not: the prior classification (step
 4) and the provenance check (step 5) refuse with exit 3 BEFORE the in-flight
 probe (step 5b) can defer, and the one key-block read has no transport
-retry. The 10:xx UTC release slot lands inside the delayed morning
-daily_sync on most days, so 4 of the 5 red release runs since 19 Oct were
-this collision, not a rejection (docs/reviews/github-run-census-20261024.md
-recommends 'align timing; safely retry reads where appropriate'):
-- 40083081692 (2026-10-24 ~09:43Z) refused superseded_by_run while daily_sync
-  40079965055 (08:56-09:53Z) was in flight; 39938800176 (2026-10-23 10:23Z)
-  the same during 39931603565 (09:24-10:35Z).
-- 39763157033 (2026-10-22 10:27Z) refused [source_not_completed,
+retry. The 05:30 cron slot fires about 09:40-10:30Z and lands inside the delayed
+morning daily_sync on most days. Of the 6 red release runs since 19 Oct (as
+of 2026-10-24 14:30Z), 3 were refusals inside a running sync and 1 a Sheets
+read timeout during one; the other 2 (39245386428, 40102546721) are
+dispatched genuine rejections (exit 2 not_accepted) and stay red.
+docs/reviews/github-run-census-20261024.md recommends 'align timing; safely
+retry reads where appropriate':
+- 40083081692 (created 2026-10-24 09:43:28Z) refused superseded_by_run while
+  daily_sync 40079965055 (08:56-09:53Z) was in flight; 39938800176 (created
+  2026-10-23 10:23:50Z) the same during 39931603565 (09:24-10:35Z).
+- 39763157033 (created 2026-10-22 10:26:51Z) refused [source_not_completed,
   final_job_not_executed]: its source, daily_sync 39755653571, was still
   running (completed 10:28:54Z).
-- 39584712312 (2026-10-21 10:28Z) layout_fault: 'TimeoutError: The read
-  operation timed out' on the bare key-block read during 39576807720.
+- 39584712312 (created 2026-10-21 10:27:24Z) layout_fault: 'TimeoutError: The
+  read operation timed out' on the bare key-block read during 39576807720.
 Every one wrote nothing (fail closed) and the next slot re-reads everything,
 so no number was wrong; but a daily false red on the ARMED promotion path
 looks exactly like the refusals that matter (compare_and_set_failed,
@@ -33,11 +36,15 @@ WHAT CHANGED (only when TFB_RELEASE_INFLIGHT_DEFER is armed with the _ARMED
 words AND mode=release AND source=auto AND GITHUB_EVENT_NAME=schedule):
 - step 1: the one read-only KEY_RANGE get calls execute(num_retries=2), so a
   socket timeout, connection reset, 429 or 5xx is retried by the Sheets
-  client (writes are never retried). Off: execute() exactly as before.
+  client (writes are never retried). This also covers the sticky-variable
+  kill and the in-release sweep on such a slot (they run inside mode=release
+  after this read); mode=sweep and mode=kill get no retry. Off: execute()
+  exactly as before.
 - step 4: a refusal with reason superseded_by_run whose prior is EXACTLY the
   supersede grammar defers (exit 1, outcome deferred, reasons
-  [superseded_by_run, production_run_in_flight]) only when the in-flight
-  probe succeeds AND lists the superseding run id as busy.
+  [superseded_by_run, production_run_in_flight]) only when SOURCE is older
+  than the superseding run AND the in-flight probe succeeds AND lists the
+  superseding run id as busy.
 - step 5: a provenance refusal defers only when its reasons include
   source_not_completed, are a subset of {source_not_completed,
   final_job_not_executed}, and the probe succeeds AND lists SOURCE as busy.
@@ -867,9 +874,12 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     if prior_class == "refused":
         if slot_defer and why == "superseded_by_run":
             # v1.2.1: the superseding sync is still writing; the next slot
-            # reads its cohort. Exact supersede grammar only.
+            # reads its cohort. Exact supersede grammar only, and only while
+            # SOURCE is OLDER than the superseding run (a re-release, or a
+            # superseding run that is not newer than the cohort, stays 3).
             sup = SUPERSEDE_VALUE_RE.fullmatch(str(effective_prior or "").strip())
-            if sup is not None and _defer_for_run(out, probe, sup.group("by")):
+            if (sup is not None and int(source) < int(sup.group("by"))
+                    and _defer_for_run(out, probe, sup.group("by"))):
                 return _finish(out, 1, "deferred", why, "production_run_in_flight")
         return _finish(out, 3, "refused", why)
 

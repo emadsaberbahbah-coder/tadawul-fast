@@ -21,7 +21,7 @@ built from the bundled sheets.v4 discovery document. No network, no workbook.
 Cases
   I1  armed + schedule + superseded_by_run + superseding run busy -> exit 1
       deferred [superseded_by_run, production_run_in_flight]; zero writes,
-      no provenance, no audit
+      no provenance, no audit; also with TFB_DECISION_RELEASE=1 (production)
   I2  armed + schedule + [source_not_completed, final_job_not_executed] +
       SOURCE busy -> exit 1 deferred; zero writes, no audit
   I3  key read: the real HttpRequest raising TimeoutError once is retried
@@ -29,11 +29,16 @@ Cases
       three timeouts still fail closed when armed
   I4  negatives that keep exit 3 with the gate armed: dispatched run,
       explicit source, nothing in flight, an unrelated run in flight, probe
-      error, non-exact supersede grammar, final_job_not_executed alone,
-      not_main, SOURCE not busy; sweep and kill unchanged
+      error, non-exact supersede grammar, a re-release (SOURCE not older
+      than the superseding run) and a superseding run older than SOURCE,
+      final_job_not_executed alone, not_main, SOURCE not busy; mode=sweep and
+      mode=kill read without retry; the sticky KILL variable on a scheduled
+      release reads with the retry and is otherwise unchanged
   I5  off (unset and 9 non-armed spellings, plus armed on a dispatch) ==
-      the v1.2.0 base on the full JSON result and the read call, over every
-      fixture; checked against OFF_GOLDEN digests where the base is missing
+      the v1.2.0 base on the full JSON result, the read call, the probe and
+      provenance calls and the writes, over every fixture; checked against
+      OFF_GOLDEN digests everywhere (they are proven against the base copy
+      when it is available)
   I6  armed vocabulary: 1/true/yes/on (any case, padded) only
   N1  workflow: step-level mapping, job env unchanged; version floor,
       verifier pin, WHY order
@@ -84,10 +89,14 @@ VETO_OLD = ("NOT_ACTIONABLE(final_publication) | run=" + OLD +
 
 
 def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    saved = list(sys.path)   # a module loaded from a temp dir inserts its parents
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:] = saved
     return mod
 
 
@@ -198,7 +207,7 @@ def _no_finalize():
 
 
 def drive(mod, rows, source="auto", *, mode="release", gate=None, event="schedule",
-          inflight=None, provenance=None, service=None):
+          inflight=None, provenance=None, service=None, release_armed=False, kill_var=False):
     saved = {k: os.environ.get(k) for k in ENV_NAMES}
     for k in ENV_NAMES:
         os.environ.pop(k, None)
@@ -206,6 +215,10 @@ def drive(mod, rows, source="auto", *, mode="release", gate=None, event="schedul
                        "GITHUB_RUN_ATTEMPT": "1"})
     if gate is not None:
         os.environ[GATE] = gate
+    if release_armed:
+        os.environ["TFB_DECISION_RELEASE"] = "1"
+    if kill_var:
+        os.environ["TFB_DECISION_RELEASE_KILL"] = "1"
     if event is not None:
         os.environ["GITHUB_EVENT_NAME"] = event
     seen = {"provenance": [], "probe": 0}
@@ -254,6 +267,9 @@ def test_i1_superseded_by_the_running_sync_defers():
     assert svc.updates() == [] and seen["provenance"] == [] and seen["probe"] == 1
     assert out["feed_promoted"] is False and out["blocker_published"] is False
     assert svc.read_retries == [R.KEY_READ_RETRIES] and R.KEY_READ_RETRIES == 2
+    armed, _s, svc = drive(R, grid(), gate="1", inflight=busy(NEW), release_armed=True)
+    assert armed["release_enabled"] is True and armed["dry_run"] is False
+    assert (armed["exit_code"], armed["outcome"]) == (1, "deferred") and svc.updates() == []
 
 
 # ---------------------------------------------------------------- I2 -----
@@ -268,14 +284,17 @@ def test_i2_source_still_running_defers():
     assert out["source_run_id"] == NEW and seen["provenance"] == [NEW]
     assert out["inflight_defer"]["run"] == NEW and out["inflight_defer"]["busy"] is True
     assert svc.updates() == []
+    armed, _s, svc = drive(R, rows, gate="on", inflight=busy(NEW), provenance=prov,
+                           release_armed=True)
+    assert (armed["exit_code"], armed["outcome"]) == (1, "deferred") and svc.updates() == []
 
 
 # ---------------------------------------------------------------- I3 -----
 def _real_sheets(fails):
     """A REAL googleapiclient service whose transport raises TimeoutError
     for the first `fails` requests, then serves the key block."""
-    import httplib2
-    from googleapiclient import discovery
+    httplib2 = pytest.importorskip("httplib2")
+    discovery = pytest.importorskip("googleapiclient.discovery")
     doc = (Path(discovery.__file__).parent / "discovery_cache" / "documents"
            / "sheets.v4.json").read_text(encoding="utf-8")
 
@@ -294,7 +313,7 @@ def _real_sheets(fails):
 
 
 def _quiet_backoff():
-    from googleapiclient import http as gh
+    gh = pytest.importorskip("googleapiclient.http")
     return gh.time, gh.time.sleep
 
 
@@ -332,6 +351,12 @@ NEGATIVES = {
     "nothing_in_flight": dict(rows=grid(), inflight=[]),
     "unrelated_in_flight": dict(rows=grid(), inflight=busy("40000000001")),
     "probe_error": dict(rows=grid(), inflight=Boom("api down")),
+    "re_release": dict(rows=grid(gm_run=NEW, feed="NOT_ACTIONABLE(final_publication) | run=" + NEW
+                                 + " | 2026-10-24 12:00:05+03:00 | superseded_by_run=" + NEW + ".2"),
+                       inflight=busy(NEW)),
+    "older_superseder": dict(rows=grid(gm_run=NEW, feed="NOT_ACTIONABLE(final_publication) | run=" + NEW
+                                       + " | 2026-10-24 12:00:05+03:00 | superseded_by_run=" + OLD + ".2"),
+                             inflight=busy(OLD)),
     "loose_supersede": dict(rows=grid(feed="NOT_ACTIONABLE(final_publication) | run=" + OLD
                                       + " | superseded_by_run=" + NEW + ".1"),
                             inflight=busy(NEW)),
@@ -356,10 +381,16 @@ def _drive_case(mod, name, gate):
 
 def test_i4_negatives_keep_exit_3():
     for name in NEGATIVES:
-        out, _seen, svc = _drive_case(R, name, "1")
-        assert out["exit_code"] == 3 and out["outcome"] == "refused", (name, out["reasons"])
-        assert "production_run_in_flight" not in out["reasons"], name
-        assert out["deferred"] is False and svc.updates() == [], name
+        for release_armed in (False, True):
+            c = dict(NEGATIVES[name])
+            rows = c.pop("rows")
+            out, _seen, svc = drive(R, rows, gate="1", release_armed=release_armed, **c)
+            assert out["exit_code"] == 3 and out["outcome"] == "refused", (name, out["reasons"])
+            assert "production_run_in_flight" not in out["reasons"], name
+            assert out["deferred"] is False and svc.updates() == [], name
+    for name in ("re_release", "older_superseder"):   # refused before any probe
+        out, seen, _v = _drive_case(R, name, "1")
+        assert seen["probe"] == 0 and "inflight_defer" not in out, name
     out, _s, _v = _drive_case(R, "probe_error", "1")
     assert out["inflight_defer"]["busy"] is False and "api down" in out["inflight_defer"]["probe_error"]
     out, _s, _v = _drive_case(R, "dispatched", "1")
@@ -368,6 +399,17 @@ def test_i4_negatives_keep_exit_3():
         out, _s, svc = drive(R, grid(feed=VETO_OLD), mode=mode, gate="1", inflight=busy(NEW))
         assert out["exit_code"] == 0 and "inflight_defer" not in out and svc.updates() == [], mode
         assert svc.read_retries == [None], mode        # retries are for the release attempt only
+    # the sticky KILL variable runs inside mode=release: the read retries,
+    # and everything else is what the gate-off run gives
+    live = ("EXECUTABLE | run=" + OLD + " | 2026-10-24 11:58:44+03:00"
+            " | issued=2026-10-24T12:10:00+03:00 | expires=2026-10-24T19:58:44+03:00"
+            " | ttl_min=480 | release=777001 | attempt=1 | receipts=T10:" + OLD + ",PF:" + OLD
+            + " | t10_at=2026-10-24T12:05:00+03:00 | pf_at=2026-10-24T12:00:00+03:00"
+            " | mp_at=2026-10-24T11:58:44+03:00 | audits=0,0")
+    on, _s, svc_on = drive(R, grid(feed=live), gate="1", kill_var=True, release_armed=True)
+    off, _s, svc_off = drive(R, grid(feed=live), kill_var=True, release_armed=True)
+    assert svc_on.read_retries == [2] and svc_off.read_retries == [None]
+    assert norm(on) == norm(off) and on["kill_active"] is True
 
 
 # ---------------------------------------------------------------- I5 -----
@@ -381,22 +423,25 @@ FIXTURES = {
     **NEGATIVES,
 }
 # v1.2.0 (main 83283c61) results per fixture, gate unset: sha256[:16] of the
-# normalised JSON plus the key-read retry argument. I5 proves them against the
+# normalised JSON, the key-read request and retry argument, the probe and
+# provenance calls and the writes. I5 proves them against the
 # base copy when it is available and checks the delivered module everywhere.
 OFF_GOLDEN = {
-              "i1": "675817aa366aadc9",
-              "i2": "6ad3924e23042d32",
-              "eligible_offline": "162a23016383ba5f",
-              "dispatched": "675817aa366aadc9",
-              "no_event": "675817aa366aadc9",
-              "explicit_source": "dd40a30f3b143d3b",
-              "nothing_in_flight": "675817aa366aadc9",
-              "unrelated_in_flight": "675817aa366aadc9",
-              "probe_error": "675817aa366aadc9",
-              "loose_supersede": "85ce76000721ca41",
-              "final_job_alone": "0204b1c360a79d11",
-              "not_main": "4c0e071186576107",
-              "source_not_busy": "6ad3924e23042d32"}
+              "i1": "d8853a395b31fefd",
+              "i2": "3a8327746b0ee4bd",
+              "eligible_offline": "e19a073d3d01cac9",
+              "dispatched": "d8853a395b31fefd",
+              "no_event": "d8853a395b31fefd",
+              "explicit_source": "8f42320bc0b6cdb8",
+              "nothing_in_flight": "d8853a395b31fefd",
+              "unrelated_in_flight": "d8853a395b31fefd",
+              "probe_error": "d8853a395b31fefd",
+              "re_release": "c69346df28e81d42",
+              "older_superseder": "3e6044aa9cacbcfe",
+              "loose_supersede": "fcb3b84530a7f389",
+              "final_job_alone": "28ec8c96d31646ce",
+              "not_main": "d4b4d6d00196eb7a",
+              "source_not_busy": "3a8327746b0ee4bd"}
 
 
 def _snapshot(mod, name, gate, *, event_override=False):
@@ -406,7 +451,8 @@ def _snapshot(mod, name, gate, *, event_override=False):
         c["event"] = "workflow_dispatch"
     out, seen, svc = drive(mod, rows, gate=gate, **c)
     return {"out": norm(out), "read": svc.read_retries, "provenance": seen["provenance"],
-            "probe": seen["probe"], "updates": svc.updates()}
+            "probe": seen["probe"], "updates": svc.updates(),
+            "gets": [kw for kind, kw in svc.calls if kind == "get"]}
 
 
 def _digest(snap):
@@ -415,24 +461,23 @@ def _digest(snap):
 
 def test_i5_off_is_byte_identical_to_the_v120_base():
     b = _base_or_none()
+    assert set(OFF_GOLDEN) == set(FIXTURES)
     for name in FIXTURES:
         ref = None
         if b is not None:
             ref = _snapshot(b, name, None)
-            if "@@" not in OFF_GOLDEN:
-                assert _digest(ref) == OFF_GOLDEN[name], (name, _digest(ref))
+            assert _digest(ref) == OFF_GOLDEN[name], (name, _digest(ref))
         for gate in OFF_GATES:
             got = _snapshot(R, name, gate)
             assert got["read"] == [None], (name, gate)        # execute() exactly as before
             if ref is not None:
                 assert got == ref, (name, gate)
-            if "@@" not in OFF_GOLDEN:
-                assert _digest(got) == OFF_GOLDEN[name], (name, gate)
-        # armed, but the attempt is a dispatch: the gate does not apply
+            assert _digest(got) == OFF_GOLDEN[name], (name, gate)
+        # armed, but the attempt is a dispatch: the gate does not apply, and
+        # v1.2.0 reads neither the gate nor the event, so the answer is the
+        # gate-unset one
         got = _snapshot(R, name, "1", event_override=True)
-        if ref is not None and FIXTURES[name].get("event", "schedule") == "schedule":
-            dispatched_ref = _snapshot(b, name, "1", event_override=True)
-            assert got == dispatched_ref, name
+        assert got["read"] == [None] and _digest(got) == OFF_GOLDEN[name], name
 
 
 # ---------------------------------------------------------------- I6 -----
@@ -493,9 +538,8 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
     assert fns("\n".join(new)) - fns("\n".join(old)) == {"inflight_defer_enabled", "_defer_for_run"}
 
 
-def _digest_all():
-    parts = [name for name, fn in sorted(globals().items())
-             if name.startswith("test_") and callable(fn)]
+def _digest_all(results):
+    parts = ["%s=%s" % kv for kv in sorted(results.items())]
     parts.append(R.SCRIPT_VERSION)
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -504,14 +548,17 @@ if __name__ == "__main__":
     tests = [(k, v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     passed = skipped = 0
+    results = {}
     for name, fn in tests:
         try:
             fn()
             passed += 1
+            results[name] = "ok"
             print("ok  ", name)
         except pytest.skip.Exception as exc:
             skipped += 1
+            results[name] = "skip"
             print("SKIP", name, "::", exc)
     print(f"PASS {passed}/{len(tests)}"
           + (f" (skipped {skipped})" if skipped else "")
-          + f" digest {_digest_all()}")
+          + f" digest {_digest_all(results)}")

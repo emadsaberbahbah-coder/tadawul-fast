@@ -22,6 +22,11 @@ v1.1.0 path (gates, provenance, probes, strict audits).
   A5  an explicit numeric source behaves exactly as before (source_mode explicit)
   A6  CLI accepts 'auto' and still refuses a missing source
   A7  manifest pin and the workflow invariants the schedule relies on
+  A8  v1.2.1 TFB_RELEASE_INFLIGHT_DEFER: off refuses superseded_by_run as
+      v1.2.0; armed on a schedule with the superseding sync in flight defers
+      (exit 1, zero writes); a re-release stays refused
+  A9  v1.2.1 provenance deferral: SOURCE still running and busy defers;
+      not_main, final_job_not_executed alone, or SOURCE not busy stay exit 3
 
 Run: pytest -q tests/test_release_auto_source.py
 """
@@ -250,6 +255,42 @@ def test_a8_scheduled_slot_inside_the_superseding_sync(monkeypatch):
     assert (on["exit_code"], on["outcome"]) == (1, "deferred")
     assert on["reasons"] == ["superseded_by_run", "production_run_in_flight"]
     assert svc.updates() == [] and seen["provenance"] == []
+    # a re-release (SOURCE not older than the superseding run) stays refused
+    again = ("NOT_ACTIONABLE(final_publication) | run=" + RUN +
+             " | 2026-10-24 12:00:00+03:00 | superseded_by_run=" + RUN + ".2")
+    rel, _ = _run(Service(grid(feed=again)), R.SOURCE_AUTO,
+                  inflight=lambda: [dict(busy[0], id=int(RUN))])
+    assert (rel["exit_code"], rel["outcome"], rel["reasons"]) == (3, "refused", ["superseded_by_run"])
+
+
+def test_a9_scheduled_slot_while_its_source_still_runs(monkeypatch):
+    older = ("NOT_ACTIONABLE(final_publication) | run=39000000001"
+             " | 2026-10-24 12:00:00+03:00 | coverage_failed")
+
+    def prov(status="in_progress", branch="main", final_status="queued"):
+        return lambda rid: {
+            "run": {"id": int(rid), "path": ".github/workflows/daily_sync.yml",
+                    "head_branch": branch, "event": "schedule", "status": status,
+                    "run_attempt": 1, "head_sha": "a" * 40, "conclusion": None},
+            "jobs": [{"name": "Verify final decision publication", "status": final_status,
+                      "conclusion": None}]}
+    mine = [{"workflow": "daily_sync.yml", "id": int(RUN), "event": "schedule",
+             "status": "in_progress"}]
+    other = [dict(mine[0], id=40000000001)]
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("TFB_RELEASE_INFLIGHT_DEFER", "1")
+    svc = Service(grid(feed=older))
+    out, _ = _run(svc, R.SOURCE_AUTO, provenance=prov(), inflight=lambda: mine)
+    assert (out["exit_code"], out["outcome"]) == (1, "deferred") and svc.updates() == []
+    assert out["reasons"] == ["source_not_completed", "final_job_not_executed",
+                              "production_run_in_flight"]
+    for kwargs, inflight in ((dict(branch="dev"), mine),
+                             (dict(status="completed"), mine),
+                             (dict(), other)):
+        out, _ = _run(Service(grid(feed=older)), R.SOURCE_AUTO, provenance=prov(**kwargs),
+                      inflight=lambda inflight=inflight: inflight)
+        assert (out["exit_code"], out["outcome"]) == (3, "refused"), (kwargs, out["reasons"])
+        assert "production_run_in_flight" not in out["reasons"]
 
 
 if __name__ == "__main__":   # pragma: no cover

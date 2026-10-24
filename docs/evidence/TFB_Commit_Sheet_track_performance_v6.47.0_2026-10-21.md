@@ -274,5 +274,7 @@ The **Coverage** bullet above says "those past the 5-day grace EXPIRE as UNPRICE
   - With the default `TFB_TRACK_PRICE_FALLBACK` on, the Yahoo fallback joins its own reason onto every symbol it leaves unpriced (`scripts/track_performance.py` around L9917-9919). `_yahoo_chart_fallback_prices` sets a reason on every exit.
   - The grace expiry fires only on the exact reason `price_unavailable` (around L10025).
   - The only expiry test forces the fallback off (`tests/test_outcome_price_evidence.py` autouse fixture).
-- **Production logs:** every audited Performance Clock run since #742 (2026-10-09) logs `expired-unpriced=0`, while pending rose to 3,956 (job 120614987176, run 40012156458). Those records stay ACTIVE.
+- **Production logs:** every audited Performance Clock run since #742 (merged 2026-10-08 22:26Z) logs `expired-unpriced=0`.
+  - The unpriced population: on 23 Oct the backend left 359 symbols unpriced, and the fallback priced 0 of them (16 HTTP 429, then 343 skipped by the breaker; job 120614987176, run 40012156458).
+  - Their overdue records stay ACTIVE. They are part of the run's `pending-price=3956`, which counts every pending record. Most of those are wrong-session quotes, the HIST-CLOSE class.
 - **Status:** this is the behaviour main has today, not something v6.47.0 changed. `docs/reviews/witnessed-outcomes-20261009.md` (L62-65) lets only an actually absent price expire. Whether a rate-limited or breaker-skipped fallback miss counts as absent is an owner policy decision. No code change is proposed until it is made (daily review of 2026-10-24).
