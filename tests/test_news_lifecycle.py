@@ -12,6 +12,27 @@ NOW = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
 REVIEW_NOW = datetime(2026, 10, 24, 6, tzinfo=timezone.utc)
 
 
+def test_irbo_legacy_caption_never_fetches_or_substitutes_arty(monkeypatch):
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    now = max(datetime.fromisoformat(x['reviewed_at_utc']) for x in data['bindings']) + timedelta(minutes=1)
+    monkeypatch.setattr(archive, '_utc_now', lambda: now)
+    args = options(); args.universe = ['IRBO.US', 'ACTIVE.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-10-24')
+    assert universe == ['ACTIVE.US'] and items == [{'symbol': 'ACTIVE.US'}]
+    legacy = evidence['lifecycle_exclusions'][0]
+    assert legacy['symbol'] == 'IRBO.US' and legacy['successor_symbol'] == 'ARTY.US'
+    assert legacy['status'] == 'VERIFIED_LEGACY'
+    # Different venue and bare symbol are not aliases; expired proof is UNKNOWN.
+    args.universe = ['IRBO', 'IRBO.L']
+    assert archive._select_news_universe(args, None, '2026-10-24')[0] == args.universe
+    monkeypatch.setattr(archive, '_utc_now', lambda: now + timedelta(days=8))
+    args.universe = ['IRBO.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-11-01')
+    assert universe == items == [] and not evidence['discovery_complete']
+    assert evidence['lifecycle_exclusions'][0]['status'] == 'UNKNOWN'
+
+
 def options():
     return argparse.Namespace(universe=["ROG.SW", "ROP.SW", "GXTG.US", "GXDW.US"],
                               adaptive=False, max_symbols=60)

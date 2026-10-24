@@ -5337,6 +5337,44 @@
         }
       ],
       "review_receipt_sha256": "cfea79927869900b11494e8783315a2a3e3fc7b44daa0e225d5caadc7cc72690"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "IRBO.US",
+      "name": "iShares Robotics and Artificial Intelligence Multisector ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Historical IRBO caption: issuer confirms name, ticker, benchmark and investment objective changed effective 2024-08-12. Successor ARTY must be acquired and evaluated independently; no quote or history substitution.",
+      "identifiers": {
+        "CIK": "0001100663",
+        "series_id": "S000062201",
+        "exact_exchange_code": "IRBO",
+        "security_class": "historical ETF shares; no current tradability certification",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2024-08-12T00:00:00+00:00",
+        "lifecycle_time_precision": "date_start_bound_not_observed_event_time",
+        "successor_symbol": "ARTY.US"
+      },
+      "reviewed_at_utc": "2026-10-24T16:07:48.869748+00:00",
+      "expires_at_utc": "2026-10-31T16:07:48.869748+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524223753/filename9.htm",
+          "sha256": "16a6230708c76d4fc66245c593740a1eb1df3bf4b1eec88917fac1ab76c0f409",
+          "captured_at_utc": "2026-10-24T16:07:04.718020+00:00"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312524159938/d420147d497.htm",
+          "sha256": "84ed8c7f63b5e9ab134a7251777483ad8fe2ed2bff8e180a8ba643a292bdd82a",
+          "captured_at_utc": "2026-10-24T16:07:09.010599+00:00"
+        }
+      ],
+      "review_receipt_sha256": "2da7ae810752ee30dc0cd24b9f909c4be066dba1a278bc0684369daff81f13d8"
     }
   ]
 }
