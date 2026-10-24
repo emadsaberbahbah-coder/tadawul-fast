@@ -1,7 +1,57 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.14
+ * Version: 1.5.15
+ *
+ * v1.5.15 MAIN CHANGES  (THE LAYOUT BUILDER KEEPS OPERATOR INPUTS -- P-76
+ *                        port from 16_Decision_Top10 v1.11.3; Script
+ *                        Property PD_PANEL_PRESERVE, default OFF; ALL
+ *                        v1.5.14 logic carried verbatim; authored as
+ *                        v1.5.14 in PR #780, renumbered 2026-10-21 after
+ *                        #810 shipped a different v1.5.14)
+ * ---------------------------------------------------------------
+ * WHY (2026-10-15 export vs _Portfolio_Action_Log): the panel snapshot the
+ * action log wrote at 2026-10-14 04:45:58 Riyadh carried 'PF: Cash
+ * Available SAR' 53,769.2625 and 'PF: Max Position %' 20; the export of
+ * 2026-10-15 shows 0 and 15, exactly the _Lists_Config / built-in
+ * defaults. The same reset happened on 2026-09-09 23:14:30 (cash 0, Max
+ * Position 15) and the owner retyped 19,615 / 20 at 23:25:05.
+ * buildPortfolioDecisionLayout() sheet.clear()s and re-seeds EVERY panel
+ * cell from the defaults, and refreshPortfolioDecision() calls it whenever
+ * A4 is blank, so one rebuild silently sizes every ADD against 0 SAR of
+ * cash and a 15 % position cap the owner never chose. 16_Decision_Top10
+ * fixed the same defect in v1.11.3 (P-76); this page never got the port.
+ * The cockpit also reads this page's cash and 'PF: Max Position %' cells
+ * (P-134 cash source, WP-8 input truth), so when those modes are on the
+ * reset reaches Top_10 too.
+ * WHAT (Script Property PD_PANEL_PRESERVE = off (default) | observe |
+ * enforce; anything else reads off):
+ *  off      reads nothing extra; every sheet write is v1.5.14's.
+ *  observe  snapshots the non-blank panel inputs before the clear, seeds
+ *           the defaults exactly as off, and logs which inputs the rebuild
+ *           reset ('layout: observe -- N operator input(s) reset to
+ *           defaults: ...').
+ *  enforce  re-seeds each panel cell as preserved operator input >
+ *           _Lists_Config default > built-in default, and logs 'layout:
+ *           preserved N operator input(s) (M differ from defaults: ...)'.
+ *           A snapshot read fault aborts the rebuild BEFORE the clear
+ *           (throws; the sheet is left untouched) instead of re-seeding
+ *           the defaults; observe logs the fault and carries on as off.
+ *  A value is kept only when its label cell still holds the exact PF: label
+ *  at the same position (a moved layout keeps nothing); a sheet with no
+ *  panel yet seeds exactly as before.
+ * LIMITS: values already lost are not recovered; the owner retypes the
+ * CURRENT cash and Max Position % once (the 10-14 snapshot read 53,769.2625
+ * and 20). Enforce keeps every non-blank cell, stale or not (the P-134
+ * lesson in 16_Decision_Top10 v1.11.7): to apply a changed _Lists_Config
+ * default or to reset a value, blank the cell first (or rebuild once with
+ * off). A formula in a panel cell is kept as its value. A moved panel (a row
+ * or column inserted above or left of it) keeps nothing; the log then reads
+ * 'preserved 0'.
+ * ES5. Functions added: 3 (pdPanelPreserveMode_, pdPanelPreserve_(sheet,
+ * faults), pdPanelSeedValue_). Changed: buildPortfolioDecisionLayout.
+ * Removed: 0.
+ * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.14.
  *
  * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
  * ---------------------------------------------------------------
@@ -2567,7 +2617,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.14';
+var PD_VERSION = '1.5.15';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3795,6 +3845,60 @@ function pdReadPanel_(sheet, ss) {
   return out;
 }
 
+/* ----- v1.5.15 operator inputs survive a layout rebuild (P-76 port) ------- */
+
+var PD_PANEL_PRESERVE_PROP = 'PD_PANEL_PRESERVE';  /* off (default) | observe | enforce */
+
+function pdPanelPreserveMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_PANEL_PRESERVE_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return (v === 'observe' || v === 'enforce') ? v : 'off';
+  } catch (e) {
+    return 'off';
+  }
+}
+
+/** v1.5.15: snapshot of the panel's NON-BLANK operator values, read raw (no
+ * defaults) BEFORE a layout rebuild clears the sheet. A value is kept only
+ * when its label cell still holds the exact PD_PANEL label (a moved layout
+ * keeps nothing). A sheet without a panel yet returns {}. Never throws: a
+ * read fault is pushed onto the optional `faults` array (so the caller can
+ * tell a failed read from an empty panel) and returns what was read. */
+function pdPanelPreserve_(sheet, faults) {
+  var out = {};
+  try {
+    if (!sheet || sheet.getLastRow() < PD_ROW_PANEL_FIRST) return out;
+    for (var i = 0; i < PD_PANEL.length; i++) {
+      var item = PD_PANEL[i];
+      var pos = pdPanelPos_(i);
+      var lbl = sheet.getRange(pos.row, pos.labelCol).getValue();
+      if (String(lbl === null || lbl === undefined ? '' : lbl)
+          .replace(/^\s+|\s+$/g, '') !== item.label) continue;
+      var v = sheet.getRange(pos.row, pos.valueCol).getValue();
+      if (pdHasValue_(v)) out[item.label] = v;
+    }
+  } catch (e) {
+    if (faults && faults.push) faults.push(String(e && e.message || e));
+  }
+  return out;
+}
+
+/** v1.5.15 PURE: the value a rebuilt panel cell receives -- preserved
+ * operator input > _Lists_Config default > built-in default. With no
+ * preserved map this is exactly the v1.5.13 seed expression. */
+function pdPanelSeedValue_(item, defaults, preserved) {
+  if (preserved && preserved.hasOwnProperty(item.label) &&
+      pdHasValue_(preserved[item.label])) {
+    return preserved[item.label];
+  }
+  return defaults && defaults.hasOwnProperty(item.label) &&
+         pdHasValue_(defaults[item.label]) ? defaults[item.label]
+                                           : item.def;
+}
+
 /* ----- holdings pool (reads the 122-col My_Portfolio page) ----------------- */
 
 function pdCollectHoldings_(extraFields, wantStamps) {
@@ -3922,6 +4026,23 @@ function buildPortfolioDecisionLayout() {
   var tokens = pdTokens_(ss);
   var header = tokens.HEADER || PD_FALLBACK_TOKENS.HEADER;
   var op = tokens.OPERATOR_INPUT || PD_FALLBACK_TOKENS.OPERATOR_INPUT;
+  /* v1.5.15: snapshot operator inputs BEFORE the clear (off reads nothing).
+   * Enforce aborts on a snapshot read fault, before anything is cleared:
+   * a failed read must not turn into the reset this mode exists to stop. */
+  var preserveMode = pdPanelPreserveMode_();
+  var preserveFaults = [];
+  var preserved = preserveMode === 'off' ? {}
+                                         : pdPanelPreserve_(sheet, preserveFaults);
+  if (preserveFaults.length) {
+    var faultMsg = '[MP-DEC v' + PD_VERSION + '] layout: panel snapshot failed (' +
+        preserveFaults[0] + ')';
+    if (preserveMode === 'enforce') {
+      Logger.log(faultMsg + '; rebuild aborted, sheet left untouched');
+      throw new Error(faultMsg + '; rebuild aborted, sheet left untouched. ' +
+          'Retry, or set PD_PANEL_PRESERVE=off to rebuild with the defaults.');
+    }
+    Logger.log(faultMsg + '; observe continues with the defaults');
+  }
 
   sheet.clear();
   sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
@@ -3955,14 +4076,33 @@ function buildPortfolioDecisionLayout() {
     sheet.getRange(pos.row, pos.labelCol).setValue(item.label)
         .setFontWeight('bold').setFontSize(9).setWrap(true)
         .setBackground(PD_TINT).setFontColor(PD_NAVY);
-    var seed = defaults.hasOwnProperty(item.label) &&
-               pdHasValue_(defaults[item.label]) ? defaults[item.label]
-                                                 : item.def;
+    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.14
+        preserveMode === 'enforce' ? preserved : null);
     var cell = sheet.getRange(pos.row, pos.valueCol);
     cell.setValue(seed).setBackground(op.bg).setFontColor(op.fg)
         .setFontWeight('bold');
     if (item.kind === 'sar') cell.setNumberFormat(PD_FMT_SAR);
     else if (item.kind === 'num') cell.setNumberFormat('0.0#');
+  }
+  if (preserveMode !== 'off') {                                  // v1.5.14
+    var kept = [], differ = [];
+    for (var pi = 0; pi < PD_PANEL.length; pi++) {
+      var pItem = PD_PANEL[pi];
+      if (!preserved.hasOwnProperty(pItem.label)) continue;
+      kept.push(pItem.label);
+      if (String(preserved[pItem.label]) !==
+          String(pdPanelSeedValue_(pItem, defaults, null))) {
+        differ.push(pItem.label);
+      }
+    }
+    Logger.log('[MP-DEC v' + PD_VERSION + '] layout: ' +
+        (preserveMode === 'enforce'
+            ? 'preserved ' + kept.length + ' operator input(s) (' +
+              differ.length + ' differ from defaults' +
+              (differ.length ? ': ' + differ.join(', ') : '') + ')'
+            : 'observe -- ' + differ.length +
+              ' operator input(s) reset to defaults' +
+              (differ.length ? ': ' + differ.join(', ') : '')));
   }
   sheet.getRange(PD_ROW_PANEL_FIRST, 1, PD_PANEL_ROWS, 8)
       .setBorder(true, true, true, true, true, true, PD_BORDER,

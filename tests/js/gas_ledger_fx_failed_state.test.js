@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.14');
+  assert.ok(String(ctx.PD_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 5, 14][k] ? 1 : x < [1, 5, 14][k] ? -1 : 0), 0) >= 0, 'PD_VERSION floor 1.5.14 (merge note 2026-10-21, #780: panel preserve is v1.5.15 over the #810 v1.5.14): ' + ctx.PD_VERSION);
   return copy(ctx._myPortfolioLedgerMap_());
 }
 
