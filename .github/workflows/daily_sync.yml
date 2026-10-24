@@ -1335,18 +1335,11 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
-          # (2026-09-22) P-158 TARGET-UNIT SENTRY — scripts/track_performance.py
-          # v6.39.0 (deployed 2026-09-21: [PERF-VERDICT v6.39.0] selftest=PASS 14/14).
-          # observe: criterion-4 row untouched, stored rows never rewritten; adds
-          # the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9 and
-          # ONE [PERF-UNIT v6.39.0] _Run_Log line per run (fraction/percent/
-          # unresolved counts). Explicit words only: off|observe|enforce.
-          # KILL-SWITCH: delete this line -> off (v6.39.0 default = legacy).
-          # Hardcoded here, not a repo Variable (S-1 lesson 2026-09-10: a Variable
-          # can be silently unset). This step runs in GitHub Actions, so a Render
-          # env var would never be seen. Enforce = separate sitting with the S-1
-          # criterion-4 boundary note.
-          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # v6.48.0: criterion4 uses canonical forecast provenance and pp.
+          # Unproven, ambiguous or duplicate targets cannot supply a sample.
+          # Historical target cells and S1 thresholds remain unchanged.
+          # Rollback: set both workflow lines to observe; legacy stays diagnostic.
+          TFB_PERF_TARGET_UNIT_SENTRY: "enforce"
           # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
           # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
           # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
@@ -1370,7 +1363,8 @@ jobs:
           # reruns use the same run ID. Canonical targets require price evidence.
           # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
           # Rollback: off/0; historical target values and publications stay.
-          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          # Prospective price-derived percentage points; explicit '0' rolls back.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
