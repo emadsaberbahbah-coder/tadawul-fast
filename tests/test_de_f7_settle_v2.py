@@ -24,6 +24,11 @@ Gaps found on the 21/22 Oct exports (see WHY v5.157.0 in core/data_engine_v2.py)
 The settle trajectory is v5.156.0's: status, pass counts, held-back rows and
 every published value are identical; only the f7_settle tag's field
 disclosures differ. enforce == base enforce + scope.
+v5.158.0 (F-7 v2b): enforce publishes the v2 trajectory (the scorer's own
+confidence re-derived; tests/test_de_f7_settle_shadow.py), observe still
+publishes the v1 trajectory above and takes only its tag text from the v2
+shadow - so the base comparisons below cover observe, scoped observe and
+out-of-scope enforce with every f7_settle tag removed, and the v1 trajectory.
 
 REAL engine module, the six real 2026-09-22 Global_Markets fixtures and the
 helpers of tests/test_de_f7_scoring_settle.py (FIXTURES, _prep, _pair, _golden,
@@ -130,7 +135,8 @@ def _base():
 
 
 def _skip_or_raise(exc):
-    if pytest is not None:
+    # pytest.skip only inside a pytest run; the __main__ runner reports SKIP.
+    if pytest is not None and os.environ.get("PYTEST_CURRENT_TEST"):
         pytest.skip(str(exc))
     raise exc
 
@@ -212,6 +218,21 @@ def _tagless(row):
         if key == "warnings" and isinstance(value, str):
             value = "; ".join(_prefix(p.strip()) if p.strip().startswith("f7_settle:") else p.strip()
                               for p in value.split(";") if p.strip())
+        out.append((key, value))
+    return json.dumps(out, default=repr)
+
+
+def _untagged(row):
+    """_bytes with every f7_settle tag removed (and a warnings cell that held
+    only tags dropped): v5.158.0 observe takes tag text and presence from the
+    v2 shadow, every other published byte from the v1 (base) result."""
+    out = []
+    for key, value in row.items():
+        if key == "warnings" and isinstance(value, str):
+            value = "; ".join(p.strip() for p in value.split(";")
+                              if p.strip() and not p.strip().startswith("f7_settle:"))
+            if not value:
+                continue
         out.append((key, value))
     return json.dumps(out, default=repr)
 
@@ -397,7 +418,7 @@ def case_c3_enforce_is_observe_out_of_scope(de):
             for pages in (GM, "global markets", REALISTIC, "My_Portfolio, Global_Markets"):
                 _set("enforce", pages)
                 row = f7._prep(fx)
-                golden = f7._golden(copy.deepcopy(row), 4)
+                golden = f7._golden(copy.deepcopy(row), 4, fx["row"])   # v5.158.0: enforce = v2
                 out = de._f7_settle_pass(row, row["symbol"], PF, scope_page=GM)
                 assert out is not row and f7._norm(out) == f7._norm(golden), (symbol, pages)
                 assert _one_tag(out) == _one_tag(observed).replace(":observe:", ":enforce:", 1)
@@ -417,7 +438,9 @@ def case_c3_enforce_is_observe_out_of_scope(de):
             assert out is not row
             _, out, row = _settle(de, fx, "enforce", page=ML, pages=GM)
             assert out is row and _bytes(out) == _bytes(observed)
-        # non-stable results are fail-closed in and out of scope, identically
+        # non-stable results are fail-closed in and out of scope (v5.158.0: the
+        # in-scope receipt is the v2 result's, out of scope the v1 result's
+        # plus the shadow tag; every other field is identical)
         outs = []
         for scope_page in (GM, ML):
             _set("enforce", GM, max_passes=2)
@@ -425,7 +448,9 @@ def case_c3_enforce_is_observe_out_of_scope(de):
             with patch.object(de, "_compute_scores_canonical_first", lambda r: r.update(overall_score=r["overall_score"] + 1.0)), \
                     patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
                 outs.append(de._f7_settle_pass(row, row["symbol"], PF, scope_page=scope_page))
-        assert de._f7_settle_failed(outs[0]) and _bytes(outs[0]) == _bytes(outs[1])
+        assert de._f7_settle_failed(outs[0]) and de._f7_settle_failed(outs[1])
+        assert [(k, v) for k, v in outs[0].items() if k not in ("warnings", "scoring_errors")] == \
+               [(k, v) for k, v in outs[1].items() if k not in ("warnings", "scoring_errors")]
 
 
 def case_c3_scope_is_the_inferred_market_on_every_surface(de):
@@ -495,9 +520,10 @@ def case_off_is_byte_identical(de, base=None):
 
 def case_published_rows_identical_except_tag_text(de, base=None):
     """observe publishes the pass-1 row plus ONE tag; enforce publishes the
-    independent golden. With a base copy, at MAX_PASSES 2-5: observe (any
-    scope), enforce, enforce in scope and enforce out of scope (== base
-    observe) are byte-identical to base apart from the tag's disclosures."""
+    independent golden (v5.158.0: the v2 golden). With a base copy, at
+    MAX_PASSES 2-5: observe (any scope) and enforce out of scope (== base
+    observe) are byte-identical to base apart from the f7_settle tags
+    (v5.158.0: their text and presence come from the v2 shadow)."""
     with _engine(de):
         for fx in f7.FIXTURES:
             pass1, out, row = _settle(de, fx, "observe")
@@ -505,7 +531,7 @@ def case_published_rows_identical_except_tag_text(de, base=None):
             assert len(f7._tags(out)) == 1 and not any(f in _one_tag(out).lower() for f in f7.FORBIDDEN)
             _set("enforce")
             row = f7._prep(fx)
-            golden = f7._golden(copy.deepcopy(row), 4)
+            golden = f7._golden(copy.deepcopy(row), 4, fx["row"])
             assert f7._norm(de._f7_settle_pass(row, row["symbol"], GM)) == f7._norm(golden)
         if base is None:
             return
@@ -513,19 +539,14 @@ def case_published_rows_identical_except_tag_text(de, base=None):
             for fx in f7.FIXTURES:
                 with _engine(base):
                     _, b_obs, _ = _settle(base, fx, "observe", max_passes=max_passes)
-                    _, b_enf, _ = _settle(base, fx, "enforce", max_passes=max_passes)
                 runs = {
                     "observe": (_settle(de, fx, "observe", max_passes=max_passes)[1], b_obs),
                     "observe in scope": (_settle(de, fx, "observe", pages=GM, scope_page=GM, max_passes=max_passes)[1], b_obs),
                     "observe out of scope": (_settle(de, fx, "observe", pages=ML, scope_page=GM, max_passes=max_passes)[1], b_obs),
-                    "enforce": (_settle(de, fx, "enforce", max_passes=max_passes)[1], b_enf),
-                    "enforce in scope": (_settle(de, fx, "enforce", pages=GM, scope_page=GM, max_passes=max_passes)[1], b_enf),
                     "enforce out of scope": (_settle(de, fx, "enforce", pages=ML, scope_page=GM, max_passes=max_passes)[1], b_obs),
                 }
                 for label, (new, old) in runs.items():
-                    where = (label, max_passes, fx["row"]["symbol"])
-                    assert _tagless(new) == _tagless(old), where
-                    assert [_prefix(t) for t in f7._tags(new)] == [_prefix(t) for t in f7._tags(old)], where
+                    assert _untagged(new) == _untagged(old), (label, max_passes, fx["row"]["symbol"])
 
 
 def _trajectory_cases():
@@ -556,7 +577,9 @@ def case_settle_trajectory_identical(de, base):
     2-5 the F7SettlementResult (status, settled_at, passes_run, reason,
     first/last diff, settled row) is identical, held-back rows included; the
     error / oscillation / pass_limit paths publish byte-identical rows under
-    every TFB_SETTLE_UNRESOLVED mode."""
+    every TFB_SETTLE_UNRESOLVED mode. v5.158.0: this is the v1 trajectory
+    (v2=False), which observe publishes; the failure paths are compared under
+    observe with the f7_settle tags removed (enforce publishes v2)."""
     seen = set()
     for max_passes in (2, 3, 4, 5):
         for fx in _trajectory_cases():
@@ -564,7 +587,8 @@ def case_settle_trajectory_identical(de, base):
             for engine in (de, base):
                 with _engine(engine):
                     _set("enforce", max_passes=max_passes)
-                    res = engine._f7_settle_result(f7._prep(fx))
+                    res = (engine._f7_settle_result(f7._prep(fx), v2=False) if engine is de
+                           else engine._f7_settle_result(f7._prep(fx)))
                 got.append((res.status, res.settled_at, res.passes_run, res.reason, res.error_type,
                             res.first_diff, res.last_diff, _bytes(res.row) if res.row is not None else None))
             assert got[0] == got[1], (max_passes, fx["row"]["symbol"], got[0][:4], got[1][:4])
@@ -580,7 +604,7 @@ def case_settle_trajectory_identical(de, base):
     def oscillate(r):
         r["overall_score"] = 20.0 if r["overall_score"] == 80.0 else 80.0
 
-    for mode in ("observe", "enforce"):
+    for mode in ("observe",):
         for unresolved in (None, "observe", "enforce"):
             for scorer, max_passes in ((boom, 4), (drift, 2), (oscillate, 4)):
                 for symbol in ("BNY.US", "BRK-B.US"):
@@ -593,7 +617,7 @@ def case_settle_trajectory_identical(de, base):
                                 row["overall_score"] = 80.0
                             with patch.object(engine, "_compute_scores_canonical_first", scorer), \
                                     patch.object(engine, "_apply_phase_dd_enhancements", lambda r: r):
-                                outs.append(_bytes(engine._f7_settle_pass(row, row["symbol"], GM)))
+                                outs.append(_untagged(engine._f7_settle_pass(row, row["symbol"], GM)))
                     assert outs[0] == outs[1], (mode, unresolved, scorer.__name__, symbol)
 
 
@@ -718,9 +742,9 @@ def test_wiring_and_version():
     assert DE._F7_MARKET_PAGES == MARKETS
     assert [code for _k, code, _kind, _tol in DE._F7_SETTLE_FIELDS] == ["ov", "op", "va", "fcf", "r12", "rc", "os", "fs"]
     assert "final_diff" in DE.F7SettlementResult.__dataclass_fields__
-    # C1 deferred: no confidence provenance and no scoring flag in this version
-    assert not [name for name in vars(DE) if name.startswith(("_F7_CONF", "_f7_conf"))]
-    assert "_f7_conf_derived" not in src and not hasattr(_SCORING, "_CONF_NOT_DATA_FLAG")
+    # v5.158.0: C1 (confidence provenance) is tests/test_de_f7_settle_shadow.py's;
+    # core.scoring still has no confidence flag of its own.
+    assert not hasattr(_SCORING, "_CONF_NOT_DATA_FLAG")
 
 
 TESTS = [test_c2_tag_discloses_final_values_enforce_publishes, test_c2_tag_order_limit_and_degrade,
