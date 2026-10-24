@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import json
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -280,6 +284,172 @@ def test_reordered_current_headers_and_aligned_keys_keep_their_original_order():
     exit_code, result, writer = run_sync(payload)
     assert exit_code == 0 and result.status == "success"
     assert writer.writes == [(list(reversed(CURRENT_HEADERS)), [list(reversed(CURRENT_ROW))])]
+
+
+def _producer_contract(legacy):
+    """Read each actual producer contract without importing optional routes."""
+    if not legacy:
+        from core.sheets.schema_registry import get_sheet_headers
+        return get_sheet_headers("Insights_Analysis"), list(CURRENT_ROW)
+    source = Path(__file__).resolve().parents[1] / "routes/analysis_sheet_rows.py"
+    assignment = next(node for node in ast.parse(source.read_text()).body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "_INSIGHTS_HEADERS"
+                              for target in node.targets))
+    return ast.literal_eval(assignment.value), list(VALID_ROW)
+
+
+def _audit_written_insights(monkeypatch, tmp_path, grid, *, max_rows=20):
+    """Run the scoped validator CLI and actual final coverage against one readback."""
+    from core.sheets import schema_registry
+    from scripts import audit_full_refresh_coverage as coverage
+    from scripts import validate_dashboard as validator
+    from scripts.workflow_validation_scope import source_pages
+
+    calls = []
+
+    def read(_sheet, a1):
+        calls.append(a1)
+        if a1.startswith("_Portfolio_CostBasis!"):
+            return [["Symbol", "Status"], ["SYNTH.US", "Active"]]
+        assert a1.startswith("Insights_Analysis!")
+        return deepcopy(grid)
+
+    async def no_logical_reader():
+        return None
+
+    monkeypatch.setattr(validator, "_resolve_read_range", lambda: read)
+    monkeypatch.setattr(validator, "_resolve_get_sheet_rows", no_logical_reader)
+    monkeypatch.setattr(validator, "_engine_version", lambda: "synthetic")
+    path = tmp_path / "scoped-insights.json"
+    monkeypatch.setattr(sys, "argv", ["validate_dashboard.py", "--sheet-id", "synthetic",
+        "--pages", *source_pages("INSIGHTS_ANALYSIS"), "--max-rows", str(max_rows),
+        "--write-sheet", "0", "--json-out", str(path)])
+    code = validator.main()
+    payload = json.loads(path.read_text())
+    report = asyncio.run(coverage.run("synthetic", reader=read, registry=schema_registry,
+        policy_rules=[coverage.Rule("Insights_Analysis", 1, None, 0, 0, 0, False)]))
+    return code, {check["name"]: check for check in payload["results"]}, report, calls
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("reordered", [False, True])
+@pytest.mark.parametrize("normalized", [False, True])
+def test_real_writer_contract_passes_scoped_and_final_insights_audits(
+        monkeypatch, tmp_path, legacy, reordered, normalized):
+    headers, row = _producer_contract(legacy)
+    if reordered:
+        headers, row = list(reversed(headers)), list(reversed(row))
+    if normalized:
+        headers = [sync._guard_norm(header).upper() for header in headers]
+    code, result, writer = run_sync({"headers": headers, "rows_matrix": [row]})
+    assert code == 0 and result.rows_written == 1
+    assert writer.writes == [(headers, [row])]
+    code, checks, report, calls = _audit_written_insights(monkeypatch, tmp_path, writer.table)
+    assert code == 0
+    assert checks["contract.header_match"]["status"] == "PASS"
+    assert checks["scope.coverage"]["status"] == "PASS"
+    assert report.code == 0 and report.pages[0].rows == 1
+    # Insights has no clock requirement, including its legacy timestamp column.
+    assert report.pages[0].fresh_pct is None and report.pages[0].oldest_age_h is None
+    assert all(a1.startswith(("Insights_Analysis!", "_Portfolio_CostBasis!")) for a1 in calls)
+
+
+@pytest.mark.parametrize("headers", [
+    ["Section", "Item", "Source", "Metric", "Value", "Notes", "Last Updated (Riyadh)"],
+    ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Sort Order"],
+    [*HEADERS, "Source"],
+    [*HEADERS[:-1], "ITEM"],
+    HEADERS[:-1],
+    [*HEADERS[:-1], "Last Updated (UTC)"],
+    [[header] for header in HEADERS],
+])
+def test_unsupported_insights_contracts_fail_writer_and_both_auditors(monkeypatch, tmp_path, headers):
+    row = ["Overview", "Sources", *([""] * (len(headers) - 2))]
+    assert_retained_failure(*run_sync({"headers": headers, "rows_matrix": [row]}))
+    code, checks, report, _calls = _audit_written_insights(monkeypatch, tmp_path, [headers, row])
+    assert code == 2 and checks["contract.header_match"]["status"] == "FAIL"
+    assert report.code == 2 and any("header mismatch" in failure for failure in report.pages[0].failures)
+
+
+def test_legacy_symbol_sanity_uses_the_written_contract_without_new_membership_gate(monkeypatch, tmp_path):
+    headers, row = _producer_contract(True)
+    row[2] = "SYNTH.US"
+    second = list(row)
+    second[1] = "Another metric"
+    code, result, writer = run_sync({"headers": headers, "rows_matrix": [row, second]})
+    assert code == 0 and result.rows_written == 2
+    code, checks, report, _calls = _audit_written_insights(monkeypatch, tmp_path, writer.table)
+    assert code == 1 and checks["contract.header_match"]["status"] == "PASS"
+    assert checks["sanity.no_duplicate_symbols"]["status"] == "WARN"
+    assert checks["sanity.no_duplicate_symbols"]["examples"] == ["SYNTH.USx2"]
+    assert report.code == 0  # Repeated symbols across report metrics remain permitted.
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_supported_insights_contract_cannot_certify_a_sampled_window(monkeypatch, tmp_path, legacy):
+    headers, row = _producer_contract(legacy)
+    code, _result, writer = run_sync({"headers": headers, "rows_matrix": [row, row]})
+    assert code == 0
+    code, checks, _report, _calls = _audit_written_insights(monkeypatch, tmp_path, writer.table, max_rows=1)
+    assert code == 2 and checks["scope.coverage"]["status"] == "FAIL"
+    assert "SAMPLE_ONLY" in checks["scope.coverage"]["detail"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_complete_insights_header_is_preferred_over_partial_preamble(monkeypatch, tmp_path, legacy):
+    headers, row = _producer_contract(legacy)
+    code, _result, writer = run_sync({"headers": list(reversed(headers)), "rows_matrix": [list(reversed(row))]})
+    assert code == 0
+    grid = [["Section", "Item", "Metric", "Value", "Notes"], [], *writer.table]
+    code, checks, report, _calls = _audit_written_insights(monkeypatch, tmp_path, grid)
+    assert code == 0 and checks["scope.coverage"]["count"] == 1
+    assert report.code == 0 and report.pages[0].header_row == 3
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_supported_insights_headers_do_not_clear_the_empty_report_floor(monkeypatch, tmp_path, legacy):
+    headers, row = _producer_contract(legacy)
+    code, _result, writer = run_sync({"headers": headers, "rows_matrix": [row]})
+    assert code == 0
+    _code, _checks, report, _calls = _audit_written_insights(monkeypatch, tmp_path, writer.table[:1])
+    assert report.code == 2 and report.pages[0].rows == 0
+    assert "row count 0 below minimum 1" in report.pages[0].failures
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_logical_insights_rows_cannot_replace_literal_scope_proof(monkeypatch, legacy):
+    from scripts import validate_dashboard as validator
+
+    headers, row = _producer_contract(legacy)
+    code, _result, writer = run_sync({"headers": headers, "rows_matrix": [row]})
+    assert code == 0
+
+    async def logical_reader():
+        written_headers, written_rows = writer.writes[0]
+        return lambda *_args, **_kwargs: [dict(zip(written_headers, written_rows[0]))], False, "synthetic"
+
+    monkeypatch.setattr(validator, "_resolve_read_range", lambda: None)
+    monkeypatch.setattr(validator, "_resolve_get_sheet_rows", logical_reader)
+    monkeypatch.setattr(validator, "_engine_version", lambda: "synthetic")
+    results, _meta = asyncio.run(validator.validate(pages=["Insights_Analysis"], sid="synthetic", max_rows=20))
+    checks = {check.name: check for check in results}
+    assert validator._exit_code(results) == 2 and checks["scope.coverage"].status == "FAIL"
+    assert "UNKNOWN literal-sheet extent" in checks["scope.coverage"].detail
+
+
+@pytest.mark.parametrize("page", ["Global_Markets", "Data_Dictionary"])
+def test_other_page_contracts_keep_exact_physical_order(page):
+    from core.sheets.schema_registry import get_sheet_headers
+    from scripts import audit_full_refresh_coverage as coverage
+    from scripts import validate_dashboard as validator
+
+    expected = get_sheet_headers(page)
+    actual = list(reversed(expected))
+    assert validator.check_contract(page, expected, actual).status == "FAIL"
+    result = coverage.audit_grid([actual, ["synthetic"]],
+        coverage.Rule(page, 1, None, 0, 0, 0, False), expected, datetime.now(timezone.utc))
+    assert result.status == "FAIL" and any("header mismatch" in failure for failure in result.failures)
 
 
 @pytest.mark.parametrize("headers,row", [(CURRENT_HEADERS, CURRENT_ROW), (HEADERS, VALID_ROW)])

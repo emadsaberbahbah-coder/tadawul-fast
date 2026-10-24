@@ -2,6 +2,8 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# Revision 3 (2026-10-24): block workflow inventory truncation, identity parser
+# regressions and uninformative/misleading live-audit recovery summaries.
 # Revision 2 (2026-10-24): verify full bounded audit scope, labelled unique
 # performance cohorts, v2 funding/display evidence and sukuk industry fallback.
 # Revision 1 (2026-10-23): block regressions in expired-cache reclamation,
@@ -690,6 +692,7 @@ jobs:
             tests/test_scheduled_portfolio_refresh.py \
             tests/test_news_intelligence_contracts.py \
             tests/test_news_acquisition_evidence.py \
+            tests/test_news_workflow_health.py \
             tests/test_news_adaptive_universe.py \
             tests/test_news_lifecycle.py \
             tests/test_engine_cache_expiry.py \
@@ -727,6 +730,9 @@ jobs:
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
+            tests/test_github_workflow_run_window.py \
+            tests/test_monitor_recovery_guidance.py \
+            tests/test_render_audit_summary.py \
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py \
             tests/test_approved_scope_native_binding.py \
@@ -737,6 +743,7 @@ jobs:
             tests/test_decision_surface_freshness.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
+            tests/test_matrix_validation_scope.py \
             tests/test_release_decision_feed.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.1)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.2)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -88,7 +88,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.3.2"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -653,8 +653,14 @@ def _identity_pairs(grid: List[List[Any]], *, research: bool = False,
             break
         if not symbol and not name:
             continue
+        # BMV uses internal ampersands in tickers such as PE&OLES. Retain
+        # the canonical .MX namespace and company-name proof; never split
+        # that exact identity into aliases or admit shell/query punctuation.
+        mx_ampersand = (len(symbol) <= 41 and bool(re.fullmatch(
+            r"[A-Z0-9][A-Z0-9_-]*&[A-Z0-9][A-Z0-9_-]*\.MX", symbol)))
         valid = (symbol not in {"SYMBOL", "TICKER", "NAME", "RANK"}
-                 and bool(re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=_-]{0,40}", symbol)))
+                 and (bool(re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=_-]{0,40}", symbol))
+                      or mx_ampersand))
         if valid and symbol in (lifecycle or {}):
             record = dict(lifecycle[symbol])
             if name and " ".join(name.casefold().split()) != " ".join(record["historical_name"].casefold().split()):
@@ -895,6 +901,73 @@ def _validated_news_results(raw, items):
                       "complete": not (unexpected or malformed or duplicates)}
 
 
+def _collection_failure_codes(report: Dict[str, Any]) -> List[str]:
+    """Bounded operational causes, without publicising source identities.
+
+    An accepted selected batch does not resolve unknown identities elsewhere
+    in adaptive discovery. Preserve the failure and tell operators which
+    input needs repair rather than presenting it as a news-provider crash.
+    """
+    codes = []
+    error = report.get("error_code") or (report.get("archive_write") or {}).get("error_code")
+    if error:
+        codes.append(error if error in {
+            "news_batch_timeout", "news_batch_failed", "archive_target_missing",
+            "archive_client_unavailable", "archive_lookup_failed", "archive_header_read_failed",
+            "archive_header_unverified", "archive_init_failed", "archive_unavailable",
+            "archive_key_read_failed", "archive_append_outcome_unknown"} else "collection_error")
+    validation = report.get("response_validation")
+    if isinstance(validation, dict) and validation.get("complete") is not True:
+        codes.append("news_response_unverified")
+    if report.get("selected_acquisition_complete") is not True:
+        codes.append("selected_acquisition_incomplete")
+    selection = report.get("selection") or {}
+    if selection.get("mode") == "adaptive":
+        if selection.get("source_read_complete") is not True:
+            codes.append("identity_source_read_incomplete")
+        if selection.get("discovery_identity_coverage_complete") is not True:
+            codes.append("identity_coverage_incomplete")
+    if selection.get("missing_identity_symbols"):
+        codes.append("selected_identity_missing")
+    if selection.get("omitted_priority_count", 0):
+        codes.append("priority_selection_capped")
+    if selection.get("discovery_complete") is not True and not any(
+            code.startswith("identity_") or code in {"selected_identity_missing", "priority_selection_capped"}
+            for code in codes):
+        codes.append("identity_discovery_incomplete")
+    if report.get("complete") is not True and not codes:
+        codes.append("collection_incomplete")
+    return codes
+
+
+def _write_collection_step_summary(summary: Dict[str, Any]) -> None:
+    """Append the same nonfinancial evidence to the current Actions step."""
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    write = summary["archive_write"]
+    status = write.get("status")
+    if status not in {"DRY_RUN", "APPEND_ACCEPTED", "SKIPPED_EXISTING", "NO_ELIGIBLE_ROWS",
+                      "NOT_ATTEMPTED", "WITHHELD", "UNKNOWN"}:
+        status = "UNVERIFIED"
+    selection = summary.get("selection") or {}
+    lines = ["## News archive acquisition and discovery", "",
+             "| Check | Result |", "|---|---|",
+             "| Selected acquisition | " + ("COMPLETE" if summary["selected_acquisition_complete"] else "INCOMPLETE") + " |",
+             "| Selection / discovery checks | " + ("COMPLETE" if selection.get("discovery_complete") is True else "INCOMPLETE") + " |",
+             "| Archive write | " + status + " |",
+             f"| Accepted rows | {write['accepted_rows']} |",
+             f"| Existing rows skipped | {write['skipped_rows']} |", "",
+             "Failure codes: " + (", ".join(summary["failure_codes"]) or "none") + ".", "",
+             "Incomplete discovery remains a failing outcome even when the selected news batch was acquired and archived. "
+             "Counts do not certify full-market news coverage or investment readiness.", ""]
+    try:
+        with Path(path).open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines))
+    except OSError:
+        logger.warning("News acquisition step summary unavailable; retained JSON/stdout evidence")
+
+
 def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
                               status: str, *, error_code: Optional[str] = None,
                               attempted_rows: int = 0, accepted_rows: int = 0,
@@ -906,6 +979,7 @@ def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
         write["error_code"] = error_code
         report["complete"] = False
     report["archive_write"] = write
+    report["failure_codes"] = _collection_failure_codes(report)
     _write_collection_report(getattr(args, "evidence_json", None), report)
     selection = report.get("selection") or {}
     counts = {key: int(value) for key, value in (report.get("status_counts") or {}).items()
@@ -917,8 +991,9 @@ def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
                    "discovery_identity_coverage_complete", "discovery_complete")},
                "selected_acquisition_complete": bool(report.get("selected_acquisition_complete")),
                "complete": bool(report.get("complete")), "status_counts": counts,
-               "archive_write": write}
+               "archive_write": write, "failure_codes": report["failure_codes"]}
     print("[news_archive] evidence " + json.dumps(summary, sort_keys=True))
+    _write_collection_step_summary(summary)
 
 
 # -----------------------------------------------------------------------------
