@@ -53,7 +53,7 @@ nz = importlib.import_module("core.symbols.normalize")
 
 ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 DE_BASE = os.environ.get("TFB_TEST_DE_BASE", "")
-BASE_VERSION = "5.157.3"   # merge note 2026-10-24 (#778): main #821-#829 is the new base (was 5.157.0, #817; 5.156.0, #816; 5.155.0, #810)
+BASE_VERSION = "5.158.0"   # merge note 2026-10-24 (#778, second): main #819 is the new base (was 5.157.3, #821-#829; 5.157.0, #817; 5.156.0, #816; 5.155.0, #810)
 # 2026-10-15 (v5.160.0 since the second 2026-10-22 merge): default armed in code, so unset (None) now arms;
 # an explicit blank still reads off in the engine and stays in OFF.
 ARMED = (None, "1", "true", "yes", "on", " ON ", "True")
