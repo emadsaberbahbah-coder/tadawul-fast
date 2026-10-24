@@ -65,8 +65,12 @@ def grid(*, gm=GM, feed=VETO, extra=()):
 class _Req:
     def __init__(self, fn):
         self._fn = fn
+        self.num_retries = None
 
-    def execute(self):
+    def execute(self, num_retries=None):
+        # v1.2.1: the real googleapiclient HttpRequest.execute takes
+        # num_retries; the armed slot deferral passes it on the key read.
+        self.num_retries = num_retries
         return self._fn()
 
 
@@ -109,7 +113,7 @@ class Service:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for name in ("TFB_DECISION_RELEASE", "TFB_DECISION_RELEASE_KILL", "GITHUB_TOKEN",
-                 "GITHUB_REPOSITORY"):
+                 "GITHUB_REPOSITORY", "TFB_RELEASE_INFLIGHT_DEFER", "GITHUB_EVENT_NAME"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_RUN_ID", "777002")
@@ -214,9 +218,10 @@ def test_a6_cli_accepts_auto_and_refuses_a_missing_source(monkeypatch, tmp_path)
 
 
 def test_a7_pin_and_workflow_invariants():
-    assert R.SCRIPT_VERSION == "1.2.0"
+    # 2026-10-24 (v1.2.1): a version floor plus the verifier pin of the same value.
+    assert tuple(int(x) for x in R.SCRIPT_VERSION.split(".")) >= (1, 2, 0)
     verifier = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("release_decision_feed", "1.2.0"' in verifier
+    assert '("release_decision_feed", "%s"' % R.SCRIPT_VERSION in verifier
     text = (_REPO / ".github" / "workflows" / "release_decision_feed.yml").read_text(encoding="utf-8")
     assert "schedule:" in text and "source_run_id || 'auto'" in text
     # the schedule never kills or sweeps by itself; the sticky variable does
@@ -224,6 +229,27 @@ def test_a7_pin_and_workflow_invariants():
     # exits 1 and 2 are tolerated only on the schedule
     assert '"$EVENT_NAME" == "schedule" && ( "$code" -eq 1 || "$code" -eq 2 )' in text
     assert R.GM_FEED_KEY == "TFB Feed Global_Markets"
+
+
+
+def test_a8_scheduled_slot_inside_the_superseding_sync(monkeypatch):
+    """v1.2.1 (blocking-lane guard; the full battery is
+    tests/test_release_inflight_defer.py): off refuses as v1.2.0; armed on a
+    schedule with the superseding sync in flight defers with zero writes."""
+    sup = ("NOT_ACTIONABLE(final_publication) | run=" + RUN +
+           " | 2026-10-24 12:00:00+03:00 | superseded_by_run=40079965055.1")
+    busy = [{"workflow": "daily_sync.yml", "id": 40079965055, "event": "schedule",
+             "status": "in_progress"}]
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    off, _ = _run(Service(grid(feed=sup)), R.SOURCE_AUTO, inflight=lambda: busy)
+    assert (off["exit_code"], off["outcome"], off["reasons"]) == (3, "refused", ["superseded_by_run"])
+    assert "inflight_defer" not in off
+    monkeypatch.setenv("TFB_RELEASE_INFLIGHT_DEFER", "1")
+    svc = Service(grid(feed=sup))
+    on, seen = _run(svc, R.SOURCE_AUTO, inflight=lambda: busy)
+    assert (on["exit_code"], on["outcome"]) == (1, "deferred")
+    assert on["reasons"] == ["superseded_by_run", "production_run_in_flight"]
+    assert svc.updates() == [] and seen["provenance"] == []
 
 
 if __name__ == "__main__":   # pragma: no cover

@@ -1,6 +1,54 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.2.1 (2026-10-24) -- A SCHEDULED SLOT THAT LANDS INSIDE A SYNC DEFERS
+(gate TFB_RELEASE_INFLIGHT_DEFER, default OFF = v1.2.0 byte-identical apart
+from script_version). Nothing removed; every acceptance rule, gate, write and
+exit code of v1.2.0 is unchanged when the gate is off.
+
+WHY (2026-10-24)
+----------------
+The v1.2.0 commit sheet promised that 'a slot that lands inside a sync
+defers and retries next slot'. It does not: the prior classification (step
+4) and the provenance check (step 5) refuse with exit 3 BEFORE the in-flight
+probe (step 5b) can defer, and the one key-block read has no transport
+retry. The 10:xx UTC release slot lands inside the delayed morning
+daily_sync on most days, so 4 of the 5 red release runs since 19 Oct were
+this collision, not a rejection (docs/reviews/github-run-census-20261024.md
+recommends 'align timing; safely retry reads where appropriate'):
+- 40083081692 (2026-10-24 ~09:43Z) refused superseded_by_run while daily_sync
+  40079965055 (08:56-09:53Z) was in flight; 39938800176 (2026-10-23 10:23Z)
+  the same during 39931603565 (09:24-10:35Z).
+- 39763157033 (2026-10-22 10:27Z) refused [source_not_completed,
+  final_job_not_executed]: its source, daily_sync 39755653571, was still
+  running (completed 10:28:54Z).
+- 39584712312 (2026-10-21 10:28Z) layout_fault: 'TimeoutError: The read
+  operation timed out' on the bare key-block read during 39576807720.
+Every one wrote nothing (fail closed) and the next slot re-reads everything,
+so no number was wrong; but a daily false red on the ARMED promotion path
+looks exactly like the refusals that matter (compare_and_set_failed,
+release_unconfirmed, kill_unconfirmed, sweep_unconfirmed).
+
+WHAT CHANGED (only when TFB_RELEASE_INFLIGHT_DEFER is armed with the _ARMED
+words AND mode=release AND source=auto AND GITHUB_EVENT_NAME=schedule):
+- step 1: the one read-only KEY_RANGE get calls execute(num_retries=2), so a
+  socket timeout, connection reset, 429 or 5xx is retried by the Sheets
+  client (writes are never retried). Off: execute() exactly as before.
+- step 4: a refusal with reason superseded_by_run whose prior is EXACTLY the
+  supersede grammar defers (exit 1, outcome deferred, reasons
+  [superseded_by_run, production_run_in_flight]) only when the in-flight
+  probe succeeds AND lists the superseding run id as busy.
+- step 5: a provenance refusal defers only when its reasons include
+  source_not_completed, are a subset of {source_not_completed,
+  final_job_not_executed}, and the probe succeeds AND lists SOURCE as busy.
+- Everything else keeps exit 3: a probe error, a busy list without that run,
+  any other refusal reason, final_job_not_executed alone, a dispatched run
+  and an explicit numeric source. The deferral writes nothing and runs no
+  audit, like production_run_in_flight; out gains 'inflight_defer' (the run
+  checked, whether it was busy, any probe error) only when the gate applies.
+ROLLBACK: unset the repository variable TFB_RELEASE_INFLIGHT_DEFER (or set
+it to anything outside 1/true/yes/on).
+
 VERSION 1.2.0 (2026-10-19) -- SOURCE DISCOVERY FOR SCHEDULED ATTEMPTS.
 Nothing removed; every acceptance rule, gate, write and exit code of v1.1.0
 is unchanged.
@@ -144,6 +192,8 @@ EXIT CODES
   0 released, already released, dry-run accepted, swept or killed;
     supersede: nothing to supersede, or the downgrade is confirmed
   1 deferred (in-flight run or probe/provenance unavailable) or warning-only
+    (v1.2.1, gate on: also a scheduled auto attempt that lands inside the
+    sync that superseded or produced its cohort)
   2 audits failed
   3 refused, compare-and-set/readback failure, layout fault or fatal error;
     supersede: invalid run/attempt, read/layout fault or unconfirmed downgrade
@@ -170,8 +220,12 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
+# v1.2.1: scheduled-slot deferral and read retry (default off).
+INFLIGHT_DEFER_ENV = "TFB_RELEASE_INFLIGHT_DEFER"
+KEY_READ_RETRIES = 2
+_INFLIGHT_PROVENANCE = frozenset({"source_not_completed", "final_job_not_executed"})
 # v1.2.0: --source-run-id auto reads the cohort from this _Status L:M key.
 SOURCE_AUTO = "auto"
 GM_FEED_KEY = "TFB Feed Global_Markets"
@@ -236,6 +290,24 @@ def release_enabled() -> bool:
 def release_killed() -> bool:
     """TFB_DECISION_RELEASE_KILL, default OFF: on => never promote, retract."""
     return (os.getenv(KILL_ENV) or "0").strip().lower() in _ARMED
+
+
+def inflight_defer_enabled() -> bool:
+    """v1.2.1 TFB_RELEASE_INFLIGHT_DEFER, default OFF (see the WHY)."""
+    return (os.getenv(INFLIGHT_DEFER_ENV) or "0").strip().lower() in _ARMED
+
+
+def _defer_for_run(out: dict, probe: Callable[[], Any], run_id: str) -> bool:
+    """v1.2.1: True only when the in-flight probe succeeds and lists run_id
+    as busy. Records what it checked in out['inflight_defer']."""
+    count, busy, error = _probe_inflight(probe)
+    hit = error is None and any(isinstance(item, dict) and str(item.get("id")) == run_id
+                                for item in busy)
+    out["inflight_defer"] = {"run": run_id, "busy": hit, "probe_error": error}
+    if hit:
+        out["in_flight"] = busy
+        out["deferred"] = True
+    return hit
 
 
 # --------------------------------------------------------------------------- clocks
@@ -721,14 +793,20 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         # gate spelling that would leave that step skipped.
         return _finish(out, 3, "refused", "release_gate_not_canonical")
 
+    # v1.2.1: the gate applies to scheduled source=auto release attempts only.
+    slot_defer = (inflight_defer_enabled() and mode == "release" and auto
+                  and (os.getenv("GITHUB_EVENT_NAME") or "").strip() == "schedule")
+
     # 1. one bounded read of the global key block
     try:
         if service is None:
             from integrations.google_sheets_service import get_sheets_service
             service = get_sheets_service()
-        grid = service.spreadsheets().values().get(
+        request = service.spreadsheets().values().get(
             spreadsheetId=sheet_id, range=fin.KEY_RANGE,
-            valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
+            valueRenderOption="UNFORMATTED_VALUE")
+        grid = (request.execute(num_retries=KEY_READ_RETRIES) if slot_defer
+                else request.execute()).get("values")
         slot = fin.publication_slot(grid)
     except Exception as exc:  # noqa: BLE001 - layout or transport fault
         out["fatal"] = safe_error_text(exc)
@@ -787,6 +865,12 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     prior_class, why = classify_prior(effective_prior, source)
     out["prior_class"] = prior_class
     if prior_class == "refused":
+        if slot_defer and why == "superseded_by_run":
+            # v1.2.1: the superseding sync is still writing; the next slot
+            # reads its cohort. Exact supersede grammar only.
+            sup = SUPERSEDE_VALUE_RE.fullmatch(str(effective_prior or "").strip())
+            if sup is not None and _defer_for_run(out, probe, sup.group("by")):
+                return _finish(out, 1, "deferred", why, "production_run_in_flight")
         return _finish(out, 3, "refused", why)
 
     # 5. provenance of SOURCE and the in-flight probe (fail closed)
@@ -798,6 +882,11 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         return _finish(out, 1, "deferred", "provenance_unavailable")
     out["provenance"] = prov
     if not prov["ok"]:
+        if (slot_defer and "source_not_completed" in prov["reasons"]
+                and set(prov["reasons"]) <= _INFLIGHT_PROVENANCE
+                and _defer_for_run(out, probe, source)):
+            # v1.2.1: SOURCE itself is still running (its final job pending).
+            return _finish(out, 1, "deferred", *prov["reasons"], "production_run_in_flight")
         return _finish(out, 3, "refused", *prov["reasons"])
     count, busy, error = _probe_inflight(probe)
     out["in_flight"] = busy

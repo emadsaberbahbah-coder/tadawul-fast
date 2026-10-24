@@ -1,6 +1,14 @@
 # =============================================================================
 # Release Decision Feed (P0-1) - .github/workflows/release_decision_feed.yml
 # =============================================================================
+# VERSION 1.1.1 (2026-10-24) -- SCHEDULED SLOT DEFERRAL (release_decision_feed.py
+# v1.2.1). The release step maps TFB_RELEASE_INFLIGHT_DEFER from the repository
+# variable (default '0' = v1.2.0 behaviour). Armed, a scheduled source=auto attempt
+# that lands inside the daily_sync which superseded or produced its cohort exits 1
+# (deferred, green with a warning below) instead of 3, and the one key-block read
+# retries transport faults. Mapped in the STEP env so the job env stays the final
+# job's env plus the two release gates. ROLLBACK: delete the variable.
+#
 # VERSION 1.1.0 (2026-10-19) -- SCHEDULED ATTEMPTS WITH SOURCE DISCOVERY
 #
 # WHY: the board has read 'FEED NOT ACTIONABLE ... 0 EXECUTABLE' on every
@@ -235,6 +243,8 @@ jobs:
           RELEASE_MODE: ${{ inputs.mode || 'release' }}
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_TOKEN: ${{ github.token }}
+          # v1.1.1: scheduled-slot deferral (release_decision_feed.py v1.2.1).
+          TFB_RELEASE_INFLIGHT_DEFER: ${{ vars.TFB_RELEASE_INFLIGHT_DEFER || '0' }}
         run: |
           set -euo pipefail
           code=0

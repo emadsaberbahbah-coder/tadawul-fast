@@ -233,7 +233,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
-    ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-24 (daily; manifest pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.2.1
+    # (TFB_RELEASE_INFLIGHT_DEFER, default off; release_decision_feed.yml step env only).
+    ("release_decision_feed", "1.2.1", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.5.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
