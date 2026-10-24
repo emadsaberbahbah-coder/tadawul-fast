@@ -30,6 +30,7 @@ retain those observations explicitly.
 | Workflow / owner | Confirmed defect | Correction and preserved boundary |
 | --- | --- | --- |
 | `daily_sync.yml` / matrix validation | Each leg validated all pages and the asynchronous cockpit, racing other writers and suppressing its success-guarded tracker. | Validate actual scoped source pages per leg; reject empty/unknown scopes. Write the shared audit once after writers/recovery; retain mandatory native structure proof and one downgrade publisher. |
+| Insights report contracts / both source auditors | The writer supports current and legacy seven-column reports and preserves their order, while both auditors required only the current registry order. | Share one strict known-contract selector and resolve actual column aliases. Accept both writer layouts and their supported reorders; reject mixed, duplicate, extra and malformed headers. Preserve full scope, minimum rows and the existing report clock policy. |
 | `finalize_decision_publication.py` / native proof | Old OK status text could coexist with a missing grid. | Bind the real validator report to this run, source SHA, workbook and time. Missing/failed/unverified proof blocks; retain the two-audit release grammar. Existing nonblocking sanity warnings remain diagnostic, not a new publication veto. |
 | `actions_health_review.yml` / run collector | The all-branch weekly window exceeded GitHub's filtered 1,000-result limit. | Bounded window splitting, exact page/ID census, boundary deduplication and incomplete-read failures; no partial PASS and no schedule activation. |
 | `news_archive.yml` / collector | A legitimate internal ampersand in `.MX` identity was rejected; acquisition and discovery failures were hard to distinguish. | Exact namespace-aware parsing, explicit failure codes/summary and supported artifact major. Blank or unverified identities remain withheld. |
@@ -53,6 +54,16 @@ nonblocking warning policy across the final release consumer. A real uploaded
 six-page validator report was also exercised against the structural-witness
 reader; this is stronger than a fabricated checklist and does not certify a
 current executable recommendation.
+
+The initial PR review also exposed the supported Insights legacy report
+being rejected after a successful write. Actual runner output reproduces the
+mismatch: eight of nine selected current/legacy/order/alias cases failed the
+old audits. The follow-up executes the scoped validator CLI and final coverage
+against the same writer readback, including normalized and reordered layouts,
+partial preambles, mixed/invalid contracts, sampled scope and advisory legacy
+symbol checks. Optional route/Google dependencies are not imported to obtain
+the legacy schema. Insights remains a report with a minimum row count, not a
+symbol membership or new timestamp-freshness gate.
 
 Final tests, exact-head CI and the adoption verdict are recorded in the PR.
 No old run outcome is deleted, overwritten or relabelled. Rerunning an old

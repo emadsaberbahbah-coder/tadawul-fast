@@ -60,6 +60,24 @@ the prior feed unchanged. The candidate returns `[0, 2]` and performs exactly
 one downgrade/readback. Missing or unbound witnesses return `[0, 3]` through
 the same writer. This is not a claim that the current live cohort is accepted.
 
+The initial PR's automated P2 review found that the newly scoped Insights
+validator rejected the writer's supported legacy report. The final coverage
+auditor independently had the same current-order-only assumption. On actual
+runner readback, eight of nine selected contract/order/alias cases reproduce
+the mismatch; only the canonical current report passed before the follow-up.
+Both auditors now use a shared lightweight selector for exactly the current
+or legacy seven-column report, including the writer's supported order and
+normalization. Literal header types, complete-header detection, legacy symbol
+resolution, minimum rows and sampled-scope rejection are verified. Mixed or
+unknown columns remain failures; the non-symbol Insights report gains no new
+freshness requirement. Ordinary page order and decision gates are unchanged.
+
+Focused writer/validator/coverage/manifest tests pass in a minimal dependency
+environment without Google, FastAPI or pandas. The legacy contract is read
+from the real route source by AST, avoiding optional route imports. Current
+registry headers are read from the actual registry. Tests execute the scoped
+validator CLI and final coverage against the same writer-produced grid.
+
 The persistent late native refresh/receipt mismatch remains a separate
 operational prerequisite. The final gate continues to report it rather than
 relaxing receipt, freshness, stability or account requirements.
