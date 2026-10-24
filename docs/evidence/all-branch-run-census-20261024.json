@@ -1,0 +1,1793 @@
+{
+  "schema": "tfb.github-all-branch-run-census.v1",
+  "repository": "emadsaberbahbah-coder/tadawul-fast",
+  "created_window_utc": {
+    "from": "2026-10-17T00:00:00Z",
+    "through": "2026-10-24T08:05:38Z"
+  },
+  "source_snapshot": {
+    "complete": true,
+    "total_runs": 1793,
+    "paginated_requests": 20,
+    "main": {
+      "total": 850,
+      "counts": {
+        "success": 279,
+        "skipped": 491,
+        "failure": 80
+      }
+    },
+    "other_branches": {
+      "total": 943,
+      "counts": {
+        "success": 875,
+        "cancelled": 50,
+        "failure": 18
+      }
+    }
+  },
+  "status_snapshot_note": "Counts reflect the later all-branch metadata read for the same fixed created-at window. The earlier frozen main-only census recorded 278 successful and one in-progress run; that CI later completed successfully. Its original evidence remains unchanged.",
+  "failed_log_coverage": {
+    "main_runs": 80,
+    "main_jobs": 89,
+    "other_branch_runs": 18,
+    "other_branch_jobs": 51,
+    "total_failed_runs": 98,
+    "total_failed_job_logs": 140,
+    "access_gaps": 0
+  },
+  "main_census_reference": "github-run-census-20261024.json",
+  "scope": "Latest-attempt records represented by this fixed created-at inventory; no historical-attempt reconstruction or live acquisition replay. Non-main CI failures are separated from production source/decision executions.",
+  "other_branch_records": [
+    {
+      "run_id": 39569626760,
+      "path": ".github/workflows/daily_sync.yml",
+      "branch": "claude/p0-sync-truth-20261021",
+      "event": "pull_request",
+      "created_at_utc": "2026-10-21T08:29:16Z",
+      "head_sha": "b3aee34e59d12985f78f18a976154df11b2e0d1c",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39569626760",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 119120261967,
+          "name": "🧪 CI Tests (Schema Alignment + Contracts)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run Tests (hard fail on missing gates)",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39569626760/job/119120261967",
+          "log_retrieved": true,
+          "classification": "historical_candidate_status_stamp_warning_contract",
+          "reason_codes": [
+            "S7.14_KEY_READ_WARNING_EXPECTATION",
+            "S7.15_WRITE_WARNING_EXPECTATION"
+          ],
+          "failed_tests": [],
+          "standalone_assertions_failed": [
+            "S7.14 key-column read failure: fail-open + loud warning",
+            "S7.15 write failure: fail-open + loud stamp FAILED"
+          ]
+        }
+      ],
+      "followup": {
+        "associated_prs": [
+          {
+            "number": 810,
+            "state": "closed",
+            "merged_at": "2026-10-21T09:32:31Z",
+            "head_sha": "50c1bf4950812c1053794333451461e98f703d62",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/810"
+          }
+        ],
+        "checked_head": "50c1bf4950812c1053794333451461e98f703d62",
+        "disposition": "later_head_passed_and_PR810_merged"
+      }
+    },
+    {
+      "run_id": 39230946600,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/stoic-dirac-iggjv8",
+      "event": "push",
+      "created_at_utc": "2026-10-19T09:33:21Z",
+      "head_sha": "f54e3c898d0994a1946223a5054135327bc517c8",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39230946600",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117988469405,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39230946600/job/117988469405",
+          "log_retrieved": true,
+          "classification": "historical_candidate_default_off_equivalence",
+          "reason_codes": [
+            "RESEARCH_DIVERSIFY_OFF_EQUALS_UNSET_ASSERTION"
+          ],
+          "failed_tests": [
+            "tests/test_ob_research_diversify.py::test_off_explicit_zero_equals_unset"
+          ]
+        },
+        {
+          "job_id": 117990567085,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39230946600/job/117990567085",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [
+          {
+            "number": 801,
+            "state": "open",
+            "merged_at": null,
+            "head_sha": "28b31501474a512b81eaebebbc00c1f045f5c1e9",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/801"
+          },
+          {
+            "number": 800,
+            "state": "closed",
+            "merged_at": "2026-10-19T13:14:34Z",
+            "head_sha": "8d7030ae3668e5267b2477f1fdf8e460d4003470",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/800"
+          },
+          {
+            "number": 799,
+            "state": "closed",
+            "merged_at": "2026-10-19T13:03:28Z",
+            "head_sha": "70c2800f6a4506a2a004eb089b45887e4262e569",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/799"
+          },
+          {
+            "number": 798,
+            "state": "closed",
+            "merged_at": "2026-10-19T10:51:21Z",
+            "head_sha": "c474ee59bd48fb0f68f6def0265d8db52c1e6d5f",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/798"
+          },
+          {
+            "number": 797,
+            "state": "closed",
+            "merged_at": "2026-10-19T09:20:23Z",
+            "head_sha": "8cd4b28997822a2dc4af97f578e5c175f1daac38",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/797"
+          },
+          {
+            "number": 796,
+            "state": "closed",
+            "merged_at": "2026-10-19T08:05:48Z",
+            "head_sha": "a0c4093b58eb3210b938d5ef05a9420f073c80cc",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/796"
+          }
+        ],
+        "checked_head": "28b31501474a512b81eaebebbc00c1f045f5c1e9",
+        "disposition": "later_PR801_head_passed_required_contexts; PR_open_unmerged"
+      }
+    },
+    {
+      "run_id": 39149084606,
+      "path": ".github/workflows/ci.yml",
+      "branch": "fix/github-workflow-review-20261018",
+      "event": "pull_request",
+      "created_at_utc": "2026-10-18T17:19:59Z",
+      "head_sha": "d019962c5d883c9f4a42fd6aff32ada4af0c2205",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117738859955,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606/job/117738859955",
+          "log_retrieved": true,
+          "classification": "historical_candidate_workflow_contract",
+          "reason_codes": [
+            "CONCURRENCY_LEASE_GROUP_ASSERTION",
+            "SUPERSEDE_BEFORE_WRITER_ORDER_ASSERTION"
+          ],
+          "failed_tests": [
+            "tests/test_final_publication_workflow.py::FinalPublicationStructureTests::test_waits_for_all_source_legs_and_recovery_without_releasing_lease",
+            "tests/test_release_decision_feed.py::test_release_decision_feed[n34_supersede_wired_into_every_page_writer]"
+          ]
+        },
+        {
+          "job_id": 117738860088,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606/job/117738860088",
+          "log_retrieved": true,
+          "classification": "historical_candidate_workflow_contract",
+          "reason_codes": [
+            "CONCURRENCY_LEASE_GROUP_ASSERTION",
+            "SUPERSEDE_BEFORE_WRITER_ORDER_ASSERTION"
+          ],
+          "failed_tests": [
+            "tests/test_final_publication_workflow.py::FinalPublicationStructureTests::test_waits_for_all_source_legs_and_recovery_without_releasing_lease",
+            "tests/test_release_decision_feed.py::test_release_decision_feed[n34_supersede_wired_into_every_page_writer]"
+          ]
+        },
+        {
+          "job_id": 117740055107,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149084606/job/117740055107",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [
+          {
+            "number": 795,
+            "state": "open",
+            "merged_at": null,
+            "head_sha": "34922d26984b4f45188c5cf0cccc9ca9405c969f",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/795"
+          }
+        ],
+        "checked_head": "34922d26984b4f45188c5cf0cccc9ca9405c969f",
+        "disposition": "later_PR795_head_passed_observed_CI_checks; PR_open_unmerged_and_required_contexts_not_all_present"
+      }
+    },
+    {
+      "run_id": 39149057325,
+      "path": ".github/workflows/ci.yml",
+      "branch": "fix/github-workflow-review-20261018",
+      "event": "push",
+      "created_at_utc": "2026-10-18T17:19:37Z",
+      "head_sha": "d019962c5d883c9f4a42fd6aff32ada4af0c2205",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149057325",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117738773856,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149057325/job/117738773856",
+          "log_retrieved": true,
+          "classification": "historical_candidate_workflow_contract",
+          "reason_codes": [
+            "CONCURRENCY_LEASE_GROUP_ASSERTION",
+            "SUPERSEDE_BEFORE_WRITER_ORDER_ASSERTION"
+          ],
+          "failed_tests": [
+            "tests/test_final_publication_workflow.py::FinalPublicationStructureTests::test_waits_for_all_source_legs_and_recovery_without_releasing_lease",
+            "tests/test_release_decision_feed.py::test_release_decision_feed[n34_supersede_wired_into_every_page_writer]"
+          ]
+        },
+        {
+          "job_id": 117738773974,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149057325/job/117738773974",
+          "log_retrieved": true,
+          "classification": "historical_candidate_workflow_contract",
+          "reason_codes": [
+            "CONCURRENCY_LEASE_GROUP_ASSERTION",
+            "SUPERSEDE_BEFORE_WRITER_ORDER_ASSERTION"
+          ],
+          "failed_tests": [
+            "tests/test_final_publication_workflow.py::FinalPublicationStructureTests::test_waits_for_all_source_legs_and_recovery_without_releasing_lease",
+            "tests/test_release_decision_feed.py::test_release_decision_feed[n34_supersede_wired_into_every_page_writer]"
+          ]
+        },
+        {
+          "job_id": 117739999468,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39149057325/job/117739999468",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [
+          {
+            "number": 795,
+            "state": "open",
+            "merged_at": null,
+            "head_sha": "34922d26984b4f45188c5cf0cccc9ca9405c969f",
+            "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/795"
+          }
+        ],
+        "checked_head": "34922d26984b4f45188c5cf0cccc9ca9405c969f",
+        "disposition": "later_PR795_head_passed_observed_CI_checks; PR_open_unmerged_and_required_contexts_not_all_present"
+      }
+    },
+    {
+      "run_id": 39048479442,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T16:13:38Z",
+      "head_sha": "8e9203b712702953160d5d8106e67b0534ba0095",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39048479442",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117441929614,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39048479442/job/117441929614",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117441929810,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39048479442/job/117441929810",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117443095617,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39048479442/job/117443095617",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39042247171,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T14:47:32Z",
+      "head_sha": "59cd767f1c1fdce3199e20241fab7a6f4a446404",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39042247171",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117423916432,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39042247171/job/117423916432",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117423916439,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39042247171/job/117423916439",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117425045750,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39042247171/job/117425045750",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39041260233,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T14:33:29Z",
+      "head_sha": "8d5417bf34fd86424e0a075bc58356a406c8dbb1",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39041260233",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117421064581,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39041260233/job/117421064581",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117421064795,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39041260233/job/117421064795",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117422151883,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39041260233/job/117422151883",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39040593528,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T14:24:12Z",
+      "head_sha": "c44c3e24c7446695d6b4b8805ad683c9bee7b6bf",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39040593528",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117419155333,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39040593528/job/117419155333",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117419155367,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39040593528/job/117419155367",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117420263082,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39040593528/job/117420263082",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39039779930,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T14:12:50Z",
+      "head_sha": "5dd40a0ef877a19cef07816eb5ccaeb75a5168df",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039779930",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117416716155,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039779930/job/117416716155",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117416716433,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039779930/job/117416716433",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117417867409,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039779930/job/117417867409",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39039327802,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T14:06:20Z",
+      "head_sha": "08e42185335165d3edbcf4af57b61241e4487626",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039327802",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117415416857,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039327802/job/117415416857",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "FASTAPI_TEST_IN_LEAN_WITHOUT_DEPENDENCY"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants",
+            "tests/test_pf_uncertified_view_c1.py::test_route_forwards_the_caller_context"
+          ]
+        },
+        {
+          "job_id": 117415416936,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039327802/job/117415416936",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117416526366,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39039327802/job/117416526366",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39038313323,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T13:51:49Z",
+      "head_sha": "ed9792c60ea388de2ffea7a04f9275f06d98c1bc",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39038313323",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117412512874,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39038313323/job/117412512874",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117412513001,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39038313323/job/117412513001",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117413586680,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39038313323/job/117413586680",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39037724563,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T13:43:16Z",
+      "head_sha": "fb918c60fd66bda14f9a837f4254026d2386a94f",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39037724563",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117410816263,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39037724563/job/117410816263",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117410816404,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39037724563/job/117410816404",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117411815946,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39037724563/job/117411815946",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39036334368,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T13:23:08Z",
+      "head_sha": "55a15747d3260eb12ce783b3980047fd0feaa770",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39036334368",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117406774611,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39036334368/job/117406774611",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117406774707,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39036334368/job/117406774707",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117407533497,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39036334368/job/117407533497",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39035718740,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T13:14:06Z",
+      "head_sha": "644f9cd9b4aeeb77482501e451363def6d5d44dc",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035718740",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117404974638,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035718740/job/117404974638",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117404974689,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035718740/job/117404974689",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117406023478,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035718740/job/117406023478",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39035115832,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T13:05:12Z",
+      "head_sha": "9f4663360a7c84db00e58fbbfd30000a1d75d966",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035115832",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117403251920,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035115832/job/117403251920",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117403252010,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035115832/job/117403252010",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117404335623,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39035115832/job/117404335623",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39034475573,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T12:55:41Z",
+      "head_sha": "91c3377b5087a6012987d05ce21b228fe8bf524c",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39034475573",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117401574285,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39034475573/job/117401574285",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117401574437,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39034475573/job/117401574437",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_module_pins_match_head_constants",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117402613391,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39034475573/job/117402613391",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39033530738,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T12:41:32Z",
+      "head_sha": "d6a9548c4f10707a975ed9820b11ec9ef8a30ee0",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39033530738",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117398699103,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39033530738/job/117398699103",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117398699285,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39033530738/job/117398699285",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117399341326,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39033530738/job/117399341326",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    },
+    {
+      "run_id": 39032959162,
+      "path": ".github/workflows/ci.yml",
+      "branch": "claude/new-session-twoifp",
+      "event": "push",
+      "created_at_utc": "2026-10-17T12:32:53Z",
+      "head_sha": "cf8e875336980a67f621e28e2a1f13ec4f2cf5bd",
+      "conclusion": "failure",
+      "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39032959162",
+      "production_execution": false,
+      "jobs": [
+        {
+          "job_id": 117397185175,
+          "name": "🧪 Decision-layer suites (lean)",
+          "failed_steps": [
+            {
+              "name": "🧪 Run decision-layer suites",
+              "number": 6
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39032959162/job/117397185175",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST"
+          ],
+          "failed_tests": [
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117397185466,
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "failed_steps": [
+            {
+              "name": "Discover every offline regression",
+              "number": 5
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39032959162/job/117397185466",
+          "log_retrieved": true,
+          "classification": "historical_branch_manifest_or_test_contract",
+          "reason_codes": [
+            "STALE_VERSION_MANIFEST",
+            "BACKTEST_RUNLOG_WARNING_CONTRACT"
+          ],
+          "failed_tests": [
+            "tests/test_backtest_history_depth_l2.py::test_runlog_warning_row_is_fail_open_and_names_the_registry",
+            "tests/test_verify_manifest_pins.py::test_script_pins_match_head_constants"
+          ]
+        },
+        {
+          "job_id": 117397941087,
+          "name": "📋 CI verdict",
+          "failed_steps": [
+            {
+              "name": "📋 Print verdict",
+              "number": 2
+            }
+          ],
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39032959162/job/117397941087",
+          "log_retrieved": true,
+          "classification": "downstream_required_test_verdict",
+          "reason_codes": [],
+          "failed_tests": []
+        }
+      ],
+      "followup": {
+        "associated_prs": [],
+        "checked_head": null,
+        "disposition": "historical_branch_only_no_matching_PR_found; do not infer active production failure"
+      }
+    }
+  ],
+  "current_head_followup": [
+    {
+      "branch": "claude/p0-sync-truth-20261021",
+      "head_sha": "50c1bf4950812c1053794333451461e98f703d62",
+      "checks": [
+        {
+          "name": "📋 CI verdict",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119138358252"
+        },
+        {
+          "name": "📋 CI verdict",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119138330140"
+        },
+        {
+          "name": "🔔 Run verdict",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135746985"
+        },
+        {
+          "name": "🛡️ Verify final decision publication",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135745831"
+        },
+        {
+          "name": "🚀 Data Sync (${{ matrix.group }})",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135744265"
+        },
+        {
+          "name": "🧯 Recover missing market pages",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135743933"
+        },
+        {
+          "name": "🛡️ Pre-flight Validation",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135741581"
+        },
+        {
+          "name": "🧪 CI Tests (Schema Alignment + Contracts)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260477/job/119135739690"
+        },
+        {
+          "name": "📐 Schema & route contract",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737474"
+        },
+        {
+          "name": "🧱 Compile all production code",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737315"
+        },
+        {
+          "name": "🔭 Python 3.13 and latest FastAPI (advisory)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737292"
+        },
+        {
+          "name": "⚙️ Data engine suite (blocking)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737244"
+        },
+        {
+          "name": "🧪 Decision-layer suites (lean)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737183"
+        },
+        {
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260733/job/119135737084"
+        },
+        {
+          "name": "GitGuardian Security Checks",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/runs/119135736951"
+        },
+        {
+          "name": "Validate workflow safety and maintenance",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260583/job/119135736722"
+        },
+        {
+          "name": "Fail-closed policy tests",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574260524/job/119135736528"
+        },
+        {
+          "name": "⚙️ Data engine suite (blocking)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135711313"
+        },
+        {
+          "name": "🧪 Decision-layer suites (lean)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135711247"
+        },
+        {
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135711241"
+        },
+        {
+          "name": "📐 Schema & route contract",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135711160"
+        },
+        {
+          "name": "🧱 Compile all production code",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135711158"
+        },
+        {
+          "name": "🔭 Python 3.13 and latest FastAPI (advisory)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39574253146/job/119135710851"
+        }
+      ],
+      "required_contexts_missing": [],
+      "note": "A later passing head does not rewrite the failed historical run or prove production deployment."
+    },
+    {
+      "branch": "claude/stoic-dirac-iggjv8",
+      "head_sha": "28b31501474a512b81eaebebbc00c1f045f5c1e9",
+      "checks": [
+        {
+          "name": "📋 CI verdict",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118124352533"
+        },
+        {
+          "name": "📋 CI verdict",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118123519448"
+        },
+        {
+          "name": "GitGuardian Security Checks",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/runs/118121167128"
+        },
+        {
+          "name": "🔔 Run verdict",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121154702"
+        },
+        {
+          "name": "🧯 Recover missing market pages",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121153205"
+        },
+        {
+          "name": "🛡️ Verify final decision publication",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121152659"
+        },
+        {
+          "name": "🛡️ Pre-flight Validation",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121151854"
+        },
+        {
+          "name": "🚀 Data Sync (${{ matrix.group }})",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121151018"
+        },
+        {
+          "name": "🧪 CI Tests (Schema Alignment + Contracts)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486367/job/118121148229"
+        },
+        {
+          "name": "🔭 Python 3.13 and latest FastAPI (advisory)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146957"
+        },
+        {
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146895"
+        },
+        {
+          "name": "⚙️ Data engine suite (blocking)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146793"
+        },
+        {
+          "name": "📐 Schema & route contract",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146757"
+        },
+        {
+          "name": "🧱 Compile all production code",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146746"
+        },
+        {
+          "name": "🧪 Decision-layer suites (lean)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486484/job/118121146268"
+        },
+        {
+          "name": "Validate workflow safety and maintenance",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486506/job/118121146089"
+        },
+        {
+          "name": "Fail-closed policy tests",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270486335/job/118121145970"
+        },
+        {
+          "name": "🧪 Decision-layer suites (lean)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121118663"
+        },
+        {
+          "name": "🔭 Python 3.13 and latest FastAPI (advisory)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121118245"
+        },
+        {
+          "name": "🧱 Compile all production code",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121118058"
+        },
+        {
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121118044"
+        },
+        {
+          "name": "⚙️ Data engine suite (blocking)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121117998"
+        },
+        {
+          "name": "📐 Schema & route contract",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39270477812/job/118121117686"
+        }
+      ],
+      "required_contexts_missing": [],
+      "note": "A later passing head does not rewrite the failed historical run or prove production deployment."
+    },
+    {
+      "branch": "fix/github-workflow-review-20261018",
+      "head_sha": "34922d26984b4f45188c5cf0cccc9ca9405c969f",
+      "checks": [
+        {
+          "name": "📋 CI verdict",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117958683170"
+        },
+        {
+          "name": "🧪 Decision-layer suites (lean)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956789379"
+        },
+        {
+          "name": "⚙️ Data engine suite (blocking)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956789110"
+        },
+        {
+          "name": "🧱 Compile all production code",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956789098"
+        },
+        {
+          "name": "📐 Schema & route contract",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956789076"
+        },
+        {
+          "name": "🧪 Whole suite (pinned Python 3.11)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956789004"
+        },
+        {
+          "name": "🔭 Python 3.13 and latest FastAPI (advisory)",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102882/job/117956788613"
+        },
+        {
+          "name": "GitGuardian Security Checks",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/runs/117956356770"
+        },
+        {
+          "name": "typed-baseline",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102967/job/117956336771"
+        },
+        {
+          "name": "Validate workflow safety and maintenance",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102970/job/117956336679"
+        },
+        {
+          "name": "dependencies",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/emadsaberbahbah-coder/tadawul-fast/actions/runs/39221102967/job/117956336431"
+        }
+      ],
+      "required_contexts_missing": [
+        "Fail-closed policy tests",
+        "🧪 CI Tests (Schema Alignment + Contracts)"
+      ],
+      "note": "A later passing head does not rewrite the failed historical run or prove production deployment."
+    }
+  ],
+  "validation": {
+    "records": 18,
+    "jobs": 51,
+    "all_logs_retrieved": true,
+    "frozen_main_contract_recheck": {
+      "commit": "561db60c74c1d56d866d4b72756f8ef9a9df57d5",
+      "passed": 6,
+      "failed": 0,
+      "scope": "Version manifests, final-publication lease, supersede-before-writer order and default-off research equivalence. Historical branch-only backtest/PF test files are absent from main and are not claimed as retested."
+    }
+  },
+  "privacy": "Only workflow metadata, failure identifiers and reviewed current-head check results are retained. Raw logs, tokens, private account state and provider/upload URLs are excluded."
+}
