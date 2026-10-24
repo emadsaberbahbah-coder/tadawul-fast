@@ -142,6 +142,9 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_MARGIN_PUBLISH` | `off` | margin publication receipt contract | no | value | yes | not recorded |
 | `TFB_PRICE_PRECISION` | `0` | seven significant digits for small prices | no | toggle | yes | not recorded |
 | `TFB_OPP_FX_USX_SUBUNIT` | `0` | US-cent currency parent conversion | no | toggle | no | not recorded |
+| `TFB_OPP_VENUE_CAL_EXT` | `0` | extra venue calendars for quote freshness | no | toggle | no | not recorded |
+| `TFB_OPP_FRESHNESS_ALERT` | `0` | stale_quotes alert and run-window near-miss text | no | toggle | no | not recorded |
+| `TFB_OPP_AUDIT_KEEP` | `0` | cockpit-held symbols kept in the capped audit | no | toggle | no | not recorded |
 | `TFB_EODHD_CRYPTO_MAP` | `0` | native EODHD explicit crypto pairs | no | toggle | no | not recorded |
 | `TFB_CRYPTO_NAME_GATE` | `off` | Yahoo fundamentals crypto-name screen | no | value | no | not recorded |
 | `TFB_COMPLIANCE_GATE_ENABLED` | `0` | compliance gate evaluates | no | toggle | no | not recorded |

@@ -2,8 +2,58 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.3
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.0
 ================================================================================
+
+WHY v5.159.0 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
+5.155.0, 2026-10-22 after #816 shipped a different 5.156.0, and again 2026-10-22
+after #817 shipped a different 5.157.0 while open #818 claims 5.158.0) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
+TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identical)
+- EVIDENCE: the Top_10_Investments export of 2026-10-13 20:37 Riyadh (route
+  v4.18.1, builder v1.26.1, pool 9,786 rows) publishes MWG.VN as Market
+  NASDAQ/NYSE, Ccy USD, Price 74,700.00, Price SAR 280,653.13
+  (74,700 x 3.75707). At VND 0.000148 the true value is about 11.06 SAR, so the
+  published number is about 25,370x too large. Only Quote Freshness (10.1h
+  old, no .VN venue calendar) kept it off the board; a live in-session quote
+  passes every unit-free gate. In the 2026-10-10 Global_Markets fixture
+  (tests/fixtures/wp3ab_tuple_rows_2026-10-10.json) all 10 .VN rows are
+  BLOCKED 'Identity unverified' and every one carries
+  market_cap_currency_suspect, a tag that fires only on a USD-labelled row.
+  The 2026-08-09 audit found the same on CTG/MBB/TCB/VIB/VPB.VN
+  (opportunity_builder v1.10.2 G-1 note). The consumers were guarded; the
+  producer was never fixed.
+- ROOT CAUSE (traced offline, providers stubbed): EODHD is first for
+  Global_Markets and Top_10_Investments. Its real-time payload has no exchange
+  or currency, and its _GEO_BY_SUFFIX lacks .VN, so the patch arrives with
+  both blank. _canonicalize_provider_row fills them from
+  _infer_exchange_from_symbol and _infer_currency_from_symbol. Their
+  _SUFFIX_TO_LOCALE has no .VN, so they fall through to "NASDAQ/NYSE" and
+  "USD". _infer_country_from_symbol already asks core.symbols.normalize and
+  says Vietnam, hence the self-contradicting Vietnam / NASDAQ/NYSE / USD row.
+  Later merges and the Yahoo enrichment pass only fill blanks, so Yahoo's
+  VND / HOSE never lands. _nz_get_currency_from_symbol has been imported
+  since v5.68.0 and never called.
+- SAME CLASS (the engine already names the right country, then stamps USD):
+  .VN .HOSE .SET .PS .PSE .AU .KO .BE .DU .DUB .FP .IM .VX .BU .CNQ - all
+  known to normalize, absent from the local table. v5.113.0 Fix AX added six
+  suffixes by hand; this asks the module that already knows the rest.
+- CHANGE (armed by 1/true/yes/on): _suffix_locale_nz_for(symbol) returns
+  normalize's (exchange, currency, country) for a DOTTED symbol whose suffix
+  the local table lacks, and only when all three are present, the currency
+  is a 3-letter code other than USD and the country is not the USA; else
+  None. _infer_exchange_from_symbol and _infer_currency_from_symbol consult
+  it just before their NASDAQ/NYSE and USD fallbacks. Table hits, 4-digit
+  Tadawul codes, =X, =F, crypto pairs, undotted tickers and share classes
+  (BRK.B) never reach it. MWG.VN -> HOSE / VND (country Vietnam as before).
+  Exchange labels are normalize's display names (.BE and .DU read XETRA).
+- NOT CHANGED: _SUFFIX_TO_LOCALE, the repair block in
+  _canonicalize_provider_row, _infer_country_from_symbol, surface_gate_states
+  (no new health key), every provider, identity_guard and the builder.
+  Suffixes no table knows (.PH .MA .ETR .LG) still fall back to USD.
+- OFF (unset or any other value): both inferrers return exactly what main's
+  v5.157.3 (#829; was v5.155.0 when authored) returned; no log line, tag or
+  payload field is added.
+- ROLLBACK: unset TFB_ENGINE_SUFFIX_LOCALE_FALLBACK (no redeploy needed).
 
 WHY v5.157.3 - CONFIGURED SUKUK INDUSTRY FALLBACK (2026-10-24)
 The Saudi-listing fallback labelled configured sukuk as Listed Equities even
@@ -4294,7 +4344,12 @@ from core.financial_units import (
 #   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
 #   settle trajectory, status and published values are v5.156.0's; off is
 #   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
-__version__ = "5.157.3"
+# v5.159.0 (2026-10-14; renumbered 2026-10-21 and twice 2026-10-22 after #810, #816
+# and #817 took 5.155.0-5.157.0; open #818 claims 5.158.0): suffix locale fallback
+# (gated, default off); a dotted
+# suffix the local table lacks asks core.symbols.normalize for exchange and
+# currency before the NASDAQ/NYSE and USD fallbacks (MWG.VN -> HOSE / VND).
+__version__ = "5.159.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -15538,6 +15593,53 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
     return "Equity"
 
 
+# =============================================================================
+# v5.159.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
+# -----------------------------------------------------------------------------
+# A dotted suffix absent from _SUFFIX_TO_LOCALE (.VN, .SET, .PS, .AU, .KO, ...)
+# fell through to NASDAQ/NYSE + USD while _infer_country_from_symbol already
+# asked core.symbols.normalize and named the right country. Armed, the
+# exchange and currency inferrers ask normalize the same way, and keep the old
+# answer when normalize has none or says US. Off: never consulted.
+# =============================================================================
+try:
+    from core.symbols.normalize import get_exchange_display as _nz_get_exchange_display
+except Exception:  # pragma: no cover
+    _nz_get_exchange_display = None  # type: ignore
+
+_SUFFIX_LOCALE_FALLBACK_ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
+
+
+def _suffix_locale_fallback_enabled() -> bool:
+    return os.getenv(_SUFFIX_LOCALE_FALLBACK_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _suffix_locale_nz_for(symbol: str) -> Optional[Tuple[str, str, str]]:
+    """normalize's (exchange, currency, country) for a dotted symbol whose
+    suffix the local table lacks; None when off, undotted, in the table,
+    incomplete, US or USD. Pure; never raises."""
+    try:
+        if not _suffix_locale_fallback_enabled():
+            return None
+        s = normalize_symbol(symbol)
+        if not s or "." not in s or _suffix_locale_for(s) is not None:
+            return None
+        if _nz_get_exchange_display is None or _nz_get_currency_from_symbol is None \
+                or _nz_get_country_from_symbol is None:
+            return None
+        exch = _safe_str(_nz_get_exchange_display(s)).strip()
+        ccy = _safe_str(_nz_get_currency_from_symbol(s)).strip().upper()
+        country = _safe_str(_nz_get_country_from_symbol(s)).strip()
+        if not exch or not country or len(ccy) != 3 or not ccy.isalpha():
+            return None
+        if ccy == "USD" or country.upper() in _US_COUNTRY_TOKENS \
+                or "NASDAQ" in exch.upper() or "NYSE" in exch.upper():
+            return None
+        return (exch, ccy, country)
+    except Exception:
+        return None
+
+
 def _infer_exchange_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
@@ -15553,6 +15655,9 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "Futures"
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
+    if _nzl is not None:
+        return _nzl[0]
     return "NASDAQ/NYSE"
 
 
@@ -15577,6 +15682,9 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
+    if _nzl is not None:
+        return _nzl[1]
     return "USD"
 
 

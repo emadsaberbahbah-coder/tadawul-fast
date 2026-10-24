@@ -145,7 +145,7 @@ def test_s2_exhausted_reports_error_with_consequence(armed, capsys):
     assert armed == [3.0, 8.0, 15.0]
     out = capsys.readouterr().out
     assert out.count("stamp FAILED") == 1 and "::error::" not in out
-    assert "::warning::[STATUS-STAMP v6.70.2] stamp FAILED for Global_Markets after 4 attempt(s)" in out
+    assert f"::warning::[STATUS-STAMP v{sync.SCRIPT_VERSION}] stamp FAILED for Global_Markets after 4 attempt(s)" in out
     assert "cohort mismatch" in out and "could not read _Status key column" in out
 
 
@@ -217,6 +217,8 @@ def test_s8_gate_off_means_no_calls(monkeypatch):
 
 
 def test_version_pin():
-    assert sync.SCRIPT_VERSION == "6.70.2"
+    # merge note (2026-10-21, #778): FW-2 SCOPE builds on this as 6.71.0, so this is a
+    # version floor and the manifest pin is read from the source constant.
+    assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 70, 2)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.70.2", "dashboard sync")' in src
+    assert f'("run_dashboard_sync", "{sync.SCRIPT_VERSION}", "dashboard sync")' in src

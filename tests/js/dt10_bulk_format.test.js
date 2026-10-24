@@ -42,11 +42,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {v11310Source} = require('./dt10_cash_utc_history');
+// 2026-10-22 merge of #778 (held seats, v1.13.12 over this v1.13.11): the
+// oracle is rebuilt from the delivered file with #778's designed regions
+// removed first (they touch the request, never the render).
+const {stripDesigned} = require('./dt10_audit_keep_regions.js');
 
 const ROOT = path.join(__dirname, '../..');
 const SOURCE_PATH = process.env.DT10_DELIVERED || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const source = fs.readFileSync(SOURCE_PATH, 'utf8');
-const oracleSource = v11310Source(source);
+const oracleSource = v11310Source(stripDesigned(source));
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -374,9 +378,9 @@ test('B7 dt10BulkPaint_: token rows get bg/fg/bold, undefined fields reset, null
 
 /* ================================================================== B8 */
 test('B8 version lockstep, WHY block, oracle integrity, ES5 shape and ASCII of the change', () => {
-  assert.equal(NEW.DT10_VERSION, '1.13.11');
+  assert(/^1\.13\.(1[1-9]|[2-9]\d)$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // merge note 2026-10-22 (#778): floor 1.13.11
   assert.equal(OLD.DT10_VERSION, '1.13.10');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.11 /);
+  assert(source.split('\n')[3].startsWith(' * Version: ' + NEW.DT10_VERSION + ' '));
   assert(source.includes(' * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n'));
   assert(source.includes(' * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE\n'), 'prior WHY kept');
   const why = source.slice(source.indexOf(' * v1.13.11 (2026-10-22)'), source.indexOf(' * v1.13.10 (2026-10-20)'));

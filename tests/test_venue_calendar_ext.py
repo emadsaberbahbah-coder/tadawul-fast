@@ -175,9 +175,13 @@ def test_t6_extension_never_shadows_base():
 
 
 def test_t7_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
+    # 2026-10-19 merge of #778: a version floor (house convention) instead of an
+    # exact pin, so a later builder build does not turn this suite red; the
+    # manifest pin must still equal the source constant.
+    # 2026-10-22 merge of #778: the floor follows main's v1.27.2 (#813).
+    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")[:3]) >= (1, 27, 2)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.27.2", "opportunity builder"' in src
+    assert '"%s", "opportunity builder"' % ob.OPPORTUNITY_BUILDER_VERSION in src
 
 
 def test_t8_athens_resolves_and_obeys_the_kill_switch(monkeypatch):
