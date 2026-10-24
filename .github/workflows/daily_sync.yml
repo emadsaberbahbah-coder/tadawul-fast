@@ -1284,11 +1284,18 @@ jobs:
             export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
           fi
           # Capture exit without tripping the default `-e` shell.
+          # Each leg owns only its scoped acquisition pages. Validating other
+          # writers or the asynchronous native cockpit here raced their writes
+          # and also suppressed the success()-guarded tracker. The final job
+          # retains one full contract + native check under the same write lease.
+          VALIDATE_PAGES="$(python scripts/workflow_validation_scope.py pages)"
+          read -r -a PAGE_ARGS <<< "$VALIDATE_PAGES"
           code=0
           python scripts/validate_dashboard.py \
             --sheet-id "$TARGET_SHEET_ID" \
+            --pages "${PAGE_ARGS[@]}" \
             --json-out validate_dashboard.json \
-            --write-sheet 1 || code=$?
+            --write-sheet 0 || code=$?
           echo "validate_exit=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" -ge 2 ]; then
             echo "::error::Dashboard validation failed (exit $code) — see report above / Dashboard_Audit tab."
@@ -2131,11 +2138,28 @@ jobs:
         id: final_audit
         run: |
           set -euo pipefail
+          # The native cockpit is asynchronous and is not a matrix-leg output.
+          # Inspect its real grid only after all source writers/recovery finish.
+          # A failed or missing structural witness still reaches the finalizer's
+          # one downgrade writer; it must never leave an old executable feed.
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
+          fi
+          rm -f final_dashboard_validation.json
+          structure_code=0
+          python scripts/validate_dashboard.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --pages Market_Leaders Global_Markets Commodities_FX Mutual_Funds My_Portfolio Top_10_Investments \
+            --json-out final_dashboard_validation.json \
+            --write-sheet 1 || structure_code=$?
+          python scripts/workflow_validation_scope.py attest \
+            --report final_dashboard_validation.json --process-exit "$structure_code" || true
           code=0
           python scripts/finalize_decision_publication.py \
             --sheet-id "$TARGET_SHEET_ID" \
             --max-rows 20000 \
             --publish-blockers \
+            --decision-structure-report final_dashboard_validation.json \
             --json-out final_decision_publication.json || code=$?
           echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
           if [[ "$code" -ne 0 ]]; then
@@ -2161,13 +2185,17 @@ jobs:
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nNative installation and refresh are required before executable decisions.\n')
           PY
+          python scripts/render_audit_summary.py \
+            --final-report final_decision_publication.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload final publication evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: final-decision-publication-${{ github.run_id }}
-          path: final_decision_publication.json
+          path: |
+            final_decision_publication.json
+            final_dashboard_validation.json
           retention-days: 30
           if-no-files-found: warn
 
