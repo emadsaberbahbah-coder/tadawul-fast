@@ -159,7 +159,7 @@ SCRIPT_VERSION = "1.0.61"  # v1.0.49 (2026-10-11) - pins data_engine_v2 5.152.0-
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.6', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
     ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
