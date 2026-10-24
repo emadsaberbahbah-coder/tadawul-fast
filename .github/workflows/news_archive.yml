@@ -1,5 +1,7 @@
 name: news-archive
 
+# v1.3.2 collector reports acquisition, discovery and archive-write outcomes
+# separately in the Actions summary. Incomplete discovery still exits nonzero.
 # Daily news/sentiment snapshot -- the forward-collection clock for Strategy
 # items (b) news->sector and (c) theme rotation. Appends one row per symbol per
 # day to the News_Archive tab. SEPARATE from track_performance.yml and
@@ -141,7 +143,7 @@ jobs:
 
       - name: Preserve news acquisition evidence
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: news-acquisition-${{ github.run_id }}
           path: artifacts/news-acquisition.json

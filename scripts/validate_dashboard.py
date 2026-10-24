@@ -2,12 +2,19 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.2)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.3)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.3 (2026-10-24) — SUPPORTED INSIGHTS REPORT CONTRACTS
+--------------------------------------------------------------------------------
+Match the sync writer's current and legacy seven-column Insights reports,
+including their preserved order and normalized header aliases. Resolve row
+checks using that actual contract. Mixed, duplicate and unsupported headers
+still fail; all other page contracts and full-scope gates are unchanged.
+
 v1.3.2 (2026-10-24) — FULL SOURCE SCOPE BY DEFAULT
 --------------------------------------------------------------------------------
 The old 1,500-row default left the tails of Global_Markets and Mutual_Funds
@@ -295,7 +302,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.2"
+SCRIPT_VERSION = "1.3.3"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -515,6 +522,11 @@ def _project_root_on_path() -> None:
 
 _project_root_on_path()
 
+from core.sheets.insights_contract import (  # noqa: E402
+    INSIGHTS_PAGE, aligned_keys as insights_keys, header_token as insights_header_token,
+    find_header_row as insights_header_row, trim_headers as insights_trim_headers,
+)
+
 # A1 end column wide enough to catch over-width sheets (DZ = 130 columns).
 _READ_END_COL = "DZ"
 
@@ -550,7 +562,7 @@ async def _resolve_get_sheet_rows() -> Optional[Tuple[Callable, bool, str]]:
 
 
 def _detect_header_row(
-    grid: List[List[Any]], expected_tokens: set, scan: int = 14
+    grid: List[List[Any]], expected_tokens: set, scan: int = 14, normalizer: Callable = _safe_str
 ) -> int:
     """Return the index of the row most resembling the header (max overlap
     with expected headers/keys). -1 if nothing plausible."""
@@ -558,7 +570,7 @@ def _detect_header_row(
     for i, row in enumerate(grid[:scan]):
         if not isinstance(row, list):
             continue
-        cells = {_safe_str(c) for c in row if _safe_str(c)}
+        cells = {normalizer(c) for c in row if normalizer(c)}
         if not cells:
             continue
         overlap = len(cells & expected_tokens)
@@ -568,7 +580,7 @@ def _detect_header_row(
 
 
 def _grid_to_rows(
-    header_cells: List[str], data_grid: List[List[Any]]
+    header_cells: List[Any], data_grid: List[List[Any]]
 ) -> List[Dict[str, Any]]:
     headers = [_safe_str(h) for h in header_cells]
     rows: List[Dict[str, Any]] = []
@@ -590,7 +602,7 @@ def _grid_to_rows(
 class _PageData:
     page: str
     source: str            # "read_range" | "get_sheet_rows" | "none"
-    header_cells: List[str]  # literal header row (empty on get_sheet_rows path)
+    header_cells: List[Any]  # literal header row (empty on get_sheet_rows path)
     rows: List[Dict[str, Any]]
     error: str = ""
     sampled: bool = False   # v1.3.0: more rows existed beyond max_rows
@@ -604,7 +616,8 @@ async def _read_page(
     rows_reader: Optional[Tuple[Callable, bool, str]],
     max_rows: int,
 ) -> _PageData:
-    expected_tokens = set(reg.headers(page)) | set(reg.keys(page))
+    normalizer = insights_header_token if page == INSIGHTS_PAGE else _safe_str
+    expected_tokens = {normalizer(value) for value in reg.headers(page) + reg.keys(page)}
 
     # PRIMARY: literal cells via read_range
     if read_range is not None and sid:
@@ -618,9 +631,11 @@ async def _read_page(
             logger.warning("read_range failed for %s: %s", page, e)
             grid = None
         if isinstance(grid, list) and len(grid) >= 1:
-            hr = _detect_header_row(grid, expected_tokens)
+            hr = insights_header_row(grid, 14) if page == INSIGHTS_PAGE else -1
+            if hr < 0:
+                hr = _detect_header_row(grid, expected_tokens, normalizer=normalizer)
             if hr >= 0:
-                header_cells = [_safe_str(c) for c in grid[hr]]
+                header_cells = list(grid[hr])
                 avail = max(0, len(grid) - (hr + 1))
                 rows = _grid_to_rows(header_cells, grid[hr + 1 : hr + 1 + max_rows])
                 # v1.3.0: the range already over-fetches (+25), so any grid
@@ -706,11 +721,17 @@ def check_contract(page: str, expected_headers: List[str], actual_headers: List[
     while act and act[-1] == "":
         act.pop()
 
-    if act == exp:
+    if page == INSIGHTS_PAGE and insights_keys(insights_trim_headers(actual_headers)) is not None:
+        return CheckResult(page, "contract.header_match", "PASS",
+                           detail="7 columns, supported current/legacy Insights report in its written order")
+
+    if act == exp and page != INSIGHTS_PAGE:
         return CheckResult(page, "contract.header_match", "PASS",
                            detail=f"{len(act)} columns, ends with '{act[-1] if act else ''}'")
 
     detail_bits: List[str] = [f"expected {len(exp)} cols, found {len(act)}"]
+    if page == INSIGHTS_PAGE:
+        detail_bits.append("headers do not match one complete supported Insights report")
     if exp:
         exp_last = exp[-1]
         act_last = act[-1] if act else "(none)"
@@ -1288,6 +1309,13 @@ async def validate(
         if pdata.source == "read_range":
             results.append(check_contract(page, expected_headers, pdata.header_cells))
             actual_set = {_safe_str(h) for h in pdata.header_cells if _safe_str(h)}
+            if page == INSIGHTS_PAGE:
+                headers = insights_trim_headers(pdata.header_cells)
+                keys = insights_keys(headers)
+                if keys is not None:
+                    # Legacy Symbol and timestamp aliases must resolve against
+                    # the real written report, rather than the current registry.
+                    k2h = dict(zip(keys, headers))
         else:
             results.append(check_contract_logical(page, expected_keys, pdata.rows))
             actual_set = set()  # empty => _has_column relies on registry mapping
