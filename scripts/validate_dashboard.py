@@ -2,12 +2,21 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.1)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.2)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.2 (2026-10-24) — FULL SOURCE SCOPE BY DEFAULT
+--------------------------------------------------------------------------------
+The old 1,500-row default left the tails of Global_Markets and Mutual_Funds
+unchecked. The default bounded read now covers 20,000 data rows per page with
+the existing over-read sentinel; the Sheets request count is unchanged. Any
+observed overflow is a failed incomplete audit, with an explicitly UNKNOWN
+tail, rather than a warning tolerated by daily_sync. An explicit lower bound
+still limits work, but cannot certify a longer page. No trade gate is relaxed.
+
 v1.3.1 (2026-10-21) — DECISION SURFACE: IN-PROGRESS RENDER + COCKPIT STATUS
 --------------------------------------------------------------------------------
 WHY: in sync run 39513589733 the global-markets and mutual-funds legs failed
@@ -254,7 +263,7 @@ ENVIRONMENT
 -----------
   VALIDATE_SHEET_ID / DEFAULT_SPREADSHEET_ID   spreadsheet id
   VALIDATE_PAGES                               comma-separated page list
-  VALIDATE_MAX_ROWS                            max data rows per page (default 1500)
+  VALIDATE_MAX_ROWS                            max data rows per page (default 20000)
   VALIDATE_JSON_OUT                            write JSON report to this path
   VALIDATE_WRITE_SHEET                         truthy = also write Dashboard_Audit tab
   VALIDATE_AUDIT_TAB                           audit tab name (default Dashboard_Audit)
@@ -286,7 +295,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.3.2"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -1258,17 +1267,22 @@ async def validate(
             results.append(CheckResult(page, "read", "FAIL", detail=pdata.error))
             continue
 
-        # v1.3.0 (audit P1-1): every page verdict now carries its scope.
-        # WARN exits 1; daily_sync tolerates exit 1 by explicit design and
-        # reds only on >= 2 — the page is labeled, production is not broken.
+        # A bounded partial audit cannot certify the unchecked tail. Logical
+        # engine rows cannot establish the extent of the literal source sheet.
+        # The failed scope remains separate from checks on observed rows.
+        incomplete = pdata.sampled or pdata.source != "read_range"
         results.append(CheckResult(
             page, "scope.coverage",
-            "WARN" if pdata.sampled else "PASS",
+            "FAIL" if incomplete else "PASS",
             count=len(pdata.rows),
             detail=(f"SAMPLE_ONLY: first {len(pdata.rows)} rows validated; "
-                    "page has more — NOT a full-page certificate "
-                    "(--full / VALIDATE_FULL=1 to certify)")
-            if pdata.sampled else f"FULL ({len(pdata.rows)} rows)"))
+                    "unchecked tail UNKNOWN — NOT a full-page certificate; "
+                    "increase the verified row bound and rerun")
+            if pdata.sampled else
+            (f"UNKNOWN literal-sheet extent: {len(pdata.rows)} logical engine "
+             "rows checked; restore the literal sheet reader and rerun")
+            if pdata.source != "read_range" else
+            f"FULL ({len(pdata.rows)} rows)"))
 
         # CONTRACT
         if pdata.source == "read_range":
@@ -1398,7 +1412,7 @@ def create_parser() -> argparse.ArgumentParser:
                    help="Spreadsheet ID (also VALIDATE_SHEET_ID / DEFAULT_SPREADSHEET_ID env).")
     p.add_argument("--pages", nargs="+", default=_env_csv("VALIDATE_PAGES", _DEFAULT_PAGES),
                    help="Pages to validate (also VALIDATE_PAGES env as CSV).")
-    p.add_argument("--max-rows", type=int, default=_env_int("VALIDATE_MAX_ROWS", 1500, lo=1),
+    p.add_argument("--max-rows", type=int, default=_env_int("VALIDATE_MAX_ROWS", 20000, lo=1),
                    help="Max data rows per page (also VALIDATE_MAX_ROWS env).")
     p.add_argument("--full", action="store_true",
                    default=_env_bool("VALIDATE_FULL", False),

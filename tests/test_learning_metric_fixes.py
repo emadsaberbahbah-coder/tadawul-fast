@@ -14,17 +14,21 @@ The run_shadow_scorer turnover/cost change from PR #809 is not carried here.
 from __future__ import annotations
 
 import math
+import itertools
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from scripts import track_performance as tp
 
+_observations = itertools.count()
+
 
 def _rec(reco, roi, hz="1M", inv="", rel=0.0):
     now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
     return tp.PerformanceRecord(
-        record_id="r", symbol="X.SR", horizon=tp.HorizonType(hz), date_recorded=now,
+        # Each item models a distinct signal, not repeated copies of one key.
+        record_id="r", symbol=f"X{next(_observations)}.SR", horizon=tp.HorizonType(hz), date_recorded=now,
         entry_price=10, entry_recommendation=reco, entry_score=50, entry_risk_bucket="LOW",
         entry_confidence="HIGH", origin_tab="Decision_Coverage", target_price=9, target_roi=-10,
         target_date=now + timedelta(days=30), status=tp.PerformanceStatus.MATURED,

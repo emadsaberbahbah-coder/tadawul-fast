@@ -2,8 +2,15 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.2
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.3
 ================================================================================
+
+WHY v5.157.3 - CONFIGURED SUKUK INDUSTRY FALLBACK (2026-10-24)
+The Saudi-listing fallback labelled configured sukuk as Listed Equities even
+after the existing fixed-income classifier set their asset class. Use the
+same fixed-income policy for that generic fallback, preserving any specific
+provider industry, financial values, recommendation and gate behavior.
+Tests: tests/test_sukuk_industry_classification.py.
 
 WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
 Sweep expired entries during cache traffic under the existing async lock.
@@ -4287,7 +4294,7 @@ from core.financial_units import (
 #   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
 #   settle trajectory, status and published values are v5.156.0's; off is
 #   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
-__version__ = "5.157.2"
+__version__ = "5.157.3"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -5624,6 +5631,7 @@ def _intrinsic_display_source_signature(row: Mapping[str, Any]) -> str:
         # the start; a later policy change invalidates an old equity receipt.
         if _sukuk_classification_enabled() and _row_is_fixed_income(row):
             values["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+            values["industry"] = _fixed_income_industry(row.get("industry"))
         encoded = json.dumps(values,
                              sort_keys=True, allow_nan=False, separators=(",", ":"))
         return hashlib.sha256(encoded.encode()).hexdigest()
@@ -6035,6 +6043,13 @@ def _sukuk_classification_enabled() -> bool:
 # sync's run_dashboard_sync._fixed_income_symbols() classification so the engine
 # (on-demand refresh) and the daily sync agree on the same cell.
 _FIXED_INCOME_ASSET_CLASS = "Fixed Income / Sukuk"
+
+
+def _fixed_income_industry(industry: Any) -> Any:
+    """Replace only our generic equity fallback; retain provider detail."""
+    if not industry or _safe_str(industry).strip().lower() == "listed equities":
+        return _FIXED_INCOME_ASSET_CLASS
+    return industry
 
 
 def _fixed_income_symbols() -> frozenset:
@@ -8720,6 +8735,7 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     # Env-toggleable via TFB_ENGINE_SUKUK_CLASS (default ON).
     if _sukuk_classification_enabled() and _row_is_fixed_income(row):
         row["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+        row["industry"] = _fixed_income_industry(row.get("industry"))
         row["recommendation"] = "HOLD"
         row["recommendation_detailed"] = "HOLD"
         row["recommendation_source"] = "fixed_income_sukuk"
@@ -15742,6 +15758,8 @@ def _infer_sector_from_symbol(symbol: str) -> str:
 
 def _infer_industry_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
+    if _sukuk_classification_enabled() and s in _fixed_income_symbols():
+        return _FIXED_INCOME_ASSET_CLASS
     if s in _COMMODITY_INDUSTRY_HINTS:
         return _COMMODITY_INDUSTRY_HINTS[s]
     if s.endswith("=X"):
