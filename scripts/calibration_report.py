@@ -29,7 +29,7 @@ import sys
 
 import openpyxl
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 RISK_COLUMNS = ("Volatility", "Max Drawdown %", "Sharpe Ratio")
 
 
@@ -234,6 +234,7 @@ def analyze_workbook(path, min_sample=20):
                        "global_markets_updated_dates": dict(sorted(market_dates.items())),
                        "global_markets_dominant_date": market_dates.most_common(1)[0][0] if market_dates else None},
             "method": {"min_sample": min_sample, "dedup": "first matured finite-realized-ROI record per nonblank Key",
+                       "outcome_metric": "price_positive_rate; not direction-aware call correctness",
                        "outcome": "sign of stored Realized ROI %; breakeven excluded from win rate/Brier",
                        "probability": "Entry Forecast Reliability / 100; missing/nonfinite/out-of-range excluded",
                        "risk": "blank/invalid and all-zero triplets excluded as risk measurements; outcomes retained",
@@ -259,12 +260,14 @@ def render_md(report):
              f"Observed Global_Markets dominant update date: {source['global_markets_dominant_date']}; "
              f"latest Signal_History date: {source['signal_dates']['latest']}. These are source data dates, not a live read-back.",
              f"Performance_Log header row {source['performance_header_row']} is intentional.", "",
-             f"After deduplication: {overall['matured']:,} matured records; {overall['wins']:,} wins / "
-             f"{overall['losses']:,} losses, win rate {fmt(overall['win_rate_pct'])}%. "
+             f"After deduplication: {overall['matured']:,} matured records; {overall['wins']:,} positive returns / "
+             f"{overall['losses']:,} negative returns, price-positive rate {fmt(overall['win_rate_pct'])}%. "
              f"Brier {fmt(overall['brier'])} over {overall['brier_n']:,} eligible records (baseline 0.25).", "",
+             "This offline report scores the sign of long-price ROI, while the tracker labels direction-aware call correctness separately. "
+             "A falling SELL call can be directionally correct with a negative long-price ROI. "
              "Reliability is treated as an advisory implied probability. Blank/zero risk placeholders supply no risk evidence; "
              "their realized outcomes remain eligible. Signal_History supplies coverage only; ambiguous or later versions never replace entry predictions.", "",
-             "| Horizon | Origin page | Matured | Wins | Losses | Win rate % | Brier n | Brier | Mean claim % | Claim minus wins pp | Sufficient |",
+             "| Horizon | Origin page | Matured | Positive returns | Negative returns | Price-positive % | Brier n | Brier | Mean claim % | Claim minus positive pp | Sufficient |",
              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for row in report["by_horizon_page"]:
         values = [row[k] for k in ("horizon", "page", "matured", "wins", "losses", "win_rate_pct", "brier_n", "brier",

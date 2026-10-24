@@ -130,7 +130,8 @@ class FinalPublicationStructureTests(unittest.TestCase):
         for name in ("Publish final audit summary", "Upload final publication evidence", "Secure credential cleanup"):
             self.assertEqual(expression_field(step_source(self.job, name), "if", 8), "always()")
         artifact = step_source(self.job, "Upload final publication evidence")
-        self.assertEqual(expression_field(artifact, "path", 10), "final_decision_publication.json")
+        self.assertIn("final_decision_publication.json", artifact)
+        self.assertIn("final_dashboard_validation.json", artifact)
         self.assertNotIn("continue-on-error", self.job)
         verdict = job_source(self.workflow, "notify-run-verdict")
         self.assertIn(FINAL_JOB, expression_field(verdict, "needs", 4))
@@ -157,18 +158,30 @@ class FinalPublicationShellTests(unittest.TestCase):
             "GITHUB_ENV": str(self.root / "github-env"),
             "GITHUB_OUTPUT": str(self.root / "github-output"),
             "GITHUB_STEP_SUMMARY": str(self.root / "summary.md"),
+            "GITHUB_RUN_ID": "90001", "GITHUB_SHA": "a" * 40,
             "SECRET_CREDS": self.raw, "SECRET_CREDS_B64": "",
             "STUB_AUDIT_EXIT": "0", "STUB_CALL_PATH": str(self.root / "audit-call.json"),
         }
         self.job = job_source(WORKFLOW.read_text(encoding="utf-8"), FINAL_JOB)
         python = self.bin / "python"
-        python.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+        python.write_text(f"#!{sys.executable}\nREPO = {str(ROOT)!r}\n" + textwrap.dedent("""\
             import json, os, sys
             from pathlib import Path
+            if len(sys.argv) > 1 and sys.argv[1] == 'scripts/validate_dashboard.py':
+                from datetime import datetime, timedelta, timezone
+                payload = {'meta': {'reader': 'read_range', 'generated_riyadh': datetime.now(
+                    timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')}, 'results': []}
+                output = sys.argv[sys.argv.index('--json-out') + 1]
+                Path(output).write_text(json.dumps(payload))
+                raise SystemExit(0)
+            if len(sys.argv) > 1 and sys.argv[1] in ('scripts/workflow_validation_scope.py', 'scripts/render_audit_summary.py'):
+                os.execv(sys.executable, [sys.executable, str(Path(REPO) / sys.argv[1]), *sys.argv[2:]])
             if len(sys.argv) > 1 and sys.argv[1] == 'scripts/finalize_decision_publication.py':
                 Path(os.environ['STUB_CALL_PATH']).write_text(json.dumps(sys.argv[1:]))
                 code = int(os.environ['STUB_AUDIT_EXIT'])
                 payload = {'exit_code': code, 'audit_exit_codes': [code, 0],
+                           'audits': {'coverage': {'summary': {'exit_code': code}, 'pages': []},
+                                      'decision': {'summary': {'exit_code': 0}, 'findings': []}},
                            'blockers': ['coverage_failed'] if code >= 2 else [],
                            'blocker_published': code >= 2, 'feed_promoted': False}
                 output = sys.argv[sys.argv.index('--json-out') + 1]
@@ -205,7 +218,9 @@ class FinalPublicationShellTests(unittest.TestCase):
                 self.assert_no_credential_disclosure(result)
         self.assertEqual(json.loads(Path(self.env["STUB_CALL_PATH"]).read_text()), [
             "scripts/finalize_decision_publication.py", "--sheet-id", "fake-workbook",
-            "--max-rows", "20000", "--publish-blockers", "--json-out", "final_decision_publication.json",
+            "--max-rows", "20000", "--publish-blockers",
+            "--decision-structure-report", "final_dashboard_validation.json",
+            "--json-out", "final_decision_publication.json",
         ])
 
     def test_plain_and_base64_credentials_use_private_temp_file(self):
@@ -285,9 +300,10 @@ class FinalPublicationShellTests(unittest.TestCase):
 
     def test_summary_missing_report_never_claims_acceptance(self):
         result = self.run_step("Publish final audit summary")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
         summary = Path(self.env["GITHUB_STEP_SUMMARY"]).read_text()
         self.assertIn("No acceptance was issued", summary)
+        self.assertIn("UNKNOWN", summary)
         self.assertNotIn("| exit_code |", summary)
         self.assert_no_credential_disclosure(result)
 

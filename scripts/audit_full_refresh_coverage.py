@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.3.2 — Insights audits accept exactly the same current/legacy report
+contracts and physical column order supported by the writer. Its non-symbol
+row-count policy remains unchanged; no new report freshness rule is added.
+
 VERSION 1.3.1 — exact scoped membership requires an independent complete A:A
 read crossbound to the quality scan. Sparse tails beyond the audit bound fail
 closed instead of certifying a partial window as the full approved membership.
@@ -48,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -63,6 +67,10 @@ for p in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.paren
 from core.data_validity import (  # noqa: E402
     acquisition_census, coverage_validity, retrieval_timestamp, row_acquisition,
     timestamp_freshness,
+)
+from core.sheets.insights_contract import (  # noqa: E402
+    INSIGHTS_PAGE, aligned_keys as insights_keys, header_token as insights_header_token,
+    find_header_row as insights_header_row, trim_headers as insights_trim_headers,
 )
 from scripts.critical_symbol_identity import canonicalize_symbol  # noqa: E402
 from scripts.approved_universe_scope import (  # noqa: E402
@@ -201,10 +209,11 @@ async def read_symbol_column(reader, sid, page):
     if not isinstance(val,list): raise TypeError("complete Symbol column did not return a list")
     return val
 
-def header_row(grid, expected):
-    exp={s(x).casefold() for x in expected if s(x)}; best=(-1,0)
+def header_row(grid, expected, normalizer=None):
+    token=normalizer or (lambda value:s(value).casefold())
+    exp={token(x) for x in expected if token(x)}; best=(-1,0)
     for i,row in enumerate(grid[:45]):
-        score=len({s(x).casefold() for x in row if s(x)} & exp)
+        score=len({token(x) for x in row if token(x)} & exp)
         if score>best[1]: best=(i,score)
     return best[0] if best[1] >= (3 if len(exp)>=3 else 1) else -1
 
@@ -243,10 +252,14 @@ def rules(*, approved_scope: ScopePolicy | None=None):
 def audit_grid(grid, rule, expected, now, active=(), *, approved_scope: ScopePolicy | None=None, source_column=None):
     if approved_scope is not None and rule.page in approved_scope.pages:
         rule=replace(rule,min_rows=approved_scope.pages[rule.page].approved_count)
-    hr=header_row(grid,expected); r=Result(rule.page,min_rows=rule.min_rows,expected_cols=len(expected),header_row=hr+1 if hr>=0 else 0)
+    normalizer=insights_header_token if rule.page==INSIGHTS_PAGE else None
+    hr=insights_header_row(grid,45) if rule.page==INSIGHTS_PAGE else -1
+    if hr<0: hr=header_row(grid,expected,normalizer)
+    r=Result(rule.page,min_rows=rule.min_rows,expected_cols=len(expected),header_row=hr+1 if hr>=0 else 0)
     if hr<0: r.failures.append("header row not found"); return r.finish()
     headers=trim(grid[hr]); r.actual_cols=len(headers)
-    if headers != [s(x) for x in expected]: r.failures.append(f"header mismatch: expected {len(expected)}, found {len(headers)}")
+    matched=(insights_keys(insights_trim_headers(grid[hr])) is not None) if rule.page==INSIGHTS_PAGE else headers==[s(x) for x in expected]
+    if not matched: r.failures.append(f"header mismatch: expected {len(expected)}, found {len(headers)}")
     rows=[list(x) for x in grid[hr+1:] if has(x)]; r.rows=len(rows)
     if r.rows<rule.min_rows: r.failures.append(f"row count {r.rows} below minimum {rule.min_rows}")
     if not rule.symbols: return r.finish()

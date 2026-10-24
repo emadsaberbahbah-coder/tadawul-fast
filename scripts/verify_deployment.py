@@ -164,7 +164,7 @@ SCRIPT_VERSION = "1.0.61"  # v1.0.49 (2026-10-11) - pins data_engine_v2 5.152.0-
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.6', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
     ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
@@ -204,7 +204,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.3',
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.5',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
@@ -221,22 +221,23 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
-    ("audit_full_refresh_coverage", "1.3.1", "read-only full row coverage audit"),
+    ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
+    ("validate_dashboard", "1.3.3", "scoped literal contract and native cockpit validation"),
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
-    ("tfb_workbook_dq_audit", "1.0.3", "nightly offline workbook DQ audit"),
+    ("tfb_workbook_dq_audit", "1.0.4", "nightly offline workbook DQ audit"),
     ("compare_broker_observation", "1.0.0", "offline research observation comparison; no funding certificate"),
     ('tfb_capture_evidence', '1.0.0', 'private offline custodian capture'),
     ('repair_pit_legacy_rows', '1.0.0', 'bounded operator PIT repair'),
-    ('tfb_export_audit', '1.2.0', 'offline export audit'),
-    ('calibration_report', '1.0.0', 'offline calibration evidence'),
+    ('tfb_export_audit', '1.2.1', 'offline export audit'),
+    ('calibration_report', '1.0.1', 'offline calibration evidence'),
     ('audit_workbook', '1.2.1', 'read-only workbook audit'),
     ('flag_registry', '1.0.0', 'static flag inventory'),
     ('render_env_contract', '1.0.0', 'static Render ENV contract (H-8)'),
 
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
-    ("finalize_decision_publication", "1.1.1", "final decision-publication acceptance"),
+    ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.5.0", "shadow board"),
@@ -245,7 +246,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
-    ("track_performance", "6.47.0", "track performance"),
+    ("track_performance", "6.48.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.

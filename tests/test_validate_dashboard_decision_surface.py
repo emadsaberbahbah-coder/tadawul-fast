@@ -135,7 +135,7 @@ def test_v5_published_board_single_read(monkeypatch):
 
 
 def test_v6_version():
-    assert vd.SCRIPT_VERSION == "1.3.1"
+    assert vd.SCRIPT_VERSION == "1.3.3"
 
 
 def test_v7_stamp_age(monkeypatch):
