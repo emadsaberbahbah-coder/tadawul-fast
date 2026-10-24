@@ -123,7 +123,24 @@ from typing import Any, Dict, List, Optional, Tuple
 # LiveSource.integrity_tab). Changed: 3 (_page_columns optional argument,
 # _top10_sections and check_decision_integrity A3 read integrity_tab).
 # Removed: 0.
-VERSION = "1.0.10"
+# v1.0.11 (2026-10-20, Codex P2 on PR #808) -- RELOCATED AUDIT GRID.
+# WHY: 16_Decision_Top10 DT10_CAND_TAB=enforce moves the audit grid to the
+# hidden tab _T10_Candidates (row 1 run stamp + receipt JSON in column 2,
+# row 2 headers, rows 3.. data; dt10CandTabWrite_) and leaves the section
+# header, the column header and one pointer line (dt10CandPointerText_) in
+# the cockpit. Under that supported mode the v1.0.10 window still gives A2a
+# no USD rows, so it stays a hard NA with the gate on. Not armed today (the
+# 14 Oct export carries the grid in the cockpit).
+# CHANGE (same gate, TFB_ACCEPTANCE_LIVE_WINDOW; off = unchanged): when the
+# cockpit audit body is that pointer (_cand_tab_pointer) AND the receipt
+# says COMMITTED with the same row count as the data rows (_cand_tab_audit),
+# _top10_sections reads the hidden grid through integrity_tab. Anything else
+# keeps the cockpit section: a failed-open publication leaves the grid in
+# the cockpit; a pointer with a PENDING or mismatched grid stays NA; a
+# missing tab is recorded in .errors (fail-closed). ROLLBACK: unset the
+# Variable, or re-deploy v1.0.10. Functions added: 2 (_cand_tab_pointer,
+# _cand_tab_audit). Changed: 1 (_top10_sections). Removed: 0.
+VERSION = "1.0.11"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -926,7 +943,40 @@ def _top10_sections(src: Source) -> Dict[str, Tuple[List[str], List[List[str]]]]
             out["qualified"] = (r, body(i))
         elif prev.startswith("CANDIDATES") and "audit" not in out:
             out["audit"] = (r, body(i))
+    if _live_window_enabled() and "audit" in out and _cand_tab_pointer(out["audit"][1]):
+        moved = _cand_tab_audit(src)   # v1.0.11: DT10_CAND_TAB=enforce layout
+        if moved is not None:
+            out["audit"] = moved
     return out
+
+
+_CAND_TAB = "_T10_Candidates"
+
+
+def _cand_tab_pointer(body: List[List[str]]) -> bool:
+    """v1.0.11: True when the cockpit audit body is the one pointer line that
+    16_Decision_Top10 (DT10_CAND_TAB=enforce) writes instead of the grid."""
+    return bool(body) and any(f"written to hidden tab {_CAND_TAB}" in _s(c) for c in body[0])
+
+
+def _cand_tab_audit(src: Source) -> Optional[Tuple[List[str], List[List[str]]]]:
+    """v1.0.11: (header, body) of _T10_Candidates when its receipt (row 1,
+    column 2) is COMMITTED and its row count matches the data rows; else None."""
+    rows = [[_s(c) for c in r] for r in src.integrity_tab(_CAND_TAB)]
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return None
+    try:
+        receipt = json.loads(rows[0][1])
+    except ValueError:
+        return None
+    data: List[List[str]] = []
+    for rr in rows[2:]:
+        if not rr or not (rr[0] or (len(rr) > 1 and rr[1])):
+            break
+        data.append(rr)
+    if not isinstance(receipt, dict) or receipt.get("state") != "COMMITTED" or receipt.get("rows") != len(data):
+        return None
+    return rows[1], data
 
 
 def _implied_fx(header: List[str], body: List[List[str]], ccy_col: str, px_col: str,
