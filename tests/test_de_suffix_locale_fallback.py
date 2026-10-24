@@ -54,8 +54,11 @@ nz = importlib.import_module("core.symbols.normalize")
 ENV = "TFB_ENGINE_SUFFIX_LOCALE_FALLBACK"
 DE_BASE = os.environ.get("TFB_TEST_DE_BASE", "")
 BASE_VERSION = "5.157.3"   # merge note 2026-10-24 (#778): main #821-#829 is the new base (was 5.157.0, #817; 5.156.0, #816; 5.155.0, #810)
-ARMED = ("1", "true", "yes", "on", " ON ", "True")
-OFF = (None, "", "0", "false", "off", "no", "observe", "enforce", "2")
+# 2026-10-15 (v5.160.0 since the second 2026-10-22 merge): default armed in code, so unset (None) now arms;
+# an explicit blank still reads off in the engine and stays in OFF.
+ARMED = (None, "1", "true", "yes", "on", " ON ", "True")
+OFF = ("", "0", "false", "off", "no", "observe", "enforce", "2")
+LEGACY_OFF = "0"  # explicit disarm; unset no longer means off
 
 # The engine already names the right country for these, then stamps USD.
 CLASS = (".VN", ".HOSE", ".SET", ".PS", ".PSE", ".AU", ".KO", ".BE", ".DU",
@@ -132,14 +135,14 @@ def assert_vn_fixed(module):
 
 # ---------------------------------------------------------------- WORKS ----
 def case_w1_inferrers_armed(mp, _tmp):
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     assert _infer(de, "MWG.VN") == ("NASDAQ/NYSE", "USD", "Vietnam")  # the defect
     _arm(mp)
     assert_vn_fixed(de)
 
 
 def case_w2_provider_row_canonicalized(mp, _tmp):
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     off = _canon(de, "MWG.VN")
     assert (off["exchange"], off["currency"], off["country"]) == ("NASDAQ/NYSE", "USD", "Vietnam")
     _arm(mp)
@@ -214,7 +217,7 @@ def _engine_row(mp, page):
 
 def case_w3_full_engine_path(mp, _tmp):
     for page in ("Global_Markets", "Top_10_Investments"):
-        _arm(mp, None)
+        _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
         off = _engine_row(mp, page)
         assert (off["exchange"], off["currency"]) == ("NASDAQ/NYSE", "USD"), page
         assert "market_cap_currency_suspect" in str(off.get("warnings"))
@@ -228,7 +231,7 @@ def case_w3_full_engine_path(mp, _tmp):
 
 def case_w4_identity_guard_agrees(mp, _tmp):
     ig = importlib.import_module("core.analysis.identity_guard")
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     assert ig.currency_is_consistent("MWG.VN", _infer(de, "MWG.VN")[1]) is False
     _arm(mp)
     assert ig.currency_is_consistent("MWG.VN", _infer(de, "MWG.VN")[1]) is True
@@ -238,14 +241,14 @@ def case_w5_builder_price_sar(mp, _tmp):
     ob = importlib.import_module("core.analysis.opportunity_builder")
     crit = ob.make_criteria()
     got = {}
-    for mode in (None, "1"):
+    for mode in (LEGACY_OFF, "1"):  # 2026-10-15: default armed in code; this case tests the legacy/off path
         _arm(mp, mode)
         row = _canon(de, "MWG.VN")
         cand = ob.normalize_candidate(
             {"Symbol": "MWG.VN", "Exchange": row["exchange"],
              "Currency": row["currency"], "Current Price": 74700.0}, FX, crit)
         got[mode] = (cand["currency"], round(cand["price_sar"], 2))
-    assert got[None] == ("USD", 280653.13), got  # the published number
+    assert got[LEGACY_OFF] == ("USD", 280653.13), got  # the published number
     assert got["1"] == ("VND", 11.06), got
 
 
@@ -259,7 +262,7 @@ def case_w6_arm_spellings(mp, _tmp):
 def case_w7_fixture_census_moves_vn_only(mp, _tmp):
     syms = _fixture_symbols()
     assert len(syms) >= 2000
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     off = {s: _infer(de, s) for s in syms}
     _arm(mp)
     on = {s: _infer(de, s) for s in syms}
@@ -281,7 +284,7 @@ def case_n1_off_spellings_are_off(mp, _tmp):
 
 
 def case_n2_untouched_shapes(mp, _tmp):
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     off = {s: _infer(de, s) for s in UNTOUCHED}
     _arm(mp)
     for s in UNTOUCHED:
@@ -325,7 +328,7 @@ def case_n4_never_raises(mp, _tmp):
 
 
 def case_n5_no_new_health_key(mp, _tmp):
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     off = de.surface_gate_states()
     _arm(mp)
     on = de.surface_gate_states()
@@ -378,7 +381,7 @@ def case_g1_off_census_byte_identical_to_base(mp, _tmp):
         _arm(mp, value)
         for s in syms:
             assert _infer(de, s) == _infer(base, s), (value, s)
-    _arm(mp, None)
+    _arm(mp, LEGACY_OFF)  # 2026-10-15: default armed in code; this case tests the legacy/off path
     for s in ["MWG" + suffix for suffix in CLASS] + list(UNTOUCHED[:-1]):
         assert _canon(de, s) == _canon(base, s), s
     assert de.surface_gate_states() == base.surface_gate_states()

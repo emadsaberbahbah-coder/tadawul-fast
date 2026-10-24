@@ -1640,7 +1640,47 @@ from typing import Optional
 #   above that names .AT/.NS/.SZ rows now names .SZ rows only. OFF (all three
 #   unset/0): byte-identical to v1.27.2 except the version stamp.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.27.3"
+# v1.28.0 (2026-10-15) [DECISION-PAGES LAUNCH] - three v1.24.2/v1.27.0 gates
+#   become DEFAULT ON (owner decision 2026-10-15); each keeps an explicit kill
+#   switch (=0/false/off/no).
+# EVIDENCE (Top_10_Investments export of 2026-10-15 00:56 Riyadh, builder
+#   1.26.1, pool 9,786, written audit 500): 4 of 500 rows pass every gate and
+#   441 stop at Quote Freshness. 56 of those are "venue calendar unavailable"
+#   (.NS 15, .BK 7, .MX 7, .AX 7, .OL 4, .CO 4, .VN 3, .TW 3, .AT 2, .HE 1,
+#   .VI 1, .JK 1, .BA 1); with the v1.27.0 calendar extension 44 of them are
+#   certified as the witnessed latest close and 9 become a correct STALE
+#   pre-close. 3 of the 4 qualified research seats are Real Estate while the
+#   operator panel says Max Per Sector 2, because the research pass does not
+#   advance the sector counter unless TFB_OPP_RESEARCH_DIVERSIFY is armed.
+# WHAT (only the three readers' defaults move):
+#   (1) _env_venue_cal_ext: TFB_OPP_VENUE_CAL_EXT unset -> ON. The freshness
+#       rule itself is unchanged (live <= TFB_TICKET_MAX_QUOTE_AGE_MIN in
+#       session, else the witnessed latest close); it becomes decidable on 30
+#       more venues instead of failing closed as "calendar unavailable".
+#   (2) _env_freshness_alert: TFB_OPP_FRESHNESS_ALERT unset -> ON. Display
+#       only: one stale_quotes alert plus re-qualify text on near-misses.
+#   (3) _env_research_diversify: TFB_OPP_RESEARCH_DIVERSIFY unset or blank ->
+#       ON, so a research seat consumes the sector/market/issuer counters the
+#       way a funded seat does and the board honours Max Per Sector.
+#   TFB_OPP_AUDIT_KEEP stays DEFAULT OFF (inert until the 16_Decision_Top10
+#   v1.13.10 cockpit is pasted and DT10_AUDIT_KEEP=on).
+# OFF: setting each name to 0/false/off/no restores v1.27.0 behaviour exactly
+#   (v1.27.0 with all three unset). Functions added 0. Removed 0.
+# Rollback: set the three names to 0 on Render; or revert.
+# MERGE NOTE (2026-10-19): rebased onto the decision-pages bundle after
+#   main's v1.26.2/v1.27.0; the data-quality build underneath is v1.27.1.
+#   main's v1.26.2 _VENUE_CAL_EXT_MAP already certifies 27 of the 30
+#   venues in (1) BY DEFAULT, so arming TFB_OPP_VENUE_CAL_EXT by default
+#   now adds exactly three: .AT (ASEX), .NS (XBOM), .SZ (XSHG). Read every
+#   'v1.27.0' in this block as v1.27.1; the OFF clause restores v1.27.1.
+# MERGE NOTE 2 (2026-10-22): the bundle underneath is now v1.27.3 (renumbered
+#   over main's v1.27.2, #813). #813 put .AT in the default-on map and, on
+#   review, keeps .NS fail-closed (XBOM does not model NSE's special
+#   sessions), so the bundle's _VENUE_CAL_MAP_EXT holds only .SZ (XSHG) and
+#   arming TFB_OPP_VENUE_CAL_EXT by default now adds exactly that one venue.
+#   Read 'v1.27.1' above as v1.27.3; the OFF clause restores v1.27.3.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.28.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3018,10 +3058,10 @@ def _env_trust_lineage_mode():
 
 
 def _env_research_diversify():
-    """v1.24.2: research-pass diversification. Default OFF; =1/true/on/yes
-    makes a research pick consume the sector/market/issuer counters the way a
-    funded pick does. OFF => v1.24.1 byte-identical."""
-    return (os.getenv("TFB_OPP_RESEARCH_DIVERSIFY") or "").strip().lower() in (
+    """v1.24.2: research-pass diversification; =1/true/on/yes makes a research
+    pick consume the sector/market/issuer counters the way a funded pick does.
+    v1.28.0: DEFAULT ON (unset or blank); 0/false/off/no => v1.24.1 behaviour."""
+    return (os.getenv("TFB_OPP_RESEARCH_DIVERSIFY") or "1").strip().lower() in (
         "1", "true", "on", "yes")
 
 
@@ -3213,13 +3253,15 @@ def _env_fx_usx_subunit():
 
 
 def _env_venue_cal_ext():
-    """v1.27.0: resolve _VENUE_CAL_MAP_EXT venues in the freshness gate; DEFAULT OFF."""
-    return _env_flag01("TFB_OPP_VENUE_CAL_EXT", "0")
+    """v1.27.0: resolve _VENUE_CAL_MAP_EXT venues in the freshness gate.
+    v1.28.0: DEFAULT ON; 0/false/off/no restores the 16-venue map."""
+    return _env_flag01("TFB_OPP_VENUE_CAL_EXT", "1")
 
 
 def _env_freshness_alert():
-    """v1.27.0: stale_quotes alert + run-window near-miss text; DEFAULT OFF."""
-    return _env_flag01("TFB_OPP_FRESHNESS_ALERT", "0")
+    """v1.27.0: stale_quotes alert + run-window near-miss text.
+    v1.28.0: DEFAULT ON (display only); 0/false/off/no removes it."""
+    return _env_flag01("TFB_OPP_FRESHNESS_ALERT", "1")
 
 
 def _env_audit_keep():

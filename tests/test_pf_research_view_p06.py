@@ -4,15 +4,18 @@
 portfolio_actions v1.16.0 [P0-6 RESEARCH VIEW] harness - REAL module, ZERO
 network, synthetic holdings and invented account captures only.
 
-TFB_PF_RESEARCH_VIEW = off (default) | observe | enforce. Off must be the
+TFB_PF_RESEARCH_VIEW = off | observe | enforce. Off must be the
 v1.15.1 output except the version string; observe adds text only; enforce
 shows rule verdicts, market value, cost, P&L and levels on rows that stay
 BLOCK with zero money. The D4 daily custody tier is NOT part of this build.
+2026-10-15 (1.17.0): unset / blank now read enforce; the harness pins
+TFB_PF_RESEARCH_VIEW=off in POLICY so its default runs stay the off path.
 
-  R0   off is byte-identical to the base on 6 fixtures x 7 env spellings
+  R0   off is byte-identical to the base on 6 fixtures x 6 off spellings
        (needs TFB_TEST_PA_BASE; skips cleanly when unset)
   R0b  off never enters the research view (no base needed)
-  R0c  the env reader: only exact observe / enforce arm it
+  R0c  the env reader: unset / blank / observe / enforce arm it; the armed
+       default builds exactly the explicit enforce output
   R0d  a direct call with the gate off returns the off output
   R1   observe: numbers, KPIs, alerts identical to off; tag on every row
   R2   enforce, no packet: BLOCK + legacy prefix + tag; MV / P&L / levels
@@ -87,7 +90,9 @@ NEW_FUNCTIONS = {"_env_research_view_mode", "_research_verdict", "_research_fx_r
 # unless a case names it. Restored after each build (no env leaks).
 POLICY = {"TFB_PF_ENABLED": "1", "TFB_PF_CONFIRM_PERSIST": "0",
           "TFB_PF_ADD_CONFIRM_DAYS": "0", "TFB_PF_TRUST_GATE": "0",
-          "TFB_EXIT_BY_RULE_GATE": "0"}
+          "TFB_EXIT_BY_RULE_GATE": "0",
+          # 2026-10-15: default armed in code; this case tests the legacy/off path
+          "TFB_PF_RESEARCH_VIEW": "off"}
 CLEARED = ("TFB_PF_RESEARCH_VIEW", "TFB_PF_CUSTODY_DAILY_MAX_AGE_S", "TFB_PF_DD_EXIT",
            "TFB_EXIT_BY_RULE_EXTRA", "TFB_SHARIAH_FAIL_LIST", "TFB_PF_CONFIRM_SESSION",
            "TFB_PF_ADD_LOSER_VETO", "TFB_FORECAST_BASIS", "TFB_PA_SUKUK_LADDER_LEGACY",
@@ -104,9 +109,11 @@ TAG_M = "[custody-matched]"
 LEVEL_KEYS = ("market_value_sar", "cost_sar", "pnl_sar", "pnl_pct", "stop_sar", "tp1_sar", "tp2_sar")
 KPI_KEYS = ("holdings_value_sar", "cost_basis_sar", "pnl_sar", "pnl_pct")
 FX_NOTE = "SAR figures withheld: holding FX differs from the supplied rate"
-OFF_SPELLINGS = ({}, {"TFB_PF_RESEARCH_VIEW": "OFF"}, {"TFB_PF_RESEARCH_VIEW": "bogus"},
-                 {"TFB_PF_RESEARCH_VIEW": ""}, {"TFB_PF_RESEARCH_VIEW": "enforced"},
+OFF_SPELLINGS = ({"TFB_PF_RESEARCH_VIEW": "off"}, {"TFB_PF_RESEARCH_VIEW": "OFF"},
+                 {"TFB_PF_RESEARCH_VIEW": "bogus"}, {"TFB_PF_RESEARCH_VIEW": "enforced"},
                  {"TFB_PF_RESEARCH_VIEW": "1"}, {"TFB_PF_CUSTODY_DAILY_MAX_AGE_S": "86400"})
+# 2026-10-15 (portfolio_actions 1.17.0): unset and blank now arm enforce.
+ARMED_SPELLINGS = ({"TFB_PF_RESEARCH_VIEW": None}, {"TFB_PF_RESEARCH_VIEW": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -586,12 +593,20 @@ def case_r0d_direct_call_with_gate_off_returns_off_output():
 
 
 def case_r0c_env_reader():
-    expected = {None: "off", "": "off", "off": "off", "OFF": "off", "bogus": "off", "1": "off",
+    # 2026-10-15 (1.17.0): unset / blank read enforce; explicit off spellings stay off.
+    expected = {None: "enforce", "": "enforce", "off": "off", "OFF": "off", "bogus": "off", "1": "off",
                 "true": "off", "enforced": "off", "observe,enforce": "off", "observe": "observe",
                 " Observe ": "observe", "enforce": "enforce", "ENFORCE": "enforce"}
     for value, mode in expected.items():
         with policy_env({"TFB_PF_RESEARCH_VIEW": value}):
             assert pa._env_research_view_mode() == mode, (value, pa._env_research_view_mode())
+    # The armed default builds exactly the explicit enforce output.
+    for name, evidence in fixtures().items():
+        rows = main_rows()
+        armed = norm(run(pa, evidence, rows=rows, env=mode_env("enforce")))
+        for env in ARMED_SPELLINGS:
+            assert norm(run(pa, evidence, rows=rows, env=env)) == armed, (name, env)
+    assert run(pa, None, env=ARMED_SPELLINGS[0])["meta"]["research_view"]["mode"] == "enforce"
 
 
 def case_r1_observe_identical_numbers():
