@@ -1,0 +1,561 @@
+{
+ "note": "refreshPortfolioDecision output of 10_My_Portfolio.gs v1.5.14 on the synthetic 24 Oct all-cash scenario and its fail-closed variants; functions = every top-level function of v1.5.14",
+ "source_sha256": "98e9518600220a186a02d32d85d06f68d96fd6882e64645a7290a40cb273dddd",
+ "source_lines": 4545,
+ "non_ascii_lines": 97,
+ "functions": [
+  "_filterToHeldSymbols_",
+  "_mpFindSymbolHeader_",
+  "_mpMapBySymbol_",
+  "_myPortfolioAbortNoSymbols_",
+  "_myPortfolioCostBasisSymbols_",
+  "_myPortfolioLedgerMap_",
+  "_myPortfolioLedgerSeed_",
+  "_myPortfolioReseedInputsAfterRefresh_",
+  "_myPortfolioRunOptionalPostProcessors_",
+  "_myPortfolioSeedManualInputs_",
+  "appendMyPortfolioFallbackWarning_",
+  "buildMyPortfolio_",
+  "buildPortfolioDecisionLayout",
+  "debugMyPortfolioInvestmentGate_",
+  "debugMyPortfolioPreserve_",
+  "diagnoseMyPortfolio_",
+  "getHeaderMapMyPortfolio_",
+  "getMissingMyPortfolioBusinessHeaders_",
+  "getMissingMyPortfolioDecisionHeaders_",
+  "getMissingMyPortfolioInvestmentGateHeaders_",
+  "getMyPortfolioDecisionCoverage_",
+  "getMyPortfolioInvestmentGateCoverage_",
+  "getMyPortfolioPreserveColumns_",
+  "getMyPortfolioStrictApprovedRows_",
+  "getMyPortfolioStrictThreshold_",
+  "getMyPortfolioSymbols_",
+  "inferMyPortfolioLayout_",
+  "manageMyPortfolioSymbols_",
+  "mergeMyPortfolioHeaders_",
+  "myPortfolioBoolean_",
+  "myPortfolioIsBlank_",
+  "myPortfolioNormalizeHeader_",
+  "myPortfolioNumber_",
+  "myPortfolioPushWarning_",
+  "myPortfolioResolveHeaderColumn_",
+  "myPortfolioUniqueStrings_",
+  "normalizeMyPortfolioSymbols_",
+  "pdActLogMode_",
+  "pdActLogRowFromAction_",
+  "pdActLogSheet_",
+  "pdActLogSignature_",
+  "pdActLogStateLoad_",
+  "pdActLogStateSave_",
+  "pdActLogToday_",
+  "pdActionToRow_",
+  "pdAlertToRow_",
+  "pdAppToken_",
+  "pdAppendActionLog_",
+  "pdApplyColFormats_",
+  "pdBackendUrl_",
+  "pdCell_",
+  "pdCollectHoldings_",
+  "pdColorActions_",
+  "pdEvidencePacket_",
+  "pdFxRates_",
+  "pdHasValue_",
+  "pdIbkrAge_",
+  "pdIbkrApply_",
+  "pdIbkrCaptureWatch",
+  "pdIbkrCentsText_",
+  "pdIbkrDiv_",
+  "pdIbkrExcludeList_",
+  "pdIbkrLatestCapture_",
+  "pdIbkrList_",
+  "pdIbkrMode_",
+  "pdIbkrNative_",
+  "pdIbkrNote_",
+  "pdIbkrPegRates_",
+  "pdIbkrPlan_",
+  "pdIbkrProp_",
+  "pdIbkrRiyadh_",
+  "pdIbkrSplitRows_",
+  "pdIbkrStampMs_",
+  "pdIbkrSym_",
+  "pdIbkrUnitsText_",
+  "pdIbkrUnits_",
+  "pdIbkrWatcherState_",
+  "pdIbkrWindowOpen_",
+  "pdIbkrWindow_",
+  "pdInstallCaptureWatcher",
+  "pdKpiValues_",
+  "pdMetaLine_",
+  "pdPanelDefaults_",
+  "pdPanelPos_",
+  "pdPost_",
+  "pdReadPanel_",
+  "pdReceiptMode_",
+  "pdReceiptNote_",
+  "pdRemoveCaptureWatcher",
+  "pdRemoveCaptureWatcher_",
+  "pdRenderPayload_",
+  "pdScopeToRow_",
+  "pdSectorToRow_",
+  "pdSelfTest",
+  "pdSrcBindingCore_",
+  "pdSrcCapture_",
+  "pdSrcCount_",
+  "pdSrcNormToken_",
+  "pdSrcReadinessCore_",
+  "pdSrcReadiness_",
+  "pdSrcStampMs_",
+  "pdSrcToken_",
+  "pdSrcUtcMs_",
+  "pdStatusLine_",
+  "pdTokens_",
+  "pdWriteSection_",
+  "pdWriteTable_",
+  "preservePortfolioInputs_",
+  "proposeMyPortfolioHeaderUpgrades_",
+  "refreshMyPortfolioInBatches_",
+  "refreshMyPortfolioSelectedRow_",
+  "refreshMyPortfolio_",
+  "refreshPortfolioDecision",
+  "resolveMyPortfolioSortPlan_",
+  "resolveMyPortfolioTargetRow_",
+  "sortMyPortfolio_",
+  "validateMyPortfolioGateLocally_",
+  "validateMyPortfolio_"
+ ],
+ "scenarios": {
+  "allcash": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence SENT (capture 17:39 age 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 9999.SR) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 82819.2,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    },
+    "reconciliation_evidence": {
+     "schema_version": 1,
+     "source_ref": "ibkr-capture:TFB_IBKR_Capture_20261024T143920Z.json",
+     "captured_at": "2026-10-24T14:39:20.117Z",
+     "accounts": [
+      {
+       "account_id": "ibkr-synthetic",
+       "positions_asof": "2026-10-24T14:39:20.117Z",
+       "positions_complete": true,
+       "positions": [],
+       "cash_asof": "2026-10-24T14:39:20.117Z",
+       "cash_complete": true,
+       "cash": [
+        {
+         "currency": "USD",
+         "settled_cash": "22085.12",
+         "reserved_cash": "0",
+         "reservations_complete": true
+        }
+       ]
+      }
+     ],
+     "holding_links": [],
+     "funding_accounts": [
+      "ibkr-synthetic"
+     ],
+     "fx_rates": [
+      {
+       "currency": "USD",
+       "rate_to_sar": "3.75",
+       "asof": "2026-10-24T14:39:20.117Z",
+       "source_ref": "policy://sama-usd-peg-3.75"
+      }
+     ]
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "empty",
+   "logs": [
+    "[MP-DEC v1.5.14] done status=empty in 0s | ActLog: off"
+   ]
+  },
+  "no capture": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence NOT SENT: no capture in the last 36h; USD 3.75; excluded 9999.SR | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 500,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "empty"
+  },
+  "stale capture (24m)": {
+   "b2": "Last run 2026-10-24 18:03:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence NOT SENT: capture 17:39 is 24m old (limit 14m); USD 3.75; excluded 9999.SR | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 500,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "empty"
+  },
+  "broker holds 1 position not on the page": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence SENT (capture 17:39 age 4m; linked 0/0; IBKR not on page: SYNA; cash 82819.20 SAR; USD 3.75; excluded 9999.SR) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 82819.2,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    },
+    "reconciliation_evidence": {
+     "schema_version": 1,
+     "source_ref": "ibkr-capture:TFB_IBKR_Capture_20261024T143920Z.json",
+     "captured_at": "2026-10-24T14:39:20.117Z",
+     "accounts": [
+      {
+       "account_id": "ibkr-synthetic",
+       "positions_asof": "2026-10-24T14:39:20.117Z",
+       "positions_complete": true,
+       "positions": [
+        {
+         "instrument_id": "1000001",
+         "symbol": "SYNA",
+         "currency": "USD",
+         "quantity": "40"
+        }
+       ],
+       "cash_asof": "2026-10-24T14:39:20.117Z",
+       "cash_complete": true,
+       "cash": [
+        {
+         "currency": "USD",
+         "settled_cash": "22085.12",
+         "reserved_cash": "0",
+         "reservations_complete": true
+        }
+       ]
+      }
+     ],
+     "holding_links": [],
+     "funding_accounts": [
+      "ibkr-synthetic"
+     ],
+     "fx_rates": [
+      {
+       "currency": "USD",
+       "rate_to_sar": "3.75",
+       "asof": "2026-10-24T14:39:20.117Z",
+       "source_ref": "policy://sama-usd-peg-3.75"
+      }
+     ]
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "empty"
+  },
+  "status ok with 0 rows": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: ok | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness VERIFIED (run 6363636363) | ibkr evidence SENT (capture 17:39 age 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 9999.SR) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 82819.2,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    },
+    "reconciliation_evidence": {
+     "schema_version": 1,
+     "source_ref": "ibkr-capture:TFB_IBKR_Capture_20261024T143920Z.json",
+     "captured_at": "2026-10-24T14:39:20.117Z",
+     "accounts": [
+      {
+       "account_id": "ibkr-synthetic",
+       "positions_asof": "2026-10-24T14:39:20.117Z",
+       "positions_complete": true,
+       "positions": [],
+       "cash_asof": "2026-10-24T14:39:20.117Z",
+       "cash_complete": true,
+       "cash": [
+        {
+         "currency": "USD",
+         "settled_cash": "22085.12",
+         "reserved_cash": "0",
+         "reservations_complete": true
+        }
+       ]
+      }
+     ],
+     "holding_links": [],
+     "funding_accounts": [
+      "ibkr-synthetic"
+     ],
+     "fx_rates": [
+      {
+       "currency": "USD",
+       "rate_to_sar": "3.75",
+       "asof": "2026-10-24T14:39:20.117Z",
+       "source_ref": "policy://sama-usd-peg-3.75"
+      }
+     ]
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "ok"
+  },
+  "status error": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: error | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status error | ibkr evidence SENT (capture 17:39 age 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 9999.SR) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 82819.2,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    },
+    "reconciliation_evidence": {
+     "schema_version": 1,
+     "source_ref": "ibkr-capture:TFB_IBKR_Capture_20261024T143920Z.json",
+     "captured_at": "2026-10-24T14:39:20.117Z",
+     "accounts": [
+      {
+       "account_id": "ibkr-synthetic",
+       "positions_asof": "2026-10-24T14:39:20.117Z",
+       "positions_complete": true,
+       "positions": [],
+       "cash_asof": "2026-10-24T14:39:20.117Z",
+       "cash_complete": true,
+       "cash": [
+        {
+         "currency": "USD",
+         "settled_cash": "22085.12",
+         "reserved_cash": "0",
+         "reservations_complete": true
+        }
+       ]
+      }
+     ],
+     "holding_links": [],
+     "funding_accounts": [
+      "ibkr-synthetic"
+     ],
+     "fx_rates": [
+      {
+       "currency": "USD",
+       "rate_to_sar": "3.75",
+       "asof": "2026-10-24T14:39:20.117Z",
+       "source_ref": "policy://sama-usd-peg-3.75"
+      }
+     ]
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "error"
+  },
+  "empty but actions present": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence SENT (capture 17:39 age 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 9999.SR) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 82819.2,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    },
+    "reconciliation_evidence": {
+     "schema_version": 1,
+     "source_ref": "ibkr-capture:TFB_IBKR_Capture_20261024T143920Z.json",
+     "captured_at": "2026-10-24T14:39:20.117Z",
+     "accounts": [
+      {
+       "account_id": "ibkr-synthetic",
+       "positions_asof": "2026-10-24T14:39:20.117Z",
+       "positions_complete": true,
+       "positions": [],
+       "cash_asof": "2026-10-24T14:39:20.117Z",
+       "cash_complete": true,
+       "cash": [
+        {
+         "currency": "USD",
+         "settled_cash": "22085.12",
+         "reserved_cash": "0",
+         "reservations_complete": true
+        }
+       ]
+      }
+     ],
+     "holding_links": [],
+     "funding_accounts": [
+      "ibkr-synthetic"
+     ],
+     "fx_rates": [
+      {
+       "currency": "USD",
+       "rate_to_sar": "3.75",
+       "asof": "2026-10-24T14:39:20.117Z",
+       "source_ref": "policy://sama-usd-peg-3.75"
+      }
+     ]
+    }
+   },
+   "writes_sha256": "42f7a51c06209a5a32ce44fcbd5c1616737cb838008f08cb3cca740a012b847b",
+   "ret": "empty"
+  },
+  "ibkr observe": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | [ibkr-observe] would send (capture 17:39 age 4m; linked 0/0; cash 82819.20 SAR; would exclude 9999.SR; USD 3.75) | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [
+     {
+      "Symbol": "9999.SR",
+      "Name": "Synthetic Sukuk",
+      "Sector": "Fixed Income",
+      "Exchange": "SAU",
+      "Currency": "SAR",
+      "Quantity": 10,
+      "Buy Price": 1000,
+      "Avg Cost": 1000,
+      "Current Price": 998.5,
+      "Forecast Reliability Score": 60,
+      "Data Quality Score": 80,
+      "Risk Bucket": "Low",
+      "Volatility 30D": 2,
+      "Avg Volume 30D": 1000,
+      "Recommendation Detail": "HOLD",
+      "Investability Status": "INVESTABLE"
+     }
+    ],
+    "controls": {
+     "PF: Cash Available SAR": 500,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75547
+    }
+   },
+   "writes_sha256": "4db921e065b961c134b610bf32b6dffa97bcc0198d9da84d09b012b933a5c039",
+   "ret": "empty"
+  },
+  "ibkr off": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [
+     {
+      "Symbol": "9999.SR",
+      "Name": "Synthetic Sukuk",
+      "Sector": "Fixed Income",
+      "Exchange": "SAU",
+      "Currency": "SAR",
+      "Quantity": 10,
+      "Buy Price": 1000,
+      "Avg Cost": 1000,
+      "Current Price": 998.5,
+      "Forecast Reliability Score": 60,
+      "Data Quality Score": 80,
+      "Risk Bucket": "Low",
+      "Volatility 30D": 2,
+      "Avg Volume 30D": 1000,
+      "Recommendation Detail": "HOLD",
+      "Investability Status": "INVESTABLE"
+     }
+    ],
+    "controls": {
+     "PF: Cash Available SAR": 500,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75547
+    }
+   },
+   "writes_sha256": "4db921e065b961c134b610bf32b6dffa97bcc0198d9da84d09b012b933a5c039",
+   "ret": "empty"
+  },
+  "capture folder unset": {
+   "b2": "Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows from My_Portfolio (qty/cost from cost-basis: 0) | source readiness WITHHELD: decision status empty | ibkr evidence NOT SENT: capture folder not set (PD_IBKR_CAPTURE_FOLDER_ID); USD 3.75; excluded 9999.SR | route v4.18.2 | actions v1.16.0 | builder v1.26.1 | req req-synthetic | 0s | ActLog: off",
+   "post": {
+    "rows": [],
+    "controls": {
+     "PF: Cash Available SAR": 500,
+     "PF: Target Cash %": 10,
+     "PF: Max Position %": 15,
+     "PF: Max Sector %": 30,
+     "PF: Min Reliability to Add": 70,
+     "PF: Min DQ to Add": 80,
+     "PF: Rebalance Mode": "Advisory Only"
+    },
+    "fx_rates": {
+     "SAR": 1,
+     "USD": 3.75
+    }
+   },
+   "writes_sha256": "0a0e63f06b9c0f9272e8a788da9296e18df03ba4477562cb8ddfd24607b2c262",
+   "ret": "empty"
+  }
+ }
+}

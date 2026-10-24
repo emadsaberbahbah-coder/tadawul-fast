@@ -1,4 +1,4 @@
-/* 10_My_Portfolio v1.5.14 + 16_Decision_Top10 v1.13.10 correctness fixes.
+/* 10_My_Portfolio v1.5.15 (lockstep; v1.5.14 fixes) + 16_Decision_Top10 v1.13.10 correctness fixes.
  * Runs the REAL Apps Script sources in a vm with service stubs; all
  * holdings, lots and rates are synthetic.
  *   L*  _myPortfolioLedgerMap_ excludes Sold/Closed/Inactive lots exactly
@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.14');
+  assert.equal(ctx.PD_VERSION, '1.5.15');
   return copy(ctx._myPortfolioLedgerMap_());
 }
 

@@ -1,4 +1,4 @@
-"""10_My_Portfolio v1.5.14 + 16_Decision_Top10 v1.13.10: run the native harness
+"""10_My_Portfolio v1.5.15 (lockstep; v1.5.14 fixes) + 16_Decision_Top10 v1.13.10: run the native harness
 (the REAL Apps Script sources in a vm) and check its outputs against the real
 Python consumers, so the whole-suite CI job collects it:
 - the FAILED banner a throwing refresh leaves is parsed by the freshness audit
