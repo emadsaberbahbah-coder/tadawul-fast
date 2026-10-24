@@ -1,5 +1,6 @@
 /* Preserve the immutable v1.13.8 source without duplicating a 438 KB fixture.
- * Every v1.13.11 edit (bulk render formatting), then every v1.13.10 edit
+ * Every v1.14.0 edit (confirmation basis), then every v1.13.11 edit (bulk
+ * render formatting), then every v1.13.10 edit
  * (holding subunit FX, null value_sar for a missing rate, terminal FAILED
  * refresh state) and then every v1.13.9 edit is reversed exactly once and
  * the full historical digest
@@ -22,7 +23,37 @@ const WHY = [
   ' *',
   ''
 ].join('\n');
-/* v1.13.11 edits, reversed first (current -> v1.13.10 text). The result is
+/* v1.14.0 edits, reversed FIRST (current -> v1.13.11 text). The result is
+ * hash-pinned (V11311_SHA256 = the reviewed v1.13.11 file, origin/main
+ * ca2f87c7), so tests/test_dt10_confirm_basis.js can run the v1.13.11 clocks
+ * as its golden negative and kill-identity oracle without a fixture copy.
+ * Nine insertions (prior '') and two version-line rewrites. */
+const V11311_SHA256 = '268b85adafa64b9d8e026646f5227f266541a7fd6a178352fb3d62a3c290b979';
+const EDITS_V1140 = [
+  [" * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" * v1.14.0 (2026-10-24) [CONFIRM-BASIS] -- QUALIFIED DAYS COUNT TOWARD CONFIRMATION\n * WHY (owner, 24 Oct 2026): a stock that qualifies on day 1 and day 2 is\n * pushed out of the backend's raw top-10 on day 3 by a higher-ranked\n * newcomer. It is still INVEST on the audited grid, only ranked lower, yet\n * its confirmation count fell to 0 and it had to start over. Live trail:\n * the 22 Oct board seated XIOR.BR, GBCI.US and PINE.US at FAST-TRACK 1/3;\n * on the 24 Oct advance none of them was in the raw set and every count\n * read 0 again (those three had also left INVEST, so the rule below would\n * not have kept them; it keeps a name that stays INVEST inside the\n * buffer). Mechanism, pinned on v1.13.11: the dt10StabCore_ counter pass\n * advances ci only for a symbol present in rawSet (payload.selected, the\n * sized top-N); any other day-advance sets ci = 0, and for a member only\n * the exit clock honours the rank buffer (pause). Confirmation was keyed\n * to the sized list, not to qualification.\n * WHAT: Script Property TFB_T10_CONFIRM_BASIS, read ONCE in\n *   dt10ApplyStability_ (dt10StabConfirmBasis_, the dt10HardVerdictStrict_\n *   pattern: the service read stays outside the pure core) into\n *   knobs.confirm_basis. 'qualified' (DEFAULT, owner decision 2026-10-24)\n *   | 'raw' (legacy). Anything else, blank or a service fault reads as\n *   'qualified'. Under 'raw' every clock, label, note and state byte is\n *   v1.13.11.\n * (a) new PURE dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs,\n *   hardOut): the symbol has an audited row whose verdict is exactly\n *   INVEST (any case), no structural_block, not hardOut, and its\n *   opportunity-score rank across the deduped audited grid is <= 'T10:\n *   Stability Rank Buffer' (> 0) -- the SAME window the exit-clock pause\n *   has used since v1.3.0 (rank <= buffer, default 15), so the panel knob\n *   keeps one meaning.\n * (b) counter pass, day-advance, not outage-paused: when the symbol is NOT\n *   in rawSet and knobs.confirm_basis === 'qualified' and (a) holds, the\n *   day counts exactly like a raw sighting: ci + 1, co = 0, score point\n *   recorded. Otherwise the v1.13.11 branch runs unchanged (ci = 0; a\n *   member pauses inside the buffer or takes a miss). Members benefit the\n *   same way: a GRACE or FAST-TRACK seat still INVEST inside the buffer\n *   has co reset and ci advanced instead of a pause, so a fast-track seat\n *   can graduate on a qualified day (its label that day stays GRACE, ghost\n *   path, sizing suspended -- no raw ticket, no sizing).\n * (c) NOT changed: seating. Entry as 'NEW (confirmed n/n)' still requires\n *   presence in rawSyms (a sized ticket); fast-track fills only from\n *   rawSyms; displacement, capacity, hard/soft exit and every label are\n *   v1.13.11. The rule applies to symbols already tracked in the state\n *   blob (members and past raw sightings inside the 14-day prune window);\n *   a symbol never seen in raw is not tracked and accrues nothing.\n * (d) Read-back: under 'qualified' the stab note gains ', confirm=qualified'\n *   and, when a non-raw challenger inside the buffer has ci > 0, ', near\n *   <k> SYM(ci/confirm_days) ...' (up to 3, the 'pending' style). Under\n *   'raw' no token is added (byte-identical note).\n * (e) dt10SelfTest gains 'confirm basis (TFB_T10_CONFIRM_BASIS): ...' and\n *   the pure battery 'confirm basis core: ok' (raw replay identity; day-1/2\n *   raw, day-3 qualified at rank 12 -> ci 3, day-4 seated NEW 3/3 with the\n *   raw ticket's sizing; WATCH -> 0; rank buffer + 1 -> 0; buffer 0 ->\n *   legacy; GRACE member -> co 0, ci advanced).\n * Functions added (0 removed): dt10StabQualifiedWithin_,\n * dt10StabConfirmBasis_; var added: DT10_T10_CONFIRM_BASIS_PROP.\n * Harness: tests/test_dt10_confirm_basis.js (REAL file; golden negative on\n * the v1.13.11 base rebuilt by reversing these edits, SHA-256 pinned; kill\n * deep-equal; ES5/ASCII lint; inventory). Rollback: Script Property\n * TFB_T10_CONFIRM_BASIS = raw (no re-paste) or re-paste v1.13.11.\n * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped\n * in lockstep.\n *\n",
+    ""],
+  ["var DT10_VERSION = '1.14.0';\n",
+    "var DT10_VERSION = '1.13.11';\n"],
+  ["// v1.14.0 [CONFIRM-BASIS]: which days count toward entry confirmation --\n// see the v1.14.0 header block. 'qualified' (default) | 'raw' (v1.13.11).\nvar DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';\n",
+    ""],
+  ["/** v1.14.0 [CONFIRM-BASIS] PURE: is `sym` INVEST-qualified inside the rank\n * buffer on this run? True when the deduped audited grid (candBySym) has a\n * row for it whose verdict is exactly INVEST (any case), structural_block is\n * not true, hardOut(sym) is false, knobs.rank_buffer > 0 and its\n * opportunity-score rank (globalRank, 1 = best) is <= knobs.rank_buffer --\n * the same window the exit-clock pause has used since v1.3.0. Never throws;\n * a symbol absent from the grid is false (absence is jitter, not a\n * qualification). hardOut is the caller's closure over candBySym + knobs. */\nfunction dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut) {\n  var c = candBySym ? candBySym[sym] : null;\n  if (!c || typeof c !== 'object') return false;\n  if (String(c.verdict || '').toUpperCase() !== 'INVEST') return false;\n  if (c.structural_block === true) return false;\n  if (typeof hardOut === 'function' && hardOut(sym)) return false;\n  var buf = knobs ? Number(knobs.rank_buffer) : 0;\n  if (!(buf > 0)) return false;\n  var r = globalRank ? Number(globalRank[sym]) : 0;\n  return r > 0 && r <= buf;\n}\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: the basis rides as a plain knob (service read in\n  // dt10ApplyStability_). Only the exact string 'qualified' arms the\n  // qualified branch; an absent knob (older callers, the self-test replays)\n  // is the v1.13.11 raw basis.\n  var qualifiedBasis = knobs.confirm_basis === 'qualified';\n  function qualifiedWithin(sym) {\n    return dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut);\n  }\n",
+    ""],
+  ["        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n          // v1.14.0 [CONFIRM-BASIS]: absent from the sized top-N but INVEST\n          // on the audited grid inside the rank buffer -- the day counts\n          // exactly like a raw sighting (ci + 1, co = 0; the score point\n          // below is recorded as for raw). The 'raw' basis never gets here.\n          st.ci = (st.ci || 0) + 1;\n          st.co = 0;\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: read-back tokens under the qualified basis only\n  // ('raw' leaves the note byte-identical to v1.13.11): the armed basis and\n  // the non-raw challengers inside the buffer whose count is alive.\n  if (qualifiedBasis) {\n    var nearSyms = [];\n    for (var nqk in symbols) {\n      if (!symbols.hasOwnProperty(nqk) || symbols[nqk].member || rawSet[nqk]) continue;\n      if ((symbols[nqk].ci || 0) > 0 && qualifiedWithin(nqk)) nearSyms.push(nqk);\n    }\n    nearSyms.sort(function (a, b) {\n      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);\n      if (dci) return dci;\n      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);\n      if (drk) return drk;\n      return a < b ? -1 : (a > b ? 1 : 0);\n    });\n    note += ', confirm=qualified';\n    if (nearSyms.length) {\n      var nqParts = [];\n      for (var nqi = 0; nqi < nearSyms.length && nqParts.length < 3; nqi++) {\n        nqParts.push(nearSyms[nqi] + '(' + (symbols[nearSyms[nqi]].ci || 0) +\n                     '/' + knobs.confirm_days + ')');\n      }\n      note += ', near ' + nearSyms.length + ' ' + nqParts.join(' ');\n    }\n  }\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: same pattern -- one service read here, the\n  // core consumes the basis as a plain knob ('qualified' default | 'raw').\n  knobs.confirm_basis = dt10StabConfirmBasis_();\n",
+    ""],
+  ["\n/**\n * v1.14.0 [CONFIRM-BASIS]: confirmation basis -- Script Property\n * TFB_T10_CONFIRM_BASIS (DT10_T10_CONFIRM_BASIS_PROP). Exactly 'raw'\n * (trimmed, any case) selects the v1.13.11 clocks; anything else, a blank\n * or a PropertiesService fault reads as 'qualified' (the owner's default of\n * 2026-10-24). Mirrors dt10HardVerdictStrict_ (service read outside the\n * pure core); never throws.\n */\nfunction dt10StabConfirmBasis_() {\n  try {\n    var v = String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_T10_CONFIRM_BASIS_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase();\n    return v === 'raw' ? 'raw' : 'qualified';\n  } catch (eCb) {}\n  return 'qualified';\n}\n",
+    ""],
+  ["  /* v1.14.0 [CONFIRM-BASIS]: basis line (one property read) + pure battery\n     (no services). Board of 2 seats: A (ACTIVE) and B (GRACE 1/3, INVEST at\n     rank 15 = the buffer boundary); challenger CHAL in raw on days 1-2,\n     displaced from raw by NEWC on day 3 while INVEST at rank 12, back on\n     day 4. Grid ranks: NEWC 97 (1), A 95 (2), F1..F12 94.5..83.5, CHAL 86\n     (12), B 84 (15). */\n  report.push('confirm basis (TFB_T10_CONFIRM_BASIS): ' + dt10StabConfirmBasis_() +\n              ' (default qualified; raw = v1.13.11 clocks)');\n  function cbKnobs(basis, buf) {\n    return { enabled: true, confirm_days: 3, exit_days: 3,\n             rank_buffer: (buf === undefined ? 15 : buf), smooth_days: 5,\n             hard_strict: true, confirm_basis: basis };\n  }\n  function cbCand(sym, sc, verdict) {\n    return { symbol: sym, name: sym, opportunity_score: sc,\n             verdict: (verdict === undefined ? 'INVEST' : verdict), price: 10 };\n  }\n  function cbTk(sym, sc) {\n    return { symbol: sym, name: sym, opportunity_score: sc, suggested_sar: 5000,\n             suggested_shares: 50, entry_zone: '9-11', stop_sar: 8, tp1_sar: 12,\n             tp2_sar: 14, exp_gain_12m_sar: 900, advisor_note: 'INVEST',\n             detail: { funds_from: 'Cash 5,000 SAR' } };\n  }\n  function cbGrid(chalScore, chalVerdict) {\n    var g = [cbCand('NEWC.US', 97), cbCand('A.US', 95)];\n    for (var cf = 1; cf <= 12; cf++) g.push(cbCand('F' + cf + '.US', 95.5 - cf));\n    g.push(cbCand('B.US', 84));\n    g.push(cbCand('CHAL.US', chalScore, chalVerdict));\n    return g;\n  }\n  var cbSeed = { v: 1, date: '2026-10-20', symbols: {\n      'A.US': { ci: 3, co: 0, member: true, since: '2026-10-15',\n                ls: '2026-10-20', hist: [95], ft: false },\n      'B.US': { ci: 3, co: 1, member: true, since: '2026-10-15',\n                ls: '2026-10-20', hist: [84], ft: false } } };\n  var cbRaw = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n               [cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n               [cbTk('A.US', 95), cbTk('NEWC.US', 97)],\n               [cbTk('A.US', 95), cbTk('CHAL.US', 86)]];\n  var cbDays = ['2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'];\n  function cbRun(knobs, day3Score, day3Verdict) {\n    var st = dt10StabParseState_(cbSeed);\n    var outs = [];\n    for (var cd = 0; cd < 4; cd++) {\n      var grid = (cd === 2) ? cbGrid(day3Score, day3Verdict) : cbGrid(86);\n      var o = dt10StabCore_(cbRaw[cd], grid, st, knobs, 2, cbDays[cd]);\n      st = dt10StabParseState_(o.state);\n      outs.push(o);\n    }\n    return outs;\n  }\n  function cbTk4(outs, sym) {\n    for (var ct = 0; ct < outs[3].tickets.length; ct++) {\n      if (outs[3].tickets[ct].symbol === sym) return outs[3].tickets[ct];\n    }\n    return null;\n  }\n  function cbClocks(outs) {   // everything but the armed-basis token\n    var cc = [];\n    for (var ck = 0; ck < outs.length; ck++) {\n      cc.push({ t: outs[ck].tickets, s: outs[ck].state, a: outs[ck].audit,\n                n: outs[ck].note.replace(', confirm=qualified', '') });\n    }\n    return JSON.stringify(cc);\n  }\n  var cbQ = cbRun(cbKnobs('qualified'), 86);\n  var cbR = cbRun(cbKnobs('raw'), 86);\n  var cbN = cbRun(cbKnobs(undefined), 86);               // knob absent\n  var cbW = cbRun(cbKnobs('qualified'), 86, 'WATCH');   // (c)\n  var cbO = cbRun(cbKnobs('qualified'), 83);            // (d) rank 16\n  var cbE = cbRun(cbKnobs('qualified'), 84.2);          // rank 15 boundary\n  var cbZ = cbRun(cbKnobs('qualified', 0), 86);         // (e)\n  var cbZr = cbRun(cbKnobs('raw', 0), 86);\n  var opKraw = { enabled: true, confirm_days: 3, exit_days: 3, rank_buffer: 15,\n                 smooth_days: 5, hard_strict: true, confirm_basis: 'raw' };\n  var opRraw = dt10StabCore_([], [], dt10StabParseState_(opSeed), opKraw, 10,\n                             '2026-09-26', opMap);       // (a) P-168 replay\n  var cbChal4 = cbTk4(cbQ, 'CHAL.US');\n  report.push('confirm basis core: ' +\n      ((JSON.stringify(opRraw) === JSON.stringify(opR) &&\n        JSON.stringify(cbR) === JSON.stringify(cbN) &&\n        cbR[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbR[3].state.symbols['CHAL.US'].ci === 1 &&\n        cbR[3].tickets.length === 2 && cbTk4(cbR, 'CHAL.US') === null &&\n        cbR[2].note.indexOf('confirm=') < 0 && cbR[2].note.indexOf('near') < 0 &&\n        cbR[0].state.symbols['B.US'].co === 1 && cbR[0].state.symbols['B.US'].ci === 0 &&\n        cbQ[1].state.symbols['CHAL.US'].ci === 2 &&\n        cbQ[2].state.symbols['CHAL.US'].ci === 3 &&\n        cbQ[2].state.symbols['CHAL.US'].member === false &&\n        cbQ[2].tickets.length === 2 &&\n        cbQ[2].note.indexOf('pending NEWC.US(1/3)') > 0 &&\n        cbQ[2].note.indexOf('confirm=qualified') > 0 &&\n        cbQ[2].note.indexOf('near 1 CHAL.US(3/3)') > 0 &&\n        cbChal4 !== null && cbChal4._stab_status === 'NEW (confirmed 3/3)' &&\n        cbChal4.suggested_sar === 5000 && cbChal4.suggested_shares === 50 &&\n        cbChal4._grace_hold !== true && cbChal4._ft_suspended !== true &&\n        cbQ[3].audit.entered.length === 1 &&\n        cbQ[3].audit.exited_displaced.length === 1 &&\n        cbQ[3].audit.exited_displaced[0] === 'B.US' &&\n        cbQ[3].note.indexOf('near 1 NEWC.US(2/3)') > 0 &&\n        cbQ[0].state.symbols['B.US'].co === 0 && cbQ[0].state.symbols['B.US'].ci === 4 &&\n        cbQ[0].state.symbols['A.US'].ci === 4 && cbR[0].state.symbols['A.US'].ci === 4 &&\n        cbW[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbO[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbE[2].state.symbols['CHAL.US'].ci === 3 &&\n        cbClocks(cbZ) === cbClocks(cbZr))\n       ? 'ok (raw = v1.13.11 clocks; qualified: day-3 rank 12 -> 3/3, day-4 NEW 3/3 sized, ' +\n         'WATCH -> 0, rank 16 -> 0, rank 15 -> 3, buffer 0 = legacy, GRACE member co 0)'\n       : 'FAIL [' + cbQ[2].note + ' | ' + cbQ[3].note + ' | ' + cbR[3].note + ']'));\n",
+    ""]
+];
+/* v1.13.11 edits, reversed next (current -> v1.13.10 text). The result is
  * hash-pinned (V11310_SHA256 = the reviewed v1.13.10 file), so the bulk
  * formatting harness can run the previous per-cell code as its oracle. */
 const V11310_SHA256 = '914592a3a103815e9d26ecc6b485233623c21cec5382aea68ef5c2b5b1cb32d8';
@@ -71,7 +102,7 @@ const EDITS_V11310 = [
   ["        hxC.value_sar === null && hxD.value_sar === 445.08 &&\n        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +\n       hxD.value_sar + '/' + hxE.value_sar + ']'));\n",
     "        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));\n"]
 ];
-const EDITS = EDITS_V11311.concat(EDITS_V11310, [
+const EDITS = EDITS_V1140.concat(EDITS_V11311, EDITS_V11310, [
   [' * Version: 1.13.9 ', ' * Version: 1.13.8 '],
   [WHY, ''],
   ["var DT10_VERSION = '1.13.9';", "var DT10_VERSION = '1.13.8';"],
@@ -97,17 +128,31 @@ function feedHistorySource(source) {
   let historical = source;
   for (const [current, prior] of EDITS) {
     assert.equal(historical.split(current).length - 1, 1,
-      'exactly one approved v1.13.9/v1.13.10/v1.13.11 edit: ' + current.split('\n')[0]);
+      'exactly one approved v1.13.9/v1.13.10/v1.13.11/v1.14.0 edit: ' + current.split('\n')[0]);
     historical = historical.replace(current, prior);
   }
   assert.equal(crypto.createHash('sha256').update(historical).digest('hex'), HISTORY_SHA256,
-    'v1.13.9/v1.13.10/v1.13.11 may change only their enumerated edits');
+    'v1.13.9/v1.13.10/v1.13.11/v1.14.0 may change only their enumerated edits');
   return historical;
 }
-/* v1.13.10 source (the bulk-format oracle): only the v1.13.11 edits are
+/* v1.13.11 source (the confirm-basis oracle): only the v1.14.0 edits are
  * reversed, each exactly once, and the result must be the reviewed file. */
-function v11310Source(source) {
+function v11311Source(source) {
   let prior = source;
+  for (const [current, previous] of EDITS_V1140) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.14.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V11311_SHA256,
+    'v1.14.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.13.10 source (the bulk-format oracle): the v1.14.0 and then the v1.13.11
+ * edits are reversed, each exactly once, and the result must be the reviewed
+ * file. */
+function v11310Source(source) {
+  let prior = v11311Source(source);
   for (const [current, previous] of EDITS_V11311) {
     assert.equal(prior.split(current).length - 1, 1,
       'exactly one approved v1.13.11 edit: ' + current.split('\n')[0]);
@@ -117,4 +162,4 @@ function v11310Source(source) {
     'v1.13.11 may change only its enumerated edits');
   return prior;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256};
+module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256};
