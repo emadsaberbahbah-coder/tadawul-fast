@@ -167,7 +167,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
-    ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
+    ('core.symbols.normalize', '__version__', '5.6.1', 'symbol normalization'),
     ('core.analysis.identity_guard', 'IDENTITY_GUARD_VERSION', '1.3.1', 'surface identity guard'),
     ('core.surface_action_invariants', '__version__', '1.4.2', 'surface unit/action invariants'),
     ('scripts.performance_math', '__version__', '1.0.0', 'pure performance statistics'),
@@ -213,7 +213,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.158.0", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.159.0", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import

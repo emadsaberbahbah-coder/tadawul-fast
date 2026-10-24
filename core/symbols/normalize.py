@@ -2,10 +2,19 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.6.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.6.1 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.6.1 WHY (2026-10-25 one-time audit): to_yahoo_symbol stripped ".US"
+and returned BEFORE the v5.3.2 share-class dash step, so with
+TFB_YAHOO_SHARE_CLASS_DASH=1 "BRK.B" became "BRK-B" but "BRK.B.US" still
+became "BRK.B". Live check 2026-10-24: Yahoo chart BRK-B 200, BRK.B 404
+("No data found, symbol may be delisted"); the same 404 appears in Render
+logs for $BRK.B. The ".US" branch now applies the same dash rule under the
+same flag. Flag unset: byte-identical to v5.6.0.
+Tests: tests/test_yahoo_share_class_dash.py.
 
 v5.6.0 WHY (2026-10-10 work brief WP-05): seven wrong-identity crypto
 rows were preserved after Yahoo short-ticker collisions. Add a provider
@@ -118,7 +127,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.6.0"
+__version__ = "5.6.1"
 
 __all__ = [
     "MarketType",
@@ -1288,6 +1297,11 @@ def to_yahoo_symbol(symbol: str) -> str:
 
     base, ex = split_symbol_exchange(s)
     if ex == "US":
+        # v5.6.1: BRK.B.US strips to BRK.B, which Yahoo answers 404; the
+        # v5.3.2 dash form applies here too, under the same flag.
+        if _env_bool("TFB_YAHOO_SHARE_CLASS_DASH", False) \
+                and US_SHARE_CLASS_DOT_RE.match(base):
+            return base.replace(".", "-")
         return base
     if ex:
         # v5.3.1: hand Yahoo the suffix IT expects (e.g. RELIANCE.NSE -> RELIANCE.NS).
