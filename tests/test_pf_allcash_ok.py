@@ -210,6 +210,16 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     assert len(text.split("\n")) - golden["source_lines"] == 92 + 141   # + #780
 
 
+# merge note 2026-10-25 (#780): the three seed lines buildPortfolioDecisionLayout
+# replaced with pdPanelSeedValue_, matched as whole lines so the pdReadPanel_
+# fallback (which shares their substrings) stays guarded.
+PD780_SEED_REMOVED = (
+    "    var seed = defaults.hasOwnProperty(item.label) &&",
+    "               pdHasValue_(defaults[item.label]) ? defaults[item.label]",
+    "                                                 : item.def;",
+)
+
+
 def test_added_lines_are_es5_and_ascii(base_source):
     import difflib
     base = base_source.read_text(encoding="utf-8").split("\n")
@@ -218,9 +228,11 @@ def test_added_lines_are_es5_and_ascii(base_source):
              if line.startswith("+") and not line.startswith("+++")]
     removed = [line[1:] for line in difflib.unified_diff(base, now, n=0, lineterm="")
                if line.startswith("-") and not line.startswith("---")]
-    # merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15: the delivered file also carries #780's
-    # 146 added / 5 removed panel-preserve lines (the removed ones are listed below).
-    assert 95 + 146 <= len(added) <= 110 + 146 and len(removed) <= 10 + 5, (len(added), len(removed))
+    # merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15. Against
+    # this v1.5.14 base the delivered file also carries #780's 144 added / 3 removed
+    # panel-preserve lines (the version swaps are already in main's counts); the three
+    # removed seed lines are matched exactly below.
+    assert 95 + 144 <= len(added) <= 110 + 144 and len(removed) <= 10 + 3, (len(added), len(removed))
     code = [line for line in added if not re.match(r"\s*(\*|/\*|//)", line)]
     assert len(code) >= 40, len(code)
     for line in added:
@@ -238,7 +250,4 @@ def test_added_lines_are_es5_and_ascii(base_source):
             "var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,",
             "pool.rows.length, payload, binding);",
             "var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +",
-            "statusCell.setValue(pdStatusLine_(String(payload.status || '?'),",
-            'var seed = defaults.hasOwnProperty(item.label) &&',
-            'pdHasValue_(defaults[item.label]) ? defaults[item.label]',
-            ': item.def;')), repr(line)   # + #780
+            "statusCell.setValue(pdStatusLine_(String(payload.status || '?'),")) or line in PD780_SEED_REMOVED, repr(line)

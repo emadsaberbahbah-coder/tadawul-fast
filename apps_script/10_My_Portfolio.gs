@@ -4162,7 +4162,7 @@ function buildPortfolioDecisionLayout() {
     sheet.getRange(pos.row, pos.labelCol).setValue(item.label)
         .setFontWeight('bold').setFontSize(9).setWrap(true)
         .setBackground(PD_TINT).setFontColor(PD_NAVY);
-    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.14
+    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.16
         preserveMode === 'enforce' ? preserved : null);
     var cell = sheet.getRange(pos.row, pos.valueCol);
     cell.setValue(seed).setBackground(op.bg).setFontColor(op.fg)
@@ -4170,7 +4170,7 @@ function buildPortfolioDecisionLayout() {
     if (item.kind === 'sar') cell.setNumberFormat(PD_FMT_SAR);
     else if (item.kind === 'num') cell.setNumberFormat('0.0#');
   }
-  if (preserveMode !== 'off') {                                  // v1.5.14
+  if (preserveMode !== 'off') {                                  // v1.5.16
     var kept = [], differ = [];
     for (var pi = 0; pi < PD_PANEL.length; pi++) {
       var pItem = PD_PANEL[pi];
