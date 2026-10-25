@@ -1,4 +1,4 @@
-/* 10_My_Portfolio v1.5.14 + 16_Decision_Top10 v1.13.10 correctness fixes.
+/* 10_My_Portfolio v1.5.15 (lockstep; v1.5.14 fixes) + 16_Decision_Top10 v1.13.10 correctness fixes.
  * Runs the REAL Apps Script sources in a vm with service stubs; all
  * holdings, lots and rates are synthetic.
  *   L*  _myPortfolioLedgerMap_ excludes Sold/Closed/Inactive lots exactly
@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.ok(String(ctx.PD_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 5, 14][k] ? 1 : x < [1, 5, 14][k] ? -1 : 0), 0) >= 0, 'PD_VERSION floor 1.5.14 (merge note 2026-10-21, #780: panel preserve is v1.5.15 over the #810 v1.5.14): ' + ctx.PD_VERSION);
+  assert.ok(String(ctx.PD_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 5, 15][k] ? 1 : x < [1, 5, 15][k] ? -1 : 0), 0) >= 0, 'PD_VERSION floor 1.5.15 (merge note 2026-10-25, #780: panel preserve is v1.5.16 over #834\'s v1.5.15): ' + ctx.PD_VERSION);
   return copy(ctx._myPortfolioLedgerMap_());
 }
 
@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.equal(ctx.DT10_VERSION, '1.13.10');
+  assert.equal(ctx.DT10_VERSION, '1.15.0');   // 2026-10-25: v1.15.0 pending grace, pin moved
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];

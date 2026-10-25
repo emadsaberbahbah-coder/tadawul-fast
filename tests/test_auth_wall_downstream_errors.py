@@ -216,7 +216,7 @@ def test_d7_leaked_cancellation_is_500_not_401(res):
 
 
 def test_d5b_version(res):
-    assert res["version"] == "8.14.6"
+    assert res["version"] == "8.14.7"
 
 
 def test_d6_golden_negative_on_base():

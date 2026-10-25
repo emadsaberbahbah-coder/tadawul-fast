@@ -1,4 +1,5 @@
-/* 10_My_Portfolio v1.5.15 (authored as v1.5.14; merge note 2026-10-21 (#780): renumbered v1.5.15 over #810's v1.5.14):
+/* 10_My_Portfolio v1.5.16 (authored as v1.5.14; merge notes (#780): 2026-10-21 renumbered v1.5.15 over #810's v1.5.14,
+ * 2026-10-25 renumbered v1.5.16 over #834's v1.5.15):
  * the Portfolio_Decision layout builder keeps the
  * operator's panel inputs (P-76 port from 16_Decision_Top10 v1.11.3), gated
  * by Script Property PD_PANEL_PRESERVE = off (default) | observe | enforce.
@@ -345,8 +346,8 @@ check('W6 the mode tolerates case and surrounding blanks like the other PD prope
   for (const raw of ['ENFORCE', ' enforce ', 'Enforce\t']) {
     assert.deepEqual(build({props: {PD_PANEL_PRESERVE: raw}}).panel, OPERATOR, JSON.stringify(raw));
   }
-  assert.equal(ctx0.PD_VERSION, '1.5.15');   // merge note 2026-10-21 (#780): renumbered v1.5.15 over #810's v1.5.14
-  assert.ok(/\n \* Version: 1\.5\.15\n/.test(SOURCE));
+  assert.equal(ctx0.PD_VERSION, '1.5.16');   // merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15
+  assert.ok(/\n \* Version: 1\.5\.16\n/.test(SOURCE));
 });
 
 check('W7 observe: a snapshot read fault is logged and the build carries on as v1.5.13', () => {
@@ -436,16 +437,16 @@ check('N4 the snapshot never throws: no sheet, an empty sheet, a faulting sheet 
   assert.deepEqual(JSON.parse(JSON.stringify(ok)), OPERATOR);
 });
 
-check('N5 the v1.5.15 header block and the added functions are ASCII', () => {
-  const a = SOURCE.indexOf(' * v1.5.15 MAIN CHANGES');
-  const b = SOURCE.indexOf(' * v1.5.14 (2026-10-20)  (LEDGER READER');   // merge note 2026-10-21 (#780): renumbered v1.5.15 over #810's v1.5.14
-  const c = SOURCE.indexOf('/* ----- v1.5.15 operator inputs survive');
+check('N5 the v1.5.16 header block and the added functions are ASCII', () => {
+  const a = SOURCE.indexOf(' * v1.5.16 MAIN CHANGES');
+  const b = SOURCE.indexOf(' * v1.5.15 (2026-10-24)  (PD-ALLCASH');   // merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15
+  const c = SOURCE.indexOf('/* ----- v1.5.16 operator inputs survive');
   const d = SOURCE.indexOf('/* ----- holdings pool (reads the 122-col');
   assert.ok(a > 0 && b > a && c > 0 && d > c);
   for (const block of [SOURCE.slice(a, b), SOURCE.slice(c, d)]) {
     assert.ok(/^[\x00-\x7f]*$/.test(block));
   }
-  const e = SOURCE.indexOf('/* v1.5.15: snapshot operator inputs BEFORE the clear');
+  const e = SOURCE.indexOf('/* v1.5.16: snapshot operator inputs BEFORE the clear');
   const f = SOURCE.indexOf("Logger.log('[MP-DEC v' + PD_VERSION + '] layout built');");
   assert.ok(e > 0 && f > e && /^[\x00-\x7f]*$/.test(SOURCE.slice(e, f).replace(/\\u2014/g, '')));
 });
@@ -496,8 +497,10 @@ check('G2 live base (PF_BASE_GAS): off == base byte for byte; enforce on base st
   const base = fs.readFileSync(process.env.PF_BASE_GAS, 'utf8');
   // merge note 2026-10-21 (#780): the base is the v1.5.13 golden source or main's v1.5.14
   // (#810 changed only _myPortfolioLedgerMap_, outside the panel path).
+  // merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15; main's v1.5.15 is also a
+  // valid base (#834 changed the receipt / all-cash status path, not the panel).
   const base13 = /var PD_VERSION = '1\.5\.13';/.test(base);
-  assert.ok(base13 || /var PD_VERSION = '1\.5\.14';/.test(base));
+  assert.ok(base13 || /var PD_VERSION = '1\.5\.1[45]';/.test(base));
   if (base13) assert.equal(crypto.createHash('sha256').update(base).digest('hex'), golden.source_sha256);
   const b = build({source: base});
   assert.deepEqual(offOp.trace, b.trace);

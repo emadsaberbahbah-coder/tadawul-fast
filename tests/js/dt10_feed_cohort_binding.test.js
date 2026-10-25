@@ -535,8 +535,8 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.13.10');
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.13\.10 /);
+  assert.equal(ctx.DT10_VERSION, '1.15.0');   // 2026-10-25: v1.15.0 pending grace, pin moved
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.15\.0 /);
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {

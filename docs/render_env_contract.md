@@ -111,6 +111,7 @@ ENV names are derived statically from each entry's expression and the functions 
 | `rel_path_tag` | `TFB_REL_PATH_TAG` | '' | 'off' | not recorded |
 | `crypto_pair_class` | `TFB_SYM_CRYPTO_PAIR_CLASS` | '' | 'off' | not recorded |
 | `scoring_settle` | `TFB_SCORING_SETTLE` | '' | 'off' | not recorded |
+| `scoring_settle_pages` | `TFB_SCORING_SETTLE_PAGES` | '' | 'all' | not recorded |
 | `fc_tuple_coherent` | `TFB_FC_TUPLE_COHERENT` | '' | 'off' | not recorded |
 | `w52_ceiling_scrub` | `TFB_ENGINE_52W_CEILING_SCRUB` | '1' | 'on' | not recorded |
 | `eodhd_fund_cache` | `TFB_EODHD_FUND_CACHE` | '' | 'off' | not recorded |
@@ -165,6 +166,7 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_TUPLE_NOISE_RELEASE` | `off` | precision-evidenced tuple release (off&#124;observe&#124;enforce) | no | value | yes | not recorded |
 | `TFB_EQ_ROI_UNIT_SENTRY` | `off` | enriched-quote fraction-unit sentry (off&#124;observe&#124;enforce) | no | value | no | not recorded |
 | `TFB_SCORING_SETTLE` | `off` | F-7 settle loop runs; observe AND enforce withhold non-converged/error rows (enforce also publishes the settled row) (off&#124;observe&#124;enforce) | no | value | yes | not recorded |
+| `TFB_SCORING_SETTLE_PAGES` | `''` | F-7 enforce scope: market pages (Global_Markets,Market_Leaders,Commodities_FX,Mutual_Funds) whose symbols TFB_SCORING_SETTLE=enforce may settle, by each symbol's inferred market; unset/all = every market, other names ignored (engine 5.157.0+) | no | value | yes | not recorded |
 | `TFB_SETTLE_UNRESOLVED` | `off` | non-converged rows publish pass-1 scores as WATCHLIST, WP-2b; inert while TFB_SCORING_SETTLE is off (off&#124;observe&#124;enforce) | no | value | yes | not recorded |
 | `TFB_TICKET_FRESHNESS_GATE` | `1` | stale-priced candidates defer (W-2) | yes; armed when unset | toggle | no | not recorded |
 | `TFB_TICKET_MAX_QUOTE_AGE_MIN` | `15` | in-session live-quote max age (W-2) | no | value | no | not recorded |

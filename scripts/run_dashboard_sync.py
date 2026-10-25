@@ -4210,6 +4210,11 @@ class SheetsWriter:
         # workbook Name is used, and every non-Name cell remains unchanged.
         from core.verified_name_labels import apply_verified_name_labels
         matrix, _nl_stats = apply_verified_name_labels(sheet_name, hdr, matrix)
+        # Current authority may identify a security while its provider mapping
+        # and instrument-specific valuation remain unverified. Never publish an
+        # equity forecast/score for the exact reviewed debt identifier.
+        from core.reviewed_instrument_classes import apply_reviewed_instrument_matrix
+        matrix, _ic_stats = apply_reviewed_instrument_matrix(sheet_name, hdr, matrix)
         matrix, _rp_stats = _rank_overall_page_apply(sheet_name, hdr, matrix)  # v6.66.0 [RANK-PAGE]: whole page, after restoration, before copy-only presentation
         matrix = _present_market_sheet_rows(sheet_name, hdr, matrix)
         # Every removal, including a direct write or newly re-emitted token,
@@ -4260,7 +4265,7 @@ class SheetsWriter:
         # Separate the historical input digest from the actual submitted RAW
         # values after final fill guard, ranking and warning publication. This
         # attests a successful update request, not an independent live readback.
-        if _rp_stats or _wc_final or _nl_stats or _payload_evidence:
+        if _rp_stats or _wc_final or _nl_stats or _ic_stats or _payload_evidence:
             receipt = {"written_payload_sha8": _payload_sha8(hdr, matrix),
                        "evidence": "successful_RAW_update", "live_readback": False,
                        "rows": len(matrix), "written_range": rng,
@@ -4278,6 +4283,8 @@ class SheetsWriter:
                         "written_payload_sha8": receipt["written_payload_sha8"]})
             if _nl_stats:
                 receipt["name_labels"] = dict(_nl_stats)
+            if _ic_stats:
+                receipt["instrument_classes"] = dict(_ic_stats)
             self._write_receipts[(spreadsheet_id, sheet_name)] = receipt
 
         if _nl_stats:
@@ -13023,6 +13030,21 @@ def _record_acquisition_census(res: Any, headers: Any, rows: Any,
     origins once, even when the replacement has a recent valid-looking stamp.
     """
     now = now or _utc_now()
+    # Re-evaluate the exact same final publication quarantine before the final
+    # census: write_table uses a defensive copy, so the caller's raw matrix may
+    # still carry the supplier price that was intentionally withheld on write.
+    if origins is not None:
+        from core.reviewed_instrument_classes import (
+            PROTECTED_SYMBOLS, apply_reviewed_instrument_matrix,
+        )
+        _ic_sym_i = _guard_find_col(list(headers or []), _GUARD_SYMBOL_ALIASES)
+        if _ic_sym_i >= 0 and any(
+                isinstance(row, (list, tuple)) and _ic_sym_i < len(row)
+                and isinstance(row[_ic_sym_i], str) and row[_ic_sym_i] in PROTECTED_SYMBOLS
+                for row in rows or ()):
+            rows, _ic_census = apply_reviewed_instrument_matrix(res.sheet_name, headers, rows, now=now)
+            if _ic_census:
+                res._stamp_meta["instrument_class_quarantined"] = _ic_census["quarantined"]
     census = acquisition_census(headers or [], rows or [], now=now,
         max_age_seconds=_acquisition_max_age_seconds(res.sheet_name),
         requested=requested_symbols, symbol_key=canonicalize_symbol)

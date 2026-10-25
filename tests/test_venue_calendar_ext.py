@@ -22,6 +22,12 @@ Properties pinned here:
       stale), exercised through the real _quote_freshness_assessment
   T6  no extension key shadows a base key (the base map always wins)
   T7  version and manifest pin
+  T8  v1.27.2: Athens ('.AT' -> ASEX, present in 4.13.2) resolves, skips its
+      own holiday (28 Oct, Ochi Day), follows the same three freshness
+      verdicts and drops out under the kill switch. NSE India ('.NS') stays
+      uncertified (T4b): XBOM does not model NSE's special sessions (no Diwali
+      Muhurat session), so an alias would certify a stale close while the
+      market trades (review on PR #813). '.VN' '.AE' '.QA' '.BH' likewise.
 
 Run: pytest -q tests/test_venue_calendar_ext.py
 """
@@ -45,8 +51,10 @@ xc = pytest.importorskip("exchange_calendars")
 
 # Suffixes the Render log named on 2026-10-18/19 that have NO calendar in
 # exchange_calendars 4.13.2: they must stay uncertified (None), not be
-# guessed onto a neighbouring venue.
-KNOWN_ABSENT = ("AT", "NS", "VN", "AE", "QA", "BH")
+# guessed onto a neighbouring venue. v1.27.2: '.AT' left this list (ASEX
+# exists in 4.13.2). '.NS' stays: XBOM shares NSE's regular session but not
+# its special sessions (Diwali Muhurat), so an XBOM alias would mis-certify.
+KNOWN_ABSENT = ("NS", "VN", "AE", "QA", "BH")
 
 
 @pytest.fixture(autouse=True)
@@ -163,13 +171,66 @@ def test_t5b_kill_switch_restores_calendar_unavailable_verdict(monkeypatch):
 
 def test_t6_extension_never_shadows_base():
     assert not (set(ob._VENUE_CAL_EXT_MAP) & set(ob._VENUE_CAL_MAP))
-    assert len(ob._VENUE_CAL_EXT_MAP) == 39
+    assert len(ob._VENUE_CAL_EXT_MAP) == 40          # v1.27.2: 39 + AT
 
 
 def test_t7_version_and_manifest_pin():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.0"
+    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.27.2"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.27.0", "opportunity builder"' in src
+    assert '"1.27.2", "opportunity builder"' in src
+
+
+def test_t8_athens_resolves_and_obeys_the_kill_switch(monkeypatch):
+    assert "AT" not in ob._VENUE_CAL_MAP
+    assert ob._venue_cal_code("AT") == "ASEX"
+    assert ob._venue_cal_code("NS") is None          # deliberately fail-closed
+    monkeypatch.setenv("TFB_TICKET_VENUE_CAL_EXT", "0")
+    assert ob._venue_cal_code("AT") is None
+    assert ob._venue_state("OTE.AT", datetime.now(timezone.utc)) is None
+
+
+def test_t8a_nse_old_quote_stays_calendar_unavailable():
+    old = datetime.now(timezone.utc) - timedelta(hours=20)
+    passed, why, detail = _assess("RELIANCE.NS", old)
+    assert not passed and detail["mode"] == "calendar_unavailable"
+    assert "venue calendar unavailable" in why
+
+
+@pytest.mark.parametrize("symbol,now,closed_day,prev_day", [
+    # Athens is shut on 28 Oct (Ochi Day): before the 29 Oct open the previous
+    # close is 27 Oct, not 28 Oct.
+    ("OTE.AT", datetime(2026, 10, 29, 6, 0, tzinfo=timezone.utc), "2026-10-28", "2026-10-27"),
+])
+def test_t8b_new_venue_skips_its_own_holiday(symbol, now, closed_day, prev_day):
+    vs = ob._venue_state(symbol, now)
+    assert vs is not None, symbol
+    is_open, prev_close = vs
+    assert is_open is False
+    assert prev_close.strftime("%Y-%m-%d") == prev_day, (symbol, prev_close)
+    assert prev_close.strftime("%Y-%m-%d") != closed_day
+
+
+@pytest.mark.parametrize("symbol", ["OTE.AT"])
+def test_t8c_new_venue_follows_the_same_three_verdicts(symbol, monkeypatch):
+    """Same contract as T5, through the real assessment and the real ASEX
+    calendar. The live window is narrowed to 0.6 s so the calendar branch is
+    exercised whatever the wall clock: CI run 39615679706 ran 6 min after the
+    Athens close, the close-minus-30s quote was inside the default 15-min live
+    window, and the builder (correctly) answered 'live' instead."""
+    monkeypatch.setenv("TFB_TICKET_MAX_QUOTE_AGE_MIN", "0.01")
+    now = datetime.now(timezone.utc)
+    is_open, prev_close = ob._venue_state(symbol, now)
+    if is_open:
+        passed, why, detail = _assess(symbol, now - timedelta(hours=2))
+        assert not passed and detail["mode"] == "session_open"
+        assert why.startswith("STALE_PRICE intraday")
+        return
+    passed, why, detail = _assess(symbol, prev_close - timedelta(seconds=30))
+    assert passed and detail["mode"] == "session_closed", (why, detail)
+    assert why.startswith("last close")
+    passed, why, detail = _assess(symbol, prev_close - timedelta(hours=3))
+    assert not passed and detail["mode"] == "session_closed"
+    assert why.startswith("STALE_PRICE pre-close")
 
 
 if __name__ == "__main__":   # pragma: no cover
