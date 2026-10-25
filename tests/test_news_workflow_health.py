@@ -205,7 +205,8 @@ def test_identity_gap_policy_defaults_to_fail_for_every_other_value(monkeypatch,
     assert archive._identity_gap_policy() == "fail"
     assert archive._identity_gap_tolerated({"failure_codes": ["identity_coverage_incomplete"],
                                             "selected_acquisition_complete": True,
-                                            "archive_write": {"status": "APPEND_ACCEPTED"}}) is False
+                                            "archive_write": {"status": "APPEND_ACCEPTED"},
+                                            "selection": _ok_selection()}) is False
 
 
 def test_identity_gap_policy_warn_turns_only_the_pure_gap_into_exit_zero(monkeypatch, tmp_path, capsys):
@@ -231,9 +232,17 @@ def test_identity_gap_policy_warn_turns_only_the_pure_gap_into_exit_zero(monkeyp
     assert json.loads(path.read_text())["archive_write"]["status"] == "SKIPPED_EXISTING"
 
 
+def _ok_selection(**over):
+    selection = {"selected_count": 1, "missing_identity_symbols": [], "omitted_priority_count": 0,
+                 "lifecycle_registry": {"status": "VALID", "map_sha256": "x"}, "lifecycle_exclusions": []}
+    selection.update(over)
+    return selection
+
+
 def test_identity_gap_policy_warn_never_tolerates_other_failures(monkeypatch):
     monkeypatch.setenv("TFB_NEWS_IDENTITY_GAP_POLICY", "warn")
-    base = {"selected_acquisition_complete": True, "archive_write": {"status": "APPEND_ACCEPTED"}}
+    base = {"selected_acquisition_complete": True, "archive_write": {"status": "APPEND_ACCEPTED"},
+            "selection": _ok_selection()}
     assert archive._identity_gap_tolerated(dict(base, failure_codes=["identity_coverage_incomplete"])) is True
     assert archive._identity_gap_tolerated(dict(base, failure_codes=["identity_discovery_incomplete"])) is True
     assert archive._identity_gap_tolerated(dict(base, failure_codes=[])) is False
@@ -272,3 +281,53 @@ def test_news_workflow_arms_warn_policy_with_variable_override():
                          Loader=yaml.BaseLoader)
     step = next(s for s in workflow["jobs"]["collect"]["steps"] if s.get("name") == "Collect news archive")
     assert step["env"]["TFB_NEWS_IDENTITY_GAP_POLICY"] == "${{ vars.TFB_NEWS_IDENTITY_GAP_POLICY || 'warn' }}"
+
+
+def test_identity_gap_policy_warn_never_tolerates_lifecycle_or_selection_failures(monkeypatch):
+    """Codex P2 (PR #839): an unverified lifecycle exclusion, an invalid registry, an empty
+    selection or a budget cut only surface as identity_discovery/coverage_incomplete."""
+    monkeypatch.setenv("TFB_NEWS_IDENTITY_GAP_POLICY", "warn")
+    base = {"failure_codes": ["identity_discovery_incomplete"], "selected_acquisition_complete": True,
+            "archive_write": {"status": "APPEND_ACCEPTED"}}
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection())) is True
+    legacy = {"symbol": "ROG.SW", "status": "VERIFIED_LEGACY", "historical_name": "Roche"}
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(lifecycle_exclusions=[legacy]))) is True
+    for status in ("UNKNOWN", "EXPIRED", "", None):
+        bad = dict(legacy, status=status)
+        assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(lifecycle_exclusions=[legacy, bad]))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(lifecycle_exclusions=["ROG.SW"]))) is False
+    for status in ("UNKNOWN", "INVALID", None):
+        assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(
+            lifecycle_registry={"status": status, "map_sha256": None}))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(lifecycle_registry=None))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(selected_count=0))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(missing_identity_symbols=["X.US"]))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=_ok_selection(omitted_priority_count=1))) is False
+    assert archive._identity_gap_tolerated(dict(base, selection=None)) is False
+    assert archive._identity_gap_tolerated(dict(base)) is False
+
+
+def test_identity_gap_policy_warn_still_fails_an_expired_lifecycle_exclusion_end_to_end(monkeypatch, tmp_path):
+    """Codex's example: ROG.SW excluded at an expired review date + a successful ACTIVE.US fetch."""
+    monkeypatch.setenv("TFB_NEWS_IDENTITY_GAP_POLICY", "warn")
+    monkeypatch.setenv("NEWS_ARCHIVE_UNIVERSE", "ROG.SW ACTIVE.US")
+    expired = {"ROG.SW": {"symbol": "ROG.SW", "status": "UNKNOWN", "historical_name": "Roche Holding AG",
+                          "reason": "review_expired"}}
+    monkeypatch.setattr(archive, "load_news_lifecycle",
+                        lambda now=None: (expired, {"status": "VALID", "map_sha256": "x"}), raising=False)
+    import core.news_identity_lifecycle as lifecycle_module
+    monkeypatch.setattr(lifecycle_module, "load_news_lifecycle",
+                        lambda now=None: (expired, {"status": "VALID", "map_sha256": "x"}))
+    context = {"identities": {"ACTIVE.US": "Active Corp"}, "portfolio_membership": [], "research": [],
+               "pool": [], "eligible": [], "sources": [], "complete": True, "source_read_complete": True,
+               "identity_coverage_complete": True, "lifecycle_exclusions": [expired["ROG.SW"]]}
+    written = []
+    _gap_store_and_batch(monkeypatch, context, written)
+    path = tmp_path / "evidence.json"
+    args = argparse.Namespace(universe=None, adaptive=True, max_symbols=60, sheet_id="test",
+                              dry_run=False, evidence_json=str(path))
+    assert asyncio.run(archive.collect(args)) == 1
+    first = json.loads(path.read_text())
+    assert first["archive_write"]["status"] == "APPEND_ACCEPTED" and len(written) == 1
+    assert first["identity_gap_tolerated"] is False
+    assert first["selection"]["lifecycle_exclusions"][0]["status"] == "UNKNOWN"

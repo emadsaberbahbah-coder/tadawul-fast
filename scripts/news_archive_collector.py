@@ -66,6 +66,9 @@
 #   code (news_batch_*, archive_*, selected_acquisition_incomplete,
 #   identity_source_read_incomplete, selected_identity_missing,
 #   priority_selection_capped, collection_error) still exits 1 under warn.
+#   A lifecycle registry that is not VALID, an exclusion that is not
+#   VERIFIED_LEGACY (expired review / caption conflict), an empty selection or
+#   a budget cut also still exit 1 under warn (Codex P2 on PR #839).
 #   The scheduled workflow sets warn (news_archive.yml v1.3.3).
 # ROLLBACK: unset the ENV (or set fail) -- v1.3.2 exit codes return exactly.
 # =============================================================================
@@ -985,6 +988,20 @@ def _identity_gap_tolerated(report: Dict[str, Any]) -> bool:
     if not codes or not set(codes) <= _IDENTITY_GAP_CODES:
         return False
     if report.get("selected_acquisition_complete") is not True:
+        return False
+    # The gap codes also carry lifecycle-review failures and an empty or
+    # over-budget selection (Codex P2, 25 Oct). Those are never a caption gap:
+    # the registry must be VALID, every exclusion independently VERIFIED_LEGACY,
+    # at least one symbol selected, nothing missing and nothing cut by budget.
+    selection = report.get("selection") or {}
+    registry = selection.get("lifecycle_registry") or {}
+    if registry.get("status") != "VALID":
+        return False
+    exclusions = selection.get("lifecycle_exclusions") or []
+    if any(not isinstance(record, dict) or record.get("status") != "VERIFIED_LEGACY" for record in exclusions):
+        return False
+    if not selection.get("selected_count") or selection.get("missing_identity_symbols") \
+            or selection.get("omitted_priority_count", 0):
         return False
     write = report.get("archive_write") or {}
     return write.get("status") in _TOLERABLE_WRITE_STATUSES and not write.get("error_code")

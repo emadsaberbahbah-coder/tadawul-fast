@@ -13,6 +13,7 @@ Nine consecutive runs red since v1.3.0 landed (22 Oct 23:12Z): `39870284821, 399
 - `_identity_gap_tolerated(report)`: True only under `warn` AND failure codes non-empty and a subset of `{identity_coverage_incomplete, identity_discovery_incomplete}` AND `selected_acquisition_complete is True` AND archive write status in `{APPEND_ACCEPTED, SKIPPED_EXISTING, NO_ELIGIBLE_ROWS, DRY_RUN}` with no `error_code`.
 - `_finish_collection_report` records `identity_gap_policy` and `identity_gap_tolerated` in the report, the evidence JSON and the stdout summary; prints `::warning::` when tolerated (codes only, never symbols). The step summary gains one policy line. `failure_codes` and `complete` are untouched (still `false` on a gap).
 - Exit points (dry-run, nothing-new, append): `1 if incomplete and not tolerated else 0`.
+- **Codex P2 (PR #839, 25 Oct 11:11Z) fixed in `3b…`:** the two gap codes also carry lifecycle-review failures (`_select_news_universe`: registry not VALID, an exclusion whose status is not `VERIFIED_LEGACY` because its review expired or the current caption conflicts) and an empty/over-budget selection. `_identity_gap_tolerated` now also requires `selection.lifecycle_registry.status == VALID`, every `selection.lifecycle_exclusions[].status == VERIFIED_LEGACY`, `selected_count > 0`, no `missing_identity_symbols`, `omitted_priority_count == 0`. Codex's example (ROG.SW excluded at an expired review + a successful ACTIVE.US fetch) exits 1 again; the same with a VERIFIED_LEGACY exclusion exits 0.
 - Workflow: `TFB_NEWS_IDENTITY_GAP_POLICY: ${{ vars.TFB_NEWS_IDENTITY_GAP_POLICY || 'warn' }}` on the Collect step; header WHY.
 
 ## S3 -- Not changed
@@ -21,7 +22,8 @@ Discovery, selection, identity validation, lifecycle exclusions, archive writer,
 ## S4 -- Audits
 | Battery | Result |
 |---|---|
-| `tests/test_news_workflow_health.py` (+5), `test_news_acquisition_evidence.py`, `test_news_adaptive_universe.py` | 113 passed |
+| `tests/test_news_workflow_health.py` (+7), `test_news_acquisition_evidence.py`, `test_news_adaptive_universe.py`, `test_news_lifecycle.py` | 151 passed |
+| Golden negative for the Codex P2 against the first v1.3.3 head `984a978` | both lifecycle tests FAIL there, PASS on the fix |
 | Golden negative: the 5 new tests against the untouched v1.3.2 copy (`TFB_NEWS_HEALTH_SOURCE`) | FAIL on the base (policy helpers absent; pure-gap run exits 1), PASS on v1.3.3 |
 | Default policy (absent / `fail` / `FAIL` / `warning` / `1` / `true`) | `fail`; existing `test_discovery_gap_retains_nonzero_exit...` still exits 1 unchanged |
 | `warn` never tolerates: `identity_source_read_incomplete`, `selected_identity_missing`, `priority_selection_capped`, `news_batch_failed`, `collection_error`, `news_response_unverified`, acquisition incomplete, write WITHHELD/NOT_ATTEMPTED/UNKNOWN/UNVERIFIED, write with error_code | asserted |
