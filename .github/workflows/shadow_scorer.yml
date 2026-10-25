@@ -30,6 +30,13 @@ on:
         description: "true = record today's rollback drill (criterion 6)"
         default: "false"
 
+# Single write lease, same shape as shadow_board.yml: the 15:20 UTC cron and
+# the Apps Script dispatch (15:40 UTC) must never score concurrently into
+# Shadow_History. cancel-in-progress: false — the second run waits.
+concurrency:
+  group: tfb-shadow-scorer
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
