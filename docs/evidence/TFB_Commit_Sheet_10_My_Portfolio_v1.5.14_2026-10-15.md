@@ -2,6 +2,8 @@
 
 Renumbered 2026-10-21: main shipped a different v1.5.14 first (#810, the ledger reader excludes sold/closed lots). This build is now **v1.5.15** on top of it: off is byte-identical to that v1.5.14 (the harness's live base compare passes with `PF_BASE_GAS=<main v1.5.14>` as well as with the v1.5.13 golden source), and the golden negative still fails W1 on main's v1.5.14 (panel after rebuild = cash 0, Max Position 15). The harness digest is now `4af915fbb6e6da76` (the version string is part of the traced log lines). The figures below are as measured on 2026-10-15 against v1.5.13.
 
+Renumbered again 2026-10-25: main shipped a different v1.5.15 first (#834, PD-ALLCASH: a broker-proven all-cash book publishes status ok and the readiness receipt). This build is now **v1.5.16** on top of it. Off is byte-identical to main's v1.5.15 on the panel path: the live base compare passes with `PF_BASE_GAS=<main v1.5.15>` (16/16). The golden negative still fails W1 on main's v1.5.15 (panel after rebuild = cash 0, Max Position 15). The harness digest is now `f8b85742e2e61dc6`. Main's #834 harnesses were adjusted for this build's additions only (the Logger-line check reads `PD_VERSION`; the inventory counts the three panel-preserve functions and 141 lines), and they pass: `pf_allcash_ok` 7/7, `tests/test_pf_allcash_ok.py` with `TFB_PF_BASE_REF=4123c831^`. The paste is now **v1.5.16** from main; it contains #834's v1.5.15 and #810's v1.5.14.
+
 Date: 2026-10-15 (daily improvement, one item).
 - **Base:** v1.5.13 (main `11ef1345`, sha256 `a8a00d6d...`, 4,529 lines). Result sha256 `63f840c9...`, 4,667 lines.
 - **Lane:** Apps Script (bound project). A paste of one file. Nothing in the backend, workflows or Render changes.
