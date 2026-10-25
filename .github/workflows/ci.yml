@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.36 (2026-10-25) -- TRACKER BOARD COVERAGE
+#
+# v1.1.36: run tests/test_track_board_coverage.py (track_performance v6.49.0:
+# TFB_TRACK_BOARD_SYMBOLS, default off -- the live Top_10_Investments board's
+# seated symbols, GRACE ghosts included, join the forced-coverage set so
+# Signal_History / Performance_Log record the recommendations the Apps Script
+# board publishes; off is v6.48.0 byte for byte) in the blocking lean lane next
+# to tests/test_track_force_coverage_p180.py. Pure parser / knob / plan cases,
+# offline. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.35 (2026-10-24) -- DT10 CONFIRM BASIS
 #
 # v1.1.35: run tests/test_dt10_confirm_basis.js (16_Decision_Top10.gs v1.14.0:
@@ -806,6 +816,7 @@ jobs:
             tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
+            tests/test_track_board_coverage.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_dedup_signal_p191.py \
             tests/test_track_flags_mapped.py \
