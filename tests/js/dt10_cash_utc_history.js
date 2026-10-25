@@ -1,5 +1,6 @@
 /* Preserve the immutable v1.13.8 source without duplicating a 438 KB fixture.
- * Every v1.14.0 edit (confirmation basis), then every v1.13.11 edit (bulk
+ * Every v1.15.0 edit (pending grace), then every v1.14.0 edit (confirmation
+ * basis), then every v1.13.11 edit (bulk
  * render formatting), then every v1.13.10 edit
  * (holding subunit FX, null value_sar for a missing rate, terminal FAILED
  * refresh state) and then every v1.13.9 edit is reversed exactly once and
@@ -23,7 +24,47 @@ const WHY = [
   ' *',
   ''
 ].join('\n');
-/* v1.14.0 edits, reversed FIRST (current -> v1.13.11 text). The result is
+/* v1.15.0 edits, reversed FIRST (current -> v1.14.0 text). The result is
+ * hash-pinned (V1140_SHA256 = the reviewed v1.14.0 file, origin/main
+ * 115200ab / f598fea2), so tests/test_dt10_pending_grace.js can run the
+ * v1.14.0 clocks as its golden negative and kill-identity oracle without a
+ * fixture copy. Twelve insertions (prior '') and three rewrites (the two
+ * version lines and the core's return block); three insertions carry one
+ * neighbouring line of context because the inserted line repeats. */
+const V1140_SHA256 = 'b888d7fd0f0b90f3170bd0e84cabb9c0efd1e665a1a55914746df9fdb9eda52c';
+const EDITS_V1150 = [
+  [" * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" *\n * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT\n * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails\n * ONE criteria day (still on the audited grid, no structural block, not a\n * hard-out verdict, inside the rank buffer, but DO_NOT_INVEST because a\n * floor was missed) had its count reset to 0 by dt10StabCore_'s\n * `else { st.ci = 0; ... }` -- the same branch a hard exit uses. Live case,\n * 25 Oct 08:10 board (first run on the 2026-10-25 epoch): PHP.L sat at 1/3\n * on 24 Oct with reliability 71.5 / DQ 100; on 25 Oct -- a weekend, no LSE\n * session, price unchanged at 92.05 -- its Expected ROI 3M read 8.13% (<12%)\n * and the name fell to GRACE with its count gone. Members already enjoy this\n * tolerance ('plain DO_NOT_INVEST criteria-misses ARE grace-holdable', exit\n * clock, v1.2.0); challengers did not. The owner asked (24 Oct 19:32) for a\n * rule that does not restart a positive name's count on one such day.\n * WHAT: Script Property TFB_T10_PENDING_GRACE_DAYS (integer 0..5; default\n * absent/0/junk = v1.14.0 clocks byte for byte). When > 0, on a day-advance\n * a NON-member with ci > 0 that is absent from raw and not qualifiedWithin\n * but is a SOFT MISS (dt10StabSoftMiss_: audited row present, verdict not\n * INVEST, structural_block !== true, not hardOut, global rank inside the\n * rank buffer) keeps ci and increments st.cp (consecutive pending-grace\n * days); the day's score point is still recorded. Once cp would exceed the\n * grace, the v1.14.0 reset applies (ci 0, cp cleared). Any raw or qualified\n * day clears cp. Members, hard exits, outage pauses, seating (still needs a\n * raw ticket), fast-track, displacement, capacity and sizing are unchanged.\n * SECTION 8 KEPT: no gate, score or verdict is recomputed -- the soft miss is\n * read from the backend's own audited row (verdict + structural_block + rank).\n * SURFACE: status note gains ', pgrace=<n>' and ', pheld <k> SYM(ci/n) ...'\n * (up to 3) only when the property is armed; audit gains `pending_held`\n * only when armed; the state blob writes `cp` only while > 0 (a blob that\n * never paused is byte-identical). dt10SelfTest gains 'pending grace core'.\n * Functions added (0 removed): dt10StabSoftMiss_, dt10StabPendingGrace_;\n * var added: DT10_T10_PENDING_GRACE_PROP.\n * Harness: tests/test_dt10_pending_grace.js (REAL file; golden negative on\n * the v1.14.0 base rebuilt by reversing these edits, SHA-256 pinned; kill\n * identity with the property absent/0; ES5/ASCII lint; inventory).\n * Rollback: delete the property (no re-paste) or re-paste v1.14.0.\n * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped\n * in lockstep. Arming is an owner step AFTER the first funded ticket of\n * 26 Oct 2026 (the Monday path runs on v1.14.0 clocks).\n",
+    ""],
+  ["var DT10_VERSION = '1.15.0';\n",
+    "var DT10_VERSION = '1.14.0';\n"],
+  ["// v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances a NON-member\n// challenger with ci > 0 may absorb without its count resetting -- see the\n// v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.\nvar DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';\nvar DT10_T10_PENDING_GRACE_MAX = 5;\n",
+    ""],
+  ["      // v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances absorbed\n      // by a pending challenger. Absent in older blobs => 0; written only\n      // when > 0 so a blob that never paused stays byte-identical to v1.14.0.\n      var vcp = Math.max(0, parseInt(v.cp, 10) || 0);\n      if (vcp > 0) out.symbols[sym].cp = vcp;\n",
+    ""],
+  ["/** v1.15.0 [PENDING-GRACE] PURE: is today's miss for `sym` a SOFT miss?\n * True when the deduped audited grid (candBySym) has a row for it whose\n * verdict is NOT INVEST (a criteria miss the backend itself reports),\n * structural_block is not true, hardOut(sym) is false and its all-pool rank\n * is inside the rank buffer. Never recomputes a gate, score or verdict\n * (section 8): the row, its verdict and its rank are the backend's own.\n * A row absent from the grid, a structural block, a hard-out verdict or a\n * rank outside the buffer is a HARD miss (v1.14.0 reset). Never throws. */\nfunction dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut) {\n  var c = candBySym ? candBySym[sym] : null;\n  if (!c || typeof c !== 'object') return false;\n  if (String(c.verdict || '').toUpperCase() === 'INVEST') return false;\n  if (c.structural_block === true) return false;\n  if (typeof hardOut === 'function' && hardOut(sym)) return false;\n  var buf = knobs ? Number(knobs.rank_buffer) : 0;\n  if (!(buf > 0)) return false;\n  var r = globalRank ? Number(globalRank[sym]) : 0;\n  return r > 0 && r <= buf;\n}\n",
+    ""],
+  ["  // v1.15.0 [PENDING-GRACE]: the grace rides as a plain knob (service read in\n  // dt10ApplyStability_); absent/0 (older callers, the self-test replays,\n  // the property unset) is the v1.14.0 clock byte for byte.\n  var pgDays = Math.max(0, Math.min(DT10_T10_PENDING_GRACE_MAX,\n                                    parseInt(knobs.pending_grace, 10) || 0));\n  var pendingHeld = [];\n  function softMiss(sym) {\n    return dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut);\n  }\n",
+    ""],
+  ["          st.co = 0;\n          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n",
+    "          st.co = 0;\n        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n"],
+  ["          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n        } else if (pgDays > 0 && !st.member && (st.ci || 0) > 0 &&\n                   (st.cp || 0) < pgDays && softMiss(sym)) {\n          // v1.15.0 [PENDING-GRACE]: a NON-member challenger with a live count\n          // misses on a SOFT criteria day (audited row present, not INVEST, no\n          // structural block, not hard-out, inside the rank buffer): the count\n          // PAUSES (ci kept) and the grace counter advances; the score point\n          // below is still recorded. Members never enter this branch (their\n          // exit clock already pauses inside the buffer); a hard miss, or a\n          // grace already spent, falls through to the v1.14.0 reset.\n          st.cp = (st.cp || 0) + 1;\n          pendingHeld.push(sym);\n",
+    ""],
+  ["          st.ci = 0;\n          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n          if (st.member) {\n",
+    "          st.ci = 0;\n          if (st.member) {\n"],
+  ["  // v1.15.0 [PENDING-GRACE]: read-back tokens only while the grace is armed\n  // (0 leaves the note and the audit byte-identical to v1.14.0): the armed\n  // grace and the challengers whose count was paused on this day-advance.\n  if (pgDays > 0) {\n    pendingHeld.sort(function (a, b) {\n      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);\n      if (dci) return dci;\n      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);\n      if (drk) return drk;\n      return a < b ? -1 : (a > b ? 1 : 0);\n    });\n    note += ', pgrace=' + pgDays;\n    if (pendingHeld.length) {\n      var phParts = [];\n      for (var phi = 0; phi < pendingHeld.length && phParts.length < 3; phi++) {\n        phParts.push(pendingHeld[phi] + '(' + (symbols[pendingHeld[phi]].ci || 0) +\n                     '/' + knobs.confirm_days + ')');\n      }\n      note += ', pheld ' + pendingHeld.length + ' ' + phParts.join(' ');\n    }\n  }\n  var coreOut = {\n",
+    "  return {\n"],
+  ["  if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0\n  return coreOut;\n",
+    ""],
+  ["}\n\n/**\n * v1.15.0 [PENDING-GRACE]: pending grace days -- Script Property\n * TFB_T10_PENDING_GRACE_DAYS (DT10_T10_PENDING_GRACE_PROP). An integer\n * 1..DT10_T10_PENDING_GRACE_MAX arms the grace (larger values clamp to the\n * max); absent, blank, 0, negative, junk or a PropertiesService fault read\n * as 0 = the v1.14.0 clocks. Mirrors dt10StabConfirmBasis_ (service read\n * outside the pure core); never throws.\n */\nfunction dt10StabPendingGrace_() {\n  try {\n    var raw = String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_T10_PENDING_GRACE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '');\n    if (!/^\\d+$/.test(raw)) return 0;\n    var n = parseInt(raw, 10);\n    if (!(n > 0)) return 0;\n    return Math.min(DT10_T10_PENDING_GRACE_MAX, n);\n  } catch (ePg) {}\n  return 0;\n",
+    ""],
+  ["  // v1.15.0 [PENDING-GRACE]: same pattern -- one service read here; the knob\n  // is set ONLY when armed (> 0) so an unarmed run publishes the v1.14.0\n  // knobs object byte for byte.\n  var pgRead = dt10StabPendingGrace_();\n  if (pgRead > 0) knobs.pending_grace = pgRead;\n",
+    ""],
+  ["  /* v1.15.0 [PENDING-GRACE]: property line (one read) + pure battery on the\n     same board. CHAL confirmed days 1-2 (raw), day 3 a SOFT miss (absent from\n     raw, audited row verdict WATCH at rank 12, no block), day 4 raw again.\n     grace 1: day 3 pauses (ci 2, cp 1, 'pgrace=1', 'pheld 1 CHAL.US(2/3)'),\n     day 4 NEW 3/3 sized. grace absent/0: identical to the v1.14.0 cbW replay.\n     Two consecutive soft misses with grace 1: day 4 resets. Hard miss\n     (structural_block) with grace 1: reset. Member B untouched either way. */\n  report.push('pending grace (TFB_T10_PENDING_GRACE_DAYS): ' + dt10StabPendingGrace_() +\n              ' (0 = v1.14.0 clocks; 1..' + DT10_T10_PENDING_GRACE_MAX + ' arms)');\n  function pgKnobs(pg) {\n    var k = cbKnobs('qualified');\n    if (pg !== undefined) k.pending_grace = pg;\n    return k;\n  }\n  function pgRun(knobs, grids, raw) {\n    var st = dt10StabParseState_(cbSeed);\n    var outs = [];\n    for (var pd = 0; pd < 4; pd++) {\n      var o = dt10StabCore_(raw[pd], grids[pd], st, knobs, 2, cbDays[pd]);\n      st = dt10StabParseState_(o.state);\n      outs.push(o);\n    }\n    return outs;\n  }\n  var pgG = cbGrid(86);\n  var pgSoft = cbGrid(86, 'WATCH');\n  var pgBlk = cbGrid(86);\n  pgBlk[pgBlk.length - 1].structural_block = true;\n  var pgRaw2 = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n                [cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n                [cbTk('A.US', 95), cbTk('NEWC.US', 97)],\n                [cbTk('A.US', 95), cbTk('NEWC.US', 97)]];\n  var pg1 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pg0 = pgRun(pgKnobs(0), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pgA = pgRun(pgKnobs(undefined), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pg1x2 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgSoft], pgRaw2);\n  var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);\n  var pgChal4 = cbTk4(pg1, 'CHAL.US');\n  var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);\n  report.push('pending grace core: ' +\n      ((JSON.stringify(pg0) === JSON.stringify(cbW) &&\n        JSON.stringify(pgA) === JSON.stringify(cbW) &&\n        pg1[1].state.symbols['CHAL.US'].ci === 2 &&\n        pg1[2].state.symbols['CHAL.US'].ci === 2 &&\n        pg1[2].state.symbols['CHAL.US'].cp === 1 &&\n        pg1[2].state.symbols['CHAL.US'].member === false &&\n        pgBlob2.indexOf('\"cp\":1') > 0 &&\n        pg1[2].note.indexOf('pgrace=1') > 0 &&\n        pg1[2].note.indexOf('pheld 1 CHAL.US(2/3)') > 0 &&\n        pg1[2].audit.pending_held.length === 1 &&\n        pg1[3].state.symbols['CHAL.US'].ci === 3 &&\n        pg1[3].state.symbols['CHAL.US'].cp === undefined &&\n        pg1[3].note.indexOf('pheld') < 0 &&\n        pgChal4 !== null && pgChal4._stab_status === 'NEW (confirmed 3/3)' &&\n        pgChal4.suggested_sar === 5000 &&\n        pg1x2[2].state.symbols['CHAL.US'].ci === 2 &&\n        pg1x2[3].state.symbols['CHAL.US'].ci === 0 &&\n        pg1x2[3].state.symbols['CHAL.US'].cp === undefined &&\n        pg1h[2].state.symbols['CHAL.US'].ci === 0 &&\n        pg1h[2].note.indexOf('pheld') < 0 &&\n        JSON.stringify(pg1[2].state.symbols['B.US']) ===\n            JSON.stringify(cbW[2].state.symbols['B.US']) &&\n        cbW[2].audit.pending_held === undefined &&\n        cbW[2].note.indexOf('pgrace') < 0)\n       ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +\n         'two soft misses -> reset, structural block -> reset, member untouched)'\n       : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));\n",
+    ""]
+];
+/* v1.14.0 edits, reversed NEXT (current -> v1.13.11 text). The result is
  * hash-pinned (V11311_SHA256 = the reviewed v1.13.11 file, origin/main
  * ca2f87c7), so tests/test_dt10_confirm_basis.js can run the v1.13.11 clocks
  * as its golden negative and kill-identity oracle without a fixture copy.
@@ -102,7 +143,7 @@ const EDITS_V11310 = [
   ["        hxC.value_sar === null && hxD.value_sar === 445.08 &&\n        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +\n       hxD.value_sar + '/' + hxE.value_sar + ']'));\n",
     "        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));\n"]
 ];
-const EDITS = EDITS_V1140.concat(EDITS_V11311, EDITS_V11310, [
+const EDITS = EDITS_V1150.concat(EDITS_V1140, EDITS_V11311, EDITS_V11310, [
   [' * Version: 1.13.9 ', ' * Version: 1.13.8 '],
   [WHY, ''],
   ["var DT10_VERSION = '1.13.9';", "var DT10_VERSION = '1.13.8';"],
@@ -128,17 +169,31 @@ function feedHistorySource(source) {
   let historical = source;
   for (const [current, prior] of EDITS) {
     assert.equal(historical.split(current).length - 1, 1,
-      'exactly one approved v1.13.9/v1.13.10/v1.13.11/v1.14.0 edit: ' + current.split('\n')[0]);
+      'exactly one approved v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 edit: ' + current.split('\n')[0]);
     historical = historical.replace(current, prior);
   }
   assert.equal(crypto.createHash('sha256').update(historical).digest('hex'), HISTORY_SHA256,
-    'v1.13.9/v1.13.10/v1.13.11/v1.14.0 may change only their enumerated edits');
+    'v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 may change only their enumerated edits');
   return historical;
 }
-/* v1.13.11 source (the confirm-basis oracle): only the v1.14.0 edits are
+/* v1.14.0 source (the pending-grace oracle): only the v1.15.0 edits are
  * reversed, each exactly once, and the result must be the reviewed file. */
-function v11311Source(source) {
+function v1140Source(source) {
   let prior = source;
+  for (const [current, previous] of EDITS_V1150) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.15.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1140_SHA256,
+    'v1.15.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.13.11 source (the confirm-basis oracle): the v1.15.0 and then the
+ * v1.14.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v11311Source(source) {
+  let prior = v1140Source(source);
   for (const [current, previous] of EDITS_V1140) {
     assert.equal(prior.split(current).length - 1, 1,
       'exactly one approved v1.14.0 edit: ' + current.split('\n')[0]);
@@ -162,4 +217,4 @@ function v11310Source(source) {
     'v1.13.11 may change only its enumerated edits');
   return prior;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256};
+module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256};

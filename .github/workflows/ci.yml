@@ -2,15 +2,43 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.36 (2026-10-25) -- PF WEIGHT ZERO/SHORT/FX KEY + YAHOO CLASS DASH
+# VERSION 1.1.38 (2026-10-25) -- PF WEIGHT ZERO/SHORT/FX KEY + YAHOO CLASS DASH
 #
-# v1.1.36: run tests/test_pf_weight_zero_short_fx.py (data_engine_v2 v5.159.0:
+# v1.1.38: run tests/test_pf_weight_zero_short_fx.py (data_engine_v2 v5.159.0:
 # a held row priced <= 0 or a negative quantity blanks the book instead of
 # inflating other weights; an operator GBp key keeps the INDICATIVE:GBP
 # disclosure) and tests/test_yahoo_share_class_dash.py (normalize v5.6.1:
 # BRK.B.US -> BRK-B under TFB_YAHOO_SHARE_CLASS_DASH) in the lean model lane,
 # next to tests/test_pf_weight_value_complete.py. Offline. Nothing is removed
 # and no existing entry moves.
+#
+# VERSION 1.1.37 (2026-10-25) -- DT10 PENDING GRACE
+#
+# v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
+# Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
+# challenger with a live confirmation count that misses ONE criteria day
+# softly (audited row present, verdict not INVEST, no structural block, not a
+# hard-out verdict, inside 'T10: Stability Rank Buffer') keeps its count for
+# up to N consecutive such days instead of resetting to 0; absent/0 is the
+# v1.14.0 clock byte for byte; seating still needs a raw ticket) in the
+# blocking lean lane's native Apps Script step, next to
+# tests/test_dt10_confirm_basis.js. Offline; the REAL file in a vm context;
+# the v1.14.0 base is rebuilt from the delivered file by reversing the
+# enumerated v1.15.0 edits (SHA-256 pinned in tests/js/dt10_cash_utc_history.js)
+# for the golden negative and the kill identity. Version pins moved in the
+# sibling harnesses (confirm basis, input truth, source readiness, bulk
+# format, feed cohort binding, ledger FX). Nothing is removed and no existing
+# entry moves.
+#
+# VERSION 1.1.36 (2026-10-25) -- TRACKER BOARD COVERAGE
+#
+# v1.1.36: run tests/test_track_board_coverage.py (track_performance v6.49.0:
+# TFB_TRACK_BOARD_SYMBOLS, default off -- the live Top_10_Investments board's
+# seated symbols, GRACE ghosts included, join the forced-coverage set so
+# Signal_History / Performance_Log record the recommendations the Apps Script
+# board publishes; off is v6.48.0 byte for byte) in the blocking lean lane next
+# to tests/test_track_force_coverage_p180.py. Pure parser / knob / plan cases,
+# offline. Nothing is removed and no existing entry moves.
 #
 # VERSION 1.1.35 (2026-10-24) -- DT10 CONFIRM BASIS
 #
@@ -816,6 +844,7 @@ jobs:
             tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
+            tests/test_track_board_coverage.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_dedup_signal_p191.py \
             tests/test_track_flags_mapped.py \
@@ -880,6 +909,7 @@ jobs:
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
           node tests/test_dt10_confirm_basis.js
+          node tests/test_dt10_pending_grace.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js

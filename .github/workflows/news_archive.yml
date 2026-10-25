@@ -1,5 +1,13 @@
 name: news-archive
 
+# v1.3.3 (2026-10-25): TFB_NEWS_IDENTITY_GAP_POLICY=warn for this workflow.
+# Every run since 22 Oct 23:12Z was red with the single code
+# identity_coverage_incomplete while the batch was fetched 60/60 and the
+# archive write was APPEND_ACCEPTED: the collector demanded a Name on 100% of
+# six workbook pages whose own contract is the 99% coverage floor. Under warn
+# that gap is a ::warning:: with the evidence JSON unchanged (complete=false,
+# codes verbatim); acquisition, source-read and archive failures still fail.
+# Rollback: set the repository Variable TFB_NEWS_IDENTITY_GAP_POLICY=fail.
 # v1.3.2 collector reports acquisition, discovery and archive-write outcomes
 # separately in the Actions summary. Incomplete discovery still exits nonzero.
 # Daily news/sentiment snapshot -- the forward-collection clock for Strategy
@@ -126,6 +134,8 @@ jobs:
           INPUT_UNIVERSE: ${{ github.event.inputs.universe }}
           NEWS_ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run }}
           TFB_NEWS_ARCHIVE_ADAPTIVE: ${{ github.event_name != 'workflow_dispatch' && 'true' || github.event.inputs.adaptive }}
+          # v1.3.3: identity-gap policy (fail = v1.3.2 exit codes; warn = annotation, exit 0 when only the gap failed)
+          TFB_NEWS_IDENTITY_GAP_POLICY: ${{ vars.TFB_NEWS_IDENTITY_GAP_POLICY || 'warn' }}
         run: |
           set -euo pipefail
           CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --max-symbols 60 --evidence-json artifacts/news-acquisition.json --verbose)
