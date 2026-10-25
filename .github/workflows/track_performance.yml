@@ -1,5 +1,17 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.6 (2026-10-25) -- PERFORMANCE_LOG READ PRECISION (OWNER OPT-IN)
+# WHY (2026-10-25): track_performance read Performance_Log as formatted text
+# (about 10 significant digits), so canonical v2 1W/2W targets failed their
+# 1e-9 consistency proof once read back (schema_price_mismatch 6 -> 43 while
+# percent_points went 222 -> 249, jobs 121006724938 / 121127954714), and an
+# audit pass rewrote the rounded values for good.
+# WHAT: the 'Run performance clock' step maps repository Variable
+# TRACK_LOG_UNFORMATTED_READ (default 'off' = 1.0.5 behaviour) to
+# track_performance v6.50.0: 'observe' logs one [v6.50.0 LOG-READ] comparison
+# line and changes nothing; 'enforce' reads numbers unformatted. daily_sync's
+# tracker step maps the same Variable (ENV PARITY).
+# Rollback: unset TRACK_LOG_UNFORMATTED_READ (or set off).
 # VERSION 1.0.5 (2026-10-24) -- CANONICAL PROSPECTIVE TARGETS
 # New rows use forecast-price-derived percentage points and schema receipts.
 # Historical rows and promotion thresholds are unchanged; criterion4 now
@@ -358,6 +370,13 @@ jobs:
           TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
+          # (2026-10-25) track_performance v6.50.0 [LOG-READ]: Performance_Log
+          # numbers read at full precision (UNFORMATTED_VALUE) instead of their
+          # displayed text, so canonical v2 1W/2W targets survive the read-back.
+          # Default off = the v6.49.0 read. Arm: observe for one run, then
+          # enforce; both tracker lanes map the same Variable (ENV PARITY).
+          # Rollback: unset or off.
+          TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,

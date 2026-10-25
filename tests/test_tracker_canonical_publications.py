@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import random
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -70,7 +71,8 @@ def source_row():
 def reset_rollout_flags(monkeypatch):
     old_failures = tracker._evidence_append_failures()
     for name in ("TRACK_CANONICAL_TARGETS", "TRACK_SIGNAL_PUBLICATION_MODE",
-                 "TRACK_PUBLICATION_ID", "TRACK_DEDUP_SIGNAL_HISTORY"):
+                 "TRACK_PUBLICATION_ID", "TRACK_DEDUP_SIGNAL_HISTORY",
+                 "TRACK_LOG_UNFORMATTED_READ"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(tracker.RiyadhTime, "now", classmethod(lambda cls: NOW))
     yield
@@ -290,3 +292,69 @@ def test_invalid_stored_outcomes_are_not_canonical_zero_samples(monkeypatch, raw
     assert loaded.realized_roi_source_valid is valid
     result = tracker.canonical_performance_report([loaded])
     assert bool(result["by_horizon"]) is valid
+
+
+# --- v6.50.0 [LOG-READ]: the Performance_Log read-back (full harness:
+# tests/test_tracker_log_read_precision.py; these two guard the blocking lane).
+class FormattedLog:
+    """Rows as the tracker writes them (RAW); numbers come back as their
+    displayed '.10g' text unless UNFORMATTED_VALUE is requested, as in Sheets."""
+
+    def __init__(self, rows):
+        self.rows, self.row_count, self.calls = copy.deepcopy(rows), 1000, []
+
+    def get(self, range_name, **kw):
+        self.calls.append(kw)
+        if kw.get("value_render_option") == "UNFORMATTED_VALUE":
+            return copy.deepcopy(self.rows)
+        return [[format(v, ".10g") if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+                 for v in row] for row in self.rows]
+
+
+def written_log_rows(monkeypatch):
+    monkeypatch.setenv("TRACK_CANONICAL_TARGETS", "1")
+    app = app_with_store(Worksheet())
+    app.args.horizons = ["1W", "2W", "1M", "3M"]
+    rnd, rows = random.Random(20261025), []
+    for i in range(12):
+        price, r1 = round(rnd.uniform(5, 500), 2), rnd.uniform(-0.12, 0.25)
+        r3 = r1 * rnd.uniform(1.4, 2.6)
+        row = source_row()
+        row.update(symbol="S%02d.US" % i, current_price=price, expected_roi_1m=r1, expected_roi_3m=r3,
+                   forecast_price_1m=round(price * (1 + r1), 2), forecast_price_3m=round(price * (1 + r3), 2))
+        rows.append(row)
+    records = asyncio.run(app.record_from_top10([], rows))
+    store = object.__new__(tracker.PerformanceStore)
+    return [store._record_to_row(r) for r in records]
+
+
+def reload_log(rows):
+    store = object.__new__(tracker.PerformanceStore)
+    store.ws, store.backoff = FormattedLog(rows), ImmediateRetry()
+    store.cache, store.cache_lock = {}, tracker.Lock()
+    return store.load_records(1000), store
+
+
+def schema_mismatches(records):
+    return sum(1 for item in tracker.canonical_performance_report(records)["records"]
+               if item["reason"] == "schema_price_mismatch")
+
+
+@pytest.mark.parametrize("mode", (None, "off", "1"))
+def test_log_read_off_keeps_the_formatted_read_that_loses_canonical_targets(monkeypatch, mode):
+    rows = written_log_rows(monkeypatch)
+    if mode is not None:
+        monkeypatch.setenv("TRACK_LOG_UNFORMATTED_READ", mode)
+    loaded, store = reload_log(rows)
+    assert store.ws.calls == [{}]
+    assert len(loaded) == 48 and schema_mismatches(loaded) > 0   # the defect, pinned
+
+
+def test_log_read_enforce_reads_back_exactly_what_was_written(monkeypatch):
+    rows = written_log_rows(monkeypatch)
+    monkeypatch.setenv("TRACK_LOG_UNFORMATTED_READ", "enforce")
+    loaded, store = reload_log(rows)
+    assert store.ws.calls == [{"value_render_option": "UNFORMATTED_VALUE",
+                               "date_time_render_option": "FORMATTED_STRING"}]
+    assert schema_mismatches(loaded) == 0
+    assert [store._record_to_row(r) for r in loaded] == rows
