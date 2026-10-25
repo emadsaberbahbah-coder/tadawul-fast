@@ -57,11 +57,40 @@ def test_zero_price_matches_the_missing_price_contract():
         assert {k: ra.get(k) for k in keys} == {k: rb.get(k) for k in keys}
 
 
-def test_zero_price_falls_back_to_a_positive_price_field():
-    r = _row("2222.SR", 100, 0.0, cost=25.0)
-    r["price"] = 30.0
-    E._compute_position_math(r)
-    assert r["position_value"] == 3000.0
+@pytest.mark.parametrize('bad', [0, '0', -1.0])
+def test_explicit_invalid_primary_cannot_borrow_an_unverified_price_alias(bad):
+    rows = [_row('2222.SR', 100, bad, tw=50, cost=25),
+            _row('1120.SR', 100, 90, tw=50)]
+    rows[0]['price'] = 30.0
+    E._compute_portfolio_fields(rows)
+    for row in rows:
+        assert row['actual_weight'] is None and row['weight_gap'] is None
+        assert row['portfolio_fx_status'] == 'PORTFOLIO_VALUE_INCOMPLETE: 2222.SR'
+        assert row['action_flag'] == 'HOLD'
+    assert rows[0].get('position_value') is None
+    assert rows[0].get('unrealized_pl') is None
+
+
+def test_absent_primary_preserves_existing_positive_alias_fallback():
+    row = _row('2222.SR', 100, None, cost=25)
+    row['price'] = 30.0
+    E._compute_position_math(row)
+    assert row['position_value'] == 3000.0
+
+
+def test_failed_primary_clears_derived_values_from_an_earlier_successful_pass():
+    rows = [_row('2222.SR', 100, 30, tw=50, cost=25),
+            _row('1120.SR', 100, 90, tw=50)]
+    E._compute_portfolio_fields(rows)
+    assert rows[0]['position_value'] == 3000.0
+    rows[0]['current_price'] = 0
+    rows[0]['price'] = 30.0
+    E._compute_portfolio_fields(rows)
+    assert rows[0]['position_value'] is None
+    assert rows[0]['unrealized_pl'] is None
+    assert rows[0]['unrealized_pl_pct'] is None
+    assert all(row['actual_weight'] is None for row in rows)
+    assert rows[0]['position_cost'] == 2500.0
 
 
 def test_zero_quantity_watch_row_at_price_zero_does_not_block_the_book():
@@ -99,6 +128,27 @@ def test_short_and_unvalued_are_both_named():
     E._compute_portfolio_fields(rows)
     assert rows[2]["portfolio_fx_status"] == (
         "PORTFOLIO_VALUE_INCOMPLETE: 2222.SR | PORTFOLIO_SHORT_UNSUPPORTED: AAPL")
+
+
+@pytest.mark.parametrize('signal', ['SELL', 'STRONG_SELL'])
+def test_unsupported_short_has_no_sell_instruction(signal):
+    rows = [_row('AAPL', -10, 90, ccy='USD', cost=100),
+            _row('1120.SR', 100, 90)]
+    rows[0]['recommendation'] = signal
+    E._compute_portfolio_fields(rows)
+    assert rows[0]['decision'] == 'HOLD'
+    assert rows[0]['action_flag'] == 'HOLD'
+    assert rows[0]['actual_weight'] is None
+    assert rows[0]['portfolio_fx_status'] == 'PORTFOLIO_SHORT_UNSUPPORTED: AAPL'
+
+
+def test_long_signal_verdict_is_preserved_when_another_holding_is_unpriced():
+    rows = [_row('AAPL', 10, 90, ccy='USD', cost=100),
+            _row('1120.SR', 100, None)]
+    rows[0]['recommendation'] = 'SELL'
+    E._compute_portfolio_fields(rows)
+    assert rows[0]['decision'] == 'SELL'
+    assert rows[0]['actual_weight'] is None
 
 
 # ----------------------------------------------------- PF-FX-OPERATOR-KEY --- #

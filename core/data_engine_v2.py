@@ -11609,9 +11609,16 @@ def _compute_position_math(row: Dict[str, Any]) -> None:
     price = _as_float(row.get("current_price"))
     # v5.159.0 [PF-VALUE-ZERO]: a price <= 0 is a failed quote, not a value;
     # treat it exactly like a missing price (no -100% P&L from a 0 quote).
-    if price is not None and price <= 0.0:
+    invalid_primary_price = price is not None and price <= 0.0
+    if invalid_primary_price:
         price = None
-    if price is None:
+        # A previous successful pass is not evidence for this failed quote.
+        # These are derived fields; manual quantity and cost stay intact.
+        for field in ("position_value", "unrealized_pl", "unrealized_pl_pct"):
+            row[field] = None
+    # An explicitly failed canonical quote cannot be repaired by an unbound
+    # alias. A usable fallback must first be validated/promoted upstream.
+    if price is None and not invalid_primary_price:
         price = _as_float(row.get("price"))
         if price is not None and price <= 0.0:
             price = None
@@ -11828,6 +11835,10 @@ def _pf_blank_book(rows: List[Dict[str, Any]], msg: str, band: Any, weak: Any) -
         _portfolio_missing_price_holdback(r)
         _f7_settle_holdback(r)
         _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
+        # No directional portfolio instruction for an unsupported short.
+        # Keep the original signal available in recommendation for research.
+        if (_as_float(r.get("position_qty")) or 0.0) < 0.0:
+            r["decision"] = "HOLD"
 
 
 def _compute_portfolio_fields(rows: List[Dict[str, Any]],
