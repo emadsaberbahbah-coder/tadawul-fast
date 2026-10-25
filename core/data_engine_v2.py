@@ -2,8 +2,31 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.158.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.0
 ================================================================================
+
+WHY v5.159.0 - MY_PORTFOLIO WEIGHTS: ZERO PRICES, SHORTS, GBp OPERATOR KEY
+(2026-10-25 one-time audit; ungated, like the v5.156.0 PF-VALUE-COMPLETE fix
+it completes). Three reproduced defects in _compute_portfolio_fields:
+- [PF-VALUE-ZERO] a held row whose quote failed as price 0 got
+  position_value 0, passed the v5.156.0 `is None` check and was left out of
+  total_mv: 2222.SR 100@0 + 1120.SR 100@90 read 1120.SR 100% / gap -50 /
+  REDUCE under OK:SAR, while _insights_base_totals already rejected the same
+  book. _compute_position_math now treats a price <= 0 as missing, and a held
+  row with position_value <= 0 blanks the book with
+  PORTFOLIO_VALUE_INCOMPLETE, exactly like a missing price.
+- [PF-SHORT] a negative position_qty published a negative weight (AAPL
+  -37.5%, weights summing to 62.5%) and a profitable short read -10% because
+  the P&L percent divided by a negative cost. Shorts are not supported by
+  portfolio_actions or the broker capture, so the book now blanks with
+  PORTFOLIO_SHORT_UNSUPPORTED: <symbols>; unrealized_pl_pct divides by
+  abs(position_cost) so its sign follows unrealized_pl.
+- [PF-FX-OPERATOR-KEY] the operator-rate set upper-cased keys, so an
+  operator "GBp" rate counted as an operator GBP rate and a GBP row converted
+  at the built-in indicative 4.80 lost its INDICATIVE:GBP disclosure. The set
+  now uses _pf_fx_key, the same key the FX table stores.
+Values of long books with positive prices are unchanged. Tests:
+tests/test_pf_weight_zero_short_fx.py. Rollback: git revert.
 
 WHY v5.158.0 - F-7 v2b: SETTLE RE-DERIVES THE SCORER'S OWN CONFIDENCE UNDER
 ENFORCE; OBSERVE PUBLISHES v5.157.0 AND SHOWS THE v2 RESULT IN ITS TAG
@@ -4403,7 +4426,12 @@ from core.financial_units import (
 #   v5.157.0 publishes and its f7_settle tag shows the v2 result (stx when
 #   enforce would hold the row back). Off is byte-identical.
 #   Tests: tests/test_de_f7_settle_shadow.py.
-__version__ = "5.158.0"
+# v5.159.0 (2026-10-25): see WHY v5.159.0. [PF-VALUE-ZERO] held rows valued
+#   <= 0 blank the book (PORTFOLIO_VALUE_INCOMPLETE); [PF-SHORT] negative
+#   quantities blank it (PORTFOLIO_SHORT_UNSUPPORTED) and P&L % divides by
+#   abs(cost); [PF-FX-OPERATOR-KEY] operator FX keys use _pf_fx_key.
+#   Tests: tests/test_pf_weight_zero_short_fx.py.
+__version__ = "5.159.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -11579,8 +11607,21 @@ def _compute_position_math(row: Dict[str, Any]) -> None:
     qty = _as_float(row.get("position_qty"))
     avg_cost = _as_float(row.get("avg_cost"))
     price = _as_float(row.get("current_price"))
-    if price is None:
+    # v5.159.0 [PF-VALUE-ZERO]: a price <= 0 is a failed quote, not a value;
+    # treat it exactly like a missing price (no -100% P&L from a 0 quote).
+    invalid_primary_price = price is not None and price <= 0.0
+    if invalid_primary_price:
+        price = None
+        # A previous successful pass is not evidence for this failed quote.
+        # These are derived fields; manual quantity and cost stay intact.
+        for field in ("position_value", "unrealized_pl", "unrealized_pl_pct"):
+            row[field] = None
+    # An explicitly failed canonical quote cannot be repaired by an unbound
+    # alias. A usable fallback must first be validated/promoted upstream.
+    if price is None and not invalid_primary_price:
         price = _as_float(row.get("price"))
+        if price is not None and price <= 0.0:
+            price = None
     # v5.92.0 (Fix AH): recompute the price-dependent derived fields every run
     # (overriding a stale prior-run value), not fill-only. Each line stays
     # guarded on its own inputs; when the gate is OFF, "_auth or ... is None"
@@ -11596,7 +11637,8 @@ def _compute_position_math(row: Dict[str, Any]) -> None:
         row["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(row.get("unrealized_pl"))
     if upl is not None and pos_cost not in (None, 0) and (_auth or _as_float(row.get("unrealized_pl_pct")) is None):
-        row["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
+        # v5.159.0 [PF-SHORT]: abs() so the percent's sign follows the P&L.
+        row["unrealized_pl_pct"] = round((upl / abs(pos_cost)) * 100.0, 6)
 
 
 # v5.121.0 - units of SAR per 1 unit of the keyed currency.
@@ -11793,6 +11835,10 @@ def _pf_blank_book(rows: List[Dict[str, Any]], msg: str, band: Any, weak: Any) -
         _portfolio_missing_price_holdback(r)
         _f7_settle_holdback(r)
         _f7_unresolved_capital_hold(r)  # v5.153.0 (WP-2b)
+        # No directional portfolio instruction for an unsupported short.
+        # Keep the original signal available in recommendation for research.
+        if (_as_float(r.get("position_qty")) or 0.0) < 0.0:
+            r["decision"] = "HOLD"
 
 
 def _compute_portfolio_fields(rows: List[Dict[str, Any]],
@@ -11832,9 +11878,11 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
         _operator_set = set()
         for _k in (_safe_str(os.getenv("TFB_PF_FX_RATES")) or "").split(","):
             if ":" in _k:
-                _operator_set.add(_k.partition(":")[0].strip().upper())
+                _operator_set.add(_pf_fx_key(_k.partition(":")[0]))
         for _k in (fx_rates or {}):
-            _operator_set.add(_safe_str(_k).upper())
+            # v5.159.0 [PF-FX-OPERATOR-KEY]: the table's own key, so an
+            # operator "GBp" rate (GBX) does not count as an operator GBP rate.
+            _operator_set.add(_pf_fx_key(_k))
         # v5.121.0: clear every engine-derived portfolio field BEFORE recomputing,
         # so a holding whose price vanished cannot keep yesterday's weight and
         # gap sitting beside today's action.
@@ -11920,15 +11968,30 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
         # (no usable price) cannot be summed, so no row's share of the book
         # is known. Blank the whole book exactly like PORTFOLIO_FX_INCOMPLETE
         # instead of publishing weights inflated by the missing holding.
+        # v5.159.0 [PF-VALUE-ZERO]: a value <= 0 (a failed quote read as 0)
+        # cannot be summed either; [PF-SHORT]: nor can a negative quantity.
+        def _pv_sym(r: Dict[str, Any]) -> str:
+            return normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol"))) or "(blank)"
+
         _unvalued = sorted(
-            normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol"))) or "(blank)"
+            _pv_sym(r)
             for r in rows
             if isinstance(r, dict)
             and (_as_float(r.get("position_qty")) or 0.0) > 0.0
-            and _as_float(r.get("position_value")) is None
+            and not ((_as_float(r.get("position_value")) or 0.0) > 0.0)
         )
-        if _unvalued:
-            _msg = "PORTFOLIO_VALUE_INCOMPLETE: " + ",".join(_unvalued)
+        _shorts = sorted(
+            _pv_sym(r)
+            for r in rows
+            if isinstance(r, dict) and (_as_float(r.get("position_qty")) or 0.0) < 0.0
+        )
+        if _unvalued or _shorts:
+            _parts = []
+            if _unvalued:
+                _parts.append("PORTFOLIO_VALUE_INCOMPLETE: " + ",".join(_unvalued))
+            if _shorts:
+                _parts.append("PORTFOLIO_SHORT_UNSUPPORTED: " + ",".join(_shorts))
+            _msg = " | ".join(_parts)
             logger.error(
                 "[engine_v2 v%s PF-WEIGHT] %s -- held rows without a position "
                 "value; actual_weight and weight_gap BLANKED for the whole book "
