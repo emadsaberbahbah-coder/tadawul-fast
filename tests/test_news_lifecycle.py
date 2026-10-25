@@ -38,6 +38,29 @@ def options():
                               adaptive=False, max_symbols=60)
 
 
+@pytest.mark.parametrize('symbol,successor', [('JKE.US', 'ILCG.US'), ('JKJ.US', 'ISCB.US')])
+def test_morningstar_legacy_is_exact_and_does_not_acquire_successor(monkeypatch, symbol, successor):
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    now = max(datetime.fromisoformat(x['reviewed_at_utc']) for x in data['bindings']) + timedelta(minutes=1)
+    monkeypatch.setattr(archive, '_utc_now', lambda: now)
+    args = options(); args.universe = [symbol, 'ACTIVE.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-10-25')
+    assert universe == ['ACTIVE.US'] and items == [{'symbol': 'ACTIVE.US'}]
+    record = evidence['lifecycle_exclusions'][0]
+    assert record['symbol'] == symbol and record['successor_symbol'] == successor
+    assert record['status'] == 'VERIFIED_LEGACY'
+    assert record['effective_time_precision'] == 'legacy_confirmed_by_date_bound_not_observed_event_time'
+    # No fuzzy alias across venues, and no historical approval from expired proof.
+    args.universe = [symbol[:-3], symbol[:-3] + '.L']
+    assert archive._select_news_universe(args, None, '2026-10-25')[0] == args.universe
+    monkeypatch.setattr(archive, '_utc_now', lambda: now + timedelta(days=8))
+    args.universe = [symbol]
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-11-02')
+    assert universe == items == [] and not evidence['discovery_complete']
+    assert evidence['lifecycle_exclusions'][0]['status'] == 'UNKNOWN'
+
+
 def test_cli_legacy_is_excluded_without_remapping(monkeypatch):
     monkeypatch.setattr(archive, "_utc_now", lambda: NOW)
     universe, items, evidence = archive._select_news_universe(options(), None, "2026-10-23")
