@@ -1,7 +1,43 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.14
+ * Version: 1.5.15
+ *
+ * v1.5.15 (2026-10-24)  (PD-ALLCASH: A BROKER-PROVEN ALL-CASH BOOK IS A
+ *                        DECIDED STATE -- PD_ALLCASH_OK, default enforce;
+ *                        ALL v1.5.14 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (verified 2026-10-24): the brokerage account has been all cash since
+ * the DDI sale on 22 Oct (0 positions). The only My_Portfolio row (5023.SR)
+ * is outside the execution scope, so the backend answers status 'empty'
+ * and pdReceiptNote_ withheld the receipt with 'decision status empty'.
+ * B2 read: 'Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows
+ * from My_Portfolio (qty/cost from cost-basis: 1) | source readiness
+ * WITHHELD: decision status empty | ibkr evidence SENT (capture 17:39 age
+ * 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 5023.SR) | ...'.
+ * The release gate (audit_decision_surface_freshness PF_STATUS_NOT_OK and
+ * PF_SOURCE_CONSUMPTION_UNPROVEN) therefore failed on every attempt since
+ * 23 Oct and no Top-10 ticket could be sized. An empty book that the
+ * broker capture proves is a legitimate decided state.
+ * WHAT: Script Property PD_ALLCASH_OK = enforce (default; owner decision
+ * 2026-10-24) | off (every line byte-identical to v1.5.14). Any other value
+ * is enforce. Pure pdAllCashProof_(payload, ibkr) is true only when the
+ * decision status is 'empty' with no actions AND this run's IBKR evidence
+ * was SENT (enforce, capture within PD_IBKR_SEND_MAX_AGE_MS) AND that
+ * capture holds 0 positions and 0 links; anything missing or unknown is
+ * false (fail-closed). When it holds under enforce: (a) pdReceiptNote_
+ * accepts 'empty' as the decision status (source cohort, binding and every
+ * other readiness check unchanged); (b) the B2 status token is 'ok' and the
+ * line gains ' | book all-cash (broker 0 positions, decisions 0)' right
+ * after it. Otherwise (no capture, stale capture, positions > 0, any other
+ * status) every line is v1.5.14 byte-identical. The Logger line, the
+ * broker reads, the exclusion logic, the action log and the renderer are
+ * untouched; pdIbkrApply_ only exposes the plan's positions, linked and
+ * ageMs on its result (read-only). pdSelfTest reports the gate.
+ * ES5. Functions added: 2 (pdAllCashMode_, pdAllCashProof_). Changed:
+ * pdReceiptNote_ (optional 7th arg), pdIbkrApply_ (result fields),
+ * refreshPortfolioDecision, pdSelfTest. Removed: 0. Rollback:
+ * PD_ALLCASH_OK=off, or v1.5.14.
  *
  * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
  * ---------------------------------------------------------------
@@ -2567,7 +2603,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.14';
+var PD_VERSION = '1.5.15';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3071,14 +3107,17 @@ function pdSrcBindingCore_(pre, post, stampMs) {
 
 /** Status-line fragment. off -> '' (v1.5.10 byte-identical); observe -> a
  * tag the final audit does not parse; enforce -> exactly one receipt. */
-function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
+function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding, allCash) {
   if (mode !== 'observe' && mode !== 'enforce') return '';
   var src;
   try {
     src = pdSrcReadiness_(ss, ctx, consumedRows);
     var st = (payload && payload.status !== null && payload.status !== undefined)
         ? String(payload.status).toLowerCase() : '';
-    if (src.ready && st !== 'ok') {
+    /* v1.5.15: a broker-proven all-cash book ('empty' + IBKR 0 positions,
+     * 0 links) is a decided state; every other check here is unchanged. */
+    var stOk = st === 'ok' || (allCash === true && st === 'empty');
+    if (src.ready && !stOk) {
       src = {ready: false, reason: 'decision status ' + (st || 'unknown'), cohort: ''};
     }
     if (src.ready && binding) {
@@ -3094,6 +3133,45 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
   return mode === 'observe'
       ? ' | [receipt-observe] would publish ' + verdict
       : ' | source readiness ' + verdict;
+}
+
+/* ----- v1.5.15 PD-ALLCASH: a broker-proven all-cash book -------------------- */
+
+var PD_ALLCASH_PROP = 'PD_ALLCASH_OK';   /* enforce (default) | off */
+var PD_ALLCASH_TOKEN = 'book all-cash (broker 0 positions, decisions 0)';
+
+/** 'off' only when the property says so; anything else (unset, blank,
+ * unreadable, any other text) is 'enforce' (owner decision 2026-10-24). */
+function pdAllCashMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_ALLCASH_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return v === 'off' ? 'off' : 'enforce';
+  } catch (e) {
+    return 'enforce';
+  }
+}
+
+/** PURE, fail-closed: true only when the decision status is 'empty' with
+ * no actions AND this run's IBKR evidence was SENT (pdIbkrApply_ result:
+ * enforce, capture inside PD_IBKR_SEND_MAX_AGE_MS) AND that capture holds
+ * 0 positions and 0 links. Any missing or unknown value -> false. */
+function pdAllCashProof_(payload, ibkr) {
+  if (!payload || payload.status === null || payload.status === undefined) {
+    return false;
+  }
+  if (String(payload.status).toLowerCase() !== 'empty') return false;
+  var acts = payload.actions;
+  if (Object.prototype.toString.call(acts) !== '[object Array]' ||
+      acts.length !== 0) return false;
+  if (!ibkr || ibkr.sent !== true) return false;
+  if (String(ibkr.note || '').indexOf('ibkr evidence SENT') < 0) return false;
+  if (typeof ibkr.ageMs !== 'number' || !isFinite(ibkr.ageMs) ||
+      ibkr.ageMs < 0 || ibkr.ageMs > PD_IBKR_SEND_MAX_AGE_MS) return false;
+  if (ibkr.positions !== 0 || ibkr.linked !== 0) return false;
+  return true;
 }
 
 /* ----- v1.5.12 IBKR capture evidence + execution scope ---------------------- */
@@ -3551,9 +3629,11 @@ function pdIbkrLatestCapture_(nowMs) {
 }
 
 /** v1.5.12: apply the observe/enforce mode to the request body IN PLACE.
- * Returns {note, excluded, controls, sent}. Never throws. */
+ * Returns {note, excluded, controls, sent} plus, from v1.5.15, the plan's
+ * {positions, linked, ageMs} (null without a valid capture). Never throws. */
 function pdIbkrApply_(mode, body) {
-  var res = {note: '', excluded: [], controls: null, sent: false};
+  var res = {note: '', excluded: [], controls: null, sent: false,
+             positions: null, linked: null, ageMs: null};   /* v1.5.15 */
   try {
     var nowMs = Date.now();
     var split = pdIbkrSplitRows_(body.rows,
@@ -3565,6 +3645,11 @@ function pdIbkrApply_(mode, body) {
         : {ok: false, reason: cap.reason};
     var fresh = plan.ok === true && plan.ageMs >= 0 &&
         plan.ageMs <= PD_IBKR_SEND_MAX_AGE_MS;
+    if (plan.ok === true) {   /* v1.5.15: counts for the all-cash proof */
+      res.positions = plan.positions;
+      res.linked = plan.linked;
+      res.ageMs = plan.ageMs;
+    }
     if (mode === 'enforce') {
       var rates = pdIbkrPegRates_(body.fx_rates);
       var controls = null;
@@ -4124,12 +4209,17 @@ function refreshPortfolioDecision() {
     try { postStamps = pdCollectHoldings_(null, true).stamps; } catch (eRb) {}
     binding = {pre: pool.stamps, post: postStamps};
   }
+  /* v1.5.15 PD-ALLCASH: 'empty' with this run's IBKR evidence SENT at 0
+   * positions / 0 links is a decided all-cash book; PD_ALLCASH_OK=off (or
+   * a failed proof) keeps every v1.5.14 line byte-identical. */
+  var allCash = pdAllCashMode_() === 'enforce' && pdAllCashProof_(payload, ibkr);
   var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,
-      pool.rows.length, payload, binding);
-  var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
+      pool.rows.length, payload, binding, allCash);
+  var statusLine = (allCash ? PD_ALLCASH_TOKEN + ' | ' : '') +
+      poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
       pdMetaLine_(payload.meta) +
       ' | ' + secs + 's';
-  statusCell.setValue(pdStatusLine_(String(payload.status || '?'),
+  statusCell.setValue(pdStatusLine_(allCash ? 'ok' : String(payload.status || '?'),
       logNote ? statusLine + ' | ' + logNote : statusLine));
   Logger.log('[MP-DEC v' + PD_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's' + (logNote ? ' | ' + logNote : ''));
@@ -4515,6 +4605,8 @@ function pdSelfTest() {
       (pdEvidencePacket_() ? 'present (schema 1)' : 'absent'));
   /* v1.5.12: IBKR capture evidence (read-only; never amounts or the packet). */
   report.push('IBKR evidence mode (PD_IBKR_EVIDENCE): ' + pdIbkrMode_());
+  /* v1.5.15: the all-cash gate (read-only). */
+  report.push('all-cash gate (PD_ALLCASH_OK): ' + pdAllCashMode_());
   var ibEx = pdIbkrExcludeList_(pdIbkrProp_(PD_IBKR_EXCLUDE_PROP));
   report.push('execution scope exclusions (PD_EXECUTION_EXCLUDE): ' +
       (ibEx.length ? ibEx.join(', ') : 'none'));

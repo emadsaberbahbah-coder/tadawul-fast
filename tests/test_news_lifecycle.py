@@ -8,13 +8,76 @@ import pytest
 
 from scripts import news_archive_collector as archive
 
-NOW = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
-REVIEW_NOW = datetime(2026, 10, 24, 6, tzinfo=timezone.utc)
+
+
+def _registry_clock():
+    """One minute after the newest lifecycle review in the live registry.
+
+    The registry is renewed every week (name_label_renewal.yml re-stamps
+    reviewed_at_utc), so a clock pinned to one review cohort fails CI on the
+    first renewal (PR #840, 25 Oct 2026). Deriving it keeps every lifecycle
+    binding inside its 7-day review window regardless of when it was renewed;
+    the expiry and future-effective cases below add days to this clock.
+    """
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    stamps = [datetime.fromisoformat(item["reviewed_at_utc"]) for item in data["bindings"]
+              if "news_lifecycle" in (item.get("identifiers") or {})]
+    assert stamps, "registry carries no lifecycle binding"
+    return max(stamps).astimezone(timezone.utc) + timedelta(minutes=1)
+
+
+NOW = _registry_clock()
+REVIEW_NOW = NOW
+
+
+def test_irbo_legacy_caption_never_fetches_or_substitutes_arty(monkeypatch):
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    now = max(datetime.fromisoformat(x['reviewed_at_utc']) for x in data['bindings']) + timedelta(minutes=1)
+    monkeypatch.setattr(archive, '_utc_now', lambda: now)
+    args = options(); args.universe = ['IRBO.US', 'ACTIVE.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-10-24')
+    assert universe == ['ACTIVE.US'] and items == [{'symbol': 'ACTIVE.US'}]
+    legacy = evidence['lifecycle_exclusions'][0]
+    assert legacy['symbol'] == 'IRBO.US' and legacy['successor_symbol'] == 'ARTY.US'
+    assert legacy['status'] == 'VERIFIED_LEGACY'
+    # Different venue and bare symbol are not aliases; expired proof is UNKNOWN.
+    args.universe = ['IRBO', 'IRBO.L']
+    assert archive._select_news_universe(args, None, '2026-10-24')[0] == args.universe
+    monkeypatch.setattr(archive, '_utc_now', lambda: now + timedelta(days=8))
+    args.universe = ['IRBO.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-11-01')
+    assert universe == items == [] and not evidence['discovery_complete']
+    assert evidence['lifecycle_exclusions'][0]['status'] == 'UNKNOWN'
 
 
 def options():
     return argparse.Namespace(universe=["ROG.SW", "ROP.SW", "GXTG.US", "GXDW.US"],
                               adaptive=False, max_symbols=60)
+
+
+@pytest.mark.parametrize('symbol,successor', [('JKE.US', 'ILCG.US'), ('JKJ.US', 'ISCB.US')])
+def test_morningstar_legacy_is_exact_and_does_not_acquire_successor(monkeypatch, symbol, successor):
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    now = max(datetime.fromisoformat(x['reviewed_at_utc']) for x in data['bindings']) + timedelta(minutes=1)
+    monkeypatch.setattr(archive, '_utc_now', lambda: now)
+    args = options(); args.universe = [symbol, 'ACTIVE.US']
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-10-25')
+    assert universe == ['ACTIVE.US'] and items == [{'symbol': 'ACTIVE.US'}]
+    record = evidence['lifecycle_exclusions'][0]
+    assert record['symbol'] == symbol and record['successor_symbol'] == successor
+    assert record['status'] == 'VERIFIED_LEGACY'
+    assert record['effective_time_precision'] == 'legacy_confirmed_by_date_bound_not_observed_event_time'
+    # No fuzzy alias across venues, and no historical approval from expired proof.
+    args.universe = [symbol[:-3], symbol[:-3] + '.L']
+    assert archive._select_news_universe(args, None, '2026-10-25')[0] == args.universe
+    monkeypatch.setattr(archive, '_utc_now', lambda: now + timedelta(days=8))
+    args.universe = [symbol]
+    universe, items, evidence = archive._select_news_universe(args, None, '2026-11-02')
+    assert universe == items == [] and not evidence['discovery_complete']
+    assert evidence['lifecycle_exclusions'][0]['status'] == 'UNKNOWN'
 
 
 def test_cli_legacy_is_excluded_without_remapping(monkeypatch):

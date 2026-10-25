@@ -378,7 +378,7 @@ test('B7 dt10BulkPaint_: token rows get bg/fg/bold, undefined fields reset, null
 
 /* ================================================================== B8 */
 test('B8 version lockstep, WHY block, oracle integrity, ES5 shape and ASCII of the change', () => {
-  assert(/^1\.13\.(1[1-9]|[2-9]\d)$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // merge note 2026-10-22 (#778): floor 1.13.11
+  assert(/^1\.(1[5-9]|[2-9]\d)\.\d+$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // merge note 2026-10-25 (#778): floor 1.15.0 (held seats are v1.15.1 over #838)
   assert.equal(OLD.DT10_VERSION, '1.13.10');
   assert(source.split('\n')[3].startsWith(' * Version: ' + NEW.DT10_VERSION + ' '));
   assert(source.includes(' * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n'));

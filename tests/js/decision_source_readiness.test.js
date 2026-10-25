@@ -137,7 +137,7 @@ test('dated scoped approval supersedes old properties; unscoped properties may o
 test('embedded dated scope counts/hashes exactly match the approved manifest without an embedded raw roster',()=> {
   const ctx=load({}, {nativeHashes:true});
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../../config/approved_universe_scope_v1.json'),'utf8'));
-  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 13, 11][k] ? 1 : x < [1, 13, 11][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.13.11 (merge note 2026-10-22, #778: held seats are v1.13.12 over #815): ' + ctx.DT10_VERSION);assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
+  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 15, 0][k] ? 1 : x < [1, 15, 0][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.15.0 (merge note 2026-10-25, #778: held seats are v1.15.1 over #838): ' + ctx.DT10_VERSION);assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
   assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.approved_on,manifest.approved_on);
   for(const page of SCOPE_PAGES) {
     const declared=ctx.DT10_SOURCE_APPROVED_SCOPE.pages[page],approved=manifest.pages[page];

@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.48.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.49.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1717,7 +1717,48 @@ from urllib.error import HTTPError, URLError
 # v6.48.0 (2026-10-24): outcome summaries use unique valid matured keys,
 # disclose directional versus price-return metrics and their denominators.
 # This is a read-only analytics correction; no historical row is changed.
-SCRIPT_VERSION = "6.48.0"
+# -----------------------------------------------------------------------------
+# v6.49.0 (2026-10-25) [BOARD-COVERAGE]: the live decision board joins the
+# daily forecast record. ENV-gated, DEFAULT OFF (TFB_TRACK_BOARD_SYMBOLS).
+# EVIDENCE (workbook read 2026-10-25 09:40 Riyadh, gviz): Signal_History
+#   2026-10-24 held 176 rows - 44 tagged Origin Tab 'Top_10_Investments'
+#   (2222.SR, 2283.SR, BNY.US, 9961.HK, BRK-B.US, 7030.SR, ... all WATCH;
+#   the rows the backend's legacy /sheet-rows page=Top_10_Investments build
+#   returns) and 132 'Decision_Coverage' (ledger lots: AER, CARE, CWBC, DDI,
+#   EPRT, HCI, KRP, NMM, PFS, RCI, VEL, ...). NONE of the names seated on the
+#   live Top_10_Investments board that day (PHP.L, FRST.US, ZTO.US, CRC.US,
+#   CBAN.US, ORC.US, AX.US, PGC.US, UMBF.US, FBK.US) had a snapshot; the
+#   last Signal_History rows for ZTO.US / PHP.L / FRST.US date from August.
+#   Performance_Log records are built from the same row set, so the
+#   forecast-vs-outcome evidence (Brier, hit rate, calibration) never sees the
+#   recommendations the Apps Script board (16_Decision_Top10, stability layer,
+#   TFB_SCORING_SETTLE=enforce) actually publishes. Strategy requirement #2
+#   (daily recording for Top_10 + holdings) is met for holdings only.
+# WHAT: when TFB_TRACK_BOARD_SYMBOLS is on, _augment_with_decision_symbols
+#   also reads the board's SELECTED grid (Top_10_Investments A12:B130, the
+#   same window v6.33.0's champion read uses) and adds every seated symbol -
+#   confirmed seats, FAST-TRACK and GRACE-held ghosts alike (a grace hold is
+#   still a published recommendation under watch; the v6.33.0 CHAMPION stamp
+#   keeps excluding ghosts, unchanged) - to the forced-coverage priority set.
+#   Board symbols are treated like pinned extras in _force_plan (never cut by
+#   TFB_TRACK_FORCE_MAX). Fetched rows whose symbol came only from the board
+#   carry origin 'Decision_Board' (visible in Signal_History 'Origin Tab');
+#   rows that are also ledger lots keep 'Decision_Coverage'. One INFO line
+#   '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' per run.
+#   Fail-open: an unreadable board adds nothing and logs one warning.
+# BYTE-IDENTICAL when off (default): no read, no log line, same rows.
+# ENV LANE: .github/workflows/track_performance.yml 'Run performance clock'
+#   AND daily_sync.yml's tracker step (ENV PARITY rule; both map
+#   ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}). Arm by setting the repo
+#   Variable to 1 after one observed run.
+# KNOWN LIMITS: rows come from TFB_TRACK_FORCE_ROWS_ENDPOINT with page
+#   TFB_TRACK_FORCE_ROWS_PAGE (Market_Leaders by default) - the engine's
+#   per-symbol verdict, not the board's sized ticket; stability state is not
+#   recorded (the board's own _Selection_Log keeps it).
+# ZERO functions removed. Additions: _board_symbols_enabled,
+#   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
+# ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
+SCRIPT_VERSION = "6.49.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2265,6 +2306,94 @@ def _force_plan(active: List[str], closed: List[str], extras: List[str],
 def _costbasis_tab() -> str:
     return (os.getenv("TFB_TRACK_COSTBASIS_TAB")
             or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
+
+
+# --- v6.49.0 [BOARD-COVERAGE]: the live decision board joins the record ----
+_BOARD_TAG = "[v6.49.0 BOARD-COVERAGE]"
+_BOARD_TAB_DEFAULT = "Top_10_Investments"
+_BOARD_RANGE = "A12:B130"      # the v6.33.0 champion-read window
+_BOARD_MAX = 15                # the board never seats more than 10 + grace
+
+
+def _board_symbols_enabled() -> bool:
+    """v6.49.0: DEFAULT OFF (house convention). TFB_TRACK_BOARD_SYMBOLS=1/on/
+    true adds the live board's seated symbols to the forced-coverage set."""
+    return _env_bool("TFB_TRACK_BOARD_SYMBOLS", False)
+
+
+def _board_tab() -> str:
+    return (os.getenv("TFB_TRACK_BOARD_TAB") or _BOARD_TAB_DEFAULT).strip() \
+        or _BOARD_TAB_DEFAULT
+
+
+def _board_symbols_from_values(vals: Any) -> Tuple[List[str], int]:
+    """v6.49.0 PURE: from the board's A12:B130 value matrix return
+    (seated_symbols_in_board_order, ghost_count). Same walk as
+    _read_board_selected_symbols (header row 'Rank'|'Symbol', stop at the
+    'ALL QUALIFIED' zone or the first fully blank row, cap _BOARD_MAX) but
+    GRACE-held ghosts (Rank cell '—') are KEPT - they are published
+    recommendations under watch and must be recorded daily. Shape-validated
+    (SG-1 rule), deduped. Never throws: junk -> ([], 0)."""
+    out: List[str] = []
+    seen: set = set()
+    ghosts = 0
+    in_table = False
+    try:
+        for row in (vals or []):
+            row = row or []
+            a = _safe_str(row[0] if len(row) > 0 else "").strip()
+            b = _safe_str(row[1] if len(row) > 1 else "").strip().upper()
+            if not in_table:
+                if a == "Rank" and b == "SYMBOL":
+                    in_table = True
+                continue
+            if a.upper().startswith("ALL QUALIFIED") or (not a and not b):
+                break
+            if not b or b == "SYMBOL" or not _valid_symbol_shape(b):
+                continue
+            if a == "—":
+                ghosts += 1
+            if b not in seen:
+                seen.add(b)
+                out.append(b)
+            if len(out) >= _BOARD_MAX:
+                break
+    except Exception:
+        return [], 0
+    return out, ghosts
+
+
+def _load_board_symbols(spreadsheet_id: str) -> Tuple[List[str], int]:
+    """v6.49.0: ONE read of the board's SELECTED window via the stores'
+    SA-credential pattern (mirrors _load_costbasis_symbols). Fail-open:
+    any problem -> ([], 0) with one debug line."""
+    if not spreadsheet_id or not GSPREAD_AVAILABLE or gspread is None:
+        return [], 0
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return [], 0
+    s = raw
+    if not s.startswith("{"):
+        try:
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return [], 0
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(spreadsheet_id).worksheet(_board_tab())
+        vals = ws.get_values(_BOARD_RANGE) or []
+        return _board_symbols_from_values(vals)
+    except Exception as e:
+        logger.debug("%s board read skipped: %s", _BOARD_TAG, e)
+        return [], 0
 
 
 # =============================================================================
@@ -9653,6 +9782,23 @@ class PerformanceTrackerApp:
         }
         priority: set = set(_force_extra_symbols())
         _by_status: Optional[Tuple[List[str], List[str]]] = None   # v6.40.0
+        # v6.49.0 [BOARD-COVERAGE]: the live board's seated symbols join the
+        # priority set as pinned extras. OFF (default) -> nothing below runs.
+        _board: List[str] = []
+        _board_ghosts = 0
+        if _board_symbols_enabled() and self.spreadsheet_id:
+            try:
+                _board, _board_ghosts = await asyncio.get_running_loop().run_in_executor(
+                    _get_executor(), _load_board_symbols, self.spreadsheet_id
+                )
+            except Exception as e:
+                logger.warning("%s board read failed: %s", _BOARD_TAG, e)
+                _board, _board_ghosts = [], 0
+            if _board:
+                priority |= set(_board)
+            else:
+                logger.warning("%s board read returned no seated symbol "
+                               "(unreadable or empty board) - nothing added", _BOARD_TAG)
         if self.spreadsheet_id:
             loop = asyncio.get_running_loop()
             try:
@@ -9689,8 +9835,10 @@ class PerformanceTrackerApp:
                 priority = {x for x in priority if _valid_symbol_shape(x)}
         missing = sorted(s for s in priority if s and s not in covered)
         if _by_status is not None:                        # v6.40.0 P-180
+            # v6.49.0: board symbols ride as extras -> never cut by the cap.
+            _extras = sorted(set(_force_extra_symbols()) | set(_board))
             _plan = _force_plan(_by_status[0], _by_status[1],
-                                sorted(_force_extra_symbols()), covered,
+                                _extras, covered,
                                 _force_max(), _force_scope())
             logger.info(
                 "[v6.40.0 COVERAGE] scope=%s active=%d closed=%d extras=%d "
@@ -9720,6 +9868,9 @@ class PerformanceTrackerApp:
                 "[v6.16.0 COVERAGE] full: %d priority symbol(s) already in the "
                 "%d prefetched row(s)", len(priority), len(rows),
             )
+            if _board:
+                logger.info("%s board=%d new=0 ghosts=%d (all prefetched)",
+                            _BOARD_TAG, len(_board), _board_ghosts)
             return rows
         if not self.backend.base_url:
             logger.warning(
@@ -9730,12 +9881,28 @@ class PerformanceTrackerApp:
         fetched, meta = await self.backend.get_rows_for_symbols(
             missing, _force_rows_page()
         )
+        # v6.49.0: a symbol that is on the board and NOT a ledger lot or a
+        # pinned extra is tagged 'Decision_Board'; everything else keeps
+        # the v6.16.0 'Decision_Coverage' tag byte for byte.
+        _board_only: set = set()
+        if _board:
+            _ledger: set = set(_force_extra_symbols())
+            if _by_status is not None:
+                _ledger |= set(_by_status[0]) | set(_by_status[1])
+            else:
+                _ledger |= {s for s in priority if s not in set(_board)}
+            _board_only = {s for s in _board if s not in _ledger}
         got: set = set()
+        _board_new = 0
         for r in fetched:
             sym = _safe_str(r.get("symbol")).strip().upper()
             if not sym or sym in covered:
                 continue
-            r.setdefault("origin", "Decision_Coverage")
+            if sym in _board_only:
+                r.setdefault("origin", "Decision_Board")
+                _board_new += 1
+            else:
+                r.setdefault("origin", "Decision_Coverage")
             rows.append(r)
             covered.add(sym)
             got.add(sym)
@@ -9745,6 +9912,9 @@ class PerformanceTrackerApp:
             "unresolved=%s", len(priority), len(rows) - len(got), len(missing),
             len(got), ",".join(unresolved) if unresolved else "-",
         )
+        if _board:
+            logger.info("%s board=%d new=%d ghosts=%d", _BOARD_TAG,
+                        len(_board), _board_new, _board_ghosts)
         return rows
 
     async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
