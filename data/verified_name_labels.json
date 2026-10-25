@@ -5375,6 +5375,84 @@
         }
       ],
       "review_receipt_sha256": "2da7ae810752ee30dc0cd24b9f909c4be066dba1a278bc0684369daff81f13d8"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "JKE.US",
+      "name": "iShares Morningstar Large-Cap Growth ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Historical caption only. Issuer supplement effective 2021-03-22; exchange circular handles ticker change on 2021-03-23. Successor requires independent acquisition; no quote, price-history or index continuity claim.",
+      "identifiers": {
+        "CIK": "0001100663",
+        "exact_exchange_code": "JKE",
+        "security_class": "historical ETF shares; no current tradability certification",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2021-03-23T00:00:00+00:00",
+        "lifecycle_time_precision": "legacy_confirmed_by_date_bound_not_observed_event_time",
+        "issuer_effective_date": "2021-03-22",
+        "exchange_handling_date": "2021-03-23",
+        "successor_symbol": "ILCG.US"
+      },
+      "reviewed_at_utc": "2026-10-25T05:07:11.692969+00:00",
+      "expires_at_utc": "2026-11-01T05:07:11.692969+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521087773/d114683d497.htm",
+          "sha256": "1b4d34c1ae16667ffb941e537535986c9ba4bcdc54ad4004ca1de85d3c091221",
+          "captured_at_utc": "2026-10-25T05:06:50.210432+00:00"
+        },
+        {
+          "url": "https://www.miaxglobal.com/sites/default/files/circular-files/MIAX_Pearl_Equities_PC_2021_2505.pdf",
+          "sha256": "26ee5ad0e0e14bfae7ca7938bf4a0a65cd049437f75203d5496fff5ae4d0944c",
+          "captured_at_utc": "2026-10-25T05:06:53.295083+00:00"
+        }
+      ],
+      "review_receipt_sha256": "c18a67e8f57da72dd181b860e159d8877e628aff1a916b7613ba0ffb43d4853e"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "JKJ.US",
+      "name": "iShares Morningstar Small-Cap ETF",
+      "native_metadata": {
+        "Asset Class": "Equity",
+        "Exchange": "NYSE/NASDAQ",
+        "Currency": "USD",
+        "Country": "USA"
+      },
+      "requires_quarantine": false,
+      "state": "Historical caption only. Issuer supplement effective 2021-03-22; exchange circular handles ticker change on 2021-03-23. Successor requires independent acquisition; no quote, price-history or index continuity claim.",
+      "identifiers": {
+        "CIK": "0001100663",
+        "exact_exchange_code": "JKJ",
+        "security_class": "historical ETF shares; no current tradability certification",
+        "news_lifecycle": "LEGACY_SYMBOL",
+        "lifecycle_effective_utc": "2021-03-23T00:00:00+00:00",
+        "lifecycle_time_precision": "legacy_confirmed_by_date_bound_not_observed_event_time",
+        "issuer_effective_date": "2021-03-22",
+        "exchange_handling_date": "2021-03-23",
+        "successor_symbol": "ISCB.US"
+      },
+      "reviewed_at_utc": "2026-10-25T05:07:11.692969+00:00",
+      "expires_at_utc": "2026-11-01T05:07:11.692969+00:00",
+      "sources": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1100663/000119312521087773/d114683d497.htm",
+          "sha256": "1b4d34c1ae16667ffb941e537535986c9ba4bcdc54ad4004ca1de85d3c091221",
+          "captured_at_utc": "2026-10-25T05:06:50.210432+00:00"
+        },
+        {
+          "url": "https://www.miaxglobal.com/sites/default/files/circular-files/MIAX_Pearl_Equities_PC_2021_2505.pdf",
+          "sha256": "26ee5ad0e0e14bfae7ca7938bf4a0a65cd049437f75203d5496fff5ae4d0944c",
+          "captured_at_utc": "2026-10-25T05:06:53.295083+00:00"
+        }
+      ],
+      "review_receipt_sha256": "b66d4f9f70ededd33801a533df422c50f73cdd353cc3174d1af0497e3e6e7ebb"
     }
   ]
 }

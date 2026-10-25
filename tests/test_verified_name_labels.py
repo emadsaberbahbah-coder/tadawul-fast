@@ -63,8 +63,8 @@ def registry_file(tmp_path, transform):
 
 
 def test_all_reviewed_bindings_change_only_name_without_promoting_any_guard():
-    assert len(BINDINGS) == 126
-    assert sum(x["page"] == "Mutual_Funds" for x in BINDINGS) == 42
+    assert len(BINDINGS) == 128
+    assert sum(x["page"] == "Mutual_Funds" for x in BINDINGS) == 44
     for item in BINDINGS:
         headers = get_sheet_headers(item["page"])
         row = row_for(item)
@@ -299,7 +299,7 @@ def test_committed_registry_is_only_public_authority_identity_data():
     raw = labels.REGISTRY_PATH.read_text()
     assert all(word not in raw for word in ("/workspace/", "account", "holdings", "broker", "api_token"))
     loaded, _ = labels._load_registry(labels.REGISTRY_PATH)
-    assert len(loaded) == 126
+    assert len(loaded) == 128
     assert all("eodhd.com" not in source["url"] for item in BINDINGS for source in item["sources"])
     nvei = binding("NVEI.TO")
     assert nvei["native_metadata"] == {"Asset Class": "Equity", "Exchange": "TSX", "Currency": "CAD", "Country": "Canada"}
