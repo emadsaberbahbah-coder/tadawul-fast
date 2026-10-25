@@ -1,5 +1,9 @@
 name: news-archive
 
+# v1.3.4 (2026-10-26): TFB_NEWS_SOURCE_READ_RETRIES=1 (45 s): run 40238751745
+# failed only because the Top_10_Investments identity read threw once; the
+# page was intact minutes later. A failed read now records its reason and is
+# re-read once after the other pages. Rollback: Variable ...RETRIES=0.
 # v1.3.3 (2026-10-25): TFB_NEWS_IDENTITY_GAP_POLICY=warn for this workflow.
 # Every run since 22 Oct 23:12Z was red with the single code
 # identity_coverage_incomplete while the batch was fetched 60/60 and the
@@ -136,6 +140,9 @@ jobs:
           TFB_NEWS_ARCHIVE_ADAPTIVE: ${{ github.event_name != 'workflow_dispatch' && 'true' || github.event.inputs.adaptive }}
           # v1.3.3: identity-gap policy (fail = v1.3.2 exit codes; warn = annotation, exit 0 when only the gap failed)
           TFB_NEWS_IDENTITY_GAP_POLICY: ${{ vars.TFB_NEWS_IDENTITY_GAP_POLICY || 'warn' }}
+          # v1.3.4: one bounded re-read of a page whose identity read failed (0 = v1.3.3)
+          TFB_NEWS_SOURCE_READ_RETRIES: ${{ vars.TFB_NEWS_SOURCE_READ_RETRIES || '1' }}
+          TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S: ${{ vars.TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S || '45' }}
         run: |
           set -euo pipefail
           CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --max-symbols 60 --evidence-json artifacts/news-acquisition.json --verbose)
