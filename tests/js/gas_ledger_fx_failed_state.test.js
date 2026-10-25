@@ -1,4 +1,4 @@
-/* 10_My_Portfolio v1.5.14 + 16_Decision_Top10 v1.13.10 correctness fixes.
+/* 10_My_Portfolio v1.5.15 (lockstep; v1.5.14 fixes) + 16_Decision_Top10 v1.13.10 correctness fixes.
  * Runs the REAL Apps Script sources in a vm with service stubs; all
  * holdings, lots and rates are synthetic.
  *   L*  _myPortfolioLedgerMap_ excludes Sold/Closed/Inactive lots exactly
@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.14');
+  assert.equal(ctx.PD_VERSION, '1.5.15');
   return copy(ctx._myPortfolioLedgerMap_());
 }
 
@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 13, 11][k] ? 1 : x < [1, 13, 11][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.13.11 (merge note 2026-10-22, #778: held seats are v1.13.12 over #815): ' + ctx.DT10_VERSION);
+  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 15, 0][k] ? 1 : x < [1, 15, 0][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.15.0 (merge note 2026-10-25, #778: held seats are v1.15.1 over #838): ' + ctx.DT10_VERSION);
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];

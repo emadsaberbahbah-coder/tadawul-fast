@@ -2,10 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.36 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22 and twice 2026-10-24; merged over main's 1.1.34) -- DT10 v1.13.12 HELD-SEAT HARNESS
+# VERSION 1.1.39 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24 and 2026-10-25; merged over main's 1.1.37) -- DT10 v1.15.1 HELD-SEAT HARNESS
 #
-# v1.1.36 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.34 first, 1.1.30-1.1.34 for #815, #816, #817, #829 and #819): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
-# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.13.12
+# v1.1.39 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.37 first, 1.1.30-1.1.37 for #815, #816, #817, #829, #819, #833, #837 and #838): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.15.1
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
 # 1.27.3 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
@@ -13,14 +13,56 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.35 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22 and twice 2026-10-24; merged over main's 1.1.34) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.38 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24 and 2026-10-25; merged over main's 1.1.37) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.35 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.34 for #802, #806, #809, #810, #815, #816, #817, #829 and #819): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.38 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.37 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837 and #838): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+#
+# VERSION 1.1.37 (2026-10-25) -- DT10 PENDING GRACE
+#
+# v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
+# Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
+# challenger with a live confirmation count that misses ONE criteria day
+# softly (audited row present, verdict not INVEST, no structural block, not a
+# hard-out verdict, inside 'T10: Stability Rank Buffer') keeps its count for
+# up to N consecutive such days instead of resetting to 0; absent/0 is the
+# v1.14.0 clock byte for byte; seating still needs a raw ticket) in the
+# blocking lean lane's native Apps Script step, next to
+# tests/test_dt10_confirm_basis.js. Offline; the REAL file in a vm context;
+# the v1.14.0 base is rebuilt from the delivered file by reversing the
+# enumerated v1.15.0 edits (SHA-256 pinned in tests/js/dt10_cash_utc_history.js)
+# for the golden negative and the kill identity. Version pins moved in the
+# sibling harnesses (confirm basis, input truth, source readiness, bulk
+# format, feed cohort binding, ledger FX). Nothing is removed and no existing
+# entry moves.
+#
+# VERSION 1.1.36 (2026-10-25) -- TRACKER BOARD COVERAGE
+#
+# v1.1.36: run tests/test_track_board_coverage.py (track_performance v6.49.0:
+# TFB_TRACK_BOARD_SYMBOLS, default off -- the live Top_10_Investments board's
+# seated symbols, GRACE ghosts included, join the forced-coverage set so
+# Signal_History / Performance_Log record the recommendations the Apps Script
+# board publishes; off is v6.48.0 byte for byte) in the blocking lean lane next
+# to tests/test_track_force_coverage_p180.py. Pure parser / knob / plan cases,
+# offline. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.35 (2026-10-24) -- DT10 CONFIRM BASIS
+#
+# v1.1.35: run tests/test_dt10_confirm_basis.js (16_Decision_Top10.gs v1.14.0:
+# Script Property TFB_T10_CONFIRM_BASIS, default 'qualified' -- a day-advance on
+# which a tracked symbol is absent from the backend's sized top-N but INVEST on
+# the audited grid inside 'T10: Stability Rank Buffer' counts as a confirmation
+# day instead of resetting the count; 'raw' is the v1.13.11 clock byte for
+# byte; seating still needs a raw ticket) in the blocking lean lane's native
+# Apps Script step, next to tests/test_dt10_calendar_completeness.js. Offline;
+# the REAL file in a vm context; the v1.13.11 base is rebuilt from the delivered
+# file by reversing the enumerated v1.14.0 edits (SHA-256 pinned in
+# tests/js/dt10_cash_utc_history.js) for the golden negative and the kill
+# identity. Nothing is removed and no existing entry moves.
 #
 # VERSION 1.1.34 (2026-10-24) -- F-7 v2b SETTLE SHADOW
 #
@@ -813,6 +855,7 @@ jobs:
             tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
+            tests/test_track_board_coverage.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_dedup_signal_p191.py \
             tests/test_track_flags_mapped.py \
@@ -874,6 +917,8 @@ jobs:
         run: |
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
+          node tests/test_dt10_confirm_basis.js
+          node tests/test_dt10_pending_grace.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_audit_keep.test.js

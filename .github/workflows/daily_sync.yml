@@ -1370,6 +1370,15 @@ jobs:
           # Historical target cells and S1 thresholds remain unchanged.
           # Rollback: set both workflow lines to observe; legacy stays diagnostic.
           TFB_PERF_TARGET_UNIT_SENTRY: "enforce"
+          # (2026-10-25) v6.49.0 [BOARD-COVERAGE]: the live Top_10_Investments
+          # board's seated symbols (incl. GRACE ghosts) join the forced-coverage
+          # set, so Signal_History / Performance_Log record the recommendations
+          # the Apps Script board actually publishes (24 Oct: none of the 10
+          # seated names had a snapshot). Default off = v6.48.0 byte-identical.
+          # Mirrored VERBATIM from track_performance.yml (ENV PARITY). Read-back:
+          # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
+          # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
+          TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
           # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
           # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
           # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
