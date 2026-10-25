@@ -630,3 +630,97 @@ def test_existing_valid_header_with_case_and_padding_needs_no_write(monkeypatch)
     assert store.is_available() and store.init_error_code is None
     assert created == [] and worksheet.updates == []
     assert worksheet.header == header
+
+
+# --- v1.3.4: a failed identity page read records its reason and may be re-read once ---
+
+class FlakyWorksheet(Worksheet):
+    """Fails the first `failures` get_values calls, then behaves normally."""
+    def __init__(self, values, *, failures=1, exc=None, **kwargs):
+        super().__init__(values, **kwargs)
+        self.failures, self.exc = failures, exc
+
+    def get_values(self, source_range, **kwargs):
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append((source_range, kwargs))
+            raise self.exc or RuntimeError("private failure details")
+        return super().get_values(source_range, **kwargs)
+
+
+def _no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(archive.time, "sleep", lambda s: slept.append(s))
+    return slept
+
+
+def test_failed_read_records_type_and_known_reason_only(monkeypatch):
+    monkeypatch.delenv("TFB_NEWS_SOURCE_READ_RETRIES", raising=False)
+    store, pages = store_with_sources()
+    pages["Top_10_Investments"].fail = True
+    result = store.load_news_source_context()
+    entry = next(s for s in result["sources"] if s["page"] == "Top_10_Investments")
+    assert entry["status"] == "UNAVAILABLE" and entry["error_code"] == "identity_source_read_failed"
+    assert entry["error_type"] == "RuntimeError" and entry["error_reason"] == "unspecified"
+    assert "attempts" not in entry and not result["source_read_complete"]
+    assert "private failure" not in json.dumps(result)
+    # one of the module's own reason codes is published verbatim
+    pages["Top_10_Investments"].fail = False
+    pages["Top_10_Investments"].values[17] = ["Ticker", "Symbol", "Name"]
+    entry = next(s for s in store.load_news_source_context()["sources"] if s["page"] == "Top_10_Investments")
+    assert entry["error_reason"] == "research_identity_header_unknown"
+
+
+def test_retry_off_by_default_is_byte_identical_to_a_single_attempt(monkeypatch):
+    monkeypatch.delenv("TFB_NEWS_SOURCE_READ_RETRIES", raising=False)
+    slept = _no_sleep(monkeypatch)
+    store, pages = store_with_sources()
+    pages["Top_10_Investments"] = FlakyWorksheet(pages["Top_10_Investments"].values, failures=1)
+    result = store.load_news_source_context()
+    entry = next(s for s in result["sources"] if s["page"] == "Top_10_Investments")
+    assert entry["status"] == "UNAVAILABLE" and len(pages["Top_10_Investments"].calls) == 1
+    assert slept == [] and not result["source_read_complete"]
+
+
+def test_one_retry_recovers_a_transient_read_after_the_other_pages(monkeypatch):
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRIES", "1")
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S", "45")
+    slept = _no_sleep(monkeypatch)
+    store, pages = store_with_sources()
+    pages["Top_10_Investments"] = FlakyWorksheet(pages["Top_10_Investments"].values, failures=1)
+    result = store.load_news_source_context()
+    entry = next(s for s in result["sources"] if s["page"] == "Top_10_Investments")
+    assert entry["status"] == "OK" and entry["attempts"] == 2
+    assert entry["failed_attempts"][0]["error_type"] == "RuntimeError"
+    assert entry["failed_attempts"][0]["error_reason"] == "unspecified"
+    assert slept == [45.0] and result["source_read_complete"] and result["complete"]
+    assert result["identities"]["P1.US"] == "Pool Company 1"
+    assert "private failure" not in json.dumps(result)
+    # the retried page is read last: the other pages' read order is untouched
+    order = [s["page"] for s in result["sources"]]
+    assert order.index("Top_10_Investments") == len(order) - 1
+
+
+def test_retry_bound_keeps_a_persistent_failure_unavailable(monkeypatch):
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRIES", "1")
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S", "0")
+    slept = _no_sleep(monkeypatch)
+    store, pages = store_with_sources()
+    pages["Global_Markets"] = FlakyWorksheet(pages["Global_Markets"].values, failures=5)
+    result = store.load_news_source_context()
+    entry = next(s for s in result["sources"] if s["page"] == "Global_Markets")
+    assert entry["status"] == "UNAVAILABLE" and entry["attempts"] == 2
+    assert len(entry["failed_attempts"]) == 1 and len(pages["Global_Markets"].calls) == 2
+    assert slept == [] and not result["source_read_complete"]
+
+
+@pytest.mark.parametrize("raw,expected", [("", 0), ("0", 0), ("1", 1), ("3", 3), ("9", 3), ("-2", 0), ("x", 0), ("1.5", 0)])
+def test_retry_env_is_bounded(monkeypatch, raw, expected):
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRIES", raw)
+    assert archive._source_read_retries() == expected
+
+
+@pytest.mark.parametrize("raw,expected", [("", 45.0), ("0", 0.0), ("30", 30.0), ("999", 180.0), ("-1", 0.0), ("x", 45.0)])
+def test_retry_sleep_env_is_bounded(monkeypatch, raw, expected):
+    monkeypatch.setenv("TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S", raw)
+    assert archive._source_read_retry_sleep() == expected

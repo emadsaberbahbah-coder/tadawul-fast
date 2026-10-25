@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.3)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.4)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -44,6 +44,26 @@
 #     it is not quote freshness, article recency or investment eligibility.
 #   - news_intelligence uses Google-News RSS and configured feeds: no provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
+# =============================================================================
+# v1.3.4 (2026-10-26) -- SOURCE READ: RECORD THE REASON, RETRY ONCE (ENV-GATED)
+# WHY: scheduled run 40238751745 (25 Oct 22:00Z) exited 1 with
+#   identity_source_read_incomplete: the Top_10_Investments identity read was
+#   UNAVAILABLE / identity_source_read_failed while the six other pages read
+#   OK and the batch was fetched 60/60 and archived. The page was intact a
+#   few minutes later (Rank/Symbol/Name header at row 18). The exception was
+#   swallowed, so the evidence could not say whether it was a Sheets API
+#   error, a header not found during a cockpit render, or something else,
+#   and a one-off read failure failed the whole discovery with no second try.
+# WHAT: (a) a failed page read now records error_type and error_reason (one
+#   of this module's own reason codes, else 'unspecified'; never the raw
+#   message) on that page's evidence entry; (b) TFB_NEWS_SOURCE_READ_RETRIES = 0 (default,
+#   byte-identical to v1.3.3) | 1..3: a page whose read failed is re-read up
+#   to N more times after TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S seconds (default
+#   45, 0..180), after the other pages; the entry records attempts. A page
+#   that still fails stays UNAVAILABLE and discovery stays incomplete. The
+#   scheduled workflow sets retries=1 (news_archive.yml v1.3.4).
+# ROLLBACK: unset the ENV (retries 0) -- v1.3.3 behaviour; error fields
+#   appear only on a failed read.
 # =============================================================================
 # v1.3.3 (2026-10-25) -- IDENTITY GAP POLICY (ENV-GATED, DEFAULT fail = v1.3.2)
 # WHY: every scheduled and push run since v1.3.0 landed (22 Oct 23:12Z) ended
@@ -115,7 +135,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.3.3"
+SCRIPT_VERSION = "1.3.4"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -287,6 +307,38 @@ class _Backoff:
                 time.sleep(min(self.cap, self.base * (2 ** i)) * (0.5 + random.random() / 2.0))
         if last:
             raise last
+
+
+# v1.3.4: bounded re-read of a failed identity source page.
+def _source_read_retries() -> int:
+    try:
+        n = int((os.getenv("TFB_NEWS_SOURCE_READ_RETRIES") or "0").strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(3, n))
+
+
+def _source_read_retry_sleep() -> float:
+    try:
+        v = float((os.getenv("TFB_NEWS_SOURCE_READ_RETRY_SLEEP_S") or "45").strip() or 45)
+    except (TypeError, ValueError):
+        return 45.0
+    return max(0.0, min(180.0, v))
+
+
+_KNOWN_READ_REASONS = frozenset({"source_unavailable", "status_header_unknown", "status_page_ambiguous",
+                                 "research_identity_header_unknown"})
+
+
+def _safe_error_fields(exc: BaseException) -> Dict[str, str]:
+    """Exception type plus one of this module's own reason codes; never the
+    raw message (provider/API text is not published). Never raises."""
+    try:
+        reason = str(exc).strip()
+    except Exception:
+        reason = ""
+    return {"error_type": type(exc).__name__,
+            "error_reason": reason if reason in _KNOWN_READ_REASONS else "unspecified"}
 
 
 # -----------------------------------------------------------------------------
@@ -466,9 +518,22 @@ class NewsArchiveStore:
         except Exception:
             before = {}
             complete = False
-        for page in pages:
+        # v1.3.4: a failed page read may be re-queued (bounded) after the others.
+        retries_allowed = _source_read_retries()
+        retry_sleep = _source_read_retry_sleep()
+        queue: List[str] = list(pages)
+        attempts: Dict[str, int] = {}
+        failed_attempts: Dict[str, List[Dict[str, Any]]] = {}
+        while queue:
+            page = queue.pop(0)
+            attempts[page] = attempts.get(page, 0) + 1
+            if attempts[page] > 1 and retry_sleep > 0:
+                time.sleep(retry_sleep)
             started = _utc_now().isoformat()
             entry: Dict[str, Any] = {"page": page, "read_started_utc": started}
+            if attempts[page] > 1:
+                entry["attempts"] = attempts[page]
+                entry["failed_attempts"] = list(failed_attempts.get(page, []))
             try:
                 if self.sheet is None:
                     raise RuntimeError("source_unavailable")
@@ -540,8 +605,17 @@ class NewsArchiveStore:
                 else:
                     entry.pop("unknown_identity_symbols", None)
                     entry.pop("lifecycle_exclusions", None)
-            except Exception:
+            except Exception as exc:
                 entry.update({"status": "UNAVAILABLE", "error_code": "identity_source_read_failed"})
+                entry.update(_safe_error_fields(exc))
+                if attempts[page] <= retries_allowed:
+                    # v1.3.4: one more bounded try, queued after the other
+                    # pages; this attempt is kept on the final entry.
+                    failed_attempts.setdefault(page, []).append(
+                        {"read_started_utc": started, "error_type": entry["error_type"],
+                         "error_reason": entry["error_reason"]})
+                    queue.append(page)
+                    continue
                 complete = False
             entry["read_finished_utc"] = _utc_now().isoformat()
             observed[page] = entry
