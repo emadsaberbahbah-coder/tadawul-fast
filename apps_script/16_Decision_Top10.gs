@@ -1,11 +1,50 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT
+ * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails
+ * ONE criteria day (still on the audited grid, no structural block, not a
+ * hard-out verdict, inside the rank buffer, but DO_NOT_INVEST because a
+ * floor was missed) had its count reset to 0 by dt10StabCore_'s
+ * `else { st.ci = 0; ... }` -- the same branch a hard exit uses. Live case,
+ * 25 Oct 08:10 board (first run on the 2026-10-25 epoch): PHP.L sat at 1/3
+ * on 24 Oct with reliability 71.5 / DQ 100; on 25 Oct -- a weekend, no LSE
+ * session, price unchanged at 92.05 -- its Expected ROI 3M read 8.13% (<12%)
+ * and the name fell to GRACE with its count gone. Members already enjoy this
+ * tolerance ('plain DO_NOT_INVEST criteria-misses ARE grace-holdable', exit
+ * clock, v1.2.0); challengers did not. The owner asked (24 Oct 19:32) for a
+ * rule that does not restart a positive name's count on one such day.
+ * WHAT: Script Property TFB_T10_PENDING_GRACE_DAYS (integer 0..5; default
+ * absent/0/junk = v1.14.0 clocks byte for byte). When > 0, on a day-advance
+ * a NON-member with ci > 0 that is absent from raw and not qualifiedWithin
+ * but is a SOFT MISS (dt10StabSoftMiss_: audited row present, verdict not
+ * INVEST, structural_block !== true, not hardOut, global rank inside the
+ * rank buffer) keeps ci and increments st.cp (consecutive pending-grace
+ * days); the day's score point is still recorded. Once cp would exceed the
+ * grace, the v1.14.0 reset applies (ci 0, cp cleared). Any raw or qualified
+ * day clears cp. Members, hard exits, outage pauses, seating (still needs a
+ * raw ticket), fast-track, displacement, capacity and sizing are unchanged.
+ * SECTION 8 KEPT: no gate, score or verdict is recomputed -- the soft miss is
+ * read from the backend's own audited row (verdict + structural_block + rank).
+ * SURFACE: status note gains ', pgrace=<n>' and ', pheld <k> SYM(ci/n) ...'
+ * (up to 3) only when the property is armed; audit gains `pending_held`
+ * only when armed; the state blob writes `cp` only while > 0 (a blob that
+ * never paused is byte-identical). dt10SelfTest gains 'pending grace core'.
+ * Functions added (0 removed): dt10StabSoftMiss_, dt10StabPendingGrace_;
+ * var added: DT10_T10_PENDING_GRACE_PROP.
+ * Harness: tests/test_dt10_pending_grace.js (REAL file; golden negative on
+ * the v1.14.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent/0; ES5/ASCII lint; inventory).
+ * Rollback: delete the property (no re-paste) or re-paste v1.14.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep. Arming is an owner step AFTER the first funded ticket of
+ * 26 Oct 2026 (the Monday path runs on v1.14.0 clocks).
  *
  * v1.14.0 (2026-10-24) [CONFIRM-BASIS] -- QUALIFIED DAYS COUNT TOWARD CONFIRMATION
  * WHY (owner, 24 Oct 2026): a stock that qualifies on day 1 and day 2 is
@@ -1863,7 +1902,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.14.0';
+var DT10_VERSION = '1.15.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2730,6 +2769,11 @@ var DT10_STAB_PRUNE_DAYS = 14;    // drop non-member entries unseen this long
 // v1.14.0 [CONFIRM-BASIS]: which days count toward entry confirmation --
 // see the v1.14.0 header block. 'qualified' (default) | 'raw' (v1.13.11).
 var DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';
+// v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances a NON-member
+// challenger with ci > 0 may absorb without its count resetting -- see the
+// v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.
+var DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';
+var DT10_T10_PENDING_GRACE_MAX = 5;
 // v1.11.10 [P-168]: outage pause -- see the v1.11.10 header block.
 var DT10_P168_MAX_PAUSE_DAYS = 5;         // consecutive paused day-advances
 var DT10_P168_OUTAGE_RE = /fetch_failed/i; // engine tag family on 'Warnings'
@@ -3507,6 +3551,11 @@ function dt10StabParseState_(raw) {
       // stays byte-identical to v1.11.9.
       var vop = Math.max(0, parseInt(v.op, 10) || 0);
       if (vop > 0) out.symbols[sym].op = vop;
+      // v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances absorbed
+      // by a pending challenger. Absent in older blobs => 0; written only
+      // when > 0 so a blob that never paused stays byte-identical to v1.14.0.
+      var vcp = Math.max(0, parseInt(v.cp, 10) || 0);
+      if (vcp > 0) out.symbols[sym].cp = vcp;
     }
   }
   return out;
@@ -3653,6 +3702,25 @@ function dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut) {
   var r = globalRank ? Number(globalRank[sym]) : 0;
   return r > 0 && r <= buf;
 }
+/** v1.15.0 [PENDING-GRACE] PURE: is today's miss for `sym` a SOFT miss?
+ * True when the deduped audited grid (candBySym) has a row for it whose
+ * verdict is NOT INVEST (a criteria miss the backend itself reports),
+ * structural_block is not true, hardOut(sym) is false and its all-pool rank
+ * is inside the rank buffer. Never recomputes a gate, score or verdict
+ * (section 8): the row, its verdict and its rank are the backend's own.
+ * A row absent from the grid, a structural block, a hard-out verdict or a
+ * rank outside the buffer is a HARD miss (v1.14.0 reset). Never throws. */
+function dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut) {
+  var c = candBySym ? candBySym[sym] : null;
+  if (!c || typeof c !== 'object') return false;
+  if (String(c.verdict || '').toUpperCase() === 'INVEST') return false;
+  if (c.structural_block === true) return false;
+  if (typeof hardOut === 'function' && hardOut(sym)) return false;
+  var buf = knobs ? Number(knobs.rank_buffer) : 0;
+  if (!(buf > 0)) return false;
+  var r = globalRank ? Number(globalRank[sym]) : 0;
+  return r > 0 && r <= buf;
+}
 /**
  * Membership-hysteresis core. Inputs:
  *   rawTickets  payload.selected (backend's memoryless answer, best-first)
@@ -3754,6 +3822,15 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   function qualifiedWithin(sym) {
     return dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut);
   }
+  // v1.15.0 [PENDING-GRACE]: the grace rides as a plain knob (service read in
+  // dt10ApplyStability_); absent/0 (older callers, the self-test replays,
+  // the property unset) is the v1.14.0 clock byte for byte.
+  var pgDays = Math.max(0, Math.min(DT10_T10_PENDING_GRACE_MAX,
+                                    parseInt(knobs.pending_grace, 10) || 0));
+  var pendingHeld = [];
+  function softMiss(sym) {
+    return dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut);
+  }
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -3800,6 +3877,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
         if (rawSet[sym]) {
           st.ci = (st.ci || 0) + 1;
           st.co = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
         } else if (qualifiedBasis && qualifiedWithin(sym)) {
           // v1.14.0 [CONFIRM-BASIS]: absent from the sized top-N but INVEST
           // on the audited grid inside the rank buffer -- the day counts
@@ -3807,8 +3885,21 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
           // below is recorded as for raw). The 'raw' basis never gets here.
           st.ci = (st.ci || 0) + 1;
           st.co = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
+        } else if (pgDays > 0 && !st.member && (st.ci || 0) > 0 &&
+                   (st.cp || 0) < pgDays && softMiss(sym)) {
+          // v1.15.0 [PENDING-GRACE]: a NON-member challenger with a live count
+          // misses on a SOFT criteria day (audited row present, not INVEST, no
+          // structural block, not hard-out, inside the rank buffer): the count
+          // PAUSES (ci kept) and the grace counter advances; the score point
+          // below is still recorded. Members never enter this branch (their
+          // exit clock already pauses inside the buffer); a hard miss, or a
+          // grace already spent, falls through to the v1.14.0 reset.
+          st.cp = (st.cp || 0) + 1;
+          pendingHeld.push(sym);
         } else {
           st.ci = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
           if (st.member) {
             var r = globalRank[sym];
             var within = knobs.rank_buffer > 0 && r && r <= knobs.rank_buffer;
@@ -4118,7 +4209,28 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       note += ', near ' + nearSyms.length + ' ' + nqParts.join(' ');
     }
   }
-  return {
+  // v1.15.0 [PENDING-GRACE]: read-back tokens only while the grace is armed
+  // (0 leaves the note and the audit byte-identical to v1.14.0): the armed
+  // grace and the challengers whose count was paused on this day-advance.
+  if (pgDays > 0) {
+    pendingHeld.sort(function (a, b) {
+      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);
+      if (dci) return dci;
+      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);
+      if (drk) return drk;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+    note += ', pgrace=' + pgDays;
+    if (pendingHeld.length) {
+      var phParts = [];
+      for (var phi = 0; phi < pendingHeld.length && phParts.length < 3; phi++) {
+        phParts.push(pendingHeld[phi] + '(' + (symbols[pendingHeld[phi]].ci || 0) +
+                     '/' + knobs.confirm_days + ')');
+      }
+      note += ', pheld ' + pendingHeld.length + ' ' + phParts.join(' ');
+    }
+  }
+  var coreOut = {
     tickets: tickets,
     state: state,
     audit: { entered: entered, fast_tracked: fastTracked,
@@ -4132,6 +4244,8 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
              state_pruned: pruned },
     note: note
   };
+  if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0
+  return coreOut;
 }
 // ---------------------------------------------------------------------------
 // Payload → render-row mappers (pure; verified by node exec-test)
@@ -4277,6 +4391,27 @@ function dt10StabConfirmBasis_() {
     return v === 'raw' ? 'raw' : 'qualified';
   } catch (eCb) {}
   return 'qualified';
+}
+
+/**
+ * v1.15.0 [PENDING-GRACE]: pending grace days -- Script Property
+ * TFB_T10_PENDING_GRACE_DAYS (DT10_T10_PENDING_GRACE_PROP). An integer
+ * 1..DT10_T10_PENDING_GRACE_MAX arms the grace (larger values clamp to the
+ * max); absent, blank, 0, negative, junk or a PropertiesService fault read
+ * as 0 = the v1.14.0 clocks. Mirrors dt10StabConfirmBasis_ (service read
+ * outside the pure core); never throws.
+ */
+function dt10StabPendingGrace_() {
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_PENDING_GRACE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n > 0)) return 0;
+    return Math.min(DT10_T10_PENDING_GRACE_MAX, n);
+  } catch (ePg) {}
+  return 0;
 }
 
 /** v1.11.11 [P-144] PURE: UTC date key ('yyyy-MM-dd') of a feed-stamp
@@ -6333,6 +6468,11 @@ function dt10ApplyStability_(payload, panel, outage) {
   // v1.14.0 [CONFIRM-BASIS]: same pattern -- one service read here, the
   // core consumes the basis as a plain knob ('qualified' default | 'raw').
   knobs.confirm_basis = dt10StabConfirmBasis_();
+  // v1.15.0 [PENDING-GRACE]: same pattern -- one service read here; the knob
+  // is set ONLY when armed (> 0) so an unarmed run publishes the v1.14.0
+  // knobs object byte for byte.
+  var pgRead = dt10StabPendingGrace_();
+  if (pgRead > 0) knobs.pending_grace = pgRead;
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -8789,6 +8929,73 @@ function dt10SelfTest() {
        ? 'ok (raw = v1.13.11 clocks; qualified: day-3 rank 12 -> 3/3, day-4 NEW 3/3 sized, ' +
          'WATCH -> 0, rank 16 -> 0, rank 15 -> 3, buffer 0 = legacy, GRACE member co 0)'
        : 'FAIL [' + cbQ[2].note + ' | ' + cbQ[3].note + ' | ' + cbR[3].note + ']'));
+  /* v1.15.0 [PENDING-GRACE]: property line (one read) + pure battery on the
+     same board. CHAL confirmed days 1-2 (raw), day 3 a SOFT miss (absent from
+     raw, audited row verdict WATCH at rank 12, no block), day 4 raw again.
+     grace 1: day 3 pauses (ci 2, cp 1, 'pgrace=1', 'pheld 1 CHAL.US(2/3)'),
+     day 4 NEW 3/3 sized. grace absent/0: identical to the v1.14.0 cbW replay.
+     Two consecutive soft misses with grace 1: day 4 resets. Hard miss
+     (structural_block) with grace 1: reset. Member B untouched either way. */
+  report.push('pending grace (TFB_T10_PENDING_GRACE_DAYS): ' + dt10StabPendingGrace_() +
+              ' (0 = v1.14.0 clocks; 1..' + DT10_T10_PENDING_GRACE_MAX + ' arms)');
+  function pgKnobs(pg) {
+    var k = cbKnobs('qualified');
+    if (pg !== undefined) k.pending_grace = pg;
+    return k;
+  }
+  function pgRun(knobs, grids, raw) {
+    var st = dt10StabParseState_(cbSeed);
+    var outs = [];
+    for (var pd = 0; pd < 4; pd++) {
+      var o = dt10StabCore_(raw[pd], grids[pd], st, knobs, 2, cbDays[pd]);
+      st = dt10StabParseState_(o.state);
+      outs.push(o);
+    }
+    return outs;
+  }
+  var pgG = cbGrid(86);
+  var pgSoft = cbGrid(86, 'WATCH');
+  var pgBlk = cbGrid(86);
+  pgBlk[pgBlk.length - 1].structural_block = true;
+  var pgRaw2 = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+                [cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+                [cbTk('A.US', 95), cbTk('NEWC.US', 97)],
+                [cbTk('A.US', 95), cbTk('NEWC.US', 97)]];
+  var pg1 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pg0 = pgRun(pgKnobs(0), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pgA = pgRun(pgKnobs(undefined), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pg1x2 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgSoft], pgRaw2);
+  var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);
+  var pgChal4 = cbTk4(pg1, 'CHAL.US');
+  var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);
+  report.push('pending grace core: ' +
+      ((JSON.stringify(pg0) === JSON.stringify(cbW) &&
+        JSON.stringify(pgA) === JSON.stringify(cbW) &&
+        pg1[1].state.symbols['CHAL.US'].ci === 2 &&
+        pg1[2].state.symbols['CHAL.US'].ci === 2 &&
+        pg1[2].state.symbols['CHAL.US'].cp === 1 &&
+        pg1[2].state.symbols['CHAL.US'].member === false &&
+        pgBlob2.indexOf('"cp":1') > 0 &&
+        pg1[2].note.indexOf('pgrace=1') > 0 &&
+        pg1[2].note.indexOf('pheld 1 CHAL.US(2/3)') > 0 &&
+        pg1[2].audit.pending_held.length === 1 &&
+        pg1[3].state.symbols['CHAL.US'].ci === 3 &&
+        pg1[3].state.symbols['CHAL.US'].cp === undefined &&
+        pg1[3].note.indexOf('pheld') < 0 &&
+        pgChal4 !== null && pgChal4._stab_status === 'NEW (confirmed 3/3)' &&
+        pgChal4.suggested_sar === 5000 &&
+        pg1x2[2].state.symbols['CHAL.US'].ci === 2 &&
+        pg1x2[3].state.symbols['CHAL.US'].ci === 0 &&
+        pg1x2[3].state.symbols['CHAL.US'].cp === undefined &&
+        pg1h[2].state.symbols['CHAL.US'].ci === 0 &&
+        pg1h[2].note.indexOf('pheld') < 0 &&
+        JSON.stringify(pg1[2].state.symbols['B.US']) ===
+            JSON.stringify(cbW[2].state.symbols['B.US']) &&
+        cbW[2].audit.pending_held === undefined &&
+        cbW[2].note.indexOf('pgrace') < 0)
+       ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +
+         'two soft misses -> reset, structural block -> reset, member untouched)'
+       : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

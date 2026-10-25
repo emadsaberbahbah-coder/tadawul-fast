@@ -2,6 +2,24 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.37 (2026-10-25) -- DT10 PENDING GRACE
+#
+# v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
+# Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
+# challenger with a live confirmation count that misses ONE criteria day
+# softly (audited row present, verdict not INVEST, no structural block, not a
+# hard-out verdict, inside 'T10: Stability Rank Buffer') keeps its count for
+# up to N consecutive such days instead of resetting to 0; absent/0 is the
+# v1.14.0 clock byte for byte; seating still needs a raw ticket) in the
+# blocking lean lane's native Apps Script step, next to
+# tests/test_dt10_confirm_basis.js. Offline; the REAL file in a vm context;
+# the v1.14.0 base is rebuilt from the delivered file by reversing the
+# enumerated v1.15.0 edits (SHA-256 pinned in tests/js/dt10_cash_utc_history.js)
+# for the golden negative and the kill identity. Version pins moved in the
+# sibling harnesses (confirm basis, input truth, source readiness, bulk
+# format, feed cohort binding, ledger FX). Nothing is removed and no existing
+# entry moves.
+#
 # VERSION 1.1.36 (2026-10-25) -- TRACKER BOARD COVERAGE
 #
 # v1.1.36: run tests/test_track_board_coverage.py (track_performance v6.49.0:
@@ -879,6 +897,7 @@ jobs:
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
           node tests/test_dt10_confirm_basis.js
+          node tests/test_dt10_pending_grace.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js

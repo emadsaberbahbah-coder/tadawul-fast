@@ -228,9 +228,10 @@ function battery() {
   test('T0 base oracle is the reviewed v1.13.11 file (SHA-256 pinned); delivered file compiles', function () {
     eq(sha256(baseSource), history.V11311_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.13.11', 'base version');
-    eq(N.DT10_VERSION, '1.14.0', 'delivered version');
-    assert(/^ \* Version: 1\.14\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    assert(newSource.indexOf("var DT10_VERSION = '1.14.0';") > 0, 'DT10_VERSION literal');
+    // 2026-10-25: the delivered file is v1.15.0 (pending grace stacked on this change); pins moved
+    eq(N.DT10_VERSION, '1.15.0', 'delivered version');
+    assert(/^ \* Version: 1\.15\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
+    assert(newSource.indexOf("var DT10_VERSION = '1.15.0';") > 0, 'DT10_VERSION literal');
   });
 
   test('T1 GOLDEN NEGATIVE (v1.13.11): displaced challenger resets to 0 on day 3; pending 1/3, unseated on day 4; displaced FAST-TRACK seat restarts', function () {
@@ -341,7 +342,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('confirm basis core: ok') > 0, 'battery line');
     assert(rep.indexOf('confirm basis (TFB_T10_CONFIRM_BASIS): qualified') > 0, 'basis line default');
-    assert(rep.indexOf('[DT10 v1.14.0] self-test') === 0, 'version line');
+    assert(rep.indexOf('[DT10 v1.15.0] self-test') === 0, 'version line');
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     var baseLines = repB.split('\n'), newLines = rep.split('\n');
     var missing = baseLines.filter(function (l) { return l.indexOf('[DT10 v1.13.11]') !== 0 && newLines.indexOf(l) < 0; });
@@ -362,13 +363,13 @@ function battery() {
       assert(!/\b(let|const|class)\s|=>|`/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l);
       if (!/^[\x09\x20-\x7e]*$/.test(l)) {
         // the only non-ASCII added line is the version header rewrite (pre-existing em dash)
-        assert(baseLines[l.replace('1.14.0', '1.13.11')] === true, 'non-ASCII added line: ' + l);
+        assert(baseLines[l.replace('1.15.0', '1.13.11')] === true, 'non-ASCII added line: ' + l);
       }
     });
     function nonAscii(s) { var m = {}; for (var j = 0; j < s.length; j++) { var c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
     deq(nonAscii(newSource), nonAscii(baseSource), 'non-ASCII code point multiset');
     assert(newSource.indexOf('\r') < 0, 'LF only');
-    assert(!/[‘’“”]/.test(newSource.slice(0, newSource.indexOf(' * v1.13.11 (2026-10-22)'))), 'no smart quotes in the new WHY');
+    assert(!/[\u2018\u2019\u201c\u201d]/.test(newSource.slice(0, newSource.indexOf(' * v1.13.11 (2026-10-22)'))), 'no smart quotes in the new WHY');
     var why = newSource.slice(newSource.indexOf(' * v1.14.0 (2026-10-24)'), newSource.indexOf(' * v1.13.11 (2026-10-22)'));
     assert(why.length > 1000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block present and ASCII');
     for (var n2 = 0; n2 < 2; n2++) {
@@ -388,11 +389,12 @@ function battery() {
     var removed = Object.keys(fb).filter(function (k) { return !fn[k]; });
     deq(removed, [], 'functions removed');
     var tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(newSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
-    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10StabConfirmBasis_', 'dt10StabQualifiedWithin_'], 'top-level functions added');
-    eq(Object.keys(tb).length, 195, 'base top-level census'); eq(Object.keys(tn).length, 197, 'new top-level census');
+    // 2026-10-25: v1.15.0 (pending grace) adds dt10StabSoftMiss_ / dt10StabPendingGrace_ on top of this change
+    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10StabConfirmBasis_', 'dt10StabPendingGrace_', 'dt10StabQualifiedWithin_', 'dt10StabSoftMiss_'], 'top-level functions added');
+    eq(Object.keys(tb).length, 195, 'base top-level census'); eq(Object.keys(tn).length, 199, 'new top-level census');
     var vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(function (k) { return !vn[k]; }), [], 'vars removed');
-    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }), ['DT10_T10_CONFIRM_BASIS_PROP'], 'vars added');
+    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_T10_CONFIRM_BASIS_PROP', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP'], 'vars added');
     // every nested function of dt10StabCore_ is kept, and the new closure is present
     var core = newSource.slice(newSource.indexOf('function dt10StabCore_('), newSource.indexOf('\n// ----', newSource.indexOf('function dt10StabCore_(')));
     ['outageOf', 'hardOut', 'scoreOf', 'smoothed', 'boardSort', 'inFinal', 'inList', 'qualifiedWithin'].forEach(function (f) {
