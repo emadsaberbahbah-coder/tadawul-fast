@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.2)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.3.3)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -45,6 +45,30 @@
 #   - news_intelligence uses Google-News RSS and configured feeds: no provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
 # =============================================================================
+# v1.3.3 (2026-10-25) -- IDENTITY GAP POLICY (ENV-GATED, DEFAULT fail = v1.3.2)
+# WHY: every scheduled and push run since v1.3.0 landed (22 Oct 23:12Z) ended
+#   red with the single failure code identity_coverage_incomplete while the
+#   selected batch was fetched 60/60 and the archive write was APPEND_ACCEPTED
+#   (runs 39870284821 .. 40165083700, nine in a row). identity_coverage_complete
+#   requires ZERO rows without a Name across six workbook pages, but the pages'
+#   own publication contract is the 99% Name floor of the coverage audit (24
+#   blank captions allowed on Mutual_Funds alone) and the Top-10 board keeps
+#   ghost seats whose Name is a dash. The 100% requirement can therefore never
+#   be met, so the workflow is red every day and a genuine acquisition or
+#   archive failure would be indistinguishable in the Actions list.
+# WHAT: TFB_NEWS_IDENTITY_GAP_POLICY = fail (default, byte-identical to v1.3.2)
+#   | warn. Under warn, a run whose ONLY failure codes are the identity-gap codes
+#   (identity_coverage_incomplete / identity_discovery_incomplete), whose
+#   selected acquisition is complete and whose archive write is accepted,
+#   skipped or dry-run, exits 0 and prints a ::warning:: annotation; the
+#   evidence JSON keeps complete=false and the failure codes verbatim and adds
+#   identity_gap_policy / identity_gap_tolerated so nothing is hidden. Any other
+#   code (news_batch_*, archive_*, selected_acquisition_incomplete,
+#   identity_source_read_incomplete, selected_identity_missing,
+#   priority_selection_capped, collection_error) still exits 1 under warn.
+#   The scheduled workflow sets warn (news_archive.yml v1.3.3).
+# ROLLBACK: unset the ENV (or set fail) -- v1.3.2 exit codes return exactly.
+# =============================================================================
 # v1.3.0 (2026-10-23) -- BOUNDED ADAPTIVE NEWS SELECTION
 #   Add exact-symbol/company-name discovery, portfolio/research priority,
 #   eligible and broader rotation, explicit acquisition/selection evidence,
@@ -88,7 +112,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_VERSION = "1.3.2"
+SCRIPT_VERSION = "1.3.3"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -940,6 +964,32 @@ def _collection_failure_codes(report: Dict[str, Any]) -> List[str]:
     return codes
 
 
+# v1.3.3: the only failure codes a warn policy may tolerate.
+_IDENTITY_GAP_CODES = frozenset({"identity_coverage_incomplete", "identity_discovery_incomplete"})
+_TOLERABLE_WRITE_STATUSES = frozenset({"APPEND_ACCEPTED", "SKIPPED_EXISTING", "NO_ELIGIBLE_ROWS", "DRY_RUN"})
+
+
+def _identity_gap_policy() -> str:
+    """fail (default) keeps v1.3.2 exit codes; warn is the only other value."""
+    value = (os.getenv("TFB_NEWS_IDENTITY_GAP_POLICY") or "").strip().lower()
+    return "warn" if value == "warn" else "fail"
+
+
+def _identity_gap_tolerated(report: Dict[str, Any]) -> bool:
+    """True only when every failure code is an identity-gap code and the batch
+    was acquired and archived (or deliberately not written). Evidence keeps
+    complete=false either way; this decides the process exit code only."""
+    if _identity_gap_policy() != "warn":
+        return False
+    codes = list(report.get("failure_codes") or [])
+    if not codes or not set(codes) <= _IDENTITY_GAP_CODES:
+        return False
+    if report.get("selected_acquisition_complete") is not True:
+        return False
+    write = report.get("archive_write") or {}
+    return write.get("status") in _TOLERABLE_WRITE_STATUSES and not write.get("error_code")
+
+
 def _write_collection_step_summary(summary: Dict[str, Any]) -> None:
     """Append the same nonfinancial evidence to the current Actions step."""
     path = os.getenv("GITHUB_STEP_SUMMARY")
@@ -959,6 +1009,9 @@ def _write_collection_step_summary(summary: Dict[str, Any]) -> None:
              f"| Accepted rows | {write['accepted_rows']} |",
              f"| Existing rows skipped | {write['skipped_rows']} |", "",
              "Failure codes: " + (", ".join(summary["failure_codes"]) or "none") + ".", "",
+             ("Identity gap policy: warn -- the identity gap above is reported, not fatal (exit 0); "
+              "the evidence JSON keeps complete=false." if summary.get("identity_gap_tolerated") else
+              "Identity gap policy: " + str(summary.get("identity_gap_policy") or "fail") + "."), "",
              "Incomplete discovery remains a failing outcome even when the selected news batch was acquired and archived. "
              "Counts do not certify full-market news coverage or investment readiness.", ""]
     try:
@@ -980,6 +1033,9 @@ def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
         report["complete"] = False
     report["archive_write"] = write
     report["failure_codes"] = _collection_failure_codes(report)
+    # v1.3.3: policy and verdict are evidence; they never alter the codes above.
+    report["identity_gap_policy"] = _identity_gap_policy()
+    report["identity_gap_tolerated"] = _identity_gap_tolerated(report)
     _write_collection_report(getattr(args, "evidence_json", None), report)
     selection = report.get("selection") or {}
     counts = {key: int(value) for key, value in (report.get("status_counts") or {}).items()
@@ -991,8 +1047,14 @@ def _finish_collection_report(args: argparse.Namespace, report: Dict[str, Any],
                    "discovery_identity_coverage_complete", "discovery_complete")},
                "selected_acquisition_complete": bool(report.get("selected_acquisition_complete")),
                "complete": bool(report.get("complete")), "status_counts": counts,
-               "archive_write": write, "failure_codes": report["failure_codes"]}
+               "archive_write": write, "failure_codes": report["failure_codes"],
+               "identity_gap_policy": report["identity_gap_policy"],
+               "identity_gap_tolerated": report["identity_gap_tolerated"]}
     print("[news_archive] evidence " + json.dumps(summary, sort_keys=True))
+    if report["identity_gap_tolerated"]:
+        print("::warning::news_archive: identity gap tolerated by TFB_NEWS_IDENTITY_GAP_POLICY=warn ("
+              + ", ".join(report["failure_codes"]) + "); the archive write is " + str(write["status"])
+              + " and the evidence JSON keeps complete=false.")
     _write_collection_step_summary(summary)
 
 
@@ -1066,7 +1128,7 @@ async def collect(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("[news_archive] DRY RUN -- %d rows NOT written" % len(rows))
         _finish_collection_report(args, report, "DRY_RUN")
-        return 1 if incomplete else 0
+        return 1 if incomplete and not report.get("identity_gap_tolerated") else 0
 
     if not sheet_id:
         logger.error("no spreadsheet id (use --sheet-id or DEFAULT_SPREADSHEET_ID)")
@@ -1102,7 +1164,7 @@ async def collect(args: argparse.Namespace) -> int:
         _finish_collection_report(args, report,
                                   "SKIPPED_EXISTING" if rows else "NO_ELIGIBLE_ROWS",
                                   skipped_rows=skipped)
-        return 1 if incomplete else 0
+        return 1 if incomplete and not report.get("identity_gap_tolerated") else 0
 
     # v1.1.0 [SECTOR JOIN] -- env-gated, fail-open; see header WHY.
     if _env_sector_join_enabled():
@@ -1129,7 +1191,7 @@ async def collect(args: argparse.Namespace) -> int:
                               attempted_rows=len(fresh), accepted_rows=len(fresh) if ok else 0,
                               skipped_rows=skipped)
     print("[news_archive] %s %d rows to %s" % ("wrote" if ok else "UNKNOWN write outcome for", len(fresh), store.sheet_name))
-    return 0 if ok and not incomplete else 1
+    return 0 if ok and (not incomplete or report.get("identity_gap_tolerated")) else 1
 
 
 def create_parser() -> argparse.ArgumentParser:
