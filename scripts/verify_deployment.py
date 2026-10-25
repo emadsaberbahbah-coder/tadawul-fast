@@ -254,7 +254,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
-    ("run_daily_brief", "1.18.1", "daily brief"),
+    ("run_daily_brief", "1.19.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     ("run_calendar_sync", "1.1.4", "calendar sync"),
 ]

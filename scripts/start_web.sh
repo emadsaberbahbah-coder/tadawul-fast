@@ -79,6 +79,9 @@
 #   TFB_WORKERS, TFB_TIMEOUT, TFB_GRACEFUL_TIMEOUT, TFB_KEEPALIVE,
 #   TFB_ACCESS_LOG, TFB_WORKER_CLASS, TFB_WORKER_TMP_DIR,
 #   TFB_MAX_REQUESTS, TFB_MAX_REQUESTS_JITTER, TFB_LOG_LEVEL
+#   (v2.7.0: TFB_MAX_REQUESTS default 200, jitter 50; 0 disables)
+#   TFB_MALLOC_ARENA_MAX      v2.7.0: MALLOC_ARENA_MAX when unset (default
+#                             2; off leaves it unset)
 #
 # Expected Render service config (Render dashboard — this repo has NO
 # render.yaml Blueprint)
@@ -88,6 +91,31 @@
 #     chmod +x scripts/start_web.sh
 #     exec ./scripts/start_web.sh
 #   Health Check Path: /readyz   (ensure main.py exposes this route)
+#
+# v2.7.0 (2026-10-25) -- WORKER RECYCLING + GLIBC ARENA CAP ON BY DEFAULT
+# WHY: every Render instance climbs from ~0.15 GB after a deploy to
+# 3.6-4.0 GB of its 4.29 GB limit within 4-8 hours and never comes down
+# (instance 59hw2 on 25 Oct: 1.92 -> 2.10 -> 2.72 -> 4.02 GB in 2 h samples
+# after the 12:03 UTC deploy; 93.5% of the limit). Only the owner's
+# frequent manual deploys have kept it from an OOM kill. Gunicorn never
+# recycled a worker: --max-requests defaulted to 0 and neither
+# TFB_MAX_REQUESTS nor WORKER_MAX_REQUESTS is set on Render. The growth
+# comes from per-worker stores sized by the ~10k-symbol universe
+# (engine _symbol_snapshots, provider caches, LKG stores, per-symbol
+# metrics) plus allocator fragmentation; MALLOC_ARENA_MAX was unset, so
+# glibc kept one arena per thread across the server's thread pools.
+# CHANGE: (1) unset TFB_MAX_REQUESTS/WORKER_MAX_REQUESTS now means
+# --max-requests 200 --max-requests-jitter 50, so each of the 2 workers
+# restarts roughly once per full sync (~400 batch requests) at a
+# different moment, while the other keeps serving. The sync client
+# times out at 30 s and retries 3x on reset/5xx, both inside the 45 s
+# graceful timeout, and the fundamentals/target LKG stores are
+# Redis-backed in production, so a recycle loses only in-process caches.
+# (2) MALLOC_ARENA_MAX defaults to 2 when the environment leaves it unset.
+# ROLLBACK (no code change): TFB_MAX_REQUESTS=0 restores the v2.6.1
+# no-recycling command line; TFB_MALLOC_ARENA_MAX=off leaves
+# MALLOC_ARENA_MAX unset as in v2.6.1. An explicit value in either env
+# var wins over these defaults.
 #
 # Exit codes
 # ----------
@@ -102,7 +130,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.7.0"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -284,9 +312,26 @@ if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
 fi
 WORKER_TMP_DIR="${TFB_WORKER_TMP_DIR:-$_DEFAULT_TMP_DIR}"
 
-# Max-requests recycling (0 disables)
-MAX_REQUESTS="$(as_int "${TFB_MAX_REQUESTS:-${WORKER_MAX_REQUESTS:-0}}" 0)"
-MAX_REQUESTS_JITTER="$(as_int "${TFB_MAX_REQUESTS_JITTER:-${WORKER_MAX_REQUESTS_JITTER:-0}}" 0)"
+# Max-requests recycling (0 disables). v2.7.0: default 200 / jitter 50.
+MAX_REQUESTS="$(as_int "${TFB_MAX_REQUESTS:-${WORKER_MAX_REQUESTS:-200}}" 200)"
+MAX_REQUESTS_JITTER="$(as_int "${TFB_MAX_REQUESTS_JITTER:-${WORKER_MAX_REQUESTS_JITTER:-50}}" 50)"
+if [ "$MAX_REQUESTS" -eq 0 ]; then
+  MAX_REQUESTS_JITTER=0
+fi
+
+# v2.7.0: cap glibc malloc arenas unless the environment already chose.
+_ARENA_RAW="$(lower "${TFB_MALLOC_ARENA_MAX:-}")"
+case "$_ARENA_RAW" in
+  off|0|false|no|none|disabled)
+    ;;
+  *)
+    if [ -z "${MALLOC_ARENA_MAX:-}" ]; then
+      MALLOC_ARENA_MAX="$(as_int "$_ARENA_RAW" 2)"
+      [ "$MALLOC_ARENA_MAX" -gt 0 ] || MALLOC_ARENA_MAX=2
+      export MALLOC_ARENA_MAX
+    fi
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Pre-flight
@@ -313,7 +358,9 @@ log "TFB start_web.sh v${SCRIPT_VERSION}"
 log "boot config: app=$APP_MODULE host=$HOST port=$PORT workers=$WORKERS \
 workers_max=$_WORKERS_MAX gunicorn_log_level=$GUNICORN_LOG_LEVEL \
 timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE \
-access_log=$ACCESS_LOGFILE worker_tmp_dir=$WORKER_TMP_DIR"
+access_log=$ACCESS_LOGFILE worker_tmp_dir=$WORKER_TMP_DIR \
+max_requests=$MAX_REQUESTS max_requests_jitter=$MAX_REQUESTS_JITTER \
+malloc_arena_max=${MALLOC_ARENA_MAX:-unset}"
 
 # Verify gunicorn is present (fail-fast diagnostic)
 if ! command -v gunicorn >/dev/null 2>&1; then

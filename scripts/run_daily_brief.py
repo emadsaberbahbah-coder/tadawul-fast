@@ -555,7 +555,30 @@ from __future__ import annotations
 # (harness: corpus comparison against the v1.18.0 copy). ZERO functions
 # removed. Added: _feed_release_expiry (a lockstep copy shared verbatim with
 # send_digest and tfb_acceptance) and _feed_veto_label.
-__version__ = "1.18.1"
+# ---------------------------------------------------------------------------
+# v1.19.0 (2026-10-25, one-time audit) -- THE BOOK SNAPSHOT NAMES WHAT IT
+# CANNOT SEE, AND THE SEND TIME STOPS CLAIMING "BEFORE MARKET OPEN".
+# EVIDENCE: the 25 Oct 21:15 Riyadh brief (run 40220333814) printed "Book
+# snapshot. 0 holdings" while the same day's sync sourced 1 active holding
+# (5023.SR) into My_Portfolio from _Portfolio_CostBasis and the coverage
+# audit listed active_holdings ["5023.SR"]. The holdings count is the sum
+# of the Portfolio_Decision action groups, so a holding that page does not
+# list vanished from the brief without a word. The same brief, sent at
+# 21:15, said "before market open" in the header and footer -- a literal
+# printed on all four daily sends (and GitHub starts the scheduled sends
+# a median 2h21m after their cron times this week).
+# CHANGE: (1) build_model compares the Portfolio_Decision holdings with
+# the My_Portfolio ledger (rows with a Symbol and a non-zero or unknown
+# Position Qty). Ledger symbols the decision page does not list are
+# named in the input notice, the snapshot reads "N of M holdings", and
+# book MV/cost/P&L become unavailable instead of a partial total shown
+# as the book. Disclosure only: no action, group, ticket or candidate
+# changes. (2) The header and footer print the Riyadh session state at
+# send time (before Tadawul open / Tadawul session open / after Tadawul
+# close / Tadawul closed, weekend).
+# KILL-SWITCHES: TFB_BRIEF_HOLDINGS_RECONCILE=0 and TFB_BRIEF_SEND_LABEL=0
+# each restore the v1.18.1 output byte-identically.
+__version__ = "1.19.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -691,9 +714,85 @@ def _book_money(x: Optional[float]) -> str:
     return "unavailable" if x is None else _money(x)
 
 
+def _holdings_reconcile_enabled() -> bool:
+    """v1.19.0: default ON; TFB_BRIEF_HOLDINGS_RECONCILE=0 restores v1.18.1."""
+    return (os.getenv("TFB_BRIEF_HOLDINGS_RECONCILE") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _ledger_holdings(rows: List[List[Any]]) -> List[str]:
+    """v1.19.0: held symbols on the My_Portfolio ledger. A row counts when it
+    has a Symbol and its Position Qty is non-zero or unreadable (an unknown
+    quantity is still a position to account for). Unreadable page -> []."""
+    rows = _pad(rows or [])
+    h = _find_header(rows, ("symbol",))
+    if h < 0:
+        return []
+    si = _col_index(rows[h], "Symbol")
+    qi = _col_index(rows[h], "Position Qty", "Quantity", "Qty")
+    out: List[str] = []
+    for r in rows[h + 1:]:
+        sym = _s(_cell(r, si)).upper()
+        if not sym or sym == "SYMBOL":
+            continue
+        if qi is not None:
+            q = _num(_cell(r, qi))
+            if q is not None and q == 0:
+                continue
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
+def _reconcile_decision_holdings(d: Dict[str, Any], ledger: List[str]) -> None:
+    """v1.19.0: name ledger holdings that Portfolio_Decision does not list.
+    A book total built from a subset of the positions is not the book, so
+    MV/cost/P&L become unavailable. Nothing is moved between action groups."""
+    listed = {_s(r.get("symbol")).upper() for grp in ("sell", "trim", "add", "hold", "verify", "block")
+              for r in (d.get(grp) or [])}
+    missing = sorted(s for s in ledger if s not in listed)
+    if not missing:
+        return
+    d["ledger_missing"] = missing
+    d["ledger_total"] = len(listed | set(ledger))
+    d["mv"] = d["cost"] = d["pl_pct"] = None
+
+
+def _holdings_count_text(d: Dict[str, Any]) -> str:
+    n = sum(len(d.get(g) or []) for g in ("sell", "trim", "add", "hold", "verify", "block"))
+    if d.get("ledger_missing"):
+        return f"{n} of {d['ledger_total']}"
+    return str(n)
+
+
+def _send_label_enabled() -> bool:
+    """v1.19.0: default ON; TFB_BRIEF_SEND_LABEL=0 restores 'before market open'."""
+    return (os.getenv("TFB_BRIEF_SEND_LABEL") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _send_window_label(when: _dt.datetime) -> str:
+    """v1.19.0: Tadawul session state at the Riyadh send time (Sun-Thu
+    10:00-15:00). `when` is Riyadh wall time (the workflow sets TZ)."""
+    if not _send_label_enabled():
+        return "before market open"
+    if when.weekday() in (4, 5):   # Friday, Saturday
+        return "Tadawul closed (weekend)"
+    hm = when.hour * 60 + when.minute
+    if hm < 10 * 60:
+        return "before Tadawul open"
+    if hm < 15 * 60:
+        return "Tadawul session open"
+    return "after Tadawul close"
+
+
 def _decision_input_notice(d: Dict[str, Any]) -> str:
     """Explain withheld evidence consistently on every brief surface."""
     notices = []
+    if d.get("ledger_missing"):
+        notices.append(f"My_Portfolio holds {len(d['ledger_missing'])} position(s) that "
+                       f"Portfolio_Decision does not list ({', '.join(d['ledger_missing'])}); "
+                       "reconcile before relying on the book snapshot.")
     if d.get("execution_veto"):
         notices.append("Final decision feed withheld execution: " + d["execution_veto"] + ".")
     if d.get("block"):
@@ -2054,6 +2153,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     # DIFFERENT symbol (share-class siblings, e.g. BBDO.US vs held BBD.US).
     held_syms, held_names = _held_issuers(pages_data)
     held_all = held | held_syms
+    if _holdings_reconcile_enabled():
+        _reconcile_decision_holdings(decision, _ledger_holdings(pages_data.get(PAGE_PORTFOLIO, [])))
 
     def _annotate(items: List[Dict[str, Any]]) -> None:
         for it in items:
@@ -2582,7 +2683,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     <div style="height:1px; background:{BRASS}; margin:16px 0 14px 0; line-height:1px; font-size:0;">&nbsp;</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
       <td style="font-family:{SERIF}; color:#FFFFFF; font-size:25px;">Daily Investment Brief<div style="font-family:{SANS}; font-size:10px; color:#9CA8BA; letter-spacing:2px; margin-top:4px;">LOCAL&nbsp;&amp;&nbsp;GLOBAL&nbsp;MARKETS</div></td>
-      <td align="right" style="font-family:{SANS}; color:#A9B4C4; font-size:12px;">{date_long}<br>{date_short}<br><span style="color:#7E8AA0;">before market open</span></td>
+      <td align="right" style="font-family:{SANS}; color:#A9B4C4; font-size:12px;">{date_long}<br>{date_short}<br><span style="color:#7E8AA0;">{_esc(_send_window_label(when))}</span></td>
     </tr></table>
   </td></tr>
 
@@ -2599,7 +2700,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:18px 32px 4px 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F4EF; border:1px solid #E6E1D6;"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:13px; color:#3A3A3A; line-height:1.7;">
-      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])+len(d.get('block') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_book_money(d['mv'])} vs {_book_money(d['cost'])}&nbsp;SAR). {_book_snapshot_hold_phrase(d)} {_concentration(d)} {_esc(input_notice)}
+      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {_holdings_count_text(d)} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_book_money(d['mv'])} vs {_book_money(d['cost'])}&nbsp;SAR). {_book_snapshot_hold_phrase(d)} {_concentration(d)} {_esc(input_notice)}
     </td></tr></table>
   </td></tr>
 
@@ -2645,7 +2746,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   </td></tr>
 
 </table>
-<div style="font-family:{SANS}; font-size:10px; color:#A8A398; margin-top:14px;">Sent before market open · {date_short}, {when.strftime('%H:%M')} Riyadh</div>
+<div style="font-family:{SANS}; font-size:10px; color:#A8A398; margin-top:14px;">Sent {_esc(_send_window_label(when))} · {date_short}, {when.strftime('%H:%M')} Riyadh</div>
 </td></tr></table></body></html>"""
 
 
@@ -3041,7 +3142,8 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         kpis = [("BOOK VALUE", f"{_book_money(d['mv'])} SAR", gray6),
                 ("CURRENT ROI", _p(pl), (green if (pl or 0) >= 0 else red)),
                 ("FREED CASH", f"~{d['freed_cash']:,.0f} SAR", gray6),
-                ("HOLDINGS", str(len(holdings)), gray6),
+                ("HOLDINGS", (_holdings_count_text(d) if d.get("ledger_missing")
+                              else str(len(holdings))), gray6),
                 (("ACTIONS TODAY" if _lv else "NEW BUYS"),
                  (str(_n_actions) if _lv else str(len(t["top"]))), gray6)]
         cells = [Paragraph(f'<font color="#7E8AA0" size="6">{k}</font><br/>'
