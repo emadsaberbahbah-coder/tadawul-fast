@@ -1766,13 +1766,18 @@ from urllib.error import HTTPError, URLError
 #   number came back as its displayed text (about 10 significant digits under
 #   the Automatic format). The tracker writes the log RAW at full float
 #   precision, and canonical_performance_report proves a v2 target with
-#   math.isclose(stored, (target/entry - 1) * 100, rel_tol=1e-9), so a target
-#   that was exact when written failed as 'schema_price_mismatch' once read
-#   back; small 1W/2W ROIs amplify the rounding past 1e-9 most often. The
-#   [CANONICAL-PERFORMANCE] job lines show schema_price_mismatch 6 -> 6 -> 43
-#   while percent_points went 34 -> 222 -> 249 (jobs 120950277470,
-#   121006724938, 121127954714; 24 Oct 18:21Z, 22:34Z, 25 Oct 09:14Z): the
-#   188 rows recorded at 22:34Z were exact in memory on the run that wrote
+#   math.isclose(stored, (target/entry - 1) * 100, rel_tol=1e-9,
+#   abs_tol=1e-8). A 1W/2W checkpoint target price is the interpolation
+#   entry*(1-frac) + forecast*frac (frac 7/30, 14/30) and carries about 16
+#   significant digits; rendered at about 10 it moves the price-implied ROI
+#   by up to about 5e-8 pp, past the 1e-8 absolute floor, whatever the ROI
+#   size, so a target that was exact when written failed as
+#   'schema_price_mismatch' once read back. 1M/3M target prices are the
+#   engine's 4 dp forecast prices and survive. The [CANONICAL-PERFORMANCE]
+#   lines show schema_price_mismatch 6 -> 6 -> 43 while percent_points went
+#   34 -> 222 -> 249 (jobs 120950277470, 121006724938, 121127954714; tracker
+#   steps at 24 Oct 18:21Z, 23:29Z and 25 Oct 10:08Z): the 188 rows recorded
+#   at 23:29Z (25 Oct Riyadh) were exact in memory on the run that wrote
 #   them, and 37 more targets failed on the next run, which read them back.
 #   An offline replay (400 sources x 4 horizons, '.10g' rendering) loses
 #   129/400 1W and 135/400 2W, 0 at 1M/3M, and 0 on a raw round-trip. An
@@ -1786,12 +1791,14 @@ from urllib.error import HTTPError, URLError
 #     as v6.49.0; no log line, no extra read.
 #   observe: the records are the off records. One extra read of the same
 #     range with valueRenderOption UNFORMATTED_VALUE (dateTimeRenderOption
-#     FORMATTED_STRING) is compared cell by cell and one WARNING line
-#     '[v6.50.0 LOG-READ] mode=observe ...' reports precision_only (numbers
-#     equal within 1e-6 relative), divergent {header: n} (numbers that differ
-#     beyond that, e.g. a percent number format), text_differs {header: n},
-#     misaligned rows and the schema_price_mismatch count of both parses. A
-#     failed extra read logs one WARNING and changes nothing.
+#     FORMATTED_STRING); both reads are parsed by from_sheet_row and compared
+#     field by field, and one WARNING line '[v6.50.0 LOG-READ] mode=observe
+#     ...' reports precision_only (numbers within 1e-6: absolute below 1,
+#     relative above), divergent {header: n} (numbers that differ beyond
+#     that, e.g. a percent number format), text_differs {header: n} (any
+#     other parsed difference, e.g. a typed boolean or a number in a text
+#     column), misaligned rows and the schema_price_mismatch count of both
+#     parses. A failed extra read logs one WARNING and changes nothing.
 #   enforce: the one read asks for UNFORMATTED_VALUE + FORMATTED_STRING and
 #     logs one INFO line '[v6.50.0 LOG-READ] mode=enforce rows=N'. Parsing is
 #     unchanged (from_sheet_row via _safe_float/_safe_str); the tracker's
@@ -6444,9 +6451,10 @@ def _log_read_mode() -> str:
 
 
 def _log_read_observe(store: Any, rng: str, rows_fmt: Any) -> Dict[str, Any]:
-    """v6.50.0 observe: ONE extra unformatted read of the same range, compared
-    with the formatted rows cell by cell, and ONE WARNING line. Read-only and
-    never raises: the caller's records are the formatted (off) records."""
+    """v6.50.0 observe: ONE extra unformatted read of the same range; both
+    reads are parsed by from_sheet_row and compared field by field (what
+    enforce would change), and ONE WARNING line. Read-only and never raises:
+    the caller's records are the formatted (off) records."""
     out: Dict[str, Any] = {"mode": "observe", "rows": 0, "unformatted_rows": 0,
                            "precision_only": 0, "divergent": {}, "text_differs": {},
                            "misaligned": 0, "canonical_mismatch_formatted": 0,
@@ -6457,37 +6465,45 @@ def _log_read_observe(store: Any, rng: str, rows_fmt: Any) -> Dict[str, Any]:
                                  date_time_render_option="FORMATTED_STRING"))
         headers = list(store.HEADERS)
         width = len(headers)
-        fmt = [r for r in (rows_fmt or []) if r and _safe_str(r[0])]
-        unf = [r for r in (rows_unf or []) if r and _safe_str(r[0])]
+
+        def _parse(rows: Any) -> List[Any]:
+            out_rows = []
+            for r in rows or []:
+                if r and _safe_str(r[0]):
+                    padded = list(r) + [""] * max(0, width - len(r))
+                    out_rows.append((padded, PerformanceRecord.from_sheet_row(padded, headers)))
+            return out_rows
+
+        fmt, unf = _parse(rows_fmt), _parse(rows_unf)
         out["rows"], out["unformatted_rows"] = len(fmt), len(unf)
         divergent: Dict[str, int] = defaultdict(int)
         text_differs: Dict[str, int] = defaultdict(int)
-        for rf, ru in zip(fmt, unf):
-            if _safe_str(rf[0]) != _safe_str(ru[0]):
+        for (pf, rf), (pu, ru) in zip(fmt, unf):
+            if _safe_str(pf[0]) != _safe_str(pu[0]):
                 out["misaligned"] += 1
                 continue
-            pf = list(rf) + [""] * max(0, width - len(rf))
-            pu = list(ru) + [""] * max(0, width - len(ru))
+            of, ou = store._record_to_row(rf), store._record_to_row(ru)
             for i in range(width):
-                f, u = pf[i], pu[i]
-                if isinstance(u, (int, float)) and not isinstance(u, bool):
-                    fv = _safe_float(f, default=float("nan"))
-                    uv = float(u)
-                    if fv == uv:
-                        continue
-                    if math.isfinite(fv) and abs(fv - uv) <= 1e-6 * max(1.0, abs(uv)):
+                if _safe_str(pf[i]) == "" and _safe_str(pu[i]) == "":
+                    continue           # both blank: only parse fallbacks differ
+                a, b = of[i], ou[i]
+                if a == b:
+                    continue
+                if (isinstance(a, (int, float)) and not isinstance(a, bool)
+                        and isinstance(b, (int, float)) and not isinstance(b, bool)):
+                    fa, fb = float(a), float(b)
+                    if math.isfinite(fa) and math.isfinite(fb) and abs(fa - fb) <= 1e-6 * max(1.0, abs(fb)):
                         out["precision_only"] += 1
                     else:
                         divergent[headers[i]] += 1
-                elif _safe_str(f) != _safe_str(u):
+                else:
                     text_differs[headers[i]] += 1
         out["divergent"] = dict(sorted(divergent.items()))
         out["text_differs"] = dict(sorted(text_differs.items()))
 
-        def _mismatch(rows: List[List[Any]]) -> int:
-            recs = [PerformanceRecord.from_sheet_row(list(r) + [""] * max(0, width - len(r)), headers)
-                    for r in rows]
-            return int(canonical_performance_report(recs)["unit_counts"].get("schema_price_mismatch", 0))
+        def _mismatch(parsed: List[Any]) -> int:
+            return int(canonical_performance_report([rec for _r, rec in parsed])["unit_counts"]
+                       .get("schema_price_mismatch", 0))
 
         out["canonical_mismatch_formatted"] = _mismatch(fmt)
         out["canonical_mismatch_unformatted"] = _mismatch(unf)

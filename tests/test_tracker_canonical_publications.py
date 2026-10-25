@@ -358,3 +358,15 @@ def test_log_read_enforce_reads_back_exactly_what_was_written(monkeypatch):
                                "date_time_render_option": "FORMATTED_STRING"}]
     assert schema_mismatches(loaded) == 0
     assert [store._record_to_row(r) for r in loaded] == rows
+
+
+def test_log_read_observe_returns_the_off_records_after_one_extra_read(monkeypatch):
+    rows = written_log_rows(monkeypatch)
+    off, _store = reload_log(rows)
+    monkeypatch.setenv("TRACK_LOG_UNFORMATTED_READ", "observe")
+    observed, store = reload_log(rows)
+    assert store.ws.calls == [{}, {"value_render_option": "UNFORMATTED_VALUE",
+                                   "date_time_render_option": "FORMATTED_STRING"}]
+    assert [store._record_to_row(r) for r in observed] == [store._record_to_row(r) for r in off]
+    assert tracker._LAST_LOG_READ["canonical_mismatch_unformatted"] == 0
+    assert tracker._LAST_LOG_READ["canonical_mismatch_formatted"] == schema_mismatches(off) > 0

@@ -65,6 +65,7 @@ NOW = datetime(2026, 10, 25, 8, 10, tzinfo=RIYADH)
 # _record_to_row of every loaded record. Proven against the base in L2 when
 # the base is available, checked alone on a shallow CI checkout.
 OFF_GOLDEN = "39dae323624dc93e"
+OFF_RANGE = "A6:AF1005"     # DATA_ROW0 6, 32 HEADERS, max_records 1000 (row_count 5000)
 
 
 def _load(path: Path, name: str):
@@ -116,17 +117,29 @@ class ImmediateRetry:
         return operation()
 
 
-class LogSheet:
-    """Data rows of Performance_Log as RAW-written values; FORMATTED_VALUE
-    renders numbers as '.10g' text (percent_cols as a percent number format),
-    UNFORMATTED_VALUE returns the stored value."""
+def _trim(row):
+    """values.get leaves trailing empty cells out of each returned row."""
+    row = list(row)
+    while row and (row[-1] == "" or row[-1] is None):
+        row.pop()
+    return row
 
-    def __init__(self, rows, headers, percent_cols=(), fail_unformatted=False, data_row0=6):
+
+class LogSheet:
+    """Data rows of Performance_Log as RAW-written values. FORMATTED_VALUE
+    renders numbers as '.10g' text (percent_cols as a percent number format,
+    fixed2_cols as a '0.00' format); UNFORMATTED_VALUE returns the stored
+    value. Trailing empty cells are left out, as the API does."""
+
+    def __init__(self, rows, headers, percent_cols=(), fixed2_cols=(), fail_unformatted=False,
+                 swap_unformatted=None, data_row0=6):
         self.rows = copy.deepcopy(rows)
         self.data_row0 = data_row0
         self.headers = list(headers)
         self.percent = {self.headers.index(c) for c in percent_cols}
+        self.fixed2 = {self.headers.index(c) for c in fixed2_cols}
         self.fail_unformatted = fail_unformatted
+        self.swap_unformatted = swap_unformatted
         self.row_count = 5000
         self.calls = []
 
@@ -136,6 +149,8 @@ class LogSheet:
         if isinstance(v, (int, float)):
             if i in self.percent:
                 return "%.2f%%" % (float(v) * 100.0)
+            if i in self.fixed2:
+                return "%.2f" % float(v)
             return format(v, ".10g")
         return v
 
@@ -144,8 +159,12 @@ class LogSheet:
         if kw.get("value_render_option") == "UNFORMATTED_VALUE":
             if self.fail_unformatted:
                 raise OSError("simulated unformatted read fault")
-            return copy.deepcopy(self.rows)
-        return [[self._fmt(v, i) for i, v in enumerate(r)] for r in self.rows]
+            out = [_trim(r) for r in copy.deepcopy(self.rows)]
+            if self.swap_unformatted:
+                a, b = self.swap_unformatted
+                out[a], out[b] = out[b], out[a]
+            return out
+        return [_trim([self._fmt(v, i) for i, v in enumerate(r)]) for r in self.rows]
 
     def batch_clear(self, ranges):
         self.rows = []
@@ -169,10 +188,19 @@ class _SignalSheet:
         return None
 
 
+_TRACKER_PREFIXES = ("TRACK_", "TFB_TRACK_")
+
+
 @contextlib.contextmanager
 def _env(**values):
-    old = {k: os.environ.get(k) for k in values}
+    """Set the given variables; every other TRACK_* / TFB_TRACK_* variable is
+    cleared for the duration, so the caller's environment never reaches the
+    fixture (TRACK_RISK_BLANK etc. change _record_to_row)."""
+    stray = [k for k in os.environ if k.startswith(_TRACKER_PREFIXES) and k not in values]
+    old = {k: os.environ.get(k) for k in list(values) + stray}
     try:
+        for k in stray:
+            os.environ.pop(k, None)
         for k, v in values.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -314,6 +342,24 @@ def _version(v):
     return tuple(int(x) for x in str(v).split(".")[:3])
 
 
+def _clear_tracker_env():
+    for k in [k for k in os.environ if k.startswith(_TRACKER_PREFIXES)]:
+        os.environ.pop(k, None)
+
+
+try:
+    import pytest as _pytest
+
+    @_pytest.fixture(autouse=True)
+    def _isolated_tracker_env(monkeypatch):
+        """No TRACK_* / TFB_TRACK_* variable of the caller reaches a case."""
+        for k in [k for k in os.environ if k.startswith(_TRACKER_PREFIXES)]:
+            monkeypatch.delenv(k, raising=False)
+        yield
+except Exception:      # script mode without pytest: __main__ clears instead
+    pass
+
+
 # ------------------------------------------------------------------ cases
 def test_l1_version_floor_and_mode_parser():
     assert _version(TP.SCRIPT_VERSION) >= (6, 50, 0), TP.SCRIPT_VERSION
@@ -333,7 +379,8 @@ def test_l2_off_is_the_base_read_and_pins_the_defect():
         loaded, sheet, _store_, lines = _load_with(TP, rows, mode)
         rng = sheet.calls[0][0]
         assert sheet.calls == [(rng, {})], (mode, sheet.calls)
-        assert _log_read_lines(lines) == [], (mode, lines)
+        assert rng == OFF_RANGE, rng
+        assert lines == [], (mode, lines)            # off logs nothing at all
         mm = _mismatch_by_horizon(TP, loaded)
         assert mm.get("1W", 0) + mm.get("2W", 0) >= 10 and mm.get("1M", 0) == mm.get("3M", 0) == 0, mm
         digests.add(_digest(sheet.calls, _rows_of(TP, loaded)))
@@ -344,6 +391,7 @@ def test_l2_off_is_the_base_read_and_pins_the_defect():
         assert b_rows == rows, "the fixture writer is unchanged"
         b_loaded, b_sheet, _s, b_lines = _load_with(base, b_rows, None)
         assert b_sheet.calls == sheet.calls
+        assert b_lines == lines, (b_lines, lines)
         assert _rows_of(base, b_loaded) == _rows_of(TP, loaded)
         assert digests == {_digest(b_sheet.calls, _rows_of(base, b_loaded))}
     if OFF_GOLDEN != "0000000000000000":
@@ -352,11 +400,11 @@ def test_l2_off_is_the_base_read_and_pins_the_defect():
 
 def test_l3_enforce_reads_unformatted_and_keeps_every_canonical_target():
     recs, rows = _fixture(TP)
-    loaded, sheet, _s, lines = _load_with(TP, rows, " enforce ")
+    # one row with a blank Record ID: read (rows=161), skipped as a record
+    loaded, sheet, _s, lines = _load_with(TP, rows + [["", "orphan|key", "ZZZ.US"]], " enforce ")
     # the outcome first: on the base this is where the golden negative fails
     assert _mismatch_by_horizon(TP, loaded) == {}, _mismatch_by_horizon(TP, loaded)
-    rng = sheet.calls[0][0]
-    assert sheet.calls == [(rng, UNF)], sheet.calls
+    assert sheet.calls == [(OFF_RANGE, UNF)], sheet.calls     # the same range as off
     assert _canonicals(TP, loaded) == _canonicals(TP, recs)
     assert _rows_of(TP, loaded) == rows, "an exact read-back of what the tracker wrote"
     assert loaded[0].realized_roi is None and loaded[0].status == TP.PerformanceStatus.MATURED
@@ -364,7 +412,7 @@ def test_l3_enforce_reads_unformatted_and_keeps_every_canonical_target():
     assert [l.notes for l in loaded] == [r.notes for r in recs]
     assert [TP.RiyadhTime.format(l.date_recorded) for l in loaded] == [TP.RiyadhTime.format(r.date_recorded) for r in recs]
     log = _log_read_lines(lines)
-    assert log == [("INFO", "[v6.50.0 LOG-READ] mode=enforce rows=160")], log
+    assert log == [("INFO", "[v6.50.0 LOG-READ] mode=enforce rows=161")], log
 
 
 def test_l4_enforce_persists_full_precision_and_off_keeps_the_residual():
@@ -403,6 +451,25 @@ def test_l5_observe_compares_and_changes_nothing():
     # a percent number format on one column is named, records still equal off
     obs_pct, _sp, _s2, _lp = _load_with(TP, rows, "observe", percent_cols=("Target ROI %",))
     assert list(TP._LAST_LOG_READ["divergent"]) == ["Target ROI %"], TP._LAST_LOG_READ
+    off_pct, _op, _s5, _l5 = _load_with(TP, rows, "off", percent_cols=("Target ROI %",))
+    assert _rows_of(TP, obs_pct) == _rows_of(TP, off_pct)
+    # a '0.00' number format on the interpolated 1W/2W target price is beyond 1e-6: divergent
+    _o2, _s2b, _s6, _l6 = _load_with(TP, rows, "observe", fixed2_cols=("Target Price",))
+    d2 = TP._LAST_LOG_READ["divergent"]
+    assert list(d2) == ["Target Price"] and 0 < d2["Target Price"] <= 80, TP._LAST_LOG_READ
+    # a number typed into a text column (Entry Investability 0) parses '0' formatted, '' raw
+    col_i = TP.PerformanceStore.HEADERS.index("Entry Investability")
+    rows_i = copy.deepcopy(rows)
+    for r in rows_i[:5]:
+        r[col_i] = 0
+    _oi, _si, _s7, _l7 = _load_with(TP, rows_i, "observe")
+    assert TP._LAST_LOG_READ["text_differs"] == {"Entry Investability": 5}, TP._LAST_LOG_READ
+    # two unformatted rows out of order are counted, never compared
+    _om, _sm, _s8, _l8 = _load_with(TP, rows, "observe", swap_unformatted=(3, 4))
+    assert TP._LAST_LOG_READ["misaligned"] == 2 and TP._LAST_LOG_READ["divergent"] == {}, TP._LAST_LOG_READ
+    # a blank Record ID row is skipped in both reads
+    _ob2, _sb2, _s9, _l9 = _load_with(TP, rows + [["", "orphan|key", "ZZZ.US"]], "observe")
+    assert TP._LAST_LOG_READ["rows"] == TP._LAST_LOG_READ["unformatted_rows"] == 160, TP._LAST_LOG_READ
     # a boolean cell (owner-typed TRUE) renders 'TRUE' formatted and True raw: text_differs names it
     col = TP.PerformanceStore.HEADERS.index("Entry Selected")
     rows_b = copy.deepcopy(rows)
@@ -451,6 +518,7 @@ def test_l6_real_gspread_client_sends_the_render_options():
             got = store.load_records(1000)
         assert len(got) == 160 and len(sent) == 1, (mode, sent)
         url = sent[0]
+        assert "A6%3AAF1005" in url, url             # the off range in both modes
         if want_unf:
             assert "valueRenderOption=UNFORMATTED_VALUE" in url and "dateTimeRenderOption=FORMATTED_STRING" in url, url
             assert _rows_of(TP, got) == rows
@@ -476,7 +544,11 @@ def test_l7_ascii_added_lines_and_zero_removals():
 
     removed = names(src) - names(new)
     assert removed == set(), sorted(removed)
-    assert names(new) - names(src) == {"_log_read_mode", "_log_read_observe"}, sorted(names(new) - names(src))
+    added_names = names(new) - names(src)
+    if TP.SCRIPT_VERSION == "6.50.0":        # exactly this release's additions
+        assert added_names == {"_log_read_mode", "_log_read_observe"}, sorted(added_names)
+    else:                                    # a later release may add more
+        assert {"_log_read_mode", "_log_read_observe"} <= added_names, sorted(added_names)
 
 
 CASES = [test_l1_version_floor_and_mode_parser, test_l2_off_is_the_base_read_and_pins_the_defect,
@@ -487,6 +559,7 @@ CASES = [test_l1_version_floor_and_mode_parser, test_l2_off_is_the_base_read_and
 
 
 if __name__ == "__main__":
+    _clear_tracker_env()     # this process only: the caller's tracker flags never reach a case
     passed = failed = skipped = 0
     for case in CASES:
         try:
