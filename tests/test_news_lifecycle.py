@@ -8,8 +8,27 @@ import pytest
 
 from scripts import news_archive_collector as archive
 
-NOW = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
-REVIEW_NOW = datetime(2026, 10, 24, 6, tzinfo=timezone.utc)
+
+
+def _registry_clock():
+    """One minute after the newest lifecycle review in the live registry.
+
+    The registry is renewed every week (name_label_renewal.yml re-stamps
+    reviewed_at_utc), so a clock pinned to one review cohort fails CI on the
+    first renewal (PR #840, 25 Oct 2026). Deriving it keeps every lifecycle
+    binding inside its 7-day review window regardless of when it was renewed;
+    the expiry and future-effective cases below add days to this clock.
+    """
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    stamps = [datetime.fromisoformat(item["reviewed_at_utc"]) for item in data["bindings"]
+              if "news_lifecycle" in (item.get("identifiers") or {})]
+    assert stamps, "registry carries no lifecycle binding"
+    return max(stamps).astimezone(timezone.utc) + timedelta(minutes=1)
+
+
+NOW = _registry_clock()
+REVIEW_NOW = NOW
 
 
 def test_irbo_legacy_caption_never_fetches_or_substitutes_arty(monkeypatch):
