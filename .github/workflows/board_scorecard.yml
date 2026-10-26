@@ -24,6 +24,28 @@ name: "📋 TFB Board Scorecard"
 # ticket path of the script does not depend on any of this.
 # v1.0.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
 # ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
+# v1.1.0 (2026-10-27) -- ARMING + RANKING HEALTH.
+# WHY: the October review (claude/TFB_October_2026_Recommendation_Review.md)
+# found the engine's expected-ROI rank runs backwards (Spearman -0.38 over 71
+# seats; ranks 1-3 beat the market 38% vs 70% for ranks 7-10) and that the
+# picks beat SPUS only through sector exposure (vs their own sector ETF: 44%
+# hit, -1.1 pp). scripts/score_selection_log.py v1.1.0 measures both every
+# night behind TFB_BOARD_SCORECARD_RANKING (default off, byte-identical off):
+# a sector-ETF / venue-index reference per seat next to SPUS, seven DETAIL
+# columns at the end, and a RANKING HEALTH block (rank / ROI-cap / confidence
+# / sector buckets, Spearman, one verdict row per window) that also lands in
+# the _Run_Log message. This workflow turns the gate ON.
+# ARMING: TFB_BOARD_SCORECARD moves from "observe" to "write". The scorecard
+# has had more than twenty green observe runs since 1 Oct (artifacts + job
+# summaries read sensibly every night) and the owner approved arming on
+# 27 Oct 2026. Each scheduled run now rewrites the NEW tab _Board_Scorecard
+# as one rectangle and appends one _Run_Log row; the v1.0.0 coverage floor
+# (TFB_BOARD_SCORECARD_MIN_COVERAGE, default 0.5) still blocks a degraded
+# write (DEGRADED row, exit 1). Cron, concurrency group and the runner pin
+# are unchanged. _Selection_Log stays READ ONLY.
+# ROLLBACK: TFB_BOARD_SCORECARD: "observe" (artifacts only) and/or
+# TFB_BOARD_SCORECARD_RANKING: "off" (v1.0.0 outputs byte for byte); nothing
+# else depends on either.
 # ============================================================================
 
 on:
@@ -56,9 +78,13 @@ jobs:
     env:
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       # Scheduled runs use this value. "observe" = no sheet writes at all.
-      # ARMING (Emad's hand edit, after two green observe runs whose job
-      # summary reads sensibly): change to "write".
-      TFB_BOARD_SCORECARD: "observe"
+      # ARMED v1.1.0 (2026-10-27, owner approval after >20 green observe
+      # runs): "write" = rewrite _Board_Scorecard + one _Run_Log row per run.
+      # Rollback: "observe".
+      TFB_BOARD_SCORECARD: "write"
+      # v1.1.0 [RANKING HEALTH]: reference benchmark + ranking verdict.
+      # "off" restores the v1.0.0 outputs byte for byte.
+      TFB_BOARD_SCORECARD_RANKING: "on"
     steps:
       # Pinned to main; the job token is not persisted into .git.
       - uses: actions/checkout@v6
