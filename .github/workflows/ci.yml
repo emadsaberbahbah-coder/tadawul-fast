@@ -2,7 +2,11 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.38 (2026-10-26) -- FUNDING EVIDENCE TRANSPORT
+# VERSION 1.1.39 (2026-10-26) -- FINAL CONSUMER-PENDING EXIT
+#
+# v1.1.39: run tests/test_final_consumer_pending.py (finalize_decision_publication
+# v1.2.0: a sync whose only decision findings are same-cohort consumer lag
+# ends with a warning; evidence exit 2, blocker and veto unchanged).
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
 # v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
@@ -806,6 +810,7 @@ jobs:
             tests/test_name_identity_workflow.py \
             tests/test_decision_surface_freshness.py \
             tests/test_final_decision_publication.py \
+            tests/test_final_consumer_pending.py \
             tests/test_final_publication_workflow.py \
             tests/test_matrix_validation_scope.py \
             tests/test_release_decision_feed.py \

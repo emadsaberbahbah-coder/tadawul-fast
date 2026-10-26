@@ -2145,6 +2145,14 @@ jobs:
 
       - name: Audit final coverage and decision clocks
         id: final_audit
+        env:
+          # (2026-10-26) finalize 1.2.0: a run whose ONLY decision findings are
+          # "Top_10/Portfolio_Decision have not rendered this run yet" still
+          # writes NOT_ACTIONABLE run=N (the 26_Decision_Chain go signal) and
+          # keeps evidence exit_code 2, but the job ends with a warning instead
+          # of red. Stale, missing, NOT_OK, pool and source findings stay red.
+          # Rollback: repository variable TFB_FINAL_CONSUMER_PENDING=off.
+          TFB_FINAL_CONSUMER_PENDING: ${{ vars.TFB_FINAL_CONSUMER_PENDING || 'warn' }}
         run: |
           set -euo pipefail
           # The native cockpit is asynchronous and is not a matrix-leg output.
@@ -2175,6 +2183,9 @@ jobs:
             echo "::error::Final coverage or decision publication is not accepted (exit $code)."
             exit "$code"
           fi
+          if python -c "import json,sys; sys.exit(0 if json.load(open('final_decision_publication.json')).get('consumer_pending') is True else 1)" 2>/dev/null; then
+            echo "::warning::Sources accepted; Top_10/Portfolio_Decision have not rendered run ${GITHUB_RUN_ID} yet. Feed stays NOT_ACTIONABLE until 26_Decision_Chain renders and release_decision_feed re-audits."
+          fi
 
       - name: Publish final audit summary
         if: always()
@@ -2190,7 +2201,7 @@ jobs:
               else:
                   result = json.loads(path.read_text())
                   handle.write('| Check | Result |\n|---|---|\n')
-                  for key in ('exit_code', 'audit_exit_codes', 'blockers', 'blocker_published', 'feed_promoted'):
+                  for key in ('exit_code', 'audit_exit_codes', 'blockers', 'blocker_published', 'feed_promoted', 'consumer_pending', 'process_exit_code'):
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nNative installation and refresh are required before executable decisions.\n')
           PY

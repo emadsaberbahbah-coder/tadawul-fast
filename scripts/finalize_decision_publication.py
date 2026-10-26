@@ -4,6 +4,20 @@ Run after all market matrix legs and inline recovery, under their write lease.
 This command never refreshes a cockpit, restores a universe, or promotes the
 feed to EXECUTABLE. Only a bounded existing _Status L:M key may be changed.
 Native installation and a subsequent native refresh/readback remain required.
+
+v1.2.0 (2026-10-26) -- CONSUMER-PENDING PROCESS EXIT. 26_Decision_Chain
+renders Top_10 for run N only after this job has written 'TFB Decision Feed'
+run=N, so this audit always meets decision pages that have not consumed the
+cohort yet. Every scheduled sync therefore ended red (5/6 scheduled runs,
+25-26 Oct; 20/21 in the 17-24 Oct census), which hid genuine failures.
+classify_consumer_pending() recognises exactly that state: coverage <= 1,
+structure witness < 2, the blocker published, and every decision finding a
+same-cohort consumer-lag code. Under TFB_FINAL_CONSUMER_PENDING=warn the
+PROCESS exits with the coverage code instead of 2. run() is unchanged: the
+evidence keeps exit_code 2, the blockers and the NOT_ACTIONABLE write, and
+release_decision_feed.py still re-runs the real audits. Default (unset/off)
+keeps the v1.1.2 exit codes and writes; the evidence only gains the
+consumer_pending and process_exit_code keys. Rollback: unset the variable.
 """
 from __future__ import annotations
 
@@ -31,7 +45,7 @@ from scripts.approved_universe_scope import (
 )
 from scripts.workflow_validation_scope import SOURCE_PAGES, strict_json
 
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.2.0"
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -48,6 +62,63 @@ SOFT_VALIDATION_WARNINGS = frozenset({
     "sanity.open_in_day_range", "sanity.price_in_52w_range", "sanity.roi12_within_softcap",
     "decision.price_present",
 })
+
+
+# Same-cohort consumer lag only: the decision pages have not rendered the run
+# this job audits yet. Stale (>8 h), missing, NOT_OK, pool-count and source
+# findings are deliberately absent and keep the job red.
+CONSUMER_PENDING_CODES = frozenset({
+    "PF_OLDER_THAN_SOURCE", "PF_SOURCE_CONSUMPTION_UNPROVEN",
+    "T10_OLDER_THAN_SOURCE", "T10_SOURCE_CONSUMPTION_UNPROVEN",
+    "T10_POOL_RECONCILIATION_UNPROVEN", "FALSE_FULL_UNIVERSE_CLAIM",
+})
+# A pool reconciliation finding is lag only when its receipt names another run.
+POOL_LAG_MESSAGES = (
+    "native pool reconciliation does not match one consumed/current source cohort",
+    "native pool reconciliation does not match expected source run",
+)
+
+
+def classify_consumer_pending(result: Any) -> bool:
+    """PURE. True only when the sole blocker is decision pages awaiting this cohort."""
+    try:
+        codes = result["audit_exit_codes"]
+        if (result.get("fatal") or result.get("publication_error") or result.get("feed_promoted")
+                or result.get("exit_code") != 2 or result.get("blockers") != ["decision_failed"]
+                or result.get("blocker_published") is not True
+                or not isinstance(codes, list) or len(codes) != 2
+                or any(type(code) is not int for code in codes)
+                or codes[0] not in (0, 1) or codes[1] != 2):
+            return False
+        decision = result["audits"]["decision"]
+        structure = decision.get("structural_validation")
+        if (not isinstance(structure, dict) or structure.get("same_job_witness") is not True
+                or structure.get("exit_code") not in (0, 1)
+                or decision.get("freshness_exit_code") != 2):
+            return False
+        findings = decision.get("findings")
+        if not isinstance(findings, list) or not findings:
+            return False
+        lag = False
+        for finding in findings:
+            code = finding.get("code") if isinstance(finding, dict) else None
+            if finding.get("severity") != "FAIL" or code not in CONSUMER_PENDING_CODES:
+                return False
+            if code == "T10_POOL_RECONCILIATION_UNPROVEN" and not any(
+                    message in str(finding.get("message", "")) for message in POOL_LAG_MESSAGES):
+                return False
+            lag |= code != "FALSE_FULL_UNIVERSE_CLAIM"
+        return lag
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def process_exit_code(result: Any) -> int:
+    """The job's exit. Evidence exit_code is never changed here."""
+    policy = os.getenv("TFB_FINAL_CONSUMER_PENDING", "").strip().lower()
+    if policy == "warn" and result.get("consumer_pending") is True:
+        return result["audit_exit_codes"][0]
+    return result["exit_code"]
 
 
 def _bounded_env(name: str, default: float, *, minimum=None, maximum=None) -> float:
@@ -368,12 +439,15 @@ def main(argv=None) -> int:
     except Exception as exc:
         result = {"script_version": SCRIPT_VERSION, "exit_code": 3,
                   "fatal": safe_error_text(exc), "feed_promoted": False}
+    result["consumer_pending"] = classify_consumer_pending(result)
+    result["process_exit_code"] = process_exit_code(result)
     text = json.dumps(result, ensure_ascii=False, default=str, indent=2)
     Path(args.json_out).write_text(text + "\n", encoding="utf-8")
     print(json.dumps({key: result.get(key) for key in (
         "script_version", "exit_code", "audit_exit_codes", "blockers",
-        "blocker_published", "feed_promoted", "fatal", "publication_error")}, ensure_ascii=False))
-    return result["exit_code"]
+        "blocker_published", "feed_promoted", "consumer_pending", "process_exit_code",
+        "fatal", "publication_error")}, ensure_ascii=False))
+    return result["process_exit_code"]
 
 
 if __name__ == "__main__":
