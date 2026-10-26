@@ -191,17 +191,21 @@ def _top_level_functions(text):
 
 def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     text = GAS.read_text(encoding="utf-8")
-    assert " * Version: 1.5.15\n" in text and "var PD_VERSION = '1.5.15';" in text
-    assert "var PD_VERSION = '1.5.14';" not in text
+    # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
+    assert " * Version: 1.5.16\n" in text and "var PD_VERSION = '1.5.16';" in text
+    assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "\r" not in text
     now = set(_top_level_functions(text))
     base = set(golden["functions"])
     assert len(base) == 118
     assert base <= now, sorted(base - now)
-    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_"]
+    # 2026-10-26: v1.5.16 (evidence publication) adds eight pdIbkr* functions on top of this change
+    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdIbkrArmFollowUp_", "pdIbkrEvidenceFollowUp",
+                                  "pdIbkrFollowUpCore_", "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
+                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_"]
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
-    assert len(text.split("\n")) - golden["source_lines"] == 92
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224
 
 
 def test_added_lines_are_es5_and_ascii(base_source):

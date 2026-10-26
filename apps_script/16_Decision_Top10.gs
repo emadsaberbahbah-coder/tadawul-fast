@@ -1,11 +1,75 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.16.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE] -- THE BROKER PACKET CERTIFIES THE REQUEST
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): FRST.US, ZTO.US and CRC.US
+ * confirmed ACTIVE (day 3) and the board rendered them UNSIZED -- Ticket 0
+ * SAR, Shares 0, Entry/Stop/TP '--', 'Research seat -- no executable
+ * allocation today', funding=final/0exec, EXECUTABLE 0 of 10. Trace: the
+ * allocate replay (dt10ReallocateBoard_) POSTs the same body as the first
+ * request; the backend's allocate stage (opportunity_builder
+ * _portfolio_input_assessment -> core/portfolio_reconciliation
+ * certify_portfolio_inputs) withholds executable funding unless
+ * portfolio.reconciliation_evidence is a fresh (<= 900 s) broker packet
+ * whose certified cash equals cash_available_sar to the cent, whose FX
+ * proofs equal the request's fx_rates, whose positions link to every
+ * holding row sent, and holdings_input_incomplete is false. This file
+ * forwarded the document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (v1.11.x) but nothing wrote it ('Nothing writes it today', 14 Oct), the
+ * cash came from the Top_10 panel (82,819.20, before the day's BUY
+ * reservation), fx_rates.USD came from TFB_FX_LOOKUP (3.7448, not the 3.75
+ * peg the proof declares) and the Sukuk row 5023.SR (Tadawul custody) can
+ * never link to an IBKR position. The executable funding path had never
+ * been exercisable in production; it surfaced on the first 3/3 day.
+ * WHAT: Script Property DT10_FUNDING_EVIDENCE = off (DEFAULT: the request
+ * body, the status line and every render are v1.15.0 byte for byte) | on.
+ * When on, after the holdings and cash-source blocks build the body,
+ * dt10FundingApply_ reads the packet 10_My_Portfolio v1.5.16 publishes
+ * (PD_IBKR_EVIDENCE_PUBLISH=on, from the read-only IBKR capture the
+ * 08:30-10:30 watcher consumes) and the PURE dt10FundingApplyCore_ applies
+ * it IN PLACE when, and only when, every check holds: schema 1, captured_at
+ * with an explicit offset, age 0..840 s (the backend's 900 s less a 60 s
+ * request margin), holdings sent (DT10_SEND_HOLDINGS) and read complete,
+ * FX proofs readable at 2 decimals. Then: rows whose Symbol is in
+ * PD_EXECUTION_EXCLUDE (the same property 10_My_Portfolio uses; 5023.SR)
+ * leave the funding cohort; holding_links are rebuilt for THIS request's
+ * rows (native symbol + currency, each positive packet position must be
+ * represented -- the backend decides, the note discloses); cash_available_sar
+ * becomes the packet's certified cash (settled - reserved) x proven rate,
+ * integer cents, round half-even exactly as the backend compares it;
+ * pending_proceeds_sar = 0; fx_rates gains the proven rates (USD 3.75) and a
+ * kept row with a proven currency, a quantity and a price has value_sar
+ * recomputed at that rate (the backend's price x fx x quantity check). The
+ * allocate replay deep-copies the applied body, so one apply covers both
+ * stages. Any failed check leaves the body untouched and the status line
+ * says ' | funding evidence NOT APPLIED (<reason>)'; success says
+ * ' | funding evidence APPLIED (capture age Nm; cash X SAR; linked a/b;
+ * excluded ...; USD 3.75)'. The packet is never logged or rendered.
+ * ORDER: the backend's 900 s window means Top_10 must render within ~14 min
+ * of the capture: 10_My_Portfolio v1.5.16's watcher arms a one-off
+ * follow-up render after it publishes (chain-style guards). SECTION 8 KEPT:
+ * no gate, score or verdict is recomputed here; sizing stays the backend's.
+ * Functions added (0 removed): dt10FundingMode_, dt10FundingExcludeList_,
+ * dt10FundingSym_, dt10FundingUnits_, dt10FundingDiv_, dt10FundingAge_,
+ * dt10FundingNative_, dt10FundingRates_, dt10FundingCashCents_,
+ * dt10FundingLinks_, dt10FundingDecimal_, dt10FundingValueSar_,
+ * dt10FundingApplyCore_,
+ * dt10FundingNote_, dt10FundingApply_. Changed: refreshDecisionTop10 (one
+ * call after the cash block; fundingNote in the status line), dt10SelfTest
+ * ('funding evidence core'). Vars added: DT10_FUNDING_PROP,
+ * DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS,
+ * DT10_FUNDING_SAFE. Harness: tests/test_dt10_funding_evidence.js (REAL
+ * file; golden negative on the v1.15.0 base; kill identity with the property
+ * absent; ES5/ASCII lint). Rollback: delete DT10_FUNDING_EVIDENCE (no
+ * re-paste) or re-paste v1.15.0. ES5; ASCII; all prior WHYs verbatim;
+ * DT10_VERSION and the header bumped in lockstep. Arming is an owner step
+ * AFTER the first funded ticket of 26 Oct 2026 is recorded.
  *
  * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT
  * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails
@@ -1902,7 +1966,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.15.0';
+var DT10_VERSION = '1.16.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3451,6 +3515,328 @@ function dt10PortfolioInputs_(ss, panel) {
     portfolio.holdings_input_incomplete = holdings._input_incomplete === true;
   }
   return portfolio;
+}
+// ---------------------------------------------------------------------------
+// v1.16.0 [FUNDING-EVIDENCE] -- apply the published broker packet to THIS
+// request (PURE core + thin orchestrator). Script Property
+// DT10_FUNDING_EVIDENCE = off (DEFAULT: the request body is v1.15.0 byte for
+// byte) | on. The packet is the document property 10_My_Portfolio publishes
+// from a read-only IBKR capture (PD_IBKR_EVIDENCE_PUBLISH=on); this file only
+// reads it. Nothing here invents a position, a quantity, a quote or a cash
+// figure: every number sent is read from the packet or from My_Portfolio.
+// ---------------------------------------------------------------------------
+var DT10_FUNDING_PROP = 'DT10_FUNDING_EVIDENCE';        // off (default) | on
+var DT10_FUNDING_EXCLUDE_PROP = 'PD_EXECUTION_EXCLUDE';  // shared with 10_My_Portfolio
+var DT10_FUNDING_MAX_AGE_MS = 840000;   // backend 900 s less a 60 s request margin
+var DT10_FUNDING_MAX_ITEMS = 500;
+var DT10_FUNDING_SAFE = 9007199254740991;
+
+function dt10FundingMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on' ? 'on' : 'off';
+  } catch (eFm) { return 'off'; }
+}
+
+/** PURE: 'a, B;c' -> ['A', 'B', 'C'] (trimmed, upper, unique). */
+function dt10FundingExcludeList_(raw) {
+  var out = [], seen = {};
+  var parts = String(raw === null || raw === undefined ? '' : raw).split(/[,;\s]+/);
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i].toUpperCase();
+    if (s && !seen.hasOwnProperty(s)) { seen[s] = true; out.push(s); }
+  }
+  return out;
+}
+
+function dt10FundingSym_(v) {
+  return String(v === null || v === undefined ? '' : v)
+      .replace(/^\s+|\s+$/g, '').toUpperCase();
+}
+
+/** PURE: a plain decimal (text exactly; a number via toFixed(scale)) ->
+ * integer units of 10^-scale, or null (port of 10_My_Portfolio pdIbkrUnits_). */
+function dt10FundingUnits_(value, scale) {
+  if (typeof value === 'boolean' || value === null || value === undefined) return null;
+  var text;
+  if (typeof value === 'number') {
+    if (!isFinite(value) || Math.abs(value) >= 1e15) return null;
+    text = value.toFixed(scale);
+  } else {
+    text = String(value).replace(/^\s+|\s+$/g, '');
+  }
+  var m = text.match(/^(-)?(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  var frac = m[3] || '';
+  if (frac.length > scale) {
+    if (/[^0]/.test(frac.slice(scale))) return null;
+    frac = frac.slice(0, scale);
+  }
+  while (frac.length < scale) frac += '0';
+  var digits = (m[2] + frac).replace(/^0+(?=\d)/, '');
+  if (digits.length > 15) return null;
+  var n = Number(digits);
+  return (m[1] && n !== 0) ? -n : n;
+}
+
+/** PURE: exact integer division of safe integers; 'even' = round half to
+ * even (Python Decimal default, the backend's rounding). */
+function dt10FundingDiv_(num, div, mode) {
+  var q = Math.floor(num / div);
+  var r = num - q * div;
+  while (r < 0) { q -= 1; r += div; }
+  while (r >= div) { q += 1; r -= div; }
+  if (r === 0) return q;
+  if (mode === 'up') return q + 1;
+  if (r * 2 > div) return q + 1;
+  if (r * 2 < div) return q;
+  return q % 2 === 0 ? q : q + 1;
+}
+
+function dt10FundingAge_(ms) {
+  var m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60) + 'm';
+}
+
+/** PURE: the decision Symbol an IBKR position stands for (same rule as
+ * 10_My_Portfolio pdIbkrNative_ for the packet, which carries USD stocks
+ * only): 'BRK B'/USD -> 'BRK-B.US'; anything else links nothing. */
+function dt10FundingNative_(symbol, currency) {
+  if (dt10FundingSym_(currency) !== 'USD') return '';
+  var s = dt10FundingSym_(symbol).replace(/\s+/g, '-');
+  return /^[A-Z0-9][A-Z0-9.\-]{0,15}$/.test(s) ? s + '.US' : '';
+}
+
+/** PURE: {CCY: rate x100} from the packet's FX proofs (SAR fixed at 100).
+ * A proof finer than 2 decimals, repeated or unreadable -> null. */
+function dt10FundingRates_(packet) {
+  var rates = {SAR: 100};
+  var proofs = packet && Object.prototype.toString.call(packet.fx_rates) === '[object Array]'
+      ? packet.fx_rates : [];
+  if (proofs.length > DT10_FUNDING_MAX_ITEMS) return null;
+  for (var i = 0; i < proofs.length; i++) {
+    var p = proofs[i] || {};
+    var ccy = dt10FundingSym_(p.currency);
+    var x100 = dt10FundingUnits_(p.rate_to_sar, 2);
+    if (!/^[A-Z]{3}$/.test(ccy) || x100 === null || x100 <= 0) return null;
+    if (rates.hasOwnProperty(ccy)) return null;
+    rates[ccy] = x100;
+  }
+  return rates;
+}
+
+/** PURE: certified cash in cents from the funding accounts' settled cash
+ * less reservations, at the proven rates. {cents|null, reason}. */
+function dt10FundingCashCents_(packet, rates) {
+  var out = {cents: null, reason: ''};
+  function fail(why) { out.cents = null; out.reason = why; return out; }
+  var funding = packet && Object.prototype.toString.call(packet.funding_accounts) === '[object Array]'
+      ? packet.funding_accounts : [];
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  if (!funding.length || accounts.length > DT10_FUNDING_MAX_ITEMS) return fail('funding accounts missing');
+  var total = 0, rows = 0;
+  for (var f = 0; f < funding.length; f++) {
+    var aid = String(funding[f]);
+    var acc = null;
+    for (var a = 0; a < accounts.length; a++) {
+      if (accounts[a] && String(accounts[a].account_id) === aid) { acc = accounts[a]; break; }
+    }
+    if (!acc) return fail('funding account unknown');
+    var cash = Object.prototype.toString.call(acc.cash) === '[object Array]' ? acc.cash : [];
+    if (!cash.length || cash.length > DT10_FUNDING_MAX_ITEMS) return fail('cash rows missing');
+    for (var c = 0; c < cash.length; c++) {
+      var row = cash[c] || {};
+      var ccy = dt10FundingSym_(row.currency);
+      var settled = dt10FundingUnits_(row.settled_cash, 6);
+      var reserved = dt10FundingUnits_(row.reserved_cash, 6);
+      if (settled === null || reserved === null) return fail('cash unreadable (' + ccy + ')');
+      if (row.reservations_complete !== true) return fail('reservations incomplete (' + ccy + ')');
+      var net = settled - reserved;
+      if (net < 0) return fail('cash over-reserved (' + ccy + ')');
+      if (!rates.hasOwnProperty(ccy)) return fail('cash currency without FX proof (' + ccy + ')');
+      var rate = rates[ccy];
+      if (net > Math.floor(DT10_FUNDING_SAFE / rate) || total > DT10_FUNDING_SAFE - net * rate) {
+        return fail('cash too large for an exact check');
+      }
+      total += net * rate;             /* SAR at 10^-8 */
+      rows++;
+    }
+  }
+  if (!rows) return fail('cash rows missing');
+  out.cents = dt10FundingDiv_(total, 1000000, 'even');
+  return out;
+}
+
+/** PURE: links for THIS request's rows (row_index = position in holdings),
+ * matched on the native symbol + currency; every positive packet position
+ * must be represented. {links, unlinked, unrepresented, reason}. */
+function dt10FundingLinks_(holdings, packet) {
+  var out = {links: [], unlinked: [], unrepresented: [], reason: ''};
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  var positions = [];
+  for (var a = 0; a < accounts.length; a++) {
+    var acc = accounts[a] || {};
+    var list = Object.prototype.toString.call(acc.positions) === '[object Array]' ? acc.positions : [];
+    if (list.length > DT10_FUNDING_MAX_ITEMS) { out.reason = 'positions oversized'; return out; }
+    for (var p = 0; p < list.length; p++) {
+      var pos = list[p] || {};
+      var qty = dt10FundingUnits_(pos.quantity, 6);
+      positions.push({account_id: String(acc.account_id), instrument_id: String(pos.instrument_id),
+                      symbol: dt10FundingSym_(pos.symbol), currency: dt10FundingSym_(pos.currency),
+                      native: dt10FundingNative_(pos.symbol, pos.currency),
+                      positive: qty !== null && qty > 0});
+    }
+  }
+  var used = {};
+  for (var i = 0; i < holdings.length; i++) {
+    var h = holdings[i] || {};
+    var s = dt10FundingSym_(h.symbol), c = dt10FundingSym_(h.currency);
+    var hit = null, hits = 0;
+    for (var q = 0; q < positions.length; q++) {
+      if (positions[q].native && positions[q].native === s && positions[q].currency === c) {
+        hit = positions[q]; hits++;
+      }
+    }
+    var key = hit ? hit.account_id + '|' + hit.instrument_id : '';
+    if (hits === 1 && !used.hasOwnProperty(key)) {
+      used[key] = true;
+      out.links.push({row_index: i, account_id: hit.account_id, instrument_id: hit.instrument_id,
+                      position_symbol: hit.symbol, symbol: s, currency: c});
+    } else {
+      out.unlinked.push(s || '?');
+    }
+  }
+  for (var u = 0; u < positions.length; u++) {
+    var k2 = positions[u].account_id + '|' + positions[u].instrument_id;
+    if (positions[u].positive && !used.hasOwnProperty(k2)) out.unrepresented.push(positions[u].symbol);
+  }
+  return out;
+}
+
+/** PURE: a non-negative plain decimal at its own minimal scale (<= 6):
+ * 15.2 -> {units: 152, scale: 1}; 174 -> {units: 174, scale: 0}; else null. */
+function dt10FundingDecimal_(value) {
+  var u = dt10FundingUnits_(value, 6);
+  if (u === null || u < 0) return null;
+  var scale = 6;
+  while (scale > 0 && u % 10 === 0) { u = u / 10; scale--; }
+  return {units: u, scale: scale};
+}
+
+/** PURE: price x quantity x proven rate, rounded half-even to the cent, or
+ * null when any input is not a plain non-negative number or the exact
+ * product would leave the safe-integer range (the backend then decides). */
+function dt10FundingValueSar_(price, quantity, rateX100) {
+  var p = dt10FundingDecimal_(price), q = dt10FundingDecimal_(quantity);
+  if (!p || !q || !(rateX100 > 0)) return null;
+  if (p.units > 0 && q.units > Math.floor(DT10_FUNDING_SAFE / p.units)) return null;
+  var pq = p.units * q.units;
+  if (pq > Math.floor(DT10_FUNDING_SAFE / rateX100)) return null;
+  var div = Math.pow(10, p.scale + q.scale);     /* -> cents */
+  return dt10FundingDiv_(pq * rateX100, div, 'even') / 100;
+}
+
+/** PURE core. Mutates body IN PLACE only when it returns applied=true.
+ * exclude = symbols outside the broker's custody (e.g. 5023.SR). */
+function dt10FundingApplyCore_(body, packet, exclude, nowMs) {
+  var out = {applied: false, reason: '', ageMs: null, cashCents: null, rows: 0,
+             linked: 0, unlinked: [], unrepresented: [], excluded: [], rates: null};
+  function fail(why) { out.applied = false; out.reason = why; return out; }
+  if (!body || !body.portfolio || typeof body.portfolio !== 'object') return fail('request body unavailable');
+  if (!packet || Object.prototype.toString.call(packet) !== '[object Object]' ||
+      packet.schema_version !== 1) return fail('no evidence packet');
+  var capMs = dt10SourceStampMs_(packet.captured_at);
+  if (capMs === null || typeof packet.captured_at !== 'string' ||
+      !/(Z|[+-]\d{2}:?\d{2})$/.test(packet.captured_at)) return fail('captured_at unreadable');
+  out.ageMs = nowMs - capMs;
+  if (out.ageMs < 0) return fail('capture time ahead of the clock');
+  if (out.ageMs > DT10_FUNDING_MAX_AGE_MS) return fail('capture too old (' + dt10FundingAge_(out.ageMs) + ')');
+  var holdings = body.portfolio.holdings;
+  if (Object.prototype.toString.call(holdings) !== '[object Array]') return fail('holdings not sent (DT10_SEND_HOLDINGS)');
+  if (body.portfolio.holdings_input_incomplete !== false) return fail('holdings read incomplete');
+  if (holdings.length > DT10_FUNDING_MAX_ITEMS) return fail('holdings oversized');
+  var rates = dt10FundingRates_(packet);
+  if (!rates) return fail('fx proofs unreadable');
+  var set = {};
+  for (var e = 0; e < (exclude || []).length; e++) set[exclude[e]] = true;
+  var kept = [];
+  for (var r = 0; r < holdings.length; r++) {
+    var s = dt10FundingSym_(holdings[r] ? holdings[r].symbol : '');
+    if (s && set.hasOwnProperty(s)) out.excluded.push(s); else kept.push(holdings[r]);
+  }
+  var cash = dt10FundingCashCents_(packet, rates);
+  if (cash.cents === null) return fail(cash.reason);
+  var linkRes = dt10FundingLinks_(kept, packet);
+  if (linkRes.reason) return fail(linkRes.reason);
+  var evidence;
+  try { evidence = JSON.parse(JSON.stringify(packet)); } catch (eCp) { return fail('packet not serializable'); }
+  evidence.holding_links = linkRes.links;
+  var fx = {};
+  for (var k in body.fx_rates) { if (body.fx_rates.hasOwnProperty(k)) fx[k] = body.fx_rates[k]; }
+  for (var ccy in rates) {
+    if (rates.hasOwnProperty(ccy) && ccy !== 'SAR') fx[ccy] = rates[ccy] / 100;
+  }
+  for (var v = 0; v < kept.length; v++) {
+    var h = kept[v];
+    var hc = dt10FundingSym_(h.currency);
+    if (hc && hc !== 'SAR' && rates.hasOwnProperty(hc) &&
+        typeof h.quantity === 'number' && typeof h.current_price === 'number') {
+      var val = dt10FundingValueSar_(h.current_price, h.quantity, rates[hc]);
+      if (val !== null) h.value_sar = val;
+    }
+  }
+  body.portfolio.holdings = kept;
+  body.portfolio.reconciliation_evidence = evidence;
+  body.portfolio.cash_available_sar = cash.cents / 100;
+  body.portfolio.pending_proceeds_sar = 0;
+  body.fx_rates = fx;
+  out.applied = true;
+  out.cashCents = cash.cents;
+  out.rows = kept.length;
+  out.linked = linkRes.links.length;
+  out.unlinked = linkRes.unlinked;
+  out.unrepresented = linkRes.unrepresented;
+  out.rates = rates;
+  return out;
+}
+
+/** PURE: the status-line fragment (never the packet). */
+function dt10FundingNote_(res) {
+  if (!res) return '';
+  if (!res.applied) return ' | funding evidence NOT APPLIED (' + String(res.reason || '?').slice(0, 80) + ')';
+  var cents = res.cashCents, a = Math.abs(cents), c = a % 100;
+  var cashText = (cents < 0 ? '-' : '') + Math.floor(a / 100) + '.' + (c < 10 ? '0' : '') + c;
+  var fxText = [];
+  for (var k in res.rates) {
+    if (res.rates.hasOwnProperty(k) && k !== 'SAR') fxText.push(k + ' ' + (res.rates[k] / 100));
+  }
+  return ' | funding evidence APPLIED (capture age ' + dt10FundingAge_(res.ageMs) +
+      '; cash ' + cashText + ' SAR; linked ' + res.linked + '/' + res.rows +
+      (res.unlinked.length ? '; unlinked ' + res.unlinked.slice(0, 3).join(',') : '') +
+      (res.unrepresented.length ? '; unrepresented ' + res.unrepresented.slice(0, 3).join(',') : '') +
+      (res.excluded.length ? '; excluded ' + res.excluded.slice(0, 3).join(',') : '') +
+      (fxText.length ? '; ' + fxText.join(' ') : '') + ')';
+}
+
+/** Orchestrator: DT10_FUNDING_EVIDENCE=on only. Never throws; a fault leaves
+ * the body untouched and says so in the note. */
+function dt10FundingApply_(body, nowMs) {
+  try {
+    if (dt10FundingMode_() !== 'on') return '';
+    var exclude = dt10FundingExcludeList_(
+        PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_EXCLUDE_PROP));
+    var res = dt10FundingApplyCore_(body, dt10ReconciliationEvidence_(), exclude, nowMs);
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] funding evidence ' +
+                 (res.applied ? 'applied' : 'not applied: ' + res.reason));
+    } catch (eLg) {}
+    return dt10FundingNote_(res);
+  } catch (eFa) {
+    return ' | funding evidence ERROR (' + String(eFa && eFa.message ? eFa.message : eFa).slice(0, 80) + ')';
+  }
 }
 // ---------------------------------------------------------------------------
 // v1.3.0 — SELECTION STABILITY LAYER (pure core; node-parity-tested against
@@ -7440,6 +7826,10 @@ function dt10RefreshDecisionTop10Run_(run) {
     body.portfolio.cash_available_sar = dt10Chosen.sent;
     cashNote = dt10Chosen.note;
   }
+  // v1.16.0 [FUNDING-EVIDENCE]: the published broker packet certifies THIS
+  // request (cash after reservations, links, proven FX). Default off = the
+  // body above byte for byte; the replay deep-copies the applied body.
+  var fundingNote = dt10FundingApply_(body, Date.now());
   var poolNote = 'backend selector';
   var dt10Outage = null;   // v1.11.10 [P-168]: sheet-pool outage sightings
   // Capture source generations BEFORE reading pool rows. A late source
@@ -7548,7 +7938,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
-      poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
+      poolNote + heldNote + cashNote + fundingNote + ' | ' + dt10MetaLine_(payload.meta) +
       (stab && stab.note ? ' | ' + stab.note : '') +
       (earn && earn.note ? ' | ' + earn.note : '') +
       (kpiNote ? ' | ' + kpiNote : '') +
@@ -8968,6 +9358,22 @@ function dt10SelfTest() {
   var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);
   var pgChal4 = cbTk4(pg1, 'CHAL.US');
   var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);
+  // v1.16.0 [FUNDING-EVIDENCE]: pure core dry run (nothing is sent).
+  var fundProbe = {fx_rates: {USD: 3.7448}, portfolio: {cash_available_sar: 1, pending_proceeds_sar: 0,
+      holdings_input_incomplete: false, holdings: [{symbol: '5023.SR', currency: 'SAR', value_sar: 9390}]}};
+  var fundPacket = {schema_version: 1, source_ref: 'selftest', captured_at: '2026-10-26T05:40:00Z',
+      accounts: [{account_id: 'ibkr-primary', positions_asof: '2026-10-26T05:40:00Z', positions_complete: true,
+                  positions: [], cash_asof: '2026-10-26T05:40:00Z', cash_complete: true,
+                  cash: [{currency: 'USD', settled_cash: '22085.12', reserved_cash: '2644.8', reservations_complete: true}]}],
+      holding_links: [], funding_accounts: ['ibkr-primary'],
+      fx_rates: [{currency: 'USD', rate_to_sar: '3.75', asof: '2026-10-26T05:40:00Z', source_ref: 'policy://sama-usd-peg-3.75'}]};
+  var fundRes = dt10FundingApplyCore_(fundProbe, fundPacket, ['5023.SR'], Date.UTC(2026, 9, 26, 5, 45));
+  report.push('funding evidence core: ' + ((fundRes.applied && fundRes.cashCents === 7290120 &&
+      fundProbe.portfolio.cash_available_sar === 72901.2 && fundProbe.fx_rates.USD === 3.75 &&
+      fundProbe.portfolio.holdings.length === 0 && fundRes.excluded.length === 1 &&
+      dt10FundingApplyCore_({fx_rates: {}, portfolio: {holdings: [], holdings_input_incomplete: false}},
+          fundPacket, [], Date.UTC(2026, 9, 26, 6)).reason.indexOf('capture too old') === 0) ? 'ok' : 'FAIL') +
+      ' (mode ' + dt10FundingMode_() + ', packet ' + (dt10ReconciliationEvidence_() ? 'present' : 'absent') + ')');
   report.push('pending grace core: ' +
       ((JSON.stringify(pg0) === JSON.stringify(cbW) &&
         JSON.stringify(pgA) === JSON.stringify(cbW) &&
