@@ -1,5 +1,5 @@
-"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.0.0
-[P-182 BOARD SCORECARD].
+"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.1.0
+[P-182 BOARD SCORECARD] + [RANKING HEALTH].
 
 REAL module. The only stub is an in-memory workbook (worksheet /
 add_worksheet / get_all_values / update / append_row / add_rows / add_cols)
@@ -8,10 +8,14 @@ injected through _open_book; it records every call. No network.
 Env (all optional):
   SSL_FILE=<path>             test a file outside the repo tree
   SSL_BASE=<v0.1.0 file>      dual-tree for the unchanged v0.1.0 ticket path
+  SSL_BASE_V1=<v1.0.0 file>   golden negative for P9/P11 when `git show
+                              d25468a5:scripts/score_selection_log.py` is not
+                              available (shallow clone); otherwise git is used
   TFB_TEST_SELLOG_TSV=<_Selection_Log.tsv>   real-data legs (10-01 export)
   TFB_TEST_EXPORT_DIR=<dir>   Global_Markets.tsv / Mutual_Funds.tsv /
                               Market_Leaders.tsv of the same export
-P1 embedded self-test 16/16 (7 v0.1.0 cases + 9 new)
+P1 embedded self-test 20/20 (7 v0.1.0 cases + 9 v1.0.0 + 4 v1.1.0:
+   Spearman, reference mapping, ranking health / verdicts, wiring)
 P2 v0.1.0 ticket path: run() CSV + stdout byte-identical to base
    (synthetic; + the real export when set)
 P3 synthetic scorecard through main(): episodes, exit reasons, venue bar
@@ -31,6 +35,23 @@ P6 write: NEW tab created and written as ONE rectangle in one update; a
    write, DEGRADED row, rc 1
 P7 off: nothing computed, zero workbook calls, no artifacts
 P8 idempotence (detail + rectangle digests)
+P9 v1.1.0 GOLDEN NEGATIVE: TFB_BOARD_SCORECARD_RANKING unset / off -> stdout,
+   the three artifacts, the step summary, the tab rectangle and the _Run_Log
+   row are byte-identical to the untouched v1.0.0 base (d25468a5, read with
+   `git show`; only the version tag differs and is normalised); the base
+   never emits RANKING HEALTH, even with the gate on
+P10 gate on, synthetic _Selection_Log of 50 seats (5 boards x ranks 1-10,
+   Engine ROI / Rel / Conf / Sector / Market filled; 46 .US names over 6
+   sector words + PHP.L / WDP.BR / 2222.SR / AEFES.IS) with a prices CSV
+   carrying SPUS.US, XLF.US, VNQ.US, XLE.US, ^STOXX50E, ^FTSE, ^TASI.SR (XLK /
+   XLU deliberately missing): INVERTED / OK / INSUFFICIENT_DATA verdicts in
+   three variants; reference mapping per row; the seven DETAIL columns at the
+   END with hand-checked values; every RANKING HEALTH row re-aggregated
+   independently from the detail CSV; Spearman cross-checked by an
+   independent implementation + the hand-checked 6-point case; MD / step
+   summary / stdout carry the section; write mode: rectangle block below
+   CHURN, _Run_Log message carries the verdict, details JSON too
+P11 selftest() count: 16 (base) -> 20 (v1.1.0); the four new cases named
 
 Run under pytest in an isolated subprocess.
 """
@@ -46,9 +67,12 @@ def main():
     ROOT = os.path.abspath(os.path.join(HERE, ".."))
     SSL_FILE = os.environ.get("SSL_FILE") or os.path.join(ROOT, "scripts", "score_selection_log.py")
     SSL_BASE = os.environ.get("SSL_BASE", "")
+    SSL_BASE_V1 = os.environ.get("SSL_BASE_V1", "")
+    BASE_V1_REV = "d25468a5"          # main before v1.1.0: the untouched v1.0.0 script
     TSV = os.environ.get("TFB_TEST_SELLOG_TSV", "")
     EXPORT_DIR = os.environ.get("TFB_TEST_EXPORT_DIR", "")
-    ENVS = ("TFB_BOARD_SCORECARD", "TFB_BOARD_SCORECARD_MIN_COVERAGE", "GITHUB_STEP_SUMMARY")
+    ENVS = ("TFB_BOARD_SCORECARD", "TFB_BOARD_SCORECARD_MIN_COVERAGE", "GITHUB_STEP_SUMMARY",
+            "TFB_BOARD_SCORECARD_RANKING")
     ASOF = "2026-10-01T06:00:00Z"
 
 
@@ -61,7 +85,8 @@ def main():
 
 
     m = _load(SSL_FILE, "ssl_under_test")
-    assert tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 0, 0), m.SCRIPT_VERSION
+    assert tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 1, 0), m.SCRIPT_VERSION
+    VTAG = "v" + m.SCRIPT_VERSION
     out = []
     digests = []
     TMP = tempfile.mkdtemp(prefix="tfb_p182_")
@@ -169,7 +194,8 @@ def main():
         SERIAL_NUMBER): 'Logged At' as a serial number, numbers as numbers."""
         hdr = grid[0]
         i_at = hdr.index("Logged At")
-        num_cols = {hdr.index(c) for c in ("Rank", "Price", "Price SAR", "FX→SAR") if c in hdr}
+        num_cols = {hdr.index(c) for c in ("Rank", "Price", "Price SAR", "FX→SAR",
+                                           "Engine ROI %", "Rel") if c in hdr}
         outg = [list(hdr)]
         for r in grid[1:]:
             r = list(r)
@@ -195,7 +221,8 @@ def main():
 
 
     def _slrow(at, run, sym, rank="", px="", fx="", ticket="", stop="", tp1="", tp2="",
-               outcome="", exit_=False, output="HELD", ccy="USD", sector="Tech"):
+               outcome="", exit_=False, output="HELD", ccy="USD", sector="Tech",
+               eroi="", rel="", conf="", market=""):
         row = [""] * len(SELLOG_HDR)
         H = {c: i for i, c in enumerate(SELLOG_HDR)}
         info = f"Last run {run} | status: ok | output: {output} | route v4.16.0"
@@ -206,7 +233,8 @@ def main():
                 "Sector": "" if exit_ else sector, "Ccy": "" if exit_ else ccy,
                 "FX→SAR": fx, "Price": px, "Ticket SAR": ticket, "Stop SAR": stop,
                 "TP1 SAR": tp1, "TP2 SAR": tp2, "Outcome": outcome,
-                "Stability": "" if exit_ else "FAST-TRACK (day 1)"}
+                "Stability": "" if exit_ else "FAST-TRACK (day 1)",
+                "Engine ROI %": eroi, "Rel": rel, "Conf": conf, "Market": market}
         for k, v in vals.items():
             row[H[k]] = v
         return row
@@ -284,6 +312,113 @@ def main():
     _write_tsv(syn_tsv, SYN_LOG)
     _write_prices(syn_px, SYN_PRICES)
 
+    # ------------------------------------------- v1.1.0 [RANKING HEALTH] fixture
+    # 5 boards (09-01, 09-08, 09-15, 09-22, 10-01 at 10:00 Riyadh) x ranks 1-10
+    # = 50 seats; every board replaces the previous one whole (DROPPED). Each
+    # name's closes are a straight line close_i = 100 * (1 + g * i) over its
+    # venue's sessions; the seat price is the previous session's close, so
+    # the sign of every excess is sign(g_name - g_reference) by construction
+    # (f(g) = (1 + N g) / (1 + k g) rises with g while k < N). References:
+    # SPUS +0.001/session, XLF +0.002, VNQ +0.003, XLE +0.004, the venue
+    # indexes +0.001. XLK.US and XLU.US are NOT in the prices CSV (mapped but
+    # missing -> blank vs-Ref columns, SPUS fallback in the statistics).
+    RK_ASOF = "2026-10-02T06:00:00Z"
+    RK_SECTOR = {"FS": "Financial Services", "RE": "Real Estate", "EN": "Energy",
+                 "TK": "Technology", "BK": "Banks", "UT": "Utilities"}
+    RK_REF = {"FS": "XLF.US", "RE": "VNQ.US", "EN": "XLE.US", "TK": "XLK.US", "BK": "",
+              "UT": "XLU.US"}
+    RK_REF_G = {"SPUS.US": 0.001, "XLF.US": 0.002, "VNQ.US": 0.003, "XLE.US": 0.004,
+                "^STOXX50E": 0.001, "^FTSE": 0.001, "^TASI.SR": 0.001}
+    RK_RANK_G = {1: -0.004, 2: -0.003, 3: -0.002, 4: 0.0015, 5: 0.0025, 6: 0.0035,
+                 7: 0.006, 8: 0.007, 9: 0.008, 10: 0.009}
+    RK_DAYS = ["2026-09-01", "2026-09-08", "2026-09-15", "2026-09-22", "2026-10-01"]
+    # (symbol, sector key, reference) in seat order: board-major, rank-minor
+    RK_SEATS = [("FS01.US", "FS", "XLF.US"), ("RE01.US", "RE", "VNQ.US"), ("EN01.US", "EN", "XLE.US"),
+                ("FS02.US", "FS", "XLF.US"), ("RE02.US", "RE", "VNQ.US"), ("EN02.US", "EN", "XLE.US"),
+                ("PHP.L", "FS", "^FTSE"), ("WDP.BR", "RE", "^STOXX50E"), ("FS03.US", "FS", "XLF.US"),
+                ("2222.SR", "EN", "^TASI.SR"),
+                ("FS04.US", "FS", "XLF.US"), ("RE03.US", "RE", "VNQ.US"), ("EN03.US", "EN", "XLE.US"),
+                ("FS05.US", "FS", "XLF.US"), ("RE04.US", "RE", "VNQ.US"), ("EN04.US", "EN", "XLE.US"),
+                ("FS06.US", "FS", "XLF.US"), ("RE05.US", "RE", "VNQ.US"), ("EN05.US", "EN", "XLE.US"),
+                ("TK01.US", "TK", "XLK.US"),
+                ("FS07.US", "FS", "XLF.US"), ("RE06.US", "RE", "VNQ.US"), ("EN06.US", "EN", "XLE.US"),
+                ("FS08.US", "FS", "XLF.US"), ("RE07.US", "RE", "VNQ.US"), ("EN07.US", "EN", "XLE.US"),
+                ("FS09.US", "FS", "XLF.US"), ("RE08.US", "RE", "VNQ.US"), ("EN08.US", "EN", "XLE.US"),
+                ("TK02.US", "TK", "XLK.US"),
+                ("FS10.US", "FS", "XLF.US"), ("RE09.US", "RE", "VNQ.US"), ("BK01.US", "BK", ""),
+                ("FS11.US", "FS", "XLF.US"), ("RE10.US", "RE", "VNQ.US"), ("AEFES.IS", "TK", ""),
+                ("FS12.US", "FS", "XLF.US"), ("RE11.US", "RE", "VNQ.US"), ("TK03.US", "TK", "XLK.US"),
+                ("BK02.US", "BK", ""),
+                ("FS13.US", "FS", "XLF.US"), ("RE12.US", "RE", "VNQ.US"), ("UT01.US", "UT", "XLU.US"),
+                ("FS14.US", "FS", "XLF.US"), ("FS15.US", "FS", "XLF.US"), ("FS16.US", "FS", "XLF.US"),
+                ("FS17.US", "FS", "XLF.US"), ("FS18.US", "FS", "XLF.US"), ("FS19.US", "FS", "XLF.US"),
+                ("FS20.US", "FS", "XLF.US")]
+    assert len(RK_SEATS) == 50 and len({s[0] for s in RK_SEATS}) == 50
+
+    def _rk_fixture(variant):
+        """variant: 'inverted' (ranks 1-3 fall, 7-10 rise; Engine ROI falls
+        with the drift), 'ok' (the mirror image: ranks 1-3 rise; Engine ROI
+        rises with the drift), 'insufficient' (the first board only).
+        Returns (grid, prices_rows, seats) with seats = per-seat facts."""
+        boards = RK_DAYS[:1] if variant == "insufficient" else RK_DAYS
+        grid, seats, rows = [SELLOG_HDR], [], []
+        for b, day in enumerate(boards):
+            for rank in range(1, 11):
+                sym, key, ref = RK_SEATS[10 * b + rank - 1]
+                g = RK_RANK_G[11 - rank] if variant == "ok" else RK_RANK_G[rank]
+                roi = (40.0 + 5000.0 * g) if variant == "ok" else (60.0 - 5000.0 * g)
+                conf = "Medium" if rank <= 3 else ("High" if rank <= 6 or rank % 2 == 0 else "Low")
+                sess = SR if sym.endswith(".SR") else US
+                k = sess.index(day)                       # sessions before the seat
+                seat_px = 100.0 * (1.0 + g * k)
+                ccy = "SAR" if sym.endswith(".SR") else ("GBP" if sym.endswith(".L") else
+                                                         ("EUR" if sym.endswith(".BR") else
+                                                          ("TRY" if sym.endswith(".IS") else "USD")))
+                grid.append(_slrow(day + "T10:00:00", day + " 10:00:00", sym, str(float(rank)),
+                                   repr(seat_px), "3.75", ccy=ccy, sector=RK_SECTOR[key],
+                                   eroi=repr(roi), rel=str(70.0 + rank), conf=conf,
+                                   market=sym.rsplit(".", 1)[1]))
+                rows += [(sym, d, 100.0 * (1.0 + g * i)) for i, d in enumerate(sess, 1)]
+                g_ref = RK_REF_G.get(ref, RK_REF_G["SPUS.US"])     # mapped-but-missing -> SPUS
+                seats.append({"symbol": sym, "day": day, "rank": rank, "g": g, "roi": roi,
+                              "conf": conf, "sector": RK_SECTOR[key], "ref": ref,
+                              "hit_ref": g > g_ref, "hit_spus": g > RK_REF_G["SPUS.US"],
+                              "ref_present": ref in RK_REF_G})
+        for ref, gr in RK_REF_G.items():
+            sess = SR if ref.endswith(".SR") else US
+            rows += [(ref, "2026-08-31", 50.0)] + [(ref, d, 50.0 * (1.0 + gr * i))
+                                                   for i, d in enumerate(sess, 1)]
+        return grid, rows, seats
+
+    def _spearman_ref(xs, ys):
+        """Independent Spearman (average ranks for ties, Pearson on ranks)."""
+        def ranks(v):
+            idx = sorted(range(len(v)), key=lambda i: v[i])
+            out, i = [0.0] * len(v), 0
+            while i < len(idx):
+                j = i
+                while j + 1 < len(idx) and v[idx[j + 1]] == v[idx[i]]:
+                    j += 1
+                for t in range(i, j + 1):
+                    out[idx[t]] = (i + j) / 2.0 + 1.0
+                i = j + 1
+            return out
+        rx, ry = ranks(xs), ranks(ys)
+        n = len(xs)
+        mx, my = sum(rx) / n, sum(ry) / n
+        num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+        den = (sum((a - mx) ** 2 for a in rx) * sum((b - my) ** 2 for b in ry)) ** 0.5
+        return num / den
+
+    rk_fx = {}
+    for variant in ("inverted", "ok", "insufficient"):
+        g_, p_, s_ = _rk_fixture(variant)
+        t_path, p_path = (os.path.join(TMP, "rk_%s_sellog.tsv" % variant),
+                          os.path.join(TMP, "rk_%s_prices.csv" % variant))
+        _write_tsv(t_path, g_)
+        _write_prices(p_path, p_)
+        rk_fx[variant] = (t_path, p_path, g_, s_, p_)
+
 
     def _export_closes():
         """US rows refreshed on 10-01 carry two closes each: Previous Close =
@@ -317,7 +452,7 @@ def main():
 
     # ------------------------------------------------------------------- P1
     rc, so = _call(m.selftest)
-    T("P1 embedded self-test 16/16", rc == 0 and "SELFTEST 16/16: ALL GREEN" in so, so.strip())
+    T("P1 embedded self-test 20/20", rc == 0 and "SELFTEST 20/20: ALL GREEN" in so, so.strip())
 
     # ------------------------------------------------------------------- P2
     if SSL_BASE:
@@ -343,9 +478,9 @@ def main():
     with _env(TFB_BOARD_SCORECARD="observe", GITHUB_STEP_SUMMARY=step):
         rc, so = _call(m.main, ["--scorecard", "--tsv", syn_tsv, "--prices-csv", syn_px,
                                 "--asof", ASOF, "--out-dir", syn_out])
-    T("P3 rc 0 + tag line", rc == 0 and "[BOARD-SCORECARD v1.0.0] mode=observe source=tsv episodes=5 "
-      "open=2 since=2026-09-01(5) priced=4 prices=csv 4/5 bench=ok orphan_exits=1 wrote=0 artifacts=3" in so,
-      so.strip().splitlines()[-1])
+    T("P3 rc 0 + tag line", rc == 0 and "[BOARD-SCORECARD %s] mode=observe source=tsv episodes=5 "
+      "open=2 since=2026-09-01(5) priced=4 prices=csv 4/5 bench=ok orphan_exits=1 wrote=0 artifacts=3" % VTAG in so
+      and so.strip().splitlines()[-1].endswith("artifacts=3"), so.strip().splitlines()[-1])
     hdr, det = _detail_by(os.path.join(syn_out, "board_scorecard_detail.csv"))
     T("P3 detail header", hdr == m.DETAIL_HEADER)
     by = {(d["Symbol"], d["Seat Date"]): d for d in det}
@@ -497,10 +632,11 @@ def main():
     rect = tab.values
     T("P6 rectangle: uniform width 22, title tag, DETAIL header present",
       len({len(r) for r in rect}) == 1 and len(rect[0]) == len(m.DETAIL_HEADER)
-      and rect[0][0].startswith("[BOARD-SCORECARD v1.0.0]") and m.DETAIL_HEADER in rect, len(rect))
+      and rect[0][0].startswith("[BOARD-SCORECARD %s]" % VTAG) and m.DETAIL_HEADER in rect, len(rect))
     rl = book.tabs["_Run_Log"].values[-1]
     T("P6 _Run_Log row: OK, tag, details JSON", rl[1:5] == ["INFO", "score_selection_log", "_Board_Scorecard", "OK"]
-      and rl[5].startswith("[BOARD-SCORECARD v1.0.0] episodes=") and json.loads(rl[9])["mode"] == "write", rl[:6])
+      and rl[5].startswith("[BOARD-SCORECARD %s] episodes=" % VTAG) and json.loads(rl[9])["mode"] == "write"
+      and "ranking" not in rl[5] and "ranking" not in json.loads(rl[9]), rl[:6])
     n1 = len(rect)
     # second, shorter write: only the log rows up to 09-09 -> fewer episodes
     cut = ((datetime(2026, 7, 1) if REAL else datetime(2026, 9, 9)) - datetime(1899, 12, 30)).days
@@ -538,6 +674,334 @@ def main():
     _live_run(book, "write", os.path.join(TMP, "live_i2"), cov="0")
     r2 = [list(r) for r in book.tabs["_Board_Scorecard"].values]
     T("P8 idempotence: same input -> identical rectangle", r1 == r2 and r1 == rect, _h(r1))
+
+    # ----------------------------------------------------------- v1.1.0 helpers
+    def _run_mod(mod, book, mode, out_dir, tsv_path, px_path, rk=None, asof=RK_ASOF, step=None):
+        """One scorecard run of `mod`: live (stub book) when book is given,
+        else the TSV path. rk = TFB_BOARD_SCORECARD_RANKING value or None."""
+        if book is not None:
+            mod._open_book = lambda: book
+        args = ["--scorecard", "--prices-csv", px_path, "--asof", asof, "--out-dir", out_dir]
+        args += ["--live"] if book is not None else ["--tsv", tsv_path]
+        with _env(TFB_BOARD_SCORECARD=mode, TFB_BOARD_SCORECARD_RANKING=rk,
+                  TFB_BOARD_SCORECARD_MIN_COVERAGE="0", GITHUB_STEP_SUMMARY=step):
+            return _call(mod.main, args)
+
+    def _artifacts(out_dir):
+        return {f: open(os.path.join(out_dir, f), "rb").read()
+                for f in ("board_scorecard_detail.csv", "board_scorecard_summary.csv",
+                          "board_scorecard.md")}
+
+    def _norm(obj):
+        """Version-tag normalisation: v1.1.0 text -> v1.0.0 (meta line, tag
+        lines, details JSON) so the rest can be compared byte for byte."""
+        return (obj if isinstance(obj, str) else json.dumps(obj, default=str)).replace(
+            m.SCRIPT_VERSION, "1.0.0")
+
+    base_v1_path = os.path.join(TMP, "base_v1_0_0", "score_selection_log.py")
+    os.makedirs(os.path.dirname(base_v1_path), exist_ok=True)
+    base_v1_src = ""
+    if SSL_BASE_V1 and os.path.exists(SSL_BASE_V1):
+        base_v1_src = SSL_BASE_V1
+    else:
+        try:
+            blob = subprocess.run(["git", "-C", ROOT, "show", BASE_V1_REV + ":scripts/score_selection_log.py"],
+                                  capture_output=True, text=True, timeout=60)
+            if blob.returncode == 0 and "SCRIPT_VERSION = \"1.0.0\"" in blob.stdout:
+                with open(base_v1_path, "w", encoding="utf-8") as fh:
+                    fh.write(blob.stdout)
+                base_v1_src = base_v1_path
+        except (OSError, subprocess.SubprocessError):
+            base_v1_src = ""
+    base_v1 = _load(base_v1_src, "ssl_base_v1_0_0") if base_v1_src else None
+
+    inv_tsv, inv_px, inv_grid, inv_seats, _inv_rows = rk_fx["inverted"]
+    inv_live = _serialize_live(inv_grid)
+
+    # ------------------------------------------------------------------- P9
+    if base_v1 is not None:
+        T("P9 base is the untouched v1.0.0 (SCRIPT_VERSION, no ranking gate helper)",
+          base_v1.SCRIPT_VERSION == "1.0.0" and not hasattr(base_v1, "_ranking_enabled")
+          and not hasattr(base_v1, "ranking_health"))
+        for gate in (None, "off"):
+            label = "unset" if gate is None else "off"
+            res = {}
+            for who, mod in (("new", m), ("base", base_v1)):
+                od = os.path.join(TMP, "p9_%s_%s" % (who, label))
+                st = os.path.join(TMP, "p9_step_%s_%s.md" % (who, label))
+                rc, so = _run_mod(mod, None, "observe", od, inv_tsv, inv_px, rk=gate, step=st)
+                res[who] = (rc, _norm(so), {k: _norm(v.decode("utf-8")) for k, v in _artifacts(od).items()},
+                            _norm(open(st, encoding="utf-8").read()))
+            T("P9 gate %s: stdout + 3 artifacts + step summary byte-identical to v1.0.0 (tag normalised)"
+              % label, res["new"] == res["base"] and res["new"][0] == 0,
+              [(k, len(res["new"][2][k]), len(res["base"][2][k])) for k in res["new"][2]])
+            T("P9 gate %s: 22 DETAIL columns, no RANKING HEALTH anywhere" % label,
+              res["new"][2]["board_scorecard_detail.csv"].splitlines()[0].count(",") == 21
+              and "RANKING" not in res["new"][1] and "ranking" not in res["new"][1]
+              and all("RANKING" not in v for v in res["new"][2].values()))
+            # write path: rectangle + _Run_Log row
+            rects, logs = {}, {}
+            for who, mod in (("new", m), ("base", base_v1)):
+                book = StubBook({"_Selection_Log": inv_live, "_Run_Log": [RUNLOG_HDR]})
+                rc, so = _run_mod(mod, book, "write", os.path.join(TMP, "p9w_%s_%s" % (who, label)),
+                                  inv_tsv, inv_px, rk=gate)
+                rects[who] = (rc, _norm(book.tabs["_Board_Scorecard"].values),
+                              [c[0] for c in _writes(book)])
+                logs[who] = _norm(book.tabs["_Run_Log"].values[-1])
+            T("P9 gate %s: write mode -> identical rectangle, identical write calls, identical _Run_Log row"
+              % label, rects["new"] == rects["base"] and logs["new"] == logs["base"]
+              and rects["new"][2] == ["add_worksheet", "update", "append_row"],
+              (rects["new"][2], logs["new"][:120]))
+        # the base ignores the gate: no RANKING HEALTH even when it is on
+        od = os.path.join(TMP, "p9_base_on")
+        rc, so = _run_mod(base_v1, None, "observe", od, inv_tsv, inv_px, rk="on")
+        T("P9 base v1.0.0 never emits RANKING HEALTH (gate on is ignored by it)",
+          rc == 0 and "RANKING HEALTH" not in so
+          and all(b"RANKING" not in v for v in _artifacts(od).values())
+          and _artifacts(od)["board_scorecard_detail.csv"].splitlines()[0].count(b",") == 21)
+    else:
+        out.append("SKIP P9 golden negative (git show %s unavailable; set SSL_BASE_V1=<v1.0.0 file>)"
+                   % BASE_V1_REV)
+
+    # ------------------------------------------------------------------ P10
+    EXTRA = ["Rank", "Engine ROI %", "Rel", "Conf", "Ref", "vs Ref +5 pp", "vs Ref Now pp"]
+    T("P10 constants: DETAIL_HEADER_RANKING = DETAIL_HEADER + 7 at the END; ROI_CAP_BUCKET 34; header",
+      m.DETAIL_HEADER_RANKING == m.DETAIL_HEADER + EXTRA and m.ROI_CAP_BUCKET == 34.0
+      and m.RANKING_HEADER == ["Window", "Cut", "Bucket", "Episodes", "With Data", "Hit % (vs ref)",
+                               "Mean vs Ref pp", "Mean vs SPUS pp"])
+    seen = []
+    for v in (None, "off", "bogus", "on", "ON", "1", "true", "yes"):
+        with _env(TFB_BOARD_SCORECARD_RANKING=v):
+            seen.append(m._ranking_enabled())
+    T("P10 gate parsing: unset/off/bogus -> off; on/1/true/yes -> on",
+      seen == [False, False, False, True, True, True, True, True], seen)
+    T("P10 Spearman hand check: 6 points with a tie -> 14.5/sqrt(17*17.5) = 0.84067; textbook -29/165",
+      abs(m.spearman([1, 2, 2, 4, 5, 6], [2, 1, 3, 4, 6, 5]) - 14.5 / (17.0 * 17.5) ** 0.5) < 1e-12
+      and abs(m.spearman([106, 86, 100, 101, 99, 103, 97, 113, 112, 110],
+                         [7, 0, 27, 50, 28, 29, 20, 12, 6, 17]) + 29.0 / 165.0) < 1e-12
+      and m.spearman([1, 2, 3], [1, 1, 1]) is None)
+    T("P10 reference mapping: US sector words / non-US suffix / unmatched",
+      [m.ref_symbol(s, sec) for s, sec in (("A.US", "Financial Services"), ("A.US", "Financials"),
+                                           ("A.US", "Real Estate"), ("A.US", "Technology"),
+                                           ("A.US", "Information Technology"), ("A.US", "Healthcare"),
+                                           ("A.US", "Consumer Cyclical"), ("A.US", "Consumer Defensive"),
+                                           ("A.US", "Basic Materials"), ("A.US", "Communication Services"),
+                                           ("A.US", "Consumer"), ("A.US", "Banks"), ("A.US", ""),
+                                           ("PHP.L", "Real Estate"), ("WDP.BR", "Real Estate"),
+                                           ("URW.PA", ""), ("1972.HK", "Energy"), ("2222.SR", "Energy"),
+                                           ("7203.T", "Consumer Cyclical"), ("RY.TO", "Financials"),
+                                           ("BHP.AX", "Basic Materials"), ("D05.SI", "Financials"),
+                                           ("AMXL.MX", ""), ("005930.KS", "Technology"), ("X.IS", ""))] ==
+      ["XLF.US", "XLF.US", "VNQ.US", "XLK.US", "XLK.US", "XLV.US", "XLY.US", "XLP.US", "XLB.US", "XLC.US",
+       "", "", "", "^FTSE", "^STOXX50E", "^STOXX50E", "^HSI", "^TASI.SR", "^N225", "^GSPTSE", "^AXJO",
+       "^STI", "^MXX", "", ""])
+
+    def _rk_rows(summary_csv):
+        rows = _read_csv(summary_csv)
+        i = rows.index(m.RANKING_HEADER)
+        return [r for r in rows[i + 1:] if r]
+
+    def _check_variant(variant, want_verdict):
+        tsv_path, px_path, grid, seats, px_rows = rk_fx[variant]
+        od = os.path.join(TMP, "p10_" + variant)
+        st = os.path.join(TMP, "p10_step_%s.md" % variant)
+        rc, so = _run_mod(m, None, "observe", od, tsv_path, px_path, rk="on", step=st)
+        n = len(seats)
+        last = so.strip().splitlines()[-1]
+        T("P10 %s: rc 0, %d episodes, tag line ends with ranking=%s" % (variant, n, want_verdict),
+          rc == 0 and ("episodes=%d" % n) in last and last.endswith(" ranking=" + want_verdict), last)
+        hdr, det = _detail_by(os.path.join(od, "board_scorecard_detail.csv"))
+        T("P10 %s: detail header = v1.0.0 columns + the 7 new ones at the END" % variant,
+          hdr == m.DETAIL_HEADER_RANKING, hdr[-8:])
+        by = {d["Symbol"]: d for d in det}
+        T("P10 %s: every seat scored (OPEN / CLOSED), all %d symbols once" % (variant, n),
+          len(det) == n and all(d["Status"] in ("OPEN", "CLOSED") for d in det)
+          and all(s["symbol"] in by for s in seats), sorted({d["Status"] for d in det}))
+        exp_ref = {s["symbol"]: s["ref"] for s in seats}
+        T("P10 %s: Ref column per row = sector ETF (.US) / venue index / blank" % variant,
+          all(by[s]["Ref"] == r for s, r in exp_ref.items()),
+          [(s, by[s]["Ref"], r) for s, r in exp_ref.items() if by[s]["Ref"] != r][:5])
+        missing = [s["symbol"] for s in seats if s["ref"] and not s["ref_present"]]
+        T("P10 %s: mapped-but-missing series (XLK/XLU, %d names) -> blank vs-Ref columns, not an error"
+          % (variant, len(missing)),
+          (variant == "insufficient" or len(missing) == 4)
+          and all(by[s]["vs Ref +5 pp"] == "" and by[s]["vs Ref Now pp"] == ""
+                  and by[s]["vs SPUS Now pp"] != "" for s in missing), missing)
+        T("P10 %s: Rank / Engine ROI %% / Rel / Conf carried from the first seat" % variant,
+          all(by[s["symbol"]]["Rank"] == str(s["rank"]) and by[s["symbol"]]["Conf"] == s["conf"]
+              and float(by[s["symbol"]]["Engine ROI %"]) == round(s["roi"], 2)
+              and float(by[s["symbol"]]["Rel"]) == 70.0 + s["rank"] for s in seats))
+        T("P10 %s: hit sign per row = sign(g_name - g_ref) by construction (vs ref and vs SPUS)" % variant,
+          all(((float(by[s["symbol"]]["vs Ref Now pp"]) > 0) == s["hit_ref"] if s["ref_present"] else True)
+              and (float(by[s["symbol"]]["vs SPUS Now pp"]) > 0) == s["hit_spus"] for s in seats))
+        # EXACT excess per seat, independently from the fixture's own series
+        # (bar 1 = the seat day for every venue here: 10:00 Riyadh is before
+        # each venue's close); spec: reference % from its last close before
+        # bar 1 to its last close on/before the name's last close.
+        series = {}
+        for sym_, d_, c_ in px_rows:
+            series.setdefault(sym_, []).append((d_, c_))
+
+        def _ret(ser, d1, dk):
+            ref = val = None
+            for d_, c_ in sorted(ser):
+                if d_ < d1:
+                    ref = c_
+                if d_ <= dk:
+                    val = c_
+            return (val / ref - 1.0) * 100.0
+
+        exact = {}
+        for s_ in seats:
+            ser = sorted(series[s_["symbol"]])
+            k_ = [d_ for d_, _c in ser].index(s_["day"])
+            seat_px = 100.0 if k_ == 0 else ser[k_ - 1][1]
+            r_now = (ser[-1][1] / seat_px - 1.0) * 100.0
+            x_spus = r_now - _ret(series["SPUS.US"], s_["day"], ser[-1][0])
+            x_ref = (r_now - _ret(series[s_["ref"]], s_["day"], ser[-1][0])
+                     if s_["ref_present"] else None)
+            exact[s_["symbol"]] = {"now": r_now, "x_spus": x_spus, "x_ref": x_ref,
+                                   "eff": x_spus if x_ref is None else x_ref,
+                                   "rank": s_["rank"], "roi": s_["roi"], "conf": s_["conf"],
+                                   "sector": s_["sector"]}
+        r2s = lambda v: "" if v is None else str(round(v, 2) + 0.0)
+        bad = [(sym_, by[sym_]["To Now %"], r2s(e["now"]), by[sym_]["vs SPUS Now pp"], r2s(e["x_spus"]),
+                by[sym_]["vs Ref Now pp"], r2s(e["x_ref"])) for sym_, e in exact.items()
+               if (by[sym_]["To Now %"], by[sym_]["vs SPUS Now pp"], by[sym_]["vs Ref Now pp"])
+               != (r2s(e["now"]), r2s(e["x_spus"]), r2s(e["x_ref"]))]
+        T("P10 %s: To Now %% / vs SPUS Now pp / vs Ref Now pp of all %d rows == exact values (2 dp)"
+          % (variant, n), not bad, bad[:3])
+        # independent re-aggregation of every RANKING HEALTH row of the Since window
+        rows = _rk_rows(os.path.join(od, "board_scorecard_summary.csv"))
+        W = "Since 2026-09-01"
+        since_rows = [r for r in rows if r[0] == W]
+        ex = list(exact.values())
+
+        def agg(sub):
+            xs = [e["eff"] for e in sub]
+            sp = [e["x_spus"] for e in sub]
+            return [str(len(sub)), str(len(xs)),
+                    r2s(100.0 * sum(1 for x in xs if x > 0) / len(xs)) if xs else "",
+                    r2s(sum(xs) / len(xs)) if xs else "", r2s(sum(sp) / len(sp)) if sp else ""]
+
+        exp = []
+        for lab, lo, hi in (("1-3", 1, 3), ("4-6", 4, 6), ("7-10", 7, 10)):
+            exp.append([W, "Rank", lab] + agg([e for e in ex if lo <= e["rank"] <= hi]))
+        exp.append([W, "Engine ROI", ">= 34"] + agg([e for e in ex if e["roi"] >= 34]))
+        exp.append([W, "Engine ROI", "< 34"] + agg([e for e in ex if e["roi"] < 34]))
+        for lab in ("High", "Medium"):
+            exp.append([W, "Conf", lab] + agg([e for e in ex if e["conf"] == lab]))
+        exp.append([W, "Conf", "Other"] + agg([e for e in ex if e["conf"] not in ("High", "Medium")]))
+        cnt = {}
+        for e in ex:
+            cnt[e["sector"]] = cnt.get(e["sector"], 0) + 1
+        big = sorted([k for k, c in cnt.items() if c >= 5], key=lambda k: (-cnt[k], k))
+        for k in big:
+            exp.append([W, "Sector", k] + agg([e for e in ex if e["sector"] == k]))
+        exp.append([W, "Sector", "Other"] + agg([e for e in ex if e["sector"] not in big]))
+        T("P10 %s: Rank / Engine ROI / Conf / Sector rows of the Since window == independent re-aggregation"
+          " of the exact values (%d rows, byte-equal)" % (variant, len(exp)),
+          since_rows[:len(exp)] == exp, [(a, b) for a, b in zip(since_rows, exp) if a != b][:2])
+        rho = _spearman_ref([e["roi"] for e in ex], [e["eff"] for e in ex])
+        rho_rk = _spearman_ref([e["rank"] for e in ex], [e["eff"] for e in ex])
+        sp_rows = [r for r in since_rows if r[1] == "Spearman"]
+        T("P10 %s: Spearman rows == independent implementation on the exact values (ROI %.3f, Rank %.3f, n=%d)"
+          % (variant, rho, rho_rk, n),
+          sp_rows[0][2] == "Engine ROI at seat vs excess: rho %.3f (n=%d)" % (round(rho, 3) + 0.0, n)
+          and sp_rows[1][2] == "Rank at seat vs excess: rho %.3f (n=%d)" % (round(rho_rk, 3) + 0.0, n)
+          and sp_rows[0][3:5] == [str(n), str(n)] and sp_rows[1][3:5] == [str(n), str(n)], sp_rows)
+        text = "%s (spearman %.2f, n=%d)" % (want_verdict, round(rho, 2) + 0.0, n)
+        vrow = [r for r in since_rows if r[1] == "Verdict"]
+        T("P10 %s: ONE verdict row per window; Since window = '%s'" % (variant, text),
+          len(vrow) == 1 and vrow[0][2] == text and vrow[0][3] == str(n) and since_rows[-1] == vrow[0]
+          and [r[1] for r in rows].count("Verdict") == len({r[0] for r in rows}), vrow)
+        md = open(os.path.join(od, "board_scorecard.md"), encoding="utf-8").read()
+        T("P10 %s: RANKING HEALTH in stdout, MD artifact and step summary (Since rows + month verdicts)"
+          % variant, "RANKING HEALTH" in so and md in so and open(st, encoding="utf-8").read() == md
+          and "| " + " | ".join(vrow[0]) + " |" in md
+          and all("| " + " | ".join(r) + " |" in md for r in rows if r[1] == "Verdict")
+          and all(("| " + " | ".join(r) + " |" in md) == (r[0] == W or r[1] == "Verdict") for r in rows))
+        return rows, det, by, rho
+
+    rows_inv, det_inv, by_inv, rho_inv = _check_variant("inverted", "RANKING_INVERTED")
+    W = "Since 2026-09-01"
+    r13 = [r for r in rows_inv if r[:3] == [W, "Rank", "1-3"]][0]
+    r710 = [r for r in rows_inv if r[:3] == [W, "Rank", "7-10"]][0]
+    T("P10 inverted: ranks 1-3 15/15 hit 0 %%, ranks 7-10 20/20 hit 100 %%, Spearman(ROI) <= -0.20 (%.3f)" % rho_inv,
+      r13[3:6] == ["15", "15", "0.0"] and r710[3:6] == ["20", "20", "100.0"] and rho_inv <= -0.20, (r13, r710))
+    T("P10 inverted: Engine ROI >= 34 holds the 30 top-six seats, < 34 the 20 others; Conf High 25 / Medium 15 / Other 10",
+      [r[3] for r in rows_inv if r[:2] == [W, "Engine ROI"]] == ["30", "20"]
+      and [(r[2], r[3]) for r in rows_inv if r[:2] == [W, "Conf"]] == [("High", "25"), ("Medium", "15"), ("Other", "10")])
+    T("P10 inverted: Sector rows = Financial Services 21, Real Estate 13, Energy 9 (>= 5 each), Other 7",
+      [(r[2], r[3]) for r in rows_inv if r[:2] == [W, "Sector"]] ==
+      [("Financial Services", "21"), ("Real Estate", "13"), ("Energy", "9"), ("Other", "7")])
+    T("P10 inverted: month windows 2026-10 (10 seats) INSUFFICIENT_DATA, 2026-09 (40) RANKING_INVERTED",
+      [r[2][:r[2].index(" (")] for r in rows_inv if r[1] == "Verdict"] ==
+      ["RANKING_INVERTED", "INSUFFICIENT_DATA", "RANKING_INVERTED"]
+      and [r[0] for r in rows_inv if r[1] == "Verdict"] == [W, "2026-10", "2026-09"]
+      and [r for r in rows_inv if r[0] == "2026-10" and r[1] == "Verdict"][0][2].endswith("n=10)"))
+    fs3 = by_inv["FS03.US"]
+    T("P10 inverted hand check FS03.US (seat 09-01, g +0.8 %/session, XLF +0.2 %, SPUS +0.1 %): +5 4.0 /"
+      " now 17.6 / vs XLF +5 3.0 / now 13.2 / vs SPUS +5 3.5 / now 15.4 / rank 9 / ROI 20 / Rel 79 / Low",
+      [fs3[k] for k in ("+5 %", "To Now %", "vs Ref +5 pp", "vs Ref Now pp", "vs SPUS +5 pp", "vs SPUS Now pp",
+                        "Rank", "Engine ROI %", "Rel", "Conf", "Ref", "Exit Kind")] ==
+      ["4.0", "17.6", "3.0", "13.2", "3.5", "15.4", "9", "20.0", "79.0", "Low", "XLF.US", "DROPPED"], fs3)
+    T("P10 inverted: PHP.L -> ^FTSE, WDP.BR -> ^STOXX50E, 2222.SR -> ^TASI.SR, AEFES.IS / Banks -> SPUS fallback",
+      [by_inv[s]["Ref"] for s in ("PHP.L", "WDP.BR", "2222.SR", "AEFES.IS", "BK01.US")] ==
+      ["^FTSE", "^STOXX50E", "^TASI.SR", "", ""]
+      and all(by_inv[s]["vs Ref Now pp"] != "" for s in ("PHP.L", "WDP.BR", "2222.SR"))
+      and all(by_inv[s]["vs Ref Now pp"] == "" and by_inv[s]["vs SPUS Now pp"] != "" for s in ("AEFES.IS", "BK01.US")))
+    rows_ok, _d, _b, rho_ok = _check_variant("ok", "RANKING_OK")
+    T("P10 ok: Spearman(ROI) >= +0.10 (%.3f) and ranks 1-3 hit 100 %% >= ranks 7-10" % rho_ok,
+      rho_ok >= 0.10 and [r for r in rows_ok if r[:3] == [W, "Rank", "1-3"]][0][5] == "100.0")
+    rows_ins, _d, _b, rho_ins = _check_variant("insufficient", "INSUFFICIENT_DATA")
+    T("P10 insufficient: n=10 < 30 -> INSUFFICIENT_DATA although the sample is inverted (%.3f)" % rho_ins,
+      rho_ins < 0 and [r for r in rows_ins if r[1] == "Verdict"][0][3] == "10")
+    # write mode (live stub): rectangle block + _Run_Log verdict + details JSON
+    book = StubBook({"_Selection_Log": inv_live, "_Run_Log": [RUNLOG_HDR]})
+    rc, so = _run_mod(m, book, "write", os.path.join(TMP, "p10_write"), inv_tsv, inv_px, rk="on")
+    rect = book.tabs["_Board_Scorecard"].values
+    width = len(rect[0])
+    i_ch = rect.index(["CHURN - how long seats lasted and how they ended"] + [""] * (width - 1))
+    i_rk = rect.index([m.RANKING_TITLE] + [""] * (width - 1))
+    i_dt = rect.index(["DETAIL - one row per board seat episode, newest first"] + [""] * (width - 1))
+    rk_cells = [[str(c) for c in r[:8]] for r in rect[i_rk + 2:i_dt - 1]]
+    T("P10 write: ONE rectangle %d wide (29 = 22 + 7), RANKING HEALTH block below CHURN and above DETAIL,"
+      " header row, every row == summary CSV rows" % width,
+      rc == 0 and len({len(r) for r in rect}) == 1 and width == len(m.DETAIL_HEADER_RANKING)
+      and i_ch < i_rk < i_dt and rect[i_rk + 1][:8] == m.RANKING_HEADER
+      and rk_cells == rows_inv and rect[i_dt + 1][:width] == m.DETAIL_HEADER_RANKING
+      and [c[0] for c in _writes(book)] == ["add_worksheet", "update", "append_row"],
+      (width, i_ch, i_rk, i_dt, len(rk_cells), len(rows_inv)))
+    rl = book.tabs["_Run_Log"].values[-1]
+    vtext = [r for r in rows_inv if r[:2] == [W, "Verdict"]][0][2]
+    dj = json.loads(rl[9])
+    T("P10 write: _Run_Log message ends with ' | ranking: %s'; details JSON carries the verdict" % vtext,
+      rl[4] == "OK" and " wrote=" in rl[5] and rl[5].endswith(" | ranking: " + vtext)
+      and dj["ranking"]["verdict"] == "RANKING_INVERTED" and dj["ranking"]["n"] == 50
+      and dj["ranking"]["refs"] == 6 and dj["ranking"]["refs_total"] == 8
+      and abs(dj["ranking"]["spearman_roi"] - round(rho_inv, 4)) < 1e-9, (rl[5], dj.get("ranking")))
+    T("P10 write: meta line carries 'refs 6/8 | ranking RANKING_INVERTED' (XLK / XLU missing)",
+      " | refs 6/8 | ranking RANKING_INVERTED" in rect[0][0], rect[0][0][-80:])
+    live_det = _artifacts(os.path.join(TMP, "p10_write"))["board_scorecard_detail.csv"]
+    tsv_det = _artifacts(os.path.join(TMP, "p10_inverted"))["board_scorecard_detail.csv"]
+    T("P10 write: live read (serial 'Logged At', numeric Rank / Engine ROI % / Rel) == TSV path detail",
+      live_det == tsv_det, (len(live_det), len(tsv_det)))
+    digests.append(_h(live_det.decode("utf-8")))
+
+    # ------------------------------------------------------------------ P11
+    rc, so = _call(m.selftest)
+    names = [l for l in open(SSL_FILE, encoding="utf-8").read().splitlines()
+             if l.strip().startswith("# 17:") or l.strip().startswith("# 18:")
+             or l.strip().startswith("# 19:") or l.strip().startswith("# 20:")]
+    T("P11 selftest() grew 16 -> 20 with the four v1.1.0 cases (Spearman, mapping, ranking health, wiring)",
+      rc == 0 and "SELFTEST 20/20: ALL GREEN" in so and len(names) == 4
+      and "Spearman" in names[0] and "reference" in names[1] and "ranking health" in names[2]
+      and "gate" in names[3], names)
+    if base_v1 is not None:
+        rc_b, so_b = _call(base_v1.selftest)
+        T("P11 base v1.0.0 selftest is 16/16 (the count rose by exactly the new cases)",
+          rc_b == 0 and "SELFTEST 16/16: ALL GREEN" in so_b, so_b.strip())
 
     shutil.rmtree(TMP, ignore_errors=True)
     digest = hashlib.sha256(("\n".join(out) + json.dumps(digests)).encode()).hexdigest()[:16]
