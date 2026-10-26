@@ -2,7 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.37 (2026-10-25) -- DT10 PENDING GRACE
+# VERSION 1.1.38 (2026-10-26) -- FUNDING EVIDENCE TRANSPORT
+#
+# v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
+# v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
+# packet published by 10_My_Portfolio certifies the cockpit's request: cash
+# after reservations, holding links, peg FX, custody exclusions) and
+# tests/test_pd_evidence_publish.js (10_My_Portfolio.gs v1.5.16: Script
+# Property PD_IBKR_EVIDENCE_PUBLISH, default off -- the SENT packet is
+# written to the document property the cockpit forwards and ONE one-off
+# follow-up render is armed inside the packet's 14-minute window) in the
+# blocking lean lane's native Apps Script step, next to the pending-grace
+# harness. Version pins moved in the sibling harnesses.
 #
 # v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
 # Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
@@ -898,6 +909,8 @@ jobs:
           node tests/test_dt10_calendar_completeness.js
           node tests/test_dt10_confirm_basis.js
           node tests/test_dt10_pending_grace.js
+          node tests/test_dt10_funding_evidence.js
+          node tests/test_pd_evidence_publish.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js

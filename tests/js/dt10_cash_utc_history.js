@@ -1,5 +1,6 @@
 /* Preserve the immutable v1.13.8 source without duplicating a 438 KB fixture.
- * Every v1.15.0 edit (pending grace), then every v1.14.0 edit (confirmation
+ * Every v1.16.0 edit (funding evidence, tests/js/dt10_edits_v1160.json),
+ * then every v1.15.0 edit (pending grace), then every v1.14.0 edit (confirmation
  * basis), then every v1.13.11 edit (bulk
  * render formatting), then every v1.13.10 edit
  * (holding subunit FX, null value_sar for a missing rate, terminal FAILED
@@ -32,6 +33,13 @@ const WHY = [
  * version lines and the core's return block); three insertions carry one
  * neighbouring line of context because the inserted line repeats. */
 const V1140_SHA256 = 'b888d7fd0f0b90f3170bd0e84cabb9c0efd1e665a1a55914746df9fdb9eda52c';
+/* v1.16.0 edits (funding evidence), reversed FIRST of all (current -> v1.15.0
+ * text). Seven hunks derived from the reviewed diff and stored verbatim in
+ * tests/js/dt10_edits_v1160.json; pure insertions carry one following line
+ * of context so each 'current' is unique. The result is hash-pinned
+ * (V1150_SHA256 = the reviewed v1.15.0 file, origin/main ab19432e). */
+const V1150_SHA256 = 'e099e187c82ed03fe137b88d789d9a383da5d3f452b6bd854c4d6e1bf757c1a8';
+const EDITS_V1160 = require('./dt10_edits_v1160.json');
 const EDITS_V1150 = [
   [" * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored\n",
     " * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n"],
@@ -166,7 +174,7 @@ const EDITS = EDITS_V1150.concat(EDITS_V1140, EDITS_V11311, EDITS_V11310, [
   ['  sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);\n', '']
 ]);
 function feedHistorySource(source) {
-  let historical = source;
+  let historical = v1150Source(source);
   for (const [current, prior] of EDITS) {
     assert.equal(historical.split(current).length - 1, 1,
       'exactly one approved v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 edit: ' + current.split('\n')[0]);
@@ -176,10 +184,23 @@ function feedHistorySource(source) {
     'v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 may change only their enumerated edits');
   return historical;
 }
-/* v1.14.0 source (the pending-grace oracle): only the v1.15.0 edits are
+/* v1.15.0 source (the funding-evidence oracle): only the v1.16.0 edits are
  * reversed, each exactly once, and the result must be the reviewed file. */
-function v1140Source(source) {
+function v1150Source(source) {
   let prior = source;
+  for (const [current, previous] of EDITS_V1160) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.16.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1150_SHA256,
+    'v1.16.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.14.0 source (the pending-grace oracle): the v1.16.0 and then the v1.15.0
+ * edits are reversed, each exactly once, and the result must be the reviewed file. */
+function v1140Source(source) {
+  let prior = v1150Source(source);
   for (const [current, previous] of EDITS_V1150) {
     assert.equal(prior.split(current).length - 1, 1,
       'exactly one approved v1.15.0 edit: ' + current.split('\n')[0]);
@@ -217,4 +238,4 @@ function v11310Source(source) {
     'v1.13.11 may change only its enumerated edits');
   return prior;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256};
+module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256};
