@@ -5,14 +5,15 @@ audit pass counts as a valid outcome in the same run
 Zero network: the real audit_active_records runs with a fixed clock, an
 offline calendar, an AsyncMock backend transport, CA-GUARD and the Yahoo
 fallback off and a fake HIST-CLOSE bar pull. Fixture rows are canonical v2
-1W records round-tripped through _record_to_row -> text -> from_sheet_row,
-so the blank 'Realized ROI %' cell gives realized_roi_source_valid=False
-exactly as a production load does.
+1W records (M8: legacy rows with no target schema) round-tripped through
+_record_to_row -> text -> from_sheet_row, so the blank 'Realized ROI %' cell
+gives realized_roi_source_valid=False exactly as a production load does.
 
   M0  the mode parser takes the exact word 'enforce' only
   M1  enforce: a fresh witnessed close matures the row and the SAME run's
       summary, calibrator, canonical report, S-1 measure and MATURED receipt
-      all use it; one '[v6.51.0 MATURED-EVIDENCE]' line
+      all use it; one INFO '[v6.51.0 MATURED-EVIDENCE]' line, after the
+      MATURE-FRESH line
   M2  enforce: the HIST-CLOSE enforce path reaches the same assignment
   M3  enforce: same-run consumers equal the next run's reload
   M4  OFF (unset, '', off, 0, 1, true, on, observe, enforced): record
@@ -20,11 +21,16 @@ exactly as a production load does.
       (v6.49.0) copy, or its recorded digest on a shallow checkout
   M5  enforce never revalidates a stored MATURED row with a malformed cell,
       a row left PENDING or a corp-action-suspect row that goes EXPIRED
-  M6  workflow and pins: the clock step maps the Variable once (default
-      'off'), daily_sync does not, header 1.0.7, SCRIPT_VERSION >= 6.51.0
-      in lockstep with docstring line 5 and the verify_deployment pin
+  M6  workflow and pins: both tracker steps (the clock, and daily_sync's,
+      which audits on a manual dispatch) map the Variable once (default
+      'off'), header 1.0.7, SCRIPT_VERSION >= 6.51.0 in lockstep with
+      docstring line 5 and the verify_deployment pin
   M7  ASCII added lines, zero removals, exactly this release's additions
       (needs the base copy)
+  M8  enforce: a legacy row (no target schema, the live 24 Oct population)
+      counts in the same run; off keeps the v6.49.0 lag
+  M9  enforce: CA-GUARD 'adjust' and 'ledger' maturities count in the same
+      run and their receipts carry forecast_error_pp
 
 The module under test is scripts/track_performance.py, or the file named by
 TFB_TRACK_UNDER_TEST (golden negative: point it at the untouched base copy,
@@ -37,6 +43,7 @@ Run: python tests/test_tracker_matured_evidence.py  (prints PASS k/k)
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import dataclasses
 import hashlib
@@ -45,6 +52,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -109,7 +117,9 @@ def _base_module():
         if src is None:
             _BASE["mod"] = None
         else:
-            tmp = Path(tempfile.mkdtemp(prefix="tp_me_base_")) / "track_performance_base.py"
+            tmp_dir = tempfile.mkdtemp(prefix="tp_me_base_")
+            atexit.register(shutil.rmtree, tmp_dir, True)
+            tmp = Path(tmp_dir) / "track_performance_base.py"
             tmp.write_text(src, encoding="utf-8")
             _BASE["mod"] = _load(tmp, "tp_matured_evidence_base")
     return _BASE["mod"]
@@ -143,8 +153,9 @@ def quote(symbol, price):
             "acquisition_acquired_at": NOW.isoformat(), "acquisition_quote_asof": CLOSE.isoformat()}
 
 
-def loaded(mod, rid, symbol, target, realized_cell="", status="ACTIVE", realized=None):
-    """A canonical v2 1W row as a production load sees it (text cells)."""
+def loaded(mod, rid, symbol, target, realized_cell="", status="ACTIVE", realized=None, schema=True):
+    """A canonical v2 1W row as a production load sees it (text cells);
+    schema=False gives a legacy row (no target schema in Notes)."""
     rec = mod.PerformanceRecord(
         record_id=rid, symbol=symbol, horizon=mod.HorizonType.WEEK_1,
         date_recorded=target - timedelta(days=7), entry_price=100.0,
@@ -152,9 +163,9 @@ def loaded(mod, rid, symbol, target, realized_cell="", status="ACTIVE", realized
         entry_risk_bucket="MODERATE", entry_confidence="HIGH", origin_tab="Top_10_Investments",
         target_price=110.0, target_roi=10.0, target_date=target,
         status=getattr(mod.PerformanceStatus, status), last_updated=NOW, realized_roi=realized)
-    rec.notes = mod._TARGET_SCHEMA_TAG + json.dumps({"version": 2, "horizon": "1W",
+    rec.notes = (mod._TARGET_SCHEMA_TAG + json.dumps({"version": 2, "horizon": "1W",
                  "roi_unit": "percent_points", "basis": "forecast_price",
-                 "producer_version": "fixture"}) + "]"
+                 "producer_version": "fixture"}) + "]") if schema else ""
     store = object.__new__(mod.PerformanceStore)
     row = [str("" if v is None else v) for v in store._record_to_row(rec)]
     row[store.HEADERS.index("Realized ROI %")] = realized_cell
@@ -167,30 +178,45 @@ def reload(mod, rec):
         [str("" if v is None else v) for v in store._record_to_row(rec)], store.HEADERS)
 
 
+class _Logs(list):
+    """Log messages (as before); .records keeps (levelno, message) in order."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+
 @contextlib.contextmanager
 def harness(mod, env, extra=None):
     """Clock, calendar, transport and gates pinned; every TRACK_* / TFB_TRACK_*
-    / TFB_PERF_* variable of the caller is cleared for the duration."""
-    logs = []
+    / TFB_PERF_* variable of the caller is cleared for the duration. Every
+    snapshot is taken before the first change, and every change happens inside
+    the try, so a failing setup still restores the caller's state."""
+    logs = _Logs()
     stray = {k: os.environ[k] for k in list(os.environ) if k.startswith(PREFIXES)}
-    for k in stray:
-        os.environ.pop(k, None)
-    os.environ.update({"TRACK_CANONICAL_TARGETS": "1", "TFB_PERF_TARGET_UNIT_SENTRY": "enforce"})
-    os.environ.update({k: v for k, v in env.items() if v is not None})
     swaps = {"_utc_now": lambda: NOW, "_outcome_calendar_schedule": calendar_fixture,
              "_price_fallback_enabled": lambda: False, "_ca_guard_enabled": lambda: False,
              "_feed_legacy": lambda: True, "_ca_ledger_index": lambda: {},
              "_hist_close_pull": lambda s: bars(108.0),
              "urlopen": lambda *a, **k: (_ for _ in ()).throw(AssertionError("network"))}
     swaps.update(extra or {})
-    saved = {k: getattr(mod, k) for k in swaps}
+    saved = {k: getattr(mod, k) for k in swaps if hasattr(mod, k)}
     saved_now = mod.RiyadhTime.__dict__["now"]
-    h = logging.Handler()
-    h.emit = lambda r: logs.append(r.getMessage())
-    mod.logger.addHandler(h)
     level = mod.logger.level
-    mod.logger.setLevel(logging.INFO)
+    h = logging.Handler()
+
+    def _emit(r):
+        logs.append(r.getMessage())
+        logs.records.append((r.levelno, r.getMessage()))
+
+    h.emit = _emit
     try:
+        for k in stray:
+            os.environ.pop(k, None)
+        os.environ.update({"TRACK_CANONICAL_TARGETS": "1", "TFB_PERF_TARGET_UNIT_SENTRY": "enforce"})
+        os.environ.update({k: v for k, v in env.items() if v is not None})
+        mod.logger.addHandler(h)
+        mod.logger.setLevel(logging.INFO)
         for k, v in swaps.items():
             setattr(mod, k, v)
         mod.RiyadhTime.now = staticmethod(lambda: NOW)
@@ -199,8 +225,11 @@ def harness(mod, env, extra=None):
         mod.logger.setLevel(level)
         mod.logger.removeHandler(h)
         mod.RiyadhTime.now = saved_now
-        for k, v in saved.items():
-            setattr(mod, k, v)
+        for k in swaps:
+            if k in saved:
+                setattr(mod, k, saved[k])
+            elif hasattr(mod, k):
+                delattr(mod, k)
         for k in [k for k in os.environ if k.startswith(PREFIXES)]:
             os.environ.pop(k, None)
         os.environ.update(stray)
@@ -276,7 +305,12 @@ def test_m1_enforce_same_run_consumers_and_receipt_use_the_new_outcome():
     assert proof["target_achieved_at_horizon"] is False
     assert got["canonical"] == {"1W": (2, pytest.approx(-6.0))} and got["s1_n"] == 2
     assert rec.realized_roi_source_valid is True
-    assert logs.count("[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=1") == 1
+    line = "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=1"
+    assert logs.count(line) == 1
+    order = [m for _, m in logs.records]
+    fresh_at = [i for i, m in enumerate(order) if "MATURE-FRESH-ONLY" in m]
+    assert fresh_at and order.index(line) == fresh_at[-1] + 1, order    # right after MATURE-FRESH
+    assert (logging.INFO, line) in logs.records, logs.records             # INFO, not WARNING
 
 
 def test_m2_hist_close_enforce_is_covered_by_the_same_assignment():
@@ -342,12 +376,19 @@ def test_m6_workflow_mapping_and_version_pins():
     assert '("track_performance", "%s", "track performance")' % TP.SCRIPT_VERSION in verify
     wf_text = (ROOT / ".github" / "workflows" / "track_performance.yml").read_text(encoding="utf-8")
     assert "# VERSION 1.0.7 (2026-10-26) -- SAME-RUN MATURITIES COUNT (OWNER OPT-IN)" in wf_text
-    wf = yaml.safe_load(wf_text)
-    steps = [st for job in wf["jobs"].values() for st in job.get("steps", [])
-             if ENV in (st.get("env") or {})]
-    assert len(steps) == 1 and steps[0]["name"].endswith("Run performance clock"), steps
-    assert steps[0]["env"][ENV] == "${{ vars.TRACK_MATURED_EVIDENCE_VALID || 'off' }}"
-    assert ENV not in (ROOT / ".github" / "workflows" / "daily_sync.yml").read_text(encoding="utf-8")
+    want = "${{ vars.TRACK_MATURED_EVIDENCE_VALID || 'off' }}"
+    for name, step_suffix in (("track_performance.yml", "Run performance clock"),
+                              ("daily_sync.yml", "Track Performance (record + audit)")):
+        text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        assert text.count(ENV + ":") == 1, name                # one mapping per workflow
+        steps = [st for job in yaml.safe_load(text)["jobs"].values() for st in job.get("steps", [])
+                 if ENV in (st.get("env") or {})]
+        assert len(steps) == 1 and steps[0]["name"].endswith(step_suffix), (name, steps)
+        assert "track_performance.py" in steps[0]["run"], name  # the tracker step itself
+        assert steps[0]["env"][ENV] == want, (name, steps[0]["env"][ENV])
+    # daily_sync's tracker step audits only on a manual dispatch with run_tracker=true
+    ds = (ROOT / ".github" / "workflows" / "daily_sync.yml").read_text(encoding="utf-8")
+    assert 'AUDIT_FLAG="--audit"' in ds and "track_performance.py --record $AUDIT_FLAG" in ds
 
 
 def test_m7_ascii_added_lines_and_zero_removals():
@@ -373,6 +414,42 @@ def test_m7_ascii_added_lines_and_zero_removals():
         assert ADDED <= added_names, sorted(added_names)
 
 
+def test_m8_legacy_row_without_target_schema_counts_in_the_same_run():
+    def run(env):
+        rec = loaded(TP, "L", "LLL.US", TODAY_TARGET, schema=False)
+        assert TP._target_schema(rec.notes) is None and rec.realized_roi_source_valid is False
+        logs, got, _ = audit(TP, [rec], [quote("LLL.US", 104.0)], env)
+        return rec, logs, got
+    rec, logs, got = run(ENFORCE)
+    assert rec.status == TP.PerformanceStatus.MATURED and rec.realized_roi == pytest.approx(4.0)
+    assert got["summary"][:2] == (1, 0) and got["calibrator"][:2] == (1, 0), got
+    assert rec.realized_roi_source_valid is True
+    assert got["canonical"] == {} and got["s1_n"] == 0          # legacy rows never reach S-1
+    assert "forecast_error_pp" not in receipt(TP, rec)          # no target schema, no target fields
+    assert "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=1 revalidated=1" in logs
+    rec, logs, got = run({})
+    assert got["summary"][:2] == (0, 1) and rec.realized_roi_source_valid is False, got
+
+
+def test_m9_ca_guard_adjust_and_ledger_maturities_count_in_the_same_run():
+    adj = loaded(TP, "J", "JJJ.US", TODAY_TARGET)
+    led = loaded(TP, "K", "KKK.US", TODAY_TARGET)
+    extra = {"_ca_guard_enabled": lambda: True, "_ca_budget_state": lambda s: "ok",
+             "_ca_target_bar": lambda *a, **k: ({"close": 1.0}, ""),
+             "_ca_adjusted_roi": lambda symbol, *a, **k: 5.0 if symbol == "JJJ.US" else None,
+             "_ca_ledger_factor": lambda symbol, *a, **k: 0.5 if symbol == "KKK.US" else None}
+    logs, got, _ = audit(TP, [adj, led], [quote("JJJ.US", 160.0), quote("KKK.US", 200.0)], ENFORCE, extra)
+    pa, pl = receipt(TP, adj), receipt(TP, led)
+    assert (pa["roi_basis"], pl["roi_basis"]) == ("adjust", "ledger"), (pa, pl)
+    assert adj.status == led.status == TP.PerformanceStatus.MATURED
+    assert adj.realized_roi == pytest.approx(5.0) and led.realized_roi == pytest.approx(0.0)
+    assert got["summary"][:2] == (2, 0) and got["calibrator"][:2] == (2, 0), got
+    assert [adj.realized_roi_source_valid, led.realized_roi_source_valid] == [True, True]
+    assert pa["forecast_error_pp"] == pytest.approx(-5.0) and pl["forecast_error_pp"] == pytest.approx(-10.0)
+    assert got["s1_n"] == 2
+    assert "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=2" in logs
+
+
 CASES = [test_m0_mode_parser_exact_word,
          test_m1_enforce_same_run_consumers_and_receipt_use_the_new_outcome,
          test_m2_hist_close_enforce_is_covered_by_the_same_assignment,
@@ -380,7 +457,9 @@ CASES = [test_m0_mode_parser_exact_word,
          ("test_m4_off_equals_base", lambda: [_check_off(s) for s in OFF_SPELLINGS]),
          test_m5_stored_malformed_pending_and_expired_stay_invalid,
          test_m6_workflow_mapping_and_version_pins,
-         test_m7_ascii_added_lines_and_zero_removals]
+         test_m7_ascii_added_lines_and_zero_removals,
+         test_m8_legacy_row_without_target_schema_counts_in_the_same_run,
+         test_m9_ca_guard_adjust_and_ledger_maturities_count_in_the_same_run]
 
 
 if __name__ == "__main__":

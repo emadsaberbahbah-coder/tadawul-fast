@@ -1778,12 +1778,18 @@ from urllib.error import HTTPError, URLError
 #   'invalid_realized_evidence'. Live: Performance Clock run 40120329898
 #   (job 120950277470, 24 Oct 18:22Z, TRACK_SCHEDULED_AUDIT=1) logged
 #   'matured-fresh=87' and, in the same run, 'Matured: 11773 ... Invalid
-#   matured excluded: 87'; the next run read the same rows as 11860 valid,
-#   0 invalid. So each audit's own maturities miss that run's summary,
-#   TFB_CALIBRATION_FACTORS and S-1 row (published only on audit runs) and
-#   arrive one run late; from the first canonical v2 maturities (records
-#   made since #827, 24 Oct) the receipts would lose their target fields
-#   for good.
+#   matured excluded: 87'; the next tracker run (daily_sync, record-only,
+#   job 121006724938) read the same rows as 11860 valid, 0 invalid. So each
+#   audit's own maturities miss that run's summary panel (rewritten by the
+#   next --analyze run, daily_sync's included) and its
+#   TFB_CALIBRATION_FACTORS and S-1 row (published only on audit runs), and
+#   reach those one audit run late. The 87 were legacy rows (no target
+#   schema): there the live effect was on the summary and the calibration
+#   inputs; legacy rows never reach the S-1 canonical measure and their
+#   receipts carry no target fields.
+#   From the first canonical v2 maturities (records made since #827,
+#   24 Oct) the S-1 measure would also drop them and the receipts would lose
+#   their target fields for good.
 # WHAT (audit_active_records only; one assignment, at the one place a record
 #   becomes MATURED, before the outcome receipt is built):
 #   off (DEFAULT; unset or any other word, '1' included): v6.49.0 exactly;
@@ -1796,11 +1802,17 @@ from urllib.error import HTTPError, URLError
 #     paths all mature through that transition. A stored MATURED row with a
 #     malformed cell, a PENDING row and an EXPIRED (corp-action suspect or
 #     unpriced) row are never touched.
-# ENV LANE: .github/workflows/track_performance.yml 'Run performance clock'
-#   only (the HIST-CLOSE precedent): daily_sync's tracker step never passes
-#   --audit, so it never matures a record.
+# ENV LANE: both tracker steps map the Variable (ENV PARITY):
+#   .github/workflows/track_performance.yml 'Run performance clock' (every
+#   scheduled audit) and daily_sync.yml 'Track Performance (record + audit)',
+#   which passes --audit on a manual dispatch with run_tracker=true and so
+#   matures records too. Its scheduled runs never audit, so there the
+#   Variable is inert.
 # KNOWN LIMITS: maturities from before arming keep their null receipts (the
-#   summary and calibration already count them from the next run on).
+#   summary and calibration already count them from the next run on). As on
+#   v6.49.0, run_once ignores save_records' result, so after a failed save
+#   the same run still publishes its own (unsaved) maturities in either
+#   mode.
 # ZERO functions removed. Additions: _matured_evidence_mode,
 #   _MATURED_EVIDENCE_TAG.
 # ROLLBACK: unset TRACK_MATURED_EVIDENCE_VALID (or set off).

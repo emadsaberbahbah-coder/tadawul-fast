@@ -27,6 +27,8 @@ SYNC_DEFAULTS = {
     "TFB_OPP_FX_USX_SUBUNIT": "0",
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
+# 2026-10-26: v6.51.0 [MATURED-EVIDENCE]; both tracker lanes can audit.
+TRACKER_DEFAULTS["TRACK_MATURED_EVIDENCE_VALID"] = "off"
 
 
 def _workflow(name):
