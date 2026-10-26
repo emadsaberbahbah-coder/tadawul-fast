@@ -16,6 +16,9 @@ first effect not at all and the second against SPUS only, so the learning
 loop could not see either. v1.1.0 makes the scorecard measure both, every
 night, from the same _Selection_Log read, so the loop can correct itself.
 WHAT (all of it only when TFB_BOARD_SCORECARD_RANKING=on):
+  * (review fix, Codex P2 on PR #847) reference indexes follow their own
+    venue clock in _final_bars (REF_VENUE_SUFFIX), so a manual run between
+    a foreign close and the US close keeps the index's completed bar.
   * board_events() also reads Rank, Engine ROI %, Rel, Conf and Market
     (tolerant of missing columns); build_episodes() carries the FIRST-seat
     values (rank_at_seat, eng_roi_at_seat, rel_at_seat, conf_at_seat,
@@ -432,6 +435,16 @@ VENUE_REF: Dict[str, str] = {
     "LS": "^STOXX50E", "AS": "^STOXX50E", "DE": "^STOXX50E", "MI": "^STOXX50E",
     "HK": "^HSI", "TO": "^GSPTSE", "AX": "^AXJO", "MX": "^MXX", "SR": "^TASI.SR",
     "SI": "^STI", "T": "^N225"}
+# v1.1.0 review fix (Codex P2 on PR #847): a bare index symbol ('^HSI') has no
+# suffix, so _venue() used to give it the New York clock and _final_bars()
+# dropped its latest completed bar on a manual run between that venue's close
+# and the US close (the stock kept the day, its reference lost it -> wrong
+# same-day excess). Each reference index now follows the clock of the venue it
+# stands for. The scheduled 22:23 UTC run was never affected (every venue is
+# closed by then).
+REF_VENUE_SUFFIX: Dict[str, str] = {
+    "^FTSE": "L", "^STOXX50E": "DE", "^HSI": "HK", "^GSPTSE": "TO",
+    "^AXJO": "AX", "^MXX": "MX", "^TASI.SR": "SR", "^STI": "SI", "^N225": "T"}
 
 
 def _scorecard_mode() -> str:
@@ -580,6 +593,8 @@ def _zone(name: str):
 
 def _venue(sym: str) -> Tuple[str, str]:
     s = str(sym).strip().upper()
+    if s in REF_VENUE_SUFFIX:                 # v1.1.0 review fix: index clock
+        return VENUE_CLOSE.get(REF_VENUE_SUFFIX[s], DEFAULT_VENUE)
     suf = s.rsplit(".", 1)[1] if "." in s else "US"
     return VENUE_CLOSE.get(suf, DEFAULT_VENUE)
 
@@ -1782,7 +1797,25 @@ def selftest() -> int:
     assert "| Since 2026-09-01 | Rank | 1-3 | 1 | 1 | 100.0 | 1.25 | 1.25 |" in md1
     assert "| 2026-10 | Verdict | INSUFFICIENT_DATA (spearman n/a, n=1) |" in md1
     ok += 1
-    print(f"SELFTEST {ok}/20: ALL GREEN")
+    # 21: reference indexes keep their venue's clock in _final_bars (Codex P2
+    #     on PR #847): at 10:00Z on 26 Oct the HK, Tokyo and Saudi(after 12Z)
+    #     sessions are closed, London / Toronto / New York are not
+    ref_bars = [("2026-10-23", 1.0), ("2026-10-26", 2.0)]
+    t10 = datetime(2026, 10, 26, 10, 0, tzinfo=timezone.utc)
+    assert _final_bars("^HSI", ref_bars, t10) == ref_bars
+    assert _final_bars("^N225", ref_bars, t10) == ref_bars
+    assert _final_bars("^FTSE", ref_bars, t10) == ref_bars[:1]
+    assert _final_bars("^GSPTSE", ref_bars, t10) == ref_bars[:1]
+    assert _final_bars("^TASI.SR", ref_bars, t10) == ref_bars[:1]
+    assert _final_bars("^TASI.SR", ref_bars,
+                       datetime(2026, 10, 26, 12, 30, tzinfo=timezone.utc)) == ref_bars
+    assert _final_bars("SPUS.US", ref_bars, t10) == ref_bars[:1]
+    assert _venue("^HSI") == VENUE_CLOSE["HK"] and _venue("^STOXX50E") == VENUE_CLOSE["DE"]
+    assert _venue("1972.HK") == VENUE_CLOSE["HK"] and _venue("RDN.US") == VENUE_CLOSE["US"]
+    assert all(v in VENUE_CLOSE for v in REF_VENUE_SUFFIX.values())
+    assert set(REF_VENUE_SUFFIX) == set(VENUE_REF.values())
+    ok += 1
+    print(f"SELFTEST {ok}/21: ALL GREEN")
     return 0
 
 

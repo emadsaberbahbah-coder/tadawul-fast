@@ -14,7 +14,7 @@ Env (all optional):
   TFB_TEST_SELLOG_TSV=<_Selection_Log.tsv>   real-data legs (10-01 export)
   TFB_TEST_EXPORT_DIR=<dir>   Global_Markets.tsv / Mutual_Funds.tsv /
                               Market_Leaders.tsv of the same export
-P1 embedded self-test 20/20 (7 v0.1.0 cases + 9 v1.0.0 + 4 v1.1.0:
+P1 embedded self-test 21/21 (7 v0.1.0 cases + 9 v1.0.0 + 5 v1.1.0:
    Spearman, reference mapping, ranking health / verdicts, wiring)
 P2 v0.1.0 ticket path: run() CSV + stdout byte-identical to base
    (synthetic; + the real export when set)
@@ -452,7 +452,7 @@ def main():
 
     # ------------------------------------------------------------------- P1
     rc, so = _call(m.selftest)
-    T("P1 embedded self-test 20/20", rc == 0 and "SELFTEST 20/20: ALL GREEN" in so, so.strip())
+    T("P1 embedded self-test 21/21", rc == 0 and "SELFTEST 21/21: ALL GREEN" in so, so.strip())
 
     # ------------------------------------------------------------------- P2
     if SSL_BASE:
@@ -993,11 +993,12 @@ def main():
     rc, so = _call(m.selftest)
     names = [l for l in open(SSL_FILE, encoding="utf-8").read().splitlines()
              if l.strip().startswith("# 17:") or l.strip().startswith("# 18:")
-             or l.strip().startswith("# 19:") or l.strip().startswith("# 20:")]
-    T("P11 selftest() grew 16 -> 20 with the four v1.1.0 cases (Spearman, mapping, ranking health, wiring)",
-      rc == 0 and "SELFTEST 20/20: ALL GREEN" in so and len(names) == 4
+             or l.strip().startswith("# 19:") or l.strip().startswith("# 20:")
+             or l.strip().startswith("# 21:")]
+    T("P11 selftest() grew 16 -> 21 with the five v1.1.0 cases (Spearman, mapping, ranking health, wiring, index clocks)",
+      rc == 0 and "SELFTEST 21/21: ALL GREEN" in so and len(names) == 5
       and "Spearman" in names[0] and "reference" in names[1] and "ranking health" in names[2]
-      and "gate" in names[3], names)
+      and "gate" in names[3] and "venue" in names[4], names)
     if base_v1 is not None:
         rc_b, so_b = _call(base_v1.selftest)
         T("P11 base v1.0.0 selftest is 16/16 (the count rose by exactly the new cases)",
