@@ -2,7 +2,7 @@
 
 The owner chose on 2026-10-15 to arm five default-off gates in code:
 
-  opportunity_builder 1.28.0  TFB_OPP_VENUE_CAL_EXT, TFB_OPP_FRESHNESS_ALERT,
+  opportunity_builder 1.28.2  TFB_OPP_VENUE_CAL_EXT, TFB_OPP_FRESHNESS_ALERT,
                               TFB_OPP_RESEARCH_DIVERSIFY  -> ON when unset
   portfolio_actions 1.17.0    TFB_PF_RESEARCH_VIEW        -> enforce when unset
   data_engine_v2 5.160.0      TFB_ENGINE_SUFFIX_LOCALE_FALLBACK -> ON when unset
@@ -108,7 +108,7 @@ def case_d4_readback_declares_enforce(_mp, _tmp):
 
 
 def case_d5_versions_and_verifier(_mp, _tmp):
-    assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 28, 0)
+    assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 28, 2)   # merge note 2026-10-27 (#779): the defaults build is 1.28.2 over #778's 1.28.1
     assert _vt(pa.PORTFOLIO_ACTIONS_VERSION) >= (1, 17, 0)
     assert _vt(de.__version__) >= (5, 160, 0)
     text = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
@@ -153,7 +153,7 @@ def case_k3_audit_keep_stays_off(mp, _tmp):
 
 def case_k4_ascii_added_lines(_mp, _tmp):
     for rel, start, end in (
-            ("core/analysis/opportunity_builder.py", "# v1.28.0 (2026-10-15)", 'OPPORTUNITY_BUILDER_VERSION = "'),
+            ("core/analysis/opportunity_builder.py", "# v1.28.2 (2026-10-15", 'OPPORTUNITY_BUILDER_VERSION = "'),
             ("core/analysis/portfolio_actions.py", "# v1.17.0 (2026-10-15)", 'PORTFOLIO_ACTIONS_VERSION = "'),
             ("core/data_engine_v2.py", "WHY v5.160.0 (2026-10-15", "WHY v5.159.0 (2026-10-14"),
             (".github/workflows/daily_sync.yml", "# VERSION 1.0.6 (2026-10-15", "# VERSION 1.0.5 (2026-10-14"),
@@ -189,7 +189,10 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     # merged): builder 1.27.3, actions 1.16.1, engine 5.159.0.
     # 2026-10-24: the bundle head is 2462215c (main #821-#829 merged); the same
     # versions, so the assertions below are unchanged.
-    assert bob.OPPORTUNITY_BUILDER_VERSION == "1.27.3"
+    # 2026-10-27: the bundle head is 0d2f989c (main #844, #847-#853 merged):
+    # builder 1.28.1 (renumbered over #848's 1.28.0), actions 1.16.1, engine
+    # 5.159.0.
+    assert bob.OPPORTUNITY_BUILDER_VERSION == "1.28.1"
     assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.16.1"
     assert bde.__version__ == "5.159.0"
     _clean(mp)

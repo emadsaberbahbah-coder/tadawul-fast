@@ -1,20 +1,22 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.15.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.17.2 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
  *
- * v1.15.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
+ * v1.17.2 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
  * (Built 2026-10-13 as an unreleased v1.13.9 draft in PR #770; renumbered
  * after #774 shipped v1.13.9, again on 2026-10-21 after #810 shipped a
  * different v1.13.10, on 2026-10-22 after #815 shipped a different
- * v1.13.11 (bulk render formatting), and on 2026-10-25 after #833 and
- * #838 shipped v1.14.0 (confirm basis) and v1.15.0 (pending grace). No
- * behaviour changed in the renumbering; the base named below is now
- * v1.15.0, the one it sits on.)
+ * v1.13.11 (bulk render formatting), on 2026-10-25 after #833 and
+ * #838 shipped v1.14.0 (confirm basis) and v1.15.0 (pending grace), and
+ * on 2026-10-27 after #844, #849 and #852 shipped v1.16.0 (funding
+ * evidence), v1.17.0 (shadow rank log) and v1.17.1 (shadow momentum).
+ * ALL v1.17.1 logic carried verbatim. No behaviour changed in the
+ * renumbering; the base named below is now v1.17.1, the one it sits on.)
  * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held
  * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank
  * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit
@@ -23,7 +25,7 @@
  * backend never learns which incumbents this cockpit holds.
  * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)
  * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
- * v1.15.0 in every request and render (one memoized property read is
+ * v1.17.1 in every request and render (one memoized property read is
  * added). Armed, body.criteria gains audit_keep_symbols = the sorted
  * stability members (seated and grace-held, fast-track included; at most
  * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.
@@ -32,13 +34,174 @@
  * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and
  * either alone is inert. The list is display context, never a decision
  * input: it moves no gate, score, seat or ticket. A property or state read
- * failure sends nothing (the v1.15.0 body).
+ * failure sends nothing (the v1.17.1 body).
  * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;
  * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10
  * makes one guarded call before the POST. Harness:
  * tests/js/dt10_audit_keep.test.js.
- * Rollback: delete the property (the next run is v1.15.0 behaviour) or
- * re-paste v1.15.0.
+ * Rollback: delete the property (the next run is v1.17.1 behaviour) or
+ * re-paste v1.17.1.
+ *
+ * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM] -- THE CHALLENGER GETS ITS MOMENTUM INPUT
+ * WHY (first shadow day, 27 Oct 2026): the pre-registered challenger order
+ * (opportunity_builder v1.28.0, program register A2) breaks reliability-band
+ * ties by sector-relative momentum, read from momentum_score on each pool
+ * row. DT10_POOL_FIELDS never sent the 'Momentum Score' column, so the
+ * backend logged momentum=0/26 on every call that day and the first
+ * _Shadow_Rank_Log event (10:48 Riyadh) shows the challenger as the exact
+ * reverse of the champion (smaller engine ROI first inside one reliability
+ * band) -- not the order that was pre-registered. The column is filled on
+ * the pages (Global_Markets 6,605 of 6,611 rows, column BK). Same defect
+ * class as v1.6.1, v1.8.1 and v1.11.12: an input starved by the pool
+ * contract.
+ * WHAT: var DT10_SHADOW_POOL_FIELDS = [Momentum Score]. The per-execution
+ * pool projection (dt10PoolFieldsActive_ with no argument, memoized) appends
+ * it ONLY while DT10_SHADOW_RANK_LOG is on or all (dt10PoolFieldsWithShadow_;
+ * a send already in the list is never added twice). Off -> the very list
+ * object of v1.17.0: every header map, pool row and POST body is byte for
+ * byte unchanged. Under TFB_OPP_RANK_MODE=legacy the builder never reads the
+ * field; under shadow it feeds only the challenger's second key, so the live
+ * order, gates, verdicts, sizing and funding are unchanged either way. The
+ * mode is read ONCE per execution (memo 'shadow_log_mode') and the log
+ * written after the POST (dt10AppendShadowRankLog_) reuses it, so a property
+ * flipped mid-run cannot log a day whose rows went without momentum. The
+ * send follows the LOG switch, not TFB_OPP_RANK_MODE: with the log off and
+ * the backend in shadow the challenger runs without momentum (harmless while
+ * enforce is reserved); the promotion PR must send it whenever the backend
+ * ranks by it. (Independent review before merge, 27 Oct: mode read once,
+ * self-test memo swap in try/finally, field-count-proof self-test check.)
+ * SECTION 8 KEPT: the value is the engine's own sheet column, sent as is.
+ * Functions added (0 removed): dt10PoolFieldsWithShadow_. Changed:
+ * dt10PoolFieldsActive_ (the memoized no-argument branch only),
+ * dt10AppendShadowRankLog_ (the memoized mode when the projection ran),
+ * dt10SelfTest ('property memo core' counts the armed field; new 'shadow
+ * pool fields core'). Var added: DT10_SHADOW_POOL_FIELDS.
+ * Harness: tests/test_dt10_shadow_momentum.js (REAL file; golden negative on
+ * the v1.17.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent / off / junk; the builder alias read from
+ * core/analysis/opportunity_builder.py; ES5/ASCII lint; inventory).
+ * Rollback: DT10_SHADOW_RANK_LOG off stops the send (and the log) with no
+ * re-paste; or re-paste v1.17.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep. Days logged without momentum (27 Oct) are not counted by the
+ * nightly scorecard (score_selection_log v1.2.1).
+ *
+ * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG] -- THE RANKING CHALLENGER, LOGGED
+ * WHY (October review + first nightly scorecard, 27 Oct 2026): the live
+ * order of the INVEST pool does not predict outcomes (engine ROI vs excess
+ * Spearman -0.38 in October, -0.17 since 1 Sep; names at the ROI cap beat
+ * their sector/venue reference 34-35% of the time vs 53-61% below it).
+ * opportunity_builder v1.28.0 (TFB_OPP_RANK_MODE=shadow, program register A2)
+ * computes a second, pre-registered order of the same pool and publishes it
+ * in meta.rank_challenger (champion and challenger top 10) plus shadow_rank
+ * on the INVEST audit rows and tickets. Nothing in the workbook recorded it,
+ * so the nightly scorecard could not compare the two orders on the same days.
+ * WHAT: Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT: one property
+ * read and nothing else -- no tab, no write, no status token; every render is
+ * v1.16.0 byte for byte) | on | all. When armed and the payload carries
+ * meta.rank_challenger without an error, dt10AppendShadowRankLog_ appends one
+ * event to the hidden tab _Shadow_Rank_Log (created on first use): CHAMPION
+ * rows (the backend's live order, top 10), CHALLENGER rows (the shadow order,
+ * top 10) and BOARD rows (the seats this render shows: board rank, seat class,
+ * and the shadow rank when the name is in today's INVEST pool). Columns:
+ * Logged At, Day (UTC key), Cohort (source run), Order, Rank, Symbol, Market,
+ * Sector, Seat, Live Rank, Shadow Rank, Engine ROI %, Rel, Conf, Momentum,
+ * Strength, Strength Ref, Cap, Floor OK, Mode, Rule, Builder, Pool, Overlap
+ * Top5 (Rule and Builder written as 'v1.0' / 'v1.28.0' so Sheets cannot turn
+ * them into numbers or dates). Cadence: 'on' = the first event of each UTC
+ * day only -- exactly what the nightly scorecard reads, about 30 rows a day;
+ * 'all' = also whenever an order changes (audit trail, about 180 rows a day;
+ * the workbook's cell budget is why it is not the default). State
+ * DT10_SHADOW_LOG_STATE_V1. Row 1 must be the header: it is written whenever
+ * row 1 is blank (new, emptied or cleared tab; a first run cut short after
+ * the tab was created) and a tab whose row 1 carries another layout is never
+ * written ('ERROR header mismatch at column N'). Rows are added before a write
+ * that would pass the grid. Creating the tab drops its two unused columns,
+ * hides it and returns the view to Top_10_Investments. The status line gains
+ * ' | ShadowLog: +N' / 'logged today' / 'unchanged' / 'none (<reason>)' /
+ * 'ERROR ...' only when armed. The log holds ranks, symbols and the backend's
+ * own figures -- no ticket, price or amount -- so it is research evidence,
+ * never an order sheet. (Review before merge, 27 Oct: header on an empty tab,
+ * cadence default, text-safe version cells, view and grid handling.)
+ * SECTION 8 KEPT: nothing is ranked, scored or gated here; both orders are the
+ * backend's. _Selection_Log is untouched (schema and cadence).
+ * Functions added (0 removed): dt10ShadowLogMode_, dt10ShadowLogRows_,
+ * dt10AppendShadowRankLog_. Changed: dt10RefreshDecisionTop10Run_ (the
+ * refreshDecisionTop10 body: one call after the exit log; shadowNote in the
+ * final status line), dt10SelfTest ('shadow rank log core'). Vars added:
+ * DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET,
+ * DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS.
+ * Harness: tests/test_dt10_shadow_rank_log.js (REAL file; golden negative on
+ * the v1.16.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent; ES5/ASCII lint; inventory).
+ * Rollback: delete DT10_SHADOW_RANK_LOG (no re-paste) or re-paste v1.16.0;
+ * 'all' -> 'on' stops the on-change rows.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep. Arm after the backend runs TFB_OPP_RANK_MODE=shadow.
+ *
+ * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE] -- THE BROKER PACKET CERTIFIES THE REQUEST
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): FRST.US, ZTO.US and CRC.US
+ * confirmed ACTIVE (day 3) and the board rendered them UNSIZED -- Ticket 0
+ * SAR, Shares 0, Entry/Stop/TP '--', 'Research seat -- no executable
+ * allocation today', funding=final/0exec, EXECUTABLE 0 of 10. Trace: the
+ * allocate replay (dt10ReallocateBoard_) POSTs the same body as the first
+ * request; the backend's allocate stage (opportunity_builder
+ * _portfolio_input_assessment -> core/portfolio_reconciliation
+ * certify_portfolio_inputs) withholds executable funding unless
+ * portfolio.reconciliation_evidence is a fresh (<= 900 s) broker packet
+ * whose certified cash equals cash_available_sar to the cent, whose FX
+ * proofs equal the request's fx_rates, whose positions link to every
+ * holding row sent, and holdings_input_incomplete is false. This file
+ * forwarded the document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (v1.11.x) but nothing wrote it ('Nothing writes it today', 14 Oct), the
+ * cash came from the Top_10 panel (82,819.20, before the day's BUY
+ * reservation), fx_rates.USD came from TFB_FX_LOOKUP (3.7448, not the 3.75
+ * peg the proof declares) and the Sukuk row 5023.SR (Tadawul custody) can
+ * never link to an IBKR position. The executable funding path had never
+ * been exercisable in production; it surfaced on the first 3/3 day.
+ * WHAT: Script Property DT10_FUNDING_EVIDENCE = off (DEFAULT: the request
+ * body, the status line and every render are v1.15.0 byte for byte) | on.
+ * When on, after the holdings and cash-source blocks build the body,
+ * dt10FundingApply_ reads the packet 10_My_Portfolio v1.5.16 publishes
+ * (PD_IBKR_EVIDENCE_PUBLISH=on, from the read-only IBKR capture the
+ * 08:30-10:30 watcher consumes) and the PURE dt10FundingApplyCore_ applies
+ * it IN PLACE when, and only when, every check holds: schema 1, captured_at
+ * with an explicit offset, age 0..840 s (the backend's 900 s less a 60 s
+ * request margin), holdings sent (DT10_SEND_HOLDINGS) and read complete,
+ * FX proofs readable at 2 decimals. Then: rows whose Symbol is in
+ * PD_EXECUTION_EXCLUDE (the same property 10_My_Portfolio uses; 5023.SR)
+ * leave the funding cohort; holding_links are rebuilt for THIS request's
+ * rows (native symbol + currency, each positive packet position must be
+ * represented -- the backend decides, the note discloses); cash_available_sar
+ * becomes the packet's certified cash (settled - reserved) x proven rate,
+ * integer cents, round half-even exactly as the backend compares it;
+ * pending_proceeds_sar = 0; fx_rates gains the proven rates (USD 3.75) and a
+ * kept row with a proven currency, a quantity and a price has value_sar
+ * recomputed at that rate (the backend's price x fx x quantity check). The
+ * allocate replay deep-copies the applied body, so one apply covers both
+ * stages. Any failed check leaves the body untouched and the status line
+ * says ' | funding evidence NOT APPLIED (<reason>)'; success says
+ * ' | funding evidence APPLIED (capture age Nm; cash X SAR; linked a/b;
+ * excluded ...; USD 3.75)'. The packet is never logged or rendered.
+ * ORDER: the backend's 900 s window means Top_10 must render within ~14 min
+ * of the capture: 10_My_Portfolio v1.5.16's watcher arms a one-off
+ * follow-up render after it publishes (chain-style guards). SECTION 8 KEPT:
+ * no gate, score or verdict is recomputed here; sizing stays the backend's.
+ * Functions added (0 removed): dt10FundingMode_, dt10FundingExcludeList_,
+ * dt10FundingSym_, dt10FundingUnits_, dt10FundingDiv_, dt10FundingAge_,
+ * dt10FundingNative_, dt10FundingRates_, dt10FundingCashCents_,
+ * dt10FundingLinks_, dt10FundingDecimal_, dt10FundingValueSar_,
+ * dt10FundingApplyCore_,
+ * dt10FundingNote_, dt10FundingApply_. Changed: refreshDecisionTop10 (one
+ * call after the cash block; fundingNote in the status line), dt10SelfTest
+ * ('funding evidence core'). Vars added: DT10_FUNDING_PROP,
+ * DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS,
+ * DT10_FUNDING_SAFE. Harness: tests/test_dt10_funding_evidence.js (REAL
+ * file; golden negative on the v1.15.0 base; kill identity with the property
+ * absent; ES5/ASCII lint). Rollback: delete DT10_FUNDING_EVIDENCE (no
+ * re-paste) or re-paste v1.15.0. ES5; ASCII; all prior WHYs verbatim;
+ * DT10_VERSION and the header bumped in lockstep. Arming is an owner step
+ * AFTER the first funded ticket of 26 Oct 2026 is recorded.
  *
  * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT
  * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails
@@ -1935,7 +2098,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.15.1';
+var DT10_VERSION = '1.17.2';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3070,6 +3233,15 @@ var DT10_POOL_EVIDENCE_TOKENS = {
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
                          '52W Position %': true, 'Percent Change': true };
+/** v1.17.1 [SHADOW-MOMENTUM]: the ranking challenger's inputs that ride on
+ * the pool row ONLY while the shadow rank log is armed (DT10_SHADOW_RANK_LOG
+ * on/all; dt10PoolFieldsWithShadow_). opportunity_builder v1.28.0 reads
+ * momentum_score (alias 'momentumscore') only under TFB_OPP_RANK_MODE
+ * shadow/enforce, for the challenger's second key; the live order never
+ * reads it. */
+var DT10_SHADOW_POOL_FIELDS = [
+  { send: 'Momentum Score', match: ['momentumscore'] }
+];
 /** v1.11.13 [P-202]: per-execution memo for Script Property reads that sit
  * on per-row paths. Apps Script gives each execution a fresh global scope,
  * so this object lives exactly one run; refreshDecisionTop10 also resets it
@@ -3103,7 +3275,14 @@ function dt10W52FieldsLegacy_() {
 function dt10PoolFieldsActive_(legacy) {
   if (legacy === undefined) {   // v1.11.13 [P-202]: ONE list per execution
     return dt10PropMemoGet_('pool_fields_active', function () {
-      return dt10PoolFieldsActive_(dt10W52FieldsLegacy_());
+      // v1.17.1 [SHADOW-MOMENTUM]: + the challenger's inputs while the shadow
+      // rank log is armed; off -> the v1.17.0 list (the same object). The
+      // mode is read once and kept for this execution: the log written after
+      // the POST (dt10AppendShadowRankLog_) uses the same value.
+      var shadowMode = dt10PropMemoGet_('shadow_log_mode', dt10ShadowLogMode_);
+      return dt10PoolFieldsWithShadow_(
+          dt10PoolFieldsActive_(dt10W52FieldsLegacy_()),
+          shadowMode !== 'off');
     });
   }
   var leg = !!legacy;
@@ -3137,6 +3316,23 @@ function dt10FindHeaderRow_(values, scanRows) {
     if (hasSymbol && hasSecond) return r;
   }
   return -1;
+}
+/** v1.17.1 [SHADOW-MOMENTUM] PURE: `fields` plus DT10_SHADOW_POOL_FIELDS
+ * when `armed`; `fields` itself (the same array) when not, so an unarmed
+ * projection is the v1.17.0 list object. A send already present is not
+ * added again. Never mutates `fields`. */
+function dt10PoolFieldsWithShadow_(fields, armed) {
+  if (!armed) return fields;
+  var out = fields.slice();
+  var have = {};
+  for (var i = 0; i < out.length; i++) have[out[i].send] = true;
+  for (var j = 0; j < DT10_SHADOW_POOL_FIELDS.length; j++) {
+    if (!have[DT10_SHADOW_POOL_FIELDS[j].send]) {
+      out.push(DT10_SHADOW_POOL_FIELDS[j]);
+      have[DT10_SHADOW_POOL_FIELDS[j].send] = true;
+    }
+  }
+  return out;
 }
 /** Map DT10_POOL_FIELDS → column index from a header row array; null=absent */
 function dt10MapHeaderCols_(headerRow) {
@@ -3484,6 +3680,328 @@ function dt10PortfolioInputs_(ss, panel) {
     portfolio.holdings_input_incomplete = holdings._input_incomplete === true;
   }
   return portfolio;
+}
+// ---------------------------------------------------------------------------
+// v1.16.0 [FUNDING-EVIDENCE] -- apply the published broker packet to THIS
+// request (PURE core + thin orchestrator). Script Property
+// DT10_FUNDING_EVIDENCE = off (DEFAULT: the request body is v1.15.0 byte for
+// byte) | on. The packet is the document property 10_My_Portfolio publishes
+// from a read-only IBKR capture (PD_IBKR_EVIDENCE_PUBLISH=on); this file only
+// reads it. Nothing here invents a position, a quantity, a quote or a cash
+// figure: every number sent is read from the packet or from My_Portfolio.
+// ---------------------------------------------------------------------------
+var DT10_FUNDING_PROP = 'DT10_FUNDING_EVIDENCE';        // off (default) | on
+var DT10_FUNDING_EXCLUDE_PROP = 'PD_EXECUTION_EXCLUDE';  // shared with 10_My_Portfolio
+var DT10_FUNDING_MAX_AGE_MS = 840000;   // backend 900 s less a 60 s request margin
+var DT10_FUNDING_MAX_ITEMS = 500;
+var DT10_FUNDING_SAFE = 9007199254740991;
+
+function dt10FundingMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on' ? 'on' : 'off';
+  } catch (eFm) { return 'off'; }
+}
+
+/** PURE: 'a, B;c' -> ['A', 'B', 'C'] (trimmed, upper, unique). */
+function dt10FundingExcludeList_(raw) {
+  var out = [], seen = {};
+  var parts = String(raw === null || raw === undefined ? '' : raw).split(/[,;\s]+/);
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i].toUpperCase();
+    if (s && !seen.hasOwnProperty(s)) { seen[s] = true; out.push(s); }
+  }
+  return out;
+}
+
+function dt10FundingSym_(v) {
+  return String(v === null || v === undefined ? '' : v)
+      .replace(/^\s+|\s+$/g, '').toUpperCase();
+}
+
+/** PURE: a plain decimal (text exactly; a number via toFixed(scale)) ->
+ * integer units of 10^-scale, or null (port of 10_My_Portfolio pdIbkrUnits_). */
+function dt10FundingUnits_(value, scale) {
+  if (typeof value === 'boolean' || value === null || value === undefined) return null;
+  var text;
+  if (typeof value === 'number') {
+    if (!isFinite(value) || Math.abs(value) >= 1e15) return null;
+    text = value.toFixed(scale);
+  } else {
+    text = String(value).replace(/^\s+|\s+$/g, '');
+  }
+  var m = text.match(/^(-)?(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  var frac = m[3] || '';
+  if (frac.length > scale) {
+    if (/[^0]/.test(frac.slice(scale))) return null;
+    frac = frac.slice(0, scale);
+  }
+  while (frac.length < scale) frac += '0';
+  var digits = (m[2] + frac).replace(/^0+(?=\d)/, '');
+  if (digits.length > 15) return null;
+  var n = Number(digits);
+  return (m[1] && n !== 0) ? -n : n;
+}
+
+/** PURE: exact integer division of safe integers; 'even' = round half to
+ * even (Python Decimal default, the backend's rounding). */
+function dt10FundingDiv_(num, div, mode) {
+  var q = Math.floor(num / div);
+  var r = num - q * div;
+  while (r < 0) { q -= 1; r += div; }
+  while (r >= div) { q += 1; r -= div; }
+  if (r === 0) return q;
+  if (mode === 'up') return q + 1;
+  if (r * 2 > div) return q + 1;
+  if (r * 2 < div) return q;
+  return q % 2 === 0 ? q : q + 1;
+}
+
+function dt10FundingAge_(ms) {
+  var m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60) + 'm';
+}
+
+/** PURE: the decision Symbol an IBKR position stands for (same rule as
+ * 10_My_Portfolio pdIbkrNative_ for the packet, which carries USD stocks
+ * only): 'BRK B'/USD -> 'BRK-B.US'; anything else links nothing. */
+function dt10FundingNative_(symbol, currency) {
+  if (dt10FundingSym_(currency) !== 'USD') return '';
+  var s = dt10FundingSym_(symbol).replace(/\s+/g, '-');
+  return /^[A-Z0-9][A-Z0-9.\-]{0,15}$/.test(s) ? s + '.US' : '';
+}
+
+/** PURE: {CCY: rate x100} from the packet's FX proofs (SAR fixed at 100).
+ * A proof finer than 2 decimals, repeated or unreadable -> null. */
+function dt10FundingRates_(packet) {
+  var rates = {SAR: 100};
+  var proofs = packet && Object.prototype.toString.call(packet.fx_rates) === '[object Array]'
+      ? packet.fx_rates : [];
+  if (proofs.length > DT10_FUNDING_MAX_ITEMS) return null;
+  for (var i = 0; i < proofs.length; i++) {
+    var p = proofs[i] || {};
+    var ccy = dt10FundingSym_(p.currency);
+    var x100 = dt10FundingUnits_(p.rate_to_sar, 2);
+    if (!/^[A-Z]{3}$/.test(ccy) || x100 === null || x100 <= 0) return null;
+    if (rates.hasOwnProperty(ccy)) return null;
+    rates[ccy] = x100;
+  }
+  return rates;
+}
+
+/** PURE: certified cash in cents from the funding accounts' settled cash
+ * less reservations, at the proven rates. {cents|null, reason}. */
+function dt10FundingCashCents_(packet, rates) {
+  var out = {cents: null, reason: ''};
+  function fail(why) { out.cents = null; out.reason = why; return out; }
+  var funding = packet && Object.prototype.toString.call(packet.funding_accounts) === '[object Array]'
+      ? packet.funding_accounts : [];
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  if (!funding.length || accounts.length > DT10_FUNDING_MAX_ITEMS) return fail('funding accounts missing');
+  var total = 0, rows = 0;
+  for (var f = 0; f < funding.length; f++) {
+    var aid = String(funding[f]);
+    var acc = null;
+    for (var a = 0; a < accounts.length; a++) {
+      if (accounts[a] && String(accounts[a].account_id) === aid) { acc = accounts[a]; break; }
+    }
+    if (!acc) return fail('funding account unknown');
+    var cash = Object.prototype.toString.call(acc.cash) === '[object Array]' ? acc.cash : [];
+    if (!cash.length || cash.length > DT10_FUNDING_MAX_ITEMS) return fail('cash rows missing');
+    for (var c = 0; c < cash.length; c++) {
+      var row = cash[c] || {};
+      var ccy = dt10FundingSym_(row.currency);
+      var settled = dt10FundingUnits_(row.settled_cash, 6);
+      var reserved = dt10FundingUnits_(row.reserved_cash, 6);
+      if (settled === null || reserved === null) return fail('cash unreadable (' + ccy + ')');
+      if (row.reservations_complete !== true) return fail('reservations incomplete (' + ccy + ')');
+      var net = settled - reserved;
+      if (net < 0) return fail('cash over-reserved (' + ccy + ')');
+      if (!rates.hasOwnProperty(ccy)) return fail('cash currency without FX proof (' + ccy + ')');
+      var rate = rates[ccy];
+      if (net > Math.floor(DT10_FUNDING_SAFE / rate) || total > DT10_FUNDING_SAFE - net * rate) {
+        return fail('cash too large for an exact check');
+      }
+      total += net * rate;             /* SAR at 10^-8 */
+      rows++;
+    }
+  }
+  if (!rows) return fail('cash rows missing');
+  out.cents = dt10FundingDiv_(total, 1000000, 'even');
+  return out;
+}
+
+/** PURE: links for THIS request's rows (row_index = position in holdings),
+ * matched on the native symbol + currency; every positive packet position
+ * must be represented. {links, unlinked, unrepresented, reason}. */
+function dt10FundingLinks_(holdings, packet) {
+  var out = {links: [], unlinked: [], unrepresented: [], reason: ''};
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  var positions = [];
+  for (var a = 0; a < accounts.length; a++) {
+    var acc = accounts[a] || {};
+    var list = Object.prototype.toString.call(acc.positions) === '[object Array]' ? acc.positions : [];
+    if (list.length > DT10_FUNDING_MAX_ITEMS) { out.reason = 'positions oversized'; return out; }
+    for (var p = 0; p < list.length; p++) {
+      var pos = list[p] || {};
+      var qty = dt10FundingUnits_(pos.quantity, 6);
+      positions.push({account_id: String(acc.account_id), instrument_id: String(pos.instrument_id),
+                      symbol: dt10FundingSym_(pos.symbol), currency: dt10FundingSym_(pos.currency),
+                      native: dt10FundingNative_(pos.symbol, pos.currency),
+                      positive: qty !== null && qty > 0});
+    }
+  }
+  var used = {};
+  for (var i = 0; i < holdings.length; i++) {
+    var h = holdings[i] || {};
+    var s = dt10FundingSym_(h.symbol), c = dt10FundingSym_(h.currency);
+    var hit = null, hits = 0;
+    for (var q = 0; q < positions.length; q++) {
+      if (positions[q].native && positions[q].native === s && positions[q].currency === c) {
+        hit = positions[q]; hits++;
+      }
+    }
+    var key = hit ? hit.account_id + '|' + hit.instrument_id : '';
+    if (hits === 1 && !used.hasOwnProperty(key)) {
+      used[key] = true;
+      out.links.push({row_index: i, account_id: hit.account_id, instrument_id: hit.instrument_id,
+                      position_symbol: hit.symbol, symbol: s, currency: c});
+    } else {
+      out.unlinked.push(s || '?');
+    }
+  }
+  for (var u = 0; u < positions.length; u++) {
+    var k2 = positions[u].account_id + '|' + positions[u].instrument_id;
+    if (positions[u].positive && !used.hasOwnProperty(k2)) out.unrepresented.push(positions[u].symbol);
+  }
+  return out;
+}
+
+/** PURE: a non-negative plain decimal at its own minimal scale (<= 6):
+ * 15.2 -> {units: 152, scale: 1}; 174 -> {units: 174, scale: 0}; else null. */
+function dt10FundingDecimal_(value) {
+  var u = dt10FundingUnits_(value, 6);
+  if (u === null || u < 0) return null;
+  var scale = 6;
+  while (scale > 0 && u % 10 === 0) { u = u / 10; scale--; }
+  return {units: u, scale: scale};
+}
+
+/** PURE: price x quantity x proven rate, rounded half-even to the cent, or
+ * null when any input is not a plain non-negative number or the exact
+ * product would leave the safe-integer range (the backend then decides). */
+function dt10FundingValueSar_(price, quantity, rateX100) {
+  var p = dt10FundingDecimal_(price), q = dt10FundingDecimal_(quantity);
+  if (!p || !q || !(rateX100 > 0)) return null;
+  if (p.units > 0 && q.units > Math.floor(DT10_FUNDING_SAFE / p.units)) return null;
+  var pq = p.units * q.units;
+  if (pq > Math.floor(DT10_FUNDING_SAFE / rateX100)) return null;
+  var div = Math.pow(10, p.scale + q.scale);     /* -> cents */
+  return dt10FundingDiv_(pq * rateX100, div, 'even') / 100;
+}
+
+/** PURE core. Mutates body IN PLACE only when it returns applied=true.
+ * exclude = symbols outside the broker's custody (e.g. 5023.SR). */
+function dt10FundingApplyCore_(body, packet, exclude, nowMs) {
+  var out = {applied: false, reason: '', ageMs: null, cashCents: null, rows: 0,
+             linked: 0, unlinked: [], unrepresented: [], excluded: [], rates: null};
+  function fail(why) { out.applied = false; out.reason = why; return out; }
+  if (!body || !body.portfolio || typeof body.portfolio !== 'object') return fail('request body unavailable');
+  if (!packet || Object.prototype.toString.call(packet) !== '[object Object]' ||
+      packet.schema_version !== 1) return fail('no evidence packet');
+  var capMs = dt10SourceStampMs_(packet.captured_at);
+  if (capMs === null || typeof packet.captured_at !== 'string' ||
+      !/(Z|[+-]\d{2}:?\d{2})$/.test(packet.captured_at)) return fail('captured_at unreadable');
+  out.ageMs = nowMs - capMs;
+  if (out.ageMs < 0) return fail('capture time ahead of the clock');
+  if (out.ageMs > DT10_FUNDING_MAX_AGE_MS) return fail('capture too old (' + dt10FundingAge_(out.ageMs) + ')');
+  var holdings = body.portfolio.holdings;
+  if (Object.prototype.toString.call(holdings) !== '[object Array]') return fail('holdings not sent (DT10_SEND_HOLDINGS)');
+  if (body.portfolio.holdings_input_incomplete !== false) return fail('holdings read incomplete');
+  if (holdings.length > DT10_FUNDING_MAX_ITEMS) return fail('holdings oversized');
+  var rates = dt10FundingRates_(packet);
+  if (!rates) return fail('fx proofs unreadable');
+  var set = {};
+  for (var e = 0; e < (exclude || []).length; e++) set[exclude[e]] = true;
+  var kept = [];
+  for (var r = 0; r < holdings.length; r++) {
+    var s = dt10FundingSym_(holdings[r] ? holdings[r].symbol : '');
+    if (s && set.hasOwnProperty(s)) out.excluded.push(s); else kept.push(holdings[r]);
+  }
+  var cash = dt10FundingCashCents_(packet, rates);
+  if (cash.cents === null) return fail(cash.reason);
+  var linkRes = dt10FundingLinks_(kept, packet);
+  if (linkRes.reason) return fail(linkRes.reason);
+  var evidence;
+  try { evidence = JSON.parse(JSON.stringify(packet)); } catch (eCp) { return fail('packet not serializable'); }
+  evidence.holding_links = linkRes.links;
+  var fx = {};
+  for (var k in body.fx_rates) { if (body.fx_rates.hasOwnProperty(k)) fx[k] = body.fx_rates[k]; }
+  for (var ccy in rates) {
+    if (rates.hasOwnProperty(ccy) && ccy !== 'SAR') fx[ccy] = rates[ccy] / 100;
+  }
+  for (var v = 0; v < kept.length; v++) {
+    var h = kept[v];
+    var hc = dt10FundingSym_(h.currency);
+    if (hc && hc !== 'SAR' && rates.hasOwnProperty(hc) &&
+        typeof h.quantity === 'number' && typeof h.current_price === 'number') {
+      var val = dt10FundingValueSar_(h.current_price, h.quantity, rates[hc]);
+      if (val !== null) h.value_sar = val;
+    }
+  }
+  body.portfolio.holdings = kept;
+  body.portfolio.reconciliation_evidence = evidence;
+  body.portfolio.cash_available_sar = cash.cents / 100;
+  body.portfolio.pending_proceeds_sar = 0;
+  body.fx_rates = fx;
+  out.applied = true;
+  out.cashCents = cash.cents;
+  out.rows = kept.length;
+  out.linked = linkRes.links.length;
+  out.unlinked = linkRes.unlinked;
+  out.unrepresented = linkRes.unrepresented;
+  out.rates = rates;
+  return out;
+}
+
+/** PURE: the status-line fragment (never the packet). */
+function dt10FundingNote_(res) {
+  if (!res) return '';
+  if (!res.applied) return ' | funding evidence NOT APPLIED (' + String(res.reason || '?').slice(0, 80) + ')';
+  var cents = res.cashCents, a = Math.abs(cents), c = a % 100;
+  var cashText = (cents < 0 ? '-' : '') + Math.floor(a / 100) + '.' + (c < 10 ? '0' : '') + c;
+  var fxText = [];
+  for (var k in res.rates) {
+    if (res.rates.hasOwnProperty(k) && k !== 'SAR') fxText.push(k + ' ' + (res.rates[k] / 100));
+  }
+  return ' | funding evidence APPLIED (capture age ' + dt10FundingAge_(res.ageMs) +
+      '; cash ' + cashText + ' SAR; linked ' + res.linked + '/' + res.rows +
+      (res.unlinked.length ? '; unlinked ' + res.unlinked.slice(0, 3).join(',') : '') +
+      (res.unrepresented.length ? '; unrepresented ' + res.unrepresented.slice(0, 3).join(',') : '') +
+      (res.excluded.length ? '; excluded ' + res.excluded.slice(0, 3).join(',') : '') +
+      (fxText.length ? '; ' + fxText.join(' ') : '') + ')';
+}
+
+/** Orchestrator: DT10_FUNDING_EVIDENCE=on only. Never throws; a fault leaves
+ * the body untouched and says so in the note. */
+function dt10FundingApply_(body, nowMs) {
+  try {
+    if (dt10FundingMode_() !== 'on') return '';
+    var exclude = dt10FundingExcludeList_(
+        PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_EXCLUDE_PROP));
+    var res = dt10FundingApplyCore_(body, dt10ReconciliationEvidence_(), exclude, nowMs);
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] funding evidence ' +
+                 (res.applied ? 'applied' : 'not applied: ' + res.reason));
+    } catch (eLg) {}
+    return dt10FundingNote_(res);
+  } catch (eFa) {
+    return ' | funding evidence ERROR (' + String(eFa && eFa.message ? eFa.message : eFa).slice(0, 80) + ')';
+  }
 }
 // ---------------------------------------------------------------------------
 // v1.3.0 — SELECTION STABILITY LAYER (pure core; node-parity-tested against
@@ -5738,7 +6256,7 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
-/** v1.15.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
+/** v1.17.2: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
  * case) arms the held-seat hand-off; absent or any other word is off. A
  * property-service failure reads as OFF: the list is display context only,
  * so failing open keeps the unarmed request. Memoized (P-202). */
@@ -5753,7 +6271,7 @@ function dt10AuditKeepOn_() {
     } catch (eProp) { return false; }
   });
 }
-/** v1.15.1 PURE: the stability members (member === true: seated, grace-held
+/** v1.17.2 PURE: the stability members (member === true: seated, grace-held
  * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at
  * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */
 function dt10AuditKeepSymbols_(state) {
@@ -7022,6 +7540,229 @@ function dt10AppendExitLog_(ss, audit, runInfo) {
     return 'ExitLog: ERROR';
   }
 }
+// ---------------------------------------------------------------------------
+// v1.17.0 [SHADOW-RANK-LOG] -- the backend's ranking challenger, logged.
+// Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT) | on | all; see the
+// v1.17.0 header block. Research evidence only: ranks, symbols and the backend's own
+// figures, never a ticket, price or amount.
+// ---------------------------------------------------------------------------
+var DT10_SHADOW_LOG_PROP = 'DT10_SHADOW_RANK_LOG';
+var DT10_SHADOW_LOG_SHEET = '_Shadow_Rank_Log';
+var DT10_SHADOW_LOG_STATE_PROP = 'DT10_SHADOW_LOG_STATE_V1';
+var DT10_SHADOW_LOG_HEADERS = ['Logged At', 'Day', 'Cohort', 'Order', 'Rank',
+  'Symbol', 'Market', 'Sector', 'Seat', 'Live Rank', 'Shadow Rank',
+  'Engine ROI %', 'Rel', 'Conf', 'Momentum', 'Strength', 'Strength Ref',
+  'Cap', 'Floor OK', 'Mode', 'Rule', 'Builder', 'Pool', 'Overlap Top5'];
+/** v1.17.0: 'on' (first event of each UTC day) or 'all' (also on change)
+ * for those exact words (trimmed, any case), else 'off'. Never throws. */
+function dt10ShadowLogMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_SHADOW_LOG_PROP) || '');
+  } catch (e) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'on' || raw === 'all') ? raw : 'off';
+}
+/** v1.17.0 PURE: the rows of one logging event and its signature, from
+ * payload.meta.rank_challenger (opportunity_builder v1.28.0, shadow) and the
+ * seats this render shows (payload.selected). Returns { rows, sig, reason };
+ * rows is empty -- nothing to log -- when the block is absent (backend at
+ * legacy), carries an error, or both lists are empty. Orders: CHAMPION (the
+ * backend's live order; Rank = live rank), CHALLENGER (the shadow order;
+ * Rank = shadow rank), BOARD (Rank = board rank; Shadow Rank from the seat,
+ * else from the INVEST audit row; blank when the name is not in today's
+ * INVEST pool, e.g. a grace hold). Every row is DT10_SHADOW_LOG_HEADERS wide. */
+function dt10ShadowLogRows_(payload, stamp, day, cohort) {
+  var meta = (payload && payload.meta) || {};
+  var rc = meta.rank_challenger;
+  if (!rc || typeof rc !== 'object') {
+    return { rows: [], sig: '', reason: 'no challenger block' };
+  }
+  if (rc.error) {
+    return { rows: [], sig: '', reason: 'challenger error ' + String(rc.error) };
+  }
+  var champ = rc.champion || [];
+  var chal = rc.challenger || [];
+  if (!champ.length && !chal.length) {
+    return { rows: [], sig: '', reason: 'empty challenger lists' };
+  }
+  var detail = {};
+  var i, r, s;
+  var lists = [chal, champ];
+  for (var li = 0; li < lists.length; li++) {
+    for (i = 0; i < lists[li].length; i++) {
+      r = lists[li][i] || {};
+      s = dt10NormSym_(r.symbol);
+      if (s && !detail.hasOwnProperty(s)) detail[s] = r;
+    }
+  }
+  var auditRank = {};
+  var cands = (payload && payload.candidates_rows) || [];
+  for (i = 0; i < cands.length; i++) {
+    r = cands[i] || {};
+    s = dt10NormSym_(r.symbol);
+    if (s && r.shadow_rank !== undefined && r.shadow_rank !== null &&
+        !auditRank.hasOwnProperty(s)) {
+      auditRank[s] = r.shadow_rank;
+    }
+  }
+  function vtag(v) {
+    var c = dt10Cell_(v);
+    return c === '' ? '' : 'v' + String(c);
+  }
+  var tail = [dt10Cell_(rc.mode), vtag(rc.version), vtag(rc.builder),
+              dt10Cell_(rc.pool), dt10Cell_(rc.overlap_top5)];
+  function flag(v) {
+    return v === true ? 'Y' : (v === false ? 'N' : '');
+  }
+  function line(order, rank, sym, x, seat, live, shadow, eng, rel, conf) {
+    return [stamp, day, cohort, order, dt10Cell_(rank), dt10Cell_(sym),
+            dt10Cell_(x.market), dt10Cell_(x.sector), seat, dt10Cell_(live),
+            dt10Cell_(shadow), dt10Cell_(eng), dt10Cell_(rel), dt10Cell_(conf),
+            dt10Cell_(x.momentum), dt10Cell_(x.strength),
+            dt10Cell_(x.strength_ref), flag(x.cap), flag(x.floor_ok)]
+        .concat(tail);
+  }
+  var rows = [], cSyms = [], sSyms = [], bToks = [];
+  for (i = 0; i < champ.length; i++) {
+    r = champ[i] || {};
+    rows.push(line('CHAMPION', r.live_rank, r.symbol, r, '', r.live_rank,
+                   r.shadow_rank, r.engine_roi_pct, r.rel, r.conf));
+    cSyms.push(dt10NormSym_(r.symbol));
+  }
+  for (i = 0; i < chal.length; i++) {
+    r = chal[i] || {};
+    rows.push(line('CHALLENGER', r.shadow_rank, r.symbol, r, '', r.live_rank,
+                   r.shadow_rank, r.engine_roi_pct, r.rel, r.conf));
+    sSyms.push(dt10NormSym_(r.symbol));
+  }
+  var seats = (payload && payload.selected) || [];
+  for (i = 0; i < seats.length; i++) {
+    var t = seats[i] || {};
+    s = dt10NormSym_(t.symbol);
+    if (!s) continue;
+    var x = detail.hasOwnProperty(s) ? detail[s] : {};
+    var seat = '';
+    try {
+      seat = String(t._stab_status || '').split(' ')[0].split('(')[0]
+          .toUpperCase();
+    } catch (eS) {
+      seat = '';
+    }
+    var shadow = (t.shadow_rank !== undefined && t.shadow_rank !== null) ?
+        t.shadow_rank : (auditRank.hasOwnProperty(s) ? auditRank[s] : '');
+    var bRank = (t.rank !== undefined && t.rank !== null && t.rank !== '') ?
+        t.rank : i + 1;
+    rows.push(line('BOARD', bRank, t.symbol,
+                   { market: t.market, sector: t.sector,
+                     momentum: x.momentum, strength: x.strength,
+                     strength_ref: x.strength_ref, cap: x.cap,
+                     floor_ok: x.floor_ok },
+                   seat, x.live_rank, shadow, t.engine_roi_pct, t.reliability,
+                   t.confidence_band));
+    bToks.push(bRank + ':' + s);
+  }
+  return { rows: rows, reason: '',
+           sig: day + '|C:' + cSyms.join(',') + '|S:' + sSyms.join(',') +
+               '|B:' + bToks.join(',') };
+}
+/** v1.17.0: append one event to _Shadow_Rank_Log when DT10_SHADOW_RANK_LOG
+ * is on or all. '' when off (no further read, no tab, no write: the v1.16.0
+ * status line). Cadence: 'on' = the first event of each UTC day (what the
+ * nightly scorecard reads); 'all' = also whenever an order changes (state
+ * DT10_SHADOW_LOG_STATE_V1). The tab is created hidden on first use; row 1
+ * must be the header (written when blank; another layout is never written).
+ * Returns the status token. NEVER throws. */
+function dt10AppendShadowRankLog_(ss, payload, cohort) {
+  // v1.17.1 [SHADOW-MOMENTUM]: the mode the pool projection used in this
+  // execution when it ran (the logged day and the sent rows agree); else the
+  // property itself, as in v1.17.0.
+  var mode = (typeof DT10_PROP_MEMO_ === 'object' && DT10_PROP_MEMO_ &&
+      Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, 'shadow_log_mode')) ?
+      DT10_PROP_MEMO_.shadow_log_mode : dt10ShadowLogMode_();
+  if (mode === 'off') return '';
+  try {
+    var stamp = '';
+    try {
+      stamp = Utilities.formatDate(new Date(),
+          Session.getScriptTimeZone() || 'Asia/Riyadh',
+          'yyyy-MM-dd HH:mm:ss');
+    } catch (eT) {
+      stamp = String(new Date());
+    }
+    var day = dt10StabToday_();
+    var built = dt10ShadowLogRows_(payload, stamp, day,
+        String(cohort === null || cohort === undefined ? '' : cohort));
+    if (!built.rows.length) return 'ShadowLog: none (' + built.reason + ')';
+    var props = PropertiesService.getScriptProperties();
+    var prev = {};
+    try {
+      prev = JSON.parse(props.getProperty(DT10_SHADOW_LOG_STATE_PROP) ||
+                        '{}') || {};
+    } catch (eP) {
+      prev = {};
+    }
+    if (prev.date === day && (mode === 'on' || prev.sig === built.sig)) {
+      return mode === 'on' ? 'ShadowLog: logged today' :
+          'ShadowLog: unchanged';
+    }
+    var want = DT10_SHADOW_LOG_HEADERS.length;
+    var sh = ss.getSheetByName(DT10_SHADOW_LOG_SHEET);
+    if (!sh) {
+      sh = ss.insertSheet(DT10_SHADOW_LOG_SHEET);
+      try {
+        if (sh.getMaxColumns() > want) {
+          sh.deleteColumns(want + 1, sh.getMaxColumns() - want);
+        }
+      } catch (eC) {}
+      try {
+        sh.hideSheet();
+      } catch (eH) {}
+      try {
+        ss.setActiveSheet(ss.getSheetByName(DT10_SHEET));
+      } catch (eF) {}
+    }
+    if (sh.getMaxColumns() < want) {
+      sh.insertColumnsAfter(sh.getMaxColumns(), want - sh.getMaxColumns());
+    }
+    var head = sh.getLastRow() > 0 ?
+        (sh.getRange(1, 1, 1, want).getValues()[0] || []) : [];
+    var blank = false;
+    for (var hi = 0; hi < want; hi++) {
+      var hv = String(head[hi] === null || head[hi] === undefined ?
+          '' : head[hi]).replace(/^\s+|\s+$/g, '');
+      if (hv === '') {
+        blank = true;
+      } else if (hv !== DT10_SHADOW_LOG_HEADERS[hi]) {
+        return 'ShadowLog: ERROR header mismatch at column ' + (hi + 1);
+      }
+    }
+    if (blank) {
+      sh.getRange(1, 1, 1, want).setValues([DT10_SHADOW_LOG_HEADERS])
+          .setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    var first = Math.max(sh.getLastRow(), 1) + 1;
+    var need = first + built.rows.length - 1;
+    if (sh.getMaxRows() < need) {
+      sh.insertRowsAfter(sh.getMaxRows(), need - sh.getMaxRows());
+    }
+    sh.getRange(first, 1, built.rows.length, want).setValues(built.rows);
+    try {
+      props.setProperty(DT10_SHADOW_LOG_STATE_PROP,
+          JSON.stringify({ date: day, sig: built.sig }));
+    } catch (eS) {}
+    return 'ShadowLog: +' + built.rows.length;
+  } catch (e) {
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] ShadowLog ERROR: ' + e);
+    } catch (e2) {}
+    return 'ShadowLog: ERROR ' + String(e).slice(0, 60);
+  }
+}
 /**
  * Append the rendered board to _Selection_Log. Modes (ScriptProperty
  * DT10_SELECTION_LOG): 'off' kill-switch; 'always' every run; unset =
@@ -7503,6 +8244,10 @@ function dt10RefreshDecisionTop10Run_(run) {
     body.portfolio.cash_available_sar = dt10Chosen.sent;
     cashNote = dt10Chosen.note;
   }
+  // v1.16.0 [FUNDING-EVIDENCE]: the published broker packet certifies THIS
+  // request (cash after reservations, links, proven FX). Default off = the
+  // body above byte for byte; the replay deep-copies the applied body.
+  var fundingNote = dt10FundingApply_(body, Date.now());
   var poolNote = 'backend selector';
   var dt10Outage = null;   // v1.11.10 [P-168]: sheet-pool outage sightings
   // Capture source generations BEFORE reading pool rows. A late source
@@ -7526,7 +8271,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
-  // v1.15.1: held seats kept in the backend's written audit (display only).
+  // v1.17.2: held seats kept in the backend's written audit (display only).
   if (dt10AuditKeepOn_()) {
     try {
       var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());
@@ -7618,7 +8363,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
-      poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
+      poolNote + heldNote + cashNote + fundingNote + ' | ' + dt10MetaLine_(payload.meta) +
       (stab && stab.note ? ' | ' + stab.note : '') +
       (earn && earn.note ? ' | ' + earn.note : '') +
       (kpiNote ? ' | ' + kpiNote : '') +
@@ -7638,9 +8383,14 @@ function dt10RefreshDecisionTop10Run_(run) {
   // v1.6.6 (S-4): membership departures logged with an Outcome stamp.
   var exitNote = dt10AppendExitLog_(ss,
       (stab && stab.audit) ? stab.audit : {}, statusLine);
+  // v1.17.0 [SHADOW-RANK-LOG]: the backend's ranking challenger, logged
+  // ('' when DT10_SHADOW_RANK_LOG is off -> the v1.16.0 status line).
+  var shadowNote = dt10AppendShadowRankLog_(ss, payload,
+      finalSource && finalSource.ready ? finalSource.cohort : '');
   var finalStatusLine = selLogNote ? statusLine + ' | ' + selLogNote
                                    : statusLine;
   if (exitNote) finalStatusLine += ' | ' + exitNote;
+  if (shadowNote) finalStatusLine += ' | ' + shadowNote;   // v1.17.0
   statusCell.setValue(finalStatusLine);
   // v1.13.4 [WP-8]: ONE _Run_Log INPUT-TRUTH row when any gate is armed.
   dt10InputTruthRunLog_(itMode, candMode, vintMode, payload, itRef,
@@ -8216,6 +8966,25 @@ function dt10SelfTest() {
               ' rowCells=' + slRow.length + ' mode=' + slMode +
               ' sig(B,A)=' +
               dt10SelLogSignature_([{ symbol: 'B' }, { symbol: 'A' }]));
+  // v1.17.0 [SHADOW-RANK-LOG]: pure rows core (nothing is written).
+  var srlBuilt = dt10ShadowLogRows_({ meta: { rank_challenger: {
+      version: '1.0', mode: 'shadow', builder: '1.28.0', pool: 2,
+      overlap_top5: 2,
+      champion: [{ symbol: 'A.US', live_rank: 1, shadow_rank: 2 },
+                 { symbol: 'B.US', live_rank: 2, shadow_rank: 1 }],
+      challenger: [{ symbol: 'B.US', live_rank: 2, shadow_rank: 1 },
+                   { symbol: 'A.US', live_rank: 1, shadow_rank: 2 }] } },
+      selected: [{ symbol: 'A.US', rank: 1, shadow_rank: 2 }] },
+      'stamp', 'day', 'run');
+  report.push('shadow rank log (' + DT10_SHADOW_LOG_PROP + '): ' +
+              dt10ShadowLogMode_());
+  report.push('shadow rank log core: ' +
+      ((srlBuilt.rows.length === 5 &&
+        srlBuilt.rows[0].length === DT10_SHADOW_LOG_HEADERS.length &&
+        srlBuilt.sig === 'day|C:A.US,B.US|S:B.US,A.US|B:1:A.US' &&
+        srlBuilt.rows[0][20] === 'v1.0' && srlBuilt.rows[0][21] === 'v1.28.0' &&
+        dt10ShadowLogRows_({}, 's', 'd', 'c').rows.length === 0) ?
+       'ok' : 'FAIL'));
   // v1.4.0: page-status dry check (pure — nothing is written).
   report.push('page-status upsert: writePageStatus_ ' +
               (typeof writePageStatus_ === 'function' ?
@@ -8716,9 +9485,51 @@ function dt10SelfTest() {
   report.push('property memo core: ' +
       ((pmA === pmB && pmB === pmC && pmKeys >= 2 &&
         pmA.length === (dt10W52FieldsLegacy_() ? DT10_POOL_FIELDS.length - 4
-                                               : DT10_POOL_FIELDS.length))
+                                               : DT10_POOL_FIELDS.length) +
+            (DT10_PROP_MEMO_.shadow_log_mode !== 'off' ?
+             DT10_SHADOW_POOL_FIELDS.length : 0))   // v1.17.1
        ? 'ok (pool fields memoized; keys=' + pmKeys + '; reads=1/execution)'
        : 'FAIL'));
+  /* v1.17.1 [SHADOW-MOMENTUM]: the challenger's momentum input travels on
+     the pool row only while the shadow rank log is armed. Pure: the memo is
+     swapped for the two projections and restored (finally). */
+  var spOff = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, false);
+  var spOn = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, true);
+  var spTwice = dt10PoolFieldsWithShadow_(spOn, true);
+  var spTail = spOn.slice(DT10_POOL_FIELDS.length);
+  var spTailOk = spTail.length === DT10_SHADOW_POOL_FIELDS.length;
+  for (var spi = 0; spTailOk && spi < spTail.length; spi++) {
+    if (spTail[spi] !== DT10_SHADOW_POOL_FIELDS[spi]) spTailOk = false;
+  }
+  var spHdr = ['Symbol', 'Name', 'Momentum Score'];
+  var spMemo = DT10_PROP_MEMO_;
+  var spMap = null, spRow = null, spBlank = null, spOffMap = null;
+  var spOffRow = null;
+  try {
+    DT10_PROP_MEMO_ = { pool_fields_active: spOn };
+    spMap = dt10MapHeaderCols_(spHdr);
+    spRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spMap, 'Global_Markets');
+    spBlank = dt10PoolRowFromSheetRow_(['WPC.US', 'W. P. Carey', ''],
+        spMap, 'Global_Markets');
+    DT10_PROP_MEMO_ = { pool_fields_active: spOff };
+    spOffMap = dt10MapHeaderCols_(spHdr);
+    spOffRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spOffMap, 'Global_Markets');
+  } finally {
+    DT10_PROP_MEMO_ = spMemo;
+  }
+  report.push('shadow pool fields core: ' +
+      ((spOff === DT10_POOL_FIELDS && spOn !== DT10_POOL_FIELDS && spTailOk &&
+        spTwice.length === spOn.length &&
+        spMap && spMap['Momentum Score'] === 2 && spRow !== null &&
+        spRow['Momentum Score'] === 57.03 && spBlank !== null &&
+        spBlank['Momentum Score'] === undefined &&
+        spOffMap && spOffMap['Momentum Score'] === undefined &&
+        spOffRow !== null && spOffRow['Momentum Score'] === undefined) ?
+       'ok (Momentum Score sent only while the shadow log is armed)' :
+       'FAIL') +
+      ' | sent now: ' + (dt10ShadowLogMode_() !== 'off' ? 'yes' : 'no'));
   /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race
      (ML run 37114669145 at 12:59, GM still run 37079471147 at 03:43) and
      the clean 10-04 case (both legs run 37160795404). */
@@ -9038,6 +9849,22 @@ function dt10SelfTest() {
   var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);
   var pgChal4 = cbTk4(pg1, 'CHAL.US');
   var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);
+  // v1.16.0 [FUNDING-EVIDENCE]: pure core dry run (nothing is sent).
+  var fundProbe = {fx_rates: {USD: 3.7448}, portfolio: {cash_available_sar: 1, pending_proceeds_sar: 0,
+      holdings_input_incomplete: false, holdings: [{symbol: '5023.SR', currency: 'SAR', value_sar: 9390}]}};
+  var fundPacket = {schema_version: 1, source_ref: 'selftest', captured_at: '2026-10-26T05:40:00Z',
+      accounts: [{account_id: 'ibkr-primary', positions_asof: '2026-10-26T05:40:00Z', positions_complete: true,
+                  positions: [], cash_asof: '2026-10-26T05:40:00Z', cash_complete: true,
+                  cash: [{currency: 'USD', settled_cash: '22085.12', reserved_cash: '2644.8', reservations_complete: true}]}],
+      holding_links: [], funding_accounts: ['ibkr-primary'],
+      fx_rates: [{currency: 'USD', rate_to_sar: '3.75', asof: '2026-10-26T05:40:00Z', source_ref: 'policy://sama-usd-peg-3.75'}]};
+  var fundRes = dt10FundingApplyCore_(fundProbe, fundPacket, ['5023.SR'], Date.UTC(2026, 9, 26, 5, 45));
+  report.push('funding evidence core: ' + ((fundRes.applied && fundRes.cashCents === 7290120 &&
+      fundProbe.portfolio.cash_available_sar === 72901.2 && fundProbe.fx_rates.USD === 3.75 &&
+      fundProbe.portfolio.holdings.length === 0 && fundRes.excluded.length === 1 &&
+      dt10FundingApplyCore_({fx_rates: {}, portfolio: {holdings: [], holdings_input_incomplete: false}},
+          fundPacket, [], Date.UTC(2026, 9, 26, 6)).reason.indexOf('capture too old') === 0) ? 'ok' : 'FAIL') +
+      ' (mode ' + dt10FundingMode_() + ', packet ' + (dt10ReconciliationEvidence_() ? 'present' : 'absent') + ')');
   report.push('pending grace core: ' +
       ((JSON.stringify(pg0) === JSON.stringify(cbW) &&
         JSON.stringify(pgA) === JSON.stringify(cbW) &&

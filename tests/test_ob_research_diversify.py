@@ -8,6 +8,8 @@ seats, leaving cash unallocated (100,000 -> 50,000 SAR on the synthetic case
 below). Gate ON makes research seats consume the cash-independent
 diversification slots. Gate OFF must be byte-identical to v1.24.1.
 v1.28.0 (2026-10-15): unset/blank now means ON; OFF cases pin GATE=0.
+(The defaults build is v1.28.2 since 2026-10-27, renumbered over #848's v1.28.0
+and #778's v1.28.1.)
 
 Runs as a script ("PASS k/k") and under pytest. Zero network, synthetic rows.
 Golden negative: TFB_ORD_BUILDER=<path to a base copy of
@@ -156,7 +158,7 @@ def test_off_research_lists_every_qualified_name():
 
 
 def test_default_unset_and_blank_equal_explicit_one():
-    # 2026-10-15: default armed in code (v1.28.0); unset/blank moved to the
+    # 2026-10-15: default armed in code (v1.28.0; v1.28.2 since 2026-10-27); unset/blank moved to the
     # armed side, explicit 0 stays the legacy/off path.
     ob = _load_builder()
     with _Env():

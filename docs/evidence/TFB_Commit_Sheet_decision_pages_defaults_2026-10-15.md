@@ -4,6 +4,8 @@ opportunity_builder 1.27.0 -> 1.28.0 - portfolio_actions 1.16.0 -> 1.17.0 - data
 
 Renumbered 2026-10-22 (merge of the re-merged #778 bundle, which now carries main #813/#815/#816): the engine half is **data_engine_v2 5.158.0** (5.157.0 is now the bundle's fallback, renumbered over #816's 5.156.0); portfolio_actions stays 1.17.0 and now sits on #816's 1.16.1 FRAC-QTY fix, so `TFB_PF_RESEARCH_VIEW=off` restores 1.16.1; opportunity_builder stays 1.28.0 on the bundle's 1.27.3. Arming `TFB_OPP_VENUE_CAL_EXT` by default now adds exactly one venue, .SZ (XSHG): #813 put .AT in the default-on map and keeps .NS fail-closed, and the bundle dropped both from its extension. Pins: verify_deployment 1.0.65 (builder 1.28.0, actions 1.17.0, engine 5.158.0), tiny-quotes ENGINE 5.158.0. `tests/test_decision_pages_defaults.py` G1 now loads the pre-flip copies from the bundle head c5133148 (builder 1.27.3, actions 1.16.1, engine 5.157.0). No default changed in the renumbering.
 
+Renumbered 2026-10-27 (merge of the re-merged #778 bundle 0d2f989c, which now carries main #844, #847-#853): main's #848 shipped a different opportunity_builder 1.28.0 (ranking challenger in shadow, `TFB_OPP_RANK_MODE` default legacy) and the bundle's data-quality gates moved to 1.28.1 over it, so the builder half of this PR is **opportunity_builder 1.28.2** (authored as 1.28.0); `TFB_OPP_*=0` restores 1.28.1. portfolio_actions stays 1.17.0 and data_engine_v2 stays 5.160.0. Pins: verify_deployment 1.0.65 (builder 1.28.2). `tests/test_decision_pages_defaults.py` G1 now loads the pre-flip copies from the bundle head 0d2f989c (builder 1.28.1, actions 1.16.1, engine 5.159.0). No default changed in the renumbering.
+
 ## S0 - Decision and base
 | Item | Value |
 |---|---|

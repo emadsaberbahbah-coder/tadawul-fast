@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.27.2  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.28.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.28.0 (2026-10-27): ranking challenger in shadow, TFB_OPP_RANK_MODE =
+legacy (default, byte-identical) | shadow | enforce. Shadow computes a second
+order of the same INVEST pool - engine ROI as a floor (>= Required ROI), then
+reliability band, sector-relative momentum, target-revision direction and the
+smaller gap to target, with names at the ROI cap (>= 34%) kept out of ranks
+1-5 - and publishes it as `shadow_rank` plus meta.rank_challenger without
+touching selection. `enforce` is reserved and behaves as shadow until the
+promotion PR (which must also move the GAS display order and the allocate
+replay). See the dated WHY block above OPPORTUNITY_BUILDER_VERSION.
 
 v1.27.2 (2026-10-21): Athens ('.AT' -> ASEX) joins the venue-calendar
 extension, so an old quote there is certified as the last session close or
@@ -1566,11 +1576,98 @@ from typing import Optional
 #   Version note: 1.27.1 is claimed by open PR #803; whichever lands second
 #   re-bumps.
 # -----------------------------------------------------------------------------
-# v1.27.3 (2026-10-13, renumbered 2026-10-19 and 2026-10-22) [TOP10 DATA-QUALITY]
-#   - three gates, all DEFAULT OFF. Authored as v1.27.0 in PR #770/#778; main
-#   shipped a different v1.27.0 (conviction sizing, #797) first, so this build
-#   was 1.27.1; on 2026-10-22 main shipped v1.27.2 (#813, Athens calendar) and
-#   1.27.1 stays claimed by open #803, so this build is 1.27.3.
+# v1.28.0 (2026-10-27) - RANKING CHALLENGER IN SHADOW (program register A2/L4)
+# WHY: the October review (71 first seats, 1-26 Oct, IBKR closes; project doc
+#   TFB_October_2026_Recommendation_Review.md) and the first nightly board
+#   scorecard (score_selection_log v1.1.0, 27 Oct 02:12 Riyadh, 258 seat
+#   episodes since 1 Sep) agree on one defect: the INVEST pool is ordered by
+#   opportunity_score, and half of that score (ann_roi 20 + risk_reward 18 +
+#   margin_of_safety 12) is the distance to the analyst target / intrinsic
+#   value - a distance that does not predict the outcome. Engine ROI vs
+#   excess return: Spearman -0.38 (October, n=71) and -0.17 (since 1 Sep,
+#   n=258); names at the engine ROI cap (>= 34%) beat their sector/venue
+#   reference 34-35% of the time vs 53-61% below the cap; board ranks 1-3
+#   beat the market 38% of the time vs 70% for ranks 7-10 (October). A large
+#   gap to a consensus target is widest exactly when fundamentals are
+#   deteriorating and analysts lag (Yale Insights, consensus target prices).
+#   The first funded ticket (FRST.US, 26 Oct) was seated two sessions after a
+#   22% EPS miss on a lagging consensus target - one instance of the pattern.
+# WHAT: gate TFB_OPP_RANK_MODE = legacy (DEFAULT) | shadow | enforce, read per
+#   build; any other value -> legacy.
+#   legacy  -> v1.27.2 byte-identical: no new candidate key, no new payload
+#              key, no log line.
+#   shadow  -> once the live order of the INVEST pool is fixed, a second order
+#              of the SAME pool is computed (_rank_challenger) and published.
+#              Selection, sizing, tickets, near-miss and the audit grid order
+#              are untouched. Additive keys only: `shadow_rank` on every
+#              INVEST candidates_rows record and on every selected ticket, and
+#              meta.rank_challenger = {version, mode, rule, pool, tiers,
+#              coverage, overlap_top5, champion[top 10], challenger[top 10]};
+#              both lists carry symbol, market, sector, live_rank,
+#              shadow_rank, rel, conf, engine ROI, momentum, strength, cap,
+#              floor_ok and revision. One INFO line per build:
+#              [RANK-CHALLENGER v1.28.0] mode=... pool=... .
+#   enforce -> RESERVED: behaves exactly like shadow and says so
+#              (meta.rank_challenger.enforce_reserved = true). A real enforce
+#              must also move the GAS cockpit's display order (it sorts seats
+#              by its own smoothed opportunity_score) and the funding order of
+#              the allocate replay, so it ships with the promotion PR, after
+#              the pre-registered rule below is met - never before.
+#   The allocate replay (board_funding_stage = allocate) never computes the
+#   order: it re-runs a frozen subset of the research pool, and GAS copies
+#   the allocated ticket keys over the research seat, so a replay-pool rank
+#   would overwrite the research one. The research pass and the single pass
+#   carry it.
+# THE CHALLENGER ORDER (pre-registered 27 Oct, before any shadow data):
+#   1. Floor: engine 12M ROI >= criteria required_roi_pct (a missing engine
+#      ROI fails the floor). Floor failures sort after every floor pass.
+#   2. Among floor passes: reliability band desc (5-point bands,
+#      floor(rel / 5)); then sector-relative strength desc (momentum_score
+#      minus the median momentum_score of the candidate's sector across the
+#      scanned pool when the sector has >= 3 values, else the pool median;
+#      bucketed +1 above +5 points, -1 below -5, 0 inside or unknown); then
+#      target-revision direction desc (+1 raised, -1 cut, 0 unknown - no
+#      producer yet, so the key stays inert until register item A8 publishes
+#      a revision field); then the SMALLER engine ROI first (a wide gap to
+#      target is a warning, not an opportunity); then symbol.
+#   3. Names at the cap (engine ROI >= 34%) never take ranks 1-5 while a
+#      floor-passing name below the cap is available: the first five
+#      below-cap names go first, then the rest of both groups in key order.
+#   Promotion rule (project doc TFB_Self_Correcting_Recommendation_Program_
+#   2026-10-27.md section 4): >= 40 scored seats per order and >= 20 trading
+#   days; challenger hit rate at +5 sessions vs the sector/venue reference
+#   >= champion + 10 points; mean excess >= champion; no guardrail breach;
+#   inconclusive after 40 trading days -> keep the champion.
+# NOT CHANGED: gates, verdicts, opportunity_score and its components, the
+#   audit grid order, near-miss, alerts, kpis, sizing, funding plans, the
+#   board-funding snapshot/replay contract. TFB_OPP_* is part of that
+#   contract's policy fingerprint, so changing the gate between a research
+#   pass and its allocate pass (seconds apart) fails that one replay closed:
+#   arm outside a sync.
+# KNOWN LIMITS: (a) shadow_rank reaches the sheet only when 16_Decision_Top10
+#   logs it (A2 part 2: _Selection_Log "Shadow Rank" plus a daily
+#   champion/challenger top-5 log); until then the order is visible in the
+#   payload and the Render log line only. A withheld single-pass build
+#   (portfolio inputs unverified) returns before ranking and carries no
+#   order - for both orders alike, so the paired days stay paired. (b)
+#   momentum_score is a short-horizon blend (RSI, 1D/5D change, 52W
+#   position, volume ratio); its coverage on the pool is reported in meta
+#   and a name without it is neutral. (c) In-sample sanity check only
+#   (October first seats, momentum not available): challenger key vs excess
+#   Spearman +0.15 / +0.17 (to date / +5 sessions), live rank -0.15 / -0.09.
+#   That is design evidence, not proof; the shadow window is the test.
+#   Functions added: 5 (_env_rank_mode, _rank_revision_dir, _rank_median,
+#   _rank_challenger, _rank_apply_shadow) plus the nested _row formatter
+#   inside _rank_challenger. Removed: 0.
+#   Rollback: unset TFB_OPP_RANK_MODE (or set legacy), or git revert.
+# -----------------------------------------------------------------------------
+# v1.28.1 (2026-10-13, renumbered 2026-10-19, 2026-10-22 and 2026-10-27) [TOP10 DATA-QUALITY]
+#   - three gates, all DEFAULT OFF; ALL v1.28.0 logic carried verbatim.
+#   Authored as v1.27.0 in PR #770/#778; main shipped a different v1.27.0
+#   (conviction sizing, #797) first, so this build was 1.27.1; on 2026-10-22
+#   main shipped v1.27.2 (#813, Athens calendar) and 1.27.1 stays claimed by
+#   open #803, so this build was 1.27.3; on 2026-10-27 main shipped v1.28.0
+#   (#848, ranking challenger in shadow) above it, so this build is 1.28.1.
 # EVIDENCE (Top_10_Investments export 2026-10-13 20:37 Riyadh = 17:37 UTC,
 #   pool 9,786, written audit 500): 481 of 500 written rows (96.2%) stop at
 #   Quote Freshness and only 2 pass every gate. By venue: 385 .US + 11 .TO
@@ -1639,10 +1736,21 @@ from typing import Optional
 #   (Shenzhen trades the Shanghai session and holiday calendar). The hint
 #   above that names .AT/.NS/.SZ rows now names .SZ rows only. OFF (all three
 #   unset/0): byte-identical to v1.27.2 except the version stamp.
+# MERGE NOTE 3 (2026-10-27, main e8337a16): v1.28.0 (#848) added
+#   TFB_OPP_RANK_MODE (default legacy) and the shadow challenger order. It
+#   and this build's three gates read disjoint env names and add disjoint
+#   payload keys (shadow_rank / meta.rank_challenger vs the stale_quotes
+#   alert, the near-miss improve_note text and meta.audit_keep); no line of
+#   either is changed by the other. OFF (all three unset/0, rank mode
+#   legacy): byte-identical to v1.28.0 except the version stamp.
 # -----------------------------------------------------------------------------
-# v1.28.0 (2026-10-15) [DECISION-PAGES LAUNCH] - three v1.24.2/v1.27.0 gates
+# v1.28.2 (2026-10-15, renumbered 2026-10-27) [DECISION-PAGES LAUNCH] - three v1.24.2/v1.27.0 gates
 #   become DEFAULT ON (owner decision 2026-10-15); each keeps an explicit kill
-#   switch (=0/false/off/no).
+#   switch (=0/false/off/no). ALL v1.28.1 logic carried verbatim (main's
+#   v1.28.0 plus the #778 data-quality gates). Authored as v1.28.0 in PR
+#   #779, renumbered 2026-10-27 after #848 shipped a different v1.28.0
+#   (ranking challenger in shadow) and the bundle underneath (#778) took
+#   1.28.1 over it.
 # EVIDENCE (Top_10_Investments export of 2026-10-15 00:56 Riyadh, builder
 #   1.26.1, pool 9,786, written audit 500): 4 of 500 rows pass every gate and
 #   441 stop at Quote Freshness. 56 of those are "venue calendar unavailable"
@@ -1679,8 +1787,17 @@ from typing import Optional
 #   sessions), so the bundle's _VENUE_CAL_MAP_EXT holds only .SZ (XSHG) and
 #   arming TFB_OPP_VENUE_CAL_EXT by default now adds exactly that one venue.
 #   Read 'v1.27.1' above as v1.27.3; the OFF clause restores v1.27.3.
+# MERGE NOTE 3 (2026-10-27): the bundle underneath is now v1.28.1 (#778's
+#   data-quality gates, renumbered over main's v1.28.0, #848). #848 added
+#   TFB_OPP_RANK_MODE (default legacy) and the shadow challenger order. It
+#   reads none of the three names above and they read none of its names;
+#   under rank mode shadow the challenger orders whatever INVEST pool these
+#   defaults leave (its order rule is unchanged). The three defaults and
+#   their kill switches are unchanged. Read 'v1.27.3' above as v1.28.1; the
+#   OFF clause restores v1.28.1 (which, with its own gates unset and rank
+#   mode legacy, is main's v1.28.0 except the version stamp).
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.28.0"
+OPPORTUNITY_BUILDER_VERSION = "1.28.2"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3060,7 +3177,7 @@ def _env_trust_lineage_mode():
 def _env_research_diversify():
     """v1.24.2: research-pass diversification; =1/true/on/yes makes a research
     pick consume the sector/market/issuer counters the way a funded pick does.
-    v1.28.0: DEFAULT ON (unset or blank); 0/false/off/no => v1.24.1 behaviour."""
+    v1.28.2: DEFAULT ON (unset or blank); 0/false/off/no => v1.24.1 behaviour."""
     return (os.getenv("TFB_OPP_RESEARCH_DIVERSIFY") or "1").strip().lower() in (
         "1", "true", "on", "yes")
 
@@ -3102,6 +3219,29 @@ def _env_rank_by_engine_roi():
     return str(_env_str(
         "TFB_OPP_RANK_BY_ENGINE_ROI", "0")).strip().lower() in (
         "1", "true", "yes", "on", "enabled", "enable")
+
+
+# v1.28.0 [RANK-CHALLENGER] (A2/L4): pre-registered constants of the shadow
+# order. Fixed on 27 Oct before any shadow data; changing one is a new
+# challenger and restarts the evaluation window.
+RANK_CHALLENGER_VERSION = "1.0"
+RANK_CAP_ENGINE_ROI_PCT = 34.0   # engine ROI % at/above -> "at the cap"
+RANK_CAP_FIRST_FREE = 5          # cap names never take ranks 1..5 (see WHY)
+RANK_REL_BAND_PTS = 5.0          # reliability band width (points)
+RANK_STRENGTH_DEADBAND = 5.0     # momentum points vs the sector median
+RANK_SECTOR_MIN_PEERS = 3        # values needed for a sector median
+RANK_PUBLISH_TOP_N = 10          # rows per order in meta.rank_challenger
+
+
+def _env_rank_mode():
+    """v1.28.0 [RANK-CHALLENGER]: TFB_OPP_RANK_MODE = legacy (default) |
+    shadow | enforce, read per call (no restart). Any other value -> legacy
+    (byte-identical v1.27.2). Never raises."""
+    try:
+        raw = str(_env_str("TFB_OPP_RANK_MODE", "legacy")).strip().lower()
+        return raw if raw in ("shadow", "enforce") else "legacy"
+    except Exception:
+        return "legacy"
 
 
 def _env_issuer_dedup():
@@ -3254,13 +3394,13 @@ def _env_fx_usx_subunit():
 
 def _env_venue_cal_ext():
     """v1.27.0: resolve _VENUE_CAL_MAP_EXT venues in the freshness gate.
-    v1.28.0: DEFAULT ON; 0/false/off/no restores the 16-venue map."""
+    v1.28.2: DEFAULT ON; 0/false/off/no restores the 16-venue map."""
     return _env_flag01("TFB_OPP_VENUE_CAL_EXT", "1")
 
 
 def _env_freshness_alert():
     """v1.27.0: stale_quotes alert + run-window near-miss text.
-    v1.28.0: DEFAULT ON (display only); 0/false/off/no removes it."""
+    v1.28.2: DEFAULT ON (display only); 0/false/off/no removes it."""
     return _env_flag01("TFB_OPP_FRESHNESS_ALERT", "1")
 
 
@@ -3701,6 +3841,12 @@ _FIELD_ALIASES = {
                          "w52positionpct", "week52position", "52wpos"),
     "pct_change_1d": ("percentchange", "pctchange", "changepct",
                       "daychangepct", "percentchange1d", "pctchange1d"),
+    # v1.28.0 [RANK-CHALLENGER]: read only when TFB_OPP_RANK_MODE is shadow or
+    # enforce (normalize_candidate attaches nothing under legacy).
+    "momentum_score": ("momentumscore",),
+    "target_revision": ("targetrevision30d", "targetrevision",
+                        "pricetargetrevision30d", "analysttargetrevision30d",
+                        "targetrevisiondirection", "targetrevisiondir"),
 }
 
 _TREND_MAP = {
@@ -4071,6 +4217,12 @@ def normalize_candidate(row, fx_rates, criteria):
         cand["w52_low"] = _to_float(_field(view, "w52_low"))
         cand["w52_position_pct"] = _to_float(_field(view, "w52_position_pct"))
         cand["pct_change_1d"] = _to_float(_field(view, "pct_change_1d"))
+    # v1.28.0 [RANK-CHALLENGER]: the shadow-order inputs attach ONLY when the
+    # gate is shadow/enforce, so the legacy cand dict stays byte-identical.
+    if _env_rank_mode() != "legacy":
+        cand["momentum_score"] = _to_float(_field(view, "momentum_score"))
+        cand["target_revision_dir"] = _rank_revision_dir(
+            _field(view, "target_revision"))
     return cand
 
 
@@ -4728,7 +4880,7 @@ _VENUE_CAL_EXT_MAP = {
     "VS": "XLIT", "CR": "XZAG", "RO": "XBSE", "PK": "XKAR",
     "AT": "ASEX",   # v1.27.2 ('.NS' deliberately absent: no NSE special sessions)
 }
-# v1.27.3 [VENUE-CAL-EXT] (merged with v1.26.2 and v1.27.2): read only when
+# v1.28.1 [VENUE-CAL-EXT] (merged with v1.26.2 and v1.27.2): read only when
 # TFB_OPP_VENUE_CAL_EXT is armed, AFTER v1.26.2's map. Only the suffixes
 # v1.26.2/v1.27.2 leave out; every code exists in exchange_calendars 4.13.2
 # (verified by get_calendar_names, 2026-10-19). .SZ shares XSHG. 2026-10-22:
@@ -4777,7 +4929,7 @@ def _venue_suffix(symbol):
 
 def _venue_code(symbol):
     """v1.27.0: exchange_calendars code for the symbol's venue or None.
-    v1.27.3: the base map, then v1.26.2's extension (_venue_cal_code, kill
+    v1.28.1: the base map, then v1.26.2's extension (_venue_cal_code, kill
     switch TFB_TICKET_VENUE_CAL_EXT), then _VENUE_CAL_MAP_EXT only when
     TFB_OPP_VENUE_CAL_EXT=1."""
     suffix = _venue_suffix(symbol)
@@ -4793,7 +4945,7 @@ def _venue_state(symbol, now_utc):
     failure, any exception) — an old quote then remains uncertified.
     Lazy exchange_calendars + pandas; NEVER raises."""
     try:
-        code = _venue_code(symbol)      # v1.27.3: base, v1.26.2 ext, then v1.27.3 ext
+        code = _venue_code(symbol)      # v1.28.1: base, v1.26.2 ext, then v1.28.1 ext
         if not code:
             return None
         cal = _VENUE_CAL_CACHE.get(code)
@@ -5608,6 +5760,192 @@ def opportunity_score(components):
     for key, weight in SCORE_WEIGHTS.items():
         total += components.get(key, 0.0) * weight / 100.0
     return round(total, 1)
+
+
+# ---------------------------------------------------------------------------
+# v1.28.0 [RANK-CHALLENGER] (A2/L4) - the pre-registered shadow order. Runs
+# only when TFB_OPP_RANK_MODE is shadow/enforce; see the dated WHY block above
+# OPPORTUNITY_BUILDER_VERSION.
+# ---------------------------------------------------------------------------
+
+_RANK_REVISION_UP = frozenset((
+    "up", "raise", "raised", "upgrade", "upgraded", "higher", "increase",
+    "increased", "positive"))
+_RANK_REVISION_DOWN = frozenset((
+    "down", "cut", "lower", "lowered", "downgrade", "downgraded", "decrease",
+    "decreased", "negative", "reduced"))
+
+
+def _rank_revision_dir(value):
+    """v1.28.0: analyst target-revision direction -> +1 / -1 / 0. A number
+    reads by its sign, a word by the two token sets; blank, flat or unknown
+    is 0. Never raises."""
+    try:
+        if value is None:
+            return 0
+        f = _to_float(value)
+        if f is not None:
+            return 1 if f > 0 else (-1 if f < 0 else 0)
+        token = str(value).strip().lower()
+        if token in _RANK_REVISION_UP:
+            return 1
+        if token in _RANK_REVISION_DOWN:
+            return -1
+    except Exception:  # noqa: BLE001 - an unreadable cell is "unknown"
+        pass
+    return 0
+
+
+def _rank_median(values):
+    """v1.28.0: median of the non-None values; None when there are none."""
+    vals = sorted(float(v) for v in values if v is not None)
+    n = len(vals)
+    if not n:
+        return None
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _rank_challenger(audit, invest, crit, mode):
+    """v1.28.0 [RANK-CHALLENGER]: the pre-registered second order of the SAME
+    INVEST pool.
+
+    audit  - every scanned record; its `_cand` carries momentum_score when
+             the gate is armed, and the sector / pool medians come from it.
+    invest - the INVEST records in the LIVE order (index + 1 = live_rank).
+    Returns (ordered_records, ranks, info): a new list holding the same
+    record objects in challenger order, symbol -> shadow rank (first
+    occurrence wins), and the meta.rank_challenger block. Mutates nothing."""
+    try:
+        req = float(crit.get("required_roi_pct") or 0.0)
+    except (TypeError, ValueError):
+        req = 0.0
+    by_sector = {}
+    pool_vals = []
+    for rec in audit:
+        c = rec.get("_cand") or {}
+        m = c.get("momentum_score")
+        if m is None:
+            continue
+        pool_vals.append(m)
+        by_sector.setdefault(c.get("sector") or "Unknown", []).append(m)
+    pool_med = _rank_median(pool_vals)
+    sector_med = {s: _rank_median(v) for s, v in by_sector.items()
+                  if len(v) >= RANK_SECTOR_MIN_PEERS}
+
+    entries = []
+    for live_rank, rec in enumerate(invest, start=1):
+        c = rec.get("_cand") or {}
+        rel = c.get("reliability")
+        eng = _engine_roi_to_pct(c.get("engine_roi_12m_pct"))
+        floor_ok = eng is not None and eng >= req
+        cap = eng is not None and eng >= RANK_CAP_ENGINE_ROI_PCT
+        mom = c.get("momentum_score")
+        ref = sector_med.get(c.get("sector") or "Unknown")
+        ref_basis = "sector" if ref is not None else None
+        if ref is None and pool_med is not None:
+            ref, ref_basis = pool_med, "pool"
+        strength = (mom - ref) if (mom is not None and ref is not None) else None
+        if strength is None:
+            bucket = 0
+        elif strength > RANK_STRENGTH_DEADBAND:
+            bucket = 1
+        elif strength < -RANK_STRENGTH_DEADBAND:
+            bucket = -1
+        else:
+            bucket = 0
+        band = (int(math.floor(rel / RANK_REL_BAND_PTS))
+                if rel is not None else -1)
+        rev = int(c.get("target_revision_dir") or 0)
+        gap = eng if eng is not None else c.get("roi_pct")
+        entries.append({
+            "rec": rec, "live_rank": live_rank, "rel": rel, "eng": eng,
+            "floor_ok": floor_ok, "cap": cap, "mom": mom,
+            "strength": strength if mom is not None else None,
+            "strength_ref": ref_basis if mom is not None else None,
+            "rev": rev,
+            "key": (-band, -bucket, -rev,
+                    gap if gap is not None else float("inf"),
+                    str(rec.get("symbol") or "")),
+        })
+
+    passes = sorted((e for e in entries if e["floor_ok"]), key=lambda e: e["key"])
+    fails = sorted((e for e in entries if not e["floor_ok"]), key=lambda e: e["key"])
+    head, rest = [], []
+    for e in passes:   # rest stays in key order: it is a subsequence of passes
+        if len(head) < RANK_CAP_FIRST_FREE and not e["cap"]:
+            head.append(e)
+        else:
+            rest.append(e)
+    ordered = head + rest + fails
+
+    ranks = {}
+    for pos, e in enumerate(ordered, start=1):
+        sym = e["rec"].get("symbol")
+        if sym not in ranks:
+            ranks[sym] = pos
+
+    def _row(e, shadow_rank):
+        rec = e["rec"]
+        return {
+            "shadow_rank": shadow_rank, "live_rank": e["live_rank"],
+            "symbol": rec.get("symbol"), "market": rec.get("market"),
+            "sector": rec.get("sector"),
+            "rel": _round1(e["rel"]), "conf": confidence_band(e["rel"]),
+            "engine_roi_pct": _round1(e["eng"]),
+            "momentum": _round1(e["mom"]), "strength": _round1(e["strength"]),
+            "strength_ref": e["strength_ref"], "cap": bool(e["cap"]),
+            "floor_ok": bool(e["floor_ok"]), "revision": e["rev"],
+        }
+
+    n_top = RANK_PUBLISH_TOP_N
+    champion = [_row(e, ranks.get(e["rec"].get("symbol"))) for e in entries[:n_top]]
+    challenger = [_row(e, pos) for pos, e in enumerate(ordered[:n_top], start=1)]
+    top_live = {r["symbol"] for r in champion[:5]}
+    top_shadow = {r["symbol"] for r in challenger[:5]}
+    info = {
+        "version": RANK_CHALLENGER_VERSION,
+        "mode": mode,
+        "builder": OPPORTUNITY_BUILDER_VERSION,
+        "rule": ("floor engine ROI >= required ROI; then reliability band "
+                 "(5 pts) desc > sector-relative momentum (+/-5) desc > "
+                 "target revision desc > smaller engine ROI; engine ROI >= "
+                 "34% kept out of ranks 1-5"),
+        "pool": len(entries),
+        "required_roi_pct": req,
+        "cap_engine_roi_pct": RANK_CAP_ENGINE_ROI_PCT,
+        "cap_first_free": RANK_CAP_FIRST_FREE,
+        "rel_band_pts": RANK_REL_BAND_PTS,
+        "strength_deadband": RANK_STRENGTH_DEADBAND,
+        "tiers": {
+            "below_cap": sum(1 for e in passes if not e["cap"]),
+            "at_cap": sum(1 for e in passes if e["cap"]),
+            "below_floor": len(fails),
+        },
+        "coverage": {
+            "invest_with_momentum": sum(1 for e in entries if e["mom"] is not None),
+            "scanned_with_momentum": len(pool_vals),
+            "scanned": len(audit),
+            "sectors_with_median": len(sector_med),
+            "revision_known": sum(1 for e in entries if e["rev"] != 0),
+        },
+        "overlap_top5": len(top_live & top_shadow),
+        "champion": champion,
+        "challenger": challenger,
+    }
+    if mode == "enforce":
+        info["enforce_reserved"] = True
+    return [e["rec"] for e in ordered], ranks, info
+
+
+def _rank_apply_shadow(ordered_records, tickets, ranks):
+    """v1.28.0 [RANK-CHALLENGER]: additive `shadow_rank` on every INVEST
+    audit record (its position in the challenger order) and on every
+    selected ticket (by symbol). Never reorders anything."""
+    for pos, rec in enumerate(ordered_records, start=1):
+        rec["shadow_rank"] = pos
+    for t in tickets:
+        t["shadow_rank"] = ranks.get(t.get("symbol"))
 
 
 # ---------------------------------------------------------------------------
@@ -7502,6 +7840,21 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         invest.sort(key=lambda a: (-(a["opportunity_score"] or 0.0),
                                    -(a["_cand"]["ann_roi_pct"] or 0.0),
                                    a["symbol"]))
+    # v1.28.0 [RANK-CHALLENGER] (A2/L4): the shadow order of the SAME pool,
+    # computed once the live order above is fixed. legacy -> nothing runs.
+    # The allocate replay never ranks (frozen subset; see WHY). Selection
+    # below is untouched in every mode (enforce is reserved = shadow).
+    _rank_mode = _env_rank_mode()
+    _rank_ordered, _rank_ranks, _rank_info = None, None, None
+    if _rank_mode != "legacy" and not _board_replay:
+        try:
+            _rank_ordered, _rank_ranks, _rank_info = _rank_challenger(
+                audit, invest, crit, _rank_mode)
+        except Exception as _rank_err:  # noqa: BLE001 - never fails a build
+            _rank_ordered, _rank_ranks = None, None
+            _rank_info = {"version": RANK_CHALLENGER_VERSION,
+                          "mode": _rank_mode,
+                          "error": type(_rank_err).__name__}
     picks, deferrals, deployable, remaining = _select_and_size(
         [a["_cand"] for a in invest], crit, pf, sector_ctx)
 
@@ -7524,6 +7877,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     if _board_research:
         for ticket in tickets:
             ticket["_board_research"] = True
+    if _rank_ordered is not None:   # v1.28.0 [RANK-CHALLENGER] additive keys
+        _rank_apply_shadow(_rank_ordered, tickets, _rank_ranks)
     selected_syms = {t["symbol"] for t in tickets}
     by_symbol = {a["symbol"]: a for a in audit}
     for sym in selected_syms:
@@ -7915,6 +8270,26 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     if _TIMING_STATE.get("mode") in ("observe", "enforce"):
         meta["timing_gate"] = dict(_TIMING_STATE)    # v1.23.0 [P-181] read-back
+    # v1.28.0 [RANK-CHALLENGER]: meta block + ONE log line, armed builds only.
+    if _rank_info is not None:
+        meta["rank_challenger"] = _rank_info
+        try:
+            _ri_t = _rank_info.get("tiers") or {}
+            _ri_c = _rank_info.get("coverage") or {}
+            _LOG.info(
+                "[RANK-CHALLENGER v%s] mode=%s pool=%s below_cap=%s at_cap=%s "
+                "below_floor=%s overlap_top5=%s momentum=%s/%s top5=%s%s",
+                OPPORTUNITY_BUILDER_VERSION, _rank_info.get("mode"),
+                _rank_info.get("pool"), _ri_t.get("below_cap"),
+                _ri_t.get("at_cap"), _ri_t.get("below_floor"),
+                _rank_info.get("overlap_top5"),
+                _ri_c.get("invest_with_momentum"), _rank_info.get("pool"),
+                ",".join(str(r.get("symbol"))
+                         for r in (_rank_info.get("challenger") or [])[:5]),
+                (" error=" + str(_rank_info["error"])
+                 if _rank_info.get("error") else ""))
+        except Exception:  # noqa: BLE001 - a log line never fails a build
+            pass
     status = "ok" if audit else "no_candidates"
     payload = {
         "version": OPPORTUNITY_BUILDER_VERSION,
