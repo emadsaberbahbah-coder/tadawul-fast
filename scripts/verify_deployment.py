@@ -240,7 +240,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
-    ("validate_dashboard", "1.3.3", "scoped literal contract and native cockpit validation"),
+    # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
+    # (the FEED banner detail keeps up to 1,000 characters).
+    ("validate_dashboard", "1.3.4", "scoped literal contract and native cockpit validation"),
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.4", "nightly offline workbook DQ audit"),
@@ -274,7 +276,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pit_snapshot", "1.1.1", "pit snapshot"),
     # 2026-10-27 (A4 part 2; pin only, SCRIPT_VERSION unchanged): 1.18.1 -> 1.19.0
     # (a post-earnings-tagged seat is held back from the picks and named).
-    ("run_daily_brief", "1.19.0", "daily brief"),
+    # 2026-10-28 (audit; pin only): 1.19.0 -> 1.20.0 (send-time label and
+    # session hours from the IANA zones).
+    ("run_daily_brief", "1.20.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
