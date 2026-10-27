@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.equal(ctx.DT10_VERSION, '1.16.0');   // 2026-10-26: v1.16.0 funding evidence, pin moved
+  assert.equal(ctx.DT10_VERSION, '1.17.0');   // 2026-10-27: v1.17.0 shadow rank log, pin moved
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];

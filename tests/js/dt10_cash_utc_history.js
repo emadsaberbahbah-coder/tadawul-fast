@@ -1,5 +1,6 @@
 /* Preserve the immutable v1.13.8 source without duplicating a 438 KB fixture.
- * Every v1.16.0 edit (funding evidence, tests/js/dt10_edits_v1160.json),
+ * Every v1.17.0 edit (shadow rank log, tests/js/dt10_edits_v1170.json), then
+ * every v1.16.0 edit (funding evidence, tests/js/dt10_edits_v1160.json),
  * then every v1.15.0 edit (pending grace), then every v1.14.0 edit (confirmation
  * basis), then every v1.13.11 edit (bulk
  * render formatting), then every v1.13.10 edit
@@ -40,6 +41,13 @@ const V1140_SHA256 = 'b888d7fd0f0b90f3170bd0e84cabb9c0efd1e665a1a55914746df9fdb9
  * (V1150_SHA256 = the reviewed v1.15.0 file, origin/main ab19432e). */
 const V1150_SHA256 = 'e099e187c82ed03fe137b88d789d9a383da5d3f452b6bd854c4d6e1bf757c1a8';
 const EDITS_V1160 = require('./dt10_edits_v1160.json');
+/* v1.17.0 edits (shadow rank log), reversed FIRST of all (current -> v1.16.0
+ * text). Seven hunks derived from the reviewed diff and stored verbatim in
+ * tests/js/dt10_edits_v1170.json; each insertion carries its anchor line so
+ * every 'current' is unique. The result is hash-pinned (V1160_SHA256 = the
+ * reviewed v1.16.0 file, origin/main 53c8544e, live sha e1c43659). */
+const V1160_SHA256 = 'e1c4365942a2bcd60d98cb7f007c29a932b85de140a2b7df8004daef9ac3d43a';
+const EDITS_V1170 = require('./dt10_edits_v1170.json');
 const EDITS_V1150 = [
   [" * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored\n",
     " * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n"],
@@ -184,10 +192,24 @@ function feedHistorySource(source) {
     'v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 may change only their enumerated edits');
   return historical;
 }
-/* v1.15.0 source (the funding-evidence oracle): only the v1.16.0 edits are
+/* v1.16.0 source (the shadow-rank-log oracle): only the v1.17.0 edits are
  * reversed, each exactly once, and the result must be the reviewed file. */
-function v1150Source(source) {
+function v1160Source(source) {
   let prior = source;
+  for (const [current, previous] of EDITS_V1170) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.17.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1160_SHA256,
+    'v1.17.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.15.0 source (the funding-evidence oracle): the v1.17.0 and then the
+ * v1.16.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v1150Source(source) {
+  let prior = v1160Source(source);
   for (const [current, previous] of EDITS_V1160) {
     assert.equal(prior.split(current).length - 1, 1,
       'exactly one approved v1.16.0 edit: ' + current.split('\n')[0]);
@@ -238,4 +260,4 @@ function v11310Source(source) {
     'v1.13.11 may change only its enumerated edits');
   return prior;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256};
+module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256, v1160Source, V1160_SHA256};

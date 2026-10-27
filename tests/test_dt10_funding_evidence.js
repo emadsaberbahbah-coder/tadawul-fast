@@ -225,7 +225,8 @@ ok(i0 > 0 && i1 > i0, 'F10 block located');
 ok(!/\b(let|const)\s|=>|`|\.\.\.|class\s/.test(block), 'F10 ES5 only');
 ok(![...block].some((ch) => ch.charCodeAt(0) > 126), 'F10 ASCII only');
 for (const f of FUNCS.slice(2)) ok(block.indexOf('function ' + f + '(') > 0, 'F10 inventory ' + f);
-ok((src.match(/var DT10_VERSION = '1\.16\.0';/) || []).length === 1 && /\* Version: 1\.16\.0 \(see DT10_VERSION;/.test(src), 'F10 version lockstep');
+// 2026-10-27: v1.17.0 (shadow rank log) stacked on this change; pins moved
+ok((src.match(/var DT10_VERSION = '1\.17\.0';/) || []).length === 1 && /\* Version: 1\.17\.0 \(see DT10_VERSION;/.test(src), 'F10 version lockstep');
 ok(src.indexOf("var fundingNote = dt10FundingApply_(body, Date.now());") > 0 && src.indexOf("cashNote + fundingNote + ' | '") > 0, 'F10 wired into the request + status line');
 console.log('F10 PASS lint + inventory');
 
