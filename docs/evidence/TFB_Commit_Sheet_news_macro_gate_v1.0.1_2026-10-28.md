@@ -12,7 +12,7 @@
 - `scripts/verify_deployment.py`: pin 1.0.1.
 - This sheet.
 
-## S1 - Evidence: the first live dry run `40595558188` (28 Oct 22:32-22:43 UTC, main `78faeb6e`, write=false)
+## S1 - Evidence: the first live dry run `40595558188` (27 Oct 22:32-22:43 UTC = 28 Oct 01:32-01:43 Riyadh, main `78faeb6e`, write=false)
 - **Sources:**
   - Every source answered: econ 98 events, edgar 19 filings, fed_rss 0 (no release in 3 days), gdelt 24 items, google_news 400 items, market 2 quotes.
   - GDELT answered the geopolitics query with HTTP 429 after the retry.

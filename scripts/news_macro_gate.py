@@ -13,7 +13,7 @@ WHY (Codex re-review on PR #859; the fix was pushed after the owner merged
 WHAT: main() returns 2 before collecting anything when --write has no
   usable Sheets session, and says so; a session that fails to open is
   reported (exception type only).
-  Second fix (first live dry run 40595558188, 28 Oct 22:32 UTC, still
+  Second fix (first live dry run 40595558188, 27 Oct 22:32 UTC, still
   collecting after 10 minutes): a throttled or unreachable provider cost
   about a minute per query (two 25 s attempts plus the back-off), with no
   bound across ~20 queries, so the 20-minute job limit was within reach.
