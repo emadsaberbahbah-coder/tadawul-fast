@@ -103,7 +103,9 @@ EIGHT = ["AAA.US", "BBB.US", "CCC.US", "DDD.US", "BAD.L", "EEE.US", "FFF.US", "G
 @pytest.fixture
 def cp():
     import core.providers.calendar_provider as mod
-    assert mod.__version__ == "1.3.1"
+    # 2026-10-27: v1.3.2 (venue batches + EODHD exchange codes, both gated
+    # off by default) stacked on this change; pin moved
+    assert mod.__version__ == "1.3.2"
     return mod
 
 
@@ -150,7 +152,9 @@ def test_s2_last_report_split_keeps_known_codes(cp, monkeypatch, caplog):
     assert ("BAD.L",) in [c[3] for c in calls]
     assert len(calls) == 7, [c[3] for c in calls]      # 8 -> 4+4 -> 2+2 -> 1+1
     msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert msgs == ["[calendar_provider v1.3.1] last-earnings: 404 batches split 3 time(s), "
+    # 2026-10-27: the version in the line moved with v1.3.2 (pin moved; the
+    # rest of the line is v1.3.1's - no translation when the suffix map is off)
+    assert msgs == ["[calendar_provider v1.3.2] last-earnings: 404 batches split 3 time(s), "
                     "7 request(s); EODHD rejected 1 code(s): BAD.L"], msgs
 
 
