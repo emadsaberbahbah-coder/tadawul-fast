@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_news_macro_gate.py - scripts/news_macro_gate.py v1.0.0.
+"""tests/test_news_macro_gate.py - scripts/news_macro_gate.py v1.0.1 (v1.0.0 + G8 credentials).
 
 WHY (2026-10-28): the owner asked for the hand-made macro and news check
 before every GO/NO-GO to run by itself, grade its sources, and keep a record
@@ -295,7 +295,8 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("DEFAULT_SPREADSHEET_ID", FakeSheets.SID)
     monkeypatch.setenv("TFB_NEWS_GATE_GDELT_SPACING_S", "0")
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
-              "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES"):
+              "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES",
+              "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -372,6 +373,48 @@ def test_g2_arabic_and_english_anchor_share_a_cluster():
     clf = ng.Classifier(ng.load_taxonomy())
     assert clf.classify(AR["drone_hormuz"], "MACRO")["anchor"] == "hormuz"
     assert clf.classify("Missile strike near Strait of Hormuz", "MACRO")["anchor"] == "hormuz"
+
+
+@pytest.mark.parametrize("title,etype", [
+    ("Iran launches missile strikes as diplomatic efforts fail", "war_escalation"),
+    ("Missile strikes go on after diplomatic efforts failed", "war_escalation"),
+    ("Airstrikes resume after peace talks stall", "war_escalation"),
+    ("Houthis reject truce and fire missiles at tankers", "war_escalation"),
+    ("Missile barrage follows breakdown in ceasefire talks", "war_escalation"),
+    ("\u0647\u062c\u0648\u0645 \u0635\u0627\u0631\u0648\u062e\u064a \u0628\u0639\u062f \u0641\u0634\u0644 \u0627\u0644\u062c\u0647\u0648\u062f \u0627\u0644\u062f\u0628\u0644\u0648\u0645\u0627\u0633\u064a\u0629", "war_escalation"),
+    ("\u063a\u0627\u0631\u0627\u062a \u062c\u062f\u064a\u062f\u0629 \u0645\u0639 \u062a\u0639\u062b\u0631 \u0645\u062d\u0627\u062f\u062b\u0627\u062a \u0627\u0644\u0647\u062f\u0646\u0629", "war_escalation"),
+    ("Diplomatic efforts gather pace to contain the conflict", "de_escalation"),
+    ("US-brokered ceasefire halts missile strikes", "de_escalation"),
+    ("Missile shield installed as the truce holds", "de_escalation"),
+])
+def test_g2_failed_diplomacy_stays_escalation(title, etype):
+    """Codex P2 on #861: a diplomacy term must not turn strikes into easing
+    when the headline says the diplomacy failed (fails on 3d84c263); the
+    word-start terms keep "US-brokered" and "installed" out of it."""
+    clf = ng.Classifier(ng.load_taxonomy())
+    assert clf.classify(title, "MACRO")["event_type"] == etype
+
+
+def test_g2_leading_space_marks_a_word_start():
+    terms = ng._norm_terms([" stall", "broke ", "fail", " fail"])
+    assert terms == [" stall", "broke ", " fail ", " fail"]
+    assert ng._hit(ng.normalize_text("Talks stalled again"), terms[:1])
+    assert not ng._hit(ng.normalize_text("Radar installed at the base"), terms[:1])
+    assert not ng._hit(ng.normalize_text("A US-brokered truce"), terms[1:2])
+    assert ng._hit(ng.normalize_text("Efforts failed"), terms[3:])
+    assert not ng._hit(ng.normalize_text("Efforts failed"), terms[2:3])
+
+
+@pytest.mark.parametrize("title,etype", [
+    ("\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0646\u0641\u0637 \u062a\u062a\u0631\u0627\u062c\u0639 \u0648\u0633\u0637 \u062a\u0632\u0627\u064a\u062f \u0627\u0644\u062c\u0647\u0648\u062f \u0627\u0644\u062f\u0628\u0644\u0648\u0645\u0627\u0633\u064a\u0629 \u0644\u0627\u062d\u062a\u0648\u0627\u0621 \u062d\u0631\u0628 \u0625\u064a\u0631\u0627\u0646", "de_escalation"),
+    ("\u0627\u0646\u062a\u0647\u0627\u0621 \u0627\u0644\u062d\u0631\u0628 \u0633\u064a\u062f\u0641\u0639 \u0627\u0644\u0646\u0641\u0637 \u0625\u0644\u0649 \u062f\u0648\u0646 100 \u062f\u0648\u0644\u0627\u0631", "de_escalation"),
+    ("\u0625\u064a\u0631\u0627\u0646 \u0645\u0628\u0627\u0634\u0631.. \u0627\u0634\u062a\u0639\u0627\u0644 \u0646\u0627\u0642\u0644\u0629 \u0628\u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632 \u0648\u0648\u0627\u0634\u0646\u0637\u0646 \u062a\u062a\u0647\u0645 \u0637\u0647\u0631\u0627\u0646 \u0628\u0634\u0646 \u062d\u0631\u0628 \u0627\u0642\u062a\u0635\u0627\u062f\u064a\u0629", "war_escalation"),
+    ("Saudi-led coalition says it intercepts three Houthi missiles, four drones", "war_escalation"),
+])
+def test_g2_live_headlines_28_oct(title, etype):
+    """v1.0.1: headlines from the first live dry run (40595558188)."""
+    clf = ng.Classifier(ng.load_taxonomy())
+    assert clf.classify(title, "MACRO")["event_type"] == etype
 
 
 @pytest.mark.parametrize("title,etype", [
@@ -464,6 +507,14 @@ def test_g5_fomc_day_is_caution_with_riyadh_time():
     assert g["drivers"] == ["scheduled: FOMC rate decision (today 21:00 Riyadh)"]
 
 
+def test_g5_eodhd_fomc_statement_is_not_a_second_driver():
+    econ = ng.parse_econ_events([{"type": "FOMC Statement", "comparison": None, "period": None,
+                                  "country": "US", "date": "2026-10-28 18:00:00", "actual": None,
+                                  "previous": None, "estimate": None}])
+    g = ng.evaluate([], econ, {}, NOW)
+    assert g["drivers"] == ["scheduled: FOMC rate decision (today 21:00 Riyadh)"]
+
+
 def test_g5_quiet_day_is_go():
     g = ng.evaluate([], [], {}, QUIET)
     assert g["verdict"] == "GO" and g["drivers"] == [] and g["names"] == {}
@@ -478,6 +529,18 @@ def test_g5_gulf_escalation_three_domains_is_no_new_entry():
     assert g["verdict"] == "NO_NEW_ENTRY"
     assert any(d.startswith("macro: war_escalation/hormuz grade 1, 3 sources") for d in g["drivers"])
     assert not any("russia" in d for d in g["drivers"])
+
+
+def test_g5_failed_diplomacy_from_three_wires_is_no_new_entry():
+    """Codex P2 on #861: the same story read as easing gave GO."""
+    items = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/f1", "Iran launches missile strikes as diplomatic efforts fail", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/f2", "Iran fires missiles at Gulf targets as diplomatic efforts fail", "20261030T101000Z", "apnews.com"),
+        ("https://www.bbc.com/f3", "Iran missile strikes follow failed diplomatic efforts", "20261030T102000Z", "bbc.com"),
+    ]), "MACRO", "geo")
+    g = ng.evaluate(_clusters(items, QUIET), [], {}, QUIET)
+    assert g["verdict"] == "NO_NEW_ENTRY"
+    assert g["drivers"][0].startswith("macro: war_escalation/iran grade 1, 3 sources")
 
 
 def test_g5_russia_ukraine_alone_does_not_move_the_gate():
@@ -588,6 +651,51 @@ def test_g7_article_keeps_macro_and_company_scope():
     assert names["ACME.US"][0]["level"] == "WATCH"
 
 
+def test_g7_breaker_stops_a_dead_source(armed):
+    """v1.0.1: dry run 40595558188 sat in collection > 10 min; a provider
+    that fails twice in a row is skipped for the rest of the run."""
+    http = FakeHTTP(fail={"gdeltproject": -1})
+    (rc, rep), _ = _run(http=http, write=False, sources=["gdelt"])
+    gd = [u for u in http.calls if "gdeltproject" in u]
+    assert len(gd) == 2 * ng.BREAKER_FAILURES              # two queries, two attempts each
+    note = rep["sources_failed"]["gdelt"]
+    assert "circuit open after 2 consecutive failures" in note and "queries skipped" in note
+
+
+def test_g7_time_budget_bounds_a_slow_source(armed):
+    t = [0.0]
+
+    class SlowHTTP(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            if "gdeltproject" in url:
+                t[0] += 100.0
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    http = SlowHTTP()
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
+    col = ng.Collector(http, _sleep, NOW, clock=lambda: t[0])
+    gq, _ = ng.build_queries(scope)
+    assert len(gq) == 7
+    col.gdelt(gq, 0.0)
+    assert len([u for u in http.calls if "gdeltproject" in u]) == 3   # starts at 0, 100, 200 s
+    assert "time budget 240s spent; 4 queries skipped" in col.failed["gdelt"]
+
+
+def test_g7_request_timeout_is_bounded(armed, monkeypatch):
+    seen = []
+
+    class T(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.append(timeout)
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    col = ng.Collector(T(), _sleep, NOW)
+    col.fed_rss()
+    monkeypatch.setenv("TFB_NEWS_GATE_TIMEOUT_S", "500")
+    ng.Collector(T(), _sleep, NOW).fed_rss()
+    assert seen == [20.0, 60.0]
+
+
 def test_g7_dry_run_writes_nothing(armed):
     (rc, rep), sh = _run(write=False)
     assert rc == 0 and rep["wrote"] is False
@@ -625,7 +733,16 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.1")
+
+
+def test_g8_write_without_credentials_fails_loudly(armed, capsys):
+    """Codex P2 on #859: --write with a sheet id but no usable credentials
+    used to run as a quiet dry run and exit 0."""
+    http = FakeHTTP()
+    assert ng.main(["--write"], http=http, sheets=None, now=NOW, sleep=_sleep) == 2
+    assert http.calls == []
+    assert "--write needs readable GOOGLE_SHEETS_CREDENTIALS" in capsys.readouterr().out
 
 
 def test_g8_bad_now(armed):
@@ -641,9 +758,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.0.0"
+    assert ng.__version__ == "1.0.1"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.0.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.0.1", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
