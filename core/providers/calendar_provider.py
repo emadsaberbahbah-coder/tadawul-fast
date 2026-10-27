@@ -23,7 +23,9 @@ split in halves and each half retried, recursively, so every code EODHD
 accepts is kept; a single code that answers 404 is recorded as rejected;
 any other error propagates to the caller's v1.3.0 handling (logged, batch
 skipped). Requests per call are capped by TFB_CALENDAR_SPLIT_MAX_CALLS
-(default 200, 1..1000): past the cap a 404 half is dropped (counted). One
+(default 200, 1..1000), checked before every request: past the cap nothing
+more is requested - pending halves and later batches - and their codes are
+counted (review fix, Codex P2 on PR #853). One
 WARNING line per call names the rejected codes (first 40) and the counts,
 so the symbol mapping can be corrected from evidence. Applies to both
 batched earnings paths: fetch_earnings_map (forward) and
@@ -372,8 +374,13 @@ async def _earnings_items_split(client: httpx.AsyncClient, base: Dict[str, Any],
     HTTP 404 on more than one code splits the batch in halves (EODHD answers
     404 for the WHOLE request when it does not know one code); a single code
     that answers 404 is recorded in state['rejected']. Any other error
-    propagates. Past state['cap'] requests a 404 part is dropped and counted
-    in state['capped']."""
+    propagates. The budget is checked BEFORE every request (review fix, Codex
+    P2 on PR #853): once state['cap'] requests were made in this call, no
+    further request is issued - pending halves and later batches alike - and
+    their codes are counted in state['capped']."""
+    if state["calls"] >= state["cap"]:
+        state["capped"] += len(batch)
+        return []
     state["calls"] += 1
     params = dict(base)
     params["symbols"] = ",".join(batch)
@@ -384,9 +391,6 @@ async def _earnings_items_split(client: httpx.AsyncClient, base: Dict[str, Any],
             raise
         if len(batch) == 1:
             state["rejected"].append(batch[0])
-            return []
-        if state["calls"] >= state["cap"]:
-            state["capped"] += len(batch)
             return []
         state["split"] += 1
         mid = len(batch) // 2

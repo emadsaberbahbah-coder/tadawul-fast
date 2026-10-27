@@ -10,8 +10,9 @@ S1  gate off: a 404 batch is dropped whole - requests, results and log lines
 S2  gate on, last report: one unknown code among eight -> split, the seven
     known codes keep their reports, the unknown one is named once
 S3  gate on, forward: the same for next earnings (earliest upcoming kept)
-S4  several unknown codes, the request cap, a non-404 error inside a split
-    (the top-level batch is skipped exactly as v1.3.0 skips it)
+S4  several unknown codes, the request cap (checked before every request -
+    review fix, Codex P2 on #853), a non-404 error inside a split (the
+    top-level batch is skipped exactly as v1.3.0 skips it)
 S5  gate spellings; _is_http_404 on real httpx errors; the workflow arms it
 """
 from __future__ import annotations
@@ -178,15 +179,29 @@ def test_s4_many_unknown_cap_and_non_404(cp, monkeypatch, caplog):
                         "WDP.BR", "1113.HK"}
     msg = [r.getMessage() for r in caplog.records if "rejected" in r.getMessage()][0]
     assert "EODHD rejected 4 code(s): AEFES.IS.US, X1.T, X2.KL, X3.L" in msg, msg
-    # the cap: two requests only -> the first 404 splits, its halves are dropped
+    # the cap is checked BEFORE every request (review fix, Codex P2 on #853):
+    # two requests, then nothing more - pending halves included
     calls = []
     _prep(cp, monkeypatch, calls, PAST, "on")
     monkeypatch.setenv("TFB_CALENDAR_SPLIT_MAX_CALLS", "2")
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         out = cp.fetch_last_earnings_sync(many)
-    assert len(calls) <= 3 and set(out) <= set(many)
-    assert any("dropped at the request cap 2" in r.getMessage() for r in caplog.records)
+    assert len(calls) == 2 and out == {}, [c[3] for c in calls]
+    assert any("2 request(s)" in r.getMessage() and "13 code(s) dropped at the request cap 2" in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+    # Codex's case: cap 2, two all-404 batches of four and two codes -> exactly
+    # two requests; the later batch is never requested
+    calls = []
+    _prep(cp, monkeypatch, calls, PAST, "on")
+    monkeypatch.setenv("TFB_CALENDAR_SPLIT_MAX_CALLS", "2")
+    monkeypatch.setenv("TFB_CALENDAR_EARNINGS_CHUNK", "4")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        out = cp.fetch_last_earnings_sync(["U1.L", "U2.L", "U3.L", "U4.L", "U5.L", "U6.L"])
+    assert len(calls) == 2 and out == {} and calls[0][3] == ("U1.L", "U2.L", "U3.L", "U4.L")
+    assert any("6 code(s) dropped at the request cap 2" in r.getMessage() for r in caplog.records)
+    monkeypatch.delenv("TFB_CALENDAR_EARNINGS_CHUNK", raising=False)
     # a non-404 error inside a split: that top-level batch is skipped (v1.3.0 handling)
     calls = []
     _prep(cp, monkeypatch, calls, PAST, "on", extra_fail=lambda syms: syms == ["BBB.US", "CCC.US"])
