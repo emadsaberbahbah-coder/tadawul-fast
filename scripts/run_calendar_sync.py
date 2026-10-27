@@ -130,11 +130,18 @@ from zoneinfo import ZoneInfo
 # and expires with the window. The prior read widens to A1:J only when the
 # tab already has 10 columns; the tab grows to 10 columns before the write.
 # One summary line: last_report: with=n fresh=f carried=c window=Nd.
-# Rollback: unset TFB_CAL_LAST_REPORT; the next run writes A1:G again
-# (columns H:J keep their last values until cleared - nothing reads them).
+# Rollback: unset TFB_CAL_LAST_REPORT; the next run writes A1:G again and
+# blanks H:J in the same atomic update (review fix below).
+# Review fix (Codex P2 on PR #850): with the lane off the publication is
+# A:G only, so rows could move under H:J values an earlier ON run left
+# behind, and a re-arm inside the window would carry another row's report
+# (FRST's -22.2% landing on ZTO). When the lane is off and the tab still
+# holds the last-report block (>= 10 columns AND H1:J1 equal to the three
+# last-report headers), the off run now writes A1:J with H:J blank, header
+# included; a 7-column tab (never armed) stays v1.1.4 byte for byte.
 # Functions added: _last_report_enabled, _last_report_window, _to_num,
 # _days_since, _past_report, parse_prior_last, merge_last_report,
-# last_report_cells. Removed: 0.
+# last_report_cells, _stale_last_report_cols. Removed: 0.
 __version__ = "1.2.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
@@ -484,6 +491,23 @@ def merge_last_report(symbols: List[str],
     return merged, n_fresh, n_carried
 
 
+def _stale_last_report_cols(ws: Any) -> bool:
+    """v1.2.0 review fix: True when the tab still carries the last-report
+    block of an earlier ON run - at least 10 columns AND H1:J1 equal to
+    LAST_REPORT_HEADERS. A narrower tab -> False without any read; a failed
+    header read -> WARN and False (H:J left as is)."""
+    cols = getattr(ws, "col_count", None)
+    if not isinstance(cols, int) or cols < len(HEADERS) + len(LAST_REPORT_HEADERS):
+        return False
+    try:
+        got = ws.get("A1:J1")
+    except Exception as e:
+        _out(f"WARN: last-report header read failed ({e}) - H:J left as is")
+        return False
+    head = [str(c or "").strip() for c in (got[0] if got else [])][7:10]
+    return head == LAST_REPORT_HEADERS
+
+
 def last_report_cells(symbol: str, merged: Dict[str, Dict[str, Any]]) -> List[Any]:
     """v1.2.0: [Last Earnings Date, Days Since Earnings, EPS Surprise %]."""
     m = (merged or {}).get(symbol)
@@ -656,6 +680,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             _out("  " + " | ".join(str(c) for c in r))
         _out("dry-run — nothing written (pass --write to publish)")
         return 0
+
+    # v1.2.0 review fix: lane off on a tab an earlier ON run widened -> blank
+    # H:J (header included) in the same atomic update, so the old reports can
+    # never be carried onto rows that moved under them.
+    if not lr_on and prior_sheet is not None and _stale_last_report_cols(prior_sheet):
+        headers += [""] * len(LAST_REPORT_HEADERS)
+        rows = [r + [""] * len(LAST_REPORT_HEADERS) for r in rows]
+        last_col = "J"
+        _out("last_report: off - clearing H:J left by an earlier ON run")
 
     try:
         extent = max(1000, len(rows) + 1, prior_extent)

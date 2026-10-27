@@ -23,6 +23,11 @@ L5  sync ON, 10-column tab: prior read A1:J; a 429-style empty fetch keeps
     never resurrects an unharvested symbol for its last report alone
 L6  sync ON, the provider import or fetch raises: WARN, prior reports only,
     the publication still happens
+L7  review fix (Codex P2 on PR #850): ON -> OFF with the rows reordered ->
+    ON again with an empty fetch. The off run blanks H:J (header included) in
+    its one atomic A1:J update, so the re-arm carries nothing (without the
+    fix ZTO.US inherited FRST.US's -22.2%). An off run on a wide tab whose
+    H1:J1 is not the last-report header keeps the A1:G write.
 """
 from __future__ import annotations
 
@@ -302,6 +307,41 @@ def test_l6_on_fetch_failure_keeps_publication(monkeypatch, capsys, boom):
     body = {r[0]: r for r in sheet.requests[0]["values"][1:] if r[0]}
     assert body["FRST.US"][7:] == ["2026-10-22", 5, -22.2]
     assert "WARN: last-report fetch failed" in err and "carried=1" in err
+
+
+def test_l7_off_after_on_clears_h_to_j_so_a_rearm_cannot_misattribute(monkeypatch, capsys):
+    hdr = sync.HEADERS + sync.LAST_REPORT_HEADERS
+    prior = [hdr,
+             ["FRST.US", "2027-01-28", 93, "", "", ASOF, "eodhd", "2026-10-22", 4, -22.2],
+             ["ZTO.US", "2026-11-18", 22, "", "", ASOF, "eodhd", "", "", ""]]
+    sheet = Sheet(prior, cols=10)
+    # OFF, harvest order swapped: ZTO now sits on FRST's old row
+    rc, _ = _run(sync, monkeypatch, sheet, ["ZTO.US", "FRST.US"], CTX, LAST, gate="off")
+    err = capsys.readouterr().err
+    assert rc == 0 and sheet.reads == ["A1:G1000", "A1:J1"] and sheet.resizes == []
+    req = sheet.requests[0]
+    assert req["range"] == "A1:J1000", "one atomic update covering H:J"
+    assert req["values"][0] == list(sync.HEADERS) + ["", "", ""], "the last-report header is blanked too"
+    assert all(r[7:] == ["", "", ""] for r in req["values"]), "no stale report survives the off run"
+    assert [r[0] for r in req["values"][1:3]] == ["ZTO.US", "FRST.US"]
+    assert "last_report: off - clearing H:J left by an earlier ON run" in err
+    # ON again inside the window, the fetch returns nothing (a 429): no carry
+    rc, _ = _run(sync, monkeypatch, sheet, ["ZTO.US", "FRST.US"], CTX, {}, gate="on")
+    err = capsys.readouterr().err
+    assert rc == 0 and sheet.reads[-1] == "A1:J1000"
+    body = {r[0]: r for r in sheet.requests[-1]["values"][1:] if r[0]}
+    assert body["ZTO.US"][7:] == ["", "", ""], "ZTO never inherits FRST's report"
+    assert body["FRST.US"][7:] == ["", "", ""]
+    assert "last_report: with=0 fresh=0 carried=0 window=21d" in err
+
+
+def test_l7b_off_on_a_wide_tab_without_the_block_keeps_the_a_to_g_write(monkeypatch, capsys):
+    sheet = Sheet([row + ["", "", ""] for row in _prior7()], cols=26)
+    rc, _ = _run(sync, monkeypatch, sheet, ["FRST.US", "ZTO.US"], CTX, LAST, gate=None)
+    err = capsys.readouterr().err
+    assert rc == 0 and sheet.reads == ["A1:G1000", "A1:J1"]
+    assert sheet.requests[0]["range"] == "A1:G1000" and sheet.requests[0]["values"][0] == sync.HEADERS
+    assert "last_report" not in err
 
 
 def test_selftest_and_version():

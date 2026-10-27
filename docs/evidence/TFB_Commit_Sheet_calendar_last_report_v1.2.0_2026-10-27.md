@@ -18,11 +18,11 @@ FRST.US (first funded ticket, 26 Oct) was bought two sessions after a 22 % EPS m
 Off (unset / off / any other word): reads, the update request and every log line equal v1.1.4 (harness L3, golden against `53c8544e`).
 
 ## S3 - Tests
-- `tests/test_calendar_last_report_a4.py` -> **11 passed**: L1 provider (latest report in window, bounds incl. today and day -22 excluded, surprise from `percent` / computed / estimate 0, KSA never sent, request window `2026-10-06..2026-10-26` for 27 Oct, `DAYS_BACK=7` window, chunk 1 batching, a 429 batch dropped alone, disabled -> `{}`); L2 the forward context never requests a past window; L3 OFF golden x3 (unset / off / junk: same reads, update request, resizes and stderr as v1.1.4 with the version tag normalised); L4 ON first run on a 7-column tab (read `A1:G1000`, resize to 10 columns, one `A1:J1000` write, 10-column header, FRST `2026-10-22 | 5 | -22.2`, forward columns unchanged, log line); L5 ON carry (inside the window kept, 37-day-old report dropped, unharvested symbol not resurrected); L6 ON with the fetch or the import raising (WARN, carried report kept, publication still written); selftest 13/13.
+- `tests/test_calendar_last_report_a4.py` -> **11 passed** (13 after the review fix, below): L1 provider (latest report in window, bounds incl. today and day -22 excluded, surprise from `percent` / computed / estimate 0, KSA never sent, request window `2026-10-06..2026-10-26` for 27 Oct, `DAYS_BACK=7` window, chunk 1 batching, a 429 batch dropped alone, disabled -> `{}`); L2 the forward context never requests a past window; L3 OFF golden x3 (unset / off / junk: same reads, update request, resizes and stderr as v1.1.4 with the version tag normalised); L4 ON first run on a 7-column tab (read `A1:G1000`, resize to 10 columns, one `A1:J1000` write, 10-column header, FRST `2026-10-22 | 5 | -22.2`, forward columns unchanged, log line); L5 ON carry (inside the window kept, 37-day-old report dropped, unharvested symbol not resurrected); L6 ON with the fetch or the import raising (WARN, carried report kept, publication still written); selftest 13/13.
 - Existing calendar suites + manifest pins + workflow mapping/audit + render env contract: **179 passed, 4 skipped**. `py_compile` PASS.
 
 ## S4 - Rollback
-Unset the repo Variable `TFB_CAL_LAST_REPORT` (or `off`): the next run writes `A1:G` exactly as v1.1.4. Columns H:J keep their last values until cleared by hand; nothing reads them while the gate is off. `git revert` restores both modules.
+Unset the repo Variable `TFB_CAL_LAST_REPORT` (or `off`): the next run writes the seven columns again and blanks H:J in the same atomic `A1:J` update (review fix below), so a later re-arm starts clean. A tab that was never armed (7 columns) is written exactly as v1.1.4. `git revert` restores both modules.
 
 ## S5 - Known limits
 - EODHD only: no Saudi coverage for past reports (the forward path's Yahoo fallback is not extended to past reports in this version).
@@ -34,5 +34,11 @@ Unset the repo Variable `TFB_CAL_LAST_REPORT` (or `off`): the next run writes `A
 1. Merge. Nothing changes until the Variable is set.
 2. Set the repository Variable `TFB_CAL_LAST_REPORT=on` (Settings -> Variables -> Actions), then dispatch `calendar_sync.yml` with `write=false` once (dry run prints the table incl. the three columns), then `write=true` (or wait for the daily schedule).
 3. Verify `Calendar_Events`: header has 10 columns; FRST.US shows `2026-10-22 | <days> | -22.2`; the job log shows `last_report: with=n fresh=f carried=c window=21d`.
+
+## Review fix (27 Oct, Codex P2 on PR #850) + CI lane
+- **Finding:** after an ON run, an OFF run rewrote only `A:G`, so H:J stayed at their old row positions while the harvested rows could move; a re-arm inside the 21-day window then carried another row's report (FRST.US's -22.2 % landing on ZTO.US when the two swapped). Path is real (rollback then re-arm); fix is small.
+- **Fix:** `_stale_last_report_cols(ws)`: with the lane off and the tab still holding the block (>= 10 columns AND `H1:J1` equal to the three last-report headers, one `A1:J1` header read), the off run writes `A1:J` with H:J blank, header included, in its single atomic update. A 7-column tab never reads more and stays v1.1.4 byte for byte (L3 unchanged); a wide tab without the block keeps the `A1:G` write. A failed header read logs WARN and leaves H:J as is.
+- **Tests:** L7 (ON -> OFF with the rows swapped -> ON with an empty fetch: the off run blanks H:J; the re-arm carries nothing; `carried=0`) and L7b (wide tab without the block: `A1:G` write) -> **13 passed**; both L7 legs fail on the pre-fix file. Selftest 13/13.
+- **CI:** the first run of this PR failed the lean lane: the provider legs import the real `calendar_provider`, which needs `httpx` (not installed there). The harness moved to the contract lane next to `tests/test_calendar_partial_fill.py` (httpx pinned there). Local replay of both lists on this tree: lean **4,082 passed / 26 skipped**, contract **369 passed / 10 skipped**.
 
 Not a licensed financial adviser; the owner decides and executes every trade.

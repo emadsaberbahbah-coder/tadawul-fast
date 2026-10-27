@@ -8,8 +8,10 @@
 # #849): run tests/test_calendar_last_report_a4.py (calendar_provider 1.3.0
 # fetch_last_earnings_map + run_calendar_sync 1.2.0 TFB_CAL_LAST_REPORT,
 # default off = the v1.1.4 seven-column table byte for byte) in the blocking
-# lean lane next to the other calendar suites. Offline; its golden legs read
-# the v1.1.4 base with `git show` and skip on a shallow checkout.
+# contract lane next to tests/test_calendar_partial_fill.py: its provider legs
+# import the real calendar_provider, which needs httpx (installed there, not
+# in the lean lane). Offline; its golden legs read the v1.1.4 base with
+# `git show` and skip on a shallow checkout.
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
 # v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
@@ -796,7 +798,6 @@ jobs:
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_atomic_publication.py \
-            tests/test_calendar_last_report_a4.py \
             tests/test_outcome_price_evidence.py \
             tests/test_portfolio_blank_fee_witness.py \
             tests/test_checkpoint_target_contract.py \
@@ -977,6 +978,7 @@ jobs:
             tests/test_portfolio_reconciliation_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
+            tests/test_calendar_last_report_a4.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
