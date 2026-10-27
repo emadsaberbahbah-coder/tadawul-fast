@@ -247,9 +247,11 @@ def selected_sources(spec: str) -> List[str]:
     return [s for s in ALL_SOURCES if s in want]
 
 
-def item_id(url: str, title: str, source: str) -> str:
+def item_id(url: str, title: str, source: str, scope: str = "") -> str:
+    """One row per article AND scope: an article returned by a macro query
+    and by a company query keeps both associations (Codex P2, #859)."""
     basis = (url or "").strip() or (source + "|" + (title or "").strip().lower())
-    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1((scope + "|" + basis).encode("utf-8")).hexdigest()[:16]
 
 
 def domain_of(url: str) -> str:
@@ -352,6 +354,8 @@ class Classifier:
         def pair(key: str) -> List[str]:
             block = tax.get(key) or {}
             return _norm_terms(list(block.get("en") or []) + list(block.get("ar") or []))
+        self.by_type = {e["type"]: e for e in self.events}
+        self.breach = pair("breach")
         self.pos = pair("positive")
         self.neg = pair("negative")
         self.rumor = pair("rumor")
@@ -378,6 +382,12 @@ class Classifier:
             if _hit(norm, ev["terms"]):
                 found = ev
                 break
+        # A truce or de-escalation story that also names an attack word is
+        # de-escalation unless it says the truce was broken (Codex P2, #859).
+        deesc = self.by_type.get("de_escalation")
+        if found is not None and found["type"] == "war_escalation" and deesc is not None \
+                and _hit(norm, deesc["terms"]) and not _hit(norm, self.breach):
+            found = deesc
         pos, neg = _count(norm, self.pos), _count(norm, self.neg)
         if found is None:
             return {"event_type": "", "direction": 0, "severity": "",
@@ -551,10 +561,17 @@ def parse_market(payload: Any) -> Dict[str, Dict[str, Any]]:
 # ----------------------------------------------------------------------------- #
 def information_grade(members: Sequence[Dict[str, Any]]) -> int:
     """Admiralty-style: 1 confirmed .. 6 social only."""
+    denials = [m for m in members if m.get("denial")]
+    if denials:
+        # A denial weighs against the story only when denials are at least
+        # half of the cluster; otherwise the denying items are left out, so
+        # an unrelated denial cannot wipe out a confirmed situation (Codex
+        # P2, #859).
+        if len(denials) * 2 >= len(members):
+            return 5
+        members = [m for m in members if not m.get("denial")]
     tiers = [m.get("tier", "F") for m in members]
     domains = {m.get("domain") for m in members if m.get("domain")}
-    if any(m.get("denial") for m in members):
-        return 5
     if tiers and all(t == "E" for t in tiers):
         return 6
     if "A" in tiers or (len(domains) >= 3 and "B" in tiers):
@@ -646,12 +663,16 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
     """Deterministic, observe-only verdict. Rules (v1.0.0):
     NO_NEW_ENTRY - S&P 500 day change <= -3% or VIX >= 35; or a Gulf-anchored
       high-severity macro story (war escalation / emergency policy / market
-      turmoil) graded 1-2 from >= 3 independent domains in the last 24 h.
+      turmoil) graded 1 (an A source, or >= 3 domains including a licensed
+      wire) from >= 3 independent domains in the last 24 h.
     CAUTION - a FOMC decision or a high-impact US release within the next
       30 h or the last 2 h; S&P <= -1.5%, VIX >= 25 or VIX +15% on the day;
       any market-anchored high-severity macro story graded 1-2 from >= 3
       domains, or Gulf-anchored graded 3-4; a confirmed (grade <= 2)
       sanctions / credit-stress story on a market anchor.
+    Clusters are situations (event type + anchor within the window), not
+    single stories: several incidents around one Gulf anchor in 24 h are one
+    situation by design (see the #859 review thread).
     Otherwise GO. Per name: BLOCK (8-K 1.03 / 2.04 / 3.01 / 4.02 within 30
     days, or a bankruptcy / delisting / restatement story graded <= 2),
     WATCH (8-K 1.02 / 1.05 / 2.05 / 2.06 / 4.01 within 10 days, or a negative
@@ -698,7 +719,7 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
             positives.append(tag)
             continue
         if c["severity"] == "H" and c["event_type"] in ("war_escalation", "emergency_policy", "market_turmoil"):
-            if anchor in GULF_ANCHORS and grade <= 2 and len(doms) >= 3:
+            if anchor in GULF_ANCHORS and grade == 1 and len(doms) >= 3:
                 bump(2, "macro: " + tag)
             elif anchor in MARKET_ANCHORS and grade <= 2 and len(doms) >= 3:
                 bump(1, "macro: " + tag)
@@ -1110,7 +1131,7 @@ def classify_all(items: List[Dict[str, Any]], clf: Classifier, now: _dt.datetime
     seen = set()
     out = []
     for it in items:
-        iid = item_id(it.get("url", ""), it.get("title", ""), it.get("source", ""))
+        iid = item_id(it.get("url", ""), it.get("title", ""), it.get("source", ""), it.get("scope", ""))
         if iid in seen:
             continue
         seen.add(iid)

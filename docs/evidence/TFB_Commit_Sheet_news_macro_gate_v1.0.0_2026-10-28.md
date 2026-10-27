@@ -3,7 +3,7 @@
 **Scope:** program register **A7 (news layer), Phase 1**. The owner's request of 28 Oct 00:01-00:15 Riyadh: make the macro and news check that precedes every GO/NO-GO automatic, grade each source before believing it, and record every call so its accuracy can be measured. Use free sources (decision 00:11). Observe-only.
 
 **Files:**
-- New: `scripts/news_macro_gate.py`, `data/news_gate_taxonomy.json` (ASCII, Arabic escaped), `.github/workflows/news_macro_gate.yml`, `tests/test_news_macro_gate.py` (41 cases), this sheet.
+- New: `scripts/news_macro_gate.py`, `data/news_gate_taxonomy.json` (ASCII, Arabic escaped), `.github/workflows/news_macro_gate.yml`, `tests/test_news_macro_gate.py` (48 cases), this sheet.
 - Changed: `scripts/verify_deployment.py` (pin 1.0.0) and `.github/workflows/ci.yml` 1.1.50 (lean lane).
 
 ## S1 - WHY
@@ -70,7 +70,7 @@
 
 Nothing in the live system reads the new tabs. A rule moves to enforcement only after it is scored and the owner decides.
 
-## S4 - Tests (`tests/test_news_macro_gate.py`, 41 passed x3; offline)
+## S4 - Tests (`tests/test_news_macro_gate.py`, 48 passed x3; offline)
 | Group | Proves |
 |---|---|
 | G1 | Gate off, blank, junk or `true`: no HTTP call, no Sheets call, exit 0. |
@@ -87,6 +87,15 @@ Other checks:
 - `scripts/audit_repository_workflows.py`: errors 0, warnings 0.
 - Manifest pins and workflow suites: 35 passed.
 - Live calls cannot be made from the build container (allow-listed network). Live validation is the first dispatch after merge (S6).
+
+### Review fixes (Codex, PR #859)
+| Finding | Verified path | Fix | Golden negative |
+|---|---|---|---|
+| A truce near Hormuz read as war | `escalation` matched inside the normalised `de escalation`, and a bare `hormuz` was a war term; war precedes de-escalation in the taxonomy. | War terms no longer include `hormuz`, `houthi`, `escalation` or Arabic `tasid` / `madiq hormuz`; those are anchors, not events. A war match that also matches de-escalation is de-escalation unless a breach marker (violat / breaks / collapse / despite; Arabic intihak / kharq / raghm) says the truce failed. Arabic `khafd al-tasid` added to de-escalation. | 3 of 4 cases fail on the first push. |
+| An article in a macro and a company query lost the company scope | The Item ID was URL-only, so the first scope (macro) won. | The Item ID covers scope + URL: one row per article per scope. | Fails on the first push. |
+| An unrelated denial wiped out a situation; C-only coverage reached NO_NEW_ENTRY | Any denial gave grade 5. Gulf NO_NEW_ENTRY accepted grade 2. | A denial weighs only when denials are at least half the cluster; otherwise the denying items are left out. Gulf NO_NEW_ENTRY needs grade 1 (an A source, or 3+ domains including a licensed wire); grade 2 from 3 domains is CAUTION. | Both fail on the first push. |
+
+Not changed: clusters stay situations (event type + anchor within 24 h), not single stories. Splitting by headline words would separate one incident told in Arabic and English, or in different wording. The 3-domain rule then never fires, which is the more dangerous miss. Several incidents around one Gulf anchor in a day are treated as one situation by design. Phase 3 scoring will measure the false-positive rate. Answered on the review thread.
 
 ## S5 - Rollback
 Repository Variable `TFB_NEWS_GATE=off` (the next run collects and writes nothing), or delete the workflow. The three tabs can be deleted by hand; nothing else reads them.

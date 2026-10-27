@@ -374,6 +374,20 @@ def test_g2_arabic_and_english_anchor_share_a_cluster():
     assert clf.classify("Missile strike near Strait of Hormuz", "MACRO")["anchor"] == "hormuz"
 
 
+@pytest.mark.parametrize("title,etype", [
+    ("Iran and Saudi Arabia agree de-escalation deal", "de_escalation"),
+    ("Ceasefire agreed in Strait of Hormuz", "de_escalation"),
+    ("Missile strike breaks ceasefire near Hormuz", "war_escalation"),
+    ("\u0627\u062a\u0641\u0627\u0642 \u0639\u0644\u0649 \u062e\u0641\u0636 \u0627\u0644\u062a\u0635\u0639\u064a\u062f \u0641\u064a \u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632", "de_escalation"),
+])
+def test_g2_de_escalation_is_not_war(title, etype):
+    """Codex P2 on #859: 'escalation' inside 'de-escalation' and a bare
+    'hormuz' used to classify a truce as war news (golden negative on
+    the first push of this branch)."""
+    clf = ng.Classifier(ng.load_taxonomy())
+    assert clf.classify(title, "MACRO")["event_type"] == etype
+
+
 def test_g3_parsers():
     g = ng.parse_gdelt(GDELT_GEO, "MACRO", "geo")
     assert len(g) == 4 and g[0]["domain"] == "reuters.com"
@@ -429,6 +443,14 @@ def test_g4_information_grade():
     assert ng.information_grade([_m("x.com"), _m("reddit.com")]) == 6
 
 
+def test_g4_unrelated_denial_does_not_wipe_out_a_situation():
+    """Codex P2 on #859: one denial in a cluster used to force grade 5."""
+    base = [_m("reuters.com"), _m("cnbc.com"), _m("bbc.com")]
+    assert ng.information_grade(base + [_m("aljazeera.com", denial=True)]) == 1
+    assert ng.information_grade([_m("reuters.com"), _m("cnbc.com", denial=True),
+                                 _m("bbc.com", denial=True)]) == 5
+
+
 # ----------------------------------------------------------------------------- G5
 def _clusters(items, now=NOW):
     clf = ng.Classifier(ng.load_taxonomy())
@@ -475,6 +497,17 @@ def test_g5_unconfirmed_gulf_story_is_caution():
     g = ng.evaluate(_clusters(items, QUIET), [], {}, QUIET)
     assert g["verdict"] == "CAUTION"
     assert g["drivers"][0].startswith("macro (unconfirmed): war_escalation/hormuz grade 3")
+
+
+def test_g5_no_new_entry_needs_a_licensed_wire():
+    items = ng.parse_gdelt(gdelt_articles([
+        ("https://www.cnbc.com/c1", "Missile strike on tanker near Hormuz", "20261030T100000Z", "cnbc.com"),
+        ("https://www.bbc.com/c2", "Missiles hit tanker near Hormuz", "20261030T101000Z", "bbc.com"),
+        ("https://www.cnn.com/c3", "Tanker hit by missile near Hormuz", "20261030T102000Z", "cnn.com"),
+    ]), "MACRO", "geo")
+    g = ng.evaluate(_clusters(items, QUIET), [], {}, QUIET)
+    assert g["verdict"] == "CAUTION"                         # grade 2 (three C outlets)
+    assert g["drivers"][0].startswith("macro: war_escalation/hormuz grade 2, 3 sources")
 
 
 @pytest.mark.parametrize("market,verdict", [
@@ -538,6 +571,21 @@ def test_g7_end_to_end_write_then_dedupe_and_upsert(armed):
     fed = [r for r in sh2.tabs[ng.ECON_TAB][1:] if r[3] == "Fed Interest Rate Decision"]
     assert len(fed) == 1 and fed[0][8] == 3.5 and fed[0][10] == 0.0
     assert len(sh2.tabs[ng.GATE_TAB]) == 3
+
+
+def test_g7_article_keeps_macro_and_company_scope():
+    """Codex P2 on #859: URL-only dedupe dropped the company association."""
+    clf = ng.Classifier(ng.load_taxonomy())
+    url = "https://www.reuters.com/acme"
+    raw = [{"source": "gdelt", "scope": "MACRO", "title": "Acme earnings miss rattles Wall Street",
+            "url": url, "domain": "reuters.com", "published": QUIET},
+           {"source": "gdelt", "scope": "ACME.US", "title": "Acme earnings miss rattles Wall Street",
+            "url": url, "domain": "reuters.com", "published": QUIET}]
+    items = ng.classify_all(raw, clf, QUIET)
+    assert [i["scope"] for i in items] == ["MACRO", "ACME.US"]
+    assert items[1]["event_type"] == "earnings" and items[1]["direction"] == -1
+    names = ng.evaluate(ng.cluster_items([i for i in items if i.get("event_type")]), [], {}, QUIET)["names"]
+    assert names["ACME.US"][0]["level"] == "WATCH"
 
 
 def test_g7_dry_run_writes_nothing(armed):
