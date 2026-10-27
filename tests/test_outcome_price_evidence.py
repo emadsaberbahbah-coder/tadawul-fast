@@ -321,6 +321,49 @@ def test_actual_backend_failed_http_remains_pending_after_grace():
     assert receipt(rec)["reason"] == "quote_transport_failed"
 
 
+# --- v6.52.0 [OUTCOME-TALLY] guards (full harness:
+# tests/test_tracker_outcome_tally.py). observe logs one line per audit with
+# why due records did not mature, per calendar; off logs nothing new.
+def _tally_audit(mode, monkeypatch):
+    if mode is None:
+        monkeypatch.delenv("TRACK_OUTCOME_TALLY", raising=False)
+    else:
+        monkeypatch.setenv("TRACK_OUTCOME_TALLY", mode)
+    import logging
+    seen = []
+    h = logging.Handler()
+    h.emit = lambda r: seen.append(r.getMessage())
+    tp.logger.addHandler(h)
+    level = tp.logger.level
+    tp.logger.setLevel(logging.INFO)
+    try:
+        sr_close = CLOSE.replace(hour=12)
+        recs = [record(), record(symbol="2286.SR", target=CLOSE.replace(hour=8))]
+        rows = [row(price=110), row(symbol="2286.SR", price=30, quote=sr_close + timedelta(minutes=10, seconds=24))]
+        run(app_with_response(rows).audit_active_records(recs))
+    finally:
+        tp.logger.removeHandler(h)
+        tp.logger.setLevel(level)
+    return recs, [m for m in seen if "OUTCOME-TALLY" in m]
+
+
+@pytest.mark.parametrize("mode", [None, "off", "1"])
+def test_outcome_tally_off_logs_nothing_new(mode, monkeypatch):
+    recs, lines = _tally_audit(mode, monkeypatch)
+    assert recs[0].status == tp.PerformanceStatus.MATURED and recs[1].status == tp.PerformanceStatus.ACTIVE
+    assert lines == [] and getattr(tp, "_OUTCOME_TALLY", None) is None
+
+
+def test_outcome_tally_observe_names_the_saudi_refusal(monkeypatch):
+    recs, lines = _tally_audit("observe", monkeypatch)
+    assert recs[0].status == tp.PerformanceStatus.MATURED and recs[1].status == tp.PerformanceStatus.ACTIVE
+    assert lines == ["[v6.52.0 OUTCOME-TALLY] mode=observe evaluated=2 matured=1 expired=0 pending=1 | "
+                     "XNYS n=1 matured=1 expired=0 pending=0 reasons=- after_close_min=- | "
+                     "XSAU n=1 matured=0 expired=0 pending=1 reasons=quote_session_unknown:1 "
+                     "after_close_min=0-15:1"], lines
+    assert tp._OUTCOME_TALLY is None
+
+
 def chart(symbol="SYNTH", price=110, quote=CLOSE.timestamp(), **extra):
     return {"chart": {"result": [{"meta": {"symbol": symbol, "regularMarketPrice": price,
                                           "regularMarketTime": quote, **extra}}]}}

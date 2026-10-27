@@ -251,7 +251,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
-    ("track_performance", "6.49.0", "track performance"),
+    # 2026-10-27: 6.49.0 -> 6.52.0 (TRACK_OUTCOME_TALLY, default off; pin only;
+    # open #841 / #845 claim 6.50.0 / 6.51.0).
+    ("track_performance", "6.52.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
