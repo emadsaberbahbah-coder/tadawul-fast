@@ -4,8 +4,10 @@
 # ============================================================================
 # VERSION 1.1.43 (2026-10-27) -- BOARD SCORECARD HARNESS JOINS THE LEAN LANE
 #
-# v1.1.43: run tests/test_board_scorecard_p182.py (scripts/score_selection_log.py
-# v1.2.0 [CHALLENGER]: TFB_BOARD_SCORECARD_CHALLENGER, default off -- reads the
+# v1.1.43 (1.1.39 / 1.1.41 / 1.1.42 are claimed by open PRs #846 / #849 /
+# #850; 1.1.40 is #848): run tests/test_board_scorecard_p182.py
+# (scripts/score_selection_log.py v1.2.0 [CHALLENGER]:
+# TFB_BOARD_SCORECARD_CHALLENGER, default off -- reads the
 # cockpit's _Shadow_Rank_Log and scores the champion and challenger orders by
 # the pre-registered rule of the self-correcting program, section 4) as its
 # own step of the blocking lean lane; until now only the advisory whole-suite
@@ -15,7 +17,16 @@
 # first (a failed fetch turns only those legs into SKIP lines). Nothing is
 # removed and no existing entry moves.
 #
-# VERSION 1.1.38 (2026-10-26) -- FUNDING EVIDENCE TRANSPORT
+# VERSION 1.1.40 (2026-10-27) -- RANKING CHALLENGER IN SHADOW
+#
+# v1.1.40 (1.1.39 is claimed by open PR #846): run
+# tests/test_opp_rank_challenger_a2.py (opportunity_builder v1.28.0:
+# TFB_OPP_RANK_MODE, default legacy = v1.27.2 byte for byte -- shadow
+# publishes a second, pre-registered order of the same INVEST pool as
+# shadow_rank + meta.rank_challenger without touching selection) in the
+# blocking lean lane next to the other opportunity-builder suites. Offline;
+# its golden legs read the v1.27.2 base with `git show` and print SKIP on a
+# shallow checkout.
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
 # v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
@@ -829,6 +840,7 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
+            tests/test_opp_rank_challenger_a2.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
