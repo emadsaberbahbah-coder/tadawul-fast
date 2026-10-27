@@ -2,6 +2,61 @@
 """
 scripts/score_selection_log.py — Selection_Log ticket-vs-reality scorer
 =======================================================================
+VERSION 1.2.0 (2026-10-27) - [CHALLENGER] (additive; gate default off)
+
+WHY: program register A2 (project doc
+TFB_Self_Correcting_Recommendation_Program_2026-10-27.md). The backend now
+computes a pre-registered challenger order of the INVEST pool next to the
+live order (opportunity_builder v1.28.0, TFB_OPP_RANK_MODE=shadow) and the
+cockpit logs both every UTC day (16_Decision_Top10 v1.17.0,
+DT10_SHADOW_RANK_LOG=on -> the hidden _Shadow_Rank_Log tab: CHAMPION,
+CHALLENGER and BOARD rows). The promotion rule was fixed BEFORE any shadow
+data (program doc section 4): primary metric = hit rate of the excess vs the
+sector/venue reference at +5 sessions on the names ranked 1-5 by each order,
+measured on the same days. Nothing computed it; this version does, nightly.
+WHAT (all of it only when TFB_BOARD_SCORECARD_CHALLENGER=on):
+  * shadow_events() reads _Shadow_Rank_Log (live: the tab; offline:
+    --shadow-tsv), keeps the FIRST event of each UTC Day (the pre-registered
+    choice) and the CHAMPION / CHALLENGER rows ranked 1..5; each order
+    becomes a sequence of daily snapshots and build_episodes() turns it into
+    episodes exactly like board seats (an episode opens on the first day a
+    name is in that order's top 5 and closes on the first day it is not).
+  * score_shadow_episode(): the base price is the venue's last close BEFORE
+    the first session after the logged moment (the log carries no price by
+    design), then score_episode() as for seats: +1/+5/+10/+20 and now, vs
+    SPUS and vs the episode's sector/venue reference (ref_symbol on the
+    logged Sector). Prices ride the same path as the board (the shadow
+    symbols and references join the fetch; board price coverage is unchanged).
+  * challenger_compare(): per order - trading days (distinct logged UTC
+    days Monday-Friday; a weekend log still yields episodes, never a day),
+    episodes, scored at +5, hit % at +5 vs reference (vs SPUS only when the
+    name maps to no reference; a mapped reference without prices for the
+    window leaves the episode unscored), mean and worst excess at +5 vs
+    reference, entries per
+    trading day (churn), mean +5 vs SPUS - and ONE verdict by the
+    pre-registered rule: NO_DATA (no trading day logged); INSUFFICIENT_DATA
+    (< 20 trading days or < 40 scored +5 episodes in either order, window
+    < 40 days); PROMOTE_ELIGIBLE (>= 20 days, >= 40 scored each, challenger
+    hit >= champion + 10 points, challenger mean >= champion mean, worst not
+    lower by > 3 points, churn not higher by > 20%); KEEP_CHAMPION (40
+    trading days reached without PROMOTE_ELIGIBLE - inconclusive keeps the
+    champion); else CONTINUE. PROMOTE_ELIGIBLE is a recommendation to the
+    owner, never an automatic switch.
+  * Output: a CHALLENGER vs CHAMPION block (stdout, MD artifact, step
+    summary, a fourth block in the summary CSV, the tab below RANKING HEALTH
+    or CHURN, above DETAIL); the meta line gains ' | challenger <verdict>';
+    the final stdout line ' challenger=<verdict>'; in write mode the _Run_Log
+    message ' | challenger: <verdict> (days d, scored c/k)' and the details
+    JSON a 'challenger' object. A missing or empty _Shadow_Rank_Log reads as
+    NO_DATA, never an error. The live read uses the same raw render as
+    _Selection_Log (numbers as numbers, dates as serials): the cockpit's
+    'Logged At' / 'Day' text is stored by Sheets as dates.
+GATE TFB_BOARD_SCORECARD_CHALLENGER = off (default) | on. Off -> no shadow
+read, no extra fetch, every v1.1.0 output byte for byte. _Shadow_Rank_Log is
+READ ONLY. Workflow v1.2.0 arms the gate (a NO_DATA block until the backend
+and the cockpit log are armed).
+ROLLBACK: TFB_BOARD_SCORECARD_CHALLENGER=off. Prior WHY blocks verbatim.
+-----------------------------------------------------------------------
 VERSION 1.1.0 (2026-10-27) - [RANKING HEALTH] (additive; gate default off)
 
 WHY: the October review (claude/TFB_October_2026_Recommendation_Review.md,
@@ -179,7 +234,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 EODHD_URL = "https://eodhd.com/api/eod/{sym}?from={frm}&api_token={tok}&fmt=json&period=d"
 SKIP_SUFFIX = ("=F",)          # futures: no reliable EOD mapping
 SKIP_CONTAINS = ("-USD",)      # crypto pairs: out of scope v0.1.0
@@ -445,6 +500,25 @@ VENUE_REF: Dict[str, str] = {
 REF_VENUE_SUFFIX: Dict[str, str] = {
     "^FTSE": "L", "^STOXX50E": "DE", "^HSI": "HK", "^GSPTSE": "TO",
     "^AXJO": "AX", "^MXX": "MX", "^TASI.SR": "SR", "^STI": "SI", "^N225": "T"}
+# ---- v1.2.0 [CHALLENGER] - all of it behind TFB_BOARD_SCORECARD_CHALLENGER=on.
+# The rule constants are the program doc's section 4, fixed 27 Oct 2026
+# before any shadow data; changing one is a new evaluation.
+CHALLENGER_ENV = "TFB_BOARD_SCORECARD_CHALLENGER"
+SHADOW_TAB = "_Shadow_Rank_Log"
+SHADOW_ORDERS = ("CHAMPION", "CHALLENGER")
+CHAL_TOP_N = 5                 # names ranked 1..5 by each order
+CHAL_MIN_SCORED = 40           # scored +5 episodes per order
+CHAL_MIN_DAYS = 20             # trading days logged (UTC Mon-Fri)
+CHAL_MAX_DAYS = 40             # inconclusive at this length -> keep the champion
+CHAL_HIT_EDGE_PP = 10.0        # challenger hit % >= champion + this
+CHAL_WORST_TOL_PP = 3.0        # worst +5 excess not lower by more than this
+CHAL_CHURN_TOL = 1.20          # entries per day not higher than champion x this
+CHALLENGER_HEADER = ["Order", "Trading Days", "Episodes", "Scored +5",
+                     "Hit % +5 (vs ref)", "Mean +5 vs Ref pp",
+                     "Worst +5 vs Ref pp", "Entries / Day", "Mean +5 vs SPUS pp"]
+CHALLENGER_TITLE = ("CHALLENGER vs CHAMPION - the backend's two orders of the "
+                    "INVEST pool, names ranked 1-5 by each, first logged event "
+                    "of each UTC day (pre-registered rule, program doc section 4)")
 
 
 def _scorecard_mode() -> str:
@@ -468,6 +542,11 @@ def _ranking_enabled() -> bool:
     true / yes arm it; anything else (unset, 'off', junk) keeps the v1.0.0
     outputs byte-identical."""
     return os.getenv(RANKING_ENV, "").strip().lower() in ("on", "1", "true", "yes")
+
+
+def _challenger_enabled() -> bool:
+    """v1.2.0 gate - DEFAULT OFF (exactly 'on' arms it, any case)."""
+    return os.getenv(CHALLENGER_ENV, "off").strip().lower() == "on"
 
 
 def _num_pct(s) -> Optional[float]:
@@ -780,6 +859,183 @@ def build_episodes(events: List[Dict[str, Any]],
     return eps, stats
 
 
+def _day_key(v) -> Optional[str]:
+    """v1.2.0: a _Shadow_Rank_Log 'Day' cell -> 'YYYY-MM-DD' or None. The
+    cockpit writes the UTC day as text and Sheets stores it as a date, so a
+    live read (SERIAL_NUMBER render) returns a serial; an exported TSV returns
+    the displayed text (ISO or m/d/Y)."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) or re.fullmatch(r"\d{5}(\.\d+)?", str(v).strip()):
+        f = float(v)
+        if not 20000.0 < f < 80000.0:
+            return None
+        return (datetime(1899, 12, 30) + timedelta(days=int(f))).strftime("%Y-%m-%d")
+    s = str(v).strip()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})(?:[ T].*)?$", s)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    try:
+        return datetime.strptime(s.split(" ")[0], "%m/%d/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _trading_day(day: str) -> bool:
+    """v1.2.0: a logged UTC day counts toward the rule's 'trading days' only
+    Monday-Friday (a weekend log still yields episodes, never a day)."""
+    try:
+        return datetime.strptime(day, "%Y-%m-%d").weekday() < 5
+    except (TypeError, ValueError):
+        return False
+
+
+def shadow_events(values: List[List[Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]],
+                                                   Dict[str, int]]:
+    """v1.2.0: _Shadow_Rank_Log grid -> {order: board-like events}. Only the
+    FIRST event of each UTC Day (earliest Logged At) counts, and only the
+    CHAMPION / CHALLENGER rows ranked 1..CHAL_TOP_N. Every row of one event
+    shares its Logged At, so build_episodes() reads each kept event as one
+    snapshot. An unreadable Day falls back to the UTC date of Logged At
+    (Riyadh wall time - 3 h). A missing tab, an empty grid or a missing
+    column -> no events."""
+    out: Dict[str, List[Dict[str, Any]]] = {o: [] for o in SHADOW_ORDERS}
+    stats = {"rows": 0, "days": 0, "events_kept": 0, "bad_time": 0}
+    if not values:
+        return out, stats
+    hdr = [str(c).strip() for c in values[0]]
+    if any(k not in hdr for k in ("Logged At", "Day", "Order", "Rank", "Symbol")):
+        return out, stats
+    h = {c: i for i, c in enumerate(hdr)}
+    first_at: Dict[str, datetime] = {}
+    rows: List[Tuple[str, datetime, List[Any]]] = []
+    for r in values[1:]:
+        stats["rows"] += 1
+        at = _parse_logged_at(_cell(r, h, "Logged At"))
+        if at is None:
+            stats["bad_time"] += 1
+            continue
+        day = _day_key(_cell(r, h, "Day")) or (at - timedelta(hours=3)).strftime("%Y-%m-%d")
+        rows.append((day, at, r))
+        if day not in first_at or at < first_at[day]:
+            first_at[day] = at
+    stats["days"] = len(first_at)
+    for day, at, r in rows:
+        if at != first_at[day]:
+            continue
+        order = str(_cell(r, h, "Order")).strip().upper()
+        rank = _rank_int(_cell(r, h, "Rank"))
+        sym = str(_cell(r, h, "Symbol")).strip()
+        if order not in out or rank is None or not 1 <= rank <= CHAL_TOP_N or not sym:
+            continue
+        out[order].append({
+            "at": at, "symbol": sym, "outcome": "", "is_exit": False,
+            "run": day, "output": order, "price": None, "name": "",
+            "sector": str(_cell(r, h, "Sector")).strip(), "ccy": "",
+            "stability": "", "rank": rank,
+            "eng_roi": _num_pct(_cell(r, h, "Engine ROI %")),
+            "rel": _num_pct(_cell(r, h, "Rel")),
+            "conf": str(_cell(r, h, "Conf")).strip(),
+            "market": str(_cell(r, h, "Market")).strip()})
+        stats["events_kept"] += 1
+    for order, ev in out.items():
+        ev.sort(key=lambda e: (e["at"], e["rank"]))
+        for k, e in enumerate(ev):
+            e["seq"] = k
+    return out, stats
+
+
+def score_shadow_episode(ep: Dict[str, Any], closes: List[Tuple[str, float]],
+                         bench: List[Tuple[str, float]],
+                         ref: Optional[List[Tuple[str, float]]] = None) -> Dict[str, Any]:
+    """v1.2.0: base = the venue's last close BEFORE the first session after
+    the logged moment (the shadow log carries no price), then score_episode()
+    exactly as for a board seat. No prior close -> NO_PRICE."""
+    if not closes:
+        res = score_episode(dict(ep, seat_px=None), closes, bench, ref)
+        res["status"] = "NO_DATA"           # no series at all, not a missing base
+        return res
+    b1 = _first_bar_index(ep["symbol"], ep["seat_at"], closes)
+    if b1 is not None and b1 >= 1:
+        return score_episode(dict(ep, seat_px=closes[b1 - 1][1]), closes, bench, ref)
+    return score_episode(dict(ep, seat_px=None), closes, bench, ref)
+
+
+def challenger_verdict(days: int, n_champ: int, n_chal: int,
+                       champ: Dict[str, Any], chal: Dict[str, Any]) -> Tuple[str, str]:
+    """v1.2.0: the pre-registered rule (program doc section 4). Returns
+    (verdict, reason)."""
+    if days <= 0:
+        return "NO_DATA", "no trading day logged in " + SHADOW_TAB
+    enough = days >= CHAL_MIN_DAYS and min(n_champ, n_chal) >= CHAL_MIN_SCORED
+    if enough:
+        ok_hit = (chal["hit"] is not None and champ["hit"] is not None
+                  and chal["hit"] >= champ["hit"] + CHAL_HIT_EDGE_PP)
+        ok_mean = (chal["mean"] is not None and champ["mean"] is not None
+                   and chal["mean"] >= champ["mean"])
+        ok_worst = (chal["worst"] is not None and champ["worst"] is not None
+                    and chal["worst"] >= champ["worst"] - CHAL_WORST_TOL_PP)
+        ok_churn = (chal["churn"] is not None and champ["churn"] is not None
+                    and chal["churn"] <= champ["churn"] * CHAL_CHURN_TOL)
+        if ok_hit and ok_mean and ok_worst and ok_churn:
+            return "PROMOTE_ELIGIBLE", "every condition met - owner decides"
+        failed = [n for n, ok in (("hit edge", ok_hit), ("mean", ok_mean),
+                                  ("worst", ok_worst), ("churn", ok_churn)) if not ok]
+        if days >= CHAL_MAX_DAYS:
+            return "KEEP_CHAMPION", ("inconclusive at %d days: %s"
+                                     % (days, ", ".join(failed)))
+        return "CONTINUE", "not yet: " + ", ".join(failed)
+    if days >= CHAL_MAX_DAYS:
+        return "KEEP_CHAMPION", ("inconclusive at %d days: scored %d/%d < %d"
+                                 % (days, n_champ, n_chal, CHAL_MIN_SCORED))
+    return "INSUFFICIENT_DATA", ("days %d/%d, scored +5 %d/%d (need %d each)"
+                                 % (days, CHAL_MIN_DAYS, n_champ, n_chal, CHAL_MIN_SCORED))
+
+
+def challenger_compare(scored_by_order: Dict[str, List[Dict[str, Any]]],
+                       days_by_order: Dict[str, int]) -> Tuple[List[List[Any]], Dict[str, Any]]:
+    """v1.2.0: CHALLENGER_HEADER rows (one per order + one verdict row) and the
+    statistics. Hit/mean/worst use the +5 excess vs the reference (vs SPUS
+    only when the episode maps to no reference; a mapped reference without
+    prices for the window -> unscored, never SPUS); churn = episodes opened
+    per trading day logged."""
+    rows: List[List[Any]] = []
+    per: Dict[str, Dict[str, Any]] = {}
+    for order in SHADOW_ORDERS:
+        sub = scored_by_order.get(order, [])
+        xs = []
+        for sc in sub:
+            # vs SPUS only when the episode has NO reference mapping; a mapped
+            # reference without prices for the window leaves it unscored (the
+            # metric never switches benchmark on price availability).
+            v = sc["xr"].get(5) if (sc["ep"].get("ref") or "") else sc["x"].get(5)
+            xs.append(v)
+        xs = [v for v in xs if v is not None]
+        sp = [sc["x"].get(5) for sc in sub if sc["x"].get(5) is not None]
+        days = days_by_order.get(order, 0)
+        st = {"days": days, "episodes": len(sub), "scored": len(xs),
+              "hit": (100.0 * sum(1 for v in xs if v > 0) / len(xs)) if xs else None,
+              "mean": statistics.fmean(xs) if xs else None,
+              "worst": min(xs) if xs else None,
+              "churn": (len(sub) / days) if days else None,
+              "spus": statistics.fmean(sp) if sp else None}
+        per[order] = st
+        rows.append([order, days, len(sub), len(xs), _r2(st["hit"]), _r2(st["mean"]),
+                     _r2(st["worst"]), _r2(st["churn"]), _r2(st["spus"])])
+    days = min(days_by_order.get(o, 0) for o in SHADOW_ORDERS)
+    verdict, reason = challenger_verdict(days, per["CHAMPION"]["scored"],
+                                         per["CHALLENGER"]["scored"],
+                                         per["CHAMPION"], per["CHALLENGER"])
+    text = "%s (days %d, scored %d/%d; %s)" % (verdict, days, per["CHAMPION"]["scored"],
+                                              per["CHALLENGER"]["scored"], reason)
+    rows.append(["Verdict", text, "", "", "", "", "", "", ""])
+    return rows, {"verdict": verdict, "reason": reason, "text": text, "days": days,
+                  "champion": per["CHAMPION"], "challenger": per["CHALLENGER"]}
+
+
 def _pct(px: float, base: float) -> float:
     return (px / base - 1.0) * 100.0
 
@@ -1058,7 +1314,8 @@ def ranking_health(scored: List[Dict[str, Any]],
 
 def scorecard_rect(meta: str, summary: List[List[Any]], churn: List[List[Any]],
                    detail: List[List[Any]],
-                   ranking: Optional[List[List[Any]]] = None) -> List[List[Any]]:
+                   ranking: Optional[List[List[Any]]] = None,
+                   challenger: Optional[List[List[Any]]] = None) -> List[List[Any]]:
     """The whole tab as ONE rectangle (uniform width), written in one call.
     v1.1.0: `ranking` rows (when not None) go below CHURN under
     RANKING_HEADER and DETAIL takes the DETAIL_HEADER_RANKING header."""
@@ -1071,6 +1328,8 @@ def scorecard_rect(meta: str, summary: List[List[Any]], churn: List[List[Any]],
         + churn)
     if ranking is not None:
         rect += [[], [RANKING_TITLE], RANKING_HEADER] + ranking
+    if challenger is not None:             # v1.2.0 [CHALLENGER]
+        rect += [[], [CHALLENGER_TITLE], CHALLENGER_HEADER] + challenger
     rect += ([[], ["DETAIL - one row per board seat episode, newest first"],
               DETAIL_HEADER_RANKING if ranking is not None else DETAIL_HEADER]
              + detail)
@@ -1088,7 +1347,8 @@ def _pad_rect(rect: List[List[Any]], rows: int, cols: int) -> List[List[Any]]:
 
 def scorecard_markdown(meta: str, summary: List[List[Any]],
                        churn: List[List[Any]], since: str,
-                       ranking: Optional[List[List[Any]]] = None) -> str:
+                       ranking: Optional[List[List[Any]]] = None,
+                       challenger: Optional[List[List[Any]]] = None) -> str:
     """v1.1.0: `ranking` rows (when not None) add a RANKING HEALTH table: the
     'Since <since>' window in full plus the Verdict row of every seat month
     (the tab and the summary CSV carry every window)."""
@@ -1107,6 +1367,11 @@ def scorecard_markdown(meta: str, summary: List[List[Any]],
                   "|" + "---|" * len(RANKING_HEADER)]
         lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in ranking
                   if r[0] == "Since " + since or r[1] == "Verdict"]
+    if challenger is not None:             # v1.2.0 [CHALLENGER]
+        lines += ["", CHALLENGER_TITLE, "",
+                  "| " + " | ".join(CHALLENGER_HEADER) + " |",
+                  "|" + "---|" * len(CHALLENGER_HEADER)]
+        lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in challenger]
     return "\n".join(lines) + "\n"
 
 
@@ -1188,6 +1453,14 @@ def _read_sellog_live(book) -> List[List[Any]]:
         date_time_render_option="SERIAL_NUMBER")
 
 
+def _read_shadow_live(book) -> List[List[Any]]:
+    """v1.2.0: _Shadow_Rank_Log, same raw render ('Logged At' and 'Day' as
+    serial numbers). READ ONLY."""
+    return book.worksheet(SHADOW_TAB).get_all_values(
+        value_render_option="UNFORMATTED_VALUE",
+        date_time_render_option="SERIAL_NUMBER")
+
+
 def _sheets_credentials():
     from google.oauth2 import service_account
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -1260,7 +1533,8 @@ def _append_run_log(book, asof_utc: datetime, status: str, message: str,
 
 def _write_artifacts(out_dir: str, summary: List[List[Any]],
                      churn: List[List[Any]], detail: List[List[Any]],
-                     md: str, ranking: Optional[List[List[Any]]] = None) -> List[str]:
+                     md: str, ranking: Optional[List[List[Any]]] = None,
+                     challenger: Optional[List[List[Any]]] = None) -> List[str]:
     """v1.1.0: with `ranking` rows the detail CSV takes DETAIL_HEADER_RANKING
     and the summary CSV gains a third block (RANKING_HEADER + rows)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -1282,6 +1556,10 @@ def _write_artifacts(out_dir: str, summary: List[List[Any]],
             w.writerow([])
             w.writerow(RANKING_HEADER)
             w.writerows(ranking)
+        if challenger is not None:         # v1.2.0 [CHALLENGER]
+            w.writerow([])
+            w.writerow(CHALLENGER_HEADER)
+            w.writerows(challenger)
     with open(p_md, "w", encoding="utf-8") as fh:
         fh.write(md)
     return [p_det, p_sum, p_md]
@@ -1291,7 +1569,8 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
                   prices_csv: Optional[str] = None, fetch_yahoo_: bool = False,
                   fetch_eodhd: bool = False, since: str = DEFAULT_SINCE,
                   out_dir: str = DEFAULT_OUT_DIR,
-                  asof: Optional[str] = None) -> int:
+                  asof: Optional[str] = None,
+                  shadow_tsv: Optional[str] = None) -> int:
     tag = f"[BOARD-SCORECARD v{SCRIPT_VERSION}]"
     mode = _scorecard_mode()
     if mode == "off":
@@ -1318,6 +1597,34 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
     syms = sorted({e["symbol"] for e in episodes})
     frm = (min(e["seat_at"] for e in episodes).date()
            - timedelta(days=10)).strftime("%Y-%m-%d")
+    # v1.2.0 [CHALLENGER]: the logged orders become episodes like seats; their
+    # symbols and references join the fetch (board coverage is unchanged).
+    chal_on = _challenger_enabled()
+    sh_eps: Dict[str, List[Dict[str, Any]]] = {o: [] for o in SHADOW_ORDERS}
+    sh_days: Dict[str, int] = {o: 0 for o in SHADOW_ORDERS}
+    sh_extra: List[str] = []
+    if chal_on:
+        sh_values: List[List[Any]] = []
+        try:
+            if shadow_tsv:
+                sh_values = _read_sellog_tsv(shadow_tsv)
+            elif book is not None:
+                sh_values = _read_shadow_live(book)
+        except Exception as exc:                      # noqa: BLE001
+            if type(exc).__name__ != "WorksheetNotFound":
+                print(f"WARN: {SHADOW_TAB} not read ({exc}) - challenger NO_DATA")
+            sh_values = []
+        sh_ev, _sh_stats = shadow_events(sh_values)
+        for order in SHADOW_ORDERS:
+            sh_eps[order], _st = build_episodes(sh_ev[order], now_riyadh)
+            sh_days[order] = len({e["run"] for e in sh_ev[order] if _trading_day(e["run"])})
+            for ep in sh_eps[order]:
+                ep["ref"] = ref_symbol(ep["symbol"], ep["sector"])
+                sh_extra += [ep["symbol"]] + ([ep["ref"]] if ep["ref"] else [])
+        firsts = [e["seat_at"] for o in SHADOW_ORDERS for e in sh_eps[o]]
+        if firsts:
+            frm = min(frm, (min(firsts).date() - timedelta(days=10)).strftime("%Y-%m-%d"))
+        sh_extra = sorted(set(sh_extra) - set(syms) - {BENCH_SYMBOL})
     # v1.1.0 [RANKING HEALTH]: reference series ride the same price path as
     # SPUS; they never count towards price coverage (that stays per seat).
     ranking_on = _ranking_enabled()
@@ -1329,12 +1636,14 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
     if prices_csv:
         prices, psrc = load_prices_csv(prices_csv), "csv"
     elif fetch_yahoo_:
-        prices, psrc = fetch_yahoo(syms + [BENCH_SYMBOL] + refs, frm, asof_utc), "yahoo"
+        prices, psrc = fetch_yahoo(syms + [BENCH_SYMBOL] + refs + sorted(set(sh_extra) - set(refs)),
+                                   frm, asof_utc), "yahoo"
     elif fetch_eodhd:
         tok = os.getenv("TFB_EODHD_API_KEY", "").strip()
         if not tok:
             raise SystemExit("TFB_EODHD_API_KEY missing (fetch mode)")
-        prices, psrc = fetch_prices(syms + [BENCH_SYMBOL] + refs, frm, tok), "eodhd"
+        prices, psrc = fetch_prices(syms + [BENCH_SYMBOL] + refs + sorted(set(sh_extra) - set(refs)),
+                                    frm, tok), "eodhd"
     else:
         raise SystemExit("--scorecard needs --prices-csv, --fetch-yahoo or --fetch")
     prices = {s: _final_bars(s, sorted(v), asof_utc) for s, v in prices.items()}
@@ -1353,6 +1662,13 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
         ranking, rk_stats = ranking_health(scored, since)
         rk = rk_stats.get("Since " + since, {})
         refs_ok = sum(1 for r in refs if prices.get(r))
+    challenger: Optional[List[List[Any]]] = None
+    ch: Dict[str, Any] = {}
+    if chal_on:
+        sh_scored = {o: [score_shadow_episode(ep, prices.get(ep["symbol"], []), bench,
+                                              ref=prices.get(ep["ref"], []) if ep.get("ref") else None)
+                         for ep in sh_eps[o]] for o in SHADOW_ORDERS}
+        challenger, ch = challenger_compare(sh_scored, sh_days)
     n_open = sum(1 for e in episodes if e["exit_at"] is None)
     n_since = sum(1 for s in scored if s["seat_date"] >= since)
     n_priced = sum(1 for s in scored if s["status"] in ("OPEN", "CLOSED"))
@@ -1364,10 +1680,15 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
     if ranking_on:
         meta += (f" | refs {refs_ok}/{len(refs)} | ranking "
                  f"{rk.get('verdict', 'n/a')}")
-    rect = scorecard_rect(meta, summary, churn, detail, ranking=ranking)
-    md = scorecard_markdown(meta, summary, churn, since, ranking=ranking)
+    if chal_on:
+        meta += f" | challenger {ch.get('verdict', 'n/a')}"
+    rect = scorecard_rect(meta, summary, churn, detail, ranking=ranking,
+                          challenger=challenger)
+    md = scorecard_markdown(meta, summary, churn, since, ranking=ranking,
+                            challenger=challenger)
     print(md)
-    paths = _write_artifacts(out_dir, summary, churn, detail, md, ranking=ranking)
+    paths = _write_artifacts(out_dir, summary, churn, detail, md, ranking=ranking,
+                             challenger=challenger)
     step = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
     if step:
         try:
@@ -1389,6 +1710,15 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
             "spearman_roi": None if rho is None else round(rho, 4),
             "hit_1_3": rk.get("hit_1_3"), "hit_7_10": rk.get("hit_7_10"),
             "refs": refs_ok, "refs_total": len(refs)}
+    if chal_on:
+        def _rd(v):
+            return None if v is None else round(v, 2)
+        details["challenger"] = {
+            "verdict": ch.get("verdict"), "days": ch.get("days"),
+            "champion": {k: _rd(v) if isinstance(v, float) else v
+                         for k, v in (ch.get("champion") or {}).items()},
+            "challenger": {k: _rd(v) if isinstance(v, float) else v
+                           for k, v in (ch.get("challenger") or {}).items()}}
     wrote = "0"
     rc = 0
     if mode == "write":
@@ -1408,7 +1738,12 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
                             f"since={since}({n_since}) priced={n_priced} "
                             f"prices={psrc} {covered}/{len(syms)} wrote={wrote}"
                             + (f" | ranking: {rk.get('text', 'n/a')}"
-                               if ranking_on else ""),
+                               if ranking_on else "")
+                            + (" | challenger: %s (days %s, scored %s/%s)"
+                               % (ch.get("verdict", "n/a"), ch.get("days", 0),
+                                  (ch.get("champion") or {}).get("scored", 0),
+                                  (ch.get("challenger") or {}).get("scored", 0))
+                               if chal_on else ""),
                             details)
     elif degraded:
         print(f"::warning::{tag} price coverage {covered}/{len(syms)} below "
@@ -1418,7 +1753,8 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
           f"prices={psrc} {covered}/{len(syms)} bench={'ok' if bench else 'missing'} "
           f"orphan_exits={ep_stats['orphan_exits']} wrote={wrote} "
           f"artifacts={len(paths)}"
-          + (f" ranking={rk.get('verdict', 'n/a')}" if ranking_on else ""))
+          + (f" ranking={rk.get('verdict', 'n/a')}" if ranking_on else "")
+          + (f" challenger={ch.get('verdict', 'n/a')}" if chal_on else ""))
     return rc
 
 
@@ -1815,7 +2151,102 @@ def selftest() -> int:
     assert all(v in VENUE_CLOSE for v in REF_VENUE_SUFFIX.values())
     assert set(REF_VENUE_SUFFIX) == set(VENUE_REF.values())
     ok += 1
-    print(f"SELFTEST {ok}/21: ALL GREEN")
+    # 22: shadow log parsing (v1.2.0): first event of each UTC Day only,
+    #     CHAMPION / CHALLENGER rows ranked 1..5, BOARD and rank 6+ ignored,
+    #     a missing column or an empty grid -> no events; live-render serials,
+    #     Day fallback and the Mon-Fri trading-day count
+    sh_hdr = ["Logged At", "Day", "Cohort", "Order", "Rank", "Symbol", "Market",
+              "Sector", "Seat", "Live Rank", "Shadow Rank", "Engine ROI %", "Rel",
+              "Conf"]
+
+    def _shrow(at, day, order, rank, sym, sector="Financials", roi=20.0):
+        return [at, day, "run", order, rank, sym, "NYSE", sector, "", "", "",
+                roi, 80.0, "High"]
+    sh_vals = [sh_hdr,
+               _shrow("2026-10-27 08:47:00", "2026-10-27", "CHAMPION", 1, "A.US", roi=35.0),
+               _shrow("2026-10-27 08:47:00", "2026-10-27", "CHAMPION", 6, "Z.US"),
+               _shrow("2026-10-27 08:47:00", "2026-10-27", "CHALLENGER", 1, "B.US"),
+               _shrow("2026-10-27 08:47:00", "2026-10-27", "BOARD", 1, "A.US"),
+               _shrow("2026-10-27 15:00:00", "2026-10-27", "CHALLENGER", 1, "C.US"),
+               _shrow("2026-10-28 08:47:00", "2026-10-28", "CHALLENGER", 1, "B.US"),
+               _shrow("2026-10-28 08:47:00", "2026-10-28", "CHAMPION", 1, "D.US"),
+               _shrow("bad", "2026-10-28", "CHAMPION", 2, "E.US")]
+    sh_ev, sh_st = shadow_events(sh_vals)
+    assert [e["symbol"] for e in sh_ev["CHAMPION"]] == ["A.US", "D.US"]
+    assert [e["symbol"] for e in sh_ev["CHALLENGER"]] == ["B.US", "B.US"]
+    assert sh_st == {"rows": 8, "days": 2, "events_kept": 4, "bad_time": 1}
+    assert sh_ev["CHAMPION"][0]["eng_roi"] == 35.0 and sh_ev["CHAMPION"][0]["run"] == "2026-10-27"
+    assert shadow_events([])[0] == {"CHAMPION": [], "CHALLENGER": []}
+    assert shadow_events([["Logged At", "Order"]])[0]["CHALLENGER"] == []
+    ch_eps, _x = build_episodes(sh_ev["CHALLENGER"], datetime(2026, 10, 29))
+    assert len(ch_eps) == 1 and ch_eps[0]["exit_at"] is None, "one open episode (B on both days)"
+    cm_eps, _x = build_episodes(sh_ev["CHAMPION"], datetime(2026, 10, 29))
+    assert [(e["symbol"], e["exit_kind"]) for e in cm_eps] == [("A.US", "DROPPED"), ("D.US", "")]
+    # the live render: 'Logged At' and 'Day' come back as serials; an
+    # unreadable Day falls back to the UTC date of Logged At (Riyadh - 3 h),
+    # so Sat 02:00 Riyadh belongs to Friday's UTC day (not its first event)
+
+    def _ser(dt):
+        return (dt - datetime(1899, 12, 30)).total_seconds() / 86400.0
+    sh_live = [sh_hdr,
+               [_ser(datetime(2026, 10, 29, 8, 47)), float(int(_ser(datetime(2026, 10, 29)))),
+                "run", "CHAMPION", 1.0, "D.US", "NYSE", "Tech", "", "", "", 20.0, 80.0, "High"],
+               [_ser(datetime(2026, 10, 30, 8, 47)), "", "run", "CHAMPION", 2.0, "F.US", "NYSE",
+                "Tech", "", "", "", 20.0, 80.0, "High"],
+               [_ser(datetime(2026, 10, 31, 2, 0)), "", "run", "CHAMPION", 1.0, "G.US", "NYSE",
+                "Tech", "", "", "", 20.0, 80.0, "High"],
+               _shrow("2026-11-01 09:00:00", "11/01/2026", "CHALLENGER", 1, "H.US")]
+    lv_ev, lv_st = shadow_events(sh_live)
+    assert [(e["symbol"], e["run"]) for e in lv_ev["CHAMPION"]] == [
+        ("D.US", "2026-10-29"), ("F.US", "2026-10-30")], lv_ev["CHAMPION"]
+    assert [(e["symbol"], e["run"]) for e in lv_ev["CHALLENGER"]] == [("H.US", "2026-11-01")]
+    assert lv_st == {"rows": 4, "days": 3, "events_kept": 3, "bad_time": 0}, lv_st
+    assert [_day_key(v) for v in ("2026-10-27", "2026-10-27 00:00:00", "10/27/2026",
+                                  _ser(datetime(2026, 10, 27)), "46322", "junk", 5, None)] == [
+        "2026-10-27", "2026-10-27", "2026-10-27", "2026-10-27", "2026-10-27", None, None, None]
+    assert [_trading_day(d) for d in ("2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02",
+                                      "bad")] == [True, False, False, True, False]
+    ok += 1
+    # 23: shadow episodes take the last close BEFORE the first session after
+    #     the logged moment as their base; no prior close -> NO_PRICE
+    sh_closes = [("2026-10-26", 10.0), ("2026-10-27", 11.0), ("2026-10-28", 12.1),
+                 ("2026-10-29", 12.0), ("2026-10-30", 12.5), ("2026-11-02", 13.0),
+                 ("2026-11-03", 13.2)]
+    sh_bench = [(d, 100.0) for d, _c in sh_closes]
+    ep23 = {"symbol": "B.US", "seat_at": datetime(2026, 10, 27, 8, 47), "seat_px": None,
+            "exit_at": None}
+    r23 = score_shadow_episode(ep23, sh_closes, sh_bench)
+    assert r23["status"] == "OPEN" and abs(r23["r"][1] - 10.0) < 1e-9, r23["r"]
+    assert abs(r23["r"][5] - 30.0) < 1e-9 and abs(r23["x"][5] - 30.0) < 1e-9
+    assert score_shadow_episode(dict(ep23, seat_at=datetime(2026, 10, 25, 8, 0)),
+                                sh_closes, sh_bench)["status"] == "NO_PRICE"
+    assert score_shadow_episode(ep23, [], sh_bench)["status"] == "NO_DATA"
+    ok += 1
+    # 24: the pre-registered verdict: NO_DATA, INSUFFICIENT_DATA, CONTINUE,
+    #     PROMOTE_ELIGIBLE, KEEP_CHAMPION; each guardrail can block alone
+    cp = {"hit": 50.0, "mean": 0.5, "worst": -8.0, "churn": 1.0}
+    good = {"hit": 61.0, "mean": 0.6, "worst": -10.5, "churn": 1.2}
+    assert challenger_verdict(0, 0, 0, cp, good)[0] == "NO_DATA"
+    assert challenger_verdict(19, 80, 80, cp, good)[0] == "INSUFFICIENT_DATA"
+    assert challenger_verdict(25, 39, 80, cp, good)[0] == "INSUFFICIENT_DATA"
+    assert challenger_verdict(20, 40, 40, cp, good)[0] == "PROMOTE_ELIGIBLE"
+    for k, bad in (("hit", 59.9), ("mean", 0.49), ("worst", -11.1), ("churn", 1.21)):
+        v, why = challenger_verdict(25, 50, 50, cp, dict(good, **{k: bad}))
+        assert v == "CONTINUE" and why.startswith("not yet:"), (k, v, why)
+        assert challenger_verdict(40, 50, 50, cp, dict(good, **{k: bad}))[0] == "KEEP_CHAMPION"
+    assert challenger_verdict(40, 10, 10, cp, good)[0] == "KEEP_CHAMPION"
+    rows24, st24 = challenger_compare(
+        {"CHAMPION": [r23], "CHALLENGER": []}, {"CHAMPION": 1, "CHALLENGER": 0})
+    assert [r[0] for r in rows24] == ["CHAMPION", "CHALLENGER", "Verdict"]
+    assert rows24[0][1:5] == [1, 1, 1, 100.0] and st24["verdict"] == "NO_DATA"
+    # a mapped reference whose series is missing: unscored, never vs SPUS
+    r_miss = dict(r23, ep=dict(r23["ep"], ref="XLF.US"))
+    rows24m, _st = challenger_compare(
+        {"CHAMPION": [r23, r_miss], "CHALLENGER": []}, {"CHAMPION": 1, "CHALLENGER": 0})
+    assert rows24m[0][1:5] == [1, 2, 1, 100.0], rows24m[0]
+    assert all(len(r) == len(CHALLENGER_HEADER) for r in rows24)
+    ok += 1
+    print(f"SELFTEST {ok}/24: ALL GREEN")
     return 0
 
 
@@ -1838,13 +2269,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--since", default=DEFAULT_SINCE)
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     ap.add_argument("--asof", help="UTC moment treated as now (replays/tests)")
+    # v1.2.0: TFB_BOARD_SCORECARD_CHALLENGER=on adds CHALLENGER vs CHAMPION.
+    ap.add_argument("--shadow-tsv",
+                    help="scorecard: _Shadow_Rank_Log export (offline; --live "
+                         "reads the tab)")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
     if a.scorecard:
         return run_scorecard(tsv=a.tsv, live=a.live, prices_csv=a.prices_csv,
                              fetch_yahoo_=a.fetch_yahoo, fetch_eodhd=a.fetch,
-                             since=a.since, out_dir=a.out_dir, asof=a.asof)
+                             since=a.since, out_dir=a.out_dir, asof=a.asof,
+                             shadow_tsv=a.shadow_tsv)
     if not a.tsv:
         ap.error("--tsv required (or --selftest)")
     return run(a.tsv, a.out, a.prices_csv, a.fetch)

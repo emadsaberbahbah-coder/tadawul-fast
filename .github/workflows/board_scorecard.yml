@@ -46,6 +46,22 @@ name: "📋 TFB Board Scorecard"
 # ROLLBACK: TFB_BOARD_SCORECARD: "observe" (artifacts only) and/or
 # TFB_BOARD_SCORECARD_RANKING: "off" (v1.0.0 outputs byte for byte); nothing
 # else depends on either.
+# v1.2.0 (2026-10-27) -- CHALLENGER vs CHAMPION.
+# WHY: program register A2 (claude/TFB_Self_Correcting_Recommendation_
+# Program_2026-10-27.md). The backend computes a pre-registered challenger
+# order of the INVEST pool next to the live order (opportunity_builder
+# v1.28.0, TFB_OPP_RANK_MODE=shadow) and the cockpit logs both once per UTC
+# day (16_Decision_Top10 v1.17.0, DT10_SHADOW_RANK_LOG=on -> the hidden
+# _Shadow_Rank_Log tab). scripts/score_selection_log.py v1.2.0 scores the
+# names ranked 1-5 by each order like board seats (+5 sessions vs the
+# sector / venue reference) and prints ONE verdict by the rule fixed before
+# any data (program doc section 4): NO_DATA / INSUFFICIENT_DATA / CONTINUE /
+# PROMOTE_ELIGIBLE / KEEP_CHAMPION. PROMOTE_ELIGIBLE is evidence for the
+# owner, never a switch. This workflow turns the gate ON; until the backend
+# and the cockpit log are armed the block reads NO_DATA (no tab yet - not an
+# error). _Shadow_Rank_Log is READ ONLY; its names ride the same Yahoo fetch.
+# ROLLBACK: TFB_BOARD_SCORECARD_CHALLENGER: "off" (v1.1.0 outputs byte for
+# byte).
 # ============================================================================
 
 on:
@@ -85,6 +101,10 @@ jobs:
       # v1.1.0 [RANKING HEALTH]: reference benchmark + ranking verdict.
       # "off" restores the v1.0.0 outputs byte for byte.
       TFB_BOARD_SCORECARD_RANKING: "on"
+      # v1.2.0 [CHALLENGER]: champion vs challenger by the pre-registered
+      # rule (reads _Shadow_Rank_Log). "off" restores the v1.1.0 outputs
+      # byte for byte.
+      TFB_BOARD_SCORECARD_CHALLENGER: "on"
     steps:
       # Pinned to main; the job token is not persisted into .git.
       - uses: actions/checkout@v6
