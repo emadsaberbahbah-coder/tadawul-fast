@@ -2,9 +2,30 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.2 (FIELD-INDEPENDENT YAHOO FALLBACK)
+Calendar Provider — v1.3.0 (LAST REPORT DATE + EPS SURPRISE)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.3.0 (2026-10-27) — the most recent PAST earnings report (program register
+A4, post-earnings quarantine data lane). WHY: the first funded ticket (FRST.US,
+26 Oct 2026) was bought two sessions after a 22% EPS miss (Q3 reported 22 Oct
+after the close; -4.1% and -3.7% on heavy volume the next sessions). Every
+earnings path in this module looks FORWARD only (d >= today), so the system
+could not know a name had just reported, let alone missed. ADDED (pure
+addition, nothing existing changes): fetch_last_earnings_map() /
+fetch_last_earnings_sync() — one batched EODHD /calendar/earnings call per
+TFB_CALENDAR_EARNINGS_CHUNK symbols over [today - TFB_CALENDAR_DAYS_BACK
+(default 21, 1..120), today - 1]; per symbol the LATEST report date in that
+window plus its EPS surprise % (the payload's 'percent' when numeric, else
+(actual - estimate) / |estimate| x 100 when both are numeric and the estimate
+is not 0), actual, estimate and before/after-market timing. A same-day report
+stays the forward path's business (next earnings = today). KSA symbols are
+skipped exactly like the forward path (EODHD has no Saudi coverage); no Yahoo
+fallback for past reports in this version. fetch_event_context is untouched,
+so track_performance and the v1.1.x calendar sync read byte-identical data.
+Consumer: scripts/run_calendar_sync.py v1.2.0 behind TFB_CAL_LAST_REPORT.
+Zero functions removed; additions: fetch_last_earnings_map,
+fetch_last_earnings_sync, _num.
 
 v1.2.2 — retry Yahoo when either earnings or ex-dividend is missing.
 Each event fills independently; existing EODHD dates are never overwritten.
@@ -117,6 +138,7 @@ ENV
     TFB_CALENDAR_ENABLED              "1" enables (DEFAULT OFF)
     TFB_CALENDAR_TIMEOUT_SEC          per-request timeout   (default 12)
     TFB_CALENDAR_DAYS_AHEAD           earnings look-ahead   (default 45)
+    TFB_CALENDAR_DAYS_BACK            v1.3.0 last-report look-back (default 21)
     TFB_CALENDAR_DIV_DAYS_AHEAD       ex-div look-ahead     (default 90)
     TFB_CALENDAR_EARNINGS_CHUNK       symbols per earnings call (default 50)
     TFB_CALENDAR_CONCURRENCY          parallel dividend calls   (default 4)
@@ -147,7 +169,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -162,6 +184,8 @@ __all__ = [
     "fetch_next_exdiv_map",
     "fetch_ipos",
     "fetch_ipos_sync",
+    "fetch_last_earnings_map",
+    "fetch_last_earnings_sync",
 ]
 
 # ----------------------------------------------------------------------------- #
@@ -344,6 +368,87 @@ async def fetch_earnings_map(symbols: List[str],
         return out
     except Exception as e:  # blanket: a calendar hiccup must never propagate
         logger.error("[calendar_provider v%s] fetch_earnings_map failed: %s",
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
+        return {}
+
+
+# ----------------------------------------------------------------------------- #
+# v1.3.0 - the most recent PAST earnings report (batched like the forward map)
+# ----------------------------------------------------------------------------- #
+def _num(raw: Any) -> Optional[float]:
+    """Finite float or None (bools, blanks and text are not numbers)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+async def fetch_last_earnings_map(symbols: List[str],
+                                  days_back: Optional[int] = None
+                                  ) -> Dict[str, Dict[str, Any]]:
+    """{ORIGINAL_SYMBOL: {"last_earnings_date": 'YYYY-MM-DD',
+    "eps_surprise_pct": float|None, "eps_actual": float|None,
+    "eps_estimate": float|None, "report_timing": str|None}} for the LATEST
+    report in [today - days_back, today - 1]. Empty when disabled, on any
+    error, or for symbols with no report in the window. KSA symbols skipped
+    (no EODHD coverage)."""
+    if not is_enabled():
+        return {}
+    try:
+        code_map, _ksa = _split_symbols(symbols)
+        if not code_map:
+            return {}
+        today = _today()
+        back = days_back or _env_int("TFB_CALENDAR_DAYS_BACK", 21, lo=1, hi=120)
+        start = today - _dt.timedelta(days=back)
+        end = today - _dt.timedelta(days=1)
+        chunk = _env_int("TFB_CALENDAR_EARNINGS_CHUNK", 50, lo=1, hi=200)
+        codes = sorted(code_map)
+        out: Dict[str, Dict[str, Any]] = {}
+        async with _client() as client:
+            for i in range(0, len(codes), chunk):
+                batch = codes[i:i + chunk]
+                try:
+                    payload = await _get_json(client, "/calendar/earnings", {
+                        "from": _iso(start), "to": _iso(end),
+                        "symbols": ",".join(batch),
+                    })
+                except Exception as e:
+                    logger.error("[calendar_provider v%s] last-earnings batch "
+                                 "failed (%d syms): %s", __version__, len(batch),
+                                 safe_error_text(e, secret_values=(_api_key(),)))
+                    continue
+                items = payload.get("earnings") if isinstance(payload, dict) else payload
+                for it in items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    code = str(it.get("code") or it.get("symbol") or "").strip().upper()
+                    d = _parse_date(it.get("report_date") or it.get("date"))
+                    orig = code_map.get(code)
+                    if not orig or d is None or d < start or d > end:
+                        continue
+                    prev = _parse_date((out.get(orig) or {}).get("last_earnings_date"))
+                    if prev is not None and d <= prev:   # keep the LATEST report
+                        continue
+                    actual, estimate = _num(it.get("actual")), _num(it.get("estimate"))
+                    surprise = _num(it.get("percent"))
+                    if surprise is None and actual is not None and estimate:
+                        surprise = (actual - estimate) / abs(estimate) * 100.0
+                    timing = str(it.get("before_after_market") or "").strip() or None
+                    out[orig] = {
+                        "last_earnings_date": _iso(d),
+                        "eps_surprise_pct": (round(surprise, 1)
+                                             if surprise is not None else None),
+                        "eps_actual": actual,
+                        "eps_estimate": estimate,
+                        "report_timing": timing,
+                    }
+        return out
+    except Exception as e:  # blanket: a calendar hiccup must never propagate
+        logger.error("[calendar_provider v%s] fetch_last_earnings_map failed: %s",
                      __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return {}
 
@@ -665,6 +770,13 @@ def fetch_event_context_sync(symbols: List[str]) -> Dict[str, Dict[str, Optional
 
 def fetch_ipos_sync(days_ahead: int = 30) -> List[Dict[str, Any]]:
     return _run_sync(fetch_ipos(days_ahead))
+
+
+def fetch_last_earnings_sync(symbols: List[str],
+                             days_back: Optional[int] = None
+                             ) -> Dict[str, Dict[str, Any]]:
+    """v1.3.0: sync wrapper of fetch_last_earnings_map."""
+    return _run_sync(fetch_last_earnings_map(symbols, days_back))
 
 
 # ----------------------------------------------------------------------------- #
