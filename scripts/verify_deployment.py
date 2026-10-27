@@ -271,7 +271,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("archive_to_bigquery", "1.0.0", "bigquery archive"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
-    ("news_macro_gate", "1.0.1", "news macro gate"),
+    ("news_macro_gate", "1.0.2", "news macro gate"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)

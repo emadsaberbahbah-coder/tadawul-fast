@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_news_macro_gate.py - scripts/news_macro_gate.py v1.0.1 (v1.0.0 + G8 credentials).
+"""tests/test_news_macro_gate.py - scripts/news_macro_gate.py v1.0.2 (v1.0.1 + G7 memory, English wires).
 
 WHY (2026-10-28): the owner asked for the hand-made macro and news check
 before every GO/NO-GO to run by itself, grade its sources, and keep a record
@@ -25,6 +25,11 @@ Pinned here:
      thresholds; names BLOCK (8-K 4.02) / WATCH (negative confirmed news) /
      INFO (8-K 2.02)
   G6 FOMC decision times follow US daylight saving (18:00 / 19:00 UTC)
+  G7 (v1.0.2) memory: a situation recorded by an earlier run stays in the
+     clusters while it can move the verdict (24 h macro, 72 h a name), so a
+     second fetch that misses the wire story keeps NO_NEW_ENTRY; English
+     Google-News confirms a Gulf story when GDELT is throttled; INFO flags
+     reach the Names Flagged cell
   G7 end to end: write mode creates the three tabs with headers, appends,
      deduplicates items on the next run, upserts an economic release when
      its actual arrives; dry run writes nothing; a failing source is named
@@ -148,15 +153,24 @@ ECON_US = [
 ECON_SA = [{"type": "Inflation Rate", "comparison": "yoy", "period": "Sep", "country": "SA",
             "date": "2026-10-27 09:00:00", "actual": None, "previous": 2.1, "estimate": 2.0,
             "change": None, "change_percentage": None}]
+GNEWS_EN_RSS = """<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>
+<item><title>Iran fires missiles at tanker in Strait of Hormuz - Reuters</title><link>https://news.google.com/rss/articles/en1</link>
+<pubDate>Wed, 28 Oct 2026 09:00:00 GMT</pubDate><source url="https://www.reuters.com">Reuters</source></item>
+<item><title>Missile strike sets tanker ablaze near Hormuz - AP News</title><link>https://news.google.com/rss/articles/en2</link>
+<pubDate>Wed, 28 Oct 2026 09:20:00 GMT</pubDate><source url="https://apnews.com">AP News</source></item>
+<item><title>Tanker hit by missile in Strait of Hormuz - BBC</title><link>https://news.google.com/rss/articles/en3</link>
+<pubDate>Wed, 28 Oct 2026 09:40:00 GMT</pubDate><source url="https://www.bbc.com">BBC</source></item>
+</channel></rss>"""
 MARKET = [{"code": "GSPC.INDX", "close": 6650.1, "previousClose": 6700.0, "change_p": -0.74},
           {"code": "VIX.INDX", "close": 18.2, "previousClose": 17.0, "change_p": 7.06}]
 
 
 class FakeHTTP:
-    def __init__(self, fail: Optional[Dict[str, int]] = None, econ_us=None):
+    def __init__(self, fail: Optional[Dict[str, int]] = None, econ_us=None, en_rss: str = ""):
         self.calls: List[str] = []
         self.fail = fail or {}
         self.econ_us = econ_us if econ_us is not None else ECON_US
+        self.en_rss = en_rss
 
     def get(self, url, params=None, headers=None, timeout=None):
         params = params or {}
@@ -182,6 +196,9 @@ class FakeHTTP:
             if '"Bad"' in q:
                 return Resp(200, text="The specified phrase is too short")
             return Resp(200, GDELT_EMPTY)
+        if url == ng.GNEWS_RSS and self.en_rss and params.get("hl") == "en-US" \
+                and "Hormuz" in params.get("q", ""):
+            return Resp(200, text=self.en_rss)
         if url == ng.GNEWS_RSS:
             return Resp(200, text=GNEWS_RSS if params.get("hl") == "ar" and "\u0647\u062c\u0648\u0645" in params.get("q", "") else
                         "<rss><channel></channel></rss>")
@@ -618,6 +635,8 @@ def test_g7_end_to_end_write_then_dedupe_and_upsert(armed):
     assert gate[2] == "NO_NEW_ENTRY"                          # Gulf escalation, 3 domains, today
     assert "FOMC rate decision" in gate[4]
     assert "BADCO.US BLOCK" in gate[6]
+    assert "FRST.US INFO: earnings released" in gate[6]                 # v1.0.2
+    assert gate[6].index("BADCO.US BLOCK") < gate[6].index("FRST.US INFO")
     assert rep["scope"][0]["symbol"] == "FRST.US" and rep["scope"][0]["role"] == "holding"
     assert {s["symbol"] for s in rep["scope"]} == {"FRST.US", "5023.SR", "BADCO.US"}   # OLD.US: older day
     assert "gdelt" in rep["sources_failed"] and "non-JSON reply" in rep["sources_failed"]["gdelt"]
@@ -634,6 +653,54 @@ def test_g7_end_to_end_write_then_dedupe_and_upsert(armed):
     fed = [r for r in sh2.tabs[ng.ECON_TAB][1:] if r[3] == "Fed Interest Rate Decision"]
     assert len(fed) == 1 and fed[0][8] == 3.5 and fed[0][10] == 0.0
     assert len(sh2.tabs[ng.GATE_TAB]) == 3
+
+
+def test_g7_memory_keeps_a_confirmed_situation_across_runs(armed):
+    """v1.0.2: on 27 Oct runs eight minutes apart read NO_NEW_ENTRY, then
+    CAUTION, because the second fetch missed the wire story (GDELT
+    throttled). The second run must still see what the first recorded."""
+    (rc, rep), sh = _run()
+    assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    writes = list(sh.writes)
+    later = NOW + dt.timedelta(hours=2)
+    (rc2, rep2), _ = _run(http=FakeHTTP(fail={"gdeltproject": 429}), sheets=sh, now=later, write=False)
+    assert rep2["gate"]["verdict"] == "NO_NEW_ENTRY"          # v1.0.1: CAUTION (one Arabic outlet left)
+    assert rep["counts"]["carried"] == 0
+    assert any(d.startswith("macro: war_escalation/hormuz grade 1, 4 sources") for d in rep2["gate"]["drivers"])
+    assert rep2["counts"]["carried"] >= 3                     # reuters, cnbc, aljazeera from run 1
+    assert sh.writes == writes                                # a dry run only reads the memory
+    (rc3, rep3), sh3 = _run(http=FakeHTTP(fail={"gdeltproject": 429}), sheets=sh, now=later)
+    assert rep3["counts"]["new"] == 0                         # nothing carried is written again
+    assert sh3.tabs[ng.GATE_TAB][-1][7].endswith(" carried")
+
+
+def test_g7_memory_respects_the_verdict_windows(armed):
+    (rc, rep), sh = _run()
+    late = NOW + dt.timedelta(hours=30)       # the Hormuz stories are > 24 h old by then
+    mem = ng.read_memory(sh, FakeSheets.SID, late, 1500)
+    assert mem and {m["scope"] for m in mem} == {"FRST.US"}   # a name story keeps 72 h
+    assert {m["source"] for m in mem} <= set(ng.MEMORY_SOURCES)   # EDGAR / Fed re-read whole
+    assert all(m["memory"] and m["published"] >= late - dt.timedelta(hours=72) for m in mem)
+    (rc2, rep2), _ = _run(http=FakeHTTP(fail={"gdeltproject": 429}), sheets=sh, now=late, write=False)
+    assert not any("war_escalation/hormuz grade 1" in d for d in rep2["gate"]["drivers"])
+    assert ng.read_memory(sh, FakeSheets.SID, late, 0) == []                 # 0 = off
+    assert ng.read_memory(workbook(), FakeSheets.SID, late, 1500) == []      # no tab yet
+
+
+def test_g7_english_wires_confirm_without_gdelt(armed):
+    """v1.0.2: GDELT throttled the runner on 27 Oct; Google-News in English
+    reaches Reuters / AP / BBC on its own."""
+    http = FakeHTTP(fail={"gdeltproject": 429}, en_rss=GNEWS_EN_RSS)
+    (rc, rep), _ = _run(http=http, write=False)
+    assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    assert any(d.startswith("macro: war_escalation/hormuz grade 1") for d in rep["gate"]["drivers"])
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
+    gq, nq = ng.build_queries(scope)
+    assert len(gq) == 7                                       # GDELT unchanged
+    en = [q for q in nq if q[3] == "en"]
+    assert [q[1] for q in en if q[0] == "MACRO"] == ["geopolitics en", "oil en", "rates en", "markets en"]
+    assert {q[0] for q in en if q[0] != "MACRO"} == {"FRST.US", "BADCO.US"}
+    assert [q[0] for q in nq if q[3] == "en-sa"] == ["5023.SR"]
 
 
 def test_g7_article_keeps_macro_and_company_scope():
@@ -733,7 +800,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.1")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.2")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -758,9 +825,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.0.1"
+    assert ng.__version__ == "1.0.2"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.0.1", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.0.2", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
