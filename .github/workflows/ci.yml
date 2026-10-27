@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.45 (2026-10-27) -- CALENDAR 404 BATCH SPLIT
+#
+# v1.1.45 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.44 are #848-#852):
+# run tests/test_calendar_split_404.py (core/providers/calendar_provider
+# v1.3.1: TFB_CALENDAR_SPLIT_404, default off -- a /calendar/earnings batch
+# that answers HTTP 404 is split so every code EODHD accepts is kept; off =
+# the v1.3.0 requests and results byte for byte) in the blocking contract
+# lane next to tests/test_calendar_last_report_a4.py (its provider legs need
+# httpx). Its golden leg reads the untouched v1.3.0 module with `git show
+# aba4e5eb`; the step fetches that commit first (a failed fetch only turns
+# the leg into a SKIP). Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.44 (2026-10-27) -- CHALLENGER MOMENTUM INPUT
 #
 # v1.1.44 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.43 are #848-#851):
@@ -1033,6 +1045,11 @@ jobs:
 
       - name: 📐 Run schema alignment
         run: |
+          # v1.1.45: the golden leg of tests/test_calendar_split_404.py reads
+          # the untouched calendar_provider v1.3.0 (aba4e5eb); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin aba4e5eb6d30064e32c416b2a2369598ae4aa412 \
+            || echo "::notice::calendar golden base not fetched - test_calendar_split_404 S1 will SKIP"
           echo "::group::pytest (contract)"
           # PY-4 (2026-07-26): the exact current-schema contract is now an
           # UNCONDITIONAL gate — previously only the legacy alignment test
@@ -1049,6 +1066,7 @@ jobs:
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
             tests/test_calendar_last_report_a4.py \
+            tests/test_calendar_split_404.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
