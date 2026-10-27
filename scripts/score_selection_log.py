@@ -29,8 +29,10 @@ WHAT (all of it only when TFB_BOARD_SCORECARD_CHALLENGER=on):
     symbols and references join the fetch; board price coverage is unchanged).
   * challenger_compare(): per order - trading days (distinct logged UTC
     days Monday-Friday; a weekend log still yields episodes, never a day),
-    episodes, scored at +5, hit % at +5 vs reference (vs SPUS when no
-    reference), mean and worst excess at +5 vs reference, entries per
+    episodes, scored at +5, hit % at +5 vs reference (vs SPUS only when the
+    name maps to no reference; a mapped reference without prices for the
+    window leaves the episode unscored), mean and worst excess at +5 vs
+    reference, entries per
     trading day (churn), mean +5 vs SPUS - and ONE verdict by the
     pre-registered rule: NO_DATA (no trading day logged); INSUFFICIENT_DATA
     (< 20 trading days or < 40 scored +5 episodes in either order, window
@@ -997,16 +999,20 @@ def challenger_compare(scored_by_order: Dict[str, List[Dict[str, Any]]],
                        days_by_order: Dict[str, int]) -> Tuple[List[List[Any]], Dict[str, Any]]:
     """v1.2.0: CHALLENGER_HEADER rows (one per order + one verdict row) and the
     statistics. Hit/mean/worst use the +5 excess vs the reference (vs SPUS
-    when the episode has no reference); churn = episodes opened per trading
-    day logged."""
+    only when the episode maps to no reference; a mapped reference without
+    prices for the window -> unscored, never SPUS); churn = episodes opened
+    per trading day logged."""
     rows: List[List[Any]] = []
     per: Dict[str, Dict[str, Any]] = {}
     for order in SHADOW_ORDERS:
         sub = scored_by_order.get(order, [])
         xs = []
         for sc in sub:
-            v = sc["xr"].get(5)
-            xs.append(sc["x"].get(5) if v is None else v)
+            # vs SPUS only when the episode has NO reference mapping; a mapped
+            # reference without prices for the window leaves it unscored (the
+            # metric never switches benchmark on price availability).
+            v = sc["xr"].get(5) if (sc["ep"].get("ref") or "") else sc["x"].get(5)
+            xs.append(v)
         xs = [v for v in xs if v is not None]
         sp = [sc["x"].get(5) for sc in sub if sc["x"].get(5) is not None]
         days = days_by_order.get(order, 0)
@@ -2233,6 +2239,11 @@ def selftest() -> int:
         {"CHAMPION": [r23], "CHALLENGER": []}, {"CHAMPION": 1, "CHALLENGER": 0})
     assert [r[0] for r in rows24] == ["CHAMPION", "CHALLENGER", "Verdict"]
     assert rows24[0][1:5] == [1, 1, 1, 100.0] and st24["verdict"] == "NO_DATA"
+    # a mapped reference whose series is missing: unscored, never vs SPUS
+    r_miss = dict(r23, ep=dict(r23["ep"], ref="XLF.US"))
+    rows24m, _st = challenger_compare(
+        {"CHAMPION": [r23, r_miss], "CHALLENGER": []}, {"CHAMPION": 1, "CHALLENGER": 0})
+    assert rows24m[0][1:5] == [1, 2, 1, 100.0], rows24m[0]
     assert all(len(r) == len(CHALLENGER_HEADER) for r in rows24)
     ok += 1
     print(f"SELFTEST {ok}/24: ALL GREEN")

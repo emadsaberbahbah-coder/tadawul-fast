@@ -1222,13 +1222,15 @@ def main():
         b0, b5 = _line(50.0, gr, j), _line(50.0, gr, j + 5)
         return (c5 / c0 - 1.0) * 100.0 - (b5 / b0 - 1.0) * 100.0
 
-    def _ch_expect(exp, days):
+    def _ch_expect(exp, days, xlf_missing=False):
         """Independent per-order rows: +5 excess vs the reference (SPUS for
-        'Banks'), hit %, mean, worst, entries per trading day, mean vs SPUS."""
+        'Banks', which maps to none), hit %, mean, worst, entries per trading
+        day, mean vs SPUS. xlf_missing: the mapped XLF.US series is absent,
+        so its episodes are unscored (never re-scored vs SPUS)."""
         rows_ = []
         for o in ("CHAMPION", "CHALLENGER"):
             lst = exp[o]
-            xs = [_x5(g, gr, j) for (_s, j, g, gr) in lst]
+            xs = [_x5(g, gr, j) for (_s, j, g, gr) in lst if not (xlf_missing and gr == G_XLF)]
             sp = [_x5(g, G_SPUS, j) for (_s, j, g, _gr) in lst]
             rows_.append([o, str(days), str(len(lst)), str(len(xs)),
                           _f(100.0 * sum(1 for v in xs if v > 0) / len(xs)), _f(statistics.fmean(xs)),
@@ -1277,6 +1279,22 @@ def main():
 
     # promote: first event of the UTC day only, Saturday not a trading day
     p_grid, p_sh, p_px, p_exp, p_unp, p_days, _v, _r = ch_fx["P"]
+
+    # a MAPPED reference without prices (XLF.US absent) leaves its episodes
+    # unscored - never vs SPUS (review on #851); 'Banks' (no mapping) still
+    # scores vs SPUS
+    px_noxlf = os.path.join(TMP, "ch_P_px_noxlf.csv")
+    _write_prices(px_noxlf, [r for r in _read_csv(p_px)[1:] if r[0] != "XLF.US"])
+    od = os.path.join(TMP, "p13_P_noxlf")
+    rc, so = _run_mod(m, None, "observe", od, ch_board_tsv, px_noxlf, rk="on", asof=CH_ASOF, ch="on",
+                      shadow=p_sh)
+    blk = _ch_block(od)
+    T("P13 P without XLF.US: the 100 Financial Services episodes per order stay unscored, the 25 'Banks' "
+      "ones score vs SPUS -> INSUFFICIENT_DATA (the metric never switches benchmark)",
+      rc == 0 and blk[1:3] == _ch_expect(p_exp, p_days, xlf_missing=True)
+      and blk[1][:4] == ["CHAMPION", "25", "125", "25"] and blk[2][:4] == ["CHALLENGER", "25", "125", "25"]
+      and blk[3][1] == "INSUFFICIENT_DATA (days 25, scored 25/25; days 25/20, scored +5 25/25 (need 40 each))",
+      (blk[1:], _ch_expect(p_exp, p_days, xlf_missing=True)))
     od_p = os.path.join(TMP, "p13_P")
     blk_p = _ch_block(od_p)
     T("P13 P: 125 episodes per order although day 1 and day 7 carry a later event and 09-05 (Saturday) "
