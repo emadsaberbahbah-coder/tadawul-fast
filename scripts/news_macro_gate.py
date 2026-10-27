@@ -2,8 +2,39 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.0.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.0.1 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.0.1 (2026-10-28) -- --write NEEDS A WORKBOOK SESSION
+WHY (Codex re-review on PR #859; the fix was pushed after the owner merged
+  the PR at 45748da0, so it lands here): with DEFAULT_SPREADSHEET_ID set
+  but GOOGLE_SHEETS_CREDENTIALS missing or unreadable, no Sheets session was
+  opened and run() skipped its write block - a scheduled --write ran as a
+  silent dry run (no scope, no tabs written) and still exited 0.
+WHAT: main() returns 2 before collecting anything when --write has no
+  usable Sheets session, and says so; a session that fails to open is
+  reported (exception type only).
+  Second fix (first live dry run 40595558188, 28 Oct 22:32 UTC, still
+  collecting after 10 minutes): a throttled or unreachable provider cost
+  about a minute per query (two 25 s attempts plus the back-off), with no
+  bound across ~20 queries, so the 20-minute job limit was within reach.
+  Each multi-query source (gdelt, google_news, edgar) now stops after 2
+  consecutive failed queries (circuit open) or once its time budget is spent
+  (SOURCE_BUDGET_S: gdelt 240 s, google_news 120 s, edgar 150 s); skipped
+  queries are counted in its failure note. The per-request timeout is 20 s
+  (TFB_NEWS_GATE_TIMEOUT_S, 5..60). A GDELT plain-text answer (malformed
+  query) is an answer, not a breaker failure. One progress line per source
+  ("[news_gate v1.0.1] gdelt: N items in Ts | failures") shows in the log.
+  Third fix, from the same live run (verdict NO_NEW_ENTRY on 28 Oct 01:32
+  Riyadh): its Iran cluster led with "oil falls as diplomatic efforts to
+  contain the Iran war grow" - the bare Arabic word for war (harb) is a
+  topic, not an escalation. Taxonomy: harb removed from war_escalation;
+  war outbreak / declaration, attacks and a burning or hit tanker (EN + AR)
+  added; ending the war, diplomatic efforts and containment (EN + AR) added
+  to de_escalation. EODHD's "FOMC Statement" no longer doubles the FOMC
+  driver (FOMC_NAME_RE).
+ROLLBACK: revert this file to v1.0.0 (78faeb6e).
+--------------------------------------------------------------------------------
+v1.0.0 (2026-10-28)
 WHY (owner request 28 Oct 2026, 00:01-00:15 Riyadh): every GO/NO-GO since the
 first ticket (26 Oct) has needed a hand-made macro and news check (war news,
 energy prices, the Fed, each name's own news), and the existing news archive
@@ -76,7 +107,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -94,6 +125,12 @@ EODHD_ECON = "https://eodhd.com/api/economic-events"
 EODHD_RT = "https://eodhd.com/api/real-time/{code}"
 
 ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market")
+# v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
+# once its time budget is spent, so one throttled provider cannot hold the job
+# to its 20-minute limit (dry run 40595558188 sat in collection > 10 min).
+SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
+                   "fed_rss": 45.0, "econ": 60.0, "market": 45.0}
+BREAKER_FAILURES = 2
 
 GATE_TAB = "_News_Gate"
 ITEMS_TAB = "_News_Items"
@@ -175,6 +212,8 @@ FOMC_DECISION_DAYS = (
     "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28",
     "2027-09-15", "2027-10-27", "2027-12-08",
 )
+FOMC_NAME_RE = re.compile(r"(fomc|interest rate decision|fed funds|federal funds|fed press conference|"
+                          r"economic projections)", re.I)
 HIGH_ECON_RE = re.compile(
     r"(nonfarm|non farm|payrolls|\bcpi\b|consumer price|inflation rate|interest rate decision|"
     r"fed funds|fomc|gdp growth|gdp annualized|\bpce\b|retail sales|unemployment rate|"
@@ -651,7 +690,10 @@ def scheduled_events(now: _dt.datetime, econ: Sequence[Dict[str, Any]],
             continue
         if now - _dt.timedelta(hours=behind_h) <= e["date"] <= now + _dt.timedelta(hours=ahead_h):
             name = e["type"]
-            if "interest rate decision" in name.lower() and ("US", "FOMC rate decision", e["date"].date()) in seen:
+            # v1.0.1: EODHD names the same meeting "FOMC Statement", "Fed
+            # Interest Rate Decision", "FOMC Press Conference"... - one driver
+            # per decision day (live dry run 40595558188 listed it twice).
+            if FOMC_NAME_RE.search(name) and ("US", "FOMC rate decision", e["date"].date()) in seen:
                 continue
             out.append({"when": e["date"], "country": e["country"], "event": name, "source": "eodhd"})
     out.sort(key=lambda x: x["when"])
@@ -777,9 +819,46 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
 # ----------------------------------------------------------------------------- #
 # HTTP collectors (injected session: .get(url, params=, headers=, timeout=))
 # ----------------------------------------------------------------------------- #
+class _Guard:
+    """v1.0.1: per-source circuit breaker + time budget."""
+
+    def __init__(self, col: "Collector", src: str):
+        self.col, self.src = col, src
+        self.t0 = col.clock()
+        self.budget = SOURCE_BUDGET_S.get(src, 120.0)
+        self.consecutive = 0
+        self.skipped = 0
+        self.open = False
+
+    def allow(self) -> bool:
+        if self.open or (self.col.clock() - self.t0) >= self.budget:
+            self.skipped += 1
+            return False
+        return True
+
+    def success(self) -> None:
+        self.consecutive = 0
+
+    def failure(self) -> None:
+        self.consecutive += 1
+        if self.consecutive >= BREAKER_FAILURES:
+            self.open = True
+
+    def close(self) -> None:
+        if not self.skipped:
+            return
+        why = (f"circuit open after {BREAKER_FAILURES} consecutive failures" if self.open
+               else f"time budget {self.budget:.0f}s spent")
+        prev = self.col.failed.get(self.src, "")
+        self.col.failed[self.src] = (((prev[:110] + "; ") if prev else "")
+                                     + f"{why}; {self.skipped} queries skipped")[:240]
+
+
 class Collector:
-    def __init__(self, http: Any, sleep: Callable[[float], None], now: _dt.datetime):
-        self.http, self.sleep, self.now = http, sleep, now
+    def __init__(self, http: Any, sleep: Callable[[float], None], now: _dt.datetime,
+                 clock: Callable[[], float] = time.monotonic):
+        self.http, self.sleep, self.now, self.clock = http, sleep, now, clock
+        self.timeout = _float_env("TFB_NEWS_GATE_TIMEOUT_S", 20.0, 5.0, 60.0)
         self.ok: Dict[str, int] = {}
         self.failed: Dict[str, str] = {}
 
@@ -787,7 +866,7 @@ class Collector:
              headers: Optional[Dict[str, str]] = None, retry_wait: float = 8.0) -> Any:
         for attempt in (1, 2):
             try:
-                resp = self.http.get(url, params=params, headers=headers or {}, timeout=25)
+                resp = self.http.get(url, params=params, headers=headers or {}, timeout=self.timeout)
             except Exception as exc:  # network error
                 if attempt == 2:
                     raise RuntimeError(f"{type(exc).__name__}: {exc}")
@@ -812,7 +891,10 @@ class Collector:
     def gdelt(self, queries: Sequence[Tuple[str, str, str]], spacing: float,
               timespan: str = "24h") -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "gdelt")
         for i, (scope, label, q) in enumerate(queries):
+            if not guard.allow():
+                continue
             if i:
                 self.sleep(spacing)
             try:
@@ -824,19 +906,27 @@ class Collector:
                     payload = resp.json()
                 except ValueError:
                     # GDELT answers a malformed query with a plain-text message
+                    # (the service answered: not a breaker failure)
                     self._fail("gdelt", f"{label}: non-JSON reply: {str(getattr(resp, 'text', ''))[:100]}")
+                    guard.success()
                     continue
                 got = parse_gdelt(payload, scope, label)
                 out.extend(got)
                 self._note("gdelt", len(got))
+                guard.success()
             except Exception as exc:
                 self._fail("gdelt", f"{label}: {exc}")
+                guard.failure()
+        guard.close()
         return out
 
     # -- Google News RSS ---------------------------------------------------------
     def google_news(self, queries: Sequence[Tuple[str, str, str, str]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "google_news")
         for i, (scope, label, q, lang) in enumerate(queries):
+            if not guard.allow():
+                continue
             if i:
                 self.sleep(1.0)
             params = {"ar": {"q": q, "hl": "ar", "gl": "SA", "ceid": "SA:ar"},
@@ -847,8 +937,11 @@ class Collector:
                 got = parse_rss(resp.text, scope, label, "google_news", lang[:2])
                 out.extend(got)
                 self._note("google_news", len(got))
+                guard.success()
             except Exception as exc:
                 self._fail("google_news", f"{label}: {exc}")
+                guard.failure()
+        guard.close()
         return out
 
     # -- Fed RSS ----------------------------------------------------------------
@@ -879,6 +972,7 @@ class Collector:
             return [], names
         out: List[Dict[str, Any]] = []
         since = self.now - _dt.timedelta(days=30)
+        guard = _Guard(self, "edgar")
         for sym in symbols:
             if not sym.upper().endswith(".US"):
                 continue
@@ -888,14 +982,19 @@ class Collector:
                 continue
             cik, title = hit
             names[sym] = title
+            if not guard.allow():
+                continue
             self.sleep(0.15)
             try:
                 payload = self._get("edgar", EDGAR_SUBMISSIONS.format(cik=cik), headers=hdr).json()
                 got = parse_edgar_submissions(payload, sym, cik, since)
                 out.extend(got)
                 self._note("edgar", len(got))
+                guard.success()
             except Exception as exc:
                 self._fail("edgar", f"{sym}: {exc}")
+                guard.failure()
+        guard.close()
         if "edgar" not in self.ok and "edgar" not in self.failed:
             self.ok["edgar"] = 0
         return out, names
@@ -1226,24 +1325,47 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     econ: List[Dict[str, Any]] = []
     market: Dict[str, Dict[str, Any]] = {}
     symbols = [s["symbol"] for s in scope]
+    def stage(src: str, n: int, t0: float) -> None:
+        # v1.0.1: one progress line per source, so a live log shows where the
+        # time goes (the digest only prints at the end).
+        why = col.failed.get(src, "")
+        _out(f"[news_gate v{__version__}] {src}: {n} items in {col.clock() - t0:.0f}s"
+             + (f" | {why[:160]}" if why else ""))
+
+    _out(f"[news_gate v{__version__}] scope {len(scope)}: " + ", ".join(symbols)[:300])
     if "edgar" in sources:
+        t0 = col.clock()
         got, sec_names = col.edgar(symbols, _env("TFB_SEC_USER_AGENT"))
         raw.extend(got)
         for s in scope:
             if not s.get("name") and s["symbol"] in sec_names:
                 s["name"] = sec_names[s["symbol"]]
+        stage("edgar", len(got), t0)
     gq, nq = build_queries(scope)
     if "gdelt" in sources:
-        raw.extend(col.gdelt(gq, _float_env("TFB_NEWS_GATE_GDELT_SPACING_S", 6.0, 0.0, 60.0)))
+        t0 = col.clock()
+        got = col.gdelt(gq, _float_env("TFB_NEWS_GATE_GDELT_SPACING_S", 6.0, 0.0, 60.0))
+        raw.extend(got)
+        stage("gdelt", len(got), t0)
     if "google_news" in sources:
-        raw.extend(col.google_news(nq))
+        t0 = col.clock()
+        got = col.google_news(nq)
+        raw.extend(got)
+        stage("google_news", len(got), t0)
     if "fed_rss" in sources:
-        raw.extend(col.fed_rss())
+        t0 = col.clock()
+        got = col.fed_rss()
+        raw.extend(got)
+        stage("fed_rss", len(got), t0)
     key = _env("EODHD_API_KEY")
     if "econ" in sources:
+        t0 = col.clock()
         econ = col.econ(key)
+        stage("econ", len(econ), t0)
     if "market" in sources:
+        t0 = col.clock()
         market = col.market(key)
+        stage("market", len(market), t0)
 
     items = classify_all(raw, clf, now)
     classified = [i for i in items if i.get("event_type") and i["event_type"] != "law_firm_noise"]
@@ -1340,7 +1462,17 @@ def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any 
     if http is None:  # pragma: no cover - live run
         http = make_http_session()
     if sheets is None and sid and _credentials_info():  # pragma: no cover - live run
-        sheets = make_sheets_session()
+        try:
+            sheets = make_sheets_session()
+        except Exception as exc:
+            _out(f"[news_gate v{__version__}] could not open the workbook session: {type(exc).__name__}")
+            sheets = None
+    if args.write and sheets is None:
+        # A scheduled --write without a usable Sheets session must not pass
+        # as a quiet dry run (Codex P2, #859).
+        _out(f"[news_gate v{__version__}] --write needs readable GOOGLE_SHEETS_CREDENTIALS - "
+             "nothing collected, nothing written")
+        return 2
     max_names = _int_env("TFB_NEWS_GATE_MAX_NAMES", 15, 0, 60)
     scope: List[Dict[str, str]] = []
     if sheets is not None and sid:
