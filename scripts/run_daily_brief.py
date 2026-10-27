@@ -555,7 +555,25 @@ from __future__ import annotations
 # (harness: corpus comparison against the v1.18.0 copy). ZERO functions
 # removed. Added: _feed_release_expiry (a lockstep copy shared verbatim with
 # send_digest and tfb_acceptance) and _feed_veto_label.
-__version__ = "1.18.1"
+# ---------------------------------------------------------------------------
+# v1.19.0 (2026-10-27) -- [POST-EARNINGS-HELD] (program register A4 part 2)
+# WHY: 16_Decision_Top10 v1.18.0 puts '\u26a0 post-earnings S/L \u00b7 EPS x% \u00b7 '
+#   on the Advisor Note of a SELECTED seat inside its post-earnings
+#   quarantine (interim trading policy rule 3: 5 weekday sessions after a
+#   report, 10 after a negative EPS surprise) while the cockpit's Script
+#   Property DT10_POST_EARN is armed. Such a note no longer begins with
+#   INVEST, so extract_top10 left the seat out of the picks SILENTLY
+#   (independent review of PR #855).
+# CHANGE: the seat stays out of the picks and the brief now says so -
+#   extract_top10 records each tagged seat that would otherwise have been a
+#   pick (positive INVEST note under the tag, shares > 0, a confirmed
+#   stability, not held) in top10['post_earnings_held'] and
+#   _post_earnings_held_line(model) prints one factual sentence on all three
+#   surfaces (HTML / PDF / text), next to the v1.17.0 earnings line. No tag
+#   on the sheet -> no key and no line: the v1.18.1 output byte for byte.
+# ZERO functions removed. Added: _POST_EARN_NOTE_RE, _post_earnings_note,
+#   _post_earnings_held_line.
+__version__ = "1.19.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -1272,6 +1290,12 @@ def _rulebook_blocked(sym: str) -> Optional[str]:
 _UNIT_COHERENCE_TAG = "[UNIT-COHERENCE v1.17.0]"
 _CAND_EARN_TAG = "[CAND-EARNINGS-GUARD v1.17.0]"
 _EARN_NOTE_RE = re.compile(r"earnings\s*(?:\u2264|<=|<)\s*(\d+)\s*d", re.IGNORECASE)
+# v1.19.0 [POST-EARNINGS-HELD]: the cockpit's post-earnings tag (16_Decision_Top10
+# v1.18.0) at the head of a note, after an optional forward earnings tag.
+_POST_EARN_NOTE_RE = re.compile(
+    r"^(?P<fwd>\u26a0\ufe0f?\s*earnings\s*(?:\u2264|<=)\s*\d+\s*d\s*[\u00b7|:]\s*)?"
+    r"\u26a0\ufe0f?\s*post-earnings\s+(?P<s>\d+)\s*/\s*(?P<l>\d+)\s*\u00b7\s*"
+    r"EPS\s+(?P<eps>[^\u00b7]+?)\s*\u00b7\s*", re.IGNORECASE)
 
 
 def _unit_coherence_enabled() -> bool:
@@ -1381,6 +1405,32 @@ def _filter_candidates_earnings(top10: Dict[str, Any],
     if held:
         top10["earnings_held"] = held
     return top10, held
+
+
+def _post_earnings_note(note: Any) -> Optional[Dict[str, Any]]:
+    """v1.19.0: the cockpit's post-earnings tag at the head of a note (after
+    an optional forward earnings tag) -> {'sessions', 'limit', 'eps', 'rest'}
+    where rest is the note without the tag; None when there is no tag."""
+    text = str(note or "")
+    m = _POST_EARN_NOTE_RE.match(text)
+    if not m:
+        return None
+    return {"sessions": int(m.group("s")), "limit": int(m.group("l")),
+            "eps": m.group("eps").strip(), "rest": (m.group("fwd") or "") + text[m.end():]}
+
+
+def _post_earnings_held_line(model: Dict[str, Any]) -> str:
+    """v1.19.0: one factual sentence for all three surfaces."""
+    held = ((model.get("top10") or {}).get("post_earnings_held")) or []
+    if not held:
+        return ""
+    parts = ["%s (session %d of %d, EPS %s)" % (h.get("symbol"), int(h.get("sessions") or 0),
+                                                 int(h.get("limit") or 0), h.get("eps") or "n/a")
+             for h in held]
+    return ("%d candidate(s) held back \u2014 reported earnings recently "
+            "(post-earnings quarantine, interim rule 3): %s. "
+            "They re-enter automatically when the quarantine ends."
+            % (len(held), ", ".join(parts)))
 
 
 def _earnings_held_line(model: Dict[str, Any]) -> str:
@@ -1535,6 +1585,7 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
         "shares": _col_index(hdr, "Shares"),
         "stability": _col_index(hdr, "Stability"),
     }
+    post_held: List[Dict[str, Any]] = []   # v1.19.0 [POST-EARNINGS-HELD]
     for r in rows[h + 1:]:
         note = _s(_cell(r, ci["note"]))
         symbol = _s(_cell(r, ci["symbol"]))
@@ -1542,14 +1593,23 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
             break  # spacer, empty-table marker or another table's header
         # v1.13.0: tag-tolerant — v1.6.0 prefixes "⚠ earnings ≤Nd · " before
         # INVEST; grace/exit notes carry no INVEST and stay excluded.
+        post = None
         if not _positive_invest_note(note):
-            continue
+            # v1.19.0: a seat inside its post-earnings quarantine is held back
+            # below and named, never dropped silently.
+            post = _post_earnings_note(note)
+            if post is None or not _positive_invest_note(post["rest"]):
+                continue
         if ci["shares"] is not None and (_num(_cell(r, ci["shares"])) or 0) <= 0:
             continue
         if re.search(r"GRACE|FAST-TRACK|SUSPENDED|RESEARCH|NO ALLOCATION",
                      _s(_cell(r, ci["stability"])), re.I):
             continue
         if symbol.upper() in exclude:
+            continue
+        if post is not None:
+            post_held.append({"symbol": symbol, "sessions": post["sessions"],
+                              "limit": post["limit"], "eps": post["eps"]})
             continue
         picks.append({
             "symbol": symbol,
@@ -1571,7 +1631,10 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
     rest: Dict[str, List[Dict[str, Any]]] = {}
     for p in picks[top_n:]:
         rest.setdefault(p["market"], []).append(p)
-    return {"top": top, "rest": rest}
+    out: Dict[str, Any] = {"top": top, "rest": rest}
+    if post_held:   # v1.19.0: absent when no seat carries the tag (v1.18.1 shape)
+        out["post_earnings_held"] = post_held
+    return out
 
 
 def _brief_levels_enabled() -> bool:
@@ -2622,7 +2685,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   <tr><td style="padding:10px 32px 0 32px;">
     <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">{opp_intro}</div>
     {funnel_html}{opp_rows}{rest_block}
-    {('<div style="font-family:' + SANS + '; font-size:11px; color:#B26B00; line-height:1.6; padding:8px 2px 0 2px;">&#9888;&#65039; ' + _esc(_earnings_held_line(model)) + '</div>') if _earnings_held_line(model) else ''}
+    {('<div style="font-family:' + SANS + '; font-size:11px; color:#B26B00; line-height:1.6; padding:8px 2px 0 2px;">&#9888;&#65039; ' + _esc(_earnings_held_line(model)) + '</div>') if _earnings_held_line(model) else ''}{('<div style="font-family:' + SANS + '; font-size:11px; color:#B26B00; line-height:1.6; padding:8px 2px 0 2px;">&#9888;&#65039; ' + _esc(_post_earnings_held_line(model)) + '</div>') if _post_earnings_held_line(model) else ''}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
   </td></tr>
 {_shadow_rotation_html(model)}
@@ -3156,6 +3219,10 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         _ehl = _earnings_held_line(model)
         if _ehl:
             story.append(Paragraph("!! " + _ehl, st_note))
+        # v1.19.0 [POST-EARNINGS-HELD]
+        _pehl = _post_earnings_held_line(model)
+        if _pehl:
+            story.append(Paragraph("!! " + _esc(_pehl), st_note))
         # v1.9.0: FV saturation judged once over everything listed here.
         _pdf_all = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
                                      for p in names]
@@ -3356,6 +3423,10 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     if t.get("withheld_reason"):
         lines += ["", "NEW OPPORTUNITIES WITHHELD: " + t["withheld_reason"],
                   "  No executable new-buy candidates are shown."]
+    # v1.19.0 [POST-EARNINGS-HELD]: shown even when no candidate is left.
+    _pehl_t = _post_earnings_held_line(model)
+    if _pehl_t:
+        lines += ["", "  !! " + _pehl_t]
     if t["top"]:
         _sat_t = _fv_saturation(list(t["top"]))
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
