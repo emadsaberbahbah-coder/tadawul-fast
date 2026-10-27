@@ -10,8 +10,8 @@ WIRING  W1-W14  the three gates through the real builder entry point
                 (build_opportunity_payload) at a pinned clock, 2026-10-13
                 17:37 UTC (a Tuesday: NYSE open, LSE and Bursa closed).
 NEG     N1-N4   off spellings, never-raise, ASCII, rule not widened.
-GOLD    G1-G2   against a base copy of v1.27.2 = main (TFB_TEST_OB_BASE =
-                path to `git show df99bcf3:core/analysis/opportunity_builder.py`):
+GOLD    G1-G2   against a base copy of v1.28.0 = main (TFB_TEST_OB_BASE =
+                path to `git show e8337a16:core/analysis/opportunity_builder.py`):
                 OFF payload byte-identical; the armed env does nothing on base.
 
 Real exchange_calendars cases SKIP when the package is absent (the lean CI
@@ -125,7 +125,9 @@ def canon(payload):
     p = copy.deepcopy(payload)
     p.get("meta", {}).pop("generated_at_utc", None)
     text = json.dumps(p, sort_keys=True, default=str)
-    return re.sub(r"1\.2[67]\.[0-3]", "<ver>", text)
+    # 2026-10-27 merge of #778: the stamps now read 1.28.0 (main, the golden
+    # base) and 1.28.1 (this build).
+    return re.sub(r"1\.2[678]\.[0-3]", "<ver>", text)
 
 
 def by_symbol(payload):
@@ -399,7 +401,7 @@ def case_n3_ascii_text(mp, _tmp):
     added = src[src.index("def _venue_next_close("):src.index("def _data_trust_assessment(")]
     assert added.isascii() and src[src.index("def _venue_suffix("):
                                    src.index("def _venue_state(")].isascii()
-    block = src[src.index("# v1.27.3 (2026-10-13, renumbered 2026-10-19 and 2026-10-22) [TOP10 DATA-QUALITY]"):
+    block = src[src.index("# v1.28.1 (2026-10-13, renumbered 2026-10-19, 2026-10-22 and 2026-10-27) [TOP10 DATA-QUALITY]"):
                 src.index('OPPORTUNITY_BUILDER_VERSION = "')]
     assert block.isascii()
 
@@ -425,7 +427,9 @@ def _base():
     # at 1.27.0 (it was the v1.26.1 copy before main moved).
     # 2026-10-22 merge: main is now v1.27.2 (#813), the base copy is
     # `git show df99bcf3:core/analysis/opportunity_builder.py`.
-    assert mod.OPPORTUNITY_BUILDER_VERSION == "1.27.2", "TFB_TEST_OB_BASE is not v1.27.2"
+    # 2026-10-27 merge: main is now v1.28.0 (#848), the base copy is
+    # `git show e8337a16:core/analysis/opportunity_builder.py`.
+    assert mod.OPPORTUNITY_BUILDER_VERSION == "1.28.0", "TFB_TEST_OB_BASE is not v1.28.0"
     return mod
 
 

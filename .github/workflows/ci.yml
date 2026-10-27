@@ -2,27 +2,112 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.39 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24 and 2026-10-25; merged over main's 1.1.37) -- DT10 v1.15.1 HELD-SEAT HARNESS
+# VERSION 1.1.47 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25 and 2026-10-27; merged over main's 1.1.45) -- DT10 v1.17.2 HELD-SEAT HARNESS
 #
-# v1.1.39 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.37 first, 1.1.30-1.1.37 for #815, #816, #817, #829, #819, #833, #837 and #838): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
-# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.15.1
+# v1.1.47 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.45 first, 1.1.30-1.1.45 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852 and #853; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.17.2
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
-# 1.27.3 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
+# 1.28.1 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
 # harness runs the full .gs in a node vm (K1-K5: reader, pure list, REAL
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.38 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24 and 2026-10-25; merged over main's 1.1.37) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.46 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25 and 2026-10-27; merged over main's 1.1.45) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.38 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.37 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837 and #838): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.46 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.45 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852 and #853; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
 #
-# VERSION 1.1.37 (2026-10-25) -- DT10 PENDING GRACE
+# VERSION 1.1.45 (2026-10-27) -- CALENDAR 404 BATCH SPLIT
+#
+# v1.1.45 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.44 are #848-#852):
+# run tests/test_calendar_split_404.py (core/providers/calendar_provider
+# v1.3.1: TFB_CALENDAR_SPLIT_404, default off -- a /calendar/earnings batch
+# that answers HTTP 404 is split so every code EODHD accepts is kept; off =
+# the v1.3.0 requests and results byte for byte) in the blocking contract
+# lane next to tests/test_calendar_last_report_a4.py (its provider legs need
+# httpx). Its golden leg reads the untouched v1.3.0 module with `git show
+# aba4e5eb`; the step fetches that commit first (a failed fetch only turns
+# the leg into a SKIP). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.44 (2026-10-27) -- CHALLENGER MOMENTUM INPUT
+#
+# v1.1.44 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.43 are #848-#851):
+# run tests/test_dt10_shadow_momentum.js (16_Decision_Top10.gs v1.17.1: the
+# pool row carries the engine's 'Momentum Score' only while
+# DT10_SHADOW_RANK_LOG is armed -- the challenger's second pre-registered key;
+# off = the v1.17.0 projection byte for byte) in the blocking lean lane's
+# native Apps Script step next to tests/test_dt10_shadow_rank_log.js. Offline;
+# rebuilds the v1.17.0 base from tests/js/dt10_edits_v1171.json (SHA-256
+# pinned). The board scorecard step also fetches f60cff37 (the untouched
+# score_selection_log v1.2.0) for the P15 golden legs of v1.2.1 (a shadow
+# day logged without the challenger's momentum input counts for neither
+# order). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.43 (2026-10-27) -- BOARD SCORECARD HARNESS JOINS THE LEAN LANE
+#
+# v1.1.43 (1.1.39 is claimed by open PR #846; 1.1.40 is #848, 1.1.41 is
+# #849, 1.1.42 is #850): run tests/test_board_scorecard_p182.py
+# (scripts/score_selection_log.py v1.2.0 [CHALLENGER]:
+# TFB_BOARD_SCORECARD_CHALLENGER, default off -- reads the
+# cockpit's _Shadow_Rank_Log and scores the champion and challenger orders by
+# the pre-registered rule of the self-correcting program, section 4) as its
+# own step of the blocking lean lane; until now only the advisory whole-suite
+# job ran it. Its golden negatives (P9 vs the untouched v1.0.0, P12 vs the
+# untouched v1.1.0) read the two base commits with `git show`; the default
+# checkout is shallow, so the step fetches exactly those two commits by SHA
+# first (a failed fetch turns only those legs into SKIP lines). Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.42 (2026-10-27) -- LAST REPORT DATE
+#
+# v1.1.42 (1.1.39 is claimed by open PR #846; 1.1.40 is #848, 1.1.41
+# is #849): run tests/test_calendar_last_report_a4.py (calendar_provider 1.3.0
+# fetch_last_earnings_map + run_calendar_sync 1.2.0 TFB_CAL_LAST_REPORT,
+# default off = the v1.1.4 seven-column table byte for byte) in the blocking
+# contract lane next to tests/test_calendar_partial_fill.py: its provider legs
+# import the real calendar_provider, which needs httpx (installed there, not
+# in the lean lane). Offline; its golden legs read the v1.1.4 base with
+# `git show` and skip on a shallow checkout.
+#
+# VERSION 1.1.41 (2026-10-27) -- SHADOW RANK LOG
+#
+# v1.1.41 (1.1.39 is claimed by open PR #846; 1.1.40 is #848): run
+# tests/test_dt10_shadow_rank_log.js (16_Decision_Top10.gs v1.17.0: Script
+# Property DT10_SHADOW_RANK_LOG, default off -- one property read and nothing
+# else; on: the backend's champion/challenger orders (opportunity_builder
+# v1.28.0 meta.rank_challenger) and the board seats are appended to the hidden
+# _Shadow_Rank_Log tab once per UTC day; 'all' adds every order change) in
+# the blocking lean lane's native Apps Script step. Offline; reads the real
+# builder payload
+# fixture tests/fixtures/rank_challenger_payload_v1280.json and rebuilds the
+# v1.16.0 base from tests/js/dt10_edits_v1170.json (SHA-256 pinned).
+#
+# VERSION 1.1.40 (2026-10-27) -- RANKING CHALLENGER IN SHADOW
+#
+# v1.1.40 (1.1.39 is claimed by open PR #846): run
+# tests/test_opp_rank_challenger_a2.py (opportunity_builder v1.28.0:
+# TFB_OPP_RANK_MODE, default legacy = v1.27.2 byte for byte -- shadow
+# publishes a second, pre-registered order of the same INVEST pool as
+# shadow_rank + meta.rank_challenger without touching selection) in the
+# blocking lean lane next to the other opportunity-builder suites. Offline;
+# its golden legs read the v1.27.2 base with `git show` and print SKIP on a
+# shallow checkout.
+#
+# v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
+# v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
+# packet published by 10_My_Portfolio certifies the cockpit's request: cash
+# after reservations, holding links, peg FX, custody exclusions) and
+# tests/test_pd_evidence_publish.js (10_My_Portfolio.gs v1.5.16: Script
+# Property PD_IBKR_EVIDENCE_PUBLISH, default off -- the SENT packet is
+# written to the document property the cockpit forwards and ONE one-off
+# follow-up render is armed inside the packet's 14-minute window) in the
+# blocking lean lane's native Apps Script step, next to the pending-grace
+# harness. Version pins moved in the sibling harnesses.
 #
 # v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
 # Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
@@ -826,6 +911,7 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
+            tests/test_opp_rank_challenger_a2.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
@@ -900,6 +986,20 @@ jobs:
           python -m pytest -q tests/test_pf_add_loser_veto_p183.py
           python -m pytest -q tests/test_pf_sukuk_ladder_p153.py
 
+      - name: 📋 Board scorecard harness (golden bases fetched by SHA)
+        run: |
+          # v1.1.43: P9 / P12 compare scripts/score_selection_log.py with the
+          # untouched v1.0.0 (d25468a5) and v1.1.0 (53c8544e) scripts. The
+          # checkout is shallow: fetch exactly those two commits; a failed
+          # fetch only turns those legs into SKIP lines.
+          # v1.1.44: + the untouched v1.2.0 (f60cff37) for P15.
+          git fetch --no-tags --depth=1 origin \
+            d25468a548bcba082779f3d7d5f8b4dfadaac176 \
+            53c8544e88d217054dcaf56d04fce110d002e4d2 \
+            f60cff37707812bd89f41c47ed4ddd3f2c4c9746 \
+            || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
+          python tests/test_board_scorecard_p182.py
+
       - name: ✅ Coverage note
         run: |
           echo "portfolio_actions suite executed — the gap this workflow exists to close."
@@ -919,6 +1019,10 @@ jobs:
           node tests/test_dt10_calendar_completeness.js
           node tests/test_dt10_confirm_basis.js
           node tests/test_dt10_pending_grace.js
+          node tests/test_dt10_funding_evidence.js
+          node tests/test_dt10_shadow_rank_log.js
+          node tests/test_dt10_shadow_momentum.js
+          node tests/test_pd_evidence_publish.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_audit_keep.test.js
@@ -963,6 +1067,11 @@ jobs:
 
       - name: 📐 Run schema alignment
         run: |
+          # v1.1.45: the golden leg of tests/test_calendar_split_404.py reads
+          # the untouched calendar_provider v1.3.0 (aba4e5eb); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin aba4e5eb6d30064e32c416b2a2369598ae4aa412 \
+            || echo "::notice::calendar golden base not fetched - test_calendar_split_404 S1 will SKIP"
           echo "::group::pytest (contract)"
           # PY-4 (2026-07-26): the exact current-schema contract is now an
           # UNCONDITIONAL gate — previously only the legacy alignment test
@@ -978,6 +1087,8 @@ jobs:
             tests/test_portfolio_reconciliation_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
+            tests/test_calendar_last_report_a4.py \
+            tests/test_calendar_split_404.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \

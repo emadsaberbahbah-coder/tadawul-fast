@@ -2,9 +2,58 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.2.2 (FIELD-INDEPENDENT YAHOO FALLBACK)
+Calendar Provider — v1.3.1 (SPLIT A 404 BATCH)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.3.1 (2026-10-27) — a 404 batch no longer loses every symbol in it. WHY:
+the first armed run of the last-report columns (calendar_sync run
+40489000970, 27 Oct 13:30 Riyadh) filled 3 of 327 rows: five of the
+last-earnings batches (50 codes each) and the forward batch of the 31
+decision symbols answered HTTP 404 for the WHOLE request, so every code in
+them was dropped. The forward batch failed the same way on 26 Oct (v1.2.2)
+-- the board names' next-earnings dates have been coming from Yahoo
+estimates and the sync's prior-row carry instead of EODHD. EODHD answers
+404 for the whole /calendar/earnings request when one code in `symbols` is
+one it does not know (the failing batches mix venues whose suffixes EODHD
+spells differently, e.g. '.L', '.T', '.KL', and a malformed 'AEFES.IS.US').
+WHAT (only when TFB_CALENDAR_SPLIT_404 is on/1/true/yes; default off = the
+v1.3.0 requests and results byte for byte): a batch that answers 404 is
+split in halves and each half retried, recursively, so every code EODHD
+accepts is kept; a single code that answers 404 is recorded as rejected;
+any other error propagates to the caller's v1.3.0 handling (logged, batch
+skipped). Requests per call are capped by TFB_CALENDAR_SPLIT_MAX_CALLS
+(default 200, 1..1000), checked before every request: past the cap nothing
+more is requested - pending halves and later batches - and their codes are
+counted (review fix, Codex P2 on PR #853). One
+WARNING line per call names the rejected codes (first 40) and the counts,
+so the symbol mapping can be corrected from evidence. Applies to both
+batched earnings paths: fetch_earnings_map (forward) and
+fetch_last_earnings_map (last report). The ex-dividend path (per symbol)
+and the Yahoo fallbacks are unchanged. Additions (0 removed):
+_split_404_enabled, _is_http_404, _split_state, _earnings_items_split,
+_earnings_split_payload, _log_split_state.
+
+v1.3.0 (2026-10-27) — the most recent PAST earnings report (program register
+A4, post-earnings quarantine data lane). WHY: the first funded ticket (FRST.US,
+26 Oct 2026) was bought two sessions after a 22% EPS miss (Q3 reported 22 Oct
+after the close; -4.1% and -3.7% on heavy volume the next sessions). Every
+earnings path in this module looks FORWARD only (d >= today), so the system
+could not know a name had just reported, let alone missed. ADDED (pure
+addition, nothing existing changes): fetch_last_earnings_map() /
+fetch_last_earnings_sync() — one batched EODHD /calendar/earnings call per
+TFB_CALENDAR_EARNINGS_CHUNK symbols over [today - TFB_CALENDAR_DAYS_BACK
+(default 21, 1..120), today - 1]; per symbol the LATEST report date in that
+window plus its EPS surprise % (the payload's 'percent' when numeric, else
+(actual - estimate) / |estimate| x 100 when both are numeric and the estimate
+is not 0), actual, estimate and before/after-market timing. A same-day report
+stays the forward path's business (next earnings = today). KSA symbols are
+skipped exactly like the forward path (EODHD has no Saudi coverage); no Yahoo
+fallback for past reports in this version. fetch_event_context is untouched,
+so track_performance and the v1.1.x calendar sync read byte-identical data.
+Consumer: scripts/run_calendar_sync.py v1.2.0 behind TFB_CAL_LAST_REPORT.
+Zero functions removed; additions: fetch_last_earnings_map,
+fetch_last_earnings_sync, _num.
 
 v1.2.2 — retry Yahoo when either earnings or ex-dividend is missing.
 Each event fills independently; existing EODHD dates are never overwritten.
@@ -117,8 +166,12 @@ ENV
     TFB_CALENDAR_ENABLED              "1" enables (DEFAULT OFF)
     TFB_CALENDAR_TIMEOUT_SEC          per-request timeout   (default 12)
     TFB_CALENDAR_DAYS_AHEAD           earnings look-ahead   (default 45)
+    TFB_CALENDAR_DAYS_BACK            v1.3.0 last-report look-back (default 21)
     TFB_CALENDAR_DIV_DAYS_AHEAD       ex-div look-ahead     (default 90)
     TFB_CALENDAR_EARNINGS_CHUNK       symbols per earnings call (default 50)
+    TFB_CALENDAR_SPLIT_404            v1.3.1 "on" splits a 404 batch to keep
+                                      the codes EODHD accepts (default off)
+    TFB_CALENDAR_SPLIT_MAX_CALLS      v1.3.1 request cap per call (default 200)
     TFB_CALENDAR_CONCURRENCY          parallel dividend calls   (default 4)
     TFB_CAL_YAHOO_FALLBACK            "0" disables the v1.1.0 Yahoo
                                       earnings/ex-div fallback (default ON)
@@ -147,7 +200,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.2.2"
+__version__ = "1.3.1"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -162,6 +215,8 @@ __all__ = [
     "fetch_next_exdiv_map",
     "fetch_ipos",
     "fetch_ipos_sync",
+    "fetch_last_earnings_map",
+    "fetch_last_earnings_sync",
 ]
 
 # ----------------------------------------------------------------------------- #
@@ -294,6 +349,80 @@ def _client() -> httpx.AsyncClient:
 
 
 # ----------------------------------------------------------------------------- #
+# v1.3.1 - a 404 batch is split so the codes EODHD accepts are kept
+# ----------------------------------------------------------------------------- #
+def _split_404_enabled() -> bool:
+    """TFB_CALENDAR_SPLIT_404 = on|1|true|yes (any case). Default off."""
+    return _env_str("TFB_CALENDAR_SPLIT_404").lower() in ("on", "1", "true", "yes")
+
+
+def _is_http_404(exc: BaseException) -> bool:
+    """True for an HTTP 404 answer (httpx.HTTPStatusError or any exception
+    carrying a response whose status_code is 404)."""
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 404
+
+
+def _split_state() -> Dict[str, Any]:
+    return {"calls": 0, "rejected": [], "capped": 0, "split": 0,
+            "cap": _env_int("TFB_CALENDAR_SPLIT_MAX_CALLS", 200, lo=1, hi=1000)}
+
+
+async def _earnings_items_split(client: httpx.AsyncClient, base: Dict[str, Any],
+                                batch: List[str], state: Dict[str, Any]) -> List[Any]:
+    """The /calendar/earnings items for `batch` (params `base` + symbols). An
+    HTTP 404 on more than one code splits the batch in halves (EODHD answers
+    404 for the WHOLE request when it does not know one code); a single code
+    that answers 404 is recorded in state['rejected']. Any other error
+    propagates. The budget is checked BEFORE every request (review fix, Codex
+    P2 on PR #853): once state['cap'] requests were made in this call, no
+    further request is issued - pending halves and later batches alike - and
+    their codes are counted in state['capped']."""
+    if state["calls"] >= state["cap"]:
+        state["capped"] += len(batch)
+        return []
+    state["calls"] += 1
+    params = dict(base)
+    params["symbols"] = ",".join(batch)
+    try:
+        payload = await _get_json(client, "/calendar/earnings", params)
+    except Exception as e:
+        if not _is_http_404(e):
+            raise
+        if len(batch) == 1:
+            state["rejected"].append(batch[0])
+            return []
+        state["split"] += 1
+        mid = len(batch) // 2
+        left = await _earnings_items_split(client, base, batch[:mid], state)
+        right = await _earnings_items_split(client, base, batch[mid:], state)
+        return left + right
+    items = payload.get("earnings") if isinstance(payload, dict) else payload
+    return list(items or [])
+
+
+async def _earnings_split_payload(client: httpx.AsyncClient, base: Dict[str, Any],
+                                  batch: List[str], state: Dict[str, Any]) -> Dict[str, Any]:
+    """_earnings_items_split shaped like the endpoint's own payload, so the
+    callers' item loop is the v1.3.0 code."""
+    return {"earnings": await _earnings_items_split(client, base, batch, state)}
+
+
+def _log_split_state(label: str, state: Dict[str, Any]) -> None:
+    """One WARNING line per call when a 404 split happened (no line when the
+    gate is off or nothing answered 404)."""
+    if not state["split"] and not state["rejected"] and not state["capped"]:
+        return
+    rej = state["rejected"]
+    logger.warning("[calendar_provider v%s] %s: 404 batches split %d time(s), "
+                   "%d request(s); EODHD rejected %d code(s)%s%s", __version__,
+                   label, state["split"], state["calls"], len(rej),
+                   (": " + ", ".join(rej[:40]) + (" ..." if len(rej) > 40 else "")) if rej else "",
+                   ("; %d code(s) dropped at the request cap %d" % (state["capped"], state["cap"]))
+                   if state["capped"] else "")
+
+
+# ----------------------------------------------------------------------------- #
 # Earnings calendar (batched: chunks of symbols per request)
 # ----------------------------------------------------------------------------- #
 async def fetch_earnings_map(symbols: List[str],
@@ -316,14 +445,20 @@ async def fetch_earnings_map(symbols: List[str],
         chunk = _env_int("TFB_CALENDAR_EARNINGS_CHUNK", 50, lo=1, hi=200)
         codes = sorted(code_map)
         out: Dict[str, str] = {}
+        split_on = _split_404_enabled()                  # v1.3.1
+        state = _split_state() if split_on else {}
         async with _client() as client:
             for i in range(0, len(codes), chunk):
                 batch = codes[i:i + chunk]
                 try:
-                    payload = await _get_json(client, "/calendar/earnings", {
-                        "from": _iso(today), "to": horizon,
-                        "symbols": ",".join(batch),
-                    })
+                    if split_on:                         # v1.3.1: a 404 batch is split
+                        payload = await _earnings_split_payload(
+                            client, {"from": _iso(today), "to": horizon}, batch, state)
+                    else:
+                        payload = await _get_json(client, "/calendar/earnings", {
+                            "from": _iso(today), "to": horizon,
+                            "symbols": ",".join(batch),
+                        })
                 except Exception as e:
                     logger.error("[calendar_provider v%s] earnings batch failed "
                                  "(%d syms): %s", __version__, len(batch),
@@ -341,9 +476,100 @@ async def fetch_earnings_map(symbols: List[str],
                     prev = _parse_date(out.get(orig))
                     if prev is None or d < prev:      # keep the EARLIEST upcoming
                         out[orig] = _iso(d)
+        if split_on:
+            _log_split_state("earnings", state)
         return out
     except Exception as e:  # blanket: a calendar hiccup must never propagate
         logger.error("[calendar_provider v%s] fetch_earnings_map failed: %s",
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
+        return {}
+
+
+# ----------------------------------------------------------------------------- #
+# v1.3.0 - the most recent PAST earnings report (batched like the forward map)
+# ----------------------------------------------------------------------------- #
+def _num(raw: Any) -> Optional[float]:
+    """Finite float or None (bools, blanks and text are not numbers)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+async def fetch_last_earnings_map(symbols: List[str],
+                                  days_back: Optional[int] = None
+                                  ) -> Dict[str, Dict[str, Any]]:
+    """{ORIGINAL_SYMBOL: {"last_earnings_date": 'YYYY-MM-DD',
+    "eps_surprise_pct": float|None, "eps_actual": float|None,
+    "eps_estimate": float|None, "report_timing": str|None}} for the LATEST
+    report in [today - days_back, today - 1]. Empty when disabled, on any
+    error, or for symbols with no report in the window. KSA symbols skipped
+    (no EODHD coverage)."""
+    if not is_enabled():
+        return {}
+    try:
+        code_map, _ksa = _split_symbols(symbols)
+        if not code_map:
+            return {}
+        today = _today()
+        back = days_back or _env_int("TFB_CALENDAR_DAYS_BACK", 21, lo=1, hi=120)
+        start = today - _dt.timedelta(days=back)
+        end = today - _dt.timedelta(days=1)
+        chunk = _env_int("TFB_CALENDAR_EARNINGS_CHUNK", 50, lo=1, hi=200)
+        codes = sorted(code_map)
+        out: Dict[str, Dict[str, Any]] = {}
+        split_on = _split_404_enabled()                  # v1.3.1
+        state = _split_state() if split_on else {}
+        async with _client() as client:
+            for i in range(0, len(codes), chunk):
+                batch = codes[i:i + chunk]
+                try:
+                    if split_on:                         # v1.3.1: a 404 batch is split
+                        payload = await _earnings_split_payload(
+                            client, {"from": _iso(start), "to": _iso(end)}, batch, state)
+                    else:
+                        payload = await _get_json(client, "/calendar/earnings", {
+                            "from": _iso(start), "to": _iso(end),
+                            "symbols": ",".join(batch),
+                        })
+                except Exception as e:
+                    logger.error("[calendar_provider v%s] last-earnings batch "
+                                 "failed (%d syms): %s", __version__, len(batch),
+                                 safe_error_text(e, secret_values=(_api_key(),)))
+                    continue
+                items = payload.get("earnings") if isinstance(payload, dict) else payload
+                for it in items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    code = str(it.get("code") or it.get("symbol") or "").strip().upper()
+                    d = _parse_date(it.get("report_date") or it.get("date"))
+                    orig = code_map.get(code)
+                    if not orig or d is None or d < start or d > end:
+                        continue
+                    prev = _parse_date((out.get(orig) or {}).get("last_earnings_date"))
+                    if prev is not None and d <= prev:   # keep the LATEST report
+                        continue
+                    actual, estimate = _num(it.get("actual")), _num(it.get("estimate"))
+                    surprise = _num(it.get("percent"))
+                    if surprise is None and actual is not None and estimate:
+                        surprise = (actual - estimate) / abs(estimate) * 100.0
+                    timing = str(it.get("before_after_market") or "").strip() or None
+                    out[orig] = {
+                        "last_earnings_date": _iso(d),
+                        "eps_surprise_pct": (round(surprise, 1)
+                                             if surprise is not None else None),
+                        "eps_actual": actual,
+                        "eps_estimate": estimate,
+                        "report_timing": timing,
+                    }
+        if split_on:
+            _log_split_state("last-earnings", state)
+        return out
+    except Exception as e:  # blanket: a calendar hiccup must never propagate
+        logger.error("[calendar_provider v%s] fetch_last_earnings_map failed: %s",
                      __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return {}
 
@@ -665,6 +891,13 @@ def fetch_event_context_sync(symbols: List[str]) -> Dict[str, Dict[str, Optional
 
 def fetch_ipos_sync(days_ahead: int = 30) -> List[Dict[str, Any]]:
     return _run_sync(fetch_ipos(days_ahead))
+
+
+def fetch_last_earnings_sync(symbols: List[str],
+                             days_back: Optional[int] = None
+                             ) -> Dict[str, Dict[str, Any]]:
+    """v1.3.0: sync wrapper of fetch_last_earnings_map."""
+    return _run_sync(fetch_last_earnings_map(symbols, days_back))
 
 
 # ----------------------------------------------------------------------------- #

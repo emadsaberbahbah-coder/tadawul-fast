@@ -179,7 +179,10 @@ def test_t7_version_and_manifest_pin():
     # exact pin, so a later builder build does not turn this suite red; the
     # manifest pin must still equal the source constant.
     # 2026-10-22 merge of #778: the floor follows main's v1.27.2 (#813).
-    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")[:3]) >= (1, 27, 2)
+    # v1.28.0 (A2): exact pin -> version-tuple floor (house rule); the
+    # manifest must still name the source constant exactly.
+    # 2026-10-27 merge of #778: the floor follows main's v1.28.0 (#848).
+    assert tuple(map(int, ob.OPPORTUNITY_BUILDER_VERSION.split("."))) >= (1, 28, 0)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '"%s", "opportunity builder"' % ob.OPPORTUNITY_BUILDER_VERSION in src
 

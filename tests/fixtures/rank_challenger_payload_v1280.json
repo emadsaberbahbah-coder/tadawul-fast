@@ -1,0 +1,314 @@
+{
+ "_note": "opportunity_builder v1.28.0 (TFB_OPP_RANK_MODE=shadow) payload subset, generated from the A2 harness pool F1 (tests/test_opp_rank_challenger_a2.py); the GAS shadow-rank log reads exactly these keys",
+ "candidates_rows": [
+  {
+   "shadow_rank": 1,
+   "symbol": "F.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "shadow_rank": 4,
+   "symbol": "A.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "shadow_rank": 2,
+   "symbol": "B.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "shadow_rank": 3,
+   "symbol": "G.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "shadow_rank": 5,
+   "symbol": "D.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "shadow_rank": 6,
+   "symbol": "E.SR",
+   "verdict": "INVEST"
+  },
+  {
+   "symbol": "C.SR",
+   "verdict": "DO_NOT_INVEST"
+  }
+ ],
+ "meta": {
+  "rank_challenger": {
+   "builder": "1.28.0",
+   "cap_engine_roi_pct": 34.0,
+   "cap_first_free": 5,
+   "challenger": [
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 28.0,
+     "floor_ok": true,
+     "live_rank": 3,
+     "market": "Tadawul",
+     "momentum": 45.0,
+     "rel": 90.0,
+     "revision": 0,
+     "sector": "Materials",
+     "shadow_rank": 1,
+     "strength": -7.5,
+     "strength_ref": "pool",
+     "symbol": "F.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 20.0,
+     "floor_ok": true,
+     "live_rank": 5,
+     "market": "Tadawul",
+     "momentum": 40.0,
+     "rel": 86.0,
+     "revision": 0,
+     "sector": "Banks",
+     "shadow_rank": 2,
+     "strength": -12.5,
+     "strength_ref": "pool",
+     "symbol": "B.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 22.0,
+     "floor_ok": true,
+     "live_rank": 4,
+     "market": "Tadawul",
+     "momentum": null,
+     "rel": 81.0,
+     "revision": 0,
+     "sector": "Utilities",
+     "shadow_rank": 3,
+     "strength": null,
+     "strength_ref": null,
+     "symbol": "G.SR"
+    },
+    {
+     "cap": true,
+     "conf": "High",
+     "engine_roi_pct": 35.0,
+     "floor_ok": true,
+     "live_rank": 1,
+     "market": "Tadawul",
+     "momentum": 60.0,
+     "rel": 88.0,
+     "revision": 0,
+     "sector": "Banks",
+     "shadow_rank": 4,
+     "strength": 7.5,
+     "strength_ref": "pool",
+     "symbol": "A.SR"
+    },
+    {
+     "cap": true,
+     "conf": "High",
+     "engine_roi_pct": 34.5,
+     "floor_ok": true,
+     "live_rank": 2,
+     "market": "Tadawul",
+     "momentum": 50.0,
+     "rel": 77.0,
+     "revision": 0,
+     "sector": "Energy",
+     "shadow_rank": 5,
+     "strength": -2.5,
+     "strength_ref": "pool",
+     "symbol": "D.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 10.0,
+     "floor_ok": false,
+     "live_rank": 6,
+     "market": "Tadawul",
+     "momentum": 55.0,
+     "rel": 76.0,
+     "revision": 0,
+     "sector": "Materials",
+     "shadow_rank": 6,
+     "strength": 2.5,
+     "strength_ref": "pool",
+     "symbol": "E.SR"
+    }
+   ],
+   "champion": [
+    {
+     "cap": true,
+     "conf": "High",
+     "engine_roi_pct": 35.0,
+     "floor_ok": true,
+     "live_rank": 1,
+     "market": "Tadawul",
+     "momentum": 60.0,
+     "rel": 88.0,
+     "revision": 0,
+     "sector": "Banks",
+     "shadow_rank": 4,
+     "strength": 7.5,
+     "strength_ref": "pool",
+     "symbol": "A.SR"
+    },
+    {
+     "cap": true,
+     "conf": "High",
+     "engine_roi_pct": 34.5,
+     "floor_ok": true,
+     "live_rank": 2,
+     "market": "Tadawul",
+     "momentum": 50.0,
+     "rel": 77.0,
+     "revision": 0,
+     "sector": "Energy",
+     "shadow_rank": 5,
+     "strength": -2.5,
+     "strength_ref": "pool",
+     "symbol": "D.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 28.0,
+     "floor_ok": true,
+     "live_rank": 3,
+     "market": "Tadawul",
+     "momentum": 45.0,
+     "rel": 90.0,
+     "revision": 0,
+     "sector": "Materials",
+     "shadow_rank": 1,
+     "strength": -7.5,
+     "strength_ref": "pool",
+     "symbol": "F.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 22.0,
+     "floor_ok": true,
+     "live_rank": 4,
+     "market": "Tadawul",
+     "momentum": null,
+     "rel": 81.0,
+     "revision": 0,
+     "sector": "Utilities",
+     "shadow_rank": 3,
+     "strength": null,
+     "strength_ref": null,
+     "symbol": "G.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 20.0,
+     "floor_ok": true,
+     "live_rank": 5,
+     "market": "Tadawul",
+     "momentum": 40.0,
+     "rel": 86.0,
+     "revision": 0,
+     "sector": "Banks",
+     "shadow_rank": 2,
+     "strength": -12.5,
+     "strength_ref": "pool",
+     "symbol": "B.SR"
+    },
+    {
+     "cap": false,
+     "conf": "High",
+     "engine_roi_pct": 10.0,
+     "floor_ok": false,
+     "live_rank": 6,
+     "market": "Tadawul",
+     "momentum": 55.0,
+     "rel": 76.0,
+     "revision": 0,
+     "sector": "Materials",
+     "shadow_rank": 6,
+     "strength": 2.5,
+     "strength_ref": "pool",
+     "symbol": "E.SR"
+    }
+   ],
+   "coverage": {
+    "invest_with_momentum": 5,
+    "revision_known": 0,
+    "scanned": 7,
+    "scanned_with_momentum": 6,
+    "sectors_with_median": 0
+   },
+   "mode": "shadow",
+   "overlap_top5": 5,
+   "pool": 6,
+   "rel_band_pts": 5.0,
+   "required_roi_pct": 12.0,
+   "rule": "floor engine ROI >= required ROI; then reliability band (5 pts) desc > sector-relative momentum (+/-5) desc > target revision desc > smaller engine ROI; engine ROI >= 34% kept out of ranks 1-5",
+   "strength_deadband": 5.0,
+   "tiers": {
+    "at_cap": 2,
+    "below_cap": 3,
+    "below_floor": 1
+   },
+   "version": "1.0"
+  }
+ },
+ "selected": [
+  {
+   "confidence_band": "High",
+   "engine_roi_pct": 35.0,
+   "market": "Tadawul",
+   "rank": 1,
+   "reliability": 88.0,
+   "sector": "Banks",
+   "shadow_rank": 4,
+   "symbol": "A.SR"
+  },
+  {
+   "confidence_band": "High",
+   "engine_roi_pct": 34.5,
+   "market": "Tadawul",
+   "rank": 2,
+   "reliability": 77.0,
+   "sector": "Energy",
+   "shadow_rank": 5,
+   "symbol": "D.SR"
+  },
+  {
+   "confidence_band": "High",
+   "engine_roi_pct": 28.0,
+   "market": "Tadawul",
+   "rank": 3,
+   "reliability": 90.0,
+   "sector": "Materials",
+   "shadow_rank": 1,
+   "symbol": "F.SR"
+  },
+  {
+   "confidence_band": "High",
+   "engine_roi_pct": 22.0,
+   "market": "Tadawul",
+   "rank": 4,
+   "reliability": 81.0,
+   "sector": "Utilities",
+   "shadow_rank": 3,
+   "symbol": "G.SR"
+  },
+  {
+   "confidence_band": "High",
+   "engine_roi_pct": 20.0,
+   "market": "Tadawul",
+   "rank": 5,
+   "reliability": 86.0,
+   "sector": "Banks",
+   "shadow_rank": 2,
+   "symbol": "B.SR"
+  }
+ ]
+}
