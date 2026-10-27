@@ -263,6 +263,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
+    # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
+    ("archive_to_bigquery", "1.0.0", "bigquery archive"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
