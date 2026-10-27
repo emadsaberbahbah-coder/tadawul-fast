@@ -103,7 +103,20 @@ def test_extract_top10_holds_the_tagged_seats_back_and_names_them():
 
 
 def _norm(text, mod):
-    return text.replace(mod.__version__, "V")
+    text = text.replace(mod.__version__, "V")
+    if mod is brief:   # v1.20.0 [SEND-WINDOW] lines, mapped back to their v1.19.0 constants
+        w = brief._send_window(WHEN)
+        text = (text.replace(">" + w["label"] + "</span></td>", ">before market open</span></td>")
+                .replace("Sent " + w["label"] + " \u00b7", "Sent before market open \u00b7")
+                .replace("US</strong> " + w["us"], "US</strong> 16:30\u201323:00")
+                .replace("Europe</strong> " + w["europe"], "Europe</strong> ~10:00\u201319:30")
+                .replace('<br>\n      <span style="color:#8D98A8;">Regular sessions on the send date; '
+                         'exchange holidays are not checked.</span>', "")
+                .replace("Sent during Tadawul hours (10:30 Riyadh).\n", "")
+                .replace("US 16:30-23:00 - Europe ~11:00-19:30 - Tokyo/HK early morning. "
+                         "Regular sessions; exchange holidays are not checked.",
+                         "US 16:30-23:00 - Europe ~10:00-19:30 - Tokyo/HK early morning."))
+    return text
 
 
 def test_golden_untagged_board_is_v1181_byte_for_byte():
