@@ -2,6 +2,34 @@
 """
 scripts/score_selection_log.py — Selection_Log ticket-vs-reality scorer
 =======================================================================
+VERSION 1.2.1 (2026-10-27) - [CHALLENGER INPUTS] (inside the challenger gate)
+
+WHY: the first _Shadow_Rank_Log day (27 Oct 2026, 10:48 Riyadh) was logged
+while the cockpit (16_Decision_Top10 v1.17.0) did not yet send the engine's
+'Momentum Score' column, so the backend ranked the challenger with its
+second pre-registered key missing (Render log momentum=0/26; the logged
+Momentum cells are blank on every row). That day the challenger was the
+exact reverse of the champion inside one reliability band -- not the order
+the promotion rule was registered for. Cockpit v1.17.1 sends the column;
+a day logged without it must not count for either order, or the comparison
+would mix two different challengers. Amendment fixed before any +5 outcome
+existed (program doc section 4).
+WHAT (only when TFB_BOARD_SCORECARD_CHALLENGER=on):
+  * shadow_days_without_inputs(): the logged UTC days whose FIRST event
+    carries no Momentum value on any row (CHAMPION, CHALLENGER or BOARD).
+    A grid without the 'Momentum' column (an older layout), a missing tab or
+    an empty grid -> none.
+  * shadow_events(values, skip_days=...) drops those days for BOTH orders
+    (paired days stay paired); with no skip set it is v1.2.0 exactly.
+  * challenger_compare(..., excluded=n) / challenger_verdict(..., excluded=n):
+    when n > 0 the reason says 'n logged day(s) excluded - no momentum
+    input' (NO_DATA then reads 'no trading day with the challenger's inputs
+    in _Shadow_Rank_Log'); stdout prints the excluded days; the details JSON
+    gains 'excluded_days'. Nothing changes when no day is excluded: every
+    v1.2.0 output byte for byte.
+ROLLBACK: revert to v1.2.0 (the day then counts again). Prior WHY blocks
+verbatim.
+-----------------------------------------------------------------------
 VERSION 1.2.0 (2026-10-27) - [CHALLENGER] (additive; gate default off)
 
 WHY: program register A2 (project doc
@@ -232,9 +260,9 @@ import time
 import urllib.request
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 EODHD_URL = "https://eodhd.com/api/eod/{sym}?from={frm}&api_token={tok}&fmt=json&period=d"
 SKIP_SUFFIX = ("=F",)          # futures: no reliable EOD mapping
 SKIP_CONTAINS = ("-USD",)      # crypto pairs: out of scope v0.1.0
@@ -893,15 +921,48 @@ def _trading_day(day: str) -> bool:
         return False
 
 
-def shadow_events(values: List[List[Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]],
-                                                   Dict[str, int]]:
+def shadow_days_without_inputs(values: List[List[Any]]) -> List[str]:
+    """v1.2.1: the logged UTC days whose FIRST event (earliest Logged At, the
+    one shadow_events() keeps) carries no Momentum value on any row - the
+    backend then ranked the challenger without its second pre-registered key
+    (cockpit v1.17.0 never sent the column). Such a day counts for neither
+    order. Same Day keying as shadow_events(). A grid without the 'Momentum'
+    column (an older layout), a missing tab or an empty grid -> []."""
+    if not values:
+        return []
+    hdr = [str(c).strip() for c in values[0]]
+    if any(k not in hdr for k in ("Logged At", "Day", "Momentum")):
+        return []
+    h = {c: i for i, c in enumerate(hdr)}
+    first_at: Dict[str, datetime] = {}
+    rows: List[Tuple[str, datetime, List[Any]]] = []
+    for r in values[1:]:
+        at = _parse_logged_at(_cell(r, h, "Logged At"))
+        if at is None:
+            continue
+        day = _day_key(_cell(r, h, "Day")) or (at - timedelta(hours=3)).strftime("%Y-%m-%d")
+        rows.append((day, at, r))
+        if day not in first_at or at < first_at[day]:
+            first_at[day] = at
+    with_inputs = set()
+    for day, at, r in rows:
+        v = _cell(r, h, "Momentum")
+        if at == first_at[day] and v is not None and str(v).strip() != "":
+            with_inputs.add(day)
+    return sorted(d for d in first_at if d not in with_inputs)
+
+
+def shadow_events(values: List[List[Any]],
+                  skip_days: Optional[Set[str]] = None
+                  ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int]]:
     """v1.2.0: _Shadow_Rank_Log grid -> {order: board-like events}. Only the
     FIRST event of each UTC Day (earliest Logged At) counts, and only the
     CHAMPION / CHALLENGER rows ranked 1..CHAL_TOP_N. Every row of one event
     shares its Logged At, so build_episodes() reads each kept event as one
     snapshot. An unreadable Day falls back to the UTC date of Logged At
     (Riyadh wall time - 3 h). A missing tab, an empty grid or a missing
-    column -> no events."""
+    column -> no events. v1.2.1: a Day in `skip_days` (see
+    shadow_days_without_inputs) yields no event for either order."""
     out: Dict[str, List[Dict[str, Any]]] = {o: [] for o in SHADOW_ORDERS}
     stats = {"rows": 0, "days": 0, "events_kept": 0, "bad_time": 0}
     if not values:
@@ -925,6 +986,8 @@ def shadow_events(values: List[List[Any]]) -> Tuple[Dict[str, List[Dict[str, Any
     stats["days"] = len(first_at)
     for day, at, r in rows:
         if at != first_at[day]:
+            continue
+        if skip_days and day in skip_days:      # v1.2.1: challenger inputs absent
             continue
         order = str(_cell(r, h, "Order")).strip().upper()
         rank = _rank_int(_cell(r, h, "Rank"))
@@ -965,9 +1028,22 @@ def score_shadow_episode(ep: Dict[str, Any], closes: List[Tuple[str, float]],
 
 
 def challenger_verdict(days: int, n_champ: int, n_chal: int,
-                       champ: Dict[str, Any], chal: Dict[str, Any]) -> Tuple[str, str]:
+                       champ: Dict[str, Any], chal: Dict[str, Any],
+                       excluded: int = 0) -> Tuple[str, str]:
     """v1.2.0: the pre-registered rule (program doc section 4). Returns
-    (verdict, reason)."""
+    (verdict, reason). v1.2.1: `excluded` logged days without the
+    challenger's inputs are named in the reason (never counted)."""
+    verdict, reason = _challenger_verdict_core(days, n_champ, n_chal, champ, chal)
+    if excluded > 0:
+        if verdict == "NO_DATA":
+            reason = "no trading day with the challenger's inputs in " + SHADOW_TAB
+        reason += "; %d logged day(s) excluded - no momentum input" % excluded
+    return verdict, reason
+
+
+def _challenger_verdict_core(days: int, n_champ: int, n_chal: int,
+                             champ: Dict[str, Any], chal: Dict[str, Any]) -> Tuple[str, str]:
+    """v1.2.0 rule body (moved verbatim under this name by v1.2.1)."""
     if days <= 0:
         return "NO_DATA", "no trading day logged in " + SHADOW_TAB
     enough = days >= CHAL_MIN_DAYS and min(n_champ, n_chal) >= CHAL_MIN_SCORED
@@ -996,7 +1072,8 @@ def challenger_verdict(days: int, n_champ: int, n_chal: int,
 
 
 def challenger_compare(scored_by_order: Dict[str, List[Dict[str, Any]]],
-                       days_by_order: Dict[str, int]) -> Tuple[List[List[Any]], Dict[str, Any]]:
+                       days_by_order: Dict[str, int],
+                       excluded: int = 0) -> Tuple[List[List[Any]], Dict[str, Any]]:
     """v1.2.0: CHALLENGER_HEADER rows (one per order + one verdict row) and the
     statistics. Hit/mean/worst use the +5 excess vs the reference (vs SPUS
     only when the episode maps to no reference; a mapped reference without
@@ -1028,7 +1105,8 @@ def challenger_compare(scored_by_order: Dict[str, List[Dict[str, Any]]],
     days = min(days_by_order.get(o, 0) for o in SHADOW_ORDERS)
     verdict, reason = challenger_verdict(days, per["CHAMPION"]["scored"],
                                          per["CHALLENGER"]["scored"],
-                                         per["CHAMPION"], per["CHALLENGER"])
+                                         per["CHAMPION"], per["CHALLENGER"],
+                                         excluded=excluded)
     text = "%s (days %d, scored %d/%d; %s)" % (verdict, days, per["CHAMPION"]["scored"],
                                               per["CHALLENGER"]["scored"], reason)
     rows.append(["Verdict", text, "", "", "", "", "", "", ""])
@@ -1603,6 +1681,7 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
     sh_eps: Dict[str, List[Dict[str, Any]]] = {o: [] for o in SHADOW_ORDERS}
     sh_days: Dict[str, int] = {o: 0 for o in SHADOW_ORDERS}
     sh_extra: List[str] = []
+    sh_skip: List[str] = []
     if chal_on:
         sh_values: List[List[Any]] = []
         try:
@@ -1614,7 +1693,13 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
             if type(exc).__name__ != "WorksheetNotFound":
                 print(f"WARN: {SHADOW_TAB} not read ({exc}) - challenger NO_DATA")
             sh_values = []
-        sh_ev, _sh_stats = shadow_events(sh_values)
+        # v1.2.1: a day logged without the challenger's inputs counts for
+        # neither order (paired days stay paired)
+        sh_skip = shadow_days_without_inputs(sh_values)
+        if sh_skip:
+            print(f"{tag} challenger: {len(sh_skip)} logged day(s) excluded - "
+                  f"no momentum input: {', '.join(sh_skip)}")
+        sh_ev, _sh_stats = shadow_events(sh_values, skip_days=set(sh_skip))
         for order in SHADOW_ORDERS:
             sh_eps[order], _st = build_episodes(sh_ev[order], now_riyadh)
             sh_days[order] = len({e["run"] for e in sh_ev[order] if _trading_day(e["run"])})
@@ -1668,7 +1753,7 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
         sh_scored = {o: [score_shadow_episode(ep, prices.get(ep["symbol"], []), bench,
                                               ref=prices.get(ep["ref"], []) if ep.get("ref") else None)
                          for ep in sh_eps[o]] for o in SHADOW_ORDERS}
-        challenger, ch = challenger_compare(sh_scored, sh_days)
+        challenger, ch = challenger_compare(sh_scored, sh_days, excluded=len(sh_skip))
     n_open = sum(1 for e in episodes if e["exit_at"] is None)
     n_since = sum(1 for s in scored if s["seat_date"] >= since)
     n_priced = sum(1 for s in scored if s["status"] in ("OPEN", "CLOSED"))
@@ -1719,6 +1804,8 @@ def run_scorecard(tsv: Optional[str] = None, live: bool = False,
                          for k, v in (ch.get("champion") or {}).items()},
             "challenger": {k: _rd(v) if isinstance(v, float) else v
                            for k, v in (ch.get("challenger") or {}).items()}}
+        if sh_skip:
+            details["challenger"]["excluded_days"] = sh_skip
     wrote = "0"
     rc = 0
     if mode == "write":
@@ -2246,7 +2333,43 @@ def selftest() -> int:
     assert rows24m[0][1:5] == [1, 2, 1, 100.0], rows24m[0]
     assert all(len(r) == len(CHALLENGER_HEADER) for r in rows24)
     ok += 1
-    print(f"SELFTEST {ok}/24: ALL GREEN")
+    # 25: challenger inputs (v1.2.1): a logged day whose FIRST event carries
+    #     no Momentum value on any row counts for neither order (a later
+    #     event with momentum does not rescue it); no 'Momentum' column -> no
+    #     exclusion; the verdict reason names the excluded days
+    mh = sh_hdr + ["Momentum"]
+
+    def _mrow(at, day, order, rank, sym, mom):
+        return _shrow(at, day, order, rank, sym) + [mom]
+    m_vals = [mh,
+              _mrow("2026-10-27 10:48:41", "2026-10-27", "CHAMPION", 1, "A.US", ""),
+              _mrow("2026-10-27 10:48:41", "2026-10-27", "CHALLENGER", 1, "B.US", ""),
+              _mrow("2026-10-27 10:48:41", "2026-10-27", "BOARD", 1, "A.US", ""),
+              _mrow("2026-10-27 15:00:00", "2026-10-27", "CHALLENGER", 1, "C.US", 57.0),
+              _mrow("2026-10-28 04:02:00", "2026-10-28", "CHAMPION", 1, "D.US", ""),
+              _mrow("2026-10-28 04:02:00", "2026-10-28", "CHALLENGER", 1, "E.US", 61.2),
+              _mrow("2026-10-29 04:02:00", "2026-10-29", "CHALLENGER", 1, "F.US", 0)]
+    assert shadow_days_without_inputs(m_vals) == ["2026-10-27"]
+    assert shadow_days_without_inputs(sh_vals) == []            # no Momentum column
+    assert shadow_days_without_inputs([]) == [] and shadow_days_without_inputs([mh]) == []
+    m_ev, m_st = shadow_events(m_vals, skip_days={"2026-10-27"})
+    assert [e["symbol"] for e in m_ev["CHAMPION"]] == ["D.US"]
+    assert [e["symbol"] for e in m_ev["CHALLENGER"]] == ["E.US", "F.US"]
+    assert m_st["days"] == 3 and m_st["events_kept"] == 3, m_st
+    assert shadow_events(m_vals)[0]["CHALLENGER"][0]["symbol"] == "B.US"    # no skip: v1.2.0
+    v25, why25 = challenger_verdict(0, 0, 0, cp, good, excluded=1)
+    assert v25 == "NO_DATA" and why25 == (
+        "no trading day with the challenger's inputs in _Shadow_Rank_Log; "
+        "1 logged day(s) excluded - no momentum input"), why25
+    assert challenger_verdict(0, 0, 0, cp, good) == challenger_verdict(0, 0, 0, cp, good, excluded=0)
+    v25b, why25b = challenger_verdict(3, 5, 5, cp, good, excluded=2)
+    assert v25b == "INSUFFICIENT_DATA" and why25b.endswith(
+        "; 2 logged day(s) excluded - no momentum input"), why25b
+    rows25, st25 = challenger_compare({"CHAMPION": [], "CHALLENGER": []},
+                                      {"CHAMPION": 0, "CHALLENGER": 0}, excluded=1)
+    assert st25["verdict"] == "NO_DATA" and "1 logged day(s) excluded" in rows25[-1][1]
+    ok += 1
+    print(f"SELFTEST {ok}/25: ALL GREEN")
     return 0
 
 
