@@ -190,8 +190,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.data_validity", "DATA_VALIDITY_VERSION", "1.0.2", "price acquisition evidence"),
     ("integrations.google_sheets_service", "SERVICE_VERSION", "6.2.2", "Sheets publication writer"),
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
+    # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
+    # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.27.2", "opportunity builder"),
+     "1.28.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
      "1.16.1", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",

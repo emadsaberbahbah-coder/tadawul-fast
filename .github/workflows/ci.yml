@@ -4,14 +4,25 @@
 # ============================================================================
 # VERSION 1.1.42 (2026-10-27) -- LAST REPORT DATE
 #
-# v1.1.42 (1.1.39 / 1.1.40 / 1.1.41 are claimed by open PRs #846 / #848 /
-# #849): run tests/test_calendar_last_report_a4.py (calendar_provider 1.3.0
+# v1.1.42 (1.1.39 / 1.1.41 are claimed by open PRs #846 / #849; 1.1.40 is
+# #848): run tests/test_calendar_last_report_a4.py (calendar_provider 1.3.0
 # fetch_last_earnings_map + run_calendar_sync 1.2.0 TFB_CAL_LAST_REPORT,
 # default off = the v1.1.4 seven-column table byte for byte) in the blocking
 # contract lane next to tests/test_calendar_partial_fill.py: its provider legs
 # import the real calendar_provider, which needs httpx (installed there, not
 # in the lean lane). Offline; its golden legs read the v1.1.4 base with
 # `git show` and skip on a shallow checkout.
+#
+# VERSION 1.1.40 (2026-10-27) -- RANKING CHALLENGER IN SHADOW
+#
+# v1.1.40 (1.1.39 is claimed by open PR #846): run
+# tests/test_opp_rank_challenger_a2.py (opportunity_builder v1.28.0:
+# TFB_OPP_RANK_MODE, default legacy = v1.27.2 byte for byte -- shadow
+# publishes a second, pre-registered order of the same INVEST pool as
+# shadow_rank + meta.rank_challenger without touching selection) in the
+# blocking lean lane next to the other opportunity-builder suites. Offline;
+# its golden legs read the v1.27.2 base with `git show` and print SKIP on a
+# shallow checkout.
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
 # v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
@@ -825,6 +836,7 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
+            tests/test_opp_rank_challenger_a2.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
