@@ -1,15 +1,16 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.16
+ * Version: 1.5.17
  *
- * v1.5.16 MAIN CHANGES  (THE LAYOUT BUILDER KEEPS OPERATOR INPUTS -- P-76
+ * v1.5.17 MAIN CHANGES  (THE LAYOUT BUILDER KEEPS OPERATOR INPUTS -- P-76
  *                        port from 16_Decision_Top10 v1.11.3; Script
  *                        Property PD_PANEL_PRESERVE, default OFF; ALL
- *                        v1.5.15 logic carried verbatim; authored as
+ *                        v1.5.16 logic carried verbatim; authored as
  *                        v1.5.14 in PR #780, renumbered 2026-10-21 after
- *                        #810 shipped a different v1.5.14, and 2026-10-25
- *                        after #834 shipped a different v1.5.15)
+ *                        #810 shipped a different v1.5.14, 2026-10-25
+ *                        after #834 shipped a different v1.5.15, and
+ *                        2026-10-27 after #844 shipped a different v1.5.16)
  * ---------------------------------------------------------------
  * WHY (2026-10-15 export vs _Portfolio_Action_Log): the panel snapshot the
  * action log wrote at 2026-10-14 04:45:58 Riyadh carried 'PF: Cash
@@ -27,7 +28,7 @@
  * reset reaches Top_10 too.
  * WHAT (Script Property PD_PANEL_PRESERVE = off (default) | observe |
  * enforce; anything else reads off):
- *  off      reads nothing extra; every sheet write is v1.5.15's.
+ *  off      reads nothing extra; every sheet write is v1.5.16's.
  *  observe  snapshots the non-blank panel inputs before the clear, seeds
  *           the defaults exactly as off, and logs which inputs the rebuild
  *           reset ('layout: observe -- N operator input(s) reset to
@@ -52,7 +53,58 @@
  * ES5. Functions added: 3 (pdPanelPreserveMode_, pdPanelPreserve_(sheet,
  * faults), pdPanelSeedValue_). Changed: buildPortfolioDecisionLayout.
  * Removed: 0.
- * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.15.
+ * Rollback: PD_PANEL_PRESERVE=off (or delete it), or v1.5.16.
+ *
+ * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION: THE SENT PACKET BECOMES THE
+ *                        TOP_10 COCKPIT'S FUNDING EVIDENCE -- PD_IBKR_EVIDENCE_PUBLISH,
+ *                        default off; ALL v1.5.15 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): Top_10_Investments
+ * confirmed FRST.US / ZTO.US / CRC.US ACTIVE (day 3) and rendered them
+ * UNSIZED (Ticket 0 SAR, Shares 0, 'Research seat -- no executable
+ * allocation today', EXECUTABLE 0 of 10; Portfolio_Decision v2 read 'IBKR
+ * evidence UNKNOWN'). The backend's allocate stage certifies executable
+ * funding only from a fresh (<= 900 s) broker packet in
+ * portfolio.reconciliation_evidence. This page has built exactly that
+ * packet from the read-only IBKR capture since v1.5.12 and sent it with its
+ * own request (status line 'ibkr evidence SENT (...)'), but the cockpit
+ * forwards the DOCUMENT PROPERTY TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1,
+ * which nothing wrote ('Nothing writes it today', v1.5.11). Two producers,
+ * one packet, no hand-over.
+ * WHAT: Script Property PD_IBKR_EVIDENCE_PUBLISH = off (default: every
+ * line, request and property byte-identical to v1.5.15) | on. Under
+ * PD_IBKR_EVIDENCE=enforce, when the plan is fresh and the packet is SENT,
+ * pdIbkrPublish_ writes that SAME packet (JSON, <= 9,000 chars, the limit
+ * both readers apply) to the document property and the status line gains
+ * ' | evidence published' (or ' | evidence NOT published: <reason>').
+ * Not fresh, observe, off or a failed publication -> nothing is written
+ * and the previous property is left for the backend's own freshness check
+ * to reject. ORDER: the backend accepts the packet for 900 s, so Top_10
+ * must render within ~14 min of the capture; pdIbkrCaptureWatch, after a
+ * refresh that published, arms ONE one-off trigger pdIbkrEvidenceFollowUp
+ * (+60 s) which clears itself, re-reads the packet age (<= 840 s), asks the
+ * Decision Chain's guards when 26_Decision_Chain is present
+ * (tfbDcReadInputs_: automation paused, sync in flight, cockpit running,
+ * quiet window) and then calls refreshDecisionTop10() -- the cockpit takes
+ * its own lock and its own gates; nothing here changes a verdict. One
+ * _Run_Log row (handler pdIbkrEvidenceFollowUp, page Top_10_Investments,
+ * OK/FAILED/SKIPPED) and one Logger line; never the packet. The cockpit
+ * side (16_Decision_Top10 v1.16.0, DT10_FUNDING_EVIDENCE=on) applies the
+ * property to its request: certified cash, links, peg FX, exclusions.
+ * pdSelfTest reports the publish mode, the follow-up trigger state and a
+ * pure 'follow-up core' check.
+ * ES5. Functions added: 8 (pdIbkrPublishMode_, pdIbkrPublish_,
+ * pdIbkrRemoveFollowUp_, pdIbkrArmFollowUp_, pdIbkrFollowUpCore_,
+ * pdIbkrRunLog_, pdIbkrEvidenceFollowUp, pdIbkrFollowUpState_). Changed:
+ * pdIbkrApply_ (publication + note suffix, enforce/fresh/on only),
+ * pdIbkrCaptureWatch (marker + follow-up arming), pdSelfTest. Vars added: 5
+ * (PD_IBKR_PUBLISH_PROP, PD_IBKR_FOLLOWUP_HANDLER, PD_IBKR_FOLLOWUP_DELAY_MS,
+ * PD_IBKR_FOLLOWUP_MAX_AGE_MS, PD_IBKR_PUBLISHED_RUN_). Removed: 0.
+ * Harness: tests/test_pd_evidence_publish.js (REAL file; golden negative on
+ * the v1.5.15 base). Rollback: PD_IBKR_EVIDENCE_PUBLISH=off (and delete the
+ * document property if a stale packet should not linger), or v1.5.15.
+ * Arming is an owner step AFTER the first funded ticket of 26 Oct 2026 is
+ * recorded.
  *
  * v1.5.15 (2026-10-24)  (PD-ALLCASH: A BROKER-PROVEN ALL-CASH BOOK IS A
  *                        DECIDED STATE -- PD_ALLCASH_OK, default enforce;
@@ -2654,7 +2706,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.16';
+var PD_VERSION = '1.5.17';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3249,6 +3301,12 @@ var PD_IBKR_RATE_X100 = {USD: 375, SAR: 100};   /* exact SAR rate x 100 */
 var PD_IBKR_FX_SOURCE = 'policy://sama-usd-peg-3.75';
 var PD_IBKR_WATCH_HANDLER = 'pdIbkrCaptureWatch';
 var PD_IBKR_WATCH_EVERY_MIN = 5;
+/* v1.5.16: publish the SENT packet for 16_Decision_Top10 + one follow-up render */
+var PD_IBKR_PUBLISH_PROP = 'PD_IBKR_EVIDENCE_PUBLISH';   /* off (default) | on */
+var PD_IBKR_FOLLOWUP_HANDLER = 'pdIbkrEvidenceFollowUp';
+var PD_IBKR_FOLLOWUP_DELAY_MS = 60000;
+var PD_IBKR_FOLLOWUP_MAX_AGE_MS = 840000;   /* the packet's own acceptance window */
+var PD_IBKR_PUBLISHED_RUN_ = null;          /* set by pdIbkrPublish_ in this execution */
 var PD_IBKR_SAFE = 9007199254740991;
 var PD_IBKR_PROVENANCE_FIELDS = [
   { send: 'Data Provider', match: ['Data Provider'] },
@@ -3715,6 +3773,14 @@ function pdIbkrApply_(mode, body) {
       body.fx_rates = rates;
       delete body.reconciliation_evidence;     /* enforce: the capture only */
       if (fresh) body.reconciliation_evidence = plan.packet;
+      /* v1.5.16: the same packet becomes the Top_10 cockpit's funding
+       * evidence (document property); off -> nothing written. */
+      if (fresh && pdIbkrPublishMode_() === 'on') {
+        var pub = pdIbkrPublish_(plan.packet, nowMs);
+        res.published = pub.published;
+        res.publishNote = pub.published ? ' | evidence published'
+                                        : ' | evidence NOT published: ' + pub.reason;
+      }
       if (controls) {
         body.controls = controls;
         res.controls = controls;
@@ -3722,7 +3788,7 @@ function pdIbkrApply_(mode, body) {
       res.excluded = split.excluded;
       res.sent = fresh;
     }
-    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded);
+    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded) + (res.publishNote || '');
   } catch (e) {
     res.note = ' | ibkr evidence ERROR (' +
         String(e && e.message ? e.message : e).slice(0, 80) + ')';
@@ -3779,12 +3845,16 @@ function pdIbkrCaptureWatch() {
       props.setProperty(PD_IBKR_LAST_PROP, cap.id);
       return 'capture not usable for a decision';
     }
+    PD_IBKR_PUBLISHED_RUN_ = null;   /* v1.5.16 */
     var outcome = String(refreshPortfolioDecision() || '');
     if (/^(NETWORK ERROR|HTTP )/.test(outcome)) return 'refresh failed: ' + outcome;
     props.setProperty(PD_IBKR_LAST_PROP, cap.id);
+    /* v1.5.16: Top_10 must render inside the packet's window -> one-off trigger */
+    var armed = (PD_IBKR_PUBLISHED_RUN_ && pdIbkrPublishMode_() === 'on')
+        ? pdIbkrArmFollowUp_() : '';
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher refreshed (' +
-               mode + ', status ' + outcome + ')');
-    return 'refreshed';
+               mode + ', status ' + outcome + (armed ? ', ' + armed : '') + ')');
+    return 'refreshed' + (armed ? '; ' + armed : '');
   } catch (e) {
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher error: ' +
                String(e && e.message ? e.message : e).slice(0, 120));
@@ -3844,6 +3914,150 @@ function pdIbkrWatcherState_() {
              : 'not installed (run pdInstallCaptureWatcher)';
   } catch (e) {
     return 'unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/* ----- v1.5.16 evidence publication + follow-up render ------------------- */
+
+function pdIbkrPublishMode_() {
+  return pdIbkrProp_(PD_IBKR_PUBLISH_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** The SENT packet -> document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (the one 16_Decision_Top10 forwards; same 9,000-char limit). Records the
+ * publication for this execution only. Never logs the packet. */
+function pdIbkrPublish_(packet, nowMs) {
+  var out = {published: false, reason: ''};
+  try {
+    var text = JSON.stringify(packet);
+    if (!text || text.length > PD_EVIDENCE_MAX_CHARS) {
+      out.reason = 'packet oversized';
+      return out;
+    }
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) { out.reason = 'document properties unavailable'; return out; }
+    props.setProperty(PD_EVIDENCE_PROP, text);
+    PD_IBKR_PUBLISHED_RUN_ = {at_ms: nowMs,
+                              captured_at: String(packet && packet.captured_at || '')};
+    out.published = true;
+  } catch (e) {
+    out.reason = 'publish failed';
+  }
+  return out;
+}
+
+function pdIbkrRemoveFollowUp_() {
+  var n = 0;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) {
+        ScriptApp.deleteTrigger(all[i]);
+        n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+/** One-off trigger: Top_10 renders ~1 min after the publication, inside the
+ * packet's 14-minute acceptance window. Never throws. */
+function pdIbkrArmFollowUp_() {
+  try {
+    pdIbkrRemoveFollowUp_();
+    ScriptApp.newTrigger(PD_IBKR_FOLLOWUP_HANDLER).timeBased()
+        .after(PD_IBKR_FOLLOWUP_DELAY_MS).create();
+    return 'follow-up armed';
+  } catch (e) {
+    return 'follow-up not armed (' +
+        String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE: should the follow-up render Top_10 now? s = the Decision Chain's
+ * read inputs (26_Decision_Chain tfbDcReadInputs_) or null. */
+function pdIbkrFollowUpCore_(mode, packetAgeMs, hasTop10, s) {
+  if (mode !== 'on') return {go: false, reason: 'publish off'};
+  if (!hasTop10) return {go: false, reason: 'refreshDecisionTop10 unavailable'};
+  if (packetAgeMs === null || packetAgeMs === undefined) {
+    return {go: false, reason: 'no published packet'};
+  }
+  if (packetAgeMs < 0) return {go: false, reason: 'packet ahead of the clock'};
+  if (packetAgeMs > PD_IBKR_FOLLOWUP_MAX_AGE_MS) {
+    return {go: false, reason: 'packet too old (' + pdIbkrAge_(packetAgeMs) + ')'};
+  }
+  if (s) {
+    if (s.automationAllowed === false) return {go: false, reason: 'automation paused'};
+    if (s.inflight) return {go: false, reason: 'sync in flight'};
+    if (s.cockpitRunning) return {go: false, reason: 'cockpit refresh in progress'};
+    if (s.quiet) return {go: false, reason: 'quiet window'};
+  }
+  return {go: true, reason: 'packet age ' + pdIbkrAge_(packetAgeMs)};
+}
+
+/** One _Run_Log row (10-column house format). Never throws. */
+function pdIbkrRunLog_(level, status, message, ms, details) {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('_Run_Log');
+    if (!sh) return false;
+    var dj = '{}';
+    try { dj = JSON.stringify(details || {}); } catch (eJ) {}
+    sh.appendRow([new Date(), String(level || 'INFO'), PD_IBKR_FOLLOWUP_HANDLER,
+                  'Top_10_Investments', String(status || ''),
+                  String(message || '').slice(0, 400), '', '',
+                  ms === null || ms === undefined ? '' : String(ms), dj]);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** Time-driven once (pdIbkrArmFollowUp_): render Top_10 while the published
+ * packet is fresh, under the Decision Chain's guards when that file is
+ * present. Clears its own trigger first. Never throws. */
+function pdIbkrEvidenceFollowUp() {
+  var removed = pdIbkrRemoveFollowUp_();
+  var nowMs = Date.now();
+  var packet = pdEvidencePacket_();
+  var capMs = packet ? pdIbkrStampMs_(packet.captured_at) : null;
+  var age = capMs === null ? null : nowMs - capMs;
+  var s = null;
+  try {
+    if (typeof tfbDcReadInputs_ === 'function') {
+      s = tfbDcReadInputs_(SpreadsheetApp.getActiveSpreadsheet(), 'on',
+                           {pd: '', t10: '', claim: null, attempts: {}}, nowMs);
+    }
+  } catch (eS) { s = null; }
+  var d = pdIbkrFollowUpCore_(pdIbkrPublishMode_(), age,
+                              typeof refreshDecisionTop10 === 'function', s);
+  var t0 = Date.now(), outcome;
+  if (d.go) {
+    try {
+      refreshDecisionTop10();
+      outcome = 'rendered';
+    } catch (eR) {
+      outcome = 'error: ' + String(eR && eR.message ? eR.message : eR).slice(0, 120);
+    }
+  } else {
+    outcome = 'skipped: ' + d.reason;
+  }
+  var line = '[MP-DEC v' + PD_VERSION + '] evidence follow-up -> ' + outcome +
+      ' (' + d.reason + (removed ? '; trigger cleared' : '') + ')';
+  try { Logger.log(line); } catch (eL) {}
+  pdIbkrRunLog_(outcome === 'rendered' || !d.go ? 'INFO' : 'ERROR',
+                outcome === 'rendered' ? 'OK' : (d.go ? 'FAILED' : 'SKIPPED'),
+                line, Date.now() - t0, {version: PD_VERSION, go: d.go});
+  return outcome;
+}
+
+function pdIbkrFollowUpState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) n++;
+    }
+    return n ? n + ' armed' : 'none armed';
+  } catch (e) {
+    return 'unknown';
   }
 }
 
@@ -3931,7 +4145,7 @@ function pdReadPanel_(sheet, ss) {
   return out;
 }
 
-/* ----- v1.5.16 operator inputs survive a layout rebuild (P-76 port) ------- */
+/* ----- v1.5.17 operator inputs survive a layout rebuild (P-76 port) ------- */
 
 var PD_PANEL_PRESERVE_PROP = 'PD_PANEL_PRESERVE';  /* off (default) | observe | enforce */
 
@@ -3947,7 +4161,7 @@ function pdPanelPreserveMode_() {
   }
 }
 
-/** v1.5.16: snapshot of the panel's NON-BLANK operator values, read raw (no
+/** v1.5.17: snapshot of the panel's NON-BLANK operator values, read raw (no
  * defaults) BEFORE a layout rebuild clears the sheet. A value is kept only
  * when its label cell still holds the exact PD_PANEL label (a moved layout
  * keeps nothing). A sheet without a panel yet returns {}. Never throws: a
@@ -3972,7 +4186,7 @@ function pdPanelPreserve_(sheet, faults) {
   return out;
 }
 
-/** v1.5.16 PURE: the value a rebuilt panel cell receives -- preserved
+/** v1.5.17 PURE: the value a rebuilt panel cell receives -- preserved
  * operator input > _Lists_Config default > built-in default. With no
  * preserved map this is exactly the v1.5.13 seed expression. */
 function pdPanelSeedValue_(item, defaults, preserved) {
@@ -4112,7 +4326,7 @@ function buildPortfolioDecisionLayout() {
   var tokens = pdTokens_(ss);
   var header = tokens.HEADER || PD_FALLBACK_TOKENS.HEADER;
   var op = tokens.OPERATOR_INPUT || PD_FALLBACK_TOKENS.OPERATOR_INPUT;
-  /* v1.5.16: snapshot operator inputs BEFORE the clear (off reads nothing).
+  /* v1.5.17: snapshot operator inputs BEFORE the clear (off reads nothing).
    * Enforce aborts on a snapshot read fault, before anything is cleared:
    * a failed read must not turn into the reset this mode exists to stop. */
   var preserveMode = pdPanelPreserveMode_();
@@ -4162,7 +4376,7 @@ function buildPortfolioDecisionLayout() {
     sheet.getRange(pos.row, pos.labelCol).setValue(item.label)
         .setFontWeight('bold').setFontSize(9).setWrap(true)
         .setBackground(PD_TINT).setFontColor(PD_NAVY);
-    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.16
+    var seed = pdPanelSeedValue_(item, defaults,                 // v1.5.17
         preserveMode === 'enforce' ? preserved : null);
     var cell = sheet.getRange(pos.row, pos.valueCol);
     cell.setValue(seed).setBackground(op.bg).setFontColor(op.fg)
@@ -4170,7 +4384,7 @@ function buildPortfolioDecisionLayout() {
     if (item.kind === 'sar') cell.setNumberFormat(PD_FMT_SAR);
     else if (item.kind === 'num') cell.setNumberFormat('0.0#');
   }
-  if (preserveMode !== 'off') {                                  // v1.5.16
+  if (preserveMode !== 'off') {                                  // v1.5.17
     var kept = [], differ = [];
     for (var pi = 0; pi < PD_PANEL.length; pi++) {
       var pItem = PD_PANEL[pi];
@@ -4769,6 +4983,17 @@ function pdSelfTest() {
         : 'rejected: ' + ibPlan.reason));
   }
   report.push('capture watcher: ' + pdIbkrWatcherState_());
+  /* v1.5.16: evidence publication (read-only; never the packet). */
+  report.push('evidence publish (PD_IBKR_EVIDENCE_PUBLISH): ' + pdIbkrPublishMode_() +
+      '; follow-up trigger: ' + pdIbkrFollowUpState_());
+  var fuOk = pdIbkrFollowUpCore_('on', 300000, true,
+      {automationAllowed: true, inflight: false, cockpitRunning: false, quiet: false}).go === true &&
+      pdIbkrFollowUpCore_('on', 841000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, true, {quiet: true}).go === false &&
+      pdIbkrFollowUpCore_('off', 1000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', null, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, false, null).go === false;
+  report.push('follow-up core: ' + (fuOk ? 'ok' : 'FAIL'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

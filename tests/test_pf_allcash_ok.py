@@ -191,23 +191,27 @@ def _top_level_functions(text):
 
 def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     text = GAS.read_text(encoding="utf-8")
-    # merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15;
-    # it adds pdPanelPreserveMode_ / pdPanelPreserve_ / pdPanelSeedValue_ and 141
+    # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
+    # merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16;
+    # it adds pdPanelPreserveMode_ / pdPanelPreserve_ / pdPanelSeedValue_ and 142
     # lines, all ASCII (tests/js/pf_panel_preserve.test.js).
     m = re.search(r"var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';", text)
-    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 15), m
+    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 16), m
     assert " * Version: %s.%s.%s\n" % m.groups() in text
-    assert "var PD_VERSION = '1.5.14';" not in text
+    assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "\r" not in text
     now = set(_top_level_functions(text))
     base = set(golden["functions"])
     assert len(base) == 118
     assert base <= now, sorted(base - now)
-    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdPanelPreserveMode_",
+    # 2026-10-26: v1.5.16 (evidence publication) adds eight pdIbkr* functions on top of this change
+    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdIbkrArmFollowUp_", "pdIbkrEvidenceFollowUp",
+                                  "pdIbkrFollowUpCore_", "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
+                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_", "pdPanelPreserveMode_",
                                   "pdPanelPreserve_", "pdPanelSeedValue_"]   # + #780
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 141   # + #780
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 142   # + #780
 
 
 # merge note 2026-10-25 (#780): the three seed lines buildPortfolioDecisionLayout
@@ -228,11 +232,11 @@ def test_added_lines_are_es5_and_ascii(base_source):
              if line.startswith("+") and not line.startswith("+++")]
     removed = [line[1:] for line in difflib.unified_diff(base, now, n=0, lineterm="")
                if line.startswith("-") and not line.startswith("---")]
-    # merge note 2026-10-25 (#780): panel preserve is v1.5.16 over #834's v1.5.15. Against
-    # this v1.5.14 base the delivered file also carries #780's 144 added / 3 removed
+    # merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16. Against
+    # this v1.5.14 base the delivered file also carries #780's 145 added / 3 removed
     # panel-preserve lines (the version swaps are already in main's counts); the three
     # removed seed lines are matched exactly below.
-    assert 95 + 144 <= len(added) <= 110 + 144 and len(removed) <= 10 + 3, (len(added), len(removed))
+    assert 95 + 145 <= len(added) <= 110 + 145 and len(removed) <= 10 + 3, (len(added), len(removed))
     code = [line for line in added if not re.match(r"\s*(\*|/\*|//)", line)]
     assert len(code) >= 40, len(code)
     for line in added:
