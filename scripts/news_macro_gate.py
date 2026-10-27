@@ -32,6 +32,16 @@ WHAT: main() returns 2 before collecting anything when --write has no
   added; ending the war, diplomatic efforts and containment (EN + AR) added
   to de_escalation. EODHD's "FOMC Statement" no longer doubles the FOMC
   driver (FOMC_NAME_RE).
+  Fourth fix (Codex review on PR #861): an attack headline that also names
+  diplomacy was read as easing unless a breach marker matched, and failure
+  was not one - "Iran launches missile strikes as diplomatic efforts fail"
+  read as de-escalation, and from three wires the verdict fell from
+  NO_NEW_ENTRY to GO. Breach markers now cover failed, stalled or rejected
+  diplomacy, a breakdown, deadlock or impasse and no progress (EN + AR).
+  A leading space in a taxonomy term marks a word start (" stall" does not
+  match "installed"), and "broke " no longer matches "US-brokered". When
+  attack and diplomacy words meet, failure words keep it escalation: the
+  safer error for an entry gate.
 ROLLBACK: revert this file to v1.0.0 (78faeb6e).
 --------------------------------------------------------------------------------
 v1.0.0 (2026-10-28)
@@ -356,13 +366,18 @@ def normalize_text(text: str) -> str:
 def _norm_terms(terms: Iterable[str]) -> List[str]:
     """Short ASCII words ("cpi", "fed", "eps") match whole words only; a
     trailing space in the taxonomy marks a word end (Arabic words keep their
-    attached prefixes, e.g. al- or wa-, so only the end is bounded)."""
+    attached prefixes, e.g. al- or wa-, so only the end is bounded). A
+    leading space marks a word start with an open end (v1.0.1): " stall"
+    matches stalls / stalled but not installed, " fail" matches failed /
+    failure."""
     out = []
     for term in terms or []:
         n = normalize_text(term).strip()
         if not n:
             continue
-        if all(ord(ch) < 128 for ch in n) and len(n) <= 4:
+        if term.startswith(" "):
+            out.append(" " + n + (" " if term.endswith(" ") else ""))
+        elif all(ord(ch) < 128 for ch in n) and len(n) <= 4:
             out.append(" " + n + " ")
         elif term.endswith(" "):
             out.append(n + " ")

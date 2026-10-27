@@ -376,6 +376,36 @@ def test_g2_arabic_and_english_anchor_share_a_cluster():
 
 
 @pytest.mark.parametrize("title,etype", [
+    ("Iran launches missile strikes as diplomatic efforts fail", "war_escalation"),
+    ("Missile strikes go on after diplomatic efforts failed", "war_escalation"),
+    ("Airstrikes resume after peace talks stall", "war_escalation"),
+    ("Houthis reject truce and fire missiles at tankers", "war_escalation"),
+    ("Missile barrage follows breakdown in ceasefire talks", "war_escalation"),
+    ("\u0647\u062c\u0648\u0645 \u0635\u0627\u0631\u0648\u062e\u064a \u0628\u0639\u062f \u0641\u0634\u0644 \u0627\u0644\u062c\u0647\u0648\u062f \u0627\u0644\u062f\u0628\u0644\u0648\u0645\u0627\u0633\u064a\u0629", "war_escalation"),
+    ("\u063a\u0627\u0631\u0627\u062a \u062c\u062f\u064a\u062f\u0629 \u0645\u0639 \u062a\u0639\u062b\u0631 \u0645\u062d\u0627\u062f\u062b\u0627\u062a \u0627\u0644\u0647\u062f\u0646\u0629", "war_escalation"),
+    ("Diplomatic efforts gather pace to contain the conflict", "de_escalation"),
+    ("US-brokered ceasefire halts missile strikes", "de_escalation"),
+    ("Missile shield installed as the truce holds", "de_escalation"),
+])
+def test_g2_failed_diplomacy_stays_escalation(title, etype):
+    """Codex P2 on #861: a diplomacy term must not turn strikes into easing
+    when the headline says the diplomacy failed (fails on 3d84c263); the
+    word-start terms keep "US-brokered" and "installed" out of it."""
+    clf = ng.Classifier(ng.load_taxonomy())
+    assert clf.classify(title, "MACRO")["event_type"] == etype
+
+
+def test_g2_leading_space_marks_a_word_start():
+    terms = ng._norm_terms([" stall", "broke ", "fail", " fail"])
+    assert terms == [" stall", "broke ", " fail ", " fail"]
+    assert ng._hit(ng.normalize_text("Talks stalled again"), terms[:1])
+    assert not ng._hit(ng.normalize_text("Radar installed at the base"), terms[:1])
+    assert not ng._hit(ng.normalize_text("A US-brokered truce"), terms[1:2])
+    assert ng._hit(ng.normalize_text("Efforts failed"), terms[3:])
+    assert not ng._hit(ng.normalize_text("Efforts failed"), terms[2:3])
+
+
+@pytest.mark.parametrize("title,etype", [
     ("\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0646\u0641\u0637 \u062a\u062a\u0631\u0627\u062c\u0639 \u0648\u0633\u0637 \u062a\u0632\u0627\u064a\u062f \u0627\u0644\u062c\u0647\u0648\u062f \u0627\u0644\u062f\u0628\u0644\u0648\u0645\u0627\u0633\u064a\u0629 \u0644\u0627\u062d\u062a\u0648\u0627\u0621 \u062d\u0631\u0628 \u0625\u064a\u0631\u0627\u0646", "de_escalation"),
     ("\u0627\u0646\u062a\u0647\u0627\u0621 \u0627\u0644\u062d\u0631\u0628 \u0633\u064a\u062f\u0641\u0639 \u0627\u0644\u0646\u0641\u0637 \u0625\u0644\u0649 \u062f\u0648\u0646 100 \u062f\u0648\u0644\u0627\u0631", "de_escalation"),
     ("\u0625\u064a\u0631\u0627\u0646 \u0645\u0628\u0627\u0634\u0631.. \u0627\u0634\u062a\u0639\u0627\u0644 \u0646\u0627\u0642\u0644\u0629 \u0628\u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632 \u0648\u0648\u0627\u0634\u0646\u0637\u0646 \u062a\u062a\u0647\u0645 \u0637\u0647\u0631\u0627\u0646 \u0628\u0634\u0646 \u062d\u0631\u0628 \u0627\u0642\u062a\u0635\u0627\u062f\u064a\u0629", "war_escalation"),
@@ -499,6 +529,18 @@ def test_g5_gulf_escalation_three_domains_is_no_new_entry():
     assert g["verdict"] == "NO_NEW_ENTRY"
     assert any(d.startswith("macro: war_escalation/hormuz grade 1, 3 sources") for d in g["drivers"])
     assert not any("russia" in d for d in g["drivers"])
+
+
+def test_g5_failed_diplomacy_from_three_wires_is_no_new_entry():
+    """Codex P2 on #861: the same story read as easing gave GO."""
+    items = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/f1", "Iran launches missile strikes as diplomatic efforts fail", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/f2", "Iran fires missiles at Gulf targets as diplomatic efforts fail", "20261030T101000Z", "apnews.com"),
+        ("https://www.bbc.com/f3", "Iran missile strikes follow failed diplomatic efforts", "20261030T102000Z", "bbc.com"),
+    ]), "MACRO", "geo")
+    g = ng.evaluate(_clusters(items, QUIET), [], {}, QUIET)
+    assert g["verdict"] == "NO_NEW_ENTRY"
+    assert g["drivers"][0].startswith("macro: war_escalation/iran grade 1, 3 sources")
 
 
 def test_g5_russia_ukraine_alone_does_not_move_the_gate():

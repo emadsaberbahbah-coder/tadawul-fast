@@ -8,7 +8,7 @@
 **Files:**
 - `scripts/news_macro_gate.py`: 1.0.0 -> 1.0.1; WHY block prepended, the v1.0.0 text kept verbatim.
 - `data/news_gate_taxonomy.json`: regenerated, still ASCII.
-- `tests/test_news_macro_gate.py`: 57 cases.
+- `tests/test_news_macro_gate.py`: 69 cases.
 - `scripts/verify_deployment.py`: pin 1.0.1.
 - This sheet.
 
@@ -47,10 +47,16 @@ What the 22:32 UTC run would have said with v1.0.1:
 
 This matches the hand check, which keeps the gate observe-only until it is scored.
 
+### Review fix (Codex, PR #861, head `3d84c263`)
+| Finding | Verified path | Fix | Golden negative |
+|---|---|---|---|
+| Failed diplomacy read as easing. *"Iran launches missile strikes as diplomatic efforts fail"* became de-escalation; from Reuters, AP and BBC the verdict fell from NO_NEW_ENTRY to GO. | Fix 3a added *diplomatic efforts* to de-escalation. `Classifier.classify()` turns a war match into de-escalation whenever a de-escalation term matches and no breach marker does, and failure was not a breach marker. | Breach markers (EN + AR) now cover failed, stalled or rejected diplomacy, a breakdown, deadlock or impasse, and no progress. A leading space in a taxonomy term now marks a word start: ` stall` misses *installed*, and ` fail` catches *failed* and *failure*. A trailing space keeps `broke ` out of *US-brokered* (a v1.0.0 slip that kept a brokered ceasefire as war). When attack and diplomacy words meet, a failure word keeps the story escalation, the safer error for an entry gate. | 10 new cases fail on `3d84c263`: 7 headlines (EN + AR), the brokered ceasefire, the word-start rule, and Reuters / AP / BBC giving NO_NEW_ENTRY. Two guards pass on both: easing diplomacy stays easing, and *installed* is not *stalled*. |
+
 ## S3 - Tests
-- `tests/test_news_macro_gate.py`: 57 passed (49 before).
-- The 9 cases above fail on 78faeb6e: the live-headline, FOMC, breaker, budget, timeout and credentials cases, plus two version-string checks.
-- Manifest pins pass. All files are ASCII.
+- `tests/test_news_macro_gate.py`: 69 passed (49 before).
+- 16 of the 69 fail on 78faeb6e: the live-headline, FOMC, breaker, budget, timeout and credentials cases, two version-string checks, and the review-fix cases that v1.0.0 also got wrong.
+- The 10 review-fix cases fail on `3d84c263`.
+- Manifest pins, the workflow audit (errors 0, warnings 0) and the related suites pass (119). All files are ASCII.
 
 ## S4 - Rollback
 Revert `scripts/news_macro_gate.py` and `data/news_gate_taxonomy.json` to 78faeb6e. No workflow, gate or tab changes.
