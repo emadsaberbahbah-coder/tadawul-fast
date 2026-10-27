@@ -412,12 +412,12 @@ function battery() {
     // 2026-10-27: v1.17.0 (shadow rank log) adds dt10ShadowLogMode_ / dt10ShadowLogRows_ / dt10AppendShadowRankLog_
     // 2026-10-27: v1.17.1 (shadow momentum) adds dt10PoolFieldsWithShadow_ / DT10_SHADOW_POOL_FIELDS
     // 2026-10-27: v1.18.0 (post-earnings tag) adds the dt10PostEarn* family, dt10ApplyPostEarnTags_,
-    //   dt10WeekdaysBetween_ and DT10_POST_EARN_PROP / _SESSIONS / _SESSIONS_NEG
+    //   dt10WeekdaysBetween_ and DT10_POST_EARN_PROP / _SESSIONS / _SESSIONS_NEG / _MAX_DAYS
     deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10AppendShadowRankLog_', 'dt10ApplyPostEarnTags_', 'dt10FundingAge_', 'dt10FundingApplyCore_', 'dt10FundingApply_', 'dt10FundingCashCents_', 'dt10FundingDecimal_', 'dt10FundingDiv_', 'dt10FundingExcludeList_', 'dt10FundingLinks_', 'dt10FundingMode_', 'dt10FundingNative_', 'dt10FundingNote_', 'dt10FundingRates_', 'dt10FundingSym_', 'dt10FundingUnits_', 'dt10FundingValueSar_', 'dt10PoolFieldsWithShadow_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_', 'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10StabPendingGrace_', 'dt10StabSoftMiss_', 'dt10WeekdaysBetween_'], 'top-level functions added');
     eq(Object.keys(tb).length, 197, 'base top-level census'); eq(Object.keys(tn).length, 224, 'new top-level census');
     var vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(function (k) { return !vn[k]; }), [], 'vars removed');
-    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP'], 'vars added');
+    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP'], 'vars added');
     var core = newSource.slice(newSource.indexOf('function dt10StabCore_('), newSource.indexOf('\n// ----', newSource.indexOf('function dt10StabCore_(')));
     ['outageOf', 'hardOut', 'scoreOf', 'smoothed', 'boardSort', 'inFinal', 'inList', 'qualifiedWithin', 'softMiss'].forEach(function (f) {
       assert(core.indexOf('function ' + f + '(') > 0, 'nested ' + f);

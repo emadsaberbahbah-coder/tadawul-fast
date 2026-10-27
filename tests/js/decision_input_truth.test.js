@@ -13,8 +13,8 @@
  *  core: ok'. Behaviour is proved by tests/test_dt10_shadow_momentum.js.)
  * (2026-10-27, v1.18.0: version pins; census +6 functions dt10PostEarnMode_,
  *  dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_,
- *  dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_; +3 vars DT10_POST_EARN_PROP,
- *  DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG; the self-test must print
+ *  dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_; +4 vars DT10_POST_EARN_PROP,
+ *  DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG, DT10_POST_EARN_MAX_DAYS; the self-test must print
  *  'post-earnings core: ok'. Behaviour is proved by tests/test_dt10_post_earnings.js.)
  * (2026-10-24, v1.14.0: version pins; census +2 functions dt10StabQualifiedWithin_,
  *  dt10StabConfirmBasis_ and +1 var DT10_T10_CONFIRM_BASIS_PROP; the self-test
@@ -567,7 +567,7 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
     'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v1.18.0] self-test',
     'shadow rank log (DT10_SHADOW_RANK_LOG): off', 'shadow rank log core: ok',
     'shadow pool fields core: ok (Momentum Score sent only while the shadow log is armed) | sent now: no',
-    'post-earnings core: ok (FRST 3/10 tagged; +EPS at 10 sessions untagged; blank EPS 5/5) | mode now: off',
+    'post-earnings core: ok (FRST 3/10; +EPS at 10 sessions untagged; blank EPS 5/5; past next date 1/5) | mode now: off',
     'feed cohort bind (DT10_FEED_COHORT_BIND): off', 'feed cohort core: ok',
     'confirm basis (TFB_T10_CONFIRM_BASIS): qualified', 'confirm basis core: ok'];
   const missing = need.filter(n => !rep.includes(n));
@@ -600,7 +600,7 @@ check('T9 static: DT10_VERSION 1.18.0 in lockstep with header line 4, ES5 source
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
   const fns = census(source, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), vars = census(source, /^var\s+([A-Za-z_$][\w$]*)/mg);
-  assert.equal(fns.size,224,'full v1.18.0 function census (v1.13.9 191 + dt10HoldingFxRate_, dt10RefreshFailed_, dt10RefreshDecisionTop10Run_ in v1.13.10 + dt10BulkPaint_ in v1.13.11 + dt10StabQualifiedWithin_, dt10StabConfirmBasis_ in v1.14.0 + dt10StabSoftMiss_, dt10StabPendingGrace_ in v1.15.0 + 15 dt10Funding* in v1.16.0 + dt10ShadowLogMode_, dt10ShadowLogRows_, dt10AppendShadowRankLog_ in v1.17.0 + dt10PoolFieldsWithShadow_ in v1.17.1 + dt10PostEarnMode_, dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_, dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_ in v1.18.0)'); assert.equal(vars.size,120,'full v1.18.0 variable census (v1.13.9 103 + DT10_FX_SUBUNIT_PARENT + DT10_T10_CONFIRM_BASIS_PROP + DT10_T10_PENDING_GRACE_PROP + DT10_T10_PENDING_GRACE_MAX + DT10_FUNDING_PROP, DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS, DT10_FUNDING_SAFE + DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET, DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS + DT10_SHADOW_POOL_FIELDS in v1.17.1 + DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG in v1.18.0)');
+  assert.equal(fns.size,224,'full v1.18.0 function census (v1.13.9 191 + dt10HoldingFxRate_, dt10RefreshFailed_, dt10RefreshDecisionTop10Run_ in v1.13.10 + dt10BulkPaint_ in v1.13.11 + dt10StabQualifiedWithin_, dt10StabConfirmBasis_ in v1.14.0 + dt10StabSoftMiss_, dt10StabPendingGrace_ in v1.15.0 + 15 dt10Funding* in v1.16.0 + dt10ShadowLogMode_, dt10ShadowLogRows_, dt10AppendShadowRankLog_ in v1.17.0 + dt10PoolFieldsWithShadow_ in v1.17.1 + dt10PostEarnMode_, dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_, dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_ in v1.18.0)'); assert.equal(vars.size,121,'full v1.18.0 variable census (v1.13.9 103 + DT10_FX_SUBUNIT_PARENT + DT10_T10_CONFIRM_BASIS_PROP + DT10_T10_PENDING_GRACE_PROP + DT10_T10_PENDING_GRACE_MAX + DT10_FUNDING_PROP, DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS, DT10_FUNDING_SAFE + DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET, DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS + DT10_SHADOW_POOL_FIELDS in v1.17.1 + DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG, DT10_POST_EARN_MAX_DAYS in v1.18.0)');
   for (const f of DESIGNED_FUNCTIONS) assert(fns.has(f), 'missing ' + f);
   for (const v of DESIGNED_VARS) assert(vars.has(v), 'missing ' + v);
   for (const f of DESIGNED_FUNCTIONS) assert.equal(typeof ctx[f], 'function', f);

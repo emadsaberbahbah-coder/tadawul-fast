@@ -13,9 +13,11 @@
 # the blocking lean lane's native Apps Script step next to
 # tests/test_dt10_shadow_momentum.js. Offline; rebuilds the v1.17.1 base from
 # tests/js/dt10_edits_v1180.json (SHA-256 pinned). The daily-brief step also
-# runs tests/test_daily_brief_post_earnings_tag.py (a tagged seat is not one
-# of the brief's executable picks). Nothing is removed and no existing entry
-# moves.
+# runs tests/test_daily_brief_post_earnings_tag.py (run_daily_brief v1.19.0:
+# a tagged seat is held back from the picks and named on HTML / PDF / text;
+# no tag = v1.18.1 byte for byte; its golden leg reads the untouched v1.18.1
+# with `git show e8337a16`, fetched first - a failed fetch only turns that
+# leg into a SKIP). Nothing is removed and no existing entry moves.
 #
 # VERSION 1.1.45 (2026-10-27) -- CALENDAR 404 BATCH SPLIT
 #
@@ -1140,7 +1142,13 @@ jobs:
             tests/test_news_singleflight_cancellation.py
 
       - name: 🧪 Daily brief unavailable-evidence and blocked-decision regressions
-        run: python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
+        run: |
+          # v1.1.47: the golden leg of tests/test_daily_brief_post_earnings_tag.py
+          # reads the untouched run_daily_brief v1.18.1 (e8337a16); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
+            || echo "::notice::brief golden base not fetched - its golden leg will SKIP"
+          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py tests/test_decision_v2_cash_presentation.py

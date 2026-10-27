@@ -259,7 +259,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
-    ("run_daily_brief", "1.18.1", "daily brief"),
+    # 2026-10-27 (A4 part 2; pin only, SCRIPT_VERSION unchanged): 1.18.1 -> 1.19.0
+    # (a post-earnings-tagged seat is held back from the picks and named).
+    ("run_daily_brief", "1.19.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),

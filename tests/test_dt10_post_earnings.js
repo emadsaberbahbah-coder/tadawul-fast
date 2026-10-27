@@ -14,8 +14,10 @@
  *   P2 armed (observe / on / ' On ' / 'OBSERVE'): exactly the Advisor Note
  *      cells of the seats inside their quarantine change -- the FRST case
  *      (3/10, EPS -22.2%), a blank surprise (5/5), a Riyadh-midnight Date
- *      cell (2/10), a seat carrying both tags (post first, then forward);
- *      the status token 'post-earn !4/9'; a withheld row keeps the prefixes
+ *      cell (2/10), a past Next Earnings Date the sync has not caught up
+ *      with (1/5, review of PR #855), a seat carrying both tags (forward
+ *      first, then post); the status token 'post-earn !5/9'; a withheld
+ *      row keeps the prefixes
  *   P3 golden negative: the v1.17.1 base, armed, never tags (the FRST
  *      ticket of 26 Oct was bought two sessions after a 22% miss)
  *   P4 pure cores: weekday sessions, the calendar map (header detection,
@@ -195,6 +197,7 @@ const CAL_ROWS = [
   ['SYM4.US', '2026-11-03', 7, '', '', '', 'eodhd', '2026-10-26', 1, 6.4],      // both tags
   ['SYM5.US', '', '', '', '', '', 'eodhd', '2026-10-27', 0, -3.0],              // today -> not a past report
   ['SYM6.US', '', '', '', '', '', 'eodhd', RIYADH_23OCT, 4, -1.9],             // a Sheets Date cell -> 2/10
+  ['SYM7.US', '2026-10-26', 0, '', '', '', 'eodhd', '', '', ''],                // past next date (sync lag) -> 1/5
   ['SYM8.US', '', '', '', '', '', 'eodhd', '2026-10-06', 21, -5],               // 15 sessions -> out
   ['C1.US', '', '', '', '', '', 'eodhd', '2026-10-26', 1, -9.9]                 // not on the board
 ];
@@ -275,6 +278,9 @@ for (const state of ['EXECUTABLE', 'NOT_ACTIONABLE']) {
     ok(n.note === b.note, 'P1 identical status token ' + label + ': ' + n.note);
     ok(deep(n.calReads, b.calReads), 'P1 no extra Calendar_Events read ' + label + ': ' + n.calReads.join(' '));
     ok(deep(n.payload.selected, b.payload.selected), 'P1 tickets untouched ' + label);
+    ok(deep(n.ctx.__propReads.slice().sort(),
+            (opts.propsThrow ? b.ctx.__propReads : b.ctx.__propReads.concat(['DT10_POST_EARN'])).slice().sort()),
+       'P1 the only extra property read is DT10_POST_EARN itself ' + label);
     ok(!n.ctx.__logs.some(l => /post-earnings/.test(l)), 'P1 no post-earnings log line ' + label);
   }
 }
@@ -285,8 +291,14 @@ const TAGS = {
   'SYM0.US': WARN + ' post-earnings 3/10 ' + DOT + ' EPS -22.2% ' + DOT + ' ',
   'SYM2.US': WARN + ' post-earnings 5/5 ' + DOT + ' EPS n/a ' + DOT + ' ',
   'SYM4.US': WARN + ' post-earnings 1/5 ' + DOT + ' EPS +6.4% ' + DOT + ' ',
-  'SYM6.US': WARN + ' post-earnings 2/10 ' + DOT + ' EPS -1.9% ' + DOT + ' '
+  'SYM6.US': WARN + ' post-earnings 2/10 ' + DOT + ' EPS -1.9% ' + DOT + ' ',
+  'SYM7.US': WARN + ' post-earnings 1/5 ' + DOT + ' EPS n/a ' + DOT + ' '
 };
+const FWD_RE = new RegExp('^' + WARN + ' earnings ' + LE + '\\d+d ' + DOT + ' ');
+function tagged(sym, was) {   // the forward tag (if any) stays first
+  const f = was.match(FWD_RE);
+  return f ? f[0] + TAGS[sym] + was.slice(f[0].length) : TAGS[sym] + was;
+}
 for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
   for (const state of ['EXECUTABLE', 'NOT_ACTIONABLE']) {
     const b = render(base, { DT10_POST_EARN: mode }, state);
@@ -295,24 +307,24 @@ for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
     const changed = diffCells(n.snap, b.snap);
     const want = Object.keys(TAGS).map(s => noteRowOf(b.snap, s) + ':' + NOTE_COL).sort();
     ok(want.every(k => !/^-1:/.test(k)) && deep(changed, want),
-       'P2 exactly the four quarantined Advisor Note cells change ' + label + ': ' + changed.join(','));
+       'P2 exactly the five quarantined Advisor Note cells change ' + label + ': ' + changed.join(','));
     for (const sym of Object.keys(TAGS)) {
       const k = noteRowOf(b.snap, sym) + ':' + NOTE_COL;
       const was = String(b.snap.cells[k].v), now = String(n.snap.cells[k].v);
       if (state === 'EXECUTABLE') {
-        ok(now === TAGS[sym] + was, 'P2 ' + sym + ' note = post-earnings prefix + the v1.17.1 note ' + label + ': ' + now);
+        ok(now === tagged(sym, was), 'P2 ' + sym + ' note = the v1.17.1 note with the post-earnings tag ' + label + ': ' + now);
       } else {
-        ok(now === TAGS[sym] + was && /SIZING WITHHELD/.test(was),
+        ok(now === tagged(sym, was) && /SIZING WITHHELD/.test(was),
            'P2 ' + sym + ' withheld row keeps the prefix(es) before the withhold text ' + label + ': ' + now);
       }
     }
     const k4 = noteRowOf(n.snap, 'SYM4.US') + ':' + NOTE_COL;
-    ok(String(n.snap.cells[k4].v).indexOf(TAGS['SYM4.US'] + WARN + ' earnings ' + LE + '7d ' + DOT + ' ') === 0,
-       'P2 both tags: post-earnings first, then the forward tag ' + label);
-    ok(n.note === b.note + ' | post-earn ' + WARN + '4/9', 'P2 status token ' + label + ': ' + n.note);
-    ok(n.calReads.length === b.calReads.length + 1 && n.calReads[n.calReads.length - 1] === '1x1x10x10',
+    ok(String(n.snap.cells[k4].v).indexOf(WARN + ' earnings ' + LE + '7d ' + DOT + ' ' + TAGS['SYM4.US']) === 0,
+       'P2 both tags: the forward tag first (its own guard keeps working), then post-earnings ' + label);
+    ok(n.note === b.note + ' | post-earn ' + WARN + '5/9', 'P2 status token ' + label + ': ' + n.note);
+    ok(n.calReads.length === b.calReads.length + 1 && n.calReads[n.calReads.length - 1] === '1x1x' + (CAL_ROWS.length + 1) + 'x10',
        'P2 one extra Calendar_Events read (A1, all 10 columns) ' + label + ': ' + n.calReads.join(' '));
-    ok(n.ctx.__logs.some(l => l === '[DT10 v1.18.0] post-earnings tags: 4/9 tickets (last reports 7; quarantine 5/10 sessions)'),
+    ok(n.ctx.__logs.some(l => l === '[DT10 v1.18.0] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),
        'P2 Logger line ' + label);
   }
 }
@@ -324,7 +336,10 @@ for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
   const rows = [CAL_HDR].concat(CAL_ROWS);
   cal.getRange(1, 1, rows.length, 10).setValues(rows);
   const p = payload();
-  ok(n.dt10PostEarnAnnotate_(p, book) === 'post-earn ' + WARN + '4/9', 'P2 orchestrator token');
+  ok(n.dt10ApplyEarningsTags_(p.selected, { 'SYM4.US': 7 }, 14) === 1, 'P2 the forward tag first, as the render does');
+  ok(n.dt10PostEarnAnnotate_(p, book) === 'post-earn ' + WARN + '5/9', 'P2 orchestrator token');
+  // the forward tagger run again on the tagged board still finds its own prefix (review nit, PR #855)
+  ok(n.dt10ApplyEarningsTags_(p.selected, { 'SYM4.US': 7 }, 14) === 0, 'P2 a second forward pass does not double its tag');
   const once = JSON.stringify(p.selected);
   ok(n.dt10PostEarnAnnotate_(p, book) === 'post-earn 0/9' && JSON.stringify(p.selected) === once,
      'P2 idempotent: a second pass tags nothing and changes no note');
@@ -352,6 +367,9 @@ ok(C.dt10WeekdaysBetween_(day('2026-10-27'), day('2026-10-20')) === 0, 'P4 rever
 ok(C.dt10WeekdaysBetween_(day('2026-09-29'), day('2026-10-27')) === 20, 'P4 four weeks = 20');
 ok(C.dt10WeekdaysBetween_(-10, -3) === 5, 'P4 days before 1970 still count weekdays (1969-12-22..12-29)');
 ok(C.dt10WeekdaysBetween_(null, 5) === 0 && C.dt10WeekdaysBetween_('1', 5) === 0, 'P4 non-numbers = 0');
+ok(C.dt10WeekdaysBetween_(day('2026-10-23'), day('2026-10-25'), true) === 1 &&
+   C.dt10WeekdaysBetween_(day('2026-10-22'), day('2026-10-27'), true) === 3 &&
+   C.dt10WeekdaysBetween_(day('2026-10-29'), day('2026-11-01'), true) === 1, 'P4 Sun-Thu sessions (Tadawul)');
 {
   const vals = [['title row', 'x'], ['', ''], CAL_HDR.slice(0, 7).concat(['Last Earnings Date', 'EPS Surprise %']),
     [' frst.us ', '', '', '', '', '', '', '2026-10-22', '-22.2'],
@@ -372,7 +390,52 @@ ok(C.dt10WeekdaysBetween_(null, 5) === 0 && C.dt10WeekdaysBetween_('1', 5) === 0
   ok(m['OPBK.US'].sessions === 10 && m['OPBK.US'].surprise === 3.1, 'P4 OPBK entry');
   ok(m['TXT.US'].surprise === null && m['NUM.US'].surprise === 4.5, 'P4 text surprise unknown; signed numeric text parsed');
   ok(deep(C.dt10PostEarnMapFromValues_([CAL_HDR.slice(0, 7), ['FRST.US', '', '', '', '', '', '']], '2026-10-27'), {}),
-     'P4 a 7-column calendar (lane off) -> empty map');
+     'P4 a 7-column calendar (lane off) without a past date -> empty map');
+  ok(deep(C.dt10PostEarnMapFromValues_([CAL_HDR.slice(0, 7), ['WPC.US', '2026-10-26', 0, '', '', '', '']], '2026-10-27'),
+          { 'WPC.US': { date: '2026-10-26', sessions: 1, surprise: null } }),
+     'P4 a 7-column calendar: a past Next Earnings Date is the report (surprise unknown)');
+  const both = C.dt10PostEarnMapFromValues_([CAL_HDR,
+    ['NEWER.US', '2026-10-26', '', '', '', '', '', '2026-10-20', '', -5],
+    ['OLDER.US', '2026-10-20', '', '', '', '', '', '2026-10-26', '', -5],
+    ['FUTNEXT.US', '2026-11-20', '', '', '', '', '', '2026-10-26', '', '+3.0%'],
+    ['OLD.US', '', '', '', '', '', '', '2026-09-20', '', -5],
+    ['EDGE.US', '', '', '', '', '', '', '2026-09-26', '', -5],
+    ['PCT.US', '', '', '', '', '', '', '2026-10-26', '', '-22.2%'],
+    ['COMMA.US', '', '', '', '', '', '', '2026-10-26', '', '1,234.5'],
+    ['HUGE.US', '', '', '', '', '', '', '2026-10-26', '', 1e21],
+    ['2222.SR', '', '', '', '', '', '', '2026-10-23', '', 1],
+    ['1120', '', '', '', '', '', '', '2026-10-23', '', 1],
+    ['AAA.US', '', '', '', '', '', '', '2026-10-23', '', 1]], '2026-10-25');
+  ok(deep(both['NEWER.US'], { date: '2026-10-20', sessions: 3, surprise: -5 }) &&
+     deep(both['OLDER.US'], { date: '2026-10-20', sessions: 3, surprise: null }),
+     'P4 as of Sun 25 Oct the 26 Oct dates are future: the past one of the two is the report');
+  const both27 = C.dt10PostEarnMapFromValues_([CAL_HDR,
+    ['NEWER.US', '2026-10-26', '', '', '', '', '', '2026-10-20', '', -5],
+    ['OLDER.US', '2026-10-20', '', '', '', '', '', '2026-10-26', '', -5],
+    ['FUTNEXT.US', '2026-11-20', '', '', '', '', '', '2026-10-26', '', '+3.0%'],
+    ['OLD.US', '', '', '', '', '', '', '2026-09-20', '', -5],
+    ['EDGE.US', '', '', '', '', '', '', '2026-09-26', '', -5],
+    ['PCT.US', '', '', '', '', '', '', '2026-10-26', '', '-22.2%'],
+    ['COMMA.US', '', '', '', '', '', '', '2026-10-26', '', '1,234.5'],
+    ['HUGE.US', '', '', '', '', '', '', '2026-10-26', '', 1e21]], '2026-10-27');
+  ok(deep(both27['NEWER.US'], { date: '2026-10-26', sessions: 1, surprise: null }),
+     'P4 a past Next Earnings Date newer than the last report wins, surprise unknown');
+  ok(deep(both27['OLDER.US'], { date: '2026-10-26', sessions: 1, surprise: -5 }), 'P4 a newer last report keeps its surprise');
+  ok(deep(both27['FUTNEXT.US'], { date: '2026-10-26', sessions: 1, surprise: 3 }), 'P4 a future next date is ignored; +3.0% text parsed');
+  ok(both27['OLD.US'] === undefined && both27['EDGE.US'].sessions === 22, 'P4 37 days old -> left out; 31 days -> kept');
+  ok(both27['PCT.US'].surprise === -22.2 && both27['COMMA.US'].surprise === 1234.5 && both27['HUGE.US'].surprise === 999999,
+     'P4 text with % and , parsed; a huge value clamped');
+  ok(both['2222.SR'].sessions === 1 && both['1120'].sessions === 1 && both['AAA.US'].sessions === 0,
+     'P4 Fri report read on Sun: Tadawul (Sun-Thu) 1 session, US (Mon-Fri) 0');
+  {
+    const junk = [CAL_HDR];
+    for (let q = 0; q < 5000; q++) junk.push(['J' + q + '.US', '0001-01-01', '', '', '', '', '', '0001-01-01', '', -1]);
+    const t0 = Date.now();
+    const jm = C.dt10PostEarnMapFromValues_(junk, '2026-10-27');
+    ok(deep(jm, {}) && Date.now() - t0 < 2000, 'P4 5,000 ancient dates are skipped without walking them (' + (Date.now() - t0) + ' ms)');
+  }
+  ok(C.dt10WeekdaysBetween_(day('2025-10-27'), day('2026-10-27')) === 261 &&
+     C.dt10WeekdaysBetween_(day('2000-01-01'), day('2026-10-27')) === 262, 'P4 the walk is bounded to the last 366 days');
   ok(deep(C.dt10PostEarnMapFromValues_([['Symbol', 'Last Earnings Date'], ['A.US', '2026-10-26']], '2026-10-27'),
           { 'A.US': { date: '2026-10-26', sessions: 1, surprise: null } }), 'P4 no EPS column -> surprise null');
   ok(deep(C.dt10PostEarnMapFromValues_([], '2026-10-27'), {}) && deep(C.dt10PostEarnMapFromValues_(null), {}) &&
@@ -399,6 +462,12 @@ ok(C.dt10WeekdaysBetween_(null, 5) === 0 && C.dt10WeekdaysBetween_('1', 5) === 0
   ok(notes['U5.US'] === WARN + ' post-earnings 5/5 ' + DOT + ' EPS n/a ' + DOT + ' x', 'P4 unknown surprise -> 5');
   ok(notes['Z0.US'] === WARN + ' post-earnings 0/5 ' + DOT + ' EPS +12.3% ' + DOT + ' x', 'P4 a weekend read (0 sessions) is inside');
   ok(C.dt10ApplyPostEarnTags_(t, map) === 0, 'P4 idempotent');
+  const tf = [{ symbol: 'P5.US', advisor_note: WARN + ' earnings ' + LE + '9d ' + DOT + ' INVEST' }];
+  ok(C.dt10ApplyPostEarnTags_(tf, map) === 1 && tf[0].advisor_note === WARN + ' earnings ' + LE + '9d ' + DOT + ' ' +
+     WARN + ' post-earnings 5/5 ' + DOT + ' EPS 0.0% ' + DOT + ' INVEST', 'P4 the forward tag stays first');
+  ok(C.dt10UvWithholdRow_(['x', tf[0].advisor_note], [], 1, 'r')[1] === WARN + ' earnings ' + LE + '9d ' + DOT + ' ' +
+     WARN + ' post-earnings 5/5 ' + DOT + ' EPS 0.0% ' + DOT + ' ' + C.dt10UvWithholdNote_('r'),
+     'P4 a withheld row keeps forward then post-earnings');
   ok(C.dt10ApplyPostEarnTags_([], map) === 0 && C.dt10ApplyPostEarnTags_(null, map) === 0 &&
      C.dt10ApplyPostEarnTags_(t, null) === 0, 'P4 empty / null inputs -> 0');
   ok(C.dt10UvWithholdRow_(['x', 'plain note'], [], 1, 'r')[1] === C.dt10UvWithholdNote_('r') &&
@@ -420,9 +489,14 @@ console.log('P4 PASS pure cores');
 // ------------------------------------------------------------ P5 tokens
 {
   const noRows = render(src, { DT10_POST_EARN: 'observe' }, 'EXECUTABLE', { calRows: CAL_ROWS.map(r => r.slice(0, 7).concat(['', '', ''])) });
-  ok(/\| post-earn n\/a$/.test(noRows.note || '') && !/post-earnings/.test(JSON.stringify(noRows.snap)), 'P5 no last-report rows -> n/a, no tag: ' + noRows.note);
+  ok(String(noRows.note || '').endsWith('| post-earn ' + WARN + '1/9'),
+     'P5 no last-report rows: only the past Next Earnings Date (SYM7) tags: ' + noRows.note);
+  const noPast = render(src, { DT10_POST_EARN: 'observe' }, 'EXECUTABLE',
+    { calRows: [['SYM3.US', '2026-11-01', 5, '', '', '', 'eodhd', '', '', '']] });
+  ok(/\| post-earn n\/a$/.test(noPast.note || '') && !/post-earnings/.test(JSON.stringify(noPast.snap)),
+     'P5 no past report in the calendar -> n/a, no tag: ' + noPast.note);
   const narrow = render(src, { DT10_POST_EARN: 'observe' }, 'EXECUTABLE', { narrowCalendar: true });
-  ok(/\| post-earn n\/a$/.test(narrow.note || ''), 'P5 a 7-column calendar -> n/a: ' + narrow.note);
+  ok(String(narrow.note || '').endsWith('| post-earn ' + WARN + '1/9'), 'P5 a 7-column calendar: the past next date still tags: ' + narrow.note);
   const none = render(src, { DT10_POST_EARN: 'observe' }, 'EXECUTABLE', { noCalendar: true });
   ok(none.note === 'post-earn n/a', 'P5 no Calendar_Events tab -> n/a alone: ' + none.note);
   const fault = render(src, { DT10_POST_EARN: 'observe' }, 'EXECUTABLE', { throwOn: 'Calendar_Events' });
@@ -444,7 +518,7 @@ function runBlock(ctx, code) {
 }
 for (const [props, mode] of [[{}, 'off'], [{ DT10_POST_EARN: 'observe' }, 'observe'], [{ DT10_POST_EARN: 'ON' }, 'observe']]) {
   const rep = runBlock(load(src, props), src.slice(st0, st1));
-  ok(rep.length === 1 && rep[0] === 'post-earnings core: ok (FRST 3/10 tagged; +EPS at 10 sessions untagged; blank EPS 5/5) | mode now: ' + mode,
+  ok(rep.length === 1 && rep[0] === 'post-earnings core: ok (FRST 3/10; +EPS at 10 sessions untagged; blank EPS 5/5; past next date 1/5) | mode now: ' + mode,
      'P6 self-test line ' + JSON.stringify(props) + ': ' + rep[0]);
 }
 // The REAL dt10SelfTest (full workbook stub, zero FAIL, the new line present) is
@@ -473,9 +547,9 @@ const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(src, /^var\s
 ok([...fb].every((f) => fn.has(f)) && [...vb].every((v) => vn.has(v)), 'P7 zero functions / vars removed');
 ok(deep([...fn].filter((f) => !fb.has(f)).sort(), ['dt10ApplyPostEarnTags_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_',
    'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10WeekdaysBetween_']) &&
-   deep([...vn].filter((v) => !vb.has(v)).sort(), ['DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG']),
+   deep([...vn].filter((v) => !vb.has(v)).sort(), ['DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG']),
    'P7 exactly the designed names added');
-ok(fb.size === 218 && fn.size === 224 && vb.size === 117 && vn.size === 120, 'P7 census 218 -> 224 functions, 117 -> 120 vars');
+ok(fb.size === 218 && fn.size === 224 && vb.size === 117 && vn.size === 121, 'P7 census 218 -> 224 functions, 117 -> 121 vars');
 const edits = require('./js/dt10_edits_v1180.json');
 ok(edits.length === 7, 'P7 seven hunks');
 ok(crypto.createHash('sha256').update(base).digest('hex') === history.V1171_SHA256, 'P7 reversal = the reviewed v1.17.1 file (SHA-256 pinned)');
