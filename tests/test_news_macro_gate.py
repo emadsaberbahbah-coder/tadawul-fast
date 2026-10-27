@@ -687,6 +687,20 @@ def test_g7_memory_respects_the_verdict_windows(armed):
     assert ng.read_memory(workbook(), FakeSheets.SID, late, 1500) == []      # no tab yet
 
 
+def test_g7_memory_carries_only_the_selected_sources(armed):
+    """Codex P2 on #862: a market-only run must not be moved by remembered
+    GDELT / Google-News headlines."""
+    (rc, rep), sh = _run()
+    later = NOW + dt.timedelta(hours=2)
+    (rc2, rep2), _ = _run(sheets=sh, now=later, write=False, sources=["market"])
+    assert rep2["counts"]["carried"] == 0
+    assert rep2["gate"]["verdict"] == "CAUTION"               # the static FOMC schedule only
+    assert not any(d.startswith("macro") for d in rep2["gate"]["drivers"])
+    only_gn = ng.read_memory(sh, FakeSheets.SID, later, 1500, ["google_news"])
+    assert only_gn and {m["source"] for m in only_gn} == {"google_news"}
+    assert ng.read_memory(sh, FakeSheets.SID, later, 1500, ["edgar", "market"]) == []
+
+
 def test_g7_english_wires_confirm_without_gdelt(armed):
     """v1.0.2: GDELT throttled the runner on 27 Oct; Google-News in English
     reaches Reuters / AP / BBC on its own."""

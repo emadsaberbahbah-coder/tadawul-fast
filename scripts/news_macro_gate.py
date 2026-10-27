@@ -20,7 +20,9 @@ WHAT: (1) Memory: before clustering, the run reads back the newest
   taxonomy. A fresh copy wins on the same Item ID, nothing carried is
   written again, EDGAR and the Fed feed are re-read whole as before, and
   the gate row's Items cell shows "+N carried". Dry runs read it too
-  (read-only). (2) Google-News in English (US edition): four macro queries
+  (read-only). Only sources selected for the run are carried, so a run
+  limited by TFB_NEWS_GATE_SOURCES is not moved by an excluded source
+  (Codex review on #862). (2) Google-News in English (US edition): four macro queries
   (geopolitics, oil, rates, markets) and one per non-Saudi name, beside
   GDELT. (3) The Names Flagged cell lists INFO flags too (earnings
   released), BLOCK first, then WATCH, then INFO.
@@ -1327,12 +1329,15 @@ def _parse_stamp(text: Any, tz: _dt.timezone) -> Optional[_dt.datetime]:
     return None
 
 
-def read_memory(sheets: Any, sid: str, now: _dt.datetime, max_rows: int) -> List[Dict[str, Any]]:
+def read_memory(sheets: Any, sid: str, now: _dt.datetime, max_rows: int,
+                sources: Sequence[str] = MEMORY_SOURCES) -> List[Dict[str, Any]]:
     """v1.0.2: GDELT / Google-News headlines recorded by earlier runs that can
     still move the verdict (published within 24 h for macro, 72 h for a
     name), read from the newest max_rows rows of _News_Items. EDGAR and the
-    Fed feed are re-read whole every run, so their rows are not carried."""
-    if max_rows <= 0:
+    Fed feed are re-read whole every run, so their rows are not carried, and
+    a source left out of the run's selection is not carried either."""
+    allowed = {src for src in sources if src in MEMORY_SOURCES}
+    if max_rows <= 0 or not allowed:
         return []
     ids = read_values(sheets, sid, ITEMS_TAB, "A2:A")
     if not ids:
@@ -1345,7 +1350,7 @@ def read_memory(sheets: Any, sid: str, now: _dt.datetime, max_rows: int) -> List
         r = [str(x).strip() for x in row] + [""] * (len(ITEMS_HEADER) - len(row))
         iid, seen, pub, scope, source, domain, title, url = (r[0], r[1], r[2], r[3], r[8], r[9],
                                                              r[12], r[13])
-        if not iid or not scope or not title or source not in MEMORY_SOURCES:
+        if not iid or not scope or not title or source not in allowed:
             continue
         published = _parse_stamp(pub, UTC)
         if published is None:
@@ -1476,7 +1481,8 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     if sheets is not None and sid:
         t0 = col.clock()
         try:
-            memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000))
+            memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
+                                 sources)
         except Exception as exc:  # memory is a help, never a reason to fail
             memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
         _out(f"[news_gate v{__version__}] memory: {len(memory)} items within 24 h / 72 h in "
