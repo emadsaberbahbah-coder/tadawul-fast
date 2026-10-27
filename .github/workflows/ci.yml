@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.50 (2026-10-28) -- NEWS & MACRO GATE (OBSERVE)
+#
+# v1.1.50 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.49 are #848-#856
+# and #858): run tests/test_news_macro_gate.py (scripts/news_macro_gate.py
+# v1.0.0 + data/news_gate_taxonomy.json + workflow news_macro_gate.yml: free
+# sources - SEC EDGAR, GDELT, Google-News RSS, the Federal Reserve RSS, EODHD
+# economic events and S&P 500 / VIX - graded by source tier and information
+# grade into an observe-only GO / CAUTION / NO_NEW_ENTRY verdict with per-name
+# flags) in the blocking lean lane. Offline: the real module against a fake
+# HTTP session and an in-memory workbook; no provider is called. Nothing is
+# removed and no existing entry moves.
+#
 # VERSION 1.1.49 (2026-10-28) -- DAILY SYNC _Status STAMP BUDGET
 #
 # v1.1.49 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.48 are #848-#856):
@@ -911,6 +923,7 @@ jobs:
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
             tests/test_daily_sync_stamp_budget.py \
+            tests/test_news_macro_gate.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
