@@ -210,7 +210,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
-    ("core.providers.calendar_provider", "__version__", "1.2.2",
+    # 2026-10-27 (A4; manifest pin only, SCRIPT_VERSION unchanged as in the
+    # 2026-10-21 note): 1.2.2 -> 1.3.0 (fetch_last_earnings_map, additive).
+    ("core.providers.calendar_provider", "__version__", "1.3.0",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
@@ -258,7 +260,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pit_snapshot", "1.1.1", "pit snapshot"),
     ("run_daily_brief", "1.18.1", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
-    ("run_calendar_sync", "1.1.4", "calendar sync"),
+    # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
+    ("run_calendar_sync", "1.2.0", "calendar sync"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)

@@ -94,6 +94,10 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           TFB_CALENDAR_ENABLED: "1"
+          # 2026-10-27 (A4): run_calendar_sync v1.2.0 last-report columns;
+          # default off = the v1.1.4 seven-column table. Arm with the repo
+          # Variable TFB_CAL_LAST_REPORT=on.
+          TFB_CAL_LAST_REPORT: ${{ vars.TFB_CAL_LAST_REPORT || 'off' }}
         run: |
           if [[ -z "${EODHD_API_KEY:-}" ]]; then
             echo "::error::EODHD_API_KEY secret not set (add the rotated token in repo Settings → Secrets)."
