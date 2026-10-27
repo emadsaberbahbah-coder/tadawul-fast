@@ -21,6 +21,12 @@ GOLD   G1      against the pre-flip tree (TFB_TEST_LAUNCH_BASE = a directory
                before the 2026-10-21 renumbering): the
                same unset environment reads OFF on the base - the golden
                negative for "defaults armed".
+               Current base (2026-10-27): `git show ac6888c1:<path>` for
+               core/analysis/opportunity_builder.py,
+               core/analysis/portfolio_actions.py and core/data_engine_v2.py,
+               saved flat (builder 1.28.1, actions 1.16.1, engine 5.159.0).
+               The older commits named above were the base before later
+               renumberings and now fail G1's version checks.
 
 Run:  python tests/test_decision_pages_defaults.py   (prints PASS k/k)
       pytest -q tests/test_decision_pages_defaults.py
@@ -189,6 +195,8 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     # merged): builder 1.27.3, actions 1.16.1, engine 5.159.0.
     # 2026-10-24: the bundle head is 2462215c (main #821-#829 merged); the same
     # versions, so the assertions below are unchanged.
+    # 2026-10-27 (second): the bundle head is ac6888c1 (main #854 merged); the
+    # three module blobs equal 0d2f989c's, so the assertions below are unchanged.
     # 2026-10-27: the bundle head is 0d2f989c (main #844, #847-#853 merged):
     # builder 1.28.1 (renumbered over #848's 1.28.0), actions 1.16.1, engine
     # 5.159.0.

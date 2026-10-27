@@ -6,6 +6,8 @@ Renumbered 2026-10-22 (merge of the re-merged #778 bundle, which now carries mai
 
 Renumbered 2026-10-27 (merge of the re-merged #778 bundle 0d2f989c, which now carries main #844, #847-#853): main's #848 shipped a different opportunity_builder 1.28.0 (ranking challenger in shadow, `TFB_OPP_RANK_MODE` default legacy) and the bundle's data-quality gates moved to 1.28.1 over it, so the builder half of this PR is **opportunity_builder 1.28.2** (authored as 1.28.0); `TFB_OPP_*=0` restores 1.28.1. portfolio_actions stays 1.17.0 and data_engine_v2 stays 5.160.0. Pins: verify_deployment 1.0.65 (builder 1.28.2). `tests/test_decision_pages_defaults.py` G1 now loads the pre-flip copies from the bundle head 0d2f989c (builder 1.28.1, actions 1.16.1, engine 5.159.0). No default changed in the renumbering.
 
+Updated 2026-10-27 (second; merge of the bundle re-merged with main #854, `ac6888c1`; this PR's merge is `60d85f08`, a clean automatic merge): no version or default changed. The three pre-flip module blobs are identical at `0d2f989c` and `ac6888c1`, so G1 may load either; G1 PASS with `ac6888c1` copies (12 passed under pytest, PASS 11/11 as a script). The "Pristine copies" row in S0 and the G1 line in S3 name the original 2026-10-15 base `8c5b1e54`; that base now fails G1's version checks, so use `git show ac6888c1:<path>` for core/analysis/opportunity_builder.py, core/analysis/portfolio_actions.py and core/data_engine_v2.py, saved flat in one directory.
+
 ## S0 - Decision and base
 | Item | Value |
 |---|---|
