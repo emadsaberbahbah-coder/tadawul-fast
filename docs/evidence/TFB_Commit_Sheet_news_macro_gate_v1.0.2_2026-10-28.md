@@ -7,7 +7,7 @@
 
 **Files:**
 - `scripts/news_macro_gate.py`: 1.0.1 -> 1.0.2; WHY block prepended, earlier text kept verbatim.
-- `tests/test_news_macro_gate.py`: 73 cases.
+- `tests/test_news_macro_gate.py`: 74 cases.
 - `scripts/verify_deployment.py`: pin 1.0.2.
 - This sheet.
 
@@ -43,7 +43,7 @@ A hand check (web, 28 Oct 02:20 Riyadh) confirms that attacks on shipping in Hor
 ### Review fix (Codex, PR #862, head `1744b8c7`)
 | Finding | Fix | Golden negative |
 |---|---|---|
-| Memory imported GDELT and Google-News headlines even when `TFB_NEWS_GATE_SOURCES` (or the dispatch `sources` input) left them out. A market-only dry run after a normal write still read NO_NEW_ENTRY from the remembered Hormuz news. | `read_memory()` takes the run's source selection and carries only GDELT / Google-News rows that are selected. With neither selected, it does not read the tab at all. | `test_g7_memory_carries_only_the_selected_sources`: 6 items carried on `1744b8c7`, 0 now. The market-only run reads CAUTION (static FOMC schedule only). |
+| Memory imported GDELT and Google-News headlines even when `TFB_NEWS_GATE_SOURCES` (or the dispatch `sources` input) left them out. A market-only dry run after a normal write still read NO_NEW_ENTRY from the remembered Hormuz news. | `read_memory()` takes the run's source selection and carries only GDELT / Google-News rows that are selected. With neither selected, it does not read the tab at all. Same pass: a name's rows are carried only while the name is in today's scope, so yesterday's board seat cannot raise a flag today. | `test_g7_memory_carries_only_the_selected_sources`: 6 items carried on `1744b8c7`, 0 now. The market-only run reads CAUTION (static FOMC schedule only).<br>`test_g7_memory_drops_a_name_that_left_the_scope` |
 
 Unchanged:
 - verdict rules and thresholds;
@@ -54,9 +54,9 @@ Unchanged:
 - observe-only mode.
 
 ## S3 - Tests
-- `tests/test_news_macro_gate.py`: 73 passed (69 before).
-- 7 fail on `2f8ead9f`: the four changes above, the review fix, and two version-string checks.
-- The review-fix case fails on `1744b8c7`.
+- `tests/test_news_macro_gate.py`: 74 passed (69 before).
+- 8 fail on `2f8ead9f`: the four changes above, the two review-pass cases, and two version-string checks.
+- Both review-pass cases fail on `1744b8c7`.
 - Manifest pins, the workflow audit (errors 0, warnings 0) and the related suites pass (122). All files are ASCII.
 
 ## S4 - Known limits / next

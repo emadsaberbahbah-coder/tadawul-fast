@@ -701,6 +701,16 @@ def test_g7_memory_carries_only_the_selected_sources(armed):
     assert ng.read_memory(sh, FakeSheets.SID, later, 1500, ["edgar", "market"]) == []
 
 
+def test_g7_memory_drops_a_name_that_left_the_scope(armed):
+    (rc, rep), sh = _run()
+    later = NOW + dt.timedelta(hours=2)
+    every = ng.read_memory(sh, FakeSheets.SID, later, 1500)
+    assert "FRST.US" in {m["scope"] for m in every}
+    kept = ng.read_memory(sh, FakeSheets.SID, later, 1500, ng.MEMORY_SOURCES, ["5023.SR", "BADCO.US"])
+    assert "FRST.US" not in {m["scope"] for m in kept}
+    assert {m["scope"] for m in kept} >= {"MACRO"}                       # macro is always carried
+
+
 def test_g7_english_wires_confirm_without_gdelt(armed):
     """v1.0.2: GDELT throttled the runner on 27 Oct; Google-News in English
     reaches Reuters / AP / BBC on its own."""
