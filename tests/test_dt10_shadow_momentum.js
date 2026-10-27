@@ -206,7 +206,10 @@ console.log('M6 PASS builder alias');
 
 // ------------------------------------------------------------ M7 self-test lines
 const s0 = src.indexOf('  /* v1.17.1 [SHADOW-MOMENTUM]: the challenger\'s momentum input travels on');
-const s1 = src.indexOf('  /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race', s0);
+// 2026-10-27: v1.18.0 (post-earnings tag) inserts its self-test block between this one and
+// SYNC-INFLIGHT; the slice ends where that block starts (pin moved).
+const sPe = src.indexOf('  /* v1.18.0 [POST-EARNINGS]: pure core on the FRST case', s0);
+const s1 = sPe > 0 ? sPe : src.indexOf('  /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race', s0);
 const m0 = src.indexOf('  /* v1.11.13 [P-202]: property memo -- the no-arg projection is ONE list');
 ok(s0 > 0 && s1 > s0 && m0 > 0 && m0 < s0, 'M7 self-test blocks located');
 function runBlock(ctx, code) {
@@ -226,14 +229,19 @@ for (const [props, sent] of [[{}, 'no'], [{ DT10_SHADOW_RANK_LOG: 'on' }, 'yes']
 console.log('M7 PASS embedded self-test lines');
 
 // ------------------------------------------------------------ M8 static
-ok((src.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(src.split('\n')[3]),
-   'M8 version lockstep 1.17.1');
+// 2026-10-27: v1.18.0 (post-earnings tag) stacked on this change; pins moved. The delivered file
+// is v1.18.0; the added-lines lint and the census compare the v1.17.1 file rebuilt from it
+// (v1.18.0 edits reversed, SHA-256 pinned) with v1.17.0.
+const s1171 = history.v1171Source(src);
+ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
+   (s1171.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(s1171.split('\n')[3]),
+   'M8 version lockstep 1.18.0 (delivered) and 1.17.1 (rebuilt)');
 const why = src.slice(src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), src.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'));
 ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'M8 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'), base.indexOf(' * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE]'))) > 0,
    'M8 the v1.17.0 WHY block verbatim');
 const baseLines = new Set(base.split('\n'));
-const added = src.split('\n').filter((l) => !baseLines.has(l));
+const added = s1171.split('\n').filter((l) => !baseLines.has(l));
 ok(added.length >= 80 && added.length <= 160, 'M8 added lines ' + added.length);
 for (const l of added) {
   if (/^ \* Version: 1\.17\.1 /.test(l)) continue;   // the version line keeps its pre-existing em dash
@@ -242,8 +250,8 @@ for (const l of added) {
   ok(!/\b(let|const|class)\s|=>|`|\.\.\./.test(code) || /^\s*(\*|\/\*)/.test(l), 'M8 ES5 added line: ' + l);
 }
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
-const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(src, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
-const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(src, /^var\s+([A-Za-z_$][\w$]*)/mg);
+const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(s1171, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(s1171, /^var\s+([A-Za-z_$][\w$]*)/mg);
 ok([...fb].every((f) => fn.has(f)) && [...vb].every((v) => vn.has(v)), 'M8 zero functions / vars removed');
 ok(deep([...fn].filter((f) => !fb.has(f)), ['dt10PoolFieldsWithShadow_']) && deep([...vn].filter((v) => !vb.has(v)), ['DT10_SHADOW_POOL_FIELDS']),
    'M8 exactly the designed names added');

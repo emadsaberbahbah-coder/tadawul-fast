@@ -1,11 +1,60 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.17.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.18.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.18.0 (2026-10-27) [POST-EARNINGS] -- THE BOARD SAYS WHEN A NAME HAS JUST REPORTED
+ * WHY (program register A4 part 2; FRST post-mortem P1): the first funded
+ * ticket (FRST.US, 26 Oct 2026) was bought two sessions after a 22% EPS miss
+ * (Q3 reported 22 Oct after the close; -4.1% and -3.7% on heavy volume the
+ * next sessions). Every calendar signal on this board looks FORWARD (v1.6.0
+ * '\u26a0 earnings \u2264Nd'); nothing showed that a seat had just reported,
+ * let alone missed. Calendar_Events now carries the last report
+ * (calendar_sync v1.2.0 with TFB_CAL_LAST_REPORT, calendar_provider v1.3.1
+ * and v1.3.2): Last Earnings Date | Days Since Earnings | EPS Surprise %.
+ * WHAT (only when Script Property DT10_POST_EARN is observe or on; absent,
+ * blank or anything else = off = v1.17.1 byte for byte): after the v1.6.0
+ * forward tag, every SELECTED ticket whose symbol reported inside its
+ * quarantine gets its Advisor Note prefixed with
+ *   '\u26a0 post-earnings S/L \u00b7 EPS x% \u00b7 '
+ * where S = weekday sessions after the report date up to today (Riyadh
+ * calendar day; Mon-Fri, exchange holidays not known) and L = 5, or 10 when
+ * the EPS surprise is negative (interim trading policy rule 3, program doc
+ * section 5). A blank surprise is unknown -> 5. One Calendar_Events read per
+ * render (A1 to the last column, at most 16), only when armed; any read
+ * fault -> no tag and the token 'post-earn n/a'. The status line gains
+ * 'post-earn \u26a0N/M' (tagged / selected) after the forward 'earn' token.
+ * A withheld row (feed NOT_ACTIONABLE) keeps the post-earnings prefix as
+ * research context, like the forward prefix (dt10UvWithholdRow_; with no
+ * post-earnings tag on the note the kept prefix is the v1.17.1 one).
+ * OBSERVE ONLY on this board: nothing gates, blocks, resizes or re-ranks.
+ * Downstream, the daily brief lists only notes that begin with INVEST
+ * (optionally after the forward tag), so a tagged seat drops out of the
+ * brief's executable picks - interim rule 3 (pinned by
+ * tests/test_daily_brief_post_earnings_tag.py); the v2 decision pages show
+ * the tag once 01_Menu reads it (register A12). Interim rule 3 stays a hand
+ * check at every GO/NO-GO until the enforce step (no new money for a tagged
+ * seat) ships after a week of observed tags. KSA names carry no last report
+ * (EODHD has no Saudi coverage), so they are never tagged here.
+ * Functions added (0 removed): dt10PostEarnMode_, dt10WeekdaysBetween_
+ * (pure), dt10PostEarnMapFromValues_ (pure), dt10PostEarnMap_,
+ * dt10ApplyPostEarnTags_ (pure), dt10PostEarnAnnotate_. Changed:
+ * dt10RenderPayload_ (one call after the forward tag), dt10UvWithholdRow_
+ * (keeps the new prefix), dt10SelfTest (new 'post-earnings core' line).
+ * Vars added: DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS,
+ * DT10_POST_EARN_SESSIONS_NEG.
+ * Harness: tests/test_dt10_post_earnings.js (REAL file; golden negative on
+ * the v1.17.1 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent / off / junk / faulted; ES5/ASCII lint;
+ * inventory).
+ * Rollback: DT10_POST_EARN off (or delete it) with no re-paste; or re-paste
+ * v1.17.1.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep.
  *
  * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM] -- THE CHALLENGER GETS ITS MOMENTUM INPUT
  * WHY (first shadow day, 27 Oct 2026): the pre-registered challenger order
@@ -2063,7 +2112,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.17.1';
+var DT10_VERSION = '1.18.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -4817,7 +4866,11 @@ function dt10UvWithholdRow_(row, idxList, noteIdx, reason) {
   if (noteIdx < row.length) {
     // Calendar proximity is research context. Keep only the generated
     // prefix; never preserve the previous order narrative or numbers.
-    var earnings = String(row[noteIdx] || '').match(/^(\u26a0 earnings \u2264\d+d \u00b7 )/);
+    // v1.18.0 [POST-EARNINGS]: the post-earnings prefix is research context
+    // too; it can only exist while DT10_POST_EARN is armed, so without it
+    // the kept prefix is the v1.17.1 one.
+    var earnings = String(row[noteIdx] || '').match(
+        /^((?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?(?:\u26a0 earnings \u2264\d+d \u00b7 )?)/);
     row[noteIdx] = (earnings ? earnings[1] : '') + dt10UvWithholdNote_(reason);
   }
   return row;
@@ -6512,6 +6565,147 @@ function dt10EarningsAnnotate_(payload, ss) {
     return { note: n ? 'earn \u26a0' + n + '/' + sel.length : '', map: map };
   } catch (eEa) {
     return { note: '' };
+  }
+}
+/** v1.18.0 [POST-EARNINGS]: Script Property that arms the post-earnings
+ * advisor tag (observe | on; anything else = off) and the quarantine lengths
+ * of the interim trading policy (rule 3): sessions after any report, and
+ * after a report with a negative EPS surprise. */
+var DT10_POST_EARN_PROP = 'DT10_POST_EARN';
+var DT10_POST_EARN_SESSIONS = 5;
+var DT10_POST_EARN_SESSIONS_NEG = 10;
+/** v1.18.0 [POST-EARNINGS]: 'observe' when DT10_POST_EARN is observe or on
+ * (any case, surrounding blanks ignored); else 'off'. Never throws. */
+function dt10PostEarnMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_POST_EARN_PROP) || '');
+  } catch (ePe) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'observe' || raw === 'on') ? 'observe' : 'off';
+}
+/** v1.18.0 [POST-EARNINGS] PURE: weekday sessions (Mon-Fri) after `fromDay`
+ * up to and including `toDay` (integer UTC days from dt10CalendarDay_).
+ * Exchange holidays are not known here. */
+function dt10WeekdaysBetween_(fromDay, toDay) {
+  var n = 0;
+  if (typeof fromDay !== 'number' || typeof toDay !== 'number') return n;
+  for (var d = fromDay + 1; d <= toDay; d++) {
+    var dow = ((d % 7) + 11) % 7;   // day 0 (1970-01-01) was a Thursday; 0 = Sunday
+    if (dow >= 1 && dow <= 5) n++;
+  }
+  return n;
+}
+/** v1.18.0 [POST-EARNINGS] PURE: {SYMBOL: {date, sessions, surprise}} from a
+ * Calendar_Events grid for the rows whose Last Earnings Date lies before
+ * `asOfDate` (a Riyadh calendar day; default now). The header row is the
+ * first one carrying 'Symbol' and 'Last Earnings Date' ('EPS Surprise %'
+ * optional). surprise = the cell's number, or null when blank / text. A grid
+ * without the last-report columns, or a blank / invalid date -> no entry. */
+function dt10PostEarnMapFromValues_(values, asOfDate) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, iSur = -1, r, c, cells, tok, rs, rd, rp;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    rs = -1; rd = -1; rp = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol') rs = c;
+      else if (tok === 'lastearningsdate') rd = c;
+      else if (tok === 'epssurprise') rp = c;
+    }
+    if (rs >= 0 && rd >= 0) { iSym = rs; iDate = rd; iSur = rp; }
+  }
+  if (iSym < 0 || iDate < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL' ||
+        Object.prototype.hasOwnProperty.call(map, sym)) continue;
+    var day = dt10CalendarDay_(cells[iDate]);
+    if (day === null || day >= today) continue;
+    var raw = iSur >= 0 ? cells[iSur] : null, sur = null;
+    if (typeof raw === 'number' && isFinite(raw)) {
+      sur = raw;
+    } else if (typeof raw === 'string' && /^\s*[+-]?\d+(\.\d+)?\s*$/.test(raw)) {
+      sur = parseFloat(raw);
+    }
+    map[sym] = { date: new Date(day * 86400000).toISOString().slice(0, 10),
+                 sessions: dt10WeekdaysBetween_(day, today), surprise: sur };
+  }
+  return map;
+}
+/** v1.18.0 [POST-EARNINGS]: live Calendar_Events read (A1 to the last
+ * column, at most 16). ANY failure => empty map => zero tags. */
+function dt10PostEarnMap_(ss, asOfDate) {
+  try {
+    var sh = ss.getSheetByName('Calendar_Events');
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 16);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10PostEarnMapFromValues_(
+        sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
+  } catch (ePm) {
+    return {};
+  }
+}
+/** v1.18.0 [POST-EARNINGS] PURE: prefixes
+ * '\u26a0 post-earnings S/L \u00b7 EPS x% \u00b7 ' onto advisor_note for the
+ * tickets inside their quarantine (S sessions since the report, L = 5, or 10
+ * after a negative EPS surprise). Idempotent: a note already carrying the
+ * prefix is never tagged again. Returns the tag count. */
+function dt10ApplyPostEarnTags_(tickets, map) {
+  var n = 0;
+  if (!tickets || !tickets.length || !map) return n;
+  for (var i = 0; i < tickets.length; i++) {
+    var t = tickets[i];
+    if (!t) continue;
+    var sym = dt10NormSym_(t.symbol);
+    if (!sym || !Object.prototype.hasOwnProperty.call(map, sym)) continue;
+    var e = map[sym];
+    var lim = (e.surprise !== null && e.surprise < 0) ?
+        DT10_POST_EARN_SESSIONS_NEG : DT10_POST_EARN_SESSIONS;
+    if (!(e.sessions >= 0 && e.sessions <= lim)) continue;
+    var note = String(t.advisor_note || '');
+    if (note.indexOf('\u26a0 post-earnings ') >= 0) continue;
+    var eps = e.surprise === null ? 'n/a' :
+        (e.surprise > 0 ? '+' : '') + e.surprise.toFixed(1) + '%';
+    t.advisor_note = '\u26a0 post-earnings ' + e.sessions + '/' + lim +
+        ' \u00b7 EPS ' + eps + ' \u00b7 ' + note;
+    n++;
+  }
+  return n;
+}
+/** v1.18.0 [POST-EARNINGS]: orchestrator - '' when DT10_POST_EARN is off
+ * (no sheet read, nothing touched); else tags the SELECTED board in place
+ * and returns the status token 'post-earn \u26a0N/M' ('post-earn 0/M' when
+ * no seat is inside a quarantine, 'post-earn n/a' when the calendar holds no
+ * last report or the read failed). Guarded end to end. */
+function dt10PostEarnAnnotate_(payload, ss) {
+  if (dt10PostEarnMode_() === 'off') return '';
+  try {
+    var map = dt10PostEarnMap_(ss);
+    var sel = (payload && payload.selected) || [];
+    var n = dt10ApplyPostEarnTags_(sel, map);
+    var k = 0, q;
+    for (q in map) {
+      if (Object.prototype.hasOwnProperty.call(map, q)) k++;
+    }
+    Logger.log('[DT10 v' + DT10_VERSION + '] post-earnings tags: ' + n + '/' +
+               sel.length + ' tickets (last reports ' + k + '; quarantine ' +
+               DT10_POST_EARN_SESSIONS + '/' + DT10_POST_EARN_SESSIONS_NEG +
+               ' sessions)');
+    if (!k) return 'post-earn n/a';
+    return 'post-earn ' + (n ? '\u26a0' : '') + n + '/' + sel.length;
+  } catch (ePa) {
+    return 'post-earn n/a';
   }
 }
 function dt10WritePageStatus_(status, message, httpCode, rows, durationMs,
@@ -8538,6 +8732,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // v1.13.2: annotate after the last note-replacing finalization, before
   // painting the board. The refresh status and selection log use this result.
   var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
+  // v1.18.0 [POST-EARNINGS]: the post-earnings advisor tag ('' when
+  // DT10_POST_EARN is off -> no sheet read, earn and every note untouched).
+  var postEarn = dt10PostEarnAnnotate_(payload, sheet.getParent());
+  if (postEarn) earn.note = earn.note ? earn.note + ' | ' + postEarn : postEarn;
   // KPI strip
   sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
@@ -9458,6 +9656,35 @@ function dt10SelfTest() {
        'ok (Momentum Score sent only while the shadow log is armed)' :
        'FAIL') +
       ' | sent now: ' + (dt10ShadowLogMode_() !== 'off' ? 'yes' : 'no'));
+  /* v1.18.0 [POST-EARNINGS]: pure core on the FRST case (reported Thu 22 Oct
+     after the close, EPS -22.2%; read on Tue 27 Oct = 3 sessions later). */
+  var peVals = [['Symbol', 'Next Earnings Date', 'Days To Earnings',
+      'Next Ex-Div Date', 'Days To ExDiv', 'Updated At (Riyadh)', 'Source',
+      'Last Earnings Date', 'Days Since Earnings', 'EPS Surprise %'],
+    ['FRST.US', '2027-01-28', 93, '', '', '', 's', '2026-10-22', 5, -22.2],
+    ['OPBK.US', '', '', '', '', '', 's', '2026-10-13', 14, 3.1],
+    ['WTFC.US', '', '', '', '', '', 's', '2026-10-20', 7, ''],
+    ['AER.US', '2026-10-28', 1, '', '', '', 's', '', '', '']];
+  var peMap = dt10PostEarnMapFromValues_(peVals, '2026-10-27');
+  var peT = [{ symbol: 'FRST.US', advisor_note: 'n1' },
+             { symbol: 'OPBK.US', advisor_note: 'n2' },
+             { symbol: 'WTFC.US', advisor_note: 'n3' },
+             { symbol: 'AER.US', advisor_note: 'n4' }];
+  var peN = dt10ApplyPostEarnTags_(peT, peMap);
+  var peN2 = dt10ApplyPostEarnTags_(peT, peMap);
+  var peKept = dt10UvWithholdRow_(['x', peT[0].advisor_note], [], 1, 'r');
+  report.push('post-earnings core: ' +
+      ((peN === 2 && peN2 === 0 && peMap['OPBK.US'].sessions === 10 &&
+        peT[0].advisor_note ===
+            '\u26a0 post-earnings 3/10 \u00b7 EPS -22.2% \u00b7 n1' &&
+        peT[1].advisor_note === 'n2' &&
+        peT[2].advisor_note === '\u26a0 post-earnings 5/5 \u00b7 EPS n/a \u00b7 n3' &&
+        peT[3].advisor_note === 'n4' &&
+        peKept[1].indexOf('\u26a0 post-earnings 3/10 \u00b7 EPS -22.2% \u00b7 ' +
+                          'SIZING WITHHELD') === 0) ?
+       'ok (FRST 3/10 tagged; +EPS at 10 sessions untagged; blank EPS 5/5)' :
+       'FAIL') +
+      ' | mode now: ' + dt10PostEarnMode_());
   /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race
      (ML run 37114669145 at 12:59, GM still run 37079471147 at 03:43) and
      the clean 10-04 case (both legs run 37160795404). */
