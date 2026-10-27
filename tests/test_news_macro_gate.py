@@ -295,7 +295,8 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("DEFAULT_SPREADSHEET_ID", FakeSheets.SID)
     monkeypatch.setenv("TFB_NEWS_GATE_GDELT_SPACING_S", "0")
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
-              "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES"):
+              "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES",
+              "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -626,6 +627,15 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
     assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.0")
+
+
+def test_g8_write_without_credentials_fails_loudly(armed, capsys):
+    """Codex P2 on #859: --write with a sheet id but no usable credentials
+    used to run as a quiet dry run and exit 0."""
+    http = FakeHTTP()
+    assert ng.main(["--write"], http=http, sheets=None, now=NOW, sleep=_sleep) == 2
+    assert http.calls == []
+    assert "--write needs readable GOOGLE_SHEETS_CREDENTIALS" in capsys.readouterr().out
 
 
 def test_g8_bad_now(armed):

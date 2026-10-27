@@ -1340,7 +1340,17 @@ def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any 
     if http is None:  # pragma: no cover - live run
         http = make_http_session()
     if sheets is None and sid and _credentials_info():  # pragma: no cover - live run
-        sheets = make_sheets_session()
+        try:
+            sheets = make_sheets_session()
+        except Exception as exc:
+            _out(f"[news_gate v{__version__}] could not open the workbook session: {type(exc).__name__}")
+            sheets = None
+    if args.write and sheets is None:
+        # A scheduled --write without a usable Sheets session must not pass
+        # as a quiet dry run (Codex P2, #859).
+        _out(f"[news_gate v{__version__}] --write needs readable GOOGLE_SHEETS_CREDENTIALS - "
+             "nothing collected, nothing written")
+        return 2
     max_names = _int_env("TFB_NEWS_GATE_MAX_NAMES", 15, 0, 60)
     scope: List[Dict[str, str]] = []
     if sheets is not None and sid:
