@@ -2,7 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.38 (2026-10-26) -- FUNDING EVIDENCE TRANSPORT
+# VERSION 1.1.40 (2026-10-27) -- RANKING CHALLENGER IN SHADOW
+#
+# v1.1.40 (1.1.39 is claimed by open PR #846): run
+# tests/test_opp_rank_challenger_a2.py (opportunity_builder v1.28.0:
+# TFB_OPP_RANK_MODE, default legacy = v1.27.2 byte for byte -- shadow
+# publishes a second, pre-registered order of the same INVEST pool as
+# shadow_rank + meta.rank_challenger without touching selection) in the
+# blocking lean lane next to the other opportunity-builder suites. Offline;
+# its golden legs read the v1.27.2 base with `git show` and print SKIP on a
+# shallow checkout.
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
 # v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
@@ -816,6 +825,7 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
+            tests/test_opp_rank_challenger_a2.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
