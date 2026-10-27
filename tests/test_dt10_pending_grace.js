@@ -359,7 +359,11 @@ function battery() {
     assert(rep.indexOf('pending grace (TFB_T10_PENDING_GRACE_DAYS): 0 (') > 0, 'property line default');
     assert(rep.indexOf('[DT10 v1.17.1] self-test') === 0, 'version line');
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
-    var baseLines = repB.split('\n'), newLines = rep.split('\n');
+    // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
+    // property memo, so the memo line reports one more key (keys=3); pin moved
+    var baseLines = repB.split('\n'), newLines = rep.split('\n').map(function (l) {
+      return l.replace('(pool fields memoized; keys=3; reads=1/execution)', '(pool fields memoized; keys=2; reads=1/execution)');
+    });
     var missing = baseLines.filter(function (l) { return l.indexOf('[DT10 v1.14.0]') !== 0 && newLines.indexOf(l) < 0; });
     deq(missing, [], 'every base self-test line present');
     var cores = baseLines.filter(function (l) { return / core: ok/.test(l); });

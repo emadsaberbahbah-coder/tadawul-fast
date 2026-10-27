@@ -19,7 +19,10 @@
  *      'momentumscore' for momentum_score, attached only off legacy
  *   M7 embedded self-test lines (off / on) and the memo line, zero FAIL
  *   M8 version lockstep, WHY block, ES5/ASCII lint of the diff, inventory,
- *      eight hunks whose reversal is the reviewed v1.17.0 file
+ *      nine hunks whose reversal is the reviewed v1.17.0 file
+ *   M9 one mode per execution: the log written after the POST uses the mode
+ *      the projection used, even when the property flips mid-run; with no
+ *      projection in the execution it reads the property (v1.17.0)
  * Run: node tests/test_dt10_shadow_momentum.js   (exit 0 = all PASS)
  */
 'use strict';
@@ -47,6 +50,8 @@ function load(source, props, opts) {
   const reads = [];
   const ctx = {
     Logger: { log() {} },
+    Session: { getScriptTimeZone: () => 'Asia/Riyadh' },
+    Utilities: { formatDate: (d, zone, pattern) => (pattern === 'yyyy-MM-dd' ? '2026-10-28' : '2026-10-28 04:02:00') },
     PropertiesService: {
       getScriptProperties() {
         if (opts.propsThrow) throw new Error('property service down');
@@ -195,8 +200,8 @@ console.log('M5 PASS pure helper');
 const ob = fs.readFileSync(OB, 'utf8');
 ok(/"momentum_score": \("momentumscore",\),/.test(ob), 'M6 opportunity_builder alias momentum_score <- momentumscore');
 ok('Momentum Score'.toLowerCase().replace(/[^a-z0-9]/g, '') === 'momentumscore', 'M6 the send normalizes to the alias');
-const guard = ob.indexOf('    if _env_rank_mode() != "legacy":\n        cand["momentum_score"] = _to_float(_field(view, "momentum_score"))');
-ok(guard > 0, 'M6 the builder attaches momentum_score only off legacy (champion never reads it)');
+ok(/if\s+_env_rank_mode\(\)\s*!=\s*["']legacy["']\s*:\s*\n\s+cand\[["']momentum_score["']\]\s*=\s*_to_float\(_field\(view,\s*["']momentum_score["']\)\)/.test(ob),
+   'M6 the builder attaches momentum_score only off legacy (champion never reads it)');
 console.log('M6 PASS builder alias');
 
 // ------------------------------------------------------------ M7 self-test lines
@@ -229,7 +234,7 @@ ok(src.indexOf(base.slice(base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG
    'M8 the v1.17.0 WHY block verbatim');
 const baseLines = new Set(base.split('\n'));
 const added = src.split('\n').filter((l) => !baseLines.has(l));
-ok(added.length >= 80 && added.length <= 130, 'M8 added lines ' + added.length);
+ok(added.length >= 80 && added.length <= 160, 'M8 added lines ' + added.length);
 for (const l of added) {
   if (/^ \* Version: 1\.17\.1 /.test(l)) continue;   // the version line keeps its pre-existing em dash
   ok(/^[\x09\x20-\x7e]*$/.test(l), 'M8 ASCII added line: ' + l);
@@ -244,10 +249,39 @@ ok(deep([...fn].filter((f) => !fb.has(f)), ['dt10PoolFieldsWithShadow_']) && dee
    'M8 exactly the designed names added');
 ok(fb.size === 217 && fn.size === 218 && vb.size === 116 && vn.size === 117, 'M8 census 217 -> 218 functions, 116 -> 117 vars');
 const edits = require('./js/dt10_edits_v1171.json');
-ok(edits.length === 8, 'M8 eight hunks');
+ok(edits.length === 9, 'M8 nine hunks');
 ok(crypto.createHash('sha256').update(base).digest('hex') === history.V1170_SHA256, 'M8 reversal = the reviewed v1.17.0 file (SHA-256 pinned)');
 new vm.Script(src, { filename: '16_Decision_Top10.gs' });
 console.log('M8 PASS lockstep, WHY, lint, inventory, hunks');
+
+// ------------------------------------------------------------ M9 one mode per execution
+const props9 = { DT10_SHADOW_RANK_LOG: 'on' };
+const c9 = load(src, props9);
+const noBlock = { meta: {}, selected: [] };
+c9.dt10PropMemoReset_();
+const sent9 = c9.dt10PoolFieldsActive_();
+ok(sent9.length === c9.DT10_POOL_FIELDS.length + 1 && c9.DT10_PROP_MEMO_.shadow_log_mode === 'on',
+   'M9 the projection keeps the mode it used (on)');
+props9.DT10_SHADOW_RANK_LOG = 'off';                    // flipped after the rows were built
+c9.__reads.length = 0;
+ok(c9.dt10AppendShadowRankLog_(null, noBlock, 'c') === 'ShadowLog: none (no challenger block)' &&
+   c9.__reads.indexOf('DT10_SHADOW_RANK_LOG') < 0,
+   'M9 rows sent with momentum -> the log still runs as armed (no second read)');
+c9.dt10PropMemoReset_();
+c9.dt10PoolFieldsActive_();                             // a new execution: off now
+ok(c9.DT10_PROP_MEMO_.shadow_log_mode === 'off', 'M9 a new execution reads the property again (off)');
+props9.DT10_SHADOW_RANK_LOG = 'on';                     // flipped on after rows went without momentum
+ok(c9.dt10AppendShadowRankLog_(null, noBlock, 'c') === '',
+   'M9 rows sent without momentum -> no log event that day from this run');
+c9.dt10PropMemoReset_();                                // no projection in this execution
+c9.__reads.length = 0;
+ok(c9.dt10AppendShadowRankLog_(null, noBlock, 'c') === 'ShadowLog: none (no challenger block)' &&
+   c9.__reads.filter((k) => k === 'DT10_SHADOW_RANK_LOG').length === 1,
+   'M9 no projection in the execution -> one live read, as in v1.17.0');
+const base9 = load(base, { DT10_SHADOW_RANK_LOG: 'on' });
+ok(base9.dt10AppendShadowRankLog_(null, noBlock, 'c') === 'ShadowLog: none (no challenger block)',
+   'M9 the v1.17.0 base answers the same on the same call');
+console.log('M9 PASS one mode per execution');
 
 const digest = crypto.createHash('sha256').update(src).digest('hex').slice(0, 12);
 console.log('ALL PASS (' + pass + ' checks) on ' + path.basename(SRC) + ' sha256 ' + digest);

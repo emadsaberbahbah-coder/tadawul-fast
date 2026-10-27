@@ -26,12 +26,21 @@
  * object of v1.17.0: every header map, pool row and POST body is byte for
  * byte unchanged. Under TFB_OPP_RANK_MODE=legacy the builder never reads the
  * field; under shadow it feeds only the challenger's second key, so the live
- * order, gates, verdicts, sizing and funding are unchanged either way.
+ * order, gates, verdicts, sizing and funding are unchanged either way. The
+ * mode is read ONCE per execution (memo 'shadow_log_mode') and the log
+ * written after the POST (dt10AppendShadowRankLog_) reuses it, so a property
+ * flipped mid-run cannot log a day whose rows went without momentum. The
+ * send follows the LOG switch, not TFB_OPP_RANK_MODE: with the log off and
+ * the backend in shadow the challenger runs without momentum (harmless while
+ * enforce is reserved); the promotion PR must send it whenever the backend
+ * ranks by it. (Independent review before merge, 27 Oct: mode read once,
+ * self-test memo swap in try/finally, field-count-proof self-test check.)
  * SECTION 8 KEPT: the value is the engine's own sheet column, sent as is.
  * Functions added (0 removed): dt10PoolFieldsWithShadow_. Changed:
- * dt10PoolFieldsActive_ (the memoized no-argument branch only), dt10SelfTest
- * ('property memo core' counts the armed field; new 'shadow pool fields
- * core'). Var added: DT10_SHADOW_POOL_FIELDS.
+ * dt10PoolFieldsActive_ (the memoized no-argument branch only),
+ * dt10AppendShadowRankLog_ (the memoized mode when the projection ran),
+ * dt10SelfTest ('property memo core' counts the armed field; new 'shadow
+ * pool fields core'). Var added: DT10_SHADOW_POOL_FIELDS.
  * Harness: tests/test_dt10_shadow_momentum.js (REAL file; golden negative on
  * the v1.17.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
  * identity with the property absent / off / junk; the builder alias read from
@@ -3232,10 +3241,13 @@ function dt10PoolFieldsActive_(legacy) {
   if (legacy === undefined) {   // v1.11.13 [P-202]: ONE list per execution
     return dt10PropMemoGet_('pool_fields_active', function () {
       // v1.17.1 [SHADOW-MOMENTUM]: + the challenger's inputs while the shadow
-      // rank log is armed; off -> the v1.17.0 list (the same object).
+      // rank log is armed; off -> the v1.17.0 list (the same object). The
+      // mode is read once and kept for this execution: the log written after
+      // the POST (dt10AppendShadowRankLog_) uses the same value.
+      var shadowMode = dt10PropMemoGet_('shadow_log_mode', dt10ShadowLogMode_);
       return dt10PoolFieldsWithShadow_(
           dt10PoolFieldsActive_(dt10W52FieldsLegacy_()),
-          dt10ShadowLogMode_() !== 'off');
+          shadowMode !== 'off');
     });
   }
   var leg = !!legacy;
@@ -7600,7 +7612,12 @@ function dt10ShadowLogRows_(payload, stamp, day, cohort) {
  * must be the header (written when blank; another layout is never written).
  * Returns the status token. NEVER throws. */
 function dt10AppendShadowRankLog_(ss, payload, cohort) {
-  var mode = dt10ShadowLogMode_();
+  // v1.17.1 [SHADOW-MOMENTUM]: the mode the pool projection used in this
+  // execution when it ran (the logged day and the sent rows agree); else the
+  // property itself, as in v1.17.0.
+  var mode = (typeof DT10_PROP_MEMO_ === 'object' && DT10_PROP_MEMO_ &&
+      Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, 'shadow_log_mode')) ?
+      DT10_PROP_MEMO_.shadow_log_mode : dt10ShadowLogMode_();
   if (mode === 'off') return '';
   try {
     var stamp = '';
@@ -9397,39 +9414,47 @@ function dt10SelfTest() {
       ((pmA === pmB && pmB === pmC && pmKeys >= 2 &&
         pmA.length === (dt10W52FieldsLegacy_() ? DT10_POOL_FIELDS.length - 4
                                                : DT10_POOL_FIELDS.length) +
-            (dt10ShadowLogMode_() !== 'off' ?
+            (DT10_PROP_MEMO_.shadow_log_mode !== 'off' ?
              DT10_SHADOW_POOL_FIELDS.length : 0))   // v1.17.1
        ? 'ok (pool fields memoized; keys=' + pmKeys + '; reads=1/execution)'
        : 'FAIL'));
   /* v1.17.1 [SHADOW-MOMENTUM]: the challenger's momentum input travels on
      the pool row only while the shadow rank log is armed. Pure: the memo is
-     swapped for the two projections and restored. */
+     swapped for the two projections and restored (finally). */
   var spOff = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, false);
   var spOn = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, true);
   var spTwice = dt10PoolFieldsWithShadow_(spOn, true);
+  var spTail = spOn.slice(DT10_POOL_FIELDS.length);
+  var spTailOk = spTail.length === DT10_SHADOW_POOL_FIELDS.length;
+  for (var spi = 0; spTailOk && spi < spTail.length; spi++) {
+    if (spTail[spi] !== DT10_SHADOW_POOL_FIELDS[spi]) spTailOk = false;
+  }
   var spHdr = ['Symbol', 'Name', 'Momentum Score'];
   var spMemo = DT10_PROP_MEMO_;
-  DT10_PROP_MEMO_ = { pool_fields_active: spOn };
-  var spMap = dt10MapHeaderCols_(spHdr);
-  var spRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
-      spMap, 'Global_Markets');
-  var spBlank = dt10PoolRowFromSheetRow_(['WPC.US', 'W. P. Carey', ''],
-      spMap, 'Global_Markets');
-  DT10_PROP_MEMO_ = { pool_fields_active: spOff };
-  var spOffMap = dt10MapHeaderCols_(spHdr);
-  var spOffRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
-      spOffMap, 'Global_Markets');
-  DT10_PROP_MEMO_ = spMemo;
+  var spMap = null, spRow = null, spBlank = null, spOffMap = null;
+  var spOffRow = null;
+  try {
+    DT10_PROP_MEMO_ = { pool_fields_active: spOn };
+    spMap = dt10MapHeaderCols_(spHdr);
+    spRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spMap, 'Global_Markets');
+    spBlank = dt10PoolRowFromSheetRow_(['WPC.US', 'W. P. Carey', ''],
+        spMap, 'Global_Markets');
+    DT10_PROP_MEMO_ = { pool_fields_active: spOff };
+    spOffMap = dt10MapHeaderCols_(spHdr);
+    spOffRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spOffMap, 'Global_Markets');
+  } finally {
+    DT10_PROP_MEMO_ = spMemo;
+  }
   report.push('shadow pool fields core: ' +
-      ((spOff === DT10_POOL_FIELDS && spOn !== DT10_POOL_FIELDS &&
-        spOn.length === DT10_POOL_FIELDS.length + 1 &&
-        spOn[spOn.length - 1].send === 'Momentum Score' &&
+      ((spOff === DT10_POOL_FIELDS && spOn !== DT10_POOL_FIELDS && spTailOk &&
         spTwice.length === spOn.length &&
-        spMap['Momentum Score'] === 2 && spRow !== null &&
+        spMap && spMap['Momentum Score'] === 2 && spRow !== null &&
         spRow['Momentum Score'] === 57.03 && spBlank !== null &&
         spBlank['Momentum Score'] === undefined &&
-        spOffMap['Momentum Score'] === undefined && spOffRow !== null &&
-        spOffRow['Momentum Score'] === undefined) ?
+        spOffMap && spOffMap['Momentum Score'] === undefined &&
+        spOffRow !== null && spOffRow['Momentum Score'] === undefined) ?
        'ok (Momentum Score sent only while the shadow log is armed)' :
        'FAIL') +
       ' | sent now: ' + (dt10ShadowLogMode_() !== 'off' ? 'yes' : 'no'));
