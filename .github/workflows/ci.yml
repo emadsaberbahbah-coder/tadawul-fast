@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.48 (2026-10-27) -- BIGQUERY ARCHIVE (C8 PHASE 1)
+#
+# v1.1.48 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.47 are #848-#855):
+# run tests/test_bq_archive.py
+# (scripts/archive_to_bigquery.py v1.0.0, the read-only daily copy of the
+# decision workbook's learning tabs into BigQuery; workflow bq_archive.yml)
+# in the blocking lean lane. Offline: the HTTP session is a fake, no google
+# library is imported, PyYAML (already in the lane) reads the workflow.
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.47 (2026-10-27) -- COCKPIT POST-EARNINGS TAG
 #
 # v1.1.47 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.46 are #848-#854):
@@ -867,6 +877,7 @@ jobs:
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
+            tests/test_bq_archive.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
