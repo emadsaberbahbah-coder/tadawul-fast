@@ -141,7 +141,8 @@ def test_l1_provider_window_env_batches_and_failures(provider, monkeypatch):
     monkeypatch.setattr(provider, "is_enabled", lambda: False)
     assert provider.fetch_last_earnings_sync(["AAA.US"]) == {}
     # 2026-10-27: v1.3.1 (404 batch split, gated) stacked on this change; pin moved
-    assert provider.__version__ == "1.3.1"
+    # 2026-10-27: v1.3.2 (venue batches + EODHD exchange codes, gated); pin moved
+    assert provider.__version__ == "1.3.2"
 
 
 def test_l2_forward_context_untouched(provider, monkeypatch):

@@ -227,7 +227,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-27 (A4; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note): 1.2.2 -> 1.3.0 (fetch_last_earnings_map, additive).
     # 2026-10-27 (same rule): 1.3.0 -> 1.3.1 (404 batch split, gated).
-    ("core.providers.calendar_provider", "__version__", "1.3.1",
+    # 2026-10-27 (same rule): 1.3.1 -> 1.3.2 (venue batches + EODHD exchange
+    # codes for the calendar, both gated).
+    ("core.providers.calendar_provider", "__version__", "1.3.2",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
