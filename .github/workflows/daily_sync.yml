@@ -1356,9 +1356,9 @@ jobs:
           # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
           # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
           TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
-          # (2026-10-27) track_performance v6.52.0 [OUTCOME-TALLY]: observe logs
-          # one line per audit with why due records did not mature, per
-          # exchange calendar. Measures only; inert on record-only schedules
+          # (2026-10-27) track_performance v6.52.0 [OUTCOME-TALLY]: observe logs,
+          # per audit, why due records did not mature (totals, then one line per
+          # exchange calendar). Measures only; inert on record-only schedules
           # (no audit). Mirrored from track_performance.yml (ENV PARITY).
           # Default off = v6.49.0. ROLLBACK: unset or off.
           TRACK_OUTCOME_TALLY: ${{ vars.TRACK_OUTCOME_TALLY || 'off' }}

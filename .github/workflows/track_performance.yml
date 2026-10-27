@@ -6,8 +6,9 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # (many .SR records targeted that session) could not be explained.
 # WHAT: the 'Run performance clock' step maps repository Variable
 # TRACK_OUTCOME_TALLY (default 'off' = 1.0.5 behaviour) to track_performance
-# v6.52.0: 'observe' logs one '[v6.52.0 OUTCOME-TALLY]' line per audit and
-# changes nothing else. daily_sync's tracker step maps the same Variable
+# v6.52.0: 'observe' logs '[v6.52.0 OUTCOME-TALLY]' lines per audit (totals,
+# then one per exchange calendar) and changes nothing else. daily_sync's
+# tracker step maps the same Variable
 # (ENV PARITY). Numbered 1.0.8 because open #841 / #845 claim 1.0.6 / 1.0.7.
 # Rollback: unset TRACK_OUTCOME_TALLY (or set off).
 # VERSION 1.0.5 (2026-10-24) -- CANONICAL PROSPECTIVE TARGETS
@@ -415,9 +416,9 @@ jobs:
           # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
           # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
           TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
-          # (2026-10-27) 1.0.8: v6.52.0 [OUTCOME-TALLY] observe logs one line per
-          # audit with why due records did not mature, per exchange calendar
-          # (and, for quote_session_unknown, minutes after the close). Measures
+          # (2026-10-27) 1.0.8: v6.52.0 [OUTCOME-TALLY] observe logs, per audit,
+          # why due records did not mature: a totals line, then one per exchange
+          # calendar (and, for quote_session_unknown, minutes after the close). Measures
           # only. 'off' = v6.49.0. Mirrored in daily_sync.yml (ENV PARITY).
           # ROLLBACK: unset or off.
           TRACK_OUTCOME_TALLY: ${{ vars.TRACK_OUTCOME_TALLY || 'off' }}

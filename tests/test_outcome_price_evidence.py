@@ -338,7 +338,8 @@ def _tally_audit(mode, monkeypatch):
     tp.logger.setLevel(logging.INFO)
     try:
         sr_close = CLOSE.replace(hour=12)
-        recs = [record(), record(symbol="2286.SR", target=CLOSE.replace(hour=8))]
+        recs = [record(symbol="2286.SR", target=CLOSE.replace(hour=8)), record(),
+                record(symbol="2286.SR", target=CLOSE.replace(hour=9))]
         rows = [row(price=110), row(symbol="2286.SR", price=30, quote=sr_close + timedelta(minutes=10, seconds=24))]
         run(app_with_response(rows).audit_active_records(recs))
     finally:
@@ -350,17 +351,18 @@ def _tally_audit(mode, monkeypatch):
 @pytest.mark.parametrize("mode", [None, "off", "1"])
 def test_outcome_tally_off_logs_nothing_new(mode, monkeypatch):
     recs, lines = _tally_audit(mode, monkeypatch)
-    assert recs[0].status == tp.PerformanceStatus.MATURED and recs[1].status == tp.PerformanceStatus.ACTIVE
+    assert recs[1].status == tp.PerformanceStatus.MATURED and recs[0].status == tp.PerformanceStatus.ACTIVE
     assert lines == [] and getattr(tp, "_OUTCOME_TALLY", None) is None
 
 
 def test_outcome_tally_observe_names_the_saudi_refusal(monkeypatch):
     recs, lines = _tally_audit("observe", monkeypatch)
-    assert recs[0].status == tp.PerformanceStatus.MATURED and recs[1].status == tp.PerformanceStatus.ACTIVE
-    assert lines == ["[v6.52.0 OUTCOME-TALLY] mode=observe evaluated=2 matured=1 expired=0 pending=1 | "
-                     "XNYS n=1 matured=1 expired=0 pending=0 reasons=- after_close_min=- | "
-                     "XSAU n=1 matured=0 expired=0 pending=1 reasons=quote_session_unknown:1 "
-                     "after_close_min=0-15:1"], lines
+    assert recs[1].status == tp.PerformanceStatus.MATURED and recs[0].status == tp.PerformanceStatus.ACTIVE
+    # two 2286.SR records, one symbol: n counts records, after_close_min symbols
+    assert lines == ["[v6.52.0 OUTCOME-TALLY] mode=observe evaluated=3 matured=1 expired=0 pending=2 calendars=2",
+                     "[v6.52.0 OUTCOME-TALLY] XSAU n=2 matured=0 expired=0 pending=2 "
+                     "reasons=quote_session_unknown:2 after_close_min=0-15:1",
+                     "[v6.52.0 OUTCOME-TALLY] XNYS n=1 matured=1 expired=0 pending=0 reasons=- after_close_min=-"], lines
     assert tp._OUTCOME_TALLY is None
 
 
