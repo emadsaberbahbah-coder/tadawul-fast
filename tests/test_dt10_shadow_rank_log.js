@@ -312,7 +312,8 @@ console.log('S7 PASS embedded self-test core');
 
 // ---------------------------------------------------------- S8 wiring + lint
 // 2026-10-27: v1.17.1 (shadow momentum) stacked on this change; pins moved (S9 checks the v1.17.0 file itself)
-ok((src.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.17.1 (delivered)');
+// 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
+ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.18.0 (delivered)');
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');
