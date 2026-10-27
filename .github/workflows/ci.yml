@@ -2,6 +2,20 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.44 (2026-10-27) -- CHALLENGER MOMENTUM INPUT
+#
+# v1.1.44 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.43 are #848-#851):
+# run tests/test_dt10_shadow_momentum.js (16_Decision_Top10.gs v1.17.1: the
+# pool row carries the engine's 'Momentum Score' only while
+# DT10_SHADOW_RANK_LOG is armed -- the challenger's second pre-registered key;
+# off = the v1.17.0 projection byte for byte) in the blocking lean lane's
+# native Apps Script step next to tests/test_dt10_shadow_rank_log.js. Offline;
+# rebuilds the v1.17.0 base from tests/js/dt10_edits_v1171.json (SHA-256
+# pinned). The board scorecard step also fetches f60cff37 (the untouched
+# score_selection_log v1.2.0) for the P15 golden legs of v1.2.1 (a shadow
+# day logged without the challenger's momentum input counts for neither
+# order). Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.43 (2026-10-27) -- BOARD SCORECARD HARNESS JOINS THE LEAN LANE
 #
 # v1.1.43 (1.1.39 is claimed by open PR #846; 1.1.40 is #848, 1.1.41 is
@@ -945,10 +959,12 @@ jobs:
           # untouched v1.0.0 (d25468a5) and v1.1.0 (53c8544e) scripts. The
           # checkout is shallow: fetch exactly those two commits; a failed
           # fetch only turns those legs into SKIP lines.
+          # v1.1.44: + the untouched v1.2.0 (f60cff37) for P15.
           git fetch --no-tags --depth=1 origin \
             d25468a548bcba082779f3d7d5f8b4dfadaac176 \
             53c8544e88d217054dcaf56d04fce110d002e4d2 \
-            || echo "::notice::scorecard golden bases not fetched - P9/P12 will SKIP"
+            f60cff37707812bd89f41c47ed4ddd3f2c4c9746 \
+            || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
           python tests/test_board_scorecard_p182.py
 
       - name: ✅ Coverage note
@@ -972,6 +988,7 @@ jobs:
           node tests/test_dt10_pending_grace.js
           node tests/test_dt10_funding_evidence.js
           node tests/test_dt10_shadow_rank_log.js
+          node tests/test_dt10_shadow_momentum.js
           node tests/test_pd_evidence_publish.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
