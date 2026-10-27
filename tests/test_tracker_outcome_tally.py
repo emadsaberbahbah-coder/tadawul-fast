@@ -14,23 +14,30 @@ Yahoo fallback off.
       between a refused quote and the session close (0-15, 15-20, 20-60,
       60+); a record not yet due, a non-ACTIVE record and a stamped record
       whose final reason is another one are not bucketed
-  T1b the production lane: Yahoo fallback on. Joined reasons
-      ('quote_session_unknown;quote_http_429') still bucket, and the
-      backend's stamp wins over a later refused Yahoo quote
+  T1b Yahoo fallback on, on the legacy AND the production FEED-R/breaker
+      feed paths: joined reasons ('quote_session_unknown;quote_http_429',
+      '<backend reason>;quote_session_unknown', '...;quote_rate_limit_breaker')
+      still bucket; the FIRST stamp wins (not the last, not the smallest);
+      a backend quote_session_stale quote is never stamped
   T2  observe changes nothing else: records, receipts, audit stats, every
-      other log record (level, logger, text) and stdout equal the off run
-  T3  OFF (unset, '', off, 0, 1, true, on, enforce, observed) over three
+      other log record (level incl. DEBUG, logger, text), stdout and stderr
+      equal the off run
+  T3  OFF (unset, '', off, 0, 1, true, on, enforce, observed) over four
       passes (mixed + HIST-CLOSE observe, dead feed with the fallback on,
-      no ACTIVE record): records, receipts, stats, log records and stdout
-      equal the base copy, or its digest on a shallow checkout, with only
-      SCRIPT_VERSION normalised; no collector is armed at any receipt
+      the T1b case on the production feed path, no ACTIVE record): records,
+      receipts, stats, tracker and root log records at every level,
+      stdout and stderr equal the base copy, or its digest on a shallow
+      checkout, with only SCRIPT_VERSION and wall-clock durations
+      normalised; no collector is armed at any receipt
   T4  INFO lines, after the MATURE-FRESH and HIST-CLOSE lines, one pass ->
       one block; collectors disarmed after a pass, and after a raising pass
       once the next audit call runs
   T5  edges: both sides of the 15 / 20 / 60 minute bucket edges; a
       regular_market quote refused after its 15 min slack; expired
-      unpriced; UNKNOWN calendar; nothing due -> no line; only live quote
-      kinds are stamped; the first stamp wins; helpers never raise
+      unpriced; UNKNOWN ordered by size like any calendar; a record with no
+      target time; per-reason sums equal the audit's counter; nothing due
+      -> no line; only live quote kinds are stamped; the first stamp wins;
+      helpers never raise
   T6  workflow and pins: both tracker steps map the Variable once (default
       'off'), header 1.0.8, SCRIPT_VERSION >= 6.52.0 in lockstep with
       docstring line 5 and the verify_deployment pin
@@ -84,7 +91,7 @@ OBSERVE = {ENV: "observe"}
 OFF_SPELLINGS = (None, "", "off", "0", "1", "true", "on", "enforce", "observed")
 # sha256[:16] of the base (v6.49.0) T3 output; proven against the base in T3
 # when the base is available, checked alone on a shallow CI checkout.
-OFF_GOLDEN = "ffa28067f021c852"
+OFF_GOLDEN = "30ffbf022760aef3"
 ADDED = {"_outcome_tally_mode", "_outcome_tally_begin", "_outcome_tally_end",
          "_outcome_tally_stamp", "_outcome_tally_calendar", "_outcome_tally_lines"}
 TAG = "[v6.52.0 OUTCOME-TALLY]"
@@ -215,11 +222,15 @@ def harness(mod, env, extra=None):
     saved_now = mod.RiyadhTime.__dict__["now"]
     level = mod.logger.level
     root = logging.getLogger()
+    root_level = root.level
     h = logging.Handler()
 
     def _emit(r):
-        logs.append(r.getMessage())
-        logs.records.append((r.levelno, r.name, r.getMessage()))
+        # the tracker's own logger and the root logger, at every level
+        # (DEBUG included); third-party loggers such as asyncio are not ours
+        if r.name == "root" or r.name.startswith(mod.logger.name):
+            logs.append(r.getMessage())
+            logs.records.append((r.levelno, r.name, r.getMessage()))
 
     h.emit = _emit
     try:
@@ -227,13 +238,15 @@ def harness(mod, env, extra=None):
             os.environ.pop(k, None)
         os.environ.update({k: v for k, v in env.items() if v is not None})
         root.addHandler(h)
-        mod.logger.setLevel(logging.INFO)
+        root.setLevel(logging.DEBUG)
+        mod.logger.setLevel(logging.NOTSET)
         for k, v in swaps.items():
             setattr(mod, k, v)
         mod.RiyadhTime.now = staticmethod(lambda: NOW)
         yield logs
     finally:
         mod.logger.setLevel(level)
+        root.setLevel(root_level)
         root.removeHandler(h)
         mod.RiyadhTime.now = saved_now
         for k in swaps:
@@ -252,15 +265,17 @@ def audit(mod, records, rows, env, extra=None):
     """One real audit pass. Returns logs, stats, stdout and whether the
     collectors were still armed when the pass returned (read before the
     harness resets them)."""
-    out = io.StringIO()
+    out, err = io.StringIO(), io.StringIO()
     with harness(mod, env, extra) as logs:
         app = mod.PerformanceTrackerApp.__new__(mod.PerformanceTrackerApp)
         app.backend = mod.BackendClient("https://transport.invalid")
         app.backend.post_json = AsyncMock(return_value=({"rows": rows}, None, 200))
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             asyncio.run(app.audit_active_records(records))
         armed = getattr(mod, "_OUTCOME_TALLY", None) is not None
-    return logs, dict(getattr(app, "_last_audit_stats", {}) or {}), out.getvalue(), armed
+    # stdout and stderr travel together (the job log merges them); logging's
+    # own stream handler keeps the real stderr, so it is not captured here
+    return logs, dict(getattr(app, "_last_audit_stats", {}) or {}), out.getvalue() + err.getvalue(), armed
 
 
 def state(mod, r):
@@ -321,8 +336,11 @@ def _passes(mod, env):
     r1 = audit(mod, recs, rows, hist, {"_hist_close_pull": lambda s: [], "_outcome_receipt": spy})
     dead = [rec(mod, "O", "OLD.US", US_CLOSE - timedelta(days=10)), rec(mod, "OS", "2280.SR", NOW - timedelta(hours=14))]
     r2 = audit(mod, dead, [], env, dict(fallback_on(mod, {}), _outcome_receipt=spy))
+    # the production feed path (FEED-R chain, breaker) with Saudi refusals and a 429ing fallback
+    t1b, t1b_rows, plan = _t1b_case(mod)
+    r2b = audit(mod, t1b, t1b_rows, env, dict(fallback_on(mod, plan), _feed_legacy=lambda: False, _outcome_receipt=spy))
     r3 = audit(mod, [rec(mod, "X", "DONE.US", US_CLOSE, status="MATURED")], [], env, {"_outcome_receipt": spy})
-    for (logs, stats, stdout, armed), group in ((r1, recs), (r2, dead), (r3, [])):
+    for (logs, stats, stdout, armed), group in ((r1, recs), (r2, dead), (r2b, t1b), (r3, [])):
         out.append(([state(mod, r) for r in group], stats, norm(mod, logs), stdout, armed))
     return out, seen
 
@@ -370,20 +388,49 @@ def test_t1_observe_counts_records_reasons_and_after_close_symbols():
     assert armed is False
 
 
-def test_t1b_fallback_on_joined_reasons_bucket_and_backend_stamp_wins():
+def _t1b_case(mod):
     today = NOW - timedelta(hours=14)
-    recs = [rec(TP, "Y1", "2286.SR", today), rec(TP, "Y2", "2222.SR", today)]
+    syms = ("2286.SR", "2222.SR", "2010.SR", "1150.SR", "4280.SR")
+    recs = [rec(mod, "Y%d" % i, s, today) for i, s in enumerate(syms)]
+    no_stamp = quote("2010.SR", 80.0, SR_CLOSE)
+    no_stamp.pop("acquisition_quote_asof")                     # backend: quote_timestamp_unknown
     rows = [quote("2286.SR", 30.0, SR_CLOSE + timedelta(minutes=10, seconds=24)),
-            quote("2222.SR", 27.0, SR_CLOSE + timedelta(minutes=17))]
-    # Yahoo refuses 2286.SR too, with its own regular_market stamp 20 min after the close
-    plan = {"2286.SR": SR_CLOSE + timedelta(minutes=20), "2222.SR": "429"}
-    logs, stats, _, _ = audit(TP, recs, rows, OBSERVE, fallback_on(TP, plan))
-    assert stats["outcome_skipped_reasons"] == {"quote_session_unknown": 1,
-                                                "quote_session_unknown;quote_http_429": 1}, stats
-    assert _tally_lines(logs)[1:] == [
-        TAG + " XSAU n=2 matured=0 expired=0 pending=2 "
-              "reasons=quote_session_unknown:1,quote_session_unknown;quote_http_429:1 "
-              "after_close_min=0-15:1,15-20:1"], logs
+            quote("2222.SR", 27.0, SR_CLOSE + timedelta(minutes=17)),
+            no_stamp,
+            quote("1150.SR", 25.0, SR_CLOSE + timedelta(minutes=25)),
+            quote("4280.SR", 10.0, SR_CLOSE - timedelta(days=1, hours=1))]   # Wed 11:00Z: quote_session_stale
+    plan = {"2286.SR": SR_CLOSE + timedelta(minutes=20),       # Yahoo refused after the backend: backend wins
+            "2222.SR": "429",
+            "2010.SR": SR_CLOSE + timedelta(minutes=19),       # only Yahoo stamps: 15-20
+            "1150.SR": SR_CLOSE + timedelta(minutes=16),       # Yahoo EARLIER than the backend: first (25) wins
+            "4280.SR": SR_CLOSE + timedelta(minutes=40)}       # backend stale is never stamped: Yahoo's 20-60
+    return recs, rows, plan
+
+
+def test_t1b_fallback_on_joined_reasons_bucket_and_backend_stamp_wins():
+    for legacy in (True, False):                               # False = the production FEED-R/breaker path
+        recs, rows, plan = _t1b_case(TP)
+        extra = dict(fallback_on(TP, plan), _feed_legacy=(lambda v=legacy: v))
+        logs, stats, _, _ = audit(TP, recs, rows, OBSERVE, extra)
+        assert stats["outcome_skipped_reasons"] == {
+            "quote_session_unknown": 2, "quote_session_unknown;quote_http_429": 1,
+            "quote_timestamp_unknown;quote_session_unknown": 1,
+            "quote_session_stale;quote_session_unknown": 1}, (legacy, stats)
+        assert _tally_lines(logs)[1:] == [
+            TAG + " XSAU n=5 matured=0 expired=0 pending=5 "
+                  "reasons=quote_session_unknown:2,quote_session_stale;quote_session_unknown:1,"
+                  "quote_session_unknown;quote_http_429:1,quote_timestamp_unknown;quote_session_unknown:1 "
+                  "after_close_min=0-15:1,15-20:2,20-60:2"], (legacy, logs)
+    # the production breaker: after N consecutive 429s the rest are skipped, and still bucket
+    today = NOW - timedelta(hours=14)
+    syms = ["40%02d.SR" % i for i in range(1, 6)]
+    recs = [rec(TP, s, s, today) for s in syms]
+    rows = [quote(s, 10.0, SR_CLOSE + timedelta(minutes=5)) for s in syms]
+    extra = dict(fallback_on(TP, {}), _feed_legacy=lambda: False, _fallback_break_429=lambda: 3)
+    logs, stats, _, _ = audit(TP, recs, rows, OBSERVE, extra)
+    assert stats["outcome_skipped_reasons"] == {"quote_session_unknown;quote_http_429": 3,
+                                                "quote_session_unknown;quote_rate_limit_breaker": 2}, stats
+    assert _tally_lines(logs)[1].endswith("after_close_min=0-15:5"), logs
 
 
 def test_t2_observe_changes_nothing_else():
@@ -392,7 +439,7 @@ def test_t2_observe_changes_nothing_else():
     for o in on:
         o[2][:] = [x for x in o[2] if "OUTCOME-TALLY]" not in x[2]]
     assert on == off
-    assert sum(1 for o in _passes(TP, OBSERVE)[0] for x in o[2] if "OUTCOME-TALLY]" in x[2]) == 3 + 3
+    assert sum(1 for o in _passes(TP, OBSERVE)[0] for x in o[2] if "OUTCOME-TALLY]" in x[2]) == 3 + 3 + 2
 
 
 def _check_off(spelling):
@@ -459,10 +506,21 @@ def test_t5_edges_and_helpers():
     assert old.status == TP.PerformanceStatus.EXPIRED, old.status
     assert _tally_lines(logs)[1:] == [TAG + " XNYS n=1 matured=0 expired=1 pending=0 "
                                       "reasons=expired:price_unavailable:1 after_close_min=-"], logs
-    # a symbol without a tracker calendar is reported as UNKNOWN, with its reason
-    logs, _, _, _ = audit(TP, [rec(TP, "X", "ODD.ZZ", today)], [quote("ODD.ZZ", 10.0, SR_CLOSE)], OBSERVE)
+    # symbols without a tracker calendar are UNKNOWN, ordered by size like any calendar,
+    # and a record with no target time is counted with its reason
+    recs = [rec(TP, "X", "ODD.ZZ", today), rec(TP, "Y", "^GSPC", today), rec(TP, "T", "7020.SR", None)]
+    logs, stats, _, _ = audit(TP, recs, [quote("ODD.ZZ", 10.0, SR_CLOSE), quote("^GSPC", 10.0, SR_CLOSE)], OBSERVE)
     lines = _tally_lines(logs)
-    assert len(lines) == 2 and lines[1].startswith(TAG + " UNKNOWN n=1 matured=0 expired=0 pending=1 reasons="), lines
+    assert lines[0] == TAG + " mode=observe evaluated=3 matured=0 expired=0 pending=3 calendars=2", lines
+    assert lines[1].startswith(TAG + " UNKNOWN n=2 matured=0 expired=0 pending=2 reasons="), lines
+    assert lines[2] == TAG + (" XSAU n=1 matured=0 expired=0 pending=1 reasons=outcome_target_time_unknown:1 "
+                              "after_close_min=-"), lines
+    shown = {}
+    for ln in lines[1:]:
+        for kv in ln.split(" reasons=", 1)[1].split(" after_close_min=", 1)[0].split(","):
+            k, n = kv.rsplit(":", 1)
+            shown[k] = shown.get(k, 0) + int(n)
+    assert shown == stats["outcome_skipped_reasons"], (shown, stats)
     # nothing due -> no line, collectors disarmed
     logs, _, _, armed = audit(TP, [rec(TP, "F", "FUT.US", NOW + timedelta(days=3))], [quote("FUT.US", 1.0, US_CLOSE)], OBSERVE)
     assert not _tally_lines(logs) and armed is False

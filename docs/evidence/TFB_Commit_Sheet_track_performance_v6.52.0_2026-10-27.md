@@ -69,7 +69,8 @@ Zero functions or methods removed at any depth.
 ## S3 - Known limits
 
 - **Production reason strings are joined.** With the Yahoo fallback on (the production default: neither workflow maps `TFB_TRACK_PRICE_FALLBACK`, so the code default `1` applies), a backend refusal reads e.g. `quote_session_unknown;quote_http_429` or `quote_session_unknown;quote_rate_limit_breaker`. Such refusals are still bucketed.
-- **What `after_close_min` measures.** It counts distinct symbols, not records, and it uses the first refused quote per symbol. Only a quote refused as `quote_session_unknown` carries a stamp; another refusal (for example `quote_timestamp_unknown`) shows only its reason.
+- **What `after_close_min` measures.** It counts distinct symbols, not records, and it uses the first refused quote per symbol. Only a quote refused as `quote_session_unknown` carries a stamp; another refusal (for example `quote_timestamp_unknown` or `quote_session_stale`) shows only its reason.
+- **Line length.** One line per calendar keeps the realistic production shape (about 30 distinct reasons) under about 1.5 KB per line. A calendar with hundreds of distinct joined reasons can still reach about 11-15 KB; reasons are not capped, so nothing is hidden.
 - **Calendar.** The calendar is the symbol's own exchange calendar, or `UNKNOWN` when the tracker has none.
 - **A raising pass.** If a pass raises, the collectors stay armed but unread until the next audit call resets them (an empty audit disarms them too).
 - **It measures; it does not fix.** The XSAU closing-auction allowance stays a separate, owner-gated build; its prototype is in the 26 Oct review.
@@ -79,17 +80,17 @@ Zero functions or methods removed at any depth.
 
 **`tests/test_tracker_outcome_tally.py`:**
 - PASS 10/10 as a script; 18 passed under pytest; identical under three hash seeds.
-- With no git base (`GIT_DIR=/nonexistent`, CI's depth-1 checkout) and stray tracker variables set: 17 passed, 1 skipped (T7). T3 then checks `OFF_GOLDEN = ffa28067f021c852`, the base digest.
+- With no git base (`GIT_DIR=/nonexistent`, CI's depth-1 checkout) and stray tracker variables set (`TFB_TRACK_FEED_LEGACY=1` included): 17 passed, 1 skipped (T7). T3 then checks `OFF_GOLDEN = 30ffbf022760aef3`, the base digest. It is also the same under `TZ=Asia/Riyadh`.
 
 | Case | What it pins |
 |---|---|
 | T0 | the parser takes the exact word `observe` only (`'1'`, `'true'`, `'on'`, `'enforce'`, `'observed'` -> off) |
 | T1 | **observe, 14 records.** The XSAU records come first, so it is name order that puts XNYS first. Results: `evaluated=12 matured=3 pending=9 calendars=2`. **XNYS:** `n=6 matured=2 pending=4 reasons=quote_session_unknown:2,entry_price_invalid:1,price_unavailable:1 after_close_min=20-60:2`. **XSAU:** `n=6 matured=1 pending=5 reasons=quote_session_unknown:5 after_close_min=0-15:1,15-20:1,20-60:1,60+:1`. XNYS covers: two AAA.US records matured, BBB.US / CCC.US at 20:30Z, ZERO.US stamped but `entry_price_invalid`, and MISS.US unpriced. XSAU covers: two 2286.SR records at 12:10:24Z counted once in the buckets, 2222.SR 12:17Z, 1150.SR 12:45Z, 2010.SR 15:00Z, and 7010.SR at 12:00Z, which matures. A not-yet-due and an already-MATURED record are not counted. The tally equals `_last_audit_stats`. |
-| T1b | the production lane, with the Yahoo fallback on: `reasons=quote_session_unknown:1,quote_session_unknown;quote_http_429:1 after_close_min=0-15:1,15-20:1`. The backend's 12:10:24Z stamp wins over a refused Yahoo `regular_market` quote at 12:20Z. |
-| T2 | observe changes nothing else over the three T3 passes: records, receipts, stats, every other log record (level, logger, text) and stdout equal the off run |
-| T3 | **off, nine spellings, three passes.** The passes are: mixed + HIST-CLOSE observe; a dead feed with the fallback on (PRICE-FEED ERROR, PRICE-FALLBACK, MATURE-FRESH); and an audit with no ACTIVE record. Records, receipts, stats, root-logger records (level, logger, text) and stdout equal the v6.49.0 copy, or `OFF_GOLDEN`. Only `SCRIPT_VERSION` and the fallback's wall-clock duration are normalised. A spy on `_outcome_receipt` proves no collector is armed at any receipt. |
+| T1b | **Yahoo fallback on**, on both the legacy and the production FEED-R/breaker feed paths: `reasons=quote_session_unknown:2,quote_session_stale;quote_session_unknown:1,quote_session_unknown;quote_http_429:1,quote_timestamp_unknown;quote_session_unknown:1 after_close_min=0-15:1,15-20:2,20-60:2`. The first stamp wins: the backend's 12:10:24Z beats Yahoo's later 12:20Z, and the backend's 12:25Z beats Yahoo's earlier 12:16Z. A backend `quote_session_stale` quote is never stamped. Production breaker: three `quote_http_429`, then two `quote_rate_limit_breaker`; all five still bucket. |
+| T2 | observe changes nothing else over the four T3 passes: records, receipts, stats, every other log record (level including DEBUG, logger, text), stdout and stderr equal the off run |
+| T3 | **off, nine spellings, four passes.** The passes are: mixed + HIST-CLOSE observe; a dead feed with the fallback on (PRICE-FEED ERROR, PRICE-FALLBACK, MATURE-FRESH); the T1b case on the production FEED-R feed path; and an audit with no ACTIVE record. Records, receipts, stats, tracker and root log records at every level (DEBUG included), stdout and stderr all equal the v6.49.0 copy, or `OFF_GOLDEN = 30ffbf022760aef3`. Only `SCRIPT_VERSION` and the fallback's wall-clock duration are normalised. A spy on `_outcome_receipt` proves no collector is armed at any receipt. |
 | T4 | the lines are INFO, from logger PerfTracker, in one contiguous block after the MATURE-FRESH and HIST-CLOSE lines. Collectors are disarmed after a pass; after a raising pass, they are disarmed by the next audit call, even one with no ACTIVE record. |
-| T5 | edges: 15 / 20 / 21 / 60 / 61 minutes give `0-15:1,15-20:1,20-60:2,60+:1`; a `regular_market` quote 16 min after close (past its 15 min slack) lands in 15-20; an unpriced record past grace counts as `expired:price_unavailable`; an unknown calendar reads `UNKNOWN`; nothing due means no line; only live quote kinds are stamped; the first stamp per symbol wins; the helpers never raise |
+| T5 | edges: 15 / 20 / 21 / 60 / 61 minutes give `0-15:1,15-20:1,20-60:2,60+:1`; a `regular_market` quote 16 min after close (past its 15 min slack) lands in 15-20; an unpriced record past grace counts as `expired:price_unavailable`; two symbols without a calendar make `UNKNOWN n=2`, ordered before XSAU by size, with `calendars=2`; a record with no target time reads `outcome_target_time_unknown:1`, and the per-reason sums equal `_last_audit_stats`; nothing due means no line; only live quote kinds are stamped; the first stamp per symbol wins; the helpers never raise |
 | T6 | both tracker steps map `${{ vars.TRACK_OUTCOME_TALLY \|\| 'off' }}` exactly once; header 1.0.8; SCRIPT_VERSION >= 6.52.0 in lockstep with docstring line 5 and the `verify_deployment` pin |
 | T7 | ASCII added lines. The one exception is the inherited U+2013 on docstring line 5, which comes from the base line. Zero removals at any depth (Class.method included). On 6.52.0, exactly the six new functions are added. |
 | T8 | `_outcome_tally_calendar` agrees with `_outcome_sessions` on 17 symbols (share-class dots, no suffix, `^`, `=X`, `-USD`, unknown suffix, digits, lower case) without building any calendar. A dead-feed observe audit builds no calendar that off would not. |
@@ -100,7 +101,7 @@ Zero functions or methods removed at any depth.
 
 **Blocking-lane guards** (`tests/test_outcome_price_evidence.py`): 81 passed. On the base tree the observe guard fails, and the three off guards pass.
 
-**Mutations: 36/36 caught.**
+**Mutations: 44/44 caught.** One further mutant was found to be equivalent and dropped: stamping a `quote_timestamp_stale` quote can record nothing, because that quote predates every session close in the 14-day window.
 
 | Mutation | Caught by |
 |---|---|
@@ -140,6 +141,14 @@ Zero functions or methods removed at any depth.
 | version not bumped | T6 |
 | docstring not bumped | T6 |
 | a method removed | T7 |
+| bucket only when the reason STARTS with `quote_session_unknown` | T1b |
+| smallest stamp wins | T1b |
+| `quote_session_stale` quotes stamped | T1b |
+| target-unknown records skipped | T5 |
+| UNKNOWN always listed last | T5 |
+| `calendars=` excludes UNKNOWN | T5 |
+| off logs at DEBUG | T2, T3 |
+| off prints to stderr | T2, T3 |
 
 ## S5 - Review (before the PR)
 
@@ -162,7 +171,16 @@ A four-lens adversarial review ran (off identity, semantics on production-shaped
 - T1's symbol list is corrected.
 - The T7 exemption is stated.
 
-**Refuted:**
+**Second pass** (`37be277f`): fix-by-fix verification plus a fresh regression hunt.
+- **No code bug found.** Off identity was re-proven on independent fixtures (29 records, real calendars, 10 scenarios including the production feed path, CA guard, HIST-CLOSE enforce, an empty base_url and the record-only run). The calendar name agrees with `_outcome_sessions` on 21,065 symbols.
+- **Harness gaps, all closed here:**
+  - DEBUG and stderr were not compared;
+  - T1b ran only the legacy feed;
+  - three stamp shapes on the fallback lane were unpinned;
+  - target-unknown records were not covered;
+  - the UNKNOWN order and its totals were not checked.
+
+**Refuted in the first pass:**
 - "Every XSAU refusal reads 0-15": the line reports what it measures.
 - "Notes already hold the reasons": the claim is about printed output.
 - "T2 cannot see saves or the `_Run_Log` inputs": the refuter judged it immaterial, because T2 compares the records, receipts and stats those surfaces are built from.
