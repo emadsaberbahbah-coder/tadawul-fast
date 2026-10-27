@@ -311,7 +311,8 @@ ok(deep(report, ['shadow rank log (DT10_SHADOW_RANK_LOG): off', 'shadow rank log
 console.log('S7 PASS embedded self-test core');
 
 // ---------------------------------------------------------- S8 wiring + lint
-ok((src.match(/^var DT10_VERSION = '1\.17\.0';$/m) || []).length === 1 && /^ \* Version: 1\.17\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.17.0');
+// 2026-10-27: v1.17.1 (shadow momentum) stacked on this change; pins moved (S9 checks the v1.17.0 file itself)
+ok((src.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.17.1 (delivered)');
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');
@@ -341,8 +342,11 @@ ok(sha === history.V1160_SHA256, 'S9 base is the reviewed v1.16.0 file (SHA-256 
 ok(/var DT10_VERSION = '1\.16\.0';/.test(base) && base.indexOf('ShadowLog') < 0 && base.indexOf('DT10_SHADOW') < 0 &&
    NEW_FUNCS.every((f) => base.indexOf('function ' + f + '(') < 0), 'S9 the base lacks every added name and the status token');
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
-const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(src, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
-const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(src, /^var\s+([A-Za-z_$][\w$]*)/mg);
+// 2026-10-27: the census compares v1.16.0 with the v1.17.0 file rebuilt from the delivered one (v1.17.1 edits reversed, SHA-256 pinned)
+const s1170 = history.v1170Source(src);
+ok(crypto.createHash('sha256').update(s1170).digest('hex') === history.V1170_SHA256, 'S9 the v1.17.0 file is rebuilt exactly (SHA-256 pinned)');
+const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(s1170, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(s1170, /^var\s+([A-Za-z_$][\w$]*)/mg);
 ok([...fb].every((f) => fn.has(f)) && [...vb].every((v) => vn.has(v)), 'S9 zero functions / vars removed');
 ok(deep([...fn].filter((f) => !fb.has(f)).sort(), NEW_FUNCS.slice().sort()) && deep([...vn].filter((v) => !vb.has(v)).sort(), VARS.slice(1).sort()),
    'S9 exactly the designed names added');

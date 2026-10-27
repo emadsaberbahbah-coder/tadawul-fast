@@ -1,5 +1,5 @@
-"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.2.0
-[P-182 BOARD SCORECARD] + [RANKING HEALTH] + [CHALLENGER].
+"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.2.1
+[P-182 BOARD SCORECARD] + [RANKING HEALTH] + [CHALLENGER] + [CHALLENGER INPUTS].
 
 REAL module. The only stub is an in-memory workbook (worksheet /
 add_worksheet / get_all_values / update / append_row / add_rows / add_cols)
@@ -13,13 +13,17 @@ Env (all optional):
                               available (shallow clone); otherwise git is used
   SSL_BASE_V11=<v1.1.0 file>  golden negative for P12/P14 when `git show
                               53c8544e:scripts/score_selection_log.py` is not
-                              available (CI fetches both bases by SHA first)
+                              available (CI fetches the bases by SHA first)
+  SSL_BASE_V12=<v1.2.0 file>  golden negative for P15 when `git show
+                              f60cff37:scripts/score_selection_log.py` is not
+                              available
   TFB_TEST_SELLOG_TSV=<_Selection_Log.tsv>   real-data legs (10-01 export)
   TFB_TEST_EXPORT_DIR=<dir>   Global_Markets.tsv / Mutual_Funds.tsv /
                               Market_Leaders.tsv of the same export
-P1 embedded self-test 24/24 (7 v0.1.0 cases + 9 v1.0.0 + 5 v1.1.0:
+P1 embedded self-test 25/25 (7 v0.1.0 cases + 9 v1.0.0 + 5 v1.1.0:
    Spearman, reference mapping, ranking health / verdicts, wiring + 3 v1.2.0:
-   shadow log parsing, shadow base price, the pre-registered verdict)
+   shadow log parsing, shadow base price, the pre-registered verdict + 1
+   v1.2.1: challenger inputs)
 P2 v0.1.0 ticket path: run() CSV + stdout byte-identical to base
    (synthetic; + the real export when set)
 P3 synthetic scorecard through main(): episodes, exit reasons, venue bar
@@ -73,8 +77,13 @@ P13 gate on, a synthetic _Shadow_Rank_Log in the cockpit's 24-column layout
    top-5 names and their references; a missing tab -> NO_DATA silently, a
    failed read -> WARN + NO_DATA; additivity: with the gate on, removing the
    CHALLENGER block (and the verdict suffixes) gives the gate-off outputs
-P14 selftest() grew 21 -> 24 with the three v1.2.0 cases named; the v1.1.0
-   base is 21/21
+P14 selftest() grew 21 -> 24 with the three v1.2.0 cases named (25 since
+   v1.2.1); the v1.1.0 base is 21/21
+P15 v1.2.1 [CHALLENGER INPUTS]: a logged day whose first event carries no
+   Momentum value counts for neither order (TSV and live paths, the excluded
+   line, the verdict reason, details JSON 'excluded_days'); golden negative:
+   the untouched v1.2.0 (f60cff37) counts that day; with no day excluded the
+   gate-on outputs are v1.2.0 byte for byte; selftest 24 -> 25
 
 Run under pytest in an isolated subprocess.
 """
@@ -94,6 +103,8 @@ def main():
     BASE_V1_REV = "d25468a5"          # main before v1.1.0: the untouched v1.0.0 script
     SSL_BASE_V11 = os.environ.get("SSL_BASE_V11", "")
     BASE_V11_REV = "53c8544e"         # main before v1.2.0: the untouched v1.1.0 script
+    SSL_BASE_V12 = os.environ.get("SSL_BASE_V12", "")
+    BASE_V12_REV = "f60cff37"         # main before v1.2.1: the untouched v1.2.0 script
     TSV = os.environ.get("TFB_TEST_SELLOG_TSV", "")
     EXPORT_DIR = os.environ.get("TFB_TEST_EXPORT_DIR", "")
     ENVS = ("TFB_BOARD_SCORECARD", "TFB_BOARD_SCORECARD_MIN_COVERAGE", "GITHUB_STEP_SUMMARY",
@@ -477,7 +488,8 @@ def main():
 
     # ------------------------------------------------------------------- P1
     rc, so = _call(m.selftest)
-    T("P1 embedded self-test 24/24", rc == 0 and "SELFTEST 24/24: ALL GREEN" in so, so.strip())
+    # 2026-10-27: v1.2.1 adds case 25 (challenger inputs); pins moved
+    T("P1 embedded self-test 25/25", rc == 0 and "SELFTEST 25/25: ALL GREEN" in so, so.strip())
 
     # ------------------------------------------------------------------- P2
     if SSL_BASE:
@@ -1029,7 +1041,7 @@ def main():
              or l.strip().startswith("# 19:") or l.strip().startswith("# 20:")
              or l.strip().startswith("# 21:")]
     T("P11 the five v1.1.0 selftest cases are still there (Spearman, mapping, ranking health, wiring, index clocks)",
-      rc == 0 and "SELFTEST 24/24: ALL GREEN" in so and len(names) == 5
+      rc == 0 and "SELFTEST 25/25: ALL GREEN" in so and len(names) == 5
       and "Spearman" in names[0] and "reference" in names[1] and "ranking health" in names[2]
       and "gate" in names[3] and "venue" in names[4], names)
     if base_v1 is not None:
@@ -1477,14 +1489,134 @@ def main():
     names = [l for l in open(SSL_FILE, encoding="utf-8").read().splitlines()
              if l.strip().startswith("# 22:") or l.strip().startswith("# 23:")
              or l.strip().startswith("# 24:")]
-    T("P14 selftest() grew 21 -> 24 with the three v1.2.0 cases (shadow parsing, shadow base price, verdict)",
-      rc == 0 and "SELFTEST 24/24: ALL GREEN" in so and len(names) == 3
+    T("P14 selftest() grew 21 -> 24 with the three v1.2.0 cases (shadow parsing, shadow base price, verdict); "
+      "25 since v1.2.1",
+      rc == 0 and "SELFTEST 25/25: ALL GREEN" in so and len(names) == 3
       and "shadow log parsing" in names[0] and "shadow episodes" in names[1]
       and "pre-registered verdict" in names[2], names)
     if base_v11 is not None:
         rc_b, so_b = _call(base_v11.selftest)
         T("P14 base v1.1.0 selftest is 21/21 (the count rose by exactly the new cases)",
           rc_b == 0 and "SELFTEST 21/21: ALL GREEN" in so_b, so_b.strip())
+
+    # ------------------------------------------------------------------ P15
+    # v1.2.1 [CHALLENGER INPUTS]: the first event of a logged day without a
+    # Momentum value on any row (how cockpit v1.17.0 logged 27 Oct) counts
+    # for neither order.
+    K_MOM = SH_HDR.index("Momentum")
+
+    def _blank_momentum(grid, days):
+        out = [list(grid[0])]
+        for r in grid[1:]:
+            r = list(r)
+            if r[1] in days:
+                r[K_MOM] = ""
+            out.append(r)
+        return out
+
+    d0 = US2[0]
+    g15 = _blank_momentum(p_grid, {d0})
+    sh15 = os.path.join(TMP, "ch_P15_shadow.tsv")
+    _write_tsv(sh15, g15)
+    exp15 = {o: [e for e in p_exp[o] if e[1] != 0] for o in ("CHAMPION", "CHALLENGER")}
+    od15 = os.path.join(TMP, "p15_P")
+    rc, so = _run_mod(m, None, "observe", od15, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="on", shadow=sh15)
+    blk15 = _ch_block(od15)
+    reason15 = "every condition met - owner decides; 1 logged day(s) excluded - no momentum input"
+    T("P15 day 1 logged without momentum: 24 trading days, its 5 names per order never become episodes",
+      rc == 0 and blk15[1:3] == _ch_expect(exp15, 24)
+      and blk15[1][:4] == ["CHAMPION", "24", "120", "120"] and blk15[2][:4] == ["CHALLENGER", "24", "120", "120"],
+      (blk15[1:3], _ch_expect(exp15, 24)))
+    T("P15 the verdict names the excluded day; stdout lists it",
+      blk15[3] == ["Verdict", "PROMOTE_ELIGIBLE (days 24, scored 120/120; %s)" % reason15, "", "", "", "", "", "", ""]
+      and ("[BOARD-SCORECARD v%s] challenger: 1 logged day(s) excluded - no momentum input: %s"
+           % (m.SCRIPT_VERSION, d0)) in so
+      and so.strip().splitlines()[-1].endswith(" challenger=PROMOTE_ELIGIBLE"), (blk15[3], so[-300:]))
+    g15b = _blank_momentum(p_grid, {d0})
+    for r in g15b[1:]:
+        if r[1] == d0 and r[0].endswith("08:47:00") and r[3] == "BOARD" and r[4] == 2:
+            r[K_MOM] = 3.0               # one value on any row of the first event keeps the day
+    sh15b = os.path.join(TMP, "ch_P15b_shadow.tsv")
+    _write_tsv(sh15b, g15b)
+    od15b = os.path.join(TMP, "p15_Pb")
+    rc, so = _run_mod(m, None, "observe", od15b, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="on", shadow=sh15b)
+    T("P15 one Momentum value on any row of the first event (here a BOARD row) keeps the day: v1.2.0 rows",
+      rc == 0 and _ch_block(od15b) == blk_p and "excluded" not in so, _ch_block(od15b)[3])
+    # the live render reads blank cells as '' and keeps the rule
+    book15 = StubBook({"_Selection_Log": ch_board_live, "_Run_Log": [RUNLOG_HDR],
+                       "_Shadow_Rank_Log": _serialize_shadow(g15)})
+    od15w = os.path.join(TMP, "p15_write")
+    rc, so = _run_mod(m, book15, "write", od15w, None, p_px, rk="on", asof=CH_ASOF, ch="on")
+    log15 = list(book15.tabs["_Run_Log"].values[-1])
+    det15 = json.loads(log15[9])
+    T("P15 live write: same block as the TSV path; _Run_Log ' | challenger: PROMOTE_ELIGIBLE (days 24, scored "
+      "120/120)'; details JSON 'excluded_days'",
+      rc == 0 and _ch_block(od15w) == blk15
+      and log15[5].endswith(" | challenger: PROMOTE_ELIGIBLE (days 24, scored 120/120)")
+      and det15["challenger"]["excluded_days"] == [d0] and det15["challenger"]["days"] == 24,
+      (log15[5][-80:], det15.get("challenger", {}).get("excluded_days")))
+    T("P15 no day excluded -> the details JSON carries no 'excluded_days' key (v1.2.0 shape)",
+      "excluded_days" not in json.loads(logs["on"][9])["challenger"], json.loads(logs["on"][9])["challenger"].keys())
+    all_blank = os.path.join(TMP, "ch_P15_all_blank.tsv")
+    _write_tsv(all_blank, _blank_momentum(p_grid, {r[1] for r in p_grid[1:]}))
+    od15n = os.path.join(TMP, "p15_nodata")
+    rc, so = _run_mod(m, None, "observe", od15n, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="on", shadow=all_blank)
+    blk15n = _ch_block(od15n)
+    T("P15 every day without momentum -> NO_DATA that says why (26 logged days excluded, Saturday included)",
+      rc == 0 and blk15n[1][:4] == ["CHAMPION", "0", "0", "0"]
+      and blk15n[3][1] == ("NO_DATA (days 0, scored 0/0; no trading day with the challenger's inputs in "
+                           "_Shadow_Rank_Log; 26 logged day(s) excluded - no momentum input)"), blk15n[3][1])
+
+    # golden negative + byte identity vs the untouched v1.2.0
+    base_v12_path = os.path.join(TMP, "base_v1_2_0", "score_selection_log.py")
+    os.makedirs(os.path.dirname(base_v12_path), exist_ok=True)
+    base_v12_src = ""
+    if SSL_BASE_V12 and os.path.exists(SSL_BASE_V12):
+        base_v12_src = SSL_BASE_V12
+    else:
+        try:
+            blob = subprocess.run(["git", "-C", ROOT, "show", BASE_V12_REV + ":scripts/score_selection_log.py"],
+                                  capture_output=True, text=True, timeout=60)
+            if blob.returncode == 0 and "SCRIPT_VERSION = \"1.2.0\"" in blob.stdout:
+                with open(base_v12_path, "w", encoding="utf-8") as fh:
+                    fh.write(blob.stdout)
+                base_v12_src = base_v12_path
+        except (OSError, subprocess.SubprocessError):
+            base_v12_src = ""
+    base_v12 = _load(base_v12_src, "ssl_base_v1_2_0") if base_v12_src else None
+    if base_v12 is not None:
+        T("P15 base is the untouched v1.2.0 (no input rule)",
+          base_v12.SCRIPT_VERSION == "1.2.0" and not hasattr(base_v12, "shadow_days_without_inputs"),
+          base_v12.SCRIPT_VERSION)
+        odb = os.path.join(TMP, "p15_base_blank")
+        rc, so = _run_mod(base_v12, None, "observe", odb, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="on",
+                          shadow=sh15)
+        blkb = _ch_block(odb)
+        T("P15 golden negative: v1.2.0 counts the momentum-less day (25 days, 125 episodes per order)",
+          rc == 0 and blkb[1][:4] == ["CHAMPION", "25", "125", "125"] and blkb[3][1].startswith(
+              "PROMOTE_ELIGIBLE (days 25, scored 125/125;") and "excluded" not in blkb[3][1], blkb[1:])
+        for code in ("P", "C", "U", "K", "I"):
+            _g, sh_c, px_c = ch_fx[code][0], ch_fx[code][1], ch_fx[code][2]
+            od_n, od_b = os.path.join(TMP, "p15_id_new_" + code), os.path.join(TMP, "p15_id_base_" + code)
+            rc_n, so_n = _run_mod(m, None, "observe", od_n, ch_board_tsv, px_c, rk="on", asof=CH_ASOF, ch="on",
+                                  shadow=sh_c)
+            rc_b, so_b = _run_mod(base_v12, None, "observe", od_b, ch_board_tsv, px_c, rk="on", asof=CH_ASOF,
+                                  ch="on", shadow=sh_c)
+            an, ab = _artifacts(od_n), _artifacts(od_b)
+            T("P15 %s: nothing excluded -> stdout and the three artifacts == v1.2.0 byte for byte (tag normalised)"
+              % code,
+              rc_n == rc_b == 0 and so_n.replace(m.SCRIPT_VERSION, "1.2.0") == so_b
+              and all(an[f].decode("utf-8").replace(m.SCRIPT_VERSION, "1.2.0") == ab[f].decode("utf-8")
+                      for f in an), code)
+        rc_b, so_b = _call(base_v12.selftest)
+        names = [l for l in open(SSL_FILE, encoding="utf-8").read().splitlines()
+                 if l.strip().startswith("# 25:")]
+        T("P15 selftest 24 -> 25 with the challenger-inputs case; the v1.2.0 base is 24/24",
+          rc_b == 0 and "SELFTEST 24/24: ALL GREEN" in so_b and len(names) == 1
+          and "challenger inputs" in names[0], (so_b.strip(), names))
+    else:
+        out.append("SKIP P15 golden negative (git show %s unavailable; set SSL_BASE_V12=<v1.2.0 file>)"
+                   % BASE_V12_REV)
 
     shutil.rmtree(TMP, ignore_errors=True)
     digest = hashlib.sha256(("\n".join(out) + json.dumps(digests)).encode()).hexdigest()[:16]

@@ -1,11 +1,55 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.17.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.17.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM] -- THE CHALLENGER GETS ITS MOMENTUM INPUT
+ * WHY (first shadow day, 27 Oct 2026): the pre-registered challenger order
+ * (opportunity_builder v1.28.0, program register A2) breaks reliability-band
+ * ties by sector-relative momentum, read from momentum_score on each pool
+ * row. DT10_POOL_FIELDS never sent the 'Momentum Score' column, so the
+ * backend logged momentum=0/26 on every call that day and the first
+ * _Shadow_Rank_Log event (10:48 Riyadh) shows the challenger as the exact
+ * reverse of the champion (smaller engine ROI first inside one reliability
+ * band) -- not the order that was pre-registered. The column is filled on
+ * the pages (Global_Markets 6,605 of 6,611 rows, column BK). Same defect
+ * class as v1.6.1, v1.8.1 and v1.11.12: an input starved by the pool
+ * contract.
+ * WHAT: var DT10_SHADOW_POOL_FIELDS = [Momentum Score]. The per-execution
+ * pool projection (dt10PoolFieldsActive_ with no argument, memoized) appends
+ * it ONLY while DT10_SHADOW_RANK_LOG is on or all (dt10PoolFieldsWithShadow_;
+ * a send already in the list is never added twice). Off -> the very list
+ * object of v1.17.0: every header map, pool row and POST body is byte for
+ * byte unchanged. Under TFB_OPP_RANK_MODE=legacy the builder never reads the
+ * field; under shadow it feeds only the challenger's second key, so the live
+ * order, gates, verdicts, sizing and funding are unchanged either way. The
+ * mode is read ONCE per execution (memo 'shadow_log_mode') and the log
+ * written after the POST (dt10AppendShadowRankLog_) reuses it, so a property
+ * flipped mid-run cannot log a day whose rows went without momentum. The
+ * send follows the LOG switch, not TFB_OPP_RANK_MODE: with the log off and
+ * the backend in shadow the challenger runs without momentum (harmless while
+ * enforce is reserved); the promotion PR must send it whenever the backend
+ * ranks by it. (Independent review before merge, 27 Oct: mode read once,
+ * self-test memo swap in try/finally, field-count-proof self-test check.)
+ * SECTION 8 KEPT: the value is the engine's own sheet column, sent as is.
+ * Functions added (0 removed): dt10PoolFieldsWithShadow_. Changed:
+ * dt10PoolFieldsActive_ (the memoized no-argument branch only),
+ * dt10AppendShadowRankLog_ (the memoized mode when the projection ran),
+ * dt10SelfTest ('property memo core' counts the armed field; new 'shadow
+ * pool fields core'). Var added: DT10_SHADOW_POOL_FIELDS.
+ * Harness: tests/test_dt10_shadow_momentum.js (REAL file; golden negative on
+ * the v1.17.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent / off / junk; the builder alias read from
+ * core/analysis/opportunity_builder.py; ES5/ASCII lint; inventory).
+ * Rollback: DT10_SHADOW_RANK_LOG off stops the send (and the log) with no
+ * re-paste; or re-paste v1.17.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep. Days logged without momentum (27 Oct) are not counted by the
+ * nightly scorecard (score_selection_log v1.2.1).
  *
  * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG] -- THE RANKING CHALLENGER, LOGGED
  * WHY (October review + first nightly scorecard, 27 Oct 2026): the live
@@ -2019,7 +2063,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.17.0';
+var DT10_VERSION = '1.17.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3154,6 +3198,15 @@ var DT10_POOL_EVIDENCE_TOKENS = {
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
                          '52W Position %': true, 'Percent Change': true };
+/** v1.17.1 [SHADOW-MOMENTUM]: the ranking challenger's inputs that ride on
+ * the pool row ONLY while the shadow rank log is armed (DT10_SHADOW_RANK_LOG
+ * on/all; dt10PoolFieldsWithShadow_). opportunity_builder v1.28.0 reads
+ * momentum_score (alias 'momentumscore') only under TFB_OPP_RANK_MODE
+ * shadow/enforce, for the challenger's second key; the live order never
+ * reads it. */
+var DT10_SHADOW_POOL_FIELDS = [
+  { send: 'Momentum Score', match: ['momentumscore'] }
+];
 /** v1.11.13 [P-202]: per-execution memo for Script Property reads that sit
  * on per-row paths. Apps Script gives each execution a fresh global scope,
  * so this object lives exactly one run; refreshDecisionTop10 also resets it
@@ -3187,7 +3240,14 @@ function dt10W52FieldsLegacy_() {
 function dt10PoolFieldsActive_(legacy) {
   if (legacy === undefined) {   // v1.11.13 [P-202]: ONE list per execution
     return dt10PropMemoGet_('pool_fields_active', function () {
-      return dt10PoolFieldsActive_(dt10W52FieldsLegacy_());
+      // v1.17.1 [SHADOW-MOMENTUM]: + the challenger's inputs while the shadow
+      // rank log is armed; off -> the v1.17.0 list (the same object). The
+      // mode is read once and kept for this execution: the log written after
+      // the POST (dt10AppendShadowRankLog_) uses the same value.
+      var shadowMode = dt10PropMemoGet_('shadow_log_mode', dt10ShadowLogMode_);
+      return dt10PoolFieldsWithShadow_(
+          dt10PoolFieldsActive_(dt10W52FieldsLegacy_()),
+          shadowMode !== 'off');
     });
   }
   var leg = !!legacy;
@@ -3221,6 +3281,23 @@ function dt10FindHeaderRow_(values, scanRows) {
     if (hasSymbol && hasSecond) return r;
   }
   return -1;
+}
+/** v1.17.1 [SHADOW-MOMENTUM] PURE: `fields` plus DT10_SHADOW_POOL_FIELDS
+ * when `armed`; `fields` itself (the same array) when not, so an unarmed
+ * projection is the v1.17.0 list object. A send already present is not
+ * added again. Never mutates `fields`. */
+function dt10PoolFieldsWithShadow_(fields, armed) {
+  if (!armed) return fields;
+  var out = fields.slice();
+  var have = {};
+  for (var i = 0; i < out.length; i++) have[out[i].send] = true;
+  for (var j = 0; j < DT10_SHADOW_POOL_FIELDS.length; j++) {
+    if (!have[DT10_SHADOW_POOL_FIELDS[j].send]) {
+      out.push(DT10_SHADOW_POOL_FIELDS[j]);
+      have[DT10_SHADOW_POOL_FIELDS[j].send] = true;
+    }
+  }
+  return out;
 }
 /** Map DT10_POOL_FIELDS → column index from a header row array; null=absent */
 function dt10MapHeaderCols_(headerRow) {
@@ -7535,7 +7612,12 @@ function dt10ShadowLogRows_(payload, stamp, day, cohort) {
  * must be the header (written when blank; another layout is never written).
  * Returns the status token. NEVER throws. */
 function dt10AppendShadowRankLog_(ss, payload, cohort) {
-  var mode = dt10ShadowLogMode_();
+  // v1.17.1 [SHADOW-MOMENTUM]: the mode the pool projection used in this
+  // execution when it ran (the logged day and the sent rows agree); else the
+  // property itself, as in v1.17.0.
+  var mode = (typeof DT10_PROP_MEMO_ === 'object' && DT10_PROP_MEMO_ &&
+      Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, 'shadow_log_mode')) ?
+      DT10_PROP_MEMO_.shadow_log_mode : dt10ShadowLogMode_();
   if (mode === 'off') return '';
   try {
     var stamp = '';
@@ -9331,9 +9413,51 @@ function dt10SelfTest() {
   report.push('property memo core: ' +
       ((pmA === pmB && pmB === pmC && pmKeys >= 2 &&
         pmA.length === (dt10W52FieldsLegacy_() ? DT10_POOL_FIELDS.length - 4
-                                               : DT10_POOL_FIELDS.length))
+                                               : DT10_POOL_FIELDS.length) +
+            (DT10_PROP_MEMO_.shadow_log_mode !== 'off' ?
+             DT10_SHADOW_POOL_FIELDS.length : 0))   // v1.17.1
        ? 'ok (pool fields memoized; keys=' + pmKeys + '; reads=1/execution)'
        : 'FAIL'));
+  /* v1.17.1 [SHADOW-MOMENTUM]: the challenger's momentum input travels on
+     the pool row only while the shadow rank log is armed. Pure: the memo is
+     swapped for the two projections and restored (finally). */
+  var spOff = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, false);
+  var spOn = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, true);
+  var spTwice = dt10PoolFieldsWithShadow_(spOn, true);
+  var spTail = spOn.slice(DT10_POOL_FIELDS.length);
+  var spTailOk = spTail.length === DT10_SHADOW_POOL_FIELDS.length;
+  for (var spi = 0; spTailOk && spi < spTail.length; spi++) {
+    if (spTail[spi] !== DT10_SHADOW_POOL_FIELDS[spi]) spTailOk = false;
+  }
+  var spHdr = ['Symbol', 'Name', 'Momentum Score'];
+  var spMemo = DT10_PROP_MEMO_;
+  var spMap = null, spRow = null, spBlank = null, spOffMap = null;
+  var spOffRow = null;
+  try {
+    DT10_PROP_MEMO_ = { pool_fields_active: spOn };
+    spMap = dt10MapHeaderCols_(spHdr);
+    spRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spMap, 'Global_Markets');
+    spBlank = dt10PoolRowFromSheetRow_(['WPC.US', 'W. P. Carey', ''],
+        spMap, 'Global_Markets');
+    DT10_PROP_MEMO_ = { pool_fields_active: spOff };
+    spOffMap = dt10MapHeaderCols_(spHdr);
+    spOffRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spOffMap, 'Global_Markets');
+  } finally {
+    DT10_PROP_MEMO_ = spMemo;
+  }
+  report.push('shadow pool fields core: ' +
+      ((spOff === DT10_POOL_FIELDS && spOn !== DT10_POOL_FIELDS && spTailOk &&
+        spTwice.length === spOn.length &&
+        spMap && spMap['Momentum Score'] === 2 && spRow !== null &&
+        spRow['Momentum Score'] === 57.03 && spBlank !== null &&
+        spBlank['Momentum Score'] === undefined &&
+        spOffMap && spOffMap['Momentum Score'] === undefined &&
+        spOffRow !== null && spOffRow['Momentum Score'] === undefined) ?
+       'ok (Momentum Score sent only while the shadow log is armed)' :
+       'FAIL') +
+      ' | sent now: ' + (dt10ShadowLogMode_() !== 'off' ? 'yes' : 'no'));
   /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race
      (ML run 37114669145 at 12:59, GM still run 37079471147 at 03:43) and
      the clean 10-04 case (both legs run 37160795404). */
