@@ -9,7 +9,9 @@
  * checked against the writer's actual keys. Sections:
  *   S1 mode reader                 S2 rows core on the builder fixture
  *   S3 nothing to log              S4 kill identity (property absent / off)
- *   S5 orchestrator on: create, cadence, change, new day, narrow sheet
+ *   S5 orchestrator on / all: create (header, hidden, view back, unused
+ *      columns dropped), daily cadence (on) and on-change cadence (all), new
+ *      day, narrow / empty / cleared / foreign-layout tab, grid growth
  *   S6 never throws                S7 embedded self-test core lines
  *   S8 wiring, version lockstep, ES5/ASCII lint, inventory
  *   S9 golden negative: the v1.16.0 base rebuilt by reversing the v1.17.0
@@ -77,13 +79,28 @@ function makeBook(opts) {
   const sheets = {};
   function mkSheet(name, cols) {
     const sh = {
-      _name: name, _rows: [], _cols: cols || 26, _hidden: false, _frozen: 0,
+      _name: name, _rows: [], _cols: cols || 26, _maxRows: 1000, _hidden: false, _frozen: 0,
       getRange(r, c, nr, nc) {
         calls.push(['getRange', name, r, c, nr, nc]);
         if (opts.rangeThrows) throw new Error('range write failed');
+        if (r < 1 || c < 1 || c - 1 + nc > sh._cols || r - 1 + nr > sh._maxRows) {
+          throw new Error('The coordinates of the range are outside the dimensions of the sheet.');
+        }
         const rng = {
+          getValues() {
+            calls.push(['getValues', name, r, c, nr, nc]);
+            const out = [];
+            for (let i = 0; i < nr; i++) {
+              const row = sh._rows[r - 1 + i] || [];
+              const vals = [];
+              for (let j = 0; j < nc; j++) vals.push(row[c - 1 + j] === undefined ? '' : row[c - 1 + j]);
+              out.push(vals);
+            }
+            return out;
+          },
           setValues(v) {
             calls.push(['setValues', name, r, c, nr, nc, JSON.stringify(v)]);
+            if (v.length !== nr || v.some((row) => row.length !== nc)) throw new Error('dimension mismatch');
             for (let i = 0; i < v.length; i++) sh._rows[r - 1 + i] = v[i].slice();
             return rng;
           },
@@ -94,16 +111,26 @@ function makeBook(opts) {
       setFrozenRows(n) { calls.push(['setFrozenRows', name, n]); sh._frozen = n; },
       hideSheet() { calls.push(['hideSheet', name]); sh._hidden = true; },
       getMaxColumns() { return sh._cols; },
+      getMaxRows() { return sh._maxRows; },
       insertColumnsAfter(after, n) { calls.push(['insertColumnsAfter', name, after, n]); sh._cols += n; },
+      deleteColumns(at, n) { calls.push(['deleteColumns', name, at, n]); sh._cols -= n; },
+      insertRowsAfter(after, n) { calls.push(['insertRowsAfter', name, after, n]); sh._maxRows += n; },
       getLastRow() { return sh._rows.length; }
     };
     return sh;
   }
   const ss = {
     getSheetByName(n) { calls.push(['getSheetByName', n]); return sheets[n] || null; },
-    insertSheet(n) { calls.push(['insertSheet', n]); sheets[n] = mkSheet(n, 26); return sheets[n]; }
+    insertSheet(n) { calls.push(['insertSheet', n]); sheets[n] = mkSheet(n, 26); return sheets[n]; },
+    setActiveSheet(sh) { calls.push(['setActiveSheet', sh ? sh._name : null]); return sh; }
   };
-  if (opts.existing) { sheets[opts.existing.name] = mkSheet(opts.existing.name, opts.existing.cols); sheets[opts.existing.name]._rows = opts.existing.rows || [['hdr']]; }
+  sheets.Top_10_Investments = mkSheet('Top_10_Investments', 40);
+  if (opts.existing) {
+    const ex = mkSheet(opts.existing.name, opts.existing.cols);
+    ex._rows = opts.existing.rows === undefined ? [['hdr']] : opts.existing.rows;
+    if (opts.existing.maxRows) ex._maxRows = opts.existing.maxRows;
+    sheets[opts.existing.name] = ex;
+  }
   return { ss, calls, sheets };
 }
 
@@ -113,6 +140,7 @@ const NEW_FUNCS = ['dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10AppendShadow
 const FUNCS = ['dt10NormSym_', 'dt10Cell_', 'dt10StabToday_'].concat(NEW_FUNCS);
 const geval = eval;   // indirect eval: global scope, so the real functions are callable here
 for (const v of VARS) geval(extractVar(src, v));
+geval(extractVar(src, 'DT10_SHEET'));
 for (const f of FUNCS) geval(extract(src, f));
 
 let pass = 0;
@@ -127,7 +155,8 @@ function payload(over) { return Object.assign(JSON.parse(JSON.stringify(FIX)), o
 PROPS = {}; ok(dt10ShadowLogMode_() === 'off', 'S1 absent -> off');
 PROPS = { DT10_SHADOW_RANK_LOG: '' }; ok(dt10ShadowLogMode_() === 'off', 'S1 blank -> off');
 PROPS = { DT10_SHADOW_RANK_LOG: ' ON ' }; ok(dt10ShadowLogMode_() === 'on', 'S1 on (trim, case)');
-for (const junk of ['observe', '1', 'true', 'enforce', 'onn']) {
+PROPS = { DT10_SHADOW_RANK_LOG: ' All ' }; ok(dt10ShadowLogMode_() === 'all', 'S1 all (trim, case)');
+for (const junk of ['observe', '1', 'true', 'enforce', 'onn', 'always', 'al']) {
   PROPS = { DT10_SHADOW_RANK_LOG: junk }; ok(dt10ShadowLogMode_() === 'off', 'S1 ' + junk + ' -> off');
 }
 PROPS = { DT10_SHADOW_RANK_LOG: 'on' }; PROPS_THROW = true;
@@ -160,7 +189,9 @@ ok(deep(byOrder('CHALLENGER').map((r) => r[col('Symbol')]), ['F.SR', 'B.SR', 'G.
 ok(deep(byOrder('CHALLENGER').map((r) => r[col('Rank')]), [1, 2, 3, 4, 5, 6]), 'S2 challenger Rank = shadow rank');
 const a0 = byOrder('CHAMPION')[0];
 ok(deep(a0, ['2026-10-27 08:47:00', '2026-10-27', '40418101374', 'CHAMPION', 1, 'A.SR', 'Tadawul', 'Banks', '', 1, 4, 35, 88, 'High',
-  60, 7.5, 'pool', 'Y', 'Y', 'shadow', '1.0', '1.28.0', 6, 5]), 'S2 champion row A.SR (cap Y, floor Y, strength +7.5 vs pool) ' + JSON.stringify(a0));
+  60, 7.5, 'pool', 'Y', 'Y', 'shadow', 'v1.0', 'v1.28.0', 6, 5]), 'S2 champion row A.SR (cap Y, floor Y, strength +7.5 vs pool; Rule / Builder as text) ' + JSON.stringify(a0));
+const noVer = payload(); delete noVer.meta.rank_challenger.version; delete noVer.meta.rank_challenger.builder;
+ok(dt10ShadowLogRows_(noVer, 's', 'd', 'c').rows.every((r) => r[col('Rule')] === '' && r[col('Builder')] === ''), 'S2 missing version -> blank, never a bare "v"');
 const e5 = byOrder('CHALLENGER')[5];
 ok(e5[col('Symbol')] === 'E.SR' && e5[col('Floor OK')] === 'N' && e5[col('Cap')] === 'N' && e5[col('Engine ROI %')] === 10 && e5[col('Live Rank')] === 6,
    'S2 challenger row E.SR (below floor -> Floor OK N)');
@@ -198,37 +229,68 @@ for (const value of [undefined, '', 'off', 'observe']) {
 }
 console.log('S4 PASS kill identity');
 
-// ------------------------------------------------------------ S5 orchestrator on
+// ------------------------------------------------------------ S5 orchestrator on / all
 PROPS = { DT10_SHADOW_RANK_LOG: 'on' }; PROP_WRITES = []; NOW_ISO = '2026-10-27T05:47:00Z';
 const bk = makeBook();
 let n = dt10AppendShadowRankLog_(bk.ss, payload(), '40418101374');
 const tab = bk.sheets._Shadow_Rank_Log;
 ok(n === 'ShadowLog: +17' && tab && tab._hidden === true && tab._frozen === 1, 'S5 first event: tab created hidden + frozen, 17 rows: ' + n);
 ok(deep(tab._rows[0], H) && bk.calls.some((c) => c[0] === 'setFontWeight' && c[2] === 'bold'), 'S5 bold header row');
+ok(tab._cols === 24 && bk.calls.some((c) => c[0] === 'deleteColumns' && c[2] === 25 && c[3] === 2), 'S5 the two unused columns dropped at creation');
+ok(bk.calls.some((c) => c[0] === 'setActiveSheet' && c[1] === 'Top_10_Investments') &&
+   bk.calls.findIndex((c) => c[0] === 'setActiveSheet') > bk.calls.findIndex((c) => c[0] === 'hideSheet'), 'S5 creation returns the view to Top_10_Investments');
 ok(tab._rows.length === 18 && tab._rows[1][0] === '2026-10-27 08:47:00' && tab._rows[1][1] === '2026-10-27' && tab._rows[1][2] === '40418101374', 'S5 rows at 2..18; Logged At Riyadh, Day UTC, Cohort');
 const st1 = JSON.parse(PROPS.DT10_SHADOW_LOG_STATE_V1);
 ok(st1.date === '2026-10-27' && st1.sig.indexOf('2026-10-27|C:A.SR,D.SR') === 0, 'S5 state saved');
 let calls0 = bk.calls.length;
 n = dt10AppendShadowRankLog_(bk.ss, payload(), '40418101374');
-ok(n === 'ShadowLog: unchanged' && bk.calls.length === calls0 && tab._rows.length === 18, 'S5 same orders same day -> unchanged, no sheet call');
+ok(n === 'ShadowLog: logged today' && bk.calls.length === calls0 && tab._rows.length === 18, 'S5 on: same day -> logged today, no sheet call');
 const moved = payload();
 moved.meta.rank_challenger.challenger = moved.meta.rank_challenger.challenger.slice().reverse();
 n = dt10AppendShadowRankLog_(bk.ss, moved, '40418101374');
-ok(n === 'ShadowLog: +17' && tab._rows.length === 35 && bk.calls.filter((c) => c[0] === 'insertSheet').length === 1, 'S5 a changed order appends again (no second tab)');
-NOW_ISO = '2026-10-28T05:47:00Z';
+ok(n === 'ShadowLog: logged today' && bk.calls.length === calls0 && tab._rows.length === 18, 'S5 on: a changed order the same day is NOT logged (daily cadence)');
+PROPS.DT10_SHADOW_RANK_LOG = 'all';
+n = dt10AppendShadowRankLog_(bk.ss, moved, '40418101374');
+ok(n === 'ShadowLog: +17' && tab._rows.length === 35 && bk.calls.filter((c) => c[0] === 'insertSheet').length === 1, 'S5 all: a changed order appends again (no second tab)');
+calls0 = bk.calls.length;
+n = dt10AppendShadowRankLog_(bk.ss, moved, '40418101374');
+ok(n === 'ShadowLog: unchanged' && bk.calls.length === calls0 && tab._rows.length === 35, 'S5 all: same orders -> unchanged, no sheet call');
+PROPS.DT10_SHADOW_RANK_LOG = 'on'; NOW_ISO = '2026-10-28T05:47:00Z';
 n = dt10AppendShadowRankLog_(bk.ss, moved, '40418999999');
-ok(n === 'ShadowLog: +17' && tab._rows.length === 52 && tab._rows[51][1] === '2026-10-28' && JSON.parse(PROPS.DT10_SHADOW_LOG_STATE_V1).date === '2026-10-28', 'S5 new UTC day -> appended with the new Day key');
+ok(n === 'ShadowLog: +17' && tab._rows.length === 52 && tab._rows[51][1] === '2026-10-28' && JSON.parse(PROPS.DT10_SHADOW_LOG_STATE_V1).date === '2026-10-28', 'S5 on: new UTC day -> appended with the new Day key');
+ok(bk.calls.filter((c) => c[0] === 'setFontWeight').length === 1, 'S5 the header is written once, not per event');
 n = dt10AppendShadowRankLog_(bk.ss, { meta: {} }, 'x');
 ok(n === 'ShadowLog: none (no challenger block)' && tab._rows.length === 52, 'S5 backend at legacy -> none, nothing written');
-const narrow = makeBook({ existing: { name: '_Shadow_Rank_Log', cols: 20, rows: [H.slice(0, 20)] } });
-PROPS = { DT10_SHADOW_RANK_LOG: 'on' };
+NOW_ISO = '2026-10-27T05:47:00Z';
+function fresh(existing) { PROPS = { DT10_SHADOW_RANK_LOG: 'on' }; return makeBook({ existing: existing }); }
+const narrow = fresh({ name: '_Shadow_Rank_Log', cols: 20, rows: [H.slice(0, 20)] });
 n = dt10AppendShadowRankLog_(narrow.ss, payload(), 'c');
 ok(n === 'ShadowLog: +17' && narrow.calls.some((c) => c[0] === 'insertColumnsAfter' && c[2] === 20 && c[3] === 4) &&
-   !narrow.calls.some((c) => c[0] === 'insertSheet'), 'S5 an existing narrower tab gains the missing columns');
+   !narrow.calls.some((c) => c[0] === 'insertSheet') && deep(narrow.sheets._Shadow_Rank_Log._rows[0], H) &&
+   narrow.sheets._Shadow_Rank_Log._rows.length === 18, 'S5 an existing narrower tab gains the missing columns and the full header');
+const empty = fresh({ name: '_Shadow_Rank_Log', cols: 26, rows: [] });
+n = dt10AppendShadowRankLog_(empty.ss, payload(), 'c');
+const et = empty.sheets._Shadow_Rank_Log;
+ok(n === 'ShadowLog: +17' && deep(et._rows[0], H) && et._rows.length === 18 && et._frozen === 1 && !empty.calls.some((c) => c[0] === 'insertSheet' || c[0] === 'deleteColumns'),
+   'S5 an existing EMPTY tab (first run cut short, or emptied by hand) gets the header before the rows');
+const cleared = fresh({ name: '_Shadow_Rank_Log', cols: 24, rows: [new Array(24).fill(''), ['old'].concat(new Array(23).fill(''))] });
+n = dt10AppendShadowRankLog_(cleared.ss, payload(), 'c');
+const ct = cleared.sheets._Shadow_Rank_Log;
+ok(n === 'ShadowLog: +17' && deep(ct._rows[0], H) && ct._rows[1][0] === 'old' && ct._rows.length === 19, 'S5 a cleared header row is restored; existing rows kept, new rows below them');
+const foreign = fresh({ name: '_Shadow_Rank_Log', cols: 24, rows: [['Date', 'Note']] });
+n = dt10AppendShadowRankLog_(foreign.ss, payload(), 'c');
+ok(n === 'ShadowLog: ERROR header mismatch at column 1' && !foreign.calls.some((c) => c[0] === 'setValues') &&
+   !PROPS.DT10_SHADOW_LOG_STATE_V1, 'S5 a tab with another layout is never written; state not saved');
+const shifted = fresh({ name: '_Shadow_Rank_Log', cols: 24, rows: [H.slice(0, 5).concat(['Seat'], H.slice(6))] });
+ok(dt10AppendShadowRankLog_(shifted.ss, payload(), 'c') === 'ShadowLog: ERROR header mismatch at column 6', 'S5 one wrong header cell names its column');
+const small = fresh({ name: '_Shadow_Rank_Log', cols: 24, rows: [H.slice()], maxRows: 5 });
+n = dt10AppendShadowRankLog_(small.ss, payload(), 'c');
+ok(n === 'ShadowLog: +17' && small.calls.some((c) => c[0] === 'insertRowsAfter' && c[2] === 5 && c[3] === 13) &&
+   small.sheets._Shadow_Rank_Log._rows.length === 18, 'S5 rows are added before a write that would pass the grid');
 PROPS = { DT10_SHADOW_RANK_LOG: 'on', DT10_SHADOW_LOG_STATE_V1: '{not json' };
 const healed = makeBook();
 ok(dt10AppendShadowRankLog_(healed.ss, payload(), 'c') === 'ShadowLog: +17', 'S5 unreadable state -> treated as no state');
-console.log('S5 PASS orchestrator on');
+console.log('S5 PASS orchestrator on / all');
 
 // --------------------------------------------------------------- S6 never throws
 PROPS = { DT10_SHADOW_RANK_LOG: 'on' }; LOGS = [];

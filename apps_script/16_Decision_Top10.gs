@@ -19,7 +19,7 @@
  * so the nightly scorecard could not compare the two orders on the same days.
  * WHAT: Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT: one property
  * read and nothing else -- no tab, no write, no status token; every render is
- * v1.16.0 byte for byte) | on. When on and the payload carries
+ * v1.16.0 byte for byte) | on | all. When armed and the payload carries
  * meta.rank_challenger without an error, dt10AppendShadowRankLog_ appends one
  * event to the hidden tab _Shadow_Rank_Log (created on first use): CHAMPION
  * rows (the backend's live order, top 10), CHALLENGER rows (the shadow order,
@@ -28,12 +28,22 @@
  * Logged At, Day (UTC key), Cohort (source run), Order, Rank, Symbol, Market,
  * Sector, Seat, Live Rank, Shadow Rank, Engine ROI %, Rel, Conf, Momentum,
  * Strength, Strength Ref, Cap, Floor OK, Mode, Rule, Builder, Pool, Overlap
- * Top5. Cadence mirrors _Selection_Log's default: the first event of a UTC
- * day, then only when an order changes (state DT10_SHADOW_LOG_STATE_V1). The
- * status line gains ' | ShadowLog: +N' / 'unchanged' / 'none (<reason>)' /
- * 'ERROR ...' only when on. The log holds ranks, symbols and the backend's own
- * figures -- no ticket, price or amount -- so it is research evidence, never
- * an order sheet.
+ * Top5 (Rule and Builder written as 'v1.0' / 'v1.28.0' so Sheets cannot turn
+ * them into numbers or dates). Cadence: 'on' = the first event of each UTC
+ * day only -- exactly what the nightly scorecard reads, about 30 rows a day;
+ * 'all' = also whenever an order changes (audit trail, about 180 rows a day;
+ * the workbook's cell budget is why it is not the default). State
+ * DT10_SHADOW_LOG_STATE_V1. Row 1 must be the header: it is written whenever
+ * row 1 is blank (new, emptied or cleared tab; a first run cut short after
+ * the tab was created) and a tab whose row 1 carries another layout is never
+ * written ('ERROR header mismatch at column N'). Rows are added before a write
+ * that would pass the grid. Creating the tab drops its two unused columns,
+ * hides it and returns the view to Top_10_Investments. The status line gains
+ * ' | ShadowLog: +N' / 'logged today' / 'unchanged' / 'none (<reason>)' /
+ * 'ERROR ...' only when armed. The log holds ranks, symbols and the backend's
+ * own figures -- no ticket, price or amount -- so it is research evidence,
+ * never an order sheet. (Review before merge, 27 Oct: header on an empty tab,
+ * cadence default, text-safe version cells, view and grid handling.)
  * SECTION 8 KEPT: nothing is ranked, scored or gated here; both orders are the
  * backend's. _Selection_Log is untouched (schema and cadence).
  * Functions added (0 removed): dt10ShadowLogMode_, dt10ShadowLogRows_,
@@ -45,7 +55,8 @@
  * Harness: tests/test_dt10_shadow_rank_log.js (REAL file; golden negative on
  * the v1.16.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
  * identity with the property absent; ES5/ASCII lint; inventory).
- * Rollback: delete DT10_SHADOW_RANK_LOG (no re-paste) or re-paste v1.16.0.
+ * Rollback: delete DT10_SHADOW_RANK_LOG (no re-paste) or re-paste v1.16.0;
+ * 'all' -> 'on' stops the on-change rows.
  * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
  * lockstep. Arm after the backend runs TFB_OPP_RANK_MODE=shadow.
  *
@@ -7389,8 +7400,8 @@ function dt10AppendExitLog_(ss, audit, runInfo) {
 }
 // ---------------------------------------------------------------------------
 // v1.17.0 [SHADOW-RANK-LOG] -- the backend's ranking challenger, logged.
-// Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT) | on; see the v1.17.0
-// header block. Research evidence only: ranks, symbols and the backend's own
+// Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT) | on | all; see the
+// v1.17.0 header block. Research evidence only: ranks, symbols and the backend's own
 // figures, never a ticket, price or amount.
 // ---------------------------------------------------------------------------
 var DT10_SHADOW_LOG_PROP = 'DT10_SHADOW_RANK_LOG';
@@ -7400,8 +7411,8 @@ var DT10_SHADOW_LOG_HEADERS = ['Logged At', 'Day', 'Cohort', 'Order', 'Rank',
   'Symbol', 'Market', 'Sector', 'Seat', 'Live Rank', 'Shadow Rank',
   'Engine ROI %', 'Rel', 'Conf', 'Momentum', 'Strength', 'Strength Ref',
   'Cap', 'Floor OK', 'Mode', 'Rule', 'Builder', 'Pool', 'Overlap Top5'];
-/** v1.17.0: 'on' only for that exact word (trimmed, any case), else 'off'.
- * Never throws. */
+/** v1.17.0: 'on' (first event of each UTC day) or 'all' (also on change)
+ * for those exact words (trimmed, any case), else 'off'. Never throws. */
 function dt10ShadowLogMode_() {
   var raw = '';
   try {
@@ -7410,7 +7421,8 @@ function dt10ShadowLogMode_() {
   } catch (e) {
     raw = '';
   }
-  return raw.replace(/^\s+|\s+$/g, '').toLowerCase() === 'on' ? 'on' : 'off';
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'on' || raw === 'all') ? raw : 'off';
 }
 /** v1.17.0 PURE: the rows of one logging event and its signature, from
  * payload.meta.rank_challenger (opportunity_builder v1.28.0, shadow) and the
@@ -7455,9 +7467,12 @@ function dt10ShadowLogRows_(payload, stamp, day, cohort) {
       auditRank[s] = r.shadow_rank;
     }
   }
-  var tail = [dt10Cell_(rc.mode), dt10Cell_(rc.version),
-              dt10Cell_(rc.builder), dt10Cell_(rc.pool),
-              dt10Cell_(rc.overlap_top5)];
+  function vtag(v) {
+    var c = dt10Cell_(v);
+    return c === '' ? '' : 'v' + String(c);
+  }
+  var tail = [dt10Cell_(rc.mode), vtag(rc.version), vtag(rc.builder),
+              dt10Cell_(rc.pool), dt10Cell_(rc.overlap_top5)];
   function flag(v) {
     return v === true ? 'Y' : (v === false ? 'N' : '');
   }
@@ -7513,12 +7528,15 @@ function dt10ShadowLogRows_(payload, stamp, day, cohort) {
                '|B:' + bToks.join(',') };
 }
 /** v1.17.0: append one event to _Shadow_Rank_Log when DT10_SHADOW_RANK_LOG
- * is on. '' when off (no further read, no tab, no write: the v1.16.0 status
- * line). Cadence = _Selection_Log's default: the first event of a UTC day,
- * then only when an order changes (state DT10_SHADOW_LOG_STATE_V1). The tab
- * is created hidden on first use. Returns the status token. NEVER throws. */
+ * is on or all. '' when off (no further read, no tab, no write: the v1.16.0
+ * status line). Cadence: 'on' = the first event of each UTC day (what the
+ * nightly scorecard reads); 'all' = also whenever an order changes (state
+ * DT10_SHADOW_LOG_STATE_V1). The tab is created hidden on first use; row 1
+ * must be the header (written when blank; another layout is never written).
+ * Returns the status token. NEVER throws. */
 function dt10AppendShadowRankLog_(ss, payload, cohort) {
-  if (dt10ShadowLogMode_() !== 'on') return '';
+  var mode = dt10ShadowLogMode_();
+  if (mode === 'off') return '';
   try {
     var stamp = '';
     try {
@@ -7540,24 +7558,52 @@ function dt10AppendShadowRankLog_(ss, payload, cohort) {
     } catch (eP) {
       prev = {};
     }
-    if (prev.date === day && prev.sig === built.sig) {
-      return 'ShadowLog: unchanged';
+    if (prev.date === day && (mode === 'on' || prev.sig === built.sig)) {
+      return mode === 'on' ? 'ShadowLog: logged today' :
+          'ShadowLog: unchanged';
     }
     var want = DT10_SHADOW_LOG_HEADERS.length;
     var sh = ss.getSheetByName(DT10_SHADOW_LOG_SHEET);
     if (!sh) {
       sh = ss.insertSheet(DT10_SHADOW_LOG_SHEET);
-      sh.getRange(1, 1, 1, want).setValues([DT10_SHADOW_LOG_HEADERS])
-          .setFontWeight('bold');
-      sh.setFrozenRows(1);
+      try {
+        if (sh.getMaxColumns() > want) {
+          sh.deleteColumns(want + 1, sh.getMaxColumns() - want);
+        }
+      } catch (eC) {}
       try {
         sh.hideSheet();
       } catch (eH) {}
-    } else if (sh.getMaxColumns() < want) {
+      try {
+        ss.setActiveSheet(ss.getSheetByName(DT10_SHEET));
+      } catch (eF) {}
+    }
+    if (sh.getMaxColumns() < want) {
       sh.insertColumnsAfter(sh.getMaxColumns(), want - sh.getMaxColumns());
     }
-    sh.getRange(sh.getLastRow() + 1, 1, built.rows.length, want)
-        .setValues(built.rows);
+    var head = sh.getLastRow() > 0 ?
+        (sh.getRange(1, 1, 1, want).getValues()[0] || []) : [];
+    var blank = false;
+    for (var hi = 0; hi < want; hi++) {
+      var hv = String(head[hi] === null || head[hi] === undefined ?
+          '' : head[hi]).replace(/^\s+|\s+$/g, '');
+      if (hv === '') {
+        blank = true;
+      } else if (hv !== DT10_SHADOW_LOG_HEADERS[hi]) {
+        return 'ShadowLog: ERROR header mismatch at column ' + (hi + 1);
+      }
+    }
+    if (blank) {
+      sh.getRange(1, 1, 1, want).setValues([DT10_SHADOW_LOG_HEADERS])
+          .setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    var first = Math.max(sh.getLastRow(), 1) + 1;
+    var need = first + built.rows.length - 1;
+    if (sh.getMaxRows() < need) {
+      sh.insertRowsAfter(sh.getMaxRows(), need - sh.getMaxRows());
+    }
+    sh.getRange(first, 1, built.rows.length, want).setValues(built.rows);
     try {
       props.setProperty(DT10_SHADOW_LOG_STATE_PROP,
           JSON.stringify({ date: day, sig: built.sig }));
@@ -8782,6 +8828,7 @@ function dt10SelfTest() {
       ((srlBuilt.rows.length === 5 &&
         srlBuilt.rows[0].length === DT10_SHADOW_LOG_HEADERS.length &&
         srlBuilt.sig === 'day|C:A.US,B.US|S:B.US,A.US|B:1:A.US' &&
+        srlBuilt.rows[0][20] === 'v1.0' && srlBuilt.rows[0][21] === 'v1.28.0' &&
         dt10ShadowLogRows_({}, 's', 'd', 'c').rows.length === 0) ?
        'ok' : 'FAIL'));
   // v1.4.0: page-status dry check (pure — nothing is written).
