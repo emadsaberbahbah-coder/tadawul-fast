@@ -1,5 +1,5 @@
-"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.1.0
-[P-182 BOARD SCORECARD] + [RANKING HEALTH].
+"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.2.0
+[P-182 BOARD SCORECARD] + [RANKING HEALTH] + [CHALLENGER].
 
 REAL module. The only stub is an in-memory workbook (worksheet /
 add_worksheet / get_all_values / update / append_row / add_rows / add_cols)
@@ -11,11 +11,15 @@ Env (all optional):
   SSL_BASE_V1=<v1.0.0 file>   golden negative for P9/P11 when `git show
                               d25468a5:scripts/score_selection_log.py` is not
                               available (shallow clone); otherwise git is used
+  SSL_BASE_V11=<v1.1.0 file>  golden negative for P12/P14 when `git show
+                              53c8544e:scripts/score_selection_log.py` is not
+                              available (CI fetches both bases by SHA first)
   TFB_TEST_SELLOG_TSV=<_Selection_Log.tsv>   real-data legs (10-01 export)
   TFB_TEST_EXPORT_DIR=<dir>   Global_Markets.tsv / Mutual_Funds.tsv /
                               Market_Leaders.tsv of the same export
-P1 embedded self-test 21/21 (7 v0.1.0 cases + 9 v1.0.0 + 5 v1.1.0:
-   Spearman, reference mapping, ranking health / verdicts, wiring)
+P1 embedded self-test 24/24 (7 v0.1.0 cases + 9 v1.0.0 + 5 v1.1.0:
+   Spearman, reference mapping, ranking health / verdicts, wiring + 3 v1.2.0:
+   shadow log parsing, shadow base price, the pre-registered verdict)
 P2 v0.1.0 ticket path: run() CSV + stdout byte-identical to base
    (synthetic; + the real export when set)
 P3 synthetic scorecard through main(): episodes, exit reasons, venue bar
@@ -51,7 +55,26 @@ P10 gate on, synthetic _Selection_Log of 50 seats (5 boards x ranks 1-10,
    independent implementation + the hand-checked 6-point case; MD / step
    summary / stdout carry the section; write mode: rectangle block below
    CHURN, _Run_Log message carries the verdict, details JSON too
-P11 selftest() count: 16 (base) -> 20 (v1.1.0); the four new cases named
+P11 the five v1.1.0 selftest cases still named (# 17-21); v1.0.0 base 16/16
+P12 v1.2.0 GOLDEN NEGATIVE: TFB_BOARD_SCORECARD_CHALLENGER unset / off ->
+   stdout, the three artifacts, the step summary, the tab rectangle and the
+   _Run_Log row byte-identical to the untouched v1.1.0 (53c8544e), with
+   TFB_BOARD_SCORECARD_RANKING off AND on; the base never emits CHALLENGER
+P13 gate on, a synthetic _Shadow_Rank_Log in the cockpit's 24-column layout
+   (contract-checked against 16_Decision_Top10.gs when v1.17.0 is on the
+   tree): six verdicts end to end - PROMOTE_ELIGIBLE / CONTINUE (hit edge) /
+   CONTINUE (churn) / KEEP_CHAMPION / INSUFFICIENT_DATA / NO_DATA - every
+   order row re-derived independently (base = the close before the logged
+   day's session, +5 vs XLF / SPUS, hit / mean / worst / churn); first event
+   of a UTC day only (a later same-day event, ranks 6-10 and BOARD rows are
+   never scored nor fetched); a Saturday log never counts as a trading day;
+   live read (serials) == TSV; the read is UNFORMATTED + SERIAL_NUMBER and
+   the tab is never written; fetch list = board + SPUS + refs + the shadow
+   top-5 names and their references; a missing tab -> NO_DATA silently, a
+   failed read -> WARN + NO_DATA; additivity: with the gate on, removing the
+   CHALLENGER block (and the verdict suffixes) gives the gate-off outputs
+P14 selftest() grew 21 -> 24 with the three v1.2.0 cases named; the v1.1.0
+   base is 21/21
 
 Run under pytest in an isolated subprocess.
 """
@@ -60,7 +83,7 @@ import subprocess
 import sys
 
 def main():
-    import contextlib, csv, hashlib, importlib.util, io, json, os, shutil, sys, tempfile
+    import contextlib, csv, hashlib, importlib.util, io, json, os, re, shutil, statistics, sys, tempfile
     from datetime import date, datetime, timedelta
 
     HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,10 +92,12 @@ def main():
     SSL_BASE = os.environ.get("SSL_BASE", "")
     SSL_BASE_V1 = os.environ.get("SSL_BASE_V1", "")
     BASE_V1_REV = "d25468a5"          # main before v1.1.0: the untouched v1.0.0 script
+    SSL_BASE_V11 = os.environ.get("SSL_BASE_V11", "")
+    BASE_V11_REV = "53c8544e"         # main before v1.2.0: the untouched v1.1.0 script
     TSV = os.environ.get("TFB_TEST_SELLOG_TSV", "")
     EXPORT_DIR = os.environ.get("TFB_TEST_EXPORT_DIR", "")
     ENVS = ("TFB_BOARD_SCORECARD", "TFB_BOARD_SCORECARD_MIN_COVERAGE", "GITHUB_STEP_SUMMARY",
-            "TFB_BOARD_SCORECARD_RANKING")
+            "TFB_BOARD_SCORECARD_RANKING", "TFB_BOARD_SCORECARD_CHALLENGER")
     ASOF = "2026-10-01T06:00:00Z"
 
 
@@ -452,7 +477,7 @@ def main():
 
     # ------------------------------------------------------------------- P1
     rc, so = _call(m.selftest)
-    T("P1 embedded self-test 21/21", rc == 0 and "SELFTEST 21/21: ALL GREEN" in so, so.strip())
+    T("P1 embedded self-test 24/24", rc == 0 and "SELFTEST 24/24: ALL GREEN" in so, so.strip())
 
     # ------------------------------------------------------------------- P2
     if SSL_BASE:
@@ -676,15 +701,23 @@ def main():
     T("P8 idempotence: same input -> identical rectangle", r1 == r2 and r1 == rect, _h(r1))
 
     # ----------------------------------------------------------- v1.1.0 helpers
-    def _run_mod(mod, book, mode, out_dir, tsv_path, px_path, rk=None, asof=RK_ASOF, step=None):
+    def _run_mod(mod, book, mode, out_dir, tsv_path, px_path, rk=None, asof=RK_ASOF, step=None,
+                 ch=None, shadow=None, fetch=False):
         """One scorecard run of `mod`: live (stub book) when book is given,
-        else the TSV path. rk = TFB_BOARD_SCORECARD_RANKING value or None."""
+        else the TSV path. rk = TFB_BOARD_SCORECARD_RANKING value or None;
+        ch = TFB_BOARD_SCORECARD_CHALLENGER value or None (v1.2.0); shadow =
+        --shadow-tsv path; fetch = --fetch-yahoo (mod.fetch_yahoo patched by
+        the caller) instead of --prices-csv."""
         if book is not None:
             mod._open_book = lambda: book
-        args = ["--scorecard", "--prices-csv", px_path, "--asof", asof, "--out-dir", out_dir]
+        args = (["--scorecard", "--fetch-yahoo"] if fetch else ["--scorecard", "--prices-csv", px_path])
+        args += ["--asof", asof, "--out-dir", out_dir]
         args += ["--live"] if book is not None else ["--tsv", tsv_path]
+        if shadow:
+            args += ["--shadow-tsv", shadow]
         with _env(TFB_BOARD_SCORECARD=mode, TFB_BOARD_SCORECARD_RANKING=rk,
-                  TFB_BOARD_SCORECARD_MIN_COVERAGE="0", GITHUB_STEP_SUMMARY=step):
+                  TFB_BOARD_SCORECARD_MIN_COVERAGE="0", GITHUB_STEP_SUMMARY=step,
+                  TFB_BOARD_SCORECARD_CHALLENGER=ch):
             return _call(mod.main, args)
 
     def _artifacts(out_dir):
@@ -995,14 +1028,445 @@ def main():
              if l.strip().startswith("# 17:") or l.strip().startswith("# 18:")
              or l.strip().startswith("# 19:") or l.strip().startswith("# 20:")
              or l.strip().startswith("# 21:")]
-    T("P11 selftest() grew 16 -> 21 with the five v1.1.0 cases (Spearman, mapping, ranking health, wiring, index clocks)",
-      rc == 0 and "SELFTEST 21/21: ALL GREEN" in so and len(names) == 5
+    T("P11 the five v1.1.0 selftest cases are still there (Spearman, mapping, ranking health, wiring, index clocks)",
+      rc == 0 and "SELFTEST 24/24: ALL GREEN" in so and len(names) == 5
       and "Spearman" in names[0] and "reference" in names[1] and "ranking health" in names[2]
       and "gate" in names[3] and "venue" in names[4], names)
     if base_v1 is not None:
         rc_b, so_b = _call(base_v1.selftest)
         T("P11 base v1.0.0 selftest is 16/16 (the count rose by exactly the new cases)",
           rc_b == 0 and "SELFTEST 16/16: ALL GREEN" in so_b, so_b.strip())
+
+    # ------------------------------------------------- v1.2.0 golden base (v1.1.0)
+    base_v11_path = os.path.join(TMP, "base_v1_1_0", "score_selection_log.py")
+    os.makedirs(os.path.dirname(base_v11_path), exist_ok=True)
+    base_v11_src = ""
+    if SSL_BASE_V11 and os.path.exists(SSL_BASE_V11):
+        base_v11_src = SSL_BASE_V11
+    else:
+        try:
+            blob = subprocess.run(["git", "-C", ROOT, "show", BASE_V11_REV + ":scripts/score_selection_log.py"],
+                                  capture_output=True, text=True, timeout=60)
+            if blob.returncode == 0 and "SCRIPT_VERSION = \"1.1.0\"" in blob.stdout:
+                with open(base_v11_path, "w", encoding="utf-8") as fh:
+                    fh.write(blob.stdout)
+                base_v11_src = base_v11_path
+        except (OSError, subprocess.SubprocessError):
+            base_v11_src = ""
+    base_v11 = _load(base_v11_src, "ssl_base_v1_1_0") if base_v11_src else None
+
+    def _n11(who, obj):
+        """The new module's version tag -> 1.1.0; the base is left as is."""
+        txt = obj if isinstance(obj, str) else json.dumps(obj, default=str)
+        return txt.replace(m.SCRIPT_VERSION, "1.1.0") if who == "new" else txt
+
+    # ------------------------------------------------------------------ P12
+    if base_v11 is not None:
+        T("P12 base is the untouched v1.1.0 (SCRIPT_VERSION, ranking gate, no challenger helper)",
+          base_v11.SCRIPT_VERSION == "1.1.0" and hasattr(base_v11, "_ranking_enabled")
+          and not hasattr(base_v11, "_challenger_enabled") and not hasattr(base_v11, "shadow_events"))
+        for rkv in (None, "on"):
+            for gate in (None, "off"):
+                label = "ranking %s / challenger %s" % (rkv or "unset", gate or "unset")
+                res = {}
+                for who, mod in (("new", m), ("base", base_v11)):
+                    od = os.path.join(TMP, "p12_%s_%s_%s" % (who, rkv or "u", gate or "u"))
+                    st = od + "_step.md"
+                    rc, so = _run_mod(mod, None, "observe", od, inv_tsv, inv_px, rk=rkv, ch=gate, step=st)
+                    res[who] = (rc, _n11(who, so),
+                                {k: _n11(who, v.decode("utf-8")) for k, v in _artifacts(od).items()},
+                                _n11(who, open(st, encoding="utf-8").read()))
+                T("P12 %s: stdout + 3 artifacts + step summary byte-identical to v1.1.0 (tag normalised)"
+                  % label, res["new"] == res["base"] and res["new"][0] == 0,
+                  [(k, len(res["new"][2][k]), len(res["base"][2][k])) for k in res["new"][2]])
+                T("P12 %s: no CHALLENGER anywhere" % label,
+                  "CHALLENGER" not in res["new"][1] and "challenger" not in res["new"][1]
+                  and all("CHALLENGER" not in v for v in res["new"][2].values()))
+                rects, logs = {}, {}
+                for who, mod in (("new", m), ("base", base_v11)):
+                    book = StubBook({"_Selection_Log": inv_live, "_Run_Log": [RUNLOG_HDR]})
+                    rc, so = _run_mod(mod, book, "write", os.path.join(TMP, "p12w_%s_%s_%s"
+                                                                       % (who, rkv or "u", gate or "u")),
+                                      inv_tsv, inv_px, rk=rkv, ch=gate)
+                    rects[who] = (rc, _n11(who, book.tabs["_Board_Scorecard"].values),
+                                  [c[0] for c in _writes(book)],
+                                  [c for c in book.calls if "_Shadow_Rank_Log" in c])
+                    logs[who] = _n11(who, book.tabs["_Run_Log"].values[-1])
+                T("P12 %s: write mode -> identical rectangle, write calls, _Run_Log row; the shadow tab is "
+                  "never touched" % label,
+                  rects["new"] == rects["base"] and logs["new"] == logs["base"]
+                  and rects["new"][2] == ["add_worksheet", "update", "append_row"] and rects["new"][3] == [],
+                  (rects["new"][2], rects["new"][3], logs["new"][:120]))
+        od = os.path.join(TMP, "p12_base_on")
+        rc, so = _run_mod(base_v11, None, "observe", od, inv_tsv, inv_px, rk="on", ch="on")
+        T("P12 base v1.1.0 never emits CHALLENGER (gate on is ignored by it)",
+          rc == 0 and "CHALLENGER" not in so and "RANKING HEALTH" in so
+          and all(b"CHALLENGER" not in v for v in _artifacts(od).values()))
+    else:
+        out.append("SKIP P12 golden negative (git show %s unavailable; set SSL_BASE_V11=<v1.1.0 file>)"
+                   % BASE_V11_REV)
+
+    # ------------------------------------------------------------------ P13
+    # _Shadow_Rank_Log as the cockpit (16_Decision_Top10 v1.17.0) writes it:
+    # one event = CHAMPION + CHALLENGER rows ranked 1-10 + BOARD rows, all
+    # with one 'Logged At' (Riyadh wall time) and the UTC 'Day'. Each logged
+    # day opens new top-5 names in both orders (rank 1 shared by the two
+    # orders); ranks 6-10, BOARD rows and a later same-day event carry names
+    # WITHOUT prices: they must never be scored nor fetched. A priced name's
+    # closes are a straight line close_i = c0 * (1 + g * i) over US2 (i = 0
+    # on 2026-08-31), so a name logged before the session of US2[j] has base
+    # i = j and +5 at i = j + 5; its excess is sign(g - g_ref). Hits g =
+    # +0.004, misses -0.002; references XLF.US +0.002 ('Financial Services')
+    # and SPUS.US +0.001 ('Banks' maps to no reference -> SPUS).
+    SH_HDR = ["Logged At", "Day", "Cohort", "Order", "Rank", "Symbol", "Market", "Sector", "Seat",
+              "Live Rank", "Shadow Rank", "Engine ROI %", "Rel", "Conf", "Momentum", "Strength",
+              "Strength Ref", "Cap", "Floor OK", "Mode", "Rule", "Builder", "Pool", "Overlap Top5"]
+    gas_path = os.path.join(ROOT, "apps_script", "16_Decision_Top10.gs")
+    gas_src = open(gas_path, encoding="utf-8").read() if os.path.exists(gas_path) else ""
+    mh = re.search(r"var DT10_SHADOW_LOG_HEADERS = \[(.*?)\];", gas_src, re.S)
+    if mh:
+        gas_hdr = re.findall(r"'([^']*)'", mh.group(1))
+        T("P13 contract: the fixture header == the cockpit's DT10_SHADOW_LOG_HEADERS (24 columns)",
+          gas_hdr == SH_HDR, gas_hdr)
+    else:
+        out.append("SKIP P13 contract (16_Decision_Top10.gs v1.17.0 not on this tree)")
+    T("P13 the scorer's required shadow columns are all in the cockpit's header",
+      all(c in SH_HDR for c in ("Logged At", "Day", "Order", "Rank", "Symbol", "Sector",
+                                "Engine ROI %", "Rel", "Conf", "Market")))
+
+    US2 = _sessions(date(2026, 9, 1), 60, {0, 1, 2, 3, 4}, {date(2026, 9, 7)})
+    CH_ASOF = (datetime.strptime(US2[-1], "%Y-%m-%d") + timedelta(days=3)).strftime("%Y-%m-%dT06:00:00Z")
+    G_HIT, G_MISS, G_SPUS, G_XLF = 0.004, -0.002, 0.001, 0.002
+    OC = {"CHAMPION": "M", "CHALLENGER": "N"}
+
+    def _line(c0, g, i):
+        return c0 * (1.0 + g * i)
+
+    def _series(sym, g, c0=100.0):
+        return ([(sym, "2026-08-31", _line(c0, g, 0))]
+                + [(sym, d, _line(c0, g, i)) for i, d in enumerate(US2, 1)])
+
+    CH_BOARD = [SELLOG_HDR] + [
+        _slrow(d + "T10:00:00", d + " 10:00:00", s, str(float(r)), "100.0", "3.75",
+               sector="Financial Services", eroi="20.0", rel="80.0", conf="High", market="US")
+        for d in ("2026-09-01", "2026-09-02") for r, s in ((1, "BRD1.US"), (2, "BRD2.US"))]
+    ch_board_tsv = os.path.join(TMP, "ch_board.tsv")
+    _write_tsv(ch_board_tsv, CH_BOARD)
+    CH_BASE_ROWS = (_series("BRD1.US", 0.001) + _series("BRD2.US", 0.0005)
+                    + _series("SPUS.US", G_SPUS, 50.0) + _series("XLF.US", G_XLF, 50.0))
+
+    def _ch_fixture(code, n_days, hits, sat_after=None, late_days=(), champ_fixed=()):
+        """One _Shadow_Rank_Log variant -> (grid of Python values, price
+        rows, expected scored episodes {order: [(symbol, j, g, g_ref)]},
+        names that must never be fetched, trading days)."""
+        grid, rows, unpriced = [SH_HDR], list(CH_BASE_ROWS), set()
+        exp = {"CHAMPION": [], "CHALLENGER": []}
+        g_of, seen = {}, {"CHAMPION": set(), "CHALLENGER": set()}
+
+        def nm(order, j, r):
+            o = "CHAMPION" if (order == "CHALLENGER" and r == 1) else order
+            jj = 0 if (o == "CHAMPION" and r in champ_fixed) else j
+            return "%s%s%02d%d.US" % (code, OC[o], jj, r)
+
+        def ev_rows(at, day, j, cohort, late=False):
+            rs = []
+            for order in ("CHAMPION", "CHALLENGER"):
+                for r in range(1, 11):
+                    if late:
+                        sym = "%sL%s%02d%d.US" % (code, OC[order], j, r)
+                        unpriced.add(sym)
+                    elif r <= 5:
+                        sym = nm(order, j, r)
+                    else:
+                        sym = "%sX%s%02d%d.US" % (code, OC[order], j, r)
+                        unpriced.add(sym)
+                    rs.append([at, day, cohort, order, r, sym, "US",
+                               "Banks" if r == 5 else "Financial Services", "",
+                               r if order == "CHAMPION" else r + 1, r if order == "CHALLENGER" else r + 1,
+                               20.0 + r, 80.0 - r, "High", 1.5, 70.0, 65.0, "N", "Y", "shadow", "1.0",
+                               "1.28.0", 40, 3])
+            for r in (1, 2):
+                sym = "%sB%02d%d.US" % (code, j, r)
+                unpriced.add(sym)
+                rs.append([at, day, cohort, "BOARD", r, sym, "US", "Financial Services", "HELD", r,
+                           r + 1, 20.0, 80.0, "High", "", "", "", "", "", "shadow", "1.0", "1.28.0", 40, 3])
+            return rs
+
+        for j in range(n_days):
+            day = US2[j]
+            grid += ev_rows(day + " 08:47:00", day, j, "cohort-%02d" % j)
+            if j in late_days:
+                grid += ev_rows(day + " 15:00:00", day, j, "cohort-%02dL" % j, late=True)
+            if sat_after == j:
+                sat = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+                assert datetime.strptime(sat, "%Y-%m-%d").weekday() == 5, sat
+                grid += ev_rows(sat + " 08:47:00", sat, j, "cohort-%02dS" % j)
+            for order in ("CHAMPION", "CHALLENGER"):
+                for r in range(1, 6):
+                    sym = nm(order, j, r)
+                    g = G_HIT if r in hits[order] else G_MISS
+                    assert g_of.setdefault(sym, g) == g, sym      # shared / fixed names agree
+                    if sym not in seen[order]:
+                        seen[order].add(sym)
+                        exp[order].append((sym, j, g, G_SPUS if r == 5 else G_XLF))
+        assert all(len(r) == 24 for r in grid)
+        for sym, g in sorted(g_of.items()):
+            rows += _series(sym, g)
+        return grid, rows, exp, unpriced, n_days
+
+    def _f(v):
+        return str(round(v, 2) + 0.0)
+
+    def _x5(g, gr, j):
+        c0, c5 = _line(100.0, g, j), _line(100.0, g, j + 5)
+        b0, b5 = _line(50.0, gr, j), _line(50.0, gr, j + 5)
+        return (c5 / c0 - 1.0) * 100.0 - (b5 / b0 - 1.0) * 100.0
+
+    def _ch_expect(exp, days):
+        """Independent per-order rows: +5 excess vs the reference (SPUS for
+        'Banks'), hit %, mean, worst, entries per trading day, mean vs SPUS."""
+        rows_ = []
+        for o in ("CHAMPION", "CHALLENGER"):
+            lst = exp[o]
+            xs = [_x5(g, gr, j) for (_s, j, g, gr) in lst]
+            sp = [_x5(g, G_SPUS, j) for (_s, j, g, _gr) in lst]
+            rows_.append([o, str(days), str(len(lst)), str(len(xs)),
+                          _f(100.0 * sum(1 for v in xs if v > 0) / len(xs)), _f(statistics.fmean(xs)),
+                          _f(min(xs)), _f(len(lst) / days), _f(statistics.fmean(sp))])
+        return rows_
+
+    def _ch_block(out_dir):
+        """The CHALLENGER block of the summary CSV: header, two orders, verdict."""
+        rows_ = _read_csv(os.path.join(out_dir, "board_scorecard_summary.csv"))
+        i = rows_.index(m.CHALLENGER_HEADER)
+        return rows_[i:]
+
+    VARIANTS = [
+        # code, days, hits by order, saturday after, late days, champion fixed ranks, verdict, reason
+        ("P", 25, {"CHAMPION": {1, 2}, "CHALLENGER": {1, 2, 3}}, 3, (1, 7), (),
+         "PROMOTE_ELIGIBLE", "every condition met - owner decides"),
+        ("C", 22, {"CHAMPION": {1, 2}, "CHALLENGER": {1, 2}}, None, (), (),
+         "CONTINUE", "not yet: hit edge"),
+        ("U", 25, {"CHAMPION": {1, 2, 3}, "CHALLENGER": {1, 2, 3}}, None, (), (1, 2, 3),
+         "CONTINUE", "not yet: churn"),
+        ("K", 41, {"CHAMPION": {1, 2}, "CHALLENGER": {1, 2}}, None, (), (),
+         "KEEP_CHAMPION", "inconclusive at 41 days: hit edge"),
+        ("I", 5, {"CHAMPION": {1, 2}, "CHALLENGER": {1, 2, 3}}, None, (), (),
+         "INSUFFICIENT_DATA", "days 5/20, scored +5 25/25 (need 40 each)"),
+    ]
+    ch_fx = {}
+    for code, nd, hits, sat, late, fixed, verdict, reason in VARIANTS:
+        grid_, rows_, exp_, unp_, days_ = _ch_fixture(code, nd, hits, sat, late, fixed)
+        sh_path, px_path = os.path.join(TMP, "ch_%s_shadow.tsv" % code), os.path.join(TMP, "ch_%s_px.csv" % code)
+        _write_tsv(sh_path, grid_)
+        _write_prices(px_path, rows_)
+        ch_fx[code] = (grid_, sh_path, px_path, exp_, unp_, days_, verdict, reason)
+        od = os.path.join(TMP, "p13_%s" % code)
+        rc, so = _run_mod(m, None, "observe", od, ch_board_tsv, px_path, rk="on", asof=CH_ASOF, ch="on",
+                          shadow=sh_path)
+        blk = _ch_block(od)
+        n_c, n_h = len(exp_["CHAMPION"]), len(exp_["CHALLENGER"])
+        text = "%s (days %d, scored %d/%d; %s)" % (verdict, days_, n_c, n_h, reason)
+        T("P13 %s: %d logged days -> %s (%s)" % (code, nd, verdict, reason),
+          rc == 0 and blk[3] == ["Verdict", text, "", "", "", "", "", "", ""]
+          and so.strip().splitlines()[-1].endswith(" ranking=INSUFFICIENT_DATA challenger=" + verdict),
+          (blk[3:], so.strip()[-160:]))
+        T("P13 %s: both order rows re-derived independently (days, episodes, scored, hit, mean, worst, "
+          "churn, vs SPUS)" % code, blk[1:3] == _ch_expect(exp_, days_), (blk[1:3], _ch_expect(exp_, days_)))
+        digests.append(_h(blk))
+
+    # promote: first event of the UTC day only, Saturday not a trading day
+    p_grid, p_sh, p_px, p_exp, p_unp, p_days, _v, _r = ch_fx["P"]
+    od_p = os.path.join(TMP, "p13_P")
+    blk_p = _ch_block(od_p)
+    T("P13 P: 125 episodes per order although day 1 and day 7 carry a later event and 09-05 (Saturday) "
+      "repeats Friday: 25 trading days, 5 entries per day",
+      blk_p[1][:4] == ["CHAMPION", "25", "125", "125"] and blk_p[2][:4] == ["CHALLENGER", "25", "125", "125"]
+      and blk_p[1][7] == "5.0" and blk_p[2][7] == "5.0", blk_p[1:3])
+    T("P13 P: hit 40.0 (champion, ranks 1-2) vs 60.0 (challenger, ranks 1-3)",
+      blk_p[1][4] == "40.0" and blk_p[2][4] == "60.0", (blk_p[1][4], blk_p[2][4]))
+    md_p = open(os.path.join(od_p, "board_scorecard.md"), encoding="utf-8").read()
+    T("P13 P: MD carries the CHALLENGER title, header and verdict; meta ' | challenger PROMOTE_ELIGIBLE'",
+      m.CHALLENGER_TITLE in md_p and ("| " + " | ".join(m.CHALLENGER_HEADER) + " |") in md_p
+      and "| Verdict | PROMOTE_ELIGIBLE (days 25, scored 125/125;" in md_p
+      and md_p.splitlines()[0].endswith(" | challenger PROMOTE_ELIGIBLE"), md_p.splitlines()[0][-90:])
+    _hdr_p, det_p = _detail_by(os.path.join(od_p, "board_scorecard_detail.csv"))
+    T("P13 P: DETAIL never carries shadow names (board seats only)",
+      sorted(d["Symbol"] for d in det_p) == ["BRD1.US", "BRD2.US"], [d["Symbol"] for d in det_p][:6])
+
+    # NO_DATA: an empty shadow export (header only) and a missing one
+    empty_sh = os.path.join(TMP, "ch_empty_shadow.tsv")
+    _write_tsv(empty_sh, [SH_HDR])
+    od = os.path.join(TMP, "p13_nodata")
+    rc, so = _run_mod(m, None, "observe", od, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="on", shadow=empty_sh)
+    blk = _ch_block(od)
+    T("P13 NO_DATA: an empty _Shadow_Rank_Log -> zero rows per order, verdict NO_DATA, rc 0",
+      rc == 0 and blk[1][:4] == ["CHAMPION", "0", "0", "0"] and blk[2][:4] == ["CHALLENGER", "0", "0", "0"]
+      and blk[3][1] == "NO_DATA (days 0, scored 0/0; no trading day logged in _Shadow_Rank_Log)"
+      and so.strip().splitlines()[-1].endswith(" challenger=NO_DATA"), (blk, so.strip()[-80:]))
+
+    # live path: serials for 'Logged At' and 'Day', numbers as numbers
+    def _ser_dt(txt):
+        return (datetime.fromisoformat(txt) - datetime(1899, 12, 30)).total_seconds() / 86400.0
+
+    def _serialize_shadow(grid):
+        outg = [list(grid[0])]
+        for r in grid[1:]:
+            r = list(r)
+            r[0] = _ser_dt(r[0])
+            r[1] = float((datetime.strptime(r[1], "%Y-%m-%d") - datetime(1899, 12, 30)).days)
+            outg.append(r)
+        return outg
+
+    ch_board_live = _serialize_live(CH_BOARD)
+    book = StubBook({"_Selection_Log": ch_board_live, "_Run_Log": [RUNLOG_HDR],
+                     "_Shadow_Rank_Log": _serialize_shadow(p_grid)})
+    od_lw = os.path.join(TMP, "p13_live_write")
+    rc, so = _run_mod(m, book, "write", od_lw, None, p_px, rk="on", asof=CH_ASOF, ch="on")
+    T("P13 live: the shadow read asks for UNFORMATTED_VALUE + SERIAL_NUMBER",
+      ("get_all_values", "_Shadow_Rank_Log", (("date_time_render_option", "SERIAL_NUMBER"),
+                                              ("value_render_option", "UNFORMATTED_VALUE"))) in book.calls,
+      [c for c in book.calls if "_Shadow_Rank_Log" in c])
+    T("P13 live: _Shadow_Rank_Log is READ ONLY (worksheet + one read, no write call on it)",
+      [c[0] for c in book.calls if "_Shadow_Rank_Log" in c] == ["worksheet", "get_all_values"]
+      and [c[0] for c in _writes(book)] == ["add_worksheet", "update", "append_row"]
+      and all(c[1] != "_Shadow_Rank_Log" for c in _writes(book)), _writes(book))
+    T("P13 live (serial 'Logged At' / 'Day') == TSV path: identical CHALLENGER block",
+      _ch_block(od_lw) == blk_p, (_ch_block(od_lw)[3:], blk_p[3:]))
+    rect = book.tabs["_Board_Scorecard"].values
+    i_t = [k for k, r in enumerate(rect) if r[0] == m.CHALLENGER_TITLE]
+    i_rk = [k for k, r in enumerate(rect) if r[0] == m.RANKING_TITLE]
+    i_det = [k for k, r in enumerate(rect) if str(r[0]).startswith("DETAIL - ")]
+    T("P13 live write: the tab carries CHALLENGER below RANKING HEALTH and above DETAIL; meta suffix",
+      len(i_t) == 1 and len(i_rk) == 1 and len(i_det) == 1 and i_rk[0] < i_t[0] < i_det[0]
+      and rect[i_t[0] + 1][:len(m.CHALLENGER_HEADER)] == m.CHALLENGER_HEADER
+      and [str(c) for c in rect[i_t[0] + 2][:9]] == blk_p[1]
+      and [str(c) for c in rect[i_t[0] + 3][:9]] == blk_p[2]
+      and [str(c) for c in rect[i_t[0] + 4][:2]] == blk_p[3][:2]
+      and rect[0][0].endswith(" | refs 1/1 | ranking INSUFFICIENT_DATA | challenger PROMOTE_ELIGIBLE"),
+      (i_rk, i_t, i_det, rect[0][0][-110:]))
+    rl = book.tabs["_Run_Log"].values[-1]
+    dj = json.loads(rl[9])
+    T("P13 live write: _Run_Log message ends ' | challenger: PROMOTE_ELIGIBLE (days 25, scored 125/125)'; "
+      "details JSON carries the challenger object",
+      rl[4] == "OK" and rl[5].endswith(" | challenger: PROMOTE_ELIGIBLE (days 25, scored 125/125)")
+      and dj["challenger"]["verdict"] == "PROMOTE_ELIGIBLE" and dj["challenger"]["days"] == 25
+      and dj["challenger"]["champion"]["scored"] == 125 and dj["challenger"]["challenger"]["hit"] == 60.0
+      and dj["challenger"]["champion"]["hit"] == 40.0 and dj["challenger"]["challenger"]["churn"] == 5.0,
+      (rl[5][-90:], dj.get("challenger")))
+    T("P13 live write: final stdout line ends ' challenger=PROMOTE_ELIGIBLE'",
+      rc == 0 and so.strip().splitlines()[-1].endswith(" challenger=PROMOTE_ELIGIBLE"), so.strip()[-90:])
+    digests.append(_h(rect))
+
+    # live, tab missing -> NO_DATA silently; a failed read -> WARN + NO_DATA
+    book = StubBook({"_Selection_Log": ch_board_live, "_Run_Log": [RUNLOG_HDR]})
+    rc, so = _run_mod(m, book, "observe", os.path.join(TMP, "p13_live_missing"), None, p_px, rk="on",
+                      asof=CH_ASOF, ch="on")
+    T("P13 live: no _Shadow_Rank_Log tab -> NO_DATA, no WARN, rc 0, zero writes",
+      rc == 0 and "WARN" not in so and so.strip().splitlines()[-1].endswith(" challenger=NO_DATA")
+      and _writes(book) == [], so.strip()[-80:])
+
+    class _BrokenShadowBook(StubBook):
+        def worksheet(self, title):
+            if title == "_Shadow_Rank_Log":
+                self.calls.append(("worksheet", title))
+                raise RuntimeError("quota exceeded")
+            return StubBook.worksheet(self, title)
+
+    book = _BrokenShadowBook({"_Selection_Log": ch_board_live, "_Run_Log": [RUNLOG_HDR]})
+    rc, so = _run_mod(m, book, "observe", os.path.join(TMP, "p13_live_broken"), None, p_px, rk="on",
+                      asof=CH_ASOF, ch="on")
+    T("P13 live: a failed shadow read -> one WARN line, NO_DATA, the board still scored, rc 0",
+      rc == 0 and "WARN: _Shadow_Rank_Log not read (quota exceeded) - challenger NO_DATA" in so
+      and so.strip().splitlines()[-1].endswith(" challenger=NO_DATA") and "episodes=2" in so,
+      so.strip()[-120:])
+
+    # fetch path: the shadow top-5 names and their references join the fetch;
+    # ranks 6-10, BOARD rows and the later same-day event never do
+    p_prices = m.load_prices_csv(p_px)
+    fetched = []
+    real_fetch = m.fetch_yahoo
+
+    def _fake_fetch(symbols, frm, asof_utc, pause=0.25):
+        fetched.append((list(symbols), frm))
+        return {s_: list(p_prices[s_]) for s_ in symbols if s_ in p_prices}
+
+    m.fetch_yahoo = _fake_fetch
+    try:
+        od_f = os.path.join(TMP, "p13_fetch_on")
+        rc, so = _run_mod(m, None, "observe", od_f, ch_board_tsv, None, rk="on", asof=CH_ASOF, ch="on",
+                          shadow=p_sh, fetch=True)
+        syms_on, frm_on = fetched[-1]
+        rc_off, so_off = _run_mod(m, None, "observe", os.path.join(TMP, "p13_fetch_off"), ch_board_tsv,
+                                  None, rk="on", asof=CH_ASOF, ch="off", shadow=p_sh, fetch=True)
+        syms_off, frm_off = fetched[-1]
+    finally:
+        m.fetch_yahoo = real_fetch
+    shadow_priced = sorted({s_ for o in p_exp.values() for (s_, _j, _g, _gr) in o})
+    T("P13 fetch (gate on): board + SPUS + refs, then the shadow top-5 names - one fetch, no duplicates",
+      rc == 0 and syms_on == ["BRD1.US", "BRD2.US", "SPUS.US", "XLF.US"] + shadow_priced
+      and len(set(syms_on)) == len(syms_on) and frm_on == "2026-08-22", (syms_on[:6], len(syms_on), frm_on))
+    T("P13 fetch (gate on): no rank 6-10, BOARD or later-event name is ever fetched",
+      not (set(syms_on) & p_unp) and len(p_unp) > 0, sorted(set(syms_on) & p_unp)[:5])
+    T("P13 fetch (gate off): the v1.1.0 list exactly (board + SPUS + refs)",
+      rc_off == 0 and syms_off == ["BRD1.US", "BRD2.US", "SPUS.US", "XLF.US"] and frm_off == "2026-08-22",
+      syms_off)
+    T("P13 fetch path == CSV path: identical CHALLENGER block", _ch_block(od_f) == blk_p,
+      _ch_block(od_f)[3:])
+
+    # additivity: gate on minus the CHALLENGER block == gate off (same inputs)
+    od_off = os.path.join(TMP, "p13_P_off")
+    rc, so_off = _run_mod(m, None, "observe", od_off, ch_board_tsv, p_px, rk="on", asof=CH_ASOF, ch="off",
+                          shadow=p_sh)
+    a_on, a_off = _artifacts(od_p), _artifacts(od_off)
+    sum_on, sum_off = (a_on["board_scorecard_summary.csv"].decode("utf-8"),
+                       a_off["board_scorecard_summary.csv"].decode("utf-8"))
+    T("P13 additive: DETAIL CSV byte-identical with the gate on or off",
+      a_on["board_scorecard_detail.csv"] == a_off["board_scorecard_detail.csv"])
+    T("P13 additive: summary CSV (on) == summary CSV (off) + one blank row + the CHALLENGER block",
+      sum_on.startswith(sum_off)
+      and list(csv.reader(io.StringIO(sum_on[len(sum_off):]))) == [[]] + blk_p, len(sum_on) - len(sum_off))
+    md_on, md_off = a_on["board_scorecard.md"].decode("utf-8"), a_off["board_scorecard.md"].decode("utf-8")
+    T("P13 additive: MD (on, meta suffix removed) starts with MD (off); the rest is the CHALLENGER table",
+      md_on.replace(" | challenger PROMOTE_ELIGIBLE", "", 1).startswith(md_off)
+      and md_on.replace(" | challenger PROMOTE_ELIGIBLE", "", 1)[len(md_off):].startswith(
+          "\n" + m.CHALLENGER_TITLE + "\n"), md_on[len(md_off) - 20:len(md_off) + 60])
+    rects, logs = {}, {}
+    for gate in ("on", "off"):
+        book = StubBook({"_Selection_Log": ch_board_live, "_Run_Log": [RUNLOG_HDR],
+                         "_Shadow_Rank_Log": _serialize_shadow(p_grid)})
+        _run_mod(m, book, "write", os.path.join(TMP, "p13_add_w_" + gate), None, p_px, rk="on",
+                 asof=CH_ASOF, ch=gate)
+        rects[gate] = [list(r) for r in book.tabs["_Board_Scorecard"].values]
+        logs[gate] = list(book.tabs["_Run_Log"].values[-1])
+        if gate == "off":
+            T("P13 gate off: the shadow tab is not even opened",
+              [c for c in book.calls if "_Shadow_Rank_Log" in c] == [], book.calls[:4])
+    k_t = [k for k, r in enumerate(rects["on"]) if r[0] == m.CHALLENGER_TITLE][0]
+    stripped = rects["on"][:k_t - 1] + rects["on"][k_t + 5:]       # blank, title, header, 2 orders, verdict
+    stripped[0] = [stripped[0][0].replace(" | challenger PROMOTE_ELIGIBLE", "", 1)] + stripped[0][1:]
+    T("P13 additive: rectangle (on) minus the 6-row CHALLENGER block == rectangle (off)",
+      stripped == rects["off"], (len(rects["on"]), len(rects["off"])))
+    msg_on = re.sub(r"wrote=\d+x\d+", "wrote=*", logs["on"][5])
+    msg_off = re.sub(r"wrote=\d+x\d+", "wrote=*", logs["off"][5])
+    T("P13 additive: _Run_Log message (on) == (off) + ' | challenger: ...'; details JSON only gains the key",
+      msg_on == msg_off + " | challenger: PROMOTE_ELIGIBLE (days 25, scored 125/125)"
+      and {k: v for k, v in json.loads(logs["on"][9]).items() if k != "challenger"}
+      == json.loads(logs["off"][9]), (msg_on[-120:], msg_off[-60:]))
+
+    # ------------------------------------------------------------------ P14
+    rc, so = _call(m.selftest)
+    names = [l for l in open(SSL_FILE, encoding="utf-8").read().splitlines()
+             if l.strip().startswith("# 22:") or l.strip().startswith("# 23:")
+             or l.strip().startswith("# 24:")]
+    T("P14 selftest() grew 21 -> 24 with the three v1.2.0 cases (shadow parsing, shadow base price, verdict)",
+      rc == 0 and "SELFTEST 24/24: ALL GREEN" in so and len(names) == 3
+      and "shadow log parsing" in names[0] and "shadow episodes" in names[1]
+      and "pre-registered verdict" in names[2], names)
+    if base_v11 is not None:
+        rc_b, so_b = _call(base_v11.selftest)
+        T("P14 base v1.1.0 selftest is 21/21 (the count rose by exactly the new cases)",
+          rc_b == 0 and "SELFTEST 21/21: ALL GREEN" in so_b, so_b.strip())
 
     shutil.rmtree(TMP, ignore_errors=True)
     digest = hashlib.sha256(("\n".join(out) + json.dumps(digests)).encode()).hexdigest()[:16]

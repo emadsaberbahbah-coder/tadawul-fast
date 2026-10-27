@@ -2,6 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.43 (2026-10-27) -- BOARD SCORECARD HARNESS JOINS THE LEAN LANE
+#
+# v1.1.43: run tests/test_board_scorecard_p182.py (scripts/score_selection_log.py
+# v1.2.0 [CHALLENGER]: TFB_BOARD_SCORECARD_CHALLENGER, default off -- reads the
+# cockpit's _Shadow_Rank_Log and scores the champion and challenger orders by
+# the pre-registered rule of the self-correcting program, section 4) as its
+# own step of the blocking lean lane; until now only the advisory whole-suite
+# job ran it. Its golden negatives (P9 vs the untouched v1.0.0, P12 vs the
+# untouched v1.1.0) read the two base commits with `git show`; the default
+# checkout is shallow, so the step fetches exactly those two commits by SHA
+# first (a failed fetch turns only those legs into SKIP lines). Nothing is
+# removed and no existing entry moves.
+#
 # VERSION 1.1.38 (2026-10-26) -- FUNDING EVIDENCE TRANSPORT
 #
 # v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
@@ -889,6 +902,18 @@ jobs:
           # Separate processes keep their state out of the other lean suites.
           python -m pytest -q tests/test_pf_add_loser_veto_p183.py
           python -m pytest -q tests/test_pf_sukuk_ladder_p153.py
+
+      - name: 📋 Board scorecard harness (golden bases fetched by SHA)
+        run: |
+          # v1.1.43: P9 / P12 compare scripts/score_selection_log.py with the
+          # untouched v1.0.0 (d25468a5) and v1.1.0 (53c8544e) scripts. The
+          # checkout is shallow: fetch exactly those two commits; a failed
+          # fetch only turns those legs into SKIP lines.
+          git fetch --no-tags --depth=1 origin \
+            d25468a548bcba082779f3d7d5f8b4dfadaac176 \
+            53c8544e88d217054dcaf56d04fce110d002e4d2 \
+            || echo "::notice::scorecard golden bases not fetched - P9/P12 will SKIP"
+          python tests/test_board_scorecard_p182.py
 
       - name: ✅ Coverage note
         run: |
