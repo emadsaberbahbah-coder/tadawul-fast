@@ -2,6 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.46 (2026-10-27) -- CALENDAR VENUE BATCHES + EODHD EXCHANGE CODES
+#
+# v1.1.46 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.45 are #848-#853):
+# run tests/test_calendar_venue_batches.py (core/providers/calendar_provider
+# v1.3.2: TFB_CALENDAR_VENUE_BATCHES and TFB_CALENDAR_SUFFIX_MAP, both default
+# off -- one venue per /calendar/earnings batch, US first, and EODHD's
+# exchange codes for '.L' / '.KL' / '.IS' / '.LS'; off = the v1.3.1 requests,
+# results and log lines byte for byte) in the blocking contract lane next to
+# tests/test_calendar_split_404.py. Its golden leg reads the untouched v1.3.1
+# module with `git show e8337a16`; the step fetches that commit too (a failed
+# fetch only turns the leg into a SKIP). Nothing is removed and no existing
+# entry moves.
+#
 # VERSION 1.1.45 (2026-10-27) -- CALENDAR 404 BATCH SPLIT
 #
 # v1.1.45 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.44 are #848-#852):
@@ -1050,6 +1063,10 @@ jobs:
           # shallow checkout (a failed fetch only turns that leg into a SKIP).
           git fetch --no-tags --depth=1 origin aba4e5eb6d30064e32c416b2a2369598ae4aa412 \
             || echo "::notice::calendar golden base not fetched - test_calendar_split_404 S1 will SKIP"
+          # v1.1.46: the golden leg of tests/test_calendar_venue_batches.py reads
+          # the untouched calendar_provider v1.3.1 (e8337a16).
+          git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
+            || echo "::notice::calendar v1.3.1 base not fetched - test_calendar_venue_batches V1 will SKIP"
           echo "::group::pytest (contract)"
           # PY-4 (2026-07-26): the exact current-schema contract is now an
           # UNCONDITIONAL gate — previously only the legacy alignment test
@@ -1067,6 +1084,7 @@ jobs:
             tests/test_calendar_partial_fill.py \
             tests/test_calendar_last_report_a4.py \
             tests/test_calendar_split_404.py \
+            tests/test_calendar_venue_batches.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
