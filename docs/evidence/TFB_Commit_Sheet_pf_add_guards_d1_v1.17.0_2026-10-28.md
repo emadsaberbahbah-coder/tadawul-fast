@@ -11,8 +11,9 @@
 | `main.py` | 8.14.7 -> 8.14.8 | `/health` pf_gates lists the five new env names |
 | `scripts/verify_deployment.py` | pins | portfolio_actions 1.17.0, advanced_analysis 4.19.0, main 8.14.8 |
 | `docs/render_env_contract.md` | regenerated | five new rows |
-| `.github/workflows/ci.yml` | 1.1.53 -> 1.1.54 | new pytest file in the isolated protective step (+ base fetch by SHA), new node harness |
-| `tests/test_pf_add_guards_d1.py` | new | 37 cases |
+| `.github/workflows/ci.yml` | 1.1.53 -> 1.1.54 | new pytest file in the isolated protective step (+ base fetch by SHA), the route case in the contract lane, new node harness |
+| `tests/test_pf_add_guards_d1.py` | new | 36 cases (isolated protective lane; numpy + pytest only) |
+| `tests/test_pf_add_guards_d1_route.py` | new | 1 case (schema and route contract lane; FastAPI) |
 | `tests/test_pd_post_earn_inputs.js` | new | 62 checks (+3 with `PD_BASE`) |
 | `tests/test_auth_wall_scope_path.py`, `tests/test_auth_wall_downstream_errors.py`, `tests/test_main_health_pf_gates_v8140.py`, `tests/test_pf_allcash_ok.py`, `tests/test_pd_evidence_publish.js`, `tests/js/gas_ledger_fx_failed_state.test.js` | pins | stacked version pins moved (main 8.14.8, route 4.19.0, PD 1.5.17, +5 health keys, +4 GAS functions, +259 lines); every other assertion kept |
 
@@ -47,7 +48,7 @@
 | `test_off_is_byte_identical_to_v1161_base` | off = the untouched v1.16.1 module at `22658e0f` (versions masked) |
 | post-earnings observe / enforce / limits / env limits / unverifiable inputs / sukuk | tags only in observe; HOLD only for the name inside its window; KPIs and alerts consistent; absent, unavailable, stale, invalid inputs hold under enforce only |
 | ticket cap at the cap / free slots / observe + sukuk / interplay / determinism | FRST-shaped one-ticket book holds every ADD; slots in funding order; sukuk not counted; a post-earnings hold frees the slot |
-| `test_route_forwards_only_a_mapping` | the real route forwards a mapping only; absent, list or null -> no key |
+| `test_route_forwards_only_a_mapping` (route file) | the real route forwards a mapping only; absent, list or null -> no key |
 | `tests/test_pd_post_earn_inputs.js` E1-E10 | GAS inputs equal the Top-10 reader on a realistic grid (FRST 4 sessions, EPS -22.2); unavailable/stale paths; Date vs text cells; bounded read; mode; meta line unchanged without blocks; gated wiring; ES5/ASCII; 4 functions added, 0 removed |
 
 Golden negatives: `tests/test_pf_add_guards_d1.py` on `22658e0f`: 32 of 35 fail (the three that pass are the off-identity cases). `tests/test_pd_post_earn_inputs.js` on the v1.5.16 file fails at the first added var; with `PD_BASE=<v1.5.16>` E10 proves the base has none of the additions.

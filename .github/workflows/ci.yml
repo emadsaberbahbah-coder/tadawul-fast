@@ -10,7 +10,9 @@
 # TFB_PF_MAX_OPEN_TICKETS_MODE, default off = byte-identical) in the isolated
 # protective-harness step next to the P-183 veto it extends, after fetching
 # the untouched v1.16.1 base commit 22658e0f by SHA for its off-identity case
-# (a failed fetch only turns that case into a SKIP); and node
+# (a failed fetch only turns that case into a SKIP), its route case
+# tests/test_pf_add_guards_d1_route.py in the schema and route contract lane
+# (the protective lane has no FastAPI); and node
 # tests/test_pd_post_earn_inputs.js (apps_script/10_My_Portfolio.gs v1.5.17,
 # PD_POST_EARN) with the other Apps Script harnesses. Offline. Nothing is
 # removed and no existing entry moves.
@@ -1189,6 +1191,7 @@ jobs:
             tests/test_board_funding_route.py \
             tests/test_insights_cohort_route.py \
             tests/test_portfolio_reconciliation_route.py \
+            tests/test_pf_add_guards_d1_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
             tests/test_calendar_last_report_a4.py \
