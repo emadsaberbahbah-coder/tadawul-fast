@@ -10,13 +10,19 @@
  * the 04:00, 04:05 and 04:09 ticks each re-rendered the same WITHHELD
  * Top_10 (Commodities_FX acquired 430/453 below 95%), about 2 min of Apps
  * Script time each, with nothing changed between them: the receipt is
- * derived from _Status, and only the sync writes _Status. Now, when an
- * attempt renders and its receipt does not verify the planned run, the
- * chain records the _Status fingerprint it planned from (A:J rows and L:M
- * keys, one bounded read per tick) under the attempt key; later ticks skip
- * that key while the fingerprint is unchanged ("waiting for _Status to
- * change") and plan it again, within the same TFB_DC_MAX_ATTEMPTS budget,
- * once the sync or its recovery rewrote _Status. A held Portfolio_Decision
+ * derived from the sync-owned part of _Status. Now, when an attempt
+ * renders and its receipt does not verify the planned run, the chain
+ * records the fingerprint of that source-owned part it planned from (A:J
+ * rows whose Endpoint starts 'backend:' - the sync's own stamp - and the
+ * L:M keys 'TFB Decision Feed' and 'TFB Feed *'; one bounded read per tick)
+ * under the attempt key; later ticks skip that key while the fingerprint is
+ * unchanged ("waiting for _Status to change") and plan it again, within the
+ * same TFB_DC_MAX_ATTEMPTS budget, once the sync, its recovery or the
+ * release rewrote that part. Renderer-owned rows never release a hold: the
+ * cockpit upserts its own Top_10_Investments row (endpoint
+ * /sheet-rows/opportunity-candidates) on every render (Codex review on
+ * #866), and GAS-written keys such as 'Last Global Update' are not source
+ * evidence. A held Portfolio_Decision
  * no longer blocks the Top_10 step. Thrown refreshes, an unchanged board
  * (early return) and timestamp failures keep the v1.0.2 retry on the next
  * tick. Functions added: 2 (tfbDcFingerprintCore_ PURE,
@@ -112,6 +118,8 @@ var TFB_DC_ML_FEED_KEY = 'TFB Feed Market_Leaders';
 var TFB_DC_DECISION_FEED_KEY = 'TFB Decision Feed';
 var TFB_DC_INFLIGHT_MAX_MIN = 90;
 var TFB_DC_STATUS_FP_MAX_ROWS = 400;                  // v1.0.3: bounded _Status read
+var TFB_DC_FP_ENDPOINT_PREFIX = 'backend:';           // v1.0.3: the sync's own A:J stamp
+var TFB_DC_FP_FEED_PREFIX = 'TFB Feed ';              // v1.0.3: sync-written per-page keys
 
 /* ------------------------------------------------------------------ PURE --- */
 
@@ -196,14 +204,26 @@ function tfbDcStateOf_(raw) {
 }
 
 /** v1.0.3 PURE: one short fingerprint of what the receipts derive from -
- * the _Status page rows (A:J) and keyed values (L:M). Cells are joined as
- * strings; the order of rows is the sheet's. '' when nothing was readable,
- * and '' never holds anything. djb2 over the text, base 36, with the length. */
+ * the SOURCE-OWNED part of _Status: A:J rows whose Endpoint (column E)
+ * starts with 'backend:' (the sync's stamp; the cockpit's own row and GAS
+ * rows are excluded) and the L:M keys 'TFB Decision Feed' and 'TFB Feed *'.
+ * Cells are joined as strings; the order of rows is the sheet's. '' when
+ * nothing source-owned was readable, and '' never holds anything. djb2 over
+ * the text, base 36, with the length. */
 function tfbDcFingerprintCore_(rowsAJ, rowsLM) {
   var parts = [];
-  function add(rows) {
+  function trim(v) { return String(v === null || v === undefined ? '' : v).replace(/^\s+|\s+$/g, ''); }
+  function sourceRow(r) {
+    return trim(r[4]).toLowerCase().indexOf(TFB_DC_FP_ENDPOINT_PREFIX) === 0;
+  }
+  function sourceKey(r) {
+    var k = trim(r[0]);
+    return k === TFB_DC_DECISION_FEED_KEY || k.indexOf(TFB_DC_FP_FEED_PREFIX) === 0;
+  }
+  function add(rows, keep) {
     for (var i = 0; i < (rows || []).length; i++) {
       var r = rows[i] || [];
+      if (!keep(r)) continue;
       var cells = [];
       for (var j = 0; j < r.length; j++) {
         var v = r[j];
@@ -213,8 +233,8 @@ function tfbDcFingerprintCore_(rowsAJ, rowsLM) {
       if (cells.length) parts.push(cells.join('\u001f'));
     }
   }
-  add(rowsAJ);
-  add(rowsLM);
+  add(rowsAJ, sourceRow);
+  add(rowsLM, sourceKey);
   if (!parts.length) return '';
   var text = parts.join('\u001e');
   var h = 5381;

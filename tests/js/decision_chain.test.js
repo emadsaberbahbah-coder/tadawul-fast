@@ -133,6 +133,15 @@ function world(o) {
     calls.t10++;
     if (o.t10Throws) throw new Error('synthetic cockpit failure');
     if (!o.keepT10Status) boards.t10 = o.t10Status ? o.t10Status(calls.t10) : renderedStatus('t10', calls.t10);
+    if (o.t10WritesStatus) {
+      // v1.0.3 (Codex review on #866): every render upserts the cockpit's own
+      // _Status row (16_Decision_Top10 dt10WritePageStatus_ -> writePageStatus_).
+      const own = ['Top_10_Investments', riyadh(world.clock.now), 'WITHHELD',
+        'Decision cockpit: render ' + calls.t10, '/sheet-rows/opportunity-candidates', '200', 7, '', 114000, ''];
+      const at = grid.findIndex(r => r[0] === 'Top_10_Investments');
+      if (at >= 0) grid[at] = own; else grid.push(own);
+      kv['Last Global Update'] = riyadh(world.clock.now);   // a GAS-written key, not source evidence
+    }
   };
   return {ctx, props, runLog, calls, triggers, boards, setNow(ms) { world.clock.now = ms; }};
 }
@@ -596,12 +605,27 @@ check('C32 v1.0.3: an unreadable _Status fingerprint never holds; the fingerprin
   const c = w.ctx;
   assert.equal(c.tfbDcFingerprintCore_([], []), '');
   assert.equal(c.tfbDcFingerprintCore_([['', null, undefined]], [['', '']]), '');
-  const a = c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]);
-  assert.equal(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]));
-  assert.notEqual(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'y', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]));
-  assert.notEqual(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=2']]));
-  assert.notEqual(c.tfbDcFingerprintCore_([[new Date(1000)]], []), c.tfbDcFingerprintCore_([[new Date(2000)]], []));
+  const BE = 'backend:run_dashboard_sync';
+  const src = (stamp) => [['My_Portfolio', stamp, 'SUCCESS', 'msg', BE]];
+  const a = c.tfbDcFingerprintCore_(src('x'), [['TFB Feed Global_Markets', 'OK | run=1']]);
+  assert.equal(a, c.tfbDcFingerprintCore_(src('x'), [['TFB Feed Global_Markets', 'OK | run=1']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_(src('y'), [['TFB Feed Global_Markets', 'OK | run=1']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_(src('x'), [['TFB Feed Global_Markets', 'OK | run=2']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_(src('x').concat([['Global_Markets', 'z', 'OK', 'm', ' Backend:x ']]),
+    [['TFB Feed Global_Markets', 'OK | run=1']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_(src('x'), [['TFB Feed Global_Markets', 'OK | run=1'], ['TFB Decision Feed', 'X']]));
+  assert.notEqual(c.tfbDcFingerprintCore_([[new Date(1000), 'a', 'b', 'c', BE]], []),
+                  c.tfbDcFingerprintCore_([[new Date(2000), 'a', 'b', 'c', BE]], []));
   assert.match(a, /^[0-9a-z]+-\d+$/);
+  // v1.0.3 (Codex review on #866): renderer-owned rows and GAS keys never move it
+  const header = ['Page', 'Last Updated', 'Status', 'Message', 'Endpoint'];
+  const t10Row = (stamp) => ['Top_10_Investments', stamp, 'WITHHELD', 'cockpit', '/sheet-rows/opportunity-candidates'];
+  const gasRow = (stamp) => ['My_Portfolio_Sort', stamp, 'SORT_OK', 'Sorted', ''];
+  assert.equal(c.tfbDcFingerprintCore_([header].concat(src('x'), [t10Row('1')], [gasRow('1')]),
+                 [['TFB Feed Global_Markets', 'OK | run=1'], ['Last Global Update', '1'], ['Token Loaded', 'yes']]),
+               c.tfbDcFingerprintCore_([header].concat(src('x'), [t10Row('2')], [gasRow('2')]),
+                 [['TFB Feed Global_Markets', 'OK | run=1'], ['Last Global Update', '2'], ['TFB Sync Hold', 'on']]));
+  assert.equal(c.tfbDcFingerprintCore_([header, t10Row('1')], [['Last Global Update', '1']]), '');
   // plan: a hold without a readable fingerprint is ignored (retry as v1.0.2)
   const st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {'t10:1': 1}, observed: {}, hold: {'t10:1': 'abc-9'}};
   const base = {mode: 'on', nowMs: T0, state: st, pd: {available: false}, t10: {available: true, gmRun: '1', decisionRun: '1'},
@@ -629,5 +653,27 @@ check('C33 v1.0.3: a hold is pruned with its cohort when the next run arrives', 
   assert.deepEqual(Object.keys(st.hold), ['t10:' + NEXT]);
 });
 
-console.log('RESULT ' + passed + '/33 PASS');
-assert.equal(passed, 33);
+check('C34 v1.0.3: the cockpit upserting its own _Status row on every render does not release the hold', () => {
+  const cfxRow = ['Commodities_FX', riyadh(GM_AT - 60000), 'PARTIAL', 'acquired=430/453 run=' + RUN,
+                  'backend:run_dashboard_sync', '', 453, 60, 900, ''];
+  const o = {now: T0, status: readyStatus(OLD).concat([cfxRow]), kv: readyKv(RUN, RUN), t10Status: WITHHELD_T10,
+    t10WritesStatus: true,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  for (const min of [5, 10, 15, 30]) {
+    w.setNow(T0 + min * 60000);
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
+  }
+  assert.equal(w.calls.t10, 1);                                 // v1.0.3 as first written re-rendered here
+  // the sync's recovery rewrites the Commodities_FX stamp -> one retry
+  cfxRow[1] = riyadh(T0 + 40 * 60000);
+  w.setNow(T0 + 41 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.equal(w.calls.t10, 2);
+  w.setNow(T0 + 46 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
+});
+
+console.log('RESULT ' + passed + '/34 PASS');
+assert.equal(passed, 34);

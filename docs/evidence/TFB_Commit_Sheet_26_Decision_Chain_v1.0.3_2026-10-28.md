@@ -33,6 +33,13 @@
 
 Golden negative on `18ab6e38` (v1.0.2): the harness fails at C18 (no `waiting for _Status to change`, and the second tick re-renders).
 
+### Review fix (Codex, PR #866, head `dc97332f`)
+| Finding | Fix | Golden negative |
+|---|---|---|
+| P2: the fingerprint included renderer-owned rows. Every WITHHELD render upserts the cockpit's own `Top_10_Investments` row in `_Status` (`dt10WritePageStatus_` -> `writePageStatus_`, endpoint `/sheet-rows/opportunity-candidates`), so the render itself moved the plan-time fingerprint and the next tick retried until the budget was spent - the loop this change exists to stop. The harness spies did not write `_Status`. | `tfbDcFingerprintCore_` keeps only the source-owned part: A:J rows whose Endpoint starts `backend:` (the sync's documented author stamp, `run_dashboard_sync` `_STATUS_STAMP_ENDPOINT`) and the L:M keys `TFB Decision Feed` and `TFB Feed *` (the sync's and the release's keys). The `_Status` header row, the cockpit's row, GAS rows and GAS keys (`Last Global Update`, `Token Loaded`, `TFB Sync Hold`) never move it. The harness Top-10 spy now upserts the cockpit's own row and a GAS key on every render; new C34 proves the hold survives four ticks and is released by the next `backend:` stamp. | The new harness fails on `dc97332f` at C32 (a renderer-owned row moves the fingerprint). |
+
+Harness: 34/34; `tests/test_decision_chain_js.py` expects 34/34.
+
 ## S4 - Owner steps (after merge)
 1. Apps Script editor -> `26_Decision_Chain.gs` -> replace the whole file with the merged repo copy -> Ctrl+S. No trigger change: the 5-minute trigger and `TFB_DECISION_CHAIN` stay as they are.
 2. Read-back next morning: `_Run_Log` shows at most one `tfbDecisionChainTick` ERROR row per cohort while the board is WITHHELD, with `waiting for _Status to change`; `tfbDecisionChainStatus()` reads `next=none (Top_10 run N did not verify; waiting for _Status to change)` between syncs.
