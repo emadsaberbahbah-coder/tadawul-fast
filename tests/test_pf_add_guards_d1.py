@@ -194,6 +194,24 @@ def test_window_eval(entry, expected):
     assert pa._post_earn_eval({"symbol": "OTHER.US"}, pe, 5, 10)["in_window"] is False
 
 
+def test_report_day_is_inside_every_window(rows, monkeypatch):
+    # Review fix (Codex P1, PR #869): 10_My_Portfolio sends a report dated
+    # today at 0 sessions; the guard holds the ADD on the report day itself.
+    today = riyadh_today().isoformat()
+    ev = pa._post_earn_eval({"symbol": "EARN.US"},
+                            {"status": "ok", "map": {"EARN.US": {"date": today, "sessions": 0,
+                                                             "surprise": None}}}, 5, 10)
+    assert ev["in_window"] and ev["trig"] == "report day %s (0/5 sessions, EPS n/a)" % today
+    for surprise, limit in ((None, 5), (-5.0, 10), (2.0, 5)):
+        entry = {"EARN.US": {"date": today, "sessions": 0, "surprise": surprise}}
+        enf = build(rows, monkeypatch, post_earn="enforce", inputs=calendar(entry))
+        held = actions(enf)["EARN.US"]
+        eps = "n/a" if surprise is None else "%+.1f%%" % surprise
+        assert held["action"] == "HOLD" and held["action_reason"].startswith(
+            "ADD held [POST-EARN]: report day %s (0/%d sessions, EPS %s)" % (today, limit, eps))
+        assert actions(enf)["CALM.US"]["action"] == "ADD"
+
+
 # ----------------------------------------------------------------- off
 def test_off_is_identical_with_or_without_inputs(rows, monkeypatch):
     plain = build(rows, monkeypatch)

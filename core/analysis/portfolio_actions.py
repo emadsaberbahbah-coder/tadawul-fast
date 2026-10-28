@@ -3640,8 +3640,14 @@ def _post_earn_eval(cand, pe, sessions_pos, sessions_neg):
         out["limit"] = lim
         out["in_window"] = 0 <= e["sessions"] <= lim
         eps = "n/a" if e["surprise"] is None else "%+.1f%%" % e["surprise"]
-        out["trig"] = ("reported %s, %d/%d sessions since the report (EPS %s)"
-                       % (e["date"], e["sessions"], lim, eps))
+        if e["sessions"] == 0:
+            # Review fix (PR #869): a report dated today (before or after
+            # the release) is the report day itself.
+            out["trig"] = ("report day %s (0/%d sessions, EPS %s)"
+                           % (e["date"], lim, eps))
+        else:
+            out["trig"] = ("reported %s, %d/%d sessions since the report (EPS %s)"
+                           % (e["date"], e["sessions"], lim, eps))
     except Exception:  # noqa: BLE001 - pure helper, never fatal
         out = {"in_window": False, "limit": None, "trig": ""}
     return out

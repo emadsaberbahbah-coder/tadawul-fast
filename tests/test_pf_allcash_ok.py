@@ -209,8 +209,8 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
                                   "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
-    # 2026-10-28: + 224 lines for v1.5.17 (post-earnings inputs)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 224
+    # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259
 
 
 def test_added_lines_are_es5_and_ascii(base_source):

@@ -23,7 +23,9 @@
  * (Riyadh date), updated (newest 'Updated At (Riyadh)' day), reports (recent
  * reports in the calendar) and, for the held symbols only, {date, sessions,
  * surprise} from the Top-10's own reader dt10PostEarnMapFromValues_ (same
- * sessions, same 31-day window, Sun-Thu for KSA). A missing sheet, header or
+ * sessions, same 31-day window, Sun-Thu for KSA), plus a held name whose
+ * Last or Next Earnings Date is today at 0 sessions (review fix: that reader
+ * keeps strictly past reports only). A missing sheet, header or
  * 16_Decision_Top10 parser, or any read error -> 'unavailable'; a newest
  * update older than PD_POST_EARN_STALE_DAYS (7) -> 'stale'. The backend
  * ignores the object unless the guard is armed, and pops it before meta, so
@@ -4453,7 +4455,9 @@ function pdPostEarnRiyadhDay_(value) {
  * (values; null when the sheet could not be read), the held symbols and the
  * run time. Report dates, sessions and surprises come from the Top-10's
  * reader dt10PostEarnMapFromValues_ (16_Decision_Top10 v1.18.0) so both
- * pages count the same sessions; without it -> 'unavailable'. The newest
+ * pages count the same sessions; without it -> 'unavailable'. A held name
+ * whose Last or Next Earnings Date is today enters at 0 sessions (that
+ * reader keeps strictly past reports only). The newest
  * 'Updated At (Riyadh)' day older than PD_POST_EARN_STALE_DAYS -> 'stale'.
  * Never throws. */
 function pdPostEarnCore_(values, held, now) {
@@ -4472,24 +4476,26 @@ function pdPostEarnCore_(values, held, now) {
       out.reason = 'Calendar_Events not readable';
       return out;
     }
-    var iSym = -1, iUpd = -1, iRep = -1, r, c, cells, tok;
+    var iSym = -1, iUpd = -1, iLast = -1, iNext = -1, iSur = -1, r, c, cells, tok;
     for (r = 0; r < values.length && r < 10 && iSym < 0; r++) {
       cells = values[r] || [];
-      var s = -1, u = -1, p = -1;
+      var s = -1, u = -1, l = -1, x = -1, p = -1;
       for (c = 0; c < cells.length; c++) {
         tok = String(cells[c] === null || cells[c] === undefined ? '' : cells[c])
             .toLowerCase().replace(/[^a-z0-9]/g, '');
         if (tok === 'symbol') s = c;
         else if (tok === 'updatedatriyadh' || tok === 'updatedat') u = c;
-        else if (tok === 'lastearningsdate' || tok === 'nextearningsdate' ||
-                 tok === 'earningsdate') p = c;
+        else if (tok === 'lastearningsdate') l = c;
+        else if (tok === 'nextearningsdate' || tok === 'earningsdate') x = c;
+        else if (tok === 'epssurprise') p = c;
       }
-      if (s >= 0 && p >= 0) { iSym = s; iUpd = u; iRep = p; }
+      if (s >= 0 && (l >= 0 || x >= 0)) { iSym = s; iUpd = u; iLast = l; iNext = x; iSur = p; }
     }
-    if (iSym < 0 || iRep < 0) {
+    if (iSym < 0) {
       out.reason = 'Calendar_Events header not found';
       return out;
     }
+    var firstBody = r;
     var newest = null;
     if (iUpd >= 0) {
       for (; r < values.length; r++) {
@@ -4504,11 +4510,40 @@ function pdPostEarnCore_(values, held, now) {
       if (Object.prototype.hasOwnProperty.call(full, k)) n++;
     }
     out.reports = n;
-    var map = {};
+    var map = {}, heldSet = {};
     for (var i = 0; i < (held || []).length; i++) {
       var sym = String(held[i] === null || held[i] === undefined ? '' : held[i])
           .replace(/^\s+|\s+$/g, '').toUpperCase();
-      if (sym && Object.prototype.hasOwnProperty.call(full, sym)) map[sym] = full[sym];
+      if (!sym) continue;
+      heldSet[sym] = true;
+      if (Object.prototype.hasOwnProperty.call(full, sym)) map[sym] = full[sym];
+    }
+    /* Review fix (Codex P1, PR #869): the Top-10 reader keeps strictly past
+     * reports, so a held name that reports, or reported, TODAY was missing
+     * and its ADD passed on the report day itself. Such a name enters at 0
+     * sessions (inside every window); the surprise is read only from a Last
+     * Earnings Date of today, as the Top-10 reader parses it. */
+    var dayOf = (typeof dt10CalendarDay_ === 'function') ? dt10CalendarDay_ : pdPostEarnRiyadhDay_;
+    for (var q = firstBody; today !== null && q < values.length; q++) {
+      cells = values[q] || [];
+      var hs = String(cells[iSym] === null || cells[iSym] === undefined ? '' : cells[iSym])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!hs || !heldSet[hs] || Object.prototype.hasOwnProperty.call(map, hs)) continue;
+      var lastDay = iLast >= 0 ? dayOf(cells[iLast]) : null;
+      var nextDay = iNext >= 0 ? dayOf(cells[iNext]) : null;
+      if (lastDay !== today && nextDay !== today) continue;
+      var sur = null;
+      if (lastDay === today && iSur >= 0) {
+        var raw = cells[iSur];
+        if (typeof raw === 'string') raw = raw.replace(/[,%\s]/g, '');
+        if (typeof raw === 'number' && isFinite(raw)) {
+          sur = raw;
+        } else if (typeof raw === 'string' && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+          sur = parseFloat(raw);
+        }
+        if (sur !== null && Math.abs(sur) > 999999) sur = sur > 0 ? 999999 : -999999;
+      }
+      map[hs] = {date: out.asof, sessions: 0, surprise: sur};
     }
     out.map = map;
     if (iUpd >= 0 && (newest === null || today === null ||

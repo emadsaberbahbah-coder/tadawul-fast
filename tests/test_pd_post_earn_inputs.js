@@ -93,6 +93,34 @@ ok(deep(r.map['FRST.US'], t10['FRST.US']) && deep(r.map['WPC.US'], t10['WPC.US']
 ok(!('reason' in r), 'E1 no reason on ok');
 console.log('E1 PASS core');
 
+// ---------------------------------------------------------------- E1b report day (Codex P1, PR #869)
+const sameDay = grid().concat([
+  ['TODAY.US', '2027-01-20', 84, '', '', '2026-10-28 02:10', 'eodhd', '2026-10-28', 0, '-5.0%'],
+  ['RELEASE.US', '2026-10-28', 0, '', '', '2026-10-28 02:10', 'eodhd', '', '', ''],
+  ['TOMORROW.US', '2026-10-29', 1, '', '', '2026-10-28 02:10', 'eodhd', '', '', ''],
+  ['NOTHELD.US', '2026-10-28', 0, '', '', '2026-10-28 02:10', 'eodhd', '', '', '']]);
+r = pdPostEarnCore_(sameDay, ['FRST.US', 'TODAY.US', 'RELEASE.US', 'TOMORROW.US'], NOW);
+ok(r.status === 'ok' && r.reports === 3, 'E1b ok; the Top-10 reader still counts past reports only');
+ok(deep(r.map['TODAY.US'], { date: '2026-10-28', sessions: 0, surprise: -5 }), 'E1b reported today: 0 sessions, surprise parsed');
+ok(deep(r.map['RELEASE.US'], { date: '2026-10-28', sessions: 0, surprise: null }), 'E1b reports today (Next Earnings Date): 0 sessions, surprise unknown');
+ok(!('TOMORROW.US' in r.map) && !('NOTHELD.US' in r.map), 'E1b a later date and a name not held stay out');
+ok(deep(r.map['FRST.US'], { date: '2026-10-22', sessions: 4, surprise: -22.2 }), 'E1b past reports unchanged');
+ok(!('TODAY.US' in dt10PostEarnMapFromValues_(sameDay, NOW)), 'E1b the Top-10 reader itself is untouched (strictly past)');
+const sameDayDates = sameDay.map((row, i) => {
+  if (!i) return row;
+  const out = row.slice();
+  for (const c of [1, 7]) if (/^\d{4}-\d{2}-\d{2}$/.test(String(row[c]))) out[c] = new Date(Date.parse(row[c] + 'T00:00:00.000Z') - 3 * 3600 * 1000);
+  return out;
+});
+ok(deep(pdPostEarnCore_(sameDayDates, ['TODAY.US', 'RELEASE.US'], NOW).map,
+        pdPostEarnCore_(sameDay, ['TODAY.US', 'RELEASE.US'], NOW).map),
+   'E1b Date cells give the same report-day entries');
+const lateNow = new Date('2026-10-28T20:59:00Z');   // 23:59 Riyadh, still 28 Oct
+ok(pdPostEarnCore_(sameDay, ['TODAY.US'], lateNow).map['TODAY.US'].sessions === 0, 'E1b 23:59 Riyadh is still the report day');
+const nextNow = new Date('2026-10-28T21:00:00Z');   // 00:00 Riyadh, 29 Oct
+ok(pdPostEarnCore_(sameDay, ['TODAY.US'], nextNow).map['TODAY.US'].sessions === 1, 'E1b the next Riyadh day counts one session (Top-10 reader)');
+console.log('E1b PASS report day');
+
 // ---------------------------------------------------------------- E2
 const saved = global.dt10PostEarnMapFromValues_;
 global.dt10PostEarnMapFromValues_ = undefined;

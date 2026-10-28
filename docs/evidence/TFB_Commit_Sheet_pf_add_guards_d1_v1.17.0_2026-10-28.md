@@ -12,9 +12,9 @@
 | `scripts/verify_deployment.py` | pins | portfolio_actions 1.17.0, advanced_analysis 4.19.0, main 8.14.8 |
 | `docs/render_env_contract.md` | regenerated | five new rows |
 | `.github/workflows/ci.yml` | 1.1.53 -> 1.1.54 | new pytest file in the isolated protective step (+ base fetch by SHA), new node harness |
-| `tests/test_pf_add_guards_d1.py` | new | 35 cases |
-| `tests/test_pd_post_earn_inputs.js` | new | 53 checks (+3 with `PD_BASE`) |
-| `tests/test_auth_wall_scope_path.py`, `tests/test_auth_wall_downstream_errors.py`, `tests/test_main_health_pf_gates_v8140.py`, `tests/test_pf_allcash_ok.py`, `tests/test_pd_evidence_publish.js`, `tests/js/gas_ledger_fx_failed_state.test.js` | pins | stacked version pins moved (main 8.14.8, route 4.19.0, PD 1.5.17, +5 health keys, +4 GAS functions, +224 lines); every other assertion kept |
+| `tests/test_pf_add_guards_d1.py` | new | 36 cases |
+| `tests/test_pd_post_earn_inputs.js` | new | 62 checks (+3 with `PD_BASE`) |
+| `tests/test_auth_wall_scope_path.py`, `tests/test_auth_wall_downstream_errors.py`, `tests/test_main_health_pf_gates_v8140.py`, `tests/test_pf_allcash_ok.py`, `tests/test_pd_evidence_publish.js`, `tests/js/gas_ledger_fx_failed_state.test.js` | pins | stacked version pins moved (main 8.14.8, route 4.19.0, PD 1.5.17, +5 health keys, +4 GAS functions, +259 lines); every other assertion kept |
 
 ## S1 - Evidence
 - `Portfolio_Decision` 28 Oct 08:46: `ADD FRST.US 48 sh (~2,671 SAR, cash) - Upside 23.0 %` on a lot at -3.9 % (174 @ 15.4363), five sessions after the 22 Oct report (`Calendar_Events`: Last Earnings Date 2026-10-22, EPS Surprise -22.2 %).
@@ -23,7 +23,7 @@
 
 ## S2 - WHAT
 **(b) post-earnings window - `_apply_add_post_earn`, per row after P-183**
-- Inputs: `body.post_earnings` (schema `tfb.pd-post-earnings/v1`) from 10_My_Portfolio v1.5.17: `status` ok | unavailable | stale, `asof` (Riyadh date), `updated`, `reports`, and for held symbols only `{date, sessions, surprise}` from the Top-10's reader `dt10PostEarnMapFromValues_`, so both pages count the same sessions (Mon-Fri, Sun-Thu for KSA) inside the same 31-day window. The route forwards it; `_build` pops it like the evidence packet, so `meta.upstream` never echoes it.
+- Inputs: `body.post_earnings` (schema `tfb.pd-post-earnings/v1`) from 10_My_Portfolio v1.5.17: `status` ok | unavailable | stale, `asof` (Riyadh date), `updated`, `reports`, and for held symbols only `{date, sessions, surprise}` from the Top-10's reader `dt10PostEarnMapFromValues_`, so both pages count the same sessions (Mon-Fri, Sun-Thu for KSA) inside the same 31-day window. A held name whose Last or Next Earnings Date is today enters at 0 sessions (that reader keeps strictly past reports only; review fix below). The route forwards it; `_build` pops it like the evidence packet, so `meta.upstream` never echoes it.
 - `_post_earn_inputs` validates: wrong schema, malformed map (> 200 symbols), `asof` more than one day from the backend's Riyadh date -> `invalid`; malformed entries are dropped.
 - Rule: an ADD whose holding reported within `TFB_PF_POST_EARN_SESSIONS` (5) sessions, or `TFB_PF_POST_EARN_SESSIONS_NEG` (10) after a negative EPS surprise, narrows to HOLD. Under enforce, inputs that are absent, unavailable, stale or invalid also hold (the window cannot be verified; an ADD is never urgent). A holding without a report in the window passes.
 
@@ -53,6 +53,11 @@
 Golden negatives: `tests/test_pf_add_guards_d1.py` on `22658e0f`: 32 of 35 fail (the three that pass are the off-identity cases). `tests/test_pd_post_earn_inputs.js` on the v1.5.16 file fails at the first added var; with `PD_BASE=<v1.5.16>` E10 proves the base has none of the additions.
 
 Local runs: the new files, every 10_My_Portfolio harness (7 node, 4 pytest), the version-pin tests, `render_env_contract.py --check`, and the whole suite (see the PR).
+
+### Review fix (Codex, PR #869, head `502b7400`)
+| Finding | Fix | Golden negative |
+|---|---|---|
+| P1: the reused Top-10 reader drops reports dated today (`last >= today`, `next >= today`), so a held name on its report day was absent from the inputs (status still `ok`) and its ADD passed under enforce. | `pdPostEarnCore_` adds a held name whose Last or Next Earnings Date is today at 0 sessions (surprise only from a Last Earnings Date of today, parsed as the Top-10 reader parses it); the Top-10 reader itself is unchanged. The backend names it `report day <date> (0/<limit> sessions, EPS ...)`. New E1b (reported today, reports today, tomorrow and not-held stay out, Date cells, 23:59 vs 00:00 Riyadh) and `test_report_day_is_inside_every_window`. | The harness fails at E1b on the `502b7400` file. |
 
 ## S4 - Owner steps (after merge)
 1. Apps Script: replace `10_My_Portfolio.gs` with the merged repo copy -> Ctrl+S. Project Settings -> Script Properties -> add `PD_POST_EARN` = `on`. Run `pdSelfTest` once: the line `post-earnings inputs (PD_POST_EARN=on): ok; ...` should list `FRST.US 2026-10-22 4 sess EPS -22.2` (sessions grow by one per weekday). The live backend (4.18.2) ignores the new field, so this step is safe before the deploy.
