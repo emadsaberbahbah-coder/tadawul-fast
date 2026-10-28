@@ -2,8 +2,22 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.1
 ================================================================================
+
+WHY v5.159.1 - THE FUND-CACHE HIT GATE ALSO RUNS ON THE 12M FORECAST
+(TFB_EODHD_ANALYST_TARGET unchanged; off = byte-identical to v5.158.0)
+- Codex review on #865 (P2): with TFB_EODHD_ANALYST_TARGET=1,
+  TFB_EODHD_FUND_CACHE=enforce and the supported TFB_TARGET_MEAN_PUBLISH=0,
+  the v5.159.0 capture stores forecast_price_12m / forecast_source without
+  target_mean_price (Fix AI never publishes it), and the hit gate was
+  entered only on target_mean_price: a 125 target captured at price 100
+  and replayed at 20 landed as provider_target, unjudged. Production runs
+  with the publish switch on (default), so the path was not live.
+- _fill_carries_eodhd_target(fill): forecast_price_12m OR target_mean_price.
+  The hit gate is entered on it and judges forecast_price_12m first; the
+  ":nt" suffix is omitted on the same test. One helper added, two
+  conditions changed; nothing else moved.
 
 WHY v5.159.0 - EODHD ANALYST TARGET THROUGH THE FALLBACK AND THE FUND CACHE
 (TFB_EODHD_ANALYST_TARGET, the eodhd_provider v4.19.0 flag; default off =
@@ -4437,7 +4451,7 @@ from core.financial_units import (
 #   v5.157.0 publishes and its f7_settle tag shows the v2 result (stx when
 #   enforce would hold the row back). Off is byte-identical.
 #   Tests: tests/test_de_f7_settle_shadow.py.
-__version__ = "5.159.0"
+__version__ = "5.159.1"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -5089,6 +5103,21 @@ def _row_has_eodhd_analyst_tag(row: Mapping[str, Any]) -> bool:
         if isinstance(raw, (list, tuple, set)):
             return any(_EODHD_ANALYST_TAG in _safe_str(p) for p in raw)
         return False
+    except Exception:
+        return False
+
+
+def _fill_carries_eodhd_target(fill: Any) -> bool:
+    """v5.159.1: True when a fund-cache fill carries a 12M analyst-target
+    value of the v5.159.0 snapshot block: forecast_price_12m OR
+    target_mean_price. With TFB_TARGET_MEAN_PUBLISH=0 the block is captured
+    without target_mean_price, so the 12M forecast alone must count (Codex
+    review on #865). Off, the lookup strips the block: always False."""
+    try:
+        if not isinstance(fill, Mapping):
+            return False
+        return _as_float(fill.get("forecast_price_12m")) is not None \
+            or _as_float(fill.get("target_mean_price")) is not None
     except Exception:
         return False
 
@@ -14395,8 +14424,9 @@ def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
                 # v5.159.0: a snapshot that carries the EODHD target fills
                 # it on this hit, so the fill is no longer "no target".
                 # Off, the snapshot never carries the key: tag unchanged.
+                # v5.159.1: the 12M forecast alone counts as the target.
                 if _is_missing_or_unknown_field(row.get("target_mean_price")) \
-                        and _is_missing_or_unknown_field(filtered.get("target_mean_price")):
+                        and not _fill_carries_eodhd_target(filtered):
                     tag += ":nt"
                 if mode == "enforce":
                     _margin_unit_copy(filtered, fields, list(filtered))
@@ -19717,16 +19747,21 @@ class DataEngineV5:
         if _fc_mode != "off":
             _fc_kind, _fc_tag, _fc_fill = _fund_cache_decide(row, symbol, page, _fc_mode)
             if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
-                if _fc_fill and _as_float(_fc_fill.get("target_mean_price")) is not None:
+                if _fc_fill and _fill_carries_eodhd_target(_fc_fill):
                     # v5.159.0: the snapshot carries an EODHD target (armed
                     # capture). Judge it against TODAY's row price with the
                     # v5.77.18 gate before it lands; a refused target leaves
                     # the v5.77.19 drop tag, an accepted one the provenance
                     # tag. Off, the snapshot never carries the key.
+                    # v5.159.1: entered on the 12M forecast as well, so a
+                    # block captured with TFB_TARGET_MEAN_PUBLISH=0 (no
+                    # target_mean_price) is judged too (Codex review on #865).
                     _fc_ref = _as_float(row.get("current_price"))
                     if _fc_ref is None:
                         _fc_ref = _as_float(row.get("price"))
-                    _fc_t12 = _fc_fill.get("forecast_price_12m", _fc_fill.get("target_mean_price"))
+                    _fc_t12 = _fc_fill.get("forecast_price_12m")
+                    if _as_float(_fc_t12) is None:
+                        _fc_t12 = _fc_fill.get("target_mean_price")
                     if _provider_target_gate_enabled() \
                             and not _provider_target_is_plausible(_fc_ref, _fc_t12):
                         for _fc_k in _EODHD_ANALYST_SNAPSHOT_FIELDS:

@@ -16,7 +16,9 @@ from scripts import verify_core_repair_readback as probe
 COMMIT = "a" * 40
 WORKFLOW_COMMIT = COMMIT
 OTHER_COMMIT = "f" * 40
-ENGINE = "5.158.0"
+# 2026-10-28: data_engine_v2 5.159.1 (#865 EODHD analyst target + its
+# follow-up); the CLI compares this with the source constant, like ROUTE.
+ENGINE = "5.159.1"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"
