@@ -2,10 +2,23 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.7.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.7.1 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.7.1 WHY (2026-10-28, final audit of sync run 40673830237): with
+TFB_YAHOO_ID_ALIAS=1 the seven aliased coins are priced again, but their
+Name cell is blank (warning identity_echo_refused), so Commodities_FX name
+coverage is 446/453 = 98.45 %, below the 99.00 % final-publication floor,
+and the cohort cannot be released. Cause: the engine's chart-meta name
+rescue (data_engine_v2 BB-1) compares the echoed id SUI20947-USD with the
+page symbol SUI-USD and refuses it as a borrowed identity, although
+SUI20947-USD is exactly the id this module sent to Yahoo.
+WHAT: yahoo_id_alias(symbol) returns the verified id that to_yahoo_symbol()
+sends for one of the nine page symbols while TFB_YAHOO_ID_ALIAS=1, else ''.
+Read at call time; nothing else in this module changes (to_yahoo_symbol
+and every route are byte-identical to v5.7.0).
 
 v5.7.0 WHY (2026-10-28, morning board WITHHELD): Commodities_FX was fresh
 on 430 of 453 rows (94.9 %, below the 95 % audit floor), and 9 of the 23
@@ -138,7 +151,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.7.0"
+__version__ = "5.7.1"
 
 __all__ = [
     "MarketType",
@@ -167,6 +180,7 @@ __all__ = [
     "is_us_ticker_heuristic",
     "parse_occ_option",
     "to_yahoo_symbol",
+    "yahoo_id_alias",
     "to_finnhub_symbol",
     "to_eodhd_symbol",
     "to_bloomberg_symbol",
@@ -1291,6 +1305,19 @@ def infer_symbol_metadata(symbol: str) -> Dict[str, Optional[str]]:
 
     result["asset_class"] = detect_asset_class(s).value
     return result
+
+
+def yahoo_id_alias(symbol: str) -> str:
+    """v5.7.1: the verified Yahoo id that to_yahoo_symbol() sends for this
+    page symbol while TFB_YAHOO_ID_ALIAS=1 (one of the nine v5.7.0 rows),
+    else ''. Read at call time (not cached), so an identity check and the
+    provider request agree on what was asked for. Never raises."""
+    try:
+        if not _env_bool("TFB_YAHOO_ID_ALIAS", False):
+            return ""
+        return _YAHOO_ID_ALIAS.get(normalize_symbol(symbol), "")
+    except Exception:
+        return ""
 
 
 @lru_cache(maxsize=20000)

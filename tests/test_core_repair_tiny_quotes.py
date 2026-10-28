@@ -29,7 +29,10 @@ OTHER_COMMIT = "f" * 40
 # follow-up); the CLI compares this with the source constant, like ROUTE.
 # 2026-10-28 (#778 merge of main #865 and #867): main is 5.159.1; this branch
 # carries 5.159.2 (suffix locale fallback renumbered over them).
-ENGINE = "5.159.2"
+# 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
+# 2026-10-28 (#778 merge of main #870 and #871): main is 5.159.2 (#871); this
+# branch carries 5.159.3 (suffix locale fallback renumbered over it).
+ENGINE = "5.159.3"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

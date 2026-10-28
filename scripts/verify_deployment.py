@@ -173,6 +173,9 @@ sys.path.insert(0, _ROOT)
 # default off); FLAGS declares the flag. No verifier logic changed.
 # 2026-10-28 (same rule): data_engine_v2 5.159.0 -> 5.159.1 (the fund-cache
 # hit gate also runs on the 12M forecast; Codex review on #865).
+# 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
+# 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
+# requested; Commodities_FX name coverage). No verifier logic changed.
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -185,7 +188,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ('main', 'APP_ENTRY_VERSION', '8.14.8', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
-    ('core.symbols.normalize', '__version__', '5.7.0', 'symbol normalization'),
+    ('core.symbols.normalize', '__version__', '5.7.1', 'symbol normalization'),
     ('core.analysis.identity_guard', 'IDENTITY_GUARD_VERSION', '1.3.1', 'surface identity guard'),
     ('core.surface_action_invariants', '__version__', '1.4.2', 'surface unit/action invariants'),
     ('scripts.performance_math', '__version__', '1.0.0', 'pure performance statistics'),
@@ -214,8 +217,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # carries 1.28.1 (its Top10 data-quality gates renumbered over it).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
      "1.28.1", "opportunity builder"),
+    # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
+    # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.17.0", "portfolio actions"),
+     "1.17.1", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
@@ -244,7 +249,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # this branch carries 5.159.0 (suffix locale fallback).
     # 2026-10-28 (#778 merge of main #865 and #867): main pins 5.159.1; the
     # suffix locale fallback is renumbered 5.159.2 over them.
-    ("core.data_engine_v2", "__version__", "5.159.2", "data engine"),
+    # 2026-10-28 (#778 merge of main #870 and #871): main pins 5.159.2 (#871, the
+    # BB-1 alias); the suffix locale fallback is renumbered 5.159.3 over it.
+    ("core.data_engine_v2", "__version__", "5.159.3", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import

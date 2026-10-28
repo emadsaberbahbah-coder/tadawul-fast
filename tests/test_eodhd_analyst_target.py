@@ -426,9 +426,10 @@ def test_e8_l2_round_trip_carries_the_block_only_while_armed(monkeypatch):
 
 def test_e9_versions_pins_flag_registration_and_ci_lane():
     assert ep.PROVIDER_VERSION == "4.19.0"
-    # merge note 2026-10-28 (#778): the suffix locale fallback is 5.159.2 over
-    # this 5.159.1, so the engine pin is a floor.
-    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 159, 1), de.__version__
+    # 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
+    # merge note 2026-10-28 (#778): the suffix locale fallback is 5.159.3 over
+    # this 5.159.2, so the engine pin is a floor.
+    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 159, 2), de.__version__
     assert de._EODHD_ANALYST_TAG == TAG
     for bad in ("cap", "forecast", "target", "roi", "drop", "reject"):
         assert bad not in TAG
