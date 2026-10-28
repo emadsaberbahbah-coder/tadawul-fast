@@ -15,10 +15,12 @@ WORKS   W1-W7   armed: inferrers, provider-row canonicalization, the full
 NEVER   N1-N6   off spellings; shapes that must never reach normalize; a
                 raising/None/US/malformed normalize answer; never raises;
                 no new health key; ASCII added lines.
-GOLD    G1-G3   against an untouched base copy of main's engine, v5.155.0
-                since 2026-10-21 (TFB_TEST_DE_BASE = path to
-                `git show 55b47f24:core/data_engine_v2.py`; authored against
-                v5.154.0 at 030e22eb): OFF census and
+GOLD    G1-G3   against an untouched base copy of main's engine, v5.159.2
+                since 2026-10-28 (TFB_TEST_DE_BASE = path to
+                `git show 729a316e:core/data_engine_v2.py`, #871; it must
+                equal BASE_VERSION below. Earlier bases: v5.155.0 at
+                55b47f24 from 2026-10-21; authored against v5.154.0 at
+                030e22eb): OFF census and
                 canonicalization byte-identical; GOLDEN NEGATIVE - the W1
                 check fails on the base with the gate armed; zero
                 function/class removals.
