@@ -380,7 +380,7 @@ test('B7 dt10BulkPaint_: token rows get bg/fg/bold, undefined fields reset, null
 test('B8 version lockstep, WHY block, oracle integrity, ES5 shape and ASCII of the change', () => {
   assert(/^1\.((1[89]|[2-9]\d)\.\d+)$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0 (floor 1.18.0)
   assert.equal(OLD.DT10_VERSION, '1.13.10');
-  assert(source.split('\n')[3].startsWith(' * Version: ' + NEW.DT10_VERSION + ' '));
+  assert(source.split('\n')[3].startsWith(' * Version: ' + NEW.DT10_VERSION + ' '));   // 2026-10-27: v1.18.0 post-earnings tag, pin moved
   assert(source.includes(' * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n'));
   assert(source.includes(' * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE\n'), 'prior WHY kept');
   const why = source.slice(source.indexOf(' * v1.13.11 (2026-10-22)'), source.indexOf(' * v1.13.10 (2026-10-20)'));
