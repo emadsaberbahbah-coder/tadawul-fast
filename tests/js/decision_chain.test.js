@@ -675,5 +675,44 @@ check('C34 v1.0.3: the cockpit upserting its own _Status row on every render doe
   assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
 });
 
-console.log('RESULT ' + passed + '/34 PASS');
-assert.equal(passed, 34);
+check('C35 v1.0.3: two unverified boards on different runs keep each other\'s holds (no alternation)', () => {
+  // My_Portfolio carries NEXT, Global_Markets carries RUN (Codex review on #866)
+  const pdWithheld = () => 'Last run ' + gasFormatDate(new Date(world.clock.now), 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss') +
+    ' | status: ok | source readiness WITHHELD: consumed 1 holdings vs 2 published rows';
+  const cfxRow = ['Commodities_FX', riyadh(GM_AT - 60000), 'PARTIAL', 'acquired=430/453 run=' + RUN,
+                  'backend:run_dashboard_sync', '', 453, 60, 900, ''];
+  const o = {now: T0, status: readyStatus(NEXT).concat([cfxRow]), kv: readyKv(RUN, RUN),
+    pdStatus: pdWithheld, t10Status: WITHHELD_T10, t10WritesStatus: true,
+    props: {TFB_DECISION_CHAIN: 'on'}};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + NEXT);
+  w.setNow(T0 + 5 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  for (let i = 2; i < 8; i++) {
+    w.setNow(T0 + i * 5 * 60000);
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
+  }
+  assert.deepEqual([w.calls.pd, w.calls.t10], [1, 1]);         // 243863f7 alternated: six renders
+  let st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual(st.attempts, {['pd:' + NEXT]: 1, ['t10:' + RUN]: 1});
+  assert.deepEqual(Object.keys(st.hold).sort(), ['pd:' + NEXT, 't10:' + RUN].sort());
+  // one backend stamp change releases both, once each; the budget keeps counting
+  cfxRow[1] = riyadh(T0 + 50 * 60000);
+  w.setNow(T0 + 51 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed pd run ' + NEXT);
+  w.setNow(T0 + 56 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual(st.attempts, {['pd:' + NEXT]: 2, ['t10:' + RUN]: 2});
+  // a new My_Portfolio run supersedes the PD cohort: its old attempts and hold are pruned
+  const fresh = myPortfolioRow(PUB + 60000, '7777777773');   // mutate in place: the world holds this row
+  for (let i = 0; i < fresh.length; i++) o.status[0][i] = fresh[i];
+  w.setNow(T0 + 61 * 60000);
+  w.ctx.tfbDecisionChainTick();
+  st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.attempts['pd:' + NEXT], undefined);
+  assert.equal(st.hold['pd:' + NEXT], undefined);
+});
+
+console.log('RESULT ' + passed + '/35 PASS');
+assert.equal(passed, 35);

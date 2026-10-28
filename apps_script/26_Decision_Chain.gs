@@ -22,14 +22,20 @@
  * cockpit upserts its own Top_10_Investments row (endpoint
  * /sheet-rows/opportunity-candidates) on every render (Codex review on
  * #866), and GAS-written keys such as 'Last Global Update' are not source
- * evidence. A held Portfolio_Decision
+ * evidence. Attempts and holds are pruned per board: a board keeps the
+ * attempts (and hold) of its own current cohort while the other board
+ * works on a different run (My_Portfolio and Global_Markets can carry
+ * different runs; Codex review on #866), so two unverified boards never
+ * alternate and reset each other's budget. A held Portfolio_Decision
  * no longer blocks the Top_10 step. Thrown refreshes, an unchanged board
  * (early return) and timestamp failures keep the v1.0.2 retry on the next
  * tick. Functions added: 2 (tfbDcFingerprintCore_ PURE,
  * tfbDcStatusFingerprint_ I/O). Changed: tfbDcReceiptCore_ (wait flag on
  * that one reason), tfbDcStateOf_ (hold), tfbDcPlanCore_ (hold check),
- * tfbDcReadInputs_ (statusFp), tfbDecisionChainTick (hold record and
- * prune). Removed: 0. Default off and observe unchanged. Rollback: v1.0.2.
+ * tfbDcReadInputs_ (statusFp), tfbDecisionChainTick (hold record, plan-time
+ * cohorts, per-board prune). Removed: 0. Default off and observe unchanged;
+ * on: an attempt budget now spans both boards' interleaved attempts instead
+ * of restarting whenever the other board ran. Rollback: v1.0.2.
  *
  * v1.0.2 -- require native receipt readback before completing a cohort.
  * A successful HTTP response / nonthrowing refresh may render WITHHELD,
@@ -539,7 +545,12 @@ function tfbDecisionChainTick() {
     state.claim = {act: plan.action, run: plan.run, at_ms: nowMs};
     state.attempts[key] = (state.attempts[key] || 0) + 1;
     props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
-    return {plan: plan, key: key, fp: inputs.statusFp};   /* v1.0.3: fp */
+    /* v1.0.3: fp = the plan-time source fingerprint; cur = each board's
+     * current cohort, so pruning keeps the other board's open attempts */
+    var rel = (String(inputs.t10.releaseRun || '') === String(inputs.t10.gmRun || ''))
+        ? String(inputs.t10.releaseIssued || '') : '';
+    return {plan: plan, key: key, fp: inputs.statusFp,
+            cur: {pd: String(inputs.pd.cohort || ''), t10: String(inputs.t10.gmRun || ''), rel: rel}};
   });
   if (planned.busy) return 'busy';
   var p = planned.value;
@@ -576,10 +587,15 @@ function tfbDecisionChainTick() {
     }
     state.claim = null;
     var keep = {};   // prune attempts to the cohort (or release stamp) being worked on
+    var cur = p.cur || {};   // v1.0.3: and each board's own current cohort (Codex review on #866)
     for (var k in state.attempts) {
       if (!state.attempts.hasOwnProperty(k)) continue;
       var tail = String(k).slice(String(k).indexOf(':') + 1);
+      var head = String(k).slice(0, String(k).indexOf(':'));
       if (tail === p.plan.run || (p.plan.release && tail === p.plan.release)) keep[k] = state.attempts[k];
+      else if (head === 'pd' && cur.pd && tail === cur.pd) keep[k] = state.attempts[k];
+      else if (head === 't10' && cur.t10 && tail === cur.t10) keep[k] = state.attempts[k];
+      else if (head === 't10rel' && cur.rel && tail === cur.rel) keep[k] = state.attempts[k];
     }
     state.attempts = keep;
     /* v1.0.3: a rendered board whose receipt did not verify waits for
