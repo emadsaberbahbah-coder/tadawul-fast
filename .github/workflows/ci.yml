@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.53 (2026-10-28) -- EODHD ANALYST TARGET (TFB_EODHD_ANALYST_TARGET)
+#
+# v1.1.53 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.52 are #848-#864):
+# run tests/test_eodhd_analyst_target.py (core/providers/eodhd_provider.py
+# v4.19.0 + core/data_engine_v2.py v5.159.0: the EODHD fundamentals patch
+# carries the analyst consensus target when TFB_EODHD_ANALYST_TARGET=1, the
+# engine canonicalizes it behind the plausibility gate with the row price
+# injected, and the fund-LKG snapshot carries it so a fund-cache hit fills it
+# too; default off = byte-identical) in the full-dependency work-brief lane
+# next to tests/test_yahoo_id_alias.py, because it drives the real provider
+# and engine modules. Offline. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.52 (2026-10-28) -- VERIFIED YAHOO IDS (TFB_YAHOO_ID_ALIAS)
 #
 # v1.1.52 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.51 are #848-#863):
@@ -1263,6 +1275,7 @@ jobs:
             tests/test_identity_guard.py \
             tests/test_crypto_provider_identity.py \
             tests/test_yahoo_id_alias.py \
+            tests/test_eodhd_analyst_target.py \
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
