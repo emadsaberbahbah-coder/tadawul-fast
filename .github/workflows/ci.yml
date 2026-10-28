@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.56 (2026-10-29) -- FW-2 STALE P/E (run_dashboard_sync 6.71.0)
+#
+# v1.1.56: run tests/test_fw2_stale_pe.py (run_dashboard_sync v6.71.0
+# FW2-STALE-PE, TFB_SYNC_FW2_STALE_PE default off = the v6.70.2 FW-2 call: a
+# row FW-2 would strip for a mildly stale P/E keeps its fresh quote with P/E
+# and EPS cleared once its last-good row witnesses the instrument; mapped by
+# daily_sync.yml 1.0.8) in the blocking lean lane next to the other sync
+# suites. Offline fakes only; its base-identity legs read the untouched
+# 729a316e with `git show` and SKIP on a shallow checkout. Nothing is removed
+# and no existing entry moves.
+#
 # VERSION 1.1.55 (2026-10-28) -- POST-EARNINGS INVALID EVIDENCE (portfolio_actions 1.17.1)
 #
 # v1.1.55: the isolated protective step also fetches the merged v1.17.0
@@ -980,6 +991,7 @@ jobs:
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
             tests/test_daily_sync_stamp_budget.py \
+            tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \

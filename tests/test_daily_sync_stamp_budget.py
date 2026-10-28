@@ -52,6 +52,10 @@ WORKFLOW = _REPO / ".github" / "workflows" / "daily_sync.yml"
 BASE_SHA = "21dc13e9"  # main before v1.0.7 (daily_sync.yml v1.0.4)
 KEY = "TFB_SYNC_STATUS_STAMP_DEADLINE_S"
 EXPR = "${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}"
+# daily_sync.yml 1.0.8 (2026-10-29) maps one more key in the same two jobs
+# (run_dashboard_sync 6.71.0 FW2-STALE-PE; pinned in tests/test_fw2_stale_pe.py).
+# B4 strips it too, so it still proves "env mapping only" back to v1.0.4.
+LATER_KEYS = ("TFB_SYNC_FW2_STALE_PE",)
 
 
 def _jobs(doc):
@@ -219,6 +223,8 @@ def _strip_added(doc):
             env = holder.get("env")
             if isinstance(env, dict):
                 env.pop(KEY, None)
+                for later in LATER_KEYS:
+                    env.pop(later, None)
     return out
 
 
