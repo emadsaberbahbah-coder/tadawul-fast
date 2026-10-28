@@ -272,6 +272,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
+    # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
+    ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
