@@ -4,16 +4,16 @@
 
 **Files:**
 - `apps_script/26_Decision_Chain.gs`: 1.0.2 -> 1.0.3. WHY block prepended; earlier text kept verbatim. ES5, ASCII additions, anchored edits.
-- `tests/js/decision_chain.test.js`: C18 updated (a repaired source is a changed `_Status`), C29-C33 added; 33 cases.
-- `tests/test_decision_chain_js.py`: expects `RESULT 33/33 PASS`.
+- `tests/js/decision_chain.test.js`: C18 updated (a repaired source is a changed `_Status`), C29-C36 added; 36 cases.
+- `tests/test_decision_chain_js.py`: expects `RESULT 36/36 PASS`.
 - This sheet.
 
 ## S1 - Evidence
-`_Run_Log` since 27 Oct: 203 INFO / 64 WARNING / **10 ERROR**, every ERROR row `tfbDecisionChainTick` with `native source receipt does not verify the planned run`. On 28 Oct the 04:00, 04:05 and 04:09 ticks each rendered the same Top-10 (`source readiness WITHHELD: Commodities_FX acquired 430/453 below 95%`), about 2 min of Apps Script time each, until `TFB_DC_MAX_ATTEMPTS` (3) gave up on the cohort. Nothing changed between the three renders: the receipt is derived from `_Status` (page rows A:J, keyed values L:M), and only the sync writes `_Status` (no Apps Script producer does; `16_Decision_Top10` and `10_My_Portfolio` only read it).
+`_Run_Log` since 27 Oct: 203 INFO / 64 WARNING / **10 ERROR**, every ERROR row `tfbDecisionChainTick` with `native source receipt does not verify the planned run`. On 28 Oct the 04:00, 04:05 and 04:09 ticks each rendered the same Top-10 (`source readiness WITHHELD: Commodities_FX acquired 430/453 below 95%`), about 2 min of Apps Script time each, until `TFB_DC_MAX_ATTEMPTS` (3) gave up on the cohort. Nothing changed between the three renders: the receipt is derived from `_Status` (page rows A:J, keyed values L:M), and only the sync writes `_Status` (no Apps Script producer does; `16_Decision_Top10` and `10_My_Portfolio` only read it). Correction (review fix 1 below): the cockpit does upsert its own `Top_10_Investments` row, so the fingerprint covers only the source-owned part of `_Status`.
 
 ## S2 - WHAT
-- `tfbDcReceiptCore_` (PURE) marks that one failure reason with `wait: true`; the four other reasons (status unavailable, board not updated, run invalid, timestamp outside the attempt) are unchanged and keep the v1.0.2 next-tick retry.
-- `tfbDcFingerprintCore_(rowsAJ, rowsLM)` (PURE): djb2 over the non-empty cells of `_Status` A:J and L:M, base 36 plus the text length; `''` when nothing is readable, and `''` never holds anything.
+- `tfbDcReceiptCore_` (PURE) marks that one failure reason with `wait: true`, and (review fix 3) only for a single `source readiness WITHHELD: <reason>` receipt whose reason carries no transient marker; the four other reasons (status unavailable, board not updated, run invalid, timestamp outside the attempt) are unchanged and keep the v1.0.2 next-tick retry.
+- `tfbDcFingerprintCore_(rowsAJ, rowsLM)` (PURE): djb2 over the non-empty source-owned cells of `_Status` (review fix 1: A:J rows whose Endpoint starts `backend:`, L:M keys `TFB Decision Feed` and `TFB Feed *`), base 36 plus the text length; `''` when nothing is readable, and `''` never holds anything.
 - `tfbDcStatusFingerprint_(ss)`: one bounded read per tick (`A1:J<lastRow>` up to 400 rows, `L1:M60`); `''` on any failure.
 - `tfbDcReadInputs_` adds `statusFp`; `tfbDcStateOf_` parses `hold` (`{attemptKey: fingerprint}`).
 - `tfbDcPlanCore_` (PURE): a candidate whose attempt key is held under the current fingerprint is skipped with the reason `... did not verify; waiting for _Status to change` (Top-10 cohort, release re-render) or falls through to the Top-10 step (a held Portfolio_Decision no longer blocks it).
@@ -21,7 +21,7 @@
 - Budget: `TFB_DC_MAX_ATTEMPTS` still bounds the cohort; a hold only decides *when* the next attempt may run (after the sync or its recovery rewrote `_Status`), never adds attempts.
 - Limit: a WITHHELD reason that clears without a `_Status` write (a scope-policy change) waits for the next sync stamp (at most ~8 h); the 4-hourly wrapper (`13_AutoRefresh`) still renders independently.
 
-## S3 - Tests (`node tests/js/decision_chain.test.js`, 33/33; `tests/test_decision_chain_js.py` wraps it)
+## S3 - Tests (`node tests/js/decision_chain.test.js`, 36/36; `tests/test_decision_chain_js.py` wraps it)
 | Case | Proves |
 |---|---|
 | C18 (updated) | A WITHHELD Portfolio_Decision is not re-rendered while `_Status` is unchanged; the held step no longer blocks Top-10; a re-published My_Portfolio row (changed `_Status`) lets the same cohort complete. |
@@ -30,16 +30,17 @@
 | C31 | A thrown refresh and an unchanged board (early return) keep the next-tick retry and record no hold. |
 | C32 | Fingerprint core: `''` on empty, deterministic, changes on any cell or Date; an unreadable fingerprint never holds; observe mode unchanged. |
 | C33 | A hold is pruned with its cohort when the next run arrives. |
+| C34 | Review fix 1: renderer-owned `_Status` writes (the cockpit's row, a GAS key) do not release a hold; the next `backend:` stamp does. |
+| C35 | Review fix 2: two boards on different cohorts keep their own holds and attempt counters; no alternation. |
+| C36 | Review fix 3: a transient read failure records no hold and the next tick renders; the wait flag on five transient and three source reasons. |
 
 Golden negative on `18ab6e38` (v1.0.2): the harness fails at C18 (no `waiting for _Status to change`, and the second tick re-renders).
 
-### Review fix (Codex, PR #866, head `dc97332f`)
+### Review fixes (Codex, PR #866; first review on head `dc97332f`; final head reviewed clean)
 | Finding | Fix | Golden negative |
 |---|---|---|
 | P2: the fingerprint included renderer-owned rows. Every WITHHELD render upserts the cockpit's own `Top_10_Investments` row in `_Status` (`dt10WritePageStatus_` -> `writePageStatus_`, endpoint `/sheet-rows/opportunity-candidates`), so the render itself moved the plan-time fingerprint and the next tick retried until the budget was spent - the loop this change exists to stop. The harness spies did not write `_Status`. | `tfbDcFingerprintCore_` keeps only the source-owned part: A:J rows whose Endpoint starts `backend:` (the sync's documented author stamp, `run_dashboard_sync` `_STATUS_STAMP_ENDPOINT`) and the L:M keys `TFB Decision Feed` and `TFB Feed *` (the sync's and the release's keys). The `_Status` header row, the cockpit's row, GAS rows and GAS keys (`Last Global Update`, `Token Loaded`, `TFB Sync Hold`) never move it. The harness Top-10 spy now upserts the cockpit's own row and a GAS key on every render; new C34 proves the hold survives four ticks and is released by the next `backend:` stamp. | The new harness fails on `dc97332f` at C32 (a renderer-owned row moves the fingerprint). |
-
 | P2 (second review, head `243863f7`): attempts and holds were pruned to the cohort just worked on. When My_Portfolio carries a newer run than Global_Markets, a held Portfolio_Decision falls through to the Top-10 step, whose prune deleted the PD hold and attempts; the next tick rendered PD again, whose prune deleted the Top-10 hold - the two boards alternated forever with attempt counts of 1. | The planning lock returns each board's current cohort (`cur`: PD cohort, Global_Markets run, release stamp of that run); the prune keeps every board's attempts (and so its hold) for its own current cohort, plus the v1.0.2 rule. A superseded cohort is still pruned. `on` only: the attempt budget now spans interleaved attempts instead of restarting whenever the other board ran. | New C35 (My_Portfolio run NEXT, Global_Markets run RUN, both unverified): two renders over eight ticks, both holds and both counters kept, one release per backend stamp change, the old PD cohort pruned once My_Portfolio publishes a newer run. Fails on `243863f7` in the unchanged-source ticks (it renders again). |
-
 | P2 (third review, head `a67eab5b`): every unverified receipt set `wait`, so a transient read failure inside the render (`dt10SourceReadiness_` returns `source status unavailable`; scope reads return `... unavailable`; PD returns `publication status unavailable`) held a healthy cohort until another publication, although a retry would succeed and nothing in `_Status` has to change. | `tfbDcReceiptCore_` sets `wait` only for exactly one `source readiness WITHHELD: <reason>` receipt whose reason carries no transient marker (`unavailable`, `unreadable`, `read failed` / `read error`, `timed out`, `exception`). Transient failures, missing receipts, observe-only receipts, a VERIFIED receipt for another run and duplicates keep the v1.0.2 bounded next-tick retry. | New C36: an unavailable-status WITHHELD render records no hold and the next tick renders the recovered board (refreshed); the core's wait flag on five transient reasons (false) and three source reasons (true). Fails on `a67eab5b` (a hold is recorded). |
 
 Harness: 36/36; `tests/test_decision_chain_js.py` expects 36/36.
