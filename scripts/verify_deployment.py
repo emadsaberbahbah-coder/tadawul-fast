@@ -167,6 +167,12 @@ sys.path.insert(0, _ROOT)
 # run_dashboard_sync 6.70.0 -> 6.70.2 (KLG-READ from PR #809 + STAMP-RETRY) and
 # data_engine_v2 5.154.0 -> 5.155.0 (PR #809 subunit-safe portfolio weight FX);
 # FLAGS declares TFB_SR_THREAD_LOCAL_SERVICE. No verifier logic changed.
+# 2026-10-28 (D2, same rule): eodhd_provider 4.18.5 -> 4.19.0 and
+# data_engine_v2 5.158.0 -> 5.159.0 (TFB_EODHD_ANALYST_TARGET: the EODHD
+# analyst target through the fundamentals fallback and the fund cache,
+# default off); FLAGS declares the flag. No verifier logic changed.
+# 2026-10-28 (same rule): data_engine_v2 5.159.0 -> 5.159.1 (the fund-cache
+# hit gate also runs on the 12M forecast; Codex review on #865).
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -176,10 +182,10 @@ SCRIPT_VERSION = "1.0.64"  # v1.0.64 merge note 7 (2026-10-24, second merge) - m
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.8', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
-    ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
+    ('core.symbols.normalize', '__version__', '5.7.0', 'symbol normalization'),
     ('core.analysis.identity_guard', 'IDENTITY_GUARD_VERSION', '1.3.1', 'surface identity guard'),
     ('core.surface_action_invariants', '__version__', '1.4.2', 'surface unit/action invariants'),
     ('scripts.performance_math', '__version__', '1.0.0', 'pure performance statistics'),
@@ -209,8 +215,8 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
      "1.28.1", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.16.1", "portfolio actions"),
-    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",
+     "1.17.0", "portfolio actions"),
+    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
      "analysis sheet publication route"),
@@ -220,7 +226,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.5',
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.19.0',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
@@ -236,7 +242,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # was surviving purely on the alternate-attribute fallback.
     # 2026-10-24 (#778 merges of main #821-#829 and #819): main pins 5.158.0;
     # this branch carries 5.159.0 (suffix locale fallback).
-    ("core.data_engine_v2", "__version__", "5.159.0", "data engine"),
+    # 2026-10-28 (#778 merge of main #865 and #867): main pins 5.159.1; the
+    # suffix locale fallback is renumbered 5.159.2 over them.
+    ("core.data_engine_v2", "__version__", "5.159.2", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -263,7 +271,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
-    ("run_shadow_board", "1.5.0", "shadow board"),
+    ("run_shadow_board", "1.6.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
@@ -277,10 +285,19 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
-    ("run_daily_brief", "1.18.1", "daily brief"),
+    # 2026-10-27 (A4 part 2; pin only, SCRIPT_VERSION unchanged): 1.18.1 -> 1.19.0
+    # (a post-earnings-tagged seat is held back from the picks and named).
+    ("run_daily_brief", "1.19.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
+    # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
+    ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
+    # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
+    ("news_macro_gate", "1.0.2", "news macro gate"),
+    # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
+    ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
@@ -338,6 +355,8 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ('TFB_OPP_AUDIT_KEEP', '0', 'cockpit-held symbols kept in the capped audit', False),
     ('TFB_EODHD_CRYPTO_MAP', '0', 'native EODHD explicit crypto pairs', False),
     ('TFB_CRYPTO_NAME_GATE', 'off', 'Yahoo fundamentals crypto-name screen', False),
+    ('TFB_YAHOO_ID_ALIAS', '0', 'verified Yahoo ids for dead or colliding page tickers', False),
+    ('TFB_EODHD_ANALYST_TARGET', '0', 'EODHD analyst target through the fallback and fund cache', False),
 
     ("TFB_COMPLIANCE_GATE_ENABLED", "0", "compliance gate evaluates", False),
     ("TFB_SHADOW_COMPLIANCE", "0", "selector logs [SHADOW-GATE]", False),

@@ -2,10 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.48 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25 and twice 2026-10-27; merged over main's 1.1.46) -- DT10 v1.17.2 HELD-SEAT HARNESS
+# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- DT10 v1.18.1 HELD-SEAT HARNESS
 #
-# v1.1.48 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.46 first, 1.1.30-1.1.46 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853 and #854; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
-# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.17.2
+# v1.1.56 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.54 first, 1.1.30-1.1.54 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.18.1
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
 # 1.28.1 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
@@ -13,14 +13,114 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.47 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25 and twice 2026-10-27; merged over main's 1.1.46) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.55 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.47 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.46 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853 and #854; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.55 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.54 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+#
+# VERSION 1.1.54 (2026-10-28) -- PORTFOLIO ADD GUARDS (D1b POST-EARN, D1c TICKET-CAP)
+#
+# v1.1.54 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.53 are #848-#865):
+# run tests/test_pf_add_guards_d1.py (core/analysis/portfolio_actions.py
+# v1.17.0 + routes/advanced_analysis.py v4.19.0: TFB_PF_ADD_POST_EARN and
+# TFB_PF_MAX_OPEN_TICKETS_MODE, default off = byte-identical) in the isolated
+# protective-harness step next to the P-183 veto it extends, after fetching
+# the untouched v1.16.1 base commit 22658e0f by SHA for its off-identity case
+# (a failed fetch only turns that case into a SKIP), its route case
+# tests/test_pf_add_guards_d1_route.py in the schema and route contract lane
+# (the protective lane has no FastAPI); and node
+# tests/test_pd_post_earn_inputs.js (apps_script/10_My_Portfolio.gs v1.5.17,
+# PD_POST_EARN) with the other Apps Script harnesses. Offline. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.53 (2026-10-28) -- EODHD ANALYST TARGET (TFB_EODHD_ANALYST_TARGET)
+#
+# v1.1.53 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.52 are #848-#864):
+# run tests/test_eodhd_analyst_target.py (core/providers/eodhd_provider.py
+# v4.19.0 + core/data_engine_v2.py v5.159.0: the EODHD fundamentals patch
+# carries the analyst consensus target when TFB_EODHD_ANALYST_TARGET=1, the
+# engine canonicalizes it behind the plausibility gate with the row price
+# injected, and the fund-LKG snapshot carries it so a fund-cache hit fills it
+# too; default off = byte-identical) in the full-dependency work-brief lane
+# next to tests/test_yahoo_id_alias.py, because it drives the real provider
+# and engine modules. Offline. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.52 (2026-10-28) -- VERIFIED YAHOO IDS (TFB_YAHOO_ID_ALIAS)
+#
+# v1.1.52 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.51 are #848-#863):
+# run tests/test_yahoo_id_alias.py (core/symbols/normalize.py v5.7.0: the
+# nine Commodities_FX tickers that are dead or collide on Yahoo map to the ids
+# the provider read-back confirmed, only when TFB_YAHOO_ID_ALIAS=1) in the
+# full-dependency work-brief lane next to tests/test_crypto_provider_identity.py,
+# because its engine and adapter cases import the real modules. Offline.
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.51 (2026-10-28) -- PROVIDER IDENTITY PROBE (READ-ONLY)
+#
+# v1.1.51 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.50 are #848-#859):
+# run tests/test_provider_identity_probe.py (scripts/provider_identity_probe.py
+# v1.0.0 + data/provider_probe_cfx_2026-10-28.json + workflow
+# provider_identity_probe.yml: the WP-05 provider read-back for the
+# Commodities_FX rows that failed every day - wrong-coin crypto pairs, gold
+# spot and exotic crosses without a price, LBS=F / DX=F) in the blocking lean
+# lane next to tests/test_news_macro_gate.py. Offline: the real probe against
+# a fake HTTP session; no provider is called. Nothing is removed and no
+# existing entry moves.
+#
+# VERSION 1.1.50 (2026-10-28) -- NEWS & MACRO GATE (OBSERVE)
+#
+# v1.1.50 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.49 are #848-#856
+# and #858): run tests/test_news_macro_gate.py (scripts/news_macro_gate.py
+# v1.0.0 + data/news_gate_taxonomy.json + workflow news_macro_gate.yml: free
+# sources - SEC EDGAR, GDELT, Google-News RSS, the Federal Reserve RSS, EODHD
+# economic events and S&P 500 / VIX - graded by source tier and information
+# grade into an observe-only GO / CAUTION / NO_NEW_ENTRY verdict with per-name
+# flags) in the blocking lean lane. Offline: the real module against a fake
+# HTTP session and an in-memory workbook; no provider is called. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.49 (2026-10-28) -- DAILY SYNC _Status STAMP BUDGET
+#
+# v1.1.49 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.48 are #848-#856):
+# run tests/test_daily_sync_stamp_budget.py (daily_sync.yml v1.0.7: both
+# page-writing jobs map TFB_SYNC_STATUS_STAMP_DEADLINE_S, default 300, so a
+# Global_Markets stamp whose reads each wait the 60 s socket timeout gets
+# all 4 attempts instead of 2 - run 40556442682 lost its stamp that way and
+# the cockpit withheld the board) in the blocking lean lane next to
+# tests/test_sync_status_stamp_retry.py. Offline; its base-identity leg
+# reads the untouched v1.0.4 with `git show 21dc13e9` and SKIPs on a shallow
+# checkout. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.48 (2026-10-27) -- BIGQUERY ARCHIVE (C8 PHASE 1)
+#
+# v1.1.48 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.47 are #848-#855):
+# run tests/test_bq_archive.py
+# (scripts/archive_to_bigquery.py v1.0.0, the read-only daily copy of the
+# decision workbook's learning tabs into BigQuery; workflow bq_archive.yml)
+# in the blocking lean lane. Offline: the HTTP session is a fake, no google
+# library is imported, PyYAML (already in the lane) reads the workflow.
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.47 (2026-10-27) -- COCKPIT POST-EARNINGS TAG
+#
+# v1.1.47 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.46 are #848-#854):
+# run tests/test_dt10_post_earnings.js
+# (16_Decision_Top10.gs v1.18.0: DT10_POST_EARN, default off -- the SELECTED
+# board's Advisor Note gains '<warn> post-earnings S/L <dot> EPS x% <dot> '
+# for a seat whose last report is inside its quarantine, 5 sessions or 10
+# after a negative EPS surprise; off = the v1.17.1 render byte for byte) in
+# the blocking lean lane's native Apps Script step next to
+# tests/test_dt10_shadow_momentum.js. Offline; rebuilds the v1.17.1 base from
+# tests/js/dt10_edits_v1180.json (SHA-256 pinned). The daily-brief step also
+# runs tests/test_daily_brief_post_earnings_tag.py (run_daily_brief v1.19.0:
+# a tagged seat is held back from the picks and named on HTML / PDF / text;
+# no tag = v1.18.1 byte for byte; its golden leg reads the untouched v1.18.1
+# with `git show e8337a16`, fetched first - a failed fetch only turns that
+# leg into a SKIP). Nothing is removed and no existing entry moves.
 #
 # VERSION 1.1.46 (2026-10-27) -- CALENDAR VENUE BATCHES + EODHD EXCHANGE CODES
 #
@@ -870,6 +970,7 @@ jobs:
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
+            tests/test_bq_archive.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -890,6 +991,9 @@ jobs:
             tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
+            tests/test_daily_sync_stamp_budget.py \
+            tests/test_news_macro_gate.py \
+            tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
@@ -998,6 +1102,11 @@ jobs:
           # Separate processes keep their state out of the other lean suites.
           python -m pytest -q tests/test_pf_add_loser_veto_p183.py
           python -m pytest -q tests/test_pf_sukuk_ladder_p153.py
+          # v1.1.54: D1b/D1c ADD guards; the off-identity case compares with
+          # the untouched v1.16.1 module at 22658e0f (fetched by SHA).
+          git fetch --no-tags --depth=1 origin 22658e0f10ed0264feaf40e7208dc1f85b6a6e8b \
+            || echo "::notice::portfolio_actions v1.16.1 base not fetched - the off-identity case will SKIP"
+          python -m pytest -q tests/test_pf_add_guards_d1.py
 
       - name: 📋 Board scorecard harness (golden bases fetched by SHA)
         run: |
@@ -1035,7 +1144,9 @@ jobs:
           node tests/test_dt10_funding_evidence.js
           node tests/test_dt10_shadow_rank_log.js
           node tests/test_dt10_shadow_momentum.js
+          node tests/test_dt10_post_earnings.js
           node tests/test_pd_evidence_publish.js
+          node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/dt10_audit_keep.test.js
@@ -1102,6 +1213,7 @@ jobs:
             tests/test_board_funding_route.py \
             tests/test_insights_cohort_route.py \
             tests/test_portfolio_reconciliation_route.py \
+            tests/test_pf_add_guards_d1_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
             tests/test_calendar_last_report_a4.py \
@@ -1164,7 +1276,13 @@ jobs:
             tests/test_news_singleflight_cancellation.py
 
       - name: 🧪 Daily brief unavailable-evidence and blocked-decision regressions
-        run: python -m pytest -q tests/test_daily_brief_blocked_inputs.py
+        run: |
+          # v1.1.47: the golden leg of tests/test_daily_brief_post_earnings_tag.py
+          # reads the untouched run_daily_brief v1.18.1 (e8337a16); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
+            || echo "::notice::brief golden base not fetched - its golden leg will SKIP"
+          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py tests/test_decision_v2_cash_presentation.py
@@ -1200,6 +1318,8 @@ jobs:
             tests/test_usx_currency_lockstep.py \
             tests/test_identity_guard.py \
             tests/test_crypto_provider_identity.py \
+            tests/test_yahoo_id_alias.py \
+            tests/test_eodhd_analyst_target.py \
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \

@@ -539,7 +539,7 @@ test('C11 pure helper edge cases', () => {
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
   const atLeast = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
-  assert(atLeast(ctx.DT10_VERSION, [1, 17, 1]), ctx.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, pin moved; merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1
+  assert(atLeast(ctx.DT10_VERSION, [1, 18, 0]), ctx.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
   assert(source.split('\n')[3].startsWith(' * Version: ' + ctx.DT10_VERSION + ' '));
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');

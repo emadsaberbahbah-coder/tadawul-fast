@@ -1152,9 +1152,28 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
+# v4.19.0 WHY (2026-10-28): the analyst 12M target leg of the engine has
+# depended on Yahoo fundamentals alone. Since 2026-10-21 09:28Z every sync
+# logs "[YF-CB] OPEN reason=info_empty status=429 ... yfinance fundamentals
+# suspended for cooldown; EODHD fallback carries fundamentals" (100+ events
+# on 23 Oct, dozens per sync since). This fallback carries ratios and
+# margins but no target, so the engine restores the last known target and
+# tags analyst_lkg:<age>h; the opportunity builder then holds the row
+# ("Held target - no new money"). On 28 Oct 23 of 31 board candidates were
+# held that way. EODHD fundamentals already carry AnalystRatings.TargetPrice
+# and Highlights.WallStreetTargetPrice. When TFB_EODHD_ANALYST_TARGET=1 the
+# patch adds target_mean_price (AnalystRatings.TargetPrice first, then
+# Highlights.WallStreetTargetPrice) and analyst_count (the sum of the five
+# rating buckets). The engine already accepts target_mean_price fill-only,
+# canonicalizes it to forecast_price_12m behind the plausibility gate, and
+# tags forecast_source = provider_target. Default off: the patch and the
+# fundamentals cache key are byte-identical to v4.18.5. Armed, the cache key
+# gains the segment "at1" so a cached v4.18.5 patch without a target is
+# never served as an armed one.
+# =============================================================================
 # v4.18.5: current-year EPS estimates are not reported trailing earnings.
 # Version the fundamentals cache so an old estimated eps_ttm cannot survive.
-PROVIDER_VERSION = "4.18.5"
+PROVIDER_VERSION = "4.19.0"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -1702,6 +1721,38 @@ def _pct_points_to_frac(v: Any) -> Optional[float]:
     if f is None:
         return None
     return f / 100.0
+
+
+def _eodhd_analyst_target_enabled() -> bool:
+    """v4.19.0: TFB_EODHD_ANALYST_TARGET=1 adds the analyst consensus target
+    (target_mean_price) and the rating count (analyst_count) to the
+    fundamentals patch. Default off: the patch is byte-identical to v4.18.5."""
+    return _env_bool("TFB_EODHD_ANALYST_TARGET", False)
+
+
+def _analyst_target_fields(highlights: Any, ratings: Any) -> Dict[str, Any]:
+    """v4.19.0: the two analyst fields from an EODHD fundamentals payload.
+
+    target_mean_price: AnalystRatings.TargetPrice, else
+    Highlights.WallStreetTargetPrice; only a positive finite number counts.
+    analyst_count: the sum of StrongBuy, Buy, Hold, Sell and StrongSell when at
+    least one bucket is a number; a zero sum is not a count.
+    Returns only the keys that have a value."""
+    out: Dict[str, Any] = {}
+    hl = highlights if isinstance(highlights, dict) else {}
+    ar = ratings if isinstance(ratings, dict) else {}
+    target = safe_float(ar.get("TargetPrice"))
+    if target is None or target <= 0:
+        target = safe_float(hl.get("WallStreetTargetPrice"))
+    if target is not None and target > 0:
+        out["target_mean_price"] = target
+    buckets = [safe_float(ar.get(k)) for k in ("StrongBuy", "Buy", "Hold", "Sell", "StrongSell")]
+    present = [b for b in buckets if b is not None and b >= 0]
+    if present:
+        count = int(round(sum(present)))
+        if count > 0:
+            out["analyst_count"] = count
+    return out
 
 
 def _already_frac(v: Any) -> Optional[float]:
@@ -2635,7 +2686,10 @@ class EODHDClient:
 
         margin_unit_aware = _eodhd_unit_aware_enabled()
         margin_version = _MARGIN_FRACTION_VERSION if margin_unit_aware else _MARGIN_LEGACY_VERSION
-        ck = f"f:eps_basis_v1:{margin_version}:{sym}"
+        # v4.19.0: an armed patch carries two more keys, so it gets its own
+        # cache segment; off, the key is byte-identical to v4.18.5.
+        analyst_target = _eodhd_analyst_target_enabled()
+        ck = f"f:eps_basis_v1:{margin_version}:{'at1:' if analyst_target else ''}{sym}"
         cached = await self.fund_cache.get(ck)
         if cached:
             return cached, None
@@ -2657,6 +2711,9 @@ class EODHDClient:
             splits = data.get("SplitsDividends") or {}
             etf_data = data.get("ETF_Data") or {}
             financials = data.get("Financials") or {}
+            # v4.19.0: analyst consensus target and rating count, only when armed.
+            analyst_fields = _analyst_target_fields(
+                highlights, data.get("AnalystRatings")) if analyst_target else {}
 
             # v4.9.2 AO: response identity guard — fundamentals declare
             # their instrument in General.Code / General.Exchange; a definite
@@ -2939,6 +2996,9 @@ class EODHDClient:
                     "fcf_ttm": fcf_ttm,
                     "debt_to_equity": debt_to_equity,
                     "d_e_ratio": debt_to_equity,
+                    # v4.19.0: absent unless TFB_EODHD_ANALYST_TARGET=1.
+                    "target_mean_price": analyst_fields.get("target_mean_price"),
+                    "analyst_count": analyst_fields.get("analyst_count"),
                     "warnings": warnings_list if warnings_list else None,
                     "last_updated_utc": collected_at,
                     "last_updated_riyadh": _riyadh_iso(),

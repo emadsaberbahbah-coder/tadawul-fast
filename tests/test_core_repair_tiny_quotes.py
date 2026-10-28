@@ -25,7 +25,11 @@ OTHER_COMMIT = "f" * 40
 # (F-7 v2) and open #818 claims 5.158.0; an in-place pin as above.
 # 2026-10-24: main moved to 5.157.3 (#821-#829); this branch keeps 5.159.0.
 # 2026-10-24 (second merge): main is 5.158.0 (#819); this branch keeps 5.159.0.
-ENGINE = "5.159.0"
+# 2026-10-28: data_engine_v2 5.159.1 (#865 EODHD analyst target + its
+# follow-up); the CLI compares this with the source constant, like ROUTE.
+# 2026-10-28 (#778 merge of main #865 and #867): main is 5.159.1; this branch
+# carries 5.159.2 (suffix locale fallback renumbered over them).
+ENGINE = "5.159.2"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

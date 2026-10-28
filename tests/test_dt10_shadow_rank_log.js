@@ -32,6 +32,8 @@ const src = fs.readFileSync(SRC, 'utf8');
 // runs on the delivered file; the base oracle, the lint and the inventory
 // compare main's v1.17.1 layer: the delivered file with exactly those regions
 // removed (stripDesigned throws on any other shape).
+// merge note 2026-10-28 (#778): the delivered file is now main's v1.18.0 plus the
+// v1.18.1 held-seat regions, so the layer is main's v1.18.0 byte for byte.
 const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
 const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
 const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
@@ -320,10 +322,11 @@ console.log('S7 PASS embedded self-test core');
 
 // ---------------------------------------------------------- S8 wiring + lint
 // 2026-10-27: v1.17.1 (shadow momentum) stacked on this change; pins moved (S9 checks the v1.17.0 file itself)
-ok((layerSrc.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]), 'S8 version lockstep 1.17.1 (layer)');
-ok(dt10Floor(deliveredVersion, [1, 17, 1]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+// 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
+ok((layerSrc.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]), 'S8 version lockstep 1.18.0 (layer)');
+ok(dt10Floor(deliveredVersion, [1, 18, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
    src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
-   'S8 delivered version floor 1.17.1 in lockstep: ' + deliveredVersion);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1
+   'S8 delivered version floor 1.18.0 in lockstep: ' + deliveredVersion);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');

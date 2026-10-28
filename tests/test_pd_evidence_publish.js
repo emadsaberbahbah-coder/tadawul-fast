@@ -190,7 +190,12 @@ ok(i0 > 0 && i1 > i0, 'P8 block located');
 ok(!/\b(let|const)\s|=>|`|\.\.\.|class\s/.test(block), 'P8 ES5 only');
 ok(![...block].some((ch) => ch.charCodeAt(0) > 126), 'P8 ASCII only');
 for (const f of FUNCS.slice(5)) ok(block.indexOf('function ' + f + '(') > 0, 'P8 inventory ' + f);
-ok((src.match(/var PD_VERSION = '1\.5\.16';/) || []).length === 1 && /^ \* Version: 1\.5\.16$/m.test(src), 'P8 version lockstep');
+// 2026-10-28: v1.5.17 (post-earnings inputs) stacks on this change; the lockstep holds at the
+// delivered file's own version, which must be 1.5.16 or later.
+const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m) || [];
+ok(pdv.length === 4 && (src.match(/var PD_VERSION = '/g) || []).length === 1 &&
+   new RegExp('^ \\* Version: ' + pdv[1] + '\\.' + pdv[2] + '\\.' + pdv[3] + '$', 'm').test(src) &&
+   (+pdv[1]) * 1e6 + (+pdv[2]) * 1e3 + (+pdv[3]) >= 1005016, 'P8 version lockstep');
 ok(src.indexOf(" * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION") > 0 && src.indexOf(" * v1.5.15 (2026-10-24)  (PD-ALLCASH") > 0, 'P8 header blocks, prior WHY kept');
 console.log('P8 PASS lint + inventory');
 

@@ -1,0 +1,234 @@
+{
+ "version": "2026-10-28",
+ "why": "Commodities_FX fresh 430/453 on run 40604805750; the 17 structural rows plus two controls",
+ "items": [
+  {
+   "row": "SUI-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "SUI-USD.CC",
+    "SUI-USD.US"
+   ],
+   "search": "SUI",
+   "yahoo": [
+    "SUI-USD",
+    "SUI20947-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "GRT-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "GRT-USD.CC",
+    "GRT-USD.US"
+   ],
+   "search": "GRT",
+   "yahoo": [
+    "GRT-USD",
+    "GRT6719-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "APT-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "APT-USD.CC",
+    "APT-USD.US"
+   ],
+   "search": "APT",
+   "yahoo": [
+    "APT-USD",
+    "APT21794-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "UNI-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "UNI-USD.CC",
+    "UNI-USD"
+   ],
+   "search": "UNI",
+   "yahoo": [
+    "UNI-USD",
+    "UNI7083-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "COMP-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "COMP-USD.CC",
+    "COMP-USD.US"
+   ],
+   "search": "COMP",
+   "yahoo": [
+    "COMP-USD",
+    "COMP5692-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "IMX-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "IMX-USD.CC",
+    "IMX-USD.US"
+   ],
+   "search": "IMX",
+   "yahoo": [
+    "IMX-USD",
+    "IMX10603-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "STX-USD",
+   "kind": "crypto",
+   "eodhd": [
+    "STX-USD.CC",
+    "STX-USD.US"
+   ],
+   "search": "STX",
+   "yahoo": [
+    "STX-USD",
+    "STX4847-USD"
+   ],
+   "note": "WP-05 armed route vs today's legacy route; Yahoo short ticker vs its CMC-suffixed id"
+  },
+  {
+   "row": "XAUUSD=X",
+   "kind": "fx",
+   "eodhd": [
+    "XAUUSD.FOREX"
+   ],
+   "yahoo": [
+    "XAUUSD=X",
+    "GC=F"
+   ],
+   "note": "gold spot: EODHD FOREX vs Yahoo (GC=F is the front future, a cross-check only)"
+  },
+  {
+   "row": "BHDSAR=X",
+   "kind": "fx",
+   "eodhd": [
+    "BHDSAR.FOREX"
+   ],
+   "yahoo": [
+    "BHDSAR=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "BRLBHD=X",
+   "kind": "fx",
+   "eodhd": [
+    "BRLBHD.FOREX"
+   ],
+   "yahoo": [
+    "BRLBHD=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "AEDMYR=X",
+   "kind": "fx",
+   "eodhd": [
+    "AEDMYR.FOREX"
+   ],
+   "yahoo": [
+    "AEDMYR=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "AEDPHP=X",
+   "kind": "fx",
+   "eodhd": [
+    "AEDPHP.FOREX"
+   ],
+   "yahoo": [
+    "AEDPHP=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "AEDIDR=X",
+   "kind": "fx",
+   "eodhd": [
+    "AEDIDR.FOREX"
+   ],
+   "yahoo": [
+    "AEDIDR=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "BHDPLN=X",
+   "kind": "fx",
+   "eodhd": [
+    "BHDPLN.FOREX"
+   ],
+   "yahoo": [
+    "BHDPLN=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "AEDMXN=X",
+   "kind": "fx",
+   "eodhd": [
+    "AEDMXN.FOREX"
+   ],
+   "yahoo": [
+    "AEDMXN=X"
+   ],
+   "note": "exotic cross: TFB_EODHD_FX_MAP would request the .FOREX code"
+  },
+  {
+   "row": "LBS=F",
+   "kind": "future",
+   "yahoo": [
+    "LBS=F",
+    "LBR=F"
+   ],
+   "note": "CME lumber: LBS was replaced by LBR (physically delivered, 2022)"
+  },
+  {
+   "row": "DX=F",
+   "kind": "future",
+   "yahoo": [
+    "DX=F",
+    "DX-Y.NYB"
+   ],
+   "note": "ICE dollar index future vs the index"
+  },
+  {
+   "row": "BTC-USD",
+   "kind": "control",
+   "eodhd": [
+    "BTC-USD.CC"
+   ],
+   "search": "BTC",
+   "yahoo": [
+    "BTC-USD"
+   ],
+   "note": "control: must read CONFIRMED"
+  },
+  {
+   "row": "EURUSD=X",
+   "kind": "control",
+   "eodhd": [
+    "EURUSD.FOREX"
+   ],
+   "yahoo": [
+    "EURUSD=X"
+   ],
+   "note": "control: must read CONFIRMED"
+  }
+ ]
+}

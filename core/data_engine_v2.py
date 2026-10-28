@@ -2,12 +2,13 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.2
 ================================================================================
 
-WHY v5.159.0 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
-5.155.0, 2026-10-22 after #816 shipped a different 5.156.0, and again 2026-10-22
-after #817 shipped a different 5.157.0 while #818/#819 claimed 5.158.0) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
+WHY v5.159.2 (2026-10-14, renumbered 2026-10-21 after #810 shipped a different
+5.155.0, 2026-10-22 after #816 shipped a different 5.156.0, again 2026-10-22
+after #817 shipped a different 5.157.0 while #818/#819 claimed 5.158.0, and
+2026-10-28 after #865 and #867 shipped 5.159.0 and 5.159.1) - SUFFIX LOCALE FALLBACK FOR SUFFIXES THE LOCAL
 TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identical)
 - EVIDENCE: the Top_10_Investments export of 2026-10-13 20:37 Riyadh (route
   v4.18.1, builder v1.26.1, pool 9,786 rows) publishes MWG.VN as Market
@@ -51,9 +52,57 @@ TABLE LACKS (env TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF -> byte-identica
   (no new health key), every provider, identity_guard and the builder.
   Suffixes no table knows (.PH .MA .ETR .LG) still fall back to USD.
 - OFF (unset or any other value): both inferrers return exactly what main's
-  v5.158.0 (#819; was v5.155.0 when authored) returned; no log line, tag or
+  v5.159.1 (#867; was v5.155.0 when authored) returned; no log line, tag or
   payload field is added.
 - ROLLBACK: unset TFB_ENGINE_SUFFIX_LOCALE_FALLBACK (no redeploy needed).
+
+WHY v5.159.1 - THE FUND-CACHE HIT GATE ALSO RUNS ON THE 12M FORECAST
+(TFB_EODHD_ANALYST_TARGET unchanged; off = byte-identical to v5.158.0)
+- Codex review on #865 (P2): with TFB_EODHD_ANALYST_TARGET=1,
+  TFB_EODHD_FUND_CACHE=enforce and the supported TFB_TARGET_MEAN_PUBLISH=0,
+  the v5.159.0 capture stores forecast_price_12m / forecast_source without
+  target_mean_price (Fix AI never publishes it), and the hit gate was
+  entered only on target_mean_price: a 125 target captured at price 100
+  and replayed at 20 landed as provider_target, unjudged. Production runs
+  with the publish switch on (default), so the path was not live.
+- _fill_carries_eodhd_target(fill): forecast_price_12m OR target_mean_price.
+  The hit gate is entered on it and judges forecast_price_12m first; the
+  ":nt" suffix is omitted on the same test. One helper added, two
+  conditions changed; nothing else moved.
+
+WHY v5.159.0 - EODHD ANALYST TARGET THROUGH THE FALLBACK AND THE FUND CACHE
+(TFB_EODHD_ANALYST_TARGET, the eodhd_provider v4.19.0 flag; default off =
+every row, snapshot and tag byte-identical to v5.158.0)
+- EVIDENCE: since 2026-10-21 09:28Z every sync logs "[YF-CB v6.9.1] OPEN
+  reason=info_empty status=429 ... yfinance fundamentals suspended for
+  cooldown; EODHD fallback carries fundamentals" (100+ events on 23 Oct,
+  dozens per sync since). The fallback carried ratios and margins but no
+  target, so Phase-II restored the last known target (analyst_lkg:<age>h)
+  and the opportunity builder held the row ("Held target - no new money",
+  TFB_OPP_HELD_TARGET_NO_NEW_MONEY=1). On 28 Oct 23 of 31 board candidates
+  were held that way.
+- eodhd_provider v4.19.0 adds target_mean_price (AnalystRatings.TargetPrice,
+  else Highlights.WallStreetTargetPrice) and analyst_count to the
+  fundamentals patch when armed. This engine change is the seam:
+  1. _apply_eodhd_fundamentals_fallback: a patch that carries
+     target_mean_price is canonicalized with the row's known price injected
+     into a COPY (the v5.77.19 Fix 1 case: the patch has no price, so the
+     v5.77.18 gate would fail open), the gate's drop tags are carried back
+     (Fix 2), and a 12M leg that lands is tagged analyst_consensus_eodhd
+     (substring-safe). A patch without the key takes the v5.158.0 path.
+  2. _fund_lkg_capture: with the flag on, a row whose 12M target came from
+     EODHD on this pass (tag present, source provider_target) also stores
+     target_mean_price / forecast_price_12m / forecast_source in its
+     snapshot. The P-154c fund cache (enforce live, TTL 24 h) asks EODHD
+     once per symbol per day; the other two syncs are hits, and without
+     this the hit forgoes the target (":nt"), Phase-II restores analyst_lkg
+     and the row is held again. The AZ-2 restore filters to
+     _FUND_LKG_FIELDS and never sees these keys.
+  3. A fund-cache hit whose fill carries the target judges it against the
+     row's price of the day (same gate; refused: provider_target_
+     implausible_dropped_12m, accepted: analyst_consensus_eodhd); the
+     ":nt" suffix is omitted when the fill carries the target.
+- Rollback: unset the flag (= off) or revert; nothing else moved.
 
 WHY v5.158.0 - F-7 v2b: SETTLE RE-DERIVES THE SCORER'S OWN CONFIDENCE UNDER
 ENFORCE; OBSERVE PUBLISHES v5.157.0 AND SHOWS THE v2 RESULT IN ITS TAG
@@ -4453,12 +4502,13 @@ from core.financial_units import (
 #   v5.157.0 publishes and its f7_settle tag shows the v2 result (stx when
 #   enforce would hold the row back). Off is byte-identical.
 #   Tests: tests/test_de_f7_settle_shadow.py.
-# v5.159.0 (2026-10-14; renumbered 2026-10-21 and twice 2026-10-22 after #810, #816
-# and #817 took 5.155.0-5.157.0; #819 took 5.158.0 on 2026-10-24): suffix locale fallback
+# v5.159.2 (2026-10-14; renumbered 2026-10-21 and twice 2026-10-22 after #810, #816
+# and #817 took 5.155.0-5.157.0; #819 took 5.158.0 on 2026-10-24; #865 and #867 took
+# 5.159.0 and 5.159.1 on 2026-10-28): suffix locale fallback
 # (gated, default off); a dotted
 # suffix the local table lacks asks core.symbols.normalize for exchange and
 # currency before the NASDAQ/NYSE and USD fallbacks (MWG.VN -> HOSE / VND).
-__version__ = "5.159.0"
+__version__ = "5.159.2"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -5083,6 +5133,50 @@ def _eodhd_fundamentals_fallback_enabled() -> bool:
     if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
         return False
     return True
+
+
+_EODHD_ANALYST_TAG: str = "analyst_consensus_eodhd"
+_EODHD_ANALYST_SNAPSHOT_FIELDS: Tuple[str, ...] = (
+    "target_mean_price", "forecast_price_12m", "forecast_source",
+)
+
+
+def _eodhd_analyst_target_enabled() -> bool:
+    """v5.159.0: TFB_EODHD_ANALYST_TARGET=1 (the eodhd_provider v4.19.0 flag,
+    read here with the same spelling) lets the fund-LKG snapshot carry the
+    analyst target the EODHD fallback delivered, so a fund-cache hit fills it
+    too. Default off: the snapshot and the hit fill are byte-identical to
+    v5.158.0."""
+    raw = (os.getenv("TFB_EODHD_ANALYST_TARGET") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+
+
+def _row_has_eodhd_analyst_tag(row: Mapping[str, Any]) -> bool:
+    """True when the row's warnings carry the v5.159.0 provenance tag."""
+    try:
+        raw = row.get("warnings") if isinstance(row, Mapping) else None
+        if isinstance(raw, str):
+            return _EODHD_ANALYST_TAG in raw
+        if isinstance(raw, (list, tuple, set)):
+            return any(_EODHD_ANALYST_TAG in _safe_str(p) for p in raw)
+        return False
+    except Exception:
+        return False
+
+
+def _fill_carries_eodhd_target(fill: Any) -> bool:
+    """v5.159.1: True when a fund-cache fill carries a 12M analyst-target
+    value of the v5.159.0 snapshot block: forecast_price_12m OR
+    target_mean_price. With TFB_TARGET_MEAN_PUBLISH=0 the block is captured
+    without target_mean_price, so the 12M forecast alone must count (Codex
+    review on #865). Off, the lookup strips the block: always False."""
+    try:
+        if not isinstance(fill, Mapping):
+            return False
+        return _as_float(fill.get("forecast_price_12m")) is not None \
+            or _as_float(fill.get("target_mean_price")) is not None
+    except Exception:
+        return False
 
 
 def _yahoo_enrich_on_missing_industry() -> bool:
@@ -13848,6 +13942,22 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
                 fields[k] = v
         if not fields:
             return False
+        # v5.159.0: when TFB_EODHD_ANALYST_TARGET=1 and THIS pass took its
+        # 12M target from the EODHD fallback (provenance tag present, source
+        # still provider_target: the capture seam runs before Phase-II, so
+        # no LKG restore can have written the source yet), the snapshot also
+        # carries the target block. A fund-cache hit then fills it through
+        # the same whitelist (target_mean_price / forecast_price_12m /
+        # forecast_source are in _YAHOO_FUNDAMENTAL_FIELDS) instead of
+        # forgoing it (the ":nt" case). The AZ-2 restore filters to
+        # _FUND_LKG_FIELDS, so it never sees these keys. Off: no key added.
+        if _eodhd_analyst_target_enabled() and _row_has_eodhd_analyst_tag(row) \
+                and _safe_str(row.get("forecast_source")).lower() == "provider_target" \
+                and _forecast_price_is_populated(row.get("forecast_price_12m")):
+            for k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                v = row.get(k)
+                if not _is_missing_or_unknown_field(v):
+                    fields[k] = v
         now = time.time()
         _FUND_LKG_STORE[s] = {
             "ts": now,
@@ -14063,6 +14173,12 @@ def _fund_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
             "name": _safe_str(entry.get("name")),
             "fields": {k: v for k, v in fields.items() if k in _FUND_LKG_FIELDS},
         }
+        # v5.159.0: the target block travels to L2 only while the flag is
+        # on, so every worker's hit carries it (captures are per worker).
+        if _eodhd_analyst_target_enabled():
+            for _k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                if not _is_missing_or_unknown_field(fields.get(_k)):
+                    cached["fields"][_k] = fields.get(_k)
         version = entry.get("margin_contract_version")
         if isinstance(version, str) and version:
             cached["margin_contract_version"] = version
@@ -14109,6 +14225,12 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
         if not fields or all(_is_missing_or_unknown_field(fields.get(k))
                              for k in _FUND_LKG_ANCHOR_FIELDS):
             return None
+        # v5.159.0: read the target block back only while the flag is on.
+        if _eodhd_analyst_target_enabled():
+            for k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                v = fields_in.get(k)
+                if not _is_missing_or_unknown_field(v):
+                    fields[k] = v
         _FUND_LKG_REDIS_STATE["hits"] = int(_FUND_LKG_REDIS_STATE.get("hits") or 0) + 1
         entry = {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
         version = d.get("margin_contract_version")
@@ -14243,6 +14365,12 @@ def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
         if not isinstance(fields, dict) or not fields:
             return None
         fields = dict(fields)
+        # v5.159.0: a snapshot captured while TFB_EODHD_ANALYST_TARGET was
+        # on may carry the target block; with the flag off it is not served,
+        # so off stays byte-identical to v5.158.0 for the snapshot's life.
+        if not _eodhd_analyst_target_enabled():
+            for _k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                fields.pop(_k, None)
         units = _margin_cache_units(entry, fields)
         if _margin_unit_tracking_enabled() or units:
             fields[_MPC_UNIT_KEY] = units
@@ -14350,7 +14478,12 @@ def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
                 kind = pfx + "hit"
                 _fund_cache_bump(kind)
                 tag = "%s:%s:%dh:%d" % (_FUND_CACHE_TAG, kind, int(age_s // 3600), len(filtered))
-                if _is_missing_or_unknown_field(row.get("target_mean_price")):
+                # v5.159.0: a snapshot that carries the EODHD target fills
+                # it on this hit, so the fill is no longer "no target".
+                # Off, the snapshot never carries the key: tag unchanged.
+                # v5.159.1: the 12M forecast alone counts as the target.
+                if _is_missing_or_unknown_field(row.get("target_mean_price")) \
+                        and not _fill_carries_eodhd_target(filtered):
                     tag += ":nt"
                 if mode == "enforce":
                     _margin_unit_copy(filtered, fields, list(filtered))
@@ -15895,7 +16028,7 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
 
 
 # =============================================================================
-# v5.159.0 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
+# v5.159.2 - SUFFIX LOCALE FALLBACK (TFB_ENGINE_SUFFIX_LOCALE_FALLBACK, default OFF)
 # -----------------------------------------------------------------------------
 # A dotted suffix absent from _SUFFIX_TO_LOCALE (.VN, .SET, .PS, .AU, .KO, ...)
 # fell through to NASDAQ/NYSE + USD while _infer_country_from_symbol already
@@ -15956,7 +16089,7 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "Futures"
-    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.2: off -> None
     if _nzl is not None:
         return _nzl[0]
     return "NASDAQ/NYSE"
@@ -15983,7 +16116,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
-    _nzl = _suffix_locale_nz_for(s)  # v5.159.0: off -> None
+    _nzl = _suffix_locale_nz_for(s)  # v5.159.2: off -> None
     if _nzl is not None:
         return _nzl[1]
     return "USD"
@@ -19724,6 +19857,28 @@ class DataEngineV5:
         if _fc_mode != "off":
             _fc_kind, _fc_tag, _fc_fill = _fund_cache_decide(row, symbol, page, _fc_mode)
             if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
+                if _fc_fill and _fill_carries_eodhd_target(_fc_fill):
+                    # v5.159.0: the snapshot carries an EODHD target (armed
+                    # capture). Judge it against TODAY's row price with the
+                    # v5.77.18 gate before it lands; a refused target leaves
+                    # the v5.77.19 drop tag, an accepted one the provenance
+                    # tag. Off, the snapshot never carries the key.
+                    # v5.159.1: entered on the 12M forecast as well, so a
+                    # block captured with TFB_TARGET_MEAN_PUBLISH=0 (no
+                    # target_mean_price) is judged too (Codex review on #865).
+                    _fc_ref = _as_float(row.get("current_price"))
+                    if _fc_ref is None:
+                        _fc_ref = _as_float(row.get("price"))
+                    _fc_t12 = _fc_fill.get("forecast_price_12m")
+                    if _as_float(_fc_t12) is None:
+                        _fc_t12 = _fc_fill.get("target_mean_price")
+                    if _provider_target_gate_enabled() \
+                            and not _provider_target_is_plausible(_fc_ref, _fc_t12):
+                        for _fc_k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                            _fc_fill.pop(_fc_k, None)
+                        _v573_append_warning(row, "provider_target_implausible_dropped_12m")
+                    else:
+                        _v573_append_warning(row, _EODHD_ANALYST_TAG)
                 if _fc_fill:
                     row = self._merge(row, _fc_fill)
                     _margin_unit_copy(row, _fc_fill, _fc_fill)
@@ -19756,8 +19911,27 @@ class DataEngineV5:
         sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
             _safe_str(row.get("symbol") or row.get("requested_symbol"))
         )
+        # v5.159.0: eodhd_provider v4.19.0 adds target_mean_price to this
+        # patch when TFB_EODHD_ANALYST_TARGET=1. The patch has no price, so
+        # the v5.77.18 plausibility gate would fail open (the v5.77.19 Fix 1
+        # case). Inject the row's known price into a COPY, exactly as the
+        # Yahoo fundamentals path does; current_price is not in
+        # _YAHOO_FUNDAMENTAL_FIELDS, so it never travels onto the row. A
+        # patch without a target (every patch while the flag is off) takes
+        # the v5.158.0 path unchanged.
+        _eat_target = _as_float(patch.get("target_mean_price")) is not None
+        patch_for_canon = patch
+        if _eat_target:
+            patch_for_canon = dict(patch)
+            _eat_ref_price = _as_float(row.get("current_price"))
+            if _eat_ref_price is None:
+                _eat_ref_price = _as_float(row.get("price"))
+            if _eat_ref_price is not None \
+                    and _as_float(patch_for_canon.get("current_price")) is None \
+                    and _as_float(patch_for_canon.get("price")) is None:
+                patch_for_canon["current_price"] = _eat_ref_price
         canon_patch = _canonicalize_provider_row(
-            patch, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
+            patch_for_canon, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
             provider="eodhd_fundamentals",
         )
         # v5.140.0 (P-115): unit-contract conversion on the canonical patch
@@ -19803,11 +19977,21 @@ class DataEngineV5:
         if not filtered:
             # v5.150.0 (P-154c): the paid request landed nothing usable.
             _fund_cache_note_empty(row, symbol, _fc_mode, "nofill")
+        if _eat_target:
+            # v5.159.0 (the v5.77.19 Fix 2 case): the missing-field filter
+            # drops the gate's provider_target_implausible_dropped_* tags;
+            # carry them back so a refused EODHD target leaves a trail.
+            _merge_gate_drop_warnings(row, canon_patch)
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
             _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
+            if _eat_target and "forecast_price_12m" in filtered:
+                # v5.159.0: provenance of a 12M leg that came from EODHD.
+                # Substring-safe for the reliability scan (no cap / forecast
+                # / target / roi / drop / reject).
+                _v573_append_warning(row, _EODHD_ANALYST_TAG)
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
             for _fus_k in _fus_keys:
