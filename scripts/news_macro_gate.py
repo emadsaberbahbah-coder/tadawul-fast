@@ -2,8 +2,33 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.0.1 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.0.2 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.0.2 (2026-10-28) -- A STABLE VERDICT: 24 h MEMORY + ENGLISH WIRES
+WHY (the first two runs on main 2f8ead9f, 27 Oct 23:03 and 23:11 UTC, eight
+  minutes apart): the dry run read NO_NEW_ENTRY - a Hormuz cluster from 5
+  domains with a licensed wire ("oil closes higher as attacks continue in
+  the Strait of Hormuz") - and the write run read CAUTION: Google-News
+  returned a different set and GDELT throttled the runner (circuit open at
+  its second query, 14 queries skipped), so the wire story was not in the
+  second fetch. A verdict that flips with feed variance cannot be scored.
+  US names were reached only through GDELT, so most were skipped.
+WHAT: (1) Memory: before clustering, the run reads back the newest
+  _News_Items rows (TFB_NEWS_GATE_MEMORY_ROWS, default 2500; 0 = off) and
+  carries every GDELT / Google-News headline published within 24 h (macro)
+  or 72 h (a name) into the clusters, re-classified with the current
+  taxonomy. A fresh copy wins on the same Item ID, nothing carried is
+  written again, EDGAR and the Fed feed are re-read whole as before, and
+  the gate row's Items cell shows "+N carried". Dry runs read it too
+  (read-only). Only sources selected for the run are carried, so a run
+  limited by TFB_NEWS_GATE_SOURCES is not moved by an excluded source
+  (Codex review on #862), and a name's rows are carried only while the
+  name is in today's scope. (2) Google-News in English (US edition): four macro queries
+  (geopolitics, oil, rates, markets) and one per non-Saudi name, beside
+  GDELT. (3) The Names Flagged cell lists INFO flags too (earnings
+  released), BLOCK first, then WATCH, then INFO.
+ROLLBACK: revert this file to v1.0.1 (2f8ead9f). No tab or header change.
+--------------------------------------------------------------------------------
 v1.0.1 (2026-10-28) -- --write NEEDS A WORKBOOK SESSION
 WHY (Codex re-review on PR #859; the fix was pushed after the owner merged
   the PR at 45748da0, so it lands here): with DEFAULT_SPREADSHEET_ID set
@@ -117,7 +142,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -153,6 +178,11 @@ ITEMS_HEADER = ["Item ID", "First Seen (Riyadh)", "Published (UTC)", "Scope", "E
                 "Cluster Grade", "Headline", "URL", "Cluster", "Run ID"]
 ECON_HEADER = ["Key", "Date (UTC)", "Country", "Event", "Comparison", "Period", "Importance",
                "Estimate", "Actual", "Previous", "Surprise", "Surprise %", "Updated At (Riyadh)"]
+# v1.0.2: headlines from earlier runs stay in the clusters while they can still
+# move the verdict (evaluate(): 24 h for macro, 72 h for a name).
+MEMORY_HOURS = {"MACRO": 24.0, "NAME": 72.0}
+MEMORY_SOURCES = ("gdelt", "google_news")
+_LEVEL_ORDER = {"BLOCK": 0, "WATCH": 1, "INFO": 2}
 
 VERDICTS = ("GO", "CAUTION", "NO_NEW_ENTRY")
 
@@ -1070,6 +1100,14 @@ GNEWS_AR_QUERIES: Tuple[Tuple[str, str], ...] = (
     ("rates ar", "\u0627\u0644\u0641\u064a\u062f\u0631\u0627\u0644\u064a OR \u0633\u0639\u0631 \u0627\u0644\u0641\u0627\u0626\u062f\u0629 when:1d"),
     ("geopolitics ar", "\u0647\u062c\u0648\u0645 OR \u062a\u0635\u0639\u064a\u062f OR \u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632 when:1d"),
 )
+# v1.0.2: English Google-News (US edition) reaches the licensed wires when
+# GDELT throttles the runner (27 Oct: circuit open at its second query).
+GNEWS_EN_QUERIES: Tuple[Tuple[str, str], ...] = (
+    ("geopolitics en", '"Strait of Hormuz" OR Iran OR Houthi OR missile OR ceasefire when:1d'),
+    ("oil en", '"oil prices" OR OPEC OR "Brent crude" OR "crude oil" when:1d'),
+    ("rates en", '"Federal Reserve" OR FOMC OR "Treasury yields" OR "rate cut" when:1d'),
+    ("markets en", '"Wall Street" OR "stock market" OR "Saudi stocks" OR Tadawul when:1d'),
+)
 
 
 def _name_query(name: str) -> str:
@@ -1082,6 +1120,7 @@ def _name_query(name: str) -> str:
 def build_queries(scope: Sequence[Dict[str, str]]) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str, str]]]:
     gdelt = [("MACRO", label, q) for label, q in GDELT_MACRO_QUERIES]
     gnews = [("MACRO", label, q, "ar") for label, q in GNEWS_AR_QUERIES]
+    gnews += [("MACRO", label, q, "en") for label, q in GNEWS_EN_QUERIES]
     for s in scope:
         name = s.get("name") or ""
         nq = _name_query(name)
@@ -1091,6 +1130,7 @@ def build_queries(scope: Sequence[Dict[str, str]]) -> Tuple[List[Tuple[str, str,
             gnews.append((s["symbol"], f"name {s['symbol']}", f"{nq} when:3d", "en-sa"))
         else:
             gdelt.append((s["symbol"], f"name {s['symbol']}", nq))
+            gnews.append((s["symbol"], f"name {s['symbol']} en", f"{nq} when:3d", "en"))
     return gdelt, gnews
 
 
@@ -1245,13 +1285,17 @@ def classify_all(items: List[Dict[str, Any]], clf: Classifier, now: _dt.datetime
     seen = set()
     out = []
     for it in items:
-        iid = item_id(it.get("url", ""), it.get("title", ""), it.get("source", ""), it.get("scope", ""))
+        # v1.0.2: a carried item keeps its recorded Item ID and first-seen
+        # time; fresh items come first, so a fresh copy wins on the same ID.
+        iid = it.get("id") or item_id(it.get("url", ""), it.get("title", ""), it.get("source", ""),
+                                      it.get("scope", ""))
         if iid in seen:
             continue
         seen.add(iid)
         it["id"] = iid
         it["tier"] = "A" if it.get("source") in ("edgar", "fed_rss") else tier_of(it.get("domain", ""))
-        it["first_seen"] = now
+        if not it.get("first_seen"):
+            it["first_seen"] = now
         if it.get("source") == "edgar":
             worst = None
             for code in it.get("items") or []:
@@ -1276,6 +1320,61 @@ def item_row(it: Dict[str, Any], run_id: str) -> List[Any]:
             it.get("cluster", ""), run_id]
 
 
+def _parse_stamp(text: Any, tz: _dt.timezone) -> Optional[_dt.datetime]:
+    raw = str(text or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return _dt.datetime.strptime(raw, fmt).replace(tzinfo=tz).astimezone(UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def read_memory(sheets: Any, sid: str, now: _dt.datetime, max_rows: int,
+                sources: Sequence[str] = MEMORY_SOURCES,
+                symbols: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+    """v1.0.2: GDELT / Google-News headlines recorded by earlier runs that can
+    still move the verdict (published within 24 h for macro, 72 h for a
+    name), read from the newest max_rows rows of _News_Items. EDGAR and the
+    Fed feed are re-read whole every run, so their rows are not carried, and
+    a source left out of the run's selection is not carried either. With
+    symbols given, a name's rows are carried only for names in that scope."""
+    allowed = {src for src in sources if src in MEMORY_SOURCES}
+    names = None if symbols is None else {str(x).strip().upper() for x in symbols}
+    if max_rows <= 0 or not allowed:
+        return []
+    ids = read_values(sheets, sid, ITEMS_TAB, "A2:A")
+    if not ids:
+        return []
+    last = len(ids) + 1
+    first = max(2, last - max_rows + 1)
+    rows = read_values(sheets, sid, ITEMS_TAB, f"A{first}:P{last}") or []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        r = [str(x).strip() for x in row] + [""] * (len(ITEMS_HEADER) - len(row))
+        iid, seen, pub, scope, source, domain, title, url = (r[0], r[1], r[2], r[3], r[8], r[9],
+                                                             r[12], r[13])
+        if not iid or not scope or not title or source not in allowed:
+            continue
+        if scope != "MACRO" and names is not None and scope.upper() not in names:
+            continue
+        published = _parse_stamp(pub, UTC)
+        if published is None:
+            continue
+        hours = MEMORY_HOURS["MACRO" if scope == "MACRO" else "NAME"]
+        if published < now - _dt.timedelta(hours=hours) or published > now + _dt.timedelta(hours=1):
+            continue
+        out.append({"id": iid, "source": source, "scope": scope, "title": title, "url": url,
+                    "domain": domain, "published": published, "first_seen": _parse_stamp(seen, RIYADH),
+                    "memory": True})
+    return out
+
+
+def _flags(g: Dict[str, Any]) -> List[Tuple[str, Dict[str, str]]]:
+    return sorted(((s, f) for s, fl in g["names"].items() for f in fl),
+                  key=lambda x: (_LEVEL_ORDER.get(x[1]["level"], 9), x[0]))
+
+
 def econ_row(e: Dict[str, Any], now: _dt.datetime) -> List[Any]:
     def v(x: Any) -> Any:
         return "" if x is None else x
@@ -1286,8 +1385,7 @@ def econ_row(e: Dict[str, Any], now: _dt.datetime) -> List[Any]:
 
 def gate_row(rep: Dict[str, Any]) -> List[Any]:
     g = rep["gate"]
-    names = "; ".join(f"{s} {f['level']}: {f['why']}" for s, fl in sorted(g["names"].items()) for f in fl
-                      if f["level"] != "INFO")
+    names = "; ".join(f"{s} {f['level']}: {f['why']}" for s, f in _flags(g))
     sched = "; ".join(f"{s['event']} {fmt_riyadh(s['when'])[5:16]}" for s in g["scheduled"])
     mk = g["market"]
     market = ", ".join(x for x in [
@@ -1296,7 +1394,8 @@ def gate_row(rep: Dict[str, Any]) -> List[Any]:
     c = rep["counts"]
     return [fmt_riyadh(rep["now"]), rep["run_id"], g["verdict"], " | ".join(g["drivers"])[:1500],
             sched[:500], market, names[:1500],
-            f"{c['new']}/{c['classified']}/{c['collected']}",
+            f"{c['new']}/{c['classified']}/{c['collected']}"
+            + (f" +{c['carried']} carried" if c.get("carried") else ""),
             ", ".join(f"{k}={v}" for k, v in sorted(rep["sources_ok"].items())),
             "; ".join(f"{k}: {v}" for k, v in sorted(rep["sources_failed"].items()))[:500],
             rep["mode"], __version__]
@@ -1310,7 +1409,7 @@ def render_digest(rep: Dict[str, Any]) -> str:
     lines.append("**Drivers:** " + ("; ".join(g["drivers"]) if g["drivers"] else "none"))
     if g["positives"]:
         lines.append("**Easing:** " + "; ".join(g["positives"]))
-    flagged = [(s, f) for s, fl in sorted(g["names"].items()) for f in fl]
+    flagged = _flags(g)
     lines.append("")
     lines.append("**Names:** " + ("; ".join(f"{s} {f['level']} - {f['why']}" for s, f in flagged)
                                    if flagged else "no flags"))
@@ -1323,7 +1422,8 @@ def render_digest(rep: Dict[str, Any]) -> str:
                      f"{c['headline'][:110].replace('|', '/')} |")
     lines.append("")
     c = rep["counts"]
-    lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}. "
+    lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}, "
+                 f"carried from earlier runs {c.get('carried', 0)}. "
                  f"Sources OK: {', '.join(f'{k}={v}' for k, v in sorted(rep['sources_ok'].items())) or 'none'}. "
                  f"Failed: {'; '.join(f'{k}: {v}' for k, v in sorted(rep['sources_failed'].items())) or 'none'}.")
     lines.append("")
@@ -1382,17 +1482,34 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         market = col.market(key)
         stage("market", len(market), t0)
 
-    items = classify_all(raw, clf, now)
+    memory: List[Dict[str, Any]] = []
+    memory_error = ""
+    if sheets is not None and sid:
+        t0 = col.clock()
+        try:
+            memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
+                                 sources, symbols)
+        except Exception as exc:  # memory is a help, never a reason to fail
+            memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+        _out(f"[news_gate v{__version__}] memory: {len(memory)} items within 24 h / 72 h in "
+             f"{col.clock() - t0:.0f}s" + (f" | {memory_error}" if memory_error else ""))
+
+    items = classify_all(raw + memory, clf, now)
+    fresh_items = [i for i in items if not i.get("memory")]
     classified = [i for i in items if i.get("event_type") and i["event_type"] != "law_firm_noise"]
+    carried = [i for i in classified if i.get("memory")]
     clusters = cluster_items(classified)
     gate = evaluate(clusters, econ, market, now)
     rep: Dict[str, Any] = {
         "version": __version__, "now": now, "run_id": run_id, "mode": mode, "wrote": False,
         "scope": scope, "gate": gate, "clusters": clusters,
         "sources_ok": dict(col.ok), "sources_failed": dict(col.failed),
-        "counts": {"collected": len(items), "classified": len(classified), "new": 0},
+        "counts": {"collected": len(fresh_items), "classified": len(classified) - len(carried),
+                   "new": 0, "carried": len(carried)},
         "econ": econ,
     }
+    if memory_error:
+        rep["memory_error"] = memory_error
     answered = bool(col.ok)
     rc = 0 if answered else 1
     if write and sheets is not None and sid:
@@ -1400,7 +1517,7 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
             max_items = _int_env("TFB_NEWS_GATE_MAX_ITEMS", 200, 1, 2000)
             ensure_tab(sheets, sid, ITEMS_TAB, ITEMS_HEADER)
             existing = {str(r[0]) for r in (read_values(sheets, sid, ITEMS_TAB, "A2:A") or []) if r}
-            fresh = [i for i in classified if i["id"] not in existing]
+            fresh = [i for i in classified if not i.get("memory") and i["id"] not in existing]
             fresh.sort(key=lambda i: (_SEV_RANK.get(i.get("severity") or "L", 3), i.get("cluster_grade") or 9))
             fresh = fresh[:max_items]
             append_rows(sheets, sid, ITEMS_TAB, [item_row(i, run_id) for i in fresh])
@@ -1514,7 +1631,7 @@ def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any 
             pass
     g = rep["gate"]
     _out(f"[news_gate v{__version__}] verdict={g['verdict']} drivers={len(g['drivers'])} "
-         f"names_flagged={len(g['names'])} scope={len(scope)} "
+         f"names_flagged={len(g['names'])} scope={len(scope)} carried={rep['counts'].get('carried', 0)} "
          f"sources_ok={sorted(rep['sources_ok'])} sources_failed={sorted(rep['sources_failed'])} "
          f"wrote={rep['wrote']}" + (f" write_error={rep['write_error']}" if rep.get("write_error") else ""))
     return rc
