@@ -69,4 +69,16 @@ Neighbouring suites pass: fund cache-first P-154c, EPS basis contract, margin un
 ## S5 - Rollback
 Unset `TFB_EODHD_ANALYST_TARGET` and restart: provider patch, cache key, snapshot fill and tags are byte-identical to v4.18.5 / v5.158.0, and an armed-era snapshot is served without its target block. Or revert the two files to `18ab6e38`.
 
+## S6 - Follow-up after merge: `data_engine_v2` v5.159.1 (PR after #865)
+#865 merged at `cc450da7` with one red CI job and one open review finding. Both are fixed here; nothing is armed.
+
+| Item | Cause | Fix | Proof |
+|---|---|---|---|
+| CI: *Whole suite (pinned Python 3.11)*, 1 failed / 6216 passed - `tests/test_core_repair_tiny_quotes.py::TinyQuoteCliTests::test_cli_provenance_matches_helper_and_workflow_while_tiny_probe_defaults_off[tiny_quote_readback=True]`, exit 1 != 0 | The test's fake `/health` pins `ENGINE = "5.158.0"` and the readback CLI compares it with the source constant; #865 moved the constant. My pre-push run covered the neighbouring suites, not the whole suite. | Pin moves in place to `5.159.1` (the same rule the file states for `ROUTE`). | Reproduced locally on `cc450da7`; passes after the pin; whole suite run locally before this push. |
+| Codex P2 on #865: *gate cached forecasts independently of target-mean publication* | With `TFB_TARGET_MEAN_PUBLISH=0` (supported kill-switch) Fix AI never publishes `target_mean_price`, so the armed capture stores `forecast_price_12m` / `forecast_source` only, and the hit gate was entered on `target_mean_price` alone: 125 captured at 100 and replayed at 20 landed as `provider_target`, unjudged. Production runs with the switch on (default; not in the Render list), so the path was not live. | `_fill_carries_eodhd_target(fill)`: `forecast_price_12m` OR `target_mean_price`. The hit gate is entered on it and judges `forecast_price_12m` first; the `:nt` suffix uses the same test. | New `test_e10_publish_off_snapshot_is_still_gated_on_the_12m_forecast`: fails on `cc450da7` at the replay at 20 (the forecast lands), passes here; refused at 20, accepted at 100 without `:nt`. |
+
+Also: the test fixture now clears the real gate name `TFB_PROVIDER_TARGET_GATE_ENABLED` (it named `TFB_PROVIDER_TARGET_GATE`, which nothing reads) and `TFB_TARGET_MEAN_PUBLISH`.
+
+Pins: `data_engine_v2` 5.159.1 in `scripts/verify_deployment.py`, `tests/test_eodhd_analyst_target.py` (E9) and `tests/test_core_repair_tiny_quotes.py`. Arming (S4) is unchanged; arm after this follow-up merges.
+
 Not a licensed financial adviser; the owner decides and executes every trade.

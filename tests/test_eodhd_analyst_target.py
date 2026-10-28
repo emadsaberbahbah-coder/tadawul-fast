@@ -38,6 +38,9 @@ the registry module are the only replacements):
   E7 off after an armed capture: the snapshot's target block is not served
   E8 L2 round trip: the block travels only while armed
   E9 version, manifest pins, FLAGS row, env-contract row, ci lane
+  E10 v5.159.1 (Codex review on #865): with TFB_TARGET_MEAN_PUBLISH=0 the
+     snapshot carries forecast_price_12m without target_mean_price; the hit
+     still judges it on today's price (refused at 20, accepted at 100)
 
 Run: python tests/test_eodhd_analyst_target.py   or   pytest -q <this file>
 """
@@ -91,7 +94,8 @@ RATIOS = {
 def _clean(monkeypatch):
     for k in (FLAG, "TFB_EODHD_FUND_CACHE", "TFB_EODHD_FUND_CACHE_TTL_H",
               "TFB_EODHD_FUND_NEG_TTL_H", "TFB_EODHD_FUND_FALLBACK_SKIP_PAGES",
-              "TFB_FUND_UNIT_SENTRY", "TFB_ENGINE_TARGET_KLG", "TFB_PROVIDER_TARGET_GATE"):
+              "TFB_FUND_UNIT_SENTRY", "TFB_ENGINE_TARGET_KLG", "TFB_PROVIDER_TARGET_GATE_ENABLED",
+              "TFB_TARGET_MEAN_PUBLISH"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TFB_ENGINE_FUND_LKG", "1")
     monkeypatch.setenv("TFB_ENGINE_FUND_LKG_REDIS", "0")
@@ -422,18 +426,53 @@ def test_e8_l2_round_trip_carries_the_block_only_while_armed(monkeypatch):
 
 def test_e9_versions_pins_flag_registration_and_ci_lane():
     assert ep.PROVIDER_VERSION == "4.19.0"
-    assert de.__version__ == "5.159.0"
+    assert de.__version__ == "5.159.1"
     assert de._EODHD_ANALYST_TAG == TAG
     for bad in ("cap", "forecast", "target", "roi", "drop", "reject"):
         assert bad not in TAG
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert "(\"core.providers.eodhd_provider\", \"PROVIDER_VERSION\", '4.19.0'," in vd
-    assert "(\"core.data_engine_v2\", \"__version__\", \"5.159.0\"," in vd
+    assert "(\"core.data_engine_v2\", \"__version__\", \"5.159.1\"," in vd
     assert "('TFB_EODHD_ANALYST_TARGET', '0'," in vd
     contract = (_REPO / "docs" / "render_env_contract.md").read_text(encoding="utf-8")
     assert "TFB_EODHD_ANALYST_TARGET" in contract
     ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "tests/test_eodhd_analyst_target.py" in ci
+
+
+def test_e10_publish_off_snapshot_is_still_gated_on_the_12m_forecast(monkeypatch):
+    # Codex review on #865: TFB_TARGET_MEAN_PUBLISH=0 (supported kill-switch)
+    # never publishes target_mean_price, so the armed capture stores the 12M
+    # forecast and its source only; the hit must still judge that value.
+    monkeypatch.setenv("TFB_TARGET_MEAN_PUBLISH", "0")
+    _arm(monkeypatch)
+    calls = _Calls()
+    first = _run(_engine(_eodhd_patch(), calls), ROW)          # miss at 100: paid once
+    assert calls.n == 1 and TAG in _tags(first)
+    assert first["forecast_price_12m"] == 125.0 and first["forecast_source"] == "provider_target"
+    assert "target_mean_price" not in first                      # the switch is off
+    snap = de._FUND_LKG_STORE["SYNTH.US"]["fields"]
+    assert snap["forecast_price_12m"] == 125.0 and "target_mean_price" not in snap
+    monkeypatch.setenv("TFB_EODHD_FUND_CACHE", "enforce")
+    # hit at today's 20: 125 is 6.25x the price -> refused, ratios still fill
+    crashed = _run(_engine(_eodhd_patch(), calls), dict(ROW, current_price=20.0, price=20.0))
+    assert calls.n == 1
+    assert "forecast_price_12m" not in crashed
+    assert _safe(crashed.get("forecast_source")) != "provider_target"
+    assert DROP in _tags(crashed) and TAG not in _tags(crashed)
+    assert crashed["debt_to_equity"] == 0.3
+    # hit at today's 100: accepted, provenance tag, the fill is not "no target"
+    calm = _run(_engine(_eodhd_patch(), calls), ROW)
+    assert calls.n == 1
+    assert calm["forecast_price_12m"] == 125.0 and calm["forecast_source"] == "provider_target"
+    assert TAG in _tags(calm) and DROP not in _tags(calm)
+    hit = [t for t in _tags(calm) if t.startswith("fund_cache:hit:")]
+    assert hit and not hit[0].endswith(":nt")
+    # the helper: either key counts, neither does not
+    assert de._fill_carries_eodhd_target({"forecast_price_12m": 125.0})
+    assert de._fill_carries_eodhd_target({"target_mean_price": 125.0})
+    assert not de._fill_carries_eodhd_target({"debt_to_equity": 0.3})
+    assert not de._fill_carries_eodhd_target(None)
 
 
 if __name__ == "__main__":

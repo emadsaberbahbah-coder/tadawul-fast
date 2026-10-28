@@ -159,6 +159,8 @@ sys.path.insert(0, _ROOT)
 # data_engine_v2 5.158.0 -> 5.159.0 (TFB_EODHD_ANALYST_TARGET: the EODHD
 # analyst target through the fundamentals fallback and the fund cache,
 # default off); FLAGS declares the flag. No verifier logic changed.
+# 2026-10-28 (same rule): data_engine_v2 5.159.0 -> 5.159.1 (the fund-cache
+# hit gate also runs on the 12M forecast; Codex review on #865).
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -224,7 +226,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.159.0", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.159.1", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
