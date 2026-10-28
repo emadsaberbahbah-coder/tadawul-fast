@@ -2,9 +2,10 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.56 (2026-10-29) -- DAILY BRIEF SEND WINDOW
+# VERSION 1.1.60 (2026-10-29) -- DAILY BRIEF SEND WINDOW
 #
-# v1.1.56 (ported from open PR #860, whose 1.1.50 number #859 took): run
+# v1.1.60 (ported from open PR #860, whose 1.1.50 number #859 took; 1.1.56-1.1.57
+# are claimed by open PR #778): run
 # tests/test_daily_brief_send_window.py (run_daily_brief v1.20.0: the
 # send-time label and the US / Europe session hours come from the IANA
 # zones instead of "before market open" and fixed hours that go wrong when
