@@ -232,7 +232,9 @@ stale status, because the certifier rejects the whole packet.
 
 `TFB_PF_RESEARCH_VIEW` is read on every call. Accepted values are `off`,
 `observe` and `enforce`, in any letter case. Since portfolio_actions 1.17.0
-(2026-10-15, owner decision) an unset or blank value reads `enforce`; any
+(2026-10-15, owner decision; renumbered 1.17.2 on 2026-10-28 after #869
+shipped a different 1.17.0 and open #870 claimed 1.17.1) an unset or blank
+value reads `enforce`; any
 other value is treated as `off`. To turn the view off, set the explicit value
 `off` on Render. Unsetting it no longer turns it off.
 
@@ -313,7 +315,8 @@ and `meta.research_view.status` reads `error`.
 when the run declares the mode with `--expect-pf-research-view`. The workflow
 passes the value of the Actions Variable `TFB_PF_RESEARCH_VIEW_EXPECT`.
 Since readback 1.2.2 (2026-10-15) both the workflow fallback and the CLI
-default are `enforce`, in lockstep with portfolio_actions 1.17.0. With `off`
+default are `enforce`, in lockstep with portfolio_actions 1.17.0 (1.17.2 since
+the 2026-10-28 renumber). With `off`
 the probe is unchanged, and an enforce page fails with `uncertified portfolio
 amount was published: holdings_value_sar`.
 Under a declared `enforce` every money, execution, weight, sector, cash KPI
@@ -325,7 +328,8 @@ Arming order (historical, 1.16.0): set `observe` on Render first (the
 unchanged readback stays green). Set `enforce` only after readback 1.2.0 is on
 main, and set `TFB_PF_RESEARCH_VIEW_EXPECT` to the same word at the same time.
 
-Rollback (1.17.0 and later): set `TFB_PF_RESEARCH_VIEW=off` on Render AND the
+Rollback (1.17.0 and later; 1.17.2 since the 2026-10-28 renumber): set
+`TFB_PF_RESEARCH_VIEW=off` on Render AND the
 Actions Variable `TFB_PF_RESEARCH_VIEW_EXPECT=off` together. Unsetting either
 one leaves it at the `enforce` default.
 

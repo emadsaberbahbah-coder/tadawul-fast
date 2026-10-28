@@ -95,7 +95,7 @@ os.environ.setdefault("DEFER_ROUTER_MOUNT", "false")
 os.environ.setdefault("TFB_TEST_SCORE_BUDGET_MS", "200")
 
 # 2026-10-15 (decision-pages launch): the owner armed five defaults in code
-# (opportunity_builder 1.28.0, 1.28.2 since 2026-10-27, portfolio_actions 1.17.0, data_engine_v2
+# (opportunity_builder 1.28.0, 1.28.2 since 2026-10-27, portfolio_actions 1.17.0, 1.17.2 since 2026-10-28, data_engine_v2
 # 5.157.0 since 2026-10-21, 5.158.0 since 2026-10-22, 5.160.0 since the second 2026-10-22
 # merge, daily_sync.yml FW-2 enforce). The batteries written while these
 # were default-off assert that legacy behaviour without naming the variable,

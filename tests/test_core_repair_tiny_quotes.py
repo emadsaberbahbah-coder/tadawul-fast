@@ -25,6 +25,8 @@ OTHER_COMMIT = "f" * 40
 # fallback moved to 5.159.0 and open #818 claims 5.158.0; an in-place pin.
 # 2026-10-24: main moved to 5.157.3 (#821-#829); this build keeps 5.160.0.
 # 2026-10-24 (second merge): main is 5.158.0 (#819); this build keeps 5.160.0.
+# 2026-10-28: data_engine_v2 5.159.1 (#865 EODHD analyst target + its
+# follow-up); the CLI compares this with the source constant, like ROUTE.
 # 2026-10-28: main is 5.159.1 (#865, #867) and the bundle's fallback 5.159.2;
 # this build keeps 5.160.0.
 ENGINE = "5.160.0"
