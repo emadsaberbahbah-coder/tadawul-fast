@@ -292,7 +292,7 @@ def test_off_is_byte_identical_to_v1161_base(rows, monkeypatch):
     for payload in (new, old):
         payload["meta"].pop("generated_utc", None)
     old_text = json.dumps(old, sort_keys=True).replace('"1.16.1"', '"<v>"')
-    # merge note 2026-10-28 (#779): the research-view defaults build is 1.17.1 over
+    # merge note 2026-10-28 (#779): the research-view defaults build is 1.17.2 over
     # this 1.17.0, so the delivered version string is read from the module.
     new_text = json.dumps(new, sort_keys=True).replace('"%s"' % pa.PORTFOLIO_ACTIONS_VERSION, '"<v>"')
     assert new_text == old_text

@@ -226,9 +226,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "1.28.2", "opportunity builder"),
     # 2026-10-28 (#779 merge of the re-merged #778): main pins 1.17.0 (#869, the
     # D1b/D1c ADD guards); this build (research view default enforce, authored
-    # as 1.17.0) is 1.17.1.
+    # as 1.17.0) is 1.17.2, because open #870 claims 1.17.1.
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.17.1", "portfolio actions"),
+     "1.17.2", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",

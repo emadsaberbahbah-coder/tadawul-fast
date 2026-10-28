@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.17.1  (header synced to runtime; history below)
+Version: 1.17.2  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -829,10 +829,10 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   10_My_Portfolio contract); a holding under one share stays blank.
 #   Tests: tests/test_pf_weight_value_complete.py.
 # ---------------------------------------------------------------------------
-# v1.17.1 (2026-10-15) [DECISION-PAGES LAUNCH] - the P0-6 research view is
+# v1.17.2 (2026-10-15) [DECISION-PAGES LAUNCH] - the P0-6 research view is
 #   DEFAULT ENFORCE (owner decision 2026-10-15). Authored as v1.17.0;
 #   renumbered 2026-10-28 after #869 shipped a different v1.17.0 (the D1b/D1c
-#   ADD guards, below, carried unchanged).
+#   ADD guards, below, carried unchanged); 1.17.1 is claimed by open #870.
 # EVIDENCE (Portfolio_Decision export of 2026-10-15 01:00 Riyadh, actions
 #   1.16.0): all 4 holdings render BLOCK "RECONCILIATION_REQUIRED:
 #   missing_evidence" with Price SAR only - MV, cost, P&L, stop and targets
@@ -913,7 +913,7 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   calls, four alerts, two meta blocks). Removed: 0.
 #   Tests: tests/test_pf_add_guards_d1.py. Rollback: both envs unset
 #   (= v1.16.1 output, byte for byte) or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.17.1"
+PORTFOLIO_ACTIONS_VERSION = "1.17.2"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3995,7 +3995,7 @@ RESEARCH_ADD_WITHHELD = ("new-money verdict withheld until fresh positions "
 
 def _env_research_view_mode():
     """v1.16.0 [P0-6]: off | observe | enforce, read at call time (the
-    _env_dd_guard_mode convention). v1.17.1: unset or blank reads enforce;
+    _env_dd_guard_mode convention). v1.17.2: unset or blank reads enforce;
     any other value outside observe/enforce reads off, so a misspelt value
     can never arm the view and an explicit off restores v1.16.0."""
     v = str(os.environ.get("TFB_PF_RESEARCH_VIEW", "")).strip().lower()
