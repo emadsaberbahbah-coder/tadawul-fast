@@ -1152,6 +1152,36 @@ def _build_error_patch_with_geo(
 #       unretrieved Future (red-team T02).
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
+# v4.20.0 WHY (2026-10-28): fundamentals for Bursa Malaysia and Euronext
+# Lisbon rows are requested under codes EODHD rejects. The shared normalizer
+# (core.symbols.normalize.to_eodhd_symbol) keeps '.KL' as is (it has no
+# KL -> KLSE entry) and, because '.LS' is not one of its exchange suffixes,
+# appends the default exchange: EDP.LS -> EDP.LS.US. _canonicalize_eodhd_suffix
+# maps only .L / .XETR / .ETR / .TASE. Evidence: calendar_sync run
+# 40498374271 (27 Oct) logged 'EODHD rejected 33 code(s)', among them the
+# '.KL' codes and the 'X.LS.US' codes; run 40678905106 (28 Oct), with
+# calendar_provider v1.3.2's TFB_CALENDAR_SUFFIX_MAP armed, sent
+# 'KL->KLSE x2, LS.US->LS x3' and none of those codes was rejected. The
+# Yahoo fundamentals breaker has been open since 2026-10-21 (v4.19.0 WHY),
+# so EODHD is the fundamentals source for these rows and they get none. In
+# the 10 Oct Global_Markets fixture 13 of 2,033 rows are .KL or .LS.
+# WHAT: TFB_EODHD_FUND_SUFFIX_MAP = off (default; unset, blank or any other
+# word) | observe | enforce, read per call, fundamentals endpoint only.
+#   off      fetch_fundamentals is byte-identical to v4.19.0: same request
+#            path, cache key, patch and log lines.
+#   observe  the request is unchanged; the first time a code would be
+#            translated in this process, one INFO line names it.
+#   enforce  fundamentals are requested as X.KLSE (for X.KL) and X.LS (for
+#            X.LS.US); the cache key, identity guard and symbol_normalized
+#            follow the requested code; the patch's 'symbol' stays the
+#            row's own. One INFO line per translated code per process.
+# Only the two codes the calendar run proved are mapped. '.IS' stays
+# rejected by EODHD's calendar even as X.IS, and '.T', '.SI', '.MI' and the
+# other venues have no established code here, so they are unchanged.
+# Quotes, history and every other endpoint are unchanged in every mode.
+# Additions (0 removed): _fund_suffix_map_mode, _eodhd_fund_venue_code,
+# _fund_suffix_map, _FUND_SUFFIX_MAP_SEEN. Rollback: unset the variable.
+# =============================================================================
 # v4.19.0 WHY (2026-10-28): the analyst 12M target leg of the engine has
 # depended on Yahoo fundamentals alone. Since 2026-10-21 09:28Z every sync
 # logs "[YF-CB] OPEN reason=info_empty status=429 ... yfinance fundamentals
@@ -1173,7 +1203,7 @@ def _build_error_patch_with_geo(
 # =============================================================================
 # v4.18.5: current-year EPS estimates are not reported trailing earnings.
 # Version the fundamentals cache so an old estimated eps_ttm cannot survive.
-PROVIDER_VERSION = "4.19.0"
+PROVIDER_VERSION = "4.20.0"
 # =============================================================================
 # v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
 # The isolation branch sat inside `if sc in (401, 403)` with broad tokens
@@ -1721,6 +1751,51 @@ def _pct_points_to_frac(v: Any) -> Optional[float]:
     if f is None:
         return None
     return f / 100.0
+
+
+_FUND_SUFFIX_MAP_SEEN: set = set()   # v4.20.0: codes already logged in this process
+
+
+def _fund_suffix_map_mode() -> str:
+    """v4.20.0: TFB_EODHD_FUND_SUFFIX_MAP = off | observe | enforce, read per
+    call (trimmed, any case). Unset, blank or any other word is off."""
+    raw = (os.getenv("TFB_EODHD_FUND_SUFFIX_MAP") or "").strip().lower()
+    return raw if raw in ("observe", "enforce") else "off"
+
+
+def _eodhd_fund_venue_code(sym: str) -> str:
+    """v4.20.0 PURE: the fundamentals code EODHD knows for a
+    normalize_eodhd_symbol code. 'X.KL' -> 'X.KLSE' (Bursa Malaysia) and
+    'X.LS.US' -> 'X.LS' (Euronext Lisbon; the shared normalizer appends the
+    default exchange because it does not list .LS). Anything else comes back
+    unchanged."""
+    parts = (sym or "").split(".")
+    if len(parts) == 2 and parts[0] and parts[1] == "KL":
+        return parts[0] + ".KLSE"
+    if len(parts) == 3 and parts[0] and parts[1] == "LS" and parts[2] == "US":
+        return parts[0] + ".LS"
+    return sym
+
+
+def _fund_suffix_map(sym: str) -> str:
+    """v4.20.0: the code fetch_fundamentals requests. Off returns sym without
+    any other work. Observe returns sym and logs the translation it would
+    make; enforce returns the translated code and logs it. Each translated
+    code is logged once per process (no URL, no key)."""
+    mode = _fund_suffix_map_mode()
+    if mode == "off":
+        return sym
+    mapped = _eodhd_fund_venue_code(sym)
+    if mapped == sym:
+        return sym
+    if (mode, sym) not in _FUND_SUFFIX_MAP_SEEN:
+        _FUND_SUFFIX_MAP_SEEN.add((mode, sym))
+        logger.info(
+            "[eodhd v%s] FUND-SUFFIX-MAP %s: fundamentals for %s %s %s",
+            PROVIDER_VERSION, mode, sym,
+            "requested as" if mode == "enforce" else "would be requested as", mapped,
+        )
+    return mapped if mode == "enforce" else sym
 
 
 def _eodhd_analyst_target_enabled() -> bool:
@@ -2680,6 +2755,7 @@ class EODHDClient:
         sym = normalize_eodhd_symbol(sym_raw)
         if not sym:
             return {}, "invalid_symbol"
+        sym = _fund_suffix_map(sym)   # v4.20.0: TFB_EODHD_FUND_SUFFIX_MAP, default off
 
         if _KSA_RE.match(sym) and _ksa_blocked_by_default() and not _allow_ksa_override():
             return {}, "ksa_blocked"

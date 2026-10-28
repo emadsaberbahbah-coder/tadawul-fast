@@ -212,7 +212,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.19.0',
+    # 2026-10-28 (daily; pin only): 4.19.0 -> 4.20.0 (TFB_EODHD_FUND_SUFFIX_MAP,
+    # fundamentals codes for .KL / .LS, default off).
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.20.0',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
