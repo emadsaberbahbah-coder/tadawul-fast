@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.16.0  (header synced to runtime; history below)
+Version: 1.17.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -828,7 +828,63 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   in post_trade_weight_pct. The delta stays a signed INTEGER (the
 #   10_My_Portfolio contract); a holding under one share stays blank.
 #   Tests: tests/test_pf_weight_value_complete.py.
-PORTFOLIO_ACTIONS_VERSION = "1.16.1"
+# ---------------------------------------------------------------------------
+# v1.17.0 (2026-10-28) [D1b POST-EARN + D1c TICKET-CAP] TWO ADD GUARDS FROM
+#   THE INTERIM TRADING POLICY (27 Oct), BOTH DEFAULT OFF
+# WHY: weekly review 28 Oct, defect D1. Portfolio_Decision recommended "ADD
+#   48 FRST.US (~2,671 SAR)" five sessions after a -22.2 % EPS miss
+#   (Calendar_Events: reported 2026-10-22) on the only open ticket of a
+#   one-ticket book. P-183 (enforce since 28 Oct) holds that ADD because the
+#   lot is -3.9 % below cost, but nothing holds a PROFITABLE lot inside the
+#   post-earnings window, and nothing knows the policy's "max one open
+#   ticket" (an ADD is a second order ticket). The owner has applied both
+#   rules by hand at every GO/NO-GO since 27 Oct.
+# WHAT: two post-decision seams in _build_verified after P-183 (same seam
+#   pattern; decide_action, sizing, the funding pass and the confirmation
+#   clock are untouched; a held ADD keeps its confirmed state):
+#   (b) _apply_add_post_earn, per row. Inputs: body.post_earnings from
+#       10_My_Portfolio v1.5.17 (Calendar_Events read through the Top-10's
+#       own post-earnings parser, so both pages count the same sessions),
+#       routed by advanced_analysis 4.19.0 as upstream_meta.post_earnings and
+#       popped in _build like the evidence packet, so meta.upstream never
+#       echoes it. An ADD whose holding reported within
+#       TFB_PF_POST_EARN_SESSIONS (5) sessions, or
+#       TFB_PF_POST_EARN_SESSIONS_NEG (10) after a negative EPS surprise,
+#       narrows to HOLD (both lengths 0..14: the longest window the
+#       21-day calendar can prove, review fix). Under enforce, inputs that
+#       are absent, unavailable, stale, invalid or not dated today (Riyadh,
+#       +-1 day) also hold: the window cannot be verified and an ADD is
+#       never urgent. A holding with no report in the inputs passes
+#       (Calendar_Events keeps 21 days; the EODHD calendar does not cover
+#       KSA names - limit).
+#   (c) _apply_ticket_cap, one pass after the per-row loop. Open tickets =
+#       held non-sukuk positions (quantity > 0) in this run. ADDs take the
+#       free slots (TFB_PF_MAX_OPEN_TICKETS, default 1, minus open tickets)
+#       in the funding pass's own order (annual ROI, reliability, symbol);
+#       every other ADD narrows to HOLD. With one ticket open and cap 1, no
+#       ADD passes. A working entry order that has not filled is not counted
+#       (the evidence packet carries positions only - limit).
+#   A sukuk (D-9) is exempt from both and never counts as a ticket.
+# GATES (read at call time; any other value, blank included, = off):
+#   TFB_PF_ADD_POST_EARN         = off (default) | observe | enforce
+#   TFB_PF_MAX_OPEN_TICKETS_MODE = off (default) | observe | enforce
+#   observe -> actions, sizing and KPIs identical to off; one
+#              "[postearn-observe] ..." / "[ticketcap-observe] ..." tag per
+#              ADD row (both render sites), alerts add_post_earn_observe /
+#              add_ticket_cap_observe, meta.post_earn_guard / meta.ticket_cap.
+#   enforce -> ADD -> HOLD "ADD held [POST-EARN]: ... (was ADD: ...)" or
+#              "ADD held [TICKET-CAP]: ... (was ADD: ...)", proceeds 0,
+#              capped_from=ADD; alerts add_post_earn_hold /
+#              add_ticket_cap_hold, both excluded from low_confidence_capped.
+# Functions added: 10 (_env_add_post_earn_mode, _env_post_earn_sessions,
+#   _env_post_earn_sessions_neg, _post_earn_inputs, _post_earn_eval,
+#   _apply_add_post_earn, _env_ticket_cap_mode, _env_ticket_cap,
+#   _ticket_exempt, _apply_ticket_cap). Changed: _build (pops
+#   post_earnings), _build_verified (keyword post_earnings=None, two seam
+#   calls, four alerts, two meta blocks). Removed: 0.
+#   Tests: tests/test_pf_add_guards_d1.py. Rollback: both envs unset
+#   (= v1.16.1 output, byte for byte) or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.17.0"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3475,6 +3531,242 @@ def _apply_add_loser_veto(cand, action, reason, proceeds, capped_from):
     return ACTION_HOLD, new_reason, 0.0, ACTION_ADD
 
 
+# v1.17.0 [D1b POST-EARN]: body.post_earnings contract (10_My_Portfolio
+# v1.5.17). Only "ok" inputs can clear an ADD under enforce.
+_POST_EARN_SCHEMA = "tfb.pd-post-earnings/v1"
+_POST_EARN_MAX_SYMBOLS = 200
+_POST_EARN_STATUSES = ("absent", "unavailable", "stale", "invalid", "ok")
+# Review fix (Codex P2, PR #869): a window is only as long as the inputs can
+# prove. Calendar_Events keeps a Last Earnings Date for 21 calendar days
+# (calendar_sync, TFB_CALENDAR_DAYS_BACK default; the Top-10 reader keeps
+# 31), and a report at most 14 sessions old is at most 20 calendar days old
+# (Mon-Fri or Sun-Thu); a 15-session report can be 23 days old and already
+# gone, which would read as "no report". Both session readers accept 0..14.
+_POST_EARN_MAX_SESSIONS = 14
+
+
+def _env_add_post_earn_mode():
+    """v1.17.0 [D1b]: off | observe | enforce (read at call time). Any other
+    value -> off (byte-identical)."""
+    v = str(os.environ.get("TFB_PF_ADD_POST_EARN", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _env_post_earn_sessions():
+    """v1.17.0 [D1b]: sessions after any report (default 5,
+    0.._POST_EARN_MAX_SESSIONS)."""
+    n = _env_int("TFB_PF_POST_EARN_SESSIONS", 5)
+    return n if 0 <= n <= _POST_EARN_MAX_SESSIONS else 5
+
+
+def _env_post_earn_sessions_neg():
+    """v1.17.0 [D1b]: sessions after a negative EPS surprise (default 10,
+    0.._POST_EARN_MAX_SESSIONS)."""
+    n = _env_int("TFB_PF_POST_EARN_SESSIONS_NEG", 10)
+    return n if 0 <= n <= _POST_EARN_MAX_SESSIONS else 10
+
+
+def _post_earn_inputs(raw, today=None):
+    """v1.17.0 [D1b] PURE: validated body.post_earnings ->
+    {"status", "asof", "updated", "reports", "map": {SYMBOL: {"date",
+    "sessions", "surprise"}}}. status: absent (not supplied) | unavailable |
+    stale (from the producer) | invalid (wrong schema, malformed map, asof
+    not within one day of `today`, a Riyadh date) | ok. Malformed entries
+    are dropped. Never raises."""
+    out = {"status": "absent", "asof": None, "updated": None, "reports": None,
+           "map": {}}
+    if raw is None:
+        return out
+    try:
+        if not isinstance(raw, dict) or raw.get("schema") != _POST_EARN_SCHEMA:
+            out["status"] = "invalid"
+            return out
+        asof = str(raw.get("asof") or "").strip()[:10]
+        out["asof"] = asof or None
+        updated = raw.get("updated")
+        out["updated"] = str(updated)[:32] if updated not in (None, "") else None
+        reports = raw.get("reports")
+        if isinstance(reports, int) and not isinstance(reports, bool) and reports >= 0:
+            out["reports"] = reports
+        status = str(raw.get("status") or "").strip().lower()
+        if status != "ok":
+            out["status"] = status if status in ("unavailable", "stale") else "invalid"
+            return out
+        if today is None:
+            today = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+        try:
+            asof_day = datetime.strptime(asof, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            out["status"] = "invalid"
+            return out
+        if abs((today - asof_day).days) > 1:
+            out["status"] = "invalid"
+            return out
+        entries = raw.get("map")
+        if not isinstance(entries, dict) or len(entries) > _POST_EARN_MAX_SYMBOLS:
+            out["status"] = "invalid"
+            return out
+        clean = {}
+        for sym, e in entries.items():
+            key = str(sym or "").strip().upper()
+            if not key or not isinstance(e, dict):
+                continue
+            day = str(e.get("date") or "").strip()
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+            except (TypeError, ValueError):
+                continue
+            sessions = e.get("sessions")
+            if (isinstance(sessions, bool) or not isinstance(sessions, (int, float))
+                    or not math.isfinite(sessions) or sessions < 0
+                    or int(sessions) != sessions):
+                continue
+            sur = e.get("surprise")
+            if (isinstance(sur, bool) or not isinstance(sur, (int, float))
+                    or not math.isfinite(sur)):
+                sur = None
+            clean[key] = {"date": day, "sessions": int(sessions),
+                          "surprise": float(sur) if sur is not None else None}
+        out["map"] = clean
+        out["status"] = "ok"
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        out = {"status": "invalid", "asof": None, "updated": None,
+               "reports": None, "map": {}}
+    return out
+
+
+def _post_earn_eval(cand, pe, sessions_pos, sessions_neg):
+    """v1.17.0 [D1b] PURE: {"in_window", "limit", "trig"} for one holding.
+    The limit is sessions_neg after a negative EPS surprise, else
+    sessions_pos; a holding absent from the map is outside every window."""
+    out = {"in_window": False, "limit": None, "trig": ""}
+    try:
+        sym = str((cand or {}).get("symbol") or "").strip().upper()
+        e = ((pe or {}).get("map") or {}).get(sym)
+        if not e:
+            return out
+        neg = e["surprise"] is not None and e["surprise"] < 0
+        lim = int(sessions_neg if neg else sessions_pos)
+        out["limit"] = lim
+        out["in_window"] = 0 <= e["sessions"] <= lim
+        eps = "n/a" if e["surprise"] is None else "%+.1f%%" % e["surprise"]
+        if e["sessions"] == 0:
+            # Review fix (PR #869): a report dated today (before or after
+            # the release) is the report day itself.
+            out["trig"] = ("report day %s (0/%d sessions, EPS %s)"
+                           % (e["date"], lim, eps))
+        else:
+            out["trig"] = ("reported %s, %d/%d sessions since the report (EPS %s)"
+                           % (e["date"], e["sessions"], lim, eps))
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        out = {"in_window": False, "limit": None, "trig": ""}
+    return out
+
+
+def _apply_add_post_earn(cand, action, reason, proceeds, capped_from, pe):
+    """v1.17.0 [D1b POST-EARN] - seam pattern (decide_action stays
+    byte-identical). off -> pass-through; only an ADD is examined; a sukuk
+    is exempt (D-9). observe -> tag only; enforce -> ADD narrows to HOLD with
+    capped_from=ADD and zero proceeds when the holding is inside its window
+    or the inputs cannot verify it. Returns (action, reason, proceeds,
+    capped_from)."""
+    mode = _env_add_post_earn_mode()
+    if mode == "off" or action != ACTION_ADD:
+        return action, reason, proceeds, capped_from
+    if _protect_sukuk_enabled() and _is_sukuk_holding(cand):
+        return action, reason, proceeds, capped_from
+    pe = pe or {}
+    status = pe.get("status") if pe.get("status") in _POST_EARN_STATUSES else "invalid"
+    if status != "ok":
+        trig = "earnings calendar %s" % status
+        if mode == "observe":
+            tag = " | [postearn-observe] %s - would HOLD under enforce" % trig
+            return action, (reason or "") + tag, proceeds, capped_from
+        new_reason = ("ADD held [POST-EARN]: %s - the post-earnings window "
+                      "cannot be verified (was ADD: %s)" % (trig, reason or ""))
+        return ACTION_HOLD, new_reason, 0.0, ACTION_ADD
+    ev = _post_earn_eval(cand, pe, _env_post_earn_sessions(),
+                         _env_post_earn_sessions_neg())
+    if not ev["in_window"]:
+        if mode == "observe":
+            return action, (reason or "") + " | [postearn-observe] ok", proceeds, capped_from
+        return action, reason, proceeds, capped_from
+    if mode == "observe":
+        tag = " | [postearn-observe] %s - would HOLD under enforce" % ev["trig"]
+        return action, (reason or "") + tag, proceeds, capped_from
+    new_reason = ("ADD held [POST-EARN]: %s - no adding inside the "
+                  "post-earnings window (was ADD: %s)" % (ev["trig"], reason or ""))
+    return ACTION_HOLD, new_reason, 0.0, ACTION_ADD
+
+
+def _env_ticket_cap_mode():
+    """v1.17.0 [D1c]: off | observe | enforce (read at call time). Any other
+    value -> off (byte-identical)."""
+    v = str(os.environ.get("TFB_PF_MAX_OPEN_TICKETS_MODE", "")).strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _env_ticket_cap():
+    """v1.17.0 [D1c]: open-ticket cap, an integer 1..100 (default 1; any
+    other value -> 1, the interim policy)."""
+    n = _env_int("TFB_PF_MAX_OPEN_TICKETS", 1)
+    return n if 1 <= n <= 100 else 1
+
+
+def _ticket_exempt(cand):
+    """v1.17.0 [D1c]: a sukuk (D-9) is income, not a ticket."""
+    return _protect_sukuk_enabled() and _is_sukuk_holding(cand)
+
+
+def _apply_ticket_cap(entries):
+    """v1.17.0 [D1c TICKET-CAP] - one pass over the decided rows, before the
+    funding pass. off -> None and nothing touched. Open tickets = held
+    non-sukuk positions (quantity > 0); ADDs take the free slots in the
+    funding order; the rest are tagged (observe) or narrowed to HOLD with
+    capped_from=ADD and zero proceeds (enforce). Returns the meta block."""
+    mode = _env_ticket_cap_mode()
+    if mode == "off":
+        return None
+    cap = _env_ticket_cap()
+    open_n = sum(1 for e in entries
+                 if _pos_float(e["cand"].get("quantity")) is not None
+                 and not _ticket_exempt(e["cand"]))
+    slots = max(0, cap - open_n)
+    adds = [e for e in entries
+            if e["action"] == ACTION_ADD and not _ticket_exempt(e["cand"])]
+    adds.sort(key=lambda e: (-(e["cand"].get("ann_roi_pct") or 0.0),
+                             -(e["cand"].get("reliability") or 0.0),
+                             e["cand"].get("symbol") or ""))
+    held = would = 0
+    for i, e in enumerate(adds):
+        if i < slots:
+            if mode == "observe":
+                e["action_reason"] = ((e["action_reason"] or "") +
+                                      " | [ticketcap-observe] ok (%d open, cap %d)"
+                                      % (open_n, cap))
+            continue
+        if open_n >= cap:
+            trig = "%d open ticket%s at the cap of %d" % (
+                open_n, "" if open_n == 1 else "s", cap)
+        else:
+            trig = "%d open ticket%s and %d higher-ranked ADD%s fill the cap of %d" % (
+                open_n, "" if open_n == 1 else "s", slots, "" if slots == 1 else "s", cap)
+        if mode == "observe":
+            e["action_reason"] = ((e["action_reason"] or "") +
+                                  " | [ticketcap-observe] %s - would HOLD under enforce"
+                                  % trig)
+            would += 1
+            continue
+        e["action_reason"] = ("ADD held [TICKET-CAP]: %s - no new ticket until one "
+                              "closes (was ADD: %s)" % (trig, e["action_reason"] or ""))
+        e["action"] = ACTION_HOLD
+        e["proceeds_sar"] = 0.0
+        e["capped_from"] = ACTION_ADD
+        held += 1
+    return {"mode": mode, "cap": cap, "open_tickets": open_n, "slots": slots,
+            "held": held, "would_hold": would}
+
+
 def _action_row(entry, review_date, controls):
     cand = entry["cand"]
     fx = cand.get("fx_to_sar")
@@ -3869,6 +4161,8 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
 def _build(rows, ctl, fx_rates, upstream_meta):
     upstream = dict(upstream_meta) if isinstance(upstream_meta, dict) else {}
     evidence = upstream.pop("reconciliation_evidence", None)
+    # v1.17.0 [D1b]: private guard inputs, never echoed in meta.upstream.
+    post_earnings = upstream.pop("post_earnings", None)
     certification = certify_portfolio_inputs(rows, evidence, fx_rates)
     if upstream.get("holdings_input_incomplete") or (ctl["max_holdings"] and len(rows) > ctl["max_holdings"]):
         certification["funding_eligible"] = False
@@ -3923,7 +4217,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     effective = dict(ctl)
     effective["cash_available_sar"] = certification["certified_cash_available_sar"]
     effective["rebalance_mode"] = REBALANCE_NEW_CASH
-    result = _build_verified(rows, effective, fx_rates, upstream)
+    result = _build_verified(rows, effective, fx_rates, upstream,
+                             post_earnings=post_earnings)
     result["meta"].update({"execution_ready": True, "input_certification": certification_summary(certification),
                           "funding_basis": "settled_cash_after_reservations",
                           "requested_rebalance_mode": ctl["rebalance_mode"]})
@@ -3932,7 +4227,7 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     return result
 
 
-def _build_verified(rows, ctl, fx_rates, upstream_meta):
+def _build_verified(rows, ctl, fx_rates, upstream_meta, post_earnings=None):
     if ctl["max_holdings"] and len(rows) > ctl["max_holdings"]:
         rows = rows[:ctl["max_holdings"]]
     cash = ctl["cash_available_sar"] or 0.0
@@ -3976,6 +4271,9 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
         sector_excess[sec] = max(0.0, val - cap_val)
 
     # Pass 2 — actions
+    # v1.17.0 [D1b]: guard inputs validated once per run; off reads nothing.
+    _pe_mode = _env_add_post_earn_mode()
+    _pe = _post_earn_inputs(post_earnings) if _pe_mode != "off" else None
     entries = []
     for c in cands:
         mv = c["market_value_sar"]
@@ -4011,6 +4309,11 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
         # pure pass-through (harness L2 byte-identical proof).
         action, reason, proceeds, capped_from = _apply_add_loser_veto(
             c, action, reason, proceeds, capped_from)
+        # v1.17.0 [D1b POST-EARN]: same seam pattern; off is a pure
+        # pass-through (harness D1 byte-identical proof).
+        if _pe_mode != "off":
+            action, reason, proceeds, capped_from = _apply_add_post_earn(
+                c, action, reason, proceeds, capped_from, _pe)
         # v1.12.0 [F-1a]: observe-mode basis evidence — same seam pattern;
         # legacy/plan3m are pure pass-throughs (harness F1 proof).
         reason = _apply_f1_observe_tag(c, reason, ctl)
@@ -4026,6 +4329,10 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
             "suggested_delta_sar": None, "suggested_delta_shares": None,
             "funds_from": None, "_sector_room_sar": sec_room,
         })
+
+    # v1.17.0 [D1c TICKET-CAP]: after every per-row seam, before funding;
+    # off returns None and touches nothing.
+    _ticket_meta = _apply_ticket_cap(entries)
 
     # v1.0.2: a cost-basis BLOCK rejects the basis as untrusted — null its
     # cost / P&L so neither the row (_action_row) nor the portfolio KPIs
@@ -4226,6 +4533,30 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
            sum(1 for e in entries if "[addveto-observe]" in _rl(e)
                and "would hold" in _rl(e)),
            "Observe only - this ADD would be vetoed under enforce")
+    # v1.17.0 [D1b/D1c]: held ADDs carry capped_from=ADD; counted ONCE here
+    # and excluded from low_confidence_capped. Off -> zero rows -> nothing
+    # appended (the helper skips count 0), so alerts stay byte-identical.
+    _alert("add_post_earn_hold",
+           sum(1 for e in entries if e.get("capped_from")
+               and "add held [post-earn]" in _rl(e)),
+           "ADD narrowed to HOLD - inside the post-earnings window (5 "
+           "sessions, 10 after an EPS miss) or the earnings calendar could "
+           "not verify it (interim trading policy)")
+    _alert("add_post_earn_observe",
+           sum(1 for e in entries if "[postearn-observe]" in _rl(e)
+               and "would hold" in _rl(e)),
+           "Observe only - this ADD would be held under enforce "
+           "(post-earnings window)")
+    _alert("add_ticket_cap_hold",
+           sum(1 for e in entries if e.get("capped_from")
+               and "add held [ticket-cap]" in _rl(e)),
+           "ADD narrowed to HOLD - the open-ticket cap is reached (interim "
+           "trading policy: max one open ticket)")
+    _alert("add_ticket_cap_observe",
+           sum(1 for e in entries if "[ticketcap-observe]" in _rl(e)
+               and "would hold" in _rl(e)),
+           "Observe only - this ADD would be held under enforce "
+           "(open-ticket cap)")
     _alert("low_confidence_capped",
            sum(1 for e in entries
                if e.get("capped_from") and
@@ -4235,7 +4566,9 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
                and "precedence" not in _rl(e)
                and "engine state" not in _rl(e)
                and "synthetic" not in _rl(e)
-               and "add vetoed [p-183]" not in _rl(e)),  # v1.14.0 [P-183]
+               and "add vetoed [p-183]" not in _rl(e)   # v1.14.0 [P-183]
+               and "add held [post-earn]" not in _rl(e)     # v1.17.0 [D1b]
+               and "add held [ticket-cap]" not in _rl(e)),  # v1.17.0 [D1c]
            "Improve data reliability; actions were capped to HOLD")
     _alert("portfolio_value_incomplete", 1 if _pv_incomplete else 0,  # F3
            "A held position has no resolvable market value — weights, "
@@ -4312,6 +4645,26 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta):
                                   and "would hold" in
                                   str(e.get("action_reason") or "").lower()),
                }} if _env_add_loser_veto_mode() != "off" else {}),
+            **({"post_earn_guard": {                               # v1.17.0
+                "mode": _pe_mode,
+                "sessions": _env_post_earn_sessions(),
+                "sessions_neg": _env_post_earn_sessions_neg(),
+                "input_status": _pe["status"],
+                "asof": _pe["asof"],
+                "calendar_updated": _pe["updated"],
+                "calendar_reports": _pe["reports"],
+                "holdings_with_report": len(_pe["map"]),
+                "held": sum(1 for e in entries if e.get("capped_from")
+                            and "add held [post-earn]" in
+                            str(e.get("action_reason") or "").lower()),
+                "would_hold": sum(1 for e in entries
+                                  if "[postearn-observe]" in
+                                  str(e.get("action_reason") or "").lower()
+                                  and "would hold" in
+                                  str(e.get("action_reason") or "").lower()),
+               }} if _pe is not None else {}),
+            **({"ticket_cap": _ticket_meta}                         # v1.17.0
+               if _ticket_meta is not None else {}),
             "controls_snapshot": ctl,
             "cash_floor_sar": _round(cash_floor, 0),
             "fx": {"provided": sorted(fx_rates.keys()),

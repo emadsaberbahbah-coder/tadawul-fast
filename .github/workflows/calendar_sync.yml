@@ -21,6 +21,16 @@
 #       this job only; the Render flag stays unset (no backend caller exists).
 # NOTE: this workflow WRITES exactly one tab (Calendar_Events) and reads two
 #       pages. It never touches universe pages, cockpits, or the sync.
+# 2026-10-27: arms calendar_provider v1.3.1 TFB_CALENDAR_SPLIT_404 - EODHD
+#       answers 404 for a WHOLE /calendar/earnings batch when one code is
+#       unknown (run 40489000970 kept 3 of 327 last reports; the 31-symbol
+#       forward batch failed on 26 and 27 Oct). The split keeps every code
+#       EODHD accepts and names the rejected ones in one WARNING line.
+# 2026-10-27: arms calendar_provider v1.3.2 TFB_CALENDAR_VENUE_BATCHES and
+#       TFB_CALENDAR_SUFFIX_MAP - run 40498374271 spent the 200-request cap
+#       on splitting mixed-venue batches and never asked for 42 codes (27 US
+#       names TAK..ZTO). Batches are now one venue each, US first, and the
+#       calendar is asked with EODHD's codes for '.L' / '.KL' / '.IS' / '.LS'.
 # =============================================================================
 name: 📅 Calendar Sync
 
@@ -94,6 +104,18 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           TFB_CALENDAR_ENABLED: "1"
+          # 2026-10-27 (A4): run_calendar_sync v1.2.0 last-report columns;
+          # default off = the v1.1.4 seven-column table. Arm with the repo
+          # Variable TFB_CAL_LAST_REPORT=on.
+          TFB_CAL_LAST_REPORT: ${{ vars.TFB_CAL_LAST_REPORT || 'off' }}
+          # 2026-10-27: calendar_provider v1.3.1 - split a 404 earnings batch
+          # (default off in the module; armed here). Kill: "off".
+          TFB_CALENDAR_SPLIT_404: "on"
+          # 2026-10-27: calendar_provider v1.3.2 - one venue per batch, US
+          # first; EODHD exchange codes for .L/.KL/.IS/.LS (default off in
+          # the module; armed here). Kill: "off" (each independently).
+          TFB_CALENDAR_VENUE_BATCHES: "on"
+          TFB_CALENDAR_SUFFIX_MAP: "on"
         run: |
           if [[ -z "${EODHD_API_KEY:-}" ]]; then
             echo "::error::EODHD_API_KEY secret not set (add the rotated token in repo Settings → Secrets)."

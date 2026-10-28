@@ -2,8 +2,170 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.157.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.1
 ================================================================================
+
+WHY v5.159.1 - THE FUND-CACHE HIT GATE ALSO RUNS ON THE 12M FORECAST
+(TFB_EODHD_ANALYST_TARGET unchanged; off = byte-identical to v5.158.0)
+- Codex review on #865 (P2): with TFB_EODHD_ANALYST_TARGET=1,
+  TFB_EODHD_FUND_CACHE=enforce and the supported TFB_TARGET_MEAN_PUBLISH=0,
+  the v5.159.0 capture stores forecast_price_12m / forecast_source without
+  target_mean_price (Fix AI never publishes it), and the hit gate was
+  entered only on target_mean_price: a 125 target captured at price 100
+  and replayed at 20 landed as provider_target, unjudged. Production runs
+  with the publish switch on (default), so the path was not live.
+- _fill_carries_eodhd_target(fill): forecast_price_12m OR target_mean_price.
+  The hit gate is entered on it and judges forecast_price_12m first; the
+  ":nt" suffix is omitted on the same test. One helper added, two
+  conditions changed; nothing else moved.
+
+WHY v5.159.0 - EODHD ANALYST TARGET THROUGH THE FALLBACK AND THE FUND CACHE
+(TFB_EODHD_ANALYST_TARGET, the eodhd_provider v4.19.0 flag; default off =
+every row, snapshot and tag byte-identical to v5.158.0)
+- EVIDENCE: since 2026-10-21 09:28Z every sync logs "[YF-CB v6.9.1] OPEN
+  reason=info_empty status=429 ... yfinance fundamentals suspended for
+  cooldown; EODHD fallback carries fundamentals" (100+ events on 23 Oct,
+  dozens per sync since). The fallback carried ratios and margins but no
+  target, so Phase-II restored the last known target (analyst_lkg:<age>h)
+  and the opportunity builder held the row ("Held target - no new money",
+  TFB_OPP_HELD_TARGET_NO_NEW_MONEY=1). On 28 Oct 23 of 31 board candidates
+  were held that way.
+- eodhd_provider v4.19.0 adds target_mean_price (AnalystRatings.TargetPrice,
+  else Highlights.WallStreetTargetPrice) and analyst_count to the
+  fundamentals patch when armed. This engine change is the seam:
+  1. _apply_eodhd_fundamentals_fallback: a patch that carries
+     target_mean_price is canonicalized with the row's known price injected
+     into a COPY (the v5.77.19 Fix 1 case: the patch has no price, so the
+     v5.77.18 gate would fail open), the gate's drop tags are carried back
+     (Fix 2), and a 12M leg that lands is tagged analyst_consensus_eodhd
+     (substring-safe). A patch without the key takes the v5.158.0 path.
+  2. _fund_lkg_capture: with the flag on, a row whose 12M target came from
+     EODHD on this pass (tag present, source provider_target) also stores
+     target_mean_price / forecast_price_12m / forecast_source in its
+     snapshot. The P-154c fund cache (enforce live, TTL 24 h) asks EODHD
+     once per symbol per day; the other two syncs are hits, and without
+     this the hit forgoes the target (":nt"), Phase-II restores analyst_lkg
+     and the row is held again. The AZ-2 restore filters to
+     _FUND_LKG_FIELDS and never sees these keys.
+  3. A fund-cache hit whose fill carries the target judges it against the
+     row's price of the day (same gate; refused: provider_target_
+     implausible_dropped_12m, accepted: analyst_consensus_eodhd); the
+     ":nt" suffix is omitted when the fill carries the target.
+- Rollback: unset the flag (= off) or revert; nothing else moved.
+
+WHY v5.158.0 - F-7 v2b: SETTLE RE-DERIVES THE SCORER'S OWN CONFIDENCE UNDER
+ENFORCE; OBSERVE PUBLISHES v5.157.0 AND SHOWS THE v2 RESULT IN ITS TAG
+(TFB_SCORING_SETTLE and TFB_SCORING_SETTLE_PAGES unchanged; core.scoring
+untouched at 5.11.4. Off: every row byte-identical to v5.157.0. Observe and
+enforce out of scope: every published field identical to v5.157.0 observe
+except the f7_settle tag. Enforce in scope: the v2 trajectory below.)
+- EVIDENCE: G1 (deferred in v5.157.0). core.scoring.compute_confidence_score
+  REUSES any existing confidence; a cold pass 1 (target restored inside
+  Phase-II, 3M forecast fields absent when it was scored) derives 0.6323
+  where the warm row derives 0.6641, and every settle pass reuses it. On the
+  22 Oct export soft-capped cold rows sit at reliability 54.3 and would be
+  69.3 under v5.157.0 enforce vs 71.5 warm - straddling the board's Min
+  Reliability 70 (3 of the 13 board names: WDP.BR, EPRT.US, NBIX.US; about
+  577 GM rows at 54.3), a churn driver base enforce keeps. Putting the
+  re-derivation into the published trajectory (87e4e52 / 76ea51d) changed
+  which rows observe holds back, so observe now stays on the v1 trajectory.
+- [F7-CONF-RECOMPUTE] provenance markers, never published: on a
+  non-settlement call while TFB_SCORING_SETTLE != off,
+  _compute_scores_canonical_first marks a row whose confidence core.scoring
+  DERIVED: _f7_conf_derived - also when the derivation produced no value (a
+  sparse priced row: Phase-II then writes an engine-made synthetic
+  confidence; Codex review on #819). "Derived" is decided exactly as
+  compute_confidence_score decides it, with core.scoring's own _get /
+  _safe_float - the first of forecast_confidence / ai_confidence /
+  confidence_score / confidence that is not None must parse as a number to be
+  reused, so a blank or invalid earlier alias means derived even when a later
+  one is populated (Codex review on #818). Phase-II's synthetic writer, which
+  then OWNS the confidence it writes, turns that marker into
+  _f7_conf_synthetic. A reused (input) confidence makes no marker.
+  _f7_settle_result(row, v2=True) prepares each marked iterate before its
+  re-score (_f7_conf_v2_iterate): derived -> forecast_confidence,
+  confidence_score and confidence_bucket set to None (the scorer re-derives
+  the confidence from the completed row = warm); synthetic -> ONLY
+  forecast_confidence set to None (the scorer reuses Phase-II's
+  confidence_score - equal to Phase-II's confidence at 4 dp on all 15,505
+  synthetic iterates of the sweep - and _completeness_factor no longer counts
+  an engine-made confidence as data). An input alias the scorer never writes
+  (ai_confidence, confidence) that would otherwise be reused on that re-score
+  (only possible when an earlier alias blocked it on pass 1) is hidden for the
+  re-score and restored right after it. v2=False is exactly the v5.157.0
+  trajectory, and an unmarked row's v2 trajectory is its v1 trajectory.
+- _f7_settle_pass: off unchanged. Enforce (in scope): ONE v2 result, published
+  exactly as v5.157.0 enforce publishes its result. Observe and enforce out
+  of scope: pub = the v1 result drives EVERYTHING published, exactly as
+  v5.157.0 observe (values, holdback / unresolved handling, scoring_settlement
+  JSON); shadow = the v2 result drives ONLY the f7_settle tag text:
+  st<k>:p<n> + its pass 1 -> final diff when stable, stx:p<n> + its pass 1 ->
+  pass 2 diff when non_converged / error. A row is tagged when v5.157.0 would
+  tag it, when the shadow's final diff is non-empty, or when the shadow is
+  not stable; on a row the v1 result holds back or publishes unresolved the
+  shadow tag follows that handling. Codes, order (ov op os rc va fcf r12 fs)
+  and the 8-field limit unchanged. An unmarked row's shadow is its v1 result.
+- SHADOW FAULT: if only the v2 shadow run raises (the v1 result did not),
+  the published row is still v5.157.0's and the tag is
+  f7_settle:observe:sterr:p<n> (no disclosures) with one WARNING naming the
+  symbol and exception class - never stx, so stx counts only rows enforce
+  would hold back.
+- OBSERVE TAGS NOW SHOW v2 ENFORCE: pass 1 -> what enforce would publish,
+  including stx tags for rows enforce would hold back (f7_settle:observe:stx
+  can now follow an f7_settle_failed receipt). DQ-37 ov= / rc= deltas and tag
+  counts read pass 1 -> v2 final.
+- COST: observe settles every marked row twice. Measured on the 1,736 sweep
+  cases at MAX_PASSES 4 (settle pass only): 2.58 -> 4.74 ms/row mean (marked
+  4.84, unmarked 3.00); enforce 2.47.
+- MEASURED vs v5.157.0 (review harness, 1,736 cases at MAX_PASSES 3, 4 and
+  5): observe, observe in / out of scope and enforce out of scope publish
+  every field except the f7_settle tag identically on all 1,736 at each
+  setting, including the synthetic cases whose v2 status differs (MAX_PASSES
+  3: 14 rows v1 settles and v2 holds back, 8 the reverse); the v1 trajectory
+  is identical; off is byte-identical incl. the scorer labels; no marker is
+  published. Shadow status = enforce status on every case and every stable
+  shadow tag's after-values = what enforce publishes. v1 -> v2 at MAX_PASSES
+  4: convergence status unchanged on all 868 provider and 775 synthetic cases
+  (pass counts move: provider 140 st3 -> st2; synthetic 25 st3 -> st2, 14
+  st3 -> st4, 8 st4 -> st3). v2 enforce moves the recommendation vs pass 1 on
+  317 of 1,736 (v5.157.0 enforce: 316) and differs from v5.157.0 enforce on
+  36. Review-driven variants (124 blank-alias inputs, 93 sparse priced rows
+  whose confidence the scorer cannot derive and Phase-II then writes): the
+  same observe identity on all of them; at MAX_PASSES 4 one sparse row v1
+  settles does not converge under v2 (enforce would hold it back, observe
+  tags it stx).
+- ENFORCE vs v5.157.0 enforce: cold provider twins settle to the warm
+  confidence and reliability (recalibrated gate; SUBC.OL 74.3 -> 76.5 with
+  its real target, 69.3 -> 71.5 soft-capped; FCN.US 73.1 -> 75.4, 68.1 ->
+  70.4); quality_score -1.02 on marked rows (completeness no longer counts
+  the engine's own confidence - the pass-1 basis; six F-7 fixtures, e.g.
+  BNY.US 60.02 -> 59.00, overall 47.72 -> 47.52, no recommendation change);
+  synthetic and provider twins of the same data settle to the same quality
+  (BRK-B.US, SKG.L).
+- RESIDUAL (as v5.157.0): a snapshot-served or re-settled row brings its
+  prior confidence as input, so no marker is made and it settles on the v1
+  trajectory, counting that confidence as data.
+- Functions added 6 (_f7_conf_scorer_derives, _f7_conf_marked,
+  _f7_conf_marker_strip, _f7_conf_v2_iterate, _f7_shadow_raised,
+  _f7_shadow_tag); changed:
+  _f7_settle_result (+ v2), _f7_settle_pass, _compute_scores_canonical_first,
+  _compute_scores_fallback, _phase_ii_quality_forecast; constants added 6;
+  core.scoring's _get / _safe_float imported (read-only); removed 0. Tests:
+  tests/test_de_f7_settle_shadow.py. Rollback: keep TFB_SCORING_SETTLE at
+  observe (published values = v5.157.0) or off, or git revert. Enforce is
+  NOT armed by this change.
+
+WHY v5.157.3 - CONFIGURED SUKUK INDUSTRY FALLBACK (2026-10-24)
+The Saudi-listing fallback labelled configured sukuk as Listed Equities even
+after the existing fixed-income classifier set their asset class. Use the
+same fixed-income policy for that generic fallback, preserving any specific
+provider industry, financial values, recommendation and gate behavior.
+Tests: tests/test_sukuk_industry_classification.py.
+
+WHY v5.157.1 - RECLAIM EXPIRED CACHE PAYLOADS (2026-10-23)
+Sweep expired entries during cache traffic under the existing async lock.
+Live-entry TTLs, values, scoring and publication gates are unchanged.
+Tests: tests/test_engine_cache_expiry.py.
 
 WHY v5.157.0 - F-7 v2: FINAL-PASS TAG AND ENFORCE SCOPE BY INFERRED MARKET
 (TFB_SCORING_SETTLE unchanged, new TFB_SCORING_SETTLE_PAGES; core.scoring
@@ -4282,9 +4444,17 @@ from core.financial_units import (
 #   inferred market page on every surface. [F7-CONF-RECOMPUTE] deferred: the
 #   settle trajectory, status and published values are v5.156.0's; off is
 #   byte-identical. Tests: tests/test_de_f7_settle_v2.py.
-__version__ = "5.157.0"
+# v5.158.0 (2026-10-22): F-7 v2b (see WHY v5.158.0). [F7-CONF-RECOMPUTE]
+#   enforce settles on the v2 trajectory (the scorer's own pass-1 confidence
+#   is re-derived; Phase-II's synthetic confidence is kept but not counted in
+#   completeness; core.scoring unchanged); observe publishes exactly what
+#   v5.157.0 publishes and its f7_settle tag shows the v2 result (stx when
+#   enforce would hold the row back). Off is byte-identical.
+#   Tests: tests/test_de_f7_settle_shadow.py.
+__version__ = "5.159.1"
 
 from core.sheet_presentation import present_instrument_row
+from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
 from core.price_precision import (
     price_precision_enabled as _price_precision_enabled,
     price_round_half_quantum as _price_round_half_quantum,
@@ -4522,6 +4692,17 @@ except Exception:  # pragma: no cover
         "REDUCE", "SELL", "STRONG_SELL", "AVOID",
     )
     _CORE_SCORING_AVAILABLE = False
+
+# v5.158.0 [F7-CONF-RECOMPUTE] (Codex review on #818): the confidence-provenance
+# predicate uses core.scoring's OWN alias precedence (_get: the first key whose
+# value is not None) and numeric parser (_safe_float), so it can never disagree
+# with compute_confidence_score. Unavailable -> no canonical scorer, nothing is
+# marked.
+try:
+    from core.scoring import _get as _scoring_conf_get, _safe_float as _scoring_conf_float
+except Exception:  # pragma: no cover
+    _scoring_conf_get = None  # type: ignore
+    _scoring_conf_float = None  # type: ignore
 
 # v5.76.0: 8-tier canonical recommendation vocabulary. Mirror of the
 # RECOMMENDATION_ENUM tuple exported by core.scoring v5.7.0+ and the
@@ -4895,6 +5076,50 @@ def _eodhd_fundamentals_fallback_enabled() -> bool:
     if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
         return False
     return True
+
+
+_EODHD_ANALYST_TAG: str = "analyst_consensus_eodhd"
+_EODHD_ANALYST_SNAPSHOT_FIELDS: Tuple[str, ...] = (
+    "target_mean_price", "forecast_price_12m", "forecast_source",
+)
+
+
+def _eodhd_analyst_target_enabled() -> bool:
+    """v5.159.0: TFB_EODHD_ANALYST_TARGET=1 (the eodhd_provider v4.19.0 flag,
+    read here with the same spelling) lets the fund-LKG snapshot carry the
+    analyst target the EODHD fallback delivered, so a fund-cache hit fills it
+    too. Default off: the snapshot and the hit fill are byte-identical to
+    v5.158.0."""
+    raw = (os.getenv("TFB_EODHD_ANALYST_TARGET") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+
+
+def _row_has_eodhd_analyst_tag(row: Mapping[str, Any]) -> bool:
+    """True when the row's warnings carry the v5.159.0 provenance tag."""
+    try:
+        raw = row.get("warnings") if isinstance(row, Mapping) else None
+        if isinstance(raw, str):
+            return _EODHD_ANALYST_TAG in raw
+        if isinstance(raw, (list, tuple, set)):
+            return any(_EODHD_ANALYST_TAG in _safe_str(p) for p in raw)
+        return False
+    except Exception:
+        return False
+
+
+def _fill_carries_eodhd_target(fill: Any) -> bool:
+    """v5.159.1: True when a fund-cache fill carries a 12M analyst-target
+    value of the v5.159.0 snapshot block: forecast_price_12m OR
+    target_mean_price. With TFB_TARGET_MEAN_PUBLISH=0 the block is captured
+    without target_mean_price, so the 12M forecast alone must count (Codex
+    review on #865). Off, the lookup strips the block: always False."""
+    try:
+        if not isinstance(fill, Mapping):
+            return False
+        return _as_float(fill.get("forecast_price_12m")) is not None \
+            or _as_float(fill.get("target_mean_price")) is not None
+    except Exception:
+        return False
 
 
 def _yahoo_enrich_on_missing_industry() -> bool:
@@ -5618,6 +5843,7 @@ def _intrinsic_display_source_signature(row: Mapping[str, Any]) -> str:
         # the start; a later policy change invalidates an old equity receipt.
         if _sukuk_classification_enabled() and _row_is_fixed_income(row):
             values["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+            values["industry"] = _fixed_income_industry(row.get("industry"))
         encoded = json.dumps(values,
                              sort_keys=True, allow_nan=False, separators=(",", ":"))
         return hashlib.sha256(encoded.encode()).hexdigest()
@@ -6031,6 +6257,13 @@ def _sukuk_classification_enabled() -> bool:
 _FIXED_INCOME_ASSET_CLASS = "Fixed Income / Sukuk"
 
 
+def _fixed_income_industry(industry: Any) -> Any:
+    """Replace only our generic equity fallback; retain provider detail."""
+    if not industry or _safe_str(industry).strip().lower() == "listed equities":
+        return _FIXED_INCOME_ASSET_CLASS
+    return industry
+
+
 def _fixed_income_symbols() -> frozenset:
     """Symbols treated as fixed income / sukuk. Read from TFB_FIXED_INCOME_SYMBOLS
     (comma-separated), defaulting to the Cenomi Centers Sukuk (5023.SR) -- the
@@ -6217,7 +6450,6 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
             logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
                            "row_sanity=%d errors=%d",
                            _tag, sheet, _n1, _n2, _n3, _n4, _err)
-        return rows
     except Exception as _exc:
         # v5.129.1: keep the probe's finer "incompatible" verdict — the
         # generic error label only for genuine import/apply failures.
@@ -6230,7 +6462,10 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
         else:
             logger.warning("[SURFACE-INV] pass skipped on %s: %s",
                            sheet, _exc)
-        return rows
+    # Mandatory exact-security protection is independent of the optional
+    # surface invariant's fail-open policy. All three final surfaces pass here.
+    from core.reviewed_instrument_classes import apply_reviewed_instrument_rows
+    return apply_reviewed_instrument_rows(_canonicalize_sheet_name(sheet), rows)[0]
 
 
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
@@ -8712,6 +8947,7 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     # Env-toggleable via TFB_ENGINE_SUKUK_CLASS (default ON).
     if _sukuk_classification_enabled() and _row_is_fixed_income(row):
         row["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+        row["industry"] = _fixed_income_industry(row.get("industry"))
         row["recommendation"] = "HOLD"
         row["recommendation_detailed"] = "HOLD"
         row["recommendation_source"] = "fixed_income_sukuk"
@@ -9753,6 +9989,23 @@ _F7_MARKET_PAGES: Tuple[str, ...] = ("Global_Markets", "Market_Leaders", "Commod
 # v5.157.0 [F7-FINAL-TAG]: tag disclosure order (codes of _F7_SETTLE_FIELDS) and limit.
 _F7_SETTLE_TAG_ORDER: Tuple[str, ...] = ("ov", "op", "os", "rc", "va", "fcf", "r12", "fs")
 _F7_SETTLE_TAG_MAX: int = 8
+# v5.158.0 (F-7 v2b) [F7-CONF-RECOMPUTE] (see WHY v5.158.0): transient
+# provenance of a confidence the canonical scorer DERIVED on pass 1 because the
+# input carried none. Created only while TFB_SCORING_SETTLE != off; read only
+# by the v2 settle trajectory; never published.
+_F7_CONF_DERIVED_KEY: str = "_f7_conf_derived"
+# The derived marker after Phase-II's synthetic writer replaced that
+# confidence with its own (forecast_confidence + confidence_score + bucket).
+_F7_CONF_SYNTH_KEY: str = "_f7_conf_synthetic"
+_F7_CONF_TRANSIENT_KEYS: Tuple[str, ...] = (_F7_CONF_DERIVED_KEY, _F7_CONF_SYNTH_KEY)
+# The keys core.scoring.compute_confidence_score reuses when one carries a value.
+_F7_CONF_READ_KEYS: Tuple[str, ...] = ("forecast_confidence", "ai_confidence", "confidence_score", "confidence")
+# The confidence keys the canonical scorer writes; cleared on a derived-marked
+# (provider) v2 iterate so the scorer re-derives them from the completed row.
+_F7_CONF_SCORER_KEYS: Tuple[str, ...] = ("forecast_confidence", "confidence_score", "confidence_bucket")
+# Read keys the scorer never writes (input aliases): hidden from a v2 iterate's
+# re-score only when they would otherwise be reused, restored right after it.
+_F7_CONF_INPUT_ALIASES: Tuple[str, ...] = ("ai_confidence", "confidence")
 
 
 @dataclass(frozen=True)
@@ -10079,6 +10332,72 @@ def _f7_settle_page_in_scope(page: Any) -> bool:
     return _canonicalize_sheet_name(_safe_str(page).strip()) in pages
 
 
+def _f7_conf_scorer_derives(row: Mapping[str, Any]) -> bool:
+    """v5.158.0 [F7-CONF-RECOMPUTE]: True when core.scoring.compute_confidence_score
+    DERIVES the confidence for this row instead of reusing one. It reads the
+    FIRST of forecast_confidence / ai_confidence / confidence_score / confidence
+    whose value is not None and reuses it only when its own parser gives a
+    number; so no such key, or a first non-None value that does not parse ("",
+    "  ", "abc", "nan", a bool), means derived - even when a LATER alias is
+    populated (forecast_confidence="" with confidence_score=66.41: Codex review
+    on #818). Decided with core.scoring's own _get / _safe_float (compute_scores
+    hands compute_confidence_score these keys unchanged)."""
+    if _scoring_conf_get is None or _scoring_conf_float is None:
+        return False
+    try:
+        return _scoring_conf_float(_scoring_conf_get(row, *_F7_CONF_READ_KEYS)) is None
+    except Exception:
+        return False
+
+
+def _f7_conf_marked(row: Mapping[str, Any]) -> bool:
+    """v5.158.0: does the row carry a confidence-provenance marker? Without
+    one the v2 trajectory is the v1 trajectory, step for step."""
+    return any(row.get(key) for key in _F7_CONF_TRANSIENT_KEYS)
+
+
+def _f7_conf_marker_strip(row: Any) -> None:
+    """v5.158.0 [F7-CONF-RECOMPUTE]: the provenance markers never leave
+    _f7_settle_pass. A row without them is untouched (pop of a missing key
+    changes nothing, other keys keep their order)."""
+    if isinstance(row, dict):
+        for key in _F7_CONF_TRANSIENT_KEYS:
+            row.pop(key, None)
+
+
+def _f7_conf_v2_iterate(cand: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.158.0 [F7-CONF-RECOMPUTE]: prepare ONE v2 settle iterate before its
+    re-score. Derived marker (the scorer derived the pass-1 confidence; provider
+    rows): forecast_confidence, confidence_score and confidence_bucket are set
+    to None in place, so core.scoring re-derives the confidence from the
+    completed row (None reads as absent; the keys keep their position).
+    Synthetic marker (Phase-II's confidence; the scorer had derived the one it
+    replaced): ONLY forecast_confidence is set to None - the scorer reuses
+    confidence_score (Phase-II's value; equal at 4 dp) and _completeness_factor
+    no longer counts an engine-made confidence as data. core.scoring is
+    unchanged. An input alias the scorer never writes (ai_confidence,
+    confidence) that would otherwise be reused instead - possible only when an
+    earlier alias blocked it on pass 1 - is hidden (None) for this re-score;
+    the caller restores the returned values right after it."""
+    hidden: Dict[str, Any] = {}
+    if cand.get(_F7_CONF_DERIVED_KEY):
+        for key in _F7_CONF_SCORER_KEYS:
+            if key in cand:
+                cand[key] = None
+        aliases = _F7_CONF_INPUT_ALIASES
+    elif cand.get(_F7_CONF_SYNTH_KEY):
+        if "forecast_confidence" in cand:
+            cand["forecast_confidence"] = None
+        aliases = ("ai_confidence",)  # the one alias read before confidence_score
+    else:
+        return hidden
+    for key in aliases:
+        if cand.get(key) is not None:
+            hidden[key] = cand[key]
+            cand[key] = None
+    return hidden
+
+
 def _f7_settle_token(value: Any) -> str:
     """Rewrite a source/label token so it stays readable but can never carry
     one of the gate's forbidden substrings (longest rewrites first, then the
@@ -10153,12 +10472,16 @@ def _f7_settle_tag(mode: str, settled_at: Optional[int], passes_run: int,
     return tag
 
 
-def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
+def _f7_settle_result(row: Dict[str, Any], v2: bool = True) -> F7SettlementResult:
     """Evaluate isolated iterates against a fixed snapshot of source inputs.
 
     Generated forecasts may evolve with scores (the existing synthetic path).
     Source observations cannot change, and a failure never exposes an iterate
     as a usable row. The full canonical forecast tuple is owned by TFB-05.
+    v5.158.0 [F7-CONF-RECOMPUTE]: v2=False is exactly the v5.157.0 trajectory
+    (the provenance markers are carried but never read). v2=True prepares each
+    marked iterate with _f7_conf_v2_iterate before its re-score; an unmarked
+    row follows the v5.157.0 trajectory either way.
     """
     passes_run = 0
     first_diff: Tuple[Tuple[str, str, str], ...] = ()
@@ -10181,7 +10504,10 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                           reason="intrinsic_model_basis_unproven")
             if model_values is not None:
                 cand["intrinsic_value"], cand["upside_pct"] = model_values
+            _hidden_aliases = _f7_conf_v2_iterate(cand) if v2 else {}
             _compute_scores_canonical_first(cand)
+            if _hidden_aliases:
+                cand.update(_hidden_aliases)  # input data: only that re-score skipped them
             if model_values is not None:
                 # The canonical patch rounds its display upside independently;
                 # Phase-II must consume the same witnessed raw tuple as scoring.
@@ -10205,6 +10531,7 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                 final_diff: Tuple[Tuple[str, str, str], ...] = ()
                 if stable_row is not row:
                     _cap_intrinsic_display(stable_row)
+                    _f7_conf_marker_strip(stable_row)
                     # v5.157.0 [F7-FINAL-TAG]: disclosure only, never a verdict.
                     final_diff = tuple(_f7_settle_diff(frozen_input, stable_row))
                 return F7SettlementResult("stable", stable_row, k, passes_run, first_diff,
@@ -10221,6 +10548,39 @@ def _f7_settle_result(row: Dict[str, Any]) -> F7SettlementResult:
                                   last_diff=last_diff, reason="scorer_exception", error_type=type(exc).__name__)
 
 
+def _f7_shadow_raised(pub: Optional[F7SettlementResult], shadow: Optional[F7SettlementResult]) -> bool:
+    """v5.158.0: the separate v2 shadow run raised (scorer_exception) while
+    the published v1 result did not - an engine fault of the shadow, never a
+    statement about what enforce would publish."""
+    return (pub is not None and shadow is not None and shadow is not pub
+            and shadow.status == "error" and shadow.reason == "scorer_exception"
+            and not (pub.status == "error" and pub.reason == "scorer_exception"))
+
+
+def _f7_shadow_tag(mode: str, shadow: Optional[F7SettlementResult], base_tagged: bool,
+                   pub: Optional[F7SettlementResult] = None) -> str:
+    """v5.158.0 [F7-CONF-RECOMPUTE]: the observe tag, composed from the v2
+    SHADOW result (what enforce would do with this row). Stable shadow:
+    st<k>:p<n> plus its pass-1 -> final diff; non_converged / error shadow:
+    stx:p<n> plus its pass-1 -> pass-2 diff. Emitted when v5.157.0 would tag
+    the row (base_tagged: the published v1 result's pass 2 moved), when the
+    shadow's final diff is non-empty, or when the shadow is not stable.
+    Codes, order and the 8-field limit are _f7_settle_tag's. A shadow that
+    RAISED while the published v1 result did not (_f7_shadow_raised) is not a
+    v2 verdict: it gets f7_settle:<mode>:sterr:p<n> (no field disclosures), so
+    it never counts as an stx (enforce-would-hold-back) row; the caller logs
+    it at WARNING."""
+    if shadow is None:
+        return ""
+    if _f7_shadow_raised(pub, shadow):
+        return ":".join((_F7_SETTLE_TAG, mode, "sterr", "p%d" % int(shadow.passes_run)))
+    if shadow.status == "stable":
+        if not (base_tagged or shadow.final_diff):
+            return ""
+        return _f7_settle_tag(mode, shadow.settled_at, shadow.passes_run, list(shadow.final_diff))
+    return _f7_settle_tag(mode, None, shadow.passes_run, list(shadow.first_diff))
+
+
 def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
                     scope_page: Optional[str] = None) -> Dict[str, Any]:
     """Keep stable mode semantics; detected failures always withhold execution.
@@ -10230,21 +10590,48 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
     to Off can turn a known error/non-convergence into valid scores or funding.
     v5.157.0 (F-7 v2): Enforce runs as Observe when scope_page (default None =
     page) is not in TFB_SCORING_SETTLE_PAGES; the orchestrator passes the
-    symbol's inferred market page. The tag discloses pass 1 -> FINAL. The
-    settle trajectory (passes, status, values) is v5.156.0's.
+    symbol's inferred market page. The tag discloses pass 1 -> FINAL.
+    v5.158.0 (F-7 v2b): Enforce (in scope) runs ONE v2 result and publishes it
+    exactly as v5.157.0 enforce published its result. Observe (and enforce out
+    of scope) publishes from the v1 result exactly as v5.157.0 observe did -
+    values, holdback / unresolved handling, scoring_settlement JSON, tag
+    presence - while the v2 SHADOW result supplies only the f7_settle tag text
+    (_f7_shadow_tag), appended after the holdback / unresolved handling on rows
+    the v1 result withholds. The confidence-provenance markers are stripped on
+    every return path.
     """
     if not isinstance(row, dict):
         return row
     if _f7_settle_failed(row):
+        _f7_conf_marker_strip(row)
         _f7_settle_holdback(row)
         return row
     mode = _f7_settle_mode()
     if mode == "off":
+        _f7_conf_marker_strip(row)  # no-op unless the mode flipped after pass 1
         return row
     # v5.157.0 [F7-PAGE-SCOPE]: enforce outside the configured pages == observe.
     if mode == "enforce" and not _f7_settle_page_in_scope(page if scope_page is None else scope_page):
         mode = "observe"
-    result = _f7_settle_result(row)
+    # v5.158.0 [F7-CONF-RECOMPUTE]: enforce -> the v2 result is published.
+    # observe -> pub = the v1 (v5.157.0) result drives everything published;
+    # shadow = the v2 result drives only the tag text. An unmarked row's v2
+    # trajectory IS its v1 trajectory, so its shadow is the pub result.
+    result = _f7_settle_result(row, v2=(mode == "enforce"))
+    shadow: Optional[F7SettlementResult] = None
+    if mode == "observe":
+        shadow = _f7_settle_result(row, v2=True) if _f7_conf_marked(row) else result
+    if _f7_shadow_raised(result, shadow):
+        logger.warning(
+            "[engine_v2 v%s F-7 v2b] shadow (v2) settle raised for %s (page=%s): %s; "
+            "published values are the v1 result's, tagged sterr",
+            __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
+            shadow.error_type or "?",
+        )
+    _f7_conf_marker_strip(row)
+    for _res in (result, shadow):
+        if _res is not None and _res.row is not None and _res.row is not row:
+            _f7_conf_marker_strip(_res.row)
     if result.status != "stable":
         # v5.153.0 (WP-2b): only a non_converged result consults
         # TFB_SETTLE_UNRESOLVED; status error stays fail-closed in every mode.
@@ -10257,6 +10644,8 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
                 __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
                 result.reason,
             )
+            # v5.158.0: observe -> the shadow tag after the unresolved receipt.
+            _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False, result))
             return row
         # observe: compose the receipt from the still-intact pass-1 row BEFORE
         # the holdback blanks it; the values below are exactly today's.
@@ -10270,6 +10659,8 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
             __version__, _safe_str(sym or row.get("symbol"), "UNKNOWN"), page or "?",
             result.status, result.reason,
         )
+        # v5.158.0: observe -> the shadow tag after the holdback.
+        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, False, result))
         return row
     # v5.153.0 (WP-2b): a fresh STABLE settlement retires a stale
     # settle_unresolved receipt (L2 / KLG carried warnings) so the row is no
@@ -10277,6 +10668,12 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
     _f7_unresolved_strip(row)
     if result.row is not None and result.row is not row:
         _f7_unresolved_strip(result.row)
+    if mode == "observe":
+        # v5.158.0: the pass-1 row is published as v5.157.0 observe did; the
+        # tag (presence widened, text from the shadow) shows what v2 enforce
+        # would publish.
+        _v573_append_warning(row, _f7_shadow_tag(mode, shadow, bool(result.first_diff), result))
+        return row
     if not result.first_diff:
         return row
     # v5.157.0 [F7-FINAL-TAG]: pass 1 -> FINAL (what enforce publishes), not
@@ -10284,7 +10681,7 @@ def _f7_settle_pass(row: Dict[str, Any], sym: str = "", page: str = "",
     # (first_diff), and the disclosure may be empty when pass 1 -> final nets
     # inside the non-transitive tolerances.
     tag = _f7_settle_tag(mode, result.settled_at, result.passes_run, list(result.final_diff))
-    out = row if mode == "observe" else result.row
+    out = result.row
     _v573_append_warning(out, tag)
     return out
 
@@ -10720,6 +11117,14 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
         row["confidence_bucket"] = "MODERATE"
     else:
         row["confidence_bucket"] = "LOW"
+    # v5.158.0 [F7-CONF-RECOMPUTE]: Phase-II now OWNS this synthetic row's
+    # confidence. When the scorer had derived the replaced one because the
+    # input carried none (derived marker - only while TFB_SCORING_SETTLE !=
+    # off), the marker becomes _f7_conf_synthetic: v2 settle iterates keep
+    # Phase-II's confidence_score but score with forecast_confidence absent.
+    # No derived marker -> nothing is created.
+    if row.pop(_F7_CONF_DERIVED_KEY, None):
+        row[_F7_CONF_SYNTH_KEY] = True
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
@@ -11933,6 +12338,10 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 
     if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
         try:
+            # v5.158.0 [F7-CONF-RECOMPUTE]: provenance is read BEFORE scoring;
+            # off or a settlement iterate -> False, nothing is marked.
+            _conf_derives = (not row.get("_f7_settlement_active")
+                             and _f7_settle_mode() != "off" and _f7_conf_scorer_derives(row))
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
                 _f7_reject_scoring_patch_failures(row, patch)
@@ -11954,6 +12363,11 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
                 }
                 row.update(safe_patch)
                 _preserve_scoring_provenance(row, patch)
+                # Marked even when the derivation produced no value: Phase-II may
+                # then write a synthetic confidence that is engine-made, not data
+                # (Codex review on #819: sparse priced rows).
+                if _conf_derives:
+                    row[_F7_CONF_DERIVED_KEY] = True
                 return
             if row.get("_f7_settlement_active"):
                 raise RuntimeError("canonical scoring returned no score patch")
@@ -11981,6 +12395,9 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """Backward-compatible v5.74.0 delegator."""
     _compute_scores_canonical_first(row)
+    # v5.158.0 [F7-CONF-RECOMPUTE]: no _f7_settle_pass follows this delegator,
+    # so the transient confidence marker never outlives the call.
+    _f7_conf_marker_strip(row)
 
 
 def _empty_row_fundamentals_exempt(row: Mapping[str, Any]) -> bool:
@@ -13040,6 +13457,7 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
         return None
     merged["eps_ttm"] = None
     merged["pe_ttm"] = None
+    _copy_eps_basis(merged, {}, ())
     return "pe_incoherent_cleared:engine"
 
 
@@ -13467,6 +13885,22 @@ def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
                 fields[k] = v
         if not fields:
             return False
+        # v5.159.0: when TFB_EODHD_ANALYST_TARGET=1 and THIS pass took its
+        # 12M target from the EODHD fallback (provenance tag present, source
+        # still provider_target: the capture seam runs before Phase-II, so
+        # no LKG restore can have written the source yet), the snapshot also
+        # carries the target block. A fund-cache hit then fills it through
+        # the same whitelist (target_mean_price / forecast_price_12m /
+        # forecast_source are in _YAHOO_FUNDAMENTAL_FIELDS) instead of
+        # forgoing it (the ":nt" case). The AZ-2 restore filters to
+        # _FUND_LKG_FIELDS, so it never sees these keys. Off: no key added.
+        if _eodhd_analyst_target_enabled() and _row_has_eodhd_analyst_tag(row) \
+                and _safe_str(row.get("forecast_source")).lower() == "provider_target" \
+                and _forecast_price_is_populated(row.get("forecast_price_12m")):
+            for k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                v = row.get(k)
+                if not _is_missing_or_unknown_field(v):
+                    fields[k] = v
         now = time.time()
         _FUND_LKG_STORE[s] = {
             "ts": now,
@@ -13538,6 +13972,9 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
         witnessed_fields = dict(fields)
         witnessed_fields[_MPC_UNIT_KEY] = _margin_cache_units(entry, fields)
         _margin_unit_copy(row, witnessed_fields, filtered)
+        # LKG currently persists no EPS source proof; a restored value cannot
+        # inherit the degraded row's old receipt.
+        _copy_eps_basis(row, {}, filtered)
         age_h = int(age_s // 3600)
         return "fundamentals_lkg:%dh" % age_h
     except Exception:
@@ -13549,7 +13986,10 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
 # raises. A mirror of the v5.136.0 target-LKG layer with the {ts,name,fields}
 # schema; admissibility (TTL / min-fields / fill-only) stays in the callers.
 # ---------------------------------------------------------------------------
-_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v1:"
+# EPS estimates could previously seed eps_ttm through two ingestion paths.
+# Do not restore unversioned old semantics after the adapter/alias correction.
+# Existing v1 keys expire naturally; no historical records are rewritten.
+_FUND_LKG_REDIS_KEY_PREFIX: str = "tfb:fund_lkg:v2:"
 _FUND_LKG_REDIS_BREAKER_ERRORS: int = 3
 _FUND_LKG_REDIS_BREAKER_SECONDS: float = 300.0
 _FUND_LKG_REDIS_TIMEOUT_S: float = 0.25
@@ -13676,6 +14116,12 @@ def _fund_lkg_redis_set(sym: str, entry: Mapping[str, Any]) -> bool:
             "name": _safe_str(entry.get("name")),
             "fields": {k: v for k, v in fields.items() if k in _FUND_LKG_FIELDS},
         }
+        # v5.159.0: the target block travels to L2 only while the flag is
+        # on, so every worker's hit carries it (captures are per worker).
+        if _eodhd_analyst_target_enabled():
+            for _k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                if not _is_missing_or_unknown_field(fields.get(_k)):
+                    cached["fields"][_k] = fields.get(_k)
         version = entry.get("margin_contract_version")
         if isinstance(version, str) and version:
             cached["margin_contract_version"] = version
@@ -13722,6 +14168,12 @@ def _fund_lkg_redis_get(sym: str) -> Optional[Dict[str, Any]]:
         if not fields or all(_is_missing_or_unknown_field(fields.get(k))
                              for k in _FUND_LKG_ANCHOR_FIELDS):
             return None
+        # v5.159.0: read the target block back only while the flag is on.
+        if _eodhd_analyst_target_enabled():
+            for k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                v = fields_in.get(k)
+                if not _is_missing_or_unknown_field(v):
+                    fields[k] = v
         _FUND_LKG_REDIS_STATE["hits"] = int(_FUND_LKG_REDIS_STATE.get("hits") or 0) + 1
         entry = {"ts": ts, "name": _safe_str(d.get("name")), "fields": fields}
         version = d.get("margin_contract_version")
@@ -13856,6 +14308,12 @@ def _fund_cache_lookup(sym: str) -> Optional[Tuple[Dict[str, Any], float]]:
         if not isinstance(fields, dict) or not fields:
             return None
         fields = dict(fields)
+        # v5.159.0: a snapshot captured while TFB_EODHD_ANALYST_TARGET was
+        # on may carry the target block; with the flag off it is not served,
+        # so off stays byte-identical to v5.158.0 for the snapshot's life.
+        if not _eodhd_analyst_target_enabled():
+            for _k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                fields.pop(_k, None)
         units = _margin_cache_units(entry, fields)
         if _margin_unit_tracking_enabled() or units:
             fields[_MPC_UNIT_KEY] = units
@@ -13963,7 +14421,12 @@ def _fund_cache_decide(row: Mapping[str, Any], symbol: str, page: str,
                 kind = pfx + "hit"
                 _fund_cache_bump(kind)
                 tag = "%s:%s:%dh:%d" % (_FUND_CACHE_TAG, kind, int(age_s // 3600), len(filtered))
-                if _is_missing_or_unknown_field(row.get("target_mean_price")):
+                # v5.159.0: a snapshot that carries the EODHD target fills
+                # it on this hit, so the fill is no longer "no target".
+                # Off, the snapshot never carries the key: tag unchanged.
+                # v5.159.1: the 12M forecast alone counts as the target.
+                if _is_missing_or_unknown_field(row.get("target_mean_price")) \
+                        and not _fill_carries_eodhd_target(filtered):
                     tag += ":nt"
                 if mode == "enforce":
                     _margin_unit_copy(filtered, fields, list(filtered))
@@ -15098,7 +15561,9 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
     "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths", "epsCurrentYear"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths"),
+    "eps_estimate_current_year": ("eps_estimate_current_year", "epsCurrentYear", "EPSEstimateCurrentYear"),
+    "eps_net_income_current_shares": ("eps_net_income_current_shares",),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
     "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
     "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
@@ -15725,6 +16190,8 @@ def _infer_sector_from_symbol(symbol: str) -> str:
 
 def _infer_industry_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
+    if _sukuk_classification_enabled() and s in _fixed_income_symbols():
+        return _FIXED_INCOME_ASSET_CLASS
     if s in _COMMODITY_INDUSTRY_HINTS:
         return _COMMODITY_INDUSTRY_HINTS[s]
     if s.endswith("=X"):
@@ -16200,6 +16667,9 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    # Diagnostic provenance only; this receipt grants no eligibility or unit
+    # conversion. Estimates have no alias to the trailing scoring field.
+    _copy_eps_basis(out, src, _EPS_FIELDS)
     if _MPC_UNIT_KEY in src:
         source_basis = src.get(_MPC_UNIT_KEY)
         explicit_fields = [field for field in _MPC_FIELDS
@@ -16831,6 +17301,10 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     _f7_settle_holdback(row)
     _publish_tuple_seams(row)  # v5.152.0 (WP-3ab): 12M ceiling then noise release, AFTER the gate/trend block, BEFORE presentation
     displayed = present_instrument_row(row)
+    # Route fallbacks call this boundary after fetching a guarded cached quote.
+    # Re-assert the mandatory debt quarantine after generic gate recomputation.
+    from core.reviewed_instrument_classes import reviewed_quote_rows
+    displayed = reviewed_quote_rows("My_Portfolio" if "position_qty" in keys else "Global_Markets", [displayed])[0]
     return {k: _json_safe(displayed.get(k)) for k in keys}
 
 
@@ -16901,14 +17375,18 @@ def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[
     if not isinstance(template_row, dict):
         return out
     filled_margin_fields: List[str] = []
+    filled_eps_fields: List[str] = []
     for k, v in template_row.items():
-        if k == _MPC_UNIT_KEY:
+        if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
             continue  # Only the per-field landed-value copy can carry proof.
         if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
             out[k] = _json_safe(v)
             if k in _MPC_FIELDS:
                 filled_margin_fields.append(k)
+            if k in _EPS_FIELDS:
+                filled_eps_fields.append(k)
     _margin_unit_copy(out, template_row, filled_margin_fields)
+    _copy_eps_basis(out, template_row, filled_eps_fields)
     return out
 
 
@@ -17108,6 +17586,7 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     # identical to v5.99.1 (every blank live value is skipped).
     clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
     replaced_margin_fields: List[str] = []
+    replaced_eps_fields: List[str] = []
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
@@ -17118,7 +17597,10 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
         out[k] = _json_safe(v)
         if k in _MPC_FIELDS:
             replaced_margin_fields.append(k)
+        if k in _EPS_FIELDS:
+            replaced_eps_fields.append(k)
     _margin_unit_copy(out, live_row, replaced_margin_fields)
+    _copy_eps_basis(out, live_row, replaced_eps_fields)
     return out
 
 
@@ -17799,6 +18281,11 @@ class MultiLevelCache:
     `OrderedDict` so we can evict the oldest entries when the map exceeds
     `max_entries`. Previous versions silently grew without bound under
     sustained heavy load.
+
+    Expired entries are swept during normal traffic, at most once per TTL
+    (or 30 seconds for longer TTLs). Without the sweep, short-lived quote
+    and page payloads that were never requested again remained resident
+    until the entry-count limit was reached.
     """
 
     def __init__(self, ttl_seconds: int = 30, max_entries: int = 50_000) -> None:
@@ -17806,16 +18293,33 @@ class MultiLevelCache:
         self._max = max(1000, int(max_entries))
         self._data: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._sweep_interval = min(self._ttl, 30)
+        self._next_expiry_sweep = 0.0
+
+    def _prune_expired(self, now: float) -> None:
+        """Reclaim expired payloads under _lock without changing live TTLs.
+
+        Accesses move entries in LRU order, so timestamps are not ordered.
+        Scan the bounded map rather than stopping at the first live entry.
+        The sweep deadline amortizes this work across normal cache traffic.
+        """
+        if now < self._next_expiry_sweep:
+            return
+        cutoff = now - self._ttl
+        for key in [k for k, (ts, _) in self._data.items() if ts < cutoff]:
+            self._data.pop(key, None)
+        self._next_expiry_sweep = now + self._sweep_interval
 
     async def get(self, key: str) -> Any:
         if not key:
             return None
         async with self._lock:
+            now = time.time()
+            self._prune_expired(now)
             entry = self._data.get(key)
             if entry is None:
                 return None
             ts, value = entry
-            now = time.time()
             if now - ts > self._ttl:
                 self._data.pop(key, None)
                 return None
@@ -17826,7 +18330,9 @@ class MultiLevelCache:
         if not key:
             return
         async with self._lock:
-            self._data[key] = (time.time(), value)
+            now = time.time()
+            self._prune_expired(now)
+            self._data[key] = (now, value)
             self._data.move_to_end(key)
             while len(self._data) > self._max:
                 self._data.popitem(last=False)
@@ -18818,8 +19324,9 @@ class DataEngineV5:
     def _merge(self, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base or {})
         landed_margins: List[str] = []
+        landed_eps: List[str] = []
         for k, v in (patch or {}).items():
-            if k == _MPC_UNIT_KEY:
+            if k in (_MPC_UNIT_KEY, _EPS_BASIS_KEY):
                 continue
             if v is None or v == "":
                 continue
@@ -18827,7 +19334,10 @@ class DataEngineV5:
                 out[k] = v
                 if k in _MPC_FIELDS:
                     landed_margins.append(k)
+                if k in _EPS_FIELDS:
+                    landed_eps.append(k)
         _margin_unit_copy(out, patch or {}, landed_margins)
+        _copy_eps_basis(out, patch or {}, landed_eps)
         return out
 
     def _data_quality(self, row: Dict[str, Any]) -> QuoteQuality:
@@ -19237,6 +19747,28 @@ class DataEngineV5:
         if _fc_mode != "off":
             _fc_kind, _fc_tag, _fc_fill = _fund_cache_decide(row, symbol, page, _fc_mode)
             if _fc_mode == "enforce" and _fc_kind in _FUND_CACHE_SHORT_CIRCUIT_KINDS:
+                if _fc_fill and _fill_carries_eodhd_target(_fc_fill):
+                    # v5.159.0: the snapshot carries an EODHD target (armed
+                    # capture). Judge it against TODAY's row price with the
+                    # v5.77.18 gate before it lands; a refused target leaves
+                    # the v5.77.19 drop tag, an accepted one the provenance
+                    # tag. Off, the snapshot never carries the key.
+                    # v5.159.1: entered on the 12M forecast as well, so a
+                    # block captured with TFB_TARGET_MEAN_PUBLISH=0 (no
+                    # target_mean_price) is judged too (Codex review on #865).
+                    _fc_ref = _as_float(row.get("current_price"))
+                    if _fc_ref is None:
+                        _fc_ref = _as_float(row.get("price"))
+                    _fc_t12 = _fc_fill.get("forecast_price_12m")
+                    if _as_float(_fc_t12) is None:
+                        _fc_t12 = _fc_fill.get("target_mean_price")
+                    if _provider_target_gate_enabled() \
+                            and not _provider_target_is_plausible(_fc_ref, _fc_t12):
+                        for _fc_k in _EODHD_ANALYST_SNAPSHOT_FIELDS:
+                            _fc_fill.pop(_fc_k, None)
+                        _v573_append_warning(row, "provider_target_implausible_dropped_12m")
+                    else:
+                        _v573_append_warning(row, _EODHD_ANALYST_TAG)
                 if _fc_fill:
                     row = self._merge(row, _fc_fill)
                     _margin_unit_copy(row, _fc_fill, _fc_fill)
@@ -19269,8 +19801,27 @@ class DataEngineV5:
         sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
             _safe_str(row.get("symbol") or row.get("requested_symbol"))
         )
+        # v5.159.0: eodhd_provider v4.19.0 adds target_mean_price to this
+        # patch when TFB_EODHD_ANALYST_TARGET=1. The patch has no price, so
+        # the v5.77.18 plausibility gate would fail open (the v5.77.19 Fix 1
+        # case). Inject the row's known price into a COPY, exactly as the
+        # Yahoo fundamentals path does; current_price is not in
+        # _YAHOO_FUNDAMENTAL_FIELDS, so it never travels onto the row. A
+        # patch without a target (every patch while the flag is off) takes
+        # the v5.158.0 path unchanged.
+        _eat_target = _as_float(patch.get("target_mean_price")) is not None
+        patch_for_canon = patch
+        if _eat_target:
+            patch_for_canon = dict(patch)
+            _eat_ref_price = _as_float(row.get("current_price"))
+            if _eat_ref_price is None:
+                _eat_ref_price = _as_float(row.get("price"))
+            if _eat_ref_price is not None \
+                    and _as_float(patch_for_canon.get("current_price")) is None \
+                    and _as_float(patch_for_canon.get("price")) is None:
+                patch_for_canon["current_price"] = _eat_ref_price
         canon_patch = _canonicalize_provider_row(
-            patch, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
+            patch_for_canon, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
             provider="eodhd_fundamentals",
         )
         # v5.140.0 (P-115): unit-contract conversion on the canonical patch
@@ -19281,6 +19832,11 @@ class DataEngineV5:
         )
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
+        )
+        # Research diagnostics are not core-fundamental completeness inputs.
+        # Carry them separately without changing the gap/negative-cache policy.
+        eps_diagnostics, _ = _filter_patch_to_missing_fields(
+            row, canon_patch, ("eps_estimate_current_year", "eps_net_income_current_shares"),
         )
         # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
         # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
@@ -19311,10 +19867,21 @@ class DataEngineV5:
         if not filtered:
             # v5.150.0 (P-154c): the paid request landed nothing usable.
             _fund_cache_note_empty(row, symbol, _fc_mode, "nofill")
+        if _eat_target:
+            # v5.159.0 (the v5.77.19 Fix 2 case): the missing-field filter
+            # drops the gate's provider_target_implausible_dropped_* tags;
+            # carry them back so a refused EODHD target leaves a trail.
+            _merge_gate_drop_warnings(row, canon_patch)
         if filtered:
             row = self._merge(row, filtered)
             _margin_unit_copy(row, canon_patch, filtered)
+            _copy_eps_basis(row, canon_patch, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
+            if _eat_target and "forecast_price_12m" in filtered:
+                # v5.159.0: provenance of a 12M leg that came from EODHD.
+                # Substring-safe for the reliability scan (no cap / forecast
+                # / target / roi / drop / reject).
+                _v573_append_warning(row, _EODHD_ANALYST_TAG)
             # v5.140.0 (P-115): disclose each contract-converted key that
             # actually landed on the row (survived the filter).
             for _fus_k in _fus_keys:
@@ -19324,6 +19891,9 @@ class DataEngineV5:
                         _FUND_SENTRY_TAG_PREFIX + ":eodhd:" + _fus_k
                         + ("" if _fus_mode == "enforce" else ":observe"),
                     )
+        if eps_diagnostics:
+            row = self._merge(row, eps_diagnostics)
+            _copy_eps_basis(row, canon_patch, eps_diagnostics)
         return row
 
     # =========================================================================
@@ -19761,10 +20331,14 @@ class DataEngineV5:
 
     async def get_enriched_quote(self, symbol: str, page: str = "") -> UnifiedQuote:
         row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        row = reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
         return UnifiedQuote(**row) if row else UnifiedQuote()
 
     async def get_enriched_quote_dict(self, symbol: str, page: str = "") -> Dict[str, Any]:
-        return await self._get_enriched_quote_impl(symbol, page)
+        row = await self._get_enriched_quote_impl(symbol, page)
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), [row])[0] if row else row
 
     async def get_enriched_quotes(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         # v5.77.7: per-symbol failure isolation. v5.77.6 used
@@ -19863,7 +20437,8 @@ class DataEngineV5:
                     )
             except Exception:
                 pass
-        return out
+        from core.reviewed_instrument_classes import reviewed_quote_rows
+        return reviewed_quote_rows(_canonicalize_sheet_name(page), out)
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
         return await self.get_enriched_quotes(symbols, page)

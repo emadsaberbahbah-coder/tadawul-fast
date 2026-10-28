@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.47.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.49.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1714,7 +1714,51 @@ from urllib.error import HTTPError, URLError
 #     reliability of the same decided records; mean_claimed_reliability
 #     keeps the all-n average.
 # Embedded self-test count unchanged (22). Tests: tests/test_learning_metric_fixes.py.
-SCRIPT_VERSION = "6.47.0"
+# v6.48.0 (2026-10-24): outcome summaries use unique valid matured keys,
+# disclose directional versus price-return metrics and their denominators.
+# This is a read-only analytics correction; no historical row is changed.
+# -----------------------------------------------------------------------------
+# v6.49.0 (2026-10-25) [BOARD-COVERAGE]: the live decision board joins the
+# daily forecast record. ENV-gated, DEFAULT OFF (TFB_TRACK_BOARD_SYMBOLS).
+# EVIDENCE (workbook read 2026-10-25 09:40 Riyadh, gviz): Signal_History
+#   2026-10-24 held 176 rows - 44 tagged Origin Tab 'Top_10_Investments'
+#   (2222.SR, 2283.SR, BNY.US, 9961.HK, BRK-B.US, 7030.SR, ... all WATCH;
+#   the rows the backend's legacy /sheet-rows page=Top_10_Investments build
+#   returns) and 132 'Decision_Coverage' (ledger lots: AER, CARE, CWBC, DDI,
+#   EPRT, HCI, KRP, NMM, PFS, RCI, VEL, ...). NONE of the names seated on the
+#   live Top_10_Investments board that day (PHP.L, FRST.US, ZTO.US, CRC.US,
+#   CBAN.US, ORC.US, AX.US, PGC.US, UMBF.US, FBK.US) had a snapshot; the
+#   last Signal_History rows for ZTO.US / PHP.L / FRST.US date from August.
+#   Performance_Log records are built from the same row set, so the
+#   forecast-vs-outcome evidence (Brier, hit rate, calibration) never sees the
+#   recommendations the Apps Script board (16_Decision_Top10, stability layer,
+#   TFB_SCORING_SETTLE=enforce) actually publishes. Strategy requirement #2
+#   (daily recording for Top_10 + holdings) is met for holdings only.
+# WHAT: when TFB_TRACK_BOARD_SYMBOLS is on, _augment_with_decision_symbols
+#   also reads the board's SELECTED grid (Top_10_Investments A12:B130, the
+#   same window v6.33.0's champion read uses) and adds every seated symbol -
+#   confirmed seats, FAST-TRACK and GRACE-held ghosts alike (a grace hold is
+#   still a published recommendation under watch; the v6.33.0 CHAMPION stamp
+#   keeps excluding ghosts, unchanged) - to the forced-coverage priority set.
+#   Board symbols are treated like pinned extras in _force_plan (never cut by
+#   TFB_TRACK_FORCE_MAX). Fetched rows whose symbol came only from the board
+#   carry origin 'Decision_Board' (visible in Signal_History 'Origin Tab');
+#   rows that are also ledger lots keep 'Decision_Coverage'. One INFO line
+#   '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' per run.
+#   Fail-open: an unreadable board adds nothing and logs one warning.
+# BYTE-IDENTICAL when off (default): no read, no log line, same rows.
+# ENV LANE: .github/workflows/track_performance.yml 'Run performance clock'
+#   AND daily_sync.yml's tracker step (ENV PARITY rule; both map
+#   ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}). Arm by setting the repo
+#   Variable to 1 after one observed run.
+# KNOWN LIMITS: rows come from TFB_TRACK_FORCE_ROWS_ENDPOINT with page
+#   TFB_TRACK_FORCE_ROWS_PAGE (Market_Leaders by default) - the engine's
+#   per-symbol verdict, not the board's sized ticket; stability state is not
+#   recorded (the board's own _Selection_Log keeps it).
+# ZERO functions removed. Additions: _board_symbols_enabled,
+#   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
+# ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
+SCRIPT_VERSION = "6.49.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2262,6 +2306,94 @@ def _force_plan(active: List[str], closed: List[str], extras: List[str],
 def _costbasis_tab() -> str:
     return (os.getenv("TFB_TRACK_COSTBASIS_TAB")
             or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
+
+
+# --- v6.49.0 [BOARD-COVERAGE]: the live decision board joins the record ----
+_BOARD_TAG = "[v6.49.0 BOARD-COVERAGE]"
+_BOARD_TAB_DEFAULT = "Top_10_Investments"
+_BOARD_RANGE = "A12:B130"      # the v6.33.0 champion-read window
+_BOARD_MAX = 15                # the board never seats more than 10 + grace
+
+
+def _board_symbols_enabled() -> bool:
+    """v6.49.0: DEFAULT OFF (house convention). TFB_TRACK_BOARD_SYMBOLS=1/on/
+    true adds the live board's seated symbols to the forced-coverage set."""
+    return _env_bool("TFB_TRACK_BOARD_SYMBOLS", False)
+
+
+def _board_tab() -> str:
+    return (os.getenv("TFB_TRACK_BOARD_TAB") or _BOARD_TAB_DEFAULT).strip() \
+        or _BOARD_TAB_DEFAULT
+
+
+def _board_symbols_from_values(vals: Any) -> Tuple[List[str], int]:
+    """v6.49.0 PURE: from the board's A12:B130 value matrix return
+    (seated_symbols_in_board_order, ghost_count). Same walk as
+    _read_board_selected_symbols (header row 'Rank'|'Symbol', stop at the
+    'ALL QUALIFIED' zone or the first fully blank row, cap _BOARD_MAX) but
+    GRACE-held ghosts (Rank cell '—') are KEPT - they are published
+    recommendations under watch and must be recorded daily. Shape-validated
+    (SG-1 rule), deduped. Never throws: junk -> ([], 0)."""
+    out: List[str] = []
+    seen: set = set()
+    ghosts = 0
+    in_table = False
+    try:
+        for row in (vals or []):
+            row = row or []
+            a = _safe_str(row[0] if len(row) > 0 else "").strip()
+            b = _safe_str(row[1] if len(row) > 1 else "").strip().upper()
+            if not in_table:
+                if a == "Rank" and b == "SYMBOL":
+                    in_table = True
+                continue
+            if a.upper().startswith("ALL QUALIFIED") or (not a and not b):
+                break
+            if not b or b == "SYMBOL" or not _valid_symbol_shape(b):
+                continue
+            if a == "—":
+                ghosts += 1
+            if b not in seen:
+                seen.add(b)
+                out.append(b)
+            if len(out) >= _BOARD_MAX:
+                break
+    except Exception:
+        return [], 0
+    return out, ghosts
+
+
+def _load_board_symbols(spreadsheet_id: str) -> Tuple[List[str], int]:
+    """v6.49.0: ONE read of the board's SELECTED window via the stores'
+    SA-credential pattern (mirrors _load_costbasis_symbols). Fail-open:
+    any problem -> ([], 0) with one debug line."""
+    if not spreadsheet_id or not GSPREAD_AVAILABLE or gspread is None:
+        return [], 0
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return [], 0
+    s = raw
+    if not s.startswith("{"):
+        try:
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return [], 0
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(spreadsheet_id).worksheet(_board_tab())
+        vals = ws.get_values(_BOARD_RANGE) or []
+        return _board_symbols_from_values(vals)
+    except Exception as e:
+        logger.debug("%s board read skipped: %s", _BOARD_TAG, e)
+        return [], 0
 
 
 # =============================================================================
@@ -4810,6 +4942,64 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
     return rep
 
 
+def _s1_canonical_checkpoint_measure(records: Any) -> Dict[str, Any]:
+    """Enforcement accepts proven canonical targets, never inferred legacy units.
+
+    The read-only migration audit rejects self-consistent legacy tuples
+    without forecast provenance, duplicate matured keys and ambiguous units.
+    Prospective schema receipts provide a valid positive path immediately;
+    only matured 1W/2W outcomes count toward unchanged S1 thresholds.
+    """
+    items = list(records or [])
+    audit = canonical_performance_report(items)
+    counts = {"fraction": 0, "percent": 0, "unresolved": 0}
+    allc = dict(counts)
+    reasons: Dict[str, int] = defaultdict(int)
+    errors: List[float] = []
+    per_hz: Dict[str, List[float]] = defaultdict(list)
+    zero_errors: List[float] = []
+    zero_per_hz: Dict[str, List[float]] = defaultdict(list)
+    tiny = 0
+    for record, evidence in zip(items, audit["records"]):
+        hz = record.horizon.value
+        if hz not in ("1W", "2W") or record.target_roi == 0.0:
+            continue
+        canonical = evidence.get("canonical_target_roi_pp")
+        label = ("fraction" if evidence.get("unit_evidence") == "fraction" else "percent")
+        if canonical is None or evidence.get("reason"):
+            label = "unresolved"
+        allc[label] += 1
+        if record.status != PerformanceStatus.MATURED or record.realized_roi is None:
+            continue
+        error = evidence.get("forecast_error_pp")
+        if error is None:
+            counts["unresolved"] += 1
+            reasons[evidence.get("reason") or "invalid_realized_evidence"] += 1
+            continue
+        counts[label] += 1
+        value = float(error)
+        if not math.isfinite(value):
+            raise ValueError("nonfinite canonical checkpoint error")
+        errors.append(value)
+        per_hz[hz].append(value)
+        zero_errors.append(abs(float(record.realized_roi)))
+        zero_per_hz[hz].append(abs(float(record.realized_roi)))
+        tiny += int(label == "percent" and abs(canonical) < _PERF_UNIT_TINY_PP)
+    n = len(errors)
+    return {
+        "n": n, "basis": "canonical_forecast_provenance",
+        "mean_abs_error_pp": round(sum(abs(e) for e in errors) / n, 2) if n else None,
+        "mean_signed_error_pp": round(sum(errors) / n, 2) if n else None,
+        "zero_mae_pp": _s1_zero_mae(zero_errors),
+        "by_horizon": {h: {"n": len(values),
+                           "mean_abs_pp": round(sum(abs(e) for e in values) / len(values), 2),
+                           "zero_mae_pp": _s1_zero_mae(zero_per_hz[h])}
+                       for h, values in sorted(per_hz.items())},
+        "counts": counts, "all_checkpoints": allc,
+        "unresolved_why": dict(reasons), "percent_tiny": tiny,
+    }
+
+
 def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
                           mode: str) -> Dict[str, Any]:
     """observe: the legacy result plus a 'unit_sentry' report. enforce: the
@@ -4818,7 +5008,8 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
     metrics; legacy results remain diagnostic only. Never raises."""
     new = dict(out)
     try:
-        rep = _s1_unit_sentry_measure(records)
+        rep = (_s1_canonical_checkpoint_measure(records) if mode == "enforce"
+               else _s1_unit_sentry_measure(records))
     except Exception as exc:
         rep = {"n": 0, "error": "unit_sentry_error:" + type(exc).__name__}
     rep["mode"] = mode
@@ -4855,7 +5046,7 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
             raise ValueError("nonfinite corrected calibration")
         c = rep.get("counts") or {}
         _leg = rep["legacy"].get("mean_abs_error_pp")
-        tail = (" [unit-sentry enforce: targets in pp; %d fraction-scale "
+        tail = (" [unit-sentry enforce: canonical forecast provenance; targets in pp; %d fraction-scale "
                 "rescaled, %d already pp, %d unresolved excluded; legacy "
                 "mean |err| %spp]" % (
                     int(c.get("fraction", 0)), int(c.get("percent", 0)),
@@ -4899,7 +5090,7 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
     n = int(rep.get("n") or 0)
     basis = rep.get("error") or rep.get("enforce_note") or (
         "criterion-4 basis: "
-        + ("unit-corrected" if (mode == "enforce" and n > 0) else "legacy"))
+        + ("canonical forecast provenance" if (mode == "enforce" and n > 0) else "legacy"))
 
     def _v(x: Any) -> Any:
         return "" if x is None else x
@@ -4916,9 +5107,11 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
          "fraction %d" % int(c.get("fraction", 0)),
          "percent %d (tiny %d)" % (int(c.get("percent", 0)),
                                    int(rep.get("percent_tiny") or 0)),
-         "unresolved %d (no_sibling %d, mismatch %d)" % (
+         ("unresolved %d: %s" % (int(c.get("unresolved", 0)), json_dumps(w))
+          if rep.get("basis") == "canonical_forecast_provenance" else
+          "unresolved %d (no_sibling %d, mismatch %d)" % (
              int(c.get("unresolved", 0)), int(w.get("no_sibling", 0)),
-             int(w.get("mismatch", 0)))],
+             int(w.get("mismatch", 0))))],
         ["all checkpoint rows / creation this run",
          "fraction %d / percent %d / unresolved %d" % (
              int(a.get("fraction", 0)), int(a.get("percent", 0)),
@@ -5374,6 +5567,12 @@ class PerformanceSummary:
     # losses, count}. Both empty until matured gate-tagged records exist.
     hit_rate_by_investability: Dict[str, float] = field(default_factory=dict)
     performance_by_investability: Dict[str, Any] = field(default_factory=dict)
+    duplicate_matured_excluded: int = 0
+    invalid_matured_excluded: int = 0
+    price_positive: int = 0
+    price_negative: int = 0
+    price_breakeven: int = 0
+    price_positive_rate: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -5583,6 +5782,8 @@ class CalibrationReport:
     regret_picked_minus_alt: Optional[float] = None
     regret_n_board: int = 0
     regret_n_alt: int = 0
+    duplicate_matured_excluded: int = 0
+    invalid_matured_excluded: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -6590,16 +6791,16 @@ class PerformanceStore:
             ["Performance Summary", "", "", f"Updated: {RiyadhTime.format()}", ""],
             ["Total Records", summary.total_records, "", "", ""],
             ["Active Records", summary.active_records, "", "", ""],
-            ["Matured Records", summary.matured_records, "", "", ""],
-            ["Wins", summary.wins, "", "", ""],
-            ["Losses", summary.losses, "", "", ""],
-            ["Win Rate", f"{summary.win_rate:.1f}%", "", "", ""],
-            ["Avg ROI", f"{summary.avg_roi:.2f}%", "", "", ""],
-            ["Median ROI", f"{summary.median_roi:.2f}%", "", "", ""],
-            ["Best ROI", f"{summary.best_roi:.2f}%", "", "", ""],
-            ["Worst ROI", f"{summary.worst_roi:.2f}%", "", "", ""],
-            ["Sharpe Ratio", _fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio), "", "", ""],
-            ["Sortino Ratio", _fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio), "", "", ""],
+            ["Matured Outcomes (unique valid keys)", summary.matured_records, "", "Duplicate matured excluded", summary.duplicate_matured_excluded],
+            ["Directional Wins", summary.wins, "", "HOLD / neutral excluded", summary.neutral_records],
+            ["Directional Losses", summary.losses, "", "Directional breakeven excluded", summary.breakeven],
+            ["Directional Win Rate", f"{summary.win_rate:.1f}%" if summary.wins + summary.losses else "unavailable", "", "Denominator: directional wins + losses", summary.wins + summary.losses],
+            ["Avg Price ROI", f"{summary.avg_roi:.2f}%", "", "Price-positive / price-negative", f"{summary.price_positive} / {summary.price_negative}"],
+            ["Median Price ROI", f"{summary.median_roi:.2f}%", "", "Price-positive rate (nonzero returns)", f"{summary.price_positive_rate:.1f}%" if summary.price_positive_rate is not None else "unavailable"],
+            ["Best Price ROI", f"{summary.best_roi:.2f}%", "", "Price breakeven", summary.price_breakeven],
+            ["Worst Price ROI", f"{summary.worst_roi:.2f}%", "", "Invalid matured ROI excluded", summary.invalid_matured_excluded],
+            ["Sharpe Ratio (price, by horizon)", _fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio), "", "Directional wins score the call", "SELL + falling price = WIN"],
+            ["Sortino Ratio (price, by horizon)", _fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio), "", "Price ROI is not net trade P&L", "Overlapping horizons are correlated"],
         ]
         # v6.20.0 (VT-1 hygiene): clear every historical panel footprint
         # first (A1:E4 legacy top-left stub, AG1:AK13 side block) so a
@@ -7380,6 +7581,38 @@ class AttributionAnalyzer:
         return out
 
 
+def _summary_outcome_cohort(records: List[PerformanceRecord]) -> Tuple[List[PerformanceRecord], int, int]:
+    """First valid matured outcome per stable key, without editing history.
+
+    Active, unpriced and malformed copies cannot hide a later measured
+    outcome. First valid decided evidence wins for a repeated key; the
+    exclusion count makes the reduction visible rather than inflating n.
+    """
+    cohort: List[PerformanceRecord] = []
+    seen: set = set()
+    duplicates = invalid = 0
+    for record in records:
+        if record.status != PerformanceStatus.MATURED:
+            continue
+        try:
+            valid = (record.realized_roi is not None
+                     and record.realized_roi_source_valid
+                     and not isinstance(record.realized_roi, bool)
+                     and math.isfinite(float(record.realized_roi)))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            invalid += 1
+            continue
+        key = record.key
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        cohort.append(record)
+    return cohort, duplicates, invalid
+
+
 class PerformanceAnalyzer:
     def __init__(self):
         self.risk = RiskCalculator()
@@ -7391,15 +7624,16 @@ class PerformanceAnalyzer:
         s.active_records = sum(
             1 for r in records if r.status == PerformanceStatus.ACTIVE
         )
-        matured = [
-            r
-            for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
+        matured, s.duplicate_matured_excluded, s.invalid_matured_excluded = _summary_outcome_cohort(records)
         s.matured_records = len(matured)
 
         if matured:
             rois = [float(r.realized_roi or 0.0) for r in matured]
+            s.price_positive = sum(roi > 0 for roi in rois)
+            s.price_negative = sum(roi < 0 for roi in rois)
+            s.price_breakeven = len(rois) - s.price_positive - s.price_negative
+            price_decided = s.price_positive + s.price_negative
+            s.price_positive_rate = 100.0 * s.price_positive / price_decided if price_decided else None
             # v6.46.0 [DIR-OUTCOME]: WIN/LOSS of the CALL (a SELL that fell
             # wins); HOLD records are neutral and excluded from every
             # directional rate. ROI aggregates below stay PRICE returns.
@@ -7422,7 +7656,9 @@ class PerformanceAnalyzer:
             else:
                 rois_sorted = sorted(rois)
                 s.avg_roi = sum(rois) / max(1, len(rois))
-                s.median_roi = rois_sorted[len(rois_sorted) // 2]
+                middle = len(rois_sorted) // 2
+                s.median_roi = (rois_sorted[middle] if len(rois_sorted) % 2
+                                else (rois_sorted[middle - 1] + rois_sorted[middle]) / 2)
                 s.best_roi = max(rois_sorted)
                 s.worst_roi = min(rois_sorted)
 
@@ -7787,10 +8023,7 @@ class ReliabilityCalibrator:
 
     def calibrate(self, records: List[PerformanceRecord],
                   signal_mix: Optional[Dict[str, int]] = None) -> CalibrationReport:
-        matured = [
-            r for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
+        matured, duplicate_count, invalid_count = _summary_outcome_cohort(records)
         total = len(records)
         decided_total = sum(1 for r in matured
                             if _record_outcome(r) in ("WIN", "LOSS"))   # v6.46.0
@@ -7929,6 +8162,8 @@ class ReliabilityCalibrator:
             generated_riyadh=RiyadhTime.format(),
             total_records=total,
             matured_records=len(matured),
+            duplicate_matured_excluded=duplicate_count,
+            invalid_matured_excluded=invalid_count,
             decided_records=decided_total,
             min_sample=self.min_sample,
             shrinkage_k=self.shrink_k,
@@ -8045,11 +8280,7 @@ class ReportGenerator:
     def generate_json(
         self, records: List[PerformanceRecord], summary: PerformanceSummary
     ) -> str:
-        matured = [
-            r
-            for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
+        matured, _, _ = _summary_outcome_cohort(records)
         outcomes = [o == "WIN" for o in map(_record_outcome, matured)
                     if o in ("WIN", "LOSS")]   # v6.46.0: decided, direction-aware
         ci = (
@@ -8096,12 +8327,7 @@ class ReportGenerator:
         plots: Dict[str, str] = {}
         if PLOT_AVAILABLE and Figure is not None and NUMPY_AVAILABLE and np is not None:
             try:
-                matured = [
-                    r
-                    for r in records
-                    if r.status == PerformanceStatus.MATURED
-                    and r.realized_roi is not None
-                ]
+                matured, _, _ = _summary_outcome_cohort(records)
                 matured.sort(key=lambda x: (x.maturity_date or x.date_recorded))
 
                 if matured:
@@ -8119,9 +8345,9 @@ class ReportGenerator:
                     win_rate = np.divide(wins * 100.0, denom,
                                          out=np.zeros_like(denom), where=denom > 0)
                     ax1.plot(dates, win_rate, linewidth=2)
-                    ax1.set_title("Cumulative Win Rate (%)")
+                    ax1.set_title("Cumulative Directional Win Rate (%) — unique decided keys")
                     ax1.set_xlabel("Date")
-                    ax1.set_ylabel("Win Rate %")
+                    ax1.set_ylabel("Directional Win Rate %")
                     ax1.grid(True, alpha=0.25)
                     plots["win_rate"] = self._plot_png_base64(fig1)
 
@@ -8132,7 +8358,7 @@ class ReportGenerator:
                     ax2 = fig2.add_subplot(111)
                     ax2.hist(roi, bins=30)
                     ax2.axvline(0.0, linestyle="--", linewidth=1.5)
-                    ax2.set_title("ROI Distribution (%)")
+                    ax2.set_title("Price ROI Distribution (%) — unique matured keys")
                     ax2.set_xlabel("ROI %")
                     ax2.set_ylabel("Frequency")
                     ax2.grid(True, alpha=0.2)
@@ -8166,8 +8392,8 @@ class ReportGenerator:
 
   <div class="grid" style="margin-top:12px;">
     <div class="card"><div>Total Records</div><div style="font-size:22px;font-weight:bold;">{summary.total_records}</div></div>
-    <div class="card"><div>Win Rate</div><div style="font-size:22px;font-weight:bold;">{summary.win_rate:.1f}%</div></div>
-    <div class="card"><div>Avg ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div></div>
+    <div class="card"><div>Directional Win Rate (wins / decided)</div><div style="font-size:22px;font-weight:bold;">{f'{summary.win_rate:.1f}%' if summary.wins + summary.losses else 'unavailable'}</div><div>{summary.wins} / {summary.wins + summary.losses}; HOLD {summary.neutral_records}, breakeven {summary.breakeven} excluded</div></div>
+    <div class="card"><div>Avg Price ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div><div>{summary.matured_records} unique valid matured keys; {summary.duplicate_matured_excluded} duplicates and {summary.invalid_matured_excluded} invalid outcomes excluded</div></div>
     <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)}</div></div>
   </div>
 
@@ -9556,6 +9782,23 @@ class PerformanceTrackerApp:
         }
         priority: set = set(_force_extra_symbols())
         _by_status: Optional[Tuple[List[str], List[str]]] = None   # v6.40.0
+        # v6.49.0 [BOARD-COVERAGE]: the live board's seated symbols join the
+        # priority set as pinned extras. OFF (default) -> nothing below runs.
+        _board: List[str] = []
+        _board_ghosts = 0
+        if _board_symbols_enabled() and self.spreadsheet_id:
+            try:
+                _board, _board_ghosts = await asyncio.get_running_loop().run_in_executor(
+                    _get_executor(), _load_board_symbols, self.spreadsheet_id
+                )
+            except Exception as e:
+                logger.warning("%s board read failed: %s", _BOARD_TAG, e)
+                _board, _board_ghosts = [], 0
+            if _board:
+                priority |= set(_board)
+            else:
+                logger.warning("%s board read returned no seated symbol "
+                               "(unreadable or empty board) - nothing added", _BOARD_TAG)
         if self.spreadsheet_id:
             loop = asyncio.get_running_loop()
             try:
@@ -9592,8 +9835,10 @@ class PerformanceTrackerApp:
                 priority = {x for x in priority if _valid_symbol_shape(x)}
         missing = sorted(s for s in priority if s and s not in covered)
         if _by_status is not None:                        # v6.40.0 P-180
+            # v6.49.0: board symbols ride as extras -> never cut by the cap.
+            _extras = sorted(set(_force_extra_symbols()) | set(_board))
             _plan = _force_plan(_by_status[0], _by_status[1],
-                                sorted(_force_extra_symbols()), covered,
+                                _extras, covered,
                                 _force_max(), _force_scope())
             logger.info(
                 "[v6.40.0 COVERAGE] scope=%s active=%d closed=%d extras=%d "
@@ -9623,6 +9868,9 @@ class PerformanceTrackerApp:
                 "[v6.16.0 COVERAGE] full: %d priority symbol(s) already in the "
                 "%d prefetched row(s)", len(priority), len(rows),
             )
+            if _board:
+                logger.info("%s board=%d new=0 ghosts=%d (all prefetched)",
+                            _BOARD_TAG, len(_board), _board_ghosts)
             return rows
         if not self.backend.base_url:
             logger.warning(
@@ -9633,12 +9881,28 @@ class PerformanceTrackerApp:
         fetched, meta = await self.backend.get_rows_for_symbols(
             missing, _force_rows_page()
         )
+        # v6.49.0: a symbol that is on the board and NOT a ledger lot or a
+        # pinned extra is tagged 'Decision_Board'; everything else keeps
+        # the v6.16.0 'Decision_Coverage' tag byte for byte.
+        _board_only: set = set()
+        if _board:
+            _ledger: set = set(_force_extra_symbols())
+            if _by_status is not None:
+                _ledger |= set(_by_status[0]) | set(_by_status[1])
+            else:
+                _ledger |= {s for s in priority if s not in set(_board)}
+            _board_only = {s for s in _board if s not in _ledger}
         got: set = set()
+        _board_new = 0
         for r in fetched:
             sym = _safe_str(r.get("symbol")).strip().upper()
             if not sym or sym in covered:
                 continue
-            r.setdefault("origin", "Decision_Coverage")
+            if sym in _board_only:
+                r.setdefault("origin", "Decision_Board")
+                _board_new += 1
+            else:
+                r.setdefault("origin", "Decision_Coverage")
             rows.append(r)
             covered.add(sym)
             got.add(sym)
@@ -9648,6 +9912,9 @@ class PerformanceTrackerApp:
             "unresolved=%s", len(priority), len(rows) - len(got), len(missing),
             len(got), ",".join(unresolved) if unresolved else "-",
         )
+        if _board:
+            logger.info("%s board=%d new=%d ghosts=%d", _BOARD_TAG,
+                        len(_board), _board_new, _board_ghosts)
         return rows
 
     async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
@@ -10919,12 +11186,14 @@ class PerformanceTrackerApp:
                 f"| Matured: {summary.matured_records}"
             )
             _out(
-                f"Wins: {summary.wins} | Losses: {summary.losses} "
-                f"| WinRate: {summary.win_rate:.1f}% "
-                f"| Neutral(HOLD): {summary.neutral_records}"
+                f"Directional wins: {summary.wins} | Losses: {summary.losses} "
+                f"| WinRate: {summary.win_rate:.1f}% (decided n={summary.wins + summary.losses}) "
+                f"| Neutral(HOLD): {summary.neutral_records} | Breakeven: {summary.breakeven} "
+                f"| Duplicates excluded: {summary.duplicate_matured_excluded} "
+                f"| Invalid matured excluded: {summary.invalid_matured_excluded}"
             )
             _out(
-                f"Avg ROI: {summary.avg_roi:.2f}% "
+                f"Avg price ROI: {summary.avg_roi:.2f}% "
                 f"| Sharpe: {_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)} "
                 f"| Sortino: {_fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio)}"
             )
@@ -10980,12 +11249,7 @@ class PerformanceTrackerApp:
                          f"{' (CHANGED - see _Run_Log)' if _pub.get('changed') else ''}")
 
         if self.args.simulate:
-            matured = [
-                r
-                for r in records
-                if r.status == PerformanceStatus.MATURED
-                and r.realized_roi is not None
-            ]
+            matured, _, _ = _summary_outcome_cohort(records)
             outcomes = [o == "WIN" for o in map(_record_outcome, matured)
                         if o in ("WIN", "LOSS")]   # v6.46.0
             if outcomes:

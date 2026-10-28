@@ -1,4 +1,4 @@
-/* 10_My_Portfolio v1.5.14 + 16_Decision_Top10 v1.13.10 correctness fixes.
+/* 10_My_Portfolio v1.5.15 (lockstep; v1.5.14 fixes) + 16_Decision_Top10 v1.13.10 correctness fixes.
  * Runs the REAL Apps Script sources in a vm with service stubs; all
  * holdings, lots and rates are synthetic.
  *   L*  _myPortfolioLedgerMap_ excludes Sold/Closed/Inactive lots exactly
@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.14');
+  assert.equal(ctx.PD_VERSION, '1.5.17');   // 2026-10-26: evidence publication stacked; 2026-10-28: post-earnings inputs stacked
   return copy(ctx._myPortfolioLedgerMap_());
 }
 
@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.equal(ctx.DT10_VERSION, '1.13.11');
+  assert.equal(ctx.DT10_VERSION, '1.18.0');   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];

@@ -1,6 +1,13 @@
 """tests/test_auth_wall_scope_path.py - global auth wall routed-path harness.
 
 HARNESS_VERSION 1.0.0 (2026-10-13) for main.py v8.14.5.
+HARNESS_VERSION 1.2.0 (2026-10-24): keep every synthetic scope and auth
+decision, but use the independent ASGI path as the helper oracle in W8/W15.
+Starlette 1.3.1 rejects some Host authority forms previously accepted by
+0.41.3. With no server address, its relative URL can parse a leading "//"
+as an authority. URL rendering is not the auth path oracle. URL-path parity
+still runs over every real-server scope and every authority-bearing URL;
+the actual HTTP, root_path, token and tripwire assertions are unchanged.
 HARNESS_VERSION 1.1.1 (2026-10-13, CI fix on PR #769): W19 skips, with its
 reason, when orjson is not importable. The contract job installs only
 fastapi/starlette/httpx/pydantic/anyio/numpy/pytest; routes/config renders
@@ -61,7 +68,9 @@ Cases:
      (with and without port, IPv6 literals, uppercase, sub-delims, empty,
      absent) and plain paths, the v8.14.4 expression
      str(request.url.path) in _GLOBAL_AUTH_EXEMPT_PATHS equals the new
-     decision, and request.url.path equals the echoed scope path;
+     decision and the independent scope-path membership oracle. Every
+     helper result equals scope["path"]; request.url.path also equals it
+     when the scope has a server address or the URL has an authority;
      _scope_route_path equals Starlette's own get_route_path
   W9 (7b) [needs TFB_AUTH_WALL_BASE] dual tree: the same corpus through the
      pre-change wall and the new wall gives byte-identical status and body
@@ -86,8 +95,8 @@ Cases:
      knows; a valid token passes with a normal or a crafted Host; a wrong
      token is refused
   W15 route-layer identity, always on: each module's _request_scope_path
-     equals request.url.path for the valid-Host corpus (the path is the only
-     input that changed, so every decision is unchanged) and returns "" for
+     equals the independent scope["path"] for the full corpus, also equals
+     request.url.path when a server or URL authority is available, and returns "" for
      a request object without a scope; the six auth functions read no
      request.url (AST); versions bumped; verify_deployment pins
      advanced_analysis and analysis_sheet_rows
@@ -134,7 +143,7 @@ except ImportError:  # pragma: no cover - script mode without pytest
     pytest = None
 
 
-HARNESS_VERSION = "1.1.2"
+HARNESS_VERSION = "1.2.0"
 ROOT = Path(__file__).resolve().parents[1]
 DELIVERED = ROOT / "main.py"
 ENV_BASE = "TFB_AUTH_WALL_BASE"
@@ -142,7 +151,9 @@ ENV_ROUTE_BASE = "TFB_ROUTE_AUTH_BASE"
 # 1.1.2 (2026-10-21): main.py 8.14.6 moves call_next out of the wall's
 # fail-closed try (tests/test_auth_wall_downstream_errors.py). Every case here
 # is unchanged: the stub never raises, so each decision and denial is identical.
-EXPECTED_VERSION = "8.14.6"
+# v8.14.7 changes diagnostic inventory only; retain every auth assertion.
+# v8.14.8 (2026-10-28) adds /health pf_gates keys only; same rule.
+EXPECTED_VERSION = "8.14.8"
 NEW_HELPERS = ["_global_auth_exempt_request", "_request_scope_path", "_scope_route_path"]
 TOKEN = "harness-wall-token-7q2"
 RID = "harness-rid-1"
@@ -266,7 +277,7 @@ if hasattr(m, "_global_auth_exempt_request"):
     for _ in range(600):
         paths.append("/" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14))))
     hosts = list(SPEC["valid_hosts"]) + [None]
-    n = mism = echo = 0
+    n = mism = echo = scope_mism = oracle_mism = url_n = authority_free_echo = 0
     examples = []
     for host in hosts:
         for path in paths:
@@ -280,16 +291,32 @@ if hasattr(m, "_global_auth_exempt_request"):
                 headers = [] if host is None else [(b"host", host.encode("latin-1"))]
                 scope = {"type": "http", "method": "GET", "scheme": scheme, "path": path, "root_path": "",
                          "query_string": b"x=/health", "headers": headers, "server": server}
-                old = str(Request(scope).url.path or "") in m._GLOBAL_AUTH_EXEMPT_PATHS
-                new = m._global_auth_exempt_request(Request(scope))
+                request = Request(scope)
+                old = str(request.url.path or "") in m._GLOBAL_AUTH_EXEMPT_PATHS
+                new = m._global_auth_exempt_request(request)
+                actual_path = m._request_scope_path(request)
                 n += 1
                 if old != new:
                     mism += 1
                     if len(examples) < 5:
                         examples.append([host, path, old, new])
-                if Request(scope).url.path != m._request_scope_path(Request(scope)):
-                    echo += 1
-    out["identity"] = {"n": n, "mismatch": mism, "echo_mismatch": echo, "examples": examples}
+                if new != (path in m._GLOBAL_AUTH_EXEMPT_PATHS):
+                    oracle_mism += 1
+                if actual_path != path:
+                    scope_mism += 1
+                # A rejected Host plus server=None produces a relative URL
+                # on patched Starlette. Keep every scope in the independent
+                # raw-path/auth checks; URL parity needs an actual authority.
+                if server is not None or request.url.scheme in ("http", "https"):
+                    url_n += 1
+                    if request.url.path != actual_path:
+                        echo += 1
+                elif request.url.path != actual_path:
+                    authority_free_echo += 1
+    out["identity"] = {"n": n, "mismatch": mism, "echo_mismatch": echo,
+                       "scope_mismatch": scope_mism, "oracle_mismatch": oracle_mism,
+                       "url_n": url_n, "authority_free_url_mismatch": authority_free_echo,
+                       "examples": examples}
     try:
         from starlette._utils import get_route_path
         roots = ["", "/", "/api", "/v1", "/health", "/_debug", "/v1/health", "/a/b"]
@@ -472,7 +499,9 @@ ROUTE_SITES = ["investment_advisor._auth_passed", "analysis_sheet_rows._auth_pas
 ROUTE_FILES = {
     "routes/investment_advisor.py": ("INVESTMENT_ADVISOR_VERSION", "2.18.1", "_auth_passed"),
     "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.8.4", "_auth_passed"),
-    "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.18.2", "_auth_passed"),
+    # 4.18.2 -> 4.19.0 (2026-10-28): post-earnings guard inputs forwarded on
+    # the portfolio route; _auth_passed and _request_scope_path untouched.
+    "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.19.0", "_auth_passed"),
     "routes/config.py": ("ROUTER_VERSION", "5.9.1", "_auth_ok"),
     # 8.5.2 -> 8.6.0 (2026-10-19): bridge signature binding + gated instrument
     # fallback; _Service.auth_guard and _request_scope_path untouched.
@@ -596,7 +625,7 @@ for name, mod in MODS.items():
     if not callable(fn):
         helpers[name] = None
         continue
-    n = mism = 0
+    n = mism = url_mism = url_n = authority_free_echo = 0
     examples = []
     for host in SPEC["valid_hosts"] + [None]:
         servers = [("testserver", 80), ("10.0.0.1", 8443)] + ([None] if host is not None else [])
@@ -604,12 +633,22 @@ for name, mod in MODS.items():
             for server in servers:
                 r = req(p, host, server=server)
                 n += 1
-                if fn(r) != r.url.path:
+                actual_path = fn(r)
+                if actual_path != p:
                     mism += 1
                     if len(examples) < 4:
-                        examples.append([host, p, fn(r), r.url.path])
+                        examples.append([host, p, actual_path])
+                if server is not None or r.url.scheme in ("http", "https"):
+                    url_n += 1
+                    if actual_path != r.url.path:
+                        url_mism += 1
+                        if len(examples) < 4:
+                            examples.append([host, p, actual_path, r.url.path])
+                elif actual_path != r.url.path:
+                    authority_free_echo += 1
     helpers[name] = {"n": n, "mismatch": mism, "examples": examples, "duck": fn(_Duck()),
-                     "none": fn(None)}
+                     "none": fn(None), "url_mismatch": url_mism, "url_n": url_n,
+                     "authority_free_url_mismatch": authority_free_echo}
 out["helpers"] = helpers
 
 # full stack, wall dropped: the route layer is the only check
@@ -847,8 +886,10 @@ def case_w8(res=None):
         return "FAIL", "the module under test has no _global_auth_exempt_request"
     par = res.get("route_path_parity", {})
     problems = []
-    if ident["mismatch"] or ident["echo_mismatch"]:
-        problems.append(f"decision mismatches {ident['mismatch']}, echo mismatches {ident['echo_mismatch']}: {ident['examples']}")
+    if ident["mismatch"] or ident["echo_mismatch"] or ident["scope_mismatch"] or ident["oracle_mismatch"]:
+        problems.append(f"decision mismatches {ident['mismatch']}, ASGI path mismatches {ident['scope_mismatch']}, "
+                        f"independent exemption mismatches {ident['oracle_mismatch']}, "
+                        f"URL echo mismatches {ident['echo_mismatch']}: {ident['examples']}")
     parity = "starlette get_route_path unavailable (%s)" % par.get("skip")
     if "skip" not in par:
         parity = f"_scope_route_path == get_route_path in {par['n'] - par['mismatch']}/{par['n']}"
@@ -857,7 +898,9 @@ def case_w8(res=None):
     if problems:
         return "FAIL", "; ".join(problems)
     return "PASS", (f"{ident['n']} valid-Host requests: old and new decisions identical, "
-                    f"url.path == scope path; {parity}")
+                    f"independent ASGI path and exemption oracles match; "
+                    f"{ident['url_n']} authority-bearing URLs match scope path; "
+                    f"{ident['authority_free_url_mismatch']} authority-free URL differences; {parity}")
 
 
 def _dual(base: Path):
@@ -1045,19 +1088,24 @@ def _route_ast_problems(root: Path) -> list:
 def case_w15(res=None):
     res = res or _run_routes(ROOT)
     problems = _route_ast_problems(ROOT)
-    total = 0
+    total = authority_free_echo = 0
     for rel, h in sorted(res["helpers"].items()):
         if h is None:
             problems.append(f"{rel}: no {ROUTE_HELPER} at run time")
             continue
         total += h["n"]
+        authority_free_echo += h["authority_free_url_mismatch"]
         if h["mismatch"]:
-            problems.append(f"{rel}: {h['mismatch']}/{h['n']} differ from url.path {h['examples']}")
+            problems.append(f"{rel}: {h['mismatch']}/{h['n']} differ from ASGI path {h['examples']}")
+        if h["url_mismatch"]:
+            problems.append(f"{rel}: {h['url_mismatch']}/{h['url_n']} differ from authority-bearing URL.path {h['examples']}")
         if h["duck"] != "" or h["none"] != "":
             problems.append(f"{rel}: no-scope request gave {h['duck']!r} / {h['none']!r}, not ''")
     if problems:
         return "FAIL", "; ".join(problems[:6])
-    return "PASS", (f"{total} valid-Host requests over {len(res['helpers'])} modules: scope path == url.path; "
+    return "PASS", (f"{total} valid-Host requests over {len(res['helpers'])} modules: helpers equal ASGI path, "
+                    "authority-bearing URL paths agree; "
+                    f"{authority_free_echo} authority-free URL differences; "
                     "no-scope objects give ''; no request.url read in the six auth functions; versions and "
                     "verify_deployment pins match")
 
@@ -1175,7 +1223,7 @@ def case_w19(res=None):
 
 
 CASES = (
-    ("W1 v8.14.6, helpers present, no request.url reads", case_w1),
+    ("W1 v8.14.8, helpers present, no request.url reads", case_w1),
     ("W2 anonymous protected requests get 401", case_w2),
     ("W3 crafted Host and decoded-path shapes still get 401", case_w3),
     ("W4 exempt paths stay exempt", case_w4),

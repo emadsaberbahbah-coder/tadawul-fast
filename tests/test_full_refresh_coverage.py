@@ -114,15 +114,18 @@ def test_default_live_audit_loads_current_policy_and_records_membership_receipts
     for page, count in (("Global_Markets", 6512), ("Commodities_FX", 453), ("My_Portfolio", 1)):
         grids[page] = [HEADERS, *[["PF.SR" if page == "My_Portfolio" else f"{page[0]}{i:05d}.US",
             "Synthetic", 50, NOW.isoformat(), 1, 40, "eodhd"] for i in range(count)]]
-    for page in ("Insights_Analysis", "Data_Dictionary"):
-        grids[page] = [HEADERS, ["synthetic"]]
+    from core.sheets.schema_registry import get_sheet_headers
+    insights_headers = get_sheet_headers("Insights_Analysis")
+    grids["Insights_Analysis"] = [insights_headers, ["Overview", "Sources", "count", 0, "", "", 1]]
+    grids["Data_Dictionary"] = [HEADERS, ["synthetic"]]
     reads = []
     def reader(_sid, a1):
         reads.append(a1)
         grid = grids[a1.split("!")[0]]
         return symbol_column(grid) if a1.endswith("!A:A") else copy.deepcopy(grid)
     report = asyncio.run(coverage.run("synthetic-sheet", reader=reader,
-        registry=SimpleNamespace(SCHEMA_VERSION="synthetic", get_sheet_headers=lambda _page: HEADERS), now=NOW))
+        registry=SimpleNamespace(SCHEMA_VERSION="synthetic", get_sheet_headers=lambda page:
+            insights_headers if page == "Insights_Analysis" else HEADERS), now=NOW))
     assert report.code == 0, [(page.page, page.failures) for page in report.pages]
     assert report.approved_scope == scope.receipt()
     assert all(result.approved_scope["valid"] for result in report.pages if result.page in scope.pages)

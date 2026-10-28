@@ -2,6 +2,267 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.54 (2026-10-28) -- PORTFOLIO ADD GUARDS (D1b POST-EARN, D1c TICKET-CAP)
+#
+# v1.1.54 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.53 are #848-#865):
+# run tests/test_pf_add_guards_d1.py (core/analysis/portfolio_actions.py
+# v1.17.0 + routes/advanced_analysis.py v4.19.0: TFB_PF_ADD_POST_EARN and
+# TFB_PF_MAX_OPEN_TICKETS_MODE, default off = byte-identical) in the isolated
+# protective-harness step next to the P-183 veto it extends, after fetching
+# the untouched v1.16.1 base commit 22658e0f by SHA for its off-identity case
+# (a failed fetch only turns that case into a SKIP), its route case
+# tests/test_pf_add_guards_d1_route.py in the schema and route contract lane
+# (the protective lane has no FastAPI); and node
+# tests/test_pd_post_earn_inputs.js (apps_script/10_My_Portfolio.gs v1.5.17,
+# PD_POST_EARN) with the other Apps Script harnesses. Offline. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.53 (2026-10-28) -- EODHD ANALYST TARGET (TFB_EODHD_ANALYST_TARGET)
+#
+# v1.1.53 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.52 are #848-#864):
+# run tests/test_eodhd_analyst_target.py (core/providers/eodhd_provider.py
+# v4.19.0 + core/data_engine_v2.py v5.159.0: the EODHD fundamentals patch
+# carries the analyst consensus target when TFB_EODHD_ANALYST_TARGET=1, the
+# engine canonicalizes it behind the plausibility gate with the row price
+# injected, and the fund-LKG snapshot carries it so a fund-cache hit fills it
+# too; default off = byte-identical) in the full-dependency work-brief lane
+# next to tests/test_yahoo_id_alias.py, because it drives the real provider
+# and engine modules. Offline. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.52 (2026-10-28) -- VERIFIED YAHOO IDS (TFB_YAHOO_ID_ALIAS)
+#
+# v1.1.52 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.51 are #848-#863):
+# run tests/test_yahoo_id_alias.py (core/symbols/normalize.py v5.7.0: the
+# nine Commodities_FX tickers that are dead or collide on Yahoo map to the ids
+# the provider read-back confirmed, only when TFB_YAHOO_ID_ALIAS=1) in the
+# full-dependency work-brief lane next to tests/test_crypto_provider_identity.py,
+# because its engine and adapter cases import the real modules. Offline.
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.51 (2026-10-28) -- PROVIDER IDENTITY PROBE (READ-ONLY)
+#
+# v1.1.51 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.50 are #848-#859):
+# run tests/test_provider_identity_probe.py (scripts/provider_identity_probe.py
+# v1.0.0 + data/provider_probe_cfx_2026-10-28.json + workflow
+# provider_identity_probe.yml: the WP-05 provider read-back for the
+# Commodities_FX rows that failed every day - wrong-coin crypto pairs, gold
+# spot and exotic crosses without a price, LBS=F / DX=F) in the blocking lean
+# lane next to tests/test_news_macro_gate.py. Offline: the real probe against
+# a fake HTTP session; no provider is called. Nothing is removed and no
+# existing entry moves.
+#
+# VERSION 1.1.50 (2026-10-28) -- NEWS & MACRO GATE (OBSERVE)
+#
+# v1.1.50 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.49 are #848-#856
+# and #858): run tests/test_news_macro_gate.py (scripts/news_macro_gate.py
+# v1.0.0 + data/news_gate_taxonomy.json + workflow news_macro_gate.yml: free
+# sources - SEC EDGAR, GDELT, Google-News RSS, the Federal Reserve RSS, EODHD
+# economic events and S&P 500 / VIX - graded by source tier and information
+# grade into an observe-only GO / CAUTION / NO_NEW_ENTRY verdict with per-name
+# flags) in the blocking lean lane. Offline: the real module against a fake
+# HTTP session and an in-memory workbook; no provider is called. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.49 (2026-10-28) -- DAILY SYNC _Status STAMP BUDGET
+#
+# v1.1.49 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.48 are #848-#856):
+# run tests/test_daily_sync_stamp_budget.py (daily_sync.yml v1.0.7: both
+# page-writing jobs map TFB_SYNC_STATUS_STAMP_DEADLINE_S, default 300, so a
+# Global_Markets stamp whose reads each wait the 60 s socket timeout gets
+# all 4 attempts instead of 2 - run 40556442682 lost its stamp that way and
+# the cockpit withheld the board) in the blocking lean lane next to
+# tests/test_sync_status_stamp_retry.py. Offline; its base-identity leg
+# reads the untouched v1.0.4 with `git show 21dc13e9` and SKIPs on a shallow
+# checkout. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.48 (2026-10-27) -- BIGQUERY ARCHIVE (C8 PHASE 1)
+#
+# v1.1.48 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.47 are #848-#855):
+# run tests/test_bq_archive.py
+# (scripts/archive_to_bigquery.py v1.0.0, the read-only daily copy of the
+# decision workbook's learning tabs into BigQuery; workflow bq_archive.yml)
+# in the blocking lean lane. Offline: the HTTP session is a fake, no google
+# library is imported, PyYAML (already in the lane) reads the workflow.
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.47 (2026-10-27) -- COCKPIT POST-EARNINGS TAG
+#
+# v1.1.47 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.46 are #848-#854):
+# run tests/test_dt10_post_earnings.js
+# (16_Decision_Top10.gs v1.18.0: DT10_POST_EARN, default off -- the SELECTED
+# board's Advisor Note gains '<warn> post-earnings S/L <dot> EPS x% <dot> '
+# for a seat whose last report is inside its quarantine, 5 sessions or 10
+# after a negative EPS surprise; off = the v1.17.1 render byte for byte) in
+# the blocking lean lane's native Apps Script step next to
+# tests/test_dt10_shadow_momentum.js. Offline; rebuilds the v1.17.1 base from
+# tests/js/dt10_edits_v1180.json (SHA-256 pinned). The daily-brief step also
+# runs tests/test_daily_brief_post_earnings_tag.py (run_daily_brief v1.19.0:
+# a tagged seat is held back from the picks and named on HTML / PDF / text;
+# no tag = v1.18.1 byte for byte; its golden leg reads the untouched v1.18.1
+# with `git show e8337a16`, fetched first - a failed fetch only turns that
+# leg into a SKIP). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.46 (2026-10-27) -- CALENDAR VENUE BATCHES + EODHD EXCHANGE CODES
+#
+# v1.1.46 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.45 are #848-#853):
+# run tests/test_calendar_venue_batches.py (core/providers/calendar_provider
+# v1.3.2: TFB_CALENDAR_VENUE_BATCHES and TFB_CALENDAR_SUFFIX_MAP, both default
+# off -- one venue per /calendar/earnings batch, US first, and EODHD's
+# exchange codes for '.L' / '.KL' / '.IS' / '.LS'; off = the v1.3.1 requests,
+# results and log lines byte for byte) in the blocking contract lane next to
+# tests/test_calendar_split_404.py. Its golden leg reads the untouched v1.3.1
+# module with `git show e8337a16`; the step fetches that commit too (a failed
+# fetch only turns the leg into a SKIP). Nothing is removed and no existing
+# entry moves.
+#
+# VERSION 1.1.45 (2026-10-27) -- CALENDAR 404 BATCH SPLIT
+#
+# v1.1.45 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.44 are #848-#852):
+# run tests/test_calendar_split_404.py (core/providers/calendar_provider
+# v1.3.1: TFB_CALENDAR_SPLIT_404, default off -- a /calendar/earnings batch
+# that answers HTTP 404 is split so every code EODHD accepts is kept; off =
+# the v1.3.0 requests and results byte for byte) in the blocking contract
+# lane next to tests/test_calendar_last_report_a4.py (its provider legs need
+# httpx). Its golden leg reads the untouched v1.3.0 module with `git show
+# aba4e5eb`; the step fetches that commit first (a failed fetch only turns
+# the leg into a SKIP). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.44 (2026-10-27) -- CHALLENGER MOMENTUM INPUT
+#
+# v1.1.44 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.43 are #848-#851):
+# run tests/test_dt10_shadow_momentum.js (16_Decision_Top10.gs v1.17.1: the
+# pool row carries the engine's 'Momentum Score' only while
+# DT10_SHADOW_RANK_LOG is armed -- the challenger's second pre-registered key;
+# off = the v1.17.0 projection byte for byte) in the blocking lean lane's
+# native Apps Script step next to tests/test_dt10_shadow_rank_log.js. Offline;
+# rebuilds the v1.17.0 base from tests/js/dt10_edits_v1171.json (SHA-256
+# pinned). The board scorecard step also fetches f60cff37 (the untouched
+# score_selection_log v1.2.0) for the P15 golden legs of v1.2.1 (a shadow
+# day logged without the challenger's momentum input counts for neither
+# order). Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.43 (2026-10-27) -- BOARD SCORECARD HARNESS JOINS THE LEAN LANE
+#
+# v1.1.43 (1.1.39 is claimed by open PR #846; 1.1.40 is #848, 1.1.41 is
+# #849, 1.1.42 is #850): run tests/test_board_scorecard_p182.py
+# (scripts/score_selection_log.py v1.2.0 [CHALLENGER]:
+# TFB_BOARD_SCORECARD_CHALLENGER, default off -- reads the
+# cockpit's _Shadow_Rank_Log and scores the champion and challenger orders by
+# the pre-registered rule of the self-correcting program, section 4) as its
+# own step of the blocking lean lane; until now only the advisory whole-suite
+# job ran it. Its golden negatives (P9 vs the untouched v1.0.0, P12 vs the
+# untouched v1.1.0) read the two base commits with `git show`; the default
+# checkout is shallow, so the step fetches exactly those two commits by SHA
+# first (a failed fetch turns only those legs into SKIP lines). Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.42 (2026-10-27) -- LAST REPORT DATE
+#
+# v1.1.42 (1.1.39 is claimed by open PR #846; 1.1.40 is #848, 1.1.41
+# is #849): run tests/test_calendar_last_report_a4.py (calendar_provider 1.3.0
+# fetch_last_earnings_map + run_calendar_sync 1.2.0 TFB_CAL_LAST_REPORT,
+# default off = the v1.1.4 seven-column table byte for byte) in the blocking
+# contract lane next to tests/test_calendar_partial_fill.py: its provider legs
+# import the real calendar_provider, which needs httpx (installed there, not
+# in the lean lane). Offline; its golden legs read the v1.1.4 base with
+# `git show` and skip on a shallow checkout.
+#
+# VERSION 1.1.41 (2026-10-27) -- SHADOW RANK LOG
+#
+# v1.1.41 (1.1.39 is claimed by open PR #846; 1.1.40 is #848): run
+# tests/test_dt10_shadow_rank_log.js (16_Decision_Top10.gs v1.17.0: Script
+# Property DT10_SHADOW_RANK_LOG, default off -- one property read and nothing
+# else; on: the backend's champion/challenger orders (opportunity_builder
+# v1.28.0 meta.rank_challenger) and the board seats are appended to the hidden
+# _Shadow_Rank_Log tab once per UTC day; 'all' adds every order change) in
+# the blocking lean lane's native Apps Script step. Offline; reads the real
+# builder payload
+# fixture tests/fixtures/rank_challenger_payload_v1280.json and rebuilds the
+# v1.16.0 base from tests/js/dt10_edits_v1170.json (SHA-256 pinned).
+#
+# VERSION 1.1.40 (2026-10-27) -- RANKING CHALLENGER IN SHADOW
+#
+# v1.1.40 (1.1.39 is claimed by open PR #846): run
+# tests/test_opp_rank_challenger_a2.py (opportunity_builder v1.28.0:
+# TFB_OPP_RANK_MODE, default legacy = v1.27.2 byte for byte -- shadow
+# publishes a second, pre-registered order of the same INVEST pool as
+# shadow_rank + meta.rank_challenger without touching selection) in the
+# blocking lean lane next to the other opportunity-builder suites. Offline;
+# its golden legs read the v1.27.2 base with `git show` and print SKIP on a
+# shallow checkout.
+#
+# v1.1.38: run tests/test_dt10_funding_evidence.js (16_Decision_Top10.gs
+# v1.16.0: Script Property DT10_FUNDING_EVIDENCE, default off -- the broker
+# packet published by 10_My_Portfolio certifies the cockpit's request: cash
+# after reservations, holding links, peg FX, custody exclusions) and
+# tests/test_pd_evidence_publish.js (10_My_Portfolio.gs v1.5.16: Script
+# Property PD_IBKR_EVIDENCE_PUBLISH, default off -- the SENT packet is
+# written to the document property the cockpit forwards and ONE one-off
+# follow-up render is armed inside the packet's 14-minute window) in the
+# blocking lean lane's native Apps Script step, next to the pending-grace
+# harness. Version pins moved in the sibling harnesses.
+#
+# v1.1.37: run tests/test_dt10_pending_grace.js (16_Decision_Top10.gs v1.15.0:
+# Script Property TFB_T10_PENDING_GRACE_DAYS, default absent/0 -- a NON-member
+# challenger with a live confirmation count that misses ONE criteria day
+# softly (audited row present, verdict not INVEST, no structural block, not a
+# hard-out verdict, inside 'T10: Stability Rank Buffer') keeps its count for
+# up to N consecutive such days instead of resetting to 0; absent/0 is the
+# v1.14.0 clock byte for byte; seating still needs a raw ticket) in the
+# blocking lean lane's native Apps Script step, next to
+# tests/test_dt10_confirm_basis.js. Offline; the REAL file in a vm context;
+# the v1.14.0 base is rebuilt from the delivered file by reversing the
+# enumerated v1.15.0 edits (SHA-256 pinned in tests/js/dt10_cash_utc_history.js)
+# for the golden negative and the kill identity. Version pins moved in the
+# sibling harnesses (confirm basis, input truth, source readiness, bulk
+# format, feed cohort binding, ledger FX). Nothing is removed and no existing
+# entry moves.
+#
+# VERSION 1.1.36 (2026-10-25) -- TRACKER BOARD COVERAGE
+#
+# v1.1.36: run tests/test_track_board_coverage.py (track_performance v6.49.0:
+# TFB_TRACK_BOARD_SYMBOLS, default off -- the live Top_10_Investments board's
+# seated symbols, GRACE ghosts included, join the forced-coverage set so
+# Signal_History / Performance_Log record the recommendations the Apps Script
+# board publishes; off is v6.48.0 byte for byte) in the blocking lean lane next
+# to tests/test_track_force_coverage_p180.py. Pure parser / knob / plan cases,
+# offline. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.35 (2026-10-24) -- DT10 CONFIRM BASIS
+#
+# v1.1.35: run tests/test_dt10_confirm_basis.js (16_Decision_Top10.gs v1.14.0:
+# Script Property TFB_T10_CONFIRM_BASIS, default 'qualified' -- a day-advance on
+# which a tracked symbol is absent from the backend's sized top-N but INVEST on
+# the audited grid inside 'T10: Stability Rank Buffer' counts as a confirmation
+# day instead of resetting the count; 'raw' is the v1.13.11 clock byte for
+# byte; seating still needs a raw ticket) in the blocking lean lane's native
+# Apps Script step, next to tests/test_dt10_calendar_completeness.js. Offline;
+# the REAL file in a vm context; the v1.13.11 base is rebuilt from the delivered
+# file by reversing the enumerated v1.14.0 edits (SHA-256 pinned in
+# tests/js/dt10_cash_utc_history.js) for the golden negative and the kill
+# identity. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.34 (2026-10-24) -- F-7 v2b SETTLE SHADOW
+#
+# v1.1.34: run tests/test_de_f7_settle_shadow.py (data_engine_v2 v5.158.0:
+# enforce settles on the v2 trajectory - the scorer's own confidence is
+# re-derived; observe publishes exactly v5.157.0 and its tag shows the v2
+# result) next to tests/test_de_f7_settle_v2.py in the lean model lane and the
+# heavy scoring-settle step. Offline; real engine module, fixtures and
+# orchestrator. Its identity comparisons with v5.157.0 and golden negative
+# need TFB_F7V2B_BASE and skip in CI. Merged onto v1.1.33 (2026-10-24): every
+# job and test enrolment of both sides is kept.
+#
+# Revision 3 (2026-10-24): block workflow inventory truncation, identity parser
+# regressions and uninformative/misleading live-audit recovery summaries.
+# Revision 2 (2026-10-24): verify full bounded audit scope, labelled unique
+# performance cohorts, v2 funding/display evidence and sukuk industry fallback.
+# Revision 1 (2026-10-23): block regressions in expired-cache reclamation,
+# news acquisition evidence and native decision-chain receipt completion.
+# VERSION 1.1.33 (2026-10-24): match the supported production framework
+# security pair, require the real framework/NLTK/OTEL regressions, and close
+# confirmed test-only PDF parser advisories at pypdf 6.21.2. Existing required
+# lanes, financial gates and advisory policy remain intact.
 # VERSION 1.1.32 (2026-10-22) -- F-7 v2 SETTLE
 #
 # v1.1.32: run tests/test_de_f7_settle_v2.py (data_engine_v2 v5.157.0: the
@@ -507,6 +768,7 @@ on:
       - 'config/approved_universe_scope_v1.json'
       - 'config/render_env_expected.json'
       - 'docs/render_env_contract.md'
+      - 'data/reviewed_instrument_classes.json'
       - 'config.py'
       - 'env.py'
       - 'core/**'
@@ -554,7 +816,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install production pins and test-only workbook dependency
-        run: python -m pip install -r requirements.txt pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.20.0"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.21.2"
       - name: Discover every offline regression
         run: python -m pytest -q tests
 
@@ -678,9 +942,15 @@ jobs:
             tests/test_pf_minor_unit_ccy_guard.py \
             tests/test_scheduled_portfolio_refresh.py \
             tests/test_news_intelligence_contracts.py \
+            tests/test_news_acquisition_evidence.py \
+            tests/test_news_workflow_health.py \
+            tests/test_news_adaptive_universe.py \
+            tests/test_news_lifecycle.py \
+            tests/test_engine_cache_expiry.py \
             tests/test_insights_cohort_receipt.py \
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
+            tests/test_bq_archive.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -701,6 +971,9 @@ jobs:
             tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
+            tests/test_daily_sync_stamp_budget.py \
+            tests/test_news_macro_gate.py \
+            tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
@@ -712,6 +985,9 @@ jobs:
             tests/test_checkpoint_target_contract.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_full_refresh_coverage.py \
+            tests/test_github_workflow_run_window.py \
+            tests/test_monitor_recovery_guidance.py \
+            tests/test_render_audit_summary.py \
             tests/test_approved_universe_scope.py \
             tests/test_approved_universe_workflow.py \
             tests/test_approved_scope_native_binding.py \
@@ -722,6 +998,7 @@ jobs:
             tests/test_decision_surface_freshness.py \
             tests/test_final_decision_publication.py \
             tests/test_final_publication_workflow.py \
+            tests/test_matrix_validation_scope.py \
             tests/test_release_decision_feed.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
@@ -730,6 +1007,7 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
+            tests/test_opp_rank_challenger_a2.py \
             tests/test_core_repair_readback.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
@@ -759,12 +1037,14 @@ jobs:
             tests/test_runner_pin_ubuntu2404.py \
             tests/test_tp_target_unit_sentry_p158.py \
             tests/test_track_force_coverage_p180.py \
+            tests/test_track_board_coverage.py \
             tests/test_tp_dedup_matured_p189b.py \
             tests/test_tp_dedup_signal_p191.py \
             tests/test_track_flags_mapped.py \
             tests/test_tracker_canonical_publications.py \
             tests/test_tp_zero_baseline_p201.py \
             tests/test_learning_metric_fixes.py \
+            tests/test_performance_summary_integrity.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
@@ -790,6 +1070,7 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_settle_v2.py \
+            tests/test_de_f7_settle_shadow.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_pf_weight_subunit_fx.py \
             tests/test_pf_weight_value_complete.py
@@ -800,6 +1081,25 @@ jobs:
           # Separate processes keep their state out of the other lean suites.
           python -m pytest -q tests/test_pf_add_loser_veto_p183.py
           python -m pytest -q tests/test_pf_sukuk_ladder_p153.py
+          # v1.1.54: D1b/D1c ADD guards; the off-identity case compares with
+          # the untouched v1.16.1 module at 22658e0f (fetched by SHA).
+          git fetch --no-tags --depth=1 origin 22658e0f10ed0264feaf40e7208dc1f85b6a6e8b \
+            || echo "::notice::portfolio_actions v1.16.1 base not fetched - the off-identity case will SKIP"
+          python -m pytest -q tests/test_pf_add_guards_d1.py
+
+      - name: 📋 Board scorecard harness (golden bases fetched by SHA)
+        run: |
+          # v1.1.43: P9 / P12 compare scripts/score_selection_log.py with the
+          # untouched v1.0.0 (d25468a5) and v1.1.0 (53c8544e) scripts. The
+          # checkout is shallow: fetch exactly those two commits; a failed
+          # fetch only turns those legs into SKIP lines.
+          # v1.1.44: + the untouched v1.2.0 (f60cff37) for P15.
+          git fetch --no-tags --depth=1 origin \
+            d25468a548bcba082779f3d7d5f8b4dfadaac176 \
+            53c8544e88d217054dcaf56d04fce110d002e4d2 \
+            f60cff37707812bd89f41c47ed4ddd3f2c4c9746 \
+            || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
+          python tests/test_board_scorecard_p182.py
 
       - name: ✅ Coverage note
         run: |
@@ -818,10 +1118,19 @@ jobs:
         run: |
           node tests/js/portfolio_reconciliation_inputs.test.js
           node tests/test_dt10_calendar_completeness.js
+          node tests/test_dt10_confirm_basis.js
+          node tests/test_dt10_pending_grace.js
+          node tests/test_dt10_funding_evidence.js
+          node tests/test_dt10_shadow_rank_log.js
+          node tests/test_dt10_shadow_momentum.js
+          node tests/test_dt10_post_earnings.js
+          node tests/test_pd_evidence_publish.js
+          node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js
           node tests/js/dt10_bulk_format.test.js
+          node tests/js/decision_chain.test.js
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
@@ -851,8 +1160,8 @@ jobs:
           python -m pip install \
             "numpy==1.26.4" \
             pytest \
-            "fastapi==0.115.14" \
-            "starlette==0.41.3" \
+            "fastapi==0.140.13" \
+            "starlette==1.3.1" \
             "httpx==0.27.2" \
             "pydantic==2.13.2" \
             "pydantic-core==2.46.2" \
@@ -860,6 +1169,15 @@ jobs:
 
       - name: 📐 Run schema alignment
         run: |
+          # v1.1.45: the golden leg of tests/test_calendar_split_404.py reads
+          # the untouched calendar_provider v1.3.0 (aba4e5eb); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin aba4e5eb6d30064e32c416b2a2369598ae4aa412 \
+            || echo "::notice::calendar golden base not fetched - test_calendar_split_404 S1 will SKIP"
+          # v1.1.46: the golden leg of tests/test_calendar_venue_batches.py reads
+          # the untouched calendar_provider v1.3.1 (e8337a16).
+          git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
+            || echo "::notice::calendar v1.3.1 base not fetched - test_calendar_venue_batches V1 will SKIP"
           echo "::group::pytest (contract)"
           # PY-4 (2026-07-26): the exact current-schema contract is now an
           # UNCONDITIONAL gate — previously only the legacy alignment test
@@ -873,8 +1191,12 @@ jobs:
             tests/test_board_funding_route.py \
             tests/test_insights_cohort_route.py \
             tests/test_portfolio_reconciliation_route.py \
+            tests/test_pf_add_guards_d1_route.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_partial_fill.py \
+            tests/test_calendar_last_report_a4.py \
+            tests/test_calendar_split_404.py \
+            tests/test_calendar_venue_batches.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \
@@ -882,6 +1204,8 @@ jobs:
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \
+            tests/test_reviewed_instrument_classes.py \
+            tests/test_sukuk_industry_classification.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \
             tests/test_auth_wall_scope_path.py \
             tests/test_auth_wall_downstream_errors.py \
@@ -912,7 +1236,7 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -r requirements.txt
-          python -m pip install pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.20.0"
+          python -m pip install pytest "openpyxl==3.1.5" "reportlab==5.0.1" "pypdf==6.21.2"
 
       - name: ⚙️ Run data engine suite
         run: |
@@ -925,19 +1249,26 @@ jobs:
           python -m pytest -q \
             tests/test_de_f7_scoring_settle.py \
             tests/test_de_f7_settle_v2.py \
+            tests/test_de_f7_settle_shadow.py \
             tests/test_de_f7_intrinsic_display_basis.py \
             tests/test_news_singleflight_cancellation.py
 
       - name: 🧪 Daily brief unavailable-evidence and blocked-decision regressions
-        run: python -m pytest -q tests/test_daily_brief_blocked_inputs.py
+        run: |
+          # v1.1.47: the golden leg of tests/test_daily_brief_post_earnings_tag.py
+          # reads the untouched run_daily_brief v1.18.1 (e8337a16); fetch it on the
+          # shallow checkout (a failed fetch only turns that leg into a SKIP).
+          git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
+            || echo "::notice::brief golden base not fetched - its golden leg will SKIP"
+          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
 
       - name: 💵 Run exported-workbook cash certification regressions
-        run: python -m pytest -q tests/test_cash_snapshot_certification.py
+        run: python -m pytest -q tests/test_cash_snapshot_certification.py tests/test_decision_v2_cash_presentation.py
 
       - name: 📊 Run workbook DQ audit harness (WP-0)
         # The golden run on the real export (P12) is skipped here: the export is
         # never committed. P1-P11 exercise the checks on synthetic workbooks.
-        run: python -m pytest -q tests/test_workbook_dq_audit.py
+        run: python -m pytest -q tests/test_workbook_dq_audit.py tests/test_validator_full_scope.py
 
       - name: ⚙️ Run outcome evidence with production calendars
         run: python -m pytest -q tests/test_outcome_price_evidence.py
@@ -952,7 +1283,8 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_margin_scoring_unit_contract.py \
-            tests/test_margin_producer_unit_receipts.py
+            tests/test_margin_producer_unit_receipts.py \
+            tests/test_eps_basis_contract.py
 
       - name: 🧪 Work-brief publication, policy and workbook regressions
         # Full production dependencies exercise the real engine/provider
@@ -964,6 +1296,8 @@ jobs:
             tests/test_usx_currency_lockstep.py \
             tests/test_identity_guard.py \
             tests/test_crypto_provider_identity.py \
+            tests/test_yahoo_id_alias.py \
+            tests/test_eodhd_analyst_target.py \
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
@@ -981,7 +1315,9 @@ jobs:
         # in a child process with outbound sockets blocked.
         env:
           TFB_LIBSMOKE_REQUIRE_PINNED: "1"
-        run: python -m pytest -q tests/test_security_pins_libsmoke_20261013.py
+        run: >-
+          python -m pytest -q tests/test_security_pins_libsmoke_20261013.py
+          tests/test_dependency_health_20261024.py tests/test_framework_security_20261024.py
 
   # ==========================================================================
   # JOB 5 — gate summary

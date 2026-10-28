@@ -86,7 +86,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -218,7 +218,72 @@ class CoverageReport:
     def payload(self) -> dict[str, Any]:
         out = asdict(self)
         out["exit_code"] = self.exit_code
+        out["recovery"] = recovery_guidance(self)
         return out
+
+
+def recovery_guidance(report: CoverageReport) -> dict[str, Any]:
+    """Propose a recovery path; never accept or alter a reference.
+
+    Repeated scheduled failures restored an empty August cache for a week.
+    Retrying that schedule cannot initialize a missing reference. Surface the
+    explicit recovery prerequisite without treating today's observation as
+    a healthy baseline merely because it is readable.
+    """
+    codes = {finding.code for finding in report.findings}
+    nonbaseline_controls = [finding for finding in report.findings
+                            if finding.severity == "CONTROL" and not finding.code.startswith("CH_BASELINE_")]
+    if report.fatal or nonbaseline_controls:
+        action = "REPAIR_CONTROL_EVIDENCE"
+        detail = "Resolve the read/configuration failure and rerun the read-only audit."
+    elif any(finding.severity == "FAIL" for finding in report.findings):
+        action = "INVESTIGATE_COVERAGE"
+        detail = "Repair the provider/row coverage loss; retain the last-good reference."
+    elif codes & {"CH_BASELINE_STALE", "CH_BASELINE_MISMATCH", "CH_BASELINE_POLICY_MISMATCH",
+                  "CH_BASELINE_FUTURE", "CH_BASELINE_CORRUPT"}:
+        action = "RESTORE_OR_REVIEW_REFERENCE"
+        detail = ("Restore the matching verified reference or investigate the gap before an "
+                  "explicit reviewed bootstrap. Preserve the current file for diagnosis.")
+    elif codes & {"CH_BASELINE_MISSING", "CH_BASELINE_EMPTY"}:
+        action = "REVIEW_EXPLICIT_BOOTSTRAP"
+        detail = ("Verify a coherent healthy acquisition cycle and review the current provenance "
+                  "observations, then dispatch provider_target_coverage.yml with bootstrap=true "
+                  "once. Keep accept_baseline=false; do not initialize from a failing cycle.")
+    elif report.exit_code == 1:
+        action = "INVESTIGATE_COVERAGE"
+        detail = "Repair the provider/row coverage loss; retain the last-good reference."
+    elif report.exit_code == 2:
+        action = "REPAIR_CONTROL_EVIDENCE"
+        detail = "Resolve the reported control findings before any baseline update."
+    else:
+        action = "NONE"
+        detail = "No recovery action required by this audit."
+    return {"action": action, "automatic": False, "baseline_changed_by_guidance": False,
+            "detail": detail,
+            "runbook": "docs/reviews/provider-name-workflow-recovery-20261024.md"}
+
+
+def render_step_summary(payload: dict[str, Any]) -> str:
+    """Bounded workflow evidence, with no account data or environment values."""
+    code = payload.get("exit_code")
+    verdict = ({0: "PASS", 1: "COVERAGE FAILURE", 2: "CONTROL FAILURE"}.get(code, "UNKNOWN")
+               if type(code) is int else "UNKNOWN")
+    recovery = payload.get("recovery") or {}
+    rows = ["# Provider-target coverage", "", f"Result: **{verdict}** (exit {code}).",
+            "The audit does not release recommendations or certify a new reference.", "",
+            "| Page | Rows | Provider share % | Reference share % | Verdict |",
+            "|---|---:|---:|---:|---|"]
+    for page, value in list((payload.get("pages") or {}).items())[:20]:
+        safe_page = str(page).replace("|", "\\|").replace("\n", " ")
+        rows.append(f"| {safe_page} | {value.get('rows')} | {value.get('share_pct')} | "
+                    f"{value.get('baseline_pct')} | {value.get('verdict')} |")
+    codes = sorted({str(f.get("code", "UNKNOWN")) for f in payload.get("findings", [])})
+    rows += ["", "Finding codes: " + (", ".join(codes) if codes else "none"),
+             "", "Recovery: **" + str(recovery.get("action", "UNKNOWN")) + "**.",
+             str(recovery.get("detail", "Read the retained JSON evidence before recovery.")),
+             "", "No automatic baseline acceptance; existing freeze and failure guards remain in force.",
+             "See `docs/reviews/provider-name-workflow-recovery-20261024.md`."]
+    return "\n".join(rows) + "\n"
 
 
 def _find_col(header: Sequence[Any], aliases: set) -> int:

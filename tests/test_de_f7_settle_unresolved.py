@@ -125,13 +125,18 @@ def _without_unres(row):
 
 def _holdback_reference(scorer, max_passes):
     """Today's (v5.152.0) non-stable branch, computed directly: the result plus
-    _f7_settle_holdback on the same row."""
+    _f7_settle_holdback on the same row. v5.158.0 (F-7 v2b): under observe the
+    v2 shadow's tag follows the holdback - the failure row carries no
+    confidence marker, so its shadow is the result itself: stx:p<n> plus the
+    pass-1 -> pass-2 diff, composed by _f7_settle_tag."""
     row = f7._failure_row()
     os.environ[MAX_ENV] = str(max_passes)
     with patch.object(de, "_compute_scores_canonical_first", scorer), \
             patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
         result = de._f7_settle_result(row)
     de._f7_settle_holdback(row, result)
+    if de._f7_settle_mode() == "observe":
+        de._v573_append_warning(row, de._f7_settle_tag("observe", None, result.passes_run, list(result.first_diff)))
     return row
 
 

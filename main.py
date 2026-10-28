@@ -2,12 +2,17 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.6)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.7)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.7 (2026-10-24, FRAMEWORK COMPATIBILITY): /_debug/routes lists and
+counts the effective business routes inside lazy included routers, matching
+the existing signature, ownership and health diagnostics. Authentication,
+route registration and request handling are unchanged.
 
 v8.14.6 (2026-10-21, OBSERVABILITY / SYNC TRUTH): the global auth wall no
 longer answers 401 for a request it ALLOWED. Its fail-closed try/except
@@ -464,7 +469,13 @@ class _StrictJSONResponse(JSONResponse):
 # See the module docstring for the WHY and the valid-Host identity proof.
 # v8.14.6 (2026-10-21): the wall decides inside its fail-closed try and calls
 # downstream outside it, so a downstream error is a 500, not the wall's 401.
-APP_ENTRY_VERSION = "8.14.6"
+# v8.14.7: debug inventory uses the existing effective-route traversal.
+# v8.14.8 (2026-10-28, D1b/D1c): /health pf_gates lists the five env names
+# portfolio_actions 1.17.0 reads per call for its post-earnings and
+# open-ticket ADD guards (no boot line; the v8.14.1 / v8.14.4 gap). Additive
+# keys only; an unset gate reports "unset". No route, auth or engine change.
+# Rollback: remove the keys and restore 8.14.7.
+APP_ENTRY_VERSION = "8.14.8"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -2215,6 +2226,13 @@ _PF_GATE_ENVS: Tuple[str, ...] = (
     # v8.14.4 (2026-10-13): P0-6 research view. portfolio_actions v1.16.0
     # reads it per call (_env_research_view_mode) and prints no boot line.
     "TFB_PF_RESEARCH_VIEW",
+    # v8.14.8 (2026-10-28): D1b post-earnings and D1c open-ticket ADD guards.
+    # portfolio_actions v1.17.0 reads these per call (_env_add_post_earn_mode,
+    # _env_post_earn_sessions, _env_post_earn_sessions_neg,
+    # _env_ticket_cap_mode, _env_ticket_cap) and prints no boot line.
+    "TFB_PF_ADD_POST_EARN", "TFB_PF_POST_EARN_SESSIONS",
+    "TFB_PF_POST_EARN_SESSIONS_NEG", "TFB_PF_MAX_OPEN_TICKETS_MODE",
+    "TFB_PF_MAX_OPEN_TICKETS",
 )
 _OB_GATE_ENVS: Tuple[str, ...] = (
     "TFB_FORECAST_BASIS", "TFB_T10_REQ_ROI_3M_PCT", "TFB_OPP_CASH_FLOOR_MODE",
@@ -2920,9 +2938,12 @@ def create_app() -> FastAPI:
                 content={"status": "error", "error": "unauthorized"},
             )
 
+        effective_routes = list(_iter_effective_routes(
+            getattr(request.app, "routes", []) or [],
+        ))
         route_paths = sorted({
             str(getattr(r, "path", "") or "")
-            for r in (getattr(request.app, "routes", []) or [])
+            for r in effective_routes
         })
         route_sigs = sorted([
             f"{path} [{method}]"
@@ -2944,7 +2965,7 @@ def create_app() -> FastAPI:
             "routes_snapshot": getattr(
                 request.app.state, "routes_snapshot", {}
             ),
-            "app_route_count": len(getattr(request.app, "routes", []) or []),
+            "app_route_count": len(effective_routes),
             "app_route_signature_count": _route_signature_count(
                 request.app, include_builtin=True,
             ),

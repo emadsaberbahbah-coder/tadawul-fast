@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # tests/test_security_pins_20261013.py
 """
-Security pin floors for requirements.txt v1.1.4 -- pure stdlib, ZERO network.
+Security pin floors for requirements.txt v1.1.5 -- pure stdlib, ZERO network.
+
+VERSION 1.1.0 (2026-10-24)
+Add the confirmed aiohttp, framework and coherent OpenTelemetry security
+floors. Retire unused NLTK only with explicit installed/dependency and real
+news-output guards in test_dependency_health_20261024.py. The protobuf 5.x
+and production-pinned CI parity checks remain mandatory.
 
 VERSION 1.0.0 (2026-10-13)
 WHY: the advisory audit (dependency_typing_review.yml: pip-audit==2.9.0
@@ -20,12 +26,13 @@ blocking lean lane. It parses text only; it imports none of the packages.
      opentelemetry-proto 1.28.0 needs >=5.0,<6).
   S3 pyOpenSSL and cryptography are a compatible pair (pyOpenSSL 26.4.x
      needs cryptography >=49,<51; 26.3.x needs >=49,<50).
-  S4 starlette is excluded on purpose: while fastapi is 0.115.x it must stay
-     below 0.47.0 (fastapi 0.115.14 requires starlette<0.47.0).
+  S4 FastAPI and Starlette meet the selected supported security floors;
+     installed metadata, resolver and pip check prove their compatibility.
   S5 every "pkg==ver" pin in ci.yml's contract job equals requirements.txt.
   S6 the httpcore direct-wheel URL pin (skipped by pip-audit) still names
      the version audited on its own: httpcore 1.0.9, no known advisories.
-  S7 the requirements.txt header carries the v1.1.4 dated WHY.
+  S7 the requirements.txt header carries the current dated WHY.
+  S8 OpenTelemetry API/SDK/exporter and instrumentation pins are coherent.
   G1 GOLDEN NEGATIVE: set TFB_SECPIN_BASE=<copy of the pre-change
      requirements.txt (v1.1.3)> and the S1 floors are evaluated against that
      file -- this test then FAILS (12 pins below their fixed versions). It
@@ -45,7 +52,7 @@ import unittest
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = Path(os.environ.get("TFB_SECPIN_REQ", str(ROOT / "requirements.txt")))
@@ -56,12 +63,16 @@ BASE = (os.environ.get("TFB_SECPIN_BASE", "") or "").strip()
 # pip-audit 2.9.0 reported for it (on the old pin, and on the new pin itself:
 # cryptography 49.0.0 carries PYSEC-2026-3552, fixed in 50.0.0).
 SECURITY_FLOORS: Dict[str, str] = {
-    "aiohttp": "3.14.3",
+    "aiohttp": "3.14.4",
+    "fastapi": "0.140.13",
+    "starlette": "1.3.1",
+    "opentelemetry-api": "1.45.1",
+    "opentelemetry-sdk": "1.45.1",
+    "opentelemetry-exporter-otlp": "1.45.1",
     "anyio": "4.14.2",
     "cryptography": "50.0.0",
     "h2": "4.4.1",
     "lxml": "6.1.0",
-    "nltk": "3.10.3",
     "protobuf": "5.29.6",
     "pydantic-settings": "2.14.2",
     "pyjwt": "2.15.0",
@@ -180,12 +191,11 @@ def test_s3_pyopenssl_and_cryptography_are_a_compatible_pair() -> None:
     assert lo <= crypto < hi, "cryptography %r outside pyOpenSSL %r window %r..%r" % (crypto, ossl, lo, hi)
 
 
-def test_s4_starlette_exclusion_matches_fastapi_bound() -> None:
+def test_s4_framework_security_floors_are_met() -> None:
     reqs = _parse_requirements(REQUIREMENTS)
     fastapi = _vtuple(_exact(reqs, "fastapi"))
     starlette = _vtuple(_exact(reqs, "starlette"))
-    if fastapi[:2] == (0, 115):
-        assert starlette < (0, 47, 0), "fastapi 0.115.x requires starlette<0.47.0, got %r" % (starlette,)
+    assert fastapi >= (0, 140, 13) and starlette >= (1, 3, 1)
 
 
 def test_s5_contract_job_pins_follow_requirements() -> None:
@@ -219,8 +229,17 @@ def test_s6_httpcore_url_pin_is_the_separately_audited_version() -> None:
 def test_s7_requirements_header_records_dated_why() -> None:
     head = "\n".join(REQUIREMENTS.read_text(encoding="utf-8").splitlines()[:12])
     m = re.search(r"requirements\.txt \(v(\d+\.\d+\.\d+)\)", head)
-    assert m and _vtuple(m.group(1)) >= (1, 1, 4), head
-    assert "WHY v1.1.4 (2026-10-13)" in REQUIREMENTS.read_text(encoding="utf-8")
+    assert m and _vtuple(m.group(1)) >= (1, 1, 5), head
+    assert "WHY v1.1.5 (2026-10-24)" in REQUIREMENTS.read_text(encoding="utf-8")
+
+
+def test_s8_otel_security_family_is_coherent() -> None:
+    reqs = _parse_requirements(REQUIREMENTS)
+    # Published SDK and instrumentation metadata bind these exact families.
+    for name in ("api", "sdk", "exporter-otlp"):
+        assert _exact(reqs, "opentelemetry-" + name) == "1.45.1"
+    for name in ("instrumentation", "instrumentation-asgi", "instrumentation-fastapi"):
+        assert _exact(reqs, "opentelemetry-" + name) == "0.66b1"
 
 
 def test_g1_golden_negative_base_requirements_fail_the_floors() -> None:

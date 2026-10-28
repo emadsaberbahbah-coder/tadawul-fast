@@ -1,5 +1,10 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.5 (2026-10-24) -- CANONICAL PROSPECTIVE TARGETS
+# New rows use forecast-price-derived percentage points and schema receipts.
+# Historical rows and promotion thresholds are unchanged; criterion4 now
+# enforces the stricter canonical forecast-provenance basis. Set the repository
+# TRACK_CANONICAL_TARGETS variable to '0' to restore legacy creation.
 # VERSION 1.0.4 (2026-10-21) -- HISTORICAL TARGET-SESSION CLOSE (OWNER OPT-IN)
 # WHY (2026-10-21): 1.0.3 stops new losses only when a run lands inside a
 # record's target session; records whose session already passed stay ACTIVE for
@@ -350,7 +355,7 @@ jobs:
           # reruns use the same run ID. Canonical targets require price evidence.
           # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
           # Rollback: off/0; historical target values and publications stay.
-          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
@@ -386,16 +391,20 @@ jobs:
           # in NEITHER the champion nor the alternates bucket and is therefore
           # invisible to the regret split.
           TFB_TRACK_SHADOW_COHORTS: "1"
-          # (2026-09-22) P-158 TARGET-UNIT SENTRY - v6.39.0+.
-          # observe: criterion-4 row untouched, stored rows never rewritten;
-          # adds the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9
-          # and ONE [PERF-UNIT] _Run_Log line per run (fraction/percent/
-          # unresolved counts). Explicit words only: off|observe|enforce.
-          # KILL-SWITCH: delete this line -> off (default = legacy).
-          # Hardcoded, not a repo Variable (S-1 lesson 2026-09-10: a Variable
-          # can be silently unset). Enforce = separate sitting with the S-1
-          # criterion-4 boundary note.
-          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # v6.48.0: criterion4 uses canonical forecast provenance and pp.
+          # Unproven, ambiguous or duplicate targets cannot supply a sample.
+          # Historical target cells and S1 thresholds remain unchanged.
+          # Rollback: set both workflow lines to observe; legacy stays diagnostic.
+          TFB_PERF_TARGET_UNIT_SENTRY: "enforce"
+          # (2026-10-25) v6.49.0 [BOARD-COVERAGE]: the live Top_10_Investments
+          # board's seated symbols (incl. GRACE ghosts) join the forced-coverage
+          # set, so Signal_History / Performance_Log record the recommendations
+          # the Apps Script board actually publishes (24 Oct: none of the 10
+          # seated names had a snapshot). Default off = v6.48.0 byte-identical.
+          # Mirrored VERBATIM in daily_sync.yml (ENV PARITY). Read-back: the
+          # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
+          # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
+          TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
           # plain secret, fall back to the _B64 variant if that is the one set.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}

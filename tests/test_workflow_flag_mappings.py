@@ -18,7 +18,7 @@ import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 TRACKER_DEFAULTS = {"TRACK_DEDUP_MATURED": "off", "TRACK_RISK_BLANK": "0",
-                    "TRACK_CANONICAL_TARGETS": "0", "TRACK_SIGNAL_PUBLICATION_MODE": "off"}
+                    "TRACK_CANONICAL_TARGETS": "1", "TRACK_SIGNAL_PUBLICATION_MODE": "off"}
 SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_TAB": "off",
     "TFB_SYNC_RETIRE_TAB_NAME": "_Retired_Symbols",
@@ -56,7 +56,7 @@ def _mapping(name, default):
 
 
 @pytest.mark.parametrize("name,default", TRACKER_DEFAULTS.items())
-def test_both_tracker_steps_map_the_same_default_off_variable(name, default):
+def test_both_tracker_steps_map_the_same_declared_default(name, default):
     for workflow_name, job_name in (
         ("track_performance.yml", "performance-clock"),
         ("daily_sync.yml", "sync-dashboard"),

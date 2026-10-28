@@ -69,3 +69,23 @@ def test_existing_enforce_modes_never_claim_off_or_observe_is_armed(monkeypatch)
             assert rows[name]['set']
             assert rows[name]['armed'] is (mode.strip().lower() == 'enforce')
             assert rows[name]['scope'] == 'render'
+
+
+def test_scoring_settle_pages_scope_is_visible(monkeypatch):
+    """F-7 v2 (engine 5.157.0+): the enforce scope is declared beside
+    TFB_SCORING_SETTLE, Render-scoped, a value flag that is never a kill
+    switch - unset reads as the every-market default, a configured subset
+    shows as SET with its value."""
+    from scripts.verify_deployment import check_flags
+
+    flags = {name: (default, required) for name, default, _meaning, required in literal('FLAGS')}
+    assert flags['TFB_SCORING_SETTLE_PAGES'] == ('', False)
+    assert 'TFB_SCORING_SETTLE_PAGES' in literal('_VALUE_FLAGS')
+    assert 'TFB_SCORING_SETTLE_PAGES' not in literal('_WORKFLOW_SCOPED')
+    monkeypatch.delenv('TFB_SCORING_SETTLE_PAGES', raising=False)
+    row = {r['flag']: r for r in check_flags()}['TFB_SCORING_SETTLE_PAGES']
+    assert (row['set'], row['armed'], row['value'], row['scope'], row['kind']) == (False, False, '', 'render', 'value')
+    monkeypatch.setenv('TFB_SCORING_SETTLE_PAGES', 'Global_Markets,Commodities_FX,Mutual_Funds')
+    row = {r['flag']: r for r in check_flags()}['TFB_SCORING_SETTLE_PAGES']
+    assert row['set'] and row['armed'] and row['value'] == 'Global_Markets,Commodities_FX,Mutual_Funds'
+    assert not row['kill_switch'] and row['scope'] == 'render'
