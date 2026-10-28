@@ -251,7 +251,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
-    ("run_shadow_board", "1.5.0", "shadow board"),
+    ("run_shadow_board", "1.6.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
