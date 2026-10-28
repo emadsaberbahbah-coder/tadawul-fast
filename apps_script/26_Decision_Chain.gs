@@ -22,7 +22,9 @@
  * cockpit upserts its own Top_10_Investments row (endpoint
  * /sheet-rows/opportunity-candidates) on every render (Codex review on
  * #866), and GAS-written keys such as 'Last Global Update' are not source
- * evidence. Attempts and holds are pruned per board: a board keeps the
+ * evidence. Only a source WITHHELD receipt waits: a transient read failure
+ * inside the render ('... unavailable', '... read failed', 'unreadable')
+ * and every other unverified shape keep the v1.0.2 next-tick retry. Attempts and holds are pruned per board: a board keeps the
  * attempts (and hold) of its own current cohort while the other board
  * works on a different run (My_Portfolio and Global_Markets can carry
  * different runs; Codex review on #866), so two unverified boards never
@@ -269,9 +271,18 @@ function tfbDcReceiptCore_(before, after, run, startedMs, nowMs, parseStamp) {
   var receipt = after.match(/(?:^|\|)\s*source readiness VERIFIED \(run ([1-9]\d*)\)(?=\s*(?:\||$))/);
   if (occurrences.length !== 1 || !receipt || receipt[1] !== String(run)) {
     /* v1.0.3: the board rendered, but what it read did not verify the run.
-     * Nothing changes until the sync writes _Status again, so the caller
-     * waits for that instead of re-rendering on the next tick. */
-    return {ok: false, reason: 'native source receipt does not verify the planned run', wait: true};
+     * When that is a source WITHHELD (one receipt, a readiness reason), it
+     * cannot change until the sync writes _Status again, so the caller
+     * waits for that instead of re-rendering on the next tick. A transient
+     * read failure inside the render ('source status unavailable',
+     * 'publication status unavailable', '... read failed', 'unreadable')
+     * or any other unverified shape keeps the v1.0.2 bounded next-tick
+     * retry (Codex review on #866). */
+    var withheld = after.match(/(?:^|\|)\s*source readiness WITHHELD:\s*([^|]*)/i);
+    var transient = !withheld ||
+        /\bunavailable\b|\bunreadable\b|read (?:failed|error)|timed? ?out|exception/i.test(withheld[1]);
+    return {ok: false, reason: 'native source receipt does not verify the planned run',
+            wait: occurrences.length === 1 && !transient};
   }
   var status = after.match(/^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*status:\s*ok(?=\s*(?:\||$))/i);
   var stamp = status && typeof parseStamp === 'function'

@@ -714,5 +714,35 @@ check('C35 v1.0.3: two unverified boards on different runs keep each other\'s ho
   assert.equal(st.hold['pd:' + NEXT], undefined);
 });
 
-console.log('RESULT ' + passed + '/35 PASS');
-assert.equal(passed, 35);
+check('C36 v1.0.3: a transient readiness read failure keeps the next-tick retry; only a source WITHHELD waits', () => {
+  // Codex review on #866: an unavailable-status receipt followed by a healthy renderer
+  const stamp = () => 'Last run ' + gasFormatDate(new Date(world.clock.now), 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss') + ' | status: ok | ';
+  const o = {now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    t10Status: () => stamp() + 'output: WITHHELD | source readiness WITHHELD: source status unavailable',
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.deepEqual(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).hold, {});
+  assert.doesNotMatch(w.runLog[0][5], /waiting for _Status/);
+  o.t10Status = null;                                           // the service recovered
+  w.setNow(T0 + 8 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.equal(w.calls.t10, 2);
+  // the PD side: 'publication status unavailable' is transient too
+  const c = w.ctx;
+  const after = (reason) => 'Last run 2026-10-16 03:58:30 | status: ok | source readiness WITHHELD: ' + reason;
+  const core = (txt) => c.tfbDcReceiptCore_('before', txt, RUN, T0, T0 + 60000, () => T0 + 30000);
+  for (const r of ['publication status unavailable', 'Global_Markets approved scope unverified: membership receipt unavailable',
+                   'physical source grid unavailable', 'verdict read failed', 'stamps unreadable']) {
+    assert.equal(core(after(r)).wait, false, r);
+  }
+  for (const r of ['Commodities_FX acquired 430/453 below 95%', 'consumed 1 holdings vs 2 published rows',
+                   'Mutual_Funds available pool 2469 below the floor']) {
+    assert.equal(core(after(r)).wait, true, r);
+  }
+  assert.equal(core('Last run x | status: ok | no source receipt').wait, false);
+  assert.equal(core('Last run x | status: ok | source readiness VERIFIED (run ' + OLD + ')').wait, false);
+});
+
+console.log('RESULT ' + passed + '/36 PASS');
+assert.equal(passed, 36);
