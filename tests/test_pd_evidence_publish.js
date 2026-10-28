@@ -209,7 +209,15 @@ if (process.env.PD_BASE) {
   // every v1.5.15 top-level function is still present
   const names = (s) => (s.match(/^function\s+([A-Za-z_$][\w$]*)\s*\(/mg) || []).map((m) => m.replace(/^function\s+/, '').replace(/\s*\($/, ''));
   const nb = names(base), nn = new Set(names(src));
-  ok(nb.every((n) => nn.has(n)) && nn.size === nb.length + 8, 'P9 zero functions removed; exactly 8 added (' + nb.length + ' -> ' + nn.size + ')');
+  // merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16: the delivered file also carries
+  // #780's three panel-preserve functions (tests/js/pf_panel_preserve.test.js).
+  const PD780 = ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'];
+  // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17, which adds four pdPostEarn*
+  // functions (tests/test_pd_post_earn_inputs.js); they count too.
+  const PD869 = ['pdPostEarnMode_', 'pdPostEarnRiyadhDay_', 'pdPostEarnCore_', 'pdPostEarnBody_'];
+  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
+     PD869.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + 8 + PD869.length + PD780.length,
+     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('P9 PASS golden negative on the v1.5.15 base ' + sha.slice(0, 12));
 } else {
   console.log('P9 SKIP (set PD_BASE=<v1.5.15 file> to run the golden negative)');

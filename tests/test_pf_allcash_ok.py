@@ -193,7 +193,12 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     text = GAS.read_text(encoding="utf-8")
     # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
     # 2026-10-28: v1.5.17 (post-earnings inputs) stacks on top; pin moved again
-    assert " * Version: 1.5.17\n" in text and "var PD_VERSION = '1.5.17';" in text
+    # merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17;
+    # it adds pdPanelPreserveMode_ / pdPanelPreserve_ / pdPanelSeedValue_ and 144
+    # lines, all ASCII (tests/js/pf_panel_preserve.test.js).
+    m = re.search(r"var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';", text)
+    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 17), m
+    assert " * Version: %s.%s.%s\n" % m.groups() in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "var PD_VERSION = '1.5.16';" not in text
     assert "\r" not in text
@@ -205,12 +210,23 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-10-28: v1.5.17 (post-earnings inputs) adds four pdPostEarn* functions
     assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdIbkrArmFollowUp_", "pdIbkrEvidenceFollowUp",
                                   "pdIbkrFollowUpCore_", "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
-                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_", "pdPostEarnBody_", "pdPostEarnCore_",
-                                  "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]
+                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_", "pdPanelPreserveMode_",
+                                  "pdPanelPreserve_", "pdPanelSeedValue_", "pdPostEarnBody_", "pdPostEarnCore_",
+                                  "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]   # + #780
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
     # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 144   # + #780
+
+
+# merge note 2026-10-25 (#780): the three seed lines buildPortfolioDecisionLayout
+# replaced with pdPanelSeedValue_, matched as whole lines so the pdReadPanel_
+# fallback (which shares their substrings) stays guarded.
+PD780_SEED_REMOVED = (
+    "    var seed = defaults.hasOwnProperty(item.label) &&",
+    "               pdHasValue_(defaults[item.label]) ? defaults[item.label]",
+    "                                                 : item.def;",
+)
 
 
 def test_added_lines_are_es5_and_ascii(base_source):
@@ -221,7 +237,11 @@ def test_added_lines_are_es5_and_ascii(base_source):
              if line.startswith("+") and not line.startswith("+++")]
     removed = [line[1:] for line in difflib.unified_diff(base, now, n=0, lineterm="")
                if line.startswith("-") and not line.startswith("---")]
-    assert 95 <= len(added) <= 110 and len(removed) <= 10, (len(added), len(removed))
+    # merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16. Against
+    # this v1.5.14 base the delivered file also carries #780's 145 added / 3 removed
+    # panel-preserve lines (the version swaps are already in main's counts); the three
+    # removed seed lines are matched exactly below.
+    assert 95 + 145 <= len(added) <= 110 + 145 and len(removed) <= 10 + 3, (len(added), len(removed))
     code = [line for line in added if not re.match(r"\s*(\*|/\*|//)", line)]
     assert len(code) >= 40, len(code)
     for line in added:
@@ -239,4 +259,4 @@ def test_added_lines_are_es5_and_ascii(base_source):
             "var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,",
             "pool.rows.length, payload, binding);",
             "var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +",
-            "statusCell.setValue(pdStatusLine_(String(payload.status || '?'),")), repr(line)
+            "statusCell.setValue(pdStatusLine_(String(payload.status || '?'),")) or line in PD780_SEED_REMOVED, repr(line)

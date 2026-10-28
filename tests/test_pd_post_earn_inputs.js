@@ -245,7 +245,12 @@ for (const f of FUNCS) ok(block.indexOf('function ' + f + '(') >= 0, 'E9 invento
 const h0 = src.indexOf(' * v1.5.17 (2026-10-28)');
 const h1 = src.indexOf(' * v1.5.16 (2026-10-26)');
 ok(h0 > 0 && h1 > h0 && ![...src.slice(h0, h1)].some((ch) => ch.charCodeAt(0) > 126), 'E9 WHY block ASCII, above v1.5.16');
-ok((src.match(/var PD_VERSION = '1\.5\.17';/g) || []).length === 1 && /^ \* Version: 1\.5\.17$/m.test(src), 'E9 version lockstep');
+// merge note 2026-10-28 (#780): panel preserve is v1.5.18 over this v1.5.17; the delivered file may sit above
+// v1.5.17, so the floor is v1.5.17 and the header line stays in lockstep with PD_VERSION.
+const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m) || [];
+ok(pdv.length === 4 && (src.match(/var PD_VERSION = '/g) || []).length === 1 &&
+   new RegExp('^ \\* Version: ' + pdv[1] + '\\.' + pdv[2] + '\\.' + pdv[3] + '$', 'm').test(src) &&
+   (+pdv[1]) * 1e6 + (+pdv[2]) * 1e3 + (+pdv[3]) >= 1005017, 'E9 version lockstep');
 ok(src.indexOf(" * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION") > 0 && src.indexOf(" * v1.5.15 (2026-10-24)  (PD-ALLCASH") > 0, 'E9 prior WHY blocks kept');
 const metaFn = extract(src, 'pdMetaLine_');
 ok(!/\b(let|const)\s|=>|`/.test(metaFn) && ![...metaFn].some((ch) => ch.charCodeAt(0) > 126), 'E9 pdMetaLine_ ES5/ASCII');
@@ -262,7 +267,11 @@ if (process.env.PD_BASE) {
   ok(pdMetaLine_(meta) === plain && pdMetaLine_(armed) === plain, 'E10 the base line ignores the guard blocks (no read-back)');
   const names = (s) => (s.match(/^function\s+([A-Za-z_$][\w$]*)\s*\(/mg) || []).map((m) => m.replace(/^function\s+/, '').replace(/\s*\($/, ''));
   const nb = names(base), nn = new Set(names(src));
-  ok(nb.every((n) => nn.has(n)) && nn.size === nb.length + FUNCS.length, 'E10 zero functions removed; exactly ' + FUNCS.length + ' added (' + nb.length + ' -> ' + nn.size + ')');
+  // merge note 2026-10-28 (#780): the delivered file also carries #780's three panel-preserve functions
+  // (tests/js/pf_panel_preserve.test.js), which the v1.5.16 base lacks.
+  const PD780 = ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'];
+  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + FUNCS.length + PD780.length,
+     'E10 zero functions removed; exactly ' + FUNCS.length + ' added + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('E10 PASS golden negative on the v1.5.16 base ' + sha.slice(0, 12));
 } else {
   console.log('E10 SKIP (set PD_BASE=<v1.5.16 file> to run the golden negative)');
