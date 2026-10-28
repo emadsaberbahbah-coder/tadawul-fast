@@ -170,7 +170,7 @@ SCRIPT_VERSION = "1.0.61"  # v1.0.49 (2026-10-11) - pins data_engine_v2 5.152.0-
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.8', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
     ('core.symbols.normalize', '__version__', '5.7.0', 'symbol normalization'),
@@ -201,8 +201,8 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
      "1.28.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.16.1", "portfolio actions"),
-    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",
+     "1.17.0", "portfolio actions"),
+    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
      "analysis sheet publication route"),
