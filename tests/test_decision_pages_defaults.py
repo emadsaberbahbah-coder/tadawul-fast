@@ -31,7 +31,8 @@ GOLD   G1      against the pre-flip tree (TFB_TEST_LAUNCH_BASE = a directory
                same three files, saved flat (builder 1.28.1, actions 1.17.0
                from #869, engine 5.159.2); ac6888c1 now fails the checks too.
                Since the second 2026-10-28 merge: `git show 974bc418:<path>`
-               (builder 1.28.1, actions 1.17.1 from #870, engine 5.159.3).
+               (builder 1.28.1, actions 1.17.1 from #870, engine 5.159.3);
+               9c96e453 now fails the checks too.
 
 Run:  python tests/test_decision_pages_defaults.py   (prints PASS k/k)
       pytest -q tests/test_decision_pages_defaults.py
@@ -120,7 +121,7 @@ def case_d4_readback_declares_enforce(_mp, _tmp):
 
 def case_d5_versions_and_verifier(_mp, _tmp):
     assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 28, 2)   # merge note 2026-10-27 (#779): the defaults build is 1.28.2 over #778's 1.28.1
-    assert _vt(pa.PORTFOLIO_ACTIONS_VERSION) >= (1, 17, 2)   # merge note 2026-10-28 (#779): 1.17.2 over #869's 1.17.0 (open #870 claims 1.17.1)
+    assert _vt(pa.PORTFOLIO_ACTIONS_VERSION) >= (1, 17, 2)   # merge note 2026-10-28 (#779): 1.17.2 over #869's 1.17.0 (open #870 claims 1.17.1); second merge 2026-10-28: #870 shipped 1.17.1, this build stays 1.17.2
     assert _vt(de.__version__) >= (5, 160, 0)
     text = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     for name in ("TFB_OPP_VENUE_CAL_EXT", "TFB_OPP_FRESHNESS_ALERT"):
