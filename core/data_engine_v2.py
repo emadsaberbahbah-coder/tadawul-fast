@@ -2,8 +2,28 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.2
 ================================================================================
+
+WHY v5.159.2 - THE NAME RESCUE ACCEPTS THE VERIFIED YAHOO ALIAS IT ASKED FOR
+(TFB_YAHOO_ID_ALIAS, the normalize v5.7.0 flag; off = byte-identical)
+- EVIDENCE: final audit of sync run 40673830237 (28 Oct 15:48 Riyadh):
+  coverage FAIL, the only one - "Commodities_FX name coverage 98.45% below
+  99.00%". The seven coins aliased by normalize v5.7.0 (SUI-USD ->
+  SUI20947-USD, GRT6719-USD, APT21794-USD, UNI7083-USD, COMP5692-USD,
+  IMX10603-USD, STX4847-USD) carry a fresh yahoo_chart price and a BLANK
+  Name with the warning identity_echo_refused: 446/453 named.
+- CAUSE: BB-1 (_apply_identity_rescue) asks the chart meta for the page
+  symbol; the provider sends Yahoo the verified alias and the meta echoes
+  it (SUI20947-USD). _bb1_echo_matches compares raw, canonical and base
+  forms of SUI-USD only, so the id we requested reads as a contradicting
+  echo and the name is refused.
+- FIX: _bb1_echo_matches also accepts an echo equal to
+  normalize.yahoo_id_alias(requested) - exactly the verified id for one of
+  the nine rows, only while TFB_YAHOO_ID_ALIAS=1. Every other comparison,
+  the class guard, the crypto name screen and the BA-2 fallback are
+  unchanged; a crossed coin (SUI-USD answered as GRT6719-USD) is still
+  refused. One helper added (_bb1_alias), one function changed.
 
 WHY v5.159.1 - THE FUND-CACHE HIT GATE ALSO RUNS ON THE 12M FORECAST
 (TFB_EODHD_ANALYST_TARGET unchanged; off = byte-identical to v5.158.0)
@@ -4451,7 +4471,10 @@ from core.financial_units import (
 #   v5.157.0 publishes and its f7_settle tag shows the v2 result (stx when
 #   enforce would hold the row back). Off is byte-identical.
 #   Tests: tests/test_de_f7_settle_shadow.py.
-__version__ = "5.159.1"
+# v5.159.2 (2026-10-28): BB-1 echo gate accepts the verified Yahoo alias it
+#   requested (see WHY v5.159.2). Off (TFB_YAHOO_ID_ALIAS unset) is
+#   byte-identical. Tests: tests/test_yahoo_id_alias.py (A10-A12).
+__version__ = "5.159.2"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -18516,9 +18539,26 @@ def _bb1_echo_matches(requested: Any, echo: Any) -> bool:
         got.discard("")
         if not want or not got:
             return True
-        return bool(want & got)
+        if want & got:
+            return True
+        # v5.159.2: the provider was sent the verified alias for this page
+        # symbol (normalize v5.7.0, TFB_YAHOO_ID_ALIAS=1); an echo of exactly
+        # that id is the security we asked for, not a borrowed identity.
+        alias = _bb1_alias(requested)
+        return bool(alias) and alias in got
     except Exception:
         return True
+
+
+def _bb1_alias(requested: Any) -> str:
+    """v5.159.2: normalize.yahoo_id_alias(requested), upper-cased; '' when the
+    alias flag is off, the symbol is not one of the nine, or the helper is
+    unavailable. Never raises."""
+    try:
+        from core.symbols.normalize import yahoo_id_alias
+        return _safe_str(yahoo_id_alias(_safe_str(requested))).strip().upper()
+    except Exception:
+        return ""
 
 
 def _bb2_identity_guard_enabled() -> bool:
