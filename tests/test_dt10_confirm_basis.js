@@ -374,7 +374,7 @@ function battery() {
   });
 
   test('T5 ES5/ASCII lint of the diff: added lines ES5 and ASCII, no non-ASCII code point added or removed, file compiles', function () {
-    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer
+    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer; main's v1.18.0 layer since 2026-10-28
     var baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
     for (var i = 0; i < bl.length; i++) baseLines[bl[i]] = true;
     var added = nl.filter(function (l) { return !baseLines[l]; });
@@ -405,7 +405,7 @@ function battery() {
   });
 
   test('T6 inventory: zero functions and zero vars removed vs the base; exactly the designed names added', function () {
-    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer
+    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer; main's v1.18.0 layer since 2026-10-28
     function names(src, re) { var out = {}, m; while ((m = re.exec(src))) out[m[1]] = true; return out; }
     var fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(newSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
     var removed = Object.keys(fb).filter(function (k) { return !fn[k]; });

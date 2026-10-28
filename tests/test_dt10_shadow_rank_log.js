@@ -350,14 +350,14 @@ new vm.Script(src, { filename: '16_Decision_Top10.gs' });
 console.log('S8 PASS wiring, lockstep, lint, inventory');
 
 // -------------------------------------------------------- S9 golden negative
-const base = history.v1160Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1
+const base = history.v1160Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1; v1.18.1 over #855's v1.18.0 since 2026-10-28
 const sha = crypto.createHash('sha256').update(base).digest('hex');
 ok(sha === history.V1160_SHA256, 'S9 base is the reviewed v1.16.0 file (SHA-256 pinned)');
 ok(/var DT10_VERSION = '1\.16\.0';/.test(base) && base.indexOf('ShadowLog') < 0 && base.indexOf('DT10_SHADOW') < 0 &&
    NEW_FUNCS.every((f) => base.indexOf('function ' + f + '(') < 0), 'S9 the base lacks every added name and the status token');
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
 // 2026-10-27: the census compares v1.16.0 with the v1.17.0 file rebuilt from the delivered one (v1.17.1 edits reversed, SHA-256 pinned)
-const s1170 = history.v1170Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1
+const s1170 = history.v1170Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1; v1.18.1 over #855's v1.18.0 since 2026-10-28
 ok(crypto.createHash('sha256').update(s1170).digest('hex') === history.V1170_SHA256, 'S9 the v1.17.0 file is rebuilt exactly (SHA-256 pinned)');
 const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(s1170, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
 const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(s1170, /^var\s+([A-Za-z_$][\w$]*)/mg);
