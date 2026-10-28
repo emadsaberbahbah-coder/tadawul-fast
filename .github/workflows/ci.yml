@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- DT10 v1.18.1 HELD-SEAT HARNESS
+# VERSION 1.1.57 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- DT10 v1.18.1 HELD-SEAT HARNESS
 #
-# v1.1.56 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.54 first, 1.1.30-1.1.54 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# v1.1.57 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.54 first, 1.1.30-1.1.54 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846 and 1.1.55 by open #870): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
 # native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.18.1
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
@@ -13,9 +13,9 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.55 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.55 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.54 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.56 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.54 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846 and 1.1.55 by open #870): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
