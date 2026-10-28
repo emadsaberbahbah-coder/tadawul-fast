@@ -1,4 +1,4 @@
-/* 26_Decision_Chain v1.0.2: refresh Portfolio_Decision and Top_10 when the
+/* 26_Decision_Chain v1.0.3: refresh Portfolio_Decision and Top_10 when the
  * sync's data lands. Runs the REAL 10_My_Portfolio, 11_Manual_Refresh_
  * Coordinator, 16_Decision_Top10 and 26_Decision_Chain sources in one vm (the
  * shared Apps Script namespace) with service stubs; only the two refresh
@@ -356,9 +356,17 @@ check('C18 v1.0.2: HTTP-ok Portfolio_Decision with WITHHELD source receipt remai
   assert.equal(st.pd, '');
   assert.equal(st.attempts['pd:' + RUN], 1);
   assert.match(w.runLog[0][5], /native source receipt/);
-  // Source repaired: a subsequent genuine render may complete the same cohort.
-  o.pdStatus = null;
+  assert.match(w.runLog[0][5], /waiting for _Status to change/);   // v1.0.3
+  // v1.0.3: nothing changed in _Status -> the same cohort is not re-rendered;
+  // the held Portfolio_Decision no longer blocks the Top_10 step.
   w.setNow(T0 + 5 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  assert.equal(w.calls.pd, 1);
+  // Source repaired = the sync re-published My_Portfolio (its _Status row
+  // changed): a subsequent genuine render may complete the same cohort.
+  o.pdStatus = null;
+  o.status[0][1] = riyadh(T0 + 6 * 60000);
+  w.setNow(T0 + 10 * 60000);
   assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
   st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
   assert.equal(st.pd, RUN);
@@ -505,5 +513,121 @@ check('C28 v1.0.2: invalid timezone and non-roundtripping native stamps fail clo
   assert.equal(w.ctx.tfbDcScriptStampMs_(text, T0, T0), null);
 });
 
-console.log('RESULT ' + passed + '/28 PASS');
-assert.equal(passed, 28);
+// A real WITHHELD render carries its own Last run stamp (the board changes each time).
+const WITHHELD_T10 = () => 'Last run ' + gasFormatDate(new Date(world.clock.now), 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss') +
+  ' | status: ok | output: WITHHELD | source readiness WITHHELD: Commodities_FX acquired 430/453 below 95%';
+
+check('C29 v1.0.3: a WITHHELD Top_10 render is not repeated while _Status is unchanged; a changed _Status retries it', () => {
+  const kv = readyKv(RUN, RUN);
+  const cfxRow = ['Commodities_FX', riyadh(GM_AT - 60000), 'PARTIAL', 'acquired=430/453 run=' + RUN,
+                  'backend:run_dashboard_sync', '', 453, 60, 900, ''];
+  const o = {now: T0, status: readyStatus(OLD).concat([cfxRow]), kv, t10Status: WITHHELD_T10,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  let st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.attempts['t10:' + RUN], 1);
+  assert.match(String(st.hold['t10:' + RUN]), /^[0-9a-z]+-\d+$/);
+  assert.equal(w.runLog[0][1], 'ERROR');
+  assert.match(w.runLog[0][5], /does not verify the planned run \| waiting for _Status to change/);
+  // the 04:05 and 04:09 ticks of 28 Oct: nothing changed -> no render, no ERROR row
+  for (const min of [5, 9, 30, 120]) {
+    w.setNow(T0 + min * 60000);
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
+  }
+  assert.equal(w.calls.t10, 1);
+  assert.equal(w.runLog.length, 1);
+  // the inline recovery rewrote the Commodities_FX page row -> retried once
+  cfxRow[1] = riyadh(T0 + 125 * 60000);
+  cfxRow[2] = 'SUCCESS';
+  cfxRow[3] = 'acquired=439/453 run=' + RUN;
+  w.setNow(T0 + 126 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);   // still WITHHELD in this synthetic board
+  assert.equal(w.calls.t10, 2);
+  st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.equal(st.attempts['t10:' + RUN], 2);
+  w.setNow(T0 + 131 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' did not verify; waiting for _Status to change');
+  // a verifying render after the next _Status change completes the cohort and clears the hold
+  o.t10Status = null;
+  o.kv['TFB Feed Global_Markets'] = feed('OK', RUN, T0 + 135 * 60000);
+  w.setNow(T0 + 136 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual([st.t10, st.attempts, st.hold], [RUN, {}, {}]);
+});
+
+check('C30 v1.0.3: the attempts budget still bounds a cohort that keeps rendering WITHHELD', () => {
+  const o = {now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN), t10Status: WITHHELD_T10,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}};
+  const w = world(o);
+  for (let i = 0; i < 3; i++) {
+    w.setNow(T0 + i * 20 * 60000);
+    o.kv['TFB Feed Global_Markets'] = feed('PARTIAL_FRESH', RUN, GM_AT + i * 60000);   // _Status changed each time
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  }
+  o.kv['TFB Feed Global_Markets'] = feed('PARTIAL_FRESH', RUN, GM_AT + 9 * 60000);
+  w.setNow(T0 + 70 * 60000);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Top_10 run ' + RUN + ' gave up after 3 attempts');
+  assert.equal(w.calls.t10, 3);
+});
+
+check('C31 v1.0.3: thrown refreshes and an unchanged board keep the v1.0.2 next-tick retry (no hold)', () => {
+  const thrown = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN), t10Throws: true,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(thrown.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.deepEqual(JSON.parse(thrown.props.TFB_DECISION_CHAIN_STATE).hold, {});
+  thrown.setNow(T0 + 8 * 60000);
+  assert.equal(thrown.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.equal(thrown.calls.t10, 2);
+  const old = 'Last run ' + riyadh(T0).slice(0, 19) + ' | status: ok | source readiness VERIFIED (run ' + RUN + ')';
+  const early = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN), t10Initial: old, keepT10Status: true,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}});
+  assert.equal(early.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.deepEqual(JSON.parse(early.props.TFB_DECISION_CHAIN_STATE).hold, {});
+  assert.doesNotMatch(early.runLog[0][5], /waiting for _Status/);
+  early.setNow(T0 + 8 * 60000);
+  assert.equal(early.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.equal(early.calls.t10, 2);
+});
+
+check('C32 v1.0.3: an unreadable _Status fingerprint never holds; the fingerprint core is deterministic', () => {
+  const w = world({now: T0});
+  const c = w.ctx;
+  assert.equal(c.tfbDcFingerprintCore_([], []), '');
+  assert.equal(c.tfbDcFingerprintCore_([['', null, undefined]], [['', '']]), '');
+  const a = c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]);
+  assert.equal(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'y', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=1']]));
+  assert.notEqual(a, c.tfbDcFingerprintCore_([['My_Portfolio', 'x', 'SUCCESS']], [['TFB Feed Global_Markets', 'OK | run=2']]));
+  assert.notEqual(c.tfbDcFingerprintCore_([[new Date(1000)]], []), c.tfbDcFingerprintCore_([[new Date(2000)]], []));
+  assert.match(a, /^[0-9a-z]+-\d+$/);
+  // plan: a hold without a readable fingerprint is ignored (retry as v1.0.2)
+  const st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {'t10:1': 1}, observed: {}, hold: {'t10:1': 'abc-9'}};
+  const base = {mode: 'on', nowMs: T0, state: st, pd: {available: false}, t10: {available: true, gmRun: '1', decisionRun: '1'},
+    inflight: false, cockpitRunning: false, quiet: false, automationAllowed: true};
+  assert.equal(c.tfbDcPlanCore_(Object.assign({}, base, {statusFp: ''})).action, 't10');
+  assert.equal(c.tfbDcPlanCore_(Object.assign({}, base, {statusFp: 'abc-9'})).action, 'none');
+  assert.equal(c.tfbDcPlanCore_(Object.assign({}, base, {statusFp: 'zzz-9'})).action, 't10');
+  // observe mode plans from a view without attempts or holds (unchanged)
+  const ob = world({now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN),
+    props: {TFB_DECISION_CHAIN: 'observe', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD, hold: {['t10:' + RUN]: 'x-1'}})}});
+  assert.equal(ob.ctx.tfbDecisionChainTick(), 'observed t10 run ' + RUN);
+});
+
+check('C33 v1.0.3: a hold is pruned with its cohort when the next run arrives', () => {
+  const o = {now: T0, status: readyStatus(OLD), kv: readyKv(RUN, RUN), t10Status: WITHHELD_T10,
+    props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: JSON.stringify({pd: OLD})}};
+  const w = world(o);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + RUN);
+  assert.ok(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).hold['t10:' + RUN]);
+  Object.assign(o.kv, readyKv(NEXT, NEXT));
+  w.setNow(T0 + 3 * 3600000);   // 06:58 Riyadh, outside the quiet windows
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'failed t10 run ' + NEXT);
+  const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual(Object.keys(st.attempts), ['t10:' + NEXT]);
+  assert.deepEqual(Object.keys(st.hold), ['t10:' + NEXT]);
+});
+
+console.log('RESULT ' + passed + '/33 PASS');
+assert.equal(passed, 33);

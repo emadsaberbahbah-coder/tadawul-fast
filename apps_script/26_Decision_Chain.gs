@@ -1,8 +1,29 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.2 (2026-10-23)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.3 (2026-10-28)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.3 -- wait for _Status to change before re-rendering a board whose
+ * receipt did not verify. _Run_Log since 27 Oct: all 10 ERROR rows are this
+ * handler with "native source receipt does not verify the planned run" -
+ * the 04:00, 04:05 and 04:09 ticks each re-rendered the same WITHHELD
+ * Top_10 (Commodities_FX acquired 430/453 below 95%), about 2 min of Apps
+ * Script time each, with nothing changed between them: the receipt is
+ * derived from _Status, and only the sync writes _Status. Now, when an
+ * attempt renders and its receipt does not verify the planned run, the
+ * chain records the _Status fingerprint it planned from (A:J rows and L:M
+ * keys, one bounded read per tick) under the attempt key; later ticks skip
+ * that key while the fingerprint is unchanged ("waiting for _Status to
+ * change") and plan it again, within the same TFB_DC_MAX_ATTEMPTS budget,
+ * once the sync or its recovery rewrote _Status. A held Portfolio_Decision
+ * no longer blocks the Top_10 step. Thrown refreshes, an unchanged board
+ * (early return) and timestamp failures keep the v1.0.2 retry on the next
+ * tick. Functions added: 2 (tfbDcFingerprintCore_ PURE,
+ * tfbDcStatusFingerprint_ I/O). Changed: tfbDcReceiptCore_ (wait flag on
+ * that one reason), tfbDcStateOf_ (hold), tfbDcPlanCore_ (hold check),
+ * tfbDcReadInputs_ (statusFp), tfbDecisionChainTick (hold record and
+ * prune). Removed: 0. Default off and observe unchanged. Rollback: v1.0.2.
  *
  * v1.0.2 -- require native receipt readback before completing a cohort.
  * A successful HTTP response / nonthrowing refresh may render WITHHELD,
@@ -76,7 +97,7 @@
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.2';
+var TFB_DC_VERSION = '1.0.3';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -90,6 +111,7 @@ var TFB_DC_GM_FEED_KEY = 'TFB Feed Global_Markets';
 var TFB_DC_ML_FEED_KEY = 'TFB Feed Market_Leaders';
 var TFB_DC_DECISION_FEED_KEY = 'TFB Decision Feed';
 var TFB_DC_INFLIGHT_MAX_MIN = 90;
+var TFB_DC_STATUS_FP_MAX_ROWS = 400;                  // v1.0.3: bounded _Status read
 
 /* ------------------------------------------------------------------ PURE --- */
 
@@ -157,7 +179,7 @@ function tfbDcReleaseOf_(raw) {
 
 /** Parse the chain's own state JSON; anything malformed -> empty state. */
 function tfbDcStateOf_(raw) {
-  var st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {}, observed: {}};
+  var st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {}, observed: {}, hold: {}};
   try {
     var o = JSON.parse(String(raw || ''));
     if (o && typeof o === 'object') {
@@ -167,9 +189,39 @@ function tfbDcStateOf_(raw) {
       st.claim = (o.claim && typeof o.claim === 'object') ? o.claim : null;
       st.attempts = (o.attempts && typeof o.attempts === 'object') ? o.attempts : {};
       st.observed = (o.observed && typeof o.observed === 'object') ? o.observed : {};
+      st.hold = (o.hold && typeof o.hold === 'object') ? o.hold : {};   /* v1.0.3 */
     }
   } catch (e) {}
   return st;
+}
+
+/** v1.0.3 PURE: one short fingerprint of what the receipts derive from -
+ * the _Status page rows (A:J) and keyed values (L:M). Cells are joined as
+ * strings; the order of rows is the sheet's. '' when nothing was readable,
+ * and '' never holds anything. djb2 over the text, base 36, with the length. */
+function tfbDcFingerprintCore_(rowsAJ, rowsLM) {
+  var parts = [];
+  function add(rows) {
+    for (var i = 0; i < (rows || []).length; i++) {
+      var r = rows[i] || [];
+      var cells = [];
+      for (var j = 0; j < r.length; j++) {
+        var v = r[j];
+        if (v === null || v === undefined || v === '') continue;
+        cells.push(v instanceof Date ? String(v.getTime()) : String(v));
+      }
+      if (cells.length) parts.push(cells.join('\u001f'));
+    }
+  }
+  add(rowsAJ);
+  add(rowsLM);
+  if (!parts.length) return '';
+  var text = parts.join('\u001e');
+  var h = 5381;
+  for (var k = 0; k < text.length; k++) {
+    h = ((h * 33) ^ text.charCodeAt(k)) >>> 0;
+  }
+  return h.toString(36) + '-' + text.length;
 }
 
 /** PURE: completion means this attempt rendered and consumed its planned
@@ -190,7 +242,10 @@ function tfbDcReceiptCore_(before, after, run, startedMs, nowMs, parseStamp) {
   var occurrences = after.match(/source\s+readiness/gi) || [];
   var receipt = after.match(/(?:^|\|)\s*source readiness VERIFIED \(run ([1-9]\d*)\)(?=\s*(?:\||$))/);
   if (occurrences.length !== 1 || !receipt || receipt[1] !== String(run)) {
-    return fail('native source receipt does not verify the planned run');
+    /* v1.0.3: the board rendered, but what it read did not verify the run.
+     * Nothing changes until the sync writes _Status again, so the caller
+     * waits for that instead of re-rendering on the next tick. */
+    return {ok: false, reason: 'native source receipt does not verify the planned run', wait: true};
   }
   var status = after.match(/^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*status:\s*ok(?=\s*(?:\||$))/i);
   var stamp = status && typeof parseStamp === 'function'
@@ -211,6 +266,12 @@ function tfbDcPlanCore_(s) {
   function none(reason) { return {action: 'none', run: '', reason: reason}; }
   if (!s || s.mode === 'off') return none('off');
   var st = s.state || {pd: '', t10: '', claim: null, attempts: {}};
+  /* v1.0.3: an attempt key is held while _Status still reads as it did when
+   * the held render was planned. An unreadable fingerprint holds nothing. */
+  var hold = st.hold || {};
+  function held(key) {
+    return !!(s.statusFp && hold[key] && hold[key] === s.statusFp);
+  }
   var c = st.claim;
   if (c && typeof c.at_ms === 'number' &&
       s.nowMs - c.at_ms < TFB_DC_CLAIM_TTL_MIN * 60000 && s.mode === 'on') {
@@ -222,7 +283,8 @@ function tfbDcPlanCore_(s) {
   var pd = s.pd || {};
   if (pd.available && pd.ready && /^[1-9]\d*$/.test(String(pd.cohort || '')) &&
       String(pd.cohort) !== st.pd &&
-      (att['pd:' + pd.cohort] || 0) < TFB_DC_MAX_ATTEMPTS) {
+      (att['pd:' + pd.cohort] || 0) < TFB_DC_MAX_ATTEMPTS &&
+      !held('pd:' + pd.cohort)) {
     return {action: 'pd', run: String(pd.cohort),
             reason: 'My_Portfolio run ' + pd.cohort + ' published and ready'};
   }
@@ -241,6 +303,9 @@ function tfbDcPlanCore_(s) {
     if ((att['t10rel:' + issued] || 0) >= TFB_DC_MAX_ATTEMPTS) {
       return none('Top_10 release re-render gave up after ' + TFB_DC_MAX_ATTEMPTS + ' attempts');
     }
+    if (held('t10rel:' + issued)) {
+      return none('Top_10 release re-render for ' + issued + ' did not verify; waiting for _Status to change');
+    }
     if (s.cockpitRunning) return none('cockpit refresh in progress');
     if (s.quiet) return none('quiet window (S-1 board slot)');
     return {action: 't10', run: run, release: issued,
@@ -251,6 +316,9 @@ function tfbDcPlanCore_(s) {
   }
   if ((att['t10:' + run] || 0) >= TFB_DC_MAX_ATTEMPTS) {
     return none('Top_10 run ' + run + ' gave up after ' + TFB_DC_MAX_ATTEMPTS + ' attempts');
+  }
+  if (held('t10:' + run)) {
+    return none('Top_10 run ' + run + ' did not verify; waiting for _Status to change');
   }
   if (s.cockpitRunning) return none('cockpit refresh in progress');
   if (s.quiet) return none('quiet window (S-1 board slot)');
@@ -284,6 +352,22 @@ function tfbDcStatusValue_(ss, key) {
     }
   } catch (e) {}
   return '';
+}
+
+/** v1.0.3: the _Status fingerprint the receipts derive from, read once per
+ * tick (A:J page rows, bounded; L:M keyed values). '' on any failure. */
+function tfbDcStatusFingerprint_(ss) {
+  try {
+    var sh = ss.getSheetByName('_Status');
+    if (!sh) return '';
+    var rows = sh.getLastRow();
+    var aj = [];
+    if (rows >= 1 && rows <= TFB_DC_STATUS_FP_MAX_ROWS) {
+      aj = sh.getRange(1, 1, rows, 10).getValues();
+    }
+    var lm = sh.getRange('L1:M60').getValues();
+    return tfbDcFingerprintCore_(aj, lm);
+  } catch (e) { return ''; }
 }
 
 /** The producer-owned B2 status line. Missing/unreadable is not evidence. */
@@ -331,7 +415,7 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
            t10: {available: typeof refreshDecisionTop10 === 'function',
                  gmRun: '', decisionRun: '', releaseRun: '', releaseIssued: ''},
            inflight: false, cockpitRunning: false, quiet: false,
-           automationAllowed: true};
+           automationAllowed: true, statusFp: ''};
   try {
     if (s.pd.available) {
       var src = pdSrcReadiness_(ss, null, null);
@@ -368,6 +452,7 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
       s.automationAllowed = !!tfbAutomaticRefreshAllowed_(TFB_DC_HANDLER);
     }
   } catch (eA) {}
+  s.statusFp = tfbDcStatusFingerprint_(ss);   /* v1.0.3 */
   return s;
 }
 
@@ -411,7 +496,8 @@ function tfbDecisionChainTick() {
            t10rel: state.observed.t10rel || state.t10rel,
            claim: null, attempts: {}, observed: state.observed}
         : state;
-    var plan = tfbDcPlanCore_(tfbDcReadInputs_(ss, mode, view, nowMs));
+    var inputs = tfbDcReadInputs_(ss, mode, view, nowMs);
+    var plan = tfbDcPlanCore_(inputs);
     if (plan.action === 'none') return {plan: plan};
     /* v1.0.1: a release re-render is keyed by its issued= stamp */
     var rerender = plan.action === 't10' && plan.release && plan.run === String(state.t10 || '');
@@ -433,13 +519,13 @@ function tfbDecisionChainTick() {
     state.claim = {act: plan.action, run: plan.run, at_ms: nowMs};
     state.attempts[key] = (state.attempts[key] || 0) + 1;
     props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
-    return {plan: plan, key: key};
+    return {plan: plan, key: key, fp: inputs.statusFp};   /* v1.0.3: fp */
   });
   if (planned.busy) return 'busy';
   var p = planned.value;
   if (!p.key) return p.observed ? 'observed ' + p.plan.action + ' run ' + p.plan.run
                                 : p.plan.reason;
-  var t0 = Date.now(), ok = false, outcome = '';
+  var t0 = Date.now(), ok = false, outcome = '', wait = false;
   var previous = tfbDcReadReceipt_(ss, p.plan.action);
   try {
     if (p.plan.action === 'pd') {
@@ -454,6 +540,7 @@ function tfbDecisionChainTick() {
           tfbDcReadReceipt_(ss, p.plan.action), p.plan.run, t0, Date.now(), tfbDcScriptStampMs_);
       ok = verified.ok;
       if (!ok) outcome += ' | ' + verified.reason;
+      wait = !ok && !!verified.wait;   /* v1.0.3 */
     }
   } catch (eRun) {
     outcome = 'error: ' + String(eRun && eRun.message ? eRun.message : eRun).slice(0, 200);
@@ -475,6 +562,14 @@ function tfbDecisionChainTick() {
       if (tail === p.plan.run || (p.plan.release && tail === p.plan.release)) keep[k] = state.attempts[k];
     }
     state.attempts = keep;
+    /* v1.0.3: a rendered board whose receipt did not verify waits for
+     * _Status to change; the hold lives exactly as long as its attempt key. */
+    var holds = {};
+    for (var hk in (state.hold || {})) {
+      if (state.hold.hasOwnProperty(hk) && keep.hasOwnProperty(hk)) holds[hk] = state.hold[hk];
+    }
+    if (wait && p.fp && keep.hasOwnProperty(p.key)) holds[p.key] = p.fp;
+    state.hold = holds;
     props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
     return true;
   });
@@ -482,8 +577,10 @@ function tfbDecisionChainTick() {
             p.plan.action === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments',
             ok ? 'OK' : 'FAILED',
             '[DECISION-CHAIN v' + TFB_DC_VERSION + '] ' + p.plan.action + ' run ' +
-            p.plan.run + ' -> ' + outcome + ' (' + p.plan.reason + ')', ms,
-            {version: TFB_DC_VERSION, act: p.plan.action, run: p.plan.run, ok: ok});
+            p.plan.run + ' -> ' + outcome +
+            (wait && p.fp ? ' | waiting for _Status to change' : '') +
+            ' (' + p.plan.reason + ')', ms,
+            {version: TFB_DC_VERSION, act: p.plan.action, run: p.plan.run, ok: ok, wait: wait});
   return (ok ? 'refreshed ' : 'failed ') + p.plan.action + ' run ' + p.plan.run;
 }
 
