@@ -71,6 +71,11 @@ main.py reports these on every status payload. `pf_gates` shows the raw ENV valu
 | `TFB_PF_ADD_LOSER_PCT` | `_env_add_loser_pct` | 2.0 | _env_add_loser_pct() -> 2.0 | not recorded |
 | `TFB_PF_ADD_STOP_PROX_PCT` | `_env_add_stop_prox_pct` | 2.0 | _env_add_stop_prox_pct() -> 2.0 | not recorded |
 | `TFB_PF_RESEARCH_VIEW` | `_env_research_view_mode` | '' | _env_research_view_mode() -> 'enforce' | not recorded |
+| `TFB_PF_ADD_POST_EARN` | `_env_add_post_earn_mode` | '' | _env_add_post_earn_mode() -> 'off' | not recorded |
+| `TFB_PF_POST_EARN_SESSIONS` | `_env_post_earn_sessions` | 5 | _env_post_earn_sessions() -> 5 | not recorded |
+| `TFB_PF_POST_EARN_SESSIONS_NEG` | `_env_post_earn_sessions_neg` | 10 | _env_post_earn_sessions_neg() -> 10 | not recorded |
+| `TFB_PF_MAX_OPEN_TICKETS_MODE` | `_env_ticket_cap_mode` | '' | _env_ticket_cap_mode() -> 'off' | not recorded |
+| `TFB_PF_MAX_OPEN_TICKETS` | `_env_ticket_cap` | 1 | _env_ticket_cap() -> 1 | not recorded |
 
 ### B.2 pf_gates.opportunity_builder (main.py `_OB_GATE_ENVS`, read in core/analysis/opportunity_builder.py)
 
@@ -147,6 +152,8 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_OPP_AUDIT_KEEP` | `0` | cockpit-held symbols kept in the capped audit | no | toggle | no | not recorded |
 | `TFB_EODHD_CRYPTO_MAP` | `0` | native EODHD explicit crypto pairs | no | toggle | no | not recorded |
 | `TFB_CRYPTO_NAME_GATE` | `off` | Yahoo fundamentals crypto-name screen | no | value | no | not recorded |
+| `TFB_YAHOO_ID_ALIAS` | `0` | verified Yahoo ids for dead or colliding page tickers | no | toggle | no | not recorded |
+| `TFB_EODHD_ANALYST_TARGET` | `0` | EODHD analyst target through the fallback and fund cache | no | toggle | no | not recorded |
 | `TFB_COMPLIANCE_GATE_ENABLED` | `0` | compliance gate evaluates | no | toggle | no | not recorded |
 | `TFB_SHADOW_COMPLIANCE` | `0` | selector logs [SHADOW-GATE] | no | toggle | no | not recorded |
 | `TFB_ENRICH_COMPLIANCE` | `0` | quotes carry compliance stamp | no | toggle | no | not recorded |

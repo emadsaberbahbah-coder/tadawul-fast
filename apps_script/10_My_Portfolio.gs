@@ -1,7 +1,51 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.16
+ * Version: 1.5.17
+ *
+ * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS INPUTS: Calendar_Events REACHES
+ *                        THE PORTFOLIO_DECISION BACKEND GUARD; ALL v1.5.16
+ *                        logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (weekly review 28 Oct, defect D1): the page recommended 'ADD 48
+ * FRST.US (~2,671 SAR)' five sessions after a -22.2 % EPS miss (reported
+ * 22 Oct). The interim trading policy forbids adding inside 5 sessions of a
+ * report (10 after an EPS miss), and the Top-10 board already tags its seats
+ * from Calendar_Events (16_Decision_Top10 v1.18.0), but the backend that
+ * decides ADD never sees the calendar: the 122 My_Portfolio columns carry no
+ * report date. portfolio_actions 1.17.0 adds the guard (Render
+ * TFB_PF_ADD_POST_EARN = off | observe | enforce, default off) and needs the
+ * report dates in the request.
+ * WHAT: Script Property PD_POST_EARN = off (default: no Calendar_Events read,
+ * request and every line byte-identical to v1.5.16) | on. When on,
+ * refreshPortfolioDecision adds body.post_earnings = pdPostEarnBody_
+ * (schema tfb.pd-post-earnings/v1): status ok | unavailable | stale, asof
+ * (Riyadh date), updated (newest 'Updated At (Riyadh)' day), reports (recent
+ * reports in the calendar) and, for the held symbols only, {date, sessions,
+ * surprise} from the Top-10's own reader dt10PostEarnMapFromValues_ (same
+ * sessions, same 31-day window, Sun-Thu for KSA), plus a held name whose
+ * Last or Next Earnings Date is today at 0 sessions (review fix: that reader
+ * keeps strictly past reports only). A missing sheet, header or
+ * 16_Decision_Top10 parser, or any read error -> 'unavailable'; a newest
+ * update older than PD_POST_EARN_STALE_DAYS (7) -> 'stale'. The backend
+ * ignores the object unless the guard is armed, and pops it before meta, so
+ * with the guard off the page, the action log and every line are unchanged
+ * even when PD_POST_EARN is on; the field is never logged. Order: paste,
+ * set PD_POST_EARN=on, then arm the Render guard (an armed guard without
+ * inputs holds every ADD as 'earnings calendar absent'). pdMetaLine_ gains
+ * ' | post-earn <mode> (...)'
+ * and ' | tickets <open>/<cap> <mode> (...)' ONLY when the response carries
+ * meta.post_earn_guard / meta.ticket_cap (guards armed on Render).
+ * pdSelfTest reports the mode and the inputs a run would send now.
+ * ES5. Functions added: 4 (pdPostEarnMode_, pdPostEarnRiyadhDay_,
+ * pdPostEarnCore_, pdPostEarnBody_). Changed: refreshPortfolioDecision (one
+ * gated request field), pdMetaLine_ (two conditional tokens), pdSelfTest
+ * (one line). Vars added: 3 (PD_POST_EARN_PROP, PD_POST_EARN_SCHEMA,
+ * PD_POST_EARN_STALE_DAYS). Removed: 0.
+ * Harness: tests/test_pd_post_earn_inputs.js (REAL file; golden negative on
+ * the v1.5.16 base). Rollback: PD_POST_EARN=off (or delete it) with no
+ * re-paste, or re-paste v1.5.16; with either, an armed Render guard reads
+ * 'earnings calendar absent', so turn the guard off first.
  *
  * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION: THE SENT PACKET BECOMES THE
  *                        TOP_10 COCKPIT'S FUNDING EVIDENCE -- PD_IBKR_EVIDENCE_PUBLISH,
@@ -2654,7 +2698,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.16';
+var PD_VERSION = '1.5.17';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2841,6 +2885,22 @@ function pdMetaLine_(meta) {
     parts.push(Math.round(route.duration_ms) + 'ms');
   }
   if (route.request_id) parts.push('req ' + route.request_id);
+  /* v1.5.17 [D1b/D1c]: guard read-back, only when the backend reports the
+   * guard armed (absent blocks -> the v1.5.16 line). */
+  var pg = meta.post_earn_guard;
+  if (pg && typeof pg === 'object') {
+    parts.push('post-earn ' + pdCell_(pg.mode) + ' (' +
+               pdCell_(pg.input_status) + '; held ' + pdCell_(pg.held) +
+               (pg.mode === 'observe' ? '; would ' + pdCell_(pg.would_hold) : '') +
+               ')');
+  }
+  var tc = meta.ticket_cap;
+  if (tc && typeof tc === 'object') {
+    parts.push('tickets ' + pdCell_(tc.open_tickets) + '/' + pdCell_(tc.cap) +
+               ' ' + pdCell_(tc.mode) + ' (held ' + pdCell_(tc.held) +
+               (tc.mode === 'observe' ? '; would ' + pdCell_(tc.would_hold) : '') +
+               ')');
+  }
   return parts.join(' | ');
 }
 
@@ -4352,6 +4412,186 @@ function pdApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 
 /* ----- main refresh --------------------------------------------------------------- */
 
+/* ----- v1.5.17 [D1b POST-EARN]: Calendar_Events inputs for the backend
+ * guard (portfolio_actions 1.17.0, Render TFB_PF_ADD_POST_EARN). ---------- */
+var PD_POST_EARN_PROP = 'PD_POST_EARN';
+var PD_POST_EARN_SCHEMA = 'tfb.pd-post-earnings/v1';
+var PD_POST_EARN_STALE_DAYS = 7;
+
+/** v1.5.17: 'on' when Script Property PD_POST_EARN is on (any case,
+ * surrounding blanks ignored); anything else, absent included, 'off'. */
+function pdPostEarnMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(PD_POST_EARN_PROP) || '');
+  } catch (ePm) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return raw === 'on' ? 'on' : 'off';
+}
+
+/** v1.5.17 PURE: integer day (UTC days since 1970) of a Riyadh calendar
+ * date: a Date is shifted +3 h; a string must start 'YYYY-MM-DD'. Else
+ * null. */
+function pdPostEarnRiyadhDay_(value) {
+  var text = '';
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (!isFinite(value.getTime())) return null;
+    text = new Date(value.getTime() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    text = value.replace(/^\s+/, '').slice(0, 10);
+  } else {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  var ms = Date.parse(text + 'T00:00:00.000Z');
+  if (!isFinite(ms) || new Date(ms).toISOString().slice(0, 10) !== text) return null;
+  return Math.round(ms / 86400000);
+}
+
+/** v1.5.17 PURE: the body.post_earnings object from a Calendar_Events grid
+ * (values; null when the sheet could not be read), the held symbols and the
+ * run time. Report dates, sessions and surprises come from the Top-10's
+ * reader dt10PostEarnMapFromValues_ (16_Decision_Top10 v1.18.0) so both
+ * pages count the same sessions; without it -> 'unavailable'. A held name
+ * whose Last or Next Earnings Date is today enters at 0 sessions (that
+ * reader keeps strictly past reports only). The newest
+ * 'Updated At (Riyadh)' day older than PD_POST_EARN_STALE_DAYS -> 'stale'.
+ * Never throws. */
+function pdPostEarnCore_(values, held, now) {
+  var nowDate = (now && Object.prototype.toString.call(now) === '[object Date]' &&
+                 isFinite(now.getTime())) ? now : new Date();
+  var today = pdPostEarnRiyadhDay_(nowDate);
+  var out = {schema: PD_POST_EARN_SCHEMA, status: 'unavailable',
+             asof: today === null ? '' : new Date(today * 86400000).toISOString().slice(0, 10),
+             updated: '', reports: 0, map: {}};
+  try {
+    if (typeof dt10PostEarnMapFromValues_ !== 'function') {
+      out.reason = 'post-earnings parser missing (16_Decision_Top10 v1.18.0)';
+      return out;
+    }
+    if (!values || !values.length) {
+      out.reason = 'Calendar_Events not readable';
+      return out;
+    }
+    var iSym = -1, iUpd = -1, iLast = -1, iNext = -1, iSur = -1, r, c, cells, tok;
+    for (r = 0; r < values.length && r < 10 && iSym < 0; r++) {
+      cells = values[r] || [];
+      var s = -1, u = -1, l = -1, x = -1, p = -1;
+      for (c = 0; c < cells.length; c++) {
+        tok = String(cells[c] === null || cells[c] === undefined ? '' : cells[c])
+            .toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (tok === 'symbol') s = c;
+        else if (tok === 'updatedatriyadh' || tok === 'updatedat') u = c;
+        else if (tok === 'lastearningsdate') l = c;
+        else if (tok === 'nextearningsdate' || tok === 'earningsdate') x = c;
+        else if (tok === 'epssurprise') p = c;
+      }
+      if (s >= 0 && (l >= 0 || x >= 0)) { iSym = s; iUpd = u; iLast = l; iNext = x; iSur = p; }
+    }
+    if (iSym < 0) {
+      out.reason = 'Calendar_Events header not found';
+      return out;
+    }
+    var firstBody = r;
+    var newest = null;
+    if (iUpd >= 0) {
+      for (; r < values.length; r++) {
+        var d = pdPostEarnRiyadhDay_((values[r] || [])[iUpd]);
+        if (d !== null && (newest === null || d > newest)) newest = d;
+      }
+    }
+    if (newest !== null) out.updated = new Date(newest * 86400000).toISOString().slice(0, 10);
+    var full = dt10PostEarnMapFromValues_(values, nowDate) || {};
+    var k, n = 0;
+    for (k in full) {
+      if (Object.prototype.hasOwnProperty.call(full, k)) n++;
+    }
+    out.reports = n;
+    var map = {}, heldSet = {};
+    for (var i = 0; i < (held || []).length; i++) {
+      var sym = String(held[i] === null || held[i] === undefined ? '' : held[i])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!sym) continue;
+      heldSet[sym] = true;
+      if (Object.prototype.hasOwnProperty.call(full, sym)) map[sym] = full[sym];
+    }
+    /* Review fix (Codex P1, PR #869): the Top-10 reader keeps strictly past
+     * reports, so a held name that reports, or reported, TODAY was missing
+     * and its ADD passed on the report day itself. Such a name enters at 0
+     * sessions (inside every window); the surprise is read only from a Last
+     * Earnings Date of today, as the Top-10 reader parses it. */
+    var dayOf = (typeof dt10CalendarDay_ === 'function') ? dt10CalendarDay_ : pdPostEarnRiyadhDay_;
+    for (var q = firstBody; today !== null && q < values.length; q++) {
+      cells = values[q] || [];
+      var hs = String(cells[iSym] === null || cells[iSym] === undefined ? '' : cells[iSym])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!hs || !heldSet[hs] || Object.prototype.hasOwnProperty.call(map, hs)) continue;
+      var lastDay = iLast >= 0 ? dayOf(cells[iLast]) : null;
+      var nextDay = iNext >= 0 ? dayOf(cells[iNext]) : null;
+      if (lastDay !== today && nextDay !== today) continue;
+      var sur = null;
+      if (lastDay === today && iSur >= 0) {
+        var raw = cells[iSur];
+        if (typeof raw === 'string') raw = raw.replace(/[,%\s]/g, '');
+        if (typeof raw === 'number' && isFinite(raw)) {
+          sur = raw;
+        } else if (typeof raw === 'string' && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+          sur = parseFloat(raw);
+        }
+        if (sur !== null && Math.abs(sur) > 999999) sur = sur > 0 ? 999999 : -999999;
+      }
+      map[hs] = {date: out.asof, sessions: 0, surprise: sur};
+    }
+    out.map = map;
+    if (iUpd >= 0 && (newest === null || today === null ||
+        today - newest > PD_POST_EARN_STALE_DAYS)) {
+      out.status = 'stale';
+      out.reason = newest === null ? 'no Updated At day' :
+          'newest calendar update ' + out.updated;
+      return out;
+    }
+    out.status = 'ok';
+    return out;
+  } catch (ePc) {
+    out.status = 'unavailable';
+    out.map = {};
+    out.reason = 'Calendar_Events parse failed';
+    return out;
+  }
+}
+
+/** v1.5.17: live Calendar_Events read for pdPostEarnCore_; the held symbols
+ * are the request rows' Symbol cells. Any failure -> 'unavailable'. Never
+ * throws; never logged. */
+function pdPostEarnBody_(ss, rows) {
+  var now = new Date();
+  var held = [];
+  try {
+    for (var i = 0; i < (rows || []).length; i++) {
+      if (rows[i] && rows[i]['Symbol'] !== undefined) held.push(rows[i]['Symbol']);
+    }
+  } catch (eHs) {
+    held = [];
+  }
+  var values = null;
+  try {
+    var sh = ss.getSheetByName('Calendar_Events');
+    var maxRows = (typeof DT10_CALENDAR_MAX_ROWS === 'number') ? DT10_CALENDAR_MAX_ROWS : 5000;
+    if (sh) {
+      var nr = sh.getLastRow(), nc = Math.min(sh.getLastColumn(), 16);
+      if (isFinite(nr) && isFinite(nc) && nr >= 2 && nc >= 2 && nr <= maxRows + 1) {
+        values = sh.getRange(1, 1, nr, nc).getValues();
+      }
+    }
+  } catch (eRd) {
+    values = null;
+  }
+  return pdPostEarnCore_(values, held, now);
+}
+
 function refreshPortfolioDecision() {
   var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -4389,6 +4629,11 @@ function refreshPortfolioDecision() {
    * (absent -> request unchanged). Never logged. */
   var evidence = pdEvidencePacket_();
   if (evidence) body.reconciliation_evidence = evidence;
+  /* v1.5.17 [D1b]: Calendar_Events post-earnings inputs for the backend
+   * guard (portfolio_actions 1.17.0); off -> no read and the request is
+   * unchanged. Never logged; the backend ignores it unless
+   * TFB_PF_ADD_POST_EARN is armed. */
+  if (pdPostEarnMode_() === 'on') body.post_earnings = pdPostEarnBody_(ss, pool.rows);
   /* v1.5.12: IBKR capture evidence + execution scope; off -> no Drive
    * read and the request is unchanged. Never logged. */
   var ibkr = ibkrMode === 'off' ? null : pdIbkrApply_(ibkrMode, body);
@@ -4852,6 +5097,20 @@ function pdSelfTest() {
       pdIbkrFollowUpCore_('on', null, true, null).go === false &&
       pdIbkrFollowUpCore_('on', 1000, false, null).go === false;
   report.push('follow-up core: ' + (fuOk ? 'ok' : 'FAIL'));
+  /* v1.5.17 [D1b]: the post-earnings inputs the next run would send. */
+  var peNow = pdPostEarnBody_(ss, pool.rows);
+  var peList = [];
+  for (var pk in peNow.map) {
+    if (Object.prototype.hasOwnProperty.call(peNow.map, pk)) {
+      var pe = peNow.map[pk];
+      peList.push(pk + ' ' + pe.date + ' ' + pe.sessions + ' sess EPS ' +
+                  (pe.surprise === null ? 'n/a' : pe.surprise));
+    }
+  }
+  report.push('post-earnings inputs (PD_POST_EARN=' + pdPostEarnMode_() + '): ' + peNow.status +
+      (peNow.reason ? ' (' + peNow.reason + ')' : '') + '; calendar updated ' +
+      (peNow.updated || '-') + '; recent reports ' + peNow.reports +
+      '; held with a report: ' + (peList.length ? peList.join(', ') : 'none'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

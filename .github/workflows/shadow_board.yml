@@ -25,6 +25,13 @@ name: "🕶️ TFB Shadow Board"
 # ROLLBACK: each item is independently removable; none depends on another.
 # v1.2.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
 # ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
+# v1.3.0 (2026-10-28) -- SETTLED TOP-10 READ (run_shadow_board v1.6.0, weekly
+# review D7). WHY: evening runs read 0 candidates on 20, 21, 23 and 27 Oct
+# because they read Top_10_Investments inside a cockpit render (B2 "status:
+# running...", zones from row 18 cleared). TFB_SHADOW_T10_READ_RETRIES=6 arms
+# up to six re-reads 30 s apart (3 min, inside timeout-minutes 15) when the
+# read is empty or rendering; a settled first read costs nothing. Rollback:
+# set "0" (or delete the line) = v1.5.0's single read.
 # ============================================================================
 
 on:
@@ -93,6 +100,8 @@ jobs:
       # the S-1 window boundary annotation on the flip date.
       # Rollback: set off (or delete the line).
       TFB_BOARD_ENGINE_ROI: "enforce"
+      # v1.3.0 (D7): re-read an empty or rendering Top-10 (see the header).
+      TFB_SHADOW_T10_READ_RETRIES: "6"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
