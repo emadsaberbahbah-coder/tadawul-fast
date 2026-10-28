@@ -30,6 +30,8 @@ GOLD   G1      against the pre-flip tree (TFB_TEST_LAUNCH_BASE = a directory
                Current base (2026-10-28): `git show 9c96e453:<path>` for the
                same three files, saved flat (builder 1.28.1, actions 1.17.0
                from #869, engine 5.159.2); ac6888c1 now fails the checks too.
+               Since the second 2026-10-28 merge: `git show 974bc418:<path>`
+               (builder 1.28.1, actions 1.17.1 from #870, engine 5.159.3).
 
 Run:  python tests/test_decision_pages_defaults.py   (prints PASS k/k)
       pytest -q tests/test_decision_pages_defaults.py
@@ -164,7 +166,7 @@ def case_k4_ascii_added_lines(_mp, _tmp):
     for rel, start, end in (
             ("core/analysis/opportunity_builder.py", "# v1.28.2 (2026-10-15", 'OPPORTUNITY_BUILDER_VERSION = "'),
             ("core/analysis/portfolio_actions.py", "# v1.17.2 (2026-10-15)", 'PORTFOLIO_ACTIONS_VERSION = "'),
-            ("core/data_engine_v2.py", "WHY v5.160.0 (2026-10-15", "WHY v5.159.2 (2026-10-14"),
+            ("core/data_engine_v2.py", "WHY v5.160.0 (2026-10-15", "WHY v5.159.3 (2026-10-14"),
             (".github/workflows/daily_sync.yml", "# VERSION 1.0.6 (2026-10-15", "# VERSION 1.0.5 (2026-10-14"),
             ("scripts/verify_core_repair_readback.py", "# v1.2.2 (2026-10-15)", "# v1.2.1 (2026-10-13)")):
         text = (ROOT / rel).read_text(encoding="utf-8")
@@ -198,6 +200,9 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     # merged): builder 1.27.3, actions 1.16.1, engine 5.159.0.
     # 2026-10-24: the bundle head is 2462215c (main #821-#829 merged); the same
     # versions, so the assertions below are unchanged.
+    # 2026-10-28 (second): the bundle head is 974bc418 (main #870 and #871
+    # merged): builder 1.28.1, actions 1.17.1 (#870), engine 5.159.3 (the
+    # fallback renumbered over #871's 5.159.2).
     # 2026-10-28: the bundle head is 9c96e453 (main #855-#869 merged): builder
     # 1.28.1, actions 1.17.0 (#869's D1b/D1c guards; this build is 1.17.2 over
     # it, open #870 claims 1.17.1), engine 5.159.2 (the fallback renumbered over
@@ -208,8 +213,8 @@ def case_g1_golden_negative_base_reads_off(mp, _tmp):
     # builder 1.28.1 (renumbered over #848's 1.28.0), actions 1.16.1, engine
     # 5.159.0.
     assert bob.OPPORTUNITY_BUILDER_VERSION == "1.28.1"
-    assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.17.0"
-    assert bde.__version__ == "5.159.2"
+    assert bpa.PORTFOLIO_ACTIONS_VERSION == "1.17.1"
+    assert bde.__version__ == "5.159.3"
     _clean(mp)
     got = _armed(bob, bpa, bde)
     assert got == {"venue_cal_ext": False, "freshness_alert": False,

@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.57 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- DT10 v1.18.1 HELD-SEAT HARNESS
+# VERSION 1.1.57 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.55) -- DT10 v1.18.1 HELD-SEAT HARNESS
 #
-# v1.1.57 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.54 first, 1.1.30-1.1.54 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846 and 1.1.55 by open #870): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# v1.1.57 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.55 first, 1.1.30-1.1.55 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869 and #870; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
 # native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.18.1
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
@@ -13,14 +13,22 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.54) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.55) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.56 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.54 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865 and #869; 1.1.39 is claimed by open #846 and 1.1.55 by open #870): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v1.1.56 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.55 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869 and #870; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
 # v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+#
+# VERSION 1.1.55 (2026-10-28) -- POST-EARNINGS INVALID EVIDENCE (portfolio_actions 1.17.1)
+#
+# v1.1.55: the isolated protective step also fetches the merged v1.17.0
+# module (0c3d3e21) by SHA, so tests/test_pf_add_guards_d1.py can prove that
+# 1.17.1 with the guard off, and with valid inputs under observe/enforce,
+# decides exactly as 1.17.0 (a failed fetch only turns those cases into a
+# SKIP). No step, lane or other entry changes.
 #
 # VERSION 1.1.54 (2026-10-28) -- PORTFOLIO ADD GUARDS (D1b POST-EARN, D1c TICKET-CAP)
 #
@@ -1106,6 +1114,10 @@ jobs:
           # the untouched v1.16.1 module at 22658e0f (fetched by SHA).
           git fetch --no-tags --depth=1 origin 22658e0f10ed0264feaf40e7208dc1f85b6a6e8b \
             || echo "::notice::portfolio_actions v1.16.1 base not fetched - the off-identity case will SKIP"
+          # v1.1.55: portfolio_actions 1.17.1 is also compared with the merged
+          # v1.17.0 module at 0c3d3e21 (off and valid inputs unchanged).
+          git fetch --no-tags --depth=1 origin 0c3d3e21a523c0a275b0f9b9c33951d695afc4bb \
+            || echo "::notice::portfolio_actions v1.17.0 base not fetched - the v1.17.0 identity cases will SKIP"
           python -m pytest -q tests/test_pf_add_guards_d1.py
 
       - name: 📋 Board scorecard harness (golden bases fetched by SHA)
