@@ -6,7 +6,7 @@
 - New: `scripts/provider_identity_probe.py`.
 - New: `data/provider_probe_cfx_2026-10-28.json`, ASCII, 19 rows (17 failing rows and 2 controls).
 - New: `.github/workflows/provider_identity_probe.yml`, dispatch only.
-- New: `tests/test_provider_identity_probe.py`, 14 cases.
+- New: `tests/test_provider_identity_probe.py`, 15 cases.
 - New: this sheet.
 - Changed: `scripts/verify_deployment.py` pins 1.0.0.
 - Changed: `.github/workflows/ci.yml` 1.1.51 adds the test to the lean lane.
@@ -55,7 +55,7 @@ So the 28 Oct stability day does not count.
 4. **Output:** a markdown table (log and job summary) and `provider_probe.json` (artifact, 30 days).
 5. **Workflow:** dispatch only. Read-only `contents` permission. The only secret is `EODHD_API_KEY`. No workbook credentials.
 
-## S3 - Tests (`tests/test_provider_identity_probe.py`, 14 passed; offline)
+## S3 - Tests (`tests/test_provider_identity_probe.py`, 15 passed; offline)
 | Group | Proves |
 |---|---|
 | P1 | The default spec is ASCII and holds the 17 rows plus 2 controls. Bad items are refused. |
@@ -65,6 +65,11 @@ So the 28 Oct stability day does not count.
 | P5 | ASCII module, version and manifest pin. Dispatch-only, read-only workflow with no workbook credentials. |
 
 Workflow audit: errors 0, warnings 0. Manifest pins pass.
+
+### Review fix (Codex, PR #863, head `301be8c8`)
+| Finding | Fix | Golden negative |
+|---|---|---|
+| A wrong-coin candidate that priced within 3 % of a correctly named candidate from the other provider was CONFIRMED: the passing name overrode the explicit mismatch. Example: EODHD `SUI-USD.CC` named *Salmonation* at 2.11 against Yahoo `SUI20947-USD` *Sui USD* at 2.12. | A pair is rejected when either side's name explicitly fails the screen. A curated root still needs at least one passing name. | `test_p3_named_wrong_coin_at_a_matching_price_is_not_confirmed` fails on `301be8c8`. |
 
 ## S4 - Rollback
 Delete the workflow and the script. Nothing reads them, and nothing is armed.

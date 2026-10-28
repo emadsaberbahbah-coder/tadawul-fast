@@ -283,9 +283,11 @@ def judge(item: Dict[str, Any], cands: List[Dict[str, Any]]) -> Dict[str, Any]:
             gap = abs(e["price"] / y["price"] - 1.0) * 100.0
             judged = [_name_ok(row, kind, n) for n in (y.get("name"), e.get("name")) if n]
             curated = kind in ("crypto", "control") and crypto_name_matches(row, "?") is not None
-            if any(j is True for j in judged):
-                ident: Optional[bool] = True
-            elif any(j is False for j in judged) or (curated and not judged):
+            if any(j is False for j in judged):
+                ident: Optional[bool] = False   # a named wrong coin never confirms (Codex P2, #863)
+            elif any(j is True for j in judged):
+                ident = True
+            elif curated:
                 ident = False           # a curated coin needs a name that passes the screen
             else:
                 ident = None            # not judged (FX, futures, unknown roots)

@@ -198,6 +198,18 @@ def test_p3_cc_route_that_is_the_wrong_coin_is_never_confirmed():
     assert r["mismatches"] == ['eodhd:SUI-USD.CC "Salmonation"']
 
 
+def test_p3_named_wrong_coin_at_a_matching_price_is_not_confirmed():
+    """Codex P2 on #863: a passing name on one side must not override an
+    explicit mismatch on the other (fails on 301be8c8)."""
+    cands = [{"provider": "eodhd", "code": "SUI-USD.CC", "ok": True, "price": 2.11, "age_h": 1,
+              "name": "Salmonation"},
+             {"provider": "yahoo", "code": "SUI20947-USD", "ok": True, "price": 2.12, "age_h": 1,
+              "name": "Sui USD"}]
+    r = pp.judge(SUI, cands)
+    assert r["verdict"] == "AVAILABLE" and r["best"] == "yahoo:SUI20947-USD"
+    assert r["mismatches"] == ['eodhd:SUI-USD.CC "Salmonation"']
+
+
 def test_p3_fx_cross_dead_and_gold_confirmed():
     assert pp.probe_item(_prober(), _item("BHDSAR=X", "fx", ["BHDSAR.FOREX"], "", ["BHDSAR=X"]))["verdict"] == "DEAD"
     g = pp.probe_item(_prober(), _item("XAUUSD=X", "fx", ["XAUUSD.FOREX"], "", ["XAUUSD=X", "GC=F"]))
