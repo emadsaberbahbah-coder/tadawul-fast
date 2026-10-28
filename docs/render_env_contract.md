@@ -145,6 +145,7 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_EODHD_CRYPTO_MAP` | `0` | native EODHD explicit crypto pairs | no | toggle | no | not recorded |
 | `TFB_CRYPTO_NAME_GATE` | `off` | Yahoo fundamentals crypto-name screen | no | value | no | not recorded |
 | `TFB_YAHOO_ID_ALIAS` | `0` | verified Yahoo ids for dead or colliding page tickers | no | toggle | no | not recorded |
+| `TFB_EODHD_ANALYST_TARGET` | `0` | EODHD analyst target through the fallback and fund cache | no | toggle | no | not recorded |
 | `TFB_COMPLIANCE_GATE_ENABLED` | `0` | compliance gate evaluates | no | toggle | no | not recorded |
 | `TFB_SHADOW_COMPLIANCE` | `0` | selector logs [SHADOW-GATE] | no | toggle | no | not recorded |
 | `TFB_ENRICH_COMPLIANCE` | `0` | quotes carry compliance stamp | no | toggle | no | not recorded |

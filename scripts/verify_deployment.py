@@ -155,6 +155,12 @@ sys.path.insert(0, _ROOT)
 # run_dashboard_sync 6.70.0 -> 6.70.2 (KLG-READ from PR #809 + STAMP-RETRY) and
 # data_engine_v2 5.154.0 -> 5.155.0 (PR #809 subunit-safe portfolio weight FX);
 # FLAGS declares TFB_SR_THREAD_LOCAL_SERVICE. No verifier logic changed.
+# 2026-10-28 (D2, same rule): eodhd_provider 4.18.5 -> 4.19.0 and
+# data_engine_v2 5.158.0 -> 5.159.0 (TFB_EODHD_ANALYST_TARGET: the EODHD
+# analyst target through the fundamentals fallback and the fund cache,
+# default off); FLAGS declares the flag. No verifier logic changed.
+# 2026-10-28 (same rule): data_engine_v2 5.159.0 -> 5.159.1 (the fund-cache
+# hit gate also runs on the 12M forecast; Codex review on #865).
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -206,7 +212,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.5',
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.19.0',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
@@ -220,7 +226,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.158.0", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.159.1", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -329,6 +335,7 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ('TFB_EODHD_CRYPTO_MAP', '0', 'native EODHD explicit crypto pairs', False),
     ('TFB_CRYPTO_NAME_GATE', 'off', 'Yahoo fundamentals crypto-name screen', False),
     ('TFB_YAHOO_ID_ALIAS', '0', 'verified Yahoo ids for dead or colliding page tickers', False),
+    ('TFB_EODHD_ANALYST_TARGET', '0', 'EODHD analyst target through the fallback and fund cache', False),
 
     ("TFB_COMPLIANCE_GATE_ENABLED", "0", "compliance gate evaluates", False),
     ("TFB_SHADOW_COMPLIANCE", "0", "selector logs [SHADOW-GATE]", False),
