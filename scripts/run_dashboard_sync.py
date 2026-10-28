@@ -6250,22 +6250,34 @@ def _fw2_name_key(v: Any) -> str:
         return ""
 
 
+# The legal-form words core.analysis.symbol_dedup._NAME_NOISE drops (casefolded;
+# tests/test_fw2_stale_pe.py pins the two sets equal). They are removed from the
+# Unicode-preserving key, never by stripping non-Latin text: symbol_dedup's own
+# normalise_company_name keeps only [A-Z0-9], so '<CJK> Bank' and '<other CJK>
+# Bank' would both read 'BANK' (Codex review on PR #875).
+_FW2_LEGAL_FORM_WORDS = frozenset({
+    "inc", "incorporated", "corp", "corporation", "company", "co", "cos",
+    "ltd", "limited", "plc", "llc", "lp", "llp", "ag", "nv", "bv", "se",
+    "sa", "sab", "saa", "spa", "ab", "as", "asa", "oyj", "kk", "kgaa",
+    "gmbh", "holding", "holdings", "group", "grp", "the", "and",
+    "sgps", "cv", "de", "cia", "companhia", "sas", "pt", "tbk", "bhd",
+    "pjsc", "jsc", "oao", "pao", "adr", "gdr", "class", "shares", "shs",
+    "common", "stock", "ord", "ordinary", "reg", "registered", "trust",
+    "fund", "etf",
+})
+
+
 def _fw2_names_match(a: Any, b: Any) -> bool:
-    """Same Name: equal _fw2_name_key, or equal non-empty company keys of
-    core.analysis.symbol_dedup.normalise_company_name (the dedup identity
-    key: legal-form words such as Inc / Corp / PLC ignored). A blank or
-    unusable Name never matches. Imported here, so off never loads it."""
-    ka, kb = _fw2_name_key(a), _fw2_name_key(b)
-    if not ka or not kb:
-        return False
-    if ka == kb:
-        return True
-    try:
-        from core.analysis.symbol_dedup import normalise_company_name
-        na, nb = normalise_company_name(a), normalise_company_name(b)
-    except Exception:
-        return False
-    return bool(na) and na == nb
+    """Same Name: the _fw2_name_key tokens of both, legal-form words removed,
+    are equal and not empty ('Apple Inc.' == 'APPLE', 'Microsoft' ==
+    'Microsoft Corporation'). Every other character counts, non-Latin text
+    included. A blank Name, or one made only of legal-form words, never
+    matches."""
+    def _core(v: Any) -> str:
+        return " ".join(t for t in _fw2_name_key(v).split()
+                        if t not in _FW2_LEGAL_FORM_WORDS)
+    ca, cb = _core(a), _core(b)
+    return bool(ca) and ca == cb
 
 
 def _fw2_ccy_col(hdr: List[Any]) -> int:

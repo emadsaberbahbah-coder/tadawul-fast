@@ -39,9 +39,11 @@ dispatched run failed at 94.9 %.
      fetch-failed;
   3. that row passes the FW-1 identity rules (`_klg_old_row_identity_ok`: a Name that is not blank or fabricated, and
      P/E == Price/EPS when testable), applied whatever `TFB_SYNC_KLG_IDENTITY_GATE` says;
-  4. the fresh Name equals the last-good Name (case, punctuation and the legal-form words of
-     `core.analysis.symbol_dedup.normalise_company_name` such as Inc or PLC ignored; a blank, fabricated or unusable Name
-     never matches);
+  4. the fresh Name equals the last-good Name: case, punctuation and the legal-form words of
+     `core.analysis.symbol_dedup._NAME_NOISE` (Inc, Corp, PLC, ...) are dropped from a Unicode-preserving key, so
+     non-Latin text still counts (Codex review on #875: symbol_dedup's own key keeps only [A-Z0-9], which would read
+     '<CJK> Bank' and '<other CJK> Bank' as the same 'BANK'); a blank or fabricated Name, or one made only of legal-form
+     words, never matches;
   5. the same non-blank Currency, compared exactly (so `GBp` never equals `GBP`);
   6. today's price within +/-25 % of the last-good price (inclusive).
   Forced symbols (`TFB_SYNC_FORCE_REFETCH_SYMBOLS`), fetch-failed rows, error-provider rows and non-ticker symbols never
@@ -99,15 +101,18 @@ stale-EODHD hypothesis during observe).
 
 ## Evidence
 
-- `tests/test_fw2_stale_pe.py`: 84 cases (P1-P12 pure, E1/E1b/E1c/G1 through the real `_run_one_task`, A1 source
-  identity and zero removals, W1 workflow mapping, V1 pins). All pass locally (Python 3.11.17).
-- Golden negative: the same file run against the untouched 729a316e tree fails 77 cases and errors 1 (6 base-dependent
+- `tests/test_fw2_stale_pe.py`: 90 cases (P1-P12 pure, E1/E1b/E1c/G1 through the real `_run_one_task`, A1 source
+  identity and zero removals, W1 workflow mapping, V1 pins). All pass locally (Python 3.11.17). On a shallow clone the 6
+  base-dependent cases SKIP and the rest pass.
+- Golden negative: the same file run against the untouched 729a316e tree fails 83 cases and errors 1 (6 base-dependent
   cases skip there); inside the repo G1 shows the base stripping the witnessed row and FW-KEEP restoring yesterday's row
   (INVALID) even with the variable set to enforce.
-- Whole suite: 6,434 passed, 48 skipped, 10 failed; the 10 are `tests/test_framework_security_20261024.py` (9) and
+- Whole suite: 6,440 passed, 48 skipped, 10 failed; the 10 are `tests/test_framework_security_20261024.py` (9) and
   `tests/test_security_pins_libsmoke_20261013.py::test_l17` (1), which fail identically on the untouched base tree in
   this environment (installed framework versions).
-- Lean lane (numpy + pytest + PyYAML only, the 123 files of ci.yml 1.1.56): 4,298 passed, 26 skipped, 0 failed.
+- Lean lane (numpy + pytest + PyYAML only, the 123 files of ci.yml 1.1.56): 4,304 passed, 26 skipped, 0 failed.
+- GitHub CI on the first commit (ce9be794): every check green, including the whole suite (pinned Python 3.11) and the
+  lean lane.
 - AST: 11 functions added (`_fw2_stale_pe_mode`, `_fw2_name_key`, `_fw2_names_match`, `_fw2_ccy_col`, `_fw2_row_cols`,
   `_fw2_read_last_good`, `_fw2_last_good_index`, `_fw2_stale_pe_witness`, `_fw2_stale_pe_plan`,
   `_fw2_stale_pe_firewall`, `_fw2_stale_pe_line`), 0 removed. Added lines are ASCII except the title line, which keeps

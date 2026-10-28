@@ -347,6 +347,8 @@ ARABIC_RAJHI = "".join(map(chr, (0x645, 0x635, 0x631, 0x641, 0x20, 0x627, 0x644,
                                  0x627, 0x62C, 0x62D, 0x64A)))
 ARABIC_BILAD = "".join(map(chr, (0x628, 0x646, 0x643, 0x20, 0x627, 0x644, 0x628, 0x644,
                                  0x627, 0x62F)))
+CJK_CHINA = chr(0x4E2D) + chr(0x56FD)     # 'China'
+CJK_JAPAN = chr(0x65E5) + chr(0x672C)     # 'Japan'
 
 
 @pytest.mark.parametrize("a,b,want", [
@@ -362,10 +364,29 @@ ARABIC_BILAD = "".join(map(chr, (0x628, 0x646, 0x643, 0x20, 0x627, 0x644, 0x628,
     ("", "", False),
     (None, "Apple", False),
     ("Inc.", "Corp", False),
+    ("Holdings", "Holdings", False),               # legal-form words only: unusable
+    # Codex review on PR #875: shared Latin words must not merge different non-Latin names
+    (CJK_CHINA + " Bank", CJK_JAPAN + " Bank", False),
+    (CJK_CHINA + " Bank Ltd", CJK_CHINA + " BANK", True),
+    (ARABIC_RAJHI + " PLC", ARABIC_BILAD + " PLC", False),
 ])
 def test_p7_names_match(a, b, want):
     assert sync._fw2_names_match(a, b) is want
     assert sync._fw2_names_match(b, a) is want
+
+
+def test_p7c_legal_form_words_are_symbol_dedups():
+    from core.analysis import symbol_dedup
+    assert sync._FW2_LEGAL_FORM_WORDS == {w.casefold() for w in symbol_dedup._NAME_NOISE}
+
+
+def test_p7d_mixed_script_mismatch_stays_stripped():
+    rows = [r("8306.T", CJK_CHINA + " Bank", 107.0, 5.0, 19.5, ccy="JPY")]
+    grid = [list(H), r("8306.T", CJK_JAPAN + " Bank", 100.0, 5.0, 20.0, ccy="JPY")]
+    want_out, want_s, _d = run_off(rows)
+    out, stripped, rep, _d = run_mode(rows, "enforce", Loader(grid))
+    assert (out, stripped) == (want_out, want_s) == (want_out, ["8306.T"])
+    assert rep["rejected"] == [("8306.T", "name")]
 
 
 def test_p7b_name_key_keeps_unicode_letters():
