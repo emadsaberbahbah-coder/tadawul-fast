@@ -3997,7 +3997,8 @@ def _env_research_view_mode():
     """v1.16.0 [P0-6]: off | observe | enforce, read at call time (the
     _env_dd_guard_mode convention). v1.17.2: unset or blank reads enforce;
     any other value outside observe/enforce reads off, so a misspelt value
-    can never arm the view and an explicit off restores v1.16.0."""
+    can never arm the view and an explicit off restores v1.16.0 (since the
+    2026-10-28 merge: v1.17.0, i.e. v1.16.1 plus #869's D1b/D1c guards)."""
     v = str(os.environ.get("TFB_PF_RESEARCH_VIEW", "")).strip().lower()
     if v == "":
         return "enforce"
