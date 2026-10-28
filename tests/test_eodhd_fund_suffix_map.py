@@ -3,13 +3,16 @@
 (TFB_EODHD_FUND_SUFFIX_MAP = off | observe | enforce, default off).
 
 WHY (2026-10-28): fundamentals for Bursa Malaysia and Euronext Lisbon rows are
-requested under codes EODHD rejects. normalize_eodhd_symbol keeps '1295.KL' as
-is and turns 'SON.LS' into 'SON.LS.US' (the shared normalizer does not list
-.LS and appends the default exchange). calendar_sync run 40498374271 (27 Oct)
-logged both shapes among the codes EODHD rejected; run 40678905106 (28 Oct)
-sent 'KL->KLSE x2, LS.US->LS x3' with no rejection. The Yahoo fundamentals
-breaker has been open since 21 Oct, so EODHD is the fundamentals source for
-these rows: 13 of the 2,033 Global_Markets rows in the 10 Oct fixture.
+requested under codes EODHD does not use for those venues. normalize_eodhd_symbol
+keeps '1295.KL' as is and turns 'SON.LS' into 'SON.LS.US' (the shared
+normalizer does not list .LS and appends the default exchange). On EODHD's
+earnings-calendar endpoint, calendar_sync run 40498374271 (27 Oct) logged both
+shapes among the rejected codes and run 40678905106 (28 Oct) sent 'KL->KLSE x2,
+LS.US->LS x3' with no rejection. The Yahoo fundamentals breaker has re-tripped
+in every sync since 21 Oct, so EODHD is often these rows' only fundamentals
+source: 13 of the 2,033 Global_Markets rows in the 10 Oct fixture. The supplier
+stub below rejects the old codes, as the calendar endpoint did; that is the
+premise, not a measurement of the fundamentals endpoint.
 
 Pinned here (REAL provider and engine modules; the supplier HTTP boundary is
 the only replacement, and it answers only the codes EODHD knows):
@@ -20,15 +23,22 @@ the only replacement, and it answers only the codes EODHD knows):
   W3 observe: the request is the v4.19.0 one; one INFO line per code names
      the translation it would make
   W4 the engine fallback end to end (_apply_eodhd_fundamentals_fallback):
-     off -> nothing fills (the venue code is rejected); enforce -> the
-     ratios fill, eodhd_fundamentals_fallback_applied, no identity refusal
-  N1 off (11 spellings): request paths, cache keys, patches and log records
-     over all 2,033 fixture Global_Markets symbols equal the v4.19.0 copy
-     (git show BASE_SHA; else the OFF_GOLDEN digest of that copy's output)
+     off -> nothing fills (the stub rejects the old code); enforce -> the
+     ratios fill, eodhd_fundamentals_fallback_applied
+  W5 the engine's fund cache (TFB_EODHD_FUND_CACHE=enforce, live in
+     production): an empty answer under the old code leaves a negative mark
+     on the ROW symbol; while it lives, enforce does not reach the provider
+     at all (the rollout delay the owner steps state); once it has expired
+     (TFB_EODHD_FUND_NEG_TTL_H, default 168 h), enforce asks EODHD under the
+     venue code and the row fills
+  N1 off (11 spellings x all 2,033 fixture Global_Markets symbols): request
+     paths, cache keys, patches and log records equal the v4.19.0 copy (git
+     show BASE_SHA; without git, the OFF_GOLDEN digest of that copy's output,
+     and the run says the live comparison was skipped)
   N2 enforce never touches quotes or history, nor any other venue code
      (.IS, .T, .MI, .SI, .L, .SR, US, FX, crypto)
   N3 version floor, manifest pin, zero removed functions, ASCII added lines
-  G1 golden negative: W2, W3 and W4 fail on the v4.19.0 copy
+  G1 golden negative: W2, W3, W4 and W5 fail on the v4.19.0 copy
 
 Run: python tests/test_eodhd_fund_suffix_map.py   or   pytest -q <this file>
 """
@@ -60,8 +70,8 @@ from core.providers import eodhd_provider as ep  # noqa: E402
 
 FLAG = "TFB_EODHD_FUND_SUFFIX_MAP"
 BASE_SHA = "0c3d3e21"          # main before v4.20.0 (eodhd_provider v4.19.0)
-OFF_GOLDEN = "55ed1fd874aeaace"   # sha256[:16] of the v4.19.0 copy's off trace (all 2,033 symbols)
-OFF_GOLDEN_SPELLINGS = "df4e10c1742e1f7a"   # the same for 613 symbols x the 11 off spellings
+OFF_GOLDEN = "dd8d68d6d0971802"   # sha256[:16] of the v4.19.0 copy's off trace (2,033 symbols x 11 spellings)
+NOTES = []   # what a run without the v4.19.0 copy could not compare (printed by the script runner)
 FIXTURE = _REPO / "tests" / "fixtures" / "wp3ab_tuple_rows_2026-10-10.json"
 LOGGER = "core.providers.eodhd_provider"
 OFF_SPELLINGS = (None, "", "off", "OFF", "0", "1", "on", "true", "yes", "observe-ish", "enforced")
@@ -313,11 +323,54 @@ def case_w4_engine_fallback_end_to_end(mp, mod=ep):
 
 
 def _hermetic(mp):
-    """Every TFB_* / EODHD* variable unset, so the trace and its digest are
-    the code defaults wherever this runs (script, pytest + conftest, CI)."""
+    """Every TFB_* / EODHD* / NORMALIZE_* variable unset, so the trace and its
+    digest are the code defaults wherever this runs (script, pytest +
+    conftest, CI). NORMALIZE_STRIP_SUFFIXES / _PREFIXES are read when
+    core.symbols.normalize is imported; set them and the digest moves."""
     for k in list(os.environ):
-        if k.startswith(("TFB_", "EODHD")):
+        if k.startswith(("TFB_", "EODHD", "NORMALIZE_")):
             mp.delenv(k, raising=False)
+
+
+def case_w5_fund_cache_negative_mark_delays_then_enforce_fills(mp, mod=ep):
+    mp.setenv("TFB_EODHD_FUND_CACHE", "enforce")
+    mp.setenv("TFB_ENGINE_FUND_LKG", "1")
+    mp.setenv("TFB_ENGINE_FUND_LKG_REDIS", "0")
+    mp.setenv("TFB_FUND_UNIT_SENTRY", "off")
+    for k in ("TFB_EODHD_ANALYST_TARGET", "TFB_EODHD_FUND_NEG_TTL_H"):
+        mp.delenv(k, raising=False)
+    de._FUND_NEG_STORE.clear()
+    de._FUND_LKG_STORE.clear()
+    sym = ROW["symbol"]
+    try:
+        # 1. today (map off): the old code lands nothing, so the row is marked
+        _set(mp, None)
+        _fresh(mod)
+        eng, server = _engine(mp, mod)
+        out = asyncio.run(eng._apply_eodhd_fundamentals_fallback(dict(ROW), sym, "Global_Markets"))
+        assert server.calls == ["fundamentals/1295.KL"], server.calls
+        assert out.get("pe_ttm") is None and sym in de._FUND_NEG_STORE, (out, de._FUND_NEG_STORE)
+        # 2. armed while the mark lives: the provider is not reached at all
+        _set(mp, "enforce")
+        _fresh(mod)
+        eng, server = _engine(mp, mod)
+        logs, done = _capture()
+        try:
+            out = asyncio.run(eng._apply_eodhd_fundamentals_fallback(dict(ROW), sym, "Global_Markets"))
+        finally:
+            done()
+        assert server.calls == [] and out.get("pe_ttm") is None, (server.calls, out)
+        assert any(t.startswith("fund_cache:neg") for t in _tags(out)), _tags(out)
+        assert not [m for _lvl, m in logs.lines if "FUND-SUFFIX-MAP" in m]
+        # 3. the mark has expired (default TTL 168 h): enforce asks under the venue code
+        de._FUND_NEG_STORE[sym] = de._FUND_NEG_STORE[sym] - (168 * 3600 + 60)
+        out = asyncio.run(eng._apply_eodhd_fundamentals_fallback(dict(ROW), sym, "Global_Markets"))
+        assert server.calls == ["fundamentals/1295.KLSE"], server.calls
+        assert out.get("pe_ttm") == 10.0 and "eodhd_fundamentals_fallback_applied" in _tags(out), out
+        assert sym not in de._FUND_NEG_STORE
+    finally:
+        de._FUND_NEG_STORE.clear()
+        de._FUND_LKG_STORE.clear()
 
 
 def case_n1_off_is_the_v4190_copy(mp, mod=ep):
@@ -325,20 +378,17 @@ def case_n1_off_is_the_v4190_copy(mp, mod=ep):
     syms = _gm_symbols()
     assert len(syms) == 2033
     assert sum(1 for s in syms if s.endswith((".KL", ".LS"))) == 13
-    new = _off_trace(mp, mod, syms[:600] + [s for s in syms if s.endswith((".KL", ".LS"))],
-                     spellings=OFF_SPELLINGS)
-    full = _off_trace(mp, mod, syms, spellings=(None,))
-    base = _base_module()
-    if base is not None and mod is ep:
-        assert new == _off_trace(mp, base, syms[:600] + [s for s in syms if s.endswith((".KL", ".LS"))],
-                                 spellings=OFF_SPELLINGS)
-        assert full == _off_trace(mp, base, syms, spellings=(None,))
-    assert _digest(full) == OFF_GOLDEN, _digest(full)
-    assert _digest(new) == OFF_GOLDEN_SPELLINGS, _digest(new)
     if hasattr(mod, "_fund_suffix_map_mode"):
         for value in OFF_SPELLINGS:
             _set(mp, value)
             assert mod._fund_suffix_map_mode() == "off", value
+    trace = _off_trace(mp, mod, syms, spellings=OFF_SPELLINGS)
+    base = _base_module()
+    if base is not None and mod is ep:
+        assert trace == _off_trace(mp, base, syms, spellings=OFF_SPELLINGS)
+    elif mod is ep:
+        NOTES.append("N1: v4.19.0 copy unavailable (git show %s); compared with OFF_GOLDEN only" % BASE_SHA)
+    assert _digest(trace) == OFF_GOLDEN, _digest(trace)
 
 
 def case_n2_enforce_scope(mp, mod=ep):
@@ -372,6 +422,8 @@ def case_n3_version_pin_inventory_ascii(_mp, mod=ep):
     for text in (block, helpers):
         assert all(ord(ch) < 128 for ch in text)
     base = _base_module()
+    if base is None:
+        NOTES.append("N3: v4.19.0 copy unavailable; the zero-removal AST check did not run")
     if base is not None:
         base_src = Path(base.__file__).read_text(encoding="utf-8")
 
@@ -388,17 +440,19 @@ def case_g1_golden_negative_on_the_v4190_copy(mp, _mod=ep):
         pytest.skip("v4.19.0 copy unavailable (git show %s)" % BASE_SHA)
     failed = []
     for case in (case_w2_enforce_requests_the_eodhd_code, case_w3_observe_logs_and_changes_nothing,
-                 case_w4_engine_fallback_end_to_end):
+                 case_w4_engine_fallback_end_to_end, case_w5_fund_cache_negative_mark_delays_then_enforce_fills):
         try:
             case(mp, base)
         except (AssertionError, AttributeError):
             failed.append(case.__name__)
     assert failed == ["case_w2_enforce_requests_the_eodhd_code", "case_w3_observe_logs_and_changes_nothing",
-                      "case_w4_engine_fallback_end_to_end"], failed
+                      "case_w4_engine_fallback_end_to_end",
+                      "case_w5_fund_cache_negative_mark_delays_then_enforce_fills"], failed
 
 
 CASES = [case_w1_code_map, case_w2_enforce_requests_the_eodhd_code, case_w3_observe_logs_and_changes_nothing,
-         case_w4_engine_fallback_end_to_end, case_n1_off_is_the_v4190_copy, case_n2_enforce_scope,
+         case_w4_engine_fallback_end_to_end, case_w5_fund_cache_negative_mark_delays_then_enforce_fills,
+         case_n1_off_is_the_v4190_copy, case_n2_enforce_scope,
          case_n3_version_pin_inventory_ascii, case_g1_golden_negative_on_the_v4190_copy]
 
 
@@ -409,7 +463,7 @@ def test_eodhd_fund_suffix_map(case, monkeypatch):
 
 
 if __name__ == "__main__":
-    passed = 0
+    passed = skipped = 0
     for case in CASES:
         mp = MonkeyPatch()
         try:
@@ -418,11 +472,14 @@ if __name__ == "__main__":
             passed += 1
             print("ok   " + case.__name__)
         except pytest.skip.Exception as exc:
-            passed += 1
+            skipped += 1
             print("skip " + case.__name__ + ": " + str(exc))
         except Exception as exc:  # noqa: BLE001
             print("FAIL " + case.__name__ + ": " + repr(exc)[:400])
         finally:
             mp.undo()
-    print("PASS %d/%d" % (passed, len(CASES)))
-    sys.exit(0 if passed == len(CASES) else 1)
+    for note in NOTES:
+        print("note " + note)
+    ran = len(CASES) - skipped
+    print("PASS %d/%d%s" % (passed, ran, " (%d skipped)" % skipped if skipped else ""))
+    sys.exit(0 if passed == ran else 1)

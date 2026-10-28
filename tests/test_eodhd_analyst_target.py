@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import types
@@ -488,15 +489,20 @@ def _klse_payload():
 
 
 @pytest.mark.parametrize("value", [None, "", "off", "on", "1", "true"])
-def test_g20_fund_suffix_map_off_keeps_the_v4190_request(monkeypatch, value):
+def test_g20_fund_suffix_map_off_keeps_the_v4190_request(monkeypatch, caplog, value):
     if value is None:
         monkeypatch.delenv("TFB_EODHD_FUND_SUFFIX_MAP", raising=False)
     else:
         monkeypatch.setenv("TFB_EODHD_FUND_SUFFIX_MAP", value)
+    ep._FUND_SUFFIX_MAP_SEEN.clear()
     client, calls = _client(monkeypatch, _klse_payload())
-    asyncio.run(client.fetch_fundamentals("1295.KL"))
-    asyncio.run(client.fetch_fundamentals("SON.LS"))
+    with caplog.at_level(logging.DEBUG, logger="core.providers.eodhd_provider"):
+        asyncio.run(client.fetch_fundamentals("1295.KL"))
+        asyncio.run(client.fetch_fundamentals("SON.LS"))
     assert calls == ["fundamentals/1295.KL", "fundamentals/SON.LS.US"]
+    assert ep._fund_suffix_map_mode() == "off"
+    assert not [r for r in caplog.records if "FUND-SUFFIX-MAP" in r.getMessage()]
+    assert all(k.endswith((":1295.KL", ":SON.LS.US")) for k in _cache_keys(client))
 
 
 def test_g20_fund_suffix_map_enforce_requests_the_eodhd_codes(monkeypatch):

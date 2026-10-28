@@ -1153,18 +1153,20 @@ def _build_error_patch_with_geo(
 # All v4.17.0 and earlier WHY blocks below are preserved verbatim.
 # =============================================================================
 # v4.20.0 WHY (2026-10-28): fundamentals for Bursa Malaysia and Euronext
-# Lisbon rows are requested under codes EODHD rejects. The shared normalizer
-# (core.symbols.normalize.to_eodhd_symbol) keeps '.KL' as is (it has no
-# KL -> KLSE entry) and, because '.LS' is not one of its exchange suffixes,
-# appends the default exchange: EDP.LS -> EDP.LS.US. _canonicalize_eodhd_suffix
-# maps only .L / .XETR / .ETR / .TASE. Evidence: calendar_sync run
-# 40498374271 (27 Oct) logged 'EODHD rejected 33 code(s)', among them the
-# '.KL' codes and the 'X.LS.US' codes; run 40678905106 (28 Oct), with
-# calendar_provider v1.3.2's TFB_CALENDAR_SUFFIX_MAP armed, sent
-# 'KL->KLSE x2, LS.US->LS x3' and none of those codes was rejected. The
-# Yahoo fundamentals breaker has been open since 2026-10-21 (v4.19.0 WHY),
-# so EODHD is the fundamentals source for these rows and they get none. In
-# the 10 Oct Global_Markets fixture 13 of 2,033 rows are .KL or .LS.
+# Lisbon rows are requested under codes EODHD does not use for those venues.
+# The shared normalizer (core.symbols.normalize.to_eodhd_symbol) keeps '.KL'
+# as is (it has no KL -> KLSE entry) and, because '.LS' is not one of its
+# exchange suffixes, appends the default exchange: EDP.LS -> EDP.LS.US.
+# _canonicalize_eodhd_suffix maps only .L / .XETR / .ETR / .TASE. Evidence
+# (EODHD's earnings-calendar endpoint; no fundamentals-endpoint log exists):
+# calendar_sync run 40498374271 (27 Oct) logged 'EODHD rejected 33 code(s)',
+# among them '.KL' and 'X.LS.US' codes; run 40678905106 (28 Oct), with
+# calendar_provider v1.3.2's TFB_CALENDAR_SUFFIX_MAP armed, sent 'KL->KLSE
+# x2, LS.US->LS x3' and none of those codes was rejected. The Yahoo
+# fundamentals breaker has re-tripped in every sync since 2026-10-21 (v4.19.0
+# WHY), so EODHD is often the only fundamentals source, and for these rows
+# it is asked under the wrong code. The 10 Oct Global_Markets fixture has 13
+# such rows of 2,033 (10 '.KL', 3 '.LS'); the calendar runs name more.
 # WHAT: TFB_EODHD_FUND_SUFFIX_MAP = off (default; unset, blank or any other
 # word) | observe | enforce, read per call, fundamentals endpoint only.
 #   off      fetch_fundamentals is byte-identical to v4.19.0: same request
@@ -1179,6 +1181,10 @@ def _build_error_patch_with_geo(
 # rejected by EODHD's calendar even as X.IS, and '.T', '.SI', '.MI' and the
 # other venues have no established code here, so they are unchanged.
 # Quotes, history and every other endpoint are unchanged in every mode.
+# LIMIT: data_engine_v2's fund cache keeps a negative mark per ROW symbol
+# (TFB_EODHD_FUND_NEG_TTL_H, default 168 h) and checks it before calling this
+# provider, so a row marked under the old code is asked again only after its
+# mark expires; until then neither observe nor enforce sees it.
 # Additions (0 removed): _fund_suffix_map_mode, _eodhd_fund_venue_code,
 # _fund_suffix_map, _FUND_SUFFIX_MAP_SEEN. Rollback: unset the variable.
 # =============================================================================
