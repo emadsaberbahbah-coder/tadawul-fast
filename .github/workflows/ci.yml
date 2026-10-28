@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.52 (2026-10-28) -- VERIFIED YAHOO IDS (TFB_YAHOO_ID_ALIAS)
+#
+# v1.1.52 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.51 are #848-#863):
+# run tests/test_yahoo_id_alias.py (core/symbols/normalize.py v5.7.0: the
+# nine Commodities_FX tickers that are dead or collide on Yahoo map to the ids
+# the provider read-back confirmed, only when TFB_YAHOO_ID_ALIAS=1) in the
+# full-dependency work-brief lane next to tests/test_crypto_provider_identity.py,
+# because its engine and adapter cases import the real modules. Offline.
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.51 (2026-10-28) -- PROVIDER IDENTITY PROBE (READ-ONLY)
 #
 # v1.1.51 (1.1.39 is claimed by open PR #846; 1.1.40-1.1.50 are #848-#859):
@@ -1252,6 +1262,7 @@ jobs:
             tests/test_usx_currency_lockstep.py \
             tests/test_identity_guard.py \
             tests/test_crypto_provider_identity.py \
+            tests/test_yahoo_id_alias.py \
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
