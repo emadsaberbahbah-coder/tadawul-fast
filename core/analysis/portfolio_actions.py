@@ -850,11 +850,13 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #       echoes it. An ADD whose holding reported within
 #       TFB_PF_POST_EARN_SESSIONS (5) sessions, or
 #       TFB_PF_POST_EARN_SESSIONS_NEG (10) after a negative EPS surprise,
-#       narrows to HOLD. Under enforce, inputs that are absent, unavailable,
-#       stale, invalid or not dated today (Riyadh, +-1 day) also hold: the
-#       window cannot be verified and an ADD is never urgent. A holding with
-#       no report in the calendar's 31-day window passes (the EODHD calendar
-#       does not cover KSA names - limit).
+#       narrows to HOLD (both lengths 0..14: the longest window the
+#       21-day calendar can prove, review fix). Under enforce, inputs that
+#       are absent, unavailable, stale, invalid or not dated today (Riyadh,
+#       +-1 day) also hold: the window cannot be verified and an ADD is
+#       never urgent. A holding with no report in the inputs passes
+#       (Calendar_Events keeps 21 days; the EODHD calendar does not cover
+#       KSA names - limit).
 #   (c) _apply_ticket_cap, one pass after the per-row loop. Open tickets =
 #       held non-sukuk positions (quantity > 0) in this run. ADDs take the
 #       free slots (TFB_PF_MAX_OPEN_TICKETS, default 1, minus open tickets)
@@ -3534,6 +3536,13 @@ def _apply_add_loser_veto(cand, action, reason, proceeds, capped_from):
 _POST_EARN_SCHEMA = "tfb.pd-post-earnings/v1"
 _POST_EARN_MAX_SYMBOLS = 200
 _POST_EARN_STATUSES = ("absent", "unavailable", "stale", "invalid", "ok")
+# Review fix (Codex P2, PR #869): a window is only as long as the inputs can
+# prove. Calendar_Events keeps a Last Earnings Date for 21 calendar days
+# (calendar_sync, TFB_CALENDAR_DAYS_BACK default; the Top-10 reader keeps
+# 31), and a report at most 14 sessions old is at most 20 calendar days old
+# (Mon-Fri or Sun-Thu); a 15-session report can be 23 days old and already
+# gone, which would read as "no report". Both session readers accept 0..14.
+_POST_EARN_MAX_SESSIONS = 14
 
 
 def _env_add_post_earn_mode():
@@ -3544,16 +3553,17 @@ def _env_add_post_earn_mode():
 
 
 def _env_post_earn_sessions():
-    """v1.17.0 [D1b]: sessions after any report (default 5, 0..60)."""
+    """v1.17.0 [D1b]: sessions after any report (default 5,
+    0.._POST_EARN_MAX_SESSIONS)."""
     n = _env_int("TFB_PF_POST_EARN_SESSIONS", 5)
-    return n if 0 <= n <= 60 else 5
+    return n if 0 <= n <= _POST_EARN_MAX_SESSIONS else 5
 
 
 def _env_post_earn_sessions_neg():
     """v1.17.0 [D1b]: sessions after a negative EPS surprise (default 10,
-    0..60)."""
+    0.._POST_EARN_MAX_SESSIONS)."""
     n = _env_int("TFB_PF_POST_EARN_SESSIONS_NEG", 10)
-    return n if 0 <= n <= 60 else 10
+    return n if 0 <= n <= _POST_EARN_MAX_SESSIONS else 10
 
 
 def _post_earn_inputs(raw, today=None):

@@ -137,8 +137,12 @@ def test_number_readers(monkeypatch):
             pa._env_ticket_cap()) == (5, 10, 1)
     for key, raw, expected in (("TFB_PF_POST_EARN_SESSIONS", "3", 3),
                                ("TFB_PF_POST_EARN_SESSIONS", "99", 5),
+                               ("TFB_PF_POST_EARN_SESSIONS", "14", 14),
+                               ("TFB_PF_POST_EARN_SESSIONS", "15", 5),
                                ("TFB_PF_POST_EARN_SESSIONS_NEG", "7", 7),
                                ("TFB_PF_POST_EARN_SESSIONS_NEG", "-1", 10),
+                               ("TFB_PF_POST_EARN_SESSIONS_NEG", "14", 14),
+                               ("TFB_PF_POST_EARN_SESSIONS_NEG", "30", 10),
                                ("TFB_PF_MAX_OPEN_TICKETS", "2", 2),
                                ("TFB_PF_MAX_OPEN_TICKETS", "0", 1),
                                ("TFB_PF_MAX_OPEN_TICKETS", "x", 1)):
@@ -148,6 +152,34 @@ def test_number_readers(monkeypatch):
                   "TFB_PF_MAX_OPEN_TICKETS": pa._env_ticket_cap}[key]
         assert reader() == expected, (key, raw)
         monkeypatch.delenv(key)
+
+
+def _weekdays_between(day, today, sun_thu=False):
+    """Mirror of dt10WeekdaysBetween_: sessions after `day` up to `today`."""
+    from datetime import timedelta
+    n, d = 0, day + timedelta(days=1)
+    while d <= today:
+        wd = d.weekday()                      # Monday = 0 .. Sunday = 6
+        n += (wd in (6, 0, 1, 2, 3)) if sun_thu else (wd <= 4)
+        d += timedelta(days=1)
+    return n
+
+
+def test_session_cap_is_the_longest_window_the_calendar_can_prove():
+    # Review fix (Codex P2, PR #869): Calendar_Events keeps a last report for
+    # 21 calendar days; every report at most 14 sessions old is at most 20
+    # days old, while a 15-session report can be 23 days old (already gone).
+    from datetime import timedelta
+    assert pa._POST_EARN_MAX_SESSIONS == 14
+    for sun_thu in (False, True):
+        oldest = {}
+        for start in range(7):
+            day = date(2026, 10, 5) + timedelta(days=start)
+            for gap in range(0, 40):
+                s = _weekdays_between(day, day + timedelta(days=gap), sun_thu)
+                oldest[s] = max(oldest.get(s, 0), gap)
+        assert oldest[14] == 20 and oldest[15] == 23, (sun_thu, oldest[14], oldest[15])
+        assert max(oldest[s] for s in range(15)) <= 21
 
 
 # ----------------------------------------------------------------- inputs
