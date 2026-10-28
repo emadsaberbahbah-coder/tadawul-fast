@@ -190,12 +190,12 @@ ok(i0 > 0 && i1 > i0, 'P8 block located');
 ok(!/\b(let|const)\s|=>|`|\.\.\.|class\s/.test(block), 'P8 ES5 only');
 ok(![...block].some((ch) => ch.charCodeAt(0) > 126), 'P8 ASCII only');
 for (const f of FUNCS.slice(5)) ok(block.indexOf('function ' + f + '(') > 0, 'P8 inventory ' + f);
-// merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16: the delivered file may sit above
-// v1.5.16; the floor is v1.5.16 and the header line stays in lockstep with PD_VERSION.
-const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m);
-const pdAtLeast = (v, f) => { for (let k = 0; k < f.length; k++) { if (v[k] !== f[k]) return v[k] > f[k]; } return true; };
-ok(pdv && (src.match(/var PD_VERSION = '/g) || []).length === 1 && pdAtLeast(pdv.slice(1).map(Number), [1, 5, 16]) &&
-   new RegExp('^ \\* Version: ' + pdv.slice(1).join('\\.') + '$', 'm').test(src), 'P8 version lockstep');
+// 2026-10-28: v1.5.17 (post-earnings inputs) stacks on this change; the lockstep holds at the
+// delivered file's own version, which must be 1.5.16 or later.
+const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m) || [];
+ok(pdv.length === 4 && (src.match(/var PD_VERSION = '/g) || []).length === 1 &&
+   new RegExp('^ \\* Version: ' + pdv[1] + '\\.' + pdv[2] + '\\.' + pdv[3] + '$', 'm').test(src) &&
+   (+pdv[1]) * 1e6 + (+pdv[2]) * 1e3 + (+pdv[3]) >= 1005016, 'P8 version lockstep');
 ok(src.indexOf(" * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION") > 0 && src.indexOf(" * v1.5.15 (2026-10-24)  (PD-ALLCASH") > 0, 'P8 header blocks, prior WHY kept');
 console.log('P8 PASS lint + inventory');
 
@@ -212,8 +212,12 @@ if (process.env.PD_BASE) {
   // merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16: the delivered file also carries
   // #780's three panel-preserve functions (tests/js/pf_panel_preserve.test.js).
   const PD780 = ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'];
-  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + 8 + PD780.length,
-     'P9 zero functions removed; exactly 8 added + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
+  // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17, which adds four pdPostEarn*
+  // functions (tests/test_pd_post_earn_inputs.js); they count too.
+  const PD869 = ['pdPostEarnMode_', 'pdPostEarnRiyadhDay_', 'pdPostEarnCore_', 'pdPostEarnBody_'];
+  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
+     PD869.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + 8 + PD869.length + PD780.length,
+     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('P9 PASS golden negative on the v1.5.15 base ' + sha.slice(0, 12));
 } else {
   console.log('P9 SKIP (set PD_BASE=<v1.5.15 file> to run the golden negative)');

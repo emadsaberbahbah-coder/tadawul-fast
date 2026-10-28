@@ -1,5 +1,6 @@
-/* 10_My_Portfolio v1.5.17 (authored as v1.5.14; merge notes (#780): 2026-10-21 renumbered v1.5.15 over #810's v1.5.14,
- * 2026-10-25 renumbered v1.5.16 over #834's v1.5.15, 2026-10-27 renumbered v1.5.17 over #844's v1.5.16):
+/* 10_My_Portfolio v1.5.18 (authored as v1.5.14; merge notes (#780): 2026-10-21 renumbered v1.5.15 over #810's v1.5.14,
+ * 2026-10-25 renumbered v1.5.16 over #834's v1.5.15, 2026-10-27 renumbered v1.5.17 over #844's v1.5.16,
+ * 2026-10-28 renumbered v1.5.18 over #869's v1.5.17):
  * the Portfolio_Decision layout builder keeps the
  * operator's panel inputs (P-76 port from 16_Decision_Top10 v1.11.3), gated
  * by Script Property PD_PANEL_PRESERVE = off (default) | observe | enforce.
@@ -346,8 +347,8 @@ check('W6 the mode tolerates case and surrounding blanks like the other PD prope
   for (const raw of ['ENFORCE', ' enforce ', 'Enforce\t']) {
     assert.deepEqual(build({props: {PD_PANEL_PRESERVE: raw}}).panel, OPERATOR, JSON.stringify(raw));
   }
-  assert.equal(ctx0.PD_VERSION, '1.5.17');   // merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16
-  assert.ok(/\n \* Version: 1\.5\.17\n/.test(SOURCE));
+  assert.equal(ctx0.PD_VERSION, '1.5.18');   // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17
+  assert.ok(/\n \* Version: 1\.5\.18\n/.test(SOURCE));
 });
 
 check('W7 observe: a snapshot read fault is logged and the build carries on as v1.5.13', () => {
@@ -437,16 +438,16 @@ check('N4 the snapshot never throws: no sheet, an empty sheet, a faulting sheet 
   assert.deepEqual(JSON.parse(JSON.stringify(ok)), OPERATOR);
 });
 
-check('N5 the v1.5.17 header block and the added functions are ASCII', () => {
-  const a = SOURCE.indexOf(' * v1.5.17 MAIN CHANGES');
-  const b = SOURCE.indexOf(' * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION');   // merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16
-  const c = SOURCE.indexOf('/* ----- v1.5.17 operator inputs survive');
+check('N5 the v1.5.18 header block and the added functions are ASCII', () => {
+  const a = SOURCE.indexOf(' * v1.5.18 MAIN CHANGES');
+  const b = SOURCE.indexOf(' * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS');   // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17
+  const c = SOURCE.indexOf('/* ----- v1.5.18 operator inputs survive');
   const d = SOURCE.indexOf('/* ----- holdings pool (reads the 122-col');
   assert.ok(a > 0 && b > a && c > 0 && d > c);
   for (const block of [SOURCE.slice(a, b), SOURCE.slice(c, d)]) {
     assert.ok(/^[\x00-\x7f]*$/.test(block));
   }
-  const e = SOURCE.indexOf('/* v1.5.17: snapshot operator inputs BEFORE the clear');
+  const e = SOURCE.indexOf('/* v1.5.18: snapshot operator inputs BEFORE the clear');
   const f = SOURCE.indexOf("Logger.log('[MP-DEC v' + PD_VERSION + '] layout built');");
   assert.ok(e > 0 && f > e && /^[\x00-\x7f]*$/.test(SOURCE.slice(e, f).replace(/\\u2014/g, '')));
 });
@@ -501,8 +502,10 @@ check('G2 live base (PF_BASE_GAS): off == base byte for byte; enforce on base st
   // valid base (#834 changed the receipt / all-cash status path, not the panel).
   // merge note 2026-10-27 (#780): panel preserve is v1.5.17 over #844's v1.5.16; main's v1.5.16 is also a
   // valid base (#844 changed the IBKR apply / capture watcher / self-test, not the panel).
+  // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17; main's v1.5.17 is also a
+  // valid base (#869 added a PD_POST_EARN-gated request field, two meta tokens and a self-test line, not the panel).
   const base13 = /var PD_VERSION = '1\.5\.13';/.test(base);
-  assert.ok(base13 || /var PD_VERSION = '1\.5\.1[456]';/.test(base));
+  assert.ok(base13 || /var PD_VERSION = '1\.5\.1[4567]';/.test(base));
   if (base13) assert.equal(crypto.createHash('sha256').update(base).digest('hex'), golden.source_sha256);
   const b = build({source: base});
   assert.deepEqual(offOp.trace, b.trace);

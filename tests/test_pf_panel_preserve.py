@@ -1,4 +1,4 @@
-"""10_My_Portfolio v1.5.17 (authored as v1.5.14; renumbered over #810, #834 and #844): Portfolio_Decision panel inputs survive a rebuild.
+"""10_My_Portfolio v1.5.18 (authored as v1.5.14; renumbered over #810, #834, #844 and #869): Portfolio_Decision panel inputs survive a rebuild.
 
 Runs tests/js/pf_panel_preserve.test.js (the REAL Apps Script source in a vm,
 cell-level sheet model, synthetic holdings) and checks what it produced:

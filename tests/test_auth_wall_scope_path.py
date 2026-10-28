@@ -152,7 +152,8 @@ ENV_ROUTE_BASE = "TFB_ROUTE_AUTH_BASE"
 # fail-closed try (tests/test_auth_wall_downstream_errors.py). Every case here
 # is unchanged: the stub never raises, so each decision and denial is identical.
 # v8.14.7 changes diagnostic inventory only; retain every auth assertion.
-EXPECTED_VERSION = "8.14.7"
+# v8.14.8 (2026-10-28) adds /health pf_gates keys only; same rule.
+EXPECTED_VERSION = "8.14.8"
 NEW_HELPERS = ["_global_auth_exempt_request", "_request_scope_path", "_scope_route_path"]
 TOKEN = "harness-wall-token-7q2"
 RID = "harness-rid-1"
@@ -498,7 +499,9 @@ ROUTE_SITES = ["investment_advisor._auth_passed", "analysis_sheet_rows._auth_pas
 ROUTE_FILES = {
     "routes/investment_advisor.py": ("INVESTMENT_ADVISOR_VERSION", "2.18.1", "_auth_passed"),
     "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.8.4", "_auth_passed"),
-    "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.18.2", "_auth_passed"),
+    # 4.18.2 -> 4.19.0 (2026-10-28): post-earnings guard inputs forwarded on
+    # the portfolio route; _auth_passed and _request_scope_path untouched.
+    "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.19.0", "_auth_passed"),
     "routes/config.py": ("ROUTER_VERSION", "5.9.1", "_auth_ok"),
     # 8.5.2 -> 8.6.0 (2026-10-19): bridge signature binding + gated instrument
     # fallback; _Service.auth_guard and _request_scope_path untouched.
@@ -1220,7 +1223,7 @@ def case_w19(res=None):
 
 
 CASES = (
-    ("W1 v8.14.7, helpers present, no request.url reads", case_w1),
+    ("W1 v8.14.8, helpers present, no request.url reads", case_w1),
     ("W2 anonymous protected requests get 401", case_w2),
     ("W3 crafted Host and decoded-path shapes still get 401", case_w3),
     ("W4 exempt paths stay exempt", case_w4),
