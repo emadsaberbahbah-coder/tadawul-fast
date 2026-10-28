@@ -167,7 +167,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
-    ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
+    ('core.symbols.normalize', '__version__', '5.7.0', 'symbol normalization'),
     ('core.analysis.identity_guard', 'IDENTITY_GUARD_VERSION', '1.3.1', 'surface identity guard'),
     ('core.surface_action_invariants', '__version__', '1.4.2', 'surface unit/action invariants'),
     ('scripts.performance_math', '__version__', '1.0.0', 'pure performance statistics'),
@@ -328,6 +328,7 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ('TFB_OPP_FX_USX_SUBUNIT', '0', 'US-cent currency parent conversion', False),
     ('TFB_EODHD_CRYPTO_MAP', '0', 'native EODHD explicit crypto pairs', False),
     ('TFB_CRYPTO_NAME_GATE', 'off', 'Yahoo fundamentals crypto-name screen', False),
+    ('TFB_YAHOO_ID_ALIAS', '0', 'verified Yahoo ids for dead or colliding page tickers', False),
 
     ("TFB_COMPLIANCE_GATE_ENABLED", "0", "compliance gate evaluates", False),
     ("TFB_SHADOW_COMPLIANCE", "0", "selector logs [SHADOW-GATE]", False),
