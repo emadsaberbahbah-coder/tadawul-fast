@@ -2,8 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.59 (2026-10-29) -- BIGQUERY LOOKER VIEWS (C8 PHASE 2)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877.)
+#
+# v1.1.59: run tests/test_bq_views.py (scripts/apply_bq_views.py v1.0.0 +
+# sql/bigquery/*.sql: three helper functions and ten typed views over the
+# nightly tfb_archive tables for Looker Studio; workflow bq_views.yml,
+# dispatch-only, verify by default) in the blocking lean lane next to
+# tests/test_bq_archive.py. Offline: the BigQuery session is a fake, no
+# google library is imported, PyYAML (already in the lane) reads the
+# workflow. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.58 (2026-10-29) -- RELEASE RENDER SETTLE (release_decision_feed 1.3.0)
-# (1.1.56 is #875; 1.1.57 is #876.)
 #
 # v1.1.58: run tests/test_release_render_settle.py (release_decision_feed
 # v1.3.0: a cockpit caught mid-render settles and is re-audited instead of
@@ -993,6 +1003,7 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
+            tests/test_bq_views.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
