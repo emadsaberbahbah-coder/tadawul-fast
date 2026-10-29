@@ -9,7 +9,7 @@
 | `.github/workflows/release_decision_feed.yml` | 1.1.0 -> 1.2.0 | release STEP env maps `TFB_RELEASE_RENDER_SETTLE` (default `'0'`); job env untouched (final-job parity); the summary prints a `render_settle` row only when a settle happened |
 | `tests/test_release_render_settle.py` | NEW | 14 cases (R1-R14), script and pytest |
 | `tests/test_release_auto_source.py` | a7 | exact `1.2.0` pins -> a version floor and a k==k manifest pin |
-| `.github/workflows/ci.yml` | 1.1.55 -> 1.1.58 | the new harness in the blocking lean lane (1.1.56 / 1.1.57 claimed by #875 / #876) |
+| `.github/workflows/ci.yml` | 1.1.55 -> 1.1.58 | the new harness in the blocking lean lane (1.1.56 / 1.1.57 are #875 / #876) |
 | `scripts/verify_deployment.py` | pin | `release_decision_feed 1.3.0` |
 
 ## S1 - Evidence
