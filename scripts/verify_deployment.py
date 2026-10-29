@@ -261,7 +261,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
-    ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
+    # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
+    ("release_decision_feed", "1.3.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
