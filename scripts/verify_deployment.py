@@ -293,7 +293,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("archive_to_bigquery", "1.0.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
     # scripts/apply_bq_views.py, the typed Looker views over the archive.
-    ("apply_bq_views", "1.0.0", "bigquery looker views"),
+    # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
+    # the market_series_daily source for the global markets page), plus NEW
+    # scripts/archive_market_series.py, the daily bars of the reference markets.
+    ("apply_bq_views", "1.1.0", "bigquery looker views"),
+    ("archive_market_series", "1.0.0", "bigquery market series"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

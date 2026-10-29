@@ -1,0 +1,432 @@
+"""scripts/archive_market_series.py v1.0.0 - the daily bars of the world's
+reference markets for the Looker global markets page (program register C8,
+Phase 2b).
+
+REAL module; the stubs are the Yahoo opener / fetch and the HTTP session (an
+AuthorizedSession-like fake answering BigQuery datasets, tables, jobs and the
+resumable upload offline). No network, no google libraries.
+
+M1  SERIES: ids unique, permanent (pinned below) and inside 1..1000; symbols
+    and names unique; kinds and regions from the declared lists; every
+    sector ETF names its sector, every index its local currency
+M2  parse_chart: venue-local dates from gmtoffset, null and non-positive
+    closes skipped, a repeated date keeps the last bar, adjclose / volume
+    read, output sorted
+M3  the bars of a session still open at run time are left out; a closed
+    session or a malformed trading period keeps every bar
+M4  fetch_series: query1 then query2, a 404 is final, the symbol is encoded
+    and the window passed
+M5  rows: exactly the SCHEMA columns, blanks as NULL, NDJSON lines
+M6  the table: the live 29 Oct layout passes schema_problems; a changed mode,
+    type, column or partitioning is refused; ensure_table creates the
+    range-partitioned table when missing and refuses a different one
+M7  write: each series loads into market_series_daily$<id> with
+    WRITE_TRUNCATE / CREATE_NEVER; a series that fails once is retried and
+    loaded; one that fails twice is left untouched while the others load
+    (exit 1); a job errorResult counts as a failure
+M8  dry run: Yahoo read and the dataset checked; no table call, no load
+M9  main: gate off (no request at all), missing project, bad --days, unknown
+    symbol, missing dataset, unreadable credentials, a table with another
+    layout
+M10 the workflow: nightly schedule, dry-run dispatch by default, read-only
+    repository, armed gate with a kill switch, pinned actions
+M11 nothing here writes to the workbook or runs DML
+"""
+from __future__ import annotations
+
+import datetime as dt
+import io
+import json
+import urllib.error
+from pathlib import Path
+
+import pytest
+import yaml
+
+from scripts import archive_market_series as ms
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = ROOT / "tests" / "fixtures" / "bq_market_series_table_2026-10-29.json"
+WORKFLOW = ROOT / ".github" / "workflows" / "bq_markets.yml"
+NOW = dt.datetime(2026, 10, 29, 22, 35, 9, 123456, tzinfo=dt.timezone.utc)
+PROJECT, DATASET = "proj-x", "tfb_archive"
+
+# series_id -> symbol is permanent (one partition per id): a renumbered or
+# reused id would mix two instruments in one partition.
+PINNED_IDS = {
+    1: "^GSPC", 2: "^IXIC", 3: "^DJI", 4: "^STOXX50E", 5: "^FTSE", 6: "^GDAXI", 7: "^FCHI",
+    8: "000001.SS", 9: "399001.SZ", 10: "000300.SS", 11: "^HSI", 12: "^N225", 13: "^TASI.SR",
+    20: "SPY", 21: "VGK", 22: "MCHI", 23: "EWJ", 24: "KSA", 25: "UAE", 26: "QAT", 27: "KWT",
+    28: "ACWI", 29: "EEM",
+    40: "XLK", 41: "XLF", 42: "XLE", 43: "XLV", 44: "XLI", 45: "XLY", 46: "XLP", 47: "XLU",
+    48: "XLB", 49: "XLRE", 50: "XLC",
+    60: "BZ=F", 61: "CL=F", 62: "GC=F",
+    70: "IXN", 71: "IXG", 72: "IXC", 73: "IXJ", 74: "EXI", 75: "RXI", 76: "KXI", 77: "JXI",
+    78: "MXI", 79: "REET", 80: "IXP",
+}
+
+
+def _ts(day: str, hh: int = 14, mm: int = 30) -> int:
+    d = dt.datetime.strptime(day, "%Y-%m-%d").replace(hour=hh, minute=mm, tzinfo=dt.timezone.utc)
+    return int(d.timestamp())
+
+
+def _chart(ts, close, adj=None, gmtoffset=-14400, period=None, volume=None):
+    q = {"open": close, "high": close, "low": close, "close": close,
+         "volume": volume if volume is not None else [1000] * len(close)}
+    ind = {"quote": [q]}
+    if adj is not None:
+        ind["adjclose"] = [{"adjclose": adj}]
+    meta = {"gmtoffset": gmtoffset}
+    if period is not None:
+        meta["currentTradingPeriod"] = {"regular": period}
+    return {"chart": {"result": [{"meta": meta, "timestamp": ts, "indicators": ind}], "error": None}}
+
+
+def _bars(*days):
+    return [{"date": d, "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0 + i, "adj_close": None,
+             "volume": 5} for i, d in enumerate(days)]
+
+
+class Resp:
+    def __init__(self, status=200, body=None, headers=None):
+        self.status_code = status
+        self._body = body if body is not None else {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._body
+
+
+class FakeBQ:
+    """Offline BigQuery: datasets.get, tables.get / insert, resumable load
+    jobs (DONE after `polls` GETs) and the uploaded NDJSON per partition."""
+
+    def __init__(self, table=None, dataset=True, job_error=None, polls=1):
+        self.table = table            # None = missing; dict = tables.get body
+        self.dataset = dataset
+        self.job_error = job_error or {}
+        self.polls = polls
+        self.calls, self.created, self.jobs, self.uploads = [], [], {}, {}
+
+    def get(self, url, timeout=None, **_):
+        self.calls.append(("GET", url))
+        if "/jobs/" in url:
+            job_id = url.split("/jobs/")[1].split("?")[0]
+            job = self.jobs[job_id]
+            job["polls"] += 1
+            done = job["polls"] >= self.polls
+            status = {"state": "DONE" if done else "RUNNING"}
+            if done and job["sid"] in self.job_error:
+                status["errorResult"] = {"message": self.job_error[job["sid"]]}
+            return Resp(200, {"status": status, "statistics": {"load": {"outputRows": str(job["rows"])}}})
+        if url.endswith(f"/datasets/{DATASET}"):
+            return Resp(200 if self.dataset else 404, {})
+        if url.endswith(f"/tables/{ms.TABLE}"):
+            return Resp(200, self.table) if self.table is not None else Resp(404, {})
+        raise AssertionError("unexpected GET " + url)
+
+    def post(self, url, json=None, timeout=None, headers=None, **_):
+        self.calls.append(("POST", url))
+        if url.endswith(f"/datasets/{DATASET}/tables"):
+            self.created.append(json)
+            self.table = {"schema": json["schema"], "rangePartitioning": json["rangePartitioning"]}
+            return Resp(200, json)
+        if url.startswith(ms.BQ_UPLOAD) and "uploadType=resumable" in url:
+            job_id = json["jobReference"]["jobId"]
+            dest = json["configuration"]["load"]["destinationTable"]["tableId"]
+            self.jobs[job_id] = {"config": json, "dest": dest, "sid": int(dest.split("$")[1]), "polls": 0,
+                                 "rows": 0, "length": int(headers["X-Upload-Content-Length"])}
+            return Resp(200, {}, {"Location": "https://upload.invalid/session/" + job_id})
+        raise AssertionError("unexpected POST " + url)
+
+    def put(self, url, data=None, timeout=None, headers=None, **_):
+        self.calls.append(("PUT", url))
+        job = self.jobs[url.rsplit("/", 1)[1]]
+        assert job["length"] == len(data)
+        lines = [ln for ln in data.decode("utf-8").split("\n") if ln]
+        job["rows"] = len(lines)
+        self.uploads[job["sid"]] = [json.loads(ln) for ln in lines]
+        return Resp(200, {"status": {"state": "RUNNING"}})
+
+
+def _live_table():
+    body = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    body.pop("_note", None)
+    return body
+
+
+def _env(monkeypatch, gate="on", project=PROJECT):
+    monkeypatch.setenv("TFB_BQ_MARKETS", gate)
+    if project is None:
+        monkeypatch.delenv("TFB_BQ_PROJECT", raising=False)
+    else:
+        monkeypatch.setenv("TFB_BQ_PROJECT", project)
+    monkeypatch.setenv("TFB_BQ_DATASET", DATASET)
+    monkeypatch.setenv("TFB_BQ_LOCATION", "US")
+    monkeypatch.setenv("GITHUB_RUN_ID", "777")
+
+
+def _run(monkeypatch, argv, session, fetch, capsys=None):
+    _env(monkeypatch)
+    slept = []
+    rc = ms.main(argv, session=session, now=NOW, fetch=fetch, sleep=slept.append)
+    return rc, slept
+
+
+# --------------------------------------------------------------------------- M1
+def test_m1_series_integrity():
+    ids = [s[0] for s in ms.SERIES]
+    assert len(ids) == len(set(ids)) == 48
+    assert {s[0]: s[1] for s in ms.SERIES} == PINNED_IDS
+    assert all(1 <= i <= ms.MAX_SERIES_ID for i in ids)
+    syms = [s[1] for s in ms.SERIES]
+    names = [s[2] for s in ms.SERIES]
+    assert len(set(syms)) == len(syms) and len(set(names)) == len(names)
+    for sid, sym, name, region, country, kind, cur, sector in ms.SERIES:
+        assert region in ms.REGIONS and kind in ms.KINDS, sym
+        assert cur and name and sym
+        if "sector" in kind:
+            assert sector, sym
+        if kind != "Index":
+            assert cur == "USD", sym
+    local = {s[1]: s[6] for s in ms.SERIES if s[5] == "Index"}
+    assert local["^TASI.SR"] == "SAR" and local["^N225"] == "JPY" and local["000300.SS"] == "CNY"
+    regions = {s[3] for s in ms.SERIES}
+    assert {"US", "Europe", "China", "Gulf"} <= regions
+    assert [r["symbol"] for r in ms.series_records("KSA, ^GSPC")] == ["KSA", "^GSPC"]
+    with pytest.raises(ValueError):
+        ms.series_records("NOPE")
+
+
+# --------------------------------------------------------------------------- M2
+def test_m2_parse_chart():
+    ts = [_ts("2026-10-26"), _ts("2026-10-27"), _ts("2026-10-28"), _ts("2026-10-28", 19), _ts("2026-10-29")]
+    close = [100.0, None, 101.5, 102.0, 0]
+    adj = [99.0, None, 100.5, 101.0, 0]
+    bars = ms.parse_chart(_chart(ts, close, adj, volume=[10, None, 30, 40, 0]))
+    assert [b["date"] for b in bars] == ["2026-10-26", "2026-10-28"]
+    assert bars[1]["close"] == 102.0 and bars[1]["adj_close"] == 101.0 and bars[1]["volume"] == 40
+    # venue-local date: 22:00 UTC with +03:00 (Riyadh) is the next day
+    sa = ms.parse_chart(_chart([_ts("2026-10-28", 22, 0)], [11000.0], gmtoffset=10800))
+    assert sa[0]["date"] == "2026-10-29" and sa[0]["adj_close"] is None
+    # unordered input comes back sorted; garbage payloads are empty
+    rev = ms.parse_chart(_chart([_ts("2026-10-28"), _ts("2026-10-27")], [2.0, 1.0]))
+    assert [b["date"] for b in rev] == ["2026-10-27", "2026-10-28"]
+    for bad in ({}, {"chart": {"result": None}}, {"chart": {"result": [None]}}, None, "x"):
+        assert ms.parse_chart(bad) == []
+
+
+# --------------------------------------------------------------------------- M3
+def test_m3_open_session_left_out():
+    ts = [_ts("2026-10-28", 13, 30), _ts("2026-10-29", 13, 30)]
+    period = {"start": _ts("2026-10-29", 13, 30), "end": _ts("2026-10-29", 20, 0)}
+    inside = _ts("2026-10-29", 15, 0)
+    after = _ts("2026-10-29", 22, 35)
+    assert [b["date"] for b in ms.parse_chart(_chart(ts, [1.0, 2.0], period=period), inside)] == ["2026-10-28"]
+    assert len(ms.parse_chart(_chart(ts, [1.0, 2.0], period=period), after)) == 2
+    assert len(ms.parse_chart(_chart(ts, [1.0, 2.0], period=period))) == 2      # no clock given
+    bad = {"start": "x", "end": None}
+    assert len(ms.parse_chart(_chart(ts, [1.0, 2.0], period=bad), inside)) == 2
+
+
+# --------------------------------------------------------------------------- M4
+class _Body(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_m4_fetch_series_hosts():
+    seen = []
+    good = json.dumps(_chart([_ts("2026-10-28")], [5.0])).encode()
+
+    def opener(req, timeout):
+        seen.append(req.full_url)
+        if "query1" in req.full_url:
+            raise urllib.error.URLError("reset")
+        return _Body(good)
+
+    slept = []
+    bars = ms.fetch_series("^TASI.SR", 111, 222, None, opener=opener, sleep=slept.append)
+    assert [b["close"] for b in bars] == [5.0] and len(seen) == 2 and slept == [1.5]
+    assert "/v8/finance/chart/%5ETASI.SR?period1=111&period2=222&interval=1d" in seen[1]
+    assert "events=div%2Csplits" in seen[1] and "includeAdjustedClose=true" in seen[1]
+    assert "%3DF" in ms.YAHOO_PATH.format(sym=ms.urllib.parse.quote("BZ=F", safe=""), p1=1, p2=2)
+
+    def not_found(req, timeout):
+        seen.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+    seen.clear()
+    assert ms.fetch_series("NOPE", 1, 2, None, opener=not_found, sleep=slept.append) == []
+    assert len(seen) == 1
+
+    def empty(req, timeout):
+        return _Body(json.dumps({"chart": {"result": None}}).encode())
+
+    assert ms.fetch_series("X", 1, 2, None, opener=empty, sleep=lambda s: None) == []
+
+
+# --------------------------------------------------------------------------- M5
+def test_m5_rows_and_ndjson():
+    rec = ms.series_records("BZ=F")[0]
+    rows = ms.build_rows(rec, _bars("2026-10-27", "2026-10-28"), "2026-10-29T22:35:09.123456Z", "")
+    assert [set(r) for r in rows] == [{f["name"] for f in ms.SCHEMA}] * 2
+    assert rows[0]["country"] is None and rows[0]["run_id"] is None and rows[0]["sector"] == "Energy"
+    assert {r["series_id"] for r in rows} == {60} and rows[1]["close"] == 11.0
+    lines = ms.ndjson(rows).decode("utf-8").splitlines()
+    assert len(lines) == 2 and json.loads(lines[0])["symbol"] == "BZ=F"
+    required = [f["name"] for f in ms.SCHEMA if f["mode"] == "REQUIRED"]
+    assert all(rows[0][k] is not None for k in required)
+
+
+# --------------------------------------------------------------------------- M6
+def test_m6_table_layout():
+    live = _live_table()
+    assert ms.schema_problems(live) == []
+    t = json.loads(json.dumps(live))
+    t["schema"]["fields"][12]["mode"] = "NULLABLE"            # close
+    assert any("columns differ" in p for p in ms.schema_problems(t))
+    t = json.loads(json.dumps(live))
+    t["schema"]["fields"][9]["type"] = "STRING"               # open
+    assert ms.schema_problems(t)
+    t = json.loads(json.dumps(live))
+    t["schema"]["fields"].pop()
+    assert ms.schema_problems(t)
+    t = json.loads(json.dumps(live))
+    t.pop("rangePartitioning")
+    t["timePartitioning"] = {"type": "DAY", "field": "date"}
+    assert any("range-partitioned" in p for p in ms.schema_problems(t))
+    # FLOAT64 / INT64 spellings are the same types
+    t = json.loads(json.dumps(live))
+    for f in t["schema"]["fields"]:
+        f["type"] = {"FLOAT": "FLOAT64", "INTEGER": "INT64"}.get(f["type"], f["type"])
+    assert ms.schema_problems(t) == []
+
+    s = FakeBQ(table=None)
+    assert ms.ensure_table(s, PROJECT, DATASET) is True
+    body = s.created[0]
+    assert body["rangePartitioning"] == {"field": "series_id", "range": {"start": "1", "end": "1001", "interval": "1"}}
+    assert body["schema"]["fields"] == ms.SCHEMA and "timePartitioning" not in body
+    assert ms.ensure_table(FakeBQ(table=live), PROJECT, DATASET) is False
+    bad = json.loads(json.dumps(live))
+    bad["schema"]["fields"][0]["name"] = "sid"
+    with pytest.raises(RuntimeError, match="differs from SCHEMA"):
+        ms.ensure_table(FakeBQ(table=bad), PROJECT, DATASET)
+
+
+# --------------------------------------------------------------------------- M7
+def test_m7_write_loads_each_partition_and_isolates_failures(monkeypatch, capsys):
+    attempts = {}
+
+    def fetch(symbol, p1, p2, now_ts):
+        attempts[symbol] = attempts.get(symbol, 0) + 1
+        assert now_ts == int(NOW.timestamp()) and p2 == now_ts + 86400
+        assert p1 == int((NOW - dt.timedelta(days=1100)).timestamp())
+        if symbol == "^HSI" and attempts[symbol] == 1:
+            raise RuntimeError("Yahoo 429")
+        if symbol == "QAT":
+            return []
+        return _bars("2026-10-27", "2026-10-28")
+
+    s = FakeBQ(table=_live_table(), polls=2)
+    rc, slept = _run(monkeypatch, ["--write", "--symbols", "^GSPC,^HSI,QAT,KSA"], s, fetch)
+    out = capsys.readouterr()
+    assert rc == 1
+    assert attempts == {"^GSPC": 1, "^HSI": 2, "QAT": 2, "KSA": 1}
+    assert sorted(s.uploads) == [1, 11, 24]                    # QAT (26) untouched
+    for job in s.jobs.values():
+        load = job["config"]["configuration"]["load"]
+        assert load["destinationTable"]["tableId"] == f"{ms.TABLE}${job['sid']}"
+        assert load["writeDisposition"] == "WRITE_TRUNCATE" and load["createDisposition"] == "CREATE_NEVER"
+        assert load["schema"]["fields"] == ms.SCHEMA
+        assert {r["series_id"] for r in s.uploads[job["sid"]]} == {job["sid"]}
+        assert job["config"]["jobReference"]["jobId"].startswith(f"tfb_market_{job['sid']}_777_")
+    assert all(r["run_id"] == "777" and r["source"] == "yahoo_chart_v8" for r in s.uploads[1])
+    assert "3/4 series" in out.out and "FAILED (left as they were): QAT" in out.out
+    assert 20.0 in slept and not s.created                    # retry wait; table existed
+
+    s = FakeBQ(table=_live_table(), job_error={24: "Provided Schema does not match"})
+    rc, _ = _run(monkeypatch, ["--write", "--symbols", "^GSPC,KSA"], s,
+                 lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+    assert rc == 1 and 1 in s.uploads and "FAILED (left as they were): KSA" in capsys.readouterr().out
+
+    s = FakeBQ(table=None)
+    rc, _ = _run(monkeypatch, ["--write", "--symbols", "^GSPC"], s,
+                 lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+    assert rc == 0 and len(s.created) == 1 and "table created" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- M8
+def test_m8_dry_run(monkeypatch, capsys):
+    s = FakeBQ(table=None)
+    rc, _ = _run(monkeypatch, ["--symbols", "^GSPC,^TASI.SR"], s, lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+    assert rc == 0
+    assert [c for c in s.calls] == [("GET", f"{ms.BQ_API}/projects/{PROJECT}/datasets/{DATASET}")]
+    assert not s.jobs and not s.created
+    assert "dry run, nothing loaded" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- M9
+def test_m9_main_configuration(monkeypatch):
+    def never(*a, **k):
+        raise AssertionError("no request expected")
+
+    class Boom:
+        get = post = put = never
+
+    monkeypatch.setattr(ms, "make_session", never)
+    _env(monkeypatch, gate="off")
+    assert ms.main([], session=None, now=NOW, fetch=never) == 0
+    monkeypatch.delenv("TFB_BQ_MARKETS")
+    assert ms.main([], session=None, now=NOW, fetch=never) == 0
+    _env(monkeypatch, project=None)
+    assert ms.main([], session=Boom(), now=NOW, fetch=never) == 2
+    _env(monkeypatch)
+    assert ms.main(["--days", "5"], session=Boom(), now=NOW, fetch=never) == 2
+    assert ms.main(["--symbols", "NOPE"], session=Boom(), now=NOW, fetch=never) == 2
+    assert ms.main(["--write"], session=FakeBQ(dataset=False), now=NOW, fetch=never) == 2
+
+    def no_key():
+        raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS missing or unreadable")
+
+    monkeypatch.setattr(ms, "make_session", no_key)
+    assert ms.main(["--write"], session=None, now=NOW, fetch=never) == 2
+    bad = _live_table()
+    bad["schema"]["fields"][3]["mode"] = "NULLABLE"
+    assert ms.main(["--write"], session=FakeBQ(table=bad), now=NOW, fetch=never) == 2
+
+
+# --------------------------------------------------------------------------- M10
+def test_m10_workflow():
+    wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    on = wf.get(True) or wf.get("on")
+    assert on["schedule"] == [{"cron": "35 22 * * *"}]
+    inputs = on["workflow_dispatch"]["inputs"]
+    assert inputs["write"]["default"] is False and inputs["write"]["type"] == "boolean"
+    assert inputs["days"]["default"] == "1100" and inputs["symbols"]["default"] == ""
+    assert wf["permissions"] == {"contents": "read"}
+    job = wf["jobs"]["markets"]
+    assert int(job["timeout-minutes"]) <= 30
+    run = [st for st in job["steps"] if "run the loader" in st.get("name", "").lower()][0]
+    env = run["env"]
+    assert env["TFB_BQ_MARKETS"] == "${{ vars.TFB_BQ_MARKETS || 'on' }}"
+    assert "secrets.GOOGLE_SHEETS_CREDENTIALS" in env["GOOGLE_SHEETS_CREDENTIALS"]
+    assert 'MODE="--write"' in run["run"] and 'MODE="--dry-run"' in run["run"]
+    assert "scripts/archive_market_series.py $MODE" in run["run"] and 'exit "$rc"' in run["run"]
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "actions/checkout@v6" in text and "actions/setup-python@v6" in text
+
+
+# --------------------------------------------------------------------------- M11
+def test_m11_no_workbook_write_no_dml():
+    src = (ROOT / "scripts" / "archive_market_series.py").read_text(encoding="utf-8")
+    assert "sheets.googleapis" not in src and "gspread" not in src
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    for word in ("DELETE FROM", "INSERT INTO", "UPDATE `", "MERGE `", "DROP TABLE", "TRUNCATE TABLE"):
+        assert word not in code, word
+    assert '"tableId": f"{TABLE}${series_id}"' in src
+    assert src.count("WRITE_TRUNCATE") == 2 and '"createDisposition": "CREATE_NEVER"' in src
