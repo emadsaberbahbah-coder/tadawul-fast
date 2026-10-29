@@ -34,6 +34,14 @@ imported.
       scripts/archive_market_series.py SCHEMA declares, from that table only;
       the table functions take (start_date DATE, end_date DATE) and read only
       the objects before them
+  V12 v_performance_log scores the CALL as track_performance's summary does
+      (_directional_outcome on records loaded with a HOLD default): the
+      8 tiers' signs read from its source, HOLD and aliases neutral,
+      is_scored = decided, win_flag only for decided calls, one record per
+      Key; fails on the first cut's price-direction flags
+  V13 v_portfolio_decision.pd_ibkr_evidence recognizes every note
+      pdIbkrNote_ (apps_script/10_My_Portfolio.gs) writes - SENT (...) too;
+      fails on the first cut's pattern
 """
 from __future__ import annotations
 
@@ -61,7 +69,9 @@ DATASET = bv.DEFAULT_DATASET
 # created: TO_HEX(SHA256(view_definition | routine_definition));
 # v_performance_log re-applied after the Codex review (STRONG SELL bearish);
 # v_market_daily / f_market_window / f_market_summary created the same day
-# (apply_bq_views 1.1.0) and read back the same way.
+# (apply_bq_views 1.1.0) and read back the same way; v_performance_log and
+# v_portfolio_decision re-applied after the Codex review of #879 (call-scored
+# learning flags; the SENT evidence note) and read back again.
 INSTALLED = {
     "f_cell": "25c3a65640088f2a000cd3c0a9f8c792a7129a546e5189f6a39ec08cf2315e7d",
     "f_num": "135ec9de4bf03c52499f4edf6e2a1d9caaf7cf6df1f1b6989a426968c663189a",
@@ -69,8 +79,8 @@ INSTALLED = {
     "v_archive_health": "9932e59c56f917b3691ff63eae0b24581049d1a25d0bed91f9eecd71d37dcb72",
     "v_board_episodes": "76a6a240891eca669a574fd50b6d61b3d41439e502d9107aaefeb3c43d386048",
     "v_my_portfolio": "3fade0a8611cd65e9106643e753c454bb01c13a4c1743caa2a98403e7ef7c5dd",
-    "v_performance_log": "164916ee9201f26f865e84b846ca9770151c9bf0e206bbe7b5efacf7102f8d98",
-    "v_portfolio_decision": "a44c112595437f6b0a7a3ece94b142dd34fbb6d20459139a031c73fd43f3bfb7",
+    "v_performance_log": "c8f644b51d60100f062824d4a7edd19898fedd89005e122ecce8d515d02635dc",
+    "v_portfolio_decision": "98b6090df20eb1244dc9dd6d0a0054ace85ed9036eedc4679fc86e85fd87b4ce",
     "v_run_log": "4b06dfa258072044b7a8a7fd162dc9b0407879e9238f5d6b9eada60a2e5a824c",
     "v_selection_log": "3a9400566a6bdbeab9087a8950ea18dbf22150b98efc80d7a27de9af7846a234",
     "v_signal_history": "b0f74c3f849376e969ea5637993f33fa24a06e799537b8f112aed35d04a43ff7",
@@ -409,7 +419,70 @@ def case_v11():
         assert "@DS_START_DATE" in tpl and "@DS_END_DATE" in tpl   # the Looker custom query, documented
 
 
-CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11]
+def case_v12():
+    import re
+    src = (ROOT / "scripts" / "track_performance.py").read_text(encoding="utf-8")
+    # the summary path loads Entry Recommendation with a HOLD default, so the
+    # EXIT / TRIM aliases of _reco_trade_sign never reach its scoring
+    assert "rec = _parse_enum_value(RecommendationType, rec_raw, RecommendationType.HOLD)" in src
+    assert "return _directional_outcome(getattr(r, \"entry_recommendation\", None)," in src
+    block = src.split("_RECO_TRADE_SIGN: Dict[str, int] = {", 1)[1].split("}", 1)[0]
+    sign = {name.replace("_", ""): int(v) for name, v in
+            re.findall(r"RecommendationType\.([A-Z_]+)\.value:\s*(-?\d+)", block)}
+    assert sign["STRONGSELL"] == -1 and sign["HOLD"] == 0 and len(sign) == 8, sign
+    tpl = [o for o in bv.load_objects() if o.name == "v_performance_log"][0].template
+    code = bv._code(tpl)
+    lists = {}
+    for won, label in (("> 0", "long"), ("< 0", "short")):
+        m = re.search(r"IN \(([^)]*)\)\s*THEN CASE WHEN realized_roi_pp " + re.escape(won) + r" THEN 'WIN'", code)
+        assert m, label
+        lists[label] = set(re.findall(r"'([^']+)'", m.group(1)))
+    assert lists["long"] == {k for k, v in sign.items() if v == 1}, lists
+    assert lists["short"] == {k for k, v in sign.items() if v == -1}, lists
+    assert not ({"HOLD", "EXIT", "TRIM"} & (lists["long"] | lists["short"]))
+    assert "WHEN IFNULL(status, '') != 'matured' OR realized_roi_pp IS NULL THEN NULL" in code
+    assert "IFNULL(call_outcome IN ('WIN', 'LOSS'), FALSE) AS is_scored" in code
+    assert "CASE WHEN call_outcome = 'WIN' THEN 1 WHEN call_outcome = 'LOSS' THEN 0 END AS win_flag" in code
+    assert "PARTITION BY record_key, matured_valid" in code
+    # golden negative: the first cut scored the sheet's PRICE label
+    assert "outcome IN ('WIN', 'LOSS', 'BREAKEVEN') AS is_scored" not in code
+    assert "WHEN outcome = 'WIN' THEN 1" not in code
+
+
+def case_v13():
+    import re
+    gs = (ROOT / "apps_script" / "10_My_Portfolio.gs").read_text(encoding="utf-8")
+    fn = gs.split("function pdIbkrNote_(", 1)[1].split("\nfunction ", 1)[0]
+    notes = {
+        "SENT": "' | ibkr evidence SENT ('",
+        "NOT SENT": "' | ibkr evidence NOT SENT: '",
+        "WOULD SEND (observe)": "' | [ibkr-observe] would send ('",
+        "WOULD NOT SEND (observe)": "' | [ibkr-observe] would not send: '",
+    }
+    for literal in notes.values():
+        assert literal in fn, literal
+    tpl = [o for o in bv.load_objects() if o.name == "v_portfolio_decision"][0].template
+    rules = re.findall(r"WHEN REGEXP_CONTAINS\(st\.status_text, r'([^']+)'\) THEN '([^']+)'", tpl)
+    assert len(rules) == 4, rules
+
+    def label(text):
+        for pattern, value in rules:
+            if re.search(pattern, text):
+                return value
+        return None
+
+    head = "Portfolio Decision | status: ok | Last run 2026-10-29 10:00:00"
+    for want, literal in notes.items():
+        text = head + literal.strip("'") + "capture 2026-10-29 09:58 age 2m; linked 9/9; cash 1,234.00 SAR; USD 3.75)"
+        assert label(text) == want, (want, label(text))
+    assert label(head) is None
+    # golden negative: the first cut's pattern never matched the SENT note
+    sent = head + notes["SENT"].strip("'") + "capture 2026-10-29 09:58 age 2m)"
+    assert re.search(r"ibkr evidence ([A-Z ]+?)[:|]", sent) is None
+
+
+CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
+         case_v12, case_v13]
 
 
 def test_v1(): case_v1()
@@ -423,6 +496,8 @@ def test_v8(): case_v8()
 def test_v9(): case_v9()
 def test_v10(): case_v10()
 def test_v11(): case_v11()
+def test_v12(): case_v12()
+def test_v13(): case_v13()
 
 
 if __name__ == "__main__":
