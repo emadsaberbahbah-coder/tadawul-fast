@@ -17,9 +17,11 @@ WHAT:
                        FUNCTION, the {{DS}} placeholder, no data-changing
                        statement, functions before views, every referenced
                        object defined earlier or an archive table) and prints
-                       the plan with each object's body hash. With
-                       credentials it also asks BigQuery to dry-run each
-                       statement. Nothing is created.
+                       the plan with each object's body hash. When the
+                       service-account key is configured it also asks
+                       BigQuery to dry-run each statement (a broken key
+                       exits 2); without one the checks stay offline.
+                       Nothing is created.
   --write              creates or replaces every object in file order.
   --verify             reads the live definitions (INFORMATION_SCHEMA VIEWS
                        and ROUTINES) and compares their SHA-256 with the files;
@@ -90,6 +92,11 @@ def _out(msg: str) -> None:
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
+
+
+def _has_credentials() -> bool:
+    """The archive's service-account key is configured (raw JSON or base64)."""
+    return bool(_env("GOOGLE_SHEETS_CREDENTIALS") or _env("GOOGLE_CREDENTIALS"))
 
 
 def _code(sql: str) -> str:
@@ -303,6 +310,12 @@ def main(argv: Optional[Sequence[str]] = None, session: Any = None,
               f"{project}.{dataset}" + ("" if not bad else f"; mismatch: {', '.join(n for n, _ in bad)}"))
         return 1 if bad else 0
 
+    if session is None and _has_credentials():
+        try:
+            session = make_session()
+        except Exception as exc:  # noqa: BLE001
+            _out(f"CONFIG {exc}")
+            return 2
     if session is not None:
         for o in objs:
             try:
@@ -310,7 +323,9 @@ def main(argv: Optional[Sequence[str]] = None, session: Any = None,
             except Exception as exc:  # noqa: BLE001
                 _out(f"FAIL dry-run {o.name}: {exc}")
                 return 1
-    print(f"[bq_views v{__version__}] dry run: {len(objs)} objects checked for {project}.{dataset}; nothing created")
+    checked = "static checks and BigQuery dry-run" if session is not None else "static checks only (no credentials)"
+    print(f"[bq_views v{__version__}] dry run: {len(objs)} objects, {checked}, for "
+          f"{project}.{dataset}; nothing created")
     return 0
 
 

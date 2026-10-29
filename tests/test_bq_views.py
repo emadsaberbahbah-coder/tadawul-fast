@@ -23,10 +23,15 @@ session is a fake, no google library is imported.
       verify, and runs the script in the chosen mode
   V8  nothing here can write to the workbook: no Sheets API in the script or
       the SQL, and every SQL object is a view or a function
+  V9  v_performance_log.entry_stance mirrors track_performance's
+      _reco_trade_sign (read from its source): STRONG SELL is bearish
+  V10 dry run: offline without a key; with a key every statement is sent as
+      a BigQuery dry run in order; a broken key exits 2
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -40,12 +45,14 @@ import apply_bq_views as bv  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "bq_archive_headers_2026-10-29.json"
 WORKFLOW = ROOT / ".github" / "workflows" / "bq_views.yml"
+_KEY_ENV = ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS")
 PROJECT = bv.DEFAULT_PROJECT
 DATASET = bv.DEFAULT_DATASET
 
 # Read back on 2026-10-29 from INFORMATION_SCHEMA.VIEWS / ROUTINES of
 # project-2e3530e6-2311-4aa3-b36.tfb_archive right after the objects were
-# created: TO_HEX(SHA256(view_definition | routine_definition)).
+# created: TO_HEX(SHA256(view_definition | routine_definition));
+# v_performance_log re-applied after the Codex review (STRONG SELL bearish).
 INSTALLED = {
     "f_cell": "25c3a65640088f2a000cd3c0a9f8c792a7129a546e5189f6a39ec08cf2315e7d",
     "f_num": "135ec9de4bf03c52499f4edf6e2a1d9caaf7cf6df1f1b6989a426968c663189a",
@@ -53,7 +60,7 @@ INSTALLED = {
     "v_archive_health": "9932e59c56f917b3691ff63eae0b24581049d1a25d0bed91f9eecd71d37dcb72",
     "v_board_episodes": "76a6a240891eca669a574fd50b6d61b3d41439e502d9107aaefeb3c43d386048",
     "v_my_portfolio": "3fade0a8611cd65e9106643e753c454bb01c13a4c1743caa2a98403e7ef7c5dd",
-    "v_performance_log": "c966f9da7bc8789839452047b865138188dfd5de4a9cf9d42842829fdfd2042c",
+    "v_performance_log": "164916ee9201f26f865e84b846ca9770151c9bf0e206bbe7b5efacf7102f8d98",
     "v_portfolio_decision": "a44c112595437f6b0a7a3ece94b142dd34fbb6d20459139a031c73fd43f3bfb7",
     "v_run_log": "4b06dfa258072044b7a8a7fd162dc9b0407879e9238f5d6b9eada60a2e5a824c",
     "v_selection_log": "3a9400566a6bdbeab9087a8950ea18dbf22150b98efc80d7a27de9af7846a234",
@@ -197,14 +204,30 @@ def case_v5():
             assert any(needle in p for p in problems), (needle, problems)
 
 
+def _no_key_env():
+    saved = {k: os.environ.pop(k) for k in _KEY_ENV if k in os.environ}
+    return saved
+
+
+def _restore_env(saved):
+    for k in _KEY_ENV:
+        os.environ.pop(k, None)
+    os.environ.update(saved)
+
+
 def case_v6():
     import io
     import contextlib
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-        rc = bv.main([])
+    saved = _no_key_env()
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = bv.main([])
+    finally:
+        _restore_env(saved)
     assert rc == 0 and "nothing created" in buf.getvalue(), (rc, buf.getvalue())
+    assert "static checks only" in buf.getvalue(), buf.getvalue()
 
     real = bv.make_session
     try:
@@ -273,7 +296,63 @@ def case_v8():
         assert "sheets.googleapis" not in o.template
 
 
-CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8]
+def _stance_lists(template):
+    import re
+    out = {}
+    for label in ("bullish", "bearish"):
+        m = re.search(r"WHEN entry_recommendation IN \(([^)]*)\) THEN '" + label + "'", template)
+        assert m, label
+        out[label] = set(re.findall(r"'([^']+)'", m.group(1)))
+    m = re.search(r"WHEN entry_recommendation = '([^']+)' THEN 'neutral'", template)
+    out["neutral"] = {m.group(1)} if m else set()
+    return out
+
+
+def case_v9():
+    import re
+    src = (ROOT / "scripts" / "track_performance.py").read_text(encoding="utf-8")
+    block = src.split("_RECO_TRADE_SIGN: Dict[str, int] = {", 1)[1].split("}", 1)[0]
+    sign = {name.replace("_", " "): int(v) for name, v in
+            re.findall(r"RecommendationType\.([A-Z_]+)\.value:\s*(-?\d+)", block)}
+    aliases = src.split("_RECO_TRADE_SIGN_ALIASES: Dict[str, int] = {", 1)[1].split("}", 1)[0]
+    sign.update({k: int(v) for k, v in re.findall(r'"([A-Z ]+)":\s*(-?\d+)', aliases)})
+    assert sign.get("STRONG SELL") == -1 and sign.get("HOLD") == 0, sign
+    tpl = [o for o in bv.load_objects() if o.name == "v_performance_log"][0].template
+    lists = _stance_lists(tpl)
+    assert lists["bullish"] == {k for k, v in sign.items() if v == 1}, (lists, sign)
+    assert lists["bearish"] == {k for k, v in sign.items() if v == -1}, (lists, sign)
+    assert lists["neutral"] == {k for k, v in sign.items() if v == 0}, (lists, sign)
+
+
+def case_v10():
+    import io
+    import contextlib
+
+    saved = _no_key_env()
+    real = bv.make_session
+    try:
+        os.environ["GOOGLE_SHEETS_CREDENTIALS"] = "{}"
+        s = FakeSession()
+        bv.make_session = lambda: s
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            assert bv.main(["--dry-run"]) == 0
+        assert "BigQuery dry-run" in buf.getvalue(), buf.getvalue()
+        assert [d for _, d in s.sent] == [True] * len(EXPECTED_ORDER), s.sent
+        names = [o.name for q, _ in s.sent for o in bv.load_objects() if o.render(PROJECT, DATASET) == q]
+        assert names == EXPECTED_ORDER, names
+
+        def broken():
+            raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS missing or unreadable")
+        bv.make_session = broken
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            assert bv.main([]) == 2
+    finally:
+        bv.make_session = real
+        _restore_env(saved)
+
+
+CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10]
 
 
 def test_v1(): case_v1()
@@ -284,6 +363,8 @@ def test_v5(): case_v5()
 def test_v6(): case_v6()
 def test_v7(): case_v7()
 def test_v8(): case_v8()
+def test_v9(): case_v9()
+def test_v10(): case_v10()
 
 
 if __name__ == "__main__":

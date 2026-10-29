@@ -6,6 +6,9 @@
 -- "Target ROI %" mixes fractions and percent points (only part of October
 -- declares roi_unit=percent_points), so target_roi_pp is recomputed from the
 -- two prices and target_roi_sheet keeps the raw cell for reference.
+-- entry_stance mirrors track_performance's _reco_trade_sign: STRONG BUY /
+-- BUY / ACCUMULATE bullish, REDUCE / SELL / STRONG SELL / AVOID (and the
+-- EXIT / TRIM aliases) bearish, HOLD neutral, anything else unknown.
 CREATE OR REPLACE VIEW `{{DS}}.v_performance_log`
 OPTIONS (description = "TFB Looker v1: Performance_Log forecast records, latest version per Record ID (percent points)")
 AS
@@ -84,9 +87,10 @@ SELECT
   outcome IN ('WIN', 'LOSS', 'BREAKEVEN') AS is_scored,
   CASE WHEN outcome = 'WIN' THEN 1 WHEN outcome IN ('LOSS', 'BREAKEVEN') THEN 0 END AS win_flag,
   CASE
-    WHEN entry_recommendation IN ('BUY', 'STRONG BUY', 'ACCUMULATE') THEN 'bullish'
-    WHEN entry_recommendation IN ('SELL', 'REDUCE', 'AVOID') THEN 'bearish'
+    WHEN entry_recommendation IN ('STRONG BUY', 'BUY', 'ACCUMULATE') THEN 'bullish'
+    WHEN entry_recommendation IN ('REDUCE', 'SELL', 'STRONG SELL', 'AVOID', 'EXIT', 'TRIM') THEN 'bearish'
+    WHEN entry_recommendation = 'HOLD' THEN 'neutral'
     WHEN entry_recommendation IS NULL THEN NULL
-    ELSE 'neutral'
+    ELSE 'unknown'
   END AS entry_stance
 FROM latest;

@@ -9,7 +9,7 @@
 | `sql/bigquery/10..31_v_*.sql` | NEW | ten views (below) |
 | `scripts/apply_bq_views.py` | NEW 1.0.0 | `--dry-run` (default: static checks + plan), `--write` (create or replace in file order, then verify), `--verify` (INFORMATION_SCHEMA definitions vs the files, SHA-256) |
 | `.github/workflows/bq_views.yml` | NEW 1.0.0 | manual dispatch only, `mode=verify` (default) or `write`; contents: read |
-| `tests/test_bq_views.py` + `tests/fixtures/bq_archive_headers_2026-10-29.json` | NEW | 8 cases (V1-V8) |
+| `tests/test_bq_views.py` + `tests/fixtures/bq_archive_headers_2026-10-29.json` | NEW | 10 cases (V1-V10) |
 | `.github/workflows/ci.yml` | 1.1.58 -> 1.1.59 | the harness in the blocking lean lane next to `test_bq_archive.py` |
 | `scripts/verify_deployment.py` | pin | `apply_bq_views 1.0.0` |
 
@@ -34,7 +34,7 @@
 - Read-back after creation: every view returns rows and the counts match the sheet (Performance_Log `Total Records 25593`; scorecard `episodes 479`; Selection_Log 3,152 rows incl. header).
 
 ## S2 - Installed state
-All 13 objects were created on 29 Oct (owner's BigQuery, via the BigQuery connector) from these exact files; INFORMATION_SCHEMA read back and hashed: **13/13 match** the file bodies (V4 pins the hashes). After merge, `bq_views.yml mode=verify` proves the same from main with the service account.
+All 13 objects were created on 29 Oct (owner's BigQuery, via the BigQuery connector) from these exact files; INFORMATION_SCHEMA read back and hashed: **13/13 match** the file bodies (V4 pins the hashes; `v_performance_log` re-applied after the review fix below and read back again). After merge, `bq_views.yml mode=verify` proves the same from main with the service account.
 
 ## S3 - Tests
 | Case | Proves |
@@ -47,8 +47,10 @@ All 13 objects were created on 29 Oct (owner's BigQuery, via the BigQuery connec
 | V6 | dry run creates nothing; `--write` / `--verify` without credentials exit 2; `--write` applies in order and verifies; a failing statement stops the run (exit 1); `--verify` reports a changed or missing object (exit 1) |
 | V7 | the workflow is dispatch-only, contents: read, verify by default, runs the script in the chosen mode |
 | V8 | no Sheets API in the script or the SQL; every object is a view or a function |
+| V9 | `entry_stance` mirrors `track_performance._reco_trade_sign` read from its source (STRONG SELL / EXIT / TRIM bearish, HOLD neutral, anything else `unknown`); fails on the first cut's mapping |
+| V10 | `--dry-run` stays offline without a key; with a key every statement goes to BigQuery as a dry run in order; a broken key exits 2 |
 
-Runs: `python tests/test_bq_views.py` -> `PASS 8/8`; with the manifest pins, archive, workflow-audit and CI-verdict suites: 67 passed. `audit_repository_workflows.py` errors=0 warnings=0; ruff E9/F63/F7/F82/F401/F841 clean; compileall clean.
+Runs: `python tests/test_bq_views.py` -> `PASS 10/10`; with the manifest pins, archive, workflow-audit and CI-verdict suites: 67 passed. `audit_repository_workflows.py` errors=0 warnings=0; ruff E9/F63/F7/F82/F401/F841 clean; compileall clean.
 
 ## S4 - Owner steps (after merge)
 1. None required for the views (already installed). Optional proof from main: Actions -> **BigQuery Looker Views** -> Run workflow (mode `verify`).
@@ -56,6 +58,9 @@ Runs: `python tests/test_bq_views.py` -> `PASS 8/8`; with the manifest pins, arc
 
 ## S5 - Rollback
 Views are logical: `DROP VIEW` / `DROP FUNCTION` (or ignore them); revert the PR. The archive tables are untouched either way.
+
+## Review
+Codex on the first cut: 2 findings, both fixed in this PR - (1) `STRONG SELL` fell through to `neutral` in `entry_stance` (the producer serializes it and treats it as sell-family) -> the stance lists now mirror `_reco_trade_sign` exactly (V9); (2) `--dry-run` never created a session, so the documented BigQuery dry-run never ran with credentials -> a configured key now creates one (V10).
 
 ## Known limits / deliberate cuts
 - Cost grows with history: the all-snapshot views scan every partition (today ~10-45 MB per query; about 1.3 GB at 90 days for `v_run_log`). Inside the 1 TB/month free tier at the current viewing rate; a nightly materialized table is the planned fix when it matters.
