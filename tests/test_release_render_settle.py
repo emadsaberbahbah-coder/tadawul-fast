@@ -14,14 +14,16 @@ fixtures; R1 below is that reproduction on the unchanged (gate-off) path.
 
   R1  golden negative, gate off: a live release re-verified while Top_10
       renders is withdrawn and its window is consumed (the defect, unchanged)
-  R2  gate on, same race: one 120 s settle, the re-audit passes, the live
+  R2  gate on, same race: one 150 s settle, the re-audit passes, the live
       release stays (already_released, zero writes)
   R3  Portfolio_Decision mid-render, and both cockpits mid-render
-  R4  still mid-render after two settles: judged exactly as today (an armed
+  R4  still mid-render after the settle: judged exactly as today (an armed
       re-verification still withdraws: fail closed)
   R5  a FIRST release caught mid-render is released after the settle
-  R6  no settle for any other failure: coverage failed, a stale board, an
-      ERROR or unknown status, a missing receipt with status OK
+  R6  no settle for any other failure, ALONE OR NEXT TO A RUNNING COCKPIT:
+      coverage failed, a stale board, an ERROR or unknown status, a missing
+      receipt with status OK, a failed or stale Portfolio_Decision while
+      Top_10 renders - identical to the gate off, even when a writer starts
   R7  a writer (or a probe fault) during the settle defers with zero writes
   R8  a strict-audit fault on the re-run is fatal with zero writes
   R9  settle_candidates is exact (code, surface, message, coverage passed)
@@ -29,7 +31,10 @@ fixtures; R1 below is that reproduction on the unchanged (gate-off) path.
   R11 off-path identity against the untouched 1.2.0 module (git show 729a316e;
       SKIP on a shallow checkout)
   R12 workflow: the gate is mapped in the release STEP env only (job env
-      parity with the final job holds), summary keys unchanged, bounded time
+      parity with the final job holds); the summary output is unchanged
+      unless a settle happened; bounded time
+  R13 the clock moves during the settle: the window is judged at the new time
+  R14 compare-and-set after a settle: a feed changed during the wait refuses
 
 Runs standalone (python tests/test_release_render_settle.py -> PASS k/k,
 SKIPs reported) and under pytest. Offline fakes only.
@@ -86,15 +91,19 @@ class Grids:
 
 
 class Sleeps:
-    def __init__(self):
+    def __init__(self, hook=None):
         self.seconds = []
+        self.hook = hook
 
     async def __call__(self, seconds):
         self.seconds.append(seconds)
+        if self.hook is not None:
+            self.hook(seconds)
 
 
-def release(ctx, module=R, *, sleeps=None, mode="release"):
-    kwargs = dict(mode=mode, service=ctx.service, now_utc=ctx.clock["now"],
+def release(ctx, module=R, *, sleeps=None, mode="release", moving_clock=False):
+    now = (lambda: ctx.clock["now"]) if moving_clock else ctx.clock["now"]
+    kwargs = dict(mode=mode, service=ctx.service, now_utc=now,
                   inflight=ctx.inflight, provenance=ctx.provenance)
     if sleeps is not None:
         kwargs["settle_sleep"] = sleeps
@@ -152,9 +161,9 @@ def case_r2_gate_on_settles_and_keeps_the_live_release(mp, tmp_path):
     result = release(ctx, sleeps=sleeps)
     assert result["exit_code"] == 0 and result["outcome"] == "already_released", result["reasons"]
     assert ctx.updates() == [] and feed(ctx) == live
-    assert sleeps.seconds == [R.RENDER_SETTLE_S] and grids.calls == 2
+    assert sleeps.seconds == [R.RENDER_SETTLE_S] == [150] and grids.calls == 2
     settle = result["render_settle"]
-    assert len(settle) == 1 and settle[0]["attempt"] == 1 and settle[0]["wait_s"] == 120
+    assert len(settle) == 1 and settle[0]["attempt"] == 1 and settle[0]["wait_s"] == 150
     assert settle[0]["cockpits"] == ["Top_10_Investments"]
     assert "decision_findings_present" in settle[0]["reasons"]
     assert result["accepted"] is True and result["reasons"] == []
@@ -173,15 +182,15 @@ def case_r3_portfolio_and_both_cockpits_mid_render(mp, tmp_path):
         assert sorted(result["render_settle"][0]["cockpits"]) == cockpits
 
 
-def case_r4_still_mid_render_after_two_settles_fails_closed(mp, tmp_path):
-    grids = Grids(running=3)
+def case_r4_still_mid_render_after_the_settle_fails_closed(mp, tmp_path):
+    grids = Grids(running=2)
     ctx = T.setup(mp, tmp_path, feed=T.live_release_value(), grids=grids)
     arm(mp)
     sleeps = Sleeps()
     result = release(ctx, sleeps=sleeps)
     assert result["outcome"] == "not_accepted" and result["exit_code"] == 2
-    assert sleeps.seconds == [120, 120] and grids.calls == 3
-    assert [item["attempt"] for item in result["render_settle"]] == [1, 2]
+    assert sleeps.seconds == [150] and grids.calls == 2
+    assert [item["attempt"] for item in result["render_settle"]] == [1]
     written = [item["body"]["values"][0][1] for item in ctx.updates()]
     assert len(written) == 1 and "release=" + T.RELEASE_RUN in written[0]
     assert R.classify_prior(feed(ctx), T.SOURCE) == ("refused", "release_window_consumed")
@@ -194,7 +203,7 @@ def case_r5_first_release_mid_render_is_released_after_the_settle(mp, tmp_path):
     sleeps = Sleeps()
     result = release(ctx, sleeps=sleeps)
     assert result["outcome"] == "released" and result["exit_code"] == 0, result["reasons"]
-    assert sleeps.seconds == [120] and len(ctx.updates()) == 1
+    assert sleeps.seconds == [150] and len(ctx.updates()) == 1
     assert R.RELEASE_VALUE_RE.fullmatch(feed(ctx))
     # the same race with the gate off: a plain failure, no write
     grids = Grids(running=1)
@@ -212,6 +221,15 @@ def case_r6_no_settle_for_any_other_failure(mp, tmp_path):
             return sources, portfolio, top10
         return build
     ok_line = T.current_publication_grids()[2][1][1]
+    pf_line = T.current_publication_grids()[1][1][1]
+
+    def running_t10_with_pf(text):
+        def build():
+            sources, portfolio, top10 = (copy.deepcopy(list(item)) for item in T.current_publication_grids())
+            top10[1][1] = T10_RUNNING
+            portfolio[1][1] = text
+            return sources, portfolio, top10
+        return build
     cases = [
         dict(coverage="failed", grids=Grids(running=99)),                       # coverage gate
         dict(grids=variant(ok_line.replace("status: ok", "status: error"))),     # ERROR
@@ -219,21 +237,31 @@ def case_r6_no_settle_for_any_other_failure(mp, tmp_path):
         dict(grids=variant(re.sub(r" \| source readiness VERIFIED \(run \d+\)", "", ok_line))),
         dict(grids=variant(ok_line.replace("2026-07-31", "2026-07-30"))),        # stale board
         dict(grids=variant("Last run 2026-07-31 21:05:00")),                    # no status at all
+        # a running Top_10 NEXT TO a real Portfolio_Decision failure
+        dict(grids=running_t10_with_pf(pf_line.replace("status: ok", "status: failed"))),
+        dict(grids=running_t10_with_pf(pf_line.replace("2026-07-31", "2026-07-30"))),
+        dict(grids=running_t10_with_pf(re.sub(r" \| source readiness VERIFIED \(run \d+\)", "",
+                                              pf_line))),
     ]
+    busy = [{"workflow": "daily_sync.yml", "id": 90003, "event": "schedule", "status": "queued"}]
     for index, extra in enumerate(cases):
-        for settle in (True, False):
-            ctx = T.setup(mp, tmp_path / ("c%d%d" % (index, settle)), feed=T.live_release_value(),
-                          **extra)
-            arm(mp, settle=settle)
-            sleeps = Sleeps()
-            result = release(ctx, sleeps=sleeps)
-            assert sleeps.seconds == [] and "render_settle" not in result, (index, settle)
-            assert result["outcome"] == "not_accepted", (index, settle, result["outcome"])
-            if settle:
-                on = result
-            else:
-                off = result
-        assert stable(on) == stable(off), index
+        for writer in (False, True):
+            for settle in (True, False):
+                ctx = T.setup(mp, tmp_path / ("c%d%d%d" % (index, writer, settle)),
+                              feed=T.live_release_value(), **extra)
+                if writer:          # a writer queued right after step 5's probe
+                    ctx.probe_results.extend([[], busy])
+                arm(mp, settle=settle)
+                sleeps = Sleeps()
+                result = release(ctx, sleeps=sleeps)
+                assert sleeps.seconds == [] and "render_settle" not in result, (index, settle)
+                assert result["outcome"] == "not_accepted", (index, settle, result["outcome"])
+                if settle:
+                    on, on_writes = result, ctx.updates()
+                else:
+                    off, off_writes = result, ctx.updates()
+            assert stable(on) == stable(off), (index, writer)
+            assert on_writes == off_writes and len(on_writes) == 1, (index, writer)
 
 
 def case_r7_writer_or_probe_fault_during_the_settle_defers(mp, tmp_path):
@@ -274,9 +302,28 @@ def case_r9_settle_candidates_is_exact(mp, tmp_path):
     run_t10 = {"severity": "FAIL", "code": "T10_STATUS_NOT_OK", "surface": "Top_10_Investments",
                "message": "Embedded status is RUNNING, not OK."}
     run_pf = dict(run_t10, code="PF_STATUS_NOT_OK", surface="Portfolio_Decision")
+    def finding(code, surface, message="synthetic"):
+        return {"severity": "FAIL", "code": code, "surface": surface, "message": message}
+    t10_tail = [finding("T10_SOURCE_CONSUMPTION_UNPROVEN", "Top_10_Investments"),
+                finding("T10_POOL_COUNT_MISSING", "Top_10_Investments"),
+                finding("T10_POOL_RECONCILIATION_UNPROVEN", "Top_10_Investments")]
+    pf_tail = [finding("PF_SOURCE_CONSUMPTION_UNPROVEN", "Portfolio_Decision")]
     assert R.settle_candidates(result([run_t10])) == ["Top_10_Investments"]
-    assert R.settle_candidates(result([run_pf, run_t10, run_t10])) == ["Portfolio_Decision",
-                                                                       "Top_10_Investments"]
+    assert R.settle_candidates(result([run_t10] + t10_tail)) == ["Top_10_Investments"]
+    assert R.settle_candidates(result([run_pf] + pf_tail)) == ["Portfolio_Decision"]
+    assert R.settle_candidates(result([run_pf, run_t10, run_t10] + t10_tail + pf_tail)) == [
+        "Portfolio_Decision", "Top_10_Investments"]
+    # any finding the render does not explain: no settle
+    for extra in (finding("PF_SOURCE_STALE", "Portfolio_Decision"),
+                  finding("PF_STATUS_NOT_OK", "Portfolio_Decision", "Embedded status is FAILED, not OK."),
+                  finding("T10_RUN_STALE", "Top_10_Investments"),
+                  finding("FALSE_FULL_UNIVERSE_CLAIM", "Top_10_Investments"),
+                  finding("STRUCTURE_DECISION_PAYLOAD_INVALID", "Top_10_Investments"),
+                  finding("PF_SOURCE_CONSUMPTION_UNPROVEN", "Portfolio_Decision"),   # PF not running
+                  finding("T10_POOL_COUNT_MISSING", "Portfolio_Decision"),            # wrong surface
+                  "not-a-dict"):
+        assert R.settle_candidates(result([run_t10] + t10_tail + [extra])) == [], extra
+    assert R.settle_candidates(result(pf_tail + t10_tail)) == []      # nothing is running
     for findings in ([dict(run_t10, message="Embedded status is ERROR, not OK.")],
                      [dict(run_t10, message="Embedded status is unknown, not OK.")],
                      [dict(run_t10, surface="Portfolio_Decision")],
@@ -309,7 +356,7 @@ def case_r10_gate_vocabulary(mp, tmp_path):
         else:
             mp.setenv("TFB_RELEASE_RENDER_SETTLE", word)
         assert R.render_settle_enabled() is armed, word
-    assert R.RENDER_SETTLE_S == 120 and R.RENDER_SETTLE_MAX == 2
+    assert R.RENDER_SETTLE_S == 150 and R.RENDER_SETTLE_MAX == 1
 
 
 def _base_module(tmp_path):
@@ -360,8 +407,10 @@ def case_r12_workflow_mapping_and_bounds(mp, tmp_path):
     assert "TFB_RELEASE_RENDER_SETTLE" not in job["env"]
     final_env = daily["jobs"]["verify-final-decision-publication"]["env"]
     assert "TFB_RELEASE_RENDER_SETTLE" not in final_env
-    assert "render_settle" not in steps["Publish release summary"]["run"]
-    assert R.RENDER_SETTLE_S * R.RENDER_SETTLE_MAX <= 5 * 60 < job["timeout-minutes"] * 60
+    summary = steps["Publish release summary"]["run"]
+    assert "if 'render_settle' in result:" in summary
+    assert R.RENDER_SETTLE_S * R.RENDER_SETTLE_MAX <= 3 * 60 < job["timeout-minutes"] * 60
+    _summary_identity(summary, tmp_path)
     text = RELEASE_YML.read_text(encoding="utf-8")
     assert all(ord(ch) < 128 for ch in text)
     script = (ROOT / "scripts" / "release_decision_feed.py").read_text(encoding="utf-8")
@@ -369,6 +418,73 @@ def case_r12_workflow_mapping_and_bounds(mp, tmp_path):
         assert all(ord(ch) < 128 for ch in path_text)
     verifier = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("release_decision_feed", "' + R.SCRIPT_VERSION + '"' in verifier
+
+
+def _summary_identity(summary_run, tmp_path):
+    """The summary step's OUTPUT is unchanged for a result without
+    render_settle (gate off), compared with the 1.1.0 step when git has it."""
+    def render(code, result):
+        work = Path(tmp_path) / ("s" + str(abs(hash(code)) % 10000))
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "release_decision_feed.json").write_text(json.dumps(result), encoding="utf-8")
+        out = work / "summary.md"
+        body = code.split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        env = {"GITHUB_STEP_SUMMARY": str(out), "TFB_DECISION_RELEASE": "1",
+               "TFB_DECISION_RELEASE_KILL": "0", "PATH": "/usr/bin:/bin"}
+        subprocess.run([sys.executable, "-c", __import__("textwrap").dedent(body)], cwd=work,
+                       env=env, check=True, timeout=60)
+        return out.read_text(encoding="utf-8")
+    plain = {"mode": "release", "exit_code": 0, "outcome": "released", "reasons": []}
+    settled = dict(plain, render_settle=[{"attempt": 1, "cockpits": ["Top_10_Investments"],
+                                          "wait_s": 150, "reasons": ["decision_failed"]}])
+    current_plain = render(summary_run, plain)
+    assert "render_settle" not in current_plain
+    assert "| render_settle | " in render(summary_run, settled)
+    try:
+        base_text = subprocess.run(["git", "show", BASE_SHA + ":.github/workflows/release_decision_feed.yml"],
+                                   cwd=ROOT, capture_output=True, text=True, check=True, timeout=30).stdout
+    except Exception:  # noqa: BLE001 - shallow checkout: the in-file assertions above still hold
+        return
+    import yaml
+    base_doc = yaml.safe_load(base_text)
+    base_steps = {step["name"]: step for step in base_doc["jobs"]["release-decision-feed"]["steps"]}
+    assert render(base_steps["Publish release summary"]["run"], plain) == current_plain
+
+
+def case_r13_the_clock_moves_during_the_settle(mp, tmp_path):
+    from datetime import timedelta
+    for prior, name in ((T.W0_VETO, "first"), (T.live_release_value(), "live")):
+        grids = Grids(running=1)
+        ctx = T.setup(mp, tmp_path / name, feed=prior, grids=grids)
+        ctx.clock["now"] = T.ANCHOR + timedelta(minutes=478)     # inputs 7h58m old
+        arm(mp)
+
+        def move(seconds, ctx=ctx):
+            ctx.clock["now"] = ctx.clock["now"] + timedelta(seconds=seconds)
+        result = release(ctx, sleeps=Sleeps(move), moving_clock=True)
+        assert result["render_settle"][0]["wait_s"] == 150, name
+        # judged at the NEW time: the My_Portfolio input crossed the 8 h cap
+        # during the wait (7h58m -> 8h00m30s), so the re-audit itself fails
+        codes = {item["code"] for item in result["audits"]["decision"]["findings"]}
+        assert result["outcome"] == "not_accepted" and codes == {"PF_SOURCE_STALE"}, (name, codes)
+        if name == "first":
+            assert ctx.updates() == []
+        else:       # an armed re-verification of an expired live release withdraws, as 1.2.0 does
+            assert len(ctx.updates()) == 1
+
+
+def case_r14_compare_and_set_after_the_settle(mp, tmp_path):
+    grids = Grids(running=1)
+    ctx = T.setup(mp, tmp_path, feed=T.W0_VETO, grids=grids)
+    arm(mp)
+    newer = T.W0_VETO.replace("2026-07-31 20:10:00", "2026-07-31 21:06:00")
+
+    def change(seconds):
+        ctx.service.rows[3][12] = newer          # another writer touched the cell meanwhile
+    result = release(ctx, sleeps=Sleeps(change))
+    assert result["outcome"] == "refused" and result["exit_code"] == 3
+    assert "compare_and_set_failed" in result["reasons"]
+    assert ctx.updates() == [] and feed(ctx) == newer
 
 
 # --------------------------------------------------------------------------- runner

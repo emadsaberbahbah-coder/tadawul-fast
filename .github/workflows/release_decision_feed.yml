@@ -11,8 +11,10 @@
 # TFB_RELEASE_RENDER_SETTLE: ${{ vars.TFB_RELEASE_RENDER_SETTLE || '0' }}
 # (default OFF). The JOB env is untouched, so its parity with the final job
 # of daily_sync.yml (tests/test_release_decision_feed.py case_n16) holds.
-# A settle adds at most 2 x 120 s, inside the 30-minute timeout. Nothing else
-# changes: triggers, group, gates, steps, summary keys.
+# A settle adds one 150 s wait plus one strict audit, inside the 30-minute
+# timeout. The release summary prints a render_settle row only when the
+# result carries that key (absent when the gate is off). Nothing else
+# changes: triggers, group, gates, steps.
 # ROLLBACK: unset the variable, or revert this line.
 #
 # VERSION 1.1.0 (2026-10-19) -- SCHEDULED ATTEMPTS WITH SOURCE DISCOVERY
@@ -297,6 +299,9 @@ jobs:
                               'deferred', 'released', 'expires', 'downgrade', 'would_downgrade',
                               'display_pending_cockpit_refresh'):
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
+                  if 'render_settle' in result:
+                      # v1.2.0: only when release_decision_feed 1.3.0 settled a render.
+                      handle.write('| render_settle | ' + json.dumps(result['render_settle']) + ' |\n')
                   handle.write('\nA released value is shown on the board only after both cockpits re-render.\n')
           PY
 

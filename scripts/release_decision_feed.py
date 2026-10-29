@@ -33,20 +33,36 @@ The render is a transient state the cockpit itself declares, not a verdict.
 WHAT CHANGED (only when TFB_RELEASE_RENDER_SETTLE is armed with the _ARMED
 words; mode=release only - sweep and kill run no audit):
 - step 6b, new PURE settle_candidates(result): the cockpits whose strict
-  decision finding is exactly T10_STATUS_NOT_OK / PF_STATUS_NOT_OK with the
-  message 'Embedded status is RUNNING, not OK.', and only when the coverage
-  audit itself passed (audit_exit_codes[0] == 0). Anything else: no settle.
-- When the strict audits fail and a candidate exists: wait RENDER_SETTLE_S
-  (120 s), re-run the in-flight probe (busy or probe error -> exit 1
-  deferred, zero writes: a live release stays live, the next slot
-  re-verifies), then re-run the SAME strict audits (fresh reads) and judge
-  that result instead. At most RENDER_SETTLE_MAX (2) settles; a cockpit
-  still mid-render after them is judged exactly as today (fail closed: an
-  armed re-verification still withdraws).
+  decision finding is exactly T10_STATUS_NOT_OK / PF_STATUS_NOT_OK on its
+  own surface with 'Embedded status is RUNNING, not OK.' - and only when
+  the coverage audit passed AND EVERY decision finding is one that the
+  running line itself produces on a running cockpit (Top_10: STATUS_NOT_OK,
+  SOURCE_CONSUMPTION_UNPROVEN, POOL_COUNT_MISSING, POOL_RECONCILIATION_
+  UNPROVEN; Portfolio_Decision: STATUS_NOT_OK, SOURCE_CONSUMPTION_UNPROVEN;
+  measured on this file's fixtures). Any other finding (a stale board, a
+  failed status, a cohort, membership or structure finding) settles
+  nothing, so the attempt is judged exactly as today.
+- When the strict audits fail and the render explains every finding: wait
+  RENDER_SETTLE_S (150 s, once: RENDER_SETTLE_MAX = 1), re-run the in-flight
+  probe (busy or probe error -> exit 1 deferred, zero writes: a live
+  release that failed ONLY on the render stays live, the next slot
+  re-verifies), then re-run the SAME strict audits (fresh reads, the clock
+  read again) and judge that result instead. A cockpit still mid-render is
+  judged exactly as today (fail closed: an armed re-verification still
+  withdraws).
 - out gains 'render_settle' (attempt, cockpits, wait, the first attempt's
   reasons) only when a settle happened; out['reasons'] then carries the
-  final attempt's audit reasons. The printed line and the workflow summary
-  keys are unchanged.
+  final attempt's audit reasons. The printed line is unchanged; the
+  workflow summary prints a render_settle row only when that key exists.
+REVIEW FIXES (2026-10-29, independent review, same unreleased v1.3.0)
+- The first cut settled on ANY RUNNING finding, so a live release that also
+  carried a real failure could be KEPT when a writer started or the probe
+  failed during the settle (reproduced: 1.2.0 withdrew it, the first cut
+  deferred and kept it). Now every finding must be explained by the render.
+- One settle instead of two: TFB_DECISION_RELEASE and the sticky KILL are
+  read when the run starts, so each settle extends the time a newly set
+  KILL is not seen by this run; one 150 s settle bounds it to about three
+  minutes.
 ROLLBACK: unset the repository variable TFB_RELEASE_RENDER_SETTLE (or set it
 to anything outside 1/true/yes/on).
 
@@ -223,11 +239,17 @@ SCRIPT_VERSION = "1.3.0"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
 # v1.3.0: a cockpit caught mid-render settles instead of failing (default off).
 RENDER_SETTLE_ENV = "TFB_RELEASE_RENDER_SETTLE"
-RENDER_SETTLE_S = 120
-RENDER_SETTLE_MAX = 2
+RENDER_SETTLE_S = 150
+RENDER_SETTLE_MAX = 1
 _RENDER_STATUS_CODES = {"T10_STATUS_NOT_OK": "Top_10_Investments",
                         "PF_STATUS_NOT_OK": "Portfolio_Decision"}
 _RENDER_RUNNING_MESSAGE = "Embedded status is RUNNING, not OK."
+# The findings a 'status: running...' line itself produces on its cockpit.
+_RENDER_EXPLAINED = {
+    "Top_10_Investments": frozenset({"T10_STATUS_NOT_OK", "T10_SOURCE_CONSUMPTION_UNPROVEN",
+                                     "T10_POOL_COUNT_MISSING", "T10_POOL_RECONCILIATION_UNPROVEN"}),
+    "Portfolio_Decision": frozenset({"PF_STATUS_NOT_OK", "PF_SOURCE_CONSUMPTION_UNPROVEN"}),
+}
 # v1.2.0: --source-run-id auto reads the cohort from this _Status L:M key.
 SOURCE_AUTO = "auto"
 GM_FEED_KEY = "TFB Feed Global_Markets"
@@ -551,10 +573,12 @@ def accepted(result: Any, source: str) -> tuple[bool, list[str]]:
 
 def settle_candidates(result: Any) -> list[str]:
     """PURE (v1.3.0). The cockpits whose own status line says a render is in
-    progress, from the strict decision audit: exactly T10_STATUS_NOT_OK /
-    PF_STATUS_NOT_OK with 'Embedded status is RUNNING, not OK.', and only
-    when the coverage audit passed. Anything else (another state, a missing
-    payload, a failed coverage audit) -> [] (no settle)."""
+    progress (T10_STATUS_NOT_OK / PF_STATUS_NOT_OK on its own surface with
+    'Embedded status is RUNNING, not OK.'), returned only when the coverage
+    audit passed and EVERY decision finding is one that running line itself
+    produces on a running cockpit (_RENDER_EXPLAINED). Anything else (another
+    state, any other finding, a malformed payload, a failed coverage audit)
+    -> [] (no settle: judged exactly as v1.2.0)."""
     if not isinstance(result, dict):
         return []
     codes = result.get("audit_exit_codes")
@@ -563,16 +587,20 @@ def settle_candidates(result: Any) -> list[str]:
     audits = result.get("audits")
     decision = audits.get("decision") if isinstance(audits, dict) else None
     findings = decision.get("findings") if isinstance(decision, dict) else None
-    if not isinstance(findings, list):
+    if not isinstance(findings, list) or not findings:
         return []
     running = []
     for finding in findings:
         if not isinstance(finding, dict):
-            continue
+            return []
         surface = _RENDER_STATUS_CODES.get(finding.get("code"))
         if (surface and finding.get("message") == _RENDER_RUNNING_MESSAGE
                 and finding.get("surface") == surface and surface not in running):
             running.append(surface)
+    for finding in findings:
+        surface = finding.get("surface")
+        if surface not in running or finding.get("code") not in _RENDER_EXPLAINED[surface]:
+            return []
     return running
 
 
