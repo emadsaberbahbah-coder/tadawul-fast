@@ -164,6 +164,11 @@ sys.path.insert(0, _ROOT)
 # 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
 # 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
 # requested; Commodities_FX name coverage). No verifier logic changed.
+# 2026-10-29 (same rule): run_dashboard_sync 6.70.2 -> 6.71.0 (FW2-STALE-PE,
+# TFB_SYNC_FW2_STALE_PE, default off: a row FW-2 would strip for a mildly
+# stale P/E keeps its fresh quote with P/E and EPS cleared once its last-good
+# row witnesses the instrument). Workflow-scoped like TFB_SYNC_COH_HK_*, so
+# FLAGS is unchanged. No verifier logic changed.
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -270,7 +275,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.70.2", "dashboard sync"),
+    ("run_dashboard_sync", "6.71.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
