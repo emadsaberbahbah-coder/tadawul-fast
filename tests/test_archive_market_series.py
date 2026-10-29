@@ -42,7 +42,8 @@ M14 (v1.1.1) the minimum is window-aware: --days 30 (20-22 trading days)
     needs 11 bars, the nightly 1,100 days 30, never fewer than 2; a complete
     30-day answer loads every series (daily, or rebuilt from hourly bars,
     with no hourly call on a full daily answer) while one bar still fails
-    and keeps its rows
+    and keeps its rows; the 10 / 11 boundary holds at both decision points,
+    and months with long closures (12 and 13 sessions, a Sun-Thu week) load
 """
 from __future__ import annotations
 
@@ -603,3 +604,48 @@ def test_m14_window_aware_minimum(monkeypatch, capsys):
                  lambda sym, a, b, now_ts: got)
     assert rc == 0 and len(s.uploads[13]) == len(got)
     assert "(rebuilt from hourly bars)" in capsys.readouterr().err
+
+
+def test_m14_boundary_and_closure_months(monkeypatch, capsys):
+    p1, p2 = _window(30)
+    days = _weekdays_since(p1, end="2026-10-28")              # 22 weekdays
+    need = ms.min_bars(p1, p2)
+    assert need == 11 and len(days) == 22
+    empty = json.dumps({"chart": {"result": None}}).encode()
+
+    # the hourly trigger: 10 daily bars ask for hourly bars, 11 do not
+    for n, asks in ((need - 1, True), (need, False)):
+        daily = json.dumps(_chart([_ts(d) for d in days[-n:]], [5.0] * n)).encode()
+        seen = []
+
+        def opener(req, timeout, daily=daily, seen=seen):
+            seen.append(req.full_url)
+            return _Body(daily if "interval=1d" in req.full_url else empty)
+
+        got = ms.fetch_series("^GSPC", p1, p2, int(NOW.timestamp()), opener=opener, sleep=lambda s: None)
+        assert len(got) == n and any("interval=1h" in u for u in seen) is asks
+
+    # the refusal: 10 bars keep the rows, 11 load
+    for n, rc_want, loaded in ((need - 1, 1, []), (need, 0, [1])):
+        s = FakeBQ(table=_live_table())
+        rc, _ = _run(monkeypatch, ["--write", "--days", "30", "--symbols", "^GSPC"], s,
+                     lambda sym, a, b, now_ts, n=n: _bars(*days[-n:]))
+        assert rc == rc_want and sorted(s.uploads) == loaded
+    assert "only 10 bar(s) from Yahoo, daily and hourly, 11 needed" in capsys.readouterr().err
+
+    # months with a long closure still load: 12 sessions (the fewest the review
+    # found in a real 30-day window - Shanghai, Mid-Autumn and Golden Week 2010)
+    # and 13 sessions on a Sun-Thu week (Tadawul, Eid al-Fitr 2022)
+    closed = [d for d in days if d >= "2026-10-13"]
+    sun_thu = []
+    d = dt.datetime.fromtimestamp(p1, tz=dt.timezone.utc).date()
+    while d.isoformat() <= "2026-10-28":
+        if d.weekday() in (6, 0, 1, 2, 3) and d.isoformat() >= "2026-10-12":
+            sun_thu.append(d.isoformat())
+        d += dt.timedelta(days=1)
+    assert (len(closed), len(sun_thu)) == (12, 13)
+    s = FakeBQ(table=_live_table())
+    rc, _ = _run(monkeypatch, ["--write", "--days", "30", "--symbols", "000001.SS,^TASI.SR"], s,
+                 lambda sym, a, b, now_ts: _bars(*(sun_thu if sym == "^TASI.SR" else closed)))
+    assert rc == 0 and len(s.uploads[8]) == 12 and len(s.uploads[13]) == 13
+    assert "2/2 series" in capsys.readouterr().out
