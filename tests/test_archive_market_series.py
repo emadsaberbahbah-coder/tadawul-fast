@@ -1,4 +1,4 @@
-"""scripts/archive_market_series.py v1.0.0 - the daily bars of the world's
+"""scripts/archive_market_series.py v1.1.0 - the daily bars of the world's
 reference markets for the Looker global markets page (program register C8,
 Phase 2b).
 
@@ -31,6 +31,13 @@ M9  main: gate off (no request at all), missing project, bad --days, unknown
 M10 the workflow: nightly schedule, dry-run dispatch by default, read-only
     repository, armed gate with a kill switch, pinned actions
 M11 nothing here writes to the workbook or runs DML
+M12 (v1.1.0) a daily answer shorter than MIN_BARS (Yahoo gives ^TASI.SR and
+    000300.SS one bar) is rebuilt from hourly bars: one row per venue-local
+    day - first open, high max, low min, last close, summed volume - from
+    p1 on, an open session left out, source yahoo_chart_v8_1h; a full daily
+    answer never asks for hourly bars
+M13 (v1.1.0) a series still shorter than MIN_BARS fails and keeps its rows
+    (no WRITE_TRUNCATE down to one day); the others load
 """
 from __future__ import annotations
 
@@ -86,6 +93,17 @@ def _chart(ts, close, adj=None, gmtoffset=-14400, period=None, volume=None):
 def _bars(*days):
     return [{"date": d, "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0 + i, "adj_close": None,
              "volume": 5} for i, d in enumerate(days)]
+
+
+def _days(n=40, end="2026-10-28"):
+    """n consecutive weekdays ending on `end` (a full history for the tests)."""
+    d = dt.date.fromisoformat(end)
+    out = []
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.isoformat())
+        d -= dt.timedelta(days=1)
+    return _bars(*reversed(out))
 
 
 class Resp:
@@ -241,19 +259,20 @@ class _Body(io.BytesIO):
 
 def test_m4_fetch_series_hosts():
     seen = []
-    good = json.dumps(_chart([_ts("2026-10-28")], [5.0])).encode()
+    full = json.dumps(_chart([_ts(d["date"]) for d in _days(35)], [5.0] * 35)).encode()
 
     def opener(req, timeout):
         seen.append(req.full_url)
         if "query1" in req.full_url:
             raise urllib.error.URLError("reset")
-        return _Body(good)
+        return _Body(full)
 
     slept = []
     bars = ms.fetch_series("^TASI.SR", 111, 222, None, opener=opener, sleep=slept.append)
-    assert [b["close"] for b in bars] == [5.0] and len(seen) == 2 and slept == [1.5]
+    assert len(bars) == 35 and len(seen) == 2 and slept == [1.5]
     assert "/v8/finance/chart/%5ETASI.SR?period1=111&period2=222&interval=1d" in seen[1]
     assert "events=div%2Csplits" in seen[1] and "includeAdjustedClose=true" in seen[1]
+    assert not any("interval=1h" in u for u in seen)            # full daily answer: no hourly call
     assert "%3DF" in ms.YAHOO_PATH.format(sym=ms.urllib.parse.quote("BZ=F", safe=""), p1=1, p2=2)
 
     def not_found(req, timeout):
@@ -262,7 +281,7 @@ def test_m4_fetch_series_hosts():
 
     seen.clear()
     assert ms.fetch_series("NOPE", 1, 2, None, opener=not_found, sleep=slept.append) == []
-    assert len(seen) == 1
+    assert len(seen) == 2 and "interval=1h" in seen[1]           # one try per resolution, 404 final
 
     def empty(req, timeout):
         return _Body(json.dumps({"chart": {"result": None}}).encode())
@@ -330,7 +349,7 @@ def test_m7_write_loads_each_partition_and_isolates_failures(monkeypatch, capsys
             raise RuntimeError("Yahoo 429")
         if symbol == "QAT":
             return []
-        return _bars("2026-10-27", "2026-10-28")
+        return _days(40)
 
     s = FakeBQ(table=_live_table(), polls=2)
     rc, slept = _run(monkeypatch, ["--write", "--symbols", "^GSPC,^HSI,QAT,KSA"], s, fetch)
@@ -351,19 +370,19 @@ def test_m7_write_loads_each_partition_and_isolates_failures(monkeypatch, capsys
 
     s = FakeBQ(table=_live_table(), job_error={24: "Provided Schema does not match"})
     rc, _ = _run(monkeypatch, ["--write", "--symbols", "^GSPC,KSA"], s,
-                 lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+                 lambda sym, p1, p2, now_ts: _days(40))
     assert rc == 1 and 1 in s.uploads and "FAILED (left as they were): KSA" in capsys.readouterr().out
 
     s = FakeBQ(table=None)
     rc, _ = _run(monkeypatch, ["--write", "--symbols", "^GSPC"], s,
-                 lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+                 lambda sym, p1, p2, now_ts: _days(40))
     assert rc == 0 and len(s.created) == 1 and "table created" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- M8
 def test_m8_dry_run(monkeypatch, capsys):
     s = FakeBQ(table=None)
-    rc, _ = _run(monkeypatch, ["--symbols", "^GSPC,^TASI.SR"], s, lambda sym, p1, p2, now_ts: _bars("2026-10-28"))
+    rc, _ = _run(monkeypatch, ["--symbols", "^GSPC,^TASI.SR"], s, lambda sym, p1, p2, now_ts: _days(40))
     assert rc == 0
     assert [c for c in s.calls] == [("GET", f"{ms.BQ_API}/projects/{PROJECT}/datasets/{DATASET}")]
     assert not s.jobs and not s.created
@@ -429,4 +448,72 @@ def test_m11_no_workbook_write_no_dml():
     for word in ("DELETE FROM", "INSERT INTO", "UPDATE `", "MERGE `", "DROP TABLE", "TRUNCATE TABLE"):
         assert word not in code, word
     assert '"tableId": f"{TABLE}${series_id}"' in src
-    assert src.count("WRITE_TRUNCATE") == 2 and '"createDisposition": "CREATE_NEVER"' in src
+    assert '"writeDisposition": "WRITE_TRUNCATE"' in code and '"createDisposition": "CREATE_NEVER"' in src
+
+
+# --------------------------------------------------------------------------- M12
+def _hourly(rows, gmtoffset=10800, period=None):
+    """rows: (utc 'YYYY-MM-DD HH:MM', open, high, low, close, volume)."""
+    ts = [int(dt.datetime.strptime(r[0], "%Y-%m-%d %H:%M").replace(tzinfo=dt.timezone.utc).timestamp())
+          for r in rows]
+    q = {"open": [r[1] for r in rows], "high": [r[2] for r in rows], "low": [r[3] for r in rows],
+         "close": [r[4] for r in rows], "volume": [r[5] for r in rows]}
+    meta = {"gmtoffset": gmtoffset}
+    if period is not None:
+        meta["currentTradingPeriod"] = {"regular": period}
+    return {"chart": {"result": [{"meta": meta, "timestamp": ts, "indicators": {"quote": [q]}}], "error": None}}
+
+
+def test_m12_hourly_rebuild():
+    rows = [("2026-10-27 07:00", 100.0, 101.0, 99.0, 100.5, 10),
+            ("2026-10-27 08:00", 100.5, 103.0, 100.0, 102.0, 20),
+            ("2026-10-27 09:00", None, None, None, None, None),      # an empty hour
+            ("2026-10-27 11:00", 102.0, 102.5, 98.0, 99.0, 30),
+            ("2026-10-28 07:00", 99.0, 99.5, 97.0, 98.0, 5),
+            ("2026-10-28 11:00", 98.0, 100.0, 97.5, 99.5, 7),
+            ("2026-10-29 07:00", 99.5, 99.9, 99.0, 99.8, 3)]       # today, session open
+    period = {"start": _ts("2026-10-29", 7, 0), "end": _ts("2026-10-29", 12, 0)}
+    bars = ms.parse_hourly(_hourly(rows, period=period), _ts("2026-10-29", 9, 0))
+    assert [b["date"] for b in bars] == ["2026-10-27", "2026-10-28"]
+    d = bars[0]
+    assert (d["open"], d["high"], d["low"], d["close"], d["volume"]) == (100.0, 103.0, 98.0, 99.0, 60)
+    assert d["adj_close"] is None and d["source"] == "yahoo_chart_v8_1h"
+    assert len(ms.parse_hourly(_hourly(rows, period=period))) == 3          # no clock: today kept
+    # gmtoffset decides the trading day: 22:00 UTC is the next day in Riyadh
+    late = ms.parse_hourly(_hourly([("2026-10-27 22:00", 1.0, 1.0, 1.0, 1.0, 1)]))
+    assert late[0]["date"] == "2026-10-28"
+    for bad in ({}, {"chart": {"result": None}}, None):
+        assert ms.parse_hourly(bad) == []
+
+    # fetch_series: one daily bar -> the hourly rebuild (from p1 on) is used
+    hourly_rows = []
+    for d in [b["date"] for b in _days(45)]:
+        hourly_rows += [(d + " 07:00", 10.0, 11.0, 9.0, 10.0, 1), (d + " 11:00", 10.0, 12.0, 9.5, 11.0, 2)]
+    hourly = json.dumps(_hourly(hourly_rows)).encode()
+    one_daily = json.dumps(_chart([_ts("2026-10-29")], [12.0])).encode()
+    seen = []
+
+    def opener(req, timeout):
+        seen.append(req.full_url)
+        return _Body(hourly if "interval=1h" in req.full_url else one_daily)
+
+    p1 = int(dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc).timestamp())
+    got = ms.fetch_series("^TASI.SR", p1, p1 + 86400 * 90, None, opener=opener, sleep=lambda s: None)
+    assert "range=730d&interval=1h" in seen[-1] and "%5ETASI.SR" in seen[-1]
+    assert got and all(b["source"] == "yahoo_chart_v8_1h" and b["date"] >= "2026-09-01" for b in got)
+    assert all(b["close"] == 11.0 and b["high"] == 12.0 and b["volume"] == 3 for b in got)
+    rows_out = ms.build_rows(ms.series_records("^TASI.SR")[0], got, "2026-10-29T22:35:09Z", "9")
+    assert {r["source"] for r in rows_out} == {"yahoo_chart_v8_1h"}
+
+
+# --------------------------------------------------------------------------- M13
+def test_m13_short_history_keeps_rows(monkeypatch, capsys):
+    def fetch(symbol, p1, p2, now_ts):
+        return _bars("2026-10-29") if symbol == "000300.SS" else _days(40)
+
+    s = FakeBQ(table=_live_table())
+    rc, _ = _run(monkeypatch, ["--write", "--symbols", "^GSPC,000300.SS"], s, fetch)
+    out = capsys.readouterr()
+    assert rc == 1 and sorted(s.uploads) == [1]                 # CSI 300 (10) untouched
+    assert "only 1 bar(s) from Yahoo" in out.err and "FAILED (left as they were): 000300.SS" in out.out
+    assert ms.MIN_BARS == 30

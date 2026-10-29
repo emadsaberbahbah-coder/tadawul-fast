@@ -297,7 +297,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
     ("apply_bq_views", "1.1.0", "bigquery looker views"),
-    ("archive_market_series", "1.0.0", "bigquery market series"),
+    # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
+    # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
+    # still shorter than MIN_BARS fails and keeps its rows).
+    ("archive_market_series", "1.1.0", "bigquery market series"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

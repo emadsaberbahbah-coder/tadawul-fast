@@ -2,8 +2,19 @@
 # scripts/archive_market_series.py
 """
 ================================================================================
-TFB Market Series - v1.0.0 (program register C8, Phase 2b: global markets page)
+TFB Market Series - v1.1.0 (program register C8, Phase 2b: global markets page)
 ================================================================================
+v1.1.0 (29 Oct 2026, first live load): Yahoo serves ONE daily bar for
+^TASI.SR and 000300.SS (every range, both hosts - their daily history is
+missing upstream) while their hourly history is complete, so the first fill
+loaded 47/48 series and CSI 300 with a single day. Now a series whose daily
+answer has fewer than MIN_BARS bars is rebuilt from Yahoo's hourly bars
+(range=730d, ~2.9 years): one row per venue-local trading day - first open,
+highest high, lowest low, LAST hourly close, summed volume - tagged
+source=yahoo_chart_v8_1h. On TASI the last hourly close is the price before
+the closing auction (typically within a few tenths of a percent of the
+official close). And a series that still has fewer than MIN_BARS bars is a
+failure that keeps its rows, never a WRITE_TRUNCATE down to one day.
 WHY (owner request 29 Oct 2026): the first Looker Studio page must show how
 the world's markets move - the US, Europe, China, Japan and the Gulf - day by
 day: the trend over the year, the average return of each market, one market
@@ -61,7 +72,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 TABLE = "market_series_daily"
 DEFAULT_DAYS = 1100
@@ -70,7 +81,10 @@ MAX_SERIES_ID = 1000
 YAHOO_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
 YAHOO_PATH = ("/v8/finance/chart/{sym}?period1={p1}&period2={p2}"
               "&interval=1d&events=div%2Csplits&includeAdjustedClose=true")
-YAHOO_UA = "Mozilla/5.0 (compatible; TFB-market-series/1.0)"
+YAHOO_HOURLY_PATH = "/v8/finance/chart/{sym}?range=730d&interval=1h"
+YAHOO_UA = "Mozilla/5.0 (compatible; TFB-market-series/1.1)"
+# fewer bars than this is not a history: rebuild from hourly bars, else fail
+MIN_BARS = 30
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
 
@@ -261,22 +275,74 @@ def parse_chart(payload: Any, now_ts: Optional[int] = None) -> List[Dict[str, An
     return [out[d] for d in sorted(out)]
 
 
+def parse_hourly(payload: Any, now_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Yahoo v8 HOURLY chart JSON -> one daily bar per venue-local trading
+    day: first open, highest high, lowest low, last close, summed volume
+    (bars without a positive close skipped; the bars of a session still open
+    at now_ts left out, as in parse_chart). adj_close is None (indices)."""
+    try:
+        r0 = (payload["chart"]["result"] or [None])[0]
+    except (KeyError, TypeError, IndexError):
+        return []
+    if not r0:
+        return []
+    meta = r0.get("meta") or {}
+    try:
+        off = int(meta.get("gmtoffset") or 0)
+    except (TypeError, ValueError):
+        off = 0
+    live_from = _live_session_start(meta, now_ts)
+    try:
+        q = ((r0.get("indicators") or {}).get("quote") or [{}])[0] or {}
+    except (TypeError, IndexError, AttributeError):
+        q = {}
+    days: Dict[str, Dict[str, Any]] = {}
+    for i, t in sorted(enumerate(r0.get("timestamp") or []), key=lambda it: (_num(it[1]) or 0)):
+        def at(key: str) -> Optional[float]:
+            seq = q.get(key) or []
+            return _num(seq[i]) if i < len(seq) else None
+        close = at("close")
+        if close is None or not close > 0:
+            continue
+        try:
+            t = int(t)
+            if live_from is not None and t >= live_from:
+                continue
+            day = _dt.datetime.fromtimestamp(t + off, tz=_dt.timezone.utc).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        o, h, lo, v = at("open"), at("high"), at("low"), at("volume")
+        d = days.get(day)
+        if d is None:
+            days[day] = {"date": day, "open": o, "high": h, "low": lo, "close": close, "adj_close": None,
+                         "volume": int(v) if v is not None and v >= 0 else None,
+                         "source": "yahoo_chart_v8_1h"}
+            continue
+        if d["open"] is None:
+            d["open"] = o
+        if h is not None:
+            d["high"] = h if d["high"] is None else max(d["high"], h)
+        if lo is not None:
+            d["low"] = lo if d["low"] is None else min(d["low"], lo)
+        d["close"] = close
+        if v is not None and v >= 0:
+            d["volume"] = int(v) + (d["volume"] or 0)
+    return [days[d] for d in sorted(days)]
+
+
 def _default_opener(req: urllib.request.Request, timeout: float):  # pragma: no cover - network
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def fetch_series(symbol: str, p1: int, p2: int, now_ts: Optional[int] = None,
-                 opener: Callable[..., Any] = _default_opener,
-                 sleep: Callable[[float], None] = time.sleep) -> List[Dict[str, Any]]:
-    """Daily bars for one Yahoo symbol, query1 then query2; a 404 (unknown
-    symbol) is not retried. [] when nothing usable came back."""
-    ysym = urllib.parse.quote(symbol, safe="")
+def _fetch(path: str, parse: Callable[..., List[Dict[str, Any]]], now_ts: Optional[int],
+           opener: Callable[..., Any], sleep: Callable[[float], None]) -> List[Dict[str, Any]]:
+    """query1 then query2; a 404 (unknown symbol) is not retried."""
     for host in YAHOO_HOSTS:
-        url = "https://" + host + YAHOO_PATH.format(sym=ysym, p1=p1, p2=p2)
-        req = urllib.request.Request(url, headers={"User-Agent": YAHOO_UA, "Accept": "application/json"})
+        req = urllib.request.Request("https://" + host + path,
+                                     headers={"User-Agent": YAHOO_UA, "Accept": "application/json"})
         try:
             with opener(req, 30) as resp:
-                bars = parse_chart(json.loads(resp.read().decode("utf-8", "replace")), now_ts)
+                bars = parse(json.loads(resp.read().decode("utf-8", "replace")), now_ts)
             if bars:
                 return bars
         except Exception as exc:  # noqa: BLE001
@@ -284,6 +350,22 @@ def fetch_series(symbol: str, p1: int, p2: int, now_ts: Optional[int] = None,
                 return []
         sleep(1.5)
     return []
+
+
+def fetch_series(symbol: str, p1: int, p2: int, now_ts: Optional[int] = None,
+                 opener: Callable[..., Any] = _default_opener,
+                 sleep: Callable[[float], None] = time.sleep) -> List[Dict[str, Any]]:
+    """Daily bars for one Yahoo symbol. When the daily answer has fewer than
+    MIN_BARS bars, the series is rebuilt from hourly bars (from p1 on) if
+    that gives more. [] when nothing usable came back."""
+    ysym = urllib.parse.quote(symbol, safe="")
+    daily = _fetch(YAHOO_PATH.format(sym=ysym, p1=p1, p2=p2), parse_chart, now_ts, opener, sleep)
+    if len(daily) >= MIN_BARS:
+        return daily
+    first_day = _dt.datetime.fromtimestamp(int(p1), tz=_dt.timezone.utc).strftime("%Y-%m-%d")
+    hourly = [b for b in _fetch(YAHOO_HOURLY_PATH.format(sym=ysym), parse_hourly, now_ts, opener, sleep)
+              if b["date"] >= first_day]
+    return hourly if len(hourly) > len(daily) else daily
 
 
 def build_rows(rec: Dict[str, Any], bars: Iterable[Dict[str, Any]],
@@ -294,7 +376,8 @@ def build_rows(rec: Dict[str, Any], bars: Iterable[Dict[str, Any]],
         row["country"] = rec.get("country") or None
         row["sector"] = rec.get("sector") or None
         row.update({k: b.get(k) for k in ("date", "open", "high", "low", "close", "adj_close", "volume")})
-        row.update({"source": "yahoo_chart_v8", "captured_at": captured_at, "run_id": run_id or None})
+        row.update({"source": b.get("source") or "yahoo_chart_v8", "captured_at": captured_at,
+                    "run_id": run_id or None})
         rows.append(row)
     return rows
 
@@ -439,8 +522,11 @@ def _one(session: Any, rec: Dict[str, Any], *, project: str, dataset: str, locat
     bars = fetch(rec["symbol"], p1, p2, now_ts)
     if not bars:
         raise RuntimeError("no bars from Yahoo (series left as it was)")
+    if len(bars) < MIN_BARS:
+        raise RuntimeError(f"only {len(bars)} bar(s) from Yahoo, daily and hourly (series left as it was)")
     rows = build_rows(rec, bars, captured_at, run_id)
-    span = f"{rows[0]['date']}..{rows[-1]['date']}"
+    span = f"{rows[0]['date']}..{rows[-1]['date']}" + (" (rebuilt from hourly bars)"
+                                                         if rows[-1]["source"] == "yahoo_chart_v8_1h" else "")
     if not write:
         _out(f"{rec['symbol']:10s} {rec['name']}: {len(rows)} bars {span} | dry run")
         return len(rows)
