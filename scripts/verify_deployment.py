@@ -300,7 +300,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
-    ("archive_market_series", "1.1.0", "bigquery market series"),
+    # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
+    # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
+    ("archive_market_series", "1.1.1", "bigquery market series"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

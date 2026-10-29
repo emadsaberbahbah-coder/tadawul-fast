@@ -2,8 +2,16 @@
 # scripts/archive_market_series.py
 """
 ================================================================================
-TFB Market Series - v1.1.0 (program register C8, Phase 2b: global markets page)
+TFB Market Series - v1.1.1 (program register C8, Phase 2b: global markets page)
 ================================================================================
+v1.1.1 (29 Oct 2026, review of #880): the 30-bar minimum is a history test
+for the nightly 1,100-day window, but a --days 30 run (the smallest window
+the job accepts) holds only 20-22 trading days, so every complete answer was
+refused and the run failed. The minimum is now window-aware, min_bars(p1,
+p2): MIN_BARS, or half the trading days a window of that length holds (5 of
+every 7 calendar days, holidays aside) when that is smaller, never below 2.
+fetch_series (when to rebuild from hourly bars) and _one (when to refuse a
+series) use the same number; the nightly window still needs MIN_BARS = 30.
 v1.1.0 (29 Oct 2026, first live load): Yahoo serves ONE daily bar for
 ^TASI.SR and 000300.SS (every range, both hosts - their daily history is
 missing upstream) while their hourly history is complete, so the first fill
@@ -72,7 +80,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 TABLE = "market_series_daily"
 DEFAULT_DAYS = 1100
@@ -84,6 +92,7 @@ YAHOO_PATH = ("/v8/finance/chart/{sym}?period1={p1}&period2={p2}"
 YAHOO_HOURLY_PATH = "/v8/finance/chart/{sym}?range=730d&interval=1h"
 YAHOO_UA = "Mozilla/5.0 (compatible; TFB-market-series/1.1)"
 # fewer bars than this is not a history: rebuild from hourly bars, else fail
+# (the bar for a long window; a short one needs fewer - see min_bars)
 MIN_BARS = 30
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
@@ -352,15 +361,26 @@ def _fetch(path: str, parse: Callable[..., List[Dict[str, Any]]], now_ts: Option
     return []
 
 
+def min_bars(p1: int, p2: int) -> int:
+    """The fewest bars that count as a history of the window p1..p2 (epoch
+    seconds): MIN_BARS, or half the trading days a window of that length
+    holds (5 of every 7 calendar days, holidays aside) when that is smaller.
+    --days 30 (p2 one day past the run) gives 11 of its 20-22 trading days;
+    the nightly 1,100 days give 30. Never below 2: the one bar Yahoo serves
+    for ^TASI.SR and 000300.SS is never a history."""
+    days = max(0, (int(p2) - int(p1)) // 86400)
+    return max(2, min(MIN_BARS, days * 5 // 7 // 2))
+
+
 def fetch_series(symbol: str, p1: int, p2: int, now_ts: Optional[int] = None,
                  opener: Callable[..., Any] = _default_opener,
                  sleep: Callable[[float], None] = time.sleep) -> List[Dict[str, Any]]:
     """Daily bars for one Yahoo symbol. When the daily answer has fewer than
-    MIN_BARS bars, the series is rebuilt from hourly bars (from p1 on) if
-    that gives more. [] when nothing usable came back."""
+    min_bars(p1, p2) bars, the series is rebuilt from hourly bars (from p1
+    on) if that gives more. [] when nothing usable came back."""
     ysym = urllib.parse.quote(symbol, safe="")
     daily = _fetch(YAHOO_PATH.format(sym=ysym, p1=p1, p2=p2), parse_chart, now_ts, opener, sleep)
-    if len(daily) >= MIN_BARS:
+    if len(daily) >= min_bars(p1, p2):
         return daily
     first_day = _dt.datetime.fromtimestamp(int(p1), tz=_dt.timezone.utc).strftime("%Y-%m-%d")
     hourly = [b for b in _fetch(YAHOO_HOURLY_PATH.format(sym=ysym), parse_hourly, now_ts, opener, sleep)
@@ -522,8 +542,10 @@ def _one(session: Any, rec: Dict[str, Any], *, project: str, dataset: str, locat
     bars = fetch(rec["symbol"], p1, p2, now_ts)
     if not bars:
         raise RuntimeError("no bars from Yahoo (series left as it was)")
-    if len(bars) < MIN_BARS:
-        raise RuntimeError(f"only {len(bars)} bar(s) from Yahoo, daily and hourly (series left as it was)")
+    need = min_bars(p1, p2)
+    if len(bars) < need:
+        raise RuntimeError(f"only {len(bars)} bar(s) from Yahoo, daily and hourly, {need} needed for "
+                           f"this window (series left as it was)")
     rows = build_rows(rec, bars, captured_at, run_id)
     span = f"{rows[0]['date']}..{rows[-1]['date']}" + (" (rebuilt from hourly bars)"
                                                          if rows[-1]["source"] == "yahoo_chart_v8_1h" else "")
