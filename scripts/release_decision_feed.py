@@ -1,6 +1,55 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.3.0 (2026-10-29) -- A COCKPIT CAUGHT MID-RENDER SETTLES INSTEAD OF
+FAILING (gate TFB_RELEASE_RENDER_SETTLE, default OFF = v1.2.0 byte-identical
+apart from script_version). Nothing removed; every acceptance rule, gate,
+write and exit code is unchanged when the gate is off. (1.2.1 is claimed by
+open PR #831.)
+
+WHY (2026-10-29, independent review of PR #876, reproduced on this file's
+own test fixtures)
+----------------------------------------------------------------------------
+Both cockpits overwrite their status cell (B2) with 'Last run <now> |
+status: running...' as the FIRST write of every render
+(16_Decision_Top10.gs dt10StatusLine_, 10_My_Portfolio.gs pdStatusLine_)
+and restore the full line with the receipt only at the end. A release run
+whose strict audit reads B2 during that window sees T10_STATUS_NOT_OK (or
+PF_STATUS_NOT_OK) 'Embedded status is RUNNING, not OK.', the consumption
+finding and the pool-count findings that follow from the short line, and:
+- re-verifying a LIVE release of SOURCE (every slot after a promotion does
+  this, and the decision chain re-renders Top_10 right after every
+  promotion; the 4-hourly wrapper and the IBKR capture watcher render too),
+  armed, it WITHDRAWS the release:
+    NOT_ACTIONABLE(final_publication) | run=N | ... | decision_failed |
+    release=<this run>
+  and classify_prior then refuses every later release of N
+  (release_window_consumed) until the next sync - hours of a verified
+  cohort lost to a two-minute render;
+- a FIRST release of a consumed cohort simply fails (exit 2); a dispatched
+  attempt ends red and the cohort waits for the next late slot.
+The render is a transient state the cockpit itself declares, not a verdict.
+
+WHAT CHANGED (only when TFB_RELEASE_RENDER_SETTLE is armed with the _ARMED
+words; mode=release only - sweep and kill run no audit):
+- step 6b, new PURE settle_candidates(result): the cockpits whose strict
+  decision finding is exactly T10_STATUS_NOT_OK / PF_STATUS_NOT_OK with the
+  message 'Embedded status is RUNNING, not OK.', and only when the coverage
+  audit itself passed (audit_exit_codes[0] == 0). Anything else: no settle.
+- When the strict audits fail and a candidate exists: wait RENDER_SETTLE_S
+  (120 s), re-run the in-flight probe (busy or probe error -> exit 1
+  deferred, zero writes: a live release stays live, the next slot
+  re-verifies), then re-run the SAME strict audits (fresh reads) and judge
+  that result instead. At most RENDER_SETTLE_MAX (2) settles; a cockpit
+  still mid-render after them is judged exactly as today (fail closed: an
+  armed re-verification still withdraws).
+- out gains 'render_settle' (attempt, cockpits, wait, the first attempt's
+  reasons) only when a settle happened; out['reasons'] then carries the
+  final attempt's audit reasons. The printed line and the workflow summary
+  keys are unchanged.
+ROLLBACK: unset the repository variable TFB_RELEASE_RENDER_SETTLE (or set it
+to anything outside 1/true/yes/on).
+
 VERSION 1.2.0 (2026-10-19) -- SOURCE DISCOVERY FOR SCHEDULED ATTEMPTS.
 Nothing removed; every acceptance rule, gate, write and exit code of v1.1.0
 is unchanged.
@@ -170,8 +219,15 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
+# v1.3.0: a cockpit caught mid-render settles instead of failing (default off).
+RENDER_SETTLE_ENV = "TFB_RELEASE_RENDER_SETTLE"
+RENDER_SETTLE_S = 120
+RENDER_SETTLE_MAX = 2
+_RENDER_STATUS_CODES = {"T10_STATUS_NOT_OK": "Top_10_Investments",
+                        "PF_STATUS_NOT_OK": "Portfolio_Decision"}
+_RENDER_RUNNING_MESSAGE = "Embedded status is RUNNING, not OK."
 # v1.2.0: --source-run-id auto reads the cohort from this _Status L:M key.
 SOURCE_AUTO = "auto"
 GM_FEED_KEY = "TFB Feed Global_Markets"
@@ -236,6 +292,12 @@ def release_enabled() -> bool:
 def release_killed() -> bool:
     """TFB_DECISION_RELEASE_KILL, default OFF: on => never promote, retract."""
     return (os.getenv(KILL_ENV) or "0").strip().lower() in _ARMED
+
+
+def render_settle_enabled() -> bool:
+    """v1.3.0 TFB_RELEASE_RENDER_SETTLE, default OFF: on => a cockpit caught
+    mid-render is re-audited after a bounded settle instead of failing."""
+    return (os.getenv(RENDER_SETTLE_ENV) or "0").strip().lower() in _ARMED
 
 
 # --------------------------------------------------------------------------- clocks
@@ -487,6 +549,33 @@ def accepted(result: Any, source: str) -> tuple[bool, list[str]]:
     return not reasons, reasons
 
 
+def settle_candidates(result: Any) -> list[str]:
+    """PURE (v1.3.0). The cockpits whose own status line says a render is in
+    progress, from the strict decision audit: exactly T10_STATUS_NOT_OK /
+    PF_STATUS_NOT_OK with 'Embedded status is RUNNING, not OK.', and only
+    when the coverage audit passed. Anything else (another state, a missing
+    payload, a failed coverage audit) -> [] (no settle)."""
+    if not isinstance(result, dict):
+        return []
+    codes = result.get("audit_exit_codes")
+    if not isinstance(codes, list) or len(codes) != 2 or type(codes[0]) is not int or codes[0] != 0:
+        return []
+    audits = result.get("audits")
+    decision = audits.get("decision") if isinstance(audits, dict) else None
+    findings = decision.get("findings") if isinstance(decision, dict) else None
+    if not isinstance(findings, list):
+        return []
+    running = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        surface = _RENDER_STATUS_CODES.get(finding.get("code"))
+        if (surface and finding.get("message") == _RENDER_RUNNING_MESSAGE
+                and finding.get("surface") == surface and surface not in running):
+            running.append(surface)
+    return running
+
+
 def release_window(result: dict, now: datetime) -> tuple[Optional[dict], list[str]]:
     """Expiry anchor = OLDEST audited decision input; refuse when spent."""
     decision = result.get("audits", {}).get("decision", {})
@@ -670,7 +759,8 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
               registry=None, service=None, now_utc: Any = None,
               inflight: Optional[Callable[[], Any]] = None,
               provenance: Optional[Callable[[str], Any]] = None,
-              release_run_id: Optional[str] = None, finalize: Any = None) -> dict:
+              release_run_id: Optional[str] = None, finalize: Any = None,
+              settle_sleep: Optional[Callable[[float], Any]] = None) -> dict:
     fin = finalize or final
     if callable(now_utc):
         clock = now_utc
@@ -808,9 +898,14 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         return _finish(out, 1, "deferred", "probe_unavailable" if error is not None else "production_run_in_flight")
 
     # 6. the REAL strict audits, bound to SOURCE (never GITHUB_RUN_ID, never 'local')
+    pre_audit_reasons = list(out["reasons"])   # v1.3.0: the base for a settled re-audit
+
+    async def strict_audits():
+        # v1.3.0: the ONE call site (case_n22), shared by the step-6b re-audit.
+        return await fin.run(sheet_id, reader=reader, registry=registry, publish=False,
+                             max_rows=20000, run_id=source)
     try:
-        result = await fin.run(sheet_id, reader=reader, registry=registry, publish=False,
-                               max_rows=20000, run_id=source)
+        result = await strict_audits()
     except Exception as exc:  # noqa: BLE001
         out["fatal"] = safe_error_text(exc)
         return _finish(out, 3, "fatal", "finalize_error")
@@ -827,6 +922,49 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         ok = not window_reasons
     out["accepted"] = ok
     out["reasons"] += [reason for reason in reasons if reason not in out["reasons"]]
+
+    # 6b. v1.3.0 (TFB_RELEASE_RENDER_SETTLE, default off): a cockpit caught
+    #     mid-render is a transient state it declares itself, not a verdict.
+    #     Bounded: at most RENDER_SETTLE_MAX settles, each followed by a fresh
+    #     in-flight probe and the SAME strict audits; then judged as today.
+    settles = 0
+    while not ok and settles < RENDER_SETTLE_MAX and render_settle_enabled():
+        running = settle_candidates(result)
+        if not running:
+            break
+        settles += 1
+        out.setdefault("render_settle", []).append({
+            "attempt": settles, "cockpits": running, "wait_s": RENDER_SETTLE_S,
+            "reasons": [reason for reason in reasons]})
+        await (settle_sleep or asyncio.sleep)(RENDER_SETTLE_S)
+        count, busy, error = _probe_inflight(probe)
+        if error is not None or count:
+            out["in_flight"] = busy
+            out["deferred"] = True
+            out["reasons"] = list(pre_audit_reasons)
+            if error is not None:
+                out["probe_error"] = error
+            return _finish(out, 1, "deferred",
+                           "probe_unavailable" if error is not None else "production_run_in_flight")
+        try:
+            result = await strict_audits()
+        except Exception as exc:  # noqa: BLE001
+            out["fatal"] = safe_error_text(exc)
+            return _finish(out, 3, "fatal", "finalize_error")
+        for key, item in result.items():
+            if key in ("script_version", "exit_code"):
+                out["finalize_" + key] = item
+            elif key not in ("feed_promoted", "blocker_published"):
+                out[key] = item
+        ok, reasons = accepted(result, source)
+        window = None
+        if ok:
+            window, window_reasons = release_window(result, clock())
+            reasons += window_reasons
+            ok = not window_reasons
+        out["accepted"] = ok
+        out["reasons"] = pre_audit_reasons + [reason for reason in reasons
+                                              if reason not in pre_audit_reasons]
 
     # 7. not accepted: never promote; retract this run's own release when armed
     #    (gate off: report it as would_downgrade, zero writes)

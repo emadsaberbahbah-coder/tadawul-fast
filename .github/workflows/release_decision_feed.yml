@@ -1,6 +1,20 @@
 # =============================================================================
 # Release Decision Feed (P0-1) - .github/workflows/release_decision_feed.yml
 # =============================================================================
+# VERSION 1.2.0 (2026-10-29) -- RENDER SETTLE MAPPING (release_decision_feed 1.3.0)
+# (1.1.1 is claimed by open PR #831.)
+#
+# WHY: a release run whose strict audit reads a cockpit mid-render ('status:
+# running...' in B2) fails, and an armed re-verification of a live release
+# then withdraws it for good (release_window_consumed); see the script's
+# v1.3.0 WHY. WHAT: the release STEP env maps
+# TFB_RELEASE_RENDER_SETTLE: ${{ vars.TFB_RELEASE_RENDER_SETTLE || '0' }}
+# (default OFF). The JOB env is untouched, so its parity with the final job
+# of daily_sync.yml (tests/test_release_decision_feed.py case_n16) holds.
+# A settle adds at most 2 x 120 s, inside the 30-minute timeout. Nothing else
+# changes: triggers, group, gates, steps, summary keys.
+# ROLLBACK: unset the variable, or revert this line.
+#
 # VERSION 1.1.0 (2026-10-19) -- SCHEDULED ATTEMPTS WITH SOURCE DISCOVERY
 #
 # WHY: the board has read 'FEED NOT ACTIONABLE ... 0 EXECUTABLE' on every
@@ -235,6 +249,8 @@ jobs:
           RELEASE_MODE: ${{ inputs.mode || 'release' }}
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_TOKEN: ${{ github.token }}
+          # v1.2.0: release_decision_feed 1.3.0 render settle (default OFF).
+          TFB_RELEASE_RENDER_SETTLE: ${{ vars.TFB_RELEASE_RENDER_SETTLE || '0' }}
         run: |
           set -euo pipefail
           code=0
