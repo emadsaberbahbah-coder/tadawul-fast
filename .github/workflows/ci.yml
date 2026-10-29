@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.57 (2026-10-29) -- RELEASE AFTER SYNC (await_cockpit_receipts 1.0.0)
+# (1.1.56 is #875.)
+#
+# v1.1.57: run tests/test_await_cockpit_receipts.py (scripts/
+# await_cockpit_receipts.py v1.0.0 + release_after_sync.yml v1.0.0: after a
+# completed production sync, a read-only bounded wait for both cockpit
+# receipts, then one dispatch of the unchanged release workflow;
+# TFB_RELEASE_AFTER_SYNC default off) in the blocking lean lane, next to the
+# two P0-1 release harnesses. Offline fakes only (numpy/pytest/PyYAML lane).
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.56 (2026-10-29) -- FW-2 STALE P/E (run_dashboard_sync 6.71.0)
 #
 # v1.1.56: run tests/test_fw2_stale_pe.py (run_dashboard_sync v6.71.0
@@ -1071,6 +1082,7 @@ jobs:
             tests/test_ycp_loopguard_b6.py \
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
+            tests/test_await_cockpit_receipts.py \
             tests/test_ob_conviction_sizing.py $EXTRA
           echo "::endgroup::"
 
